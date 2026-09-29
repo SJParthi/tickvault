@@ -305,6 +305,23 @@ struct InstrumentSlot {
     /// it would pass as fresh and inflate the bucket; and without a direction
     /// the bucket would publish a null net over the stored signed one.
     replay_settling: bool,
+    /// One bit per timeframe: during a replay, the last SEALED bar is held
+    /// rather than emitted, because a late tick can still amend it until the
+    /// next bar of that timeframe seals — and a late tick in a SKIPPED span
+    /// would have amended the stored bar, which an early emission would then
+    /// overwrite with the unamended version (review round 6, found by the
+    /// mixed-stream property). Released by `release_held`.
+    replay_held: u16,
+    /// IST fold second up to which a bucket may still be missing SKIPPED
+    /// ticks (0 = none). Frames are skipped in CAPTURE order, and a late tick
+    /// can carry an older trade time than a skipped one, so a replay can open
+    /// the bucket of a skipped tick later, from a later frame, and take it for
+    /// complete (review round 6, found by the mixed-stream property). Every
+    /// skipped frame was received before this slot's first tick after the
+    /// gap, and a trade is not received before it happens, so that receipt
+    /// time (plus a small clock-skew margin) bounds them. While set, every
+    /// open bucket starting at or before it is marked partial.
+    replay_gap_frontier: u32,
 }
 
 /// Every timeframe's bit in [`InstrumentSlot::replay_open_partial`].
@@ -1112,6 +1129,8 @@ impl MultiTfAggregator {
             // came before its first tick (during a replay, those frames may
             // have been skipped), so its first buckets settle like a gap's.
             replay_settling: true,
+            replay_held: 0,
+            replay_gap_frontier: 0,
         });
         self.index
             .insert(key, u32::try_from(idx).unwrap_or(u32::MAX));
@@ -1743,6 +1762,11 @@ impl MultiTfAggregator {
         if gap_now {
             slot.last_cumulative = cumulative_volume;
         }
+        if replay_mode && (gap_now || seeded_now) {
+            slot.replay_gap_frontier = slot
+                .replay_gap_frontier
+                .max(replay_gap_frontier_secs(tick.received_at_nanos, fold_secs));
+        }
         let baseline = slot.last_cumulative;
         let mut stats = ConsumeStats::default();
 
@@ -1879,6 +1903,20 @@ impl MultiTfAggregator {
         }
 
         for tf in TfIndex::ALL {
+            // A held bar becomes final the moment this tick seals the bar
+            // after it: release it now, before the seal replaces it.
+            if slot.replay_held & replay_tf_bit(tf) != 0 && slot.cell.would_seal(tf, fold_secs) {
+                match release_held(slot, tf, live_from, &mut on_seal) {
+                    Released::Emitted => stats.sealed_count = stats.sealed_count.saturating_add(1),
+                    Released::Suppressed => {
+                        stats.replay_partial_suppressed =
+                            stats.replay_partial_suppressed.saturating_add(1);
+                        self.replay_suppressed_total =
+                            self.replay_suppressed_total.saturating_add(1);
+                    }
+                    Released::Nothing => {}
+                }
+            }
             match slot.cell.consume_tick_with_extremes(
                 tf,
                 tick,
@@ -1913,6 +1951,9 @@ impl MultiTfAggregator {
                         crate::candles::fold_counters::fold_counters()
                             .refold_partial_suppressed
                             .increment(1);
+                    } else if replay_mode {
+                        // Held until it can no longer be amended.
+                        slot.replay_held |= replay_tf_bit(tf);
                     } else {
                         stats.sealed_count = stats.sealed_count.saturating_add(1);
                         on_seal(key.0, key.1, key.2, tf, sealed_state);
@@ -1932,6 +1973,10 @@ impl MultiTfAggregator {
                         crate::candles::fold_counters::fold_counters()
                             .refold_partial_suppressed
                             .increment(1);
+                    } else if replay_mode {
+                        // The held bar now carries the amendment; it is
+                        // emitted when released.
+                        slot.replay_held |= replay_tf_bit(tf);
                     } else {
                         stats.amended_count = stats.amended_count.saturating_add(1);
                         on_seal(key.0, key.1, key.2, tf, amended_state);
@@ -1989,6 +2034,21 @@ impl MultiTfAggregator {
         // Refusing the regression is the only correct answer: a cumulative
         // counter cannot legitimately go down within a day, so a smaller value
         // is stale, never news. It is counted so the correction is visible.
+        // GAP FRONTIER (plan ITEM 47, review round 6): a bucket that starts at
+        // or before it may still be missing a skipped tick. O(TF_COUNT), and
+        // only while a frontier is set during a replay.
+        if slot.replay_gap_frontier != 0 {
+            let frontier = slot.replay_gap_frontier;
+            for tf in TfIndex::ALL {
+                let start = slot.cell.open_bucket_start(tf);
+                if start != 0 && start <= frontier {
+                    slot.replay_open_partial |= replay_tf_bit(tf);
+                }
+            }
+            if fold_secs > frontier.saturating_add(MAX_BUCKET_SECS) {
+                slot.replay_gap_frontier = 0;
+            }
+        }
         // POST-GAP SETTLING (plan ITEM 47, review round 5). While settling, a
         // tick that ADDS volume is uncertain: its delta is measured from a
         // baseline that may sit below the skipped span's highest cumulative,
@@ -2141,6 +2201,16 @@ impl MultiTfAggregator {
                 // With no bucket open, `force_seal` can still return the LAST
                 // SEALED bar amended with a settled carry; that bar is judged
                 // by the sealed bits, and the open bits are left alone.
+                // The day boundary clears the last sealed bar: a held one is
+                // final now.
+                match release_held(slot, tf, live_from, &mut on_seal) {
+                    Released::Emitted => emitted = emitted.saturating_add(1),
+                    Released::Suppressed => {
+                        self.replay_suppressed_total =
+                            self.replay_suppressed_total.saturating_add(1);
+                    }
+                    Released::Nothing => {}
+                }
                 let nothing_open = slot.cell.snapshot(tf).is_uninitialised();
                 if let Some(state) = slot.cell.force_seal(tf) {
                     let before = ended_before_capture(tf, state.bucket_start_ist_secs, live_from);
@@ -2256,6 +2326,18 @@ impl MultiTfAggregator {
                 slot.sync_replay_gap(gap_epoch);
                 let (feed, sid, seg) = slot.key;
                 for tf in TfIndex::ALL {
+                    if slot.replay_held & replay_tf_bit(tf) != 0
+                        && slot.cell.would_catch_up_seal(tf, cutoff_secs)
+                    {
+                        match release_held(slot, tf, live_from, &mut on_seal) {
+                            Released::Emitted => emitted = emitted.saturating_add(1),
+                            Released::Suppressed => {
+                                self.replay_suppressed_total =
+                                    self.replay_suppressed_total.saturating_add(1);
+                            }
+                            Released::Nothing => {}
+                        }
+                    }
                     if let Some(state) = slot.cell.catch_up_seal(tf, cutoff_secs) {
                         let before =
                             ended_before_capture(tf, state.bucket_start_ist_secs, live_from);
@@ -2263,6 +2345,8 @@ impl MultiTfAggregator {
                             count_replay_partial_suppressed();
                             self.replay_suppressed_total =
                                 self.replay_suppressed_total.saturating_add(1);
+                        } else if replay_mode {
+                            slot.replay_held |= replay_tf_bit(tf);
                         } else {
                             emitted = emitted.saturating_add(1);
                             on_seal(feed, sid, seg, tf, state);
@@ -2340,6 +2424,10 @@ impl MultiTfAggregator {
     /// Then replay mode ends and one more gap is marked, so the first live
     /// tick re-seeds instead of taking the downtime's volume.
     ///
+    /// Every bar still HELD (see `InstrumentSlot::replay_held`) is released
+    /// through `on_seal` here: emitted if complete, counted if tainted or
+    /// partial.
+    ///
     /// Returns `(tainted, suppressed)`: the buckets tainted here, and the bars
     /// suppressed as partial during the replay.
     ///
@@ -2348,13 +2436,25 @@ impl MultiTfAggregator {
     /// it gets none now either, counted, rather than a row missing its head.
     /// Telling that case from a process that did store it would need a record
     /// of what the previous process sealed, which the WAL does not hold.
+    /// Second limit (review rounds 5 and 6): a packet that is stale against a
+    /// skipped span the replay never saw cannot always be recognised. An
+    /// emitted bar can then exceed the live bar's volume by at most the
+    /// largest backward step of the cumulative, and its net volume and close
+    /// can differ too; the randomized property
+    /// `test_replay_with_stale_packets_overcounts_at_most_the_largest_regression`
+    /// bounds the volume half.
     ///
     /// # Complexity
     /// O(slots × `TF_COUNT`), once per lane start. A no-op when no replay ran.
-    pub fn finish_replay(&mut self, ended_on_gap: bool) -> (u64, u64) {
+    pub fn finish_replay<F>(&mut self, ended_on_gap: bool, mut on_seal: F) -> (u64, u64)
+    where
+        F: FnMut(Feed, u64, u8, TfIndex, LiveCandleState),
+    {
         if !self.replay_mode {
             return (0, 0);
         }
+        let live_from = self.live_capture_from_secs;
+        let mut released_suppressed = 0_u64;
         let epoch = self.replay_gap_epoch;
         // The hand-over gap (the downtime before the first live frame) is
         // applied HERE, eagerly, rather than through the lazy epoch sync: the
@@ -2386,6 +2486,16 @@ impl MultiTfAggregator {
                 slot.replay_sealed_partial
             };
             tainted = tainted.saturating_add(u64::from(slot.replay_taint_open.count_ones()));
+            // Every bar still held is final now: emitted if complete, counted
+            // if the taint or a gap marked it.
+            for tf in TfIndex::ALL {
+                if matches!(
+                    release_held(slot, tf, live_from, &mut on_seal),
+                    Released::Suppressed
+                ) {
+                    released_suppressed = released_suppressed.saturating_add(1);
+                }
+            }
             // The hand-over gap: the next accepted tick discards its delta and
             // re-bases, as after any gap. A frame with nothing open is partial
             // (its next bucket misses that tick); an open bucket keeps its
@@ -2400,6 +2510,9 @@ impl MultiTfAggregator {
         // O(1) EXEMPT: end
         self.replay_gap_epoch = hand_over_epoch;
         self.replay_mode = false;
+        self.replay_suppressed_total = self
+            .replay_suppressed_total
+            .saturating_add(released_suppressed);
         (tainted, self.replay_suppressed_total)
     }
 
@@ -2509,6 +2622,82 @@ impl InstrumentSlot {
             || self.replay_taint_sealed & bit != 0
             || (partial && ended_before_capture)
     }
+}
+
+/// The longest bucket of any timeframe, in seconds: a gap frontier this far
+/// behind the fold can no longer touch an open bucket.
+const MAX_BUCKET_SECS: u32 = {
+    let mut max = 0;
+    let mut i = 0;
+    while i < TF_COUNT {
+        let secs = TfIndex::ALL[i].seconds_per_bucket();
+        if secs > max {
+            max = secs;
+        }
+        i += 1;
+    }
+    max
+};
+
+/// Seconds the exchange clock may run ahead of this box's receipt clock.
+/// Widens the gap frontier so a skipped tick stamped a little after its
+/// receipt still falls inside it.
+const REPLAY_FRONTIER_SKEW_SECS: u32 = 5;
+
+/// The gap frontier for a slot's first tick after a gap: its receipt time in
+/// IST fold seconds plus [`REPLAY_FRONTIER_SKEW_SECS`]. A tick with no
+/// plausible receipt (legacy WAL records) falls back to its own trade time.
+/// O(1).
+fn replay_gap_frontier_secs(received_at_nanos: i64, fold_secs: u32) -> u32 {
+    let receipt_secs = received_at_nanos
+        .checked_div(1_000_000_000)
+        .and_then(|secs| secs.checked_add(crate::candles::tf_index::IST_UTC_OFFSET_SECS))
+        .and_then(|secs| u32::try_from(secs).ok())
+        .filter(|_| received_at_nanos > 0);
+    receipt_secs
+        .unwrap_or(fold_secs)
+        .max(fold_secs)
+        .saturating_add(REPLAY_FRONTIER_SKEW_SECS)
+}
+
+/// What [`release_held`] did with a held bar.
+enum Released {
+    /// No bar was held for this timeframe.
+    Nothing,
+    /// The held bar was complete and was emitted.
+    Emitted,
+    /// The held bar turned out partial (a gap marked it) and was counted.
+    Suppressed,
+}
+
+/// Releases `tf`'s held bar (plan ITEM 47): the cell's last sealed bar, which
+/// carries every amendment the replay saw. Emitted if it is still complete,
+/// counted if a later gap or the hand-over marked it partial or tainted. O(1).
+fn release_held<F>(
+    slot: &mut InstrumentSlot,
+    tf: TfIndex,
+    live_from: u32,
+    on_seal: &mut F,
+) -> Released
+where
+    F: FnMut(Feed, u64, u8, TfIndex, LiveCandleState),
+{
+    let bit = replay_tf_bit(tf);
+    if slot.replay_held & bit == 0 {
+        return Released::Nothing;
+    }
+    slot.replay_held &= !bit;
+    let Some(bar) = slot.cell.last_sealed_snapshot(tf) else {
+        return Released::Nothing;
+    };
+    let before = ended_before_capture(tf, bar.bucket_start_ist_secs, live_from);
+    if slot.sealed_is_suppressed(tf, true, before) {
+        count_replay_partial_suppressed();
+        return Released::Suppressed;
+    }
+    let (feed, sid, seg) = slot.key;
+    on_seal(feed, sid, seg, tf, bar);
+    Released::Emitted
 }
 
 /// `true` when the `tf` bucket starting at `bucket_start` ended at or before
@@ -2756,7 +2945,11 @@ mod tests {
             if gap {
                 agg.mark_replay_gap();
             }
-            agg.catch_up_seal_all(OPEN + 100_000, |_, _, _, _, _| {})
+            // The sweep seals; a replay holds what it seals until the
+            // hand-over releases it.
+            let mut emitted = agg.catch_up_seal_all(OPEN + 100_000, |_, _, _, _, _| {});
+            agg.finish_replay(false, |_, _, _, _, _| emitted += 1);
+            emitted
         };
         assert!(
             seal_after(false) > 0,
@@ -2795,6 +2988,7 @@ mod tests {
         ] {
             agg.consume_tick(Feed::Dhan, &gtick(ts, cum), None, &mut sink);
         }
+        agg.finish_replay(false, &mut sink);
         assert!(
             out.iter()
                 .any(|(tf, start, v)| *tf == TfIndex::M1 && *start == t0 + 60 && v.abs() == 90),
@@ -2822,7 +3016,7 @@ mod tests {
                 agg.consume_tick(Feed::Dhan, &gtick(ts, cum), None, |_, _, _, _, _| {});
             }
             if finish {
-                agg.finish_replay(false);
+                agg.finish_replay(false, |_, _, _, _, _| {});
             } else {
                 agg.set_replay_mode(false);
             }
@@ -2860,7 +3054,7 @@ mod tests {
         // As in production: the lane records when it began listening, here
         // after the complete minute ended (a crash-restart; review round 4).
         agg.set_live_capture_start(OPEN + 3_000);
-        agg.finish_replay(false);
+        agg.finish_replay(false, |_, _, _, _, _| {});
         let mut sealed: Vec<(TfIndex, u32, i64)> = Vec::new();
         agg.catch_up_seal_all(OPEN + 100_000, |_, _, _, tf, st| {
             sealed.push((tf, st.bucket_start_ist_secs, st.signed_volume()));
@@ -2962,7 +3156,7 @@ mod tests {
         ] {
             agg.consume_tick(Feed::Dhan, &gtick(ts, cum), None, |_, _, _, _, _| {});
         }
-        agg.finish_replay(false);
+        agg.finish_replay(false, |_, _, _, _, _| {});
         let mut m1: Vec<(u32, i64)> = Vec::new();
         for (ts, cum) in [(t0 + 40, 51_000), (t0 + 50, 51_100), (t0 + 61, 51_200)] {
             agg.consume_tick(Feed::Dhan, &gtick(ts, cum), None, |_, _, _, tf, st| {
@@ -2995,7 +3189,7 @@ mod tests {
             ] {
                 agg.consume_tick(Feed::Dhan, &gtick(ts, cum), None, |_, _, _, _, _| {});
             }
-            let (tainted, _) = agg.finish_replay(ended_on_gap);
+            let (tainted, _) = agg.finish_replay(ended_on_gap, |_, _, _, _, _| {});
             let mut m1 = 0_usize;
             agg.catch_up_seal_all(OPEN + 100_000, |_, _, _, tf, st| {
                 if tf == TfIndex::M1 && st.bucket_start_ist_secs == OPEN + 60 {
@@ -3082,6 +3276,14 @@ mod tests {
         ] {
             feed(&mut agg, ts, cum);
         }
+        agg.finish_replay(false, |_, _, _, tf, st| {
+            bars.push((
+                tf,
+                st.bucket_start_ist_secs,
+                st.volume,
+                st.net_volume_signed,
+            ));
+        });
         assert!(
             bars.iter().all(|(_, _, v, net)| net.unsigned_abs() <= *v),
             "no bar may carry more net than volume: {bars:?}"
@@ -3130,6 +3332,13 @@ mod tests {
         ] {
             feed(&mut agg, ts, cum);
         }
+        // A replay holds each sealed bar until it can no longer be amended;
+        // the hand-over releases the rest.
+        agg.finish_replay(false, |_, _, _, tf, st| {
+            if tf == TfIndex::M1 {
+                m1.push((st.bucket_start_ist_secs, st.volume));
+            }
+        });
         assert!(
             m1.iter().any(|(start, v)| *start == t0 + 120 && *v == 100),
             "a minute after the restart counts on the new axis: {m1:?}"
@@ -3194,7 +3403,7 @@ mod tests {
             ] {
                 agg.consume_tick(Feed::Dhan, &gtick(ts, cum), None, |_, _, _, _, _| {});
             }
-            agg.finish_replay(ended_on_gap);
+            agg.finish_replay(ended_on_gap, |_, _, _, _, _| {});
             let mut count = 0_u32;
             // A live late tick for the sealed t0 + 60 minute.
             agg.consume_tick(
@@ -3264,6 +3473,12 @@ mod tests {
 
         type Bars = HashMap<(TfIndex, u32), LiveCandleState>;
 
+        /// Receipt in UTC nanoseconds for an IST fold second.
+        fn receipt_nanos(ist_secs: u32) -> i64 {
+            (i64::from(ist_secs) - i64::from(crate::candles::tf_index::IST_UTC_OFFSET_SECS))
+                * 1_000_000_000
+        }
+
         #[derive(Clone, Debug)]
         struct Step {
             dt: u32,
@@ -3303,6 +3518,7 @@ mod tests {
                     volume: u32::try_from(cum).unwrap_or(u32::MAX),
                     day_high: hi,
                     day_low: lo,
+                    received_at_nanos: receipt_nanos(ts),
                     ..ParsedTick::default()
                 };
                 agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, tf, st| {
@@ -3311,8 +3527,11 @@ mod tests {
             }
             if replay {
                 // As in production: the replay hands over to the live feed,
-                // and it ended on a gap if its last frames were skipped.
-                let _ = agg.finish_replay(gap);
+                // and it ended on a gap if its last frames were skipped. Bars
+                // still held are released here.
+                let _ = agg.finish_replay(gap, |_, _, _, tf, st| {
+                    bars.insert((tf, st.bucket_start_ist_secs), st);
+                });
             }
             agg.catch_up_seal_all(ts + 100_000, |_, _, _, tf, st| {
                 bars.insert((tf, st.bucket_start_ist_secs), st);
@@ -3347,6 +3566,122 @@ mod tests {
             )
         }
 
+        /// Two contracts interleaved, repeated quotes (same second, price and
+        /// cumulative) and late trades (a trade time behind the stream).
+        #[derive(Clone, Debug)]
+        struct MixedStep {
+            second: bool,
+            dt: u32,
+            late_by: u32,
+            dcum: i32,
+            dpx: i8,
+            dropped: bool,
+        }
+
+        type MixedBars = HashMap<(u64, TfIndex, u32), LiveCandleState>;
+
+        fn fold_mixed(steps: &[MixedStep], replay: bool) -> MixedBars {
+            let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+            if replay {
+                agg.set_replay_mode(true);
+                agg.mark_replay_gap();
+            }
+            let mut bars: MixedBars = HashMap::new();
+            let mut clock = OPEN + 60;
+            // Per contract: cumulative, price, session high, session low.
+            let mut state = [(10_000_i64, 1_000.0_f32, 1_000.0_f32, 1_000.0_f32); 2];
+            let mut gap = false;
+            for step in steps {
+                clock += step.dt;
+                let which = usize::from(step.second);
+                let (cum, px, hi, lo) = &mut state[which];
+                *cum = (*cum + i64::from(step.dcum)).max(0);
+                *px = (*px + f32::from(step.dpx) * 0.05).max(1.0);
+                *hi = hi.max(*px);
+                *lo = lo.min(*px);
+                if replay && step.dropped {
+                    gap = true;
+                    continue;
+                }
+                if std::mem::replace(&mut gap, false) {
+                    agg.mark_replay_gap();
+                }
+                let sid = GAP_SID + u64::from(step.second);
+                let t = ParsedTick {
+                    security_id: sid,
+                    exchange_segment_code: SEG_EQ,
+                    last_traded_price: *px,
+                    exchange_timestamp: clock.saturating_sub(step.late_by).max(OPEN),
+                    volume: u32::try_from(*cum).unwrap_or(u32::MAX),
+                    day_high: *hi,
+                    day_low: *lo,
+                    // Received now, whatever its trade time says.
+                    received_at_nanos: receipt_nanos(clock),
+                    ..ParsedTick::default()
+                };
+                agg.consume_tick(Feed::Dhan, &t, None, |_, id, _, tf, st| {
+                    bars.insert((id, tf, st.bucket_start_ist_secs), st);
+                });
+            }
+            if replay {
+                let _ = agg.finish_replay(gap, |_, id, _, tf, st| {
+                    bars.insert((id, tf, st.bucket_start_ist_secs), st);
+                });
+            }
+            agg.catch_up_seal_all(clock + 100_000, |_, id, _, tf, st| {
+                bars.insert((id, tf, st.bucket_start_ist_secs), st);
+            });
+            bars
+        }
+
+        fn mixed_step() -> impl Strategy<Value = MixedStep> {
+            (
+                any::<bool>(),
+                0_u32..30,
+                prop_oneof![8 => Just(0_u32), 1 => 1_u32..20],
+                0_i32..300,
+                -3_i8..=3,
+                prop::bool::weighted(0.25),
+            )
+                .prop_map(|(second, dt, late_by, dcum, dpx, dropped)| MixedStep {
+                    second,
+                    dt,
+                    late_by,
+                    dcum,
+                    dpx,
+                    dropped,
+                })
+        }
+
+        /// Regression pinned from the round-6 property run: a SKIPPED tick
+        /// captured before a LATE tick with an older trade time. The replay
+        /// then opened the skipped tick's minute from a later tick and took it
+        /// for complete; the gap frontier marks it partial.
+        #[test]
+        fn test_regression_skipped_tick_before_a_late_tick_leaves_its_minute_partial() {
+            let step = |dt, late_by, dpx, dropped| MixedStep {
+                second: false,
+                dt,
+                late_by,
+                dcum: 0,
+                dpx,
+                dropped,
+            };
+            let steps = vec![
+                step(0, 0, 0, true),
+                step(0, 13, 0, false),
+                step(7, 3, 1, false),
+                step(0, 0, 0, false),
+                step(0, 0, 0, false),
+            ];
+            let live = fold_mixed(&steps, false);
+            let replay = fold_mixed(&steps, true);
+            for (key, bar) in &replay {
+                let truth = live.get(key).expect("the live fold emitted this bar");
+                assert_eq!(bar.open.to_bits(), truth.open.to_bits(), "{key:?} open");
+            }
+        }
+
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(512))]
             #[test]
@@ -3379,6 +3714,37 @@ mod tests {
                 // except the bars the pass-start gap makes partial.
                 if steps.iter().all(|s| !s.dropped) {
                     prop_assert!(replay.len() <= live.len());
+                }
+            }
+
+            /// Round 6: the same contract with two contracts interleaved,
+            /// repeated quotes and late trades.
+            #[test]
+            fn test_replay_with_gaps_mixed_stream_emits_only_live_identical_bars(
+                steps in prop::collection::vec(mixed_step(), 1..200)
+            ) {
+                let live = fold_mixed(&steps, false);
+                let replay = fold_mixed(&steps, true);
+                for ((id, tf, start), bar) in &replay {
+                    let Some(truth) = live.get(&(*id, *tf, *start)) else {
+                        return Err(TestCaseError::fail(format!(
+                            "{id} {tf:?} {start}: the replay emitted a bar the live fold never did"
+                        )));
+                    };
+                    prop_assert_eq!(bar.volume, truth.volume, "{} {:?} {} volume", id, tf, start);
+                    prop_assert_eq!(bar.open.to_bits(), truth.open.to_bits(), "{} {:?} {} open", id, tf, start);
+                    prop_assert_eq!(bar.high.to_bits(), truth.high.to_bits(), "{} {:?} {} high", id, tf, start);
+                    prop_assert_eq!(bar.low.to_bits(), truth.low.to_bits(), "{} {:?} {} low", id, tf, start);
+                    prop_assert_eq!(bar.close.to_bits(), truth.close.to_bits(), "{} {:?} {} close", id, tf, start);
+                    prop_assert_eq!(bar.net_volume_signed, truth.net_volume_signed, "{} {:?} {} net", id, tf, start);
+                    prop_assert_eq!(
+                        bar.net_volume_classified,
+                        truth.net_volume_classified,
+                        "{} {:?} {} classified",
+                        id,
+                        tf,
+                        start
+                    );
                 }
             }
 
@@ -3426,8 +3792,8 @@ mod tests {
         assert!(
             marked
                 .iter()
-                .any(|(tf, start, v)| *tf == TfIndex::S1 && *start == OPEN + 302 && v.abs() == 10),
-            "a 1-second bar after the first post-gap increase is complete: {marked:?}"
+                .any(|(tf, start, v)| *tf == TfIndex::S1 && *start == OPEN + 307 && v.abs() == 10),
+            "a 1-second bar past the first post-gap increase and the gap frontier's clock-skew margin is complete: {marked:?}"
         );
     }
 
