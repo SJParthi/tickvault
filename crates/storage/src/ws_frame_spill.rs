@@ -2997,6 +2997,16 @@ pub struct WalReplayBatch {
     pub stopped_for_disk: bool,
     /// `true` when the pass was refused on [`WAL_REPLAY_MAX_FRAMES_PER_BOOT`].
     pub stopped_for_frame_cap: bool,
+    /// Plan ITEM 47: `true` when something was really skipped before the first
+    /// returned frame — a segment archived as applied, main-feed frames dropped
+    /// as applied, or a damaged segment. The first frame's `after_gap` is set
+    /// on every pass regardless, because a pass does not know what an earlier
+    /// pass read; a caller draining in consecutive rounds reads this to tell a
+    /// real gap from a round boundary.
+    pub leading_gap: bool,
+    /// Plan ITEM 47: `true` when the pass ended on a gap — frames dropped or
+    /// lost after the last returned one.
+    pub trailing_gap: bool,
 }
 
 /// Should THIS deferral page the operator?
@@ -3137,9 +3147,13 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
     // Plan ITEM 47: the first frame of a pass always follows a gap (what came
     // before it was applied, or was read by an earlier pass).
     let mut gap_pending = true;
+    // The same, without the pass-start assumption: set only by a real skip.
+    let mut real_gap = false;
+    let mut leading_gap: Option<bool> = None;
     for (seg_idx, path) in segments.iter().enumerate() {
         if gap_before_segment.get(seg_idx).copied().unwrap_or(false) {
             gap_pending = true;
+            real_gap = true;
         }
         if bytes_held >= budget_bytes && consumed > 0 {
             break;
@@ -3174,9 +3188,17 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
                 for f in &batch {
                     bytes_held = bytes_held.saturating_add(f.frame.len());
                 }
-                if gap_pending && let Some(first) = batch.first_mut() {
-                    first.after_gap = true;
+                if let Some(first) = batch.first_mut() {
+                    // `first.after_gap` here is the segment walk's own verdict:
+                    // frames dropped in front of it inside this segment.
+                    if leading_gap.is_none() {
+                        leading_gap = Some(real_gap || first.after_gap);
+                    }
+                    if gap_pending {
+                        first.after_gap = true;
+                    }
                     gap_pending = false;
+                    real_gap = false;
                 }
                 frames.append(&mut batch);
                 // A walk that stopped on a bad record never returned the
@@ -3185,11 +3207,13 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
                 // segment follows a gap.
                 if damaged || trailing_gap {
                     gap_pending = true;
+                    real_gap = true;
                 }
             }
             Err(err) => {
                 corrupted += 1;
                 gap_pending = true;
+                real_gap = true;
                 error!(segment = ?path, error = %err, "WAL segment corrupted; skipping");
             }
         }
@@ -3357,6 +3381,8 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
         skipped_bytes,
         stopped_for_disk: false,
         stopped_for_frame_cap: false,
+        leading_gap: leading_gap.unwrap_or(real_gap),
+        trailing_gap: real_gap,
     })
 }
 
@@ -5141,7 +5167,15 @@ fn replay_segment_core<F: Fn(u64, WalEndpoint) -> bool>(
             && applied.frame_is_applied(applied_sink_for(endpoint), frame_seq)
         {
             dropped_as_applied = dropped_as_applied.saturating_add(1);
-            gap_pending = true;
+            // Only a skipped MAIN-FEED frame can hide ticks from the candle
+            // fold. A depth or order-update frame carries none, so dropping it
+            // is no gap: when the depth watermark runs ahead of the tick one,
+            // depth frames interleaved with main-feed frames would otherwise
+            // flag a gap before nearly every main-feed frame, and the fold
+            // would suppress almost every bar as partial (review, 2026-09-29).
+            if matches!(endpoint, WalEndpoint::MainFeed) {
+                gap_pending = true;
+            }
             i = record_end;
             continue;
         }
@@ -9524,6 +9558,14 @@ mod tests {
             vec![wm_seq(1_000), wm_seq(3_000)],
             "each shed segment's first frame follows skipped frames"
         );
+        assert!(
+            batch.leading_gap,
+            "segment 0 was archived unread before the first frame"
+        );
+        assert!(
+            batch.trailing_gap,
+            "the last segment's frames were all dropped as applied"
+        );
         let _ = std::fs::remove_dir_all(&dir);
 
         // With no watermark nothing is skipped: only the pass's first frame
@@ -9534,6 +9576,51 @@ mod tests {
         let batch = replay_unguarded(&dir);
         let flagged: Vec<bool> = batch.frames.iter().map(|f| f.after_gap).collect();
         assert_eq!(flagged, vec![true, false, false, false, false, false]);
+        assert!(
+            !batch.leading_gap && !batch.trailing_gap,
+            "the pass-start flag alone is not a real gap"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Plan ITEM 47 review: dropping an already-applied DEPTH frame hides no
+    /// tick, so it is no gap. Main-feed and depth frames interleave on the
+    /// wire; with the depth watermark ahead of the tick one, every depth frame
+    /// is dropped and every main-feed frame kept, and none of the kept ones may
+    /// be flagged — otherwise the fold would suppress nearly every bar.
+    #[test]
+    fn test_replay_dropped_depth_frame_is_not_a_gap() {
+        let dir = tmp_dir("wm-after-gap-depth");
+        let mut bytes = Vec::new();
+        for i in 0..6_u64 {
+            let endpoint = if i % 2 == 0 {
+                WalEndpoint::MainFeed
+            } else {
+                WalEndpoint::Depth20
+            };
+            bytes.extend_from_slice(&encode_v4_record(
+                WsType::LiveFeed,
+                wm_seq(i),
+                7,
+                endpoint,
+                &[0xAB; 32],
+            ));
+        }
+        std::fs::write(dir.join(format!("ws-frames-{:020}.wal", wm_seq(0))), bytes).unwrap();
+        let wm = crate::wal_applied_watermark::AppliedWatermark::new_for_tests();
+        wm.note_depth_acked(wm_seq(5_000));
+        write_wm_watermark(&dir, &wm.snapshot());
+        let batch = replay_unguarded(&dir);
+        let kept: Vec<(u64, bool)> = batch
+            .frames
+            .iter()
+            .map(|f| (f.frame_seq, f.after_gap))
+            .collect();
+        assert_eq!(
+            kept,
+            vec![(wm_seq(0), true), (wm_seq(2), false), (wm_seq(4), false)],
+            "depth frames are dropped as applied; only the pass's first frame follows a gap"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
