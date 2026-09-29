@@ -4560,14 +4560,24 @@ impl LiveIngest {
         (emitted, dropped)
     }
 
-    /// Ends a WAL replay: hands the candle fold over to the live feed (plan
-    /// ITEM 47, [`MultiTfAggregator::finish_replay`]). `ended_on_gap` is
+    /// Hands the candle fold over to the live feed, once per lane start,
+    /// before the first live frame: records when this process began capturing
+    /// ([`MultiTfAggregator::set_live_capture_start`]) and ends any WAL replay
+    /// (plan ITEM 47, [`MultiTfAggregator::finish_replay`]). `ended_on_gap` is
     /// `true` when frames after the last replayed one were skipped or left
-    /// unread. A no-op when no replay ran.
+    /// unread.
     ///
     /// # Complexity
     /// O(slots × TF), once per lane start.
     pub fn finish_wal_replay(&mut self, ended_on_gap: bool) {
+        // Every boot, replay or not: from here on a partial bar whose bucket
+        // ended before this process began listening is a fragment of a bar
+        // the previous process owned, never written (review round 3).
+        let now_ist_secs = chrono::Utc::now().timestamp().saturating_add(i64::from(
+            tickvault_common::constants::IST_UTC_OFFSET_SECONDS,
+        ));
+        self.aggregator
+            .set_live_capture_start(u32::try_from(now_ist_secs).unwrap_or(u32::MAX));
         let (tainted, suppressed) = self.aggregator.finish_replay(ended_on_gap);
         if tainted > 0 || suppressed > 0 {
             info!(
@@ -10227,10 +10237,10 @@ pub struct DhanFeedStackParams {
     /// returned nothing. Carried into the catch-up drain, whose first round
     /// continues that pass.
     pub wal_replay_trailing_gap: Option<bool>,
-    /// Capture sequence of the boot pass's last candle-bearing frame, so the
-    /// catch-up drain can flag a capture jump across the pass boundary (plan
-    /// ITEM 47).
-    pub wal_replay_last_fold_seq: Option<u64>,
+    /// Receipt time of the boot pass's last candle-bearing frame, so the
+    /// catch-up drain can flag a process boundary across the pass boundary
+    /// (plan ITEM 47, `process_boundary_is_gap`).
+    pub wal_replay_last_fold_receipt: Option<i64>,
     /// Main-feed instruments (the hardcoded index set — see
     /// [`hardcoded_index_universe`]).
     pub main_feed_instruments: Vec<SubscribeInstrument>,
@@ -15278,7 +15288,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         // after a gap, whatever the replay assumes about its own first frame.
         // `None` = unknown, treated as a gap.
         let mut catchup_prev_trailing_gap: Option<bool> = params.wal_replay_trailing_gap;
-        let mut catchup_last_fold_seq: Option<u64> = params.wal_replay_last_fold_seq;
+        let mut catchup_last_fold_receipt: Option<i64> = params.wal_replay_last_fold_receipt;
         // Every segment this drain can confirm holds frames below THIS point;
         // a shed from a socket dialed during the drain lands above it and its
         // bucket must survive the reset at the end.
@@ -15399,6 +15409,13 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 );
             }
             if batch.frames.is_empty() {
+                // An empty pass can still END on a gap: every main-feed frame
+                // of the last segment dropped as applied (review round 3).
+                catchup_prev_trailing_gap = Some(
+                    catchup_prev_trailing_gap.unwrap_or(true)
+                        || batch.trailing_gap
+                        || batch.leading_gap,
+                );
                 catchup_drained = batch.deferred_segments == 0
                     && !batch.stopped_for_disk
                     && !batch.stopped_for_frame_cap
@@ -15442,17 +15459,23 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             let mut staged_gaps: Vec<usize> = Vec::new();
             let mut gap_carry = false;
             // O(1) EXEMPT: begin — one pass over a catch-up batch on the boot drain, cold path
+            let mut segment_boundary = false;
             for f in batch.frames {
                 gap_carry |= f.after_gap;
+                segment_boundary |= f.first_in_segment;
                 if tickvault_storage::ws_frame_spill::frame_feeds_the_candle_fold(
                     f.ws_type, f.endpoint,
                 ) {
-                    if let Some(prev) = catchup_last_fold_seq
-                        && tickvault_storage::ws_frame_spill::capture_jump_is_gap(prev, f.frame_seq)
+                    if std::mem::replace(&mut segment_boundary, false)
+                        && let Some(prev) = catchup_last_fold_receipt
+                        && tickvault_storage::ws_frame_spill::process_boundary_is_gap(
+                            prev,
+                            f.received_at_nanos,
+                        )
                     {
                         gap_carry = true;
                     }
-                    catchup_last_fold_seq = Some(f.frame_seq);
+                    catchup_last_fold_receipt = Some(f.received_at_nanos);
                 }
                 if f.ws_type != tickvault_storage::ws_frame_spill::WsType::LiveFeed {
                     continue;
@@ -18589,7 +18612,7 @@ mod tests {
             wal_replay_live_feed: Vec::new(),
             wal_replay_gaps: Vec::new(),
             wal_replay_trailing_gap: None,
-            wal_replay_last_fold_seq: None,
+            wal_replay_last_fold_receipt: None,
             main_feed_instruments: hardcoded_index_universe(),
             depth_20_instruments: Vec::new(),
             depth_200_instruments: Vec::new(),
@@ -23175,14 +23198,26 @@ mod wal_refold_tests {
         let main_src = include_str!("main.rs");
         for (name, text) in [("main.rs", main_src), ("dhan_feed_stack.rs", prod)] {
             assert!(
-                text.contains("capture_jump_is_gap("),
-                "{name} must flag a capture jump as a replay gap"
+                text.contains("process_boundary_is_gap("),
+                "{name} must flag a process boundary as a replay gap"
             );
         }
         assert!(main_src.contains("wal_replay_trailing_gap: ws_wal_replay_trailing_gap,"));
-        assert!(main_src.contains("wal_replay_last_fold_seq: ws_wal_replay_last_fold_seq,"));
+        assert!(
+            main_src.contains("wal_replay_last_fold_receipt: ws_wal_replay_last_fold_receipt,")
+        );
         assert!(prod.contains("params.wal_replay_trailing_gap;"));
-        assert!(prod.contains("params.wal_replay_last_fold_seq;"));
+        assert!(prod.contains("params.wal_replay_last_fold_receipt;"));
+        // Round 3: an EMPTY final pass can still end on a gap; it must reach
+        // the hand-over's verdict, not be skipped by the early break.
+        let empty_arm = prod
+            .split("if batch.frames.is_empty() {")
+            .nth(1)
+            .and_then(|rest| rest.split("break;").next())
+            .expect("empty-pass arm");
+        assert!(
+            empty_arm.contains("batch.trailing_gap") && empty_arm.contains("batch.leading_gap")
+        );
     }
 
     /// The 2026-09-01 finding: a depth-socket frame in the live-feed WAL was

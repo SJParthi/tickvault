@@ -868,6 +868,10 @@ impl AggregatorCell {
             let state = &mut self.slots[ord];
             let open = !state.is_uninitialised();
             if open && tf.bucket_start(fold_secs) == state.bucket_start_ist_secs {
+                // The gross now includes trades whose direction nobody saw, so
+                // the net can no longer claim to cover them (review,
+                // 2026-09-29), exactly as an unclassified carry does.
+                state.net_volume_classified = false;
                 continue;
             }
             if open {
@@ -2943,6 +2947,10 @@ mod tests {
         cell.rebase_open_buckets_after_gap(100_000, 33_330);
         let m1 = cell.snapshot(TfIndex::M1);
         assert_eq!(m1.bucket_start_cumulative, 10, "same bucket: not re-based");
+        assert!(
+            !m1.net_volume_classified,
+            "same bucket: the net no longer covers the gross"
+        );
         assert!(!cell.chain_broken[TfIndex::M1.as_ordinal()]);
         assert_eq!(
             cell.carried_upto[TfIndex::M1.as_ordinal()],

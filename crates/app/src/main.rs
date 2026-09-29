@@ -996,9 +996,9 @@ async fn async_main() -> Result<()> {
     // Whether the boot pass ENDED on a gap: frames after its last live-feed
     // frame were skipped. `None` when it returned nothing (plan ITEM 47).
     let mut ws_wal_replay_trailing_gap: Option<bool> = None;
-    // Capture sequence of the boot pass's last candle-bearing frame, so the
-    // catch-up drain can see a capture jump across the pass boundary.
-    let mut ws_wal_replay_last_fold_seq: Option<u64> = None;
+    // Receipt time of the boot pass's last candle-bearing frame, so the
+    // catch-up drain can see a process boundary across the pass boundary.
+    let mut ws_wal_replay_last_fold_receipt: Option<i64> = None;
     let mut ws_wal_replay_order_update: Vec<Vec<u8>> = Vec::new();
     // A REFUSED pass (disk floor, per-boot frame cap) returns no frames AND
     // touches nothing — including whatever an earlier boot left staged in
@@ -1021,23 +1021,27 @@ async fn async_main() -> Result<()> {
                 // A gap in front of a frame this lane does not fold still
                 // applies to the next live-feed frame (plan ITEM 47).
                 let mut gap_carry = false;
+                let mut segment_boundary = false;
                 for rec in recovered {
                     gap_carry |= rec.after_gap;
-                    // A jump in capture time is a gap too: nothing is dropped
-                    // where one process's frames meet the next one's.
+                    // A process boundary is a gap too: nothing is dropped where
+                    // one run's frames meet the next one's, so receipt times
+                    // are compared across each segment boundary.
+                    segment_boundary |= rec.first_in_segment;
                     if tickvault_storage::ws_frame_spill::frame_feeds_the_candle_fold(
                         rec.ws_type,
                         rec.endpoint,
                     ) {
-                        if let Some(prev) = ws_wal_replay_last_fold_seq
-                            && tickvault_storage::ws_frame_spill::capture_jump_is_gap(
+                        if std::mem::replace(&mut segment_boundary, false)
+                            && let Some(prev) = ws_wal_replay_last_fold_receipt
+                            && tickvault_storage::ws_frame_spill::process_boundary_is_gap(
                                 prev,
-                                rec.frame_seq,
+                                rec.received_at_nanos,
                             )
                         {
                             gap_carry = true;
                         }
-                        ws_wal_replay_last_fold_seq = Some(rec.frame_seq);
+                        ws_wal_replay_last_fold_receipt = Some(rec.received_at_nanos);
                     }
                     match rec.ws_type {
                         tickvault_storage::ws_frame_spill::WsType::LiveFeed => {
@@ -2732,7 +2736,7 @@ async fn async_main() -> Result<()> {
         ws_wal_replay_live_feed.clear();
         ws_wal_replay_gaps.clear();
         ws_wal_replay_trailing_gap = None;
-        ws_wal_replay_last_fold_seq = None;
+        ws_wal_replay_last_fold_receipt = None;
     }
     if dhan_lane_will_refold && !ws_wal_replay_live_feed.is_empty() {
         // DELIBERATELY NOT CONFIRMING HERE (2026-08-21).
@@ -3074,7 +3078,7 @@ async fn async_main() -> Result<()> {
             wal_replay_live_feed: std::mem::take(&mut ws_wal_replay_live_feed),
             wal_replay_gaps: std::mem::take(&mut ws_wal_replay_gaps),
             wal_replay_trailing_gap: ws_wal_replay_trailing_gap,
-            wal_replay_last_fold_seq: ws_wal_replay_last_fold_seq,
+            wal_replay_last_fold_receipt: ws_wal_replay_last_fold_receipt,
             // The master-sourced set: `live_subscription_from_master` was built
             // default-off and the operator turned it on on 2026-08-12
             // (`config/base.toml` ships `true`). A missing list for today takes
