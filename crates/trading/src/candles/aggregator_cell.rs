@@ -842,7 +842,8 @@ impl AggregatorCell {
 
     /// Re-bases the open buckets after a WAL-replay GAP (plan ITEM 47): the
     /// counter did not restart, the replay just skipped a span of it.
-    /// `fold_secs` is the fold second of the tick that follows the gap.
+    /// `fold_secs` is the fold second of the tick that follows the gap;
+    /// `last_counted_secs` that of the last tick whose cumulative counted.
     ///
     /// Per frame, three cases:
     /// - **The tick lands in the SAME open bucket.** The whole skipped span
@@ -862,12 +863,24 @@ impl AggregatorCell {
     ///
     /// # Complexity
     /// O(`TF_COUNT`).
-    pub fn rebase_open_buckets_after_gap(&mut self, cumulative_volume: u64, fold_secs: u32) {
+    pub fn rebase_open_buckets_after_gap(
+        &mut self,
+        cumulative_volume: u64,
+        fold_secs: u32,
+        last_counted_secs: u32,
+    ) {
         for tf in TfIndex::ALL {
             let ord = tf.as_ordinal();
             let state = &mut self.slots[ord];
             let open = !state.is_uninitialised();
-            if open && tf.bucket_start(fold_secs) == state.bucket_start_ist_secs {
+            // The span is inside this bucket only if the last tick whose
+            // cumulative counted was inside it too: a bucket opened after it
+            // (by a stale packet) chains to the pre-gap end, and would take
+            // the previous bucket's skipped tail (review round 4).
+            if open
+                && tf.bucket_start(fold_secs) == state.bucket_start_ist_secs
+                && state.bucket_start_ist_secs <= last_counted_secs
+            {
                 // The gross now includes trades whose direction nobody saw, so
                 // the net can no longer claim to cover them (review,
                 // 2026-09-29), exactly as an unclassified carry does.
@@ -2919,7 +2932,7 @@ mod tests {
         // The post-gap tick ROLLS M1 (it lands at 11:06:40): re-based,
         // counted volume kept, chain intact; unopened frames break it.
         let mut cell = open_m1();
-        cell.rebase_open_buckets_after_gap(100_000, 40_000);
+        cell.rebase_open_buckets_after_gap(100_000, 40_000, 33_310);
         for tf in TfIndex::ALL {
             let open = !cell.snapshot(tf).is_uninitialised();
             assert_eq!(
@@ -2944,7 +2957,7 @@ mod tests {
         // whole skipped span is in this bucket, so nothing moves and the
         // cumulative attributes it exactly.
         let mut cell = open_m1();
-        cell.rebase_open_buckets_after_gap(100_000, 33_330);
+        cell.rebase_open_buckets_after_gap(100_000, 33_330, 33_310);
         let m1 = cell.snapshot(TfIndex::M1);
         assert_eq!(m1.bucket_start_cumulative, 10, "same bucket: not re-based");
         assert!(
@@ -2956,6 +2969,17 @@ mod tests {
             cell.carried_upto[TfIndex::M1.as_ordinal()],
             3,
             "same bucket: carry kept"
+        );
+
+        // Same bucket, but the last COUNTED tick was before it opened (a
+        // stale packet opened it): the span began elsewhere, so it re-bases.
+        let mut cell = open_m1();
+        cell.rebase_open_buckets_after_gap(100_000, 33_330, 33_290);
+        let m1 = cell.snapshot(TfIndex::M1);
+        assert_eq!(
+            m1.bucket_start_cumulative,
+            100_000 - 7,
+            "opened after the last counted tick: re-based"
         );
     }
 

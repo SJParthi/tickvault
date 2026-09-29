@@ -1041,7 +1041,14 @@ async fn async_main() -> Result<()> {
                         {
                             gap_carry = true;
                         }
-                        ws_wal_replay_last_fold_receipt = Some(rec.received_at_nanos);
+                        // A record with no known receipt (legacy) does not reset
+                        // the comparison point.
+                        if tickvault_storage::ws_frame_spill::plausible_receipt_nanos(
+                            rec.received_at_nanos,
+                        ) != tickvault_storage::ws_frame_spill::WAL_RECEIPT_UNKNOWN_NANOS
+                        {
+                            ws_wal_replay_last_fold_receipt = Some(rec.received_at_nanos);
+                        }
                     }
                     match rec.ws_type {
                         tickvault_storage::ws_frame_spill::WsType::LiveFeed => {

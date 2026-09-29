@@ -3267,8 +3267,9 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
             // never see the gap it leaves (review, 2026-09-29).
             if path.parent() == Some(replaying_dir.as_path())
                 && let Some(name) = path.file_name()
+                && let Err(err) = std::fs::rename(path, wal_dir.join(name))
             {
-                drop(std::fs::rename(path, wal_dir.join(name)));
+                warn!(segment = ?path, error = %err, "could not return a skipped WAL segment to the live dir; the next pass may miss the gap it leaves");
             }
             continue;
         }
