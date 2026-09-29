@@ -1290,6 +1290,13 @@ impl AggregatorCell {
             // than losing the official open for the whole day; pinning it to a
             // session-time window would put trading-calendar knowledge inside
             // this cell, which is the wrong place for it.
+            //
+            // ⚠ CORRECTED 2026-09-29 (plan ITEM 47, review round 10): the
+            // residual above no longer holds. The check below requires the
+            // bucket that owns 09:15 (`is_days_first_session_bucket`), so a
+            // later bucket never takes the official open; a `day_open`
+            // withheld past that bucket is simply not stamped, and the roll
+            // path applies the same rule.
             let use_day_open = self.armed_for_day_open[ord]
                 && prices.day_open > 0.0
                 && is_days_first_session_bucket(tf, bucket_start);
@@ -1803,6 +1810,13 @@ fn widen_range_to_include(state: &mut LiveCandleState, price: f64) {
 /// trusting the old wording would conclude this function needs a pre-open
 /// carve-out it does not need. The 09:15 anchoring is also what makes the test
 /// reduce to `bucket_start == day_start + 33_300` for every timeframe.
+///
+/// **⚠ Corrected again 2026-09-29.** The paragraph above is stale since the
+/// 2026-08-28 grid move to 09:00 (recorded inside the body below): M30 and M60
+/// DO have a 09:00 bucket now, and M10's bucket holding 09:15 starts at 09:10.
+/// The function is still exact because it aligns 09:15 with
+/// [`TfIndex::bucket_start`] rather than comparing against 09:15 itself. The
+/// roll path in `consume_tick` applies the same rule (plan ITEM 47, round 9).
 ///
 /// # Complexity
 /// O(1) — one remainder, one bucket alignment, one compare.
@@ -2842,37 +2856,48 @@ mod tests {
     /// the two paths published different opening bars for the same ticks —
     /// and a WAL replay, which runs no sweep, rebuilt a different bar than
     /// live had stored.
+    ///
+    /// Widened in round 10: every timeframe (M10's 09:15 bucket starts at
+    /// 09:10 and M30/M60's at 09:00, so for them the pre-open ticks already
+    /// share the opening bar), the whole candle rather than three fields, and
+    /// an official open that arrives on the SECOND tick of the bar. Both ticks
+    /// share the 09:15:00 second so the snapshot is the opening bar on the
+    /// one-second frames too.
     #[test]
     fn test_regression_roll_and_empty_open_stamp_the_same_day_open() {
         let strategy = FeedStrategy::DEFAULT;
-        for tf in [TfIndex::M1, TfIndex::M5] {
-            let run = |sweep_first: bool| {
-                let mut cell = AggregatorCell::empty();
-                // Two pre-open trades (09:08) with no official open yet.
-                for (ts, cum) in [(OPEN - 420, 1_000_u32), (OPEN - 410, 1_010)] {
-                    let t = tick_at(ts, 100.0, cum);
-                    cell.consume_tick(tf, &t, cum.into(), strategy, cum.into());
-                }
-                if sweep_first {
-                    assert!(
-                        cell.catch_up_seal(tf, OPEN).is_some(),
-                        "the sweep seals 09:08"
-                    );
-                }
-                let mut first = tick_at(OPEN + 5, 102.0, 1_020);
-                first.day_open = 101.0;
-                cell.consume_tick(tf, &first, 1_020, strategy, 1_020);
-                cell.snapshot(tf)
-            };
-            let swept = run(true);
-            let rolled = run(false);
-            assert_eq!(swept.open.to_bits(), rolled.open.to_bits(), "{tf:?} open");
-            assert_eq!(swept.low.to_bits(), rolled.low.to_bits(), "{tf:?} low");
-            assert_eq!(swept.high.to_bits(), rolled.high.to_bits(), "{tf:?} high");
-            assert!(
-                (rolled.open - 101.0).abs() < 1e-9,
-                "{tf:?}: the bar that owns 09:15 opens at the official day open"
-            );
+        for late_open in [false, true] {
+            for tf in TfIndex::ALL {
+                let run = |sweep_first: bool| {
+                    let mut cell = AggregatorCell::empty();
+                    // Two pre-open trades (09:08) with no official open yet.
+                    for (ts, cum) in [(OPEN - 420, 1_000_u32), (OPEN - 410, 1_010)] {
+                        let t = tick_at(ts, 100.0, cum);
+                        cell.consume_tick(tf, &t, cum.into(), strategy, cum.into());
+                    }
+                    if sweep_first {
+                        // Seals the pre-open bar where it has already ended
+                        // (M30/M60 keep it open: it is the opening bar).
+                        let _ = cell.catch_up_seal(tf, OPEN);
+                    }
+                    let mut first = tick_at(OPEN, 102.0, 1_020);
+                    first.day_open = if late_open { 0.0 } else { 101.0 };
+                    cell.consume_tick(tf, &first, 1_020, strategy, 1_020);
+                    let mut second = tick_at(OPEN, 103.0, 1_030);
+                    second.day_open = 101.0;
+                    cell.consume_tick(tf, &second, 1_030, strategy, 1_030);
+                    cell.snapshot(tf)
+                };
+                let swept = run(true);
+                let rolled = run(false);
+                assert_eq!(swept, rolled, "{tf:?} late_open={late_open}");
+                assert!(
+                    (rolled.open - 101.0).abs() < 1e-9,
+                    "{tf:?} late_open={late_open}: the bar that owns 09:15 opens at \
+                     the official day open, got {}",
+                    rolled.open
+                );
+            }
         }
     }
 
