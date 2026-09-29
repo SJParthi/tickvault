@@ -4228,6 +4228,16 @@ mod tests {
         );
     }
 
+    /// The default margin is the app's measured catch-up margin, and the
+    /// setter replaces it.
+    #[test]
+    fn test_set_catch_up_margin_secs_replaces_the_default() {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        assert_eq!(agg.catch_up_margin_secs, DEFAULT_CATCH_UP_MARGIN_SECS);
+        agg.set_catch_up_margin_secs(600);
+        assert_eq!(agg.catch_up_margin_secs, 600);
+    }
+
     /// Review round 7 (hostile review, LOW): a counter restart that is the
     /// first tick after a gap resolves the gap without `gap_now` (it is also
     /// stale), and must still set the gap frontier.
