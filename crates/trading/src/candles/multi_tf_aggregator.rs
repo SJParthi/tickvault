@@ -242,6 +242,14 @@ struct InstrumentSlot {
     /// time (plus a small clock-skew margin) bounds them. While set, every
     /// open bucket starting at or before it is marked partial.
     replay_gap_frontier: u32,
+    /// One bit per timeframe: the NEXT bucket this slot opens is partial
+    /// (review round 7). Set when a replayed tick lands in an open bucket the
+    /// live process may already have closed by its periodic catch-up seal:
+    /// live then carried that tick's volume into the next bucket, the replay
+    /// folds it into the open one, so neither bar can be rebuilt as live
+    /// stored it. Consumed when the bucket rolls; after the hand-over it
+    /// taints the new bucket instead, since live mode ignores partial bits.
+    replay_next_partial: u16,
 }
 
 /// Every timeframe's bit in [`InstrumentSlot::replay_open_partial`].
@@ -507,6 +515,11 @@ pub struct MultiTfAggregator {
     /// (review, 2026-09-29). Such a bar is suppressed and counted in every
     /// mode.
     live_capture_from_secs: u32,
+    /// How far behind the watermark the live catch-up seal closes a quiet
+    /// bucket (the app's `CATCHUP_LATENESS_MARGIN_SECS`). A replay uses it
+    /// to recognise a tick that live may have seen only AFTER that seal
+    /// (review round 7). Defaults to [`DEFAULT_CATCH_UP_MARGIN_SECS`].
+    catch_up_margin_secs: u32,
     /// Test-only slot-ceiling override so the fail-closed exhaustion path can
     /// be exercised without allocating 25,000 cells (~135 MB).
     #[cfg(test)]
@@ -669,6 +682,7 @@ impl MultiTfAggregator {
             replay_gap_epoch: 0,
             replay_suppressed_total: 0,
             live_capture_from_secs: 0,
+            catch_up_margin_secs: DEFAULT_CATCH_UP_MARGIN_SECS,
             #[cfg(test)]
             test_capacity_override: None,
         }
@@ -1008,6 +1022,7 @@ impl MultiTfAggregator {
             replay_settling: true,
             replay_held: 0,
             replay_gap_frontier: 0,
+            replay_next_partial: 0,
         });
         self.index
             .insert(key, u32::try_from(idx).unwrap_or(u32::MAX));
@@ -1502,6 +1517,20 @@ impl MultiTfAggregator {
         let replay_mode = self.replay_mode;
         let gap_epoch = self.replay_gap_epoch;
         let live_from = self.live_capture_from_secs;
+        // LATE-TICK BOUND (plan ITEM 47, review round 7): during a replay, the
+        // latest instant the live process could have reached when it saw this
+        // tick — its watermark then, which never exceeds this tick's receipt,
+        // and was at least the replay's own watermark. An open bucket that
+        // ended `catch_up_margin_secs` before it may already have been closed
+        // live by the periodic catch-up seal. 0 outside a replay.
+        let late_bound = if replay_mode {
+            receipt_ist_secs(tick.received_at_nanos)
+                .unwrap_or(0)
+                .max(self.watermark_secs)
+        } else {
+            0
+        };
+        let catch_up_margin = self.catch_up_margin_secs;
         let Some(slot) = self.slots.get_mut(idx) else {
             // Unreachable: slot_index either returned an existing index or
             // just pushed one. Fail closed rather than index-panic.
@@ -1723,6 +1752,13 @@ impl MultiTfAggregator {
         let next_bucket_partial = seeded_now || slot.replay_gap_rebase_pending;
         if restarted && slot.replay_gap_rebase_pending {
             slot.replay_settling = true;
+            // A counter restart resolves the gap instead of `gap_now` (it is
+            // also stale), so it sets the frontier too (review round 7).
+            if replay_mode {
+                slot.replay_gap_frontier = slot
+                    .replay_gap_frontier
+                    .max(replay_gap_frontier_secs(tick.received_at_nanos, fold_secs));
+            }
         }
         if restarted {
             slot.replay_gap_rebase_pending = false;
@@ -1737,6 +1773,30 @@ impl MultiTfAggregator {
         }
 
         for tf in TfIndex::ALL {
+            // A tick that lands in an open bucket live may already have
+            // closed by catch-up: live amended the closed bar and carried the
+            // volume into the next one, the replay folds it into the open
+            // one. Neither bar can be rebuilt as stored, so both are partial
+            // (and the last sealed bar too, for a tick older than the open
+            // bucket, which live could not have amended). Replay only; one
+            // compare per timeframe (review round 7).
+            if late_bound != 0 {
+                let open_start = slot.cell.open_bucket_start(tf);
+                if open_start != 0
+                    && open_start
+                        .saturating_add(tf.seconds_per_bucket())
+                        .saturating_add(catch_up_margin)
+                        <= late_bound
+                    && !slot.cell.would_seal(tf, fold_secs)
+                {
+                    let bit = replay_tf_bit(tf);
+                    slot.replay_open_partial |= bit;
+                    slot.replay_next_partial |= bit;
+                    if fold_secs < open_start {
+                        slot.replay_sealed_partial |= bit;
+                    }
+                }
+            }
             // A held bar becomes final the moment this tick seals the bar
             // after it: release it now, before the seal replaces it.
             if slot.replay_held & replay_tf_bit(tf) != 0 && slot.cell.would_seal(tf, fold_secs) {
@@ -1870,8 +1930,9 @@ impl MultiTfAggregator {
         // is stale, never news. It is counted so the correction is visible.
         // GAP FRONTIER (plan ITEM 47, review round 6): a bucket that starts at
         // or before it may still be missing a skipped tick. O(TF_COUNT), and
-        // only while a frontier is set during a replay.
-        if slot.replay_gap_frontier != 0 {
+        // only while a frontier is set during a replay: live mode never pays
+        // it, and `finish_replay` clears every frontier at the hand-over.
+        if replay_mode && slot.replay_gap_frontier != 0 {
             let frontier = slot.replay_gap_frontier;
             for tf in TfIndex::ALL {
                 let start = slot.cell.open_bucket_start(tf);
@@ -2013,6 +2074,9 @@ impl MultiTfAggregator {
             // UNSEEDED, not to a fabricated `0` baseline.
             slot.last_cumulative = 0;
             slot.volume_baseline_seeded = false;
+            // Nothing carries across the day boundary, so neither does a
+            // late tick's mark on the next bucket (review round 7).
+            slot.replay_next_partial = 0;
             // The tick-rule carry resets with the baseline, and for the same
             // reason: a direction learned from yesterday's last print is not
             // evidence about today's first. Carrying it across would attribute
@@ -2276,6 +2340,12 @@ impl MultiTfAggregator {
     /// can differ too; the randomized property
     /// `test_replay_with_stale_packets_overcounts_at_most_the_largest_regression`
     /// bounds the volume half.
+    /// Third limit (review round 7): bars are HELD in memory until this
+    /// runs, while each catch-up round archives its segments as it goes. A
+    /// process that dies between a round's archive and this hand-over loses
+    /// the bars still held then (at most the last sealed bar per timeframe
+    /// per instrument); the next boot does not re-read archived segments, so
+    /// whatever the previous process stored for those buckets stands.
     ///
     /// # Complexity
     /// O(slots × `TF_COUNT`), once per lane start. A no-op when no replay ran.
@@ -2337,6 +2407,10 @@ impl MultiTfAggregator {
             slot.replay_gap_epoch_seen = hand_over_epoch;
             slot.last_tick_sign = 0;
             slot.replay_gap_rebase_pending = true;
+            // The frontier only guards buckets a replay could not see in
+            // full; each one still open was marked above, so live mode
+            // carries none (review round 7).
+            slot.replay_gap_frontier = 0;
             slot.replay_open_partial =
                 (REPLAY_ALL_TF_MASK & !open_mask) | (slot.replay_open_partial & open_mask);
         }
@@ -2367,6 +2441,29 @@ impl MultiTfAggregator {
     pub fn set_live_capture_start(&mut self, ist_fold_secs: u32) {
         self.live_capture_from_secs = ist_fold_secs;
     }
+
+    /// Sets how far behind the watermark the live catch-up seal closes a
+    /// quiet bucket; the app passes the margin its catch-up uses, so a
+    /// replay judges late ticks by the same rule (review round 7). O(1).
+    pub fn set_catch_up_margin_secs(&mut self, secs: u32) {
+        self.catch_up_margin_secs = secs;
+    }
+}
+
+/// Fallback for [`MultiTfAggregator::set_catch_up_margin_secs`]: the app's
+/// catch-up margin on 2026-09-29 (a measured 199 s delivery lag, rounded up
+/// to whole minutes). A SMALLER margin makes a replay more cautious, never
+/// less, so a stale default errs toward suppressing bars.
+pub const DEFAULT_CATCH_UP_MARGIN_SECS: u32 = 240;
+
+/// The receipt time of a tick in IST fold seconds, or `None` when the tick
+/// carries no plausible receipt (legacy WAL records). O(1).
+fn receipt_ist_secs(received_at_nanos: i64) -> Option<u32> {
+    received_at_nanos
+        .checked_div(1_000_000_000)
+        .and_then(|secs| secs.checked_add(crate::candles::tf_index::IST_UTC_OFFSET_SECS))
+        .and_then(|secs| u32::try_from(secs).ok())
+        .filter(|_| received_at_nanos > 0)
 }
 
 impl InstrumentSlot {
@@ -2435,8 +2532,17 @@ impl InstrumentSlot {
         let was_tainted = self.replay_taint_open & bit != 0;
         set_bit(&mut self.replay_sealed_partial, bit, was_partial);
         set_bit(&mut self.replay_taint_sealed, bit, was_tainted);
-        set_bit(&mut self.replay_open_partial, bit, next_open_partial);
-        self.replay_taint_open &= !bit;
+        // A late tick marked the bucket after this one (review round 7).
+        let forced = self.replay_next_partial & bit != 0;
+        self.replay_next_partial &= !bit;
+        set_bit(
+            &mut self.replay_open_partial,
+            bit,
+            next_open_partial || forced,
+        );
+        // Live mode ignores partial bits, so after the hand-over the mark
+        // taints the new bucket instead.
+        set_bit(&mut self.replay_taint_open, bit, forced && !replay_mode);
         (replay_mode && was_partial) || was_tainted || (was_partial && ended_before_capture)
     }
 
@@ -2482,12 +2588,7 @@ const REPLAY_FRONTIER_SKEW_SECS: u32 = 5;
 /// plausible receipt (legacy WAL records) falls back to its own trade time.
 /// O(1).
 fn replay_gap_frontier_secs(received_at_nanos: i64, fold_secs: u32) -> u32 {
-    let receipt_secs = received_at_nanos
-        .checked_div(1_000_000_000)
-        .and_then(|secs| secs.checked_add(crate::candles::tf_index::IST_UTC_OFFSET_SECS))
-        .and_then(|secs| u32::try_from(secs).ok())
-        .filter(|_| received_at_nanos > 0);
-    receipt_secs
+    receipt_ist_secs(received_at_nanos)
         .unwrap_or(fold_secs)
         .max(fold_secs)
         .saturating_add(REPLAY_FRONTIER_SKEW_SECS)
@@ -2556,6 +2657,13 @@ fn count_replay_partial_suppressed() {
         .refold_partial_suppressed
         .increment(1);
 }
+
+/// A seal sink that ignores every bar, for tests that only drive the fold.
+/// One shared function rather than a closure per call site: an inline
+/// `|_, _, _, _, _| {}` that a test never reaches counted as an uncovered
+/// line each time it was written (review round 7).
+#[cfg(test)]
+fn ignore_seal(_: Feed, _: u64, _: u8, _: TfIndex, _: LiveCandleState) {}
 
 #[cfg(test)]
 impl MultiTfAggregator {
@@ -2670,7 +2778,7 @@ mod tests {
         let mut fold = |agg: &mut MultiTfAggregator,
                         out: &mut Vec<(TfIndex, u32, i64)>,
                         ts: u32,
-                        px: f32,
+                        _px: f32,
                         cum: u32| {
             let t = gtick(ts, cum);
             let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, tf, st| {
@@ -2768,11 +2876,11 @@ mod tests {
     fn test_mark_replay_gap_reaches_a_slot_through_the_seal_sweep() {
         let seal_after = |gap: bool| {
             let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
-            agg.consume_tick(Feed::Dhan, &gtick(OPEN, 1_000), None, |_, _, _, _, _| {});
+            agg.consume_tick(Feed::Dhan, &gtick(OPEN, 1_000), None, ignore_seal);
             // The first volume increase settles the new slot; the second
             // second's bucket after it is complete.
             for (ts, cum) in [(OPEN + 1, 1_005), (OPEN + 2, 1_010)] {
-                agg.consume_tick(Feed::Dhan, &gtick(ts, cum), None, |_, _, _, _, _| {});
+                agg.consume_tick(Feed::Dhan, &gtick(ts, cum), None, ignore_seal);
             }
             agg.set_replay_mode(true);
             if gap {
@@ -2780,7 +2888,7 @@ mod tests {
             }
             // The sweep seals; a replay holds what it seals until the
             // hand-over releases it.
-            let mut emitted = agg.catch_up_seal_all(OPEN + 100_000, |_, _, _, _, _| {});
+            let mut emitted = agg.catch_up_seal_all(OPEN + 100_000, ignore_seal);
             agg.finish_replay(false, |_, _, _, _, _| emitted += 1);
             emitted
         };
@@ -2846,10 +2954,10 @@ mod tests {
             agg.set_replay_mode(true);
             agg.mark_replay_gap();
             for (ts, cum) in [(OPEN + 62, 1_000), (OPEN + 70, 1_050)] {
-                agg.consume_tick(Feed::Dhan, &gtick(ts, cum), None, |_, _, _, _, _| {});
+                agg.consume_tick(Feed::Dhan, &gtick(ts, cum), None, ignore_seal);
             }
             if finish {
-                agg.finish_replay(false, |_, _, _, _, _| {});
+                agg.finish_replay(false, ignore_seal);
             } else {
                 agg.set_replay_mode(false);
             }
@@ -2882,12 +2990,12 @@ mod tests {
             (OPEN + 60, 1_010),
             (OPEN + 70, 1_050),
         ] {
-            agg.consume_tick(Feed::Dhan, &gtick(ts, cum), None, |_, _, _, _, _| {});
+            agg.consume_tick(Feed::Dhan, &gtick(ts, cum), None, ignore_seal);
         }
         // As in production: the lane records when it began listening, here
         // after the complete minute ended (a crash-restart; review round 4).
         agg.set_live_capture_start(OPEN + 3_000);
-        agg.finish_replay(false, |_, _, _, _, _| {});
+        agg.finish_replay(false, ignore_seal);
         let mut sealed: Vec<(TfIndex, u32, i64)> = Vec::new();
         agg.catch_up_seal_all(OPEN + 100_000, |_, _, _, tf, st| {
             sealed.push((tf, st.bucket_start_ist_secs, st.signed_volume()));
@@ -2902,18 +3010,8 @@ mod tests {
         // After the hand-over, a live bucket opened after the capture start is
         // live data: emitted.
         let mut out = 0_usize;
-        agg.consume_tick(
-            Feed::Dhan,
-            &gtick(OPEN + 3_600, 2_000),
-            None,
-            |_, _, _, _, _| {},
-        );
-        agg.consume_tick(
-            Feed::Dhan,
-            &gtick(OPEN + 3_610, 2_010),
-            None,
-            |_, _, _, _, _| {},
-        );
+        agg.consume_tick(Feed::Dhan, &gtick(OPEN + 3_600, 2_000), None, ignore_seal);
+        agg.consume_tick(Feed::Dhan, &gtick(OPEN + 3_610, 2_010), None, ignore_seal);
         agg.consume_tick(
             Feed::Dhan,
             &gtick(OPEN + 3_671, 2_020),
@@ -2936,35 +3034,42 @@ mod tests {
             let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
             agg.set_replay_mode(true);
             let t0 = OPEN + 60;
-            // Seed, then a complete minute at t0 + 60 sealed by t0 + 120.
+            // Seed; the t0 + 60 minute is partial (the post-seed settling
+            // marks it); the t0 + 120 minute is complete and sealed, so HELD,
+            // by t0 + 180.
             for (ts, cum) in [
                 (t0 + 5, 1_000),
                 (t0 + 60, 1_010),
                 (t0 + 70, 1_050),
                 (t0 + 120, 1_100),
+                (t0 + 130, 1_110),
+                (t0 + 180, 1_150),
             ] {
-                agg.consume_tick(Feed::Dhan, &gtick(ts, cum), None, |_, _, _, _, _| {});
+                agg.consume_tick(Feed::Dhan, &gtick(ts, cum), None, ignore_seal);
             }
             if gap {
                 agg.mark_replay_gap();
             }
-            let mut amended_m1 = 0_u32;
-            // A late tick for the sealed t0 + 60 minute.
-            let late = gtick(t0 + 110, 1_120);
-            let stats = agg.consume_tick(Feed::Dhan, &late, None, |_, _, _, tf, st| {
-                if tf == TfIndex::M1 && st.bucket_start_ist_secs == t0 + 60 {
-                    amended_m1 += 1;
+            // A late tick for the sealed t0 + 120 minute. The held bar is
+            // released at the hand-over, so that is where it is counted
+            // (review round 7: counting only this tick's callback read 0 in
+            // both arms once replay began holding sealed bars).
+            let late = gtick(t0 + 170, 1_160);
+            agg.consume_tick(Feed::Dhan, &late, None, ignore_seal);
+            let mut emitted_m1 = 0_u32;
+            agg.finish_replay(false, |_, _, _, tf, st| {
+                if tf == TfIndex::M1 && st.bucket_start_ist_secs == t0 + 120 {
+                    emitted_m1 += 1;
                 }
             });
-            (amended_m1, stats.amended_count)
+            (emitted_m1, ())
         };
-        let (without_gap, amended) = run(false);
-        assert!(
-            without_gap == 1 || amended == 0,
-            "control: with no gap a late tick amends the complete bar, when the \
-             late policy amends at all"
+        let (without_gap, ()) = run(false);
+        assert_eq!(
+            without_gap, 1,
+            "control: with no gap the complete, amended bar is written once"
         );
-        let (after_gap, _) = run(true);
+        let (after_gap, ()) = run(true);
         assert_eq!(
             after_gap, 0,
             "after a gap the sealed bar is partial: not re-emitted"
@@ -2987,9 +3092,9 @@ mod tests {
             (t0 + 5, 50_000),
             (t0 + 20, 50_300),
         ] {
-            agg.consume_tick(Feed::Dhan, &gtick(ts, cum), None, |_, _, _, _, _| {});
+            agg.consume_tick(Feed::Dhan, &gtick(ts, cum), None, ignore_seal);
         }
-        agg.finish_replay(false, |_, _, _, _, _| {});
+        agg.finish_replay(false, ignore_seal);
         let mut m1: Vec<(u32, i64)> = Vec::new();
         for (ts, cum) in [(t0 + 40, 51_000), (t0 + 50, 51_100), (t0 + 61, 51_200)] {
             agg.consume_tick(Feed::Dhan, &gtick(ts, cum), None, |_, _, _, tf, st| {
@@ -3020,9 +3125,9 @@ mod tests {
                 (OPEN + 60, 1_010),
                 (OPEN + 70, 1_050),
             ] {
-                agg.consume_tick(Feed::Dhan, &gtick(ts, cum), None, |_, _, _, _, _| {});
+                agg.consume_tick(Feed::Dhan, &gtick(ts, cum), None, ignore_seal);
             }
-            let (tainted, _) = agg.finish_replay(ended_on_gap, |_, _, _, _, _| {});
+            let (tainted, _) = agg.finish_replay(ended_on_gap, ignore_seal);
             let mut m1 = 0_usize;
             agg.catch_up_seal_all(OPEN + 100_000, |_, _, _, tf, st| {
                 if tf == TfIndex::M1 && st.bucket_start_ist_secs == OPEN + 60 {
@@ -3054,17 +3159,12 @@ mod tests {
         agg.set_replay_mode(true);
         // A slot first seen in the replay: its first minute is partial.
         for (ts, cum) in [(OPEN + 62, 1_000), (OPEN + 70, 1_050)] {
-            agg.consume_tick(Feed::Dhan, &gtick(ts, cum), None, |_, _, _, _, _| {});
+            agg.consume_tick(Feed::Dhan, &gtick(ts, cum), None, ignore_seal);
         }
         // The catch-up seal closes that minute (suppressed); nothing is open.
-        agg.catch_up_seal_all(OPEN + 200, |_, _, _, _, _| {});
+        agg.catch_up_seal_all(OPEN + 200, ignore_seal);
         // A late tick for that minute leaves a carry behind.
-        agg.consume_tick(
-            Feed::Dhan,
-            &gtick(OPEN + 100, 1_080),
-            None,
-            |_, _, _, _, _| {},
-        );
+        agg.consume_tick(Feed::Dhan, &gtick(OPEN + 100, 1_080), None, ignore_seal);
         let mut reemitted = 0_usize;
         agg.force_seal_all(|_, _, _, tf, st| {
             if tf == TfIndex::M1 && st.bucket_start_ist_secs == OPEN + 60 {
@@ -3228,29 +3328,38 @@ mod tests {
             let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
             agg.set_replay_mode(true);
             let t0 = OPEN + 60;
+            // The t0 + 120 minute is complete (the t0 + 60 one is partial:
+            // the post-seed settling marks it) and the last sealed bar.
             for (ts, cum) in [
                 (t0 + 5, 1_000),
                 (t0 + 60, 1_010),
                 (t0 + 70, 1_050),
                 (t0 + 120, 1_100),
+                (t0 + 130, 1_110),
+                (t0 + 180, 1_150),
             ] {
-                agg.consume_tick(Feed::Dhan, &gtick(ts, cum), None, |_, _, _, _, _| {});
+                agg.consume_tick(Feed::Dhan, &gtick(ts, cum), None, ignore_seal);
             }
-            agg.finish_replay(ended_on_gap, |_, _, _, _, _| {});
+            agg.finish_replay(ended_on_gap, ignore_seal);
             let mut count = 0_u32;
-            // A live late tick for the sealed t0 + 60 minute.
+            // A live late tick for the sealed t0 + 120 minute.
             agg.consume_tick(
                 Feed::Dhan,
-                &gtick(t0 + 110, 1_120),
+                &gtick(t0 + 170, 1_160),
                 None,
                 |_, _, _, tf, st| {
-                    if tf == TfIndex::M1 && st.bucket_start_ist_secs == t0 + 60 {
+                    if tf == TfIndex::M1 && st.bucket_start_ist_secs == t0 + 120 {
                         count += 1;
                     }
                 },
             );
             count
         };
+        assert_eq!(
+            reemitted(false),
+            1,
+            "control (review round 7): a clean replay leaves the bar amendable"
+        );
         assert_eq!(
             reemitted(true),
             0,
@@ -3282,6 +3391,20 @@ mod tests {
         feed(&mut agg, t0 + 62, 999); // stale, but it rolls the t0 minute
         feed(&mut agg, t0 + 65, 1_600); // the first counted tick after the gap
         feed(&mut agg, t0 + 125, 1_700); // rolls the t0 + 60 minute
+        feed(&mut agg, t0 + 185, 1_750); // the t0 + 180 minute is complete
+        feed(&mut agg, t0 + 245, 1_800);
+        // Sealed bars are HELD during a replay; the hand-over releases them
+        // (review round 7: without this the list stayed empty and both
+        // assertions below passed vacuously).
+        agg.finish_replay(false, |_, _, _, tf, st| {
+            if tf == TfIndex::M1 {
+                m1.push((st.bucket_start_ist_secs, st.volume));
+            }
+        });
+        assert!(
+            m1.iter().any(|(start, _)| *start == t0 + 180),
+            "control: the complete minute after settling is written: {m1:?}"
+        );
         assert!(
             !m1.iter().any(|(start, _)| *start == t0 + 60),
             "the minute the stale packet opened is partial and not written: {m1:?}"
@@ -3547,6 +3670,40 @@ mod tests {
                 // except the bars the pass-start gap makes partial.
                 if steps.iter().all(|s| !s.dropped) {
                     prop_assert!(replay.len() <= live.len());
+                    // NON-VACUITY (review round 7): a replay that held back
+                    // every bar would pass the checks above. Past the first
+                    // tick that adds volume with a known direction, which
+                    // ends the pass-start settling, and past the pass-start
+                    // gap frontier (the first tick plus the clock-skew
+                    // margin), every live bar must be rebuilt too.
+                    let (mut ts, mut px) = (OPEN + 60, 1_000.0_f32);
+                    let (mut moved, mut settled_at) = (false, None);
+                    for (i, s) in steps.iter().enumerate() {
+                        ts += s.dt;
+                        let prev = px;
+                        px = (px + f32::from(s.dpx) * 0.05).max(1.0);
+                        if i == 0 {
+                            continue; // the seeding tick
+                        }
+                        moved |= px.to_bits() != prev.to_bits();
+                        if moved && s.dcum > 0 {
+                            settled_at = Some(ts);
+                            break;
+                        }
+                    }
+                    let first_ts = OPEN + 60 + steps.first().map_or(0, |s| s.dt);
+                    let frontier = first_ts + REPLAY_FRONTIER_SKEW_SECS;
+                    if let Some(end) = settled_at.map(|at: u32| at.max(frontier)) {
+                        for (tf, start) in live.keys() {
+                            prop_assert!(
+                                *start <= end || replay.contains_key(&(*tf, *start)),
+                                "{:?} {}: complete after settling ({}), yet not rebuilt",
+                                tf,
+                                start,
+                                end
+                            );
+                        }
+                    }
                 }
             }
 
@@ -3647,6 +3804,308 @@ mod tests {
         );
     }
 
+    /// Review round 7 (2026-09-29): with no replay, `finish_replay` touches
+    /// nothing and releases nothing.
+    #[test]
+    fn test_finish_replay_without_a_replay_is_a_no_op() {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        for (ts, cum) in [(OPEN + 5, 1_000), (OPEN + 65, 1_050)] {
+            agg.consume_tick(Feed::Dhan, &gtick(ts, cum), None, ignore_seal);
+        }
+        let out = agg.finish_replay(true, |_, _, _, _, _| {
+            panic!("no replay ran, so nothing is held and nothing is released")
+        });
+        assert_eq!(out, (0, 0));
+    }
+
+    /// Folds a complete minute at `OPEN + 180` in replay mode and seals it,
+    /// so it is HELD (the minute before it is partial: the post-seed
+    /// settling marks it). Returns the aggregator; `gap` marks a gap
+    /// afterwards, which makes the held bar partial (skipped frames may have
+    /// amended it).
+    fn held_complete_minute(gap: bool) -> MultiTfAggregator {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        agg.set_replay_mode(true);
+        for (ts, cum) in [
+            (OPEN + 65, 1_000),
+            (OPEN + 120, 1_010),
+            (OPEN + 130, 1_050),
+            (OPEN + 180, 1_100),
+            (OPEN + 190, 1_150),
+            (OPEN + 240, 1_200),
+        ] {
+            // Shorter frames release their held bars as the next one seals;
+            // the M1 bar at `OPEN + 180` stays held until a sweep.
+            agg.consume_tick(Feed::Dhan, &gtick(ts, cum), None, |_, _, _, tf, st| {
+                assert!(
+                    !(tf == TfIndex::M1 && st.bucket_start_ist_secs == OPEN + 180),
+                    "the M1 bar is held, not emitted, by the tick that seals it"
+                );
+            });
+        }
+        if gap {
+            agg.mark_replay_gap();
+        }
+        agg
+    }
+
+    /// Counts the M1 bars for `OPEN + 180` a sweep hands to its callback.
+    fn m1_at_180(count: &mut u32) -> impl FnMut(Feed, u64, u8, TfIndex, LiveCandleState) + '_ {
+        move |_, _, _, tf, st| {
+            if tf == TfIndex::M1 && st.bucket_start_ist_secs == OPEN + 180 {
+                *count += 1;
+            }
+        }
+    }
+
+    /// Review round 7: the close seal releases a held complete bar (emitted
+    /// once) and counts a held bar a gap made partial (never emitted).
+    #[test]
+    fn test_force_seal_all_releases_a_held_bar() {
+        let mut complete = 0_u32;
+        let mut agg = held_complete_minute(false);
+        agg.force_seal_all(m1_at_180(&mut complete));
+        assert_eq!(complete, 1, "the held complete minute is emitted once");
+        let (_, suppressed_clean) = agg.finish_replay(false, ignore_seal);
+
+        let mut partial = 0_u32;
+        let mut agg = held_complete_minute(true);
+        agg.force_seal_all(m1_at_180(&mut partial));
+        assert_eq!(partial, 0, "after a gap the held minute is partial");
+        let (_, suppressed_gap) = agg.finish_replay(false, ignore_seal);
+        assert!(
+            suppressed_gap > suppressed_clean,
+            "and it is counted: {suppressed_gap} vs {suppressed_clean}"
+        );
+    }
+
+    /// Review round 7: a catch-up sweep that would seal the bucket after a
+    /// held bar releases the held bar first, emitted if complete and counted
+    /// if a gap marked it; the bar it seals is then held in its turn.
+    #[test]
+    fn test_catch_up_seal_releases_a_held_bar_before_sealing_the_next() {
+        let mut complete = 0_u32;
+        let mut agg = held_complete_minute(false);
+        agg.catch_up_seal_all(OPEN + 400, m1_at_180(&mut complete));
+        assert_eq!(complete, 1, "the held complete minute is emitted once");
+        let mut next = 0_u32;
+        agg.finish_replay(false, |_, _, _, tf, st| {
+            if tf == TfIndex::M1 && st.bucket_start_ist_secs == OPEN + 240 {
+                next += 1;
+            }
+        });
+        assert_eq!(
+            next, 1,
+            "the minute the sweep sealed was held until the hand-over"
+        );
+
+        let mut partial = 0_u32;
+        let mut agg = held_complete_minute(true);
+        agg.catch_up_seal_all(OPEN + 400, m1_at_180(&mut partial));
+        assert_eq!(partial, 0, "after a gap the held minute is partial");
+    }
+
+    /// Review round 7 (hostile review, HIGH): live closes a quiet bucket by
+    /// its periodic catch-up seal once the watermark is the catch-up margin
+    /// past its end; a tick for that bucket arriving later amends the closed
+    /// bar and carries its volume into the NEXT bucket. A replay runs no such
+    /// sweep, so it folds the same tick into the still-open bucket. Both bars
+    /// then differ from what live stored, and must not be written.
+    /// `mode`: 0 = no late tick evidence (control), 1 = another instrument
+    /// pushed the watermark, 2 = the late tick's own receipt shows it.
+    fn late_tick_minutes(mode: u8) -> Vec<u32> {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        agg.set_replay_mode(true);
+        let t0 = OPEN + 600;
+        let mut m1: Vec<u32> = Vec::new();
+        let feed = |agg: &mut MultiTfAggregator, t: ParsedTick, m1: &mut Vec<u32>| {
+            agg.consume_tick(Feed::Dhan, &t, None, |_, sid, _, tf, st| {
+                if sid == GAP_SID && tf == TfIndex::M1 {
+                    m1.push(st.bucket_start_ist_secs);
+                }
+            });
+        };
+        for (ts, cum) in [
+            (t0 + 5, 1_000),
+            (t0 + 10, 1_010),
+            (t0 + 65, 1_020),
+            (t0 + 70, 1_030),
+        ] {
+            feed(&mut agg, gtick(ts, cum), &mut m1);
+        }
+        if mode == 1 {
+            // t0 + 60 ends at t0 + 120; 240 s later live may have closed it.
+            feed(
+                &mut agg,
+                tick(GAP_SID + 1, SEG_EQ, t0 + 420, 500.0, 5_000),
+                &mut m1,
+            );
+        }
+        let mut late = gtick(t0 + 80, 1_100);
+        if mode == 2 {
+            late.received_at_nanos = (i64::from(t0 + 420) - 19_800) * 1_000_000_000;
+        }
+        feed(&mut agg, late, &mut m1);
+        for (ts, cum) in [(t0 + 130, 1_150), (t0 + 190, 1_200), (t0 + 250, 1_250)] {
+            feed(&mut agg, gtick(ts, cum), &mut m1);
+        }
+        agg.finish_replay(false, |_, sid, _, tf, st| {
+            if sid == GAP_SID && tf == TfIndex::M1 {
+                m1.push(st.bucket_start_ist_secs);
+            }
+        });
+        m1
+    }
+
+    #[test]
+    fn test_regression_late_tick_after_a_live_catch_up_leaves_both_minutes_partial() {
+        let t0 = OPEN + 600;
+        let control = late_tick_minutes(0);
+        assert!(
+            control.contains(&(t0 + 60)) && control.contains(&(t0 + 120)),
+            "control: with no sign that live closed the minute, both are written: {control:?}"
+        );
+        for mode in [1, 2] {
+            let fixed = late_tick_minutes(mode);
+            assert!(
+                !fixed.contains(&(t0 + 60)) && !fixed.contains(&(t0 + 120)),
+                "mode {mode}: the minute the late tick landed in and the next are \
+                 partial: {fixed:?}"
+            );
+            assert!(
+                fixed.contains(&(t0 + 180)),
+                "mode {mode}: the minute after them is complete again: {fixed:?}"
+            );
+        }
+    }
+
+    /// Review round 7: a tick OLDER than the open bucket, arriving once live
+    /// may have closed that bucket by catch-up, amends the LAST SEALED bar
+    /// in the replay, which live could not have done. The sealed bar, the
+    /// open one and the one after it are all partial; a margin too large to
+    /// reach (`set_catch_up_margin_secs`) turns the rule off.
+    fn older_late_tick_minutes(push_watermark: bool, margin: Option<u32>) -> Vec<u32> {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        if let Some(secs) = margin {
+            agg.set_catch_up_margin_secs(secs);
+        }
+        agg.set_replay_mode(true);
+        let t0 = OPEN + 600;
+        let mut m1 = Vec::new();
+        // A held bar is released when the next bar of its timeframe seals,
+        // so every callback is collected, not only the hand-over's.
+        let feed = |agg: &mut MultiTfAggregator, t: ParsedTick, m1: &mut Vec<u32>| {
+            agg.consume_tick(Feed::Dhan, &t, None, |_, sid, _, tf, st| {
+                if sid == GAP_SID && tf == TfIndex::M1 {
+                    m1.push(st.bucket_start_ist_secs);
+                }
+            });
+        };
+        for (ts, cum) in [
+            (t0 + 5, 1_000),
+            (t0 + 10, 1_010),
+            (t0 + 65, 1_020),
+            (t0 + 70, 1_030),
+        ] {
+            feed(&mut agg, gtick(ts, cum), &mut m1);
+        }
+        if push_watermark {
+            feed(
+                &mut agg,
+                tick(GAP_SID + 1, SEG_EQ, t0 + 420, 500.0, 5_000),
+                &mut m1,
+            );
+        }
+        // Rolls the t0 + 60 minute and opens t0 + 120; then a trade for the
+        // sealed t0 + 60 minute.
+        for (ts, cum) in [
+            (t0 + 130, 1_100),
+            (t0 + 80, 1_110),
+            (t0 + 190, 1_150),
+            (t0 + 250, 1_200),
+            (t0 + 310, 1_250),
+        ] {
+            feed(&mut agg, gtick(ts, cum), &mut m1);
+        }
+        agg.finish_replay(false, |_, sid, _, tf, st| {
+            if sid == GAP_SID && tf == TfIndex::M1 {
+                m1.push(st.bucket_start_ist_secs);
+            }
+        });
+        m1
+    }
+
+    #[test]
+    fn test_late_tick_older_than_the_open_bucket_marks_the_sealed_bar_too() {
+        let t0 = OPEN + 600;
+        for control in [
+            older_late_tick_minutes(false, None),
+            older_late_tick_minutes(true, Some(u32::MAX)),
+        ] {
+            assert!(
+                [t0 + 60, t0 + 120, t0 + 180, t0 + 240]
+                    .iter()
+                    .all(|m| control.contains(m)),
+                "control: nothing says live closed a bucket first: {control:?}"
+            );
+        }
+        let fixed = older_late_tick_minutes(true, None);
+        assert!(
+            [t0 + 60, t0 + 120, t0 + 180]
+                .iter()
+                .all(|m| !fixed.contains(m)),
+            "the amended sealed minute, the open one and the next are partial: {fixed:?}"
+        );
+        assert!(
+            fixed.contains(&(t0 + 240)),
+            "the minute after them is complete again: {fixed:?}"
+        );
+    }
+
+    /// Review round 7 (hostile review, LOW): a counter restart that is the
+    /// first tick after a gap resolves the gap without `gap_now` (it is also
+    /// stale), and must still set the gap frontier.
+    #[test]
+    fn test_counter_restart_after_a_gap_sets_the_gap_frontier() {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        agg.set_replay_mode(true);
+        let high = u32::MAX - 10;
+        // The seeding tick's own frontier expires an hour later.
+        for (ts, cum) in [(OPEN + 5, high - 10), (OPEN + 3_700, high)] {
+            agg.consume_tick(Feed::Dhan, &gtick(ts, cum), None, ignore_seal);
+        }
+        assert!(agg.slots.iter().all(|s| s.replay_gap_frontier == 0));
+        agg.mark_replay_gap();
+        agg.consume_tick(Feed::Dhan, &gtick(OPEN + 3_710, 5), None, ignore_seal);
+        assert!(
+            agg.slots
+                .iter()
+                .all(|s| s.replay_gap_frontier >= OPEN + 3_710),
+            "the restart tick resolved the gap and set a frontier"
+        );
+    }
+
+    /// Review round 7 (hot-path review): the gap frontier is replay-only. At
+    /// the hand-over it is cleared, so live ticks never pay its pass and a
+    /// live bucket is never marked partial by it.
+    #[test]
+    fn test_finish_replay_clears_the_gap_frontier() {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        agg.set_replay_mode(true);
+        agg.consume_tick(Feed::Dhan, &gtick(OPEN + 5, 1_000), None, ignore_seal);
+        agg.mark_replay_gap();
+        let mut first = gtick(OPEN + 10, 1_100);
+        // A receipt far in the future sets a frontier that would cover every
+        // live bucket of the next hour if it survived the hand-over.
+        first.received_at_nanos = (i64::from(OPEN + 3_000) - 19_800) * 1_000_000_000;
+        agg.consume_tick(Feed::Dhan, &first, None, ignore_seal);
+        assert!(agg.slots.iter().any(|s| s.replay_gap_frontier != 0));
+        agg.finish_replay(false, ignore_seal);
+        assert!(
+            agg.slots.iter().all(|s| s.replay_gap_frontier == 0),
+            "no frontier survives the hand-over"
+        );
+    }
     /// A late tick amends the last SEALED bar. If a replay could only partly
     /// see that bar, the amendment is suppressed too.
     #[test]
@@ -4565,9 +5024,9 @@ mod tests {
         let mut m1: Vec<(u32, u64)> = Vec::new();
 
         let first = tick(13, SEG_IDX, OPEN + 3_600, 100.0, 1_000_000);
-        let _ = agg.consume_tick(Feed::Dhan, &first, None, |_, _, _, _, _| {});
+        let _ = agg.consume_tick(Feed::Dhan, &first, None, ignore_seal);
         let second = tick(13, SEG_IDX, OPEN + 3_610, 101.0, 1_000_500);
-        let _ = agg.consume_tick(Feed::Dhan, &second, None, |_, _, _, _, _| {});
+        let _ = agg.consume_tick(Feed::Dhan, &second, None, ignore_seal);
         agg.force_seal_all(|_, _, _, tf, st| {
             if tf == TfIndex::M1 {
                 m1.push((st.bucket_start_ist_secs, st.volume));
@@ -4591,14 +5050,14 @@ mod tests {
         // every bar of the new day at volume 0.
         let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
         let day1 = tick(13, SEG_IDX, OPEN + 10, 100.0, 900_000);
-        let _ = agg.consume_tick(Feed::Dhan, &day1, None, |_, _, _, _, _| {});
-        agg.force_seal_all(|_, _, _, _, _| {});
+        let _ = agg.consume_tick(Feed::Dhan, &day1, None, ignore_seal);
+        agg.force_seal_all(ignore_seal);
 
         // Next session: cumulative restarts small.
         let mut m1: Vec<u64> = Vec::new();
         for (off, cum) in [(0_u32, 100_u32), (10, 700)] {
             let t = tick(13, SEG_IDX, OPEN + 86_400 + off, 100.0, cum);
-            let _ = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+            let _ = agg.consume_tick(Feed::Dhan, &t, None, ignore_seal);
         }
         agg.force_seal_all(|_, _, _, tf, st| {
             if tf == TfIndex::M1 {
@@ -5063,7 +5522,7 @@ mod tests {
             sink,
         );
         // Session close: this is the production day-boundary seal.
-        let _ = agg.force_seal_all(|_, _, _, _, _| {});
+        let _ = agg.force_seal_all(ignore_seal);
 
         // Day two — cumulative restarts near zero, as the exchange does.
         let open2 = OPEN + 86_400;
@@ -5219,7 +5678,7 @@ mod tests {
             Feed::Dhan,
             &tick(13, SEG_IDX, OPEN, 100.0, 1),
             None,
-            |_, _, _, _, _| {},
+            ignore_seal,
         );
         assert_eq!(agg.len(), 1);
         assert!(!agg.is_empty());
@@ -5228,7 +5687,7 @@ mod tests {
             Feed::Dhan,
             &tick(13, SEG_IDX, OPEN + 1, 101.0, 2),
             None,
-            |_, _, _, _, _| {},
+            ignore_seal,
         );
         assert_eq!(agg.len(), 1);
     }
@@ -5242,7 +5701,7 @@ mod tests {
             Feed::Dhan,
             &tick(13, SEG_IDX, OPEN, 100.0, 1),
             None,
-            |_, _, _, _, _| {},
+            ignore_seal,
         );
         assert_eq!(agg.lookup(Feed::Dhan, 13, SEG_IDX), Some(0));
         assert_eq!(agg.lookup(Feed::Truedata, 13, SEG_IDX), None);
@@ -5256,7 +5715,7 @@ mod tests {
             Feed::Dhan,
             &tick(13, SEG_IDX, OPEN, 100.0, 5),
             None,
-            |_, _, _, _, _| {},
+            ignore_seal,
         );
         let s = agg
             .snapshot(Feed::Dhan, 13, SEG_IDX, TfIndex::M1)
@@ -5272,7 +5731,7 @@ mod tests {
             Feed::Dhan,
             &tick(13, SEG_IDX, OPEN + 100, 100.0, 1),
             None,
-            |_, _, _, _, _| {},
+            ignore_seal,
         );
         assert_eq!(agg.watermark_secs(), OPEN + 100);
         // An older (late) tick must not pull the watermark back.
@@ -5280,7 +5739,7 @@ mod tests {
             Feed::Dhan,
             &tick(13, SEG_IDX, OPEN + 10, 100.0, 2),
             None,
-            |_, _, _, _, _| {},
+            ignore_seal,
         );
         assert_eq!(agg.watermark_secs(), OPEN + 100);
         // A post-close tick still advances it (so the last session bar can seal).
@@ -5289,7 +5748,7 @@ mod tests {
             Feed::Dhan,
             &tick(13, SEG_IDX, post_close, 100.0, 3),
             None,
-            |_, _, _, _, _| {},
+            ignore_seal,
         );
         assert!(stats.out_of_session, "post-close must be gated out");
         assert_eq!(agg.watermark_secs(), post_close, "…but must still advance");
@@ -5302,7 +5761,7 @@ mod tests {
             Feed::Dhan,
             &tick(13, SEG_IDX, OPEN, 100.0, 1),
             None,
-            |_, _, _, _, _| {},
+            ignore_seal,
         );
         assert!(agg.watermark_secs() > 0);
         agg.reset_watermark();
@@ -5386,7 +5845,7 @@ mod tests {
         // THE POINT: an honest tick right after it still folds.
         let mut honest = tick(13, SEG_IDX, today_in_session, 100.0, 2);
         honest.received_at_nanos = receipt_now_nanos;
-        let stats = agg.consume_tick(Feed::Dhan, &honest, None, |_, _, _, _, _| {});
+        let stats = agg.consume_tick(Feed::Dhan, &honest, None, ignore_seal);
         assert!(
             !stats.stale_trading_day,
             "the future tick must not have advanced the watermark — before this \
@@ -5412,7 +5871,7 @@ mod tests {
         // Default `received_at_nanos` is 0 — the sentinel.
         let t = tick(13, SEG_IDX, today_in_session + 86_400, 100.0, 1);
         assert_eq!(t.received_at_nanos, 0, "fixture must exercise the sentinel");
-        let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+        let stats = agg.consume_tick(Feed::Dhan, &t, None, ignore_seal);
         assert!(
             !stats.future_trading_day,
             "with no second clock the gate must not guess"
@@ -5443,7 +5902,7 @@ mod tests {
         let mut t = tick(66_422, SEG_IDX, yesterday_1529, 142.50, 12_000);
         t.received_at_nanos = today_0915_utc_secs * 1_000_000_000;
 
-        let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+        let stats = agg.consume_tick(Feed::Dhan, &t, None, ignore_seal);
 
         assert!(
             stats.stale_trading_day,
@@ -5475,7 +5934,7 @@ mod tests {
         let mut t = tick(66_422, SEG_IDX, today_0915, 142.50, 12_000);
         t.received_at_nanos = today_0915_utc_secs * 1_000_000_000;
 
-        let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+        let stats = agg.consume_tick(Feed::Dhan, &t, None, ignore_seal);
 
         assert!(
             !stats.stale_trading_day,
@@ -5552,7 +6011,7 @@ mod tests {
         let mut t = tick(66_422, SEG_IDX, just_before_midnight, 142.50, 12_000);
         t.received_at_nanos = just_after_midnight_utc_secs * 1_000_000_000;
 
-        let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+        let stats = agg.consume_tick(Feed::Dhan, &t, None, ignore_seal);
 
         assert!(
             stats.stale_trading_day,
@@ -5577,7 +6036,7 @@ mod tests {
             Feed::Dhan,
             &tick(13, SEG_IDX, yesterday_in_session, 100.0, 1),
             None,
-            |_, _, _, _, _| {},
+            ignore_seal,
         );
         assert!(
             !stats.stale_trading_day,
@@ -5632,7 +6091,7 @@ mod tests {
             Feed::Dhan,
             &tick(13, SEG_IDX, DAY + 33_300 + 60, 100.0, 1),
             None,
-            |_, _, _, _, _| {},
+            ignore_seal,
         );
         assert!(
             !stats.stale_trading_day,
@@ -5734,7 +6193,7 @@ mod tests {
             Feed::Dhan,
             &tick(13, SEG_IDX, pre_open, 100.0, 1),
             None,
-            |_, _, _, _, _| {},
+            ignore_seal,
         );
         assert!(stats.out_of_session);
         assert_eq!(agg.len(), 0, "a gated tick must not allocate a slot");
@@ -5748,14 +6207,14 @@ mod tests {
             Feed::Dhan,
             &tick(13, SEG_IDX, OPEN, 100.0, 1),
             None,
-            |_, _, _, _, _| {},
+            ignore_seal,
         );
         let mut seals: Vec<SealRow> = Vec::new();
         let emitted = agg.force_seal_all(|f, s, g, tf, st| seals.push(row(f, s, g, tf, st)));
         assert_eq!(emitted, TF_COUNT, "one bar per opened timeframe");
         assert_eq!(seals.len(), TF_COUNT);
         // Idempotent: a second flush emits NOTHING (never a duplicate row).
-        assert_eq!(agg.force_seal_all(|_, _, _, _, _| {}), 0);
+        assert_eq!(agg.force_seal_all(ignore_seal), 0);
     }
 
     #[test]
@@ -5765,7 +6224,7 @@ mod tests {
             Feed::Dhan,
             &tick(13, SEG_IDX, OPEN + 5, 100.0, 1),
             None,
-            |_, _, _, _, _| {},
+            ignore_seal,
         );
         // Cutoff one second into the session: only the 1s..5s frames whose
         // bucket already ended can close; the 1m frame cannot.
@@ -5797,14 +6256,14 @@ mod tests {
                 Feed::Dhan,
                 &tick(sid, SEG_EQ, first, 100.0 + (mix % 50) as f32, 10),
                 None,
-                |_, _, _, _, _| {},
+                ignore_seal,
             );
             if mix % 3 == 0 {
                 let _ = agg.consume_tick(
                     Feed::Dhan,
                     &tick(sid, SEG_EQ, first + (mix % 7) as u32, 101.0, 25),
                     None,
-                    |_, _, _, _, _| {},
+                    ignore_seal,
                 );
             }
         }
@@ -5871,9 +6330,9 @@ mod tests {
     #[test]
     fn catch_up_seal_slots_past_the_end_is_a_no_op() {
         let mut agg = scattered_book(5, 1);
-        let (emitted, next) = agg.catch_up_seal_slots(OPEN + 200, 99, 10, |_, _, _, _, _| {});
+        let (emitted, next) = agg.catch_up_seal_slots(OPEN + 200, 99, 10, ignore_seal);
         assert_eq!((emitted, next), (0, 5));
-        let (emitted, next) = agg.catch_up_seal_slots(OPEN + 200, 0, 0, |_, _, _, _, _| {});
+        let (emitted, next) = agg.catch_up_seal_slots(OPEN + 200, 0, 0, ignore_seal);
         assert_eq!((emitted, next), (0, 0), "a zero budget visits nothing");
     }
 
@@ -5890,19 +6349,19 @@ mod tests {
             Feed::Dhan,
             &tick(27, SEG_IDX, OPEN, 100.0, 10),
             None,
-            |_, _, _, _, _| {},
+            ignore_seal,
         );
         let _ = agg.consume_tick(
             Feed::Dhan,
             &tick(27, SEG_EQ, OPEN, 200.0, 20),
             None,
-            |_, _, _, _, _| {},
+            ignore_seal,
         );
         let _ = agg.consume_tick(
             Feed::Truedata,
             &tick(27, SEG_IDX, OPEN, 300.0, 30),
             None,
-            |_, _, _, _, _| {},
+            ignore_seal,
         );
 
         assert_eq!(agg.len(), 3, "three distinct identities, three slots");
@@ -5937,7 +6396,7 @@ mod tests {
                 Feed::Dhan,
                 &tick(13, SEG_IDX, OPEN, *p, cum),
                 None,
-                |_, _, _, _, _| {},
+                ignore_seal,
             );
             assert!(stats.folded(), "tick {i} must fold");
             assert_eq!(stats.sealed_count, 0, "same second seals nothing");
@@ -6030,7 +6489,7 @@ mod tests {
             Feed::Dhan,
             &tick(13, SEG_IDX, OPEN, 100.0, 1),
             None,
-            |_, _, _, _, _| {},
+            ignore_seal,
         );
         let before = agg
             .snapshot(Feed::Dhan, 13, SEG_IDX, TfIndex::M1)
@@ -6110,7 +6569,7 @@ mod tests {
                 Feed::Dhan,
                 &tick(sid + 1, SEG_IDX, OPEN, 100.0, 1),
                 None,
-                |_, _, _, _, _| {},
+                ignore_seal,
             );
             assert!(
                 stats.folded(),
@@ -6152,7 +6611,7 @@ mod tests {
                 Feed::Dhan,
                 &tick(sid + 1, SEG_IDX, OPEN, 100.0, 1),
                 None,
-                |_, _, _, _, _| {},
+                ignore_seal,
             );
         }
         assert_eq!(
@@ -6165,7 +6624,7 @@ mod tests {
             Feed::Dhan,
             &tick(9_999, SEG_IDX, OPEN, 100.0, 1),
             None,
-            |_, _, _, _, _| {},
+            ignore_seal,
         );
         assert!(
             agg.slots.capacity() >= 64,
@@ -6197,7 +6656,7 @@ mod tests {
             Feed::Dhan,
             &tick(13, SEG_IDX, CANDLE_OPEN, 100.0, 1),
             None,
-            |_, _, _, _, _| {},
+            ignore_seal,
         );
         assert!(stats.folded());
     }
@@ -6219,7 +6678,7 @@ mod tests {
             Feed::Dhan,
             &tick(13, SEG_IDX, OPEN, 0.0, 0),
             None,
-            |_, _, _, _, _| {},
+            ignore_seal,
         );
         assert!(
             zero.untraded_sentinel,
@@ -6237,7 +6696,7 @@ mod tests {
                 Feed::Dhan,
                 &tick(13, SEG_IDX, OPEN, corrupt, 0),
                 None,
-                |_, _, _, _, _| {},
+                ignore_seal,
             );
             assert!(
                 s.refused_price,
@@ -6255,7 +6714,7 @@ mod tests {
             Feed::Dhan,
             &tick(13, SEG_IDX, OPEN, 100.0, 1),
             None,
-            |_, _, _, _, _| {},
+            ignore_seal,
         );
         assert!(good.folded(), "a real price must still fold");
     }
@@ -6292,7 +6751,7 @@ mod tests {
             Feed::Dhan,
             &quote(OPEN + 20, 101.25, 500, 1_000, base_ns),
             None,
-            |_, _, _, _, _| {},
+            ignore_seal,
         );
         assert!(first.folded() && !first.repeat_quote);
         let before = m1(&agg);
@@ -6301,7 +6760,7 @@ mod tests {
             Feed::Dhan,
             &quote(OPEN + 20, 101.25, 500, 1_200, base_ns + 30_000_000_000),
             None,
-            |_, _, _, _, _| {},
+            ignore_seal,
         );
         assert!(
             again.repeat_quote,
@@ -6330,8 +6789,8 @@ mod tests {
     fn a_hundred_repeats_after_the_seal_emit_no_amendment() {
         let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
         let t = quote(OPEN + 5, 250.5, 9_000, 10, 0);
-        let _ = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
-        let sealed = agg.catch_up_seal_all(OPEN + 61, |_, _, _, _, _| {});
+        let _ = agg.consume_tick(Feed::Dhan, &t, None, ignore_seal);
+        let sealed = agg.catch_up_seal_all(OPEN + 61, ignore_seal);
         assert!(sealed > 0, "the fixture must actually seal something");
 
         let mut emitted = 0_usize;
@@ -6353,14 +6812,14 @@ mod tests {
             Feed::Dhan,
             &quote(OPEN + 30, 99.0, 700, 0, 0),
             None,
-            |_, _, _, _, _| {},
+            ignore_seal,
         );
         // One more unit traded inside the same second.
         let more = agg.consume_tick(
             Feed::Dhan,
             &quote(OPEN + 30, 99.0, 701, 0, 0),
             None,
-            |_, _, _, _, _| {},
+            ignore_seal,
         );
         assert!(!more.repeat_quote && more.folded());
         // Same volume, different price: an index trades with volume 0 always,
@@ -6369,7 +6828,7 @@ mod tests {
             Feed::Dhan,
             &quote(OPEN + 30, 99.05, 701, 0, 0),
             None,
-            |_, _, _, _, _| {},
+            ignore_seal,
         );
         assert!(!moved.repeat_quote && moved.folded());
         // Same price and volume, a later trade time: a new print.
@@ -6377,7 +6836,7 @@ mod tests {
             Feed::Dhan,
             &quote(OPEN + 31, 99.05, 701, 0, 0),
             None,
-            |_, _, _, _, _| {},
+            ignore_seal,
         );
         assert!(!later.repeat_quote && later.folded());
         assert_eq!(m1(&agg).tick_count, 4);
@@ -6391,7 +6850,7 @@ mod tests {
                 Feed::Dhan,
                 &tick(13, SEG_IDX, OPEN + 40, price, 0),
                 None,
-                |_, _, _, _, _| {},
+                ignore_seal,
             );
             assert!(!s.repeat_quote, "price {price} moved, so it is a print");
         }
@@ -6407,12 +6866,12 @@ mod tests {
         let mut first = quote(OPEN + 50, 100.0, 300, 0, 0);
         first.day_high = 101.0;
         first.day_low = 99.0;
-        let _ = agg.consume_tick(Feed::Dhan, &first, None, |_, _, _, _, _| {});
+        let _ = agg.consume_tick(Feed::Dhan, &first, None, ignore_seal);
         // Identical trade, but the exchange's running high moved: a print we
         // never received happened, and the fold is what attributes it.
         let mut copy = first;
         copy.day_high = 102.0;
-        let s = agg.consume_tick(Feed::Dhan, &copy, None, |_, _, _, _, _| {});
+        let s = agg.consume_tick(Feed::Dhan, &copy, None, ignore_seal);
         assert!(
             !s.repeat_quote,
             "a moved session extreme is evidence, not a repeat"
@@ -6432,7 +6891,7 @@ mod tests {
             Feed::Dhan,
             &quote(OPEN + 1, 50.0, 0, 0, 0),
             None,
-            |_, _, _, _, _| {},
+            ignore_seal,
         );
         assert!(!s.repeat_quote && s.folded());
     }
@@ -6607,7 +7066,7 @@ mod tests {
             Feed::Dhan,
             &tick(13, SEG_IDX, OPEN + 60, 100.0, 1),
             None,
-            |_, _, _, _, _| {},
+            ignore_seal,
         );
         let honest = agg.watermark_secs();
         assert_eq!(honest, OPEN + 60);
@@ -6642,7 +7101,7 @@ mod tests {
             Feed::Dhan,
             &tick(13, SEG_IDX, OPEN + 60, 100.0, 1),
             None,
-            |_, _, _, _, _| {},
+            ignore_seal,
         );
         let before = agg.watermark_secs();
 
@@ -6650,7 +7109,7 @@ mod tests {
             Feed::Dhan,
             &tick(13, SEG_IDX, OPEN + 120, f32::NAN, 2),
             None,
-            |_, _, _, _, _| {},
+            ignore_seal,
         );
         assert!(stats.refused_price, "NaN price must be refused");
         assert_eq!(
@@ -6671,14 +7130,14 @@ mod tests {
             Feed::Dhan,
             &tick(13, SEG_IDX, OPEN + 60, 100.0, 1),
             None,
-            |_, _, _, _, _| {},
+            ignore_seal,
         );
         let post_close = DAY + 56_500; // past the 15:40 session upper bound
         let stats = agg.consume_tick(
             Feed::Dhan,
             &tick(13, SEG_IDX, post_close, 100.0, 2),
             None,
-            |_, _, _, _, _| {},
+            ignore_seal,
         );
         assert!(stats.out_of_session, "post-close tick is gated for folding");
         assert_eq!(
@@ -6697,13 +7156,13 @@ mod tests {
             Feed::Dhan,
             &tick(1, SEG_IDX, OPEN, 100.0, 1),
             None,
-            |_, _, _, _, _| {},
+            ignore_seal,
         );
         let _ = agg.consume_tick(
             Feed::Dhan,
             &tick(2, SEG_IDX, OPEN, 100.0, 1),
             None,
-            |_, _, _, _, _| {},
+            ignore_seal,
         );
         assert_eq!(agg.len(), 2);
         // Simulate the ceiling by asserting the guard's own arithmetic: the
@@ -6727,7 +7186,7 @@ mod tests {
             Feed::Dhan,
             &tick(1, SEG_IDX, OPEN + 1, 101.0, 2),
             None,
-            |_, _, _, _, _| {},
+            ignore_seal,
         );
         assert!(ok.folded());
         // A second refusal counts again but logs only once (latch).
@@ -6735,7 +7194,7 @@ mod tests {
             Feed::Dhan,
             &tick(4, SEG_IDX, OPEN, 100.0, 1),
             None,
-            |_, _, _, _, _| {},
+            ignore_seal,
         );
         assert!(stats2.slot_exhausted);
         assert_eq!(agg.slots_exhausted_total(), 2);
@@ -6813,7 +7272,7 @@ mod tests {
             Feed::Dhan,
             &tick(13, SEG_IDX, OPEN, 100.0, 0),
             Some(big),
-            |_, _, _, _, _| {},
+            ignore_seal,
         );
         let s = agg
             .snapshot(Feed::Dhan, 13, SEG_IDX, TfIndex::M1)
@@ -6922,14 +7381,14 @@ mod tests {
                 Feed::Dhan,
                 &tick(sid, SEG_EQ, OPEN, 100.0, 1),
                 None,
-                |_, _, _, _, _| {},
+                ignore_seal,
             );
         }
         let slots = agg.len();
         // Cutoff far in the past: every cell is visited, none seals. This is
         // the pure traversal cost — the shape that runs on 99% of sweeps.
         let t0 = std::time::Instant::now();
-        let emitted = agg.catch_up_seal_all(OPEN, |_, _, _, _, _| {});
+        let emitted = agg.catch_up_seal_all(OPEN, ignore_seal);
         let elapsed = t0.elapsed();
         println!(
             "catch_up_seal_all: {slots} slots x {TF_COUNT} TF = {} cells, \
@@ -6977,7 +7436,7 @@ mod tests {
                 Feed::Dhan,
                 &tick(sid, SEG_EQ, OPEN, 100.0, 1),
                 None,
-                |_, _, _, _, _| {},
+                ignore_seal,
             );
         }
         let slots = agg.len();
@@ -8007,7 +8466,7 @@ mod exchange_clock_end_to_end_tests {
         let mut t = tick(13, SEG_IDX, traded, 100.0, 10);
         t.received_at_nanos = receipt_nanos_for_ist(received);
 
-        let _ = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+        let _ = agg.consume_tick(Feed::Dhan, &t, None, ignore_seal);
 
         assert_ne!(
             TfIndex::M1.bucket_start(received),
@@ -8040,7 +8499,7 @@ mod exchange_clock_end_to_end_tests {
         let mut t = tick(13, SEG_IDX, traded, 100.0, 10);
         t.received_at_nanos = receipt_nanos_for_ist(traded + 100 * 60);
 
-        let _ = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+        let _ = agg.consume_tick(Feed::Dhan, &t, None, ignore_seal);
 
         assert_eq!(
             seal_m1_bucket(&mut agg),
@@ -8062,7 +8521,7 @@ mod exchange_clock_end_to_end_tests {
         let mut t = tick(13, SEG_IDX, traded, 100.0, 10);
         t.received_at_nanos = receipt_nanos_for_ist(traded + 9 * 3_600);
 
-        let _ = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+        let _ = agg.consume_tick(Feed::Dhan, &t, None, ignore_seal);
 
         assert_eq!(
             seal_m1_bucket(&mut agg),
@@ -8091,8 +8550,8 @@ mod exchange_clock_end_to_end_tests {
         let mut second = tick(13, SEG_IDX, minute + 5, 107.0, 20);
         second.received_at_nanos = receipt_nanos_for_ist(minute + 45);
 
-        let _ = agg.consume_tick(Feed::Dhan, &first, None, |_, _, _, _, _| {});
-        let _ = agg.consume_tick(Feed::Dhan, &second, None, |_, _, _, _, _| {});
+        let _ = agg.consume_tick(Feed::Dhan, &first, None, ignore_seal);
+        let _ = agg.consume_tick(Feed::Dhan, &second, None, ignore_seal);
 
         let mut close = f64::NAN;
         let mut high = f64::NAN;
@@ -8138,7 +8597,7 @@ mod exchange_clock_end_to_end_tests {
         let mut t = tick(13, SEG_IDX, traded, 100.0, 10);
         t.received_at_nanos = receipt_nanos_for_ist(received);
 
-        let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+        let stats = agg.consume_tick(Feed::Dhan, &t, None, ignore_seal);
 
         assert!(
             received % 86_400 >= MARKET_CLOSE_SECS_OF_DAY_IST,
@@ -8185,7 +8644,7 @@ mod out_of_band_timestamp_tests {
         let mut t = tick(13, SEG_IDX, 1_000_000_000, 100.0, 10);
         t.received_at_nanos = (i64::from(CANDLE_OPEN) - 19_800) * 1_000_000_000;
 
-        let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+        let stats = agg.consume_tick(Feed::Dhan, &t, None, ignore_seal);
 
         assert!(
             stats.out_of_band_timestamp,
@@ -8212,7 +8671,7 @@ mod out_of_band_timestamp_tests {
         let t = tick(13, SEG_IDX, 1_000_000_000, 100.0, 10);
         assert_eq!(t.received_at_nanos, 0, "fixture models the WAL-replay path");
 
-        let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+        let stats = agg.consume_tick(Feed::Dhan, &t, None, ignore_seal);
 
         assert!(
             stats.refused_timestamp,
@@ -8231,7 +8690,7 @@ mod out_of_band_timestamp_tests {
         let mut t = tick(13, SEG_IDX, CANDLE_OPEN + 60, 100.0, 10);
         t.received_at_nanos = (i64::from(CANDLE_OPEN) + 62 - 19_800) * 1_000_000_000;
 
-        let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+        let stats = agg.consume_tick(Feed::Dhan, &t, None, ignore_seal);
 
         assert!(!stats.out_of_band_timestamp);
         assert!(!stats.refused_timestamp);
@@ -8251,7 +8710,7 @@ mod out_of_band_timestamp_tests {
         );
 
         let t = tick(77, 2, CANDLE_OPEN + 60, 101.25, 500);
-        let _ = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+        let _ = agg.consume_tick(Feed::Dhan, &t, None, ignore_seal);
 
         let got = agg
             .last_ltp(Feed::Dhan, 77, 2)
@@ -8268,7 +8727,7 @@ mod out_of_band_timestamp_tests {
         // bare id, an index would answer with a same-numbered option's price.
         let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
         let t = tick(27, 2, CANDLE_OPEN + 60, 55.5, 100);
-        let _ = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+        let _ = agg.consume_tick(Feed::Dhan, &t, None, ignore_seal);
         assert!(agg.last_ltp(Feed::Dhan, 27, 2).is_some());
         assert_eq!(
             agg.last_ltp(Feed::Dhan, 27, 0),
@@ -8329,7 +8788,7 @@ mod day_gate_permutation_sweep {
         let t = tick(13, SEG_IDX, yesterday, 100.0, 1);
         assert_eq!(t.received_at_nanos, 0, "fixture must exercise the sentinel");
 
-        let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+        let stats = agg.consume_tick(Feed::Dhan, &t, None, ignore_seal);
 
         assert!(
             !stats.stale_trading_day,
@@ -8353,7 +8812,7 @@ mod day_gate_permutation_sweep {
         let mut t = tick(13, SEG_IDX, TODAY_0916, 100.0, 1);
         t.received_at_nanos = -1_000_000_000;
 
-        let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+        let stats = agg.consume_tick(Feed::Dhan, &t, None, ignore_seal);
 
         assert!(
             !stats.stale_trading_day && !stats.future_trading_day,
@@ -8382,7 +8841,7 @@ mod day_gate_permutation_sweep {
         let mut t = tick(13, SEG_IDX, TODAY_0916, 100.0, 1);
         t.received_at_nanos = 1;
 
-        let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+        let stats = agg.consume_tick(Feed::Dhan, &t, None, ignore_seal);
 
         assert!(
             stats.future_trading_day,
@@ -8404,7 +8863,7 @@ mod day_gate_permutation_sweep {
         let mut t = tick(13, SEG_IDX, TODAY_0916, 100.0, 1);
         t.received_at_nanos = i64::MAX;
 
-        let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+        let stats = agg.consume_tick(Feed::Dhan, &t, None, ignore_seal);
 
         assert!(
             stats.stale_trading_day,
@@ -8425,7 +8884,7 @@ mod day_gate_permutation_sweep {
         let mut t = tick(66_422, SEG_IDX, thirty_four_days_ago, 142.50, 12_000);
         t.received_at_nanos = receipt_at_ist(i64::from(TODAY_0916));
 
-        let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+        let stats = agg.consume_tick(Feed::Dhan, &t, None, ignore_seal);
 
         assert!(
             stats.stale_trading_day,
@@ -8455,14 +8914,14 @@ mod day_gate_permutation_sweep {
         let yesterday_1529 = DAY - 86_400 + 15 * 3_600 + 29 * 60;
         let mut stale = tick(66_422, SEG_IDX, yesterday_1529, 142.50, 12_000);
         stale.received_at_nanos = receipt_at_ist(i64::from(TODAY_0916));
-        let stats = agg.consume_tick(Feed::Dhan, &stale, None, |_, _, _, _, _| {});
+        let stats = agg.consume_tick(Feed::Dhan, &stale, None, ignore_seal);
         assert!(stats.stale_trading_day && stats.receipt_day_mismatch);
 
         // Receipt-clock FUTURE: stamped tomorrow, received today.
         let mut agg = MultiTfAggregator::default();
         let mut future = tick(13, SEG_IDX, TODAY_0916 + 86_400, 100.0, 1);
         future.received_at_nanos = receipt_at_ist(i64::from(TODAY_0916));
-        let stats = agg.consume_tick(Feed::Dhan, &future, None, |_, _, _, _, _| {});
+        let stats = agg.consume_tick(Feed::Dhan, &future, None, ignore_seal);
         assert!(stats.future_trading_day && stats.receipt_day_mismatch);
 
         // WATERMARK stale: a fresh tick today moves the watermark; then a tick
@@ -8472,14 +8931,14 @@ mod day_gate_permutation_sweep {
         let mut agg = MultiTfAggregator::default();
         let mut today = tick(13, SEG_IDX, TODAY_0916, 100.0, 1);
         today.received_at_nanos = receipt_at_ist(i64::from(TODAY_0916));
-        let first = agg.consume_tick(Feed::Dhan, &today, None, |_, _, _, _, _| {});
+        let first = agg.consume_tick(Feed::Dhan, &today, None, ignore_seal);
         assert!(
             first.folded(),
             "fixture: today's tick must fold and set the watermark"
         );
         let mut replayed = tick(13, SEG_IDX, yesterday_1529, 99.0, 1);
         replayed.received_at_nanos = receipt_at_ist(i64::from(yesterday_1529));
-        let stats = agg.consume_tick(Feed::Dhan, &replayed, None, |_, _, _, _, _| {});
+        let stats = agg.consume_tick(Feed::Dhan, &replayed, None, ignore_seal);
         assert!(
             stats.stale_trading_day,
             "fixture: the watermark arm must be what refuses this tick"
@@ -8525,7 +8984,7 @@ mod day_gate_permutation_sweep {
         let mut t = tick(13, SEG_IDX, DAY - 1, 100.0, 1);
         t.received_at_nanos = receipt_at_ist(i64::from(DAY + 33_400));
 
-        let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+        let stats = agg.consume_tick(Feed::Dhan, &t, None, ignore_seal);
 
         assert!(
             stats.stale_trading_day,
@@ -8543,7 +9002,7 @@ mod day_gate_permutation_sweep {
         let mut t = tick(13, SEG_IDX, DAY, 100.0, 1);
         t.received_at_nanos = receipt_at_ist(i64::from(DAY + 33_400));
 
-        let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+        let stats = agg.consume_tick(Feed::Dhan, &t, None, ignore_seal);
 
         assert!(
             !stats.stale_trading_day,
@@ -8566,7 +9025,7 @@ mod day_gate_permutation_sweep {
         let mut t = tick(13, SEG_IDX, yesterday, f32::NAN, 1);
         t.received_at_nanos = receipt_at_ist(i64::from(TODAY_0916));
 
-        let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+        let stats = agg.consume_tick(Feed::Dhan, &t, None, ignore_seal);
 
         assert!(stats.refused_price, "the price arm owns a NaN");
         assert!(
@@ -8587,7 +9046,7 @@ mod day_gate_permutation_sweep {
         let mut t = tick(13, SEG_IDX, 0, 100.0, 1);
         t.received_at_nanos = receipt_at_ist(i64::from(TODAY_0916));
 
-        let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+        let stats = agg.consume_tick(Feed::Dhan, &t, None, ignore_seal);
 
         assert!(
             stats.untraded_timestamp,
@@ -8610,7 +9069,7 @@ mod day_gate_permutation_sweep {
         let mut t = tick(13, SEG_IDX, MIN_PLAUSIBLE_EXCHANGE_TS_SECS - 1, 100.0, 1);
         t.received_at_nanos = receipt_at_ist(i64::from(TODAY_0916));
 
-        let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+        let stats = agg.consume_tick(Feed::Dhan, &t, None, ignore_seal);
 
         assert!(
             stats.out_of_band_timestamp,
@@ -8645,7 +9104,7 @@ mod day_gate_permutation_sweep {
                 t.received_at_nanos =
                     receipt_at_ist(i64::from(DAY) + receipt_offset * 86_400 + 33_400);
 
-                let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+                let stats = agg.consume_tick(Feed::Dhan, &t, None, ignore_seal);
 
                 assert!(
                     !(stats.stale_trading_day && stats.future_trading_day),
