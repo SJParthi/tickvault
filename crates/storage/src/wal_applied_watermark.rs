@@ -327,7 +327,7 @@ impl AppliedSnapshot {
 /// path, or the path as given when it cannot be canonicalised (a directory
 /// that does not exist yet has no file to load anyway). Never `0`, so an
 /// unbound snapshot can never match a real directory by accident.
-fn dir_tag_of(wal_dir: &Path) -> u64 {
+pub(crate) fn dir_tag_of(wal_dir: &Path) -> u64 {
     let canonical = std::fs::canonicalize(wal_dir).unwrap_or_else(|_| wal_dir.to_path_buf()); // APPROVED: boot-time bind, cold path
     let bytes = canonical.as_os_str().as_encoded_bytes();
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -845,16 +845,20 @@ impl AppliedWatermark {
 /// path is never followed — `O_EXCL` fails on an existing symlink rather than
 /// writing through it. A stale tmp from a crashed persist is removed first;
 /// it holds nothing the live file does not.
-fn write_fresh(tmp: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_fresh(tmp: &Path, bytes: &[u8]) -> std::io::Result<()> {
     drop(std::fs::remove_file(tmp)); // APPROVED: once-a-second persist, sink thread, cold path
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(tmp)?; // APPROVED: once-a-second persist, sink thread, cold path
-    file.write_all(bytes)
+    file.write_all(bytes)?;
+    // Durable BEFORE the caller renames it over the live file: without this a
+    // host crash can keep the rename and lose the data, leaving a file that
+    // loads as rejected (2026-09-29, item 45a security review).
+    file.sync_all()
 }
 
-fn wall_nanos() -> u64 {
+pub(crate) fn wall_nanos() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
@@ -881,7 +885,7 @@ const CRC32_TABLE: [u32; 256] = {
     table
 };
 
-fn crc32_ieee(bytes: &[u8]) -> u32 {
+pub(crate) fn crc32_ieee(bytes: &[u8]) -> u32 {
     let mut c: u32 = 0xFFFF_FFFF;
     for &b in bytes {
         c = CRC32_TABLE[((c ^ u32::from(b)) & 0xFF) as usize] ^ (c >> 8);
@@ -1543,5 +1547,37 @@ mod tests {
             "the second inside the interval is not"
         );
         assert!(AppliedSnapshot::load(&dir).is_some());
+    }
+
+    #[test]
+    fn test_dir_tag_of_is_stable_nonzero_and_distinct_per_directory() {
+        let base = std::env::temp_dir().join(format!("tv-dirtag-{}", std::process::id()));
+        let a = base.join("a");
+        let b = base.join("b");
+        std::fs::create_dir_all(&a).expect("dir a");
+        std::fs::create_dir_all(&b).expect("dir b");
+        assert_eq!(dir_tag_of(&a), dir_tag_of(&a));
+        assert_ne!(dir_tag_of(&a), 0);
+        assert_ne!(dir_tag_of(&a), dir_tag_of(&b));
+        drop(std::fs::remove_dir_all(&base));
+    }
+
+    #[test]
+    fn test_write_fresh_replaces_a_stale_tmp() {
+        let dir = std::env::temp_dir().join(format!("tv-writefresh-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let tmp = dir.join("marks.tmp");
+        std::fs::write(&tmp, b"stale leftover").expect("stale");
+        write_fresh(&tmp, b"new").expect("write_fresh");
+        assert_eq!(std::fs::read(&tmp).expect("read"), b"new");
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn test_wall_nanos_is_a_real_wall_clock_reading() {
+        let first = wall_nanos();
+        // After 2020-01-01 and not in the far future.
+        assert!(first > 1_577_836_800_000_000_000);
+        assert!(wall_nanos() >= first);
     }
 }

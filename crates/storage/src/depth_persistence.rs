@@ -2602,6 +2602,8 @@ impl DepthWriterSink {
         let wm = crate::wal_applied_watermark::applied_watermark();
         wm.note_depth_completed();
         wm.persist_if_due_now();
+        // Item 45a: shed-depth marks ride the same once-a-second cadence.
+        crate::wal_deferred_depth::deferred_depth().persist_if_due_now();
         self.return_spare_buffer(batch);
         landed
     }
