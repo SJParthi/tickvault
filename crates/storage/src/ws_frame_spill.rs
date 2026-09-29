@@ -9088,7 +9088,7 @@ mod tests {
     /// Below the hard disk floor, pinned segments are the last to go — after
     /// every ordinary segment — and each one is counted as a loss.
     #[test]
-    fn below_the_disk_floor_pinned_segments_go_last_and_are_counted() {
+    fn test_prune_active_segments_deferred_at_below_the_disk_floor_takes_pinned_last() {
         let dir = tmp_dir("deferred-floor");
         let now = SystemTime::now();
         let a = write_wm_segment(&dir, 0, 3, WalEndpoint::MainFeed);
@@ -9185,7 +9185,7 @@ mod tests {
     /// and a shed segment is exactly that. The archive prune must honour the
     /// mark as well.
     #[test]
-    fn the_archive_prune_keeps_a_deferred_segment() {
+    fn test_prune_archived_segments_deferred_at_keeps_a_deferred_segment() {
         let dir = tmp_dir("deferred-archive");
         let archive = dir.join(ARCHIVE_SUBDIR);
         std::fs::create_dir_all(&archive).unwrap();
@@ -9205,10 +9205,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// An unmeasurable disk must never justify deleting the only copy of shed
+    /// depth: a failed probe reads as NOT below the floor.
+    #[test]
+    fn test_wal_disk_below_floor_is_false_when_the_probe_fails() {
+        let missing = std::env::temp_dir().join(format!("tv-no-such-dir-{}", std::process::id()));
+        assert!(!missing.exists());
+        assert!(!wal_disk_below_floor(&missing));
+    }
+
     /// The pass lists every directory a shed segment can be in, in capture
     /// order, with each segment bounded by its successor.
     #[test]
-    fn deferred_spans_order_across_active_replaying_archive() {
+    fn test_deferred_segment_spans_order_across_active_replaying_archive() {
         let dir = tmp_dir("spans");
         let archive = dir.join(ARCHIVE_SUBDIR);
         let replaying = dir.join(REPLAYING_SUBDIR);

@@ -694,6 +694,9 @@ pub fn spawn_after_close_supervisor(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
+            if cancel.load(Ordering::Acquire) {
+                return;
+            }
             // Poll the clock at most once a minute so cancellation is seen
             // promptly without a second shutdown signal.
             let wait = secs_until_window(super::now_ist_secs_of_day()).min(60);
@@ -844,7 +847,7 @@ mod tests {
     /// The rewrite numbers packets exactly as the live append does: for a
     /// two-packet frame, the second packet's rows carry packet index 1.
     #[test]
-    fn rewrite_matches_the_live_capture_seq_for_every_packet() {
+    fn test_rewrite_inline_depth_matches_the_live_capture_seq_for_every_packet() {
         let mut frame = full_packet(13);
         frame.extend_from_slice(&full_packet(25));
         let (seq, rx) = in_session();
@@ -936,7 +939,7 @@ mod tests {
 
     /// Cancellation stops the pass before it touches a bucket.
     #[test]
-    fn a_cancelled_pass_touches_nothing() {
+    fn test_run_after_close_pass_cancelled_touches_nothing() {
         let marks = DeferredDepth::new_for_tests();
         marks.note_shed(1_780_000_000_000_000_000u64, ShedDepth::Inline);
         let signals = PassSignals {
@@ -957,7 +960,7 @@ mod tests {
 
     /// A pass started outside the window does nothing.
     #[test]
-    fn a_pass_outside_the_window_touches_nothing() {
+    fn test_run_after_close_pass_outside_the_window_touches_nothing() {
         let marks = DeferredDepth::new_for_tests();
         marks.note_shed(1_780_000_000_000_000_000u64, ShedDepth::Dedicated);
         let signals = PassSignals {
@@ -1087,5 +1090,31 @@ mod tests {
         assert!(endpoint_matches(WalEndpoint::Depth200, dedicated));
         assert!(!endpoint_matches(WalEndpoint::Depth20, inline));
         assert!(!endpoint_matches(WalEndpoint::OrderUpdate, SHED_DEPTH_ALL));
+    }
+
+    /// The production signals read real state and never block: the clock is
+    /// a second of the day, and an empty kinds mask is never blocked.
+    #[test]
+    fn test_live_signals_read_a_valid_clock_and_an_empty_mask_never_blocks() {
+        let signals = live_signals();
+        assert!((signals.now_secs_ist)() < 86_400);
+        assert!(!(signals.shed_blocks)(0));
+    }
+
+    /// A cancelled supervisor exits at once and never opens a writer.
+    #[tokio::test]
+    async fn test_spawn_after_close_supervisor_exits_when_cancelled() {
+        let questdb = tickvault_common::config::QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 9000,
+            pg_port: 8812,
+            ilp_port: 9009,
+        };
+        let cancel = std::sync::Arc::new(AtomicBool::new(true));
+        let handle = spawn_after_close_supervisor(questdb, std::env::temp_dir(), cancel);
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("a cancelled supervisor must exit promptly")
+            .expect("the supervisor task must not panic");
     }
 }

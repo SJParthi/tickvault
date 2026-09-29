@@ -946,4 +946,119 @@ mod tests {
         assert_eq!(ids, sorted);
         assert_eq!(ids.len(), 3);
     }
+
+    // Named per public fn, so each is pinned by a test that says what it proves.
+
+    #[test]
+    fn test_kinds_in_range_reports_only_the_kinds_inside_the_range() {
+        let d = DeferredDepth::new_for_tests();
+        d.note_shed(seq(100), ShedDepth::Inline);
+        d.note_shed(seq(20_000), ShedDepth::Dedicated);
+        let snap = d.snapshot();
+        assert_eq!(
+            snap.kinds_in_range(seq(100), Some(seq(100))),
+            ShedDepth::Inline as u8
+        );
+        assert_eq!(
+            snap.kinds_in_range(seq(20_000), Some(seq(20_000))),
+            ShedDepth::Dedicated as u8
+        );
+        assert_eq!(
+            snap.kinds_in_range(seq(100), Some(seq(20_000))),
+            SHED_DEPTH_ALL
+        );
+        assert_eq!(snap.kinds_in_range(seq(5_000), Some(seq(5_100))), 0);
+    }
+
+    #[test]
+    fn test_range_is_deferred_only_where_a_mark_falls() {
+        let d = DeferredDepth::new_for_tests();
+        d.note_shed(seq(10_000), ShedDepth::Inline);
+        let snap = d.snapshot();
+        assert!(snap.range_is_deferred(seq(9_990), Some(seq(10_010))));
+        assert!(!snap.range_is_deferred(seq(1_000), Some(seq(1_100))));
+    }
+
+    #[test]
+    fn test_load_file_tells_absent_loaded_and_rejected_apart() {
+        let dir = scratch("load-file");
+        assert!(matches!(
+            DeferredDepthSnapshot::load_file(&dir),
+            MarksFile::Absent
+        ));
+        let d = DeferredDepth::new_for_tests();
+        d.bind(&dir);
+        d.note_shed(seq(100), ShedDepth::Inline);
+        d.persist_now();
+        match DeferredDepthSnapshot::load_file(&dir) {
+            MarksFile::Loaded(snap) => assert_eq!(
+                snap.kinds_in_range(seq(100), Some(seq(100))),
+                ShedDepth::Inline as u8
+            ),
+            _ => panic!("a freshly persisted file must load"),
+        }
+        std::fs::write(dir.join(DEFERRED_DEPTH_FILE), b"torn").expect("write");
+        assert!(matches!(
+            DeferredDepthSnapshot::load_file(&dir),
+            MarksFile::Rejected
+        ));
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// A mark recorded by an earlier session (only on disk) still protects
+    /// its segments through the prune view.
+    #[test]
+    fn test_prune_view_includes_the_marks_file_on_disk() {
+        let dir = scratch("prune-view");
+        let d = DeferredDepth::new_for_tests();
+        d.bind(&dir);
+        d.note_shed(seq(3_000), ShedDepth::Dedicated);
+        d.persist_now();
+        let view = prune_view(&dir);
+        assert_ne!(
+            view.kinds_in_range(seq(3_000), Some(seq(3_000))) & ShedDepth::Dedicated as u8,
+            0
+        );
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn test_deferred_depth_is_one_process_global() {
+        assert!(std::ptr::eq(deferred_depth(), deferred_depth()));
+    }
+
+    #[test]
+    fn test_note_shed_marks_the_bucket_of_its_sequence() {
+        let d = DeferredDepth::new_for_tests();
+        d.note_shed(seq(500), ShedDepth::Dedicated);
+        assert_eq!(
+            d.snapshot().marked_buckets(),
+            vec![(
+                seq(500) >> DEFERRED_BUCKET_SHIFT,
+                ShedDepth::Dedicated as u8
+            )]
+        );
+    }
+
+    #[test]
+    fn test_clear_overflow_through_lifts_only_once_the_lost_mark_is_covered() {
+        let d = DeferredDepth::new_for_tests();
+        let a = seq(100);
+        let b = a + ((DEFERRED_BUCKETS as u64) << DEFERRED_BUCKET_SHIFT);
+        d.note_shed(a, ShedDepth::Inline);
+        d.note_shed(b, ShedDepth::Inline);
+        d.clear_overflow_through(b - 1);
+        assert!(d.snapshot().overflowed);
+        d.clear_overflow_through(u64::MAX);
+        assert!(!d.snapshot().overflowed);
+    }
+
+    #[test]
+    fn test_unrecordable_total_counts_each_zero_sequence() {
+        let d = DeferredDepth::new_for_tests();
+        d.note_shed(0, ShedDepth::Inline);
+        d.note_shed(0, ShedDepth::Dedicated);
+        d.note_shed(seq(1), ShedDepth::Inline);
+        assert_eq!(d.unrecordable_total(), 2);
+    }
 }
