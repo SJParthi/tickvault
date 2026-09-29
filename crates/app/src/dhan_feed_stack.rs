@@ -4561,13 +4561,24 @@ impl LiveIngest {
     }
 
     /// Ends a WAL replay: hands the candle fold over to the live feed (plan
-    /// ITEM 47, [`MultiTfAggregator::finish_replay`]). A no-op when no replay
-    /// ran.
+    /// ITEM 47, [`MultiTfAggregator::finish_replay`]). `ended_on_gap` is
+    /// `true` when frames after the last replayed one were skipped or left
+    /// unread. A no-op when no replay ran.
     ///
     /// # Complexity
     /// O(slots × TF), once per lane start.
-    pub fn finish_wal_replay(&mut self) {
-        self.aggregator.finish_replay();
+    pub fn finish_wal_replay(&mut self, ended_on_gap: bool) {
+        let (tainted, suppressed) = self.aggregator.finish_replay(ended_on_gap);
+        if tainted > 0 || suppressed > 0 {
+            info!(
+                ended_on_gap,
+                tainted_buckets = tainted,
+                suppressed_partial_bars = suppressed,
+                "WAL replay handed over to the live feed. Candles the replay could only \
+                 partly see were not written, so they cannot overwrite the complete \
+                 candles already stored; buckets still open are held back the same way"
+            );
+        }
     }
 
     /// `watermark − CATCHUP_LATENESS_MARGIN_SECS`, saturating at 0 (seal
@@ -10211,6 +10222,15 @@ pub struct DhanFeedStackParams {
     /// in the replay (plan ITEM 47): frames before them were not replayed,
     /// so the candle fold must not carry its volume baseline across.
     pub wal_replay_gaps: Vec<usize>,
+    /// Whether the boot replay pass ENDED on a gap (plan ITEM 47): frames
+    /// after its last live-feed frame were skipped. `None` when the pass
+    /// returned nothing. Carried into the catch-up drain, whose first round
+    /// continues that pass.
+    pub wal_replay_trailing_gap: Option<bool>,
+    /// Capture sequence of the boot pass's last candle-bearing frame, so the
+    /// catch-up drain can flag a capture jump across the pass boundary (plan
+    /// ITEM 47).
+    pub wal_replay_last_fold_seq: Option<u64>,
     /// Main-feed instruments (the hardcoded index set — see
     /// [`hardcoded_index_universe`]).
     pub main_feed_instruments: Vec<SubscribeInstrument>,
@@ -15022,6 +15042,10 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // recovered frame therefore cannot race a live frame for the same
     // `capture_seq`, and the gap detector already knows every instrument, so a
     // recovered tick lands against a seeded slot rather than creating one.
+    // Plan ITEM 47: whether the WAL replay (boot + catch-up) ended with frames
+    // after its last one skipped or unread. Decides, at the hand-over, whether
+    // every bucket still open is held back or only the partial ones.
+    let mut replay_ended_on_gap = false;
     if !params.wal_replay_live_feed.is_empty() {
         // ORDERING PIN -- added 2026-08-28.
         //
@@ -15248,11 +15272,13 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         // one state in which the applied-watermark's unapplied buckets can be
         // cleared: everything they guarded has been replayed and confirmed.
         let mut catchup_drained = false;
-        // Plan ITEM 47: whether the previous catch-up round ended on a real
-        // gap. Rounds are consecutive reads of one backlog, so a round that
-        // follows a clean one does not start after a gap, whatever the replay
-        // pass assumes about its own first frame.
-        let mut catchup_prev_trailing_gap = false;
+        // Plan ITEM 47: whether the previous pass (the boot pass, then each
+        // catch-up round) ended on a real gap. They are consecutive reads of
+        // one backlog, so a round that follows a clean pass does not start
+        // after a gap, whatever the replay assumes about its own first frame.
+        // `None` = unknown, treated as a gap.
+        let mut catchup_prev_trailing_gap: Option<bool> = params.wal_replay_trailing_gap;
+        let mut catchup_last_fold_seq: Option<u64> = params.wal_replay_last_fold_seq;
         // Every segment this drain can confirm holds frames below THIS point;
         // a shed from a socket dialed during the drain lands above it and its
         // bucket must survive the reset at the end.
@@ -15398,18 +15424,16 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             // with the boot path so one series answers "how many of these have
             // we seen", regardless of which drain saw them.
             let batch_len = batch.frames.len();
-            // Plan ITEM 47: the first round follows the boot replay across the
-            // downtime, a real gap; a later round continues the previous one
-            // unless that one ended on a gap or this one skipped something
-            // before its first frame.
-            if rounds > 0
-                && !catchup_prev_trailing_gap
+            // Plan ITEM 47: this round continues the previous pass unless that
+            // one ended on a gap or this one skipped something before its
+            // first frame.
+            if catchup_prev_trailing_gap == Some(false)
                 && !batch.leading_gap
                 && let Some(first) = batch.frames.first_mut()
             {
                 first.after_gap = false;
             }
-            catchup_prev_trailing_gap = batch.trailing_gap;
+            let batch_trailing_gap = batch.trailing_gap;
             let mut staged: Vec<(u64, i64, WalEndpoint, bytes::Bytes)> =
                 Vec::with_capacity(batch_len);
             // Plan ITEM 47: indexes into `staged` of frames that follow a gap.
@@ -15420,6 +15444,16 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             // O(1) EXEMPT: begin — one pass over a catch-up batch on the boot drain, cold path
             for f in batch.frames {
                 gap_carry |= f.after_gap;
+                if tickvault_storage::ws_frame_spill::frame_feeds_the_candle_fold(
+                    f.ws_type, f.endpoint,
+                ) {
+                    if let Some(prev) = catchup_last_fold_seq
+                        && tickvault_storage::ws_frame_spill::capture_jump_is_gap(prev, f.frame_seq)
+                    {
+                        gap_carry = true;
+                    }
+                    catchup_last_fold_seq = Some(f.frame_seq);
+                }
                 if f.ws_type != tickvault_storage::ws_frame_spill::WsType::LiveFeed {
                     continue;
                 }
@@ -15434,6 +15468,10 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 ));
             }
             // O(1) EXEMPT: end
+            // A gap flagged on a frame after the last live-feed one (an
+            // order-update or TrueData frame) is still a gap at this round's
+            // end; so is one on a round that stages nothing.
+            catchup_prev_trailing_gap = Some(batch_trailing_gap || gap_carry);
             let not_folded = batch_len.saturating_sub(staged.len());
             if not_folded > 0 {
                 catchup_not_folded = catchup_not_folded.saturating_add(not_folded as u64);
@@ -15488,6 +15526,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 "WAL catch-up drain round complete"
             );
         }
+        replay_ended_on_gap = !catchup_drained || catchup_prev_trailing_gap.unwrap_or(true);
         if catchup_drained {
             // Every captured frame is now either in the database, in a spill
             // file, or archived — the unapplied map has nothing left to guard.
@@ -15680,7 +15719,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     let (seed_tx, seed_rx) = tokio::sync::mpsc::channel::<Vec<SubscribeInstrument>>(8);
     // Plan ITEM 47: the WAL replay (boot + catch-up) is over; hand over to the
     // live feed before its first frame folds.
-    ingest.finish_wal_replay();
+    ingest.finish_wal_replay(replay_ended_on_gap);
     let drain = tokio::spawn(run_frame_drain(
         frame_rx,
         ingest,
@@ -18549,6 +18588,8 @@ mod tests {
             // main.rs still drops the batch loudly when the gate is closed.
             wal_replay_live_feed: Vec::new(),
             wal_replay_gaps: Vec::new(),
+            wal_replay_trailing_gap: None,
+            wal_replay_last_fold_seq: None,
             main_feed_instruments: hardcoded_index_universe(),
             depth_20_instruments: Vec::new(),
             depth_200_instruments: Vec::new(),
@@ -23106,7 +23147,7 @@ mod wal_refold_tests {
     fn test_finish_wal_replay_runs_once_between_the_catch_up_and_the_drain() {
         let src = include_str!("dhan_feed_stack.rs");
         let prod = src.split("#[cfg(test)]").next().expect("production half");
-        let call = "ingest.finish_wal_replay();";
+        let call = "ingest.finish_wal_replay(replay_ended_on_gap);";
         assert_eq!(prod.matches(call).count(), 1, "exactly one hand-over");
         let finish = prod.find(call).expect("hand-over present");
         let catch_up = prod
@@ -23128,6 +23169,20 @@ mod wal_refold_tests {
             !refold.contains("set_replay_mode(false)") && !refold.contains("finish_replay"),
             "the refold must not end replay mode between catch-up rounds"
         );
+        // Review round 2: a jump in capture time (one process's frames meeting
+        // the next one's) is a gap in BOTH readers of the WAL, and the pass
+        // end is carried from the boot pass into the catch-up drain.
+        let main_src = include_str!("main.rs");
+        for (name, text) in [("main.rs", main_src), ("dhan_feed_stack.rs", prod)] {
+            assert!(
+                text.contains("capture_jump_is_gap("),
+                "{name} must flag a capture jump as a replay gap"
+            );
+        }
+        assert!(main_src.contains("wal_replay_trailing_gap: ws_wal_replay_trailing_gap,"));
+        assert!(main_src.contains("wal_replay_last_fold_seq: ws_wal_replay_last_fold_seq,"));
+        assert!(prod.contains("params.wal_replay_trailing_gap;"));
+        assert!(prod.contains("params.wal_replay_last_fold_seq;"));
     }
 
     /// The 2026-09-01 finding: a depth-socket frame in the live-feed WAL was

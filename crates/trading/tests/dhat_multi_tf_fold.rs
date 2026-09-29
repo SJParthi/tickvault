@@ -76,6 +76,10 @@ fn dhat_consume_tick_zero_alloc_in_bucket_and_across_boundaries() {
     let warm = tick_at(OPEN, 24_000.0, 10);
     agg.consume_tick(Feed::Dhan, &warm, None, |_, _, _, _, _| {});
 
+    // Phase (d) counts across every attempt: a re-attempt re-runs the same
+    // ticks, which are then late, so a per-attempt count could read 0.
+    let mut replay_suppressed = 0u32;
+    let mut replay_live_sealed = 0usize;
     let (_, allocs) = dhat_support::measure_with_phantom_retry(
         0,
         0,
@@ -133,7 +137,50 @@ fn dhat_consume_tick_zero_alloc_in_bucket_and_across_boundaries() {
                  phase (c) measures the ordinary fold and passes vacuously; \
                  got {repeats} of 10,000"
             );
+
+            // (d) WAL-REPLAY GAPS, added 2026-09-29 with plan ITEM 47 after
+            // review found these branches ran under no allocation gate: the
+            // lazy gap sync, the post-gap cell re-base, both suppression arms,
+            // the seal-sweep sync, and the one-off hand-over to live mode.
+            agg.set_replay_mode(true);
+            let mut cum = 300_000u32;
+            for gap in 0..200u32 {
+                agg.mark_replay_gap();
+                for step in 0..3u32 {
+                    cum += 5;
+                    let t = tick_at(
+                        OPEN + 2 * 3_600 + gap * 61 + step * 20,
+                        24_000.0 + (step as f32) * 0.05,
+                        cum,
+                    );
+                    replay_suppressed += u32::from(
+                        agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {})
+                            .replay_partial_suppressed,
+                    );
+                }
+            }
+            agg.catch_up_seal_all(OPEN + 6 * 3_600, |_, _, _, _, _| {});
+            agg.finish_replay(false);
+            // Live ticks from 15:16: the replay above ran to ~14:38, and an
+            // earlier live tick would be late and discarded, sealing nothing.
+            for minute in 1..=10u32 {
+                cum += 7;
+                let t = tick_at(OPEN + 6 * 3_600 + minute * 60, 24_010.0, cum);
+                agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {
+                    replay_live_sealed += 1;
+                });
+            }
         },
+    );
+
+    assert!(
+        replay_suppressed > 0,
+        "phase (d) must reach the replay suppression arm, or it measures \
+         nothing and passes vacuously"
+    );
+    assert!(
+        replay_live_sealed > 0,
+        "phase (d) must seal live bars after the hand-over"
     );
 
     assert_eq!(

@@ -842,29 +842,42 @@ impl AggregatorCell {
 
     /// Re-bases the open buckets after a WAL-replay GAP (plan ITEM 47): the
     /// counter did not restart, the replay just skipped a span of it.
+    /// `fold_secs` is the fold second of the tick that follows the gap.
     ///
-    /// Same re-base and carry drop as [`Self::rebase_open_buckets`], but the
-    /// chain is broken ONLY for a frame with no open bucket. An open bucket
-    /// re-based here has its right endpoint on the post-gap cumulative, so the
-    /// next bucket chains to it exactly, and must: breaking it would anchor
-    /// that bucket on its rolling tick and lose the tick's volume from a bar
-    /// that is otherwise complete (found by review, 2026-09-29). A frame with
-    /// no open bucket would chain to its last SEALED bar, whose endpoint is
-    /// from before the gap — that one must anchor on the live cumulative.
+    /// Per frame, three cases:
+    /// - **The tick lands in the SAME open bucket.** The whole skipped span
+    ///   lies inside that bucket, so the cumulative counter attributes its
+    ///   volume exactly: nothing is re-based and the carry is kept. (Re-basing
+    ///   here dropped the whole downtime span from the first live bar after
+    ///   every restart — review, 2026-09-29.) Its high/low still miss the
+    ///   skipped ticks, which is why the caller keeps it marked partial.
+    /// - **The tick rolls the open bucket.** It is re-based on the post-gap
+    ///   cumulative, keeping the volume it counted, and the next bucket chains
+    ///   to that endpoint — breaking the chain there would anchor it on its
+    ///   rolling tick and lose that tick's volume from a bar that is
+    ///   otherwise complete.
+    /// - **Nothing is open.** The chain is broken: the next bucket would
+    ///   otherwise chain to the last SEALED bar, whose endpoint is from before
+    ///   the gap.
     ///
     /// # Complexity
     /// O(`TF_COUNT`).
-    pub fn rebase_open_buckets_after_gap(&mut self, cumulative_volume: u64) {
-        for (state, broken) in self.slots.iter_mut().zip(self.chain_broken.iter_mut()) {
+    pub fn rebase_open_buckets_after_gap(&mut self, cumulative_volume: u64, fold_secs: u32) {
+        for tf in TfIndex::ALL {
+            let ord = tf.as_ordinal();
+            let state = &mut self.slots[ord];
             let open = !state.is_uninitialised();
+            if open && tf.bucket_start(fold_secs) == state.bucket_start_ist_secs {
+                continue;
+            }
             if open {
                 state.bucket_start_cumulative = cumulative_volume.saturating_sub(state.volume);
             }
-            *broken = !open;
+            self.chain_broken[ord] = !open;
+            self.carried_upto[ord] = 0;
+            self.carried_net[ord] = 0;
+            self.carried_unclassified[ord] = false;
         }
-        self.carried_upto = [0; TF_COUNT];
-        self.carried_net = [0; TF_COUNT];
-        self.carried_unclassified = [false; TF_COUNT];
     }
     /// Folds one tick into ONE timeframe slot.
     ///
@@ -2887,16 +2900,22 @@ mod tests {
     /// chains to the re-based endpoint and keeps its rolling tick's volume.
     #[test]
     fn test_rebase_open_buckets_after_gap_breaks_the_chain_only_where_nothing_is_open() {
-        let mut cell = AggregatorCell::empty();
-        // M1 open with 7 counted; every other frame never opened.
-        let m1 = &mut cell.slots[TfIndex::M1.as_ordinal()];
-        m1.bucket_start_ist_secs = 33_300;
-        m1.bucket_start_cumulative = 10;
-        m1.volume = 7;
-        assert!(!cell.snapshot(TfIndex::M1).is_uninitialised());
-        assert!(cell.snapshot(TfIndex::S1).is_uninitialised());
-        cell.chain_broken = [false; TF_COUNT];
-        cell.rebase_open_buckets_after_gap(100_000);
+        let open_m1 = || {
+            let mut cell = AggregatorCell::empty();
+            // M1 open at 09:15 with 7 counted; every other frame never opened.
+            let m1 = &mut cell.slots[TfIndex::M1.as_ordinal()];
+            m1.bucket_start_ist_secs = 33_300;
+            m1.bucket_start_cumulative = 10;
+            m1.volume = 7;
+            cell.carried_upto[TfIndex::M1.as_ordinal()] = 3;
+            cell.chain_broken = [false; TF_COUNT];
+            cell
+        };
+
+        // The post-gap tick ROLLS M1 (it lands at 11:06:40): re-based,
+        // counted volume kept, chain intact; unopened frames break it.
+        let mut cell = open_m1();
+        cell.rebase_open_buckets_after_gap(100_000, 40_000);
         for tf in TfIndex::ALL {
             let open = !cell.snapshot(tf).is_uninitialised();
             assert_eq!(
@@ -2904,14 +2923,32 @@ mod tests {
                 !open,
                 "{tf:?}: chain broken exactly when no bucket is open"
             );
-            if open {
-                assert_eq!(
-                    cell.snapshot(tf).bucket_start_cumulative,
-                    100_000 - cell.snapshot(tf).volume,
-                    "{tf:?}: re-based onto the post-gap cumulative, volume kept"
-                );
-            }
         }
+        let m1 = cell.snapshot(TfIndex::M1);
+        assert_eq!(
+            m1.bucket_start_cumulative,
+            100_000 - 7,
+            "re-based, volume kept"
+        );
+        assert_eq!(
+            cell.carried_upto[TfIndex::M1.as_ordinal()],
+            0,
+            "carry dropped"
+        );
+
+        // The post-gap tick lands INSIDE the open M1 bucket (09:15:30): the
+        // whole skipped span is in this bucket, so nothing moves and the
+        // cumulative attributes it exactly.
+        let mut cell = open_m1();
+        cell.rebase_open_buckets_after_gap(100_000, 33_330);
+        let m1 = cell.snapshot(TfIndex::M1);
+        assert_eq!(m1.bucket_start_cumulative, 10, "same bucket: not re-based");
+        assert!(!cell.chain_broken[TfIndex::M1.as_ordinal()]);
+        assert_eq!(
+            cell.carried_upto[TfIndex::M1.as_ordinal()],
+            3,
+            "same bucket: carry kept"
+        );
     }
 
     #[test]
