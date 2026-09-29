@@ -4321,6 +4321,7 @@ fn prune_wal_dir_at(
             if remaining <= max_bytes {
                 break;
             }
+            // O(1) EXEMPT: periodic cold WAL prune under the disk floor, never the per-frame append
             match std::fs::remove_file(&s.path) {
                 Ok(()) => {
                     remaining = remaining.saturating_sub(s.len);
@@ -4718,7 +4719,7 @@ pub struct SegmentSpan {
 /// clear their protection while the segments are still on disk.
 pub fn deferred_segment_spans(wal_dir: &Path) -> std::io::Result<Vec<SegmentSpan>> {
     let mut paths: Vec<PathBuf> = Vec::with_capacity(ARCHIVE_PRUNE_SURVIVOR_HINT);
-    // O(1) EXEMPT: cold after-close listing, bounded by the segments on disk
+    // O(1) EXEMPT: begin — cold after-close listing, bounded by the segments on disk
     for dir in [
         wal_dir.to_path_buf(),
         wal_dir.join(REPLAYING_SUBDIR),
@@ -4742,6 +4743,7 @@ pub fn deferred_segment_spans(wal_dir: &Path) -> std::io::Result<Vec<SegmentSpan
             }
         }
     }
+    // O(1) EXEMPT: end
     paths.sort_by(|a, b| a.file_name().cmp(&b.file_name())); // O(1) EXEMPT: cold listing
     let firsts: Vec<u64> = paths
         .iter()
@@ -4786,7 +4788,7 @@ pub fn segments_for_bucket(spans: &[SegmentSpan], bucket_id: u64) -> BucketSegme
     // The start of the last readable segment seen, so an unreadable one can be
     // placed between its neighbours.
     let mut prev_lo_id: u64 = 0;
-    // O(1) EXEMPT: cold after-close lookup, one pass over the listing
+    // O(1) EXEMPT: begin — cold after-close lookup, one pass over the listing
     for (idx, span) in spans.iter().enumerate() {
         if span.lo == 0 {
             let next_lo_id = spans
@@ -4805,10 +4807,11 @@ pub fn segments_for_bucket(spans: &[SegmentSpan], bucket_id: u64) -> BucketSegme
             if span.is_open {
                 out.touches_open = true;
             } else {
-                out.paths.push(span.path.clone());
+                out.paths.push(span.path.clone()); // APPROVED: cold after-close lookup, one path per covering segment
             }
         }
     }
+    // O(1) EXEMPT: end
     out
 }
 
@@ -4833,9 +4836,9 @@ pub struct SegmentRead {
 ///
 /// # Errors
 /// The file could not be opened or read.
-pub fn read_segment_frames_matching(
+pub fn read_segment_frames_matching<F: Fn(u64, WalEndpoint) -> bool>(
     path: &Path,
-    keep: &dyn Fn(u64, WalEndpoint) -> bool,
+    keep: &F,
 ) -> anyhow::Result<SegmentRead> {
     replay_segment_core(path, None, keep, false)
 }
@@ -4844,10 +4847,10 @@ pub fn read_segment_frames_matching(
 /// [`read_segment_frames_matching`]. `report_corruption` is `false` only for
 /// the deferred-depth pass, whose segments are NOT moved to the archive on
 /// damage — the replay's log text would say otherwise.
-fn replay_segment_core(
+fn replay_segment_core<F: Fn(u64, WalEndpoint) -> bool>(
     path: &Path,
     applied: Option<&crate::wal_applied_watermark::AppliedSnapshot>,
-    keep: &dyn Fn(u64, WalEndpoint) -> bool,
+    keep: &F,
     report_corruption: bool,
 ) -> anyhow::Result<SegmentRead> {
     let mut unreadable = false;
@@ -9296,9 +9299,11 @@ mod tests {
         let now = SystemTime::now();
         let a = write_wm_segment(&dir, 0, 3, WalEndpoint::MainFeed);
         let b = write_wm_segment(&dir, 1_000, 3, WalEndpoint::MainFeed);
-        let mut deferred = crate::wal_deferred_depth::DeferredDepthSnapshot::default();
-        deferred.overflowed = true;
-        deferred.overflow_high_seq = u64::MAX;
+        let deferred = crate::wal_deferred_depth::DeferredDepthSnapshot {
+            overflowed: true,
+            overflow_high_seq: u64::MAX,
+            ..Default::default()
+        };
         let out = prune_active_segments_deferred_at(
             &dir,
             172_800,

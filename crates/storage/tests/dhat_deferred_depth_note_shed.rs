@@ -53,7 +53,7 @@ fn dhat_note_shed_is_zero_allocation_on_every_arm() {
     );
 
     assert!(
-        bytes <= BUDGET_BYTES && blocks <= BUDGET_BLOCKS,
+        bytes == BUDGET_BYTES && blocks == BUDGET_BLOCKS,
         "DeferredDepth::note_shed allocated {bytes} bytes / {blocks} blocks over 10,000 \
          calls. It runs on the frame drain for every shed packet and must stay atomics \
          only — no Vec, no String, no metrics macro."

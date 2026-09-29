@@ -84,11 +84,15 @@ pub const AFTER_CLOSE_DEPTH_STOP_SECS_IST: u64 = 17 * 3_600 + 15 * 60;
 /// to prove the window ends in time; the stop itself is terraform's.
 const BOX_STOP_SECS_IST: u64 = 17 * 3_600 + 30 * 60;
 /// Sleep while paused.
-pub const AFTER_CLOSE_PAUSE: Duration = Duration::from_secs(10);
+pub const AFTER_CLOSE_PAUSE_SECS: u64 = 10;
+/// [`AFTER_CLOSE_PAUSE_SECS`] as a `Duration`.
+pub const AFTER_CLOSE_PAUSE: Duration = Duration::from_secs(AFTER_CLOSE_PAUSE_SECS);
 /// Wait after the last flush before trusting the acks: one WAL-suspension
 /// poll (60 s, `wal_suspension_watcher::WAL_SUSPENSION_POLL_INTERVAL_SECS`)
 /// plus five seconds.
-pub const AFTER_CLOSE_SETTLE: Duration = Duration::from_secs(65);
+pub const AFTER_CLOSE_SETTLE_SECS: u64 = 65;
+/// [`AFTER_CLOSE_SETTLE_SECS`] as a `Duration`.
+pub const AFTER_CLOSE_SETTLE: Duration = Duration::from_secs(AFTER_CLOSE_SETTLE_SECS);
 
 // The settle must fit between the stop and the box stop.
 const _: () =
