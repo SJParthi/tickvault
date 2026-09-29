@@ -1544,6 +1544,10 @@ impl MultiTfAggregator {
             && fold_secs == slot.last_trade_ts
             && cumulative_volume == slot.last_cumulative
             && slot.last_ltp.to_bits() == prices.last_traded_price.to_bits();
+        // The fold second of the last tick whose cumulative COUNTED, before
+        // this tick replaces it: after a gap, only a bucket that holds it can
+        // take the skipped span (plan ITEM 47, review round 4).
+        let last_counted_secs = slot.last_trade_ts;
         if !is_stale_packet {
             slot.last_ltp = prices.last_traded_price;
             slot.last_trade_ts = fold_secs;
@@ -1677,14 +1681,19 @@ impl MultiTfAggregator {
         // per gap.
         // A counter restart inside the skipped span is handled by the
         // restart's own full re-base above, which also breaks every chain.
-        let next_bucket_partial =
-            seeded_now || gap_now || (restarted && slot.replay_gap_rebase_pending);
+        // Any tick that rolls a bucket while a gap is still pending opens a
+        // partial one: a stale packet leaves the gap pending, and the bucket
+        // it opens chains to the pre-gap end (review round 4).
+        let next_bucket_partial = seeded_now || slot.replay_gap_rebase_pending;
         if restarted {
             slot.replay_gap_rebase_pending = false;
         } else if gap_now {
             slot.replay_gap_rebase_pending = false;
-            slot.cell
-                .rebase_open_buckets_after_gap(cumulative_volume, fold_secs);
+            slot.cell.rebase_open_buckets_after_gap(
+                cumulative_volume,
+                fold_secs,
+                last_counted_secs,
+            );
         }
 
         for tf in TfIndex::ALL {
@@ -2087,14 +2096,16 @@ impl MultiTfAggregator {
     /// the next were skipped, because the database had already applied them
     /// (plan ITEM 47).
     ///
-    /// Every slot's volume baseline and tick-rule carry are un-seeded, so the
-    /// first tick after the gap re-seeds instead of taking the whole skipped
-    /// span's volume into one bar — the 2026-09-28 defect, 733,406 shares in
-    /// one second for one stock. Every open bucket is marked partial: its tail
-    /// is missing.
+    /// The first non-stale tick after the gap discards its own delta instead
+    /// of taking the whole skipped span's volume into one bar — the
+    /// 2026-09-28 defect, 733,406 shares in one second for one stock. The
+    /// baseline stays seeded, so the stale-packet and counter-restart checks
+    /// still run on that tick. Every open bucket and last-sealed bar is marked
+    /// partial: its tail, or a late amendment to it, may be missing.
     ///
-    /// Undercount, never overcount: the bucket the re-seeding tick lands in
-    /// misses that tick's own delta, and is itself marked partial.
+    /// Undercount, never overcount: a bucket that tick opens misses its delta
+    /// and is itself marked partial; only a bucket that also holds the last
+    /// counted tick takes the span, which the cumulative attributes exactly.
     ///
     /// # Complexity
     /// O(1). The gap is recorded as an epoch bump; each slot applies it the
@@ -2149,6 +2160,13 @@ impl MultiTfAggregator {
             return (0, 0);
         }
         let epoch = self.replay_gap_epoch;
+        // The hand-over gap (the downtime before the first live frame) is
+        // applied HERE, eagerly, rather than through the lazy epoch sync: the
+        // sync would mark every open bucket partial, and a complete one would
+        // then be suppressed by the live `ended_before_capture` rule — after a
+        // crash, the last bars the replay rebuilt in full, which exist nowhere
+        // else (review round 4).
+        let hand_over_epoch = epoch.wrapping_add(1);
         let mut tainted = 0_u64;
         // O(1) EXEMPT: begin — once per boot, at the WAL-replay to live hand-over, never per tick
         for slot in &mut self.slots {
@@ -2172,10 +2190,20 @@ impl MultiTfAggregator {
                 slot.replay_sealed_partial
             };
             tainted = tainted.saturating_add(u64::from(slot.replay_taint_open.count_ones()));
+            // The hand-over gap: the next accepted tick discards its delta and
+            // re-bases, as after any gap. A frame with nothing open is partial
+            // (its next bucket misses that tick); an open bucket keeps its
+            // bits: a tainted one is held back by the taint, a complete one
+            // stays complete and carries on with live ticks.
+            slot.replay_gap_epoch_seen = hand_over_epoch;
+            slot.last_tick_sign = 0;
+            slot.replay_gap_rebase_pending = true;
+            slot.replay_open_partial =
+                (REPLAY_ALL_TF_MASK & !open_mask) | (slot.replay_open_partial & open_mask);
         }
         // O(1) EXEMPT: end
+        self.replay_gap_epoch = hand_over_epoch;
         self.replay_mode = false;
-        self.mark_replay_gap();
         (tainted, self.replay_suppressed_total)
     }
 
@@ -2186,6 +2214,14 @@ impl MultiTfAggregator {
     /// carrying an old last-trade time, of a bar the previous process owned
     /// (see [`Self::live_capture_from_secs`]). Call once, before the first
     /// live frame. O(1).
+    ///
+    /// **Honest limits (review round 4):** a partial bar for a bucket that
+    /// ended during a DOWNTIME, when no process owned it, is held back too:
+    /// it would be a one-trade, zero-volume fragment either way. And if the
+    /// box clock runs a few seconds ahead of the exchange, the first partial
+    /// 1/3/5-second bars after a mid-session restart can be held back. At a
+    /// pre-market boot the capture start precedes every bucket, so nothing
+    /// changes there.
     pub fn set_live_capture_start(&mut self, ist_fold_secs: u32) {
         self.live_capture_from_secs = ist_fold_secs;
     }
@@ -2193,11 +2229,11 @@ impl MultiTfAggregator {
 
 impl InstrumentSlot {
     /// Applies a replay gap marked since this slot was last touched: the
-    /// volume baseline and tick-rule carry are un-seeded, so the first tick
-    /// after the gap re-seeds instead of taking the whole skipped span's
-    /// volume into one bar (the 2026-09-28 defect, 733,406 shares in one
-    /// second for one stock); every open bucket is marked partial, because
-    /// its tail is missing; and the next accepted tick re-bases the cell.
+    /// tick-rule carry is cleared, every open bucket and last-sealed bar is
+    /// marked partial (its tail, or a late amendment, may be missing), and the
+    /// next non-stale tick discards its own delta and re-bases the cell, so
+    /// the skipped span's volume lands in no bar (the 2026-09-28 defect,
+    /// 733,406 shares in one second for one stock). The baseline stays seeded.
     /// O(1); one compare when there is nothing to apply.
     #[inline]
     fn sync_replay_gap(&mut self, epoch: u64) {
@@ -2642,6 +2678,9 @@ mod tests {
                 |_, _, _, _, _| {},
             );
         }
+        // As in production: the lane records when it began listening, here
+        // after the complete minute ended (a crash-restart; review round 4).
+        agg.set_live_capture_start(OPEN + 3_000);
         agg.finish_replay(false);
         let mut sealed: Vec<(TfIndex, u32, i64)> = Vec::new();
         agg.catch_up_seal_all(OPEN + 100_000, |_, _, _, tf, st| {
@@ -2654,23 +2693,24 @@ mod tests {
             "the complete minute is emitted after the hand-over: {sealed:?}"
         );
 
-        // After the hand-over, a live bucket is live data: emitted.
+        // After the hand-over, a live bucket opened after the capture start is
+        // live data: emitted.
         let mut out = 0_usize;
         agg.consume_tick(
             Feed::Dhan,
-            &tick(GAP_SID, SEG_EQ, OPEN + 600, 1_215.0, 2_000),
+            &tick(GAP_SID, SEG_EQ, OPEN + 3_600, 1_215.0, 2_000),
             None,
             |_, _, _, _, _| {},
         );
         agg.consume_tick(
             Feed::Dhan,
-            &tick(GAP_SID, SEG_EQ, OPEN + 610, 1_215.0, 2_010),
+            &tick(GAP_SID, SEG_EQ, OPEN + 3_610, 1_215.0, 2_010),
             None,
             |_, _, _, _, _| {},
         );
         agg.consume_tick(
             Feed::Dhan,
-            &tick(GAP_SID, SEG_EQ, OPEN + 671, 1_215.0, 2_020),
+            &tick(GAP_SID, SEG_EQ, OPEN + 3_671, 1_215.0, 2_020),
             None,
             |_, _, _, tf, _| {
                 if tf == TfIndex::M1 {
@@ -3024,6 +3064,45 @@ mod tests {
             reemitted(true),
             0,
             "ended on a gap: the last sealed bar is held"
+        );
+    }
+
+    /// Review round 4 (2026-09-29): a STALE first packet after a gap that
+    /// rolls a bucket opens it chained to the pre-gap end. The next tick lands
+    /// in that bucket, but the skipped span began in the previous one, so the
+    /// new bucket must not take it, and it is partial.
+    #[test]
+    fn test_mark_replay_gap_stale_packet_rolling_a_bucket_opens_it_partial() {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        agg.set_replay_mode(true);
+        let t0 = OPEN + 600;
+        let mut m1: Vec<(u32, u64)> = Vec::new();
+        let mut feed = |agg: &mut MultiTfAggregator, ts: u32, cum: u32| {
+            agg.consume_tick(
+                Feed::Dhan,
+                &tick(GAP_SID, SEG_EQ, ts, 1_215.0, cum),
+                None,
+                |_, _, _, tf, st| {
+                    if tf == TfIndex::M1 {
+                        m1.push((st.bucket_start_ist_secs, st.volume));
+                    }
+                },
+            );
+        };
+        for (ts, cum) in [(t0 + 5, 990), (t0 + 10, 1_000)] {
+            feed(&mut agg, ts, cum);
+        }
+        agg.mark_replay_gap(); // the skipped span traded up to 1,500
+        feed(&mut agg, t0 + 62, 999); // stale, but it rolls the t0 minute
+        feed(&mut agg, t0 + 65, 1_600); // the first counted tick after the gap
+        feed(&mut agg, t0 + 125, 1_700); // rolls the t0 + 60 minute
+        assert!(
+            !m1.iter().any(|(start, _)| *start == t0 + 60),
+            "the minute the stale packet opened is partial and not written: {m1:?}"
+        );
+        assert!(
+            m1.iter().all(|(_, v)| *v < 500),
+            "no minute takes the skipped span: {m1:?}"
         );
     }
 

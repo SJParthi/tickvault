@@ -15475,7 +15475,14 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                     {
                         gap_carry = true;
                     }
-                    catchup_last_fold_receipt = Some(f.received_at_nanos);
+                    // A record with no known receipt (legacy) does not reset
+                    // the comparison point.
+                    if tickvault_storage::ws_frame_spill::plausible_receipt_nanos(
+                        f.received_at_nanos,
+                    ) != tickvault_storage::ws_frame_spill::WAL_RECEIPT_UNKNOWN_NANOS
+                    {
+                        catchup_last_fold_receipt = Some(f.received_at_nanos);
+                    }
                 }
                 if f.ws_type != tickvault_storage::ws_frame_spill::WsType::LiveFeed {
                     continue;
