@@ -3259,6 +3259,9 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
     // A rename that fails leaves the segment a `*.wal`; the next pass skips
     // it again, so nothing applied is ever re-read by accident of this.
     // O(1) EXEMPT: begin — one rename per skipped segment, boot replay cold path
+    // Restores that fail, here and for DEFERRED segments below: both leave a
+    // segment in `replaying/`, where the confirm archives it unread.
+    let mut restore_failures = 0usize;
     for (path, next_kept) in &pending_skips {
         if *next_kept > consumed {
             // Past the stop. A leftover in `replaying/` goes back to the live
@@ -3269,7 +3272,18 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
                 && let Some(name) = path.file_name()
                 && let Err(err) = std::fs::rename(path, wal_dir.join(name))
             {
-                warn!(segment = ?path, error = %err, "could not return a skipped WAL segment to the live dir; the next pass may miss the gap it leaves");
+                // Coded and counted like the deferred restore below (review
+                // round 7): archived unread, it hides the gap it leaves.
+                restore_failures = restore_failures.saturating_add(1);
+                error!(
+                    code = ErrorCode::WsSpill02FrameDropped.code_str(),
+                    segment = ?path,
+                    error = %err,
+                    "WAL replay could not return a SKIPPED staged segment to the live \
+                     directory. The confirm step will archive it, and the next pass will \
+                     not see the gap it leaves, so bars across that gap may be rebuilt \
+                     from part of their ticks."
+                );
             }
             continue;
         }
@@ -3328,7 +3342,6 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
     // and it gets a coded error plus a counter rather than a shrug. Both
     // renames are within one filesystem between sibling directories, so a
     // failure here means the staging renames below are failing too.
-    let mut restore_failures = 0usize;
     for path in segments.iter().skip(consumed) {
         if path.parent() != Some(replaying_dir.as_path()) {
             continue; // never staged; a live `*.wal` is already re-globbable

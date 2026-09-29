@@ -2647,7 +2647,14 @@ impl LiveIngest {
             // up writing a store a different reader is holding. Boot clones
             // the `Arc` straight back out for the attach tasks.
             spot_prices: std::sync::Arc::new(crate::spot_price_store::SpotPriceStore::new()),
-            aggregator: MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, capacity),
+            aggregator: {
+                let mut aggregator =
+                    MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, capacity);
+                // A WAL replay judges late ticks by the SAME margin the live
+                // catch-up seal uses (plan ITEM 47, review round 7).
+                aggregator.set_catch_up_margin_secs(CATCHUP_LATENESS_MARGIN_SECS);
+                aggregator
+            },
             writer,
             seq_refused: 0,
             refused_price: 0,
@@ -15109,6 +15116,9 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // after its last one skipped or unread. Decides, at the hand-over, whether
     // every bucket still open is held back or only the partial ones.
     let mut replay_ended_on_gap = false;
+    // Whether the boot pass archived its segments. If not, they stay staged
+    // and catch-up round 0 reads the same frames again (review round 7).
+    let mut boot_refold_confirmed = false;
     if !params.wal_replay_live_feed.is_empty() {
         // ORDERING PIN -- added 2026-08-28.
         //
@@ -15252,6 +15262,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 tickvault_storage::ws_frame_spill::confirm_replayed(
                     crate::boot_helpers::ws_wal_dir(),
                 );
+                boot_refold_confirmed = true;
             }
             if flushed > 0 {
                 info!(
@@ -15340,7 +15351,15 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         // one backlog, so a round that follows a clean pass does not start
         // after a gap, whatever the replay assumes about its own first frame.
         // `None` = unknown, treated as a gap.
-        let mut catchup_prev_trailing_gap: Option<bool> = params.wal_replay_trailing_gap;
+        // A boot pass that was NOT confirmed left its segments staged, so
+        // round 0 re-reads its frames: fold them as after a gap, or a
+        // re-read zero-volume tick would count twice in a bar that is then
+        // written (review round 7).
+        let mut catchup_prev_trailing_gap: Option<bool> = if boot_refold_confirmed {
+            params.wal_replay_trailing_gap
+        } else {
+            Some(true)
+        };
         let mut catchup_last_fold_receipt: Option<i64> = params.wal_replay_last_fold_receipt;
         // Every segment this drain can confirm holds frames below THIS point;
         // a shed from a socket dialed during the drain lands above it and its
@@ -21282,12 +21301,53 @@ mod tests {
     /// depending on which drain reached it first, which is how a reader
     /// concludes there is nothing there.
     #[test]
-    fn the_catchup_drain_counts_what_it_does_not_fold() {
+    fn test_catch_up_round_zero_is_a_gap_when_the_boot_pass_was_not_confirmed() {
+        // Review round 7: an unconfirmed boot pass leaves its segments staged,
+        // so round 0 re-reads its frames; re-folding them without a gap lets a
+        // repeated zero-volume tick count twice in a bar that is written.
         let src = include_str!("dhan_feed_stack.rs");
         let body = src
-            .split_once("async fn run_frame_drain")
-            .expect("the drain function must exist")
-            .1;
+            .split_once("async fn run_dhan_feed_stack(")
+            .expect("the lane function must exist")
+            .1
+            .split_once("\n#[cfg(test)]")
+            .expect("the test module must follow the production code")
+            .0;
+        let confirm = body
+            .find("boot_refold_confirmed = true;")
+            .expect("the boot confirm must record that it ran");
+        let archive = body[..confirm]
+            .rfind("confirm_replayed(")
+            .expect("it is recorded right after archiving");
+        assert!(confirm - archive < 200, "recorded next to the archive call");
+        let init = body
+            .find("let mut catchup_prev_trailing_gap")
+            .expect("the catch-up gap carry must exist");
+        assert!(
+            body[init..init + 200].contains("if boot_refold_confirmed")
+                && body[init..init + 300].contains("Some(true)"),
+            "round 0 starts after a gap unless the boot pass was confirmed"
+        );
+    }
+
+    #[test]
+    fn the_catchup_drain_counts_what_it_does_not_fold() {
+        let src = include_str!("dhan_feed_stack.rs");
+        // PRODUCTION ONLY (review round 7): this scanned from the drain to the
+        // end of the file, test module included, so this test's own string
+        // literals satisfied three of its four needles and a stale one
+        // (`batch.len()`, long since `batch.frames.len()`) still passed.
+        let body = src
+            .split_once("async fn run_dhan_feed_stack(")
+            .expect("the lane function must exist")
+            .1
+            .split_once("\n#[cfg(test)]")
+            .expect("the test module must follow the production code")
+            .0;
+        assert!(
+            !body.contains("fn the_catchup_drain_counts_what_it_does_not_fold"),
+            "self-test: the scanned region must not include this test"
+        );
         // Comment-blind: the doc above quotes the shape, and a scan that its
         // own explanation satisfies is decorative (the house convention).
         let code: String = body
@@ -21297,7 +21357,7 @@ mod tests {
             .join("\n");
 
         for needle in [
-            "let batch_len = batch.len();",
+            "let batch_len = batch.frames.len();",
             "batch_len.saturating_sub(staged.len())",
             "\"ws_type\" => \"catchup_not_folded\"",
             "catchup_not_folded",
@@ -23266,7 +23326,7 @@ mod wal_refold_tests {
         assert!(
             main_src.contains("wal_replay_last_fold_receipt: ws_wal_replay_last_fold_receipt,")
         );
-        assert!(prod.contains("params.wal_replay_trailing_gap;"));
+        assert!(prod.contains("            params.wal_replay_trailing_gap\n"));
         assert!(prod.contains("params.wal_replay_last_fold_receipt;"));
         // Round 3: an EMPTY final pass can still end on a gap; it must reach
         // the hand-over's verdict, not be skipped by the early break.
