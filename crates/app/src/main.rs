@@ -993,6 +993,12 @@ async fn async_main() -> Result<()> {
     // Indexes into `ws_wal_replay_live_feed` of frames that follow a gap in
     // the replay (plan ITEM 47).
     let mut ws_wal_replay_gaps: Vec<usize> = Vec::new();
+    // Whether the boot pass ENDED on a gap: frames after its last live-feed
+    // frame were skipped. `None` when it returned nothing (plan ITEM 47).
+    let mut ws_wal_replay_trailing_gap: Option<bool> = None;
+    // Capture sequence of the boot pass's last candle-bearing frame, so the
+    // catch-up drain can see a capture jump across the pass boundary.
+    let mut ws_wal_replay_last_fold_seq: Option<u64> = None;
     let mut ws_wal_replay_order_update: Vec<Vec<u8>> = Vec::new();
     // A REFUSED pass (disk floor, per-boot frame cap) returns no frames AND
     // touches nothing — including whatever an earlier boot left staged in
@@ -1004,6 +1010,7 @@ async fn async_main() -> Result<()> {
     match tickvault_storage::ws_frame_spill::replay_all_fenced(&ws_wal_path) {
         Ok(batch) => {
             ws_wal_replay_refused = batch.stopped_for_disk || batch.stopped_for_frame_cap;
+            let boot_pass_trailing_gap = batch.trailing_gap;
             let recovered = batch.frames;
             if recovered.is_empty() {
                 info!(dir = %ws_wal_dir, "STAGE-C: WAL replay — no residual frames");
@@ -1016,6 +1023,22 @@ async fn async_main() -> Result<()> {
                 let mut gap_carry = false;
                 for rec in recovered {
                     gap_carry |= rec.after_gap;
+                    // A jump in capture time is a gap too: nothing is dropped
+                    // where one process's frames meet the next one's.
+                    if tickvault_storage::ws_frame_spill::frame_feeds_the_candle_fold(
+                        rec.ws_type,
+                        rec.endpoint,
+                    ) {
+                        if let Some(prev) = ws_wal_replay_last_fold_seq
+                            && tickvault_storage::ws_frame_spill::capture_jump_is_gap(
+                                prev,
+                                rec.frame_seq,
+                            )
+                        {
+                            gap_carry = true;
+                        }
+                        ws_wal_replay_last_fold_seq = Some(rec.frame_seq);
+                    }
                     match rec.ws_type {
                         tickvault_storage::ws_frame_spill::WsType::LiveFeed => {
                             live += 1;
@@ -1046,6 +1069,9 @@ async fn async_main() -> Result<()> {
                         }
                     }
                 }
+                // A gap flagged on a frame after the last live-feed one, or
+                // after the pass's last frame, is a gap at the pass's end.
+                ws_wal_replay_trailing_gap = Some(boot_pass_trailing_gap || gap_carry);
                 info!(
                     dir = %ws_wal_dir,
                     total = live + ord + truedata,
@@ -2705,6 +2731,8 @@ async fn async_main() -> Result<()> {
         .increment(dropped);
         ws_wal_replay_live_feed.clear();
         ws_wal_replay_gaps.clear();
+        ws_wal_replay_trailing_gap = None;
+        ws_wal_replay_last_fold_seq = None;
     }
     if dhan_lane_will_refold && !ws_wal_replay_live_feed.is_empty() {
         // DELIBERATELY NOT CONFIRMING HERE (2026-08-21).
@@ -3045,6 +3073,8 @@ async fn async_main() -> Result<()> {
             // Empty on a clean boot.
             wal_replay_live_feed: std::mem::take(&mut ws_wal_replay_live_feed),
             wal_replay_gaps: std::mem::take(&mut ws_wal_replay_gaps),
+            wal_replay_trailing_gap: ws_wal_replay_trailing_gap,
+            wal_replay_last_fold_seq: ws_wal_replay_last_fold_seq,
             // The master-sourced set: `live_subscription_from_master` was built
             // default-off and the operator turned it on on 2026-08-12
             // (`config/base.toml` ships `true`). A missing list for today takes
