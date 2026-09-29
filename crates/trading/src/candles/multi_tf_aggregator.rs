@@ -217,6 +217,13 @@ struct InstrumentSlot {
     /// The same for the last SEALED bucket, so a late tick cannot re-emit a
     /// partial replayed bar through an amendment.
     replay_taint_sealed: u16,
+    /// One bit per timeframe: the bucket still open at a CLEAN hand-over,
+    /// complete, which [`MultiTfAggregator::finish_replay`] kept (review
+    /// round 4: after a crash it exists nowhere else). Live post-gap settling
+    /// does not mark it partial, or the capture-start rule would drop it
+    /// depending on the next ticks' delivery lag (review round 12). Cleared
+    /// when that bucket rolls.
+    replay_handover_kept: u16,
     /// `true` from the tick that resolves a replay gap (or a new slot's first
     /// tick) until a later tick has both RAISED the cumulative and left the
     /// tick rule with a direction (plan ITEM 47, review round 5). Until then a
@@ -1016,6 +1023,7 @@ impl MultiTfAggregator {
             replay_gap_epoch_seen: self.replay_gap_epoch,
             replay_taint_open: 0,
             replay_taint_sealed: 0,
+            replay_handover_kept: 0,
             // A new slot knows neither the cumulative nor the direction that
             // came before its first tick (during a replay, those frames may
             // have been skipped), so its first buckets settle like a gap's.
@@ -1983,7 +1991,10 @@ impl MultiTfAggregator {
         // zero-volume index never loses a bar. Settling ends on the first
         // such tick that also left the tick rule with a direction.
         if slot.replay_settling && !gap_now && !is_stale_packet && cumulative_volume > baseline {
-            slot.replay_open_partial = REPLAY_ALL_TF_MASK;
+            // Not a bucket the hand-over kept complete: live mode accepts this
+            // uncertainty for every bucket it opens itself, and marking the
+            // kept one would only let the capture-start rule drop it (round 12).
+            slot.replay_open_partial |= REPLAY_ALL_TF_MASK & !slot.replay_handover_kept;
             if slot.last_tick_sign != 0 {
                 slot.replay_settling = false;
             }
@@ -2419,6 +2430,7 @@ impl MultiTfAggregator {
             } else {
                 slot.replay_sealed_partial
             };
+            slot.replay_handover_kept = open_mask & !slot.replay_taint_open;
             tainted = tainted.saturating_add(u64::from(slot.replay_taint_open.count_ones()));
             // Every bar still held is final now: emitted if complete, counted
             // if the taint or a gap marked it.
@@ -2589,6 +2601,7 @@ impl InstrumentSlot {
         // share a line with, and every later live bar of a tainted timeframe
         // was suppressed for the rest of the process (review round 11).
         self.replay_taint_open &= !bit;
+        self.replay_handover_kept &= !bit;
         // A late tick marked the bucket after this one (review round 7).
         let forced = self.replay_next_partial & bit != 0;
         self.replay_next_partial &= !bit;
@@ -2994,6 +3007,61 @@ mod tests {
                 .any(|(tf, start, _)| *tf == TfIndex::M1 && *start == t0),
             "the minute open across the gap is still suppressed: {out:?}"
         );
+    }
+
+    /// Plan ITEM 47, review round 12 (MEDIUM, reproduced by the reviewer): a
+    /// clean hand-over KEEPS the complete buckets still open (round 4: after
+    /// a crash they exist nowhere else). The post-hand-over settling then
+    /// marked every open bucket partial on the first live tick that added
+    /// volume, and a kept bucket that ended before the capture start was
+    /// suppressed when it rolled — so whether it survived depended on the
+    /// delivery lag of the next two ticks. Kept buckets must come out exactly
+    /// as with no capture-start rule at all.
+    #[test]
+    fn test_regression_live_settling_does_not_drop_a_bucket_the_hand_over_kept() {
+        let run = |capture_start: u32| {
+            let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+            agg.set_replay_mode(true);
+            let mut cum = 1_000_u32;
+            // Every 5 s from 09:15:05 to 09:29:40, nothing skipped: the M5
+            // 09:25 and M10 09:20 buckets are complete and open at the end.
+            let mut ts = OPEN + 5;
+            while ts <= OPEN + 880 {
+                cum += 100;
+                agg.consume_tick(Feed::Dhan, &gtick(ts, cum), None, ignore_seal);
+                ts += 5;
+            }
+            agg.set_live_capture_start(capture_start);
+            agg.finish_replay(false, ignore_seal);
+            // Live, with the usual delivery lag: trade times 09:29:52 and
+            // 09:29:57 arrive after the 09:30:02 capture start.
+            let mut out: std::collections::HashMap<(TfIndex, u32), i64> =
+                std::collections::HashMap::new();
+            for (t, add) in [(OPEN + 892, 100), (OPEN + 897, 100), (OPEN + 910, 100)] {
+                cum += add;
+                agg.consume_tick(Feed::Dhan, &gtick(t, cum), None, |_, _, _, tf, st| {
+                    out.insert((tf, st.bucket_start_ist_secs), st.signed_volume());
+                });
+            }
+            out
+        };
+        let control = run(0);
+        let with_rule = run(OPEN + 902);
+        for (tf, start) in [
+            (TfIndex::M5, OPEN + 600),
+            (TfIndex::M10, OPEN + 300),
+            (TfIndex::M1, OPEN + 840),
+        ] {
+            assert!(
+                control.contains_key(&(tf, start)),
+                "{tf:?} {start}: the control run emits the kept bucket: {control:?}"
+            );
+            assert_eq!(
+                with_rule.get(&(tf, start)),
+                control.get(&(tf, start)),
+                "{tf:?} {start}: a bucket the hand-over kept is dropped by live settling"
+            );
+        }
     }
 
     /// Plan ITEM 47, review round 11 (CRITICAL, reproduced by the reviewer):
