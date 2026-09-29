@@ -346,6 +346,10 @@ pub struct ReplayedFrame {
     /// derives running state from consecutive frames (the candle fold's volume
     /// baseline) must not carry it across this point.
     pub after_gap: bool,
+    /// Plan ITEM 47: `true` for the first frame returned from each WAL
+    /// segment. A reader compares receipt times only across a segment
+    /// boundary ([`process_boundary_is_gap`]).
+    pub first_in_segment: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -2875,17 +2879,23 @@ pub const fn wal_replay_disk_floor_bytes(total_bytes: u64) -> u64 {
 /// and counted rather than materialised until something dies.
 pub const WAL_REPLAY_MAX_FRAMES_PER_BOOT: u64 = 3_000_000;
 
-/// A jump in capture time between two consecutive candle-bearing frames of a
-/// WAL replay larger than this is a GAP (plan ITEM 47): capture stopped — a
-/// process ended and the next began, or the main feed was down. The frames
-/// carry no sequence number from the vendor, and nothing is DROPPED at such a
-/// boundary, so without this the fold would carry its volume baseline across
-/// it and the next process's first tick would take the whole downtime's
-/// volume into one bar. Thirty seconds of silence on the main feed, which
-/// carries every subscribed instrument, is far outside the session's normal
-/// frame spacing; outside the session a false gap only holds back a bar,
-/// never invents one.
-pub const WAL_REPLAY_CAPTURE_GAP_NANOS: u64 = 30_000_000_000;
+/// A receipt-time jump larger than this between the last candle-bearing
+/// frame of one WAL segment and the first of a later one is a PROCESS
+/// BOUNDARY gap (plan ITEM 47): one run of the lane ended and the next began.
+/// The new process started its candle fold afresh, so a replay that carried
+/// its volume baseline across the boundary would give the new process's
+/// first tick the whole downtime's volume. Nothing is dropped at such a
+/// boundary, which is why it needs its own test.
+///
+/// Checked ONLY across segment boundaries, and on RECEIPT time: every process
+/// opens a new segment, while a silence inside one segment is harmless (the
+/// live process folded exactly those frames). A restart takes far longer than
+/// five seconds (auth, database, universe, socket dial), while a segment the
+/// writer rotates for size is written back to back. Frame sequences are not
+/// used: they advance by one when frames outrun the clock and carry on from
+/// the disk's highest sequence across a restart, so they understate
+/// downtime (review, 2026-09-29).
+pub const WAL_REPLAY_PROCESS_GAP_NANOS: i64 = 5_000_000_000;
 
 /// `true` when a frame can carry ticks into the candle fold: a live-feed
 /// frame from the MAIN-FEED socket. Depth and order-update frames, and
@@ -2896,13 +2906,17 @@ pub fn frame_feeds_the_candle_fold(ws_type: WsType, endpoint: WalEndpoint) -> bo
     ws_type == WsType::LiveFeed && matches!(endpoint, WalEndpoint::MainFeed)
 }
 
-/// `true` when capture jumped by more than [`WAL_REPLAY_CAPTURE_GAP_NANOS`]
-/// between two consecutive candle-bearing frames (sequences are capture
-/// nanoseconds). A `0` sequence is a legacy record with no capture time and
-/// never counts. O(1).
+/// `true` when the receipt time moved forward by more than
+/// [`WAL_REPLAY_PROCESS_GAP_NANOS`] between two candle-bearing frames that a
+/// segment boundary separates. A receipt the WAL does not know (legacy
+/// records) or that is implausible never counts. O(1).
 #[must_use]
-pub fn capture_jump_is_gap(previous_seq: u64, seq: u64) -> bool {
-    previous_seq != 0 && seq != 0 && seq.saturating_sub(previous_seq) > WAL_REPLAY_CAPTURE_GAP_NANOS
+pub fn process_boundary_is_gap(previous_receipt_nanos: i64, receipt_nanos: i64) -> bool {
+    let previous = plausible_receipt_nanos(previous_receipt_nanos);
+    let current = plausible_receipt_nanos(receipt_nanos);
+    previous != WAL_RECEIPT_UNKNOWN_NANOS
+        && current != WAL_RECEIPT_UNKNOWN_NANOS
+        && current.saturating_sub(previous) > WAL_REPLAY_PROCESS_GAP_NANOS
 }
 
 /// Segments the applied-watermark let this pass ARCHIVE UNREAD.
@@ -3247,6 +3261,15 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
     // O(1) EXEMPT: begin — one rename per skipped segment, boot replay cold path
     for (path, next_kept) in &pending_skips {
         if *next_kept > consumed {
+            // Past the stop. A leftover in `replaying/` goes back to the live
+            // dir, exactly as a deferred kept segment does below: left there,
+            // the confirm would archive it by glob and the next pass would
+            // never see the gap it leaves (review, 2026-09-29).
+            if path.parent() == Some(replaying_dir.as_path())
+                && let Some(name) = path.file_name()
+            {
+                drop(std::fs::rename(path, wal_dir.join(name)));
+            }
             continue;
         }
         let Some(name) = path.file_name() else {
@@ -5236,6 +5259,7 @@ fn replay_segment_core<F: Fn(u64, WalEndpoint) -> bool>(
             received_at_nanos,
             endpoint,
             after_gap: std::mem::replace(&mut gap_pending, false),
+            first_in_segment: out.is_empty(),
         });
         i = record_end;
     }
@@ -9685,10 +9709,64 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Review round 3: a skipped leftover in `replaying/` past a budget stop
+    /// goes back to the live dir, so the confirm cannot archive it by glob
+    /// and the next pass still sees its gap.
+    #[test]
+    fn test_replay_skipped_leftover_in_replaying_past_a_stop_is_restored() {
+        let dir = tmp_dir("wm-skip-replaying");
+        write_wm_segment(&dir, 0, 5, WalEndpoint::MainFeed);
+        write_wm_segment(&dir, 10_000, 5, WalEndpoint::MainFeed);
+        write_wm_segment(&dir, 19_991, 300, WalEndpoint::MainFeed);
+        let late = write_wm_segment(&dir, 30_000, 5, WalEndpoint::MainFeed);
+        write_wm_segment(&dir, 39_782, 300, WalEndpoint::MainFeed);
+        // The late skipped segment was staged by an earlier boot.
+        let replaying = dir.join(REPLAYING_SUBDIR);
+        std::fs::create_dir_all(&replaying).unwrap();
+        let name = late.file_name().unwrap().to_owned();
+        std::fs::rename(&late, replaying.join(&name)).unwrap();
+        let wm = crate::wal_applied_watermark::AppliedWatermark::new_for_tests();
+        wm.note_ticks_acked(wm_seq(50_000));
+        wm.note_depth_acked(wm_seq(50_000));
+        for unapplied in [2, 20_270, 40_060] {
+            wm.note_unapplied(wm_seq(unapplied));
+        }
+        write_wm_watermark(&dir, &wm.snapshot());
+
+        let first = replay_all_with_report_guarded(&dir, 1, || None, None, WAL_REPLAY_RSS_STOP_PCT)
+            .expect("replay");
+        assert_eq!(first.frames.len(), 5);
+        assert!(dir.join(&name).exists(), "restored to the live dir");
+        assert!(!replaying.join(&name).exists());
+        confirm_replayed(&dir);
+        let second = replay_unguarded(&dir);
+        let gaps: Vec<u64> = second
+            .frames
+            .iter()
+            .filter(|f| f.after_gap)
+            .map(|f| f.frame_seq)
+            .collect();
+        assert_eq!(gaps, vec![wm_seq(20_265), wm_seq(40_057)], "{gaps:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review round 3: the first frame returned from each segment is marked,
+    /// so a reader can compare receipt times across a segment boundary only.
+    #[test]
+    fn test_replay_marks_the_first_frame_of_each_segment() {
+        let dir = tmp_dir("wm-first-in-segment");
+        write_wm_segment(&dir, 0, 3, WalEndpoint::MainFeed);
+        write_wm_segment(&dir, 100, 2, WalEndpoint::MainFeed);
+        let batch = replay_unguarded(&dir);
+        let firsts: Vec<bool> = batch.frames.iter().map(|f| f.first_in_segment).collect();
+        assert_eq!(firsts, vec![true, false, false, true, false]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Plan ITEM 47 review: which frames can hide ticks, and what a capture
     /// jump is.
     #[test]
-    fn test_frame_feeds_the_candle_fold_and_capture_jump_is_gap() {
+    fn test_frame_feeds_the_candle_fold_and_process_boundary_is_gap() {
         assert!(frame_feeds_the_candle_fold(
             WsType::LiveFeed,
             WalEndpoint::MainFeed
@@ -9710,19 +9788,30 @@ mod tests {
             WalEndpoint::MainFeed
         ));
 
-        let t = 1_780_000_000_000_000_000_u64;
-        assert!(!capture_jump_is_gap(t, t + WAL_REPLAY_CAPTURE_GAP_NANOS));
-        assert!(capture_jump_is_gap(t, t + WAL_REPLAY_CAPTURE_GAP_NANOS + 1));
+        // A plausible receipt instant (2026-09-29 in nanoseconds).
+        let t = 1_790_000_000_000_000_000_i64;
+        assert!(!process_boundary_is_gap(
+            t,
+            t + WAL_REPLAY_PROCESS_GAP_NANOS
+        ));
+        assert!(process_boundary_is_gap(
+            t,
+            t + WAL_REPLAY_PROCESS_GAP_NANOS + 1
+        ));
         assert!(
-            !capture_jump_is_gap(t + 5, t),
+            !process_boundary_is_gap(t + 5, t),
             "going backwards is never a jump"
         );
         assert!(
-            !capture_jump_is_gap(0, t),
-            "a legacy record has no capture time"
+            !process_boundary_is_gap(WAL_RECEIPT_UNKNOWN_NANOS, t),
+            "a legacy record has no receipt"
         );
-        assert!(!capture_jump_is_gap(t, 0));
-        assert!(!capture_jump_is_gap(u64::MAX, 1));
+        assert!(!process_boundary_is_gap(t, WAL_RECEIPT_UNKNOWN_NANOS));
+        assert!(
+            !process_boundary_is_gap(t, i64::MAX),
+            "an implausible receipt never counts"
+        );
+        assert!(!process_boundary_is_gap(i64::MIN, t));
     }
 
     /// Plan ITEM 47 review: dropping an already-applied DEPTH frame hides no
