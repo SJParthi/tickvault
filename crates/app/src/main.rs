@@ -990,6 +990,9 @@ async fn async_main() -> Result<()> {
         tickvault_storage::ws_frame_spill::WalEndpoint,
         bytes::Bytes,
     )> = Vec::new();
+    // Indexes into `ws_wal_replay_live_feed` of frames that follow a gap in
+    // the replay (plan ITEM 47).
+    let mut ws_wal_replay_gaps: Vec<usize> = Vec::new();
     let mut ws_wal_replay_order_update: Vec<Vec<u8>> = Vec::new();
     // A REFUSED pass (disk floor, per-boot frame cap) returns no frames AND
     // touches nothing — including whatever an earlier boot left staged in
@@ -1008,10 +1011,17 @@ async fn async_main() -> Result<()> {
                 let mut live = 0u64;
                 let mut ord = 0u64;
                 let mut truedata = 0u64;
+                // A gap in front of a frame this lane does not fold still
+                // applies to the next live-feed frame (plan ITEM 47).
+                let mut gap_carry = false;
                 for rec in recovered {
+                    gap_carry |= rec.after_gap;
                     match rec.ws_type {
                         tickvault_storage::ws_frame_spill::WsType::LiveFeed => {
                             live += 1;
+                            if std::mem::replace(&mut gap_carry, false) {
+                                ws_wal_replay_gaps.push(ws_wal_replay_live_feed.len());
+                            }
                             ws_wal_replay_live_feed.push((
                                 rec.frame_seq,
                                 rec.received_at_nanos,
@@ -2694,6 +2704,7 @@ async fn async_main() -> Result<()> {
         )
         .increment(dropped);
         ws_wal_replay_live_feed.clear();
+        ws_wal_replay_gaps.clear();
     }
     if dhan_lane_will_refold && !ws_wal_replay_live_feed.is_empty() {
         // DELIBERATELY NOT CONFIRMING HERE (2026-08-21).
@@ -3033,6 +3044,7 @@ async fn async_main() -> Result<()> {
             // opens; DEDUP-idempotent via the replay-stable `capture_seq`.
             // Empty on a clean boot.
             wal_replay_live_feed: std::mem::take(&mut ws_wal_replay_live_feed),
+            wal_replay_gaps: std::mem::take(&mut ws_wal_replay_gaps),
             // The master-sourced set: `live_subscription_from_master` was built
             // default-off and the operator turned it on on 2026-08-12
             // (`config/base.toml` ships `true`). A missing list for today takes

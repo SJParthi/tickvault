@@ -93,6 +93,11 @@ pub(crate) struct FoldCounters {
     /// contract most packets are book updates, not trades. Local `/metrics`
     /// only — deliberately not an EMF name (the budget needs a lever first).
     pub(crate) repeat_quote: metrics::Counter,
+    /// Bars a WAL replay did NOT emit because it could only partly see them
+    /// (a gap in the replayed frames). The complete bar the live process
+    /// stored survives. Local `/metrics` only, like `repeat_quote` (plan
+    /// ITEM 47).
+    pub(crate) refold_partial_suppressed: metrics::Counter,
     /// `tick_refused` carries a `reason` label with **SEVEN** distinct values.
     /// One field per value, because collapsing them would merge seven
     /// independent refusal causes into one series and make the counter
@@ -203,6 +208,9 @@ impl FoldCounters {
                 "tv_aggregator_slot_volume_baseline_zero_total"
             ),
             repeat_quote: metrics::counter!("tv_candle_repeat_quote_total"),
+            refold_partial_suppressed: metrics::counter!(
+                "tv_candle_refold_partial_suppressed_total"
+            ),
             tick_refused_price: metrics::counter!(
                 "tv_aggregator_tick_refused_total",
                 "reason" => "price"
@@ -321,6 +329,8 @@ pub(crate) fn fold_counters() -> &'static FoldCounters {
         // Added 2026-09-23 with the repeat-quote filter, seeded for the same
         // reason as the block above: the agent drops a series' first sample.
         resolved.repeat_quote.increment(0);
+        // Added 2026-09-29 (plan ITEM 47), same reason.
+        resolved.refold_partial_suppressed.increment(0);
         resolved
     })
 }

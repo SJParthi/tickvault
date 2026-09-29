@@ -759,6 +759,7 @@ jobs:
           crates/core/tests/dhat_token_handle.rs
           crates/core/tests/dhat_truedata_decode_zero_alloc.rs
           crates/core/tests/dhat_ws_reader_zero_alloc.rs
+          crates/storage/tests/dhat_deferred_depth_note_shed.rs
           crates/storage/tests/dhat_depth_append_zero_alloc.rs
           crates/storage/tests/dhat_flush_buffer_recycle.rs
           crates/trading/tests/dhat_multi_tf_fold.rs
@@ -884,11 +885,15 @@ jobs:
       # tick and depth writers recycle their ILP buffer across flushes instead
       # of allocating a fresh one per flush. The drift check caught it on the
       # first push, exactly as it caught the three targets before it.
+      #
+      # 2026-09-29: dhat_deferred_depth_note_shed added — 2 -> 3. It pins that
+      # the per-packet shed mark (plan item 45a) stays atomics only.
       - name: DHAT (storage)
         shell: bash
         run: |
           set -euo pipefail
           cargo test -p tickvault-storage \
+            --test dhat_deferred_depth_note_shed \
             --test dhat_depth_append_zero_alloc \
             --test dhat_flush_buffer_recycle \
             2>&1 | tee /tmp/dhat-storage.log
@@ -897,8 +902,8 @@ jobs:
             exit 1
           fi
           ran=$(grep -c 'Running.*tests/dhat_' /tmp/dhat-storage.log || true)
-          if [ "$ran" -ne 2 ]; then
-            echo "::error::storage DHAT step executed $ran targets, expected 2 — a --test flag was dropped from this step."
+          if [ "$ran" -ne 3 ]; then
+            echo "::error::storage DHAT step executed $ran targets, expected 3 — a --test flag was dropped from this step."
             exit 1
           fi
 

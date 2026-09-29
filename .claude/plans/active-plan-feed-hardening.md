@@ -5519,3 +5519,105 @@ Local `/metrics` counters plus coded log lines only (no EMF name, no alarm — s
 - Tests: `a_missing_table_reads_as_absent_not_failed`, `other_errors_are_never_read_as_absence`, `the_phrase_without_an_error_envelope_is_not_absence`, `partition_listing_variants_are_distinct`, `absent_tables_latch_the_day_but_a_real_list_failure_does_not`.
 
 **Rollback:** revert the commit; absent tables count as failures again and the day stays unlatched (the pre-fix behaviour, loud but harmless to data). **Observability:** `tables_absent` on the pass-complete line; STORAGE-GAP-04 unchanged. **Failure mode:** if QuestDB rewords the error, absent tables fall back to failures — the loud direction, never a false latch. **NOT fixed:** the 09-21 hours 12–15 and all of 09-22 were dropped by the operator-authorized fresh-start reset before any archive ran; that market data is gone and is not SEBI data.
+
+## ITEM 45 — DESIGN ADDENDUM (added 2026-09-29): ZERO LOSS — nothing received is ever missed or deleted
+
+**Operator (2026-09-29, verbatim):** "what the fuck nothign shdou lneevr ever be missed or removed or deleted see clealry ntoe bro i always need all the data and all the ticks dude okay? neevr ever anythign shodul be fucking missed dude okay?" — then, on the seven-step plan: "yes approve all steps, go ahead and check the server".
+
+**Approved by:** Parthiban (operator), 2026-09-29, in-session. Rule-file-first: `docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md` Quote 27 + 28 and `docs/claude-rules-full/project/websocket-connection-scope-lock.md` "2026-09-29 — ZERO LOSS". **Open:** the two auto-loaded summary stubs (`.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md`, `.claude/rules/project/aws-budget.md` cost note) still need the matching lines; the session's tooling refused self-edits of `.claude/rules/`, so the operator lands them.
+
+**Measured 2026-09-29 on the live box (read-only SSM + CloudWatch + S3):**
+- 08:31 boot; 08:32–08:38 the WAL catch-up drain flooded QuestDB (HOT-PATH-02, WS-SPILL-01/02, ticks-dropped, persistence-loss, wal-apply-lag pages) before any socket dialled.
+- By 10:08 IST: `shed_inline` 5,792,427 · depth `dropped` 694,040 · `refused` 272,090 · `tv_questdb_wal_apply_lag_max` 32,019 · `ws_wal` 27 GB · `spill` 40 GB · disk 41% used of 600 GB.
+- Raw capture 25.0 GB for the 2026-09-28 session; gzip-1 ratio 0.46.
+- The CloudWatch agent's `errors-jsonl` pipe froze at 08:32:31 IST after a ~9.5 MB error burst (the app kept writing: 13,581 lines, `tv_log_lines_dropped_total{sink="errors_jsonl"}` = 0). Restarted with operator OK at 10:12 IST; events flow again.
+- 2026-09-28 cross-verification: `diverged` (864 instruments, 307,669 minutes; option check 25,534 of 65,799 minutes missing live). S3 holds only 2026-09-25 09:00–14:59 (earlier days deleted under Quotes 24/26; the 15:00 hour of 09-25 is unexplained).
+
+Crates: `crates/app` (dhan_feed_stack.rs, main.rs, disk_pressure_boot.rs), `crates/storage` (ws_frame_spill.rs, wal_applied_watermark.rs, partition_archive.rs, seal_spill.rs, tick_persistence.rs, depth_persistence.rs, fresh_start_reset.rs, shadow_persistence.rs), `crates/common` (ingest_shed.rs, constants.rs), `crates/aws-lambdas` (none planned), `deploy/aws/terraform` (main.tf lifecycle, IAM, alarms), `deploy/aws/cloudwatch-agent.json`.
+
+One PR at a time, in this order (each item is its own PR unless noted):
+
+- [x] 45a — **A shed is a deferral, replayed after close, depth only.** (Implemented 2026-09-29: `crates/storage/src/wal_deferred_depth.rs`, `crates/app/src/dhan_feed_stack/deferred_depth_pass.rs`, prune gating in `ws_frame_spill.rs`, shed sites in `dhan_feed_stack.rs`; review fixes: rejected marks file adopts overflow, listing errors never read as "gone", hard disk floor at 5% free takes pinned segments last and counts each as a coded loss, applied segments pruned before unapplied, fsync before rename; zero-alloc gate `dhat_deferred_depth_note_shed`.) (Corrected 2026-09-29 before any code: the first draft called `note_unapplied` at both shed sites. That marks a whole ~4.6-minute bucket (`UNAPPLIED_BUCKET_SHIFT` = 38) as unapplied, so a session-long shed would mark the whole 25 GB day and the next boot would re-fold ticks, candles and depth for all of it — the exact 2026-09-29 morning flood, every day.) Design: the shed sites record the shed frame's bucket in a SEPARATE deferred-depth mark set (not the unapplied table), which only keeps those segments from the age and byte prunes. An after-close pass inside the running process (15:45–17:15 IST, paced by apply lag, stopping before the 17:30 stop) re-reads only those segments and writes ONLY the shed component (inline depth for `shed_inline`, dedicated depth for `shed_dedicated`); ticks and candles are not re-folded. A segment leaves the mark set only after its depth rows are acked. Anything not finished by 17:15 stays marked for the next day's after-close pass (and is in S3 under 45e). Tests: `shed_inline_records_a_deferred_depth_mark`, `deferred_mark_keeps_the_segment_from_both_prunes`, `after_close_pass_writes_depth_only`, `after_close_pass_stops_before_the_stop_time`, `deferred_mark_clears_only_after_ack`.
+- [ ] 45b — **The byte prune never deletes unapplied data.** `ws_frame_spill.rs` byte pass refuses an unapplied segment (counted `tv_wal_prune_refused_unapplied_total`, coded ERROR) instead of deleting it; disk protection falls back to the shed (45a) and the existing pressure ladder. Tests: `byte_prune_refuses_an_unapplied_segment`, `byte_prune_still_deletes_applied_and_uploaded_segments`.
+- [ ] 45c — **Brake the boot replay.** The catch-up drain pauses between rounds while `publish_wal_apply_lag_growing` reports growth (bounded wait, then stop and leave the rest on disk), and caps its budget so it stops by 08:58 IST. Loss counters gain `origin=live|replay`; the `ticks-dropped` / `market-data-persistence-loss` filters and WS-SPILL-02 alarm exclude `replay_*` deferral sources. Tests: pure pacing decision over (lag growing, round, clock) permutations; `replay_deferral_is_not_counted_as_live_loss`.
+- [ ] 45d — **Error-log burst and uploader.** Coalesce repeated identical coded ERROR lines per (code, source) at most once per second with a repeat count on the next line (the three-lines-per-failed-flush pattern produced ~8,000 lines in 8 minutes); ship `tv_log_lines_dropped_total` to CloudWatch; alarm when `errors.jsonl` file growth on the box is non-zero while the stream ingests nothing (uploader frozen). Tests: coalescer unit + proptest; terraform guard for the new alarm.
+- [ ] 45e — **Raw frames to S3 before any delete.** A cold-path uploader compresses each sealed WAL segment (gzip, as `partition_archive.rs` already does), uploads to `s3://tv-prod-cold/raw-frames/<date>/<segment>.wal.gz` with a no-overwrite put and SHA-256, verifies size, and writes a local `.uploaded` marker; both prune passes require the marker. Runs after close and on disk pressure, never on the drain. IAM: `s3:PutObject` on that prefix only. Tests: marker gating in both prune passes; upload verify refuses a size mismatch.
+- [ ] 45f — **S3 keeps everything.** `deploy/aws/terraform/main.tf`: remove `expiration { days = 1825 }`; add Deep Archive transition for `raw-frames/` after 30 days; enable `aws_s3_bucket_versioning`. Guard test pins no `expiration` and versioning `Enabled`.
+- [ ] 45g — **No delete without a copy (spill, quarantine, boot drops).** Seal spill age prune, tick quarantine prune, fresh-start reset and retired-table sweeps export to S3 (verified) before deleting, or refuse. Tests per path.
+- [ ] 45h — **Persist what is received but never saved.** OI packets, market-status packets, `oi_day_high`/`oi_day_low`, out-of-window ticks and prior-day connect snapshots are written (new columns / a `feed`-tagged table, `feed` in the DEDUP key), outside the candle fold. Tests: one per packet class; DEDUP meta-guard.
+- [ ] 45i — **Depth array rows** (separate designed project): scratch-table test on QuestDB 9.3.5 first (DOUBLE[] + DEDUP), then a binary-safe spill format, then the switch. Not started until the test result is recorded here.
+
+### Design
+
+The principle is one sentence: **the raw frame is the record; every later stage may be late but may not be the only copy.** 45a–45b turn the two existing loss exits into deferrals using the applied-watermark mechanism that already exists (`note_unapplied`). 45c–45d stop the pressure that triggers them in the first place and fix the blind alarm. 45e–45g put a verified S3 copy under every delete. 45h stores the packet classes the parser already decodes and throws away. 45i is the only change that reduces QuestDB load by an order of magnitude without dropping anything.
+
+### Edge Cases
+
+A shed that lasts a whole session (every inline-depth frame unapplied → the whole day's segments kept: bounded by disk, which 45e relieves by uploading); a boot with no QuestDB lag signal yet (pacing treats "unknown" as "not growing" for at most one round); a segment half-uploaded when the box stops (no marker → kept, retried next pass); an S3 PUT that succeeds but the verify read fails (no marker, retry); versioning with the existing Quote 24/26 manifests (history only, no further deletes authorized); a restart inside 09:00–15:40 (in-session budget stays short, as 44a); a coalesced error line that hides a different `source` (key includes `source`).
+
+### Failure Modes
+
+S3 unreachable for a day: segments stay local (never deleted), disk fills faster, the existing disk ladder sheds — which is now a deferral — and the disk alarm pages; the hard floor is a full volume, which suspends QuestDB and is paged. The uploader dying: counted, alarmed, prunes blocked. Pacing too strict: backlog grows and is paged by the existing WAL-backlog alarm. A wrong `origin` label: the alarm would under-page replay loss — prevented by labelling at the single writer entry point, tested.
+
+### Test Plan
+
+Unit + proptest per item as listed; DHAT stays green on the drain (45a adds one atomic store per shed frame, no allocation); storage/app/common suites green; terraform guards for 45c/45d/45f; each PR runs the full CI (All Green). Bite-proof each new guard by reverting the change locally and watching it fail.
+
+### Rollback
+
+Each item is one PR and reverts independently. 45a/45b reverting restores today's loss behaviour (loud via existing counters). 45f reverting re-adds expiry — but versioning cannot be turned off, only suspended; stated so the revert is a conscious choice.
+
+### Observability
+
+New: `tv_wal_prune_refused_unapplied_total`, `tv_dhan_feed_depth_total{outcome="shed_deferred"}`, `tv_raw_frame_upload_total{outcome}`, `tv_raw_frame_upload_bytes_total`, `origin` label on loss counters, the uploader-frozen alarm, `tv_log_lines_dropped_total` in CloudWatch. Each new CloudWatch metric is costed in the PR that adds it.
+
+### Per-Item Guarantee Matrix (Item 45)
+
+Cross-references `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row); each implementing PR carries both matrices in its body. Resilience row "Zero ticks lost" is the point of this item: every received frame is either in QuestDB, in the local WAL, or in S3 with a verified checksum — never in none of them. Honest envelope: bounded by S3 availability and local disk; beyond both, QuestDB suspends and pages, and nothing is deleted to make room.
+
+## ITEM 46 — DESIGN ADDENDUM (added 2026-09-29, operator: "fix and reosleve vrythignn dude okay?"): the daily 1-minute cross-verification reports false divergence
+
+Measured on the 2026-09-28 run (outcome `diverged`, 864 instruments, 307,669 minutes): volume matched exactly in only 42% of minutes, and 25,534 option minutes read as "missing". Read-only production queries showed most of it is the checker, not the feed.
+
+- [x] 46a — **Compare the size of our volume.** (Implemented: `dhan_live_crossverify::compare_day_in_scope`.) `candles_<tf>.volume` is gross volume carrying the bar's direction in its sign (`shadow_seal_columns::from_buffered_seal`, 2026-09-18 directive). `dhan_live_crossverify::compare_day` compared it signed against Dhan's unsigned volume, so every sell-side bar read as a mismatch. Compare `abs(live)` in both `volume_exact` and the capture percentage. Tests: `test_compare_day_volume_compares_magnitude_of_signed_live_volume`.
+- [x] 46b — **A no-trade minute is not divergence.** (Implemented: `compare_day_in_scope`, `INDEX_SEGMENT`.) Dhan prints a flat bar with volume 0 for a minute nothing traded; our fold prints nothing. `real = cells_diverged > 0 || missing_live > 0` counted those. Now `real` counts only `missing_live_traded` for non-index instruments; an `IDX_I` missing minute (indices carry no volume and tick every second) still counts. The zero-volume count stays reported. Tests: `test_compare_day_zero_volume_missing_minute_is_not_divergence`, `test_compare_day_missing_index_minute_is_still_divergence`.
+- [x] 46c — **09:15 carries pre-open volume.** (Implemented: `compare_day_in_scope`, `session_open_minute`.) Our 09:15 bar includes the pre-open auction volume; Dhan's does not. The 09:15 minute is excluded from the volume measurement (OHLC still compared). Tests: `test_compare_day_session_open_minute_is_excluded_from_volume_measure`.
+
+### Design
+Three local changes inside `compare_day`, O(1) per compared minute, no new state beyond two counters.
+### Edge Cases
+Index with volume 0 on both sides; a missing traded minute; a sell-side bar with negative volume equal in size; 09:15 bar; `i64::MIN` volume (`unsigned_abs`).
+### Failure Modes
+A real loss hidden: guarded by keeping every missing minute counted and reported, and by keeping index minutes strict.
+### Test Plan
+The five tests named above, plus the module's existing suite.
+### Rollback
+Revert the commit; the persisted tables are unchanged.
+### Observability
+Existing `dhan_live_crossverify_daily` columns; `missing_live_zero_volume` already persisted.
+
+Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
+
+## ITEM 47 — DESIGN ADDENDUM (added 2026-09-29, operator: "fix and reosleve vrythignn dude okay?"): a gapped WAL replay rebuilt partial candles that overwrote full ones
+
+Measured on production (read-only): on 2026-09-28 the 1-minute candles of ~696 NSE_EQ stocks at 11:02 summed to -43,032,622 (neighbours ±1-3 million). Security 2885: `candles_1s` 11:02:48 held -733,406 in ONE tick; the stored `candles_1m` 11:02 bar held 13 ticks, open latency 49 s, volume -734,559, while the 1-second bars inside that minute held ~70 ticks. Root cause (read in code, restart confirmed in the logs at 23:44 IST): the boot refold (`dhan_feed_stack::refold_wal_frames`) folds only the UNAPPLIED frames. Segments and frames the applied watermark skipped leave gaps, and the fold carried each instrument's volume baseline across a gap: the first tick after it took the whole skipped span's volume. The rebuilt partial bars then UPSERTed over the complete live rows (candles DEDUP key `ts, security_id, segment, feed`).
+
+- [x] 47a — **The replay says where its gaps are.** `ws_frame_spill::ReplayedFrame` gains `after_gap`: `true` for the first frame of a pass, the first kept frame after a skipped segment, and the first kept frame after frames dropped as already applied. Tests: `test_replay_marks_after_gap_on_first_frame_and_after_skipped_frames`. Impl: `ws_frame_spill.rs` — `ReplayedFrame::after_gap`, `SegmentRead::trailing_gap`, `replay_all_with_report_guarded`.
+- [x] 47b — **No volume across a gap.** `MultiTfAggregator::mark_replay_gap` un-seeds every slot's volume baseline and tick-rule carry and marks every open bucket partial. O(slots), boot/refold path only. Tests: `test_regression_wal_refold_gap_dumps_skipped_volume_into_one_partial_bar`. Impl: `multi_tf_aggregator.rs::mark_replay_gap` + `replay_gap_rebase_pending` → `AggregatorCell::rebase_open_buckets`.
+- [x] 47c — **A partial replay bar never overwrites a full one.** Per slot, two `u16` bitmasks (one bit per timeframe) record whether the open and the last-sealed bucket are partial. While `set_replay_mode(true)` is on, a partial bar's seal or late amendment is suppressed and counted (`tv_candle_refold_partial_suppressed_total`); complete bars between gaps are still emitted. Live mode is unchanged. Tests: `test_mark_replay_gap_complete_bucket_after_gap_is_still_emitted`, `test_mark_replay_gap_live_mode_still_emits_partial_bars`, `test_set_replay_mode_suppresses_amendment_of_a_partial_bar`. Impl: `multi_tf_aggregator.rs::{set_replay_mode, InstrumentSlot::take_open_partial}`, `fold_counters.rs::refold_partial_suppressed`.
+- [x] 47d — **The refold applies it.** `refold_wal_frames(ingest, frames, gaps)` takes the gap indexes, calls `mark_replay_gap` at each, runs the fold in replay mode, and re-seeds once more at the end so the first live tick after boot cannot take the downtime's volume either. Boot and catch-up both pass the gaps. Tests: `test_refold_wal_frames_with_gaps_marks_each_gap`. Impl: `dhan_feed_stack.rs::refold_wal_frames`, `DhanFeedStackParams::wal_replay_gaps`, `main.rs` gap collection.
+
+### Design
+Gaps are carried as a list of frame indexes beside the existing frame list, so the frame tuple every caller and test uses is unchanged. The fold's per-tick cost is one bool read and, only on a seal, two bit operations. `mark_replay_gap` is O(slots) and runs at most once per gap on the boot path.
+### Edge Cases
+A gap before the first frame; two adjacent gaps; a bucket opened by the seeding tick; a catch-up or close seal of a partial bucket; a late amendment of a partial sealed bar; a slot first created during replay; live mode after the refold.
+### Failure Modes
+Undercount, never overcount: after a gap the first bucket loses the seeding tick's own volume and is not written during replay. For a mid-session crash, a bucket that only the refold saw has no candle row (its ticks are in `ticks`); counted, never silent.
+### Test Plan
+The tests named in 47a–47d, plus the aggregator, storage replay and refold suites.
+### Rollback
+Revert the commit. No schema change.
+### Observability
+`tv_candle_refold_partial_suppressed_total` (seeded at 0) and the refold's info line reporting gaps and suppressed bars.
+
+Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.

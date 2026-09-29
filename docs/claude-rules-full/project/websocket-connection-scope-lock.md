@@ -8293,3 +8293,46 @@ socket).
   above is done and recorded.
 - Logs a client id, PIN, TOTP or token of either account, or puts a client id
   in a Telegram body.
+
+---
+
+### 2026-09-29 — ZERO LOSS: every received byte is kept; a shed is a deferral, never a drop
+
+**Operator quotes (2026-09-29, preserve EXACTLY, typos included):**
+> "what the fuck nothign shdou lneevr ever be missed or removed or deleted see clealry ntoe bro i always need all the data and all the ticks dude okay? neevr ever anythign shodul be fucking missed dude okay?"
+
+> "yes approve all steps, go ahead and check the server"
+
+The storage side (S3 raw archive, no expiry, versioning, no delete without a
+copy) is recorded as Quote 27 + 28 in `daily-universe-scope-expansion-2026-05-27.md`.
+The plan is `active-plan-feed-hardening.md` ITEM 45. This section covers the
+feed and schema side.
+
+**Measured on the box the same morning (read-only, 10:08 IST):**
+`tv_dhan_feed_depth_total{outcome="shed_inline"}` = 5,792,427,
+`{outcome="dropped"}` = 694,040, `{outcome="refused"}` = 272,090,
+`tv_ingest_shed_transitions_total{level="inline_depth"}` = 3,
+`tv_questdb_wal_apply_lag_max` = 32,019. The 08:31 boot catch-up drain flooded
+QuestDB before any socket dialled.
+
+#### What this authorizes
+
+| Surface | Disposition |
+|---|---|
+| Ingest shed (`ShedLevel::InlineDepth` / `AllDepth`) | Stays as the disk and apply-lag pressure valve, but a shed frame is **marked unapplied** so its raw segment is kept and re-folded at the next out-of-session boot. A shed stops the QuestDB write NOW; it never loses the data. |
+| Boot WAL catch-up drain | **Paced**: it pauses between rounds while QuestDB apply lag is growing, and uses a short budget when it would still be running at 09:00. Leftover segments stay on disk (and in S3 under Quote 27). |
+| Loss counters and alarms | Carry an `origin` of `live` or `replay`; a replay deferral (WS-SPILL-02 `replay_*` sources) no longer reads as a lost frame. |
+| Received data that is never persisted today | Open-interest packets, market-status packets, `oi_day_high` / `oi_day_low`, ticks stamped outside 09:00–15:40 and the prior-day last-trade snapshot on connect are **persisted**: new columns via `ALTER ADD COLUMN IF NOT EXISTS` or a shared table tagged `feed`, `feed` in every DEDUP key. They are kept OUT of the candle fold where the fold refuses them today, so candles do not change. |
+| `market_depth` row shape | May move to one row per (packet, side) with `DOUBLE[]` price, quantity and orders arrays — a lossless storage change — only after a scratch-table test proves QuestDB 9.3.5 accepts DEDUP on that table and the depth spill format carries binary ILP. Until then the per-level row stays. |
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Sheds a frame without marking its segment unapplied, or lets any prune delete
+  a segment that is unapplied or has no verified S3 copy.
+- Adds a new "drop" disposition for received market data anywhere in the live
+  or replay path, or widens an existing one, without a fresh dated quote HERE.
+- Lets the catch-up drain run at full speed past 09:00 while apply lag grows.
+- Persists the new packet classes into `ticks` / `candles_*` in a way that
+  changes an existing candle, or writes a row without `feed`.
+- Switches `market_depth` to array rows before the scratch-table test is
+  recorded, or drops any level, side or packet in the conversion.
