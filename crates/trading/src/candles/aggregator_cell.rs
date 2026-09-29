@@ -771,6 +771,35 @@ impl AggregatorCell {
         self.slots[tf.as_ordinal()]
     }
 
+    /// `true` when a tick at `fold_secs` would SEAL this frame's open bucket:
+    /// a bucket is open and the tick's bucket starts after it. The exact rule
+    /// `consume_tick` applies (plan ITEM 47 uses it to release a held bar
+    /// before the seal replaces it). O(1).
+    #[must_use]
+    pub fn would_seal(&self, tf: TfIndex, fold_secs: u32) -> bool {
+        let open = self.slots[tf.as_ordinal()];
+        !open.is_uninitialised() && tf.bucket_start(fold_secs) > open.bucket_start_ist_secs
+    }
+
+    /// Start (IST fold seconds) of this frame's OPEN bucket, or 0 when none is
+    /// open. O(1).
+    #[must_use]
+    pub fn open_bucket_start(&self, tf: TfIndex) -> u32 {
+        self.slots[tf.as_ordinal()].bucket_start_ist_secs
+    }
+
+    /// `true` when the catch-up seal at `cutoff_secs` would seal this frame's
+    /// open bucket (its exclusive end is at or before the cutoff). O(1).
+    #[must_use]
+    pub fn would_catch_up_seal(&self, tf: TfIndex, cutoff_secs: u32) -> bool {
+        let open = self.slots[tf.as_ordinal()];
+        !open.is_uninitialised()
+            && open
+                .bucket_start_ist_secs
+                .saturating_add(tf.seconds_per_bucket())
+                <= cutoff_secs
+    }
+
     /// Snapshot of the most-recently sealed bucket of one timeframe, or
     /// `None` when nothing is amendable (boot, or after a day-boundary
     /// [`Self::force_seal`]).

@@ -1694,6 +1694,69 @@ const fn board_cadence_for_fold_frame(
     }
 }
 
+/// Seals routed by [`route_catch_up_seal`], in the three outcomes a seal can
+/// have.
+#[derive(Debug, Default, Clone, Copy)]
+struct SealTally {
+    emitted: u64,
+    dropped: u64,
+    rescued: u64,
+}
+
+/// Routes one sealed bar from a catch-up seal or the replay hand-over: the
+/// board's copy, then the seal writer, spilling to disk when the writer is
+/// absent or full. O(1).
+///
+/// The board's copy of a sealed window (audit PR4c-2), O(1).
+///
+/// Every frame the fold produces is emitted. The enum carries
+/// exactly the nine native timeframes the operator asked for
+/// (directive 2026-09-18: 1s 3s 5s 1m 3m 5m 15m 30m 60m — his
+/// list has eleven entries, of which `ticks` is a separate
+/// table and `10m` is DERIVED from candles_1m, so neither is a
+/// fold frame).
+///
+/// Until 2026-09-19 the enum carried 24 and a
+/// `!tf.is_operator_requested()` gate stood here, skipping the
+/// fifteen unrequested frames into a third `seals_skipped`
+/// counter so that no bar escaped the ledger. `TF_COUNT` is 9
+/// now, so that gate could only ever return false and that
+/// counter could only ever report 0 — a filter that cannot
+/// filter reads as a live one to the next author, and a
+/// counter that cannot count is a dead monitor. Both are gone;
+/// the guarantee they carried is structural instead, because
+/// there is no unrequested frame left to skip.
+/// Pinned by `tf_index::tests::tf_index_all_is_the_operators_nine`.
+#[allow(clippy::too_many_arguments)] // APPROVED: one seal's identity plus its two sinks and the tally
+fn route_catch_up_seal(
+    sender: Option<&tokio::sync::mpsc::Sender<BufferedSeal>>,
+    leaderboard: &mut crate::volume_leaderboard::VolumeLeaderboard,
+    feed: tickvault_common::feed::Feed,
+    security_id: u64,
+    segment_code: u8,
+    tf: TfIndex,
+    state: LiveCandleState,
+    tally: &mut SealTally,
+) {
+    record_board_seal(leaderboard, security_id, segment_code, tf, &state);
+    let seal = BufferedSeal::new(security_id, segment_code, tf, state, feed);
+    let Some(tx) = sender else {
+        match escalate_refused_seal(&seal) {
+            SealRefusal::Rescued => tally.rescued = tally.rescued.saturating_add(1),
+            SealRefusal::Lost => tally.dropped = tally.dropped.saturating_add(1),
+        }
+        return;
+    };
+    if let Err(refused) = tx.try_send(seal) {
+        match escalate_refused_seal(&refused.into_inner()) {
+            SealRefusal::Rescued => tally.rescued = tally.rescued.saturating_add(1),
+            SealRefusal::Lost => tally.dropped = tally.dropped.saturating_add(1),
+        }
+    } else {
+        tally.emitted = tally.emitted.saturating_add(1);
+    }
+}
+
 /// Hands a bar the fold just SEALED to the leaderboard when it is a board
 /// frame's bar, so the window's board can still read its volume after the
 /// contract has sealed a later bar over it in the fold (audit PR4c-2, see
@@ -4578,7 +4641,28 @@ impl LiveIngest {
         ));
         self.aggregator
             .set_live_capture_start(u32::try_from(now_ist_secs).unwrap_or(u32::MAX));
-        let (tainted, suppressed) = self.aggregator.finish_replay(ended_on_gap);
+        // Bars the replay still HELD (sealed, but amendable until the next
+        // bar of their timeframe sealed) are final now; the complete ones go
+        // down the same seal path as a catch-up seal.
+        let sender = tickvault_storage::seal_writer_runner::global_seal_sender();
+        let leaderboard = &mut self.leaderboard;
+        let mut tally = SealTally::default();
+        let (tainted, suppressed) = self.aggregator.finish_replay(
+            ended_on_gap,
+            |feed, security_id, segment_code, tf, state| {
+                route_catch_up_seal(
+                    sender,
+                    leaderboard,
+                    feed,
+                    security_id,
+                    segment_code,
+                    tf,
+                    state,
+                    &mut tally,
+                );
+            },
+        );
+        self.apply_seal_tally(tally);
         if tainted > 0 || suppressed > 0 {
             info!(
                 ended_on_gap,
@@ -4704,81 +4788,50 @@ impl LiveIngest {
         from_slot: usize,
         max_slots: usize,
     ) -> (u64, u64, usize) {
-        let mut emitted = 0u64;
-        let mut dropped = 0u64;
-        let mut rescued = 0u64;
         let sender = tickvault_storage::seal_writer_runner::global_seal_sender();
         let leaderboard = &mut self.leaderboard;
+        let mut tally = SealTally::default();
         let (bars, next) = self.aggregator.catch_up_seal_slots(
             cutoff,
             from_slot,
             max_slots,
             |feed, security_id, segment_code, tf, state| {
-                // The board's copy of a sealed window (audit PR4c-2), O(1).
-                record_board_seal(leaderboard, security_id, segment_code, tf, &state);
-                // Every frame the fold produces is emitted. The enum carries
-                // exactly the nine native timeframes the operator asked for
-                // (directive 2026-09-18: 1s 3s 5s 1m 3m 5m 15m 30m 60m — his
-                // list has eleven entries, of which `ticks` is a separate
-                // table and `10m` is DERIVED from candles_1m, so neither is a
-                // fold frame).
-                //
-                // Until 2026-09-19 the enum carried 24 and a
-                // `!tf.is_operator_requested()` gate stood here, skipping the
-                // fifteen unrequested frames into a third `seals_skipped`
-                // counter so that no bar escaped the ledger. `TF_COUNT` is 9
-                // now, so that gate could only ever return false and that
-                // counter could only ever report 0 — a filter that cannot
-                // filter reads as a live one to the next author, and a
-                // counter that cannot count is a dead monitor. Both are gone;
-                // the guarantee they carried is structural instead, because
-                // there is no unrequested frame left to skip.
-                // Pinned by `tf_index::tests::tf_index_all_is_the_operators_nine`.
-                let seal = BufferedSeal::new(security_id, segment_code, tf, state, feed);
-                // No writer channel installed at all. Before 2026-08-19 this
-                // discarded the seal outright; it now takes the same durable
-                // route a full channel does, so a boot-order problem costs a
-                // disk write rather than a day of candles.
-                let Some(tx) = sender else {
-                    match escalate_refused_seal(&seal) {
-                        SealRefusal::Rescued => rescued = rescued.saturating_add(1),
-                        SealRefusal::Lost => dropped = dropped.saturating_add(1),
-                    }
-                    return;
-                };
-                // NEVER discard. Operator directive 2026-08-19: "never ever
-                // drop any ticks irrespective of any worst case". A refused
-                // seal goes to disk (spill, then DLQ); only a seal both disk
-                // tiers reject is counted as lost, and that fires
-                // AGGREGATOR-DROP-01.
-                if let Err(refused) = tx.try_send(seal) {
-                    match escalate_refused_seal(&refused.into_inner()) {
-                        SealRefusal::Rescued => rescued = rescued.saturating_add(1),
-                        SealRefusal::Lost => dropped = dropped.saturating_add(1),
-                    }
-                } else {
-                    emitted = emitted.saturating_add(1);
-                }
+                route_catch_up_seal(
+                    sender,
+                    leaderboard,
+                    feed,
+                    security_id,
+                    segment_code,
+                    tf,
+                    state,
+                    &mut tally,
+                );
             },
         );
         debug_assert_eq!(
             bars as u64,
-            emitted.saturating_add(dropped),
+            tally.emitted.saturating_add(tally.dropped),
             "every bar catch_up_seal_slots produced must be accounted as emitted or dropped"
         );
-        self.seals_emitted = self.seals_emitted.saturating_add(emitted);
-        self.seals_dropped = self.seals_dropped.saturating_add(dropped);
-        self.seals_rescued = self.seals_rescued.saturating_add(rescued);
-        if emitted > 0 {
-            counters().seals_emitted.increment(emitted);
-        }
-        if dropped > 0 {
-            counters().seals_dropped.increment(dropped);
-        }
-        if rescued > 0 {
-            counters().seals_rescued.increment(rescued);
-        }
+        let (emitted, dropped) = (tally.emitted, tally.dropped);
+        self.apply_seal_tally(tally);
         (emitted, dropped, next)
+    }
+
+    /// Adds a seal tally to the ingest's running totals and counters. O(1).
+    fn apply_seal_tally(&mut self, tally: SealTally) {
+        self.seals_emitted = self.seals_emitted.saturating_add(tally.emitted);
+        self.seals_dropped = self.seals_dropped.saturating_add(tally.dropped);
+        self.seals_rescued = self.seals_rescued.saturating_add(tally.rescued);
+        if tally.emitted > 0 {
+            counters().seals_emitted.increment(tally.emitted);
+        }
+        if tally.dropped > 0 {
+            counters().seals_dropped.increment(tally.dropped);
+        }
+        if tally.rescued > 0 {
+            counters().seals_rescued.increment(tally.rescued);
+        }
     }
 
     /// Instruments the gap detector is tracking. O(1).

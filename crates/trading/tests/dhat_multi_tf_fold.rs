@@ -160,7 +160,7 @@ fn dhat_consume_tick_zero_alloc_in_bucket_and_across_boundaries() {
                 }
             }
             agg.catch_up_seal_all(OPEN + 6 * 3_600, |_, _, _, _, _| {});
-            agg.finish_replay(false);
+            agg.finish_replay(false, |_, _, _, _, _| {});
             // Live ticks from 15:16: the replay above ran to ~14:38, and an
             // earlier live tick would be late and discarded, sealing nothing.
             for minute in 1..=10u32 {
