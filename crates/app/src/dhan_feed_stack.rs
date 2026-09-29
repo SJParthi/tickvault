@@ -4560,6 +4560,16 @@ impl LiveIngest {
         (emitted, dropped)
     }
 
+    /// Ends a WAL replay: hands the candle fold over to the live feed (plan
+    /// ITEM 47, [`MultiTfAggregator::finish_replay`]). A no-op when no replay
+    /// ran.
+    ///
+    /// # Complexity
+    /// O(slots × TF), once per lane start.
+    pub fn finish_wal_replay(&mut self) {
+        self.aggregator.finish_replay();
+    }
+
     /// `watermark − CATCHUP_LATENESS_MARGIN_SECS`, saturating at 0 (seal
     /// nothing) before the session's watermark has moved.
     fn catch_up_cutoff(&self) -> u32 {
@@ -14518,12 +14528,11 @@ pub fn refold_wal_frames(
     // here, which is why the guard is set and cleared in this function and
     // not at either caller.
     ingest.replaying_wal = false;
-    // Plan ITEM 47: the live feed resumes after frames this replay never saw
-    // (applied ones, and any downtime), so the next live tick re-seeds rather
-    // than taking that span into one bar. Undercount of one tick per
-    // instrument, never an invented volume.
-    ingest.aggregator.mark_replay_gap();
-    ingest.aggregator.set_replay_mode(false);
+    // Plan ITEM 47: replay mode stays ON across the boot replay and every
+    // catch-up round, which are consecutive with nothing live folded between
+    // them. It ends once, at the hand-over to the live drain
+    // (`LiveIngest::finish_wal_replay`), which also marks the gap the
+    // downtime left.
     out
 }
 
@@ -15239,6 +15248,11 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         // one state in which the applied-watermark's unapplied buckets can be
         // cleared: everything they guarded has been replayed and confirmed.
         let mut catchup_drained = false;
+        // Plan ITEM 47: whether the previous catch-up round ended on a real
+        // gap. Rounds are consecutive reads of one backlog, so a round that
+        // follows a clean one does not start after a gap, whatever the replay
+        // pass assumes about its own first frame.
+        let mut catchup_prev_trailing_gap = false;
         // Every segment this drain can confirm holds frames below THIS point;
         // a shed from a socket dialed during the drain lands above it and its
         // bucket must survive the reset at the end.
@@ -15312,7 +15326,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 break;
             }
             let wal_dir = crate::boot_helpers::ws_wal_dir();
-            let batch = match tickvault_storage::ws_frame_spill::replay_all_with_report_fenced(
+            let mut batch = match tickvault_storage::ws_frame_spill::replay_all_with_report_fenced(
                 &wal_dir,
                 tickvault_storage::ws_frame_spill::WAL_REPLAY_MAX_BYTES,
             ) {
@@ -15384,6 +15398,18 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             // with the boot path so one series answers "how many of these have
             // we seen", regardless of which drain saw them.
             let batch_len = batch.frames.len();
+            // Plan ITEM 47: the first round follows the boot replay across the
+            // downtime, a real gap; a later round continues the previous one
+            // unless that one ended on a gap or this one skipped something
+            // before its first frame.
+            if rounds > 0
+                && !catchup_prev_trailing_gap
+                && !batch.leading_gap
+                && let Some(first) = batch.frames.first_mut()
+            {
+                first.after_gap = false;
+            }
+            catchup_prev_trailing_gap = batch.trailing_gap;
             let mut staged: Vec<(u64, i64, WalEndpoint, bytes::Bytes)> =
                 Vec::with_capacity(batch_len);
             // Plan ITEM 47: indexes into `staged` of frames that follow a gap.
@@ -15652,6 +15678,9 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // handful of batches in a session. A large buffer here would only delay
     // discovering that nobody is receiving.
     let (seed_tx, seed_rx) = tokio::sync::mpsc::channel::<Vec<SubscribeInstrument>>(8);
+    // Plan ITEM 47: the WAL replay (boot + catch-up) is over; hand over to the
+    // live feed before its first frame folds.
+    ingest.finish_wal_replay();
     let drain = tokio::spawn(run_frame_drain(
         frame_rx,
         ingest,
@@ -23066,6 +23095,39 @@ mod wal_refold_tests {
         assert_eq!(out.gaps_marked, 2, "indexes 0 and 2, once each");
         let none = refold_wal_frames(&mut ingest(), &frames, &[]);
         assert_eq!(none.gaps_marked, 0);
+    }
+
+    /// Plan ITEM 47 review: the replay-to-live hand-over runs ONCE, in the
+    /// lane start, after the boot replay and every catch-up round and before
+    /// the live drain is spawned. Anywhere later, a live frame folds while the
+    /// replay's partial buckets are unguarded; anywhere earlier (inside the
+    /// refold), every catch-up round would restart on a false gap.
+    #[test]
+    fn test_finish_wal_replay_runs_once_between_the_catch_up_and_the_drain() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let prod = src.split("#[cfg(test)]").next().expect("production half");
+        let call = "ingest.finish_wal_replay();";
+        assert_eq!(prod.matches(call).count(), 1, "exactly one hand-over");
+        let finish = prod.find(call).expect("hand-over present");
+        let catch_up = prod
+            .find("refold_wal_frames(&mut ingest, &staged, &staged_gaps)")
+            .expect("catch-up refold present");
+        let spawn = prod
+            .find("tokio::spawn(run_frame_drain(")
+            .expect("drain spawn present");
+        assert!(
+            catch_up < finish && finish < spawn,
+            "catch-up, hand-over, drain"
+        );
+        let refold = prod
+            .split("pub fn refold_wal_frames")
+            .nth(1)
+            .and_then(|rest| rest.split("\npub fn ").next())
+            .expect("refold body");
+        assert!(
+            !refold.contains("set_replay_mode(false)") && !refold.contains("finish_replay"),
+            "the refold must not end replay mode between catch-up rounds"
+        );
     }
 
     /// The 2026-09-01 finding: a depth-socket frame in the live-feed WAL was

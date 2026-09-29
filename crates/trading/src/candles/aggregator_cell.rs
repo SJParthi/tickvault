@@ -839,6 +839,33 @@ impl AggregatorCell {
         // documents.
         self.chain_broken = [true; TF_COUNT];
     }
+
+    /// Re-bases the open buckets after a WAL-replay GAP (plan ITEM 47): the
+    /// counter did not restart, the replay just skipped a span of it.
+    ///
+    /// Same re-base and carry drop as [`Self::rebase_open_buckets`], but the
+    /// chain is broken ONLY for a frame with no open bucket. An open bucket
+    /// re-based here has its right endpoint on the post-gap cumulative, so the
+    /// next bucket chains to it exactly, and must: breaking it would anchor
+    /// that bucket on its rolling tick and lose the tick's volume from a bar
+    /// that is otherwise complete (found by review, 2026-09-29). A frame with
+    /// no open bucket would chain to its last SEALED bar, whose endpoint is
+    /// from before the gap — that one must anchor on the live cumulative.
+    ///
+    /// # Complexity
+    /// O(`TF_COUNT`).
+    pub fn rebase_open_buckets_after_gap(&mut self, cumulative_volume: u64) {
+        for (state, broken) in self.slots.iter_mut().zip(self.chain_broken.iter_mut()) {
+            let open = !state.is_uninitialised();
+            if open {
+                state.bucket_start_cumulative = cumulative_volume.saturating_sub(state.volume);
+            }
+            *broken = !open;
+        }
+        self.carried_upto = [0; TF_COUNT];
+        self.carried_net = [0; TF_COUNT];
+        self.carried_unclassified = [false; TF_COUNT];
+    }
     /// Folds one tick into ONE timeframe slot.
     ///
     /// `bucket_start_cumulative` is the instrument's cumulative day volume as
@@ -2853,6 +2880,38 @@ mod tests {
             cell.snapshot(TfIndex::M1).is_uninitialised(),
             "a slot that never opened must stay uninitialised"
         );
+    }
+
+    /// Plan ITEM 47 review: after a replay gap only a frame with NO open
+    /// bucket breaks its chain; an open bucket keeps it, so the next bucket
+    /// chains to the re-based endpoint and keeps its rolling tick's volume.
+    #[test]
+    fn test_rebase_open_buckets_after_gap_breaks_the_chain_only_where_nothing_is_open() {
+        let mut cell = AggregatorCell::empty();
+        // M1 open with 7 counted; every other frame never opened.
+        let m1 = &mut cell.slots[TfIndex::M1.as_ordinal()];
+        m1.bucket_start_ist_secs = 33_300;
+        m1.bucket_start_cumulative = 10;
+        m1.volume = 7;
+        assert!(!cell.snapshot(TfIndex::M1).is_uninitialised());
+        assert!(cell.snapshot(TfIndex::S1).is_uninitialised());
+        cell.chain_broken = [false; TF_COUNT];
+        cell.rebase_open_buckets_after_gap(100_000);
+        for tf in TfIndex::ALL {
+            let open = !cell.snapshot(tf).is_uninitialised();
+            assert_eq!(
+                cell.chain_broken[tf.as_ordinal()],
+                !open,
+                "{tf:?}: chain broken exactly when no bucket is open"
+            );
+            if open {
+                assert_eq!(
+                    cell.snapshot(tf).bucket_start_cumulative,
+                    100_000 - cell.snapshot(tf).volume,
+                    "{tf:?}: re-based onto the post-gap cumulative, volume kept"
+                );
+            }
+        }
     }
 
     #[test]
