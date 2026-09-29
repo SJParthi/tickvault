@@ -1459,16 +1459,35 @@ impl AggregatorCell {
         }
 
         // Strictly newer bucket — seal the open one and open the new one at
-        // the LTP (an intraday crossing is never the day's first bar).
+        // the LTP, or at the official day open when the new bucket is the one
+        // that owns it (see the 2026-09-29 note below).
         //
-        // 2026-08-19 — the `false` is unchanged, but the DISARM beside it is
-        // new. Leaving here means the day's first bucket is behind us, so the
-        // official open can never legitimately be stamped again; disarming
-        // makes that structural rather than incidental, and is what lets the
-        // in-bucket path below stamp a late-arriving `day_open` without any
-        // risk of a later bucket claiming it.
+        // 2026-08-19 — the DISARM. Once the day's first session bucket is
+        // behind us the official open can never legitimately be stamped
+        // again; disarming makes that structural rather than incidental, and
+        // is what lets the in-bucket path stamp a late-arriving `day_open`
+        // without any risk of a later bucket claiming it.
         if bucket_start > open_start {
-            self.armed_for_day_open[ord] = false;
+            // ⚠ 2026-09-29 (plan ITEM 47, review round 9): "an intraday
+            // crossing is never the day's first bar" is FALSE for a roll out
+            // of a PRE-OPEN bucket (the grid starts at 09:00) into the bucket
+            // holding 09:15. The empty-slot open stamps the official day open
+            // on that bucket; the roll did not, and disarmed. Which one ran
+            // depended only on whether the catch-up sweep sealed the pre-open
+            // bar first, so the same ticks gave two different opening bars,
+            // and a WAL replay (which runs no sweep) rebuilt a different bar
+            // than live stored. The roll now applies the same rule, and
+            // disarms only once it has used the open or moved past the
+            // bucket that owns it.
+            let day_start = bucket_start - (bucket_start % 86_400);
+            let first_session_start =
+                tf.bucket_start(day_start.saturating_add(MARKET_OPEN_SECS_OF_DAY_IST));
+            let use_day_open = self.armed_for_day_open[ord]
+                && prices.day_open > 0.0
+                && bucket_start == first_session_start;
+            if use_day_open || bucket_start > first_session_start {
+                self.armed_for_day_open[ord] = false;
+            }
             // The bar we are about to seal IS the new bar's predecessor, so
             // its close is read from the OPEN slot here rather than from
             // `last_sealed` (which still holds the bar before it). Captured
@@ -1514,10 +1533,13 @@ impl AggregatorCell {
                     bucket_start,
                     chained_start,
                     BucketOpenContext {
-                        use_day_open: false,
-                        // An intraday crossing is never the day's first bar,
-                        // so the running session extremes must NOT be adopted
-                        // here — the scope guarantee of plan Item 6.
+                        // The official open, exactly as the empty-slot open
+                        // would stamp it (see above).
+                        use_day_open,
+                        // A roll has a predecessor today, so the running
+                        // session extremes must NOT be adopted here — the
+                        // scope guarantee of plan Item 6, and what the
+                        // empty-slot open also decides once a bar has sealed.
                         first_bucket_of_day: false,
                         prev_close: prev_close_for_new_bucket,
                     },
@@ -2809,6 +2831,48 @@ mod tests {
             exchange_timestamp: ts,
             volume: cum_volume,
             ..ParsedTick::default()
+        }
+    }
+
+    /// Plan ITEM 47, review round 9 (verified by the reviewer on a live
+    /// sequence): the bar holding the market open must come out the same
+    /// whether the pre-open bar before it was sealed by the catch-up sweep
+    /// (then the 09:15 tick opens an EMPTY slot) or by the 09:15 tick itself
+    /// (a ROLL). Before the fix the roll ignored the official day open and
+    /// the two paths published different opening bars for the same ticks —
+    /// and a WAL replay, which runs no sweep, rebuilt a different bar than
+    /// live had stored.
+    #[test]
+    fn test_regression_roll_and_empty_open_stamp_the_same_day_open() {
+        let strategy = FeedStrategy::DEFAULT;
+        for tf in [TfIndex::M1, TfIndex::M5] {
+            let run = |sweep_first: bool| {
+                let mut cell = AggregatorCell::empty();
+                // Two pre-open trades (09:08) with no official open yet.
+                for (ts, cum) in [(OPEN - 420, 1_000_u32), (OPEN - 410, 1_010)] {
+                    let t = tick_at(ts, 100.0, cum);
+                    cell.consume_tick(tf, &t, cum.into(), strategy, cum.into());
+                }
+                if sweep_first {
+                    assert!(
+                        cell.catch_up_seal(tf, OPEN).is_some(),
+                        "the sweep seals 09:08"
+                    );
+                }
+                let mut first = tick_at(OPEN + 5, 102.0, 1_020);
+                first.day_open = 101.0;
+                cell.consume_tick(tf, &first, 1_020, strategy, 1_020);
+                cell.snapshot(tf)
+            };
+            let swept = run(true);
+            let rolled = run(false);
+            assert_eq!(swept.open.to_bits(), rolled.open.to_bits(), "{tf:?} open");
+            assert_eq!(swept.low.to_bits(), rolled.low.to_bits(), "{tf:?} low");
+            assert_eq!(swept.high.to_bits(), rolled.high.to_bits(), "{tf:?} high");
+            assert!(
+                (rolled.open - 101.0).abs() < 1e-9,
+                "{tf:?}: the bar that owns 09:15 opens at the official day open"
+            );
         }
     }
 

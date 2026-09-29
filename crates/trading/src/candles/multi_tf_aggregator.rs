@@ -3462,8 +3462,7 @@ mod tests {
 
         /// Receipt in UTC nanoseconds for an IST fold second.
         fn receipt_nanos(ist_secs: u32) -> i64 {
-            (i64::from(ist_secs) - i64::from(crate::candles::tf_index::IST_UTC_OFFSET_SECS))
-                * 1_000_000_000
+            (i64::from(ist_secs) - crate::candles::tf_index::IST_UTC_OFFSET_SECS) * 1_000_000_000
         }
 
         #[derive(Clone, Debug)]
