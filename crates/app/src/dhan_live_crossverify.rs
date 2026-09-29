@@ -82,6 +82,10 @@ const SECS_PER_MINUTE: i64 = 60;
 
 /// NSE session open — 09:15:00 IST, as seconds-of-day.
 pub const SESSION_OPEN_SECS_OF_DAY_IST: i64 = 9 * 3600 + 15 * 60;
+
+/// Dhan's index segment. An index carries no volume, so a missing index
+/// minute cannot be split into traded / untraded and always counts as real.
+const INDEX_SEGMENT: &str = "IDX_I";
 /// NSE session close — 15:40:00 IST, as seconds-of-day. The window is
 /// half-open `[open, close)`, so the last comparable bucket opens at 15:39.
 ///
@@ -870,6 +874,10 @@ pub fn compare_day_in_scope(
     let mut missing_live_zero_volume: i64 = 0;
     let mut missing_rest: i64 = 0;
     let mut tail_unsealed: i64 = 0;
+    // Missing minutes on an index — always real (see the missing arm).
+    let mut missing_live_index: i64 = 0;
+    let session_open_minute = day_start_ist_nanos
+        .saturating_add(SESSION_OPEN_SECS_OF_DAY_IST.saturating_mul(NANOS_PER_SEC));
 
     let all_keys: BTreeSet<&Key> = live_map.keys().chain(rest_map.keys()).collect();
 
@@ -915,17 +923,27 @@ pub fn compare_day_in_scope(
                 // reports as untraded says nothing about our capture, and
                 // counting it as 0% would drag the median toward a number
                 // that means "no trades happened", not "we missed them".
-                if r.bar.volume > 0 {
+                //
+                // Our `volume` is gross volume CARRYING THE BAR'S DIRECTION
+                // in its sign (`shadow_seal_columns::from_buffered_seal`,
+                // 2026-09-18 directive); Dhan's is unsigned. So the SIZE is
+                // what is compared — comparing the signed value read every
+                // sell-side bar as a mismatch (2026-09-28: 42% "exact").
+                //
+                // The 09:15 minute is left out of the volume measure: our
+                // first bar includes the pre-open auction volume and Dhan's
+                // does not, so it can never match and says nothing about
+                // capture. Its prices are still compared above.
+                if r.bar.volume > 0 && minute != session_open_minute {
                     volume_cells = volume_cells.saturating_add(1);
-                    if l.bar.volume == r.bar.volume {
+                    let live_size = i64::try_from(l.bar.volume.unsigned_abs()).unwrap_or(i64::MAX);
+                    if live_size == r.bar.volume {
                         volume_exact = volume_exact.saturating_add(1);
                     }
                     // Integer arithmetic throughout — a float ratio here
                     // would be the one place in this module that compares
                     // by epsilon, which its own header forbids.
-                    let pct = l
-                        .bar
-                        .volume
+                    let pct = live_size
                         .saturating_mul(100)
                         .checked_div(r.bar.volume)
                         .unwrap_or(0);
@@ -949,6 +967,12 @@ pub fn compare_day_in_scope(
                         missing_live_traded = missing_live_traded.saturating_add(1);
                     } else {
                         missing_live_zero_volume = missing_live_zero_volume.saturating_add(1);
+                    }
+                    // An index carries no volume, so the traded/untraded
+                    // split says nothing about it — and it ticks every
+                    // second, so a minute it is missing IS lost data.
+                    if segment == INDEX_SEGMENT {
+                        missing_live_index = missing_live_index.saturating_add(1);
                     }
                     DhanLiveXverifyCellKind::MissingLive
                 };
@@ -1031,7 +1055,15 @@ pub fn compare_day_in_scope(
         // anomaly is `missing_rest` lands on `Partial`, which `is_pass()`
         // refuses and `is_measured()` accepts: visible, never a pass, and
         // never crying feed-loss either.
-        let real = cells_diverged > 0 || missing_live > 0;
+        //
+        // 2026-09-29: a missing minute counts as real only when Dhan's own
+        // bar shows a trade, or the instrument is an index. Dhan prints a
+        // flat volume-0 bar for a minute nothing traded, and our fold
+        // correctly prints nothing — on 2026-09-28 that was 24,441 of the
+        // 25,534 "missing" option minutes, and it turned the whole day
+        // `diverged`. Those minutes stay counted and persisted
+        // (`missing_live_zero_volume`); they just no longer decide the verdict.
+        let real = cells_diverged > 0 || missing_live_traded > 0 || missing_live_index > 0;
         if degraded {
             DhanLiveXverifyOutcome::Partial
         } else if real {
@@ -3538,6 +3570,10 @@ mod tests {
 
     /// Builds on the existing `bar` helper rather than calling the
     /// constructor again, so this file gains no second fallible-unwrap site.
+    /// 09:16 — the first minute the volume measure scores (09:15 carries the
+    /// pre-open auction on our side only).
+    const VOL_MINUTE: i64 = OPEN + 60;
+
     fn bar_vol(o: f64, h: f64, l: f64, c: f64, v: i64) -> PaiseBar {
         let mut b = bar(o, h, l, c);
         b.volume = v;
@@ -3548,8 +3584,8 @@ mod tests {
     fn volume_is_compared_at_all() {
         // The whole point. Before today this assertion was unwritable:
         // there was no field to read.
-        let live = vec![side(1, OPEN, bar_vol(10.0, 10.0, 10.0, 10.0, 700))];
-        let rest = vec![side(1, OPEN, bar_vol(10.0, 10.0, 10.0, 10.0, 1_000))];
+        let live = vec![side(1, VOL_MINUTE, bar_vol(10.0, 10.0, 10.0, 10.0, 700))];
+        let rest = vec![side(1, VOL_MINUTE, bar_vol(10.0, 10.0, 10.0, 10.0, 1_000))];
         let cmp = compare_day(&live, &rest, DAY_START_NANOS, RUN_TS, 0, false);
 
         assert_eq!(cmp.volume_cells, 1, "the cell must be counted");
@@ -3567,8 +3603,8 @@ mod tests {
         // ~1/sec sample and theirs is the full tape, so under-capture is
         // STRUCTURAL. Folding it into `cells_diverged` would flag nearly
         // every cell and drown the price signal beside it.
-        let live = vec![side(1, OPEN, bar_vol(10.0, 10.0, 10.0, 10.0, 1))];
-        let rest = vec![side(1, OPEN, bar_vol(10.0, 10.0, 10.0, 10.0, 9_999))];
+        let live = vec![side(1, VOL_MINUTE, bar_vol(10.0, 10.0, 10.0, 10.0, 1))];
+        let rest = vec![side(1, VOL_MINUTE, bar_vol(10.0, 10.0, 10.0, 10.0, 9_999))];
         let cmp = compare_day(&live, &rest, DAY_START_NANOS, RUN_TS, 0, false);
 
         assert_eq!(
@@ -3591,12 +3627,12 @@ mod tests {
         // it 0% would drag the median toward "we missed everything" when the
         // truth is "there was nothing to miss".
         let live = vec![
-            side(1, OPEN, bar_vol(10.0, 10.0, 10.0, 10.0, 0)),
-            side(2, OPEN, bar_vol(10.0, 10.0, 10.0, 10.0, 500)),
+            side(1, VOL_MINUTE, bar_vol(10.0, 10.0, 10.0, 10.0, 0)),
+            side(2, VOL_MINUTE, bar_vol(10.0, 10.0, 10.0, 10.0, 500)),
         ];
         let rest = vec![
-            side(1, OPEN, bar_vol(10.0, 10.0, 10.0, 10.0, 0)),
-            side(2, OPEN, bar_vol(10.0, 10.0, 10.0, 10.0, 500)),
+            side(1, VOL_MINUTE, bar_vol(10.0, 10.0, 10.0, 10.0, 0)),
+            side(2, VOL_MINUTE, bar_vol(10.0, 10.0, 10.0, 10.0, 500)),
         ];
         let cmp = compare_day(&live, &rest, DAY_START_NANOS, RUN_TS, 0, false);
 
@@ -3615,7 +3651,7 @@ mod tests {
     #[test]
     fn capturing_everything_reads_as_one_hundred_percent() {
         let live: Vec<SideBar> = (0..10)
-            .map(|i| side(1, OPEN + i * 60, bar_vol(10.0, 10.0, 10.0, 10.0, 250)))
+            .map(|i| side(1, VOL_MINUTE + i * 60, bar_vol(10.0, 10.0, 10.0, 10.0, 250)))
             .collect();
         let rest = live.clone();
         let cmp = compare_day(&live, &rest, DAY_START_NANOS, RUN_TS, 0, false);
@@ -3635,11 +3671,27 @@ mod tests {
         // is fine; only the tail says an instrument had a hole in it. That
         // asymmetry is why both are reported.
         let mut live: Vec<SideBar> = (0..19)
-            .map(|i| side(1, OPEN + i * 60, bar_vol(10.0, 10.0, 10.0, 10.0, 1_000)))
+            .map(|i| {
+                side(
+                    1,
+                    VOL_MINUTE + i * 60,
+                    bar_vol(10.0, 10.0, 10.0, 10.0, 1_000),
+                )
+            })
             .collect();
-        live.push(side(1, OPEN + 19 * 60, bar_vol(10.0, 10.0, 10.0, 10.0, 20)));
+        live.push(side(
+            1,
+            VOL_MINUTE + 19 * 60,
+            bar_vol(10.0, 10.0, 10.0, 10.0, 20),
+        ));
         let rest: Vec<SideBar> = (0..20)
-            .map(|i| side(1, OPEN + i * 60, bar_vol(10.0, 10.0, 10.0, 10.0, 1_000)))
+            .map(|i| {
+                side(
+                    1,
+                    VOL_MINUTE + i * 60,
+                    bar_vol(10.0, 10.0, 10.0, 10.0, 1_000),
+                )
+            })
             .collect();
         let cmp = compare_day(&live, &rest, DAY_START_NANOS, RUN_TS, 0, false);
 
@@ -3673,8 +3725,8 @@ mod tests {
         // happen honestly. It is the signature of the double-counting defect
         // measured on 2026-08-24 (intraday frames at ~9.2x the day bar), and
         // clamping it to 100 would erase the only evidence of it.
-        let live = vec![side(1, OPEN, bar_vol(10.0, 10.0, 10.0, 10.0, 9_200))];
-        let rest = vec![side(1, OPEN, bar_vol(10.0, 10.0, 10.0, 10.0, 1_000))];
+        let live = vec![side(1, VOL_MINUTE, bar_vol(10.0, 10.0, 10.0, 10.0, 9_200))];
+        let rest = vec![side(1, VOL_MINUTE, bar_vol(10.0, 10.0, 10.0, 10.0, 1_000))];
         let cmp = compare_day(&live, &rest, DAY_START_NANOS, RUN_TS, 0, false);
 
         assert_eq!(
@@ -3952,5 +4004,101 @@ mod tests {
             "3 targeted instruments produce 3 findings — not 200. That ratio \
              is what took the buffer from 208 MB back under its ceiling"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // 2026-09-29 (plan ITEM 46): false divergence on the 2026-09-28 run.
+    // -----------------------------------------------------------------
+
+    fn side_in(sid: i64, segment: &str, secs: i64, b: PaiseBar) -> SideBar {
+        SideBar {
+            segment: segment.to_string(),
+            ..side(sid, secs, b)
+        }
+    }
+
+    /// Our volume carries the bar's direction in its sign; Dhan's does not.
+    /// A sell-side bar of the same size is an exact match.
+    #[test]
+    fn test_compare_day_volume_compares_magnitude_of_signed_live_volume() {
+        let live = vec![
+            side(1, VOL_MINUTE, bar_vol(10.0, 10.0, 10.0, 10.0, -1_000)),
+            side(2, VOL_MINUTE, bar_vol(10.0, 10.0, 10.0, 10.0, i64::MIN)),
+        ];
+        let rest = vec![
+            side(1, VOL_MINUTE, bar_vol(10.0, 10.0, 10.0, 10.0, 1_000)),
+            side(2, VOL_MINUTE, bar_vol(10.0, 10.0, 10.0, 10.0, 1_000)),
+        ];
+        let cmp = compare_day(&live, &rest, DAY_START_NANOS, RUN_TS, 0, false);
+        assert_eq!(cmp.volume_cells, 2);
+        assert_eq!(cmp.volume_exact, 1, "-1000 is the same size as 1000");
+        assert!(
+            cmp.volume_capture_min_pct >= 100,
+            "a negative bar must read as capture, never as below 0%"
+        );
+    }
+
+    /// Dhan prints a flat volume-0 bar for a minute nothing traded; our fold
+    /// prints nothing. That minute is counted, never a divergence.
+    #[test]
+    fn test_compare_day_zero_volume_missing_minute_is_not_divergence() {
+        let live = vec![side_in(
+            1,
+            "NSE_FNO",
+            VOL_MINUTE,
+            bar_vol(10.0, 10.0, 10.0, 10.0, 5),
+        )];
+        let rest = vec![
+            side_in(1, "NSE_FNO", VOL_MINUTE, bar_vol(10.0, 10.0, 10.0, 10.0, 5)),
+            side_in(
+                1,
+                "NSE_FNO",
+                VOL_MINUTE + 60,
+                bar_vol(10.0, 10.0, 10.0, 10.0, 0),
+            ),
+        ];
+        let cmp = compare_day(&live, &rest, DAY_START_NANOS, RUN_TS, 0, false);
+        assert_eq!(cmp.missing_live, 1, "still counted");
+        assert_eq!(cmp.missing_live_zero_volume, 1);
+        assert_eq!(cmp.missing_live_traded, 0);
+        assert_eq!(cmp.outcome, DhanLiveXverifyOutcome::Clean);
+
+        // The same minute with a trade in Dhan's bar IS lost data.
+        let rest_traded = vec![
+            side_in(1, "NSE_FNO", VOL_MINUTE, bar_vol(10.0, 10.0, 10.0, 10.0, 5)),
+            side_in(
+                1,
+                "NSE_FNO",
+                VOL_MINUTE + 60,
+                bar_vol(10.0, 10.0, 10.0, 10.0, 7),
+            ),
+        ];
+        let cmp = compare_day(&live, &rest_traded, DAY_START_NANOS, RUN_TS, 0, false);
+        assert_eq!(cmp.outcome, DhanLiveXverifyOutcome::Diverged);
+    }
+
+    /// An index carries no volume and ticks every second: a minute it is
+    /// missing is real loss even though Dhan's bar shows volume 0.
+    #[test]
+    fn test_compare_day_missing_index_minute_is_still_divergence() {
+        let live = vec![side(13, VOL_MINUTE, bar(100.0, 100.0, 100.0, 100.0))];
+        let rest = vec![
+            side(13, VOL_MINUTE, bar(100.0, 100.0, 100.0, 100.0)),
+            side(13, VOL_MINUTE + 60, bar_vol(100.0, 100.0, 100.0, 100.0, 0)),
+        ];
+        let cmp = compare_day(&live, &rest, DAY_START_NANOS, RUN_TS, 0, false);
+        assert_eq!(cmp.missing_live_zero_volume, 1);
+        assert_eq!(cmp.outcome, DhanLiveXverifyOutcome::Diverged);
+    }
+
+    /// 09:15 carries the pre-open auction on our side only: its prices are
+    /// compared, its volume is not scored.
+    #[test]
+    fn test_compare_day_session_open_minute_is_excluded_from_volume_measure() {
+        let live = vec![side(1, OPEN, bar_vol(10.0, 10.0, 10.0, 10.0, 90_000))];
+        let rest = vec![side(1, OPEN, bar_vol(10.0, 10.0, 10.0, 10.0, 1_000))];
+        let cmp = compare_day(&live, &rest, DAY_START_NANOS, RUN_TS, 0, false);
+        assert_eq!(cmp.minutes_compared, 1, "prices are still compared");
+        assert_eq!(cmp.volume_cells, 0, "09:15 volume is not scored");
     }
 }

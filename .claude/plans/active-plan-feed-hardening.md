@@ -5918,3 +5918,26 @@ New: `tv_wal_prune_refused_unapplied_total`, `tv_dhan_feed_depth_total{outcome="
 ### Per-Item Guarantee Matrix (Item 45)
 
 Cross-references `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row); each implementing PR carries both matrices in its body. Resilience row "Zero ticks lost" is the point of this item: every received frame is either in QuestDB, in the local WAL, or in S3 with a verified checksum — never in none of them. Honest envelope: bounded by S3 availability and local disk; beyond both, QuestDB suspends and pages, and nothing is deleted to make room.
+
+## ITEM 46 — DESIGN ADDENDUM (added 2026-09-29, operator: "fix and reosleve vrythignn dude okay?"): the daily 1-minute cross-verification reports false divergence
+
+Measured on the 2026-09-28 run (outcome `diverged`, 864 instruments, 307,669 minutes): volume matched exactly in only 42% of minutes, and 25,534 option minutes read as "missing". Read-only production queries showed most of it is the checker, not the feed.
+
+- [x] 46a — **Compare the size of our volume.** (Implemented: `dhan_live_crossverify::compare_day_in_scope`.) `candles_<tf>.volume` is gross volume carrying the bar's direction in its sign (`shadow_seal_columns::from_buffered_seal`, 2026-09-18 directive). `dhan_live_crossverify::compare_day` compared it signed against Dhan's unsigned volume, so every sell-side bar read as a mismatch. Compare `abs(live)` in both `volume_exact` and the capture percentage. Tests: `test_compare_day_volume_compares_magnitude_of_signed_live_volume`.
+- [x] 46b — **A no-trade minute is not divergence.** (Implemented: `compare_day_in_scope`, `INDEX_SEGMENT`.) Dhan prints a flat bar with volume 0 for a minute nothing traded; our fold prints nothing. `real = cells_diverged > 0 || missing_live > 0` counted those. Now `real` counts only `missing_live_traded` for non-index instruments; an `IDX_I` missing minute (indices carry no volume and tick every second) still counts. The zero-volume count stays reported. Tests: `test_compare_day_zero_volume_missing_minute_is_not_divergence`, `test_compare_day_missing_index_minute_is_still_divergence`.
+- [x] 46c — **09:15 carries pre-open volume.** (Implemented: `compare_day_in_scope`, `session_open_minute`.) Our 09:15 bar includes the pre-open auction volume; Dhan's does not. The 09:15 minute is excluded from the volume measurement (OHLC still compared). Tests: `test_compare_day_session_open_minute_is_excluded_from_volume_measure`.
+
+### Design
+Three local changes inside `compare_day`, O(1) per compared minute, no new state beyond two counters.
+### Edge Cases
+Index with volume 0 on both sides; a missing traded minute; a sell-side bar with negative volume equal in size; 09:15 bar; `i64::MIN` volume (`unsigned_abs`).
+### Failure Modes
+A real loss hidden: guarded by keeping every missing minute counted and reported, and by keeping index minutes strict.
+### Test Plan
+The five tests named above, plus the module's existing suite.
+### Rollback
+Revert the commit; the persisted tables are unchanged.
+### Observability
+Existing `dhan_live_crossverify_daily` columns; `missing_live_zero_volume` already persisted.
+
+Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
