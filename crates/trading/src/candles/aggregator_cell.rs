@@ -887,13 +887,17 @@ impl AggregatorCell {
                 state.net_volume_classified = false;
                 continue;
             }
+            // An open bucket that is about to roll first takes the carry owed
+            // to it (units already counted, from a refused late tick), exactly
+            // as a roll would; then it re-bases with that volume included
+            // (review round 5). With nothing open the carry is dropped.
+            let carry = self.take_carry(ord);
+            let state = &mut self.slots[ord];
             if open {
+                carry.settle_into(state);
                 state.bucket_start_cumulative = cumulative_volume.saturating_sub(state.volume);
             }
             self.chain_broken[ord] = !open;
-            self.carried_upto[ord] = 0;
-            self.carried_net[ord] = 0;
-            self.carried_unclassified[ord] = false;
         }
     }
     /// Folds one tick into ONE timeframe slot.
