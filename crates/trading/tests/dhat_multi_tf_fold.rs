@@ -68,16 +68,27 @@ fn tick_at(ts: u32, price: f32, volume: u32) -> ParsedTick {
 fn dhat_consume_tick_zero_alloc_in_bucket_and_across_boundaries() {
     let _profiler = dhat::Profiler::builder().testing().build();
 
-    let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, 8);
-
     // Pre-warm OUTSIDE the measured region: the first tick for an instrument
     // legitimately allocates its slot (one hash entry + one dense-vec push).
     // Steady state is what the hot-path claim is about.
+    //
+    // One aggregator PER ATTEMPT (plan ITEM 47, 2026-09-29): the helper
+    // re-runs this workload when an attempt measures a cross-thread phantom,
+    // and on the same aggregator every re-run tick is hours behind the clock
+    // phase (d) leaves at ~15:25, so nothing seals and the vacuity asserts
+    // fail — the retry that exists to absorb the phantom could never pass
+    // (seen on CI: attempt 1 measured 900 B / 4 blocks, attempt 2 panicked).
+    // Each attempt now starts from the same warmed state.
     let warm = tick_at(OPEN, 24_000.0, 10);
-    agg.consume_tick(Feed::Dhan, &warm, None, |_, _, _, _, _| {});
+    let mut aggs: [MultiTfAggregator; 3] = std::array::from_fn(|_| {
+        let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, 8);
+        agg.consume_tick(Feed::Dhan, &warm, None, |_, _, _, _, _| {});
+        agg
+    });
+    let mut attempt = 0usize;
 
-    // Phase (d) counts across every attempt: a re-attempt re-runs the same
-    // ticks, which are then late, so a per-attempt count could read 0.
+    // Phase (d) counts across every attempt (kept from before the per-attempt
+    // aggregators; harmless, and the asserts below read the totals).
     let mut replay_suppressed = 0u32;
     let mut replay_live_sealed = 0usize;
     let (_, allocs) = dhat_support::measure_with_phantom_retry(
@@ -85,6 +96,8 @@ fn dhat_consume_tick_zero_alloc_in_bucket_and_across_boundaries() {
         0,
         || {},
         || {
+            let agg = &mut aggs[attempt.min(2)];
+            attempt += 1;
             // (a) 10,000 IN-BUCKET folds — the common case, all 21 timeframes
             // per tick, no boundary crossed.
             for i in 0..10_000u32 {
