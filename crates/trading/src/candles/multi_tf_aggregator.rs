@@ -1889,6 +1889,21 @@ impl MultiTfAggregator {
             slot.replay_gap_frontier = slot
                 .replay_gap_frontier
                 .max(replay_gap_frontier_secs(tick.received_at_nanos, fold_secs));
+            // The gap tick may be a packet delivered out of order, older than
+            // a skipped one (review round 23, found by the differential once
+            // it delivered out of order): the next trade's delta then holds
+            // skipped volume and its price comparison reads an old price, and
+            // that false direction was carried into a later bar written as
+            // complete (-5 against a true +5). No direction is read until a
+            // trade after the frontier, exactly as after a live hand-over. A
+            // slot first seeded after a gap (a pass starts after one) is the
+            // same case: its seed may be older than a skipped packet, and the
+            // next trade then carried the skipped volume (42 against 17). Not
+            // on a seed with no gap marked: nothing was skipped.
+            if gap_now || gap_epoch != 0 {
+                slot.prev_price_untrusted = true;
+                slot.replay_settling = true;
+            }
         }
         if gap_now {
             slot.last_cumulative = cumulative_volume;

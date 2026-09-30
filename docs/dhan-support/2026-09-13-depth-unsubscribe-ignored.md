@@ -184,3 +184,79 @@ We are happy to run any diagnostic tests you need: a packet capture of the exact
 Thank you,
 **Parthiban Subramanian**
 Client ID: `1106656882`
+
+---
+
+## 2026-09-30 — Dhan's reply (received 12:56 IST, after a phone call)
+
+Transcribed verbatim from the email (sender "Dhan Cares", signed Shubham, DhanHQ Support Team). The JSON is reproduced as sent, including the mismatch between "Request Code **11**" in the text and `12` in the example that follows it.
+
+> Dear Parthiban,
+>
+> Greetings from the team at Dhan.
+>
+> As discussed over the call, we would like to clarify the Full Depth WebSocket feed disconnection process. If you are using Request Code 25 to unsubscribe from a feed, the request must include the same instrument details that were used during subscription. For example :
+>
+> ```json
+> {
+>     "RequestCode": 25,
+>     "InstrumentCount": 1,
+>     "InstrumentList": [
+>         {
+>             "ExchangeSegment": "NSE_EQ",
+>             "SecurityId": "11536"
+>         }
+>     ]
+> }
+> ```
+>
+> Sending only the Request Code, as shown below, will not unsubscribe or disconnect the feed :
+>
+> ```json
+> {
+>     "RequestCode": 25
+> }
+> ```
+>
+> If your intention is to disconnect the entire Full Depth WebSocket feed directly, you can use Request Code 11 as shown below:
+>
+> ```json
+> {
+>     "RequestCode": 12
+> }
+> ```
+>
+> Request Code 12 is used to terminate the complete WebSocket connection. We will also be updating the documentation to include this information for better clarity.
+>
+> Please let us know if you have any further queries.
+>
+> Best Regards,
+> Shubham
+> DhanHQ Support Team
+
+### What it answers
+
+| Our question | Answer in the reply | Status |
+|---|---|---|
+| 1. Is RequestCode 25 implemented for Full Market Depth? | Yes: 25 is the per-instrument unsubscribe. | Answered |
+| 2. Which code, 24 or 25? | 25. | Answered |
+| 3. Is RequestCode 12 plus a fresh subscribe the only way? | No: 25 with the instrument list unsubscribes one instrument; 12 closes the whole connection. | Answered |
+| 4. Is an unsubscribe acknowledged in any form? | Not addressed. | Open |
+| 5. Does a duplicate subscribe count again against the 804 cap? | Not addressed. | Open |
+
+### What it does not explain
+
+- **Our frames already match the example.** Our 20-level unsubscribe with code 25 (the frame quoted under "Request JSON" above) has exactly the reply's shape: `RequestCode` 25, `InstrumentCount`, and an `InstrumentList` carrying the same segment and string `SecurityId` as the subscribe. Both code-25 sessions in this ticket still measured instruments arriving after it: 110,114 ghost packets on 2026-09-10, and 41 ghost verdicts on 2026-09-24, when 207 of the 1,724 unsubscribes were on 20-level sockets.
+- **The 200-level shape is not shown.** Our 200-level subscribe is the flat form from the guide (`{"RequestCode":23,"ExchangeSegment":…,"SecurityId":…}`), so our unsubscribe is the flat form with 25. The reply's example is the list form. "The same instrument details that were used during subscription" reads as the flat form for 200-level, but that is our reading, not their statement.
+- **"11" or "12".** The text says Request Code 11; the example and the next sentence say 12. The Annexure lists 12 as Feed Disconnect, and 12 is what we would send.
+
+### What changes on our side
+
+Nothing today. Since 2026-09-25 the 20-level sockets hold one fixed set for the day and the 200-level sockets change instrument by reconnecting, so neither sends a per-instrument unsubscribe. If per-instrument steering comes back, the reply supports sending 25 in the subscribe shape, which is what `build_unsubscribe_payload` already emits. The ghost counter stays in place to measure it.
+
+### Suggested follow-up (not sent)
+
+1. Our 20-level unsubscribe already has exactly your example's shape, and instruments still arrived after it on 2026-09-10 and 2026-09-24. Could you check the SecurityIds from our 2026-09-24 session on your side?
+2. For 200-level sockets, should the unsubscribe be the flat form (as their subscribe is) or the list form in your example?
+3. Is the whole-connection disconnect Request Code 12 or 11? The email says both.
+4. Is an unsubscribe acknowledged in any form (our question 4), and does a duplicate subscribe count again against the 804 cap (question 5)?
