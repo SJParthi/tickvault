@@ -224,6 +224,15 @@ struct InstrumentSlot {
     /// depending on the next ticks' delivery lag (review round 12). Cleared
     /// when that bucket rolls.
     replay_handover_kept: u16,
+    /// `true` from a replay hand-over until this instrument's first live tick
+    /// with a receipt (review round 17): instruments on a socket that
+    /// listened later had a longer downtime than the process-wide capture
+    /// start says, so each one re-applies the downtime rule at its own first
+    /// live receipt.
+    handover_listen_pending: bool,
+    /// That receipt, IST seconds; `0` until it arrives. It bounds the span
+    /// this instrument's hand-over gap can hold.
+    handover_listen_secs: u32,
     /// `true` from the tick that resolves a replay gap (or a new slot's first
     /// tick) until a later tick has both RAISED the cumulative and left the
     /// tick rule with a direction (plan ITEM 47, review round 5). Until then a
@@ -1039,6 +1048,8 @@ impl MultiTfAggregator {
             replay_taint_open: 0,
             replay_taint_sealed: 0,
             replay_handover_kept: 0,
+            handover_listen_pending: false,
+            handover_listen_secs: 0,
             // A new slot knows neither the cumulative nor the direction that
             // came before its first tick (during a replay, those frames may
             // have been skipped), so its first buckets settle like a gap's.
@@ -1084,8 +1095,8 @@ impl MultiTfAggregator {
         // ITEM 47, review round 16). Both read the receipt of EVERY frame,
         // before any gate below refuses it: a refused post-close or
         // zero-price frame still shows the previous process was capturing.
-        // Replay pays one compare; live mode one bool test, false after its
-        // first tick.
+        // Replay pays one compare; live mode two bool tests (the mode, then
+        // the flag, false after its first tick).
         if self.replay_mode {
             if let Some(receipt) = receipt_ist_secs(tick.received_at_nanos) {
                 self.replay_last_frame_secs = self.replay_last_frame_secs.max(receipt);
@@ -1573,6 +1584,7 @@ impl MultiTfAggregator {
         } else {
             0
         };
+        let last_frame = self.replay_last_frame_secs;
         let catch_up_margin = self.catch_up_margin_secs;
         let Some(slot) = self.slots.get_mut(idx) else {
             // Unreachable: slot_index either returned an existing index or
@@ -1586,6 +1598,17 @@ impl MultiTfAggregator {
         // the baseline or the partial bits are read below. One compare per
         // tick when there is none.
         slot.sync_replay_gap(gap_epoch);
+        // This instrument's first live tick after a replay hand-over (review
+        // round 17): its socket may have listened later than the process-wide
+        // capture start, so its own receipt ends its downtime. One bool test
+        // per tick otherwise; O(`TF_COUNT`) once per instrument.
+        if slot.handover_listen_pending
+            && let Some(receipt) = receipt_ist_secs(tick.received_at_nanos)
+        {
+            slot.handover_listen_pending = false;
+            slot.handover_listen_secs = receipt;
+            slot.taint_kept_ended_in_downtime(receipt, last_frame);
+        }
 
         let cumulative_volume =
             cumulative_volume_override.unwrap_or_else(|| u64::from(tick.volume));
@@ -1853,7 +1876,11 @@ impl MultiTfAggregator {
             // then cannot take it: it is partial, and no longer one the
             // hand-over keeps complete. Inside a replay the span is unbounded
             // and the gap sync already marked every open bucket partial.
-            let span_ends_by = if replay_mode { 0 } else { live_from };
+            let span_ends_by = if replay_mode {
+                0
+            } else {
+                live_from.max(slot.handover_listen_secs)
+            };
             let unabsorbed = slot.cell.rebase_open_buckets_after_gap(
                 cumulative_volume,
                 fold_secs,
@@ -2504,24 +2531,14 @@ impl MultiTfAggregator {
             // the outcome no longer depends on the order the first live ticks
             // arrive in (the round-12 concern). The skew margin leans towards
             // withholding when this box's clock runs ahead of the exchange.
-            if live_from != 0 {
-                for tf in TfIndex::ALL {
-                    let bit = replay_tf_bit(tf);
-                    if open_mask & !slot.replay_taint_open & bit == 0 {
-                        continue;
-                    }
-                    let end = slot
-                        .cell
-                        .open_bucket_start(tf)
-                        .saturating_add(tf.seconds_per_bucket());
-                    if end <= live_from
-                        && end.saturating_add(REPLAY_FRONTIER_SKEW_SECS) > last_frame
-                    {
-                        slot.replay_taint_open |= bit;
-                    }
-                }
-            }
             slot.replay_handover_kept = open_mask & !slot.replay_taint_open;
+            if live_from != 0 {
+                slot.taint_kept_ended_in_downtime(live_from, last_frame);
+            }
+            // Each instrument re-applies the rule at its own first live
+            // receipt (review round 17).
+            slot.handover_listen_pending = live_from != 0;
+            slot.handover_listen_secs = 0;
             tainted = tainted.saturating_add(u64::from(slot.replay_taint_open.count_ones()));
             // Every bar still held is final now: emitted if complete, counted
             // if the taint or a gap marked it.
@@ -2608,24 +2625,7 @@ impl MultiTfAggregator {
         let last_frame = self.replay_last_frame_secs;
         // O(1) EXEMPT: begin — once per replay hand-over, at its first live tick
         for slot in &mut self.slots {
-            if slot.replay_handover_kept == 0 {
-                continue;
-            }
-            for tf in TfIndex::ALL {
-                let bit = replay_tf_bit(tf);
-                if slot.replay_handover_kept & bit == 0 {
-                    continue;
-                }
-                let start = slot.cell.open_bucket_start(tf);
-                let end = start.saturating_add(tf.seconds_per_bucket());
-                if start != 0
-                    && end <= receipt
-                    && end.saturating_add(REPLAY_FRONTIER_SKEW_SECS) > last_frame
-                {
-                    slot.replay_taint_open |= bit;
-                    slot.replay_handover_kept &= !bit;
-                }
-            }
+            slot.taint_kept_ended_in_downtime(receipt, last_frame);
         }
         // O(1) EXEMPT: end
     }
@@ -2700,6 +2700,33 @@ impl InstrumentSlot {
         // discard its own delta, exactly as a re-seeding tick does.
         let next_open_partial = !self.volume_baseline_seeded || self.replay_gap_rebase_pending;
         self.roll_replay_bits(tf, next_open_partial, replay_mode, ended_before_capture)
+    }
+
+    /// Taints every bucket the hand-over still keeps whose tail fell into the
+    /// downtime: it ended after the previous process's last frame
+    /// (`last_frame`, less the clock-skew margin) but by `listening_from`,
+    /// when this instrument's feed was known to be listening again (review
+    /// rounds 15 to 17). Nobody captured those trades, so the bucket is not
+    /// complete. O(`TF_COUNT`).
+    fn taint_kept_ended_in_downtime(&mut self, listening_from: u32, last_frame: u32) {
+        if self.replay_handover_kept == 0 {
+            return;
+        }
+        for tf in TfIndex::ALL {
+            let bit = replay_tf_bit(tf);
+            if self.replay_handover_kept & bit == 0 {
+                continue;
+            }
+            let start = self.cell.open_bucket_start(tf);
+            let end = start.saturating_add(tf.seconds_per_bucket());
+            if start != 0
+                && end <= listening_from
+                && end.saturating_add(REPLAY_FRONTIER_SKEW_SECS) > last_frame
+            {
+                self.replay_taint_open |= bit;
+                self.replay_handover_kept &= !bit;
+            }
+        }
     }
 
     /// Whether `tf`'s open bucket may already have been closed in live mode by
@@ -3288,14 +3315,18 @@ mod tests {
             }
             t
         };
-        let minute = |restart: bool| {
+        // `other_first` (review round 17): ANOTHER instrument's first live
+        // frame arrives first, from a socket that listened earlier, and
+        // confirms the process-wide start at 09:20:56. This instrument's
+        // downtime still runs to its own first receipt.
+        let minute = |restart: bool, other_first: bool| {
             let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
             if restart {
                 agg.set_replay_mode(true);
             }
             let mut got = None;
-            let mut keep = |_: Feed, _: u64, _: u8, tf: TfIndex, st: LiveCandleState| {
-                if tf == TfIndex::M1 && st.bucket_start_ist_secs == OPEN + 300 {
+            let mut keep = |_: Feed, id: u64, _: u8, tf: TfIndex, st: LiveCandleState| {
+                if id == GAP_SID && tf == TfIndex::M1 && st.bucket_start_ist_secs == OPEN + 300 {
                     got = Some(st.volume);
                 }
             };
@@ -3308,18 +3339,26 @@ mod tests {
             } else {
                 agg.consume_tick(Feed::Dhan, &at(369, 12_108, 369), None, &mut keep);
             }
+            if other_first {
+                let mut other = tick(GAP_SID + 5, SEG_EQ, OPEN + 356, 50.0, 10);
+                other.received_at_nanos = receipt_at(OPEN + 356);
+                agg.consume_tick(Feed::Dhan, &other, None, &mut keep);
+            }
             agg.consume_tick(Feed::Dhan, &at(347, 12_235, 396), None, &mut keep);
             agg.consume_tick(Feed::Dhan, &at(482, 12_313, 490), None, &mut keep);
             agg.catch_up_seal_all(OPEN + 100_000, &mut keep);
             got
         };
-        let truth = minute(false);
-        assert_eq!(truth, Some(33), "control");
-        let written = minute(true);
-        assert!(
-            written.is_none() || written == truth,
-            "the 09:20 minute was written with {written:?} shares against {truth:?}"
-        );
+        for other_first in [false, true] {
+            let truth = minute(false, other_first);
+            assert_eq!(truth, Some(33), "control");
+            let written = minute(true, other_first);
+            assert!(
+                written.is_none() || written == truth,
+                "other_first={other_first}: the 09:20 minute was written with {written:?} \
+                 shares against {truth:?}"
+            );
+        }
     }
 
     /// Review round 16, finding 2 (reproduced): the previous process's last
