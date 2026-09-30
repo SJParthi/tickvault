@@ -24,6 +24,7 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 
 use tickvault_common::feed::Feed;
 use tickvault_common::tick_types::ParsedTick;
+use tickvault_trading::candles::TfIndex;
 use tickvault_trading::candles::aggregator_cell::FeedStrategy;
 use tickvault_trading::candles::multi_tf_aggregator::MultiTfAggregator;
 
@@ -91,6 +92,9 @@ fn dhat_consume_tick_zero_alloc_in_bucket_and_across_boundaries() {
     // aggregators; harmless, and the asserts below read the totals).
     let mut replay_suppressed = 0u32;
     let mut replay_live_sealed = 0usize;
+    let mut live_withheld = 0u32;
+    let mut day_close_sealed = 0usize;
+    let mut wrap_minute_volume = 0u64;
     let (_, allocs) = dhat_support::measure_with_phantom_retry(
         0,
         0,
@@ -173,18 +177,54 @@ fn dhat_consume_tick_zero_alloc_in_bucket_and_across_boundaries() {
                 }
             }
             agg.catch_up_seal_all(OPEN + 6 * 3_600, |_, _, _, _, _| {});
+            // A MID-SESSION capture start (review round 24, auditor D): the
+            // live post-restart paths (the provisional capture start and its
+            // confirmation, the hand-over wait, the untrusted-price rule, the
+            // per-instrument capture start) only run after one is set, and
+            // phase (d) never set one, so they ran under no allocation gate.
+            agg.set_live_capture_start(OPEN + 6 * 3_600);
             agg.finish_replay(false, |_, _, _, _, _| {});
             // Live ticks from 15:16: the replay above ran to ~14:38, and an
             // earlier live tick would be late and discarded, sealing nothing.
             for minute in 1..=10u32 {
                 cum += 7;
                 let t = tick_at(OPEN + 6 * 3_600 + minute * 60, 24_010.0, cum);
-                agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {
+                let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {
                     replay_live_sealed += 1;
+                });
+                live_withheld += u32::from(stats.replay_partial_suppressed);
+            }
+            // (e) The day-close seal, then a u32 wrap of the cumulative on
+            // the next day (review round 24): the wrap now counts forward
+            // instead of re-basing, on the same no-allocation terms.
+            agg.force_seal_all(|_, _, _, _, _| {
+                day_close_sealed += 1;
+            });
+            let next_day = OPEN + 86_400;
+            for (step, volume) in [u32::MAX - 20, u32::MAX - 5, 4, 30].into_iter().enumerate() {
+                let step = u32::try_from(step).unwrap_or(0);
+                let t = tick_at(next_day + step * 61, 24_020.0 + step as f32, volume);
+                agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, tf, st| {
+                    // The minute holding the wrap (step 2): 5 + 1 + 4 units.
+                    if tf == TfIndex::M1 && st.bucket_start_ist_secs == next_day + 120 {
+                        wrap_minute_volume = st.volume;
+                    }
                 });
             }
         },
     );
+
+    assert_eq!(
+        wrap_minute_volume, 10,
+        "phase (e): the minute holding the u32 wrap counts it forward exactly"
+    );
+
+    assert!(
+        live_withheld > 0,
+        "phase (d) must withhold a live bar that began before the mid-session \
+         capture start, or it never reached the post-restart rules"
+    );
+    assert!(day_close_sealed > 0, "phase (e) must seal at the day close");
 
     assert!(
         replay_suppressed > 0,

@@ -99,6 +99,14 @@ struct Case {
     /// listened), 2 a STALE copy of the last trade the previous process
     /// received (review round 20), which looks exactly like a true re-send.
     resend_on_subscribe: Vec<u8>,
+    /// Both runs end with the day-close seal (`force_seal_all`) instead of a
+    /// final catch-up sweep (review round 24: the day-close seal judged
+    /// bars after clearing each instrument's capture start, and no run here
+    /// ever reached it).
+    day_close: bool,
+    /// Every stock's cumulative starts just below `u32::MAX` and wraps
+    /// (review round 25: no run here ever came near the top of the range).
+    near_wrap: bool,
 }
 
 fn event() -> impl Strategy<Value = Event> {
@@ -132,6 +140,8 @@ fn case() -> impl Strategy<Value = Case> {
         prop::collection::vec(0u32..=20, 4),
         prop::collection::vec(0u8..100, 64..600),
         prop::collection::vec(0u8..3, 4),
+        prop::bool::weighted(0.35),
+        prop::bool::weighted(0.2),
     )
         .prop_map(
             |(
@@ -141,6 +151,8 @@ fn case() -> impl Strategy<Value = Case> {
                 listen_after_start,
                 unreadable,
                 resend_on_subscribe,
+                day_close,
+                near_wrap,
             )| Case {
                 instruments,
                 crash_per_mille,
@@ -148,6 +160,8 @@ fn case() -> impl Strategy<Value = Case> {
                 listen_after_start,
                 unreadable,
                 resend_on_subscribe,
+                day_close,
+                near_wrap,
             },
         )
 }
@@ -156,7 +170,10 @@ fn case() -> impl Strategy<Value = Case> {
 struct Packet {
     instrument: usize,
     trade: u32,
-    cumulative: u32,
+    /// The true day-cumulative on a monotonic 64-bit axis. The packet the
+    /// fold sees carries its low 32 bits, as the vendor's `u32` field does,
+    /// so a run that starts near the top of the range wraps (review round 25).
+    cumulative: u64,
     price: f32,
     high: f32,
     low: f32,
@@ -180,7 +197,7 @@ fn tick(p: &Packet, received_ms: u64) -> ParsedTick {
         exchange_segment_code: u8::from(p.instrument != 0),
         last_traded_price: p.price,
         exchange_timestamp: p.trade,
-        volume: p.cumulative,
+        volume: u32::try_from(p.cumulative % (1_u64 << 32)).unwrap_or(0),
         day_open: p.open,
         day_close: 1_000.0,
         day_high: p.high,
@@ -194,12 +211,19 @@ fn tick(p: &Packet, received_ms: u64) -> ParsedTick {
 fn packets(c: &Case) -> Vec<Packet> {
     let mut out = Vec::new();
     for (instrument, events) in c.instruments.iter().enumerate() {
-        let (mut trade, mut cumulative, mut price) = (START, 0u32, 1_000.0f32);
+        // Stocks of a near-wrap case start 300 units below `u32::MAX`, so their
+        // counter wraps early in the day (review round 25).
+        let base = if c.near_wrap && instrument != 0 {
+            u64::from(u32::MAX) - 300
+        } else {
+            0
+        };
+        let (mut trade, mut cumulative, mut price) = (START, base, 1_000.0f32);
         let (mut high, mut low, mut open, mut last_received) = (0f32, f32::MAX, 0f32, 0u64);
         for (k, e) in events.iter().enumerate() {
             trade += u32::from(e.dt);
             if instrument != 0 {
-                cumulative += u32::from(e.size);
+                cumulative += u64::from(e.size);
             }
             price = (price + f32::from(e.price_steps) * 0.05).max(1.0);
             if open == 0.0 {
@@ -289,6 +313,15 @@ fn sweep(agg: &mut MultiTfAggregator, wall_secs: u32, out: &mut Written) {
     agg.catch_up_seal_all(cutoff, |_, sid, _, tf, bar| out.put(sid, tf, bar));
 }
 
+/// Ends a run: the day-close seal, or a final catch-up sweep to `end_cutoff`.
+fn finish(agg: &mut MultiTfAggregator, day_close: bool, end_cutoff: u32, out: &mut Written) {
+    if day_close {
+        agg.force_seal_all(|_, sid, _, tf, bar| out.put(sid, tf, bar));
+    } else {
+        agg.catch_up_seal_all(end_cutoff, |_, sid, _, tf, bar| out.put(sid, tf, bar));
+    }
+}
+
 /// Folds `packets` live from a capture start before the session.
 fn fold_live<'a>(
     packets: impl Iterator<Item = &'a Packet>,
@@ -346,7 +379,7 @@ fn check(c: &Case) -> Result<(), TestCaseError> {
 
     let mut truth = Written::default();
     let mut truth_agg = fold_live(all.iter(), &mut truth);
-    truth_agg.catch_up_seal_all(end_cutoff, |_, sid, _, tf, bar| truth.put(sid, tf, bar));
+    finish(&mut truth_agg, c.day_close, end_cutoff, &mut truth);
 
     let crash_ms = first.received_ms
         + (last.received_ms - first.received_ms) * u64::from(c.crash_per_mille) / 1000;
@@ -437,7 +470,7 @@ fn check(c: &Case) -> Result<(), TestCaseError> {
     // added volume, whose bars are withheld because the gap packet may have
     // been a stale copy (review round 20).
     // It is the running baseline from then on.
-    let mut gap_cum: HashMap<usize, u32> = HashMap::new();
+    let mut gap_cum: HashMap<usize, u64> = HashMap::new();
     // Every packet that added volume while the gap packet was untrusted,
     // `(trade second, receipt ms)`: each one that traded no later than the
     // instrument's listen time plus the skew, and the first that traded later
@@ -504,7 +537,7 @@ fn check(c: &Case) -> Result<(), TestCaseError> {
         );
         sweep(&mut agg, (*received / 1000) as u32, &mut restart);
     }
-    agg.catch_up_seal_all(end_cutoff, |_, sid, _, tf, bar| restart.put(sid, tf, bar));
+    finish(&mut agg, c.day_close, end_cutoff, &mut restart);
     // The first live receipt of ANY instrument confirms the capture start.
     let confirmed_start = live.first().map_or(capture_start, |(received, _, _)| {
         capture_start.max((*received / 1000) as u32)

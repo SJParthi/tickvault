@@ -1630,8 +1630,9 @@ pub struct LiveIngest {
 /// same volume even in top volume also as simialr to candles tables volume"*).
 /// That is only meaningful if every cadence HAS a fold frame of equal length.
 ///
-/// Since the 2026-09-19 nine-frame collapse `TfIndex::ALL` IS exactly those
-/// nine frames — `S1 S3 S5 M1 M3 M5 M15 M30 M60` — and the four
+/// Since the 2026-09-19 nine-frame collapse `TfIndex::ALL` holds those nine
+/// frames — `S1 S3 S5 M1 M3 M5 M15 M30 M60` — plus `M10`, appended on
+/// 2026-09-22 (`TF_COUNT` is 10), and the four
 /// cadences map onto the first four of them. The three-second pair is the one
 /// that had to be MADE true: `S3` was not an emitting frame before that
 /// directive, so a 3s snapshot row would have had no bar to compare against.
@@ -1724,8 +1725,9 @@ struct SealTally {
 /// Until 2026-09-19 the enum carried 24 and a
 /// `!tf.is_operator_requested()` gate stood here, skipping the
 /// fifteen unrequested frames into a third `seals_skipped`
-/// counter so that no bar escaped the ledger. `TF_COUNT` is 9
-/// now, so that gate could only ever return false and that
+/// counter so that no bar escaped the ledger. `TF_COUNT` is 10
+/// now (the nine plus `M10`, appended 2026-09-22), so that
+/// gate could only ever return false and that
 /// counter could only ever report 0 — a filter that cannot
 /// filter reads as a live one to the next author, and a
 /// counter that cannot count is a dead monitor. Both are gone;
@@ -3632,8 +3634,9 @@ impl LiveIngest {
                 // Until 2026-09-19 the enum carried 24 and a
                 // `!tf.is_operator_requested()` gate stood here, skipping the
                 // fifteen unrequested frames into a third `seals_skipped`
-                // counter so that no bar escaped the ledger. `TF_COUNT` is 9
-                // now, so that gate could only ever return false and that
+                // counter so that no bar escaped the ledger. `TF_COUNT` is 10
+                // now (the nine plus `M10`, appended 2026-09-22), so that
+                // gate could only ever return false and that
                 // counter could only ever report 0 — a filter that cannot
                 // filter reads as a live one to the next author, and a
                 // counter that cannot count is a dead monitor. Both are gone;
@@ -4249,8 +4252,9 @@ impl LiveIngest {
                 // Until 2026-09-19 the enum carried 24 and a
                 // `!tf.is_operator_requested()` gate stood here, skipping the
                 // fifteen unrequested frames into a third `seals_skipped`
-                // counter so that no bar escaped the ledger. `TF_COUNT` is 9
-                // now, so that gate could only ever return false and that
+                // counter so that no bar escaped the ledger. `TF_COUNT` is 10
+                // now (the nine plus `M10`, appended 2026-09-22), so that
+                // gate could only ever return false and that
                 // counter could only ever report 0 — a filter that cannot
                 // filter reads as a live one to the next author, and a
                 // counter that cannot count is a dead monitor. Both are gone;
