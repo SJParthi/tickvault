@@ -1,5 +1,5 @@
 //! Randomized restart differential for the candle fold (plan ITEM 47,
-//! review rounds 18 and 19).
+//! review rounds 18 to 20).
 //!
 //! One market is folded twice. The TRUTH run folds every packet live, as a
 //! process that never stopped would. The RESTART run is what production does
@@ -8,7 +8,8 @@
 //! random frames unreadable, hands over at a capture start after the crash,
 //! and folds live from there. Each instrument's socket starts listening at
 //! its own time at or after the capture start, so a packet received in the
-//! downtime is lost, and a subscribe may re-send the last trade. Packets
+//! downtime is lost, and a subscribe may re-send its latest state or a STALE
+//! copy of the last trade the previous process received (review round 20). Packets
 //! arrive late, out of trade order, repeated, and some never at all.
 //!
 //! Every bar the restart writes is compared with the truth, and with what the
@@ -21,8 +22,10 @@
 //!    a bar that classifies its net volume carries the truth's (an
 //!    unclassified one says the direction is unknown, which is honest);
 //! 4. a bucket missing after the crash started by the moment its instrument
-//!    was known to be captured: the confirmed capture start or the
-//!    instrument's own first live receipt.
+//!    was known to be captured (the confirmed capture start, or the receipt
+//!    of the packet that ended its gap: neither a repeat of its last
+//!    replayed trade nor stale), or holds its first trade that added volume
+//!    after that packet, which may have been a stale copy.
 //!
 //! No bar is exempt from 3. Until review round 19 the bar holding the first
 //! live trade was, and that hid a real defect: a bucket that began in the
@@ -31,9 +34,10 @@
 //! would overwrite a stored row or publish a wrong one, which is what this
 //! file exists to catch.
 //!
-//! 256 cases per run. Measured on the round-19 fix: 20,000 cases with zero
-//! failures, in about 56 s in a release build; the round-18 aggregator fails
-//! these checks 32,761 times over the same 20,000 cases.
+//! 256 cases per run. Measured on the round-20 fix: 20,000 cases with zero
+//! failures, in about 56 s in a release build. The round-18 aggregator failed
+//! these checks 32,761 times over 20,000 cases; the round-19 one fails in
+//! under a second once stale re-sends are generated.
 
 use std::collections::HashMap;
 
@@ -74,7 +78,11 @@ struct Case {
     start_after_crash: u32,
     listen_after_start: Vec<u32>,
     unreadable: Vec<u8>,
-    resend_on_subscribe: Vec<bool>,
+    /// Per instrument, what its subscribe re-sends at the listen instant:
+    /// 0 nothing, 1 its latest state (the last packet received before it
+    /// listened), 2 a STALE copy of the last trade the previous process
+    /// received (review round 20), which looks exactly like a true re-send.
+    resend_on_subscribe: Vec<u8>,
 }
 
 fn event() -> impl Strategy<Value = Event> {
@@ -105,7 +113,7 @@ fn case() -> impl Strategy<Value = Case> {
         0u32..=30,
         prop::collection::vec(0u32..=20, 4),
         prop::collection::vec(0u8..100, 64..600),
-        prop::collection::vec(any::<bool>(), 4),
+        prop::collection::vec(0u8..3, 4),
     )
         .prop_map(
             |(
@@ -320,11 +328,20 @@ fn check(c: &Case) -> Result<(), TestCaseError> {
     let mut restart = Written::default();
     let mut agg = aggregator();
     agg.set_replay_mode(true);
+    // Per instrument, the last replayed packet the fold accepted (a stale one,
+    // whose cumulative went backwards, is refused).
+    let mut last_replayed: HashMap<usize, Packet> = HashMap::new();
     let mut gap = true;
     for (k, p) in all.iter().filter(|p| p.received_ms <= crash_ms).enumerate() {
         if c.unreadable[k % c.unreadable.len()] < UNREADABLE_PERCENT {
             gap = true;
             continue;
+        }
+        if last_replayed
+            .get(&p.instrument)
+            .is_none_or(|l| p.cumulative >= l.cumulative)
+        {
+            last_replayed.insert(p.instrument, *p);
         }
         if std::mem::replace(&mut gap, false) {
             agg.mark_replay_gap();
@@ -356,17 +373,46 @@ fn check(c: &Case) -> Result<(), TestCaseError> {
         .take(c.instruments.len())
     {
         let listen_ms = u64::from(listen[i]) * 1000;
+        let sent_by = match resend {
+            1 => listen_ms,
+            2 => crash_ms + 1,
+            _ => 0,
+        };
         if let Some(p) = all
             .iter()
-            .rfind(|p| resend && p.instrument == i && p.received_ms < listen_ms)
+            .rfind(|p| p.instrument == i && p.received_ms < sent_by)
         {
             live.push((listen_ms, 0, *p));
         }
     }
     live.sort_by_key(|(received, order, p)| (*received, *order, p.instrument, p.cumulative));
     // Per instrument: the first live packet's `(trade second, receipt ms)`.
+    // Per instrument, the receipt of the first live packet that ends its
+    // hand-over gap: not a repeat of the last replayed trade (a stale copy
+    // cannot be told from one, review round 20) and not stale itself.
+    let mut gap_ended: HashMap<usize, u64> = HashMap::new();
+    // The cumulative of the packet that ended each instrument's gap (or
+    // seeded it: every boot here is mid-session), and the trade second of the first later packet that
+    // added volume, whose bars are withheld because the gap packet may have
+    // been a stale copy (review round 20).
+    let mut gap_cum: HashMap<usize, u32> = HashMap::new();
+    let mut first_add: HashMap<usize, u32> = HashMap::new();
     let mut first_live: HashMap<usize, (u32, u64)> = HashMap::new();
     for (received, _, p) in &live {
+        let repeats_or_stale = last_replayed.get(&p.instrument).is_some_and(|l| {
+            p.cumulative < l.cumulative
+                || (p.trade == l.trade
+                    && p.cumulative == l.cumulative
+                    && p.price.to_bits() == l.price.to_bits())
+        });
+        if let Some(&cum) = gap_cum.get(&p.instrument) {
+            if p.cumulative > cum {
+                first_add.entry(p.instrument).or_insert(p.trade);
+            }
+        } else if !repeats_or_stale {
+            gap_ended.entry(p.instrument).or_insert(*received);
+            gap_cum.insert(p.instrument, p.cumulative);
+        }
         first_live
             .entry(p.instrument)
             .or_insert((p.trade, *received));
@@ -402,11 +448,11 @@ fn check(c: &Case) -> Result<(), TestCaseError> {
                 let (t, r) = (truth.last.get(&key), restart.last.get(&key));
                 // The latest instant the fold can treat as "before this
                 // instrument was captured": the confirmed capture start, or
-                // the instrument's own first live receipt. An instrument that
-                // never received a live packet never confirmed at all.
-                let captured_from = first_live
+                // the receipt of the packet that ended the instrument's gap. An
+                // instrument whose gap never ended never confirmed at all.
+                let captured_from = gap_ended
                     .get(&i)
-                    .map(|&(_, received)| confirmed_start.max((received / 1000) as u32));
+                    .map(|&received| confirmed_start.max((received / 1000) as u32));
                 let context = format!(
                     "sid {sid} {tf:?} bucket +{}..+{}, crash +{}, capture start +{}, \
                      listen +{}, first live {:?}: restart {} | truth {}",
@@ -430,8 +476,11 @@ fn check(c: &Case) -> Result<(), TestCaseError> {
                     // 4. Missing after the crash: only a bucket that started
                     // before the instrument was known to be captured.
                     if t.is_some() && u64::from(end) * 1000 > crash_ms {
+                        let holds_first_add = first_add
+                            .get(&i)
+                            .is_some_and(|&trade| trade >= start && trade < end);
                         prop_assert!(
-                            captured_from.is_none_or(|from| start <= from),
+                            holds_first_add || captured_from.is_none_or(|from| start <= from),
                             "withheld without cause: {context}"
                         );
                     }
