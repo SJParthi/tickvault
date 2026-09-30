@@ -1,5 +1,5 @@
 //! Randomized restart differential for the candle fold (plan ITEM 47,
-//! review round 18).
+//! review rounds 18 and 19).
 //!
 //! One market is folded twice. The TRUTH run folds every packet live, as a
 //! process that never stopped would. The RESTART run is what production does
@@ -11,29 +11,29 @@
 //! downtime is lost, and a subscribe may re-send the last trade. Packets
 //! arrive late, out of trade order, repeated, and some never at all.
 //!
-//! Every bar the restart writes is compared with the truth:
+//! Every bar the restart writes is compared with the truth, and with what the
+//! previous process stored (a third run, live up to the crash):
 //!
 //! 1. no bar ever carries MORE volume than the truth (a double count);
-//! 2. a bucket that ended by the crash is written identical to the truth, net
-//!    volume included, or not written (the previous process stored it);
-//! 3. any other bar that is written equals the truth (volume and OHLC),
-//!    unless it holds the instrument's first live trade after the restart;
-//! 4. a bucket that starts after the instrument's socket listened and is
-//!    missing from the restart either holds that first live trade or ended
-//!    by the instrument's first live receipt.
+//! 2. a bucket the previous process stored is written identical to the truth,
+//!    net volume included, or not written;
+//! 3. any other bar that is written equals the truth in volume and OHLC, and
+//!    a bar that classifies its net volume carries the truth's (an
+//!    unclassified one says the direction is unknown, which is honest);
+//! 4. a bucket missing after the crash started by the moment its instrument
+//!    was known to be captured: the confirmed capture start or the
+//!    instrument's own first live receipt.
 //!
-//! The two exceptions are the recorded limits. The first live trade's own
-//! volume is mixed with the downtime's, so the bucket it opens misses it,
-//! exactly as a fresh boot's first bucket misses the seeding tick; and the
-//! fold cannot see when a socket began listening, only when its first packet
-//! arrived, so a bucket that ended by then may be missing downtime trades and
-//! is withheld. A withheld bar is counted
-//! (`tv_candle_refold_partial_suppressed_total`); a wrong bar would overwrite
-//! a stored row, which is what this file exists to catch.
+//! No bar is exempt from 3. Until review round 19 the bar holding the first
+//! live trade was, and that hid a real defect: a bucket that began in the
+//! downtime was written without the downtime's trades and prices. A withheld
+//! bar is counted (`tv_candle_refold_partial_suppressed_total`); a wrong bar
+//! would overwrite a stored row or publish a wrong one, which is what this
+//! file exists to catch.
 //!
-//! 256 cases per run. Measured on the round-18 fix: 20,000 cases (8.4 million
-//! bars written) with zero failures of the four checks, in about 70 s in a
-//! release build.
+//! 256 cases per run. Measured on the round-19 fix: 20,000 cases with zero
+//! failures, in about 56 s in a release build; the round-18 aggregator fails
+//! these checks 32,761 times over the same 20,000 cases.
 
 use std::collections::HashMap;
 
@@ -307,6 +307,14 @@ fn check(c: &Case) -> Result<(), TestCaseError> {
         .map(|i| capture_start + c.listen_after_start[i])
         .collect();
 
+    // The previous process: live up to the crash. What it sealed is what
+    // the database holds for the restart to overwrite.
+    let mut stored = Written::default();
+    fold_live(
+        all.iter().filter(|p| p.received_ms <= crash_ms),
+        &mut stored,
+    );
+
     // The restarted process: replay the WAL (some frames unreadable), hand
     // over, then fold what each socket receives once it listens.
     let mut restart = Written::default();
@@ -371,6 +379,10 @@ fn check(c: &Case) -> Result<(), TestCaseError> {
         sweep(&mut agg, (*received / 1000) as u32, &mut restart);
     }
     agg.catch_up_seal_all(end_cutoff, |_, sid, _, tf, bar| restart.put(sid, tf, bar));
+    // The first live receipt of ANY instrument confirms the capture start.
+    let confirmed_start = live.first().map_or(capture_start, |(received, _, _)| {
+        capture_start.max((*received / 1000) as u32)
+    });
 
     for (i, &listen_at) in listen.iter().enumerate() {
         let sid = security_id(i);
@@ -388,12 +400,13 @@ fn check(c: &Case) -> Result<(), TestCaseError> {
                 let key = (sid, tf.as_ordinal(), start);
                 let end = start + tf.seconds_per_bucket();
                 let (t, r) = (truth.last.get(&key), restart.last.get(&key));
-                let holds_first_live = first_live
+                // The latest instant the fold can treat as "before this
+                // instrument was captured": the confirmed capture start, or
+                // the instrument's own first live receipt. An instrument that
+                // never received a live packet never confirmed at all.
+                let captured_from = first_live
                     .get(&i)
-                    .is_some_and(|&(trade, _)| trade >= start && trade < end);
-                let ended_by_first_receipt = first_live
-                    .get(&i)
-                    .is_some_and(|&(_, received)| u64::from(end) * 1000 <= received);
+                    .map(|&(_, received)| confirmed_start.max((received / 1000) as u32));
                 let context = format!(
                     "sid {sid} {tf:?} bucket +{}..+{}, crash +{}, capture start +{}, \
                      listen +{}, first live {:?}: restart {} | truth {}",
@@ -414,25 +427,30 @@ fn check(c: &Case) -> Result<(), TestCaseError> {
                     );
                 }
                 let Some(r) = r else {
-                    // 4. Missing after the socket listened: only the two limits.
-                    if t.is_some() && start >= listen_at {
+                    // 4. Missing after the crash: only a bucket that started
+                    // before the instrument was known to be captured.
+                    if t.is_some() && u64::from(end) * 1000 > crash_ms {
                         prop_assert!(
-                            holds_first_live || ended_by_first_receipt,
+                            captured_from.is_none_or(|from| start <= from),
                             "withheld without cause: {context}"
                         );
                     }
                     continue;
                 };
-                if u64::from(end) * 1000 <= crash_ms {
+                if stored.last.contains_key(&key) {
                     // 2. Stored by the previous process: identical or absent.
                     prop_assert!(
                         t.is_some_and(|t| same(r, t, true)),
                         "a stored bucket was rewritten differently: {context}"
                     );
-                } else if !holds_first_live {
-                    // 3. Written after the crash: exact, bar the first live trade.
+                } else {
+                    // 3. Stored nowhere else: exact, and a classified net
+                    // volume is the truth's (an unclassified one says the
+                    // direction is unknown, which is honest, not wrong).
                     prop_assert!(
-                        t.is_some_and(|t| same(r, t, false)),
+                        t.is_some_and(
+                            |t| same(r, t, false) && (!r.net_volume_classified || same(r, t, true))
+                        ),
                         "a wrong bar was written: {context}"
                     );
                 }
