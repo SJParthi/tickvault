@@ -49,7 +49,7 @@
 //! these checks 32,761 times over 20,000 cases; the round-19 one fails in
 //! under a second once stale re-sends are generated.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use proptest::prelude::*;
 use tickvault_common::feed::Feed;
@@ -81,6 +81,10 @@ struct Event {
     lag_ms: u32,
     resend_ms: Option<u16>,
     delivered: bool,
+    /// Delivered on its own lag, possibly after a later trade of the same
+    /// instrument (review round 23: two downtime trades that arrive late and
+    /// out of order after the socket listens).
+    out_of_order: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -105,15 +109,17 @@ fn event() -> impl Strategy<Value = Event> {
         prop_oneof![500 => 0u32..=10_000, 16 => 10_001u32..=200_000, 1 => 240_001u32..=400_000],
         prop_oneof![9 => Just(None), 1 => (0u16..=3_000).prop_map(Some)],
         prop_oneof![9 => Just(true), 1 => Just(false)],
+        prop_oneof![14 => Just(false), 1 => Just(true)],
     )
         .prop_map(
-            |(dt, size, price_steps, lag_ms, resend_ms, delivered)| Event {
+            |(dt, size, price_steps, lag_ms, resend_ms, delivered, out_of_order)| Event {
                 dt,
                 size,
                 price_steps,
                 lag_ms,
                 resend_ms,
                 delivered,
+                out_of_order,
             },
         )
 }
@@ -190,7 +196,7 @@ fn packets(c: &Case) -> Vec<Packet> {
     for (instrument, events) in c.instruments.iter().enumerate() {
         let (mut trade, mut cumulative, mut price) = (START, 0u32, 1_000.0f32);
         let (mut high, mut low, mut open, mut last_received) = (0f32, f32::MAX, 0f32, 0u64);
-        for e in events {
+        for (k, e) in events.iter().enumerate() {
             trade += u32::from(e.dt);
             if instrument != 0 {
                 cumulative += u32::from(e.size);
@@ -204,7 +210,25 @@ fn packets(c: &Case) -> Vec<Packet> {
             if !e.delivered {
                 continue;
             }
-            last_received = last_received.max(u64::from(trade) * 1000 + u64::from(e.lag_ms));
+            let own = u64::from(trade) * 1000 + u64::from(e.lag_ms);
+            // Stocks only: a stock packet older than one already accepted is
+            // refused by its cumulative, so either process drops it the same
+            // way. An index (volume always 0) cannot be refused like that, and
+            // whether a late one amends a bar or is discarded depends on packets
+            // the restart lost in the downtime (a recorded limit). Only a trade
+            // the next one adds volume after: a real stock packet with an equal
+            // cumulative is the same last trade, at the same price, while this
+            // generator moves a price with no volume (pre-open quotes), which
+            // would make an older packet indistinguishable from a newer one.
+            let out_of_order = e.out_of_order
+                && instrument != 0
+                && events.get(k + 1).is_some_and(|next| next.size > 0);
+            let received_ms = if out_of_order {
+                own
+            } else {
+                last_received = last_received.max(own);
+                last_received
+            };
             let p = Packet {
                 instrument,
                 trade,
@@ -213,13 +237,18 @@ fn packets(c: &Case) -> Vec<Packet> {
                 high,
                 low,
                 open,
-                received_ms: last_received,
+                received_ms,
             };
             out.push(p);
             if let Some(resend) = e.resend_ms {
-                last_received += u64::from(resend);
+                let again = if out_of_order {
+                    received_ms + u64::from(resend)
+                } else {
+                    last_received += u64::from(resend);
+                    last_received
+                };
                 out.push(Packet {
-                    received_ms: last_received,
+                    received_ms: again,
                     ..p
                 });
             }
@@ -407,12 +436,17 @@ fn check(c: &Case) -> Result<(), TestCaseError> {
     // seeded it: every boot here is mid-session), and the trade second of the first later packet that
     // added volume, whose bars are withheld because the gap packet may have
     // been a stale copy (review round 20).
+    // It is the running baseline from then on.
     let mut gap_cum: HashMap<usize, u32> = HashMap::new();
-    let mut first_add: HashMap<usize, u32> = HashMap::new();
-    // The instrument's later packets after that one, `(trade second, receipt
-    // ms)`: a late first-volume trade's volume is carried into the bucket its
-    // timeframe has open, or opens next, when that bucket seals (review round
-    // 22), so that bucket is withheld too.
+    // Every packet that added volume while the gap packet was untrusted,
+    // `(trade second, receipt ms)`: each one that traded no later than the
+    // instrument's listen time plus the skew, and the first that traded later
+    // (review round 23). Their bars are withheld.
+    let mut tainted: HashMap<usize, Vec<(u32, u64)>> = HashMap::new();
+    let mut taint_done: HashSet<usize> = HashSet::new();
+    // The instrument's later packets after the last of those: a late one's
+    // volume is carried into the bucket its timeframe has open, or opens next,
+    // when that bucket seals (review round 22), so that bucket is withheld too.
     let mut after_add: HashMap<usize, Vec<(u32, u64)>> = HashMap::new();
     let mut first_live: HashMap<usize, (u32, u64)> = HashMap::new();
     for (received, _, p) in &live {
@@ -422,17 +456,29 @@ fn check(c: &Case) -> Result<(), TestCaseError> {
                     && p.cumulative == l.cumulative
                     && p.price.to_bits() == l.price.to_bits())
         });
-        if let Some(&cum) = gap_cum.get(&p.instrument) {
-            if let Some(&add) = first_add.get(&p.instrument) {
+        if let Some(cum) = gap_cum.get_mut(&p.instrument) {
+            if taint_done.contains(&p.instrument) {
+                let last = tainted
+                    .get(&p.instrument)
+                    .and_then(|t| t.last())
+                    .map_or(0, |t| t.0);
                 // A later trade, not a re-delivered copy of that one.
-                if p.trade > add {
+                if p.trade > last {
                     after_add
                         .entry(p.instrument)
                         .or_default()
                         .push((p.trade, *received));
                 }
-            } else if p.cumulative > cum {
-                first_add.insert(p.instrument, p.trade);
+            } else if p.cumulative > *cum {
+                *cum = p.cumulative;
+                tainted
+                    .entry(p.instrument)
+                    .or_default()
+                    .push((p.trade, *received));
+                let listen_secs = gap_ended.get(&p.instrument).map_or(0, |r| r / 1000);
+                if u64::from(p.trade) > listen_secs + SKEW_SECS {
+                    taint_done.insert(p.instrument);
+                }
             }
         } else if !repeats_or_stale {
             gap_ended.entry(p.instrument).or_insert(*received);
@@ -518,7 +564,7 @@ fn check(c: &Case) -> Result<(), TestCaseError> {
                         && p.trade >= start
                         && p.trade < end
                         && p.received_ms > crash_ms
-                        && p.received_ms > (u64::from(end) + u64::from(MARGIN)) * 1000
+                        && p.received_ms >= (u64::from(end) + u64::from(MARGIN)) * 1000
                 });
                 if beyond_margin {
                     continue;
@@ -540,8 +586,19 @@ fn check(c: &Case) -> Result<(), TestCaseError> {
                                 (open_until * 1000 > received).then_some(trade)
                             })
                         });
-                        let holds_first_add = first_add.get(&i).is_some_and(|&trade| {
-                            trade < end && settles_by.is_none_or(|next| start <= next)
+                        // The range runs from the first tainted trade's bucket
+                        // to the last one's, and past it only when that trade
+                        // was late (its own bucket sealable when it arrived).
+                        let holds_first_add = tainted.get(&i).is_some_and(|adds| {
+                            let (Some(&(first, _)), Some(&(last, last_rx))) =
+                                (adds.first(), adds.last())
+                            else {
+                                return false;
+                            };
+                            let last_late =
+                                u64::from(tf.bucket_start(last) + secs + MARGIN) * 1000 <= last_rx;
+                            let upto = if last_late { settles_by } else { Some(last) };
+                            first < end && upto.is_none_or(|next| start <= next)
                         });
                         prop_assert!(
                             holds_first_add || captured_from.is_none_or(|from| start <= from),

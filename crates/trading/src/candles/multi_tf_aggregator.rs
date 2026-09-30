@@ -1723,6 +1723,21 @@ impl MultiTfAggregator {
             slot.replay_gap_frontier = slot
                 .replay_gap_frontier
                 .max(replay_gap_frontier_secs(tick.received_at_nanos, fold_secs));
+            // The gap tick may be a packet delivered out of order, older than
+            // a skipped one (review round 23, found by the differential once
+            // it delivered out of order): the next trade's delta then holds
+            // skipped volume and its price comparison reads an old price, and
+            // that false direction was carried into a later bar written as
+            // complete (-5 against a true +5). No direction is read until a
+            // trade after the frontier, exactly as after a live hand-over. A
+            // slot first seeded after a gap (a pass starts after one) is the
+            // same case: its seed may be older than a skipped packet, and the
+            // next trade then carried the skipped volume (42 against 17). Not
+            // on a seed with no gap marked: nothing was skipped.
+            if gap_now || gap_epoch != 0 {
+                slot.prev_price_untrusted = true;
+                slot.replay_settling = true;
+            }
         }
         let baseline = slot.last_cumulative;
         let mut stats = ConsumeStats::default();
@@ -1771,6 +1786,9 @@ impl MultiTfAggregator {
             if replay_mode && slot.replay_gap_rebase_pending {
                 slot.replay_gap_rebase_pending = false;
                 slot.replay_settling = true;
+                // The copy may be stale: no direction is read from its price
+                // (review round 23), as after a gap tick.
+                slot.prev_price_untrusted = true;
             }
             let mut refreshed_open: u16 = 0;
             for tf in TfIndex::ALL {
@@ -1827,11 +1845,35 @@ impl MultiTfAggregator {
         // from the gap tick's price, and every bar it lands in is withheld:
         // the last sealed ones before the fold (a late tick amends one), the
         // open ones after it. One bool test per tick otherwise.
+        //
+        // The flag stays set until a volume-adding tick that TRADED after the
+        // instrument's listen time plus the skew (review round 23). A tick
+        // that traded earlier may itself be a late downtime trade whose
+        // cumulative is below a downtime trade nobody received; clearing on it
+        // let the next trade carry that lost volume (15 written against 10).
+        // Cumulatives rise with trade time, so the first tick that traded
+        // later sets a baseline at or above every downtime trade; it is still
+        // withheld (its own delta may hold lost trades), and the one after it
+        // is exact.
+        let untrusted_before = slot.prev_price_untrusted;
         let first_after_handover_gap =
             !is_stale_packet && slot.prev_price_untrusted && cumulative_volume > baseline;
         if first_after_handover_gap {
-            slot.prev_price_untrusted = false;
-            slot.replay_taint_sealed = REPLAY_ALL_TF_MASK;
+            // Inside a replay the bound is the gap frontier (the slot's first
+            // receipt after the gap, plus the skew; every skipped frame was
+            // received before it), and settling already withholds the bars.
+            let trusted_after = if replay_mode {
+                slot.replay_gap_frontier
+            } else {
+                slot.handover_listen_secs
+                    .saturating_add(REPLAY_FRONTIER_SKEW_SECS)
+            };
+            if fold_secs > trusted_after {
+                slot.prev_price_untrusted = false;
+            }
+            if !replay_mode {
+                slot.replay_taint_sealed = REPLAY_ALL_TF_MASK;
+            }
         }
         let signed_tick_volume = if is_stale_packet {
             // A stale packet traded nothing new (its delta off the monotonic
@@ -1945,6 +1987,9 @@ impl MultiTfAggregator {
                 slot.replay_gap_frontier = slot
                     .replay_gap_frontier
                     .max(replay_gap_frontier_secs(tick.received_at_nanos, fold_secs));
+                // And no direction is trusted until a trade after it, as for
+                // every other way settling starts (review round 23).
+                slot.prev_price_untrusted = true;
             }
         }
         if restarted {
@@ -2119,8 +2164,11 @@ impl MultiTfAggregator {
             // settles into the bucket this timeframe has open, or opens next,
             // when that bucket seals, so that bucket holds the downtime volume
             // instead. Tainting only the landed timeframes wrote such a bucket
-            // at volume 90 against a true 20.
-            slot.replay_taint_open = REPLAY_ALL_TF_MASK;
+            // at volume 90 against a true 20. Inside a replay, settling marks
+            // these buckets partial instead.
+            if !replay_mode {
+                slot.replay_taint_open = REPLAY_ALL_TF_MASK;
+            }
         }
 
         // Store the SAME resolved cumulative the cells folded, so the next
@@ -2180,7 +2228,16 @@ impl MultiTfAggregator {
             // Not a bucket the hand-over kept complete: live mode accepts this
             // uncertainty for every bucket it opens itself, and marking the
             // kept one would only let the capture-start rule drop it (round 12).
-            slot.replay_open_partial |= REPLAY_ALL_TF_MASK & !slot.replay_handover_kept;
+            // Inside a replay, a trade after the untrusted stretch ended whose
+            // delta and direction both come from trusted packets is exact
+            // (review round 23): it ends settling and marks nothing.
+            let exact = replay_mode
+                && !untrusted_before
+                && signed_tick_volume.is_some()
+                && slot.last_tick_sign != 0;
+            if !exact {
+                slot.replay_open_partial |= REPLAY_ALL_TF_MASK & !slot.replay_handover_kept;
+            }
             if slot.last_tick_sign != 0 {
                 slot.replay_settling = false;
             }
@@ -2955,9 +3012,15 @@ impl InstrumentSlot {
     ) -> bool {
         let bit = replay_tf_bit(tf);
         let partial = self.replay_sealed_partial & bit != 0;
+        // Live mode never re-emits an amendment of a bar that began before
+        // the instrument's capture start (review round 23): whether an
+        // uninterrupted process would have amended it or discarded the late
+        // tick depends on packets the restart lost in the downtime (a newer
+        // packet with the same cumulative, which an index or a stock with no
+        // new volume cannot show), so the stored row stands instead.
         (replay_mode && partial)
             || self.replay_taint_sealed & bit != 0
-            || (partial && started_before_capture)
+            || ((partial || !replay_mode) && started_before_capture)
     }
 }
 
@@ -4003,6 +4066,41 @@ mod tests {
                 (STOCK, tf, tf.bucket_start(OPEN + 605)),
             );
         }
+
+        // 4. Review round 23 (HIGH, reproduced by the reviewer): two downtime
+        //    trades arrive late and out of order after the socket listens
+        //    (+51 received at +62 ends the gap, +54 received at +70), and the
+        //    downtime trade +55 (cumulative 30) is lost. +54 cleared the
+        //    untrusted flag, so +75's delta from 25 carried +55's 5 shares:
+        //    written at 15 against a true 10, with a classified net.
+        let mut p4: Vec<RestartPkt> = vec![
+            (STOCK, 0, 100.0, 10, 0),
+            (STOCK, 50, 100.1, 20, 50),
+            (STOCK, 51, 100.2, 22, 62),
+            (STOCK, 54, 100.15, 25, 70),
+            (STOCK, 55, 100.3, 30, 55),
+            (STOCK, 75, 100.4, 40, 75),
+            (STOCK, 200, 100.5, 50, 200),
+        ];
+        p4.extend(index_every_5s(5, 1_000));
+        p4.sort_by_key(|p| p.4);
+        for tf in [TfIndex::S1, TfIndex::S3, TfIndex::S5] {
+            absent_or_consistent(
+                "a second late downtime trade",
+                &p4,
+                (52, 56, &[]),
+                (STOCK, tf, tf.bucket_start(OPEN + 75)),
+            );
+        }
+        // The trade after the first one that traded past the listen time is
+        // exact, and written.
+        let key = (STOCK, TfIndex::S1, OPEN + 200);
+        let truth = bar_row(&restart_bars(&p4, None), key);
+        let written = bar_row(&restart_bars(&p4, Some((52, 56, &[]))), key);
+        assert!(
+            truth.is_some() && written == truth,
+            "the trade after the listen time: wrote {written:?} against {truth:?}"
+        );
     }
 
     /// Review round 19: an instrument first seen live is judged against its
@@ -4703,6 +4801,7 @@ mod tests {
             (t0 + 30, 1_150),
             (t0 + 65, 1_200),
             (t0 + 125, 1_300),
+            (t0 + 185, 1_400),
         ] {
             feed(&mut agg, ts, cum);
         }
@@ -4720,8 +4819,10 @@ mod tests {
         );
         assert!(
             bars.iter()
-                .any(|(tf, start, v, _)| *tf == TfIndex::M1 && *start == t0 + 60 && *v == 50),
-            "the minute after the gap holds exactly its 50 shares (1,150 to 1,200): {bars:?}"
+                .any(|(tf, start, v, _)| *tf == TfIndex::M1 && *start == t0 + 120 && *v == 100),
+            "the minute after the first trusted trade holds exactly its 100 shares (1,200 to 1,300); \
+             the minute of +65 is withheld, since +30 traded within the gap frontier and +65 is the \
+             first trade after it (review round 23): {bars:?}"
         );
         // The second opened after the stale packet: 100 shares traded, and a
         // low re-seed at 950 would have published 150.
@@ -5014,6 +5115,9 @@ mod tests {
             let mut gap_cum: Option<i64> = None;
             let mut added = false;
             let mut first_live_ts: Option<u32> = None;
+            // When the gap tick arrived: later adds stay untrusted until one
+            // trades after it plus the skew (review round 23).
+            let mut listen_at = 0_u32;
             for (i, step) in head.iter().chain(tail).enumerate() {
                 ts += step.dt;
                 cum = (cum + i64::from(step.dcum)).max(0);
@@ -5043,12 +5147,14 @@ mod tests {
                         None if cum >= accepted_cum => {
                             gap_cum = Some(cum);
                             reach = ts;
+                            listen_at = ts;
                             // A gap tick that traded after the first live
                             // receipt cannot be a stale copy (review round 21).
                             added = ts > first + REPLAY_FRONTIER_SKEW_SECS;
                         }
                         Some(at) if !added && cum > at => {
-                            added = true;
+                            gap_cum = Some(cum);
+                            added = ts > listen_at + REPLAY_FRONTIER_SKEW_SECS;
                             reach = ts;
                         }
                         _ => {}
@@ -5235,8 +5341,10 @@ mod tests {
             replay: &Bars,
         ) -> Result<(), TestCaseError> {
             prop_assert!(replay.len() <= live.len());
+            let first_ts = OPEN + 60 + steps.first().map_or(0, |s| s.dt);
+            let frontier = first_ts + REPLAY_FRONTIER_SKEW_SECS;
             let (mut ts, mut px) = (OPEN + 60, 1_000.0_f32);
-            let (mut moved, mut settled_at) = (false, None);
+            let (mut cleared, mut settled_at) = (false, None);
             for (i, s) in steps.iter().enumerate() {
                 ts += s.dt;
                 let prev = px;
@@ -5244,20 +5352,25 @@ mod tests {
                 if i == 0 {
                     continue; // the seeding tick
                 }
-                // The tick rule learns a direction only from a price change
-                // on a tick that ADDS volume (`classify_tick_volume` returns
-                // early on a zero delta without touching the carry).
-                if s.dcum > 0 {
-                    moved |= px.to_bits() != prev.to_bits();
+                if s.dcum <= 0 {
+                    continue;
                 }
-                if moved && s.dcum > 0 {
+                // Review round 23: the seed may be older than a skipped
+                // packet, so no trade is trusted until one after the gap
+                // frontier has cleared the untrusted run (that one is still
+                // withheld). The first trade after it that moves the price
+                // (the tick rule learns a direction only from a price change
+                // on a trade) settles the pass.
+                if !cleared {
+                    cleared = ts > frontier;
+                    continue;
+                }
+                if px.to_bits() != prev.to_bits() {
                     settled_at = Some(ts);
                     break;
                 }
             }
-            let first_ts = OPEN + 60 + steps.first().map_or(0, |s| s.dt);
-            let frontier = first_ts + REPLAY_FRONTIER_SKEW_SECS;
-            if let Some(end) = settled_at.map(|at: u32| at.max(frontier)) {
+            if let Some(end) = settled_at {
                 for (tf, start) in live.keys() {
                     prop_assert!(
                         *start <= end || replay.contains_key(&(*tf, *start)),
