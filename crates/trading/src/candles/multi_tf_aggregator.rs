@@ -3018,9 +3018,9 @@ impl InstrumentSlot {
         // tick depends on packets the restart lost in the downtime (a newer
         // packet with the same cumulative, which an index or a stock with no
         // new volume cannot show), so the stored row stands instead.
-        (replay_mode && partial)
-            || self.replay_taint_sealed & bit != 0
-            || ((partial || !replay_mode) && started_before_capture)
+        self.replay_taint_sealed & bit != 0
+            || (replay_mode && partial)
+            || (!replay_mode && started_before_capture)
     }
 }
 
