@@ -2003,9 +2003,6 @@ impl MultiTfAggregator {
         // 11). Sampled once: a timeframe only sets or clears its OWN held bit,
         // and only after its own test.
         let any_held = slot.replay_held != 0;
-        // The timeframes whose OPEN bucket now holds this tick (review round
-        // 21). One register OR per timeframe.
-        let mut landed_open: u16 = 0;
         for tf in TfIndex::ALL {
             // A held bar becomes final the moment this tick seals the bar
             // after it: release it now, before the seal replaces it.
@@ -2043,9 +2040,8 @@ impl MultiTfAggregator {
                 // tick (24 timeframes × the bucket site and one fold arm).
                 fold_secs,
             ) {
-                ConsumeOutcome::Updated => landed_open |= replay_tf_bit(tf),
+                ConsumeOutcome::Updated => {}
                 ConsumeOutcome::Sealed { sealed_state } => {
-                    landed_open |= replay_tf_bit(tf);
                     // Plan ITEM 47: the bucket just sealed inherits the open
                     // bucket's replay bits; the bucket this tick opened is
                     // complete unless this tick seeded the baseline.
@@ -2117,11 +2113,14 @@ impl MultiTfAggregator {
         }
 
         if first_after_handover_gap {
-            // Only the buckets this tick is IN: a late tick that amended a
-            // sealed bar or was discarded left no open bucket of its own, and
-            // a taint there would withhold the next, unrelated bucket (review
-            // round 21).
-            slot.replay_taint_open |= landed_open;
+            // EVERY timeframe (review round 22, reversing round 21): where this
+            // tick landed in an open bucket, that bucket holds its delta; where
+            // it was late (amended or discarded), its volume is CARRIED and
+            // settles into the bucket this timeframe has open, or opens next,
+            // when that bucket seals, so that bucket holds the downtime volume
+            // instead. Tainting only the landed timeframes wrote such a bucket
+            // at volume 90 against a true 20.
+            slot.replay_taint_open = REPLAY_ALL_TF_MASK;
         }
 
         // Store the SAME resolved cumulative the cells folded, so the next
@@ -3893,8 +3892,9 @@ mod tests {
         );
     }
 
-    /// Review round 21 (two MEDIUM over-withholding defects, reproduced by the
-    /// reviewer): bars that are exact must be WRITTEN.
+    /// Review rounds 21 and 22: a bar a restart can prove exact must be
+    /// WRITTEN, and a bar the late first volume trade after an untrusted gap
+    /// packet carries into must be withheld or exact, never over-counted.
     #[test]
     fn test_regression_exact_bars_after_a_restart_are_written() {
         const STOCK: u64 = GAP_SID;
@@ -3912,6 +3912,20 @@ mod tests {
                 "{name}: wrote {w:?} against {t:?}"
             );
         };
+        let absent_or_consistent = |name: &str,
+                                    pkts: &[RestartPkt],
+                                    restart: (u32, u32, &[(u64, u32)]),
+                                    key: (u64, TfIndex, u32)| {
+            let truth = bar_row(&restart_bars(pkts, None), key);
+            let written = bar_row(&restart_bars(pkts, Some(restart)), key);
+            assert!(truth.is_some(), "{name}: control writes the bar");
+            if let (Some(w), Some(t)) = (written, truth) {
+                assert!(
+                    (w.0, w.1, w.2, w.3, w.4) == (t.0, t.1, t.2, t.3, t.4) && (!w.6 || w == t),
+                    "{name}: wrote {w:?} against {t:?}"
+                );
+            }
+        };
         let index_every_5s = |from: u32, to: u32| -> Vec<RestartPkt> {
             (from..=to)
                 .step_by(5)
@@ -3920,10 +3934,11 @@ mod tests {
         };
 
         // 1. The first trade that adds volume after the gap packet (+115) is
-        //    delivered at +500, after the catch-up sealed its buckets: it
-        //    amends or is discarded and opens nothing. The taint meant for
-        //    its buckets landed on the next ones a normal trade opened
-        //    (+700), which it is not in.
+        //    delivered at +500, after the catch-up sealed its buckets: its
+        //    volume is carried into the next bucket each timeframe opens
+        //    (+700). The gap packet (+110) is not provably fresh, so that
+        //    bucket may hold downtime volume: withheld, or exact (round 22
+        //    reversed round 21, which wrote it).
         let mut p1: Vec<RestartPkt> = vec![
             (STOCK, 0, 100.0, 10, 0),
             (STOCK, 50, 100.1, 20, 50),
@@ -3935,12 +3950,37 @@ mod tests {
         p1.extend(index_every_5s(5, 1_000));
         p1.sort_by_key(|p| p.4);
         for tf in [TfIndex::M1, TfIndex::M3, TfIndex::M5, TfIndex::M10] {
-            written_exactly(
+            absent_or_consistent(
                 "a late first volume trade",
                 &p1,
+                (60, 100, &[]),
                 (STOCK, tf, tf.bucket_start(OPEN + 700)),
             );
         }
+
+        // 3. Review round 22 (HIGH, reproduced by the reviewer): the gap packet
+        //    is a STALE copy of the downtime trade +54 (cumulative 100); +55
+        //    (105) is lost; the next trade +57 (110) is delivered 300 s late,
+        //    after its minute sealed, and its volume, measured from 100, is
+        //    carried into the minute +360 that the on-time +400 opens. It was
+        //    written with +55's 5 shares too.
+        let mut p3: Vec<RestartPkt> = vec![
+            (STOCK, 0, 100.0, 10, 0),
+            (STOCK, 50, 100.1, 20, 50),
+            (STOCK, 54, 100.2, 100, 54),
+            (STOCK, 55, 100.3, 105, 55),
+            (STOCK, 54, 100.2, 100, 56),
+            (STOCK, 57, 100.4, 110, 357),
+            (STOCK, 400, 100.5, 120, 400),
+        ];
+        p3.extend(index_every_5s(5, 1_000));
+        p3.sort_by_key(|p| p.4);
+        absent_or_consistent(
+            "a stale gap packet and a late next trade",
+            &p3,
+            (53, 56, &[]),
+            (STOCK, TfIndex::M1, TfIndex::M1.bucket_start(OPEN + 400)),
+        );
 
         // 2. A quiet stock: its last replayed trade (+50) is re-sent at +101,
         //    so it is provably listening from then; its next trades (+600,

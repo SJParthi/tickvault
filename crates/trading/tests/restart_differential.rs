@@ -28,12 +28,14 @@
 //!    replayed trade nor stale), or holds its first trade that added volume
 //!    after that packet, which may have been a stale copy.
 //!
-//! Beyond the envelope, a bucket holding a trade delivered more than the
-//! catch-up margin (240 s) late and received after the crash is checked by 1
-//! only: even the uninterrupted process takes such a trade as a late
-//! amendment, and a restart that lost it in the downtime cannot know of it.
-//! The generator does produce such lags (review round 21 needed them), and
-//! production's measured maximum is 199 s.
+//! Beyond the envelope, a bucket holding a trade received after the crash and
+//! more than the catch-up margin (240 s) after the bucket ended is checked by
+//! 1 only: even the uninterrupted process takes such a trade as a late
+//! amendment, and a restart may have lost it in the downtime or refuse to
+//! amend a bar that began before its capture start. The generator produces
+//! such lags rarely (review rounds 21 and 22: about 1 event in 500, so the
+//! exactness checks still cover nearly every bucket); production's measured
+//! maximum is 199 s.
 //!
 //! No bar is exempt from 3. Until review round 19 the bar holding the first
 //! live trade was, and that hid a real defect: a bucket that began in the
@@ -100,7 +102,7 @@ fn event() -> impl Strategy<Value = Event> {
         1u8..=20,
         0u16..=40,
         -3i8..=3,
-        prop_oneof![30 => 0u32..=10_000, 1 => 10_001u32..=200_000, 1 => 240_001u32..=400_000],
+        prop_oneof![500 => 0u32..=10_000, 16 => 10_001u32..=200_000, 1 => 240_001u32..=400_000],
         prop_oneof![9 => Just(None), 1 => (0u16..=3_000).prop_map(Some)],
         prop_oneof![9 => Just(true), 1 => Just(false)],
     )
@@ -407,6 +409,11 @@ fn check(c: &Case) -> Result<(), TestCaseError> {
     // been a stale copy (review round 20).
     let mut gap_cum: HashMap<usize, u32> = HashMap::new();
     let mut first_add: HashMap<usize, u32> = HashMap::new();
+    // The instrument's later packets after that one, `(trade second, receipt
+    // ms)`: a late first-volume trade's volume is carried into the bucket its
+    // timeframe has open, or opens next, when that bucket seals (review round
+    // 22), so that bucket is withheld too.
+    let mut after_add: HashMap<usize, Vec<(u32, u64)>> = HashMap::new();
     let mut first_live: HashMap<usize, (u32, u64)> = HashMap::new();
     for (received, _, p) in &live {
         let repeats_or_stale = last_replayed.get(&p.instrument).is_some_and(|l| {
@@ -416,8 +423,16 @@ fn check(c: &Case) -> Result<(), TestCaseError> {
                     && p.price.to_bits() == l.price.to_bits())
         });
         if let Some(&cum) = gap_cum.get(&p.instrument) {
-            if p.cumulative > cum {
-                first_add.entry(p.instrument).or_insert(p.trade);
+            if let Some(&add) = first_add.get(&p.instrument) {
+                // A later trade, not a re-delivered copy of that one.
+                if p.trade > add {
+                    after_add
+                        .entry(p.instrument)
+                        .or_default()
+                        .push((p.trade, *received));
+                }
+            } else if p.cumulative > cum {
+                first_add.insert(p.instrument, p.trade);
             }
         } else if !repeats_or_stale {
             gap_ended.entry(p.instrument).or_insert(*received);
@@ -491,17 +506,19 @@ fn check(c: &Case) -> Result<(), TestCaseError> {
                         "over-count ({max}): {context}"
                     );
                 }
-                // Beyond the envelope: a trade delivered more than the catch-up
-                // margin late, after the crash. Even the uninterrupted process
-                // takes it as a late amendment, and a restart that lost it in
-                // the downtime cannot know of it; only 1 is checked for such a
+                // Beyond the envelope: a trade of this bucket received after the
+                // crash and after the catch-up margin past the bucket's end, so
+                // the catch-up may already have sealed it. Even the uninterrupted
+                // process takes such a trade as a late amendment, and a restart
+                // may have lost it in the downtime or refuse to amend a bar that
+                // began before the capture start; only 1 is checked for such a
                 // bucket (production's measured maximum lag is 199 s).
                 let beyond_margin = all.iter().any(|p| {
                     p.instrument == i
                         && p.trade >= start
                         && p.trade < end
                         && p.received_ms > crash_ms
-                        && p.received_ms > (u64::from(p.trade) + u64::from(MARGIN)) * 1000
+                        && p.received_ms > (u64::from(end) + u64::from(MARGIN)) * 1000
                 });
                 if beyond_margin {
                     continue;
@@ -510,9 +527,22 @@ fn check(c: &Case) -> Result<(), TestCaseError> {
                     // 4. Missing after the crash: only a bucket that started
                     // before the instrument was known to be captured.
                     if t.is_some() && u64::from(end) * 1000 > crash_ms {
-                        let holds_first_add = first_add
-                            .get(&i)
-                            .is_some_and(|&trade| trade >= start && trade < end);
+                        // The bucket that holds the first volume trade, or
+                        // that its carried volume settles into: ending after
+                        // it, and starting by the first later packet whose own
+                        // bucket of this timeframe the catch-up cannot yet
+                        // have sealed when it arrived (a bucket open then, or
+                        // opened by it, takes the carry).
+                        let secs = tf.seconds_per_bucket();
+                        let settles_by = after_add.get(&i).and_then(|later| {
+                            later.iter().find_map(|&(trade, received)| {
+                                let open_until = u64::from(tf.bucket_start(trade) + secs + MARGIN);
+                                (open_until * 1000 > received).then_some(trade)
+                            })
+                        });
+                        let holds_first_add = first_add.get(&i).is_some_and(|&trade| {
+                            trade < end && settles_by.is_none_or(|next| start <= next)
+                        });
                         prop_assert!(
                             holds_first_add || captured_from.is_none_or(|from| start <= from),
                             "withheld without cause: {context}"
