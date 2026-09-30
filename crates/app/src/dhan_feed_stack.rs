@@ -1576,7 +1576,12 @@ pub struct LiveIngest {
     top_volume_close_clock: crate::top_volume_sweep::WindowCloseClock,
     /// The wall clock, IST epoch seconds, at the last timer poll; `0` until
     /// the first. The per-frame poll caps the candle clock against it without
-    /// reading a clock of its own.
+    /// reading a clock of its own, and so does the catch-up seal's cutoff
+    /// (plan ITEM 47, review round 12). Written at the hand-over
+    /// (`finish_wal_replay`), with each folded main-feed frame's arrival, and
+    /// by the snapshot timers with a real clock reading; under a frame
+    /// backlog the biased select starves those timers, and the reading is then
+    /// the latest frame's arrival, still our own clock.
     top_volume_wall_secs: u32,
     /// The catch-up seal sweep in progress, if any (audit PR4b, 2026-09-26).
     /// The 5 s timer arm only sets this; the drain's idle arm advances it
@@ -4648,6 +4653,12 @@ impl LiveIngest {
         ));
         self.aggregator
             .set_live_capture_start(u32::try_from(now_ist_secs).unwrap_or(u32::MAX));
+        // The same reading is the catch-up cutoff's first wall cap (review
+        // round 13): the catch-up timer fires at once when the drain starts,
+        // before any live frame or snapshot timer has stored a reading, and
+        // an uncapped first sweep would let a future-stamped trade inside the
+        // REPLAYED frames close buckets early once per boot.
+        self.store_top_volume_wall(now_ist_secs.saturating_mul(1_000_000_000));
         // Bars the replay still HELD (sealed, but amendable until the next
         // bar of their timeframe sealed) are final now; the complete ones go
         // down the same seal path as a catch-up seal.
@@ -4684,10 +4695,29 @@ impl LiveIngest {
 
     /// `watermark − CATCHUP_LATENESS_MARGIN_SECS`, saturating at 0 (seal
     /// nothing) before the session's watermark has moved.
+    ///
+    /// The watermark is capped at the wall clock first — the arrival instant
+    /// of the latest folded frame, the same reading the top-volume close
+    /// clock is capped at (plan ITEM 47, review round 12). The watermark is
+    /// the vendor's trade stamp and only a stamp on a future DAY is refused,
+    /// so one trade stamped minutes ahead on the same day would otherwise
+    /// close every quiet instrument's buckets before their real trades
+    /// arrived. The hand-over (`finish_wal_replay`) stores the first reading, so
+    /// even the sweep that fires as the drain starts is capped (review round
+    /// 13); with no reading at all (an ingest never handed over, as in unit
+    /// tests) the cutoff follows the watermark as before. The cap is also what
+    /// keeps a WAL replay's late-tick bound (receipt plus the clock skew) at
+    /// or above anything live could have sealed, whatever frames it skipped.
+    ///
+    /// O(1): one compare and one subtraction.
     fn catch_up_cutoff(&self) -> u32 {
-        self.aggregator
-            .watermark_secs()
-            .saturating_sub(CATCHUP_LATENESS_MARGIN_SECS)
+        let watermark = self.aggregator.watermark_secs();
+        let clock = if self.top_volume_wall_secs == 0 {
+            watermark
+        } else {
+            watermark.min(self.top_volume_wall_secs)
+        };
+        clock.saturating_sub(CATCHUP_LATENESS_MARGIN_SECS)
     }
 
     /// Starts a sliced catch-up seal — the only part the drain's 5 s timer
@@ -21095,6 +21125,81 @@ mod tests {
             "a bucket whose end is inside the lateness margin must stay open — \
              sealing it would write a truncated bar, which is worse than the \
              late bar this mechanism exists to prevent"
+        );
+    }
+
+    /// Plan ITEM 47, review round 12 (the future-dated question): the
+    /// vendor stamp is the candle clock, and only a stamp on a FUTURE DAY is
+    /// refused, so one trade stamped 15 minutes ahead on the same day moved
+    /// the catch-up cutoff 15 minutes ahead and closed every quiet
+    /// instrument's buckets before their real trades arrived. The cutoff is
+    /// now capped at the wall clock (the latest frame's arrival), as the
+    /// top-volume close clock already is.
+    #[test]
+    fn test_regression_a_future_stamped_tick_cannot_close_buckets_early() {
+        let run = |record_wall: bool| {
+            let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+            let ts = 1_779_355_000;
+            let recv_nanos = i64::from(ts) * 1_000_000_000;
+            for (sid, stamp) in [(1_001_u32, ts), (999, ts + 900)] {
+                let packet = ticker_packet(sid, 100.0, stamp);
+                let ParsedFrame::Tick(tick) = dispatch_frame(&packet, recv_nanos).expect("parse")
+                else {
+                    panic!("expected a tick");
+                };
+                ingest.ingest_tick(&tick, 7, u64::from(ts) * 1_000);
+            }
+            if record_wall {
+                // The drain records each folded frame's arrival, IST.
+                ingest.poll_top_volume_window_closes_by_candles(i64::from(ts) * 1_000_000_000);
+            }
+            // Sealed bars: "emitted" to the writer, or "dropped" when a test has
+            // no writer attached. Either way the bucket was closed.
+            let (emitted, dropped) = ingest.catch_up_seal();
+            emitted + dropped
+        };
+        assert!(
+            run(false) > 0,
+            "control: with no wall reading the cutoff still follows the candle clock"
+        );
+        assert_eq!(
+            run(true),
+            0,
+            "a trade stamped 15 minutes ahead must not close buckets that have not \
+             ended by the wall clock"
+        );
+    }
+
+    /// Review round 13: the catch-up timer fires as soon as the drain starts,
+    /// before any live frame or snapshot timer has stored a wall reading. The
+    /// hand-over stores one, so a watermark pushed ahead by a future-stamped
+    /// trade inside the REPLAYED frames cannot make that first sweep close
+    /// buckets early.
+    #[test]
+    fn test_finish_wal_replay_caps_the_first_catch_up_sweep_at_the_wall_clock() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        let now_ist = || {
+            u32::try_from(
+                chrono::Utc::now().timestamp()
+                    + i64::from(tickvault_common::constants::IST_UTC_OFFSET_SECONDS),
+            )
+            .expect("fits")
+        };
+        let before = now_ist();
+        // The replay saw a trade stamped far ahead of the wall clock.
+        ingest.aggregator.seed_watermark_at_least(before + 10_000);
+        assert!(
+            ingest.catch_up_cutoff() > before,
+            "control: with no wall reading the cutoff follows the watermark"
+        );
+        ingest.finish_wal_replay(false);
+        let after = now_ist();
+        let cutoff = ingest.catch_up_cutoff();
+        assert!(
+            cutoff >= before.saturating_sub(CATCHUP_LATENESS_MARGIN_SECS)
+                && cutoff <= after.saturating_sub(CATCHUP_LATENESS_MARGIN_SECS),
+            "the first sweep after the hand-over is capped at the wall clock: \
+             cutoff {cutoff}, wall {before}..{after}"
         );
     }
 

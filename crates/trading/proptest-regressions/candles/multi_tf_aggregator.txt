@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a44ed221c9686f2b95dcef04b5939447c96d32b1082efb4d9d7af905d33be6a9 # shrinks to head = [Step { dt: 1, dcum: 0, dpx: 0, dropped: false }], tail = [Step { dt: 1, dcum: 1, dpx: 0, dropped: false }]

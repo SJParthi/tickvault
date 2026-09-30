@@ -890,6 +890,17 @@ impl AggregatorCell {
     ///   otherwise chain to the last SEALED bar, whose endpoint is from before
     ///   the gap.
     ///
+    /// `span_ends_by_secs` bounds the skipped span when it is known: after
+    /// the hand-over to the live feed it is the capture start, since every
+    /// downtime trade happened before the new process began listening (`0`
+    /// = unbounded, as inside a replay). A SAME-bucket open bucket that ENDED
+    /// by then cannot hold the whole span — the trades after its end belong
+    /// to later buckets — so it is re-based like a rolled one instead of
+    /// absorbing the span, and its bit is returned so the caller can mark it
+    /// partial (review round 15: a LATE first live trade poured the whole
+    /// downtime into the minute the hand-over had kept, 225 shares against a
+    /// true 33).
+    ///
     /// # Complexity
     /// O(`TF_COUNT`).
     pub fn rebase_open_buckets_after_gap(
@@ -897,7 +908,9 @@ impl AggregatorCell {
         cumulative_volume: u64,
         fold_secs: u32,
         last_counted_secs: u32,
-    ) {
+        span_ends_by_secs: u32,
+    ) -> u16 {
+        let mut unabsorbed: u16 = 0;
         for tf in TfIndex::ALL {
             let ord = tf.as_ordinal();
             let state = &mut self.slots[ord];
@@ -906,10 +919,15 @@ impl AggregatorCell {
             // cumulative counted was inside it too: a bucket opened after it
             // (by a stale packet) chains to the pre-gap end, and would take
             // the previous bucket's skipped tail (review round 4).
-            if open
+            let same_bucket = open
                 && tf.bucket_start(fold_secs) == state.bucket_start_ist_secs
-                && state.bucket_start_ist_secs <= last_counted_secs
-            {
+                && state.bucket_start_ist_secs <= last_counted_secs;
+            let span_fits = span_ends_by_secs == 0
+                || state
+                    .bucket_start_ist_secs
+                    .saturating_add(tf.seconds_per_bucket())
+                    > span_ends_by_secs;
+            if same_bucket && span_fits {
                 // The gross now includes trades whose direction nobody saw, so
                 // the net can no longer claim to cover them (review,
                 // 2026-09-29), exactly as an unclassified carry does.
@@ -926,8 +944,12 @@ impl AggregatorCell {
                 carry.settle_into(state);
                 state.bucket_start_cumulative = cumulative_volume.saturating_sub(state.volume);
             }
+            if same_bucket {
+                unabsorbed |= 1_u16 << ord;
+            }
             self.chain_broken[ord] = !open;
         }
+        unabsorbed
     }
     /// Folds one tick into ONE timeframe slot.
     ///
@@ -1290,6 +1312,13 @@ impl AggregatorCell {
             // than losing the official open for the whole day; pinning it to a
             // session-time window would put trading-calendar knowledge inside
             // this cell, which is the wrong place for it.
+            //
+            // ⚠ CORRECTED 2026-09-29 (plan ITEM 47, review round 10): the
+            // residual above no longer holds. The check below requires the
+            // bucket that owns 09:15 (`is_days_first_session_bucket`), so a
+            // later bucket never takes the official open; a `day_open`
+            // withheld past that bucket is simply not stamped, and the roll
+            // path applies the same rule.
             let use_day_open = self.armed_for_day_open[ord]
                 && prices.day_open > 0.0
                 && is_days_first_session_bucket(tf, bucket_start);
@@ -1459,16 +1488,35 @@ impl AggregatorCell {
         }
 
         // Strictly newer bucket — seal the open one and open the new one at
-        // the LTP (an intraday crossing is never the day's first bar).
+        // the LTP, or at the official day open when the new bucket is the one
+        // that owns it (see the 2026-09-29 note below).
         //
-        // 2026-08-19 — the `false` is unchanged, but the DISARM beside it is
-        // new. Leaving here means the day's first bucket is behind us, so the
-        // official open can never legitimately be stamped again; disarming
-        // makes that structural rather than incidental, and is what lets the
-        // in-bucket path below stamp a late-arriving `day_open` without any
-        // risk of a later bucket claiming it.
+        // 2026-08-19 — the DISARM. Once the day's first session bucket is
+        // behind us the official open can never legitimately be stamped
+        // again; disarming makes that structural rather than incidental, and
+        // is what lets the in-bucket path stamp a late-arriving `day_open`
+        // without any risk of a later bucket claiming it.
         if bucket_start > open_start {
-            self.armed_for_day_open[ord] = false;
+            // ⚠ 2026-09-29 (plan ITEM 47, review round 9): "an intraday
+            // crossing is never the day's first bar" is FALSE for a roll out
+            // of a PRE-OPEN bucket (the grid starts at 09:00) into the bucket
+            // holding 09:15. The empty-slot open stamps the official day open
+            // on that bucket; the roll did not, and disarmed. Which one ran
+            // depended only on whether the catch-up sweep sealed the pre-open
+            // bar first, so the same ticks gave two different opening bars,
+            // and a WAL replay (which runs no sweep) rebuilt a different bar
+            // than live stored. The roll now applies the same rule, and
+            // disarms only once it has used the open or moved past the
+            // bucket that owns it.
+            let day_start = bucket_start - (bucket_start % 86_400);
+            let first_session_start =
+                tf.bucket_start(day_start.saturating_add(MARKET_OPEN_SECS_OF_DAY_IST));
+            let use_day_open = self.armed_for_day_open[ord]
+                && prices.day_open > 0.0
+                && bucket_start == first_session_start;
+            if use_day_open || bucket_start > first_session_start {
+                self.armed_for_day_open[ord] = false;
+            }
             // The bar we are about to seal IS the new bar's predecessor, so
             // its close is read from the OPEN slot here rather than from
             // `last_sealed` (which still holds the bar before it). Captured
@@ -1514,10 +1562,13 @@ impl AggregatorCell {
                     bucket_start,
                     chained_start,
                     BucketOpenContext {
-                        use_day_open: false,
-                        // An intraday crossing is never the day's first bar,
-                        // so the running session extremes must NOT be adopted
-                        // here — the scope guarantee of plan Item 6.
+                        // The official open, exactly as the empty-slot open
+                        // would stamp it (see above).
+                        use_day_open,
+                        // A roll has a predecessor today, so the running
+                        // session extremes must NOT be adopted here — the
+                        // scope guarantee of plan Item 6, and what the
+                        // empty-slot open also decides once a bar has sealed.
                         first_bucket_of_day: false,
                         prev_close: prev_close_for_new_bucket,
                     },
@@ -1781,6 +1832,13 @@ fn widen_range_to_include(state: &mut LiveCandleState, price: f64) {
 /// trusting the old wording would conclude this function needs a pre-open
 /// carve-out it does not need. The 09:15 anchoring is also what makes the test
 /// reduce to `bucket_start == day_start + 33_300` for every timeframe.
+///
+/// **⚠ Corrected again 2026-09-29.** The paragraph above is stale since the
+/// 2026-08-28 grid move to 09:00 (recorded inside the body below): M30 and M60
+/// DO have a 09:00 bucket now, and M10's bucket holding 09:15 starts at 09:10.
+/// The function is still exact because it aligns 09:15 with
+/// [`TfIndex::bucket_start`] rather than comparing against 09:15 itself. The
+/// roll path in `consume_tick` applies the same rule (plan ITEM 47, round 9).
 ///
 /// # Complexity
 /// O(1) — one remainder, one bucket alignment, one compare.
@@ -2812,6 +2870,59 @@ mod tests {
         }
     }
 
+    /// Plan ITEM 47, review round 9 (verified by the reviewer on a live
+    /// sequence): the bar holding the market open must come out the same
+    /// whether the pre-open bar before it was sealed by the catch-up sweep
+    /// (then the 09:15 tick opens an EMPTY slot) or by the 09:15 tick itself
+    /// (a ROLL). Before the fix the roll ignored the official day open and
+    /// the two paths published different opening bars for the same ticks —
+    /// and a WAL replay, which runs no sweep, rebuilt a different bar than
+    /// live had stored.
+    ///
+    /// Widened in round 10: every timeframe (M10's 09:15 bucket starts at
+    /// 09:10 and M30/M60's at 09:00, so for them the pre-open ticks already
+    /// share the opening bar), the whole candle rather than three fields, and
+    /// an official open that arrives on the SECOND tick of the bar. Both ticks
+    /// share the 09:15:00 second so the snapshot is the opening bar on the
+    /// one-second frames too.
+    #[test]
+    fn test_regression_roll_and_empty_open_stamp_the_same_day_open() {
+        let strategy = FeedStrategy::DEFAULT;
+        for late_open in [false, true] {
+            for tf in TfIndex::ALL {
+                let run = |sweep_first: bool| {
+                    let mut cell = AggregatorCell::empty();
+                    // Two pre-open trades (09:08) with no official open yet.
+                    for (ts, cum) in [(OPEN - 420, 1_000_u32), (OPEN - 410, 1_010)] {
+                        let t = tick_at(ts, 100.0, cum);
+                        cell.consume_tick(tf, &t, cum.into(), strategy, cum.into());
+                    }
+                    if sweep_first {
+                        // Seals the pre-open bar where it has already ended
+                        // (M30/M60 keep it open: it is the opening bar).
+                        let _ = cell.catch_up_seal(tf, OPEN);
+                    }
+                    let mut first = tick_at(OPEN, 102.0, 1_020);
+                    first.day_open = if late_open { 0.0 } else { 101.0 };
+                    cell.consume_tick(tf, &first, 1_020, strategy, 1_020);
+                    let mut second = tick_at(OPEN, 103.0, 1_030);
+                    second.day_open = 101.0;
+                    cell.consume_tick(tf, &second, 1_030, strategy, 1_030);
+                    cell.snapshot(tf)
+                };
+                let swept = run(true);
+                let rolled = run(false);
+                assert_eq!(swept, rolled, "{tf:?} late_open={late_open}");
+                assert!(
+                    (rolled.open - 101.0).abs() < 1e-9,
+                    "{tf:?} late_open={late_open}: the bar that owns 09:15 opens at \
+                     the official day open, got {}",
+                    rolled.open
+                );
+            }
+        }
+    }
+
     /// A repeated quote (same trade, new book/OI) refreshes ONLY the quote
     /// fields of the bucket that trade belongs to. It never counts a tick,
     /// never moves a price, and never touches a bucket it does not belong to.
@@ -2965,7 +3076,7 @@ mod tests {
         // The post-gap tick ROLLS M1 (it lands at 11:06:40): re-based,
         // counted volume kept, chain intact; unopened frames break it.
         let mut cell = open_m1();
-        cell.rebase_open_buckets_after_gap(100_000, 40_000, 33_310);
+        cell.rebase_open_buckets_after_gap(100_000, 40_000, 33_310, 0);
         for tf in TfIndex::ALL {
             let open = !cell.snapshot(tf).is_uninitialised();
             assert_eq!(
@@ -2990,7 +3101,7 @@ mod tests {
         // whole skipped span is in this bucket, so nothing moves and the
         // cumulative attributes it exactly.
         let mut cell = open_m1();
-        cell.rebase_open_buckets_after_gap(100_000, 33_330, 33_310);
+        cell.rebase_open_buckets_after_gap(100_000, 33_330, 33_310, 0);
         let m1 = cell.snapshot(TfIndex::M1);
         assert_eq!(m1.bucket_start_cumulative, 10, "same bucket: not re-based");
         assert!(
@@ -3007,7 +3118,7 @@ mod tests {
         // Same bucket, but the last COUNTED tick was before it opened (a
         // stale packet opened it): the span began elsewhere, so it re-bases.
         let mut cell = open_m1();
-        cell.rebase_open_buckets_after_gap(100_000, 33_330, 33_290);
+        cell.rebase_open_buckets_after_gap(100_000, 33_330, 33_290, 0);
         let m1 = cell.snapshot(TfIndex::M1);
         assert_eq!(
             m1.bucket_start_cumulative,
