@@ -233,6 +233,17 @@ struct InstrumentSlot {
     /// That receipt, IST seconds; `0` until it arrives. It bounds the span
     /// this instrument's hand-over gap can hold.
     handover_listen_secs: u32,
+    /// The tick-rule direction at the replay hand-over, restored if this
+    /// instrument's first live packet proves nothing traded in the downtime
+    /// (review round 19): the hand-over resets it because the downtime may
+    /// have moved the price, and a kept bucket then took the next flat trade
+    /// unsigned.
+    handover_tick_sign: i8,
+    /// `true` once this instrument's first live packet after a hand-over was
+    /// the last replayed trade itself (review round 19): nothing traded in
+    /// the downtime, so no bucket can be missing a downtime trade and the
+    /// capture-start rule does not apply to it.
+    downtime_clear: bool,
     /// `true` from the tick that resolves a replay gap (or a new slot's first
     /// tick) until a later tick has both RAISED the cumulative and left the
     /// tick rule with a direction (plan ITEM 47, review round 5). Until then a
@@ -529,7 +540,8 @@ pub struct MultiTfAggregator {
     /// contract can be an hour old, and it would otherwise open a one-tick,
     /// zero-volume bar for that old bucket and overwrite the stored row
     /// (review, 2026-09-29). Such a bar is suppressed and counted in every
-    /// mode.
+    /// mode. Since review round 19 the test is whether the bucket STARTED by
+    /// then, since one that straddles it may be missing downtime trades.
     live_capture_from_secs: u32,
     /// The latest frame the replay folded, IST seconds: its receipt, or its
     /// trade second when a frame carries none. It stands for when the
@@ -1050,6 +1062,8 @@ impl MultiTfAggregator {
             replay_handover_kept: 0,
             handover_listen_pending: false,
             handover_listen_secs: 0,
+            handover_tick_sign: 0,
+            downtime_clear: false,
             // A new slot knows neither the cumulative nor the direction that
             // came before its first tick (during a replay, those frames may
             // have been skipped), so its first buckets settle like a gap's.
@@ -1598,24 +1612,44 @@ impl MultiTfAggregator {
         // the baseline or the partial bits are read below. One compare per
         // tick when there is none.
         slot.sync_replay_gap(gap_epoch);
-        // This instrument's first live tick after a replay hand-over (review
-        // round 17): its socket may have listened later than the process-wide
-        // capture start, so its own receipt ends its downtime. One bool test
-        // per tick otherwise; O(`TF_COUNT`) once per instrument.
-        if slot.handover_listen_pending
-            && let Some(receipt) = receipt_ist_secs(tick.received_at_nanos)
-        {
-            slot.handover_listen_pending = false;
-            slot.handover_listen_secs = receipt;
-            slot.taint_kept_ended_in_downtime(
-                receipt,
-                last_frame,
-                catch_up_margin.max(REPLAY_FRONTIER_SKEW_SECS),
-            );
-        }
-
         let cumulative_volume =
             cumulative_volume_override.unwrap_or_else(|| u64::from(tick.volume));
+        // This instrument's first live tick after a replay hand-over (review
+        // rounds 17 and 19): its socket may have listened later than the
+        // process-wide capture start, so its own receipt ends its downtime. A
+        // kept bucket that ended in the downtime, or within the catch-up
+        // margin of the previous process's last frame, may be missing a trade
+        // delivered while nobody listened, and a kept bucket still open may be
+        // missing a downtime price; each is withheld, UNLESS this packet is the
+        // last replayed trade itself (same last-trade time, price and day
+        // cumulative, as the subscribe snapshot is when the instrument did not
+        // trade; the repeat-quote path then folds it as a repeat): any later trade moves the last-trade time, so nothing traded
+        // in the downtime and every kept bucket is complete (round 19: the
+        // margin alone withheld ~2 complete bars per instrument per restart).
+        // An index carries no volume, so it cannot prove this and is withheld.
+        // One bool test per tick otherwise; O(`TF_COUNT`) once per instrument.
+        if slot.handover_listen_pending {
+            slot.handover_listen_pending = false;
+            // Every live frame carries its receipt; a tick without one
+            // still ends the downtime, no earlier than its own trade time.
+            slot.handover_listen_secs =
+                receipt_ist_secs(tick.received_at_nanos).unwrap_or(fold_secs);
+            let nothing_traded = slot.volume_baseline_seeded
+                && slot.last_cumulative > 0
+                && cumulative_volume == slot.last_cumulative
+                && fold_secs == slot.last_trade_ts
+                && slot.last_ltp.to_bits() == prices.last_traded_price.to_bits();
+            if nothing_traded {
+                // Nothing happened between the last replayed trade and now,
+                // so the hand-over gap is empty: the direction carries on
+                // and this packet folds as the repeat it is.
+                slot.replay_gap_rebase_pending = false;
+                slot.last_tick_sign = slot.handover_tick_sign;
+                slot.downtime_clear = true;
+            } else {
+                slot.taint_kept_at_risk(last_frame, catch_up_margin.max(REPLAY_FRONTIER_SKEW_SECS));
+            }
+        }
 
         // SEED, do not assume zero. A slot allocated mid-session has never
         // seen this instrument, so the volume it traded before we arrived is
@@ -1685,6 +1719,21 @@ impl MultiTfAggregator {
         // `true` when THIS tick seeds the baseline: the bucket it opens misses
         // this tick's own delta, so it is partial (plan ITEM 47).
         let seeded_now = !slot.volume_baseline_seeded;
+        // An instrument first seen LIVE after a mid-session boot (review
+        // round 19): it may have traded while nobody listened, and its socket
+        // may have listened later than the others, so its own first receipt
+        // is its capture start, exactly as for an instrument the replay had
+        // seen. Its first buckets are partial (the seeding tick's delta is
+        // unknown) and those that started by then are withheld. A pre-market
+        // boot has nothing to miss, so every first bar of the day is still
+        // written. One compare on a seeding tick only.
+        if seeded_now
+            && !replay_mode
+            && capture_is_mid_session(live_from, fold_secs)
+            && let Some(receipt) = receipt_ist_secs(tick.received_at_nanos)
+        {
+            slot.handover_listen_secs = slot.handover_listen_secs.max(receipt);
+        }
         if !slot.volume_baseline_seeded {
             slot.volume_baseline_seeded = true;
             slot.last_cumulative = cumulative_volume;
@@ -1967,8 +2016,7 @@ impl MultiTfAggregator {
                     // Plan ITEM 47: the bucket just sealed inherits the open
                     // bucket's replay bits; the bucket this tick opened is
                     // complete unless this tick seeded the baseline.
-                    let before = ended_before_capture(
-                        tf,
+                    let before = started_before_capture(
                         sealed_state.bucket_start_ist_secs,
                         slot.capture_from(live_from),
                     );
@@ -1992,8 +2040,7 @@ impl MultiTfAggregator {
                     // A late tick amends the last SEALED bar. If a replay
                     // could only partly see that bar, re-emitting it would
                     // overwrite the complete live row (plan ITEM 47).
-                    let before = ended_before_capture(
-                        tf,
+                    let before = started_before_capture(
                         amended_state.bucket_start_ist_secs,
                         slot.capture_from(live_from),
                     );
@@ -2256,8 +2303,7 @@ impl MultiTfAggregator {
                     slot.hold_unconfirmed_kept(tf, margin, last_frame);
                 }
                 if let Some(state) = slot.cell.force_seal(tf) {
-                    let before = ended_before_capture(
-                        tf,
+                    let before = started_before_capture(
                         state.bucket_start_ist_secs,
                         slot.capture_from(live_from),
                     );
@@ -2391,8 +2437,7 @@ impl MultiTfAggregator {
                         slot.hold_unconfirmed_kept(tf, margin, last_frame);
                     }
                     if let Some(state) = slot.cell.catch_up_seal(tf, cutoff_secs) {
-                        let before = ended_before_capture(
-                            tf,
+                        let before = started_before_capture(
                             state.bucket_start_ist_secs,
                             slot.capture_from(live_from),
                         );
@@ -2516,13 +2561,11 @@ impl MultiTfAggregator {
         }
         let live_from = self.live_capture_from_secs;
         let mut released_suppressed = 0_u64;
-        let last_frame = self.replay_last_frame_secs;
-        let margin = self.catch_up_margin_secs.max(REPLAY_FRONTIER_SKEW_SECS);
         let epoch = self.replay_gap_epoch;
         // The hand-over gap (the downtime before the first live frame) is
         // applied HERE, eagerly, rather than through the lazy epoch sync: the
         // sync would mark every open bucket partial, and a complete one would
-        // then be suppressed by the live `ended_before_capture` rule — after a
+        // then be suppressed by the live `started_before_capture` rule — after a
         // crash, the last bars the replay rebuilt in full, which exist nowhere
         // else (review round 4).
         let hand_over_epoch = epoch.wrapping_add(1);
@@ -2559,13 +2602,13 @@ impl MultiTfAggregator {
             // the outcome no longer depends on the order the first live ticks
             // arrive in (the round-12 concern). The skew margin leans towards
             // withholding when this box's clock runs ahead of the exchange.
+            // The rule is applied at each instrument's own first live receipt,
+            // where the day cumulative shows whether anything traded in the
+            // downtime (review rounds 17 and 19); until then a sweep that
+            // would seal such a bucket withholds it (`hold_unconfirmed_kept`).
             slot.replay_handover_kept = open_mask & !slot.replay_taint_open;
-            if live_from != 0 {
-                slot.taint_kept_ended_in_downtime(live_from, last_frame, margin);
-            }
-            // Each instrument re-applies the rule at its own first live
-            // receipt (review round 17).
             slot.handover_listen_pending = live_from != 0;
+            slot.downtime_clear = false;
             slot.handover_listen_secs = 0;
             tainted = tainted.saturating_add(u64::from(slot.replay_taint_open.count_ones()));
             // Every bar still held is final now: emitted if complete, counted
@@ -2584,6 +2627,7 @@ impl MultiTfAggregator {
             // bits: a tainted one is held back by the taint, a complete one
             // stays complete and carries on with live ticks.
             slot.replay_gap_epoch_seen = hand_over_epoch;
+            slot.handover_tick_sign = slot.last_tick_sign;
             slot.last_tick_sign = 0;
             slot.replay_gap_rebase_pending = true;
             // The frontier only guards buckets a replay could not see in
@@ -2612,12 +2656,15 @@ impl MultiTfAggregator {
     }
 
     /// Records the IST fold second at which this process began capturing
-    /// live frames. From then on a PARTIAL bar whose bucket ended at or
-    /// before it is suppressed and counted in every mode: it can only be a
+    /// live frames. From then on a PARTIAL bar whose bucket started at or
+    /// before it is suppressed and counted in every mode: it may be a
     /// fragment, typically opened by the first packet after a subscribe
-    /// carrying an old last-trade time, of a bar the previous process owned
-    /// (see [`Self::live_capture_from_secs`]). Call once, before the first
-    /// live frame. O(1).
+    /// carrying an old last-trade time, of a bar the previous process owned,
+    /// or it may be missing trades from the downtime (review round 19; see
+    /// [`Self::live_capture_from_secs`]). In live mode so is any bar that
+    /// started by then and that the hand-over did not keep complete, and
+    /// each instrument's own first live receipt moves the instant later for
+    /// it. Call once, before the first live frame. O(1).
     ///
     /// **Honest limits (review round 4):** a partial bar for a bucket that
     /// ended during a DOWNTIME, when no process owned it, is held back too:
@@ -2635,12 +2682,13 @@ impl MultiTfAggregator {
     /// hand-over was read before the sockets were dialled, so a bucket that
     /// ended in the dial window was kept as complete although its tail was
     /// in the downtime. This tick's receipt is known to be after listening
-    /// began: the capture start moves to it, and the hand-over's downtime
-    /// rule is applied once more to the buckets still kept.
+    /// began: the capture start moves to it. The downtime rule itself runs at
+    /// each instrument's own first live receipt (review rounds 17 and 19),
+    /// where the day cumulative shows whether anything traded meanwhile.
     ///
     /// # Complexity
-    /// O(slots × `TF_COUNT`), ONCE per replay hand-over (at its first live
-    /// tick); every other tick pays one bool test in the caller.
+    /// O(1), once per replay hand-over; every other tick pays one bool test
+    /// in the caller.
     fn confirm_capture_start(&mut self, received_at_nanos: i64) {
         let Some(receipt) = receipt_ist_secs(received_at_nanos) else {
             return;
@@ -2650,13 +2698,6 @@ impl MultiTfAggregator {
             return;
         }
         self.live_capture_from_secs = receipt;
-        let margin = self.catch_up_margin_secs.max(REPLAY_FRONTIER_SKEW_SECS);
-        let last_frame = self.replay_last_frame_secs;
-        // O(1) EXEMPT: begin — once per replay hand-over, at its first live tick
-        for slot in &mut self.slots {
-            slot.taint_kept_ended_in_downtime(receipt, last_frame, margin);
-        }
-        // O(1) EXEMPT: end
     }
 
     /// Sets how far behind the watermark the live catch-up seal closes a
@@ -2723,51 +2764,58 @@ impl InstrumentSlot {
         &mut self,
         tf: TfIndex,
         replay_mode: bool,
-        ended_before_capture: bool,
+        started_before_capture: bool,
     ) -> bool {
         // A gap still pending means the tick that opens the next bucket will
         // discard its own delta, exactly as a re-seeding tick does.
         let next_open_partial = !self.volume_baseline_seeded || self.replay_gap_rebase_pending;
-        self.roll_replay_bits(tf, next_open_partial, replay_mode, ended_before_capture)
+        self.roll_replay_bits(tf, next_open_partial, replay_mode, started_before_capture)
     }
 
-    /// Taints every bucket the hand-over still keeps whose tail fell into the
-    /// downtime: it ended after the previous process's last frame
-    /// (`last_frame`, less the clock-skew margin) but by `listening_from`,
-    /// when this instrument's feed was known to be listening again (review
-    /// rounds 15 to 17). Nobody captured those trades, so the bucket is not
-    /// complete. O(`TF_COUNT`).
-    ///
-    /// `margin` is how long after a bucket's end its late ticks may still
-    /// arrive (the live catch-up margin): a bucket is complete only if the
-    /// previous process kept capturing that long past its end (review round
-    /// 18: with a 5 s allowance, a 90 s-late trade delivered after the crash
-    /// left a kept minute short).
-    fn taint_kept_ended_in_downtime(&mut self, listening_from: u32, last_frame: u32, margin: u32) {
+    /// Taints every bucket the hand-over still keeps that the downtime may
+    /// have touched (review rounds 15 to 19): see
+    /// [`Self::taint_kept_tf_if_at_risk`]. Called at this instrument's first
+    /// live receipt when the day cumulative moved in the downtime (or cannot
+    /// show it, for an index). O(`TF_COUNT`).
+    fn taint_kept_at_risk(&mut self, last_frame: u32, margin: u32) {
         if self.replay_handover_kept == 0 {
             return;
         }
         for tf in TfIndex::ALL {
-            let bit = replay_tf_bit(tf);
-            if self.replay_handover_kept & bit == 0 {
-                continue;
-            }
-            let start = self.cell.open_bucket_start(tf);
-            let end = start.saturating_add(tf.seconds_per_bucket());
-            if start != 0 && end <= listening_from && end.saturating_add(margin) > last_frame {
-                self.replay_taint_open |= bit;
-                self.replay_handover_kept &= !bit;
-            }
+            self.taint_kept_tf_if_at_risk(tf, margin, last_frame);
+        }
+    }
+
+    /// Taints `tf`'s bucket if the hand-over kept it and the downtime may have
+    /// touched it: it did not end at least `margin` seconds before the
+    /// previous process's last frame (`last_frame`). `margin` is how long
+    /// after a bucket's end its late ticks may still arrive (the live catch-up
+    /// margin), so a bucket that ended earlier was captured in full, late
+    /// ticks included (review round 18: with a 5 s allowance, a 90 s-late
+    /// trade delivered after the crash left a kept minute short). A later one
+    /// may be missing a trade delivered while nobody listened, or, if still
+    /// open, a downtime price that set its high or low (review round 19: an
+    /// index minute missed a 1000.25 low). O(1).
+    fn taint_kept_tf_if_at_risk(&mut self, tf: TfIndex, margin: u32, last_frame: u32) {
+        let bit = replay_tf_bit(tf);
+        if self.replay_handover_kept & bit == 0 {
+            return;
+        }
+        let start = self.cell.open_bucket_start(tf);
+        let end = start.saturating_add(tf.seconds_per_bucket());
+        if start != 0 && end.saturating_add(margin) > last_frame {
+            self.replay_taint_open |= bit;
+            self.replay_handover_kept &= !bit;
         }
     }
 
     /// This instrument's capture start: the process-wide one, or its own first
-    /// live receipt when that is later (review round 18). A bucket that ended
-    /// before it is a fragment of the downtime, whatever the other sockets
-    /// did. O(1).
+    /// live receipt when that is later (review round 18). A partial bucket
+    /// that started by then may hold part of the downtime, whatever the other
+    /// sockets did. O(1).
     #[inline]
     fn capture_from(&self, live_from: u32) -> u32 {
-        if live_from == 0 {
+        if live_from == 0 || self.downtime_clear {
             0
         } else {
             live_from.max(self.handover_listen_secs)
@@ -2775,23 +2823,12 @@ impl InstrumentSlot {
     }
 
     /// Before a kept bucket is sealed by a sweep while this instrument has
-    /// not yet confirmed its own listening time (review round 18): a bucket
-    /// that ended within `margin` of the previous process's last frame may
-    /// still have its tail in this instrument's downtime, which only its
-    /// first live receipt can rule out, so it is tainted and withheld. A
-    /// bucket that ended earlier is complete whatever the downtime. O(1).
+    /// not yet confirmed its own listening time (review round 18): only its
+    /// first live receipt can show whether the downtime touched the bucket,
+    /// so a bucket at risk is tainted and withheld. O(1).
     fn hold_unconfirmed_kept(&mut self, tf: TfIndex, margin: u32, last_frame: u32) {
-        let bit = replay_tf_bit(tf);
-        if !self.handover_listen_pending || self.replay_handover_kept & bit == 0 {
-            return;
-        }
-        let end = self
-            .cell
-            .open_bucket_start(tf)
-            .saturating_add(tf.seconds_per_bucket());
-        if end.saturating_add(margin) > last_frame {
-            self.replay_taint_open |= bit;
-            self.replay_handover_kept &= !bit;
+        if self.handover_listen_pending {
+            self.taint_kept_tf_if_at_risk(tf, margin, last_frame);
         }
     }
 
@@ -2813,17 +2850,27 @@ impl InstrumentSlot {
     /// next open bucket's partial bit to `next_open_partial` and clears its
     /// taint (a bucket opened after the hand-over holds live data). Returns
     /// whether the bar being sealed must be suppressed: a partial bar during a
-    /// replay, or a bar tainted at the hand-over in any mode. O(1).
+    /// replay, a bar tainted at the hand-over in any mode, or, in live mode, a
+    /// bar that started by this instrument's capture start
+    /// (`started_before_capture`) unless the hand-over kept it complete. A
+    /// trade lost in the downtime has a trade time before that instant, so
+    /// such a bucket may be missing its price, and its volume if the bucket
+    /// is partial (review round 19: a half-hour that began two seconds before
+    /// the capture start, opened by a live tick, was written without the
+    /// downtime's trades). The sealed bar carries the verdict as its partial
+    /// bit, so a late amendment is refused by the same rule. O(1).
     #[inline]
     fn roll_replay_bits(
         &mut self,
         tf: TfIndex,
         next_open_partial: bool,
         replay_mode: bool,
-        ended_before_capture: bool,
+        started_before_capture: bool,
     ) -> bool {
         let bit = replay_tf_bit(tf);
-        let was_partial = self.replay_open_partial & bit != 0;
+        let was_kept = self.replay_handover_kept & bit != 0;
+        let was_partial = self.replay_open_partial & bit != 0
+            || (!replay_mode && started_before_capture && !was_kept);
         let was_tainted = self.replay_taint_open & bit != 0;
         set_bit(&mut self.replay_sealed_partial, bit, was_partial);
         set_bit(&mut self.replay_taint_sealed, bit, was_tainted);
@@ -2842,7 +2889,7 @@ impl InstrumentSlot {
             bit,
             next_open_partial || forced,
         );
-        (replay_mode && was_partial) || was_tainted || (was_partial && ended_before_capture)
+        (replay_mode && was_partial) || was_tainted || (was_partial && started_before_capture)
     }
 
     /// Whether a late amendment of `tf`'s last sealed bar must be suppressed,
@@ -2852,13 +2899,13 @@ impl InstrumentSlot {
         &self,
         tf: TfIndex,
         replay_mode: bool,
-        ended_before_capture: bool,
+        started_before_capture: bool,
     ) -> bool {
         let bit = replay_tf_bit(tf);
         let partial = self.replay_sealed_partial & bit != 0;
         (replay_mode && partial)
             || self.replay_taint_sealed & bit != 0
-            || (partial && ended_before_capture)
+            || (partial && started_before_capture)
     }
 }
 
@@ -2881,6 +2928,10 @@ const MAX_BUCKET_SECS: u32 = {
 /// Widens the gap frontier so a skipped tick stamped a little after its
 /// receipt still falls inside it.
 const REPLAY_FRONTIER_SKEW_SECS: u32 = 5;
+
+/// Seconds in one IST day: fold seconds are IST epoch seconds, so `/ SECS_PER_DAY`
+/// is the IST day and `% SECS_PER_DAY` the second of that day.
+const SECS_PER_DAY: u32 = 86_400;
 
 /// The gap frontier for a slot's first tick after a gap: its receipt time in
 /// IST fold seconds plus [`REPLAY_FRONTIER_SKEW_SECS`]. A tick with no
@@ -2923,7 +2974,7 @@ where
     let Some(bar) = slot.cell.last_sealed_snapshot(tf) else {
         return Released::Nothing;
     };
-    let before = ended_before_capture(tf, bar.bucket_start_ist_secs, slot.capture_from(live_from));
+    let before = started_before_capture(bar.bucket_start_ist_secs, slot.capture_from(live_from));
     if slot.sealed_is_suppressed(tf, true, before) {
         count_replay_partial_suppressed();
         return Released::Suppressed;
@@ -2933,11 +2984,29 @@ where
     Released::Emitted
 }
 
-/// `true` when the `tf` bucket starting at `bucket_start` ended at or before
-/// `live_from`, the instant this process began capturing (0 = not set). O(1).
+/// `true` when the bucket starting at `bucket_start` STARTED at or before
+/// `live_from`, the instant this instrument was known to be captured (0 = not
+/// set): part of it may lie in a downtime nobody captured, so a PARTIAL bar
+/// for it is withheld in live mode. Until review round 19 this asked whether
+/// the bucket had ENDED by then, and the bucket the first live trade opened
+/// after a restart, which starts in the downtime and ends after it, was
+/// written with the downtime's trades and prices missing (60 shares and a
+/// 105/99 range written as 0 and one price). At a pre-market boot every
+/// bucket starts after the capture start, so nothing changes there. O(1).
 #[inline]
-fn ended_before_capture(tf: TfIndex, bucket_start: u32, live_from: u32) -> bool {
-    live_from != 0 && bucket_start.saturating_add(tf.seconds_per_bucket()) <= live_from
+fn started_before_capture(bucket_start: u32, live_from: u32) -> bool {
+    live_from != 0 && bucket_start <= live_from
+}
+
+/// `true` when this process began capturing (`live_from`, 0 = not set) after
+/// the candle session opened on the same IST day as `fold_secs`: a restart
+/// in the session, when trades may have happened while nobody listened.
+/// `false` for a pre-market boot and for a later day. O(1).
+#[inline]
+fn capture_is_mid_session(live_from: u32, fold_secs: u32) -> bool {
+    live_from != 0
+        && live_from / SECS_PER_DAY == fold_secs / SECS_PER_DAY
+        && live_from % SECS_PER_DAY > CANDLE_SESSION_OPEN_SECS_OF_DAY_IST
 }
 
 /// Sets or clears `bit` in `mask`. O(1).
@@ -3515,6 +3584,200 @@ mod tests {
         }
     }
 
+    /// The bar `restart_bars` wrote for `key`, as the fields a stored row
+    /// carries: volume, open, high, low, close, net, classified.
+    fn bar_row(
+        bars: &HashMap<(u64, TfIndex, u32), LiveCandleState>,
+        key: (u64, TfIndex, u32),
+    ) -> Option<(u64, f64, f64, f64, f64, i64, bool)> {
+        bars.get(&key).map(|b| {
+            (
+                b.volume,
+                b.open,
+                b.high,
+                b.low,
+                b.close,
+                b.net_volume_signed,
+                b.net_volume_classified,
+            )
+        })
+    }
+
+    /// Review round 19 (HIGH, reproduced by the reviewer, and the cases the
+    /// tightened randomized differential then found): after a restart, a
+    /// bucket that STARTED before the instrument was known to be captured was
+    /// written with the downtime's trades or prices missing. Each must now be
+    /// withheld or identical to an uninterrupted run; and a quiet instrument
+    /// that provably traded nothing in the downtime keeps its bars.
+    #[test]
+    fn test_regression_a_bucket_that_began_in_the_downtime_is_withheld() {
+        const STOCK: u64 = GAP_SID;
+        const INDEX: u64 = GAP_SID + 1;
+        const FRESH: u64 = GAP_SID + 2;
+        let exact_or_absent = |name: &str,
+                               pkts: &[RestartPkt],
+                               restart: (u32, u32, &[(u64, u32)]),
+                               key: (u64, TfIndex, u32)| {
+            let truth = bar_row(&restart_bars(pkts, None), key);
+            let written = bar_row(&restart_bars(pkts, Some(restart)), key);
+            assert!(truth.is_some(), "{name}: control writes the bar");
+            assert!(
+                written.is_none() || written == truth,
+                "{name}: wrote {written:?} against {truth:?}"
+            );
+        };
+        let index_every_5s = |from: u32, to: u32| -> Vec<RestartPkt> {
+            (from..=to)
+                .step_by(5)
+                .map(|s| (INDEX, s, 500.0 + (s % 7) as f32 * 0.05, 0, s))
+                .collect()
+        };
+
+        // 1. The reviewer's reproduction: the minute [900, 960) begins at the
+        //    crash; +902 (105) and +903 (99) are lost; the first live trade at
+        //    +911 opens the minute. It was written v0 with one price.
+        let mut p1: Vec<RestartPkt> = vec![
+            (STOCK, 600, 100.0, 10, 600),
+            (STOCK, 700, 100.1, 20, 700),
+            (STOCK, 760, 100.2, 30, 760),
+            (STOCK, 830, 100.2, 40, 830),
+            (STOCK, 850, 100.3, 45, 850),
+            (STOCK, 890, 100.2, 50, 890),
+            (STOCK, 902, 105.0, 60, 902),
+            (STOCK, 903, 99.0, 70, 903),
+            (STOCK, 911, 100.2, 80, 911),
+            (STOCK, 1_000, 100.4, 90, 1_000),
+        ];
+        p1.extend(index_every_5s(600, 1_100));
+        p1.sort_by_key(|p| p.4);
+        exact_or_absent(
+            "first live trade's minute began in the downtime",
+            &p1,
+            (900, 905, &[]),
+            (STOCK, TfIndex::M1, OPEN + 900),
+        );
+
+        // 2. An index minute still open at the crash: a downtime tick set its
+        //    low, and the first live tick lands in the same minute. It was
+        //    written with the replayed low.
+        let mut p2 = index_every_5s(60, 400);
+        for p in &mut p2 {
+            if p.1 == 130 {
+                p.2 = 400.0;
+            }
+        }
+        exact_or_absent(
+            "index minute missing a downtime low",
+            &p2,
+            (127, 140, &[]),
+            (INDEX, TfIndex::M1, OPEN + 120),
+        );
+
+        // 3. A minute a live tick opened with a trade time before the capture
+        //    start (delivered late): a trade lost in the downtime may belong
+        //    to it. The stock's first live packet ends the gap in an earlier
+        //    minute; the next one, stamped +905, opens [900, 960).
+        let mut p3: Vec<RestartPkt> = vec![
+            (STOCK, 800, 100.0, 10, 800),
+            (STOCK, 880, 100.1, 20, 880),
+            (STOCK, 903, 110.0, 30, 904),
+            (STOCK, 895, 100.2, 25, 912),
+            (STOCK, 905, 100.3, 35, 913),
+            (STOCK, 1_000, 100.4, 40, 1_000),
+        ];
+        p3.extend(index_every_5s(700, 1_100));
+        p3.sort_by_key(|p| p.4);
+        exact_or_absent(
+            "a late live trade's minute began before the capture start",
+            &p3,
+            (900, 910, &[]),
+            (STOCK, TfIndex::M1, OPEN + 900),
+        );
+
+        // 4. An instrument the replay never saw, on a socket that listened
+        //    only from +970, well after the capture start (+905): it traded at
+        //    +962 (lost) and first trades live at +975. Its minute [960, 1020)
+        //    began after the capture start but before its own first receipt,
+        //    and missed the +962 trade.
+        let mut p4: Vec<RestartPkt> =
+            vec![(FRESH, 962, 50.0, 10, 962), (FRESH, 975, 50.5, 15, 975)];
+        p4.push((FRESH, 1_050, 50.6, 20, 1_050));
+        p4.extend(index_every_5s(700, 1_100));
+        p4.sort_by_key(|p| p.4);
+        exact_or_absent(
+            "an instrument first seen live after a mid-session restart",
+            &p4,
+            (900, 905, &[(FRESH, 970)]),
+            (FRESH, TfIndex::M1, OPEN + 960),
+        );
+
+        // 5. A quiet stock: its last trade (+850) is re-sent live at +910
+        //    (Dhan re-sends it on every order-book change), so nothing traded
+        //    in the downtime. Its minute [840, 900), still open at the crash,
+        //    and the next one are exact, and the direction carries on.
+        let mut p5: Vec<RestartPkt> = vec![
+            (STOCK, 700, 100.0, 10, 700),
+            (STOCK, 820, 100.5, 20, 820),
+            (STOCK, 850, 100.5, 25, 850),
+            (STOCK, 850, 100.5, 25, 910),
+            (STOCK, 915, 100.5, 30, 915),
+            (STOCK, 1_000, 100.5, 35, 1_000),
+        ];
+        p5.extend(index_every_5s(700, 1_100));
+        p5.sort_by_key(|p| p.4);
+        let truth = restart_bars(&p5, None);
+        let written = restart_bars(&p5, Some((900, 905, &[])));
+        for start in [840, 900] {
+            let key = (STOCK, TfIndex::M1, OPEN + start);
+            let t = bar_row(&truth, key);
+            assert!(
+                t.is_some_and(|t| t.6),
+                "quiet stock +{start}: control is classified"
+            );
+            assert_eq!(
+                bar_row(&written, key),
+                t,
+                "quiet stock +{start}: nothing traded in the downtime, so the bar is kept"
+            );
+        }
+    }
+
+    /// Review round 19: an instrument first seen live is judged against its
+    /// own first receipt only after a MID-SESSION boot. After a pre-market
+    /// boot nothing can have been missed, and its first bars of the day are
+    /// written as before.
+    #[test]
+    fn test_a_pre_market_boot_still_writes_every_first_bar() {
+        let run = |capture_start: u32| {
+            let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+            agg.set_live_capture_start(capture_start);
+            agg.finish_replay(false, ignore_seal);
+            let mut minutes = Vec::new();
+            for (ts, cum) in [(OPEN + 5, 100), (OPEN + 30, 110), (OPEN + 65, 120)] {
+                let mut t = gtick(ts, cum);
+                t.received_at_nanos = receipt_at(ts);
+                agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, tf, st| {
+                    if tf == TfIndex::M1 {
+                        minutes.push(st.bucket_start_ist_secs);
+                    }
+                });
+            }
+            minutes
+        };
+        // 08:55 IST: before the 09:00 session open.
+        assert_eq!(
+            run(OPEN - 1_200),
+            vec![OPEN],
+            "pre-market boot: the first minute is written"
+        );
+        // 09:15:10: a restart in the session; the first minute began before
+        // this instrument was known to be captured.
+        assert!(
+            run(OPEN + 10).is_empty(),
+            "mid-session boot: the first minute is withheld"
+        );
+    }
+
     /// Review round 16, finding 1 (MEDIUM, reproduced): the app reads its
     /// clock for the capture start BEFORE the sockets are dialled, so the
     /// downtime really ends later. Here the hand-over says 09:20:55, before
@@ -3731,12 +3994,14 @@ mod tests {
                 );
             }
         }
-        // Still open at the capture start: kept and completed live, the same
-        // way in both orders.
+        // The half-hour that began at 09:30:00, two seconds before the capture
+        // start, opened by the first live tick: part of it lies in the
+        // downtime, so it is withheld, the same way in both orders (review
+        // round 19; until then it was written without the downtime's trades).
         for (name, out) in [("late", &late), ("on time", &on_time)] {
             assert!(
-                out.contains_key(&(GAP_SID, TfIndex::M30, OPEN + 900)),
-                "{name}: the half-hour open at the capture start is kept"
+                !out.contains_key(&(GAP_SID, TfIndex::M30, OPEN + 900)),
+                "{name}: the half-hour that began in the downtime is withheld"
             );
             // Ended while the previous process still captured: complete.
             assert!(
@@ -3792,10 +4057,19 @@ mod tests {
                     "ended_on_gap={ended_on_gap} {tf:?}: the bucket open at the hand-over \
                      is withheld"
                 );
+                // The first live tick ends the hand-over gap: its own delta is
+                // mixed with the downtime's, so the bucket it lands in, which
+                // starts by its receipt, is withheld too (review round 19).
+                let first_live = tf.bucket_start(OPEN + 120);
+                assert!(
+                    !emitted.contains(&(tf, first_live)),
+                    "ended_on_gap={ended_on_gap} {tf:?}: the first live tick's bucket \
+                     is withheld"
+                );
                 let mut t = OPEN + 120;
                 while t < OPEN + 120 + 3 * 3_600 {
                     let bucket = tf.bucket_start(t);
-                    if bucket > tainted {
+                    if bucket > tainted.max(first_live) {
                         assert!(
                             emitted.contains(&(tf, bucket)),
                             "ended_on_gap={ended_on_gap} {tf:?}: live bucket {bucket} \
@@ -3899,7 +4173,21 @@ mod tests {
                 }
             },
         );
-        assert_eq!(out, 1, "the first live minute seals normally in live mode");
+        // The first live minute holds the tick that ended the hand-over gap,
+        // whose own delta is mixed with the downtime's: withheld (review
+        // round 19). The next minute is live data and seals normally.
+        assert_eq!(out, 0, "the minute holding the first live tick is withheld");
+        agg.consume_tick(
+            Feed::Dhan,
+            &gtick(OPEN + 3_732, 2_030),
+            None,
+            |_, _, _, tf, _| {
+                if tf == TfIndex::M1 {
+                    out += 1;
+                }
+            },
+        );
+        assert_eq!(out, 1, "the next live minute seals normally in live mode");
     }
 
     /// Review round 2 (2026-09-29): a gap may have skipped late amendments to
