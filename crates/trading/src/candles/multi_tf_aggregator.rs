@@ -711,6 +711,52 @@ impl Default for MultiTfAggregator {
 /// range, and a day rollover drops the entire previous day's volume.
 const CUMULATIVE_RESTART_DROP_FLOOR: u64 = 1 << 31;
 
+/// How close to each end of the `u32` range the vendor's day-cumulative must
+/// be for a backwards step to read as a WRAP past `u32::MAX` (review round
+/// 24). 2^28 units (~268 million) is far more than one instrument trades
+/// between two packets we receive, and far less than the gap between a wrap
+/// and any other counter restart the fold has seen.
+const CUMULATIVE_WRAP_WINDOW: u64 = 1 << 28;
+
+/// One full turn of the vendor's `u32` day-cumulative counter.
+const CUMULATIVE_WRAP_SPAN: u64 = 1 << 32;
+
+/// Widens the vendor's `u32` day-cumulative to the monotonic `u64` axis the
+/// fold keeps in `last_cumulative`, whose bits above 32 count the wraps seen
+/// so far (review round 24). A step from the top of the range to the bottom
+/// is a wrap and counts forward exactly; a packet from before the latest wrap,
+/// delivered after it, lands below the stored value and is refused as stale.
+/// Until round 24 a wrap was treated as a counter restart: the wrapping
+/// trade's volume was dropped, a bucket open across it lost what traded
+/// after it (5 written against a true 7), and the next bucket of every
+/// timeframe forfeited its first trade (0 against 7).
+///
+/// Any other large drop keeps its old meaning, a counter restart, and is
+/// re-anchored by the caller. An unseeded slot takes the raw value. O(1).
+///
+/// **Honest limit:** a vendor counter reset from within 2^28 of `u32::MAX` to
+/// within 2^28 of zero cannot be told from a wrap and would count at most
+/// 2^29 units forward; no such reset has been observed.
+#[inline]
+fn unwrap_u32_cumulative(raw: u32, last: u64, seeded: bool) -> u64 {
+    let raw = u64::from(raw);
+    if !seeded {
+        return raw;
+    }
+    let turns = last & !(CUMULATIVE_WRAP_SPAN - 1);
+    let last_low = last & (CUMULATIVE_WRAP_SPAN - 1);
+    let top = CUMULATIVE_WRAP_SPAN - CUMULATIVE_WRAP_WINDOW;
+    if last_low >= top && raw < CUMULATIVE_WRAP_WINDOW {
+        turns
+            .saturating_add(CUMULATIVE_WRAP_SPAN)
+            .saturating_add(raw)
+    } else if turns != 0 && last_low < CUMULATIVE_WRAP_WINDOW && raw >= top {
+        turns - CUMULATIVE_WRAP_SPAN + raw
+    } else {
+        turns.saturating_add(raw)
+    }
+}
+
 #[inline]
 #[must_use]
 fn classify_tick_volume(prev: f64, price: f64, delta: u64, carry: &mut i8) -> Option<i64> {
@@ -1773,8 +1819,13 @@ impl MultiTfAggregator {
         {
             slot.handover_first_receipt_secs = receipt;
         }
-        let cumulative_volume =
-            cumulative_volume_override.unwrap_or_else(|| u64::from(tick.volume));
+        let cumulative_volume = cumulative_volume_override.unwrap_or_else(|| {
+            unwrap_u32_cumulative(
+                tick.volume,
+                slot.last_cumulative,
+                slot.volume_baseline_seeded,
+            )
+        });
 
         // SEED, do not assume zero. A slot allocated mid-session has never
         // seen this instrument, so the volume it traded before we arrived is
@@ -1851,11 +1902,15 @@ impl MultiTfAggregator {
         // seen. Its first buckets are partial (the seeding tick's delta is
         // unknown) and those that started by then are withheld. A pre-market
         // boot has nothing to miss, so every first bar of the day is still
-        // written. One compare on a seeding tick only.
+        // written. A boot just before the open counts as mid-session, but a
+        // first receipt at or before 09:00:00 missed nothing: nothing trades
+        // or moves before the session opens (review round 24). A few compares
+        // on a seeding tick only.
         if seeded_now
             && !replay_mode
             && capture_is_mid_session(live_from, fold_secs)
             && let Some(receipt) = receipt_ist_secs(tick.received_at_nanos)
+            && receipt % SECS_PER_DAY > CANDLE_SESSION_OPEN_SECS_OF_DAY_IST
         {
             slot.handover_listen_secs = slot.handover_listen_secs.max(receipt);
             // The seeding packet may be a stale copy too: the next trade's
@@ -2545,44 +2600,6 @@ impl MultiTfAggregator {
         for slot in &mut self.slots {
             slot.sync_replay_gap(gap_epoch);
             let (feed, sid, seg) = slot.key;
-            // DAY-BOUNDARY RESET — required by the monotonic baseline in
-            // `consume_tick`, and wrong to omit. The vendor's cumulative
-            // volume restarts at ~0 each session; without this the
-            // advance-only rule would read tomorrow's honest small cumulative
-            // as a regression, refuse it all day, and publish every bar at
-            // volume 0. This is the ONE place a regression is legitimate, so
-            // it is the one place the baseline drops — and it drops to
-            // UNSEEDED, not to a fabricated `0` baseline.
-            slot.last_cumulative = 0;
-            slot.volume_baseline_seeded = false;
-            // Nothing carries across the day boundary, so neither does a
-            // late tick's mark on the next bucket (review round 7), nor a
-            // hand-over still waiting for this instrument's first live trade:
-            // left set, a quiet instrument's first receipt the NEXT day would
-            // become its capture start and withhold its first bars (review
-            // round 20).
-            slot.replay_next_partial = 0;
-            slot.handover_listen_pending = false;
-            slot.handover_listen_secs = 0;
-            slot.prev_price_untrusted = false;
-            slot.handover_first_receipt_secs = 0;
-            // The tick-rule carry resets with the baseline, and for the same
-            // reason: a direction learned from yesterday's last print is not
-            // evidence about today's first. Carrying it across would attribute
-            // the whole of the new session's opening zero-tick volume to
-            // whichever side happened to move the price at yesterday's close.
-            //
-            // `last_ltp` is deliberately LEFT ALONE — it is a published
-            // accessor (`MultiTfAggregator::last_ltp`) whose contract is "the
-            // last accepted price", and blanking it here would make that
-            // reader answer `None` after a force-seal. The carry reset is
-            // enough: with `last_tick_sign` at 0, the first zero tick of the
-            // new day is refused as unclassified rather than mis-signed.
-            slot.last_tick_sign = 0;
-            // The repeat-quote test already stands down while the baseline is
-            // unseeded; clearing the trade time too means a stale value can
-            // never be what makes a new day's first packet read as a repeat.
-            slot.last_trade_ts = 0;
             for tf in TfIndex::ALL {
                 // With no bucket open, `force_seal` can still return the LAST
                 // SEALED bar amended with a settled carry; that bar is judged
@@ -2621,6 +2638,54 @@ impl MultiTfAggregator {
                     }
                 }
             }
+            // The resets below run AFTER every bar above was judged (review
+            // round 24). They used to run first, and the judgement then read a
+            // cleared slot: `capture_from` fell back to the process-wide
+            // capture start, so a bucket opened by an instrument's own first
+            // live trade was written with the downtime's volume missing (10
+            // bars at volume 0 against a true 20); and with
+            // `handover_listen_pending` already cleared, `hold_unconfirmed_kept`
+            // never withheld a kept bucket the downtime may have touched (an
+            // hour written at 40 against a true 80).
+            //
+            // DAY-BOUNDARY RESET — required by the monotonic baseline in
+            // `consume_tick`, and wrong to omit. The vendor's cumulative
+            // volume restarts at ~0 each session; without this the
+            // advance-only rule would read tomorrow's honest small cumulative
+            // as a regression, refuse it all day, and publish every bar at
+            // volume 0. This is the ONE place a regression is legitimate, so
+            // it is the one place the baseline drops — and it drops to
+            // UNSEEDED, not to a fabricated `0` baseline.
+            slot.last_cumulative = 0;
+            slot.volume_baseline_seeded = false;
+            // Nothing carries across the day boundary, so neither does a
+            // late tick's mark on the next bucket (review round 7), nor a
+            // hand-over still waiting for this instrument's first live trade:
+            // left set, a quiet instrument's first receipt the NEXT day would
+            // become its capture start and withhold its first bars (review
+            // round 20).
+            slot.replay_next_partial = 0;
+            slot.handover_listen_pending = false;
+            slot.handover_listen_secs = 0;
+            slot.prev_price_untrusted = false;
+            slot.handover_first_receipt_secs = 0;
+            // The tick-rule carry resets with the baseline, and for the same
+            // reason: a direction learned from yesterday's last print is not
+            // evidence about today's first. Carrying it across would attribute
+            // the whole of the new session's opening zero-tick volume to
+            // whichever side happened to move the price at yesterday's close.
+            //
+            // `last_ltp` is deliberately LEFT ALONE — it is a published
+            // accessor (`MultiTfAggregator::last_ltp`) whose contract is "the
+            // last accepted price", and blanking it here would make that
+            // reader answer `None` after a force-seal. The carry reset is
+            // enough: with `last_tick_sign` at 0, the first zero tick of the
+            // new day is refused as unclassified rather than mis-signed.
+            slot.last_tick_sign = 0;
+            // The repeat-quote test already stands down while the baseline is
+            // unseeded; clearing the trade time too means a stale value can
+            // never be what makes a new day's first packet read as a repeat.
+            slot.last_trade_ts = 0;
             // MERGE RESOLUTION 2026-08-25 — both branches found this same
             // day-boundary defect and reset the baseline; main's version is
             // kept and this branch's duplicate assignment is removed.
@@ -3297,7 +3362,10 @@ where
 /// it, was written with the downtime's trades and prices missing (60 shares
 /// and a 105/99 range written as 0 and one price). A capture that began by
 /// the 09:00 candle session open missed nothing, so a boot at 09:00:00 or
-/// before withholds nothing (review round 20). Round 20 briefly used 09:07
+/// before withholds nothing (review round 20). (Review round 24: that holds for
+/// a capture confirmed by 09:00; a boot less than five minutes before the
+/// open takes each instrument's first receipt as its capture start, see
+/// `capture_is_mid_session`.) Round 20 briefly used 09:07
 /// for equity and F&O, the pre-open match; round 21 withdrew it, because
 /// pre-open packets carrying prices but no volume do reach the fold from
 /// 09:00, and a boot at 09:05 would then write a first bar without them.
@@ -3309,16 +3377,34 @@ fn started_before_capture(bucket_start: u32, captured_from: u32) -> bool {
         && bucket_start <= captured_from
 }
 
-/// `true` when this process began capturing (`live_from`, 0 = not set) after
-/// the 09:00 candle session open on the same IST day as `fold_secs`: a
-/// restart when packets may have arrived while nobody listened. `false` for
-/// a boot at or before 09:00:00 and for a later day. O(1).
+/// `true` when this process may have begun LISTENING after the 09:00 candle
+/// session open on the same IST day as `fold_secs`: a restart when packets
+/// may have arrived while nobody listened. `live_from` (0 = not set) is read
+/// before the sockets are dialled, so a boot less than
+/// [`PRE_OPEN_DIAL_WINDOW_SECS`] before 09:00 counts too: its sockets may
+/// still be dialling at the open (review round 24: a boot at 08:59:58 whose
+/// first packet came at 09:00:40 wrote the 09:00 minute with one price
+/// against a true 1000/1010/995 range). `false` for an earlier boot, such as
+/// the scheduled 08:30 start, and for a later day. O(1).
 #[inline]
 fn capture_is_mid_session(live_from: u32, fold_secs: u32) -> bool {
     live_from != 0
         && live_from / SECS_PER_DAY == fold_secs / SECS_PER_DAY
-        && live_from % SECS_PER_DAY > CANDLE_SESSION_OPEN_SECS_OF_DAY_IST
+        && live_from % SECS_PER_DAY
+            > CANDLE_SESSION_OPEN_SECS_OF_DAY_IST.saturating_sub(PRE_OPEN_DIAL_WINDOW_SECS)
 }
+
+/// How long before the 09:00 candle session open a boot may still be
+/// dialling its sockets when the session opens (review round 24). A boot this
+/// close to the open takes each instrument's first receipt after 09:00 as its
+/// capture start, exactly as a mid-session boot does. Five minutes covers a
+/// dial with its retries; the scheduled 08:30 start and its 08:45 backup are
+/// well outside it, so a normal morning withholds nothing.
+///
+/// **Honest limit:** a boot earlier than this whose sockets still had not
+/// connected by 09:00 is not detected; that is a feed outage, the same as a
+/// socket that drops mid-session with no restart.
+const PRE_OPEN_DIAL_WINDOW_SECS: u32 = 300;
 
 /// Sets or clears `bit` in `mask`. O(1).
 #[inline]
@@ -3772,6 +3858,17 @@ mod tests {
         pkts: &[RestartPkt],
         restart: Option<(u32, u32, &[(u64, u32)])>,
     ) -> HashMap<(u64, TfIndex, u32), LiveCandleState> {
+        restart_bars_until(pkts, restart, false)
+    }
+
+    /// [`restart_bars`], ending with the day-close seal (`force_seal_all`)
+    /// when `day_close` is set, instead of a final catch-up sweep (review
+    /// round 24: the differential never reached the day-close seal).
+    fn restart_bars_until(
+        pkts: &[RestartPkt],
+        restart: Option<(u32, u32, &[(u64, u32)])>,
+        day_close: bool,
+    ) -> HashMap<(u64, TfIndex, u32), LiveCandleState> {
         let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
         let mut bars = HashMap::new();
         let packet = |&(sid, ts, px, cum, recv): &RestartPkt| {
@@ -3809,10 +3906,221 @@ mod tests {
                 bars.insert((id, tf, st.bucket_start_ist_secs), st);
             });
         }
-        agg.catch_up_seal_all(OPEN + 100_000, |_, id, _, tf, st| {
+        let mut record = |_: Feed, id: u64, _: u8, tf: TfIndex, st: LiveCandleState| {
             bars.insert((id, tf, st.bucket_start_ist_secs), st);
-        });
+        };
+        if day_close {
+            agg.force_seal_all(&mut record);
+        } else {
+            agg.catch_up_seal_all(OPEN + 100_000, &mut record);
+        }
         bars
+    }
+
+    /// Every bar `written` for `sid` equals the uninterrupted run's bar for the
+    /// same bucket; a withheld bar is fine. Returns how many were compared.
+    fn assert_written_bars_exact(
+        name: &str,
+        sid: u64,
+        truth: &HashMap<(u64, TfIndex, u32), LiveCandleState>,
+        written: &HashMap<(u64, TfIndex, u32), LiveCandleState>,
+    ) -> usize {
+        let mut compared = 0;
+        for (key, w) in written.iter().filter(|(k, _)| k.0 == sid) {
+            let t = truth
+                .get(key)
+                .map(|b| (b.volume, b.open, b.high, b.low, b.close));
+            assert_eq!(
+                Some((w.volume, w.open, w.high, w.low, w.close)),
+                t,
+                "{name}: {key:?} written differs from the uninterrupted run"
+            );
+            compared += 1;
+        }
+        compared
+    }
+
+    /// Review round 24, F1 (HIGH): the day-close seal cleared each
+    /// instrument's own capture start BEFORE judging its open bars. An
+    /// instrument whose hand-over gap ended on its only later trade (15:37)
+    /// had every timeframe's bar written at volume 0 against a true 20.
+    #[test]
+    fn test_regression_day_close_keeps_each_instruments_capture_start() {
+        const SID: u64 = GAP_SID;
+        let pkts: &[RestartPkt] = &[
+            (SID, 2_600, 1000.0, 100, 2_600),
+            (SID, 2_640, 1001.0, 110, 2_640),
+            // The subscribe re-send repeats the last replayed trade: the
+            // instrument's hand-over gap stays open.
+            (SID, 2_640, 1001.0, 110, 2_705),
+            // Its next and only trade ends the gap; nothing trades after it
+            // before the close.
+            (SID, 22_320, 1002.0, 130, 22_320),
+        ];
+        let truth = restart_bars_until(pkts, None, true);
+        let written = restart_bars_until(pkts, Some((2_650, 2_703, &[])), true);
+        assert!(
+            TfIndex::ALL.iter().all(|tf| truth.contains_key(&(
+                SID,
+                *tf,
+                tf.bucket_start(OPEN + 22_320)
+            ))),
+            "the uninterrupted run writes the 15:37 trade's bar in every timeframe"
+        );
+        for tf in TfIndex::ALL {
+            let key = (SID, tf, tf.bucket_start(OPEN + 22_320));
+            assert!(
+                !written.contains_key(&key),
+                "{tf:?}: the bar the gap-ending trade opened is withheld at the close"
+            );
+        }
+        assert_written_bars_exact("F1", SID, &truth, &written);
+    }
+
+    /// Review round 24, F2 (MEDIUM): the day-close seal cleared the hand-over
+    /// wait before `hold_unconfirmed_kept` read it. An instrument that got no
+    /// live packet after a crash at 15:20 had its hour written at volume 40
+    /// and high 1001 against a true 80 and 1009 (a downtime trade at 15:21).
+    #[test]
+    fn test_regression_day_close_withholds_an_unconfirmed_kept_bucket() {
+        const SID: u64 = GAP_SID;
+        const OTHER: u64 = GAP_SID + 7;
+        let mut pkts: Vec<RestartPkt> = vec![
+            (SID, 21_000, 1000.0, 70, 21_000),
+            (SID, 21_840, 1001.0, 110, 21_840),
+            // Traded in the downtime: seen only by the uninterrupted run.
+            (SID, 21_960, 1009.0, 150, 21_960),
+        ];
+        // Another instrument keeps the sweep moving after the hand-over.
+        for (i, off) in (21_000_u32..22_500).step_by(60).enumerate() {
+            let cum = 1_000 + u32::try_from(i).unwrap_or(0) * 10;
+            pkts.push((OTHER, off, 500.0 + (i % 3) as f32, cum, off));
+        }
+        pkts.sort_by_key(|p| p.4);
+        let truth = restart_bars_until(&pkts, None, true);
+        let written = restart_bars_until(&pkts, Some((21_900, 22_020, &[])), true);
+        let hour = (SID, TfIndex::M60, TfIndex::M60.bucket_start(OPEN + 21_000));
+        assert_eq!(truth.get(&hour).map(|b| b.volume), Some(80));
+        assert!(
+            !written.contains_key(&hour),
+            "the hour the downtime touched is withheld, not written at 40"
+        );
+        assert_written_bars_exact("F2", SID, &truth, &written);
+        assert!(assert_written_bars_exact("F2 other", OTHER, &truth, &written) > 0);
+    }
+
+    /// Review round 24, F3 (MEDIUM): a boot just before 09:00 with an empty
+    /// WAL never confirmed its capture start, and the 09:00 minute was written
+    /// with one price against a true 1000/1010/995 range. A first receipt at
+    /// 09:00:00 exactly missed nothing, so its bars are still written.
+    #[test]
+    fn test_regression_boot_just_before_the_open_withholds_what_it_missed() {
+        let open = CANDLE_OPEN;
+        let run = |boot: u32, first: u32| {
+            let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+            agg.set_live_capture_start(boot);
+            agg.finish_replay(false, ignore_seal);
+            let mut bars = HashMap::new();
+            for (ts, px) in [
+                (first, 1005.0_f32),
+                (open + 50, 1006.0),
+                (open + 70, 1007.0),
+            ] {
+                let mut t = tick(13, SEG_IDX, ts, px, 0);
+                t.received_at_nanos = receipt_at(ts);
+                agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, tf, st| {
+                    bars.insert((tf, st.bucket_start_ist_secs), st);
+                });
+            }
+            agg.catch_up_seal_all(open + 100_000, |_, _, _, tf, st| {
+                bars.insert((tf, st.bucket_start_ist_secs), st);
+            });
+            bars.contains_key(&(TfIndex::M1, open))
+        };
+        // 08:59:58 boot, first packet at 09:00:40: withheld.
+        assert!(
+            !run(open - 2, open + 40),
+            "the 09:00 minute missed 40 s of prices"
+        );
+        // Same boot, first packet at 09:00:00: nothing was missed.
+        assert!(
+            run(open - 2, open),
+            "a first receipt at the open misses nothing"
+        );
+        // The scheduled 08:30 boot: listening long before the open.
+        assert!(
+            run(open - 1_800, open + 40),
+            "an 08:30 boot withholds nothing"
+        );
+    }
+
+    /// Review round 24, F4 (LOW): a wrap of the vendor's `u32` cumulative
+    /// past `u32::MAX` was treated as a counter restart. The minute holding
+    /// it was written at 5 against a true 16, and the next at 0 against 7.
+    /// Now it counts forward exactly, and a packet from before the wrap,
+    /// delivered after it, is refused as stale.
+    #[test]
+    fn test_regression_a_u32_wrap_counts_forward_exactly() {
+        let max = u32::MAX;
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let mut minutes: HashMap<u32, u64> = HashMap::new();
+        let steps: [(u32, u32, f32); 7] = [
+            (OPEN, max - 10, 100.0),
+            (OPEN + 10, max - 5, 101.0),
+            (OPEN + 20, 3, 102.0),
+            // Stale: from before the wrap, delivered after it.
+            (OPEN + 25, max - 7, 99.0),
+            (OPEN + 30, 5, 103.0),
+            (OPEN + 65, 12, 104.0),
+            (OPEN + 125, 20, 105.0),
+        ];
+        for (ts, cum, px) in steps {
+            agg.consume_tick(
+                Feed::Dhan,
+                &tick(13, SEG_EQ, ts, px, cum),
+                None,
+                |_, _, _, tf, st| {
+                    if tf == TfIndex::M1 {
+                        minutes.insert(st.bucket_start_ist_secs, st.volume);
+                    }
+                },
+            );
+        }
+        agg.catch_up_seal_all(OPEN + 100_000, |_, _, _, tf, st| {
+            if tf == TfIndex::M1 {
+                minutes.insert(st.bucket_start_ist_secs, st.volume);
+            }
+        });
+        // max-10 seeds; +5, +9 across the wrap, +2.
+        assert_eq!(minutes.get(&OPEN), Some(&16));
+        assert_eq!(minutes.get(&(OPEN + 60)), Some(&7));
+        assert_eq!(minutes.get(&(OPEN + 120)), Some(&8));
+    }
+
+    /// The `u32` cumulative widening itself (review round 24). O(1) cases.
+    #[test]
+    fn test_unwrap_u32_cumulative_cases() {
+        let span = CUMULATIVE_WRAP_SPAN;
+        let max = u32::MAX;
+        // Unseeded: the raw value.
+        assert_eq!(unwrap_u32_cumulative(max, 0, false), u64::from(max));
+        // An ordinary step forward, and a stale one back.
+        assert_eq!(unwrap_u32_cumulative(150, 100, true), 150);
+        assert_eq!(unwrap_u32_cumulative(90, 100, true), 90);
+        // A wrap counts forward.
+        assert_eq!(unwrap_u32_cumulative(3, u64::from(max - 5), true), span + 3);
+        // A packet from before the latest wrap lands below the stored value.
+        assert_eq!(
+            unwrap_u32_cumulative(max - 7, span + 3, true),
+            u64::from(max - 7)
+        );
+        // After a wrap, ordinary steps keep the turn.
+        assert_eq!(unwrap_u32_cumulative(10, span + 3, true), span + 10);
+        // A drop from well below the top is a counter RESTART, left to the
+        // caller: not a wrap.
+        assert_eq!(unwrap_u32_cumulative(100, 4_000_000_000, true), 100);
+        // A value near the top with no turn yet is an ordinary step.
+        assert_eq!(unwrap_u32_cumulative(max, 5, true), u64::from(max));
     }
 
     /// Review round 18, all three defects (reproduced by a randomized restart
@@ -4332,10 +4640,17 @@ mod tests {
             first_bars.len()
         };
         let all = TF_COUNT;
-        // 08:55 IST, before the 09:00 session open.
+        // 08:55 IST: five minutes before the 09:00 session open, so its
+        // sockets were listening by then.
         assert_eq!(run(OPEN - 1_200, false, None), all, "pre-market boot");
-        // Exactly 09:00:00: nothing could have arrived yet (review round 20).
-        assert_eq!(run(OPEN - 900, false, None), all, "boot at 09:00:00");
+        // Review round 24: the capture start is read BEFORE the sockets are
+        // dialled, so a boot less than five minutes before the open, or at
+        // 09:00:00 exactly, may still be dialling when pre-open packets start
+        // at 09:00 (round 20 read "09:00:00" as "nothing could have arrived
+        // yet"). This instrument's first receipt, 09:15:05, is its capture
+        // start, exactly as after the replay confirmed at 09:00:02 below.
+        assert_eq!(run(OPEN - 1_199, false, None), 0, "boot at 08:55:01");
+        assert_eq!(run(OPEN - 900, false, None), 0, "boot at 09:00:00");
         // After 09:00, pre-open packets carrying prices but no volume may have
         // arrived while nobody listened, so a first bar that began before the
         // instrument was known to be captured is withheld, not written without
@@ -6136,7 +6451,8 @@ mod tests {
     fn test_counter_restart_after_a_gap_sets_the_gap_frontier() {
         let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
         agg.set_replay_mode(true);
-        let high = u32::MAX - 10;
+        // A counter RESTART (not a wrap: review round 24 counts a wrap forward).
+        let high = 4_000_000_000_u32;
         // The seeding tick's own frontier expires an hour later.
         for (ts, cum) in [(OPEN + 5, high - 10), (OPEN + 3_700, high)] {
             agg.consume_tick(Feed::Dhan, &gtick(ts, cum), None, ignore_seal);
