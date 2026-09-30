@@ -1,5 +1,5 @@
 //! Randomized restart differential for the candle fold (plan ITEM 47,
-//! review rounds 18 to 20).
+//! review rounds 18 to 21).
 //!
 //! One market is folded twice. The TRUTH run folds every packet live, as a
 //! process that never stopped would. The RESTART run is what production does
@@ -16,7 +16,8 @@
 //! previous process stored (a third run, live up to the crash):
 //!
 //! 1. no bar ever carries MORE volume than the truth (a double count);
-//! 2. a bucket the previous process stored is written identical to the truth,
+//! 2. a bucket the previous process stored is written identical to the truth
+//!    or to the stored row itself,
 //!    net volume included, or not written;
 //! 3. any other bar that is written equals the truth in volume and OHLC, and
 //!    a bar that classifies its net volume carries the truth's (an
@@ -27,6 +28,13 @@
 //!    replayed trade nor stale), or holds its first trade that added volume
 //!    after that packet, which may have been a stale copy.
 //!
+//! Beyond the envelope, a bucket holding a trade delivered more than the
+//! catch-up margin (240 s) late and received after the crash is checked by 1
+//! only: even the uninterrupted process takes such a trade as a late
+//! amendment, and a restart that lost it in the downtime cannot know of it.
+//! The generator does produce such lags (review round 21 needed them), and
+//! production's measured maximum is 199 s.
+//!
 //! No bar is exempt from 3. Until review round 19 the bar holding the first
 //! live trade was, and that hid a real defect: a bucket that began in the
 //! downtime was written without the downtime's trades and prices. A withheld
@@ -34,7 +42,7 @@
 //! would overwrite a stored row or publish a wrong one, which is what this
 //! file exists to catch.
 //!
-//! 256 cases per run. Measured on the round-20 fix: 20,000 cases with zero
+//! 256 cases per run. Measured on the round-21 fix: 20,000 cases with zero
 //! failures, in about 56 s in a release build. The round-18 aggregator failed
 //! these checks 32,761 times over 20,000 cases; the round-19 one fails in
 //! under a second once stale re-sends are generated.
@@ -58,6 +66,8 @@ const MARGIN: u32 = 240;
 const EARLY_CAPTURE: u32 = DAY + 32_000;
 /// IST minus UTC, in milliseconds.
 const IST_OFFSET_MS: i64 = 19_800_000;
+/// The fold's clock-skew allowance (`REPLAY_FRONTIER_SKEW_SECS`).
+const SKEW_SECS: u64 = 5;
 /// Out of 100: a replayed WAL frame below this is unreadable.
 const UNREADABLE_PERCENT: u8 = 4;
 
@@ -90,7 +100,7 @@ fn event() -> impl Strategy<Value = Event> {
         1u8..=20,
         0u16..=40,
         -3i8..=3,
-        prop_oneof![30 => 0u32..=10_000, 1 => 10_001u32..=200_000],
+        prop_oneof![30 => 0u32..=10_000, 1 => 10_001u32..=200_000, 1 => 240_001u32..=400_000],
         prop_oneof![9 => Just(None), 1 => (0u16..=3_000).prop_map(Some)],
         prop_oneof![9 => Just(true), 1 => Just(false)],
     )
@@ -411,7 +421,16 @@ fn check(c: &Case) -> Result<(), TestCaseError> {
             }
         } else if !repeats_or_stale {
             gap_ended.entry(p.instrument).or_insert(*received);
-            gap_cum.insert(p.instrument, p.cumulative);
+            // A gap packet that traded after the instrument's first live
+            // receipt cannot be a stale copy (review round 21); a seeding
+            // packet of an instrument the replay never saw always may be.
+            let first_receipt_secs =
+                first_live.get(&p.instrument).map_or(*received, |f| f.1) / 1000;
+            let trusted = last_replayed.contains_key(&p.instrument)
+                && u64::from(p.trade) > first_receipt_secs + SKEW_SECS;
+            if !trusted {
+                gap_cum.insert(p.instrument, p.cumulative);
+            }
         }
         first_live
             .entry(p.instrument)
@@ -472,6 +491,21 @@ fn check(c: &Case) -> Result<(), TestCaseError> {
                         "over-count ({max}): {context}"
                     );
                 }
+                // Beyond the envelope: a trade delivered more than the catch-up
+                // margin late, after the crash. Even the uninterrupted process
+                // takes it as a late amendment, and a restart that lost it in
+                // the downtime cannot know of it; only 1 is checked for such a
+                // bucket (production's measured maximum lag is 199 s).
+                let beyond_margin = all.iter().any(|p| {
+                    p.instrument == i
+                        && p.trade >= start
+                        && p.trade < end
+                        && p.received_ms > crash_ms
+                        && p.received_ms > (u64::from(p.trade) + u64::from(MARGIN)) * 1000
+                });
+                if beyond_margin {
+                    continue;
+                }
                 let Some(r) = r else {
                     // 4. Missing after the crash: only a bucket that started
                     // before the instrument was known to be captured.
@@ -486,10 +520,13 @@ fn check(c: &Case) -> Result<(), TestCaseError> {
                     }
                     continue;
                 };
-                if stored.last.contains_key(&key) {
-                    // 2. Stored by the previous process: identical or absent.
+                if let Some(s) = stored.last.get(&key) {
+                    // 2. Stored by the previous process: identical to the truth,
+                    // or to the row already stored (rewriting a row with its own
+                    // content changes nothing: a late trade lost in the downtime
+                    // is missing from both), or absent.
                     prop_assert!(
-                        t.is_some_and(|t| same(r, t, true)),
+                        t.is_some_and(|t| same(r, t, true)) || same(r, s, true),
                         "a stored bucket was rewritten differently: {context}"
                     );
                 } else {
