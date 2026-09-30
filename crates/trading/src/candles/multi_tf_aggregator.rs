@@ -1663,6 +1663,17 @@ impl MultiTfAggregator {
         // never received, and the fold below is what attributes it. Rare, and
         // folding it costs one tick of `tick_count` — the safe direction.
         if repeat_candidate && extremes.is_empty() {
+            // A repeat of the last COUNTED trade resolves a pending gap
+            // exactly (plan ITEM 47, review round 13): it carries the same
+            // cumulative, so nothing traded between that trade and this
+            // packet, and the gap has nothing to discard. Left pending, the
+            // gap discarded the NEXT real trade's delta instead — after a
+            // restart, where Dhan re-sends the last trade on every order-book
+            // change, the first live trade of the instrument lost its volume.
+            // The gap tick's other duties (re-base, net marked unknown,
+            // settling) all guard trades a skipped span might hold; there are
+            // none. O(1).
+            slot.replay_gap_rebase_pending = false;
             let mut refreshed_open: u16 = 0;
             for tf in TfIndex::ALL {
                 // `false` means the bucket this trade belongs to has already
@@ -3007,6 +3018,60 @@ mod tests {
                 .any(|(tf, start, _)| *tf == TfIndex::M1 && *start == t0),
             "the minute open across the gap is still suppressed: {out:?}"
         );
+    }
+
+    /// Plan ITEM 47, review round 13 (found by the mixed-stream restart
+    /// property): after a gap, Dhan's first packet is often a RE-SEND of the
+    /// last counted trade (it re-sends on every order-book change). The
+    /// repeat path returned early and left the gap pending, so the next real
+    /// trade's delta was discarded as the gap tick's: after a restart the
+    /// first live trade of the instrument lost its volume (0 instead of 10
+    /// here). The re-send carries the same cumulative, which proves nothing
+    /// traded in between, so it resolves the gap itself.
+    #[test]
+    fn test_regression_a_resent_trade_resolves_the_gap_without_losing_the_next_trade() {
+        // `mode`: 0 continuous live, 1 restart (gap at the hand-over),
+        // 2 a gap inside the replay itself.
+        let run = |mode: u8| {
+            let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+            if mode != 0 {
+                agg.set_replay_mode(true);
+            }
+            for (ts, cum) in [(OPEN + 60, 1_000), (OPEN + 61, 1_050)] {
+                agg.consume_tick(Feed::Dhan, &gtick(ts, cum), None, ignore_seal);
+            }
+            match mode {
+                1 => {
+                    agg.set_live_capture_start(OPEN + 100);
+                    agg.finish_replay(false, ignore_seal);
+                }
+                2 => agg.mark_replay_gap(),
+                _ => {}
+            }
+            // The re-send (open interest moved), then a real trade.
+            let mut resent = gtick(OPEN + 61, 1_050);
+            resent.open_interest = 7;
+            let stats = agg.consume_tick(Feed::Dhan, &resent, None, ignore_seal);
+            assert!(
+                stats.repeat_quote,
+                "mode {mode}: the re-send is a repeat quote"
+            );
+            let mut minute = None;
+            agg.consume_tick(Feed::Dhan, &gtick(OPEN + 185, 1_060), None, ignore_seal);
+            if mode == 2 {
+                agg.finish_replay(false, ignore_seal);
+            }
+            agg.catch_up_seal_all(OPEN + 100_000, |_, _, _, tf, st| {
+                if tf == TfIndex::M1 && st.bucket_start_ist_secs == OPEN + 180 {
+                    minute = Some((st.volume, st.net_volume_classified));
+                }
+            });
+            minute
+        };
+        let continuous = run(0);
+        assert_eq!(continuous.map(|m| m.0), Some(10), "control");
+        assert_eq!(run(1), continuous, "after a restart");
+        assert_eq!(run(2), continuous, "after a gap inside the replay");
     }
 
     /// Plan ITEM 47, review round 12 (MEDIUM, reproduced by the reviewer): a
