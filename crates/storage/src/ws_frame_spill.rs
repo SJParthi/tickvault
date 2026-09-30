@@ -339,6 +339,17 @@ pub struct ReplayedFrame {
     /// field — which is exactly what every earlier replay assumed, so a legacy
     /// segment behaves precisely as it did before.
     pub endpoint: WalEndpoint,
+    /// `true` when frames captured before this one were NOT replayed (plan
+    /// ITEM 47): the first frame of a pass, the first after a segment the
+    /// applied watermark skipped or a segment that could not be fully read,
+    /// and the first after frames dropped as already applied. A consumer that
+    /// derives running state from consecutive frames (the candle fold's volume
+    /// baseline) must not carry it across this point.
+    pub after_gap: bool,
+    /// Plan ITEM 47: `true` for the first frame returned from each WAL
+    /// segment. A reader compares receipt times only across a segment
+    /// boundary ([`process_boundary_is_gap`]).
+    pub first_in_segment: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -2868,6 +2879,46 @@ pub const fn wal_replay_disk_floor_bytes(total_bytes: u64) -> u64 {
 /// and counted rather than materialised until something dies.
 pub const WAL_REPLAY_MAX_FRAMES_PER_BOOT: u64 = 3_000_000;
 
+/// A receipt-time jump larger than this between the last candle-bearing
+/// frame of one WAL segment and the first of a later one is a PROCESS
+/// BOUNDARY gap (plan ITEM 47): one run of the lane ended and the next began.
+/// The new process started its candle fold afresh, so a replay that carried
+/// its volume baseline across the boundary would give the new process's
+/// first tick the whole downtime's volume. Nothing is dropped at such a
+/// boundary, which is why it needs its own test.
+///
+/// Checked ONLY across segment boundaries, and on RECEIPT time: every process
+/// opens a new segment, while a silence inside one segment is harmless (the
+/// live process folded exactly those frames). A restart takes far longer than
+/// five seconds (auth, database, universe, socket dial), while a segment the
+/// writer rotates for size is written back to back. Frame sequences are not
+/// used: they advance by one when frames outrun the clock and carry on from
+/// the disk's highest sequence across a restart, so they understate
+/// downtime (review, 2026-09-29).
+pub const WAL_REPLAY_PROCESS_GAP_NANOS: i64 = 5_000_000_000;
+
+/// `true` when a frame can carry ticks into the candle fold: a live-feed
+/// frame from the MAIN-FEED socket. Depth and order-update frames, and
+/// TrueData frames (which share the main-feed endpoint byte), carry none, so
+/// skipping one is never a gap (plan ITEM 47). O(1).
+#[must_use]
+pub fn frame_feeds_the_candle_fold(ws_type: WsType, endpoint: WalEndpoint) -> bool {
+    ws_type == WsType::LiveFeed && matches!(endpoint, WalEndpoint::MainFeed)
+}
+
+/// `true` when the receipt time moved forward by more than
+/// [`WAL_REPLAY_PROCESS_GAP_NANOS`] between two candle-bearing frames that a
+/// segment boundary separates. A receipt the WAL does not know (legacy
+/// records) or that is implausible never counts. O(1).
+#[must_use]
+pub fn process_boundary_is_gap(previous_receipt_nanos: i64, receipt_nanos: i64) -> bool {
+    let previous = plausible_receipt_nanos(previous_receipt_nanos);
+    let current = plausible_receipt_nanos(receipt_nanos);
+    previous != WAL_RECEIPT_UNKNOWN_NANOS
+        && current != WAL_RECEIPT_UNKNOWN_NANOS
+        && current.saturating_sub(previous) > WAL_REPLAY_PROCESS_GAP_NANOS
+}
+
 /// Segments the applied-watermark let this pass ARCHIVE UNREAD.
 pub const WAL_REPLAY_SKIPPED_SEGMENTS_COUNTER: &str = "tv_wal_replay_skipped_segments_total";
 /// Frames inside a boundary segment that were read and then dropped as
@@ -2990,6 +3041,16 @@ pub struct WalReplayBatch {
     pub stopped_for_disk: bool,
     /// `true` when the pass was refused on [`WAL_REPLAY_MAX_FRAMES_PER_BOOT`].
     pub stopped_for_frame_cap: bool,
+    /// Plan ITEM 47: `true` when something was really skipped before the first
+    /// returned frame — a segment archived as applied, main-feed frames dropped
+    /// as applied, or a damaged segment. The first frame's `after_gap` is set
+    /// on every pass regardless, because a pass does not know what an earlier
+    /// pass read; a caller draining in consecutive rounds reads this to tell a
+    /// real gap from a round boundary.
+    pub leading_gap: bool,
+    /// Plan ITEM 47: `true` when the pass ended on a gap — frames dropped or
+    /// lost after the last returned one.
+    pub trailing_gap: bool,
 }
 
 /// Should THIS deferral page the operator?
@@ -3062,8 +3123,18 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
     };
     let mut skipped_segments = 0u64;
     let mut skipped_bytes = 0u64;
+    // Plan ITEM 47: `true` at index i when a segment skipped as applied sits
+    // between kept segment i-1 and kept segment i — its frames were never
+    // replayed, so kept segment i's first frame follows a gap.
+    let mut gap_before_segment: Vec<bool> = vec![false; segments.len()]; // APPROVED: boot-time WAL replay, cold path
+    // Segments decided SKIPPED, with the index of the kept segment that
+    // follows each. They are archived only AFTER the read below, and only
+    // when that kept segment was reached: one past a budget or memory stop
+    // stays a `*.wal`, so the next pass sees it again and flags the gap it
+    // leaves (plan ITEM 47 review). Archiving it now lost that gap.
+    let mut pending_skips: Vec<(PathBuf, usize)> = Vec::new(); // APPROVED: boot-time WAL replay, cold path
+    let archive_dir = wal_dir.join(ARCHIVE_SUBDIR);
     if let Some(applied) = applied.as_ref() {
-        let archive_dir = wal_dir.join(ARCHIVE_SUBDIR);
         // A segment's range is `[its first seq, next segment's first seq − 1]`.
         // The LAST segment has no upper bound and is always read.
         // O(1) EXEMPT: boot replay, one header read per segment, cold path
@@ -3072,6 +3143,8 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
             .map(|p| first_frame_seq_in_segment(p))
             .collect(); // APPROVED: boot-time WAL replay, cold path
         let mut keep: Vec<PathBuf> = Vec::with_capacity(segments.len()); // APPROVED: boot-time WAL replay, cold path
+        let mut keep_gap: Vec<bool> = Vec::with_capacity(segments.len()); // APPROVED: boot-time WAL replay, cold path
+        let mut skipped_since_kept = false;
         for (idx, path) in segments.iter().enumerate() {
             let lo = firsts[idx];
             let hi = firsts.get(idx + 1).copied().and_then(|n| n.checked_sub(1));
@@ -3081,28 +3154,19 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
             };
             if !skip {
                 keep.push(path.clone()); // APPROVED: boot-time WAL replay, cold path
+                keep_gap.push(std::mem::replace(&mut skipped_since_kept, false));
                 continue;
             }
-            let Some(name) = path.file_name() else {
+            if path.file_name().is_none() {
                 keep.push(path.clone()); // APPROVED: boot-time WAL replay, cold path
+                keep_gap.push(std::mem::replace(&mut skipped_since_kept, false));
                 continue;
-            };
-            drop(std::fs::create_dir_all(&archive_dir)); // O(1) EXEMPT: boot replay skip, cold path
-            let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0); // O(1) EXEMPT: boot replay skip, cold path
-            // O(1) EXEMPT: boot replay skip, cold path
-            match std::fs::rename(path, archive_dir.join(name)) {
-                Ok(()) => {
-                    skipped_segments = skipped_segments.saturating_add(1);
-                    skipped_bytes = skipped_bytes.saturating_add(bytes);
-                }
-                Err(err) => {
-                    // Not archived → still a `*.wal` → read it as before.
-                    warn!(segment = ?path, error = %err, "could not archive an applied WAL segment; replaying it instead");
-                    keep.push(path.clone()); // APPROVED: boot-time WAL replay, cold path
-                }
             }
+            pending_skips.push((path.clone(), keep.len())); // APPROVED: boot-time WAL replay, cold path
+            skipped_since_kept = true;
         }
         segments = keep;
+        gap_before_segment = keep_gap;
     }
     let mut skipped_frames = 0u64;
 
@@ -3116,7 +3180,17 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
     let mut consumed = 0usize;
 
     let mut stopped_for_memory = false;
-    for path in &segments {
+    // Plan ITEM 47: the first frame of a pass always follows a gap (what came
+    // before it was applied, or was read by an earlier pass).
+    let mut gap_pending = true;
+    // The same, without the pass-start assumption: set only by a real skip.
+    let mut real_gap = false;
+    let mut leading_gap: Option<bool> = None;
+    for (seg_idx, path) in segments.iter().enumerate() {
+        if gap_before_segment.get(seg_idx).copied().unwrap_or(false) {
+            gap_pending = true;
+            real_gap = true;
+        }
         if bytes_held >= budget_bytes && consumed > 0 {
             break;
         }
@@ -3138,21 +3212,97 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
             stopped_for_memory = true;
             break;
         }
-        match replay_segment_filtered(path, applied.as_ref()) {
-            Ok((mut batch, dropped)) => {
+        match replay_segment_core(path, applied.as_ref(), &|_, _| true, true) {
+            Ok(read) => {
+                let SegmentRead {
+                    frames: mut batch,
+                    dropped_as_applied: dropped,
+                    damaged,
+                    trailing_gap,
+                } = read;
                 skipped_frames = skipped_frames.saturating_add(dropped);
                 for f in &batch {
                     bytes_held = bytes_held.saturating_add(f.frame.len());
                 }
+                if let Some(first) = batch.first_mut() {
+                    // `first.after_gap` here is the segment walk's own verdict:
+                    // frames dropped in front of it inside this segment.
+                    if leading_gap.is_none() {
+                        leading_gap = Some(real_gap || first.after_gap);
+                    }
+                    if gap_pending {
+                        first.after_gap = true;
+                    }
+                    gap_pending = false;
+                    real_gap = false;
+                }
                 frames.append(&mut batch);
+                // A walk that stopped on a bad record never returned the
+                // frames after it, and frames dropped as applied after the
+                // last returned one were never replayed: either way the next
+                // segment follows a gap.
+                if damaged || trailing_gap {
+                    gap_pending = true;
+                    real_gap = true;
+                }
             }
             Err(err) => {
                 corrupted += 1;
+                gap_pending = true;
+                real_gap = true;
                 error!(segment = ?path, error = %err, "WAL segment corrupted; skipping");
             }
         }
         consumed += 1;
     }
+    // Archive the skipped segments this pass got past (see `pending_skips`).
+    // A rename that fails leaves the segment a `*.wal`; the next pass skips
+    // it again, so nothing applied is ever re-read by accident of this.
+    // O(1) EXEMPT: begin — one rename per skipped segment, boot replay cold path
+    // Restores that fail, here and for DEFERRED segments below: both leave a
+    // segment in `replaying/`, where the confirm archives it unread.
+    let mut restore_failures = 0usize;
+    for (path, next_kept) in &pending_skips {
+        if *next_kept > consumed {
+            // Past the stop. A leftover in `replaying/` goes back to the live
+            // dir, exactly as a deferred kept segment does below: left there,
+            // the confirm would archive it by glob and the next pass would
+            // never see the gap it leaves (review, 2026-09-29).
+            if path.parent() == Some(replaying_dir.as_path())
+                && let Some(name) = path.file_name()
+                && let Err(err) = std::fs::rename(path, wal_dir.join(name))
+            {
+                // Coded and counted like the deferred restore below (review
+                // round 7): archived unread, it hides the gap it leaves.
+                restore_failures = restore_failures.saturating_add(1);
+                error!(
+                    code = ErrorCode::WsSpill02FrameDropped.code_str(),
+                    segment = ?path,
+                    error = %err,
+                    "WAL replay could not return a SKIPPED staged segment to the live \
+                     directory. The confirm step will archive it, and the next pass will \
+                     not see the gap it leaves, so bars across that gap may be rebuilt \
+                     from part of their ticks."
+                );
+            }
+            continue;
+        }
+        let Some(name) = path.file_name() else {
+            continue;
+        };
+        drop(std::fs::create_dir_all(&archive_dir));
+        let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        match std::fs::rename(path, archive_dir.join(name)) {
+            Ok(()) => {
+                skipped_segments = skipped_segments.saturating_add(1);
+                skipped_bytes = skipped_bytes.saturating_add(bytes);
+            }
+            Err(err) => {
+                warn!(segment = ?path, error = %err, "could not archive an applied WAL segment; it stays and is skipped again next pass");
+            }
+        }
+    }
+    // O(1) EXEMPT: end
     // RESTORE any DEFERRED segment that came from `replaying/` back to the
     // live dir, BEFORE anything else can observe the deferral.
     //
@@ -3192,7 +3342,6 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
     // and it gets a coded error plus a counter rather than a shrug. Both
     // renames are within one filesystem between sibling directories, so a
     // failure here means the staging renames below are failing too.
-    let mut restore_failures = 0usize;
     for path in segments.iter().skip(consumed) {
         if path.parent() != Some(replaying_dir.as_path()) {
             continue; // never staged; a live `*.wal` is already re-globbable
@@ -3315,6 +3464,8 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
         skipped_bytes,
         stopped_for_disk: false,
         stopped_for_frame_cap: false,
+        leading_gap: leading_gap.unwrap_or(real_gap),
+        trailing_gap: real_gap,
     })
 }
 
@@ -4684,6 +4835,7 @@ fn replay_segment(path: &Path) -> anyhow::Result<Vec<ReplayedFrame>> {
 /// the walk and be reported whether or not its sequence would have been
 /// skipped; filtering before the check would let corruption inside a skipped
 /// range pass silently.
+#[cfg(test)]
 fn replay_segment_filtered(
     path: &Path,
     applied: Option<&crate::wal_applied_watermark::AppliedSnapshot>,
@@ -4826,6 +4978,9 @@ pub struct SegmentRead {
     /// unreadable by this binary. A torn TAIL is not damage: it is what an
     /// interrupted writer leaves and abandons nothing beyond itself.
     pub damaged: bool,
+    /// Frames were dropped as applied AFTER the last returned frame (plan
+    /// ITEM 47): the next segment's first frame follows a gap.
+    pub trailing_gap: bool,
 }
 
 /// Reads the frames of ONE segment whose `(frame_seq, endpoint)` satisfies
@@ -4843,7 +4998,7 @@ pub fn read_segment_frames_matching<F: Fn(u64, WalEndpoint) -> bool>(
     replay_segment_core(path, None, keep, false)
 }
 
-/// The shared walk behind [`replay_segment_filtered`] and
+/// The shared walk behind the boot replay (`replay_all_with_report_guarded`) and
 /// [`read_segment_frames_matching`]. `report_corruption` is `false` only for
 /// the deferred-depth pass, whose segments are NOT moved to the archive on
 /// damage — the replay's log text would say otherwise.
@@ -4855,6 +5010,9 @@ fn replay_segment_core<F: Fn(u64, WalEndpoint) -> bool>(
 ) -> anyhow::Result<SegmentRead> {
     let mut unreadable = false;
     let mut dropped_as_applied = 0u64;
+    // Plan ITEM 47: a frame dropped as applied leaves a gap before the next
+    // kept one.
+    let mut gap_pending = false;
     let mut f = File::open(path)?;
     let mut buf = Vec::new(); // APPROVED: boot-time WAL replay, cold path
     f.read_to_end(&mut buf)?;
@@ -5092,6 +5250,15 @@ fn replay_segment_core<F: Fn(u64, WalEndpoint) -> bool>(
             && applied.frame_is_applied(applied_sink_for(endpoint), frame_seq)
         {
             dropped_as_applied = dropped_as_applied.saturating_add(1);
+            // Only a skipped MAIN-FEED frame can hide ticks from the candle
+            // fold. A depth or order-update frame carries none, so dropping it
+            // is no gap: when the depth watermark runs ahead of the tick one,
+            // depth frames interleaved with main-feed frames would otherwise
+            // flag a gap before nearly every main-feed frame, and the fold
+            // would suppress almost every bar as partial (review, 2026-09-29).
+            if frame_feeds_the_candle_fold(ws_type, endpoint) {
+                gap_pending = true;
+            }
             i = record_end;
             continue;
         }
@@ -5105,6 +5272,8 @@ fn replay_segment_core<F: Fn(u64, WalEndpoint) -> bool>(
             frame_seq,
             received_at_nanos,
             endpoint,
+            after_gap: std::mem::replace(&mut gap_pending, false),
+            first_in_segment: out.is_empty(),
         });
         i = record_end;
     }
@@ -5169,6 +5338,7 @@ fn replay_segment_core<F: Fn(u64, WalEndpoint) -> bool>(
         frames: out,
         dropped_as_applied,
         damaged,
+        trailing_gap: gap_pending,
     })
 }
 
@@ -9439,6 +9609,262 @@ mod tests {
         assert_eq!(
             batch.skipped_frames, 10,
             "the first and last are read and filtered"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Plan ITEM 47: the replay says where its gaps are. The first frame of a
+    /// pass, and the first kept frame after skipped segments or frames dropped
+    /// as applied, carry `after_gap`; a frame whose predecessor was replayed
+    /// does not.
+    #[test]
+    fn test_replay_marks_after_gap_on_first_frame_and_after_skipped_frames() {
+        let dir = tmp_dir("wm-after-gap");
+        for first in [0, 1_000, 2_000, 3_000, 4_000] {
+            write_wm_segment(&dir, first, 5, WalEndpoint::MainFeed);
+        }
+        let wm = crate::wal_applied_watermark::AppliedWatermark::new_for_tests();
+        wm.note_ticks_acked(wm_seq(5_000));
+        wm.note_depth_acked(wm_seq(5_000));
+        wm.note_unapplied(wm_seq(1_002));
+        wm.note_unapplied(wm_seq(3_002));
+        write_wm_watermark(&dir, &wm.snapshot());
+        let batch = replay_unguarded(&dir);
+        let gaps: Vec<u64> = batch
+            .frames
+            .iter()
+            .filter(|f| f.after_gap)
+            .map(|f| f.frame_seq)
+            .collect();
+        assert_eq!(batch.frames.len(), 10, "the two shed segments come back");
+        assert_eq!(
+            gaps,
+            vec![wm_seq(1_000), wm_seq(3_000)],
+            "each shed segment's first frame follows skipped frames"
+        );
+        assert!(
+            batch.leading_gap,
+            "segment 0 was archived unread before the first frame"
+        );
+        assert!(
+            batch.trailing_gap,
+            "the last segment's frames were all dropped as applied"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // With no watermark nothing is skipped: only the pass's first frame
+        // follows a gap.
+        let dir = tmp_dir("wm-after-gap-none");
+        write_wm_segment(&dir, 0, 3, WalEndpoint::MainFeed);
+        write_wm_segment(&dir, 100, 3, WalEndpoint::MainFeed);
+        let batch = replay_unguarded(&dir);
+        let flagged: Vec<bool> = batch.frames.iter().map(|f| f.after_gap).collect();
+        assert_eq!(flagged, vec![true, false, false, false, false, false]);
+        assert!(
+            !batch.leading_gap && !batch.trailing_gap,
+            "the pass-start flag alone is not a real gap"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Plan ITEM 47 review: an applied segment past a budget stop is NOT
+    /// archived by that pass. It stays a `*.wal`, so the next pass skips it
+    /// again and flags the gap it leaves; archiving it early lost that gap.
+    #[test]
+    fn test_replay_skipped_segment_past_a_budget_stop_is_kept_for_the_next_pass() {
+        let dir = tmp_dir("wm-skip-after-stop");
+        // A segment's range runs to one nanosecond before the next segment's
+        // first frame, so a skipped segment must END before an unapplied
+        // bucket (2^38 ns) begins. The kept segments therefore span a bucket
+        // boundary and only their LATER bucket is unapplied: bucket
+        // 6_475_676 starts at offset 20,264.93 s, 6_475_748 at 40,056.14 s.
+        write_wm_segment(&dir, 0, 5, WalEndpoint::MainFeed); // kept
+        write_wm_segment(&dir, 10_000, 5, WalEndpoint::MainFeed); // skipped
+        write_wm_segment(&dir, 19_991, 300, WalEndpoint::MainFeed); // kept from 20,265
+        write_wm_segment(&dir, 30_000, 5, WalEndpoint::MainFeed); // skipped
+        write_wm_segment(&dir, 39_782, 300, WalEndpoint::MainFeed); // kept from 40,057
+        let wm = crate::wal_applied_watermark::AppliedWatermark::new_for_tests();
+        wm.note_ticks_acked(wm_seq(50_000));
+        wm.note_depth_acked(wm_seq(50_000));
+        for unapplied in [2, 20_270, 40_060] {
+            wm.note_unapplied(wm_seq(unapplied));
+        }
+        write_wm_watermark(&dir, &wm.snapshot());
+        let skipped_late = dir.join(format!("ws-frames-{:020}.wal", wm_seq(30_000)));
+
+        // Pass 1 stops on its budget after the first kept segment.
+        let first = replay_all_with_report_guarded(&dir, 1, || None, None, WAL_REPLAY_RSS_STOP_PCT)
+            .expect("replay");
+        assert_eq!(first.frames.len(), 5, "only segment 0 was read");
+        assert!(
+            first.trailing_gap,
+            "the skipped segment before the stop is a gap at the end"
+        );
+        assert!(
+            skipped_late.exists(),
+            "a skip past the stop stays for the next pass"
+        );
+        confirm_replayed(&dir);
+
+        // Pass 2 reads the rest and still sees the late skip as a gap.
+        let second = replay_unguarded(&dir);
+        let gaps: Vec<u64> = second
+            .frames
+            .iter()
+            .filter(|f| f.after_gap)
+            .map(|f| f.frame_seq)
+            .collect();
+        assert_eq!(gaps, vec![wm_seq(20_265), wm_seq(40_057)], "{gaps:?}");
+        assert!(
+            second.leading_gap,
+            "frames were dropped in front of its first frame"
+        );
+        assert!(!skipped_late.exists(), "archived once a pass got past it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review round 3: a skipped leftover in `replaying/` past a budget stop
+    /// goes back to the live dir, so the confirm cannot archive it by glob
+    /// and the next pass still sees its gap.
+    #[test]
+    fn test_replay_skipped_leftover_in_replaying_past_a_stop_is_restored() {
+        let dir = tmp_dir("wm-skip-replaying");
+        write_wm_segment(&dir, 0, 5, WalEndpoint::MainFeed);
+        write_wm_segment(&dir, 10_000, 5, WalEndpoint::MainFeed);
+        write_wm_segment(&dir, 19_991, 300, WalEndpoint::MainFeed);
+        let late = write_wm_segment(&dir, 30_000, 5, WalEndpoint::MainFeed);
+        write_wm_segment(&dir, 39_782, 300, WalEndpoint::MainFeed);
+        // The late skipped segment was staged by an earlier boot.
+        let replaying = dir.join(REPLAYING_SUBDIR);
+        std::fs::create_dir_all(&replaying).unwrap();
+        let name = late.file_name().unwrap().to_owned();
+        std::fs::rename(&late, replaying.join(&name)).unwrap();
+        let wm = crate::wal_applied_watermark::AppliedWatermark::new_for_tests();
+        wm.note_ticks_acked(wm_seq(50_000));
+        wm.note_depth_acked(wm_seq(50_000));
+        for unapplied in [2, 20_270, 40_060] {
+            wm.note_unapplied(wm_seq(unapplied));
+        }
+        write_wm_watermark(&dir, &wm.snapshot());
+
+        let first = replay_all_with_report_guarded(&dir, 1, || None, None, WAL_REPLAY_RSS_STOP_PCT)
+            .expect("replay");
+        assert_eq!(first.frames.len(), 5);
+        assert!(dir.join(&name).exists(), "restored to the live dir");
+        assert!(!replaying.join(&name).exists());
+        confirm_replayed(&dir);
+        let second = replay_unguarded(&dir);
+        let gaps: Vec<u64> = second
+            .frames
+            .iter()
+            .filter(|f| f.after_gap)
+            .map(|f| f.frame_seq)
+            .collect();
+        assert_eq!(gaps, vec![wm_seq(20_265), wm_seq(40_057)], "{gaps:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review round 3: the first frame returned from each segment is marked,
+    /// so a reader can compare receipt times across a segment boundary only.
+    #[test]
+    fn test_replay_marks_the_first_frame_of_each_segment() {
+        let dir = tmp_dir("wm-first-in-segment");
+        write_wm_segment(&dir, 0, 3, WalEndpoint::MainFeed);
+        write_wm_segment(&dir, 100, 2, WalEndpoint::MainFeed);
+        let batch = replay_unguarded(&dir);
+        let firsts: Vec<bool> = batch.frames.iter().map(|f| f.first_in_segment).collect();
+        assert_eq!(firsts, vec![true, false, false, true, false]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Plan ITEM 47 review: which frames can hide ticks, and what a capture
+    /// jump is.
+    #[test]
+    fn test_frame_feeds_the_candle_fold_and_process_boundary_is_gap() {
+        assert!(frame_feeds_the_candle_fold(
+            WsType::LiveFeed,
+            WalEndpoint::MainFeed
+        ));
+        assert!(!frame_feeds_the_candle_fold(
+            WsType::LiveFeed,
+            WalEndpoint::Depth20
+        ));
+        assert!(!frame_feeds_the_candle_fold(
+            WsType::LiveFeed,
+            WalEndpoint::Depth200
+        ));
+        assert!(!frame_feeds_the_candle_fold(
+            WsType::OrderUpdate,
+            WalEndpoint::MainFeed
+        ));
+        assert!(!frame_feeds_the_candle_fold(
+            WsType::TruedataFeed,
+            WalEndpoint::MainFeed
+        ));
+
+        // A plausible receipt instant (2026-09-29 in nanoseconds).
+        let t = 1_790_000_000_000_000_000_i64;
+        assert!(!process_boundary_is_gap(
+            t,
+            t + WAL_REPLAY_PROCESS_GAP_NANOS
+        ));
+        assert!(process_boundary_is_gap(
+            t,
+            t + WAL_REPLAY_PROCESS_GAP_NANOS + 1
+        ));
+        assert!(
+            !process_boundary_is_gap(t + 5, t),
+            "going backwards is never a jump"
+        );
+        assert!(
+            !process_boundary_is_gap(WAL_RECEIPT_UNKNOWN_NANOS, t),
+            "a legacy record has no receipt"
+        );
+        assert!(!process_boundary_is_gap(t, WAL_RECEIPT_UNKNOWN_NANOS));
+        assert!(
+            !process_boundary_is_gap(t, i64::MAX),
+            "an implausible receipt never counts"
+        );
+        assert!(!process_boundary_is_gap(i64::MIN, t));
+    }
+
+    /// Plan ITEM 47 review: dropping an already-applied DEPTH frame hides no
+    /// tick, so it is no gap. Main-feed and depth frames interleave on the
+    /// wire; with the depth watermark ahead of the tick one, every depth frame
+    /// is dropped and every main-feed frame kept, and none of the kept ones may
+    /// be flagged — otherwise the fold would suppress nearly every bar.
+    #[test]
+    fn test_replay_dropped_depth_frame_is_not_a_gap() {
+        let dir = tmp_dir("wm-after-gap-depth");
+        let mut bytes = Vec::new();
+        for i in 0..6_u64 {
+            let endpoint = if i % 2 == 0 {
+                WalEndpoint::MainFeed
+            } else {
+                WalEndpoint::Depth20
+            };
+            bytes.extend_from_slice(&encode_v4_record(
+                WsType::LiveFeed,
+                wm_seq(i),
+                7,
+                endpoint,
+                &[0xAB; 32],
+            ));
+        }
+        std::fs::write(dir.join(format!("ws-frames-{:020}.wal", wm_seq(0))), bytes).unwrap();
+        let wm = crate::wal_applied_watermark::AppliedWatermark::new_for_tests();
+        wm.note_depth_acked(wm_seq(5_000));
+        write_wm_watermark(&dir, &wm.snapshot());
+        let batch = replay_unguarded(&dir);
+        let kept: Vec<(u64, bool)> = batch
+            .frames
+            .iter()
+            .map(|f| (f.frame_seq, f.after_gap))
+            .collect();
+        assert_eq!(
+            kept,
+            vec![(wm_seq(0), true), (wm_seq(2), false), (wm_seq(4), false)],
+            "depth frames are dropped as applied; only the pass's first frame follows a gap"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

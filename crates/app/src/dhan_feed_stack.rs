@@ -1576,7 +1576,12 @@ pub struct LiveIngest {
     top_volume_close_clock: crate::top_volume_sweep::WindowCloseClock,
     /// The wall clock, IST epoch seconds, at the last timer poll; `0` until
     /// the first. The per-frame poll caps the candle clock against it without
-    /// reading a clock of its own.
+    /// reading a clock of its own, and so does the catch-up seal's cutoff
+    /// (plan ITEM 47, review round 12). Written at the hand-over
+    /// (`finish_wal_replay`), with each folded main-feed frame's arrival, and
+    /// by the snapshot timers with a real clock reading; under a frame
+    /// backlog the biased select starves those timers, and the reading is then
+    /// the latest frame's arrival, still our own clock.
     top_volume_wall_secs: u32,
     /// The catch-up seal sweep in progress, if any (audit PR4b, 2026-09-26).
     /// The 5 s timer arm only sets this; the drain's idle arm advances it
@@ -1691,6 +1696,69 @@ const fn board_cadence_for_fold_frame(
         TfIndex::S5 => Some(SnapshotCadence::FiveSecond),
         TfIndex::M1 => Some(SnapshotCadence::OneMinute),
         _ => None,
+    }
+}
+
+/// Seals routed by [`route_catch_up_seal`], in the three outcomes a seal can
+/// have.
+#[derive(Debug, Default, Clone, Copy)]
+struct SealTally {
+    emitted: u64,
+    dropped: u64,
+    rescued: u64,
+}
+
+/// Routes one sealed bar from a catch-up seal or the replay hand-over: the
+/// board's copy, then the seal writer, spilling to disk when the writer is
+/// absent or full. O(1).
+///
+/// The board's copy of a sealed window (audit PR4c-2), O(1).
+///
+/// Every frame the fold produces is emitted. The enum carries
+/// exactly the nine native timeframes the operator asked for
+/// (directive 2026-09-18: 1s 3s 5s 1m 3m 5m 15m 30m 60m — his
+/// list has eleven entries, of which `ticks` is a separate
+/// table and `10m` is DERIVED from candles_1m, so neither is a
+/// fold frame).
+///
+/// Until 2026-09-19 the enum carried 24 and a
+/// `!tf.is_operator_requested()` gate stood here, skipping the
+/// fifteen unrequested frames into a third `seals_skipped`
+/// counter so that no bar escaped the ledger. `TF_COUNT` is 9
+/// now, so that gate could only ever return false and that
+/// counter could only ever report 0 — a filter that cannot
+/// filter reads as a live one to the next author, and a
+/// counter that cannot count is a dead monitor. Both are gone;
+/// the guarantee they carried is structural instead, because
+/// there is no unrequested frame left to skip.
+/// Pinned by `tf_index::tests::tf_index_all_is_the_operators_nine`.
+#[allow(clippy::too_many_arguments)] // APPROVED: one seal's identity plus its two sinks and the tally
+fn route_catch_up_seal(
+    sender: Option<&tokio::sync::mpsc::Sender<BufferedSeal>>,
+    leaderboard: &mut crate::volume_leaderboard::VolumeLeaderboard,
+    feed: tickvault_common::feed::Feed,
+    security_id: u64,
+    segment_code: u8,
+    tf: TfIndex,
+    state: LiveCandleState,
+    tally: &mut SealTally,
+) {
+    record_board_seal(leaderboard, security_id, segment_code, tf, &state);
+    let seal = BufferedSeal::new(security_id, segment_code, tf, state, feed);
+    let Some(tx) = sender else {
+        match escalate_refused_seal(&seal) {
+            SealRefusal::Rescued => tally.rescued = tally.rescued.saturating_add(1),
+            SealRefusal::Lost => tally.dropped = tally.dropped.saturating_add(1),
+        }
+        return;
+    };
+    if let Err(refused) = tx.try_send(seal) {
+        match escalate_refused_seal(&refused.into_inner()) {
+            SealRefusal::Rescued => tally.rescued = tally.rescued.saturating_add(1),
+            SealRefusal::Lost => tally.dropped = tally.dropped.saturating_add(1),
+        }
+    } else {
+        tally.emitted = tally.emitted.saturating_add(1);
     }
 }
 
@@ -2584,7 +2652,14 @@ impl LiveIngest {
             // up writing a store a different reader is holding. Boot clones
             // the `Arc` straight back out for the attach tasks.
             spot_prices: std::sync::Arc::new(crate::spot_price_store::SpotPriceStore::new()),
-            aggregator: MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, capacity),
+            aggregator: {
+                let mut aggregator =
+                    MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, capacity);
+                // A WAL replay judges late ticks by the SAME margin the live
+                // catch-up seal uses (plan ITEM 47, review round 7).
+                aggregator.set_catch_up_margin_secs(CATCHUP_LATENESS_MARGIN_SECS);
+                aggregator
+            },
             writer,
             seq_refused: 0,
             refused_price: 0,
@@ -4560,12 +4635,89 @@ impl LiveIngest {
         (emitted, dropped)
     }
 
+    /// Hands the candle fold over to the live feed, once per lane start,
+    /// before the first live frame: records when this process began capturing
+    /// ([`MultiTfAggregator::set_live_capture_start`]) and ends any WAL replay
+    /// (plan ITEM 47, [`MultiTfAggregator::finish_replay`]). `ended_on_gap` is
+    /// `true` when frames after the last replayed one were skipped or left
+    /// unread.
+    ///
+    /// # Complexity
+    /// O(slots × TF), once per lane start.
+    pub fn finish_wal_replay(&mut self, ended_on_gap: bool) {
+        // Every boot, replay or not: from here on a partial bar whose bucket
+        // ended before this process began listening is a fragment of a bar
+        // the previous process owned, never written (review round 3).
+        let now_ist_secs = chrono::Utc::now().timestamp().saturating_add(i64::from(
+            tickvault_common::constants::IST_UTC_OFFSET_SECONDS,
+        ));
+        self.aggregator
+            .set_live_capture_start(u32::try_from(now_ist_secs).unwrap_or(u32::MAX));
+        // The same reading is the catch-up cutoff's first wall cap (review
+        // round 13): the catch-up timer fires at once when the drain starts,
+        // before any live frame or snapshot timer has stored a reading, and
+        // an uncapped first sweep would let a future-stamped trade inside the
+        // REPLAYED frames close buckets early once per boot.
+        self.store_top_volume_wall(now_ist_secs.saturating_mul(1_000_000_000));
+        // Bars the replay still HELD (sealed, but amendable until the next
+        // bar of their timeframe sealed) are final now; the complete ones go
+        // down the same seal path as a catch-up seal.
+        let sender = tickvault_storage::seal_writer_runner::global_seal_sender();
+        let leaderboard = &mut self.leaderboard;
+        let mut tally = SealTally::default();
+        let (tainted, suppressed) = self.aggregator.finish_replay(
+            ended_on_gap,
+            |feed, security_id, segment_code, tf, state| {
+                route_catch_up_seal(
+                    sender,
+                    leaderboard,
+                    feed,
+                    security_id,
+                    segment_code,
+                    tf,
+                    state,
+                    &mut tally,
+                );
+            },
+        );
+        self.apply_seal_tally(tally);
+        if tainted > 0 || suppressed > 0 {
+            info!(
+                ended_on_gap,
+                tainted_buckets = tainted,
+                suppressed_partial_bars = suppressed,
+                "WAL replay handed over to the live feed. Candles the replay could only \
+                 partly see were not written, so they cannot overwrite the complete \
+                 candles already stored; buckets still open are held back the same way"
+            );
+        }
+    }
+
     /// `watermark − CATCHUP_LATENESS_MARGIN_SECS`, saturating at 0 (seal
     /// nothing) before the session's watermark has moved.
+    ///
+    /// The watermark is capped at the wall clock first — the arrival instant
+    /// of the latest folded frame, the same reading the top-volume close
+    /// clock is capped at (plan ITEM 47, review round 12). The watermark is
+    /// the vendor's trade stamp and only a stamp on a future DAY is refused,
+    /// so one trade stamped minutes ahead on the same day would otherwise
+    /// close every quiet instrument's buckets before their real trades
+    /// arrived. The hand-over (`finish_wal_replay`) stores the first reading, so
+    /// even the sweep that fires as the drain starts is capped (review round
+    /// 13); with no reading at all (an ingest never handed over, as in unit
+    /// tests) the cutoff follows the watermark as before. The cap is also what
+    /// keeps a WAL replay's late-tick bound (receipt plus the clock skew) at
+    /// or above anything live could have sealed, whatever frames it skipped.
+    ///
+    /// O(1): one compare and one subtraction.
     fn catch_up_cutoff(&self) -> u32 {
-        self.aggregator
-            .watermark_secs()
-            .saturating_sub(CATCHUP_LATENESS_MARGIN_SECS)
+        let watermark = self.aggregator.watermark_secs();
+        let clock = if self.top_volume_wall_secs == 0 {
+            watermark
+        } else {
+            watermark.min(self.top_volume_wall_secs)
+        };
+        clock.saturating_sub(CATCHUP_LATENESS_MARGIN_SECS)
     }
 
     /// Starts a sliced catch-up seal — the only part the drain's 5 s timer
@@ -4673,81 +4825,50 @@ impl LiveIngest {
         from_slot: usize,
         max_slots: usize,
     ) -> (u64, u64, usize) {
-        let mut emitted = 0u64;
-        let mut dropped = 0u64;
-        let mut rescued = 0u64;
         let sender = tickvault_storage::seal_writer_runner::global_seal_sender();
         let leaderboard = &mut self.leaderboard;
+        let mut tally = SealTally::default();
         let (bars, next) = self.aggregator.catch_up_seal_slots(
             cutoff,
             from_slot,
             max_slots,
             |feed, security_id, segment_code, tf, state| {
-                // The board's copy of a sealed window (audit PR4c-2), O(1).
-                record_board_seal(leaderboard, security_id, segment_code, tf, &state);
-                // Every frame the fold produces is emitted. The enum carries
-                // exactly the nine native timeframes the operator asked for
-                // (directive 2026-09-18: 1s 3s 5s 1m 3m 5m 15m 30m 60m — his
-                // list has eleven entries, of which `ticks` is a separate
-                // table and `10m` is DERIVED from candles_1m, so neither is a
-                // fold frame).
-                //
-                // Until 2026-09-19 the enum carried 24 and a
-                // `!tf.is_operator_requested()` gate stood here, skipping the
-                // fifteen unrequested frames into a third `seals_skipped`
-                // counter so that no bar escaped the ledger. `TF_COUNT` is 9
-                // now, so that gate could only ever return false and that
-                // counter could only ever report 0 — a filter that cannot
-                // filter reads as a live one to the next author, and a
-                // counter that cannot count is a dead monitor. Both are gone;
-                // the guarantee they carried is structural instead, because
-                // there is no unrequested frame left to skip.
-                // Pinned by `tf_index::tests::tf_index_all_is_the_operators_nine`.
-                let seal = BufferedSeal::new(security_id, segment_code, tf, state, feed);
-                // No writer channel installed at all. Before 2026-08-19 this
-                // discarded the seal outright; it now takes the same durable
-                // route a full channel does, so a boot-order problem costs a
-                // disk write rather than a day of candles.
-                let Some(tx) = sender else {
-                    match escalate_refused_seal(&seal) {
-                        SealRefusal::Rescued => rescued = rescued.saturating_add(1),
-                        SealRefusal::Lost => dropped = dropped.saturating_add(1),
-                    }
-                    return;
-                };
-                // NEVER discard. Operator directive 2026-08-19: "never ever
-                // drop any ticks irrespective of any worst case". A refused
-                // seal goes to disk (spill, then DLQ); only a seal both disk
-                // tiers reject is counted as lost, and that fires
-                // AGGREGATOR-DROP-01.
-                if let Err(refused) = tx.try_send(seal) {
-                    match escalate_refused_seal(&refused.into_inner()) {
-                        SealRefusal::Rescued => rescued = rescued.saturating_add(1),
-                        SealRefusal::Lost => dropped = dropped.saturating_add(1),
-                    }
-                } else {
-                    emitted = emitted.saturating_add(1);
-                }
+                route_catch_up_seal(
+                    sender,
+                    leaderboard,
+                    feed,
+                    security_id,
+                    segment_code,
+                    tf,
+                    state,
+                    &mut tally,
+                );
             },
         );
         debug_assert_eq!(
             bars as u64,
-            emitted.saturating_add(dropped),
+            tally.emitted.saturating_add(tally.dropped),
             "every bar catch_up_seal_slots produced must be accounted as emitted or dropped"
         );
-        self.seals_emitted = self.seals_emitted.saturating_add(emitted);
-        self.seals_dropped = self.seals_dropped.saturating_add(dropped);
-        self.seals_rescued = self.seals_rescued.saturating_add(rescued);
-        if emitted > 0 {
-            counters().seals_emitted.increment(emitted);
-        }
-        if dropped > 0 {
-            counters().seals_dropped.increment(dropped);
-        }
-        if rescued > 0 {
-            counters().seals_rescued.increment(rescued);
-        }
+        let (emitted, dropped) = (tally.emitted, tally.dropped);
+        self.apply_seal_tally(tally);
         (emitted, dropped, next)
+    }
+
+    /// Adds a seal tally to the ingest's running totals and counters. O(1).
+    fn apply_seal_tally(&mut self, tally: SealTally) {
+        self.seals_emitted = self.seals_emitted.saturating_add(tally.emitted);
+        self.seals_dropped = self.seals_dropped.saturating_add(tally.dropped);
+        self.seals_rescued = self.seals_rescued.saturating_add(tally.rescued);
+        if tally.emitted > 0 {
+            counters().seals_emitted.increment(tally.emitted);
+        }
+        if tally.dropped > 0 {
+            counters().seals_dropped.increment(tally.dropped);
+        }
+        if tally.rescued > 0 {
+            counters().seals_rescued.increment(tally.rescued);
+        }
     }
 
     /// Instruments the gap detector is tracking. O(1).
@@ -10197,6 +10318,19 @@ pub struct DhanFeedStackParams {
     /// `(frame_seq, received_at_nanos, endpoint, frame)` — the TVW4 endpoint
     /// is what routes a replayed depth frame to the depth drain.
     pub wal_replay_live_feed: Vec<(u64, i64, WalEndpoint, bytes::Bytes)>,
+    /// Indexes into [`Self::wal_replay_live_feed`] of frames that follow a gap
+    /// in the replay (plan ITEM 47): frames before them were not replayed,
+    /// so the candle fold must not carry its volume baseline across.
+    pub wal_replay_gaps: Vec<usize>,
+    /// Whether the boot replay pass ENDED on a gap (plan ITEM 47): frames
+    /// after its last live-feed frame were skipped. `None` when the pass
+    /// returned nothing. Carried into the catch-up drain, whose first round
+    /// continues that pass.
+    pub wal_replay_trailing_gap: Option<bool>,
+    /// Receipt time of the boot pass's last candle-bearing frame, so the
+    /// catch-up drain can flag a process boundary across the pass boundary
+    /// (plan ITEM 47, `process_boundary_is_gap`).
+    pub wal_replay_last_fold_receipt: Option<i64>,
     /// Main-feed instruments (the hardcoded index set — see
     /// [`hardcoded_index_universe`]).
     pub main_feed_instruments: Vec<SubscribeInstrument>,
@@ -13630,6 +13764,9 @@ fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize 
 pub struct WalRefoldOutcome {
     /// Ticks successfully folded into the aggregator and queued for the DB.
     pub refolded: u64,
+    /// Gaps in the replayed frames at which the candle fold re-seeded its
+    /// volume baseline (plan ITEM 47).
+    pub gaps_marked: u64,
     /// Ticks parsed but REFUSED by the fold (sequence unrepresentable,
     /// aggregator refusal, write failure). Real, counted loss.
     pub lost: u64,
@@ -14028,12 +14165,20 @@ fn refold_one_tick(
 pub fn refold_wal_frames(
     ingest: &mut LiveIngest,
     frames: &[(u64, i64, WalEndpoint, bytes::Bytes)],
+    gaps: &[usize],
 ) -> WalRefoldOutcome {
     let mut out = WalRefoldOutcome::default();
     // Held for the whole backlog; cleared at the single exit below. See the
     // `replaying_wal` field for why a replayed frame must never reach the
     // volume ranking.
     ingest.replaying_wal = true;
+    // Plan ITEM 47: while replaying, a candle the replay could only partly
+    // see is counted instead of emitted, so it never overwrites the complete
+    // candle the live process already stored under the same key.
+    ingest.aggregator.set_replay_mode(true);
+    // `gaps` holds ascending indexes into `frames` of frames that follow a
+    // gap in the replay; a cursor walks it once, O(1) per frame.
+    let mut gap_cursor = 0usize;
 
     // ⚠ READ THIS FIRST — 2026-09-18. The two corrections below are kept
     // verbatim as the record of how this line reached its current shape, and
@@ -14172,7 +14317,24 @@ pub fn refold_wal_frames(
         .aggregator
         .seed_watermark_at_least(ist_day_start_secs);
 
-    for (frame_seq, wal_received_at_nanos, endpoint, bytes) in frames {
+    for (frame_idx, (frame_seq, wal_received_at_nanos, endpoint, bytes)) in
+        frames.iter().enumerate()
+    {
+        // Plan ITEM 47: frames before this one were not replayed, so no
+        // instrument's volume baseline may carry across. `while`, not `if`,
+        // so a duplicate index is consumed rather than stalling the cursor.
+        let mut gap_marked_here = false;
+        while let Some(&gap_idx) = gaps.get(gap_cursor) {
+            if gap_idx > frame_idx {
+                break;
+            }
+            if gap_idx == frame_idx && !gap_marked_here {
+                ingest.aggregator.mark_replay_gap();
+                out.gaps_marked = out.gaps_marked.saturating_add(1);
+                gap_marked_here = true;
+            }
+            gap_cursor += 1;
+        }
         // SIZE TRIGGER -- the bound this loop did not have, MEASURED biting on
         // 2026-09-02. The live drain flushes on `FLUSH_ROW_THRESHOLD` and
         // `DEPTH_FLUSH_ROW_THRESHOLD`; replay had NEITHER, so it appended the
@@ -14486,6 +14648,11 @@ pub fn refold_wal_frames(
     // here, which is why the guard is set and cleared in this function and
     // not at either caller.
     ingest.replaying_wal = false;
+    // Plan ITEM 47: replay mode stays ON across the boot replay and every
+    // catch-up round, which are consecutive with nothing live folded between
+    // them. It ends once, at the hand-over to the live drain
+    // (`LiveIngest::finish_wal_replay`), which also marks the gap the
+    // downtime left.
     out
 }
 
@@ -14975,6 +15142,13 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // recovered frame therefore cannot race a live frame for the same
     // `capture_seq`, and the gap detector already knows every instrument, so a
     // recovered tick lands against a seeded slot rather than creating one.
+    // Plan ITEM 47: whether the WAL replay (boot + catch-up) ended with frames
+    // after its last one skipped or unread. Decides, at the hand-over, whether
+    // every bucket still open is held back or only the partial ones.
+    let mut replay_ended_on_gap = false;
+    // Whether the boot pass archived its segments. If not, they stay staged
+    // and catch-up round 0 reads the same frames again (review round 7).
+    let mut boot_refold_confirmed = false;
     if !params.wal_replay_live_feed.is_empty() {
         // ORDERING PIN -- added 2026-08-28.
         //
@@ -15029,11 +15203,13 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         } else {
             let unlanded_before =
                 tickvault_storage::wal_applied_watermark::applied_watermark().unlanded_total();
-            let outcome = refold_wal_frames(&mut ingest, &params.wal_replay_live_feed);
+            let (boot_frames, boot_gaps) = (&params.wal_replay_live_feed, &params.wal_replay_gaps);
+            let outcome = refold_wal_frames(&mut ingest, boot_frames, boot_gaps);
             if outcome.lost == 0 {
                 info!(
                     frames = params.wal_replay_live_feed.len(),
                     ticks = outcome.refolded,
+                    replay_gaps = outcome.gaps_marked,
                     "recovered live-feed frames from the write-ahead log and folded them — \
                  ticks captured by a previous session are now in the database"
                 );
@@ -15116,6 +15292,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 tickvault_storage::ws_frame_spill::confirm_replayed(
                     crate::boot_helpers::ws_wal_dir(),
                 );
+                boot_refold_confirmed = true;
             }
             if flushed > 0 {
                 info!(
@@ -15199,6 +15376,21 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         // one state in which the applied-watermark's unapplied buckets can be
         // cleared: everything they guarded has been replayed and confirmed.
         let mut catchup_drained = false;
+        // Plan ITEM 47: whether the previous pass (the boot pass, then each
+        // catch-up round) ended on a real gap. They are consecutive reads of
+        // one backlog, so a round that follows a clean pass does not start
+        // after a gap, whatever the replay assumes about its own first frame.
+        // `None` = unknown, treated as a gap.
+        // A boot pass that was NOT confirmed left its segments staged, so
+        // round 0 re-reads its frames: fold them as after a gap, or a
+        // re-read zero-volume tick would count twice in a bar that is then
+        // written (review round 7).
+        let mut catchup_prev_trailing_gap: Option<bool> = if boot_refold_confirmed {
+            params.wal_replay_trailing_gap
+        } else {
+            Some(true)
+        };
+        let mut catchup_last_fold_receipt: Option<i64> = params.wal_replay_last_fold_receipt;
         // Every segment this drain can confirm holds frames below THIS point;
         // a shed from a socket dialed during the drain lands above it and its
         // bucket must survive the reset at the end.
@@ -15272,7 +15464,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 break;
             }
             let wal_dir = crate::boot_helpers::ws_wal_dir();
-            let batch = match tickvault_storage::ws_frame_spill::replay_all_with_report_fenced(
+            let mut batch = match tickvault_storage::ws_frame_spill::replay_all_with_report_fenced(
                 &wal_dir,
                 tickvault_storage::ws_frame_spill::WAL_REPLAY_MAX_BYTES,
             ) {
@@ -15319,6 +15511,13 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 );
             }
             if batch.frames.is_empty() {
+                // An empty pass can still END on a gap: every main-feed frame
+                // of the last segment dropped as applied (review round 3).
+                catchup_prev_trailing_gap = Some(
+                    catchup_prev_trailing_gap.unwrap_or(true)
+                        || batch.trailing_gap
+                        || batch.leading_gap,
+                );
                 catchup_drained = batch.deferred_segments == 0
                     && !batch.stopped_for_disk
                     && !batch.stopped_for_frame_cap
@@ -15344,19 +15543,67 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             // with the boot path so one series answers "how many of these have
             // we seen", regardless of which drain saw them.
             let batch_len = batch.frames.len();
-            let staged: Vec<(u64, i64, WalEndpoint, bytes::Bytes)> = batch
-                .frames
-                .into_iter()
-                .filter(|f| f.ws_type == tickvault_storage::ws_frame_spill::WsType::LiveFeed)
-                .map(|f| {
-                    (
-                        f.frame_seq,
+            // Plan ITEM 47: this round continues the previous pass unless that
+            // one ended on a gap or this one skipped something before its
+            // first frame.
+            if catchup_prev_trailing_gap == Some(false)
+                && !batch.leading_gap
+                && let Some(first) = batch.frames.first_mut()
+            {
+                first.after_gap = false;
+            }
+            let batch_trailing_gap = batch.trailing_gap;
+            let mut staged: Vec<(u64, i64, WalEndpoint, bytes::Bytes)> =
+                Vec::with_capacity(batch_len);
+            // Plan ITEM 47: indexes into `staged` of frames that follow a gap.
+            // A gap in front of a frame this lane does not fold carries to
+            // the next live-feed frame.
+            let mut staged_gaps: Vec<usize> = Vec::new();
+            let mut gap_carry = false;
+            // O(1) EXEMPT: begin — one pass over a catch-up batch on the boot drain, cold path
+            let mut segment_boundary = false;
+            for f in batch.frames {
+                gap_carry |= f.after_gap;
+                segment_boundary |= f.first_in_segment;
+                if tickvault_storage::ws_frame_spill::frame_feeds_the_candle_fold(
+                    f.ws_type, f.endpoint,
+                ) {
+                    if std::mem::replace(&mut segment_boundary, false)
+                        && let Some(prev) = catchup_last_fold_receipt
+                        && tickvault_storage::ws_frame_spill::process_boundary_is_gap(
+                            prev,
+                            f.received_at_nanos,
+                        )
+                    {
+                        gap_carry = true;
+                    }
+                    // A record with no known receipt (legacy) does not reset
+                    // the comparison point.
+                    if tickvault_storage::ws_frame_spill::plausible_receipt_nanos(
                         f.received_at_nanos,
-                        f.endpoint,
-                        bytes::Bytes::from(f.frame),
-                    )
-                })
-                .collect();
+                    ) != tickvault_storage::ws_frame_spill::WAL_RECEIPT_UNKNOWN_NANOS
+                    {
+                        catchup_last_fold_receipt = Some(f.received_at_nanos);
+                    }
+                }
+                if f.ws_type != tickvault_storage::ws_frame_spill::WsType::LiveFeed {
+                    continue;
+                }
+                if std::mem::replace(&mut gap_carry, false) {
+                    staged_gaps.push(staged.len());
+                }
+                staged.push((
+                    f.frame_seq,
+                    f.received_at_nanos,
+                    f.endpoint,
+                    bytes::Bytes::from(f.frame),
+                ));
+            }
+            // O(1) EXEMPT: end
+            // A gap flagged on a frame after the last live-feed one (an
+            // order-update or TrueData frame) is still a gap at this round's
+            // end; so is one on a round that stages nothing.
+            catchup_prev_trailing_gap = Some(batch_trailing_gap || gap_carry);
             let not_folded = batch_len.saturating_sub(staged.len());
             if not_folded > 0 {
                 catchup_not_folded = catchup_not_folded.saturating_add(not_folded as u64);
@@ -15380,7 +15627,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             }
             let unlanded_before =
                 tickvault_storage::wal_applied_watermark::applied_watermark().unlanded_total();
-            let outcome = refold_wal_frames(&mut ingest, &staged);
+            let outcome = refold_wal_frames(&mut ingest, &staged, &staged_gaps);
             let flushed = blocking_flush(|| ingest.flush());
             // ACK BEFORE CONFIRMING — see `replay_rows_landed`. A timeout ends
             // the drain rather than re-offering the same batch to a sink that
@@ -15411,6 +15658,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 "WAL catch-up drain round complete"
             );
         }
+        replay_ended_on_gap = !catchup_drained || catchup_prev_trailing_gap.unwrap_or(true);
         if catchup_drained {
             // Every captured frame is now either in the database, in a spill
             // file, or archived — the unapplied map has nothing left to guard.
@@ -15601,6 +15849,9 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // handful of batches in a session. A large buffer here would only delay
     // discovering that nobody is receiving.
     let (seed_tx, seed_rx) = tokio::sync::mpsc::channel::<Vec<SubscribeInstrument>>(8);
+    // Plan ITEM 47: the WAL replay (boot + catch-up) is over; hand over to the
+    // live feed before its first frame folds.
+    ingest.finish_wal_replay(replay_ended_on_gap);
     let drain = tokio::spawn(run_frame_drain(
         frame_rx,
         ingest,
@@ -18468,6 +18719,9 @@ mod tests {
             // A disabled lane never reaches the re-fold, which is exactly why
             // main.rs still drops the batch loudly when the gate is closed.
             wal_replay_live_feed: Vec::new(),
+            wal_replay_gaps: Vec::new(),
+            wal_replay_trailing_gap: None,
+            wal_replay_last_fold_receipt: None,
             main_feed_instruments: hardcoded_index_universe(),
             depth_20_instruments: Vec::new(),
             depth_200_instruments: Vec::new(),
@@ -20874,6 +21128,81 @@ mod tests {
         );
     }
 
+    /// Plan ITEM 47, review round 12 (the future-dated question): the
+    /// vendor stamp is the candle clock, and only a stamp on a FUTURE DAY is
+    /// refused, so one trade stamped 15 minutes ahead on the same day moved
+    /// the catch-up cutoff 15 minutes ahead and closed every quiet
+    /// instrument's buckets before their real trades arrived. The cutoff is
+    /// now capped at the wall clock (the latest frame's arrival), as the
+    /// top-volume close clock already is.
+    #[test]
+    fn test_regression_a_future_stamped_tick_cannot_close_buckets_early() {
+        let run = |record_wall: bool| {
+            let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+            let ts = 1_779_355_000;
+            let recv_nanos = i64::from(ts) * 1_000_000_000;
+            for (sid, stamp) in [(1_001_u32, ts), (999, ts + 900)] {
+                let packet = ticker_packet(sid, 100.0, stamp);
+                let ParsedFrame::Tick(tick) = dispatch_frame(&packet, recv_nanos).expect("parse")
+                else {
+                    panic!("expected a tick");
+                };
+                ingest.ingest_tick(&tick, 7, u64::from(ts) * 1_000);
+            }
+            if record_wall {
+                // The drain records each folded frame's arrival, IST.
+                ingest.poll_top_volume_window_closes_by_candles(i64::from(ts) * 1_000_000_000);
+            }
+            // Sealed bars: "emitted" to the writer, or "dropped" when a test has
+            // no writer attached. Either way the bucket was closed.
+            let (emitted, dropped) = ingest.catch_up_seal();
+            emitted + dropped
+        };
+        assert!(
+            run(false) > 0,
+            "control: with no wall reading the cutoff still follows the candle clock"
+        );
+        assert_eq!(
+            run(true),
+            0,
+            "a trade stamped 15 minutes ahead must not close buckets that have not \
+             ended by the wall clock"
+        );
+    }
+
+    /// Review round 13: the catch-up timer fires as soon as the drain starts,
+    /// before any live frame or snapshot timer has stored a wall reading. The
+    /// hand-over stores one, so a watermark pushed ahead by a future-stamped
+    /// trade inside the REPLAYED frames cannot make that first sweep close
+    /// buckets early.
+    #[test]
+    fn test_finish_wal_replay_caps_the_first_catch_up_sweep_at_the_wall_clock() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        let now_ist = || {
+            u32::try_from(
+                chrono::Utc::now().timestamp()
+                    + i64::from(tickvault_common::constants::IST_UTC_OFFSET_SECONDS),
+            )
+            .expect("fits")
+        };
+        let before = now_ist();
+        // The replay saw a trade stamped far ahead of the wall clock.
+        ingest.aggregator.seed_watermark_at_least(before + 10_000);
+        assert!(
+            ingest.catch_up_cutoff() > before,
+            "control: with no wall reading the cutoff follows the watermark"
+        );
+        ingest.finish_wal_replay(false);
+        let after = now_ist();
+        let cutoff = ingest.catch_up_cutoff();
+        assert!(
+            cutoff >= before.saturating_sub(CATCHUP_LATENESS_MARGIN_SECS)
+                && cutoff <= after.saturating_sub(CATCHUP_LATENESS_MARGIN_SECS),
+            "the first sweep after the hand-over is capped at the wall clock: \
+             cutoff {cutoff}, wall {before}..{after}"
+        );
+    }
+
     /// A watermark below the margin (session not yet started) must be a
     /// no-op, not an underflow into a huge cutoff that seals everything.
     #[test]
@@ -21077,12 +21406,53 @@ mod tests {
     /// depending on which drain reached it first, which is how a reader
     /// concludes there is nothing there.
     #[test]
-    fn the_catchup_drain_counts_what_it_does_not_fold() {
+    fn test_catch_up_round_zero_is_a_gap_when_the_boot_pass_was_not_confirmed() {
+        // Review round 7: an unconfirmed boot pass leaves its segments staged,
+        // so round 0 re-reads its frames; re-folding them without a gap lets a
+        // repeated zero-volume tick count twice in a bar that is written.
         let src = include_str!("dhan_feed_stack.rs");
         let body = src
-            .split_once("async fn run_frame_drain")
-            .expect("the drain function must exist")
-            .1;
+            .split_once("async fn run_dhan_feed_stack(")
+            .expect("the lane function must exist")
+            .1
+            .split_once("\n#[cfg(test)]")
+            .expect("the test module must follow the production code")
+            .0;
+        let confirm = body
+            .find("boot_refold_confirmed = true;")
+            .expect("the boot confirm must record that it ran");
+        let archive = body[..confirm]
+            .rfind("confirm_replayed(")
+            .expect("it is recorded right after archiving");
+        assert!(confirm - archive < 200, "recorded next to the archive call");
+        let init = body
+            .find("let mut catchup_prev_trailing_gap")
+            .expect("the catch-up gap carry must exist");
+        assert!(
+            body[init..init + 200].contains("if boot_refold_confirmed")
+                && body[init..init + 300].contains("Some(true)"),
+            "round 0 starts after a gap unless the boot pass was confirmed"
+        );
+    }
+
+    #[test]
+    fn the_catchup_drain_counts_what_it_does_not_fold() {
+        let src = include_str!("dhan_feed_stack.rs");
+        // PRODUCTION ONLY (review round 7): this scanned from the drain to the
+        // end of the file, test module included, so this test's own string
+        // literals satisfied three of its four needles and a stale one
+        // (`batch.len()`, long since `batch.frames.len()`) still passed.
+        let body = src
+            .split_once("async fn run_dhan_feed_stack(")
+            .expect("the lane function must exist")
+            .1
+            .split_once("\n#[cfg(test)]")
+            .expect("the test module must follow the production code")
+            .0;
+        assert!(
+            !body.contains("fn the_catchup_drain_counts_what_it_does_not_fold"),
+            "self-test: the scanned region must not include this test"
+        );
         // Comment-blind: the doc above quotes the shape, and a scan that its
         // own explanation satisfies is decorative (the house convention).
         let code: String = body
@@ -21092,7 +21462,7 @@ mod tests {
             .join("\n");
 
         for needle in [
-            "let batch_len = batch.len();",
+            "let batch_len = batch.frames.len();",
             "batch_len.saturating_sub(staged.len())",
             "\"ws_type\" => \"catchup_not_folded\"",
             "catchup_not_folded",
@@ -22899,7 +23269,7 @@ mod wal_refold_tests {
             WalEndpoint::MainFeed,
             replay_ticker(13, yesterday_ist),
         );
-        let out = refold_wal_frames(&mut ingest(), &[snapshot]);
+        let out = refold_wal_frames(&mut ingest(), &[snapshot], &[]);
         assert_eq!(
             out.refused_wrong_day, 1,
             "the day rule refused it by design"
@@ -22918,7 +23288,7 @@ mod wal_refold_tests {
             WalEndpoint::MainFeed,
             replay_ticker(13, yesterday_ist),
         );
-        let out = refold_wal_frames(&mut ingest(), &[prior_session]);
+        let out = refold_wal_frames(&mut ingest(), &[prior_session], &[]);
         assert_eq!(
             out.lost, 0,
             "a tick received on the day it traded is real captured data — its \
@@ -22944,7 +23314,7 @@ mod wal_refold_tests {
             WalEndpoint::MainFeed,
             replay_ticker(13, yesterday_ist),
         );
-        let out = refold_wal_frames(&mut ingest(), &[no_receipt]);
+        let out = refold_wal_frames(&mut ingest(), &[no_receipt], &[]);
         assert_eq!(out.refolded, 0, "no receipt clock, no proof, no write-back");
     }
 
@@ -22996,6 +23366,85 @@ mod wal_refold_tests {
         assert!(!is_depth_socket_frame(&wrong_code));
     }
 
+    /// Plan ITEM 47: every listed gap index is marked once, an out-of-range or
+    /// duplicate index is harmless, and an empty list marks nothing.
+    #[test]
+    fn test_refold_wal_frames_with_gaps_marks_each_gap() {
+        use tickvault_common::constants::DEEP_DEPTH_FEED_CODE_ASK;
+        let frame = |seq: u64| {
+            (
+                seq,
+                WAL_RECEIPT_UNKNOWN_NANOS,
+                WalEndpoint::MainFeed,
+                bytes::Bytes::from(depth_frame(DEEP_DEPTH_FEED_CODE_ASK, 20)),
+            )
+        };
+        let frames = vec![frame(1), frame(2), frame(3), frame(4)];
+        let out = refold_wal_frames(&mut ingest(), &frames, &[0, 2, 2, 9]);
+        assert_eq!(out.gaps_marked, 2, "indexes 0 and 2, once each");
+        let none = refold_wal_frames(&mut ingest(), &frames, &[]);
+        assert_eq!(none.gaps_marked, 0);
+    }
+
+    /// Plan ITEM 47 review: the replay-to-live hand-over runs ONCE, in the
+    /// lane start, after the boot replay and every catch-up round and before
+    /// the live drain is spawned. Anywhere later, a live frame folds while the
+    /// replay's partial buckets are unguarded; anywhere earlier (inside the
+    /// refold), every catch-up round would restart on a false gap.
+    #[test]
+    fn test_finish_wal_replay_runs_once_between_the_catch_up_and_the_drain() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let prod = src.split("#[cfg(test)]").next().expect("production half");
+        let call = "ingest.finish_wal_replay(replay_ended_on_gap);";
+        assert_eq!(prod.matches(call).count(), 1, "exactly one hand-over");
+        let finish = prod.find(call).expect("hand-over present");
+        let catch_up = prod
+            .find("refold_wal_frames(&mut ingest, &staged, &staged_gaps)")
+            .expect("catch-up refold present");
+        let spawn = prod
+            .find("tokio::spawn(run_frame_drain(")
+            .expect("drain spawn present");
+        assert!(
+            catch_up < finish && finish < spawn,
+            "catch-up, hand-over, drain"
+        );
+        let refold = prod
+            .split("pub fn refold_wal_frames")
+            .nth(1)
+            .and_then(|rest| rest.split("\npub fn ").next())
+            .expect("refold body");
+        assert!(
+            !refold.contains("set_replay_mode(false)") && !refold.contains("finish_replay"),
+            "the refold must not end replay mode between catch-up rounds"
+        );
+        // Review round 2: a jump in capture time (one process's frames meeting
+        // the next one's) is a gap in BOTH readers of the WAL, and the pass
+        // end is carried from the boot pass into the catch-up drain.
+        let main_src = include_str!("main.rs");
+        for (name, text) in [("main.rs", main_src), ("dhan_feed_stack.rs", prod)] {
+            assert!(
+                text.contains("process_boundary_is_gap("),
+                "{name} must flag a process boundary as a replay gap"
+            );
+        }
+        assert!(main_src.contains("wal_replay_trailing_gap: ws_wal_replay_trailing_gap,"));
+        assert!(
+            main_src.contains("wal_replay_last_fold_receipt: ws_wal_replay_last_fold_receipt,")
+        );
+        assert!(prod.contains("            params.wal_replay_trailing_gap\n"));
+        assert!(prod.contains("params.wal_replay_last_fold_receipt;"));
+        // Round 3: an EMPTY final pass can still end on a gap; it must reach
+        // the hand-over's verdict, not be skipped by the early break.
+        let empty_arm = prod
+            .split("if batch.frames.is_empty() {")
+            .nth(1)
+            .and_then(|rest| rest.split("break;").next())
+            .expect("empty-pass arm");
+        assert!(
+            empty_arm.contains("batch.trailing_gap") && empty_arm.contains("batch.leading_gap")
+        );
+    }
+
     /// The 2026-09-01 finding: a depth-socket frame in the live-feed WAL was
     /// reported as `unparseable` — a corruption signal — on every replay. It
     /// is now counted as what it is, and NOT as a decode failure.
@@ -23011,7 +23460,7 @@ mod wal_refold_tests {
             WalEndpoint::MainFeed,
             bytes::Bytes::from(depth_frame(DEEP_DEPTH_FEED_CODE_ASK, 20)),
         )];
-        let out = refold_wal_frames(&mut ingest(), &frames);
+        let out = refold_wal_frames(&mut ingest(), &frames, &[]);
         assert_eq!(out.depth_frames, 1, "the frame is a depth frame");
         assert_eq!(out.unparseable, 0, "and it is NOT reported as corruption");
         assert_eq!(out.undecodable, 0);
@@ -23147,7 +23596,7 @@ mod wal_refold_tests {
             bytes::Bytes::from(depth20_wal_packet(13, DEEP_DEPTH_FEED_CODE_BID)),
         )];
         let mut with_sink = ingest().with_inline_depth(DepthIngest::for_test());
-        let out = refold_wal_frames(&mut with_sink, &frames);
+        let out = refold_wal_frames(&mut with_sink, &frames, &[]);
         assert_eq!(
             out.depth_refolded_rows, 20,
             "every level is a row — nothing is sampled"
@@ -23182,7 +23631,7 @@ mod wal_refold_tests {
             WalEndpoint::Depth20,
             bytes::Bytes::from(depth20_wal_packet(13, DEEP_DEPTH_FEED_CODE_BID)),
         )];
-        let out = refold_wal_frames(&mut ingest(), &frames);
+        let out = refold_wal_frames(&mut ingest(), &frames, &[]);
         assert_eq!(
             out.depth_frames, 1,
             "no sink: counted as an un-recovered depth frame"
@@ -23206,7 +23655,7 @@ mod wal_refold_tests {
             bytes::Bytes::from(depth200_wal_packet(72_271, DEEP_DEPTH_FEED_CODE_ASK, 7)),
         )];
         let mut with_sink = ingest().with_inline_depth(DepthIngest::for_test());
-        let out = refold_wal_frames(&mut with_sink, &frames);
+        let out = refold_wal_frames(&mut with_sink, &frames, &[]);
         assert_eq!(out.depth_refolded_rows, 7, "seven rows in, seven rows out");
         assert_eq!(out.depth_refused, 0);
         assert_eq!(out.depth_frames, 0);
@@ -23239,7 +23688,7 @@ mod wal_refold_tests {
         // The LOOP header, not the first "for " in prose — the doc comments above the
         // loop say "for why" and "for exactly" long before any frame is folded.
         let first_frame_work = body
-            .find("\n    for (frame_seq, ")
+            .find("\n    for (frame_idx, (frame_seq, ")
             .expect("the refold loops over frames");
         assert!(
             set < first_frame_work,
@@ -23388,7 +23837,7 @@ mod wal_refold_tests {
             WalEndpoint::MainFeed,
             bytes::Bytes::from(bytes),
         )];
-        let out = refold_wal_frames(&mut ingest(), &frames);
+        let out = refold_wal_frames(&mut ingest(), &frames, &[]);
 
         assert_eq!(out.refolded, 0, "an OI packet carries no tick");
         assert_eq!(out.lost, 0, "and it is NOT a loss");
@@ -23470,7 +23919,7 @@ mod wal_refold_tests {
             bytes::Bytes::from(buf),
         )];
 
-        let without = refold_wal_frames(&mut ingest(), &frames);
+        let without = refold_wal_frames(&mut ingest(), &frames, &[]);
         assert_eq!(
             without.inline_depth_rows, 0,
             "with no inline-depth sink there is nothing to append to"
@@ -23478,7 +23927,7 @@ mod wal_refold_tests {
 
         let mut with_sink = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4)
             .with_inline_depth(DepthIngest::for_test());
-        let with = refold_wal_frames(&mut with_sink, &frames);
+        let with = refold_wal_frames(&mut with_sink, &frames, &[]);
 
         assert_eq!(
             with.inline_depth_rows, 10,
@@ -23516,7 +23965,7 @@ mod wal_refold_tests {
 
     #[test]
     fn test_refold_wal_frames_empty_batch_recovers_nothing() {
-        let out = refold_wal_frames(&mut ingest(), &[]);
+        let out = refold_wal_frames(&mut ingest(), &[], &[]);
         assert_eq!(out, WalRefoldOutcome::default());
     }
 
@@ -23531,7 +23980,7 @@ mod wal_refold_tests {
             WalEndpoint::MainFeed,
             bytes::Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF]),
         )];
-        let out = refold_wal_frames(&mut ingest(), &frames);
+        let out = refold_wal_frames(&mut ingest(), &frames, &[]);
         assert_eq!(out.refolded, 0, "garbage must not produce ticks");
         assert_eq!(
             out.unparseable, 1,
@@ -23550,7 +23999,7 @@ mod wal_refold_tests {
             WalEndpoint::MainFeed,
             bytes::Bytes::from_static(&[2, 0, 0, 0]),
         )];
-        let out = refold_wal_frames(&mut ingest(), &frames);
+        let out = refold_wal_frames(&mut ingest(), &frames, &[]);
         assert_eq!(out.refolded, 0);
         assert!(out.unparseable >= 1, "a truncated packet must be counted");
     }
@@ -23560,7 +24009,7 @@ mod wal_refold_tests {
         // The arithmetic guarantee the operator relies on: a tick is folded
         // XOR lost. If both could increment for one tick, a loss report could
         // be hidden behind a success count.
-        let out = refold_wal_frames(&mut ingest(), &[]);
+        let out = refold_wal_frames(&mut ingest(), &[], &[]);
         assert_eq!(out.refolded, 0);
         assert_eq!(out.lost, 0);
         // Structural: the fold's match arms are disjoint by construction —
