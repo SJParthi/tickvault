@@ -529,6 +529,12 @@ pub struct MultiTfAggregator {
     /// from one whose tail fell into the downtime (review round 15). `0`
     /// until a replayed tick.
     replay_last_frame_secs: u32,
+    /// `true` from a replay hand-over until the first live tick with a receipt
+    /// confirms the capture start (review round 16): the app reads its clock
+    /// for [`Self::set_live_capture_start`] BEFORE the sockets are dialled, so
+    /// the downtime really ends a dial-and-subscribe later. The first live
+    /// tick's receipt is the first moment known to be after it.
+    capture_start_provisional: bool,
     /// How far behind the watermark the live catch-up seal closes a quiet
     /// bucket (the app's `CATCHUP_LATENESS_MARGIN_SECS`). A replay uses it
     /// to recognise a tick that live may have seen only AFTER that seal
@@ -697,6 +703,7 @@ impl MultiTfAggregator {
             replay_suppressed_total: 0,
             live_capture_from_secs: 0,
             replay_last_frame_secs: 0,
+            capture_start_provisional: false,
             catch_up_margin_secs: DEFAULT_CATCH_UP_MARGIN_SECS,
             #[cfg(test)]
             test_capacity_override: None,
@@ -1073,6 +1080,19 @@ impl MultiTfAggregator {
     where
         F: FnMut(Feed, u64, u8, TfIndex, LiveCandleState),
     {
+        // WHEN THE PREVIOUS PROCESS STOPPED, AND WHEN THIS ONE STARTED (plan
+        // ITEM 47, review round 16). Both read the receipt of EVERY frame,
+        // before any gate below refuses it: a refused post-close or
+        // zero-price frame still shows the previous process was capturing.
+        // Replay pays one compare; live mode one bool test, false after its
+        // first tick.
+        if self.replay_mode {
+            if let Some(receipt) = receipt_ist_secs(tick.received_at_nanos) {
+                self.replay_last_frame_secs = self.replay_last_frame_secs.max(receipt);
+            }
+        } else if self.capture_start_provisional {
+            self.confirm_capture_start(tick.received_at_nanos);
+        }
         // PRICE CLASSIFICATION — corrupt and "not traded yet" are different
         // answers and were being given the same one.
         //
@@ -2537,6 +2557,9 @@ impl MultiTfAggregator {
         // O(1) EXEMPT: end
         self.replay_gap_epoch = hand_over_epoch;
         self.replay_mode = false;
+        // The capture start just used was read before the sockets were
+        // dialled; the first live tick confirms it (review round 16).
+        self.capture_start_provisional = live_from != 0;
         self.replay_suppressed_total = self
             .replay_suppressed_total
             .saturating_add(released_suppressed);
@@ -2560,6 +2583,51 @@ impl MultiTfAggregator {
     /// changes there.
     pub fn set_live_capture_start(&mut self, ist_fold_secs: u32) {
         self.live_capture_from_secs = ist_fold_secs;
+    }
+
+    /// Confirms the capture start on the first live tick after a replay
+    /// hand-over (plan ITEM 47, review round 16). The start set at the
+    /// hand-over was read before the sockets were dialled, so a bucket that
+    /// ended in the dial window was kept as complete although its tail was
+    /// in the downtime. This tick's receipt is known to be after listening
+    /// began: the capture start moves to it, and the hand-over's downtime
+    /// rule is applied once more to the buckets still kept.
+    ///
+    /// # Complexity
+    /// O(slots × `TF_COUNT`), ONCE per replay hand-over (at its first live
+    /// tick); every other tick pays one bool test in the caller.
+    fn confirm_capture_start(&mut self, received_at_nanos: i64) {
+        let Some(receipt) = receipt_ist_secs(received_at_nanos) else {
+            return;
+        };
+        self.capture_start_provisional = false;
+        if receipt <= self.live_capture_from_secs {
+            return;
+        }
+        self.live_capture_from_secs = receipt;
+        let last_frame = self.replay_last_frame_secs;
+        // O(1) EXEMPT: begin — once per replay hand-over, at its first live tick
+        for slot in &mut self.slots {
+            if slot.replay_handover_kept == 0 {
+                continue;
+            }
+            for tf in TfIndex::ALL {
+                let bit = replay_tf_bit(tf);
+                if slot.replay_handover_kept & bit == 0 {
+                    continue;
+                }
+                let start = slot.cell.open_bucket_start(tf);
+                let end = start.saturating_add(tf.seconds_per_bucket());
+                if start != 0
+                    && end <= receipt
+                    && end.saturating_add(REPLAY_FRONTIER_SKEW_SECS) > last_frame
+                {
+                    slot.replay_taint_open |= bit;
+                    slot.replay_handover_kept &= !bit;
+                }
+            }
+        }
+        // O(1) EXEMPT: end
     }
 
     /// Sets how far behind the watermark the live catch-up seal closes a
@@ -3198,6 +3266,97 @@ mod tests {
                  shares against {truth:?}"
             );
         }
+    }
+
+    /// Receipt in UTC nanoseconds for an IST second, for tests that need the
+    /// receipt clock.
+    fn receipt_at(ist_secs: u32) -> i64 {
+        (i64::from(ist_secs) - crate::candles::tf_index::IST_UTC_OFFSET_SECS) * 1_000_000_000
+    }
+
+    /// Review round 16, finding 1 (MEDIUM, reproduced): the app reads its
+    /// clock for the capture start BEFORE the sockets are dialled, so the
+    /// downtime really ends later. Here the hand-over says 09:20:55, before
+    /// the minute ends at 09:21:00, and the round-15 overcount came back (225
+    /// against 33). The first live tick's receipt now confirms the start.
+    #[test]
+    fn test_regression_the_first_live_receipt_confirms_the_capture_start() {
+        let at = |ts: u32, cum: u32, recv: u32| {
+            let mut t = tick(GAP_SID, SEG_EQ, OPEN + ts, 100.0 + cum as f32 * 0.001, cum);
+            if recv != 0 {
+                t.received_at_nanos = receipt_at(OPEN + recv);
+            }
+            t
+        };
+        let minute = |restart: bool| {
+            let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+            if restart {
+                agg.set_replay_mode(true);
+            }
+            let mut got = None;
+            let mut keep = |_: Feed, _: u64, _: u8, tf: TfIndex, st: LiveCandleState| {
+                if tf == TfIndex::M1 && st.bucket_start_ist_secs == OPEN + 300 {
+                    got = Some(st.volume);
+                }
+            };
+            for (ts, cum) in [(250, 12_000), (260, 12_010), (310, 12_020), (354, 12_043)] {
+                agg.consume_tick(Feed::Dhan, &at(ts, cum, 0), None, &mut keep);
+            }
+            if restart {
+                agg.set_live_capture_start(OPEN + 355);
+                agg.finish_replay(false, &mut keep);
+            } else {
+                agg.consume_tick(Feed::Dhan, &at(369, 12_108, 369), None, &mut keep);
+            }
+            agg.consume_tick(Feed::Dhan, &at(347, 12_235, 396), None, &mut keep);
+            agg.consume_tick(Feed::Dhan, &at(482, 12_313, 490), None, &mut keep);
+            agg.catch_up_seal_all(OPEN + 100_000, &mut keep);
+            got
+        };
+        let truth = minute(false);
+        assert_eq!(truth, Some(33), "control");
+        let written = minute(true);
+        assert!(
+            written.is_none() || written == truth,
+            "the 09:20 minute was written with {written:?} shares against {truth:?}"
+        );
+    }
+
+    /// Review round 16, finding 2 (reproduced): the previous process's last
+    /// frame moved only on ticks that passed every gate, so post-close frames
+    /// did not count; a crash after 15:40 then withheld the day's last bars of
+    /// every instrument, which the previous process never stored. Every
+    /// replayed frame's receipt now counts.
+    #[test]
+    fn test_regression_post_close_frames_show_the_previous_process_was_still_capturing() {
+        let close = OPEN + 23_100; // 15:40:00
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        agg.set_replay_mode(true);
+        let mut cum = 1_000_u32;
+        let mut ts = close - 300;
+        while ts < close {
+            cum += 10;
+            let mut t = gtick(ts, cum);
+            t.received_at_nanos = receipt_at(ts);
+            agg.consume_tick(Feed::Dhan, &t, None, ignore_seal);
+            ts += 7;
+        }
+        // Post-close frames: refused by the session gate, still captured.
+        for secs in [30, 90, 120] {
+            let mut t = gtick(close + secs, cum);
+            t.received_at_nanos = receipt_at(close + secs);
+            agg.consume_tick(Feed::Dhan, &t, None, ignore_seal);
+        }
+        agg.set_live_capture_start(close + 600);
+        agg.finish_replay(false, ignore_seal);
+        let mut sealed = Vec::new();
+        agg.catch_up_seal_all(close + 100_000, |_, _, _, tf, st| {
+            sealed.push((tf, st.bucket_start_ist_secs));
+        });
+        assert!(
+            sealed.contains(&(TfIndex::M1, close - 60)),
+            "the day's last minute, complete before the crash, is written: {sealed:?}"
+        );
     }
 
     /// Review round 14 (HIGH, reproduced by the reviewer): the re-send clears
