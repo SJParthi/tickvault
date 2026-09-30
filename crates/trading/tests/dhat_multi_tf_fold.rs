@@ -24,6 +24,7 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 
 use tickvault_common::feed::Feed;
 use tickvault_common::tick_types::ParsedTick;
+use tickvault_trading::candles::TfIndex;
 use tickvault_trading::candles::aggregator_cell::FeedStrategy;
 use tickvault_trading::candles::multi_tf_aggregator::MultiTfAggregator;
 
@@ -93,6 +94,7 @@ fn dhat_consume_tick_zero_alloc_in_bucket_and_across_boundaries() {
     let mut replay_live_sealed = 0usize;
     let mut live_withheld = 0u32;
     let mut day_close_sealed = 0usize;
+    let mut wrap_minute_volume = 0u64;
     let (_, allocs) = dhat_support::measure_with_phantom_retry(
         0,
         0,
@@ -202,9 +204,19 @@ fn dhat_consume_tick_zero_alloc_in_bucket_and_across_boundaries() {
             for (step, volume) in [u32::MAX - 20, u32::MAX - 5, 4, 30].into_iter().enumerate() {
                 let step = u32::try_from(step).unwrap_or(0);
                 let t = tick_at(next_day + step * 61, 24_020.0 + step as f32, volume);
-                agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {});
+                agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, tf, st| {
+                    // The minute holding the wrap (step 2): 5 + 1 + 4 units.
+                    if tf == TfIndex::M1 && st.bucket_start_ist_secs == next_day + 120 {
+                        wrap_minute_volume = st.volume;
+                    }
+                });
             }
         },
+    );
+
+    assert_eq!(
+        wrap_minute_volume, 10,
+        "phase (e): the minute holding the u32 wrap counts it forward exactly"
     );
 
     assert!(

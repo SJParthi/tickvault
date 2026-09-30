@@ -104,6 +104,9 @@ struct Case {
     /// bars after clearing each instrument's capture start, and no run here
     /// ever reached it).
     day_close: bool,
+    /// Every stock's cumulative starts just below `u32::MAX` and wraps
+    /// (review round 25: no run here ever came near the top of the range).
+    near_wrap: bool,
 }
 
 fn event() -> impl Strategy<Value = Event> {
@@ -138,6 +141,7 @@ fn case() -> impl Strategy<Value = Case> {
         prop::collection::vec(0u8..100, 64..600),
         prop::collection::vec(0u8..3, 4),
         prop::bool::weighted(0.35),
+        prop::bool::weighted(0.2),
     )
         .prop_map(
             |(
@@ -148,6 +152,7 @@ fn case() -> impl Strategy<Value = Case> {
                 unreadable,
                 resend_on_subscribe,
                 day_close,
+                near_wrap,
             )| Case {
                 instruments,
                 crash_per_mille,
@@ -156,6 +161,7 @@ fn case() -> impl Strategy<Value = Case> {
                 unreadable,
                 resend_on_subscribe,
                 day_close,
+                near_wrap,
             },
         )
 }
@@ -164,7 +170,10 @@ fn case() -> impl Strategy<Value = Case> {
 struct Packet {
     instrument: usize,
     trade: u32,
-    cumulative: u32,
+    /// The true day-cumulative on a monotonic 64-bit axis. The packet the
+    /// fold sees carries its low 32 bits, as the vendor's `u32` field does,
+    /// so a run that starts near the top of the range wraps (review round 25).
+    cumulative: u64,
     price: f32,
     high: f32,
     low: f32,
@@ -188,7 +197,7 @@ fn tick(p: &Packet, received_ms: u64) -> ParsedTick {
         exchange_segment_code: u8::from(p.instrument != 0),
         last_traded_price: p.price,
         exchange_timestamp: p.trade,
-        volume: p.cumulative,
+        volume: u32::try_from(p.cumulative % (1_u64 << 32)).unwrap_or(0),
         day_open: p.open,
         day_close: 1_000.0,
         day_high: p.high,
@@ -202,12 +211,19 @@ fn tick(p: &Packet, received_ms: u64) -> ParsedTick {
 fn packets(c: &Case) -> Vec<Packet> {
     let mut out = Vec::new();
     for (instrument, events) in c.instruments.iter().enumerate() {
-        let (mut trade, mut cumulative, mut price) = (START, 0u32, 1_000.0f32);
+        // Stocks of a near-wrap case start 300 units below `u32::MAX`, so their
+        // counter wraps early in the day (review round 25).
+        let base = if c.near_wrap && instrument != 0 {
+            u64::from(u32::MAX) - 300
+        } else {
+            0
+        };
+        let (mut trade, mut cumulative, mut price) = (START, base, 1_000.0f32);
         let (mut high, mut low, mut open, mut last_received) = (0f32, f32::MAX, 0f32, 0u64);
         for (k, e) in events.iter().enumerate() {
             trade += u32::from(e.dt);
             if instrument != 0 {
-                cumulative += u32::from(e.size);
+                cumulative += u64::from(e.size);
             }
             price = (price + f32::from(e.price_steps) * 0.05).max(1.0);
             if open == 0.0 {
@@ -454,7 +470,7 @@ fn check(c: &Case) -> Result<(), TestCaseError> {
     // added volume, whose bars are withheld because the gap packet may have
     // been a stale copy (review round 20).
     // It is the running baseline from then on.
-    let mut gap_cum: HashMap<usize, u32> = HashMap::new();
+    let mut gap_cum: HashMap<usize, u64> = HashMap::new();
     // Every packet that added volume while the gap packet was untrusted,
     // `(trade second, receipt ms)`: each one that traded no later than the
     // instrument's listen time plus the skew, and the first that traded later

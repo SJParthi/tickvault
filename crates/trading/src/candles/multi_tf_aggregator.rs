@@ -652,15 +652,20 @@ const CUMULATIVE_WRAP_SPAN: u64 = 1 << 32;
 /// timeframe forfeited its first trade (0 against 7).
 ///
 /// Any other large drop keeps its old meaning, a counter restart, and is
-/// re-anchored by the caller. An unseeded slot takes the raw value. O(1).
+/// re-anchored by the caller. `same_day_seeded` is `false` for an unseeded
+/// slot and for a packet on a later IST day than the last one: a day
+/// rollover in a process that never ran the day-close seal restarts the
+/// counter near zero, and read as a wrap it would count up to 2^28 units of
+/// yesterday forward (161 written against a true 10, review round 25). The
+/// raw value is returned then, and the turns restart. O(1).
 ///
 /// **Honest limit:** a vendor counter reset from within 2^28 of `u32::MAX` to
 /// within 2^28 of zero cannot be told from a wrap and would count at most
 /// 2^29 units forward; no such reset has been observed.
 #[inline]
-fn unwrap_u32_cumulative(raw: u32, last: u64, seeded: bool) -> u64 {
+fn unwrap_u32_cumulative(raw: u32, last: u64, same_day_seeded: bool) -> u64 {
     let raw = u64::from(raw);
-    if !seeded {
+    if !same_day_seeded {
         return raw;
     }
     let turns = last & !(CUMULATIVE_WRAP_SPAN - 1);
@@ -1670,7 +1675,8 @@ impl MultiTfAggregator {
             unwrap_u32_cumulative(
                 tick.volume,
                 slot.last_cumulative,
-                slot.volume_baseline_seeded,
+                slot.volume_baseline_seeded
+                    && slot.last_trade_ts / SECS_PER_DAY == fold_secs / SECS_PER_DAY,
             )
         });
 
@@ -1749,17 +1755,22 @@ impl MultiTfAggregator {
         // seen. Its first buckets are partial (the seeding tick's delta is
         // unknown) and those that started by then are withheld. A pre-market
         // boot has nothing to miss, so every first bar of the day is still
-        // written. A boot just before the open counts as mid-session, but a
-        // first receipt at or before 09:00:00 missed nothing: nothing trades
-        // or moves before the session opens (review round 24). A few compares
-        // on a seeding tick only.
+        // written. A boot just before the open counts as mid-session (review
+        // round 24). The capture start is never earlier than this packet's
+        // own trade second, nor than one second past the open: a packet of
+        // the same second can have been missed (a first receipt at
+        // 09:00:00.600 missed one at .100), and this box's clock can run
+        // behind the exchange's (review round 25). A few compares on a
+        // seeding tick only.
         if seeded_now
             && !replay_mode
             && capture_is_mid_session(live_from, fold_secs)
             && let Some(receipt) = receipt_ist_secs(tick.received_at_nanos)
-            && receipt % SECS_PER_DAY > CANDLE_SESSION_OPEN_SECS_OF_DAY_IST
         {
-            slot.handover_listen_secs = slot.handover_listen_secs.max(receipt);
+            let session_open =
+                fold_secs - fold_secs % SECS_PER_DAY + CANDLE_SESSION_OPEN_SECS_OF_DAY_IST;
+            let captured = receipt.max(fold_secs).max(session_open.saturating_add(1));
+            slot.handover_listen_secs = slot.handover_listen_secs.max(captured);
             // The seeding packet may be a stale copy too: the next trade's
             // delta may then carry downtime volume (review round 20).
             slot.prev_price_untrusted = true;
@@ -3215,6 +3226,9 @@ fn capture_is_mid_session(live_from: u32, fold_secs: u32) -> bool {
 /// **Honest limit:** a boot earlier than this whose sockets still had not
 /// connected by 09:00 is not detected; that is a feed outage, the same as a
 /// socket that drops mid-session with no restart.
+/// And a boot inside the window withholds each instrument's first bars
+/// whenever it first trades that day, as a mid-session boot does, not only
+/// near the open (review round 25): counted, never written wrong.
 const PRE_OPEN_DIAL_WINDOW_SECS: u32 = 300;
 
 /// Sets or clears `bit` in `mask`. O(1).
@@ -3822,12 +3836,14 @@ mod tests {
 
     /// Review round 24, F3 (MEDIUM): a boot just before 09:00 with an empty
     /// WAL never confirmed its capture start, and the 09:00 minute was written
-    /// with one price against a true 1000/1010/995 range. A first receipt at
-    /// 09:00:00 exactly missed nothing, so its bars are still written.
+    /// with one price against a true 1000/1010/995 range. Review round 25: a
+    /// first receipt in the open's own second can still have missed a packet of
+    /// that second, and this box's clock can run behind the exchange's, so both
+    /// are withheld too. `behind`: seconds the box clock runs behind.
     #[test]
     fn test_regression_boot_just_before_the_open_withholds_what_it_missed() {
         let open = CANDLE_OPEN;
-        let run = |boot: u32, first: u32| {
+        let run = |boot: u32, first: u32, behind: u32| {
             let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
             agg.set_live_capture_start(boot);
             agg.finish_replay(false, ignore_seal);
@@ -3838,7 +3854,7 @@ mod tests {
                 (open + 70, 1007.0),
             ] {
                 let mut t = tick(13, SEG_IDX, ts, px, 0);
-                t.received_at_nanos = receipt_at(ts);
+                t.received_at_nanos = receipt_at(ts - behind);
                 agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, tf, st| {
                     bars.insert((tf, st.bucket_start_ist_secs), st);
                 });
@@ -3850,17 +3866,18 @@ mod tests {
         };
         // 08:59:58 boot, first packet at 09:00:40: withheld.
         assert!(
-            !run(open - 2, open + 40),
+            !run(open - 2, open + 40, 0),
             "the 09:00 minute missed 40 s of prices"
         );
-        // Same boot, first packet at 09:00:00: nothing was missed.
-        assert!(
-            run(open - 2, open),
-            "a first receipt at the open misses nothing"
-        );
+        // Same boot, first packet in the open's own second: a packet earlier
+        // in that second may have been missed (round 25).
+        assert!(!run(open - 2, open, 0), "the open's own second");
+        // The box clock 2 s behind: the first packet (09:00:01) is received
+        // at 08:59:59 by this clock, after a missed 09:00:00 packet.
+        assert!(!run(open - 5, open + 1, 2), "box clock behind the exchange");
         // The scheduled 08:30 boot: listening long before the open.
         assert!(
-            run(open - 1_800, open + 40),
+            run(open - 1_800, open + 40, 0),
             "an 08:30 boot withholds nothing"
         );
     }
@@ -3906,6 +3923,37 @@ mod tests {
         assert_eq!(minutes.get(&OPEN), Some(&16));
         assert_eq!(minutes.get(&(OPEN + 60)), Some(&7));
         assert_eq!(minutes.get(&(OPEN + 120)), Some(&8));
+
+        // Review round 25 (LOW): a day rollover in a process that never ran
+        // the day-close seal is a counter RESTART, not a wrap, even when
+        // yesterday ended near the top of the range. Read as a wrap, today's
+        // first minute was written at 161 against a true 10.
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let next = OPEN + 86_400;
+        let mut day_two: HashMap<u32, u64> = HashMap::new();
+        for (ts, cum) in [
+            (OPEN, max - 200),
+            (OPEN + 5, max - 100),
+            (next, 50),
+            (next + 5, 60),
+        ] {
+            agg.consume_tick(
+                Feed::Dhan,
+                &tick(13, SEG_EQ, ts, 100.0, cum),
+                None,
+                |_, _, _, tf, st| {
+                    if tf == TfIndex::M1 && st.bucket_start_ist_secs >= next {
+                        day_two.insert(st.bucket_start_ist_secs, st.volume);
+                    }
+                },
+            );
+        }
+        agg.catch_up_seal_all(next + 100_000, |_, _, _, tf, st| {
+            if tf == TfIndex::M1 && st.bucket_start_ist_secs >= next {
+                day_two.insert(st.bucket_start_ist_secs, st.volume);
+            }
+        });
+        assert_eq!(day_two.get(&next), Some(&10), "re-anchored, not a wrap");
     }
 
     /// The `u32` cumulative widening itself (review round 24). O(1) cases.
@@ -3932,6 +3980,8 @@ mod tests {
         assert_eq!(unwrap_u32_cumulative(100, 4_000_000_000, true), 100);
         // A value near the top with no turn yet is an ordinary step.
         assert_eq!(unwrap_u32_cumulative(max, 5, true), u64::from(max));
+        // A later day (or an unseeded slot): the raw value, never a wrap.
+        assert_eq!(unwrap_u32_cumulative(3, u64::from(max - 5), false), 3);
     }
 
     /// Review round 18, all three defects (reproduced by a randomized restart
