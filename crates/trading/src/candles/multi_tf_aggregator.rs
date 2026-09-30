@@ -1607,7 +1607,11 @@ impl MultiTfAggregator {
         {
             slot.handover_listen_pending = false;
             slot.handover_listen_secs = receipt;
-            slot.taint_kept_ended_in_downtime(receipt, last_frame);
+            slot.taint_kept_ended_in_downtime(
+                receipt,
+                last_frame,
+                catch_up_margin.max(REPLAY_FRONTIER_SKEW_SECS),
+            );
         }
 
         let cumulative_volume =
@@ -1963,8 +1967,11 @@ impl MultiTfAggregator {
                     // Plan ITEM 47: the bucket just sealed inherits the open
                     // bucket's replay bits; the bucket this tick opened is
                     // complete unless this tick seeded the baseline.
-                    let before =
-                        ended_before_capture(tf, sealed_state.bucket_start_ist_secs, live_from);
+                    let before = ended_before_capture(
+                        tf,
+                        sealed_state.bucket_start_ist_secs,
+                        slot.capture_from(live_from),
+                    );
                     if slot.roll_replay_bits(tf, next_bucket_partial, replay_mode, before) {
                         stats.replay_partial_suppressed =
                             stats.replay_partial_suppressed.saturating_add(1);
@@ -1985,8 +1992,11 @@ impl MultiTfAggregator {
                     // A late tick amends the last SEALED bar. If a replay
                     // could only partly see that bar, re-emitting it would
                     // overwrite the complete live row (plan ITEM 47).
-                    let before =
-                        ended_before_capture(tf, amended_state.bucket_start_ist_secs, live_from);
+                    let before = ended_before_capture(
+                        tf,
+                        amended_state.bucket_start_ist_secs,
+                        slot.capture_from(live_from),
+                    );
                     if slot.sealed_is_suppressed(tf, replay_mode, before) {
                         stats.replay_partial_suppressed =
                             stats.replay_partial_suppressed.saturating_add(1);
@@ -2192,6 +2202,8 @@ impl MultiTfAggregator {
         let replay_mode = self.replay_mode;
         let gap_epoch = self.replay_gap_epoch;
         let live_from = self.live_capture_from_secs;
+        let margin = self.catch_up_margin_secs.max(REPLAY_FRONTIER_SKEW_SECS);
+        let last_frame = self.replay_last_frame_secs;
         for slot in &mut self.slots {
             slot.sync_replay_gap(gap_epoch);
             let (feed, sid, seg) = slot.key;
@@ -2240,8 +2252,15 @@ impl MultiTfAggregator {
                     Released::Nothing => {}
                 }
                 let nothing_open = slot.cell.snapshot(tf).is_uninitialised();
+                if !nothing_open {
+                    slot.hold_unconfirmed_kept(tf, margin, last_frame);
+                }
                 if let Some(state) = slot.cell.force_seal(tf) {
-                    let before = ended_before_capture(tf, state.bucket_start_ist_secs, live_from);
+                    let before = ended_before_capture(
+                        tf,
+                        state.bucket_start_ist_secs,
+                        slot.capture_from(live_from),
+                    );
                     let suppress = if nothing_open {
                         slot.sealed_is_suppressed(tf, replay_mode, before)
                     } else {
@@ -2349,6 +2368,8 @@ impl MultiTfAggregator {
         let replay_mode = self.replay_mode;
         let gap_epoch = self.replay_gap_epoch;
         let live_from = self.live_capture_from_secs;
+        let margin = self.catch_up_margin_secs.max(REPLAY_FRONTIER_SKEW_SECS);
+        let last_frame = self.replay_last_frame_secs;
         if let Some(range) = self.slots.get_mut(start..end) {
             for slot in range {
                 slot.sync_replay_gap(gap_epoch);
@@ -2366,9 +2387,15 @@ impl MultiTfAggregator {
                             Released::Nothing => {}
                         }
                     }
+                    if slot.cell.would_catch_up_seal(tf, cutoff_secs) {
+                        slot.hold_unconfirmed_kept(tf, margin, last_frame);
+                    }
                     if let Some(state) = slot.cell.catch_up_seal(tf, cutoff_secs) {
-                        let before =
-                            ended_before_capture(tf, state.bucket_start_ist_secs, live_from);
+                        let before = ended_before_capture(
+                            tf,
+                            state.bucket_start_ist_secs,
+                            slot.capture_from(live_from),
+                        );
                         if slot.take_open_partial(tf, replay_mode, before) {
                             count_replay_partial_suppressed();
                             self.replay_suppressed_total =
@@ -2490,6 +2517,7 @@ impl MultiTfAggregator {
         let live_from = self.live_capture_from_secs;
         let mut released_suppressed = 0_u64;
         let last_frame = self.replay_last_frame_secs;
+        let margin = self.catch_up_margin_secs.max(REPLAY_FRONTIER_SKEW_SECS);
         let epoch = self.replay_gap_epoch;
         // The hand-over gap (the downtime before the first live frame) is
         // applied HERE, eagerly, rather than through the lazy epoch sync: the
@@ -2533,7 +2561,7 @@ impl MultiTfAggregator {
             // withholding when this box's clock runs ahead of the exchange.
             slot.replay_handover_kept = open_mask & !slot.replay_taint_open;
             if live_from != 0 {
-                slot.taint_kept_ended_in_downtime(live_from, last_frame);
+                slot.taint_kept_ended_in_downtime(live_from, last_frame, margin);
             }
             // Each instrument re-applies the rule at its own first live
             // receipt (review round 17).
@@ -2622,10 +2650,11 @@ impl MultiTfAggregator {
             return;
         }
         self.live_capture_from_secs = receipt;
+        let margin = self.catch_up_margin_secs.max(REPLAY_FRONTIER_SKEW_SECS);
         let last_frame = self.replay_last_frame_secs;
         // O(1) EXEMPT: begin — once per replay hand-over, at its first live tick
         for slot in &mut self.slots {
-            slot.taint_kept_ended_in_downtime(receipt, last_frame);
+            slot.taint_kept_ended_in_downtime(receipt, last_frame, margin);
         }
         // O(1) EXEMPT: end
     }
@@ -2708,7 +2737,13 @@ impl InstrumentSlot {
     /// when this instrument's feed was known to be listening again (review
     /// rounds 15 to 17). Nobody captured those trades, so the bucket is not
     /// complete. O(`TF_COUNT`).
-    fn taint_kept_ended_in_downtime(&mut self, listening_from: u32, last_frame: u32) {
+    ///
+    /// `margin` is how long after a bucket's end its late ticks may still
+    /// arrive (the live catch-up margin): a bucket is complete only if the
+    /// previous process kept capturing that long past its end (review round
+    /// 18: with a 5 s allowance, a 90 s-late trade delivered after the crash
+    /// left a kept minute short).
+    fn taint_kept_ended_in_downtime(&mut self, listening_from: u32, last_frame: u32, margin: u32) {
         if self.replay_handover_kept == 0 {
             return;
         }
@@ -2719,13 +2754,44 @@ impl InstrumentSlot {
             }
             let start = self.cell.open_bucket_start(tf);
             let end = start.saturating_add(tf.seconds_per_bucket());
-            if start != 0
-                && end <= listening_from
-                && end.saturating_add(REPLAY_FRONTIER_SKEW_SECS) > last_frame
-            {
+            if start != 0 && end <= listening_from && end.saturating_add(margin) > last_frame {
                 self.replay_taint_open |= bit;
                 self.replay_handover_kept &= !bit;
             }
+        }
+    }
+
+    /// This instrument's capture start: the process-wide one, or its own first
+    /// live receipt when that is later (review round 18). A bucket that ended
+    /// before it is a fragment of the downtime, whatever the other sockets
+    /// did. O(1).
+    #[inline]
+    fn capture_from(&self, live_from: u32) -> u32 {
+        if live_from == 0 {
+            0
+        } else {
+            live_from.max(self.handover_listen_secs)
+        }
+    }
+
+    /// Before a kept bucket is sealed by a sweep while this instrument has
+    /// not yet confirmed its own listening time (review round 18): a bucket
+    /// that ended within `margin` of the previous process's last frame may
+    /// still have its tail in this instrument's downtime, which only its
+    /// first live receipt can rule out, so it is tainted and withheld. A
+    /// bucket that ended earlier is complete whatever the downtime. O(1).
+    fn hold_unconfirmed_kept(&mut self, tf: TfIndex, margin: u32, last_frame: u32) {
+        let bit = replay_tf_bit(tf);
+        if !self.handover_listen_pending || self.replay_handover_kept & bit == 0 {
+            return;
+        }
+        let end = self
+            .cell
+            .open_bucket_start(tf)
+            .saturating_add(tf.seconds_per_bucket());
+        if end.saturating_add(margin) > last_frame {
+            self.replay_taint_open |= bit;
+            self.replay_handover_kept &= !bit;
         }
     }
 
@@ -2857,7 +2923,7 @@ where
     let Some(bar) = slot.cell.last_sealed_snapshot(tf) else {
         return Released::Nothing;
     };
-    let before = ended_before_capture(tf, bar.bucket_start_ist_secs, live_from);
+    let before = ended_before_capture(tf, bar.bucket_start_ist_secs, slot.capture_from(live_from));
     if slot.sealed_is_suppressed(tf, true, before) {
         count_replay_partial_suppressed();
         return Released::Suppressed;
@@ -3244,7 +3310,7 @@ mod tests {
     fn test_regression_a_late_first_live_trade_cannot_pour_the_downtime_into_a_kept_minute() {
         let at =
             |ts: u32, cum: u32| tick(GAP_SID, SEG_EQ, OPEN + ts, 100.0 + cum as f32 * 0.001, cum);
-        // `neighbour`: another instrument's frame at 09:21:40 shows the
+        // `neighbour`: another instrument's frame at 09:26:40 shows the
         // previous process still captured after the minute ended, so the
         // minute is complete and KEPT at the hand-over, and only the span
         // bound stands between it and the downtime (without it, the
@@ -3266,13 +3332,13 @@ mod tests {
             if neighbour {
                 agg.consume_tick(
                     Feed::Dhan,
-                    &tick(GAP_SID + 3, SEG_EQ, OPEN + 400, 50.0, 10),
+                    &tick(GAP_SID + 3, SEG_EQ, OPEN + 700, 50.0, 10),
                     None,
                     &mut keep,
                 );
             }
             if restart {
-                agg.set_live_capture_start(OPEN + if neighbour { 420 } else { 396 });
+                agg.set_live_capture_start(OPEN + if neighbour { 720 } else { 396 });
                 agg.finish_replay(false, &mut keep);
             } else {
                 // The downtime trade only a process that never stopped sees.
@@ -3299,6 +3365,154 @@ mod tests {
     /// receipt clock.
     fn receipt_at(ist_secs: u32) -> i64 {
         (i64::from(ist_secs) - crate::candles::tf_index::IST_UTC_OFFSET_SECS) * 1_000_000_000
+    }
+
+    /// One packet for the restart harness below: instrument, trade second,
+    /// price, cumulative, receipt second (all seconds after the open).
+    type RestartPkt = (u64, u32, f32, u32, u32);
+
+    /// Round-18 restart harness. `restart = None`: a process that never stops
+    /// folds every packet live, running the live catch-up
+    /// (`min(watermark, receipt) - 240 s`) after each. `Some((crash, start,
+    /// listen))`: the previous process captured every packet received by
+    /// `crash` (the WAL), which is replayed; the capture start is `start`;
+    /// each instrument listens from its entry in `listen` (default `start`),
+    /// so a packet received before that is lost; the rest are folded live
+    /// with the same catch-up. Returns the last bar written per key.
+    fn restart_bars(
+        pkts: &[RestartPkt],
+        restart: Option<(u32, u32, &[(u64, u32)])>,
+    ) -> HashMap<(u64, TfIndex, u32), LiveCandleState> {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let mut bars = HashMap::new();
+        let packet = |&(sid, ts, px, cum, recv): &RestartPkt| {
+            let mut t = tick(sid, SEG_EQ, OPEN + ts, px, cum);
+            t.received_at_nanos = receipt_at(OPEN + recv);
+            t
+        };
+        if let Some((crash, start, _)) = restart {
+            agg.set_replay_mode(true);
+            for p in pkts.iter().filter(|p| p.4 <= crash) {
+                agg.consume_tick(Feed::Dhan, &packet(p), None, |_, id, _, tf, st| {
+                    bars.insert((id, tf, st.bucket_start_ist_secs), st);
+                });
+            }
+            agg.set_live_capture_start(OPEN + start);
+            agg.finish_replay(false, |_, id, _, tf, st| {
+                bars.insert((id, tf, st.bucket_start_ist_secs), st);
+            });
+        }
+        for p in pkts {
+            if let Some((crash, start, listen)) = restart {
+                let own = listen
+                    .iter()
+                    .find(|(id, _)| *id == p.0)
+                    .map_or(start, |l| l.1);
+                if p.4 <= crash || p.4 < own {
+                    continue;
+                }
+            }
+            agg.consume_tick(Feed::Dhan, &packet(p), None, |_, id, _, tf, st| {
+                bars.insert((id, tf, st.bucket_start_ist_secs), st);
+            });
+            let cutoff = agg.watermark_secs().min(OPEN + p.4).saturating_sub(240);
+            agg.catch_up_seal_all(cutoff, |_, id, _, tf, st| {
+                bars.insert((id, tf, st.bucket_start_ist_secs), st);
+            });
+        }
+        agg.catch_up_seal_all(OPEN + 100_000, |_, id, _, tf, st| {
+            bars.insert((id, tf, st.bucket_start_ist_secs), st);
+        });
+        bars
+    }
+
+    /// Review round 18, all three defects (reproduced by a randomized restart
+    /// differential; no bar ever carried MORE volume than the uninterrupted
+    /// run). Each wrote a short or unclassified bar for a bucket the previous
+    /// process never stored; each must now be withheld or exact.
+    #[test]
+    fn test_regression_restart_edges_withhold_what_the_downtime_touched() {
+        const STOCK: u64 = GAP_SID;
+        const INDEX: u64 = GAP_SID + 1;
+        let check = |name: &str,
+                     pkts: &[RestartPkt],
+                     restart: (u32, u32, &[(u64, u32)]),
+                     tf: TfIndex,
+                     start: u32| {
+            let truth = restart_bars(pkts, None);
+            let written = restart_bars(pkts, Some(restart));
+            let key = (STOCK, tf, OPEN + start);
+            let t = truth.get(&key).map(|b| (b.volume, b.net_volume_classified));
+            let w = written
+                .get(&key)
+                .map(|b| (b.volume, b.net_volume_classified));
+            assert!(t.is_some(), "{name}: control writes the bar");
+            assert!(w.is_none() || w == t, "{name}: wrote {w:?} against {t:?}");
+        };
+        // Seed and settle the stock in an earlier bucket, then trade in the
+        // 09:16 minute [60, 120).
+        let seed: [RestartPkt; 4] = [
+            (STOCK, 5, 100.0, 1_000, 5),
+            (STOCK, 20, 100.5, 1_005, 20),
+            (STOCK, 65, 101.0, 1_010, 65),
+            (STOCK, 80, 101.5, 1_012, 80),
+        ];
+        // 1. A trade at +110 delivered 90 s late, at +200, after the crash at
+        //    +180: the minute ended only 60 s before the previous process's
+        //    last frame, inside the 240 s a late trade may take.
+        let mut p1: Vec<RestartPkt> = seed.to_vec();
+        p1.push((STOCK, 110, 102.0, 1_032, 200));
+        for s in (25..=180).step_by(20) {
+            p1.push((INDEX, s, 500.0 + s as f32 * 0.05, 0, s));
+        }
+        p1.push((STOCK, 300, 102.5, 1_040, 300));
+        p1.sort_by_key(|p| p.4);
+        check(
+            "late trade after the crash",
+            &p1,
+            (180, 210, &[]),
+            TfIndex::M1,
+            60,
+        );
+        // 2. Crash at +90, a trade at +100 lost; the index confirms the
+        //    capture start at +95, the stock listens only from +130 and first
+        //    trades at +900. The sweep closed the kept minute first.
+        let mut p2: Vec<RestartPkt> = seed.to_vec();
+        p2.push((STOCK, 100, 102.0, 1_032, 100));
+        for s in (30..=500).step_by(20) {
+            p2.push((INDEX, s, 500.0 + s as f32 * 0.05, 0, s));
+        }
+        p2.push((STOCK, 900, 102.5, 1_040, 900));
+        p2.sort_by_key(|p| p.4);
+        check(
+            "swept before the stock listened",
+            &p2,
+            (90, 95, &[(STOCK, 130)]),
+            TfIndex::M1,
+            60,
+        );
+        // 3. Capture start +20 (the index), the stock listens from +70; its
+        //    subscribe snapshot re-sends the +40 trade lost in the downtime.
+        let p3: Vec<RestartPkt> = vec![
+            (STOCK, 2, 100.0, 1_000, 2),
+            (STOCK, 5, 100.5, 1_005, 5),
+            (INDEX, 8, 500.0, 0, 8),
+            (INDEX, 20, 500.5, 0, 20),
+            (STOCK, 40, 101.0, 1_035, 40),
+            (STOCK, 40, 101.0, 1_035, 70),
+            (STOCK, 400, 101.5, 1_040, 400),
+            (INDEX, 400, 501.0, 0, 400),
+        ];
+        for tf in [TfIndex::S1, TfIndex::S3, TfIndex::S5] {
+            let start = tf.bucket_start(OPEN + 40) - OPEN;
+            check(
+                "own listening time",
+                &p3,
+                (10, 20, &[(STOCK, 70)]),
+                tf,
+                start,
+            );
+        }
     }
 
     /// Review round 16, finding 1 (MEDIUM, reproduced): the app reads its
@@ -3381,7 +3595,7 @@ mod tests {
             ts += 7;
         }
         // Post-close frames: refused by the session gate, still captured.
-        for secs in [30, 90, 120] {
+        for secs in [60, 150, 250] {
             let mut t = gtick(close + secs, cum);
             t.received_at_nanos = receipt_at(close + secs);
             agg.consume_tick(Feed::Dhan, &t, None, ignore_seal);
@@ -3461,10 +3675,10 @@ mod tests {
         let run = |late: bool| {
             let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
             agg.set_replay_mode(true);
-            // A quiet instrument whose 09:25 minute ended long before the
+            // A quiet instrument whose 09:20 minute ended long before the
             // previous process stopped. Its first ticks seed and settle it
             // (a first bucket and the settling one are partial by design).
-            for (ts, px, cum) in [(300, 50.0, 10), (400, 51.0, 20), (610, 52.0, 30)] {
+            for (ts, px, cum) in [(100, 50.0, 10), (200, 51.0, 20), (310, 52.0, 30)] {
                 agg.consume_tick(
                     Feed::Dhan,
                     &tick(QUIET, SEG_EQ, OPEN + ts, px, cum),
@@ -3526,8 +3740,8 @@ mod tests {
             );
             // Ended while the previous process still captured: complete.
             assert!(
-                out.contains_key(&(QUIET, TfIndex::M1, OPEN + 600)),
-                "{name}: the quiet instrument's 09:25 minute, ended while the previous process still captured, is kept"
+                out.contains_key(&(QUIET, TfIndex::M1, OPEN + 300)),
+                "{name}: the quiet instrument's 09:20 minute, ended while the previous process still captured, is kept"
             );
         }
     }
@@ -3647,10 +3861,11 @@ mod tests {
         // Another instrument's frame shows the previous process was still
         // capturing after the minute ended, so its quiet tail was seen, not
         // lost to the downtime (review round 15: only such a minute is
-        // complete).
+        // complete; round 18: at least the live catch-up margin past its end,
+        // since late trades arrive that long after).
         agg.consume_tick(
             Feed::Dhan,
-            &tick(GAP_SID + 7, SEG_EQ, OPEN + 130, 50.0, 10),
+            &tick(GAP_SID + 7, SEG_EQ, OPEN + 400, 50.0, 10),
             None,
             ignore_seal,
         );
