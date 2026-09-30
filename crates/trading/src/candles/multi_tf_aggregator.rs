@@ -1663,17 +1663,26 @@ impl MultiTfAggregator {
         // never received, and the fold below is what attributes it. Rare, and
         // folding it costs one tick of `tick_count` — the safe direction.
         if repeat_candidate && extremes.is_empty() {
-            // A repeat of the last COUNTED trade resolves a pending gap
-            // exactly (plan ITEM 47, review round 13): it carries the same
-            // cumulative, so nothing traded between that trade and this
-            // packet, and the gap has nothing to discard. Left pending, the
-            // gap discarded the NEXT real trade's delta instead — after a
-            // restart, where Dhan re-sends the last trade on every order-book
-            // change, the first live trade of the instrument lost its volume.
-            // The gap tick's other duties (re-base, net marked unknown,
-            // settling) all guard trades a skipped span might hold; there are
-            // none. O(1).
-            slot.replay_gap_rebase_pending = false;
+            // A repeat of the last COUNTED trade resolves a pending gap (plan
+            // ITEM 47, review round 13): it carries the same cumulative, so
+            // the gap has nothing to discard. Left pending, the gap discarded
+            // the NEXT real trade's delta instead — after a restart, where
+            // Dhan re-sends the last trade on every order-book change, the
+            // first live trade of the instrument lost its volume.
+            //
+            // ⚠ It still SETTLES, exactly as a gap tick does (review round 14,
+            // both reproduced). The gap reset the tick-rule direction, so the
+            // next trade at an unchanged price has no sign and its bar would
+            // publish a null net over a stored signed one; and a STALE copy of
+            // the last pre-gap state is indistinguishable from a true re-send,
+            // so the next trade may carry a skipped span. Settling marks those
+            // buckets partial: a replay withholds them, as it did before this
+            // clear, while live mode (whose partial marks matter only before
+            // the capture start) keeps the next trade's volume. O(1).
+            if slot.replay_gap_rebase_pending {
+                slot.replay_gap_rebase_pending = false;
+                slot.replay_settling = true;
+            }
             let mut refreshed_open: u16 = 0;
             for tf in TfIndex::ALL {
                 // `false` means the bucket this trade belongs to has already
@@ -3071,7 +3080,57 @@ mod tests {
         let continuous = run(0);
         assert_eq!(continuous.map(|m| m.0), Some(10), "control");
         assert_eq!(run(1), continuous, "after a restart");
-        assert_eq!(run(2), continuous, "after a gap inside the replay");
+        // Inside a replay the minute still settles (review round 14): it is
+        // withheld, never written with a different buy/sell split.
+        assert_eq!(run(2), None, "after a gap inside the replay");
+    }
+
+    /// Review round 14 (HIGH, reproduced by the reviewer): the re-send clears
+    /// the gap, but the gap also reset the tick-rule direction. Without
+    /// settling, the next trade at an UNCHANGED price had no sign, and the
+    /// replay wrote its minute with an unclassified net over the stored,
+    /// classified one. Whatever the replay emits must equal what live stored.
+    #[test]
+    fn test_regression_a_resent_trade_still_settles_an_unsigned_next_trade() {
+        let at = |ts: u32, px: f32, cum: u32| tick(GAP_SID, SEG_EQ, ts, px, cum);
+        let run = |replay: bool| {
+            let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+            if replay {
+                agg.set_replay_mode(true);
+            }
+            let mut minute = None;
+            let mut keep = |_: Feed, _: u64, _: u8, tf: TfIndex, st: LiveCandleState| {
+                if tf == TfIndex::M1 && st.bucket_start_ist_secs == OPEN + 360 {
+                    minute = Some((st.volume, st.net_volume_classified));
+                }
+            };
+            agg.consume_tick(Feed::Dhan, &at(OPEN + 60, 100.0, 1_000), None, &mut keep);
+            agg.consume_tick(Feed::Dhan, &at(OPEN + 61, 101.0, 1_050), None, &mut keep);
+            if replay {
+                agg.mark_replay_gap();
+            }
+            let mut resent = at(OPEN + 61, 101.0, 1_050);
+            resent.open_interest = 7;
+            agg.consume_tick(Feed::Dhan, &resent, None, &mut keep);
+            // Same price: only the carried direction can sign it.
+            agg.consume_tick(Feed::Dhan, &at(OPEN + 400, 101.0, 1_060), None, &mut keep);
+            if replay {
+                agg.finish_replay(false, &mut keep);
+            }
+            agg.catch_up_seal_all(OPEN + 100_000, &mut keep);
+            minute
+        };
+        let stored = run(false);
+        assert_eq!(
+            stored,
+            Some((10, true)),
+            "control: live signs it from the carry"
+        );
+        let rebuilt = run(true);
+        assert!(
+            rebuilt.is_none() || rebuilt == stored,
+            "the replay wrote {rebuilt:?} over the stored {stored:?}"
+        );
     }
 
     /// Plan ITEM 47, review round 12 (MEDIUM, reproduced by the reviewer): a
