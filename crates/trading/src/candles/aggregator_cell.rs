@@ -890,6 +890,17 @@ impl AggregatorCell {
     ///   otherwise chain to the last SEALED bar, whose endpoint is from before
     ///   the gap.
     ///
+    /// `span_ends_by_secs` bounds the skipped span when it is known: after
+    /// the hand-over to the live feed it is the capture start, since every
+    /// downtime trade happened before the new process began listening (`0`
+    /// = unbounded, as inside a replay). A SAME-bucket open bucket that ENDED
+    /// by then cannot hold the whole span — the trades after its end belong
+    /// to later buckets — so it is re-based like a rolled one instead of
+    /// absorbing the span, and its bit is returned so the caller can mark it
+    /// partial (review round 15: a LATE first live trade poured the whole
+    /// downtime into the minute the hand-over had kept, 225 shares against a
+    /// true 33).
+    ///
     /// # Complexity
     /// O(`TF_COUNT`).
     pub fn rebase_open_buckets_after_gap(
@@ -897,7 +908,9 @@ impl AggregatorCell {
         cumulative_volume: u64,
         fold_secs: u32,
         last_counted_secs: u32,
-    ) {
+        span_ends_by_secs: u32,
+    ) -> u16 {
+        let mut unabsorbed: u16 = 0;
         for tf in TfIndex::ALL {
             let ord = tf.as_ordinal();
             let state = &mut self.slots[ord];
@@ -906,10 +919,15 @@ impl AggregatorCell {
             // cumulative counted was inside it too: a bucket opened after it
             // (by a stale packet) chains to the pre-gap end, and would take
             // the previous bucket's skipped tail (review round 4).
-            if open
+            let same_bucket = open
                 && tf.bucket_start(fold_secs) == state.bucket_start_ist_secs
-                && state.bucket_start_ist_secs <= last_counted_secs
-            {
+                && state.bucket_start_ist_secs <= last_counted_secs;
+            let span_fits = span_ends_by_secs == 0
+                || state
+                    .bucket_start_ist_secs
+                    .saturating_add(tf.seconds_per_bucket())
+                    > span_ends_by_secs;
+            if same_bucket && span_fits {
                 // The gross now includes trades whose direction nobody saw, so
                 // the net can no longer claim to cover them (review,
                 // 2026-09-29), exactly as an unclassified carry does.
@@ -926,8 +944,12 @@ impl AggregatorCell {
                 carry.settle_into(state);
                 state.bucket_start_cumulative = cumulative_volume.saturating_sub(state.volume);
             }
+            if same_bucket {
+                unabsorbed |= 1_u16 << ord;
+            }
             self.chain_broken[ord] = !open;
         }
+        unabsorbed
     }
     /// Folds one tick into ONE timeframe slot.
     ///
@@ -3054,7 +3076,7 @@ mod tests {
         // The post-gap tick ROLLS M1 (it lands at 11:06:40): re-based,
         // counted volume kept, chain intact; unopened frames break it.
         let mut cell = open_m1();
-        cell.rebase_open_buckets_after_gap(100_000, 40_000, 33_310);
+        cell.rebase_open_buckets_after_gap(100_000, 40_000, 33_310, 0);
         for tf in TfIndex::ALL {
             let open = !cell.snapshot(tf).is_uninitialised();
             assert_eq!(
@@ -3079,7 +3101,7 @@ mod tests {
         // whole skipped span is in this bucket, so nothing moves and the
         // cumulative attributes it exactly.
         let mut cell = open_m1();
-        cell.rebase_open_buckets_after_gap(100_000, 33_330, 33_310);
+        cell.rebase_open_buckets_after_gap(100_000, 33_330, 33_310, 0);
         let m1 = cell.snapshot(TfIndex::M1);
         assert_eq!(m1.bucket_start_cumulative, 10, "same bucket: not re-based");
         assert!(
@@ -3096,7 +3118,7 @@ mod tests {
         // Same bucket, but the last COUNTED tick was before it opened (a
         // stale packet opened it): the span began elsewhere, so it re-bases.
         let mut cell = open_m1();
-        cell.rebase_open_buckets_after_gap(100_000, 33_330, 33_290);
+        cell.rebase_open_buckets_after_gap(100_000, 33_330, 33_290, 0);
         let m1 = cell.snapshot(TfIndex::M1);
         assert_eq!(
             m1.bucket_start_cumulative,
