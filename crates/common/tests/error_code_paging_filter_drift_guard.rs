@@ -681,7 +681,13 @@ fn prod_has_error_level_needle(prod_compact: &str, needle: &str) -> bool {
     let mut search_from = 0usize;
     while let Some(rel) = prod_compact[search_from..].find(needle) {
         let idx = search_from + rel;
-        let window_start = idx.saturating_sub(800);
+        // 800 BYTES back, then forward to a character boundary: slicing
+        // inside a multi-byte character (an en dash in a nearby comment)
+        // panicked (2026-09-30).
+        let mut window_start = idx.saturating_sub(800);
+        while !prod_compact.is_char_boundary(window_start) {
+            window_start += 1;
+        }
         let window = &prod_compact[window_start..idx];
         let mut last: Option<(usize, &str)> = None;
         for opener in OPENERS {
@@ -1011,6 +1017,21 @@ fn synthetic_doc_parser_detects_a_missing_code() {
 fn synth_detect(src: &str, variant: &str) -> bool {
     let prod = compact(&production_view(src));
     prod_has_error_level_needle(&prod, &format!("ErrorCode::{variant}.code_str()"))
+}
+
+#[test]
+fn needle_window_never_slices_inside_a_multi_byte_character() {
+    // 2026-09-30: an en dash (3 bytes) 800 bytes before the needle put
+    // the window start inside it and the guard panicked. The filler length
+    // walks the 800-byte cut across the dash, so two runs straddle it.
+    let needle = "ErrorCode::Proc01OomKillDetected.code_str()";
+    for filler in 784..=789 {
+        let prod = format!("\u{2013}{}error!(code={needle},\"x\");", "b".repeat(filler));
+        assert!(
+            prod_has_error_level_needle(&prod, needle),
+            "filler {filler}"
+        );
+    }
 }
 
 #[test]

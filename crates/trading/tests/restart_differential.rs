@@ -99,6 +99,11 @@ struct Case {
     /// listened), 2 a STALE copy of the last trade the previous process
     /// received (review round 20), which looks exactly like a true re-send.
     resend_on_subscribe: Vec<u8>,
+    /// Both runs end with the day-close seal (`force_seal_all`) instead of a
+    /// final catch-up sweep (review round 24: the day-close seal judged
+    /// bars after clearing each instrument's capture start, and no run here
+    /// ever reached it).
+    day_close: bool,
 }
 
 fn event() -> impl Strategy<Value = Event> {
@@ -132,6 +137,7 @@ fn case() -> impl Strategy<Value = Case> {
         prop::collection::vec(0u32..=20, 4),
         prop::collection::vec(0u8..100, 64..600),
         prop::collection::vec(0u8..3, 4),
+        prop::bool::weighted(0.35),
     )
         .prop_map(
             |(
@@ -141,6 +147,7 @@ fn case() -> impl Strategy<Value = Case> {
                 listen_after_start,
                 unreadable,
                 resend_on_subscribe,
+                day_close,
             )| Case {
                 instruments,
                 crash_per_mille,
@@ -148,6 +155,7 @@ fn case() -> impl Strategy<Value = Case> {
                 listen_after_start,
                 unreadable,
                 resend_on_subscribe,
+                day_close,
             },
         )
 }
@@ -289,6 +297,15 @@ fn sweep(agg: &mut MultiTfAggregator, wall_secs: u32, out: &mut Written) {
     agg.catch_up_seal_all(cutoff, |_, sid, _, tf, bar| out.put(sid, tf, bar));
 }
 
+/// Ends a run: the day-close seal, or a final catch-up sweep to `end_cutoff`.
+fn finish(agg: &mut MultiTfAggregator, day_close: bool, end_cutoff: u32, out: &mut Written) {
+    if day_close {
+        agg.force_seal_all(|_, sid, _, tf, bar| out.put(sid, tf, bar));
+    } else {
+        agg.catch_up_seal_all(end_cutoff, |_, sid, _, tf, bar| out.put(sid, tf, bar));
+    }
+}
+
 /// Folds `packets` live from a capture start before the session.
 fn fold_live<'a>(
     packets: impl Iterator<Item = &'a Packet>,
@@ -346,7 +363,7 @@ fn check(c: &Case) -> Result<(), TestCaseError> {
 
     let mut truth = Written::default();
     let mut truth_agg = fold_live(all.iter(), &mut truth);
-    truth_agg.catch_up_seal_all(end_cutoff, |_, sid, _, tf, bar| truth.put(sid, tf, bar));
+    finish(&mut truth_agg, c.day_close, end_cutoff, &mut truth);
 
     let crash_ms = first.received_ms
         + (last.received_ms - first.received_ms) * u64::from(c.crash_per_mille) / 1000;
@@ -504,7 +521,7 @@ fn check(c: &Case) -> Result<(), TestCaseError> {
         );
         sweep(&mut agg, (*received / 1000) as u32, &mut restart);
     }
-    agg.catch_up_seal_all(end_cutoff, |_, sid, _, tf, bar| restart.put(sid, tf, bar));
+    finish(&mut agg, c.day_close, end_cutoff, &mut restart);
     // The first live receipt of ANY instrument confirms the capture start.
     let confirmed_start = live.first().map_or(capture_start, |(received, _, _)| {
         capture_start.max((*received / 1000) as u32)
