@@ -84,7 +84,7 @@ const NON_QUESTDB_NON_SOCKET_GIB_HIGH: u64 = 16;
 const SYSCTL_CONF: &str = "deploy/aws/sysctl/99-tickvault-net.conf";
 const VERIFIER: &str = "crates/app/src/host_tuning.rs";
 /// How the boot unit invokes the verifier (audit D6b, 2026-10-01).
-const VERIFIER_CALL: &str = "tickvault host-tuning verify";
+const VERIFIER_CALL: &str = "tickvault-host host-tuning verify";
 const USER_DATA: &str = "deploy/aws/terraform/user-data.sh.tftpl";
 const COMPOSE: &str = "deploy/docker/docker-compose.yml";
 const TF_VARS: &str = "deploy/aws/terraform/variables.tf";

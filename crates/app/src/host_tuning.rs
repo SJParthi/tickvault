@@ -128,7 +128,7 @@ fn emit(line: &str) {
 // ============================ bbr ============================
 
 fn run_bbr() -> i32 {
-    if !command_succeeds("modprobe", &["tcp_bbr"]) {
+    if !command_succeeds(Command::new("modprobe").args(["tcp_bbr"])) {
         emit(
             "host-tuning: tcp_bbr module unavailable — congestion control left at the kernel default",
         );
@@ -380,15 +380,15 @@ fn summarise_chrony_tracking(out: &str) -> String {
 fn check_clock() {
     // Every latency number is (receive instant − exchange timestamp); on an
     // undisciplined clock that measures skew and reports it as feed latency.
-    if !command_exists("chronyc", &["-v"]) {
+    if !command_exists(Command::new("chronyc").args(["-v"])) {
         emit(
             "host-tuning: WARNING chrony absent — host clock is UNDISCIPLINED and every latency metric is untrustworthy",
         );
         return;
     }
-    let _ = command_succeeds("systemctl", &["enable", "--now", "chronyd"]);
+    let _ = command_succeeds(Command::new("systemctl").args(["enable", "--now", "chronyd"]));
     std::thread::sleep(Duration::from_secs(CHRONY_SETTLE_SECS));
-    match command_stdout("chronyc", &["tracking"]) {
+    match command_stdout(Command::new("chronyc").args(["tracking"])) {
         Some(out) => emit(&format!(
             "host-tuning: clock OK — {}",
             summarise_chrony_tracking(&out)
@@ -421,8 +421,8 @@ fn nic_irqs(interrupts: &str, nic: &str) -> Vec<u32> {
 }
 
 fn steer_nic_irqs() {
-    let steer = std::env::var("TV_IRQ_STEER").unwrap_or_else(|_| "on".to_string());
-    let irq_cpu = std::env::var("TV_IRQ_CPU").unwrap_or_else(|_| "0".to_string());
+    let steer = env_or("TV_IRQ_STEER", "on");
+    let irq_cpu = env_or("TV_IRQ_CPU", "0");
     if steer == "off" {
         emit(
             "host-tuning: IRQ steering DISABLED by TV_IRQ_STEER=off — NIC interrupts left to the kernel/irqbalance",
@@ -431,8 +431,8 @@ fn steer_nic_irqs() {
     }
     // irqbalance re-spreads interrupts on a timer; static masks beside it
     // would LOOK applied and silently revert.
-    if command_succeeds("systemctl", &["is-active", "--quiet", "irqbalance"]) {
-        if command_succeeds("systemctl", &["disable", "--now", "irqbalance"]) {
+    if command_succeeds(Command::new("systemctl").args(["is-active", "--quiet", "irqbalance"])) {
+        if command_succeeds(Command::new("systemctl").args(["disable", "--now", "irqbalance"])) {
             emit(
                 "host-tuning: irqbalance STOPPED — static IRQ affinity would otherwise be re-spread on its timer",
             );
@@ -627,13 +627,13 @@ fn apply_dropin(path: &str, action: &DropIn) {
         }
     };
     if changed {
-        let _ = command_succeeds("systemctl", &["daemon-reload"]);
+        let _ = command_succeeds(Command::new("systemctl").args(["daemon-reload"]));
     }
 }
 
 fn guard_app_cpus() {
     let cores = std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get);
-    let irq_cpu = std::env::var("TV_IRQ_CPU").unwrap_or_else(|_| "0".to_string());
+    let irq_cpu = env_or("TV_IRQ_CPU", "0");
     let (action, message) = plan_cpu_guard(cores, &irq_cpu, Path::new(CPU_DROPIN_PATH).exists());
     apply_dropin(CPU_DROPIN_PATH, &action);
     emit(&message);
@@ -655,9 +655,22 @@ fn guard_app_memory() {
 
 // ============================ process helpers ============================
 
-fn command_succeeds(program: &str, args: &[&str]) -> bool {
-    Command::new(program)
-        .args(args)
+/// An operator override from the environment, the shell's `${NAME:-default}`:
+/// unset AND set-but-empty both read as the default. Treating an empty
+/// `TV_IRQ_CPU=` as a value would write an empty affinity mask, which the
+/// kernel accepts as a no-op while this code counts the IRQ as moved.
+fn non_empty_or(value: Option<String>, default: &str) -> String {
+    value
+        .filter(|v| !v.trim().is_empty())
+        .map_or_else(|| default.to_string(), |v| v.trim().to_string())
+}
+
+fn env_or(name: &str, default: &str) -> String {
+    non_empty_or(std::env::var(name).ok(), default)
+}
+
+fn command_succeeds(command: &mut Command) -> bool {
+    command
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -665,21 +678,16 @@ fn command_succeeds(program: &str, args: &[&str]) -> bool {
 }
 
 /// True when `program` can be started at all (its exit code is ignored).
-fn command_exists(program: &str, args: &[&str]) -> bool {
-    Command::new(program)
-        .args(args)
+fn command_exists(command: &mut Command) -> bool {
+    command
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .is_ok()
 }
 
-fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
-    let out = Command::new(program)
-        .args(args)
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+fn command_stdout(command: &mut Command) -> Option<String> {
+    let out = command.stderr(Stdio::null()).output().ok()?;
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
@@ -1003,13 +1011,37 @@ mod tests {
     }
 
     #[test]
+    fn test_env_override_treats_empty_as_unset() {
+        assert_eq!(non_empty_or(None, "0"), "0");
+        assert_eq!(non_empty_or(Some(String::new()), "0"), "0");
+        assert_eq!(non_empty_or(Some("  ".to_string()), "on"), "on");
+        assert_eq!(non_empty_or(Some(" 1 ".to_string()), "0"), "1");
+        assert_eq!(non_empty_or(Some("off".to_string()), "on"), "off");
+    }
+
+    #[test]
     fn test_process_helpers() {
-        assert!(!command_succeeds("tv-no-such-program-d6b", &[]));
-        assert!(!command_exists("tv-no-such-program-d6b", &[]));
-        assert_eq!(command_stdout("tv-no-such-program-d6b", &[]), None);
-        assert!(command_exists("true", &[]));
-        assert!(command_succeeds("true", &[]));
-        assert!(!command_succeeds("false", &[]));
-        assert_eq!(command_stdout("false", &[]), None);
+        // Only allowlisted programs may be spawned anywhere in the workspace
+        // (browser_surface_and_toolchain_guard), so the failure cases use a
+        // spawn that cannot start (a working directory that does not exist)
+        // and a git invocation that exits non-zero.
+        let unstartable = || {
+            let mut command = Command::new("/usr/bin/true");
+            command.current_dir("/nonexistent-tv-d6b");
+            command
+        };
+        assert!(!command_succeeds(&mut unstartable()));
+        assert!(!command_exists(&mut unstartable()));
+        assert_eq!(command_stdout(&mut unstartable()), None);
+        assert!(command_exists(&mut Command::new("/usr/bin/true")));
+        assert!(command_succeeds(&mut Command::new("/usr/bin/true")));
+        assert!(!command_succeeds(
+            Command::new("git").args(["--tv-no-such-flag-d6b"])
+        ));
+        assert_eq!(
+            command_stdout(Command::new("git").args(["--tv-no-such-flag-d6b"])),
+            None
+        );
+        assert!(command_stdout(Command::new("git").args(["--version"])).is_some());
     }
 }

@@ -73,7 +73,7 @@ ExecStart=/usr/bin/install -m 0644 -o root -g root /opt/tickvault/repo/deploy/aw
 # buffers along with it — trading a missing optimisation for a missing floor.
 # Was an inline /bin/sh -c until 2026-10-01 (audit D6b); now the app binary
 # does the same thing: modprobe, and write both drop-ins only if that worked.
-ExecStart=-/opt/tickvault/bin/tickvault host-tuning bbr
+ExecStart=-/opt/tickvault/bin/tickvault-host host-tuning bbr
 
 # NIC receive ring.
 #
@@ -98,22 +98,35 @@ ExecStart=/sbin/sysctl --system
 #    boot log. Non-zero exit here is a REPORT, not a failure — see below.
 #
 # Steps bbr, verify and apply were shell scripts until 2026-10-01 (audit D6b);
-# they are now subcommands of the app binary. On a brand-new instance the
-# binary does not exist until the first deploy, so user-data's first start of
-# this unit skips those three (the leading `-`); the deploy places the binary
-# and then restarts this unit, which applies them.
-ExecStart=-/opt/tickvault/bin/tickvault host-tuning verify
+# they are now subcommands of the app binary, run from its own root-owned copy
+# `bin/tickvault-host`, never from `bin/tickvault`. The deploy refreshes that
+# copy after the smoke test; the deploy ROLLBACK restores only `bin/tickvault`.
+# A pre-port binary does not know these subcommands and would ignore the
+# arguments and boot the whole trading app, here as root, in a oneshot that
+# `tickvault.service` waits behind. Keeping the subcommand binary separate means
+# a rollback can never put one of those here.
+#
+# On a brand-new instance the copy does not exist until the first deploy, so
+# user-data's first start of this unit skips those three (the leading `-`); the
+# deploy installs the copy and then restarts this unit, which applies them.
+ExecStart=-/opt/tickvault/bin/tickvault-host host-tuning verify
 
 # 4. The non-sysctl half: THP (a /sys write, lost on every reboot — the single
 #    strongest reason this unit exists) and the clock discipline check, without
 #    which every latency number the system reports is untrustworthy.
-ExecStart=-/opt/tickvault/bin/tickvault host-tuning apply
+ExecStart=-/opt/tickvault/bin/tickvault-host host-tuning apply
 
 # A tuning failure must NEVER keep the trading app down. A host with default
 # buffers is slower; a host with no app is blind. The `-` prefixes above and
 # this line encode that ordering of harms deliberately — the failures are loud
 # in the journal and in net-tuning.status, and they do not gate the feed.
 SuccessExitStatus=0 1
+
+# A oneshot has no start timeout by default, and `tickvault.service` is ordered
+# after this unit, so a step that hangs would keep the app down indefinitely.
+# Five minutes is far above the normal run (seconds, plus a 2 s chrony settle);
+# past it systemd kills the step and the app starts on whatever tuning landed.
+TimeoutStartSec=300
 
 StandardOutput=journal
 StandardError=journal
