@@ -310,6 +310,7 @@ resource "aws_cloudwatch_metric_alarm" "order_fill_lag_high" {
 #   tv_order_audit_rows_discarded_total          -> crates/storage/src/order_audit_persistence.rs:479
 #   tv_order_audit_persist_errors_total          -> crates/app/src/order_observability.rs:564,575
 #                                                   crates/app/src/dhan_order_push_observability.rs:195,206
+#                                                   crates/storage/src/audit_spill.rs (run_drain_loop, stage=spill_backlog: rows waiting on disk for 30 min, once per backlog episode; ADDED 2026-10-01, audit PR42b)
 #   tv_order_update_events_dropped_total         -> crates/app/src/dhan_order_push_observability.rs:257
 #                                                   crates/trading/src/oms/groww/push/order_events.rs:384
 #   tv_order_update_events_persist_errors_total  -> crates/app/src/order_update_events_boot.rs:344,358,381,395
@@ -341,7 +342,7 @@ resource "aws_cloudwatch_metric_alarm" "order_audit_chain_loss" {
   # NOTE: AWS caps alarm_description at 1024 characters (terraform validate
   # failure, 2026-08-19). Long-form reasoning belongs in comments like this
   # one, which has no cap; the description is the pager text.
-  alarm_description = "SEBI order/P&L forensic chain LOST A ROW. Sums six counters: order_audit rows discarded and persist errors, order/position events dropped, order_update_events persist errors and rows discarded, and one counter for pnl_audit / order_leg_pnl rows discarded and order-push updates skipped by a lagging consumer. Five-year retention, and the broker does not replay events. DO: (1) grep /tickvault/<env>/app for coded AUDIT-06 / ORDER-EVT / ORDER-PNL lines - they name the mechanism, stage and reason. (2) persist_errors points at QuestDB (ILP flush latency, WAL-suspended gauge). (3) discarded, dropped or lagged means the rows are gone - record the window. Order push is receive-only PAPER today, so a breach now is the rehearsal failing, not live-order data."
+  alarm_description = "SEBI order/P&L forensic chain LOST A ROW, or rows are stuck on local disk. Sums six counters: order_audit rows discarded and persist errors, order/position events dropped, order_update_events persist errors and rows discarded, and one counter for pnl_audit / order_leg_pnl rows discarded and order-push updates skipped by a lagging consumer. Five-year retention, and the broker does not replay events. DO: (1) grep /tickvault/<env>/app for coded AUDIT-06 / ORDER-EVT / ORDER-PNL lines - they name the mechanism, stage and reason. (2) persist_errors points at QuestDB (ILP flush latency, WAL-suspended gauge); stage=spill_backlog means rows have waited 30 min on local disk under data/spill/audit - kept, not lost, but not yet in the database. (3) discarded, dropped or lagged means the rows are gone - record the window. Order push is receive-only PAPER today, so a breach now is the rehearsal failing, not live-order data."
 
   comparison_operator = "GreaterThanOrEqualToThreshold"
   threshold           = 1

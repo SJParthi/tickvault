@@ -1409,9 +1409,16 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
     Replay is safe to repeat: each row keeps its own `ts`, the first column of every DEDUP key.
     Tests: 15 in `audit_spill`, 3 or 4 per writer (spill, half-appended row left out, refused
     spill still discards, production dir), two consumer tests updated (spilled rows count as
-    appended). Honest limits: the daily reconcile counts a spilled row as appended while it is
-    still on disk; if QuestDB was unreachable when a table was ensured, the replay (like the
-    live writer) can auto-create it without its DEDUP key.
+    appended). Hostile review fixes: the drain pages once per backlog episode when the oldest
+    waiting file is 30 min old (`tv_order_audit_persist_errors_total{stage="spill_backlog"}`, an
+    existing leg of the order-audit chain-loss alarm, so no new metric or alarm cost); the cap
+    no longer counts `quarantine/`; a failed directory sync after the rename keeps the rows
+    instead of counting them lost; the drain re-runs the table's ensure before replaying a
+    backlog; the replay URL states `precision=n`; a stale `.tmp` counts its rows as lost; the
+    leg-P&L flush runs under `block_in_place`; the two consumer tests remove the spill files they
+    write. Honest limits: the daily reconcile counts a spilled row as appended while it is still
+    on disk (the 30-min page covers that window); a file over 8 MiB whose second chunk is
+    refused counts all its rows lost, though the first chunk was stored.
   - [ ] **PR42c — reconcile on lag. Needs an owner decision.** The order-push consumer holds no
     copy of the paper OMS order map, and fetching the broker order book is REST outside the
     allowed classes (`no-rest-except-live-feed-2026-06-27.md`). Options: share a read handle on

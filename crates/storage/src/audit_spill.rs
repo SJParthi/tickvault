@@ -12,7 +12,20 @@
 //! `data/spill/audit/<table>/`, and one drain task per table POSTs them back
 //! to QuestDB's `/write` once it answers. A row is lost only when the disk
 //! tier itself refuses it (cap reached, write failed) or QuestDB permanently
-//! refuses the payload; both are counted on `tv_order_audit_chain_lost_total`.
+//! refuses the payload. Both are counted and reach the order-audit
+//! chain-loss alarm: a refused spill on the writer's own discard counter
+//! (`tv_order_audit_rows_discarded_total` for `order_audit`,
+//! `tv_order_audit_chain_lost_total` for the two P&L tables), a permanent
+//! refusal on `tv_order_audit_chain_lost_total`.
+//!
+//! # How an outage still pages
+//!
+//! A spilled batch makes the writer's flush succeed, so the counters that
+//! used to page on a failed flush stay at zero. The drain therefore pages
+//! itself: once the oldest file still waiting is
+//! [`AUDIT_SPILL_BACKLOG_PAGE_SECS`] old, it counts one
+//! `tv_order_audit_persist_errors_total{stage="spill_backlog"}` (a leg of the
+//! same alarm) and logs AUDIT-06, once per backlog episode.
 //!
 //! # Why this is not `tick_spill_replay`
 //!
@@ -55,17 +68,26 @@ use crate::tick_spill_replay::{
 /// spill directories next to it (`data/spill/ticks`, `data/spill/depth`).
 pub const AUDIT_SPILL_BASE: &str = "data/spill/audit";
 
-/// Byte ceiling per table directory, quarantine included.
+/// Byte ceiling for the files still waiting in one table directory.
 ///
 /// An order-side row is a few hundred bytes, so this holds well over 100,000
 /// rows per table: more than a full session of order events at the vendor's
-/// 7,000/day order budget, several events each.
+/// 7,000/day order budget, several events each. Quarantined files do not
+/// count: they grow only by permanent refusals, each already counted as lost
+/// and paged, and letting them fill the cap would refuse every later spill.
 pub const AUDIT_SPILL_MAX_BYTES_PER_TABLE: u64 = 64 * 1024 * 1024;
 
-/// File ceiling per table directory, quarantine included.
+/// File ceiling for the files still waiting in one table directory
+/// (quarantine excluded, as above).
 ///
 /// Bounds the directory scan the cap check makes on every spill (O(files)).
 pub const AUDIT_SPILL_MAX_FILES_PER_TABLE: usize = 50_000;
+
+/// Age of the oldest waiting spill file at which the drain pages, once per
+/// backlog episode. Thirty minutes: long enough that a QuestDB restart or a
+/// short outage drains without a page, short enough that SEBI rows do not
+/// sit on local disk unwatched for a session.
+pub const AUDIT_SPILL_BACKLOG_PAGE_SECS: u64 = 1_800;
 
 /// Seconds between drain rounds.
 pub const AUDIT_SPILL_DRAIN_INTERVAL_SECS: u64 = 60;
@@ -148,7 +170,15 @@ pub fn register_audit_spill_baseline() {
         metrics::counter!("tv_audit_spill_replay_failed_total", "table" => name).increment(0);
         metrics::counter!(CHAIN_LOST_COUNTER, "source" => table.lost_source()).increment(0);
     }
+    metrics::counter!(BACKLOG_PAGE_COUNTER, "stage" => BACKLOG_PAGE_STAGE).increment(0);
 }
+
+/// The shipped counter a stale backlog pages on: a leg of the order-audit
+/// chain-loss alarm (`order-side-alarms.tf`, m2).
+const BACKLOG_PAGE_COUNTER: &str = "tv_order_audit_persist_errors_total";
+
+/// The `stage` label of a backlog page on [`BACKLOG_PAGE_COUNTER`].
+const BACKLOG_PAGE_STAGE: &str = "spill_backlog";
 
 /// One table's spill target, held by a writer.
 #[derive(Debug, Clone)]
@@ -174,9 +204,10 @@ impl AuditSpill {
         Self { dir, table }
     }
 
-    /// The directory this target writes to.
+    /// The directory this target writes to (tests).
+    #[cfg(test)]
     #[must_use]
-    pub fn dir(&self) -> &Path {
+    pub(crate) fn dir(&self) -> &Path {
         &self.dir
     }
 
@@ -217,8 +248,7 @@ impl AuditSpill {
         let final_path = self.dir.join(&name);
         let tmp_path = self.dir.join(format!("{name}.{TMP_EXTENSION}"));
         let written = write_and_sync(&tmp_path, payload)
-            .and_then(|()| std::fs::rename(&tmp_path, &final_path))
-            .and_then(|()| sync_dir(&self.dir));
+            .and_then(|()| std::fs::rename(&tmp_path, &final_path));
         if let Err(err) = written {
             // A tmp file left behind would be quarantined as stale later;
             // remove it now so the failed spill leaves nothing half-done.
@@ -226,6 +256,21 @@ impl AuditSpill {
                 tracing::debug!(%remove_err, "could not remove a failed audit spill tmp file");
             }
             return Err(err);
+        }
+        // The file is complete and in place, so the drain will replay it.
+        // A failed directory sync only weakens its survival of a power cut;
+        // reporting the batch as refused would count rows as lost that are
+        // in fact replayed.
+        if let Err(err) = sync_dir(&self.dir) {
+            error!(
+                code = ErrorCode::Audit06OrderWriteFailed.code_str(),
+                table = self.table.table_name(),
+                path = %final_path.display(),
+                %err,
+                "AUDIT-06: an audit spill file is written but its directory could not be \
+                 synced — the rows are kept and replayed, though a power cut now could \
+                 lose the file"
+            );
         }
         Ok(final_path)
     }
@@ -271,25 +316,39 @@ pub fn spill_failed_batch(spill: Option<&AuditSpill>, payload: &[u8], rows: usiz
     }
 }
 
-/// Bytes and file count under `dir` and its quarantine sub-directory.
+/// Bytes and file count of the files directly in `dir` (waiting and `.tmp`
+/// files). The quarantine sub-directory is not counted.
 fn dir_usage(dir: &Path) -> (u64, usize) {
     let mut bytes = 0u64;
     let mut files = 0usize;
-    for d in [dir.to_path_buf(), dir.join(QUARANTINE_DIR)] {
-        let Ok(entries) = std::fs::read_dir(&d) else {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return (bytes, files);
+    };
+    for entry in entries.filter_map(std::result::Result::ok) {
+        let Ok(meta) = entry.metadata() else {
             continue;
         };
-        for entry in entries.filter_map(std::result::Result::ok) {
-            let Ok(meta) = entry.metadata() else {
-                continue;
-            };
-            if meta.is_file() {
-                bytes = bytes.saturating_add(meta.len());
-                files = files.saturating_add(1);
-            }
+        if meta.is_file() {
+            bytes = bytes.saturating_add(meta.len());
+            files = files.saturating_add(1);
         }
     }
     (bytes, files)
+}
+
+/// Age in seconds, at `now_nanos`, of the oldest waiting spill file in `dir`,
+/// read from its name. `None` when nothing waits. O(files).
+fn oldest_spill_age_secs(dir: &Path, now_nanos: i64) -> Option<u64> {
+    let oldest = list_spill_files(dir).into_iter().find_map(|path| {
+        path.file_name()?
+            .to_str()?
+            .split('-')
+            .next()?
+            .parse::<i64>()
+            .ok()
+    })?;
+    let age_nanos = now_nanos.saturating_sub(oldest).max(0);
+    Some(u64::try_from(age_nanos / 1_000_000_000).unwrap_or(0))
 }
 
 /// `<unix_nanos:020>-<pid>-<seq:010>-<rows>.ilp`: sorts oldest first, unique
@@ -304,10 +363,15 @@ fn spill_file_name(rows: usize) -> String {
     )
 }
 
-/// The row count encoded in a spill file name, or `None` for a foreign name.
+/// The row count encoded in a spill file name (`.ilp`, or an unfinished
+/// `.ilp.tmp`), or `None` for a foreign name.
 #[must_use]
 pub fn rows_in_spill_file_name(path: &Path) -> Option<u64> {
-    let stem = path.file_stem()?.to_str()?;
+    let name = path.file_name()?.to_str()?;
+    let name = name
+        .strip_suffix(&format!(".{TMP_EXTENSION}"))
+        .unwrap_or(name);
+    let stem = name.strip_suffix(&format!(".{SPILL_FILE_EXTENSION}"))?;
     stem.rsplit('-').next()?.parse().ok()
 }
 
@@ -500,13 +564,22 @@ fn quarantine_stale_tmp_files(dir: &Path, table: AuditSpillTable) {
             .is_some_and(|age| age >= stale);
         if is_tmp && old_enough && path.is_file() {
             let moved = quarantine(dir, &path);
+            // The process crashed before `spill` returned, so these rows were
+            // never counted anywhere; they are not replayed, so they are lost.
+            let rows = rows_in_spill_file_name(&path).unwrap_or(0);
+            if moved.is_ok() {
+                metrics::counter!(CHAIN_LOST_COUNTER, "source" => table.lost_source())
+                    .increment(rows);
+            }
             error!(
                 code = ErrorCode::Audit06OrderWriteFailed.code_str(),
                 table = table.table_name(),
                 path = %path.display(),
+                rows,
                 moved = moved.is_ok(),
                 "AUDIT-06: an audit spill file was never finished (crash between write and \
-                 rename) — set aside in quarantine for a manual look, not replayed"
+                 rename) — {rows} row(s) set aside in quarantine for a manual look, not \
+                 replayed, and counted as lost"
             );
         }
     }
@@ -522,8 +595,9 @@ static DRAIN_SPAWNED: [AtomicBool; 3] = [
 
 /// Spawns `table`'s drain task once per process. Later calls are no-ops.
 ///
-/// Call it only AFTER the table's `ensure_*_table` has run: `/write` would
-/// otherwise auto-create the table without its DEDUP key.
+/// The drain re-runs the table's `ensure_*_table` before it replays a
+/// backlog, so a boot whose own ensure failed cannot let `/write`
+/// auto-create the table without its DEDUP key.
 ///
 /// Returns `true` when this call spawned the task.
 pub fn spawn_audit_spill_drain_once(table: AuditSpillTable, questdb: &QuestDbConfig) -> bool {
@@ -531,16 +605,66 @@ pub fn spawn_audit_spill_drain_once(table: AuditSpillTable, questdb: &QuestDbCon
         return false;
     }
     register_audit_spill_baseline();
-    let url = write_url(&questdb.host, questdb.http_port);
+    let url = audit_write_url(questdb);
     let dir = table.default_dir();
-    tokio::spawn(run_drain_loop(dir, table, url));
+    tokio::spawn(run_drain_loop(dir, table, url, questdb.clone()));
     true
+}
+
+/// The drain's `/write` URL with nanosecond precision stated, the unit every
+/// writer's `.at(..)` stamps, rather than relying on the server default.
+fn audit_write_url(questdb: &QuestDbConfig) -> String {
+    format!(
+        "{}?precision=n",
+        write_url(&questdb.host, questdb.http_port)
+    )
+}
+
+/// Runs the table's own idempotent `ensure_*_table` (create, add missing
+/// columns, enable the DEDUP key).
+async fn ensure_table(table: AuditSpillTable, questdb: &QuestDbConfig) {
+    match table {
+        AuditSpillTable::OrderAudit => {
+            crate::order_audit_persistence::ensure_order_audit_table(questdb).await;
+        }
+        AuditSpillTable::PnlAudit => {
+            crate::pnl_audit_persistence::ensure_pnl_audit_table(questdb).await;
+        }
+        AuditSpillTable::OrderLegPnl => {
+            crate::order_leg_pnl_persistence::ensure_order_leg_pnl_table(questdb).await;
+        }
+    }
+}
+
+/// Edge latch for the stale-backlog page: one page per backlog episode.
+#[derive(Debug, Default)]
+struct BacklogPager {
+    paged: bool,
+}
+
+impl BacklogPager {
+    /// Feeds one observation of the oldest waiting file's age. Returns `true`
+    /// on the round that crosses [`AUDIT_SPILL_BACKLOG_PAGE_SECS`]; re-arms
+    /// once nothing waits.
+    fn observe(&mut self, oldest_age_secs: Option<u64>) -> bool {
+        match oldest_age_secs {
+            None => {
+                self.paged = false;
+                false
+            }
+            Some(age) if age >= AUDIT_SPILL_BACKLOG_PAGE_SECS && !self.paged => {
+                self.paged = true;
+                true
+            }
+            Some(_) => false,
+        }
+    }
 }
 
 /// Drains at once, then every [`AUDIT_SPILL_DRAIN_INTERVAL_SECS`]. Never
 /// returns. A failing round is logged on its rising edge only; recovery is
 /// one `info!`.
-async fn run_drain_loop(dir: PathBuf, table: AuditSpillTable, url: String) {
+async fn run_drain_loop(dir: PathBuf, table: AuditSpillTable, url: String, questdb: QuestDbConfig) {
     let name = table.table_name();
     let interval = Duration::from_secs(AUDIT_SPILL_DRAIN_INTERVAL_SECS);
     let client = loop {
@@ -559,30 +683,61 @@ async fn run_drain_loop(dir: PathBuf, table: AuditSpillTable, url: String) {
         }
     };
     let mut failing = false;
+    // Ensured once per backlog episode: re-run after a failed round or once
+    // the directory has emptied, never on every quiet round.
+    let mut ensured = false;
+    let mut pager = BacklogPager::default();
     loop {
-        let outcome = drain_audit_spill_dir(&dir, table, &url, &client).await;
-        if outcome.failed {
-            // The rows stay on disk; this counts rounds that could not finish.
-            metrics::counter!("tv_audit_spill_replay_failed_total", "table" => name).increment(1);
-            if !failing {
-                error!(
-                    code = ErrorCode::Audit06OrderWriteFailed.code_str(),
+        if list_spill_files(&dir).is_empty() {
+            ensured = false;
+            // A crash between write and rename leaves only a `.tmp`; it is
+            // still set aside and counted when nothing else waits.
+            quarantine_stale_tmp_files(&dir, table);
+        } else {
+            if !ensured {
+                ensure_table(table, &questdb).await;
+                ensured = true;
+            }
+            let outcome = drain_audit_spill_dir(&dir, table, &url, &client).await;
+            if outcome.failed {
+                // The rows stay on disk; this counts rounds that could not finish.
+                metrics::counter!("tv_audit_spill_replay_failed_total", "table" => name)
+                    .increment(1);
+                ensured = false;
+                if !failing {
+                    error!(
+                        code = ErrorCode::Audit06OrderWriteFailed.code_str(),
+                        table = name,
+                        "AUDIT-06: QuestDB is not accepting the {name} spill backlog — the \
+                         rows stay on disk and are retried every \
+                         {AUDIT_SPILL_DRAIN_INTERVAL_SECS}s"
+                    );
+                }
+            }
+            if !outcome.failed && failing {
+                info!(table = name, "the {name} spill backlog drains again");
+            }
+            failing = outcome.failed;
+            if outcome.files_replayed > 0 {
+                info!(
                     table = name,
-                    "AUDIT-06: QuestDB is not accepting the {name} spill backlog — the rows \
-                     stay on disk and are retried every {AUDIT_SPILL_DRAIN_INTERVAL_SECS}s"
+                    files = outcome.files_replayed,
+                    rows = outcome.rows_replayed,
+                    "replayed {name} rows from the disk tier into QuestDB"
                 );
             }
         }
-        if !outcome.failed && failing {
-            info!(table = name, "the {name} spill backlog drains again");
-        }
-        failing = outcome.failed;
-        if outcome.files_replayed > 0 {
-            info!(
+        let now_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let oldest = oldest_spill_age_secs(&dir, now_nanos);
+        if pager.observe(oldest) {
+            metrics::counter!(BACKLOG_PAGE_COUNTER, "stage" => BACKLOG_PAGE_STAGE).increment(1);
+            error!(
+                code = ErrorCode::Audit06OrderWriteFailed.code_str(),
                 table = name,
-                files = outcome.files_replayed,
-                rows = outcome.rows_replayed,
-                "replayed {name} rows from the disk tier into QuestDB"
+                oldest_age_secs = oldest.unwrap_or(0),
+                "AUDIT-06: {name} rows have waited on local disk for at least \
+                 {AUDIT_SPILL_BACKLOG_PAGE_SECS}s — QuestDB is not taking the backlog; \
+                 the rows are kept, not lost, but are not yet in the database"
             );
         }
         tokio::time::sleep(interval).await;
@@ -709,17 +864,75 @@ mod tests {
     }
 
     #[test]
-    fn spill_refuses_past_the_byte_ceiling_and_counts_quarantine() {
+    fn spill_refuses_past_the_byte_ceiling_of_waiting_files() {
         let tmp = TestDir::new();
-        let q = tmp.path().join(QUARANTINE_DIR);
-        std::fs::create_dir_all(&q).expect("mkdir");
-        let big = std::fs::File::create(q.join("old.ilp")).expect("create");
+        let big = std::fs::File::create(tmp.path().join("00000000000000000001-1-0000000000-1.ilp"))
+            .expect("create");
         big.set_len(AUDIT_SPILL_MAX_BYTES_PER_TABLE)
             .expect("set_len");
         let spill = AuditSpill::in_dir(AuditSpillTable::OrderAudit, tmp.path().to_path_buf());
         let err = spill.spill(ROWS, 2).expect_err("must refuse");
         assert_eq!(err.kind(), std::io::ErrorKind::StorageFull);
-        assert!(list_spill_files(tmp.path()).is_empty());
+        assert_eq!(list_spill_files(tmp.path()).len(), 1);
+    }
+
+    #[test]
+    fn a_full_quarantine_never_refuses_a_new_spill() {
+        let tmp = TestDir::new();
+        let q = tmp.path().join(QUARANTINE_DIR);
+        std::fs::create_dir_all(&q).expect("mkdir");
+        let big = std::fs::File::create(q.join("old.ilp")).expect("create");
+        big.set_len(AUDIT_SPILL_MAX_BYTES_PER_TABLE.saturating_mul(2))
+            .expect("set_len");
+        let spill = AuditSpill::in_dir(AuditSpillTable::OrderAudit, tmp.path().to_path_buf());
+        let path = spill.spill(ROWS, 2).expect("quarantine does not count");
+        assert_eq!(list_spill_files(tmp.path()), vec![path]);
+    }
+
+    #[test]
+    fn oldest_spill_age_reads_the_oldest_name_and_none_when_empty() {
+        let tmp = TestDir::new();
+        assert_eq!(oldest_spill_age_secs(tmp.path(), 10_000_000_000), None);
+        std::fs::write(
+            tmp.path().join("00000000003000000000-1-0000000001-1.ilp"),
+            b"a 1\n",
+        )
+        .expect("newer");
+        std::fs::write(
+            tmp.path().join("00000000001000000000-1-0000000000-1.ilp"),
+            b"a 1\n",
+        )
+        .expect("older");
+        // A quarantined or foreign file is not a waiting file.
+        std::fs::write(tmp.path().join("0-1-1-1.ilp.tmp"), b"a 1\n").expect("tmp");
+        assert_eq!(oldest_spill_age_secs(tmp.path(), 10_000_000_000), Some(9));
+        // A clock behind the name reads as age 0, never a wrap.
+        assert_eq!(oldest_spill_age_secs(tmp.path(), 0), Some(0));
+    }
+
+    #[test]
+    fn backlog_pager_pages_once_per_episode_and_rearms_when_empty() {
+        let mut pager = BacklogPager::default();
+        assert!(!pager.observe(None));
+        assert!(!pager.observe(Some(AUDIT_SPILL_BACKLOG_PAGE_SECS - 1)));
+        assert!(pager.observe(Some(AUDIT_SPILL_BACKLOG_PAGE_SECS)));
+        assert!(!pager.observe(Some(AUDIT_SPILL_BACKLOG_PAGE_SECS * 10)));
+        assert!(!pager.observe(None));
+        assert!(pager.observe(Some(AUDIT_SPILL_BACKLOG_PAGE_SECS + 1)));
+    }
+
+    #[test]
+    fn the_drain_url_states_nanosecond_precision() {
+        let cfg = QuestDbConfig {
+            host: "tv-questdb".to_string(),
+            http_port: 9000,
+            pg_port: 8812,
+            ilp_port: 9009,
+        };
+        assert_eq!(
+            audit_write_url(&cfg),
+            "http://tv-questdb:9000/write?precision=n"
+        );
     }
 
     #[test]
@@ -742,6 +955,15 @@ mod tests {
             Some(12)
         );
         assert_eq!(rows_in_spill_file_name(Path::new("garbage.ilp")), None);
+        // An unfinished file still names its rows, so its loss can be counted.
+        assert_eq!(
+            rows_in_spill_file_name(Path::new("00000000000000000001-7-0000000003-12.ilp.tmp")),
+            Some(12)
+        );
+        assert_eq!(
+            rows_in_spill_file_name(Path::new("00000000000000000001-7-0000000003-12.txt")),
+            None
+        );
     }
 
     #[test]

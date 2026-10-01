@@ -190,7 +190,8 @@ fn blocking_flush<T>(flush: impl FnOnce() -> T) -> T {
 }
 
 /// Append + flush one paper order_audit row. Failures are coded AUDIT-06
-/// (staged) — the writer's flush already discard-pends + counts.
+/// (staged). A failed flush spills the batch to the disk tier (audit PR42b);
+/// the writer discards and counts only when the disk tier refuses it too.
 fn persist_push_row(writer: &mut OrderAuditWriter, row: &OrderAuditRow) {
     if let Err(err) = writer.append_order_audit_row(row) {
         metrics::counter!("tv_order_audit_persist_errors_total", "stage" => "append").increment(1);
