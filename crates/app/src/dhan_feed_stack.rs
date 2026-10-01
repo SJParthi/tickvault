@@ -28545,7 +28545,7 @@ mod item_44_tests {
     }
 
     #[test]
-    fn catchup_lag_step_covers_every_permutation() {
+    fn test_wal_catchup_lag_step_covers_every_permutation() {
         use CatchupLagStep::{Pause, Proceed, Stop};
         let max = WAL_CATCHUP_LAG_PAUSE_MAX_SECS;
         for growing in [0_u32, 1, 7, u32::MAX] {

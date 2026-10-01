@@ -207,6 +207,18 @@ mod tests {
     }
 
     #[test]
+    fn test_fnv1a_matches_the_published_64_bit_vectors() {
+        assert_eq!(fnv1a(FNV_OFFSET, b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a(FNV_OFFSET, b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a(FNV_OFFSET, b"foobar"), 0x8594_4171_f739_67e8);
+        // Continuing from a prior hash is the same as hashing the concatenation.
+        assert_eq!(
+            fnv1a(fnv1a(FNV_OFFSET, b"foo"), b"bar"),
+            fnv1a(FNV_OFFSET, b"foobar")
+        );
+    }
+
+    #[test]
     fn distinct_keys_in_one_slot_are_both_admitted() {
         let c = ErrorCoalescer::new("test");
         // Same slot (low bits), different tags (high bits).
@@ -279,7 +291,7 @@ mod tests {
     }
 
     #[test]
-    fn a_burst_of_identical_coded_errors_writes_one_line() {
+    fn test_key_of_coalesces_a_coded_burst_and_passes_uncoded_lines() {
         let buf = Buf::default();
         let w = buf.clone();
         let layer = tracing_subscriber::fmt::layer()
