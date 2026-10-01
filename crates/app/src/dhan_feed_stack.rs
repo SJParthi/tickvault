@@ -5476,9 +5476,12 @@ pub const WAL_CATCHUP_IN_SESSION_COUNTER: &str = "tv_dhan_wal_catchup_in_session
 ///
 /// **A boot just before 09:00 is clamped** (2026-09-22 hostile review): the
 /// full budget from 08:56 would drain until ~09:01 and dial after the
-/// pre-open began. Before the window the budget is therefore
-/// `min(full, seconds-until-09:00 + in-session)`, so the drain ends no later
-/// than 09:00 plus the in-session budget.
+/// pre-open began. Since 2026-10-01 (item 45c) the clamp is to
+/// [`WAL_CATCHUP_PREOPEN_STOP_SECS_OF_DAY_IST`] (08:58): before the window
+/// the budget is `max(in-session, min(full, seconds-until-08:58))`, so a
+/// boot up to 08:57:40 ends its drain by 08:58 and a later pre-open boot
+/// ends it within the in-session budget, as an in-session boot does. The
+/// round already running when the clock expires still finishes.
 #[must_use]
 pub const fn wal_catchup_budget_secs(ist_secs_of_day: u64) -> u64 {
     let start = tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST as u64;
@@ -5486,12 +5489,19 @@ pub const fn wal_catchup_budget_secs(ist_secs_of_day: u64) -> u64 {
     if ist_secs_of_day >= start && ist_secs_of_day < end {
         WAL_CATCHUP_IN_SESSION_BUDGET_SECS
     } else if ist_secs_of_day < start {
-        let until_open =
-            (start - ist_secs_of_day).saturating_add(WAL_CATCHUP_IN_SESSION_BUDGET_SECS);
-        if until_open < WAL_CATCHUP_BUDGET_SECS {
-            until_open
+        // 45c: stop by 08:58, not 09:00 + the in-session budget. Never below
+        // the in-session budget, so a boot just before the line is treated
+        // like one just after it rather than given a few seconds.
+        let until_stop = WAL_CATCHUP_PREOPEN_STOP_SECS_OF_DAY_IST.saturating_sub(ist_secs_of_day);
+        let capped = if until_stop < WAL_CATCHUP_BUDGET_SECS {
+            until_stop
         } else {
             WAL_CATCHUP_BUDGET_SECS
+        };
+        if capped < WAL_CATCHUP_IN_SESSION_BUDGET_SECS {
+            WAL_CATCHUP_IN_SESSION_BUDGET_SECS
+        } else {
+            capped
         }
     } else {
         WAL_CATCHUP_BUDGET_SECS
@@ -5588,6 +5598,78 @@ pub const fn wal_catchup_should_stop_for_memory(
         stop_pct,
     )
 }
+
+/// IST second of day by which a pre-open boot's WAL catch-up drain stops:
+/// 08:58:00 (plan item 45c, 2026-09-29 scope-lock "Boot WAL catch-up drain
+/// … Paced").
+///
+/// The drain runs BEFORE the sockets dial, and on 2026-09-29 the 08:31 boot
+/// drain was still loading QuestDB when the pre-open began. Two minutes ahead
+/// of 09:00 gives the dial and the subscribe batches room to finish before
+/// the first pre-open packet. A boot inside the last
+/// [`WAL_CATCHUP_IN_SESSION_BUDGET_SECS`] before this line, or after it, gets
+/// the in-session budget, the same bound a boot one minute later would get.
+pub const WAL_CATCHUP_PREOPEN_STOP_SECS_OF_DAY_IST: u64 = 8 * 3600 + 58 * 60;
+
+const _: () = assert!(
+    WAL_CATCHUP_PREOPEN_STOP_SECS_OF_DAY_IST
+        < tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST as u64,
+    "the pre-open stop line must fall before the capture window opens"
+);
+
+/// Seconds between apply-lag re-reads while the catch-up drain is paused.
+pub const WAL_CATCHUP_LAG_PAUSE_POLL_SECS: u64 = 5;
+
+/// Longest single pause, in seconds, before the drain stands down for apply
+/// lag and leaves the rest on disk.
+///
+/// The watcher polls QuestDB once a minute and releases a table only after
+/// `WAL_APPLY_LAG_RELEASE_POLLS` (2) falling polls, so a release can take two
+/// minutes to show. Three minutes covers that with one poll of margin; past
+/// it QuestDB is not catching up and more replay only adds to its backlog.
+pub const WAL_CATCHUP_LAG_PAUSE_MAX_SECS: u64 = 180;
+
+/// Counter: pause steps the catch-up drain took while QuestDB apply lag was
+/// growing. Local `/metrics` only (no EMF name).
+pub const WAL_CATCHUP_LAG_PAUSE_COUNTER: &str = "tv_wal_catchup_lag_pause_total";
+
+/// What the catch-up drain does before its next round, given the apply lag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatchupLagStep {
+    /// Apply lag is not growing: run the round.
+    Proceed,
+    /// Apply lag is growing and the pause has room left: wait one poll.
+    Pause,
+    /// Apply lag is still growing after the longest pause, or the drain's
+    /// clock has run out: stop and leave the rest as `*.wal` files.
+    Stop,
+}
+
+/// Should the WAL catch-up drain run its next round, wait, or stand down?
+///
+/// Pure, total and O(1). `lag_growing_tables` is
+/// `ingest_shed::wal_apply_lag_growing()`; `paused_secs` is how long this
+/// pause has lasted; `secs_left` is what remains of the drain's clock.
+///
+/// Fails OPEN on zero, exactly as the shed does: before the watcher's first
+/// poll the count reads zero, and refusing to drain on "not yet measured"
+/// would leave a real backlog on disk for nothing. The drain's clock and
+/// round cap still bound it there.
+#[must_use]
+pub const fn wal_catchup_lag_step(
+    lag_growing_tables: u32,
+    paused_secs: u64,
+    secs_left: u64,
+) -> CatchupLagStep {
+    if lag_growing_tables == 0 {
+        CatchupLagStep::Proceed
+    } else if paused_secs >= WAL_CATCHUP_LAG_PAUSE_MAX_SECS || secs_left == 0 {
+        CatchupLagStep::Stop
+    } else {
+        CatchupLagStep::Pause
+    }
+}
+
 /// The ring's byte ceiling — the bound the frame count alone does not give.
 ///
 /// `FRAME_RING_CAPACITY` bounds how MANY frames sit in the ring, not how much
@@ -11577,6 +11659,8 @@ struct WidenCtx<'a> {
     live_topups: &'a mut Vec<(tokio::sync::mpsc::Sender<LiveSubscriptionCommand>, usize)>,
     main_feed_connections_used: &'a mut usize,
     contract_capacity: &'a mut Option<usize>,
+    /// R7 (2026-10-01): the dual-instance lock flag, for the widen's dials.
+    instance_lock_held: &'a Arc<AtomicBool>,
 }
 
 /// Room for NEW main-feed connections the widen may open. Zero once Dhan has
@@ -11708,6 +11792,7 @@ fn widen_running_session(
                                     // what these connections leave free.
                                     out_topups: Some(ctx.live_topups),
                                     out_depth_commands: None,
+                                    instance_lock_held: ctx.instance_lock_held,
                                 },
                             );
                             report_dial_shortfall(DIAL_HALF_MAIN_FEED, planned, dialed, attempts);
@@ -11902,6 +11987,9 @@ async fn attach_depth_when_available(
     // attach adds it once the rider writes it, and does not return while it
     // is still missing (until the 15:30 hard stop).
     mut widen: Option<RunningWiden>,
+    // R7 (2026-10-01): the process's dual-instance lock flag, wired into every
+    // socket this task dials so no dial happens while the lock is not held.
+    instance_lock_held: Arc<AtomicBool>,
 ) {
     // Publish a 0 for every contract-failure reason BEFORE the first attempt.
     //
@@ -12143,6 +12231,7 @@ async fn attach_depth_when_available(
                         live_topups: &mut live_topups,
                         main_feed_connections_used: &mut main_feed_connections_used,
                         contract_capacity: &mut contract_capacity,
+                        instance_lock_held: &instance_lock_held,
                     },
                     &today_date,
                     attempts,
@@ -12445,6 +12534,7 @@ async fn attach_depth_when_available(
                     live_topups: &mut live_topups,
                     main_feed_connections_used: &mut main_feed_connections_used,
                     contract_capacity: &mut contract_capacity,
+                    instance_lock_held: &instance_lock_held,
                 },
                 &today_date,
                 attempts.saturating_add(1),
@@ -12708,6 +12798,7 @@ async fn attach_depth_when_available(
                                 // makes it safe.
                                 out_topups: Some(&mut live_topups),
                                 out_depth_commands: None,
+                                instance_lock_held: &instance_lock_held,
                             },
                         );
                         // The TERMINAL verdict for today's selection, recorded
@@ -12892,6 +12983,7 @@ async fn attach_depth_when_available(
                                     ws_audit_tx: Some(&ws_audit_tx),
                                     out_topups: None,
                                     out_depth_commands: Some(&mut depth_commands),
+                                    instance_lock_held: &instance_lock_held,
                                 },
                             );
                             report_dial_shortfall(DIAL_HALF_DEPTH, planned, dialed, attempts);
@@ -13567,6 +13659,13 @@ struct DialContext<'a> {
     /// OLD one, and only the dial knows which connection got which. Deriving
     /// it later from the selection would be guessing at the pool's packing.
     out_depth_commands: Option<&'a mut DialedDepthCommands>,
+    /// The process's dual-instance lock-held flag (2026-10-01, R7). Wired into
+    /// every socket's sink so each dial — first dial, reconnect, 807 re-dial,
+    /// rotate, ghost redial — waits while this process does not hold the
+    /// lock. The boot gate checks it once before the first dial; this is what
+    /// keeps it checked for the life of the socket. Depth-account sockets are
+    /// gated too: same process, same lock.
+    instance_lock_held: &'a Arc<AtomicBool>,
 }
 
 fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize {
@@ -13581,6 +13680,7 @@ fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize 
         ws_audit_tx,
         mut out_topups,
         mut out_depth_commands,
+        instance_lock_held,
     } = ctx;
     let mut dialed = 0usize;
     for planned in plan.connections {
@@ -13699,7 +13799,9 @@ fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize 
             Some(tx) => sink.with_audit(tx.clone()),
             None => sink,
         };
-        let sink = Arc::new(sink);
+        // R7 (2026-10-01): no dial while this process does not hold the
+        // dual-instance lock. Live sockets are never closed by it.
+        let sink = Arc::new(sink.with_dial_permit(Arc::clone(instance_lock_held)));
         let guard = planned.guard;
         // Count it alive BEFORE the task starts, so the gauge can never read
         // high because a spawn lost a race with its own decrement.
@@ -13772,11 +13874,24 @@ fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize 
                     if let Some(manager) = global_token_manager()
                         && let Err(err) = manager.force_renewal_unless_replaced(dialled).await
                     {
-                        warn!(
-                            code = ErrorCode::WsGapConnectionState.code_str(),
-                            %err,
-                            "Dhan live feed could not refresh its token before re-dialing"
-                        );
+                        // R3 (2026-10-01): an error, not a warning; the token
+                        // manager pages once per dead token. Every socket
+                        // repeats this on each ladder step while the token
+                        // stays dead, so the line is throttled to powers of two.
+                        static RENEW_FAILURES: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        let seen = RENEW_FAILURES
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            .saturating_add(1);
+                        if seen.is_power_of_two() {
+                            error!(
+                                code = ErrorCode::WsGapConnectionState.code_str(),
+                                source = "stale_credential_renew_failed",
+                                seen,
+                                %err,
+                                "Dhan live feed could not refresh its token before re-dialing"
+                            );
+                        }
                     }
                 },
                 topup_rx,
@@ -15427,6 +15542,11 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         // WHICH bound bound, which is the difference between "the backlog is
         // big" and "this box cannot drain it".
         let mut catchup_memory_stopped = false;
+        // 45c: did the drain stand down because QuestDB apply lag kept
+        // growing through the longest pause?
+        let mut catchup_lag_stopped = false;
+        let lag_pause_counter = metrics::counter!(WAL_CATCHUP_LAG_PAUSE_COUNTER);
+        lag_pause_counter.increment(0);
         // `true` only when the final pass found NOTHING left on disk — no
         // frames, no deferred segments, no disk/frame-cap refusal. That is the
         // one state in which the applied-watermark's unapplied buckets can be
@@ -15469,6 +15589,55 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         )
         .bytes();
         while rounds < WAL_CATCHUP_MAX_ROUNDS && tokio::time::Instant::now() < catchup_deadline {
+            // APPLY-LAG PACING (45c) — checked BEFORE the round. While the
+            // watcher reports QuestDB apply lag growing, wait in short steps
+            // instead of adding another 512 MiB of replay to its backlog. The
+            // wait spends the drain's own clock, so it never keeps the sockets
+            // dark longer than the budget already allowed.
+            let mut lag_paused_secs = 0_u64;
+            loop {
+                let secs_left = catchup_deadline
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .as_secs();
+                let growing = tickvault_common::ingest_shed::wal_apply_lag_growing();
+                match wal_catchup_lag_step(growing, lag_paused_secs, secs_left) {
+                    CatchupLagStep::Proceed => break,
+                    CatchupLagStep::Stop => {
+                        catchup_lag_stopped = true;
+                        break;
+                    }
+                    CatchupLagStep::Pause => {
+                        if lag_paused_secs == 0 {
+                            info!(
+                                round = rounds,
+                                lag_growing_tables = growing,
+                                max_pause_secs = WAL_CATCHUP_LAG_PAUSE_MAX_SECS,
+                                "WAL catch-up drain pausing: QuestDB apply lag is growing"
+                            );
+                        }
+                        lag_pause_counter.increment(1);
+                        let step = WAL_CATCHUP_LAG_PAUSE_POLL_SECS.min(secs_left.max(1));
+                        tokio::time::sleep(std::time::Duration::from_secs(step)).await;
+                        lag_paused_secs = lag_paused_secs.saturating_add(step);
+                    }
+                }
+            }
+            if catchup_lag_stopped {
+                warn!(
+                    code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+                    source = "wal_catchup_apply_lag_stop",
+                    round = rounds,
+                    paused_secs = lag_paused_secs,
+                    lag_growing_tables = tickvault_common::ingest_shed::wal_apply_lag_growing(),
+                    "WAL catch-up drain STOPPED: QuestDB apply lag kept growing. Nothing is \
+                     lost — every segment the drain did not reach is still a `*.wal` file and \
+                     is re-read on the next boot."
+                );
+                break;
+            }
+            if tokio::time::Instant::now() >= catchup_deadline {
+                break;
+            }
             // MEMORY STOP — checked BEFORE the round, never after, because the
             // whole point is not to start work whose footprint we cannot hold.
             // One `/proc/self/status` read per round; the policy itself is the
@@ -15727,7 +15896,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                  unapplied map is cleared for this session"
             );
         }
-        if rounds > 0 || catchup_memory_stopped {
+        if rounds > 0 || catchup_memory_stopped || catchup_lag_stopped {
             // `catchup_memory_stopped` joins `exhausted` deliberately: all
             // three mean the SAME operational thing — the drain stood down
             // with work still on disk — and the counter exists to say that,
@@ -15736,10 +15905,13 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             // because the budget has $2.75 of margin to the automatic
             // STOP_EC2_INSTANCES line and a new EMF name is ~$0.30/mo.
             let exhausted = catchup_memory_stopped
+                || catchup_lag_stopped
                 || tokio::time::Instant::now() >= catchup_deadline
                 || rounds >= WAL_CATCHUP_MAX_ROUNDS;
             let stop_reason = if catchup_memory_stopped {
                 "memory"
+            } else if catchup_lag_stopped {
+                "apply_lag"
             } else if rounds >= WAL_CATCHUP_MAX_ROUNDS {
                 "round_cap"
             } else if exhausted {
@@ -15754,6 +15926,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 not_folded = catchup_not_folded,
                 budget_exhausted = exhausted,
                 memory_stopped = catchup_memory_stopped,
+                apply_lag_stopped = catchup_lag_stopped,
                 stop_reason,
                 "WAL catch-up drain finished — recovered a backlog that a single \
                  512 MiB replay batch could never have reached"
@@ -15958,6 +16131,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             ws_audit_tx: Some(&ws_audit_tx),
             out_topups: Some(&mut main_feed_topups),
             out_depth_commands: None,
+            instance_lock_held: &params.instance_lock_held,
         },
     );
     // `attempts = 0`: the boot dial happens once and has no retry loop behind
@@ -16015,6 +16189,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 .widen_universe
                 .clone()
                 .map(|source| RunningWiden::new(source, &params.main_feed_instruments)),
+            Arc::clone(&params.instance_lock_held),
         ));
     }
 
@@ -28351,7 +28526,10 @@ mod item_44_tests {
             let want = if (START..END).contains(&secs) {
                 WAL_CATCHUP_IN_SESSION_BUDGET_SECS
             } else if secs < START {
-                (START - secs + WAL_CATCHUP_IN_SESSION_BUDGET_SECS).min(WAL_CATCHUP_BUDGET_SECS)
+                WAL_CATCHUP_PREOPEN_STOP_SECS_OF_DAY_IST
+                    .saturating_sub(secs)
+                    .min(WAL_CATCHUP_BUDGET_SECS)
+                    .max(WAL_CATCHUP_IN_SESSION_BUDGET_SECS)
             } else {
                 WAL_CATCHUP_BUDGET_SECS
             };
@@ -28361,15 +28539,15 @@ mod item_44_tests {
 
     #[test]
     fn catchup_budget_boundaries_are_half_open() {
+        // 45c: after the 08:58 stop line a pre-open boot gets the in-session
+        // budget, the same as one minute later.
         assert_eq!(
             wal_catchup_budget_secs(32_399),
-            1 + WAL_CATCHUP_IN_SESSION_BUDGET_SECS
+            WAL_CATCHUP_IN_SESSION_BUDGET_SECS
         ); // 08:59:59
-        // A boot at 08:56 ends its drain by 09:00 + the in-session budget.
-        assert_eq!(
-            wal_catchup_budget_secs(32_160),
-            240 + WAL_CATCHUP_IN_SESSION_BUDGET_SECS
-        );
+        // A boot at 08:56 ends its drain by 08:58.
+        assert_eq!(wal_catchup_budget_secs(32_160), 120);
+        assert_eq!(WAL_CATCHUP_PREOPEN_STOP_SECS_OF_DAY_IST, 32_280);
         assert_eq!(wal_catchup_budget_secs(0), WAL_CATCHUP_BUDGET_SECS);
         assert_eq!(
             wal_catchup_budget_secs(32_400),
@@ -28383,6 +28561,80 @@ mod item_44_tests {
         assert_eq!(wal_catchup_budget_secs(u64::MAX), WAL_CATCHUP_BUDGET_SECS);
         assert_eq!(START, 32_400);
         assert_eq!(END, 56_400);
+    }
+
+    // 45c: a pre-open drain never runs past 08:58 unless the boot itself is
+    // inside the last in-session budget before that line.
+    #[test]
+    fn a_preopen_drain_ends_by_0858_or_within_the_in_session_budget() {
+        for secs in 0..START {
+            let end = secs + wal_catchup_budget_secs(secs);
+            let bound = WAL_CATCHUP_PREOPEN_STOP_SECS_OF_DAY_IST
+                .max(secs + WAL_CATCHUP_IN_SESSION_BUDGET_SECS);
+            assert!(end <= bound, "boot at {secs} ends at {end} past {bound}");
+            assert!(wal_catchup_budget_secs(secs) >= WAL_CATCHUP_IN_SESSION_BUDGET_SECS);
+            assert!(wal_catchup_budget_secs(secs) <= WAL_CATCHUP_BUDGET_SECS);
+        }
+        // The 08:30 boot keeps its full five minutes.
+        assert_eq!(wal_catchup_budget_secs(30_600), WAL_CATCHUP_BUDGET_SECS);
+    }
+
+    #[test]
+    fn test_wal_catchup_lag_step_covers_every_permutation() {
+        use CatchupLagStep::{Pause, Proceed, Stop};
+        let max = WAL_CATCHUP_LAG_PAUSE_MAX_SECS;
+        for growing in [0_u32, 1, 7, u32::MAX] {
+            for paused in [0_u64, 5, max - 1, max, max + 5, u64::MAX] {
+                for left in [0_u64, 1, 60, 300, u64::MAX] {
+                    let want = if growing == 0 {
+                        Proceed
+                    } else if paused >= max || left == 0 {
+                        Stop
+                    } else {
+                        Pause
+                    };
+                    assert_eq!(
+                        wal_catchup_lag_step(growing, paused, left),
+                        want,
+                        "growing={growing} paused={paused} left={left}"
+                    );
+                }
+            }
+        }
+    }
+
+    proptest! {
+        // Not growing always runs the round; growing never runs it.
+        #[test]
+        fn catchup_lag_step_never_runs_a_round_while_lag_grows(
+            growing in any::<u32>(),
+            paused in any::<u64>(),
+            left in any::<u64>(),
+        ) {
+            let step = wal_catchup_lag_step(growing, paused, left);
+            prop_assert_eq!(step == CatchupLagStep::Proceed, growing == 0);
+        }
+    }
+
+    #[test]
+    fn the_catchup_loop_consults_the_lag_step_before_each_round() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        let loop_at = prod
+            .find("while rounds < WAL_CATCHUP_MAX_ROUNDS")
+            .expect("catch-up loop");
+        let body = &prod[loop_at..];
+        let lag = body
+            .find("wal_catchup_lag_step(")
+            .expect("lag step in loop");
+        let replay = body
+            .find("replay_all_with_report_fenced(")
+            .expect("replay in loop");
+        assert!(lag < replay, "the lag step must run before the round reads");
+        assert!(
+            body.contains("tokio::time::sleep("),
+            "a pause must yield, not spin"
+        );
     }
 
     #[test]

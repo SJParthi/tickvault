@@ -197,6 +197,7 @@ pub mod host_limits;
 pub mod host_tuning;
 pub mod infra;
 pub mod leg_identity;
+pub mod log_coalescer;
 // 2026-05-09 PR 5c.5-final (Bug 3 — movers retirement): the
 // `movers_pipeline` orchestrator is DELETED. Operator directive:
 // "only ticks and our 9 needed candle timeframes are available".

@@ -186,27 +186,27 @@ Cluster A (this session's PR; Files/Tests per the judge-approved final design):
 
 - [x] A1 — order_runtime.rs actor: supervised single-owner task, select! arms (order-update / marks / reconcile / 16:00 reset / 15:30 sweep / self-test), NotifierAlertSink — merged via PR #1562 (checkbox ticked 2026-07-17, post-merge follow-up)
   - Files: crates/app/src/order_runtime.rs, crates/app/src/oms_wiring.rs
-  - Tests: test_traded_update_reaches_risk_engine_net_lots_nonzero, test_alert_sink_event_mapping, test_halt_fires_risk_halt_once_per_episode, prop_fill_mirror_matches_risk_net_lots
+  - Tests: test_apply_fill_reaches_risk_engine_net_lots_nonzero, test_alert_sink_event_mapping, test_halt_fires_risk_halt_once_per_episode, prop_fill_mirror_matches_risk_net_lots
 - [x] A2 — FillEvent widening of handle_order_update (+ 4-line trading_pipeline graft) — merged via PR #1562
   - Files: crates/trading/src/oms/engine.rs, crates/trading/src/oms/types.rs, crates/trading/src/oms/mod.rs, crates/app/src/trading_pipeline.rs
-  - Tests: test_same_status_refresh_applies_delta_not_cumulative, test_duplicate_update_zero_delta_skipped, test_partial_lot_remainder_floors_and_errors, test_fill_sign_from_managed_order_transaction_type, test_segment_char_parse_matrix
+  - Tests: test_same_status_refresh_applies_delta_not_cumulative, test_duplicate_update_zero_delta_skipped, test_partial_lot_remainder_floors_and_errors, test_fill_sign_from_managed_order_transaction_type, test_parse_segment_chars_matrix
 - [x] A3 — ticks→update_market_price gate (marks_wanted AtomicBool + MarkUpdate try_send tap) — merged via PR #1562. *Seam re-home note (2026-07-17): the planned `groww_bridge.rs` consume seam died with the Groww live feed (#1581, 2026-07-15); the tap shipped at the Groww per-minute REST legs' persist-confirm choke points (`groww_spot_1m_boot.rs` + `groww_contract_1m_boot.rs`), ≤4 spot + ~30 contract marks/min*
-  - Files: crates/app/src/groww_spot_1m_boot.rs, crates/app/src/groww_contract_1m_boot.rs, crates/app/src/main.rs (originally planned: crates/app/src/groww_bridge.rs — deleted 2026-07-15)
-  - Tests: test_marks_wanted_false_skips_send, test_mark_channel_full_drops_counted_never_blocks, dhat_mark_forward (0 alloc / 10K), Criterion order_gate/mark_forward ≤ 50ns
+  - Files: crates/app/src/main.rs (the Groww spot-1m and contract-1m boot modules this item also touched were deleted with the Groww feed on 2026-08-21) (originally planned: crates/app/src/groww_bridge.rs — deleted 2026-07-15)
+  - Tests: test_mark_forward_skips_send_when_marks_wanted_false, test_mark_forward_channel_full_counts_drops_and_never_blocks, dhat_mark_forward (0 alloc / 10K), Criterion order_gate/mark_forward ≤ 50ns
 - [x] A4 — WAL drain + conditional confirm in dhan_rest_stack Phase 5a — **CUT 2026-07-14, not implemented** (resolved-by-supersession; ticked 2026-07-17 so the cut is recorded, never silently skipped): the operator Dhan noise lock (`dhan-rest-only-noise-lock-2026-07-14.md` §3 + scope-lock §A.1) removed the order-update WAL drain/confirm AND the `run_order_update_connection(.., wal_spill: Some(..))` socket spawn from the shipped scope. The retained live re-arm spec lives in `order-runtime-dryrun.md` §2 — re-arming needs a fresh dated operator quote in the noise-lock file FIRST
   - Files: (none shipped — see the §2 re-arm spec)
-  - Tests: test_rest_stack_wires_order_runtime + test_rest_stack_spawns_no_order_update_ws_and_no_canary pin the shipped socket-free/WAL-free shape; ratchet_order_runtime_spawned_only_from_rest_stack shipped
+  - Tests: test_rest_stack_wires_order_runtime + test_rest_stack_order_update_push_gated_and_no_canary pin the shipped socket-free/WAL-free shape; ratchet_order_runtime_spawned_only_from_rest_stack shipped
 - [x] A5 — reconcile scheduler with honest dry-run heartbeat + local Σfills==net_lots invariant — merged via PR #1562
   - Files: crates/app/src/order_runtime.rs
-  - Tests: test_dry_run_reconcile_classified_heartbeat_not_ok, test_local_reconcile_divergence_errors
+  - Tests: test_dry_run_reconcile_returns_empty_report, test_local_reconcile_invariant_holds_and_diverges (2026-10-01: names updated to the current tests. The original `classified_heartbeat_not_ok` test no longer exists, and no current test asserts that a dry-run reconcile heartbeat is classified "not ok"; recorded, not fixed)
 - [x] A6 — paper filler + once-daily gated self-test + orphan-fill loudness — merged via PR #1562
   - Files: crates/app/src/order_runtime.rs
-  - Tests: test_paper_fill_deferred_until_finite_positive_mark, test_terminal_order_never_refilled, test_selftest_single_cycle_latched, test_selftest_refused_on_holiday_and_off_hours, test_orphan_fill_update_warns_and_counts, test_source_n_filtered_empty_tolerated, order_runtime_e2e (crates/app/tests/)
+  - Tests: test_paper_fill_deferred_until_finite_positive_mark, test_terminal_order_never_refilled, test_selftest_single_cycle_latched, test_selftest_window_gate_boundaries, test_orphan_fill_update_tolerated_book_unchanged, test_source_n_filtered_empty_tolerated, order_runtime_e2e (crates/app/tests/)
 - [x] A7 — risk P&L lot_size fix + evaluate_daily_loss_halt + trigger_halt code field + sid-segment tripwire — merged via PR #1562
   - Files: crates/trading/src/risk/engine.rs, crates/app/src/order_runtime.rs
-  - Tests: test_unrealized_pnl_multiplies_lot_size, test_evaluate_daily_loss_halt_boundary, test_sid_segment_collision_skips_and_errors, test_daily_reset_clears_book_mirror_tripwire_flag_atomically
+  - Tests: test_unrealized_pnl_multiplies_lot_size, test_evaluate_daily_loss_halt_boundary, test_tripwire_divergence_error_latched_per_sid, test_apply_fill_refuses_unknown_segment, test_daily_reset_clears_book_mirror_tripwire_flag_atomically
 - [x] A8 — config section + rule files (order-runtime-dryrun.md; dated notes in ws-reinject-error-codes.md + websocket-connection-scope-lock.md) — merged via PR #1562
-  - Files: crates/common/src/config.rs, config/base.toml, .claude/rules/project/order-runtime-dryrun.md, .claude/rules/project/ws-reinject-error-codes.md
+  - Files: crates/common/src/config.rs, config/base.toml, .claude/rules/project/order-runtime-dryrun.md, docs/error-runbooks/ws-reinject-error-codes.md
   - Tests: config validation unit tests (interval ≥ 60, capacity bounds), serde-default-off test
 
 Other clusters (checked off by their owning sessions' PRs, all referencing THIS plan):
@@ -506,5 +506,5 @@ letter registrar — please confirm.
   - Files: crates/trading/src/oms/order_readiness.rs, engine.rs, types.rs
   - Tests: test_place_order_live_refused_when_no_readiness_installed_zero_http_zero_token_fetch, test_place_order_dry_run_ignores_readiness_gate_byte_identical, test_evaluate_order_readiness_stale_boundary_2100_passes_2101_refuses
 - [x] F3 — ORDER-READY-01 ErrorCode + rule file + OmsAlert 🔷 DHAN attribution
-  - Files: crates/common/src/error_code.rs, .claude/rules/project/order-readiness-error-codes.md, engine.rs
+  - Files: crates/common/src/error_code.rs, docs/error-runbooks/order-readiness-error-codes.md, engine.rs
   - Tests: test_order_ready_01_contract, test_all_oms_alert_operator_messages_start_with_dhan_badge

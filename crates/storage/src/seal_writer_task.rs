@@ -1044,14 +1044,50 @@ pub fn drain_recovered_seals<S: SealSink>(
 //   the older copy over the stored row. The boot drain does not read the
 //   stored row to compare, because a database read per recovered seal is the
 //   cost the spill exists to avoid.
-// * **The gate needs live traffic.** It opens only on clean LIVE flushes. If
-//   the last flush before the close failed, no live seal arrives afterwards
-//   to reopen it, and the spill waits for the next boot's drain.
 // * **Clock steps.** A wall clock that steps backwards restarts the gate
 //   (never opens it early), and makes a directory scan due at once.
 //
+// ## The database's word, not only the live writer's (audit PR41b)
+//
+// * **A health check reopens the gate.** The gate used to open only on clean
+//   LIVE flushes, so a spill made after the last live write (the last flush
+//   before the close failed) waited for the next boot. It now also opens
+//   once the QuestDB WAL-suspension watcher has reported a clean probe after
+//   the last failure and [`SEAL_REPLAY_HEALTHY_SECS`] have passed since it.
+// * **A suspect table closes the gate and keeps the file.** An ILP `2xx` from
+//   a WAL-suspended table is acknowledged and never applied (see
+//   `wal_applied_watermark`). While the watcher reports a table suspended,
+//   lagging, or itself blind, nothing replays. A file read to its end is not
+//   archived until two more clean probes have reported, so one whole probe
+//   ran after its last write. If suspicion begins first, the file is read
+//   again from its start, and so is the file being read: the DEDUP keys
+//   collapse what had landed. With no watcher running (no probe ever seen),
+//   a finished file is archived at once, as before.
+// * **A flapping database is not a bad record.** A failed flush whose error is
+//   the transport, the server's configuration, or the candle tables not yet
+//   keyed says nothing about the record and never counts toward skipping it.
+//   Any other failure at a step of one record counts as a strike, the first
+//   one always and each later one only when the database accepted a write in
+//   between (a clean live flush, or a clean probe, since the last failure).
+//   Only [`SEAL_REPLAY_POISON_FAILURES`] strikes skip the record.
+// * **One stuck file never holds the rest.** After
+//   [`SEAL_REPLAY_STUCK_FAILURES`] failed flushes at one position with no
+//   progress, the file is parked where it is for [`SEAL_REPLAY_PARK_SECS`] and
+//   the replay moves to the next staged file. A parked file resumes at the
+//   same position. Later files can then reach the database before an older
+//   one; an older copy of a bucket the spill also holds newer is still dropped
+//   by the PR41a ledger (a key the ledger could not track is not).
+//
+// ## The dead-letter file replays at boot only (audit row 36)
+//
 // Only the binary spill is replayed here. The NDJSON DLQ is the last-resort
-// tier (spill itself failed) and stays with the boot drain.
+// tier: a seal reaches it only when the spill append itself failed, which
+// means the volume under the spill is failing. It also has no paused-append
+// staging (`SealSpillWriter::with_appends_paused` has no DLQ counterpart), so
+// moving its file mid-session could lose a seal appended at the same instant.
+// So the DLQ stays with the boot drain: its seals are held on disk, not lost,
+// and reach the candle tables on the next boot. Recorded in the plan as the
+// decision for row 36.
 
 /// How long the live writer must flush cleanly before a replay step may run.
 pub const SEAL_REPLAY_HEALTHY_SECS: i64 = 60;
@@ -1059,8 +1095,10 @@ pub const SEAL_REPLAY_HEALTHY_SECS: i64 = 60;
 /// Most spilled seals re-ingested per writer cycle (every 100 ms).
 pub const SEAL_REPLAY_SEALS_PER_CYCLE: usize = 512;
 
-/// Consecutive replay flush failures at a step of one record, at the same
-/// position, before that record is skipped as poison.
+/// Strikes against one record, at a step of one record and the same position,
+/// before it is skipped as poison. A strike is a failure that was not the
+/// transport (audit PR41b); after the first, only a failure that follows a
+/// write the database accepted counts.
 const SEAL_REPLAY_POISON_FAILURES: u32 = 2;
 
 /// How often, while idle and healthy, the replay looks for spill files.
@@ -1070,6 +1108,86 @@ pub const SEAL_REPLAY_SCAN_EVERY_SECS: i64 = 30;
 /// rename failed). Bounded so a directory of broken files cannot grow it; past
 /// the bound the replay stops looking for new files until the next boot.
 const SEAL_REPLAY_SKIP_LIMIT: usize = 64;
+
+/// Failed flushes at one position, with no progress, before the file is
+/// parked and the replay moves on (audit PR41b). Nine halvings take a step
+/// from [`SEAL_REPLAY_SEALS_PER_CYCLE`] down to one record, so twelve leaves
+/// the poison isolation three attempts at a step of one before parking.
+pub const SEAL_REPLAY_STUCK_FAILURES: u32 = 12;
+
+/// How long a parked file waits before the replay resumes it (audit PR41b).
+pub const SEAL_REPLAY_PARK_SECS: i64 = 600;
+
+/// Most files parked, or read to their end and waiting for the database to
+/// confirm them, at once. Same bound as [`SEAL_REPLAY_SKIP_LIMIT`]; a full list
+/// keeps the file where it is rather than dropping it.
+const SEAL_REPLAY_HELD_LIMIT: usize = SEAL_REPLAY_SKIP_LIMIT;
+
+/// Clean probes that must report after a file's last write before it is
+/// archived. Two, so one whole probe started after that write.
+const SEAL_REPLAY_ARCHIVE_CONFIRM_PROBES: u64 = 2;
+
+/// What the QuestDB WAL-suspension watcher last reported, as the replay reads
+/// it (audit PR41b).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReplayProbe {
+    /// Clean probes reported so far this process. `0` with `suspect == false`
+    /// means no watcher has reported, and the replay behaves as before PR41b.
+    pub clean_probes: u64,
+    /// `true` while a table is suspended, lagging, or the probe is blind.
+    pub suspect: bool,
+}
+
+impl ReplayProbe {
+    /// The process-global watcher's current view. Two atomic loads.
+    #[must_use]
+    pub fn current() -> Self {
+        let wm = crate::wal_applied_watermark::applied_watermark();
+        Self {
+            clean_probes: wm.clean_probe_count(),
+            suspect: wm.is_sink_suspect(),
+        }
+    }
+
+    /// `true` once any probe has reported, clean or not.
+    const fn is_running(self) -> bool {
+        self.clean_probes > 0 || self.suspect
+    }
+}
+
+/// Why a replay flush failed, as far as it bears on the record (audit PR41b).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplayFlushFailure {
+    /// The transport, the server's configuration or authentication, or the
+    /// candle tables not yet keyed. Says nothing about the record.
+    Environment,
+    /// The database answered and refused the batch, or the cause is unknown.
+    Refused,
+}
+
+/// Classify a replay flush failure. O(chain length), cold.
+fn classify_replay_flush_failure(err: &anyhow::Error) -> ReplayFlushFailure {
+    if err
+        .downcast_ref::<crate::shadow_candle_writer::CandleTablesNotKeyed>()
+        .is_some()
+    {
+        return ReplayFlushFailure::Environment;
+    }
+    match err
+        .downcast_ref::<questdb::Error>()
+        .map(questdb::Error::code)
+    {
+        Some(
+            questdb::ErrorCode::SocketError
+            | questdb::ErrorCode::CouldNotResolveAddr
+            | questdb::ErrorCode::AuthError
+            | questdb::ErrorCode::TlsError
+            | questdb::ErrorCode::HttpNotSupported
+            | questdb::ErrorCode::ConfigError,
+        ) => ReplayFlushFailure::Environment,
+        _ => ReplayFlushFailure::Refused,
+    }
+}
 
 /// What one [`MidSessionReplay::step`] did. Every field maps to a
 /// `tv_seal_replay_total{kind=...}` label emitted by the writer loop.
@@ -1087,6 +1205,13 @@ pub struct ReplayOutcome {
     /// `true` when this step's flush failed. The file keeps its position and
     /// the health gate resets.
     pub flush_failed: bool,
+    /// Files parked after [`SEAL_REPLAY_STUCK_FAILURES`] failed flushes at one
+    /// position, so the next file could go ahead (audit PR41b).
+    pub files_parked: usize,
+    /// Files to be read again from their start because the database became
+    /// suspect before it confirmed them (audit PR41b). Set by
+    /// [`MidSessionReplay::observe_probe`]; the runner folds it in.
+    pub files_rewound: usize,
 }
 
 impl ReplayOutcome {
@@ -1098,6 +1223,8 @@ impl ReplayOutcome {
             && self.records_skipped == 0
             && self.files_archived == 0
             && !self.flush_failed
+            && self.files_parked == 0
+            && self.files_rewound == 0
     }
 }
 
@@ -1111,8 +1238,16 @@ struct ReplayCursor {
     /// Records read per step, 1..=[`SEAL_REPLAY_SEALS_PER_CYCLE`]. Halved by
     /// a failed flush, doubled by a clean one.
     step_records: usize,
-    /// Consecutive failed flushes at a step of one record, at `offset`.
+    /// Strikes against the record at `offset`, at a step of one record. See
+    /// [`SEAL_REPLAY_POISON_FAILURES`].
     single_record_failures: u32,
+    /// Failed flushes at `offset` since it last moved, of any kind and any
+    /// step size. See [`SEAL_REPLAY_STUCK_FAILURES`].
+    failures_at_offset: u32,
+    /// `(clean live flushes, clean probes)` seen at the last failed flush.
+    /// Either moving on since means the database accepted something in
+    /// between.
+    evidence_mark: (u64, u64),
 }
 
 impl ReplayCursor {
@@ -1122,8 +1257,34 @@ impl ReplayCursor {
             offset: 0,
             step_records: SEAL_REPLAY_SEALS_PER_CYCLE,
             single_record_failures: 0,
+            failures_at_offset: 0,
+            evidence_mark: (0, 0),
         }
     }
+
+    /// Start the file again from its first record.
+    fn rewind(&mut self) {
+        self.offset = 0;
+        self.step_records = SEAL_REPLAY_SEALS_PER_CYCLE;
+        self.single_record_failures = 0;
+        self.failures_at_offset = 0;
+    }
+}
+
+/// A file set aside after it stopped making progress. Resumes at its cursor.
+#[derive(Debug)]
+struct ParkedFile {
+    cursor: ReplayCursor,
+    /// Wall-clock second from which the replay may resume it.
+    retry_at: i64,
+}
+
+/// A file read to its end, waiting for the database to confirm it.
+#[derive(Debug)]
+struct AwaitingArchive {
+    path: PathBuf,
+    /// Clean probes reported when its last record was flushed.
+    clean_probes_at_finish: u64,
 }
 
 /// Mid-session replay of the seal spill. Owned by the seal writer runner and
@@ -1132,16 +1293,30 @@ impl ReplayCursor {
 /// Cold path: runs on the writer loop inside `block_in_place`, never on the
 /// frame drain. Each step opens the staged file, reads at most
 /// [`SEAL_REPLAY_SEALS_PER_CYCLE`] records into a reused buffer and flushes
-/// them once: O(records) per step, bounded by the cap.
+/// them once: O(records) per step, bounded by the cap. The parked and
+/// awaiting lists hold at most [`SEAL_REPLAY_HELD_LIMIT`] files each and are
+/// scanned linearly once per step at most.
 #[derive(Debug, Default)]
 pub struct MidSessionReplay {
     /// Wall-clock second of the first clean live flush since the last failure.
     healthy_since: Option<i64>,
+    /// Wall-clock second of the last failed flush, live or replay.
+    last_failure_secs: Option<i64>,
+    /// Clean probes reported when that failure happened.
+    clean_probes_at_failure: u64,
+    /// Clean live flushes seen this process.
+    live_ok_flushes: u64,
+    /// The watcher's view as of the last [`Self::observe_probe`].
+    probe: ReplayProbe,
     /// Wall-clock second of the last directory scan.
     last_scan: Option<i64>,
     cursor: Option<ReplayCursor>,
     /// Files given up on for this process. See [`SEAL_REPLAY_SKIP_LIMIT`].
     skipped: Vec<PathBuf>,
+    /// Files set aside after they stopped making progress.
+    parked: Vec<ParkedFile>,
+    /// Files read to their end, waiting for a clean probe behind them.
+    awaiting_archive: Vec<AwaitingArchive>,
     /// Reused decode buffer, at most one step's worth of seals.
     batch: Vec<BufferedSeal>,
 }
@@ -1162,18 +1337,89 @@ impl MidSessionReplay {
             self.healthy_since = Some(now_unix_secs);
         }
         if drain.ring_seals_popped > 0 && !drain.flushed_ok {
-            self.healthy_since = None;
-        } else if drain.flushed_ok && self.healthy_since.is_none() {
-            self.healthy_since = Some(now_unix_secs);
+            self.note_failure(now_unix_secs);
+        } else if drain.flushed_ok {
+            self.live_ok_flushes = self.live_ok_flushes.saturating_add(1);
+            if self.healthy_since.is_none() {
+                self.healthy_since = Some(now_unix_secs);
+            }
         }
     }
 
-    /// `true` once the live writer has flushed cleanly for
-    /// [`SEAL_REPLAY_HEALTHY_SECS`] with no failure since.
+    /// Feed the QuestDB watcher's current view into the replay (audit PR41b).
+    /// Returns how many files are to be read again from their start because
+    /// the database turned suspect before it confirmed them.
+    ///
+    /// O([`SEAL_REPLAY_HELD_LIMIT`]) on the transition into suspicion, O(1)
+    /// otherwise.
+    pub fn observe_probe(&mut self, probe: ReplayProbe, now_unix_secs: i64) -> usize {
+        let entering = probe.suspect && !self.probe.suspect;
+        self.probe = probe;
+        if !probe.suspect {
+            return 0;
+        }
+        // Suspect: nothing replays, and the gate must be earned again.
+        self.note_failure(now_unix_secs);
+        if !entering {
+            return 0;
+        }
+        // Every ack since the last clean probe may have been a lie, so what
+        // was read since then is read again. The DEDUP keys collapse what did
+        // land; the file is never archived on an unconfirmed read.
+        let mut rewound = 0usize;
+        if let Some(cursor) = self.cursor.as_mut()
+            && cursor.offset > 0
+        {
+            cursor.rewind();
+            rewound += 1;
+        }
+        // O(1) EXEMPT: at most SEAL_REPLAY_HELD_LIMIT entries, once per suspicion
+        for parked in &mut self.parked {
+            if parked.cursor.offset > 0 {
+                parked.cursor.rewind();
+                rewound += 1;
+            }
+        }
+        // A file waiting for confirmation leaves the list, so the next scan
+        // picks it up again and reads it from its first record.
+        rewound += self.awaiting_archive.len();
+        self.awaiting_archive.clear();
+        if rewound > 0 {
+            warn!(
+                files_rewound = rewound,
+                "seal replay: QuestDB reports a suspended or lagging table — files the \
+                 replay wrote since the last clean check are read again from their start \
+                 once it is healthy"
+            );
+        }
+        rewound
+    }
+
+    /// Close the gate and remember when, for the probe path to reopen it.
+    fn note_failure(&mut self, now_unix_secs: i64) {
+        self.healthy_since = None;
+        self.last_failure_secs = Some(now_unix_secs);
+        self.clean_probes_at_failure = self.probe.clean_probes;
+    }
+
+    /// `true` once the database is healthy enough to take a replay step:
+    /// never while the watcher reports a suspect table; otherwise once the
+    /// live writer has flushed cleanly for [`SEAL_REPLAY_HEALTHY_SECS`] with no
+    /// failure since, or once a clean probe has reported after the last
+    /// failure and [`SEAL_REPLAY_HEALTHY_SECS`] have passed since it.
     #[must_use]
     pub fn is_healthy(&self, now_unix_secs: i64) -> bool {
-        self.healthy_since
-            .is_some_and(|since| now_unix_secs.saturating_sub(since) >= SEAL_REPLAY_HEALTHY_SECS)
+        if self.probe.suspect {
+            return false;
+        }
+        let live = self
+            .healthy_since
+            .is_some_and(|since| now_unix_secs.saturating_sub(since) >= SEAL_REPLAY_HEALTHY_SECS);
+        let quiet_since_failure = self.last_failure_secs.is_none_or(|at| {
+            now_unix_secs >= at && now_unix_secs.saturating_sub(at) >= SEAL_REPLAY_HEALTHY_SECS
+        });
+        let probe = self.probe.clean_probes > self.clean_probes_at_failure && quiet_since_failure;
+        live || probe
     }
 
     /// The file currently being replayed, if any.
@@ -1195,6 +1441,7 @@ impl MidSessionReplay {
         now_unix_secs: i64,
     ) -> ReplayOutcome {
         let mut outcome = ReplayOutcome::default();
+        self.archive_confirmed(&mut outcome);
         if !ring_is_empty || !self.is_healthy(now_unix_secs) {
             return outcome;
         }
@@ -1209,22 +1456,75 @@ impl MidSessionReplay {
             }
             self.last_scan = Some(now_unix_secs);
             outcome.files_staged = stage_live_spill_files(spill, spill_dir);
-            let Some(path) = self.next_staged_file(spill_dir) else {
+            let Some(path) = self.next_staged_file(spill_dir, now_unix_secs) else {
                 return outcome;
             };
-            info!(
-                ?path,
-                files_staged = outcome.files_staged,
-                "seal replay: re-ingesting a spill file mid-session"
-            );
-            self.cursor = Some(ReplayCursor::new(path));
+            // A parked file resumes where it stopped.
+            let cursor = match self.parked.iter().position(|p| p.cursor.path == path) {
+                Some(at) => {
+                    let mut cursor = self.parked.swap_remove(at).cursor;
+                    cursor.failures_at_offset = 0;
+                    info!(
+                        ?path,
+                        offset = cursor.offset,
+                        "seal replay: resuming a parked spill file"
+                    );
+                    cursor
+                }
+                None => {
+                    info!(
+                        ?path,
+                        files_staged = outcome.files_staged,
+                        "seal replay: re-ingesting a spill file mid-session"
+                    );
+                    ReplayCursor::new(path)
+                }
+            };
+            self.cursor = Some(cursor);
         }
-        self.advance(writer, spill, &mut outcome);
+        self.advance(writer, spill, now_unix_secs, &mut outcome);
         outcome
     }
 
-    /// Oldest staged spill file not yet given up on.
-    fn next_staged_file(&self, spill_dir: &Path) -> Option<PathBuf> {
+    /// Archive every file the database has confirmed: two clean probes have
+    /// reported since its last record was flushed, and none is suspect now.
+    fn archive_confirmed(&mut self, outcome: &mut ReplayOutcome) {
+        if self.probe.suspect || self.awaiting_archive.is_empty() {
+            return;
+        }
+        let clean_probes = self.probe.clean_probes;
+        let mut i = 0usize;
+        // O(1) EXEMPT: at most SEAL_REPLAY_HELD_LIMIT entries, cold writer cycle
+        while i < self.awaiting_archive.len() {
+            let entry = &self.awaiting_archive[i];
+            let confirmed = clean_probes
+                >= entry
+                    .clean_probes_at_finish
+                    .saturating_add(SEAL_REPLAY_ARCHIVE_CONFIRM_PROBES);
+            if !confirmed {
+                i += 1;
+                continue;
+            }
+            let entry = self.awaiting_archive.swap_remove(i);
+            match archive_staged(&entry.path) {
+                Ok(()) => {
+                    outcome.files_archived += 1;
+                    info!(
+                        path = ?entry.path,
+                        "seal replay: spill file re-ingested, confirmed by QuestDB, archived"
+                    );
+                }
+                Err(err) => {
+                    warn!(path = ?entry.path, ?err, "seal replay: archive rename failed");
+                    self.give_up_on(entry.path);
+                }
+            }
+        }
+    }
+
+    /// Oldest staged spill file not given up on, not waiting for
+    /// confirmation, and not parked (or parked and due).
+    fn next_staged_file(&self, spill_dir: &Path, now_unix_secs: i64) -> Option<PathBuf> {
         let replaying = spill_dir.join(SEAL_REPLAYING_SUBDIR);
         // O(1) EXEMPT: cold directory listing, at most once per scan interval
         let mut staged: Vec<PathBuf> = std::fs::read_dir(&replaying)
@@ -1234,6 +1534,13 @@ impl MidSessionReplay {
             .map(|e| e.path())
             .filter(|p| is_seal_file(p) && staged_kind(p) == Some(StagedKind::Spill))
             .filter(|p| !self.skipped.contains(p))
+            .filter(|p| !self.awaiting_archive.iter().any(|a| &a.path == p))
+            .filter(|p| {
+                self.parked
+                    .iter()
+                    .find(|parked| &parked.cursor.path == p)
+                    .is_none_or(|parked| now_unix_secs >= parked.retry_at)
+            })
             .collect();
         sort_by_write_time(&mut staged);
         staged.into_iter().next()
@@ -1243,18 +1550,22 @@ impl MidSessionReplay {
     /// retries it.
     fn skip_current(&mut self) {
         if let Some(cursor) = self.cursor.take() {
-            self.skipped.push(cursor.path);
-            if self.skipped.len() == SEAL_REPLAY_SKIP_LIMIT {
-                error!(
-                    code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
-                    files_skipped = SEAL_REPLAY_SKIP_LIMIT,
-                    "seal replay: gave up on too many spill files — the replay stops for \
-                     this process and the next boot's drain retries them"
-                );
-            }
+            self.give_up_on(cursor.path);
         }
         // Scan again at once: another file may be waiting.
         self.last_scan = None;
+    }
+
+    fn give_up_on(&mut self, path: PathBuf) {
+        self.skipped.push(path);
+        if self.skipped.len() == SEAL_REPLAY_SKIP_LIMIT {
+            error!(
+                code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                files_skipped = SEAL_REPLAY_SKIP_LIMIT,
+                "seal replay: gave up on too many spill files — the replay stops for \
+                 this process and the next boot's drain retries them"
+            );
+        }
     }
 
     /// Replay up to one step's worth of records from the cursor.
@@ -1262,6 +1573,7 @@ impl MidSessionReplay {
         &mut self,
         writer: &mut S,
         spill: &crate::seal_spill::SealSpillWriter,
+        now_unix_secs: i64,
         outcome: &mut ReplayOutcome,
     ) {
         let Some(cursor) = self.cursor.as_ref() else {
@@ -1307,8 +1619,8 @@ impl MidSessionReplay {
             if let Err(flush_err) = writer.flush() {
                 writer.discard_pending();
                 outcome.flush_failed = true;
-                self.healthy_since = None;
-                self.on_replay_flush_failed(&path, offset, &flush_err, outcome);
+                self.on_replay_flush_failed(&path, offset, &flush_err, now_unix_secs, outcome);
+                self.note_failure(now_unix_secs);
                 return;
             }
             outcome.seals_reingested += appended;
@@ -1319,25 +1631,46 @@ impl MidSessionReplay {
         if let Some(cursor) = self.cursor.as_mut() {
             cursor.offset = cursor.offset.saturating_add(consumed);
             cursor.single_record_failures = 0;
+            cursor.failures_at_offset = 0;
             cursor.step_records = cursor
                 .step_records
                 .saturating_mul(2)
                 .min(SEAL_REPLAY_SEALS_PER_CYCLE);
         }
         if at_eof {
-            match archive_staged(&path) {
-                Ok(()) => {
-                    outcome.files_archived += 1;
-                    info!(?path, "seal replay: spill file re-ingested and archived");
-                    self.cursor = None;
-                    self.last_scan = None;
-                }
-                Err(err) => {
-                    // Committed but not archived. Replaying it again would
-                    // only rewrite the same rows, so leave it for the boot.
-                    warn!(?path, ?err, "seal replay: archive rename failed");
-                    self.skip_current();
-                }
+            self.finish_file(path, outcome);
+        }
+    }
+
+    /// The file has been read to its end. With a QuestDB watcher running it
+    /// waits for two clean probes behind it; without one it is archived now.
+    fn finish_file(&mut self, path: PathBuf, outcome: &mut ReplayOutcome) {
+        if self.probe.is_running() {
+            if self.awaiting_archive.len() >= SEAL_REPLAY_HELD_LIMIT {
+                // Hold the file at its end; the next step tries again once
+                // the list has drained. Nothing is lost by waiting.
+                return;
+            }
+            self.awaiting_archive.push(AwaitingArchive {
+                path,
+                clean_probes_at_finish: self.probe.clean_probes,
+            });
+            self.cursor = None;
+            self.last_scan = None;
+            return;
+        }
+        match archive_staged(&path) {
+            Ok(()) => {
+                outcome.files_archived += 1;
+                info!(?path, "seal replay: spill file re-ingested and archived");
+                self.cursor = None;
+                self.last_scan = None;
+            }
+            Err(err) => {
+                // Committed but not archived. Replaying it again would
+                // only rewrite the same rows, so leave it for the boot.
+                warn!(?path, ?err, "seal replay: archive rename failed");
+                self.skip_current();
             }
         }
     }
@@ -1345,18 +1678,27 @@ impl MidSessionReplay {
     /// A replay flush failed: the file keeps its position and the next step
     /// reads half as many records, so a single record the database refuses is
     /// isolated instead of failing every step of the file forever. At a step
-    /// of one record, [`SEAL_REPLAY_POISON_FAILURES`] failures in a row at the
-    /// same position skip that record.
+    /// of one record, [`SEAL_REPLAY_POISON_FAILURES`] strikes skip it (see the
+    /// strike rule in the module notes). After [`SEAL_REPLAY_STUCK_FAILURES`]
+    /// failures at one position the file is parked so the next can go ahead.
     fn on_replay_flush_failed(
         &mut self,
         path: &Path,
         offset: u64,
         flush_err: &anyhow::Error,
+        now_unix_secs: i64,
         outcome: &mut ReplayOutcome,
     ) {
+        let evidence_now = (self.live_ok_flushes, self.probe.clean_probes);
+        let failure = classify_replay_flush_failure(flush_err);
         let Some(cursor) = self.cursor.as_mut() else {
             return;
         };
+        cursor.failures_at_offset = cursor.failures_at_offset.saturating_add(1);
+        let database_accepted_since =
+            evidence_now.0 > cursor.evidence_mark.0 || evidence_now.1 > cursor.evidence_mark.1;
+        cursor.evidence_mark = evidence_now;
+
         if cursor.step_records > 1 {
             cursor.step_records /= 2;
             error!(
@@ -1364,37 +1706,70 @@ impl MidSessionReplay {
                 ?flush_err,
                 ?path,
                 offset,
+                ?failure,
                 next_step_records = cursor.step_records,
                 "seal replay: flush failed — the file keeps its place, the next step reads \
                  half as many records, and the replay waits for the database to be healthy \
                  again"
             );
-            return;
-        }
-        cursor.single_record_failures = cursor.single_record_failures.saturating_add(1);
-        if cursor.single_record_failures < SEAL_REPLAY_POISON_FAILURES {
+        } else {
+            let strike = failure == ReplayFlushFailure::Refused
+                && (cursor.single_record_failures == 0 || database_accepted_since);
+            if strike {
+                cursor.single_record_failures = cursor.single_record_failures.saturating_add(1);
+            }
+            if cursor.single_record_failures >= SEAL_REPLAY_POISON_FAILURES {
+                let record_bytes = u64::try_from(SEAL_SPILL_RECORD_SIZE).unwrap_or(u64::MAX);
+                cursor.offset = cursor.offset.saturating_add(record_bytes);
+                cursor.single_record_failures = 0;
+                cursor.failures_at_offset = 0;
+                outcome.records_skipped += 1;
+                error!(
+                    code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                    ?flush_err,
+                    ?path,
+                    offset,
+                    "seal replay: the database refused this one spilled seal in every attempt, \
+                     and accepted other writes in between — skipped; its bytes stay in the \
+                     file, which moves to archive/"
+                );
+                return;
+            }
             error!(
                 code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
                 ?flush_err,
                 ?path,
                 offset,
-                "seal replay: flush of a single spilled seal failed — retrying it once more \
-                 after the database is healthy again"
+                ?failure,
+                strike,
+                strikes = cursor.single_record_failures,
+                "seal replay: flush of a single spilled seal failed — retried after the \
+                 database is healthy again; a transport failure, or one with no write \
+                 accepted since the last, is not held against the record"
             );
-            return;
         }
-        let record_bytes = u64::try_from(SEAL_SPILL_RECORD_SIZE).unwrap_or(u64::MAX);
-        cursor.offset = cursor.offset.saturating_add(record_bytes);
-        cursor.single_record_failures = 0;
-        outcome.records_skipped += 1;
-        error!(
-            code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
-            ?flush_err,
-            ?path,
-            offset,
-            "seal replay: the database refused this one spilled seal in every attempt — \
-             skipped; its bytes stay in the file, which moves to archive/"
-        );
+
+        if cursor.failures_at_offset >= SEAL_REPLAY_STUCK_FAILURES
+            && self.parked.len() < SEAL_REPLAY_HELD_LIMIT
+            && let Some(mut cursor) = self.cursor.take()
+        {
+            cursor.failures_at_offset = 0;
+            error!(
+                code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                ?path,
+                offset,
+                failures = SEAL_REPLAY_STUCK_FAILURES,
+                retry_in_secs = SEAL_REPLAY_PARK_SECS,
+                "seal replay: a spill file made no progress — parked where it stopped so the \
+                 next staged file can go ahead; it resumes at the same record later"
+            );
+            self.parked.push(ParkedFile {
+                cursor,
+                retry_at: now_unix_secs.saturating_add(SEAL_REPLAY_PARK_SECS),
+            });
+            self.last_scan = None;
+            outcome.files_parked += 1;
+        }
     }
 
     /// Decode up to `step_records` records starting at `offset` into
@@ -2245,6 +2620,9 @@ mod tests {
         flushes: usize,
         /// A bucket the database refuses: any flush carrying it fails.
         poison: Option<u32>,
+        /// Report the poison bucket's failure as a transport error (audit
+        /// PR41b), as a flapping connection would, instead of a refusal.
+        poison_as_socket: bool,
     }
 
     impl SealSink for ReplaySink {
@@ -2259,6 +2637,13 @@ mod tests {
                 anyhow::bail!("injected flush failure");
             }
             if self.poison.is_some_and(|p| self.pending.contains(&p)) {
+                if self.poison_as_socket {
+                    return Err(anyhow::Error::new(questdb::Error::new(
+                        questdb::ErrorCode::SocketError,
+                        "injected: connection reset",
+                    ))
+                    .context("shadow flush: ILP send failed after reconnect retries"));
+                }
                 anyhow::bail!("injected poison row");
             }
             self.committed.append(&mut self.pending);
@@ -2528,6 +2913,412 @@ mod tests {
             "every other record lands, in order"
         );
         cleanup(&spill, &dlq);
+    }
+
+    // -----------------------------------------------------------------
+    // Audit PR41b: flap vs bad record, stuck files, the QuestDB watcher.
+    // -----------------------------------------------------------------
+
+    /// Spill `n` seals with buckets `first..first + n`, into the day file of
+    /// `now`.
+    fn spill_range(writer: &crate::seal_spill::SealSpillWriter, first: u32, n: u32, now: i64) {
+        for i in first..first + n {
+            let seal = SerializedSeal::from(&mk_seal(13, 0, TfIndex::M1, i, 101.5));
+            writer.append_seal(&seal, now).expect("spill append");
+        }
+    }
+
+    /// One healthy-gated step every `SEAL_REPLAY_HEALTHY_SECS`, reopening the
+    /// gate with a clean live flush after a failed step. Stops when `done`.
+    fn drive(
+        replay: &mut MidSessionReplay,
+        sink: &mut ReplaySink,
+        writer: &crate::seal_spill::SealSpillWriter,
+        spill: &Path,
+        now: &mut i64,
+        max_steps: usize,
+        done: impl Fn(&ReplayOutcome, &ReplaySink) -> bool,
+    ) -> ReplayOutcome {
+        let mut total = ReplayOutcome::default();
+        replay.observe(&healthy_drain(), *now);
+        for _ in 0..max_steps {
+            *now += SEAL_REPLAY_HEALTHY_SECS;
+            let step = replay.step(sink, writer, spill, true, *now);
+            total.seals_reingested += step.seals_reingested;
+            total.records_skipped += step.records_skipped;
+            total.files_archived += step.files_archived;
+            total.files_parked += step.files_parked;
+            if step.flush_failed {
+                replay.observe(&healthy_drain(), *now);
+            }
+            if done(&total, sink) {
+                break;
+            }
+        }
+        total
+    }
+
+    #[test]
+    fn classify_replay_flush_failure_tells_the_transport_from_a_refusal() {
+        let socket = anyhow::Error::new(questdb::Error::new(
+            questdb::ErrorCode::SocketError,
+            "Broken pipe",
+        ))
+        .context("shadow flush: ILP send failed after reconnect retries");
+        assert_eq!(
+            classify_replay_flush_failure(&socket),
+            ReplayFlushFailure::Environment,
+            "a transport failure under a context layer is still the transport"
+        );
+        let refused = anyhow::Error::new(questdb::Error::new(
+            questdb::ErrorCode::ServerFlushError,
+            "Could not flush buffer: bad value [line: 1]",
+        ))
+        .context("shadow flush: ILP send failed (non-connection)");
+        assert_eq!(
+            classify_replay_flush_failure(&refused),
+            ReplayFlushFailure::Refused
+        );
+        let not_keyed = anyhow::Error::new(crate::shadow_candle_writer::CandleTablesNotKeyed);
+        assert_eq!(
+            classify_replay_flush_failure(&not_keyed),
+            ReplayFlushFailure::Environment,
+            "tables not yet keyed is the database's state, not the record's"
+        );
+        for code in [
+            questdb::ErrorCode::CouldNotResolveAddr,
+            questdb::ErrorCode::AuthError,
+            questdb::ErrorCode::TlsError,
+            questdb::ErrorCode::HttpNotSupported,
+            questdb::ErrorCode::ConfigError,
+        ] {
+            let err = anyhow::Error::new(questdb::Error::new(code, "x"));
+            assert_eq!(
+                classify_replay_flush_failure(&err),
+                ReplayFlushFailure::Environment,
+                "{code:?}"
+            );
+        }
+        assert_eq!(
+            classify_replay_flush_failure(&anyhow::anyhow!("unknown")),
+            ReplayFlushFailure::Refused,
+            "an unknown cause can be the record"
+        );
+    }
+
+    #[test]
+    fn a_transport_failure_never_skips_a_record_and_a_stuck_file_is_parked_so_the_next_goes_ahead()
+    {
+        let (spill, dlq) = temp_pair("replay-stuck-park");
+        let writer = crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(spill.clone());
+        let t0 = jan1_noon_utc();
+        // Two day files: the first holds a record whose every flush dies on
+        // the connection, the second is clean.
+        spill_range(&writer, 0, 40, t0);
+        spill_range(&writer, 10_000, 30, t0 + 86_400);
+        let mut replay = MidSessionReplay::default();
+        let mut sink = ReplaySink {
+            poison: Some(17),
+            poison_as_socket: true,
+            ..ReplaySink::default()
+        };
+        let mut now = t0 + 2 * 86_400;
+        let total = drive(
+            &mut replay,
+            &mut sink,
+            &writer,
+            &spill,
+            &mut now,
+            200,
+            |_, sink| sink.committed.contains(&10_029),
+        );
+
+        assert_eq!(
+            total.records_skipped, 0,
+            "a transport failure is never held against the record"
+        );
+        assert_eq!(total.files_parked, 1, "the stuck file is parked once");
+        let second: Vec<u32> = (10_000..10_030).collect();
+        assert!(
+            second.iter().all(|b| sink.committed.contains(b)),
+            "the next file went ahead of the stuck one"
+        );
+        assert!(
+            !sink.committed.contains(&17),
+            "the record that never flushed is not reported as written"
+        );
+        let parked = replay.parked.first().expect("the stuck file is parked");
+        assert_eq!(
+            parked.cursor.offset,
+            17 * SEAL_SPILL_RECORD_SIZE as u64,
+            "the parked file keeps its place at the stuck record"
+        );
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn a_parked_file_resumes_at_its_record_after_the_park_window() {
+        let (spill, dlq) = temp_pair("replay-park-resume");
+        let writer = crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(spill.clone());
+        let t0 = jan1_noon_utc();
+        spill_range(&writer, 0, 20, t0);
+        let mut replay = MidSessionReplay::default();
+        let mut sink = ReplaySink {
+            poison: Some(5),
+            poison_as_socket: true,
+            ..ReplaySink::default()
+        };
+        let mut now = t0 + 100;
+        drive(
+            &mut replay,
+            &mut sink,
+            &writer,
+            &spill,
+            &mut now,
+            200,
+            |total, _| total.files_parked > 0,
+        );
+        assert_eq!(replay.parked.len(), 1);
+        assert_eq!(sink.committed, (0..5).collect::<Vec<u32>>());
+
+        // The connection heals. Inside the park window the file waits.
+        sink.poison = None;
+        replay.observe(&healthy_drain(), now);
+        now += SEAL_REPLAY_HEALTHY_SECS;
+        let early = replay.step(&mut sink, &writer, &spill, true, now);
+        assert_eq!(early.seals_reingested, 0, "parked until its retry time");
+
+        now += SEAL_REPLAY_PARK_SECS;
+        let total = drive(
+            &mut replay,
+            &mut sink,
+            &writer,
+            &spill,
+            &mut now,
+            50,
+            |total, _| total.files_archived > 0,
+        );
+        assert_eq!(total.files_archived, 1);
+        assert_eq!(
+            sink.committed,
+            (0..20).collect::<Vec<u32>>(),
+            "resumed at the stuck record: nothing re-sent, nothing missed"
+        );
+        assert!(replay.parked.is_empty());
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn test_replay_probe_current_reads_the_process_watermark() {
+        let wm = crate::wal_applied_watermark::applied_watermark();
+        let probe = ReplayProbe::current();
+        // The watcher is not running under test, so the counter can only be
+        // what the global reports; read both and compare.
+        assert_eq!(probe.clean_probes, wm.clean_probe_count());
+        assert_eq!(probe.suspect, wm.is_sink_suspect());
+        assert!(
+            !ReplayProbe::default().is_running(),
+            "no probe seen reads as no watcher"
+        );
+    }
+
+    #[test]
+    fn a_clean_probe_reopens_the_gate_without_live_traffic() {
+        let t0 = jan1_noon_utc();
+        let mut replay = MidSessionReplay::default();
+        replay.observe(&healthy_drain(), t0);
+        replay.observe(&failed_drain(), t0 + 10);
+        assert!(
+            !replay.is_healthy(t0 + 3_600),
+            "no live flush and no probe: the gate stays shut"
+        );
+
+        let probe = ReplayProbe {
+            clean_probes: 1,
+            suspect: false,
+        };
+        assert_eq!(replay.observe_probe(probe, t0 + 20), 0);
+        assert!(
+            !replay.is_healthy(t0 + 10 + SEAL_REPLAY_HEALTHY_SECS - 1),
+            "a clean probe still waits out the quiet period after the failure"
+        );
+        assert!(
+            replay.is_healthy(t0 + 10 + SEAL_REPLAY_HEALTHY_SECS),
+            "a clean probe after the failure reopens the gate"
+        );
+
+        // A probe count that has not moved since a failure is not evidence.
+        replay.observe(&failed_drain(), t0 + 200);
+        assert!(!replay.is_healthy(t0 + 3_600));
+    }
+
+    #[test]
+    fn a_suspect_table_closes_the_gate() {
+        let t0 = jan1_noon_utc();
+        let mut replay = MidSessionReplay::default();
+        replay.observe(&healthy_drain(), t0);
+        assert!(replay.is_healthy(t0 + SEAL_REPLAY_HEALTHY_SECS));
+        replay.observe_probe(
+            ReplayProbe {
+                clean_probes: 3,
+                suspect: true,
+            },
+            t0 + SEAL_REPLAY_HEALTHY_SECS,
+        );
+        replay.observe(&healthy_drain(), t0 + 100);
+        assert!(
+            !replay.is_healthy(t0 + 1_000),
+            "clean live flushes do not outvote a suspended table"
+        );
+    }
+
+    #[test]
+    fn a_finished_file_waits_for_two_clean_probes_before_it_is_archived() {
+        let (spill, dlq) = temp_pair("replay-archive-confirm");
+        let writer = crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(spill.clone());
+        let t0 = jan1_noon_utc();
+        spill_range(&writer, 0, 10, t0);
+        let mut replay = MidSessionReplay::default();
+        let mut probe = ReplayProbe {
+            clean_probes: 1,
+            suspect: false,
+        };
+        replay.observe_probe(probe, t0);
+        let mut sink = ReplaySink::default();
+        let mut now = t0 + 100;
+        let read = drive(
+            &mut replay,
+            &mut sink,
+            &writer,
+            &spill,
+            &mut now,
+            10,
+            |_, sink| sink.committed.len() == 10,
+        );
+        // One more step discovers the end of the file.
+        now += SEAL_REPLAY_HEALTHY_SECS;
+        let end = replay.step(&mut sink, &writer, &spill, true, now);
+        assert_eq!(read.files_archived + end.files_archived, 0);
+        assert_eq!(replay.awaiting_archive.len(), 1, "read, not yet confirmed");
+
+        probe.clean_probes = 2;
+        replay.observe_probe(probe, now);
+        let one = replay.step(&mut sink, &writer, &spill, true, now + 1);
+        assert_eq!(one.files_archived, 0, "one probe may have started earlier");
+
+        probe.clean_probes = 3;
+        replay.observe_probe(probe, now);
+        let two = replay.step(&mut sink, &writer, &spill, true, now + 2);
+        assert_eq!(two.files_archived, 1, "two clean probes confirm the file");
+        assert_eq!(count_bin(&spill.join(SEAL_ARCHIVE_SUBDIR)), 1);
+        assert_eq!(sink.committed.len(), 10, "nothing written twice");
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn suspicion_before_confirmation_reads_the_file_again_from_its_start() {
+        let (spill, dlq) = temp_pair("replay-suspect-rewind");
+        let writer = crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(spill.clone());
+        let t0 = jan1_noon_utc();
+        spill_range(&writer, 0, 10, t0);
+        let mut replay = MidSessionReplay::default();
+        replay.observe_probe(
+            ReplayProbe {
+                clean_probes: 1,
+                suspect: false,
+            },
+            t0,
+        );
+        let mut sink = ReplaySink::default();
+        let mut now = t0 + 100;
+        drive(
+            &mut replay,
+            &mut sink,
+            &writer,
+            &spill,
+            &mut now,
+            10,
+            |_, sink| sink.committed.len() == 10,
+        );
+        now += SEAL_REPLAY_HEALTHY_SECS;
+        replay.step(&mut sink, &writer, &spill, true, now);
+        assert_eq!(replay.awaiting_archive.len(), 1);
+
+        // The table turns suspect: every ack since the last clean probe may
+        // have been a lie.
+        let rewound = replay.observe_probe(
+            ReplayProbe {
+                clean_probes: 1,
+                suspect: true,
+            },
+            now,
+        );
+        assert_eq!(rewound, 1);
+        assert!(replay.awaiting_archive.is_empty());
+        let while_suspect = replay.step(&mut sink, &writer, &spill, true, now + 600);
+        assert!(
+            while_suspect.is_idle(),
+            "nothing replays into a suspect table"
+        );
+
+        // Healthy again: the file is read from its start.
+        replay.observe_probe(
+            ReplayProbe {
+                clean_probes: 2,
+                suspect: false,
+            },
+            now + 700,
+        );
+        now += 700;
+        let again = drive(
+            &mut replay,
+            &mut sink,
+            &writer,
+            &spill,
+            &mut now,
+            10,
+            |_, sink| sink.committed.len() == 20,
+        );
+        assert_eq!(again.seals_reingested, 10, "every record written again");
+        let mut expected: Vec<u32> = (0..10).collect();
+        expected.extend(0..10);
+        assert_eq!(sink.committed, expected);
+        assert_eq!(
+            count_bin(&spill.join(SEAL_ARCHIVE_SUBDIR)),
+            0,
+            "still unconfirmed"
+        );
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn observe_probe_rewinds_the_file_being_read_and_every_parked_file_on_suspicion() {
+        let mut replay = MidSessionReplay {
+            cursor: Some(ReplayCursor {
+                offset: 4 * SEAL_SPILL_RECORD_SIZE as u64,
+                ..ReplayCursor::new(PathBuf::from("a.bin"))
+            }),
+            ..MidSessionReplay::default()
+        };
+        replay.parked.push(ParkedFile {
+            cursor: ReplayCursor {
+                offset: 9 * SEAL_SPILL_RECORD_SIZE as u64,
+                ..ReplayCursor::new(PathBuf::from("b.bin"))
+            },
+            retry_at: 0,
+        });
+        let suspect = ReplayProbe {
+            clean_probes: 0,
+            suspect: true,
+        };
+        assert_eq!(replay.observe_probe(suspect, 10), 2);
+        assert_eq!(replay.cursor.as_ref().map(|c| c.offset), Some(0));
+        assert_eq!(replay.parked[0].cursor.offset, 0);
+        assert_eq!(
+            replay.observe_probe(suspect, 11),
+            0,
+            "only the transition into suspicion rewinds"
+        );
     }
 
     #[test]

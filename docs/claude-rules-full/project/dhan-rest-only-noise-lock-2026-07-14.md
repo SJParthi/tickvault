@@ -4050,6 +4050,7 @@ spot-1m and option-chain pulls will stop until this is fixed", which is now
 wrong in the reassuring direction — **that wording is a follow-up, not fixed
 here**, and it is recorded rather than quietly left: the consequence to state is
 that the sixteen live sockets stop, which is larger than what the sentence says.
+*(Wording fixed 2026-10-01, see §2.4 "2026-10-01 — the family-3 and family-4 wording follow-up is CLOSED". Reality-check item R3, the same day, adds a family-(3) `AuthenticationFailed` page when a renewal after an 807 fails, once per token generation; no new family.)*
 
 ### ⚠ NOT claimed
 

@@ -387,6 +387,11 @@ pub struct AppliedWatermark {
     /// Highest ack received while suspect, per sink.
     suspect_max_ticks: AtomicU64,
     suspect_max_depth: AtomicU64,
+    /// Clean probes reported so far this process (audit PR41b). Monotone. The
+    /// mid-session seal replay reads it to reopen its gate without live
+    /// traffic and to archive a file only after a whole clean probe ran
+    /// behind its last write.
+    clean_probes: AtomicU64,
     /// Batches whose rows landed NOWHERE — the ILP write failed AND the
     /// rescue to the spill tier failed. Monotone. The replay confirm compares
     /// it before and after a batch: a batch that lost rows must never have its
@@ -431,6 +436,7 @@ impl AppliedWatermark {
             healthy_depth: AtomicU64::new(0),
             suspect_max_ticks: AtomicU64::new(0),
             suspect_max_depth: AtomicU64::new(0),
+            clean_probes: AtomicU64::new(0),
             unlanded: AtomicU64::new(0),
         }
     }
@@ -516,6 +522,7 @@ impl AppliedWatermark {
     /// covers (~9.8 h) overflows it, which is the old full replay.
     pub fn note_questdb_probe(&self, clean: bool) {
         if clean {
+            self.clean_probes.fetch_add(1, Ordering::AcqRel);
             if self.sink_suspect.swap(false, Ordering::AcqRel) {
                 let parked_ticks = self.suspect_max_ticks.swap(0, Ordering::AcqRel);
                 let parked_depth = self.suspect_max_depth.swap(0, Ordering::AcqRel);
@@ -544,6 +551,14 @@ impl AppliedWatermark {
                 hwm_depth.saturating_add(REPLAY_REORDER_SLACK_SEQ),
             );
         }
+    }
+
+    /// How many clean probes have reported this process (audit PR41b). `0`
+    /// until the WAL-suspension watcher first sees every table healthy, so a
+    /// reader can tell "no prober running" from "prober running".
+    #[must_use]
+    pub fn clean_probe_count(&self) -> u64 {
+        self.clean_probes.load(Ordering::Acquire)
     }
 
     /// Whether acks are currently parked rather than applied.
@@ -1511,6 +1526,16 @@ mod tests {
             snap.range_has_unapplied(5, 1),
             "lo > hi fails towards replay"
         );
+    }
+
+    #[test]
+    fn clean_probe_count_counts_only_clean_probes() {
+        let wm = AppliedWatermark::new_for_tests();
+        assert_eq!(wm.clean_probe_count(), 0);
+        wm.note_questdb_probe(true);
+        wm.note_questdb_probe(false);
+        wm.note_questdb_probe(true);
+        assert_eq!(wm.clean_probe_count(), 2, "a suspect probe is not counted");
     }
 
     #[test]
