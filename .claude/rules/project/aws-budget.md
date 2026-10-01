@@ -1411,6 +1411,55 @@ disk figure and it is not measured here.
 
 ---
 
+## RAM NOTE 2026-10-01 — the open's trade second, `open_ts_ist_secs` (plan item R6) (+6.0 MB host RAM, +$0.00/mo)
+
+**Why this note exists.** Both budget asserts fired again, as the 2026-09-19
+note above predicted ("the next field added to `LiveCandleState` fails the
+const-assert on the first build"): `MAX_AGGREGATOR_CELL_BYTES` in
+`crates/trading/src/candles/aggregator_cell.rs` and `BufferedSeal`'s bound in
+`crates/trading/src/candles/seal_ring.rs`. This is the update both ask for.
+
+**The change.** `LiveCandleState` gains ONE `u32`, `open_ts_ist_secs`: the
+exchange second of the trade that set the bar's `open`. With it, both fold
+paths (the open bucket and the late amendment of the last sealed bar) give the
+open to a STRICTLY earlier trade, as they already gave the close to the latest
+one. Before it, the open was the first tick to ARRIVE, and the feed reorders
+inside a bucket. `0` pins the exchange's official day open. The field is NOT
+persisted: the seal-spill record keeps its 128 bytes.
+
+**Why one `u32` costs eight bytes.** The payload was 149 bytes padded to 152,
+so 3 bytes of slack. One more `u32` makes 153, padded to 160. The
+`net_volume_classified` flag no longer sits in free padding on its own; the two
+share the last 8-byte word (pinned by
+`the_classified_marker_and_the_open_stamp_share_one_word`).
+
+| Budget | Was | Now | Fleet delta |
+|---|---|---|---|
+| `LiveCandleState` | 152 B | **160 B** | per state |
+| `MAX_AGGREGATOR_CELL_BYTES` | `TF_COUNT × 152 × 2 + TF_COUNT × 21 + 160` = 3,410 B allowed, **3,248 B actual** | `TF_COUNT × 160 × 2 + TF_COUNT × 21 + 160` = 3,570 B allowed, **3,408 B actual** | +160 B per instrument; 81.2 MB → **85.2 MB** at `AGGREGATOR_MAX_SLOTS` (25,000), **+4.0 MB** |
+| `BufferedSeal` (`seal_ring.rs`) | ≤ 168 B, **168 B actual** | ≤ 176 B, **176 B actual** | 42.0 MB → **44.0 MB** at `SEAL_BUFFER_CAPACITY` (250,000), **+2.0 MB** |
+| **Total** | | | **+6.0 MB**, 0.017% of the 32 GiB host |
+
+Every "Now" actual is MEASURED with `size_of` on 2026-10-01:
+`LiveCandleState` 160 · `AggregatorCell` 3,408 · `BufferedSeal` 176 ·
+`TF_COUNT` 10 · `AGGREGATOR_MAX_SLOTS` 25,000 · `SEAL_BUFFER_CAPACITY` 250,000.
+The "Was" cell actual is derived (3,408 − 10 × 8 × 2), not separately
+measured. Re-derived from the constants at `TF_COUNT = 10`, not scaled from
+the 2026-09-19 row (which was written at `TF_COUNT = 9`).
+
+The same `SEAL_BUFFER_CAPACITY` also sizes the writer channel and the
+escalation queue (see the 2026-09-27 box above). Each holds `BufferedSeal`s,
+so each grows by the same 8 B per entry, up to a further ~2.0 MB apiece at
+capacity. That is not counted in the total above.
+
+**`BufferedSeal` is again EXACTLY on its bound with zero slack.** 176 allowed,
+176 actual. The `AggregatorCell` bound keeps the 162 B of slack it had.
+
+**Dollar cost: ZERO.** No instance change, no EBS change, no new metric, alarm
+or EMF name. This is RAM on the existing host.
+
+---
+
 ## COST NOTE 2026-09-24 — `tv_dhan_ws_lag_max_ms`, the worst feed delay per minute (+~$0.30/mo, NO alarm)
 
 **Authorization:** operator, 2026-09-24, verbatim: *"i dont want any agps ir any

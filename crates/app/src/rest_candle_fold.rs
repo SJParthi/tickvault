@@ -685,6 +685,9 @@ pub fn sealed_bucket_to_seal(
         oi: 0,
         tick_count: 0,
         close_ts_ist_secs: b.last_bar_ist_secs.saturating_add(60),
+        // A REST bar is never folded again, so its open is pinned (the
+        // `LiveCandleState::open_ts_ist_secs` sentinel).
+        open_ts_ist_secs: 0,
         prev_day_close: 0.0,
         close_pct_from_prev_day: 0.0,
         // REST bars carry no order book and no intra-session previous close:
