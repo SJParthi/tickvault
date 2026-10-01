@@ -1808,13 +1808,6 @@ pub const SPOT_1M_REST_INDICES: [(SecurityId, &str); 4] = [
     (INDIA_VIX_SECURITY_ID, "INDIA VIX"),
 ];
 
-/// Post-minute-close fire delay (ms): the fetcher wakes ~300 ms after each
-/// minute boundary so Dhan has a beat to seal the just-closed candle before
-/// the first poll. The docs do NOT document just-closed-minute availability
-/// latency — the bounded re-poll ladder below plus the
-/// `tv_spot1m_close_to_data_ms` histogram are the honest live probe.
-pub const SPOT_1M_REST_FIRE_DELAY_MS: u64 = 300;
-
 // ---------------------------------------------------------------------------
 // Shared Dhan Data-API rate limiter + self-tuning (operator pacing directive
 // 2026-07-14, relayed via the coordinator session: pace Dhan to 3 requests/
@@ -1850,38 +1843,6 @@ const _: () = assert!(
     DHAN_DATA_API_RPS_CEILING < 5,
     "Dhan Data-API ceiling must stay below the published 5/sec account budget"
 );
-
-// ---------------------------------------------------------------------------
-// Cadence scheduler validation floors (operator cadence directive
-// 2026-07-14, judge-locked design rev-8 — `crates/core/src/cadence/`).
-// Consumed by `CadenceConfig::validate` in `config.rs`. The cadence
-// SCHEDULE numbers themselves are `[cadence]` config keys (serde defaults);
-// these are the non-negotiable validation FLOORS.
-// ---------------------------------------------------------------------------
-
-/// The Dhan spot ROLLING-WINDOW length (operator spot-concurrency ladder
-/// addition 2026-07-15) — the structural window the spot gate counts
-/// authorizations over, AND the spacing between consecutive Dhan burst
-/// SECOND buckets (2026-07-16 shape: second 1 / second 2 / greedy
-/// overflow seconds). 1000ms because the Dhan Data-API budget is
-/// expressed per second (5/sec hard cap — `dhan/api-introduction.md`
-/// rule 7).
-pub const CADENCE_SPOT_WINDOW_MS: i64 = 1_000;
-
-/// Hard ceiling for `[cadence] spot_window_cap` — the Dhan Data-API hard
-/// cap is 5 requests/sec (`dhan/api-introduction.md` rule 7); the shipped
-/// default is 4 (one full simultaneous spot group under the cap, leaving
-/// one slot of headroom for the co-tenant budget note in
-/// `no-rest-except-live-feed-2026-06-27.md` §9.3).
-pub const CADENCE_SPOT_WINDOW_CAP_CEILING: u32 = 5;
-
-/// Hard floor for `[cadence] chain_min_spacing_ms` — Dhan's option-chain
-/// rule is 1 unique request every 3 seconds per SAME (underlying, expiry)
-/// (`dhan/option-chain.md` rule 4; the 2026-07-16 operator directive
-/// pins it as per-(underlying, expiry) ONLY — different underlyings are
-/// explicitly concurrent, so the retired GLOBAL chain gate is gone and
-/// the cadence gates apply this floor per key).
-pub const CADENCE_CHAIN_MIN_SPACING_FLOOR_MS: i64 = 3_000;
 
 // ---------------------------------------------------------------------------
 // Option-chain 1m REST pipeline (operator grant 2026-07-12 — PR-3, the
@@ -4335,7 +4296,6 @@ mod tests {
                 .all(|&(sid, _)| sid != INDIA_VIX_SECURITY_ID),
             "INDIA VIX is SPOT-ONLY — never a chain underlying"
         );
-        assert_eq!(SPOT_1M_REST_FIRE_DELAY_MS, 300);
     }
 
     // `test_chain_1m_constants_pinned` and

@@ -391,7 +391,7 @@ pub const ALARM_PHRASES: [(&str, &str); 114] = [
     ),
     (
         "token-remaining-low",
-        "🔷 DHAN: access token expires soon — spot-1m + option-chain pulls will stop",
+        "🔷 DHAN: access token expires soon — the live price feed stops if it is not renewed",
     ),
     // ---- orders + risk ----
     ("orders-rejected", "Orders are being rejected"),
@@ -2380,7 +2380,7 @@ mod tests {
         // token-remaining-low wording is coordinator-ruled EXACT (2026-07-14).
         assert_eq!(
             alarm_phrase("token-remaining-low"),
-            "🔷 DHAN: access token expires soon — spot-1m + option-chain pulls will stop"
+            "🔷 DHAN: access token expires soon — the live price feed stops if it is not renewed"
         );
         // The four keys below are LIVE alarms as of 2026-09-01. The previous
         // four (ws-pool-all-dead, ws-failed-connections, ws-reconnect-gap-high,
