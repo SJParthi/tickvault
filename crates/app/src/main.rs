@@ -3468,6 +3468,12 @@ static SEAL_ESCALATION_PENDING: std::sync::OnceLock<
 static SEAL_ESCALATION_THREAD: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> =
     std::sync::Mutex::new(None);
 
+/// The seal writer's spill directory, where its crash marker lives, so the
+/// shutdown can mark the marker clean once the escalation queue has drained
+/// (audit PR31b-1). Set once, beside `SEAL_WRITER_HANDLE`.
+static SEAL_UNWRITTEN_MARK_DIR: std::sync::OnceLock<std::path::PathBuf> =
+    std::sync::OnceLock::new();
+
 /// Budget for draining the seal-escalation queue at shutdown.
 ///
 /// DERIVED, not guessed: the queue holds at most
@@ -3700,6 +3706,7 @@ fn spawn_seal_writer_loop(questdb_config: &tickvault_common::config::QuestDbConf
                      wins; this runner will not be spawned"
                 );
             } else {
+                let _ = SEAL_UNWRITTEN_MARK_DIR.set(runner.spill_dir().to_path_buf());
                 let handle = tokio::spawn(async move {
                     run_seal_writer_loop(runner, seal_drain_interval(), cancel_rx).await
                 });
@@ -4764,6 +4771,8 @@ async fn run_process_runloop(
     if let Some(stop) = SEAL_ESCALATION_STOP.get() {
         stop.store(true, std::sync::atomic::Ordering::Release);
     }
+    // Seals this step pages as lost, recorded in the crash marker below.
+    let mut seals_escalation_abandoned = 0_usize;
     let escalation_handle = SEAL_ESCALATION_THREAD
         .lock()
         .ok()
@@ -4803,6 +4812,7 @@ async fn run_process_runloop(
                 tickvault_storage::seal_writer_runner::SEAL_ESCALATION_ABANDONED_COUNTER
             )
             .increment(seals_abandoned as u64);
+            seals_escalation_abandoned = seals_abandoned;
             error!(
                 code = tickvault_common::error_code::ErrorCode::AggregatorDrop01.code_str(),
                 budget_secs = SEAL_ESCALATION_SHUTDOWN_BUDGET.as_secs(),
@@ -4811,6 +4821,23 @@ async fn run_process_runloop(
                  systemd does not SIGKILL us, but seals still queued are lost"
             );
         }
+    }
+
+    // 5b-2c. Crash marker (audit PR31b-1, 2026-10-01).
+    //
+    // Only now can nothing in this process still write a sealed candle: the
+    // writer (5b-2) and the escalation queue (5b-2b) are drained, or have been
+    // given up on and paged. The writer left the marker NOT clean while the
+    // escalation queue held seals, so a kill during 5b-2b is reported at the
+    // next boot. Marking it clean here, whatever the outcome above, stops the
+    // next boot paging a loss this shutdown already paged, including a writer
+    // that overran its budget.
+    if let Some(dir) = SEAL_UNWRITTEN_MARK_DIR.get() {
+        let _ = tickvault_storage::seal_writer_loop::finish_unwritten_mark_at_shutdown(
+            dir,
+            seals_escalation_abandoned,
+            chrono::Utc::now().timestamp(),
+        );
     }
 
     // 5b-3. WAL spill final drain (2026-08-28).
