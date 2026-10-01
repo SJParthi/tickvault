@@ -43,7 +43,7 @@ self-heals SILENTLY.**
 |---|---|---|---|
 | 1 ⚠RETIRED 2026-09-17 (§2.4) | Spot-1m pull failing / recovered | `Spot1mFetchDegraded` (High) / `Spot1mFetchRecovered` (Info) / `Spot1mSidNotServed` (High) / `Spot1mSidServedRecovered` (Info) | the per-minute spot leg's persist-gated 3-minute escalation edge (`rest-1m-pipeline-error-codes.md`) |
 | 2 ⚠RETIRED 2026-09-17 (§2.4) | Option-chain pull failing / recovered | `ChainFetchDegraded` (High) / `ChainFetchRecovered` (Info) / `ChainEntitlementAbsent`/`Confirmed` / `ChainExpirylistFailed` (High) / **`Chain1mUnderlyingNotServed` (High) / `Chain1mUnderlyingServedRecovered` (Info) — added 2026-07-14 per the §2.1 dated directive (the Dhan mirror of the Groww #1537 per-underlying detector)** | the chain leg's own edges (`rest-1m-pipeline-error-codes.md`) |
-| 3 | Token could not be obtained | `AuthenticationFailed` / `TokenRenewalFailed` (both Critical; reworded 2026-07-14 to plain English naming DHAN + the consequence: "the Dhan spot-1m and option-chain pulls will stop until this is fixed") | mint/renewal is TERMINALLY dead — the mid-session watchdog pages **ONCE PER FAILING EPISODE** (H1a latch, 2026-07-14 fix round — never the pre-fix ~30-min repeat) on EITHER (a) a forced re-mint failing terminally OR (b) the H1b attempt cap: `REMINT_MAX_ATTEMPTS_PER_EPISODE` (= 3) re-mints all "succeeded" yet the profile stayed REAL-invalid (dead-dataPlan/segment class — the body names the N re-logins + that the spot-1m/chain pulls are blocked). The latch resets on a clean profile cycle. (Its terminal arm emits `AuthenticationFailed` directly, since `force_renewal` -> `acquire_token` pages nothing on a non-RESILIENCE-03 permanent failure; the Telegram body is redacted + truncated via the house sanitizer — M2.) |
+| 3 | Token could not be obtained | `AuthenticationFailed` / `TokenRenewalFailed` (both Critical; reworded 2026-07-14 to plain English naming DHAN + the consequence; consequence line re-worded 2026-10-01 to "the Dhan live price feed cannot connect or reconnect until this is fixed", see §2.4 "2026-10-01") | mint/renewal is TERMINALLY dead — the mid-session watchdog pages **ONCE PER FAILING EPISODE** (H1a latch, 2026-07-14 fix round — never the pre-fix ~30-min repeat) on EITHER (a) a forced re-mint failing terminally OR (b) the H1b attempt cap: `REMINT_MAX_ATTEMPTS_PER_EPISODE` (= 3) re-mints all "succeeded" yet the profile stayed REAL-invalid (dead-dataPlan/segment class — the body names the N re-logins + that the spot-1m/chain pulls are blocked). The latch resets on a clean profile cycle. (Its terminal arm emits `AuthenticationFailed` directly, since `force_renewal` -> `acquire_token` pages nothing on a non-RESILIENCE-03 permanent failure; the Telegram body is redacted + truncated via the house sanitizer — M2.) |
 | 4 | Token expires soon (4h early warning) | CloudWatch alarm `tv-<env>-token-remaining-low` on `tv_token_remaining_seconds` → SNS → Telegram Lambda | the renewal loop stopped renewing (the watchdog-of-the-renewal-loop). The Lambda's wording is ANOTHER session's scope. |
 
 > **⚠ ROWS 1 AND 2 ARE RETIRED (2026-09-17) — the surviving Dhan Telegram set is
@@ -4050,7 +4050,7 @@ spot-1m and option-chain pulls will stop until this is fixed", which is now
 wrong in the reassuring direction — **that wording is a follow-up, not fixed
 here**, and it is recorded rather than quietly left: the consequence to state is
 that the sixteen live sockets stop, which is larger than what the sentence says.
-*(Fixed 2026-10-01, reality-check item R3: both family-(3) bodies now say the Dhan live feed sockets cannot reconnect. The same change adds a family-(3) `AuthenticationFailed` page when a renewal after an 807 fails, once per token generation; no new family.)*
+*(Wording fixed 2026-10-01, see §2.4 "2026-10-01 — the family-3 and family-4 wording follow-up is CLOSED". Reality-check item R3, the same day, adds a family-(3) `AuthenticationFailed` page when a renewal after an 807 fails, once per token generation; no new family.)*
 
 ### ⚠ NOT claimed
 
@@ -4063,6 +4063,32 @@ that the sixteen live sockets stop, which is larger than what the sentence says.
   asserts the unsendable SET only shrinks — an anti-vacuity direction, not a
   count to hit.
 - That family 3's body wording is corrected. It is not (above).
+
+### 2026-10-01 — the family-3 and family-4 wording follow-up is CLOSED
+
+**Authorization:** operator, 2026-10-01, verbatim: *"check the recent commits
+requirments discussions which have been missign and not completed elt us try to
+fix evrythign ddue okay?"*. This follow-up was on the list that request
+produced. Recorded here before the code, per the rule-file-first law.
+
+The consequence line now names what actually stops. Every body still names
+DHAN, and nothing else about either family changes: no new page, no new
+variant, no new alarm, same severities, same once-per-episode latch.
+
+| Where | Was | Now |
+|---|---|---|
+| `AuthenticationFailed` body | "The Dhan spot-1m and option-chain pulls will stop until this is fixed." | "The Dhan live price feed cannot connect or reconnect until this is fixed." |
+| `TokenRenewalFailed` body | "If this keeps failing the Dhan spot-1m and option-chain pulls will stop." | "If this keeps failing, the Dhan live price feed stops when the current login expires." |
+| The two mid-session watchdog reasons that feed `AuthenticationFailed` | "… spot-1m + option-chain pulls are blocked …" | "… live price feed cannot reconnect …" |
+| `token-remaining-low` alarm phrase (family 4) | "🔷 DHAN: access token expires soon — spot-1m + option-chain pulls will stop" | "🔷 DHAN: access token expires soon — the live price feed stops if it is not renewed" |
+
+The family-4 phrase was "coordinator-ruled EXACT (2026-07-14)". This replaces
+it; the ratchet `test_broker_scoped_alarm_phrases_carry_dhan_tag` pins the new
+phrase exactly, so the EXACT property is kept and only the words moved.
+
+**Why "cannot connect or reconnect" and not "stops":** a socket that is already
+open when the token dies is not cut by our side at that instant; what fails is
+the next dial, and every socket redials at least once a day.
 
 ### What a PR that violates §2.4 looks like (REJECT)
 
