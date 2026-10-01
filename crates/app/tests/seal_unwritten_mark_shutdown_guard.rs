@@ -57,6 +57,29 @@ fn the_finish_is_not_inside_the_escalation_outcome_branches() {
         !between.contains("if let Some(handle)"),
         "the finish must not depend on the escalation thread existing"
     );
+    // Moving the whole step, heading included, into one outcome arm would pass
+    // the checks above. Every brace opened between the escalation block and the
+    // finish must be closed again before the step heading, so the step sits at
+    // the same depth as the escalation block, not inside it. (The step's own
+    // `if let Some(dir)` opens one brace after the heading.)
+    let block = position(&src, "if let Some(handle) = escalation_handle {");
+    let before_step = &src[block..step];
+    let opens = before_step.matches('{').count();
+    let closes = before_step.matches('}').count();
+    assert_eq!(
+        opens, closes,
+        "the crash-marker step must follow the escalation block, outside every outcome arm"
+    );
+}
+
+#[test]
+fn the_finish_is_bounded_like_every_other_shutdown_wait() {
+    let src = main_rs();
+    let step = position(&src, "// 5b-2c. Crash marker");
+    let wal = position(&src, "// 5b-3. WAL spill final drain");
+    let body = &src[step..wal];
+    assert!(body.contains("tokio::task::spawn_blocking("));
+    assert!(body.contains("tokio::time::timeout(SEAL_UNWRITTEN_MARK_FINISH_BUDGET"));
 }
 
 #[test]

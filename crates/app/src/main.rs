@@ -3474,6 +3474,15 @@ static SEAL_ESCALATION_THREAD: std::sync::Mutex<Option<std::thread::JoinHandle<(
 static SEAL_UNWRITTEN_MARK_DIR: std::sync::OnceLock<std::path::PathBuf> =
     std::sync::OnceLock::new();
 
+/// Budget for marking the crash marker clean at shutdown: one small write and
+/// a rename, which take milliseconds on a healthy disk. Bounded so a stalled
+/// disk cannot hold the shutdown before the WAL floor drains.
+const SEAL_UNWRITTEN_MARK_FINISH_BUDGET_SECS: u64 = 2;
+
+/// [`SEAL_UNWRITTEN_MARK_FINISH_BUDGET_SECS`] as a `Duration`.
+const SEAL_UNWRITTEN_MARK_FINISH_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(SEAL_UNWRITTEN_MARK_FINISH_BUDGET_SECS);
+
 /// Budget for draining the seal-escalation queue at shutdown.
 ///
 /// DERIVED, not guessed: the queue holds at most
@@ -4832,12 +4841,35 @@ async fn run_process_runloop(
     // next boot. Marking it clean here, whatever the outcome above, stops the
     // next boot paging a loss this shutdown already paged, including a writer
     // that overran its budget.
+    //
+    // Bounded like every other wait on this path: the finish is a file write
+    // and a rename, and on a stalled disk an overrun writer can hold the
+    // marker's lock inside its own write. It runs on a blocking thread, and
+    // past the budget the shutdown goes on to 5b-3; the marker then keeps the
+    // count the writer last wrote, which the next boot reports.
     if let Some(dir) = SEAL_UNWRITTEN_MARK_DIR.get() {
-        let _ = tickvault_storage::seal_writer_loop::finish_unwritten_mark_at_shutdown(
-            dir,
-            seals_escalation_abandoned,
-            chrono::Utc::now().timestamp(),
-        );
+        let dir = dir.clone();
+        let now = chrono::Utc::now().timestamp();
+        let finish = tokio::task::spawn_blocking(move || {
+            tickvault_storage::seal_writer_loop::finish_unwritten_mark_at_shutdown(
+                &dir,
+                seals_escalation_abandoned,
+                now,
+            )
+        });
+        if tokio::time::timeout(SEAL_UNWRITTEN_MARK_FINISH_BUDGET, finish)
+            .await
+            .is_err()
+        {
+            error!(
+                code =
+                    tickvault_common::error_code::ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                source = "unwritten_mark",
+                budget_secs = SEAL_UNWRITTEN_MARK_FINISH_BUDGET.as_secs(),
+                "seal writer: the crash marker could not be marked clean within budget — \
+                 the next boot may report the candles this shutdown already reported"
+            );
+        }
     }
 
     // 5b-3. WAL spill final drain (2026-08-28).

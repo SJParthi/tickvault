@@ -400,7 +400,15 @@ fn record_boot_drain_observability(outcome: &BootDrainOutcome) {
 //   before main's finish, the next boot reports them again: counted twice,
 //   never missed.
 // * When the writer overran its budget, main's page does not say how many
-//   seals it still held, and the finish records none.
+//   seals it still held, and the finish records none. The same holds when
+//   the lane's own join timed out and it can still queue seals after the
+//   finish: the lane's timeout line is the only report of those.
+// * The marker is not updated while the escalation queue drains, so a kill
+//   then reports the count at the writer's exit, which over-counts the seals
+//   already written by then.
+// * If the writer loop ever exits mid-session (every cancel sender dropped,
+//   unreachable today), nothing finishes the marker and it keeps its last
+//   count.
 // * The marker is renamed into place but not fsynced: it survives a process
 //   crash (the page cache outlives the process), not a host crash or power
 //   loss, like every other unflushed file on the box.
@@ -2121,7 +2129,7 @@ mod pr31b1_tests {
     }
 
     #[test]
-    fn a_failed_finish_is_counted_and_returns_false() {
+    fn a_failed_finish_returns_false() {
         let mut dir = std::env::temp_dir();
         dir.push(format!("tickvault-pr31b1-missing-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
