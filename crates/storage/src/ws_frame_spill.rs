@@ -945,6 +945,8 @@ impl WsFrameSpill {
         // 3. Only THEN spawn the writer thread, so nothing can append at a
         //    sequence below the high-water mark.
         let disk_high = seed_frame_seq_from_disk(&wal_dir);
+        // First claim wins: the boot path claims once (audit PR31b-2).
+        let _ = BOOT_DISK_HIGH_FRAME_SEQ.set(disk_high);
         // The applied-watermark lives beside the segments and is seeded from
         // its file HERE, before the first sink can persist — otherwise the
         // first in-session persist would overwrite a good snapshot with zeros.
@@ -1945,6 +1947,19 @@ pub const MAX_PACKET_INDEX: u64 = (1 << PACKET_INDEX_BITS) - 1;
 /// wall clock. At 10,000 frames/s that drift is ≈113 days of clock-equivalent
 /// per calendar year, against ≈236 years of headroom.
 static WAL_FRAME_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// The highest frame sequence on disk when this process's WAL writer claimed
+/// its directory (audit PR31b-2). Every frame at or below it was captured by
+/// an earlier process: the writer ratchets past it before its first append.
+static BOOT_DISK_HIGH_FRAME_SEQ: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// See [`BOOT_DISK_HIGH_FRAME_SEQ`]. `None` before a WAL writer claimed a
+/// directory in this process. The boot candle warm-up reads frames up to it,
+/// so it never folds a frame this process captured. O(1).
+#[must_use]
+pub fn boot_disk_high_frame_seq() -> Option<u64> {
+    BOOT_DISK_HIGH_FRAME_SEQ.get().copied()
+}
 
 /// The most recently allocated frame sequence, without allocating one. A
 /// catch-up drain snapshots it before its first round: every segment the
@@ -3484,7 +3499,7 @@ fn segment_range_is_applied(
 }
 
 /// Which watermark a replayed frame answers to, from its TVW4 endpoint.
-const fn applied_sink_for(endpoint: WalEndpoint) -> crate::wal_applied_watermark::AppliedSink {
+pub const fn applied_sink_for(endpoint: WalEndpoint) -> crate::wal_applied_watermark::AppliedSink {
     use crate::wal_applied_watermark::AppliedSink;
     match endpoint {
         WalEndpoint::Depth20 | WalEndpoint::Depth200 => AppliedSink::Depth,
@@ -10202,6 +10217,30 @@ mod tests {
         std::fs::write(&torn, &std::fs::read(&p).unwrap()[..WAL_MIN_RECORD_V4 + 2]).unwrap();
         assert_eq!(first_frame_seq_in_segment(&torn), 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Audit PR31b-2: claiming a directory records the on-disk high-water mark
+    /// for the boot candle warm-up.
+    #[test]
+    fn boot_disk_high_frame_seq_is_set_once_a_writer_claims_a_directory() {
+        let dir = tmp_dir("boot-disk-high");
+        let spill = WsFrameSpill::new(&dir).expect("spill opens");
+        assert!(boot_disk_high_frame_seq().is_some());
+        drop(spill);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Audit PR31b-2: the warm-up asks the same watermark the replay asks.
+    #[test]
+    fn applied_sink_for_maps_depth_to_depth_and_the_rest_to_ticks() {
+        use crate::wal_applied_watermark::AppliedSink;
+        assert_eq!(applied_sink_for(WalEndpoint::Depth20), AppliedSink::Depth);
+        assert_eq!(applied_sink_for(WalEndpoint::Depth200), AppliedSink::Depth);
+        assert_eq!(applied_sink_for(WalEndpoint::MainFeed), AppliedSink::Ticks);
+        assert_eq!(
+            applied_sink_for(WalEndpoint::OrderUpdate),
+            AppliedSink::Ticks
+        );
     }
 
     #[test]
