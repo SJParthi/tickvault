@@ -283,6 +283,10 @@ pub enum TickRowError {
     /// Refusing ONE loud row is strictly better than losing the batch and
     /// wedging the recovery tier behind it.
     ///
+    /// Since 2026-10-01 only the LTP reaches this refusal. A non-finite day
+    /// open, high, low or close is written as NULL and counted instead, so a
+    /// good LTP is never lost to an auxiliary column.
+    ///
     /// The depth path in the same drain already does this
     /// (`dhan_feed_stack.rs` — "the depth twin of `tick_price_is_sane`");
     /// the tick path did not.
@@ -388,24 +392,28 @@ impl TickRow {
             }
         })?;
 
-        // Fail-closed on non-finite prices BEFORE any of them can reach an
-        // ILP line. NaN compares unequal to everything, so the `!= 0.0`
-        // gate below does NOT stop it, and `f32_to_f64_clean` passes
-        // non-finite through unchanged — see `TickRowError::PriceNotFinite`
-        // for the full chain this closes (rejected batch -> spilled buffer
-        // -> permanently-wedged replay round).
+        // Fail-closed on a non-finite LTP BEFORE it can reach an ILP line.
+        // NaN compares unequal to everything, so a `!= 0.0` gate does NOT
+        // stop it, and `f32_to_f64_clean` passes non-finite through
+        // unchanged — see `TickRowError::PriceNotFinite` for the full chain
+        // this closes (rejected batch -> spilled buffer -> permanently-wedged
+        // replay round).
         //
-        // `0.0` stays legal: it is the documented "not carried" sentinel for
-        // a Ticker (16-byte) packet and becomes NULL below. Only NaN/Inf are
-        // refused. Zero-alloc: five register compares, no branch on the
-        // happy path beyond the `is_finite` test itself.
-        for (field, value) in [
-            ("ltp", tick.last_traded_price),
-            ("open", tick.day_open),
-            ("high", tick.day_high),
-            ("low", tick.day_low),
-            ("close", tick.day_close),
-        ] {
+        // ONLY the LTP is mandatory (2026-10-01 reality check). This loop
+        // used to refuse the whole row for a non-finite day open, high, low
+        // or close as well, so one bad day-OHLC field threw away a tick whose
+        // LTP was good: the row was missing from `ticks`, an `error!` fired
+        // for every such tick on the drain, every replay refused it again,
+        // and the candle fold (which reads the LTP) still counted it, so
+        // `ticks` and `candles_*` disagreed. The day OHLC are auxiliary
+        // columns exactly like the average price, so they now take the same
+        // path: a non-finite value becomes NULL and is counted on
+        // `tv_tick_optional_price_dropped_total` (`opt_price` below).
+        //
+        // `0.0` stays legal everywhere: it is the documented "not carried"
+        // sentinel for a Ticker (16-byte) packet and becomes NULL below.
+        // Zero-alloc: one register compare on the happy path.
+        for (field, value) in [("ltp", tick.last_traded_price)] {
             if !value.is_finite() {
                 metrics::counter!("tv_tick_rows_refused_total", "reason" => "price_not_finite")
                     .increment(1);
@@ -425,18 +433,19 @@ impl TickRow {
         }
 
         // A Ticker (16-byte) packet carries only LTP + LTT; Quote/Full add the
-        // rest. Zero means "not carried" for those, so it becomes NULL. Every
-        // value reaching here is finite (refused above), so the `!= 0.0` gate
-        // now means exactly what it reads as.
+        // rest. Zero means "not carried" for those, so it becomes NULL. A
+        // non-finite value is NULL too (the `is_finite` arm below), so the
+        // `!= 0.0` gate means exactly what it reads as.
         // 2026-08-25 — `is_finite()` added, and it is NOT redundant with the
         // loop above.
         //
-        // That loop covers five fields; `average_traded_price` is a SIXTH
-        // caller of this closure and was never in it. `NaN != 0.0` is TRUE, and
-        // both `f32_to_f64_clean` and `round_to_2dp` pass non-finite straight
-        // through — so a NaN ATP went to ILP. The parser proves it can: Dhan
-        // Quote packets carry NaN there, asserted by
-        // `parser::quote`'s own `average_traded_price.is_nan()` test.
+        // That loop then covered five fields; `average_traded_price` was a
+        // SIXTH caller of this closure and was never in it. Since 2026-10-01
+        // the loop covers the LTP alone and the day OHLC use this closure too.
+        // `NaN != 0.0` is TRUE, and both `f32_to_f64_clean` and `round_to_2dp`
+        // pass non-finite straight through — so a NaN ATP went to ILP. The
+        // parser proves it can: Dhan Quote packets carry NaN there, asserted
+        // by `parser::quote`'s own `average_traded_price.is_nan()` test.
         //
         // The consequence is exactly the chain `TickRowError::PriceNotFinite`
         // documents as CLOSED: QuestDB rejects the whole batch, `discard_pending`
@@ -444,7 +453,7 @@ impl TickRow {
         // tier wedges behind a file it can never accept.
         //
         // A non-finite OPTIONAL price becomes NULL and is counted, rather than
-        // refusing the row the way the five mandatory prices do. Refusing here
+        // refusing the row the way a non-finite LTP does. Refusing here
         // would discard a tick whose LTP is perfectly good — losing a tick to
         // protect an auxiliary column, which is the wrong trade.
         let opt_price = |v: f32| {
@@ -3836,28 +3845,89 @@ mod tests {
     }
 
     #[test]
-    fn a_non_finite_price_is_refused_not_emitted_as_a_poison_ilp_row() {
-        for (field, mutate) in [
-            (
-                "ltp",
-                (|t: &mut ParsedTick| t.last_traded_price = f32::NAN) as fn(&mut ParsedTick),
-            ),
-            ("open", |t: &mut ParsedTick| t.day_open = f32::NAN),
-            ("high", |t: &mut ParsedTick| t.day_high = f32::NAN),
-            ("low", |t: &mut ParsedTick| t.day_low = f32::NAN),
-            ("close", |t: &mut ParsedTick| t.day_close = f32::NAN),
-            ("high", |t: &mut ParsedTick| t.day_high = f32::INFINITY),
-            ("low", |t: &mut ParsedTick| t.day_low = f32::NEG_INFINITY),
-        ] {
+    fn a_non_finite_ltp_is_refused_not_emitted_as_a_poison_ilp_row() {
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             let mut tick = sample_tick();
-            mutate(&mut tick);
+            tick.last_traded_price = value;
             let err = TickRow::from_parsed_tick(&tick, 1)
-                .expect_err("a non-finite price MUST be refused, never built into a row");
+                .expect_err("a non-finite LTP MUST be refused, never built into a row");
             assert_eq!(
                 err,
-                TickRowError::PriceNotFinite { field },
+                TickRowError::PriceNotFinite { field: "ltp" },
                 "the refusal must name the offending column"
             );
+        }
+    }
+
+    /// 2026-10-01 reality check: a non-finite day open, high, low or close
+    /// used to refuse the WHOLE row, so a tick with a good LTP vanished from
+    /// `ticks` (and from every replay) while the candle fold still counted
+    /// it. The day OHLC are auxiliary columns: each bad one becomes NULL and
+    /// the tick is kept with its LTP, volume and every finite column intact.
+    #[test]
+    fn a_non_finite_day_ohlc_field_is_nulled_and_the_tick_is_kept() {
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            for column in 0..4 {
+                let mut tick = sample_tick();
+                match column {
+                    0 => tick.day_open = value,
+                    1 => tick.day_high = value,
+                    2 => tick.day_low = value,
+                    _ => tick.day_close = value,
+                }
+                let good =
+                    TickRow::from_parsed_tick(&sample_tick(), 1).expect("the sample tick builds");
+                let row = TickRow::from_parsed_tick(&tick, 1)
+                    .expect("a bad day-OHLC field must not drop a tick whose LTP is good");
+                assert_eq!(row.ltp, good.ltp, "the LTP is kept");
+                assert_eq!(row.volume, good.volume, "the volume is kept");
+                let (bad, others) = match column {
+                    0 => (
+                        row.open,
+                        [
+                            (row.high, good.high),
+                            (row.low, good.low),
+                            (row.close, good.close),
+                        ],
+                    ),
+                    1 => (
+                        row.high,
+                        [
+                            (row.open, good.open),
+                            (row.low, good.low),
+                            (row.close, good.close),
+                        ],
+                    ),
+                    2 => (
+                        row.low,
+                        [
+                            (row.open, good.open),
+                            (row.high, good.high),
+                            (row.close, good.close),
+                        ],
+                    ),
+                    _ => (
+                        row.close,
+                        [
+                            (row.open, good.open),
+                            (row.high, good.high),
+                            (row.low, good.low),
+                        ],
+                    ),
+                };
+                assert!(
+                    bad.is_none(),
+                    "the non-finite column becomes NULL, never NaN/Inf"
+                );
+                for (got, want) in others {
+                    assert_eq!(got, want, "the finite day-OHLC columns are untouched");
+                }
+                assert_eq!(
+                    count_nonfinite_tick_floats(&row),
+                    0,
+                    "nothing non-finite reaches ILP"
+                );
+            }
         }
     }
 
@@ -5547,8 +5617,8 @@ mod tests {
 
     /// BITE TEST (2026-08-25) — a NaN `average_traded_price` reaching ILP.
     ///
-    /// The finiteness loop guards five fields; `average_traded_price` is a
-    /// sixth caller of the same closure and was never in it. `NaN != 0.0` is
+    /// The finiteness loop guarded five fields (the LTP alone since
+    /// 2026-10-01); `average_traded_price` was never in it. `NaN != 0.0` is
     /// true, so it passed the "not carried" gate and went to the wire — the
     /// exact batch-reject → spill → wedged-replay chain that
     /// `TickRowError::PriceNotFinite` documents as closed.
