@@ -158,6 +158,7 @@ use std::fs::File;
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -168,6 +169,8 @@ use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::feed::Feed;
 use tickvault_trading::candles::{BufferedSeal, TfIndex};
+
+use crate::seal_spill_ledger::{SpillLedger, SpillVerdict};
 
 /// Production spill directory — same parent as `tick_persistence.rs`'s
 /// `TICK_SPILL_DIR` for operational consistency.
@@ -647,19 +650,82 @@ struct OpenSpillFile {
     file: File,
 }
 
+/// Everything the append lock guards (audit PR41a added the ledger and the
+/// mirror buffer to the handle it always guarded).
+struct SpillState {
+    /// Long-lived append handle for the current IST day (2026-08-10).
+    open: Option<OpenSpillFile>,
+    /// Which copy of each slot's newest spilled bucket the spill holds. See
+    /// [`crate::seal_spill_ledger`].
+    ledger: SpillLedger,
+    /// Reused buffer for the fuller live copies appended by
+    /// [`SealSpillWriter::note_live_commits`].
+    mirror_scratch: Vec<u8>,
+}
+
+/// Slots the spill ledger tracks: the aggregator's slot ceiling times the
+/// timeframe count, i.e. one entry for every bar that can still be amended.
+/// About 8.6 MiB of address space, allocated once per writer; only the
+/// control bytes (~256 KiB) are touched until a seal is spilled.
+pub const SEAL_SPILL_LEDGER_CAPACITY: usize = tickvault_trading::candles::SEAL_BUFFER_CAPACITY;
+
+/// Counter for the spill ledger (audit PR41a). One series per `kind`:
+/// `mirrored` (a fuller live copy appended after a spilled original),
+/// `older_not_written` (an older copy of a bucket the spill already holds a
+/// fuller copy of), `replay_older_skipped` (the mid-session replay dropped an
+/// older copy), `mirror_failed` (a fuller copy could not be appended; a later
+/// replay may write the older copy over it) and `untracked` (spilled past the
+/// ledger's capacity).
+pub const SEAL_SPILL_SUPERSEDED_COUNTER: &str = "tv_seal_spill_superseded_total";
+
+/// Pre-resolved handles for [`SEAL_SPILL_SUPERSEDED_COUNTER`]. `untracked`
+/// and `older_not_written` are reachable from the frame drain's inline
+/// fallback, where the counter macro is banned.
+struct SupersededCounters {
+    mirrored: metrics::Counter,
+    older_not_written: metrics::Counter,
+    replay_older_skipped: metrics::Counter,
+    mirror_failed: metrics::Counter,
+    untracked: metrics::Counter,
+}
+
+impl SupersededCounters {
+    fn resolve() -> Self {
+        Self {
+            mirrored: metrics::counter!(SEAL_SPILL_SUPERSEDED_COUNTER, "kind" => "mirrored"),
+            older_not_written: metrics::counter!(
+                SEAL_SPILL_SUPERSEDED_COUNTER,
+                "kind" => "older_not_written"
+            ),
+            replay_older_skipped: metrics::counter!(
+                SEAL_SPILL_SUPERSEDED_COUNTER,
+                "kind" => "replay_older_skipped"
+            ),
+            mirror_failed: metrics::counter!(
+                SEAL_SPILL_SUPERSEDED_COUNTER,
+                "kind" => "mirror_failed"
+            ),
+            untracked: metrics::counter!(SEAL_SPILL_SUPERSEDED_COUNTER, "kind" => "untracked"),
+        }
+    }
+}
+
 /// Append-only spill writer. One instance lives in the writer task;
 /// `append_seal` is the single producer entry point.
 pub struct SealSpillWriter {
     /// Spill directory — production uses `SEAL_SPILL_DIR`; tests
     /// override via `with_spill_dir_for_test`.
     spill_dir: PathBuf,
-    /// Long-lived append handle for the current IST day (2026-08-10).
+    /// The append handle, the spill ledger and the mirror buffer.
     ///
     /// `Mutex` because `append_seal` takes `&self` (the absorption
     /// pipeline's `escalate_evicted` rescue path is `&self`) yet must mutate
     /// the cached handle. Uncontended: the seal writer task is the single
     /// producer, so this is an uncontended lock/unlock pair, not a wait.
-    open: Mutex<Option<OpenSpillFile>>,
+    state: Mutex<SpillState>,
+    /// `true` while the ledger tracks anything. Read without the lock, so a
+    /// writer cycle with nothing spilled never takes it.
+    ledger_tracking: AtomicBool,
     /// Pre-resolved handles for the two `append_seal` failure counters.
     ///
     /// `append_seal` is reachable from the FRAME-DRAIN task: the escalation
@@ -677,6 +743,7 @@ pub struct SealSpillWriter {
     /// affordable.
     err_no_handle: metrics::Counter,
     err_write: metrics::Counter,
+    superseded: SupersededCounters,
 }
 
 /// Name of the spill-write failure counter. Both label values are
@@ -687,11 +754,21 @@ impl SealSpillWriter {
     /// Production constructor. Uses `data/spill/`.
     #[must_use]
     pub fn new() -> Self {
+        Self::in_dir(PathBuf::from(SEAL_SPILL_DIR))
+    }
+
+    fn in_dir(spill_dir: PathBuf) -> Self {
         Self {
-            spill_dir: PathBuf::from(SEAL_SPILL_DIR),
-            open: Mutex::new(None),
+            spill_dir,
+            state: Mutex::new(SpillState {
+                open: None,
+                ledger: SpillLedger::with_capacity(SEAL_SPILL_LEDGER_CAPACITY),
+                mirror_scratch: Vec::new(),
+            }),
+            ledger_tracking: AtomicBool::new(false),
             err_no_handle: metrics::counter!(SPILL_WRITE_ERRORS_COUNTER, "stage" => "no_handle"),
             err_write: metrics::counter!(SPILL_WRITE_ERRORS_COUNTER, "stage" => "write"),
+            superseded: SupersededCounters::resolve(),
         }
     }
 
@@ -711,20 +788,15 @@ impl SealSpillWriter {
     #[must_use]
     // TEST-EXEMPT: test-only helper used as construction source by every test in this module (test_append_seal_then_read_all_roundtrip, test_seal_spill_writer_clear_*, test_seal_spill_writer_truncated_tail_*, etc.). Separate name-matched test would be redundant.
     pub fn with_spill_dir_for_test(dir: PathBuf) -> Self {
-        Self {
-            spill_dir: dir,
-            open: Mutex::new(None),
-            err_no_handle: metrics::counter!(SPILL_WRITE_ERRORS_COUNTER, "stage" => "no_handle"),
-            err_write: metrics::counter!(SPILL_WRITE_ERRORS_COUNTER, "stage" => "write"),
-        }
+        Self::in_dir(dir)
     }
 
-    /// Locks the cached-handle slot, treating a poisoned mutex as the value
-    /// it holds. A panic in another thread while holding this lock cannot
+    /// Locks the append state, treating a poisoned mutex as the value it
+    /// holds. A panic in another thread while holding this lock cannot
     /// leave the spill writer permanently dead — the worst case is a stale
     /// handle, which the day check and the write-error path both correct.
-    fn lock_open(&self) -> std::sync::MutexGuard<'_, Option<OpenSpillFile>> {
-        self.open
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, SpillState> {
+        self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -795,32 +867,22 @@ impl SealSpillWriter {
     /// `error!(code = AGGREGATOR-DROP-01)`.
     pub fn append_seal(&self, seal: &SerializedSeal, now_unix_secs: i64) -> Result<()> {
         let bytes = seal.to_bytes();
-        let day = ist_day_number(now_unix_secs);
-        let mut open = self.lock_open();
+        let mut state = self.lock_state();
+        let SpillState { open, ledger, .. } = &mut *state;
+
+        // Audit PR41a: the spill already holds a fuller copy of this bucket,
+        // so writing this one after it would make every replay end on the
+        // older copy. The fuller copy is on disk, which is what `Ok` promises.
+        let verdict = ledger.verdict(seal);
+        if verdict == SpillVerdict::OlderNotWritten {
+            self.superseded.older_not_written.increment(1);
+            return Ok(());
+        }
 
         // Rotate only when the IST day actually changed (or nothing is open
         // yet, incl. after a write error dropped the handle). The check is an
         // integer compare — no filename is built on the steady-state path.
-        let stale = match open.as_ref() {
-            Some(current) => current.ist_day != day,
-            None => true,
-        };
-        if stale {
-            // Close the previous day's handle BEFORE opening the next, so a
-            // rotation never holds two descriptors.
-            *open = None;
-            let path = self.spill_path(now_unix_secs);
-            let file = self.open_append_handle(&path)?;
-            *open = Some(OpenSpillFile { ist_day: day, file });
-        }
-        let Some(current) = open.as_mut() else {
-            // Structurally unreachable: the branch above either populated the
-            // slot or returned Err. Refuse loudly rather than assume.
-            self.err_no_handle.increment(1);
-            anyhow::bail!(
-                "seal spill handle missing after open — refusing to claim a durable write"
-            );
-        };
+        let current = self.current_file(open, now_unix_secs)?;
 
         // ONE `write(2)`. The file is unbuffered by design: the previous
         // implementation's `BufWriter::flush()` bought exactly this syscall
@@ -841,7 +903,49 @@ impl SealSpillWriter {
             let path = self.spill_path(now_unix_secs);
             return Err(err).with_context(|| format!("failed to write seal to {path:?}"));
         }
+        self.note_spilled(ledger, seal, verdict);
         Ok(())
+    }
+
+    /// The append handle for the IST day of `now_unix_secs`, opening it when
+    /// the day changed or nothing is open. Shared by every append path.
+    fn current_file<'s>(
+        &self,
+        open: &'s mut Option<OpenSpillFile>,
+        now_unix_secs: i64,
+    ) -> Result<&'s mut OpenSpillFile> {
+        let day = ist_day_number(now_unix_secs);
+        if open.as_ref().is_none_or(|current| current.ist_day != day) {
+            // Close the previous day's handle BEFORE opening the next, so a
+            // rotation never holds two descriptors.
+            *open = None;
+            let path = self.spill_path(now_unix_secs);
+            let file = self.open_append_handle(&path)?;
+            *open = Some(OpenSpillFile { ist_day: day, file });
+        }
+        match open.as_mut() {
+            Some(current) => Ok(current),
+            None => {
+                // Structurally unreachable: the branch above either populated
+                // the slot or returned Err. Refuse loudly rather than assume.
+                self.err_no_handle.increment(1);
+                anyhow::bail!(
+                    "seal spill handle missing after open — refusing to claim a durable write"
+                )
+            }
+        }
+    }
+
+    /// Record a copy the spill now holds (audit PR41a). O(1), one hash probe.
+    fn note_spilled(&self, ledger: &mut SpillLedger, seal: &SerializedSeal, verdict: SpillVerdict) {
+        match verdict {
+            SpillVerdict::Write => {
+                ledger.record(seal);
+                self.ledger_tracking.store(true, Ordering::Release);
+            }
+            SpillVerdict::Untracked => self.superseded.untracked.increment(1),
+            SpillVerdict::OlderNotWritten => {}
+        }
     }
 
     /// Append several serialised seals with ONE `write(2)` (audit PR15).
@@ -875,37 +979,35 @@ impl SealSpillWriter {
     /// O(seals) to serialise, one `write(2)` in steady state, plus one
     /// `fstat` for the rollback length. Runs on the `tv-seal-escalate`
     /// thread, never on the frame drain.
-    pub fn append_seals<'a>(
+    pub fn append_seals<'a, I>(
         &self,
-        seals: impl IntoIterator<Item = &'a SerializedSeal>,
+        seals: I,
         scratch: &mut Vec<u8>,
         now_unix_secs: i64,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = &'a SerializedSeal>,
+        I::IntoIter: Clone,
+    {
+        let seals = seals.into_iter();
+        let mut state = self.lock_state();
+        let SpillState { open, ledger, .. } = &mut *state;
+
+        // Audit PR41a: serialised under the lock, because which copies are
+        // written depends on what the spill already holds. A copy of a bucket
+        // the spill holds a fuller copy of is left out.
         scratch.clear();
-        for seal in seals {
+        for seal in seals.clone() {
+            if ledger.verdict(seal) == SpillVerdict::OlderNotWritten {
+                self.superseded.older_not_written.increment(1);
+                continue;
+            }
             scratch.extend_from_slice(&seal.to_bytes());
         }
         if scratch.is_empty() {
             return Ok(());
         }
-        let day = ist_day_number(now_unix_secs);
-        let mut open = self.lock_open();
-        let stale = match open.as_ref() {
-            Some(current) => current.ist_day != day,
-            None => true,
-        };
-        if stale {
-            *open = None;
-            let path = self.spill_path(now_unix_secs);
-            let file = self.open_append_handle(&path)?;
-            *open = Some(OpenSpillFile { ist_day: day, file });
-        }
-        let Some(current) = open.as_mut() else {
-            self.err_no_handle.increment(1);
-            anyhow::bail!(
-                "seal spill handle missing after open — refusing to claim a durable write"
-            );
-        };
+        let current = self.current_file(open, now_unix_secs)?;
         let before = match current.file.metadata() {
             Ok(meta) => meta.len(),
             Err(err) => {
@@ -945,7 +1047,106 @@ impl SealSpillWriter {
                 }
             };
         }
+        // Every copy left out above is less full than the one the ledger
+        // holds, so recording it changes nothing.
+        for seal in seals {
+            let verdict = ledger.verdict(seal);
+            self.note_spilled(ledger, seal, verdict);
+        }
         Ok(())
+    }
+
+    /// Audit PR41a: append the fuller live copy of every bucket the spill
+    /// holds an older copy of, so every replay of the spill (mid-session or
+    /// the next boot's) writes the older copy first and this one last.
+    ///
+    /// Called after a live flush succeeded, with the seals it committed.
+    /// Returns how many copies were appended.
+    ///
+    /// # Complexity
+    /// One relaxed atomic load when the spill has held nothing this process
+    /// (the steady state). Otherwise O(committed): one hash probe per seal,
+    /// and one `write(2)` when any copy is appended. Runs on the seal writer
+    /// task, never on the frame drain. No allocation after the mirror buffer
+    /// has grown to the largest batch.
+    pub fn note_live_commits(&self, committed: &[BufferedSeal], now_unix_secs: i64) -> usize {
+        if !self.ledger_tracking.load(Ordering::Acquire) || committed.is_empty() {
+            return 0;
+        }
+        let mut state = self.lock_state();
+        let SpillState {
+            open,
+            ledger,
+            mirror_scratch,
+        } = &mut *state;
+        mirror_scratch.clear();
+        let mut mirrored = 0usize;
+        for seal in committed {
+            let serialized = SerializedSeal::from(seal);
+            if ledger.live_supersedes(&serialized) {
+                mirror_scratch.extend_from_slice(&serialized.to_bytes());
+                mirrored += 1;
+            }
+        }
+        if mirrored == 0 {
+            return 0;
+        }
+        let written = self.current_file(open, now_unix_secs).and_then(|current| {
+            current
+                .file
+                .write_all(mirror_scratch)
+                .context("failed to append fuller live copies to the seal spill")
+        });
+        if let Err(err) = written {
+            // The handle may be broken; the next append reopens it. A torn
+            // tail is not cut back here: the absorption path's batch write
+            // does that, and the readers stop at a short read.
+            *open = None;
+            self.err_write.increment(1);
+            self.superseded
+                .mirror_failed
+                .increment(u64::try_from(mirrored).unwrap_or(u64::MAX));
+            error!(
+                code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                ?err,
+                copies = mirrored,
+                "seal spill: a fuller live copy of a spilled candle could not be appended — \
+                 a later replay of the spill may write the older copy over the stored row"
+            );
+            return 0;
+        }
+        for seal in committed {
+            let serialized = SerializedSeal::from(seal);
+            if ledger.live_supersedes(&serialized) {
+                ledger.record(&serialized);
+            }
+        }
+        self.superseded
+            .mirrored
+            .increment(u64::try_from(mirrored).unwrap_or(u64::MAX));
+        mirrored
+    }
+
+    /// Audit PR41a: `true` when `seal`, read back from the spill, is an older
+    /// copy of a bucket the spill also holds a fuller copy of. The
+    /// mid-session replay drops it (and counts it here), so the database never
+    /// holds the older copy, even briefly.
+    ///
+    /// # Complexity
+    /// One relaxed atomic load when the spill has held nothing this process,
+    /// otherwise one hash probe under the append lock.
+    pub fn replay_is_superseded(&self, seal: &BufferedSeal) -> bool {
+        if !self.ledger_tracking.load(Ordering::Acquire) {
+            return false;
+        }
+        let older = self
+            .lock_state()
+            .ledger
+            .replay_is_older(&SerializedSeal::from(seal));
+        if older {
+            self.superseded.replay_older_skipped.increment(1);
+        }
+        older
     }
 
     /// Run `f` while no append can reach the spill file (audit PR15).
@@ -960,10 +1161,10 @@ impl SealSpillWriter {
     /// and the writer's own rescue — waits on this lock while `f` runs, so
     /// `f` must be short: a directory listing and a few renames.
     pub fn with_appends_paused<R>(&self, f: impl FnOnce() -> R) -> R {
-        let mut open = self.lock_open();
-        *open = None;
+        let mut state = self.lock_state();
+        state.open = None;
         let result = f();
-        drop(open);
+        drop(state);
         result
     }
 
@@ -976,7 +1177,7 @@ impl SealSpillWriter {
     /// have. Pinned by
     /// `test_append_after_clear_reopens_and_is_visible_to_read_all`.
     fn close_open_handle(&self) {
-        *self.lock_open() = None;
+        self.lock_state().open = None;
     }
 
     /// Drains the daily spill file by reading every full 128-byte
@@ -3021,5 +3222,168 @@ mod per_tick_metrics_pins {
                 && body.contains("self.err_write.increment(1)"),
             "both failure sites must increment a pre-resolved handle"
         );
+    }
+}
+
+#[cfg(test)]
+mod pr41a_tests {
+    use super::*;
+
+    fn mk_seal(sid: u64, seg: u8, tf: u8, bucket: u32, close: f64) -> SerializedSeal {
+        SerializedSeal {
+            security_id: sid,
+            exchange_segment_code: seg,
+            tf_ordinal: tf,
+            feed: Feed::Dhan,
+            bucket_start_ist_secs: bucket,
+            tick_count: 5,
+            volume: 1234,
+            bucket_start_cumulative: 1000,
+            oi: 50_000,
+            open: 100.0,
+            high: 105.0,
+            low: 99.0,
+            close,
+            close_pct_from_prev_day: 1.5,
+            bucket_open_prev_close: 98.5,
+            total_buy_qty: 89_600,
+            total_sell_qty: 4_800,
+            open_pct: 7.7,
+            change_pct: 1.5,
+            open_gap_pct: 0.8,
+        }
+    }
+
+    fn temp_spill_dir(name: &str) -> PathBuf {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "tickvault-seal-spill-pr41a-{}-{}",
+            name,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
+        std::fs::create_dir_all(&dir).expect("test temp dir");
+        dir
+    }
+
+    fn pr41a_now() -> i64 {
+        Utc.with_ymd_and_hms(2026, 10, 1, 6, 0, 0)
+            .single()
+            .expect("valid")
+            .timestamp()
+    }
+
+    /// One copy of a 1-minute bar with the given fullness.
+    fn pr41a_copy(sid: u64, bucket: u32, ticks: u32, volume: u64) -> SerializedSeal {
+        let mut seal = mk_seal(sid, 2, 0, bucket, 100.0);
+        seal.tick_count = ticks;
+        seal.volume = volume;
+        seal
+    }
+
+    fn pr41a_buffered(seal: &SerializedSeal) -> BufferedSeal {
+        seal.try_into_buffered_seal().expect("known timeframe")
+    }
+
+    #[test]
+    fn pr41a_an_amended_copy_committed_live_is_appended_behind_its_spilled_original() {
+        let dir = temp_spill_dir("pr41a-mirror");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        let now = pr41a_now();
+        let original = pr41a_copy(13, 1_727_760_000, 4, 40);
+        writer.append_seal(&original, now).expect("spill original");
+
+        // The live writer then commits the amended copy (a late tick added
+        // one), plus an unrelated bar that was never spilled.
+        let amended = pr41a_copy(13, 1_727_760_000, 5, 40);
+        let unrelated = pr41a_copy(25, 1_727_760_000, 9, 90);
+        let committed = [pr41a_buffered(&amended), pr41a_buffered(&unrelated)];
+        assert_eq!(writer.note_live_commits(&committed, now), 1);
+
+        let on_disk = writer.read_all(now).expect("read");
+        assert_eq!(
+            on_disk,
+            vec![original, amended],
+            "original first, fuller copy last"
+        );
+        // Committing the same copy again appends nothing.
+        assert_eq!(writer.note_live_commits(&committed, now), 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn pr41a_an_older_copy_is_not_appended_after_the_fuller_one() {
+        let dir = temp_spill_dir("pr41a-older");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        let now = pr41a_now();
+        let fuller = pr41a_copy(13, 1_727_760_000, 5, 40);
+        let older = pr41a_copy(13, 1_727_760_000, 4, 40);
+        writer.append_seal(&fuller, now).expect("spill fuller");
+        // Reported as absorbed: the fuller copy is on disk.
+        writer.append_seal(&older, now).expect("older is absorbed");
+        let mut scratch = Vec::new();
+        writer
+            .append_seals([&older, &fuller], &mut scratch, now)
+            .expect("batch");
+        // An older BUCKET is always written: it cannot be amended any more.
+        let previous_bucket = pr41a_copy(13, 1_727_759_940, 1, 1);
+        writer
+            .append_seal(&previous_bucket, now)
+            .expect("older bucket");
+
+        let on_disk = writer.read_all(now).expect("read");
+        assert_eq!(on_disk, vec![fuller, fuller, previous_bucket]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_pr41a_replay_is_superseded_when_the_spill_holds_a_fuller_copy() {
+        let dir = temp_spill_dir("pr41a-replay");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        let now = pr41a_now();
+        let original = pr41a_copy(13, 1_727_760_000, 4, 40);
+        let amended = pr41a_copy(13, 1_727_760_000, 5, 40);
+
+        // Nothing spilled yet: nothing is superseded, and no lock is taken.
+        assert!(!writer.replay_is_superseded(&pr41a_buffered(&original)));
+
+        writer.append_seal(&original, now).expect("spill original");
+        assert!(!writer.replay_is_superseded(&pr41a_buffered(&original)));
+        assert_eq!(
+            writer.note_live_commits(&[pr41a_buffered(&amended)], now),
+            1
+        );
+        assert!(writer.replay_is_superseded(&pr41a_buffered(&original)));
+        assert!(!writer.replay_is_superseded(&pr41a_buffered(&amended)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_pr41a_note_live_commits_does_nothing_while_the_spill_has_held_nothing() {
+        let dir = temp_spill_dir("pr41a-idle");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        let now = pr41a_now();
+        let committed = [pr41a_buffered(&pr41a_copy(13, 1_727_760_000, 5, 40))];
+        assert_eq!(writer.note_live_commits(&committed, now), 0);
+        assert!(!writer.spill_path(now).exists(), "no file is created");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn pr41a_a_failed_mirror_append_is_counted_and_reported_as_nothing_appended() {
+        let dir = temp_spill_dir("pr41a-mirror-fails");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        let now = pr41a_now();
+        writer
+            .append_seal(&pr41a_copy(13, 1_727_760_000, 4, 40), now)
+            .expect("spill original");
+        // Break the spill directory: the chaos suite's "disk dead" shape.
+        writer.close_open_handle();
+        std::fs::remove_dir_all(&dir).expect("remove");
+        std::fs::write(&dir, b"not a directory").expect("block the dir");
+        let amended = pr41a_buffered(&pr41a_copy(13, 1_727_760_000, 5, 40));
+        assert_eq!(writer.note_live_commits(&[amended], now), 0);
+        let _ = std::fs::remove_file(&dir);
     }
 }
