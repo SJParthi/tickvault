@@ -1919,6 +1919,74 @@ Ticked items with rows still open: D3a (#1975) merged after the audited commit, 
 row 371 waits on the owner typing "rotate". Row 339 is already owned by PR39; the audit's "no
 plan item" is out of date.
 
+### Added 2026-10-01 (reality check on main 6f0b6ca, 8 new problems), riskiest first
+
+Source: the whole-system reality check of 2026-10-01 (artifact "Tickvault Reality Check"). None
+of the eight was in this plan. Owner approval: "bro dont blcok anyhtign evrythign is good to goa
+hea dude okay?" (2026-10-01 11:12 UTC), relayed with "fix the 8 new problems". Owned by the
+reality-check thread; every other item in this plan stays with its own thread. Each R-item is
+verified in source on `origin/main` before its PR; R1 and R2 ship together (two small,
+independent live-path fixes).
+
+- [x] **R1 — a bad day open, high, low or close no longer drops a good tick.** (`storage`)
+  - Verified: `TickRow::from_parsed_tick` refused the whole row when any of LTP or the four day
+    OHLC fields was non-finite (tick_persistence.rs:402-423), with an unthrottled `error!` per
+    tick on the drain; every replay refused the row again, and the candle fold (which reads the
+    LTP) still counted the tick, so `ticks` and `candles_*` disagreed.
+  - Fix: only the LTP is mandatory. A non-finite day OHLC field becomes NULL through the existing
+    optional-price path (`opt_price`, counted on `tv_tick_optional_price_dropped_total`, warn
+    throttled to powers of two), exactly like the average price.
+  - Tests: `a_non_finite_ltp_is_refused_not_emitted_as_a_poison_ilp_row`,
+    `a_non_finite_day_ohlc_field_is_nulled_and_the_tick_is_kept`.
+- [x] **R2 — a tick stamped later today than its receipt cannot freeze a price.** (`app`)
+  - Verified: `SpotPriceStore::record` refused yesterday and tomorrow but stored a same-day
+    future stamp (spot_price_store.rs:384-391); later-time-wins then refused every honest tick
+    as `OlderThanHeld` until that time arrived, and the depth and contract selectors read the
+    frozen price.
+  - Fix: `record` takes the frame's receipt; a trade time more than
+    `FUTURE_TRADE_TIME_SKEW_SECS` (5 s) ahead of the receipt is held at that ceiling and counted
+    on `tv_spot_price_store_future_time_capped_total`. The price is kept (nothing is dropped);
+    no receipt (`<= 0`) means no cap. O(1): one divide and one compare.
+  - Tests: `a_trade_stamped_hours_ahead_of_its_receipt_cannot_freeze_the_price`,
+    `a_trade_inside_the_skew_or_with_no_receipt_is_not_capped`,
+    `trade_time_ceiling_is_the_receipt_in_ist_seconds_plus_the_skew`.
+- [ ] **R3 — a failed token renewal after an 807 pages at once.** (`app`, maybe `core`)
+  - Verified: on renewal failure the 807 path only `warn!`s (dhan_feed_stack.rs:13719-13727);
+    the Critical page waits for the profile watchdog (~30 min).
+  - Fix: route the failure to the existing allowed family (3) page (`TokenRenewalFailed`),
+    coalesced so 16 sockets failing together send one page; `warn!` becomes a coded `error!`.
+    No new Telegram family (noise lock §2 family 3 already covers it).
+- [ ] **R4 — an order update the parser cannot read is flagged, not hidden.** (`core`)
+  - Verified: a frame that fails to deserialise is counted as a non-order message at `debug!`
+    (order_update_connection.rs:961-987), so a vendor format change would drop every order
+    update silently. Paper mode only today.
+  - Fix: a frame shaped like an order update that does not parse is counted on its own counter
+    and logged as a coded `error!` throttled to powers of two with a char-safe preview.
+- [x] **R5 — the candle fold starts a clean day if the process runs past midnight.**
+  (`app`, `trading`) Verified first; if the day-rollover path already handles it, the item
+  closes with the evidence instead of a code change.
+  - Verified: `force_seal_all` is the fold's only day reset and its only caller was the
+    shutdown seal; the drain's midnight branch called only `reset_ranking_daily`. A next-day
+    cumulative below yesterday's (and below the 2^31 restart floor) read as a stale packet, so
+    the day's bars were written at volume 0.
+  - Fix: `LiveIngest::roll_trading_day` runs the day-close seal, then the ranking reset; the
+    midnight branch calls it. Seals the writer refuses are counted on the existing drop total,
+    which the 30 s AGGREGATOR-DROP-01 report already pages. O(slots × TF_COUNT) once a day.
+  - Tests: `roll_trading_day_reseeds_the_fold_so_the_next_day_counts_volume` (control without
+    the roll reads 0, with it 300); the wiring guard
+    `the_ranking_daily_reset_fires_only_on_a_real_midnight_crossing` now pins the roll call.
+- [ ] **R6 — a bar opens at its earliest trade, not its first arrival.** (`trading`) Verified
+  first against the restart differential; ships only if the oracle and the replay rules agree.
+- [ ] **R7 — the instance lock re-reads after renewal and a machine that lost it stops
+  dialling.** (`core`, `app`) SSM has no compare-and-set, so this narrows the window and makes
+  the loss loud; it cannot close the race.
+- [ ] **R8 — the CLAUDE.md speed table matches the code.** (docs) Eight stale rows, both
+  directions, plus rows for R2's cap.
+
+R-items Z+ and guarantee matrix: covered by the shared matrix at the end of this plan. Tick
+path: R1 removes four compares per tick; R2 adds one divide and one compare per spot tick; no
+allocation in either (zero-alloc DHAT gates unchanged).
+
 ## Edge Cases
 
 - PR1: log burst larger than the non-blocking buffer → lines dropped and counted, never blocking.

@@ -2810,15 +2810,24 @@ impl LiveIngest {
     /// exchange's last-trade time. The store keys freshness on the EXCHANGE
     /// clock — a replayed frame must never overwrite a live price — and widens
     /// the price on the read side, so the drain pays no second ryu round-trip.
+    ///
+    /// `received_at_nanos` is this machine's receipt of the frame; a trade
+    /// time far ahead of it is held at the receipt ceiling (2026-10-01).
     pub fn record_spot_price(
         &self,
         security_id: u64,
         segment: tickvault_common::types::ExchangeSegment,
         last_price: f32,
         exchange_secs: u32,
+        received_at_nanos: i64,
     ) -> crate::spot_price_store::RecordOutcome {
-        self.spot_prices
-            .record(security_id, segment, last_price, exchange_secs)
+        self.spot_prices.record(
+            security_id,
+            segment,
+            last_price,
+            exchange_secs,
+            received_at_nanos,
+        )
     }
 
     /// Clears every previous close for a new trading day.
@@ -4081,6 +4090,35 @@ impl LiveIngest {
             return;
         }
         let _ = self.prev_close.record(tick.security_id, segment, widened);
+    }
+
+    /// The whole trading-day rollover for a process that outlives an IST
+    /// midnight: the candle fold's day-close seal FIRST, then the ranking and
+    /// price stores.
+    ///
+    /// Added 2026-10-01 (reality check). The midnight branch called only
+    /// [`Self::reset_ranking_daily`], so the fold kept yesterday's cumulative,
+    /// day open, session extremes and tick-rule carry. A normal instrument's
+    /// day volume is far below the 2^31 restart floor, so every next-day tick
+    /// read as a stale packet and its bars were written at volume 0, marked
+    /// classified, until the new cumulative passed yesterday's. The 17:30
+    /// daily stop hid it; a manual start or a stop that did not take does not.
+    ///
+    /// `force_seal_all` (through [`Self::seal_open_buckets_at_close`]) emits
+    /// yesterday's still-open buckets and re-arms every slot: unseeded
+    /// baseline, day open, extremes, carry. It is the same path the shutdown
+    /// runs and is safe to run twice: the shutdown seal after it emits only the
+    /// new day's buckets. Seal before reset, so nothing the seal writes into
+    /// the ranking history survives into the new day.
+    ///
+    /// Returns `(emitted, dropped)` from the seal.
+    ///
+    /// # Complexity
+    /// O(slots × TF_COUNT), once per real midnight crossing. Cold.
+    pub fn roll_trading_day(&mut self) -> (u64, u64) {
+        let sealed = self.seal_open_buckets_at_close();
+        self.reset_ranking_daily();
+        sealed
     }
 
     /// Feeds one accepted tick into the volume leaderboard. **Per-tick path.**
@@ -7580,7 +7618,20 @@ async fn run_frame_drain(
                         // store already belongs to today. The reset exists for a
                         // real IST midnight crossing, which is what the `!= 0`
                         // branch now means.
-                        ingest.reset_ranking_daily();
+                        //
+                        // 2026-10-01 (reality check): the CANDLE fold rolls here
+                        // too. It did not, so a process that outlived midnight
+                        // judged every next-day tick against yesterday's
+                        // cumulative and wrote bars at volume 0. A seal the
+                        // writer refuses lands in the running drop total, which
+                        // the 30-second AGGREGATOR-DROP-01 report already pages.
+                        let (emitted, dropped) = ingest.roll_trading_day();
+                        info!(
+                            emitted,
+                            dropped,
+                            "candle fold rolled to the new trading day: yesterday's open \
+                             buckets sealed and every slot re-armed"
+                        );
                     }
                     ranking_day = today;
                 }
@@ -8424,6 +8475,7 @@ pub fn drain_main_feed_frame(
                         segment,
                         tick.last_traded_price,
                         tick.exchange_timestamp,
+                        tick.received_at_nanos,
                     );
                 }
                 // `frame.seq` is per-FRAME, but `capture_seq` must be unique
@@ -20056,6 +20108,68 @@ mod tests {
         );
     }
 
+    /// One NSE_FNO trade at `ist_secs` (IST epoch seconds) with day volume
+    /// `cumulative`, received on time.
+    fn fno_trade(security_id: u64, ist_secs: u32, cumulative: u32) -> ParsedTick {
+        ParsedTick {
+            security_id,
+            exchange_segment_code: 2,
+            last_traded_price: 101.5,
+            last_trade_quantity: 25,
+            exchange_timestamp: ist_secs,
+            received_at_nanos: (i64::from(ist_secs) - 19_800) * 1_000_000_000,
+            volume: cumulative,
+            ..ParsedTick::default()
+        }
+    }
+
+    /// M1 volume of one contract after day D (cumulative 5,000,000) and two
+    /// trades on day D+1 (cumulative 500 then 800), with or without the
+    /// midnight roll between the days.
+    fn next_day_minute_volume(roll_between_days: bool) -> u64 {
+        const SID: u64 = 52_175;
+        // 2026-09-29 and 2026-09-30, 10:00:05 IST.
+        const DAY_D: u32 = 1_790_676_005;
+        const DAY_D1: u32 = 1_790_762_405;
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        ingest.ingest_tick(&fno_trade(SID, DAY_D, 5_000_000), 1, 1);
+        if roll_between_days {
+            let (emitted, dropped) = ingest.roll_trading_day();
+            assert!(
+                emitted.saturating_add(dropped) > 0,
+                "the roll must seal day D's open buckets"
+            );
+        }
+        ingest.ingest_tick(&fno_trade(SID, DAY_D1, 500), 2, 2);
+        ingest.ingest_tick(&fno_trade(SID, DAY_D1 + 15, 800), 3, 3);
+        ingest
+            .aggregator
+            .snapshot(Feed::Dhan, SID, 2, TfIndex::M1)
+            .expect("the contract has a slot")
+            .volume
+    }
+
+    #[test]
+    fn roll_trading_day_reseeds_the_fold_so_the_next_day_counts_volume() {
+        // Regression: 2026-10-01 (reality check). The drain's midnight branch
+        // reset only the ranking stores, so the fold judged day D+1's
+        // cumulative (500, 800) against day D's 5,000,000. Below the 2^31
+        // restart floor that reads as a stale packet, and the minute was
+        // written at volume 0.
+        assert_eq!(
+            next_day_minute_volume(false),
+            0,
+            "control: without the roll the next day's minute reads 0, the \
+             defect this test exists to pin"
+        );
+        assert_eq!(
+            next_day_minute_volume(true),
+            300,
+            "with the roll the first D+1 trade seeds the fold and the second \
+             adds its 300"
+        );
+    }
+
     #[test]
     fn test_flush_drains_the_buffer_so_rows_can_reach_the_database() {
         // The defect this pins: `append` only BUFFERS. Without a flush the
@@ -26056,7 +26170,7 @@ mod frame_walk_accounting_tests {
         let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
         let now = u32::try_from(chrono::Utc::now().timestamp()).unwrap_or(u32::MAX);
         assert_eq!(
-            ingest.record_spot_price(13, ExchangeSegment::IdxI, 24_500.0, now),
+            ingest.record_spot_price(13, ExchangeSegment::IdxI, 24_500.0, now, 0),
             crate::spot_price_store::RecordOutcome::Stored
         );
         assert_eq!(ingest.spot_prices().tracked(), 1);
@@ -26920,7 +27034,7 @@ mod depth_rebalance_wiring_tests {
         ingest
             .spot_prices()
             .reset_for_trading_day(crate::spot_price_store::ist_day_of(secs));
-        let _ = ingest.record_spot_price(13, underlying, 110.0, secs);
+        let _ = ingest.record_spot_price(13, underlying, 110.0, secs, 0);
         let mut tick = tickvault_common::tick_types::ParsedTick::default();
         tick.security_id = 777;
         tick.exchange_segment_code = ExchangeSegment::NseFno.binary_code();
