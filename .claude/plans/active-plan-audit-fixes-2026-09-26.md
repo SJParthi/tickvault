@@ -1370,12 +1370,40 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
     `observe_probe_rewinds_the_file_being_read_and_every_parked_file_on_suspicion`,
     `test_replay_probe_current_reads_the_process_watermark`,
     `wal_applied_watermark::tests::clean_probe_count_counts_only_clean_probes`.
-- [ ] **PR41c — every spilled candle record can be checked.** (`storage`)
+- [x] **PR41c — every spilled candle record can be checked.** (`storage`)
   - The candle spill has no record checksum (row 136, seal_spill.rs:832-841, :907-916): cut back a
     torn single-record write the way the batch does, check alignment before a batch, add a
     checksum. The 128-byte record is full, so the checksum needs a new format version (for
     example reusing the legacy low-32 id at bytes 0..4, the full id being at 120..128) and a reader
     that still accepts the current version during the rollout.
+  - Done 2026-10-01, in `seal_spill.rs`: spill format version 5. Bytes 0..4 hold a CRC-32
+    (IEEE, the in-crate `crc32_ieee`, no new dependency) of bytes 4..128, the version byte
+    included; the id is read from 120..128 only. `decode_spill_record` applies the version gate
+    and the checksum for every spill reader (the boot drain, the mid-session replay and
+    `read_all`), so they cannot disagree. Readers accept versions 4..=5
+    (`SEAL_SPILL_OLDEST_READABLE_VERSION`), because 4 → 5 renumbered no timeframe; a v4 record
+    must have matching low-32 and full ids, which is what refuses a v5 record whose version byte
+    flipped to 4. The dead-letter readers accept the same range. A record whose checksum fails
+    is refused and counted, and the read continues with the next record.
+    A failed single-record write is cut back to its last whole record, as the batch path does
+    (set aside if the cut fails); the day file is cut back when it is opened; a batch checks the
+    length it starts from and cuts a partial record off first.
+  - Counted: refused records add to the existing undecodable / `records_skipped` counts; one coded
+    `error!` (AGGREGATOR-SEAL-01) per file read or per replay step names how many failed the
+    checksum.
+  - Honest limits: a v4 record still on disk during the rollout has only the id cross-check, not a
+    checksum. A record refused for its checksum is one candle not replayed; its bytes stay in the
+    archived file.
+  - Tests: `to_bytes_writes_a_checksum_of_bytes_4_to_128_at_bytes_0_to_4`,
+    `decode_spill_record_refuses_a_flipped_bit_anywhere_in_the_record` (every bit of the record),
+    `a_v4_record_written_by_the_previous_build_still_decodes`,
+    `test_reseal_record_for_test_restores_a_valid_checksum`,
+    `read_all_skips_a_damaged_record_and_keeps_reading`,
+    `cut_back_to_whole_records_removes_only_a_partial_record`,
+    `a_torn_day_file_is_cut_back_when_it_is_opened`,
+    `a_batch_starts_on_a_record_boundary_even_on_an_open_handle`,
+    `boot_drain_reads_a_v4_record_and_refuses_a_damaged_one`, `boot_drain_reads_a_v4_dlq_line`,
+    `replay_skips_a_damaged_record_and_reingests_the_rest`.
 - [ ] **PR42 — order and P&L audit rows survive a database outage.** (`storage`, `app`, deploy)
   - Order and P&L audit rows are thrown away while the database is down
     (order_audit_persistence.rs:478-521; pnl_audit_persistence.rs:488;

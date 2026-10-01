@@ -57,6 +57,7 @@ use crate::seal_absorption::{SealAbsorptionPipeline, SubmitOutcome};
 use crate::seal_dlq::SealDlqRecord;
 use crate::seal_spill::{
     SEAL_SPILL_FORMAT_VERSION, SEAL_SPILL_LEDGER_CAPACITY, SEAL_SPILL_RECORD_SIZE, SerializedSeal,
+    SpillRecordRead, decode_spill_record, seal_spill_version_is_readable,
 };
 use crate::seal_spill_ledger::SpillLedger;
 use crate::shadow_candle_writer::ShadowCandleWriter;
@@ -587,6 +588,7 @@ fn read_staged_spill(path: &Path) -> Option<(Vec<SerializedSeal>, usize)> {
     let mut reader = BufReader::new(file);
     let mut out = Vec::new();
     let mut undecodable = 0usize;
+    let mut checksum_refused = 0usize;
     let mut buf = [0u8; SEAL_SPILL_RECORD_SIZE];
     // The loop ends on the first read error, which is either a clean EOF or a
     // truncated trailing record (a torn write at the moment of the crash).
@@ -608,16 +610,37 @@ fn read_staged_spill(path: &Path) -> Option<(Vec<SerializedSeal>, usize)> {
         // refused record is counted as undecodable and the file's bytes are
         // kept in `archive/` — nothing is destroyed, only kept out of a
         // timeframe it never belonged to.
-        if buf[7] != SEAL_SPILL_FORMAT_VERSION {
-            undecodable += 1;
-            continue;
-        }
-        match SerializedSeal::from_bytes(&buf) {
-            Some(seal) => out.push(seal),
-            None => undecodable += 1,
+        //
+        // 2026-10-01 (audit PR41c): the gate is the readable RANGE
+        // (`seal_spill_version_is_readable`), and a version-5 record must also
+        // match its checksum. `decode_spill_record` applies both, the same way
+        // for every spill reader.
+        match decode_spill_record(&buf) {
+            SpillRecordRead::Seal(seal) => out.push(seal),
+            SpillRecordRead::OtherVersion => undecodable += 1,
+            SpillRecordRead::ChecksumMismatch => {
+                undecodable += 1;
+                checksum_refused += 1;
+            }
         }
     }
+    note_checksum_refused(path, checksum_refused);
     Some((out, undecodable))
+}
+
+/// One coded line per file when records were refused for a checksum that does
+/// not match their bytes (audit PR41c): each is a candle damaged on disk and
+/// not replayed. Its bytes stay in the file, which is archived, not deleted.
+fn note_checksum_refused(path: &Path, checksum_refused: usize) {
+    if checksum_refused > 0 {
+        error!(
+            code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+            ?path,
+            checksum_refused,
+            "seal recovery: spilled records refused because their checksum does not match \
+             their bytes (damaged on disk); each is one candle not replayed"
+        );
+    }
 }
 
 /// Decodes every NDJSON line in a staged DLQ file.
@@ -643,7 +666,8 @@ fn read_staged_dlq(path: &Path) -> Option<(Vec<SerializedSeal>, usize)> {
             // with no warning. `format_version` defaults to 0 on those lines,
             // below every real version, so they are refused here — counted,
             // and retained on disk in `archive/`.
-            Ok(record) if record.format_version != SEAL_SPILL_FORMAT_VERSION => {
+            // 2026-10-01: a version-4 line is still read (no ordinal moved).
+            Ok(record) if !seal_spill_version_is_readable(record.format_version) => {
                 undecodable += 1;
             }
             Ok(record) => out.push(SerializedSeal::from(&record)),
@@ -1795,10 +1819,13 @@ impl MidSessionReplay {
         self.batch.clear();
         let mut buf = [0u8; SEAL_SPILL_RECORD_SIZE];
         let mut records_read = 0usize;
+        // One coded line per step, not per record, however many are damaged.
+        let mut checksum_refused = 0usize;
         while records_read < step_records {
             match reader.read_exact(&mut buf) {
                 Ok(()) => {}
                 Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    note_checksum_refused(path, checksum_refused);
                     return Some((records_read, true));
                 }
                 Err(err) => {
@@ -1812,16 +1839,20 @@ impl MidSessionReplay {
                 }
             }
             records_read += 1;
-            // The same format-version gate as the boot drain.
-            if buf[7] != SEAL_SPILL_FORMAT_VERSION {
-                outcome.records_skipped += 1;
-                continue;
-            }
-            match SerializedSeal::from_bytes(&buf).and_then(|s| s.try_into_buffered_seal()) {
-                Some(seal) => self.batch.push(seal),
-                None => outcome.records_skipped += 1,
+            // The same version and checksum gate as the boot drain.
+            match decode_spill_record(&buf) {
+                SpillRecordRead::Seal(seal) => match seal.try_into_buffered_seal() {
+                    Some(seal) => self.batch.push(seal),
+                    None => outcome.records_skipped += 1,
+                },
+                SpillRecordRead::OtherVersion => outcome.records_skipped += 1,
+                SpillRecordRead::ChecksumMismatch => {
+                    outcome.records_skipped += 1;
+                    checksum_refused += 1;
+                }
             }
         }
+        note_checksum_refused(path, checksum_refused);
         // Exactly one step's worth read: the file may end right here, which
         // the next step discovers with a zero-record read.
         Some((records_read, false))
@@ -2022,8 +2053,10 @@ mod tests {
         let current =
             SerializedSeal::from(&mk_seal(13, 0, TfIndex::S1, 1_716_000_900, 102.5)).to_bytes();
         assert_eq!(current[7], SEAL_SPILL_FORMAT_VERSION);
+        // 2026-10-01: the oldest readable version is 4, so "older" is the
+        // version below it — the last one that renumbered the ordinals.
         let mut older = current;
-        older[7] = SEAL_SPILL_FORMAT_VERSION - 1;
+        older[7] = crate::seal_spill::SEAL_SPILL_OLDEST_READABLE_VERSION - 1;
         let mut newer = current;
         newer[7] = SEAL_SPILL_FORMAT_VERSION + 1;
         let mut legacy_zero = current;
@@ -2097,6 +2130,62 @@ mod tests {
             "an unversioned line and a newer-version line are both refused and counted"
         );
 
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// Audit PR41c: the boot drain reads a version-4 record (the build before
+    /// this one wrote it) and refuses a damaged version-5 record without
+    /// losing the records after it.
+    #[test]
+    fn boot_drain_reads_a_v4_record_and_refuses_a_damaged_one() {
+        let dir = std::env::temp_dir().join(format!("tv-seal-pr41c-boot-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("seals_v4-2026-10-01.bin");
+
+        let good = SerializedSeal::from(&mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 102.5));
+        let after = SerializedSeal::from(&mk_seal(14, 0, TfIndex::M1, 1_716_000_900, 103.5));
+        let mut v4 = good.to_bytes();
+        v4[0..4].copy_from_slice(&13_u32.to_le_bytes());
+        v4[7] = 4;
+        let mut damaged = good.to_bytes();
+        damaged[64] ^= 0x40;
+
+        let mut bytes = Vec::new();
+        for record in [good.to_bytes(), v4, damaged, after.to_bytes()] {
+            bytes.extend_from_slice(&record);
+        }
+        std::fs::write(&path, &bytes).expect("write spill");
+
+        let (records, undecodable) = read_staged_spill(&path).expect("readable");
+        assert_eq!(records, vec![good, good, after]);
+        assert_eq!(undecodable, 1, "the damaged record is refused and counted");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// Audit PR41c: a dead-letter line stamped version 4 is still read.
+    #[test]
+    fn boot_drain_reads_a_v4_dlq_line() {
+        let dir = std::env::temp_dir().join(format!("tv-seal-pr41c-dlq-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("seals_v4-2026-10-01.ndjson");
+        let mut line = SealDlqRecord::from(&SerializedSeal::from(&mk_seal(
+            13,
+            0,
+            TfIndex::M1,
+            1_716_000_900,
+            102.5,
+        )));
+        line.format_version = crate::seal_spill::SEAL_SPILL_OLDEST_READABLE_VERSION;
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&line).expect("serialise")),
+        )
+        .expect("write dlq");
+        let (records, undecodable) = read_staged_dlq(&path).expect("readable");
+        assert_eq!((records.len(), undecodable), (1, 0));
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
     }
@@ -3435,7 +3524,7 @@ mod tests {
         // Append a record claiming an older format, then two good ones.
         let path = writer.spill_path(t0);
         let mut stale = SerializedSeal::from(&mk_seal(13, 0, TfIndex::M1, 99, 1.0)).to_bytes();
-        stale[7] = SEAL_SPILL_FORMAT_VERSION.wrapping_sub(1);
+        stale[7] = crate::seal_spill::SEAL_SPILL_OLDEST_READABLE_VERSION.wrapping_sub(1);
         {
             use std::io::Write;
             let mut f = std::fs::OpenOptions::new()
@@ -3449,6 +3538,28 @@ mod tests {
         replay.observe(&healthy_drain(), t0);
         let out = replay.step(&mut sink, &writer, &spill, true, t0 + 60);
         assert_eq!(out.seals_reingested, 3);
+        assert_eq!(out.records_skipped, 1);
+        assert_eq!(out.files_archived, 1);
+        cleanup(&spill, &dlq);
+    }
+
+    /// Audit PR41c: the mid-session replay skips a damaged record, counts it,
+    /// and re-ingests the records on both sides of it.
+    #[test]
+    fn replay_skips_a_damaged_record_and_reingests_the_rest() {
+        let (spill, dlq) = temp_pair("replay-damaged");
+        let writer = crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(spill.clone());
+        let t0 = jan1_noon_utc();
+        spill_n(&writer, 3, t0);
+        let path = writer.spill_path(t0);
+        let mut bytes = std::fs::read(&path).expect("read");
+        bytes[SEAL_SPILL_RECORD_SIZE + 64] ^= 0x01;
+        std::fs::write(&path, &bytes).expect("write");
+        let mut replay = MidSessionReplay::default();
+        let mut sink = ReplaySink::default();
+        replay.observe(&healthy_drain(), t0);
+        let out = replay.step(&mut sink, &writer, &spill, true, t0 + 60);
+        assert_eq!(out.seals_reingested, 2);
         assert_eq!(out.records_skipped, 1);
         assert_eq!(out.files_archived, 1);
         cleanup(&spill, &dlq);
