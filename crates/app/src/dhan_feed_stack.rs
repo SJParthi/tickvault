@@ -11577,6 +11577,8 @@ struct WidenCtx<'a> {
     live_topups: &'a mut Vec<(tokio::sync::mpsc::Sender<LiveSubscriptionCommand>, usize)>,
     main_feed_connections_used: &'a mut usize,
     contract_capacity: &'a mut Option<usize>,
+    /// R7 (2026-10-01): the dual-instance lock flag, for the widen's dials.
+    instance_lock_held: &'a Arc<AtomicBool>,
 }
 
 /// Room for NEW main-feed connections the widen may open. Zero once Dhan has
@@ -11708,6 +11710,7 @@ fn widen_running_session(
                                     // what these connections leave free.
                                     out_topups: Some(ctx.live_topups),
                                     out_depth_commands: None,
+                                    instance_lock_held: ctx.instance_lock_held,
                                 },
                             );
                             report_dial_shortfall(DIAL_HALF_MAIN_FEED, planned, dialed, attempts);
@@ -11902,6 +11905,9 @@ async fn attach_depth_when_available(
     // attach adds it once the rider writes it, and does not return while it
     // is still missing (until the 15:30 hard stop).
     mut widen: Option<RunningWiden>,
+    // R7 (2026-10-01): the process's dual-instance lock flag, wired into every
+    // socket this task dials so no dial happens while the lock is not held.
+    instance_lock_held: Arc<AtomicBool>,
 ) {
     // Publish a 0 for every contract-failure reason BEFORE the first attempt.
     //
@@ -12143,6 +12149,7 @@ async fn attach_depth_when_available(
                         live_topups: &mut live_topups,
                         main_feed_connections_used: &mut main_feed_connections_used,
                         contract_capacity: &mut contract_capacity,
+                        instance_lock_held: &instance_lock_held,
                     },
                     &today_date,
                     attempts,
@@ -12445,6 +12452,7 @@ async fn attach_depth_when_available(
                     live_topups: &mut live_topups,
                     main_feed_connections_used: &mut main_feed_connections_used,
                     contract_capacity: &mut contract_capacity,
+                    instance_lock_held: &instance_lock_held,
                 },
                 &today_date,
                 attempts.saturating_add(1),
@@ -12708,6 +12716,7 @@ async fn attach_depth_when_available(
                                 // makes it safe.
                                 out_topups: Some(&mut live_topups),
                                 out_depth_commands: None,
+                                instance_lock_held: &instance_lock_held,
                             },
                         );
                         // The TERMINAL verdict for today's selection, recorded
@@ -12892,6 +12901,7 @@ async fn attach_depth_when_available(
                                     ws_audit_tx: Some(&ws_audit_tx),
                                     out_topups: None,
                                     out_depth_commands: Some(&mut depth_commands),
+                                    instance_lock_held: &instance_lock_held,
                                 },
                             );
                             report_dial_shortfall(DIAL_HALF_DEPTH, planned, dialed, attempts);
@@ -13567,6 +13577,13 @@ struct DialContext<'a> {
     /// OLD one, and only the dial knows which connection got which. Deriving
     /// it later from the selection would be guessing at the pool's packing.
     out_depth_commands: Option<&'a mut DialedDepthCommands>,
+    /// The process's dual-instance lock-held flag (2026-10-01, R7). Wired into
+    /// every socket's sink so each dial — first dial, reconnect, 807 re-dial,
+    /// rotate, ghost redial — waits while this process does not hold the
+    /// lock. The boot gate checks it once before the first dial; this is what
+    /// keeps it checked for the life of the socket. Depth-account sockets are
+    /// gated too: same process, same lock.
+    instance_lock_held: &'a Arc<AtomicBool>,
 }
 
 fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize {
@@ -13581,6 +13598,7 @@ fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize 
         ws_audit_tx,
         mut out_topups,
         mut out_depth_commands,
+        instance_lock_held,
     } = ctx;
     let mut dialed = 0usize;
     for planned in plan.connections {
@@ -13699,7 +13717,9 @@ fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize 
             Some(tx) => sink.with_audit(tx.clone()),
             None => sink,
         };
-        let sink = Arc::new(sink);
+        // R7 (2026-10-01): no dial while this process does not hold the
+        // dual-instance lock. Live sockets are never closed by it.
+        let sink = Arc::new(sink.with_dial_permit(Arc::clone(instance_lock_held)));
         let guard = planned.guard;
         // Count it alive BEFORE the task starts, so the gauge can never read
         // high because a spawn lost a race with its own decrement.
@@ -15971,6 +15991,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             ws_audit_tx: Some(&ws_audit_tx),
             out_topups: Some(&mut main_feed_topups),
             out_depth_commands: None,
+            instance_lock_held: &params.instance_lock_held,
         },
     );
     // `attempts = 0`: the boot dial happens once and has no retry loop behind
@@ -16028,6 +16049,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 .widen_universe
                 .clone()
                 .map(|source| RunningWiden::new(source, &params.main_feed_instruments)),
+            Arc::clone(&params.instance_lock_held),
         ));
     }
 

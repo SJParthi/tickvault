@@ -3444,7 +3444,28 @@ pub trait FrameSink: Send + Sync + 'static {
         _reason: &'static str,
     ) {
     }
+
+    /// May this process OPEN a socket now? (2026-10-01, R7 — the
+    /// dual-instance lock.)
+    ///
+    /// Read before every dial. O(1), no await. Default `true`, so every
+    /// existing sink is unchanged; [`WalRingSink::with_dial_permit`] wires
+    /// the process's lock-held flag.
+    fn dial_permitted(&self) -> bool {
+        true
+    }
 }
+
+/// How often a connection refused a dial by the dual-instance lock re-checks
+/// whether it may dial again (2026-10-01, R7). Matches the 5 s token-stale
+/// redial floor; the lock's own heartbeat runs every 30 s.
+pub const DIAL_PERMIT_POLL_MS: u64 = 5_000;
+
+/// Counter of dial-refusal EPISODES caused by the dual-instance lock not being
+/// held (2026-10-01, R7). One increment per episode, beside a coded
+/// RESILIENCE-01 line. Log-sink only: not in the CloudWatch metric allowlist,
+/// so no alarm reads it.
+pub const INSTANCE_LOCK_DIAL_REFUSED_METRIC: &str = "tv_instance_lock_dial_refused_total";
 
 /// One socket lifecycle transition, WITHOUT a timestamp.
 ///
@@ -3813,6 +3834,11 @@ pub struct WalRingSink {
     /// sink built the old way behaves exactly as before — no channel, no
     /// rows, no cost.
     audit_tx: Option<tokio::sync::mpsc::Sender<WsLifecycleEvent>>,
+    /// The process's dual-instance lock-held flag (2026-10-01, R7).
+    ///
+    /// `None` by default — a sink built the old way may always dial. Set by
+    /// [`WalRingSink::with_dial_permit`]; read once per dial, never per frame.
+    dial_permit: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl WalRingSink {
@@ -3856,9 +3882,23 @@ impl WalRingSink {
             ring_full: metrics::counter!(RING_FULL_METRIC, "endpoint" => endpoint_label),
             ring_bytes_full: metrics::counter!(RING_BYTES_FULL_METRIC, "endpoint" => endpoint_label),
             audit_tx: None,
+            dial_permit: None,
         };
         sink.pre_register();
         sink
+    }
+
+    /// Gates every dial of this socket on the process's dual-instance
+    /// lock-held flag (2026-10-01, R7). While the flag reads `false` the
+    /// connection waits instead of dialling; a live socket is never closed.
+    ///
+    /// A builder, same shape as [`WalRingSink::with_audit`], so every
+    /// existing construction — tests, benches, the DHAT gates — is
+    /// untouched.
+    #[must_use]
+    pub fn with_dial_permit(mut self, held: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.dial_permit = Some(held);
+        self
     }
 
     /// Attaches the `ws_event_audit` side-channel to this socket.
@@ -3894,6 +3934,12 @@ impl WalRingSink {
 }
 
 impl FrameSink for WalRingSink {
+    fn dial_permitted(&self) -> bool {
+        self.dial_permit
+            .as_ref()
+            .is_none_or(|held| held.load(std::sync::atomic::Ordering::Acquire))
+    }
+
     fn on_lifecycle(
         &self,
         kind: tickvault_common::ws_event_types::WsEventKind,
@@ -4789,6 +4835,9 @@ where
         "begin_dial",
     );
     let mut action = supervisor.on_event(ConnEvent::BeginDial, Instant::now());
+    // R7 (2026-10-01): one RESILIENCE-01 line per dial-refusal EPISODE, not
+    // one per 5 s poll. Re-armed by the first permitted dial.
+    let mut dial_refusal_reported = false;
 
     loop {
         match action {
@@ -4861,6 +4910,48 @@ where
             SupervisorAction::Dial => {
                 // Nothing is on the wire until this dial's subscribe is acked.
                 publish_connection_instruments(&supervisor.slot(), 0);
+                // 2026-10-01, R7: a process that no longer holds the
+                // dual-instance lock must not OPEN a socket — every dial
+                // (first dial, reconnect, 807 re-dial, rotate, ghost redial)
+                // passes here. Two boxes both re-dialling is a Dhan 805
+                // eviction war and an account-block risk. Live sockets are
+                // never closed (closing loses ticks for certain); only the
+                // next dial waits. The refusal is NOT reported to the
+                // supervisor, so it costs no backoff, flap or park budget:
+                // the action stays `Dial` and is re-checked every
+                // `DIAL_PERMIT_POLL_MS`.
+                if !sink.dial_permitted() {
+                    if !dial_refusal_reported {
+                        dial_refusal_reported = true;
+                        metrics::counter!(INSTANCE_LOCK_DIAL_REFUSED_METRIC).increment(1);
+                        sink.on_lifecycle(
+                            tickvault_common::ws_event_types::WsEventKind::DialFailed,
+                            "instance_lock_not_held",
+                        );
+                        error!(
+                            code = ErrorCode::Resilience01DualInstanceDetected.code_str(),
+                            severity = ErrorCode::Resilience01DualInstanceDetected
+                                .severity()
+                                .as_str(),
+                            stage = "dial_refused",
+                            endpoint,
+                            pool_index,
+                            poll_ms = DIAL_PERMIT_POLL_MS,
+                            "RESILIENCE-01: dial refused — this process no longer holds the \
+                             dual-instance lock; live sockets are untouched, this socket \
+                             is not re-dialled until the lock is held again"
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_millis(DIAL_PERMIT_POLL_MS)).await;
+                    continue;
+                }
+                if dial_refusal_reported {
+                    dial_refusal_reported = false;
+                    info!(
+                        endpoint,
+                        pool_index, "dual-instance lock held again — dial permitted, resuming"
+                    );
+                }
                 let event = match socket.connect().await {
                     Ok(()) => ConnEvent::DialSucceeded,
                     Err(_) => {
@@ -9056,6 +9147,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// R7 (2026-10-01): a sink built the old way may always dial, and an
+    /// opted-in sink follows the process's lock-held flag on every read.
+    #[test]
+    fn with_dial_permit_follows_the_lock_flag_and_defaults_to_permitted() {
+        let dir = wal_dir("dial-permit");
+        let spill = std::sync::Arc::new(
+            WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
+        );
+        let budget = std::sync::Arc::new(RingByteBudget::new(usize::MAX));
+        let (frames_tx, _frames_rx) = tokio::sync::mpsc::channel::<CapturedFrame>(4);
+        let build = || {
+            WalRingSink::new(
+                std::sync::Arc::clone(&spill),
+                frames_tx.clone(),
+                std::sync::Arc::clone(&budget),
+                WsType::LiveFeed,
+                DhanEndpointType::MainFeed,
+                0,
+            )
+        };
+        assert!(
+            build().dial_permitted(),
+            "no permit wired = always permitted"
+        );
+        assert!(
+            RecordingSink::default().dial_permitted(),
+            "the trait default must permit"
+        );
+
+        let held = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let gated = build().with_dial_permit(std::sync::Arc::clone(&held));
+        assert!(!gated.dial_permitted(), "lock not held = no dial");
+        held.store(true, std::sync::atomic::Ordering::Release);
+        assert!(gated.dial_permitted(), "lock held again = dial");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn with_audit_is_silent_until_opted_in_and_names_its_own_endpoint() {
         // Two properties in one test because they are the same property from
@@ -10485,6 +10613,101 @@ mod tests {
         assert!(!outcome.caller_should_unmark());
         let s = st.lock().expect("fake state");
         assert_eq!(s.wire_calls, vec!["subscribe", "unsubscribe", "subscribe"]);
+    }
+
+    /// Sink whose dial permit a test flips, recording every lifecycle report
+    /// (R7, 2026-10-01).
+    struct PermitSink {
+        permit: std::sync::atomic::AtomicBool,
+        lifecycle: Mutex<Vec<(tickvault_common::ws_event_types::WsEventKind, &'static str)>>,
+    }
+
+    impl FrameSink for PermitSink {
+        fn accept(&self, _frame: Bytes) -> FrameSinkOutcome {
+            FrameSinkOutcome::Captured
+        }
+
+        fn on_lifecycle(
+            &self,
+            kind: tickvault_common::ws_event_types::WsEventKind,
+            reason: &'static str,
+        ) {
+            if let Ok(mut g) = self.lifecycle.lock() {
+                g.push((kind, reason));
+            }
+        }
+
+        fn dial_permitted(&self) -> bool {
+            self.permit.load(std::sync::atomic::Ordering::Acquire)
+        }
+    }
+
+    /// R7 (2026-10-01): a process that does not hold the dual-instance lock
+    /// waits WITHOUT dialling, reports the refusal once per episode (not once
+    /// per poll), costs the supervisor no dial failure, and dials as soon as
+    /// the lock is held again.
+    #[tokio::test(start_paused = true)]
+    async fn test_run_connection_waits_without_dialling_while_lock_not_held() {
+        use tickvault_common::ws_event_types::WsEventKind;
+
+        let st = std::sync::Arc::new(Mutex::new(FakeState::default()));
+        let sink = std::sync::Arc::new(PermitSink {
+            permit: std::sync::atomic::AtomicBool::new(false),
+            lifecycle: Mutex::new(Vec::new()),
+        });
+        let guard = SubscribeGuard::try_new(DhanEndpointType::MainFeed, vec![si(1)])
+            .expect("one instrument");
+        let task = tokio::spawn(run_connection_with_commands(
+            fake(&st),
+            sup(DhanEndpointType::MainFeed, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+            None,
+        ));
+
+        // Six polls' worth of refusal.
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert_eq!(
+            st.lock().unwrap().connects,
+            0,
+            "no dial while the lock is not held"
+        );
+        let refusals = sink
+            .lifecycle
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(k, r)| *k == WsEventKind::DialFailed && *r == "instance_lock_not_held")
+            .count();
+        assert_eq!(refusals, 1, "one report per refusal episode, not per poll");
+        assert!(
+            !task.is_finished(),
+            "a refused dial must not park the connection"
+        );
+
+        sink.permit
+            .store(true, std::sync::atomic::Ordering::Release);
+        // The default script is exhausted, so the connection dials, subscribes,
+        // reads the fatal terminator and parks — which ends the task.
+        let exit = tokio::time::timeout(Duration::from_secs(3600), task)
+            .await
+            .expect("the connection must dial once the lock is held")
+            .expect("connection task must not panic");
+        assert!(matches!(exit, ConnectionExit::Parked(_)));
+        assert!(
+            st.lock().unwrap().connects >= 1,
+            "the lock held again must re-enable the dial"
+        );
+        let lifecycle = sink.lifecycle.lock().unwrap();
+        assert_eq!(
+            lifecycle
+                .iter()
+                .filter(|(_, r)| *r == "instance_lock_not_held")
+                .count(),
+            1,
+            "the episode reported exactly once"
+        );
     }
 
     /// The subscribe half fails on the wire after the unsubscribe landed: the

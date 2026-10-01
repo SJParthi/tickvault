@@ -134,6 +134,60 @@ boot):
   the lock is `Acquired`; the heartbeat + `instance_lock_held`
   RESILIENCE-03 tripwire wiring is byte-identical to the lane's.
 
+## §3.6. 2026-10-01 (R7) — every lock write is read back; a box without the lock stops dialling
+
+**Why.** SSM `PutParameter` is not conditional. The atomic claim
+(`overwrite=false`) is safe, but the two other writes were check-then-write:
+the stale TAKEOVER (two booting peers that read the same stale value both
+returned `Acquired`) and the 30 s RENEWAL. And a process whose renewal said
+"lost" only refused the token mint: its sockets kept reconnecting, which on
+Dhan is a 805 eviction war between two boxes and an account-block risk.
+
+**What changed.**
+
+| Path | Behaviour |
+|---|---|
+| Renewal | Read (with version) → ownership check → put (returns its version) → read back. Classified by `classify_write`: **held** → renewed; **held after contention** (put version ≠ read version + 1, our value still stored) → renewed, plus `tv_instance_lock_contention_total{stage="renew"}` and a RESILIENCE-01 `error!` with `stage = "renew_contention"`; **lost** (a foreign host or newer version read back, or the parameter deleted) → the existing lock-lost path (flag false, RESILIENCE-01, heartbeat exits); **inconclusive** (versions absent or non-increasing, or a read-back older than our put) → `Err` "read-back inconclusive", the existing WARN-and-retry path — never reported as held. |
+| Stale takeover | Put → if our own get→put window exceeded `INSTANCE_LOCK_TAKEOVER_MAX_WINDOW_SECS` (5) the write is not trusted → wait `INSTANCE_LOCK_TAKEOVER_SETTLE_SECS` (10) → read back → classify. **held** → `Acquired`; **held after contention** → `Acquired` plus `tv_instance_lock_contention_total{stage="takeover"}` and RESILIENCE-01 `stage = "takeover_contention"`; **lost** → `AlreadyHeld{holder: <host read back>}` (`warn!`, `stage = "takeover_lost"`); **inconclusive** → `AlreadyHeld{holder: "(takeover unverified)"}` (`warn!`, `stage = "takeover_unverified"`). Both refusals fall into the boot loop's existing AlreadyHeld retry. A read-back that fails is an `Err` (the boot loop's transport retry), never `Acquired`. |
+| Every socket dial | Each feed socket's sink carries the process's lock-held flag. While it reads false, the connection does NOT dial (first dial, reconnect, 807 re-dial, rotate, ghost redial alike): `tv_instance_lock_dial_refused_total` +1, one `DialFailed` audit row with reason `instance_lock_not_held`, and one RESILIENCE-01 `error!` with `stage = "dial_refused"` — once per refusal episode per socket, not per poll — then re-checks every `DIAL_PERMIT_POLL_MS` (5 s). The refusal is not a dial failure to the supervisor: no backoff, flap or park budget is spent. **Live sockets are never closed** — closing loses ticks for certain; leaving them only risks Dhan evicting them when the lock owner dials. Depth-account sockets are gated too (same process, same lock). |
+
+Not changed: the `--force-instance-takeover` hatch (unconditional by design);
+the boot loop; no new Telegram page or alarm — RESILIENCE-01 has no
+`error_code_alerts` entry and both new counters are log-sink only (not in the
+CloudWatch metric allowlist), so nothing pages on them.
+
+**Operator action on `renew_contention` / `takeover_contention` /
+`dial_refused`:** another process is writing the lock parameter. Find it
+(`aws ssm get-parameter-history` on the lock path names every writer's
+`host_id`) and stop it. A process whose renewal read "lost" never re-takes
+the lock in-process (its heartbeat exits), so its refused sockets stay down
+until it is RESTARTED — restart it once the other process is stopped. The
+dial gate itself re-checks every 5 s, so it would resume on its own if the
+flag were ever set again.
+
+**Honest limit (Limitation — this NARROWS the race, it does not close it).**
+
+- **No fencing token.** SSM has no compare-and-swap; the settle relies on
+  timing. A put whose server-side commit lands later than the client saw
+  (a timeout followed by a late commit) breaks the timing assumption.
+- **Renewal does not settle.** If a peer's takeover put lands after our
+  renewal read-back, both processes believe they hold the lock for up to one
+  heartbeat (30 s), until our next renewal reads the foreign host. That
+  needs our renewals to have already failed for ~90 s (otherwise no peer
+  sees the lock stale). Closing it needs a self-fence on renewal staleness
+  (stop dialling after two consecutive renewal failures), which delays a
+  re-dial during an SSM outage — an operator trade-off, not taken here.
+- **Read-after-write consistency of `GetParameter` is Unknown** (not
+  documented as strong). A read-back older than our own put is classified
+  inconclusive and retried, never treated as held.
+- **The own-host reclaim is not implemented.** An unverified takeover leaves
+  our own value stored, and the next boot attempt reads it as a fresh foreign
+  holder until the 90 s TTL lapses; the boot loop's patience
+  (`DHAN_REST_STACK_ALREADYHELD_PATIENCE_SECS`, 300 s) absorbs that.
+- **A refused socket is not closed**, so a box that lost the lock keeps the
+  sockets it already had until Dhan evicts them; an evicted socket is then
+  not re-dialled.
+
 ## §4. What a PR that violates this lock looks like (REJECT)
 
 - Re-introduces a trading-mode (`is_live()`) or any other gate that can skip the

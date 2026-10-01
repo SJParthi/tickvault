@@ -58,7 +58,7 @@
 //!     A foreign holder is left alone (logged at WARN, not ERROR).
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, anyhow};
 use aws_sdk_ssm::Client as SsmClient;
@@ -90,6 +90,25 @@ pub const INSTANCE_LOCK_HEARTBEAT_INTERVAL_SECS: u64 = 30;
 /// is trustworthy. 5 s is generous for NTP-disciplined hosts (typical
 /// offsets are sub-100 ms) while still catching a real step.
 pub const INSTANCE_LOCK_MAX_CLOCK_SKEW_SECS: u64 = 5;
+
+/// Settle time, in seconds, between a stale-TAKEOVER put and its read-back
+/// (2026-10-01, R7).
+///
+/// SSM has no compare-and-swap, so two booting peers that both read the
+/// same stale value would both overwrite it and both return `Acquired`.
+/// This borrows Fischer's mutual-exclusion timing: a contender whose own
+/// get→put window exceeded [`INSTANCE_LOCK_TAKEOVER_MAX_WINDOW_SECS`] does
+/// not trust its write, and every other contender's put therefore lands
+/// inside a 5 s window — so after waiting 10 s the stored value is final
+/// and exactly one contender reads itself back. Cold path only (boot);
+/// renewal never settles.
+pub const INSTANCE_LOCK_TAKEOVER_SETTLE_SECS: u64 = 10;
+
+/// Longest get→put window, in seconds, after which a takeover write is not
+/// trusted even if it reads back as ours (2026-10-01, R7). Must stay
+/// strictly below [`INSTANCE_LOCK_TAKEOVER_SETTLE_SECS`] or the settle no
+/// longer covers a racing contender's put.
+pub const INSTANCE_LOCK_TAKEOVER_MAX_WINDOW_SECS: u64 = 5;
 
 /// SSM Parameter path prefix. Full path is `{prefix}/{env}/instance-lock`
 /// so dev / sandbox / prod cannot stomp on each other.
@@ -314,6 +333,80 @@ pub enum AcquireOutcome {
     AlreadyHeld { holder: String },
 }
 
+/// Verdict of a lock WRITE checked by reading it back (2026-10-01, R7).
+///
+/// SSM `PutParameter` is not conditional, so a write can silently clobber
+/// a peer's, or be clobbered by one right after. Two numbers SSM already
+/// returns make both visible: every successful put bumps the parameter
+/// version by exactly 1, so `put version == read version + 1` proves no
+/// one wrote between our read and our put, and a read-back carrying our
+/// host at our put version proves no one wrote after it. This NARROWS the
+/// race; it cannot close it (no fencing token — see the runbook's honest
+/// limit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteVerdict {
+    /// Our value is stored at our put version and nothing landed between
+    /// our read and our put.
+    Held,
+    /// Our value is stored at our put version, but someone else wrote
+    /// between our read and our put (we overwrote it). We still hold —
+    /// the interloper's own read-back sees our host and yields — but it is
+    /// counted and logged.
+    HeldAfterContention,
+    /// Someone wrote after our put (foreign host or a newer version), or
+    /// the parameter was deleted. We do not hold.
+    Lost,
+    /// The versions do not let us decide (absent, non-monotonic, or a
+    /// read-back older than our own put). Never treated as held.
+    Inconclusive,
+}
+
+impl WriteVerdict {
+    /// Short stable label for logs.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Held => "held",
+            Self::HeldAfterContention => "held_after_contention",
+            Self::Lost => "lost",
+            Self::Inconclusive => "inconclusive",
+        }
+    }
+}
+
+/// Classifies a lock write from the version we READ before it, the version
+/// our PUT returned, and the `(host_id, version)` read back after it
+/// (`None` = the parameter is gone). Pure, O(1) (2026-10-01, R7).
+///
+/// A read-back older than our own put is `Inconclusive`, never `Held`:
+/// SSM `GetParameter` read-after-write consistency is not documented as
+/// strong, so a lagging read proves nothing either way.
+#[must_use]
+pub fn classify_write(
+    read_v: i64,
+    put_v: i64,
+    post: Option<(&str, i64)>,
+    ours: &str,
+) -> WriteVerdict {
+    // Versions absent (the SDK reads 0 when the field is missing), or not
+    // increasing — SSM versions only ever grow, so a put version at or
+    // below what we read means the numbers cannot be trusted.
+    if read_v <= 0 || put_v <= 0 || put_v <= read_v {
+        return WriteVerdict::Inconclusive;
+    }
+    match post {
+        // Deleted after our put.
+        None => WriteVerdict::Lost,
+        // Read-back older than our own write: a lagging read.
+        Some((_, v)) if v < put_v => WriteVerdict::Inconclusive,
+        // Someone wrote after us.
+        Some((h, v)) if h != ours || v != put_v => WriteVerdict::Lost,
+        // Ours at our version, but a write landed between read and put.
+        Some(_) if put_v != read_v.saturating_add(1) => WriteVerdict::HeldAfterContention,
+        Some(_) => WriteVerdict::Held,
+    }
+}
+
 /// Returns current Unix seconds since epoch. Wall-clock — the lock TTL
 /// tolerates a few seconds of skew between hosts so monotonic clocks
 /// would be wrong here.
@@ -337,17 +430,28 @@ pub async fn try_acquire_instance_lock(
     env: &str,
     host_id: &str,
 ) -> Result<AcquireOutcome> {
-    try_acquire_lock_at_path(ssm, &compute_instance_lock_path(env), host_id).await
+    try_acquire_lock_at_path(
+        ssm,
+        &compute_instance_lock_path(env),
+        host_id,
+        Duration::from_secs(INSTANCE_LOCK_TAKEOVER_SETTLE_SECS),
+    )
+    .await
 }
 
 /// Shared acquire body — the SSM `PutParameter(overwrite=false)` atomic
 /// claim + stale-takeover + fail-closed evaluation, against an explicit
 /// parameter path. Private so the public surface stays the two thin
 /// wrappers above.
+///
+/// `settle` is the wait between a stale-takeover put and its read-back
+/// (2026-10-01, R7): the public wrapper passes
+/// [`INSTANCE_LOCK_TAKEOVER_SETTLE_SECS`]; tests pass `Duration::ZERO`.
 async fn try_acquire_lock_at_path(
     ssm: &SsmClient,
     path: &str,
     host_id: &str,
+    settle: Duration,
 ) -> Result<AcquireOutcome> {
     let now = now_unix_secs();
     let value = LockValue::new(host_id, now);
@@ -357,7 +461,7 @@ async fn try_acquire_lock_at_path(
     // parameter already exists. This is the SSM equivalent of Redis
     // SET NX.
     match put_parameter(ssm, path, &payload, false).await {
-        Ok(()) => {
+        Ok(_) => {
             info!(
                 target: "tickvault::instance_lock",
                 path = %path,
@@ -377,8 +481,10 @@ async fn try_acquire_lock_at_path(
         }
     }
 
-    // Step 2 — read the existing holder.
-    let raw = match get_parameter(ssm, path).await {
+    // Step 2 — read the existing holder. The version and the read instant
+    // feed the takeover's write check (2026-10-01, R7).
+    let read_at = Instant::now();
+    let (raw, read_v) = match get_parameter_versioned(ssm, path).await {
         Ok(Some(value)) => value,
         Ok(None) => {
             // Rare race: the previous holder's parameter was deleted
@@ -471,18 +577,17 @@ async fn try_acquire_lock_at_path(
                  verify time sync (the lock has no fencing token, so a forward step \
                  is observable here but not preventable)"
             );
-            put_parameter(ssm, path, &payload, true)
-                .await
-                .with_context(|| {
-                    format!("PutParameter(overwrite=true) takeover failed for path={path}")
-                })?;
-            info!(
-                target: "tickvault::instance_lock",
-                path = %path,
-                host_id = %host_id,
-                "RESILIENCE-01 lock acquired (stale takeover)"
-            );
-            Ok(AcquireOutcome::Acquired)
+            let outcome =
+                write_and_verify(ssm, path, &payload, host_id, read_v, read_at, settle).await?;
+            if outcome == AcquireOutcome::Acquired {
+                info!(
+                    target: "tickvault::instance_lock",
+                    path = %path,
+                    host_id = %host_id,
+                    "RESILIENCE-01 lock acquired (stale takeover)"
+                );
+            }
+            Ok(outcome)
         }
         Ok((existing, LockFreshness::Fresh { .. })) => Ok(AcquireOutcome::AlreadyHeld {
             holder: existing.host_id,
@@ -525,11 +630,19 @@ pub async fn renew_instance_lock(ssm: &SsmClient, env: &str, host_id: &str) -> R
 }
 
 /// Shared ownership-checked renewal body against an explicit parameter path.
+///
+/// Since 2026-10-01 (R7) the put is checked by reading it back and
+/// classifying the versions with [`classify_write`]: `Held` → `Ok(true)`;
+/// `HeldAfterContention` → counted + coded `error!`, still `Ok(true)` (the
+/// stored value is ours, so the interloper's own read-back yields);
+/// `Lost` → `Ok(false)`; `Inconclusive` → `Err` so the heartbeat takes its
+/// existing transient-retry path and never reports "held" on a read it
+/// cannot trust. Renewal does NOT settle — see the runbook's honest limit.
 async fn renew_lock_at_path(ssm: &SsmClient, path: &str, host_id: &str) -> Result<bool> {
-    let raw = get_parameter(ssm, path).await.with_context(|| {
+    let raw = get_parameter_versioned(ssm, path).await.with_context(|| {
         format!("GetParameter failed for instance lock path={path} during renewal")
     })?;
-    let Some(raw_value) = raw else {
+    let Some((raw_value, read_v)) = raw else {
         // Lock vanished mid-session. Treat as lost ownership.
         return Ok(false);
     };
@@ -547,12 +660,158 @@ async fn renew_lock_at_path(ssm: &SsmClient, path: &str, host_id: &str) -> Resul
         last_heartbeat_unix: now,
     };
     let payload = refreshed.to_json()?;
-    put_parameter(ssm, path, &payload, true)
+    let put_v = put_parameter(ssm, path, &payload, true)
         .await
         .with_context(|| {
             format!("PutParameter(overwrite=true) failed for path={path} during renewal")
         })?;
-    Ok(true)
+    let post = get_parameter_versioned(ssm, path).await.with_context(|| {
+        format!("GetParameter read-back failed for instance lock path={path} during renewal")
+    })?;
+    let post_host = post.as_ref().map(|(raw, v)| (stored_host_id(raw), *v));
+    let verdict = classify_write(
+        read_v,
+        put_v,
+        post_host.as_ref().map(|(h, v)| (h.as_str(), *v)),
+        host_id,
+    );
+    match verdict {
+        WriteVerdict::Held => Ok(true),
+        WriteVerdict::HeldAfterContention => {
+            metrics::counter!("tv_instance_lock_contention_total", "stage" => "renew").increment(1);
+            error!(
+                target: "tickvault::instance_lock",
+                code = ErrorCode::Resilience01DualInstanceDetected.code_str(),
+                severity = ErrorCode::Resilience01DualInstanceDetected
+                    .severity()
+                    .as_str(),
+                stage = "renew_contention",
+                path = %path,
+                host_id = %host_id,
+                read_v,
+                put_v,
+                verdict = verdict.as_str(),
+                "RESILIENCE-01: instance-lock renewal overwrote a write that landed \
+                 between our read and our put — another process wrote the lock \
+                 parameter. Our value is stored, so we still hold it; the other \
+                 writer's read-back sees our host and must yield. Find the other \
+                 process"
+            );
+            Ok(true)
+        }
+        WriteVerdict::Lost => Ok(false),
+        WriteVerdict::Inconclusive => Err(anyhow!(
+            "instance-lock read-back inconclusive read_v={read_v} put_v={put_v} \
+             post_v={} path={path} (during renewal)",
+            post_host.as_ref().map_or(0, |(_, v)| *v)
+        )),
+    }
+}
+
+/// The `host_id` stored in a raw lock value, or an empty string when the
+/// value is not valid lock JSON (2026-10-01, R7). An empty host never
+/// equals ours, so a corrupt read-back classifies as `Lost`.
+fn stored_host_id(raw: &str) -> String {
+    LockValue::from_json(raw)
+        .map(|l| l.host_id)
+        .unwrap_or_default()
+}
+
+/// Stale-TAKEOVER write with a settled read-back (2026-10-01, R7).
+///
+/// Puts our value, refuses to trust it if our own get→put window exceeded
+/// [`INSTANCE_LOCK_TAKEOVER_MAX_WINDOW_SECS`], waits `settle`, reads back
+/// and classifies with [`classify_write`]. Fails CLOSED: `Lost` reports the
+/// holder actually stored, `Inconclusive` reports an unverified takeover;
+/// both return `AlreadyHeld` so the boot loop retries instead of minting.
+async fn write_and_verify(
+    ssm: &SsmClient,
+    path: &str,
+    payload: &str,
+    host_id: &str,
+    read_v: i64,
+    read_at: Instant,
+    settle: Duration,
+) -> Result<AcquireOutcome> {
+    let put_v = put_parameter(ssm, path, payload, true)
+        .await
+        .with_context(|| format!("PutParameter(overwrite=true) takeover failed for path={path}"))?;
+    let window = read_at.elapsed();
+    tokio::time::sleep(settle).await;
+    let post = get_parameter_versioned(ssm, path)
+        .await
+        .with_context(|| format!("GetParameter takeover read-back failed for path={path}"))?;
+    let post_host = post.as_ref().map(|(raw, v)| (stored_host_id(raw), *v));
+    let verdict = if window > Duration::from_secs(INSTANCE_LOCK_TAKEOVER_MAX_WINDOW_SECS) {
+        WriteVerdict::Inconclusive
+    } else {
+        classify_write(
+            read_v,
+            put_v,
+            post_host.as_ref().map(|(h, v)| (h.as_str(), *v)),
+            host_id,
+        )
+    };
+    match verdict {
+        WriteVerdict::Held => Ok(AcquireOutcome::Acquired),
+        WriteVerdict::HeldAfterContention => {
+            metrics::counter!("tv_instance_lock_contention_total", "stage" => "takeover")
+                .increment(1);
+            error!(
+                target: "tickvault::instance_lock",
+                code = ErrorCode::Resilience01DualInstanceDetected.code_str(),
+                severity = ErrorCode::Resilience01DualInstanceDetected
+                    .severity()
+                    .as_str(),
+                stage = "takeover_contention",
+                path = %path,
+                host_id = %host_id,
+                read_v,
+                put_v,
+                verdict = verdict.as_str(),
+                "RESILIENCE-01: stale takeover overwrote a write that landed between \
+                 our read and our put — another process is taking the lock at the \
+                 same time. Our value survived the settle, so we hold it; the other \
+                 process must yield"
+            );
+            Ok(AcquireOutcome::Acquired)
+        }
+        WriteVerdict::Lost => {
+            let holder = post_host.map(|(h, _)| h).unwrap_or_default();
+            warn!(
+                target: "tickvault::instance_lock",
+                stage = "takeover_lost",
+                path = %path,
+                host_id = %host_id,
+                holder = %holder,
+                read_v,
+                put_v,
+                verdict = verdict.as_str(),
+                "stale takeover lost the race — another process's write landed after \
+                 ours; not holding the lock"
+            );
+            Ok(AcquireOutcome::AlreadyHeld { holder })
+        }
+        WriteVerdict::Inconclusive => {
+            warn!(
+                target: "tickvault::instance_lock",
+                stage = "takeover_unverified",
+                path = %path,
+                host_id = %host_id,
+                read_v,
+                put_v,
+                window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX),
+                max_window_secs = INSTANCE_LOCK_TAKEOVER_MAX_WINDOW_SECS,
+                verdict = verdict.as_str(),
+                "stale takeover could not be verified (get→put window too long or the \
+                 read-back versions do not prove ownership) — failing closed, not \
+                 holding the lock"
+            );
+            Ok(AcquireOutcome::AlreadyHeld {
+                holder: "(takeover unverified)".to_string(),
+            })
+        }
+    }
 }
 
 /// Releases the instance lock IFF this process still owns it.
@@ -785,8 +1044,12 @@ pub fn spawn_instance_lock_heartbeat(
 // surface stays small and the error mapping is centralised).
 // ---------------------------------------------------------------------------
 
-async fn put_parameter(ssm: &SsmClient, path: &str, value: &str, overwrite: bool) -> Result<()> {
-    ssm.put_parameter()
+/// Puts the lock value and returns the parameter VERSION SSM assigned to
+/// this write (2026-10-01, R7: read by [`classify_write`]; the SDK reads 0
+/// when the field is absent, which classifies as `Inconclusive`).
+async fn put_parameter(ssm: &SsmClient, path: &str, value: &str, overwrite: bool) -> Result<i64> {
+    let out = ssm
+        .put_parameter()
         .name(path)
         .value(value)
         .r#type(ParameterType::String)
@@ -802,16 +1065,24 @@ async fn put_parameter(ssm: &SsmClient, path: &str, value: &str, overwrite: bool
         // in the chain. Pinned by
         // `test_try_acquire_instance_lock_already_held_by_fresh_peer`.
         .map_err(|err| anyhow!("{}", aws_sdk_ssm::error::DisplayErrorContext(&err)))?;
-    Ok(())
+    Ok(out.version())
 }
 
+/// Value-only read — a thin wrapper over [`get_parameter_versioned`] for
+/// the paths that make no write decision (release, force takeover).
 async fn get_parameter(ssm: &SsmClient, path: &str) -> Result<Option<String>> {
+    Ok(get_parameter_versioned(ssm, path).await?.map(|(v, _)| v))
+}
+
+/// Reads the lock value together with its parameter VERSION (2026-10-01,
+/// R7). `Ok(None)` = the parameter is absent; the version reads 0 when SSM
+/// omits it.
+async fn get_parameter_versioned(ssm: &SsmClient, path: &str) -> Result<Option<(String, i64)>> {
     let result = ssm.get_parameter().name(path).send().await;
     match result {
         Ok(out) => Ok(out
             .parameter()
-            .and_then(|p| p.value())
-            .map(|v| v.to_string())),
+            .and_then(|p| p.value().map(|v| (v.to_string(), p.version())))),
         Err(err) => {
             // DisplayErrorContext (fix 2026-07-04): same as put_parameter —
             // the bare Display hid "ParameterNotFound", so an absent
@@ -1530,7 +1801,34 @@ mod tests {
     }
 
     fn put_ok_response() -> (u16, String) {
-        (200, r#"{"Version":1}"#.to_string())
+        put_ok_v(1)
+    }
+
+    /// A successful PutParameter that assigned version `v` (R7 write check).
+    fn put_ok_v(v: i64) -> (u16, String) {
+        (200, serde_json::json!({ "Version": v }).to_string())
+    }
+
+    /// A GetParameter returning `value` at version `v` (R7 write check).
+    fn get_v(value: &str, v: i64) -> (u16, String) {
+        (
+            200,
+            serde_json::json!({
+                "Parameter": {
+                    "Name": "/tickvault/testenv/instance-lock",
+                    "Type": "String",
+                    "Value": value,
+                    "Version": v
+                }
+            })
+            .to_string(),
+        )
+    }
+
+    fn lock_json(host: &str, heartbeat_unix: u64) -> String {
+        LockValue::new(host, heartbeat_unix)
+            .to_json()
+            .expect("serialise lock value")
     }
 
     fn parameter_already_exists_response() -> (u16, String) {
@@ -1606,21 +1904,298 @@ mod tests {
     #[tokio::test]
     async fn test_try_acquire_instance_lock_stale_takeover() {
         // Put rejected → Get returns a holder whose heartbeat is ancient
-        // → stale takeover via PutParameter(overwrite=true) → Acquired.
-        let stale = LockValue::new("dead-host", 1)
-            .to_json()
-            .expect("serialise stale holder");
+        // → stale takeover via PutParameter(overwrite=true) → read-back
+        // (R7, 2026-10-01) confirms ours at our put version → Acquired.
+        // The private body is called with a zero settle so the test does
+        // not wait the production 10 s.
+        let stale = lock_json("dead-host", 1);
+        let ours = lock_json("host-a", now_unix_secs());
         let (url, _stub) = start_ssm_stub(vec![
             parameter_already_exists_response(),
-            get_parameter_response(&stale),
-            put_ok_response(),
+            get_v(&stale, 3),
+            put_ok_v(4),
+            get_v(&ours, 4),
         ])
         .await;
         let ssm = stub_ssm_client(&url);
-        let outcome = try_acquire_instance_lock(&ssm, "testenv", "host-a")
-            .await
-            .expect("stale takeover path");
+        let outcome = try_acquire_lock_at_path(
+            &ssm,
+            &compute_instance_lock_path("testenv"),
+            "host-a",
+            Duration::ZERO,
+        )
+        .await
+        .expect("stale takeover path");
         assert_eq!(outcome, AcquireOutcome::Acquired);
+    }
+
+    // -----------------------------------------------------------------------
+    // R7 (2026-10-01) — write verdicts: the pure classifier, and the renew /
+    // takeover paths that read their own write back.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_classify_write_held_when_read_back_is_ours_at_next_version() {
+        assert_eq!(
+            classify_write(5, 6, Some(("host-a", 6)), "host-a"),
+            WriteVerdict::Held
+        );
+    }
+
+    #[test]
+    fn test_classify_write_gap_is_held_after_contention() {
+        // put 7 after reading 5: one write landed between our read and put.
+        assert_eq!(
+            classify_write(5, 7, Some(("host-a", 7)), "host-a"),
+            WriteVerdict::HeldAfterContention
+        );
+    }
+
+    #[test]
+    fn test_classify_write_foreign_or_newer_read_back_is_lost() {
+        assert_eq!(
+            classify_write(5, 6, Some(("peer", 7)), "host-a"),
+            WriteVerdict::Lost
+        );
+        assert_eq!(
+            classify_write(5, 6, Some(("peer", 6)), "host-a"),
+            WriteVerdict::Lost
+        );
+        assert_eq!(
+            classify_write(5, 6, Some(("host-a", 7)), "host-a"),
+            WriteVerdict::Lost
+        );
+    }
+
+    #[test]
+    fn test_classify_write_deleted_after_put_is_lost() {
+        assert_eq!(classify_write(5, 6, None, "host-a"), WriteVerdict::Lost);
+    }
+
+    #[test]
+    fn test_classify_write_lagging_read_back_is_inconclusive() {
+        assert_eq!(
+            classify_write(5, 6, Some(("host-a", 5)), "host-a"),
+            WriteVerdict::Inconclusive
+        );
+        // A lagging read is inconclusive even when it names a peer.
+        assert_eq!(
+            classify_write(5, 6, Some(("peer", 5)), "host-a"),
+            WriteVerdict::Inconclusive
+        );
+    }
+
+    #[test]
+    fn test_classify_write_absent_or_non_monotonic_versions_are_inconclusive() {
+        assert_eq!(
+            classify_write(0, 6, Some(("host-a", 6)), "host-a"),
+            WriteVerdict::Inconclusive
+        );
+        assert_eq!(
+            classify_write(5, 0, Some(("host-a", 0)), "host-a"),
+            WriteVerdict::Inconclusive
+        );
+        assert_eq!(
+            classify_write(-1, 6, Some(("host-a", 6)), "host-a"),
+            WriteVerdict::Inconclusive
+        );
+        // A put version at or below the read version cannot happen on SSM.
+        assert_eq!(
+            classify_write(5, 5, Some(("host-a", 5)), "host-a"),
+            WriteVerdict::Inconclusive
+        );
+        assert_eq!(
+            classify_write(i64::MAX, i64::MAX, None, "host-a"),
+            WriteVerdict::Inconclusive
+        );
+    }
+
+    #[test]
+    fn test_write_verdict_labels_are_stable() {
+        assert_eq!(WriteVerdict::Held.as_str(), "held");
+        assert_eq!(
+            WriteVerdict::HeldAfterContention.as_str(),
+            "held_after_contention"
+        );
+        assert_eq!(WriteVerdict::Lost.as_str(), "lost");
+        assert_eq!(WriteVerdict::Inconclusive.as_str(), "inconclusive");
+    }
+
+    #[test]
+    fn test_takeover_settle_covers_the_max_window() {
+        const {
+            assert!(INSTANCE_LOCK_TAKEOVER_MAX_WINDOW_SECS < INSTANCE_LOCK_TAKEOVER_SETTLE_SECS);
+        }
+        assert_eq!(INSTANCE_LOCK_TAKEOVER_SETTLE_SECS, 10);
+        assert_eq!(INSTANCE_LOCK_TAKEOVER_MAX_WINDOW_SECS, 5);
+    }
+
+    #[tokio::test]
+    async fn test_renew_true_when_read_back_confirms() {
+        let ours = lock_json("host-a", now_unix_secs());
+        let (url, _stub) =
+            start_ssm_stub(vec![get_v(&ours, 5), put_ok_v(6), get_v(&ours, 6)]).await;
+        let renewed = renew_instance_lock(&stub_ssm_client(&url), "testenv", "host-a")
+            .await
+            .expect("renew against stub");
+        assert!(renewed);
+    }
+
+    #[tokio::test]
+    async fn test_renew_false_when_peer_writes_after_our_put() {
+        let ours = lock_json("host-a", now_unix_secs());
+        let peer = lock_json("peer", now_unix_secs());
+        let (url, _stub) =
+            start_ssm_stub(vec![get_v(&ours, 5), put_ok_v(6), get_v(&peer, 7)]).await;
+        let renewed = renew_instance_lock(&stub_ssm_client(&url), "testenv", "host-a")
+            .await
+            .expect("lost-race renewal is Ok(false), not Err");
+        assert!(!renewed, "a write after ours = lost ownership");
+    }
+
+    #[tokio::test]
+    async fn test_renew_true_after_clobbering_interleaved_write() {
+        // put version 7 after reading 5 — a peer wrote version 6 in between
+        // and we overwrote it. Our value is stored: still held (counted +
+        // RESILIENCE-01 `renew_contention`).
+        let ours = lock_json("host-a", now_unix_secs());
+        let (url, _stub) =
+            start_ssm_stub(vec![get_v(&ours, 5), put_ok_v(7), get_v(&ours, 7)]).await;
+        let renewed = renew_instance_lock(&stub_ssm_client(&url), "testenv", "host-a")
+            .await
+            .expect("contention renewal");
+        assert!(renewed);
+    }
+
+    #[tokio::test]
+    async fn test_renew_err_when_read_back_lags() {
+        let ours = lock_json("host-a", now_unix_secs());
+        let (url, _stub) =
+            start_ssm_stub(vec![get_v(&ours, 5), put_ok_v(6), get_v(&ours, 5)]).await;
+        let err = renew_instance_lock(&stub_ssm_client(&url), "testenv", "host-a")
+            .await
+            .expect_err("a lagging read-back must never read as held");
+        assert!(
+            format!("{err:#}").contains("inconclusive"),
+            "error must say inconclusive: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_renew_err_when_read_back_fails() {
+        // Get + put served, the read-back finds the stub closed → Err with
+        // the renewal context (transient-retry path, never "held").
+        let ours = lock_json("host-a", now_unix_secs());
+        let (url, _stub) = start_ssm_stub(vec![get_v(&ours, 5), put_ok_v(6)]).await;
+        let err = renew_instance_lock(&stub_ssm_client(&url), "testenv", "host-a")
+            .await
+            .expect_err("failed read-back must Err");
+        assert!(
+            format!("{err:#}").contains("read-back"),
+            "error must name the read-back: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_takeover_lost_race_reports_peer() {
+        let stale = lock_json("dead-host", 1);
+        let peer = lock_json("peer", now_unix_secs());
+        let (url, _stub) = start_ssm_stub(vec![
+            parameter_already_exists_response(),
+            get_v(&stale, 3),
+            put_ok_v(4),
+            get_v(&peer, 5),
+        ])
+        .await;
+        let outcome = try_acquire_lock_at_path(
+            &stub_ssm_client(&url),
+            &compute_instance_lock_path("testenv"),
+            "host-a",
+            Duration::ZERO,
+        )
+        .await
+        .expect("lost takeover is an outcome, not Err");
+        assert_eq!(
+            outcome,
+            AcquireOutcome::AlreadyHeld {
+                holder: "peer".to_string()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_takeover_after_contention_is_acquired() {
+        // Read 3, our put lands at 5: someone wrote 4 in between, and our
+        // value survived the settle → Acquired (counted + RESILIENCE-01).
+        let stale = lock_json("dead-host", 1);
+        let ours = lock_json("host-a", now_unix_secs());
+        let (url, _stub) = start_ssm_stub(vec![
+            parameter_already_exists_response(),
+            get_v(&stale, 3),
+            put_ok_v(5),
+            get_v(&ours, 5),
+        ])
+        .await;
+        let outcome = try_acquire_lock_at_path(
+            &stub_ssm_client(&url),
+            &compute_instance_lock_path("testenv"),
+            "host-a",
+            Duration::ZERO,
+        )
+        .await
+        .expect("contention takeover");
+        assert_eq!(outcome, AcquireOutcome::Acquired);
+    }
+
+    #[tokio::test]
+    async fn test_takeover_unverified_when_read_back_lags() {
+        let stale = lock_json("dead-host", 1);
+        let (url, _stub) = start_ssm_stub(vec![
+            parameter_already_exists_response(),
+            get_v(&stale, 3),
+            put_ok_v(4),
+            get_v(&stale, 3),
+        ])
+        .await;
+        let outcome = try_acquire_lock_at_path(
+            &stub_ssm_client(&url),
+            &compute_instance_lock_path("testenv"),
+            "host-a",
+            Duration::ZERO,
+        )
+        .await
+        .expect("unverified takeover fails closed, not Err");
+        assert_eq!(
+            outcome,
+            AcquireOutcome::AlreadyHeld {
+                holder: "(takeover unverified)".to_string()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_takeover_read_back_transport_error_is_err() {
+        // The takeover put is served, the read-back finds the stub closed:
+        // Err (the boot loop's transport-retry path), never Acquired.
+        let stale = lock_json("dead-host", 1);
+        let (url, _stub) = start_ssm_stub(vec![
+            parameter_already_exists_response(),
+            get_v(&stale, 3),
+            put_ok_v(4),
+        ])
+        .await;
+        let err = try_acquire_lock_at_path(
+            &stub_ssm_client(&url),
+            &compute_instance_lock_path("testenv"),
+            "host-a",
+            Duration::ZERO,
+        )
+        .await
+        .expect_err("unreadable takeover must not acquire");
+        assert!(
+            format!("{err:#}").contains("takeover read-back"),
+            "error must name the takeover read-back: {err:#}"
+        );
     }
 
     #[tokio::test]
@@ -1712,7 +2287,7 @@ mod tests {
             .to_json()
             .expect("serialise our value");
         let (url, _stub) =
-            start_ssm_stub(vec![get_parameter_response(&ours), put_ok_response()]).await;
+            start_ssm_stub(vec![get_v(&ours, 5), put_ok_v(6), get_v(&ours, 6)]).await;
         let ssm = stub_ssm_client(&url);
         let renewed = renew_instance_lock(&ssm, "testenv", "host-a")
             .await
@@ -1855,8 +2430,7 @@ mod tests {
         let ours = LockValue::new("host-a", now_unix_secs())
             .to_json()
             .expect("serialise our value");
-        let (url2, _s2) =
-            start_ssm_stub(vec![get_parameter_response(&ours), put_ok_response()]).await;
+        let (url2, _s2) = start_ssm_stub(vec![get_v(&ours, 5), put_ok_v(6), get_v(&ours, 6)]).await;
         assert!(
             renew_instance_lock(&stub_ssm_client(&url2), "testenv", "host-a")
                 .await
@@ -1943,8 +2517,9 @@ mod tests {
             .to_json()
             .expect("serialise foreign value");
         let (url, _stub) = start_ssm_stub(vec![
-            get_parameter_response(&ours),
-            put_ok_response(),
+            get_v(&ours, 5),
+            put_ok_v(6),
+            get_v(&ours, 6),
             get_parameter_response(&foreign),
         ])
         .await;
