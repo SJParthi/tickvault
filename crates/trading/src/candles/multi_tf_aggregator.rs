@@ -52,7 +52,10 @@
 
 use std::collections::HashMap;
 
-use tickvault_common::constants::MAX_PLAUSIBLE_LTP;
+use tickvault_common::constants::{
+    EXCHANGE_SEGMENT_BSE_EQ, EXCHANGE_SEGMENT_BSE_FNO, EXCHANGE_SEGMENT_NSE_EQ,
+    EXCHANGE_SEGMENT_NSE_FNO, MAX_PLAUSIBLE_LTP,
+};
 use tickvault_common::feed::Feed;
 use tickvault_common::tick_types::ParsedTick;
 
@@ -104,6 +107,92 @@ pub const MIN_PLAUSIBLE_EXCHANGE_TS_SECS: u32 = 1_600_000_000;
 /// honest tick (a ~1.78-billion-second jump from zero) from poison. That
 /// exact mistake was made and caught by these tests before it shipped.
 pub const MAX_PLAUSIBLE_EXCHANGE_TS_SECS: u32 = 2_524_608_000;
+
+/// How recent an "untraded today" proof must be for the first trade to start
+/// from a true `0` baseline (audit PR58). 60 s: a subscribed contract's book
+/// changes far more often than that while the feed is up, so a live feed
+/// keeps the proof fresh, while a socket that was down for longer (whose
+/// reconnect snapshot carries every trade of the outage) falls back to
+/// seeding. Measured from the market open when the proof predates it, since
+/// nothing trades between the pre-open match and 09:15.
+pub const UNTRADED_PROOF_MAX_AGE_SECS: u32 = 60;
+
+/// How far a first trade's exchange stamp may sit BEFORE the receipt time of
+/// the proof that says it had not happened yet (audit PR58). The two come from
+/// different clocks (the exchange's and ours), so a few seconds of skew is
+/// normal; a trade stamped further before the proof contradicts it, and the
+/// slot seeds instead.
+pub const UNTRADED_PROOF_MAX_SKEW_SECS: u32 = 5;
+
+/// IST second-of-day after which the equity pre-open call auction has matched
+/// (09:12:00; the match runs ~09:08-09:12). An equity proof taken at or after
+/// it may be extended to the 09:15 open, because nothing trades in between;
+/// an earlier one may not, since the pre-open match can trade after it.
+pub const PRE_OPEN_MATCH_DONE_SECS_OF_DAY_IST: u32 = 33_120;
+
+/// The share of the slot table an "untraded today" proof may NOT create a slot
+/// in (audit PR58): the last 1/20 of it. At the 25,000 ceiling that keeps
+/// 1,250 slots for keys that actually trade while still covering 23,750 keys
+/// with proofs, above the measured session peak of 22,996 subscribed
+/// instruments. Before PR58 a never-traded packet created no slot at all.
+pub const UNTRADED_PROOF_SLOT_RESERVE_DIVISOR: usize = 20;
+
+/// Whether an "untraded today" proof taken at IST second `proof` makes the
+/// first accepted trade at fold second `trade` of segment `segment_code`
+/// carry the whole of its day's volume (audit PR58). All of:
+///
+/// - `proof != 0` (0 is "no proof") and both on the same IST day;
+/// - the trade is at most [`UNTRADED_PROOF_MAX_SKEW_SECS`] before the proof;
+/// - the trade is within [`UNTRADED_PROOF_MAX_AGE_SECS`] of the proof, where a
+///   proof before the 09:15 open counts as taken AT the open when nothing can
+///   trade between the two: always for a derivative segment (no pre-open
+///   session since futures left the subscription on 2026-09-18; keyed on the
+///   segment code, so if futures ever return to the subscription this must
+///   key on the instrument type instead), for an equity segment only for a
+///   proof taken once the pre-open auction has matched (09:12 plus the skew
+///   limit), and never for any other segment (currency and commodity trade
+///   from 09:00).
+///
+/// O(1), no allocation, no panic on any input.
+#[must_use]
+pub fn untraded_proof_holds(proof: u32, trade: u32, segment_code: u8) -> bool {
+    if proof == 0 || proof / 86_400 != trade / 86_400 {
+        return false;
+    }
+    if trade < proof {
+        return proof - trade <= UNTRADED_PROOF_MAX_SKEW_SECS;
+    }
+    let day_start = trade - trade % 86_400;
+    let open = day_start.saturating_add(crate::candles::tf_index::MARKET_OPEN_SECS_OF_DAY_IST);
+    // Named segments only (review 2026-10-01): currency and commodity trade
+    // from 09:00, so a proof there is never extended to the 09:15 open.
+    let is_derivative =
+        segment_code == EXCHANGE_SEGMENT_NSE_FNO || segment_code == EXCHANGE_SEGMENT_BSE_FNO;
+    let is_equity =
+        segment_code == EXCHANGE_SEGMENT_NSE_EQ || segment_code == EXCHANGE_SEGMENT_BSE_EQ;
+    let no_trade_until_open = is_derivative
+        || (is_equity
+            && proof
+                >= day_start.saturating_add(
+                    PRE_OPEN_MATCH_DONE_SECS_OF_DAY_IST + UNTRADED_PROOF_MAX_SKEW_SECS,
+                ));
+    let from = if trade >= open && no_trade_until_open {
+        proof.max(open)
+    } else {
+        proof
+    };
+    trade - from <= UNTRADED_PROOF_MAX_AGE_SECS
+}
+
+/// A frame's receipt time (UTC nanoseconds) as an IST epoch second, `None`
+/// when the frame carries none (an old WAL format) or it does not fit. O(1).
+fn receipt_ist_secs_of(received_at_nanos: i64) -> Option<u32> {
+    if received_at_nanos <= 0 {
+        return None;
+    }
+    u32::try_from(received_at_nanos / 1_000_000_000 + crate::candles::tf_index::IST_UTC_OFFSET_SECS)
+        .ok()
+}
 
 /// The composite identity. `security_id` alone is BANNED (I-P1-11); `feed` is
 /// part of it under the 2026-06-19 feed-in-key lock.
@@ -181,6 +270,52 @@ struct InstrumentSlot {
     /// ceiling, and it lives on the slot that already exists per instrument
     /// for the same reason `last_ltp` does.
     last_trade_ts: u32,
+    /// IST epoch second at which this key last sent a packet proving it had
+    /// NOT traded yet that day, `0` for none (audit PR58, 2026-09-28): a
+    /// last-trade time from an earlier day refused by the RECEIPT-day gate, a
+    /// zero price beside an earlier-day last-trade time (`untraded_sentinel`),
+    /// or a zero last-trade time with a zero price (`untraded_timestamp`),
+    /// received live (a frame with a receipt time) before the slot was
+    /// seeded. A zero field beside a live one contradicts itself and is no
+    /// proof. Every such packet refreshes it (only
+    /// ever forward in time); Dhan re-sends one on each book or open-interest
+    /// change. The watermark-day gate records NO proof: it fires on replayed
+    /// or out-of-order frames, whose receipt time says nothing about now.
+    ///
+    /// When the first accepted trade passes [`untraded_proof_holds`] (same
+    /// day, within [`UNTRADED_PROOF_MAX_AGE_SECS`] of the proof, counted from
+    /// the 09:15 open only where nothing can trade before it), that trade's day
+    /// cumulative is today's whole volume, so the baseline is a true `0` and
+    /// the first bar gets the trade. Otherwise the first tick seeds the
+    /// baseline as before: a slot that joined after trading began, or came
+    /// back from an outage, cannot tell earlier volume from this bar's, and
+    /// under-reporting one bar is less wrong than putting a morning in it.
+    ///
+    /// A proof alone is not enough (review 2026-10-01). It says "no trade as
+    /// of the proof", not "no trade was missed after it": if the packet
+    /// carrying the day's first trade was lost, our reader stalled, or a stale
+    /// snapshot arrived late, the first trade we fold carries earlier volume,
+    /// and with a 0 baseline that volume landed in the wrong bar, on every
+    /// timeframe whose bucket edge the 60 s window crossed (a 1 m bar written
+    /// at 150 against a true 50; an equity's whole pre-open auction in its
+    /// 09:15 bars). So the first trade must ALSO carry a day cumulative equal
+    /// to its own last-trade quantity: the whole day's volume is then this
+    /// one trade, whatever was lost. Anything else seeds as before, which can
+    /// under-report a bar but never over-report one.
+    ///
+    /// Honest limits: (1) the first bar's net direction is null, since the
+    /// day's first trade has no earlier price to classify it against; (2) a
+    /// first trade made of two fills between two packets, or larger than the
+    /// wire's 16-bit last-trade quantity (65,535), seeds as before;
+    /// (3) a contract that sends a proof but never trades still holds a slot
+    /// for the day, so slots are bounded by the subscribed set (at most
+    /// 25,000 main-feed instruments), not by the traded set; (4) no proof is
+    /// recorded during a WAL replay (see `record_untraded_proof`).
+    ///
+    /// Until 2026-09-28 the seed ran on every slot, so the day's first trade
+    /// of every contract was missing from its first bar. Cleared with the
+    /// seed at the day reset.
+    untraded_proof_ist_secs: u32,
     /// Replay-gap bookkeeping (plan ITEM 47, 2026-09-29). Bit
     /// `tf.as_ordinal()` set = the OPEN bucket of that timeframe may be
     /// missing ticks that a gapped WAL replay skipped, so it is PARTIAL.
@@ -982,6 +1117,56 @@ impl MultiTfAggregator {
         self.test_capacity_override.unwrap_or(AGGREGATOR_MAX_SLOTS)
     }
 
+    /// Record a live packet proving `key` had not traded yet today (audit
+    /// PR58); see `InstrumentSlot::untraded_proof_ist_secs`. A frame without a
+    /// receipt time (an old WAL format) proves nothing about when, so it is
+    /// ignored, and so is a receipt day earlier than the fold watermark's (a
+    /// replayed frame). A seeded slot needs no proof and keeps none, and a
+    /// proof only ever moves forward in time.
+    ///
+    /// A proof never takes one of the last
+    /// 1/[`UNTRADED_PROOF_SLOT_RESERVE_DIVISOR`] of the slot table: those stay
+    /// for keys that actually trade, so a burst of never-traded contracts
+    /// cannot use up the table ahead of the keys that trade and
+    /// push a trading key into `slot_exhausted`. Past that line the proof is
+    /// simply not kept: no counter, no log, and the key seeds as before.
+    ///
+    /// O(1): one hash probe, plus one push into the pre-sized slot table on
+    /// first sight.
+    fn record_untraded_proof(&mut self, key: CompositeKey, received_at_nanos: i64) {
+        // Never during a WAL replay (review 2026-10-01): a proof-created slot
+        // is unseeded at the hand-over, `finish_replay` gives it the hand-over
+        // gap, and its first live trade then withholds the first bar of every
+        // timeframe. The live connect snapshot proves the key again.
+        if self.replay_mode {
+            return;
+        }
+        let Some(proof) = receipt_ist_secs_of(received_at_nanos) else {
+            return;
+        };
+        if proof / 86_400 < self.watermark_secs / 86_400 {
+            return;
+        }
+        let idx = if let Some(&idx) = self.index.get(&key) {
+            Some(idx as usize)
+        } else {
+            let capacity = self.effective_capacity();
+            let proof_ceiling =
+                capacity.saturating_sub(capacity / UNTRADED_PROOF_SLOT_RESERVE_DIVISOR);
+            if self.slots.len() >= proof_ceiling {
+                return;
+            }
+            // Below the ceiling, so `slot_index` creates the slot and never
+            // reaches its exhaustion arm.
+            self.slot_index(key)
+        };
+        if let Some(slot) = idx.and_then(|idx| self.slots.get_mut(idx))
+            && !slot.volume_baseline_seeded
+        {
+            slot.untraded_proof_ist_secs = slot.untraded_proof_ist_secs.max(proof);
+        }
+    }
+
     /// Resolves a composite identity to its dense slot, allocating on first
     /// sight. `None` ONLY at [`AGGREGATOR_MAX_SLOTS`] — fail-closed and loud.
     ///
@@ -1096,6 +1281,7 @@ impl MultiTfAggregator {
             // Deliberately NOT a baseline — see the field doc. The first tick
             // this slot folds replaces it with a real observation.
             volume_baseline_seeded: false,
+            untraded_proof_ist_secs: 0,
             // A new slot's first buckets are partial in every mode: the tick
             // that opens them seeds the baseline and adds none of its own
             // volume, and during a replay the frames before it may have been
@@ -1272,6 +1458,15 @@ impl MultiTfAggregator {
             crate::candles::fold_counters::fold_counters()
                 .tick_untraded_timestamp
                 .increment(1);
+            // Audit PR58: no last trade time AND no price means no trade yet
+            // today. A zero time beside a real price contradicts itself and is
+            // no proof.
+            if tick.last_traded_price == 0.0 {
+                self.record_untraded_proof(
+                    (feed, tick.security_id, tick.exchange_segment_code),
+                    tick.received_at_nanos,
+                );
+            }
             return ConsumeStats {
                 untraded_timestamp: true,
                 ..ConsumeStats::default()
@@ -1356,6 +1551,19 @@ impl MultiTfAggregator {
             crate::candles::fold_counters::fold_counters()
                 .tick_refused_untraded_sentinel
                 .increment(1);
+            // Audit PR58: a zero price is "never traded", which proves the day's
+            // first trade has not happened yet, but only beside a last-trade
+            // time from an earlier day. A zero price stamped with a trade time
+            // of today contradicts itself and is no proof (measured: ~22,000
+            // zero-price packets a session carry a valid time).
+            if receipt_ist_secs_of(tick.received_at_nanos)
+                .is_some_and(|receipt| tick.exchange_timestamp / 86_400 < receipt / 86_400)
+            {
+                self.record_untraded_proof(
+                    (feed, tick.security_id, tick.exchange_segment_code),
+                    tick.received_at_nanos,
+                );
+            }
             return ConsumeStats {
                 untraded_sentinel: true,
                 ..ConsumeStats::default()
@@ -1531,6 +1739,11 @@ impl MultiTfAggregator {
                 crate::candles::fold_counters::fold_counters()
                     .tick_refused_stale_trading_day
                     .increment(1);
+                // Audit PR58: an earlier-day last trade proves no trade yet today.
+                self.record_untraded_proof(
+                    (feed, tick.security_id, tick.exchange_segment_code),
+                    tick.received_at_nanos,
+                );
                 return ConsumeStats {
                     stale_trading_day: true,
                     receipt_day_mismatch: true,
@@ -1573,6 +1786,9 @@ impl MultiTfAggregator {
             crate::candles::fold_counters::fold_counters()
                 .tick_refused_stale_trading_day
                 .increment(1);
+            // Audit PR58: deliberately NO proof here. This gate fires on a
+            // replayed or out-of-order frame, whose receipt time says nothing
+            // about whether the key has traded yet today.
             return ConsumeStats {
                 stale_trading_day: true,
                 ..ConsumeStats::default()
@@ -1777,10 +1993,29 @@ impl MultiTfAggregator {
         }
         if !slot.volume_baseline_seeded {
             slot.volume_baseline_seeded = true;
-            slot.last_cumulative = cumulative_volume;
-            crate::candles::fold_counters::fold_counters()
-                .slot_volume_baseline_seeded
-                .increment(1);
+            // Audit PR58: a key proven untraded today starts from a real 0,
+            // so this first trade lands in its bar. See the field doc. The day
+            // cumulative must also EQUAL this packet's last-trade quantity
+            // (review 2026-10-01): then the whole day's volume is this one
+            // trade. Without it a lost first-trade packet, a stalled read or a
+            // stale snapshot put earlier volume in this bar (a 1 m bar written
+            // at 150 against a true 50). O(1): one compare.
+            if untraded_proof_holds(
+                slot.untraded_proof_ist_secs,
+                fold_secs,
+                tick.exchange_segment_code,
+            ) && u64::from(tick.last_trade_quantity) == cumulative_volume
+            {
+                slot.last_cumulative = 0;
+                crate::candles::fold_counters::fold_counters()
+                    .slot_volume_baseline_zero
+                    .increment(1);
+            } else {
+                slot.last_cumulative = cumulative_volume;
+                crate::candles::fold_counters::fold_counters()
+                    .slot_volume_baseline_seeded
+                    .increment(1);
+            }
         }
         if gap_now {
             slot.last_cumulative = cumulative_volume;
@@ -2480,6 +2715,7 @@ impl MultiTfAggregator {
             // UNSEEDED, not to a fabricated `0` baseline.
             slot.last_cumulative = 0;
             slot.volume_baseline_seeded = false;
+            slot.untraded_proof_ist_secs = 0;
             // Nothing carries across the day boundary, so neither does a
             // late tick's mark on the next bucket (review round 7), nor a
             // hand-over still waiting for this instrument's first live trade:
@@ -6450,6 +6686,13 @@ mod tests {
             .bar_for_window(Feed::Dhan, 77, SEG_IDX, TfIndex::S1, OPEN)
             .expect("the window that just closed is still reachable");
         assert_eq!(closed.bucket_start_ist_secs, OPEN);
+
+        // The window still open is answered from the open bar itself.
+        let still_open = agg
+            .bar_for_window(Feed::Dhan, 77, SEG_IDX, TfIndex::S1, OPEN + 1)
+            .expect("the open window is reachable");
+        assert_eq!(still_open.bucket_start_ist_secs, OPEN + 1);
+        assert_eq!(still_open.volume, open.volume);
     }
 
     /// A window the cell holds NEITHER open NOR last-sealed is refused, not
@@ -7251,6 +7494,376 @@ mod tests {
             "second minute must baseline on 5_000 (the high-water cumulative), \
              never on the late tick's stale 2_000"
         );
+    }
+
+    // -- audit PR58 (2026-09-28): the day's first trade is in its first bar --
+
+    const FIRST_SID: u64 = 58_780;
+
+    /// A live tick received at IST second `receipt_ist`.
+    fn live(ts: u32, price: f32, cum: u32, receipt_ist: u32) -> ParsedTick {
+        let mut t = tick(FIRST_SID, 2, ts, price, cum);
+        t.received_at_nanos = (i64::from(receipt_ist) - 19_800) * 1_000_000_000;
+        t
+    }
+
+    /// The day's first trade: its last-trade quantity is the whole day
+    /// cumulative, as Dhan reports it when nothing traded before it.
+    fn first_trade(ts: u32, price: f32, cum: u16, receipt_ist: u32) -> ParsedTick {
+        let mut t = live(ts, price, u32::from(cum), receipt_ist);
+        t.last_trade_quantity = cum;
+        t
+    }
+
+    fn bar_volume(agg: &MultiTfAggregator, tf: TfIndex) -> u64 {
+        agg.snapshot(Feed::Dhan, FIRST_SID, 2, tf)
+            .map_or(u64::MAX, |st| st.volume)
+    }
+
+    /// Feeds one Dhan tick with no override, dropping any seal.
+    fn push(agg: &mut MultiTfAggregator, t: &ParsedTick) -> ConsumeStats {
+        agg.consume_tick(Feed::Dhan, t, None, |_, _, _, _, _| {})
+    }
+
+    #[test]
+    fn untraded_proof_holds_only_for_a_fresh_same_day_proof() {
+        const FNO: u8 = 2;
+        const EQ: u8 = 1;
+        // No proof, or a proof from another day.
+        assert!(!untraded_proof_holds(0, OPEN + 2, FNO));
+        assert!(!untraded_proof_holds(OPEN - 86_400, OPEN + 2, FNO));
+        // An option's connect snapshot at 09:00:30, first trade 09:15:02: no
+        // option trades before the open, so the proof counts from it (2 s).
+        assert!(untraded_proof_holds(CANDLE_OPEN + 30, OPEN + 2, FNO));
+        // The same proof for an EQUITY does not: its pre-open auction can
+        // match after 09:00:30, and that volume must not land in 09:15.
+        assert!(!untraded_proof_holds(CANDLE_OPEN + 30, OPEN + 2, EQ));
+        // An equity proof taken after the auction matched (09:13) may count
+        // from the open, since nothing trades between 09:12 and 09:15.
+        assert!(untraded_proof_holds(OPEN - 120, OPEN + 2, EQ));
+        // The option proof and a first trade at 10:00: an outage could have
+        // hidden a morning of trades, so it does not hold.
+        assert!(!untraded_proof_holds(CANDLE_OPEN + 30, OPEN + 2_700, FNO));
+        // A book update 5 s before a mid-morning first trade: holds.
+        assert!(untraded_proof_holds(OPEN + 6_000, OPEN + 6_005, EQ));
+        // Exactly at the bound holds; one past does not.
+        assert!(untraded_proof_holds(
+            OPEN + 6_000,
+            OPEN + 6_000 + UNTRADED_PROOF_MAX_AGE_SECS,
+            FNO
+        ));
+        assert!(!untraded_proof_holds(
+            OPEN + 6_000,
+            OPEN + 6_001 + UNTRADED_PROOF_MAX_AGE_SECS,
+            FNO
+        ));
+        // An equity's own pre-open match counts from the proof.
+        assert!(untraded_proof_holds(
+            CANDLE_OPEN + 400,
+            CANDLE_OPEN + 430,
+            EQ
+        ));
+        // A proof received a moment after the trade stamp (clock skew) holds
+        // up to the skew bound, and not past it.
+        assert!(untraded_proof_holds(OPEN + 7, OPEN + 5, FNO));
+        assert!(untraded_proof_holds(
+            OPEN + 100,
+            OPEN + 100 - UNTRADED_PROOF_MAX_SKEW_SECS,
+            FNO
+        ));
+        assert!(!untraded_proof_holds(
+            OPEN + 100,
+            OPEN + 99 - UNTRADED_PROOF_MAX_SKEW_SECS,
+            FNO
+        ));
+        // An equity proof AT 09:12:00 is too close to the auction to extend.
+        assert!(!untraded_proof_holds(OPEN - 180, OPEN + 2, EQ));
+        // Extreme inputs never panic.
+        for (proof, trade) in [
+            (u32::MAX, u32::MAX),
+            (u32::MAX, u32::MAX - 1),
+            (u32::MAX - 1, u32::MAX),
+            (1, 0),
+            (1, u32::MAX),
+        ] {
+            for seg in [0, EQ, FNO, 8, u8::MAX] {
+                let _ = untraded_proof_holds(proof, trade, seg);
+            }
+        }
+    }
+
+    #[test]
+    fn the_days_first_trade_lands_in_its_first_bar_after_a_stale_snapshot() {
+        // BITE PROOF: without the PR58 proof the first tick seeds the baseline
+        // at 650 and both bars read 0.
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        // Friday's close carried in Monday's 09:00:30 connect snapshot.
+        let stale = push(
+            &mut agg,
+            &live(OPEN - 3 * 86_400 + 22_500, 12.5, 90_000, CANDLE_OPEN + 30),
+        );
+        assert!(stale.stale_trading_day);
+        let first = push(&mut agg, &first_trade(OPEN + 2, 13.0, 650, OPEN + 2));
+        assert!(first.folded());
+        assert_eq!(bar_volume(&agg, TfIndex::S5), 650, "09:15:00 5 s bar");
+        assert_eq!(bar_volume(&agg, TfIndex::M1), 650, "09:15 1 m bar");
+        // The next trade still counts only its own quantity.
+        let _ = push(&mut agg, &live(OPEN + 3, 13.05, 700, OPEN + 3));
+        assert_eq!(bar_volume(&agg, TfIndex::M1), 700);
+    }
+
+    #[test]
+    fn a_never_traded_zero_price_is_also_proof_of_no_trade_yet() {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let sentinel = push(&mut agg, &live(OPEN - 86_400 + 22_000, 0.0, 0, OPEN + 1));
+        assert!(sentinel.untraded_sentinel);
+        let _ = push(&mut agg, &first_trade(OPEN + 4, 9.0, 75, OPEN + 4));
+        assert_eq!(bar_volume(&agg, TfIndex::M1), 75);
+    }
+
+    #[test]
+    fn a_first_trade_long_after_the_proof_still_seeds() {
+        // A socket that was down from 09:01 to 10:00: the reconnect snapshot
+        // carries every trade of the outage, so it must not all land in the
+        // 10:00 bar. It seeds, as before PR58.
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let _ = push(
+            &mut agg,
+            &live(OPEN - 86_400 + 22_000, 12.5, 90_000, CANDLE_OPEN + 30),
+        );
+        let _ = push(&mut agg, &live(OPEN + 2_700, 13.0, 48_000, OPEN + 2_700));
+        assert_eq!(bar_volume(&agg, TfIndex::M1), 0);
+    }
+
+    #[test]
+    fn a_frame_with_no_receipt_is_no_proof() {
+        // An old WAL frame carries no receipt, so it says nothing about when.
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let mut no_receipt = live(OPEN - 86_400 + 22_000, 0.0, 0, OPEN + 1);
+        no_receipt.received_at_nanos = 0;
+        let _ = push(&mut agg, &no_receipt);
+        agg.record_untraded_proof((Feed::Dhan, FIRST_SID, 2), 0);
+        agg.record_untraded_proof((Feed::Dhan, FIRST_SID, 2), -1);
+        assert!(
+            !agg.index.contains_key(&(Feed::Dhan, FIRST_SID, 2)),
+            "no receipt, no proof and no slot"
+        );
+        let _ = push(&mut agg, &live(OPEN + 4, 9.0, 75, OPEN + 4));
+        assert_eq!(bar_volume(&agg, TfIndex::M1), 0);
+    }
+
+    #[test]
+    fn the_day_reset_clears_the_untraded_proof() {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let _ = push(&mut agg, &live(OPEN - 86_400 + 22_000, 0.0, 0, OPEN + 1));
+        let key = (Feed::Dhan, FIRST_SID, 2);
+        assert_eq!(
+            agg.slots[agg.index[&key] as usize].untraded_proof_ist_secs,
+            OPEN + 1
+        );
+        let _ = agg.force_seal_all(|_, _, _, _, _| {});
+        let idx = agg.slot_index((Feed::Dhan, FIRST_SID, 2)).expect("slot");
+        assert_eq!(agg.slots[idx].untraded_proof_ist_secs, 0);
+    }
+
+    /// A live tick of segment `seg` received at IST second `receipt_ist`.
+    fn live_seg(seg: u8, ts: u32, price: f32, cum: u32, receipt_ist: u32) -> ParsedTick {
+        let mut t = live(ts, price, cum, receipt_ist);
+        t.exchange_segment_code = seg;
+        t
+    }
+
+    #[test]
+    fn a_zero_last_trade_time_is_also_proof_of_no_trade_yet() {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let untraded = push(&mut agg, &live(0, 0.0, 0, OPEN + 1));
+        assert!(untraded.untraded_timestamp);
+        let _ = push(&mut agg, &first_trade(OPEN + 4, 9.0, 75, OPEN + 4));
+        assert_eq!(bar_volume(&agg, TfIndex::M1), 75);
+    }
+
+    #[test]
+    fn test_regression_a_lost_first_trade_never_lands_in_the_next_minute() {
+        // Review 2026-10-01 (BITE PROOF: without the last-trade-quantity check
+        // the 09:26 minute read 150 against a true 50). The proof is fresh,
+        // but the packet of the day's first trade (100 at 09:25:58) was lost,
+        // so the next trade's cumulative (150) is NOT its own quantity (50).
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let proof_at = OPEN + 630;
+        let _ = push(
+            &mut agg,
+            &live(OPEN - 86_400 + 22_000, 12.5, 9_000, proof_at),
+        );
+        let mut second = live(OPEN + 680, 13.0, 150, OPEN + 680);
+        second.last_trade_quantity = 50;
+        let _ = push(&mut agg, &second);
+        assert_eq!(bar_volume(&agg, TfIndex::M1), 0, "seeds, never 150");
+        assert_eq!(bar_volume(&agg, TfIndex::S1), 0);
+        // The trades after it count only their own quantity.
+        let _ = push(&mut agg, &live(OPEN + 690, 13.1, 175, OPEN + 690));
+        assert_eq!(bar_volume(&agg, TfIndex::M1), 25);
+    }
+
+    #[test]
+    fn test_regression_an_equity_auction_is_never_poured_into_the_open_bar() {
+        // Review 2026-10-01: a reader that stalled read a stale snapshot at
+        // 09:12:30, after the 09:08 auction (50,000) whose packet was missed.
+        // The first trade we fold carries 50,400 against its own 400, so it
+        // seeds instead of writing 50,400 into every 09:15 bar.
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let eq = EXCHANGE_SEGMENT_NSE_EQ;
+        let _ = push(
+            &mut agg,
+            &live_seg(eq, OPEN - 86_400 + 22_000, 500.0, 9_000, OPEN - 150),
+        );
+        let mut t = live_seg(eq, OPEN + 2, 501.0, 50_400, OPEN + 2);
+        t.last_trade_quantity = 400;
+        let _ = push(&mut agg, &t);
+        assert_eq!(
+            agg.snapshot(Feed::Dhan, FIRST_SID, eq, TfIndex::M1)
+                .map_or(u64::MAX, |st| st.volume),
+            0
+        );
+    }
+
+    #[test]
+    fn test_regression_a_currency_proof_is_never_extended_to_the_open() {
+        // Review 2026-10-01: currency and commodity trade from 09:00, so a
+        // proof there counts from its own receipt, never from 09:15.
+        for seg in [3_u8, 5, 7] {
+            assert!(!untraded_proof_holds(OPEN - 120, OPEN + 30, seg));
+            assert!(untraded_proof_holds(OPEN - 20, OPEN + 30, seg));
+        }
+        assert!(untraded_proof_holds(
+            OPEN - 120,
+            OPEN + 30,
+            EXCHANGE_SEGMENT_BSE_FNO
+        ));
+        assert!(untraded_proof_holds(
+            OPEN - 120,
+            OPEN + 30,
+            EXCHANGE_SEGMENT_BSE_EQ
+        ));
+    }
+
+    #[test]
+    fn test_regression_no_proof_is_recorded_during_a_wal_replay() {
+        // Review 2026-10-01 (BITE PROOF: a replayed connect snapshot created an
+        // unseeded slot, `finish_replay` gave it the hand-over gap, and the
+        // first live trade withheld the first bar of every timeframe).
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        agg.set_replay_mode(true);
+        let _ = push(
+            &mut agg,
+            &live(OPEN - 86_400 + 22_000, 12.5, 9_000, CANDLE_OPEN + 30),
+        );
+        assert!(
+            !agg.index.contains_key(&(Feed::Dhan, FIRST_SID, 2)),
+            "no proof slot during a replay"
+        );
+    }
+
+    #[test]
+    fn a_zero_field_beside_a_live_one_is_no_proof() {
+        // A zero price stamped with a trade time of TODAY, and a zero trade
+        // time beside a real price, each contradict themselves: no proof, so
+        // the first trade seeds as before PR58.
+        let key = (Feed::Dhan, FIRST_SID, 2);
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let zero_price_today = push(&mut agg, &live(OPEN + 1, 0.0, 0, OPEN + 1));
+        assert!(zero_price_today.untraded_sentinel);
+        let zero_time_priced = push(&mut agg, &live(0, 14.0, 0, OPEN + 2));
+        assert!(zero_time_priced.untraded_timestamp);
+        assert!(!agg.index.contains_key(&key));
+        let _ = push(&mut agg, &live(OPEN + 4, 9.0, 75, OPEN + 4));
+        assert_eq!(bar_volume(&agg, TfIndex::M1), 0);
+    }
+
+    #[test]
+    fn an_equity_whose_pre_open_match_packet_was_lost_still_seeds() {
+        // An equity's 09:05 snapshot proves no trade yet, but the 09:08
+        // pre-open match can trade after it. If that packet is lost, the first
+        // accepted trade at 09:15:02 carries the match volume, which must not
+        // land in the 09:15 bar. It seeds, as before PR58.
+        const EQ: u8 = 1;
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let stale = push(
+            &mut agg,
+            &live_seg(
+                EQ,
+                OPEN - 86_400 + 22_000,
+                810.0,
+                900_000,
+                CANDLE_OPEN + 300,
+            ),
+        );
+        assert!(stale.stale_trading_day);
+        let _ = push(&mut agg, &live_seg(EQ, OPEN + 2, 812.0, 40_000, OPEN + 2));
+        assert_eq!(
+            agg.snapshot(Feed::Dhan, FIRST_SID, EQ, TfIndex::M1)
+                .map_or(u64::MAX, |st| st.volume),
+            0
+        );
+    }
+
+    #[test]
+    fn a_replayed_prior_day_frame_leaves_no_proof() {
+        // Another key trades today, so the watermark is on today.
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let mut today = live(OPEN + 10, 20.0, 100, OPEN + 10);
+        today.security_id = FIRST_SID + 1;
+        assert!(push(&mut agg, &today).folded());
+        // A frame from yesterday's session, received yesterday: the receipt
+        // day gate passes it and the watermark gate refuses it. No proof.
+        let replayed = push(
+            &mut agg,
+            &live(OPEN - 86_400 + 100, 12.0, 5_000, OPEN - 86_400 + 101),
+        );
+        assert!(replayed.stale_trading_day);
+        assert!(!replayed.receipt_day_mismatch);
+        // Yesterday's never-traded packet, replayed today: no proof either.
+        let sentinel = push(
+            &mut agg,
+            &live(OPEN - 2 * 86_400 + 100, 0.0, 0, OPEN - 86_400 + 101),
+        );
+        assert!(sentinel.untraded_sentinel);
+        assert!(!agg.index.contains_key(&(Feed::Dhan, FIRST_SID, 2)));
+        // So today's first trade seeds.
+        let _ = push(&mut agg, &live(OPEN + 20, 13.0, 650, OPEN + 20));
+        assert_eq!(bar_volume(&agg, TfIndex::M1), 0);
+    }
+
+    #[test]
+    fn a_proof_moves_only_forward_in_time() {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let key = (Feed::Dhan, FIRST_SID, 2);
+        agg.record_untraded_proof(key, (i64::from(OPEN + 30) - 19_800) * 1_000_000_000);
+        agg.record_untraded_proof(key, (i64::from(OPEN + 10) - 19_800) * 1_000_000_000);
+        let idx = agg.index[&key] as usize;
+        assert_eq!(agg.slots[idx].untraded_proof_ist_secs, OPEN + 30);
+    }
+
+    #[test]
+    fn a_proof_never_takes_the_slots_kept_for_trading_keys() {
+        // Capacity 20: proofs may create slots only below 19 (the last 1/20
+        // is kept), and never count or log an exhaustion.
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        agg.force_capacity_for_test(20);
+        for sid in 0..19_u64 {
+            let mut t = live(OPEN + 1, 10.0, 10, OPEN + 1);
+            t.security_id = 90_000 + sid;
+            assert!(push(&mut agg, &t).folded());
+        }
+        let proof = push(&mut agg, &live(OPEN - 86_400 + 22_000, 0.0, 0, OPEN + 2));
+        assert!(proof.untraded_sentinel);
+        assert!(!proof.slot_exhausted);
+        assert_eq!(agg.slots.len(), 19, "the proof did not take the kept slot");
+        assert_eq!(agg.slots_exhausted_total, 0);
+        // The kept slot goes to a key that trades.
+        let traded = push(&mut agg, &live(OPEN + 3, 9.0, 75, OPEN + 3));
+        assert!(traded.folded());
+        assert_eq!(agg.slots.len(), 20);
+        assert_eq!(agg.slots_exhausted_total, 0);
     }
 
     #[test]
@@ -8157,9 +8770,13 @@ mod tests {
             !stats.future_trading_day,
             "the mirror arm must not also fire — the two are exclusive"
         );
+        // Since audit PR58 the refusal may take a slot, to hold its "not
+        // traded yet today" proof, but it still opens no bucket.
         assert!(
-            agg.lookup(Feed::Dhan, 66_422, SEG_IDX).is_none(),
-            "and it must not take a slot or open a bucket on a day that closed"
+            TfIndex::ALL.iter().all(|&tf| agg
+                .snapshot(Feed::Dhan, 66_422, SEG_IDX, tf)
+                .is_none_or(|s| s.bucket_start_ist_secs == 0)),
+            "and it must not open a bucket on a day that closed"
         );
     }
 
@@ -8264,7 +8881,9 @@ mod tests {
              DAYS, which is the only question this gate asks."
         );
         assert!(
-            agg.lookup(Feed::Dhan, 66_422, SEG_IDX).is_none(),
+            TfIndex::ALL.iter().all(|&tf| agg
+                .snapshot(Feed::Dhan, 66_422, SEG_IDX, tf)
+                .is_none_or(|s| s.bucket_start_ist_secs == 0)),
             "and a refused tick must open no bucket"
         );
     }
@@ -11135,9 +11754,12 @@ mod day_gate_permutation_sweep {
             "the measured 34-day maximum must be refused — this is the top of \
              the envelope, not a hypothetical"
         );
+        // Audit PR58: it may take a slot for its proof; it opens no bucket.
         assert!(
-            agg.lookup(Feed::Dhan, 66_422, SEG_IDX).is_none(),
-            "and it must not take a slot"
+            TfIndex::ALL.iter().all(|&tf| agg
+                .snapshot(Feed::Dhan, 66_422, SEG_IDX, tf)
+                .is_none_or(|s| s.bucket_start_ist_secs == 0)),
+            "and it must not open a bucket"
         );
     }
 

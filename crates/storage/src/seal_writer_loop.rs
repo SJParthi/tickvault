@@ -322,6 +322,10 @@ fn record_boot_drain_observability(outcome: &BootDrainOutcome) {
         metrics::counter!("tv_seal_writer_drain_total", "kind" => "boot_append_failed")
             .increment(outcome.seals_append_failed as u64);
     }
+    if outcome.seals_superseded > 0 {
+        metrics::counter!("tv_seal_writer_drain_total", "kind" => "boot_superseded")
+            .increment(outcome.seals_superseded as u64);
+    }
     let _ = report_unrecovered_seals(
         UnrecoveredStage::BootDrain,
         outcome
@@ -894,6 +898,7 @@ pub async fn run_seal_writer_loop(
             seals_left_pending = boot.seals_left_pending,
             records_undecodable = boot.records_undecodable,
             seals_append_failed = boot.seals_append_failed,
+            seals_superseded = boot.seals_superseded,
             "seal writer boot recovery drain finished"
         );
     }
@@ -1488,6 +1493,10 @@ mod tests {
                 seals_left_pending: 7,
                 ..Default::default()
             },
+            BootDrainOutcome {
+                seals_superseded: 5,
+                ..Default::default()
+            },
         ] {
             record_boot_drain_observability(&outcome);
         }
@@ -1503,6 +1512,7 @@ mod tests {
             seals_left_pending: 50,
             records_undecodable: 2,
             seals_append_failed: 3,
+            seals_superseded: 4,
         });
     }
 
