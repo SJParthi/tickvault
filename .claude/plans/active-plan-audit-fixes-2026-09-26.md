@@ -1276,19 +1276,54 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
   - PR15's tests do not prove batching, the pause or the real replay
     (seal_writer_runner.rs:1811-1846; seal_writer_task.rs:2560-2598): assert write counts, test
     replay under a no-op pause, and add an outage-and-recovery chaos test.
-- [ ] **PR41 — a replayed candle never replaces a fuller one, and one stuck spill file never
-  holds the rest.** (`storage`, `trading`)
-  - A replayed seal overwrites a newer corrected candle (a late trade re-folded a sealed bar),
-    uncounted (seal_writer_task.rs:903-917, :1127-1175; aggregator_cell.rs:261-268). PR31 states
-    the never-replace rule for restarts only, and PR31a did not change this path: the honest-limits
-    comment on the current checkout (95cf140, after #1962) still says "Last write wins"
-    (seal_writer_task.rs:986-989). Skip or version a replayed seal older than the stored row, and
-    count it, in both the mid-session replay and the boot drain. The check is shared with PR31b's
-    "never let it replace a row with more volume".
+- PR41 — a replayed candle never replaces a fuller one, and one stuck spill file never holds the
+  rest. (`storage`, `trading`) Split 2026-10-01 into PR41a (the never-replace rule and the file
+  order) and PR41b (the stuck file, the suspect table, the replay gate and the record checksum).
+- [x] **PR41a — a replayed candle never replaces a fuller one.** (`storage`)
+  - A replayed seal overwrote a newer corrected candle (a late trade re-folded a sealed bar),
+    uncounted (seal_writer_task.rs:903-917, :1127-1175; aggregator_cell.rs:261-268). The honest
+    limit said "Last write wins" (seal_writer_task.rs:986-989).
+  - Verified before the change: only the most recently sealed bucket of a timeframe can be amended
+    (`aggregator_cell.rs`, both `AmendedLate` arms compare against `last_sealed[ord]`), and every
+    later copy of a bar has more ticks (`fold_late_hlc` adds one) or more volume (the day-close
+    carry). So "fuller" is `(tick_count, volume)` in that order, and one entry per slot and
+    timeframe is enough.
+  - Done 2026-10-01: `seal_spill_ledger.rs`. The spill writer keeps, under its append lock, the
+    newest spilled bucket of every `(security_id, segment, feed, timeframe)` and that copy's
+    fullness; capacity `SEAL_SPILL_LEDGER_CAPACITY` = `SEAL_BUFFER_CAPACITY`, allocated once,
+    never grown, O(1) per operation. (1) After every clean live flush, `drain_once` calls
+    `SealAbsorptionPipeline::note_live_commits`: a committed copy fuller than the spilled one is
+    appended to the spill behind it, so every replay ends on it (one atomic load when nothing was
+    spilled this process). (2) A spill append of a copy less full than the one held is not
+    written. (3) The mid-session replay drops a record the spill holds a fuller copy of
+    (`SealSpillWriter::replay_is_superseded`). (4) The boot drain never writes a copy less full
+    than one it already wrote in that drain (`BootDrainOutcome::seals_superseded`), which covers a
+    dead-letter file holding an older copy than a spill file read before it.
+  - Done 2026-10-01: staged files replay oldest write first, name second (`sort_by_write_time`),
+    in both the boot drain and the mid-session replay. Name order put a day file before the file
+    set aside from the same day (`<name>.<n>`), although the set-aside part was written first.
+  - Counted: `tv_seal_spill_superseded_total{kind="mirrored"|"older_not_written"|
+    "replay_older_skipped"|"mirror_failed"|"untracked"}` and
+    `tv_seal_writer_drain_total{kind="boot_superseded"}`. A failed mirror append is a coded
+    `error!` (AGGREGATOR-SEAL-01).
+  - Honest limits: a crash between a live flush and its mirror append (one drain cycle), or a
+    failed mirror append, still lets the next replay write the older copy over the stored row.
+    The boot drain does not read the stored row to compare (a database read per recovered seal).
+    PR31b's restart rebuild shares the rule but not this mechanism.
+  - Tests: `seal_spill_ledger::tests::*` (6),
+    `pr41a_an_amended_copy_committed_live_is_appended_behind_its_spilled_original`,
+    `pr41a_an_older_copy_is_not_appended_after_the_fuller_one`,
+    `test_pr41a_replay_is_superseded_when_the_spill_holds_a_fuller_copy`,
+    `test_pr41a_note_live_commits_does_nothing_while_the_spill_has_held_nothing`,
+    `pr41a_a_failed_mirror_append_is_counted_and_reported_as_nothing_appended`,
+    `pr41a_mid_session_replay_writes_only_the_fuller_copy`,
+    `pr41a_boot_drain_never_writes_an_older_copy_after_a_fuller_one`,
+    `pr41a_boot_drain_writes_both_copies_when_the_older_comes_first`,
+    `pr41a_staged_files_replay_oldest_write_first`.
+- [ ] **PR41b — one stuck spill file never holds the rest.** (`storage`)
   - A candle the replay cannot flush is skipped and later files wait
     (seal_writer_task.rs:1209-1262): tell a flapping database from a bad record before skipping,
     and move past a stuck file.
-  - Staged spill files replay in name order (seal_writer_task.rs:476, :1109): sort by write time.
   - The replay trusts acknowledgements while the table is suspect (seal_writer_task.rs:1026-1040):
     keep the file until the table is healthy.
   - The replay gate opens only on live traffic, so a spill made after the last live write waits
@@ -1296,6 +1331,7 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
   - The candle spill has no record checksum (row 136, seal_spill.rs:832-841, :907-916): cut back a
     torn single-record write the way the batch does, check alignment before a batch, add a
     checksum.
+  - Row 36 (c6#36): replay the dead-letter file mid-session, or record boot-only replay.
 - [ ] **PR42 — order and P&L audit rows survive a database outage.** (`storage`, `app`, deploy)
   - Order and P&L audit rows are thrown away while the database is down
     (order_audit_persistence.rs:478-521; pnl_audit_persistence.rs:488;
@@ -1588,7 +1624,8 @@ Source: `/mnt/project-files/audit/recheck7-gaps.md` (15 ranked items and the per
 each with file:line). "Verified" below means this thread read the code on `origin/main` at
 13e405f. Every other line is carried from the re-check and is re-verified when its item starts.
 
-Order of work: PR #1975 (D3a) finishes first. Then PR53 (it can destroy a kept table), D3b, D3c,
+Order of work: PR #1975 (D3a) finishes first. Then PR53 (it can destroy a kept table), D3b, D3c-1,
+PR58 (every day's first trade is missing from its first candle), PR59 (read-only query), D3c-2, D3c-3,
 PR54, PR55, PR56, PR57, then the order already set: PR41, PR31b, PR42–PR50, PR31c, PR32–PR39, PR51,
 the PR4c follow-ups, PR52. PR30b stays on or after 2026-10-01.
 
@@ -1645,6 +1682,75 @@ the PR4c follow-ups, PR52. PR30b stays on or after 2026-10-01.
   row growth over the last minute as the cross-check; (3) every `tv-<env>-*` CloudWatch alarm
   whose state is not OK, by name and since when. Read-only: no action, no restart, no write.
   Any new logic goes in Rust (the `/health` payload); the workflow only prints it.
+- [x] **PR58 — the day's first trade is counted in its first candle.** (`trading` candles, not
+  indicator/strategy) Reported 2026-09-28 by the "Ticks vs Dhan chart mismatch" thread (owner
+  compared HDFCBANK-29Sep2026-780-CE `candles_5s` with Dhan's 5 s chart).
+  - Verified in code (`multi_tf_aggregator.rs`, `consume_tick`): the first ACCEPTED tick of a
+    slot seeds `last_cumulative` with its own day-cumulative volume, so the first bar gets
+    `cum - cum = 0` for that tick. The previous day's connect snapshot is refused earlier
+    (`stale_trading_day`, before the slot lookup) and never seeds, and `force_seal_all` resets
+    the seed at day end. So when the feed is up before the open, the first trade of every
+    contract (cumulative 650, say) is left out of the 09:15 bar on every timeframe.
+  - Seeding is right only when we joined after trading began (a mid-session restart or a late
+    top-up; test `a_mid_session_slot_creation_must_not_put_a_whole_days_volume_in_one_bar`).
+  - Fix: seed at 0 when there is per-slot evidence we were watching before today's first
+    trade: a same-day `stale_trading_day` refusal seen for this key (lookup only, no slot
+    created), or the key's first packet received before the session open. Otherwise keep
+    seeding. O(1) per tick, no allocation; the seeded counter gains a `baseline` label
+    (`zero` / `first_tick`).
+  - Test: stale-day snapshot, then a 09:15:02 trade at cumulative 650 -> the 09:15:00 5 s and
+    1 m bars carry 650; the mid-session test still passes.
+  - As built: the proof is the RECEIPT second of the latest such packet (Dhan re-sends one on
+    every book or open-interest change): a prior-day last-trade time refused by the RECEIPT-day
+    gate, a zero price beside a prior-day trade time, or a zero trade time with a zero price (a
+    zero field beside a live one contradicts itself and is no proof). It moves only forward, and a receipt day
+    before the fold watermark's (a replayed frame) is ignored; the watermark-day gate records
+    no proof. `untraded_proof_holds(proof, trade, segment)` holds only when the first trade is
+    the same IST day, at most `UNTRADED_PROOF_MAX_SKEW_SECS` (5 s) before the proof, and within
+    `UNTRADED_PROOF_MAX_AGE_SECS` (60 s) of the proof, counted from 09:15 only where nothing can
+    trade before it: options always (futures left the subscription 2026-09-18), equities only
+    for a proof taken after the pre-open match (`PRE_OPEN_MATCH_DONE_SECS_OF_DAY_IST`, 09:12, plus
+    the 5 s skew limit).
+    So a socket that was down and reconnects with a morning's cumulative still seeds, and so
+    does an equity whose 09:08 match packet was lost. A refused packet may take a slot to hold
+    the proof, but only below the last 1/20 of the table (`UNTRADED_PROOF_SLOT_RESERVE_DIVISOR`,
+    23,750 of 25,000, above the measured 22,996 peak), with no exhaustion count or log; it opens
+    no bucket (the three tests that pinned "no slot" now pin "no bucket on any timeframe"). New
+    counter `tv_aggregator_slot_volume_baseline_zero_total`.
+  - Limitations (stated in the code): if the first trade's packet is lost and the next trade
+    arrives inside 60 s, that bar carries both, so a 1 s / 3 s / 5 s bar can hold up to 60 s of
+    volume after such a gap (before PR58 both were missing), and the window stretches by any
+    read lag, since the proof is when we READ the packet. The option rule keys on the segment
+    code, so if futures (which have a pre-open) return it must key on the instrument type. Nothing yet compares our first bar
+    with Dhan's own chart; PR59's read-only query is the tool for that check on the live box.
+  - Review 2026-10-01 (four parallel attack passes after merging main's plan 47): the
+    lost-packet limit above was WORSE than stated, since the 60 s window crosses minute and
+    higher bucket edges (a 1 m bar written at 150 against a true 50; an equity's whole auction
+    in its 09:15 bars). Fixed: the zero baseline also needs the first trade's day cumulative
+    to EQUAL its own last-trade quantity, so it never over-reports
+    (`test_regression_a_lost_first_trade_never_lands_in_the_next_minute`,
+    `test_regression_an_equity_auction_is_never_poured_into_the_open_bar`). No proof is
+    recorded during a WAL replay: a replayed snapshot's slot got the hand-over gap and
+    withheld every first bar (`test_regression_no_proof_is_recorded_during_a_wal_replay`).
+    The 09:15 extension names its segments (`test_regression_a_currency_proof_is_never_extended_to_the_open`).
+    Stated limits: the first bar's net direction is null; proof slots are bounded by the
+    subscribed set, not the traded set.
+  - Docs line (not a bug): candle `volume` is signed (negative on a down bar), while charting
+    "Net Volume" is 0 on a flat bar and compares the first bar with the previous close. Say so
+    where the candle columns are described.
+- [ ] **PR59 — a read-only database query the owner can run on the live box.** (`api` or `app`,
+  `.github/workflows/aws-control.yml`) Asked 2026-09-28 by the "Ticks vs Dhan chart mismatch"
+  thread, to confirm PR58 on real rows (HDFCBANK-29Sep2026-780-CE `ticks` and `candles_5s`).
+  - A `query` action on the existing read-only control workflow: main branch only, same
+    concurrency group as `status`, no restart and no write.
+  - The SQL is validated in Rust, not in shell (Rust-only rule): SELECT or WITH only, one
+    statement (no `;`), a banned-keyword list (INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE,
+    CREATE, RENAME, COPY, BACKUP, SNAPSHOT, VACUUM, REINDEX, GRANT and the rest of QuestDB's
+    write set), and `LIMIT 500` added when absent or capped when larger. The input travels
+    base64-encoded and is never put into a shell command line.
+  - Output is capped at 200 KB, written to the job summary and uploaded as an artifact.
+  - Tests: every banned keyword refused (any case, inside comments and quoted names too), a
+    second statement refused, the limit added and capped, a valid SELECT passed through.
 
 Corrections and widenings to existing items:
 
@@ -1776,7 +1882,7 @@ Rows folded into existing items (the fix is named here so the item carries it):
 - PR10: row 113 (c6#110, also the depth writer's ~10 name checks per row).
 - PR43: row 127 (c6#123, also count and page the spots cut at the 250 cap).
 - PR42: row 188 (c6#169, also the order-update and position-update event writers).
-- PR41: row 36 (c6#36, replay the dead-letter file mid-session, or record boot-only replay
+- PR41b: row 36 (c6#36, replay the dead-letter file mid-session, or record boot-only replay
   below).
 - PR7: rows 115 (c6#112, measure contention on the shared capture counter) and 267 (c6#236,
   time a full 250,000-record shutdown drain on the production volume).
@@ -1812,6 +1918,74 @@ Ticked items with rows still open: D3a (#1975) merged after the audited commit, 
 151 and 154 are re-checked on main when D3b starts. PR53 closes row 226 when it merges. PR36a's
 row 371 waits on the owner typing "rotate". Row 339 is already owned by PR39; the audit's "no
 plan item" is out of date.
+
+### Added 2026-10-01 (reality check on main 6f0b6ca, 8 new problems), riskiest first
+
+Source: the whole-system reality check of 2026-10-01 (artifact "Tickvault Reality Check"). None
+of the eight was in this plan. Owner approval: "bro dont blcok anyhtign evrythign is good to goa
+hea dude okay?" (2026-10-01 11:12 UTC), relayed with "fix the 8 new problems". Owned by the
+reality-check thread; every other item in this plan stays with its own thread. Each R-item is
+verified in source on `origin/main` before its PR; R1 and R2 ship together (two small,
+independent live-path fixes).
+
+- [x] **R1 — a bad day open, high, low or close no longer drops a good tick.** (`storage`)
+  - Verified: `TickRow::from_parsed_tick` refused the whole row when any of LTP or the four day
+    OHLC fields was non-finite (tick_persistence.rs:402-423), with an unthrottled `error!` per
+    tick on the drain; every replay refused the row again, and the candle fold (which reads the
+    LTP) still counted the tick, so `ticks` and `candles_*` disagreed.
+  - Fix: only the LTP is mandatory. A non-finite day OHLC field becomes NULL through the existing
+    optional-price path (`opt_price`, counted on `tv_tick_optional_price_dropped_total`, warn
+    throttled to powers of two), exactly like the average price.
+  - Tests: `a_non_finite_ltp_is_refused_not_emitted_as_a_poison_ilp_row`,
+    `a_non_finite_day_ohlc_field_is_nulled_and_the_tick_is_kept`.
+- [x] **R2 — a tick stamped later today than its receipt cannot freeze a price.** (`app`)
+  - Verified: `SpotPriceStore::record` refused yesterday and tomorrow but stored a same-day
+    future stamp (spot_price_store.rs:384-391); later-time-wins then refused every honest tick
+    as `OlderThanHeld` until that time arrived, and the depth and contract selectors read the
+    frozen price.
+  - Fix: `record` takes the frame's receipt; a trade time more than
+    `FUTURE_TRADE_TIME_SKEW_SECS` (5 s) ahead of the receipt is held at that ceiling and counted
+    on `tv_spot_price_store_future_time_capped_total`. The price is kept (nothing is dropped);
+    no receipt (`<= 0`) means no cap. O(1): one divide and one compare.
+  - Tests: `a_trade_stamped_hours_ahead_of_its_receipt_cannot_freeze_the_price`,
+    `a_trade_inside_the_skew_or_with_no_receipt_is_not_capped`,
+    `trade_time_ceiling_is_the_receipt_in_ist_seconds_plus_the_skew`.
+- [ ] **R3 — a failed token renewal after an 807 pages at once.** (`app`, maybe `core`)
+  - Verified: on renewal failure the 807 path only `warn!`s (dhan_feed_stack.rs:13719-13727);
+    the Critical page waits for the profile watchdog (~30 min).
+  - Fix: route the failure to the existing allowed family (3) page (`TokenRenewalFailed`),
+    coalesced so 16 sockets failing together send one page; `warn!` becomes a coded `error!`.
+    No new Telegram family (noise lock §2 family 3 already covers it).
+- [ ] **R4 — an order update the parser cannot read is flagged, not hidden.** (`core`)
+  - Verified: a frame that fails to deserialise is counted as a non-order message at `debug!`
+    (order_update_connection.rs:961-987), so a vendor format change would drop every order
+    update silently. Paper mode only today.
+  - Fix: a frame shaped like an order update that does not parse is counted on its own counter
+    and logged as a coded `error!` throttled to powers of two with a char-safe preview.
+- [x] **R5 — the candle fold starts a clean day if the process runs past midnight.**
+  (`app`, `trading`) Verified first; if the day-rollover path already handles it, the item
+  closes with the evidence instead of a code change.
+  - Verified: `force_seal_all` is the fold's only day reset and its only caller was the
+    shutdown seal; the drain's midnight branch called only `reset_ranking_daily`. A next-day
+    cumulative below yesterday's (and below the 2^31 restart floor) read as a stale packet, so
+    the day's bars were written at volume 0.
+  - Fix: `LiveIngest::roll_trading_day` runs the day-close seal, then the ranking reset; the
+    midnight branch calls it. Seals the writer refuses are counted on the existing drop total,
+    which the 30 s AGGREGATOR-DROP-01 report already pages. O(slots × TF_COUNT) once a day.
+  - Tests: `roll_trading_day_reseeds_the_fold_so_the_next_day_counts_volume` (control without
+    the roll reads 0, with it 300); the wiring guard
+    `the_ranking_daily_reset_fires_only_on_a_real_midnight_crossing` now pins the roll call.
+- [ ] **R6 — a bar opens at its earliest trade, not its first arrival.** (`trading`) Verified
+  first against the restart differential; ships only if the oracle and the replay rules agree.
+- [ ] **R7 — the instance lock re-reads after renewal and a machine that lost it stops
+  dialling.** (`core`, `app`) SSM has no compare-and-set, so this narrows the window and makes
+  the loss loud; it cannot close the race.
+- [ ] **R8 — the CLAUDE.md speed table matches the code.** (docs) Eight stale rows, both
+  directions, plus rows for R2's cap.
+
+R-items Z+ and guarantee matrix: covered by the shared matrix at the end of this plan. Tick
+path: R1 removes four compares per tick; R2 adds one divide and one compare per spot tick; no
+allocation in either (zero-alloc DHAT gates unchanged).
 
 ## Edge Cases
 

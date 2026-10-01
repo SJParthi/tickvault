@@ -74,6 +74,10 @@ pub(crate) struct FoldCounters {
     pub(crate) cumulative_reanchored: metrics::Counter,
     pub(crate) slot_exhausted: metrics::Counter,
     pub(crate) slot_volume_baseline_seeded: metrics::Counter,
+    /// Slots whose baseline started at a true 0 because a packet had proven
+    /// the key untraded today (audit PR58). The rest of the first ticks are
+    /// on `slot_volume_baseline_seeded`, which counts unattributable volume.
+    pub(crate) slot_volume_baseline_zero: metrics::Counter,
     /// Packets that repeated the previous accepted TRADE exactly — same
     /// last-trade time, same last-traded price, same day-cumulative volume.
     ///
@@ -199,6 +203,9 @@ impl FoldCounters {
             slot_exhausted: metrics::counter!("tv_aggregator_slot_exhausted_total"),
             slot_volume_baseline_seeded: metrics::counter!(
                 "tv_aggregator_slot_volume_baseline_seeded_total"
+            ),
+            slot_volume_baseline_zero: metrics::counter!(
+                "tv_aggregator_slot_volume_baseline_zero_total"
             ),
             repeat_quote: metrics::counter!("tv_candle_repeat_quote_total"),
             refold_partial_suppressed: metrics::counter!(

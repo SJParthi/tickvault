@@ -631,7 +631,10 @@ fn the_ranking_daily_reset_fires_only_on_a_real_midnight_crossing() {
     let lane = production_region(&read_src("src/dhan_feed_stack.rs"));
 
     const GUARD: &str = "if ranking_day != 0 {";
-    const RESET: &str = "ingest.reset_ranking_daily();";
+    // 2026-10-01: the midnight branch calls `roll_trading_day()`, which seals
+    // the candle fold and then runs `reset_ranking_daily()`. Its own body is
+    // pinned by `the_day_roll_seals_the_fold_before_resetting_the_ranking`.
+    const RESET: &str = "ingest.roll_trading_day();";
     const ADOPT: &str = "ranking_day = today;";
 
     for (needle, what) in [
@@ -654,11 +657,41 @@ fn the_ranking_daily_reset_fires_only_on_a_real_midnight_crossing() {
 
     assert!(
         guard_at < reset_at && reset_at < adopt_at,
-        "`reset_ranking_daily()` must sit INSIDE the `ranking_day != 0` block, \
+        "`roll_trading_day()` (which runs `reset_ranking_daily()`) must sit INSIDE the `ranking_day != 0` block, \
          before `ranking_day = today;`. Outside it, the reset runs on the first \
          30-second tick of every drain and destroys the one-shot code-6 \
          PrevClose burst on any mid-session restart — leaving every gainer \
          verdict Unknown and both depth pools frozen on their boot dial for the \
          rest of the session"
+    );
+}
+
+/// The midnight roll seals the candle fold BEFORE it resets the ranking.
+///
+/// Regression: 2026-10-01 (reality check). The midnight branch reset only the
+/// ranking stores, so the fold kept yesterday's cumulative and wrote every
+/// next-day bar below it at volume 0. `roll_trading_day` runs the day-close
+/// seal first; reversed, the seal would write yesterday's bars into the
+/// ranking history the reset had just cleared.
+#[test]
+fn the_day_roll_seals_the_fold_before_resetting_the_ranking() {
+    let lane = production_region(&read_src("src/dhan_feed_stack.rs"));
+    let start = lane
+        .find("pub fn roll_trading_day(&mut self)")
+        .expect("`roll_trading_day` must exist in the production half");
+    let body_end = lane[start..]
+        .find("\n    }\n")
+        .expect("the method body must close");
+    let body = &lane[start..start + body_end];
+
+    let seal_at = body
+        .find("self.seal_open_buckets_at_close()")
+        .expect("the roll must run the day-close seal");
+    let reset_at = body
+        .find("self.reset_ranking_daily()")
+        .expect("the roll must reset the ranking stores");
+    assert!(
+        seal_at < reset_at,
+        "`roll_trading_day` must seal the fold before resetting the ranking"
     );
 }
