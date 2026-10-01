@@ -2034,7 +2034,7 @@ independent live-path fixes).
     never for the mint-cooldown skip or the RESILIENCE-03 refusal, which already page. The
     app-side `warn!` is a coded `error!` throttled to powers of two. Both family (3) bodies now
     name the Dhan live feed sockets. No new Telegram family.
-  - Tests: `stale_credential_failure_pages_*` (3) and the source pin in `token_manager.rs`.
+  - Tests: `test_stale_credential_failure_pages_only_on_terminal_failure_of_the_current_token`, `test_stale_credential_page_latch_fires_once_per_token_generation`, `test_force_renewal_unless_replaced_pages_family_3_once_per_token` (all in `token_manager.rs`).
 - [x] **R4 — an order update the parser cannot read is flagged, not hidden.** (`core`)
   - Verified: a frame that fails to deserialise is counted as a non-order message at `debug!`
     (order_update_connection.rs:961-987), so a vendor format change would drop every order
