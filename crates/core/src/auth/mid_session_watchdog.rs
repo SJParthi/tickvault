@@ -251,8 +251,8 @@ async fn run_watchdog_loop(
                         "the Dhan login profile stayed INVALID after {} automatic \
                          re-logins (~30 minutes apart) — the broker accepts the login \
                          but the account check keeps failing (data plan / segment \
-                         class). The Dhan spot-1m + option-chain pulls are blocked \
-                         until this is fixed on the Dhan portal",
+                         class). The Dhan live price feed cannot \
+                         reconnect until this is fixed on the Dhan portal",
                         state.remint_attempts_this_episode
                     ),
                 });
@@ -369,7 +369,7 @@ async fn run_watchdog_loop(
                                 reason: format!(
                                     "the automatic Dhan token re-mint failed after ~30 minutes \
                                      of the broker rejecting our login ({sanitized}) — the Dhan \
-                                     spot-1m + option-chain pulls are blocked until the token \
+                                     live price feed cannot reconnect until the token \
                                      is fixed"
                                 ),
                             });
