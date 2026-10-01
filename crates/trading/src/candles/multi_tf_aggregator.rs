@@ -2771,6 +2771,44 @@ impl MultiTfAggregator {
         emitted
     }
 
+    /// Withholds every bucket still open, for a process that exits MID-SESSION
+    /// (audit PR31b-2). Returns how many it withheld; each is counted on
+    /// `tv_candle_refold_partial_suppressed_total`.
+    ///
+    /// A bucket still open when the process exits mid-session is missing
+    /// every trade after the exit, so it is not a complete bar. Until
+    /// PR31b-2 the lane's exit ran [`Self::force_seal_all`] at any hour and
+    /// wrote those truncated bars as complete. A restart replays the WAL and
+    /// its restart rules decide which of those buckets may be written; a row
+    /// written here first could only be wrong. A bucket nobody can prove
+    /// complete stays missing, and counted.
+    ///
+    /// The caller seals the complete buckets first with
+    /// [`Self::catch_up_seal_all`] at its usual cutoff, so only buckets a
+    /// running process would also have left open reach this method. After the
+    /// session ends, the caller keeps [`Self::force_seal_all`].
+    ///
+    /// # Complexity
+    /// O(N × [`TF_COUNT`]). COLD: once, at a mid-session exit.
+    pub fn withhold_open_buckets(&mut self) -> usize {
+        let mut withheld = 0_usize;
+        for slot in &mut self.slots {
+            for tf in TfIndex::ALL {
+                if slot.cell.snapshot(tf).is_uninitialised() {
+                    continue;
+                }
+                // Discarded on purpose: the bar is truncated. `force_seal`
+                // also takes it out of the cell, so a later seal of this
+                // aggregator cannot write it either.
+                if slot.cell.force_seal(tf).is_some() {
+                    withheld = withheld.saturating_add(1);
+                    count_replay_partial_suppressed();
+                }
+            }
+        }
+        withheld
+    }
+
     /// Watermark-aware intraday catch-up seal across every instrument: seals
     /// only the buckets whose exclusive end is at or before `cutoff_secs`.
     ///
@@ -5343,6 +5381,38 @@ mod tests {
             m1, 0,
             "ended on a gap: the minute is missing its tail and is held back"
         );
+    }
+
+    /// Audit PR31b-2: a mid-session exit writes no open bucket.
+    #[test]
+    fn test_withhold_open_buckets_writes_no_truncated_bar() {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        let mut written: Vec<(TfIndex, u32)> = Vec::new();
+        for (ts, cum) in [(OPEN + 10, 100), (OPEN + 70, 200), (OPEN + 130, 300)] {
+            agg.consume_tick(Feed::Dhan, &gtick(ts, cum), None, |_, _, _, tf, st| {
+                written.push((tf, st.bucket_start_ist_secs));
+            });
+        }
+        // A clean exit at OPEN + 150: the two complete minutes are sealed by
+        // their roll and the catch-up, and every bucket still open (the third
+        // minute, and every longer frame) is withheld, not written.
+        agg.catch_up_seal_all(OPEN + 120, |_, _, _, tf, st| {
+            written.push((tf, st.bucket_start_ist_secs));
+        });
+        let open_before = TfIndex::ALL
+            .iter()
+            .filter(|tf| !agg.slots[0].cell.snapshot(**tf).is_uninitialised())
+            .count();
+        let withheld = agg.withhold_open_buckets();
+        assert!(written.contains(&(TfIndex::M1, OPEN + 60)));
+        assert!(!written.iter().any(|w| *w == (TfIndex::M1, OPEN + 120)));
+        assert_eq!(withheld, open_before);
+        assert!(withheld > 0);
+        // Nothing is left for a later seal to write.
+        assert_eq!(agg.withhold_open_buckets(), 0);
+        let mut later = 0_usize;
+        agg.force_seal_all(|_, _, _, _, _| later += 1);
+        assert_eq!(later, 0, "a withheld bucket is never written later");
     }
 
     /// Review round 2 (2026-09-29), candle finding 2: with no bucket open,

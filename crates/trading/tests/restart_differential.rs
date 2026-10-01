@@ -12,6 +12,12 @@
 //! copy of the last trade the previous process received (review round 20). Packets
 //! arrive late, out of trade order, repeated, and some never at all.
 //!
+//! In about 3 cases in 10 the previous process does not crash but EXITS
+//! cleanly mid-session (audit PR31b-2), as a deploy or a restart does: its
+//! exit seals the buckets a catch-up sweep would and withholds every bucket
+//! still open. Its old exit seal (`force_seal_all` at any hour) wrote those
+//! buckets truncated, and check 5 fails on it within a second.
+//!
 //! Every bar the restart writes is compared with the truth, and with what the
 //! previous process stored (a third run, live up to the crash):
 //!
@@ -26,7 +32,9 @@
 //!    was known to be captured (the confirmed capture start, or the receipt
 //!    of the packet that ended its gap: neither a repeat of its last
 //!    replayed trade nor stale), or holds its first trade that added volume
-//!    after that packet, which may have been a stale copy.
+//!    after that packet, which may have been a stale copy;
+//! 5. a row the previous process stored for a bucket that had not ended when
+//!    it stopped, and that the restart left in place, equals the truth.
 //!
 //! Beyond the envelope, a bucket holding a trade received after the crash and
 //! more than the catch-up margin (240 s) after the bucket ended is checked by
@@ -107,6 +115,11 @@ struct Case {
     /// Every stock's cumulative starts just below `u32::MAX` and wraps
     /// (review round 25: no run here ever came near the top of the range).
     near_wrap: bool,
+    /// The previous process EXITED cleanly mid-session instead of crashing
+    /// (audit PR31b-2): it sealed what a catch-up sweep would at that
+    /// instant and withheld every bucket still open. Before, its exit seal
+    /// wrote those truncated buckets as complete bars.
+    clean_exit: bool,
 }
 
 fn event() -> impl Strategy<Value = Event> {
@@ -142,6 +155,7 @@ fn case() -> impl Strategy<Value = Case> {
         prop::collection::vec(0u8..3, 4),
         prop::bool::weighted(0.35),
         prop::bool::weighted(0.2),
+        prop::bool::weighted(0.3),
     )
         .prop_map(
             |(
@@ -153,6 +167,7 @@ fn case() -> impl Strategy<Value = Case> {
                 resend_on_subscribe,
                 day_close,
                 near_wrap,
+                clean_exit,
             )| Case {
                 instruments,
                 crash_per_mille,
@@ -162,6 +177,7 @@ fn case() -> impl Strategy<Value = Case> {
                 resend_on_subscribe,
                 day_close,
                 near_wrap,
+                clean_exit,
             },
         )
 }
@@ -392,10 +408,15 @@ fn check(c: &Case) -> Result<(), TestCaseError> {
     // The previous process: live up to the crash. What it sealed is what
     // the database holds for the restart to overwrite.
     let mut stored = Written::default();
-    fold_live(
+    let mut previous = fold_live(
         all.iter().filter(|p| p.received_ms <= crash_ms),
         &mut stored,
     );
+    if c.clean_exit {
+        // The lane's mid-session exit seal (audit PR31b-2).
+        sweep(&mut previous, crash_secs, &mut stored);
+        previous.withhold_open_buckets();
+    }
 
     // The restarted process: replay the WAL (some frames unreadable), hand
     // over, then fold what each socket receives once it listens.
@@ -603,6 +624,25 @@ fn check(c: &Case) -> Result<(), TestCaseError> {
                     continue;
                 }
                 let Some(r) = r else {
+                    // 5. A row the previous process stored for a bucket that
+                    // had not ended when it stopped, and that the restart left
+                    // in place, is what the database keeps, so it must be the
+                    // truth (audit PR31b-2: a clean exit's seal wrote such
+                    // buckets truncated, and nothing else checked them). A
+                    // bucket that ended before the stop may miss a late trade
+                    // received after it; check 2 already allows that.
+                    if let Some(s) = stored
+                        .last
+                        .get(&key)
+                        .filter(|_| u64::from(end) * 1000 > crash_ms)
+                    {
+                        prop_assert!(
+                            t.is_some_and(|t| same(s, t, true)),
+                            "a stored row left in place is wrong ({}): {context}",
+                            describe(Some(s))
+                        );
+                        continue;
+                    }
                     // 4. Missing after the crash: only a bucket that started
                     // before the instrument was known to be captured.
                     if t.is_some() && u64::from(end) * 1000 > crash_ms {

@@ -4677,6 +4677,35 @@ impl LiveIngest {
         (emitted, dropped)
     }
 
+    /// The lane-exit seal for an exit inside the ingest window (audit
+    /// PR31b-2): seals the buckets the catch-up would seal at this instant,
+    /// then withholds every bucket still open
+    /// ([`MultiTfAggregator::withhold_open_buckets`]). Those are missing the
+    /// trades after the exit. A restart the same day replays the WAL and
+    /// writes the ones its restart rules can prove complete; the rest stay
+    /// missing and counted. Writing them here wrote truncated bars as
+    /// complete ones, and a later rewrite could not always fix them.
+    ///
+    /// Returns `(emitted, dropped)` like [`Self::seal_open_buckets_at_close`].
+    ///
+    /// # Complexity
+    /// O(slots × TF). COLD — once, at a mid-session exit.
+    pub fn seal_complete_buckets_at_mid_session_exit(&mut self) -> (u64, u64) {
+        let sealed = self.catch_up_seal();
+        let withheld = self.aggregator.withhold_open_buckets();
+        if withheld > 0 {
+            warn!(
+                code = ErrorCode::WsGapConnectionState.code_str(),
+                withheld,
+                "candle fold: exiting during the session, so {withheld} open bar(s) were not \
+                 written. Each is missing the trades after the exit, so it is left missing \
+                 rather than written short. A restart today rebuilds the ones its frame log \
+                 fully covers."
+            );
+        }
+        sealed
+    }
+
     /// Hands the candle fold over to the live feed, once per lane start,
     /// before the first live frame: records when this process began capturing
     /// ([`MultiTfAggregator::set_live_capture_start`]) and ends any WAL replay
@@ -8093,7 +8122,15 @@ async fn run_frame_drain(
     // Skipping this step entirely is what the code did until 2026-08-11: one
     // bar per instrument per timeframe, discarded every single day, with no
     // counter moving and no log line. See `seal_open_buckets_at_close`.
-    let (close_emitted, close_dropped) = ingest.seal_open_buckets_at_close();
+    //
+    // Only after the session. An exit inside the ingest window (a deploy, a
+    // restart) leaves every open bucket missing its remaining trades, so it
+    // seals only the complete ones and withholds the rest (audit PR31b-2).
+    let (close_emitted, close_dropped) = if is_mid_session_exit(now_ist_secs_of_day()) {
+        ingest.seal_complete_buckets_at_mid_session_exit()
+    } else {
+        ingest.seal_open_buckets_at_close()
+    };
 
     // Flush what is still buffered — the tail of the session is exactly the
     // data a naive shutdown loses.
@@ -16250,6 +16287,16 @@ pub const fn ist_secs_of_day_from_millis(now_millis: u64) -> u64 {
     ist_secs % (tickvault_common::constants::SECONDS_PER_DAY as u64)
 }
 
+/// True when a lane exit at `secs_of_day` (IST) falls inside the ingest
+/// window, 09:00 to `TICK_PERSIST_END_SECS_OF_DAY_IST` (audit PR31b-2). Such
+/// an exit withholds the open bars instead of writing them truncated. Pure
+/// and total, so both boundaries are testable without a clock.
+#[must_use]
+pub const fn is_mid_session_exit(secs_of_day: u64) -> bool {
+    secs_of_day >= tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST as u64
+        && secs_of_day < TICK_PERSIST_END_SECS_OF_DAY_IST as u64
+}
+
 /// Current IST seconds-of-day.
 #[must_use]
 pub fn now_ist_secs_of_day() -> u64 {
@@ -20133,6 +20180,40 @@ mod tests {
             (0, 0),
             "sealing twice must not re-emit already-sealed buckets"
         );
+    }
+
+    /// Audit PR31b-2: an exit inside the session writes no open bar. One
+    /// tick opens a bucket in every timeframe and none has ended, so the
+    /// mid-session exit seals nothing, and nothing is left for a later seal.
+    #[test]
+    fn test_mid_session_exit_writes_no_open_bar() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        let packet = ticker_packet(13, 23_146.45, 1_779_355_000);
+        let ParsedFrame::Tick(tick) =
+            dispatch_frame(&packet, 1_779_355_000_000_000_000).expect("parse")
+        else {
+            panic!("expected a tick");
+        };
+        ingest.ingest_tick(&tick, 1, 1_779_355_000_000);
+
+        assert_eq!(ingest.seal_complete_buckets_at_mid_session_exit(), (0, 0));
+        assert_eq!(
+            ingest.seal_open_buckets_at_close(),
+            (0, 0),
+            "a withheld bar must not be written by a later seal"
+        );
+    }
+
+    #[test]
+    fn test_is_mid_session_exit_covers_the_ingest_window_only() {
+        let start = u64::from(tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST);
+        let end = u64::from(TICK_PERSIST_END_SECS_OF_DAY_IST);
+        assert!(!is_mid_session_exit(0));
+        assert!(!is_mid_session_exit(start - 1));
+        assert!(is_mid_session_exit(start));
+        assert!(is_mid_session_exit(end - 1));
+        assert!(!is_mid_session_exit(end), "15:40 is after the session");
+        assert!(!is_mid_session_exit(17 * 3_600 + 30 * 60), "the 17:30 stop");
     }
 
     /// One NSE_FNO trade at `ist_secs` (IST epoch seconds) with day volume
