@@ -10,7 +10,7 @@
 
 **The rule (§1, verbatim):** **Every new executable / runtime component defaults to Rust with O(1) hot-path discipline — the three principles: (1) zero allocation on the hot path, (2) O(1) or fail at compile time, (3) every version pinned — and any non-Rust executable addition needs a fresh dated operator quote recorded in this file FIRST.** Scope of "executable / runtime": lambdas, sidecars, product-path scripts, services, any process in the product path. Docs/reference/audit MAY mention other languages conceptually.
 
-**Teeth (§2):** the shrinking-allowlist ratchet in `rust_only_guard.rs` ("may only SHRINK, never GROW"); `banned-pattern-scanner.sh`; `hot-path.md`; exact-version pinning in root `Cargo.toml` (`^`/`~`/`*`/`>=` BANNED; `cargo update` BANNED).
+**Teeth (§2):** the shrinking-allowlist ratchet in `rust_only_guard.rs` ("may only SHRINK, never GROW"); the shell budget in `shell_budget_guard.rs` (§0.10: no new shell file, no growth in deploy/operator scripts, no new shell line in a systemd unit); `banned-pattern-scanner.sh`; `hot-path.md`; exact-version pinning in root `Cargo.toml` (`^`/`~`/`*`/`>=` BANNED; `cargo update` BANNED).
 
 **REJECT (§3, verbatim):**
 - Adds a NEW non-Rust runtime executable (lambda, sidecar, product-path script, service) to the product path.
