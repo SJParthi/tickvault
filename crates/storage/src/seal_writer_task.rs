@@ -55,7 +55,10 @@ use tickvault_trading::candles::BufferedSeal;
 
 use crate::seal_absorption::{SealAbsorptionPipeline, SubmitOutcome};
 use crate::seal_dlq::SealDlqRecord;
-use crate::seal_spill::{SEAL_SPILL_FORMAT_VERSION, SEAL_SPILL_RECORD_SIZE, SerializedSeal};
+use crate::seal_spill::{
+    SEAL_SPILL_FORMAT_VERSION, SEAL_SPILL_LEDGER_CAPACITY, SEAL_SPILL_RECORD_SIZE, SerializedSeal,
+};
+use crate::seal_spill_ledger::SpillLedger;
 use crate::shadow_candle_writer::ShadowCandleWriter;
 
 /// Outcome counters for one [`drain_once`] cycle. Maps 1:1 to the
@@ -223,6 +226,10 @@ pub fn drain_once(
     match writer.flush() {
         Ok(()) => {
             outcome.flushed_ok = true;
+            // Audit PR41a: an amended bar committed live while its original
+            // waits in the spill. Append the fuller copy behind it, so no
+            // replay ends on the original.
+            pipeline.note_live_commits(&popped, now_unix_secs);
         }
         Err(flush_err) => {
             // Finding S3: seal-time ILP flush failure is a persist
@@ -417,6 +424,10 @@ pub struct BootDrainOutcome {
     /// (audit PR31): it stays in `replaying/` so the next boot retries it, and
     /// these seals are also counted in `seals_left_pending`.
     pub seals_append_failed: usize,
+    /// Audit PR41a: decoded seals not written because this drain had already
+    /// written a fuller copy of the same bucket. The fuller copy is the one
+    /// the database keeps.
+    pub seals_superseded: usize,
 }
 
 impl BootDrainOutcome {
@@ -481,7 +492,7 @@ fn stage_pending_files(dir: &Path) -> Vec<PathBuf> {
     }
 
     // Re-glob the staging dir: this pass's moves PLUS any unconfirmed
-    // leftovers. Sorted so recovery is deterministic (oldest date first).
+    // leftovers, oldest write first.
     let mut staged: Vec<PathBuf> = std::fs::read_dir(&replaying)
         .into_iter()
         .flatten()
@@ -489,8 +500,26 @@ fn stage_pending_files(dir: &Path) -> Vec<PathBuf> {
         .map(|e| e.path())
         .filter(|p| is_seal_file(p))
         .collect();
-    staged.sort();
+    sort_by_write_time(&mut staged);
     staged
+}
+
+/// Audit PR41a: order staged files oldest write first, name second.
+///
+/// Name order alone put a day file before the file set aside from the SAME
+/// day (`<name>.<n>`, `set_aside_torn_file`), although every record in the
+/// set-aside file was written first. A replay in that order wrote the older
+/// records last. A file whose write time cannot be read sorts first, by name,
+/// which is the order every file had before.
+///
+/// # Complexity
+/// O(files log files) plus one `stat` per file. Cold: a directory listing.
+fn sort_by_write_time(files: &mut [PathBuf]) {
+    // O(1) EXEMPT: cold directory listing, once per scan or boot
+    files.sort_by_cached_key(|path| {
+        let written = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        (written, path.clone())
+    });
 }
 
 /// `true` for a regular file named `seals_v4-*` or legacy `seals-*`, ending `.bin` or `.ndjson`.
@@ -720,6 +749,9 @@ pub fn drain_recovered_seals<S: SealSink>(
         "seal recovery: replaying orphaned spill/DLQ files from disk"
     );
 
+    // Audit PR41a: the fullest copy of each slot's newest bucket written so
+    // far in this drain. Allocated once per boot, only when files are staged.
+    let mut written = SpillLedger::with_capacity(SEAL_SPILL_LEDGER_CAPACITY);
     let mut halted = false;
     for path in &staged {
         if halted {
@@ -780,6 +812,14 @@ pub fn drain_recovered_seals<S: SealSink>(
         for chunk in records.chunks(batch) {
             let mut appended = 0usize;
             for record in chunk {
+                // Audit PR41a: a fuller copy of this bucket was already
+                // written in this drain (a dead-letter file can hold an older
+                // copy than a spill file read before it). Writing this one
+                // would replace the fuller row.
+                if written.replay_is_older(record) {
+                    outcome.seals_superseded += 1;
+                    continue;
+                }
                 let Some(seal) = record.try_into_buffered_seal() else {
                     // Forward-compat guard: unknown tf ordinal.
                     outcome.records_undecodable += 1;
@@ -820,6 +860,7 @@ pub fn drain_recovered_seals<S: SealSink>(
                     append_failed += 1;
                     continue;
                 }
+                written.record(record);
                 appended += 1;
             }
             if appended == 0 {
@@ -986,10 +1027,23 @@ pub fn drain_recovered_seals<S: SealSink>(
 //
 // ## Honest limits
 //
-// * **Last write wins.** A replayed seal UPSERTs over whatever row the tables
-//   hold for its key, exactly as the boot drain always has. If a later,
-//   amended seal for the same bar was written live before the replay reached
-//   the older one, the older one overwrites it.
+// * **Last write wins, so the spill ends on the fullest copy (audit PR41a).**
+//   A replayed seal UPSERTs over whatever row the tables hold for its key. A
+//   bar can be written more than once (a late tick amends the bar that just
+//   sealed; the day-close seal can add carried volume), so until 2026-10-01 a
+//   spilled original replayed over an amended copy written live meanwhile.
+//   Now the spill writer keeps a ledger of the newest spilled bucket of every
+//   slot (`seal_spill_ledger`): a fuller copy committed live is appended to
+//   the spill behind the original, this replay drops a record the spill holds
+//   a fuller copy of, and the boot drain never writes a copy less full than
+//   one it already wrote. Counted on `tv_seal_spill_superseded_total{kind}`
+//   and `tv_seal_writer_drain_total{kind="boot_superseded"}`.
+//   What is NOT covered: a crash between a live flush and its mirror append
+//   (one drain cycle), and a mirror append that fails (counted as
+//   `mirror_failed`, coded `error!`). In both, the next replay can still write
+//   the older copy over the stored row. The boot drain does not read the
+//   stored row to compare, because a database read per recovered seal is the
+//   cost the spill exists to avoid.
 // * **The gate needs live traffic.** It opens only on clean LIVE flushes. If
 //   the last flush before the close failed, no live seal arrives afterwards
 //   to reopen it, and the spill waits for the next boot's drain.
@@ -1165,7 +1219,7 @@ impl MidSessionReplay {
             );
             self.cursor = Some(ReplayCursor::new(path));
         }
-        self.advance(writer, &mut outcome);
+        self.advance(writer, spill, &mut outcome);
         outcome
     }
 
@@ -1181,7 +1235,7 @@ impl MidSessionReplay {
             .filter(|p| is_seal_file(p) && staged_kind(p) == Some(StagedKind::Spill))
             .filter(|p| !self.skipped.contains(p))
             .collect();
-        staged.sort();
+        sort_by_write_time(&mut staged);
         staged.into_iter().next()
     }
 
@@ -1204,7 +1258,12 @@ impl MidSessionReplay {
     }
 
     /// Replay up to one step's worth of records from the cursor.
-    fn advance<S: SealSink>(&mut self, writer: &mut S, outcome: &mut ReplayOutcome) {
+    fn advance<S: SealSink>(
+        &mut self,
+        writer: &mut S,
+        spill: &crate::seal_spill::SealSpillWriter,
+        outcome: &mut ReplayOutcome,
+    ) {
         let Some(cursor) = self.cursor.as_ref() else {
             return;
         };
@@ -1225,6 +1284,13 @@ impl MidSessionReplay {
 
         let mut appended = 0usize;
         for seal in &self.batch {
+            // Audit PR41a: the spill also holds a fuller copy of this bucket,
+            // later in this file or in a later one. Writing this one would
+            // put the older copy over the stored row until that one is
+            // reached, or for good if it never is. Counted by the spill.
+            if spill.replay_is_superseded(seal) {
+                continue;
+            }
             if let Err(append_err) = writer.append_seal(seal) {
                 error!(
                     code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
@@ -2745,6 +2811,157 @@ mod tests {
             vec![3 * SEAL_SPILL_RECORD_SIZE as u64],
             "the staged file keeps exactly the seals written before the pause"
         );
+        cleanup(&spill, &dlq);
+    }
+
+    // -----------------------------------------------------------------------
+    // Audit PR41a — a replayed candle never replaces a fuller one
+    // -----------------------------------------------------------------------
+
+    /// A sink that records `(bucket, tick_count)` of what it committed.
+    #[derive(Default)]
+    struct CopySink {
+        pending: Vec<(u32, u32)>,
+        committed: Vec<(u32, u32)>,
+    }
+
+    impl SealSink for CopySink {
+        fn append_seal(&mut self, seal: &BufferedSeal) -> anyhow::Result<()> {
+            self.pending
+                .push((seal.state.bucket_start_ist_secs, seal.state.tick_count));
+            Ok(())
+        }
+        fn flush(&mut self) -> anyhow::Result<()> {
+            self.committed.append(&mut self.pending);
+            Ok(())
+        }
+        fn discard_pending(&mut self) {
+            self.pending.clear();
+        }
+    }
+
+    fn copy_with_ticks(bucket: u32, ticks: u32) -> BufferedSeal {
+        let mut seal = mk_seal(13, 2, TfIndex::M1, bucket, 101.5);
+        seal.state.tick_count = ticks;
+        seal
+    }
+
+    #[test]
+    fn pr41a_mid_session_replay_writes_only_the_fuller_copy() {
+        let (spill, dlq) = temp_pair("pr41a-replay");
+        let writer = crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(spill.clone());
+        let t0 = jan1_noon_utc();
+        // The original spills (ring full, database up), then the amended copy
+        // commits live and the writer appends it behind the original.
+        let original = copy_with_ticks(600, 4);
+        let amended = copy_with_ticks(600, 5);
+        writer
+            .append_seal(&SerializedSeal::from(&original), t0)
+            .expect("spill original");
+        assert_eq!(writer.note_live_commits(&[amended], t0), 1);
+
+        let mut replay = MidSessionReplay::default();
+        let mut sink = CopySink::default();
+        replay.observe(&healthy_drain(), t0);
+        let out = replay.step(
+            &mut sink,
+            &writer,
+            &spill,
+            true,
+            t0 + SEAL_REPLAY_HEALTHY_SECS,
+        );
+        assert_eq!(out.files_archived, 1);
+        assert_eq!(out.seals_reingested, 1);
+        assert_eq!(out.records_skipped, 0, "a superseded copy is not a loss");
+        assert_eq!(
+            sink.committed,
+            vec![(600, 5)],
+            "the original is never written"
+        );
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn pr41a_boot_drain_never_writes_an_older_copy_after_a_fuller_one() {
+        let (spill, dlq) = temp_pair("pr41a-boot");
+        let t0 = jan1_noon_utc();
+        // The fuller copy is in the spill; an older copy sits in a dead-letter
+        // file written later (the shape the file order cannot fix).
+        let spill_writer =
+            crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(spill.clone());
+        spill_writer
+            .append_seal(&SerializedSeal::from(&copy_with_ticks(600, 5)), t0)
+            .expect("spill fuller");
+        let dlq_writer = crate::seal_dlq::SealDlqWriter::with_dlq_dir_for_test(dlq.clone());
+        dlq_writer
+            .append_record(
+                &SealDlqRecord::from(&SerializedSeal::from(&copy_with_ticks(600, 4))),
+                t0,
+            )
+            .expect("dlq older");
+
+        let mut sink = CopySink::default();
+        let outcome = drain_recovered_seals(&mut sink, &spill, &dlq, 64);
+        assert_eq!(outcome.seals_recovered, 2);
+        assert_eq!(outcome.seals_reingested, 1);
+        assert_eq!(outcome.seals_superseded, 1);
+        assert_eq!(
+            outcome.files_archived, 2,
+            "a superseded copy does not hold its file"
+        );
+        assert_eq!(sink.committed, vec![(600, 5)]);
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn pr41a_boot_drain_writes_both_copies_when_the_older_comes_first() {
+        let (spill, dlq) = temp_pair("pr41a-boot-order");
+        let t0 = jan1_noon_utc();
+        let spill_writer =
+            crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(spill.clone());
+        // A fresh writer has no ledger, so both copies land in file order.
+        for seal in [
+            copy_with_ticks(600, 4),
+            copy_with_ticks(600, 5),
+            copy_with_ticks(660, 1),
+        ] {
+            spill_writer
+                .append_seal(&SerializedSeal::from(&seal), t0)
+                .expect("spill");
+        }
+        let mut sink = CopySink::default();
+        let outcome = drain_recovered_seals(&mut sink, &spill, &dlq, 64);
+        assert_eq!(outcome.seals_superseded, 0);
+        // The fuller copy is written last, so it is the one the table keeps.
+        assert_eq!(sink.committed, vec![(600, 4), (600, 5), (660, 1)]);
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn pr41a_staged_files_replay_oldest_write_first() {
+        let (spill, dlq) = temp_pair("pr41a-write-order");
+        // Name order puts the day file before its set-aside part, although
+        // the set-aside part was written first.
+        let day = spill.join("seals_v4-2026-10-01.bin");
+        let aside = spill.join("seals_v4-2026-10-01.bin.1");
+        std::fs::write(&day, b"").expect("day file");
+        std::fs::write(&aside, b"").expect("aside file");
+        let earlier =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_759_300_000);
+        let later = earlier + std::time::Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&aside)
+            .and_then(|f| f.set_modified(earlier))
+            .expect("aside mtime");
+        std::fs::File::options()
+            .write(true)
+            .open(&day)
+            .and_then(|f| f.set_modified(later))
+            .expect("day mtime");
+        let mut files = vec![day.clone(), aside.clone()];
+        sort_by_write_time(&mut files);
+        assert_eq!(files, vec![aside, day]);
         cleanup(&spill, &dlq);
     }
 }

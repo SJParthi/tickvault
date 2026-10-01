@@ -297,7 +297,9 @@ resource "aws_lambda_function" "tv_hard_stop_guard" {
       # The Lambda clamps every other month to $150 in code
       # (effective_budget_kill_usd), so October is protected even before the
       # scheduled 1-Oct revert of this value lands.
-      BUDGET_KILL_USD = "225"
+      # 2026-10-01 (audit PR30b): that revert. $225 -> $150, so the configured
+      # value and the code clamp agree again.
+      BUDGET_KILL_USD = "150"
       # 2026-07-09: change-only ping state (matches the IAM statement's
       # single-parameter scope above).
       PING_STATE_PARAM = "/tickvault/${var.environment}/budget-guard/ping-state"
