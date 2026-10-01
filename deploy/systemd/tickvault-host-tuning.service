@@ -71,7 +71,9 @@ ExecStart=/usr/bin/install -m 0644 -o root -g root /opt/tickvault/repo/deploy/aw
 # Leading `-` plus the modprobe guard: if tcp_bbr is unavailable, writing the
 # value would make `sysctl --system` below fail WHOLESALE and strip the receive
 # buffers along with it — trading a missing optimisation for a missing floor.
-ExecStart=-/bin/sh -c 'modprobe tcp_bbr 2>/dev/null && { echo "net.ipv4.tcp_congestion_control = bbr" > /etc/sysctl.d/99-tickvault-bbr.conf; echo tcp_bbr > /etc/modules-load.d/tickvault-bbr.conf; }'
+# Was an inline /bin/sh -c until 2026-10-01 (audit D6b); now the app binary
+# does the same thing: modprobe, and write both drop-ins only if that worked.
+ExecStart=-/opt/tickvault/bin/tickvault host-tuning bbr
 
 # NIC receive ring.
 #
@@ -94,12 +96,18 @@ ExecStart=/sbin/sysctl --system
 
 # 3. Verify EVERY load-bearing value and write the verdict where it outlives the
 #    boot log. Non-zero exit here is a REPORT, not a failure — see below.
-ExecStart=-/opt/tickvault/repo/deploy/aws/sysctl/verify-net-tuning.sh
+#
+# Steps bbr, verify and apply were shell scripts until 2026-10-01 (audit D6b);
+# they are now subcommands of the app binary. On a brand-new instance the
+# binary does not exist until the first deploy, so user-data's first start of
+# this unit skips those three (the leading `-`); the deploy places the binary
+# and then restarts this unit, which applies them.
+ExecStart=-/opt/tickvault/bin/tickvault host-tuning verify
 
 # 4. The non-sysctl half: THP (a /sys write, lost on every reboot — the single
 #    strongest reason this unit exists) and the clock discipline check, without
 #    which every latency number the system reports is untrustworthy.
-ExecStart=-/opt/tickvault/repo/deploy/aws/host-tuning/apply-host-tuning.sh
+ExecStart=-/opt/tickvault/bin/tickvault host-tuning apply
 
 # A tuning failure must NEVER keep the trading app down. A host with default
 # buffers is slower; a host with no app is blind. The `-` prefixes above and

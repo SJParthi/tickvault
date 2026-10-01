@@ -91,13 +91,13 @@ fn boot_unit_applies_both_halves_of_the_tuning() {
     // The non-sysctl half is the whole reason a BOOT unit is required: THP is a
     // /sys write and is lost on every reboot.
     assert!(
-        unit.contains("apply-host-tuning.sh"),
+        unit.contains("tickvault host-tuning apply"),
         "the unit must run the non-sysctl half (THP + clock) — THP is a /sys \
          write that does NOT survive a reboot, which is the single strongest \
          reason this unit exists"
     );
     assert!(
-        unit.contains("verify-net-tuning.sh"),
+        unit.contains("tickvault host-tuning verify"),
         "the unit must verify what it applied — applying without verifying is \
          how a silently-ineffective setting survives"
     );

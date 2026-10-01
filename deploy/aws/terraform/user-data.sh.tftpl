@@ -254,8 +254,6 @@ cp /opt/tickvault/repo/deploy/systemd/tickvault-holiday-gate.service /etc/system
 
 # Host tuning as a BOOT unit, not a launch-time script (2026-08-15) — see the
 # unit header for why per-instance wiring silently under-tuned every restart.
-chmod +x /opt/tickvault/repo/deploy/aws/host-tuning/apply-host-tuning.sh
-chmod +x /opt/tickvault/repo/deploy/aws/sysctl/verify-net-tuning.sh
 cp /opt/tickvault/repo/deploy/systemd/tickvault-host-tuning.service /etc/systemd/system/
 
 systemctl daemon-reload
