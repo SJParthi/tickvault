@@ -1482,3 +1482,26 @@ consequence, so it remains the operator's call.
 
 **What is NOT claimed.** That the three thresholds are measured-optimal (see
 §2.6). That these alarms reduce cost or risk; they only make delay visible.
+
+## COST NOTE 2026-09-29 — raw WAL frames to S3, no expiry, versioning on (+$6–12/mo, Assumed)
+
+**Authorization:** operator Quotes 27 + 28, 2026-09-29, recorded verbatim in
+`docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md`
+("NOTHING IS EVER MISSED OR DELETED"). That section says this cost is "Recorded
+in `aws-budget.md`"; it was not, until this note (added 2026-10-01, Item 48 of
+`active-plan-feed-hardening.md`).
+
+| Item | Basis | Cost |
+|---|---|---:|
+| Raw WAL segments in `s3://tv-prod-cold/raw-frames/` (ITEM 45e) | MEASURED input on the box 2026-09-29: 25.0 GB raw per session, gzip-1 ratio 0.46, so about 11.5 GB per session and about 250 GB per month, tiered to Deep Archive after 30 days | ~$6–12/mo in year one |
+| S3 expiration removed, versioning enabled on `tv-prod-cold` (ITEM 45f) | existing objects stop expiring; overwritten or deleted objects keep a prior version | included above; grows each year |
+
+**Status on 2026-10-01: NOT YET SPENT.** Neither 45e nor 45f has landed (no
+`raw-frames/` uploader exists and `main.tf` still carries
+`expiration { days = 1825 }`), so October pays nothing for this yet.
+
+**What is NOT claimed.** The figure is Assumed until one month is billed, as the
+full rule file requires. It does not fit inside the $150 October line, which
+was already projected at about $150 before this (COST NOTE 2026-09-25); if the
+forecast goes over, that is a separate dated quote, per Quote 27's own
+"What this does NOT change" row.

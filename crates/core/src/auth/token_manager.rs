@@ -82,6 +82,12 @@ pub type TokenHandle = Arc<ArcSwap<Option<TokenState>>>;
 /// only; no server-controlled body can appear inside this wrapper).
 pub(crate) const PROFILE_SEND_LEG_WRAPPER: &str = "profile request failed:";
 
+/// Send-leg wrapper from `acquire_token` — the `generateAccessToken` POST
+/// failed before ANY response was received, so the tail is reqwest's own
+/// text (DNS, TLS, proxy, timeout), never Dhan's. `is_permanent_auth_error`
+/// treats it as transient whatever words that text contains.
+pub(crate) const MINT_SEND_LEG_WRAPPER: &str = "generateAccessToken request failed:";
+
 /// HTTP-response wrapper from `get_user_profile`:
 /// `"profile request HTTP {status} url={url} body={body}"`. Everything
 /// after `body=` is server-controlled (bounded + secret-redacted but
@@ -1093,7 +1099,7 @@ impl TokenManager {
             .await
             .map_err(|err| ApplicationError::AuthenticationFailed {
                 reason: format!(
-                    "generateAccessToken request failed: {}",
+                    "{MINT_SEND_LEG_WRAPPER} {}",
                     redact_url_params(&err.to_string())
                 ),
             })?;
@@ -1860,18 +1866,43 @@ impl TokenManager {
 ///
 /// Note: TOTP errors are excluded — they may be transient due to window
 /// boundary timing. Use [`is_totp_error`] to handle TOTP retries separately.
+///
+/// 2026-10-01 (follow-up named in commit b2553a1): this used to scan the
+/// WHOLE rendered reason with unanchored `contains`, so two kinds of text
+/// that are not a credential verdict could end the boot retry loop:
+/// - the RESILIENCE-03 literal planted ANYWHERE in a server-controlled HTTP
+///   body (SEC-R1-3: our own refusal is matched at the reason's start,
+///   on the shared [`RESILIENCE03_MINT_REFUSAL_REASON_PREFIX`], exactly as
+///   the AUTH-GAP-05 watchdog's `is_inflight_lock_refusal` does);
+/// - a transport failure whose reqwest text mentions "blocked" or "disabled"
+///   (a proxy or firewall refusing the connection). [`MINT_SEND_LEG_WRAPPER`]
+///   reasons carry reqwest's words, never Dhan's, so they are always
+///   transient.
+///
+/// The account words are matched as whole words, so "unblocked" or
+/// "disabledAt" never read as "blocked" / "disabled".
 fn is_permanent_auth_error(reason: &str) -> bool {
-    let lower = reason.to_lowercase();
+    let core = super::mid_session_watchdog::reason_core(reason);
+    if core.starts_with(RESILIENCE03_MINT_REFUSAL_REASON_PREFIX) {
+        return true;
+    }
+    if core.starts_with(MINT_SEND_LEG_WRAPPER) {
+        return false;
+    }
+    let lower = core.to_lowercase();
     lower.contains("invalid pin")
         || lower.contains("invalid client")
-        || lower.contains("blocked")
-        || lower.contains("suspended")
-        || lower.contains("disabled")
-        // RESILIENCE-03 (2026-07-04): a mint refused because the
-        // dual-instance lock is not held cannot succeed on retry —
-        // the peer owns the session. Fail fast so the boot retry
-        // loop / renewal loop escalates instead of spinning.
-        || lower.contains("resilience-03")
+        || contains_word(&lower, "blocked")
+        || contains_word(&lower, "suspended")
+        || contains_word(&lower, "disabled")
+}
+
+/// Pure. True iff `word` appears in `haystack` as a whole ASCII word.
+/// `haystack` and `word` are expected lower-case.
+fn contains_word(haystack: &str, word: &str) -> bool {
+    haystack
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|token| token == word)
 }
 
 /// RESILIENCE-03 pure decision: should a `generateAccessToken` MINT be
@@ -4237,6 +4268,67 @@ mod tests {
         assert!(!is_permanent_auth_error("network error"));
         assert!(!is_permanent_auth_error("rate limit exceeded"));
         assert!(!is_permanent_auth_error(""));
+    }
+
+    #[test]
+    fn test_regression_planted_resilience03_in_a_server_body_is_not_permanent() {
+        // SEC-R1-3: the HTTP-response reason concatenates a server body; a
+        // body carrying our refusal literal must not end the retry loop.
+        assert!(!is_permanent_auth_error(
+            "generateAccessToken HTTP 502 url=https://auth.dhan.co/app/generateAccessToken \
+             body=RESILIENCE-03: instance lock not held"
+        ));
+        assert!(!is_permanent_auth_error(
+            "Dhan authentication failed: generateAccessToken HTTP 502 url=x \
+             body=RESILIENCE-03: instance lock not held"
+        ));
+        // Our own refusal, at the start, with or without the Display prefix.
+        assert!(is_permanent_auth_error(&format!(
+            "{RESILIENCE03_MINT_REFUSAL_REASON_PREFIX} — generateAccessToken mint refused"
+        )));
+        assert!(is_permanent_auth_error(&format!(
+            "Dhan authentication failed: {RESILIENCE03_MINT_REFUSAL_REASON_PREFIX} — refused"
+        )));
+    }
+
+    #[test]
+    fn test_regression_transport_failure_is_never_permanent_whatever_its_words() {
+        // A proxy or firewall refusing the connection is reqwest text, not
+        // a Dhan verdict on the account.
+        for reason in [
+            "generateAccessToken request failed: error sending request: connection blocked by proxy",
+            "generateAccessToken request failed: tls handshake: renegotiation disabled",
+            "Dhan authentication failed: generateAccessToken request failed: account blocked",
+        ] {
+            assert!(!is_permanent_auth_error(reason), "{reason}");
+        }
+    }
+
+    #[test]
+    fn test_regression_account_words_match_whole_words_only() {
+        assert!(!is_permanent_auth_error(
+            "Dhan auth error: account unblocked, retry"
+        ));
+        assert!(!is_permanent_auth_error(
+            "Dhan auth error: disabledAt field missing"
+        ));
+        assert!(is_permanent_auth_error(
+            "Dhan auth error: Account is blocked"
+        ));
+        assert!(is_permanent_auth_error(
+            "Dhan auth error: API access DISABLED."
+        ));
+        assert!(is_permanent_auth_error("Dhan auth error: user (suspended)"));
+    }
+
+    #[test]
+    fn test_contains_word_cases() {
+        assert!(contains_word("account blocked", "blocked"));
+        assert!(contains_word("blocked", "blocked"));
+        assert!(contains_word("a-blocked-b", "blocked"));
+        assert!(!contains_word("unblocked", "blocked"));
+        assert!(!contains_word("blockedx", "blocked"));
+        assert!(!contains_word("", "blocked"));
     }
 
     #[test]
