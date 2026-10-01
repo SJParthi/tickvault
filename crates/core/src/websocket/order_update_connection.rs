@@ -967,6 +967,51 @@ async fn connect_and_listen(
                                 m_active.set(0.0);
                                 break Err(OrderUpdateConnectionError::AuthFailed(reason));
                             }
+                            // R4 (2026-10-01, reality check): a frame carrying the
+                            // documented order envelope that failed the typed parse
+                            // is an order event this process cannot read. It used to
+                            // fall into the arm below as a "non-order" frame at
+                            // debug level, so a vendor format change would drop every
+                            // order update without a trace.
+                            AuthResponseKind::Success if looks_like_order_update(&text) => {
+                                // Dhan streams order events only to an
+                                // authenticated session.
+                                fire_authenticated_signal_once(
+                                    authenticated_signal,
+                                    authenticated_latch,
+                                );
+                                let seen = UNPARSEABLE_ORDER_FRAMES
+                                    .fetch_add(1, Ordering::Relaxed)
+                                    .saturating_add(1);
+                                metrics::counter!(
+                                    "tv_order_update_frames_dropped_total",
+                                    "reason" => "unparseable_order"
+                                )
+                                .increment(1);
+                                if seen.is_power_of_two() {
+                                    // Line and column only: a serde type error
+                                    // can quote a field value such as the client id.
+                                    let (err_line, err_column) = match &err {
+                                        OrderUpdateParseError::JsonError(e) => {
+                                            (e.line(), e.column())
+                                        }
+                                        OrderUpdateParseError::FrameTooLarge { .. } => (0, 0),
+                                    };
+                                    error!(
+                                        code = tickvault_common::error_code::ErrorCode::OrderEvt02DecodedHollow
+                                            .code_str(),
+                                        stage = "typed_parse_failed",
+                                        seen,
+                                        err_line,
+                                        err_column,
+                                        excerpt = %redacted_frame_excerpt(&text),
+                                        "order update DROPPED: the frame carries the order-update \
+                                         envelope but failed the typed parse, so this order event \
+                                         never reaches the order book. Excerpt is the raw frame \
+                                         (client id redacted, length bounded); logged at powers of two."
+                                    );
+                                }
+                            }
                             AuthResponseKind::Success => {
                                 // Login ack or heartbeat — not all messages are order updates.
                                 metrics::counter!("tv_order_update_non_order_messages_total")
@@ -1107,6 +1152,38 @@ enum AuthResponseKind {
 
 /// Prometheus counter for ORDER-EVT-02 hollow decodes.
 pub const ORDER_UPDATE_HOLLOW_DECODE_COUNTER: &str = "tv_order_update_hollow_decode_total";
+
+/// R4 (2026-10-01). Order-update frames that failed the typed parse but carry
+/// the order envelope, process-wide. Read only to throttle the ORDER-EVT-02
+/// `typed_parse_failed` log to powers of two.
+static UNPARSEABLE_ORDER_FRAMES: AtomicU64 = AtomicU64::new(0);
+
+/// R4 (2026-10-01). Pure, allocation-free. True iff a frame that FAILED
+/// `parse_order_update` still carries the documented order envelope: the
+/// `"order_alert"` tag, or a `"Data"` (or drifted `"data"`) key whose value
+/// opens an object.
+///
+/// # Complexity
+/// O(frame bytes), bounded by `ORDER_UPDATE_MAX_FRAME_BYTES`, the same bound
+/// as the two parses this path already runs. Not O(1); runs only on a frame
+/// the typed parse refused.
+fn looks_like_order_update(text: &str) -> bool {
+    if text.contains("\"order_alert\"") {
+        return true;
+    }
+    ["\"Data\"", "\"data\""].iter().any(|key| {
+        let mut rest = text;
+        while let Some(at) = rest.find(key) {
+            rest = &rest[at + key.len()..];
+            if let Some(value) = rest.trim_start().strip_prefix(':')
+                && value.trim_start().starts_with('{')
+            {
+                return true;
+            }
+        }
+        false
+    })
+}
 
 /// Longest raw-frame excerpt ORDER-EVT-02 will log.
 ///
@@ -1452,6 +1529,76 @@ enum OrderUpdateConnectionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // R4 (2026-10-01, reality check): an order frame the typed parse cannot
+    // read is flagged, not filed as a harmless non-order message.
+    #[test]
+    fn test_looks_like_order_update_detects_an_unreadable_order_frame() {
+        // A documented order frame whose Quantity changed type: the typed
+        // parse fails while the envelope stays.
+        let drifted = r#"{"Data":{"OrderNo":"999","Quantity":"ten"},"Type":"order_alert"}"#;
+        assert!(
+            parse_order_update(drifted).is_err(),
+            "precondition: the typed parse fails"
+        );
+        assert_eq!(
+            classify_auth_response(drifted),
+            AuthResponseKind::Success,
+            "precondition: the old path filed it as a non-order frame"
+        );
+        assert!(looks_like_order_update(drifted));
+        assert!(
+            looks_like_order_update(r#"{ "Data" :  {"OrderNo":1} }"#),
+            "whitespace around the key"
+        );
+        assert!(
+            looks_like_order_update(r#"{"Data":null,"Type":"order_alert"}"#),
+            "the tag alone"
+        );
+        assert!(
+            looks_like_order_update(r#"{"data":{"orderNo":"1"}}"#),
+            "casing drift"
+        );
+    }
+
+    #[test]
+    fn test_looks_like_order_update_leaves_genuine_non_order_frames_alone() {
+        for frame in [
+            r#"{"status":"success"}"#,
+            "{}",
+            "pong",
+            "",
+            r#"{"Data":null}"#,
+            r#"{"Data":"ok"}"#,
+            r#"{"Message":"Data received"}"#,
+            "\u{20b9}\u{20b9}\"Data\"",
+            "\"Data\"",
+        ] {
+            assert!(!looks_like_order_update(frame), "{frame:?}");
+        }
+    }
+
+    /// Source pin: the envelope arm must precede the plain Success arm (a
+    /// guarded arm after it would be unreachable), count the drop and log the
+    /// coded line.
+    #[test]
+    fn test_unparseable_order_arm_precedes_the_non_order_arm_and_counts_the_drop() {
+        let src = include_str!("order_update_connection.rs");
+        let prod = &src[..src
+            .find(concat!("#[cfg(", "test)]"))
+            .expect("test marker present")];
+        let arm = prod
+            .find("AuthResponseKind::Success if looks_like_order_update(&text)")
+            .expect("the envelope arm exists");
+        let generic = prod
+            .find("tv_order_update_non_order_messages_total")
+            .expect("the non-order arm exists");
+        assert!(arm < generic, "the envelope arm must be matched first");
+        let between = &prod[arm..generic];
+        assert!(between.contains("\"unparseable_order\""));
+        assert!(between.contains("OrderEvt02DecodedHollow"));
+        assert!(between.contains("stage = \"typed_parse_failed\""));
+    }
 
     // ========================================================================
     // O2 (2026-04-17) — Authenticated-signal latch tests
