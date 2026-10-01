@@ -1682,6 +1682,18 @@ the PR4c follow-ups, PR52. PR30b stays on or after 2026-10-01.
     read lag, since the proof is when we READ the packet. The option rule keys on the segment
     code, so if futures (which have a pre-open) return it must key on the instrument type. Nothing yet compares our first bar
     with Dhan's own chart; PR59's read-only query is the tool for that check on the live box.
+  - Review 2026-10-01 (four parallel attack passes after merging main's plan 47): the
+    lost-packet limit above was WORSE than stated, since the 60 s window crosses minute and
+    higher bucket edges (a 1 m bar written at 150 against a true 50; an equity's whole auction
+    in its 09:15 bars). Fixed: the zero baseline also needs the first trade's day cumulative
+    to EQUAL its own last-trade quantity, so it never over-reports
+    (`test_regression_a_lost_first_trade_never_lands_in_the_next_minute`,
+    `test_regression_an_equity_auction_is_never_poured_into_the_open_bar`). No proof is
+    recorded during a WAL replay: a replayed snapshot's slot got the hand-over gap and
+    withheld every first bar (`test_regression_no_proof_is_recorded_during_a_wal_replay`).
+    The 09:15 extension names its segments (`test_regression_a_currency_proof_is_never_extended_to_the_open`).
+    Stated limits: the first bar's net direction is null; proof slots are bounded by the
+    subscribed set, not the traded set.
   - Docs line (not a bug): candle `volume` is signed (negative on a down bar), while charting
     "Net Volume" is 0 on a flat bar and compares the first bar with the previous close. Say so
     where the candle columns are described.
