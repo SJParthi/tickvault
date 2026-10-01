@@ -211,9 +211,10 @@ Cluster A (this session's PR; Files/Tests per the judge-approved final design):
 
 Other clusters (checked off by their owning sessions' PRs, all referencing THIS plan):
 
-- [ ] C1 — order_audit-family QuestDB persistence revival (feed-in-key DEDUP)
-  - Files: crates/storage/src/ (new *_audit_persistence.rs modules)
+- [x] C1 — order_audit-family QuestDB persistence revival (feed-in-key DEDUP)
+  - Files: crates/storage/src/order_audit_persistence.rs, crates/storage/src/pnl_audit_persistence.rs, crates/app/src/order_observability.rs
   - Tests: TBD by owning session (8-element template ratchets)
+  - Ticked 2026-10-01 (Item 48 of active-plan-feed-hardening.md): the box was never ticked, but `OrderAuditWriter` and `ensure_order_audit_table` are live — `order_observability.rs` writes the rebuilt SEBI `order_audit` + `pnl_audit` rows.
 - [x] CT1 — Conditional & Multi Order surface (dhanhq v2 /alerts family): typed constructors +
       `POST /alerts/multi/orders` wrapper, dormant behind the hardcoded alerts gate,
       Equities/Indices fail-closed segment lock
@@ -296,9 +297,10 @@ Other clusters (checked off by their owning sessions' PRs, all referencing THIS 
     multi-order/gate tests, 23 conditional.rs constructor tests (incl. the proptest),
     14 types.rs wire-shape tests, 3 dhan_api_coverage.rs orphan/extractor tests —
     58 total.
-- [ ] D1 — orphan-watchdog re-homing + expired date-gate re-arm (PR #1545)
+- [x] D1 — orphan-watchdog re-homing + expired date-gate re-arm (PR #1545)
   - Files: crates/app/src/main.rs, crates/trading/src/oms/engine.rs, crates/common/src/constants.rs
-  - Tests: TBD by cluster D session (watchdog wiring source-scan guard)
+  - Tests: crates/app/tests/orphan_position_watchdog_wiring_guard.rs
+  - Ticked 2026-10-01 (Item 48 of active-plan-feed-hardening.md): the daily 15:25 IST orphan-position watchdog is spawned process-wide in `main.rs` (the 2026-07-14 re-home); the box was never ticked.
 - [x] E1 — exit-order layer (Super Order/OCO wiring, MPP verify, slicing) — serial after A
   - Files: crates/trading/src/oms/ (engine.rs, api_client.rs call sites), crates/app/src/order_runtime.rs
   - Tests: TBD by owning session

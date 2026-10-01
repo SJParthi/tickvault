@@ -384,7 +384,7 @@ mod alert_routing {
     /// 2026-07-14 (operator Dhan noise lock,
     /// `dhan-rest-only-noise-lock-2026-07-14.md`): the body was reworded to
     /// plain English naming the BROKER + the CONSEQUENCE ("Dhan login could
-    /// not be obtained" / "pulls will stop") — the old shouty "FAILED"
+    /// not be obtained" / "live price feed cannot connect") — the old shouty "FAILED"
     /// literal is gone by design, so this pin follows the reworded
     /// contract: failure indication + broker name + the error detail.
     #[test]
