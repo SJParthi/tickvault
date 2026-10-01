@@ -82,6 +82,23 @@ pub type TokenHandle = Arc<ArcSwap<Option<TokenState>>>;
 /// only; no server-controlled body can appear inside this wrapper).
 pub(crate) const PROFILE_SEND_LEG_WRAPPER: &str = "profile request failed:";
 
+/// Send-leg wrapper from `acquire_token` — the `generateAccessToken` POST
+/// failed before ANY response was received, so the tail is reqwest's own
+/// text (DNS, TLS, proxy, timeout), never Dhan's. `is_permanent_auth_error`
+/// treats it as transient whatever words that text contains.
+pub(crate) const MINT_SEND_LEG_WRAPPER: &str = "generateAccessToken request failed:";
+
+/// Non-2xx wrapper from `acquire_token`: `"<this> <status> url=… body=…"`.
+/// The body is server-controlled (an HTML error page from a load balancer
+/// or firewall as often as Dhan JSON), so `is_permanent_auth_error` reads
+/// it only for a 4xx other than 429 — a 5xx or 429 is transient whatever
+/// its body says.
+pub(crate) const MINT_HTTP_STATUS_WRAPPER: &str = "generateAccessToken HTTP";
+
+/// Wrapper from `acquire_token` when a 2xx body is neither a Dhan error
+/// object nor a token. No Dhan verdict was parsed, so it is transient.
+pub(crate) const MINT_PARSE_FAILURE_WRAPPER: &str = "failed to parse auth response";
+
 /// HTTP-response wrapper from `get_user_profile`:
 /// `"profile request HTTP {status} url={url} body={body}"`. Everything
 /// after `body=` is server-controlled (bounded + secret-redacted but
@@ -1093,7 +1110,7 @@ impl TokenManager {
             .await
             .map_err(|err| ApplicationError::AuthenticationFailed {
                 reason: format!(
-                    "generateAccessToken request failed: {}",
+                    "{MINT_SEND_LEG_WRAPPER} {}",
                     redact_url_params(&err.to_string())
                 ),
             })?;
@@ -1107,7 +1124,7 @@ impl TokenManager {
             // not present in `url`; redact defensively anyway).
             return Err(ApplicationError::AuthenticationFailed {
                 reason: format!(
-                    "generateAccessToken HTTP {status} url={} body={}",
+                    "{MINT_HTTP_STATUS_WRAPPER} {status} url={} body={}",
                     redact_url_params(&url),
                     capture_rest_error_body(&body_text)
                 ),
@@ -1134,7 +1151,7 @@ impl TokenManager {
             // material that url-param redaction alone would miss.
             ApplicationError::AuthenticationFailed {
                 reason: format!(
-                    "failed to parse auth response (HTTP {status}): {err}\nResponse body: {}",
+                    "{MINT_PARSE_FAILURE_WRAPPER} (HTTP {status}): {err}\nResponse body: {}",
                     capture_rest_error_body(&body_text)
                 ),
             }
@@ -1860,18 +1877,68 @@ impl TokenManager {
 ///
 /// Note: TOTP errors are excluded — they may be transient due to window
 /// boundary timing. Use [`is_totp_error`] to handle TOTP retries separately.
+///
+/// 2026-10-01 (follow-up named in commit b2553a1): this used to scan the
+/// WHOLE rendered reason with unanchored `contains`, so two kinds of text
+/// that are not a credential verdict could end the boot retry loop:
+/// - the RESILIENCE-03 literal planted ANYWHERE in a server-controlled HTTP
+///   body (SEC-R1-3: our own refusal is matched at the reason's start,
+///   on the shared [`RESILIENCE03_MINT_REFUSAL_REASON_PREFIX`], exactly as
+///   the AUTH-GAP-05 watchdog's `is_inflight_lock_refusal` does);
+/// - a transport failure whose reqwest text mentions "blocked" or "disabled"
+///   (a proxy or firewall refusing the connection). [`MINT_SEND_LEG_WRAPPER`]
+///   reasons carry reqwest's words, never Dhan's, so they are always
+///   transient.
+///
+/// The account words are matched as whole words, so "unblocked" or
+/// "disabledAt" never read as "blocked" / "disabled".
+///
+/// Only text that can be a Dhan verdict is scanned: a `status:error` body
+/// on a 2xx, or the body of a 4xx other than 429. A 5xx or 429 body (an
+/// HTML page from a firewall or load balancer saying "Request blocked"),
+/// a body that parsed as neither ([`MINT_PARSE_FAILURE_WRAPPER`]) and a
+/// transport failure are all transient. Limit: a camelCase code such as
+/// `accountBlocked` is one word and does not match; Dhan sends sentences
+/// ("Invalid Pin"), and splitting camelCase would also split `disabledAt`.
 fn is_permanent_auth_error(reason: &str) -> bool {
-    let lower = reason.to_lowercase();
+    let core = super::mid_session_watchdog::reason_core(reason);
+    if core.starts_with(RESILIENCE03_MINT_REFUSAL_REASON_PREFIX) {
+        return true;
+    }
+    if core.starts_with(MINT_SEND_LEG_WRAPPER) || core.starts_with(MINT_PARSE_FAILURE_WRAPPER) {
+        return false;
+    }
+    if let Some(after) = core.strip_prefix(MINT_HTTP_STATUS_WRAPPER)
+        && !is_client_refusal_status(after)
+    {
+        return false;
+    }
+    let lower = core.to_lowercase();
     lower.contains("invalid pin")
         || lower.contains("invalid client")
-        || lower.contains("blocked")
-        || lower.contains("suspended")
-        || lower.contains("disabled")
-        // RESILIENCE-03 (2026-07-04): a mint refused because the
-        // dual-instance lock is not held cannot succeed on retry —
-        // the peer owns the session. Fail fast so the boot retry
-        // loop / renewal loop escalates instead of spinning.
-        || lower.contains("resilience-03")
+        || contains_word(&lower, "blocked")
+        || contains_word(&lower, "suspended")
+        || contains_word(&lower, "disabled")
+}
+
+/// Pure. True iff the text after [`MINT_HTTP_STATUS_WRAPPER`] starts with a
+/// 4xx status other than 429 — the only non-2xx answers whose body can be a
+/// verdict on the credentials. Anything unparseable reads as not a refusal.
+fn is_client_refusal_status(after_wrapper: &str) -> bool {
+    let code: u16 = after_wrapper
+        .trim_start()
+        .get(..3)
+        .and_then(|digits| digits.parse().ok())
+        .unwrap_or(0);
+    (400..500).contains(&code) && code != 429
+}
+
+/// Pure. True iff `word` appears in `haystack` as a whole ASCII word.
+/// `haystack` and `word` are expected lower-case.
+fn contains_word(haystack: &str, word: &str) -> bool {
+    haystack
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|token| token == word)
 }
 
 /// RESILIENCE-03 pure decision: should a `generateAccessToken` MINT be
@@ -4237,6 +4304,100 @@ mod tests {
         assert!(!is_permanent_auth_error("network error"));
         assert!(!is_permanent_auth_error("rate limit exceeded"));
         assert!(!is_permanent_auth_error(""));
+    }
+
+    #[test]
+    fn test_regression_planted_resilience03_in_a_server_body_is_not_permanent() {
+        // SEC-R1-3: the HTTP-response reason concatenates a server body; a
+        // body carrying our refusal literal must not end the retry loop.
+        assert!(!is_permanent_auth_error(
+            "generateAccessToken HTTP 502 url=https://auth.dhan.co/app/generateAccessToken \
+             body=RESILIENCE-03: instance lock not held"
+        ));
+        assert!(!is_permanent_auth_error(
+            "Dhan authentication failed: generateAccessToken HTTP 502 url=x \
+             body=RESILIENCE-03: instance lock not held"
+        ));
+        // Our own refusal, at the start, with or without the Display prefix.
+        assert!(is_permanent_auth_error(&format!(
+            "{RESILIENCE03_MINT_REFUSAL_REASON_PREFIX} — generateAccessToken mint refused"
+        )));
+        assert!(is_permanent_auth_error(&format!(
+            "Dhan authentication failed: {RESILIENCE03_MINT_REFUSAL_REASON_PREFIX} — refused"
+        )));
+    }
+
+    #[test]
+    fn test_regression_transport_failure_is_never_permanent_whatever_its_words() {
+        // A proxy or firewall refusing the connection is reqwest text, not
+        // a Dhan verdict on the account.
+        for reason in [
+            "generateAccessToken request failed: error sending request: connection blocked by proxy",
+            "generateAccessToken request failed: tls handshake: renegotiation disabled",
+            "Dhan authentication failed: generateAccessToken request failed: account blocked",
+        ] {
+            assert!(!is_permanent_auth_error(reason), "{reason}");
+        }
+    }
+
+    #[test]
+    fn test_regression_server_error_page_never_reads_as_permanent() {
+        // A 5xx or 429 body is an infrastructure page, never a verdict on
+        // the account; nor is a 2xx body that parsed as nothing.
+        for reason in [
+            "generateAccessToken HTTP 503 Service Unavailable url=x body=<html>Request blocked by firewall</html>",
+            "Dhan authentication failed: generateAccessToken HTTP 502 Bad Gateway url=x body=service disabled",
+            "generateAccessToken HTTP 429 Too Many Requests url=x body={\"message\":\"Invalid Client ID\"}",
+            "generateAccessToken HTTP garbage url=x body=blocked",
+            "failed to parse auth response (HTTP 200 OK): expected value\nResponse body: <p>account blocked</p>",
+        ] {
+            assert!(!is_permanent_auth_error(reason), "{reason}");
+        }
+        // A 4xx body can carry Dhan's verdict and is still read.
+        assert!(is_permanent_auth_error(
+            "generateAccessToken HTTP 401 Unauthorized url=x body={\"message\":\"Invalid Pin\"}"
+        ));
+        assert!(is_permanent_auth_error(
+            "Dhan authentication failed: generateAccessToken HTTP 403 Forbidden url=x body=account blocked"
+        ));
+    }
+
+    #[test]
+    fn test_is_client_refusal_status_cases() {
+        assert!(is_client_refusal_status(" 400 Bad Request url=x"));
+        assert!(is_client_refusal_status(" 499 url=x"));
+        assert!(!is_client_refusal_status(" 429 Too Many Requests"));
+        assert!(!is_client_refusal_status(" 500 Internal Server Error"));
+        assert!(!is_client_refusal_status(" 399"));
+        assert!(!is_client_refusal_status(" 4"));
+        assert!(!is_client_refusal_status(""));
+    }
+
+    #[test]
+    fn test_regression_account_words_match_whole_words_only() {
+        assert!(!is_permanent_auth_error(
+            "Dhan auth error: account unblocked, retry"
+        ));
+        assert!(!is_permanent_auth_error(
+            "Dhan auth error: disabledAt field missing"
+        ));
+        assert!(is_permanent_auth_error(
+            "Dhan auth error: Account is blocked"
+        ));
+        assert!(is_permanent_auth_error(
+            "Dhan auth error: API access DISABLED."
+        ));
+        assert!(is_permanent_auth_error("Dhan auth error: user (suspended)"));
+    }
+
+    #[test]
+    fn test_contains_word_cases() {
+        assert!(contains_word("account blocked", "blocked"));
+        assert!(contains_word("blocked", "blocked"));
+        assert!(contains_word("a-blocked-b", "blocked"));
+        assert!(!contains_word("unblocked", "blocked"));
+        assert!(!contains_word("blockedx", "blocked"));
+        assert!(!contains_word("", "blocked"));
     }
 
     #[test]

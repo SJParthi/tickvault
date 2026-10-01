@@ -50,7 +50,7 @@ This plan converts hope into bounded, tested, alarmed guarantees. It does NOT pr
     the claim** instead. An unused dependency backing a documented guarantee is worse than
     no guarantee.
   - Files: `crates/app/src/main.rs`, `crates/app/Cargo.toml`
-  - Tests: `test_core_affinity_is_wired_or_absent` (source-scan ratchet — the dependency
+  - Tests: crates/common/tests/core_affinity_claim_guard.rs — the guard that replaced the planned single test, noted 2026-10-01 (source-scan ratchet — the dependency
     and a call site must co-exist, or neither may)
 
 - [ ] **Item 2 — Boot-time limit assertions (deploy + config, UNBLOCKED)**
@@ -140,7 +140,7 @@ This plan converts hope into bounded, tested, alarmed guarantees. It does NOT pr
   - Files: `deploy/aws/terraform/main.tf`, `crates/aws-lambdas/src/start_watchdog.rs`
   - Tests: `az_failover_guard.rs`
 
-- [ ] **Item 8 — Rebuild cross-verification: Dhan-only, NTM + NSE indices, and RETIRE the
+- [~] **Item 8 — Rebuild cross-verification: Dhan-only, NTM + NSE indices, and RETIRE the
   current post-market pass** — **QUEUED 2026-08-19 by operator directive** (verbatim, typos
   preserved): *"see as of now add this into the queue dude which is for cross verification
   enitlrey oen and only for ethe ntire ntm and entie idnices for dhan alone dude which is one
@@ -222,7 +222,7 @@ This plan converts hope into bounded, tested, alarmed guarantees. It does NOT pr
     > and never Ok remain the reference for any future comparator, in this repository or
     > another. Item 43 removes the comparator; it does not retire the lesson.
 
-- [ ] **Item 9 — depth-200 = ATM CE/PE of the current expiry, NIFTY + BANKNIFTY only, with a
+- [~] **Item 9 — (SUPERSEDED 2026-09-23/24, see Item 48) depth-200 = ATM CE/PE of the current expiry, NIFTY + BANKNIFTY only, with a
   HYSTERESIS re-subscribe policy** — **QUEUED 2026-08-19 by operator directive** (verbatim,
   typos preserved): *"see emanwhiel as of now for depth 200 always stick to atm ce pe of
   ciurrent expiry aloen for both nifty and banknifty dude okay? see how will yo ualways ensrue
@@ -1586,7 +1586,7 @@ whether the refused ticks are the indices — remain open and are answered in on
     `deterministic_run_ts_nanos_is_one_minute_past_the_close_regardless_of_fire_time`
 - [x] **16b — the fire time moved in lockstep with the window end**
   - Files: `crates/app/src/dhan_feed_stack.rs`
-  - Tests: `test_crossverify_schedule_lands_on_1531_ist_and_never_double_fires`,
+  - Tests: N/A — the 15:31 schedule and its tests were deleted with the 15:41 check on 2026-09-16 (Item 43; noted 2026-10-01). Were: `test_crossverify_schedule_lands_on_1531_ist_and_never_double_fires`,
     `test_crossverify_day_origin_covers_the_entire_session_not_just_the_first_45_minutes`
 
 ### What was wrong
@@ -1730,7 +1730,7 @@ and the shared Data-API limiter bypass) are recorded in Item 18 and are NOT fixe
   - Tests: `a_non_finite_average_traded_price_becomes_null_and_never_refuses_the_tick` (bite-proven)
 - [x] **18c — the cross-verify labelled every target `INDEX`: a partial-denominator vacuous pass**
   - Files: `crates/app/src/dhan_feed_stack.rs`
-  - Tests: `an_equity_is_never_targeted_as_an_index_and_fno_is_never_guessed` (bite-proven)
+  - Tests: N/A — deleted with the 15:41 check on 2026-09-16 (Item 43; noted 2026-10-01). Was `an_equity_is_never_targeted_as_an_index_and_fno_is_never_guessed` (bite-proven)
 - [x] **18d — an out-of-range target id was coerced to security_id 0**
   - Folded into 18c; same function, same test.
 
@@ -5352,7 +5352,7 @@ written 5.02 TB → .
 
 ## ITEM 43 — DESIGN ADDENDUM (added 2026-09-16, operator: "Bro just remove per minute price falls and 3.41 pm accuracy check alone dude okay", reaffirmed "So once everything is entirely fi ed and resolved then this will be merged and deployed right dude")
 
-- [ ] **Item 43 — Remove the per-minute Dhan REST market-data legs and the 15:41 cross-verification**
+- [x] **Item 43 — Remove the per-minute Dhan REST market-data legs and the 15:41 cross-verification**
 
 **Slot note.** The tree is at exactly 5 `active-plan*.md` files, and `plan-gate.sh` V7
 BLOCKS every `crates/*/src/**.rs` push at 6. This item is therefore added INSIDE this
@@ -5506,7 +5506,7 @@ Local `/metrics` counters plus coded log lines only (no EMF name, no alarm — s
 - [x] Four lockstep sites 150 → 225: `deploy/aws/terraform/budget.tf`, `deploy/aws/terraform/budget-guards.tf`, `crates/aws-lambdas/src/budget_digest.rs`, `crates/aws-lambdas/src/hard_stop_guard.rs`.
 - [x] `hard_stop_guard::effective_budget_kill_usd` clamps every UTC billing month except 2026-09 to `STANDING_BUDGET_KILL_USD` = 150; wired into the breach check, the ping decision and the ping text.
 - [x] Daily digest shows the effective ceiling for its month.
-- Tests: `effective_ceiling_*` unit tests in `hard_stop_guard.rs`; `budget_ceiling_lockstep_guard.rs` gains `standing_cap_is_150_and_never_above_the_fallback` and records both $150 and $225 in the rule files.
+- Tests: `effective_ceiling_*` unit tests in `hard_stop_guard.rs`; `budget_ceiling_lockstep_guard.rs` gains `standing_cap_is_150_and_the_allowance_is_one_month` (name corrected 2026-10-01) and records both $150 and $225 in the rule files.
 
 **Rollback:** revert the commit; the four sites go back to $150 and the clamp disappears. **Observability:** unchanged surfaces — the running ping and the daily digest now print the effective ceiling. **Failure mode:** if the 1-Oct revert PR never lands, the code clamp still holds October at $150; the native AWS actions would stay at percentages of $225 until it does.
 
@@ -5609,7 +5609,7 @@ Measured on production (read-only): on 2026-09-28 the 1-minute candles of ~696 N
 
 - [x] 47e — **Review round 1 fixes (2026-09-29, three reviewers).** (1) `mark_replay_gap` is O(1): an epoch bump applied lazily per slot (`InstrumentSlot::sync_replay_gap`), so many gaps cannot cost gaps × slots. (2) Only a skipped MAIN-FEED frame is a gap; a dropped depth frame hides no tick. (3) The replay ends ONCE, at the hand-over before the live drain (`MultiTfAggregator::finish_replay` via `LiveIngest::finish_wal_replay`), which taints every bucket still open and partial so it cannot seal later in live mode over a complete stored bar. (4) After a gap the chain breaks only for a frame with no open bucket (`AggregatorCell::rebase_open_buckets_after_gap`), so the next longer bucket keeps its rolling tick. (5) A catch-up round that follows a clean one does not start on a false gap (`WalReplayBatch::{leading_gap, trailing_gap}`). Tests: `test_mark_replay_gap_repeated_marks_collapse_into_one`, `test_mark_replay_gap_reaches_a_slot_through_the_seal_sweep`, `test_replay_dropped_depth_frame_is_not_a_gap`, `test_finish_replay_taints_open_partial_buckets_only`, `test_mark_replay_gap_next_longer_bucket_keeps_its_rolling_tick`, `test_rebase_open_buckets_after_gap_breaks_the_chain_only_where_nothing_is_open`, `test_finish_wal_replay_runs_once_between_the_catch_up_and_the_drain`.
 
-- [x] 47f — **Review round 2 fixes (2026-09-29, five parallel attackers).** (1) A post-gap tick that lands in the SAME open bucket keeps the whole span's volume (exact by the cumulative) instead of re-basing it away; that bucket stays partial because its high/low miss the skipped ticks (`AggregatorCell::rebase_open_buckets_after_gap(cum, fold_secs)`). (2) A gap also marks the last SEALED bar partial, so a replayed late tick cannot re-emit it without skipped amendments. (3) The close seal judges an amended last-sealed bar by its sealed bits (`force_seal_all`). (4) `finish_replay(ended_on_gap)` taints EVERY open bucket when the replay ended with frames after its last one skipped or unread; `ended_on_gap` comes from the boot pass through every catch-up round (`DhanFeedStackParams::wal_replay_trailing_gap`, `catchup_prev_trailing_gap`, `!catchup_drained`). (5) A jump in capture time over `WAL_REPLAY_CAPTURE_GAP_NANOS` (30 s) between consecutive main-feed frames is a gap, in both WAL readers and across the boot/catch-up boundary (`capture_jump_is_gap`, `wal_replay_last_fold_seq`). (6) Only a live-feed main-feed frame is a gap when dropped (`frame_feeds_the_candle_fold`; TrueData shares the endpoint byte). (7) Applied segments past a budget stop are archived only once a pass gets past them, so the next pass still sees their gap (`pending_skips`). (8) A gap flagged on the last non-live frame of a round carries to the next round. (9) The hand-over logs tainted buckets and suppressed bars. (10) DHAT phase (d) gates the replay branches: 0 allocations. Tests: `test_mark_replay_gap_suppresses_a_late_amendment_of_a_bar_sealed_before_it`, `test_finish_replay_same_bucket_live_tick_keeps_the_downtime_volume`, `test_finish_replay_ended_on_gap_taints_every_open_bucket`, `test_force_seal_all_judges_an_amended_last_sealed_bar_by_its_sealed_bits`, `test_replay_skipped_segment_past_a_budget_stop_is_kept_for_the_next_pass`, `test_frame_feeds_the_candle_fold_and_capture_jump_is_gap`, `dhat_consume_tick_zero_alloc_in_bucket_and_across_boundaries` phase (d); each fails without its fix.
+- [x] 47f — **Review round 2 fixes (2026-09-29, five parallel attackers).** (1) A post-gap tick that lands in the SAME open bucket keeps the whole span's volume (exact by the cumulative) instead of re-basing it away; that bucket stays partial because its high/low miss the skipped ticks (`AggregatorCell::rebase_open_buckets_after_gap(cum, fold_secs)`). (2) A gap also marks the last SEALED bar partial, so a replayed late tick cannot re-emit it without skipped amendments. (3) The close seal judges an amended last-sealed bar by its sealed bits (`force_seal_all`). (4) `finish_replay(ended_on_gap)` taints EVERY open bucket when the replay ended with frames after its last one skipped or unread; `ended_on_gap` comes from the boot pass through every catch-up round (`DhanFeedStackParams::wal_replay_trailing_gap`, `catchup_prev_trailing_gap`, `!catchup_drained`). (5) A jump in capture time over `WAL_REPLAY_CAPTURE_GAP_NANOS` (30 s) between consecutive main-feed frames is a gap, in both WAL readers and across the boot/catch-up boundary (`capture_jump_is_gap`, `wal_replay_last_fold_seq`). (6) Only a live-feed main-feed frame is a gap when dropped (`frame_feeds_the_candle_fold`; TrueData shares the endpoint byte). (7) Applied segments past a budget stop are archived only once a pass gets past them, so the next pass still sees their gap (`pending_skips`). (8) A gap flagged on the last non-live frame of a round carries to the next round. (9) The hand-over logs tainted buckets and suppressed bars. (10) DHAT phase (d) gates the replay branches: 0 allocations. Tests: `test_mark_replay_gap_suppresses_a_late_amendment_of_a_bar_sealed_before_it`, `test_finish_replay_same_bucket_live_tick_keeps_the_downtime_volume`, `test_finish_replay_ended_on_gap_taints_every_open_bucket`, `test_force_seal_all_judges_an_amended_last_sealed_bar_by_its_sealed_bits`, `test_replay_skipped_segment_past_a_budget_stop_is_kept_for_the_next_pass`, `test_frame_feeds_the_candle_fold_and_process_boundary_is_gap`, `dhat_consume_tick_zero_alloc_in_bucket_and_across_boundaries` phase (d); each fails without its fix.
 
 - [x] 47g — **Review round 3 fixes (2026-09-29, two attackers).** (1) The baseline stays SEEDED across a gap, so the stale-packet and counter-restart checks still run on the first post-gap tick; the gap tick's own delta is discarded instead (`gap_now`), and a restart inside the gap uses the restart's own full re-base. (2) A partial bar whose bucket ENDED before this process began capturing is never written, in any mode: the first packet after a subscribe carries the last trade time, which could otherwise overwrite a stored bar with a one-tick, zero-volume fragment — on every mid-session restart, replay or not (`MultiTfAggregator::set_live_capture_start`, set in `LiveIngest::finish_wal_replay`). A new slot's first buckets are marked partial in every mode for this. (3) A same-bucket frame across a gap marks its net unclassified. (4) A replay that ended on a gap taints every last-sealed bar. (5) An empty final catch-up pass still reports a trailing gap. (6) Skipped leftovers in `replaying/` past a stop go back to the live dir. (7) Process boundaries are detected on RECEIPT time, only across segment boundaries, over 5 s (`process_boundary_is_gap`, `ReplayedFrame::first_in_segment`); frame sequences understated downtime and a 30 s in-segment threshold could misfire in session. Tests: `test_mark_replay_gap_stale_first_packet_does_not_count_twice`, `test_mark_replay_gap_counter_restart_inside_the_gap_is_detected`, `test_set_live_capture_start_suppresses_a_fragment_of_an_old_bucket`, `test_finish_replay_ended_on_gap_blocks_amending_the_last_sealed_bar`, `test_replay_skipped_leftover_in_replaying_past_a_stop_is_restored`, `test_replay_marks_the_first_frame_of_each_segment`, `test_frame_feeds_the_candle_fold_and_process_boundary_is_gap`; each bite-checked.
 
@@ -5672,5 +5672,55 @@ The tests named in 47a–47d, plus the aggregator, storage replay and refold sui
 Revert the commit. No schema change.
 ### Observability
 `tv_candle_refold_partial_suppressed_total` (seeded at 0) and the refold's info line reporting gaps and suppressed bars.
+
+Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
+
+---
+
+## ITEM 48 — DESIGN ADDENDUM (added 2026-10-01, operator: "check the recent commits requirments discussions which have been missign and not completed elt us try to fix evrythign ddue okay?"): close the September follow-ups that were promised and never done
+
+**Slot note.** The tree is at exactly 5 `active-plan*.md` files, so this item is
+added INSIDE this plan, as Items 43–47 were.
+
+A survey of every commit, PR, issue and plan file from 2026-09-01 to 2026-10-01
+found work that a commit or PR body promised as "its own change" or "a
+follow-up" and that never landed. This item closes the small, verified ones in
+one pull request. The larger open work (ITEM 45b–45i, 12b, the telemetry
+library upgrade) stays under its own items.
+
+- [x] 48a — **Login-failure alerts named the removed minute pulls.** Families 3 and 4 said "the Dhan spot-1m and option-chain pulls will stop"; those pulls were removed on 2026-09-16 (commit 53ea4b6: "follow-up, not fixed here"). They now name the live price feed. Rule first: `dhan-rest-only-noise-lock-2026-07-14.md` §2.4 "2026-10-01".
+  - Files: crates/core/src/notification/events.rs, crates/core/src/auth/mid_session_watchdog.rs, crates/aws-lambdas/src/telegram_webhook.rs, crates/trading/tests/safety_layer.rs, docs/claude-rules-full/project/dhan-rest-only-noise-lock-2026-07-14.md
+  - Tests: test_regression_login_alerts_never_name_the_removed_minute_pulls, test_auth_failed_includes_reason, test_broker_scoped_alarm_phrases_carry_dhan_tag
+- [x] 48b — **The permanent-login-error check read loose words.** `is_permanent_auth_error` scanned the whole rendered reason with unanchored `contains` (commit b2553a1: "NOT fixed here … its own change"). Our RESILIENCE-03 refusal is now matched only at the reason's start (a server body can no longer forge it, SEC-R1-3), a transport failure (`MINT_SEND_LEG_WRAPPER`, reqwest text) is never permanent, and "blocked" / "suspended" / "disabled" match whole words only. Review round 1 (2026-10-01): the account words were still read inside any HTTP error body, so a firewall page saying "Request blocked" on a 503 ended the retries; now only a `status:error` body or a 4xx other than 429 is read, and a body that parsed as nothing is transient (`test_regression_server_error_page_never_reads_as_permanent`, `test_is_client_refusal_status_cases`).
+  - Files: crates/core/src/auth/token_manager.rs
+  - Tests: test_regression_planted_resilience03_in_a_server_body_is_not_permanent, test_regression_transport_failure_is_never_permanent_whatever_its_words, test_regression_account_words_match_whole_words_only, test_contains_word_cases, test_resilience03_is_permanent_auth_error
+- [x] 48c — **plan-verify.sh passed every plan without reading it.** It read only `active-plan.md`, a name no plan uses (commit e1a1584: "Closing that is its own change"). It now checks every `active-plan*.md` (or the files named), checks only ticked items' tests and files, fails a VERIFIED plan with open items, and has a self-test in CI's Repo Guards job. Review round 1 (2026-10-01): it also reads `Tests:` written inline on the item line (a name there passes if an identifier starts with it), `[X]`, and a Status with a trailing note; this found one more stale name (47f, renamed to `test_frame_feeds_the_candle_fold_and_process_boundary_is_gap`).
+  - Files: .claude/hooks/plan-verify.sh, .claude/hooks/plan-verify.selftest.sh, .github/workflows/ci.yml
+  - Tests: N/A — shell self-test `plan-verify.selftest.sh`, 10 scenarios, bite-proven against the old script (6 of 10 fail there)
+- [x] 48d — **Dead config sections removed.** `[spot_1m_rest]`, `[option_chain_1m]` and `[cadence]` had no reader since 2026-09-16; base.toml called deleting them "the open §12.11 row". Removed with them: the config structs, their `AppConfig` fields and validators, four constants (`CADENCE_SPOT_WINDOW_MS`, `CADENCE_SPOT_WINDOW_CAP_CEILING`, `CADENCE_CHAIN_MIN_SPACING_FLOOR_MS`, `SPOT_1M_REST_FIRE_DELAY_MS`) and the 12 tests that only tested those types, so the test count drops by 12 on purpose. There is no `deny_unknown_fields`, so an older config file still loads. Left in place: `[dhan_data_api]`, which no longer limits anything; removing it is a follow-up.
+  - Files: crates/common/src/config.rs, config/base.toml, crates/common/src/constants.rs, crates/common/tests/config_key_has_a_reader_guard.rs
+  - Tests: existing common config suite
+- [x] 48e — **Plan state matched to the code.** Item 43 ticked (landed 2026-09-16; the 15:41 check was restored on purpose 2026-09-24, §12.15). Items 8 and 9 marked superseded (`[~]`): Item 8 by Item 43, Item 9 by the 2026-09-23/24 ruling that depth-200 is stock options only. Four ticked items' test names corrected (two deleted with the 15:41 check, one renamed to a guard file, one misspelt). Order-surface C1 and D1 ticked (both live: `order_observability.rs` writes `order_audit`; the 15:25 watchdog is spawned process-wide). With 48c this plan now passes `plan-verify.sh` with every ticked item's tests and files found.
+  - Files: .claude/plans/active-plan-feed-hardening.md, .claude/plans/active-plan-dhan-order-surface.md
+  - Tests: N/A — plan text
+- [x] 48f — **Rule summaries carried the 2026-09-29 zero-loss quotes.** Commit dc3abb2 left the two auto-loaded stubs "for the operator"; they now summarise Quote 27 + 28 (including that Quotes 21–26 are spent) and the scope lock's "2026-09-29 — ZERO LOSS" section with its REJECT rows. The full daily-universe rule says the raw-frame cost is "Recorded in `aws-budget.md`"; it was not, and now is (COST NOTE 2026-09-29, marked not yet spent and Assumed).
+  - Files: .claude/rules/project/daily-universe-scope-expansion-2026-05-27.md, .claude/rules/project/websocket-connection-scope-lock.md, .claude/rules/project/aws-budget.md
+  - Tests: N/A — rule text
+- [x] 48g — **CLAUDE.md's `atm_pair_for` row was stale about reachability.** Depth-20 became a static day set on 2026-09-24; the 5-million-row-visit loop is now test-only. Dated correction added; the live path is O(2 × 3 × candidates) at the depth attach.
+  - Files: CLAUDE.md
+  - Tests: N/A — documentation
+
+### Design
+Each sub-item is the smallest change that makes the named promise true. No behaviour changes except 48b (classification of a failed login) and 48a (alert words). 48b narrows "permanent" only: a reason that was transient stays transient.
+### Edge Cases
+48b: the reason may or may not carry the "Dhan authentication failed: " Display prefix (`reason_core` strips it); RESILIENCE-03 inside a server body; "unblocked"; upper case. 48c: a plan with no Status; Tests lists holding prose, file names, `path::name` and parenthesised notes with commas.
+### Failure Modes
+48b: a real account block arriving inside a transport error would now retry instead of failing fast. Reqwest's transport text never carries Dhan's account verdict, so this cannot happen; a block arriving as an HTTP response or a 200 error body is still permanent. 48c: the script is a manual tool and no push gate calls it, so a false failure blocks nothing.
+### Test Plan
+Named per sub-item above; `cargo test -p tickvault-core`, `-p tickvault-aws-lambdas`, `-p tickvault-common`, the trading `safety_layer` suite, and the plan-verify self-test.
+### Rollback
+Revert the commit. No schema, no data, no infrastructure change.
+### Observability
+No new metric. 48a changes only the text of existing pages.
 
 Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.

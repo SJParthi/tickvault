@@ -96,10 +96,6 @@ const KNOWN_INERT: &[(&str, &str)] = &[
         "base.toml [cross_verify]. Reads as a trading kill-switch driven by \
          comparator disagreement. Nothing reads it.",
     ),
-    (
-        "history_repull_enabled",
-        "base.toml [cadence], re-pull arm removed with the cross-fill path.",
-    ),
 ];
 
 const CONFIG_FILES: &[&str] = &[
