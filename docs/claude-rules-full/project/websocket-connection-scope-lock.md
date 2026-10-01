@@ -8352,12 +8352,20 @@ the 2026-08-21 section, and the October budget is Quote 23 in
 #### Why the 2026-09-24 reason no longer holds
 
 The 2026-09-24 section chose rotate-by-reconnect "because till now dhan ahsnt
-confirmed about unsunscirbe". Dhan has now confirmed it: their 2026-09-30 reply
+confirmed about unsunscirbe". Dhan has now answered: their 2026-09-30 reply
 (`docs/dhan-support/2026-09-13-depth-unsubscribe-ignored.md`, transcribed
 verbatim) states that RequestCode **25** with the same instrument details used
 in the subscribe unsubscribes one instrument, and that RequestCode 12 closes the
 whole connection. Our 200-level unsubscribe is the flat form with 25, the same
 details as its flat subscribe with 23.
+
+**What the reply does NOT settle (stated so nobody reads "confirmed" as "proven").**
+Our 20-level code-25 frames already had the reply's exact shape, and both code-25
+sessions in that ticket still measured contracts arriving after the unsubscribe
+(110,114 ghost packets on 2026-09-10; 41 ghost verdicts on 2026-09-24). The reply
+shows only the list form; that the FLAT form with 25 works on 200-level is our
+reading, not Dhan's statement. So the in-place change is the operator's ruling on
+the trade, not a measured fact, and the ghost counter is how it is checked.
 
 #### Every deliberate close-and-redial in the tree (audited 2026-10-01)
 
@@ -8404,14 +8412,22 @@ Top 5 distinct stock-option underlyings, the 3 s first board then the 1-minute
 board, the 20-underlying hysteresis band, at most one change per socket per
 minute and five pool-wide, the static depth-20 day set, and the
 `ROTATION_HALTED` breaker: after any 805 no depth-200 change and no ghost
-unsubscribe is sent for the rest of the process.
+unsubscribe is sent for the rest of the process. Both are checked again at the
+connection, where the write happens, so a swap queued or a ghost request armed
+before the 805 is refused too (`an_805_refuses_a_queued_swap_and_a_pending_ghost_at_the_connection`).
 
 #### ⚠ Honest envelope
 
 - **A ghost is wasted bandwidth, not lost data.** If Dhan still streams a
   contract after 25 (measured before: 110,114 ghost packets on 2026-09-10), the
   extra rows are stored. The resend is the remedy; there is no longer a redial
-  behind it.
+  behind it. **Risk:** if Dhan ignores 25 on a depth-200 socket, each change
+  leaves the old contract streaming beside the new one until a resend lands,
+  and the resend is rate-limited (one per socket per 180 s, at most 8 per
+  socket per session, 20 s apart pool-wide), so ghost streams can build up on
+  those sockets. The rows are all stored, but extra depth volume is load on the
+  drain and the database, and a stalled drain is how Dhan skips ahead. Watch
+  `tv_dhan_feed_depth_total{outcome="ghost"}` on the first sessions.
 - **Dhan sends no acknowledgement for an unsubscribe** (their reply did not
   answer that question), so the only evidence is the ghost counter.
 - **The new contract has a blind window** until its book next changes — the

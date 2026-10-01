@@ -330,6 +330,14 @@ This plan converts hope into bounded, tested, alarmed guarantees. It does NOT pr
     plus the existing swap tests (`a_swap_unsubscribes_before_it_subscribes`,
     `a_swap_does_not_eat_the_frames_arriving_around_it`,
     `a_swap_that_empties_the_socket_forces_a_redial`)
+  - Review fixes (three reviewers, 2026-10-01): the 805 breaker is checked again at the
+    connection for a queued swap and a pending ghost resend; a pending ghost request is never
+    overwritten and the take reads the pair before clearing the flag; a request the socket
+    holds again is refunded to the ceiling. Tests:
+    `an_805_refuses_a_queued_swap_and_a_pending_ghost_at_the_connection`,
+    `a_pending_ghost_unsubscribe_is_never_overwritten_and_is_taken_once`,
+    `a_racing_take_never_reads_a_torn_id_and_segment_pair`,
+    `refund_ghost_resend_returns_one_place_and_saturates_at_zero`
   - Full design: ITEM RESUB addendum below
 
 
