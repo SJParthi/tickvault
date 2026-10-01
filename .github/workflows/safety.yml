@@ -654,6 +654,21 @@ jobs:
           # ONE feature configuration — the -Z build-std artifacts build
           # once and are reused across every crate.
           set -o pipefail
+          # One suppression, for one reproduced false positive in tokio
+          # (issue 1990). tokio hands each socket's ScheduledIo to the I/O
+          # driver thread as the epoll token, and TSan sees no ordering
+          # between the registering thread's Arc::new and the driver's read.
+          # A 25-line tokio-only program (tokio =1.53.1, multi-thread
+          # runtime, one TcpStream::connect) reports the same two warnings.
+          # The rule matches only races whose stacks pass through tokio's
+          # RegistrationSet::allocate; a deliberate race in our own code is
+          # still reported under it. print_suppressions=1 prints how many
+          # reports it hid, so the log shows its reach every run.
+          tsan_supp="$RUNNER_TEMP/tsan-suppressions.txt"
+          printf '%s\n' \
+            'race:tokio::runtime::io::registration_set::RegistrationSet>::allocate' \
+            > "$tsan_supp"
+          export TSAN_OPTIONS="${TSAN_OPTIONS}:suppressions=${tsan_supp}:print_suppressions=1"
           : > /tmp/tsan-test.log
           declare -A verdict
           failed=()
