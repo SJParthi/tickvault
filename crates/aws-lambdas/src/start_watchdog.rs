@@ -529,7 +529,7 @@ pub async fn read_keep_alive_until<S: SsmApi>(ssm: &S, param: &str) -> Option<Da
     }
 }
 
-/// Legacy `_holiday_stop_is_today` — true iff holiday-gate.sh stamped
+/// Legacy `_holiday_stop_is_today` — true iff the holiday gate stamped
 /// TODAY's IST date into the marker. FAIL-OPEN False on any error so a real
 /// trading day can never lose the 08:45 rescue.
 pub async fn holiday_stop_is_today<S: SsmApi>(
@@ -848,7 +848,7 @@ for AWS-StartEC2Instance, and the EventBridge rule's FailedInvocations."
     if holiday_stop_is_today(ssm, &env.holiday_stop_param, now).await {
         info!(
             state = %state,
-            "check — box is stopped but the holiday-stop marker is TODAY (NSE-holiday self-stop by holiday-gate.sh); staying silent"
+            "check — box is stopped but the holiday-stop marker is TODAY (NSE-holiday self-stop by the holiday gate); staying silent"
         );
         return Ok(json!({
             "mode": "check", "state": state, "alerted": false, "self_started": false,

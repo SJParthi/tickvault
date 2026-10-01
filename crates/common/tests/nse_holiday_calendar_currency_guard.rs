@@ -5,7 +5,7 @@
 //! Why (HIGH finding, 2026-07-01 adversarial automation hunt): `is_trading_day`
 //! (`crates/common/src/trading_calendar.rs`) treats ANY weekday not explicitly
 //! listed in `nse_holidays` as a trading day — there is no year bound. The
-//! holiday-gate self-stop (`deploy/aws/holiday-gate.sh`) relies on that calendar.
+//! holiday-gate self-stop (`tickvault holiday-gate`) relies on that calendar.
 //! So if the list only contains (say) 2026 dates and the box runs into 2027,
 //! every 2027 weekday holiday (Republic Day, Holi, Diwali, …) is treated as a
 //! trading day: the box starts, both feeds connect, and it burns a full ~8h of

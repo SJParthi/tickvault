@@ -96,7 +96,7 @@
 #   shifted to the market-hours window.
 #
 #   WEEKDAY NSE HOLIDAYS (2026-07-07 review fix): the open cron is holiday-blind
-#   (plain MON-FRI), but holiday-gate.sh SELF-STOPS the box on a definitive
+#   (plain MON-FRI), but the holiday gate SELF-STOPS the box on a definitive
 #   NSE-holiday verdict at boot (~08:32 IST) — so a blind 09:20 enable + OK
 #   reset would drive every breaching-on-missing member (this alarm +
 #   app-log-ingestion-silent) OK→ALARM against an intentionally-stopped box:
@@ -111,9 +111,9 @@
 #   holiday-blind self-healers kept restarting it all day (start-watchdog
 #   mode=check @ 08:45 IST self-start; aws-autopilot start-instances every
 #   15 min inside its 08:30-16:30 IST up-window, incl. the 03:45 UTC ≈ 09:15
-#   IST slot + GH cron jitter), and holiday-gate.sh re-stopped it ~2-3 min
+#   IST slot + GH cron jitter), and the holiday gate re-stopped it ~2-3 min
 #   after each boot — 1-3 min up-bursts that can bracket the 09:20 sample and
-#   restore the false page. Fix: holiday-gate.sh now stamps today's IST date
+#   restore the false page. Fix: the holiday gate now stamps today's IST date
 #   into the /tickvault/<env>/holiday-stop-date SSM param BEFORE the stop;
 #   (a) BOTH restarters consult it and skip the self-start (the war ends at
 #   the source — the box now genuinely stays stopped), and (b) this gate
@@ -321,7 +321,7 @@ resource "aws_iam_role_policy" "tv_market_hours_liveness_gate" {
       {
         # Weekday-NSE-holiday safety (2026-07-07): the open path checks the
         # tv-app instance state before enabling the breaching-on-missing
-        # alarms (holiday-gate.sh self-stops the box on holidays, so a blind
+        # alarms (the holiday gate self-stops the box on holidays, so a blind
         # MON-FRI enable would false-page). DescribeInstances has no
         # resource-level scoping in IAM (AWS limitation), so "*" is required;
         # the Lambda only ever reads EC2_INSTANCE_ID. Same pattern as
@@ -332,7 +332,7 @@ resource "aws_iam_role_policy" "tv_market_hours_liveness_gate" {
       },
       {
         # Round-3 holiday-race hardening (2026-07-07): the open path reads
-        # the /tickvault/<env>/holiday-stop-date marker holiday-gate.sh
+        # the /tickvault/<env>/holiday-stop-date marker the holiday gate
         # stamps before its self-stop — marker == today is race-proof
         # (the single instance-state sample can be bracketed by a
         # restart-war up-burst). Read-only, scoped to that one parameter.
@@ -601,13 +601,13 @@ resource "aws_lambda_function" "tv_market_hours_liveness_gate" {
         # groww_exchange_lag_p99_high retired 2026-07-15 (Groww live feed removal).
       ])
       # Weekday-NSE-holiday safety: the open path skips enabling when this
-      # instance is not up (holiday-gate.sh self-stop). Referencing
+      # instance is not up (the holiday gate self-stop). Referencing
       # aws_instance.tv_app.id from a Lambda env is cycle-free — the proven
       # pattern from start-watchdog-lambda.tf (the cycle concern in main.tf
       # applies only to the instance's OWN role policy).
       EC2_INSTANCE_ID = aws_instance.tv_app.id
       # Round-3 holiday-race hardening: the intentional-stop marker
-      # holiday-gate.sh writes before its self-stop. Checked FIRST on open —
+      # the holiday gate writes before its self-stop. Checked FIRST on open —
       # cannot be raced by a restart-war up-burst at the 09:20 sample.
       HOLIDAY_STOP_PARAM = "/tickvault/${var.environment}/holiday-stop-date"
     }

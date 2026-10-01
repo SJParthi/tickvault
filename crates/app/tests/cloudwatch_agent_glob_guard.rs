@@ -24,7 +24,7 @@
 //!  6. The deploy workflow loses the LOG-INGESTION-SMOKE step (or oidc.tf
 //!     loses the `logs:FilterLogEvents` grant it needs).
 //!  7. The market-hours gate Lambda loses its weekday-NSE-holiday safety
-//!     (2026-07-07 round-1 review fix): holiday-gate.sh SELF-STOPS the box
+//!     (2026-07-07 round-1 review fix): the holiday gate SELF-STOPS the box
 //!     on weekday NSE holidays while the gate's open cron is holiday-blind
 //!     MON-FRI — a blind 09:20 enable + OK reset would false-page both
 //!     breaching-on-missing gated alarms (~09:25 / ~09:35 IST) every
@@ -35,7 +35,7 @@
 //!     two holiday-blind self-healers (start-watchdog 08:45 IST check,
 //!     aws-autopilot every 15 min) kept restarting the holiday-stopped box
 //!     all day, and a 1-3 min up-burst bracketing the 09:20 sample restored
-//!     the false page. holiday-gate.sh now stamps today's IST date into the
+//!     the false page. The holiday gate now stamps today's IST date into the
 //!     /tickvault/<env>/holiday-stop-date SSM param BEFORE its stop; both
 //!     restarters skip their self-start on marker == today (the war ends at
 //!     the source), and the gate Lambda checks the marker FIRST (race-proof)
@@ -344,7 +344,7 @@ fn test_alarm_is_gated_by_market_hours_lambda() {
 }
 
 /// Round-1 review fix (2026-07-07): the gate Lambda's OPEN mode must be
-/// weekday-NSE-holiday safe. `deploy/aws/holiday-gate.sh` self-stops the box
+/// weekday-NSE-holiday safe. `tickvault holiday-gate` self-stops the box
 /// at boot on a definitive holiday verdict, while the gate's open cron is a
 /// holiday-blind plain MON-FRI schedule — so a blind enable + OK reset at
 /// 09:20 IST would drive both breaching-on-missing gated alarms
@@ -377,7 +377,7 @@ fn test_gate_lambda_open_is_holiday_safe() {
             norm.contains(pin),
             "market-hours-liveness-alarm.tf lost the holiday-safety pin `{pin}` — {why}. \
              Regressing this restores the weekday-NSE-holiday false page \
-             (box self-stopped by holiday-gate.sh + holiday-blind MON-FRI open cron \
+             (box self-stopped by the holiday gate + holiday-blind MON-FRI open cron \
              + treat_missing_data=breaching)."
         );
     }
@@ -391,7 +391,7 @@ fn test_gate_lambda_open_is_holiday_safe() {
         (
             "fail-open, treating as up",
             "an EC2 API error must NEVER suppress the trading-day liveness page \
-             — the check fails open, exactly mirroring holiday-gate.sh",
+             — the check fails open, exactly mirroring the holiday gate",
         ),
         (
             "leaving actions disabled",
@@ -423,11 +423,11 @@ fn test_gate_lambda_open_is_holiday_safe() {
 /// Round-3 review fix (2026-07-07): the round-1 single 09:20 IST
 /// instance-state sample is RACY — holiday-blind restarters (start-watchdog
 /// 08:45 self-start + aws-autopilot every 15 min, incl. the 03:45 UTC ≈
-/// 09:15 IST slot + GH cron jitter) fight holiday-gate.sh's self-stop all
+/// 09:15 IST slot + GH cron jitter) fight the holiday gate's self-stop all
 /// day, and a 1-3 min up-burst bracketing the 09:20 sample re-arms the
 /// breaching-on-missing alarms → the exact holiday false page. The gate
 /// Lambda's open path must therefore consult the race-proof
-/// holiday-stop-date SSM marker (stamped by holiday-gate.sh BEFORE its
+/// holiday-stop-date SSM marker (stamped by the holiday gate BEFORE its
 /// stop) FIRST, with the instance-state sample as the second line for the
 /// marker-less manual-stop case, and must fail OPEN on any SSM error.
 #[test]
@@ -440,7 +440,7 @@ fn test_gate_lambda_open_checks_holiday_marker_first() {
     for (pin, why) in [
         (
             "HOLIDAY_STOP_PARAM = \"/tickvault/${var.environment}/holiday-stop-date\"",
-            "the gate Lambda must be told WHERE holiday-gate.sh stamps the \
+            "the gate Lambda must be told WHERE the holiday gate stamps the \
              intentional-stop marker",
         ),
         (
@@ -597,7 +597,7 @@ fn test_gate_lambda_open_checks_holiday_marker_first() {
 
 /// Round-3 review fix (2026-07-07): the holiday-stop marker chain. Every
 /// link must survive — losing ANY one restores the holiday restart war:
-///   writer:   holiday-gate.sh stamps the marker BEFORE stop-instances
+///   writer:   the holiday gate stamps the marker BEFORE stop-instances
 ///   reader 1: start-watchdog mode=check skips self-start on marker==today
 ///             (also kills the pre-existing false Critical "auto-start
 ///             FAILED" page every weekday holiday)
@@ -607,23 +607,24 @@ fn test_gate_lambda_open_checks_holiday_marker_first() {
 ///             can ssm:GetParameter the marker param
 #[test]
 fn test_holiday_stop_marker_chain_is_wired() {
-    // --- writer: holiday-gate.sh, marker put BEFORE the stop ---------------
-    let gate = read("deploy/aws/holiday-gate.sh");
+    // --- writer: the holiday gate (a shell script until 2026-10-01, audit
+    //     D6c; now `crates/app/src/holiday_gate.rs`), marker put BEFORE the stop
+    let gate = read("crates/app/src/holiday_gate.rs");
     assert!(
         gate.contains("holiday-stop-date"),
-        "holiday-gate.sh lost the holiday-stop-date marker write — the \
+        "the holiday gate lost the holiday-stop-date marker write — the \
          intentional stop leaves no trace and the holiday-blind restarters \
          (start-watchdog + aws-autopilot) fight it all day"
     );
     let put_pos = gate
-        .find("ssm put-parameter")
-        .expect("holiday-gate.sh must write the marker via `aws ssm put-parameter`"); // APPROVED: test
+        .find(".put_parameter()")
+        .expect("the holiday gate must write the marker via SSM PutParameter"); // APPROVED: test
     let stop_pos = gate
-        .find("ec2 stop-instances")
-        .expect("holiday-gate.sh must still stop the instance on a holiday verdict"); // APPROVED: test
+        .find(".stop_instances()")
+        .expect("the holiday gate must still stop the instance on a holiday verdict"); // APPROVED: test
     assert!(
         put_pos < stop_pos,
-        "holiday-gate.sh must stamp the marker BEFORE stop-instances — writing \
+        "the holiday gate must stamp the marker BEFORE stop-instances — writing \
          after (or never) leaves a window where every restarter + the 09:20 \
          gate sample sees an unexplained stop"
     );

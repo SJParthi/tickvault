@@ -183,6 +183,10 @@ pub mod volume_semantics_probe;
 // PR #3 (2026-05-19): `greeks_pipeline` module DELETED. Greeks
 // pipeline retired alongside the indices-only universe. Option Chain
 // REST overlay (PR #8) ships Dhan-computed greeks separately.
+/// `tickvault holiday-gate`: the boot-time NSE-holiday self-stop gate the
+/// holiday-gate systemd unit runs before the app (audit D6c; replaced
+/// `deploy/aws/holiday-gate.sh`).
+pub mod holiday_gate;
 /// Boot-time verification of the kernel limits the market-data feed depends on
 /// (2026-08-10). `deploy/aws/sysctl/99-tickvault-net.conf` raises the socket
 /// receive buffer from the stock ~212 KB to 128 MB, but user-data applies it
