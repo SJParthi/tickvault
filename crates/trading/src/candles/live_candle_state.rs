@@ -85,6 +85,30 @@ pub struct LiveCandleState {
     pub tick_count: u32,
     /// IST epoch secs of the fold that set the current `close`.
     pub close_ts_ist_secs: u32,
+    /// IST epoch secs (exchange clock, the fold clock) of the trade that set
+    /// the current `open` — the mirror of [`Self::close_ts_ist_secs`].
+    ///
+    /// # Why (2026-10-01, plan item R6)
+    ///
+    /// `close` has been ordered by trade time on both fold paths since
+    /// 2026-08-25, but `open` was the first tick to ARRIVE. The feed carries no
+    /// sequence number and reorders inside a bucket (security 68407 on
+    /// 2026-09-11 showed five cumulative regressions before 09:40), so a bar
+    /// whose bucket was opened by a later trade kept that later price as its
+    /// open. Both fold paths now replace the open with a STRICTLY earlier
+    /// trade; within one second the first arrival keeps it, exactly as the
+    /// last arrival keeps the close.
+    ///
+    /// # `0` means PINNED
+    ///
+    /// `0` marks an open no trade may replace: the exchange's official day
+    /// open (stamped at every `day_open` site), or a state the live fold did
+    /// not produce (`empty()`, the spill decoder, a REST bar). Such a state is
+    /// never folded again, so the sentinel costs nothing there.
+    ///
+    /// Fold-internal and NOT persisted: the spill record keeps its size, and a
+    /// decoded state reads `0`.
+    pub open_ts_ist_secs: u32,
     /// Previous-day close baseline (last non-zero value wins — a blank
     /// pre-market `0` never clobbers a real baseline). Feeds
     /// `close_pct_from_prev_day` at seal.
@@ -121,9 +145,10 @@ pub struct LiveCandleState {
     /// `volume_pct_from_prev_day` (same 2026-05-28 removal). The struct is
     /// therefore UNCHANGED at 128 bytes and every downstream size assertion
     /// holds without being raised. (That was the 2026-05-28 size. The struct
-    /// is **152 bytes today** — 136 on 2026-09-10 for `net_volume_signed`,
-    /// 152 on 2026-09-19 for the two receipt stamps — pinned by
-    /// `the_state_is_152_bytes_and_every_size_assert_knows_it`.)
+    /// is **160 bytes today** — 136 on 2026-09-10 for `net_volume_signed`,
+    /// 152 on 2026-09-19 for the two receipt stamps, 160 on 2026-10-01 for
+    /// `open_ts_ist_secs` — pinned by
+    /// `the_state_is_160_bytes_and_every_size_assert_knows_it`.)
     pub total_sell_qty: u32,
     /// Today's SESSION open (the official 09:15 open). Static per trading
     /// day; last non-zero value wins. Feeds `open_pct` at seal.
@@ -158,8 +183,13 @@ pub struct LiveCandleState {
     /// stride reader, and it is recorded as outstanding rather than rushed
     /// through beside a hot-path change.
     ///
-    /// Costs ZERO bytes: it lands in padding the struct already had after its
-    /// three trailing `u32`s (measured — `size_of` is 152 with and without).
+    /// Cost ZERO bytes when added: it landed in padding the struct already had
+    /// after its trailing `u32`s (measured then — `size_of` was 152 with and
+    /// without). **No longer free on its own since 2026-10-01 (R6):** with
+    /// `open_ts_ist_secs` the payload is 153 bytes, padded to 160, and either the
+    /// flag or the stamp alone would fit in 152. The 8 bytes are charged to
+    /// the stamp, the change that crossed the boundary — see
+    /// `the_classified_marker_and_the_open_stamp_share_one_word`.
     pub net_volume_classified: bool,
     /// IST-NAIVE nanoseconds at which the FIRST tick of this bucket was
     /// RECEIVED by this process. `0` is the "no receipt" sentinel.
@@ -217,6 +247,7 @@ impl LiveCandleState {
             oi: 0,
             tick_count: 0,
             close_ts_ist_secs: 0,
+            open_ts_ist_secs: 0,
             prev_day_close: 0.0,
             close_pct_from_prev_day: 0.0,
             bucket_open_prev_close: 0.0,
@@ -831,7 +862,7 @@ mod tests {
     /// no volume) and the fields then sat in every bar holding a permanent
     /// `0.0` — 16 bytes per state, multiplied by `TF_COUNT` slots and again by
     /// `last_sealed`, in a struct pinned at exactly 128 bytes (at the time;
-    /// 152 today) by three separate compile-time assertions with zero slack
+    /// 160 today) by three separate compile-time assertions with zero slack
     /// between them.
     ///
     /// Reclaiming those 16 bytes is what pays for `bucket_open_prev_close`
@@ -840,33 +871,71 @@ mod tests {
     /// struct did not grow, which is the property the assertions downstream
     /// actually depend on.
     #[test]
-    fn the_state_is_152_bytes_and_every_size_assert_knows_it() {
+    fn the_state_is_160_bytes_and_every_size_assert_knows_it() {
         assert_eq!(
             std::mem::size_of::<LiveCandleState>(),
-            152,
-            "LiveCandleState changed size — BufferedSeal (<=168), AggregatorCell \
+            160,
+            "LiveCandleState changed size — BufferedSeal (<=176), AggregatorCell \
              (MAX_AGGREGATOR_CELL_BYTES) and SerializedSeal (SEAL_SPILL_RECORD_SIZE) \
              all assume this figure and every one of them is at zero slack today. \
              128 -> 136 on 2026-09-10 for `net_volume_signed`; 136 -> 152 on \
-             2026-09-19 for the two receipt stamps. Both costs are recorded \
-             in aws-budget.md."
+             2026-09-19 for the two receipt stamps; 152 -> 160 on 2026-10-01 \
+             (R6) for `open_ts_ist_secs`. All three costs are recorded in \
+             aws-budget.md."
         );
     }
 
-    /// The classified MARKER is free — it must land in existing padding.
+    /// The classified MARKER and the open STAMP share one 8-byte word.
     ///
-    /// If it ever stops being free, the two RAM budgets move again and the
-    /// arithmetic recorded beside them goes stale. Asserting the size WITHOUT
-    /// it is not possible from here, so this asserts the property that makes
-    /// it free: the struct is a multiple of its 8-byte alignment with room to
-    /// spare after the three trailing `u32`s.
+    /// Until 2026-10-01 this test was `the_classified_marker_costs_nothing`:
+    /// the flag landed in padding after the trailing `u32`s and `size_of` was
+    /// 152 with and without it. R6 added `open_ts_ist_secs` (one more `u32`),
+    /// and the payload crossed the 8-byte boundary: 153 bytes, padded to 160.
+    /// Either addition ALONE would still fit in 152, so neither is free any
+    /// more on its own — the two share the last word, and the 8 bytes are
+    /// charged to the stamp, the change that crossed the boundary. Stated as a
+    /// test rather than a comment so the next field added here meets the
+    /// arithmetic before it meets a budget assert.
+    ///
+    /// The payload is summed from the real fields (`size_of_val`), so it moves
+    /// with the struct rather than with this comment.
     #[test]
-    fn the_classified_marker_costs_nothing() {
-        assert_eq!(std::mem::align_of::<LiveCandleState>(), 8);
-        // 11 f64 + 2 u64 + 4 i64 + 3 u32 + 1 bool = 149 bytes of payload,
-        // which is why 152 has room and the flag is free. (133/136 until the
-        // two receipt stamps landed 2026-09-19 — +16 bytes, same free flag.)
-        assert_eq!(std::mem::size_of::<LiveCandleState>(), 152);
+    fn the_classified_marker_and_the_open_stamp_share_one_word() {
+        use std::mem::size_of_val;
+        let s = LiveCandleState::empty();
+        let payload = size_of_val(&s.bucket_start_ist_secs)
+            + size_of_val(&s.open)
+            + size_of_val(&s.high)
+            + size_of_val(&s.low)
+            + size_of_val(&s.close)
+            + size_of_val(&s.volume)
+            + size_of_val(&s.net_volume_signed)
+            + size_of_val(&s.bucket_start_cumulative)
+            + size_of_val(&s.oi)
+            + size_of_val(&s.tick_count)
+            + size_of_val(&s.close_ts_ist_secs)
+            + size_of_val(&s.open_ts_ist_secs)
+            + size_of_val(&s.prev_day_close)
+            + size_of_val(&s.close_pct_from_prev_day)
+            + size_of_val(&s.bucket_open_prev_close)
+            + size_of_val(&s.total_buy_qty)
+            + size_of_val(&s.total_sell_qty)
+            + size_of_val(&s.session_open)
+            + size_of_val(&s.open_pct)
+            + size_of_val(&s.open_gap_pct)
+            + size_of_val(&s.net_volume_classified)
+            + size_of_val(&s.first_receipt_ist_nanos)
+            + size_of_val(&s.last_receipt_ist_nanos);
+        let align = std::mem::align_of::<LiveCandleState>();
+        assert_eq!(align, 8);
+        let padded = |bytes: usize| bytes.div_ceil(align) * align;
+        // 10 f64 + 2 u64 + 4 i64 + 6 u32 + 1 bool = 153 bytes of payload.
+        assert_eq!(payload, 153);
+        assert_eq!(std::mem::size_of::<LiveCandleState>(), padded(payload));
+        assert_eq!(padded(payload), 160);
+        // Without the flag, or without the stamp, the struct would be 152.
+        assert_eq!(padded(payload - size_of_val(&s.net_volume_classified)), 152);
+        assert_eq!(padded(payload - size_of_val(&s.open_ts_ist_secs)), 152);
     }
 
     /// The three refusals, each one a real hazard rather than defensive noise.
