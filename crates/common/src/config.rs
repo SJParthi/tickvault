@@ -8,7 +8,6 @@ use chrono::NaiveTime;
 use serde::Deserialize;
 
 use crate::constants::{
-    CADENCE_CHAIN_MIN_SPACING_FLOOR_MS, CADENCE_SPOT_WINDOW_CAP_CEILING, CADENCE_SPOT_WINDOW_MS,
     DHAN_DATA_API_DEFAULT_TARGET_RPS, DHAN_DATA_API_RPS_CEILING, DHAN_DATA_API_RPS_FLOOR,
     SEBI_MAX_ORDERS_PER_SECOND,
 };
@@ -87,14 +86,6 @@ pub struct ApplicationConfig {
     /// off is the whole-subsystem rollback switch (B12).
     #[serde(default)]
     pub scoreboard: ScoreboardConfig,
-    /// `[spot_1m_rest]` — per-minute spot 1m REST pipeline (operator grant
-    /// 2026-07-12, `no-rest-except-live-feed-2026-06-27.md` §8): every
-    /// trading-day minute close in session, fetch that just-closed minute's
-    /// official 1m OHLCV for the 3 IDX_I spot indices via Dhan
-    /// `POST /v2/charts/intraday` and persist to `spot_1m_rest`. Absent
-    /// section ⇒ DISABLED (fail-safe default off).
-    #[serde(default)]
-    pub spot_1m_rest: Spot1mRestConfig,
     /// `[oms_reconcile]` — scheduled OMS order-book reconciliation loop
     /// (2026-07-14): a timer arm in the trading pipeline periodically calls
     /// `reconcile()` so OMS state converges with the Dhan order book.
@@ -109,15 +100,6 @@ pub struct ApplicationConfig {
     /// 3 rps default. Dhan-ONLY.
     #[serde(default)]
     pub dhan_data_api: DhanDataApiConfig,
-    /// `[option_chain_1m]` — per-minute option-chain REST pipeline (operator
-    /// grant 2026-07-12, `no-rest-except-live-feed-2026-06-27.md` §8; PR-3,
-    /// the OPTION-CHAIN half). Config-gated DEFAULT-OFF pending the
-    /// first-live-boot entitlement probe (the account had no Option Chain
-    /// Data-API entitlement in June 2026 — DH-902/806 class — and the
-    /// entitlement is unprobeable from the dev sandbox). Absent section ⇒
-    /// pipeline disabled + probe-and-report ON.
-    #[serde(default)]
-    pub option_chain_1m: OptionChain1mConfig,
     /// `[depth_unsubscribe_probe]` — the operator-armed, one-shot, two-armed
     /// unsubscribe probe (scope lock, 2026-09-12).
     ///
@@ -220,22 +202,6 @@ pub struct ApplicationConfig {
     /// behavior only (the engine's hardcoded `dry_run` blocks live POSTs).
     #[serde(default)]
     pub exit_orders: ExitOrdersConfig,
-    /// `[cadence]` — broker-agnostic fetch-cadence + decision-timing
-    /// scheduler (operator cadence directive 2026-07-14, reshaped by the
-    /// 2026-07-16 post-close burst directive — `crates/core/src/cadence/`;
-    /// supersedes the rev-8 pre-close schedule — 2026-07-16). Dry-run
-    /// decision-timing skeleton: per minute close T, BOTH lanes fire
-    /// POST-CLOSE — primary (rung 0) = ALL 7 requests concurrent in the
-    /// burst second (3 chains + 4 spots; Dhan at T +
-    /// `dhan_burst_offset_ms`, Groww at T+0); fallback (rung 1) = chains
-    /// in second 1, all 4 spots in second 2. Demotion is
-    /// RateLimited-ONLY after 2 consecutive dirty cycles (operator
-    /// Correction 2); structural zero-429 gates + event-driven per-lane
-    /// decisions throughout. This PR ships NO REST caller — the dry-run
-    /// executors log fires and return Empty. Absent section ⇒ DISABLED
-    /// (fail-safe default off).
-    #[serde(default)]
-    pub cadence: CadenceConfig,
 }
 
 /// `[order_runtime]` — dry-run order-runtime configuration (2026-07-14).
@@ -287,7 +253,7 @@ fn default_order_runtime_mark_channel_capacity() -> usize {
 
 impl Default for OrderRuntimeConfig {
     /// Manual impl so `Default` matches the serde field defaults exactly
-    /// (the Spot1mRestConfig precedent — an empty `[order_runtime]` section
+    /// (the manual-Default house precedent — an empty `[order_runtime]` section
     /// and an ABSENT section must deserialize identically).
     fn default() -> Self {
         Self {
@@ -360,7 +326,7 @@ impl Default for FeedsConfig {
 /// lock 2026-07-24, `truedata-feed-scope-2026-07-24.md`). Every field is
 /// `#[serde(default)]`-driven so an ABSENT `[feeds.truedata]` section and an
 /// empty one deserialize identically to the disabled day-0 shape (the
-/// `OrderRuntimeConfig` / `Spot1mRestConfig` precedent). The `host`/`port`
+/// `OrderRuntimeConfig` precedent). The `host`/`port`
 /// live per-account and come from SSM in production; the config carries the
 /// non-secret shape only (NEVER the user/password — those are SSM-only
 /// `Secret<String>` per the scope lock §2).
@@ -493,93 +459,6 @@ impl Default for ScoreboardConfig {
     }
 }
 
-/// `[spot_1m_rest]` — per-minute spot 1m REST pipeline (operator grant
-/// 2026-07-12; PR-2, the SPOT half). Cold path only — the WS candle
-/// pipeline is untouched.
-///
-/// Fail-safe shape: `enabled` is `#[serde(default)]` = `false`, so an
-/// absent `[spot_1m_rest]` section (or a TOML written before this PR)
-/// disables the fetcher entirely. `config/base.toml` explicitly sets
-/// `enabled = true`.
-///
-/// Extension point (PR-3, option chain): every FUTURE field on this
-/// struct MUST also be `#[serde(default)]` so older TOMLs keep
-/// deserializing byte-identically — nothing chain-specific ships in
-/// PR-2; the chain PR adds its own knobs here without a config-surface
-/// break (the nested-sub-table precedent).
-#[derive(Debug, Clone, Deserialize)]
-pub struct Spot1mRestConfig {
-    /// Master switch for the per-minute spot 1m REST fetcher. Default
-    /// OFF (fail-safe) — `config/base.toml` turns it on explicitly.
-    #[serde(default)]
-    pub enabled: bool,
-    /// 2026-07-14 serving-delay diagnostics rider: one-shot LOG-ONLY
-    /// side-by-side + alternate-window probes (≤6 bounded extra requests
-    /// per day) that discriminate "Dhan serves same-day intraday candles
-    /// with a DELAY" from "our request shape is wrong". Default OFF
-    /// (fail-safe); `config/base.toml` opts in while the 2026-07-14
-    /// all-morning `empty` signature is under investigation. Never touches
-    /// the fetch/persist/edge behaviour.
-    #[serde(default)]
-    pub diagnostics: bool,
-    /// IST seconds-of-day of the SECOND one-shot diagnostics probe (the
-    /// first fires at the first session fire after boot). Default 11:00
-    /// IST — mid-session, far from both the open and the 15:31 cross-verify
-    /// burst. Inert while `diagnostics = false`.
-    #[serde(default = "default_spot1m_diagnostics_second_probe_secs")]
-    pub diagnostics_second_probe_secs_of_day_ist: u32,
-    /// 2026-07-14 architecture optionality (pending the ~15:40 IST
-    /// sweep-discriminator operator ruling): `per_minute` (default —
-    /// today's behaviour) fires each minute close; `batch_catchup`
-    /// replaces the per-minute fires with a sweep-style catch-up every
-    /// [`Self::batch_interval_minutes`] — one day-window fetch per SID
-    /// through the shared Dhan Data-API limiter, persisting everything
-    /// new above the per-SID persisted watermark. A CONFIG MODE, not a
-    /// rewrite (reuses the existing sweep machinery).
-    #[serde(default)]
-    pub fetch_mode: SpotFetchMode,
-    /// Batch catch-up cadence (minutes) — inert while
-    /// `fetch_mode = "per_minute"`. Default 5; validated to 1..=60.
-    #[serde(default = "default_spot1m_batch_interval_minutes")]
-    pub batch_interval_minutes: u32,
-}
-
-/// `[spot_1m_rest] fetch_mode` values (2026-07-14 — see the field doc).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SpotFetchMode {
-    /// Fire each in-session minute close (the shipped PR-2 behaviour).
-    #[default]
-    PerMinute,
-    /// Sweep-style catch-up every `batch_interval_minutes` instead of
-    /// per-minute fires (the batch-architecture option the ~15:40 IST
-    /// sweep-discriminator verdict may select).
-    BatchCatchup,
-}
-
-/// Serde default for [`Spot1mRestConfig::batch_interval_minutes`] — 5.
-fn default_spot1m_batch_interval_minutes() -> u32 {
-    5
-}
-
-impl Spot1mRestConfig {
-    /// Boot-time validation — the batch cadence must be a sane in-session
-    /// interval (1..=60 minutes).
-    ///
-    /// # Errors
-    /// Returns a descriptive error when `batch_interval_minutes` is
-    /// outside `1..=60`.
-    pub fn validate(&self) -> Result<()> {
-        if !(1..=60).contains(&self.batch_interval_minutes) {
-            bail!(
-                "spot_1m_rest.batch_interval_minutes ({}) must be within 1..=60",
-                self.batch_interval_minutes
-            );
-        }
-        Ok(())
-    }
-}
-
 /// `[oms_reconcile]` — scheduled OMS order-book reconciliation
 /// (2026-07-14): a `tokio::select!` timer arm in the trading pipeline
 /// periodically calls `reconcile()` so OMS state converges with the Dhan
@@ -699,28 +578,6 @@ impl DhanDataApiConfig {
             );
         }
         Ok(())
-    }
-}
-
-/// Serde default for [`Spot1mRestConfig::diagnostics_second_probe_secs_of_day_ist`]
-/// — 11:00 IST as seconds-of-day.
-fn default_spot1m_diagnostics_second_probe_secs() -> u32 {
-    11 * 3600
-}
-
-impl Default for Spot1mRestConfig {
-    /// Manual impl so `Default` matches the serde field defaults exactly
-    /// (a derived `Default` would zero the second-probe instant while an
-    /// empty `[spot_1m_rest]` section deserializes it to 11:00 IST).
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            diagnostics: false,
-            diagnostics_second_probe_secs_of_day_ist: default_spot1m_diagnostics_second_probe_secs(
-            ),
-            fetch_mode: SpotFetchMode::default(),
-            batch_interval_minutes: default_spot1m_batch_interval_minutes(),
-        }
     }
 }
 
@@ -912,225 +769,6 @@ pub struct TfConsistencyConfig {
     pub enabled: bool,
 }
 
-/// `[cadence]` — broker-agnostic fetch-cadence + decision-timing scheduler
-/// (operator cadence directive 2026-07-14, judge-locked design rev-8).
-/// Every timing below is a TARGET on the IST millis-of-day clock; the
-/// monotonic CAS gates in `crates/core/src/cadence/gate.rs` are the hard
-/// zero-429 floor. All defaults are the judge-locked operator numbers;
-/// the ones marked (Assumed) in the design await operator confirmation and
-/// are operator-flippable here without code changes.
-///
-/// Fail-safe shape: `enabled` is `#[serde(default)]` = `false` and every
-/// other field carries the judge-locked serde default, so an absent
-/// `[cadence]` section (or a TOML written before this PR) disables the
-/// scheduler entirely and deserializes the full locked cadence table.
-///
-/// Level-trigger note (verifier F8, dated 2026-07-15; hardened by
-/// CONC-NEW-1, hostile round 1 2026-07-15): the per-LANE enable flags
-/// the runner consults (the `/api/feeds` toggle atomics — NOT keys in
-/// this section) are snapshotted at cycle entry, RE-OBSERVED every ~5s
-/// wake chunk while the cycle is still PRISTINE (no fire dispatched —
-/// the day's first cycle is entered near IST midnight and waits hours
-/// for its anchor), and re-checked at every dispatch/completion
-/// instant. A disable therefore stops every not-yet-dispatched fire
-/// within one ~5s wake chunk; already-in-flight requests complete
-/// audit-only. An enable joins the CURRENT cycle when nothing has fired
-/// yet, else the next minute boundary. Stated plainly in
-/// `.claude/rules/project/cadence-error-codes.md` too.
-#[derive(Debug, Clone, Deserialize)]
-pub struct CadenceConfig {
-    /// Master switch — DEFAULT OFF (fail-safe). Flipping the DEFAULT needs
-    /// a fresh dated operator quote.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Cadence DHAN lane gate — DEFAULT TRUE. Gates the cadence
-    /// scheduler's Dhan broker lane and is deliberately INDEPENDENT of
-    /// `feeds.dhan_enabled` (the RETIRED live-WS flag, false in prod):
-    /// the cadence lanes are REST pulls, not the live feed. Config +
-    /// restart to change; there is NO runtime toggle for it.
-    #[serde(default = "default_cadence_lane_enabled")]
-    pub dhan_lane: bool,
-    /// The Dhan BURST second offset from the minute-close instant T, ms
-    /// (operator directive 2026-07-16 — ALL fires are POST-close now).
-    /// Default 1000 (second 1): shape rung 0 fires ALL 7 requests here
-    /// concurrently (3 chains + 4 spots — the operator's same-day all-7
-    /// correction; the spots in the Data-API bucket, the chains in the
-    /// option-chain API's own per-key budget); rung 1 fires the 3
-    /// chains here and all 4 spots one window later. Validated > 0 and
-    /// feasible against the Dhan lane cutoff (the deepest spot bucket
-    /// must land inside it).
-    #[serde(default = "default_cadence_dhan_burst_offset_ms")]
-    pub dhan_burst_offset_ms: i64,
-    /// The Dhan spot ROLLING-1000ms-WINDOW gate cap (operator
-    /// spot-concurrency ladder addition 2026-07-15): at most this many
-    /// spot authorizations in ANY sliding 1000ms window. Default 4 (the
-    /// full step-0 per-second spot group); validated 1..=5 (the Dhan
-    /// Data-API hard cap is 5/sec). A cap below 4 structurally floors
-    /// the concurrency ladder's step so no SECOND BUCKET's spot count
-    /// exceeds the cap.
-    #[serde(default = "default_cadence_spot_window_cap")]
-    pub spot_window_cap: u32,
-    /// Adaptive-concurrency degrade threshold (Assumed — default 2,
-    /// flagged for operator confirm): the Dhan spot-concurrency ladder
-    /// AND the Groww fallback-shape ladder degrade ONE step only after
-    /// this many CONSECUTIVE rate-limited-dirty cycles ("continuous",
-    /// never a one-off 429).
-    #[serde(default = "default_cadence_concurrency_degrade_after_dirty_cycles")]
-    pub concurrency_degrade_after_dirty_cycles: u32,
-    /// Adaptive-concurrency recovery threshold (Assumed — default 3,
-    /// flagged for operator confirm): both ladders climb back UP one
-    /// step after this many consecutive fully-clean cycles at the
-    /// current step (never permanently stuck from a one-off 429).
-    #[serde(default = "default_cadence_concurrency_recover_after_clean_cycles")]
-    pub concurrency_recover_after_clean_cycles: u32,
-    /// Post-close clamp: a spot second-bucket base never lands earlier
-    /// than T + this, ms. Default 300 — the proven house
-    /// `SPOT_1M_REST_FIRE_DELAY_MS` post-close fire delay (structurally
-    /// inert at the default burst offset of 1000).
-    #[serde(default = "default_cadence_spot_min_post_close_ms")]
-    pub spot_min_post_close_ms: i64,
-    /// Maximum in-cycle retries per failed request (Assumed — default 1).
-    /// Retries fire ONLY through the gates and only when landing before
-    /// the lane cutoff. A RateLimited leg KEEPS its one bounded in-cycle
-    /// retry (through the gates, after the per-key spacing) — one of the
-    /// operator's "multiple attempts" before any shape demotion
-    /// (2026-07-16 Correction 2; supersedes the earlier "a RateLimited is
-    /// NEVER retried in-cycle" wording, which was the exact inverse).
-    #[serde(default = "default_cadence_in_cycle_retry_max")]
-    pub in_cycle_retry_max: u32,
-    /// Dhan lane staleness cutoff, ms after T (Assumed — default 15000:
-    /// the burst completes by ~T+2s, the chain retry grid by ~T+4s, and
-    /// the deepest spot spill + spot retries well inside :15). Past it ⇒
-    /// HONEST-SKIP + CADENCE-02, never a late decision.
-    #[serde(default = "default_cadence_dhan_lane_cutoff_ms")]
-    pub dhan_lane_cutoff_ms: i64,
-    /// Groww burst-failure verdict instant, ms after the burst anchor
-    /// Per-request bound on every individual Groww request incl. fallback
-    /// Groww lane staleness cutoff, ms after T (Assumed — default 6000:
-    /// Minimum spacing enforced by the per-(underlying, expiry) chain
-    /// gates, ms. Default 3000 (Dhan's 1-unique-request-per-3s rule —
-    /// per the 2026-07-16 operator directive it applies to the SAME
-    /// (underlying, expiry) key ONLY; different underlyings fire
-    /// concurrently and the retired GLOBAL chain gate is gone).
-    /// Validated ≥ 3000.
-    #[serde(default = "default_cadence_chain_min_spacing_ms")]
-    pub chain_min_spacing_ms: i64,
-    /// Pre-market expiry-resolution retry cadence, ms (operator spec
-    /// 2026-07-15): the boot phase re-attempts each unresolved
-    /// (broker, underlying) expiry-list fetch at this interval — from
-    /// scheduler start on a trading day until the SESSION END (15:30
-    /// IST), never giving up mid-day. Default 60_000. Validated > 0.
-    #[serde(default = "default_cadence_expiry_retry_interval_ms")]
-    pub expiry_retry_interval_ms: i64,
-    /// Pre-market expiry-resolution PAGE deadline, IST seconds-of-day
-    /// (operator spec 2026-07-15): past this instant each still-unresolved
-    /// (broker, underlying) fires ONE edge-latched CADENCE-01
-    /// `expiry_unresolved` page per episode while the background retry
-    /// continues at the same cadence. The deadline gates the PAGE, not
-    /// the attempts — a boot AFTER it (e.g. a 10:00 restart) still
-    /// resolves immediately on first success. Default 32_100 (08:55 IST).
-    /// Validated < 86_400.
-    #[serde(default = "default_cadence_expiry_deadline_secs_of_day_ist")]
-    pub expiry_deadline_secs_of_day_ist: u32,
-    /// Native micro-retry hedge for 2xx-empty cadence legs (2026-07-20 directive).
-    #[serde(default = "cadence_default_true")]
-    pub native_retry_enabled: bool,
-}
-fn cadence_default_true() -> bool {
-    true
-}
-
-/// Serde default for [`CadenceConfig::dhan_lane`] /
-/// enabled (the lanes are independent of the retired live-WS feed flags).
-fn default_cadence_lane_enabled() -> bool {
-    true
-}
-
-/// Serde default for [`CadenceConfig::dhan_burst_offset_ms`] — second 1
-/// (the operator's 2026-07-16 "first second" burst).
-fn default_cadence_dhan_burst_offset_ms() -> i64 {
-    1_000
-}
-
-/// Serde default for [`CadenceConfig::spot_window_cap`] — 4 (the full
-/// step-0 simultaneous spot group, one under the Dhan 5/sec hard cap).
-fn default_cadence_spot_window_cap() -> u32 {
-    4
-}
-
-/// Serde default for [`CadenceConfig::concurrency_degrade_after_dirty_cycles`]
-/// — 2 (Assumed — flagged for operator confirm).
-fn default_cadence_concurrency_degrade_after_dirty_cycles() -> u32 {
-    2
-}
-
-/// Serde default for [`CadenceConfig::concurrency_recover_after_clean_cycles`]
-/// — 3 (Assumed — flagged for operator confirm).
-fn default_cadence_concurrency_recover_after_clean_cycles() -> u32 {
-    3
-}
-
-/// Serde default for [`CadenceConfig::spot_min_post_close_ms`] — the house
-/// 300ms post-close fire delay.
-fn default_cadence_spot_min_post_close_ms() -> i64 {
-    300
-}
-
-/// Serde default for [`CadenceConfig::in_cycle_retry_max`] — 1 (Assumed).
-fn default_cadence_in_cycle_retry_max() -> u32 {
-    1
-}
-
-/// Serde default for [`CadenceConfig::dhan_lane_cutoff_ms`] — 15s
-/// (Assumed).
-fn default_cadence_dhan_lane_cutoff_ms() -> i64 {
-    15_000
-}
-
-/// Serde default for [`CadenceConfig::chain_min_spacing_ms`] — Dhan's
-/// 1-unique-request-per-3s option-chain rule.
-fn default_cadence_chain_min_spacing_ms() -> i64 {
-    3_000
-}
-
-/// Serde default for [`CadenceConfig::expiry_retry_interval_ms`] — one
-/// bounded expiry-list attempt per minute (operator spec 2026-07-15).
-fn default_cadence_expiry_retry_interval_ms() -> i64 {
-    60_000
-}
-
-/// Serde default for [`CadenceConfig::expiry_deadline_secs_of_day_ist`]
-/// — 08:55 IST (operator spec 2026-07-15; the pre-market page deadline).
-fn default_cadence_expiry_deadline_secs_of_day_ist() -> u32 {
-    8 * 3600 + 55 * 60
-}
-
-impl Default for CadenceConfig {
-    /// Manual impl so `Default` matches the serde field defaults exactly
-    /// (the `Spot1mRestConfig` precedent — a derived `Default` would zero
-    /// every timing while an empty `[cadence]` section deserializes the
-    /// full judge-locked cadence table).
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            dhan_lane: default_cadence_lane_enabled(),
-            dhan_burst_offset_ms: default_cadence_dhan_burst_offset_ms(),
-            spot_window_cap: default_cadence_spot_window_cap(),
-            concurrency_degrade_after_dirty_cycles:
-                default_cadence_concurrency_degrade_after_dirty_cycles(),
-            concurrency_recover_after_clean_cycles:
-                default_cadence_concurrency_recover_after_clean_cycles(),
-            spot_min_post_close_ms: default_cadence_spot_min_post_close_ms(),
-            in_cycle_retry_max: default_cadence_in_cycle_retry_max(),
-            dhan_lane_cutoff_ms: default_cadence_dhan_lane_cutoff_ms(),
-            chain_min_spacing_ms: default_cadence_chain_min_spacing_ms(),
-            expiry_retry_interval_ms: default_cadence_expiry_retry_interval_ms(),
-            expiry_deadline_secs_of_day_ist: default_cadence_expiry_deadline_secs_of_day_ist(),
-            native_retry_enabled: true,
-        }
-    }
-}
-
 /// `[rest_candle_fold]` — REST-era multi-TF candle derivation (operator
 /// directive 2026-07-16). Cold path only — folds persist-confirmed
 /// `spot_1m_rest` 1m bars into the 21 `candles_*` tables through the shared
@@ -1165,152 +803,6 @@ impl Default for RestCandleFoldConfig {
             enabled: false,
             catchup_days: default_rest_candle_fold_catchup_days(),
         }
-    }
-}
-
-impl CadenceConfig {
-    /// Boot-time validation (range-bail house shape) — rejects any
-    /// `[cadence]` section that could compress the structural zero-429
-    /// spacing floors or produce a degenerate schedule, BEFORE the runner
-    /// spawns.
-    ///
-    /// # Errors
-    /// Returns a descriptive error for the first violation found: a
-    /// chain spacing under the 3s per-(underlying, expiry) floor, a spot
-    /// window cap outside 1..=5, out-of-range burst-offset / expiry
-    /// knobs, negative clamps, non-positive cutoffs/timeouts, a Groww
-    /// cutoff at/below the burst verdict, a lane cutoff at/above one
-    /// minute, or a burst schedule outside the feasible band (nominal
-    /// burst / deepest spot bucket at/after the Dhan cutoff).
-    pub fn validate(&self) -> Result<()> {
-        if self.chain_min_spacing_ms < CADENCE_CHAIN_MIN_SPACING_FLOOR_MS {
-            bail!(
-                "cadence.chain_min_spacing_ms ({}) must be >= {} (Dhan's 1-unique-request-per-3s option-chain rule)",
-                self.chain_min_spacing_ms,
-                CADENCE_CHAIN_MIN_SPACING_FLOOR_MS
-            );
-        }
-        // The burst is a POST-close fire: a NEGATIVE offset would race the
-        // close and is refused. T+0 is legal.
-        //
-        // 2026-07-31 (operator directive — Dhan must fire at the SAME
-        // instant as Groww): relaxed `<= 0` to `< 0`. The original
-        // 2026-07-16 rule also refused T+0, citing a collision with "the
-        // Groww anchor semantics of next_joinable_boundary's
-        // strictly-in-future rule". That rationale does NOT hold:
-        // `next_joinable_boundary` anchors on
-        // term is already 0 today and a Dhan 0 changes that computation by
-        // nothing. The one real consequence (a boot landing exactly ON the
-        // boundary skips to the next minute, because the rule is strictly
-        // `anchor_ms > now`) is pre-existing, deliberate, and pinned by
-        // `test_cadence_schedule_next_joinable_boundary_no_mid_cycle_join`.
-        // Refusing 0 for Dhan while allowing it for Groww was an
-        // unjustified asymmetry between the two lanes.
-        if self.dhan_burst_offset_ms < 0 {
-            bail!(
-                "cadence.dhan_burst_offset_ms ({}) must be >= 0 (the burst is fully POST-close — a negative offset would fire before the minute closes)",
-                self.dhan_burst_offset_ms
-            );
-        }
-        if self.spot_window_cap == 0 || self.spot_window_cap > CADENCE_SPOT_WINDOW_CAP_CEILING {
-            bail!(
-                "cadence.spot_window_cap ({}) must be in 1..={} (the Dhan Data-API hard cap is 5/sec)",
-                self.spot_window_cap,
-                CADENCE_SPOT_WINDOW_CAP_CEILING
-            );
-        }
-        if self.concurrency_degrade_after_dirty_cycles == 0
-            || self.concurrency_recover_after_clean_cycles == 0
-        {
-            bail!(
-                "cadence concurrency-ladder thresholds must be >= 1 (degrade_after_dirty {}, recover_after_clean {})",
-                self.concurrency_degrade_after_dirty_cycles,
-                self.concurrency_recover_after_clean_cycles
-            );
-        }
-        if self.spot_min_post_close_ms < 0 {
-            bail!(
-                "cadence.spot_min_post_close_ms ({}) must be >= 0 (a spot can never fire pre-close)",
-                self.spot_min_post_close_ms
-            );
-        }
-        // Feasibility of the deepest spot second-bucket (CAD-NEW-3 +
-        // SEC-CAD-1 class, re-derived for the 2026-07-16 shape): the
-        // spot base is max(burst, T + spot_min_post_close_ms) and the
-        // deepest bucket (shape 1 x tier 3) sits base + 4 windows — a
-        // nominal spot fire at/after the Dhan cutoff sorts AFTER the
-        // DhanCutoff event, so the cutoff skip resolves the lane FIRST
-        // and the fire is silently discarded on the resolved-lane guard
-        // EVERY cycle, with the coded errors pointing at broker slowness
-        // instead of the degenerate schedule. Refused at boot.
-        let deepest_spot_bucket_ms = self
-            .dhan_burst_offset_ms
-            .max(self.spot_min_post_close_ms)
-            .saturating_add(4_i64.saturating_mul(CADENCE_SPOT_WINDOW_MS));
-        if deepest_spot_bucket_ms >= self.dhan_lane_cutoff_ms {
-            bail!(
-                "cadence.dhan_burst_offset_ms ({}) / spot_min_post_close_ms ({}) are too late: the deepest spot second-bucket (max(burst, clamp) + 4 windows = {}ms past T) must land strictly before dhan_lane_cutoff_ms ({}) — a nominal fire at/after the cutoff is silently discarded once the cutoff skip resolves the lane",
-                self.dhan_burst_offset_ms,
-                self.spot_min_post_close_ms,
-                deepest_spot_bucket_ms,
-                self.dhan_lane_cutoff_ms
-            );
-        }
-        if self.dhan_lane_cutoff_ms <= 0 {
-            bail!(
-                "cadence lane cutoff must be > 0 (dhan {})",
-                self.dhan_lane_cutoff_ms
-            );
-        }
-        // Hostile-review round 1 (CAD-SEC-1, 2026-07-15): a lane cutoff
-        // at/above one minute makes EVERY cycle structurally overrun its
-        // boundary (run_cycle only breaks once the cutoff event pops), so
-        // each cycle fires a should-never boundary_skipped error and the
-        // cadence silently halves — refused as a degenerate schedule.
-        if self.dhan_lane_cutoff_ms >= 60_000 {
-            bail!(
-                "cadence lane cutoff must be < 60000ms — one cycle must resolve inside its own minute (dhan {})",
-                self.dhan_lane_cutoff_ms
-            );
-        }
-        // The nominal chain burst itself must land strictly before the
-        // Dhan cutoff (CAD-NEW-3 mirror for the post-close shape).
-        if self.dhan_burst_offset_ms >= self.dhan_lane_cutoff_ms {
-            bail!(
-                "cadence.dhan_burst_offset_ms ({}) must land strictly before dhan_lane_cutoff_ms ({}) — a nominal chain fire at/after the cutoff is silently discarded once the cutoff skip resolves the lane",
-                self.dhan_burst_offset_ms,
-                self.dhan_lane_cutoff_ms
-            );
-        }
-        // Expiry-resolution boot phase knobs (operator spec 2026-07-15).
-        if self.expiry_retry_interval_ms <= 0 {
-            bail!(
-                "cadence.expiry_retry_interval_ms ({}) must be > 0 (the bounded pre-market retry cadence)",
-                self.expiry_retry_interval_ms
-            );
-        }
-        // R3-F1 belt (a), 2026-07-15: the in-session retry waves anchor
-        // at the :30-of-minute instant on a per-minute grid, so the
-        // interval must not exceed one minute — a slower interval lets
-        // the LAST pre-session wake sleep the PLAIN interval straight
-        // into the first session cycle's burst window (e.g. 65s @
-        // 09:14:58 -> 09:16:03, the spot-group instant -> one false
-        // gate_deferred_nominal page at session entry). Belt (b) — the
-        // runner-side transitional-wave clamp
-        // (`expiry_wave_anchor_active`) — survives validation drift.
-        if self.expiry_retry_interval_ms > 60_000 {
-            bail!(
-                "cadence.expiry_retry_interval_ms ({}) must be <= 60000 (one minute): retry waves anchor on the per-minute :30 grid, and a slower interval would sleep a transitional wave into the session-entry burst window",
-                self.expiry_retry_interval_ms
-            );
-        }
-        if self.expiry_deadline_secs_of_day_ist >= 86_400 {
-            bail!(
-                "cadence.expiry_deadline_secs_of_day_ist ({}) must be < 86400 (an IST seconds-of-day instant)",
-                self.expiry_deadline_secs_of_day_ist
-            );
-        }
-        Ok(())
     }
 }
 
@@ -1433,46 +925,6 @@ impl MarketRamStoreConfig {
     }
 }
 
-/// `[option_chain_1m]` — per-minute option-chain REST pipeline (operator
-/// grant 2026-07-12; PR-3, the OPTION-CHAIN half). Cold path only — the
-/// WS candle pipeline, tick capture and trading are untouched.
-///
-/// Semantics (the honest reading of the operator's "auto-enables/reports"
-/// intent WITHOUT a silent behaviour change — documented in the module doc
-/// of `crates/app/src/option_chain_1m_boot.rs`):
-/// - `enabled = true` → run the per-minute pipeline. The boot-time
-///   entitlement probe still runs FIRST; an entitlement-class reject
-///   (DH-902 / DATA 806) fires ONE edge-triggered page and keeps the
-///   pipeline down for the day.
-/// - `enabled = false` + `probe_and_report = true` (the DEFAULT) → at boot
-///   (Dhan lane up, trading day) run ONE expirylist probe, report the
-///   verdict via Telegram (entitled → "flip the setting on"; not entitled
-///   → names the DH-902/806 class), then exit. The full pipeline NEVER
-///   auto-runs while `enabled = false` — the operator flips the config.
-///
-/// Fail-safe shape: both fields `#[serde(default)]`-covered, so an absent
-/// `[option_chain_1m]` section (or a TOML written before this PR)
-/// deserializes to `{ enabled: false, probe_and_report: true }`.
-#[derive(Debug, Clone, Deserialize)]
-pub struct OptionChain1mConfig {
-    /// Master switch for the per-minute option-chain fetcher. Default OFF
-    /// (pending the live entitlement probe) — flipping the DEFAULT needs a
-    /// fresh dated operator quote.
-    #[serde(default)]
-    pub enabled: bool,
-    /// When the pipeline is disabled, still run the ONE boot-time
-    /// expirylist entitlement probe and report the verdict via Telegram.
-    /// Default ON so the operator learns the entitlement state on the
-    /// first live boot without enabling the pipeline.
-    #[serde(default = "default_chain_1m_probe_and_report")]
-    pub probe_and_report: bool,
-}
-
-/// serde default for [`OptionChain1mConfig::probe_and_report`] — ON.
-fn default_chain_1m_probe_and_report() -> bool {
-    true
-}
-
 /// `[depth_unsubscribe_probe]` — the two-armed unsubscribe probe.
 ///
 /// Every field defaults to FALSE, so an absent section, an empty section, and
@@ -1501,15 +953,6 @@ pub struct DepthUnsubscribeProbeConfig {
     /// the request code was never the variable.
     #[serde(default)]
     pub socket_close_arm: bool,
-}
-
-impl Default for OptionChain1mConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            probe_and_report: default_chain_1m_probe_and_report(),
-        }
-    }
 }
 
 /// `[dhan_universe]` — daily Dhan master + NSE India indices download + join.
@@ -3446,11 +2889,8 @@ impl ApplicationConfig {
         }
 
         // 2026-07-14 operator pacing directive: the shared Dhan Data-API
-        // limiter cap must stay inside the 2..=4 ladder, and the spot-1m
-        // batch catch-up cadence must be a sane in-session interval —
-        // both rejected at boot, BEFORE any REST task spawns.
+        // limiter cap must stay inside the 2..=4 ladder — rejected at boot.
         self.dhan_data_api.validate()?;
-        self.spot_1m_rest.validate()?;
 
         // Fix E (2026-07-17): the spot cross-verify severity noise band
         // must stay inside 0..=10_000 paise — an absurd value would demote
@@ -3469,40 +2909,6 @@ impl ApplicationConfig {
         // bounds always; freeze-limit + review-date sanity when enabled —
         // rejected at boot, BEFORE the trading pipeline spawns.
         self.exit_orders.validate()?;
-        // Cadence scheduler (operator 2026-07-14): the structural zero-429
-        // spacing floors are validated at boot, BEFORE the runner spawns
-        // (fail-closed; the default cadence.enabled=false section is always
-        // valid, so today's boot is unaffected).
-        self.cadence.validate()?;
-
-        // CAPTURE-LEG MUTUAL EXCLUSION (coordinator ruling B, 2026-07-16
-        // — SUBSUME, NEVER SHARE, interim fail-closed path): the cadence
-        // scheduler and the legacy per-minute RECORD-capture legs would
-        // place DOUBLE demand on the same broker rate budgets if both ran
-        // for one broker — no double demand is ever legal. Enabling the
-        // cadence requires the legacy legs to stand down FIRST — base.toml
-        // flipped to that shape 2026-07-17 (cadence ON, the four legacy
-        // legs OFF) with the real broker executors; the cadence executors
-        // now feed the capture tables directly (the subsumption).
-        //
-        // RS3 (2026-07-16): keyed on the LEG configs ALONE — deliberately
-        // NOT on `feeds.*_enabled`. The cadence lanes activate on the
-        // RUNTIME feed atomics (one toggle away from the boot flags),
-        // while the legacy legs spawn on their OWN config gates
-        // regardless of the feed flags — so the earlier boot-time key on
-        // `feeds.*_enabled` admitted cadence=ON + feed=OFF + legs=ON, one
-        // runtime feed enable away from reconstructing the forbidden
-        // double demand. (Today both enable directions happen to be
-        // unconditionally 409'd at the API — the PR-C2/S2b retired-lane
-        // refusals — but those refusals exist for unrelated reasons and
-        // must not be this invariant's only wall.) Fail-closed at the
-        // root: cadence + ANY legacy leg of the same broker is refused,
-        // whatever the feed flags say.
-        if self.cadence.enabled && (self.spot_1m_rest.enabled || self.option_chain_1m.enabled) {
-            bail!(
-                "cadence.enabled requires the legacy Dhan per-minute legs to stand down first: set [spot_1m_rest].enabled = false and [option_chain_1m].enabled = false (no double demand on the Dhan Data-API budget is ever legal — coordinator ruling B, 2026-07-16; keyed on the leg configs alone since RS3, regardless of feeds.dhan_enabled)"
-            );
-        }
 
         // 2026-07-16 REST-era candle derivation: the boot catch-up window
         // must be a sane 1..=370-day envelope — rejected at boot, BEFORE
@@ -4172,10 +3578,8 @@ mod tests {
             // in_mem: InMemConfig retired 2026-07-19 (BATCH-5 dead-code cleanup).
             feeds: FeedsConfig::default(),
             scoreboard: ScoreboardConfig::default(),
-            spot_1m_rest: Spot1mRestConfig::default(),
             oms_reconcile: OmsReconcileConfig::default(),
             dhan_data_api: DhanDataApiConfig::default(),
-            option_chain_1m: OptionChain1mConfig::default(),
             depth_unsubscribe_probe: DepthUnsubscribeProbeConfig::default(),
             tf_consistency: TfConsistencyConfig::default(),
             rest_candle_fold: RestCandleFoldConfig::default(),
@@ -4187,7 +3591,6 @@ mod tests {
             dhan_universe: DhanUniverseConfig::default(),
             dhan_margin_gate: DhanMarginGateConfig::default(),
             exit_orders: ExitOrdersConfig::default(),
-            cadence: CadenceConfig::default(),
         }
     }
 
@@ -5232,10 +4635,6 @@ mod tests {
         assert!(missing.scoreboard.enabled);
     }
 
-    /// Per-minute spot 1m REST pipeline (operator grant 2026-07-12): the
-    /// `[spot_1m_rest]` section is FAIL-SAFE default OFF — via `Default`,
-    /// via a missing section, and via an empty section — and an explicit
-    /// `enabled = true` (the `config/base.toml` shape) must round-trip.
     #[test]
     fn test_oms_reconcile_config_default_is_disabled() {
         let d = OmsReconcileConfig::default();
@@ -5317,92 +4716,6 @@ mod tests {
         config
             .validate()
             .expect("default reconcile interval must pass whole-config validation");
-    }
-
-    #[test]
-    fn test_spot_1m_rest_config_defaults_off_and_round_trips() {
-        use figment::Figment;
-        use figment::providers::{Format, Toml};
-
-        assert!(
-            !Spot1mRestConfig::default().enabled,
-            "spot_1m_rest must default OFF (fail-safe; base.toml opts in)"
-        );
-
-        #[derive(Deserialize)]
-        struct Wrapper {
-            #[serde(default)]
-            spot_1m_rest: Spot1mRestConfig,
-        }
-        // Missing section entirely → disabled, never an error.
-        let missing: Wrapper = Figment::new()
-            .merge(Toml::string("[other]\nx = 1\n"))
-            .extract()
-            .expect("missing [spot_1m_rest] must default, not error");
-        assert!(!missing.spot_1m_rest.enabled);
-        // Empty section (no keys) → disabled via the field-level default.
-        let empty: Wrapper = Figment::new()
-            .merge(Toml::string("[spot_1m_rest]\n"))
-            .extract()
-            .expect("empty [spot_1m_rest] must default, not error");
-        assert!(!empty.spot_1m_rest.enabled);
-        // Explicit ON (the base.toml shape) round-trips.
-        let on: Wrapper = Figment::new()
-            .merge(Toml::string("[spot_1m_rest]\nenabled = true\n"))
-            .extract()
-            .expect("explicit enabled = true must round-trip");
-        assert!(on.spot_1m_rest.enabled);
-    }
-
-    /// 2026-07-14 serving-delay diagnostics rider: `diagnostics` is
-    /// FAIL-SAFE default OFF (via `Default`, a missing section, and an
-    /// empty section), the second-probe instant defaults to 11:00 IST on
-    /// BOTH paths (manual `Default` == serde default — no derive drift),
-    /// and the base.toml opt-in shape round-trips.
-    #[test]
-    fn test_spot_1m_rest_diagnostics_defaults_off_with_1100_second_probe() {
-        use figment::Figment;
-        use figment::providers::{Format, Toml};
-
-        let d = Spot1mRestConfig::default();
-        assert!(
-            !d.diagnostics,
-            "diagnostics must default OFF (log-only opt-in)"
-        );
-        assert_eq!(
-            d.diagnostics_second_probe_secs_of_day_ist,
-            11 * 3600,
-            "second probe defaults to 11:00 IST"
-        );
-
-        #[derive(Deserialize)]
-        struct Wrapper {
-            #[serde(default)]
-            spot_1m_rest: Spot1mRestConfig,
-        }
-        // Pre-rider TOML (enabled only) → diagnostics off, probe at 11:00.
-        let old: Wrapper = Figment::new()
-            .merge(Toml::string("[spot_1m_rest]\nenabled = true\n"))
-            .extract()
-            .expect("pre-rider TOML must keep deserializing");
-        assert!(!old.spot_1m_rest.diagnostics);
-        assert_eq!(
-            old.spot_1m_rest.diagnostics_second_probe_secs_of_day_ist,
-            11 * 3600
-        );
-        // The base.toml opt-in shape + an explicit probe override round-trip.
-        let on: Wrapper = Figment::new()
-            .merge(Toml::string(
-                "[spot_1m_rest]\nenabled = true\ndiagnostics = true\n\
-                 diagnostics_second_probe_secs_of_day_ist = 43200\n",
-            ))
-            .extract()
-            .expect("diagnostics opt-in must round-trip");
-        assert!(on.spot_1m_rest.diagnostics);
-        assert_eq!(
-            on.spot_1m_rest.diagnostics_second_probe_secs_of_day_ist,
-            12 * 3600
-        );
     }
 
     /// 2026-07-14 operator pacing directive: `[dhan_data_api] target_rps`
@@ -5552,111 +4865,6 @@ mod tests {
         }
     }
 
-    /// 2026-07-14 fetch-mode flag: defaults to `per_minute` on every path
-    /// (Default / missing key / pre-flag TOML), `batch_catchup` +
-    /// `batch_interval_minutes` parse, and unknown mode strings are
-    /// REJECTED (never silently coerced to a mode).
-    #[test]
-    fn test_spot1m_fetch_mode_defaults_per_minute_and_parses_batch() {
-        use figment::Figment;
-        use figment::providers::{Format, Toml};
-
-        let d = Spot1mRestConfig::default();
-        assert_eq!(d.fetch_mode, SpotFetchMode::PerMinute);
-        assert_eq!(d.batch_interval_minutes, 5);
-
-        #[derive(Deserialize)]
-        struct Wrapper {
-            #[serde(default)]
-            spot_1m_rest: Spot1mRestConfig,
-        }
-        // Pre-flag TOML (enabled only) → per_minute, interval 5.
-        let old: Wrapper = Figment::new()
-            .merge(Toml::string("[spot_1m_rest]\nenabled = true\n"))
-            .extract()
-            .expect("pre-flag TOML must keep deserializing");
-        assert_eq!(old.spot_1m_rest.fetch_mode, SpotFetchMode::PerMinute);
-        assert_eq!(old.spot_1m_rest.batch_interval_minutes, 5);
-        // The batch shape round-trips.
-        let batch: Wrapper = Figment::new()
-            .merge(Toml::string(
-                "[spot_1m_rest]\nenabled = true\nfetch_mode = \"batch_catchup\"\n\
-                 batch_interval_minutes = 10\n",
-            ))
-            .extract()
-            .expect("batch_catchup opt-in must round-trip");
-        assert_eq!(batch.spot_1m_rest.fetch_mode, SpotFetchMode::BatchCatchup);
-        assert_eq!(batch.spot_1m_rest.batch_interval_minutes, 10);
-        // An unknown mode string is an ERROR, never a silent default.
-        let junk: Result<Wrapper, _> = Figment::new()
-            .merge(Toml::string(
-                "[spot_1m_rest]\nfetch_mode = \"warp_speed\"\n",
-            ))
-            .extract();
-        assert!(junk.is_err(), "unknown fetch_mode must be rejected");
-    }
-
-    /// Batch cadence bounds: 0 and 61+ are rejected; 1..=60 pass.
-    #[test]
-    fn test_spot1m_batch_interval_validate_bounds() {
-        let mut cfg = Spot1mRestConfig::default();
-        for bad in [0_u32, 61, 1_000] {
-            cfg.batch_interval_minutes = bad;
-            assert!(
-                cfg.validate().is_err(),
-                "batch_interval_minutes {bad} must be rejected (1..=60)"
-            );
-        }
-        for good in [1_u32, 5, 60] {
-            cfg.batch_interval_minutes = good;
-            assert!(cfg.validate().is_ok(), "interval {good} must pass");
-        }
-    }
-
-    /// Per-minute option-chain REST pipeline (operator grant 2026-07-12,
-    /// PR-3): the `[option_chain_1m]` pipeline is DEFAULT-OFF (pending the
-    /// live entitlement probe) with `probe_and_report` DEFAULT-ON — via
-    /// `Default`, via a missing section, and via an empty section — and
-    /// explicit values round-trip.
-    #[test]
-    fn test_option_chain_1m_default_off_config_gate() {
-        use figment::Figment;
-        use figment::providers::{Format, Toml};
-
-        let d = OptionChain1mConfig::default();
-        assert!(!d.enabled, "option_chain_1m must default OFF (entitlement)");
-        assert!(d.probe_and_report, "probe_and_report must default ON");
-
-        #[derive(Deserialize)]
-        struct Wrapper {
-            #[serde(default)]
-            option_chain_1m: OptionChain1mConfig,
-        }
-        // Missing section entirely → pipeline off, probe on, never an error.
-        let missing: Wrapper = Figment::new()
-            .merge(Toml::string("[other]\nx = 1\n"))
-            .extract()
-            .expect("missing [option_chain_1m] must default, not error");
-        assert!(!missing.option_chain_1m.enabled);
-        assert!(missing.option_chain_1m.probe_and_report);
-        // Empty section (no keys) → same via the field-level defaults.
-        let empty: Wrapper = Figment::new()
-            .merge(Toml::string("[option_chain_1m]\n"))
-            .extract()
-            .expect("empty [option_chain_1m] must default, not error");
-        assert!(!empty.option_chain_1m.enabled);
-        assert!(empty.option_chain_1m.probe_and_report);
-        // Explicit values round-trip (the future opt-in shape).
-        let on: Wrapper = Figment::new()
-            .merge(Toml::string(
-                "[option_chain_1m]\nenabled = true\nprobe_and_report = false\n",
-            ))
-            .extract()
-            .expect("explicit values must round-trip");
-        assert!(on.option_chain_1m.enabled);
-        assert!(!on.option_chain_1m.probe_and_report);
-    }
-
     /// Daily timeframe-consistency verifier (operator 2026-07-13): the
     /// `[tf_consistency]` section is fail-safe DEFAULT-OFF — via `Default`,
     /// via a missing section, and via an empty section — and the explicit
@@ -5725,7 +4933,7 @@ mod tests {
             .expect("missing [order_runtime] must default, not error");
         assert!(!missing.order_runtime.enabled);
         // Empty section (no keys) → the SAME defaults as Default (the
-        // Spot1mRestConfig manual-Default precedent).
+        // manual-Default house precedent).
         let empty: Wrapper = Figment::new()
             .merge(Toml::string("[order_runtime]\n"))
             .extract()
@@ -5873,248 +5081,6 @@ mod tests {
             config.validate().is_ok(),
             "a DISABLED order_runtime section is never rejected"
         );
-    }
-
-    /// Cadence scheduler (operator 2026-07-14): the `[cadence]` section is
-    /// fail-safe DEFAULT-OFF (the design's ratchet
-    /// `!CadenceConfig::default().enabled`) — via `Default`, via a missing
-    /// section, and via an empty section — and every field of the empty
-    /// section deserializes to the judge-locked cadence table.
-    #[test]
-    fn test_cadence_config_default_off() {
-        use figment::Figment;
-        use figment::providers::{Format, Toml};
-
-        let d = CadenceConfig::default();
-        assert!(
-            !d.enabled,
-            "cadence must default OFF (fail-safe; the operator flips it)"
-        );
-        // The broker lane gates DEFAULT TRUE and are deliberately
-        // live-WS flags (fix round 2026-07-17).
-        assert!(d.dhan_lane, "cadence dhan_lane must default true");
-        // The locked cadence table (2026-07-16 post-close shape).
-        assert_eq!(d.dhan_burst_offset_ms, 1_000);
-        assert_eq!(d.spot_window_cap, 4);
-        assert_eq!(d.concurrency_degrade_after_dirty_cycles, 2);
-        assert_eq!(d.concurrency_recover_after_clean_cycles, 3);
-        assert_eq!(d.spot_min_post_close_ms, 300);
-        assert_eq!(d.in_cycle_retry_max, 1);
-        assert_eq!(d.dhan_lane_cutoff_ms, 15_000);
-        assert_eq!(d.chain_min_spacing_ms, 3_000);
-        // The 2026-07-15 pre-market expiry-resolution knobs.
-        assert_eq!(d.expiry_retry_interval_ms, 60_000);
-        assert_eq!(d.expiry_deadline_secs_of_day_ist, 32_100); // 08:55 IST
-        assert!(d.validate().is_ok(), "the shipped defaults must validate");
-
-        #[derive(Deserialize)]
-        struct Wrapper {
-            #[serde(default)]
-            cadence: CadenceConfig,
-        }
-        // Missing section entirely → disabled, never an error.
-        let missing: Wrapper = Figment::new()
-            .merge(Toml::string("[other]\nx = 1\n"))
-            .extract()
-            .expect("missing [cadence] must default, not error");
-        assert!(!missing.cadence.enabled);
-        // Empty section (no keys) → disabled + the full locked table via
-        // the field-level serde defaults (must equal `Default`).
-        let empty: Wrapper = Figment::new()
-            .merge(Toml::string("[cadence]\n"))
-            .extract()
-            .expect("empty [cadence] must default, not error");
-        assert!(!empty.cadence.enabled);
-        assert!(empty.cadence.dhan_lane, "empty [cadence] => dhan_lane true");
-        assert_eq!(empty.cadence.dhan_burst_offset_ms, d.dhan_burst_offset_ms);
-        assert_eq!(empty.cadence.spot_window_cap, d.spot_window_cap);
-        assert_eq!(
-            empty.cadence.concurrency_degrade_after_dirty_cycles,
-            d.concurrency_degrade_after_dirty_cycles
-        );
-        // Explicit ON round-trips.
-        let on: Wrapper = Figment::new()
-            .merge(Toml::string("[cadence]\nenabled = true\n"))
-            .extract()
-            .expect("explicit enabled = true must round-trip");
-        assert!(on.cadence.enabled);
-    }
-
-    /// Cadence validate(): the spot ROLLING-1000ms-WINDOW cap is bounded
-    /// 1..=5 (the Dhan Data-API hard cap is 5/sec) and the shared
-    /// concurrency-ladder streak thresholds must be >= 1 — the structural
-    /// zero-429 spot floor (operator spot-concurrency ladder 2026-07-15).
-    #[test]
-    fn test_cadence_config_validate_rejects_bad_spot_window_cap() {
-        let mut cfg = CadenceConfig {
-            spot_window_cap: 0,
-            ..CadenceConfig::default()
-        };
-        let err = cfg.validate().unwrap_err();
-        assert!(
-            err.to_string().contains("spot_window_cap"),
-            "unexpected error: {err}"
-        );
-        cfg.spot_window_cap = 6;
-        let err = cfg.validate().unwrap_err();
-        assert!(
-            err.to_string().contains("spot_window_cap"),
-            "unexpected error: {err}"
-        );
-        // The whole legal range 1..=5 validates (a cap below 4 floors the
-        // concurrency ladder's step in `cadence::ladder` — never rejected
-        // here).
-        for cap in 1..=5u32 {
-            cfg.spot_window_cap = cap;
-            assert!(cfg.validate().is_ok(), "cap {cap} must be legal");
-        }
-        // The streak thresholds are Assumed operator knobs — but 0 would
-        // degrade/recover EVERY cycle (never "continuous"); refused.
-        cfg.spot_window_cap = 4;
-        cfg.concurrency_degrade_after_dirty_cycles = 0;
-        assert!(cfg.validate().is_err());
-        cfg.concurrency_degrade_after_dirty_cycles = 2;
-        cfg.concurrency_recover_after_clean_cycles = 0;
-        assert!(cfg.validate().is_err());
-    }
-
-    /// Cadence validate(): the per-(underlying, expiry) 3s chain rule's
-    /// spacing floor cannot be configured away (2026-07-16: the rule is
-    /// per-key ONLY — different underlyings are explicitly concurrent,
-    /// so there is no offsets vector and no global gate anymore), and
-    /// the burst offset must be a genuine POST-close second.
-    #[test]
-    fn test_cadence_config_validate_rejects_sub_3s_chain_spacing() {
-        // The spacing floor itself cannot be configured away.
-        let mut cfg = CadenceConfig {
-            chain_min_spacing_ms: 2_999,
-            ..CadenceConfig::default()
-        };
-        let err = cfg.validate().unwrap_err();
-        assert!(
-            err.to_string().contains("chain_min_spacing_ms"),
-            "unexpected error: {err}"
-        );
-        cfg.chain_min_spacing_ms = 3_000;
-        // The burst is a POST-close fire: NEGATIVE is refused, T+0 is LEGAL
-        // (2026-07-31 — refusing 0 for one lane while allowing it for
-        // another was an unjustified asymmetry).
-        cfg.dhan_burst_offset_ms = 0;
-        assert!(cfg.validate().is_ok(),);
-        cfg.dhan_burst_offset_ms = -1_000;
-        let err = cfg.validate().unwrap_err();
-        assert!(
-            err.to_string().contains("dhan_burst_offset_ms"),
-            "unexpected error: {err}"
-        );
-        cfg.dhan_burst_offset_ms = 1_000;
-        assert!(cfg.validate().is_ok());
-    }
-
-    /// Cadence validate(): the cutoff-ceiling + burst-feasibility bounds
-    /// (CAD-NEW-3 / CAD-SEC-1 classes re-derived for the 2026-07-16
-    /// post-close shape) — lane cutoffs must resolve inside one minute,
-    /// and the nominal burst must land strictly before the Dhan cutoff
-    /// (else its fires are silently discarded once the cutoff skip
-    /// resolves the lane).
-    #[test]
-    fn test_cadence_config_validate_burst_band_and_cutoff_ceiling() {
-        // A Dhan cutoff at/above one minute makes every cycle overrun.
-        let mut cfg = CadenceConfig {
-            dhan_lane_cutoff_ms: 120_000,
-            ..CadenceConfig::default()
-        };
-        let err = cfg.validate().unwrap_err();
-        assert!(
-            err.to_string().contains("< 60000ms"),
-            "unexpected error: {err}"
-        );
-        cfg.dhan_lane_cutoff_ms = 60_000;
-        assert!(cfg.validate().is_err(), "exactly 60000 is degenerate");
-        cfg.dhan_lane_cutoff_ms = 15_000;
-        assert!(cfg.validate().is_ok());
-        // A nominal burst at/after the Dhan cutoff is silently discarded
-        // every cycle (the CAD-NEW-3 class) — refused, exact boundary
-        // included; the deepest-spot-bucket bound trips first (burst +
-        // 4 windows).
-        cfg.dhan_burst_offset_ms = 16_000;
-        let err = cfg.validate().unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("strictly before dhan_lane_cutoff_ms"),
-            "unexpected error: {err}"
-        );
-        cfg.dhan_burst_offset_ms = 15_000;
-        assert!(
-            cfg.validate().is_err(),
-            "a burst exactly AT the cutoff is equally discarded"
-        );
-        // Just inside the cutoff still fails the DEEPEST-spot-bucket
-        // bound (14999 + 4000 >= 15000); a burst whose whole spill fits
-        // is legal (10999 + 4000 < 15000).
-        cfg.dhan_burst_offset_ms = 14_999;
-        assert!(cfg.validate().is_err(), "deepest bucket past the cutoff");
-        cfg.dhan_burst_offset_ms = 10_999;
-        assert!(cfg.validate().is_ok(), "whole spill inside the cutoff");
-        // The shipped defaults sit comfortably inside the band.
-        assert!(CadenceConfig::default().validate().is_ok());
-    }
-
-    /// Cadence validate(): the deepest-spot-bucket feasibility bound
-    /// covers BOTH schedule inputs of the 2026-07-16 shape — the burst
-    /// offset AND the post-close clamp (build_cycle_slots takes
-    /// max(burst, T + spot_min_post_close_ms) as the spot base, deepest
-    /// bucket = base + 4 windows); a large negative Groww anchor is
-    /// rejected; the expiry knobs are bounded sane.
-    #[test]
-    fn test_cadence_config_validate_rejects_out_of_range_burst_clamp_and_expiry_knobs() {
-        // A clamp that pushes the deepest bucket to/past the cutoff is
-        // refused (SEC-CAD-1 class: 11000 + 4000 >= 15000 — silently
-        // discarded on the resolved-lane guard otherwise).
-        let mut cfg = CadenceConfig {
-            spot_min_post_close_ms: 20_000,
-            ..CadenceConfig::default()
-        };
-        let err = cfg.validate().unwrap_err();
-        assert!(
-            err.to_string().contains("spot_min_post_close_ms"),
-            "unexpected error: {err}"
-        );
-        cfg.spot_min_post_close_ms = 11_000;
-        assert!(
-            cfg.validate().is_err(),
-            "clamp deepest bucket exactly AT the cutoff (11000 + 4000 == 15000) is equally discarded"
-        );
-        cfg.spot_min_post_close_ms = 10_999;
-        assert!(cfg.validate().is_ok(), "just inside the cutoff is legal");
-        cfg.spot_min_post_close_ms = 300;
-        // Expiry knobs: a non-positive retry interval and a deadline
-        // outside the seconds-of-day domain are refused.
-        cfg.expiry_retry_interval_ms = 0;
-        let err = cfg.validate().unwrap_err();
-        assert!(
-            err.to_string().contains("expiry_retry_interval_ms"),
-            "unexpected error: {err}"
-        );
-        // R3-F1 belt (a): a burst-window-capable interval (> one
-        // minute) is refused — 65s @ a 09:14:58 wake would land the
-        // last pre-era wave at 09:16:03, the spot-group instant.
-        cfg.expiry_retry_interval_ms = 65_000;
-        let err = cfg.validate().unwrap_err();
-        assert!(
-            err.to_string().contains("expiry_retry_interval_ms"),
-            "unexpected error: {err}"
-        );
-        // The one-minute ceiling itself (the base.toml default) is legal.
-        cfg.expiry_retry_interval_ms = 60_000;
-        cfg.expiry_deadline_secs_of_day_ist = 86_400;
-        let err = cfg.validate().unwrap_err();
-        assert!(
-            err.to_string().contains("expiry_deadline_secs_of_day_ist"),
-            "unexpected error: {err}"
-        );
-        cfg.expiry_deadline_secs_of_day_ist = 32_100;
-        assert!(cfg.validate().is_ok());
     }
 
     /// 🔷 DHAN exit-order layer (Cluster B, 2026-07-14): the
@@ -6336,68 +5302,6 @@ mod tests {
         assert!(config.validate().is_ok());
     }
 
-    /// CAPTURE-LEG MUTUAL EXCLUSION (coordinator ruling B, 2026-07-16 —
-    /// SUBSUME, NEVER SHARE, interim fail-closed path; RS3 hardening
-    /// same day): enabling the cadence while ANY legacy per-minute
-    /// RECORD-capture leg is still enabled is a validation ERROR (no
-    /// double demand on one broker's rate budget is ever legal) —
-    /// REGARDLESS of `feeds.*_enabled`, because the cadence lanes key on
-    /// the RUNTIME feed atomics while the legacy legs spawn on their own
-    /// config gates, so the boot-time feed flags bound neither side.
-    /// Cadence on with the legs off is legal; cadence off with the legs
-    /// on (the base.toml shape today) stays legal.
-    #[test]
-    fn test_application_config_validate_cadence_capture_leg_mutual_exclusion() {
-        // Cadence ON + a legacy Dhan leg ON → error (feed flag irrelevant).
-        let mut config = make_valid_config();
-        config.cadence.enabled = true;
-        config.feeds.dhan_enabled = true;
-        config.spot_1m_rest.enabled = true;
-        config.option_chain_1m.enabled = false;
-        let err = config.validate().unwrap_err();
-        assert!(
-            err.to_string().contains("spot_1m_rest"),
-            "error must name the standing Dhan leg, got: {err}"
-        );
-        config.spot_1m_rest.enabled = false;
-        config.option_chain_1m.enabled = true;
-        assert!(config.validate().is_err(), "chain leg alone also refuses");
-        // Cadence ON + all legs OFF → ok (the stand-down shape).
-        config.option_chain_1m.enabled = false;
-        assert!(config.validate().is_ok(), "cadence on + legs off is legal");
-        // Cadence OFF + legs ON (the pre-2026-07-17 base.toml shape —
-        // still a legal permutation) → ok.
-        let mut config = make_valid_config();
-        config.cadence.enabled = false;
-        config.spot_1m_rest.enabled = true;
-        config.option_chain_1m.enabled = true;
-        assert!(
-            config.validate().is_ok(),
-            "cadence off + legacy legs on stays a valid permutation"
-        );
-        // RS3 (2026-07-16): a boot-time-DISABLED feed lane's legs DO
-        // block the cadence now — the pre-RS3 key on `feeds.*_enabled`
-        // admitted cadence=ON + feed=OFF + legs=ON, which sat one
-        // runtime /api/feeds enable away from reconstructing the
-        // forbidden double demand (the cadence lanes key on the RUNTIME
-        // atomics, not the boot flags). Fail-closed at the root.
-        let mut config = make_valid_config();
-        config.cadence.enabled = true;
-        config.feeds.dhan_enabled = true;
-        config.spot_1m_rest.enabled = false;
-        config.option_chain_1m.enabled = false;
-        // Same in the Dhan direction: feeds.dhan_enabled=false does not
-        // exempt the Dhan legs from the exclusion.
-        let mut config = make_valid_config();
-        config.cadence.enabled = true;
-        config.feeds.dhan_enabled = false;
-        config.spot_1m_rest.enabled = true;
-        assert!(
-            config.validate().is_err(),
-            "RS3: Dhan legs refuse with feeds.dhan_enabled=false too"
-        );
-    }
-
     /// A missing `[feeds]` section must fall back to the safe default
     /// (Dhan ON, Groww OFF) via `#[serde(default)]` — never error.
     #[test]
@@ -6444,19 +5348,5 @@ mod tests {
                  (dhan={dhan}, truedata={truedata})"
             );
         }
-    }
-}
-
-#[cfg(test)]
-mod cadence_retry_flag_tests {
-    use super::*;
-
-    #[test]
-    fn test_cadence_config_retry_flags_default_on() {
-        let cfg = CadenceConfig::default();
-        assert!(
-            cfg.native_retry_enabled,
-            "native_retry_enabled must default ON"
-        );
     }
 }
