@@ -18,8 +18,8 @@
 //! ## RAM budget
 //!
 //! `SEAL_BUFFER_CAPACITY = AGGREGATOR_MAX_SLOTS × TF_COUNT` (25,000 × 10
-//! = 250,000 since 2026-09-22) and `BufferedSeal` ≤ 168 bytes → **~42.0 MB
-//! worst-case**. 0.13% of the r8g.xlarge 32 GiB host (operator Quote 13, 2026-08-08).
+//! = 250,000 since 2026-09-22) and `BufferedSeal` ≤ 176 bytes → **~44.0 MB
+//! worst-case** (168 B / ~42.0 MB until the 2026-10-01 R6 `open_ts_ist_secs`). 0.13% of the r8g.xlarge 32 GiB host (operator Quote 13, 2026-08-08).
 //! Was a hardcoded 200,000 (~29 MB) until 2026-08-10 — see the constant's
 //! own doc for why that literal under-sized the midnight burst by 3×.
 //!
@@ -103,8 +103,9 @@ pub const SEAL_BUFFER_CAPACITY: usize =
 
 /// One sealed bar ready to flush to its `candles_*` plain table.
 /// `Copy` so the ring's `VecDeque<BufferedSeal>` does not need
-/// ref-counted entries. Sized ≤ 168 bytes per the const-assert below —
-/// MEASURED at exactly 168 on 2026-09-19, so the bound has NO slack left.
+/// ref-counted entries. Sized ≤ 176 bytes per the const-assert below —
+/// MEASURED at exactly 176 on 2026-10-01 (R6, `open_ts_ist_secs`), so the
+/// bound has NO slack left. (168 on 2026-09-19.)
 /// (This line said "≤ 128" until 2026-09-19: the assert was raised twice
 /// and the prose was not, which is the same stale-number class the
 /// `SEAL_BUFFER_CAPACITY` doc six lines above records against itself.)
@@ -207,9 +208,16 @@ impl BufferedSeal {
 // 2026-09-22: `M10` became a native frame (TF_COUNT 9 -> 10), so the derived
 // capacity is 250,000 and the ring is ~42.0 MB at 168 B, +4.2 MB. Recorded in
 // `websocket-connection-scope-lock.md` "NO VIEWS ANYWHERE".
+//
+// RAISED 168 -> 176 on 2026-10-01 (plan item R6) for
+// `LiveCandleState::open_ts_ist_secs` (152 -> 160), the trade second of the
+// open, which lets an earlier trade arriving later take the open as the close
+// rule already did. 160 + 11 payload = 171, padded to 176. Ring RAM at the
+// derived SEAL_BUFFER_CAPACITY of 250,000 moves 42.0 MB -> 44.0 MB, +2.0 MB,
+// recorded in aws-budget.md under the same date.
 const _: () = assert!(
-    std::mem::size_of::<BufferedSeal>() <= 168,
-    "BufferedSeal exceeded 168-byte budget — ring RAM = SEAL_BUFFER_CAPACITY × this size; bumping requires updating aws-budget.md."
+    std::mem::size_of::<BufferedSeal>() <= 176,
+    "BufferedSeal exceeded 176-byte budget — ring RAM = SEAL_BUFFER_CAPACITY × this size; bumping requires updating aws-budget.md."
 );
 
 /// Outcome of [`SealRing::try_buffer`].
@@ -418,8 +426,10 @@ mod tests {
         // (128 -> 136); 152 -> 168 on 2026-09-19 with the two receipt stamps
         // (136 -> 152). Fleet cost recorded beside the const assert and in
         // aws-budget.md: the ring is SEAL_BUFFER_CAPACITY x this size, so at
-        // the post-collapse 225,000 that is 34.2 MB -> 37.8 MB.
-        assert!(std::mem::size_of::<BufferedSeal>() <= 168);
+        // the post-collapse 225,000 that is 34.2 MB -> 37.8 MB. 168 -> 176 on
+        // 2026-10-01 (R6) with `open_ts_ist_secs` (152 -> 160): at the
+        // 250,000 of TF_COUNT 10 that is 42.0 MB -> 44.0 MB.
+        assert!(std::mem::size_of::<BufferedSeal>() <= 176);
     }
 
     #[test]

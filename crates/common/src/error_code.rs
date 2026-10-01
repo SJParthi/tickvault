@@ -898,6 +898,12 @@ pub enum ErrorCode {
     /// 2026-07-14 Dhan noise-lock posture, whose 4-item family is
     /// unchanged). Severity::High, auto-triage-safe: nothing is retried,
     /// the row is still captured, and the operator reads the excerpt.
+    ///
+    /// `stage = "typed_parse_failed"` (added 2026-10-01, R4) is the opposite
+    /// case: the frame carries the order envelope but the typed parse
+    /// REFUSED it (a field changed type). That event is DROPPED, not captured
+    /// hollow, and is counted on `tv_order_update_frames_dropped_total`
+    /// `{reason="unparseable_order"}`; the log is throttled to powers of two.
     OrderEvt02DecodedHollow,
     /// ORDER-PNL-01 — per-leg option P&L persistence degraded (the
     /// `stage` field names the failing leg).
