@@ -417,6 +417,26 @@ inline (PR2, PR8, PR14).
     operator and dev tooling, manual-only hooks) each get a stated verdict: product path (port or
     budget) or not product path (recorded as out of the rust-only scope). The All Green matrix
     script is rule-locked to shell and needs an owner quote before it changes.
+  - Series (2026-10-01, owned by the "Replace shell scripts with Rust" thread; one PR each,
+    serial; the audit-plan thread skips D6):
+    - [ ] D6a — shell budget first: `crates/common/tests/shell_budget_guard.rs` freezes the 105
+      shell files (46 developer tooling by file set; 59 others by file set AND line ceiling) and
+      pins each systemd unit's shell `Exec*=` count (1 + 3 + 1). Rule lock §0.10. Test-only.
+      Tests: `no_new_shell_files`, `shell_lists_shrink_only`, `ops_shell_files_never_grow`,
+      `systemd_units_never_add_shell`, `shell_budget_guard_self_test`.
+    - [ ] D6b — host tuning (3 of the 5 boot shell programs: verify-net-tuning.sh,
+      apply-host-tuning.sh, the BBR `/bin/sh -c`) becomes `tickvault host-tuning` in `app`, same
+      behaviour, pure core + thin I/O shell, unit tests on every branch. Unit pin 3 → 0; two
+      ops entries removed; user-data `chmod` lines removed; the three host-tuning guards re-pointed.
+    - [ ] D6c — holiday gate becomes `tickvault holiday-gate` in `app` (IMDSv2 via reqwest; SSM
+      marker, SNS page and StopInstances via the existing workspace AWS SDK pins). Same fail-open
+      contract: stop only on a definitive holiday verdict. Unit pin 1 → 0.
+    - [ ] D6d — QuestDB self-heal becomes `tickvault ensure-questdb` in `app` (same ladder:
+      running → start → pull → compose v2 → v1 → plugin path → docker run), and the operator
+      console's SSM strings call the binary. Unit pin 1 → 0.
+    - [ ] D6e onward — the rest by risk: SSM command strings and `sh -c` spawns in Rust get a
+      budget, then workflow `run:` steps and the Makefile get a budget, then operator scripts
+      are ported or deleted (orphans first), each PR lowering the D6a lists.
 
 
 ### Added 2026-09-26 (second re-check, 26 new open gaps), riskiest first
