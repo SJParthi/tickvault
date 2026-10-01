@@ -149,16 +149,20 @@ impl SealWriterProgress {
 
 /// Counter for the mid-session spill replay (audit PR15). One series per
 /// `kind`: `files_staged`, `reingested`, `skipped`, `files_archived`,
-/// `flush_failed`.
+/// `flush_failed`, and since audit PR41b `files_parked` (a file that stopped
+/// making progress, set aside so the next could go ahead) and `files_rewound`
+/// (a file read again because QuestDB turned suspect before confirming it).
 pub const SEAL_REPLAY_COUNTER: &str = "tv_seal_replay_total";
 
-/// The five `kind` labels of [`SEAL_REPLAY_COUNTER`].
-const SEAL_REPLAY_KINDS: [&str; 5] = [
+/// The seven `kind` labels of [`SEAL_REPLAY_COUNTER`].
+const SEAL_REPLAY_KINDS: [&str; 7] = [
     "files_staged",
     "reingested",
     "skipped",
     "files_archived",
     "flush_failed",
+    "files_parked",
+    "files_rewound",
 ];
 
 /// Put every replay series on the wire at zero when the loop starts, so "the
@@ -181,6 +185,8 @@ fn record_replay_observability(replay: &ReplayOutcome) {
         replay.records_skipped,
         replay.files_archived,
         usize::from(replay.flush_failed),
+        replay.files_parked,
+        replay.files_rewound,
     ];
     for (kind, value) in SEAL_REPLAY_KINDS.into_iter().zip(values) {
         if value > 0 {
