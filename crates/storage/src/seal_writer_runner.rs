@@ -1181,14 +1181,21 @@ impl SealWriterRunner {
     ) -> (CycleOutcome, ReplayOutcome) {
         let cycle = self.run_one_cycle(now_unix_secs);
         self.replay.observe(&cycle.drain, now_unix_secs);
+        // Audit PR41b: the QuestDB watcher's word closes the gate on a
+        // suspect table and reopens it without live traffic.
+        let files_rewound = self.replay.observe_probe(
+            crate::seal_writer_task::ReplayProbe::current(),
+            now_unix_secs,
+        );
         let ring_is_empty = self.pipeline.ring_len() == 0;
-        let replay = self.replay.step(
+        let mut replay = self.replay.step(
             &mut self.writer,
             &self.spill,
             &self.spill_dir,
             ring_is_empty,
             now_unix_secs,
         );
+        replay.files_rewound += files_rewound;
         (cycle, replay)
     }
 }
