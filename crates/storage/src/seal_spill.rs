@@ -40,11 +40,11 @@
 //!
 //! | Offset | Size | Field |
 //! |---|---|---|
-//! | 0    | 4 | `security_id` low-32 (legacy/Dhan; full u64 at 120-128) |
+//! | 0    | 4 | **v5+:** `record_crc32: u32`, CRC-32 (IEEE) of bytes 4..128. **v4 and older:** `security_id` low-32 (legacy/Dhan; full u64 at 120-128) |
 //! | 4    | 1 | `exchange_segment_code: u8`     |
 //! | 5    | 1 | `tf_ordinal: u8` (0..=8 per `TfIndex` — the operator's nine frames since 2026-09-19; the ordinal space has been renumbered twice, so the byte is meaningless without `format_version`) |
 //! | 6    | 1 | `feed_index: u8` (`Feed::index()` — 0=Dhan, 1=Groww; pre-feed records read 0=Dhan) |
-//! | 7    | 1 | `format_version: u8` (=4 since 2026-09-19; `read_all` and the boot drain REFUSE every record whose version is not the live constant (older or newer), because each bump renumbered `tf_ordinal` and a stale byte decodes into the wrong frame silently) |
+//! | 7    | 1 | `format_version: u8` (=5 since 2026-10-01). Every reader accepts `SEAL_SPILL_OLDEST_READABLE_VERSION..=SEAL_SPILL_FORMAT_VERSION` (4..=5) and REFUSES every other version, older or newer: 3 → 4 renumbered `tf_ordinal`, so an older byte decodes into the wrong frame silently. 4 → 5 renumbered nothing, which is why 4 is still read |
 //! | 8    | 4 | `bucket_start_ist_secs: u32`    |
 //! | 12   | 4 | `tick_count: u32`               |
 //! | 16   | 8 | `volume: u64`                   |
@@ -125,6 +125,30 @@
 //! see the RETIRED note at the field site) and `SealDlqRecord`, whose NDJSON
 //! carries `bucket_open_prev_close` in their place. A spill-replayed or
 //! DLQ-replayed seal therefore decodes `0` / `false` for the flow pair.
+//!
+//! ## Format version 5 (2026-10-01) — every record carries a checksum
+//!
+//! Audit PR41c (row 136). Until v5 a record had no way to say it was intact:
+//! a flipped bit in a price, a volume or a timeframe byte decoded into a
+//! plausible seal and was written to the candle table as if it were true. The
+//! record is byte-for-byte full, so the checksum takes the one range that
+//! carries nothing of its own: bytes 0..4, the legacy low-32 `security_id`,
+//! whose full value has been at bytes 120..128 since 2026-06-29. A v5 record
+//! therefore reads its id from 120..128 only, and bytes 0..4 hold a CRC-32
+//! (IEEE) of bytes 4..128 — everything else in the record, the version byte
+//! included, so a flipped version byte is caught as well.
+//!
+//! No `tf_ordinal` moved, so a v4 record still decodes exactly as it did and
+//! every reader accepts it during the rollout (a spill written by the build
+//! before this one is read by this one). A v4 record has no checksum to check;
+//! that is the one gap the rollout leaves, and it closes when the last v4 file
+//! is archived. A rollback to a v4 build refuses v5 records, counts them and
+//! keeps their bytes in `archive/`, the same as any other unknown version.
+//!
+//! A record whose checksum does not hold is refused and counted as
+//! undecodable, and the reader moves on to the next record: the record
+//! boundary is unaffected by what is inside the record, so one bad record
+//! costs one seal, never the rest of the file.
 //!
 //! Total: 128 bytes, and **there is no spare room left**.
 //!
@@ -218,7 +242,92 @@ pub const SEAL_SPILL_RECORD_SIZE: usize = 128;
 /// NO receipt field. A seal replayed from spill or the DLQ therefore writes all
 /// six delay columns as NULL (never a fabricated zero): the delays of a replayed
 /// bar are unknown, and the row says so.
-pub const SEAL_SPILL_FORMAT_VERSION: u8 = 4;
+///
+/// **Bumped 4 → 5 on 2026-10-01** (audit PR41c): bytes 0..4 carry a CRC-32 of
+/// bytes 4..128 instead of the legacy low-32 id. No ordinal moved, so version
+/// 4 stays readable — see [`SEAL_SPILL_OLDEST_READABLE_VERSION`].
+pub const SEAL_SPILL_FORMAT_VERSION: u8 = 5;
+
+/// Oldest format version every reader still accepts.
+///
+/// It is the oldest version that shares the CURRENT `tf_ordinal` space. A bump
+/// that renumbers `TfIndex` (as 3 → 4 did) must raise this to the new version
+/// in the same change, so the older bytes are refused instead of filed under
+/// the wrong timeframe; a bump that changes only how a record is checked (as
+/// 4 → 5 did) leaves it where it is, so the previous build's spill is read.
+pub const SEAL_SPILL_OLDEST_READABLE_VERSION: u8 = 4;
+
+/// First format version whose bytes 0..4 carry `record_crc32` (2026-10-01).
+pub const SEAL_SPILL_FIRST_CHECKSUM_VERSION: u8 = 5;
+
+const _: () = assert!(
+    SEAL_SPILL_OLDEST_READABLE_VERSION <= SEAL_SPILL_FORMAT_VERSION
+        && SEAL_SPILL_FIRST_CHECKSUM_VERSION <= SEAL_SPILL_FORMAT_VERSION,
+    "the readable range must include the version this build writes"
+);
+
+/// `true` when a spill or dead-letter record stamped `version` can be read by
+/// this build. One range check, O(1).
+#[must_use]
+pub const fn seal_spill_version_is_readable(version: u8) -> bool {
+    version >= SEAL_SPILL_OLDEST_READABLE_VERSION && version <= SEAL_SPILL_FORMAT_VERSION
+}
+
+/// Re-stamp the checksum of a record a test edited by hand. Test-only.
+#[cfg(test)]
+pub(crate) fn reseal_record_for_test(buf: &mut [u8; SEAL_SPILL_RECORD_SIZE]) {
+    let crc = record_checksum(buf);
+    buf[0..4].copy_from_slice(&crc.to_le_bytes());
+}
+
+/// What a reader may do with one 128-byte spill record (audit PR41c).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SpillRecordRead {
+    /// The record is intact and decodes.
+    Seal(SerializedSeal),
+    /// Written under a version this build does not read (byte 7).
+    OtherVersion,
+    /// A v5+ record whose checksum does not match its bytes.
+    ChecksumMismatch,
+}
+
+/// CRC-32 (IEEE) of bytes 4..128, the value a v5+ record holds at 0..4.
+/// O(record size), zero allocation.
+fn record_checksum(buf: &[u8; SEAL_SPILL_RECORD_SIZE]) -> u32 {
+    crate::wal_applied_watermark::crc32_ieee(&buf[4..])
+}
+
+/// `true` when `buf` is a v5+ record whose checksum holds, or an older record
+/// that is consistent with itself.
+///
+/// An older record carries no checksum, but every version-4 writer put the low
+/// 32 bits of the id at 0..4 AND the full id at 120..128, so the two must
+/// agree. That check is what catches a v5 record whose version byte flipped
+/// to 4: its bytes 0..4 hold a checksum, which matches the id's low half only
+/// by a 1-in-2^32 chance. A record with a zero full id predates the widening
+/// and has nothing to compare.
+fn record_checksum_holds(buf: &[u8; SEAL_SPILL_RECORD_SIZE]) -> bool {
+    if buf[7] >= SEAL_SPILL_FIRST_CHECKSUM_VERSION {
+        return u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) == record_checksum(buf);
+    }
+    let full_id_low = [buf[120], buf[121], buf[122], buf[123]];
+    let full_id_high = [buf[124], buf[125], buf[126], buf[127]];
+    (full_id_low == [0; 4] && full_id_high == [0; 4]) || buf[0..4] == full_id_low
+}
+
+/// Classify and decode one spill record: the version gate, then the checksum,
+/// then the fields. Every spill reader goes through this, so the three cannot
+/// disagree about which records they trust. O(record size), zero allocation.
+#[must_use]
+pub fn decode_spill_record(buf: &[u8; SEAL_SPILL_RECORD_SIZE]) -> SpillRecordRead {
+    if !seal_spill_version_is_readable(buf[7]) {
+        return SpillRecordRead::OtherVersion;
+    }
+    match SerializedSeal::from_bytes(buf) {
+        Some(seal) => SpillRecordRead::Seal(seal),
+        None => SpillRecordRead::ChecksumMismatch,
+    }
+}
 
 /// ⚠ **RETIRED 2026-09-18.** Bytes 80..88 no longer carry a net volume in any
 /// version this writer produces, so nothing reads this sentinel off the wire.
@@ -336,10 +445,8 @@ impl SerializedSeal {
     #[must_use]
     pub fn to_bytes(&self) -> [u8; SEAL_SPILL_RECORD_SIZE] {
         let mut buf = [0u8; SEAL_SPILL_RECORD_SIZE];
-        // Legacy low-32 at bytes 0-4 (Dhan-readable, truncates a >u32 Groww id);
-        // the FULL u64 lives in the reserved 120-128 region below so no id is
-        // ever lost on round-trip.
-        buf[0..4].copy_from_slice(&(self.security_id as u32).to_le_bytes());
+        // Bytes 0..4 are written LAST: from version 5 they hold the checksum
+        // of everything else (audit PR41c). The id is at 120..128.
         buf[4] = self.exchange_segment_code;
         buf[5] = self.tf_ordinal;
         // Feed provenance round-trips through disk spill (byte 6; pre-feed
@@ -383,15 +490,21 @@ impl SerializedSeal {
         // back: non-zero here → full u64; zero → legacy/Dhan record, fall back
         // to the low-32 at bytes 0-4.
         buf[120..128].copy_from_slice(&self.security_id.to_le_bytes());
+        let crc = record_checksum(&buf);
+        buf[0..4].copy_from_slice(&crc.to_le_bytes());
         buf
     }
 
     /// Deserialise from a fixed 128-byte little-endian record.
     /// Returns `None` if the buffer is shorter than the record size
-    /// (truncated tail) — caller treats this as end-of-file.
+    /// (truncated tail) — caller treats this as end-of-file — or if it is a
+    /// version-5-or-later record whose checksum does not hold (audit PR41c).
+    /// It does NOT apply the version gate; [`decode_spill_record`] does both.
     #[must_use]
     pub fn from_bytes(buf: &[u8]) -> Option<Self> {
-        if buf.len() < SEAL_SPILL_RECORD_SIZE {
+        let buf: &[u8; SEAL_SPILL_RECORD_SIZE] =
+            buf.get(..SEAL_SPILL_RECORD_SIZE)?.try_into().ok()?;
+        if !record_checksum_holds(buf) {
             return None;
         }
         // Byte 6 = Feed::index(); fall back to Dhan for an out-of-range index
@@ -431,7 +544,9 @@ impl SerializedSeal {
         let security_id_full = u64::from_le_bytes([
             buf[120], buf[121], buf[122], buf[123], buf[124], buf[125], buf[126], buf[127],
         ]);
-        let security_id = if security_id_full != 0 {
+        // From version 5 bytes 0..4 are the checksum, so the full id is the
+        // only id the record holds.
+        let security_id = if security_id_full != 0 || buf[7] >= SEAL_SPILL_FIRST_CHECKSUM_VERSION {
             security_id_full
         } else {
             u64::from(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]))
@@ -894,6 +1009,12 @@ impl SealSpillWriter {
         // cross-seal user-space buffer WOULD regress that; see the
         // module-level note on why it is deliberately not done.
         if let Err(err) = current.file.write_all(&bytes) {
+            // Audit PR41c: a failed write may have left part of this record
+            // behind. Cut the file back to its last whole record BEFORE
+            // dropping the handle, as the batch path does, so the next record
+            // starts on its 128-byte boundary. Error path only: the steady
+            // state pays nothing for this.
+            let cut = cut_back_to_whole_records(&current.file);
             // Drop the possibly-broken handle so the next call reopens —
             // mirrors `ws_frame_spill::persist_record_resilient`. The error
             // still propagates, so the absorption pipeline escalates THIS
@@ -901,7 +1022,18 @@ impl SealSpillWriter {
             *open = None;
             self.err_write.increment(1);
             let path = self.spill_path(now_unix_secs);
-            return Err(err).with_context(|| format!("failed to write seal to {path:?}"));
+            return match cut {
+                Ok(_) => Err(err).with_context(|| format!("failed to write seal to {path:?}")),
+                Err(cut_err) => {
+                    let aside = set_aside_torn_file(&path);
+                    Err(err).with_context(|| {
+                        format!(
+                            "failed to write seal to {path:?}, cutting the torn tail back ALSO \
+                             failed ({cut_err}); file set aside: {aside:?}"
+                        )
+                    })
+                }
+            };
         }
         self.note_spilled(ledger, seal, verdict);
         Ok(())
@@ -920,7 +1052,32 @@ impl SealSpillWriter {
             // rotation never holds two descriptors.
             *open = None;
             let path = self.spill_path(now_unix_secs);
-            let file = self.open_append_handle(&path)?;
+            let mut file = self.open_append_handle(&path)?;
+            // Audit PR41c: a file left with a torn tail (a crash mid-write,
+            // or the third failure in a row on the write paths) would put
+            // every record appended now off its 128-byte boundary, and every
+            // reader would refuse them all. Checked once per open.
+            match cut_back_to_whole_records(&file) {
+                Ok(0) => {}
+                Ok(cut) => warn!(
+                    ?path,
+                    cut_bytes = cut,
+                    "seal spill: cut a torn partial record off the end of the day file before \
+                     appending"
+                ),
+                Err(err) => {
+                    drop(file);
+                    let aside = set_aside_torn_file(&path);
+                    warn!(
+                        ?path,
+                        ?err,
+                        ?aside,
+                        "seal spill: the day file ends mid-record and cannot be cut back; set \
+                         aside, appending to a fresh file"
+                    );
+                    file = self.open_append_handle(&path)?;
+                }
+            }
             *open = Some(OpenSpillFile { ist_day: day, file });
         }
         match open.as_mut() {
@@ -971,9 +1128,9 @@ impl SealSpillWriter {
     /// both drains still read) with the handle already closed, so the tear is
     /// the last thing in that file and reads as its end; the next append
     /// starts a fresh file. If the rename fails too, the torn tail stays in
-    /// the day file and every record appended after it is misaligned: those
-    /// records are refused on read and their bytes survive in `archive/`.
-    /// That third failure in a row is the one case this does not cover.
+    /// the day file until the next open of it, which cuts it back before the
+    /// first append (audit PR41c); this batch path also checks the length it
+    /// starts from and cuts a partial record off first.
     ///
     /// # Complexity
     /// O(seals) to serialise, one `write(2)` in steady state, plus one
@@ -1009,6 +1166,27 @@ impl SealSpillWriter {
         }
         let current = self.current_file(open, now_unix_secs)?;
         let before = match current.file.metadata() {
+            // Audit PR41c: the batch starts on a record boundary. The day
+            // file was cut back when it was opened and every failed write
+            // cuts its own tail, so this is the guard for a case those miss;
+            // the cut-back below then restores this length, never a torn one.
+            Ok(meta) if meta.len() % SEAL_SPILL_RECORD_SIZE as u64 != 0 => {
+                match cut_back_to_whole_records(&current.file) {
+                    Ok(cut) => meta.len().saturating_sub(cut),
+                    Err(err) => {
+                        *open = None;
+                        self.err_write.increment(1);
+                        let path = self.spill_path(now_unix_secs);
+                        let aside = set_aside_torn_file(&path);
+                        return Err(err).with_context(|| {
+                            format!(
+                                "seal spill file {path:?} ends mid-record and cannot be cut \
+                                 back; set aside ({aside:?}) before the batch"
+                            )
+                        });
+                    }
+                }
+            }
             Ok(meta) => meta.len(),
             Err(err) => {
                 *open = None;
@@ -1200,6 +1378,7 @@ impl SealSpillWriter {
         let mut reader = BufReader::new(file);
         let mut all = Vec::new();
         let mut legacy_refused: usize = 0;
+        let mut checksum_refused: usize = 0;
         let mut buf = [0u8; SEAL_SPILL_RECORD_SIZE];
         loop {
             match read_full_record(&mut reader, &mut buf) {
@@ -1227,18 +1406,15 @@ impl SealSpillWriter {
                     // legitimately mix older + current records via append across a
                     // deploy boundary. The loss is bounded to one deploy boot's
                     // worth of spilled seals.
-                    if buf[7] != SEAL_SPILL_FORMAT_VERSION {
-                        legacy_refused += 1;
-                        continue;
-                    }
-                    if let Some(seal) = SerializedSeal::from_bytes(&buf) {
-                        all.push(seal);
-                    } else {
-                        warn!(
-                            ?path,
-                            "spill record decode returned None — corrupt tail, stopping read"
-                        );
-                        break;
+                    //
+                    // 2026-10-01 (version 4 → 5, audit PR41c): no ordinal moved,
+                    // so the gate is the readable RANGE, 4..=5, not one value.
+                    // A v5 record whose checksum fails is refused and the read
+                    // goes on: the boundary does not depend on the contents.
+                    match decode_spill_record(&buf) {
+                        SpillRecordRead::Seal(seal) => all.push(seal),
+                        SpillRecordRead::OtherVersion => legacy_refused += 1,
+                        SpillRecordRead::ChecksumMismatch => checksum_refused += 1,
                     }
                 }
                 Ok(false) => break, // clean EOF
@@ -1257,6 +1433,15 @@ impl SealSpillWriter {
                  older or newer (their tf_ordinal belongs to another TfIndex \
                  ordinal space, so decoding them would file a seal under the \
                  wrong timeframe; deleted with the file after drain)"
+            );
+        }
+        if checksum_refused > 0 {
+            error!(
+                code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                ?path,
+                checksum_refused,
+                "refused spill records whose checksum does not match their bytes \
+                 (damaged on disk); each refused record is one candle not replayed"
             );
         }
         info!(?path, count = all.len(), "drained spill file");
@@ -1282,6 +1467,20 @@ impl SealSpillWriter {
         info!(?path, "spill file cleared after successful drain");
         Ok(())
     }
+}
+
+/// Cut `file` back to its last whole 128-byte record and return how many
+/// bytes were cut (0 when it already ends on a boundary). One `fstat`, plus
+/// one `ftruncate` only when there is a partial record to remove. The bytes
+/// removed are part of ONE record that was never written whole, so no
+/// complete record is ever cut (audit PR41c).
+fn cut_back_to_whole_records(file: &File) -> std::io::Result<u64> {
+    let len = file.metadata()?.len();
+    let torn = len % SEAL_SPILL_RECORD_SIZE as u64;
+    if torn != 0 {
+        file.set_len(len - torn)?;
+    }
+    Ok(torn)
 }
 
 /// Move a spill file whose tail is torn to `<name>.<n>` in the same
@@ -1741,6 +1940,7 @@ mod tests {
         for b in bytes.iter_mut().take(120).skip(104) {
             *b = 0;
         }
+        reseal_record_for_test(&mut bytes);
         let decoded = SerializedSeal::from_bytes(&bytes).expect("decoded");
         assert_eq!(decoded.change_pct, 0.0);
         assert_eq!(decoded.open_gap_pct, 0.0);
@@ -2596,6 +2796,9 @@ mod tests {
         for (version, label) in [(1_u8, "v1 f64 price"), (2_u8, "v2 i64 net volume")] {
             let mut bytes = SerializedSeal::from(&seal).to_bytes();
             bytes[7] = version;
+            // Versions before 5 held the id's low 32 bits at 0..4, not a
+            // checksum (audit PR41c).
+            bytes[0..4].copy_from_slice(&13_u32.to_le_bytes());
             // Whatever the older format put in those bytes, the decoder must
             // not read it as a baseline. `-4_242` is the v2 accumulator value
             // this fixture carried; as an `f64` it is a denormal near zero,
@@ -3385,5 +3588,234 @@ mod pr41a_tests {
         let amended = pr41a_buffered(&pr41a_copy(13, 1_727_760_000, 5, 40));
         assert_eq!(writer.note_live_commits(&[amended], now), 0);
         let _ = std::fs::remove_file(&dir);
+    }
+}
+
+/// Audit PR41c: every spilled record can be checked, and no torn record
+/// shifts the ones after it.
+#[cfg(test)]
+mod pr41c_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn seal(sid: u64, bucket: u32, close: f64) -> SerializedSeal {
+        SerializedSeal {
+            security_id: sid,
+            exchange_segment_code: 2,
+            tf_ordinal: 0,
+            feed: Feed::Dhan,
+            bucket_start_ist_secs: bucket,
+            tick_count: 5,
+            volume: 1234,
+            bucket_start_cumulative: 1000,
+            oi: 50_000,
+            open: 100.0,
+            high: 105.0,
+            low: 99.0,
+            close,
+            close_pct_from_prev_day: 0.5,
+            bucket_open_prev_close: 99.5,
+            total_buy_qty: 10,
+            total_sell_qty: 20,
+            open_pct: 0.1,
+            change_pct: 0.2,
+            open_gap_pct: 0.3,
+        }
+    }
+
+    fn dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("tv-seal-spill-pr41c-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    fn noon() -> i64 {
+        Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
+            .single()
+            .expect("valid")
+            .timestamp()
+    }
+
+    /// The version-4 bytes the previous build wrote for `s`.
+    fn v4_bytes(s: &SerializedSeal) -> [u8; SEAL_SPILL_RECORD_SIZE] {
+        let mut bytes = s.to_bytes();
+        bytes[0..4].copy_from_slice(&(s.security_id as u32).to_le_bytes());
+        bytes[7] = 4;
+        bytes
+    }
+
+    #[test]
+    fn to_bytes_writes_a_checksum_of_bytes_4_to_128_at_bytes_0_to_4() {
+        let s = seal(4_294_967_301, 1_716_000_900, 101.25);
+        let bytes = s.to_bytes();
+        assert_eq!(bytes[7], SEAL_SPILL_FORMAT_VERSION);
+        assert_eq!(SEAL_SPILL_FORMAT_VERSION, SEAL_SPILL_FIRST_CHECKSUM_VERSION);
+        assert_eq!(
+            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            crate::wal_applied_watermark::crc32_ieee(&bytes[4..])
+        );
+        assert_eq!(decode_spill_record(&bytes), SpillRecordRead::Seal(s));
+    }
+
+    #[test]
+    fn decode_spill_record_refuses_a_flipped_bit_anywhere_in_the_record() {
+        let s = seal(13, 1_716_000_900, 101.25);
+        let bytes = s.to_bytes();
+        for byte in 0..SEAL_SPILL_RECORD_SIZE {
+            for bit in 0..8 {
+                let mut damaged = bytes;
+                damaged[byte] ^= 1 << bit;
+                let read = decode_spill_record(&damaged);
+                assert!(
+                    matches!(
+                        read,
+                        SpillRecordRead::ChecksumMismatch | SpillRecordRead::OtherVersion
+                    ),
+                    "byte {byte} bit {bit}: a damaged record must never decode, got {read:?}"
+                );
+            }
+        }
+        // Byte 7 flipped from 5 to 4 reads as the previous format, whose id
+        // check is what refuses it.
+        let mut as_v4 = bytes;
+        as_v4[7] = 4;
+        assert_eq!(
+            decode_spill_record(&as_v4),
+            SpillRecordRead::ChecksumMismatch
+        );
+    }
+
+    #[test]
+    fn a_v4_record_written_by_the_previous_build_still_decodes() {
+        let s = seal(4_294_967_301, 1_716_000_900, 101.25);
+        let old = v4_bytes(&s);
+        assert!(seal_spill_version_is_readable(4));
+        assert!(seal_spill_version_is_readable(SEAL_SPILL_FORMAT_VERSION));
+        assert!(!seal_spill_version_is_readable(3));
+        assert!(!seal_spill_version_is_readable(
+            SEAL_SPILL_FORMAT_VERSION + 1
+        ));
+        assert_eq!(decode_spill_record(&old), SpillRecordRead::Seal(s));
+        // A v4 record from before the id widening (zero full id) has nothing
+        // to compare and decodes from its low-32 id.
+        let mut narrow = old;
+        narrow[120..128].copy_from_slice(&[0; 8]);
+        match decode_spill_record(&narrow) {
+            SpillRecordRead::Seal(read) => assert_eq!(read.security_id, 5),
+            other => panic!("a pre-widening v4 record must decode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_reseal_record_for_test_restores_a_valid_checksum() {
+        let mut bytes = seal(13, 1_716_000_900, 101.25).to_bytes();
+        bytes[64] ^= 0xFF;
+        assert_eq!(
+            decode_spill_record(&bytes),
+            SpillRecordRead::ChecksumMismatch
+        );
+        reseal_record_for_test(&mut bytes);
+        assert!(matches!(
+            decode_spill_record(&bytes),
+            SpillRecordRead::Seal(_)
+        ));
+    }
+
+    #[test]
+    fn read_all_skips_a_damaged_record_and_keeps_reading() {
+        let dir = dir("damaged-middle");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        let now = noon();
+        let (a, b, c) = (
+            seal(1, 1_716_000_900, 1.0),
+            seal(2, 1_716_000_900, 2.0),
+            seal(3, 1_716_000_900, 3.0),
+        );
+        for s in [&a, &b, &c] {
+            writer.append_seal(s, now).expect("append");
+        }
+        let path = writer.spill_path(now);
+        let mut bytes = std::fs::read(&path).expect("read");
+        bytes[SEAL_SPILL_RECORD_SIZE + 64] ^= 0x01;
+        std::fs::write(&path, &bytes).expect("write");
+        assert_eq!(writer.read_all(now).expect("read_all"), vec![a, c]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cut_back_to_whole_records_removes_only_a_partial_record() {
+        let dir = dir("cut-back");
+        let path = dir.join("f.bin");
+        std::fs::write(&path, vec![7u8; 2 * SEAL_SPILL_RECORD_SIZE + 50]).expect("write");
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open");
+        assert_eq!(cut_back_to_whole_records(&file).expect("cut"), 50);
+        assert_eq!(
+            std::fs::metadata(&path).expect("meta").len(),
+            2 * SEAL_SPILL_RECORD_SIZE as u64
+        );
+        assert_eq!(cut_back_to_whole_records(&file).expect("cut"), 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_torn_day_file_is_cut_back_when_it_is_opened() {
+        let dir = dir("torn-on-open");
+        let now = noon();
+        let (a, b) = (seal(1, 1_716_000_900, 1.0), seal(2, 1_716_000_900, 2.0));
+        let first = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        first.append_seal(&a, now).expect("append a");
+        let path = first.spill_path(now);
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("open");
+            f.write_all(&[0xAB; 50]).expect("torn write");
+        }
+        // A new writer (the next process) opens the file and appends.
+        let next = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        next.append_seal(&b, now).expect("append b");
+        assert_eq!(
+            std::fs::metadata(&path).expect("meta").len(),
+            2 * SEAL_SPILL_RECORD_SIZE as u64
+        );
+        assert_eq!(next.read_all(now).expect("read_all"), vec![a, b]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_batch_starts_on_a_record_boundary_even_on_an_open_handle() {
+        let dir = dir("batch-aligned");
+        let now = noon();
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        let (a, b, c) = (
+            seal(1, 1_716_000_900, 1.0),
+            seal(2, 1_716_000_900, 2.0),
+            seal(3, 1_716_000_900, 3.0),
+        );
+        writer.append_seal(&a, now).expect("append a");
+        let path = writer.spill_path(now);
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("open");
+            f.write_all(&[0xAB; 50]).expect("torn write");
+        }
+        let mut scratch = Vec::new();
+        writer
+            .append_seals([&b, &c], &mut scratch, now)
+            .expect("batch");
+        assert_eq!(
+            std::fs::metadata(&path).expect("meta").len(),
+            3 * SEAL_SPILL_RECORD_SIZE as u64
+        );
+        assert_eq!(writer.read_all(now).expect("read_all"), vec![a, b, c]);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
