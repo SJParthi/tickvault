@@ -79,7 +79,7 @@ jobs:
         run: |
           cargo +${{ env.NIGHTLY_VERSION }} careful test --workspace --no-run 2>&1 || {
             echo "build_failed=true" >> "$GITHUB_OUTPUT"
-            echo "::error::cargo-careful build failed (not a test finding). Check nightly compatibility."
+            echo "::error::cargo-careful build failed (not a test finding). Look for a compiler error (nightly compatibility) or 'No space left on device' / a linker 'Bus error' (runner disk full, see #1836)."
             exit 1
           }
 
@@ -218,15 +218,52 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               title,
-              body: `cargo-careful tests failed to **build** (not a test finding).\nThis is typically a nightly toolchain compatibility issue.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nTo fix: update \`NIGHTLY_VERSION\` in \`.github/workflows/safety.yml\`.`,
+              body: `cargo-careful tests failed to **build** (not a test finding).\nTwo known causes: a nightly toolchain incompatibility (a compiler error in the log), or runner disk exhaustion ('No space left on device', or a linker 'Bus error'; see #1836).\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nTo fix: for a compiler error, update \`NIGHTLY_VERSION\` in \`.github/workflows/safety.yml\`; for disk exhaustion, free runner space the way the sanitizer jobs do.`,
               labels: ['bug', 'safety'],
             });
 
   # ---- AddressSanitizer: Memory safety ----
+  #
+  # RUNNER DISK EXHAUSTION (2026-10-01, issue #1836). This job failed to
+  # BUILD every week from 2026-08-31 to 2026-09-28. The nightly pin was not
+  # the cause: the linker died with "signal 7 [Bus error]" inside rust-lld,
+  # which is what an mmap'd output file does when the disk fills, and the
+  # TSan runner died mid-build with its log lost. Reproduced locally on the
+  # 2026-09-30 main: the ASan `--no-run` build with full debug info filled
+  # 20.9 GB of target dir and stopped with "No space left on device" before
+  # it finished. The workspace grew past what a stock ubuntu-latest runner
+  # has free. Two mitigations, the same in the TSan job:
+  #   1. Free the ~25-30 GB of preinstalled toolchains this job never uses
+  #      (same recipe as ci.yml's Coverage & Perf job).
+  #   2. Line tables only for debug info. Sanitizer instrumentation is
+  #      unchanged and reports still symbolize to function + file:line;
+  #      only variable-level debug info (debugger use) is dropped. Set at
+  #      JOB level so the build and test steps share one artifact set.
+  # The "Report runner disk (issue 1836)" step prints df after the build either way, so
+  # a future squeeze shows up as a number instead of a linker crash.
   sanitizer-asan:
     name: "AddressSanitizer"
     runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
+      - name: Free runner disk space (see the job comment above)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "=== df -h BEFORE cleanup ==="
+          df -h /
+          sudo rm -rf /usr/share/dotnet \
+                      /usr/local/lib/android \
+                      /opt/ghc \
+                      /usr/local/share/boost \
+                      /opt/hostedtoolcache/CodeQL || true
+          if command -v docker >/dev/null 2>&1; then
+            sudo docker system prune -af >/dev/null 2>&1 || true
+          fi
+          echo "=== df -h AFTER cleanup ==="
+          df -h /
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install nightly toolchain (required by sanitizers)
@@ -251,9 +288,16 @@ jobs:
             --lib --tests \
             --no-run 2>&1 || {
             echo "build_failed=true" >> "$GITHUB_OUTPUT"
-            echo "::error::AddressSanitizer build failed (not a runtime finding). Check nightly compatibility."
+            echo "::error::AddressSanitizer build failed (not a runtime finding). Look for a compiler error (nightly compatibility) or 'No space left on device' / a linker 'Bus error' (runner disk full, see #1836)."
             exit 1
           }
+
+      - name: "Report runner disk (issue 1836)"
+        if: always()
+        shell: bash
+        run: |
+          df -h /
+          du -sh target 2>/dev/null || true
 
       - name: Auto-close ASan build-failure issue on green build
         if: steps.build.outcome == 'success'
@@ -467,15 +511,36 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               title,
-              body: `AddressSanitizer tests failed to **build** (not a runtime finding).\nThis is typically a nightly toolchain compatibility issue.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nTo fix: update \`NIGHTLY_VERSION\` in \`.github/workflows/safety.yml\`.`,
+              body: `AddressSanitizer tests failed to **build** (not a runtime finding).\nTwo known causes: a nightly toolchain incompatibility (a compiler error in the log), or runner disk exhaustion ('No space left on device', or a linker 'Bus error'; see #1836).\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nTo fix: for a compiler error, update \`NIGHTLY_VERSION\` in \`.github/workflows/safety.yml\`; for disk exhaustion, check the \"Report runner disk\" step and shrink the build or free more space.`,
               labels: ['bug', 'safety'],
             });
 
   # ---- ThreadSanitizer: Data races ----
+  # Runner disk: same two mitigations as the ASan job, for the same reason
+  # (#1836). See the comment above `sanitizer-asan`.
   sanitizer-tsan:
     name: "ThreadSanitizer"
     runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
+      - name: Free runner disk space (see the ASan job comment)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "=== df -h BEFORE cleanup ==="
+          df -h /
+          sudo rm -rf /usr/share/dotnet \
+                      /usr/local/lib/android \
+                      /opt/ghc \
+                      /usr/local/share/boost \
+                      /opt/hostedtoolcache/CodeQL || true
+          if command -v docker >/dev/null 2>&1; then
+            sudo docker system prune -af >/dev/null 2>&1 || true
+          fi
+          echo "=== df -h AFTER cleanup ==="
+          df -h /
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install nightly toolchain
@@ -500,9 +565,16 @@ jobs:
             --lib --tests \
             --no-run 2>&1 || {
             echo "build_failed=true" >> "$GITHUB_OUTPUT"
-            echo "::error::ThreadSanitizer build failed (not a runtime finding). Check nightly compatibility."
+            echo "::error::ThreadSanitizer build failed (not a runtime finding). Look for a compiler error (nightly compatibility) or 'No space left on device' / a linker 'Bus error' (runner disk full, see #1836)."
             exit 1
           }
+
+      - name: "Report runner disk (issue 1836)"
+        if: always()
+        shell: bash
+        run: |
+          df -h /
+          du -sh target 2>/dev/null || true
 
       - name: Auto-close TSan build-failure issue on green build
         if: steps.build.outcome == 'success'
@@ -717,6 +789,6 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               title,
-              body: `ThreadSanitizer tests failed to **build** (not a runtime finding).\nThis is typically a nightly toolchain compatibility issue.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nTo fix: update \`NIGHTLY_VERSION\` in \`.github/workflows/safety.yml\`.`,
+              body: `ThreadSanitizer tests failed to **build** (not a runtime finding).\nTwo known causes: a nightly toolchain incompatibility (a compiler error in the log), or runner disk exhaustion ('No space left on device', or a linker 'Bus error'; see #1836).\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nTo fix: for a compiler error, update \`NIGHTLY_VERSION\` in \`.github/workflows/safety.yml\`; for disk exhaustion, check the \"Report runner disk\" step and shrink the build or free more space.`,
               labels: ['bug', 'safety'],
             });
