@@ -219,7 +219,13 @@ resource "aws_budgets_budget" "tv_monthly" {
   #   in hard_stop_guard::effective_budget_kill_usd (UTC billing month), and a
   #   scheduled 1-Oct PR reverts this limit so the native 80%/100% notifications
   #   and the 90%/100% actions return to percentages of $150.
-  limit_amount      = "225"
+  #
+  # 2026-10-01 (audit PR30b, the scheduled revert Quote 23 named): $225 -> $150.
+  #   September is over, so the standing ceiling is back in all four lockstep
+  #   sites. The native 90% STOP_EC2_INSTANCES line is $135.00 again, BELOW the
+  #   code kill line of $150; aws-budget.md records the October projection
+  #   (~$150 pre-tax) and that an operator lever is needed to stay under it.
+  limit_amount      = "150"
   limit_unit        = "USD"
   time_unit         = "MONTHLY"
   time_period_start = "2026-05-01_00:00"
