@@ -208,6 +208,10 @@ pub mod partition_archive;
 // audit — rebuild of the table deleted in #T4 (2026-05-20) on the modern
 // ILP-over-HTTP template with event-in-key DEDUP (AUDIT-06).
 pub mod order_audit_persistence;
+// Audit PR42b (2026-10-01): disk tier for the three order-side audit writers
+// (order_audit, pnl_audit, order_leg_pnl) — a failed flush is written to
+// data/spill/audit/<table>/ and replayed by one drain task per table.
+pub mod audit_spill;
 // Full-fidelity order/position push-event capture (design 2026-07-18;
 // ORDER-EVT-01): one row per received broker push event, BOTH feeds —
 // the capture companions of the lossy 11-field BrokerOrderEvent seam.

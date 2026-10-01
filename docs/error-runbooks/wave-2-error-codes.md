@@ -419,3 +419,25 @@ monitoring — the operator inspects the `reason` + backtrace at leisure).
 **Source:** `crates/storage/src/disk_health_watcher.rs::spawn_supervised_spill_disk_health_watcher`,
 `crates/common/src/error_code.rs::DiskWatcher01Respawned`. Boot wiring:
 `crates/app/src/main.rs` (the `_disk_health_watcher_supervisor` spawn).
+
+### 2026-10-01 note — order and P&L audit rows go to disk when QuestDB is down (audit PR42b)
+
+A failed flush of `order_audit`, `pnl_audit` or `order_leg_pnl` no longer throws the rows
+away. They are written to `data/spill/audit/<table>/` and one drain task per table sends them
+to QuestDB once it answers (at once, then every 60 s). Each step logs AUDIT-06:
+
+- "written to the disk tier, not lost" — the rows are on disk and will be replayed. Nothing to do.
+- "QuestDB is not accepting the <table> spill backlog" — logged once per episode while the
+  replay keeps failing. DO: check QuestDB health (`make doctor`); the rows wait on disk.
+- "the disk tier refused the batch" — the directory reached 64 MiB or 50,000 files, or the
+  write failed. These rows ARE lost and count on `tv_order_audit_chain_lost_total` (the
+  order-audit chain-loss alarm). DO: check disk space and why the backlog is not draining.
+- "QuestDB permanently refused an audit spill file" — the file moved to `quarantine/` and its
+  rows count as lost. DO: read the file by hand; it is kept, never deleted.
+- "never finished (crash between write and rename)" — a `.tmp` file older than one hour was set
+  aside in `quarantine/`. DO: read it by hand.
+
+Counters (box only, not shipped): `tv_audit_spill_rows_total{table}`,
+`tv_audit_spill_replayed_rows_total{table}`, `tv_audit_spill_refused_rows_total{table}`,
+`tv_audit_spill_quarantined_rows_total{table}`, `tv_audit_spill_replay_failed_total{table}`.
+Honest limit: the daily reconcile counts a spilled row as appended while it is still on disk.

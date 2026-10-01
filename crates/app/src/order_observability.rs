@@ -76,6 +76,7 @@ use tickvault_common::sanitize::capture_rest_error_body;
 use tickvault_common::trading_calendar::TradingCalendar;
 use tickvault_core::notification::events::NotificationEvent;
 use tickvault_core::notification::service::NotificationService;
+use tickvault_storage::audit_spill::{AuditSpillTable, spawn_audit_spill_drain_once};
 use tickvault_storage::order_audit_persistence::{
     OrderAuditEvent, OrderAuditRow, OrderAuditWriter, ensure_order_audit_table,
 };
@@ -647,6 +648,10 @@ pub(crate) async fn run_order_side_consumer(
     // Subsystem-owned lazy ensure (idempotent; coded failure arms inside).
     ensure_order_audit_table(&wiring.questdb).await;
     ensure_pnl_audit_table(&wiring.questdb).await;
+    // Audit PR42b: the disk-tier drains start only after both tables are
+    // ensured, so a replay never auto-creates a table without its DEDUP key.
+    spawn_audit_spill_drain_once(AuditSpillTable::OrderAudit, &wiring.questdb);
+    spawn_audit_spill_drain_once(AuditSpillTable::PnlAudit, &wiring.questdb);
 
     let mut order_writer = OrderAuditWriter::new(&wiring.questdb);
     let mut pnl_writer = PnlAuditWriter::new(&wiring.questdb);
@@ -1363,10 +1368,13 @@ mod tests {
         drop(tx);
         run_order_side_consumer(rx, test_wiring(true, vec![]), Arc::clone(&stats)).await;
         assert_eq!(stats.received.load(Ordering::Relaxed), 8);
+        // Audit PR42b: with QuestDB unreachable every failed flush is written
+        // to the disk tier (data/spill/audit/, relative to the test's working
+        // directory) and replayed later, so all eight rows count as appended.
         assert_eq!(
             stats.appended.load(Ordering::Relaxed),
-            0,
-            "unreachable QuestDB — every flush fails, appended never advances"
+            8,
+            "unreachable QuestDB — every row goes to the disk tier, none is lost"
         );
         assert_eq!(stats.dropped.load(Ordering::Relaxed), 0);
     }
@@ -1474,8 +1482,8 @@ mod tests {
         assert_eq!(stats.received.load(Ordering::Relaxed), 1);
         assert_eq!(
             stats.appended.load(Ordering::Relaxed),
-            0,
-            "unreachable QuestDB — the live-mode row still fails at flush"
+            1,
+            "unreachable QuestDB — the live-mode row goes to the disk tier (audit PR42b)"
         );
     }
 

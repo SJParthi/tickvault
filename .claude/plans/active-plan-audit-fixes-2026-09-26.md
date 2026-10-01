@@ -1397,8 +1397,21 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
     error (`source = "order_push_lagged"`). The per-writer counters stay local.
     Tests: `order_side_paging_wiring_guard` (emit and seed at every source, coded lag arm, alarm
     sums m6, selector carries the name); EMF count ratchet 102 → 103.
-  - [ ] **PR42b — the rows survive.** Disk tier for `order_audit`, `pnl_audit` and
-    `order_leg_pnl` (bounded spill, replayed under their DEDUP keys).
+  - [x] **PR42b — the rows survive (2026-10-01).** New module `storage::audit_spill`. A failed
+    flush of `order_audit`, `pnl_audit` or `order_leg_pnl` writes the batch's exact ILP bytes
+    (whole rows only) to one immutable file under `data/spill/audit/<table>/` (tmp, fsync,
+    rename, fsync dir) and the flush reports `Ok`. One drain task per table, spawned after its
+    `ensure_*_table`, POSTs the files to `/write` at once and every 60 s: a 2xx deletes the
+    file, a permanent 4xx moves it to `quarantine/` (kept) and counts its rows on
+    `tv_order_audit_chain_lost_total{source="<table>_spill_lost"}`, anything else stops the
+    round and keeps the file. No session-window filter (unlike the tick drain). Bounded at
+    64 MiB and 50,000 files per table; past that the batch is discarded and counted as before.
+    Replay is safe to repeat: each row keeps its own `ts`, the first column of every DEDUP key.
+    Tests: 15 in `audit_spill`, 3 or 4 per writer (spill, half-appended row left out, refused
+    spill still discards, production dir), two consumer tests updated (spilled rows count as
+    appended). Honest limits: the daily reconcile counts a spilled row as appended while it is
+    still on disk; if QuestDB was unreachable when a table was ensured, the replay (like the
+    live writer) can auto-create it without its DEDUP key.
   - [ ] **PR42c — reconcile on lag. Needs an owner decision.** The order-push consumer holds no
     copy of the paper OMS order map, and fetching the broker order book is REST outside the
     allowed classes (`no-rest-except-live-feed-2026-06-27.md`). Options: share a read handle on

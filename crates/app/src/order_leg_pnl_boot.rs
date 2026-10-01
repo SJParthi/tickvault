@@ -24,6 +24,7 @@ use metrics::counter;
 use tickvault_common::broker_order_events::next_event_seq;
 use tickvault_common::config::{OrderLegPnlConfig, QuestDbConfig};
 use tickvault_common::error_code::ErrorCode;
+use tickvault_storage::audit_spill::{AuditSpillTable, spawn_audit_spill_drain_once};
 use tickvault_storage::order_leg_pnl_persistence::{
     OrderLegPnlRecord, OrderLegPnlWriter, ensure_order_leg_pnl_table,
 };
@@ -179,6 +180,8 @@ async fn run_order_leg_pnl_consumer(
     identity_index: SharedLegIdentityIndex,
 ) {
     ensure_order_leg_pnl_table(&questdb).await;
+    // Audit PR42b: the disk-tier drain starts only after the table is ensured.
+    spawn_audit_spill_drain_once(AuditSpillTable::OrderLegPnl, &questdb);
     let Some(mut guard) = ReceiverGuard::take(&rx_slot) else {
         error!(
             code = ErrorCode::OrderPnl01PersistFailed.code_str(),
