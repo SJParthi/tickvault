@@ -144,6 +144,10 @@
 //! that is the one gap the rollout leaves, and it closes when the last v4 file
 //! is archived. A rollback to a v4 build refuses v5 records, counts them and
 //! keeps their bytes in `archive/`, the same as any other unknown version.
+//! Nothing re-reads `archive/`, so a candle spilled as v5 and drained by a
+//! rolled-back build is not written by that build or by a later one; its bytes
+//! stay on disk for a manual re-ingest. That is the price of writing the
+//! checksum from this release rather than a release later.
 //!
 //! A record whose checksum does not hold is refused and counted as
 //! undecodable, and the reader moves on to the next record: the record
@@ -1067,15 +1071,36 @@ impl SealSpillWriter {
                 ),
                 Err(err) => {
                     drop(file);
-                    let aside = set_aside_torn_file(&path);
-                    warn!(
-                        ?path,
-                        ?err,
-                        ?aside,
-                        "seal spill: the day file ends mid-record and cannot be cut back; set \
-                         aside, appending to a fresh file"
-                    );
-                    file = self.open_append_handle(&path)?;
+                    match set_aside_torn_file(&path) {
+                        Ok(aside) => {
+                            warn!(
+                                ?path,
+                                ?err,
+                                ?aside,
+                                "seal spill: the day file ends mid-record and cannot be cut \
+                                 back; set aside, appending to a fresh file"
+                            );
+                            file = self.open_append_handle(&path)?;
+                        }
+                        Err(aside_err) => {
+                            // Appending to this file would put every record
+                            // off its boundary and report it written. Refuse,
+                            // so each seal escalates to the dead-letter tier.
+                            self.err_write.increment(1);
+                            error!(
+                                code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                                ?path,
+                                ?err,
+                                ?aside_err,
+                                "seal spill: the day file ends mid-record, cannot be cut back \
+                                 and cannot be set aside; refusing to append to it"
+                            );
+                            anyhow::bail!(
+                                "seal spill file {path:?} ends mid-record and can be neither cut \
+                                 back ({err}) nor set aside ({aside_err})"
+                            );
+                        }
+                    }
                 }
             }
             *open = Some(OpenSpillFile { ist_day: day, file });

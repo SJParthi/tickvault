@@ -1393,7 +1393,10 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
     checksum.
   - Honest limits: a v4 record still on disk during the rollout has only the id cross-check, not a
     checksum. A record refused for its checksum is one candle not replayed; its bytes stay in the
-    archived file.
+    archived file. A rollback to the v4 build refuses and archives every v5 record it drains, and
+    nothing re-reads `archive/`, so those candles need a manual re-ingest. If a day file ends
+    mid-record and can be neither cut back nor set aside, appends to it are refused and each seal
+    goes to the dead-letter tier.
   - Tests: `to_bytes_writes_a_checksum_of_bytes_4_to_128_at_bytes_0_to_4`,
     `decode_spill_record_refuses_a_flipped_bit_anywhere_in_the_record` (every bit of the record),
     `a_v4_record_written_by_the_previous_build_still_decodes`,
