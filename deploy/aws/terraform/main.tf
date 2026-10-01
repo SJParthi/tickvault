@@ -697,8 +697,29 @@ resource "aws_s3_bucket" "tv_cold" {
   bucket = "tv-${var.environment}-cold"
 }
 
+# Versioning ON (operator Quotes 27 + 28, 2026-09-29, ITEM 45f): an overwrite
+# or a delete leaves the prior version in place. Suspending it is a REJECT in
+# docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md.
+resource "aws_s3_bucket_versioning" "tv_cold" {
+  bucket = aws_s3_bucket.tv_cold.id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+# Objects move to cheaper tiers and are NEVER expired (Quotes 27 + 28,
+# 2026-09-29, ITEM 45f). The 5-year expiry this block used to carry was
+# removed: SEBI's five years is a floor, not a ceiling, and the operator
+# ordered that nothing captured is ever deleted. No rule here may expire a
+# current or a noncurrent version; crates/common/tests/aws_infra_wiring.rs
+# fails the build if one is added.
 resource "aws_s3_bucket_lifecycle_configuration" "tv_cold" {
   bucket = aws_s3_bucket.tv_cold.id
+
+  # A lifecycle configuration on a versioned bucket must be applied after
+  # versioning is enabled.
+  depends_on = [aws_s3_bucket_versioning.tv_cold]
 
   rule {
     id     = "tick-cold-tiering"
@@ -716,8 +737,35 @@ resource "aws_s3_bucket_lifecycle_configuration" "tv_cold" {
       storage_class = "GLACIER_IR"
     }
 
-    expiration {
-      days = 1825 # 5 years per SEBI retention
+    # A version replaced or deleted is kept, on a cheaper tier.
+    noncurrent_version_transition {
+      noncurrent_days = 30
+      storage_class   = "GLACIER_IR"
+    }
+  }
+
+  # Raw capture-at-receipt WAL segments (ITEM 45e uploads them here). They are
+  # read back only to rebuild a day, so they go straight to Deep Archive after
+  # 30 days. This rule overlaps the one above on the same day; when two
+  # transitions to different classes fall due together, S3 takes the one with
+  # the lower storage cost, i.e. Deep Archive (Assumed from the AWS lifecycle
+  # documentation; not observed on this bucket yet).
+  rule {
+    id     = "raw-frames-deep-archive"
+    status = "Enabled"
+
+    filter {
+      prefix = "raw-frames/"
+    }
+
+    transition {
+      days          = 30
+      storage_class = "DEEP_ARCHIVE"
+    }
+
+    noncurrent_version_transition {
+      noncurrent_days = 30
+      storage_class   = "DEEP_ARCHIVE"
     }
   }
 }
