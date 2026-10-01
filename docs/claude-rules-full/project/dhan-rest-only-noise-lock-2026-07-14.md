@@ -4050,6 +4050,7 @@ spot-1m and option-chain pulls will stop until this is fixed", which is now
 wrong in the reassuring direction — **that wording is a follow-up, not fixed
 here**, and it is recorded rather than quietly left: the consequence to state is
 that the sixteen live sockets stop, which is larger than what the sentence says.
+*(Fixed 2026-10-01, reality-check item R3: both family-(3) bodies now say the Dhan live feed sockets cannot reconnect. The same change adds a family-(3) `AuthenticationFailed` page when a renewal after an 807 fails, once per token generation; no new family.)*
 
 ### ⚠ NOT claimed
 

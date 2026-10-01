@@ -120,6 +120,33 @@ pub(crate) fn mint_cooldown_allows(elapsed_since_last_attempt_secs: Option<u64>)
     elapsed_since_last_attempt_secs.is_none_or(|s| s >= DHAN_TOKEN_GENERATION_COOLDOWN_SECS)
 }
 
+/// R3 (2026-10-01). Pure. A failed post-807 renewal pages iff the dialled
+/// token is still the current one (no fresh token landed meanwhile) and the
+/// failure is terminal: not the mint-cooldown skip, and not the RESILIENCE-03
+/// refusal, which `acquire_token` already paged. Prefix-anchored on our own
+/// literals, never a scan of a server body (SEC-R2-2).
+#[must_use]
+fn stale_credential_failure_pages(err: &ApplicationError, dialled: u64, current: u64) -> bool {
+    if current != dialled {
+        return false;
+    }
+    match err {
+        ApplicationError::AuthenticationFailed { reason } => {
+            !reason.starts_with(MINT_COOLDOWN_REFUSAL_REASON_PREFIX)
+                && !reason.starts_with(RESILIENCE03_MINT_REFUSAL_REASON_PREFIX)
+        }
+        _ => true,
+    }
+}
+
+/// R3 (2026-10-01). True exactly once per token `generation`. O(1),
+/// lock-free, allocation-free: one atomic swap.
+#[must_use]
+fn take_stale_credential_page(latch: &std::sync::atomic::AtomicU64, generation: u64) -> bool {
+    let mark = generation.wrapping_add(1);
+    latch.swap(mark, std::sync::atomic::Ordering::AcqRel) != mark
+}
+
 /// Wave 2 Item 5.4 (AUTH-GAP-03) — global TokenManager handle so the
 /// WebSocket sleep-wake path can call `force_renewal_if_stale()`
 /// without the connection holding a back-reference. Set once at boot
@@ -236,6 +263,10 @@ pub struct TokenManager {
     /// and this caller returns success WITHOUT issuing its own request. That
     /// is what turns sixteen renewals into one.
     renew_generation: std::sync::atomic::AtomicU64,
+    /// `generation + 1` of the last token generation whose post-807 renewal
+    /// failure paged (0 = never). One page per dead token, not one per socket:
+    /// sixteen sockets told 807 on the same token share one generation.
+    stale_credential_paged_generation: std::sync::atomic::AtomicU64,
 }
 
 impl TokenManager {
@@ -338,6 +369,7 @@ impl TokenManager {
             last_mint_attempt: std::sync::Mutex::new(None),
             renew_gate: tokio::sync::Mutex::new(()),
             renew_generation: std::sync::atomic::AtomicU64::new(0),
+            stale_credential_paged_generation: std::sync::atomic::AtomicU64::new(0),
         });
 
         // Set when SSM held a well-formed, unexpired token that Dhan REJECTED.
@@ -1763,7 +1795,36 @@ impl TokenManager {
             "trigger" => "stale_credential"
         )
         .increment(1);
-        self.renew_with_fallback_since(dialled_generation).await
+        let result = self.renew_with_fallback_since(dialled_generation).await;
+        // 2026-10-01 (reality check, R3): a failure here used to page nothing.
+        // The only page was the profile watchdog's, ~30 minutes later and only
+        // in market hours, while the live feed could not reconnect at all.
+        if let Err(err) = &result
+            && stale_credential_failure_pages(err, dialled_generation, self.renew_generation())
+            && take_stale_credential_page(
+                &self.stale_credential_paged_generation,
+                dialled_generation,
+            )
+        {
+            let rendered = err.to_string();
+            error!(
+                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                source = "stale_credential_token_unobtainable",
+                dialled_generation,
+                error = %rendered,
+                "Dhan live feed got 807 and the token could not be obtained: renewal and the \
+                 fallback login both failed; paging once for this token generation"
+            );
+            self.notifier.notify(NotificationEvent::AuthenticationFailed {
+                reason: format!(
+                    "a Dhan live-feed connection was told its login expired (code 807) and both \
+                     the renewal and a fresh login failed ({}). The Dhan live feed cannot \
+                     reconnect until a login is obtained; it keeps retrying on its own",
+                    capture_rest_error_body(&rendered)
+                ),
+            });
+        }
+        result
     }
 
     /// Wave 2 Item 5.4 (G1) — current token expiry timestamp.
@@ -1845,6 +1906,7 @@ impl TokenManager {
             last_mint_attempt: std::sync::Mutex::new(None),
             renew_gate: tokio::sync::Mutex::new(()),
             renew_generation: std::sync::atomic::AtomicU64::new(0),
+            stale_credential_paged_generation: std::sync::atomic::AtomicU64::new(0),
         })
     }
 }
@@ -1995,6 +2057,81 @@ mod tests {
     /// test-only construction lives in one place.
     fn make_test_manager(initial_token: Option<TokenState>) -> Arc<TokenManager> {
         TokenManager::new_for_test(initial_token)
+    }
+
+    // R3 (2026-10-01, reality check): a failed renewal after an 807 pages
+    // once per dead token, and never for a non-terminal skip.
+    #[test]
+    fn test_stale_credential_failure_pages_only_on_terminal_failure_of_the_current_token() {
+        let auth = |r: String| ApplicationError::AuthenticationFailed { reason: r };
+        let terminal = auth("generateAccessToken HTTP 500 url=x body=y".to_string());
+        assert!(stale_credential_failure_pages(&terminal, 7, 7));
+        assert!(
+            !stale_credential_failure_pages(&terminal, 7, 8),
+            "a fresh token landed meanwhile: no page"
+        );
+        let totp = ApplicationError::TotpGenerationFailed {
+            reason: "bad".to_string(),
+        };
+        assert!(stale_credential_failure_pages(&totp, 0, 0));
+        let renew = ApplicationError::TokenRenewalFailed {
+            attempts: 0,
+            reason: "x".to_string(),
+        };
+        assert!(stale_credential_failure_pages(&renew, 0, 0));
+        let skip = auth(format!("{MINT_COOLDOWN_REFUSAL_REASON_PREFIX} — 3s ago"));
+        assert!(
+            !stale_credential_failure_pages(&skip, 0, 0),
+            "the cooldown skip is not terminal"
+        );
+        let lock = auth(format!(
+            "{RESILIENCE03_MINT_REFUSAL_REASON_PREFIX} — refused"
+        ));
+        assert!(
+            !stale_credential_failure_pages(&lock, 0, 0),
+            "acquire_token already paged the lock refusal"
+        );
+        let forged = auth(format!(
+            "generateAccessToken HTTP 401 body={MINT_COOLDOWN_REFUSAL_REASON_PREFIX}"
+        ));
+        assert!(
+            stale_credential_failure_pages(&forged, 0, 0),
+            "a server body cannot forge a skip"
+        );
+    }
+
+    #[test]
+    fn test_stale_credential_page_latch_fires_once_per_token_generation() {
+        let latch = std::sync::atomic::AtomicU64::new(0);
+        let pages = (0..16)
+            .filter(|_| take_stale_credential_page(&latch, 0))
+            .count();
+        assert_eq!(pages, 1, "sixteen sockets on one dead token page once");
+        assert!(
+            take_stale_credential_page(&latch, 1),
+            "a later dead token is a new episode"
+        );
+        assert!(!take_stale_credential_page(&latch, 1));
+        assert!(
+            take_stale_credential_page(&latch, u64::MAX),
+            "the wrapping mark still distinguishes the last generation"
+        );
+    }
+
+    /// Source pin: the page cannot be deleted while the pure tests stay green.
+    #[test]
+    fn test_force_renewal_unless_replaced_pages_family_3_once_per_token() {
+        let src = include_str!("token_manager.rs");
+        let start = src
+            .find("pub async fn force_renewal_unless_replaced")
+            .expect("fn exists");
+        let len = src[start..]
+            .find("pub fn next_renewal_at")
+            .expect("the next fn follows");
+        let body = &src[start..start + len];
+        assert!(body.contains("stale_credential_failure_pages("));
+        assert!(body.contains("take_stale_credential_page("));
+        assert!(body.contains("NotificationEvent::AuthenticationFailed"));
     }
 
     /// Single-flight proof (2026-08-14): a caller that queues on the renewal
@@ -2769,6 +2906,7 @@ mod tests {
             last_mint_attempt: std::sync::Mutex::new(None),
             renew_gate: tokio::sync::Mutex::new(()),
             renew_generation: std::sync::atomic::AtomicU64::new(0),
+            stale_credential_paged_generation: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -3165,6 +3303,7 @@ mod tests {
             last_mint_attempt: std::sync::Mutex::new(None),
             renew_gate: tokio::sync::Mutex::new(()),
             renew_generation: std::sync::atomic::AtomicU64::new(0),
+            stale_credential_paged_generation: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -3591,6 +3730,7 @@ mod tests {
             last_mint_attempt: std::sync::Mutex::new(None),
             renew_gate: tokio::sync::Mutex::new(()),
             renew_generation: std::sync::atomic::AtomicU64::new(0),
+            stale_credential_paged_generation: std::sync::atomic::AtomicU64::new(0),
         });
 
         let handle = manager.spawn_renewal_task();
@@ -3769,6 +3909,7 @@ mod tests {
             last_mint_attempt: std::sync::Mutex::new(None),
             renew_gate: tokio::sync::Mutex::new(()),
             renew_generation: std::sync::atomic::AtomicU64::new(0),
+            stale_credential_paged_generation: std::sync::atomic::AtomicU64::new(0),
         });
 
         let handle = tokio::spawn(Arc::clone(&manager).renewal_loop());
@@ -3836,6 +3977,7 @@ mod tests {
             last_mint_attempt: std::sync::Mutex::new(None),
             renew_gate: tokio::sync::Mutex::new(()),
             renew_generation: std::sync::atomic::AtomicU64::new(0),
+            stale_credential_paged_generation: std::sync::atomic::AtomicU64::new(0),
         });
 
         let handle = tokio::spawn(Arc::clone(&manager).renewal_loop());

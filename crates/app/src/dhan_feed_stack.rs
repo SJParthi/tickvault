@@ -13772,11 +13772,24 @@ fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize 
                     if let Some(manager) = global_token_manager()
                         && let Err(err) = manager.force_renewal_unless_replaced(dialled).await
                     {
-                        warn!(
-                            code = ErrorCode::WsGapConnectionState.code_str(),
-                            %err,
-                            "Dhan live feed could not refresh its token before re-dialing"
-                        );
+                        // R3 (2026-10-01): an error, not a warning; the token
+                        // manager pages once per dead token. Every socket
+                        // repeats this on each ladder step while the token
+                        // stays dead, so the line is throttled to powers of two.
+                        static RENEW_FAILURES: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        let seen = RENEW_FAILURES
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            .saturating_add(1);
+                        if seen.is_power_of_two() {
+                            error!(
+                                code = ErrorCode::WsGapConnectionState.code_str(),
+                                source = "stale_credential_renew_failed",
+                                seen,
+                                %err,
+                                "Dhan live feed could not refresh its token before re-dialing"
+                            );
+                        }
                     }
                 },
                 topup_rx,

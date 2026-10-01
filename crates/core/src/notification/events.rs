@@ -1679,7 +1679,7 @@ impl NotificationEvent {
                 // token condition that still pages).
                 format!(
                     "🆘 <b>Dhan login could not be obtained</b>\n\
-                     The Dhan spot-1m and option-chain pulls will stop until this is fixed.\n\
+                     The Dhan live feed sockets cannot reconnect until this is fixed.\n\
                      {}",
                     html_escape(&redact_url_params(reason))
                 )
@@ -1704,10 +1704,12 @@ impl NotificationEvent {
             }
             Self::TokenRenewed => "<b>Token renewed</b>".to_string(),
             Self::TokenRenewalFailed { attempts, reason } => {
-                // 2026-07-14 Dhan noise lock reword: broker + consequence.
+                // 2026-07-14 Dhan noise lock reword: broker + consequence. The
+                // consequence was reworded 2026-10-01: the per-minute pulls it named
+                // were removed 2026-09-16; a dead token now stops the live sockets.
                 format!(
                     "🆘 <b>Dhan login renewal FAILED</b> (attempt {attempts})\n\
-                     If this keeps failing the Dhan spot-1m and option-chain pulls will stop.\n\
+                     If this keeps failing the Dhan live feed sockets cannot reconnect.\n\
                      {}",
                     html_escape(&redact_url_params(reason))
                 )
@@ -3867,7 +3869,7 @@ mod tests {
             "got: {msg}"
         );
         assert!(
-            msg.contains("spot-1m and option-chain pulls will stop"),
+            msg.contains("Dhan live feed sockets cannot reconnect"),
             "consequence line missing: {msg}"
         );
     }
