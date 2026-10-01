@@ -261,6 +261,42 @@ struct InstrumentSlot {
     /// ceiling, and it lives on the slot that already exists per instrument
     /// for the same reason `last_ltp` does.
     last_trade_ts: u32,
+    /// IST epoch second at which this key last sent a packet proving it had
+    /// NOT traded yet that day, `0` for none (audit PR58, 2026-09-28): a
+    /// last-trade time from an earlier day refused by the RECEIPT-day gate, a
+    /// zero price beside an earlier-day last-trade time (`untraded_sentinel`),
+    /// or a zero last-trade time with a zero price (`untraded_timestamp`),
+    /// received live (a frame with a receipt time) before the slot was
+    /// seeded. A zero field beside a live one contradicts itself and is no
+    /// proof. Every such packet refreshes it (only
+    /// ever forward in time); Dhan re-sends one on each book or open-interest
+    /// change. The watermark-day gate records NO proof: it fires on replayed
+    /// or out-of-order frames, whose receipt time says nothing about now.
+    ///
+    /// When the first accepted trade passes [`untraded_proof_holds`] (same
+    /// day, within [`UNTRADED_PROOF_MAX_AGE_SECS`] of the proof, counted from
+    /// the 09:15 open only where nothing can trade before it), that trade's day
+    /// cumulative is today's whole volume, so the baseline is a true `0` and
+    /// the first bar gets the trade. Otherwise the first tick seeds the
+    /// baseline as before: a slot that joined after trading began, or came
+    /// back from an outage, cannot tell earlier volume from this bar's, and
+    /// under-reporting one bar is less wrong than putting a morning in it.
+    ///
+    /// Honest limit: the proof says "no trade as of the proof", not "no trade
+    /// was missed after it". If the packet carrying the day's first trade is
+    /// lost and the next accepted trade arrives inside the 60 s window, that
+    /// trade's bar carries both, so a 1 s / 3 s / 5 s bar can hold up to 60 s
+    /// of volume after such a gap. The same holds for our own read lag: the
+    /// proof is the time WE read the packet, so a reader that stalled for a
+    /// minute stretches the window by that minute (the 5 s skew limit does not
+    /// catch it, since the stalled packet looks newer, not older). The minute
+    /// bars and the day total are right
+    /// either way; before this change both trades' volume went missing instead.
+    ///
+    /// Until 2026-09-28 the seed ran on every slot, so the day's first trade
+    /// of every contract was missing from its first bar. Cleared with the
+    /// seed at the day reset.
+    untraded_proof_ist_secs: u32,
     /// Replay-gap bookkeeping (plan ITEM 47, 2026-09-29). Bit
     /// `tf.as_ordinal()` set = the OPEN bucket of that timeframe may be
     /// missing ticks that a gapped WAL replay skipped, so it is PARTIAL.
@@ -1219,6 +1255,7 @@ impl MultiTfAggregator {
             // Deliberately NOT a baseline — see the field doc. The first tick
             // this slot folds replaces it with a real observation.
             volume_baseline_seeded: false,
+            untraded_proof_ist_secs: 0,
             // A new slot's first buckets are partial in every mode: the tick
             // that opens them seeds the baseline and adds none of its own
             // volume, and during a replay the frames before it may have been
@@ -2669,6 +2706,7 @@ impl MultiTfAggregator {
             // UNSEEDED, not to a fabricated `0` baseline.
             slot.last_cumulative = 0;
             slot.volume_baseline_seeded = false;
+            slot.untraded_proof_ist_secs = 0;
             // Nothing carries across the day boundary, so neither does a
             // late tick's mark on the next bucket (review round 7), nor a
             // hand-over still waiting for this instrument's first live trade:
