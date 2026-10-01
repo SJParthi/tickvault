@@ -2023,7 +2023,7 @@ independent live-path fixes).
     never for the mint-cooldown skip or the RESILIENCE-03 refusal, which already page. The
     app-side `warn!` is a coded `error!` throttled to powers of two. Both family (3) bodies now
     name the Dhan live feed sockets. No new Telegram family.
-  - Tests: `stale_credential_failure_pages_*` (3) and the source pin in `token_manager.rs`.
+  - Tests: `test_stale_credential_failure_pages_only_on_terminal_failure_of_the_current_token`, `test_stale_credential_page_latch_fires_once_per_token_generation`, `test_force_renewal_unless_replaced_pages_family_3_once_per_token` (all in `token_manager.rs`).
 - [x] **R4 — an order update the parser cannot read is flagged, not hidden.** (`core`)
   - Verified: a frame that fails to deserialise is counted as a non-order message at `debug!`
     (order_update_connection.rs:961-987), so a vendor format change would drop every order
@@ -2046,8 +2046,20 @@ independent live-path fixes).
   - Tests: `roll_trading_day_reseeds_the_fold_so_the_next_day_counts_volume` (control without
     the roll reads 0, with it 300); the wiring guard
     `the_ranking_daily_reset_fires_only_on_a_real_midnight_crossing` now pins the roll call.
-- [ ] **R6 — a bar opens at its earliest trade, not its first arrival.** (`trading`) Verified
+- [x] **R6 — a bar opens at its earliest trade, not its first arrival.** (`trading`) Verified
   first against the restart differential; ships only if the oracle and the replay rules agree.
+  - Fix: `LiveCandleState::open_ts_ist_secs` (0 = pinned). The official day open and the
+    repeat-quote day-open stamp pin the open; a trade open records its own second.
+    `fold_in_bucket` and `fold_late_hlc` replace the open only with a strictly earlier trade,
+    so the first arrival keeps it within one second. State 152 -> 160 B, `BufferedSeal`
+    168 -> 176 B (now exactly at its assert), about +6 MB at the ceiling (`aws-budget.md`).
+  - Tests: `open_is_the_earliest_trade_not_the_first_arrival`,
+    `within_one_second_the_first_arrival_keeps_the_open`,
+    `the_official_day_open_is_never_superseded`,
+    `a_late_earlier_trade_amends_the_sealed_bars_open`, two proptests in `fold_properties.rs`;
+    each fails with the guard removed. `restart_differential` and
+    `first_trade_restart_differential` at 20,000 cases in release: 0 failures.
+    `dhat_multi_tf_fold` passes. Bench gate not run locally.
 - [x] **R7 — the instance lock re-reads after renewal and a machine that lost it stops
   dialling.** (`core`, `app`) SSM has no compare-and-set, so this narrows the window and makes
   the loss loud; it cannot close the race.

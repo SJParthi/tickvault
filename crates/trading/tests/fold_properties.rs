@@ -323,3 +323,138 @@ proptest! {
         let _ = fold_all(&ts);
     }
 }
+
+// ---------------------------------------------------------------------------
+// R6 (2026-10-01): the OPEN is ordered by trade time, the mirror of the close.
+// ---------------------------------------------------------------------------
+
+/// 10:00:00 IST of the same day as [`BUCKET_BASE`]. NOT the day's first
+/// session bucket, so the official-open arm can never reach it.
+///
+/// Needed because at [`BUCKET_BASE`] (09:15) every scenario with a usable
+/// shared `day_open` opens PINNED at that official open, and the trade-ordered
+/// arm the open properties are about would run only in the `day_open = 0`
+/// quarter of cases. Half the cases here run at 10:00, where it always runs.
+const TEN_AM_BASE: u32 = BUCKET_BASE + 2_700;
+
+fn tick_based(
+    base: u32,
+    price: f32,
+    ts_offset: u32,
+    volume: u32,
+    oi: u32,
+    day_open: f32,
+) -> ParsedTick {
+    let mut t = tick(price, ts_offset, volume, oi, day_open);
+    t.exchange_timestamp = base + ts_offset;
+    t
+}
+
+/// A shared `day_open` that is the absent sentinel half the time.
+fn shared_day_open() -> impl Strategy<Value = f32> {
+    prop_oneof![1 => 0.05f32..90_000.0, 1 => Just(0.0f32)]
+}
+
+/// One bucket's ticks at 09:15 or 10:00 (even odds), offsets free to repeat,
+/// so the same-second tie rule is exercised too.
+fn open_ticks() -> impl Strategy<Value = Vec<ParsedTick>> {
+    (
+        prop_oneof![Just(BUCKET_BASE), Just(TEN_AM_BASE)],
+        shared_day_open(),
+        prop::collection::vec((price(), 0u32..59, 0u32..100_000, open_interest()), 1..24),
+    )
+        .prop_map(|(base, day_open, raw)| {
+            raw.into_iter()
+                .map(|(p, off, v, oi)| tick_based(base, p, off, v, oi, day_open))
+                .collect()
+        })
+}
+
+/// As [`open_ticks`], but every tick carries a DISTINCT exchange second, so
+/// the earliest trade is unique and the open cannot depend on arrival order.
+fn open_ticks_distinct_seconds() -> impl Strategy<Value = Vec<ParsedTick>> {
+    (1usize..24)
+        .prop_flat_map(|n| {
+            (
+                prop_oneof![Just(BUCKET_BASE), Just(TEN_AM_BASE)],
+                shared_day_open(),
+                prop::collection::vec((price(), 0u32..100_000, open_interest()), n),
+                prop::sample::subsequence((0u32..59).collect::<Vec<u32>>(), n).prop_shuffle(),
+            )
+        })
+        .prop_map(|(base, day_open, raw, offsets)| {
+            raw.into_iter()
+                .zip(offsets)
+                .map(|((p, v, oi), off)| tick_based(base, p, off, v, oi, day_open))
+                .collect()
+        })
+}
+
+/// `Some(official open)` when the bar must open pinned at the exchange's day
+/// open: the 09:15 bucket, with the shared `day_open` usable.
+fn pinned_open(ts: &[ParsedTick]) -> Option<f64> {
+    let first = ts.iter().find(|t| tick_price_is_sane(t))?;
+    if first.exchange_timestamp - (first.exchange_timestamp % 60) != BUCKET_BASE {
+        return None;
+    }
+    let day_open = f32_to_f64_clean(first.day_open);
+    (day_open > 0.0).then_some(day_open)
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(400))]
+
+    /// The open belongs to the EARLIEST trade, exactly as the close belongs
+    /// to the latest — unless it is the official day open, which is pinned.
+    ///
+    /// Within one second the FIRST arrival keeps the open (the guard is
+    /// strictly earlier), the mirror of the close's last-write-wins.
+    #[test]
+    fn the_open_belongs_to_the_earliest_timestamp(ts in open_ticks()) {
+        let Some(got) = fold_all(&ts) else { return Ok(()); };
+        if let Some(official) = pinned_open(&ts) {
+            prop_assert_eq!(got.open, official, "the official open is pinned");
+            prop_assert_eq!(got.open_ts_ist_secs, 0);
+            return Ok(());
+        }
+        let sane: Vec<&ParsedTick> = ts.iter().filter(|t| tick_price_is_sane(t)).collect();
+        let Some(earliest) = sane.iter().map(|t| t.exchange_timestamp).min() else {
+            prop_assert!(false, "a bucket opened with no sane price");
+            return Ok(());
+        };
+        prop_assert_eq!(got.open_ts_ist_secs, earliest);
+        // The FIRST sane arrival carrying that second.
+        let want = sane
+            .iter()
+            .find(|t| t.exchange_timestamp == earliest)
+            .map(|t| f32_to_f64_clean(t.last_traded_price));
+        prop_assert_eq!(Some(got.open), want, "open is not the first arrival at the earliest second");
+    }
+
+    /// With distinct exchange seconds, the open does not depend on arrival
+    /// order at all — the same rotate-plus-reverse permutation as the
+    /// high/low claim above.
+    #[test]
+    fn the_open_does_not_depend_on_arrival_order_when_timestamps_are_distinct(
+        ts in open_ticks_distinct_seconds(),
+        seed in 0usize..1000,
+    ) {
+        let forward = fold_all(&ts);
+        let mut shuffled = ts.clone();
+        let n = shuffled.len();
+        shuffled.rotate_left(seed % n.max(1));
+        if seed % 2 == 0 {
+            shuffled.reverse();
+        }
+        let other = fold_all(&shuffled);
+        let (Some(forward), Some(other)) = (forward, other) else {
+            prop_assert!(forward.is_none() && other.is_none(), "one order opened a bucket and the other did not");
+            return Ok(());
+        };
+        prop_assert_eq!(
+            forward.open.to_bits(), other.open.to_bits(),
+            "open moved with arrival order: {} vs {}", forward.open, other.open
+        );
+        prop_assert_eq!(forward.open_ts_ist_secs, other.open_ts_ist_secs);
+    }
+}
