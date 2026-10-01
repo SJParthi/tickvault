@@ -191,6 +191,10 @@ pub mod volume_semantics_probe;
 /// losing ticks under load. This reads what the kernel actually gave us and says
 /// so. Reports, never halts: the runtime is useful without tuned buffers.
 pub mod host_limits;
+/// `tickvault host-tuning <bbr|verify|apply>`: the per-boot kernel and host tuning
+/// the host-tuning systemd unit runs as root before the app (audit D6b; replaced
+/// two shell scripts and an inline `/bin/sh -c`).
+pub mod host_tuning;
 pub mod infra;
 pub mod leg_identity;
 pub mod log_coalescer;

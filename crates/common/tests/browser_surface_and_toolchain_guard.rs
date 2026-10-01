@@ -443,6 +443,19 @@ const SPAWN_ALLOWLIST: &[(&str, &str)] = &[
         "clock-discipline verification for the latency claim",
     ),
     (
+        "systemctl",
+        "host tuning (`tickvault host-tuning`, audit D6b 2026-10-01): enable \
+         chronyd, stop irqbalance, daemon-reload after a drop-in change. A \
+         system service manager, not a language runtime; the shell script it \
+         replaced ran the same calls.",
+    ),
+    (
+        "modprobe",
+        "host tuning (`tickvault host-tuning bbr`, audit D6b 2026-10-01): load \
+         tcp_bbr before writing the sysctl that needs it. A kernel module \
+         loader, not a language runtime; the unit's former `/bin/sh -c` ran it.",
+    ),
+    (
         "/usr/bin/true",
         "coreutils no-op, NOT a language runtime. It is what \
          `infra.rs::spawn_program` substitutes in cfg(test) builds so that \
@@ -557,6 +570,11 @@ fn spawn_allowlist_is_documented_and_has_no_language_runtime() {
     // manager -- and it is here because `infra.rs::spawn_program` substitutes it
     // in cfg(test) builds so `cargo test` can no longer run `docker compose up
     // --force-recreate` or `xdg-open` against the machine running the tests.
+    //
+    // `systemctl` and `modprobe` joined 2026-10-01 (audit D6b), turned by hand:
+    // the per-boot host tuning moved from shell into `tickvault host-tuning`,
+    // and those are the system tools the scripts already called. Moving the
+    // calls into Rust put them in front of this scan for the first time.
     const FROZEN: &[&str] = &[
         "git",
         "bash",
@@ -565,6 +583,8 @@ fn spawn_allowlist_is_documented_and_has_no_language_runtime() {
         "df",
         "open",
         "chronyc",
+        "systemctl",
+        "modprobe",
         "/usr/bin/true",
     ];
 
