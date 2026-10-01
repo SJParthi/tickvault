@@ -2014,18 +2014,25 @@ independent live-path fixes).
   - Tests: `a_trade_stamped_hours_ahead_of_its_receipt_cannot_freeze_the_price`,
     `a_trade_inside_the_skew_or_with_no_receipt_is_not_capped`,
     `trade_time_ceiling_is_the_receipt_in_ist_seconds_plus_the_skew`.
-- [ ] **R3 — a failed token renewal after an 807 pages at once.** (`app`, maybe `core`)
+- [x] **R3 — a failed token renewal after an 807 pages at once.** (`app`, `core`)
   - Verified: on renewal failure the 807 path only `warn!`s (dhan_feed_stack.rs:13719-13727);
     the Critical page waits for the profile watchdog (~30 min).
-  - Fix: route the failure to the existing allowed family (3) page (`TokenRenewalFailed`),
-    coalesced so 16 sockets failing together send one page; `warn!` becomes a coded `error!`.
-    No new Telegram family (noise lock §2 family 3 already covers it).
-- [ ] **R4 — an order update the parser cannot read is flagged, not hidden.** (`core`)
+  - Fix: `TokenManager::force_renewal_unless_replaced` sends the existing family (3)
+    `AuthenticationFailed` page once per token generation (one atomic swap on
+    `stale_credential_paged_generation`, so 16 sockets failing together send one page), and
+    never for the mint-cooldown skip or the RESILIENCE-03 refusal, which already page. The
+    app-side `warn!` is a coded `error!` throttled to powers of two. Both family (3) bodies now
+    name the Dhan live feed sockets. No new Telegram family.
+  - Tests: `stale_credential_failure_pages_*` (3) and the source pin in `token_manager.rs`.
+- [x] **R4 — an order update the parser cannot read is flagged, not hidden.** (`core`)
   - Verified: a frame that fails to deserialise is counted as a non-order message at `debug!`
     (order_update_connection.rs:961-987), so a vendor format change would drop every order
     update silently. Paper mode only today.
-  - Fix: a frame shaped like an order update that does not parse is counted on its own counter
-    and logged as a coded `error!` throttled to powers of two with a char-safe preview.
+  - Fix: a frame carrying the order envelope that fails the typed parse is counted on
+    `tv_order_update_frames_dropped_total{reason="unparseable_order"}` and logged as
+    ORDER-EVT-02 stage `typed_parse_failed`, throttled to powers of two, with the serde line
+    and column and the existing client-id-redacted excerpt.
+  - Tests: three in `order_update_connection.rs` (`looks_like_order_update` and the arm).
 - [x] **R5 — the candle fold starts a clean day if the process runs past midnight.**
   (`app`, `trading`) Verified first; if the day-rollover path already handles it, the item
   closes with the evidence instead of a code change.
@@ -2041,11 +2048,23 @@ independent live-path fixes).
     `the_ranking_daily_reset_fires_only_on_a_real_midnight_crossing` now pins the roll call.
 - [ ] **R6 — a bar opens at its earliest trade, not its first arrival.** (`trading`) Verified
   first against the restart differential; ships only if the oracle and the replay rules agree.
-- [ ] **R7 — the instance lock re-reads after renewal and a machine that lost it stops
+- [x] **R7 — the instance lock re-reads after renewal and a machine that lost it stops
   dialling.** (`core`, `app`) SSM has no compare-and-set, so this narrows the window and makes
   the loss loud; it cannot close the race.
-- [ ] **R8 — the CLAUDE.md speed table matches the code.** (docs) Eight stale rows, both
-  directions, plus rows for R2's cap.
+  - Fix: every renewal and stale-takeover write is read back and classified from the SSM
+    versions (`classify_write`: held / held after contention / lost / inconclusive, the last
+    never treated as held). A takeover settles 10 s before its read-back and is not trusted
+    past a 5 s read-to-write window. Every Dhan socket sink carries the lock flag
+    (`WalRingSink::with_dial_permit`); while the lock is not held a dial waits, counted on
+    `tv_instance_lock_dial_refused_total` with one RESILIENCE-01 error per episode, and no live
+    socket is closed. Runbook §3.6.
+  - Tests: `classify_write_*`, renew/takeover read-back tests against the SSM stub,
+    `with_dial_permit_follows_the_lock_flag_and_defaults_to_permitted`,
+    `test_run_connection_waits_without_dialling_while_lock_not_held`.
+  - Honest limit: a process that lost the lock does not re-acquire it without a restart.
+- [x] **R8 — the CLAUDE.md speed table matches the code.** (docs) Five rows corrected after a
+  re-check in source (`gainer_eligible`, `plan_depth20_ranked_minute`, `catch_up_seal_all`,
+  `atm_pair_for`, `SpotPriceStore`), each as a dated note appended to its row.
 
 R-items Z+ and guarantee matrix: covered by the shared matrix at the end of this plan. Tick
 path: R1 removes four compares per tick; R2 adds one divide and one compare per spot tick; no
