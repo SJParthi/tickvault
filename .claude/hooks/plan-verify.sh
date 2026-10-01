@@ -127,7 +127,7 @@ for PLAN_FILE in "${PLAN_FILES[@]}"; do
   REPORT=""
   NAME="${PLAN_FILE#"$PROJECT_DIR"/}"
 
-  STATUS=$(grep -m1 '^\*\*Status:\*\*' "$PLAN_FILE" 2>/dev/null | sed 's/.*\*\*Status:\*\* *//' | tr -d '[:space:]')
+  STATUS=$(grep -m1 '^\*\*Status:\*\*' "$PLAN_FILE" 2>/dev/null | sed 's/.*\*\*Status:\*\* *//' | awk '{print $1}' | tr -cd 'A-Za-z_')
   if [ -z "$STATUS" ]; then
     echo "  FAIL: $NAME has no **Status:** field" >&2
     TOTAL_VIOLATIONS=$((TOTAL_VIOLATIONS + 1))
@@ -137,7 +137,7 @@ for PLAN_FILE in "${PLAN_FILES[@]}"; do
   # `grep -c` prints "0" AND exits non-zero on zero matches; `|| true` keeps
   # the single "0" instead of appending a second one.
   UNCHECKED=$(grep -c '^\- \[ \]' "$PLAN_FILE" 2>/dev/null || true)
-  CHECKED=$(grep -c '^\- \[x\]' "$PLAN_FILE" 2>/dev/null || true)
+  CHECKED=$(grep -c '^\- \[[xX]\]' "$PLAN_FILE" 2>/dev/null || true)
   UNCHECKED=${UNCHECKED:-0}
   CHECKED=${CHECKED:-0}
 
@@ -157,14 +157,24 @@ for PLAN_FILE in "${PLAN_FILES[@]}"; do
   current_status="none"
   while IFS= read -r line; do
     case "$line" in
-      "- [x] "*) current_status="done" ;;
+      "- [x] "*|"- [X] "*) current_status="done" ;;
       "- [~] "*) current_status="deferred" ;;
       "- [ ] "*) current_status="unchecked" ;;
     esac
     [ "$current_status" = "done" ] || continue
     case "$line" in
-      *"- Tests:"*)
-        TESTS=$(strip_notes "$(echo "$line" | sed 's/^[[:space:]]*- Tests:[[:space:]]*//')")
+      *"- Tests:"*|"- ["[xX]"] "*"Tests:"*)
+        # A `- Tests:` sub-line, or `Tests:` written inline on the item
+        # line itself; either way the names are what follows the last
+        # `Tests:` on the line.
+        TESTS=$(strip_notes "$(echo "$line" | sed 's/^.*Tests:[[:space:]]*//')")
+        # An inline list runs on into the item's prose, and often names a
+        # test by a leading part of its name; there a word passes if any
+        # identifier in crates/ STARTS with it. A `- Tests:` line is exact.
+        case "$line" in
+          "- ["[xX]"] "*) TEST_PATTERN_TAIL='' ;;
+          *) TEST_PATTERN_TAIL='\b' ;;
+        esac
         IFS=',' read -ra TEST_ARRAY <<< "$TESTS"
         for token in "${TEST_ARRAY[@]}"; do
           token=$(normalise "$token")
@@ -184,7 +194,12 @@ for PLAN_FILE in "${PLAN_FILES[@]}"; do
             [ -z "$test_name" ] && continue
             # A word naming a test FILE (`foo_guard r20_case`) is the file.
             file_exists_in_project "${test_name}.rs" && continue
-            if ! grep -rqE "fn ${test_name}\b" "$PROJECT_DIR/crates" --include='*.rs' 2>/dev/null; then
+            if [ -n "$TEST_PATTERN_TAIL" ]; then
+              PATTERN="fn ${test_name}${TEST_PATTERN_TAIL}"
+            else
+              PATTERN="\b${test_name}"
+            fi
+            if ! grep -rqE "$PATTERN" "$PROJECT_DIR/crates" --include='*.rs' 2>/dev/null; then
               MISSING_TESTS=$((MISSING_TESTS + 1))
               REPORT="${REPORT}\n  [MISSING TEST] fn ${test_name} — not found in crates/"
             fi

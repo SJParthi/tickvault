@@ -82,5 +82,24 @@ d=$(new_tree)
 printf '# Plan\n\n- [x] a\n' > "$d/.claude/plans/active-plan-x.md"
 run "plan without a Status field -> FAIL" 2 "$d"; rm -rf "$d"
 
+d=$(new_tree)
+plan "$d" active-plan-x.md APPROVED "- [x] item with inline list. Tests: \`renamed_away_test\`, \`real_test_name\`."
+run "inline Tests: on the item line, one name missing -> FAIL" 2 "$d"; rm -rf "$d"
+
+d=$(new_tree)
+plan "$d" active-plan-x.md APPROVED "- [X] item. Tests: \`real_test\` (a leading part of real_test_name), \`other_real_test\` and prose"
+run "inline Tests: leading part of a name, capital X -> PASS" 0 "$d"; rm -rf "$d"
+
+d=$(new_tree)
+plan "$d" active-plan-x.md APPROVED "- [X] item
+  - Tests: missing_capital_x_test"
+run "capital-X ticked item is checked -> FAIL" 2 "$d"; rm -rf "$d"
+
+d=$(new_tree)
+plan "$d" active-plan-x.md "VERIFIED — 2026-10-01, all merged" "- [x] done
+  - Tests: real_test_name
+- [ ] still open"
+run "Status 'VERIFIED — note' still read as VERIFIED -> FAIL" 2 "$d"; rm -rf "$d"
+
 echo "  plan-verify self-test: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
