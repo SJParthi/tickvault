@@ -508,3 +508,39 @@ fn boot_units_never_run_the_rollback_restored_binary() {
          pre-port binary into the boot units"
     );
 }
+
+/// The holiday gate (audit D6c) is the second boot unit on the subcommand
+/// binary, with one extra hazard: it is copied into /etc/systemd/system by the
+/// deploy, so the deploy must copy it only AFTER `bin/tickvault-host` holds a
+/// binary that knows `holiday-gate`. A deploy that fails its smoke test stops
+/// before the copy and leaves the previous unit in place.
+#[test]
+fn holiday_gate_unit_runs_the_subcommand_binary_and_is_copied_after_it() {
+    const HOLIDAY_UNIT: &str = "deploy/systemd/tickvault-holiday-gate.service";
+    let unit = read(HOLIDAY_UNIT);
+    let exec: Vec<&str> = unit.lines().filter(|l| l.starts_with("Exec")).collect();
+    assert_eq!(
+        exec,
+        ["ExecStart=-/opt/tickvault/bin/tickvault-host holiday-gate"],
+        "{HOLIDAY_UNIT} must run exactly the subcommand, from the rollback-proof \
+         copy, fail-open when the copy is missing"
+    );
+    assert!(
+        unit.lines().any(|l| l.starts_with("TimeoutStartSec=")),
+        "{HOLIDAY_UNIT} has no start timeout; tickvault.service waits behind it"
+    );
+
+    let deploy = read(DEPLOY);
+    let install = deploy
+        .find("install -m 0755 -o root -g root bin/tickvault bin/tickvault-host")
+        .expect("the deploy no longer installs bin/tickvault-host");
+    let copy = deploy
+        .find("cp -f repo/deploy/systemd/tickvault-holiday-gate.service")
+        .expect("the deploy no longer refreshes the holiday-gate unit");
+    assert!(
+        install < copy,
+        "the deploy copies the holiday-gate unit before bin/tickvault-host is \
+         refreshed, so a failed deploy can leave the new unit calling an older \
+         copy that would boot the whole app instead of the gate"
+    );
+}

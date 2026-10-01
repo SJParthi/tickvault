@@ -305,7 +305,7 @@ resource "aws_iam_role_policy" "tv_instance" {
       },
       {
         # NSE-holiday self-stop: the boot-time holiday gate
-        # (deploy/aws/holiday-gate.sh) stops THIS instance on a non-trading
+        # (`tickvault holiday-gate`) stops THIS instance on a non-trading
         # day so the Mon-Fri start cron never bills a full no-op day.
         # Scoped by the Name tag (NOT the instance ARN) on purpose — the
         # instance -> instance-profile -> role -> policy chain would create a

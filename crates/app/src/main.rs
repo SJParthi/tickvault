@@ -94,8 +94,9 @@ use tickvault_api::state::{SharedAppState, SharedHealthStatus, SystemHealthStatu
 
 /// Exit code returned by the `--check-trading-day` gate.
 ///
-/// The holiday-gate shell script (`deploy/aws/holiday-gate.sh`) reads `$?` —
-/// NOT stdout (the app denies `print_stdout`/`print_stderr`). Contract:
+/// The holiday gate (`tickvault holiday-gate`, `holiday_gate.rs`; a shell
+/// script until 2026-10-01) reads this code, as does any operator running
+/// `tickvault --check-trading-day` by hand. Contract:
 /// - `0`  = today (IST) is a trading day → let the app start.
 /// - `75` = today is a weekend / NSE holiday → gate self-stops the instance.
 ///
@@ -107,11 +108,20 @@ fn trading_day_gate_exit_code(is_trading_day: bool) -> i32 {
 /// `--check-trading-day` short-circuit: load config → build the calendar →
 /// evaluate IST today → exit with [`trading_day_gate_exit_code`].
 ///
-/// FAIL-OPEN: any config/calendar load error exits `70`, which the gate script
+/// FAIL-OPEN: any config/calendar load error exits `70`, which the gate
 /// treats as "let the app start" — so the gate can NEVER stop the box on a real
 /// trading day because of a transient load failure. Single source of truth: the
 /// SAME `config/base.toml` NSE holiday list the app itself uses (no duplication).
 fn run_trading_day_gate() -> ! {
+    std::process::exit(trading_day_gate_code());
+}
+
+/// Exit code for the load error that the gate treats as "let the app start".
+const TRADING_DAY_GATE_LOAD_ERROR_EXIT: i32 = 70;
+
+/// The `--check-trading-day` verdict as an exit code, without exiting, so the
+/// in-process holiday gate asks the very same question.
+fn trading_day_gate_code() -> i32 {
     let config: ApplicationConfig = match Figment::new()
         .merge(Toml::file(CONFIG_BASE_PATH))
         .merge(Toml::file(CONFIG_LOCAL_PATH))
@@ -119,18 +129,16 @@ fn run_trading_day_gate() -> ! {
     {
         Ok(c) => c,
         // FAIL-OPEN on load error (exit 70 → gate lets the app start).
-        Err(_) => std::process::exit(70),
+        Err(_) => return TRADING_DAY_GATE_LOAD_ERROR_EXIT,
     };
     let calendar = match TradingCalendar::from_config(&config.trading) {
         Ok(c) => c,
-        Err(_) => std::process::exit(70),
+        Err(_) => return TRADING_DAY_GATE_LOAD_ERROR_EXIT,
     };
     let today_ist = (chrono::Utc::now()
         + chrono::TimeDelta::seconds(tickvault_common::constants::IST_UTC_OFFSET_SECONDS_I64))
     .date_naive();
-    std::process::exit(trading_day_gate_exit_code(
-        calendar.is_trading_day(today_ist),
-    ));
+    trading_day_gate_exit_code(calendar.is_trading_day(today_ist))
 }
 
 /// Metric name for the dedicated boot-completed CloudWatch signal.
@@ -537,9 +545,9 @@ async fn async_main() -> Result<()> {
     // -----------------------------------------------------------------------
     // Step -1: Holiday-gate CLI short-circuit (cold path, no TLS / no runtime).
     // -----------------------------------------------------------------------
-    // `tickvault --check-trading-day` is invoked by the boot-time holiday gate
-    // (deploy/aws/holiday-gate.sh via the tickvault-holiday-gate.service oneshot)
-    // BEFORE the app proper starts. It exits 0 (trading day) / 75 (holiday) /
+    // `tickvault --check-trading-day` answers the holiday gate's question for an
+    // operator at a shell (the gate itself, `tickvault holiday-gate`, asks it
+    // in-process at Step 0.5 below). It exits 0 (trading day) / 75 (holiday) /
     // 70 (load error → fail-open). Must run before CryptoProvider install — the
     // gate needs no TLS and exits immediately.
     if std::env::args().any(|a| a == "--check-trading-day") {
@@ -557,6 +565,19 @@ async fn async_main() -> Result<()> {
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("failed to install rustls CryptoProvider — cannot proceed without TLS"); // APPROVED: bootstrap — TLS mandatory, failure is fatal
+
+    // -----------------------------------------------------------------------
+    // Step 0.5: `tickvault holiday-gate` (audit D6c; was deploy/aws/holiday-gate.sh)
+    // -----------------------------------------------------------------------
+    // Run by tickvault-holiday-gate.service before the app. Asks the same
+    // calendar as `--check-trading-day` and, on a definitive holiday, stamps
+    // the stop marker, pages and stops the instance. After the provider
+    // install because its IMDS and AWS clients use TLS.
+    let cli_args: Vec<String> = std::env::args().collect();
+    if tickvault_app::holiday_gate::is_invocation(&cli_args) {
+        let code = tickvault_app::holiday_gate::run(trading_day_gate_code).await;
+        std::process::exit(code);
+    }
 
     // -----------------------------------------------------------------------
     // Step 1: Load and validate configuration
