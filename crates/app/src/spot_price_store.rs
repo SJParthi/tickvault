@@ -169,6 +169,29 @@ pub const OLDER_THAN_HELD_COUNTER: &str = "tv_spot_price_store_older_than_held_t
 /// cause. Refusing the future-dated tick is what keeps that counter honest.
 pub const FUTURE_DAY_COUNTER: &str = "tv_spot_price_store_future_day_total";
 
+/// Counter for a tick whose exchange trade time was LATER TODAY than this
+/// machine's receipt of it, and whose held time was therefore capped at the
+/// receipt.
+///
+/// Added 2026-10-01 (reality check). The day gate above stops a tick stamped
+/// TOMORROW; it did nothing for one stamped 15:00 arriving at 10:00. That
+/// tick was stored with 15:00, and the later-time-wins rule then refused every
+/// honest tick for that instrument as `OlderThanHeld` until 15:00 — five hours
+/// of a frozen price that the depth and contract selectors kept using. The
+/// price is still taken (the exchange did print it), but its time is held at
+/// `receipt + FUTURE_TRADE_TIME_SKEW_SECS`, so the next honest tick wins
+/// within that skew. Not a loss: nothing is dropped, so the name does not end
+/// in a loss suffix.
+pub const FUTURE_TIME_CAPPED_COUNTER: &str = "tv_spot_price_store_future_time_capped_total";
+
+/// How far ahead of this machine's receipt clock a trade time may be before
+/// it is capped. The exchange stamps whole seconds and this box's clock is
+/// chrony-disciplined (BOOT-03), so an honest tick is at most a second or two
+/// ahead; 5 s is the same skew the candle fold allows a first live receipt.
+/// The cap also bounds the worst case: a wrongly-stamped tick can now hold an
+/// instrument's price for at most this long, never for hours.
+pub const FUTURE_TRADE_TIME_SKEW_SECS: i64 = 5;
+
 /// Gauge: how many instruments the store currently prices.
 ///
 /// The number that separates "the RAM path is warming up" from "the RAM path
@@ -237,6 +260,34 @@ pub fn rupees_to_paise(rupees: f64) -> Option<i64> {
     Some(paise as i64)
 }
 
+/// The latest exchange trade time (in the units Dhan stamps: IST epoch
+/// seconds) an honest tick received at `received_at_nanos` (UTC nanos) can
+/// carry: the receipt in IST epoch seconds plus [`FUTURE_TRADE_TIME_SKEW_SECS`].
+///
+/// `None` when there is no receipt (`<= 0`, the replay-of-an-old-frame
+/// sentinel the candle fold also stands down on). Pure so the arithmetic is a
+/// unit test.
+#[must_use]
+pub const fn trade_time_ceiling_secs(received_at_nanos: i64) -> Option<u32> {
+    if received_at_nanos <= 0 {
+        return None;
+    }
+    let ceiling = (received_at_nanos / 1_000_000_000)
+        .saturating_add(IST_UTC_OFFSET_SECONDS_I64)
+        .saturating_add(FUTURE_TRADE_TIME_SKEW_SECS);
+    if ceiling > u32::MAX as i64 {
+        // APPROVED: the `u32::MAX as i64` widening is lossless; a ceiling past
+        // the wire field's range can never be exceeded, so there is no cap.
+        return None;
+    }
+    // Bounded to `0..=u32::MAX` by the guard above and the positive receipt;
+    // `TryFrom` is not const-stable.
+    // APPROVED: lossless narrowing, range checked above.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let narrowed = ceiling as u32;
+    Some(narrowed)
+}
+
 /// The IST day number of an exchange trade time (epoch seconds, UTC).
 ///
 /// The same arithmetic the drain's midnight rollover uses
@@ -303,6 +354,7 @@ pub struct SpotPriceStore {
     stale_day: AtomicU64,
     older_than_held: AtomicU64,
     future_day: AtomicU64,
+    future_time_capped: AtomicU64,
     refused_capacity: AtomicU64,
 }
 
@@ -339,6 +391,7 @@ impl SpotPriceStore {
             stale_day: AtomicU64::new(0),
             older_than_held: AtomicU64::new(0),
             future_day: AtomicU64::new(0),
+            future_time_capped: AtomicU64::new(0),
             refused_capacity: AtomicU64::new(0),
         }
     }
@@ -353,6 +406,11 @@ impl SpotPriceStore {
     ///
     /// `exchange_secs` is the exchange's last-trade time in epoch seconds —
     /// `ParsedTick::exchange_timestamp` as decoded, never the receipt clock.
+    /// `received_at_nanos` is this machine's receipt of the frame
+    /// (`ParsedTick::received_at_nanos`, UTC nanos; `<= 0` means "no receipt",
+    /// and then no cap applies). A trade time more than
+    /// [`FUTURE_TRADE_TIME_SKEW_SECS`] ahead of the receipt is held at that
+    /// ceiling — see [`FUTURE_TIME_CAPPED_COUNTER`].
     /// O(1) average, and allocation-free for an already-tracked instrument.
     pub fn record(
         &self,
@@ -360,6 +418,7 @@ impl SpotPriceStore {
         segment: ExchangeSegment,
         last_price: f32,
         exchange_secs: u32,
+        received_at_nanos: i64,
     ) -> RecordOutcome {
         // Cheap f32 compares first, before the day arithmetic or the probe.
         // `is_finite()` FIRST: it refuses NaN and both infinities, which is
@@ -385,6 +444,18 @@ impl SpotPriceStore {
             self.future_day.fetch_add(1, Ordering::Relaxed);
             return RecordOutcome::FutureTradingDay;
         }
+        // The same hazard INSIDE today (2026-10-01): a trade time hours ahead
+        // of the receipt would out-rank every honest tick until the clock
+        // caught up. Held at the receipt ceiling instead; every comparison
+        // below uses the capped time, so the next honest tick wins within the
+        // skew. One divide and one compare; no allocation.
+        let exchange_secs = match trade_time_ceiling_secs(received_at_nanos) {
+            Some(ceiling) if exchange_secs > ceiling => {
+                self.future_time_capped.fetch_add(1, Ordering::Relaxed);
+                ceiling
+            }
+            _ => exchange_secs,
+        };
         let word = pack(exchange_secs, last_price.to_bits());
         let pinned = self.prices.pin();
         let key = (security_id, segment);
@@ -534,6 +605,8 @@ impl SpotPriceStore {
         metrics::counter!(OLDER_THAN_HELD_COUNTER)
             .absolute(self.older_than_held.load(Ordering::Relaxed));
         metrics::counter!(FUTURE_DAY_COUNTER).absolute(self.future_day.load(Ordering::Relaxed));
+        metrics::counter!(FUTURE_TIME_CAPPED_COUNTER)
+            .absolute(self.future_time_capped.load(Ordering::Relaxed));
         metrics::counter!(REFUSED_COUNTER).absolute(self.refused_capacity.load(Ordering::Relaxed));
     }
 
@@ -542,6 +615,13 @@ impl SpotPriceStore {
     #[must_use]
     pub fn future_day_refusals(&self) -> u64 {
         self.future_day.load(Ordering::Relaxed)
+    }
+
+    /// Ticks whose trade time was held at the receipt ceiling because it was
+    /// later today than this machine received it.
+    #[must_use]
+    pub fn future_time_capped(&self) -> u64 {
+        self.future_time_capped.load(Ordering::Relaxed)
     }
 
     /// Refusals so far, as `(rejected_value, stale_day, older_than_held,
@@ -607,7 +687,10 @@ mod tests {
     #[test]
     fn record_stores_a_price_that_reads_back_in_paise() {
         let s = store();
-        assert_eq!(s.record(2885, NSE_EQ, 1234.55, T0), RecordOutcome::Stored);
+        assert_eq!(
+            s.record(2885, NSE_EQ, 1234.55, T0, 0),
+            RecordOutcome::Stored
+        );
         assert_eq!(s.latest_paise(2885, NSE_EQ), Some(123_455));
         assert_eq!(s.latest_exchange_secs(2885, NSE_EQ), Some(T0));
     }
@@ -615,8 +698,8 @@ mod tests {
     #[test]
     fn a_later_trade_replaces_an_earlier_one_without_adding_a_second_entry() {
         let s = store();
-        s.record(2885, NSE_EQ, 1234.55, T0);
-        s.record(2885, NSE_EQ, 1240.00, T0 + 1);
+        s.record(2885, NSE_EQ, 1234.55, T0, 0);
+        s.record(2885, NSE_EQ, 1240.00, T0 + 1, 0);
         assert_eq!(
             s.latest_paise(2885, NSE_EQ),
             Some(124_000),
@@ -633,11 +716,11 @@ mod tests {
     fn latest_exchange_secs_keeps_the_fresher_trade_when_an_older_frame_replays() {
         let s = store();
         assert_eq!(
-            s.record(2885, NSE_EQ, 1240.00, T0 + 60),
+            s.record(2885, NSE_EQ, 1240.00, T0 + 60, 0),
             RecordOutcome::Stored
         );
         assert_eq!(
-            s.record(2885, NSE_EQ, 1234.55, T0),
+            s.record(2885, NSE_EQ, 1234.55, T0, 0),
             RecordOutcome::OlderThanHeld,
             "a replayed frame from a minute ago must not replace the live price"
         );
@@ -648,8 +731,11 @@ mod tests {
     #[test]
     fn two_trades_in_the_same_second_take_the_later_arrival() {
         let s = store();
-        s.record(2885, NSE_EQ, 1234.55, T0);
-        assert_eq!(s.record(2885, NSE_EQ, 1234.60, T0), RecordOutcome::Stored);
+        s.record(2885, NSE_EQ, 1234.55, T0, 0);
+        assert_eq!(
+            s.record(2885, NSE_EQ, 1234.60, T0, 0),
+            RecordOutcome::Stored
+        );
         assert_eq!(
             s.latest_paise(2885, NSE_EQ),
             Some(123_460),
@@ -664,7 +750,7 @@ mod tests {
         let s = store();
         let yesterday = T0 - u32::try_from(SECONDS_PER_DAY).unwrap_or(86_400);
         assert_eq!(
-            s.record(2885, NSE_EQ, 1234.55, yesterday),
+            s.record(2885, NSE_EQ, 1234.55, yesterday, 0),
             RecordOutcome::StaleTradingDay
         );
         assert_eq!(s.latest_paise(2885, NSE_EQ), None);
@@ -678,10 +764,13 @@ mod tests {
     #[test]
     fn future_day_refusals_count_a_trade_stamped_tomorrow_and_the_slot_is_not_pinned() {
         let s = store();
-        assert_eq!(s.record(2885, NSE_EQ, 1234.55, T0), RecordOutcome::Stored);
+        assert_eq!(
+            s.record(2885, NSE_EQ, 1234.55, T0, 0),
+            RecordOutcome::Stored
+        );
         let tomorrow = T0 + u32::try_from(SECONDS_PER_DAY).unwrap_or(86_400);
         assert_eq!(
-            s.record(2885, NSE_EQ, 9999.99, tomorrow),
+            s.record(2885, NSE_EQ, 9999.99, tomorrow, 0),
             RecordOutcome::FutureTradingDay,
             "a tick from a later IST day must never be stored"
         );
@@ -691,7 +780,7 @@ mod tests {
             "the honest price survives the garbage stamp"
         );
         assert_eq!(
-            s.record(2885, NSE_EQ, 1234.60, T0 + 1),
+            s.record(2885, NSE_EQ, 1234.60, T0 + 1, 0),
             RecordOutcome::Stored,
             "the NEXT honest tick still lands — the slot was never pinned"
         );
@@ -703,11 +792,86 @@ mod tests {
         );
         // A brand-new instrument whose FIRST tick is future-dated gets no slot.
         assert_eq!(
-            s.record(11_536, NSE_EQ, 100.0, tomorrow),
+            s.record(11_536, NSE_EQ, 100.0, tomorrow, 0),
             RecordOutcome::FutureTradingDay
         );
         assert_eq!(s.latest_paise(11_536, NSE_EQ), None);
         assert_eq!(s.future_day_refusals(), 2);
+    }
+
+    /// The receipt (UTC nanos) at which an honest tick carries trade time `t`
+    /// (Dhan stamps IST epoch seconds).
+    fn receipt_for(t: u32) -> i64 {
+        (i64::from(t) - IST_UTC_OFFSET_SECONDS_I64) * 1_000_000_000
+    }
+
+    /// 2026-10-01 reality check: a tick stamped LATER TODAY than its receipt
+    /// (15:00 arriving at 10:00) was stored with its own time, and every
+    /// honest tick after it was refused as `OlderThanHeld` until 15:00 — a
+    /// price frozen for five hours. Its time is now held at the receipt
+    /// ceiling, so the freeze lasts at most the skew.
+    #[test]
+    fn a_trade_stamped_hours_ahead_of_its_receipt_cannot_freeze_the_price() {
+        let s = store();
+        let five_hours = 5 * 3_600;
+        assert_eq!(
+            s.record(2885, NSE_EQ, 1300.00, T0 + five_hours, receipt_for(T0)),
+            RecordOutcome::Stored,
+            "the price is taken; only its time is capped"
+        );
+        assert_eq!(s.future_time_capped(), 1);
+        let skew = u32::try_from(FUTURE_TRADE_TIME_SKEW_SECS).unwrap_or(5);
+        assert_eq!(
+            s.latest_exchange_secs(2885, NSE_EQ),
+            Some(T0 + skew),
+            "held at receipt + skew, never at the 5-hour stamp"
+        );
+        let next = T0 + skew + 1;
+        assert_eq!(
+            s.record(2885, NSE_EQ, 1234.60, next, receipt_for(next)),
+            RecordOutcome::Stored,
+            "the next honest tick past the skew wins at once, not at 15:00"
+        );
+        assert_eq!(s.latest_paise(2885, NSE_EQ), Some(123_460));
+        assert_eq!(
+            s.refusals().2,
+            0,
+            "no honest tick was refused as older-than-held"
+        );
+        assert_eq!(s.future_time_capped(), 1, "the honest tick was not capped");
+    }
+
+    #[test]
+    fn a_trade_inside_the_skew_or_with_no_receipt_is_not_capped() {
+        let s = store();
+        let skew = u32::try_from(FUTURE_TRADE_TIME_SKEW_SECS).unwrap_or(5);
+        assert_eq!(
+            s.record(1, NSE_EQ, 100.0, T0 + skew, receipt_for(T0)),
+            RecordOutcome::Stored
+        );
+        assert_eq!(s.latest_exchange_secs(1, NSE_EQ), Some(T0 + skew));
+        // No receipt (a replayed pre-receipt frame): nothing to judge against.
+        assert_eq!(
+            s.record(2, NSE_EQ, 100.0, T0 + 3_600, 0),
+            RecordOutcome::Stored
+        );
+        assert_eq!(s.latest_exchange_secs(2, NSE_EQ), Some(T0 + 3_600));
+        assert_eq!(s.future_time_capped(), 0);
+    }
+
+    #[test]
+    fn trade_time_ceiling_is_the_receipt_in_ist_seconds_plus_the_skew() {
+        assert_eq!(trade_time_ceiling_secs(0), None);
+        assert_eq!(trade_time_ceiling_secs(-1), None);
+        let skew = u32::try_from(FUTURE_TRADE_TIME_SKEW_SECS).unwrap_or(5);
+        assert_eq!(trade_time_ceiling_secs(receipt_for(T0)), Some(T0 + skew));
+        // Sub-second receipt floors to the whole second.
+        assert_eq!(
+            trade_time_ceiling_secs(receipt_for(T0) + 999_999_999),
+            Some(T0 + skew)
+        );
+        // A ceiling past the u32 wire range can never be exceeded: no cap.
+        assert_eq!(trade_time_ceiling_secs(i64::MAX), None);
     }
 
     #[test]
@@ -718,12 +882,12 @@ mod tests {
                 .unwrap_or(0);
         let s = store();
         assert_eq!(
-            s.record(1, NSE_EQ, 100.0, midnight_ist_utc - 1),
+            s.record(1, NSE_EQ, 100.0, midnight_ist_utc - 1, 0),
             RecordOutcome::StaleTradingDay,
             "23:59:59 IST yesterday"
         );
         assert_eq!(
-            s.record(1, NSE_EQ, 100.0, midnight_ist_utc),
+            s.record(1, NSE_EQ, 100.0, midnight_ist_utc, 0),
             RecordOutcome::Stored,
             "00:00:00 IST today"
         );
@@ -734,8 +898,8 @@ mod tests {
         // I-P1-11. Dhan reuses one numeric id across segments; sharing a slot
         // would let an index's level price a stock's entire option ladder.
         let s = store();
-        s.record(27, IDX, 26_000.0, T0);
-        s.record(27, NSE_EQ, 415.25, T0);
+        s.record(27, IDX, 26_000.0, T0, 0);
+        s.record(27, NSE_EQ, 415.25, T0, 0);
         assert_eq!(s.latest_paise(27, IDX), Some(2_600_000));
         assert_eq!(s.latest_paise(27, NSE_EQ), Some(41_525));
         assert_eq!(s.tracked(), 2);
@@ -757,7 +921,7 @@ mod tests {
         let s = store();
         for bad in [0.0_f32, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             assert_eq!(
-                s.record(2885, NSE_EQ, bad, T0),
+                s.record(2885, NSE_EQ, bad, T0, 0),
                 RecordOutcome::RejectedValue,
                 "{bad} must not reach the ladder"
             );
@@ -773,7 +937,7 @@ mod tests {
     #[test]
     fn a_price_too_small_to_be_one_paise_never_reaches_a_reader() {
         let s = store();
-        s.record(1, NSE_EQ, 0.004, T0);
+        s.record(1, NSE_EQ, 0.004, T0, 0);
         assert_eq!(s.latest_paise(1, NSE_EQ), None);
         assert!(
             s.snapshot_prices().is_empty(),
@@ -781,7 +945,7 @@ mod tests {
         );
         // The smallest value that IS a paise still lands, so the guard has not
         // quietly become a floor on real prices. 0.005 rounds to 1.
-        s.record(2, NSE_EQ, 0.005, T0);
+        s.record(2, NSE_EQ, 0.005, T0, 0);
         assert_eq!(s.latest_paise(2, NSE_EQ), Some(1));
     }
 
@@ -820,7 +984,7 @@ mod tests {
         // (an MRF-class share price) widens naively to 131072.09375 →
         // 13107209 paise, while the shortest-decimal cleaner gives 13107210.
         let s = store();
-        s.record(1, NSE_EQ, 131_072.1, T0);
+        s.record(1, NSE_EQ, 131_072.1, T0, 0);
         assert_eq!(
             s.latest_paise(1, NSE_EQ),
             Some(13_107_210),
@@ -832,8 +996,8 @@ mod tests {
     #[test]
     fn snapshot_prices_is_the_shape_the_contract_join_already_consumes() {
         let s = store();
-        s.record(2885, NSE_EQ, 1234.55, T0);
-        s.record(13, IDX, 24_500.10, T0);
+        s.record(2885, NSE_EQ, 1234.55, T0, 0);
+        s.record(13, IDX, 24_500.10, T0, 0);
         let snap = s.snapshot_prices();
         assert_eq!(snap.get(&(2885, NSE_EQ.binary_code())), Some(&123_455));
         assert_eq!(snap.get(&(13, IDX.binary_code())), Some(&2_450_010));
@@ -844,15 +1008,15 @@ mod tests {
     fn tracked_stops_at_the_cap_and_an_already_tracked_instrument_still_updates() {
         let s = store();
         for id in 0..MAX_TRACKED_INSTRUMENTS as u64 {
-            assert_eq!(s.record(id, NSE_EQ, 100.0, T0), RecordOutcome::Stored);
+            assert_eq!(s.record(id, NSE_EQ, 100.0, T0, 0), RecordOutcome::Stored);
         }
         assert_eq!(
-            s.record(999_999, NSE_EQ, 100.0, T0),
+            s.record(999_999, NSE_EQ, 100.0, T0, 0),
             RecordOutcome::RefusedAtCapacity,
             "past the ceiling a NEW instrument is refused"
         );
         assert_eq!(
-            s.record(0, NSE_EQ, 250.0, T0 + 1),
+            s.record(0, NSE_EQ, 250.0, T0 + 1, 0),
             RecordOutcome::Stored,
             "refusing the newcomer must never cost an already-tracked instrument \
              its price — that would be the strictly worse trade"
@@ -864,12 +1028,12 @@ mod tests {
     #[test]
     fn reset_for_trading_day_clears_prices_and_moves_the_day_gate_forward() {
         let s = store();
-        s.record(2885, NSE_EQ, 1234.55, T0);
+        s.record(2885, NSE_EQ, 1234.55, T0, 0);
         s.reset_for_trading_day(DAY + 1);
         assert!(s.is_empty());
         assert_eq!(s.latest_paise(2885, NSE_EQ), None);
         assert_eq!(
-            s.record(2885, NSE_EQ, 1234.55, T0),
+            s.record(2885, NSE_EQ, 1234.55, T0, 0),
             RecordOutcome::StaleTradingDay,
             "a tick from the day that just ended must be refused after the rollover"
         );
@@ -909,8 +1073,8 @@ mod tests {
     #[test]
     fn refusals_are_absolute_tallies_that_publish_metrics_never_double_counts() {
         let s = store();
-        s.record(1, NSE_EQ, -1.0, T0);
-        s.record(1, NSE_EQ, -1.0, T0);
+        s.record(1, NSE_EQ, -1.0, T0, 0);
+        s.record(1, NSE_EQ, -1.0, T0, 0);
         s.publish_metrics();
         s.publish_metrics();
         assert_eq!(
@@ -932,7 +1096,7 @@ mod tests {
                 let s = std::sync::Arc::clone(&s);
                 std::thread::spawn(move || {
                     for i in 0..250u64 {
-                        s.record(w * 1000 + i, NSE_EQ, 100.0 + i as f32, T0);
+                        s.record(w * 1000 + i, NSE_EQ, 100.0 + i as f32, T0, 0);
                     }
                 })
             })
@@ -958,7 +1122,7 @@ mod tests {
     #[test]
     fn concurrent_writers_on_one_slot_leave_the_freshest_trade() {
         let s = std::sync::Arc::new(store());
-        s.record(1, NSE_EQ, 1.0, T0);
+        s.record(1, NSE_EQ, 1.0, T0, 0);
         let writers: Vec<_> = (0..8u32)
             .map(|w| {
                 let s = std::sync::Arc::clone(&s);
@@ -970,7 +1134,7 @@ mod tests {
                         // second (~1.75e9) is beyond f32's 24-bit mantissa
                         // and would round, hiding which write actually won.
                         // APPROVED: offset < 400, exact in f32.
-                        s.record(1, NSE_EQ, (offset + 1) as f32, secs);
+                        s.record(1, NSE_EQ, (offset + 1) as f32, secs, 0);
                     }
                 })
             })
