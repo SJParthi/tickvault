@@ -100,18 +100,19 @@ type Key = (u64, u8);
 /// whose grace has elapsed, and which is still being delivered. An instrument
 /// the view has never held reads `Unknown`, never `Ghost` — a contract swapped
 /// IN between two publishes is exactly that shape for under a minute, and
-/// treating it as a ghost would redial a healthy socket on every swap.
+/// treating it as a ghost would ask for a repeat unsubscribe on every swap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DepthFrameClass {
     /// In a published held set — a normal frame.
     Held,
     /// Dropped by a publish less than [`GHOST_GRACE_SECS`] ago. The vendor is
     /// allowed a moment to act on the unsubscribe; frames in this window are
-    /// counted but earn no redial.
+    /// counted but earn no repeat unsubscribe.
     RecentlyDropped,
     /// Dropped by a publish at least [`GHOST_GRACE_SECS`] ago and STILL
     /// arriving: the unsubscribe was ignored or lost. The one verdict that
-    /// asks the socket to redial.
+    /// asks the socket to send the unsubscribe again (in place since
+    /// 2026-10-01; it asked for a redial until then).
     Ghost,
     /// Not held and not recently dropped, or no publish has happened yet.
     Unknown,
@@ -119,12 +120,12 @@ pub enum DepthFrameClass {
 
 /// How long after a publish dropped an instrument its frames still count as
 /// "recently dropped" rather than "ghost". Re-exported from the connection
-/// supervisor so the drain and the redial register agree on one number.
+/// supervisor so the drain and the unsubscribe register agree on one number.
 pub const GHOST_GRACE_SECS: i64 = tickvault_core::websocket::pool_supervisor::GHOST_GRACE_SECS;
 
 /// How long a dropped instrument stays in the dropped map before a publish
-/// evicts it. Longer than the redial cooldown (180 s) by design: a ghost that
-/// survives its first redial must still read as a ghost at the next one, and
+/// evicts it. Longer than the resend cooldown (180 s) by design: a ghost that
+/// survives its first repeat unsubscribe must still read as a ghost at the next one, and
 /// the map is the only memory of what this process ever dropped.
 pub const DROPPED_RETENTION_SECS: i64 = 600;
 
@@ -133,7 +134,7 @@ pub const DROPPED_RETENTION_SECS: i64 = 600;
 /// Two graces. Each pool publishes once a minute, so a healthy steering task
 /// keeps this age under ~60 s; a frame clock 180 s past the last publish is
 /// a forward clock step or a dead steering loop, and in either case the
-/// dropped map is not evidence a redial can act on. The bound holds a
+/// dropped map is not evidence a repeat unsubscribe can act on. The bound holds a
 /// forward NTP step of up to 180 s to at most the drops that were ALREADY
 /// past the grace, and refuses everything beyond it.
 pub const GHOST_VERDICT_MAX_PUBLISH_AGE_SECS: i64 = 2 * GHOST_GRACE_SECS;
@@ -175,7 +176,7 @@ pub struct DepthSubscriptionView {
     dropped: ArcSwap<HashMap<Key, i64>>,
     /// Set by the first publish. Before it, every classification is `Unknown`:
     /// the boot dial fills sockets before either loop has published, and a
-    /// detector that read that window as "ghost" would redial healthy sockets.
+    /// detector that read that window as "ghost" would send repeat unsubscribes on healthy sockets.
     published_once: AtomicBool,
     /// Epoch seconds of the LAST publish by either pool. A ghost verdict is
     /// refused when the frame's clock has run more than
@@ -487,9 +488,9 @@ impl DepthSubscriptionView {
             // publish every minute, so a frame clock more than two graces
             // past the last publish means either the wall clock stepped
             // forward (an NTP correction makes every recent drop read as
-            // ghost at once — a redial storm on healthy sockets) or the
+            // ghost at once — a storm of repeat unsubscribes) or the
             // steering task is dead (then no drop is fresh and the map is
-            // stale). Both refuse, in the safe direction: no redial on a
+            // stale). Both refuse, in the safe direction: nothing sent on a
             // clock nobody has confirmed. Found by the 2026-09-08 hostile
             // sweep (finding #21).
             Some(_)
@@ -531,7 +532,8 @@ impl DepthSubscriptionView {
     ///
     /// **HONEST LIMIT — the ghost tail outlives this answer.** The dropped map
     /// evicts at [`DROPPED_RETENTION_SECS`], and a socket that reaches its
-    /// ghost-redial session ceiling stands down and lets the contract stream
+    /// ghost-resend session ceiling (a redial ceiling until 2026-10-01) stands
+    /// down and lets the contract stream
     /// for the REST OF THE SESSION (measured 2026-09-10 and 2026-09-11:
     /// redials exhausted ~10:21–10:46 IST, ghosts continuing ~5 h). Past that
     /// retention this returns `false` and the fabricated zero is reachable
@@ -628,7 +630,7 @@ impl DepthSubscriptionView {
             if map.len() >= MAX_DROPPED_TRACKED {
                 // Fail-closed: refuse to remember more rather than grow
                 // without bound. A refused entry can never read as Ghost,
-                // which is the safe direction (no redial on a guess).
+                // which is the safe direction (nothing sent on a guess).
                 //
                 // CORRECTED 2026-09-09, two defects in these four lines:
                 //
@@ -665,7 +667,7 @@ impl DepthSubscriptionView {
                 refused,
                 tracked = map.len(),
                 cap = MAX_DROPPED_TRACKED,
-                "depth view dropped map is full; these instruments are not remembered and can never read as ghost (fail-closed: no redial on a guess)"
+                "depth view dropped map is full; these instruments are not remembered and can never read as ghost (fail-closed: nothing sent on a guess)"
             );
         }
         self.dropped.store(Arc::new(map));
@@ -913,8 +915,8 @@ mod tests {
     #[test]
     fn an_instrument_never_held_is_unknown_never_ghost() {
         // The swap-in window: a contract subscribed between two publishes is
-        // exactly "not held, not dropped". Calling it a ghost would redial a
-        // healthy socket on every swap.
+        // exactly "not held, not dropped". Calling it a ghost would ask for a
+        // repeat unsubscribe on every swap.
         let view = DepthSubscriptionView::new();
         view.publish_depth20_at([(1, NSE_FNO)], T0);
         assert_eq!(
@@ -976,7 +978,7 @@ mod tests {
     /// top 250): depth-20 drops it at T, depth-200 drops it at T+300. The
     /// grace must run from the SECOND drop — the one the socket is still
     /// honouring — or the first frames after it read as a ghost and a healthy
-    /// socket is redialled. Found by the 2026-09-08 hostile sweep; the older
+    /// socket is sent a repeat unsubscribe. Found by the 2026-09-08 hostile sweep; the older
     /// `!map.contains_key` guard kept the T stamp and this test failed on it.
     #[test]
     fn a_contract_dropped_by_both_pools_gets_its_grace_from_the_newer_drop() {
@@ -1002,7 +1004,7 @@ mod tests {
 
     /// A frame clock more than two graces past the last publish — a forward
     /// clock step, or a dead steering loop — refuses the ghost verdict
-    /// rather than redialling on a clock nobody has confirmed.
+    /// rather than acting on a clock nobody has confirmed.
     #[test]
     fn a_ghost_verdict_is_refused_when_the_last_publish_is_too_old() {
         let view = DepthSubscriptionView::new();
@@ -1288,11 +1290,11 @@ mod tests {
     }
 
     #[test]
-    fn the_grace_is_shorter_than_the_retention_and_the_redial_cooldown_fits_inside_it() {
-        // Otherwise a ghost is forgotten before it can be redialled twice.
+    fn the_grace_is_shorter_than_the_retention_and_the_resend_cooldown_fits_inside_it() {
+        // Otherwise a ghost is forgotten before its unsubscribe can be re-sent twice.
         assert!(GHOST_GRACE_SECS < DROPPED_RETENTION_SECS);
         assert!(
-            tickvault_core::websocket::pool_supervisor::GHOST_REDIAL_COOLDOWN_SECS * 2
+            tickvault_core::websocket::pool_supervisor::GHOST_RESEND_COOLDOWN_SECS * 2
                 < DROPPED_RETENTION_SECS
         );
     }
