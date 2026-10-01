@@ -55,6 +55,8 @@ Full record, measured position and lever table: `daily-universe-scope-expansion-
 
 Honest limit: until the 1-Oct revert PR merges, the native budget notifications and actions sit at percentages of $225. The code clamp is what holds October at $150 in the meantime.
 
+2026-10-01 (audit PR30b): the revert. All four sites read $150; the native 90% action line is $135.00 again.
+
 ## OPERATOR RULING 2026-08-19 — kill-ceiling RAISED $100 → $130 (gp3 IOPS 3000→6000 + throughput 125→500)
 
 **The verbatim operator demand (2026-08-19 — typed directly in-session, preserve EXACTLY, typos included):**

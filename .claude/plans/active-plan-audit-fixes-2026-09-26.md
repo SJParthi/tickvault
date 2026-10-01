@@ -920,12 +920,17 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
     start rule on (budget_killswitch.rs:208-287; main.tf:646-655); a late budget notice latches the
     wrong month (budget_killswitch.rs:208-270), which the six-hour back-dating above does not
     settle, so the period is read from the notice itself.
-- [ ] **PR30b — the October $150 ceiling in terraform.** (deploy; on or after 2026-10-01)
+- [x] **PR30b — the October $150 ceiling in terraform.** (deploy; on or after 2026-10-01)
   - The October $150 ceiling is enforced in code (`effective_budget_kill_usd`) but budget.tf and
     budget-guards.tf still say $225 (budget.tf:220-222; budget-guards.tf:278). Quote 23 keeps
     $225 for September, so the terraform change is a dated PR on or after 2026-10-01, in all four
     lockstep sites.
   - Re-check 6 (2026-09-27): line correction, budget-guards.tf:278 is now :300.
+  - Done 2026-10-01: `budget.tf limit_amount`, `budget-guards.tf BUDGET_KILL_USD`,
+    `budget_digest::BUDGET_USD` and `hard_stop_guard::DEFAULT_BUDGET_KILL_USD` all read $150,
+    pinned by `budget_ceiling_lockstep_guard.rs`. The month clamp stays as the backstop and now
+    changes no month. The native 90% stop line is $135.00 again; keeping October under $150
+    still needs one of the owner levers in daily-universe §0 Quote 23.
 - PR31 — a restart can never replace a fuller candle with a partial one. (`storage`, `app`,
   `core`, `trading`) Split 2026-09-27 into PR31a (the three smaller items) and PR31b (the
   restart rebuild itself), so each lands and is reviewed on its own.

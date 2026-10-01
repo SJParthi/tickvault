@@ -2454,6 +2454,10 @@ about a week before month end. That contradicts "accept up to 200".
 From 1 October the kill line is $150, enforced in code by
 `effective_budget_kill_usd`, whether or not the revert PR has landed.
 
+**2026-10-01 — the revert landed (audit PR30b).** All four lockstep sites read
+$150 again; the native 90% action line is $135.00. The lever table above is still
+the only way October stays under $150 without a mid-month stop.
+
 #### What a PR that violates Quote 23 looks like (REJECT)
 
 - Keeps the $225 ceiling in any of the four sites after September 2026.

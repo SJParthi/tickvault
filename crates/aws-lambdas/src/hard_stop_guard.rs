@@ -55,13 +55,17 @@ use tracing::{error, info, warn};
 /// stale fallback was a flagged follow-up while it was harmless; raising the
 /// ceiling made it a defect, so it is fixed here in the same change rather than
 /// left as a note.
-pub const DEFAULT_BUDGET_KILL_USD: f64 = 225.0;
+///
+/// 2026-10-01 (audit PR30b): 225.0 → 150.0, the scheduled revert of the
+/// September-only allowance. Equal to `STANDING_BUDGET_KILL_USD`, so the month
+/// clamp below no longer changes any month.
+pub const DEFAULT_BUDGET_KILL_USD: f64 = 150.0;
 
 /// The STANDING monthly kill line: from October 2026 the bill must stay within
 /// $150 (operator Quote 23, 2026-09-23 — daily-universe §0 + aws-budget.md).
 ///
-/// The configured ceiling (`BUDGET_KILL_USD` / `DEFAULT_BUDGET_KILL_USD`, $225)
-/// is a September-2026-only allowance. `effective_budget_kill_usd` clamps
+/// The configured ceiling (`BUDGET_KILL_USD` / `DEFAULT_BUDGET_KILL_USD`) was
+/// $225 as a September-2026-only allowance, and is $150 again since 2026-10-01. `effective_budget_kill_usd` clamps
 /// every other month back to this value IN CODE, so October is protected even
 /// if the scheduled 1-Oct revert of the terraform value is late or never lands.
 pub const STANDING_BUDGET_KILL_USD: f64 = 150.0;
@@ -740,7 +744,8 @@ pub async fn run_guard<E: Ec2Api, N: SnsApi, V: EventsApi, C: CeApi, P: SsmApi>(
         //
         // 2026-09-23 (operator Quote 23): every kill decision, ping and
         // breach message below uses the EFFECTIVE line for this UTC billing
-        // month — $225 in September 2026 only, $150 otherwise. Shadowing
+        // month: $150 since the 2026-10-01 revert (it was $225 in September
+        // 2026 only). Shadowing
         // `env` makes it impossible for one branch to read the raw value.
         let effective_env = GuardEnv {
             budget_kill_usd: effective_budget_kill_usd(
