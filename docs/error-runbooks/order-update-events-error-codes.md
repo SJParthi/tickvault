@@ -215,6 +215,18 @@ key names do not match deserializes into a full struct of defaults and
 returns success. There is no parse error to catch: the decode genuinely
 succeeded and produced nothing.
 
+**Second trigger, `stage = "typed_parse_failed"` (added 2026-10-01, R4).**
+The frame carries the documented order envelope (the `"order_alert"` tag, or
+a `"Data"` key whose value is an object) but `parse_order_update` REFUSED it,
+for example because a field changed type. This order event is **DROPPED**,
+not captured hollow: it never reaches the order book. It is counted on
+`tv_order_update_frames_dropped_total{reason="unparseable_order"}`, and the
+line carries the serde error's line and column (never its message, which can
+quote a field value) plus the same redacted excerpt. Logged at powers of two.
+Before this stage existed such a frame was filed as a non-order message at
+debug level. Triage is the same as below: compare the excerpt with
+`OrderUpdate` and fix the struct.
+
 **The incident that created this code (2026-08-25).** The operator placed a
 manual super intraday order and asked why it was in no table. Two distinct
 faults were stacked:

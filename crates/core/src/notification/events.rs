@@ -1704,7 +1704,9 @@ impl NotificationEvent {
             }
             Self::TokenRenewed => "<b>Token renewed</b>".to_string(),
             Self::TokenRenewalFailed { attempts, reason } => {
-                // 2026-07-14 Dhan noise lock reword: broker + consequence.
+                // 2026-07-14 Dhan noise lock reword: broker + consequence. The
+                // consequence was reworded 2026-10-01: the per-minute pulls it named
+                // were removed 2026-09-16; a dead token now stops the live sockets.
                 format!(
                     "🆘 <b>Dhan login renewal FAILED</b> (attempt {attempts})\n\
                      If this keeps failing, the Dhan live price feed stops when the current login expires.\n\
