@@ -228,6 +228,7 @@ pub mod questdb_health;
 pub mod seal_absorption;
 pub mod seal_dlq;
 pub mod seal_spill;
+pub(crate) mod seal_spill_ledger;
 pub mod seal_writer_loop;
 pub mod seal_writer_runner;
 pub mod seal_writer_task;
