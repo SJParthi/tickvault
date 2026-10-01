@@ -228,24 +228,37 @@ jobs:
   # BUILD every week from 2026-08-31 to 2026-09-28. The nightly pin was not
   # the cause: the linker died with "signal 7 [Bus error]" inside rust-lld,
   # which is what an mmap'd output file does when the disk fills, and the
-  # TSan runner died mid-build with its log lost. Reproduced locally on the
-  # 2026-09-30 main: the ASan `--no-run` build with full debug info filled
-  # 20.9 GB of target dir and stopped with "No space left on device" before
-  # it finished. The workspace grew past what a stock ubuntu-latest runner
-  # has free. Two mitigations, the same in the TSan job:
+  # TSan runner died mid-build with its log lost. Measured locally on the
+  # 2026-09-30 main (nightly-2026-05-19, same command as the build step):
+  #   - as it was: ran out of disk and did not finish;
+  #   - line-tables-only everywhere: still unfinished at 27 GB, with the
+  #     same "ld terminated with signal 7 [Bus error]" as CI;
+  #   - line-tables-only for workspace crates, no debug info for
+  #     dependencies and std: finished, 17 GB, 384 test executables.
+  # The per-crate test loop then rebuilt ~70 dependency crates PER PACKAGE
+  # (`cargo test -p X` unifies features for X alone, so hashes differ from
+  # the workspace build): +6 GB for just common and app. Workspace feature
+  # unification makes every `-p X` reuse the build step's artifacts
+  # (measured: 0 crates recompiled for api, storage, app --bins).
+  # So, the same in the TSan job:
   #   1. Free the ~25-30 GB of preinstalled toolchains this job never uses
   #      (same recipe as ci.yml's Coverage & Perf job).
-  #   2. Line tables only for debug info. Sanitizer instrumentation is
-  #      unchanged and reports still symbolize to function + file:line;
-  #      only variable-level debug info (debugger use) is dropped. Set at
-  #      JOB level so the build and test steps share one artifact set.
-  # The "Report runner disk (issue 1836)" step prints df after the build either way, so
-  # a future squeeze shows up as a number instead of a linker crash.
+  #   2. Debug info: line tables for our crates, none for dependencies
+  #      (the `--config` on each cargo call). Instrumentation is unchanged.
+  #      A probe heap overflow still reported `src/lib.rs:1:45` and the
+  #      test's `tests/oob.rs:4:13`; frames inside dependencies keep their
+  #      function names and lose file:line.
+  #   3. Workspace feature unification (nightly-only, job env), so the
+  #      test loop links nothing new.
+  # The "Report runner disk (issue 1836)" step prints df after the build
+  # either way, so a future squeeze shows up as a number, not a linker crash.
   sanitizer-asan:
     name: "AddressSanitizer"
     runs-on: ubuntu-latest
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_UNSTABLE_FEATURE_UNIFICATION: "true"
+      CARGO_RESOLVER_FEATURE_UNIFICATION: workspace
     steps:
       - name: Free runner disk space (see the job comment above)
         shell: bash
@@ -283,6 +296,7 @@ jobs:
           RUSTFLAGS: "-Z sanitizer=address"
         run: |
           cargo +${{ env.NIGHTLY_VERSION }} test --workspace \
+            --config 'profile.dev.package."*".debug=false' \
             --target x86_64-unknown-linux-gnu \
             -Z build-std \
             --lib --tests \
@@ -376,6 +390,7 @@ jobs:
           for p in $crates; do
             echo "::group::ASan: ${p}"
             if cargo +${{ env.NIGHTLY_VERSION }} test -p "$p" \
+              --config 'profile.dev.package."*".debug=false' \
               --target x86_64-unknown-linux-gnu \
               -Z build-std \
               --lib --tests $(extra_args "$p") --no-fail-fast \
@@ -516,13 +531,17 @@ jobs:
             });
 
   # ---- ThreadSanitizer: Data races ----
-  # Runner disk: same two mitigations as the ASan job, for the same reason
-  # (#1836). See the comment above `sanitizer-asan`.
+  # Runner disk: same three mitigations as the ASan job, for the same reason
+  # (#1836). See the comment above `sanitizer-asan`. The sizes there were
+  # measured on the ASan build; this job builds the same test set with
+  # different instrumentation.
   sanitizer-tsan:
     name: "ThreadSanitizer"
     runs-on: ubuntu-latest
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_UNSTABLE_FEATURE_UNIFICATION: "true"
+      CARGO_RESOLVER_FEATURE_UNIFICATION: workspace
     steps:
       - name: Free runner disk space (see the ASan job comment)
         shell: bash
@@ -560,6 +579,7 @@ jobs:
           RUSTFLAGS: "-Z sanitizer=thread"
         run: |
           cargo +${{ env.NIGHTLY_VERSION }} test --workspace \
+            --config 'profile.dev.package."*".debug=false' \
             --target x86_64-unknown-linux-gnu \
             -Z build-std \
             --lib --tests \
@@ -654,6 +674,7 @@ jobs:
           for p in $crates; do
             echo "::group::TSan: ${p}"
             if cargo +${{ env.NIGHTLY_VERSION }} test -p "$p" \
+              --config 'profile.dev.package."*".debug=false' \
               --target x86_64-unknown-linux-gnu \
               -Z build-std \
               --lib --tests $(extra_args "$p") --no-fail-fast \
