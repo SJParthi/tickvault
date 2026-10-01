@@ -1126,10 +1126,21 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // alarmed as a ratio). Authorized by dhan-rest-only-noise-lock-2026-07-14.md
     // §2.6. +$0.90/mo names + 3 alarms $0.30 + metric-math ~$0.10 = ~$1.30/mo; aws-budget.md
     // "COST NOTE 2026-09-25" records that §2.3n's lever rule is NOT met.
+    //
+    // 2026-10-01: 102 -> 103, tv_order_audit_chain_lost_total (audit PR42a)
+    // -- ONE counter, labelled by source, for three SEBI-row losses that
+    // reached no alarm: pnl_audit and order_leg_pnl rows discarded, and
+    // order-push updates a lagging consumer skipped. One name, not three, on
+    // purpose: the agent folds the label, so the alarm needs only the sum and
+    // the coded log line names the source. Summed into
+    // tv-<env>-order-audit-chain-loss. +$0.30/mo, aws-budget.md
+    // "COST NOTE 2026-10-01".
     assert_eq!(
         names.len(),
-        102,
-        "Z+ L2 VERIFY ratchet: expected exactly 102 names in the MAIN EMF \
+        103,
+        "Z+ L2 VERIFY ratchet: expected exactly 103 names in the MAIN EMF \
+         (2026-10-01: 102 -> 103, tv_order_audit_chain_lost_total, see aws-budget.md \
+         COST NOTE 2026-10-01.) \
          (2026-09-25: 99 -> 102, the three §2.6 alarm inputs, see aws-budget.md \
          COST NOTE 2026-09-25.) \
          (2026-09-24: 98 -> 99, tv_dhan_ws_lag_max_ms, see aws-budget.md \
