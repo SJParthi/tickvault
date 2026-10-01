@@ -3247,6 +3247,9 @@ impl TickWriterSink {
         let wm = crate::wal_applied_watermark::applied_watermark();
         wm.note_ticks_completed();
         wm.persist_if_due_now();
+        // Item 45a: ticks are never shed, so this writer keeps the shed-depth
+        // marks persisted even while every depth write is shed.
+        crate::wal_deferred_depth::deferred_depth().persist_if_due_now();
         self.return_spare_buffer(batch);
         landed
     }

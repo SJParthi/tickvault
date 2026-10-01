@@ -24,6 +24,7 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 
 use tickvault_common::feed::Feed;
 use tickvault_common::tick_types::ParsedTick;
+use tickvault_trading::candles::TfIndex;
 use tickvault_trading::candles::aggregator_cell::FeedStrategy;
 use tickvault_trading::candles::multi_tf_aggregator::MultiTfAggregator;
 
@@ -68,19 +69,39 @@ fn tick_at(ts: u32, price: f32, volume: u32) -> ParsedTick {
 fn dhat_consume_tick_zero_alloc_in_bucket_and_across_boundaries() {
     let _profiler = dhat::Profiler::builder().testing().build();
 
-    let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, 8);
-
     // Pre-warm OUTSIDE the measured region: the first tick for an instrument
     // legitimately allocates its slot (one hash entry + one dense-vec push).
     // Steady state is what the hot-path claim is about.
+    //
+    // One aggregator PER ATTEMPT (plan ITEM 47, 2026-09-29): the helper
+    // re-runs this workload when an attempt measures a cross-thread phantom,
+    // and on the same aggregator every re-run tick is hours behind the clock
+    // phase (d) leaves at ~15:25, so nothing seals and the vacuity asserts
+    // fail — the retry that exists to absorb the phantom could never pass
+    // (seen on CI: attempt 1 measured 900 B / 4 blocks, attempt 2 panicked).
+    // Each attempt now starts from the same warmed state.
     let warm = tick_at(OPEN, 24_000.0, 10);
-    agg.consume_tick(Feed::Dhan, &warm, None, |_, _, _, _, _| {});
+    let mut aggs: [MultiTfAggregator; 3] = std::array::from_fn(|_| {
+        let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, 8);
+        agg.consume_tick(Feed::Dhan, &warm, None, |_, _, _, _, _| {});
+        agg
+    });
+    let mut attempt = 0usize;
 
+    // Phase (d) counts across every attempt (kept from before the per-attempt
+    // aggregators; harmless, and the asserts below read the totals).
+    let mut replay_suppressed = 0u32;
+    let mut replay_live_sealed = 0usize;
+    let mut live_withheld = 0u32;
+    let mut day_close_sealed = 0usize;
+    let mut wrap_minute_volume = 0u64;
     let (_, allocs) = dhat_support::measure_with_phantom_retry(
         0,
         0,
         || {},
         || {
+            let agg = &mut aggs[attempt.min(2)];
+            attempt += 1;
             // (a) 10,000 IN-BUCKET folds — the common case, all 21 timeframes
             // per tick, no boundary crossed.
             for i in 0..10_000u32 {
@@ -133,7 +154,86 @@ fn dhat_consume_tick_zero_alloc_in_bucket_and_across_boundaries() {
                  phase (c) measures the ordinary fold and passes vacuously; \
                  got {repeats} of 10,000"
             );
+
+            // (d) WAL-REPLAY GAPS, added 2026-09-29 with plan ITEM 47 after
+            // review found these branches ran under no allocation gate: the
+            // lazy gap sync, the post-gap cell re-base, both suppression arms,
+            // the seal-sweep sync, and the one-off hand-over to live mode.
+            agg.set_replay_mode(true);
+            let mut cum = 300_000u32;
+            for gap in 0..200u32 {
+                agg.mark_replay_gap();
+                for step in 0..3u32 {
+                    cum += 5;
+                    let t = tick_at(
+                        OPEN + 2 * 3_600 + gap * 61 + step * 20,
+                        24_000.0 + (step as f32) * 0.05,
+                        cum,
+                    );
+                    replay_suppressed += u32::from(
+                        agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {})
+                            .replay_partial_suppressed,
+                    );
+                }
+            }
+            agg.catch_up_seal_all(OPEN + 6 * 3_600, |_, _, _, _, _| {});
+            // A MID-SESSION capture start (review round 24, auditor D): the
+            // live post-restart paths (the provisional capture start and its
+            // confirmation, the hand-over wait, the untrusted-price rule, the
+            // per-instrument capture start) only run after one is set, and
+            // phase (d) never set one, so they ran under no allocation gate.
+            agg.set_live_capture_start(OPEN + 6 * 3_600);
+            agg.finish_replay(false, |_, _, _, _, _| {});
+            // Live ticks from 15:16: the replay above ran to ~14:38, and an
+            // earlier live tick would be late and discarded, sealing nothing.
+            for minute in 1..=10u32 {
+                cum += 7;
+                let t = tick_at(OPEN + 6 * 3_600 + minute * 60, 24_010.0, cum);
+                let stats = agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, _, _| {
+                    replay_live_sealed += 1;
+                });
+                live_withheld += u32::from(stats.replay_partial_suppressed);
+            }
+            // (e) The day-close seal, then a u32 wrap of the cumulative on
+            // the next day (review round 24): the wrap now counts forward
+            // instead of re-basing, on the same no-allocation terms.
+            agg.force_seal_all(|_, _, _, _, _| {
+                day_close_sealed += 1;
+            });
+            let next_day = OPEN + 86_400;
+            for (step, volume) in [u32::MAX - 20, u32::MAX - 5, 4, 30].into_iter().enumerate() {
+                let step = u32::try_from(step).unwrap_or(0);
+                let t = tick_at(next_day + step * 61, 24_020.0 + step as f32, volume);
+                agg.consume_tick(Feed::Dhan, &t, None, |_, _, _, tf, st| {
+                    // The minute holding the wrap (step 2): 5 + 1 + 4 units.
+                    if tf == TfIndex::M1 && st.bucket_start_ist_secs == next_day + 120 {
+                        wrap_minute_volume = st.volume;
+                    }
+                });
+            }
         },
+    );
+
+    assert_eq!(
+        wrap_minute_volume, 10,
+        "phase (e): the minute holding the u32 wrap counts it forward exactly"
+    );
+
+    assert!(
+        live_withheld > 0,
+        "phase (d) must withhold a live bar that began before the mid-session \
+         capture start, or it never reached the post-restart rules"
+    );
+    assert!(day_close_sealed > 0, "phase (e) must seal at the day close");
+
+    assert!(
+        replay_suppressed > 0,
+        "phase (d) must reach the replay suppression arm, or it measures \
+         nothing and passes vacuously"
+    );
+    assert!(
+        replay_live_sealed > 0,
+        "phase (d) must seal live bars after the hand-over"
     );
 
     assert_eq!(

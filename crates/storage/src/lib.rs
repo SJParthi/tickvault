@@ -274,6 +274,9 @@ pub mod ws_frame_spill;
 // Applied-watermark for the frame WAL (2026-09-05): a restart must never replay
 // frames whose rows already reached the database. Sibling of `ws_frame_spill`.
 pub mod wal_applied_watermark;
+// Deferred-depth marks (2026-09-29, plan item 45a): frames whose depth rows the
+// ingest shed skipped are kept from the WAL prunes until written back.
+pub mod wal_deferred_depth;
 
 // Stage-2 dead-WS sweep (2026-07-17): the `tick_persistence_testing` shim and
 // `spill_dir_test_lock` (both consumed only by the deleted tick benches/DHAT

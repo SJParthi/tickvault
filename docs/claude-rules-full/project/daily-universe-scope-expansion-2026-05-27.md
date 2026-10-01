@@ -2603,3 +2603,51 @@ $88.92/mo (rate-derived; 45% of the entire six-day bill) is the driver
 and the Elastic IP at $3.60/mo is not**, is in
 below are retained verbatim per house convention; where they conflict with this
 banner, the banner wins.
+
+---
+
+#### Quote 27 + 28 (2026-09-29) — NOTHING IS EVER MISSED OR DELETED (preserve EXACTLY, typos included)
+
+**Quote 27 (2026-09-29, after the morning's replay flood and the data-loss inventory):**
+> "what the fuck nothign shdou lneevr ever be missed or removed or deleted see clealry ntoe bro i always need all the data and all the ticks dude okay? neevr ever anythign shodul be fucking missed dude okay?"
+
+**Quote 28 (2026-09-29, same session, approving the seven-step zero-loss plan — raw capture to S3, keep-don't-skip under database lag, replay brake, error-log fix, save the never-saved packets, no S3 expiry plus versioning, one row per book side):**
+> "yes approve all steps, go ahead and check the server"
+
+Recorded HERE before any code, per the rule-file-first law. The plan is
+`active-plan-feed-hardening.md` ITEM 45.
+
+##### What this authorizes
+
+| Surface | Disposition |
+|---|---|
+| Raw capture-at-receipt WAL segments | **Uploaded to `s3://tv-prod-cold/raw-frames/` (compressed, checksum-verified) BEFORE any local prune may delete them.** A segment with no verified S3 copy is never deleted by the age pass or the byte pass. |
+| S3 lifecycle on `tv-prod-cold` | The 1825-day **expiration is REMOVED**. Objects move to cheaper tiers (Glacier Instant Retrieval, then Deep Archive) but are never expired. **Versioning is ENABLED**, so an overwrite or delete leaves the prior version. |
+| Unreplayed candle spill, tick-spill quarantine, boot-time table drops (fresh-start reset, retired-table sweeps) | No delete without a verified S3 copy first. |
+| Cost | New S3 storage for raw frames, MEASURED input 2026-09-29 on the box: 25.0 GB raw per session (2026-09-28), gzip-1 ratio 0.46 → ~11.5 GB/session, ~250 GB/month. Estimated **+$6–12/month** in year one with tiering (Assumed until one month is billed). Recorded in `aws-budget.md`. |
+
+##### What this does NOT change
+
+| Surface | Why |
+|---|---|
+| SEBI and audit tables | Already never-delete (§5/§6/§25). Unchanged. |
+| The daily QuestDB partition archive | Already archive → verify → drop. Unchanged, except its S3 copies no longer expire. |
+| Instance type, EBS size, budget ceiling | Unchanged. If the S3 line pushes the forecast over $150 in October, that is a separate dated quote. |
+
+##### What this retires
+
+Quotes 21, 22, 24, 25 and 26 authorized one-off deletions of market data and S3
+objects. **They are spent and authorize nothing further.** From 2026-09-29 any
+deletion of captured market data — on the box, in QuestDB or in S3 — needs a
+fresh dated quote that names the data and states that it will be lost, recorded
+here first.
+
+##### What a PR or action that violates Quote 27/28 looks like (REJECT)
+
+- Deletes a raw WAL segment that has no verified S3 copy, by any prune path.
+- Re-adds an `expiration` to the `tv-prod-cold` lifecycle, suspends versioning,
+  or adds a `noncurrent_version_expiration`.
+- Drops, truncates or prunes market data (ticks, depth, candles, top_volume,
+  spill, quarantine) without a verified copy, including at boot.
+- Runs a wipe or nuke of market data under cover of Quotes 21–26.
+- Presents the raw-archive cost as measured before a month has been billed.
