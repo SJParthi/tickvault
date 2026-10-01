@@ -267,6 +267,15 @@ impl SealAbsorptionPipeline {
         self.escalate_evicted(seal, now_unix_secs)
     }
 
+    /// Audit PR41a: after a live flush committed `committed`, append to the
+    /// spill the fuller copy of any bucket the spill holds an older copy of,
+    /// so a later replay ends on it. See
+    /// [`SealSpillWriter::note_live_commits`]. Returns how many copies were
+    /// appended.
+    pub fn note_live_commits(&self, committed: &[BufferedSeal], now_unix_secs: i64) -> usize {
+        self.spill.note_live_commits(committed, now_unix_secs)
+    }
+
     /// Is there room on the volume to escalate at all?
     ///
     /// THROTTLED: `spill_free_bytes` forks `df`, and this is reachable from

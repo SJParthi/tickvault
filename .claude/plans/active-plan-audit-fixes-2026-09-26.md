@@ -1276,19 +1276,54 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
   - PR15's tests do not prove batching, the pause or the real replay
     (seal_writer_runner.rs:1811-1846; seal_writer_task.rs:2560-2598): assert write counts, test
     replay under a no-op pause, and add an outage-and-recovery chaos test.
-- [ ] **PR41 — a replayed candle never replaces a fuller one, and one stuck spill file never
-  holds the rest.** (`storage`, `trading`)
-  - A replayed seal overwrites a newer corrected candle (a late trade re-folded a sealed bar),
-    uncounted (seal_writer_task.rs:903-917, :1127-1175; aggregator_cell.rs:261-268). PR31 states
-    the never-replace rule for restarts only, and PR31a did not change this path: the honest-limits
-    comment on the current checkout (95cf140, after #1962) still says "Last write wins"
-    (seal_writer_task.rs:986-989). Skip or version a replayed seal older than the stored row, and
-    count it, in both the mid-session replay and the boot drain. The check is shared with PR31b's
-    "never let it replace a row with more volume".
+- PR41 — a replayed candle never replaces a fuller one, and one stuck spill file never holds the
+  rest. (`storage`, `trading`) Split 2026-10-01 into PR41a (the never-replace rule and the file
+  order) and PR41b (the stuck file, the suspect table, the replay gate and the record checksum).
+- [x] **PR41a — a replayed candle never replaces a fuller one.** (`storage`)
+  - A replayed seal overwrote a newer corrected candle (a late trade re-folded a sealed bar),
+    uncounted (seal_writer_task.rs:903-917, :1127-1175; aggregator_cell.rs:261-268). The honest
+    limit said "Last write wins" (seal_writer_task.rs:986-989).
+  - Verified before the change: only the most recently sealed bucket of a timeframe can be amended
+    (`aggregator_cell.rs`, both `AmendedLate` arms compare against `last_sealed[ord]`), and every
+    later copy of a bar has more ticks (`fold_late_hlc` adds one) or more volume (the day-close
+    carry). So "fuller" is `(tick_count, volume)` in that order, and one entry per slot and
+    timeframe is enough.
+  - Done 2026-10-01: `seal_spill_ledger.rs`. The spill writer keeps, under its append lock, the
+    newest spilled bucket of every `(security_id, segment, feed, timeframe)` and that copy's
+    fullness; capacity `SEAL_SPILL_LEDGER_CAPACITY` = `SEAL_BUFFER_CAPACITY`, allocated once,
+    never grown, O(1) per operation. (1) After every clean live flush, `drain_once` calls
+    `SealAbsorptionPipeline::note_live_commits`: a committed copy fuller than the spilled one is
+    appended to the spill behind it, so every replay ends on it (one atomic load when nothing was
+    spilled this process). (2) A spill append of a copy less full than the one held is not
+    written. (3) The mid-session replay drops a record the spill holds a fuller copy of
+    (`SealSpillWriter::replay_is_superseded`). (4) The boot drain never writes a copy less full
+    than one it already wrote in that drain (`BootDrainOutcome::seals_superseded`), which covers a
+    dead-letter file holding an older copy than a spill file read before it.
+  - Done 2026-10-01: staged files replay oldest write first, name second (`sort_by_write_time`),
+    in both the boot drain and the mid-session replay. Name order put a day file before the file
+    set aside from the same day (`<name>.<n>`), although the set-aside part was written first.
+  - Counted: `tv_seal_spill_superseded_total{kind="mirrored"|"older_not_written"|
+    "replay_older_skipped"|"mirror_failed"|"untracked"}` and
+    `tv_seal_writer_drain_total{kind="boot_superseded"}`. A failed mirror append is a coded
+    `error!` (AGGREGATOR-SEAL-01).
+  - Honest limits: a crash between a live flush and its mirror append (one drain cycle), or a
+    failed mirror append, still lets the next replay write the older copy over the stored row.
+    The boot drain does not read the stored row to compare (a database read per recovered seal).
+    PR31b's restart rebuild shares the rule but not this mechanism.
+  - Tests: `seal_spill_ledger::tests::*` (6),
+    `pr41a_an_amended_copy_committed_live_is_appended_behind_its_spilled_original`,
+    `pr41a_an_older_copy_is_not_appended_after_the_fuller_one`,
+    `test_pr41a_replay_is_superseded_when_the_spill_holds_a_fuller_copy`,
+    `test_pr41a_note_live_commits_does_nothing_while_the_spill_has_held_nothing`,
+    `pr41a_a_failed_mirror_append_is_counted_and_reported_as_nothing_appended`,
+    `pr41a_mid_session_replay_writes_only_the_fuller_copy`,
+    `pr41a_boot_drain_never_writes_an_older_copy_after_a_fuller_one`,
+    `pr41a_boot_drain_writes_both_copies_when_the_older_comes_first`,
+    `pr41a_staged_files_replay_oldest_write_first`.
+- [ ] **PR41b — one stuck spill file never holds the rest.** (`storage`)
   - A candle the replay cannot flush is skipped and later files wait
     (seal_writer_task.rs:1209-1262): tell a flapping database from a bad record before skipping,
     and move past a stuck file.
-  - Staged spill files replay in name order (seal_writer_task.rs:476, :1109): sort by write time.
   - The replay trusts acknowledgements while the table is suspect (seal_writer_task.rs:1026-1040):
     keep the file until the table is healthy.
   - The replay gate opens only on live traffic, so a spill made after the last live write waits
@@ -1296,6 +1331,7 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
   - The candle spill has no record checksum (row 136, seal_spill.rs:832-841, :907-916): cut back a
     torn single-record write the way the batch does, check alignment before a batch, add a
     checksum.
+  - Row 36 (c6#36): replay the dead-letter file mid-session, or record boot-only replay.
 - [ ] **PR42 — order and P&L audit rows survive a database outage.** (`storage`, `app`, deploy)
   - Order and P&L audit rows are thrown away while the database is down
     (order_audit_persistence.rs:478-521; pnl_audit_persistence.rs:488;
@@ -1846,7 +1882,7 @@ Rows folded into existing items (the fix is named here so the item carries it):
 - PR10: row 113 (c6#110, also the depth writer's ~10 name checks per row).
 - PR43: row 127 (c6#123, also count and page the spots cut at the 250 cap).
 - PR42: row 188 (c6#169, also the order-update and position-update event writers).
-- PR41: row 36 (c6#36, replay the dead-letter file mid-session, or record boot-only replay
+- PR41b: row 36 (c6#36, replay the dead-letter file mid-session, or record boot-only replay
   below).
 - PR7: rows 115 (c6#112, measure contention on the shared capture counter) and 267 (c6#236,
   time a full 250,000-record shutdown drain on the production volume).
