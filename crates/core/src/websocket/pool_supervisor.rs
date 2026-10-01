@@ -4939,7 +4939,8 @@ where
                             poll_ms = DIAL_PERMIT_POLL_MS,
                             "RESILIENCE-01: dial refused — this process no longer holds the \
                              dual-instance lock; live sockets are untouched, this socket \
-                             is not re-dialled until the lock is held again"
+                             is not re-dialled by this process (it never retakes a lost lock; \
+                             restart it to recover)"
                         );
                     }
                     tokio::time::sleep(Duration::from_millis(DIAL_PERMIT_POLL_MS)).await;

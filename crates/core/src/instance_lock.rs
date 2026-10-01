@@ -589,6 +589,21 @@ async fn try_acquire_lock_at_path(
             }
             Ok(outcome)
         }
+        Ok((existing, LockFreshness::Fresh { .. })) if existing.host_id == host_id => {
+            // OUR OWN value (R7 review, 2026-10-01): a host id carries this
+            // process's pid and boot random, so only this process wrote it,
+            // on an earlier attempt whose takeover could not be verified.
+            // Reading it as a live peer would spend the boot loop's patience
+            // and page a dual instance against ourselves. Re-write and
+            // re-verify it exactly like a takeover.
+            info!(
+                target: "tickvault::instance_lock",
+                path = %path,
+                host_id = %host_id,
+                "instance lock holds this process's own earlier write — re-verifying"
+            );
+            write_and_verify(ssm, path, &payload, host_id, read_v, read_at, settle).await
+        }
         Ok((existing, LockFreshness::Fresh { .. })) => Ok(AcquireOutcome::AlreadyHeld {
             holder: existing.host_id,
         }),
@@ -807,9 +822,15 @@ async fn write_and_verify(
                  read-back versions do not prove ownership) — failing closed, not \
                  holding the lock"
             );
-            Ok(AcquireOutcome::AlreadyHeld {
-                holder: "(takeover unverified)".to_string(),
-            })
+            // An Err, not AlreadyHeld (R7 review, 2026-10-01): the boot loop's
+            // AlreadyHeld arm spends its bounded patience and pages
+            // DualInstanceDetected, which an unverifiable read is not. The
+            // transport-retry arm re-runs the acquire, and the own-write arm
+            // re-verifies the value this attempt may have left stored.
+            Err(anyhow!(
+                "stale takeover unverified for path={path} (read_v={read_v} \
+                 put_v={put_v}); not holding the lock, retrying"
+            ))
         }
     }
 }
@@ -2157,6 +2178,34 @@ mod tests {
             get_v(&stale, 3),
         ])
         .await;
+        let err = try_acquire_lock_at_path(
+            &stub_ssm_client(&url),
+            &compute_instance_lock_path("testenv"),
+            "host-a",
+            Duration::ZERO,
+        )
+        .await
+        .expect_err("an unverified takeover is a transient Err, never held or a peer");
+        assert!(
+            format!("{err:#}").contains("takeover unverified"),
+            "error must say the takeover is unverified: {err:#}"
+        );
+    }
+
+    /// R7 review (2026-10-01): an earlier attempt of THIS process left its
+    /// own value stored (an unverified takeover). The next attempt must not
+    /// read it as a live peer — that spends the boot loop's patience and
+    /// pages a dual instance against ourselves. It re-verifies instead.
+    #[tokio::test]
+    async fn test_own_fresh_value_is_reverified_not_read_as_a_peer() {
+        let ours = lock_json("host-a", now_unix_secs());
+        let (url, _stub) = start_ssm_stub(vec![
+            parameter_already_exists_response(),
+            get_v(&ours, 4),
+            put_ok_v(5),
+            get_v(&ours, 5),
+        ])
+        .await;
         let outcome = try_acquire_lock_at_path(
             &stub_ssm_client(&url),
             &compute_instance_lock_path("testenv"),
@@ -2164,11 +2213,34 @@ mod tests {
             Duration::ZERO,
         )
         .await
-        .expect("unverified takeover fails closed, not Err");
+        .expect("own value re-verifies");
+        assert_eq!(outcome, AcquireOutcome::Acquired);
+    }
+
+    /// The same own-value arm still refuses when a peer wrote after us.
+    #[tokio::test]
+    async fn test_own_fresh_value_lost_to_a_later_peer_write_is_already_held() {
+        let ours = lock_json("host-a", now_unix_secs());
+        let peer = lock_json("peer", now_unix_secs());
+        let (url, _stub) = start_ssm_stub(vec![
+            parameter_already_exists_response(),
+            get_v(&ours, 4),
+            put_ok_v(5),
+            get_v(&peer, 6),
+        ])
+        .await;
+        let outcome = try_acquire_lock_at_path(
+            &stub_ssm_client(&url),
+            &compute_instance_lock_path("testenv"),
+            "host-a",
+            Duration::ZERO,
+        )
+        .await
+        .expect("lost is an outcome");
         assert_eq!(
             outcome,
             AcquireOutcome::AlreadyHeld {
-                holder: "(takeover unverified)".to_string()
+                holder: "peer".to_string()
             }
         );
     }
