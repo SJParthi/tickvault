@@ -237,7 +237,7 @@ pub enum NotificationEvent {
     /// Dhan noise lock — the ONE Dhan token condition that pages).
     /// Emitters: the boot-time auth failure AND the mid-session
     /// watchdog's TERMINAL forced-re-mint failure. Body names the broker
-    /// + the consequence (the spot-1m / option-chain pulls stop).
+    /// + the consequence (the live price feed cannot connect or reconnect).
     AuthenticationFailed { reason: String },
 
     /// Dhan authentication attempt failed transiently (network blip, DNS
@@ -1679,7 +1679,7 @@ impl NotificationEvent {
                 // token condition that still pages).
                 format!(
                     "🆘 <b>Dhan login could not be obtained</b>\n\
-                     The Dhan spot-1m and option-chain pulls will stop until this is fixed.\n\
+                     The Dhan live price feed cannot connect or reconnect until this is fixed.\n\
                      {}",
                     html_escape(&redact_url_params(reason))
                 )
@@ -1707,7 +1707,7 @@ impl NotificationEvent {
                 // 2026-07-14 Dhan noise lock reword: broker + consequence.
                 format!(
                     "🆘 <b>Dhan login renewal FAILED</b> (attempt {attempts})\n\
-                     If this keeps failing the Dhan spot-1m and option-chain pulls will stop.\n\
+                     If this keeps failing, the Dhan live price feed stops when the current login expires.\n\
                      {}",
                     html_escape(&redact_url_params(reason))
                 )
@@ -3867,7 +3867,7 @@ mod tests {
             "got: {msg}"
         );
         assert!(
-            msg.contains("spot-1m and option-chain pulls will stop"),
+            msg.contains("live price feed cannot connect or reconnect"),
             "consequence line missing: {msg}"
         );
     }
@@ -3912,6 +3912,32 @@ mod tests {
         let msg = event.to_message();
         assert!(msg.contains("3"));
         assert!(msg.contains("timeout"));
+    }
+
+    #[test]
+    fn test_regression_login_alerts_never_name_the_removed_minute_pulls() {
+        // 2026-10-01 (noise lock §2.4 follow-up): the per-minute spot-1m and
+        // option-chain pulls were removed on 2026-09-16, so a body that says
+        // they "will stop" understates the outage. The consequence is the
+        // live feed.
+        let failed = NotificationEvent::AuthenticationFailed {
+            reason: "Invalid Pin".to_string(),
+        }
+        .to_message();
+        let renewal = NotificationEvent::TokenRenewalFailed {
+            attempts: 2,
+            reason: "timeout".to_string(),
+        }
+        .to_message();
+        for msg in [&failed, &renewal] {
+            assert!(msg.contains("Dhan"), "broker must stay named: {msg}");
+            assert!(
+                msg.contains("live price feed"),
+                "consequence missing: {msg}"
+            );
+            assert!(!msg.contains("spot-1m"), "names a removed leg: {msg}");
+            assert!(!msg.contains("option-chain"), "names a removed leg: {msg}");
+        }
     }
 
     #[test]
