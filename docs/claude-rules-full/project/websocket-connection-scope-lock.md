@@ -8336,3 +8336,93 @@ QuestDB before any socket dialled.
   changes an existing candle, or writes a row without `feed`.
 - Switches `market_depth` to array rows before the scratch-table test is
   recorded, or drops any level, side or packet in the conversion.
+
+### 2026-10-01 — UNSUBSCRIBE AND SUBSCRIBE, NOT DISCONNECT AND RECONNECT: depth-200 changes contract in place, and a ghost is answered with a fresh unsubscribe
+
+**The verbatim operator demand (2026-10-01, typed directly in the project thread —
+preserve EXACTLY, typos included):**
+
+> "dude never ever use any groww or groww related items dude meamhwile make october as 150 usd dude meanwhile now isntead of disconenct reocnenct follow the unsubscribe and siubscribe apporach ddue okay? see i neve rver want to have nay ticks loss zerot icks loss and zerod ata msisign dude okay?"
+
+Recorded HERE before any code, per the rule-file-first law. (The Groww and
+budget halves of the same message are handled elsewhere: Groww stays removed per
+the 2026-08-21 section, and the October budget is Quote 23 in
+`daily-universe-scope-expansion-2026-05-27.md`.)
+
+#### Why the 2026-09-24 reason no longer holds
+
+The 2026-09-24 section chose rotate-by-reconnect "because till now dhan ahsnt
+confirmed about unsunscirbe". Dhan has now confirmed it: their 2026-09-30 reply
+(`docs/dhan-support/2026-09-13-depth-unsubscribe-ignored.md`, transcribed
+verbatim) states that RequestCode **25** with the same instrument details used
+in the subscribe unsubscribes one instrument, and that RequestCode 12 closes the
+whole connection. Our 200-level unsubscribe is the flat form with 25, the same
+details as its flat subscribe with 23.
+
+#### Every deliberate close-and-redial in the tree (audited 2026-10-01)
+
+| Path | Sockets | Was | Now |
+|---|---|---|---|
+| Depth-200 ranked rotation (`LiveSubscriptionCommand::RotateByRedial`) | depth-200 | close the socket, redial with the new contract | **REMOVED.** The steering loop sends `LiveSubscriptionCommand::Swap`: code 25 for the old contract, then code 23 for the new one, on the live socket. No dial. |
+| Ghost remedy (`request_ghost_redial` → `ReconnectReason::GhostInstrument`) | depth-20, depth-200 | close the socket and replay its set | **REPLACED.** The drain asks the socket to send code 25 again for the named ghost contract (`request_ghost_unsubscribe`). Same per-socket cooldown, pool spacing and session ceiling. No dial. |
+| Unsubscribe probe Arm B (`ReconnectReason::ProbeClose`) | depth-200 | operator-armed diagnostic | **Unchanged and OFF** (`[depth_unsubscribe_probe]` all false in `config/base.toml`). It is a measurement that only runs when the operator arms it on the box. |
+| Main feed, order update | — | no deliberate redial exists | unchanged: the main feed only ever `Extend`s in place |
+
+#### What still reconnects, and must
+
+A socket that is actually broken cannot be fixed by a frame on it: dial failure,
+subscribe failure, a vendor close, an 807 token rejection, the idle and
+frame-silence watchdogs, a subscribe that emptied a socket, and a process
+restart. Each replays the socket's full retained set.
+
+**Honest envelope for those — nothing here claims a reconnect is lossless.**
+Dhan's feed carries no sequence number and does not resend, so a price printed
+while a socket is down never reaches us. What is guaranteed instead:
+
+| Layer | What it does |
+|---|---|
+| Capture-at-receipt WAL | every frame that DID arrive is on disk before it is parsed, and is re-folded after a crash |
+| Cumulative volume | the first tick after a gap carries the whole gap's traded volume, so candle volume is recovered |
+| Replay-gap taint | after a restart, a candle whose bucket overlapped the downtime is withheld rather than written as complete |
+| Tick-gap detector, daily cross-verify | the gap is detected and counted; the after-close check compares 1-minute bars against Dhan's own record |
+
+Not recovered: the high, low and intermediate prices inside the gap. No REST
+backfill is allowed (live-feed purity guard), so this limit stands.
+
+#### Why in-place is safe on the four worst cases
+
+| Case | Why nothing is dropped |
+|---|---|
+| Subscribe during a burst | the connection keeps reading frames while the swap's writes are in flight (`await_write`), so the receive buffer is drained throughout |
+| Unsubscribe racing in-flight packets | packets for the old contract that arrive after the unsubscribe are still written to `market_depth` (grace and ghost frames are counted, never dropped) |
+| Depth-200 holds one instrument | the unsubscribe always goes out BEFORE the subscribe, so the socket never asks for two (an 804); a subscribe that fails after the unsubscribe leaves the socket empty, and that one case still redials |
+| Mid-day restart | the guard names the current contract, so a restart dials the set the steering loop last chose |
+
+#### What stays exactly as 2026-09-24 set it
+
+Top 5 distinct stock-option underlyings, the 3 s first board then the 1-minute
+board, the 20-underlying hysteresis band, at most one change per socket per
+minute and five pool-wide, the static depth-20 day set, and the
+`ROTATION_HALTED` breaker: after any 805 no depth-200 change and no ghost
+unsubscribe is sent for the rest of the process.
+
+#### ⚠ Honest envelope
+
+- **A ghost is wasted bandwidth, not lost data.** If Dhan still streams a
+  contract after 25 (measured before: 110,114 ghost packets on 2026-09-10), the
+  extra rows are stored. The resend is the remedy; there is no longer a redial
+  behind it.
+- **Dhan sends no acknowledgement for an unsubscribe** (their reply did not
+  answer that question), so the only evidence is the ghost counter.
+- **The new contract has a blind window** until its book next changes — the
+  same as after a redial, minus the ~0.3 s dial.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Re-adds a close-and-redial to change a socket's instruments, or to answer a
+  ghost, without a fresh dated quote HERE.
+- Sends the subscribe before the unsubscribe on a depth-200 socket.
+- Drops or skips writing packets that arrive for an unsubscribed contract.
+- Sends code 12 (Feed Disconnect) from any production path.
+- Removes the `ROTATION_HALTED` breaker, or raises the change caps.
+- Claims a genuine reconnect is lossless.

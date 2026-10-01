@@ -310,6 +310,28 @@ This plan converts hope into bounded, tested, alarmed guarantees. It does NOT pr
     `day_boundary_rearms_the_first_bucket_treatment`
   - Full design: ITEM 10 addendum below (C1–C8)
 
+- [ ] **Item RESUB — unsubscribe and subscribe, not disconnect and reconnect (operator 2026-10-01: "now isntead of disconenct reocnenct follow the unsubscribe and siubscribe apporach ddue okay? see i neve rver want to have nay ticks loss zerot icks loss and zerod ata msisign dude okay?")**
+  - Depth-200 ranked rotation sends `LiveSubscriptionCommand::Swap` (code 25 then code 23 on
+    the live socket) instead of `RotateByRedial`; `RotateByRedial`,
+    `ConnEvent::RotationRequested` and `ReconnectReason::RankedRotation` are removed.
+  - A ghost contract is answered by re-sending code 25 for it on its socket
+    (`request_ghost_unsubscribe` / `take_ghost_unsubscribe`), never by a redial;
+    `ReconnectReason::GhostInstrument` and `ConnEvent::GhostInstrumentDetected` are removed.
+  - Files: `crates/app/src/depth_rebalance.rs`, `crates/app/src/dhan_feed_stack.rs`,
+    `crates/core/src/websocket/pool_supervisor.rs`,
+    `crates/app/tests/ghost_instrument_named_guard.rs`,
+    `docs/claude-rules-full/project/websocket-connection-scope-lock.md` (2026-10-01 section)
+  - Tests: `a_depth_200_swap_never_closes_the_socket`,
+    `a_ghost_unsubscribe_resends_code_25_and_never_redials`,
+    `a_ghost_unsubscribe_for_a_held_instrument_sends_nothing`,
+    `request_ghost_unsubscribe_arms_once_and_take_returns_the_instrument`,
+    `request_ghost_unsubscribe_is_refused_inside_the_cooldown_and_allowed_after_it`,
+    `ranked_rotation_sends_an_in_place_swap_not_a_redial`,
+    plus the existing swap tests (`a_swap_unsubscribes_before_it_subscribes`,
+    `a_swap_does_not_eat_the_frames_arriving_around_it`,
+    `a_swap_that_empties_the_socket_forces_a_redial`)
+  - Full design: ITEM RESUB addendum below
+
 
 ---
 
@@ -397,6 +419,74 @@ memory killer is kernel-owned, and the 87th failure scenario is unknown by defin
 replay and no snapshot-on-subscribe, and measured reconnect windows of 7–11 s lose data at
 source. The honest guarantee is **capture-completeness of received frames**, never
 trade-completeness.
+
+---
+
+## ITEM RESUB — DESIGN ADDENDUM (added 2026-10-01): unsubscribe and subscribe, not disconnect and reconnect
+
+Operator quote and authority: `websocket-connection-scope-lock.md` "2026-10-01 — UNSUBSCRIBE
+AND SUBSCRIBE, NOT DISCONNECT AND RECONNECT" (recorded before any code).
+
+### R1. Audit — every deliberate close-and-redial (Verified in source, 2026-10-01)
+
+| Path | Sockets | In production | Disposition |
+|---|---|---|---|
+| `RotateByRedial` from `depth_rebalance::send_swap` | depth-200 | yes, every minute 09:16–15:40 | replaced by `Swap` |
+| Ghost redial (`request_ghost_redial` → `GhostInstrument`) | depth-20, depth-200 | yes, always on | replaced by a re-sent unsubscribe |
+| Probe Arm B (`ProbeClose`) | depth-200 | no, config-off diagnostic | unchanged |
+| Main feed | — | only `Extend` in place | unchanged |
+| Fault redials (dial/subscribe failed, vendor close, 807, idle/frame silence, emptied socket) | all | yes | unchanged: a broken socket cannot be repaired by a frame |
+
+### R2. Design
+
+- `send_swap` builds `LiveSubscriptionCommand::Swap { old, new, ack }`. The connection's
+  existing swap handler already sends the unsubscribe first, bounds both writes by
+  `SWAP_WIRE_BUDGET`, keeps reading frames while they are in flight, reverts the guard on a
+  refused unsubscribe, and redials only when the subscribe fails after a successful
+  unsubscribe (the socket would otherwise sit empty). The ack (`SwapOutcome`) is the same type
+  `RotateByRedial` used, so `reconcile_pending_swaps` is unchanged.
+- The ghost register keeps its cooldown (180 s), pool spacing (20 s) and session ceiling (8),
+  and now also stores WHICH contract ghosted (security id + segment code). The connection takes
+  it on its one-second tick into a local slot; the loop top sends code 25 for it through
+  `await_write` (bounded, reads while writing), and sends nothing if the guard holds that
+  contract.
+- The drain keeps skipping the request after an 805 (`rotation_halted()`), and `send_swap`
+  keeps refusing after an 805.
+
+## Edge Cases (Item RESUB)
+
+| Case | Handling |
+|---|---|
+| Subscribe during a burst | `await_write` polls `recv` during the write; pinned by `a_swap_does_not_eat_the_frames_arriving_around_it` |
+| Packets for the old contract after the unsubscribe | stored, counted as grace or ghost, never dropped |
+| depth-200 cap of one | unsubscribe before subscribe (`a_swap_unsubscribes_before_it_subscribes`) |
+| Subscribe fails after the unsubscribe | socket is empty, so it redials with the new contract (`a_swap_that_empties_the_socket_forces_a_redial`) |
+| Ghost for a contract the guard holds again | nothing sent (`a_ghost_unsubscribe_for_a_held_instrument_sends_nothing`) |
+| Ghost with an unknown segment code | refused at the register, counted |
+| Mid-day restart | the guard names the chosen contract; replay dials it |
+
+## Failure Modes (Item RESUB)
+
+| Failure | Effect | Detection |
+|---|---|---|
+| Dhan ignores 25 | old contract keeps streaming; rows stored; resend up to 8 times per socket | `ghost` / `ghost_unsubscribe` / `ghost_exhausted` on the depth counter, `unsubscribe_ignored` log |
+| Unsubscribe write times out | guard keeps `new`; swap reported not held | `depth_unsubscribe_timed_out` |
+| 805 | no more swaps or ghost resends this process | `rotation_halted` refusals |
+
+## Test Plan (Item RESUB)
+
+`cargo test -p tickvault-core` (pool_supervisor swap and ghost tests), `cargo test -p
+tickvault-app` (depth_rebalance steering tests, ghost guard), clippy with `-D warnings`.
+
+## Rollback (Item RESUB)
+
+Revert the commit: the redial path returns exactly as it was. No schema, config or alarm change.
+
+## Observability (Item RESUB)
+
+`tv_dhan_feed_depth_total{outcome="ghost_unsubscribe"|"ghost_exhausted"|"ghost"}`, the existing
+swap counters and `tv_dhan_ws_swap_wire_ms`, `depth_unsubscribe_sent` / `unsubscribe_ignored`
+log lines. `tv_dhan_ws_rotate_by_redial_total` is retired with the command (no alarm reads it).
 
 ---
 
