@@ -1100,6 +1100,8 @@ impl AggregatorCell {
         {
             self.armed_for_day_open[ord] = false;
             self.slots[ord].open = prices.day_open;
+            // Pinned: the official open is never superseded by a trade.
+            self.slots[ord].open_ts_ist_secs = 0;
             widen_range_to_include(&mut self.slots[ord], prices.day_open);
         }
         let slot = &mut self.slots[ord];
@@ -1394,13 +1396,19 @@ impl AggregatorCell {
             // bar. Without it, an instrument whose first in-session tick
             // carried no session open would lose the official open for the
             // whole day — the bucket is already open, and `fold_in_bucket`
-            // deliberately never touches `open`.
+            // only ever moves `open` to a strictly EARLIER trade (R6,
+            // 2026-10-01), never to the official open.
+            // (Until 2026-10-01 this read "`fold_in_bucket` deliberately never
+            // touches `open`"; R6 made it order the open by trade time.)
             if self.armed_for_day_open[ord]
                 && prices.day_open > 0.0
                 && is_days_first_session_bucket(tf, open_start)
             {
                 self.armed_for_day_open[ord] = false;
                 self.slots[ord].open = prices.day_open;
+                // Pinned: no trade, however early its stamp, may replace the
+                // official open once it is stamped.
+                self.slots[ord].open_ts_ist_secs = 0;
                 // The MORE dangerous of the two `day_open` stamp sites: this
                 // bucket has already folded ticks, so its range can be far
                 // from the official open by now. Without this widening the
@@ -1978,10 +1986,15 @@ fn open_bucket(
     let price = prices.last_traded_price;
     // `day_open` is already `0.0` unless the raw field was strictly positive
     // (NaN included), so this test carries the original `> 0.0` semantics.
-    let open = if use_day_open && prices.day_open > 0.0 {
-        prices.day_open
+    //
+    // One arm decides both the open and its trade second (R6, 2026-10-01):
+    // the official open is PINNED (`0`) and never superseded; a trade open
+    // carries its own second, so a strictly earlier trade arriving later in
+    // this bucket can replace it (`fold_in_bucket`, `fold_late_hlc`).
+    let (open, open_ts_ist_secs) = if use_day_open && prices.day_open > 0.0 {
+        (prices.day_open, 0)
     } else {
-        price
+        (price, fold_secs)
     };
     let mut state = LiveCandleState {
         bucket_start_ist_secs: bucket_start,
@@ -2020,6 +2033,7 @@ fn open_bucket(
         // compare like with like. Mixing clocks here would let a tick with a
         // later receipt but an earlier trade time silently lose the close.
         close_ts_ist_secs: fold_secs,
+        open_ts_ist_secs,
         // Same reasoning as `session_open` below: the gated widened value,
         // never the raw wire field.
         prev_day_close: prices.day_close,
@@ -2211,6 +2225,18 @@ fn fold_in_bucket(
     if price < state.low {
         state.low = price;
     }
+    // OPEN ORDER GUARD (R6, 2026-10-01), the mirror of the close guard below.
+    // The feed carries no sequence number and reorders inside a bucket, so the
+    // tick that OPENED this bucket is the first to ARRIVE, not necessarily the
+    // first to TRADE. A strictly earlier trade takes the open; within one
+    // second the first arrival keeps it, as the last arrival keeps the close.
+    // A pinned open (`open_ts_ist_secs == 0`, the official day open) can never
+    // pass this test. The price is already inside `[low, high]` (widened
+    // above), so the open stays inside the bar's own range.
+    if fold_secs < state.open_ts_ist_secs {
+        state.open = price;
+        state.open_ts_ist_secs = fold_secs;
+    }
     // ORDER GUARD (2026-08-25, permutation sweep). `fold_late_hlc` — the
     // SEALED-bucket path — has always had this test; the OPEN-bucket path did
     // not, so an out-of-order packet arriving inside a still-open bucket
@@ -2379,9 +2405,12 @@ fn fold_in_bucket(
 /// last tick (`fold_secs >= close_ts_ist_secs` — the EXCHANGE stamp since the
 /// 2026-09-18 ts-bucketing directive, the RECEIPT clock from 2026-08-28 until
 /// then), so an out-of-order EARLIER late tick can never clobber a
-/// truly-later close. `open` /
-/// `volume` / `oi` are untouched: `open` belongs to the first tick, and the
-/// cumulative snapshots are order-dependent and ambiguous for a latecomer.
+/// truly-later close. `open` moves only to a STRICTLY earlier trade than the
+/// one that set it (`fold_secs < open_ts_ist_secs`, R6 2026-10-01 — until then
+/// this said "`open` belongs to the first tick" and left it untouched, which
+/// made the open the first ARRIVAL); a pinned official open is never moved.
+/// `volume` / `oi` are untouched: the cumulative snapshots are order-dependent
+/// and ambiguous for a latecomer.
 ///
 /// The two RECEIPT stamps ARE widened by the late tick, exactly as
 /// `fold_in_bucket` widens them. This path re-emits the amended bar as
@@ -2414,6 +2443,14 @@ fn fold_late_hlc(
     }
     if price < state.low {
         state.low = price;
+    }
+    // OPEN ORDER GUARD (R6, 2026-10-01) — the same rule as `fold_in_bucket`.
+    // This was the second site where the open was arrival-ordered: a late
+    // trade stamped before the sealed bar's open trade now amends the open,
+    // re-emitted as `AmendedLate` exactly as a close or high change is.
+    if fold_secs < state.open_ts_ist_secs {
+        state.open = price;
+        state.open_ts_ist_secs = fold_secs;
     }
     if fold_secs >= state.close_ts_ist_secs {
         state.close = price;
@@ -2497,7 +2534,19 @@ fn fold_late_hlc(
 // that can tell them apart — and they MEASURE receipt against the window, they
 // never BUCKET by it (`fold_clock_ist_secs` stays the identity on
 // `exchange_timestamp`).
-const MAX_AGGREGATOR_CELL_BYTES: usize = TF_COUNT * 152 * 2 + TF_COUNT * 21 + 160;
+//
+// 152 → 160 RAISED 2026-10-01 (plan item R6) for
+// `LiveCandleState::open_ts_ist_secs`, the trade second of the open, which
+// lets both fold paths order the open by trade time as they already ordered
+// the close. One more `u32` crosses the 8-byte boundary (153 → 160).
+// Re-derived from the constants, TF_COUNT 10 since 2026-09-22:
+//   10 TF × 160 B × 2 = 3_200 B, + 10 × 21 + 160 = 3_570 B per instrument
+//   (was 10 × 152 × 2 + 370 = 3_410 B); measured actual 3_248 → 3_408 B,
+//   +160 B per instrument,
+//   × AGGREGATOR_MAX_SLOTS (25,000) = +4.0 MB fleet. The seal ring one file
+//   over carries a further +2.0 MB. Recorded in `aws-budget.md` under the
+//   same date, per this assert's own instruction.
+const MAX_AGGREGATOR_CELL_BYTES: usize = TF_COUNT * 160 * 2 + TF_COUNT * 21 + 160;
 const _: () = assert!(
     std::mem::size_of::<AggregatorCell>() <= MAX_AGGREGATOR_CELL_BYTES,
     "AggregatorCell exceeded its per-instrument budget — this multiplies by AGGREGATOR_MAX_SLOTS (25,000); update aws-budget.md before raising."
@@ -3143,7 +3192,8 @@ mod tests {
         // The real risk: the day's first IN-SESSION tick can carry
         // `day_open == 0` — a thin instrument whose session open the vendor
         // has not populated yet. The bucket opens at that tick's price, and
-        // `fold_in_bucket` never touches `open`, so without this path the
+        // `fold_in_bucket` moves `open` only to a strictly earlier TRADE (R6,
+        // 2026-10-01), never to the official open, so without this path the
         // official open would never reach any candle that day.
         let mut cell = AggregatorCell::empty();
         let strategy = FeedStrategy::DEFAULT;
@@ -3607,7 +3657,124 @@ mod tests {
         assert_eq!(amended_state.bucket_start_ist_secs, OPEN);
         assert_eq!(amended_state.high, 130.0, "late high must win");
         assert_eq!(amended_state.close, 130.0, "later LTT sets close");
-        assert_eq!(amended_state.open, 100.0, "open is never amended");
+        assert_eq!(
+            amended_state.open, 100.0,
+            "a late trade LATER than the open trade never amends the open"
+        );
+        assert_eq!(amended_state.volume, 10, "volume is never amended");
+    }
+
+    // -- R6 (2026-10-01): a bar opens at its EARLIEST trade, not its first
+    //    arrival. The 10:00 bucket is deliberately not the day's first session
+    //    bucket, so the official-open arm cannot reach it.
+
+    /// 10:00:00 IST of [`DAY`].
+    const TEN: u32 = DAY + 36_000;
+
+    #[test]
+    fn open_is_the_earliest_trade_not_the_first_arrival() {
+        // BITE PROOF: before R6 `fold_in_bucket` never touched `open`, so the
+        // bar opened at 101 (the first ARRIVAL) and this asserts 101 == 100.
+        let mut cell = AggregatorCell::empty();
+        let strategy = FeedStrategy::DEFAULT;
+        cell.consume_tick(TfIndex::M1, &tick_at(TEN + 30, 101.0, 20), 0, strategy, 20);
+        assert_eq!(cell.snapshot(TfIndex::M1).open, 101.0);
+        assert_eq!(cell.snapshot(TfIndex::M1).open_ts_ist_secs, TEN + 30);
+        // Earlier trade, later arrival, same bucket.
+        cell.consume_tick(TfIndex::M1, &tick_at(TEN + 10, 100.0, 10), 0, strategy, 10);
+        let bar = cell.snapshot(TfIndex::M1);
+        assert_eq!(bar.open, 100.0, "the earliest trade owns the open");
+        assert_eq!(bar.open_ts_ist_secs, TEN + 10);
+        assert_eq!(bar.close, 101.0, "the latest trade still owns the close");
+        assert_eq!(bar.low, 100.0);
+        assert_eq!(bar.high, 101.0);
+    }
+
+    #[test]
+    fn within_one_second_the_first_arrival_keeps_the_open() {
+        // The mirror of the close rule (last arrival wins within a second):
+        // the guard is STRICTLY earlier, so a same-second packet never moves
+        // the open.
+        let mut cell = AggregatorCell::empty();
+        let strategy = FeedStrategy::DEFAULT;
+        cell.consume_tick(TfIndex::M1, &tick_at(TEN + 10, 100.0, 10), 0, strategy, 10);
+        cell.consume_tick(TfIndex::M1, &tick_at(TEN + 10, 99.0, 12), 0, strategy, 12);
+        let bar = cell.snapshot(TfIndex::M1);
+        assert_eq!(
+            bar.open, 100.0,
+            "same second: the first arrival keeps the open"
+        );
+        assert_eq!(bar.open_ts_ist_secs, TEN + 10);
+        assert_eq!(
+            bar.close, 99.0,
+            "same second: the last arrival takes the close"
+        );
+        assert_eq!(bar.low, 99.0);
+    }
+
+    #[test]
+    fn the_official_day_open_is_never_superseded() {
+        // The day's first session bucket (09:15) with the official open armed
+        // and published on the first packet: the open is PINNED (stamp 0),
+        // and an earlier-stamped later arrival leaves it at the official open.
+        let mut cell = AggregatorCell::empty();
+        let strategy = FeedStrategy::DEFAULT;
+        let mut first = tick_at(OPEN + 30, 101.0, 20);
+        first.day_open = 98.0;
+        cell.consume_tick(TfIndex::M1, &first, 0, strategy, 20);
+        assert_eq!(cell.snapshot(TfIndex::M1).open, 98.0);
+        assert_eq!(cell.snapshot(TfIndex::M1).open_ts_ist_secs, 0, "pinned");
+        cell.consume_tick(TfIndex::M1, &tick_at(OPEN + 5, 100.0, 10), 0, strategy, 10);
+        let bar = cell.snapshot(TfIndex::M1);
+        assert_eq!(bar.open, 98.0, "no trade replaces the official open");
+        assert_eq!(bar.open_ts_ist_secs, 0);
+        assert!(bar.low <= bar.open && bar.open <= bar.high);
+
+        // The LATE stamp site pins too: a bucket opened by a trade (no
+        // official open yet) takes the official open when it arrives, and an
+        // earlier trade after that cannot take it back.
+        let mut cell = AggregatorCell::empty();
+        cell.consume_tick(TfIndex::M1, &tick_at(OPEN + 30, 101.0, 20), 0, strategy, 20);
+        assert_eq!(cell.snapshot(TfIndex::M1).open_ts_ist_secs, OPEN + 30);
+        let mut late_open = tick_at(OPEN + 40, 102.0, 25);
+        late_open.day_open = 98.0;
+        cell.consume_tick(TfIndex::M1, &late_open, 0, strategy, 25);
+        assert_eq!(cell.snapshot(TfIndex::M1).open, 98.0);
+        assert_eq!(cell.snapshot(TfIndex::M1).open_ts_ist_secs, 0, "pinned");
+        cell.consume_tick(TfIndex::M1, &tick_at(OPEN + 1, 100.0, 10), 0, strategy, 10);
+        assert_eq!(cell.snapshot(TfIndex::M1).open, 98.0);
+    }
+
+    #[test]
+    fn a_late_earlier_trade_amends_the_sealed_bars_open() {
+        // `fold_late_hlc` was the second arrival-ordered open: a late trade
+        // stamped before the sealed bar's open trade now amends the open, and
+        // the bar is re-emitted as `AmendedLate`.
+        let mut cell = AggregatorCell::empty();
+        let strategy = FeedStrategy::REFOLD;
+        cell.consume_tick(TfIndex::M1, &tick_at(TEN + 30, 100.0, 10), 0, strategy, 10);
+        // A 10:01 tick seals the 10:00 bar.
+        let sealed =
+            cell.consume_tick(TfIndex::M1, &tick_at(TEN + 60, 105.0, 20), 10, strategy, 20);
+        assert!(
+            matches!(sealed, ConsumeOutcome::Sealed { .. }),
+            "got {sealed:?}"
+        );
+        let out = cell.consume_tick(TfIndex::M1, &tick_at(TEN + 2, 97.0, 21), 10, strategy, 21);
+        let ConsumeOutcome::AmendedLate { amended_state } = out else {
+            panic!("a late trade into the sealed bar must amend, got {out:?}");
+        };
+        assert_eq!(amended_state.bucket_start_ist_secs, TEN);
+        assert_eq!(
+            amended_state.open, 97.0,
+            "the earlier late trade owns the open"
+        );
+        assert_eq!(amended_state.open_ts_ist_secs, TEN + 2);
+        assert_eq!(amended_state.low, 97.0);
+        assert_eq!(
+            amended_state.close, 100.0,
+            "an EARLIER trade never takes the close"
+        );
         assert_eq!(amended_state.volume, 10, "volume is never amended");
     }
 
