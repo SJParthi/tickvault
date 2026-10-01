@@ -920,12 +920,17 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
     start rule on (budget_killswitch.rs:208-287; main.tf:646-655); a late budget notice latches the
     wrong month (budget_killswitch.rs:208-270), which the six-hour back-dating above does not
     settle, so the period is read from the notice itself.
-- [ ] **PR30b — the October $150 ceiling in terraform.** (deploy; on or after 2026-10-01)
+- [x] **PR30b — the October $150 ceiling in terraform.** (deploy; on or after 2026-10-01)
   - The October $150 ceiling is enforced in code (`effective_budget_kill_usd`) but budget.tf and
     budget-guards.tf still say $225 (budget.tf:220-222; budget-guards.tf:278). Quote 23 keeps
     $225 for September, so the terraform change is a dated PR on or after 2026-10-01, in all four
     lockstep sites.
   - Re-check 6 (2026-09-27): line correction, budget-guards.tf:278 is now :300.
+  - Done 2026-10-01: `budget.tf limit_amount`, `budget-guards.tf BUDGET_KILL_USD`,
+    `budget_digest::BUDGET_USD` and `hard_stop_guard::DEFAULT_BUDGET_KILL_USD` all read $150,
+    pinned by `budget_ceiling_lockstep_guard.rs`. The month clamp stays as the backstop and now
+    changes no month. The native 90% stop line is $135.00 again; keeping October under $150
+    still needs one of the owner levers in daily-universe §0 Quote 23.
 - PR31 — a restart can never replace a fuller candle with a partial one. (`storage`, `app`,
   `core`, `trading`) Split 2026-09-27 into PR31a (the three smaller items) and PR31b (the
   restart rebuild itself), so each lands and is reviewed on its own.
@@ -1583,7 +1588,8 @@ Source: `/mnt/project-files/audit/recheck7-gaps.md` (15 ranked items and the per
 each with file:line). "Verified" below means this thread read the code on `origin/main` at
 13e405f. Every other line is carried from the re-check and is re-verified when its item starts.
 
-Order of work: PR #1975 (D3a) finishes first. Then PR53 (it can destroy a kept table), D3b, D3c,
+Order of work: PR #1975 (D3a) finishes first. Then PR53 (it can destroy a kept table), D3b, D3c-1,
+PR58 (every day's first trade is missing from its first candle), PR59 (read-only query), D3c-2, D3c-3,
 PR54, PR55, PR56, PR57, then the order already set: PR41, PR31b, PR42–PR50, PR31c, PR32–PR39, PR51,
 the PR4c follow-ups, PR52. PR30b stays on or after 2026-10-01.
 
@@ -1640,6 +1646,75 @@ the PR4c follow-ups, PR52. PR30b stays on or after 2026-10-01.
   row growth over the last minute as the cross-check; (3) every `tv-<env>-*` CloudWatch alarm
   whose state is not OK, by name and since when. Read-only: no action, no restart, no write.
   Any new logic goes in Rust (the `/health` payload); the workflow only prints it.
+- [x] **PR58 — the day's first trade is counted in its first candle.** (`trading` candles, not
+  indicator/strategy) Reported 2026-09-28 by the "Ticks vs Dhan chart mismatch" thread (owner
+  compared HDFCBANK-29Sep2026-780-CE `candles_5s` with Dhan's 5 s chart).
+  - Verified in code (`multi_tf_aggregator.rs`, `consume_tick`): the first ACCEPTED tick of a
+    slot seeds `last_cumulative` with its own day-cumulative volume, so the first bar gets
+    `cum - cum = 0` for that tick. The previous day's connect snapshot is refused earlier
+    (`stale_trading_day`, before the slot lookup) and never seeds, and `force_seal_all` resets
+    the seed at day end. So when the feed is up before the open, the first trade of every
+    contract (cumulative 650, say) is left out of the 09:15 bar on every timeframe.
+  - Seeding is right only when we joined after trading began (a mid-session restart or a late
+    top-up; test `a_mid_session_slot_creation_must_not_put_a_whole_days_volume_in_one_bar`).
+  - Fix: seed at 0 when there is per-slot evidence we were watching before today's first
+    trade: a same-day `stale_trading_day` refusal seen for this key (lookup only, no slot
+    created), or the key's first packet received before the session open. Otherwise keep
+    seeding. O(1) per tick, no allocation; the seeded counter gains a `baseline` label
+    (`zero` / `first_tick`).
+  - Test: stale-day snapshot, then a 09:15:02 trade at cumulative 650 -> the 09:15:00 5 s and
+    1 m bars carry 650; the mid-session test still passes.
+  - As built: the proof is the RECEIPT second of the latest such packet (Dhan re-sends one on
+    every book or open-interest change): a prior-day last-trade time refused by the RECEIPT-day
+    gate, a zero price beside a prior-day trade time, or a zero trade time with a zero price (a
+    zero field beside a live one contradicts itself and is no proof). It moves only forward, and a receipt day
+    before the fold watermark's (a replayed frame) is ignored; the watermark-day gate records
+    no proof. `untraded_proof_holds(proof, trade, segment)` holds only when the first trade is
+    the same IST day, at most `UNTRADED_PROOF_MAX_SKEW_SECS` (5 s) before the proof, and within
+    `UNTRADED_PROOF_MAX_AGE_SECS` (60 s) of the proof, counted from 09:15 only where nothing can
+    trade before it: options always (futures left the subscription 2026-09-18), equities only
+    for a proof taken after the pre-open match (`PRE_OPEN_MATCH_DONE_SECS_OF_DAY_IST`, 09:12, plus
+    the 5 s skew limit).
+    So a socket that was down and reconnects with a morning's cumulative still seeds, and so
+    does an equity whose 09:08 match packet was lost. A refused packet may take a slot to hold
+    the proof, but only below the last 1/20 of the table (`UNTRADED_PROOF_SLOT_RESERVE_DIVISOR`,
+    23,750 of 25,000, above the measured 22,996 peak), with no exhaustion count or log; it opens
+    no bucket (the three tests that pinned "no slot" now pin "no bucket on any timeframe"). New
+    counter `tv_aggregator_slot_volume_baseline_zero_total`.
+  - Limitations (stated in the code): if the first trade's packet is lost and the next trade
+    arrives inside 60 s, that bar carries both, so a 1 s / 3 s / 5 s bar can hold up to 60 s of
+    volume after such a gap (before PR58 both were missing), and the window stretches by any
+    read lag, since the proof is when we READ the packet. The option rule keys on the segment
+    code, so if futures (which have a pre-open) return it must key on the instrument type. Nothing yet compares our first bar
+    with Dhan's own chart; PR59's read-only query is the tool for that check on the live box.
+  - Review 2026-10-01 (four parallel attack passes after merging main's plan 47): the
+    lost-packet limit above was WORSE than stated, since the 60 s window crosses minute and
+    higher bucket edges (a 1 m bar written at 150 against a true 50; an equity's whole auction
+    in its 09:15 bars). Fixed: the zero baseline also needs the first trade's day cumulative
+    to EQUAL its own last-trade quantity, so it never over-reports
+    (`test_regression_a_lost_first_trade_never_lands_in_the_next_minute`,
+    `test_regression_an_equity_auction_is_never_poured_into_the_open_bar`). No proof is
+    recorded during a WAL replay: a replayed snapshot's slot got the hand-over gap and
+    withheld every first bar (`test_regression_no_proof_is_recorded_during_a_wal_replay`).
+    The 09:15 extension names its segments (`test_regression_a_currency_proof_is_never_extended_to_the_open`).
+    Stated limits: the first bar's net direction is null; proof slots are bounded by the
+    subscribed set, not the traded set.
+  - Docs line (not a bug): candle `volume` is signed (negative on a down bar), while charting
+    "Net Volume" is 0 on a flat bar and compares the first bar with the previous close. Say so
+    where the candle columns are described.
+- [ ] **PR59 — a read-only database query the owner can run on the live box.** (`api` or `app`,
+  `.github/workflows/aws-control.yml`) Asked 2026-09-28 by the "Ticks vs Dhan chart mismatch"
+  thread, to confirm PR58 on real rows (HDFCBANK-29Sep2026-780-CE `ticks` and `candles_5s`).
+  - A `query` action on the existing read-only control workflow: main branch only, same
+    concurrency group as `status`, no restart and no write.
+  - The SQL is validated in Rust, not in shell (Rust-only rule): SELECT or WITH only, one
+    statement (no `;`), a banned-keyword list (INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE,
+    CREATE, RENAME, COPY, BACKUP, SNAPSHOT, VACUUM, REINDEX, GRANT and the rest of QuestDB's
+    write set), and `LIMIT 500` added when absent or capped when larger. The input travels
+    base64-encoded and is never put into a shell command line.
+  - Output is capped at 200 KB, written to the job summary and uploaded as an artifact.
+  - Tests: every banned keyword refused (any case, inside comments and quoted names too), a
+    second statement refused, the limit added and capped, a valid SELECT passed through.
 
 Corrections and widenings to existing items:
 
