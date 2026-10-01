@@ -1299,6 +1299,9 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
 - PR41 — a replayed candle never replaces a fuller one, and one stuck spill file never holds the
   rest. (`storage`, `trading`) Split 2026-10-01 into PR41a (the never-replace rule and the file
   order) and PR41b (the stuck file, the suspect table, the replay gate and the record checksum).
+  PR41b split again 2026-10-01: the record checksum, the torn single-record cut-back and the
+  batch alignment check moved to PR41c, because a checksum needs a new spill format version and
+  its own reader migration.
 - [x] **PR41a — a replayed candle never replaces a fuller one.** (`storage`)
   - A replayed seal overwrote a newer corrected candle (a late trade re-folded a sealed bar),
     uncounted (seal_writer_task.rs:903-917, :1127-1175; aggregator_cell.rs:261-268). The honest
@@ -1340,7 +1343,7 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
     `pr41a_boot_drain_never_writes_an_older_copy_after_a_fuller_one`,
     `pr41a_boot_drain_writes_both_copies_when_the_older_comes_first`,
     `pr41a_staged_files_replay_oldest_write_first`.
-- [ ] **PR41b — one stuck spill file never holds the rest.** (`storage`)
+- [x] **PR41b — one stuck spill file never holds the rest.** (`storage`)
   - A candle the replay cannot flush is skipped and later files wait
     (seal_writer_task.rs:1209-1262): tell a flapping database from a bad record before skipping,
     and move past a stuck file.
@@ -1348,10 +1351,51 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
     keep the file until the table is healthy.
   - The replay gate opens only on live traffic, so a spill made after the last live write waits
     for the next boot: reopen it on a database health check too.
+  - Row 36 (c6#36): replay the dead-letter file mid-session, or record boot-only replay.
+  - Done 2026-10-01, all in `seal_writer_task.rs::MidSessionReplay`:
+    (1) `classify_replay_flush_failure`: a failed replay flush whose error is the transport
+    (`SocketError`, `CouldNotResolveAddr`, `TlsError`), the server's configuration or
+    authentication, or the candle tables not yet keyed (`CandleTablesNotKeyed`) never counts as a
+    strike against the record. Any other failure at a step of one record is a strike, the first
+    always and each later one only when the database accepted a write since the last failure (a
+    clean live flush or a clean probe). After `SEAL_REPLAY_STUCK_FAILURES` (12) failures at one
+    position with no progress, the file is parked where it stopped for `SEAL_REPLAY_PARK_SECS`
+    (600) and the next staged file goes ahead; the parked file resumes at the same record.
+    (2) While the QuestDB WAL-suspension watcher reports a suspended or lagging table, or cannot
+    see, nothing replays. A file read to its end waits until two more clean probes have reported
+    before it is archived; if suspicion begins first, it, the file being read and every parked file
+    are read again from their start (the DEDUP keys collapse what had landed). With no watcher
+    running, a finished file is archived at once, as before.
+    (3) The gate also opens once a clean probe has reported after the last failure and
+    `SEAL_REPLAY_HEALTHY_SECS` have passed since it. `AppliedWatermark::clean_probe_count` is new;
+    the runner feeds `ReplayProbe::current()` into `observe_probe` every cycle.
+    (4) Row 36 decided: the dead-letter file replays at boot only. A seal reaches it only when the
+    spill append itself failed, and the DLQ has no paused-append staging, so moving its file
+    mid-session could lose a seal appended at the same instant. Recorded in the replay's module
+    notes.
+  - Counted: `tv_seal_replay_total{kind="files_parked"|"files_rewound"}` (new), beside the
+    existing kinds. Parking is a coded `error!` (AGGREGATOR-SEAL-01); a rewind is a `warn!`.
+  - Honest limits: parking lets a later file reach the database before an older one; an older copy
+    of a bucket the spill also holds newer is dropped by the PR41a ledger, but a key the ledger could
+    not track is not. The strike evidence rule adds little beyond the gate, which already demands a
+    clean live flush or a clean probe before the retry; the transport classification is the real
+    separation. A refusal the database reports without naming a line (for example a 5xx after the
+    client's own retries) still counts as a strike.
+  - Tests: `classify_replay_flush_failure_tells_the_transport_from_a_refusal`,
+    `a_transport_failure_never_skips_a_record_and_a_stuck_file_is_parked_so_the_next_goes_ahead`,
+    `a_parked_file_resumes_at_its_record_after_the_park_window`,
+    `a_clean_probe_reopens_the_gate_without_live_traffic`, `a_suspect_table_closes_the_gate`,
+    `a_finished_file_waits_for_two_clean_probes_before_it_is_archived`,
+    `suspicion_before_confirmation_reads_the_file_again_from_its_start`,
+    `observe_probe_rewinds_the_file_being_read_and_every_parked_file_on_suspicion`,
+    `test_replay_probe_current_reads_the_process_watermark`,
+    `wal_applied_watermark::tests::clean_probe_count_counts_only_clean_probes`.
+- [ ] **PR41c — every spilled candle record can be checked.** (`storage`)
   - The candle spill has no record checksum (row 136, seal_spill.rs:832-841, :907-916): cut back a
     torn single-record write the way the batch does, check alignment before a batch, add a
-    checksum.
-  - Row 36 (c6#36): replay the dead-letter file mid-session, or record boot-only replay.
+    checksum. The 128-byte record is full, so the checksum needs a new format version (for
+    example reusing the legacy low-32 id at bytes 0..4, the full id being at 120..128) and a reader
+    that still accepts the current version during the rollout.
 - [ ] **PR42 — order and P&L audit rows survive a database outage.** (`storage`, `app`, deploy)
   - Order and P&L audit rows are thrown away while the database is down
     (order_audit_persistence.rs:478-521; pnl_audit_persistence.rs:488;
@@ -1903,7 +1947,7 @@ Rows folded into existing items (the fix is named here so the item carries it):
 - PR43: row 127 (c6#123, also count and page the spots cut at the 250 cap).
 - PR42: row 188 (c6#169, also the order-update and position-update event writers).
 - PR41b: row 36 (c6#36, replay the dead-letter file mid-session, or record boot-only replay
-  below).
+  below). Decided 2026-10-01: boot-only, recorded in PR41b.
 - PR7: rows 115 (c6#112, measure contention on the shared capture counter) and 267 (c6#236,
   time a full 250,000-record shutdown drain on the production volume).
 - PR11: row 189 (c6#170, candle escalation and inline writes respect the free-space floor).
