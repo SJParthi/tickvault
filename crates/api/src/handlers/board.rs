@@ -200,7 +200,7 @@ mod tests {
                 if i == 0 {
                     part
                 } else {
-                    part.split_once("\n}\n").map_or("", |(_, rest)| rest)
+                    part.split_once("\n\u{7d}\n").map_or("", |(_, rest)| rest)
                 }
             })
             .collect();

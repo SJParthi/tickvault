@@ -3028,7 +3028,7 @@ mod fifth_socket_tests {
 
     /// The production body of `run_depth_rebalance` and nothing after it.
     ///
-    /// Bounded at the function's own closing brace (the first column-0 `}`
+    /// Bounded at the function's own closing brace (the first column-0 closing brace
     /// after its signature, which rustfmt guarantees). The earlier form of the
     /// guard below sliced from the signature to the END of the production
     /// half, so it also scanned `load_attach_inputs` further down — which
@@ -3044,7 +3044,7 @@ mod fifth_socket_tests {
             .expect("the rebalance loop exists");
         let rest = &production[loop_start..];
         let end = rest
-            .find("\n}\n")
+            .find("\n\u{7d}\n")
             .expect("the rebalance loop has a closing brace");
         let body = &rest[..end];
         // Non-vacuity: the slice really is the loop, not a stub before it.

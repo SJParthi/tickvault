@@ -510,7 +510,7 @@ mod tests {
     };
 
     #[test]
-    fn a_live_commit_fuller_than_the_disk_copy_is_mirrored() {
+    fn test_on_live_commit_fuller_than_record_on_disk_copy_is_mirrored() {
         let mut ledger = SpillLedger::with_capacity(8);
         let original = copy_of(13, 2, TfIndex::M1, 600, 4, 40);
         assert_eq!(ledger.verdict(&original), SpillVerdict::Write);
@@ -604,7 +604,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_is_older_only_against_a_committed_copy() {
+    fn test_is_older_after_on_replay_commit_only_against_a_committed_copy() {
         let mut ledger = SpillLedger::with_capacity(8);
         let c1 = copy_of(13, 2, TfIndex::M1, 600, 4, 40);
         let c2 = copy_of(13, 2, TfIndex::M1, 600, 5, 40);

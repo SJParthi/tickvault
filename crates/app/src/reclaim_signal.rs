@@ -235,7 +235,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_regression_raw_upload_wake_is_separate_from_the_reclaim_wake() {
+    async fn test_regression_request_raw_upload_wakes_wait_for_raw_upload_or_not_the_reclaim_wait()
+    {
         // One test, run sequentially, so no other test races this permit.
         // With nothing requested the interval elapses.
         assert!(!wait_for_raw_upload_or(Duration::from_millis(1)).await);

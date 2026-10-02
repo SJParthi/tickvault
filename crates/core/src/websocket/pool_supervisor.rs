@@ -4283,12 +4283,6 @@ impl PoolSupervisor {
             .find(|c| c.slot().global_index == global_index)
     }
 
-    /// Read-only view of every registered supervisor.
-    #[must_use]
-    pub fn connections(&self) -> &[ConnectionSupervisor] {
-        &self.connections
-    }
-
     /// Releases one connection of `endpoint` back to the budget and forgets its
     /// supervisor.
     ///

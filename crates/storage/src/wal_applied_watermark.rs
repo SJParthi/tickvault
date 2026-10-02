@@ -1969,7 +1969,7 @@ mod tests {
     }
 
     #[test]
-    fn durability_lag_durable_at_catches_up_to_live_after_a_quiet_lag() {
+    fn test_durable_at_catches_up_to_live_after_a_quiet_lag() {
         let mut lag = DurabilityLag::new();
         lag.record(10 * SEC, 500, 700);
         assert_eq!(lag.durable_at(10 * SEC, LAG), (0, 0));
@@ -2078,7 +2078,7 @@ mod tests {
     }
 
     #[test]
-    fn a_bound_watermark_persists_the_seeded_value_before_any_sample_ages() {
+    fn test_persist_at_writes_the_seeded_value_before_any_sample_ages() {
         let dir = scratch("durability_seed");
         let wm = AppliedWatermark::new_for_tests();
         wm.bind(&dir);
@@ -2132,6 +2132,22 @@ mod tests {
                 assert!(!v.range_is_applied(sink, seq(50), seq(60)));
             }
             assert_eq!(wm.snapshot().hwm_ticks, seq(80), "RAM is unchanged");
+        }
+    }
+
+    #[test]
+    fn test_rescue_floor_is_held_tracks_hold_and_release() {
+        for sink in [AppliedSink::Ticks, AppliedSink::Depth] {
+            let wm = AppliedWatermark::new_for_tests();
+            assert!(!wm.rescue_floor_is_held(sink, seq(50)));
+            let floor = wm.hold_rescue_floor(sink, seq(50), seq(60)).expect("slot");
+            assert!(wm.rescue_floor_is_held(sink, seq(50)), "{sink:?}");
+            assert!(
+                !wm.rescue_floor_is_held(sink, seq(51)),
+                "exact min_seq only"
+            );
+            wm.release_rescue_floor(floor);
+            assert!(!wm.rescue_floor_is_held(sink, seq(50)), "{sink:?}");
         }
     }
 

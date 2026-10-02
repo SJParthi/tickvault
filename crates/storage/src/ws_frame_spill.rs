@@ -10682,7 +10682,7 @@ mod tests {
     /// The segment the writer thread is appending to is invisible to replay
     /// while the writer is alive, and visible again once it has exited.
     #[test]
-    fn replay_never_stages_the_writers_open_segment() {
+    fn test_is_open_segment_keeps_replay_off_the_writers_open_segment() {
         let dir = tmp_dir("wm-open-segment");
         let spill = WsFrameSpill::new(&dir).unwrap();
         spill.append(WsType::LiveFeed, vec![9u8; 16]);

@@ -1168,6 +1168,9 @@ pub fn tick_spill_max_bytes() -> u64 {
     })
 }
 
+// O(1) EXEMPT: begin — the spill fdatasync runs only on the writer and
+// rescue threads after a failed flush, never on the frame drain (the drain's
+// inline spill passes no sync).
 /// How a spill write is made durable before its batch counts as rescued
 /// (Z8a, 2026-10-02). Injectable so a test can make the sync fail.
 pub(crate) type SpillSyncFn = fn(&std::fs::File) -> std::io::Result<()>;
@@ -1182,6 +1185,7 @@ pub(crate) type SpillSyncFn = fn(&std::fs::File) -> std::io::Result<()>;
 pub(crate) fn sync_spill_data(file: &std::fs::File) -> std::io::Result<()> {
     file.sync_data()
 }
+// O(1) EXEMPT: end
 
 /// Writer thread and rescue thread: the spill is synced before the batch
 /// counts as rescued. Both run off the frame drain, so the wait blocks only

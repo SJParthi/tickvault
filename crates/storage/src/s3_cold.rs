@@ -148,6 +148,7 @@ pub(crate) fn resolve_environment_from(
 /// Reads the explicitly-set runtime environment name (`TV_ENVIRONMENT` →
 /// `ENVIRONMENT`); `None` when neither env var is set — archival is then
 /// skipped for the run (F1b fail-closed).
+// TEST-EXEMPT: two env reads; the decision is resolve_environment_from, tested directly
 pub(crate) fn runtime_environment() -> Option<String> {
     resolve_environment_from(
         std::env::var("TV_ENVIRONMENT").ok().as_deref(),
@@ -209,6 +210,7 @@ impl S3Cold {
     /// Wraps an existing client (the partition archiver's stub tests inject
     /// one pointed at a local server).
     #[must_use]
+    // TEST-EXEMPT: struct constructor around an AWS SDK client
     pub(crate) fn from_client(s3: aws_sdk_s3::Client, bucket: String) -> Self {
         Self { s3, bucket }
     }
@@ -244,6 +246,7 @@ impl S3Cold {
     /// precomputed SHA-256 as `x-amz-checksum-sha256`: S3 rejects a body that
     /// does not match it, and stores it as the object's content identity. A
     /// lost race against another writer is a loud 412, never an overwrite.
+    // TEST-EXEMPT: one AWS SDK call; the upload decisions around it are tested through the ColdObjectStore fake
     pub(crate) async fn put_if_absent_path(
         &self,
         path: &Path,
@@ -267,6 +270,7 @@ impl S3Cold {
     }
 
     /// [`Self::put_if_absent_path`] for an in-memory body, with user metadata.
+    // TEST-EXEMPT: one AWS SDK call; the upload decisions around it are tested through the ColdObjectStore fake
     pub(crate) async fn put_if_absent_bytes(
         &self,
         key: &str,
@@ -349,6 +353,12 @@ impl S3Cold {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_hex_encode_known_vectors() {
+        assert_eq!(hex_encode(&[]), "");
+        assert_eq!(hex_encode(&[0x00, 0x0f, 0xab, 0xff]), "000fabff");
+    }
 
     #[test]
     fn classify_existing_needs_length_and_checksum_to_match() {

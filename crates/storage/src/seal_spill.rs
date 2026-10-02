@@ -3795,6 +3795,52 @@ mod pr41a_tests {
     }
 
     #[test]
+    fn test_note_dead_lettered_lets_a_fuller_live_commit_mirror_to_the_spill() {
+        // Z6: a copy that went to the dead-letter file is known to the ledger,
+        // so the amended copy committed live afterwards reaches the spill.
+        let dir = temp_spill_dir("z6-dlq-note");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        let now = pr41a_now();
+        let original = pr41a_copy(13, 1_727_760_000, 4, 40);
+        let amended = pr41a_copy(13, 1_727_760_000, 5, 40);
+        writer.note_dead_lettered(&original);
+        assert_eq!(
+            writer.note_live_commits(&[pr41a_buffered(&amended)], now),
+            1
+        );
+        assert_eq!(writer.read_all(now).expect("read"), vec![amended]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_note_replay_commits_supersedes_an_older_replayed_copy() {
+        let dir = temp_spill_dir("z6-replay-note");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        let now = pr41a_now();
+        let original = pr41a_copy(13, 1_727_760_000, 4, 40);
+        let amended = pr41a_copy(13, 1_727_760_000, 5, 40);
+        writer.append_seal(&original, now).expect("spill original");
+        writer.note_replay_commits(&[pr41a_buffered(&amended)]);
+        assert!(writer.replay_is_superseded(&pr41a_buffered(&original)));
+        assert!(!writer.replay_is_superseded(&pr41a_buffered(&amended)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_escalation_pending_is_shared_and_note_escalation_finished_lowers_it() {
+        let dir = temp_spill_dir("z6-escalation-count");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        let pending = writer.escalation_pending();
+        pending.fetch_add(3, Ordering::SeqCst);
+        assert_eq!(writer.escalation_pending().load(Ordering::SeqCst), 3);
+        writer.note_escalation_finished(2);
+        assert_eq!(pending.load(Ordering::SeqCst), 1);
+        writer.note_escalation_finished(1);
+        assert_eq!(pending.load(Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn pr41a_a_failed_mirror_append_is_counted_and_reported_as_nothing_appended() {
         let dir = temp_spill_dir("pr41a-mirror-fails");
         let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());

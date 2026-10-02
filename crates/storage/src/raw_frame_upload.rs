@@ -399,6 +399,7 @@ async fn put_and_verify<S: ColdObjectStore>(
 
 /// Uploads one segment and writes its marker. Never panics; every failure is
 /// a `Failed` outcome with no marker.
+// TEST-EXEMPT: driven through run_pass in test_marker_matches_after_a_successful_upload, test_regression_size_mismatch_after_upload_writes_no_marker and the reuse/sidecar tests
 pub async fn upload_segment<S: ColdObjectStore>(
     store: &S,
     markers_dir: &Path,
@@ -688,6 +689,7 @@ async fn run_pass_with<S: ColdObjectStore>(
 /// claiming `raw_len` bytes. Kept below every production fn: the loss-counter
 /// guard treats the file's first `#[cfg(test)]` as the end of production code.
 #[cfg(test)]
+// TEST-EXEMPT: test-only helper for the WAL prune tests
 pub(crate) fn write_marker_for_test(markers_dir: &Path, segment: &Path, raw_len: u64) {
     let name = segment
         .file_name()
@@ -839,7 +841,7 @@ mod tests {
     }
 
     #[test]
-    fn upload_window_is_closed_from_0900_to_1540_ist() {
+    fn test_upload_window_open_is_false_from_0900_to_1540_ist() {
         // IST = UTC + 5:30. 2026-09-21 00:00 IST = 2026-09-20T18:30:00Z.
         let midnight_ist: i64 = 1_789_929_000;
         let at = |h: i64, m: i64| midnight_ist + h * 3_600 + m * 60;
@@ -869,7 +871,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn success_writes_a_marker_the_prune_accepts() {
+    async fn test_marker_matches_after_a_successful_upload() {
         let dir = temp_wal_dir("ok");
         let seg = plant(&dir, SEG, b"frames frames frames");
         let store = FakeStore::default();
