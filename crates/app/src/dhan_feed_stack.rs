@@ -13294,13 +13294,7 @@ async fn attach_depth_when_available(
                 // exactly ONE instrument, which is what makes a one-for-one
                 // swap meaningful; depth-20 holds up to 50 and needs its own
                 // shape, which is a separate change.
-                spawn_depth_rebalance(
-                    &questdb,
-                    &spot_prices,
-                    &today_date,
-                    std::mem::take(&mut depth_commands),
-                    probe_cfg,
-                );
+                spawn_depth_rebalance(&today_date, std::mem::take(&mut depth_commands), probe_cfg);
                 if widen.is_none() {
                     return;
                 }
@@ -13394,8 +13388,6 @@ pub fn depth20_track_sockets(
 /// Spawns the per-minute depth rebalance for the rest of the session.
 // TEST-EXEMPT: spawn wrapper over depth200_rebalance_sockets + run_depth_rebalance, both tested.
 fn spawn_depth_rebalance(
-    questdb: &tickvault_common::config::QuestDbConfig,
-    spot_prices: &Arc<crate::spot_price_store::SpotPriceStore>,
     date_ist: &str,
     dialed: DialedDepthCommands,
     // The operator-armed unsubscribe probe's config, threaded from the stack's
@@ -13432,11 +13424,8 @@ fn spawn_depth_rebalance(
         reloaded,
         "depth held-today set: persistence on, reloaded today's contracts"
     );
-    let questdb = questdb.clone();
     let date_ist = date_ist.to_owned();
     tokio::spawn(crate::depth_rebalance::run_depth_rebalance(
-        questdb,
-        Arc::clone(spot_prices),
         date_ist,
         sockets,
         depth20,
