@@ -1703,6 +1703,10 @@ pub struct LiveIngest {
     /// later. That is the case `papaya` is for, and the reason the aggregator's
     /// header gives for rejecting it is the reason to accept it here.
     spot_prices: std::sync::Arc<crate::spot_price_store::SpotPriceStore>,
+    /// Folds ONE copy of each packet for the contracts subscribed twice on
+    /// two main-feed sockets (scope lock 2026-10-02). Inactive, and one `bool`
+    /// test per packet, until the attach publishes the set.
+    backup: crate::main_feed_backup::BackupDedup,
     /// Cumulative volume per contract, ranked per option family.
     ///
     /// Beside `prev_close` and for the same reason: the drain is the only place
@@ -2797,6 +2801,7 @@ impl LiveIngest {
             // up writing a store a different reader is holding. Boot clones
             // the `Arc` straight back out for the attach tasks.
             spot_prices: std::sync::Arc::new(crate::spot_price_store::SpotPriceStore::new()),
+            backup: crate::main_feed_backup::BackupDedup::new(),
             aggregator: {
                 let mut aggregator =
                     MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, capacity);
@@ -8704,6 +8709,9 @@ pub fn drain_main_feed_frame(
         c.frames_wal_unbacked.increment(1);
         ingest.mark_frame_unbacked();
     }
+    // Backup copies (scope lock 2026-10-02): pick up a newly published set and
+    // stamp this socket alive. One relaxed atomic load per frame when idle.
+    ingest.backup.on_frame(frame.connection_index, recv_millis);
     while offset < frame.bytes.len() {
         let Some(len) = main_feed_packet_len(&frame.bytes[offset..]) else {
             // Item 44b (2026-09-22): an unknown code no longer discards the
@@ -8768,6 +8776,24 @@ pub fn drain_main_feed_frame(
             out.length_mismatch = out.length_mismatch.saturating_add(1);
         }
         match dispatch_frame(&frame.bytes[offset..end], received_at_nanos) {
+            // The SECOND copy of a packet for a contract subscribed on two
+            // main-feed sockets (scope lock 2026-10-02): the first copy was
+            // folded and written; this one is counted and skipped whole — no
+            // inline depth, no fold, no row. Not in the backup set: one bool
+            // or one filter-bit test, then the arm below.
+            Ok(ParsedFrame::Tick(ref t) | ParsedFrame::TickWithDepth(ref t, _))
+                if ingest
+                    .backup
+                    .admit_tick(
+                        t,
+                        &frame.bytes[offset..end],
+                        frame.connection_index,
+                        recv_millis,
+                    )
+                    .is_drop() =>
+            {
+                out.backup_dropped = out.backup_dropped.saturating_add(1);
+            }
             Ok(parsed @ (ParsedFrame::Tick(_) | ParsedFrame::TickWithDepth(..))) => {
                 // Full mode carries 5 levels of bid/ask in EVERY tick packet.
                 // Until 2026-08-19 this arm bound them to `_` and threw them
@@ -9024,6 +9050,32 @@ pub fn drain_main_feed_frame(
             // Still counted as non-tick traffic: it carries no LTP and opens no
             // candle, so the frame mix must keep reading the same. This adds a
             // store write, not a fold.
+            //
+            // First: a byte-identical second copy for a backup-set contract
+            // (scope lock 2026-10-02) is counted and not written again.
+            Ok(
+                ParsedFrame::PreviousClose {
+                    security_id,
+                    exchange_segment_code,
+                    ..
+                }
+                | ParsedFrame::OiUpdate {
+                    security_id,
+                    exchange_segment_code,
+                    ..
+                },
+            ) if ingest
+                .backup
+                .admit_aux(
+                    security_id,
+                    exchange_segment_code,
+                    &frame.bytes[offset..end],
+                )
+                .is_drop() =>
+            {
+                c.non_tick.increment(1);
+                out.backup_dropped = out.backup_dropped.saturating_add(1);
+            }
             Ok(ParsedFrame::PreviousClose {
                 security_id,
                 exchange_segment_code,
@@ -9142,6 +9194,10 @@ pub struct FrameOutcome {
     /// Unknown-code packets skipped on a validated length stamp (item 44b).
     /// Their payload was NOT decoded; the packets behind them were.
     pub unknown_skipped: u64,
+    /// Second copies of a backup-set packet (scope lock 2026-10-02): not
+    /// folded and not written, because the first copy already was. The WAL
+    /// holds both.
+    pub backup_dropped: u64,
 }
 
 /// What one depth frame produced.
@@ -10894,6 +10950,9 @@ pub struct DhanFeedStackParams {
     /// created, and config that reaches a decision through a global is config
     /// a test cannot set.
     pub depth_unsubscribe_probe: tickvault_common::config::DepthUnsubscribeProbeConfig,
+    /// `[dhan_universe] backup_top_n` (scope lock 2026-10-02): near-the-money
+    /// contracts given a second copy on another main-feed socket. 0 = off.
+    pub main_feed_backup_top_n: usize,
     pub questdb: QuestDbConfig,
     /// The process-wide write-ahead log every captured frame lands in BEFORE
     /// it is visible to the fold. `None` refuses the lane: capture-at-receipt
@@ -12412,6 +12471,10 @@ async fn attach_depth_when_available(
     // R7 (2026-10-01): the process's dual-instance lock flag, wired into every
     // socket this task dials so no dial happens while the lock is not held.
     instance_lock_held: Arc<AtomicBool>,
+    // `[dhan_universe] backup_top_n` (scope lock 2026-10-02): how many
+    // near-the-money contracts get a second copy on the spot socket once this
+    // attach finishes. 0 = off.
+    backup_top_n: usize,
 ) {
     // Publish a 0 for every contract-failure reason BEFORE the first attempt.
     //
@@ -12523,6 +12586,10 @@ async fn attach_depth_when_available(
     // `top_up_late_contracts` for why a set difference, and not a heuristic,
     // is the only thing standing between a late subscribe and an 804.
     let mut sent_contracts: std::collections::HashSet<(u64, u8)> = std::collections::HashSet::new();
+    // The contracts dialed through the POOL, i.e. whose first copy is on a
+    // contract socket and never on the spot socket. Only these may get a
+    // backup copy on the spot socket (scope lock 2026-10-02).
+    let mut pool_dialed: std::collections::HashSet<(u64, u8)> = std::collections::HashSet::new();
     // Top-up channels for connections that are already live, with the room
     // left on each. Populated by the contract dial and by the spot
     // connection's leftover after the initial overflow.
@@ -12555,6 +12622,9 @@ async fn attach_depth_when_available(
     // rebalance was handed its channels) or given up, while today's spot list
     // is still missing. From then on each attempt runs only the widen.
     let mut widen_only = false;
+    // The backup ranking held while the widen still needs the spot socket's
+    // room (scope lock 2026-10-02); subscribed once the widen is done.
+    let mut backup_pending: Option<Vec<SubscribeInstrument>> = None;
     // How many underlyings had NO spot price at the moment contracts dialed.
     // The top-up's budget is derived from how far this figure has since
     // fallen — see `MAX_CONTRACTS_PER_LATE_UNDERLYING`.
@@ -12660,6 +12730,17 @@ async fn attach_depth_when_available(
                 )
             });
             if done {
+                if let Some(ranked) = backup_pending.take() {
+                    subscribe_main_feed_backup(
+                        backup_top_n,
+                        &ranked,
+                        &pool_dialed,
+                        spot_topup.as_ref(),
+                        spot_topup_used,
+                        &live_topups,
+                    )
+                    .await;
+                }
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_secs(preopen_retry_secs(
@@ -13242,6 +13323,7 @@ async fn attach_depth_when_available(
                         // those contracts out of every later top-up.
                         for instrument in pool_contracts {
                             sent_contracts.insert(contract_identity(instrument));
+                            pool_dialed.insert(contract_identity(instrument));
                         }
                         dial_without_spot = Some(contracts.underlyings_without_spot);
                         // Make them VISIBLE to the silence detector, at the
@@ -13710,10 +13792,23 @@ async fn attach_depth_when_available(
                 // shape, which is a separate change.
                 spawn_depth_rebalance(&today_date, std::mem::take(&mut depth_commands), probe_cfg);
                 if widen.is_none() {
+                    // LAST, after the late top-up window: the backup copies
+                    // take only room nothing authorized still needs.
+                    subscribe_main_feed_backup(
+                        backup_top_n,
+                        &contracts.backup_rank,
+                        &pool_dialed,
+                        spot_topup.as_ref(),
+                        spot_topup_used,
+                        &live_topups,
+                    )
+                    .await;
                     return;
                 }
                 // Audit D3b: keep the pool and the live channels until today's
-                // spot list is on the wire; only the widen runs from here.
+                // spot list is on the wire; only the widen runs from here. The
+                // backup waits for it too, so the spot list keeps its room.
+                backup_pending = Some(contracts.backup_rank.clone());
                 widen_only = true;
                 info!(
                     attempts,
@@ -13730,6 +13825,141 @@ async fn attach_depth_when_available(
         )))
         .await;
     }
+}
+
+/// Longest the attach waits for the spot socket to acknowledge the backup
+/// subscribe. The connection sends at most 50 messages, 25 ms apart.
+const BACKUP_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120); // APPROVED: this IS the named constant the rule asks for
+
+/// Room left on the SPOT socket, where every backup copy goes.
+///
+/// `None` when there is no spot socket to use. After the contract overflow
+/// was handed to it (`spot_topup_used`), its room lives on the `live_topups`
+/// entry for the same channel, already reduced by the overflow and by every
+/// late top-up; before that, on `spot_topup` itself. Never more than the
+/// socket's guard would accept, so the backup can never be refused for
+/// stretching the 5,000 cap.
+fn backup_socket_room(
+    spot_topup: Option<&(tokio::sync::mpsc::Sender<LiveSubscriptionCommand>, usize)>,
+    spot_topup_used: bool,
+    live_topups: &[(tokio::sync::mpsc::Sender<LiveSubscriptionCommand>, usize)],
+) -> Option<usize> {
+    let (tx, spare) = spot_topup?;
+    if !spot_topup_used {
+        return Some(*spare);
+    }
+    Some(
+        live_topups
+            .iter()
+            .find(|(live, _)| live.same_channel(tx))
+            .map_or(0, |(_, room)| *room),
+    )
+}
+
+/// Subscribes the backup copies on the spot socket and, once the socket
+/// confirms them, publishes the set to the drain's dedup (scope lock
+/// 2026-10-02). Cold: once per attach. Returns how many were published.
+///
+/// Only contracts whose first copy went through the POOL (a contract socket)
+/// are eligible, so the two copies are never on one socket, and never more
+/// than the spot socket's room is asked for.
+async fn subscribe_main_feed_backup(
+    top_n: usize,
+    ranked: &[SubscribeInstrument],
+    pool_dialed: &std::collections::HashSet<(u64, u8)>,
+    spot_topup: Option<&(tokio::sync::mpsc::Sender<LiveSubscriptionCommand>, usize)>,
+    spot_topup_used: bool,
+    live_topups: &[(tokio::sync::mpsc::Sender<LiveSubscriptionCommand>, usize)],
+) -> usize {
+    use crate::main_feed_backup::{BACKUP_SUBSCRIBE_COUNTER, plan_backup_set, publish_backup_set};
+    let outcome = |o: &'static str| metrics::counter!(BACKUP_SUBSCRIBE_COUNTER, "outcome" => o);
+    if top_n == 0 {
+        outcome("disabled").increment(1);
+        return 0;
+    }
+    let Some(room) = backup_socket_room(spot_topup, spot_topup_used, live_topups) else {
+        outcome("no_spot_socket").increment(1);
+        warn!(
+            code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+            top_n,
+            "main-feed backup: there is no spot socket to carry the backup copies — the top \
+             contracts have ONE copy each this session"
+        );
+        return 0;
+    };
+    let set = plan_backup_set(ranked, pool_dialed, room, top_n);
+    if set.is_empty() {
+        outcome("no_room").increment(1);
+        warn!(
+            code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+            top_n,
+            room,
+            ranked = ranked.len(),
+            "main-feed backup: no free slot (or no eligible contract) — the top contracts have \
+             ONE copy each this session"
+        );
+        return 0;
+    }
+    let Some((tx, _)) = spot_topup else {
+        return 0;
+    };
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    if let Err(err) = tx.try_send(LiveSubscriptionCommand::Extend {
+        more: set.clone(),
+        ack: Some(ack_tx),
+    }) {
+        outcome("send_refused").increment(1);
+        warn!(
+            code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+            backup = set.len(),
+            %err,
+            "main-feed backup: the spot socket would not take the backup subscribe — the top \
+             contracts have ONE copy each this session"
+        );
+        return 0;
+    }
+    let held: Vec<SubscribeInstrument> =
+        match tokio::time::timeout(BACKUP_ACK_TIMEOUT, ack_rx).await {
+            Ok(Ok(ExtendOutcome::Held)) => {
+                outcome("held").increment(1);
+                set
+            }
+            Ok(Ok(ExtendOutcome::Truncated { not_held })) => {
+                outcome("truncated").increment(1);
+                let cut: std::collections::HashSet<(u64, u8)> =
+                    not_held.iter().map(contract_identity).collect();
+                set.into_iter()
+                    .filter(|i| !cut.contains(&contract_identity(i)))
+                    .collect()
+            }
+            Ok(Ok(ExtendOutcome::Refused)) => {
+                outcome("refused").increment(1);
+                warn!(
+                    code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                    backup = set.len(),
+                    room,
+                    "main-feed backup: the spot socket refused the backup subscribe (its cap) — \
+                     the top contracts have ONE copy each this session"
+                );
+                return 0;
+            }
+            // No answer: the guard may hold them. Deduplicating a contract that
+            // has only one copy changes nothing but a byte-identical re-send,
+            // so the set is published either way.
+            Ok(Err(_)) | Err(_) => {
+                outcome("unacknowledged").increment(1);
+                set
+            }
+        };
+    publish_backup_set(&held);
+    info!(
+        backup = held.len(),
+        room,
+        top_n,
+        "main-feed backup: the top contracts now arrive on two sockets — the spot socket \
+         carries a second copy of each, and the drain folds one"
+    );
+    held.len()
 }
 
 /// Turns the attach's dialed depth channels into the rebalance's socket list.
@@ -16670,6 +16900,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 .clone()
                 .map(|source| RunningWiden::new(source, &params.main_feed_instruments)),
             Arc::clone(&params.instance_lock_held),
+            params.main_feed_backup_top_n,
         ));
     }
 
@@ -18331,10 +18562,21 @@ mod tests {
             widen < contracts,
             "today's spots must be placed before contracts are sized"
         );
+        // The branch subscribes the backup copies (scope lock 2026-10-02),
+        // then returns; the return is still only taken when no widen is
+        // pending, and the D3b keep-open path follows it.
+        let success = body
+            .find("if widen.is_none() {\n")
+            .expect("the success return must wait for the widen");
         assert!(
-            body.contains(concat!(
+            body[success..].starts_with(concat!(
                 "if widen.is_none() {\n",
-                "                    return;"
+                "                    // LAST, after the late top-up window"
+            )) && body[success..].contains(concat!(
+                ".await;\n",
+                "                    return;\n",
+                "                }\n",
+                "                // Audit D3b"
             )),
             "the success return must wait for the widen"
         );
@@ -19425,6 +19667,7 @@ mod tests {
         // socket, no behaviour change.
         let handle = spawn_dhan_feed_stack(DhanFeedStackParams {
             depth_unsubscribe_probe: Default::default(),
+            main_feed_backup_top_n: 0,
             dhan_enabled: false,
             instance_lock_held: Arc::new(AtomicBool::new(false)),
             // A disabled lane never reaches the re-fold, which is exactly why
@@ -26669,6 +26912,82 @@ mod frame_walk_accounting_tests {
                 .as_ref()
                 .is_some_and(|d| d.writer.pending_unbacked()),
             "the inline-depth rows must be marked unbacked"
+        );
+    }
+
+    /// Scope lock 2026-10-02: a backup contract arrives on two sockets. The
+    /// drain folds the first copy and drops the second, so one packet is one
+    /// stored row and one fold step, whichever socket wins.
+    #[test]
+    fn test_drain_main_feed_frame_folds_one_copy_of_a_backup_packet_from_two_sockets() {
+        const SID: u32 = 987_654;
+        let fno = ExchangeSegment::NseFno.binary_code();
+        let mut packet = ticker_packet(SID, 101.25, any_ltt());
+        packet[3] = fno;
+        let frame = |connection_index: u8| CapturedFrame {
+            seq: 1 << 21,
+            endpoint: DhanEndpointType::MainFeed,
+            connection_index,
+            received_at: std::time::Instant::now(),
+            received_at_nanos: tickvault_storage::ws_frame_spill::receipt_nanos_from(
+                std::time::Instant::now(),
+            ),
+            wal_backed: true,
+            bytes: bytes::Bytes::copy_from_slice(&packet),
+        };
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        let (first, second) = {
+            // The published set is process-global. Other tests' ingests may
+            // install it in this window; none of them uses this id.
+            let _guard = crate::main_feed_backup::TEST_PUBLISH_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            crate::main_feed_backup::publish_backup_set(&[SubscribeInstrument {
+                security_id: u64::from(SID),
+                segment: ExchangeSegment::NseFno,
+            }]);
+            // The first frame installs the published set.
+            let first =
+                drain_main_feed_frame(&mut ingest, &frame(0), any_recv_nanos(), 1_000, counters());
+            let second =
+                drain_main_feed_frame(&mut ingest, &frame(4), any_recv_nanos(), 1_001, counters());
+            crate::main_feed_backup::publish_backup_set(&[]);
+            (first, second)
+        };
+        assert_eq!(ingest.backup.len(), 1, "the set was installed by the frame");
+        assert_eq!(first.folded, 1, "the first copy folds");
+        assert_eq!(first.backup_dropped, 0);
+        assert_eq!(second.folded, 0, "the second copy never reaches the fold");
+        assert_eq!(second.backup_dropped, 1);
+        // A contract outside the set is untouched: both copies fold.
+        let mut other = ticker_packet(SID + 1, 101.25, any_ltt());
+        other[3] = fno;
+        let plain = |connection_index: u8| CapturedFrame {
+            bytes: bytes::Bytes::copy_from_slice(&other),
+            ..frame(connection_index)
+        };
+        let a = drain_main_feed_frame(&mut ingest, &plain(0), any_recv_nanos(), 1_002, counters());
+        let b = drain_main_feed_frame(&mut ingest, &plain(4), any_recv_nanos(), 1_003, counters());
+        assert_eq!((a.folded, b.folded), (1, 1));
+        assert_eq!((a.backup_dropped, b.backup_dropped), (0, 0));
+    }
+
+    /// The backup's room is the spot socket's own room: before the contract
+    /// overflow is handed to it, the room it was dialled with; after, the
+    /// matching live top-up entry, already reduced by the overflow.
+    #[test]
+    fn test_backup_socket_room_reads_the_spot_socket_room() {
+        let (spot_tx, _spot_rx) = tokio::sync::mpsc::channel::<LiveSubscriptionCommand>(1);
+        let (other_tx, _other_rx) = tokio::sync::mpsc::channel::<LiveSubscriptionCommand>(1);
+        let spot = (spot_tx.clone(), 4_132usize);
+        assert_eq!(backup_socket_room(None, false, &[]), None);
+        assert_eq!(backup_socket_room(Some(&spot), false, &[]), Some(4_132));
+        let live = [(other_tx.clone(), 10usize), (spot_tx, 2_662usize)];
+        assert_eq!(backup_socket_room(Some(&spot), true, &live), Some(2_662));
+        // Used but not found among the live sockets: no room, never a guess.
+        assert_eq!(
+            backup_socket_room(Some(&spot), true, &[(other_tx, 10usize)]),
+            Some(0)
         );
     }
 

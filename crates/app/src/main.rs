@@ -3250,6 +3250,9 @@ async fn async_main() -> Result<()> {
             // as every flag false, so a default build never empties a
             // depth-200 socket to measure anything.
             depth_unsubscribe_probe: config.depth_unsubscribe_probe,
+            // A second copy of the top contracts on another main-feed socket
+            // (scope lock 2026-10-02). 0 turns it off.
+            main_feed_backup_top_n: config.dhan_universe.backup_top_n,
             dhan_enabled: config.feeds.dhan_enabled,
             instance_lock_held: std::sync::Arc::clone(&dhan_instance_lock_held),
             // Frames a previous session captured but died before folding. The

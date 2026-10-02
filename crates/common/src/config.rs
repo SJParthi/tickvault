@@ -1105,6 +1105,19 @@ pub struct DhanUniverseConfig {
     /// visible in the boot log.
     #[serde(default)]
     pub live_subscription_from_master: bool,
+
+    /// How many near-the-money option contracts get a SECOND, backup copy on
+    /// another main-feed socket, so a dropped socket does not cost their
+    /// ticks. `0` disables it. Default 1,000 (operator, 2026-10-02 —
+    /// `websocket-connection-scope-lock.md`, "2026-10-02 — A BACKUP COPY OF
+    /// THE TOP CONTRACTS"). Only free slots are used: the effective count is
+    /// `min(this, room on the backup socket)`.
+    #[serde(default = "default_main_feed_backup_top_n")]
+    pub backup_top_n: usize,
+}
+
+const fn default_main_feed_backup_top_n() -> usize {
+    1_000
 }
 
 const fn default_dhan_universe_target_secs() -> u32 {
@@ -1124,6 +1137,7 @@ impl Default for DhanUniverseConfig {
             live_subscription_from_master: false,
             spot_universe_fno_underlyings_only: false,
             spot_universe_ntm_only: false,
+            backup_top_n: default_main_feed_backup_top_n(),
         }
     }
 }
@@ -4677,6 +4691,29 @@ mod tests {
             d.trading_hours_only,
             "default must gate to NSE trading hours"
         );
+    }
+
+    #[test]
+    fn test_dhan_universe_backup_top_n_defaults_to_1000_and_zero_disables() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            dhan_universe: DhanUniverseConfig,
+        }
+        // A section written before the key existed reads the operator's 1,000.
+        let absent: Wrapper = Figment::new()
+            .merge(Toml::string("[dhan_universe]\nenabled = true\n"))
+            .extract()
+            .expect("absent backup_top_n must default");
+        assert_eq!(absent.dhan_universe.backup_top_n, 1_000);
+        assert_eq!(DhanUniverseConfig::default().backup_top_n, 1_000);
+        let off: Wrapper = Figment::new()
+            .merge(Toml::string("[dhan_universe]\nbackup_top_n = 0\n"))
+            .extract()
+            .expect("0 parses");
+        assert_eq!(off.dhan_universe.backup_top_n, 0);
     }
 
     #[test]

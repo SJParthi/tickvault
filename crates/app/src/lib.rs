@@ -149,6 +149,9 @@ pub mod dhan_universe;
 /// unchanged verified archive→drop and REFUSES to delete anything further
 /// when nothing reclaimable remains (STORAGE-GAP-05). DEFAULT-OFF via serde.
 pub mod disk_pressure_boot;
+/// Backup copies of the top contracts on a second main-feed socket, and the
+/// drain-side dedup that folds one copy of each packet (scope lock 2026-10-02).
+pub mod main_feed_backup;
 /// RAM residency stores boot (operator directive 2026-07-16, PR-2):
 /// installs the month-deep spot bar rings + current-day chain minute ring,
 /// runs the bounded chain-day rehydrate, and publishes the depth gauges.
