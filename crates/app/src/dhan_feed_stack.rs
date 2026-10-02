@@ -5885,6 +5885,33 @@ const _: () = assert!(
     "the main-feed share must hold many maximum-size frames"
 );
 
+// WAL replay resyncs past a bad record by scanning for the next record whose
+// declared length is at most `WAL_RESYNC_MAX_FRAME_BYTES` (Z11a). A transport
+// cap above that ceiling would let a legitimately written frame be refused as a
+// resync candidate, so a record after damage that carries such a frame would be
+// skipped instead of recovered. Asserted here because the storage crate cannot
+// see the transport caps; one line per endpoint that spills to the WAL.
+const _: () = assert!(
+    tickvault_core::websocket::connection::MAIN_FEED_MAX_FRAME_BYTES
+        <= tickvault_storage::ws_frame_spill::WAL_RESYNC_MAX_FRAME_BYTES,
+    "the main-feed frame cap must fit under the WAL resync length ceiling"
+);
+const _: () = assert!(
+    tickvault_core::websocket::connection::DEPTH_20_MAX_FRAME_BYTES
+        <= tickvault_storage::ws_frame_spill::WAL_RESYNC_MAX_FRAME_BYTES,
+    "the depth-20 frame cap must fit under the WAL resync length ceiling"
+);
+const _: () = assert!(
+    tickvault_core::websocket::connection::DEPTH_200_MAX_FRAME_BYTES
+        <= tickvault_storage::ws_frame_spill::WAL_RESYNC_MAX_FRAME_BYTES,
+    "the depth-200 frame cap must fit under the WAL resync length ceiling"
+);
+const _: () = assert!(
+    tickvault_core::parser::order_update::ORDER_UPDATE_MAX_FRAME_BYTES
+        <= tickvault_storage::ws_frame_spill::WAL_RESYNC_MAX_FRAME_BYTES,
+    "the order-update frame cap must fit under the WAL resync length ceiling"
+);
+
 /// Counter: frames taken off the ring, labelled by what the parser made of
 /// them.
 pub const DRAIN_FRAMES_COUNTER: &str = "tv_dhan_feed_drain_frames_total";
