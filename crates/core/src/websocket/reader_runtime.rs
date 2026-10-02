@@ -153,6 +153,7 @@ pub fn install_reader_runtime(threads: usize) -> std::io::Result<ReaderRuntimeIn
 /// The installed reader runtime's handle, if any.
 #[must_use]
 pub fn reader_runtime_handle() -> Option<tokio::runtime::Handle> {
+    // APPROVED: Handle is an Arc; cloned once per socket spawn, never per frame
     READER_RUNTIME.get().map(|rt| rt.handle().clone())
 }
 

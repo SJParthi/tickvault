@@ -349,14 +349,14 @@ fn nanos_to_secs(nanos: u64) -> f64 {
     // Whole microseconds through u32 is lossless up to ~71 minutes, which is
     // far past any age worth reading; beyond that it saturates.
     let micros = u32::try_from(nanos / 1_000).unwrap_or(u32::MAX);
-    // DATA-INTEGRITY-EXEMPT: a duration in microseconds, not price data
+    // APPROVED: a duration in whole microseconds (u32), not an f32 price
     f64::from(micros) / 1_000_000.0
 }
 
 fn nanos_to_f64(nanos: u64) -> f64 {
     // Same lossless-u32 shape; a max above ~4.3 s saturates, which is
     // already a stall the over-budget counter has counted.
-    // DATA-INTEGRITY-EXEMPT: a duration in nanoseconds, not price data
+    // APPROVED: a duration in whole nanoseconds (u32), not an f32 price
     f64::from(u32::try_from(nanos).unwrap_or(u32::MAX))
 }
 

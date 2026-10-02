@@ -622,9 +622,10 @@ async fn fetch_creds(limit: Duration) -> Option<PgCreds> {
 /// variables (empty when SSM failed), so a compose recreate interpolates the
 /// `${TV_QUESTDB_PG_*:?}` required keys from them.
 fn with_compose_env(mut cmd: Command, creds: Option<&PgCreds>) -> Command {
-    let (user, password) = creds.map_or(("", ""), |c| {
-        (c.user.expose_secret(), c.password.expose_secret())
-    });
+    let (user, password) = match creds {
+        Some(c) => (c.user.expose_secret(), c.password.expose_secret()),
+        None => ("", ""),
+    };
     cmd.env("TV_QUESTDB_PG_USER", user)
         .env("TV_QUESTDB_PG_PASSWORD", password);
     cmd
@@ -1320,7 +1321,7 @@ mod tests {
         );
         // Value-less `-e NAME`: no `=` after either credential name.
         assert!(!joined.contains("QDB_PG_USER="));
-        assert!(!joined.contains("QDB_PG_PASSWORD="));
+        assert!(!joined.contains("QDB_PG_PASSWORD=")); // secret-scan-ignore: asserts no value is passed
         assert_eq!(args.last().map(String::as_str), Some(IMAGE));
     }
 
