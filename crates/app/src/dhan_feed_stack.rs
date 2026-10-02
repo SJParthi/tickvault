@@ -11976,16 +11976,32 @@ struct WidenCtx<'a> {
     instance_lock_held: &'a Arc<AtomicBool>,
 }
 
-/// Room for NEW main-feed connections the widen may open. Zero once Dhan has
-/// answered with 805 (too many connections) in this process: Dhan closes the
-/// OLDEST healthy socket for each extra one, so a new connection would trade a
-/// live socket for itself (the same breaker the depth dial obeys, audit PR21).
+/// Room for NEW main-feed connections the widen may open. Zero from the moment
+/// Dhan answers with 805 (too many connections): Dhan closes the OLDEST healthy
+/// socket for each extra one, so a new connection would trade a live socket for
+/// itself.
+///
+/// D7 (2026-10-02): decided by the main-feed overflow episode, not by the
+/// depth breaker `rotation_halted()`. The episode reopens the room only after
+/// every main-feed socket parked for 805 has come back and passed its two-minute
+/// watch. The depth breaker is never cleared in-session, so depth dials and
+/// depth rotation stay refused exactly as before.
 #[must_use]
 fn widen_pool_room(main_feed_connections_used: usize) -> usize {
-    if tickvault_core::websocket::pool_supervisor::rotation_halted() {
-        0
-    } else {
+    widen_pool_room_for(
+        tickvault_core::websocket::pool_supervisor::main_feed_overflow_widen_permitted(),
+        main_feed_connections_used,
+    )
+}
+
+/// The pure half of [`widen_pool_room`]: no room unless the overflow episode
+/// permits new main-feed connections.
+#[must_use]
+fn widen_pool_room_for(widen_permitted: bool, main_feed_connections_used: usize) -> usize {
+    if widen_permitted {
         remaining_main_feed_capacity(main_feed_connections_used)
+    } else {
+        0
     }
 }
 
@@ -14100,6 +14116,14 @@ fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize 
         let sink = match ws_audit_tx {
             Some(tx) => sink.with_audit(tx.clone()),
             None => sink,
+        };
+        // D7 (2026-10-02): a MAIN-FEED socket parked by 805 waits for the
+        // overflow probe instead of ending its task. `with_overflow_probe`
+        // ignores every other endpoint, so depth sockets stay parked.
+        let sink = if endpoint == DhanEndpointType::MainFeed {
+            sink.with_overflow_probe()
+        } else {
+            sink
         };
         // R7 (2026-10-01): no dial while this process does not hold the
         // dual-instance lock. Live sockets are never closed by it.
@@ -29219,6 +29243,54 @@ mod socket_stop_tests {
                 .count(),
             1,
             "the one production sink construction must opt into SOCKET_STOP"
+        );
+    }
+
+    /// D7: the widen's room follows the main-feed overflow episode. Zero while
+    /// the episode forbids new main-feed connections, the normal capacity once
+    /// it allows them.
+    #[test]
+    fn test_widen_pool_room_for_is_zero_until_the_probe_passes() {
+        assert_eq!(widen_pool_room_for(false, 0), 0);
+        assert_eq!(widen_pool_room_for(false, 3), 0);
+        assert_eq!(
+            widen_pool_room_for(true, 1),
+            remaining_main_feed_capacity(1),
+            "permitted = the ordinary remaining capacity"
+        );
+        assert_eq!(
+            widen_pool_room(2),
+            widen_pool_room_for(
+                tickvault_core::websocket::pool_supervisor::main_feed_overflow_widen_permitted(),
+                2
+            )
+        );
+    }
+
+    /// D7: the widen reads the overflow episode, not the depth breaker, and
+    /// only main-feed sinks opt into the probe.
+    #[test]
+    fn the_widen_reads_the_overflow_episode_and_only_main_feed_sinks_opt_in() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let marker = concat!("#[cfg(", "test)]");
+        let production = src.split(marker).next().unwrap_or(src);
+        let widen = production
+            .split_once("fn widen_pool_room(")
+            .expect("widen_pool_room")
+            .1;
+        let end = widen.find("fn widen_pool_room_for(").unwrap_or(widen.len());
+        let widen = &widen[..end];
+        assert!(widen.contains("main_feed_overflow_widen_permitted()"));
+        assert!(!widen.contains("rotation_halted()"));
+        assert_eq!(production.matches("sink.with_overflow_probe()").count(), 1);
+        let opt = production
+            .find("sink.with_overflow_probe()")
+            .expect("opt-in");
+        assert!(
+            production[..opt]
+                .rfind("if endpoint == DhanEndpointType::MainFeed")
+                .is_some_and(|at| opt - at < 200),
+            "the probe opt-in must be limited to the main feed"
         );
     }
 }

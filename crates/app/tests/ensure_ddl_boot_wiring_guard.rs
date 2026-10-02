@@ -302,6 +302,9 @@ fn test_every_live_table_ensure_fn_keeps_its_boot_call_site() {
         ("ensure_pnl_audit_table", "src/order_observability.rs"),
         // ws_event_audit — SEBI-retentioned lifecycle forensics
         ("ensure_ws_event_audit_table", "src/ws_audit_consumer.rs"),
+        // feed_gap_audit — one row per reconnect gap (2026-10-02), ensured by
+        // its own writer task before the first row, like ws_event_audit.
+        ("ensure_feed_gap_audit_table", "src/ws_audit_consumer.rs"),
         // scoreboard tables — 15:45 IST aggregation
         (
             "ensure_feed_scoreboard_tables",

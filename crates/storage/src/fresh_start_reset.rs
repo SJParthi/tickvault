@@ -197,6 +197,7 @@ pub const SEBI_NEVER_RESET: &[&str] = &[
     "order_update_events",
     "position_update_events",
     "ws_event_audit",
+    "feed_gap_audit",
 ];
 
 /// Byte-wise `str` equality usable in a `const` context.

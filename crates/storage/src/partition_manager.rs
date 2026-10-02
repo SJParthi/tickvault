@@ -137,6 +137,10 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // partition loses nothing that `ws_event_audit` and `feed_episode_audit`
     // do not still hold.
     "ws_connection_daily",
+    // (2026-10-02) one row per live-feed reconnect gap, paired from the
+    // `ws_event_audit` lifecycle rows by the app forwarder. Same SEBI-audit
+    // class + DAY partitioning; `feed` is in the DEDUP key.
+    "feed_gap_audit",
     // (2026-08-29, per-table disk-footprint measurement): one row per
     // (trading day, table) recording OBSERVED disk bytes. Same SEBI-audit
     // class + DAY partitioning as the scoreboard tables above. Swept with
