@@ -676,6 +676,22 @@ pub const WAL_SPILL_SHUTDOWN_BUDGET_SECS: u64 = 10;
 /// [`WAL_SPILL_SHUTDOWN_BUDGET_SECS`] as a `Duration`.
 pub const WAL_SPILL_SHUTDOWN_BUDGET: Duration = Duration::from_secs(WAL_SPILL_SHUTDOWN_BUDGET_SECS);
 
+/// How long the panic hook waits for the WAL writer before letting the process
+/// abort (Z11b, 2026-10-02). See [`drain_registered_for_abort`].
+///
+/// An idle writer acknowledges within one [`WAL_WRITER_STOP_POLL`] (200 ms), a
+/// busy one at the end of the first batch that leaves the channel empty, so two
+/// seconds is a stall budget: the abort is delayed at most this long, never
+/// held open by a wedged disk.
+pub const WAL_ABORT_DRAIN_BUDGET: Duration = Duration::from_secs(2); // APPROVED: this IS the named constant the rule asks for
+
+/// How often [`drain_registered_for_abort`] re-checks the writer's ack.
+const WAL_ABORT_DRAIN_POLL: Duration = Duration::from_millis(5); // APPROVED: this IS the named constant the rule asks for
+
+/// The WAL writer thread's name. The panic hook compares against it, because
+/// the writer cannot wait for itself.
+pub const WAL_WRITER_THREAD_NAME: &str = "ws-frame-spill-writer";
+
 /// Records still queued when the final drain was abandoned — i.e. frames that
 /// were captured, acknowledged as `Spilled`, and then lost with the process.
 ///
@@ -894,6 +910,107 @@ pub struct WsFrameSpill {
     /// exists. Never read — its ONLY job is to keep the `flock` taken, and to
     /// release it on drop so the next process can start. See [`WalDirGuard`].
     _dir_guard: Option<WalDirGuard>,
+    /// The panic hook's handshake with this spill's writer (Z11b). Production
+    /// reaches it only through [`ABORT_DRAIN`]; tests hold it here so parallel
+    /// tests never drain one another's spill.
+    #[cfg(test)]
+    abort_drain: Arc<AbortDrain>,
+}
+
+/// Handshake between the panic hook and the WAL writer (Z11b, 2026-10-02).
+///
+/// # Why it exists
+///
+/// The release profile sets `panic = "abort"`, so a panic on ANY thread ends
+/// the process the moment the hook returns. Every record still in the spill
+/// channel then dies with it, and each one was already reported to its caller
+/// as `Spilled`; Dhan never resends. Bytes the writer has already flushed are
+/// in the page cache and survive the abort. The hook still runs before the
+/// abort, so it can give the writer a bounded moment to empty the channel.
+///
+/// # The protocol
+///
+/// The hook bumps `req` and waits until `ack >= ` its value. The writer
+/// stores `ack = req` only at a point where everything it has taken off the
+/// channel is flushed to the kernel AND the channel is empty, loading `req`
+/// BEFORE checking emptiness. So an ack covering a request proves that, at some
+/// instant after the request, nothing queued before it was still in memory.
+/// A writer that has exited stores `u64::MAX`.
+///
+/// `queued_bytes == 0` alone would not do: the writer releases a record's
+/// bytes when it RECEIVES it, before the batch is written and flushed.
+#[derive(Debug, Default)]
+struct AbortDrain {
+    req: AtomicU64,
+    ack: AtomicU64,
+}
+
+impl AbortDrain {
+    /// Writer side. Called only right after a batch flush, or after
+    /// `recv_timeout` found nothing (the previous batch was flushed before
+    /// that wait began). O(1): two atomics and a channel length read.
+    fn ack_if_drained(&self, rx: &Receiver<WalRecord>) {
+        let r = self.req.load(Ordering::SeqCst);
+        if r != 0 && rx.is_empty() {
+            self.ack.fetch_max(r, Ordering::SeqCst);
+        }
+    }
+
+    /// Writer side: the writer is gone, so no request can ever be served
+    /// better than it already has been.
+    fn writer_exited(&self) {
+        self.ack.store(u64::MAX, Ordering::SeqCst);
+    }
+
+    /// Hook side: request a drain and wait for the ack, bounded by `budget`.
+    fn wait(&self, budget: Duration) -> AbortDrainOutcome {
+        let target = self.req.fetch_add(1, Ordering::SeqCst).saturating_add(1);
+        let deadline = Instant::now() + budget;
+        loop {
+            if self.ack.load(Ordering::SeqCst) >= target {
+                return AbortDrainOutcome::Drained;
+            }
+            if Instant::now() >= deadline {
+                return AbortDrainOutcome::TimedOut;
+            }
+            thread::sleep(WAL_ABORT_DRAIN_POLL);
+        }
+    }
+}
+
+/// The live spill's [`AbortDrain`], for the panic hook. The last spill
+/// constructed wins; production constructs exactly one.
+static ABORT_DRAIN: arc_swap::ArcSwapOption<AbortDrain> = arc_swap::ArcSwapOption::const_empty();
+
+/// What [`drain_registered_for_abort`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbortDrainOutcome {
+    /// The writer confirmed an empty channel with everything flushed.
+    Drained,
+    /// The budget ran out first (a wedged disk, or a feed that never let the
+    /// channel empty). Whatever is still queued dies with the process.
+    TimedOut,
+    /// No spill was ever constructed in this process.
+    NoSpill,
+    /// Called on the writer thread itself, which cannot wait for itself.
+    SkippedOnWriterThread,
+}
+
+/// Gives the WAL writer up to `budget` to empty the spill channel before a
+/// `panic = "abort"` process dies (Z11b). Called by the app's panic hook.
+///
+/// Honest limit: a panic ON the writer thread loses its queue regardless.
+/// Draining it from the hook would re-run the code that just panicked, so
+/// that case returns [`AbortDrainOutcome::SkippedOnWriterThread`] at once.
+/// Blocking by design (the process is about to abort); never on a hot path.
+pub fn drain_registered_for_abort(budget: Duration) -> AbortDrainOutcome {
+    if thread::current().name() == Some(WAL_WRITER_THREAD_NAME) {
+        return AbortDrainOutcome::SkippedOnWriterThread;
+    }
+    match ABORT_DRAIN.load_full() {
+        Some(d) => d.wait(budget),
+        None => AbortDrainOutcome::NoSpill,
+    }
 }
 
 impl WsFrameSpill {
@@ -983,6 +1100,8 @@ impl WsFrameSpill {
         let wal_dir_for_thread = wal_dir.clone(); // APPROVED: one-shot constructor, not per-frame
         let stop = Arc::new(AtomicBool::new(false));
         let stop_for_thread = Arc::clone(&stop); // APPROVED: Arc clone in the one-shot constructor
+        let abort_drain = Arc::new(AbortDrain::default());
+        let abort_drain_for_thread = Arc::clone(&abort_drain); // APPROVED: Arc clone in the one-shot constructor
 
         // Register the abandoned-records series at zero. The CloudWatch agent
         // computes counter deltas and DROPS the first sample of a series it has
@@ -998,15 +1117,24 @@ impl WsFrameSpill {
         metrics::counter!(WAL_REPLAY_RESTORE_FAILED_COUNTER).increment(0);
 
         let writer = thread::Builder::new()
-            .name("ws-frame-spill-writer".to_string()) // APPROVED: one-shot constructor (thread name)
+            .name(WAL_WRITER_THREAD_NAME.to_string()) // APPROVED: one-shot constructor (thread name)
             .spawn(move || {
                 // Supervisor loop (mirrors WS-GAP-05 pool supervisor +
-                // DISK-WATCHER-01). A panic or a fatal return from the writer
-                // must NOT silently kill the durable WAL floor: we re-enter
+                // DISK-WATCHER-01). A fatal RETURN from the writer must NOT
+                // silently kill the durable WAL floor: we re-enter
                 // `writer_loop` with the SAME `rx`, so `append()` never sees
                 // `Disconnected` and every Dhan frame keeps being captured.
-                // `rx` is owned here and only borrowed per iteration → it
-                // outlives any panic, keeping the channel alive across respawns.
+                // `rx` is owned here and only borrowed per iteration, so it
+                // outlives each attempt.
+                //
+                // CORRECTED 2026-10-02 (Z11b): this comment used to promise the
+                // same respawn after a PANIC. That holds only in dev and test
+                // builds. The release profile sets `panic = "abort"`, so a
+                // writer panic there ends the process and `catch_unwind` never
+                // returns; the `Err(_panic)` arm below is reachable only under
+                // unwinding. What release does get is the panic hook's bounded
+                // wait (`drain_registered_for_abort`) when ANOTHER thread
+                // panics; a panic on this thread loses its queue.
                 loop {
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         writer_loop(
@@ -1015,12 +1143,14 @@ impl WsFrameSpill {
                             &persisted_for_thread,
                             &stop_for_thread,
                             &queued_bytes_for_thread,
+                            &abort_drain_for_thread,
                         )
                     }));
                     match outcome {
                         Ok(Ok(())) => {
                             // Clean shutdown: all senders dropped, channel closed.
                             info!("ws-frame-spill-writer exited cleanly (channel closed)");
+                            abort_drain_for_thread.writer_exited();
                             break;
                         }
                         Ok(Err(err)) => {
@@ -1049,8 +1179,12 @@ impl WsFrameSpill {
                     }
                     thread::sleep(WAL_WRITER_RESPAWN_BACKOFF);
                 }
+                // Z11d: whatever landed after the last empty poll is about to
+                // drop with `rx`. Count it rather than lose it silently.
+                count_records_left_at_writer_exit(&rx);
             })
             .map_err(|e| anyhow::anyhow!("spawn spill writer thread: {e}"))?;
+        ABORT_DRAIN.store(Some(Arc::clone(&abort_drain))); // APPROVED: Arc clone in the one-shot constructor
 
         Ok(Self {
             spill_tx: tx,
@@ -1063,6 +1197,8 @@ impl WsFrameSpill {
             writer: std::sync::Mutex::new(Some(writer)),
             wal_dir,
             _dir_guard: dir_guard,
+            #[cfg(test)]
+            abort_drain,
         })
     }
 
@@ -1110,6 +1246,7 @@ impl WsFrameSpill {
             writer: std::sync::Mutex::new(None),
             wal_dir: dir.clone(),
             _dir_guard: dir_guard,
+            abort_drain: Arc::new(AbortDrain::default()),
         }
     }
 
@@ -1605,12 +1742,41 @@ fn finalise_segment(
     }
 }
 
+/// Counts, and empties, what is still in the spill channel when the writer
+/// thread is about to exit and drop it (Z11d, 2026-10-02). Returns the count.
+///
+/// The writer exits on a stop only after a whole poll with the channel empty,
+/// but an `append` can still land between that poll and the thread dropping
+/// `rx`. Such a record was acknowledged as `Spilled` and is never written; it
+/// used to vanish with the channel uncounted. It now moves
+/// [`WAL_SPILL_SHUTDOWN_INCOMPLETE_COUNTER`] and logs a coded error, the same
+/// accounting `WsFrameSpill::shutdown` gives records left at its deadline.
+///
+/// Honest limit: an append landing after this count and before the drop is
+/// still uncounted. That window is a few instructions, against the poll-long
+/// one it replaces. Since Z11d `main` closes the sockets before the WAL, so
+/// this should read zero on every clean stop.
+fn count_records_left_at_writer_exit(rx: &Receiver<WalRecord>) -> usize {
+    let left = rx.try_iter().count();
+    if left > 0 {
+        metrics::counter!(WAL_SPILL_SHUTDOWN_INCOMPLETE_COUNTER).increment(left as u64);
+        error!(
+            code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+            left,
+            "WAL spill writer exited with records still in its channel — these frames \
+             were captured and acknowledged but never written; they are gone"
+        );
+    }
+    left
+}
+
 fn writer_loop(
     rx: &Receiver<WalRecord>,
     wal_dir: &Path,
     persisted: &AtomicU64,
     stop: &AtomicBool,
     queued_bytes: &AtomicU64,
+    abort_drain: &AbortDrain,
 ) -> anyhow::Result<()> {
     /// Releases a record's byte reservation the instant it leaves the channel.
     ///
@@ -1680,6 +1846,9 @@ fn writer_loop(
                     clear_open_segment_under(wal_dir);
                     return Ok(());
                 }
+                // Nothing arrived for a whole poll and the previous batch was
+                // flushed before this wait began: a pending abort drain is done.
+                abort_drain.ack_if_drained(rx);
                 // A lull. Before 2026-10-02 only a NEW record could trigger the
                 // rate-limited sync, so the last batch before a quiet spell sat in
                 // the page cache until the next record arrived, leaving the
@@ -1741,6 +1910,10 @@ fn writer_loop(
             current = None;
             thread::sleep(WAL_WRITER_IO_RETRY_BACKOFF);
         }
+        // Everything taken off the channel so far has now been flushed (or its
+        // failure reported): serve a pending abort drain if the channel is
+        // empty too. Once per batch, never per record.
+        abort_drain.ack_if_drained(rx);
 
         // AFTER the flush, never before: syncing a file whose latest records
         // are still sitting in the BufWriter would force the previous batch to
@@ -11024,6 +11197,155 @@ mod tests {
                 proptest::prop_assert_eq!(read.frames.len(), payloads.len());
             }
         }
+    }
+
+    // --- Z11d: records left at writer exit are counted (2026-10-02) ---------
+
+    /// What used to drop silently with the writer's channel is now counted
+    /// and emptied.
+    #[test]
+    fn test_regression_records_enqueued_after_writer_exit_are_counted_not_silent() {
+        let (tx, rx) = bounded::<WalRecord>(8);
+        for k in 0..3u64 {
+            tx.try_send(WalRecord {
+                ws_type: WsType::LiveFeed,
+                frame_seq: k + 1,
+                received_at_nanos: WAL_RECEIPT_UNKNOWN_NANOS,
+                endpoint: WalEndpoint::MainFeed,
+                frame: Bytes::from_static(b"late"),
+            })
+            .unwrap();
+        }
+        assert_eq!(count_records_left_at_writer_exit(&rx), 3);
+        assert!(rx.is_empty());
+        assert_eq!(
+            count_records_left_at_writer_exit(&rx),
+            0,
+            "a clean exit reads zero"
+        );
+    }
+
+    /// The writer thread reaches the count on its way out.
+    #[test]
+    fn the_writer_thread_counts_its_channel_before_dropping_it() {
+        let src = include_str!("ws_frame_spill.rs");
+        let spawn_at = src
+            .find(".name(WAL_WRITER_THREAD_NAME.to_string())")
+            .expect("writer spawn");
+        let spawn = &src[spawn_at..];
+        let end = spawn
+            .find(".map_err(|e| anyhow::anyhow!(\"spawn spill writer thread")
+            .expect("end of spawn");
+        assert!(
+            spawn[..end].contains("count_records_left_at_writer_exit(&rx);"),
+            "the writer closure must count what is left before rx drops"
+        );
+    }
+
+    // --- Z11b: the panic hook's bounded drain (2026-10-02) ------------------
+
+    /// Frames in every `*.wal` file directly under `dir`, read from disk
+    /// through a fresh descriptor: exactly what would survive an abort.
+    fn z11b_frames_on_disk(dir: &Path) -> usize {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "wal"))
+            .map(|p| {
+                read_segment_frames_matching(&p, &|_, _| true)
+                    .unwrap()
+                    .frames
+                    .len()
+            })
+            .sum()
+    }
+
+    /// The pin for Z11b: once the drain returns `Drained`, every frame
+    /// appended before it is in the kernel, not in process memory, so a
+    /// `panic = "abort"` straight after loses none of them.
+    #[test]
+    fn test_regression_drain_for_abort_returns_once_the_queue_is_empty() {
+        const N: usize = 20_000;
+        let dir = tmp_dir("abort-drain");
+        let spill = WsFrameSpill::new(&dir).unwrap();
+        for k in 0..N {
+            let outcome = spill.append(WsType::LiveFeed, vec![(k % 251) as u8; 256]);
+            assert_eq!(outcome, AppendOutcome::Spilled);
+        }
+        let outcome = spill.abort_drain.wait(Duration::from_secs(10));
+        assert_eq!(outcome, AbortDrainOutcome::Drained);
+        assert_eq!(spill.queued_records(), 0);
+        assert_eq!(
+            z11b_frames_on_disk(&dir),
+            N,
+            "every frame appended before the drain is on disk when it returns"
+        );
+        drop(spill);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An idle writer acknowledges within one stop poll, well inside the
+    /// hook's budget.
+    #[test]
+    fn drain_for_abort_on_an_idle_writer_is_prompt() {
+        let dir = tmp_dir("abort-drain-idle");
+        let spill = WsFrameSpill::new(&dir).unwrap();
+        let started = Instant::now();
+        assert_eq!(
+            spill.abort_drain.wait(WAL_ABORT_DRAIN_BUDGET),
+            AbortDrainOutcome::Drained
+        );
+        assert!(started.elapsed() < WAL_ABORT_DRAIN_BUDGET);
+        drop(spill);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A writer that never answers (wedged disk, dead thread) cannot hold
+    /// the abort past the budget.
+    #[test]
+    fn drain_for_abort_is_bounded_when_the_writer_is_wedged() {
+        let wedged = AbortDrain::default();
+        let started = Instant::now();
+        assert_eq!(
+            wedged.wait(Duration::from_millis(50)),
+            AbortDrainOutcome::TimedOut
+        );
+        let took = started.elapsed();
+        assert!(took >= Duration::from_millis(50), "{took:?}");
+        assert!(took < Duration::from_secs(1), "{took:?}");
+
+        let exited = AbortDrain::default();
+        exited.writer_exited();
+        assert_eq!(
+            exited.wait(Duration::from_secs(5)),
+            AbortDrainOutcome::Drained,
+            "a writer that has exited has nothing left to drain"
+        );
+    }
+
+    /// The writer cannot wait for itself: on its own thread the drain
+    /// returns at once instead of burning the budget.
+    #[test]
+    fn drain_registered_for_abort_skips_the_writer_thread() {
+        let outcome = std::thread::Builder::new()
+            .name(WAL_WRITER_THREAD_NAME.to_string())
+            .spawn(|| {
+                let started = Instant::now();
+                let o = drain_registered_for_abort(Duration::from_secs(5));
+                (o, started.elapsed())
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(outcome.0, AbortDrainOutcome::SkippedOnWriterThread);
+        assert!(outcome.1 < Duration::from_millis(100));
+
+        // Off the writer thread it consults the registered spill and stays
+        // inside its budget whatever it finds.
+        let started = Instant::now();
+        let o = drain_registered_for_abort(Duration::from_millis(300));
+        assert!(started.elapsed() < Duration::from_secs(2), "{o:?}");
     }
 }
 

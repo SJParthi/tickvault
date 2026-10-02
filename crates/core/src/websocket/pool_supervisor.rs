@@ -2255,6 +2255,18 @@ impl ConnectionSupervisor {
 
         self.phase = ConnPhase::Parked;
         self.park_reason = Some(reason);
+        // A stop WE asked for (Z11d) is not a lost socket. It must not move
+        // `PARK_METRIC`, which the `dhan-socket-parked` alarm pages on with no
+        // reason filter, nor log the "parked permanently" error below: every
+        // socket parks this way on every mid-session stop and deploy restart.
+        if reason == ParkReason::Shutdown {
+            info!(
+                endpoint = self.slot.endpoint.as_str(),
+                connection_index = self.slot.global_index,
+                "Dhan live-feed socket closing for shutdown"
+            );
+            return SupervisorAction::Park { reason };
+        }
         metrics::counter!(
             PARK_METRIC,
             "endpoint" => self.slot.endpoint.as_str(),
@@ -3453,7 +3465,73 @@ pub trait FrameSink: Send + Sync + 'static {
     fn dial_permitted(&self) -> bool {
         true
     }
+
+    /// Has the process asked this socket to close for shutdown? (Z11d,
+    /// 2026-10-02.)
+    ///
+    /// Read at the top of every drain iteration, before every dial and between
+    /// backoff steps. O(1), no await. Default `false`, so every existing sink
+    /// is unchanged; [`WalRingSink::with_socket_stop`] wires the process's
+    /// [`SOCKET_STOP`].
+    fn stop_requested(&self) -> bool {
+        false
+    }
 }
+
+/// The process-wide request for every Dhan feed socket to close (Z11d,
+/// 2026-10-02).
+///
+/// # The hole it closes
+///
+/// A mid-session stop used to signal only the frame DRAIN: the socket tasks
+/// took no stop signal at all (`ConnEvent::ShutdownRequested` had no
+/// production emitter), so they kept reading and appending to the WAL right
+/// up to process exit, while `main` shut the WAL writer down underneath them.
+/// Records that landed after the writer's last empty poll were dropped with
+/// the channel. `WsFrameSpill::shutdown` documents "call AFTER the sockets are
+/// closed", and nothing closed them.
+///
+/// `main` now requests this first and waits for the sockets to park. Each
+/// socket closes through `close_capturing`, so frames read during the close
+/// handshake still reach the WAL, and the lane drain is still running to fold
+/// them.
+#[derive(Debug)]
+pub struct SocketStop {
+    requested: std::sync::atomic::AtomicBool,
+}
+
+impl SocketStop {
+    /// A stop that has not been requested.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            requested: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Asks every socket wired to this stop to close and park. Idempotent;
+    /// there is no un-request, because a parked socket never re-dials.
+    pub fn request(&self) {
+        self.requested
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether [`SocketStop::request`] has been called. One atomic load.
+    #[must_use]
+    pub fn is_requested(&self) -> bool {
+        self.requested.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl Default for SocketStop {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The one production [`SocketStop`]: wired into every feed socket's sink by
+/// the app's dial path and requested by `main` at shutdown.
+pub static SOCKET_STOP: SocketStop = SocketStop::new();
 
 /// How often a connection refused a dial by the dual-instance lock re-checks
 /// whether it may dial again (2026-10-01, R7). Matches the 5 s token-stale
@@ -3838,6 +3916,10 @@ pub struct WalRingSink {
     /// `None` by default — a sink built the old way may always dial. Set by
     /// [`WalRingSink::with_dial_permit`]; read once per dial, never per frame.
     dial_permit: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// The process's socket stop (Z11d). `None` by default — a sink built
+    /// the old way never stops on request. Set by
+    /// [`WalRingSink::with_socket_stop`].
+    socket_stop: Option<&'static SocketStop>,
 }
 
 impl WalRingSink {
@@ -3882,6 +3964,7 @@ impl WalRingSink {
             ring_bytes_full: metrics::counter!(RING_BYTES_FULL_METRIC, "endpoint" => endpoint_label),
             audit_tx: None,
             dial_permit: None,
+            socket_stop: None,
         };
         sink.pre_register();
         sink
@@ -3897,6 +3980,17 @@ impl WalRingSink {
     #[must_use]
     pub fn with_dial_permit(mut self, held: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
         self.dial_permit = Some(held);
+        self
+    }
+
+    /// Lets the process close this socket for shutdown (Z11d): once `stop`
+    /// is requested the connection parks with `ParkReason::Shutdown`, closing
+    /// through `close_capturing`. A builder, same shape as
+    /// [`WalRingSink::with_dial_permit`], so every existing construction is
+    /// untouched.
+    #[must_use]
+    pub fn with_socket_stop(mut self, stop: &'static SocketStop) -> Self {
+        self.socket_stop = Some(stop);
         self
     }
 
@@ -3933,6 +4027,10 @@ impl WalRingSink {
 }
 
 impl FrameSink for WalRingSink {
+    fn stop_requested(&self) -> bool {
+        self.socket_stop.is_some_and(SocketStop::is_requested)
+    }
+
     fn dial_permitted(&self) -> bool {
         self.dial_permit
             .as_ref()
@@ -4761,6 +4859,29 @@ where
     run_connection_with_commands(socket, supervisor, guard, sink, refresh_token, None).await
 }
 
+/// Sleeps for `delay`, or less if the process asks the socket to stop (Z11d).
+///
+/// Backoff delays run to tens of seconds, which would hold a stopping socket
+/// past `main`'s wait for it. Checks every [`IDLE_POLL_INTERVAL`] and ends at
+/// exactly the same deadline as a plain sleep when nothing asks it to stop.
+/// `tokio::time`, so a paused test clock drives it like any other sleep.
+async fn sleep_unless_stopped<K>(delay: Duration, sink: &K)
+where
+    K: FrameSink + ?Sized,
+{
+    let deadline = tokio::time::Instant::now() + delay;
+    loop {
+        if sink.stop_requested() {
+            return;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return;
+        }
+        tokio::time::sleep_until((now + IDLE_POLL_INTERVAL).min(deadline)).await;
+    }
+}
+
 /// Closes `socket`, handing every data frame read during the close handshake
 /// to `sink` (2026-10-02). The ONLY way the supervisor closes a socket: a
 /// close given a do-nothing callback would compile and silently restore the
@@ -4887,7 +5008,7 @@ where
                     tickvault_common::ws_event_types::WsEventKind::Disconnected,
                     supervisor.last_redial_reason().as_str(),
                 );
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                sleep_unless_stopped(Duration::from_millis(delay_ms), &*sink).await;
                 action = supervisor.on_event(ConnEvent::BeginDial, Instant::now());
             }
 
@@ -4898,14 +5019,24 @@ where
                     tickvault_common::ws_event_types::WsEventKind::Disconnected,
                     supervisor.last_redial_reason().as_str(),
                 );
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                refresh_token().await;
+                sleep_unless_stopped(Duration::from_millis(delay_ms), &*sink).await;
+                // No credential round trip for a socket that is about to park.
+                if !sink.stop_requested() {
+                    refresh_token().await;
+                }
                 action = supervisor.on_event(ConnEvent::BeginDial, Instant::now());
             }
 
             SupervisorAction::Dial => {
                 // Nothing is on the wire until this dial's subscribe is acked.
                 publish_connection_instruments(&supervisor.slot(), 0);
+                // Z11d: a socket asked to stop never opens. Every dial path
+                // (first dial, every reconnect, the lock-refusal poll below)
+                // passes here, so this one check is what stops them all.
+                if sink.stop_requested() {
+                    action = supervisor.on_event(ConnEvent::ShutdownRequested, Instant::now());
+                    continue;
+                }
                 // 2026-10-01, R7: a process that no longer holds the
                 // dual-instance lock must not OPEN a socket — every dial
                 // (first dial, reconnect, 807 re-dial, rotate, ghost redial)
@@ -4939,7 +5070,7 @@ where
                              restart it to recover)"
                         );
                     }
-                    tokio::time::sleep(Duration::from_millis(DIAL_PERMIT_POLL_MS)).await;
+                    sleep_unless_stopped(Duration::from_millis(DIAL_PERMIT_POLL_MS), &*sink).await;
                     continue;
                 }
                 if dial_refusal_reported {
@@ -5299,6 +5430,14 @@ where
     let mut last_client_ping = Instant::now();
 
     while action == SupervisorAction::Continue {
+        // Z11d: the process asked this socket to close. One O(1) atomic load
+        // per iteration, no allocation; when idle the 1 s ticker below bounds
+        // how long it takes to be seen. Returning the park decision hands the
+        // close to the caller's `close_capturing`, so frames read during the
+        // close handshake still reach the WAL.
+        if sink.stop_requested() {
+            return supervisor.on_event(ConnEvent::ShutdownRequested, Instant::now());
+        }
         // Top-up check, BEFORE the select and deliberately not an arm of it.
         //
         // It was a select arm first. That is wrong, and the fake transport
@@ -13898,6 +14037,196 @@ mod tests {
             arm.find("let was_ever_delivered").unwrap_or(usize::MAX)
                 < arm.find("self.ever_delivered = true;").unwrap_or(0),
             "the flag must be read BEFORE it is set, or every dial reads as a re-dial"
+        );
+    }
+
+    // -- Z11d: the process can close its sockets before the WAL stops ----------
+
+    /// Records frames like [`RecordingSink`] and answers `stop_requested`
+    /// from its own flag, so parallel tests never share a stop.
+    #[derive(Default)]
+    struct StopSink {
+        accepted: Mutex<Vec<Bytes>>,
+        stop: std::sync::atomic::AtomicBool,
+    }
+
+    impl FrameSink for StopSink {
+        fn accept(&self, frame: Bytes) -> FrameSinkOutcome {
+            if let Ok(mut g) = self.accepted.lock() {
+                g.push(frame);
+            }
+            FrameSinkOutcome::Captured
+        }
+
+        fn stop_requested(&self) -> bool {
+            self.stop.load(std::sync::atomic::Ordering::Acquire)
+        }
+    }
+
+    /// The pin for Z11d: a live socket used to take no stop signal at all,
+    /// so it kept appending to the WAL after `main` shut the writer down.
+    /// Asked to stop, it now parks with `Shutdown`, and the frames read
+    /// during its close handshake still reach the sink.
+    #[tokio::test(start_paused = true)]
+    async fn test_regression_run_connection_parks_with_shutdown_and_captures_close_frames() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: one_scripted_frame(),
+            idle_when_exhausted: true,
+            close_frames: vec![Bytes::from_static(b"close-tick")],
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(StopSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::MainFeed, instruments(10))
+            .expect("inside cap");
+        let task = tokio::spawn(run_connection(
+            fake(&st),
+            sup(DhanEndpointType::MainFeed, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+        ));
+        // Live and idle: both scripted frames drained, then the reader waits.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            !task.is_finished(),
+            "an idle live socket does not end on its own"
+        );
+        sink.stop.store(true, std::sync::atomic::Ordering::Release);
+        let exit = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("a stopped socket must park within the idle poll, not run on")
+            .expect("task");
+        assert_eq!(exit, ConnectionExit::Parked(ParkReason::Shutdown));
+        let accepted = sink.accepted.lock().expect("sink");
+        assert_eq!(
+            accepted.last(),
+            Some(&Bytes::from_static(b"close-tick")),
+            "the close handshake's frame reaches the sink"
+        );
+        assert_eq!(accepted.len(), 3, "two live frames, then the close frame");
+        let s = st.lock().expect("fake state");
+        assert_eq!(s.connects, 1, "a stopping socket never re-dials");
+        assert_eq!(s.closes, 1);
+    }
+
+    /// A stop that lands in a long backoff sleep ends it within one idle
+    /// poll, and the socket parks without dialing again.
+    #[tokio::test(start_paused = true)]
+    async fn test_stop_during_backoff_returns_without_dialing() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            connect_results: VecDeque::from(vec![false; 64]),
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(StopSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::MainFeed, instruments(10))
+            .expect("inside cap");
+        let task = tokio::spawn(run_connection(
+            fake(&st),
+            sup(DhanEndpointType::MainFeed, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+        ));
+        // 0 + 1 s + 2 s + 5 s of ladder (plus jitter) puts t = 10 s inside
+        // the 15 s step.
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let dials_at_stop = st.lock().expect("fake state").connects;
+        assert!(dials_at_stop >= 2, "the ladder must have been climbing");
+        let stopped_at = tokio::time::Instant::now();
+        sink.stop.store(true, std::sync::atomic::Ordering::Release);
+        let exit = tokio::time::timeout(Duration::from_secs(60), task)
+            .await
+            .expect("a stopped socket must not stay in backoff forever")
+            .expect("task");
+        assert_eq!(exit, ConnectionExit::Parked(ParkReason::Shutdown));
+        assert!(
+            stopped_at.elapsed() <= IDLE_POLL_INTERVAL,
+            "the backoff sleep must end within one idle poll, took {:?}",
+            stopped_at.elapsed()
+        );
+        assert_eq!(
+            st.lock().expect("fake state").connects,
+            dials_at_stop,
+            "no dial after the stop"
+        );
+    }
+
+    /// A socket asked to stop before its first dial never opens.
+    #[tokio::test(start_paused = true)]
+    async fn a_socket_stopped_before_its_first_dial_never_dials() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState::default()));
+        let sink = std::sync::Arc::new(StopSink::default());
+        sink.stop.store(true, std::sync::atomic::Ordering::Release);
+        let guard = SubscribeGuard::try_new(DhanEndpointType::MainFeed, instruments(10))
+            .expect("inside cap");
+        let exit = run_connection(
+            fake(&st),
+            sup(DhanEndpointType::MainFeed, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+        )
+        .await;
+        assert_eq!(exit, ConnectionExit::Parked(ParkReason::Shutdown));
+        assert_eq!(st.lock().expect("fake state").connects, 0);
+    }
+
+    /// `SocketStop` is a one-way latch, and a `WalRingSink` follows it only
+    /// when wired; the trait default never stops.
+    #[test]
+    fn test_socket_stop_request_is_requested_latches_and_with_socket_stop_wires_the_sink() {
+        let stop: &'static SocketStop = Box::leak(Box::new(SocketStop::new()));
+        assert!(!stop.is_requested());
+        stop.request();
+        stop.request();
+        assert!(
+            stop.is_requested(),
+            "idempotent, and there is no un-request"
+        );
+        assert!(!SocketStop::default().is_requested());
+
+        let dir = wal_dir("socket-stop");
+        let spill = std::sync::Arc::new(
+            WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel::<CapturedFrame>(4);
+        let build = || {
+            WalRingSink::new(
+                std::sync::Arc::clone(&spill),
+                tx.clone(),
+                std::sync::Arc::new(RingByteBudget::new(usize::MAX)),
+                WsType::LiveFeed,
+                DhanEndpointType::MainFeed,
+                0,
+            )
+        };
+        assert!(!build().stop_requested(), "unwired sinks never stop");
+        assert!(build().with_socket_stop(stop).stop_requested());
+        assert!(!RecordingSink::default().stop_requested(), "trait default");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A shutdown park is not a lost socket: it must stay off `PARK_METRIC`
+    /// (the `dhan-socket-parked` alarm has no reason filter) and off the
+    /// "parked permanently" error line.
+    #[test]
+    fn a_shutdown_park_never_reaches_the_paging_park_metric() {
+        let src = include_str!("pool_supervisor.rs");
+        let marker = concat!("#[cfg(", "test)]");
+        let production = src.split(marker).next().unwrap_or(src);
+        let park_at = production
+            .find("fn park(&mut self, reason: ParkReason")
+            .expect("park exists");
+        let park = &production[park_at..];
+        let quiet = park
+            .find("if reason == ParkReason::Shutdown {")
+            .expect("park must return early for a shutdown");
+        let metric = park
+            .find("PARK_METRIC,")
+            .expect("park still counts real parks");
+        assert!(
+            quiet < metric,
+            "the shutdown return must come before PARK_METRIC"
         );
     }
 }

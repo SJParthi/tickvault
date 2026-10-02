@@ -377,11 +377,12 @@ PrivateTmp=true
 # MEASURED AND RAISED 2026-08-21 (was 30s, which SIGKILLed the day's tail).
 # The app's shutdown path runs FOUR bounded waits SEQUENTIALLY:
 #
-#   DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS   = 30   (lane flush, runs first)
-#   SEAL_WRITER_SHUTDOWN_BUDGET_SECS       = 75   (final seal drain, second)
-#   SEAL_ESCALATION_SHUTDOWN_BUDGET_SECS   = 5    (escalation queue, third)
-#   WAL_SPILL_SHUTDOWN_BUDGET_SECS         = 10   (WAL queue drain, fourth)
-#   worst case                             = 120s
+#   DHAN_SOCKET_STOP_BUDGET_SECS           = 5    (socket close, runs first)
+#   DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS   = 30   (lane flush, second)
+#   SEAL_WRITER_SHUTDOWN_BUDGET_SECS       = 75   (final seal drain, third)
+#   SEAL_ESCALATION_SHUTDOWN_BUDGET_SECS   = 5    (escalation queue, fourth)
+#   WAL_SPILL_SHUTDOWN_BUDGET_SECS         = 10   (WAL queue drain, fifth)
+#   worst case                             = 125s
 #
 # Three live in crates/app/src/main.rs; WAL_SPILL_SHUTDOWN_BUDGET_SECS lives
 # in crates/storage/src/ws_frame_spill.rs and is reached through
@@ -430,6 +431,13 @@ PrivateTmp=true
 # 25s rather than narrowing to 20s: the guard permits 20 but calls it the
 # floor, and the teardown after the drain (API + otel shutdown, partition
 # detach) is what spends it.
+#
+# 2026-10-02 (Z11d): a FIFTH bounded wait, DHAN_SOCKET_STOP_BUDGET_SECS, now
+# runs first: shutdown closes the Dhan feed sockets before it stops the lane
+# drain, because they used to keep appending to the WAL while its writer was
+# shut down beneath them. The timeout is NOT raised: 145 - 125 leaves exactly
+# the 20s floor the guard requires (the 25s margin noted above narrows to it).
+# Any further budget growth must raise this timeout.
 #
 # Pinned by crates/app/tests/shutdown_budget_fits_systemd_guard.rs — the
 # relationship, not the number: raising any app budget past this timeout

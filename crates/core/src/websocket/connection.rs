@@ -460,6 +460,59 @@ pub const fn max_frame_bytes(endpoint: DhanEndpointType) -> usize {
     }
 }
 
+/// Oversize refusals seen per endpoint, in [`DhanEndpointType::ALL`] order.
+/// Process-wide on purpose: the throttle must span reconnects, because each
+/// refusal tears the socket down and the next one arrives on a new socket.
+static OVERSIZE_REFUSALS: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Reports a frame the WebSocket cap refused (Z11c, 2026-10-02).
+///
+/// The refused frame never reaches the WAL: whatever ticks it carried are
+/// gone, and Dhan does not resend. It used to share the transport arm's
+/// `warn!`, which carries no `source` and so could never be told apart from an
+/// ordinary disconnect. It is now an `error!` with `source = "frame_oversize"`
+/// and the cap that refused it. Every existing WS-GAP-03 metric filter also
+/// requires a specific other `source`, so this line pages nothing by itself;
+/// it is log-sink evidence, and an alarm on it needs the operator's dated
+/// quote in the noise-lock file first.
+///
+/// Throttled to powers of two per endpoint (1st, 2nd, 4th, …). The refusal
+/// counter `FRAME_REFUSED_METRIC{reason="oversize"}` still counts every one.
+/// Cold path: once per refused frame, which already costs a reconnect.
+#[cold]
+#[inline(never)]
+fn report_oversize_refusal(
+    endpoint: DhanEndpointType,
+    err: &tokio_tungstenite::tungstenite::Error,
+) {
+    let idx = match endpoint {
+        DhanEndpointType::MainFeed => 0,
+        DhanEndpointType::Depth20 => 1,
+        DhanEndpointType::Depth200 => 2,
+        DhanEndpointType::OrderUpdate => 3,
+    };
+    let seen = OVERSIZE_REFUSALS[idx]
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .saturating_add(1);
+    if seen.is_power_of_two() {
+        error!(
+            code = ErrorCode::WsGapConnectionState.code_str(),
+            source = "frame_oversize",
+            endpoint = endpoint.as_str(),
+            cap = max_frame_bytes(endpoint),
+            refusals = seen,
+            detail = %safe_err(err),
+            "Dhan feed frame REFUSED by the WebSocket size cap — it never reached the \
+             WAL, so any ticks in it are lost; the socket reconnects"
+        );
+    }
+}
+
 /// The explicit WebSocket configuration for `endpoint`.
 ///
 /// `max_message_size` is set EQUAL to `max_frame_size` deliberately: a
@@ -1951,14 +2004,18 @@ impl<T: FeedTokenSource> DhanFeedSocket for DhanFeedSocketImpl<T> {
                         "reason" => reason,
                     )
                     .increment(1);
-                    warn!(
-                        code = ErrorCode::WsGapConnectionState.code_str(),
-                        endpoint = endpoint.as_str(),
-                        reason,
-                        detail = %safe_err(&err),
-                        "Dhan feed read failed — treating as a disconnect so the supervisor's \
-                         ladder reconnects"
-                    );
+                    if reason == "oversize" {
+                        report_oversize_refusal(endpoint, &err);
+                    } else {
+                        warn!(
+                            code = ErrorCode::WsGapConnectionState.code_str(),
+                            endpoint = endpoint.as_str(),
+                            reason,
+                            detail = %safe_err(&err),
+                            "Dhan feed read failed — treating as a disconnect so the supervisor's \
+                             ladder reconnects"
+                        );
+                    }
                     // A read error is the bare-reset shape (the
                     // `ResetWithoutClosingHandshake` class this file's
                     // history is full of): no peer left to answer a Close.
@@ -3823,5 +3880,88 @@ mod tests {
                 "{name} must not derive Debug — it would become a credential leak surface"
             );
         }
+    }
+
+    // --- Z11c: an oversize refusal is an error with its own source -----------
+
+    /// A `Write` sink the test subscriber logs into.
+    #[derive(Clone, Default)]
+    struct Z11cSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Z11cSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The pin for Z11c: a frame the cap refused was a `warn!` with no
+    /// `source`, indistinguishable from an ordinary disconnect although the
+    /// frame (and any ticks in it) never reached the WAL.
+    #[test]
+    fn test_regression_oversize_refusal_logs_error_with_source_frame_oversize() {
+        let sink = Z11cSink::default();
+        let writer = sink.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        let err = tokio_tungstenite::tungstenite::Error::Capacity(
+            tokio_tungstenite::tungstenite::error::CapacityError::MessageTooLong {
+                size: 9_000_000,
+                max_size: MAIN_FEED_MAX_FRAME_BYTES,
+            },
+        );
+        // `OrderUpdate` never reaches this module in production, so no other
+        // test moves its slot of the process-wide throttle.
+        tracing::subscriber::with_default(subscriber, || {
+            for _ in 0..4 {
+                report_oversize_refusal(DhanEndpointType::OrderUpdate, &err);
+            }
+        });
+        let out = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = out
+            .lines()
+            .filter(|l| l.contains("frame_oversize"))
+            .collect();
+        assert_eq!(lines.len(), 3, "logged at refusals 1, 2 and 4 only:\n{out}");
+        for line in &lines {
+            assert!(line.contains("ERROR"), "an error, not a warning: {line}");
+            assert!(line.contains("WS-GAP-03"), "{line}");
+            assert!(
+                line.contains(&format!("cap={}", MAIN_FEED_MAX_FRAME_BYTES)),
+                "{line}"
+            );
+        }
+    }
+
+    /// The read arm routes `Capacity` to the oversize report and keeps every
+    /// other read failure on the transport `warn!`.
+    #[test]
+    fn the_read_error_arm_splits_oversize_from_transport() {
+        let src = include_str!("connection.rs");
+        let arm_at = src
+            .find("if reason == \"oversize\" {")
+            .expect("the read-error arm branches on the oversize reason");
+        let arm = &src[arm_at..arm_at + 900];
+        let report = arm
+            .find("report_oversize_refusal(endpoint, &err)")
+            .expect("oversize goes to report_oversize_refusal");
+        let transport = arm.find("warn!(").expect("transport stays a warn!");
+        assert!(
+            report < transport,
+            "oversize is handled before the transport warn!"
+        );
+        let helper_at = src
+            .find("fn report_oversize_refusal(")
+            .expect("helper exists");
+        let helper = &src[helper_at..helper_at + 1200];
+        assert!(helper.contains("error!("), "the oversize line is an error!");
+        assert!(helper.contains("source = \"frame_oversize\""));
+        assert!(helper.contains("cap = max_frame_bytes(endpoint)"));
     }
 }
