@@ -2170,7 +2170,12 @@ Open (found, not fixed here; each needs its own design):
   the respawn is test-only); an oversize frame is counted but not alarmed; a mid-session stop
   never closes the sockets before the WAL shutdown.
 - [ ] **Z12 — CLAUDE.md speed table rows.** `connection.rs::classify_frame` is O(packets) on the
-  socket read task; `blocking_flush` runs `block_in_place` on every flush.
+  socket read task; `blocking_flush` runs `block_in_place` on every flush. The 2026-10-02 workspace
+  sweep adds: `append_inline_depth` writes 10 rows per full packet; per order, `rebuild_pending_paper`
+  and `active_order_count` are O(orders) on every order event; the per-minute depth steering builds
+  ~22,000 candidate rows and two database queries used only for a log count (their consumers
+  `plan_minute` and `top_mover_pick` have no production caller); `/api/quote` builds a new HTTP
+  client per request. None is per tick. Full list: the 2026-10-02 audit page.
 
 Z-items Z+ and guarantee matrix: covered by the shared matrix at the end of this plan. Tick path:
 Z4 adds one add and one compare per tick; Z1 runs only on the close path; Z2 adds one flag test per
