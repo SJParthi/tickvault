@@ -2151,6 +2151,29 @@ impl TickWriter {
         self.append_tick_with_seq(tick, next_capture_seq())
     }
 
+    /// Marks the pending rows as having NO write-ahead-log record behind them
+    /// (2026-10-02).
+    ///
+    /// For a frame whose WAL append was REFUSED but which still entered the
+    /// ring (`CapturedFrame::wal_backed == false`). Its rows carry a non-zero,
+    /// replay-shaped `capture_seq`, so without this flag a busy rescue thread
+    /// would hand them "to the WAL for replay" and drop them — but no WAL
+    /// segment holds them, so that replay never comes. Marked, they keep the
+    /// inline spill: written, never dropped on that assumption.
+    ///
+    /// One `bool` store, no allocation. Sticky until `discard_pending`
+    /// consumes it; a stale `true` only costs one inline spill, never a row.
+    pub fn mark_pending_unbacked(&mut self) {
+        self.pending_unbacked = true;
+    }
+
+    /// Whether the pending rows are marked as lacking WAL backing.
+    #[must_use]
+    // TEST-EXEMPT: accessor, asserted by `mark_pending_unbacked_keeps_rows_in_the_inline_spill`.
+    pub fn pending_unbacked(&self) -> bool {
+        self.pending_unbacked
+    }
+
     /// Appends a live tick with a caller-supplied, replay-stable `capture_seq`
     /// (sourced from the WAL frame sequence).
     ///
@@ -5700,6 +5723,55 @@ mod tests {
             "no capture sequence -> inline spill, never a drop"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 2026-10-02: rows from a frame the WAL REFUSED carry a real, non-zero
+    /// capture sequence yet exist in no WAL segment. Marked unbacked, they must
+    /// take the inline spill when the rescue thread is gone — never the
+    /// "deferred to the WAL" drop, whose replay can never come.
+    #[test]
+    fn mark_pending_unbacked_keeps_rows_in_the_inline_spill() {
+        let dir = scratch_dir("unbacked-inline");
+        let mut writer = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (_sink, rx) = writer.split_rescue_offload();
+        drop(rx); // thread gone -> Disconnected on try_send
+        writer
+            .append_tick_with_seq(&sample_tick(), 1 << 20)
+            .expect("buffers without a sender");
+        assert!(
+            !writer.pending_unbacked(),
+            "a WAL-shaped sequence alone reads as backed"
+        );
+        writer.mark_pending_unbacked();
+        assert!(writer.pending_unbacked());
+
+        assert_eq!(writer.discard_pending(), 1, "the row left the buffer");
+
+        let spilled = std::fs::read_dir(&dir)
+            .expect("the inline rescue created the dir")
+            .filter_map(std::result::Result::ok)
+            .count();
+        assert_eq!(
+            spilled, 1,
+            "an unbacked row must be written inline, never dropped as WAL-backed"
+        );
+        assert!(
+            !writer.pending_unbacked(),
+            "discard_pending consumes the mark"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fresh writer reads as backed; the mark sets it and nothing but
+    /// `discard_pending` clears it.
+    #[test]
+    fn pending_unbacked_is_false_until_marked() {
+        let mut writer = TickWriter::for_test(Feed::Dhan);
+        assert!(!writer.pending_unbacked());
+        writer.mark_pending_unbacked();
+        assert!(writer.pending_unbacked());
+        writer.mark_pending_unbacked();
+        assert!(writer.pending_unbacked(), "marking twice is idempotent");
     }
 
     #[test]

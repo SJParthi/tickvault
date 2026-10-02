@@ -1334,6 +1334,25 @@ impl DepthWriter {
         String::from_utf8(self.buffer.as_bytes().to_vec()).unwrap_or_default()
     }
 
+    /// Marks the pending rows as having NO write-ahead-log record behind them
+    /// (2026-10-02) — the depth twin of
+    /// `TickWriter::mark_pending_unbacked`.
+    ///
+    /// For a frame whose WAL append was REFUSED but which still entered the
+    /// ring. Its rows carry a non-zero capture sequence, so unmarked, a busy
+    /// rescue thread would hand them to a WAL replay that can never come.
+    /// Marked, they keep the inline spill. One `bool` store, no allocation.
+    pub fn mark_pending_unbacked(&mut self) {
+        self.pending_unbacked = true;
+    }
+
+    /// Whether the pending rows are marked as lacking WAL backing.
+    #[must_use]
+    // TEST-EXEMPT: accessor, asserted by `mark_pending_unbacked_keeps_depth_rows_in_the_inline_spill`.
+    pub fn pending_unbacked(&self) -> bool {
+        self.pending_unbacked
+    }
+
     /// Appends one prepared [`DepthRow`] to the ILP buffer (no flush).
     ///
     /// ILP requires every SYMBOL before any field column, so the four symbols
@@ -3384,6 +3403,41 @@ mod tests {
             "tv_depth_rescue_deferred_to_wal_total"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 2026-10-02: depth rows from a frame the WAL REFUSED carry a real capture
+    /// sequence yet exist in no WAL segment. Marked unbacked, a full rescue
+    /// queue must spill them inline, never defer them to the WAL.
+    #[test]
+    fn mark_pending_unbacked_keeps_depth_rows_in_the_inline_spill() {
+        let dir = spill_tmp("depth-rescue-unbacked");
+        let mut w = DepthWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (_sink, _rx) = w.split_rescue_offload();
+
+        for _ in 0..DEPTH_RESCUE_QUEUE_DEPTH {
+            w.append_row(&row()).expect("append");
+            assert_eq!(w.discard_pending(), 1);
+        }
+        w.append_row(&row()).expect("append");
+        assert!(!w.pending_unbacked(), "a non-zero sequence reads as backed");
+        w.mark_pending_unbacked();
+        assert!(w.pending_unbacked());
+        assert_eq!(w.discard_pending(), 1, "the rows are accounted for");
+        assert!(
+            !spill_files(&dir).is_empty(),
+            "an unbacked depth row must be written inline, never dropped as WAL-backed"
+        );
+        assert!(!w.pending_unbacked(), "discard_pending consumes the mark");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fresh depth writer reads as backed until marked.
+    #[test]
+    fn pending_unbacked_is_false_until_marked_on_a_depth_writer() {
+        let mut w = DepthWriter::for_test(Feed::Dhan);
+        assert!(!w.pending_unbacked());
+        w.mark_pending_unbacked();
+        assert!(w.pending_unbacked());
     }
 
     /// A depth writer that was never split behaves exactly as before.
