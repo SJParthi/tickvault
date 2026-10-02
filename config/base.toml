@@ -422,6 +422,13 @@ depth_hot_hours = 4
 # removed in #O3; the /metrics exporter (observability.rs, port 9091) is
 # independent and stays for CloudWatch scraping.
 
+# Raw WAL segments are copied to the cold S3 bucket (raw-frames/<IST date>/)
+# and verified before any local prune may delete them (plan item 45e-1,
+# operator Quotes 27 + 28, 2026-09-29). Keep this ON in every deployed
+# environment: `false` restores the old prune, which deletes without a copy.
+[raw_frame_archive]
+require_upload_before_prune = true
+
 [websocket]
 ping_interval_secs = 10
 pong_timeout_secs = 10

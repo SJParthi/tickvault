@@ -1829,7 +1829,14 @@ async fn async_main() -> Result<()> {
     // boot arms) — deliberately NOT the Dhan-lane periodic health loop,
     // which never runs on a Groww-only boot. Prunes once at task start
     // (each daily prod boot reclaims immediately), then every 6 h.
-    tokio::spawn(async {
+    //
+    // 2026-10-02 (plan item 45e-1, operator Quotes 27 + 28): every pass below
+    // deletes a WAL segment only when a verified S3 copy of it is recorded
+    // (`<wal_dir>/uploaded/<segment>`), unless the operator turned
+    // `[raw_frame_archive] require_upload_before_prune` off. The copies are
+    // made by the raw-frame uploader spawned right after this loop.
+    let require_raw_upload = config.raw_frame_archive.require_upload_before_prune;
+    tokio::spawn(async move {
         use std::time::Duration;
         // Monotonic, so the pressure floor cannot be defeated by a wall-clock
         // jump (NTP step, DST, a container clock correction).
@@ -1841,6 +1848,7 @@ async fn async_main() -> Result<()> {
                 &wal_dir,
                 tickvault_common::constants::WS_WAL_ARCHIVE_RETENTION_SECS,
                 tickvault_common::constants::WS_WAL_ARCHIVE_MAX_BYTES,
+                require_raw_upload,
             );
             // 2026-08-25: the ACTIVE WAL set, bounded for the first time.
             // Only `archive/` was ever pruned, on the assumption that active
@@ -1859,6 +1867,7 @@ async fn async_main() -> Result<()> {
                 &wal_dir,
                 tickvault_common::constants::WS_WAL_ACTIVE_RETENTION_SECS,
                 tickvault_storage::ws_frame_spill::ws_wal_active_max_bytes(&wal_dir),
+                require_raw_upload,
             );
             // 2026-08-19: the SPILL retention sweep, wired for the first
             // time. `SPILL_FILE_MAX_AGE_SECS` was defined, documented and
@@ -1922,6 +1931,68 @@ async fn async_main() -> Result<()> {
                     continue;
                 }
             }
+        }
+    });
+
+    // The raw-frame uploader (plan item 45e-1, operator Quotes 27 + 28,
+    // 2026-09-29): every sealed WAL segment is gzipped, put to the cold
+    // bucket under `raw-frames/<IST date>/` with a conditional create and a
+    // SHA-256 checksum, verified with HeadObject, and only then marked — and
+    // the prune above deletes nothing unmarked. Its own task and its own
+    // wake: every 2 minutes outside 09:00–15:40 IST (the session's disk and
+    // network belong to capture), and at once on disk pressure, when it runs
+    // a small batch even inside the session. After a batch that marked a
+    // segment it asks the prune to run, so the space actually comes back.
+    // Cold path: one directory walk per pass, and each segment's read, hash
+    // and gzip on a blocking thread — O(segment bytes), never on the drain.
+    let raw_upload_bucket = config.partition_retention.archive_bucket.clone();
+    tokio::spawn(async move {
+        use std::time::Duration;
+        use tickvault_storage::raw_frame_upload as raw_upload;
+        let Some(store) = tickvault_storage::s3_cold::S3Cold::load(&raw_upload_bucket).await
+        else {
+            if require_raw_upload {
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::StorageGap04S3ArchiveFailed
+                        .code_str(),
+                    source = "raw_frame_upload",
+                    "raw-frame uploader not started: no cold bucket resolves for this \
+                     environment — the WAL prune will keep every segment, so the disk \
+                     only grows until a bucket is configured"
+                );
+            } else {
+                info!(
+                    "raw-frame uploader not started: no cold bucket, and the upload gate \
+                     is off in config"
+                );
+            }
+            return;
+        };
+        let now_utc_secs = || chrono::Utc::now().timestamp();
+        // First pass at start when the window is open, so a morning boot
+        // catches up on last night's segments before 09:00.
+        let mut by_pressure = false;
+        loop {
+            if by_pressure || raw_upload::upload_window_open(now_utc_secs()) {
+                let wal_dir = tickvault_app::boot_helpers::ws_wal_dir();
+                let max_segments = if raw_upload::upload_window_open(now_utc_secs()) {
+                    usize::MAX
+                } else {
+                    raw_upload::RAW_UPLOAD_PRESSURE_BATCH
+                };
+                let pressure = by_pressure;
+                let should_continue =
+                    move || pressure || raw_upload::upload_window_open(now_utc_secs());
+                let summary =
+                    raw_upload::run_pass(&store, &wal_dir, max_segments, &should_continue).await;
+                if summary.marked() > 0 {
+                    tickvault_app::reclaim_signal::request_reclaim();
+                }
+            }
+            by_pressure = tickvault_app::reclaim_signal::wait_for_raw_upload_or(
+                Duration::from_secs(raw_upload::RAW_UPLOAD_INTERVAL_SECS),
+            )
+            .await;
         }
     });
 

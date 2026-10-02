@@ -165,6 +165,40 @@ pub struct S3ObjectMeta {
     pub checksum_sha256_b64: Option<String>,
 }
 
+/// What already sits at an S3 key, compared with the bytes about to go there.
+///
+/// Content identity is length AND the stored SHA-256 checksum attribute. An
+/// object with no checksum attribute (foreign or legacy) is `Different`:
+/// nothing proves it holds these bytes, and the never-overwrite rule means it
+/// is never written over either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExistingObject {
+    /// Nothing at the key.
+    Absent,
+    /// Same length and same SHA-256: the upload already happened (a crash
+    /// between the upload and its local record, or a re-run).
+    Identical,
+    /// Something else is there. Never overwritten.
+    Different,
+}
+
+/// Classifies `meta` (the HeadObject result for a key) against the local
+/// bytes' length and base64 SHA-256. Pure, O(1).
+#[must_use]
+pub(crate) fn classify_existing(
+    meta: Option<&S3ObjectMeta>,
+    len: u64,
+    sha256_b64: &str,
+) -> ExistingObject {
+    match meta {
+        None => ExistingObject::Absent,
+        Some(m) if m.len == len && m.checksum_sha256_b64.as_deref() == Some(sha256_b64) => {
+            ExistingObject::Identical
+        }
+        Some(_) => ExistingObject::Different,
+    }
+}
+
 /// An S3 client bound to the cold bucket.
 pub struct S3Cold {
     s3: aws_sdk_s3::Client,
@@ -232,6 +266,32 @@ impl S3Cold {
         Ok(())
     }
 
+    /// [`Self::put_if_absent_path`] for an in-memory body, with user metadata.
+    pub(crate) async fn put_if_absent_bytes(
+        &self,
+        key: &str,
+        body: Vec<u8>,
+        sha256_b64: &str,
+        metadata: &[(&'static str, String)],
+    ) -> Result<()> {
+        let mut req = self
+            .s3
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .if_none_match("*")
+            .checksum_sha256(sha256_b64)
+            .body(aws_sdk_s3::primitives::ByteStream::from(body));
+        for (k, v) in metadata {
+            req = req.metadata(*k, v.as_str());
+        }
+        req.send()
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", aws_sdk_s3::error::DisplayErrorContext(&e)))
+            .context("S3 conditional PutObject (If-None-Match + checksum_sha256) failed")?;
+        Ok(())
+    }
+
     /// HeadObject with `ChecksumMode::Enabled`: the object's length and its
     /// stored SHA-256 (base64). `Ok(None)` only when S3 says the key does not
     /// exist; any other failure is `Err`, so a caller can tell "absent" from
@@ -289,6 +349,34 @@ impl S3Cold {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classify_existing_needs_length_and_checksum_to_match() {
+        let meta = |len, sum: Option<&str>| S3ObjectMeta {
+            len,
+            checksum_sha256_b64: sum.map(ToString::to_string),
+        };
+        assert_eq!(classify_existing(None, 10, "abc"), ExistingObject::Absent);
+        assert_eq!(
+            classify_existing(Some(&meta(10, Some("abc"))), 10, "abc"),
+            ExistingObject::Identical
+        );
+        assert_eq!(
+            classify_existing(Some(&meta(11, Some("abc"))), 10, "abc"),
+            ExistingObject::Different,
+            "a length mismatch is a different object"
+        );
+        assert_eq!(
+            classify_existing(Some(&meta(10, Some("abd"))), 10, "abc"),
+            ExistingObject::Different,
+            "a checksum mismatch is a different object"
+        );
+        assert_eq!(
+            classify_existing(Some(&meta(10, None)), 10, "abc"),
+            ExistingObject::Different,
+            "an object without a checksum proves nothing and is never reused"
+        );
+    }
 
     // ---- content identity: base64 / hex / Sha256Writer (review round 2) ----
 

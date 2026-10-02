@@ -202,6 +202,35 @@ pub struct ApplicationConfig {
     /// behavior only (the engine's hardcoded `dry_run` blocks live POSTs).
     #[serde(default)]
     pub exit_orders: ExitOrdersConfig,
+    /// `[raw_frame_archive]` — raw WAL segments copied to the cold S3 bucket
+    /// and verified before any local delete (plan item 45e-1, operator Quotes
+    /// 27 + 28, 2026-09-29). Absent section ⇒ the upload IS required (fail
+    /// closed: the safe direction is keeping capture on disk).
+    #[serde(default)]
+    pub raw_frame_archive: RawFrameArchiveConfig,
+}
+
+/// `[raw_frame_archive]` — the raw WAL segment upload gate (plan item 45e-1).
+#[derive(Debug, Clone, Deserialize)]
+pub struct RawFrameArchiveConfig {
+    /// Every WAL prune pass (age, byte ceiling, 5% disk floor) deletes a
+    /// segment only when a verified copy of it is recorded in the cold bucket.
+    /// Default `true`. Set `false` ONLY on a box with no bucket (a dev box) —
+    /// with it off, capture can be deleted with no copy anywhere.
+    #[serde(default = "default_require_upload_before_prune")]
+    pub require_upload_before_prune: bool,
+}
+
+const fn default_require_upload_before_prune() -> bool {
+    true
+}
+
+impl Default for RawFrameArchiveConfig {
+    fn default() -> Self {
+        Self {
+            require_upload_before_prune: default_require_upload_before_prune(),
+        }
+    }
 }
 
 /// `[order_runtime]` — dry-run order-runtime configuration (2026-07-14).
@@ -5081,6 +5110,22 @@ mod tests {
             config.validate().is_ok(),
             "a DISABLED order_runtime section is never rejected"
         );
+    }
+
+    /// `[raw_frame_archive]` keeps the upload-before-prune gate ON unless
+    /// the operator writes `false` explicitly (plan item 45e-1).
+    #[test]
+    fn test_raw_frame_archive_requires_upload_unless_explicitly_off() {
+        assert!(RawFrameArchiveConfig::default().require_upload_before_prune);
+        let empty: RawFrameArchiveConfig =
+            toml::from_str("").expect("empty section must parse via defaults");
+        assert!(
+            empty.require_upload_before_prune,
+            "an absent key must keep the upload gate ON (fail closed)"
+        );
+        let off: RawFrameArchiveConfig =
+            toml::from_str("require_upload_before_prune = false").expect("explicit off parses");
+        assert!(!off.require_upload_before_prune);
     }
 
     /// 🔷 DHAN exit-order layer (Cluster B, 2026-07-14): the
