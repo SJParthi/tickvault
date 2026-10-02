@@ -1640,6 +1640,10 @@ fn writer_loop(
     // the loop would be a syscall on every batch.
     let fsync_interval = resolve_wal_fsync_interval();
     let mut last_sync = Instant::now();
+    // True while records have been flushed into the segment since its last
+    // sync. The lull arm below syncs them, so the power-loss window is the sync
+    // interval even when the feed goes quiet right after a batch (2026-10-02).
+    let mut unsynced = false;
     loop {
         // Timed, not blocking, so the thread can notice a shutdown request.
         //
@@ -1662,6 +1666,19 @@ fn writer_loop(
                     // The writer is gone: its last segment is closed and replayable again.
                     clear_open_segment_under(wal_dir);
                     return Ok(());
+                }
+                // A lull. Before 2026-10-02 only a NEW record could trigger the
+                // rate-limited sync, so the last batch before a quiet spell sat in
+                // the page cache until the next record arrived, leaving the
+                // power-loss window to the kernel's writeback (~30 s by default)
+                // instead of the sync interval. O(1): one flag test, and at most
+                // one sync per interval.
+                if unsynced {
+                    let synced_at = maybe_sync_segment(&mut current, fsync_interval, last_sync);
+                    if synced_at != last_sync {
+                        unsynced = false;
+                    }
+                    last_sync = synced_at;
                 }
                 continue;
             }
@@ -1715,7 +1732,12 @@ fn writer_loop(
         // AFTER the flush, never before: syncing a file whose latest records
         // are still sitting in the BufWriter would force the previous batch to
         // the platter and leave this one exactly as exposed as before.
-        last_sync = maybe_sync_segment(&mut current, fsync_interval, last_sync);
+        unsynced = true;
+        let synced_at = maybe_sync_segment(&mut current, fsync_interval, last_sync);
+        if synced_at != last_sync {
+            unsynced = false;
+        }
+        last_sync = synced_at;
 
         // The exposure C1 named, made measurable.
         //
@@ -5747,6 +5769,31 @@ mod tests {
              the failed flush and the disabled-fsync knob. A third makes the \
              sync unreachable, which no source-order check can see: every other \
              assertion in this test stays green while nothing is ever synced."
+        );
+    }
+
+    /// 2026-10-02 (zero-loss audit): the writer's idle arm syncs records that
+    /// a batch left unsynced. Before, only a NEW record could trigger the sync,
+    /// so the last batch before a lull waited for the kernel's writeback, and
+    /// a power loss in that gap lost it while `persisted` had counted it.
+    #[test]
+    fn test_regression_a_lull_syncs_the_last_batch() {
+        let src = include_str!("ws_frame_spill.rs");
+        let test_marker = concat!("\n#[cfg(", "test)]\n");
+        let production = src.split(test_marker).next().unwrap_or(src);
+        let timeout_arm = production
+            .split("Err(RecvTimeoutError::Timeout) => {")
+            .nth(1)
+            .and_then(|s| s.split("Err(RecvTimeoutError::Disconnected)").next())
+            .expect("the writer's idle arm must exist");
+        assert!(
+            timeout_arm.contains("if unsynced {")
+                && timeout_arm.contains("maybe_sync_segment(&mut current"),
+            "the idle arm must sync a batch left unsynced:\n{timeout_arm}"
+        );
+        assert!(
+            production.contains("unsynced = true;"),
+            "every batch must mark the segment unsynced"
         );
     }
 

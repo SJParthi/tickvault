@@ -124,6 +124,18 @@ pub const UNTRADED_PROOF_MAX_AGE_SECS: u32 = 60;
 /// slot seeds instead.
 pub const UNTRADED_PROOF_MAX_SKEW_SECS: u32 = 5;
 
+/// How far a vendor trade time may run ahead of our own receipt clock before
+/// the fold refuses to bucket the tick (the row is still written).
+///
+/// One minute. The fold's timing suite (`first_trade_timing_attack.rs`) treats
+/// a box clock up to 10 s behind the exchange as an honest condition that must
+/// still fold, so the margin cannot be the spot store's 5 s
+/// (`spot_price_store::FUTURE_TRADE_TIME_SKEW_SECS`, which holds the stamp at
+/// its ceiling instead of refusing it). A test in the app crate keeps this at
+/// or above that figure. One minute still bounds a bogus same-day stamp to at
+/// most one M1 bucket ahead, where the unbounded fold let it run hours ahead.
+pub const FOLD_FUTURE_TRADE_TIME_SKEW_SECS: i64 = 60;
+
 /// IST second-of-day after which the equity pre-open call auction has matched
 /// (09:12:00; the match runs ~09:08-09:12). An equity proof taken at or after
 /// it may be extended to the 09:15 open, because nothing trades in between;
@@ -524,6 +536,11 @@ pub struct ConsumeStats {
     /// receipt for any out-of-band value, so the row lands in TODAY's
     /// partition. Without a receipt the tick stays a HARD refusal
     /// ([`Self::refused_timestamp`]) — no safe stamp exists there.
+    ///
+    /// Since 2026-10-02 also set for a stamp on the receipt day that runs more
+    /// than [`FOLD_FUTURE_TRADE_TIME_SKEW_SECS`] ahead of the receipt: it is
+    /// out of the band our own clock allows, and folding it would open a
+    /// future bucket for that instrument.
     pub out_of_band_timestamp: bool,
     /// `true` when `exchange_timestamp` fell outside
     /// `[MIN_PLAUSIBLE_EXCHANGE_TS_SECS, MAX_PLAUSIBLE_EXCHANGE_TS_SECS]`.
@@ -1747,6 +1764,42 @@ impl MultiTfAggregator {
                 return ConsumeStats {
                     stale_trading_day: true,
                     receipt_day_mismatch: true,
+                    ..ConsumeStats::default()
+                };
+            }
+            // FUTURE TRADE TIME on the RECEIPT day — added 2026-10-02 (audit
+            // follow-up to R2). The two arms above judge only the DAY, so a
+            // stamp of 15:00 today received at 10:00 today passed both, moved
+            // the watermark to 15:00 and opened a 15:00 bucket on every
+            // timeframe. Every honest tick of that instrument for the next five
+            // hours was then earlier than its open bucket and took the late
+            // path, so its bars between 10:00 and 15:00 were wrong or missing,
+            // with no error line. `SpotPriceStore` caps the same shape at
+            // receipt + 5 s since R2; the fold had no cap.
+            //
+            // A trade cannot have happened after we received it, so a stamp
+            // ahead of the receipt is the vendor's clock or ours. The margin is
+            // one minute: wide enough for the 10 s box-clock lag the timing
+            // suite models as honest (the boot halts at 2 s, BOOT-03, and the
+            // live alarm is `clock-skew-high`), narrow enough that a bogus
+            // stamp opens at most one M1 bucket ahead instead of hours.
+            //
+            // CANDLE-only, the row is kept, through the existing
+            // `out_of_band_timestamp` arm: the second is out of the band our
+            // own clock allows, it cannot be bucketed, and the row is still a
+            // real last-traded price, carrying open interest and bid/ask. The
+            // refused tick's cumulative volume is not lost: nothing here
+            // touches the slot, so the next honest tick's delta carries it.
+            //
+            // O(1): one add and one compare. No allocation.
+            if i64::from(fold_secs)
+                > receipt_ist_secs.saturating_add(FOLD_FUTURE_TRADE_TIME_SKEW_SECS)
+            {
+                crate::candles::fold_counters::fold_counters()
+                    .tick_out_of_band_timestamp
+                    .increment(1);
+                return ConsumeStats {
+                    out_of_band_timestamp: true,
                     ..ConsumeStats::default()
                 };
             }
@@ -8715,6 +8768,91 @@ mod tests {
         assert!(
             agg.lookup(Feed::Dhan, 13, SEG_IDX).is_some(),
             "the honest tick folds normally"
+        );
+    }
+
+    /// Audit 2026-10-02 (follow-up to R2): a stamp hours ahead of the receipt
+    /// on the SAME day passed both day gates, opened a 15:00 bucket at 10:00
+    /// and sealed the open 10:00 bar early on every timeframe, so every honest
+    /// tick after it took the late path. Now it is refused for the candle only
+    /// (`out_of_band_timestamp`, row kept), seals nothing and leaves the
+    /// instrument's bars as if it never arrived.
+    #[test]
+    fn test_regression_a_same_day_future_stamp_never_opens_a_future_bucket() {
+        let ten = DAY + 36_000; // 10:00:00 IST
+        let receipt = |ist_secs: u32| {
+            (i64::from(ist_secs) - crate::candles::tf_index::IST_UTC_OFFSET_SECS) * 1_000_000_000
+        };
+        let mut agg = MultiTfAggregator::default();
+
+        let mut first = tick(13, SEG_IDX, ten, 100.0, 1);
+        first.received_at_nanos = receipt(ten);
+        let stats = agg.consume_tick(Feed::Dhan, &first, None, ignore_seal);
+        assert!(!stats.out_of_band_timestamp, "an honest tick folds");
+
+        // Stamped 15:00 today, received at 10:00:30 today.
+        let mut poison = tick(13, SEG_IDX, DAY + 54_000, 101.0, 2);
+        poison.received_at_nanos = receipt(ten + 30);
+        let mut sealed = 0_u32;
+        let stats = agg.consume_tick(Feed::Dhan, &poison, None, |_, _, _, _, _| sealed += 1);
+        assert!(
+            stats.out_of_band_timestamp,
+            "a same-day stamp five hours ahead of the receipt is refused for the candle"
+        );
+        assert!(!stats.future_trading_day && !stats.stale_trading_day);
+        assert_eq!(
+            sealed, 0,
+            "the refused stamp must not seal the open 10:00 bar on any timeframe"
+        );
+
+        // The next honest tick lands in the still-open 10:00 minute. It closes
+        // the 10:00:00 second-scale bars, as any later second does, and no
+        // minute bar.
+        let mut honest = tick(13, SEG_IDX, ten + 40, 102.0, 3);
+        honest.received_at_nanos = receipt(ten + 40);
+        let mut minute_seals = 0_u32;
+        let stats = agg.consume_tick(Feed::Dhan, &honest, None, |_, _, _, tf, _| {
+            if tf == TfIndex::M1 {
+                minute_seals += 1;
+            }
+        });
+        assert_eq!(
+            stats.late_count, 0,
+            "no timeframe may treat the honest tick as late"
+        );
+        assert_eq!(minute_seals, 0, "the 10:00 minute is still open");
+        assert!(!stats.out_of_band_timestamp);
+    }
+
+    /// The margin is inclusive: a stamp exactly
+    /// [`FOLD_FUTURE_TRADE_TIME_SKEW_SECS`] ahead of the receipt still folds,
+    /// one second more does not. Ordinary skew between the exchange's clock and
+    /// ours never costs a candle.
+    #[test]
+    fn test_a_same_day_stamp_within_the_skew_margin_still_folds() {
+        let ten = DAY + 36_000;
+        let receipt_nanos =
+            (i64::from(ten) - crate::candles::tf_index::IST_UTC_OFFSET_SECS) * 1_000_000_000;
+        let skew = u32::try_from(FOLD_FUTURE_TRADE_TIME_SKEW_SECS).unwrap_or(5);
+
+        let mut agg = MultiTfAggregator::default();
+        let mut at_margin = tick(13, SEG_IDX, ten + skew, 100.0, 1);
+        at_margin.received_at_nanos = receipt_nanos;
+        let stats = agg.consume_tick(Feed::Dhan, &at_margin, None, ignore_seal);
+        assert!(!stats.out_of_band_timestamp, "a stamp at the margin folds");
+        assert!(agg.lookup(Feed::Dhan, 13, SEG_IDX).is_some());
+
+        let mut agg = MultiTfAggregator::default();
+        let mut past_margin = tick(13, SEG_IDX, ten + skew + 1, 100.0, 1);
+        past_margin.received_at_nanos = receipt_nanos;
+        let stats = agg.consume_tick(Feed::Dhan, &past_margin, None, ignore_seal);
+        assert!(
+            stats.out_of_band_timestamp,
+            "one second past the margin is refused"
+        );
+        assert!(
+            agg.lookup(Feed::Dhan, 13, SEG_IDX).is_none(),
+            "and takes no slot: the gate runs before slot allocation"
         );
     }
 

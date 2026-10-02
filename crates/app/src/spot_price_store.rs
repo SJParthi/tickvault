@@ -674,6 +674,19 @@ mod tests {
     const NSE_EQ: ExchangeSegment = ExchangeSegment::NseEquity;
     const IDX: ExchangeSegment = ExchangeSegment::IdxI;
 
+    /// The spot store and the candle fold judge the same shape (a trade time
+    /// ahead of our receipt). This store holds such a stamp at its ceiling;
+    /// the fold REFUSES the candle past its own margin. So the fold's margin
+    /// must be at least this one: a tick this store takes unchanged is never
+    /// refused a candle.
+    #[test]
+    fn test_future_skew_never_exceeds_the_candle_fold() {
+        assert!(
+            FUTURE_TRADE_TIME_SKEW_SECS
+                <= tickvault_trading::candles::multi_tf_aggregator::FOLD_FUTURE_TRADE_TIME_SKEW_SECS
+        );
+    }
+
     /// 2026-08-14 10:00:00 UTC — a fixed in-session trade time.
     const T0: u32 = 1_755_165_600;
     const DAY: i64 = ist_day_of(T0);

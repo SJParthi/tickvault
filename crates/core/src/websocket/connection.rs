@@ -270,12 +270,25 @@ impl CloseHandshake {
 ///
 /// Generic over the stream so the bound is testable against a scripted peer
 /// under `tokio::time::pause` — the real socket is `DhanFeedSocketImpl::close`.
-/// Drains any data frames still in flight (they are discarded: the guard has
-/// already been marked lost) and returns on the peer's Close, on stream end,
-/// on a read error, or at the bound — whichever is first.
-async fn await_close_handshake<S>(stream: &mut S, last_read_ended_by_reset: bool) -> CloseHandshake
+/// Returns on the peer's Close, on stream end, on a read error, or at the
+/// bound — whichever is first.
+///
+/// Every binary frame that still carries market data is handed to `on_frame`
+/// as it arrives, exactly as [`DhanFeedSocket::recv`] would have handed it up:
+/// a data frame, or a disconnect stacked behind data. A lone disconnect packet
+/// and control frames carry no data and are skipped. Until 2026-10-02 every
+/// frame read here was DISCARDED with no count, so each redial (depth-200
+/// rotation, ghost redial, idle teardown, park) lost whatever Dhan delivered
+/// between our Close and its reply, for up to [`CLOSE_HANDSHAKE_WAIT`].
+async fn await_close_handshake<S, F>(
+    stream: &mut S,
+    last_read_ended_by_reset: bool,
+    endpoint: DhanEndpointType,
+    mut on_frame: F,
+) -> CloseHandshake
 where
     S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    F: FnMut(Bytes),
 {
     if last_read_ended_by_reset {
         return CloseHandshake::Skipped;
@@ -284,6 +297,16 @@ where
         loop {
             match stream.next().await {
                 None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
+                Some(Ok(Message::Binary(payload))) => {
+                    if close_drain_frame_carries_data(endpoint, &payload) {
+                        metrics::counter!(
+                            "tv_dhan_ws_close_drain_frames_total",
+                            "endpoint" => endpoint.as_str()
+                        )
+                        .increment(1);
+                        on_frame(ws_bytes_to_bytes(payload));
+                    }
+                }
                 Some(Ok(_)) => {}
             }
         }
@@ -291,6 +314,27 @@ where
     match tokio::time::timeout(CLOSE_HANDSHAKE_WAIT, drain).await {
         Ok(()) => CloseHandshake::Completed,
         Err(_elapsed) => CloseHandshake::TimedOut,
+    }
+}
+
+/// Whether a binary frame read during the close handshake carries market
+/// data: the same verdict `recv` reaches (a data frame, or a disconnect
+/// stacked behind data). A lone disconnect packet carries none. O(packets)
+/// through [`classify_frame`], on the close path only.
+fn close_drain_frame_carries_data(endpoint: DhanEndpointType, frame: &[u8]) -> bool {
+    match classify_frame(endpoint, frame) {
+        FrameClass::Data => true,
+        FrameClass::Disconnect(_) => {
+            let control = match endpoint {
+                DhanEndpointType::Depth20 | DhanEndpointType::Depth200 => {
+                    crate::parser::depth::DEPTH_DISCONNECT_PACKET_SIZE
+                }
+                DhanEndpointType::MainFeed | DhanEndpointType::OrderUpdate => {
+                    DISCONNECT_PACKET_SIZE
+                }
+            };
+            frame.len() > control
+        }
     }
 }
 
@@ -1678,7 +1722,18 @@ impl<T: FeedTokenSource> DhanFeedSocket for DhanFeedSocketImpl<T> {
     async fn connect(&mut self) -> Result<(), SocketFailure> {
         // A previous socket must be gone before a new one is dialed, or the
         // pool budget is silently exceeded and Dhan kills the OLDEST member.
-        self.close().await;
+        // The supervisor closes (and captures) every socket before it redials,
+        // so a stream left here is unexpected; a data frame drained from it has
+        // no sink at this point and is counted, never silently dropped.
+        let stale_endpoint = self.params.endpoint;
+        self.close(|_frame| {
+            metrics::counter!(
+                "tv_dhan_ws_close_drain_discarded_total",
+                "endpoint" => stale_endpoint.as_str()
+            )
+            .increment(1);
+        })
+        .await;
 
         let endpoint = self.params.endpoint;
         let Some(token) = self.token.current_token() else {
@@ -2020,7 +2075,10 @@ impl<T: FeedTokenSource> DhanFeedSocket for DhanFeedSocketImpl<T> {
         }
     }
 
-    async fn close(&mut self) {
+    async fn close<F>(&mut self, on_frame: F)
+    where
+        F: FnMut(Bytes) + Send,
+    {
         // A close owed by this connection dies with it (audit PR21).
         self.pending_close = None;
         let writer = self.writer.take();
@@ -2073,7 +2131,13 @@ impl<T: FeedTokenSource> DhanFeedSocket for DhanFeedSocketImpl<T> {
         // half-open socket can get a HEALTHY sibling killed (Assumed: that
         // Dhan counts the half-open socket against its per-endpoint cap).
         // Skipped when the last read was a reset: nothing is left to answer.
-        let verdict = await_close_handshake(&mut stream, self.last_read_ended_by_reset).await;
+        let verdict = await_close_handshake(
+            &mut stream,
+            self.last_read_ended_by_reset,
+            self.params.endpoint,
+            on_frame,
+        )
+        .await;
         debug!(
             endpoint = self.params.endpoint.as_str(),
             close_handshake = verdict.as_str(),
@@ -2419,7 +2483,7 @@ mod tests {
         let mut silent = stream::pending::<Item>();
         let started = tokio::time::Instant::now();
         assert_eq!(
-            await_close_handshake(&mut silent, false).await,
+            await_close_handshake(&mut silent, false, DhanEndpointType::MainFeed, |_| {}).await,
             CloseHandshake::TimedOut
         );
         assert_eq!(
@@ -2431,7 +2495,7 @@ mod tests {
         // A bare TCP reset: there is no peer to wait for, and no time passes.
         let started = tokio::time::Instant::now();
         assert_eq!(
-            await_close_handshake(&mut silent, true).await,
+            await_close_handshake(&mut silent, true, DhanEndpointType::MainFeed, |_| {}).await,
             CloseHandshake::Skipped
         );
         assert_eq!(
@@ -2448,7 +2512,7 @@ mod tests {
         ]);
         let started = tokio::time::Instant::now();
         assert_eq!(
-            await_close_handshake(&mut replying, false).await,
+            await_close_handshake(&mut replying, false, DhanEndpointType::MainFeed, |_| {}).await,
             CloseHandshake::Completed
         );
         assert_eq!(started.elapsed(), Duration::ZERO);
@@ -2456,7 +2520,7 @@ mod tests {
         // A stream that has already ended completes at once as well.
         let mut ended = stream::iter(Vec::<Item>::new());
         assert_eq!(
-            await_close_handshake(&mut ended, false).await,
+            await_close_handshake(&mut ended, false, DhanEndpointType::MainFeed, |_| {}).await,
             CloseHandshake::Completed
         );
         assert_eq!(CloseHandshake::TimedOut.as_str(), "timed_out");
@@ -3173,6 +3237,40 @@ mod tests {
         );
     }
 
+    /// 2026-10-02 (zero-loss audit): while the close handshake completes,
+    /// every frame that carries market data is handed on — a data frame and a
+    /// disconnect stacked behind data — and only a lone disconnect packet and
+    /// control frames are skipped. The peer's Close still ends the wait.
+    #[tokio::test(start_paused = true)]
+    async fn test_regression_the_close_handshake_hands_on_every_data_frame() {
+        use futures_util::stream;
+        let data = main_feed_packet(RESPONSE_CODE_QUOTE);
+        let mut stacked = main_feed_packet(RESPONSE_CODE_FULL);
+        stacked.extend_from_slice(&main_feed_disconnect(805));
+        let lone = main_feed_disconnect(805);
+        let mut peer = stream::iter(vec![
+            Ok::<_, tokio_tungstenite::tungstenite::Error>(Message::Binary(WsBytes::from(
+                data.clone(),
+            ))),
+            Ok(Message::Ping(WsBytes::new())),
+            Ok(Message::Binary(WsBytes::from(lone))),
+            Ok(Message::Binary(WsBytes::from(stacked.clone()))),
+            Ok(Message::Close(None)),
+            Ok(Message::Binary(WsBytes::from(data.clone()))),
+        ]);
+        let mut handed: Vec<Bytes> = Vec::new();
+        let verdict = await_close_handshake(&mut peer, false, DhanEndpointType::MainFeed, |f| {
+            handed.push(f)
+        })
+        .await;
+        assert_eq!(verdict, CloseHandshake::Completed);
+        assert_eq!(
+            handed,
+            vec![Bytes::from(data), Bytes::from(stacked)],
+            "data and stacked-disconnect frames are kept; nothing after the Close is read"
+        );
+    }
+
     #[test]
     fn a_stacked_805_is_classified_too() {
         let mut frame = main_feed_packet(RESPONSE_CODE_FULL);
@@ -3315,7 +3413,7 @@ mod tests {
             || None,
         );
         socket.pending_close = Some(DisconnectCode::ExceededActiveConnections);
-        socket.close().await;
+        socket.close(|_| {}).await;
         assert_eq!(socket.pending_close, None);
         assert_eq!(socket.recv().await, SocketEvent::Closed { code: None });
     }
@@ -3533,7 +3631,7 @@ mod tests {
             ),
             || None,
         );
-        socket.close().await;
+        socket.close(|_| {}).await;
         assert!(!socket.is_connected());
     }
 
@@ -3684,7 +3782,7 @@ mod tests {
             ),
             || None,
         );
-        socket.close().await;
+        socket.close(|_| {}).await;
         assert!(!socket.is_connected());
         drop(socket);
     }

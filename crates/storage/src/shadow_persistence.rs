@@ -388,13 +388,28 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) -> bool
         // QuestDB rejects every row on the type mismatch, so the table
         // stays empty. QuestDB cannot ALTER a column's type — drop the
         // (broken, empty) table and let the corrected CREATE rebuild it.
+        //
+        // 2026-10-02 (zero-loss audit): "empty" was an assumption this code
+        // never checked, and it runs every boot over every candle table. The
+        // drop now needs the table PROVEN empty; a table holding rows, or one
+        // whose count cannot be read, is kept and reported. No market-data
+        // delete without a copy (operator quotes 27/28, 2026-09-29).
         if candle_table_has_int_security_id(&client, &base_url, table).await {
-            let drop_ddl = format!("DROP TABLE IF EXISTS {table};");
-            run_drop_ddl(&client, &base_url, table, &drop_ddl).await;
-            info!(
-                table,
-                "candle table dropped — security_id INT→LONG self-heal"
-            );
+            if candle_table_is_empty(&client, &base_url, table).await {
+                let drop_ddl = format!("DROP TABLE IF EXISTS {table};");
+                run_drop_ddl(&client, &base_url, table, &drop_ddl).await;
+                info!(
+                    table,
+                    "candle table dropped — security_id INT→LONG self-heal (it was empty)"
+                );
+            } else {
+                metrics::counter!("tv_candle_int_self_heal_refused_total").increment(1);
+                warn!(
+                    table,
+                    "candle table has security_id INT but is not proven empty — KEPT, not \
+                     dropped; new candles for it will be refused until an operator migrates it"
+                );
+            }
         }
         // ── The 2026-09-19 fresh-scratch candle row ──────────────────────
         //
@@ -550,6 +565,32 @@ async fn candle_table_has_int_security_id(client: &Client, base_url: &str, table
         }
         _ => false,
     }
+}
+
+/// `true` only when QuestDB answers that `table` holds zero rows. Any failure
+/// (unreachable, non-success, unparseable body) is `false`: a table the boot
+/// cannot prove empty is never dropped.
+async fn candle_table_is_empty(client: &Client, base_url: &str, table: &str) -> bool {
+    let query = format!("SELECT count() FROM {table}");
+    match client
+        .get(base_url)
+        .query(&[("query", query.as_str())])
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            exec_body_reports_zero_rows(&resp.text().await.unwrap_or_default())
+        }
+        _ => false,
+    }
+}
+
+/// Reads a QuestDB `/exec` answer to `SELECT count()`: zero rows reads as a
+/// dataset of `[[0]]`. Anything else, including a missing dataset, is `false`.
+fn exec_body_reports_zero_rows(body: &str) -> bool {
+    body.split("\"dataset\":")
+        .nth(1)
+        .is_some_and(|rest| rest.trim_start().starts_with("[[0]]"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1208,6 +1249,27 @@ async fn run_ddl(client: &Client, base_url: &str, table: &str, ddl: &str) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 2026-10-02 (zero-loss audit): the INT self-heal drop needs a table
+    /// PROVEN empty. Only a dataset of exactly `[[0]]` qualifies; a row count,
+    /// an error body, or a missing dataset keeps the table.
+    #[test]
+    fn test_regression_only_a_zero_count_proves_a_candle_table_empty() {
+        assert!(exec_body_reports_zero_rows(
+            r#"{"query":"SELECT count() FROM candles_1m","columns":[{"name":"count","type":"LONG"}],"timestamp":-1,"dataset":[[0]],"count":1}"#
+        ));
+        assert!(!exec_body_reports_zero_rows(
+            r#"{"query":"x","columns":[],"dataset":[[1234]],"count":1}"#
+        ));
+        assert!(!exec_body_reports_zero_rows(
+            r#"{"query":"x","columns":[],"dataset":[[10]],"count":1}"#
+        ));
+        assert!(exec_body_reports_zero_rows(r#"{"dataset": [[0]]}"#));
+        assert!(!exec_body_reports_zero_rows(
+            r#"{"error":"table does not exist"}"#
+        ));
+        assert!(!exec_body_reports_zero_rows(""));
+    }
 
     /// The self-heal list and the candle `CREATE` must name the SAME columns,
     /// with the SAME types, in the SAME order. A name only in the CREATE is a

@@ -2113,6 +2113,69 @@ R-items Z+ and guarantee matrix: covered by the shared matrix at the end of this
 path: R1 removes four compares per tick; R2 adds one divide and one compare per spot tick; no
 allocation in either (zero-alloc DHAT gates unchanged).
 
+### Added 2026-10-02 (zero-loss audit on main c4e66b6), riskiest first
+
+Owner: "see i dont want any ticks loss or single data loss". Every path a tick takes was traced
+(socket, write-ahead log, database, candles, every delete). Done in this change:
+
+- [x] **Z1 — frames read while a socket closes are kept.** (`core`) `await_close_handshake`
+  discarded every frame Dhan delivered between our Close and its reply, uncounted, on every
+  redial, rotation and park. Each data frame now reaches the sink through `close_capturing`
+  (the only close the supervisor uses); counted on `tv_dhan_ws_close_drain_frames_total`.
+  - Files: crates/core/src/websocket/connection.rs, crates/core/src/websocket/pool_supervisor.rs
+  - Tests: `test_regression_the_close_handshake_hands_on_every_data_frame`,
+    `test_regression_frames_read_during_close_reach_the_sink`,
+    `every_production_close_passes_its_frames_to_the_sink`.
+- [x] **Z2 — the write-ahead log syncs the last batch before a quiet spell.** (`storage`) Only a
+  new record could trigger the rate-limited sync, so after a lull the last batch waited for the
+  kernel's writeback. The idle arm now syncs an unsynced segment, at most once per interval.
+  - Files: crates/storage/src/ws_frame_spill.rs
+  - Tests: `test_regression_a_lull_syncs_the_last_batch`.
+- [x] **Z3 — the candle INT self-heal drops only a table proven empty.** (`storage`) It ran every
+  boot and dropped any candle table with an INT `security_id` without checking it was empty.
+  - Files: crates/storage/src/shadow_persistence.rs
+  - Tests: `test_regression_only_a_zero_count_proves_a_candle_table_empty`.
+- [x] **Z4 — a same-day future trade time cannot open a future candle.** (`trading`, `app`) R2 capped
+  the spot store; the fold had no cap. Refused (row kept) past `FOLD_FUTURE_TRADE_TIME_SKEW_SECS`
+  = 60 s ahead of receipt.
+  - Files: crates/trading/src/candles/multi_tf_aggregator.rs, crates/app/src/spot_price_store.rs
+  - Tests: `test_regression_a_same_day_future_stamp_never_opens_a_future_bucket`,
+    `test_a_same_day_stamp_within_the_skew_margin_still_folds`,
+    `test_future_skew_never_exceeds_the_candle_fold`.
+- [x] **Z5 — the error-log filter no longer turns on TRACE for the whole process; the catch-up
+  stop reason says "clock" when time ran out.** (`app`)
+  - Files: crates/app/src/log_coalescer.rs, crates/app/src/dhan_feed_stack.rs
+  - Tests: `test_regression_combined_error_filter_keeps_the_error_level_hint`,
+    `test_wal_catchup_lag_step_covers_every_permutation`.
+
+Open (found, not fixed here; each needs its own design):
+
+- [ ] **Z6 — the candle spill ledger can let an older candle overwrite a fuller one.** (`storage`)
+  One bucket per key, recorded only after the disk write: a later bucket spilled through the
+  producer path, an original still in the escalation queue, a DLQ'd original, or a parked file
+  replayed after a later bucket each let replay write the older copy. Silent. Fix shape: keep the
+  fullest copy per (key, bucket) at replay. The PR41a/PR41b honest-limit texts understate this.
+- [ ] **Z7 — a rescue batch is not marked unapplied (PR32).** (`storage`) A crash after a later
+  batch's acknowledgement loses it uncounted.
+- [ ] **Z8 — durability below the watermark.** (`storage`, deploy) Tick spill files are not synced
+  and the QuestDB commit mode is unset, while the applied watermark is synced.
+- [ ] **Z9 — data with no stored copy is pruned.** WAL active/archive prunes, the seal-spill and
+  quarantine prunes, the retired-table drops and the console wipes delete without an S3 copy;
+  the cold bucket still expires after 1825 days with no versioning. Owned by feed-hardening 45e,
+  45f, 45g, 45h.
+- [ ] **Z10 — a full WAL disk can deadlock replay.** Replay refuses below 40 GiB free and the prune
+  refuses unapplied segments; the exit is 45e (upload, then prune).
+- [ ] **Z11 — smaller loss paths.** A mid-segment WAL corruption abandons the rest of the segment
+  (no resync); a writer panic aborts the process with the queue unwritten (`panic = "abort"`,
+  the respawn is test-only); an oversize frame is counted but not alarmed; a mid-session stop
+  never closes the sockets before the WAL shutdown.
+- [ ] **Z12 — CLAUDE.md speed table rows.** `connection.rs::classify_frame` is O(packets) on the
+  socket read task; `blocking_flush` runs `block_in_place` on every flush.
+
+Z-items Z+ and guarantee matrix: covered by the shared matrix at the end of this plan. Tick path:
+Z4 adds one add and one compare per tick; Z1 runs only on the close path; Z2 adds one flag test per
+idle poll. No allocation on the tick path.
+
 ## Edge Cases
 
 - PR1: log burst larger than the non-blocking buffer → lines dropped and counted, never blocking.

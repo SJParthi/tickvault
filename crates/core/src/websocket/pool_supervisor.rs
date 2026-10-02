@@ -4493,7 +4493,14 @@ pub trait DhanFeedSocket: Send {
     /// [`FrameSink::accept`].
     fn recv(&mut self) -> impl std::future::Future<Output = SocketEvent> + Send;
     /// Close the socket, best effort.
-    fn close(&mut self) -> impl std::future::Future<Output = ()> + Send;
+    ///
+    /// Every data frame still read while the close handshake completes is
+    /// handed to `on_frame` (2026-10-02). The supervisor passes its sink, so a
+    /// frame Dhan delivers between our Close and its reply reaches the
+    /// write-ahead log like any other instead of being discarded uncounted.
+    fn close<F>(&mut self, on_frame: F) -> impl std::future::Future<Output = ()> + Send
+    where
+        F: FnMut(Bytes) + Send;
 }
 
 /// A transport-level failure. Opaque on purpose: policy lives in the
@@ -4783,6 +4790,24 @@ where
     run_connection_with_commands(socket, supervisor, guard, sink, refresh_token, None).await
 }
 
+/// Closes `socket`, handing every data frame read during the close handshake
+/// to `sink` (2026-10-02). The ONLY way the supervisor closes a socket: a
+/// close given a do-nothing callback would compile and silently restore the
+/// discard this replaced, so every close goes through here and a source pin
+/// (`every_production_close_passes_its_frames_to_the_sink`) holds it.
+async fn close_capturing<S, K>(socket: &mut S, sink: &K)
+where
+    S: DhanFeedSocket,
+    K: FrameSink + ?Sized,
+{
+    socket
+        .close(|frame| {
+            // The sink counts and reports its own refusals.
+            let _outcome = sink.accept(frame);
+        })
+        .await;
+}
+
 /// [`run_connection`] plus a channel that can change the LIVE subscription
 /// while the socket is up.
 ///
@@ -4842,7 +4867,7 @@ where
     loop {
         match action {
             SupervisorAction::Park { reason } => {
-                socket.close().await;
+                close_capturing(&mut socket, &*sink).await;
                 // Parked for the session: the wire carries nothing from here.
                 publish_connection_instruments(&supervisor.slot(), 0);
                 // A park is PERMANENT — nothing re-dials this socket, and its
@@ -4874,14 +4899,14 @@ where
                 // every event and would otherwise spin here forever, so it is
                 // checked first; anything else re-enters the dial cycle.
                 if let Some(reason) = supervisor.park_reason() {
-                    socket.close().await;
+                    close_capturing(&mut socket, &*sink).await;
                     return ConnectionExit::Parked(reason);
                 }
                 action = supervisor.on_event(ConnEvent::BeginDial, Instant::now());
             }
 
             SupervisorAction::SleepThenDial { delay_ms } => {
-                socket.close().await;
+                close_capturing(&mut socket, &*sink).await;
                 guard.mark_lost();
                 // `mark_lost` is the honest edge: the subscription is gone and
                 // will have to be re-sent. Recorded BEFORE the sleep so the
@@ -4896,7 +4921,7 @@ where
             }
 
             SupervisorAction::RefreshTokenThenDial { delay_ms } => {
-                socket.close().await;
+                close_capturing(&mut socket, &*sink).await;
                 guard.mark_lost();
                 sink.on_lifecycle(
                     tickvault_common::ws_event_types::WsEventKind::Disconnected,
@@ -9441,7 +9466,11 @@ mod tests {
             async fn recv(&mut self) -> SocketEvent {
                 SocketEvent::Closed { code: None }
             }
-            async fn close(&mut self) {}
+            async fn close<F>(&mut self, _on_frame: F)
+            where
+                F: FnMut(Bytes) + Send,
+            {
+            }
         }
         assert_eq!(Silent.last_dial_failure_reason(), "unknown");
     }
@@ -10053,6 +10082,9 @@ mod tests {
         /// Submits (`kind>`) and answers (`<kind`) of DELAYED writes in the
         /// order they happened, so a test can prove two writes never overlap.
         write_log: Vec<&'static str>,
+        /// Frames the next `close` reads during its handshake and hands to
+        /// the caller, as the production close does (2026-10-02).
+        close_frames: Vec<Bytes>,
     }
 
     struct FakeSocket {
@@ -10194,11 +10226,21 @@ mod tests {
             }
         }
 
-        fn close(&mut self) -> impl std::future::Future<Output = ()> + Send {
+        fn close<F>(&mut self, mut on_frame: F) -> impl std::future::Future<Output = ()> + Send
+        where
+            F: FnMut(Bytes) + Send,
+        {
             let state = std::sync::Arc::clone(&self.state);
             async move {
-                if let Ok(mut s) = state.lock() {
-                    s.closes += 1;
+                let drained = match state.lock() {
+                    Ok(mut s) => {
+                        s.closes += 1;
+                        std::mem::take(&mut s.close_frames)
+                    }
+                    Err(_) => Vec::new(),
+                };
+                for frame in drained {
+                    on_frame(frame);
                 }
             }
         }
@@ -11180,7 +11222,11 @@ mod tests {
                     }
                 }
             }
-            async fn close(&mut self) {}
+            async fn close<F>(&mut self, _on_frame: F)
+            where
+                F: FnMut(Bytes) + Send,
+            {
+            }
         }
 
         let st = std::sync::Arc::new(Mutex::new(FakeState {
@@ -12044,6 +12090,67 @@ mod tests {
         assert_eq!(
             s.connects, 1,
             "805 must never be retried — a retry kills a healthy sibling"
+        );
+    }
+
+    /// 2026-10-02 (zero-loss audit): a data frame Dhan delivers while our
+    /// close handshake completes reaches the sink. Before, the production close
+    /// read and DISCARDED it, with no count, on every redial and every park.
+    #[tokio::test(start_paused = true)]
+    async fn test_regression_frames_read_during_close_reach_the_sink() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: VecDeque::from(vec![SocketEvent::Closed {
+                code: Some(DisconnectCode::ExceededActiveConnections),
+            }]),
+            close_frames: vec![
+                Bytes::from_static(b"late-tick-1"),
+                Bytes::from_static(b"late-tick-2"),
+            ],
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::MainFeed, instruments(10))
+            .expect("inside cap");
+
+        let exit = run_connection(
+            fake(&st),
+            sup(DhanEndpointType::MainFeed, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+        )
+        .await;
+
+        assert_eq!(exit, ConnectionExit::Parked(ParkReason::PoolOverflow));
+        let accepted = sink.accepted.lock().expect("sink");
+        assert_eq!(
+            accepted.as_slice(),
+            &[
+                Bytes::from_static(b"late-tick-1"),
+                Bytes::from_static(b"late-tick-2")
+            ],
+            "every frame drained by the close must be handed to the sink, in order"
+        );
+    }
+
+    /// Every production close goes through `close_capturing`, so no close can
+    /// be given a do-nothing callback and silently discard frames again.
+    #[test]
+    fn every_production_close_passes_its_frames_to_the_sink() {
+        let src = include_str!("pool_supervisor.rs");
+        let marker = concat!("#[cfg(", "test)]");
+        let production = src.split(marker).next().unwrap_or(src);
+        assert!(
+            production
+                .matches("close_capturing(&mut socket, &*sink)")
+                .count()
+                >= 4,
+            "every redial and park arm must close through close_capturing"
+        );
+        let bare_closes = production.matches(".close(|").count();
+        assert_eq!(
+            bare_closes, 1,
+            "the only direct close is the one inside close_capturing"
         );
     }
 

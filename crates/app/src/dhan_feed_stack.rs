@@ -5640,9 +5640,15 @@ pub enum CatchupLagStep {
     Proceed,
     /// Apply lag is growing and the pause has room left: wait one poll.
     Pause,
-    /// Apply lag is still growing after the longest pause, or the drain's
-    /// clock has run out: stop and leave the rest as `*.wal` files.
+    /// Apply lag is still growing after the longest pause: stop and leave the
+    /// rest as `*.wal` files. Reported as `stop_reason = "apply_lag"`.
     Stop,
+    /// Apply lag is growing but the drain's clock ran out before the longest
+    /// pause did: stand down for the CLOCK. Split from `Stop` on 2026-10-02:
+    /// a pause cut short by the budget (any in-session restart, whose budget
+    /// is shorter than the 180 s pause) was reported as "apply lag kept
+    /// growing", sometimes with `paused_secs = 0`.
+    OutOfTime,
 }
 
 /// Should the WAL catch-up drain run its next round, wait, or stand down?
@@ -5663,8 +5669,10 @@ pub const fn wal_catchup_lag_step(
 ) -> CatchupLagStep {
     if lag_growing_tables == 0 {
         CatchupLagStep::Proceed
-    } else if paused_secs >= WAL_CATCHUP_LAG_PAUSE_MAX_SECS || secs_left == 0 {
+    } else if paused_secs >= WAL_CATCHUP_LAG_PAUSE_MAX_SECS {
         CatchupLagStep::Stop
+    } else if secs_left == 0 {
+        CatchupLagStep::OutOfTime
     } else {
         CatchupLagStep::Pause
     }
@@ -15545,6 +15553,11 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         // 45c: did the drain stand down because QuestDB apply lag kept
         // growing through the longest pause?
         let mut catchup_lag_stopped = false;
+        // The clock ran out during a lag pause (`CatchupLagStep::OutOfTime`).
+        // A flag, not a re-read of the deadline: `secs_left` is whole seconds,
+        // so up to a second of budget can remain, and the tail below would
+        // then report "drained".
+        let mut catchup_pause_clock_out = false;
         let lag_pause_counter = metrics::counter!(WAL_CATCHUP_LAG_PAUSE_COUNTER);
         lag_pause_counter.increment(0);
         // `true` only when the final pass found NOTHING left on disk — no
@@ -15606,6 +15619,10 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                         catchup_lag_stopped = true;
                         break;
                     }
+                    CatchupLagStep::OutOfTime => {
+                        catchup_pause_clock_out = true;
+                        break;
+                    }
                     CatchupLagStep::Pause => {
                         if lag_paused_secs == 0 {
                             info!(
@@ -15635,7 +15652,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 );
                 break;
             }
-            if tokio::time::Instant::now() >= catchup_deadline {
+            if catchup_pause_clock_out || tokio::time::Instant::now() >= catchup_deadline {
                 break;
             }
             // MEMORY STOP — checked BEFORE the round, never after, because the
@@ -15896,7 +15913,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                  unapplied map is cleared for this session"
             );
         }
-        if rounds > 0 || catchup_memory_stopped || catchup_lag_stopped {
+        if rounds > 0 || catchup_memory_stopped || catchup_lag_stopped || catchup_pause_clock_out {
             // `catchup_memory_stopped` joins `exhausted` deliberately: all
             // three mean the SAME operational thing — the drain stood down
             // with work still on disk — and the counter exists to say that,
@@ -15906,6 +15923,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             // STOP_EC2_INSTANCES line and a new EMF name is ~$0.30/mo.
             let exhausted = catchup_memory_stopped
                 || catchup_lag_stopped
+                || catchup_pause_clock_out
                 || tokio::time::Instant::now() >= catchup_deadline
                 || rounds >= WAL_CATCHUP_MAX_ROUNDS;
             let stop_reason = if catchup_memory_stopped {
@@ -28581,15 +28599,18 @@ mod item_44_tests {
 
     #[test]
     fn test_wal_catchup_lag_step_covers_every_permutation() {
-        use CatchupLagStep::{Pause, Proceed, Stop};
+        use CatchupLagStep::{OutOfTime, Pause, Proceed, Stop};
         let max = WAL_CATCHUP_LAG_PAUSE_MAX_SECS;
         for growing in [0_u32, 1, 7, u32::MAX] {
             for paused in [0_u64, 5, max - 1, max, max + 5, u64::MAX] {
                 for left in [0_u64, 1, 60, 300, u64::MAX] {
                     let want = if growing == 0 {
                         Proceed
-                    } else if paused >= max || left == 0 {
+                    } else if paused >= max {
                         Stop
+                    } else if left == 0 {
+                        // 2026-10-02: the clock, not the lag, ended this pause.
+                        OutOfTime
                     } else {
                         Pause
                     };
