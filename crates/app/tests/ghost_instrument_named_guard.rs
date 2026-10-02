@@ -6,7 +6,9 @@
 //! code **25** on 2026-09-10 and code **24** on 2026-09-11, each producing an
 //! identical failure signature — 80 `unsubscribe_ignored` lines, split 40/40
 //! across depth-20 and depth-200, on all ten depth sockets, every socket
-//! reaching `GHOST_REDIAL_SESSION_CEILING`. Across both sessions this process
+//! reaching `GHOST_REDIAL_SESSION_CEILING`. (Renamed `GHOST_RESEND_SESSION_CEILING` on
+//! 2026-10-01, when a ghost stopped being answered by a redial and started
+//! being answered by the same unsubscribe, sent again on the live socket.) Across both sessions this process
 //! **could not say which contract ghosted.**
 //!
 //! The reason is narrow and was entirely ours. Two log sites decide it, and
@@ -84,7 +86,7 @@ fn production_str(text: &str) -> String {
 fn unsubscribe_ignored_block(src: &str) -> &str {
     block_at(src, "\"unsubscribe_ignored\"").expect(
         "the ignored-unsubscribe error! lost its `source` label. Every other ghost source in \
-         this family is distinguished by that field alone — `ghost_redial_exhausted`, \
+         this family is distinguished by that field alone — `ghost_resend_exhausted`, \
          `ghost_instrument`, `depth_unsubscribe_sent` — and all of them share one ErrorCode, \
          so without it a reader (and any future filter) cannot tell which of them a line is. \
          Per the noise lock §2.3w this family is log-only today: NO CloudWatch filter matches \
@@ -135,7 +137,7 @@ fn macro_before(src: &str, label: &str) -> String {
 #[test]
 fn every_ghost_line_is_emitted_at_a_level_production_actually_logs() {
     let drain = production(DRAIN);
-    for label in ["\"unsubscribe_ignored\"", "\"ghost_redial_exhausted\""] {
+    for label in ["\"unsubscribe_ignored\"", "\"ghost_resend_exhausted\""] {
         assert_eq!(
             macro_before(&drain, label),
             "error",
@@ -225,7 +227,7 @@ fn the_ghost_line_reports_the_segment_label_the_other_two_surfaces_use() {
     // numeric segment leaves the pairing ambiguous in exactly the case the
     // field was added to disambiguate.
     let src = production(DRAIN);
-    for label in ["\"unsubscribe_ignored\"", "\"ghost_redial_exhausted\""] {
+    for label in ["\"unsubscribe_ignored\"", "\"ghost_resend_exhausted\""] {
         let block = block_at(&src, label).unwrap_or_else(|| panic!("{label} is gone"));
         assert!(
             block.contains("segment = ghost_segment"),
@@ -243,17 +245,18 @@ fn the_ghost_line_reports_the_segment_label_the_other_two_surfaces_use() {
 
 #[test]
 fn the_ceiling_arm_names_the_contract_too() {
-    // MEASURED 2026-09-11: every socket reached the redial ceiling by 10:22 IST
+    // MEASURED 2026-09-11 (a redial ceiling then, a resend ceiling since
+    // 2026-10-01): every socket reached the ceiling by 10:22 IST
     // and 78.5% of the session's 5,345,436 ghost packets arrived after that.
     // Naming the instrument only on the redial arm leaves four fifths of the
     // evidence anonymous — the precise gap this whole change exists to close.
     let src = production(DRAIN);
-    let block = block_at(&src, "\"ghost_redial_exhausted\"")
+    let block = block_at(&src, "\"ghost_resend_exhausted\"")
         .expect("the ghost-ceiling error! lost its `source` label");
     for field in ["security_id = ghost_security_id", "segment = ghost_segment"] {
         assert!(
             block.contains(field),
-            "the ghost-ceiling line lost `{field}`. After the ceiling no redial is requested, \
+            "the ghost-ceiling line lost `{field}`. After the ceiling no resend is requested, \
              so this is the ONLY line naming the instrument for the rest of the session — and \
              it covers the majority of the session's ghost packets."
         );
@@ -371,5 +374,36 @@ fn guard_self_test() {
         "the level detector latched onto an EARLIER macro — it would report `error` for a line \
          that a downgrade had turned into `debug!`, which is the exact regression the level \
          tests exist to catch"
+    );
+}
+
+/// The repeat unsubscribe (scope lock 2026-10-01) is the ASK half of a
+/// ghost's evidence once the drain has seen it: it must name the instrument
+/// and the request code, at a level production logs, or a ghost that survives
+/// the resend cannot be paired with what we asked for.
+#[test]
+fn the_repeat_unsubscribe_is_logged_with_its_instrument_and_code() {
+    let src = production(SUPERVISOR);
+    assert_eq!(
+        macro_before(&src, "\"depth_unsubscribe_resent\""),
+        "info",
+        "the repeat-unsubscribe line is no longer an info!; production logs at info"
+    );
+    let block = block_at(&src, "\"depth_unsubscribe_resent\"")
+        .expect("the repeat-unsubscribe line lost its `source` label");
+    for field in [
+        "security_id = ghost.security_id",
+        "segment = ghost.segment.as_str()",
+        "request_code = FEED_UNSUBSCRIBE_TWENTY_DEPTH",
+    ] {
+        assert!(
+            block.contains(field),
+            "the repeat-unsubscribe line lost `{field}`"
+        );
+    }
+    assert_eq!(
+        macro_before(&src, "\"depth_unsubscribe_resend_failed\""),
+        "warn",
+        "a resend that never reached the wire must stay visible"
     );
 }
