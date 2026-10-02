@@ -8336,3 +8336,70 @@ QuestDB before any socket dialled.
   changes an existing candle, or writes a row without `feed`.
 - Switches `market_depth` to array rows before the scratch-table test is
   recorded, or drops any level, side or packet in the conversion.
+
+### 2026-10-02 — DEPTH SOCKETS RECOVER ON THEIR OWN AFTER 805: one probe, then one release at a time; `ROTATION_HALTED` stays set
+
+**The verbatim operator answers (2026-10-02, preserve EXACTLY, typos included):**
+
+> "go ahea ddude"
+>
+> (11:51:46Z, project chat — replying to a post that listed five pending
+> decisions, including the backup socket and core pinning)
+
+> "dont b;ock go ahea ddude"
+>
+> (11:51:57Z, the work thread)
+
+**What they answered.** Pending decision (2) of that post: "depth sockets
+self-recover after Dhan error 805 (they are currently parked for the process)",
+with its recommended option — the same shape plan item D7 built for the main
+feed on 2026-10-02: wait, redial ONE parked socket as a test, bring the rest
+back one at a time only if Dhan accepts it, back off and try again if it does
+not. The 2026-09-24 and 2026-09-26 sections above keep `ROTATION_HALTED`
+process-wide and never cleared; this section does NOT touch that.
+
+Recorded HERE before the code, per the rule-file-first law.
+
+#### What this AMENDS
+
+| Surface | Was (2026-09-24, D7 2026-10-02) | Now |
+|---|---|---|
+| A depth-20 / depth-200 socket closed with 805 | parked for the rest of the process | parked, then waits for the DEPTH overflow probe |
+| Probe | main feed only | main feed (unchanged: 5/10/20 min, 3 attempts) **and** depth: first probe 5 min after the last 805, the wait doubles after each failed probe up to 30 min, at most 6 probes per process |
+| What a probe dials | — | the parked socket's OWN slot, replaying the instruments it already held. No new slot, no new socket |
+| After a passed probe | — | the other parked depth sockets come back ONE at a time, each under its own watch window (2 min after its first frame; a frame within 2 min of the grant) |
+| Failure | — | an 805 on ANY socket, or any socket closing with no code, inside a window; or no frame in time. The probed socket parks again; the next probe waits the doubled delay |
+| Probes in flight | one (main feed) | **one process-wide**: the main feed goes first. A depth probe or release starts only when no main-feed window is running and no parked main-feed socket is still waiting for its probe; a main-feed grant waits for a running depth window to end |
+| `ROTATION_HALTED` | set by the first 805, never cleared | unchanged. Depth-200 rotate-by-redial, ghost redials, probe closes and NEW depth sockets (attach, spawn) stay refused for the process. Only the parked sockets reconnect |
+| Session gate | the frame watchdog's (continuous session) | unchanged, for both |
+
+#### ⚠ Honest envelope
+
+- **A failed probe can cost a healthy socket.** Dhan answers an extra
+  connection by closing the OLDEST one with 805, so a probe into an account
+  that is still over budget kills a live socket, which then parks too. The
+  doubling wait and the 6-probe cap bound that to 6 extra 805s per process.
+- **Depth sockets that were never opened stay unopened.** A depth socket the
+  attach refused after the 805 (the breaker) is not planned later; only
+  sockets that were up and parked come back.
+- **One depth episode for both accounts.** When the depth account (2026-09-26)
+  is live, an 805 on either account fails a running depth window and its
+  parked sockets share one queue. Cautious, not per account.
+- **Prometheus counters and coded log lines only** — no new CloudWatch alarm,
+  no new EMF metric (noise lock §3).
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Clears, swaps or resets `ROTATION_HALTED` within a session, or lets a
+  recovered depth socket re-enable depth-200 rotation, ghost redials, probe
+  closes or new depth dials.
+- Allows more than ONE probe or release window in flight across the main feed
+  and depth together.
+- Probes depth sooner than 5 minutes after the 805 or failed probe that
+  preceded it, shortens the doubling, raises the 30-minute cap or the 6-probe
+  cap, or removes either bound, without a fresh dated quote HERE.
+- Lets a probe or release open a socket beyond the authorized counts, or dial
+  any slot other than one that parked for 805.
+- Releases a socket parked for any reason other than 805.
+- Adds a CloudWatch alarm, EMF metric or Telegram page for the depth probe
+  without the noise lock's own dated row first.

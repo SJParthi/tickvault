@@ -14210,10 +14210,15 @@ fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize 
             Some(tx) => sink.with_audit(tx.clone()),
             None => sink,
         };
-        // D7 (2026-10-02): a MAIN-FEED socket parked by 805 waits for the
-        // overflow probe instead of ending its task. `with_overflow_probe`
-        // ignores every other endpoint, so depth sockets stay parked.
-        let sink = if endpoint == DhanEndpointType::MainFeed {
+        // D7 (2026-10-02) and the scope lock's 2026-10-02 depth section: a
+        // main-feed, depth-20 or depth-200 socket parked by 805 waits for its
+        // pool's overflow probe instead of ending its task. One probe window
+        // runs process-wide, main feed first. `ROTATION_HALTED` stays set, so
+        // the spawn gate above still refuses NEW depth sockets.
+        let sink = if matches!(
+            endpoint,
+            DhanEndpointType::MainFeed | DhanEndpointType::Depth20 | DhanEndpointType::Depth200
+        ) {
             sink.with_overflow_probe()
         } else {
             sink
@@ -29522,10 +29527,11 @@ mod socket_stop_tests {
         );
     }
 
-    /// D7: the widen reads the overflow episode, not the depth breaker, and
-    /// only main-feed sinks opt into the probe.
+    /// D7: the widen reads the overflow episode, not the depth breaker; the
+    /// market-data sinks (main feed, depth-20, depth-200) opt into the probe
+    /// (scope lock 2026-10-02), and the depth spawn gate on the breaker stays.
     #[test]
-    fn the_widen_reads_the_overflow_episode_and_only_main_feed_sinks_opt_in() {
+    fn the_widen_reads_the_overflow_episode_and_market_data_sinks_opt_in() {
         let src = include_str!("dhan_feed_stack.rs");
         let marker = concat!("#[cfg(", "test)]");
         let production = src.split(marker).next().unwrap_or(src);
@@ -29541,12 +29547,23 @@ mod socket_stop_tests {
         let opt = production
             .find("sink.with_overflow_probe()")
             .expect("opt-in");
+        let gate = production[..opt]
+            .rfind("let sink = if matches!(")
+            .expect("the opt-in is gated on the endpoint");
+        let condition = &production[gate..opt];
         assert!(
-            production[..opt]
-                .rfind("if endpoint == DhanEndpointType::MainFeed")
-                .is_some_and(|at| opt - at < 200),
-            "the probe opt-in must be limited to the main feed"
+            condition.contains("DhanEndpointType::MainFeed")
+                && condition.contains("DhanEndpointType::Depth20")
+                && condition.contains("DhanEndpointType::Depth200")
+                && !condition.contains("OrderUpdate"),
+            "the probe opt-in covers the three market-data endpoints and nothing else"
         );
+        // The breaker still refuses NEW depth sockets at the spawn, before the
+        // opt-in: a probe only ever redials a socket that already parked.
+        let spawn_gate = production
+            .find("\"path\" => \"spawn\"")
+            .expect("the depth spawn gate on the 805 breaker");
+        assert!(spawn_gate < opt);
     }
 }
 

@@ -857,14 +857,15 @@ pub enum ConnEvent {
     /// ([`LiveSubscriptionCommand::RotateByRedial`]). Live sockets only.
     /// Scope lock 2026-09-24.
     RotationRequested,
-    /// The main-feed overflow probe (plan item D7) released this socket from
-    /// its 805 park. Accepted ONLY from `Parked(PoolOverflow)` on a MAIN-FEED
-    /// slot; every other phase, park reason and endpoint ignores it, so depth
-    /// sockets stay parked. The redial runs on the normal damped ladder with
-    /// this socket's stagger. `ROTATION_HALTED` is not touched.
+    /// The overflow probe (plan item D7 for the main feed; the 2026-10-02
+    /// scope-lock section for depth) released this socket from its 805 park.
+    /// Accepted ONLY from `Parked(PoolOverflow)` on a market-data slot (main
+    /// feed, depth-20, depth-200); every other phase and park reason ignores
+    /// it. The redial runs on the normal damped ladder with this socket's
+    /// stagger. `ROTATION_HALTED` is not touched.
     OverflowProbeGranted,
     /// The overflow probe this socket was part of failed: close and park
-    /// again for 805. Main feed only; ignored once parked.
+    /// again for 805. Market-data slots only; ignored once parked.
     OverflowProbeFailed,
     /// Orderly shutdown.
     ShutdownRequested,
@@ -1083,12 +1084,19 @@ pub fn refuse_voluntary_redial_after_805(slot: ConnectionSlot, path: &'static st
 // the rest back only if Dhan accepts it.
 //
 // What this does NOT touch, by design and by the 2026-09-24 / 2026-09-26 REJECT
-// lists of the WebSocket scope lock: `ROTATION_HALTED` is never cleared, depth
-// sockets stay parked (depth recovery needs an owner decision), and depth
-// rotation, depth dials and `RotateByRedial` stay refused exactly as before.
-// Only MAIN-FEED slots parked for 805 can be released, and only through
+// lists of the WebSocket scope lock: `ROTATION_HALTED` is never cleared, and
+// depth rotation, NEW depth dials and `RotateByRedial` stay refused exactly as
+// before. Only slots parked for 805 can be released, and only through
 // `ConnEvent::OverflowProbeGranted`, which the supervisor accepts from
-// `Parked(PoolOverflow)` on the main feed and from nothing else.
+// `Parked(PoolOverflow)` on a market-data slot and from nothing else.
+//
+// Depth (scope lock 2026-10-02, owner decision 2): parked depth sockets have
+// their OWN episode (`OverflowEpisodeKind::Depth`) with a doubling wait
+// (5 min to a 30 min cap, at most 6 probes). Both episodes sit under ONE lock
+// (`OVERFLOW_EPISODES`) so exactly one probe or release window runs
+// process-wide: the main feed goes first, depth waits while a main-feed window
+// runs or a parked main-feed socket still waits for its probe, and a main-feed
+// grant waits for a running depth window to end.
 
 /// Waits before probe 1, 2 and 3, each measured from the 805 (or the failed
 /// probe) that preceded it: 5, 10 and 20 minutes.
@@ -1116,6 +1124,82 @@ pub const OVERFLOW_PROBE_FIRST_FRAME_DEADLINE_SECS: u64 = 120;
 /// [`OverflowProbeOutcome::as_str`] (a fixed set). Prometheus only: no new
 /// alarm, no new EMF selection (noise lock §3).
 pub const OVERFLOW_PROBE_METRIC: &str = "tv_dhan_ws_overflow_probe_total";
+
+/// Depth (scope lock 2026-10-02): the wait before the FIRST depth probe,
+/// measured from the 805 that parked the socket. Each failed probe doubles the
+/// next wait, up to [`DEPTH_OVERFLOW_PROBE_MAX_DELAY_SECS`].
+pub const DEPTH_OVERFLOW_PROBE_BASE_DELAY_SECS: u64 = 300;
+
+/// The ceiling of the doubling depth wait: 30 minutes.
+pub const DEPTH_OVERFLOW_PROBE_MAX_DELAY_SECS: u64 = 1_800;
+
+/// Depth probes per process lifetime. A failed probe into an account still
+/// over budget costs Dhan's OLDEST depth socket (it answers with 805), so the
+/// count is capped; after the last failure parked depth sockets stay down.
+pub const DEPTH_OVERFLOW_PROBE_MAX_ATTEMPTS: u8 = 6;
+
+/// Counter of depth overflow-probe outcomes, labelled by
+/// [`OverflowProbeOutcome::as_str`]. A separate series from the main feed's,
+/// so the existing one keeps its meaning. Prometheus only (noise lock §3).
+pub const DEPTH_OVERFLOW_PROBE_METRIC: &str = "tv_dhan_ws_depth_overflow_probe_total";
+
+/// Which pool an overflow episode recovers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverflowEpisodeKind {
+    /// D7: 5/10/20 minutes, three probes.
+    MainFeed,
+    /// 2026-10-02: 5 minutes doubling to 30, six probes.
+    Depth,
+}
+
+impl OverflowEpisodeKind {
+    /// The pool an endpoint's 805 park joins; `None` for the order-update
+    /// socket, which never takes part.
+    const fn for_endpoint(endpoint: DhanEndpointType) -> Option<Self> {
+        match endpoint {
+            DhanEndpointType::MainFeed => Some(Self::MainFeed),
+            DhanEndpointType::Depth20 | DhanEndpointType::Depth200 => Some(Self::Depth),
+            DhanEndpointType::OrderUpdate => None,
+        }
+    }
+
+    /// The wait before probe `attempt` (0-based), or `None` once the probes
+    /// are spent.
+    fn delay_secs(self, attempt: u8) -> Option<u64> {
+        match self {
+            Self::MainFeed => OVERFLOW_PROBE_DELAYS_SECS
+                .get(usize::from(attempt))
+                .copied(),
+            Self::Depth => (attempt < DEPTH_OVERFLOW_PROBE_MAX_ATTEMPTS).then(|| {
+                DEPTH_OVERFLOW_PROBE_BASE_DELAY_SECS
+                    .checked_shl(u32::from(attempt))
+                    .unwrap_or(DEPTH_OVERFLOW_PROBE_MAX_DELAY_SECS)
+                    .min(DEPTH_OVERFLOW_PROBE_MAX_DELAY_SECS)
+            }),
+        }
+    }
+
+    const fn max_attempts(self) -> u8 {
+        match self {
+            Self::MainFeed => OVERFLOW_PROBE_MAX_ATTEMPTS,
+            Self::Depth => DEPTH_OVERFLOW_PROBE_MAX_ATTEMPTS,
+        }
+    }
+
+    const fn metric(self) -> &'static str {
+        match self {
+            Self::MainFeed => OVERFLOW_PROBE_METRIC,
+            Self::Depth => DEPTH_OVERFLOW_PROBE_METRIC,
+        }
+    }
+
+    const fn source(self) -> &'static str {
+        match self {
+            Self::MainFeed => "main_feed_overflow_probe",
+            Self::Depth => "depth_overflow_probe",
+        }
+    }
+}
 
 /// Where the main-feed overflow episode stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1208,12 +1292,14 @@ struct OverflowEpisodeEffect {
 /// The overflow episode's decision core: pure, `Copy`, no clock of its own,
 /// no allocation. Every input is an event with the caller's monotonic `now`.
 ///
-/// The process-wide instance lives in [`OVERFLOW_EPISODE`]; the unit tests
+/// The process-wide instance lives in [`OVERFLOW_EPISODES`]; the unit tests
 /// drive their own values so they cannot race each other.
 #[derive(Debug, Clone, Copy)]
 struct OverflowEpisode {
+    /// Which pool this episode recovers: sets the wait and the probe cap.
+    kind: OverflowEpisodeKind,
     phase: OverflowEpisodePhase,
-    /// Main-feed slots (by global index, < 32) parked for 805 and waiting.
+    /// This pool's slots (by global index, < 32) parked for 805 and waiting.
     /// A bitmask, so add, remove and "lowest parked" are O(1).
     parked_mask: u32,
     /// Probes started this process. Never decreases.
@@ -1227,8 +1313,19 @@ struct OverflowEpisode {
 }
 
 impl OverflowEpisode {
+    /// The main-feed episode (D7).
     const fn new() -> Self {
+        Self::of_kind(OverflowEpisodeKind::MainFeed)
+    }
+
+    /// The depth episode (scope lock 2026-10-02).
+    const fn new_depth() -> Self {
+        Self::of_kind(OverflowEpisodeKind::Depth)
+    }
+
+    const fn of_kind(kind: OverflowEpisodeKind) -> Self {
         Self {
+            kind,
             phase: OverflowEpisodePhase::Quiet,
             parked_mask: 0,
             probes_started: 0,
@@ -1262,7 +1359,23 @@ impl OverflowEpisode {
         matches!(self.phase, OverflowEpisodePhase::DownForSession)
     }
 
-    /// A main-feed socket parked for 805 and is waiting to be released.
+    /// Whether this episode holds the process-wide turn: a window is
+    /// running, or a parked socket of this pool still waits for its probe
+    /// or release. The depth episode grants nothing while the main feed
+    /// holds the turn.
+    const fn holds_turn(&self) -> bool {
+        match self.phase {
+            OverflowEpisodePhase::Probing | OverflowEpisodePhase::Resuming => true,
+            OverflowEpisodePhase::Waiting | OverflowEpisodePhase::Releasing => {
+                self.parked_mask != 0
+            }
+            OverflowEpisodePhase::Quiet
+            | OverflowEpisodePhase::Recovered
+            | OverflowEpisodePhase::DownForSession => false,
+        }
+    }
+
+    /// A socket of this pool parked for 805 and is waiting to be released.
     fn on_parked(&mut self, global_index: u8) {
         if let Some(bit) = 1u32.checked_shl(u32::from(global_index)) {
             self.parked_mask |= bit;
@@ -1286,7 +1399,7 @@ impl OverflowEpisode {
                 self.fail(OverflowProbeOutcome::FailedOverflow, now)
             }
             OverflowEpisodePhase::Releasing | OverflowEpisodePhase::Recovered => {
-                if self.probes_started >= OVERFLOW_PROBE_MAX_ATTEMPTS {
+                if self.probes_started >= self.kind.max_attempts() {
                     self.phase = OverflowEpisodePhase::DownForSession;
                     OverflowEpisodeEffect {
                         outcomes: [Some(OverflowProbeOutcome::DownForSession), None],
@@ -1326,10 +1439,7 @@ impl OverflowEpisode {
     fn poll(&mut self, now: Instant, window_open: bool) -> OverflowEpisodeEffect {
         match self.phase {
             OverflowEpisodePhase::Waiting => {
-                let Some(delay) = OVERFLOW_PROBE_DELAYS_SECS
-                    .get(usize::from(self.probes_started))
-                    .copied()
-                else {
+                let Some(delay) = self.kind.delay_secs(self.probes_started) else {
                     // Unreachable: a fourth wait is never entered. Fail closed.
                     self.phase = OverflowEpisodePhase::DownForSession;
                     return OverflowEpisodeEffect {
@@ -1440,7 +1550,7 @@ impl OverflowEpisode {
         let slot = self.watched_slot;
         self.watched_slot = u8::MAX;
         self.first_frame_at = None;
-        let then = if self.probes_started >= OVERFLOW_PROBE_MAX_ATTEMPTS {
+        let then = if self.probes_started >= self.kind.max_attempts() {
             self.phase = OverflowEpisodePhase::DownForSession;
             self.phase_since = None;
             Some(OverflowProbeOutcome::DownForSession)
@@ -1457,29 +1567,113 @@ impl OverflowEpisode {
     }
 }
 
-/// The process-wide overflow episode.
+/// Both overflow episodes, under one lock so exactly one probe or release
+/// window runs process-wide (scope lock 2026-10-02).
+///
+/// Ordering: the main feed goes first. The main episode may grant only while
+/// no depth window is running; the depth episode may grant only while the
+/// main episode does not hold the turn ([`OverflowEpisode::holds_turn`]: a
+/// main window running, or a parked main-feed socket still waiting). Every
+/// 805 and every bare reset feeds BOTH, so a window on one fails on a close
+/// anywhere.
+#[derive(Debug, Clone, Copy)]
+struct OverflowEpisodes {
+    main: OverflowEpisode,
+    depth: OverflowEpisode,
+}
+
+/// What one combined step asks of the shell: one effect per episode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct OverflowEpisodesEffect {
+    main: OverflowEpisodeEffect,
+    depth: OverflowEpisodeEffect,
+}
+
+impl OverflowEpisodes {
+    const fn new() -> Self {
+        Self {
+            main: OverflowEpisode::new(),
+            depth: OverflowEpisode::new_depth(),
+        }
+    }
+
+    /// The one socket under watch, from whichever episode runs a window.
+    const fn watched(&self) -> Option<u8> {
+        match self.main.watched() {
+            Some(slot) => Some(slot),
+            None => self.depth.watched(),
+        }
+    }
+
+    /// A socket parked for 805 joins its pool's episode. The order-update
+    /// socket never takes part.
+    fn on_parked(&mut self, endpoint: DhanEndpointType, global_index: u8) {
+        match OverflowEpisodeKind::for_endpoint(endpoint) {
+            Some(OverflowEpisodeKind::MainFeed) => self.main.on_parked(global_index),
+            Some(OverflowEpisodeKind::Depth) => self.depth.on_parked(global_index),
+            None => {}
+        }
+    }
+
+    fn on_overflow(&mut self, now: Instant) -> OverflowEpisodesEffect {
+        OverflowEpisodesEffect {
+            main: self.main.on_overflow(now),
+            depth: self.depth.on_overflow(now),
+        }
+    }
+
+    fn on_bare_reset(&mut self, now: Instant) -> OverflowEpisodesEffect {
+        OverflowEpisodesEffect {
+            main: self.main.on_bare_reset(now),
+            depth: self.depth.on_bare_reset(now),
+        }
+    }
+
+    fn on_first_frame(&mut self, global_index: u8, now: Instant) {
+        self.main.on_first_frame(global_index, now);
+        self.depth.on_first_frame(global_index, now);
+    }
+
+    /// Time-driven steps for both, main first. A grant needs the session
+    /// window AND the other episode out of the way.
+    fn poll(&mut self, now: Instant, window_open: bool) -> OverflowEpisodesEffect {
+        let main_may_grant = window_open && self.depth.watched().is_none();
+        let main = self.main.poll(now, main_may_grant);
+        let depth_may_grant = window_open && !self.main.holds_turn();
+        let depth = self.depth.poll(now, depth_may_grant);
+        OverflowEpisodesEffect { main, depth }
+    }
+}
+
+/// The process-wide overflow episodes (main feed and depth).
 ///
 /// A `std` mutex, allocation-free, taken ONLY on cold paths: a socket closing
 /// with 805 or with no code, a socket parking, and the one-second poll of a
-/// parked main-feed socket (or of the one socket under watch). Never per
-/// frame: the first-frame report is the lock-free [`OVERFLOW_WATCHED_FIRST_FRAME`]
-/// flag, which the next poll stamps.
-static OVERFLOW_EPISODE: std::sync::Mutex<OverflowEpisode> =
-    std::sync::Mutex::new(OverflowEpisode::new());
+/// parked socket (or of a socket opted into the probe). Never per frame: the
+/// first-frame report is the lock-free [`OVERFLOW_WATCHED_FIRST_FRAME`] flag,
+/// which the next poll stamps.
+static OVERFLOW_EPISODES: std::sync::Mutex<OverflowEpisodes> =
+    std::sync::Mutex::new(OverflowEpisodes::new());
 
 /// Set by the first 805 of the process and never cleared: the fast check
 /// that keeps every quiet socket off the episode lock.
 static OVERFLOW_ENGAGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Published copy of [`OverflowEpisode::widen_permitted`], for an O(1) read
-/// by the main-feed widen. Cleared at the 805 itself, before the lock.
+/// Published copy of [`OverflowEpisode::widen_permitted`] (main feed), for an
+/// O(1) read by the main-feed widen. Cleared at the 805 itself, before the
+/// lock.
 static OVERFLOW_WIDEN_PERMITTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 
-/// Published copy of [`OverflowEpisode::is_down`].
+/// Published copy of the main episode's [`OverflowEpisode::is_down`].
 static OVERFLOW_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Published copy of [`OverflowEpisode::watched`] (`u8::MAX` = none).
+/// Published copy of the depth episode's [`OverflowEpisode::is_down`].
+static DEPTH_OVERFLOW_DOWN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Published copy of [`OverflowEpisodes::watched`] (`u8::MAX` = none). One
+/// slot for the whole process: at most one window runs at a time.
 static OVERFLOW_WATCHED_SLOT: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(u8::MAX);
 
@@ -1506,18 +1700,22 @@ pub fn main_feed_overflow_widen_permitted() -> bool {
     OVERFLOW_WIDEN_PERMITTED.load(std::sync::atomic::Ordering::Acquire)
 }
 
-/// Runs `step` on the process episode, publishes the atomics, then reports
-/// and executes the effect OUTSIDE the lock. Cold path.
-fn overflow_episode_step(step: impl FnOnce(&mut OverflowEpisode) -> OverflowEpisodeEffect) {
-    let (effect, watched) = {
-        let mut ep = OVERFLOW_EPISODE
+/// Runs `step` on the process episodes, publishes the atomics, then reports
+/// and executes the effects OUTSIDE the lock. Cold path.
+fn overflow_episode_step(step: impl FnOnce(&mut OverflowEpisodes) -> OverflowEpisodesEffect) {
+    let (effects, watched) = {
+        let mut eps = OVERFLOW_EPISODES
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let watched_before = ep.watched();
-        let effect = step(&mut ep);
-        let watched = ep.watched();
-        OVERFLOW_WIDEN_PERMITTED.store(ep.widen_permitted(), std::sync::atomic::Ordering::Release);
-        OVERFLOW_DOWN.store(ep.is_down(), std::sync::atomic::Ordering::Release);
+        let watched_before = eps.watched();
+        let effects = step(&mut eps);
+        let watched = eps.watched();
+        OVERFLOW_WIDEN_PERMITTED.store(
+            eps.main.widen_permitted(),
+            std::sync::atomic::Ordering::Release,
+        );
+        OVERFLOW_DOWN.store(eps.main.is_down(), std::sync::atomic::Ordering::Release);
+        DEPTH_OVERFLOW_DOWN.store(eps.depth.is_down(), std::sync::atomic::Ordering::Release);
         if watched != watched_before {
             // A new window (or none): its first-frame flag starts clear.
             OVERFLOW_WATCHED_FIRST_FRAME.store(false, std::sync::atomic::Ordering::Release);
@@ -1526,8 +1724,18 @@ fn overflow_episode_step(step: impl FnOnce(&mut OverflowEpisode) -> OverflowEpis
             watched.unwrap_or(u8::MAX),
             std::sync::atomic::Ordering::Release,
         );
-        (effect, watched)
+        (effects, watched)
     };
+    apply_overflow_effect(OverflowEpisodeKind::MainFeed, effects.main, watched);
+    apply_overflow_effect(OverflowEpisodeKind::Depth, effects.depth, watched);
+}
+
+/// Sets the registers one episode's effect asks for and reports its outcomes.
+fn apply_overflow_effect(
+    kind: OverflowEpisodeKind,
+    effect: OverflowEpisodeEffect,
+    watched: Option<u8>,
+) {
     if let Some(slot) = effect.repark
         && let Some(flag) = OVERFLOW_REPARK.get(usize::from(slot))
     {
@@ -1544,44 +1752,61 @@ fn overflow_episode_step(step: impl FnOnce(&mut OverflowEpisode) -> OverflowEpis
         }
     }
     for outcome in effect.outcomes.into_iter().flatten() {
-        report_overflow_probe_outcome(outcome, effect.grant.or(effect.repark), watched);
+        report_overflow_probe_outcome(kind, outcome, effect.grant.or(effect.repark), watched);
     }
 }
 
 /// One coded error line and one counter increment per outcome. Cold: a few
-/// per episode, bounded by three probes and the main-feed socket count.
+/// per episode, bounded by the probe caps and the socket counts.
 fn report_overflow_probe_outcome(
+    kind: OverflowEpisodeKind,
     outcome: OverflowProbeOutcome,
     slot: Option<u8>,
     watched: Option<u8>,
 ) {
-    metrics::counter!(OVERFLOW_PROBE_METRIC, "outcome" => outcome.as_str()).increment(1);
-    error!(
-        code = ErrorCode::WsGapDisconnectClassification.code_str(),
-        source = "main_feed_overflow_probe",
-        outcome = outcome.as_str(),
-        connection_index = slot.map_or(-1, i32::from),
-        watched_connection = watched.map_or(-1, i32::from),
-        rotation_halted = rotation_halted(),
-        "main-feed overflow probe ({}): after Dhan closed a socket with 805, ONE parked \
-         main-feed socket is redialled as a test and the rest come back one at a time only \
-         if no socket is closed with 805 or with no code for two minutes after each one's \
-         first frame. Depth sockets stay parked and depth rotation stays halted until a \
-         restart.",
-        outcome.as_str()
-    );
+    metrics::counter!(kind.metric(), "outcome" => outcome.as_str()).increment(1);
+    match kind {
+        OverflowEpisodeKind::MainFeed => error!(
+            code = ErrorCode::WsGapDisconnectClassification.code_str(),
+            source = kind.source(),
+            outcome = outcome.as_str(),
+            connection_index = slot.map_or(-1, i32::from),
+            watched_connection = watched.map_or(-1, i32::from),
+            rotation_halted = rotation_halted(),
+            "main-feed overflow probe ({}): after Dhan closed a socket with 805, ONE parked \
+             main-feed socket is redialled as a test and the rest come back one at a time only \
+             if no socket is closed with 805 or with no code for two minutes after each one's \
+             first frame. Parked depth sockets follow through their own probe once the main \
+             feed is settled; depth rotation stays halted until a restart.",
+            outcome.as_str()
+        ),
+        OverflowEpisodeKind::Depth => error!(
+            code = ErrorCode::WsGapDisconnectClassification.code_str(),
+            source = kind.source(),
+            outcome = outcome.as_str(),
+            connection_index = slot.map_or(-1, i32::from),
+            watched_connection = watched.map_or(-1, i32::from),
+            rotation_halted = rotation_halted(),
+            "depth overflow probe ({}): after Dhan closed a socket with 805, ONE parked depth \
+             socket redials its own instruments as a test (5 minutes, doubling to 30, at most \
+             6 tries) and the rest come back one at a time only if no socket is closed with 805 \
+             or with no code for two minutes after each one's first frame. Depth-200 rotation \
+             and new depth sockets stay halted until a restart.",
+            outcome.as_str()
+        ),
+    }
 }
 
-/// Any socket closed: an 805 or a bare reset feeds the episode. O(1) atomic
+/// Any socket closed: an 805 or a bare reset feeds the episodes. O(1) atomic
 /// check for every other close; the lock only when it matters.
 fn overflow_episode_note_disconnect(code: Option<DisconnectCode>, now: Instant) {
     if classify_disconnect(code) == DisconnectClass::PoolOverflow {
         OVERFLOW_ENGAGED.store(true, std::sync::atomic::Ordering::Release);
         // Before the lock, so the widen can never read a stale yes.
         OVERFLOW_WIDEN_PERMITTED.store(false, std::sync::atomic::Ordering::Release);
-        overflow_episode_step(|ep| ep.on_overflow(now));
+        overflow_episode_step(|eps| eps.on_overflow(now));
     } else if code.is_none() && OVERFLOW_ENGAGED.load(std::sync::atomic::Ordering::Acquire) {
-        overflow_episode_step(|ep| ep.on_bare_reset(now));
+        overflow_episode_step(|eps| eps.on_bare_reset(now));
     }
 }
 
@@ -1593,25 +1818,39 @@ fn overflow_episode_note_first_frame(global_index: u8) {
     }
 }
 
-/// A main-feed socket parked for 805 and will wait for a grant.
-fn overflow_episode_note_parked(global_index: u8) {
-    overflow_episode_step(|ep| {
-        ep.on_parked(global_index);
-        OverflowEpisodeEffect::default()
+/// A socket parked for 805 and will wait for a grant from its pool's episode.
+fn overflow_episode_note_parked(endpoint: DhanEndpointType, global_index: u8) {
+    overflow_episode_step(|eps| {
+        eps.on_parked(endpoint, global_index);
+        OverflowEpisodesEffect::default()
     });
 }
 
 /// The one-second poll: stamps the watched socket's first frame (from the
 /// lock-free flag) and runs the time-driven steps.
 fn overflow_episode_poll(now: Instant, window_open: bool) {
-    overflow_episode_step(|ep| {
-        if let Some(watched) = ep.watched()
+    overflow_episode_step(|eps| {
+        if let Some(watched) = eps.watched()
             && OVERFLOW_WATCHED_FIRST_FRAME.load(std::sync::atomic::Ordering::Acquire)
         {
-            ep.on_first_frame(watched, now);
+            eps.on_first_frame(watched, now);
         }
-        ep.poll(now, window_open)
+        eps.poll(now, window_open)
     });
+}
+
+/// Whether this endpoint's episode has spent its probes (parked sockets of
+/// that pool stay down for the session). O(1).
+fn overflow_episode_down_for(endpoint: DhanEndpointType) -> bool {
+    match OverflowEpisodeKind::for_endpoint(endpoint) {
+        Some(OverflowEpisodeKind::MainFeed) => {
+            OVERFLOW_DOWN.load(std::sync::atomic::Ordering::Acquire)
+        }
+        Some(OverflowEpisodeKind::Depth) => {
+            DEPTH_OVERFLOW_DOWN.load(std::sync::atomic::Ordering::Acquire)
+        }
+        None => true,
+    }
 }
 
 /// Takes (and clears) this slot's grant.
@@ -2257,20 +2496,21 @@ impl ConnectionSupervisor {
     /// shell must take. Total, allocation-free, O(1).
     pub fn on_event(&mut self, event: ConnEvent, now: Instant) -> SupervisorAction {
         // Parking is terminal and absorbs everything — with ONE exception:
-        // the main-feed overflow probe (plan item D7) may release a MAIN-FEED
-        // socket parked for 805. Depth sockets, every other park reason and
-        // every other event stay absorbed exactly as before.
+        // the overflow probe (D7 for the main feed, scope lock 2026-10-02 for
+        // depth) may release a market-data socket parked for 805. Every other
+        // park reason, the order-update socket and every other event stay
+        // absorbed exactly as before.
         if self.phase == ConnPhase::Parked {
             if event == ConnEvent::OverflowProbeGranted
                 && self.park_reason == Some(ParkReason::PoolOverflow)
-                && self.slot.endpoint == DhanEndpointType::MainFeed
+                && OverflowEpisodeKind::for_endpoint(self.slot.endpoint).is_some()
             {
                 self.park_reason = None;
                 info!(
                     endpoint = self.slot.endpoint.as_str(),
                     connection_index = self.slot.global_index,
-                    "main-feed socket parked for 805 released by the overflow probe — \
-                     redialling on the damped ladder"
+                    "socket parked for 805 released by the overflow probe — redialling its \
+                     own instruments on the damped ladder"
                 );
                 return self.schedule_redial(ReconnectReason::OverflowProbe, now);
             }
@@ -2285,8 +2525,8 @@ impl ConnectionSupervisor {
             ConnEvent::OverflowProbeGranted => SupervisorAction::Continue,
 
             ConnEvent::OverflowProbeFailed => {
-                // Depth sockets never take part in the probe.
-                if self.slot.endpoint != DhanEndpointType::MainFeed {
+                // The order-update socket never takes part in the probe.
+                if OverflowEpisodeKind::for_endpoint(self.slot.endpoint).is_none() {
                     return SupervisorAction::Continue;
                 }
                 // Re-park for 805. `ROTATION_HALTED` is already set by the
@@ -4106,13 +4346,14 @@ pub trait FrameSink: Send + Sync + 'static {
         self.on_lifecycle(kind, reason);
     }
 
-    /// Does this socket wait for a main-feed overflow probe after an 805 park
-    /// instead of ending its task? (D7, 2026-10-02.)
+    /// Does this socket wait for an overflow probe after an 805 park instead
+    /// of ending its task? (D7 for the main feed; scope lock 2026-10-02 for
+    /// depth.)
     ///
     /// Default `false`: every existing sink, test and bench keeps the old
-    /// "805 parks for the session" behaviour. The app opts the MAIN-FEED
-    /// sinks in through [`WalRingSink::with_overflow_probe`]; depth sinks are
-    /// never opted in.
+    /// "805 parks for the session" behaviour. The app opts the market-data
+    /// sinks (main feed, depth-20, depth-200) in through
+    /// [`WalRingSink::with_overflow_probe`].
     fn overflow_probe_enabled(&self) -> bool {
         false
     }
@@ -4604,9 +4845,9 @@ pub struct WalRingSink {
     /// the old way never stops on request. Set by
     /// [`WalRingSink::with_socket_stop`].
     socket_stop: Option<&'static SocketStop>,
-    /// Whether this socket waits for a main-feed overflow probe after an 805
-    /// park (D7). `false` by default; set by
-    /// [`WalRingSink::with_overflow_probe`] for MAIN-FEED sinks only.
+    /// Whether this socket waits for an overflow probe after an 805 park.
+    /// `false` by default; set by [`WalRingSink::with_overflow_probe`] for
+    /// market-data sinks (main feed, depth-20, depth-200).
     overflow_probe: bool,
 }
 
@@ -4683,14 +4924,13 @@ impl WalRingSink {
         self
     }
 
-    /// Opts this socket into the main-feed overflow probe (D7, 2026-10-02):
-    /// after an 805 park it waits for a probe grant instead of ending its
-    /// task. Ignored for any endpoint but the main feed, so a depth sink can
-    /// never be opted in by mistake — depth recovery after an 805 needs an
-    /// owner decision.
+    /// Opts this socket into the overflow probe: after an 805 park it waits
+    /// for a probe grant from its pool's episode instead of ending its task.
+    /// Main feed (D7) and depth-20 / depth-200 (scope lock 2026-10-02);
+    /// ignored for the order-update socket, which has no episode.
     #[must_use]
     pub fn with_overflow_probe(mut self) -> Self {
-        self.overflow_probe = self.endpoint == DhanEndpointType::MainFeed;
+        self.overflow_probe = OverflowEpisodeKind::for_endpoint(self.endpoint).is_some();
         self
     }
 
@@ -5604,19 +5844,19 @@ fn guard_len_u32(guard: &SubscribeGuard) -> u32 {
     u32::try_from(guard.len()).unwrap_or(u32::MAX)
 }
 
-/// D7: a MAIN-FEED socket parked for 805 waits here for an overflow probe
-/// grant instead of ending its task (2026-10-02).
+/// A market-data socket parked for 805 waits here for an overflow probe grant
+/// instead of ending its task (D7 for the main feed; scope lock 2026-10-02
+/// for depth).
 ///
-/// Polls the process episode once per [`IDLE_POLL_INTERVAL`] — the poll is
-/// what lets the 5/10/20-minute wait elapse, and it grants nothing outside
-/// the supervisor's session gate. Returns the supervisor's next action once
-/// this slot is granted, or `None` when the process asks the socket to stop
-/// or the episode is down for the session; the caller then ends the task as
-/// parked, exactly as before D7.
+/// Polls the process episodes once per [`IDLE_POLL_INTERVAL`] — the poll is
+/// what lets the wait elapse, and it grants nothing outside the supervisor's
+/// session gate. Returns the supervisor's next action once this slot is
+/// granted, or `None` when the process asks the socket to stop or this pool's
+/// episode is down for the session; the caller then ends the task as parked.
 ///
 /// The grant goes through [`ConnEvent::OverflowProbeGranted`], which the
-/// supervisor accepts only from `Parked(PoolOverflow)` on the main feed, so a
-/// grant can never revive any other park.
+/// supervisor accepts only from `Parked(PoolOverflow)` on a market-data slot,
+/// so a grant can never revive any other park.
 async fn wait_for_overflow_grant<K>(
     supervisor: &mut ConnectionSupervisor,
     sink: &K,
@@ -5625,6 +5865,7 @@ where
     K: FrameSink + ?Sized,
 {
     let slot = supervisor.slot().global_index;
+    let endpoint = supervisor.slot().endpoint;
     // A re-park request left over from the failure that parked this socket
     // is spent: the socket is parked. Cleared so it cannot undo a later
     // grant.
@@ -5634,9 +5875,9 @@ where
             "stale overflow re-park request cleared at park"
         );
     }
-    overflow_episode_note_parked(slot);
+    overflow_episode_note_parked(endpoint, slot);
     loop {
-        if sink.stop_requested() || OVERFLOW_DOWN.load(std::sync::atomic::Ordering::Acquire) {
+        if sink.stop_requested() || overflow_episode_down_for(endpoint) {
             return None;
         }
         overflow_episode_poll(
@@ -5653,9 +5894,9 @@ where
     }
 }
 
-/// D7: a socket opted into the overflow probe advances the episode on its
-/// one-second tick, and takes its own re-park request. Returns the action a
-/// re-park produced (a `Park`), or `Continue`.
+/// D7 / 2026-10-02: a socket opted into the overflow probe advances the
+/// episodes on its one-second tick, and takes its own re-park request.
+/// Returns the action a re-park produced (a `Park`), or `Continue`.
 ///
 /// One atomic load when no 805 has happened this process — the common case
 /// for every session — so a quiet socket never touches the episode lock.
@@ -5780,12 +6021,13 @@ where
                     reconnects = supervisor.reconnects(),
                     "supervised Dhan connection parked"
                 );
-                // D7: a MAIN-FEED socket parked for 805 waits for the overflow
-                // probe instead of ending, when the lane opted in. Depth
-                // sockets, every other reason and every sink that did not opt
-                // in return exactly as before.
+                // D7 / 2026-10-02: a market-data socket (main feed, depth-20,
+                // depth-200) parked for 805 waits for its pool's overflow
+                // probe instead of ending, when the lane opted in. Every other
+                // reason, the order-update socket and every sink that did not
+                // opt in return exactly as before.
                 let probe_eligible = reason == ParkReason::PoolOverflow
-                    && supervisor.slot().endpoint == DhanEndpointType::MainFeed
+                    && OverflowEpisodeKind::for_endpoint(supervisor.slot().endpoint).is_some()
                     && sink.overflow_probe_enabled();
                 if !probe_eligible {
                     return ConnectionExit::Parked(reason);
@@ -7393,7 +7635,7 @@ where
                         action = supervisor.on_event(ConnEvent::ProbeCloseRequested, Instant::now());
                     }
                 }
-                // D7: the main-feed overflow probe, on the same tick. A quiet
+                // D7 / 2026-10-02: the overflow probe, on the same tick. A quiet
                 // process pays one atomic load. A failed probe re-parks the
                 // probed socket here; every other socket only advances the
                 // episode timers.
@@ -15198,8 +15440,9 @@ mod tests {
         );
         assert_eq!(fatal.phase(), ConnPhase::Parked);
 
-        // A DEPTH socket parked for 805 stays parked: depth recovery needs an
-        // owner decision.
+        // A DEPTH socket parked for 805 is released too (scope lock
+        // 2026-10-02): its grant comes from the depth episode, and a failure
+        // notice re-parks it for 805.
         for endpoint in [DhanEndpointType::Depth20, DhanEndpointType::Depth200] {
             let mut depth = sup(endpoint, 0, now);
             let _ = depth.on_event(ConnEvent::BeginDial, now);
@@ -15212,17 +15455,33 @@ mod tests {
                 now,
             );
             assert_eq!(depth.park_reason(), Some(ParkReason::PoolOverflow));
-            assert_eq!(
+            assert_ne!(
                 depth.on_event(ConnEvent::OverflowProbeGranted, now),
                 SupervisorAction::Continue,
-                "{endpoint:?} must never be released by the main-feed probe"
+                "{endpoint:?} parked for 805 is released by its grant"
             );
-            assert_eq!(depth.phase(), ConnPhase::Parked);
-            // A failure notice on a depth socket is ignored too.
+            assert_ne!(depth.phase(), ConnPhase::Parked);
+            assert_eq!(depth.last_redial_reason(), ReconnectReason::OverflowProbe);
             assert_eq!(
                 depth.on_event(ConnEvent::OverflowProbeFailed, now),
+                SupervisorAction::Park {
+                    reason: ParkReason::PoolOverflow
+                }
+            );
+            // A depth socket parked for a FATAL code stays parked.
+            let mut fatal = sup(endpoint, 1, now);
+            let _ = fatal.on_event(ConnEvent::BeginDial, now);
+            let _ = fatal.on_event(
+                ConnEvent::Disconnected {
+                    code: Some(DisconnectCode::AuthenticationFailed),
+                },
+                now,
+            );
+            assert_eq!(
+                fatal.on_event(ConnEvent::OverflowProbeGranted, now),
                 SupervisorAction::Continue
             );
+            assert_eq!(fatal.phase(), ConnPhase::Parked);
         }
 
         // A live socket has nothing to be released from.
@@ -15580,7 +15839,7 @@ mod tests {
     }
 
     #[test]
-    fn test_with_overflow_probe_opts_in_main_feed_only() {
+    fn test_with_overflow_probe_opts_in_market_data_sockets() {
         let dir = wal_dir("overflow-probe");
         let spill = std::sync::Arc::new(
             WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
@@ -15603,11 +15862,18 @@ mod tests {
                 .overflow_probe_enabled()
         );
         for depth in [DhanEndpointType::Depth20, DhanEndpointType::Depth200] {
+            assert!(!build(depth).overflow_probe_enabled());
             assert!(
-                !build(depth).with_overflow_probe().overflow_probe_enabled(),
-                "{depth:?} can never be opted in"
+                build(depth).with_overflow_probe().overflow_probe_enabled(),
+                "{depth:?} recovers through the depth probe (scope lock 2026-10-02)"
             );
         }
+        assert!(
+            !build(DhanEndpointType::OrderUpdate)
+                .with_overflow_probe()
+                .overflow_probe_enabled(),
+            "the order-update socket has no overflow episode"
+        );
         assert!(!RecordingSink::default().overflow_probe_enabled());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -15699,7 +15965,7 @@ mod tests {
     }
 
     #[test]
-    fn test_park_arm_waits_for_the_probe_only_on_an_opted_in_main_feed_805() {
+    fn test_park_arm_waits_for_the_probe_only_on_an_opted_in_market_data_805() {
         let src = include_str!("pool_supervisor.rs");
         let marker = concat!("#[cfg(", "test)]");
         let prod = src.split(marker).next().unwrap_or(src);
@@ -15711,10 +15977,438 @@ mod tests {
             .find("SupervisorAction::Continue => {")
             .unwrap_or(arm.len())];
         assert!(arm.contains("reason == ParkReason::PoolOverflow"));
-        assert!(arm.contains("DhanEndpointType::MainFeed"));
+        assert!(arm.contains("OverflowEpisodeKind::for_endpoint(supervisor.slot().endpoint)"));
         assert!(arm.contains("sink.overflow_probe_enabled()"));
         let gate = arm.find("if !probe_eligible").expect("gate");
         let wait = arm.find("wait_for_overflow_grant(").expect("wait");
         assert!(gate < wait, "only an eligible socket waits");
+    }
+    // --- Depth self-recovery after 805 (scope lock 2026-10-02) ----------
+    //
+    // Same discipline as the D7 tests: every test drives its OWN
+    // `OverflowEpisodes` value, never the process-wide one.
+
+    /// Both episodes with `main` and `depth` slots parked and the 805 at `at`.
+    fn episodes_after_805(main: &[u8], depth: &[u8], at: Instant) -> OverflowEpisodes {
+        let mut eps = OverflowEpisodes::new();
+        for &slot in main {
+            eps.on_parked(DhanEndpointType::MainFeed, slot);
+        }
+        for &slot in depth {
+            eps.on_parked(DhanEndpointType::Depth200, slot);
+        }
+        assert_eq!(eps.on_overflow(at), OverflowEpisodesEffect::default());
+        eps
+    }
+
+    fn depth_delay(attempt: u8) -> Duration {
+        secs(
+            OverflowEpisodeKind::Depth
+                .delay_secs(attempt)
+                .expect("attempt within the depth cap"),
+        )
+    }
+
+    #[test]
+    fn test_depth_overflow_probe_delay_doubles_to_the_cap() {
+        let delays: Vec<Option<u64>> = (0..=DEPTH_OVERFLOW_PROBE_MAX_ATTEMPTS)
+            .map(|attempt| OverflowEpisodeKind::Depth.delay_secs(attempt))
+            .collect();
+        assert_eq!(
+            delays,
+            vec![
+                Some(300),
+                Some(600),
+                Some(1_200),
+                Some(1_800),
+                Some(1_800),
+                Some(1_800),
+                None
+            ]
+        );
+        assert_eq!(OverflowEpisodeKind::Depth.delay_secs(u8::MAX), None);
+        for attempt in 0..DEPTH_OVERFLOW_PROBE_MAX_ATTEMPTS {
+            let delay = OverflowEpisodeKind::Depth
+                .delay_secs(attempt)
+                .expect("within cap");
+            assert!(
+                (DEPTH_OVERFLOW_PROBE_BASE_DELAY_SECS..=DEPTH_OVERFLOW_PROBE_MAX_DELAY_SECS)
+                    .contains(&delay),
+                "never sooner than the cooldown, never past the cap"
+            );
+        }
+        assert_eq!(OverflowEpisodeKind::Depth.max_attempts(), 6);
+        // The main feed's D7 policy is unchanged.
+        assert_eq!(OverflowEpisodeKind::MainFeed.delay_secs(0), Some(300));
+        assert_eq!(OverflowEpisodeKind::MainFeed.delay_secs(2), Some(1_200));
+        assert_eq!(OverflowEpisodeKind::MainFeed.delay_secs(3), None);
+        assert_eq!(OverflowEpisodeKind::MainFeed.max_attempts(), 3);
+        // Which pool each endpoint joins.
+        assert_eq!(
+            OverflowEpisodeKind::for_endpoint(DhanEndpointType::MainFeed),
+            Some(OverflowEpisodeKind::MainFeed)
+        );
+        for depth in [DhanEndpointType::Depth20, DhanEndpointType::Depth200] {
+            assert_eq!(
+                OverflowEpisodeKind::for_endpoint(depth),
+                Some(OverflowEpisodeKind::Depth)
+            );
+        }
+        assert_eq!(
+            OverflowEpisodeKind::for_endpoint(DhanEndpointType::OrderUpdate),
+            None
+        );
+        assert_eq!(
+            DEPTH_OVERFLOW_PROBE_METRIC,
+            "tv_dhan_ws_depth_overflow_probe_total"
+        );
+        assert_ne!(
+            OverflowEpisodeKind::Depth.metric(),
+            OverflowEpisodeKind::MainFeed.metric()
+        );
+        assert_ne!(
+            OverflowEpisodeKind::Depth.source(),
+            OverflowEpisodeKind::MainFeed.source()
+        );
+    }
+
+    #[test]
+    fn test_depth_probe_waits_the_cooldown_then_grants_one_socket() {
+        let start = t0();
+        let mut eps = episodes_after_805(&[], &[12, 10, 11], start);
+        let base = secs(DEPTH_OVERFLOW_PROBE_BASE_DELAY_SECS);
+        assert_eq!(
+            eps.poll(start + base - secs(1), true),
+            OverflowEpisodesEffect::default(),
+            "nothing before the cooldown"
+        );
+        assert_eq!(
+            eps.poll(start + base, false),
+            OverflowEpisodesEffect::default(),
+            "nothing outside the session window"
+        );
+        let granted = eps.poll(start + base, true);
+        assert_eq!(granted.main, OverflowEpisodeEffect::default());
+        assert_eq!(
+            granted.depth.outcomes,
+            [Some(OverflowProbeOutcome::ProbeGranted), None]
+        );
+        assert_eq!(granted.depth.grant, Some(10), "the lowest parked slot");
+        assert_eq!(eps.watched(), Some(10));
+        // While the probe's window runs nothing else is granted.
+        for later in 1..OVERFLOW_PROBE_FIRST_FRAME_DEADLINE_SECS {
+            assert_eq!(eps.poll(start + base + secs(later), true).depth.grant, None);
+        }
+        assert_eq!(eps.depth.parked_mask, (1 << 11) | (1 << 12));
+    }
+
+    #[test]
+    fn test_depth_probe_success_releases_the_rest_one_by_one() {
+        let start = t0();
+        let mut eps = episodes_after_805(&[], &[5, 6, 7], start);
+        let granted = start + depth_delay(0);
+        assert_eq!(eps.poll(granted, true).depth.grant, Some(5));
+
+        let first = granted + secs(2);
+        eps.on_first_frame(5, first);
+        assert_eq!(
+            eps.poll(first + secs(OVERFLOW_PROBE_WATCH_SECS - 1), true),
+            OverflowEpisodesEffect::default()
+        );
+        let pass = eps.poll(first + secs(OVERFLOW_PROBE_WATCH_SECS), true);
+        assert_eq!(
+            pass.depth.outcomes,
+            [
+                Some(OverflowProbeOutcome::ProbePassed),
+                Some(OverflowProbeOutcome::ReleaseGranted)
+            ]
+        );
+        assert_eq!(pass.depth.grant, Some(6), "exactly one more socket");
+        assert_eq!(eps.depth.parked_mask, 1 << 7, "slot 7 waits its turn");
+
+        let first6 = first + secs(OVERFLOW_PROBE_WATCH_SECS + 3);
+        eps.on_first_frame(6, first6);
+        assert_eq!(eps.poll(first6 + secs(60), true).depth.grant, None);
+        let next = eps.poll(first6 + secs(OVERFLOW_PROBE_WATCH_SECS), true);
+        assert_eq!(
+            next.depth.outcomes,
+            [
+                Some(OverflowProbeOutcome::ReleasePassed),
+                Some(OverflowProbeOutcome::ReleaseGranted)
+            ]
+        );
+        assert_eq!(next.depth.grant, Some(7));
+
+        let first7 = first6 + secs(OVERFLOW_PROBE_WATCH_SECS + 1);
+        eps.on_first_frame(7, first7);
+        let done = eps.poll(first7 + secs(OVERFLOW_PROBE_WATCH_SECS), true);
+        assert_eq!(
+            done.depth.outcomes,
+            [
+                Some(OverflowProbeOutcome::ReleasePassed),
+                Some(OverflowProbeOutcome::Recovered)
+            ]
+        );
+        assert_eq!(eps.depth.phase, OverflowEpisodePhase::Recovered);
+        assert_eq!(eps.depth.probes_started, 1, "releases are not probes");
+        assert_eq!(eps.watched(), None);
+        assert!(!eps.depth.is_down());
+    }
+
+    #[test]
+    fn test_depth_probe_backs_off_on_repeated_805() {
+        let start = t0();
+        let mut eps = episodes_after_805(&[], &[9], start);
+        let mut wait_from = start;
+        for attempt in 0..DEPTH_OVERFLOW_PROBE_MAX_ATTEMPTS {
+            let delay = depth_delay(attempt);
+            assert_eq!(
+                eps.poll(wait_from + delay - secs(1), true).depth.grant,
+                None,
+                "attempt {attempt} must wait its whole (doubled) delay"
+            );
+            let granted = wait_from + delay;
+            assert_eq!(eps.poll(granted, true).depth.grant, Some(9));
+            eps.on_first_frame(9, granted + secs(1));
+            // Dhan answers with 805 again inside the window.
+            let failed_at = granted + secs(30);
+            let fail = eps.on_overflow(failed_at);
+            assert_eq!(
+                fail.depth.outcomes[0],
+                Some(OverflowProbeOutcome::FailedOverflow)
+            );
+            assert_eq!(fail.depth.repark, Some(9), "the probe socket parks again");
+            assert_eq!(fail.depth.grant, None);
+            eps.on_parked(DhanEndpointType::Depth200, 9);
+            wait_from = failed_at;
+            if attempt + 1 < DEPTH_OVERFLOW_PROBE_MAX_ATTEMPTS {
+                assert_eq!(fail.depth.outcomes[1], None);
+                assert!(!eps.depth.is_down());
+            } else {
+                assert_eq!(
+                    fail.depth.outcomes[1],
+                    Some(OverflowProbeOutcome::DownForSession)
+                );
+            }
+        }
+        assert!(eps.depth.is_down());
+        assert_eq!(eps.depth.probes_started, DEPTH_OVERFLOW_PROBE_MAX_ATTEMPTS);
+        assert_eq!(
+            eps.poll(wait_from + secs(86_400), true),
+            OverflowEpisodesEffect::default(),
+            "no probe after the cap, however long the wait"
+        );
+        // A bare reset inside a depth window fails it the same way.
+        let mut reset = episodes_after_805(&[], &[3], start);
+        let granted = start + depth_delay(0);
+        assert_eq!(reset.poll(granted, true).depth.grant, Some(3));
+        let fail = reset.on_bare_reset(granted + secs(10));
+        assert_eq!(
+            fail.depth.outcomes,
+            [Some(OverflowProbeOutcome::FailedBareReset), None]
+        );
+        assert_eq!(fail.depth.repark, Some(3));
+    }
+
+    #[test]
+    fn test_depth_waits_for_the_main_feed_turn() {
+        let start = t0();
+        let mut eps = episodes_after_805(&[0], &[10], start);
+        // Both delays elapse together: the main feed goes first.
+        let at = start + secs(OVERFLOW_PROBE_DELAYS_SECS[0]);
+        let first = eps.poll(at, true);
+        assert_eq!(first.main.grant, Some(0));
+        assert_eq!(first.depth.grant, None);
+        assert_eq!(eps.watched(), Some(0));
+        // While the main window runs, depth grants nothing.
+        eps.on_first_frame(0, at + secs(1));
+        assert_eq!(eps.poll(at + secs(60), true).depth.grant, None);
+        assert!(eps.main.holds_turn());
+        // The main window passes and the main feed recovers; depth probes in
+        // the same poll, because the main feed no longer holds the turn.
+        let done = eps.poll(at + secs(1 + OVERFLOW_PROBE_WATCH_SECS), true);
+        assert_eq!(
+            done.main.outcomes,
+            [
+                Some(OverflowProbeOutcome::ProbePassed),
+                Some(OverflowProbeOutcome::Recovered)
+            ]
+        );
+        assert_eq!(done.depth.grant, Some(10));
+        assert_eq!(eps.watched(), Some(10));
+        assert!(!eps.main.holds_turn());
+
+        // A main feed that is down for the session no longer holds the turn.
+        let mut down = OverflowEpisode::new();
+        down.phase = OverflowEpisodePhase::DownForSession;
+        down.parked_mask = 1;
+        assert!(!down.holds_turn());
+    }
+
+    #[test]
+    fn test_main_grant_waits_for_a_running_depth_window() {
+        let start = t0();
+        let mut eps = episodes_after_805(&[], &[10], start);
+        let at = start + depth_delay(0);
+        assert_eq!(eps.poll(at, true).depth.grant, Some(10));
+        // A main-feed socket from the same 805 registers late: its delay has
+        // elapsed, but the depth window is running.
+        eps.on_parked(DhanEndpointType::MainFeed, 1);
+        let held = eps.poll(at + secs(1), true);
+        assert_eq!(held.main.grant, None, "never two windows at once");
+        assert_eq!(eps.watched(), Some(10));
+        // The depth window passes (depth recovers); the next poll grants main.
+        eps.on_first_frame(10, at + secs(2));
+        let passed = eps.poll(at + secs(2 + OVERFLOW_PROBE_WATCH_SECS), true);
+        assert_eq!(passed.main.grant, None);
+        assert_eq!(
+            passed.depth.outcomes,
+            [
+                Some(OverflowProbeOutcome::ProbePassed),
+                Some(OverflowProbeOutcome::Recovered)
+            ]
+        );
+        let next = eps.poll(at + secs(3 + OVERFLOW_PROBE_WATCH_SECS), true);
+        assert_eq!(next.main.grant, Some(1));
+        assert_eq!(eps.watched(), Some(1));
+    }
+
+    #[test]
+    fn test_never_more_than_one_probe_window_in_flight() {
+        // A deterministic pseudo-random driver over every input the episodes
+        // take. The invariant must hold after every step.
+        let mut eps = OverflowEpisodes::new();
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut now = t0();
+        let mut grants = 0_u32;
+        let mut depth_grants = 0_u32;
+        for _ in 0..50_000 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let roll = (state >> 33) % 100;
+            now += secs((state >> 20) % 90);
+            let effects = match roll {
+                0..=3 => eps.on_overflow(now),
+                4..=7 => eps.on_bare_reset(now),
+                8..=27 => {
+                    let slot = u8::try_from((state >> 40) % 15).unwrap_or(0);
+                    let endpoint = match slot / 5 {
+                        0 => DhanEndpointType::MainFeed,
+                        1 => DhanEndpointType::Depth20,
+                        _ => DhanEndpointType::Depth200,
+                    };
+                    eps.on_parked(endpoint, slot);
+                    OverflowEpisodesEffect::default()
+                }
+                28..=47 => {
+                    if let Some(watched) = eps.watched() {
+                        eps.on_first_frame(watched, now);
+                    }
+                    OverflowEpisodesEffect::default()
+                }
+                _ => eps.poll(now, roll % 7 != 0),
+            };
+            let in_flight = usize::from(eps.main.watched().is_some())
+                + usize::from(eps.depth.watched().is_some());
+            assert!(in_flight <= 1, "two probe windows in flight: {eps:?}");
+            assert!(
+                effects.main.grant.is_none() || effects.depth.grant.is_none(),
+                "two grants in one step"
+            );
+            for (effect, is_depth) in [(effects.main, false), (effects.depth, true)] {
+                if let Some(slot) = effect.grant {
+                    grants += 1;
+                    if is_depth {
+                        depth_grants += 1;
+                    }
+                    assert_eq!(eps.watched(), Some(slot), "a grant is the watched socket");
+                }
+            }
+            assert!(eps.main.probes_started <= OVERFLOW_PROBE_MAX_ATTEMPTS);
+            assert!(eps.depth.probes_started <= DEPTH_OVERFLOW_PROBE_MAX_ATTEMPTS);
+        }
+        assert!(
+            grants > 0 && depth_grants > 0,
+            "the driver must exercise grants"
+        );
+    }
+
+    #[test]
+    fn test_depth_probe_never_clears_rotation_halted() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::Depth200, 0, now);
+        let _ = s.on_event(ConnEvent::BeginDial, now);
+        let _ = s.on_event(ConnEvent::DialSucceeded, now);
+        let _ = s.on_event(ConnEvent::SubscribeAcked, now);
+        let _ = s.on_event(
+            ConnEvent::Disconnected {
+                code: Some(DisconnectCode::ExceededActiveConnections),
+            },
+            now,
+        );
+        assert!(rotation_halted(), "the 805 latches the breaker");
+        let _ = s.on_event(ConnEvent::OverflowProbeGranted, now);
+        let _ = s.on_event(ConnEvent::BeginDial, now);
+        let _ = s.on_event(ConnEvent::DialSucceeded, now);
+        let _ = s.on_event(ConnEvent::FrameReceived, now);
+        assert!(
+            rotation_halted(),
+            "a recovered depth socket is not a reset breaker"
+        );
+
+        // The depth half lives inside the block the D7 source pin scans for
+        // breaker writes, so `test_probe_never_clears_rotation_halted` covers
+        // it; and the rotation, ghost and probe-close arms read the breaker,
+        // never the episodes.
+        let src = include_str!("pool_supervisor.rs");
+        let marker = concat!("#[cfg(", "test)]");
+        let prod = src.split(marker).next().unwrap_or(src);
+        let block = prod
+            .split("// Main-feed overflow probe (plan item D7, 2026-10-02)")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("/// A probe close is PENDING for this slot.")
+                    .next()
+            })
+            .expect("the D7 block");
+        assert!(block.contains("struct OverflowEpisodes"));
+        assert!(block.contains("DEPTH_OVERFLOW_PROBE_MAX_ATTEMPTS"));
+        assert!(!block.contains("ROTATION_HALTED."));
+    }
+
+    #[test]
+    fn test_overflow_episodes_poll_gates_each_episode_on_the_other() {
+        let src = include_str!("pool_supervisor.rs");
+        let marker = concat!("#[cfg(", "test)]");
+        let prod = src.split(marker).next().unwrap_or(src);
+        let poll = prod
+            .split("fn poll(&mut self, now: Instant, window_open: bool) -> OverflowEpisodesEffect")
+            .nth(1)
+            .expect("the combined poll");
+        let poll = &poll[..poll.find("\n    }\n").expect("end of poll")];
+        let main_gate = poll
+            .find("window_open && self.depth.watched().is_none()")
+            .expect("main waits for a running depth window");
+        let main_poll = poll.find("self.main.poll(").expect("main polled");
+        let depth_gate = poll
+            .find("window_open && !self.main.holds_turn()")
+            .expect("depth waits for the main feed's turn");
+        let depth_poll = poll.find("self.depth.poll(").expect("depth polled");
+        assert!(main_gate < main_poll && main_poll < depth_gate && depth_gate < depth_poll);
+        // One lock for both episodes; no second episode mutex anywhere.
+        assert_eq!(
+            prod.matches("std::sync::Mutex<OverflowEpisodes>").count(),
+            1
+        );
+        assert_eq!(prod.matches("std::sync::Mutex<OverflowEpisode>").count(), 0);
+        // The supervisor releases only an 805 park, and never the
+        // order-update socket.
+        let parked = prod
+            .find("if event == ConnEvent::OverflowProbeGranted")
+            .expect("grant arm");
+        let arm = &prod[parked..parked + 300];
+        assert!(arm.contains("Some(ParkReason::PoolOverflow)"));
+        assert!(arm.contains("OverflowEpisodeKind::for_endpoint(self.slot.endpoint).is_some()"));
     }
 }
