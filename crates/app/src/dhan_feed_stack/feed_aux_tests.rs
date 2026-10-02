@@ -106,6 +106,7 @@ fn drain(ingest: &mut LiveIngest, seq: u64, bytes: Vec<u8>, receipt: i64) -> Fra
             connection_index: 0,
             received_at: std::time::Instant::now(),
             received_at_nanos: receipt,
+            wal_backed: true,
             bytes: bytes.into(),
         },
         receipt,

@@ -304,7 +304,7 @@ fn function_body_extracts_exactly_one_function() {
 }
 
 #[test]
-fn every_target_resolves_to_a_non_empty_region() {
+fn every_target_resolves_to_a_non_empty_region_no_panic() {
     // `scan` panics on a missing file or function; reaching the end proves
     // every target was found.
     let _ = scan(&repo_root());

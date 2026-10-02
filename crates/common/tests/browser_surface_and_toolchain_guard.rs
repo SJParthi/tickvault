@@ -436,6 +436,13 @@ const SPAWN_ALLOWLIST: &[(&str, &str)] = &[
         "docker",
         "compose health checks (infra.rs) + container tests",
     ),
+    (
+        "docker-compose",
+        "the standalone compose v1 binary, the last fallback rung of \
+         `tickvault ensure-questdb` (ensure_questdb.rs), which replaced the \
+         deleted shell script that already ran it. Same tool as `docker \
+         compose`, NOT a language runtime. Joined 2026-10-02 (plan item D6d).",
+    ),
     ("df", "disk-health watcher"),
     ("open", "operator convenience — opens a URL on the dev box"),
     (
@@ -562,6 +569,7 @@ fn spawn_allowlist_is_documented_and_has_no_language_runtime() {
         "bash",
         "sh",
         "docker",
+        "docker-compose",
         "df",
         "open",
         "chronyc",

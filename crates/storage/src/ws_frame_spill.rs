@@ -2003,7 +2003,6 @@ fn record_sync_result(result: std::io::Result<()>, started: Instant, stage: &'st
             true
         }
         Err(err) => {
-            metrics::counter!("tv_wal_fsync_errors_total").increment(1);
             // Deliberately NOT `report_io_error`. That helper says "reopening
             // segment; thread stays alive", which is true of a WRITE failure
             // and false of this one: a failed sync reopens nothing, loses
@@ -2015,6 +2014,7 @@ fn record_sync_result(result: std::io::Result<()>, started: Instant, stage: &'st
             // Routing it through the write-error helper would also have
             // inflated `tv_ws_frame_spill_write_errors_total` with events that
             // are not write errors.
+            metrics::counter!("tv_wal_fsync_errors_total").increment(1);
             if stage == WAL_PERIODIC_FSYNC_STAGE {
                 warn!(
                     code = ErrorCode::WsSpill01WriterRespawn.code_str(),
@@ -2190,21 +2190,18 @@ struct UnflushedTally<'a> {
     len: usize,
     /// Records written past the capacity; on a loss they are counted lost.
     untracked: u64,
-    lost_counter: metrics::Counter,
 }
 
 impl<'a> UnflushedTally<'a> {
     fn new(persisted: &'a AtomicU64) -> Self {
-        let lost_counter = metrics::counter!(WAL_UNFLUSHED_LOST_COUNTER);
         // Seeded so the series exists before its first, rare, episode.
-        lost_counter.increment(0);
+        metrics::counter!(WAL_UNFLUSHED_LOST_COUNTER).increment(0);
         Self {
             persisted,
             segment_bytes: 0,
             ends: [0; UNFLUSHED_TALLY_CAPACITY],
             len: 0,
             untracked: 0,
-            lost_counter,
         }
     }
 
@@ -2266,7 +2263,9 @@ fn discard_segment_writer(w: BufWriter<File>, tally: &mut UnflushedTally<'_>, st
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |p| {
             Some(p.saturating_sub(lost))
         });
-    tally.lost_counter.increment(lost);
+    // Resolved here rather than held: this is a rare error path, and the
+    // loss-counter guard reads the coded error! next to the emit.
+    metrics::counter!(WAL_UNFLUSHED_LOST_COUNTER).increment(lost);
     error!(
         code = ErrorCode::WsSpill02FrameDropped.code_str(),
         stage,

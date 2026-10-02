@@ -1347,7 +1347,7 @@ mod tests {
     #[tokio::test]
     async fn run_bounded_reports_success_and_failure() {
         let ok = run_bounded(
-            Command::new("true"),
+            Command::new("/usr/bin/true"),
             Duration::from_secs(10),
             Sink::Null,
             Sink::Null,
@@ -1355,7 +1355,11 @@ mod tests {
         .await;
         assert!(ok.success);
         let bad = run_bounded(
-            Command::new("false"),
+            {
+                let mut c = Command::new("sh");
+                c.args(["-c", "exit 1"]);
+                c
+            },
             Duration::from_secs(10),
             Sink::Null,
             Sink::Null,
@@ -1363,7 +1367,13 @@ mod tests {
         .await;
         assert!(!bad.success);
         let missing = run_bounded(
-            Command::new("definitely-not-a-binary-d6d"),
+            {
+                // A spawn that fails before the program runs: the working
+                // directory does not exist.
+                let mut c = Command::new("/usr/bin/true");
+                c.current_dir("/definitely-not-a-dir-d6d");
+                c
+            },
             Duration::from_secs(10),
             Sink::Null,
             Sink::Null,
@@ -1374,8 +1384,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_bounded_captures_stdout_for_the_running_probe() {
-        let mut cmd = Command::new("echo");
-        cmd.arg("true");
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo true"]);
         let out = run_bounded(cmd, Duration::from_secs(10), Sink::Capture, Sink::Null).await;
         assert!(out.success);
         assert!(running_probe_says_true(&out.stdout));
@@ -1383,8 +1393,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_bounded_kills_a_child_that_outlives_its_bound() {
-        let mut cmd = Command::new("sleep");
-        cmd.arg("30");
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "exec sleep 30"]);
         let started = std::time::Instant::now();
         let out = run_bounded(cmd, Duration::from_millis(200), Sink::Null, Sink::Null).await;
         assert!(!out.success, "a timed-out call must read as failed");
