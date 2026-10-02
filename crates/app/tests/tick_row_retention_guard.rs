@@ -208,3 +208,31 @@ fn scanner_is_not_vacuous_against_the_real_file() {
          reading the real binding. Found: {expr}"
     );
 }
+
+/// Item 45h (2026-10-02, zero loss): the one hard refusal that is BY DESIGN —
+/// the prior-day connect snapshot (`RefusedWrongDay`) — still never reaches
+/// `ticks` (2026-09-10), but its packet is no longer discarded: it is kept in
+/// `feed_aux_packets` immediately before the return. Removing that append
+/// re-opens a "drop" of received data, which the 2026-09-29 lock rejects.
+#[test]
+fn the_wrong_day_return_keeps_the_packet_in_feed_aux() {
+    let src = feed_stack_src();
+    let ret = src
+        .find("return IngestOutcome::RefusedWrongDay;")
+        .expect("the wrong-day return must exist");
+    // Back up to a char boundary: the prose above the return carries em dashes.
+    let start = (0..=ret.saturating_sub(800))
+        .rev()
+        .find(|&i| src.is_char_boundary(i))
+        .unwrap_or(0);
+    let window = &src[start..ret];
+    assert!(
+        window.contains("self.append_aux_tick(AuxPacketKind::ConnectSnapshot, tick, capture_seq);"),
+        "the connect snapshot must be appended to feed_aux_packets just before \
+         the wrong-day return"
+    );
+    assert!(
+        !window.contains("append_tick_with_seq"),
+        "and never written to `ticks`"
+    );
+}

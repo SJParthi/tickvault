@@ -282,6 +282,13 @@ fn test_every_live_table_ensure_fn_keeps_its_boot_call_site() {
         // (ts, tf, family, feed, security_id, segment). Same retry loop as
         // `ticks` and `market_depth`.
         ("ensure_top_volume_tables", "src/candle_ddl_boot.rs"),
+        // feed_aux_packets (2026-10-02, item 45h) — the OI, previous-close,
+        // market-status, disconnect, out-of-window-tick and connect-snapshot
+        // rows. They ride the tick writer's buffer from the first frame, so an
+        // un-ensured table is ILP-auto-created without its 6-key DEDUP
+        // (ts, security_id, segment, kind, capture_seq, feed) and every replay
+        // duplicates. Same retry loop as `ticks`.
+        ("ensure_feed_aux_table", "src/candle_ddl_boot.rs"),
         ("run_live_table_ddl_at_boot", "src/main.rs"),
         // (the `rest_fetch_audit` ensure row retired 2026-09-17 with the four
         // REST-leg rows above — same removal, same reasoning, §12.11.)
@@ -450,7 +457,7 @@ fn the_live_table_loop_creates_no_view_and_requires_every_table() {
         "a view pass is back inside the live-table DDL loop"
     );
     assert!(
-        body.contains("if ticks_ok && depth_ok && volume_ok {"),
+        body.contains("if ticks_ok && depth_ok && volume_ok && feed_aux_ok {"),
         "the boot-complete return must still require every live table"
     );
 }

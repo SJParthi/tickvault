@@ -96,7 +96,7 @@ create_base_tables() {
     #    feed + payload_hash + capture_seq columns included so the
     #    scoreboard's feed-sliced reads work on a fresh box.
     execute_ddl "ticks" \
-        "CREATE TABLE IF NOT EXISTS ticks (received_at TIMESTAMP, ts TIMESTAMP, contract SYMBOL, feed SYMBOL, segment SYMBOL, security_id LONG, ltp DOUBLE, open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE, volume LONG, oi LONG, avg_price DOUBLE, last_trade_qty LONG, total_buy_qty LONG, total_sell_qty LONG, payload_hash LONG, capture_seq LONG) TIMESTAMP(ts) PARTITION BY HOUR WAL"
+        "CREATE TABLE IF NOT EXISTS ticks (received_at TIMESTAMP, ts TIMESTAMP, contract SYMBOL, feed SYMBOL, segment SYMBOL, security_id LONG, ltp DOUBLE, open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE, volume LONG, oi LONG, oi_day_high LONG, oi_day_low LONG, avg_price DOUBLE, last_trade_qty LONG, total_buy_qty LONG, total_sell_qty LONG, payload_hash LONG, capture_seq LONG) TIMESTAMP(ts) PARTITION BY HOUR WAL"
 
     echo ""
 }

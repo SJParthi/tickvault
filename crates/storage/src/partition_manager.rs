@@ -52,6 +52,10 @@ const PARTITION_DDL_TIMEOUT_SECS: u64 = 30;
 // for the same reason it did. `top_volume` itself STAYS listed: no boot writes
 // it any more, but its already-captured partitions must still age out rather
 // than sit on the volume forever.
+// 2026-10-02 (item 45h): `feed_aux_packets` — the OI, previous-close,
+// market-status, disconnect, out-of-window-tick and connect-snapshot rows the
+// `ticks` table does not hold. HOUR-partitioned like `ticks`, on the
+// market-data window, archived before any detach like every table here.
 pub(crate) const HOUR_PARTITIONED_TABLES: &[&str] = &[
     "ticks",
     "market_depth",
@@ -60,6 +64,7 @@ pub(crate) const HOUR_PARTITIONED_TABLES: &[&str] = &[
     "top_volume_3s",
     "top_volume_5s",
     "top_volume_1m",
+    "feed_aux_packets",
 ];
 
 /// DAY-partitioned **audit + daily-data** tables the retention sweep DETACHes
@@ -872,7 +877,11 @@ mod tests {
                 "top_volume_3s",
                 "top_volume_5s",
                 "top_volume_1m",
+                "feed_aux_packets",
             ]
+        );
+        assert!(
+            HOUR_PARTITIONED_TABLES.contains(&crate::feed_aux_persistence::FEED_AUX_PACKETS_TABLE)
         );
         // Every live per-cadence table is swept — pinned against the
         // persistence module's own names, so a fifth cadence cannot land
