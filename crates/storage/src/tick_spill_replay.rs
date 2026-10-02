@@ -241,15 +241,71 @@ pub fn is_permanent_refusal(status: u16) -> bool {
 /// is; the caller then treats it as a transient failure, because a file that
 /// could not be set aside would otherwise be silently skipped and the queue
 /// would appear to drain while it did not.
+///
+/// NEVER OVERWRITES (2026-10-02): spill files are named per feed and hour, so
+/// the same name recurs; a plain `rename` onto an already-quarantined file of
+/// that name destroyed it. The target is now the first free name of
+/// `<name>`, `<name>.1`, `<name>.2`, … The check-then-rename is not atomic,
+/// which is safe here because one drain task owns each spill directory.
 fn quarantine_spill_file(dir: &Path, path: &Path) -> std::io::Result<std::path::PathBuf> {
     let quarantine = dir.join(QUARANTINE_DIR);
     std::fs::create_dir_all(&quarantine)?;
     let name = path
         .file_name()
         .unwrap_or_else(|| std::ffi::OsStr::new("unnamed.ilp")); // APPROVED: infallible fallback, no panic on a pathological path
-    let target = quarantine.join(name);
+    let target = free_quarantine_path(&quarantine, name)?;
     std::fs::rename(path, &target)?;
     Ok(target)
+}
+
+/// Most numbered alternatives tried before quarantining gives up (the file
+/// then stays where it is and the round treats it as a transient failure).
+const QUARANTINE_NAME_ATTEMPTS: u32 = 10_000;
+
+/// The first path in `quarantine` named `name` or `name.<n>` that nothing
+/// occupies. `symlink_metadata`, so a dangling link also counts as occupied.
+/// Cold path: bounded by [`QUARANTINE_NAME_ATTEMPTS`].
+fn free_quarantine_path(
+    quarantine: &Path,
+    name: &std::ffi::OsStr,
+) -> std::io::Result<std::path::PathBuf> {
+    let base = quarantine.join(name);
+    if std::fs::symlink_metadata(&base).is_err() {
+        return Ok(base);
+    }
+    let stem = name.to_string_lossy();
+    // O(1) EXEMPT: begin — cold quarantine path, bounded by QUARANTINE_NAME_ATTEMPTS
+    for n in 1..QUARANTINE_NAME_ATTEMPTS {
+        let candidate = quarantine.join(format!("{stem}.{n}"));
+        if std::fs::symlink_metadata(&candidate).is_err() {
+            return Ok(candidate);
+        }
+    }
+    // O(1) EXEMPT: end
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "no free quarantine name left for this spill file",
+    ))
+}
+
+/// Whether `dir` is the depth spill directory (as opposed to the tick one).
+#[must_use]
+pub fn is_depth_spill_dir(dir: &Path) -> bool {
+    dir_label(dir) == dir_label(Path::new(crate::depth_persistence::DEPTH_SPILL_DIR))
+}
+
+/// The spill ceiling of the directory `dir`: the depth ceiling for the depth
+/// spill directory, the tick ceiling otherwise. The quarantine trim takes its
+/// budget from the directory it trims (until 2026-10-02 the depth quarantine
+/// was trimmed against the tick ceiling). O(1) after each ceiling's first
+/// resolution.
+#[must_use]
+pub fn spill_max_bytes_for_dir(dir: &Path) -> u64 {
+    if is_depth_spill_dir(dir) {
+        crate::depth_persistence::depth_spill_max_bytes()
+    } else {
+        crate::tick_persistence::tick_spill_max_bytes()
+    }
 }
 
 /// Replays every spill file in `dir` into QuestDB.
@@ -1049,7 +1105,7 @@ pub const REPLAY_REQUEST_TIMEOUT_SECS: u64 = 60;
 ///
 /// Returns only if the HTTP client cannot be built, which the supervisor
 /// treats as a respawn-worthy exit.
-async fn run_replay_loop(dir: PathBuf, url: String) {
+async fn run_replay_loop(dir: PathBuf, url: String, require_upload: bool) {
     let client = match crate::http_client::build_probe_client(REPLAY_REQUEST_TIMEOUT_SECS) {
         Ok(client) => client,
         Err(err) => {
@@ -1112,9 +1168,14 @@ async fn run_replay_loop(dir: PathBuf, url: String) {
         // re-disable the rescue tier until the next boot, which is the exact
         // failure the trim exists to prevent. Cheap: it reads one flat
         // directory and returns immediately when the bytes are inside budget.
+        //
+        // 2026-10-02: the budget is THIS directory's: the depth quarantine
+        // used to be trimmed against the tick spill ceiling. And a file is
+        // deleted only with a verified cold copy (plan item 45e-1).
         let pruned = crate::tick_persistence::prune_quarantine(
             &dir,
-            crate::tick_persistence::tick_spill_max_bytes(),
+            spill_max_bytes_for_dir(&dir),
+            require_upload,
         );
         if pruned > 0 {
             warn!(
@@ -1141,15 +1202,20 @@ async fn run_replay_loop(dir: PathBuf, url: String) {
 /// off-thread tick ILP flush worker died and the supervisor respawned it",
 /// which is exactly this. Its previous emit site was deleted in the 2026-07-17
 /// sweep; the runbook carries a dated note recording this revival.
+///
+/// `require_upload` is `[raw_frame_archive] require_upload_before_prune`: the
+/// per-round quarantine trim then deletes only files with a verified cold
+/// copy (plan item 45e-1).
 pub fn spawn_supervised_tick_spill_replay(
     dir: PathBuf,
     host: &str,
     http_port: u16,
+    require_upload: bool,
 ) -> tokio::task::JoinHandle<()> {
     let url = write_url(host, http_port);
     tokio::spawn(async move {
         loop {
-            let handle = tokio::spawn(run_replay_loop(dir.clone(), url.clone()));
+            let handle = tokio::spawn(run_replay_loop(dir.clone(), url.clone(), require_upload));
             let join_result = handle.await;
             let reason = if join_result.is_ok() {
                 "returned"
@@ -2217,7 +2283,7 @@ mod tests {
         // feature, and adding a dependency feature to reach one sleep would be
         // a worse trade than covering the entry path directly.
         let dir = temp_dir("supervised");
-        let handle = spawn_supervised_tick_spill_replay(dir.clone(), "127.0.0.1", 1);
+        let handle = spawn_supervised_tick_spill_replay(dir.clone(), "127.0.0.1", 1, true);
         tokio::task::yield_now().await;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(
@@ -2283,6 +2349,73 @@ mod tests {
             "it must land in the quarantine directory, not somewhere ad hoc"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 2026-10-02: spill names recur per feed and hour, and a plain rename
+    /// onto an already-quarantined file of the same name destroyed it.
+    #[test]
+    fn test_regression_quarantine_never_overwrites_an_existing_file() {
+        let dir = temp_dir("quarantine-no-overwrite");
+        let spill = dir.join("ticks-dhan-1.ilp");
+        std::fs::write(&spill, b"first").expect("write"); // APPROVED: test
+        let first = quarantine_spill_file(&dir, &spill).expect("q1"); // APPROVED: test
+        std::fs::write(&spill, b"second").expect("write"); // APPROVED: test
+        let second = quarantine_spill_file(&dir, &spill).expect("q2"); // APPROVED: test
+        std::fs::write(&spill, b"third").expect("write"); // APPROVED: test
+        let third = quarantine_spill_file(&dir, &spill).expect("q3"); // APPROVED: test
+        assert_ne!(first, second);
+        assert_ne!(second, third);
+        assert_eq!(std::fs::read(&first).expect("r"), b"first"); // APPROVED: test
+        assert_eq!(std::fs::read(&second).expect("r"), b"second"); // APPROVED: test
+        assert_eq!(std::fs::read(&third).expect("r"), b"third"); // APPROVED: test
+        assert!(second.to_string_lossy().ends_with("ticks-dhan-1.ilp.1"));
+        assert!(third.to_string_lossy().ends_with("ticks-dhan-1.ilp.2"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_free_quarantine_path_counts_a_dangling_link_as_occupied() {
+        let dir = temp_dir("quarantine-free");
+        let name = std::ffi::OsStr::new("x.ilp");
+        assert_eq!(
+            free_quarantine_path(&dir, name).expect("free"), // APPROVED: test
+            dir.join("x.ilp")
+        );
+        std::os::unix::fs::symlink(dir.join("nowhere"), dir.join("x.ilp")).expect("link"); // APPROVED: test
+        assert_eq!(
+            free_quarantine_path(&dir, name).expect("free"), // APPROVED: test
+            dir.join("x.ilp.1")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_is_depth_spill_dir_names_only_the_depth_directory() {
+        assert!(is_depth_spill_dir(Path::new(
+            crate::depth_persistence::DEPTH_SPILL_DIR
+        )));
+        assert!(!is_depth_spill_dir(Path::new(
+            crate::tick_persistence::TICK_SPILL_DIR
+        )));
+        assert!(!is_depth_spill_dir(Path::new("/tmp/whatever")));
+    }
+
+    /// The depth quarantine is trimmed against the depth ceiling, not the
+    /// tick one (until 2026-10-02 both used the tick ceiling).
+    #[test]
+    fn test_spill_max_bytes_for_dir_gives_depth_its_own_budget() {
+        assert_eq!(
+            spill_max_bytes_for_dir(Path::new(crate::depth_persistence::DEPTH_SPILL_DIR)),
+            crate::depth_persistence::depth_spill_max_bytes()
+        );
+        assert_eq!(
+            spill_max_bytes_for_dir(Path::new(crate::tick_persistence::TICK_SPILL_DIR)),
+            crate::tick_persistence::tick_spill_max_bytes()
+        );
+        assert_eq!(
+            spill_max_bytes_for_dir(Path::new("/tmp/whatever")),
+            crate::tick_persistence::tick_spill_max_bytes()
+        );
     }
 
     /// A one-shot HTTP responder: 400 for a payload containing `poison`,

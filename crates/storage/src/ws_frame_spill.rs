@@ -3714,7 +3714,7 @@ const fn applied_sink_for(endpoint: WalEndpoint) -> crate::wal_applied_watermark
 /// PREVIOUS segment's skip range: a bit-flip in the seq bytes that read as a
 /// plausibly lower number would narrow that range and let a segment be
 /// skipped while its real tail sits above the watermark.
-fn first_frame_seq_in_segment(path: &Path) -> u64 {
+pub(crate) fn first_frame_seq_in_segment(path: &Path) -> u64 {
     // A frame larger than this in the first record is not a record this
     // writer produced; refuse to allocate for it.
     const FIRST_RECORD_PROBE_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;

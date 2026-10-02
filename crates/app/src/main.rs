@@ -1894,6 +1894,7 @@ async fn async_main() -> Result<()> {
             let _spill = tickvault_storage::seal_spill::prune_spill_files(
                 std::path::Path::new("data/spill"),
                 tickvault_common::constants::SPILL_FILE_MAX_AGE_SECS,
+                require_raw_upload,
             );
             // The DLQ is MEASURED, never pruned — deliberately asymmetric
             // with the spill sweep above. It holds the operator-readable
@@ -1997,7 +1998,24 @@ async fn async_main() -> Result<()> {
                     move || pressure || raw_upload::upload_window_open(now_utc_secs());
                 let summary =
                     raw_upload::run_pass(&store, &wal_dir, max_segments, &should_continue).await;
-                if summary.marked() > 0 {
+                // Then the two prunes that delete other market data: the
+                // sealed-candle spill sweep and the tick / depth quarantine
+                // trims (plan item 45e-1, operator Quotes 27 + 28). Same
+                // schedule and batch as the WAL pass; today's spill day file
+                // is the one the live writer may hold open, so it is skipped.
+                let today_spill_file =
+                    tickvault_storage::seal_spill::live_spill_file_name(now_utc_secs());
+                let others = raw_upload::run_spill_and_quarantine_passes(
+                    &store,
+                    std::path::Path::new("data/spill"),
+                    std::path::Path::new(tickvault_storage::tick_persistence::TICK_SPILL_DIR),
+                    std::path::Path::new(tickvault_storage::depth_persistence::DEPTH_SPILL_DIR),
+                    &today_spill_file,
+                    max_segments,
+                    &should_continue,
+                )
+                .await;
+                if summary.marked() > 0 || others.marked() > 0 {
                     tickvault_app::reclaim_signal::request_reclaim();
                 }
             }
@@ -2365,6 +2383,7 @@ async fn async_main() -> Result<()> {
     let quarantine_pruned = tickvault_storage::tick_persistence::prune_quarantine(
         std::path::Path::new(tickvault_storage::tick_persistence::TICK_SPILL_DIR),
         tickvault_storage::tick_persistence::tick_spill_max_bytes(),
+        require_raw_upload,
     );
     if quarantine_pruned > 0 {
         warn!(
@@ -2379,6 +2398,7 @@ async fn async_main() -> Result<()> {
             std::path::PathBuf::from(tickvault_storage::tick_persistence::TICK_SPILL_DIR),
             &config.questdb.host,
             config.questdb.http_port,
+            require_raw_upload,
         );
 
     // The SAME drain, pointed at the depth rescue tier (2026-08-25).
@@ -2410,6 +2430,7 @@ async fn async_main() -> Result<()> {
             std::path::PathBuf::from(tickvault_storage::depth_persistence::DEPTH_SPILL_DIR),
             &config.questdb.host,
             config.questdb.http_port,
+            require_raw_upload,
         );
 
     // Feed-hardening Item 5 (2026-08-19): the watcher above MEASURES a filling

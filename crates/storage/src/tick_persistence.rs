@@ -93,7 +93,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::QUESTDB_TABLE_TICKS;
@@ -1491,15 +1491,33 @@ pub const QUARANTINE_PRUNED_COUNTER: &str = "tv_tick_spill_quarantine_pruned_tot
 /// A directory that cannot be read is not an error here — there may simply be no
 /// quarantine yet, and failing a boot over a missing subdirectory would turn a
 /// housekeeping step into an outage.
-pub fn prune_quarantine(spill_dir: &Path, spill_max_bytes: u64) -> usize {
+///
+/// # The copy gate (plan item 45e-1, operator Quotes 27 + 28)
+///
+/// With `require_upload` on, a quarantined file is deleted only when its
+/// marker in `quarantine/uploaded/` records its current length and mtime —
+/// a verified gzip copy is in the cold bucket (`tick-quarantine/` or
+/// `depth-quarantine/`), so nothing is lost. A file with no such copy is
+/// KEPT even while the directory is over budget, counted on
+/// `tv_quarantine_prune_refused_not_uploaded_total`, with one coded line per
+/// pass. The cost, stated plainly: until the uploader catches up, quarantine
+/// may hold more than its share of the spill ceiling, and new rescues can be
+/// refused sooner. The operator's rule is that no market data leaves the box
+/// without a copy; the rescue tier's refusals stay counted and loud.
+///
+/// `spill_max_bytes` is the ceiling of the spill directory THIS quarantine
+/// belongs to — the tick one or the depth one (see
+/// `tick_spill_replay::spill_max_bytes_for_dir`).
+pub fn prune_quarantine(spill_dir: &Path, spill_max_bytes: u64, require_upload: bool) -> usize {
+    let gate = crate::raw_frame_upload::CopyGate::from_config(require_upload);
     let budget = spill_max_bytes / QUARANTINE_BUDGET_FRACTION;
     let dir = spill_dir.join(crate::tick_spill_replay::QUARANTINE_DIR);
-    // O(1) EXEMPT: begin — boot-time housekeeping over a flat directory, never
+    // O(1) EXEMPT: begin — cold housekeeping over a flat directory, never
     // on any per-tick or per-frame path.
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return 0;
     };
-    let mut files: Vec<(std::time::SystemTime, u64, std::path::PathBuf)> = entries
+    let mut files: Vec<(std::time::SystemTime, std::fs::Metadata, std::path::PathBuf)> = entries
         .filter_map(std::result::Result::ok)
         .filter_map(|e| {
             let meta = e.metadata().ok()?;
@@ -1508,42 +1526,96 @@ pub fn prune_quarantine(spill_dir: &Path, spill_max_bytes: u64) -> usize {
             }
             Some((
                 meta.modified().unwrap_or(std::time::UNIX_EPOCH),
-                meta.len(),
+                meta,
                 e.path(),
             ))
         })
         .collect();
-    let mut total: u64 = files.iter().map(|(_, len, _)| *len).sum();
+    let mut total: u64 = files.iter().map(|(_, meta, _)| meta.len()).sum();
     if total <= budget {
         return 0;
     }
     files.sort_by_key(|(mtime, _, _)| *mtime);
     let mut removed = 0usize;
-    for (_, len, path) in files {
+    let mut refused = 0usize;
+    let mut refused_bytes = 0u64;
+    for (_, meta, path) in files {
         if total <= budget {
             break;
         }
-        if std::fs::remove_file(&path).is_ok() {
-            total = total.saturating_sub(len);
-            removed += 1;
-            metrics::counter!(QUARANTINE_PRUNED_COUNTER).increment(1);
-            error!(
-                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
-                path = %path.display(),
-                bytes = len,
-                budget,
-                "DELETED a quarantined tick spill file to keep the quarantine directory \
-                 inside its share of the spill ceiling. Its recoverable lines are gone. \
-                 This is deliberate and it is the lesser loss: quarantine counts toward \
-                 the spill ceiling, so an unbounded quarantine would return StorageFull \
-                 for every future rescue — permanently disabling the tier that keeps \
-                 live ticks, for this process and every boot after it."
-            );
+        let len = meta.len();
+        if !gate.allows_delete(&path, &meta) {
+            refused += 1;
+            refused_bytes = refused_bytes.saturating_add(len);
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                gate.forget(&path);
+                total = total.saturating_sub(len);
+                removed += 1;
+                metrics::counter!(QUARANTINE_PRUNED_COUNTER).increment(1);
+                if gate.copy_in_s3() {
+                    info!(
+                        path = %path.display(),
+                        bytes = len,
+                        budget,
+                        "deleted a quarantined spill file to keep the quarantine directory \
+                         inside its share of the spill ceiling; a verified copy is in the \
+                         cold bucket, so nothing is lost"
+                    );
+                } else {
+                    error!(
+                        code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                        path = %path.display(),
+                        bytes = len,
+                        budget,
+                        "DELETED a quarantined spill file to keep the quarantine directory \
+                         inside its share of the spill ceiling, with NO cold copy (the copy \
+                         gate is off). Its recoverable lines are gone. This is deliberate \
+                         and it is the lesser loss: quarantine counts toward the spill \
+                         ceiling, so an unbounded quarantine would return StorageFull for \
+                         every future rescue — permanently disabling the tier that keeps \
+                         live data, for this process and every boot after it."
+                    );
+                }
+            }
+            Err(err) => {
+                error!(
+                    code = ErrorCode::StorageGap05DiskPressureUnrelievable.code_str(),
+                    path = %path.display(),
+                    error = %err,
+                    "could not delete a quarantined spill file to keep the quarantine \
+                     inside its budget — it stays and is retried on the next pass"
+                );
+            }
         }
     }
     // O(1) EXEMPT: end
+    if refused > 0 {
+        // APPROVED: cast — a per-pass file count, always <= u64.
+        metrics::counter!(QUARANTINE_PRUNE_REFUSED_NOT_UPLOADED_COUNTER).increment(refused as u64);
+        error!(
+            code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
+            source = "quarantine_prune",
+            dir = %dir.display(),
+            files = refused,
+            bytes = refused_bytes,
+            budget,
+            "quarantined spill files over the quarantine budget were KEPT, not deleted: no \
+             verified copy of them is in the cold bucket yet. They go once the uploader has \
+             copied them; until then the quarantine holds more than its share of the spill \
+             ceiling."
+        );
+    }
     removed
 }
+
+/// Counter: quarantined spill files the budget trim KEPT because no verified
+/// cold copy is recorded for them (plan item 45e-1). The trim logs one coded
+/// STORAGE-GAP-04 line per pass that refuses any.
+pub const QUARANTINE_PRUNE_REFUSED_NOT_UPLOADED_COUNTER: &str =
+    "tv_quarantine_prune_refused_not_uploaded_total";
 /// ILP-over-HTTP conf: per-flush server ACK (the 2026-07-05 fire-and-forget
 /// lesson) with `retry_timeout=0` (the caller owns retry cadence) and a bounded
 /// `request_timeout` so a hung flush cannot wedge the pipeline.
@@ -5950,7 +6022,7 @@ mod tests {
             f.set_modified(t).expect("set mtime");
         }
 
-        let removed = prune_quarantine(&dir, ceiling);
+        let removed = prune_quarantine(&dir, ceiling, false);
 
         assert!(
             removed >= 3,
@@ -5965,6 +6037,51 @@ mod tests {
             q.join("d.ilp").exists(),
             "the NEWEST quarantined file must survive the trim"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Operator Quotes 27 + 28: with the copy gate on, a quarantined file over
+    /// the budget is deleted only when a verified cold copy is recorded; the
+    /// rest are kept even though the directory stays over budget.
+    #[test]
+    fn test_prune_quarantine_over_budget_keeps_files_without_a_marker() {
+        let dir = std::env::temp_dir().join(format!(
+            "tv-quarantine-gate-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let q = dir.join(crate::tick_spill_replay::QUARANTINE_DIR);
+        std::fs::create_dir_all(&q).expect("temp quarantine");
+        for (i, name) in ["a.ilp", "b.ilp", "c.ilp", "d.ilp"].iter().enumerate() {
+            std::fs::write(q.join(name), vec![b'x'; 60]).expect("write");
+            let t = std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(1_700_000_000 + i as u64 * 60);
+            let f = std::fs::File::options()
+                .write(true)
+                .open(q.join(name))
+                .expect("reopen");
+            f.set_modified(t).expect("set mtime");
+        }
+        // Only the second-oldest has a verified copy.
+        crate::raw_frame_upload::write_file_marker_for_test(&q.join("b.ilp"));
+
+        // Budget = 400 / 4 = 100 bytes against 240 on disk.
+        let removed = prune_quarantine(&dir, 400, true);
+
+        assert_eq!(removed, 1, "only the copied file may go");
+        assert!(!q.join("b.ilp").exists());
+        assert!(
+            !q.join(crate::raw_frame_upload::UPLOADED_SUBDIR)
+                .join("b.ilp")
+                .exists(),
+            "its marker goes with it"
+        );
+        for kept in ["a.ilp", "c.ilp", "d.ilp"] {
+            assert!(q.join(kept).exists(), "{kept} has no copy and must stay");
+        }
+        // The markers directory is never taken for a quarantined file.
+        assert!(q.join(crate::raw_frame_upload::UPLOADED_SUBDIR).is_dir());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5984,7 +6101,7 @@ mod tests {
         std::fs::create_dir_all(&q).expect("temp quarantine");
         std::fs::write(q.join("small.ilp"), b"tiny").expect("write");
 
-        assert_eq!(prune_quarantine(&dir, 4096), 0);
+        assert_eq!(prune_quarantine(&dir, 4096, false), 0);
         assert!(q.join("small.ilp").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5999,7 +6116,7 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_nanos())
         ));
-        assert_eq!(prune_quarantine(&dir, 4096), 0);
+        assert_eq!(prune_quarantine(&dir, 4096, false), 0);
     }
 
     #[test]
