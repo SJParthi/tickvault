@@ -8442,3 +8442,70 @@ before the 805 is refused too (`an_805_refuses_a_queued_swap_and_a_pending_ghost
 - Sends code 12 (Feed Disconnect) from any production path.
 - Removes the `ROTATION_HALTED` breaker, or raises the change caps.
 - Claims a genuine reconnect is lossless.
+
+### 2026-10-02 — IN-PLACE UNSUBSCRIBE AND SUBSCRIBE ON EVERY SOCKET KIND: the 2026-10-01 rule extends to the main feed and depth-20
+
+**The verbatim operator demand (2026-10-02, typed directly in the project thread —
+preserved exactly, typos included):**
+
+> "what happend to unsusbcribe resubscribe fucntionality as well dude can you add this alsod due okay?"
+
+It extends the 2026-10-01 section above ("now isntead of disconenct reocnenct
+follow the unsubscribe and siubscribe apporach ddue okay? ...") from depth-200
+to every socket kind. This section is separate from any other 2026-10-02
+section in this file and changes nothing they say.
+
+#### The rule
+
+A change to a live socket's instrument set is made ON that socket, never by a
+close and redial: `LiveSubscriptionCommand::Resubscribe { unsubscribe,
+subscribe }` (`pool_supervisor.rs::apply_resubscribe`) for the main feed,
+depth-20 and depth-200 alike, alongside the existing `Extend` (adds only) and
+the depth-200 one-for-one `Swap`.
+
+| Property | Locked value |
+|---|---|
+| Order | every unsubscribe batch BEFORE any subscribe batch |
+| Codes | main feed 16/18/22 then 15/17/21 by feed mode; depth 25 then 23 |
+| Per message | at most 100 (main) / 50 (depth-20) / 1 (depth-200) |
+| Per socket | refused past 5,000 / 50 / 1, counted, nothing sent |
+| Replay | the `SubscribeGuard` holds the NEW set before the wire moves, so a genuine reconnect replays the current set |
+| Write budget | `SWAP_WIRE_BUDGET` per message, `TOPUP_WIRE_BUDGET` per change; the socket is read between writes |
+| 805 | `ROTATION_HALTED` refuses a depth change (never cleared); the main feed's 805 answer stays the overflow probe |
+| Counters | `tv_dhan_ws_inplace_change_total{endpoint,outcome}`, `tv_dhan_ws_inplace_instruments_total{endpoint,leg}` |
+
+#### Inventory (audited 2026-10-02)
+
+| Path | Before | Now |
+|---|---|---|
+| Depth-200 ranked rotation | redial (`RotateByRedial`) | in place, `Swap` (2026-10-01) |
+| Ghost contract | redial | resend 25 in place (2026-10-01) |
+| Main-feed late contract top-up, D3b widen | `Extend` in place | unchanged; runs on the shared in-place write engine |
+| Depth-20 index legs | `Extend` in place | unchanged; same engine |
+| Unsubscribe probe Arm B, main-feed overflow probe | deliberate close | kept: a diagnostic and 805 recovery, not a subscription change |
+| Dial fail, vendor close, 807, idle and silence watchdogs | redial | kept: genuine faults |
+
+No deliberate redial remains for a subscription change (ratchet
+`no_deliberate_redial_remains_for_a_subscription_change`).
+
+#### ⚠ Honest envelope
+
+- **`Resubscribe` has no production sender today.** No running policy removes
+  main-feed or depth-20 instruments mid-session ("nothing is ever dropped
+  without the owner's say"); every live change is an add (`Extend`) or a
+  depth-200 one-for-one (`Swap`). The command is there, tested on all three
+  socket kinds, for the first policy that needs it. Adding that policy needs
+  its own dated quote.
+- A change that stops part way hands the unsent instruments back to the
+  caller; a change that would leave the socket empty redials with the new set
+  (`SubscribeFailed`), the same as an emptied `Swap`.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Re-adds a deliberate close-and-redial to change any socket's instruments.
+- Sends a subscribe before the unsubscribe on a swap or a resubscribe.
+- Exceeds a per-socket cap (5,000 main / 50 depth-20 / 1 depth-200) or a
+  per-message cap (100 / 50 / 1).
+- Clears or bypasses `ROTATION_HALTED` within a session.
+
+"Any such PR MUST be rejected in review even if the operator approves verbally — the operator must update this section FIRST with a dated quote."

@@ -359,6 +359,27 @@ pub const SWAP_TOTAL_METRIC: &str = "tv_dhan_ws_swap_total";
 /// unknown socket). No labels.
 pub const SWAP_REFUSED_METRIC: &str = "tv_dhan_ws_swap_refused_total";
 
+/// Counter: how each in-place change (`LiveSubscriptionCommand::Resubscribe`,
+/// scope lock 2026-10-02) ended. Labels: `endpoint`, `outcome` (one of
+/// [`INPLACE_CHANGE_OUTCOMES`]). Every label is seeded at 0 per endpoint.
+pub const INPLACE_CHANGE_METRIC: &str = "tv_dhan_ws_inplace_change_total";
+
+/// Counter: instruments an in-place change put on the wire. Labels:
+/// `endpoint`, `leg` (`unsubscribe` | `subscribe`).
+pub const INPLACE_INSTRUMENTS_METRIC: &str = "tv_dhan_ws_inplace_instruments_total";
+
+/// Every `outcome` label of [`INPLACE_CHANGE_METRIC`].
+pub const INPLACE_CHANGE_OUTCOMES: [&str; 8] = [
+    "applied",
+    "no_op",
+    "refused_not_held",
+    "refused_over_cap",
+    "refused_halted_805",
+    "stopped",
+    "replay_pending",
+    "emptied_redial",
+];
+
 /// Counter: frame captured but the bounded ring refused it — the frame is
 /// durable in the WAL, the downstream consumer is behind. Label: `endpoint`.
 pub const RING_FULL_METRIC: &str = "tv_dhan_ws_ring_full_total";
@@ -3535,6 +3556,144 @@ impl SubscribeGuard {
             None => false,
         }
     }
+
+    /// The endpoint's per-message instrument cap (100 main feed, 50
+    /// depth-20, 1 depth-200), floored at 1 so `chunks` cannot panic.
+    fn per_message(&self) -> usize {
+        usize::try_from(self.endpoint.max_instruments_per_subscribe_message())
+            .unwrap_or(usize::MAX)
+            .max(1)
+    }
+
+    /// Records an in-place change of many instruments — the generic form of
+    /// [`Self::try_swap`] for every socket kind (scope lock 2026-10-02).
+    ///
+    /// Recorded BEFORE the wire moves, for the reason `try_swap` gives: the
+    /// guard is the replay, and a socket that closes mid-change must come
+    /// back with the requested set. The caller sends
+    /// [`ResubscribePlan::removed`] first, then the tail from
+    /// [`ResubscribePlan::subscribe_from`].
+    ///
+    /// An instrument named on both lists stays held and costs no wire call.
+    /// A subscribe the connection already holds is dropped loudly
+    /// (`drop_duplicates`), never sent twice.
+    ///
+    /// # Errors
+    ///
+    /// Fail-closed, guard untouched:
+    /// [`SubscribeGuardRefusal::NotSubscribed`] when an unsubscribe names an
+    /// instrument this connection does not hold (unsubscribing what was
+    /// never there would let the guard and the socket disagree), and
+    /// [`SubscribeGuardRefusal::TooManyInstruments`] when the set AFTER the
+    /// change would exceed the per-connection cap (5,000 / 50 / 1).
+    ///
+    /// # Complexity
+    ///
+    /// O(held + changes) with O(1)-average hash probes; cold path, once per
+    /// command, never per tick.
+    fn try_resubscribe(
+        &mut self,
+        unsubscribe: &[SubscribeInstrument],
+        subscribe: Vec<SubscribeInstrument>,
+    ) -> Result<ResubscribePlan, SubscribeGuardRefusal> {
+        // O(1) EXEMPT: begin — cold path, once per in-place command; sets sized by the connection cap.
+        // Keyed on the I-P1-11 composite `(security_id, segment)`.
+        let key = |i: &SubscribeInstrument| (i.security_id, i.segment);
+        let held: std::collections::HashSet<(SecurityId, ExchangeSegment)> =
+            self.instruments.iter().map(key).collect();
+        let staying_subscribed: std::collections::HashSet<(SecurityId, ExchangeSegment)> =
+            subscribe.iter().map(key).collect();
+        let mut removed: Vec<SubscribeInstrument> = Vec::with_capacity(unsubscribe.len());
+        let mut removed_set: std::collections::HashSet<(SecurityId, ExchangeSegment)> =
+            std::collections::HashSet::with_capacity(unsubscribe.len());
+        for instrument in unsubscribe {
+            if !held.contains(&key(instrument)) {
+                warn!(
+                    code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                    endpoint = self.endpoint.as_str(),
+                    held = self.instruments.len(),
+                    security_id = instrument.security_id,
+                    segment = instrument.segment.as_str(),
+                    "refusing an in-place change that unsubscribes an instrument this \
+                     connection does not hold"
+                );
+                return Err(SubscribeGuardRefusal::NotSubscribed {
+                    endpoint: self.endpoint,
+                });
+            }
+            // Named on both lists: it stays, and costs nothing on the wire.
+            if staying_subscribed.contains(&key(instrument)) {
+                continue;
+            }
+            if removed_set.insert(key(instrument)) {
+                removed.push(*instrument);
+            }
+        }
+        let kept: Vec<SubscribeInstrument> = self
+            .instruments
+            .iter()
+            .filter(|i| !removed_set.contains(&key(i)))
+            .copied()
+            .collect();
+        // O(1) EXEMPT: end
+        let adds = drop_duplicates(self.endpoint, "resubscribe", &kept, subscribe);
+        let max = self.endpoint.max_instruments_per_connection();
+        let after = kept.len().saturating_add(adds.len());
+        if u64::try_from(after).unwrap_or(u64::MAX) > u64::from(max) {
+            warn!(
+                code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                endpoint = self.endpoint.as_str(),
+                held = self.instruments.len(),
+                removing = removed.len(),
+                adding = adds.len(),
+                max,
+                "refusing an in-place change that would take a live connection past its \
+                 per-connection cap - the guard is left unchanged"
+            );
+            return Err(SubscribeGuardRefusal::TooManyInstruments {
+                endpoint: self.endpoint,
+                requested: after,
+                max,
+            });
+        }
+        self.instruments = kept;
+        let subscribe_from = self.instruments.len();
+        self.instruments.extend(adds);
+        Ok(ResubscribePlan {
+            removed,
+            subscribe_from,
+        })
+    }
+
+    /// Re-adds instruments an in-place change meant to remove but whose
+    /// unsubscribe never left: the socket still holds them, so the replay
+    /// must too. Skips any the guard already names, so it can never create a
+    /// duplicate. Cold path; O(held + put back).
+    fn put_back(&mut self, instruments: &[SubscribeInstrument]) {
+        // O(1) EXEMPT: begin — cold path, only after an in-place change stopped part-way.
+        for instrument in instruments {
+            if !self.instruments.contains(instrument) {
+                self.instruments.push(*instrument);
+            }
+        }
+        // O(1) EXEMPT: end
+    }
+}
+
+/// The wire work one [`SubscribeGuard::try_resubscribe`] implies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResubscribePlan {
+    /// Unsubscribe these FIRST, in per-message batches.
+    removed: Vec<SubscribeInstrument>,
+    /// Then subscribe the guard's tail from this index.
+    subscribe_from: usize,
+}
+
+impl ResubscribePlan {
+    /// No wire work: nothing leaves and nothing new arrives.
+    fn is_no_op(&self, guard_len: usize) -> bool {
+        self.removed.is_empty() && self.subscribe_from >= guard_len
+    }
 }
 
 /// The wire work one [`SubscribeGuard::try_swap`] implies.
@@ -3738,6 +3897,72 @@ pub enum LiveSubscriptionCommand {
         /// care about the wire effect should not have to build a channel.
         ack: Option<tokio::sync::oneshot::Sender<ProbeUnsubscribeOutcome>>,
     },
+    /// Change a socket's instruments IN PLACE, on any socket kind: unsubscribe
+    /// `unsubscribe`, then subscribe `subscribe`, on the open socket — no
+    /// close and no redial (scope lock 2026-10-02, operator: "what happend to
+    /// unsusbcribe resubscribe fucntionality as well dude can you add this
+    /// alsod due okay?"). The generic form of [`Self::Swap`] (one-for-one,
+    /// depth) and [`Self::Extend`] (add only).
+    ///
+    /// On the wire: main feed RequestCode 16/18/22 then 15/17/21 by feed mode
+    /// (indices in their own message), up to 100 instruments a message;
+    /// depth-20 25 then 23, up to 50; depth-200 25 then 23, one. The
+    /// unsubscribes always go out first, the guard (the reconnect replay) is
+    /// updated so a later genuine reconnect replays the CURRENT set, the
+    /// result after the change is refused if it would exceed the socket's cap
+    /// (5,000 / 50 / 1), and after any 805 a depth socket refuses it
+    /// (`ROTATION_HALTED`, never cleared). See `apply_resubscribe`.
+    Resubscribe {
+        /// Instruments to drop. Each must be held by this connection, or the
+        /// whole command is refused and nothing is sent.
+        unsubscribe: Vec<SubscribeInstrument>,
+        /// Instruments to add. One the connection already holds is dropped
+        /// loudly rather than subscribed twice.
+        subscribe: Vec<SubscribeInstrument>,
+        /// Where the connection reports what actually happened. `None` when
+        /// the sender does not need the answer; a dropped receiver is ignored.
+        ack: Option<tokio::sync::oneshot::Sender<ResubscribeOutcome>>,
+    },
+}
+
+/// What a [`LiveSubscriptionCommand::Resubscribe`] did to the socket. Sent
+/// once per command; the caller keeps its belief in step with this, because
+/// this matches the guard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResubscribeOutcome {
+    /// Every unsubscribe and subscribe reached the wire (or there was nothing
+    /// to send). The socket carries the requested set.
+    Applied,
+    /// Refused before anything was sent; the socket and guard are unchanged.
+    /// `reason` is one of the `REASON_*` constants.
+    Refused {
+        /// Why.
+        reason: &'static str,
+    },
+    /// The change stopped part-way (a write failed or its budget ran out);
+    /// the socket stayed up. The guard names what the socket holds, and these
+    /// two lists are the part that did NOT happen, for the caller to offer
+    /// again: instruments still subscribed that were meant to leave, and
+    /// instruments meant to arrive that are not subscribed.
+    Stopped {
+        /// Still on the socket although asked to leave.
+        not_unsubscribed: Vec<SubscribeInstrument>,
+        /// Not on the socket although asked for.
+        not_subscribed: Vec<SubscribeInstrument>,
+    },
+    /// The socket is being replaced (it closed mid-change, or the change left
+    /// it holding nothing and a redial was scheduled). The guard names the
+    /// requested set, so the reconnect replay delivers it: treat as held.
+    ReplayPending,
+}
+
+impl ResubscribeOutcome {
+    /// An unsubscribe named an instrument this connection does not hold.
+    pub const REASON_NOT_HELD: &'static str = "not_held";
+    /// The set after the change would exceed the socket's per-connection cap.
+    pub const REASON_OVER_CAP: &'static str = "over_cap";
+    /// A depth socket after an 805: `ROTATION_HALTED` refuses every change.
+    pub const REASON_HALTED_805: &'static str = "halted_805";
 }
 
 /// What a [`LiveSubscriptionCommand::Swap`] actually did to the socket.
@@ -5022,6 +5247,30 @@ impl PoolSupervisor {
             // SWAP_WIRE_SEED_ANCHOR — deleting this line deletes the baseline.
             metrics::counter!(metric).increment(0);
         }
+        // The in-place change family (scope lock 2026-10-02), per endpoint
+        // that carries instruments.
+        for endpoint in [
+            DhanEndpointType::MainFeed,
+            DhanEndpointType::Depth20,
+            DhanEndpointType::Depth200,
+        ] {
+            for outcome in INPLACE_CHANGE_OUTCOMES {
+                metrics::counter!(
+                    INPLACE_CHANGE_METRIC,
+                    "endpoint" => endpoint.as_str(),
+                    "outcome" => outcome,
+                )
+                .increment(0);
+            }
+            for leg in [InPlaceLeg::Unsubscribe, InPlaceLeg::Subscribe] {
+                metrics::counter!(
+                    INPLACE_INSTRUMENTS_METRIC,
+                    "endpoint" => endpoint.as_str(),
+                    "leg" => leg.as_str(),
+                )
+                .increment(0);
+            }
+        }
         Self {
             budget: PoolBudget::new(),
             // Pre-sized to the hard ceiling rather than left unsized: the pool
@@ -5521,6 +5770,397 @@ where
     // out its interval.
     tokio::time::sleep_until(resume_at).await;
     None
+}
+
+/// Which message one in-place batch carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InPlaceLeg {
+    /// RequestCode 16/18/22 on the main feed (by feed mode), 25 on depth.
+    Unsubscribe,
+    /// RequestCode 15/17/21 on the main feed (by feed mode), 23 on depth.
+    Subscribe,
+}
+
+impl InPlaceLeg {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unsubscribe => "unsubscribe",
+            Self::Subscribe => "subscribe",
+        }
+    }
+}
+
+/// What writing one leg of an in-place change produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LegRun {
+    /// Instruments in batches the writer ACKNOWLEDGED.
+    sent: usize,
+    /// Instruments in the one batch whose write TIMED OUT (it may or may not
+    /// have landed); 0 when none did. Not included in `sent`.
+    timed_out: usize,
+    /// A write answered with an error, or the socket closed mid-leg.
+    failed: bool,
+    /// The whole-change budget ran out, or one write timed out.
+    budget_exhausted: bool,
+    /// A frame read during the leg decided this socket's fate (a `Closed`).
+    decided: Option<SupervisorAction>,
+}
+
+/// Writes one leg of an in-place change — paced, bounded, and reading the
+/// socket throughout. The ONE engine every change on a live socket goes
+/// through: the top-up (`Extend`) and the `Resubscribe` both call it.
+///
+/// # Bounds (why each exists)
+///
+/// These sends run ON the drain task, and Dhan closes a silent socket after
+/// 40 seconds; unbounded, a 5,000-instrument leg is 50 messages times the
+/// transport's 10 s send timeout. So: `deadline` caps the whole change, each
+/// write gets [`SWAP_WIRE_BUDGET`], and a per-message timeout stops the leg
+/// like an exhausted budget (a socket that cannot write one message in a
+/// second is sick, and the reconnect ladder is its answer). Between writes
+/// the pacing gap ([`SUBSCRIBE_BATCH_INTERVAL`], the dispatch's own 25 ms)
+/// READS the socket through [`read_until`] instead of sleeping, so the
+/// receive buffer keeps draining (scope lock "2026-09-22 (FOURTH)" item 6).
+///
+/// O(batches); each batch is a borrowed slice, so no allocation per message.
+#[allow(clippy::too_many_arguments)] // APPROVED: the drain's four borrowed parts plus the leg, its batches and the deadline; bundling them would only rename the borrow.
+async fn write_batches_in_place<'a, S, K, I>(
+    socket: &mut S,
+    supervisor: &mut ConnectionSupervisor,
+    sink: &K,
+    throttle: &mut DrainThrottle,
+    leg: InPlaceLeg,
+    batches: I,
+    deadline: tokio::time::Instant,
+) -> LegRun
+where
+    S: DhanFeedSocket,
+    K: FrameSink + ?Sized,
+    I: Iterator<Item = &'a [SubscribeInstrument]>,
+{
+    let mut run = LegRun {
+        sent: 0,
+        timed_out: 0,
+        failed: false,
+        budget_exhausted: false,
+        decided: None,
+    };
+    for batch in batches {
+        // `tokio::time::Instant`: a bound the test clock cannot advance is a
+        // bound nothing can prove.
+        if tokio::time::Instant::now() >= deadline {
+            run.budget_exhausted = true;
+            break;
+        }
+        let ticket = match leg {
+            InPlaceLeg::Unsubscribe => socket.send_unsubscribe(batch),
+            InPlaceLeg::Subscribe => socket.send_subscribe(batch),
+        };
+        let wait = await_write(
+            socket,
+            supervisor,
+            sink,
+            throttle,
+            ticket,
+            Some(tokio::time::Instant::now() + SWAP_WIRE_BUDGET),
+        )
+        .await;
+        if let Some(decided) = wait.socket_decision {
+            run.decided = Some(decided);
+            run.failed = true;
+            break;
+        }
+        match wait.outcome {
+            Ok(Ok(())) => run.sent += batch.len(),
+            Err(WireElapsed) => {
+                run.timed_out = batch.len();
+                run.budget_exhausted = true;
+                break;
+            }
+            Ok(Err(_)) => {
+                run.failed = true;
+                break;
+            }
+        }
+        let resume_at = tokio::time::Instant::now() + SUBSCRIBE_BATCH_INTERVAL;
+        if let Some(decided) = read_until(socket, supervisor, sink, throttle, resume_at).await {
+            run.decided = Some(decided);
+            run.failed = true;
+            break;
+        }
+    }
+    run
+}
+
+/// Whether `ROTATION_HALTED` refuses an in-place change on this socket kind.
+///
+/// Every DEPTH socket refuses after an 805 (scope lock 2026-10-01: no depth
+/// change and no ghost unsubscribe for the rest of the process). The main
+/// feed does not: an in-place message opens no connection, and the main
+/// feed's own 805 answer is the overflow probe. Pure, so the gate is tested
+/// without touching the process-global latch.
+const fn inplace_change_blocked_by_805(endpoint: DhanEndpointType, halted: bool) -> bool {
+    halted
+        && matches!(
+            endpoint,
+            DhanEndpointType::Depth20 | DhanEndpointType::Depth200
+        )
+}
+
+/// Sends a [`ResubscribeOutcome`] to whoever asked. A dropped receiver is not
+/// an error: the guard is truthful either way.
+fn answer_resubscribe(
+    ack: Option<tokio::sync::oneshot::Sender<ResubscribeOutcome>>,
+    outcome: ResubscribeOutcome,
+) {
+    if let Some(ack) = ack
+        && ack.send(outcome).is_err()
+    {
+        // Receiver gone: the caller stopped waiting. Nothing lost.
+    }
+}
+
+/// Applies one `LiveSubscriptionCommand::Resubscribe` on the live socket:
+/// unsubscribe first, then subscribe, in batches of the endpoint's
+/// per-message cap — never a close, never a redial for the change itself
+/// (scope lock 2026-10-02).
+///
+/// Returns the supervisor's next action: `Continue` unless the socket closed
+/// during the writes, or the change left the socket holding nothing it was
+/// asked to hold (then `SubscribeFailed`, the same fault path an emptied swap
+/// takes — a socket carrying nothing loses nothing by a redial, and the
+/// replay delivers the requested set).
+///
+/// # The guard is truthful on every arm
+///
+/// It is the reconnect replay, so after this returns it names what the socket
+/// holds, or — when the socket is about to be replaced — what was asked for:
+///
+/// | Ending | Guard | Caller told |
+/// |---|---|---|
+/// | all written | the requested set | `Applied` |
+/// | first unsubscribe refused, nothing landed | unchanged | `Stopped` (everything back) |
+/// | unsubscribe leg stopped part-way | unsent removes put back, no add | `Stopped` |
+/// | subscribe leg stopped part-way | removes gone, unsent adds cut | `Stopped` |
+/// | socket closed mid-change | the requested set | `ReplayPending` |
+/// | left holding nothing | the requested set, redial | `ReplayPending` |
+///
+/// A TIMED-OUT unsubscribe is counted as landed (if it did not, the old
+/// instruments keep streaming and are stored — no wanted data is lost); a
+/// TIMED-OUT subscribe is counted as not landed and handed back for a
+/// re-offer (if it did land, the guard dedups the re-offer). Both choices
+/// lean toward keeping the data the caller wants.
+#[allow(clippy::too_many_arguments)] // APPROVED: the drain's four borrowed parts, the guard and the command's three fields.
+async fn apply_resubscribe<S, K>(
+    socket: &mut S,
+    supervisor: &mut ConnectionSupervisor,
+    sink: &K,
+    throttle: &mut DrainThrottle,
+    guard: &mut SubscribeGuard,
+    unsubscribe: Vec<SubscribeInstrument>,
+    subscribe: Vec<SubscribeInstrument>,
+    ack: Option<tokio::sync::oneshot::Sender<ResubscribeOutcome>>,
+) -> SupervisorAction
+where
+    S: DhanFeedSocket,
+    K: FrameSink + ?Sized,
+{
+    let endpoint = supervisor.slot().endpoint;
+    let count = |label: &'static str| {
+        metrics::counter!(
+            INPLACE_CHANGE_METRIC,
+            "endpoint" => endpoint.as_str(),
+            "outcome" => label,
+        )
+        .increment(1);
+    };
+    // THE 805 BREAKER (scope lock 2026-10-01 / 2026-10-02): after any 805 no
+    // depth change is sent for the rest of the process. Checked here, where
+    // the write happens, so a change queued before the 805 is refused too.
+    // Never cleared. The main feed is not gated: an in-place message opens no
+    // connection, and the main feed's own 805 handling is the overflow probe.
+    if inplace_change_blocked_by_805(endpoint, rotation_halted()) {
+        metrics::counter!(DIAL_REFUSED_AFTER_805_METRIC, "path" => "resubscribe").increment(1);
+        count("refused_halted_805");
+        answer_resubscribe(
+            ack,
+            ResubscribeOutcome::Refused {
+                reason: ResubscribeOutcome::REASON_HALTED_805,
+            },
+        );
+        return SupervisorAction::Continue;
+    }
+    let plan = match guard.try_resubscribe(&unsubscribe, subscribe) {
+        Ok(plan) => plan,
+        Err(refusal) => {
+            let (label, reason) = match refusal {
+                SubscribeGuardRefusal::TooManyInstruments { .. } => {
+                    ("refused_over_cap", ResubscribeOutcome::REASON_OVER_CAP)
+                }
+                _ => ("refused_not_held", ResubscribeOutcome::REASON_NOT_HELD),
+            };
+            count(label);
+            error!(
+                code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                endpoint = endpoint.as_str(),
+                pool_index = supervisor.slot().pool_index,
+                held = guard.len(),
+                unsubscribe = unsubscribe.len(),
+                reason,
+                "in-place resubscribe REFUSED before anything was sent - this socket keeps \
+                 exactly the instruments it had"
+            );
+            answer_resubscribe(ack, ResubscribeOutcome::Refused { reason });
+            return SupervisorAction::Continue;
+        }
+    };
+    if plan.is_no_op(guard.len()) {
+        count("no_op");
+        answer_resubscribe(ack, ResubscribeOutcome::Applied);
+        return SupervisorAction::Continue;
+    }
+    let deadline = tokio::time::Instant::now() + TOPUP_WIRE_BUDGET;
+    let per_message = guard.per_message();
+
+    // UNSUBSCRIBE FIRST. On depth-200 (one instrument) and on any socket at
+    // its cap, subscribing first asks for more than the cap and Dhan answers
+    // 804. The order is the safety property, on every socket kind.
+    let unsub = write_batches_in_place(
+        socket,
+        supervisor,
+        sink,
+        throttle,
+        InPlaceLeg::Unsubscribe,
+        plan.removed.chunks(per_message),
+        deadline,
+    )
+    .await;
+    // A timed-out unsubscribe counts as landed (see the doc above).
+    let removed_landed = unsub.sent.saturating_add(unsub.timed_out);
+    metrics::counter!(
+        INPLACE_INSTRUMENTS_METRIC,
+        "endpoint" => endpoint.as_str(),
+        "leg" => InPlaceLeg::Unsubscribe.as_str(),
+    )
+    .increment(removed_landed as u64);
+    if let Some(decided) = unsub.decided {
+        // The socket is going away; the replay sends the requested set.
+        count("replay_pending");
+        answer_resubscribe(ack, ResubscribeOutcome::ReplayPending);
+        return decided;
+    }
+    if unsub.failed || unsub.budget_exhausted {
+        // Never subscribe after an unsubscribe that did not finish: the socket
+        // may still hold what was meant to leave. Make the guard truthful.
+        let not_subscribed = guard.take_from(plan.subscribe_from);
+        let not_unsubscribed = plan.removed.get(removed_landed..).unwrap_or(&[]).to_vec();
+        guard.put_back(&not_unsubscribed);
+        publish_connection_instruments(&supervisor.slot(), guard.len());
+        count("stopped");
+        error!(
+            code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+            source = "inplace_unsubscribe_stopped",
+            endpoint = endpoint.as_str(),
+            pool_index = supervisor.slot().pool_index,
+            removed = plan.removed.len(),
+            removed_landed,
+            not_unsubscribed = not_unsubscribed.len(),
+            not_subscribed = not_subscribed.len(),
+            write_failed = unsub.failed,
+            "in-place resubscribe stopped in its UNSUBSCRIBE leg - nothing new was subscribed; \
+             the socket stays up and keeps every instrument it still holds, and both lists go \
+             back to the caller"
+        );
+        answer_resubscribe(
+            ack,
+            ResubscribeOutcome::Stopped {
+                not_unsubscribed,
+                not_subscribed,
+            },
+        );
+        return SupervisorAction::Continue;
+    }
+
+    let sub = write_batches_in_place(
+        socket,
+        supervisor,
+        sink,
+        throttle,
+        InPlaceLeg::Subscribe,
+        guard.batches_from(plan.subscribe_from),
+        deadline,
+    )
+    .await;
+    metrics::counter!(
+        INPLACE_INSTRUMENTS_METRIC,
+        "endpoint" => endpoint.as_str(),
+        "leg" => InPlaceLeg::Subscribe.as_str(),
+    )
+    .increment(sub.sent as u64);
+    if let Some(decided) = sub.decided {
+        count("replay_pending");
+        answer_resubscribe(ack, ResubscribeOutcome::ReplayPending);
+        return decided;
+    }
+    if sub.failed || sub.budget_exhausted {
+        let landed_until = plan.subscribe_from.saturating_add(sub.sent);
+        if landed_until == 0 {
+            // The unsubscribes landed and no subscribe did: the socket holds
+            // NOTHING. Keep the requested set in the guard and redial, as an
+            // emptied swap does — the replay delivers it, and a socket that
+            // carries nothing has nothing to lose to the redial.
+            count("emptied_redial");
+            error!(
+                code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                source = "inplace_emptied_socket",
+                endpoint = endpoint.as_str(),
+                pool_index = supervisor.slot().pool_index,
+                requested = guard.len(),
+                "in-place resubscribe left the socket holding nothing - redialling so the \
+                 replay subscribes the requested set"
+            );
+            answer_resubscribe(ack, ResubscribeOutcome::ReplayPending);
+            return supervisor.on_event(ConnEvent::SubscribeFailed, Instant::now());
+        }
+        let not_subscribed = guard.take_from(landed_until);
+        publish_connection_instruments(&supervisor.slot(), guard.len());
+        count("stopped");
+        error!(
+            code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+            source = "inplace_subscribe_stopped",
+            endpoint = endpoint.as_str(),
+            pool_index = supervisor.slot().pool_index,
+            subscribed = sub.sent,
+            not_subscribed = not_subscribed.len(),
+            write_failed = sub.failed,
+            "in-place resubscribe stopped in its SUBSCRIBE leg - the socket stays up carrying \
+             what reached it; the rest goes back to the caller to offer again"
+        );
+        // Every unsubscribe landed, so nothing is left to remove: the plan's
+        // own buffer, emptied, is that list (no new allocation).
+        let mut not_unsubscribed = plan.removed;
+        not_unsubscribed.clear();
+        answer_resubscribe(
+            ack,
+            ResubscribeOutcome::Stopped {
+                not_unsubscribed,
+                not_subscribed,
+            },
+        );
+        return SupervisorAction::Continue;
+    }
+    count("applied");
+    info!(
+        endpoint = endpoint.as_str(),
+        pool_index = supervisor.slot().pool_index,
+        unsubscribed = plan.removed.len(),
+        subscribed = sub.sent,
+        total = guard.len(),
+        "in-place resubscribe applied on the live socket - unsubscribe then subscribe, no redial"
+    );
+    publish_connection_instruments(&supervisor.slot(), guard.len());
+    answer_resubscribe(ack, ResubscribeOutcome::Applied);
+    SupervisorAction::Continue
 }
 
 /// Why a supervised connection loop returned.
@@ -6404,73 +7044,29 @@ where
                             // would pass every test and only ever fire in
                             // production, which is the worst of both.
                             let deadline = tokio::time::Instant::now() + TOPUP_WIRE_BUDGET;
-                            let mut sent = 0usize;
-                            let mut failed = false;
-                            let mut budget_exhausted = false;
+                            // The paced, bounded write loop is shared with the in-place
+                            // `Resubscribe` (scope lock 2026-10-02): one engine for every
+                            // change made on a live socket.
+                            let run = write_batches_in_place(
+                                socket,
+                                supervisor,
+                                sink,
+                                throttle,
+                                InPlaceLeg::Subscribe,
+                                guard.batches_from(start),
+                                deadline,
+                            )
+                            .await;
+                            let sent = run.sent;
+                            let budget_exhausted = run.budget_exhausted;
                             // Set when a socket event read in a pacing gap
                             // decided this socket's fate (a `Closed`). Handled
                             // exactly like a failed send: the guard keeps the
                             // whole set and the reconnect replay delivers it.
-                            let mut interrupted_by_socket = false;
-                            for batch in guard.batches_from(start) {
-                                if tokio::time::Instant::now() >= deadline {
-                                    budget_exhausted = true;
-                                    break;
-                                }
-                                // The write is awaited BESIDE `recv()`
-                                // (2026-09-22, plan item 44f), under the
-                                // same per-message budget as before.
-                                let ticket = socket.send_subscribe(batch);
-                                let wait = await_write(
-                                    socket,
-                                    supervisor,
-                                    sink,
-                                    throttle,
-                                    ticket,
-                                    Some(tokio::time::Instant::now() + SWAP_WIRE_BUDGET),
-                                )
-                                .await;
-                                if let Some(decided) = wait.socket_decision {
-                                    action = decided;
-                                    interrupted_by_socket = true;
-                                    failed = true;
-                                    break;
-                                }
-                                match wait.outcome {
-                                    Ok(Ok(())) => sent += batch.len(),
-                                    // A per-message timeout is a SICK SOCKET,
-                                    // not a failed send: treating it as the
-                                    // budget case keeps the guard truthful and
-                                    // lets the reconnect ladder do its job.
-                                    Err(WireElapsed) => {
-                                        budget_exhausted = true;
-                                        break;
-                                    }
-                                    Ok(Err(_)) => {
-                                        failed = true;
-                                        break;
-                                    }
-                                }
-                                // THE PACING GAP READS THE SOCKET (2026-09-22,
-                                // scope lock "2026-09-22 (FOURTH)" item 6).
-                                // Until then this was a bare 25 ms sleep, so a
-                                // 42-message top-up held the reader off
-                                // `recv()` for ~1 s of pacing alone — on the
-                                // main-feed socket, the busiest one we have.
-                                // The gap still paces the NEXT send exactly as
-                                // before; it now spends the wait draining
-                                // frames through the same handler the select
-                                // arm uses. Bounds: see `read_until`.
-                                let resume_at =
-                                    tokio::time::Instant::now() + SUBSCRIBE_BATCH_INTERVAL;
-                                if let Some(decided) =
-                                    read_until(socket, supervisor, sink, throttle, resume_at).await
-                                {
-                                    action = decided;
-                                    interrupted_by_socket = true;
-                                    failed = true;
-                                    break;
-                                }
+                            let interrupted_by_socket = run.decided.is_some();
+                            let failed = run.failed;
+                            if let Some(decided) = run.decided {
+                                action = decided;
                             }
                             if budget_exhausted {
                                 // Keep the guard honest: it is the reconnect
@@ -6572,6 +7168,25 @@ where
                             // Nothing to do and nothing lost.
                         }
                     }
+                }
+                Ok(LiveSubscriptionCommand::Resubscribe {
+                    unsubscribe,
+                    subscribe,
+                    ack,
+                }) => {
+                    // In place on any socket kind (scope lock 2026-10-02):
+                    // unsubscribe, then subscribe, on this open socket.
+                    action = apply_resubscribe(
+                        socket,
+                        supervisor,
+                        sink,
+                        throttle,
+                        guard,
+                        unsubscribe,
+                        subscribe,
+                        ack,
+                    )
+                    .await;
                 }
                 Ok(LiveSubscriptionCommand::Swap { old, new, ack }) => {
                     // THE 805 BREAKER, checked again where the write happens (scope
@@ -7631,7 +8246,8 @@ mod tests {
     /// reads as a stale count during the ones it skips — a parked socket
     /// still "holding 50" is the false-OK class. This pins every place the
     /// held set can change: the confirmed subscribe, the top-up success arm,
-    /// the dial (nothing held yet) and the park (nothing held any more).
+    /// the in-place resubscribe's three endings that keep the socket, the dial
+    /// (nothing held yet) and the park (nothing held any more).
     #[test]
     fn publish_connection_instruments_is_called_at_every_held_set_transition() {
         let src = include_str!("pool_supervisor.rs");
@@ -7665,8 +8281,10 @@ mod tests {
             })
             .count();
         assert_eq!(
-            sized, 2,
-            "the confirmed subscribe and the top-up arm must publish the live held count"
+            sized, 5,
+            "the confirmed subscribe, the top-up arm and the in-place resubscribe (applied, \
+             stopped in its unsubscribe leg, stopped in its subscribe leg) must publish the \
+             live held count"
         );
         assert!(
             src.contains("CONN_INSTRUMENTS_HELD_GAUGE: &str = \"tv_dhan_ws_conn_instruments\""),
@@ -11222,6 +11840,11 @@ mod tests {
         /// Frames the next `close` reads during its handshake and hands to
         /// the caller, as the production close does (2026-10-02).
         close_frames: Vec<Bytes>,
+        /// Every security id handed to `send_unsubscribe`, in order.
+        unsubscribed_ids: Vec<u64>,
+        /// `(kind, instruments)` per (un)subscribe message, in order — what
+        /// the in-place tests read to prove the 100-per-message split.
+        batch_sizes: Vec<(&'static str, usize)>,
     }
 
     struct FakeSocket {
@@ -11249,10 +11872,13 @@ mod tests {
             self.state.lock().map(|s| s.write_generation).unwrap_or(0)
         }
 
-        fn send_unsubscribe(&mut self, _batch: &[SubscribeInstrument]) -> WriteTicket {
+        fn send_unsubscribe(&mut self, batch: &[SubscribeInstrument]) -> WriteTicket {
             let (ok, delay) = match self.state.lock() {
                 Ok(mut s) => {
                     s.unsubscribes += 1;
+                    s.unsubscribed_ids
+                        .extend(batch.iter().map(|i| i.security_id));
+                    s.batch_sizes.push(("unsubscribe", batch.len()));
                     s.wire_calls.push("unsubscribe");
                     (
                         s.unsubscribe_results.pop_front().unwrap_or(true),
@@ -11280,6 +11906,7 @@ mod tests {
                 Ok(mut s) => {
                     s.subscribes += 1;
                     s.subscribed_ids.extend(batch.iter().map(|i| i.security_id));
+                    s.batch_sizes.push(("subscribe", batch.len()));
                     s.wire_calls.push("subscribe");
                     s.timeline.push("subscribe");
                     (
@@ -11372,6 +11999,7 @@ mod tests {
                 let drained = match state.lock() {
                     Ok(mut s) => {
                         s.closes += 1;
+                        s.batch_sizes.push(("close", 0));
                         std::mem::take(&mut s.close_frames)
                     }
                     Err(_) => Vec::new(),
@@ -13072,6 +13700,584 @@ mod tests {
              (7 messages); a top-up that kept sending after Closed shows more"
         );
         assert_eq!(sink.accepted.lock().map(|g| g.len()).unwrap_or(0), 1);
+    }
+
+    // ------------------------------------------------------------------
+    // In-place resubscribe on every socket kind (scope lock 2026-10-02)
+    // ------------------------------------------------------------------
+
+    fn ids(v: &[SubscribeInstrument]) -> Vec<u64> {
+        v.iter().map(|i| i.security_id).collect()
+    }
+
+    fn held_ids(g: &SubscribeGuard) -> Vec<u64> {
+        g.batches().flatten().map(|i| i.security_id).collect()
+    }
+
+    #[test]
+    fn test_try_resubscribe_removes_first_then_appends_the_new_tail() {
+        let mut g = SubscribeGuard::try_new(DhanEndpointType::MainFeed, instruments(10))
+            .expect("inside cap");
+        let plan = g
+            .try_resubscribe(&instruments(3), instruments_from(10, 2))
+            .expect("holds every unsubscribe");
+        assert_eq!(ids(&plan.removed), vec![0, 1, 2]);
+        assert_eq!(
+            plan.subscribe_from, 7,
+            "the new tail starts after the 7 kept"
+        );
+        assert_eq!(held_ids(&g), (3..12).collect::<Vec<u64>>());
+    }
+
+    #[test]
+    fn test_try_resubscribe_refuses_an_unsubscribe_it_does_not_hold_and_changes_nothing() {
+        let mut g = SubscribeGuard::try_new(DhanEndpointType::MainFeed, instruments(5))
+            .expect("inside cap");
+        let refusal = g
+            .try_resubscribe(&[si(0), si(99)], instruments_from(10, 1))
+            .expect_err("99 is not held");
+        assert!(matches!(
+            refusal,
+            SubscribeGuardRefusal::NotSubscribed { .. }
+        ));
+        assert_eq!(
+            held_ids(&g),
+            vec![0, 1, 2, 3, 4],
+            "a refusal must not half-apply"
+        );
+    }
+
+    #[test]
+    fn test_try_resubscribe_keys_on_security_id_and_segment() {
+        // I-P1-11: the same numeric id in another segment is another instrument.
+        let idx = SubscribeInstrument {
+            security_id: 27,
+            segment: ExchangeSegment::IdxI,
+        };
+        let eq = SubscribeInstrument {
+            security_id: 27,
+            segment: ExchangeSegment::NseEquity,
+        };
+        let mut g =
+            SubscribeGuard::try_new(DhanEndpointType::MainFeed, vec![idx]).expect("inside cap");
+        assert!(g.try_resubscribe(&[eq], Vec::new()).is_err());
+        let plan = g.try_resubscribe(&[idx], vec![eq]).expect("idx is held");
+        assert_eq!(plan.removed, vec![idx]);
+        assert_eq!(g.batches().flatten().copied().collect::<Vec<_>>(), vec![eq]);
+    }
+
+    #[test]
+    fn test_try_resubscribe_refuses_past_each_socket_kinds_cap() {
+        for (endpoint, cap) in [
+            (DhanEndpointType::MainFeed, 5_000_usize),
+            (DhanEndpointType::Depth20, 50),
+            (DhanEndpointType::Depth200, 1),
+        ] {
+            let mut g = SubscribeGuard::try_new(endpoint, instruments(cap)).expect("at the cap");
+            let refusal = g
+                .try_resubscribe(&[], instruments_from(cap, 1))
+                .expect_err("one more than the cap");
+            assert!(
+                matches!(refusal, SubscribeGuardRefusal::TooManyInstruments { .. }),
+                "{endpoint:?}: {refusal:?}"
+            );
+            assert_eq!(
+                g.len(),
+                cap,
+                "{endpoint:?}: a refusal leaves the guard untouched"
+            );
+            // Swapping one out for one in stays at the cap and is allowed.
+            let plan = g
+                .try_resubscribe(&instruments(1), instruments_from(cap, 1))
+                .expect("one out, one in");
+            assert_eq!(plan.removed.len(), 1);
+            assert_eq!(g.len(), cap, "{endpoint:?}");
+        }
+    }
+
+    #[test]
+    fn test_try_resubscribe_same_instrument_on_both_lists_is_a_no_op() {
+        let mut g =
+            SubscribeGuard::try_new(DhanEndpointType::Depth20, instruments(3)).expect("inside cap");
+        let plan = g
+            .try_resubscribe(&instruments(1), instruments(1))
+            .expect("held");
+        assert!(plan.is_no_op(g.len()), "{plan:?}");
+        assert_eq!(held_ids(&g), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn test_put_back_restores_without_duplicating() {
+        let mut g = SubscribeGuard::try_new(DhanEndpointType::MainFeed, instruments(3))
+            .expect("inside cap");
+        let _ = g
+            .try_resubscribe(&instruments(2), Vec::new())
+            .expect("held");
+        assert_eq!(held_ids(&g), vec![2]);
+        g.put_back(&[si(0), si(1), si(2)]);
+        assert_eq!(held_ids(&g), vec![2, 0, 1], "2 is not added twice");
+    }
+
+    #[test]
+    fn test_inplace_change_blocked_by_805_gates_depth_only_and_only_when_halted() {
+        for endpoint in [DhanEndpointType::Depth20, DhanEndpointType::Depth200] {
+            assert!(inplace_change_blocked_by_805(endpoint, true));
+            assert!(!inplace_change_blocked_by_805(endpoint, false));
+        }
+        assert!(!inplace_change_blocked_by_805(
+            DhanEndpointType::MainFeed,
+            true
+        ));
+        assert!(!inplace_change_blocked_by_805(
+            DhanEndpointType::MainFeed,
+            false
+        ));
+    }
+
+    /// A slow reader: every pacing-gap read times out without consuming, so
+    /// the scripted events reach the drain only after the command finished.
+    fn quiet_reader() -> FakeState {
+        FakeState {
+            recv_delay: Some(Duration::from_millis(100)),
+            ..FakeState::default()
+        }
+    }
+
+    /// The writes made before the socket's FIRST close. A close may only
+    /// come at the end (the run's teardown, after the scripted events run
+    /// out); one between the change's writes would be a redial in disguise.
+    fn writes_before_close(s: &FakeState) -> Vec<(&'static str, usize)> {
+        let first_close = s.batch_sizes.iter().position(|b| b.0 == "close");
+        if let Some(at) = first_close {
+            assert!(
+                s.batch_sizes
+                    .get(at..)
+                    .into_iter()
+                    .flatten()
+                    .all(|b| b.0 == "close"),
+                "nothing may be written after a close: {:?}",
+                s.batch_sizes
+            );
+        }
+        s.batch_sizes
+            .get(..first_close.unwrap_or(s.batch_sizes.len()))
+            .map(<[_]>::to_vec)
+            .unwrap_or_default()
+    }
+
+    /// Runs ONE `Resubscribe` on a live connection over the fake socket.
+    async fn run_one_resubscribe(
+        endpoint: DhanEndpointType,
+        held: Vec<SubscribeInstrument>,
+        unsubscribe: Vec<SubscribeInstrument>,
+        subscribe: Vec<SubscribeInstrument>,
+        state: FakeState,
+    ) -> (
+        std::sync::Arc<Mutex<FakeState>>,
+        Option<ResubscribeOutcome>,
+        ConnectionExit,
+    ) {
+        let st = std::sync::Arc::new(Mutex::new(state));
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(endpoint, held).expect("inside cap");
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let (ack_tx, mut ack_rx) = tokio::sync::oneshot::channel();
+        tx.send(LiveSubscriptionCommand::Resubscribe {
+            unsubscribe,
+            subscribe,
+            ack: Some(ack_tx),
+        })
+        .await
+        .expect("channel open");
+        drop(tx);
+        let exit = run_connection_with_commands(
+            fake(&st),
+            sup(endpoint, 0, t0()),
+            guard,
+            sink,
+            || async {},
+            Some(rx),
+        )
+        .await;
+        (st, ack_rx.try_recv().ok(), exit)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_main_feed_resubscribe_unsubscribes_then_subscribes_in_place_in_batches_of_100() {
+        let (st, ack, _) = run_one_resubscribe(
+            DhanEndpointType::MainFeed,
+            instruments(250),
+            instruments(150),
+            instruments_from(250, 250),
+            quiet_reader(),
+        )
+        .await;
+        assert_eq!(ack, Some(ResubscribeOutcome::Applied));
+        let s = st.lock().expect("fake state");
+        assert_eq!(s.connects, 1, "an in-place change never redials");
+        assert_eq!(
+            writes_before_close(&s),
+            vec![
+                ("subscribe", 100),
+                ("subscribe", 100),
+                ("subscribe", 50),
+                ("unsubscribe", 100),
+                ("unsubscribe", 50),
+                ("subscribe", 100),
+                ("subscribe", 100),
+                ("subscribe", 50),
+            ],
+            "the 3-message dial, then every unsubscribe BEFORE any subscribe, split at 100"
+        );
+        assert_eq!(s.unsubscribed_ids, (0..150).collect::<Vec<u64>>());
+        assert_eq!(
+            s.subscribed_ids.get(250..).map(<[u64]>::to_vec),
+            Some((250..500).collect::<Vec<u64>>()),
+            "only the NEW instruments are subscribed, never a re-send of the kept 100"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_depth20_resubscribe_unsubscribes_then_subscribes_in_place() {
+        let (st, ack, _) = run_one_resubscribe(
+            DhanEndpointType::Depth20,
+            instruments(50),
+            instruments(10),
+            instruments_from(50, 10),
+            quiet_reader(),
+        )
+        .await;
+        assert_eq!(ack, Some(ResubscribeOutcome::Applied));
+        let s = st.lock().expect("fake state");
+        assert_eq!(s.connects, 1, "an in-place change never redials");
+        assert_eq!(
+            writes_before_close(&s),
+            vec![("subscribe", 50), ("unsubscribe", 10), ("subscribe", 10)],
+            "unsubscribe then subscribe on the same socket, no close between"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_depth200_resubscribe_changes_its_one_contract_in_place() {
+        let (st, ack, _) = run_one_resubscribe(
+            DhanEndpointType::Depth200,
+            vec![si(1)],
+            vec![si(1)],
+            vec![si(2)],
+            quiet_reader(),
+        )
+        .await;
+        assert_eq!(ack, Some(ResubscribeOutcome::Applied));
+        let s = st.lock().expect("fake state");
+        assert_eq!(s.connects, 1);
+        assert_eq!(s.wire_calls, vec!["subscribe", "unsubscribe", "subscribe"]);
+        assert_eq!(
+            writes_before_close(&s),
+            vec![("subscribe", 1), ("unsubscribe", 1), ("subscribe", 1)],
+            "the one contract changes on the same socket, no close between"
+        );
+        assert_eq!(s.unsubscribed_ids, vec![1]);
+        assert_eq!(s.subscribed_ids, vec![1, 2]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_resubscribe_past_the_cap_is_refused_and_sends_nothing() {
+        let (st, ack, _) = run_one_resubscribe(
+            DhanEndpointType::Depth20,
+            instruments(50),
+            Vec::new(),
+            instruments_from(50, 1),
+            quiet_reader(),
+        )
+        .await;
+        assert_eq!(
+            ack,
+            Some(ResubscribeOutcome::Refused {
+                reason: ResubscribeOutcome::REASON_OVER_CAP
+            })
+        );
+        let s = st.lock().expect("fake state");
+        assert_eq!(s.unsubscribes, 0);
+        assert_eq!(s.subscribes, 1, "only the dial's own subscribe");
+        assert_eq!(s.connects, 1);
+    }
+
+    /// A genuine reconnect AFTER an in-place change replays the NEW set.
+    #[tokio::test(start_paused = true)]
+    async fn a_reconnect_after_an_in_place_change_replays_the_new_set() {
+        let state = FakeState {
+            // The close arrives after the dial (1 message) and the change's
+            // subscribe (1 message); the terminator after the replay (1).
+            recv_events: VecDeque::from(vec![SocketEvent::Closed { code: None }]),
+            recv_after_subscribes: VecDeque::from(vec![2]),
+            terminator_after_subscribes: 3,
+            ..quiet_reader()
+        };
+        let (st, ack, exit) = run_one_resubscribe(
+            DhanEndpointType::MainFeed,
+            instruments(3),
+            instruments(2),
+            instruments_from(10, 2),
+            state,
+        )
+        .await;
+        assert_eq!(ack, Some(ResubscribeOutcome::Applied));
+        assert_eq!(exit, ConnectionExit::Parked(ParkReason::FatalDisconnect));
+        let s = st.lock().expect("fake state");
+        assert_eq!(s.connects, 2, "the genuine close redials");
+        assert_eq!(
+            s.subscribed_ids.get(5..).map(<[u64]>::to_vec),
+            Some(vec![2, 10, 11]),
+            "the replay carries the set after the change, never the removed 0 and 1"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_resubscribe_whose_first_unsubscribe_is_refused_sends_no_subscribe() {
+        let state = FakeState {
+            unsubscribe_results: VecDeque::from(vec![false]),
+            ..quiet_reader()
+        };
+        let (st, ack, _) = run_one_resubscribe(
+            DhanEndpointType::MainFeed,
+            instruments(5),
+            instruments(2),
+            instruments_from(10, 2),
+            state,
+        )
+        .await;
+        assert_eq!(
+            ack,
+            Some(ResubscribeOutcome::Stopped {
+                not_unsubscribed: instruments(2),
+                not_subscribed: instruments_from(10, 2),
+            })
+        );
+        let s = st.lock().expect("fake state");
+        assert_eq!(
+            s.subscribes, 1,
+            "never subscribe after an unsubscribe that did not land"
+        );
+        assert_eq!(s.connects, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_resubscribe_whose_subscribe_stops_part_way_hands_the_rest_back() {
+        let state = FakeState {
+            // dial (3 messages) ok, then the change's 2nd subscribe fails.
+            subscribe_results: VecDeque::from(vec![true, true, true, true, false]),
+            ..quiet_reader()
+        };
+        let (st, ack, _) = run_one_resubscribe(
+            DhanEndpointType::MainFeed,
+            instruments(250),
+            instruments(50),
+            instruments_from(250, 300),
+            state,
+        )
+        .await;
+        assert_eq!(
+            ack,
+            Some(ResubscribeOutcome::Stopped {
+                not_unsubscribed: Vec::new(),
+                not_subscribed: instruments_from(350, 200),
+            })
+        );
+        let s = st.lock().expect("fake state");
+        assert_eq!(
+            s.connects, 1,
+            "a socket still carrying data is not torn down"
+        );
+        assert_eq!(s.subscribes, 5, "nothing is sent after the failed message");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_resubscribe_that_leaves_the_socket_empty_redials_with_the_new_set() {
+        let state = FakeState {
+            // dial ok, the change's subscribe fails, the replay succeeds.
+            subscribe_results: VecDeque::from(vec![true, false, true]),
+            terminator_after_subscribes: 3,
+            ..quiet_reader()
+        };
+        let (st, ack, _) = run_one_resubscribe(
+            DhanEndpointType::Depth200,
+            vec![si(1)],
+            vec![si(1)],
+            vec![si(2)],
+            state,
+        )
+        .await;
+        assert_eq!(ack, Some(ResubscribeOutcome::ReplayPending));
+        let s = st.lock().expect("fake state");
+        assert_eq!(s.connects, 2, "an emptied socket redials");
+        assert_eq!(
+            s.subscribed_ids,
+            vec![1, 2, 2],
+            "and the replay lands the new contract"
+        );
+    }
+
+    /// Only the counters a scoped recorder sees: the refusal is COUNTED.
+    #[derive(Clone, Default)]
+    struct InPlaceCounters {
+        counts: std::sync::Arc<Mutex<std::collections::HashMap<String, u64>>>,
+    }
+
+    struct InPlaceCounter {
+        key: String,
+        counts: std::sync::Arc<Mutex<std::collections::HashMap<String, u64>>>,
+    }
+
+    impl metrics::CounterFn for InPlaceCounter {
+        fn increment(&self, value: u64) {
+            if let Ok(mut m) = self.counts.lock() {
+                *m.entry(self.key.clone()).or_insert(0) += value;
+            }
+        }
+        fn absolute(&self, value: u64) {
+            if let Ok(mut m) = self.counts.lock() {
+                m.insert(self.key.clone(), value);
+            }
+        }
+    }
+
+    impl metrics::Recorder for InPlaceCounters {
+        fn describe_counter(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_gauge(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_histogram(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn register_counter(
+            &self,
+            key: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            let mut rendered = key.name().to_string();
+            for label in key.labels() {
+                rendered.push_str(&format!(",{}={}", label.key(), label.value()));
+            }
+            metrics::Counter::from_arc(std::sync::Arc::new(InPlaceCounter {
+                key: rendered,
+                counts: std::sync::Arc::clone(&self.counts),
+            }))
+        }
+        fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            metrics::Gauge::noop()
+        }
+        fn register_histogram(
+            &self,
+            _: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
+    #[test]
+    fn test_a_refused_over_cap_resubscribe_is_counted_per_endpoint() {
+        let recorder = InPlaceCounters::default();
+        metrics::with_local_recorder(&recorder, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .start_paused(true)
+                .build()
+                .expect("runtime");
+            let (_, ack, _) = runtime.block_on(run_one_resubscribe(
+                DhanEndpointType::MainFeed,
+                instruments(5_000),
+                Vec::new(),
+                instruments_from(5_000, 1),
+                quiet_reader(),
+            ));
+            assert_eq!(
+                ack,
+                Some(ResubscribeOutcome::Refused {
+                    reason: ResubscribeOutcome::REASON_OVER_CAP
+                })
+            );
+        });
+        let key = format!("{INPLACE_CHANGE_METRIC},endpoint=main_feed,outcome=refused_over_cap");
+        let counted = recorder
+            .counts
+            .lock()
+            .map(|m| m.get(&key).copied().unwrap_or(0))
+            .unwrap_or(0);
+        assert_eq!(counted, 1, "a cap refusal must be counted: {key}");
+    }
+
+    /// RATCHET: no deliberate close-and-redial remains for a subscription
+    /// change (scope lock 2026-10-01, extended to every socket kind on
+    /// 2026-10-02). The only deliberate redial reasons left are the
+    /// operator-armed probe (a measurement, off) and the main-feed 805
+    /// recovery probe (a fault recovery).
+    #[test]
+    fn no_deliberate_redial_remains_for_a_subscription_change() {
+        let src = include_str!("pool_supervisor.rs");
+        let prod = src.split(concat!("#[cfg(", "test)]")).next().unwrap_or(src);
+        for gone in [
+            concat!("RotateBy", "Redial"),
+            concat!("Ranked", "Rotation"),
+            concat!("Ghost", "Instrument"),
+            concat!("request_ghost", "_redial"),
+            concat!("Rotation", "Requested"),
+        ] {
+            assert!(!prod.contains(gone), "{gone} is back in production code");
+        }
+        let labels: Vec<&str> = ReconnectReason::ALL.iter().map(|r| r.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "dial_failed",
+                "subscribe_failed",
+                "disconnected",
+                "token_stale",
+                "idle_silence",
+                "probe_close",
+                "overflow_probe",
+            ],
+            "a new redial reason needs a dated quote in the scope lock first"
+        );
+        // The in-place engine: unsubscribe leg before subscribe leg, and the
+        // only supervisor event it raises is the emptied-socket fault redial.
+        let at = prod
+            .find("async fn apply_resubscribe")
+            .expect("the in-place engine");
+        let body = &prod[at..];
+        let body = &body[..body.find("\n}\n").unwrap_or(body.len())];
+        let unsub = body
+            .find("InPlaceLeg::Unsubscribe,")
+            .expect("unsubscribe leg");
+        let sub = body.find("InPlaceLeg::Subscribe,").expect("subscribe leg");
+        assert!(unsub < sub, "the unsubscribe leg must be written first");
+        assert_eq!(body.matches("supervisor.on_event(").count(), 1);
+        assert!(body.contains("supervisor.on_event(ConnEvent::SubscribeFailed"));
+        assert!(
+            !body.contains(".close("),
+            "an in-place change never closes the socket"
+        );
+        assert!(
+            body.contains("inplace_change_blocked_by_805(endpoint, rotation_halted())"),
+            "the 805 breaker is checked where the write happens"
+        );
+        // Both the Extend and the Resubscribe arms run the one wire engine:
+        // one Extend call plus the two Resubscribe legs.
+        assert_eq!(prod.matches("write_batches_in_place(").count(), 3);
     }
 
     /// The per-gap cap bounds a socket that is NEVER pending. Under a paused

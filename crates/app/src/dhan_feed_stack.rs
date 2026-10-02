@@ -18171,6 +18171,9 @@ mod tests {
                         operator-armed probe on a depth-200 socket, never to a top-up"
                 )
             }
+            LiveSubscriptionCommand::Resubscribe { .. } => {
+                panic!("a top-up sent a Resubscribe — it must only ever Extend")
+            }
         }
     }
 
@@ -18197,6 +18200,9 @@ mod tests {
                     "a top-up sent a ProbeUnsubscribe — that command belongs to the\
                         operator-armed probe on a depth-200 socket, never to a top-up"
                 )
+            }
+            LiveSubscriptionCommand::Resubscribe { .. } => {
+                panic!("a top-up sent a Resubscribe — it must only ever Extend")
             }
         }
     }
