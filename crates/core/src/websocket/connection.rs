@@ -2511,6 +2511,57 @@ mod tests {
         );
     }
 
+    /// The unsubscribe half of an in-place change (scope lock 2026-10-02):
+    /// the main feed's code follows the feed mode (16/18/22), depth-20 is 25,
+    /// ids stay strings, and one message carries at most 100 instruments.
+    #[test]
+    fn test_build_unsubscribe_payload_codes_and_per_message_cap() {
+        let batch = |n: u32| -> Vec<SubscribeInstrument> {
+            (0..n)
+                .map(|i| SubscribeInstrument {
+                    security_id: SecurityId::from(1_000 + i),
+                    segment: ExchangeSegment::NseFno,
+                })
+                .collect()
+        };
+        let code = |endpoint, mode, n| -> Option<u64> {
+            let payload = build_unsubscribe_payload(endpoint, mode, &batch(n)).ok()?;
+            let json: serde_json::Value = serde_json::from_str(&payload).ok()?;
+            json.get("RequestCode")?.as_u64()
+        };
+        assert_eq!(
+            code(DhanEndpointType::MainFeed, FeedMode::Ticker, 1),
+            Some(16)
+        );
+        assert_eq!(
+            code(DhanEndpointType::MainFeed, FeedMode::Quote, 1),
+            Some(18)
+        );
+        assert_eq!(
+            code(DhanEndpointType::MainFeed, FeedMode::Full, 100),
+            Some(22)
+        );
+        assert_eq!(
+            code(DhanEndpointType::Depth20, FeedMode::Full, 50),
+            Some(25)
+        );
+        let payload =
+            build_unsubscribe_payload(DhanEndpointType::MainFeed, FeedMode::Quote, &batch(1))
+                .expect("one instrument builds");
+        assert!(
+            payload.contains("\"1000\""),
+            "SecurityId is a string: {payload}"
+        );
+        assert_eq!(
+            build_unsubscribe_payload(DhanEndpointType::MainFeed, FeedMode::Quote, &batch(101)),
+            Err(SubscribePayloadError::BatchSplit {
+                instruments: 101,
+                messages: 2
+            }),
+            "101 instruments must never go out as one message"
+        );
+    }
+
     const FAKE_TOKEN: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMTA2NjU2ODgyIn0.sig";
 
     /// The main-feed base with a trailing slash, for the trim test.

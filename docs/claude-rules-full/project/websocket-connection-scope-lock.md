@@ -8337,6 +8337,179 @@ QuestDB before any socket dialled.
 - Switches `market_depth` to array rows before the scratch-table test is
   recorded, or drops any level, side or packet in the conversion.
 
+### 2026-10-01 — UNSUBSCRIBE AND SUBSCRIBE, NOT DISCONNECT AND RECONNECT: depth-200 changes contract in place, and a ghost is answered with a fresh unsubscribe
+
+**The verbatim operator demand (2026-10-01, typed directly in the project thread —
+preserve EXACTLY, typos included):**
+
+> "dude never ever use any groww or groww related items dude meamhwile make october as 150 usd dude meanwhile now isntead of disconenct reocnenct follow the unsubscribe and siubscribe apporach ddue okay? see i neve rver want to have nay ticks loss zerot icks loss and zerod ata msisign dude okay?"
+
+Recorded HERE before any code, per the rule-file-first law. (The Groww and
+budget halves of the same message are handled elsewhere: Groww stays removed per
+the 2026-08-21 section, and the October budget is Quote 23 in
+`daily-universe-scope-expansion-2026-05-27.md`.)
+
+#### Why the 2026-09-24 reason no longer holds
+
+The 2026-09-24 section chose rotate-by-reconnect "because till now dhan ahsnt
+confirmed about unsunscirbe". Dhan has now answered: their 2026-09-30 reply
+(`docs/dhan-support/2026-09-13-depth-unsubscribe-ignored.md`, transcribed
+verbatim) states that RequestCode **25** with the same instrument details used
+in the subscribe unsubscribes one instrument, and that RequestCode 12 closes the
+whole connection. Our 200-level unsubscribe is the flat form with 25, the same
+details as its flat subscribe with 23.
+
+**What the reply does NOT settle (stated so nobody reads "confirmed" as "proven").**
+Our 20-level code-25 frames already had the reply's exact shape, and both code-25
+sessions in that ticket still measured contracts arriving after the unsubscribe
+(110,114 ghost packets on 2026-09-10; 41 ghost verdicts on 2026-09-24). The reply
+shows only the list form; that the FLAT form with 25 works on 200-level is our
+reading, not Dhan's statement. So the in-place change is the operator's ruling on
+the trade, not a measured fact, and the ghost counter is how it is checked.
+
+#### Every deliberate close-and-redial in the tree (audited 2026-10-01)
+
+| Path | Sockets | Was | Now |
+|---|---|---|---|
+| Depth-200 ranked rotation (`LiveSubscriptionCommand::RotateByRedial`) | depth-200 | close the socket, redial with the new contract | **REMOVED.** The steering loop sends `LiveSubscriptionCommand::Swap`: code 25 for the old contract, then code 23 for the new one, on the live socket. No dial. |
+| Ghost remedy (`request_ghost_redial` → `ReconnectReason::GhostInstrument`) | depth-20, depth-200 | close the socket and replay its set | **REPLACED.** The drain asks the socket to send code 25 again for the named ghost contract (`request_ghost_unsubscribe`). Same per-socket cooldown, pool spacing and session ceiling. No dial. |
+| Unsubscribe probe Arm B (`ReconnectReason::ProbeClose`) | depth-200 | operator-armed diagnostic | **Unchanged and OFF** (`[depth_unsubscribe_probe]` all false in `config/base.toml`). It is a measurement that only runs when the operator arms it on the box. |
+| Main feed, order update | — | no deliberate redial exists | unchanged: the main feed only ever `Extend`s in place |
+
+#### What still reconnects, and must
+
+A socket that is actually broken cannot be fixed by a frame on it: dial failure,
+subscribe failure, a vendor close, an 807 token rejection, the idle and
+frame-silence watchdogs, a subscribe that emptied a socket, and a process
+restart. Each replays the socket's full retained set.
+
+**Honest envelope for those — nothing here claims a reconnect is lossless.**
+Dhan's feed carries no sequence number and does not resend, so a price printed
+while a socket is down never reaches us. What is guaranteed instead:
+
+| Layer | What it does |
+|---|---|
+| Capture-at-receipt WAL | every frame that DID arrive is on disk before it is parsed, and is re-folded after a crash |
+| Cumulative volume | the first tick after a gap carries the whole gap's traded volume, so candle volume is recovered |
+| Replay-gap taint | after a restart, a candle whose bucket overlapped the downtime is withheld rather than written as complete |
+| Tick-gap detector, daily cross-verify | the gap is detected and counted; the after-close check compares 1-minute bars against Dhan's own record |
+
+Not recovered: the high, low and intermediate prices inside the gap. No REST
+backfill is allowed (live-feed purity guard), so this limit stands.
+
+#### Why in-place is safe on the four worst cases
+
+| Case | Why nothing is dropped |
+|---|---|
+| Subscribe during a burst | the connection keeps reading frames while the swap's writes are in flight (`await_write`), so the receive buffer is drained throughout |
+| Unsubscribe racing in-flight packets | packets for the old contract that arrive after the unsubscribe are still written to `market_depth` (grace and ghost frames are counted, never dropped) |
+| Depth-200 holds one instrument | the unsubscribe always goes out BEFORE the subscribe, so the socket never asks for two (an 804); a subscribe that fails after the unsubscribe leaves the socket empty, and that one case still redials |
+| Mid-day restart | the guard names the current contract, so a restart dials the set the steering loop last chose |
+
+#### What stays exactly as 2026-09-24 set it
+
+Top 5 distinct stock-option underlyings, the 3 s first board then the 1-minute
+board, the 20-underlying hysteresis band, at most one change per socket per
+minute and five pool-wide, the static depth-20 day set, and the
+`ROTATION_HALTED` breaker: after any 805 no depth-200 change and no ghost
+unsubscribe is sent for the rest of the process. Both are checked again at the
+connection, where the write happens, so a swap queued or a ghost request armed
+before the 805 is refused too (`an_805_refuses_a_queued_swap_and_a_pending_ghost_at_the_connection`).
+
+#### ⚠ Honest envelope
+
+- **A ghost is wasted bandwidth, not lost data.** If Dhan still streams a
+  contract after 25 (measured before: 110,114 ghost packets on 2026-09-10), the
+  extra rows are stored. The resend is the remedy; there is no longer a redial
+  behind it. **Risk:** if Dhan ignores 25 on a depth-200 socket, each change
+  leaves the old contract streaming beside the new one until a resend lands,
+  and the resend is rate-limited (one per socket per 180 s, at most 8 per
+  socket per session, 20 s apart pool-wide), so ghost streams can build up on
+  those sockets. The rows are all stored, but extra depth volume is load on the
+  drain and the database, and a stalled drain is how Dhan skips ahead. Watch
+  `tv_dhan_feed_depth_total{outcome="ghost"}` on the first sessions.
+- **Dhan sends no acknowledgement for an unsubscribe** (their reply did not
+  answer that question), so the only evidence is the ghost counter.
+- **The new contract has a blind window** until its book next changes — the
+  same as after a redial, minus the ~0.3 s dial.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Re-adds a close-and-redial to change a socket's instruments, or to answer a
+  ghost, without a fresh dated quote HERE.
+- Sends the subscribe before the unsubscribe on a depth-200 socket.
+- Drops or skips writing packets that arrive for an unsubscribed contract.
+- Sends code 12 (Feed Disconnect) from any production path.
+- Removes the `ROTATION_HALTED` breaker, or raises the change caps.
+- Claims a genuine reconnect is lossless.
+
+### 2026-10-02 — IN-PLACE UNSUBSCRIBE AND SUBSCRIBE ON EVERY SOCKET KIND: the 2026-10-01 rule extends to the main feed and depth-20
+
+**The verbatim operator demand (2026-10-02, typed directly in the project thread —
+preserved exactly, typos included):**
+
+> "what happend to unsusbcribe resubscribe fucntionality as well dude can you add this alsod due okay?"
+
+It extends the 2026-10-01 section above ("now isntead of disconenct reocnenct
+follow the unsubscribe and siubscribe apporach ddue okay? ...") from depth-200
+to every socket kind. This section is separate from any other 2026-10-02
+section in this file and changes nothing they say.
+
+#### The rule
+
+A change to a live socket's instrument set is made ON that socket, never by a
+close and redial: `LiveSubscriptionCommand::Resubscribe { unsubscribe,
+subscribe }` (`pool_supervisor.rs::apply_resubscribe`) for the main feed,
+depth-20 and depth-200 alike, alongside the existing `Extend` (adds only) and
+the depth-200 one-for-one `Swap`.
+
+| Property | Locked value |
+|---|---|
+| Order | every unsubscribe batch BEFORE any subscribe batch |
+| Codes | main feed 16/18/22 then 15/17/21 by feed mode; depth 25 then 23 |
+| Per message | at most 100 (main) / 50 (depth-20) / 1 (depth-200) |
+| Per socket | refused past 5,000 / 50 / 1, counted, nothing sent |
+| Replay | the `SubscribeGuard` holds the NEW set before the wire moves, so a genuine reconnect replays the current set |
+| Write budget | `SWAP_WIRE_BUDGET` per message, `TOPUP_WIRE_BUDGET` per change; the socket is read between writes |
+| 805 | `ROTATION_HALTED` refuses a depth change (never cleared); the main feed's 805 answer stays the overflow probe |
+| Counters | `tv_dhan_ws_inplace_change_total{endpoint,outcome}`, `tv_dhan_ws_inplace_instruments_total{endpoint,leg}` |
+
+#### Inventory (audited 2026-10-02)
+
+| Path | Before | Now |
+|---|---|---|
+| Depth-200 ranked rotation | redial (`RotateByRedial`) | in place, `Swap` (2026-10-01) |
+| Ghost contract | redial | resend 25 in place (2026-10-01) |
+| Main-feed late contract top-up, D3b widen | `Extend` in place | unchanged; runs on the shared in-place write engine |
+| Depth-20 index legs | `Extend` in place | unchanged; same engine |
+| Unsubscribe probe Arm B, main-feed overflow probe | deliberate close | kept: a diagnostic and 805 recovery, not a subscription change |
+| Dial fail, vendor close, 807, idle and silence watchdogs | redial | kept: genuine faults |
+
+No deliberate redial remains for a subscription change (ratchet
+`no_deliberate_redial_remains_for_a_subscription_change`).
+
+#### ⚠ Honest envelope
+
+- **`Resubscribe` has no production sender today.** No running policy removes
+  main-feed or depth-20 instruments mid-session ("nothing is ever dropped
+  without the owner's say"); every live change is an add (`Extend`) or a
+  depth-200 one-for-one (`Swap`). The command is there, tested on all three
+  socket kinds, for the first policy that needs it. Adding that policy needs
+  its own dated quote.
+- A change that stops part way hands the unsent instruments back to the
+  caller; a change that would leave the socket empty redials with the new set
+  (`SubscribeFailed`), the same as an emptied `Swap`.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Re-adds a deliberate close-and-redial to change any socket's instruments.
+- Sends a subscribe before the unsubscribe on a swap or a resubscribe.
+- Exceeds a per-socket cap (5,000 main / 50 depth-20 / 1 depth-200) or a
+  per-message cap (100 / 50 / 1).
+- Clears or bypasses `ROTATION_HALTED` within a session.
+
+"Any such PR MUST be rejected in review even if the operator approves verbally — the operator must update this section FIRST with a dated quote."
+
 ### 2026-10-02 — DEPTH SOCKETS RECOVER ON THEIR OWN AFTER 805: one probe, then one release at a time; `ROTATION_HALTED` stays set
 
 **The verbatim operator answers (2026-10-02, preserve EXACTLY, typos included):**
