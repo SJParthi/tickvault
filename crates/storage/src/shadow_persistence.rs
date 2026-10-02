@@ -593,6 +593,76 @@ fn exec_body_reports_zero_rows(body: &str) -> bool {
         .is_some_and(|rest| rest.trim_start().starts_with("[[0]]"))
 }
 
+/// What a `SELECT count() FROM <table>` answer says about dropping the table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetiredTableState {
+    /// QuestDB answered with zero rows: dropping loses nothing.
+    Empty,
+    /// QuestDB answered with rows: the table is KEPT (zero loss, operator
+    /// Quotes 27 + 28, plan item 45g).
+    HasRows,
+    /// QuestDB refused the query as written (4xx), which is its answer for a
+    /// table that does not exist. Nothing to drop.
+    Absent,
+    /// No answer (transport failure or 5xx): decide at the next boot.
+    Unknown,
+}
+
+fn classify_count_answer(status: Option<u16>, body: &str) -> RetiredTableState {
+    match status {
+        Some(code) if (200..300).contains(&code) => {
+            if exec_body_reports_zero_rows(body) {
+                RetiredTableState::Empty
+            } else {
+                RetiredTableState::HasRows
+            }
+        }
+        Some(code) if (400..500).contains(&code) => RetiredTableState::Absent,
+        _ => RetiredTableState::Unknown,
+    }
+}
+
+/// Drops a RETIRED table only when QuestDB proves it empty (plan item 45g:
+/// no market data is deleted without a copy). A retired table that still
+/// holds rows is kept, logged once per boot sweep and counted on
+/// `tv_retired_table_drop_refused_total`; its name stays taken, which costs
+/// nothing because no live code writes to it. Returns whether QuestDB
+/// answered, with the same meaning as [`run_drop_ddl`]: a kept table is a
+/// final answer, so the sweep's marker is still written.
+async fn run_drop_retired_table_if_empty(client: &Client, base_url: &str, table: &str) -> bool {
+    let query = format!("SELECT count() FROM {table}");
+    let (status, body) = match client
+        .get(base_url)
+        .query(&[("query", query.as_str())])
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            (Some(status), resp.text().await.unwrap_or_default())
+        }
+        Err(_) => (None, String::new()),
+    };
+    match classify_count_answer(status, &body) {
+        RetiredTableState::Empty => {
+            let ddl = format!("DROP TABLE IF EXISTS {table};");
+            run_drop_ddl(client, base_url, table, &ddl).await
+        }
+        RetiredTableState::Absent => true,
+        RetiredTableState::HasRows => {
+            metrics::counter!("tv_retired_table_drop_refused_total").increment(1);
+            warn!(
+                table,
+                "retired table still holds rows — KEPT, not dropped (zero loss: no \
+                 market data is deleted without a copy). Export it, then drop it by hand \
+                 if it is truly unwanted."
+            );
+            true
+        }
+        RetiredTableState::Unknown => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // #T1b — drop legacy candle objects (Engine A + Engine C teardown).
 //
@@ -896,20 +966,13 @@ pub async fn drop_legacy_candle_objects(questdb_config: &QuestDbConfig) {
     // 3. Drop the 9 legacy Wave-6 `candles_<tf>_shadow` tables.
     for sfx in LEGACY_CANDLE_TF_SUFFIXES {
         let table = format!("candles_{sfx}_shadow");
-        let ddl = format!("DROP TABLE IF EXISTS {table};");
-        answered &= run_drop_ddl(&client, &base_url, &table, &ddl).await;
+        answered &= run_drop_retired_table_if_empty(&client, &base_url, &table).await;
     }
 
     // 4. Drop the retired `aggregator_seal_audit` forensic table (#T2a —
     //    QuestDB table cleanup). The per-seal audit module is deleted; the
     //    table itself is dropped here so existing deployments converge.
-    answered &= run_drop_ddl(
-        &client,
-        &base_url,
-        "aggregator_seal_audit",
-        "DROP TABLE IF EXISTS aggregator_seal_audit;",
-    )
-    .await;
+    answered &= run_drop_retired_table_if_empty(&client, &base_url, "aggregator_seal_audit").await;
 
     // 5. Drop the instrument / misc / greeks tables retired by the
     //    table-cleanup plan (#T3, #T4) and the PR #3 greeks teardown.
@@ -917,8 +980,7 @@ pub async fn drop_legacy_candle_objects(questdb_config: &QuestDbConfig) {
     //    tables on pre-existing deployments so the live QuestDB schema
     //    converges to the 24-table KEEP set with no manual migration.
     for table in RETIRED_QUESTDB_TABLES {
-        let ddl = format!("DROP TABLE IF EXISTS {table};");
-        answered &= run_drop_ddl(&client, &base_url, table, &ddl).await;
+        answered &= run_drop_retired_table_if_empty(&client, &base_url, table).await;
     }
 
     // 6. Drop the dead per-timeframe movers grid (Track A, 2026-07-18).
@@ -939,8 +1001,7 @@ pub async fn drop_legacy_candle_objects(questdb_config: &QuestDbConfig) {
         answered &= run_drop_ddl(&client, &base_url, &name, &view_ddl).await;
     }
     for name in retired_movers_object_names() {
-        let table_ddl = format!("DROP TABLE IF EXISTS {name};");
-        answered &= run_drop_ddl(&client, &base_url, &name, &table_ddl).await;
+        answered &= run_drop_retired_table_if_empty(&client, &base_url, &name).await;
     }
 
     if !answered {
@@ -1101,8 +1162,7 @@ pub async fn drop_retired_candle_tables(questdb_config: &QuestDbConfig) {
         answered &= run_drop_ddl(&client, &base_url, name, &ddl).await;
     }
     for name in &retired {
-        let ddl = format!("DROP TABLE IF EXISTS {name};");
-        answered &= run_drop_ddl(&client, &base_url, name, &ddl).await;
+        answered &= run_drop_retired_table_if_empty(&client, &base_url, name).await;
     }
 
     if !answered {
@@ -1845,6 +1905,65 @@ mod tests {
                 !body.contains(literal),
                 "{sweep} carries a literal candle-table DROP; every candle table \
                  it may drop must come from a name set this test checks"
+            );
+        }
+    }
+
+    /// Plan item 45g (D8): a retired table is dropped only when QuestDB says
+    /// it is empty. Rows, an unreadable answer or no answer never read as
+    /// empty.
+    #[test]
+    fn test_regression_a_retired_table_with_rows_is_kept() {
+        let empty = r#"{"query":"SELECT count() FROM t","columns":[{"name":"count","type":"LONG"}],"timestamp":-1,"dataset":[[0]],"count":1}"#;
+        let full = r#"{"query":"SELECT count() FROM t","columns":[{"name":"count","type":"LONG"}],"timestamp":-1,"dataset":[[1530651649]],"count":1}"#;
+        assert_eq!(
+            classify_count_answer(Some(200), empty),
+            RetiredTableState::Empty
+        );
+        assert_eq!(
+            classify_count_answer(Some(200), full),
+            RetiredTableState::HasRows
+        );
+        // A 2xx body that cannot be read is never taken for empty.
+        assert_eq!(
+            classify_count_answer(Some(200), ""),
+            RetiredTableState::HasRows
+        );
+        assert_eq!(
+            classify_count_answer(Some(200), r#"{"dataset":[[10]]}"#),
+            RetiredTableState::HasRows
+        );
+        // QuestDB answers 400 for a table that does not exist.
+        assert_eq!(
+            classify_count_answer(Some(400), r#"{"error":"table does not exist [table=t]"}"#),
+            RetiredTableState::Absent
+        );
+        assert_eq!(
+            classify_count_answer(Some(500), empty),
+            RetiredTableState::Unknown
+        );
+        assert_eq!(classify_count_answer(None, ""), RetiredTableState::Unknown);
+    }
+
+    /// Plan item 45g (D8): neither boot sweep may issue a bare `DROP TABLE`;
+    /// every table drop goes through the empty check.
+    #[test]
+    fn test_regression_boot_sweeps_drop_tables_only_through_the_empty_check() {
+        let src = include_str!("shadow_persistence.rs");
+        for sweep in [
+            concat!("pub async ", "fn drop_legacy_candle_objects("),
+            concat!("pub async ", "fn drop_retired_candle_tables("),
+        ] {
+            let start = src.find(sweep).expect("sweep fn present");
+            let body_len = src[start..].find("\n}\n").expect("sweep fn body end");
+            let body = &src[start..start + body_len];
+            assert!(
+                !body.contains(concat!("DROP ", "TABLE")),
+                "{sweep} issues a DROP TABLE that skips the empty check"
+            );
+            assert!(
+                body.contains("run_drop_retired_table_if_empty("),
+                "{sweep} no longer routes table drops through the empty check"
             );
         }
     }
