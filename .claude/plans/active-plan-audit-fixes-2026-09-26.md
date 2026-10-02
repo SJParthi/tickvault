@@ -2148,28 +2148,85 @@ Owner: "see i dont want any ticks loss or single data loss". Every path a tick t
   - Tests: `test_regression_combined_error_filter_keeps_the_error_level_hint`,
     `test_wal_catchup_lag_step_covers_every_permutation`.
 
-Open (found, not fixed here; each needs its own design):
+Second round, 2026-10-02 (owner: "yes fix evrryhtign ddue okay?", then "approved entirley fully
+auotmate ddue okay?"):
 
-- [ ] **Z6 — the candle spill ledger can let an older candle overwrite a fuller one.** (`storage`)
-  One bucket per key, recorded only after the disk write: a later bucket spilled through the
-  producer path, an original still in the escalation queue, a DLQ'd original, or a parked file
-  replayed after a later bucket each let replay write the older copy. Silent. Fix shape: keep the
-  fullest copy per (key, bucket) at replay. The PR41a/PR41b honest-limit texts understate this.
-- [ ] **Z7 — a rescue batch is not marked unapplied (PR32).** (`storage`) A crash after a later
-  batch's acknowledgement loses it uncounted.
-- [ ] **Z8 — durability below the watermark.** (`storage`, deploy) Tick spill files are not synced
-  and the QuestDB commit mode is unset, while the applied watermark is synced.
-- [ ] **Z9 — data with no stored copy is pruned.** WAL active/archive prunes, the seal-spill and
-  quarantine prunes, the retired-table drops and the console wipes delete without an S3 copy;
-  the cold bucket still expires after 1825 days with no versioning. Owned by feed-hardening 45e,
-  45f, 45g, 45h.
-- [ ] **Z10 — a full WAL disk can deadlock replay.** Replay refuses below 40 GiB free and the prune
-  refuses unapplied segments; the exit is 45e (upload, then prune).
-- [ ] **Z11 — smaller loss paths.** A mid-segment WAL corruption abandons the rest of the segment
-  (no resync); a writer panic aborts the process with the queue unwritten (`panic = "abort"`,
-  the respawn is test-only); an oversize frame is counted but not alarmed; a mid-session stop
-  never closes the sockets before the WAL shutdown.
-- [ ] **Z12 — CLAUDE.md speed table rows.** `connection.rs::classify_frame` is O(packets) on the
+- [x] **Z6 — a replayed candle never replaces a fuller copy of its bar.** (`storage`, commit
+  `ed4ded9fd`) The PR41a ledger is now one entry per bar (slot and bucket), holding the fullest copy
+  on disk and the fullest committed; every rule is a max, so the result does not depend on the order
+  copies reach the disk. Covers the four paths found: a later bucket spilled first, an original
+  still in the escalation queue, a dead-lettered original, a parked file resumed after a later one.
+  The boot drain keeps the fullest copy per bar across spill and DLQ. Pre-sized, never grows; at
+  capacity it writes and counts (`kind=mirrored_overflow`, `untracked`, `boot_untracked`).
+  **Honest limit:** a DLQ write does not consult the ledger before writing (it records after); a
+  key the ledger could not track at capacity still replays in file order.
+  - Files: crates/storage/src/{seal_spill_ledger,seal_spill,seal_writer_task,seal_writer_runner,seal_absorption,seal_writer_loop}.rs
+  - Tests: `test_regression_z6_later_bucket_spilled_does_not_hide_amend`,
+    `test_regression_z6_original_in_escalation_queue_is_not_written_after_live_amend`,
+    `test_regression_z6_dead_lettered_original_mirrors_live_amend`,
+    `test_regression_z6_parked_file_resumed_after_later_bucket_skips_older_copy`,
+    `test_regression_z6_boot_drain_keeps_fullest_across_spill_and_dlq_with_intervening_bucket`,
+    `test_regression_z6_ledger_at_capacity_fails_toward_writing`.
+- [x] **Z7 — a queued rescue batch holds the persisted watermark below it.** (`storage`, commit
+  `b9ef33dda`) The drain holds a floor (fixed 8-slot CAS table per sink, no allocation, no lock)
+  before handing a batch to the rescue thread, retracts it if the hand-off is refused, and the
+  rescue thread releases it only after the spill is synced or the range is marked unapplied. A full
+  table marks the range unapplied and counts `tv_wal_rescue_floor_full_total`.
+  - Files: crates/storage/src/{wal_applied_watermark,tick_persistence,depth_persistence}.rs
+  - Tests: `test_regression_tick_queued_rescue_holds_a_floor_until_the_rescue_thread_settles_it`,
+    `test_regression_depth_queued_rescue_holds_a_floor_until_the_rescue_thread_settles_it`,
+    `test_regression_tick_refused_rescue_hand_off_retracts_its_floor`,
+    `test_regression_an_abandoned_rescue_survives_into_the_persisted_file`; DHAT
+    `dhat_rescue_floor_zero_alloc` (CI storage DHAT step 3 → 4).
+- [x] **Z8 — durability below the watermark.** (`storage`, commit `b9ef33dda`) (a) The writer-thread
+  and rescue-thread spills `fdatasync` before a batch counts as rescued; a failed sync is a failed
+  rescue. (b) QuestDB stays on its default commit mode (sync measured 6–8× slower per flush);
+  instead the persisted watermark is the value acknowledged at least
+  `WATERMARK_DURABILITY_LAG_SECS` (60 s) earlier. **Honest limits:** (b) relies on kernel writeback
+  timing, not an fsync of QuestDB's files; the drain's own inline spill stays unsynced so the drain
+  never waits on the disk; `confirm_replayed` archives on the acknowledgement.
+  - Tests: `test_regression_persisted_watermark_lags_acks_by_the_durability_lag`,
+    `test_regression_tick_rescue_sink_reports_a_failed_sync_as_a_failed_rescue`,
+    `spill_rescue_sync_guard.rs::the_spill_helper_fdatasyncs`.
+- [~] **Z9 — data with no stored copy is pruned.** PARTLY DONE.
+  - 45f done (`7fae8d31b`): the cold bucket has versioning, no expiration, `raw-frames/` goes to
+    DEEP_ARCHIVE. Test `test_terraform_cold_bucket_keeps_everything`.
+  - 45e-1 done (`66c3f8cd2`, `25c78fd65`): every WAL prune (age, byte ceiling, 5% floor) deletes a
+    segment only after a gzip copy is in `s3://<cold>/raw-frames/<IST date>/` and verified by
+    HeadObject (size + SHA-256); refusals counted on `tv_wal_prune_refused_not_uploaded_total`.
+    Tests `test_regression_age_prune_needs_a_matching_upload_marker`,
+    `test_regression_byte_prune_refuses_segments_without_a_verified_copy`,
+    `test_regression_floor_prune_needs_a_verified_copy_too`,
+    `test_regression_size_mismatch_after_upload_writes_no_marker`.
+  - 45g D7 (`9e2e86535`, a table with rows is renamed aside, never dropped), D8 (`8f4bcc857`, a
+    retired table is dropped only when a count proves it empty), D10 (`a229cb398`, the console
+    refuses every data-deleting action, `CONSOLE_DATA_WIPES_AUTHORIZED = false`) done.
+  - Open: 45e-2 (offload / re-hydrate), the seal-spill and quarantine prunes (D5/D6), 45h.
+  - **Trade-off chosen (default):** the prune gate fails CLOSED. If the bucket is unreachable for
+    days, the WAL disk fills instead of deleting an uncopied segment. Turning it off needs
+    `[raw_frame_archive] require_upload_before_prune = false`.
+- [~] **Z10 — a full WAL disk can deadlock replay.** PARTLY DONE: the uploader runs every 2 minutes
+  outside 09:00–15:40 IST and at once on disk pressure, so verified segments become prunable. Still
+  open: if S3 is also unreachable, replay below 40 GiB free still waits (45e-2).
+- [~] **Z11 — smaller loss paths.**
+  - [x] (a) WAL replay resyncs past a bad record instead of abandoning the rest of the segment
+    (`9714b4de2`, `65c306dbb`): `decode_record_at`, resync ceiling `WAL_RESYNC_MAX_FRAME_BYTES`
+    (4 MiB, const-asserted against every WAL-bound frame cap), skipped bytes counted and logged
+    (WS-SPILL-02 `source="mid_segment_resync"`). Tests
+    `test_regression_resync_recovers_records_after_a_mid_segment_crc_flip`,
+    `test_regression_corrupt_length_past_eof_is_counted_not_a_silent_tail`.
+  - [ ] (b) a writer panic drains the WAL queue before the abort; (c) an oversize frame logs a coded
+    `error!`; (d) a mid-session stop closes the sockets before the WAL shutdown.
+- [x] **Waste found by the sweep, fixed.** (`app`, `core`, `api`) The per-minute depth steering no
+  longer loads ~22,000 candidates and the movers every minute (`3b1adb524`; `plan_minute`,
+  `top_mover_pick` deleted; guard `the_steering_loop_runs_no_per_minute_candidate_or_movers_load`);
+  `PoolSupervisor::poll_all` (no caller) deleted; `/api/quote` uses the shared client, keys its cache
+  on `(security_id, segment)`, answers 409 on an ambiguous id (`c4e33f325`). Still per request:
+  `stats.rs`, `board.rs` build a client each call (not per tick).
+- [x] **Z12 — CLAUDE.md speed table rows.** Added 2026-10-02: `classify_frame`, `blocking_flush` /
+  `append_inline_depth`, `rebuild_pending_paper` / `active_order_count`, plus rows for the new
+  rescue floors and `DurabilityLag`, `raw_frame_upload::run_pass`, `resync_from`; the PR41a ledger and
+  `SpotPriceStore` rows corrected. Original finding: `connection.rs::classify_frame` is O(packets) on the
   socket read task; `blocking_flush` runs `block_in_place` on every flush. The 2026-10-02 workspace
   sweep adds: `append_inline_depth` writes 10 rows per full packet; per order, `rebuild_pending_paper`
   and `active_order_count` are O(orders) on every order event; the per-minute depth steering builds
