@@ -2221,8 +2221,9 @@ auotmate ddue okay?"):
   longer loads ~22,000 candidates and the movers every minute (`3b1adb524`; `plan_minute`,
   `top_mover_pick` deleted; guard `the_steering_loop_runs_no_per_minute_candidate_or_movers_load`);
   `PoolSupervisor::poll_all` (no caller) deleted; `/api/quote` uses the shared client, keys its cache
-  on `(security_id, segment)`, answers 409 on an ambiguous id (`c4e33f325`). Still per request:
-  `stats.rs`, `board.rs` build a client each call (not per tick).
+  on `(security_id, segment)`, answers 409 on an ambiguous id (`c4e33f325`); `/api/stats` and the board
+  also reuse the shared client with a 3 s per-query timeout (`c3a3604ff`; tests
+  `test_stats_uses_the_shared_client_and_builds_none`, `test_board_uses_the_shared_client_and_builds_none`).
 - [x] **Z12 — CLAUDE.md speed table rows.** Added 2026-10-02: `classify_frame`, `blocking_flush` /
   `append_inline_depth`, `rebuild_pending_paper` / `active_order_count`, plus rows for the new
   rescue floors and `DurabilityLag`, `raw_frame_upload::run_pass`, `resync_from`; the PR41a ledger and
