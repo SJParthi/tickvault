@@ -1200,7 +1200,7 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
     note in aws-budget.md (the ring is 42.0 MB, the escalation queue ~36 MB, up to 750,000 seals
     across the three queues). Dated history that said 225,000 at nine frames is left as written.
   - Tests: `unwritten_seals_counts_channel_ring_and_escalation_queue`,
-    `unwritten_mark_writes_only_on_change_and_at_most_once_a_second`,
+    `test_mark_clean_and_sample_write_only_on_change_and_at_most_once_a_second`,
     `test_unwritten_seal_record_to_line_round_trips_and_parse_refuses_anything_else`,
     `test_unwritten_mark_in_dir_read_previous_reports_an_unreadable_file_as_unreadable`,
     `unwritten_mark_write_failure_is_counted_not_fatal`,
