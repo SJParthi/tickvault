@@ -993,6 +993,18 @@ Workflow `run:` steps, the Makefile, SSM command strings built inside Rust
 (the operator console), and `Command::new("sh")` spawns. The plan item records
 them; this section is amended when each lands.
 
+### Progress
+
+- **D6d (2026-10-02):** `scripts/ensure-questdb.sh` is deleted. The QuestDB
+  self-heal is `tickvault ensure-questdb` in the `app` crate
+  (`crates/app/src/ensure_questdb.rs`), same ladder, timeouts and exit codes.
+  `tickvault.service` runs it as `ExecStartPre=-/opt/tickvault/bin/tickvault
+  ensure-questdb`, so that unit's shell `Exec*=` pin is 1 → 0; the operator
+  console's `restart-questdb` and `docker-reset` SSM commands call the binary.
+  The file has one variable-program spawn (the compose plugin under `$HOME`),
+  budgeted at 1 in `NON_LITERAL_SPAWN_BUDGET` with an allowlist check at the
+  call site.
+
 ### What a PR that violates §0.10 looks like (REJECT)
 
 - Adds any shell file, anywhere, or a new shell `Exec*=` line to a systemd unit.

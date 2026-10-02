@@ -367,12 +367,12 @@ lock_check"#,
     // the app first. Before, it left the unit disabled (see the compose note
     // above). The volume was NOT removed here, so the database comes back on
     // the data it already had.
-    r#"if docker volume inspect tv-questdb-data >/dev/null 2>&1; then echo 'DOCKER-RESET-FAILED: tv-questdb-data still present (in-use) — NOT recreating to avoid re-attaching stale data. Holders:'; docker ps -a --filter volume=tv-questdb-data --format '{{.Names}} ({{.Status}})'; echo docker-reset-FAILED; bash /opt/tickvault/repo/scripts/ensure-questdb.sh || true; systemctl enable tickvault || true; systemctl start tickvault || true; exit 1; fi"#,
+    r#"if docker volume inspect tv-questdb-data >/dev/null 2>&1; then echo 'DOCKER-RESET-FAILED: tv-questdb-data still present (in-use) — NOT recreating to avoid re-attaching stale data. Holders:'; docker ps -a --filter volume=tv-questdb-data --format '{{.Names}} ({{.Status}})'; echo docker-reset-FAILED; /opt/tickvault/bin/tickvault ensure-questdb || true; systemctl enable tickvault || true; systemctl start tickvault || true; exit 1; fi"#,
     r#"echo 'OK: tv-questdb-data removed'"#,
     r#"rm -rf /opt/tickvault/data/instrument-cache /opt/tickvault/data/spill /opt/tickvault/data/dlq /opt/tickvault/data/ws_wal /opt/tickvault/data/groww 2>/dev/null || true"#,
     r#"rm -f /opt/tickvault/data/*/live-ticks.ndjson /opt/tickvault/data/*/*-status.json 2>/dev/null || true"#,
     r#"echo 'OK: host caches + feed capture/replay sources wiped (instrument-cache, spill, dlq, ws_wal, groww); logs preserved'"#,
-    r#"bash /opt/tickvault/repo/scripts/ensure-questdb.sh || true"#,
+    r#"/opt/tickvault/bin/tickvault ensure-questdb || true"#,
     r#"systemctl enable tickvault || true"#,
     r#"systemctl restart tickvault || true"#,
     r#"echo docker-reset-dispatched"#,

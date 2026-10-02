@@ -36,7 +36,7 @@ timedatectl set-timezone Asia/Kolkata
 
 # ---- Step 2: Docker + Compose v2 plugin (AL2023 ships docker in the default repo) ----
 # The Compose v2 plugin (`docker compose`) is REQUIRED by BOTH the app boot
-# (infra.rs, retried every 10s) AND the systemd self-heal (ensure-questdb.sh).
+# (infra.rs, retried every 10s) AND the systemd self-heal (tickvault ensure-questdb).
 # Without it the app crash-loops on BOOT-02 with `exit status: 125: unknown
 # shorthand flag: 'f'` — the CLI lacks the `compose` subcommand so `-f` hits the
 # top-level parser.
@@ -61,7 +61,7 @@ fi
 # deploy-script ensure ladder (.github/workflows/deploy-aws.yml SSM block)
 # cannot be its safety net — without this fallback, first boot on an AL2023
 # minor whose repos lack docker-compose-plugin has NO compose at all:
-# ensure-questdb.sh (service-user) PROBES for compose but never installs,
+# tickvault ensure-questdb (service-user) PROBES for compose but never installs,
 # and the boot lands on the docker-run last resort or BOOT-02.
 # Same pin + official sha256 constants as the deploy-script copy — BUMP IN
 # LOCKSTEP (both recorded 2026-07-14 from the official docker/compose
@@ -101,7 +101,7 @@ usermod -aG docker ec2-user
 # Fail-loud VERIFY: surface a missing/broken Compose v2 plugin in the user-data
 # log immediately, instead of the box discovering it hours later as a BOOT-02
 # crash-loop. Non-fatal (`|| echo`) so a transient hiccup does not abort first
-# boot — ensure-questdb.sh's docker-run fallback still recovers QuestDB.
+# boot — tickvault ensure-questdb's docker-run fallback still recovers QuestDB.
 docker compose version \
     || echo "user-data: WARNING — 'docker compose' unavailable after install; check Step 2"
 
