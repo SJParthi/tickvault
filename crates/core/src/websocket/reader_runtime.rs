@@ -227,7 +227,8 @@ mod tests {
     /// which is what every test in the workspace relies on. This test never
     /// installs, so it cannot leak a runtime into its siblings.
     #[tokio::test]
-    async fn spawn_on_reader_runtime_falls_back_to_the_callers_runtime() {
+    async fn test_spawn_on_reader_runtime_and_reader_runtime_handle_fall_back_to_the_callers_runtime()
+     {
         if reader_runtime_handle().is_some() {
             return;
         }

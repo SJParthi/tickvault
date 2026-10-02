@@ -349,12 +349,14 @@ fn nanos_to_secs(nanos: u64) -> f64 {
     // Whole microseconds through u32 is lossless up to ~71 minutes, which is
     // far past any age worth reading; beyond that it saturates.
     let micros = u32::try_from(nanos / 1_000).unwrap_or(u32::MAX);
+    // DATA-INTEGRITY-EXEMPT: a duration in microseconds, not price data
     f64::from(micros) / 1_000_000.0
 }
 
 fn nanos_to_f64(nanos: u64) -> f64 {
     // Same lossless-u32 shape; a max above ~4.3 s saturates, which is
     // already a stall the over-budget counter has counted.
+    // DATA-INTEGRITY-EXEMPT: a duration in nanoseconds, not price data
     f64::from(u32::try_from(nanos).unwrap_or(u32::MAX))
 }
 
@@ -550,7 +552,7 @@ mod tests {
     }
 
     #[test]
-    fn record_stage_nanos_counts_samples_sum_and_stalls() {
+    fn test_record_stage_nanos_and_stage_snapshot_count_samples_sum_and_stalls() {
         // Stage `SocketToWal` is recorded only by the core crate, so only by this test inside this module's
         // test binary, so the deltas below are exact.
         let before = stage_snapshot(Stage::SocketToWal);
@@ -568,7 +570,7 @@ mod tests {
     }
 
     #[test]
-    fn beat_at_and_heartbeat_age_at_measure_time_since_progress() {
+    fn test_beat_at_and_heartbeat_age_at_measure_time_since_progress() {
         // `WsReader` is beaten only by the core crate, never inside this
         // test binary, so no sibling test can move it under our feet.
         let t0 = Instant::now();
@@ -581,7 +583,7 @@ mod tests {
     }
 
     #[test]
-    fn busy_begin_at_and_busy_end_at_report_a_stuck_batch_and_then_idle() {
+    fn test_busy_begin_at_busy_end_at_and_busy_seconds_at_report_a_stuck_batch_and_then_idle() {
         let t0 = Instant::now();
         busy_begin_at(HotTask::DepthWriter, t0);
         let busy = busy_seconds_at(HotTask::DepthWriter, t0 + Duration::from_secs(3));
