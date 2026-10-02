@@ -1,7 +1,6 @@
 //! Real-time proof that nothing on the live path is waiting (2026-10-02).
 //!
-//! Three instruments, all Prometheus-only (no CloudWatch metric, no alarm,
-//! no Telegram page — those need a dated owner quote):
+//! Three instruments, all Prometheus-only, plus one phone page (below):
 //!
 //! 1. **Per-stage latency** — a fixed power-of-two histogram per hot-path
 //!    stage, recorded with four relaxed atomic operations and ZERO heap
@@ -14,6 +13,17 @@
 //!    the task last made progress) and `tv_task_busy_seconds{task}` (how long
 //!    a writer thread has been inside ONE batch; 0 while idle). A task that
 //!    stops making progress shows up within one publish interval.
+//!
+//! # The stall page (`HOT-PATH-STALL-01`, owner-approved 2026-10-02)
+//!
+//! The publisher thread also runs [`StallAlarm`]: in session, a watched
+//! heartbeat older than [`STALL_PAGE_SECS`] or a stage sample longer than it
+//! starts an EPISODE, and the first episode signal writes ONE coded `error!`
+//! line, which CloudWatch turns into a Telegram page. The signal re-arms when
+//! it clears; at most one line per [`STALL_LINE_MIN_INTERVAL`], and episodes
+//! that start and end inside that wait are counted into the next line. The
+//! 100 µs / 100 ms / 10 ms stall budgets above stay dashboard-only: they
+//! count small stalls, which would page all day.
 //!
 //! # Why a hand-rolled histogram and not `metrics::histogram!`
 //!
@@ -454,8 +464,17 @@ impl TelemetryHandles {
     }
 }
 
-/// Publishes every series once. Resets each stage's window maximum.
-pub fn publish_once(handles: &TelemetryHandles, now: Instant) {
+/// Publishes every series once. Resets each stage's window maximum and
+/// returns what the stall alarm reads: each stage's window maximum and each
+/// watched task's heartbeat age.
+pub fn publish_once(handles: &TelemetryHandles, now: Instant) -> StallReadings {
+    let mut readings = StallReadings {
+        task_age_secs: [None; WATCHED_TASKS.len()],
+        stage_max_nanos: [0; STAGE_COUNT],
+    };
+    for (slot, task) in readings.task_age_secs.iter_mut().zip(WATCHED_TASKS.iter()) {
+        *slot = heartbeat_age_at(*task, now);
+    }
     for (stage, h) in ALL_STAGES.iter().zip(handles.stages.iter()) {
         let snap = stage_snapshot(*stage);
         let mut cumulative = 0u64;
@@ -468,6 +487,7 @@ pub fn publish_once(handles: &TelemetryHandles, now: Instant) {
         h.over_budget.absolute(snap.over_budget);
         let max = STAGES[*stage as usize].max_nanos.swap(0, Ordering::Relaxed);
         h.max.set(nanos_to_f64(max));
+        readings.stage_max_nanos[*stage as usize] = max;
     }
     for (task, h) in ALL_TASKS.iter().zip(handles.tasks.iter()) {
         // A task that has never beaten publishes nothing: an absent series
@@ -478,6 +498,7 @@ pub fn publish_once(handles: &TelemetryHandles, now: Instant) {
         }
         h.busy.set(busy_seconds_at(*task, now));
     }
+    readings
 }
 
 /// Starts the publisher thread (`tv-telemetry`). Call once, after the
@@ -492,12 +513,219 @@ pub fn spawn_publisher() -> std::io::Result<std::thread::JoinHandle<()>> {
     std::thread::Builder::new()
         .name("tv-telemetry".to_owned())
         .spawn(move || {
+            let mut alarm = StallAlarm::new();
             loop {
-                publish_once(&handles, Instant::now());
+                let now = Instant::now();
+                let readings = publish_once(&handles, now);
+                if let Some(line) = alarm.observe(now, in_session_now(), &readings) {
+                    report_stall(&line);
+                }
                 // APPROVED-BLOCKING: this is the publisher's own dedicated OS thread; sleeping here blocks nothing else, and it is why the publisher survives a wedged tokio runtime.
                 std::thread::sleep(PUBLISH_INTERVAL);
             }
         })
+}
+
+/// A watched heartbeat this many seconds old, or one stage sample this long,
+/// in session, pages. Two seconds is twenty of the runtime probe's 100 ms
+/// beats and four of the drain's 500 ms flush beats, so a healthy task never
+/// reaches it, while it is still far inside the 40 s Dhan waits before it
+/// closes a socket that stopped answering pings: the page arrives while the
+/// stall can still be acted on, not after the socket is gone.
+pub const STALL_PAGE_SECS: u32 = 2;
+
+/// [`STALL_PAGE_SECS`] in the unit the readings carry (seconds as `f64`).
+/// Spelled out rather than converted at the compare site; the test
+/// `test_stall_page_secs_f64_matches_the_integer_threshold` pins the two together.
+const STALL_PAGE_SECS_F64: f64 = 2.0;
+
+/// At most one `HOT-PATH-STALL-01` line per this interval.
+// APPROVED: this line IS the named constant the no-hardcoded-Duration rule asks for.
+pub const STALL_LINE_MIN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Heartbeats the stall alarm watches. Excluded on purpose: the socket reader
+/// heartbeat (it ages whenever no frame arrives, as before the open) and the
+/// two ILP writer threads (they run off the socket path, behind a queue, and
+/// a slow database already has its own pages).
+pub const WATCHED_TASKS: [HotTask; 3] = [
+    HotTask::MainRuntime,
+    HotTask::ReaderRuntime,
+    HotTask::FrameDrain,
+];
+
+const SIGNAL_COUNT: usize = WATCHED_TASKS.len() + STAGE_COUNT;
+
+/// What the stall alarm reads once per publish.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StallReadings {
+    /// Heartbeat age of each [`WATCHED_TASKS`] entry; `None` if it never beat.
+    pub task_age_secs: [Option<f64>; WATCHED_TASKS.len()],
+    /// Each stage's largest sample in the window, nanoseconds.
+    pub stage_max_nanos: [u64; STAGE_COUNT],
+}
+
+/// One `HOT-PATH-STALL-01` line's content.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StallLine {
+    /// The worst newly stalled signal: a task or stage label.
+    pub signal: &'static str,
+    /// `"heartbeat"` or `"stage"`.
+    pub kind: &'static str,
+    /// How long that signal had stalled, seconds.
+    pub stalled_secs: f64,
+    /// Newly stalled signals this line reports (the worst is named).
+    pub signals: usize,
+    /// Episodes that started and ended while the line was rate-limited.
+    pub missed_episodes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignalState {
+    /// Not stalled; the next stall starts a new episode.
+    Clear,
+    /// Stalled, not yet reported (waiting on the rate limit).
+    Pending,
+    /// Stalled and reported; silent until it clears.
+    Reported,
+}
+
+/// Edge-triggered stall detector. Lives on the publisher thread only.
+#[derive(Debug)]
+pub struct StallAlarm {
+    state: [SignalState; SIGNAL_COUNT],
+    last_line: Option<Instant>,
+    missed: u64,
+}
+
+impl Default for StallAlarm {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StallAlarm {
+    /// Every signal clear, nothing reported yet.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            state: [SignalState::Clear; SIGNAL_COUNT],
+            last_line: None,
+            missed: 0,
+        }
+    }
+
+    /// Feeds one publish's readings. Returns the line to write, if any.
+    /// Outside the session every signal re-arms and nothing is reported, so
+    /// a stall at boot or after the close never pages. O(signals) = O(7).
+    pub fn observe(
+        &mut self,
+        now: Instant,
+        in_session: bool,
+        readings: &StallReadings,
+    ) -> Option<StallLine> {
+        if !in_session {
+            self.state = [SignalState::Clear; SIGNAL_COUNT];
+            return None;
+        }
+        let mut worst: Option<(usize, f64)> = None;
+        let mut pending = 0usize;
+        for (i, state) in self.state.iter_mut().enumerate() {
+            let secs = signal_secs(readings, i);
+            let stalled = secs.is_some_and(|s| s >= STALL_PAGE_SECS_F64);
+            match (*state, stalled) {
+                (SignalState::Clear, true) => *state = SignalState::Pending,
+                (SignalState::Pending, false) => {
+                    self.missed = self.missed.saturating_add(1);
+                    *state = SignalState::Clear;
+                }
+                (SignalState::Reported, false) => *state = SignalState::Clear,
+                _ => {}
+            }
+            if *state == SignalState::Pending {
+                pending += 1;
+                let s = secs.unwrap_or(0.0);
+                if worst.is_none_or(|(_, w)| s > w) {
+                    worst = Some((i, s));
+                }
+            }
+        }
+        let (index, stalled_secs) = worst?;
+        let allowed = self
+            .last_line
+            .is_none_or(|at| now.saturating_duration_since(at) >= STALL_LINE_MIN_INTERVAL);
+        if !allowed {
+            return None;
+        }
+        for state in &mut self.state {
+            if *state == SignalState::Pending {
+                *state = SignalState::Reported;
+            }
+        }
+        self.last_line = Some(now);
+        let missed_episodes = std::mem::take(&mut self.missed);
+        let (signal, kind) = signal_label(index);
+        Some(StallLine {
+            signal,
+            kind,
+            stalled_secs,
+            signals: pending,
+            missed_episodes,
+        })
+    }
+}
+
+/// Signal `i` in seconds: watched tasks first, then stages.
+fn signal_secs(readings: &StallReadings, i: usize) -> Option<f64> {
+    match readings.task_age_secs.get(i) {
+        Some(age) => *age,
+        None => readings
+            .stage_max_nanos
+            .get(i - WATCHED_TASKS.len())
+            .map(|n| nanos_to_secs(*n)),
+    }
+}
+
+fn signal_label(i: usize) -> (&'static str, &'static str) {
+    match WATCHED_TASKS.get(i) {
+        Some(task) => (task.as_str(), "heartbeat"),
+        None => (
+            ALL_STAGES
+                .get(i - WATCHED_TASKS.len())
+                .map_or("unknown", |s| s.as_str()),
+            "stage",
+        ),
+    }
+}
+
+/// True inside the persist window `[09:00, 15:40)` IST for `secs_of_day`.
+#[must_use]
+pub fn is_in_session_secs_of_day(secs_of_day: u32) -> bool {
+    (tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST
+        ..tickvault_common::constants::TICK_PERSIST_END_SECS_OF_DAY_IST)
+        .contains(&secs_of_day)
+}
+
+fn in_session_now() -> bool {
+    let now_ist = chrono::Utc::now().timestamp().saturating_add(i64::from(
+        tickvault_common::constants::IST_UTC_OFFSET_SECONDS,
+    ));
+    let secs = now_ist.rem_euclid(i64::from(tickvault_common::constants::SECONDS_PER_DAY));
+    u32::try_from(secs).is_ok_and(is_in_session_secs_of_day)
+}
+
+/// Writes the `HOT-PATH-STALL-01` line (paged via CloudWatch → Telegram).
+fn report_stall(line: &StallLine) {
+    tracing::error!(
+        code = tickvault_common::error_code::ErrorCode::HotPathStall01.code_str(),
+        signal = line.signal,
+        kind = line.kind,
+        stalled_secs = line.stalled_secs,
+        threshold_secs = STALL_PAGE_SECS,
+        signals = line.signals,
+        missed_episodes = line.missed_episodes,
+        "Dhan live feed: a hot step stalled for at least {STALL_PAGE_SECS} s — the socket \
+         reads may have waited and Dhan may have skipped ticks meanwhile"
+    );
 }
 
 /// Sleeps [`RUNTIME_PROBE_INTERVAL`] on the current tokio runtime
@@ -627,6 +855,134 @@ mod tests {
         run_runtime_probe(HotTask::MainRuntime, Stage::MainRuntimeLag, 2).await;
         assert_eq!(stage_snapshot(Stage::MainRuntimeLag).count - before, 2);
         assert!(heartbeat_age_at(HotTask::MainRuntime, Instant::now()).is_some());
+    }
+
+    fn quiet() -> StallReadings {
+        StallReadings {
+            task_age_secs: [Some(0.1); WATCHED_TASKS.len()],
+            stage_max_nanos: [1_000; STAGE_COUNT],
+        }
+    }
+
+    fn drain_age(secs: f64) -> StallReadings {
+        let mut r = quiet();
+        r.task_age_secs[2] = Some(secs);
+        r
+    }
+
+    #[test]
+    fn test_stall_alarm_new_and_observe_fire_once_per_episode_and_re_arm() {
+        let mut alarm = StallAlarm::new();
+        let t0 = Instant::now();
+        assert_eq!(alarm.observe(t0, true, &quiet()), None);
+        let line = alarm
+            .observe(t0 + Duration::from_secs(1), true, &drain_age(2.5))
+            .expect("rising edge fires");
+        assert_eq!(line.signal, "frame_drain");
+        assert_eq!(line.kind, "heartbeat");
+        assert_eq!(line.signals, 1);
+        assert_eq!(line.missed_episodes, 0);
+        // Still stalled, even long after the rate limit: one line per episode.
+        for s in 2..200 {
+            assert_eq!(
+                alarm.observe(t0 + Duration::from_secs(s), true, &drain_age(3.0)),
+                None
+            );
+        }
+        // Recovery re-arms; the next stall fires again.
+        assert_eq!(
+            alarm.observe(t0 + Duration::from_secs(200), true, &quiet()),
+            None
+        );
+        assert!(
+            alarm
+                .observe(t0 + Duration::from_secs(201), true, &drain_age(2.0))
+                .is_some(),
+            "a stall exactly at the threshold, after recovery, is a new episode"
+        );
+    }
+
+    #[test]
+    fn test_stall_alarm_observe_rate_limits_and_counts_missed_episodes() {
+        let mut alarm = StallAlarm::new();
+        let t0 = Instant::now();
+        assert!(alarm.observe(t0, true, &drain_age(5.0)).is_some());
+        assert_eq!(
+            alarm.observe(t0 + Duration::from_secs(1), true, &quiet()),
+            None
+        );
+        // A new episode 10 s after the line: held back, then it ends unseen.
+        assert_eq!(
+            alarm.observe(t0 + Duration::from_secs(10), true, &drain_age(4.0)),
+            None
+        );
+        assert_eq!(
+            alarm.observe(t0 + Duration::from_secs(11), true, &quiet()),
+            None
+        );
+        // A stage stall 20 s later is held back while it lasts...
+        let mut ring = quiet();
+        ring.stage_max_nanos[Stage::RingDwell as usize] = 3_000_000_000;
+        assert_eq!(
+            alarm.observe(t0 + Duration::from_secs(30), true, &ring),
+            None
+        );
+        // ...and reported once the minute has passed, carrying the missed one.
+        let line = alarm
+            .observe(t0 + Duration::from_secs(60), true, &ring)
+            .expect("the held-back stall is reported when the limit allows");
+        assert_eq!(line.signal, "ring_dwell");
+        assert_eq!(line.kind, "stage");
+        assert!((line.stalled_secs - 3.0).abs() < 0.001);
+        assert_eq!(line.missed_episodes, 1);
+    }
+
+    #[test]
+    fn test_stall_alarm_observe_names_the_worst_signal_and_ignores_never_beaten_tasks() {
+        let mut alarm = StallAlarm::new();
+        let mut r = quiet();
+        r.task_age_secs = [None, Some(2.5), Some(9.0)];
+        r.stage_max_nanos[Stage::MainRuntimeLag as usize] = 4_000_000_000;
+        let line = alarm.observe(Instant::now(), true, &r).expect("fires");
+        assert_eq!(line.signal, "frame_drain");
+        assert_eq!(line.signals, 3);
+        let mut never = StallAlarm::new();
+        let mut none = quiet();
+        none.task_age_secs = [None; WATCHED_TASKS.len()];
+        assert_eq!(never.observe(Instant::now(), true, &none), None);
+    }
+
+    #[test]
+    fn test_stall_alarm_observe_is_silent_and_re_armed_out_of_session() {
+        let mut alarm = StallAlarm::new();
+        let t0 = Instant::now();
+        assert_eq!(alarm.observe(t0, false, &drain_age(30.0)), None);
+        assert!(alarm.observe(t0, true, &drain_age(30.0)).is_some());
+        // Out of session clears the latch, so the next session's stall pages.
+        assert_eq!(
+            alarm.observe(t0 + Duration::from_secs(120), false, &drain_age(30.0)),
+            None
+        );
+        assert!(
+            alarm
+                .observe(t0 + Duration::from_secs(180), true, &drain_age(30.0))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn test_stall_page_secs_f64_matches_the_integer_threshold() {
+        assert_eq!(STALL_PAGE_SECS_F64.fract(), 0.0);
+        assert_eq!(STALL_PAGE_SECS_F64 as u32, STALL_PAGE_SECS);
+    }
+
+    #[test]
+    fn test_is_in_session_secs_of_day_bounds() {
+        assert!(!is_in_session_secs_of_day(32_399));
+        assert!(is_in_session_secs_of_day(32_400));
+        assert!(is_in_session_secs_of_day(56_399));
+        assert!(!is_in_session_secs_of_day(56_400));
+        assert!(!is_in_session_secs_of_day(0));
     }
 
     #[test]

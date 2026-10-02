@@ -723,6 +723,21 @@ rules:
       still run on their own runtime. The fix is the unit's
       TICKVAULT_WS_READER_CORE value, an operator config edit.
 
+  - name: hot-path-stall-01-live-path-stalled-escalate
+    match:
+      code: HOT-PATH-STALL-01
+    action: escalate
+    runbook_path: docs/error-runbooks/hot-path-stall-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      HOT-PATH-STALL-01 = in session, a tokio runtime or the frame drain made
+      no progress for 2 s, or one hot-path step took 2 s. Socket reads may
+      have waited and the broker may have skipped ticks. Edge-triggered, one
+      line a minute at most. Never auto-fixed: the cause (CPU, disk,
+      database, a blocking step) needs an operator to read the stage and
+      heartbeat gauges.
+
   - name: prev-close-01-ilp-failed-escalate
     match:
       code: PREVCLOSE-01
