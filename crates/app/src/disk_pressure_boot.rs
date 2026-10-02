@@ -572,6 +572,7 @@ async fn run_one_pass(questdb: &QuestDbConfig, cfg: &PartitionRetentionConfig) -
                 dropped = summary.dropped,
                 failed = summary.failed,
                 tables_wal_suspended = summary.tables_wal_suspended,
+                tables_wal_not_applied = summary.tables_wal_not_applied,
                 rows_archived = summary.rows_archived,
                 gzip_bytes_uploaded = summary.gzip_bytes_uploaded,
                 "disk-pressure archive pass complete (every drop had a verified S3 copy)"

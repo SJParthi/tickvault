@@ -204,6 +204,13 @@ pub const fn pass_verdict(summary: &ArchiveRunSummary, max_partitions_per_run: u
         // before the day is out.
         return PassVerdict::Incomplete("wal_suspended");
     }
+    if summary.tables_wal_not_applied > 0 {
+        // A table's WAL could not be proven fully applied at the
+        // per-partition gate (most often: it was merely behind), so its
+        // partitions were kept. A later attempt the same day usually finds
+        // it caught up.
+        return PassVerdict::Incomplete("wal_not_applied");
+    }
     if summary.tables_list_failed > 0 {
         return PassVerdict::Incomplete("table_list_failed");
     }
@@ -998,6 +1005,22 @@ mod pass_ran_tests {
             PassVerdict::Incomplete("wal_suspended"),
             "a suspended table archived nothing; retrying is right because \
              RESUME WAL may land before the day is out"
+        );
+    }
+
+    /// A table kept by the per-partition WAL-applied gate (2026-10-02) must
+    /// keep the day open, or a day on which a lagging table archived
+    /// nothing would latch as done.
+    #[test]
+    fn wal_not_applied_tables_prevent_a_complete_day() {
+        let lagging = ArchiveRunSummary {
+            pass_ran: true,
+            tables_wal_not_applied: 1,
+            ..ArchiveRunSummary::default()
+        };
+        assert_eq!(
+            pass_verdict(&lagging, 200),
+            PassVerdict::Incomplete("wal_not_applied")
         );
     }
 
