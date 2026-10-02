@@ -2252,6 +2252,44 @@ Z-items Z+ and guarantee matrix: covered by the shared matrix at the end of this
 Z4 adds one add and one compare per tick; Z1 runs only on the close path; Z2 adds one flag test per
 idle poll. No allocation on the tick path.
 
+### Added 2026-10-02 (round 3: remaining loss paths, never-blocks, owner's 06:32 and 08:00 asks)
+
+- [x] **R3-1 — WAL sync off the writer thread.** `ws_frame_spill.rs`: `wal-syncer` thread; the
+  writer only flags a due sync. Test `test_writer_keeps_writing_while_sync_is_wedged` (bite-proved),
+  plus `tv_wal_fsync_backlog` / `_pending_ms` / `_inline_fallback_total`.
+- [x] **R3-2 — Failed flush/write counts its buffered records as lost.** `UnflushedTally`,
+  `tv_ws_frame_spill_unflushed_lost_total`, WS-SPILL-02. Test
+  `test_failed_segment_writer_counts_its_buffered_records_as_lost`.
+- [x] **R3-3 — Backward wall-clock step re-anchors the receipt clock.** Test
+  `test_backward_wall_step_reanchors_instead_of_freezing`.
+- [x] **R3-4 — Archive drop waits for applied WAL** (`partition_archive.rs`, `writerTxn ==
+  sequencerTxn` before export and before drop, fail closed, `STORAGE-GAP-04`).
+- [x] **R3-5 (D5/D6 part 1) — Spill and quarantine prunes gated on a verified S3 copy;**
+  quarantine never overwrites (`raw_frame_upload.rs`, `seal_spill.rs`, `tick_persistence.rs`,
+  `tick_spill_replay.rs`). Part 2 (rehydrate for the after-close pass) stays OPEN under 45e-2.
+- [x] **R3-6 (45h) — Unstored packet classes persisted:** `ticks.oi_day_high/low`, new
+  `feed_aux_packets` table with `feed` in the DEDUP key (`feed_aux_persistence.rs`).
+- [x] **R3-7 (D7, main feed only) — 805 overflow probe** in `pool_supervisor.rs`; ROTATION_HALTED is
+  never cleared (source-checked); depth sockets stay parked pending an owner decision.
+- [x] **R3-8 — `feed_gap_audit` table** (`feed_gap_audit_persistence.rs`, `ws_audit_consumer.rs`);
+  `ws_event_audit` carries the real close code, `down_secs` and attempts.
+- [x] **R3-9 — WAL-refused frames are not treated as WAL-backed** (`CapturedFrame.wal_backed`).
+- [x] **R3-10 — Kernel receive-queue sampler** (`kernel_rx_queue_sampler.rs`), WS-GAP-03 log on a
+  sustained backlog; no alarm (needs a dated quote).
+- [x] **R3-11 — Never-blocks:** dedicated reader runtime (`reader_runtime.rs`,
+  `TICKVAULT_WS_READER_THREADS`, 0 = rollback), Prometheus-only telemetry
+  (`hot_path_telemetry.rs`), ratchet `crates/common/tests/hot_path_no_blocking_guard.rs`
+  (bite-proved). CPU pinning NOT added: needs `libc` as a direct dependency (owner approval).
+- [x] **R3-12 (D6d) — `scripts/ensure-questdb.sh` replaced by `tickvault ensure-questdb`**
+  (`ensure_questdb.rs`); script deleted, shell budget reduced.
+- [ ] **R3-13 (D11) — Special sessions (Muhurat).** Built inert on `wip/d11`, NOT merged: needs the
+  owner to confirm date, hours and cost, and a compile + test run.
+- [ ] **R3-14 — WAL segment names from a monotonic source** (replay order across a clock step). Open.
+
+R3 Z+ and guarantee matrix: covered by the shared matrix at the end of this plan. Tick path adds
+one histogram bucket update per frame (R3-11) and one bool per frame (R3-9); no allocation by
+construction (an allocation test for the telemetry is still open).
+
 ## Edge Cases
 
 - PR1: log burst larger than the non-blocking buffer → lines dropped and counted, never blocking.
