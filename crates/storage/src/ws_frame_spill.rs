@@ -683,7 +683,7 @@ pub const WAL_SPILL_SHUTDOWN_BUDGET: Duration = Duration::from_secs(WAL_SPILL_SH
 /// busy one at the end of the first batch that leaves the channel empty, so two
 /// seconds is a stall budget: the abort is delayed at most this long, never
 /// held open by a wedged disk.
-pub const WAL_ABORT_DRAIN_BUDGET: Duration = Duration::from_secs(2);
+pub const WAL_ABORT_DRAIN_BUDGET: Duration = Duration::from_secs(2); // APPROVED: this IS the named constant the rule asks for
 
 /// How often [`drain_registered_for_abort`] re-checks the writer's ack.
 const WAL_ABORT_DRAIN_POLL: Duration = Duration::from_millis(5); // APPROVED: this IS the named constant the rule asks for
