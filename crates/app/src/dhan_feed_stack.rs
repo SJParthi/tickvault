@@ -3013,7 +3013,17 @@ impl LiveIngest {
                 // a writer that could stop on its own would leave the producer
                 // handing rows to a closed queue.
                 while let Ok(mut batch) = rx.recv() {
+                    // `tv_task_busy_seconds{task="tick_writer"}` grows while a
+                    // write is stuck on QuestDB; 0 while idle (2026-10-02).
+                    tickvault_storage::hot_path_telemetry::busy_begin_at(
+                        tickvault_storage::hot_path_telemetry::HotTask::TickWriter,
+                        std::time::Instant::now(),
+                    );
                     let landed = sink.write(&mut batch);
+                    tickvault_storage::hot_path_telemetry::busy_end_at(
+                        tickvault_storage::hot_path_telemetry::HotTask::TickWriter,
+                        std::time::Instant::now(),
+                    );
                     report_tick_persistence(landed > 0);
                     feed_health.record_ticks(
                         Feed::Dhan,
@@ -7266,6 +7276,16 @@ async fn run_frame_drain(
                 // then dropped, so the one number that says how far behind our
                 // own drain is existed for a microsecond and reached nothing.
                 record_ring_dwell(queued_nanos);
+                // The same dwell as a histogram and a stall count, plus the
+                // drain's heartbeat (2026-10-02). No extra clock read beyond
+                // the one `beat` takes; zero allocation.
+                tickvault_storage::hot_path_telemetry::record_stage_nanos(
+                    tickvault_storage::hot_path_telemetry::Stage::RingDwell,
+                    u64::try_from(queued_nanos).unwrap_or(0),
+                );
+                tickvault_storage::hot_path_telemetry::beat(
+                    tickvault_storage::hot_path_telemetry::HotTask::FrameDrain,
+                );
                 // The receipt the WAL record carries, read off the frame
                 // rather than re-derived as `now() - queued` (audit PR31).
                 // Replay stamps rows with the WAL's value, and the depth and
@@ -7577,6 +7597,11 @@ async fn run_frame_drain(
             // instrument sit unflushed below the size threshold waiting for a
             // next tick which, at the close, never comes.
             _ = flush_timer.tick() => {
+                // Beats with no frames too, so an idle drain reads fresh and a
+                // wedged one reads stale within one publish interval.
+                tickvault_storage::hot_path_telemetry::beat(
+                    tickvault_storage::hot_path_telemetry::HotTask::FrameDrain,
+                );
                 flush_and_record(&mut ingest, &feed_health);
                 flush_depth(ingest.depth_sink());
                 publish_fold_depth(&ingest);
@@ -9020,7 +9045,15 @@ impl DepthIngest {
                 // writer that could stop on its own would leave the producer
                 // handing rows to a closed queue.
                 while let Ok(mut batch) = rx.recv() {
+                    tickvault_storage::hot_path_telemetry::busy_begin_at(
+                        tickvault_storage::hot_path_telemetry::HotTask::DepthWriter,
+                        std::time::Instant::now(),
+                    );
                     let _landed = sink.write(&mut batch);
+                    tickvault_storage::hot_path_telemetry::busy_end_at(
+                        tickvault_storage::hot_path_telemetry::HotTask::DepthWriter,
+                        std::time::Instant::now(),
+                    );
                 }
                 info!("depth writer thread exiting — the drain closed its queue");
                 if done_tx.send(()).is_err() {
@@ -13924,7 +13957,12 @@ fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize 
             }
             (_, existing, _) => existing,
         };
-        tokio::spawn(async move {
+        // On the dedicated `tv-ws-reader` runtime when `main` installed one
+        // (2026-10-02), so no task on the main runtime — the drain, a blocking
+        // `std::fs` call, a long sort — can hold the only worker the socket
+        // needs. Without an installed runtime (every test) this is
+        // `tokio::spawn`, exactly as before.
+        tickvault_core::websocket::reader_runtime::spawn_on_reader_runtime(async move {
             // Moved in, so the socket's lifetime and the guard's are the same
             // object. Whatever ends this task — a clean return, an early
             // return, or an unwind — the count comes back down.
@@ -23274,7 +23312,7 @@ mod tests {
             .find("pool_supervisor::rotation_halted()")
             .expect("dial_planned_connections must refuse depth sockets after an 805");
         let spawn = dial
-            .find("tokio::spawn(")
+            .find("spawn_on_reader_runtime(")
             .expect("dial_planned_connections spawns the connection task");
         assert!(gate < spawn, "the 805 check must come before the spawn");
         assert!(

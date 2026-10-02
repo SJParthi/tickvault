@@ -415,6 +415,8 @@ const MAX_TOKIO_WORKER_THREADS: usize = 64;
 /// macros are banned house-wide, so the derivation is stashed here and emitted by
 /// `async_main` as a real `info!` once logging is up.
 static TOKIO_RUNTIME_SIZING: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+/// What `install_reader_runtime` did in `main`, for the boot log.
+static READER_RUNTIME_OUTCOME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// Host-derived floor and ceiling for the resolved worker count.
 ///
@@ -502,6 +504,21 @@ fn main() -> Result<()> {
     // `enable_all` matches what `#[tokio::main]` installed (IO + time drivers).
     // Named threads so `top -H` / `perf` on the box can tell a runtime worker
     // apart from a blocking-pool thread while attributing a stall.
+    // The socket readers' own runtime (2026-10-02), built BEFORE the main
+    // runtime's `block_on` so dropping a losing racer can never happen inside
+    // async code. `0` in the env keeps the readers on the main runtime. The
+    // outcome travels to the boot log with the sizing line below.
+    let reader_raw =
+        std::env::var(tickvault_core::websocket::reader_runtime::WS_READER_THREADS_ENV).ok();
+    let reader_threads =
+        tickvault_core::websocket::reader_runtime::resolve_ws_reader_threads(reader_raw.as_deref());
+    let _ = READER_RUNTIME_OUTCOME.set(
+        match tickvault_core::websocket::reader_runtime::install_reader_runtime(reader_threads) {
+            Ok(outcome) => format!("{outcome:?}"),
+            Err(err) => format!("FAILED({err}) — readers share the main runtime"),
+        },
+    );
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads)
         .thread_name("tv-worker")
@@ -900,6 +917,32 @@ async fn async_main() -> Result<()> {
     // would allocate (Principle #1 violation). Must run post-install
     // because handles created pre-install resolve to a no-op counter.
     tickvault_core::parser::prewarm_dispatcher_counters();
+
+    // Live proof that nothing on the live path is waiting (2026-10-02):
+    // the publisher thread, plus one lateness probe per tokio runtime. AFTER
+    // the recorder install, like every pre-resolved handle above.
+    if let Err(err) = tickvault_storage::hot_path_telemetry::spawn_publisher() {
+        error!(
+            code = tickvault_common::error_code::ErrorCode::Boot02DeadlineExceeded.code_str(),
+            error = %err,
+            "the hot-path telemetry thread FAILED TO SPAWN — stage latency and task \
+             heartbeat gauges will not publish (host thread or memory limit)"
+        );
+    }
+    tokio::spawn(tickvault_storage::hot_path_telemetry::run_runtime_probe(
+        tickvault_storage::hot_path_telemetry::HotTask::MainRuntime,
+        tickvault_storage::hot_path_telemetry::Stage::MainRuntimeLag,
+        u64::MAX,
+    ));
+    if tickvault_core::websocket::reader_runtime::reader_runtime_handle().is_some() {
+        tickvault_core::websocket::reader_runtime::spawn_on_reader_runtime(
+            tickvault_storage::hot_path_telemetry::run_runtime_probe(
+                tickvault_storage::hot_path_telemetry::HotTask::ReaderRuntime,
+                tickvault_storage::hot_path_telemetry::Stage::ReaderRuntimeLag,
+                u64::MAX,
+            ),
+        );
+    }
 
     // -----------------------------------------------------------------------
     // STAGE-C: WebSocket frame WAL (write-ahead log) — durable spill
@@ -2069,6 +2112,9 @@ async fn async_main() -> Result<()> {
     // line carries the host allowance and its SOURCE, not just the answer.
     if let Some(sizing) = TOKIO_RUNTIME_SIZING.get() {
         info!(sizing = %sizing, "tokio runtime sizing");
+    }
+    if let Some(outcome) = READER_RUNTIME_OUTCOME.get() {
+        info!(outcome = %outcome, "socket reader runtime");
     }
 
     // Log trading day status — critical for operational awareness.

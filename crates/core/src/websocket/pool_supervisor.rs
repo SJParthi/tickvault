@@ -6621,8 +6621,22 @@ where
         }
         SocketEvent::Frame(frame) => {
             // Two operations. That is the whole loop body.
+            let accept_started = Instant::now();
             let outcome = sink.accept(frame);
-            action = supervisor.on_event(ConnEvent::FrameReceived, Instant::now());
+            let accepted = Instant::now();
+            // Live proof the reader never waits (2026-10-02): the accept's
+            // own duration, and a heartbeat. Five relaxed atomics, no
+            // allocation; `accepted` is reused below, so the per-frame cost is
+            // ONE extra clock read.
+            tickvault_storage::hot_path_telemetry::record_stage(
+                tickvault_storage::hot_path_telemetry::Stage::SocketToWal,
+                accepted.saturating_duration_since(accept_started),
+            );
+            tickvault_storage::hot_path_telemetry::beat_at(
+                tickvault_storage::hot_path_telemetry::HotTask::WsReader,
+                accepted,
+            );
+            action = supervisor.on_event(ConnEvent::FrameReceived, accepted);
             if outcome == FrameSinkOutcome::WalDropped {
                 // Loud, but the reader does NOT stop draining:
                 // stopping would cost the pong and turn one lost
