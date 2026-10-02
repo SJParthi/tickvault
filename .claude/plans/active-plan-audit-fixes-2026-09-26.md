@@ -2208,15 +2208,28 @@ auotmate ddue okay?"):
 - [~] **Z10 — a full WAL disk can deadlock replay.** PARTLY DONE: the uploader runs every 2 minutes
   outside 09:00–15:40 IST and at once on disk pressure, so verified segments become prunable. Still
   open: if S3 is also unreachable, replay below 40 GiB free still waits (45e-2).
-- [~] **Z11 — smaller loss paths.**
+- [x] **Z11 — smaller loss paths.**
   - [x] (a) WAL replay resyncs past a bad record instead of abandoning the rest of the segment
     (`9714b4de2`, `65c306dbb`): `decode_record_at`, resync ceiling `WAL_RESYNC_MAX_FRAME_BYTES`
     (4 MiB, const-asserted against every WAL-bound frame cap), skipped bytes counted and logged
     (WS-SPILL-02 `source="mid_segment_resync"`). Tests
     `test_regression_resync_recovers_records_after_a_mid_segment_crc_flip`,
     `test_regression_corrupt_length_past_eof_is_counted_not_a_silent_tail`.
-  - [ ] (b) a writer panic drains the WAL queue before the abort; (c) an oversize frame logs a coded
-    `error!`; (d) a mid-session stop closes the sockets before the WAL shutdown.
+  - [x] (b) the panic hook gives the WAL writer up to 2 s to flush everything queued before the abort
+    (`99e2f0456`, `a8fc3b9be`; tests `the_panic_hook_drains_the_wal_before_it_aborts`,
+    `test_regression_drain_for_abort_returns_once_the_queue_is_empty`). **Honest limit:** a panic on
+    the WAL writer thread itself still loses its queue, and an out-of-memory kill runs no hook.
+  - [x] (c) a frame refused by the WebSocket size cap logs a coded `error!` with
+    `source="frame_oversize"` and the cap, throttled to powers of two per endpoint; no new alarm
+    (`dcb26b1bf`; `test_regression_oversize_refusal_logs_error_with_source_frame_oversize`).
+  - [x] (d) shutdown closes the feed sockets first (up to 5 s; frames read during the close still
+    reach the WAL), then the lane, seals and WAL; records left in the writer's channel at exit are
+    counted (`0574db4b6`; `shutdown_closes_the_sockets_before_the_lane_and_the_wal`,
+    `test_regression_run_connection_parks_with_shutdown_and_captures_close_frames`,
+    `test_regression_records_enqueued_after_writer_exit_are_counted_not_silent`). Default chosen: a
+    shutdown park skips the park counter and the "parked permanently" error (logged at info), so the
+    `dhan-socket-parked` alarm does not page on every stop or deploy; the alarm itself is unchanged.
+    Stop budgets now sum to 125 s against `TimeoutStopSec=145` (the guard's 20 s floor).
 - [x] **Waste found by the sweep, fixed.** (`app`, `core`, `api`) The per-minute depth steering no
   longer loads ~22,000 candidates and the movers every minute (`3b1adb524`; `plan_minute`,
   `top_mover_pick` deleted; guard `the_steering_loop_runs_no_per_minute_candidate_or_movers_load`);
