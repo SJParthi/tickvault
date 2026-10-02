@@ -427,6 +427,12 @@ fn line_is_positively_out_of_window(line: &[u8], is_arrival_clock: bool) -> bool
     if trimmed.is_empty() {
         return false;
     }
+    // A `feed_aux_packets` row shares the tick buffer and so its spill files
+    // (item 45h). It is stamped at RECEIPT and exists precisely to keep the
+    // packets the session window refuses, so the window must never drop it.
+    if is_feed_aux_line(trimmed) {
+        return false;
+    }
     let Some(last) = trimmed.rsplit(|b| *b == b' ').next() else {
         return false;
     };
@@ -462,6 +468,14 @@ fn line_is_positively_out_of_window(line: &[u8], is_arrival_clock: bool) -> bool
     } else {
         !tickvault_common::session_window::row_is_in_an_open_window(nanos)
     }
+}
+
+/// True when an ILP line names the `feed_aux_packets` table: the measurement
+/// is the text before the first unescaped `,` or space. One prefix compare.
+fn is_feed_aux_line(line: &[u8]) -> bool {
+    let table = crate::feed_aux_persistence::FEED_AUX_PACKETS_TABLE.as_bytes();
+    line.strip_prefix(table)
+        .is_some_and(|rest| matches!(rest.first(), Some(b',' | b' ')))
 }
 
 /// True when `nanos` is large enough to be a real market timestamp rather than
@@ -1271,6 +1285,29 @@ mod tests {
             line_is_positively_out_of_window(complete.as_bytes(), false),
             "a complete out-of-window stamp must still be refused"
         );
+    }
+
+    /// Item 45h: a `feed_aux_packets` row rides the tick spill files and is
+    /// stamped at receipt, often outside the session window (a 15:45 tick, a
+    /// pre-open connect snapshot). The replay window filter must keep it; the
+    /// same stamp on a `ticks` line is still dropped.
+    #[test]
+    fn a_feed_aux_line_outside_the_window_is_kept_but_a_tick_line_is_not() {
+        let late = ist_at(23 * 3600);
+        let aux =
+            format!("feed_aux_packets,segment=NSE_EQ,kind=out_of_window_tick ltp=1.0 {late}\n");
+        assert!(
+            !line_is_positively_out_of_window(aux.as_bytes(), false),
+            "an aux row must never be judged by the tick window"
+        );
+        let tick = format!("ticks,segment=NSE_EQ ltp=1.0 {late}\n");
+        assert!(line_is_positively_out_of_window(tick.as_bytes(), false));
+        let (kept, dropped) = retain_lines_in_open_window(format!("{aux}{tick}").as_bytes(), false);
+        assert_eq!(dropped, 1);
+        assert_eq!(kept, aux.as_bytes());
+        // A table that merely STARTS with the name is not the aux table.
+        assert!(!is_feed_aux_line(b"feed_aux_packets_old,x=1 1"));
+        assert!(is_feed_aux_line(b"feed_aux_packets x=1 1"));
     }
 
     #[test]

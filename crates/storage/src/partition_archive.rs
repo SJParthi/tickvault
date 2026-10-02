@@ -3412,6 +3412,12 @@ mod tests {
         // market-data comparator here is now a MINUTE candle — the data that
         // actually still lives on the 15-day window.
         assert_eq!(retention_class("candles_1m"), RetentionClass::MarketData);
+        // Item 45h: the auxiliary packet table is market data on the 15-day
+        // window (archived, then detached), never Standard and never Intraday.
+        assert_eq!(
+            retention_class(crate::feed_aux_persistence::FEED_AUX_PACKETS_TABLE),
+            RetentionClass::MarketData
+        );
     }
 
     #[test]

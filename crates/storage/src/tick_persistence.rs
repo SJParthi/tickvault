@@ -104,6 +104,10 @@ use tickvault_common::sanitize::sanitize_ilp_symbol;
 use tickvault_common::segment::segment_code_to_str;
 use tickvault_common::tick_types::ParsedTick;
 
+use crate::feed_aux_persistence::{
+    AuxPacketKind, AuxPacketRow, FEED_AUX_ROWS_COUNTER, append_aux_row,
+};
+
 // ---------------------------------------------------------------------------
 // Table + key contract
 // ---------------------------------------------------------------------------
@@ -347,6 +351,11 @@ pub struct TickRow {
     pub close: Option<f64>,
     /// Open interest. `None` → NULL.
     pub oi: Option<i64>,
+    /// Day-high open interest (Full packet bytes 38-41, NSE_FNO only). `None`
+    /// → NULL. Persisted since 2026-10-02 (item 45h); it never feeds a candle.
+    pub oi_day_high: Option<i64>,
+    /// Day-low open interest (Full packet bytes 42-45, NSE_FNO only). `None` → NULL.
+    pub oi_day_low: Option<i64>,
     /// Average traded price (VWAP). `None` → NULL.
     pub avg_price: Option<f64>,
     /// Last trade quantity. `None` → NULL.
@@ -492,6 +501,8 @@ impl TickRow {
             low: opt_price(tick.day_low),
             close: opt_price(tick.day_close),
             oi: opt_qty(tick.open_interest),
+            oi_day_high: opt_qty(tick.oi_day_high),
+            oi_day_low: opt_qty(tick.oi_day_low),
             avg_price: opt_price(tick.average_traded_price),
             last_trade_qty: (tick.last_trade_quantity != 0)
                 .then(|| i64::from(tick.last_trade_quantity)),
@@ -529,6 +540,8 @@ pub fn ticks_create_ddl() -> String {
             close DOUBLE, \
             volume LONG, \
             oi LONG, \
+            oi_day_high LONG, \
+            oi_day_low LONG, \
             avg_price DOUBLE, \
             last_trade_qty LONG, \
             total_buy_qty LONG, \
@@ -553,6 +566,8 @@ const TICKS_COLUMNS: &[(&str, &str)] = &[
     ("close", "DOUBLE"),
     ("volume", "LONG"),
     ("oi", "LONG"),
+    ("oi_day_high", "LONG"),
+    ("oi_day_low", "LONG"),
     ("avg_price", "DOUBLE"),
     ("last_trade_qty", "LONG"),
     ("total_buy_qty", "LONG"),
@@ -1751,6 +1766,25 @@ pub struct TickWriter {
     /// does not start the next batch from a zero-capacity buffer. `None`
     /// until [`TickWriter::split_for_offload`] runs (item 44g).
     spare_buffers: Option<std::sync::mpsc::Receiver<Buffer>>,
+    /// `tv_feed_aux_rows_total{kind}` handles, one per
+    /// [`AuxPacketKind`], resolved once so an append is a counter increment
+    /// and never a label-vector allocation (plan item 45h).
+    aux_counters: [metrics::Counter; 6],
+    /// `feed_aux_packets` rows appended by this writer over its life. The
+    /// buffer carries `ticks` and `feed_aux_packets` rows together, so
+    /// `pending` alone cannot say which table a pending row is for.
+    aux_rows_appended: u64,
+}
+
+/// Pre-resolves the per-kind `tv_feed_aux_rows_total` handles (plan item 45h).
+/// The label value is a `&'static str` from a closed set, resolved once per
+/// writer, so the append path never builds a label vector.
+fn aux_row_counters() -> [metrics::Counter; 6] {
+    AuxPacketKind::ALL.map(|k| {
+        let c = metrics::counter!(FEED_AUX_ROWS_COUNTER, "kind" => k.as_str());
+        c.increment(0);
+        c
+    })
 }
 
 /// Pre-resolved refusal counters -- one handle per reason, per writer.
@@ -2044,6 +2078,8 @@ impl TickWriter {
                     retained_spans: 0,
                     flush_counters: TickFlushCounters::new(feed),
                     spare_buffers: None,
+                    aux_counters: aux_row_counters(),
+                    aux_rows_appended: 0,
                 }
             }
             Err(err) => {
@@ -2068,6 +2104,8 @@ impl TickWriter {
                     retained_spans: 0,
                     flush_counters: TickFlushCounters::new(feed),
                     spare_buffers: None,
+                    aux_counters: aux_row_counters(),
+                    aux_rows_appended: 0,
                 }
             }
         }
@@ -2110,6 +2148,8 @@ impl TickWriter {
             retained_spans: 0,
             flush_counters: TickFlushCounters::new(feed),
             spare_buffers: None,
+            aux_counters: aux_row_counters(),
+            aux_rows_appended: 0,
         }
     }
 
@@ -2218,6 +2258,9 @@ impl TickWriter {
                     });
                     if !in_band {
                         self.out_of_window.note(TICK_TS_OUT_OF_BAND_REASON);
+                        // Refused by `ticks`, kept in `feed_aux_packets` (plan item 45h):
+                        // the row is stamped at receipt there, so no partition moves.
+                        self.persist_refused_tick(tick, capture_seq);
                         return Ok(());
                     }
                 }
@@ -2233,6 +2276,10 @@ impl TickWriter {
                     self.out_of_window.note(verdict.reason());
                 }
                 if verdict.is_refusal() {
+                    // Out of the 09:00-15:40 window: not a `ticks` row (operator,
+                    // 2026-09-05), but never dropped (operator, 2026-09-29) —
+                    // it goes to `feed_aux_packets`, stamped at receipt.
+                    self.persist_refused_tick(tick, capture_seq);
                     return Ok(());
                 }
                 self.append_row(&row)
@@ -2366,6 +2413,16 @@ impl TickWriter {
         if let Some(v) = row.oi {
             self.buffer.column_i64("oi", v).context("oi")?;
         }
+        if let Some(v) = row.oi_day_high {
+            self.buffer
+                .column_i64("oi_day_high", v)
+                .context("oi_day_high")?;
+        }
+        if let Some(v) = row.oi_day_low {
+            self.buffer
+                .column_i64("oi_day_low", v)
+                .context("oi_day_low")?;
+        }
         if let Some(v) = row.avg_price {
             self.buffer
                 .column_f64("avg_price", v)
@@ -2408,6 +2465,82 @@ impl TickWriter {
         self.last_capture_seq = self.last_capture_seq.max(row.capture_seq);
         self.note_pending_seq(row.capture_seq);
         Ok(())
+    }
+
+    /// Appends one `feed_aux_packets` row to this writer's ILP buffer (plan
+    /// item 45h).
+    ///
+    /// Same buffer as the `ticks` rows on purpose: the rows then share the
+    /// offload thread, the rescue tier, the spill files (an ILP payload may
+    /// name several tables) and the WAL applied-watermark range, so an aux row
+    /// is exactly as durable as a tick and needs no second writer. `pending`
+    /// counts it, so the size trigger and the flush see it.
+    ///
+    /// O(1), allocation-free apart from the buffer's amortised growth.
+    ///
+    /// # Errors
+    /// ILP buffer errors. The row is then a counted loss, exactly as a tick
+    /// append failure is: the frame is marked unapplied so the next replay
+    /// re-offers it, and `tv_ticks_dropped_total` is incremented.
+    pub fn append_aux(&mut self, row: &AuxPacketRow) -> Result<()> {
+        match append_aux_row(&mut self.buffer, self.feed.as_str(), row) {
+            Ok(()) => {
+                self.pending = self.pending.saturating_add(1);
+                self.aux_rows_appended = self.aux_rows_appended.saturating_add(1);
+                if let Some(c) = self.aux_counters.get(row.kind.index()) {
+                    c.increment(1);
+                }
+                self.note_pending_seq(row.capture_seq);
+                Ok(())
+            }
+            Err(err) => {
+                crate::wal_applied_watermark::applied_watermark()
+                    .note_unapplied(u64::try_from(row.capture_seq).unwrap_or(0));
+                self.flush_counters.append_dropped.increment(1);
+                self.flush_counters.append_failures =
+                    self.flush_counters.append_failures.saturating_add(1);
+                if self.flush_counters.append_failures.is_power_of_two() {
+                    error!(
+                        code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                        feed = self.feed.as_str(),
+                        security_id = row.security_id,
+                        kind = row.kind.as_str(),
+                        capture_seq = row.capture_seq,
+                        source = "ilp_append_failed",
+                        failures_so_far = self.flush_counters.append_failures,
+                        error = %err,
+                        "feed_aux_packets row could not be appended to the ILP buffer — \
+                         counted on tv_ticks_dropped_total and the frame marked unapplied \
+                         so the next replay re-offers it. Logged at powers of two."
+                    );
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// Persists a tick the `ticks` window or band gate refused as a
+    /// `feed_aux_packets` row of kind `out_of_window_tick`, stamped at receipt.
+    ///
+    /// Returns nothing on purpose: a failed append is already counted, logged
+    /// and marked unapplied inside [`Self::append_aux`]. Handing that `Err`
+    /// back would run the caller's tick-loss block a second time for the same
+    /// frame, and the window refusal itself is not a loss.
+    fn persist_refused_tick(&mut self, tick: &ParsedTick, capture_seq: i64) {
+        if let Some(row) =
+            AuxPacketRow::from_tick(AuxPacketKind::OutOfWindowTick, tick, capture_seq)
+        {
+            // Failure handled (counted + unapplied) inside `append_aux`.
+            let _handled = self.append_aux(&row).is_ok();
+        }
+        // `None` is unreachable: `from_parsed_tick` already proved the id
+        // fits, and the refusal is counted inside `from_header` either way.
+    }
+
+    /// `feed_aux_packets` rows this writer has appended over its life.
+    #[must_use]
+    pub const fn aux_rows_appended(&self) -> u64 {
+        self.aux_rows_appended
     }
 
     /// Widens the pending sequence range to cover one appended row.
@@ -3596,11 +3729,116 @@ mod tests {
         let mut w = TickWriter::for_test(Feed::Dhan);
         w.append_tick_with_seq(&tick, 1)
             .expect("a refusal is Ok(()) -- never an Err, which would be counted as a loss");
+        // Re-blessed 2026-10-02 (item 45h): the refused tick is no longer
+        // dropped — it lands as ONE `feed_aux_packets` row stamped at receipt.
+        // `ticks` still gets nothing, which is what this test exists to pin.
         assert_eq!(
-            w.pending(),
+            w.aux_rows_appended(),
+            1,
+            "the refused tick is kept as an auxiliary row"
+        );
+        assert_eq!(w.pending(), 1, "the only pending row is the aux row");
+        assert!(
+            !w.buffer_utf8().lines().any(|l| l.starts_with("ticks,")),
+            "a year-2052 stamp must be REFUSED from `ticks` even though its \
+             seconds-of-day sit inside the session window"
+        );
+    }
+
+    /// Item 45h: a tick stamped after 15:40 IST (the post-close closing-price
+    /// broadcast) is refused by the `ticks` window gate and WRITTEN to
+    /// `feed_aux_packets` as `out_of_window_tick`, with its trade fields and
+    /// trade time kept and its designated timestamp at receipt.
+    #[test]
+    fn test_append_aux_a_post_close_tick_is_written_to_feed_aux_not_ticks() {
+        let mut tick = sample_tick();
+        // 15:45:00 IST on the fixture's day: 12:30:00 + 3h15m.
+        tick.exchange_timestamp += 3 * 3600 + 15 * 60;
+        tick.received_at_nanos += (3 * 3600 + 15 * 60) * 1_000_000_000;
+        let mut w = TickWriter::for_test(Feed::Dhan);
+        w.append_tick_with_seq(&tick, 77).expect("refusal is Ok");
+        let buf = w.buffer_utf8();
+        assert!(!buf.lines().any(|l| l.starts_with("ticks,")), "{buf}");
+        let line = buf
+            .lines()
+            .find(|l| l.starts_with("feed_aux_packets,"))
+            .expect("the post-close tick must be written to feed_aux_packets");
+        assert!(line.contains(",kind=out_of_window_tick"), "{line}");
+        assert!(line.contains(",feed=dhan"), "{line}");
+        assert!(line.contains("ltp=23146.45"), "{line}");
+        assert!(line.contains("capture_seq=77i"), "{line}");
+        let receipt_ist =
+            tick.received_at_nanos + tickvault_common::constants::IST_UTC_OFFSET_NANOS;
+        assert!(
+            line.ends_with(&format!(" {receipt_ist}")),
+            "designated ts must be the receipt in IST: {line}"
+        );
+        assert_eq!(w.aux_rows_appended(), 1);
+        assert_eq!(w.pending(), 1);
+    }
+
+    /// `append_aux` counts the row as pending (so the size trigger and flush
+    /// see it) and widens the WAL sequence range like a tick.
+    #[test]
+    fn test_append_aux_counts_pending_and_appended() {
+        let mut w = TickWriter::for_test(Feed::Dhan);
+        let row = AuxPacketRow::from_header(
+            AuxPacketKind::MarketStatus,
+            13,
             0,
-            "a year-2052 stamp must be REFUSED even though its seconds-of-day \
-             sit inside the session window"
+            1_779_951_600_111_000_000,
+            1_779_951_600_111_000_000,
+        )
+        .expect("row");
+        w.append_aux(&row).expect("append");
+        w.append_aux(&row).expect("append");
+        assert_eq!(w.aux_rows_appended(), 2);
+        assert_eq!(w.pending(), 2);
+        assert_eq!(
+            w.buffer_utf8()
+                .lines()
+                .filter(|l| l.starts_with("feed_aux_packets,"))
+                .count(),
+            2
+        );
+    }
+
+    /// `aux_rows_appended` starts at zero and an in-window tick never moves it.
+    #[test]
+    fn test_aux_rows_appended_is_zero_for_an_in_window_tick() {
+        let mut w = TickWriter::for_test(Feed::Dhan);
+        assert_eq!(w.aux_rows_appended(), 0);
+        w.append_tick_with_seq(&sample_tick(), 5).expect("append");
+        assert_eq!(w.aux_rows_appended(), 0);
+        assert_eq!(w.pending(), 1);
+    }
+
+    /// Item 45h (a): the Full packet's day-high / day-low OI reach `ticks`;
+    /// a zero (Ticker / Quote packets, non-F&O) stays NULL, never `0`.
+    #[test]
+    fn test_ticks_carry_oi_day_high_and_low_and_null_them_when_zero() {
+        let mut tick = sample_tick();
+        tick.oi_day_high = 1_000_500;
+        tick.oi_day_low = 950_000;
+        let row = TickRow::from_parsed_tick(&tick, 9).expect("row");
+        assert_eq!(row.oi_day_high, Some(1_000_500));
+        assert_eq!(row.oi_day_low, Some(950_000));
+        let mut w = TickWriter::for_test(Feed::Dhan);
+        w.append_row(&row).expect("append");
+        let line = w.buffer_utf8();
+        assert!(line.contains("oi_day_high=1000500i"), "{line}");
+        assert!(line.contains("oi_day_low=950000i"), "{line}");
+
+        let zero = TickRow::from_parsed_tick(&sample_tick(), 9).expect("row");
+        assert_eq!(zero.oi_day_high, None);
+        assert_eq!(zero.oi_day_low, None);
+        let mut w = TickWriter::for_test(Feed::Dhan);
+        w.append_row(&zero).expect("append");
+        assert!(!w.buffer_utf8().contains("oi_day_"));
+        // DEDUP key unchanged by the new columns.
+        assert_eq!(
+            DEDUP_KEY_TICKS,
+            "ts, security_id, segment, capture_seq, feed"
         );
     }
 
@@ -4869,8 +5107,9 @@ mod tests {
     // ======================================================================
 
     // `Connection: close` is load-bearing, not decoration. `ensure_ticks_table`
-    // drives TWENTY DDL statements through ONE `reqwest::Client` — 1 CREATE plus
-    // one ADD COLUMN per entry in `TICKS_COLUMNS` (19) — and reqwest pools the
+    // drives TWENTY-TWO DDL statements through ONE `reqwest::Client` — 1 CREATE,
+    // one ADD COLUMN per entry in `TICKS_COLUMNS` (20) and the DEDUP ENABLE —
+    // and reqwest pools the
     // socket between them. This mock answers, then DROPS the stream, so without
     // the header reqwest can reuse a connection the mock has already closed and a
     // later statement fails, flipping the verdict to false. It is the pattern

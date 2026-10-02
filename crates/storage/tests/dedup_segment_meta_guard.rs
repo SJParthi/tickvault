@@ -312,10 +312,15 @@ fn every_audit_dedup_key_must_include_designated_timestamp_ts() {
 // (its DEDUP additionally carries `capture_seq`, the intra-second tiebreaker
 // without which second-granular Dhan timestamps collapse every tick but the
 // last in each second).
+// 2026-10-02 (item 45h): `DEDUP_KEY_FEED_AUX_PACKETS` joins — the OI,
+// previous-close, market-status, disconnect, out-of-window-tick and
+// connect-snapshot rows (`feed_aux_packets`), keyed
+// `(ts, security_id, segment, kind, capture_seq, feed)`.
 const FEED_KEYED_MARKET_DATA_KEYS: &[&str] = &[
     "DEDUP_KEY_TICKS",
     "DEDUP_KEY_CANDLES",
     "DEDUP_KEY_WS_EVENT_AUDIT",
+    "DEDUP_KEY_FEED_AUX_PACKETS",
 ];
 
 #[test]

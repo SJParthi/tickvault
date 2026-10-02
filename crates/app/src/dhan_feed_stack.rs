@@ -127,6 +127,7 @@ use tickvault_storage::depth_persistence::{
     DEPTH_KIND_5, DEPTH_KIND_20, DEPTH_KIND_200, DEPTH_SIDE_ASK, DEPTH_SIDE_BID, DepthRow,
     DepthWriter, depth_segment_label,
 };
+use tickvault_storage::feed_aux_persistence::{AuxPacketKind, AuxPacketRow, aux_price};
 use tickvault_storage::tick_persistence::TickWriter;
 use tickvault_storage::ws_frame_spill::{WalEndpoint, WsFrameSpill, WsType};
 use tickvault_trading::candles::multi_tf_aggregator::AGGREGATOR_MAX_SLOTS;
@@ -1222,6 +1223,102 @@ fn record_top_volume_append_failures(
 /// non-zero reading on THIS counter is now always worth looking at, where
 /// before it usually was not.
 pub const TOP_VOLUME_SNAPSHOT_REFUSAL_COUNTER: &str = "tv_top_volume_snapshot_refused_total";
+
+/// The `(frame_seq, packet_index)` pair of a non-tick packet does not fit
+/// the `capture_seq` column (the same refusal a tick takes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AuxSeqRefused;
+
+/// Builds the `feed_aux_packets` row for one non-tick packet (item 45h).
+///
+/// Pure, so the live drain and the WAL replay — which both call it through
+/// [`LiveIngest::ingest_non_tick_at`] with the frame's own sequence, packet
+/// index and receipt — provably build the SAME row. `Ok(None)` for a tick
+/// variant (those go through the fold) or a row the storage layer refuses
+/// (counted there). O(1), allocation-free.
+pub(crate) fn aux_row_for_non_tick(
+    parsed: &ParsedFrame,
+    packet: &[u8],
+    frame_seq: u64,
+    packet_index: u32,
+    received_at_nanos: i64,
+) -> Result<Option<AuxPacketRow>, AuxSeqRefused> {
+    let (kind, security_id, segment_code) = match parsed {
+        ParsedFrame::Tick(_) | ParsedFrame::TickWithDepth(..) => return Ok(None),
+        ParsedFrame::OiUpdate {
+            security_id,
+            exchange_segment_code,
+            ..
+        } => (
+            AuxPacketKind::OpenInterest,
+            *security_id,
+            *exchange_segment_code,
+        ),
+        ParsedFrame::PreviousClose {
+            security_id,
+            exchange_segment_code,
+            ..
+        } => (
+            AuxPacketKind::PrevClose,
+            *security_id,
+            *exchange_segment_code,
+        ),
+        ParsedFrame::MarketStatus {
+            security_id,
+            exchange_segment_code,
+        } => (
+            AuxPacketKind::MarketStatus,
+            *security_id,
+            *exchange_segment_code,
+        ),
+        // The parsed disconnect carries only its reason; the instrument and
+        // segment come from the packet's own 8-byte header.
+        ParsedFrame::Disconnect(_) => match tickvault_core::parser::header::parse_header(packet) {
+            Ok(h) => (
+                AuxPacketKind::Disconnect,
+                h.security_id,
+                h.exchange_segment_code,
+            ),
+            // Unreachable: the dispatcher parsed this same header before it
+            // could classify the packet as a disconnect.
+            Err(_) => return Ok(None),
+        },
+    };
+    let capture_seq =
+        tickvault_storage::ws_frame_spill::packet_capture_seq(frame_seq, u64::from(packet_index))
+            .and_then(capture_seq_from_frame_seq)
+            .ok_or(AuxSeqRefused)?;
+    let Some(mut row) = AuxPacketRow::from_header(
+        kind,
+        security_id,
+        segment_code,
+        received_at_nanos,
+        capture_seq,
+    ) else {
+        return Ok(None);
+    };
+    match parsed {
+        // The packet's whole payload: written as received, a zero included.
+        ParsedFrame::OiUpdate { open_interest, .. } => {
+            row.oi = Some(i64::from(*open_interest));
+        }
+        ParsedFrame::PreviousClose {
+            previous_close,
+            previous_oi,
+            ..
+        } => {
+            row.prev_close = aux_price(*previous_close);
+            row.prev_oi = Some(i64::from(*previous_oi));
+        }
+        ParsedFrame::Disconnect(reason) => {
+            row.reason_code = Some(i64::from(reason.as_u16()));
+        }
+        ParsedFrame::MarketStatus { .. }
+        | ParsedFrame::Tick(_)
+        | ParsedFrame::TickWithDepth(..) => {}
+    }
+    Ok(Some(row))
+}
 
 /// Narrows a WAL frame sequence onto the `i64` `ticks.capture_seq` column.
 ///
@@ -3504,6 +3601,65 @@ impl LiveIngest {
         self.pending_rows
     }
 
+    /// Persists one non-tick packet — open interest (code 5), previous close
+    /// (code 6), market status (code 7) or disconnect (code 50) — as a
+    /// `feed_aux_packets` row (item 45h, zero loss 2026-09-29). Until now these
+    /// were counted and dropped.
+    ///
+    /// The row never touches the candle fold: it is appended to the tick
+    /// writer's ILP buffer under its OWN table, so it shares the tick path's
+    /// offload, rescue, spill and WAL applied-watermark, and no candle reads it.
+    ///
+    /// `capture_seq` is derived from `(frame_seq, packet_index)` exactly as a
+    /// tick's is, so the live drain and a WAL replay of the same frame produce
+    /// the same row and the DEDUP key collapses the second onto the first.
+    /// `received_at_nanos` is the frame's receipt in UTC nanoseconds (`0` when
+    /// a replayed record carries none). `packet` is the packet's own bytes,
+    /// read only for a disconnect, whose parsed form drops the header.
+    ///
+    /// Returns `true` when a row was appended. A tick variant returns `false`
+    /// without touching anything (ticks go through [`Self::ingest_tick_at`]).
+    /// O(1), allocation-free.
+    pub fn ingest_non_tick_at(
+        &mut self,
+        parsed: &ParsedFrame,
+        packet: &[u8],
+        frame_seq: u64,
+        packet_index: u32,
+        received_at_nanos: i64,
+    ) -> bool {
+        match aux_row_for_non_tick(parsed, packet, frame_seq, packet_index, received_at_nanos) {
+            Ok(Some(row)) => self.append_aux_row(&row),
+            Ok(None) => false,
+            Err(AuxSeqRefused) => {
+                // The same refusal a tick takes: a fresh sequence would
+                // duplicate on replay. Counted on the tick path's counter.
+                self.seq_refused = self.seq_refused.saturating_add(1);
+                counters().ingest_seq_refused.increment(1);
+                false
+            }
+        }
+    }
+
+    /// Persists a tick that `ticks` refuses outright (the prior-day connect
+    /// snapshot) as a `feed_aux_packets` row of `kind`. O(1).
+    fn append_aux_tick(&mut self, kind: AuxPacketKind, tick: &ParsedTick, capture_seq: i64) {
+        if let Some(row) = AuxPacketRow::from_tick(kind, tick, capture_seq) {
+            let _appended = self.append_aux_row(&row);
+        }
+    }
+
+    /// One aux append through the tick writer; counts the row as pending so
+    /// the size trigger and the flush see it. A failure is already counted and
+    /// logged inside the writer.
+    fn append_aux_row(&mut self, row: &AuxPacketRow) -> bool {
+        if self.writer.append_aux(row).is_err() {
+            return false;
+        }
+        self.pending_rows = self.pending_rows.saturating_add(1);
+        true
+    }
+
     /// Registers an instrument before any tick arrives, so a stream that never
     /// delivers a single tick is still reported as silent rather than being
     /// invisible. Returns `false` when detector capacity is exhausted.
@@ -3940,6 +4096,12 @@ impl LiveIngest {
             // and timestamp are judged first above — so this is exactly "the
             // day rule refused it, and nothing else did".
             if stats.receipt_day_mismatch && !stats.refused_price && !stats.refused_timestamp {
+                // Item 45h (zero loss, 2026-09-29): the prior-day connect
+                // snapshot is a real received packet. It must never reach
+                // `ticks` (2026-09-10 directive) and never a candle, so it is
+                // kept in `feed_aux_packets`, stamped at RECEIPT, where no
+                // candle reads it. One ILP append, no allocation.
+                self.append_aux_tick(AuxPacketKind::ConnectSnapshot, tick, capture_seq);
                 return IngestOutcome::RefusedWrongDay;
             }
             return IngestOutcome::AggregatorRefused;
@@ -8712,6 +8874,15 @@ pub fn drain_main_feed_frame(
             Ok(ParsedFrame::Disconnect(reason)) => {
                 c.main_feed_disconnects.increment(1);
                 out.disconnects = out.disconnects.saturating_add(1);
+                // Item 45h: the packet is kept, with its reason code. The
+                // code is `Copy`, so re-wrapping it costs nothing.
+                let _kept = ingest.ingest_non_tick_at(
+                    &ParsedFrame::Disconnect(reason),
+                    &frame.bytes[offset..end],
+                    frame.seq,
+                    packets,
+                    received_at_nanos,
+                );
                 if !disconnect_logged {
                     disconnect_logged = true;
                     error!(
@@ -8747,9 +8918,24 @@ pub fn drain_main_feed_frame(
                 security_id,
                 exchange_segment_code,
                 previous_close,
-                ..
+                previous_oi,
             }) => {
                 c.non_tick.increment(1);
+                // Item 45h: the packet itself is kept (price and previous-day
+                // OI), beside the store write below. All four fields are
+                // `Copy`, so re-wrapping them costs nothing.
+                let _kept = ingest.ingest_non_tick_at(
+                    &ParsedFrame::PreviousClose {
+                        security_id,
+                        exchange_segment_code,
+                        previous_close,
+                        previous_oi,
+                    },
+                    &frame.bytes[offset..end],
+                    frame.seq,
+                    packets,
+                    received_at_nanos,
+                );
                 // f32 -> f64 through the house widener, never `f64::from`:
                 // a plain widening turns 10.20_f32 into 10.19999980926514
                 // (STORAGE-GAP-02), and this value is a DIVISOR — the error
@@ -8769,7 +8955,20 @@ pub fn drain_main_feed_frame(
             // arrives as its own packet, market-status and disconnect are
             // control. Counted so the traffic mix is visible, deliberately not
             // folded — none of them carries an LTP.
-            Ok(_) => c.non_tick.increment(1),
+            //
+            // Item 45h (2026-10-02): no longer dropped after the count. Each is
+            // written to `feed_aux_packets` — never to `ticks`, never to a
+            // candle — so the received packet survives.
+            Ok(ref other) => {
+                c.non_tick.increment(1);
+                let _kept = ingest.ingest_non_tick_at(
+                    other,
+                    &frame.bytes[offset..end],
+                    frame.seq,
+                    packets,
+                    received_at_nanos,
+                );
+            }
             Err(_) => {
                 // The dispatcher already counts unknown response codes and
                 // logs protocol drift; a second log line here would amplify a
@@ -14414,6 +14613,9 @@ pub fn refold_wal_frames(
     gaps: &[usize],
 ) -> WalRefoldOutcome {
     let mut out = WalRefoldOutcome::default();
+    // Item 45h: the replay's `feed_aux_packets` rows, reported beside
+    // `non_tick` below as the difference across this pass.
+    let aux_rows_before = ingest.writer.aux_rows_appended();
     // Held for the whole backlog; cleared at the single exit below. See the
     // `replaying_wal` field for why a replayed frame must never reach the
     // volume ranking.
@@ -14757,12 +14959,23 @@ pub fn refold_wal_frames(
                 Ok(ParsedFrame::Tick(tick)) => {
                     refold_one_tick(ingest, &tick, *frame_seq, packets, recv_millis, &mut out);
                 }
-                Ok(_non_tick) => {
+                Ok(non_tick) => {
                     // Open interest, previous close, disconnect, market status.
                     // Legitimate and expected in a replayed segment, and NOT
                     // loss — counted separately so `undecodable` below means
                     // what it says.
                     out.non_tick = out.non_tick.saturating_add(1);
+                    // Item 45h: written through the SAME function the live
+                    // drain uses, with the same `(frame_seq, packet_index)`
+                    // and receipt, so a replay reproduces the live row and the
+                    // DEDUP key collapses it.
+                    let _kept = ingest.ingest_non_tick_at(
+                        &non_tick,
+                        &bytes[offset..end],
+                        *frame_seq,
+                        packets,
+                        *wal_received_at_nanos,
+                    );
                 }
                 Err(_) => {
                     out.undecodable = out.undecodable.saturating_add(1);
@@ -14793,6 +15006,15 @@ pub fn refold_wal_frames(
         .increment(out.undecodable);
     metrics::counter!("tv_dhan_wal_refolded_total", "outcome" => "non_tick")
         .increment(out.non_tick);
+    // Item 45h: the rows this replay re-offered to `feed_aux_packets` (non-tick
+    // packets, connect snapshots, out-of-window ticks). A label value on the
+    // existing series, so no new metric name.
+    metrics::counter!("tv_dhan_wal_refolded_total", "outcome" => "aux_rows").increment(
+        ingest
+            .writer
+            .aux_rows_appended()
+            .saturating_sub(aux_rows_before),
+    );
     metrics::counter!("tv_dhan_wal_refolded_total", "outcome" => "depth_frame")
         .increment(out.depth_frames);
     // TVW4 (2026-09-02): the two outcomes of the depth arm, on the SAME
@@ -21113,13 +21335,18 @@ mod tests {
              refusal (2026-09-23 split) so a replay never reports it as loss — not folded, and \
              not written to a day that is not today; got {outcome:?}"
         );
+        // Re-blessed 2026-10-02 (item 45h, zero loss): the ONE buffered row
+        // is the `feed_aux_packets` connect-snapshot row, stamped at receipt.
+        // `ticks` still gets nothing: pending == aux rows proves it.
         assert_eq!(
-            ingest.pending_rows(),
-            0,
-            "no row may be buffered for the writer: `ts` is the designated \
+            (ingest.pending_rows(), ingest.writer.aux_rows_appended()),
+            (1, 1),
+            "no `ticks` row may be buffered: `ts` is the designated \
              timestamp, so a written row would land in ANOTHER DAY'S partition. \
-             This assertion is the one the operator's directive turns on"
+             This assertion is the one the operator's directive turns on. The \
+             packet itself is kept in feed_aux_packets"
         );
+        assert_eq!(ingest.writer.pending(), 1, "the only row is the aux row");
 
         let (price, ts, slot, oos, stale, oob, future) = ingest.refusals();
         assert_eq!(
@@ -21180,13 +21407,17 @@ mod tests {
              refusal (2026-09-23 split) — this is the exact shape the morning \
              replay counted as LOST and paged on; got {outcome:?}"
         );
+        // Re-blessed 2026-10-02 (item 45h, zero loss): the snapshot is kept
+        // as ONE `feed_aux_packets` row stamped at RECEIPT (today), never as a
+        // `ticks` row: pending == aux rows proves no tick row was buffered.
         assert_eq!(
-            ingest.pending_rows(),
-            0,
-            "NO row may be buffered: `ts` is the designated timestamp, so this \
-             row would land in a partition for a day that already closed — \
+            (ingest.pending_rows(), ingest.writer.aux_rows_appended()),
+            (1, 1),
+            "NO `ticks` row may be buffered: `ts` is the designated timestamp, so \
+             this row would land in a partition for a day that already closed — \
              which is precisely the row the operator found"
         );
+        assert_eq!(ingest.writer.pending(), 1, "the only row is the aux row");
 
         let (price, ts, slot, oos, stale, oob, future) = ingest.refusals();
         assert_eq!(
@@ -24258,7 +24489,7 @@ mod wal_refold_tests {
             "a decode failure must be counted"
         );
         assert!(
-            body.contains("Ok(_non_tick) =>") && body.contains("out.non_tick"),
+            body.contains("Ok(non_tick) =>") && body.contains("out.non_tick"),
             "a legitimate non-tick packet must be counted SEPARATELY, or \
              `undecodable` silently includes ordinary OI and prev-close frames"
         );
@@ -28953,3 +29184,9 @@ mod socket_stop_tests {
         );
     }
 }
+
+// Item 45h (2026-10-02): the non-tick packet classes persisted to
+// `feed_aux_packets`. Declared LAST so the source scans that cut this file at
+// its first `#[cfg(test)]` still see the whole production body.
+#[cfg(test)]
+mod feed_aux_tests;

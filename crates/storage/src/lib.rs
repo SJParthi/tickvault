@@ -267,6 +267,11 @@ pub mod option_contract_1m_rest_persistence;
 // second-granular Dhan timestamps collapse every tick but the last in each
 // second).
 pub mod depth_persistence;
+// Plan item 45h (2026-10-02): the feed packets the parser decodes and the fold
+// does not use (open interest, previous close, market status, disconnect, the
+// connect snapshot, out-of-window ticks). Rows ride the `ticks` writer's
+// buffer, offload thread and spill tier.
+pub mod feed_aux_persistence;
 pub mod tick_persistence;
 // Automatic drain for the live-tick spill tier (2026-08-21): posts spilled
 // ILP bodies back to QuestDB's /write endpoint and truncates on success, so
