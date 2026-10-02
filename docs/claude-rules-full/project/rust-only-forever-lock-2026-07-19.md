@@ -1014,3 +1014,29 @@ them; this section is amended when each lands.
   ceiling.
 - Weakens the shell detection (name, template suffix, or shebang) or drops the
   untracked-file listing.
+
+## §0.11. 2026-10-02 — `libc` becomes a DIRECT dependency (owner-approved)
+
+**Operator quotes (verbatim, typos included):**
+
+- Parthi, 2026-10-02 11:51:46Z, project chat: *"go ahea ddude"* — replying to
+  a post listing five pending decisions, including pinning the socket reader
+  thread to its own CPU core with the `libc` crate as a direct dependency.
+- Parthi, 2026-10-02 12:40:54Z, project chat: *"go ahead approved everyhtign
+  dude okay?"* — a direct reply to a post that said "The phone alert and core
+  pinning still wait for you to reply there with \"approve stall alarm and
+  libc dependency\"."
+
+**What is authorized:** `libc = "=0.2.185"` in the root `[workspace.dependencies]`,
+declared `{ workspace = true }` by `crates/core` only, for
+`sched_getaffinity` / `sched_setaffinity` / `CPU_SET` / `CPU_ISSET` in
+`crates/core/src/websocket/reader_runtime.rs` (Linux only). The version is
+exactly the one `Cargo.lock` already resolved as a transitive dependency, so
+the lock file gains no package and no new native build tool (`libc`'s
+`build.rs` is Rust; `NATIVE_BUILD_TOOLCHAIN_BUDGET` is unchanged). It binds
+the C library every Rust binary on Linux already links; no non-Rust runtime
+component enters the product path.
+
+**REJECT:** any other `libc` call site added without its own reason recorded
+here; a version range or an unpinned `libc`; using this approval to add any
+other FFI crate; pinning any thread to core 0.

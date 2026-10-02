@@ -709,6 +709,20 @@ rules:
       indicates a slow disk and should escalate via Prometheus
       alert, not per-event Telegram.
 
+  - name: hot-path-03-reader-pin-not-applied-silence
+    match:
+      code: HOT-PATH-03
+    action: silence
+    runbook_path: docs/error-runbooks/wave-1-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 86400
+    justification: >-
+      HOT-PATH-03 is one boot-time line: the socket reader threads run
+      unpinned because the requested core was refused (core 0, a core
+      outside AllowedCPUs, a bad value, or the kernel refused). The readers
+      still run on their own runtime. The fix is the unit's
+      TICKVAULT_WS_READER_CORE value, an operator config edit.
+
   - name: prev-close-01-ilp-failed-escalate
     match:
       code: PREVCLOSE-01

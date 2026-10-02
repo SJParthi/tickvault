@@ -163,6 +163,10 @@ pub enum ErrorCode {
     HotPath01SyncFsFailed,
     /// HOT-PATH-02: hot-path writer queue full / closed / uninitialized.
     HotPath02WriterQueueDrop,
+    /// HOT-PATH-03: the socket reader threads run unpinned because the
+    /// requested core pin was refused (core 0, a core outside the allowed
+    /// set, an unparseable value, or the kernel said no). Boot continues.
+    HotPath03ReaderPinNotApplied,
     /// TICK-SPILL-01 — a rescued tick-spill file was PERMANENTLY refused by
     /// QuestDB and has been quarantined so the rest of the backlog can drain.
     ///
@@ -1067,6 +1071,7 @@ impl ErrorCode {
             // Wave 1 (PR #393)
             Self::HotPath01SyncFsFailed => "HOT-PATH-01",
             Self::HotPath02WriterQueueDrop => "HOT-PATH-02",
+            Self::HotPath03ReaderPinNotApplied => "HOT-PATH-03",
             Self::TickSpill01FileQuarantined => "TICK-SPILL-01",
             // PR #5 (2026-05-19): PHASE2-01 / PHASE2-02 retired.
             Self::PrevClose01IlpFailed => "PREVCLOSE-01",
@@ -1457,6 +1462,7 @@ impl ErrorCode {
             Self::InstrumentP2TradingDayGuard
             | Self::Dh910Other
             | Self::HotPath02WriterQueueDrop
+            | Self::HotPath03ReaderPinNotApplied
             | Self::WsGap04PostCloseSleep
             | Self::DiskWatcher01Respawned
             | Self::AuthGap03TokenForceRenewedOnWake
@@ -1506,6 +1512,7 @@ impl ErrorCode {
             }
             Self::HotPath01SyncFsFailed
             | Self::HotPath02WriterQueueDrop
+            | Self::HotPath03ReaderPinNotApplied
             | Self::PrevClose01IlpFailed
             | Self::PrevClose02FirstSeenInconsistency
             | Self::PrevOi01CacheEmptyAtBoot
@@ -1795,6 +1802,7 @@ impl ErrorCode {
             Self::OrderReady01GateRefused,
             Self::HotPath01SyncFsFailed,
             Self::HotPath02WriterQueueDrop,
+            Self::HotPath03ReaderPinNotApplied,
             Self::TickSpill01FileQuarantined,
             // PR #5 (2026-05-19): Phase201DispatchFailed + Phase202EmitGuardDropped retired.
             Self::PrevClose01IlpFailed,
