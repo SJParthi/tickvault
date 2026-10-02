@@ -2089,7 +2089,7 @@ mod tests {
 
     /// Audit PR31b-2: the previous marker is published once, first call wins.
     #[test]
-    fn the_previous_marker_is_published_once() {
+    fn test_publish_previous_unwritten_stores_the_marker_once() {
         let first = PreviousUnwritten::Absent;
         let _ = publish_previous_unwritten(first);
         let stored = previous_unwritten().expect("published");
