@@ -956,7 +956,7 @@ jobs:
       # connection and every console request 503s box-offline while the box is
       # RUNNING. Exposure unchanged: the box SG admits 9000 from the Lambda SG
       # ONLY (main.tf dynamic ingress) — never public. .env is read by EVERY
-      # compose caller (this step, user-data boot, infra.rs, ensure-questdb.sh),
+      # compose caller (this step, user-data boot, infra.rs, tickvault ensure-questdb),
       # so the bind persists across restarts. Idempotent grep-or-append.
       # Verify QuestDB is actually listening on 9000 (HTTP) within 30s
       # Console-shell HARD canary (2026-07-06 shell-hang fix; hard gate 2026-07-08): the console back lambda rewrites GET / -> /index.html, so /index.html must complete box-locally within 5s on every box deploy — this is the lane that ships QuestDB image bumps. curl -f fails on any code >= 400, and --max-time 5 fails an unframed keep-alive response whose body never completes (curl exit 28): completion-within-5s IS the framing assertion. Disclosed limitation: a framed 3xx at /index.html (< 400) passes curl -f here; the end-to-end proxy gate in terraform-apply.yml requires a literal 200 and catches that shape on the next in-window apply. Never probe bare / here: QuestDB answers it with an unframed keep-alive 301 that would hang this shell.

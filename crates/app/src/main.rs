@@ -551,6 +551,19 @@ async fn async_main() -> Result<()> {
         .expect("failed to install rustls CryptoProvider — cannot proceed without TLS"); // APPROVED: bootstrap — TLS mandatory, failure is fatal
 
     // -----------------------------------------------------------------------
+    // Step 0b: QuestDB self-heal CLI short-circuit (cold path, plan item D6d).
+    // -----------------------------------------------------------------------
+    // `tickvault ensure-questdb` is run by the systemd unit's ExecStartPre and
+    // by the operator console's SSM commands to make the tv-questdb container
+    // running (it replaced scripts/ensure-questdb.sh). It exits 0 (up) / 1
+    // (could not bring it up). After Step 0 because its SSM credential read
+    // needs TLS; before config loading because it needs no config.
+    if tickvault_app::ensure_questdb::is_ensure_questdb_invocation(std::env::args()) {
+        let code = tickvault_app::ensure_questdb::run_ensure_questdb().await;
+        std::process::exit(code);
+    }
+
+    // -----------------------------------------------------------------------
     // Step 1: Load and validate configuration
     // -----------------------------------------------------------------------
     // Merge order (last-write-wins): base.toml → config/<env>.toml → local.toml.
