@@ -16273,6 +16273,16 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         seed_rx,
     ));
 
+    // ---- kernel receive-queue sampler ---------------------------------------
+    //
+    // Cold, on its own task, once a second in session: how many bytes the
+    // KERNEL holds for our :443 sockets that the drain has not read yet. The
+    // drain's own counters cannot see this; a backlog sits below them, in the
+    // socket buffer, until Dhan skips a slow consumer forward. Gauges plus one
+    // edge-triggered coded line; it never touches the drain.
+    let _kernel_rx_queue_sampler =
+        crate::kernel_rx_queue_sampler::spawn_kernel_rx_queue_sampler(Arc::clone(&params.shutdown));
+
     // ---- socket lifecycle audit -------------------------------------------
     //
     // ONE consumer for all fifteen market-data sockets, spawned before the
