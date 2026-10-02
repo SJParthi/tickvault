@@ -1949,8 +1949,7 @@ async fn async_main() -> Result<()> {
     tokio::spawn(async move {
         use std::time::Duration;
         use tickvault_storage::raw_frame_upload as raw_upload;
-        let Some(store) = tickvault_storage::s3_cold::S3Cold::load(&raw_upload_bucket).await
-        else {
+        let Some(store) = tickvault_storage::s3_cold::S3Cold::load(&raw_upload_bucket).await else {
             if require_raw_upload {
                 error!(
                     code = tickvault_common::error_code::ErrorCode::StorageGap04S3ArchiveFailed

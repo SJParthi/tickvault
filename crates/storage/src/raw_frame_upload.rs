@@ -230,27 +230,6 @@ fn write_marker(markers_dir: &Path, segment_name: &str, marker: &UploadMarker) -
     Ok(())
 }
 
-/// Test hook for the WAL prune's tests: records a marker for `segment`
-/// claiming `raw_len` bytes.
-#[cfg(test)]
-pub(crate) fn write_marker_for_test(markers_dir: &Path, segment: &Path, raw_len: u64) {
-    let name = segment
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unnamed"); // APPROVED: test-only
-    let marker = UploadMarker {
-        version: MARKER_VERSION,
-        bucket: "tv-test-cold".to_string(),
-        key: segment_key(name, 0),
-        gzip_sha256: String::new(),
-        gzip_len: 0,
-        raw_sha256: String::new(),
-        raw_len,
-        raw_mtime_secs: 0,
-    };
-    write_marker(markers_dir, name, &marker).expect("write test marker"); // APPROVED: test-only
-}
-
 /// IST calendar date (`YYYY-MM-DD`) of a UTC epoch second.
 fn ist_date(utc_secs: i64) -> String {
     chrono::DateTime::from_timestamp(utc_secs.saturating_add(IST_UTC_OFFSET_SECONDS_I64), 0)
@@ -703,6 +682,28 @@ async fn run_pass_with<S: ColdObjectStore>(
         );
     }
     summary
+}
+
+/// Test hook for the WAL prune's tests: records a marker for `segment`
+/// claiming `raw_len` bytes. Kept below every production fn: the loss-counter
+/// guard treats the file's first `#[cfg(test)]` as the end of production code.
+#[cfg(test)]
+pub(crate) fn write_marker_for_test(markers_dir: &Path, segment: &Path, raw_len: u64) {
+    let name = segment
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unnamed"); // APPROVED: test-only
+    let marker = UploadMarker {
+        version: MARKER_VERSION,
+        bucket: "tv-test-cold".to_string(),
+        key: segment_key(name, 0),
+        gzip_sha256: String::new(),
+        gzip_len: 0,
+        raw_sha256: String::new(),
+        raw_len,
+        raw_mtime_secs: 0,
+    };
+    write_marker(markers_dir, name, &marker).expect("write test marker"); // APPROVED: test-only
 }
 
 #[cfg(test)]

@@ -3620,6 +3620,7 @@ mod tests {
             dhan_universe: DhanUniverseConfig::default(),
             dhan_margin_gate: DhanMarginGateConfig::default(),
             exit_orders: ExitOrdersConfig::default(),
+            raw_frame_archive: RawFrameArchiveConfig::default(),
         }
     }
 
