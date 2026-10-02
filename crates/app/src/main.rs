@@ -417,6 +417,10 @@ const MAX_TOKIO_WORKER_THREADS: usize = 64;
 static TOKIO_RUNTIME_SIZING: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 /// What `install_reader_runtime` did in `main`, for the boot log.
 static READER_RUNTIME_OUTCOME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+/// The reader threads' core-pin plan, resolved in `main`, for the boot log.
+static READER_CORE_PLAN: std::sync::OnceLock<
+    tickvault_core::websocket::reader_runtime::ReaderCorePlan,
+> = std::sync::OnceLock::new();
 
 /// Host-derived floor and ceiling for the resolved worker count.
 ///
@@ -485,6 +489,91 @@ fn resolve_tokio_worker_threads(raw: Option<&str>, host_derived: usize) -> usize
     }
 }
 
+/// What the boot log says about the reader threads' core pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReaderPinReport {
+    /// Every reader thread is on this core.
+    Pinned(i64),
+    /// Unpinned by design or by the host shape; an `info!` line.
+    Unpinned(&'static str),
+    /// The operator asked for a pin the process could not apply; a coded
+    /// `warn!` line, once.
+    Refused(&'static str),
+}
+
+/// Pure verdict from the plan, whether the reader runtime exists, and what
+/// its threads recorded.
+fn reader_pin_report(
+    plan: tickvault_core::websocket::reader_runtime::ReaderCorePlan,
+    runtime_installed: bool,
+    pinned_core: i64,
+    pin_failures: u64,
+) -> ReaderPinReport {
+    use tickvault_core::websocket::reader_runtime::ReaderCorePlan as Plan;
+    match plan {
+        Plan::Off => ReaderPinReport::Unpinned("TICKVAULT_WS_READER_CORE=off"),
+        Plan::Unsupported => ReaderPinReport::Unpinned("not Linux"),
+        Plan::DefaultNotAllowed => {
+            ReaderPinReport::Unpinned("core 1 is not in this process's allowed core set")
+        }
+        Plan::RefusedCoreZero => {
+            ReaderPinReport::Refused("core 0 is never used: it services network interrupts")
+        }
+        Plan::NotAllowed(_) => {
+            ReaderPinReport::Refused("the named core is not in this process's allowed core set")
+        }
+        Plan::Invalid => {
+            ReaderPinReport::Refused("TICKVAULT_WS_READER_CORE is not `off` or a core id")
+        }
+        Plan::Pin(_) if !runtime_installed => {
+            ReaderPinReport::Unpinned("no dedicated reader runtime (TICKVAULT_WS_READER_THREADS=0)")
+        }
+        Plan::Pin(_) if pin_failures > 0 || pinned_core < 0 => {
+            ReaderPinReport::Refused("the kernel refused the pin")
+        }
+        Plan::Pin(_) => ReaderPinReport::Pinned(pinned_core),
+    }
+}
+
+/// Logs the reader pin outcome once and sets `tv_ws_reader_pinned_core`
+/// (the core, or -1). Never fails boot.
+fn report_reader_core_pin(plan: tickvault_core::websocket::reader_runtime::ReaderCorePlan) {
+    use tickvault_core::websocket::reader_runtime as rr;
+    let pinned = rr::reader_pinned_core();
+    let (failures, errno) = rr::reader_pin_failures();
+    let report = reader_pin_report(
+        plan,
+        rr::reader_runtime_handle().is_some(),
+        pinned,
+        failures,
+    );
+    let gauge_value = match report {
+        ReaderPinReport::Pinned(core) => core,
+        _ => -1,
+    };
+    metrics::gauge!("tv_ws_reader_pinned_core")
+        .set(f64::from(i32::try_from(gauge_value).unwrap_or(-1)));
+    match report {
+        ReaderPinReport::Pinned(core) => {
+            info!(core, "socket reader threads pinned to their own core");
+        }
+        ReaderPinReport::Unpinned(reason) => {
+            info!(plan = ?plan, reason, "socket reader threads run unpinned");
+        }
+        ReaderPinReport::Refused(reason) => {
+            warn!(
+                code = tickvault_common::error_code::ErrorCode::HotPath03ReaderPinNotApplied
+                    .code_str(),
+                plan = ?plan,
+                reason,
+                failed_threads = failures,
+                os_errno = errno,
+                "socket reader threads run UNPINNED — the requested core pin was not applied"
+            );
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let raw = std::env::var(TOKIO_WORKER_THREADS_ENV).ok();
     let (host_cpus, cpu_source) = host_cpu_allowance();
@@ -512,8 +601,20 @@ fn main() -> Result<()> {
         std::env::var(tickvault_core::websocket::reader_runtime::WS_READER_THREADS_ENV).ok();
     let reader_threads =
         tickvault_core::websocket::reader_runtime::resolve_ws_reader_threads(reader_raw.as_deref());
+    // Core pinning for those threads (2026-10-02): resolved here, against the
+    // process's allowed core set, and reported by `async_main` once logging
+    // and the metrics recorder exist.
+    let core_raw =
+        std::env::var(tickvault_core::websocket::reader_runtime::WS_READER_CORE_ENV).ok();
+    let core_plan = tickvault_core::websocket::reader_runtime::resolve_ws_reader_core_for_process(
+        core_raw.as_deref(),
+    );
+    let _ = READER_CORE_PLAN.set(core_plan);
     let _ = READER_RUNTIME_OUTCOME.set(
-        match tickvault_core::websocket::reader_runtime::install_reader_runtime(reader_threads) {
+        match tickvault_core::websocket::reader_runtime::install_reader_runtime(
+            reader_threads,
+            core_plan.core(),
+        ) {
             Ok(outcome) => format!("{outcome:?}"),
             Err(err) => format!("FAILED({err}) — readers share the main runtime"),
         },
@@ -2146,6 +2247,9 @@ async fn async_main() -> Result<()> {
     }
     if let Some(outcome) = READER_RUNTIME_OUTCOME.get() {
         info!(outcome = %outcome, "socket reader runtime");
+    }
+    if let Some(plan) = READER_CORE_PLAN.get() {
+        report_reader_core_pin(*plan);
     }
 
     // Log trading day status — critical for operational awareness.
@@ -5128,6 +5232,46 @@ async fn wait_for_shutdown_signal() -> &'static str {
 #[allow(clippy::assertions_on_constants)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reader_pin_report_covers_every_plan_and_never_reports_a_failed_pin_as_pinned() {
+        use tickvault_core::websocket::reader_runtime::ReaderCorePlan as Plan;
+        assert_eq!(
+            reader_pin_report(Plan::Pin(1), true, 1, 0),
+            ReaderPinReport::Pinned(1)
+        );
+        // The kernel refused: a coded warning, not a false "pinned".
+        assert!(matches!(
+            reader_pin_report(Plan::Pin(1), true, -1, 1),
+            ReaderPinReport::Refused(_)
+        ));
+        assert!(matches!(
+            reader_pin_report(Plan::Pin(1), true, 1, 1),
+            ReaderPinReport::Refused(_)
+        ));
+        assert!(matches!(
+            reader_pin_report(Plan::Pin(1), false, -1, 0),
+            ReaderPinReport::Unpinned(_)
+        ));
+        for plan in [Plan::Off, Plan::Unsupported, Plan::DefaultNotAllowed] {
+            assert!(
+                matches!(
+                    reader_pin_report(plan, true, -1, 0),
+                    ReaderPinReport::Unpinned(_)
+                ),
+                "{plan:?}"
+            );
+        }
+        for plan in [Plan::RefusedCoreZero, Plan::NotAllowed(7), Plan::Invalid] {
+            assert!(
+                matches!(
+                    reader_pin_report(plan, true, -1, 0),
+                    ReaderPinReport::Refused(_)
+                ),
+                "{plan:?}"
+            );
+        }
+    }
 
     #[test]
     fn stall_scan_reports_starved_only_when_it_can_see_nothing_and_should() {

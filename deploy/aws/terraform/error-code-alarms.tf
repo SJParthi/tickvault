@@ -109,7 +109,8 @@
 #   `error_code_alerts` map entries (was 18 on 2026-09-17; +3 on 2026-09-24,
 #   when the three `ws-gap-03-xverify-*` verdicts came back with the restored
 #   1-minute cross-verification — noise-lock §2.5; +1 on 2026-09-27,
-#   `aggregator-stall-01`, audit PR40d — noise-lock §2.7). Re-count with:
+#   `aggregator-stall-01`, audit PR40d — noise-lock §2.7; +1 on 2026-10-02,
+#   `hot-path-stall-01`, noise-lock §2.8 — so 23 entries). Re-count with:
 #     grep -c '^resource "aws_cloudwatch_log_metric_filter"' <this file>
 #     grep -c '^resource "aws_cloudwatch_metric_alarm"'      <this file>
 #   A count in a comment is a claim, and a claim carries a date — this repo has
@@ -372,6 +373,24 @@ locals {
       dta         = 1
       ok_recovery = false # 2026-09-27: the wait already ended when the line was written; an auto-OK would read as a repair nobody made
       desc        = "AGGREGATOR-STALL-01 = the live feed stopped reading the socket for waited_ms (>= 1 s) while it wrote a refused candle to a stalled disk itself; the escalation queue was full or its thread had died. The candle reached disk unless outcome=Lost (that also fires AGGREGATOR-DROP-01). Ticks during the wait may have been skipped by the exchange. Fields: waited_ms, max_waited_ms, stalls since the last line (one line a minute at most). Check df -h /data, the EBS volume health and data/spill/. NO recovered/OK page. Runbook: docs/error-runbooks/wave-6-error-codes.md"
+    }
+    # HOT-PATH-STALL-01 (added 2026-10-02, noise-lock §2.8 — owner-approved
+    # "approve stall alarm"). Emit site:
+    # crates/storage/src/hot_path_telemetry.rs::report_stall, on the
+    # tv-telemetry OS thread: in session (09:00-15:40 IST) a watched heartbeat
+    # (main runtime, reader runtime, frame drain) at least 2 s old, or one
+    # hot-path stage sample at least 2 s long. Edge-triggered per signal,
+    # re-armed on recovery, at most one line a minute. ok_recovery = false: a
+    # stall that ended is not a repair, and ticks skipped meanwhile do not
+    # come back.
+    "hot-path-stall-01" = {
+      pattern     = "{ $.code = \"HOT-PATH-STALL-01\" && $.level = \"ERROR\" }"
+      period      = 300
+      threshold   = 1
+      eval        = 1
+      dta         = 1
+      ok_recovery = false # 2026-10-02: the stall already ended or is latched; an auto-OK would read as a repair nobody made
+      desc        = "HOT-PATH-STALL-01 = in session, a step on the Dhan live path stalled for at least 2 s: a tokio runtime or the frame drain made no progress (kind=heartbeat), or one socket hand-off, ring wait or runtime wake took that long (kind=stage). Socket reads may have waited and Dhan may have skipped ticks. Fields: signal, kind, stalled_secs, signals, missed_episodes (one line a minute at most). Check host CPU, disk, QuestDB, and the tv_task_heartbeat_age_seconds / tv_hot_path_stage_max_ns gauges. NO recovered/OK page. Runbook: docs/error-runbooks/hot-path-stall-error-codes.md"
     }
     # WAL-SUSPEND-01 (added 2026-07-10, W2 PR#6 — audit follow-up row 10):
     # a QuestDB table's WAL apply is SUSPENDED (post disk-full / apply

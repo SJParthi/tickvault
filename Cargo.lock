@@ -4235,6 +4235,7 @@ dependencies = [
  "csv",
  "dhat",
  "futures-util",
+ "libc",
  "loom",
  "metrics",
  "proptest",

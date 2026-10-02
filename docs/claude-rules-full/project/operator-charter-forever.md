@@ -112,6 +112,15 @@ The `.mcp.json` `tickvault-logs` entry is loaded automatically — same MCP tool
 > `crates/common/tests/core_affinity_claim_guard.rs`, plus a measurement showing the pin
 > helps on the instance class actually in use. Until then this row's other three
 > mechanisms (DHAT, Criterion, tick-gap) stand unchanged and remain enforced.
+>
+> **2026-10-02 — pinning is back, through `libc`, NOT `core_affinity`, and NOT core 0.**
+> Owner-approved (quotes in `rust-only-forever-lock-2026-07-19.md` §0.11). The socket
+> reader threads (`tv-ws-reader`, their own runtime since 2026-10-02) pin to core 1 by
+> default, `TICKVAULT_WS_READER_CORE` overrides, core 0 is refused, and a refused pin runs
+> unpinned with one coded `HOT-PATH-03` line. Real call site:
+> `crates/core/src/websocket/reader_runtime.rs`; `tv_ws_reader_pinned_core` reports it.
+> **Still NOT done:** the measurement this note asks for. Nothing has shown the pin helps
+> on the r8g.xlarge; the cell above stays withdrawn until that number exists.
 | QuestDB never fails | ABSORB via 3-tier rescue→spill→DLQ + schema self-heal via `ALTER ADD COLUMN IF NOT EXISTS` | item must not break self-heal |
 | O(1) latency | `from_le_bytes` + `papaya` + `Arc<HashMap>` + SPSC bounded; bench-gate ≤5% regression on hot path | item adds Criterion bench if hot path |
 | Uniqueness + dedup | Composite `(security_id, exchange_segment)` per I-P1-11 + DEDUP UPSERT KEYS on every storage table | item DEDUP key includes segment |

@@ -178,7 +178,12 @@ window's stall count and longest wait folded into the next line. Nothing is
 lost: the candle is written. The honest limit is that the line is written when
 the wait ENDS, so a disk that never returns is caught by the liveness alarms,
 not this one. `ok_recovery = false`: a quiet window is not proof the disk is
-healthy**)**.
+healthy**)**, and **HOT-PATH-STALL-01 (added 2026-10-02** — owner-approved,
+authority `dhan-rest-only-noise-lock-2026-07-14.md` §2.8: in session, a tokio
+runtime or the frame drain made no progress for 2 s, or one hot-path step
+took 2 s; written by the telemetry thread, edge-triggered per signal, at most
+one line a minute. `ok_recovery = false`: a stall that ended is not a
+repair**)**.
 **Everything else
 is log-sink-only** unless it has its own metric alarm (app-alarms.tf) or a
 typed `NotificationEvent`. Counter-side (non-errcode) pager added
