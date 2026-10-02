@@ -10,6 +10,7 @@
 //! | `SEAL_WRITER_SHUTDOWN_BUDGET_SECS` | 75s | second (main.rs:3585) |
 //! | `SEAL_ESCALATION_SHUTDOWN_BUDGET_SECS` | 5s | third (added 2026-08-28) |
 //! | `WAL_SPILL_SHUTDOWN_BUDGET_SECS` | 10s | fourth (added 2026-08-28) |
+//! | `DHAN_SOCKET_STOP_BUDGET_SECS` | 5s | now FIRST, before all four (added 2026-10-02, Z11d) |
 //!
 //! …for a worst case of **95 seconds**, while `deploy/systemd/tickvault.service`
 //! carried `TimeoutStopSec=30`. systemd therefore SIGKILLed the process 65s
@@ -96,6 +97,8 @@ fn app_shutdown_budgets_fit_inside_systemd_stop_timeout() {
     let spill_rs = read("crates/storage/src/ws_frame_spill.rs");
     let unit = read("deploy/systemd/tickvault.service");
 
+    // Z11d (2026-10-02): the socket close now runs BEFORE everything else.
+    let sockets = const_secs(&main_rs, "DHAN_SOCKET_STOP_BUDGET_SECS");
     let lane = const_secs(&main_rs, "DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS");
     let seal = const_secs(&main_rs, "SEAL_WRITER_SHUTDOWN_BUDGET_SECS");
     // Third wait, and it lives in ANOTHER CRATE. `main` reaches it through
@@ -110,13 +113,14 @@ fn app_shutdown_budgets_fit_inside_systemd_stop_timeout() {
     // SUM. Summing (rather than taking the max) is the whole point: the bug
     // was that the seal writer inherited only the remainder after the lane
     // flush had already spent its budget.
-    let worst_case = lane + seal + escalation + wal;
+    let worst_case = sockets + lane + seal + escalation + wal;
 
     assert!(
         worst_case < timeout,
         "SHUTDOWN BUDGET OVERRUN — systemd will SIGKILL the app mid-drain.\n\
          \n\
-           DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS = {lane}s (runs first)\n\
+           DHAN_SOCKET_STOP_BUDGET_SECS         = {sockets}s (runs first)\n\
+           DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS = {lane}s (then this)\n\
            SEAL_WRITER_SHUTDOWN_BUDGET_SECS     = {seal}s (runs second)\n\
            SEAL_ESCALATION_SHUTDOWN_BUDGET_SECS = {escalation}s (runs third)\n\
            WAL_SPILL_SHUTDOWN_BUDGET_SECS       = {wal}s (runs fourth)\n\
@@ -140,7 +144,8 @@ fn stop_timeout_keeps_a_real_margin_not_a_hairline() {
     let spill_rs = read("crates/storage/src/ws_frame_spill.rs");
     let unit = read("deploy/systemd/tickvault.service");
 
-    let worst_case = const_secs(&main_rs, "DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS")
+    let worst_case = const_secs(&main_rs, "DHAN_SOCKET_STOP_BUDGET_SECS")
+        + const_secs(&main_rs, "DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS")
         + const_secs(&main_rs, "SEAL_WRITER_SHUTDOWN_BUDGET_SECS")
         + const_secs(&main_rs, "SEAL_ESCALATION_SHUTDOWN_BUDGET_SECS")
         + const_secs(&spill_rs, "WAL_SPILL_SHUTDOWN_BUDGET_SECS");
@@ -165,6 +170,7 @@ fn the_stop_timeout_is_documented_as_derived_not_guessed() {
     // constant it is derived from. Renaming a constant without updating the
     // rationale leaves the next reader unable to re-derive the number.
     for needle in [
+        "DHAN_SOCKET_STOP_BUDGET_SECS",
         "DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS",
         "SEAL_WRITER_SHUTDOWN_BUDGET_SECS",
         "SEAL_ESCALATION_SHUTDOWN_BUDGET_SECS",
@@ -224,5 +230,42 @@ fn the_panic_hook_drains_the_wal_before_it_aborts() {
     assert!(
         skip < wait,
         "the writer-thread skip must come before any wait"
+    );
+}
+
+/// Z11d (2026-10-02): the sockets must be CLOSED before the lane drain is
+/// stopped, and the drain before the WAL writer. Until then nothing closed
+/// the sockets, so they kept appending to a WAL whose writer was being shut
+/// down, and records landing after its last empty poll were lost silently.
+#[test]
+fn shutdown_closes_the_sockets_before_the_lane_and_the_wal() {
+    let main_rs = strip_comments(&read("crates/app/src/main.rs"));
+    let stop = main_rs
+        .find("stop_feed_sockets(DHAN_SOCKET_STOP_BUDGET)")
+        .expect("shutdown must close the Dhan feed sockets");
+    let lane = main_rs
+        .find("dhan_feed_shutdown.notify_one()")
+        .expect("shutdown signals the lane drain");
+    let wal = main_rs
+        .find("spill.shutdown(")
+        .expect("shutdown drains the WAL writer");
+    assert!(
+        stop < lane,
+        "the sockets must close before the lane drain is signalled"
+    );
+    assert!(lane < wal, "the lane must stop before the WAL writer does");
+
+    let stack = strip_comments(&read("crates/app/src/dhan_feed_stack.rs"));
+    let body_at = stack
+        .find("async fn request_stop_and_wait(")
+        .expect("the socket-stop wait exists");
+    let body = &stack[body_at..];
+    let request = body.find("stop.request()").expect("it requests the stop");
+    let wait = body
+        .find("alive.load(")
+        .expect("it waits on the live socket count");
+    assert!(
+        request < wait,
+        "the stop is requested before the wait begins"
     );
 }

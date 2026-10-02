@@ -4485,6 +4485,20 @@ async fn build_shared_infra(
 /// honest limit of the guard below.
 const DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS: u64 = 30;
 
+/// How long shutdown waits for the Dhan feed sockets to close before it stops
+/// the lane drain (Z11d, 2026-10-02). Runs FIRST, before every other budget
+/// in the sequential sum `shutdown_budget_fits_systemd_guard.rs` checks.
+///
+/// Sized from the close path, not guessed: a socket sees the stop within one
+/// 1 s idle poll, then spends at most two 2 s `CLOSE_HANDSHAKE_WAIT`s (the
+/// Close write and the drain of the peer's reply). 5 s covers that and keeps
+/// the guard's 20 s margin at `TimeoutStopSec=145`.
+const DHAN_SOCKET_STOP_BUDGET_SECS: u64 = 5;
+
+/// [`DHAN_SOCKET_STOP_BUDGET_SECS`] as a `Duration`.
+const DHAN_SOCKET_STOP_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(DHAN_SOCKET_STOP_BUDGET_SECS);
+
 /// [`DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS`] as a `Duration`.
 const DHAN_LANE_SHUTDOWN_FLUSH_BUDGET: std::time::Duration =
     std::time::Duration::from_secs(DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS);
@@ -4752,6 +4766,34 @@ async fn run_process_runloop(
         warn!("second shutdown signal received — forcing immediate exit");
         std::process::exit(1);
     });
+
+    // 5a. Close the Dhan feed sockets FIRST (Z11d, 2026-10-02).
+    //
+    // Until this step the sockets took no stop signal: the notify below
+    // stops only the frame DRAIN, so every socket kept reading and appending
+    // to the WAL right up to process exit while the WAL writer was shut down
+    // beneath it (step 5d), and records that landed after the writer's last
+    // empty poll were dropped with its channel. `WsFrameSpill::shutdown`
+    // documents "call AFTER the sockets are closed"; this is what closes them.
+    // Each socket parks through `close_capturing`, so frames read during the
+    // close handshake still reach the WAL and the ring, and the drain, still
+    // running, folds them. Bounded: a socket that will not close in time is
+    // reported and left, never waited on past the stop timeout.
+    let sockets_left_open =
+        tickvault_app::dhan_feed_stack::stop_feed_sockets(DHAN_SOCKET_STOP_BUDGET).await;
+    if sockets_left_open == 0 {
+        info!("Dhan live feed: every socket closed before the lane drain was stopped");
+    } else {
+        error!(
+            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+            source = "socket_stop_incomplete",
+            sockets_left_open,
+            budget_secs = DHAN_SOCKET_STOP_BUDGET_SECS,
+            "Dhan live feed: sockets were still open when the socket-stop budget ran out — \
+             they may still append to the WAL while it shuts down, and those frames are \
+             counted as WAL drops rather than written"
+        );
+    }
 
     // 5b. Dhan live lane: seal + flush the day's tail (RESTORED 2026-08-14).
     //

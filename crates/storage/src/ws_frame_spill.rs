@@ -1179,6 +1179,9 @@ impl WsFrameSpill {
                     }
                     thread::sleep(WAL_WRITER_RESPAWN_BACKOFF);
                 }
+                // Z11d: whatever landed after the last empty poll is about to
+                // drop with `rx`. Count it rather than lose it silently.
+                count_records_left_at_writer_exit(&rx);
             })
             .map_err(|e| anyhow::anyhow!("spawn spill writer thread: {e}"))?;
         ABORT_DRAIN.store(Some(Arc::clone(&abort_drain))); // APPROVED: Arc clone in the one-shot constructor
@@ -1737,6 +1740,34 @@ fn finalise_segment(
             );
         }
     }
+}
+
+/// Counts, and empties, what is still in the spill channel when the writer
+/// thread is about to exit and drop it (Z11d, 2026-10-02). Returns the count.
+///
+/// The writer exits on a stop only after a whole poll with the channel empty,
+/// but an `append` can still land between that poll and the thread dropping
+/// `rx`. Such a record was acknowledged as `Spilled` and is never written; it
+/// used to vanish with the channel uncounted. It now moves
+/// [`WAL_SPILL_SHUTDOWN_INCOMPLETE_COUNTER`] and logs a coded error, the same
+/// accounting `WsFrameSpill::shutdown` gives records left at its deadline.
+///
+/// Honest limit: an append landing after this count and before the drop is
+/// still uncounted. That window is a few instructions, against the poll-long
+/// one it replaces. Since Z11d `main` closes the sockets before the WAL, so
+/// this should read zero on every clean stop.
+fn count_records_left_at_writer_exit(rx: &Receiver<WalRecord>) -> usize {
+    let left = rx.try_iter().count();
+    if left > 0 {
+        metrics::counter!(WAL_SPILL_SHUTDOWN_INCOMPLETE_COUNTER).increment(left as u64);
+        error!(
+            code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+            left,
+            "WAL spill writer exited with records still in its channel — these frames \
+             were captured and acknowledged but never written; they are gone"
+        );
+    }
+    left
 }
 
 fn writer_loop(
@@ -11166,6 +11197,49 @@ mod tests {
                 proptest::prop_assert_eq!(read.frames.len(), payloads.len());
             }
         }
+    }
+
+    // --- Z11d: records left at writer exit are counted (2026-10-02) ---------
+
+    /// What used to drop silently with the writer's channel is now counted
+    /// and emptied.
+    #[test]
+    fn test_regression_records_enqueued_after_writer_exit_are_counted_not_silent() {
+        let (tx, rx) = bounded::<WalRecord>(8);
+        for k in 0..3u64 {
+            tx.try_send(WalRecord {
+                ws_type: WsType::LiveFeed,
+                frame_seq: k + 1,
+                received_at_nanos: WAL_RECEIPT_UNKNOWN_NANOS,
+                endpoint: WalEndpoint::MainFeed,
+                frame: Bytes::from_static(b"late"),
+            })
+            .unwrap();
+        }
+        assert_eq!(count_records_left_at_writer_exit(&rx), 3);
+        assert!(rx.is_empty());
+        assert_eq!(
+            count_records_left_at_writer_exit(&rx),
+            0,
+            "a clean exit reads zero"
+        );
+    }
+
+    /// The writer thread reaches the count on its way out.
+    #[test]
+    fn the_writer_thread_counts_its_channel_before_dropping_it() {
+        let src = include_str!("ws_frame_spill.rs");
+        let spawn_at = src
+            .find(".name(WAL_WRITER_THREAD_NAME.to_string())")
+            .expect("writer spawn");
+        let spawn = &src[spawn_at..];
+        let end = spawn
+            .find(".map_err(|e| anyhow::anyhow!(\"spawn spill writer thread")
+            .expect("end of spawn");
+        assert!(
+            spawn[..end].contains("count_records_left_at_writer_exit(&rx);"),
+            "the writer closure must count what is left before rx drops"
+        );
     }
 
     // --- Z11b: the panic hook's bounded drain (2026-10-02) ------------------

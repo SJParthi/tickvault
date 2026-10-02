@@ -474,6 +474,52 @@ fn monotonic_ms() -> i64 {
     i64::try_from(elapsed).unwrap_or(i64::MAX)
 }
 
+/// How often [`stop_feed_sockets`] re-reads the live socket count.
+const SOCKET_STOP_POLL: std::time::Duration = std::time::Duration::from_millis(20); // APPROVED: this IS the named constant the rule asks for
+
+/// Asks every Dhan feed socket to close, then waits, bounded by `budget`,
+/// for their tasks to finish (Z11d, 2026-10-02). Returns how many were still
+/// running when it gave up: `0` is a clean close.
+///
+/// `main` calls this BEFORE it signals the lane drain and long before it
+/// stops the WAL writer. Until then nothing closed the sockets at all: they
+/// kept appending while the writer shut down beneath them, and records that
+/// landed after its last empty poll were dropped with the channel. Each
+/// socket parks with `ParkReason::Shutdown` through `close_capturing`, so
+/// frames read during the close handshake still reach the WAL and the ring,
+/// and the drain (still running) folds them.
+///
+/// Cold path, once per process. Polls every [`SOCKET_STOP_POLL`]; a socket
+/// sees the request within one `IDLE_POLL_INTERVAL` (1 s) and then spends up
+/// to two `CLOSE_HANDSHAKE_WAIT`s (2 s each) closing.
+// TEST-EXEMPT: a two-line wrapper over `request_stop_and_wait`, which is tested; calling it from a test would park every socket wired to the process-wide SOCKET_STOP, including other tests' sockets.
+pub async fn stop_feed_sockets(budget: std::time::Duration) -> usize {
+    request_stop_and_wait(
+        &tickvault_core::websocket::pool_supervisor::SOCKET_STOP,
+        &ALIVE_CONNECTIONS,
+        budget,
+    )
+    .await
+}
+
+/// [`stop_feed_sockets`] over an explicit stop and live count, so it can be
+/// tested without touching the process-wide ones.
+async fn request_stop_and_wait(
+    stop: &tickvault_core::websocket::pool_supervisor::SocketStop,
+    alive: &AtomicUsize,
+    budget: std::time::Duration,
+) -> usize {
+    stop.request();
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let remaining = alive.load(Ordering::SeqCst);
+        if remaining == 0 || tokio::time::Instant::now() >= deadline {
+            return remaining;
+        }
+        tokio::time::sleep(SOCKET_STOP_POLL).await;
+    }
+}
+
 /// RAII counter for [`ALIVE_CONNECTIONS`].
 ///
 /// The increment happens OUTSIDE the socket task, deliberately, so the gauge
@@ -13825,7 +13871,12 @@ fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize 
         };
         // R7 (2026-10-01): no dial while this process does not hold the
         // dual-instance lock. Live sockets are never closed by it.
-        let sink = Arc::new(sink.with_dial_permit(Arc::clone(instance_lock_held)));
+        // Z11d (2026-10-02): `main` closes every socket through this before it
+        // stops the WAL writer. See `stop_feed_sockets`.
+        let sink = Arc::new(
+            sink.with_dial_permit(Arc::clone(instance_lock_held))
+                .with_socket_stop(&tickvault_core::websocket::pool_supervisor::SOCKET_STOP),
+        );
         let guard = planned.guard;
         // Count it alive BEFORE the task starts, so the gauge can never read
         // high because a spawn lost a race with its own decrement.
@@ -28833,5 +28884,72 @@ mod item_44_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod socket_stop_tests {
+    use super::*;
+    use tickvault_core::websocket::pool_supervisor::SocketStop;
+
+    /// Z11d: the stop is requested FIRST, and the wait returns as soon as
+    /// the last socket task has finished.
+    #[tokio::test(start_paused = true)]
+    async fn request_stop_and_wait_returns_once_every_socket_has_finished() {
+        static STOP: SocketStop = SocketStop::new();
+        static ALIVE: AtomicUsize = AtomicUsize::new(3);
+        let closer = tokio::spawn(async {
+            // Each "socket" notices the stop and finishes a moment later.
+            while !STOP.is_requested() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            for _ in 0..3 {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                ALIVE.fetch_sub(1, Ordering::SeqCst);
+            }
+        });
+        let started = tokio::time::Instant::now();
+        let left = request_stop_and_wait(&STOP, &ALIVE, std::time::Duration::from_secs(5)).await;
+        assert_eq!(left, 0, "a clean close leaves nothing running");
+        assert!(STOP.is_requested());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "returns when the last socket finishes, not at the budget: {:?}",
+            started.elapsed()
+        );
+        closer.await.expect("closer");
+    }
+
+    /// A socket that never finishes cannot hold shutdown past the budget,
+    /// and the count it returns says how many were left open.
+    #[tokio::test(start_paused = true)]
+    async fn request_stop_and_wait_is_bounded_and_reports_what_stayed_open() {
+        static STOP: SocketStop = SocketStop::new();
+        static ALIVE: AtomicUsize = AtomicUsize::new(2);
+        let started = tokio::time::Instant::now();
+        let left =
+            request_stop_and_wait(&STOP, &ALIVE, std::time::Duration::from_millis(500)).await;
+        assert_eq!(left, 2);
+        let took = started.elapsed();
+        assert!(took >= std::time::Duration::from_millis(500), "{took:?}");
+        assert!(took < std::time::Duration::from_secs(1), "{took:?}");
+    }
+
+    /// Every production feed sink is wired to the process-wide stop, or
+    /// `stop_feed_sockets` would request a stop no socket can see.
+    #[test]
+    fn the_dial_path_wires_every_sink_to_socket_stop() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let marker = concat!("#[cfg(", "test)]");
+        let production = src.split(marker).next().unwrap_or(src);
+        assert_eq!(
+            production
+                .matches(
+                    ".with_socket_stop(&tickvault_core::websocket::pool_supervisor::SOCKET_STOP)"
+                )
+                .count(),
+            1,
+            "the one production sink construction must opt into SOCKET_STOP"
+        );
     }
 }
