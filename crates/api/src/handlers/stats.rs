@@ -17,12 +17,11 @@ use crate::response_cache::cached_json_response;
 /// Timeout for QuestDB stats queries (cold path, not tick processing).
 const QUESTDB_STATS_TIMEOUT_SECS: u64 = 3;
 
-/// Builds a reqwest client with the given timeout.
-///
-/// `reqwest::Client::builder().build()` only fails if the TLS backend
-/// cannot be initialised, which never happens at runtime. The function
-/// returns a default client as ultimate fallback.
-/// `pub(crate)`: reused by the Live Board aggregator (`handlers::board`).
+/// Builds a reqwest client with the given timeout. Test-only since
+/// 2026-10-02: production uses the shared `AppState::questdb_http_client`
+/// and [`query_count`] sets the per-request timeout, so no request builds a
+/// client.
+#[cfg(test)]
 pub(crate) fn build_stats_client(timeout_secs: u64) -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(timeout_secs))
@@ -87,16 +86,15 @@ pub async fn get_stats(State(state): State<SharedAppState>) -> Response {
 /// HONEST BOUND (adversarial review 2026-07-09): there is no single-flight
 /// on a cache miss, so with QuestDB black-holed (5 x 3s timeouts) the
 /// limiter still admits up to 5 computes/s (~75 concurrent worst case),
-/// each building one short-lived HTTP client. That is BOUNDED by the
-/// limiter (pre-change it was unbounded per internet client) and cold-path
-/// only; miss single-flighting is a flagged follow-up, not a regression.
+/// each sending on the shared pooled client (until 2026-10-02 each built its
+/// own short-lived client). That is BOUNDED by the limiter (pre-change it was
+/// unbounded per internet client) and cold-path only; miss single-flighting
+/// is a flagged follow-up, not a regression.
 pub(crate) async fn compute_stats(state: &SharedAppState) -> StatsResponse {
     let cfg = state.questdb_config();
     let base_url = format!("http://{}:{}", cfg.host, cfg.http_port);
 
-    let client = build_stats_client(QUESTDB_STATS_TIMEOUT_SECS);
-
-    let tables = query_count(&client, &base_url, "SHOW TABLES").await;
+    let tables = query_count(state.questdb_http_client(), &base_url, "SHOW TABLES").await;
     let questdb_reachable = tables.is_some();
 
     StatsResponse {
@@ -109,6 +107,8 @@ pub(crate) async fn compute_stats(state: &SharedAppState) -> StatsResponse {
 }
 
 /// Runs a count query against QuestDB's HTTP endpoint. Returns None on failure.
+/// The request carries its own [`QUESTDB_STATS_TIMEOUT_SECS`] timeout, which
+/// overrides the shared client's longer default.
 /// `pub(crate)`: reused by the Live Board aggregator (`handlers::board`).
 pub(crate) async fn query_count(
     client: &reqwest::Client,
@@ -119,6 +119,7 @@ pub(crate) async fn query_count(
     let resp = client
         .get(&url)
         .query(&[("query", sql)])
+        .timeout(std::time::Duration::from_secs(QUESTDB_STATS_TIMEOUT_SECS))
         .send()
         .await
         .ok()?;
@@ -137,6 +138,35 @@ pub(crate) async fn query_count(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_stats_uses_the_shared_client_and_builds_none() {
+        // 2026-10-02: the stats handler sent each miss on a freshly built
+        // client. Production must use the shared pooled one.
+        let source = include_str!("stats.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]\nmod tests")
+            .map_or(source, |(before, _)| before);
+        let builder_free: String = production
+            .split("\n#[cfg(test)]\n")
+            .enumerate()
+            .map(|(i, part)| {
+                if i == 0 {
+                    part
+                } else {
+                    part.split_once("\n}\n").map_or("", |(_, rest)| rest)
+                }
+            })
+            .collect();
+        assert!(
+            !builder_free.contains("Client::builder"),
+            "the stats handler must not build an HTTP client in production"
+        );
+        assert!(
+            production.contains("state.questdb_http_client()"),
+            "the stats handler must use the shared QuestDB client"
+        );
+    }
     use crate::response_cache::CACHE_MARKER_HEADER;
 
     #[test]
