@@ -1879,7 +1879,7 @@ mod tests {
     }
 
     #[test]
-    fn unwritten_mark_writes_only_on_change_and_at_most_once_a_second() {
+    fn test_mark_clean_and_sample_write_only_on_change_and_at_most_once_a_second() {
         let dir = temp_dir_for("rate");
         let mut mark = UnwrittenSealMark::in_dir(&dir);
         assert_eq!(mark.read_previous(), PreviousUnwritten::Absent);
