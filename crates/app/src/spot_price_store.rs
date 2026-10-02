@@ -124,7 +124,9 @@
 //! **O(tracked)** and says so: it runs on the contract attach path (once per
 //! retry) and on the depth re-fit (**once a minute, all session** — the first
 //! draft said "at most once per retry" and was stale on arrival), never on
-//! the tick path. Space is O(instruments), hard-bounded by the cap below.
+//! the tick path. *(⚠ 2026-10-02: the depth steering loop no longer calls it
+//! per minute; the depth path now snapshots once per attach attempt, like the
+//! contract path.)* Space is O(instruments), hard-bounded by the cap below.
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 

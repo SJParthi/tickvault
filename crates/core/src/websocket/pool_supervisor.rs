@@ -55,7 +55,6 @@
 //! | [`WalRingSink::accept`] | O(1), zero alloc *of ours* | WAL append + `try_send`; see the honesty note below |
 //! | [`SubscribeGuard::batches`] | O(1) per batch, zero alloc | slice `chunks`, no copy |
 //! | [`SubscribeGuard`] full iteration | **O(n) in instruments — NOT O(1)** | inherent: every instrument must be named on the wire. Cold path: once per connect, ≤5,000 items, ~50 messages |
-//! | [`PoolSupervisor::poll_all`] | **O(N) with N ≤ 16 — NOT O(1)** | bounded by the operator-authorized ceiling, so it is a fixed constant, but it is a scan and is labelled as one |
 //! | [`PoolSupervisor::admit`] | O(1), zero alloc | delegates to the four-counter [`PoolBudget`] |
 //!
 //! **Honesty on "zero allocation on the per-frame path."** The claim is exact
@@ -4288,28 +4287,6 @@ impl PoolSupervisor {
     #[must_use]
     pub fn connections(&self) -> &[ConnectionSupervisor] {
         &self.connections
-    }
-
-    /// Runs the idle watchdog across every registered connection, returning the
-    /// slots that need re-dialing.
-    ///
-    /// **O(N), not O(1)** — a scan. N is bounded by the operator-authorized
-    /// ceiling of 16, so the cost is a fixed constant, but it is a scan and is
-    /// labelled as one rather than dressed up. It runs once per
-    /// [`IDLE_POLL_INTERVAL`] on the cold path, never per frame. The returned
-    /// `Vec` allocates; also cold path, and empty in the overwhelmingly common
-    /// case where nothing timed out.
-    pub fn poll_all(&mut self, now: Instant) -> Vec<(ConnectionSlot, SupervisorAction)> {
-        // Pre-sized to the ceiling: at most one action per connection, and the
-        // pool is hard-capped, so this never reallocates mid-sweep.
-        let mut due = Vec::with_capacity(MAX_TOTAL_DHAN_CONNECTIONS as usize);
-        for conn in &mut self.connections {
-            let action = conn.poll(now);
-            if action != SupervisorAction::Continue {
-                due.push((conn.slot(), action));
-            }
-        }
-        due
     }
 
     /// Releases one connection of `endpoint` back to the budget and forgets its
@@ -9878,33 +9855,6 @@ mod tests {
             .expect_err("the sixth main-feed socket must be refused locally");
         assert_eq!(refusal.endpoint(), DhanEndpointType::MainFeed);
         assert_eq!(pool.len(), 5, "a refusal must register nothing");
-    }
-
-    #[test]
-    fn test_pool_supervisor_poll_all_returns_only_the_expired_connections() {
-        let now = t0();
-        let mut pool = PoolSupervisor::new();
-        for _ in 0..3 {
-            let _ = pool.admit(DhanEndpointType::MainFeed, now);
-        }
-        // Drive two of them live; leave the third idle (never dialed).
-        for gi in [0u8, 1] {
-            if let Some(c) = pool.connection_mut(gi) {
-                let _ = c.on_event(ConnEvent::BeginDial, now);
-                let _ = c.on_event(ConnEvent::DialSucceeded, now);
-                let _ = c.on_event(ConnEvent::SubscribeAcked, now);
-            }
-        }
-        assert!(pool.poll_all(now).is_empty(), "nothing is idle yet");
-
-        let later = now + Duration::from_secs(60);
-        let due = pool.poll_all(later);
-        assert_eq!(due.len(), 2, "only the two live connections time out");
-        for (s, a) in &due {
-            assert_eq!(s.endpoint, DhanEndpointType::MainFeed);
-            assert!(matches!(a, SupervisorAction::SleepThenDial { .. }));
-        }
-        assert_eq!(pool.connections().len(), 3);
     }
 
     #[test]

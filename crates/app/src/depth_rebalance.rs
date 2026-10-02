@@ -48,11 +48,8 @@ use tickvault_core::websocket::pool_supervisor::{
     LiveSubscriptionCommand, SubscribeInstrument, SwapOutcome,
 };
 
-use crate::depth200_atm::{
-    ChainMinute, Depth200AtmTracker, NoTopMoverSwitch, PlannedSwap, StrikePair, TopMoverPick,
-    TopMoverSocket, plan_swaps,
-};
-use crate::dhan_depth_universe::{DepthCandidate, contract_segment_for_underlying};
+use crate::depth200_atm::{ChainMinute, PlannedSwap, StrikePair};
+use crate::dhan_depth_universe::DepthCandidate;
 use crate::dhan_feed_stack::ist_second_of_day_now;
 use crate::movers::StockMove;
 
@@ -598,53 +595,6 @@ pub fn atm_pair_for(candidates: &[DepthCandidate], underlying: &str) -> Option<S
     best
 }
 
-/// The day's leading mover, resolved to the contracts its at-the-money strike
-/// would subscribe.
-///
-/// # What "leading" means here
-///
-/// The largest move by ABSOLUTE size, in either direction. A stock down 9%
-/// leads a stock up 8%: both have a deep book, and the fifth socket's job is
-/// to watch the one the market is most interested in, not the one that happens
-/// to be rising.
-///
-/// # Every refusal returns `None`, and none of them is a failure
-///
-/// A non-finite move, an exactly-flat move, a stock whose ladder is not in the
-/// candidate slice, or a ladder with no complete at-the-money pair — each
-/// returns `None`, and [`crate::depth200_atm::TopMoverSocket::observe`] treats
-/// that as "keep what you have". A stale deep book beats an empty one, and
-/// unsubscribing spends a wire call to end up with less.
-///
-/// # Complexity
-///
-/// O(rows) to find the leader, then O(candidates) to resolve its pair.
-#[must_use]
-pub fn top_mover_pick(rows: &[MoverRow], candidates: &[DepthCandidate]) -> Option<TopMoverPick> {
-    let mut leader: Option<&MoverRow> = None;
-    for row in rows {
-        if !row.pct_change.is_finite() || row.pct_change == 0.0 {
-            continue;
-        }
-        let better = match leader {
-            None => true,
-            Some(best) => row.pct_change.abs() > best.pct_change.abs(),
-        };
-        if better {
-            leader = Some(row);
-        }
-    }
-    let leader = leader?;
-    let pair = atm_pair_for(candidates, &leader.symbol)?;
-    Some(TopMoverPick {
-        underlying_security_id: leader.security_id,
-        contract_segment: STOCK_OPTION_SEGMENT,
-        pct_change: leader.pct_change,
-        atm_ce_security_id: pair.ce_security_id,
-        atm_pe_security_id: pair.pe_security_id,
-    })
-}
-
 /// How many movers the boot set may try per depth-200 socket before it stops.
 ///
 /// Each try is an [`atm_pair_for`] call, which is three passes over the
@@ -680,7 +630,7 @@ pub const DEPTH_200_BOOT_MOVER_TRIES_PER_SOCKET: usize = 4;
 ///   contract of an underlying that already holds a socket. Held slots count
 ///   against `budget`.
 /// * One contract per underlying: the call on a riser, the put on a faller —
-///   the same leg rule [`TopMoverPick::leg_security_id`] uses, because the side
+///   the same leg rule [`crate::depth200_atm::TopMoverPick::leg_security_id`] uses, because the side
 ///   of the move is where the order flow is.
 /// * A mover with a non-finite or zero move is skipped (it has no direction).
 /// * A mover whose symbol has no stock-option ladder is skipped WITHOUT
@@ -961,91 +911,22 @@ pub fn parse_movers_dataset(body: &str) -> Result<Vec<MoverRow>, String> {
 /// must stay free.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct RebalanceDecision {
-    /// Swaps for the four index at-the-money sockets, in dial order.
+    /// The swaps to send this minute, in dial order. Since 2026-09-08 these
+    /// come only from the volume-ranked planner
+    /// (`depth200_ranked_steer::plan_ranked_minute`).
+    ///
+    /// 2026-10-02: the `top_mover_{swap,first,idle}` fields are gone. They
+    /// were filled only by the retired `plan_minute`, so in production they
+    /// were always `None`.
     pub atm_swaps: Vec<PlannedSwap>,
-    /// The fifth socket's swap, when it already carried something.
-    pub top_mover_swap: Option<PlannedSwap>,
-    /// The fifth socket's FIRST subscription. Not a swap: there is nothing to
-    /// unsubscribe, and inventing an `old` to make it look like one would ask
-    /// the guard to drop an instrument the connection never held.
-    pub top_mover_first: Option<SubscribeInstrument>,
-    /// Why the fifth socket stayed put, when it did. Carried rather than
-    /// swallowed: "already right" and "we could not tell" are different states
-    /// and must not share a silence.
-    pub top_mover_idle: Option<NoTopMoverSwitch>,
 }
 
 impl RebalanceDecision {
     /// Whether this minute costs any wire calls at all.
     #[must_use]
     pub fn is_quiet(&self) -> bool {
-        self.atm_swaps.is_empty() && self.top_mover_swap.is_none() && self.top_mover_first.is_none()
+        self.atm_swaps.is_empty()
     }
-}
-
-/// One minute of rebalance, decided but not sent.
-///
-/// ⚠ 2026-09-23: NO LONGER A PRODUCTION STEER SOURCE. The rebalance loop
-/// stopped calling this when depth-200 became stock-options-only at every
-/// stage (websocket-connection-scope-lock.md, "DEPTH-200 IS STOCK OPTIONS AT
-/// EVERY STAGE"): its four index sockets are NIFTY/BANKNIFTY at-the-money
-/// pairs, which that lock bans from depth-200. It is kept, with its tests,
-/// only because its tracker and top-mover machinery remain the tested
-/// reference for the chain-minute grouping; re-wiring it into the loop is a
-/// REJECT under that section.
-///
-/// # Why both engines run on one call
-///
-/// They share a minute and they share a candidate slice. Running them from two
-/// timers would let the index sockets act on one snapshot while the fifth acts
-/// on the next — reading two different moments as though they were one, which
-/// is the sort of skew that shows up as an inexplicable swap in a log weeks
-/// later.
-///
-/// # Why a failed half does not stop the other
-///
-/// An empty `movers` slice leaves the fifth socket where it is and the four
-/// index sockets carry on. The two answers are independent facts about the
-/// market and one being unavailable is not evidence about the other.
-///
-/// # Complexity
-///
-/// O(candidates) to group, O(pairs) per tracked underlying, O(movers) to rank.
-/// Cold path, once a minute.
-#[must_use]
-pub fn plan_minute(
-    tracker: &mut Depth200AtmTracker,
-    top_mover: &mut TopMoverSocket,
-    held: &[SubscribeInstrument],
-    candidates: &[DepthCandidate],
-    movers: &[MoverRow],
-) -> RebalanceDecision {
-    let owned = chain_minutes_from_candidates(candidates);
-    let minutes: Vec<ChainMinute<'_>> = owned.iter().map(OwnedChainMinute::as_minute).collect();
-    let atm_swaps = plan_swaps(tracker, &minutes, held, |underlying| {
-        contract_segment_for_underlying(underlying)
-    });
-
-    let pick = top_mover_pick(movers, candidates);
-    let mut decision = RebalanceDecision {
-        atm_swaps,
-        ..RebalanceDecision::default()
-    };
-    match top_mover.observe(pick.as_ref()) {
-        Ok(switch) => {
-            if let Some(swap) = TopMoverSocket::plan(&switch) {
-                decision.top_mover_swap = Some(swap);
-            } else {
-                // A first adoption. `plan` returns `None` precisely because
-                // there is no old instrument, and the caller needs to know the
-                // difference: a swap unsubscribes first, a first subscription
-                // must not.
-                decision.top_mover_first = Some(switch.to);
-            }
-        }
-        Err(idle) => decision.top_mover_idle = Some(idle),
-    }
-    decision
 }
 
 /// One depth-200 connection the rebalance can steer.
@@ -1401,18 +1282,6 @@ pub fn apply_decision(sockets: &mut [RebalanceSocket], decision: &RebalanceDecis
             sent = sent.saturating_add(1);
         }
     }
-    if let Some(swap) = &decision.top_mover_swap {
-        match sockets.get_mut(swap.socket_index) {
-            Some(socket) => {
-                if send_swap(socket, swap) {
-                    sent = sent.saturating_add(1);
-                }
-            }
-            None => {
-                metrics::counter!(REBALANCE_SWAPS_REFUSED, "reason" => "no_socket").increment(1);
-            }
-        }
-    }
     sent
 }
 
@@ -1572,17 +1441,15 @@ fn publish_depth_subscriptions(
 ///
 /// # Why it refuses to start with no sockets
 ///
-/// A rebalance over zero connections runs two queries a minute for a whole
-/// session to decide swaps that can never be sent. Refusing loudly at the
+/// A rebalance over zero connections wakes every minute for a whole session to
+/// decide swaps that can never be sent. Refusing loudly at the
 /// start is the difference between a visible gap and a silent one.
-// TEST-EXEMPT: async loop over secs_until_next_rebalance + load_depth_candidates + fetch_movers + plan_minute + apply_decision, each separately tested.
+// TEST-EXEMPT: async loop over secs_until_next_rebalance + depth200_ranked_steer::plan_ranked_minute + apply_decision, each separately tested.
 pub async fn run_depth_rebalance(
-    questdb: tickvault_common::config::QuestDbConfig,
-    // The drain's live spot levels. This loop re-centres depth windows every
-    // minute, so it takes the same primary source the contract selector does
-    // -- two selectors centring on different prices would put depth on a
-    // strike the contract set does not carry.
-    spot_store: std::sync::Arc<crate::spot_price_store::SpotPriceStore>,
+    // 2026-10-02: the QuestDB config and the spot store are no longer taken.
+    // Each minute used to load the ~22,000-row candidate set and run the
+    // movers queries, and both results reached only a log count; nothing the
+    // loop decides reads them. The attach still loads both, once.
     date_ist: String,
     mut sockets: Vec<RebalanceSocket>,
     mut depth20: Vec<crate::depth20_track::Depth20LiveSocket>,
@@ -1609,15 +1476,6 @@ pub async fn run_depth_rebalance(
         );
         return;
     }
-    // Derived here rather than taken as parameters (2026-09-12).
-    //
-    // Both are pure functions of `date_ist`, so passing them in gave the
-    // caller three values that could disagree with one another -- and a
-    // `today_ymd` from one date beside a `date_ist` from another selects
-    // today's contracts against yesterday's expiry set. Deriving them at the
-    // single place that consumes them makes that disagreement unrepresentable.
-    let today_ymd = crate::dhan_feed_stack::ymd_from_ist_date(&date_ist);
-    let today_ist_micros = crate::dhan_universe::ist_midnight_nanos(&date_ist) / 1_000;
     pre_register_rebalance_counters();
     crate::depth20_track::pre_register_depth20_counters();
     // Seed all three first-packet outcome series at zero (2026-09-11), so a
@@ -1885,14 +1743,12 @@ pub async fn run_depth_rebalance(
             continue;
         }
 
-        let candidates = crate::dhan_depth_universe::load_depth_candidates(
-            &questdb,
-            &spot_store,
-            &date_ist,
-            today_ymd,
-        )
-        .await;
-        let movers = fetch_movers(&questdb, today_ist_micros).await;
+        // No per-minute candidate load and no movers query (2026-10-02).
+        // Both used to run here and reached only the log line at the end of
+        // this iteration; the ranked steering below reads the drain's volume
+        // ranking, and the pre-ranking arms hold. A per-minute database query
+        // also delayed the heartbeat stamp by up to its timeout.
+        // Pinned by `the_steering_loop_runs_no_per_minute_candidate_or_movers_load`.
 
         // What the four index sockets are believed to hold, in dial order.
         // Read from the sockets rather than tracked separately: two records of
@@ -2014,7 +1870,6 @@ pub async fn run_depth_rebalance(
                 (
                     RebalanceDecision {
                         atm_swaps: ranked_decision.swaps,
-                        ..RebalanceDecision::default()
                     },
                     "volume_ranking",
                 )
@@ -2044,10 +1899,6 @@ pub async fn run_depth_rebalance(
             sent,
             engine,
             swaps = decision.atm_swaps.len(),
-            top_mover_swap = decision.top_mover_swap.is_some(),
-            top_mover_first = decision.top_mover_first.is_some(),
-            candidates = candidates.len(),
-            movers = movers.len(),
             "depth rebalance moved sockets"
         );
     }
@@ -2468,89 +2319,6 @@ mod tests {
         assert_eq!(atm_pair_for(&rows, "RELIANCE"), None);
     }
 
-    // ---- top_mover_pick ----
-
-    #[test]
-    fn the_biggest_absolute_move_leads_in_either_direction() {
-        let rows = vec![mover(10, "ALPHA", 8.0), mover(20, "BETA", -9.0)];
-        let candidates = vec![
-            candidate("BETA", 100.0, "CE", 501, 99.0),
-            candidate("BETA", 100.0, "PE", 502, 99.0),
-        ];
-        let got = top_mover_pick(&rows, &candidates).expect("a pick");
-        assert_eq!(got.underlying_security_id, 20);
-        assert!((got.pct_change + 9.0).abs() < f64::EPSILON);
-        // A faller carries the PUT — the side with the order flow.
-        assert_eq!(got.leg_security_id(), 502);
-    }
-
-    #[test]
-    fn a_riser_carries_the_call() {
-        let rows = vec![mover(10, "ALPHA", 8.21)];
-        let candidates = vec![
-            candidate("ALPHA", 100.0, "CE", 601, 99.0),
-            candidate("ALPHA", 100.0, "PE", 602, 99.0),
-        ];
-        let got = top_mover_pick(&rows, &candidates).expect("a pick");
-        assert_eq!(got.leg_security_id(), 601);
-        assert_eq!(got.contract_segment, ExchangeSegment::NseFno);
-    }
-
-    #[test]
-    fn a_leader_with_no_ladder_leaves_the_socket_alone() {
-        // Refusing is safe; switching on a stock whose contracts we cannot
-        // name is not.
-        let rows = vec![mover(10, "ALPHA", 8.0)];
-        let candidates = vec![
-            candidate("BETA", 100.0, "CE", 501, 99.0),
-            candidate("BETA", 100.0, "PE", 502, 99.0),
-        ];
-        assert_eq!(top_mover_pick(&rows, &candidates), None);
-    }
-
-    #[test]
-    fn a_flat_or_unmeasurable_move_never_leads() {
-        let candidates = vec![
-            candidate("ALPHA", 100.0, "CE", 601, 99.0),
-            candidate("ALPHA", 100.0, "PE", 602, 99.0),
-        ];
-        let rows = vec![
-            mover(10, "ALPHA", 0.0),
-            mover(11, "ALPHA", f64::NAN),
-            mover(12, "ALPHA", f64::INFINITY),
-        ];
-        assert_eq!(top_mover_pick(&rows, &candidates), None);
-    }
-
-    #[test]
-    fn a_flat_leader_does_not_block_a_real_one_behind_it() {
-        let rows = vec![mover(10, "ALPHA", 0.0), mover(20, "BETA", -3.0)];
-        let candidates = vec![
-            candidate("BETA", 100.0, "CE", 501, 99.0),
-            candidate("BETA", 100.0, "PE", 502, 99.0),
-        ];
-        let got = top_mover_pick(&rows, &candidates).expect("a pick");
-        assert_eq!(got.underlying_security_id, 20);
-    }
-
-    #[test]
-    fn an_empty_ranking_yields_nothing() {
-        assert_eq!(top_mover_pick(&[], &[]), None);
-    }
-
-    #[test]
-    fn a_tie_on_absolute_size_keeps_the_first_seen() {
-        // Strictly-greater, not greater-or-equal: an exact tie must not shuffle
-        // the socket every minute between two names that never separate.
-        let rows = vec![mover(10, "ALPHA", 5.0), mover(20, "BETA", -5.0)];
-        let candidates = vec![
-            candidate("ALPHA", 100.0, "CE", 601, 99.0),
-            candidate("ALPHA", 100.0, "PE", 602, 99.0),
-        ];
-        let got = top_mover_pick(&rows, &candidates).expect("a pick");
-        assert_eq!(got.underlying_security_id, 10);
-    }
-
     // ---- build_movers_query ----
 
     #[test]
@@ -2739,329 +2507,6 @@ mod tests {
 }
 
 #[cfg(test)]
-mod plan_minute_tests {
-    use super::*;
-    use crate::depth200_atm::{DEPTH_200_TOP_MOVER_SOCKET, Depth200AtmConfig};
-
-    fn candidate(underlying: &str, strike: f64, leg: &str, id: i64, spot: f64) -> DepthCandidate {
-        DepthCandidate {
-            underlying: underlying.to_owned(),
-            contract_security_id: id,
-            expiry_micros: 1_900_000_000_000_000,
-            strike,
-            spot,
-            leg: leg.to_owned(),
-            is_index_option: underlying == "NIFTY" || underlying == "BANKNIFTY",
-        }
-    }
-
-    fn mover(id: u64, symbol: &str, pct: f64) -> MoverRow {
-        MoverRow {
-            security_id: id,
-            segment: MOVER_UNDERLYING_SEGMENT,
-            symbol: symbol.to_owned(),
-            pct_change: pct,
-        }
-    }
-
-    fn instrument(id: u64, segment: ExchangeSegment) -> SubscribeInstrument {
-        SubscribeInstrument {
-            security_id: id,
-            segment,
-        }
-    }
-
-    /// A NIFTY chain at 50-point spacing around `spot`, plus BANKNIFTY at 100.
-    fn index_chain(nifty_spot: f64, bank_spot: f64) -> Vec<DepthCandidate> {
-        let mut out = Vec::new();
-        for k in 0..5 {
-            let strike = 24_300.0 + f64::from(k) * 50.0;
-            let ce = 1_000 + i64::from(k);
-            let pe = 2_000 + i64::from(k);
-            out.push(candidate("NIFTY", strike, "CE", ce, nifty_spot));
-            out.push(candidate("NIFTY", strike, "PE", pe, nifty_spot));
-        }
-        for k in 0..5 {
-            let strike = 53_800.0 + f64::from(k) * 100.0;
-            let ce = 3_000 + i64::from(k);
-            let pe = 4_000 + i64::from(k);
-            out.push(candidate("BANKNIFTY", strike, "CE", ce, bank_spot));
-            out.push(candidate("BANKNIFTY", strike, "PE", pe, bank_spot));
-        }
-        out
-    }
-
-    /// The four index sockets in dial order: NIFTY call, NIFTY put,
-    /// BANKNIFTY call, BANKNIFTY put.
-    fn held_four(nifty_k: i64, bank_k: i64) -> Vec<SubscribeInstrument> {
-        vec![
-            instrument(
-                u64::try_from(1_000 + nifty_k).expect("positive"),
-                ExchangeSegment::NseFno,
-            ),
-            instrument(
-                u64::try_from(2_000 + nifty_k).expect("positive"),
-                ExchangeSegment::NseFno,
-            ),
-            instrument(
-                u64::try_from(3_000 + bank_k).expect("positive"),
-                ExchangeSegment::NseFno,
-            ),
-            instrument(
-                u64::try_from(4_000 + bank_k).expect("positive"),
-                ExchangeSegment::NseFno,
-            ),
-        ]
-    }
-
-    fn trackers() -> (Depth200AtmTracker, TopMoverSocket) {
-        (
-            Depth200AtmTracker::new(Depth200AtmConfig::default()),
-            TopMoverSocket::default(),
-        )
-    }
-
-    #[test]
-    fn a_settled_minute_costs_nothing_at_all() {
-        let (mut tracker, mut top) = trackers();
-        let candidates = index_chain(24_400.0, 54_000.0);
-        // Seed both engines so nothing is a first adoption.
-        let held = held_four(2, 2);
-        let movers = vec![mover(10, "ALPHA", 5.0)];
-        let alpha = vec![
-            candidate("ALPHA", 100.0, "CE", 601, 99.0),
-            candidate("ALPHA", 100.0, "PE", 602, 99.0),
-        ];
-        let mut all = candidates.clone();
-        all.extend(alpha.iter().cloned());
-        // Run enough minutes for the top mover to adopt and settle.
-        for _ in 0..6 {
-            let _ = plan_minute(&mut tracker, &mut top, &held, &all, &movers);
-        }
-        let quiet = plan_minute(&mut tracker, &mut top, &held, &all, &movers);
-        assert!(
-            quiet.is_quiet(),
-            "an unchanged minute must cost zero wire calls: {quiet:?}"
-        );
-        assert_eq!(
-            quiet.top_mover_idle,
-            Some(NoTopMoverSwitch::AlreadySubscribed)
-        );
-    }
-
-    #[test]
-    fn the_fifth_socket_first_adoption_is_a_subscribe_not_a_swap() {
-        // Nothing is subscribed yet, so there is no `old`. Reporting it as a
-        // swap would ask the guard to drop an instrument the connection never
-        // held, and the guard refuses fail-closed.
-        let (mut tracker, mut top) = trackers();
-        let candidates = vec![
-            candidate("ALPHA", 100.0, "CE", 601, 99.0),
-            candidate("ALPHA", 100.0, "PE", 602, 99.0),
-        ];
-        let movers = vec![mover(10, "ALPHA", 5.0)];
-        let got = plan_minute(&mut tracker, &mut top, &[], &candidates, &movers);
-        assert!(got.top_mover_swap.is_none());
-        assert_eq!(
-            got.top_mover_first,
-            Some(instrument(601, ExchangeSegment::NseFno))
-        );
-        assert!(!got.is_quiet());
-    }
-
-    #[test]
-    fn a_market_with_no_movers_leaves_the_fifth_socket_alone() {
-        // A stale deep book beats an empty one. Unsubscribing here spends a
-        // wire call to end up with less.
-        let (mut tracker, mut top) = trackers();
-        let candidates = index_chain(24_400.0, 54_000.0);
-        let got = plan_minute(&mut tracker, &mut top, &held_four(2, 2), &candidates, &[]);
-        assert_eq!(got.top_mover_idle, Some(NoTopMoverSwitch::NoMover));
-        assert!(got.top_mover_swap.is_none());
-        assert!(got.top_mover_first.is_none());
-    }
-
-    #[test]
-    fn a_missing_movers_query_does_not_stop_the_index_sockets() {
-        // The two halves are independent facts about the market. One being
-        // unavailable is not evidence about the other.
-        let (mut tracker, mut top) = trackers();
-        // Seed the tracker at the 24,400 strike.
-        let seed = index_chain(24_400.0, 54_000.0);
-        let held = held_four(2, 2);
-        let _ = plan_minute(&mut tracker, &mut top, &held, &seed, &[]);
-        // Spot moves a full strike, with NO movers available at all. The
-        // tracker has its OWN confirmation gate, so this takes more than one
-        // minute — the point of the test is that it happens at all while the
-        // movers half is dark, not that it happens instantly.
-        let moved = index_chain(24_500.0, 54_000.0);
-        let mut swapped = false;
-        for _ in 0..4 {
-            let got = plan_minute(&mut tracker, &mut top, &held, &moved, &[]);
-            assert_eq!(got.top_mover_idle, Some(NoTopMoverSwitch::NoMover));
-            if !got.atm_swaps.is_empty() {
-                swapped = true;
-                break;
-            }
-        }
-        assert!(
-            swapped,
-            "the index sockets must act on their own evidence even with the \
-             movers query dark"
-        );
-    }
-
-    #[test]
-    fn an_index_socket_swap_names_the_socket_it_is_for() {
-        let (mut tracker, mut top) = trackers();
-        let held = held_four(2, 2);
-        let _ = plan_minute(
-            &mut tracker,
-            &mut top,
-            &held,
-            &index_chain(24_400.0, 54_000.0),
-            &[],
-        );
-        let got = plan_minute(
-            &mut tracker,
-            &mut top,
-            &held,
-            &index_chain(24_500.0, 54_000.0),
-            &[],
-        );
-        for swap in &got.atm_swaps {
-            assert!(
-                swap.socket_index < DEPTH_200_TOP_MOVER_SOCKET,
-                "an index swap must never target the fifth socket: {swap:?}"
-            );
-            assert_ne!(
-                swap.old, swap.new,
-                "a swap to the same instrument is a wasted wire call"
-            );
-        }
-    }
-
-    #[test]
-    fn a_stock_in_the_candidate_slice_never_takes_an_index_socket() {
-        // The four index sockets are NIFTY and BANKNIFTY by operator lock.
-        let (mut tracker, mut top) = trackers();
-        let mut candidates = index_chain(24_400.0, 54_000.0);
-        candidates.push(candidate("ALPHA", 100.0, "CE", 601, 99.0));
-        candidates.push(candidate("ALPHA", 100.0, "PE", 602, 99.0));
-        let held = held_four(2, 2);
-        let _ = plan_minute(&mut tracker, &mut top, &held, &candidates, &[]);
-        let got = plan_minute(&mut tracker, &mut top, &held, &candidates, &[]);
-        assert!(got.atm_swaps.is_empty(), "{got:?}");
-    }
-
-    #[test]
-    fn an_empty_minute_decides_nothing_and_does_not_panic() {
-        let (mut tracker, mut top) = trackers();
-        let got = plan_minute(&mut tracker, &mut top, &[], &[], &[]);
-        assert!(got.is_quiet());
-        assert_eq!(got.top_mover_idle, Some(NoTopMoverSwitch::NoMover));
-    }
-
-    #[test]
-    fn a_challenger_waits_out_the_confirmation_gate_before_the_socket_moves() {
-        let (mut tracker, mut top) = trackers();
-        let candidates = vec![
-            candidate("ALPHA", 100.0, "CE", 601, 99.0),
-            candidate("ALPHA", 100.0, "PE", 602, 99.0),
-            candidate("BETA", 200.0, "CE", 701, 199.0),
-            candidate("BETA", 200.0, "PE", 702, 199.0),
-        ];
-        // ALPHA adopts immediately.
-        let first = plan_minute(
-            &mut tracker,
-            &mut top,
-            &[],
-            &candidates,
-            &[mover(10, "ALPHA", 5.0)],
-        );
-        assert_eq!(
-            first.top_mover_first,
-            Some(instrument(601, ExchangeSegment::NseFno))
-        );
-
-        // BETA leads. It must hold the lead, not merely appear at the top.
-        let beta = vec![mover(20, "BETA", 9.0), mover(10, "ALPHA", 5.0)];
-        let mut moved_at = None;
-        for minute in 1..=6 {
-            let got = plan_minute(&mut tracker, &mut top, &[], &candidates, &beta);
-            if got.top_mover_swap.is_some() {
-                moved_at = Some(minute);
-                break;
-            }
-            assert_eq!(
-                got.top_mover_idle,
-                Some(NoTopMoverSwitch::AwaitingConfirmation)
-            );
-        }
-        assert_eq!(
-            moved_at,
-            Some(
-                i32::try_from(crate::depth200_atm::TOP_MOVER_CONFIRM_OBSERVATIONS).expect("small")
-            ),
-            "the socket must move exactly when the gate is satisfied, no sooner"
-        );
-    }
-
-    #[test]
-    fn the_fifth_socket_swap_carries_the_old_instrument_it_actually_held() {
-        // The guard replaces in place and refuses fail-closed if the old
-        // instrument is not on the connection. A swap that invents an old
-        // would be refused every time and the socket would never move.
-        let (mut tracker, mut top) = trackers();
-        let candidates = vec![
-            candidate("ALPHA", 100.0, "CE", 601, 99.0),
-            candidate("ALPHA", 100.0, "PE", 602, 99.0),
-        ];
-        // Adopt the CALL on a riser.
-        let first = plan_minute(
-            &mut tracker,
-            &mut top,
-            &[],
-            &candidates,
-            &[mover(10, "ALPHA", 5.0)],
-        );
-        let adopted = first.top_mover_first.expect("first adoption");
-        assert_eq!(adopted, instrument(601, ExchangeSegment::NseFno));
-
-        // The same stock flips sign. The busy leg is now the put.
-        let flipped = [mover(10, "ALPHA", -5.0)];
-        let mut swap = None;
-        for _ in 0..6 {
-            let got = plan_minute(&mut tracker, &mut top, &[], &candidates, &flipped);
-            if let Some(s) = got.top_mover_swap {
-                swap = Some(s);
-                break;
-            }
-        }
-        let swap = swap.expect("a direction flip must eventually move the socket");
-        assert_eq!(swap.old, adopted, "the old must be what was actually held");
-        assert_eq!(swap.new, instrument(602, ExchangeSegment::NseFno));
-        assert_eq!(swap.socket_index, DEPTH_200_TOP_MOVER_SOCKET);
-    }
-
-    #[test]
-    fn a_leader_whose_ladder_is_missing_is_an_unusable_minute_not_a_switch() {
-        let (mut tracker, mut top) = trackers();
-        // ALPHA leads but no ALPHA contracts exist in the slice.
-        let candidates = index_chain(24_400.0, 54_000.0);
-        let got = plan_minute(
-            &mut tracker,
-            &mut top,
-            &held_four(2, 2),
-            &candidates,
-            &[mover(10, "ALPHA", 8.0)],
-        );
-        assert_eq!(got.top_mover_idle, Some(NoTopMoverSwitch::NoMover));
-        assert!(got.is_quiet());
-    }
-}
-
-#[cfg(test)]
 mod apply_tests {
     use super::*;
     use crate::depth200_atm::SwitchReason;
@@ -3108,7 +2553,6 @@ mod apply_tests {
         let mut sockets = vec![s0, s1];
         let decision = RebalanceDecision {
             atm_swaps: vec![swap(1, 2_000, 2_001)],
-            ..RebalanceDecision::default()
         };
         assert_eq!(apply_decision(&mut sockets, &decision), 1);
         assert!(r0.try_recv().is_err(), "socket 0 must be untouched");
@@ -3127,7 +2571,6 @@ mod apply_tests {
         let mut sockets = vec![s0];
         let decision = RebalanceDecision {
             atm_swaps: vec![swap(0, 1_000, 1_001)],
-            ..RebalanceDecision::default()
         };
         apply_decision(&mut sockets, &decision);
         assert_eq!(
@@ -3152,7 +2595,6 @@ mod apply_tests {
         }];
         let decision = RebalanceDecision {
             atm_swaps: vec![swap(0, 1_000, 1_001)],
-            ..RebalanceDecision::default()
         };
         assert_eq!(apply_decision(&mut sockets, &decision), 0);
         assert_eq!(
@@ -3194,7 +2636,6 @@ mod apply_tests {
 
         let first = RebalanceDecision {
             atm_swaps: vec![swap(0, 1_000, 1_001)],
-            ..RebalanceDecision::default()
         };
         assert_eq!(apply_decision(&mut sockets, &first), 1);
         assert!(
@@ -3206,7 +2647,6 @@ mod apply_tests {
         // the same socket, from the optimistically advanced hold.
         let second = RebalanceDecision {
             atm_swaps: vec![swap(0, 1_001, 1_002)],
-            ..RebalanceDecision::default()
         };
         assert_eq!(
             apply_decision(&mut sockets, &second),
@@ -3239,7 +2679,6 @@ mod apply_tests {
         let mut sockets = vec![s0];
         let decision = RebalanceDecision {
             atm_swaps: vec![swap(0, 1_000, 1_001)],
-            ..RebalanceDecision::default()
         };
         assert_eq!(apply_decision(&mut sockets, &decision), 1);
         assert!(
@@ -3270,7 +2709,6 @@ mod apply_tests {
         let mut sockets = vec![s0];
         let decision = RebalanceDecision {
             atm_swaps: vec![swap(0, 1_000, 1_001)],
-            ..RebalanceDecision::default()
         };
         apply_decision(&mut sockets, &decision);
         take_ack(&mut r0)
@@ -3295,7 +2733,6 @@ mod apply_tests {
         let mut sockets = vec![s0];
         let decision = RebalanceDecision {
             atm_swaps: vec![swap(0, 1_000, 1_001)],
-            ..RebalanceDecision::default()
         };
         apply_decision(&mut sockets, &decision);
         drop(r0);
@@ -3316,7 +2753,6 @@ mod apply_tests {
             let mut sockets = vec![s0];
             let decision = RebalanceDecision {
                 atm_swaps: vec![swap(0, 1_000, 1_001)],
-                ..RebalanceDecision::default()
             };
             apply_decision(&mut sockets, &decision);
             take_ack(&mut r0)
@@ -3351,7 +2787,6 @@ mod apply_tests {
         }];
         let decision = RebalanceDecision {
             atm_swaps: vec![swap(0, 1_000, 1_001)],
-            ..RebalanceDecision::default()
         };
         assert_eq!(apply_decision(&mut sockets, &decision), 0);
         assert_eq!(
@@ -3362,14 +2797,12 @@ mod apply_tests {
 
     #[test]
     fn a_swap_for_a_socket_that_does_not_exist_is_counted_not_panicked() {
-        // The fifth socket is not dialed at attach — nothing exists to put on
-        // it before a leader emerges — so a top-mover swap can legitimately
-        // arrive with no socket to carry it.
+        // A planned swap whose socket index is past the dialed pool (a slot
+        // the attach never filled) must be refused and counted, not panic.
         let (s0, _r0) = socket(4, 1_000);
         let mut sockets = vec![s0];
         let decision = RebalanceDecision {
-            top_mover_swap: Some(swap(4, 9_000, 9_001)),
-            ..RebalanceDecision::default()
+            atm_swaps: vec![swap(4, 9_000, 9_001)],
         };
         assert_eq!(apply_decision(&mut sockets, &decision), 0);
     }
@@ -3398,7 +2831,6 @@ mod apply_tests {
                 swap(2, 3_000, 3_001),
                 swap(3, 4_000, 4_001),
             ],
-            ..RebalanceDecision::default()
         };
         assert_eq!(apply_decision(&mut sockets, &decision), 4);
         for (rx, expected) in [
@@ -3594,26 +3026,48 @@ mod fifth_socket_tests {
         );
     }
 
-    /// 2026-09-23. Replaced
-    /// `the_loop_seeds_its_tracker_from_the_socket_rather_than_a_parameter`:
-    /// the loop no longer runs the index at-the-money engine at all, so there
-    /// is no tracker to seed. Before the first ranking the pool HOLDS; it is
-    /// never handed to `plan_minute`, whose four index sockets would put
-    /// NIFTY/BANKNIFTY options back on depth-200.
-    #[test]
-    fn test_run_depth_rebalance_holds_depth200_until_the_first_ranking_and_never_runs_the_index_engine()
-     {
+    /// The production body of `run_depth_rebalance` and nothing after it.
+    ///
+    /// Bounded at the function's own closing brace (the first column-0 `}`
+    /// after its signature, which rustfmt guarantees). The earlier form of the
+    /// guard below sliced from the signature to the END of the production
+    /// half, so it also scanned `load_attach_inputs` further down — which
+    /// legitimately calls the candidate load and the movers query once per
+    /// attach — and could not have pinned their absence from the loop.
+    fn rebalance_loop_body() -> &'static str {
         let source = include_str!("depth_rebalance.rs");
         let production = source
             .split_once("\n#[cfg(test)]")
             .map_or(source, |(before, _)| before);
         let loop_start = production
             .find("pub async fn run_depth_rebalance")
-            .or_else(|| production.find("async fn run_depth_rebalance"))
             .expect("the rebalance loop exists");
-        let loop_body = &production[loop_start..];
+        let rest = &production[loop_start..];
+        let end = rest
+            .find("\n}\n")
+            .expect("the rebalance loop has a closing brace");
+        let body = &rest[..end];
+        // Non-vacuity: the slice really is the loop, not a stub before it.
         assert!(
-            !loop_body.contains("plan_minute(&mut"),
+            body.contains("plan_ranked_minute(") && body.contains("apply_decision("),
+            "the bounded slice must contain the loop's own steering calls"
+        );
+        body
+    }
+
+    /// 2026-09-23. Replaced
+    /// `the_loop_seeds_its_tracker_from_the_socket_rather_than_a_parameter`:
+    /// the loop no longer runs the index at-the-money engine at all, so there
+    /// is no tracker to seed. Before the first ranking the pool HOLDS; it is
+    /// never handed to the index at-the-money engine (the retired
+    /// `plan_minute`, deleted 2026-10-02), whose four index sockets would put
+    /// NIFTY/BANKNIFTY options back on depth-200.
+    #[test]
+    fn test_run_depth_rebalance_holds_depth200_until_the_first_ranking_and_never_runs_the_index_engine()
+     {
+        let loop_body = rebalance_loop_body();
+        assert!(
+            !loop_body.contains("plan_minute("),
             "the rebalance loop must not call the index at-the-money engine"
         );
         assert!(
@@ -3621,8 +3075,54 @@ mod fifth_socket_tests {
             "the rebalance loop must not build an index at-the-money tracker"
         );
         assert!(
+            !loop_body.contains("plan_swaps("),
+            "the rebalance loop must not plan index at-the-money swaps"
+        );
+        assert!(
             loop_body.contains("\"hold_until_first_ranking\""),
             "before the first ranking depth-200 must hold, under its own engine label"
+        );
+    }
+
+    /// 2026-10-02. Each minute used to load the ~22,000-row candidate set
+    /// (a spot snapshot plus a QuestDB backstop query) and run the movers
+    /// query (plus a tick fallback query before about 09:16), and both
+    /// results reached only the `candidates` / `movers` counts of one log
+    /// line. Nothing the loop decides reads them: the swaps come from the
+    /// drain's volume ranking. This pins their absence, so the waste and the
+    /// heartbeat delay behind those queries cannot come back unnoticed. The
+    /// attach still calls both once (`load_attach_inputs`), outside this body.
+    #[test]
+    fn the_steering_loop_runs_no_per_minute_candidate_or_movers_load() {
+        let loop_body = rebalance_loop_body();
+        for forbidden in [
+            "load_depth_candidates(",
+            "fetch_movers(",
+            "load_attach_inputs(",
+            "snapshot_prices(",
+            "fetch_spot_prices_backstop(",
+            "depth_candidates_from_master(",
+        ] {
+            assert!(
+                !loop_body.contains(forbidden),
+                "the per-minute steering loop must not call `{forbidden}`: its result \
+                 feeds no steering decision, and a database call here delays the \
+                 heartbeat stamp by up to its timeout"
+            );
+        }
+        // The attach keeps its one-shot load: the guard above must not be
+        // satisfied by deleting the function the attach depends on.
+        let source = include_str!("depth_rebalance.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]")
+            .map_or(source, |(before, _)| before);
+        let attach = production
+            .find("pub async fn load_attach_inputs")
+            .expect("the attach loader exists");
+        let attach_body = &production[attach..];
+        assert!(
+            attach_body.contains("load_depth_candidates(") && attach_body.contains("fetch_movers("),
+            "the attach still loads the candidates and the movers once"
         );
     }
 
