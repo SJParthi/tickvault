@@ -951,3 +951,54 @@ Recorded so the next session decides deliberately rather than rediscovering it.
   Rust.
 - Claims the general token scanner covers managed runtimes — it cannot, by
   word boundary, and the bite-test above is the evidence.
+
+---
+
+## §0.10. 2026-10-01 — SHELL BUDGET: bash was allowed everywhere with no limit (audit-plan D6)
+
+The operator's standing request on 2026-10-01 ("go ahead and fix everythign
+dude okay?") included the rust-only rule, restated in project memory as "the
+whole workspace should be Rust only, with the frontend the sole exception".
+
+### The hole
+
+`rust_only_guard.rs` bans every interpreted language except `bash` and `sh`,
+and puts no limit at all on those two. On 2026-10-01 (main `584097a`) the tree
+held **105 tracked shell files**, about 18,000 lines. Five shell programs run
+on the production server at every boot, from three systemd units:
+`deploy/aws/holiday-gate.sh`, `scripts/ensure-questdb.sh`,
+`deploy/aws/sysctl/verify-net-tuning.sh`,
+`deploy/aws/host-tuning/apply-host-tuning.sh`, and an inline `/bin/sh -c` in
+`tickvault-host-tuning.service`. Nothing stopped a 106th file, or a sixth boot
+script. §1 says product-path scripts are Rust; the guard did not check it.
+
+### The fix (first step)
+
+`crates/common/tests/shell_budget_guard.rs`, a shrink-only budget:
+
+| Test | What it pins |
+|---|---|
+| `no_new_shell_files` | every shell file (`*.sh`, `*.sh.tftpl`, or a shell shebang on line 1), tracked or untracked, must be on one of two lists |
+| `shell_lists_shrink_only` | a deleted or converted file must leave its list in the same PR |
+| `ops_shell_files_never_grow` | every non-developer shell file has a line ceiling that may only fall |
+| `systemd_units_never_add_shell` | each unit's count of `Exec*=` lines that run a shell is pinned exactly and may only fall |
+
+Developer tooling (`.claude/**`, `scripts/git-hooks/*`) is frozen by file set
+only; it never runs in the product path. Every other shell file (deploy,
+operator, CI gate scripts) is frozen by file set AND by length.
+
+### What is NOT yet budgeted (later D6 steps)
+
+Workflow `run:` steps, the Makefile, SSM command strings built inside Rust
+(the operator console), and `Command::new("sh")` spawns. The plan item records
+them; this section is amended when each lands.
+
+### What a PR that violates §0.10 looks like (REJECT)
+
+- Adds any shell file, anywhere, or a new shell `Exec*=` line to a systemd unit.
+- Raises a line ceiling or a unit pin without a fresh dated operator quote
+  recorded in this file first.
+- Moves a file from the ops list to the developer-tooling list to escape its
+  ceiling.
+- Weakens the shell detection (name, template suffix, or shebang) or drops the
+  untracked-file listing.
