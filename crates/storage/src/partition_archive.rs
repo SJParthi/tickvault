@@ -874,7 +874,8 @@ pub(crate) fn resolve_environment_from(
 /// Reads the explicitly-set runtime environment name (`TV_ENVIRONMENT` →
 /// `ENVIRONMENT`); `None` when neither env var is set — archival is then
 /// skipped for the run (F1b fail-closed).
-fn runtime_environment() -> Option<String> {
+// TEST-EXEMPT: thin env-var shim; the resolution logic is `resolve_environment_from`, unit-tested
+pub(crate) fn runtime_environment() -> Option<String> {
     resolve_environment_from(
         std::env::var("TV_ENVIRONMENT").ok().as_deref(),
         std::env::var("ENVIRONMENT").ok().as_deref(),

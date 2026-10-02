@@ -331,6 +331,43 @@ QuestDB partition to S3 and the upload failed. Idempotency-key
 
 **Source:** `crates/storage/src/s3_archive.rs` (Wave 2 Item 9.4)
 
+### Raw WAL segments (added 2026-10-01, plan item 45e)
+
+The same code covers the raw-frame uploader,
+`crates/storage/src/wal_raw_upload.rs`, which copies every closed WAL
+segment to `s3://tv-<env>-cold/raw-frames/<IST date>/<segment>.<raw bytes>.gz`
+(the raw length is in the key, so a segment that grew after an upload is
+stored again under a new key). Each object carries the raw SHA-256 and length
+as metadata (`x-amz-meta-raw-sha256`, `x-amz-meta-raw-bytes`); a restore
+checks the decompressed bytes against them. Three `source` values:
+
+- `raw_frames_upload`: a HEAD, PUT or read-back verify failed, or the segment
+  could not be read or compressed locally. Nothing was marked. An S3 failure
+  ends the pass; a local failure skips that segment and the pass moves on.
+  The next pass (within a minute) retries.
+- `raw_frames_conflict`: the key already holds a DIFFERENT object. It is never
+  overwritten, so that segment stays on disk until someone compares the two.
+  Logged once per process; later passes skip the segment quietly and copy
+  the others.
+- `raw_frames_uploader_disabled`: at boot, no explicit environment
+  (`TV_ENVIRONMENT` / `ENVIRONMENT`) was set, so no uploader runs and the WAL
+  prunes delete without a copy. Expected only on a dev machine; on the
+  production box it means the systemd unit lost `TV_ENVIRONMENT=prod`.
+
+**Why it matters:** the WAL cleanup deletes a segment only after its upload
+is verified (operator Quotes 27 + 28, 2026-09-29). While uploads fail,
+segments pile up on disk; the cleanup logs `wal_prune_refused_no_copy`
+(WS-SPILL-01) and the disk alarms page if the volume fills.
+
+**Triage:**
+1. `curl -s localhost:<metrics port>/metrics | grep -E 'tv_wal_raw_upload_total|tv_wal_raw_upload_pending_segments|tv_wal_prune_refused_no_copy_total'`
+   gives uploads by outcome, the backlog, and refusals.
+2. Credentials and reachability as above; the instance role already has
+   `s3:GetObject` / `s3:PutObject` on the whole cold bucket.
+3. For a conflict, compare the object (`aws s3api head-object --checksum-mode ENABLED`)
+   with the local segment's marker in `data/ws_wal/uploaded/`. Do not delete
+   either copy by hand.
+
 ## STORAGE-GAP-05 — disk pressure could not be relieved
 
 **Severity: Critical.** Fires ONCE per pressure episode (edge-latched).

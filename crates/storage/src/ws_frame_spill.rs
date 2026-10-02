@@ -2677,10 +2677,10 @@ impl Drop for WsFrameSpill {
     }
 }
 
-fn is_open_segment(path: &Path) -> bool {
+pub(crate) fn is_open_segment(path: &Path) -> bool {
     OPEN_SEGMENTS
         .lock()
-        .map(|open| open.iter().any(|p| p == path)) // O(1) EXEMPT: bounded by live writers, replay-time only
+        .map(|open| open.iter().any(|p| p == path)) // O(1) EXEMPT: bounded by live writers (one or two); called per segment by replay and the raw uploader, never per frame
         .unwrap_or(false)
 }
 
@@ -3882,7 +3882,21 @@ pub struct ArchivePruneOutcome {
     /// Pinned segments deleted because free disk fell below the hard floor
     /// (item 45a) — each one is order-book rows lost, logged as WS-SPILL-02.
     pub size_deleted_deferred: usize,
+    /// Segments past the age window, applied, and KEPT because no verified S3
+    /// copy exists yet (2026-10-01, item 45e).
+    pub age_kept_no_copy: usize,
+    /// Segments the byte pass or the disk-floor pass would have deleted and
+    /// REFUSED because no verified S3 copy exists yet (item 45e). Counted as
+    /// `tv_wal_prune_refused_no_copy_total`.
+    pub size_refused_no_copy: usize,
+    /// Bytes held by `size_refused_no_copy`.
+    pub size_refused_no_copy_bytes: u64,
 }
+
+/// Counter: segments a byte or floor pass refused to delete because they had
+/// no verified S3 copy (2026-10-01, item 45e), labelled `dir`. Local
+/// `/metrics` only; the pass logs one coded line with the totals.
+pub const WAL_PRUNE_REFUSED_NO_COPY_COUNTER: &str = "tv_wal_prune_refused_no_copy_total";
 
 /// Counter: segments the ACTIVE byte-ceiling prune REFUSED to delete because
 /// the applied watermark had not passed them (2026-10-01, item 45b), labelled
@@ -3921,6 +3935,23 @@ enum SegmentPruneDecision {
     RefuseForBytes {
         unknown: bool,
     },
+    /// The segment would be deleted (aged or for bytes, and applied) but has
+    /// no verified S3 copy (2026-10-01, item 45e): kept and counted. Only
+    /// [`apply_copy_gate`] produces it.
+    RefuseNoCopy,
+}
+
+/// Item 45e (2026-10-01): a delete the state rule allows still needs a
+/// verified S3 copy of the raw segment. Pure and O(1): every non-delete
+/// decision passes through unchanged, and a delete without a copy becomes
+/// [`SegmentPruneDecision::RefuseNoCopy`].
+const fn apply_copy_gate(decision: SegmentPruneDecision, copied: bool) -> SegmentPruneDecision {
+    match decision {
+        SegmentPruneDecision::DeleteAged | SegmentPruneDecision::DeleteForBytes if !copied => {
+            SegmentPruneDecision::RefuseNoCopy
+        }
+        other => other,
+    }
 }
 
 /// The per-segment prune rule (2026-09-22, item 44d; 2026-10-01, item 45b).
@@ -4010,6 +4041,7 @@ pub fn prune_archived_segments_at<P: AsRef<Path>>(
         PruneAppliedView::AllApplied,
         None,
         false,
+        crate::wal_raw_upload::RawCopyGate::NotRequired,
     )
 }
 
@@ -4025,6 +4057,30 @@ pub fn prune_archived_segments_deferred_at<P: AsRef<Path>>(
     deferred: Option<&crate::wal_deferred_depth::DeferredDepthSnapshot>,
     disk_below_floor: bool,
 ) -> ArchivePruneOutcome {
+    prune_archived_segments_gated_at(
+        wal_dir,
+        retention_secs,
+        max_bytes,
+        now,
+        deferred,
+        disk_below_floor,
+        crate::wal_raw_upload::RawCopyGate::NotRequired,
+    )
+}
+
+/// [`prune_archived_segments_deferred_at`] with the raw-copy gate (item 45e):
+/// under [`crate::wal_raw_upload::RawCopyGate::RequireMarker`] no pass
+/// deletes a segment without a verified S3 copy.
+#[must_use]
+pub fn prune_archived_segments_gated_at<P: AsRef<Path>>(
+    wal_dir: P,
+    retention_secs: u64,
+    max_bytes: u64,
+    now: std::time::SystemTime,
+    deferred: Option<&crate::wal_deferred_depth::DeferredDepthSnapshot>,
+    disk_below_floor: bool,
+    copy: crate::wal_raw_upload::RawCopyGate<'_>,
+) -> ArchivePruneOutcome {
     prune_wal_dir_at(
         &wal_dir.as_ref().join(ARCHIVE_SUBDIR),
         retention_secs,
@@ -4033,6 +4089,7 @@ pub fn prune_archived_segments_deferred_at<P: AsRef<Path>>(
         PruneAppliedView::AllApplied,
         deferred,
         disk_below_floor,
+        copy,
     )
 }
 
@@ -4135,6 +4192,7 @@ pub fn prune_active_segments_at<P: AsRef<Path>>(
         PruneAppliedView::Watermark(applied),
         None,
         false,
+        crate::wal_raw_upload::RawCopyGate::NotRequired,
     )
 }
 
@@ -4149,6 +4207,31 @@ pub fn prune_active_segments_deferred_at<P: AsRef<Path>>(
     deferred: Option<&crate::wal_deferred_depth::DeferredDepthSnapshot>,
     disk_below_floor: bool,
 ) -> ArchivePruneOutcome {
+    prune_active_segments_gated_at(
+        wal_dir,
+        retention_secs,
+        max_bytes,
+        now,
+        applied,
+        deferred,
+        disk_below_floor,
+        crate::wal_raw_upload::RawCopyGate::NotRequired,
+    )
+}
+
+/// [`prune_active_segments_deferred_at`] with the raw-copy gate (item 45e).
+#[must_use]
+#[allow(clippy::too_many_arguments)] // APPROVED: cold prune entry point; each input is a distinct gate
+pub fn prune_active_segments_gated_at<P: AsRef<Path>>(
+    wal_dir: P,
+    retention_secs: u64,
+    max_bytes: u64,
+    now: std::time::SystemTime,
+    applied: Option<&crate::wal_applied_watermark::AppliedSnapshot>,
+    deferred: Option<&crate::wal_deferred_depth::DeferredDepthSnapshot>,
+    disk_below_floor: bool,
+    copy: crate::wal_raw_upload::RawCopyGate<'_>,
+) -> ArchivePruneOutcome {
     prune_wal_dir_at(
         wal_dir.as_ref(),
         retention_secs,
@@ -4157,6 +4240,7 @@ pub fn prune_active_segments_deferred_at<P: AsRef<Path>>(
         PruneAppliedView::Watermark(applied),
         deferred,
         disk_below_floor,
+        copy,
     )
 }
 
@@ -4245,6 +4329,7 @@ fn segment_applied_states(
 /// are subdirectories it never descends into, which is what keeps the
 /// staged-but-unconfirmed set out of its reach.
 #[must_use]
+#[allow(clippy::too_many_arguments)] // APPROVED: private cold prune core; each input is a distinct gate
 fn prune_wal_dir_at(
     dir: &Path,
     retention_secs: u64,
@@ -4253,6 +4338,7 @@ fn prune_wal_dir_at(
     view: PruneAppliedView<'_>,
     deferred: Option<&crate::wal_deferred_depth::DeferredDepthSnapshot>,
     disk_below_floor: bool,
+    copy: crate::wal_raw_upload::RawCopyGate<'_>,
 ) -> ArchivePruneOutcome {
     let archive_dir = dir.to_path_buf();
     let mut outcome = ArchivePruneOutcome::default();
@@ -4331,6 +4417,8 @@ fn prune_wal_dir_at(
             outcome.deferred_kept += 1;
             let len = meta.as_ref().map_or(0, Metadata::len);
             outcome.deferred_kept_bytes = outcome.deferred_kept_bytes.saturating_add(len);
+            // A segment whose length could not be read has no proven copy.
+            let copied = meta.as_ref().is_some_and(|m| copy.has_copy(&path, m.len()));
             pinned.push(PruneSurvivor {
                 mtime: meta
                     .as_ref()
@@ -4342,6 +4430,7 @@ fn prune_wal_dir_at(
                 state,
                 first_seq,
                 last_seq,
+                copied,
             });
             continue;
         }
@@ -4351,10 +4440,16 @@ fn prune_wal_dir_at(
         let aged = mtime
             .and_then(|mt| now.duration_since(mt).ok())
             .is_some_and(|age| age > cutoff);
-        match segment_prune_decision(aged, state, false) {
+        // Item 45e: a verified S3 copy of the raw segment. Read only for a
+        // segment that has length metadata (one small marker file read).
+        let copied = meta.as_ref().is_some_and(|m| copy.has_copy(&path, m.len()));
+        match apply_copy_gate(segment_prune_decision(aged, state, false), copied) {
             // O(1) EXEMPT: periodic cold archive prune, never the per-frame append
             SegmentPruneDecision::DeleteAged => match std::fs::remove_file(&path) {
-                Ok(()) => outcome.deleted += 1,
+                Ok(()) => {
+                    outcome.deleted += 1;
+                    copy.forget(&path);
+                }
                 Err(err) => {
                     outcome.failed += 1;
                     warn!(
@@ -4366,9 +4461,14 @@ fn prune_wal_dir_at(
             },
             SegmentPruneDecision::Keep
             | SegmentPruneDecision::DeleteForBytes
-            | SegmentPruneDecision::RefuseForBytes { .. } => {
+            | SegmentPruneDecision::RefuseForBytes { .. }
+            | SegmentPruneDecision::RefuseNoCopy => {
                 outcome.kept += 1;
-                if aged {
+                if aged && state == SegmentAppliedState::Applied {
+                    // Past the window and applied, kept only because S3 has
+                    // no verified copy yet (item 45e).
+                    outcome.age_kept_no_copy += 1;
+                } else if aged {
                     // Past the window, kept only because the watermark has
                     // not passed it (item 44d).
                     outcome.age_kept_unapplied += 1;
@@ -4386,6 +4486,7 @@ fn prune_wal_dir_at(
                         state,
                         first_seq,
                         last_seq,
+                        copied,
                     });
                 }
             }
@@ -4421,16 +4522,21 @@ fn prune_wal_dir_at(
         // Already-applied segments first, then oldest first (item 45a). Since
         // item 45b only the applied ones can be deleted; the order still puts
         // every applied segment ahead of the first refusal.
-        survivors.sort_by_key(|s| (s.state != SegmentAppliedState::Applied, s.mtime));
+        // Item 45e: segments with an S3 copy ahead of those without.
+        survivors.sort_by_key(|s| (s.state != SegmentAppliedState::Applied, !s.copied, s.mtime));
         let mut remaining = total;
         for s in &survivors {
             if remaining <= max_bytes {
                 break;
             }
-            match segment_prune_decision(s.aged, s.state, true) {
+            match apply_copy_gate(segment_prune_decision(s.aged, s.state, true), s.copied) {
                 SegmentPruneDecision::DeleteForBytes | SegmentPruneDecision::DeleteAged => {}
                 SegmentPruneDecision::RefuseForBytes { unknown } => {
                     note_byte_refusal(&mut outcome, s, unknown);
+                    continue;
+                }
+                SegmentPruneDecision::RefuseNoCopy => {
+                    note_no_copy_refusal(&mut outcome, s);
                     continue;
                 }
                 SegmentPruneDecision::Keep => continue,
@@ -4438,6 +4544,7 @@ fn prune_wal_dir_at(
             // O(1) EXEMPT: periodic cold archive prune, never the per-frame append
             match std::fs::remove_file(&s.path) {
                 Ok(()) => {
+                    copy.forget(&s.path);
                     outcome.size_deleted += 1;
                     outcome.size_deleted_bytes = outcome.size_deleted_bytes.saturating_add(s.len);
                     // Oldest-first walk, so the FIRST successful delete is the
@@ -4514,9 +4621,15 @@ fn prune_wal_dir_at(
                 note_byte_refusal(&mut outcome, s, s.state == SegmentAppliedState::Unknown);
                 continue;
             }
+            // Item 45e: not even below the floor without a verified S3 copy.
+            if !s.copied {
+                note_no_copy_refusal(&mut outcome, s);
+                continue;
+            }
             // O(1) EXEMPT: periodic cold WAL prune under the disk floor, never the per-frame append
             match std::fs::remove_file(&s.path) {
                 Ok(()) => {
+                    copy.forget(&s.path);
                     remaining = remaining.saturating_sub(s.len);
                     outcome.size_deleted += 1;
                     outcome.size_deleted_deferred += 1;
@@ -4588,7 +4701,36 @@ fn prune_wal_dir_at(
              tv_wal_prune_refused_unapplied_total."
         );
     }
+    // Item 45e: one coded line per pass for segments kept for want of an S3
+    // copy, with the totals.
+    if outcome.size_refused_no_copy > 0 {
+        error!(
+            code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+            source = "wal_prune_refused_no_copy",
+            dir = %dir.display(),
+            segments = outcome.size_refused_no_copy,
+            refused_bytes = outcome.size_refused_no_copy_bytes,
+            bytes_after = outcome.bytes_after,
+            max_bytes,
+            "WAL directory is over its byte ceiling and the cleanup REFUSED to delete \
+             segments that have no verified copy in S3 yet. They are kept until the raw-frame \
+             uploader copies them; if it cannot, the disk keeps filling. Counted as \
+             tv_wal_prune_refused_no_copy_total."
+        );
+    }
     outcome
+}
+
+/// Records one segment a byte or floor pass refused to delete for want of a
+/// verified S3 copy (item 45e). Cold prune path.
+fn note_no_copy_refusal(outcome: &mut ArchivePruneOutcome, s: &PruneSurvivor) {
+    outcome.size_refused_no_copy += 1;
+    outcome.size_refused_no_copy_bytes = outcome.size_refused_no_copy_bytes.saturating_add(s.len);
+    debug!(
+        segment = %s.path.display(),
+        bytes = s.len,
+        "WAL prune kept a segment with no verified S3 copy"
+    );
 }
 
 /// Records one segment the byte pass refused to delete (item 45b). Cold prune
@@ -4619,6 +4761,8 @@ struct PruneSurvivor {
     state: SegmentAppliedState,
     first_seq: u64,
     last_seq: Option<u64>,
+    /// Item 45e: a verified S3 copy exists (always true without the gate).
+    copied: bool,
 }
 
 /// Wall-clock wrapper over [`prune_archived_segments_at`]. Cold path —
@@ -4629,19 +4773,23 @@ pub fn prune_archived_segments<P: AsRef<Path>>(
     wal_dir: P,
     retention_secs: u64,
     max_bytes: u64,
+    require_copy: bool,
 ) -> ArchivePruneOutcome {
+    let wal_dir = wal_dir.as_ref();
     // Item 45a: a segment holding shed depth not yet written back is kept.
-    let deferred = crate::wal_deferred_depth::prune_view(wal_dir.as_ref());
-    let below_floor = wal_disk_below_floor(wal_dir.as_ref());
-    let outcome = prune_archived_segments_deferred_at(
+    let deferred = crate::wal_deferred_depth::prune_view(wal_dir);
+    let below_floor = wal_disk_below_floor(wal_dir);
+    let outcome = prune_archived_segments_gated_at(
         wal_dir,
         retention_secs,
         max_bytes,
         std::time::SystemTime::now(),
         Some(&deferred),
         below_floor,
+        copy_gate(wal_dir, require_copy),
     );
     publish_deferred_kept("archive", outcome.deferred_kept);
+    publish_no_copy("archive", &outcome);
     if outcome.deleted > 0 || outcome.failed > 0 {
         metrics::counter!("tv_ws_wal_archive_pruned_total").increment(outcome.deleted as u64);
         info!(
@@ -4685,6 +4833,34 @@ pub fn wal_disk_below_floor(wal_dir: &Path) -> bool {
     }
 }
 
+/// The raw-copy gate for a production prune (item 45e): `require_copy` is
+/// true when a raw-frame uploader runs for this WAL root.
+fn copy_gate(wal_dir: &Path, require_copy: bool) -> crate::wal_raw_upload::RawCopyGate<'_> {
+    if require_copy {
+        crate::wal_raw_upload::RawCopyGate::RequireMarker(wal_dir)
+    } else {
+        crate::wal_raw_upload::RawCopyGate::NotRequired
+    }
+}
+
+/// Publishes [`WAL_PRUNE_REFUSED_NO_COPY_COUNTER`] for one directory, plus
+/// one info line when the age pass kept applied segments for want of a copy
+/// (item 45e). Unconditional increment, possibly zero, so the series exists
+/// before the first refusal. Cold prune path.
+fn publish_no_copy(dir: &'static str, outcome: &ArchivePruneOutcome) {
+    // APPROVED: cast — a per-pass segment count, always <= u64.
+    metrics::counter!(WAL_PRUNE_REFUSED_NO_COPY_COUNTER, "dir" => dir)
+        .increment(outcome.size_refused_no_copy as u64);
+    if outcome.age_kept_no_copy > 0 {
+        info!(
+            dir,
+            age_kept_no_copy = outcome.age_kept_no_copy,
+            "WAL prune kept segments past the age window because they have no verified S3 \
+             copy yet; they are deleted once the raw-frame uploader has copied them"
+        );
+    }
+}
+
 /// Publishes [`WAL_DEFERRED_KEPT_GAUGE`] for one directory. Cold prune path.
 fn publish_deferred_kept(dir: &'static str, kept: usize) {
     // APPROVED: cast — a per-pass segment count, far below f64 precision.
@@ -4699,6 +4875,7 @@ pub fn prune_active_segments<P: AsRef<Path>>(
     wal_dir: P,
     retention_secs: u64,
     max_bytes: u64,
+    require_copy: bool,
 ) -> ArchivePruneOutcome {
     let wal_dir = wal_dir.as_ref();
     // Item 44d (2026-09-22): the age pass needs the applied watermark. Read
@@ -4712,7 +4889,7 @@ pub fn prune_active_segments<P: AsRef<Path>>(
     };
     // Item 45a: a segment holding shed depth not yet written back is kept.
     let deferred = crate::wal_deferred_depth::prune_view(wal_dir);
-    let outcome = prune_active_segments_deferred_at(
+    let outcome = prune_active_segments_gated_at(
         wal_dir,
         retention_secs,
         max_bytes,
@@ -4720,8 +4897,10 @@ pub fn prune_active_segments<P: AsRef<Path>>(
         applied.as_ref(),
         Some(&deferred),
         wal_disk_below_floor(wal_dir),
+        copy_gate(wal_dir, require_copy),
     );
     publish_deferred_kept("active", outcome.deferred_kept);
+    publish_no_copy("active", &outcome);
     // Unconditional, possibly zero: creates both series on the first pass so
     // the first real refusal is not swallowed as a baseline.
     // APPROVED: cast — a per-pass segment count, always <= u64.
@@ -8087,6 +8266,194 @@ mod tests {
         paths
     }
 
+    // ---- raw-copy gate (2026-10-01, item 45e) ---------------------------
+
+    /// Writes a valid upload marker for `segment` under `wal_root`, recording
+    /// `raw_bytes` as the uploaded length.
+    fn mark_uploaded(wal_root: &Path, segment: &Path, raw_bytes: u64) {
+        crate::wal_raw_upload::write_marker(
+            wal_root,
+            segment,
+            &crate::wal_raw_upload::UploadMarker {
+                key: format!("raw-frames/2026-10-01/x.wal.{raw_bytes}.gz"),
+                raw_bytes,
+                raw_sha256_b64: "cmF3".to_string(),
+                gzip_bytes: 10,
+                gzip_sha256_b64: "c2hh".to_string(),
+            },
+        )
+        .expect("write marker");
+    }
+
+    #[test]
+    fn apply_copy_gate_turns_only_deletes_without_a_copy_into_refusals() {
+        use SegmentPruneDecision::{
+            DeleteAged, DeleteForBytes, Keep, RefuseForBytes, RefuseNoCopy,
+        };
+        let grid = [
+            (DeleteAged, true, DeleteAged),
+            (DeleteAged, false, RefuseNoCopy),
+            (DeleteForBytes, true, DeleteForBytes),
+            (DeleteForBytes, false, RefuseNoCopy),
+            (Keep, false, Keep),
+            (Keep, true, Keep),
+            (
+                RefuseForBytes { unknown: true },
+                false,
+                RefuseForBytes { unknown: true },
+            ),
+            (
+                RefuseForBytes { unknown: false },
+                true,
+                RefuseForBytes { unknown: false },
+            ),
+            (RefuseNoCopy, true, RefuseNoCopy),
+        ];
+        for (decision, copied, want) in grid {
+            assert_eq!(
+                apply_copy_gate(decision, copied),
+                want,
+                "{decision:?} copied={copied}"
+            );
+        }
+    }
+
+    proptest::proptest! {
+        /// No decision deletes a segment without a copy once the gate applies,
+        /// over every input of the state rule.
+        #[test]
+        fn copy_gate_never_deletes_without_a_copy(
+            aged in proptest::bool::ANY,
+            s in 0usize..3,
+            bytes in proptest::bool::ANY,
+            copied in proptest::bool::ANY,
+        ) {
+            let d = apply_copy_gate(segment_prune_decision(aged, ALL_STATES[s], bytes), copied);
+            if matches!(d, SegmentPruneDecision::DeleteAged | SegmentPruneDecision::DeleteForBytes) {
+                proptest::prop_assert!(copied);
+            }
+        }
+    }
+
+    #[test]
+    fn test_prune_archived_segments_gated_at_keeps_an_aged_segment_without_a_copy() {
+        let dir = tmp_dir("gate-age");
+        let now = SystemTime::now();
+        let uncopied = plant_archive_file(&dir, "ws-frames-00000000000000000001.wal", now, 900_000);
+        let copied = plant_archive_file(&dir, "ws-frames-00000000000000000002.wal", now, 900_000);
+        mark_uploaded(&dir, &copied, 13);
+        let gate = crate::wal_raw_upload::RawCopyGate::RequireMarker(&dir);
+        let out = prune_archived_segments_gated_at(&dir, 1, u64::MAX, now, None, false, gate);
+        assert_eq!(out.deleted, 1, "only the copied segment goes");
+        assert_eq!(out.age_kept_no_copy, 1);
+        assert!(uncopied.exists(), "no S3 copy, never deleted");
+        assert!(!copied.exists());
+        assert!(
+            crate::wal_raw_upload::marker_path(&dir, &copied).is_some_and(|m| !m.exists()),
+            "the deleted segment's marker goes with it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn byte_pass_refuses_a_segment_without_a_verified_copy() {
+        let dir = tmp_dir("gate-bytes");
+        // 4 x 1000 B over a 1500 B ceiling. Only the two NEWEST have copies,
+        // so the pass deletes those two and refuses the two oldest.
+        let paths = seed_archive(&dir, 4, 1000);
+        mark_uploaded(&dir, &paths[2], 1000);
+        mark_uploaded(&dir, &paths[3], 1000);
+        let gate = crate::wal_raw_upload::RawCopyGate::RequireMarker(&dir);
+        let out = prune_archived_segments_gated_at(
+            &dir,
+            u64::MAX,
+            1500,
+            SystemTime::now(),
+            None,
+            false,
+            gate,
+        );
+        assert_eq!(out.size_deleted, 2);
+        assert_eq!(out.size_refused_no_copy, 2);
+        assert_eq!(out.size_refused_no_copy_bytes, 2000);
+        assert!(paths[0].exists() && paths[1].exists(), "no copy, kept");
+        assert!(!paths[2].exists() && !paths[3].exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_marker_for_fewer_bytes_than_the_segment_is_not_a_copy() {
+        let dir = tmp_dir("gate-grown");
+        let paths = seed_archive(&dir, 1, 1000);
+        // Uploaded at 999 bytes, then the file grew: S3 lacks the tail.
+        mark_uploaded(&dir, &paths[0], 999);
+        let gate = crate::wal_raw_upload::RawCopyGate::RequireMarker(&dir);
+        let out =
+            prune_archived_segments_gated_at(&dir, 1, 0, SystemTime::now(), None, false, gate);
+        assert_eq!(out.deleted + out.size_deleted, 0);
+        assert!(paths[0].exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn without_the_gate_the_prune_deletes_as_before() {
+        let dir = tmp_dir("gate-off");
+        let paths = seed_archive(&dir, 2, 1000);
+        let out = prune_archived_segments_gated_at(
+            &dir,
+            1,
+            u64::MAX,
+            SystemTime::now(),
+            None,
+            false,
+            crate::wal_raw_upload::RawCopyGate::NotRequired,
+        );
+        assert_eq!(out.deleted, 2);
+        assert_eq!(out.age_kept_no_copy + out.size_refused_no_copy, 0);
+        assert!(!paths[0].exists() && !paths[1].exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_prune_active_segments_gated_at_keeps_an_applied_segment_without_a_copy() {
+        let dir = tmp_dir("gate-active");
+        let now = SystemTime::now();
+        let stale = write_wm_segment(&dir, 0, 3, WalEndpoint::MainFeed);
+        backdate(&stale, now, 259_200);
+        let todays = write_wm_segment(&dir, 100, 3, WalEndpoint::MainFeed);
+        backdate(&todays, now, 600);
+        let snap = all_applied_through(wm_seq(200));
+        let gate = crate::wal_raw_upload::RawCopyGate::RequireMarker(&dir);
+        let kept = prune_active_segments_gated_at(
+            &dir,
+            172_800,
+            u64::MAX,
+            now,
+            Some(&snap),
+            None,
+            false,
+            gate,
+        );
+        assert_eq!(kept.deleted, 0);
+        assert_eq!(kept.age_kept_no_copy, 1);
+        assert!(stale.exists());
+        let len = std::fs::metadata(&stale).expect("stat").len();
+        mark_uploaded(&dir, &stale, len);
+        let gone = prune_active_segments_gated_at(
+            &dir,
+            172_800,
+            u64::MAX,
+            now,
+            Some(&snap),
+            None,
+            false,
+            gate,
+        );
+        assert_eq!(gone.deleted, 1, "deleted once the copy is verified");
+        assert!(!stale.exists() && todays.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn byte_ceiling_deletes_oldest_first_until_under_the_limit() {
         let dir = tmp_dir("ceil-oldest");
@@ -9148,6 +9515,8 @@ mod tests {
                     proptest::prop_assert_eq!(unknown, state == SegmentAppliedState::Unknown);
                 }
                 SegmentPruneDecision::Keep => proptest::prop_assert!(!(bytes || (aged && applied))),
+                // Produced only by `apply_copy_gate`, never by the state rule.
+                SegmentPruneDecision::RefuseNoCopy => proptest::prop_assert!(false),
             }
             // The zero-loss property itself: only an applied segment is ever
             // a deletion.
@@ -9256,7 +9625,7 @@ mod tests {
             b"not a watermark",
         )
         .unwrap();
-        let corrupt = prune_active_segments(&dir, 172_800, u64::MAX);
+        let corrupt = prune_active_segments(&dir, 172_800, u64::MAX, false);
         assert_eq!(
             corrupt.deleted, 0,
             "a rejected watermark must keep everything"
@@ -9276,7 +9645,7 @@ mod tests {
         backdate(&a, now, 400_000);
         backdate(&b, now, 400_000);
         write_wm_watermark(&dir, &all_applied_through(wm_seq(5_000)));
-        let out = prune_active_segments(&dir, 172_800, u64::MAX);
+        let out = prune_active_segments(&dir, 172_800, u64::MAX, false);
         assert_eq!(
             out.deleted, 1,
             "a is applied and aged; b is the newest (unknown)"
