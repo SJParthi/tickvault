@@ -263,7 +263,7 @@ pub(crate) fn pass_counters() -> &'static DrainCounters {
             depth_length_mismatch: noop(),
             depth_ghost: noop(),
             depth_unsubscribed_grace: noop(),
-            depth_ghost_redials: noop(),
+            depth_ghost_unsubscribes: noop(),
             depth_ghost_exhausted: noop(),
             truncated: noop(),
             main_feed_length_mismatch: noop(),
