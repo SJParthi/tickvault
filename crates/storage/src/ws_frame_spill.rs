@@ -501,6 +501,19 @@ const WAL_MIN_RECORD_V3: usize = 29;
 /// v4 inserts endpoint(1) after received_at_nanos: 29 + 1 = 30.
 const WAL_MIN_RECORD_V4: usize = 30;
 
+/// Largest frame length a resync candidate may declare (Z11a, 2026-10-02).
+///
+/// Replay resyncs past a bad record by scanning for the next record whose
+/// magic, type, length and CRC all check out; this ceiling refuses an absurd
+/// length before the CRC runs, so one false candidate costs at most this many
+/// bytes of CRC. It is also the line between a torn tail and damage: a length
+/// past EOF that is ABOVE this ceiling is not something the writer produced.
+///
+/// 4 MiB sits above every transport cap that bounds what reaches the WAL
+/// (main feed ~1.6 MiB, depth-200 512 KiB, depth-20 and order update 256
+/// KiB); the app crate const-asserts that, since this crate cannot see them.
+pub const WAL_RESYNC_MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+
 /// Sentinel written when a caller has no receipt instant to offer, and the
 /// value a v1/v2 record replays with. NEVER a synthesized "now" — see the
 /// module header. `tick_persistence` already maps 0 to NULL.
@@ -2867,6 +2880,11 @@ pub const WAL_REPLAY_TRUNCATED_SEGMENTS_COUNTER: &str = "tv_wal_replay_truncated
 /// than no number at all.
 pub const WAL_REPLAY_ABANDONED_BYTES_COUNTER: &str = "tv_wal_replay_abandoned_bytes_total";
 
+/// Bad stretches the segment walk skipped by resyncing to the next readable
+/// record (Z11a). Prometheus only: the coded WS-SPILL-02 line and the two
+/// counters above already carry the loss.
+pub const WAL_REPLAY_RESYNCS_COUNTER: &str = "tv_wal_replay_resyncs_total";
+
 /// Stop replaying when the WAL volume has less than this free.
 ///
 /// MEASURED 2026-09-03: a restart that replays a session's backlog costs
@@ -5087,150 +5105,106 @@ fn replay_segment_core<F: Fn(u64, WalEndpoint) -> bool>(
 
     let mut out = Vec::new(); // APPROVED: boot-time WAL replay, cold path
     let mut i = 0usize;
+    // Where the walk STOPPED for good on a bad record: every byte from this
+    // offset to EOF was read by nothing. `None` when the walk reached the end
+    // (possibly after resyncing past damage) or stopped on a genuine torn tail.
     let mut corrupted_at: Option<(&str, usize)> = None;
+    // Damage the walk RESYNCED past (Z11a, 2026-10-02): a bad record followed,
+    // somewhere later in the file, by a record with a valid magic, type,
+    // plausible length and matching CRC. Before this, the first bad record
+    // ended the walk and every record after it was abandoned — at 128 MiB a
+    // segment, one flipped bit could cost ~700,000 frames that were sitting
+    // intact on disk.
+    let mut resync = ResyncTally::default();
     // TVW4 records whose endpoint byte this binary does not recognise. They
     // replay as `MainFeed` (total decode, never a drop) and are COUNTED here so
     // the mapping is reported once per segment rather than silently applied.
     let mut unknown_endpoint = 0usize;
-    // Smallest record is v1 (13 bytes); v2 is 21. Gate the OUTER loop on the v1
-    // minimum, then re-check the version-specific minimum after the magic check
-    // so a partial v2 tail can never be read as if its frame_seq were payload.
+    // Smallest record is v1 (13 bytes); fewer bytes than that cannot hold a
+    // record, so a shorter remainder is a torn tail by construction (and a
+    // resync scan could not find a record in it either).
     while i + WAL_MIN_RECORD_V1 <= buf.len() {
-        let magic = &buf[i..i + 4];
-        let is_v4 = magic == WAL_MAGIC_V4;
-        let is_v3 = magic == WAL_MAGIC_V3;
-        let is_v2 = magic == WAL_MAGIC_V2;
-        let is_v1 = magic == WAL_MAGIC;
-        if !is_v1 && !is_v2 && !is_v3 && !is_v4 {
-            // An unknown magic at offset 0 means the WHOLE segment is
-            // unreadable — and the overwhelmingly likely cause is a DEPLOY
-            // ROLLBACK: a newer binary wrote a record version this one cannot
-            // parse. That is not a torn tail, it is total loss of a segment
-            // that was captured successfully, and the caller stages and
-            // archives a zero-frame result exactly as it would a clean replay.
-            //
-            // So it is separated from the mid-segment case and raised as a
-            // CODED error, not a bare `warn!`. Before 2026-08-28 this arm was
-            // uncoded, which meant no CloudWatch metric filter could match it:
-            // the loss was not merely unrecovered, it was unpageable. A silent
-            // unrecoverable loss on the durability floor is the false-OK class
-            // this file exists to prevent.
-            //
-            // The segment itself is NOT deleted here — it is moved to the
-            // archive directory by the caller and survives until pruning, so a
-            // manual recovery with the newer binary remains possible. That is
-            // the reason this is loud-and-counted rather than fail-closed.
-            if i == 0 {
-                unreadable = true;
-                metrics::counter!("tv_wal_replay_unknown_magic_total").increment(1);
-                error!(
-                    code = ErrorCode::WsSpill02FrameDropped.code_str(),
-                    segment = ?path,
-                    magic = ?magic,
-                    bytes = buf.len(),
-                    "WAL segment is unreadable by this binary — every frame in it \
-                     is unrecovered. Most likely a deploy ROLLBACK: a newer build \
-                     wrote a record version this one cannot parse. The file is \
-                     retained in the archive directory, so re-running the newer \
-                     build can still recover it."
-                );
-            } else {
-                corrupted_at = Some(("magic_mismatch", i));
-                warn!(segment = ?path, offset = i, "WAL magic mismatch; stopping at boundary");
-            }
-            break;
-        }
-        // Version disambiguation + per-version minimum-size guard (security
-        // review HIGH): a v2 record needs 21 bytes before its variable frame,
-        // a v3 record 29, a v4 record 30. Checked BEFORE any header field is
-        // read, so a partial tail can never be reinterpreted as payload.
-        let min_rec = if is_v4 {
-            WAL_MIN_RECORD_V4
-        } else if is_v3 {
-            WAL_MIN_RECORD_V3
-        } else if is_v2 {
-            WAL_MIN_RECORD_V2
-        } else {
-            WAL_MIN_RECORD_V1
-        };
-        if i + min_rec > buf.len() {
-            warn!(segment = ?path, offset = i, is_v2, "truncated header at tail");
-            break;
-        }
-        let ws_byte = buf[i + 4];
-        let ws_type = match WsType::from_u8(ws_byte) {
-            Some(t) => t,
-            None => {
-                corrupted_at = Some(("unknown_ws_type", i));
-                warn!(segment = ?path, offset = i, ws_byte, "unknown WsType tag; stopping");
+        let rec = match decode_record_at(&buf, i, usize::MAX) {
+            RecordDecode::Record(rec) => rec,
+            RecordDecode::PastEnd { declared_len } => {
+                // The record runs past EOF. A genuine torn tail — what an
+                // interrupted writer leaves — is the LAST thing in the file and
+                // abandons nothing beyond itself, so it stays silent. Two other
+                // things look identical at this offset and are NOT silent
+                // (Z11a): a corrupt length that merely points past EOF while
+                // valid records follow (resync finds them), and a length no
+                // writer could have produced (above every transport cap).
+                if let Some(next) = resync_from(&buf, i + 1) {
+                    resync.record_gap("length_past_eof", i, next, out.len());
+                    gap_pending = true;
+                    i = next;
+                    continue;
+                }
+                if declared_len.is_some_and(|l| l > WAL_RESYNC_MAX_FRAME_BYTES) {
+                    corrupted_at = Some(("length_past_eof", i));
+                    warn!(
+                        segment = ?path,
+                        offset = i,
+                        frame_len = declared_len,
+                        "record length points past EOF and exceeds every frame cap; \
+                         counted as damage, not a torn tail"
+                    );
+                } else {
+                    warn!(segment = ?path, offset = i, frame_len = declared_len, "truncated record at tail");
+                }
                 break;
             }
-        };
-        // v1: [magic|ws|len|frame|crc]
-        // v2: [magic|ws|frame_seq(8)|len|frame|crc]
-        // v3: [magic|ws|frame_seq(8)|received_at_nanos(8)|len|frame|crc]
-        // v4: [magic|ws|frame_seq(8)|received_at_nanos(8)|endpoint(1)|len|frame|crc]
-        // Every `try_into` below is on a slice whose bounds the per-version
-        // minimum-size guard above has already validated, so these arms are
-        // structurally unreachable. They still set `corrupted_at` rather than
-        // breaking silently: a bare `break` ends the walk with the segment
-        // reported as fully replayed, and the caller then CONFIRMS and
-        // archives it — so an "impossible" arm that ever fired would discard
-        // every remaining record and say nothing at all. That is exactly the
-        // shape of the crash-recovery replay defect found the same day, and
-        // "unreachable" is a claim about today's bounds checks rather than a
-        // guarantee about tomorrow's.
-        let (frame_seq, received_at_nanos, endpoint_byte, len_off) = if is_v3 || is_v4 {
-            let seq_bytes: [u8; 8] = match buf[i + 5..i + 13].try_into() {
-                Ok(b) => b,
-                Err(_) => {
-                    corrupted_at = Some(("slice_seq_v3", i));
-                    break;
+            RecordDecode::Bad(reason) => {
+                if let Some(next) = resync_from(&buf, i + 1) {
+                    resync.record_gap(reason, i, next, out.len());
+                    gap_pending = true;
+                    i = next;
+                    continue;
                 }
-            };
-            let recv_bytes: [u8; 8] = match buf[i + 13..i + 21].try_into() {
-                Ok(b) => b,
-                Err(_) => {
-                    corrupted_at = Some(("slice_received_at", i));
-                    break;
+                // An unknown magic at offset 0, with no readable record
+                // anywhere after it, means the WHOLE segment is unreadable —
+                // and the overwhelmingly likely cause is a DEPLOY ROLLBACK: a
+                // newer binary wrote a record version this one cannot parse.
+                // That is not a torn tail, it is total loss of a segment that
+                // was captured successfully, and the caller stages and
+                // archives a zero-frame result exactly as it would a clean
+                // replay.
+                //
+                // So it is separated from the mid-segment case and raised as a
+                // CODED error, not a bare `warn!`. Before 2026-08-28 this arm
+                // was uncoded, which meant no CloudWatch metric filter could
+                // match it: the loss was not merely unrecovered, it was
+                // unpageable.
+                //
+                // The segment itself is NOT deleted here — it is moved to the
+                // archive directory by the caller and survives until pruning,
+                // so a manual recovery with the newer binary remains possible.
+                if i == 0 && reason == "magic_mismatch" {
+                    unreadable = true;
+                    metrics::counter!("tv_wal_replay_unknown_magic_total").increment(1);
+                    error!(
+                        code = ErrorCode::WsSpill02FrameDropped.code_str(),
+                        segment = ?path,
+                        magic = ?&buf[..4],
+                        bytes = buf.len(),
+                        "WAL segment is unreadable by this binary — every frame in it \
+                         is unrecovered. Most likely a deploy ROLLBACK: a newer build \
+                         wrote a record version this one cannot parse. The file is \
+                         retained in the archive directory, so re-running the newer \
+                         build can still recover it."
+                    );
+                } else {
+                    corrupted_at = Some((reason, i));
+                    warn!(segment = ?path, offset = i, reason, "bad WAL record and no readable record after it; stopping");
                 }
-            };
-            // v4 carries the endpoint byte at offset 21; v3 has no such byte
-            // and reads as `None`, which maps to `MainFeed` below — the
-            // pre-v4 assumption, stated rather than guessed.
-            let (endpoint_byte, len_off) = if is_v4 {
-                (Some(buf[i + 21]), i + 22)
-            } else {
-                (None, i + 21)
-            };
-            (
-                u64::from_le_bytes(seq_bytes),
-                i64::from_le_bytes(recv_bytes),
-                endpoint_byte,
-                len_off,
-            )
-        } else if is_v2 {
-            let seq_bytes: [u8; 8] = match buf[i + 5..i + 13].try_into() {
-                Ok(b) => b,
-                Err(_) => {
-                    corrupted_at = Some(("slice_seq_v2", i));
-                    break;
-                }
-            };
-            (
-                u64::from_le_bytes(seq_bytes),
-                WAL_RECEIPT_UNKNOWN_NANOS,
-                None,
-                i + 13,
-            )
-        } else {
-            (0u64, WAL_RECEIPT_UNKNOWN_NANOS, None, i + 5)
+                break;
+            }
         };
         // TOTAL mapping: a v1–v3 record has no endpoint and replays as the
         // main feed (what every earlier replay assumed); a v4 byte this binary
         // does not recognise ALSO maps to the main feed, but is counted so the
         // segment reports it once below rather than applying it silently.
-        let endpoint = match endpoint_byte {
+        let endpoint = match rec.endpoint_byte {
             None => WalEndpoint::MainFeed,
             Some(b) => {
                 let ep = WalEndpoint::from_u8(b);
@@ -5240,82 +5214,9 @@ fn replay_segment_core<F: Fn(u64, WalEndpoint) -> bool>(
                 ep
             }
         };
-        let len_bytes: [u8; 4] = match buf[len_off..len_off + 4].try_into() {
-            Ok(b) => b,
-            Err(_) => {
-                corrupted_at = Some(("slice_len", i));
-                break;
-            }
-        };
-        let frame_len = u32::from_le_bytes(len_bytes) as usize;
-        let frame_off = len_off + 4;
-        // checked_add chain (security review MEDIUM — defence-in-depth).
-        let record_end = match frame_off
-            .checked_add(frame_len)
-            .and_then(|v| v.checked_add(4))
-        {
-            Some(v) => v,
-            None => {
-                corrupted_at = Some(("length_overflow", i));
-                warn!(segment = ?path, offset = i, frame_len, "record length overflow; stopping");
-                break;
-            }
-        };
-        if record_end > buf.len() {
-            warn!(segment = ?path, offset = i, frame_len, "truncated record at tail");
-            break;
-        }
-        let frame = buf[frame_off..frame_off + frame_len].to_vec();
-        let crc_bytes: [u8; 4] = match buf[frame_off + frame_len..record_end].try_into() {
-            Ok(b) => b,
-            Err(_) => {
-                corrupted_at = Some(("slice_crc", i));
-                break;
-            }
-        };
-        let expected = u32::from_le_bytes(crc_bytes);
-        // CRC covers the version's exact header bytes, in write order: v2 adds
-        // frame_seq, v3 adds received_at_nanos after it. Using the wrong
-        // version's byte set here would reject every record of that version as
-        // corrupt, so the arms mirror `write_record` exactly.
-        let len_le = (frame_len as u32).to_le_bytes();
-        let actual = if is_v4 {
-            // The RAW endpoint byte, not the decoded enum: an unknown value
-            // must still CRC-verify as the bytes on disk, or every record
-            // written by a newer binary would read as corrupt.
-            crc32_ieee_of(&[
-                &[ws_byte],
-                &frame_seq.to_le_bytes()[..],
-                &received_at_nanos.to_le_bytes()[..],
-                &[endpoint_byte.unwrap_or(0)],
-                &len_le[..],
-                &frame,
-            ])
-        } else if is_v3 {
-            crc32_ieee_of(&[
-                &[ws_byte],
-                &frame_seq.to_le_bytes()[..],
-                &received_at_nanos.to_le_bytes()[..],
-                &len_le[..],
-                &frame,
-            ])
-        } else if is_v2 {
-            crc32_ieee_of(&[
-                &[ws_byte],
-                &frame_seq.to_le_bytes()[..],
-                &len_le[..],
-                &frame,
-            ])
-        } else {
-            crc32_ieee_of(&[&[ws_byte], &len_le[..], &frame])
-        };
-        if actual != expected {
-            corrupted_at = Some(("crc_mismatch", i));
-            warn!(segment = ?path, offset = i, expected, actual, "CRC mismatch; stopping");
-            break;
-        }
+        let record_end = rec.end;
         if let Some(applied) = applied
-            && applied.frame_is_applied(applied_sink_for(endpoint), frame_seq)
+            && applied.frame_is_applied(applied_sink_for(endpoint), rec.frame_seq)
         {
             dropped_as_applied = dropped_as_applied.saturating_add(1);
             // Only a skipped MAIN-FEED frame can hide ticks from the candle
@@ -5324,21 +5225,23 @@ fn replay_segment_core<F: Fn(u64, WalEndpoint) -> bool>(
             // depth frames interleaved with main-feed frames would otherwise
             // flag a gap before nearly every main-feed frame, and the fold
             // would suppress almost every bar as partial (review, 2026-09-29).
-            if frame_feeds_the_candle_fold(ws_type, endpoint) {
+            if frame_feeds_the_candle_fold(rec.ws_type, endpoint) {
                 gap_pending = true;
             }
             i = record_end;
             continue;
         }
-        if !keep(frame_seq, endpoint) {
+        if !keep(rec.frame_seq, endpoint) {
             i = record_end;
             continue;
         }
         out.push(ReplayedFrame {
-            ws_type,
-            frame,
-            frame_seq,
-            received_at_nanos,
+            ws_type: rec.ws_type,
+            // Copied only now, after the CRC has matched (Z11a): the walk used
+            // to copy every frame before checking it.
+            frame: rec.frame.to_vec(),
+            frame_seq: rec.frame_seq,
+            received_at_nanos: rec.received_at_nanos,
             endpoint,
             after_gap: std::mem::replace(&mut gap_pending, false),
             first_in_segment: out.is_empty(),
@@ -5362,44 +5265,56 @@ fn replay_segment_core<F: Fn(u64, WalEndpoint) -> bool>(
              among them is counted-and-skipped by the refold rather than re-persisted."
         );
     }
-    // CORRUPTION ACCOUNTING -- added 2026-08-28.
+    // CORRUPTION ACCOUNTING -- added 2026-08-28, extended for resync 2026-10-02.
     //
-    // Every abandon site above `break`s out of the walk, and this function then
-    // returned `Ok(out)` regardless. The caller's corruption counter fires only
-    // on `Err`, and `Err` is reachable only from `File::open` and
-    // `read_to_end` -- so a bad record in the MIDDLE of a segment discarded
-    // every frame after it with `tv_wal_replay_corrupted_segments_total`
-    // unmoved, a bare `warn!` carrying no `code` field for any metric filter to
-    // match, and the segment then staged, archived, and never re-read.
+    // A bad record used to end the walk, and this function then returned
+    // `Ok(out)` regardless; the caller's corruption counter fires only on
+    // `Err`, so a bad record in the MIDDLE of a segment discarded every frame
+    // after it with nothing counted. That gap was closed on 2026-08-28; since
+    // Z11a the walk also RESYNCS past a bad record, so what is lost is only
+    // the bytes between the bad record and the next readable one.
     //
-    // At `WAL_SEGMENT_MAX_BYTES` = 128 MiB that is on the order of 700,000
-    // frames vanishing on one flipped bit, reported nowhere. The identical
-    // hazard one branch away -- an unknown magic at offset 0 -- has always been
-    // counted and coded. This closes the gap between them.
-    //
-    // The two TAIL sites are deliberately NOT counted: a partial trailing
+    // A genuine torn tail is deliberately NOT counted: a partial trailing
     // record is what an interrupted writer leaves behind, it abandons nothing
     // beyond itself, and counting it would page on every unclean shutdown.
     //
     // Bytes, not records: the record count of undecodable bytes is unknowable,
     // and a fabricated number inside a counter that exists to stop fabrication
     // is worse than no number.
-    let damaged = unreadable || corrupted_at.is_some();
-    if report_corruption && let Some((reason, offset)) = corrupted_at {
-        let abandoned = buf.len().saturating_sub(offset);
+    //
+    // Any skipped byte is damage: the bytes the walk could not read may have
+    // held frames, so the caller treats the segment as one that was not fully
+    // read (the next segment follows a gap).
+    let damaged = unreadable || corrupted_at.is_some() || resync.gaps > 0;
+    if report_corruption && (corrupted_at.is_some() || resync.gaps > 0) {
+        let tail_abandoned = corrupted_at.map_or(0, |(_, offset)| buf.len().saturating_sub(offset));
+        let abandoned = resync.skipped_bytes.saturating_add(tail_abandoned);
+        let (reason, offset) = resync.first.or(corrupted_at).unwrap_or(("unknown", 0));
+        let recovered_after_gap = resync
+            .frames_before_first_gap
+            .map_or(0, |before| out.len().saturating_sub(before));
         metrics::counter!(WAL_REPLAY_TRUNCATED_SEGMENTS_COUNTER).increment(1);
         metrics::counter!(WAL_REPLAY_ABANDONED_BYTES_COUNTER).increment(abandoned as u64);
+        if resync.gaps > 0 {
+            metrics::counter!(WAL_REPLAY_RESYNCS_COUNTER).increment(resync.gaps as u64);
+        }
         error!(
             code = ErrorCode::WsSpill02FrameDropped.code_str(),
+            source = "mid_segment_resync",
             segment = ?path,
             reason,
             offset,
+            gaps = resync.gaps,
+            skipped_bytes = resync.skipped_bytes,
+            tail_abandoned_bytes = tail_abandoned,
             abandoned_bytes = abandoned,
             recovered_frames = out.len(),
-            "WAL segment is corrupt mid-file — the walk stopped here and every \
-             frame after this point is unrecovered. The segment is still moved \
-             to the archive directory, so the bytes survive for manual \
-             inspection, but nothing will read them again automatically."
+            recovered_after_gap,
+            "WAL segment is corrupt mid-file — the walk skipped the unreadable bytes \
+             and resumed at the next record whose CRC matches; frames in the skipped \
+             bytes are unrecovered (tail_abandoned_bytes > 0 means no readable record \
+             followed the last bad one). The segment is still moved to the archive \
+             directory, so the bytes survive for manual inspection."
         );
     }
     Ok(SegmentRead {
@@ -5408,6 +5323,236 @@ fn replay_segment_core<F: Fn(u64, WalEndpoint) -> bool>(
         damaged,
         trailing_gap: gap_pending,
     })
+}
+
+/// Damage the segment walk resynced past (Z11a). Cold path.
+#[derive(Debug, Default)]
+struct ResyncTally {
+    /// Bad stretches skipped.
+    gaps: usize,
+    /// Bytes between each bad record and the next readable one, summed.
+    skipped_bytes: usize,
+    /// The first bad record: its reason and offset.
+    first: Option<(&'static str, usize)>,
+    /// Frames returned before the first gap, so the report can say how many
+    /// were recovered only because the walk resynced.
+    frames_before_first_gap: Option<usize>,
+}
+
+impl ResyncTally {
+    fn record_gap(
+        &mut self,
+        reason: &'static str,
+        bad_at: usize,
+        next: usize,
+        frames_so_far: usize,
+    ) {
+        self.gaps = self.gaps.saturating_add(1);
+        self.skipped_bytes = self
+            .skipped_bytes
+            .saturating_add(next.saturating_sub(bad_at));
+        if self.first.is_none() {
+            self.first = Some((reason, bad_at));
+            self.frames_before_first_gap = Some(frames_so_far);
+        }
+    }
+}
+
+/// One record's fields, borrowed from the segment buffer, CRC already matched.
+#[derive(Debug)]
+struct DecodedRecord<'a> {
+    ws_type: WsType,
+    frame_seq: u64,
+    received_at_nanos: i64,
+    /// The RAW v4 endpoint byte; `None` for v1–v3.
+    endpoint_byte: Option<u8>,
+    frame: &'a [u8],
+    /// Offset one past the record's CRC.
+    end: usize,
+}
+
+/// What [`decode_record_at`] found at one offset.
+#[derive(Debug)]
+enum RecordDecode<'a> {
+    /// A complete record whose CRC matches.
+    Record(DecodedRecord<'a>),
+    /// A record start whose header or body runs past the end of the buffer.
+    /// `declared_len` is the frame length field when the header was complete.
+    PastEnd { declared_len: Option<usize> },
+    /// Not a readable record; the reason names the first check that failed.
+    Bad(&'static str),
+}
+
+/// Decodes the record starting at `i`, if any. Pure; the CRC runs over the
+/// borrowed slice and nothing is copied. A declared frame length above
+/// `max_frame_len` is refused before the CRC runs (the resync scan's bound on
+/// how much work one false candidate can cost). Cold path: O(frame length).
+fn decode_record_at(buf: &[u8], i: usize, max_frame_len: usize) -> RecordDecode<'_> {
+    let Some(magic) = buf.get(i..i.saturating_add(4)) else {
+        return RecordDecode::PastEnd { declared_len: None };
+    };
+    let is_v4 = magic == WAL_MAGIC_V4;
+    let is_v3 = magic == WAL_MAGIC_V3;
+    let is_v2 = magic == WAL_MAGIC_V2;
+    let is_v1 = magic == WAL_MAGIC;
+    if !is_v1 && !is_v2 && !is_v3 && !is_v4 {
+        return RecordDecode::Bad("magic_mismatch");
+    }
+    // Version disambiguation + per-version minimum-size guard (security
+    // review HIGH): a v2 record needs 21 bytes before its variable frame, a v3
+    // record 29, a v4 record 30. Checked BEFORE any header field is read, so a
+    // partial tail can never be reinterpreted as payload.
+    let min_rec = if is_v4 {
+        WAL_MIN_RECORD_V4
+    } else if is_v3 {
+        WAL_MIN_RECORD_V3
+    } else if is_v2 {
+        WAL_MIN_RECORD_V2
+    } else {
+        WAL_MIN_RECORD_V1
+    };
+    if i.saturating_add(min_rec) > buf.len() {
+        return RecordDecode::PastEnd { declared_len: None };
+    }
+    let ws_byte = buf[i + 4];
+    let Some(ws_type) = WsType::from_u8(ws_byte) else {
+        return RecordDecode::Bad("unknown_ws_type");
+    };
+    // v1: [magic|ws|len|frame|crc]
+    // v2: [magic|ws|frame_seq(8)|len|frame|crc]
+    // v3: [magic|ws|frame_seq(8)|received_at_nanos(8)|len|frame|crc]
+    // v4: [magic|ws|frame_seq(8)|received_at_nanos(8)|endpoint(1)|len|frame|crc]
+    // Every `try_into` below is on a slice whose bounds the minimum-size guard
+    // has already validated, so these arms are structurally unreachable. They
+    // still return a NAMED `Bad` rather than ending anything silently: the
+    // walk counts every `Bad`, and "unreachable" is a claim about today's
+    // bounds checks rather than a guarantee about tomorrow's.
+    let (frame_seq, received_at_nanos, endpoint_byte, len_off) = if is_v3 || is_v4 {
+        let Ok(seq_bytes) = <[u8; 8]>::try_from(&buf[i + 5..i + 13]) else {
+            return RecordDecode::Bad("slice_seq_v3");
+        };
+        let Ok(recv_bytes) = <[u8; 8]>::try_from(&buf[i + 13..i + 21]) else {
+            return RecordDecode::Bad("slice_received_at");
+        };
+        // v4 carries the endpoint byte at offset 21; v3 has no such byte and
+        // reads as `None`, which maps to `MainFeed` — the pre-v4 assumption.
+        let (endpoint_byte, len_off) = if is_v4 {
+            (Some(buf[i + 21]), i + 22)
+        } else {
+            (None, i + 21)
+        };
+        (
+            u64::from_le_bytes(seq_bytes),
+            i64::from_le_bytes(recv_bytes),
+            endpoint_byte,
+            len_off,
+        )
+    } else if is_v2 {
+        let Ok(seq_bytes) = <[u8; 8]>::try_from(&buf[i + 5..i + 13]) else {
+            return RecordDecode::Bad("slice_seq_v2");
+        };
+        (
+            u64::from_le_bytes(seq_bytes),
+            WAL_RECEIPT_UNKNOWN_NANOS,
+            None,
+            i + 13,
+        )
+    } else {
+        (0u64, WAL_RECEIPT_UNKNOWN_NANOS, None, i + 5)
+    };
+    let Ok(len_bytes) = <[u8; 4]>::try_from(&buf[len_off..len_off + 4]) else {
+        return RecordDecode::Bad("slice_len");
+    };
+    let frame_len = u32::from_le_bytes(len_bytes) as usize;
+    if frame_len > max_frame_len {
+        return RecordDecode::Bad("length_over_ceiling");
+    }
+    let frame_off = len_off + 4;
+    // checked_add chain (security review MEDIUM — defence-in-depth).
+    let Some(record_end) = frame_off
+        .checked_add(frame_len)
+        .and_then(|v| v.checked_add(4))
+    else {
+        return RecordDecode::Bad("length_overflow");
+    };
+    if record_end > buf.len() {
+        return RecordDecode::PastEnd {
+            declared_len: Some(frame_len),
+        };
+    }
+    let frame = &buf[frame_off..frame_off + frame_len];
+    let Ok(crc_bytes) = <[u8; 4]>::try_from(&buf[frame_off + frame_len..record_end]) else {
+        return RecordDecode::Bad("slice_crc");
+    };
+    let expected = u32::from_le_bytes(crc_bytes);
+    // CRC covers the version's exact header bytes, in write order, mirroring
+    // `write_record`: using the wrong version's byte set would reject every
+    // record of that version as corrupt.
+    let len_le = (frame_len as u32).to_le_bytes();
+    let actual = if is_v4 {
+        // The RAW endpoint byte, not the decoded enum: an unknown value must
+        // still CRC-verify as the bytes on disk, or every record written by a
+        // newer binary would read as corrupt.
+        crc32_ieee_of(&[
+            &[ws_byte],
+            &frame_seq.to_le_bytes()[..],
+            &received_at_nanos.to_le_bytes()[..],
+            &[endpoint_byte.unwrap_or(0)],
+            &len_le[..],
+            frame,
+        ])
+    } else if is_v3 {
+        crc32_ieee_of(&[
+            &[ws_byte],
+            &frame_seq.to_le_bytes()[..],
+            &received_at_nanos.to_le_bytes()[..],
+            &len_le[..],
+            frame,
+        ])
+    } else if is_v2 {
+        crc32_ieee_of(&[&[ws_byte], &frame_seq.to_le_bytes()[..], &len_le[..], frame])
+    } else {
+        crc32_ieee_of(&[&[ws_byte], &len_le[..], frame])
+    };
+    if actual != expected {
+        return RecordDecode::Bad("crc_mismatch");
+    }
+    RecordDecode::Record(DecodedRecord {
+        ws_type,
+        frame_seq,
+        received_at_nanos,
+        endpoint_byte,
+        frame,
+        end: record_end,
+    })
+}
+
+/// The offset of the first COMPLETE, CRC-verified record at or after `start`,
+/// or `None` (Z11a). A candidate must carry a `TVW1`..`TVW4` magic, a known
+/// `WsType`, a frame length no larger than [`WAL_RESYNC_MAX_FRAME_BYTES`], and
+/// a matching CRC-32 over its header and frame, so a false resync needs a
+/// 32-bit CRC collision on top of the magic and type bytes.
+///
+/// Cold path (boot replay / after-close pass), never on the frame drain:
+/// O(remaining bytes) to scan, plus O(declared length) of CRC per candidate,
+/// at most `WAL_RESYNC_MAX_FRAME_BYTES` each. A crafted file dense with
+/// plausible candidates could make this O(bytes × ceiling); a file this
+/// writer produced cannot.
+fn resync_from(buf: &[u8], start: usize) -> Option<usize> {
+    let mut j = start;
+    // O(1) EXEMPT: begin — cold resync scan over one segment buffer
+    while j.saturating_add(WAL_MIN_RECORD_V1) <= buf.len() {
+        let rel = buf.get(j..)?.windows(4).position(|w| {
+            w[0] == b'T' && w[1] == b'V' && w[2] == b'W' && (b'1'..=b'4').contains(&w[3])
+        })?;
+        let at = j + rel;
+        if let RecordDecode::Record(_) = decode_record_at(buf, at, WAL_RESYNC_MAX_FRAME_BYTES) {
+            return Some(at);
+        }
+        j = at + 1;
+    }
+    // O(1) EXEMPT: end
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -6668,10 +6813,10 @@ mod tests {
         for needle in [
             "WAL_REPLAY_TRUNCATED_SEGMENTS_COUNTER",
             "WAL_REPLAY_ABANDONED_BYTES_COUNTER",
-            "corrupted_at = Some((\"crc_mismatch\"",
-            "corrupted_at = Some((\"magic_mismatch\"",
-            "corrupted_at = Some((\"unknown_ws_type\"",
-            "corrupted_at = Some((\"length_overflow\"",
+            "RecordDecode::Bad(\"crc_mismatch\")",
+            "RecordDecode::Bad(\"magic_mismatch\")",
+            "RecordDecode::Bad(\"unknown_ws_type\")",
+            "RecordDecode::Bad(\"length_overflow\")",
         ] {
             assert!(
                 source.contains(needle),
@@ -6728,11 +6873,11 @@ mod tests {
         );
 
         for needle in [
-            "corrupted_at = Some((\"slice_seq_v3\"",
-            "corrupted_at = Some((\"slice_received_at\"",
-            "corrupted_at = Some((\"slice_seq_v2\"",
-            "corrupted_at = Some((\"slice_len\"",
-            "corrupted_at = Some((\"slice_crc\"",
+            "return RecordDecode::Bad(\"slice_seq_v3\")",
+            "return RecordDecode::Bad(\"slice_received_at\")",
+            "return RecordDecode::Bad(\"slice_seq_v2\")",
+            "return RecordDecode::Bad(\"slice_len\")",
+            "return RecordDecode::Bad(\"slice_crc\")",
         ] {
             assert!(
                 code.contains(needle),
@@ -10274,6 +10419,191 @@ mod tests {
         assert_eq!(current_frame_seq(), allocated);
         assert_eq!(current_frame_seq(), allocated, "a read allocates nothing");
         assert!(next_frame_seq() > current_frame_seq() - 1);
+    }
+    // --- Z11a: resync past mid-segment damage (2026-10-02) -----------------
+
+    /// A segment of v4 records, sequence `k + 1` and a payload of `fill(k)`;
+    /// returns the bytes and each record's start offset.
+    fn z11_segment(payloads: &[Vec<u8>]) -> (Vec<u8>, Vec<usize>) {
+        let mut bytes = Vec::new();
+        let mut offsets = Vec::new();
+        for (k, p) in payloads.iter().enumerate() {
+            offsets.push(bytes.len());
+            bytes.extend_from_slice(&encode_v4_record(
+                WsType::LiveFeed,
+                k as u64 + 1,
+                1_000 + k as i64,
+                WalEndpoint::MainFeed,
+                p,
+            ));
+        }
+        (bytes, offsets)
+    }
+
+    /// Payloads that are runs of one byte, never spelling `TVW`.
+    fn z11_plain_payloads(n: usize) -> Vec<Vec<u8>> {
+        (0..n).map(|k| vec![(k % 64) as u8 + 1; 32]).collect()
+    }
+
+    fn z11_walk(name: &str, bytes: &[u8]) -> SegmentRead {
+        let dir = tmp_dir(name);
+        let path = dir.join("00000000000000000001.wal");
+        std::fs::write(&path, bytes).unwrap();
+        let read = replay_segment_core(&path, None, &|_, _| true, true).expect("readable");
+        let _ = std::fs::remove_dir_all(&dir);
+        read
+    }
+
+    /// The pin for Z11a: one flipped byte in record 40 of 100 used to end
+    /// the walk and abandon records 41..100 that were intact on disk.
+    #[test]
+    fn test_regression_resync_recovers_records_after_a_mid_segment_crc_flip() {
+        let payloads = z11_plain_payloads(100);
+        let (mut bytes, offsets) = z11_segment(&payloads);
+        // Inside record 40's frame (the v4 header is 26 bytes).
+        bytes[offsets[40] + 26 + 5] ^= 0xFF;
+        let read = z11_walk("resync-crc", &bytes);
+        assert_eq!(read.frames.len(), 99, "only the damaged record is lost");
+        assert!(read.damaged, "skipped bytes are damage");
+        let seqs: Vec<u64> = read.frames.iter().map(|f| f.frame_seq).collect();
+        let want: Vec<u64> = (1..=100).filter(|s| *s != 41).collect();
+        assert_eq!(seqs, want);
+        for f in &read.frames {
+            assert_eq!(f.frame, payloads[(f.frame_seq - 1) as usize]);
+            assert_eq!(
+                f.after_gap,
+                f.frame_seq == 42,
+                "exactly the first frame after the skipped bytes follows a gap"
+            );
+        }
+        assert_eq!(
+            resync_from(&bytes, offsets[40] + 1),
+            Some(offsets[41]),
+            "the skipped stretch is exactly record 40's bytes"
+        );
+    }
+
+    /// A corrupt length that points past EOF used to read as a torn tail:
+    /// no counter, `damaged = false`, and every later record silently gone.
+    #[test]
+    fn test_regression_corrupt_length_past_eof_is_counted_not_a_silent_tail() {
+        let payloads = z11_plain_payloads(10);
+        let (mut bytes, offsets) = z11_segment(&payloads);
+        // v4 length field sits at offset 22 of the record.
+        bytes[offsets[4] + 22..offsets[4] + 26].copy_from_slice(&0x7FFF_FFFFu32.to_le_bytes());
+        let read = z11_walk("resync-len-mid", &bytes);
+        assert!(
+            read.damaged,
+            "a lying length with records after it is damage"
+        );
+        assert_eq!(read.frames.len(), 9, "the records after it are recovered");
+        assert!(read.frames.iter().all(|f| f.frame_seq != 5));
+
+        // The same corruption on the LAST record: nothing follows, but the
+        // length is above every frame cap, so no writer produced it.
+        let (mut last, offsets) = z11_segment(&payloads);
+        last[offsets[9] + 22..offsets[9] + 26].copy_from_slice(&0x7FFF_FFFFu32.to_le_bytes());
+        let read = z11_walk("resync-len-last", &last);
+        assert_eq!(read.frames.len(), 9);
+        assert!(read.damaged, "an impossible length at the tail is counted");
+    }
+
+    /// What an interrupted writer leaves stays silent and undamaged.
+    #[test]
+    fn torn_tail_stays_silent_and_undamaged() {
+        let payloads = z11_plain_payloads(10);
+        let (bytes, _) = z11_segment(&payloads);
+        for cut in [3usize, 20, 40] {
+            let read = z11_walk("resync-torn", &bytes[..bytes.len() - cut]);
+            assert_eq!(read.frames.len(), 9, "cut {cut}");
+            assert!(!read.damaged, "cut {cut}: a torn tail is not damage");
+            assert!(!read.trailing_gap, "cut {cut}");
+            assert!(read.frames.iter().all(|f| !f.after_gap), "cut {cut}");
+        }
+    }
+
+    /// A record whose magic at offset 0 is damaged, with readable records
+    /// after it, is resynced rather than declared wholly unreadable.
+    #[test]
+    fn a_damaged_first_magic_resyncs_to_the_second_record() {
+        let payloads = z11_plain_payloads(10);
+        let (mut bytes, _) = z11_segment(&payloads);
+        bytes[0] = b'X';
+        let read = z11_walk("resync-offset0", &bytes);
+        assert_eq!(read.frames.len(), 9);
+        assert!(read.damaged);
+        assert_eq!(read.frames[0].frame_seq, 2);
+        assert!(read.frames[0].after_gap);
+    }
+
+    /// Magic bytes inside a payload, with a plausible header, never resync
+    /// into a false record: the CRC refuses them.
+    #[test]
+    fn magic_bytes_inside_a_payload_never_produce_a_false_record() {
+        let mut payloads = z11_plain_payloads(6);
+        // A fake v4 header (valid magic, type, small length) with a bad CRC.
+        let mut fake = Vec::new();
+        fake.extend_from_slice(b"TVW4");
+        fake.push(WsType::LiveFeed.as_u8());
+        fake.extend_from_slice(&[0u8; 17]);
+        fake.extend_from_slice(&4u32.to_le_bytes());
+        fake.extend_from_slice(&[9, 9, 9, 9, 0xDE, 0xAD, 0xBE, 0xEF]);
+        payloads[2] = fake.clone();
+        payloads[3] = fake;
+        let (mut bytes, offsets) = z11_segment(&payloads);
+        // Damage record 2's own magic, so the scan walks into its payload.
+        bytes[offsets[2]] = b'X';
+        let read = z11_walk("resync-fake", &bytes);
+        let seqs: Vec<u64> = read.frames.iter().map(|f| f.frame_seq).collect();
+        assert_eq!(seqs, vec![1, 2, 4, 5, 6], "no fabricated record");
+        for f in &read.frames {
+            assert_eq!(f.frame, payloads[(f.frame_seq - 1) as usize]);
+        }
+        assert_eq!(resync_from(b"TVW4 not a record at all, just text", 0), None);
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
+
+        /// Every returned frame is one that was written, and every record
+        /// lying wholly before the first flip or wholly after the last one is
+        /// recovered.
+        #[test]
+        fn resync_returns_only_written_frames(
+            payloads in proptest::collection::vec(proptest::collection::vec(proptest::num::u8::ANY, 0..120), 1..40),
+            flips in proptest::collection::vec((0.0f64..1.0, 1u8..=255), 0..4),
+        ) {
+            let (mut bytes, offsets) = z11_segment(&payloads);
+            let mut flipped: Vec<usize> = Vec::new();
+            for (at, x) in &flips {
+                let pos = ((*at * bytes.len() as f64) as usize).min(bytes.len() - 1);
+                bytes[pos] ^= *x;
+                flipped.push(pos);
+            }
+            let read = z11_walk("resync-prop", &bytes);
+            for f in &read.frames {
+                let k = (f.frame_seq - 1) as usize;
+                proptest::prop_assert!(k < payloads.len(), "fabricated seq {}", f.frame_seq);
+                proptest::prop_assert_eq!(&f.frame, &payloads[k]);
+            }
+            let first = flipped.iter().copied().min();
+            let last = flipped.iter().copied().max();
+            for (k, start) in offsets.iter().enumerate() {
+                let end = offsets.get(k + 1).copied().unwrap_or(bytes.len());
+                let before = first.is_none_or(|f| end <= f);
+                let after = last.is_some_and(|l| *start > l);
+                if before || after {
+                    proptest::prop_assert!(
+                        read.frames.iter().any(|f| f.frame_seq == k as u64 + 1),
+                        "intact record {} not recovered", k + 1
+                    );
+                }
+            }
+            if flipped.is_empty() {
+                proptest::prop_assert!(!read.damaged);
+                proptest::prop_assert_eq!(read.frames.len(), payloads.len());
+            }
+        }
     }
 }
 
