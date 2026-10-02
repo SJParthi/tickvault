@@ -1168,6 +1168,34 @@ pub fn tick_spill_max_bytes() -> u64 {
     })
 }
 
+/// How a spill write is made durable before its batch counts as rescued
+/// (Z8a, 2026-10-02). Injectable so a test can make the sync fail.
+pub(crate) type SpillSyncFn = fn(&std::fs::File) -> std::io::Result<()>;
+
+/// `fdatasync` on the spill file.
+///
+/// `File::flush` is a no-op for `std::fs::File`, so until 2026-10-02 a rescued
+/// payload sat in the page cache while the watermark it advanced was fsynced:
+/// a host crash kept the watermark, lost the spill bytes, and nothing counted
+/// it. A failed sync returns `Err`, which the callers treat exactly like a
+/// failed write: the range is marked unapplied and the loss counted.
+pub(crate) fn sync_spill_data(file: &std::fs::File) -> std::io::Result<()> {
+    file.sync_data()
+}
+
+/// Writer thread and rescue thread: the spill is synced before the batch
+/// counts as rescued. Both run off the frame drain, so the wait blocks only
+/// them (a slow sync fills the rescue queue, whose overflow defers to the
+/// WAL — the safe direction).
+pub(crate) const SPILL_SYNC_OFF_DRAIN: Option<SpillSyncFn> = Some(sync_spill_data);
+
+/// The frame drain's own inline spill (rows with no WAL backing, or a busy
+/// rescue thread with unbacked rows). **Limitation:** NOT synced — an fsync
+/// there would block the task that empties the sockets. Those bytes reach the
+/// disk on the kernel's writeback, the same assumption the persisted
+/// watermark's durability lag (`WATERMARK_DURABILITY_LAG_SECS`) relies on.
+pub(crate) const SPILL_UNSYNCED_ON_DRAIN: Option<SpillSyncFn> = None;
+
 /// Appends a failed flush's ILP payload to the spill directory.
 ///
 /// # Why the payload is stored verbatim
@@ -1189,11 +1217,16 @@ pub fn tick_spill_max_bytes() -> u64 {
 /// `Err` when the directory cannot be created or the append fails. The caller
 /// treats that as "rescue unavailable" and falls back to the counted drop —
 /// a spill that cannot be written must never mask the loss.
+///
+/// `sync`: [`SPILL_SYNC_OFF_DRAIN`] from the writer and rescue threads (the
+/// payload is `fdatasync`ed before `Ok`), [`SPILL_UNSYNCED_ON_DRAIN`] from the
+/// drain's inline fallback. A failed sync is an `Err` like a failed write.
 fn spill_failed_ilp(
     dir: &Path,
     payload: &[u8],
     feed: Feed,
     now_unix_secs: i64,
+    sync: Option<SpillSyncFn>,
 ) -> std::io::Result<PathBuf> {
     // O(1) EXEMPT: begin — cold path, runs only on a flush failure.
     std::fs::create_dir_all(dir)?;
@@ -1359,6 +1392,9 @@ fn spill_failed_ilp(
         .open(&path)?;
     file.write_all(payload)?;
     file.flush()?;
+    if let Some(sync) = sync {
+        sync(&file)?;
+    }
     Ok(path)
     // O(1) EXEMPT: end
 }
@@ -2574,6 +2610,7 @@ impl TickWriter {
         let sink = TickRescueSink {
             spill_dir: self.spill_dir.clone(), // APPROVED: PathBuf moved into the rescue offload writer, once per process
             feed: self.feed,
+            spill_sync: SPILL_SYNC_OFF_DRAIN,
         };
         self.rescue = Some(tx);
         (sink, rx)
@@ -2748,11 +2785,24 @@ impl TickWriter {
         let mut rescue_unavailable = false;
         if let Some(tx) = self.rescue.as_ref() {
             let protocol = self.buffer.protocol_version();
+            // Z7 (2026-10-02): a queued batch is neither acked nor marked
+            // unapplied while the writer keeps acking LATER batches, so the
+            // PERSISTED watermark is held below it until the rescue thread
+            // has synced it (or failed and marked it). At most 8 CASes, no
+            // allocation, no lock; a full floor table marks the range
+            // unapplied instead (replay more).
+            let wm = crate::wal_applied_watermark::applied_watermark();
+            let floor = wm.hold_rescue_floor(
+                crate::wal_applied_watermark::AppliedSink::Ticks,
+                range.0,
+                range.1,
+            );
             let batch = RescueBatch {
                 buffer: std::mem::replace(&mut self.buffer, Buffer::new(protocol)),
                 rows: dropped,
                 min_seq: range.0,
                 max_seq: range.1,
+                floor,
             };
             match tx.try_send(batch) {
                 Ok(()) => {
@@ -2760,7 +2810,7 @@ impl TickWriter {
                     // Counted like a writer hand-off, so a replay confirm waits
                     // for the rescue thread too — a payload in THIS queue is
                     // not yet in any file.
-                    crate::wal_applied_watermark::applied_watermark().note_ticks_handed_off();
+                    wm.note_ticks_handed_off();
                     self.pending = 0;
                     self.install_spare_buffer(protocol);
                     return dropped;
@@ -2769,11 +2819,19 @@ impl TickWriter {
                     // The rescue thread is behind. Take the buffer BACK and
                     // write inline below — slower, but nothing is lost and
                     // nothing is reported as lost.
+                    // The batch never reached the thread, so its floor is
+                    // retracted; the arms below mark or spill the range.
+                    if let Some(floor) = returned.floor {
+                        wm.release_rescue_floor(floor);
+                    }
                     self.buffer = returned.buffer;
                     self.flush_counters.rescue_fallback_queue_full.increment(1);
                     rescue_unavailable = true;
                 }
                 Err(std::sync::mpsc::TrySendError::Disconnected(returned)) => {
+                    if let Some(floor) = returned.floor {
+                        wm.release_rescue_floor(floor);
+                    }
                     self.buffer = returned.buffer;
                     self.flush_counters.rescue_fallback_thread_gone.increment(1);
                     rescue_unavailable = true;
@@ -2820,8 +2878,14 @@ impl TickWriter {
             return dropped;
         }
 
-        let landed =
-            perform_tick_rescue(&self.spill_dir, self.buffer.as_bytes(), self.feed, dropped);
+        // The drain's inline spill is NOT synced (see `SPILL_UNSYNCED_ON_DRAIN`).
+        let landed = perform_tick_rescue(
+            &self.spill_dir,
+            self.buffer.as_bytes(),
+            self.feed,
+            dropped,
+            SPILL_UNSYNCED_ON_DRAIN,
+        );
         note_rescue_outcome_ticks(landed, range, false);
         self.buffer.clear();
         self.pending = 0;
@@ -2858,12 +2922,18 @@ fn note_rescue_outcome_ticks(landed: bool, range: (u64, u64), in_order: bool) {
 /// thread and the inline fallback in [`TickPersistenceWriter::discard_pending`].
 /// Two copies would have drifted, and the copy that drifted would have been the
 /// fallback — the one that only runs on the worst day.
-fn perform_tick_rescue(spill_dir: &Path, payload: &[u8], feed: Feed, dropped: usize) -> bool {
+fn perform_tick_rescue(
+    spill_dir: &Path,
+    payload: &[u8],
+    feed: Feed,
+    dropped: usize,
+    sync: Option<SpillSyncFn>,
+) -> bool {
     let payload_len = payload.len();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0_i64, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
-    match spill_failed_ilp(spill_dir, payload, feed, now) {
+    match spill_failed_ilp(spill_dir, payload, feed, now, sync) {
         Ok(path) => {
             // BOTH counters, and the alarmed one is not optional.
             //
@@ -2977,6 +3047,11 @@ pub struct RescueBatch {
     /// Lowest / highest `capture_seq` in this payload (`0` = unknown).
     min_seq: u64,
     max_seq: u64,
+    /// This batch's hold on the persisted watermark (Z7); released by the
+    /// rescue thread once the write is synced or has failed and been marked.
+    /// An abandoned batch (shutdown) never releases it, so the final persist
+    /// keeps the range replayable.
+    floor: Option<crate::wal_applied_watermark::RescueFloor>,
 }
 
 impl RescueBatch {
@@ -2995,6 +3070,8 @@ impl RescueBatch {
 pub struct TickRescueSink {
     spill_dir: PathBuf,
     feed: Feed,
+    /// [`SPILL_SYNC_OFF_DRAIN`] in production; a test injects a failing sync.
+    spill_sync: Option<SpillSyncFn>,
 }
 
 impl TickRescueSink {
@@ -3010,11 +3087,18 @@ impl TickRescueSink {
             batch.buffer.as_bytes(),
             self.feed,
             batch.rows,
+            self.spill_sync,
         );
         note_rescue_outcome_ticks(landed, (batch.min_seq, batch.max_seq), false);
+        let wm = crate::wal_applied_watermark::applied_watermark();
+        // Released only now: the spill is synced (Z8a) or the range is marked
+        // unapplied, so the persisted watermark may pass the batch (Z7).
+        if let Some(floor) = batch.floor {
+            wm.release_rescue_floor(floor);
+        }
         // The hand-off was counted when the producer queued this payload; the
         // replay confirm waits for this completion like any writer batch.
-        crate::wal_applied_watermark::applied_watermark().note_ticks_completed();
+        wm.note_ticks_completed();
     }
 }
 // ---------------------------------------------------------------------------
@@ -3388,7 +3472,13 @@ impl TickWriterSink {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0_i64, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
-        match spill_failed_ilp(&self.spill_dir, batch.buffer.as_bytes(), self.feed, now) {
+        match spill_failed_ilp(
+            &self.spill_dir,
+            batch.buffer.as_bytes(),
+            self.feed,
+            now,
+            SPILL_SYNC_OFF_DRAIN,
+        ) {
             Ok(path) => {
                 note_rescue_outcome_ticks(true, (batch.min_seq, batch.max_seq), true);
                 self.counters.dropped.increment(rows as u64);
@@ -5333,8 +5423,14 @@ mod tests {
         // lie and nobody would find out until they needed it.
         let dir = scratch_dir("verbatim");
         let payload = b"ticks,feed=dhan,segment=IDX_I security_id=13i 1700000000000000000\n";
-        let path = spill_failed_ilp(&dir, payload, Feed::Dhan, 1_700_000_000)
-            .expect("spill writes to a fresh dir");
+        let path = spill_failed_ilp(
+            &dir,
+            payload,
+            Feed::Dhan,
+            1_700_000_000,
+            SPILL_SYNC_OFF_DRAIN,
+        )
+        .expect("spill writes to a fresh dir");
         let written = std::fs::read(&path).expect("spill file is readable");
         assert_eq!(
             written.as_slice(),
@@ -5352,8 +5448,16 @@ mod tests {
         let dir = scratch_dir("append");
         let first = b"ticks first=1i 1700000000000000000\n";
         let second = b"ticks second=2i 1700000000000000001\n";
-        let p1 = spill_failed_ilp(&dir, first, Feed::Dhan, 1_700_000_000).expect("first spill");
-        let p2 = spill_failed_ilp(&dir, second, Feed::Dhan, 1_700_000_000).expect("second spill");
+        let p1 = spill_failed_ilp(&dir, first, Feed::Dhan, 1_700_000_000, SPILL_SYNC_OFF_DRAIN)
+            .expect("first spill");
+        let p2 = spill_failed_ilp(
+            &dir,
+            second,
+            Feed::Dhan,
+            1_700_000_000,
+            SPILL_SYNC_OFF_DRAIN,
+        )
+        .expect("second spill");
         assert_eq!(p1, p2, "same feed, same hour, same file");
         let written = std::fs::read(&p1).expect("readable");
         let mut expected = first.to_vec();
@@ -5367,8 +5471,22 @@ mod tests {
         // Bounded file count with a replayable granularity: an operator
         // repairing a known-bad window must not have to re-ingest the day.
         let dir = scratch_dir("split");
-        let a = spill_failed_ilp(&dir, b"a\n", Feed::Dhan, 1_700_000_000).expect("a");
-        let b = spill_failed_ilp(&dir, b"b\n", Feed::Dhan, 1_700_003_600).expect("b");
+        let a = spill_failed_ilp(
+            &dir,
+            b"a\n",
+            Feed::Dhan,
+            1_700_000_000,
+            SPILL_SYNC_OFF_DRAIN,
+        )
+        .expect("a");
+        let b = spill_failed_ilp(
+            &dir,
+            b"b\n",
+            Feed::Dhan,
+            1_700_003_600,
+            SPILL_SYNC_OFF_DRAIN,
+        )
+        .expect("b");
         assert_ne!(a, b, "a different hour is a different file");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5384,7 +5502,14 @@ mod tests {
             0,
             "a dir that does not exist reads 0"
         );
-        spill_failed_ilp(&dir, b"0123456789", Feed::Dhan, 1_700_000_000).expect("spill");
+        spill_failed_ilp(
+            &dir,
+            b"0123456789",
+            Feed::Dhan,
+            1_700_000_000,
+            SPILL_SYNC_OFF_DRAIN,
+        )
+        .expect("spill");
         assert_eq!(spill_dir_bytes(&dir), 10, "exactly the bytes written");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5403,7 +5528,14 @@ mod tests {
     #[test]
     fn quarantined_bytes_count_toward_the_spill_ceiling() {
         let dir = scratch_dir("quarantine-counts");
-        spill_failed_ilp(&dir, b"0123456789", Feed::Dhan, 1_700_000_000).expect("spill");
+        spill_failed_ilp(
+            &dir,
+            b"0123456789",
+            Feed::Dhan,
+            1_700_000_000,
+            SPILL_SYNC_OFF_DRAIN,
+        )
+        .expect("spill");
         assert_eq!(spill_dir_bytes(&dir), 10, "baseline: the live spill file");
 
         let q = dir.join(crate::tick_spill_replay::QUARANTINE_DIR);
@@ -6040,5 +6172,150 @@ mod tests {
         );
         assert_eq!(c.throttle_tick(0), Some(1));
         assert_eq!(c.throttle_tick(1), Some(1));
+    }
+
+    // -- Z7 / Z8a (2026-10-02): queued-rescue floors and synced spills ------
+
+    /// Sequences far above anything another test in this binary acks, so the
+    /// shared global watermark answers about THIS test only.
+    fn z7_seq(k: u64) -> i64 {
+        i64::try_from((1u64 << 61) + (k << 40)).expect("fits")
+    }
+
+    #[test]
+    fn test_regression_tick_queued_rescue_holds_a_floor_until_the_rescue_thread_settles_it() {
+        let dir = scratch_dir("z7-floor");
+        let mut w = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (sink, rx) = w.split_rescue_offload();
+        let seq = z7_seq(1);
+        w.append_tick_with_seq(&sample_tick(), seq).expect("append");
+        assert_eq!(w.discard_pending(), 1);
+        let batch = rx.try_recv().expect("queued");
+        let wm = crate::wal_applied_watermark::applied_watermark();
+        let sink_kind = crate::wal_applied_watermark::AppliedSink::Ticks;
+        assert!(
+            batch.floor.is_some(),
+            "a WAL-backed queued batch holds a floor"
+        );
+        assert!(wm.rescue_floor_is_held(sink_kind, seq as u64));
+        sink.rescue(&batch);
+        assert!(
+            !wm.rescue_floor_is_held(sink_kind, seq as u64),
+            "the rescue thread releases the floor once the spill is synced"
+        );
+        assert!(
+            !wm.snapshot().range_has_unapplied(seq as u64, seq as u64),
+            "a landed rescue marks nothing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_regression_tick_refused_rescue_hand_off_retracts_its_floor() {
+        let dir = scratch_dir("z7-refused");
+        let mut w = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (_sink, rx) = w.split_rescue_offload();
+        drop(rx); // Disconnected
+        let seq = z7_seq(2);
+        w.append_tick_with_seq(&sample_tick(), seq).expect("append");
+        assert_eq!(w.discard_pending(), 1);
+        let wm = crate::wal_applied_watermark::applied_watermark();
+        assert!(
+            !wm.rescue_floor_is_held(crate::wal_applied_watermark::AppliedSink::Ticks, seq as u64),
+            "a hand-off the thread never received must not leave a floor behind"
+        );
+        assert!(
+            wm.snapshot().range_has_unapplied(seq as u64, seq as u64),
+            "the deferred-to-WAL arm marks the range itself"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_regression_tick_full_rescue_queue_retracts_the_refused_batch_floor() {
+        let dir = scratch_dir("z7-full");
+        let mut w = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (sink, rx) = w.split_rescue_offload();
+        let wm = crate::wal_applied_watermark::applied_watermark();
+        let kind = crate::wal_applied_watermark::AppliedSink::Ticks;
+        let mut queued = Vec::new();
+        for k in 0..RESCUE_QUEUE_DEPTH as u64 {
+            let seq = z7_seq(10 + k);
+            w.append_tick_with_seq(&sample_tick(), seq).expect("append");
+            assert_eq!(w.discard_pending(), 1);
+            queued.push(seq as u64);
+        }
+        let refused = z7_seq(20);
+        w.append_tick_with_seq(&sample_tick(), refused)
+            .expect("append");
+        assert_eq!(w.discard_pending(), 1);
+        assert!(!wm.rescue_floor_is_held(kind, refused as u64));
+        for seq in &queued {
+            assert!(
+                wm.rescue_floor_is_held(kind, *seq),
+                "queued batches still hold theirs"
+            );
+        }
+        while let Ok(batch) = rx.try_recv() {
+            sink.rescue(&batch);
+        }
+        for seq in &queued {
+            assert!(!wm.rescue_floor_is_held(kind, *seq));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_regression_tick_rescue_sink_reports_a_failed_sync_as_a_failed_rescue() {
+        let dir = scratch_dir("z8a-sync-fail");
+        let mut w = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (mut sink, rx) = w.split_rescue_offload();
+        sink.spill_sync = Some(|_| Err(std::io::Error::other("injected fdatasync failure")));
+        let seq = z7_seq(30);
+        w.append_tick_with_seq(&sample_tick(), seq).expect("append");
+        assert_eq!(w.discard_pending(), 1);
+        let batch = rx.try_recv().expect("queued");
+        let wm = crate::wal_applied_watermark::applied_watermark();
+        let unlanded = wm.unlanded_total();
+        sink.rescue(&batch);
+        assert!(
+            wm.unlanded_total() > unlanded,
+            "a spill that never reached the disk is counted as landing nowhere"
+        );
+        assert!(
+            wm.snapshot().range_has_unapplied(seq as u64, seq as u64),
+            "its range must replay from the WAL"
+        );
+        assert!(
+            !wm.rescue_floor_is_held(crate::wal_applied_watermark::AppliedSink::Ticks, seq as u64)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spill_failed_ilp_returns_err_when_the_sync_fails() {
+        let dir = scratch_dir("z8a-direct");
+        let failing: Option<SpillSyncFn> = Some(|_| Err(std::io::Error::other("injected")));
+        assert!(spill_failed_ilp(&dir, b"x\n", Feed::Dhan, 1_700_000_000, failing).is_err());
+        assert!(
+            spill_failed_ilp(
+                &dir,
+                b"y\n",
+                Feed::Dhan,
+                1_700_000_000,
+                SPILL_UNSYNCED_ON_DRAIN
+            )
+            .is_ok()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sync_spill_data_syncs_a_real_file() {
+        let dir = scratch_dir("z8a-sync-real");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let file = std::fs::File::create(dir.join("f")).expect("file");
+        sync_spill_data(&file).expect("fdatasync on a regular file");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
