@@ -57,7 +57,9 @@ use tracing::{info, warn};
 use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
 use tickvault_common::feed::Feed;
 
-use crate::seal_spill::{SEAL_SPILL_FORMAT_VERSION, SerializedSeal};
+use crate::seal_spill::{
+    SEAL_SPILL_FORMAT_VERSION, SerializedSeal, seal_spill_version_is_readable,
+};
 
 /// Production DLQ directory — sibling of `data/spill/` so operators
 /// looking at `data/` see all three absorption tiers next to each
@@ -357,10 +359,11 @@ impl SealDlqWriter {
                 continue;
             }
             match serde_json::from_str::<SealDlqRecord>(trimmed) {
-                // `!=`, never `<`: a record from a NEWER build is exactly as
+                // A range, not `<`: a record from a NEWER build is exactly as
                 // unreadable as an older one — the case is a deploy rollback,
-                // where this binary meets lines its successor wrote.
-                Ok(rec) if rec.format_version != SEAL_SPILL_FORMAT_VERSION => {
+                // where this binary meets lines its successor wrote. Version 4
+                // is still read (2026-10-01): 4 → 5 renumbered nothing.
+                Ok(rec) if !seal_spill_version_is_readable(rec.format_version) => {
                     stale_refused += 1;
                 }
                 Ok(rec) => all.push(rec),

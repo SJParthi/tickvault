@@ -1197,11 +1197,14 @@ pub fn pre_register_rebalance_counters() {
 /// state with no sequence number for us to detect the loss. A full channel is
 /// a refusal, counted, and retried next minute; a stalled drain is tick loss.
 fn send_swap(socket: &mut RebalanceSocket, swap: &PlannedSwap) -> bool {
-    // 2026-09-24: a swap is a close-and-redial now (Dhan has not confirmed the
-    // unsubscribe works). Once any socket has taken an 805 ("too many
-    // requests/connections"), every further rotation this session is refused:
-    // the pools keep what they hold, which is safe, while another redial could
-    // get the account blocked. See `pool_supervisor::rotation_halted`.
+    // 2026-10-01: a swap is an in-place unsubscribe then subscribe on the live
+    // socket (operator: "isntead of disconenct reocnenct follow the
+    // unsubscribe and siubscribe apporach"; Dhan confirmed code 25 on
+    // 2026-09-30). It replaced the 2026-09-24 close-and-redial. Once any
+    // socket has taken an 805 ("too many requests/connections"), every further
+    // change this session is still refused: the pools keep what they hold,
+    // which is safe, while another request could get the account blocked. See
+    // `pool_supervisor::rotation_halted`.
     if tickvault_core::websocket::pool_supervisor::rotation_halted() {
         metrics::counter!(REBALANCE_SWAPS_REFUSED, "reason" => "rotation_halted").increment(1);
         return false;
@@ -1228,7 +1231,7 @@ fn send_swap(socket: &mut RebalanceSocket, swap: &PlannedSwap) -> bool {
         return false;
     }
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-    let command = LiveSubscriptionCommand::RotateByRedial {
+    let command = LiveSubscriptionCommand::Swap {
         old: swap.old,
         new: swap.new,
         ack: Some(ack_tx),
@@ -3113,12 +3116,57 @@ mod apply_tests {
         assert_eq!(apply_decision(&mut sockets, &decision), 1);
         assert!(r0.try_recv().is_err(), "socket 0 must be untouched");
         match r1.try_recv().expect("socket 1 receives") {
-            LiveSubscriptionCommand::RotateByRedial { old, new, .. } => {
+            LiveSubscriptionCommand::Swap { old, new, .. } => {
                 assert_eq!(old.security_id, 2_000);
                 assert_eq!(new.security_id, 2_001);
             }
-            other => panic!("expected a rotation, got {other:?}"),
+            other => panic!("expected an in-place swap, got {other:?}"),
         }
+    }
+
+    /// The ranked depth-200 change of contract (2026-10-01): what reaches the
+    /// connection is an in-place `Swap` (unsubscribe then subscribe on the
+    /// live socket), never a close-and-redial, and the 805 breaker is still
+    /// read before anything is sent.
+    #[test]
+    fn ranked_rotation_sends_an_in_place_swap_not_a_redial() {
+        let (s0, mut r0) = socket(4, 1_000);
+        let mut sockets = vec![s0];
+        let decision = RebalanceDecision {
+            atm_swaps: vec![swap(0, 1_000, 1_001)],
+            ..RebalanceDecision::default()
+        };
+        if tickvault_core::websocket::pool_supervisor::rotation_halted() {
+            // The latch is process-global; another test may have tripped it.
+            // The source half below still pins the order.
+            assert_eq!(apply_decision(&mut sockets, &decision), 0);
+        } else {
+            assert_eq!(apply_decision(&mut sockets, &decision), 1);
+            match r0.try_recv().expect("one command") {
+                LiveSubscriptionCommand::Swap { old, new, ack } => {
+                    assert_eq!(old.security_id, 1_000);
+                    assert_eq!(new.security_id, 1_001);
+                    assert!(ack.is_some(), "the steering loop reconciles on the ack");
+                }
+                other => panic!("expected an in-place swap, got {other:?}"),
+            }
+        }
+        let src = include_str!("depth_rebalance.rs");
+        let prod = src.split("#[cfg(test)]").next().expect("production half");
+        let body = prod
+            .split("fn send_swap(")
+            .nth(1)
+            .expect("send_swap exists");
+        let halted = body
+            .find("rotation_halted()")
+            .expect("reads the 805 breaker");
+        let command = body
+            .find("LiveSubscriptionCommand::Swap {")
+            .expect("send_swap builds an in-place swap");
+        assert!(
+            halted < command,
+            "the breaker is read before the command is built"
+        );
     }
 
     #[test]
@@ -3168,8 +3216,8 @@ mod apply_tests {
         rx: &mut tokio::sync::mpsc::Receiver<LiveSubscriptionCommand>,
     ) -> tokio::sync::oneshot::Sender<SwapOutcome> {
         match rx.try_recv().expect("one command") {
-            LiveSubscriptionCommand::RotateByRedial { ack: Some(ack), .. } => ack,
-            other => panic!("expected a rotation carrying an ack, got {other:?}"),
+            LiveSubscriptionCommand::Swap { ack: Some(ack), .. } => ack,
+            other => panic!("expected an in-place swap carrying an ack, got {other:?}"),
         }
     }
 
@@ -3408,10 +3456,10 @@ mod apply_tests {
             (&mut r3, 4_001),
         ] {
             match rx.try_recv().expect("one command") {
-                LiveSubscriptionCommand::RotateByRedial { new, .. } => {
+                LiveSubscriptionCommand::Swap { new, .. } => {
                     assert_eq!(new.security_id, expected);
                 }
-                other => panic!("expected a rotation, got {other:?}"),
+                other => panic!("expected an in-place swap, got {other:?}"),
             }
             assert!(rx.try_recv().is_err(), "exactly one command per socket");
         }
