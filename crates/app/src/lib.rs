@@ -196,6 +196,11 @@ pub mod ensure_questdb;
 /// so. Reports, never halts: the runtime is useful without tuned buffers.
 pub mod host_limits;
 pub mod infra;
+/// Cold 1 s sampler of the kernel receive queue on our Dhan :443 sockets
+/// (`/proc/net/tcp` and `/proc/net/tcp6`), published as gauges with one
+/// edge-triggered coded line when it stays past 4 MiB. Reads nothing and stays
+/// quiet where `/proc` is absent.
+pub mod kernel_rx_queue_sampler;
 pub mod leg_identity;
 pub mod log_coalescer;
 // 2026-05-09 PR 5c.5-final (Bug 3 — movers retirement): the

@@ -180,6 +180,36 @@ const DEPTH_SEGMENT_UNKNOWN: &str = tickvault_common::segment::segment_code_to_s
 const RANKED_OPTION_FAMILIES: [crate::volume_leaderboard::OptionFamily; 1] =
     [crate::volume_leaderboard::OptionFamily::Stock];
 
+/// One bit per [`crate::volume_leaderboard::OptionFamily`], for the per-tick
+/// membership test (2026-10-02).
+const fn option_family_bit(family: crate::volume_leaderboard::OptionFamily) -> u8 {
+    match family {
+        crate::volume_leaderboard::OptionFamily::Index => 1 << 0,
+        crate::volume_leaderboard::OptionFamily::Stock => 1 << 1,
+    }
+}
+
+/// [`RANKED_OPTION_FAMILIES`] folded into a bitmask at COMPILE time, so the
+/// list stays the single source and the per-tick test is one AND + compare.
+const RANKED_OPTION_FAMILY_MASK: u8 = {
+    let mut mask = 0u8;
+    let mut i = 0;
+    // O(1) EXEMPT: begin — const evaluation over a fixed-size array, run by the compiler, never at runtime.
+    while i < RANKED_OPTION_FAMILIES.len() {
+        mask |= option_family_bit(RANKED_OPTION_FAMILIES[i]);
+        i += 1;
+    }
+    // O(1) EXEMPT: end
+    mask
+};
+
+/// Whether `family` is ranked: one AND and one compare against a constant,
+/// in place of a `contains` walk over the array on the frame drain.
+#[inline]
+const fn is_ranked_option_family(family: crate::volume_leaderboard::OptionFamily) -> bool {
+    RANKED_OPTION_FAMILY_MASK & option_family_bit(family) != 0
+}
+
 /// Environment opt-in that must be `1` for the lane to run, on top of
 /// `[feeds] dhan_enabled`. Absent means OFF, which is the whole point.
 pub const DHAN_LIVE_FEED_ENV: &str = "TICKVAULT_DHAN_LIVE_FEED";
@@ -3689,6 +3719,18 @@ impl LiveIngest {
         self.ingest_tick_at(tick, frame_seq, 0, recv_monotonic_millis)
     }
 
+    /// Marks every pending row on this ingest's writers as lacking WAL backing
+    /// (2026-10-02): the tick writer and, when wired, the inline-depth writer.
+    ///
+    /// Called once per frame whose WAL append was refused, before any of its
+    /// rows are appended. Two `bool` stores, no allocation.
+    fn mark_frame_unbacked(&mut self) {
+        self.writer.mark_pending_unbacked();
+        if let Some(depth) = self.inline_depth.as_mut() {
+            depth.writer.mark_pending_unbacked();
+        }
+    }
+
     /// Folds the `packet_index`-th tick parsed out of one frame.
     ///
     /// # Why the index matters
@@ -4419,10 +4461,11 @@ impl LiveIngest {
         // owner lookup is what identifies the family, and the depth and candle
         // paths need it regardless.
         //
-        // `RANKED_OPTION_FAMILIES` is the single source: `contains` over a
-        // one-element array of a `Copy` enum compiles to one compare, and
-        // re-admitting a family stays one edit in one place.
-        if !RANKED_OPTION_FAMILIES.contains(&owner.family) {
+        // `RANKED_OPTION_FAMILIES` is the single source, folded at compile
+        // time into `RANKED_OPTION_FAMILY_MASK` (2026-10-02): one AND and one
+        // compare per tick whatever the list's length, and re-admitting a
+        // family stays one edit in one place.
+        if !is_ranked_option_family(owner.family) {
             return;
         }
         let _ = self.leaderboard.observe(
@@ -5238,6 +5281,14 @@ pub struct DrainCounters {
     /// operator hunting a bug that does not exist.
     shed_inline_depth: metrics::Counter,
     shed_dedicated_depth: metrics::Counter,
+    /// Frames drained whose WAL append was REFUSED (`wal_backed == false`,
+    /// 2026-10-02). Their rows are written and marked unbacked; this says how
+    /// many frames rode that degraded path, and a replay will NOT restore them.
+    frames_wal_unbacked: metrics::Counter,
+    /// Depth frames and inline-depth packets the shed gate WOULD have shed but
+    /// that were written because the frame is not in the WAL — shedding them
+    /// would record a deferral the after-close pass can never honour.
+    depth_unbacked_not_shed: metrics::Counter,
     depth_rows: metrics::Counter,
     depth_refused: metrics::Counter,
     depth_dropped: metrics::Counter,
@@ -5327,6 +5378,8 @@ pub fn counters() -> &'static DrainCounters {
         depth_unconsumed: metrics::counter!(DRAIN_FRAMES_COUNTER, "outcome" => "depth_unconsumed"),
         shed_inline_depth: metrics::counter!(DEPTH_COUNTER, "outcome" => "shed_inline"),
         shed_dedicated_depth: metrics::counter!(DEPTH_COUNTER, "outcome" => "shed_dedicated"),
+        frames_wal_unbacked: metrics::counter!(DRAIN_FRAMES_COUNTER, "outcome" => "wal_unbacked"),
+        depth_unbacked_not_shed: metrics::counter!(DEPTH_COUNTER, "outcome" => "unbacked_not_shed"),
         depth_rows: metrics::counter!(DEPTH_COUNTER, "outcome" => "rows"),
         depth_refused: metrics::counter!(DEPTH_COUNTER, "outcome" => "refused"),
         depth_dropped: metrics::counter!(DEPTH_COUNTER, "outcome" => "dropped"),
@@ -5382,6 +5435,11 @@ fn seed_drain_loss_baselines() {
     c.abandoned_bytes.increment(0);
     // Item 44b: the skip arm, seeded beside the abandon arm it replaces.
     c.unknown_skipped.increment(0);
+    // 2026-10-02: frames the WAL refused, and depth kept off the shed path
+    // because of it. Zero on a healthy lane; seeded so absent never reads as
+    // zero.
+    c.frames_wal_unbacked.increment(0);
+    c.depth_unbacked_not_shed.increment(0);
     // Both writers' shutdown-abandonment episodes. Labelled rather than two
     // names because the EMF processor folds label values into one summed
     // series per host, and either writer abandoning its queue calls for the
@@ -7542,7 +7600,13 @@ async fn run_frame_drain(
                             // The frame is already durable in the WAL by this
                             // point — shedding drops the DATABASE write, never
                             // the capture.
-                            Some(_) if !INGEST_SHED.allows_dedicated_depth() => {
+                            //
+                            // 2026-10-02: only a WAL-BACKED frame may be shed —
+                            // see `depth_shed_verdict`.
+                            Some(_) if depth_shed_verdict(
+                                frame.wal_backed,
+                                INGEST_SHED.allows_dedicated_depth(),
+                            ) == DepthShedVerdict::Shed => {
                                 c.shed_dedicated_depth.increment(1);
                                 // Item 45a: keep this frame's segment until the
                                 // after-close pass writes its depth back.
@@ -7550,6 +7614,12 @@ async fn run_frame_drain(
                                     .note_shed(frame.seq, tickvault_storage::wal_deferred_depth::ShedDepth::Dedicated);
                             }
                             Some(depth) => {
+                                // A closed gate reaching this arm can only be an
+                                // unbacked frame; the second gate load is paid
+                                // only on that degraded path.
+                                if !frame.wal_backed && !INGEST_SHED.allows_dedicated_depth() {
+                                    c.depth_unbacked_not_shed.increment(1);
+                                }
                                 let outcome = drain_depth_frame(
                                     depth, &frame, received_at_nanos, kind, c,
                                 );
@@ -8589,6 +8659,33 @@ pub const FLUSH_INTERVAL_MILLIS: u64 = 500;
 pub const FLUSH_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(FLUSH_INTERVAL_MILLIS);
 
+/// What the drain does with one frame's depth under the ingest-shed gate
+/// (2026-10-02).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DepthShedVerdict {
+    /// The gate is open: write the depth.
+    Write,
+    /// The gate is closed and the frame is in the WAL: shed it and record the
+    /// deferral, which the after-close pass honours by re-reading the WAL.
+    Shed,
+    /// The gate is closed but the frame is NOT in the WAL: write it anyway.
+    /// Shedding would record a deferral nothing can honour — a silent loss
+    /// reported as a deferral.
+    WriteUnbackedPastShed,
+}
+
+/// The single shed decision both depth paths (dedicated and inline) take.
+///
+/// Pure and branch-only: two `bool`s in, no load, no allocation. A frame the
+/// WAL refused is never shed, whatever the gate says.
+const fn depth_shed_verdict(wal_backed: bool, gate_allows: bool) -> DepthShedVerdict {
+    match (gate_allows, wal_backed) {
+        (true, _) => DepthShedVerdict::Write,
+        (false, true) => DepthShedVerdict::Shed,
+        (false, false) => DepthShedVerdict::WriteUnbackedPastShed,
+    }
+}
+
 /// Parses and folds ONE main-feed frame. Split out so the endpoint routing in
 /// the drain reads as routing rather than as a wall of parse logic.
 /// Decode one captured WebSocket frame and fold every packet it carries.
@@ -8629,6 +8726,15 @@ pub fn drain_main_feed_frame(
     // slow consumer forward -> silent upstream tick loss. Every other
     // high-rate arm here is throttled or counter-only for exactly this reason.
     let mut disconnect_logged = false;
+    // 2026-10-02: a frame the WAL REFUSED (`CapturedLiveOnly`) has no record a
+    // replay could re-offer. Mark both writers BEFORE any row is appended, so
+    // a busy rescue spills these rows inline rather than "deferring" them to
+    // a WAL that does not hold them. Flushes run after the frame, so one mark
+    // covers every row it appends. One bool test per frame when backed.
+    if !frame.wal_backed {
+        c.frames_wal_unbacked.increment(1);
+        ingest.mark_frame_unbacked();
+    }
     while offset < frame.bytes.len() {
         let Some(len) = main_feed_packet_len(&frame.bytes[offset..]) else {
             // Item 44b (2026-09-22): an unknown code no longer discards the
@@ -8721,7 +8827,17 @@ pub fn drain_main_feed_frame(
                 if let (Some(sink), ParsedFrame::TickWithDepth(t, levels)) =
                     (ingest.inline_depth.as_mut(), &parsed)
                 {
-                    if INGEST_SHED.allows_inline_depth() {
+                    // 2026-10-02: a frame the WAL refused is never shed — see
+                    // `depth_shed_verdict`. Its rows are written, and the
+                    // writer was marked unbacked at the top of this function,
+                    // so a busy rescue spills them inline instead of deferring
+                    // them to a WAL that does not hold them.
+                    let verdict =
+                        depth_shed_verdict(frame.wal_backed, INGEST_SHED.allows_inline_depth());
+                    if verdict != DepthShedVerdict::Shed {
+                        if verdict == DepthShedVerdict::WriteUnbackedPastShed {
+                            c.depth_unbacked_not_shed.increment(1);
+                        }
                         // `frame.seq` and `packets` are BOTH load-bearing — see
                         // the `capture_seq` derivation inside. The frame stamp
                         // alone repeats across every packet in the frame, and
@@ -9671,6 +9787,14 @@ fn drain_depth_frame(
     c: &DrainCounters,
 ) -> DepthFrameOutcome {
     let mut out = DepthFrameOutcome::default();
+    // 2026-10-02: see `drain_main_feed_frame` — a frame the WAL refused marks
+    // the writer unbacked before any row lands, so a busy rescue never drops
+    // its rows on the assumption a replay will restore them. Replayed frames
+    // are WAL-backed by definition and never take this arm.
+    if !frame.wal_backed {
+        c.frames_wal_unbacked.increment(1);
+        depth.writer.mark_pending_unbacked();
+    }
     let depth_kind_label = match kind {
         DepthFeedKind::Twenty => DEPTH_KIND_20,
         DepthFeedKind::TwoHundred => DEPTH_KIND_200,
@@ -14931,6 +15055,9 @@ pub fn refold_wal_frames(
                             // the WAL's `received_at_nanos` beside it.
                             received_at: std::time::Instant::now(),
                             received_at_nanos: *wal_received_at_nanos,
+                            // Replayed out of the WAL, so WAL-backed by
+                            // definition.
+                            wal_backed: true,
                             // APPROVED: `Bytes::clone` is an atomic refcount bump on a cold boot-replay path, NOT a copy of the frame payload.
                             bytes: bytes.clone(),
                         };
@@ -16460,6 +16587,16 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         Arc::clone(&params.feed_health),
         seed_rx,
     ));
+
+    // ---- kernel receive-queue sampler ---------------------------------------
+    //
+    // Cold, on its own task, once a second in session: how many bytes the
+    // KERNEL holds for our :443 sockets that the drain has not read yet. The
+    // drain's own counters cannot see this; a backlog sits below them, in the
+    // socket buffer, until Dhan skips a slow consumer forward. Gauges plus one
+    // edge-triggered coded line; it never touches the drain.
+    let _kernel_rx_queue_sampler =
+        crate::kernel_rx_queue_sampler::spawn_kernel_rx_queue_sampler(Arc::clone(&params.shutdown));
 
     // ---- socket lifecycle audit -------------------------------------------
     //
@@ -19540,6 +19677,7 @@ mod tests {
             received_at_nanos: tickvault_storage::ws_frame_spill::receipt_nanos_from(
                 std::time::Instant::now(),
             ),
+            wal_backed: true,
             bytes: bytes::Bytes::from(bytes),
         }
     }
@@ -19668,6 +19806,104 @@ mod tests {
         assert_eq!(out.rows, 20, "every level is a row — nothing is sampled");
         assert_eq!(out.refused, 0);
         assert_eq!(depth.pending_rows(), 20);
+    }
+
+    /// 2026-10-02: a depth frame the WAL REFUSED is still written in full, and
+    /// its rows are marked unbacked so a busy rescue spills them inline rather
+    /// than "deferring" them to a WAL segment that does not exist.
+    #[test]
+    fn an_unbacked_depth_frame_is_written_and_marks_its_rows_unbacked() {
+        let mut depth = DepthIngest::for_test();
+        let mut frame = depth_frame(depth20_packet(13, 0, 41), DhanEndpointType::Depth20, 7);
+        frame.wal_backed = false;
+        let out = drain_depth_frame(
+            &mut depth,
+            &frame,
+            1_779_355_000_000_000_000,
+            DepthFeedKind::Twenty,
+            counters(),
+        );
+        assert_eq!(out.rows, 20, "an unbacked frame loses nothing at the drain");
+        assert_eq!(depth.pending_rows(), 20);
+        assert!(
+            depth.writer.pending_unbacked(),
+            "the rows must be marked so the rescue path never drops them as WAL-backed"
+        );
+    }
+
+    /// The shed decision both depth paths take, over every input. Only a
+    /// WAL-backed frame may be shed; an unbacked one is written whatever the
+    /// gate says.
+    #[test]
+    fn depth_shed_verdict_never_sheds_an_unbacked_frame() {
+        assert_eq!(depth_shed_verdict(true, true), DepthShedVerdict::Write);
+        assert_eq!(depth_shed_verdict(false, true), DepthShedVerdict::Write);
+        assert_eq!(depth_shed_verdict(true, false), DepthShedVerdict::Shed);
+        assert_eq!(
+            depth_shed_verdict(false, false),
+            DepthShedVerdict::WriteUnbackedPastShed
+        );
+        for wal_backed in [false, true] {
+            for gate in [false, true] {
+                let shed = depth_shed_verdict(wal_backed, gate) == DepthShedVerdict::Shed;
+                assert_eq!(shed, wal_backed && !gate, "backed={wal_backed} gate={gate}");
+            }
+        }
+    }
+
+    /// The compile-time bitmask must agree with the list it is folded from,
+    /// for EVERY family value. The exhaustive `match` makes a new variant a
+    /// compile error here until it is added to the loop.
+    #[test]
+    fn is_ranked_option_family_agrees_with_the_array_for_every_family() {
+        use crate::volume_leaderboard::OptionFamily;
+        let every = [OptionFamily::Index, OptionFamily::Stock];
+        for family in every {
+            match family {
+                OptionFamily::Index | OptionFamily::Stock => {}
+            }
+            assert_eq!(
+                is_ranked_option_family(family),
+                RANKED_OPTION_FAMILIES.contains(&family),
+                "mask and array disagree for {family:?}"
+            );
+        }
+        // Distinct bits, so no two families can alias in the mask.
+        assert_ne!(
+            option_family_bit(OptionFamily::Index),
+            option_family_bit(OptionFamily::Stock)
+        );
+        // Today's policy, pinned: stock options only (2026-09-18 FOURTH).
+        assert!(is_ranked_option_family(OptionFamily::Stock));
+        assert!(!is_ranked_option_family(OptionFamily::Index));
+    }
+
+    /// Both production depth paths must route the shed through
+    /// `depth_shed_verdict` with the frame's own `wal_backed`, or one of them
+    /// could still shed a frame the WAL never held.
+    #[test]
+    fn both_depth_shed_sites_consult_wal_backed() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production = src.split(test_marker).next().unwrap_or(src);
+        // Whitespace-insensitive, so a reformat cannot break the scan.
+        let compact: String = production
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(
+            compact.contains(
+                "depth_shed_verdict(frame.wal_backed,INGEST_SHED.allows_dedicated_depth(),)"
+            ) || compact.contains(
+                "depth_shed_verdict(frame.wal_backed,INGEST_SHED.allows_dedicated_depth())"
+            ),
+            "the dedicated-depth shed must pass frame.wal_backed"
+        );
+        assert!(
+            compact
+                .contains("depth_shed_verdict(frame.wal_backed,INGEST_SHED.allows_inline_depth())"),
+            "the inline-depth shed must pass frame.wal_backed"
+        );
     }
 
     #[test]
@@ -22295,6 +22531,7 @@ mod tests {
             received_at_nanos: tickvault_storage::ws_frame_spill::receipt_nanos_from(
                 std::time::Instant::now(),
             ),
+            wal_backed: true,
             bytes: bytes::Bytes::copy_from_slice(&ticker_packet(
                 13,
                 23_146.45,
@@ -22373,6 +22610,7 @@ mod tests {
             received_at_nanos: tickvault_storage::ws_frame_spill::receipt_nanos_from(
                 std::time::Instant::now(),
             ),
+            wal_backed: true,
             bytes: bytes::Bytes::copy_from_slice(&ticker_packet(
                 13,
                 23_146.45,
@@ -22477,6 +22715,7 @@ mod tests {
             received_at_nanos: tickvault_storage::ws_frame_spill::receipt_nanos_from(
                 std::time::Instant::now(),
             ),
+            wal_backed: true,
             bytes: bytes::Bytes::from_static(&[0x0C, 0x00, 0x29, 0x00, 0x0D, 0x00, 0x00, 0x00]),
         })
         .await
@@ -26264,6 +26503,7 @@ mod frame_walk_accounting_tests {
                 received_at_nanos: tickvault_storage::ws_frame_spill::receipt_nanos_from(
                     std::time::Instant::now(),
                 ),
+                wal_backed: true,
                 bytes: bytes.into(),
             },
             any_recv_nanos(),
@@ -26421,6 +26661,70 @@ mod frame_walk_accounting_tests {
     /// bumped the frame counter by ONE, so a frame that dropped 1,500 packets
     /// and a frame that dropped one reported the same number. An operator
     /// reading `unparseable = 1` would reasonably conclude a single bad packet.
+    /// 2026-10-02: a main-feed frame the WAL REFUSED still folds every tick,
+    /// and marks BOTH its writers (tick + inline depth) unbacked, so a busy
+    /// rescue spills its rows inline instead of dropping them on the false
+    /// assumption a replay will restore them. A backed frame marks nothing.
+    #[test]
+    fn mark_frame_unbacked_is_driven_by_an_unbacked_main_feed_frame() {
+        let good = ticker_packet(13, 100.5, any_ltt());
+        let frame = |wal_backed: bool| CapturedFrame {
+            seq: 1 << 20,
+            endpoint: DhanEndpointType::MainFeed,
+            connection_index: 0,
+            received_at: std::time::Instant::now(),
+            received_at_nanos: tickvault_storage::ws_frame_spill::receipt_nanos_from(
+                std::time::Instant::now(),
+            ),
+            wal_backed,
+            bytes: bytes::Bytes::copy_from_slice(&good),
+        };
+
+        let mut backed = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8)
+            .with_inline_depth(DepthIngest::for_test());
+        let out = drain_main_feed_frame(
+            &mut backed,
+            &frame(true),
+            any_recv_nanos(),
+            1_000,
+            counters(),
+        );
+        assert_eq!(out.folded, 1);
+        assert!(
+            !backed.writer.pending_unbacked(),
+            "backed behaviour unchanged"
+        );
+        assert!(
+            !backed
+                .inline_depth
+                .as_ref()
+                .is_some_and(|d| d.writer.pending_unbacked()),
+            "backed behaviour unchanged for inline depth"
+        );
+
+        let mut unbacked = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8)
+            .with_inline_depth(DepthIngest::for_test());
+        let out = drain_main_feed_frame(
+            &mut unbacked,
+            &frame(false),
+            any_recv_nanos(),
+            1_000,
+            counters(),
+        );
+        assert_eq!(out.folded, 1, "an unbacked frame still folds its tick");
+        assert!(
+            unbacked.writer.pending_unbacked(),
+            "the tick rows must be marked unbacked"
+        );
+        assert!(
+            unbacked
+                .inline_depth
+                .as_ref()
+                .is_some_and(|d| d.writer.pending_unbacked()),
+            "the inline-depth rows must be marked unbacked"
+        );
+    }
+
     #[test]
     fn an_unknown_packet_code_reports_the_bytes_it_abandoned() {
         let good = ticker_packet(13, 100.5, any_ltt());
@@ -26445,6 +26749,7 @@ mod frame_walk_accounting_tests {
                 received_at_nanos: tickvault_storage::ws_frame_spill::receipt_nanos_from(
                     std::time::Instant::now(),
                 ),
+                wal_backed: true,
                 bytes: bytes.into(),
             },
             any_recv_nanos(),
@@ -26474,6 +26779,7 @@ mod frame_walk_accounting_tests {
                 received_at_nanos: tickvault_storage::ws_frame_spill::receipt_nanos_from(
                     std::time::Instant::now(),
                 ),
+                wal_backed: true,
                 bytes: bytes.into(),
             },
             any_recv_nanos(),
@@ -26567,6 +26873,7 @@ mod frame_walk_accounting_tests {
                 received_at_nanos: tickvault_storage::ws_frame_spill::receipt_nanos_from(
                     std::time::Instant::now(),
                 ),
+                wal_backed: true,
                 bytes: bytes.into(),
             },
             any_recv_nanos(),
@@ -26605,6 +26912,7 @@ mod frame_walk_accounting_tests {
                 received_at_nanos: tickvault_storage::ws_frame_spill::receipt_nanos_from(
                     std::time::Instant::now(),
                 ),
+                wal_backed: true,
                 bytes: bytes.into(),
             },
             any_recv_nanos(),
@@ -26638,6 +26946,7 @@ mod frame_walk_accounting_tests {
                 received_at_nanos: tickvault_storage::ws_frame_spill::receipt_nanos_from(
                     std::time::Instant::now(),
                 ),
+                wal_backed: true,
                 bytes: bytes.into(),
             },
             any_recv_nanos(),
@@ -26767,6 +27076,7 @@ mod frame_walk_accounting_tests {
                 received_at_nanos: tickvault_storage::ws_frame_spill::receipt_nanos_from(
                     std::time::Instant::now(),
                 ),
+                wal_backed: true,
                 bytes: bytes.into(),
             },
             any_recv_nanos(),
@@ -26811,6 +27121,7 @@ mod frame_walk_accounting_tests {
                 received_at_nanos: tickvault_storage::ws_frame_spill::receipt_nanos_from(
                     std::time::Instant::now(),
                 ),
+                wal_backed: true,
                 bytes: bytes.into(),
             },
             any_recv_nanos(),
@@ -26862,6 +27173,7 @@ mod frame_walk_accounting_tests {
                 received_at_nanos: tickvault_storage::ws_frame_spill::receipt_nanos_from(
                     std::time::Instant::now(),
                 ),
+                wal_backed: true,
                 bytes: bytes.into(),
             },
             any_recv_nanos(),
@@ -26911,6 +27223,7 @@ mod frame_walk_accounting_tests {
                 received_at_nanos: tickvault_storage::ws_frame_spill::receipt_nanos_from(
                     std::time::Instant::now(),
                 ),
+                wal_backed: true,
                 bytes: bytes.into(),
             },
             any_recv_nanos(),

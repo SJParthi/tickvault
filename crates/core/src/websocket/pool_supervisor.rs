@@ -4314,6 +4314,24 @@ pub struct CapturedFrame {
     /// read the same way live and on replay, makes the key collapse them.
     /// An `i64` copy: no allocation, and still no wall-clock read in this file.
     pub received_at_nanos: i64,
+    /// Whether this frame's WAL append SUCCEEDED (2026-10-02).
+    ///
+    /// `false` only on the `CapturedLiveOnly` arm: the write-ahead queue
+    /// refused the frame and it entered the ring anyway. Downstream code must
+    /// not assume such a frame can be re-offered by a replay, because no WAL
+    /// segment holds it. Two consequences, both enforced in the drain:
+    ///
+    ///   1. its depth is never SHED — shedding records the frame as deferred
+    ///      for the after-close pass, which re-reads WAL segments, so an
+    ///      unbacked shed was a silent loss reported as a deferral;
+    ///   2. its tick and depth rows are marked unbacked on the writers, so a
+    ///      busy rescue thread keeps them in the inline spill instead of
+    ///      dropping them on the assumption the WAL will restore them.
+    ///
+    /// A replayed frame is WAL-backed by definition and always carries
+    /// `true`. A `bool` copy: no allocation, `Bytes` stays the only heap
+    /// member.
+    pub wal_backed: bool,
     /// The frame exactly as it arrived. Never parsed on the read task.
     pub bytes: Bytes,
 }
@@ -4855,6 +4873,7 @@ impl FrameSink for WalRingSink {
                 connection_index: self.connection_index,
                 received_at,
                 received_at_nanos,
+                wal_backed: !wal_refused,
                 bytes: frame,
             })
             .is_err()
@@ -10452,6 +10471,47 @@ mod tests {
             published.received_at >= before && published.received_at <= after,
             "the receipt stamp must be taken inside accept() — it fell outside the \
              bracket taken around the call, so it was not stamped at receipt"
+        );
+        assert!(
+            published.wal_backed,
+            "a frame the WAL accepted must say so, or the drain stops shedding it"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 2026-10-02: a frame the WAL REFUSED still reaches the ring
+    /// (`CapturedLiveOnly`), and must arrive marked `wal_backed == false` —
+    /// otherwise the drain sheds its depth as a "deferral" and lets a busy
+    /// rescue drop its rows "to the WAL", neither of which a replay can honour.
+    #[test]
+    fn test_wal_ring_sink_marks_a_wal_refused_frame_unbacked() {
+        let dir = wal_dir("unbacked");
+        let spill = std::sync::Arc::new(
+            WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
+        );
+        // A stopped writer refuses every later append: the closest real
+        // reproduction of a WAL that cannot take the frame.
+        let _ = spill.shutdown(std::time::Duration::from_secs(5));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<CapturedFrame>(4);
+        let sink = WalRingSink::new(
+            std::sync::Arc::clone(&spill),
+            tx,
+            std::sync::Arc::new(RingByteBudget::new(usize::MAX)),
+            WsType::LiveFeed,
+            DhanEndpointType::MainFeed,
+            0,
+        );
+
+        assert_eq!(
+            sink.accept(Bytes::from_static(&[2u8, 16, 0, 0, 0, 0, 0, 0])),
+            FrameSinkOutcome::CapturedLiveOnly,
+            "a WAL refusal must still reach the ring"
+        );
+        let published = rx.try_recv().expect("the frame must still be published");
+        assert!(
+            !published.wal_backed,
+            "a frame the WAL refused must be marked unbacked"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

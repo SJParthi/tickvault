@@ -269,6 +269,8 @@ pub(crate) fn pass_counters() -> &'static DrainCounters {
             main_feed_length_mismatch: noop(),
             abandoned_bytes: noop(),
             unknown_skipped: noop(),
+            frames_wal_unbacked: noop(),
+            depth_unbacked_not_shed: noop(),
         }
     })
 }
@@ -349,6 +351,8 @@ fn rewrite_dedicated_depth(
         // A dwell anchor only; the receipt used is the WAL's.
         received_at: std::time::Instant::now(),
         received_at_nanos: frame.received_at_nanos,
+        // Re-read out of the WAL, so WAL-backed by definition.
+        wal_backed: true,
         // APPROVED: one copy of a frame on the cold after-close path.
         bytes: bytes::Bytes::copy_from_slice(&frame.frame),
     };
