@@ -3503,6 +3503,21 @@ static SEAL_ESCALATION_PENDING: std::sync::OnceLock<
 static SEAL_ESCALATION_THREAD: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> =
     std::sync::Mutex::new(None);
 
+/// The seal writer's spill directory, where its crash marker lives, so the
+/// shutdown can mark the marker clean once the escalation queue has drained
+/// (audit PR31b-1). Set once, beside `SEAL_WRITER_HANDLE`.
+static SEAL_UNWRITTEN_MARK_DIR: std::sync::OnceLock<std::path::PathBuf> =
+    std::sync::OnceLock::new();
+
+/// Budget for marking the crash marker clean at shutdown: one small write and
+/// a rename, which take milliseconds on a healthy disk. Bounded so a stalled
+/// disk cannot hold the shutdown before the WAL floor drains.
+const SEAL_UNWRITTEN_MARK_FINISH_BUDGET_SECS: u64 = 2;
+
+/// [`SEAL_UNWRITTEN_MARK_FINISH_BUDGET_SECS`] as a `Duration`.
+const SEAL_UNWRITTEN_MARK_FINISH_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(SEAL_UNWRITTEN_MARK_FINISH_BUDGET_SECS);
+
 /// Budget for draining the seal-escalation queue at shutdown.
 ///
 /// DERIVED, not guessed: the queue holds at most
@@ -3735,6 +3750,7 @@ fn spawn_seal_writer_loop(questdb_config: &tickvault_common::config::QuestDbConf
                      wins; this runner will not be spawned"
                 );
             } else {
+                let _ = SEAL_UNWRITTEN_MARK_DIR.set(runner.spill_dir().to_path_buf());
                 let handle = tokio::spawn(async move {
                     run_seal_writer_loop(runner, seal_drain_interval(), cancel_rx).await
                 });
@@ -4799,6 +4815,8 @@ async fn run_process_runloop(
     if let Some(stop) = SEAL_ESCALATION_STOP.get() {
         stop.store(true, std::sync::atomic::Ordering::Release);
     }
+    // Seals this step pages as lost, recorded in the crash marker below.
+    let mut seals_escalation_abandoned = 0_usize;
     let escalation_handle = SEAL_ESCALATION_THREAD
         .lock()
         .ok()
@@ -4838,12 +4856,53 @@ async fn run_process_runloop(
                 tickvault_storage::seal_writer_runner::SEAL_ESCALATION_ABANDONED_COUNTER
             )
             .increment(seals_abandoned as u64);
+            seals_escalation_abandoned = seals_abandoned;
             error!(
                 code = tickvault_common::error_code::ErrorCode::AggregatorDrop01.code_str(),
                 budget_secs = SEAL_ESCALATION_SHUTDOWN_BUDGET.as_secs(),
                 seals_abandoned,
                 "seal escalation: the queue did NOT drain within budget — exiting anyway so \
                  systemd does not SIGKILL us, but seals still queued are lost"
+            );
+        }
+    }
+
+    // 5b-2c. Crash marker (audit PR31b-1, 2026-10-01).
+    //
+    // Only now can nothing in this process still write a sealed candle: the
+    // writer (5b-2) and the escalation queue (5b-2b) are drained, or have been
+    // given up on and paged. The writer left the marker NOT clean while the
+    // escalation queue held seals, so a kill during 5b-2b is reported at the
+    // next boot. Marking it clean here, whatever the outcome above, stops the
+    // next boot paging a loss this shutdown already paged, including a writer
+    // that overran its budget.
+    //
+    // Bounded like every other wait on this path: the finish is a file write
+    // and a rename, and on a stalled disk an overrun writer can hold the
+    // marker's lock inside its own write. It runs on a blocking thread, and
+    // past the budget the shutdown goes on to 5b-3; the marker then keeps the
+    // count the writer last wrote, which the next boot reports.
+    if let Some(dir) = SEAL_UNWRITTEN_MARK_DIR.get() {
+        let dir = dir.clone();
+        let now = chrono::Utc::now().timestamp();
+        let finish = tokio::task::spawn_blocking(move || {
+            tickvault_storage::seal_writer_loop::finish_unwritten_mark_at_shutdown(
+                &dir,
+                seals_escalation_abandoned,
+                now,
+            )
+        });
+        if tokio::time::timeout(SEAL_UNWRITTEN_MARK_FINISH_BUDGET, finish)
+            .await
+            .is_err()
+        {
+            error!(
+                code =
+                    tickvault_common::error_code::ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                source = "unwritten_mark",
+                budget_secs = SEAL_UNWRITTEN_MARK_FINISH_BUDGET.as_secs(),
+                "seal writer: the crash marker could not be marked clean within budget — \
+                 the next boot may report the candles this shutdown already reported"
             );
         }
     }
