@@ -105,12 +105,12 @@
 #   what each dated change added or retired, and it is kept for that. It is NOT
 #   the current shape, and has not been since 2026-09-16. Counted in the file
 #   rather than carried forward: 5 standalone `aws_cloudwatch_log_metric_filter`
-#   resources, 4 standalone `aws_cloudwatch_metric_alarm` resources, and 22 live
+#   resources, 4 standalone `aws_cloudwatch_metric_alarm` resources, and 23 live
 #   `error_code_alerts` map entries (was 18 on 2026-09-17; +3 on 2026-09-24,
 #   when the three `ws-gap-03-xverify-*` verdicts came back with the restored
 #   1-minute cross-verification — noise-lock §2.5; +1 on 2026-09-27,
 #   `aggregator-stall-01`, audit PR40d — noise-lock §2.7; +1 on 2026-10-02,
-#   `hot-path-stall-01`, noise-lock §2.8 — so 23 entries). Re-count with:
+#   `hot-path-stall-01`, noise-lock §2.8). Re-count with:
 #     grep -c '^resource "aws_cloudwatch_log_metric_filter"' <this file>
 #     grep -c '^resource "aws_cloudwatch_metric_alarm"'      <this file>
 #   A count in a comment is a claim, and a claim carries a date — this repo has

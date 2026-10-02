@@ -170,8 +170,11 @@ async fn chaos_ws_mock_server_silence_mid_stream_does_not_time_out_client() {
     })
     .await;
 
-    let mut client_ws = connect_client(port).await;
+    // Start the clock before connecting: the server begins its 500 ms silence
+    // right after accepting, so a clock started after `connect` returns can
+    // read a few ms short of the window on a loaded machine.
     let start = Instant::now();
+    let mut client_ws = connect_client(port).await;
     let mut received = 0usize;
     while let Some(msg) = client_ws.next().await {
         match msg.expect("recv frame") {

@@ -2286,6 +2286,31 @@ idle poll. No allocation on the tick path.
   owner to confirm date, hours and cost, and a compile + test run.
 - [ ] **R3-14 — WAL segment names from a monotonic source** (replay order across a clock step). Open.
 
+### Added 2026-10-02 (round 4: owner approved decisions 2 to 5 and in-place resubscribe)
+
+Operator 2026-10-02: "go ahea ddude" / "dont b;ock go ahea ddude" (11:51), "what happend to
+unsusbcribe resubscribe fucntionality as well dude can you add this alsod due okay?" (11:59) and
+"go ahead approved everyhtign dude okay?" (12:40, naming the stall alarm and the libc dependency).
+Each is recorded first in its rule file.
+
+- [x] **R4-1 (decision 2) — Depth sockets recover on their own after 805.** `pool_supervisor.rs`
+  depth overflow episode (one probe process-wide, doubling wait 5 to 30 min, at most 6 probes),
+  `ROTATION_HALTED` never cleared; scope lock 2026-10-02 section. 9 tests incl. a 50,000-step
+  random driver; `tv_dhan_ws_depth_overflow_probe_total{outcome}`.
+- [x] **R4-2 (decision 5) — Backup copy of the top 1,000 contracts on the spot main-feed socket**
+  (`main_feed_backup.rs`, `[dhan_universe] backup_top_n`, 0 disables). First copy wins at the drain;
+  the WAL keeps both. Free-slot count (~2,662) is derived, not re-measured. Scope lock section.
+- [x] **R4-3 — In-place unsubscribe/resubscribe on every socket kind** (`LiveSubscriptionCommand::
+  Resubscribe`, unsubscribe batches first, per-socket caps refused and counted). Includes PR #1994
+  (depth-200 swap and ghost resend in place). No production sender yet: no live policy removes
+  instruments mid-session. Scope lock 2026-10-02 section.
+- [x] **R4-4 (decision 4) — Socket reader threads pinned to their own core** (`libc =0.2.185`,
+  `TICKVAULT_WS_READER_CORE`, default core 1 when allowed, never core 0, `tv_ws_reader_pinned_core`).
+  Benefit not measured.
+- [x] **R4-5 (decision 3) — Phone page HOT-PATH-STALL-01** when a hot task stalls 2 s in session
+  (`hot_path_telemetry.rs` StallAlarm, CloudWatch filter + alarm, noise lock 2.8). Cannot fire
+  if the whole process freezes.
+
 R3 Z+ and guarantee matrix: covered by the shared matrix at the end of this plan. Tick path adds
 one histogram bucket update per frame (R3-11) and one bool per frame (R3-9); no allocation by
 construction (an allocation test for the telemetry is still open).
