@@ -247,6 +247,33 @@ history only):
   follow-up) are DISJOINT classes — the orders-rejected alarm and the
   OrderRejected Telegram are two routes, not one signal chain.
 
+### 2026-10-01 note — the order push consumer fell behind (audit PR42a)
+
+`crates/app/src/dhan_order_push_observability.rs` logs AUDIT-06 with
+`source = "order_push_lagged"` when the paper order-push consumer falls more
+than `DHAN_ORDER_PUSH_CHANNEL_CAPACITY` (1,024) updates behind the broadcast.
+The skipped updates are never written to `order_audit` or
+`order_update_events`, and the broker does not replay them. This was an
+uncoded `warn!` until 2026-10-01.
+
+- **Counters:** `tv_dhan_order_push_lagged_total` (count of skipped updates,
+  local on `/metrics`) and the shipped
+  `tv_order_audit_chain_lost_total{source="order_push_lagged"}`, both seeded
+  at 0 when the consumer is spawned.
+- **Paging:** `tv_order_audit_chain_lost_total` is summed into the
+  `tv-<env>-order-audit-chain-loss` alarm. The same counter also carries
+  `source="pnl_audit_discarded"` and `source="order_leg_pnl_discarded"`
+  (P&L and leg P&L rows discarded by their writers), which reached no alarm
+  before the same change. CloudWatch sees only the sum; the coded log line
+  names the source.
+- **DO:** record the window from the log line; the rows are gone. The
+  usual cause is the QuestDB flush stalling the consumer, which flushes once
+  per update: check the ILP flush latency and the WAL-suspended gauge.
+- **Honest limit:** nothing reconciles the skipped updates. The consumer
+  holds no copy of the paper OMS order map, and fetching the broker order
+  book is REST outside the allowed classes. That reconcile is plan item
+  PR42c and needs an owner decision.
+
 ## STORAGE-GAP-03 — audit-table write failure (any table)
 
 **Trigger:** any audit-table writer hit an unrecoverable error after the

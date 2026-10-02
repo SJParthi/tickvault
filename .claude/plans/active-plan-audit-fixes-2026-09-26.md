@@ -1463,6 +1463,22 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
     never become audit rows, counted on the box only with an uncoded warning. Code the warning,
     ship the lag counter, and reconcile on lag. (PR14 names the order-runtime channel and PR39 a
     different line; neither covers this one.) Paper mode only; `dry_run` is not touched.
+  - [x] **PR42a — the losses are seen (2026-10-01).** One new shipped counter,
+    `tv_order_audit_chain_lost_total{source}`, counts P&L audit rows discarded
+    (`pnl_audit_discarded`), leg P&L rows discarded (`order_leg_pnl_discarded`) and order-push
+    updates a lagging consumer skipped (`order_push_lagged`); each source is seeded at 0. It is
+    the sixth leg of `tv-<env>-order-audit-chain-loss`. One name, not three: the CloudWatch agent
+    folds the label, the alarm needs only the sum, and the coded log line names the source
+    (+$0.30/mo, aws-budget.md COST NOTE 2026-10-01). The lag warning is now a coded AUDIT-06
+    error (`source = "order_push_lagged"`). The per-writer counters stay local.
+    Tests: `order_side_paging_wiring_guard` (emit and seed at every source, coded lag arm, alarm
+    sums m6, selector carries the name); EMF count ratchet 102 → 103.
+  - [ ] **PR42b — the rows survive.** Disk tier for `order_audit`, `pnl_audit` and
+    `order_leg_pnl` (bounded spill, replayed under their DEDUP keys).
+  - [ ] **PR42c — reconcile on lag. Needs an owner decision.** The order-push consumer holds no
+    copy of the paper OMS order map, and fetching the broker order book is REST outside the
+    allowed classes (`no-rest-except-live-feed-2026-06-27.md`). Options: share a read handle on
+    the OMS order map, or accept counted loss. Not started.
 - [ ] **PR43 — no NIFTY or BANKNIFTY depth-20 option leg is dropped silently.** (`app`)
   - Past 246 spot instruments every index option leg leaves depth-20 while the settle log says
     complete; shrinking starts at 215 spots, and today is about 208

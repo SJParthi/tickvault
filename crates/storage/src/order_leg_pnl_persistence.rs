@@ -216,6 +216,13 @@ impl OrderLegPnlWriter {
         // BARE at its only emit site in `discard_pending`, so this creates the
         // identical series rather than a phantom sibling.
         metrics::counter!("tv_order_leg_pnl_rows_discarded_total").increment(0);
+        // The shipped twin (audit PR42a): this writer's discards also count on
+        // the one order-audit chain counter the CloudWatch alarm sums.
+        metrics::counter!(
+            "tv_order_audit_chain_lost_total",
+            "source" => "order_leg_pnl_discarded"
+        )
+        .increment(0);
         let conf = order_leg_pnl_ilp_http_conf(&config.host, config.http_port);
         match Sender::from_conf(&conf) {
             Ok(sender) => {
@@ -401,6 +408,11 @@ impl OrderLegPnlWriter {
         let dropped = self.pending;
         if dropped > 0 {
             metrics::counter!("tv_order_leg_pnl_rows_discarded_total").increment(dropped as u64);
+            metrics::counter!(
+                "tv_order_audit_chain_lost_total",
+                "source" => "order_leg_pnl_discarded"
+            )
+            .increment(dropped as u64);
         }
         self.buffer.clear();
         self.pending = 0;

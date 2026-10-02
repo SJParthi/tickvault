@@ -20,7 +20,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::{broadcast, mpsc};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 use tickvault_common::broker_order_events::{
     OrderUpdateEventRecord, build_dhan_order_event_record,
@@ -322,11 +322,24 @@ async fn run_dhan_order_push_consumer(
                 persist_push_row(&mut writer, &row);
             }
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                // Skipped updates never become order_audit rows nor
+                // order_update_events captures, and the broker does not
+                // replay them. The shipped chain counter carries them to the
+                // order-audit chain-loss alarm (audit PR42a).
                 metrics::counter!("tv_dhan_order_push_lagged_total").increment(skipped);
-                warn!(
+                metrics::counter!(
+                    "tv_order_audit_chain_lost_total",
+                    "source" => "order_push_lagged"
+                )
+                .increment(skipped);
+                error!(
+                    code = ErrorCode::Audit06OrderWriteFailed.code_str(),
+                    source = "order_push_lagged",
                     skipped,
-                    "dhan order push: consumer lagged the broadcast — {skipped} update(s) \
-                     skipped from the paper audit record (counted, feed unaffected)"
+                    capacity = DHAN_ORDER_PUSH_CHANNEL_CAPACITY,
+                    "AUDIT-06: dhan order push consumer fell behind the broadcast — \
+                     {skipped} update(s) skipped, never written to order_audit or \
+                     order_update_events (feed unaffected)"
                 );
             }
             Err(broadcast::error::RecvError::Closed) => {
@@ -368,6 +381,13 @@ pub fn spawn_dhan_order_push_consumer(
     for reason in ["clean_exit", "panic"] {
         metrics::counter!("tv_dhan_order_push_respawn_total", "reason" => reason).increment(0);
     }
+    // A lag is counted twice: on its own counter, and on the one shipped
+    // order-audit chain counter the CloudWatch alarm sums (audit PR42a).
+    // Both seeded for the same first-sample reason: the first lag would
+    // otherwise be the unseen sample the agent drops.
+    metrics::counter!("tv_dhan_order_push_lagged_total").increment(0);
+    metrics::counter!("tv_order_audit_chain_lost_total", "source" => "order_push_lagged")
+        .increment(0);
     tokio::spawn(async move {
         let mut pending_first_rx = Some(first_rx);
         let mut consecutive_abnormal_exits: u32 = 0;

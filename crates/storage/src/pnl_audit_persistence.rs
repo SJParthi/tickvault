@@ -319,6 +319,10 @@ impl PnlAuditWriter {
         // BARE at its only emit site in `discard_pending`, so this creates the
         // identical series rather than a phantom sibling.
         metrics::counter!("tv_pnl_audit_rows_discarded_total").increment(0);
+        // The shipped twin (audit PR42a): this writer's discards also count on
+        // the one order-audit chain counter the CloudWatch alarm sums.
+        metrics::counter!("tv_order_audit_chain_lost_total", "source" => "pnl_audit_discarded")
+            .increment(0);
         let conf = pnl_audit_ilp_http_conf(config);
         match Sender::from_conf(&conf) {
             Ok(s) => {
@@ -486,6 +490,8 @@ impl PnlAuditWriter {
         let dropped = self.pending;
         if dropped > 0 {
             metrics::counter!("tv_pnl_audit_rows_discarded_total").increment(dropped as u64);
+            metrics::counter!("tv_order_audit_chain_lost_total", "source" => "pnl_audit_discarded")
+                .increment(dropped as u64);
         }
         self.buffer.clear();
         self.pending = 0;
