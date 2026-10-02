@@ -60,7 +60,8 @@ pub fn spawn_live_feed_lifecycle_audit(
 ) -> tokio::sync::mpsc::Sender<tickvault_core::websocket::pool_supervisor::WsLifecycleEvent> {
     use tickvault_core::websocket::pool_supervisor::WsLifecycleEvent;
 
-    let rows_tx = spawn_ws_event_audit_consumer(questdb_cfg);
+    let rows_tx = spawn_ws_event_audit_consumer(questdb_cfg.clone());
+    let gap_tx = spawn_feed_gap_audit_consumer(questdb_cfg);
     let (tx, mut rx) =
         tokio::sync::mpsc::channel::<WsLifecycleEvent>(WS_EVENT_AUDIT_CHANNEL_CAPACITY);
     tokio::spawn(async move {
@@ -68,25 +69,322 @@ pub fn spawn_live_feed_lifecycle_audit(
         // channel, and the page for it is said once per episode (see
         // `record_forward_drop`).
         let latch = DropLatch::new();
-        while let Some(event) = rx.recv().await {
-            let now_ist_nanos = chrono::Utc::now()
-                .timestamp_nanos_opt()
-                .unwrap_or_default()
-                .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
-            match rows_tx.try_send(lifecycle_row(event, now_ist_nanos)) {
-                Ok(()) => {
-                    let _ = record_forward_ok(&latch, &event);
+        // 2026-10-02: the open gap per connection slot, so the reconnect row
+        // carries `down_secs` and every gap becomes one `feed_gap_audit` row.
+        // Fixed 32 slots, O(1) per event, allocation-free.
+        let mut gaps = GapTracker::new();
+        let mut stop_poll = tokio::time::interval(GAP_STOP_POLL_INTERVAL);
+        let mut stop_seen = false;
+        loop {
+            tokio::select! {
+                maybe = rx.recv() => {
+                    let now_ist_nanos = now_ist_nanos();
+                    let Some(event) = maybe else {
+                        // Every socket is gone: a gap still open is written
+                        // closed at this instant rather than lost.
+                        gaps.close_all(now_ist_nanos, |row| forward_gap_row(&gap_tx, row));
+                        break;
+                    };
+                    let step = gaps.on_event(&event, now_ist_nanos);
+                    if let Some(row) = step.closed {
+                        forward_gap_row(&gap_tx, row);
+                    }
+                    if is_shutdown_close(&event) {
+                        // Shutdown is process-wide: every gap still open
+                        // (a socket parked for the session, or one mid-
+                        // backoff) ends at this instant.
+                        gaps.close_all(now_ist_nanos, |row| forward_gap_row(&gap_tx, row));
+                    }
+                    match rows_tx.try_send(lifecycle_row(event, now_ist_nanos, step)) {
+                        Ok(()) => {
+                            let _ = record_forward_ok(&latch, &event);
+                        }
+                        Err(TrySendError::Full(_)) => {
+                            let _ = record_forward_drop(&latch, &event, "full");
+                        }
+                        Err(TrySendError::Closed(_)) => {
+                            let _ = record_forward_drop(&latch, &event, "closed");
+                        }
+                    }
                 }
-                Err(TrySendError::Full(_)) => {
-                    let _ = record_forward_drop(&latch, &event, "full");
-                }
-                Err(TrySendError::Closed(_)) => {
-                    let _ = record_forward_drop(&latch, &event, "closed");
+                _ = stop_poll.tick(), if !stop_seen => {
+                    // A process stop with every socket already parked sends
+                    // no further lifecycle event, so the stop itself closes
+                    // the open gaps.
+                    if tickvault_core::websocket::pool_supervisor::SOCKET_STOP.is_requested() {
+                        stop_seen = true;
+                        gaps.close_all(now_ist_nanos(), |row| forward_gap_row(&gap_tx, row));
+                    }
                 }
             }
         }
     });
     tx
+}
+
+/// How often the forwarder checks whether the process asked its sockets to
+/// stop (one atomic load per tick).
+const GAP_STOP_POLL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(GAP_STOP_POLL_SECS);
+
+/// [`GAP_STOP_POLL_INTERVAL`] in whole seconds.
+const GAP_STOP_POLL_SECS: u64 = 1;
+
+/// Connection slots tracked for open gaps: one per global connection index,
+/// the same 32 the supervisor's per-slot registers use.
+const GAP_SLOTS: usize = tickvault_core::websocket::pool_supervisor::GHOST_REDIAL_SLOTS;
+
+/// The wall clock as IST epoch nanos (the audit tables' convention).
+fn now_ist_nanos() -> i64 {
+    chrono::Utc::now()
+        .timestamp_nanos_opt()
+        .unwrap_or_default()
+        .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS)
+}
+
+/// Is this the close a socket makes when the process stops it?
+fn is_shutdown_close(event: &tickvault_core::websocket::pool_supervisor::WsLifecycleEvent) -> bool {
+    event.kind == tickvault_common::ws_event_types::WsEventKind::Disconnected
+        && event.reason == tickvault_core::websocket::pool_supervisor::ParkReason::Shutdown.as_str()
+}
+
+/// The pool an endpoint's socket belongs to, as the audit tables name it.
+fn ws_type_of(
+    endpoint: tickvault_core::websocket::pool_budget::DhanEndpointType,
+) -> tickvault_common::ws_event_types::WsType {
+    use tickvault_common::ws_event_types::WsType;
+    use tickvault_core::websocket::pool_budget::DhanEndpointType;
+    match endpoint {
+        DhanEndpointType::Depth20 => WsType::Depth20,
+        DhanEndpointType::Depth200 => WsType::Depth200,
+        _ => WsType::MainFeed,
+    }
+}
+
+/// One connection slot's open gap: opened by its FIRST disconnect after a
+/// connect, closed by the next connect. `Copy`, so the tracker allocates
+/// nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OpenGap {
+    start_ist_nanos: i64,
+    endpoint: tickvault_core::websocket::pool_budget::DhanEndpointType,
+    reason: &'static str,
+    dhan_code: Option<u16>,
+    instruments_held: u32,
+    attempts: u32,
+}
+
+/// What one lifecycle event contributes to the reconnect record.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct GapStep {
+    /// The closed gap's length, on the CONNECTED row that closed it; else 0.
+    down_secs: i64,
+    /// Failed dials inside the closed gap; else 0.
+    attempts: i64,
+    /// The `feed_gap_audit` row, when this event closed a gap.
+    closed: Option<tickvault_storage::feed_gap_audit_persistence::FeedGapRow>,
+}
+
+/// The open gap per connection slot, in a fixed array indexed by the global
+/// connection index: O(1) per event, no allocation, no map.
+#[derive(Debug)]
+struct GapTracker {
+    open: [Option<OpenGap>; GAP_SLOTS],
+}
+
+impl GapTracker {
+    const fn new() -> Self {
+        Self {
+            open: [None; GAP_SLOTS],
+        }
+    }
+
+    /// Feeds one lifecycle event. O(1).
+    ///
+    /// - A disconnect opens the slot's gap, unless one is already open: the
+    ///   FIRST close since the last connect is when the socket went dark (a
+    ///   socket parked for 805 and later released emits a second close row
+    ///   for the release, which must not move the start).
+    /// - A failed dial counts an attempt on the open gap.
+    /// - A connect (subscribe acked) closes the gap and returns its row.
+    /// - The close a socket makes at shutdown opens nothing; the caller ends
+    ///   every open gap at that instant through [`GapTracker::close_all`].
+    fn on_event(
+        &mut self,
+        event: &tickvault_core::websocket::pool_supervisor::WsLifecycleEvent,
+        now_ist_nanos: i64,
+    ) -> GapStep {
+        use tickvault_common::ws_event_types::WsEventKind;
+        let Some(slot) = self.open.get_mut(usize::from(event.connection_index)) else {
+            return GapStep::default();
+        };
+        match event.kind {
+            WsEventKind::Disconnected | WsEventKind::DisconnectedOffHours => {
+                if slot.is_none() && !is_shutdown_close(event) {
+                    *slot = Some(OpenGap {
+                        start_ist_nanos: now_ist_nanos,
+                        endpoint: event.endpoint,
+                        reason: event.reason,
+                        dhan_code: event.dhan_code,
+                        instruments_held: event.instruments_held,
+                        attempts: 0,
+                    });
+                }
+                GapStep::default()
+            }
+            WsEventKind::DialFailed => {
+                if let Some(gap) = slot.as_mut() {
+                    gap.attempts = gap.attempts.saturating_add(1);
+                }
+                GapStep::default()
+            }
+            WsEventKind::Connected => match slot.take() {
+                Some(gap) => {
+                    let row = gap_row(event.connection_index, gap, now_ist_nanos, false);
+                    GapStep {
+                        down_secs: row.down_secs(),
+                        attempts: row.attempts,
+                        closed: Some(row),
+                    }
+                }
+                None => GapStep::default(),
+            },
+            _ => GapStep::default(),
+        }
+    }
+
+    /// Ends every open gap at `now_ist_nanos` (shutdown), handing each row to
+    /// `emit`. O(`GAP_SLOTS`) = 32, once per stop. Returns how many it closed.
+    fn close_all(
+        &mut self,
+        now_ist_nanos: i64,
+        mut emit: impl FnMut(tickvault_storage::feed_gap_audit_persistence::FeedGapRow),
+    ) -> usize {
+        let mut closed = 0_usize;
+        // O(1) EXEMPT: begin — fixed 32-slot sweep, once per process stop
+        for (index, slot) in self.open.iter_mut().enumerate() {
+            if let Some(gap) = slot.take() {
+                let connection_index = u8::try_from(index).unwrap_or(u8::MAX);
+                emit(gap_row(connection_index, gap, now_ist_nanos, true));
+                closed = closed.saturating_add(1);
+            }
+        }
+        // O(1) EXEMPT: end
+        closed
+    }
+}
+
+/// Builds the `feed_gap_audit` row for a closed gap.
+fn gap_row(
+    connection_index: u8,
+    gap: OpenGap,
+    end_ist_nanos: i64,
+    open_at_shutdown: bool,
+) -> tickvault_storage::feed_gap_audit_persistence::FeedGapRow {
+    tickvault_storage::feed_gap_audit_persistence::FeedGapRow {
+        gap_start_ist_nanos: gap.start_ist_nanos,
+        gap_end_ist_nanos: end_ist_nanos,
+        feed: tickvault_common::feed::Feed::Dhan,
+        ws_type: ws_type_of(gap.endpoint),
+        connection_index: i64::from(connection_index),
+        reason: gap.reason,
+        dhan_code: gap.dhan_code.map_or(
+            tickvault_common::ws_event_types::WS_EVENT_NO_DHAN_CODE,
+            i64::from,
+        ),
+        instruments_held: i64::from(gap.instruments_held),
+        attempts: i64::from(gap.attempts),
+        open_at_shutdown,
+    }
+}
+
+/// Bounded capacity of the gap-row channel. Gaps are rarer than lifecycle
+/// events, so the lifecycle bound covers them.
+const FEED_GAP_CHANNEL_CAPACITY: usize = WS_EVENT_AUDIT_CHANNEL_CAPACITY;
+
+/// Hands one gap row to its writer. `try_send`, never blocking the forwarder;
+/// a refused row is counted and logged (gap rows are a few a day, so one line
+/// per refusal cannot storm).
+fn forward_gap_row(
+    tx: &tokio::sync::mpsc::Sender<tickvault_storage::feed_gap_audit_persistence::FeedGapRow>,
+    row: tickvault_storage::feed_gap_audit_persistence::FeedGapRow,
+) {
+    if let Err(err) = tx.try_send(row) {
+        let reason = match err {
+            TrySendError::Full(_) => "full",
+            TrySendError::Closed(_) => "closed",
+        };
+        metrics::counter!("tv_feed_gap_audit_dropped_total", "reason" => reason).increment(1);
+        error!(
+            code = tickvault_common::error_code::ErrorCode::HotPath02WriterQueueDrop.code_str(),
+            source = "feed_gap_audit_row_dropped",
+            reason,
+            ws_type = row.ws_type.as_str(),
+            connection_index = row.connection_index,
+            down_secs = row.down_secs(),
+            "feed_gap_audit: a reconnect-gap row was DROPPED before it reached the writer \
+             ({reason}); the gap is still visible as its two ws_event_audit rows"
+        );
+    }
+}
+
+/// Creates the gap-row channel and spawns its writer task, which ensures the
+/// table at start (the same boot self-heal `ws_event_audit` gets).
+fn spawn_feed_gap_audit_consumer(
+    questdb_cfg: tickvault_common::config::QuestDbConfig,
+) -> tokio::sync::mpsc::Sender<tickvault_storage::feed_gap_audit_persistence::FeedGapRow> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<
+        tickvault_storage::feed_gap_audit_persistence::FeedGapRow,
+    >(FEED_GAP_CHANNEL_CAPACITY);
+    tokio::spawn(async move {
+        run_feed_gap_audit_consumer(rx, questdb_cfg).await;
+    });
+    tx
+}
+
+/// Drains gap rows into `feed_gap_audit`: ensure the table once, then append
+/// and flush each row. A failure is AUDIT-WS-01 (the same forensic class as
+/// `ws_event_audit`), never a recovery-path failure.
+async fn run_feed_gap_audit_consumer(
+    mut rx: tokio::sync::mpsc::Receiver<tickvault_storage::feed_gap_audit_persistence::FeedGapRow>,
+    questdb_cfg: tickvault_common::config::QuestDbConfig,
+) {
+    use tickvault_common::error_code::ErrorCode;
+    use tickvault_storage::feed_gap_audit_persistence::{
+        FeedGapAuditWriter, ensure_feed_gap_audit_table,
+    };
+
+    ensure_feed_gap_audit_table(&questdb_cfg).await;
+    let mut writer = FeedGapAuditWriter::new(&questdb_cfg);
+    while let Some(row) = rx.recv().await {
+        if let Err(err) = writer.append_row(&row) {
+            error!(
+                code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
+                ws_type = row.ws_type.as_str(),
+                connection_index = row.connection_index,
+                ?err,
+                "feed_gap_audit: append failed"
+            );
+            metrics::counter!("tv_feed_gap_audit_write_errors_total", "stage" => "append")
+                .increment(1);
+            continue;
+        }
+        if let Err(err) = writer.flush() {
+            error!(
+                code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
+                ws_type = row.ws_type.as_str(),
+                connection_index = row.connection_index,
+                ?err,
+                "feed_gap_audit: flush failed"
+            );
+            metrics::counter!("tv_feed_gap_audit_write_errors_total", "stage" => "flush")
+                .increment(1);
+        } else {
+            metrics::counter!("tv_feed_gap_audit_rows_total", "ws_type" => row.ws_type.as_str())
+                .increment(1);
+        }
+    }
+    info!("feed_gap_audit consumer: all producers dropped — exiting");
 }
 
 /// A socket-lifecycle audit row could NOT be handed to the consumer.
@@ -167,8 +465,9 @@ fn record_forward_ok(
 fn lifecycle_row(
     event: tickvault_core::websocket::pool_supervisor::WsLifecycleEvent,
     now_ist_nanos: i64,
+    step: GapStep,
 ) -> tickvault_common::ws_event_types::WsEventAuditRow {
-    use tickvault_common::ws_event_types::{WsEventAuditRow, WsType};
+    use tickvault_common::ws_event_types::WsEventAuditRow;
     use tickvault_core::websocket::pool_budget::DhanEndpointType;
 
     let nanos_per_day: i64 = 86_400 * 1_000_000_000;
@@ -181,11 +480,7 @@ fn lifecycle_row(
         // sockets, so building the row from it would file a depth-200 park
         // under the main feed — and "which pool went dark?" is the only
         // question this table exists to answer.
-        ws_type: match event.endpoint {
-            DhanEndpointType::Depth20 => WsType::Depth20,
-            DhanEndpointType::Depth200 => WsType::Depth200,
-            _ => WsType::MainFeed,
-        },
+        ws_type: ws_type_of(event.endpoint),
         connection_index: i64::from(event.connection_index),
         // The authorized per-endpoint cap, not a live count: this row records
         // ONE socket's event and must not imply a fleet-wide reading it
@@ -205,9 +500,15 @@ fn lifecycle_row(
         event_kind: event.kind,
         source: event.endpoint.as_str().to_string(),
         reason: event.reason.to_string(),
-        dhan_code: tickvault_common::ws_event_types::WS_EVENT_NO_DHAN_CODE,
-        down_secs: 0,
-        attempts: 0,
+        // The Dhan close code when the socket was closed with one; -1 otherwise.
+        dhan_code: event.dhan_code.map_or(
+            tickvault_common::ws_event_types::WS_EVENT_NO_DHAN_CODE,
+            i64::from,
+        ),
+        // On the CONNECTED row that ends a gap: how long the slot was dark and
+        // how many dials failed inside it. 0 on every other row.
+        down_secs: step.down_secs,
+        attempts: step.attempts,
         market_hours: tickvault_common::market_hours::is_within_market_hours_ist(),
     }
 }
@@ -409,8 +710,11 @@ mod lifecycle_row_tests {
                     connection_index: 4,
                     kind: WsEventKind::Disconnected,
                     reason: "park_fatal",
+                    dhan_code: None,
+                    instruments_held: 0,
                 },
                 1_700_000_000_000_000_000,
+                super::GapStep::default(),
             );
             assert_eq!(row.ws_type, ws_type, "endpoint {endpoint:?}");
             assert_eq!(row.pool_size, pool, "the AUTHORIZED cap, not a live count");
@@ -438,8 +742,11 @@ mod lifecycle_row_tests {
                 connection_index: 0,
                 kind: WsEventKind::Connected,
                 reason: "subscribe_acked",
+                dhan_code: None,
+                instruments_held: 0,
             },
             late,
+            super::GapStep::default(),
         );
         assert_eq!(row.event_ts_ist_nanos, late);
         assert_eq!(
@@ -454,6 +761,8 @@ mod lifecycle_row_tests {
             connection_index: 2,
             kind: WsEventKind::Disconnected,
             reason: "park_fatal",
+            dhan_code: None,
+            instruments_held: 0,
         }
     }
 
@@ -491,5 +800,181 @@ mod lifecycle_row_tests {
             record_forward_drop(&latch, &event, "closed"),
             "after a recovery the next drop is a NEW episode and must log again"
         );
+    }
+}
+
+/// 2026-10-02: reconnect gaps are durably recorded. A disconnect opens a gap
+/// per connection slot, the next connect closes it into one `feed_gap_audit`
+/// row and stamps `down_secs` / `attempts` on the `ws_event_audit` CONNECTED
+/// row, and a shutdown closes every gap still open at that instant.
+#[cfg(test)]
+mod feed_gap_tests {
+    use super::{GapStep, GapTracker, lifecycle_row};
+    use tickvault_common::ws_event_types::{WS_EVENT_NO_DHAN_CODE, WsEventKind, WsType};
+    use tickvault_core::websocket::pool_budget::DhanEndpointType;
+    use tickvault_core::websocket::pool_supervisor::{ParkReason, WsLifecycleEvent};
+    use tickvault_storage::feed_gap_audit_persistence::FeedGapRow;
+
+    const SEC: i64 = 1_000_000_000;
+    const T0: i64 = 1_790_000_000 * SEC;
+
+    fn event(
+        endpoint: DhanEndpointType,
+        slot: u8,
+        kind: WsEventKind,
+        reason: &'static str,
+        dhan_code: Option<u16>,
+    ) -> WsLifecycleEvent {
+        WsLifecycleEvent {
+            endpoint,
+            connection_index: slot,
+            kind,
+            reason,
+            dhan_code,
+            instruments_held: 4_000,
+        }
+    }
+
+    fn close_805(slot: u8) -> WsLifecycleEvent {
+        event(
+            DhanEndpointType::MainFeed,
+            slot,
+            WsEventKind::Disconnected,
+            "park_pool_overflow",
+            Some(805),
+        )
+    }
+
+    fn connected(slot: u8) -> WsLifecycleEvent {
+        event(
+            DhanEndpointType::MainFeed,
+            slot,
+            WsEventKind::Connected,
+            "subscribe_acked",
+            None,
+        )
+    }
+
+    #[test]
+    fn test_gap_down_secs_and_attempts_on_the_reconnect() {
+        let mut gaps = GapTracker::new();
+        assert_eq!(gaps.on_event(&close_805(3), T0), GapStep::default());
+        let failed = event(
+            DhanEndpointType::MainFeed,
+            3,
+            WsEventKind::DialFailed,
+            "dial_failed",
+            None,
+        );
+        assert_eq!(gaps.on_event(&failed, T0 + 5 * SEC), GapStep::default());
+        assert_eq!(gaps.on_event(&failed, T0 + 9 * SEC), GapStep::default());
+        let step = gaps.on_event(&connected(3), T0 + 47 * SEC + SEC / 2);
+        assert_eq!(step.down_secs, 47, "whole seconds, rounded down");
+        assert_eq!(step.attempts, 2, "two failed dials inside the gap");
+        let row = step
+            .closed
+            .expect("a connect after a disconnect closes the gap");
+        assert_eq!(row.gap_start_ist_nanos, T0);
+        assert_eq!(row.gap_end_ist_nanos, T0 + 47 * SEC + SEC / 2);
+        assert_eq!(row.ws_type, WsType::MainFeed);
+        assert_eq!(row.connection_index, 3);
+        assert_eq!(row.reason, "park_pool_overflow");
+        assert_eq!(row.dhan_code, 805);
+        assert_eq!(row.instruments_held, 4_000);
+        assert!(!row.open_at_shutdown);
+        // The slot is clear again: the next connect writes nothing.
+        assert_eq!(
+            gaps.on_event(&connected(3), T0 + 60 * SEC),
+            GapStep::default()
+        );
+    }
+
+    #[test]
+    fn test_gap_keeps_the_first_disconnect_as_its_start() {
+        // A socket parked for 805 and later released by the overflow probe
+        // emits a second close row; the gap still starts at the FIRST one.
+        let mut gaps = GapTracker::new();
+        let _ = gaps.on_event(&close_805(1), T0);
+        let bare = event(
+            DhanEndpointType::MainFeed,
+            1,
+            WsEventKind::Disconnected,
+            "reconnect_backoff",
+            None,
+        );
+        let _ = gaps.on_event(&bare, T0 + 300 * SEC);
+        let row = gaps
+            .on_event(&connected(1), T0 + 320 * SEC)
+            .closed
+            .expect("gap row");
+        assert_eq!(row.gap_start_ist_nanos, T0);
+        assert_eq!(row.down_secs(), 320);
+        assert_eq!(row.dhan_code, 805, "the code of the close that opened it");
+    }
+
+    #[test]
+    fn test_gap_open_at_shutdown_ends_at_the_shutdown_instant() {
+        let mut gaps = GapTracker::new();
+        let _ = gaps.on_event(&close_805(0), T0);
+        let depth = event(
+            DhanEndpointType::Depth200,
+            12,
+            WsEventKind::Disconnected,
+            "reconnect_backoff",
+            None,
+        );
+        let _ = gaps.on_event(&depth, T0 + 10 * SEC);
+        // The process stops: the shutdown close itself opens nothing.
+        let shutdown_at = T0 + 3_600 * SEC;
+        let stop = event(
+            DhanEndpointType::MainFeed,
+            4,
+            WsEventKind::Disconnected,
+            ParkReason::Shutdown.as_str(),
+            None,
+        );
+        assert!(super::is_shutdown_close(&stop));
+        assert_eq!(gaps.on_event(&stop, shutdown_at), GapStep::default());
+        let mut rows: Vec<FeedGapRow> = Vec::new();
+        let closed = gaps.close_all(shutdown_at, |row| rows.push(row));
+        assert_eq!(closed, 2, "both open gaps, and not the shutdown close");
+        for row in &rows {
+            assert_eq!(row.gap_end_ist_nanos, shutdown_at);
+            assert!(row.open_at_shutdown);
+        }
+        assert_eq!(rows[0].connection_index, 0);
+        assert_eq!(rows[0].down_secs(), 3_600);
+        assert_eq!(rows[1].connection_index, 12);
+        assert_eq!(rows[1].ws_type, WsType::Depth200);
+        assert_eq!(rows[1].dhan_code, WS_EVENT_NO_DHAN_CODE);
+        // Nothing left open: a second stop writes nothing.
+        assert_eq!(gaps.close_all(shutdown_at + SEC, |_| {}), 0);
+    }
+
+    #[test]
+    fn test_gap_connect_without_a_gap_and_out_of_range_slot_write_nothing() {
+        let mut gaps = GapTracker::new();
+        assert_eq!(gaps.on_event(&connected(2), T0), GapStep::default());
+        let _ = gaps.on_event(&close_805(200), T0);
+        assert_eq!(gaps.on_event(&connected(200), T0 + SEC), GapStep::default());
+        assert_eq!(gaps.close_all(T0 + 2 * SEC, |_| {}), 0);
+    }
+
+    #[test]
+    fn test_ws_event_audit_rows_carry_the_real_code_and_down_secs() {
+        let mut gaps = GapTracker::new();
+        let close = close_805(5);
+        let step = gaps.on_event(&close, T0);
+        let close_row = lifecycle_row(close, T0, step);
+        assert_eq!(close_row.dhan_code, 805, "no longer hard-coded to -1");
+        assert_eq!(close_row.down_secs, 0);
+
+        let reconnect = connected(5);
+        let step = gaps.on_event(&reconnect, T0 + 90 * SEC);
+        let open_row = lifecycle_row(reconnect, T0 + 90 * SEC, step);
+        assert_eq!(open_row.dhan_code, WS_EVENT_NO_DHAN_CODE);
+        assert_eq!(open_row.down_secs, 90, "no longer hard-coded to 0");
+        assert_eq!(open_row.attempts, 0);
+        assert_eq!(open_row.event_kind, WsEventKind::Connected);
     }
 }
