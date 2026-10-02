@@ -2124,16 +2124,23 @@ fn finalise_segment(
     flush_stage: &'static str,
     fsync_stage: &'static str,
     syncer: Option<&WalSyncer>,
+    tally: &mut UnflushedTally<'_>,
 ) {
     let Some(mut w) = current.take() else {
         return;
     };
     if let Err(err) = w.flush() {
         report_io_error(flush_stage, &err);
+        // The records still in the buffer were counted as persisted; they
+        // are counted as lost here instead of vanishing with the writer.
+        discard_segment_writer(w, tally, flush_stage);
         // A failed flush means the bytes are not in the kernel either, so
         // syncing would force an incomplete segment and report success.
         return;
     }
+    // Everything counted is in the kernel, and this segment takes no more
+    // records: the next one starts its byte count at zero.
+    tally.new_segment();
     if resolve_wal_fsync_interval().is_none() {
         return;
     }
@@ -2147,6 +2154,127 @@ fn finalise_segment(
         let started = Instant::now();
         record_sync_result(file.sync_all(), started, fsync_stage);
     }
+}
+
+/// Room for the records written since the last successful flush. Every batch
+/// ends in a flush and holds at most 257 records (one plus 256 drained), so
+/// this never fills in practice; past it, records are still counted (see
+/// `UnflushedTally::untracked`).
+const UNFLUSHED_TALLY_CAPACITY: usize = 512;
+
+/// Counter: records that `persisted` had counted but that never reached the
+/// kernel, because the segment's buffered write or flush failed (2026-10-02).
+pub const WAL_UNFLUSHED_LOST_COUNTER: &str = "tv_ws_frame_spill_unflushed_lost_total";
+
+/// The records counted in `persisted` whose bytes may still sit in the open
+/// segment's `BufWriter` (2026-10-02).
+///
+/// `persisted` moves on a successful `write_all` into the buffer, not on the
+/// flush. When a flush (or a buffered write that flushes internally) fails,
+/// the writer used to be dropped, and with it up to 256 KiB of records that
+/// were already counted: lost, and `persisted_count()` over-reported by the
+/// same number. Re-appending those bytes to a fresh segment is not safe, since
+/// a partial write can leave the buffer starting in the middle of a record.
+/// So they are COUNTED AS LOST instead: this tally keeps the end offset, in
+/// the segment, of every record written since the last good flush, and on a
+/// failure the records ending past the file's real length are the lost ones.
+///
+/// Fixed size, built once per writer start: no allocation per record.
+/// O(1) per record; the failure path walks at most `UNFLUSHED_TALLY_CAPACITY`
+/// offsets, once per failure.
+struct UnflushedTally<'a> {
+    persisted: &'a AtomicU64,
+    /// Bytes of counted records written to the current segment so far.
+    segment_bytes: u64,
+    ends: [u64; UNFLUSHED_TALLY_CAPACITY],
+    len: usize,
+    /// Records written past the capacity; on a loss they are counted lost.
+    untracked: u64,
+    lost_counter: metrics::Counter,
+}
+
+impl<'a> UnflushedTally<'a> {
+    fn new(persisted: &'a AtomicU64) -> Self {
+        let lost_counter = metrics::counter!(WAL_UNFLUSHED_LOST_COUNTER);
+        // Seeded so the series exists before its first, rare, episode.
+        lost_counter.increment(0);
+        Self {
+            persisted,
+            segment_bytes: 0,
+            ends: [0; UNFLUSHED_TALLY_CAPACITY],
+            len: 0,
+            untracked: 0,
+            lost_counter,
+        }
+    }
+
+    /// A record of `size` bytes went into the buffer and was counted.
+    fn note_written(&mut self, size: u64) {
+        self.persisted.fetch_add(1, Ordering::Relaxed);
+        self.segment_bytes = self.segment_bytes.saturating_add(size);
+        if let Some(slot) = self.ends.get_mut(self.len) {
+            *slot = self.segment_bytes;
+            self.len += 1;
+        } else {
+            self.untracked = self.untracked.saturating_add(1);
+        }
+    }
+
+    /// The buffer reached the kernel: nothing written so far can be lost to it.
+    fn flushed(&mut self) {
+        self.len = 0;
+        self.untracked = 0;
+    }
+
+    /// A new segment starts (or the old one is abandoned).
+    fn new_segment(&mut self) {
+        self.segment_bytes = 0;
+        self.flushed();
+    }
+
+    /// How many records written since the last good flush end past
+    /// `on_disk` bytes, i.e. never fully reached the file.
+    fn lost_beyond(&self, on_disk: u64) -> u64 {
+        if on_disk >= self.segment_bytes {
+            return 0;
+        }
+        let tracked = self.ends.get(..self.len).unwrap_or(&[]);
+        // O(1) EXEMPT: begin — failure path only, at most UNFLUSHED_TALLY_CAPACITY offsets
+        let lost = tracked.iter().filter(|&&end| end > on_disk).count() as u64;
+        // O(1) EXEMPT: end
+        lost.saturating_add(self.untracked)
+    }
+}
+
+/// Drops a segment writer whose write or flush failed, WITHOUT a second flush,
+/// and counts the records it was still holding as lost (2026-10-02).
+///
+/// `BufWriter`'s `Drop` would retry the flush and ignore the result, so the
+/// writer is taken apart instead. The file's real length decides which counted
+/// records reached it; a length that cannot be read counts every record since
+/// the last good flush as lost, the safe direction for a loss counter.
+fn discard_segment_writer(w: BufWriter<File>, tally: &mut UnflushedTally<'_>, stage: &'static str) {
+    let (file, _unwritten) = w.into_parts();
+    let on_disk = file.metadata().map_or(0, |m| m.len());
+    let lost = tally.lost_beyond(on_disk);
+    tally.new_segment();
+    if lost == 0 {
+        return;
+    }
+    let _previous = tally
+        .persisted
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |p| {
+            Some(p.saturating_sub(lost))
+        });
+    tally.lost_counter.increment(lost);
+    error!(
+        code = ErrorCode::WsSpill02FrameDropped.code_str(),
+        stage,
+        lost_records = lost,
+        on_disk_bytes = on_disk,
+        "CRITICAL: WAL segment write failed — records already counted as persisted never \
+         reached the file and are lost"
+    );
 }
 
 /// Counts, and empties, what is still in the spill channel when the writer
@@ -2200,6 +2328,8 @@ fn writer_loop(
     // The thread therefore NEVER dies on a transient I/O hiccup — it keeps
     // draining the channel so `append()` never observes `Disconnected` and the
     // durable WAL floor survives. The ONLY clean exit is the channel closing.
+    // What `persisted` counted but the buffer may still hold (2026-10-02).
+    let mut tally = UnflushedTally::new(persisted);
     let mut current: Option<BufWriter<File>> = open_segment_tracked(wal_dir, syncer);
     let mut bytes_written: u64 = 0;
 
@@ -2255,7 +2385,8 @@ fn writer_loop(
                 // when nothing arrived. So a stop request that reaches here has
                 // a fully drained queue behind it and it is safe to close.
                 if stop.load(Ordering::Acquire) {
-                    finalise_segment(&mut current, "flush_on_stop", "fsync_on_stop", None);
+                    let t = &mut tally;
+                    finalise_segment(&mut current, "flush_on_stop", "fsync_on_stop", None, t);
                     info!("ws-frame-spill-writer stop requested and queue drained; exiting");
                     // The writer is gone: its last segment is closed and replayable again.
                     clear_open_segment_under(wal_dir);
@@ -2295,7 +2426,8 @@ fn writer_loop(
                 // exactly the number it lost. The sibling flush thirty lines
                 // below has always called `report_io_error` -- this arm and
                 // the rotation arm were the two that did not.
-                finalise_segment(&mut current, "flush_on_close", "fsync_on_close", None);
+                let t = &mut tally;
+                finalise_segment(&mut current, "flush_on_close", "fsync_on_close", None, t);
                 info!("ws-frame-spill-writer channel closed; exiting");
                 clear_open_segment_under(wal_dir);
                 return Ok(());
@@ -2305,7 +2437,8 @@ fn writer_loop(
         release(queued_bytes, &first);
         #[cfg(test)]
         maybe_test_panic(&first);
-        bytes_written += persist_record_resilient(&mut current, wal_dir, &first, persisted, syncer);
+        bytes_written +=
+            persist_record_resilient(&mut current, wal_dir, &first, &mut tally, syncer);
 
         // Drain up to N more without blocking so we batch-flush.
         for _ in 0..256 {
@@ -2315,19 +2448,25 @@ fn writer_loop(
                     #[cfg(test)]
                     maybe_test_panic(&r);
                     bytes_written +=
-                        persist_record_resilient(&mut current, wal_dir, &r, persisted, syncer);
+                        persist_record_resilient(&mut current, wal_dir, &r, &mut tally, syncer);
                 }
                 Err(_) => break,
             }
         }
 
-        if let Some(w) = current.as_mut()
-            && let Err(err) = w.flush()
-        {
-            report_io_error("flush", &err);
-            // Drop the possibly-broken writer; the next record reopens it.
-            current = None;
-            thread::sleep(WAL_WRITER_IO_RETRY_BACKOFF);
+        match current.as_mut().map(Write::flush) {
+            Some(Ok(())) => tally.flushed(),
+            Some(Err(err)) => {
+                report_io_error("flush", &err);
+                // Drop the possibly-broken writer WITHOUT a second flush,
+                // counting the records it still held as lost; the next record
+                // reopens a segment.
+                if let Some(w) = current.take() {
+                    discard_segment_writer(w, &mut tally, "flush");
+                }
+                thread::sleep(WAL_WRITER_IO_RETRY_BACKOFF);
+            }
+            None => {}
         }
         // Everything taken off the channel so far has now been flushed (or its
         // failure reported): serve a pending abort drain if the channel is
@@ -2394,8 +2533,12 @@ fn writer_loop(
             // Since 2026-10-02 the closed file's sync is handed to the
             // `wal-syncer` thread, so a slow device does not stop this
             // thread at every rotation; with no room there it runs inline.
-            let handoff = Some(syncer);
-            finalise_segment(&mut current, "flush_on_rotate", "fsync_on_rotate", handoff);
+            // Short names keep the call on one line, which the source scan
+            // in `every_segment_finalisation_syncs_including_the_rotation`
+            // matches.
+            let to = Some(syncer);
+            let t = &mut tally;
+            finalise_segment(&mut current, "flush_on_rotate", "fsync_on_rotate", to, t);
             current = open_segment_tracked(wal_dir, syncer);
             bytes_written = 0;
         }
@@ -2467,10 +2610,11 @@ fn persist_record_resilient(
     current: &mut Option<BufWriter<File>>,
     wal_dir: &Path,
     r: &WalRecord,
-    persisted: &AtomicU64,
+    tally: &mut UnflushedTally<'_>,
     syncer: &WalSyncer,
 ) -> u64 {
     if current.is_none() {
+        tally.new_segment();
         *current = open_segment_tracked(wal_dir, syncer);
     }
     let Some(w) = current.as_mut() else {
@@ -2504,13 +2648,18 @@ fn persist_record_resilient(
     };
     match write_record(w, r) {
         Ok(()) => {
-            persisted.fetch_add(1, Ordering::Relaxed);
-            record_disk_size(r)
+            let size = record_disk_size(r);
+            tally.note_written(size);
+            size
         }
         Err(err) => {
             report_io_error("write_record", &err);
-            // Drop the possibly-corrupt writer; reopen on the next record.
-            *current = None;
+            // Drop the possibly-corrupt writer without a second flush; the
+            // records it still held are counted as lost. Reopen on the next
+            // record.
+            if let Some(w) = current.take() {
+                discard_segment_writer(w, tally, "write_record");
+            }
             thread::sleep(WAL_WRITER_IO_RETRY_BACKOFF);
             0
         }
@@ -2770,21 +2919,76 @@ pub fn refresh_receipt_anchor() {
     // one was already projecting. Refusing it costs one interval of drift
     // correction; accepting it costs an out-of-order frame, and those are not
     // the same size of mistake.
-    let projected_now = old.nanos.saturating_add(
-        i64::try_from(
-            new.instant
-                .saturating_duration_since(old.instant)
-                .as_nanos(),
-        )
-        .unwrap_or(i64::MAX),
-    );
-    if new.nanos < projected_now {
-        metrics::counter!(RECEIPT_ANCHOR_REFRESH_COUNTER, "outcome" => "refused_backward")
+    //
+    // ⚠ CHANGED 2026-10-02 — a STEP back no longer freezes the anchor. The
+    // ratchet refused every refresh that rewound, and after a wall-clock step
+    // back of S seconds every later refresh rewinds by the same S, because
+    // both clocks then advance together. So the anchor froze for the rest of
+    // the process and every receipt stayed S seconds ahead of the wall clock,
+    // filing bars S seconds late all day. A rewind larger than
+    // `RECEIPT_ANCHOR_BACKWARD_STEP_NANOS` is now treated as a step and
+    // adopted: frames received within S seconds of the swap can read back out
+    // of order once, which is smaller than mis-filing every frame for hours.
+    // It is counted (`outcome = "adopted_backward_step"`) and logged. A small
+    // rewind (slew) is still refused, and repeated refusals now end too: once
+    // the accumulated slew passes the threshold it is adopted as a step.
+    match anchor_refresh_decision(**old, new) {
+        AnchorRefresh::Adopt => {
+            cell.store(std::sync::Arc::new(new));
+            metrics::counter!(RECEIPT_ANCHOR_REFRESH_COUNTER, "outcome" => "adopted").increment(1);
+        }
+        AnchorRefresh::RefuseBackward => {
+            metrics::counter!(RECEIPT_ANCHOR_REFRESH_COUNTER, "outcome" => "refused_backward")
+                .increment(1);
+        }
+        AnchorRefresh::AdoptBackwardStep { rewind_nanos } => {
+            cell.store(std::sync::Arc::new(new));
+            metrics::counter!(
+                RECEIPT_ANCHOR_REFRESH_COUNTER,
+                "outcome" => "adopted_backward_step"
+            )
             .increment(1);
-        return;
+            warn!(
+                rewind_ms = rewind_nanos / 1_000_000,
+                "WAL receipt anchor re-taken after the wall clock stepped back; frames \
+                 received just before and after this point may read back out of order once"
+            );
+        }
     }
-    cell.store(std::sync::Arc::new(new));
-    metrics::counter!(RECEIPT_ANCHOR_REFRESH_COUNTER, "outcome" => "adopted").increment(1);
+}
+
+/// A rewind larger than this, at a receipt-anchor refresh, is a wall-clock
+/// STEP (or slew accumulated past it) and is adopted rather than refused
+/// (2026-10-02). One second: NTP slew is at most 500 ppm, about 15 ms over the
+/// 30 s refresh interval, so a single interval of slew stays far below it.
+const RECEIPT_ANCHOR_BACKWARD_STEP_NANOS: i64 = 1_000_000_000;
+
+/// What a receipt-anchor refresh does with a freshly taken anchor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnchorRefresh {
+    /// The new anchor does not rewind what the old one projects.
+    Adopt,
+    /// A small rewind (slew): keep the old anchor so frames stay ordered.
+    RefuseBackward,
+    /// A rewind past the step threshold: adopt it, or the anchor freezes.
+    AdoptBackwardStep { rewind_nanos: i64 },
+}
+
+/// Decides a refresh from the old and new anchors. Pure, O(1).
+fn anchor_refresh_decision(old: ReceiptAnchor, new: ReceiptAnchor) -> AnchorRefresh {
+    let elapsed = new.instant.saturating_duration_since(old.instant);
+    let projected_now = old
+        .nanos
+        .saturating_add(i64::try_from(elapsed.as_nanos()).unwrap_or(i64::MAX));
+    if new.nanos >= projected_now {
+        return AnchorRefresh::Adopt;
+    }
+    let rewind_nanos = projected_now.saturating_sub(new.nanos);
+    if rewind_nanos > RECEIPT_ANCHOR_BACKWARD_STEP_NANOS {
+        AnchorRefresh::AdoptBackwardStep { rewind_nanos }
+    } else {
+        AnchorRefresh::RefuseBackward
+    }
 }
 
 /// The UTC-epoch-nanos receipt for a monotonic capture instant.
@@ -7026,6 +7230,102 @@ mod tests {
     /// `BufWriter` when the "kill" lands, part-way through its `write(2)`: the
     /// kernel received the first 17 bytes of record 11 and nothing more. The
     /// buffer is discarded unflushed, exactly as a SIGKILL discards it.
+    /// 2026-10-02: a segment writer that fails is taken apart, not dropped, and
+    /// the records it still buffered are counted as LOST: `persisted` falls by
+    /// exactly that number and nothing is flushed a second time.
+    #[test]
+    fn test_failed_segment_writer_counts_its_buffered_records_as_lost() {
+        let dir = tmp_dir("discard-buffered");
+        let persisted = AtomicU64::new(0);
+        let mut tally = UnflushedTally::new(&persisted);
+        let mut w = open_new_segment(&dir).unwrap();
+        let record = |seq: u64| WalRecord {
+            ws_type: WsType::LiveFeed,
+            frame_seq: seq,
+            received_at_nanos: 1_000 + seq as i64,
+            endpoint: WalEndpoint::MainFeed,
+            frame: Bytes::from(vec![seq as u8; 40]),
+        };
+        for seq in 1..=3 {
+            write_record(&mut w, &record(seq)).unwrap();
+            tally.note_written(record_disk_size(&record(seq)));
+        }
+        w.flush().unwrap();
+        tally.flushed();
+        for seq in 4..=5 {
+            write_record(&mut w, &record(seq)).unwrap();
+            tally.note_written(record_disk_size(&record(seq)));
+        }
+        assert_eq!(persisted.load(Ordering::Relaxed), 5);
+        let path = wal_files_in(&dir).pop().expect("one segment");
+
+        discard_segment_writer(w, &mut tally, "test");
+
+        assert_eq!(
+            persisted.load(Ordering::Relaxed),
+            3,
+            "the two buffered records never reached the file and must not stay counted"
+        );
+        let size = record_disk_size(&record(1));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            3 * size,
+            "the discarded buffer must not be flushed on the way out"
+        );
+        // A partial write counts the record it cut in half as lost too.
+        tally.note_written(size);
+        tally.note_written(size);
+        assert_eq!(tally.lost_beyond(size + 1), 1);
+        assert_eq!(tally.lost_beyond(size - 1), 2);
+        assert_eq!(tally.lost_beyond(2 * size), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 2026-10-02: a wall-clock step back re-anchors receipts instead of
+    /// freezing the anchor for the rest of the process.
+    ///
+    /// Bite: with the old rule (refuse every rewind) the second refresh below
+    /// rewinds by the same ten seconds as the first, so it is refused too, and
+    /// so is every later one.
+    #[test]
+    fn test_backward_wall_step_reanchors_instead_of_freezing() {
+        let t0 = Instant::now();
+        let base = 1_780_000_000_000_000_000_i64;
+        let old = ReceiptAnchor {
+            instant: t0,
+            nanos: base,
+        };
+        let secs = |s: i64| s * 1_000_000_000;
+        let at = |after: u64, nanos: i64| ReceiptAnchor {
+            instant: t0 + Duration::from_secs(after),
+            nanos,
+        };
+        // Forward and in step: adopted.
+        assert_eq!(
+            anchor_refresh_decision(old, at(30, base + secs(30))),
+            AnchorRefresh::Adopt
+        );
+        // A slew-sized rewind (10 ms): refused, frames stay ordered.
+        assert_eq!(
+            anchor_refresh_decision(old, at(30, base + secs(30) - 10_000_000)),
+            AnchorRefresh::RefuseBackward
+        );
+        // A 10 s step back: adopted as a step.
+        let stepped = at(30, base + secs(20));
+        assert_eq!(
+            anchor_refresh_decision(old, stepped),
+            AnchorRefresh::AdoptBackwardStep {
+                rewind_nanos: secs(10)
+            }
+        );
+        // After adopting it, the next refresh with both clocks moving together
+        // is an ordinary adoption: the anchor is not frozen.
+        assert_eq!(
+            anchor_refresh_decision(stepped, at(60, base + secs(50))),
+            AnchorRefresh::Adopt
+        );
+    }
+
     #[test]
     fn test_kill_mid_batch_loses_at_most_the_unflushed_batch() {
         let dir = tmp_dir("kill-mid-batch");
@@ -7100,11 +7400,14 @@ mod tests {
             if let Some(w) = current.as_mut() {
                 w.write_all(b"closed-segment-tail").unwrap();
             }
+            let persisted = AtomicU64::new(0);
+            let mut tally = UnflushedTally::new(&persisted);
             finalise_segment(
                 &mut current,
                 "flush_on_rotate",
                 "fsync_on_rotate",
                 Some(syncer),
+                &mut tally,
             );
             assert!(current.is_none(), "a finalised segment is closed");
             assert_eq!(std::fs::read(&path).unwrap(), b"closed-segment-tail");
