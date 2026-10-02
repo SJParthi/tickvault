@@ -4920,39 +4920,41 @@ impl LiveIngest {
         (emitted, dropped)
     }
 
-    /// Installs the WAL replay's backup dedup from a persisted set (scope
-    /// lock 2026-10-02). `None`, or an empty set, leaves replay as it was:
-    /// every copy is folded. Cold, once per lane start.
+    /// Installs the WAL replay's backup dedup from the persisted history of
+    /// publications (scope lock 2026-10-02). `None`, or a history with no
+    /// contract, leaves replay as it was: every copy is folded. Cold, once
+    /// per lane start.
     pub(crate) fn install_replay_backup(
         &mut self,
-        set: Option<&crate::main_feed_backup::PersistedBackupSet>,
+        history: Option<&crate::main_feed_backup::PersistedBackupHistory>,
     ) {
         self.replay_backup_loaded = true;
-        self.replay_backup = set
-            .filter(|s| !s.contracts.is_empty())
-            .map(crate::main_feed_backup::ReplayBackup::new);
+        self.replay_backup = history.and_then(crate::main_feed_backup::ReplayBackup::new);
     }
 
     /// Reads the persisted backup set for the replay, once per lane start,
     /// counted and logged once whatever the outcome. Cold.
     fn load_replay_backup(&mut self) {
         use crate::main_feed_backup::{
-            BACKUP_REPLAY_SET_COUNTER, backup_set_path, read_backup_set,
+            BACKUP_REPLAY_SET_COUNTER, backup_set_path, read_backup_history,
         };
         if self.replay_backup_loaded {
             return;
         }
         let path = backup_set_path();
-        let set = match read_backup_set(&path) {
-            Ok(Some(set)) => {
+        let set = match read_backup_history(&path) {
+            Ok(Some(history)) => {
                 metrics::counter!(BACKUP_REPLAY_SET_COUNTER, "outcome" => "loaded").increment(1);
                 info!(
-                    contracts = set.contracts.len(),
-                    published_at_nanos = set.published_at_nanos,
-                    "WAL replay: the main-feed backup set is loaded — replayed frames fold one \
-                     copy of each backed-up packet, as the live drain did"
+                    publications = history.publications.len(),
+                    latest_contracts = history.latest().map_or(0, |p| p.contracts.len()),
+                    latest_published_at_nanos =
+                        history.latest().map_or(0, |p| p.published_at_nanos),
+                    "WAL replay: the main-feed backup publications are loaded — each replayed \
+                     frame folds one copy of each backed-up packet, judged with the set the \
+                     live drain was using when it received the frame"
                 );
-                Some(set)
+                Some(history)
             }
             Ok(None) => {
                 metrics::counter!(BACKUP_REPLAY_SET_COUNTER, "outcome" => "missing").increment(1);
@@ -13967,19 +13969,20 @@ fn backup_socket_room(
     )
 }
 
-/// Persists `set` for the WAL replay, then publishes it to the drain's
-/// dedup. Persisted FIRST: a crash between the two leaves the replay a set
-/// it may not have needed (harmless), never copies it cannot recognise.
-/// Cold: one small file write off the async worker.
+/// Persists `set` for the WAL replay (added to the bounded publication
+/// history, never overwriting an earlier publication), then publishes it to
+/// the drain's dedup. Persisted FIRST: a crash between the two leaves the
+/// replay a set it may not have needed (harmless), never copies it cannot
+/// recognise. Cold: one small file read and write off the async worker.
 async fn persist_and_publish_backup_set(
     set: &[SubscribeInstrument],
     published_at_nanos: i64,
     persist_path: &std::path::Path,
 ) {
-    use crate::main_feed_backup::{PersistedBackupSet, publish_backup_set, write_backup_set};
+    use crate::main_feed_backup::{PersistedBackupSet, publish_backup_set, record_backup_set};
     let persisted = PersistedBackupSet::from_set(set, published_at_nanos);
     let path = persist_path.to_path_buf();
-    let written = tokio::task::spawn_blocking(move || write_backup_set(&path, &persisted)).await;
+    let written = tokio::task::spawn_blocking(move || record_backup_set(&path, &persisted)).await;
     match written {
         Ok(Ok(())) => {}
         Ok(Err(err)) => warn!(
@@ -13998,7 +14001,7 @@ async fn persist_and_publish_backup_set(
              will write both copies of each backed-up packet"
         ),
     }
-    publish_backup_set(set);
+    publish_backup_set(set, published_at_nanos);
 }
 
 /// Subscribes the backup copies on the spot socket (scope lock 2026-10-02).
@@ -15456,13 +15459,15 @@ pub fn refold_wal_frames(
             out.depth_frames = out.depth_frames.saturating_add(1);
             continue;
         }
-        // Whether the live drain deduplicated this frame with the persisted
-        // backup set (received after its publication, same day). One compare
-        // and one division per frame; `false` when no set is loaded.
+        // Whether the live drain deduplicated this frame with a persisted
+        // backup publication: the one in force at the frame's receipt (the
+        // greatest instant at or before it, same IST day), found by a forward
+        // cursor — O(1) amortized per frame; `false` when none is loaded or
+        // the frame is out of order (accepted, never judged by the wrong set).
         let backup_covers = ingest
             .replay_backup
-            .as_ref()
-            .is_some_and(|r| r.covers(*wal_received_at_nanos));
+            .as_mut()
+            .is_some_and(|r| r.select(*wal_received_at_nanos));
         let mut offset = 0usize;
         let mut packets = 0u32;
         while offset < bytes.len() {
@@ -27132,22 +27137,26 @@ mod frame_walk_accounting_tests {
             bytes: bytes::Bytes::copy_from_slice(&packet),
         };
         let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        // The published set is process-global. Held for the WHOLE test: the
+        // frames drained below would otherwise adopt another test's
+        // publication mid-assertion (a flake seen 2026-10-02).
+        let _guard = crate::main_feed_backup::TEST_PUBLISH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (first, second) = {
-            // The published set is process-global. Other tests' ingests may
-            // install it in this window; none of them uses this id.
-            let _guard = crate::main_feed_backup::TEST_PUBLISH_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            crate::main_feed_backup::publish_backup_set(&[SubscribeInstrument {
-                security_id: u64::from(SID),
-                segment: ExchangeSegment::NseFno,
-            }]);
+            crate::main_feed_backup::publish_backup_set(
+                &[SubscribeInstrument {
+                    security_id: u64::from(SID),
+                    segment: ExchangeSegment::NseFno,
+                }],
+                any_recv_nanos(),
+            );
             // The first frame installs the published set.
             let first =
                 drain_main_feed_frame(&mut ingest, &frame(0), any_recv_nanos(), 1_000, counters());
             let second =
                 drain_main_feed_frame(&mut ingest, &frame(4), any_recv_nanos(), 1_001, counters());
-            crate::main_feed_backup::publish_backup_set(&[]);
+            crate::main_feed_backup::publish_backup_set(&[], any_recv_nanos());
             (first, second)
         };
         assert_eq!(ingest.backup.len(), 1, "the set was installed by the frame");
@@ -27194,10 +27203,16 @@ mod frame_walk_accounting_tests {
         ];
         let set = crate::main_feed_backup::PersistedBackupSet {
             published_at_nanos: recv - 1_000_000_000,
+            process_started_at_nanos: 0,
             contracts: vec![(u64::from(SID), fno)],
         };
+        let history = |set: &crate::main_feed_backup::PersistedBackupSet| {
+            crate::main_feed_backup::PersistedBackupHistory {
+                publications: vec![set.clone()],
+            }
+        };
         let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
-        ingest.install_replay_backup(Some(&set));
+        ingest.install_replay_backup(Some(&history(&set)));
         let out = refold_wal_frames(&mut ingest, &frames, &[]);
         assert_eq!(out.refolded, 1, "one copy folds");
         assert_eq!(
@@ -27220,10 +27235,11 @@ mod frame_walk_accounting_tests {
         // A set published AFTER these frames were received never touches them.
         let late = crate::main_feed_backup::PersistedBackupSet {
             published_at_nanos: recv + 1,
+            process_started_at_nanos: 0,
             ..set
         };
         let mut later = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
-        later.install_replay_backup(Some(&late));
+        later.install_replay_backup(Some(&history(&late)));
         let out = refold_wal_frames(&mut later, &frames, &[]);
         assert_eq!((out.refolded, out.backup_dropped), (2, 0));
     }
@@ -27284,11 +27300,18 @@ mod frame_walk_accounting_tests {
         );
         assert_eq!(held, 2);
         assert_eq!(final_keys, vec![(501, fno), (502, fno)], "the held subset");
-        let saved = crate::main_feed_backup::read_backup_set(&path)
+        let saved = crate::main_feed_backup::read_backup_history(&path)
             .expect("readable")
             .expect("saved");
-        assert_eq!(saved.contracts, vec![(501, fno), (502, fno)]);
-        assert!(saved.published_at_nanos > 0);
+        let latest = saved.latest().expect("a publication");
+        assert_eq!(latest.contracts, vec![(501, fno), (502, fno)]);
+        assert!(latest.published_at_nanos > 0);
+        assert_eq!(
+            saved.publications.len(),
+            1,
+            "the narrowing shares the attach's instant and replaces it"
+        );
+        let first_instant = latest.published_at_nanos;
 
         // Answered with a refusal: nothing is deduplicated.
         let (held, final_keys) = runtime.block_on(async {
@@ -27309,10 +27332,18 @@ mod frame_walk_accounting_tests {
         });
         assert_eq!(held, 0);
         assert!(final_keys.is_empty(), "a refusal publishes an empty set");
-        let saved = crate::main_feed_backup::read_backup_set(&path)
+        let saved = crate::main_feed_backup::read_backup_history(&path)
             .expect("readable")
             .expect("saved");
-        assert!(saved.contracts.is_empty());
+        assert!(saved.latest().expect("a publication").contracts.is_empty());
+        // The first attach's publication is kept for the replay of its frames
+        // (review 2026-10-02, F1), unless both attaches read one clock value.
+        assert!(
+            saved
+                .publications
+                .iter()
+                .any(|p| p.published_at_nanos == first_instant)
+        );
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
     }

@@ -210,10 +210,121 @@ pub fn markers_dir(wal_dir: &Path) -> PathBuf {
     wal_dir.join(UPLOADED_SUBDIR)
 }
 
+/// Most verified uploads this process keeps in memory while their marker
+/// file cannot be written (S2). Past it a verified upload is not recorded and
+/// its file is uploaded again on a later pass, so the bound costs work, never
+/// a delete.
+pub const UNMARKED_VERIFIED_LIMIT: usize = 4096;
+
+/// Gauge: verified uploads held in memory because their marker could not be
+/// written (S2). Non-zero means the disk refused a marker write.
+pub const UNMARKED_VERIFIED_GAUGE: &str = "tv_raw_upload_unmarked_verified";
+
+/// Counter: marker writes that failed after a verified upload (S2).
+pub const MARKER_WRITE_FAILED_COUNTER: &str = "tv_raw_upload_marker_write_failed_total";
+
+/// S2 (2026-10-02): verified uploads THIS process made whose marker file could
+/// not be written, keyed by the marker's path.
+///
+/// The defect it closes: on a 100%-full disk the upload and its HeadObject
+/// check succeed, the marker write fails with ENOSPC, and with no marker every
+/// prune that requires one refuses forever, so the disk never frees. An entry
+/// is added ONLY after the same HeadObject verification a marker records, and
+/// carries the same marker body, so it satisfies a prune exactly when the
+/// marker would have (raw length, and mtime for the spill and quarantine
+/// sets). It is never read from disk, so another process's claim cannot
+/// enter it. A later pass retries the marker write and drops the entry once
+/// the marker is on disk; a prune that deletes the file drops it too.
+///
+/// One `HashMap` probe per lookup under a `Mutex`, at most
+/// [`UNMARKED_VERIFIED_LIMIT`] entries. Cold paths only (the upload pass and
+/// the prunes), never the frame drain.
+static UNMARKED_VERIFIED: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, UploadMarker>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn unmarked_verified()
+-> std::sync::MutexGuard<'static, std::collections::HashMap<PathBuf, UploadMarker>> {
+    UNMARKED_VERIFIED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Records a verified upload whose marker write failed. `false` when the
+/// record is full (the file is then simply uploaded again later).
+fn remember_unmarked(marker_path: PathBuf, marker: UploadMarker) -> bool {
+    let mut held = unmarked_verified();
+    if held.len() >= UNMARKED_VERIFIED_LIMIT && !held.contains_key(&marker_path) {
+        return false;
+    }
+    held.insert(marker_path, marker);
+    // APPROVED: cast — an entry count bounded at 4096.
+    #[allow(clippy::cast_precision_loss)] // APPROVED: bounded entry count
+    metrics::gauge!(UNMARKED_VERIFIED_GAUGE).set(held.len() as f64);
+    true
+}
+
+/// Drops the in-memory record for a marker path (marker written, or the
+/// file deleted).
+fn forget_unmarked(marker_path: &Path) {
+    let mut held = unmarked_verified();
+    if held.remove(marker_path).is_some() {
+        // APPROVED: cast — an entry count bounded at 4096.
+        #[allow(clippy::cast_precision_loss)] // APPROVED: bounded entry count
+        metrics::gauge!(UNMARKED_VERIFIED_GAUGE).set(held.len() as f64);
+    }
+}
+
+/// Retries the marker write of every verified upload held in memory and drops
+/// each one that lands. Returns how many are still held. Cold: at the start of
+/// each upload pass, at most [`UNMARKED_VERIFIED_LIMIT`] small writes.
+fn retry_unmarked_markers() -> usize {
+    // O(1) EXEMPT: begin — at most UNMARKED_VERIFIED_LIMIT entries, cold upload pass
+    let snapshot: Vec<(PathBuf, UploadMarker)> = unmarked_verified()
+        .iter()
+        .map(|(path, marker)| (path.clone(), marker.clone()))
+        .collect();
+    for (path, marker) in snapshot {
+        let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
+        else {
+            continue;
+        };
+        if write_marker(dir, name, &marker).is_ok() {
+            forget_unmarked(&path);
+        }
+    }
+    // O(1) EXEMPT: end
+    unmarked_verified().len()
+}
+
+/// [`retry_unmarked_markers`] off the async runtime, logging what is still
+/// held. Skips the blocking task entirely while nothing is held.
+async fn retry_held_markers() {
+    if unmarked_verified().is_empty() {
+        return;
+    }
+    if let Ok(still_held) = tokio::task::spawn_blocking(retry_unmarked_markers).await
+        && still_held > 0
+    {
+        error!(
+            code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
+            source = "raw_frame_upload_marker",
+            still_held,
+            "verified copies in S3 still have no marker on disk; held in memory and \
+             retried on the next pass"
+        );
+    }
+}
+
 /// Reads the marker for `segment_name`, `None` when absent or unreadable.
+/// Falls back to a verified upload this process holds in memory because its
+/// marker could not be written (S2).
 fn read_marker(markers_dir: &Path, segment_name: &str) -> Option<UploadMarker> {
-    let bytes = std::fs::read(markers_dir.join(segment_name)).ok()?;
-    serde_json::from_slice::<UploadMarker>(&bytes).ok()
+    let path = markers_dir.join(segment_name);
+    std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<UploadMarker>(&bytes).ok())
+        .or_else(|| unmarked_verified().get(&path).cloned())
 }
 
 /// Whether `segment` has a marker whose recorded raw length equals `len`.
@@ -314,6 +425,7 @@ pub fn remove_marker(markers_dir: &Path, segment: &Path) {
     if let Some(name) = segment.file_name() {
         // O(1) EXEMPT: cold prune path, one unlink after a segment unlink
         drop(std::fs::remove_file(markers_dir.join(name)));
+        forget_unmarked(&markers_dir.join(name));
     }
 }
 
@@ -672,11 +784,32 @@ async fn upload_file_with<S: ColdObjectStore>(
         first_frame_seq,
     };
     let dir = markers_dir.to_path_buf();
+    let marker_path = markers_dir.join(&name);
+    let held = marker.clone();
     match tokio::task::spawn_blocking(move || write_marker(&dir, &name, &marker)).await {
         Ok(Ok(())) => outcome,
-        Ok(Err(err)) => SegmentOutcome::Failed {
-            reason: format!("upload verified but the marker write failed: {err:#}"),
-        },
+        Ok(Err(err)) => {
+            // S2: the copy IS verified in S3; only the record of it failed
+            // (most often a full disk). Hold it in memory so the prune can
+            // still free this file, and retry the marker on a later pass.
+            metrics::counter!(MARKER_WRITE_FAILED_COUNTER).increment(1);
+            let remembered = remember_unmarked(marker_path, held);
+            error!(
+                code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
+                source = "raw_frame_upload_marker",
+                remembered,
+                error = %format!("{err:#}"),
+                "a file's copy in S3 is verified but its marker could not be written; \
+                 the verified copy is held in memory so the cleanup can still free \
+                 the disk, and the marker is retried on the next pass"
+            );
+            SegmentOutcome::Failed {
+                reason: format!(
+                    "upload verified but the marker write failed (held in memory: \
+                     {remembered}): {err:#}"
+                ),
+            }
+        }
         Err(err) => SegmentOutcome::Failed {
             reason: format!("marker task failed: {err}"),
         },
@@ -941,6 +1074,7 @@ async fn run_pass_with<S: ColdObjectStore>(
     is_open: &(dyn Fn(&Path) -> bool + Send + Sync),
     now: SystemTime,
 ) -> UploadPassSummary {
+    retry_held_markers().await;
     let pending = pending_files(
         &wal_scan_dirs(wal_dir),
         Some("wal"),
@@ -1018,6 +1152,7 @@ async fn run_file_pass_with<S: ColdObjectStore>(
     is_open: &(dyn Fn(&Path) -> bool + Send + Sync),
     now: SystemTime,
 ) -> UploadPassSummary {
+    retry_held_markers().await;
     let pending = pending_files(
         &set.scan_dirs(),
         set.extension,
@@ -1846,5 +1981,101 @@ mod tests {
         let puts = store.puts.lock().expect("lock").clone(); // APPROVED: test-only
         assert!(puts.iter().any(|k| k.starts_with("tick-quarantine/")));
         assert!(puts.iter().any(|k| k.starts_with("depth-quarantine/")));
+    }
+
+    // S2 — a verified upload whose marker cannot be written still lets the
+    // prune free the disk, and the marker is retried.
+
+    #[tokio::test]
+    async fn test_regression_s2_verified_upload_with_failed_marker_write_satisfies_the_prune() {
+        let dir = temp_wal_dir("s2-enospc");
+        let seg = plant(&dir, SEG, b"frames frames frames");
+        let markers = markers_dir(&dir);
+        // A regular file where the marker directory goes: every marker write
+        // fails, the shape a full disk produces.
+        std::fs::write(&markers, b"blocker").expect("blocker"); // APPROVED: test-only
+        let store = FakeStore::default();
+        let first = run_pass_with(
+            &store,
+            &dir,
+            usize::MAX,
+            &always,
+            &never_open,
+            SystemTime::now(),
+        )
+        .await;
+        assert_eq!(first.failed, 1, "a missing marker is still reported");
+        assert_eq!(store.put_count(), 1, "the copy is in S3");
+        assert!(
+            marker_matches(&markers, &seg, 20),
+            "the verified upload satisfies the prune although no marker is on disk"
+        );
+        assert!(
+            !marker_matches(&markers, &seg, 21),
+            "a different length is never covered"
+        );
+        // The next pass does not upload it again.
+        let second = run_pass_with(
+            &store,
+            &dir,
+            usize::MAX,
+            &always,
+            &never_open,
+            SystemTime::now(),
+        )
+        .await;
+        assert_eq!(second.backlog_after, 0);
+        assert_eq!(store.put_count(), 1);
+
+        // Space comes back: the next pass writes the marker and drops the
+        // in-memory record.
+        std::fs::remove_file(&markers).expect("unblock"); // APPROVED: test-only
+        run_pass_with(
+            &store,
+            &dir,
+            usize::MAX,
+            &always,
+            &never_open,
+            SystemTime::now(),
+        )
+        .await;
+        let on_disk = std::fs::read(markers.join(SEG)).expect("marker written"); // APPROVED: test-only
+        let m: UploadMarker = serde_json::from_slice(&on_disk).expect("marker json"); // APPROVED: test-only
+        assert_eq!(m.raw_len, 20);
+        assert!(!unmarked_verified().contains_key(&markers.join(SEG)));
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn test_regression_s2_unverified_file_is_never_covered_and_a_delete_forgets_the_record() {
+        let dir = temp_wal_dir("s2-forget");
+        let markers = markers_dir(&dir);
+        let seg = plant(&dir, SEG, b"0123456789");
+        let other = plant(&dir, "ws-frames-01790000000000000001.wal", b"0123456789");
+        assert!(remember_unmarked(
+            markers.join(SEG),
+            UploadMarker {
+                version: MARKER_VERSION,
+                bucket: "tv-test-cold".to_string(),
+                key: segment_key(SEG, 0),
+                gzip_sha256: String::new(),
+                gzip_len: 0,
+                raw_sha256: String::new(),
+                raw_len: 10,
+                raw_mtime_secs: 0,
+                first_frame_seq: None,
+            },
+        ));
+        assert!(marker_matches(&markers, &seg, 10));
+        assert!(
+            !marker_matches(&markers, &other, 10),
+            "only a file this process verified is covered"
+        );
+        remove_marker(&markers, &seg);
+        assert!(
+            !marker_matches(&markers, &seg, 10),
+            "a pruned file's record is dropped with it"
+        );
+        drop(std::fs::remove_dir_all(&dir));
     }
 }

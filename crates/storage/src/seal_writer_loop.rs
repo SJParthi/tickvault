@@ -336,6 +336,19 @@ fn record_boot_drain_observability(outcome: &BootDrainOutcome) {
         metrics::counter!("tv_seal_writer_drain_total", "kind" => "boot_untracked")
             .increment(outcome.seals_untracked as u64);
     }
+    // S1: the summary that carries the older-copy guard across a stopped drain.
+    if outcome.summary_seeded > 0 {
+        metrics::counter!("tv_seal_writer_drain_total", "kind" => "boot_summary_seeded")
+            .increment(outcome.summary_seeded as u64);
+    }
+    if outcome.summary_refused > 0 {
+        metrics::counter!("tv_seal_writer_drain_total", "kind" => "boot_summary_refused")
+            .increment(outcome.summary_refused as u64);
+    }
+    if outcome.summary_not_persisted > 0 {
+        metrics::counter!("tv_seal_writer_drain_total", "kind" => "boot_summary_not_persisted")
+            .increment(outcome.summary_not_persisted as u64);
+    }
     let _ = report_unrecovered_seals(
         UnrecoveredStage::BootDrain,
         outcome
@@ -910,6 +923,9 @@ pub async fn run_seal_writer_loop(
             seals_append_failed = boot.seals_append_failed,
             seals_superseded = boot.seals_superseded,
             seals_untracked = boot.seals_untracked,
+            summary_seeded = boot.summary_seeded,
+            summary_refused = boot.summary_refused,
+            summary_not_persisted = boot.summary_not_persisted,
             "seal writer boot recovery drain finished"
         );
     }
@@ -1525,6 +1541,9 @@ mod tests {
             seals_append_failed: 3,
             seals_superseded: 4,
             seals_untracked: 1,
+            summary_seeded: 6,
+            summary_refused: 1,
+            summary_not_persisted: 2,
         });
     }
 

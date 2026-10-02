@@ -434,10 +434,63 @@ impl SpillLedger {
 /// Unlike the live ledger it grows on demand (cold, once per boot) up to
 /// `cap` bars. Past the cap a copy is written untracked and counted, so the
 /// failure direction is "write the data".
+///
+/// **S1 (2026-10-02): the record outlives a drain that stops early.** Each
+/// bar carries the fullest copy APPENDED (what the drain compares against)
+/// and the fullest copy a successful flush COMMITTED. When a drain stops with
+/// files still staged, the committed half is written to a summary file
+/// ([`BootWritten::encode_committed`]) and the next boot seeds its record
+/// from it ([`BootWritten::seed_from_bytes`]), so a file left staged cannot
+/// put an older copy over a fuller one an earlier boot committed and
+/// archived. Only committed copies are persisted: a copy whose flush failed
+/// is not in the database and must never refuse a copy that is.
 #[derive(Debug)]
 pub(crate) struct BootWritten {
-    bars: HashMap<BarKey, Fullness>,
+    bars: HashMap<BarKey, WrittenBar>,
+    /// Bars appended since the last flush, promoted to committed by
+    /// [`Self::commit_pending`]. At most one flush batch long.
+    pending: Vec<BarKey>,
     cap: usize,
+}
+
+/// One bar in [`BootWritten`].
+#[derive(Clone, Copy, Debug)]
+struct WrittenBar {
+    /// Fullest copy appended to the database writer (committed or not).
+    written: Fullness,
+    /// Fullest copy a successful flush committed, if any.
+    committed: Option<Fullness>,
+}
+
+/// Magic + layout version of the boot summary file (S1).
+const BOOT_SUMMARY_MAGIC: [u8; 8] = *b"TVBWSUM1";
+/// Bytes of one bar in the summary file: security id 8, bucket 4, segment 1,
+/// feed 1, timeframe 1, ticks 4, volume 8.
+const BOOT_SUMMARY_RECORD_SIZE: usize = 27;
+/// Header: magic 8, record count 8.
+const BOOT_SUMMARY_HEADER_SIZE: usize = 16;
+/// Trailer: CRC-32 (IEEE) of every byte before it.
+const BOOT_SUMMARY_TRAILER_SIZE: usize = 4;
+
+/// Why a boot summary file was refused. The whole file is refused: a partly
+/// trusted summary could refuse a copy the database does not hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BootSummaryRefused {
+    /// Wrong magic or layout version.
+    Magic,
+    /// The length does not match the record count.
+    Length,
+    /// The checksum does not match.
+    Checksum,
+}
+
+/// What [`BootWritten::seed_from_bytes`] did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct BootSummarySeeded {
+    /// Bars seeded as committed.
+    pub(crate) seeded: usize,
+    /// Bars in the file the record had no room for (counted, never blocks).
+    pub(crate) untracked: usize,
 }
 
 impl BootWritten {
@@ -445,18 +498,20 @@ impl BootWritten {
     pub(crate) fn new(cap: usize) -> Self {
         Self {
             bars: HashMap::new(),
+            pending: Vec::new(),
             cap,
         }
     }
 
-    /// `true` when a fuller copy of this bar was already written.
+    /// `true` when a fuller copy of this bar was already written (this
+    /// drain) or committed (an earlier, stopped drain, via the summary).
     ///
     /// # Complexity
     /// O(1), one hash probe.
     pub(crate) fn is_older(&self, seal: &SerializedSeal) -> bool {
         self.bars
             .get(&BarKey::of(seal))
-            .is_some_and(|held| fullness_of(seal) < *held)
+            .is_some_and(|held| fullness_of(seal) < held.written)
     }
 
     /// Record a copy appended to the database writer. Returns `false` when
@@ -468,14 +523,161 @@ impl BootWritten {
         let key = BarKey::of(seal);
         let copy = fullness_of(seal);
         if let Some(held) = self.bars.get_mut(&key) {
-            *held = (*held).max(copy);
+            held.written = held.written.max(copy);
+            self.pending.push(key);
             return true;
         }
         if self.bars.len() >= self.cap {
             return false;
         }
-        self.bars.insert(key, copy);
+        self.bars.insert(
+            key,
+            WrittenBar {
+                written: copy,
+                committed: None,
+            },
+        );
+        self.pending.push(key);
         true
+    }
+
+    /// A flush succeeded: every copy appended since the last flush is now
+    /// committed.
+    ///
+    /// # Complexity
+    /// O(appended since the last flush), at most one flush batch.
+    pub(crate) fn commit_pending(&mut self) {
+        // O(1) EXEMPT: begin — one flush batch, boot drain, cold
+        for key in self.pending.drain(..) {
+            if let Some(held) = self.bars.get_mut(&key) {
+                held.committed = Some(held.written);
+            }
+        }
+        // O(1) EXEMPT: end
+    }
+
+    /// A flush failed: the copies appended since the last flush are NOT
+    /// committed. Their bars keep any earlier committed copy.
+    pub(crate) fn discard_pending(&mut self) {
+        self.pending.clear();
+    }
+
+    /// Bars with a committed copy.
+    ///
+    /// # Complexity
+    /// O(bars). Boot drain, once.
+    pub(crate) fn committed_len(&self) -> usize {
+        // O(1) EXEMPT: one pass, boot drain, once
+        self.bars.values().filter(|b| b.committed.is_some()).count()
+    }
+
+    /// Serialise at most `max_bars` committed bars for the summary file.
+    /// Returns the bytes and how many committed bars did not fit.
+    ///
+    /// # Complexity
+    /// O(bars), one allocation of the output. Boot drain, once, only when it
+    /// stops with files still staged.
+    pub(crate) fn encode_committed(&self, max_bars: usize) -> (Vec<u8>, usize) {
+        let committed = self.committed_len();
+        let kept = committed.min(max_bars);
+        let dropped = committed - kept;
+        let mut out = Vec::with_capacity(
+            BOOT_SUMMARY_HEADER_SIZE
+                + kept.saturating_mul(BOOT_SUMMARY_RECORD_SIZE)
+                + BOOT_SUMMARY_TRAILER_SIZE,
+        );
+        out.extend_from_slice(&BOOT_SUMMARY_MAGIC);
+        out.extend_from_slice(&(kept as u64).to_le_bytes());
+        // O(1) EXEMPT: begin — one pass, boot drain, once
+        for (key, bar) in self
+            .bars
+            .iter()
+            .filter_map(|(k, b)| b.committed.map(|c| (k, c)))
+            .take(kept)
+        {
+            out.extend_from_slice(&key.security_id.to_le_bytes());
+            out.extend_from_slice(&key.bucket_start_ist_secs.to_le_bytes());
+            out.push(key.segment);
+            out.push(key.feed);
+            out.push(key.tf_ordinal);
+            out.extend_from_slice(&bar.0.to_le_bytes());
+            out.extend_from_slice(&bar.1.to_le_bytes());
+        }
+        // O(1) EXEMPT: end
+        let crc = crate::wal_applied_watermark::crc32_ieee(&out);
+        out.extend_from_slice(&crc.to_le_bytes());
+        (out, dropped)
+    }
+
+    /// Seed this record from a summary file written by an earlier, stopped
+    /// drain. Every seeded bar is committed (and so also written). The file
+    /// is checked whole before anything is seeded.
+    ///
+    /// # Complexity
+    /// O(records in the file). Boot drain, once.
+    pub(crate) fn seed_from_bytes(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<BootSummarySeeded, BootSummaryRefused> {
+        if bytes.len() < BOOT_SUMMARY_HEADER_SIZE + BOOT_SUMMARY_TRAILER_SIZE
+            || bytes[..8] != BOOT_SUMMARY_MAGIC
+        {
+            return Err(BootSummaryRefused::Magic);
+        }
+        let mut count_bytes = [0u8; 8];
+        count_bytes.copy_from_slice(&bytes[8..16]);
+        let count = u64::from_le_bytes(count_bytes);
+        let expected = usize::try_from(count)
+            .ok()
+            .and_then(|n| n.checked_mul(BOOT_SUMMARY_RECORD_SIZE))
+            .and_then(|n| n.checked_add(BOOT_SUMMARY_HEADER_SIZE + BOOT_SUMMARY_TRAILER_SIZE));
+        if expected != Some(bytes.len()) {
+            return Err(BootSummaryRefused::Length);
+        }
+        let (body, trailer) = bytes.split_at(bytes.len() - BOOT_SUMMARY_TRAILER_SIZE);
+        let mut crc_bytes = [0u8; 4];
+        crc_bytes.copy_from_slice(trailer);
+        if crate::wal_applied_watermark::crc32_ieee(body) != u32::from_le_bytes(crc_bytes) {
+            return Err(BootSummaryRefused::Checksum);
+        }
+        let mut outcome = BootSummarySeeded::default();
+        // O(1) EXEMPT: begin — one pass over the summary, boot drain, once
+        for rec in body[BOOT_SUMMARY_HEADER_SIZE..].chunks_exact(BOOT_SUMMARY_RECORD_SIZE) {
+            let mut sid = [0u8; 8];
+            sid.copy_from_slice(&rec[0..8]);
+            let mut bucket = [0u8; 4];
+            bucket.copy_from_slice(&rec[8..12]);
+            let mut ticks = [0u8; 4];
+            ticks.copy_from_slice(&rec[15..19]);
+            let mut volume = [0u8; 8];
+            volume.copy_from_slice(&rec[19..27]);
+            let key = BarKey {
+                security_id: u64::from_le_bytes(sid),
+                bucket_start_ist_secs: u32::from_le_bytes(bucket),
+                segment: rec[12],
+                feed: rec[13],
+                tf_ordinal: rec[14],
+            };
+            let copy = (u32::from_le_bytes(ticks), u64::from_le_bytes(volume));
+            if let Some(held) = self.bars.get_mut(&key) {
+                held.written = held.written.max(copy);
+                held.committed = Some(held.committed.map_or(copy, |c| c.max(copy)));
+                outcome.seeded += 1;
+            } else if self.bars.len() >= self.cap {
+                outcome.untracked += 1;
+            } else {
+                self.bars.insert(
+                    key,
+                    WrittenBar {
+                        written: copy,
+                        committed: Some(copy),
+                    },
+                );
+                outcome.seeded += 1;
+            }
+        }
+        // O(1) EXEMPT: end
+        Ok(outcome)
     }
 }
 
@@ -695,5 +897,81 @@ mod tests {
         // Past the cap a new bar is untracked, and the tracked one stays.
         assert!(!written.record(&copy_of(13, 2, TfIndex::M1, 660, 1, 1)));
         assert!(written.is_older(&copy_of(13, 2, TfIndex::M1, 600, 4, 40)));
+    }
+
+    #[test]
+    fn test_regression_s1_summary_persists_only_committed_copies() {
+        let mut written = BootWritten::new(16);
+        let committed = copy_of(13, 2, TfIndex::M1, 600, 5, 40);
+        assert!(written.record(&committed));
+        written.commit_pending();
+        // Appended but its flush failed: not in the database.
+        assert!(written.record(&copy_of(13, 2, TfIndex::M1, 660, 3, 9)));
+        written.discard_pending();
+        assert_eq!(written.committed_len(), 1);
+
+        let (bytes, dropped) = written.encode_committed(16);
+        assert_eq!(dropped, 0);
+        let mut next = BootWritten::new(16);
+        let seeded = next.seed_from_bytes(&bytes).expect("valid summary");
+        assert_eq!(
+            seeded,
+            BootSummarySeeded {
+                seeded: 1,
+                untracked: 0
+            }
+        );
+        assert!(next.is_older(&copy_of(13, 2, TfIndex::M1, 600, 4, 40)));
+        assert!(!next.is_older(&committed));
+        // The uncommitted bar never refuses anything.
+        assert!(!next.is_older(&copy_of(13, 2, TfIndex::M1, 660, 1, 1)));
+        // Seeded bars are re-persisted by a second stopped drain.
+        assert_eq!(next.committed_len(), 1);
+    }
+
+    #[test]
+    fn test_regression_s1_summary_refuses_a_damaged_file_whole() {
+        let mut written = BootWritten::new(16);
+        written.record(&copy_of(13, 2, TfIndex::M1, 600, 5, 40));
+        written.commit_pending();
+        let (bytes, _) = written.encode_committed(16);
+        let mut flipped = bytes.clone();
+        flipped[20] ^= 1;
+        assert_eq!(
+            BootWritten::new(16).seed_from_bytes(&flipped),
+            Err(BootSummaryRefused::Checksum)
+        );
+        assert_eq!(
+            BootWritten::new(16).seed_from_bytes(&bytes[..bytes.len() - 1]),
+            Err(BootSummaryRefused::Length)
+        );
+        assert_eq!(
+            BootWritten::new(16).seed_from_bytes(b"not a summary at all"),
+            Err(BootSummaryRefused::Magic)
+        );
+        assert_eq!(
+            BootWritten::new(16).seed_from_bytes(&[]),
+            Err(BootSummaryRefused::Magic)
+        );
+    }
+
+    #[test]
+    fn test_regression_s1_summary_is_bounded_and_counts_what_it_drops() {
+        let mut written = BootWritten::new(16);
+        for bucket in [600, 660, 720] {
+            written.record(&copy_of(13, 2, TfIndex::M1, bucket, 1, 1));
+        }
+        written.commit_pending();
+        let (bytes, dropped) = written.encode_committed(2);
+        assert_eq!(dropped, 1);
+        // Seeding past the cap counts, never blocks.
+        let seeded = BootWritten::new(1).seed_from_bytes(&bytes).expect("valid");
+        assert_eq!(
+            seeded,
+            BootSummarySeeded {
+                seeded: 1,
+                untracked: 1
+            }
+        );
     }
 }

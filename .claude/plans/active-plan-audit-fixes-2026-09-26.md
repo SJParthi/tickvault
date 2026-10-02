@@ -2328,6 +2328,29 @@ Each is recorded first in its rule file.
   test_regression_publish_backup_set_builds_off_the_drain_and_adopt_swaps,
   test_regression_same_socket_identical_repeat_is_kept,
   test_regression_newest_ltt_never_goes_backwards.
+- [x] **R5 — Round-5 attack-pass fixes** (2 medium, 4 low; 2026-10-02):
+  F1 the persisted backup set is a bounded history of publications and the replay uses the one
+  in force at each frame (`main_feed_backup.rs` `PersistedBackupHistory`, `ReplayBackup::select`);
+  F2 a new publication carries dedup state for contracts that stay (`BackupDedup::swap_in`);
+  F3 the main-feed widen flag is published only under the lock and an unprocessed 805 forces no
+  (`pool_supervisor.rs` `OVERFLOW_WIDEN_STATE`); S1 the boot drain's older-copy guard survives a
+  stopped drain (`seal_writer_task.rs` `drain_recovered_seals`, `seal_spill_ledger.rs`
+  `BootWritten`); S2 a verified upload whose marker write failed still satisfies the prune
+  (`raw_frame_upload.rs`); S3 the frame sequence is seeded above the persisted applied watermark
+  (`ws_frame_spill.rs` `seed_frame_seq_from_disk`, `wal_applied_watermark.rs`).
+  Tests: test_regression_805_never_published_over_by_a_stale_step,
+  test_regression_persisted_history_keeps_earlier_publications_bounded,
+  test_regression_replay_uses_the_publication_in_force_at_each_frame,
+  test_regression_replay_stops_a_publication_at_a_later_process_start,
+  test_regression_replay_switch_carries_state_like_the_live_adopt,
+  test_regression_adopt_carries_state_for_contracts_that_stay_in_the_set,
+  test_regression_s1_older_copy_left_staged_by_a_stopped_drain_is_refused_next_boot,
+  test_regression_s1_summary_survives_two_stopped_drains,
+  test_regression_s1_summary_is_bounded_and_counts_what_it_drops,
+  test_regression_s2_verified_upload_with_failed_marker_write_satisfies_the_prune,
+  test_regression_s2_unverified_file_is_never_covered_and_a_delete_forgets_the_record,
+  test_regression_s3_persisted_high_water_reads_only_a_valid_own_file,
+  test_regression_s3_reseed_clears_the_persisted_applied_watermark_with_no_segments.
 
 R3 Z+ and guarantee matrix: covered by the shared matrix at the end of this plan. Tick path adds
 one histogram bucket update per frame (R3-11) and one bool per frame (R3-9); no allocation by

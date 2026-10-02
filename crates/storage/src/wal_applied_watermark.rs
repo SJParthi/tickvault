@@ -484,27 +484,70 @@ impl AppliedSnapshot {
     /// mystery full replay.
     #[must_use]
     pub fn load(wal_dir: &Path) -> Option<Self> {
-        let path = wal_dir.join(APPLIED_WATERMARK_FILE);
-        let bytes = std::fs::read(&path).ok()?; // APPROVED: boot-time load, cold path
-        let expected_tag = dir_tag_of(wal_dir);
-        let parsed = Self::from_bytes(&bytes, wall_nanos());
-        let foreign = parsed
-            .as_ref()
-            .is_some_and(|snap| snap.dir_tag != expected_tag);
-        if parsed.is_none() || foreign {
-            metrics::counter!(APPLIED_INVALID_COUNTER).increment(1);
-            warn!(
-                path = %path.display(),
-                len = bytes.len(),
-                foreign,
-                "WAL applied-watermark file rejected (short, wrong magic/version, bad crc, \
-                 implausible values, or written beside a DIFFERENT directory) — ignored; \
-                 this boot replays the WAL in full"
-            );
-            return None;
-        }
-        parsed
+        Self::load_quiet(wal_dir)
+            .inspect_err(|len| {
+                metrics::counter!(APPLIED_INVALID_COUNTER).increment(1);
+                warn!(
+                    path = %wal_dir.join(APPLIED_WATERMARK_FILE).display(),
+                    len,
+                    "WAL applied-watermark file rejected (short, wrong magic/version, bad crc, \
+                     implausible values, or written beside a DIFFERENT directory) — ignored; \
+                     this boot replays the WAL in full"
+                );
+            })
+            .ok()
+            .flatten()
     }
+
+    /// S3 (2026-10-02): the highest `capture_seq` the file beside `wal_dir`
+    /// vouches for as applied, on either sink; `0` when there is no file or
+    /// it is rejected (a rejected file vouches for nothing, so no new
+    /// sequence can read as applied through it). Quiet: [`Self::load`] at the
+    /// bind reports a rejected file once.
+    ///
+    /// The WAL sequence is seeded past this as well as past the segments on
+    /// disk: once every segment is pruned, a backward clock step of less than
+    /// [`APPLIED_MAX_FUTURE_NANOS`] would otherwise mint sequences at or below
+    /// a watermark that still loads, and their segments would read as
+    /// applied — skipped on replay and deletable.
+    #[must_use]
+    pub fn persisted_high_water(wal_dir: &Path) -> u64 {
+        Self::load_quiet(wal_dir)
+            .ok()
+            .flatten()
+            .map_or(0, |snap| snap.hwm_ticks.max(snap.hwm_depth))
+    }
+
+    /// [`Self::load`] without the report. `Ok(None)` when absent, `Err(len)`
+    /// when present but rejected.
+    fn load_quiet(wal_dir: &Path) -> Result<Option<Self>, usize> {
+        let path = wal_dir.join(APPLIED_WATERMARK_FILE);
+        // APPROVED: boot-time load, cold path
+        let Ok(bytes) = std::fs::read(&path) else {
+            return Ok(None);
+        };
+        let expected_tag = dir_tag_of(wal_dir);
+        match Self::from_bytes(&bytes, wall_nanos()) {
+            Some(snap) if snap.dir_tag == expected_tag => Ok(Some(snap)),
+            _ => Err(bytes.len()),
+        }
+    }
+}
+
+/// Writes a valid watermark file for `wal_dir` holding the two high-water
+/// marks, as a persist would.
+#[cfg(test)]
+// TEST-EXEMPT: test-only helper for the S3 sequence-seed tests
+pub(crate) fn write_file_for_test(wal_dir: &Path, hwm_ticks: u64, hwm_depth: u64) {
+    let bytes = AppliedSnapshot {
+        hwm_ticks,
+        hwm_depth,
+        persisted_at_nanos: wall_nanos(),
+        dir_tag: dir_tag_of(wal_dir),
+        ..AppliedSnapshot::default()
+    }
+    .to_bytes();
+    std::fs::write(wal_dir.join(APPLIED_WATERMARK_FILE), bytes).expect("write watermark"); // APPROVED: test-only
 }
 
 /// The directory identity stored in the file: FNV-1a 64 over the canonical
@@ -1540,6 +1583,31 @@ mod tests {
         .to_bytes();
         std::fs::write(a.join(APPLIED_WATERMARK_FILE), bytes).expect("write");
         assert!(AppliedSnapshot::load(&a).is_none());
+    }
+
+    #[test]
+    fn test_regression_s3_persisted_high_water_reads_only_a_valid_own_file() {
+        let a = scratch("s3_hwm_a");
+        let b = scratch("s3_hwm_b");
+        assert_eq!(AppliedSnapshot::persisted_high_water(&a), 0, "no file");
+        write_file_for_test(&a, seq(300), seq(700));
+        assert_eq!(
+            AppliedSnapshot::persisted_high_water(&a),
+            seq(700),
+            "the higher of the two sinks"
+        );
+        std::fs::copy(
+            a.join(APPLIED_WATERMARK_FILE),
+            b.join(APPLIED_WATERMARK_FILE),
+        )
+        .expect("copy");
+        assert_eq!(
+            AppliedSnapshot::persisted_high_water(&b),
+            0,
+            "another directory's file vouches for nothing here"
+        );
+        std::fs::write(a.join(APPLIED_WATERMARK_FILE), b"torn").expect("write");
+        assert_eq!(AppliedSnapshot::persisted_high_water(&a), 0, "damaged file");
     }
 
     #[test]

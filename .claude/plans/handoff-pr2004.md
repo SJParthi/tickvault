@@ -1,7 +1,7 @@
 # Handoff — PR #2004 (zero-loss audit fixes)
 
 > Purpose: let a cold Claude session (any account) resume this work from the
-> repo alone. Updated after every milestone. Last updated: 2026-10-02 17:15 UTC.
+> repo alone. Updated after every milestone. Last updated: 2026-10-02 18:10 UTC.
 
 ## Where things are
 
@@ -9,7 +9,7 @@
 |---|---|
 | PR | https://github.com/SJParthi/tickvault/pull/2004 — DRAFT, owner merges (never merge or arm auto-merge) |
 | Branch | `claude/project-thread-x09qc8` |
-| Last pushed head | `bd81c0a98` — CI fully green (All Green success), no conflict with main |
+| Last green head | `bd81c0a98` (All Green success); round 5 pushed after it |
 | Plan file | `.claude/plans/active-plan-audit-fixes-2026-09-26.md` (round items R4-1..R4-6 ticked) |
 | Comparison page | https://claude.ai/artifact/ACvpJxrDNpHwi2GB1NNmuX (version 4; publish new versions to the SAME link) |
 | Owner | Parthi. Wants verified claims only, plain-language tables, O(1) hot paths, Rust only (except frontend), zero tick/data loss |
@@ -27,9 +27,9 @@
   pass. `dhat_ws_lag` / `dhat_live_ingest_seam` not run locally (disk) — CI
   runs them.
 
-## In progress — round 5 fixes (NOT yet committed when this file was written)
+## Round 5 fixes — committed on the PR branch (plan item R5)
 
-If the working tree is gone, redo these from the descriptions below.
+All six are fixed with regression tests; see plan item R5 for test names.
 
 | ID | Severity | Where | Fix |
 |---|---|---|---|
@@ -41,27 +41,38 @@ If the working tree is gone, redo these from the descriptions below.
 | S3 | low | `crates/storage/src/ws_frame_spill.rs` `seed_frame_seq_from_disk` | Seed the frame sequence from max(disk segments, persisted applied watermark + 1). |
 | L | limit | CLAUDE.md rows | Record: replay dedup can keep both copies when they straddle the applied-watermark skip or one was ring-shed (duplicate, never loss); `*.bin.N` / set-aside files are never uploaded or pruned. |
 
+## Merge round (Parthi 2026-10-02 17:33 UTC: "merge everything", no change lost, no overlap)
+
+| PR | State at 18:10 UTC | Next action |
+|---|---|---|
+| #2003 bucket keeps everything | was green but behind; branch updated to main, CI re-running, auto-merge armed | merges itself when green; confirm its commit is on main |
+| #2001 host tuning in Rust | same as #2003 | merges itself when green; confirm on main |
+| #2002 holiday gate in Rust | conflicts; carries old copies of #1997 + #2001 commits | after #2001 lands: merge main into its branch (merge commit, no rebase), resolve, CI, mark ready, merge |
+| #2004 this PR | round 5 pushed; overlaps #2001/#2002/#2003 (deploy files, main.rs, shell_budget_guard, main.tf, aws_infra_wiring) and duplicates #2003's bucket change | after #2003/#2001 land: merge main in, keep BOTH sides' tests, CI green, mark ready, merge |
+| #1968-#1971 opentelemetry bumps | each fails alone (two opentelemetry versions in one build) | replace with ONE combined upgrade (all four crates + code changes in crates/app/src/observability.rs) on this branch after #2004 merges; close the four only after it merges |
+
+Merges: squash, only with All Green success on the exact head. After each merge confirm the
+PR's change is on main. Close a PR only if its content is verified already on main.
+
 ## Next steps (exact)
 
-1. `cd` to the worktree, `git status`; if round-5 edits exist, review them.
-2. Tests: `cargo test -p tickvault-app main_feed_backup`, `cargo test -p tickvault-core pool_supervisor`,
-   targeted `cargo test -p tickvault-storage <module>`; `cargo clippy --workspace --no-deps -- -D warnings`;
-   `cargo fmt --all --check`; `bash .claude/hooks/banned-pattern-scanner.sh`; plan-gate.
-3. Add `R5` items to the plan file (ticked, with test names), commit with `-F file`
-   (body cites §), push to `claude/project-thread-x09qc8`.
-4. Wait for CI (PR activity subscription); fix any red; keep the PR a draft.
-5. Update the PR body (Round 5 section) and publish comparison page version 5 to the same link.
-6. Update this file.
+1. `git status` in the worktree; check PR #2004 CI on the latest head; fix any red.
+2. Check #2003 and #2001 merged (list open PRs). Then merge origin/main into this branch,
+   resolve overlaps keeping both sides, run targeted tests, push.
+3. Do #2002 as in the table. Then the combined opentelemetry upgrade.
+4. Update the PR body (Round 5 section) and publish comparison page version 5 to the same link.
+5. Update this file and push.
 
 ## Open decisions (owner only)
 
-- Merging PR #2004 — owner's call.
 - D11 (Muhurat trading capture, Sunday 2026-11-08): waiting for Parthi's session date, hours
   and cost. Not started; local branch `wip/d11` has no commits beyond this PR branch.
 
 ## Ground rules for the resuming session
 
-- Draft PR only; never merge, never arm auto-merge, never force-push, never `--no-verify`.
+- Merge only with All Green success on the exact head; never force-push, never `--no-verify`,
+  never rebase someone else's branch (merge main into it instead).
 - bruteX repo is READ-ONLY from here.
 - Every claim labelled Verified / Assumed with real output.
 - Keep usage lean: 2–3 helper agents, targeted tests, let CI run the full matrix.
+- Build with `CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0`; the disk allowance is small.

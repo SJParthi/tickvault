@@ -3398,8 +3398,17 @@ fn highest_frame_seq_in_segment(path: &Path) -> u64 {
 /// Idempotent and monotonic: it only ever RAISES the counter, so calling it
 /// twice, or after frames have already been minted, can neither lower it nor
 /// reissue a value. Returns the high-water mark found, for logging.
+///
+/// **S3 (2026-10-02): also past the persisted applied watermark.** The
+/// segments alone were the only source until today. Once every segment is
+/// pruned (each one uploaded and applied), a wall clock stepped back by less
+/// than a day left the counter seeded from the clock alone, BELOW the
+/// watermark file beside it, which still loads (it rejects values only a day
+/// or more ahead). Every new frame then read as applied: skipped on replay
+/// and deletable by the prune. The watermark's high-water is now a floor too.
 pub fn seed_frame_seq_from_disk(wal_dir: &Path) -> u64 {
-    let disk_high = highest_frame_seq_on_disk(wal_dir);
+    let disk_high = highest_frame_seq_on_disk(wal_dir)
+        .max(crate::wal_applied_watermark::AppliedSnapshot::persisted_high_water(wal_dir));
     if disk_high == 0 {
         return 0;
     }
@@ -10212,6 +10221,33 @@ mod tests {
     ///
     /// Refusing to boot over a torn tail would turn a safety net into an outage,
     /// and a lower bound is still strictly better than the wall clock alone.
+    /// S3: every segment pruned, the clock stepped back by less than a day,
+    /// and the applied watermark file still beside the empty directory. The
+    /// next mint must land ABOVE that watermark; at or below it, a new frame
+    /// reads as applied and is skipped on replay and deletable.
+    #[test]
+    fn test_regression_s3_reseed_clears_the_persisted_applied_watermark_with_no_segments() {
+        let dir = tmp_dir("wal-reseed-watermark");
+        assert_eq!(highest_frame_seq_on_disk(&dir), 0, "no segment on disk");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        // One hour ahead of this clock (inside the file's one-day ceiling, so
+        // the file still loads): the shape a backward clock step leaves.
+        let ahead = now + 3_600 * 1_000_000_000;
+        let watermark = ((ahead >> PACKET_INDEX_BITS) << PACKET_INDEX_BITS) | 3;
+        crate::wal_applied_watermark::write_file_for_test(&dir, watermark, 0);
+
+        assert_eq!(seed_frame_seq_from_disk(&dir), watermark);
+        let next = next_frame_seq();
+        assert!(
+            next > watermark,
+            "the next mint ({next}) must exceed the persisted applied watermark \
+             ({watermark}); at or below it the frame reads as applied"
+        );
+    }
+
     #[test]
     fn the_reseed_probe_tolerates_a_torn_tail_and_keeps_what_it_read() {
         let dir = tmp_dir("wal-reseed-torn");

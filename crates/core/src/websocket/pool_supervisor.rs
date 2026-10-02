@@ -1775,11 +1775,53 @@ static OVERFLOW_EPISODES: std::sync::Mutex<OverflowEpisodes> =
 /// that keeps every quiet socket off the episode lock.
 static OVERFLOW_ENGAGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Published copy of [`OverflowEpisode::widen_permitted`] (main feed), for an
-/// O(1) read by the main-feed widen. Cleared at the 805 itself, before the
-/// lock.
-static OVERFLOW_WIDEN_PERMITTED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(true);
+/// Published main-feed widen verdict, for an O(1) read by the main-feed
+/// widen: bit 0 is [`OverflowEpisode::widen_permitted`], written ONLY under
+/// the [`OVERFLOW_EPISODES`] lock; the bits above count 805s noted but not yet
+/// applied to the episode (each adds [`WIDEN_PENDING_805`] before the lock and
+/// takes it back under the lock, after the episode has seen the 805). The
+/// widen may run only when the word is exactly [`WIDEN_PERMITTED_BIT`]: a yes
+/// and nothing pending. So a step that computed "yes" from the state before
+/// an 805 cannot publish a yes once that 805 is noted — the pending count
+/// already says no, in the same word (review 2026-10-02: a separate
+/// pre-lock `false` store could be overwritten by such a step).
+static OVERFLOW_WIDEN_STATE: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(WIDEN_PERMITTED_BIT);
+
+/// Bit 0 of [`OVERFLOW_WIDEN_STATE`]: the episode permits the widen.
+const WIDEN_PERMITTED_BIT: u32 = 1;
+
+/// One 805 noted and not yet applied, in [`OVERFLOW_WIDEN_STATE`].
+const WIDEN_PENDING_805: u32 = 2;
+
+/// Whether a widen word permits the widen. O(1).
+#[inline]
+fn widen_word_permits(word: &std::sync::atomic::AtomicU32) -> bool {
+    word.load(std::sync::atomic::Ordering::Acquire) == WIDEN_PERMITTED_BIT
+}
+
+/// An 805 is noted, before the episode lock: the widen reads no from here.
+#[inline]
+fn widen_word_note_805(word: &std::sync::atomic::AtomicU32) {
+    word.fetch_add(WIDEN_PENDING_805, std::sync::atomic::Ordering::AcqRel);
+}
+
+/// Under the episode lock: publishes the episode's verdict bit.
+#[inline]
+fn widen_word_publish(word: &std::sync::atomic::AtomicU32, permitted: bool) {
+    if permitted {
+        word.fetch_or(WIDEN_PERMITTED_BIT, std::sync::atomic::Ordering::AcqRel);
+    } else {
+        word.fetch_and(!WIDEN_PERMITTED_BIT, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Under the episode lock, AFTER the episode applied the 805 and its verdict
+/// was published: takes the pending mark back.
+#[inline]
+fn widen_word_settle_805(word: &std::sync::atomic::AtomicU32) {
+    word.fetch_sub(WIDEN_PENDING_805, std::sync::atomic::Ordering::AcqRel);
+}
 
 /// Published copy of the main episode's [`OverflowEpisode::is_down`].
 static OVERFLOW_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1813,12 +1855,17 @@ static OVERFLOW_REPARK: [std::sync::atomic::AtomicBool; GHOST_REDIAL_SLOTS] =
 /// [`rotation_halted`] and are unaffected.
 #[must_use]
 pub fn main_feed_overflow_widen_permitted() -> bool {
-    OVERFLOW_WIDEN_PERMITTED.load(std::sync::atomic::Ordering::Acquire)
+    widen_word_permits(&OVERFLOW_WIDEN_STATE)
 }
 
 /// Runs `step` on the process episodes, publishes the atomics, then reports
-/// and executes the effects OUTSIDE the lock. Cold path.
-fn overflow_episode_step(step: impl FnOnce(&mut OverflowEpisodes) -> OverflowEpisodesEffect) {
+/// and executes the effects OUTSIDE the lock. Cold path. `settles_805`: this
+/// step applies an 805 noted with [`widen_word_note_805`], whose pending mark
+/// is taken back here, after the post-805 verdict is published.
+fn overflow_episode_step(
+    settles_805: bool,
+    step: impl FnOnce(&mut OverflowEpisodes) -> OverflowEpisodesEffect,
+) {
     let (effects, watched) = {
         let mut eps = OVERFLOW_EPISODES
             .lock()
@@ -1826,10 +1873,10 @@ fn overflow_episode_step(step: impl FnOnce(&mut OverflowEpisodes) -> OverflowEpi
         let watched_before = eps.watched();
         let effects = step(&mut eps);
         let watched = eps.watched();
-        OVERFLOW_WIDEN_PERMITTED.store(
-            eps.main.widen_permitted(),
-            std::sync::atomic::Ordering::Release,
-        );
+        widen_word_publish(&OVERFLOW_WIDEN_STATE, eps.main.widen_permitted());
+        if settles_805 {
+            widen_word_settle_805(&OVERFLOW_WIDEN_STATE);
+        }
         OVERFLOW_DOWN.store(eps.main.is_down(), std::sync::atomic::Ordering::Release);
         DEPTH_OVERFLOW_DOWN.store(eps.depth.is_down(), std::sync::atomic::Ordering::Release);
         if watched != watched_before {
@@ -1918,11 +1965,14 @@ fn report_overflow_probe_outcome(
 fn overflow_episode_note_disconnect(code: Option<DisconnectCode>, now: Instant) {
     if classify_disconnect(code) == DisconnectClass::PoolOverflow {
         OVERFLOW_ENGAGED.store(true, std::sync::atomic::Ordering::Release);
-        // Before the lock, so the widen can never read a stale yes.
-        OVERFLOW_WIDEN_PERMITTED.store(false, std::sync::atomic::Ordering::Release);
-        overflow_episode_step(|eps| eps.on_overflow(now));
+        // Before the lock, so the widen reads no from this instant. It is a
+        // pending mark, not a flag store, so a concurrent step that computed
+        // "yes" from the state before this 805 cannot overwrite it; this
+        // 805's own step takes it back once the episode has applied it.
+        widen_word_note_805(&OVERFLOW_WIDEN_STATE);
+        overflow_episode_step(true, |eps| eps.on_overflow(now));
     } else if code.is_none() && OVERFLOW_ENGAGED.load(std::sync::atomic::Ordering::Acquire) {
-        overflow_episode_step(|eps| eps.on_bare_reset(now));
+        overflow_episode_step(false, |eps| eps.on_bare_reset(now));
     }
 }
 
@@ -1936,7 +1986,7 @@ fn overflow_episode_note_first_frame(global_index: u8) {
 
 /// A socket parked for 805 and will wait for a grant from its pool's episode.
 fn overflow_episode_note_parked(endpoint: DhanEndpointType, global_index: u8) {
-    overflow_episode_step(|eps| {
+    overflow_episode_step(false, |eps| {
         eps.on_parked(endpoint, global_index);
         OverflowEpisodesEffect::default()
     });
@@ -1945,7 +1995,7 @@ fn overflow_episode_note_parked(endpoint: DhanEndpointType, global_index: u8) {
 /// The one-second poll: stamps the watched socket's first frame (from the
 /// lock-free flag) and runs the time-driven steps.
 fn overflow_episode_poll(now: Instant, window_open: bool) {
-    overflow_episode_step(|eps| {
+    overflow_episode_step(false, |eps| {
         if let Some(watched) = eps.watched()
             && OVERFLOW_WATCHED_FIRST_FRAME.load(std::sync::atomic::Ordering::Acquire)
         {
@@ -17258,7 +17308,54 @@ mod tests {
     fn test_main_feed_overflow_widen_permitted_reads_the_published_flag() {
         assert_eq!(
             main_feed_overflow_widen_permitted(),
-            OVERFLOW_WIDEN_PERMITTED.load(std::sync::atomic::Ordering::Acquire)
+            widen_word_permits(&OVERFLOW_WIDEN_STATE)
+        );
+    }
+
+    /// Review 2026-10-02 (F3): the 805 used to store `false` BEFORE the
+    /// episode lock, so a concurrent step that had computed "yes" from the
+    /// pre-805 state could store `true` over it — a stale yes until the
+    /// 805's own step ran. Replays that interleaving step by step on a local
+    /// word: from the moment the 805 is noted, no publication of a pre-805
+    /// "yes" can make the widen read yes.
+    #[test]
+    fn test_regression_805_never_published_over_by_a_stale_step() {
+        use std::sync::atomic::AtomicU32;
+        let word = AtomicU32::new(WIDEN_PERMITTED_BIT);
+        assert!(widen_word_permits(&word), "no 805 yet: yes");
+        // Thread A sees an 805 and notes it, before taking the lock.
+        widen_word_note_805(&word);
+        assert!(!widen_word_permits(&word), "no from the 805 itself");
+        // Thread B holds the lock with the PRE-805 episode and publishes its
+        // verdict: yes. Under the old flag this was the stale yes.
+        widen_word_publish(&word, true);
+        assert!(
+            !widen_word_permits(&word),
+            "a pre-805 yes published after the 805 is noted must not read yes"
+        );
+        // A second socket's 805 lands at the same time.
+        widen_word_note_805(&word);
+        // A takes the lock: the episode applies the 805 (verdict no), then
+        // the pending mark is taken back.
+        widen_word_publish(&word, false);
+        widen_word_settle_805(&word);
+        assert!(!widen_word_permits(&word), "the applied 805 says no");
+        // B's late pre-805 step again: still pending (the second 805).
+        widen_word_publish(&word, true);
+        assert!(
+            !widen_word_permits(&word),
+            "the second 805 is still pending"
+        );
+        widen_word_publish(&word, false);
+        widen_word_settle_805(&word);
+        assert!(!widen_word_permits(&word));
+        // Recovery (the probe passed): a step publishes yes with nothing
+        // pending, and the widen may run again.
+        widen_word_publish(&word, true);
+        assert!(widen_word_permits(&word), "recovered: yes");
+        assert_eq!(
+            word.load(std::sync::atomic::Ordering::Acquire),
+            WIDEN_PERMITTED_BIT
         );
     }
 
