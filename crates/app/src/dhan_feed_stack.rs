@@ -20186,7 +20186,7 @@ mod tests {
     /// tick opens a bucket in every timeframe and none has ended, so the
     /// mid-session exit seals nothing, and nothing is left for a later seal.
     #[test]
-    fn test_mid_session_exit_writes_no_open_bar() {
+    fn test_seal_complete_buckets_at_mid_session_exit_writes_no_open_bar() {
         let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
         let packet = ticker_packet(13, 23_146.45, 1_779_355_000);
         let ParsedFrame::Tick(tick) =
