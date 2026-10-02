@@ -121,6 +121,38 @@ pub async fn wait_for_reclaim_or(interval: Duration) -> bool {
     }
 }
 
+/// Process-global wake for the raw-frame S3 uploader (plan item 45e-1).
+///
+/// SEPARATE from [`RECLAIM_NOW`] on purpose. `notify_one` wakes exactly one
+/// waiter; if the uploader also waited on `RECLAIM_NOW`, a pressure request
+/// could wake the uploader and leave the prune asleep, which is the
+/// opposite of what pressure is for. Each task has its own permit.
+///
+/// With 45e-1 the prune refuses any segment without a verified S3 copy, so
+/// under pressure the uploader must run first and then wake the prune
+/// (the uploader calls [`request_reclaim`] after a batch that marked a
+/// segment).
+static RAW_UPLOAD_NOW: LazyLock<Notify> = LazyLock::new(Notify::new);
+
+/// Ask the raw-frame uploader to run now, inside the trading session too.
+///
+/// Called by the disk-pressure loop beside [`request_reclaim`]. Never blocks
+/// and never fails; a request with no waiter is stored as one permit.
+pub fn request_raw_upload() {
+    RAW_UPLOAD_NOW.notify_one();
+}
+
+/// Wait for either the uploader's interval or a pressure request.
+///
+/// Returns `true` when a pressure request woke it, `false` when the
+/// interval elapsed.
+pub async fn wait_for_raw_upload_or(interval: Duration) -> bool {
+    tokio::select! {
+        () = tokio::time::sleep(interval) => false,
+        () = RAW_UPLOAD_NOW.notified() => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,5 +232,20 @@ mod tests {
             "with no request pending the scheduled interval must still elapse — \
              the timer is the floor of the guarantee, not an optimisation"
         );
+    }
+
+    #[tokio::test]
+    async fn test_regression_raw_upload_wake_is_separate_from_the_reclaim_wake() {
+        // One test, run sequentially, so no other test races this permit.
+        // With nothing requested the interval elapses.
+        assert!(!wait_for_raw_upload_or(Duration::from_millis(1)).await);
+        // A raw-upload request wakes the uploader before a long interval.
+        request_raw_upload();
+        assert!(wait_for_raw_upload_or(Duration::from_secs(3600)).await);
+        // ...and it is consumed: it did not also store a permit for itself.
+        assert!(!wait_for_raw_upload_or(Duration::from_millis(1)).await);
+        // Not exercised here: that `request_reclaim` leaves this wake alone.
+        // It is structural (two statics), and calling it would store a
+        // RECLAIM_NOW permit that races the interval test above.
     }
 }
