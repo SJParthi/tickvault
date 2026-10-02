@@ -359,7 +359,13 @@ impl SealAbsorptionPipeline {
                 );
                 let dlq_record = SealDlqRecord::from(&serialised);
                 match self.dlq.append_record(&dlq_record, now_unix_secs) {
-                    Ok(()) => SubmitOutcome::DlqWritten,
+                    Ok(()) => {
+                        // Z6: the spill ledger records the dead-lettered
+                        // copy, so a fuller copy committed later is mirrored
+                        // to the spill and the boot drain ends on it.
+                        self.spill.note_dead_lettered(&serialised);
+                        SubmitOutcome::DlqWritten
+                    }
                     Err(dlq_err) => {
                         warn!(
                             ?dlq_err,
@@ -1090,5 +1096,35 @@ mod tests {
             free = free,
             floor = SEAL_ESCALATION_MIN_FREE_BYTES,
         );
+    }
+
+    /// Z6, path C: a ring eviction the spill refused went to the dead-letter
+    /// file. The spill ledger records it, so the amend committed later is
+    /// mirrored to the spill and the boot drain ends on it.
+    #[test]
+    fn test_regression_z6_evicted_seal_dead_lettered_mirrors_live_amend() {
+        let (spill, dlq) = temp_pair("z6-evicted-dlq");
+        std::fs::remove_dir_all(&spill).expect("remove spill dir");
+        std::fs::write(&spill, b"not a directory").expect("block the spill dir");
+        let mut p =
+            SealAbsorptionPipeline::with_capacity_and_dirs_for_test(1, spill.clone(), dlq.clone());
+        let now = jan1_noon_utc();
+        let mut original = mk_buffered_seal(13, 2, TfIndex::M1, 34_260, 99.0);
+        original.state.tick_count = 4;
+        let mut amended = original;
+        amended.state.tick_count = 5;
+        assert_eq!(p.submit(original, now), SubmitOutcome::Buffered);
+        assert_eq!(
+            p.submit(mk_buffered_seal(25, 2, TfIndex::M1, 34_260, 99.0), now),
+            SubmitOutcome::DlqWritten
+        );
+
+        std::fs::remove_file(&spill).expect("unblock");
+        std::fs::create_dir_all(&spill).expect("spill dir");
+        assert_eq!(p.note_live_commits(&[amended], now), 1);
+        let on_disk = p.spill_handle().read_all(now).expect("read spill");
+        assert_eq!(on_disk.len(), 1);
+        assert_eq!(on_disk[0].tick_count, 5);
+        cleanup(&spill, &dlq);
     }
 }
