@@ -198,6 +198,7 @@ use tickvault_common::error_code::ErrorCode;
 use tickvault_common::feed::Feed;
 use tickvault_trading::candles::{BufferedSeal, TfIndex};
 
+use crate::raw_frame_upload::CopyGate;
 use crate::seal_spill_ledger::{LiveCommit, QueueProgress, SpillLedger, SpillVerdict};
 
 /// Production spill directory — same parent as `tick_persistence.rs`'s
@@ -730,6 +731,14 @@ const _: () = assert!(
     std::mem::size_of::<SerializedSeal>() <= SEAL_SPILL_RECORD_SIZE,
     "SerializedSeal in-memory size exceeded SEAL_SPILL_RECORD_SIZE — bump record size + plan a forward migration."
 );
+
+/// The day file name the live spill writer opens at `now_unix_secs` (UTC):
+/// the one file in the spill root that may be held open, so neither the
+/// retention sweep nor the cold-bucket uploader touches it. Cold path.
+#[must_use]
+pub fn live_spill_file_name(now_unix_secs: i64) -> String {
+    ist_date_filename(now_unix_secs)
+}
 
 /// Returns today's IST date in `YYYY-MM-DD` form for the spill
 /// filename. Pure function for testability (clock injected by caller
@@ -1793,12 +1802,37 @@ pub struct SpillPruneOutcome {
     /// Files skipped because they are TODAY's file — the one the live writer
     /// may hold an open descriptor to. Never deleted at any age.
     pub skipped_live: usize,
-    /// Aged files deleted from `archive/` (audit PR40b). Not a loss: the
-    /// replay had finished with them. Counted apart from [`Self::deleted`],
-    /// which covers the top level and `replaying/`, where a deleted record
-    /// was never re-ingested.
+    /// Aged files deleted from `archive/` (audit PR40b). Counted apart from
+    /// [`Self::deleted`], which covers the top level and `replaying/`, where a
+    /// deleted record was never re-ingested.
+    ///
+    /// NOT "no loss" (corrected 2026-10-02): `archive/` also holds files the
+    /// replay finished WITHOUT ingesting every record — undecodable records
+    /// and seals skipped as unrecovered stay there, and those files are their
+    /// only copy. A delete is lossless only with a verified cold copy; see
+    /// [`Self::archive_deleted_without_copy`].
     pub archive_deleted: usize,
+    /// Of every delete this sweep (any folder), how many had a verified copy
+    /// in the cold bucket (`[raw_frame_archive] require_upload_before_prune`
+    /// on). Those lose nothing.
+    pub deleted_with_copy: usize,
+    /// Non-empty `archive/` files deleted with NO verified copy (only
+    /// possible with the copy gate off). May hold undecodable or skipped
+    /// seals; reported as possible loss.
+    pub archive_deleted_without_copy: usize,
+    /// Aged files the sweep would have deleted but KEPT because no verified
+    /// cold copy is recorded for them yet (operator Quotes 27 + 28). Counted
+    /// as `tv_seal_spill_prune_refused_not_uploaded_total`.
+    pub refused_not_uploaded: usize,
+    /// Bytes held by `refused_not_uploaded`.
+    pub refused_not_uploaded_bytes: u64,
 }
+
+/// Counter: aged seal-spill files the retention sweep KEPT because no
+/// verified cold copy is recorded for them (plan item 45e-1). The sweep logs
+/// one coded STORAGE-GAP-04 line per pass that refuses any.
+pub const SEAL_SPILL_PRUNE_REFUSED_NOT_UPLOADED_COUNTER: &str =
+    "tv_seal_spill_prune_refused_not_uploaded_total";
 
 /// Deletes spill files older than `max_age_secs` — pure-testable core over an
 /// injected `now`.
@@ -1829,11 +1863,20 @@ pub struct SpillPruneOutcome {
 /// an unbounded directory fills the volume, and a full volume stops EVERY
 /// table on the box, including the live writes these seals would be replayed
 /// into. Bounded-and-loud beats unbounded-and-silent.
+///
+/// # The copy gate (plan item 45e-1, operator Quotes 27 + 28)
+///
+/// With `gate` = [`CopyGate::Required`] an aged file is deleted only when its
+/// marker in `<its folder>/uploaded/` records its current length and mtime —
+/// i.e. a verified gzip copy sits in the cold bucket under `seal-spill/`.
+/// Otherwise it is kept and counted in `refused_not_uploaded`; the uploader
+/// copies it on its next pass and the following sweep deletes it.
 #[must_use]
 pub fn prune_spill_files_at(
     spill_dir: &Path,
     max_age_secs: u64,
     now: std::time::SystemTime,
+    gate: CopyGate,
 ) -> SpillPruneOutcome {
     let mut outcome = SpillPruneOutcome::default();
     // NEVER delete a file the live writer may hold open (2026-08-19, found by
@@ -1872,6 +1915,7 @@ pub fn prune_spill_files_at(
         PrunedKind::Unreplayed,
         cutoff,
         now,
+        gate,
         &mut outcome,
     );
     // Audit PR40b: the two folders the replay moves files into. Until then
@@ -1880,8 +1924,10 @@ pub fn prune_spill_files_at(
     // figure. `replaying/` holds staged files NOT yet re-ingested, so an aged
     // one there is unreplayed data exactly like an aged top-level file and is
     // counted as lost. `archive/` holds files the replay finished with: their
-    // seals are in QuestDB, or were skipped and already paged as
-    // `seal_unrecovered` when they were skipped.
+    // seals are in QuestDB, or were skipped (undecodable, or paged as
+    // `seal_unrecovered`) — and for those skipped seals the archived file is
+    // the only copy, so an archive delete is lossless only with a verified
+    // cold copy (2026-10-02).
     //
     // No live-writer guard below: the writer only ever opens TODAY's file at
     // the top level, and a file moved into either folder was already closed
@@ -1892,6 +1938,7 @@ pub fn prune_spill_files_at(
         PrunedKind::Unreplayed,
         cutoff,
         now,
+        gate,
         &mut outcome,
     );
     prune_dir(
@@ -1900,6 +1947,7 @@ pub fn prune_spill_files_at(
         PrunedKind::Archived,
         cutoff,
         now,
+        gate,
         &mut outcome,
     );
     outcome
@@ -1910,7 +1958,9 @@ pub fn prune_spill_files_at(
 enum PrunedKind {
     /// Seals not yet re-ingested: a non-empty deletion is data loss.
     Unreplayed,
-    /// A file the replay finished with: nothing is lost by deleting it.
+    /// A file the replay finished with. Its ingested seals are in QuestDB,
+    /// but undecodable or skipped seals have no other copy, so a delete is
+    /// lossless only with a verified cold copy (2026-10-02).
     Archived,
 }
 
@@ -1922,6 +1972,7 @@ fn prune_dir(
     kind: PrunedKind,
     cutoff: std::time::Duration,
     now: std::time::SystemTime,
+    gate: CopyGate,
     outcome: &mut SpillPruneOutcome,
 ) {
     // O(1) EXEMPT: periodic cold retention sweep, never the per-seal append
@@ -1960,27 +2011,52 @@ fn prune_dir(
             outcome.bytes_after = outcome.bytes_after.saturating_add(len);
             continue;
         }
+        // Operator Quotes 27 + 28: no delete without a verified cold copy.
+        if !gate.allows_delete(&path, &meta) {
+            outcome.refused_not_uploaded += 1;
+            outcome.refused_not_uploaded_bytes =
+                outcome.refused_not_uploaded_bytes.saturating_add(len);
+            outcome.bytes_after = outcome.bytes_after.saturating_add(len);
+            continue;
+        }
         // O(1) EXEMPT: periodic cold retention sweep, never the per-seal append
         match std::fs::remove_file(&path) {
-            Ok(()) => match kind {
-                PrunedKind::Archived => outcome.archive_deleted += 1,
-                PrunedKind::Unreplayed => {
-                    outcome.deleted += 1;
-                    if len > 0 {
-                        outcome.deleted_non_empty += 1;
-                        outcome.records_lost = outcome
-                            .records_lost
-                            .saturating_add(len / SEAL_SPILL_RECORD_SIZE as u64);
+            Ok(()) => {
+                gate.forget(&path);
+                let with_copy = gate.copy_in_s3();
+                if with_copy {
+                    outcome.deleted_with_copy += 1;
+                }
+                match kind {
+                    PrunedKind::Archived => {
+                        outcome.archive_deleted += 1;
+                        if !with_copy && len > 0 {
+                            outcome.archive_deleted_without_copy += 1;
+                        }
+                    }
+                    PrunedKind::Unreplayed => {
+                        outcome.deleted += 1;
+                        // With a verified copy the records are in the cold
+                        // bucket, not lost.
+                        if len > 0 && !with_copy {
+                            outcome.deleted_non_empty += 1;
+                            outcome.records_lost = outcome
+                                .records_lost
+                                .saturating_add(len / SEAL_SPILL_RECORD_SIZE as u64);
+                        }
                     }
                 }
-            },
+            }
             Err(err) => {
                 outcome.failed += 1;
                 outcome.bytes_after = outcome.bytes_after.saturating_add(len);
-                warn!(
+                error!(
+                    code = ErrorCode::StorageGap05DiskPressureUnrelievable.code_str(),
+                    source = "spill_retention",
                     path = %path.display(),
                     error = %err,
-                    "spill retention sweep: remove_file failed — retried next pass"
+                    "spill retention sweep: remove_file failed — the file stays and is \
+                     retried next pass"
                 );
             }
         }
@@ -1997,8 +2073,43 @@ fn prune_dir(
 // layer only supplies SystemTime::now(), emits the coded log and sets the
 // gauge. Mirrors the sibling ws_frame_spill::prune_archived_segments wrapper.
 #[must_use]
-pub fn prune_spill_files(spill_dir: &Path, max_age_secs: u64) -> SpillPruneOutcome {
-    let outcome = prune_spill_files_at(spill_dir, max_age_secs, std::time::SystemTime::now());
+pub fn prune_spill_files(
+    spill_dir: &Path,
+    max_age_secs: u64,
+    require_upload: bool,
+) -> SpillPruneOutcome {
+    let outcome = prune_spill_files_at(
+        spill_dir,
+        max_age_secs,
+        std::time::SystemTime::now(),
+        CopyGate::from_config(require_upload),
+    );
+    // APPROVED: cast — a per-pass file count, always <= u64.
+    metrics::counter!(SEAL_SPILL_PRUNE_REFUSED_NOT_UPLOADED_COUNTER)
+        .increment(outcome.refused_not_uploaded as u64);
+    if outcome.refused_not_uploaded > 0 {
+        error!(
+            code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
+            source = "spill_retention",
+            files = outcome.refused_not_uploaded,
+            bytes = outcome.refused_not_uploaded_bytes,
+            max_age_secs,
+            "aged sealed-candle spill files were KEPT, not deleted: no verified copy of \
+             them is in the cold bucket yet. They are deleted once the uploader has copied \
+             them; a growing count means the uploader cannot reach the bucket."
+        );
+    }
+    if outcome.archive_deleted_without_copy > 0 {
+        error!(
+            code = ErrorCode::AggregatorDrop01.code_str(),
+            source = "spill_retention",
+            files = outcome.archive_deleted_without_copy,
+            max_age_secs,
+            "aged files in the spill archive were deleted with NO cold copy (the copy gate \
+             is off). They may have held undecodable or skipped seals, whose only copy they \
+             were — reported as possible loss."
+        );
+    }
     if outcome.deleted_non_empty > 0 {
         // Audit PR40b: this line carried the unregistered code
         // "SPILL-RETENTION-01", which nothing filtered on, so a deleted spill
@@ -2025,9 +2136,9 @@ pub fn prune_spill_files(spill_dir: &Path, max_age_secs: u64) -> SpillPruneOutco
     if outcome.archive_deleted > 0 {
         info!(
             archive_deleted = outcome.archive_deleted,
+            deleted_with_copy = outcome.deleted_with_copy,
             bytes_after = outcome.bytes_after,
-            "spill retention sweep: removed aged files from archive/ (already re-ingested, \
-             or skipped and paged when skipped)"
+            "spill retention sweep: removed aged files from archive/"
         );
     }
     metrics::gauge!("tv_seal_spill_bytes").set(outcome.bytes_after as f64);
@@ -3358,7 +3469,8 @@ mod tests {
             .unwrap_or(0);
         let live = ist_date_filename(now_secs);
         let path = write_aged(&dir, &live, SEAL_SPILL_RECORD_SIZE * 4, 10_000_000);
-        let out = prune_spill_files_at(&dir, 0, std::time::SystemTime::now());
+        let out =
+            prune_spill_files_at(&dir, 0, std::time::SystemTime::now(), CopyGate::NotRequired);
         assert!(path.exists(), "today's file must NEVER be unlinked");
         assert_eq!(out.deleted, 0);
         assert_eq!(out.skipped_live, 1, "and it must be reported, not silent");
@@ -3377,7 +3489,12 @@ mod tests {
             .unwrap_or(0);
         let older = ist_date_filename(now_secs - 3 * 86_400);
         let path = write_aged(&dir, &older, 0, 10_000);
-        let out = prune_spill_files_at(&dir, 3_600, std::time::SystemTime::now());
+        let out = prune_spill_files_at(
+            &dir,
+            3_600,
+            std::time::SystemTime::now(),
+            CopyGate::NotRequired,
+        );
         assert!(!path.exists(), "an old day's file is still eligible");
         assert_eq!(out.deleted, 1);
         assert_eq!(out.skipped_live, 0);
@@ -3388,7 +3505,12 @@ mod tests {
         let dir = spill_tmp("aged");
         let old = write_aged(&dir, "seals-20260101.bin", 0, 10_000);
         let fresh = write_aged(&dir, "seals-20260819.bin", 0, 10);
-        let out = prune_spill_files_at(&dir, 3_600, std::time::SystemTime::now());
+        let out = prune_spill_files_at(
+            &dir,
+            3_600,
+            std::time::SystemTime::now(),
+            CopyGate::NotRequired,
+        );
         assert_eq!(out.deleted, 1);
         assert!(!old.exists(), "aged file must go");
         assert!(fresh.exists(), "fresh file must stay");
@@ -3405,7 +3527,12 @@ mod tests {
             SEAL_SPILL_RECORD_SIZE * 7,
             10_000,
         );
-        let out = prune_spill_files_at(&dir, 3_600, std::time::SystemTime::now());
+        let out = prune_spill_files_at(
+            &dir,
+            3_600,
+            std::time::SystemTime::now(),
+            CopyGate::NotRequired,
+        );
         assert_eq!(out.deleted, 1);
         assert_eq!(out.deleted_non_empty, 1, "must flag it as non-empty");
         assert_eq!(out.records_lost, 7, "must report the exact record count");
@@ -3417,7 +3544,12 @@ mod tests {
         // reported as data loss, or the incident signal becomes noise.
         let dir = spill_tmp("empty");
         write_aged(&dir, "seals-20260101.bin", 0, 10_000);
-        let out = prune_spill_files_at(&dir, 3_600, std::time::SystemTime::now());
+        let out = prune_spill_files_at(
+            &dir,
+            3_600,
+            std::time::SystemTime::now(),
+            CopyGate::NotRequired,
+        );
         assert_eq!(out.deleted, 1);
         assert_eq!(out.deleted_non_empty, 0);
         assert_eq!(out.records_lost, 0);
@@ -3427,7 +3559,12 @@ mod tests {
     fn spill_sweep_never_touches_foreign_files() {
         let dir = spill_tmp("foreign");
         let note = write_aged(&dir, "operator-notes.txt", 4096, 10_000);
-        let out = prune_spill_files_at(&dir, 3_600, std::time::SystemTime::now());
+        let out = prune_spill_files_at(
+            &dir,
+            3_600,
+            std::time::SystemTime::now(),
+            CopyGate::NotRequired,
+        );
         assert_eq!(out.deleted, 0);
         assert!(
             note.exists(),
@@ -3439,10 +3576,20 @@ mod tests {
     fn spill_sweep_reports_remaining_bytes_and_handles_a_missing_dir() {
         let dir = spill_tmp("bytes");
         write_aged(&dir, "seals-20260819.bin", 512, 10);
-        let out = prune_spill_files_at(&dir, 3_600, std::time::SystemTime::now());
+        let out = prune_spill_files_at(
+            &dir,
+            3_600,
+            std::time::SystemTime::now(),
+            CopyGate::NotRequired,
+        );
         assert_eq!(out.bytes_after, 512, "surviving bytes must be reported");
         let missing = std::env::temp_dir().join("tv-spill-does-not-exist-xyz");
-        let out = prune_spill_files_at(&missing, 3_600, std::time::SystemTime::now());
+        let out = prune_spill_files_at(
+            &missing,
+            3_600,
+            std::time::SystemTime::now(),
+            CopyGate::NotRequired,
+        );
         assert_eq!(out, SpillPruneOutcome::default(), "missing dir is a no-op");
     }
 
@@ -3471,7 +3618,12 @@ mod tests {
         let fresh_archived = write_aged(&archive, "seals_v4-20260103.bin", 128, 10);
         let foreign = write_aged(&archive, "seal-unwritten.mark", 64, 10_000);
 
-        let out = prune_spill_files_at(&dir, 3_600, std::time::SystemTime::now());
+        let out = prune_spill_files_at(
+            &dir,
+            3_600,
+            std::time::SystemTime::now(),
+            CopyGate::NotRequired,
+        );
 
         assert!(!old_staged.exists() && !old_archived.exists());
         assert!(fresh_staged.exists() && fresh_archived.exists() && foreign.exists());
@@ -3479,8 +3631,11 @@ mod tests {
         assert_eq!(out.deleted, 1);
         assert_eq!(out.deleted_non_empty, 1);
         assert_eq!(out.records_lost, 3);
-        // An aged archived file is not a loss and is counted apart.
+        // An aged archived file is counted apart. With the copy gate off it
+        // may have held skipped seals, so a non-empty one is possible loss.
         assert_eq!(out.archive_deleted, 1);
+        assert_eq!(out.archive_deleted_without_copy, 1);
+        assert_eq!(out.deleted_with_copy, 0);
         // Both folders count against the disk figure.
         assert_eq!(out.bytes_after, 256 + 128);
     }
@@ -3501,11 +3656,130 @@ mod tests {
         std::fs::create_dir_all(&archive).expect("mkdir archive");
         let live = write_aged(&dir, &today, 128, 10_000);
         let archived_today = write_aged(&archive, &today, 128, 10_000);
-        let out = prune_spill_files_at(&dir, 3_600, now);
+        let out = prune_spill_files_at(&dir, 3_600, now, CopyGate::NotRequired);
         assert!(live.exists(), "the live file is never deleted");
         assert!(!archived_today.exists());
         assert_eq!(out.skipped_live, 1);
         assert_eq!(out.archive_deleted, 1);
+    }
+
+    #[test]
+    fn test_live_spill_file_name_is_the_writers_day_file() {
+        // 2026-09-21T13:33:20Z = 19:03:20 IST; 18:40 UTC is the next IST day.
+        assert_eq!(
+            live_spill_file_name(1_790_000_000),
+            "seals_v4-2026-09-21.bin"
+        );
+        assert_eq!(
+            live_spill_file_name(1_790_016_000),
+            "seals_v4-2026-09-22.bin"
+        );
+        assert_eq!(
+            live_spill_file_name(1_790_000_000),
+            ist_date_filename(1_790_000_000)
+        );
+    }
+
+    #[test]
+    fn test_prune_spill_files_at_keeps_an_aged_unreplayed_file_without_a_marker() {
+        // Operator Quotes 27 + 28: with the copy gate on, an aged file with
+        // no verified cold copy is KEPT, at the top level and in replaying/.
+        let dir = spill_tmp("gate-keep");
+        let replaying = dir.join(crate::seal_writer_task::SEAL_REPLAYING_SUBDIR);
+        std::fs::create_dir_all(&replaying).expect("mkdir replaying");
+        let top = write_aged(
+            &dir,
+            "seals_v4-2026-01-01.bin",
+            SEAL_SPILL_RECORD_SIZE * 2,
+            10_000,
+        );
+        let staged = write_aged(
+            &replaying,
+            "seals_v4-2026-01-02.bin",
+            SEAL_SPILL_RECORD_SIZE,
+            10_000,
+        );
+        let out = prune_spill_files_at(
+            &dir,
+            3_600,
+            std::time::SystemTime::now(),
+            CopyGate::Required,
+        );
+        assert!(top.exists() && staged.exists());
+        assert_eq!(out.refused_not_uploaded, 2);
+        assert_eq!(
+            out.refused_not_uploaded_bytes,
+            (SEAL_SPILL_RECORD_SIZE * 3) as u64
+        );
+        assert_eq!(
+            (out.deleted, out.deleted_non_empty, out.records_lost),
+            (0, 0, 0)
+        );
+        assert_eq!(out.bytes_after, (SEAL_SPILL_RECORD_SIZE * 3) as u64);
+    }
+
+    #[test]
+    fn test_prune_spill_files_at_deletes_an_aged_file_with_a_matching_marker() {
+        let dir = spill_tmp("gate-copy");
+        let top = write_aged(
+            &dir,
+            "seals_v4-2026-01-01.bin",
+            SEAL_SPILL_RECORD_SIZE * 2,
+            10_000,
+        );
+        crate::raw_frame_upload::write_file_marker_for_test(&top);
+        let marker = dir
+            .join(crate::raw_frame_upload::UPLOADED_SUBDIR)
+            .join("seals_v4-2026-01-01.bin");
+        assert!(marker.exists());
+        let out = prune_spill_files_at(
+            &dir,
+            3_600,
+            std::time::SystemTime::now(),
+            CopyGate::Required,
+        );
+        assert!(!top.exists());
+        assert_eq!(out.deleted, 1);
+        assert_eq!(out.deleted_with_copy, 1);
+        // The records are in the cold bucket: not counted as lost.
+        assert_eq!((out.deleted_non_empty, out.records_lost), (0, 0));
+        assert_eq!(out.refused_not_uploaded, 0);
+        assert!(!marker.exists(), "the deleted file's marker goes with it");
+    }
+
+    #[test]
+    fn test_prune_spill_files_at_keeps_an_archive_file_without_a_marker() {
+        let dir = spill_tmp("gate-archive");
+        let archive = dir.join(crate::seal_writer_task::SEAL_ARCHIVE_SUBDIR);
+        std::fs::create_dir_all(&archive).expect("mkdir archive");
+        let unmarked = write_aged(&archive, "seals_v4-2026-01-01.bin", 256, 10_000);
+        let marked = write_aged(&archive, "seals_v4-2026-01-02.bin", 128, 10_000);
+        crate::raw_frame_upload::write_file_marker_for_test(&marked);
+        // A marker for a file that changed since its upload covers nothing.
+        let changed = write_aged(&archive, "seals_v4-2026-01-03.bin", 64, 10_000);
+        crate::raw_frame_upload::write_file_marker_for_test(&changed);
+        std::fs::write(&changed, vec![1_u8; 65]).expect("rewrite");
+        let f = std::fs::File::options()
+            .write(true)
+            .open(&changed)
+            .expect("reopen");
+        f.set_times(
+            std::fs::FileTimes::new().set_modified(
+                std::time::SystemTime::now() - std::time::Duration::from_secs(10_000),
+            ),
+        )
+        .expect("set mtime");
+        let out = prune_spill_files_at(
+            &dir,
+            3_600,
+            std::time::SystemTime::now(),
+            CopyGate::Required,
+        );
+        assert!(unmarked.exists() && changed.exists());
+        assert!(!marked.exists());
+        assert_eq!(out.archive_deleted, 1);
+        assert_eq!(out.archive_deleted_without_copy, 0);
+        assert_eq!(out.refused_not_uploaded, 2);
     }
 
     #[test]
@@ -3523,7 +3797,7 @@ mod tests {
             .expect("open");
         f.set_times(std::fs::FileTimes::new().set_modified(now))
             .expect("mtime");
-        let out = prune_spill_files_at(&dir, 0, now);
+        let out = prune_spill_files_at(&dir, 0, now, CopyGate::NotRequired);
         assert_eq!(out.deleted, 0, "a file with zero age must survive");
         assert!(path.exists());
     }

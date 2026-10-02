@@ -83,8 +83,27 @@ use crate::s3_cold::{
 /// prefix to Deep Archive after 30 days and never expires it (item 45f).
 pub const RAW_FRAME_S3_PREFIX: &str = "raw-frames";
 
-/// Marker directory under the WAL root.
+/// Marker directory under the WAL root (and, for the other file sets, under
+/// each directory they cover).
 pub const UPLOADED_SUBDIR: &str = "uploaded";
+
+/// Key prefix for sealed-candle spill files (`data/spill`, `replaying/`,
+/// `archive/`).
+pub const SEAL_SPILL_S3_PREFIX: &str = "seal-spill";
+/// Key prefix for quarantined tick spill files.
+pub const TICK_QUARANTINE_S3_PREFIX: &str = "tick-quarantine";
+/// Key prefix for quarantined depth spill files.
+pub const DEPTH_QUARANTINE_S3_PREFIX: &str = "depth-quarantine";
+
+/// Counter: spill / quarantine files uploaded (or found uploaded) and
+/// marked, labelled `set`.
+pub const COLD_FILE_UPLOAD_OK_COUNTER: &str = "tv_cold_file_upload_ok_total";
+/// Counter: spill / quarantine file attempts that ended without a marker,
+/// labelled `set`.
+pub const COLD_FILE_UPLOAD_FAILED_COUNTER: &str = "tv_cold_file_upload_failed_total";
+/// Gauge: spill / quarantine files still without a valid marker after the
+/// last pass, labelled `set`.
+pub const COLD_FILE_UPLOAD_BACKLOG_GAUGE: &str = "tv_cold_file_upload_backlog_files";
 
 /// Scheduled cadence of the upload pass outside the session window.
 pub const RAW_UPLOAD_INTERVAL_SECS: u64 = 120;
@@ -177,6 +196,12 @@ pub struct UploadMarker {
     pub raw_len: u64,
     /// Raw segment mtime, whole seconds since the epoch.
     pub raw_mtime_secs: u64,
+    /// First frame sequence of a WAL segment (plan item 45e-2), so a deleted
+    /// segment can still be placed in capture order. `None` for other files,
+    /// for markers written before it existed, and for an unreadable first
+    /// record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_frame_seq: Option<u64>,
 }
 
 /// `<wal_dir>/uploaded`.
@@ -201,6 +226,86 @@ pub fn marker_matches(markers_dir: &Path, segment: &Path, len: u64) -> bool {
         .and_then(|n| n.to_str())
         .and_then(|name| read_marker(markers_dir, name))
         .is_some_and(|m| m.raw_len == len)
+}
+
+/// Whole seconds since the epoch of a file's mtime, `0` when unreadable —
+/// the same reading [`prepare_segment`] records as `raw_mtime_secs`.
+fn mtime_secs_of(meta: &std::fs::Metadata) -> u64 {
+    meta.modified()
+        .ok()
+        .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Whether `path` has a marker in `markers_dir` whose recorded raw length
+/// AND mtime equal `len` and `mtime_secs`. The spill and quarantine prunes
+/// ask this: their file names repeat across days and folders (a day file is
+/// recreated after the replay stages it), so the name and length alone could
+/// match a different file. Cold path: one small file read.
+#[must_use]
+pub fn marker_matches_file(markers_dir: &Path, path: &Path, len: u64, mtime_secs: u64) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|name| read_marker(markers_dir, name))
+        .is_some_and(|m| m.raw_len == len && m.raw_mtime_secs == mtime_secs)
+}
+
+/// `<dir>/uploaded` for a file in `dir`: where the spill and quarantine sets
+/// keep a file's marker. `None` for a path with no parent.
+#[must_use]
+pub fn sibling_markers_dir(path: &Path) -> Option<PathBuf> {
+    path.parent().map(|p| p.join(UPLOADED_SUBDIR))
+}
+
+/// Whether a spill or quarantine prune may delete a file (operator Quotes 27
+/// + 28: no market-data delete without a verified copy). Config:
+/// `[raw_frame_archive] require_upload_before_prune`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyGate {
+    /// No copy needed: the behaviour before this gate. A box without a bucket
+    /// and with the config off uses this.
+    NotRequired,
+    /// Every delete needs the file's marker in `<its dir>/uploaded/`, with
+    /// the file's current length and mtime.
+    Required,
+}
+
+impl CopyGate {
+    /// The gate for `require_upload_before_prune`.
+    #[must_use]
+    pub const fn from_config(require_upload: bool) -> Self {
+        if require_upload {
+            Self::Required
+        } else {
+            Self::NotRequired
+        }
+    }
+
+    /// Whether `path`, whose metadata is `meta`, may be deleted as far as the
+    /// copy is concerned. Cold prune path: one small marker read.
+    #[must_use]
+    pub fn allows_delete(self, path: &Path, meta: &std::fs::Metadata) -> bool {
+        match self {
+            Self::NotRequired => true,
+            Self::Required => sibling_markers_dir(path).is_some_and(|markers| {
+                marker_matches_file(&markers, path, meta.len(), mtime_secs_of(meta))
+            }),
+        }
+    }
+
+    /// Whether a delete under this gate leaves a verified copy in S3.
+    #[must_use]
+    pub const fn copy_in_s3(self) -> bool {
+        matches!(self, Self::Required)
+    }
+
+    /// Removes the marker of a file the prune just deleted. Best effort: a
+    /// leftover marker never matches another file (length and mtime).
+    pub fn forget(self, path: &Path) {
+        if let (Self::Required, Some(markers)) = (self, sibling_markers_dir(path)) {
+            remove_marker(&markers, path);
+        }
+    }
 }
 
 /// Removes `segment`'s marker after the prune deleted the segment.
@@ -252,7 +357,19 @@ pub fn segment_key(segment_name: &str, mtime_secs: u64) -> String {
         || i64::try_from(mtime_secs).unwrap_or(i64::MAX),
         |n| i64::try_from(n / 1_000_000_000).unwrap_or(i64::MAX),
     );
-    format!("{RAW_FRAME_S3_PREFIX}/{}/{segment_name}.gz", ist_date(secs))
+    dated_key(RAW_FRAME_S3_PREFIX, secs, segment_name)
+}
+
+/// `<prefix>/<IST date of utc_secs>/<name>.gz`.
+fn dated_key(prefix: &str, utc_secs: i64, name: &str) -> String {
+    format!("{prefix}/{}/{name}.gz", ist_date(utc_secs))
+}
+
+/// The canonical key for a spill or quarantine file:
+/// `<prefix>/<IST date of its mtime>/<name>.gz`.
+#[must_use]
+pub fn cold_file_key(prefix: &str, name: &str, mtime_secs: u64) -> String {
+    dated_key(prefix, i64::try_from(mtime_secs).unwrap_or(i64::MAX), name)
 }
 
 /// The content-addressed key used when the canonical key holds different
@@ -294,8 +411,13 @@ fn prepare_segment(path: &Path) -> Result<PreparedSegment> {
         .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
         .map_or(0, |d| d.as_secs());
     let mut raw_hasher = sha2::Sha256::new();
+    // A spill or quarantine file is often a few KiB; pre-size to the file,
+    // capped at the segment-sized figure.
+    let presize = usize::try_from(meta.len())
+        .unwrap_or(GZIP_PRESIZE_BYTES)
+        .min(GZIP_PRESIZE_BYTES);
     let mut encoder = GzEncoder::new(
-        Sha256Writer::new(Vec::with_capacity(GZIP_PRESIZE_BYTES)),
+        Sha256Writer::new(Vec::with_capacity(presize)),
         Compression::fast(),
     );
     let mut chunk = vec![0u8; READ_CHUNK_BYTES];
@@ -397,13 +519,64 @@ async fn put_and_verify<S: ColdObjectStore>(
     }
 }
 
-/// Uploads one segment and writes its marker. Never panics; every failure is
-/// a `Failed` outcome with no marker.
+/// Uploads one WAL segment to `raw-frames/<IST date>/<name>.gz` and writes
+/// its marker, recording the segment's first frame sequence. Never panics;
+/// every failure is a `Failed` outcome with no marker.
 // TEST-EXEMPT: driven through run_pass in test_marker_matches_after_a_successful_upload, test_regression_size_mismatch_after_upload_writes_no_marker and the reuse/sidecar tests
 pub async fn upload_segment<S: ColdObjectStore>(
     store: &S,
     markers_dir: &Path,
     segment: &Path,
+) -> SegmentOutcome {
+    let Some(name) = segment.file_name().and_then(|n| n.to_str()) else {
+        return SegmentOutcome::Failed {
+            reason: "segment path has no file name".to_string(),
+        };
+    };
+    let path = segment.to_path_buf();
+    let probed = tokio::task::spawn_blocking(move || {
+        let mtime = std::fs::metadata(&path).map_or(0, |m| mtime_secs_of(&m));
+        (
+            mtime,
+            crate::ws_frame_spill::first_frame_seq_in_segment(&path),
+        )
+    })
+    .await;
+    let (mtime, first_seq) = match probed {
+        Ok(v) => v,
+        Err(err) => {
+            return SegmentOutcome::Failed {
+                reason: format!("probe task failed: {err}"),
+            };
+        }
+    };
+    let key = segment_key(name, mtime);
+    // `0` is the probe's "unknown" (v1 record, torn or unreadable first record).
+    let first_frame_seq = (first_seq != 0).then_some(first_seq);
+    upload_file_with(store, markers_dir, segment, &key, first_frame_seq).await
+}
+
+/// Uploads any one file to `key` (its canonical key; a conflicting object
+/// there sends the bytes to the content-addressed sidecar instead), verifies
+/// it, and writes its marker into `markers_dir`. Used for the spill and
+/// quarantine sets; [`upload_segment`] is the WAL form. Never panics; every
+/// failure is a `Failed` outcome with no marker.
+pub async fn upload_file<S: ColdObjectStore>(
+    store: &S,
+    markers_dir: &Path,
+    path: &Path,
+    key: &str,
+) -> SegmentOutcome {
+    upload_file_with(store, markers_dir, path, key, None).await
+}
+
+/// [`upload_file`] with the marker's first frame sequence.
+async fn upload_file_with<S: ColdObjectStore>(
+    store: &S,
+    markers_dir: &Path,
+    segment: &Path,
+    key: &str,
+    first_frame_seq: Option<u64>,
 ) -> SegmentOutcome {
     let Some(name) = segment
         .file_name()
@@ -411,7 +584,7 @@ pub async fn upload_segment<S: ColdObjectStore>(
         .map(ToString::to_string)
     else {
         return SegmentOutcome::Failed {
-            reason: "segment path has no file name".to_string(),
+            reason: "file path has no file name".to_string(),
         };
     };
     let path = segment.to_path_buf();
@@ -429,7 +602,7 @@ pub async fn upload_segment<S: ColdObjectStore>(
         }
     };
     let gzip_len = prepared.gzip.len() as u64;
-    let canonical = segment_key(&name, prepared.raw_mtime_secs);
+    let canonical = key.to_string();
 
     let head = match store.head_object(&canonical).await {
         Ok(h) => h,
@@ -496,6 +669,7 @@ pub async fn upload_segment<S: ColdObjectStore>(
         raw_sha256: prepared.raw_sha256_hex,
         raw_len: prepared.raw_len,
         raw_mtime_secs: prepared.raw_mtime_secs,
+        first_frame_seq,
     };
     let dir = markers_dir.to_path_buf();
     match tokio::task::spawn_blocking(move || write_marker(&dir, &name, &marker)).await {
@@ -509,37 +683,54 @@ pub async fn upload_segment<S: ColdObjectStore>(
     }
 }
 
-/// A sealed segment without a valid marker.
+/// A directory a pass scans, and where the markers of its files live.
+#[derive(Debug, Clone)]
+struct ScanDir {
+    dir: PathBuf,
+    markers: PathBuf,
+}
+
+/// How a pass decides a file's existing marker still covers it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarkerMatch {
+    /// Name and length: WAL segments, whose names are unique nanos and which
+    /// are never rewritten once sealed (the WAL prune asks the same).
+    Length,
+    /// Name, length and mtime: spill and quarantine files, whose names repeat
+    /// (the spill and quarantine prunes ask the same).
+    LengthAndMtime,
+}
+
+/// A file without a valid marker.
 #[derive(Debug, Clone)]
 struct Candidate {
     path: PathBuf,
+    markers: PathBuf,
 }
 
-/// Sealed segments still needing an upload, oldest first: every `*.wal` in
-/// the WAL root, `replaying/` and `archive/` that `is_open` does not claim,
+/// Files still needing an upload, in file-name order: every regular file in
+/// `dirs` with `extension` (any, when `None`) that `is_open` does not claim,
 /// that has been quiet for [`RAW_UPLOAD_MIN_QUIET_SECS`], and whose marker is
-/// missing or records a different length. Cold path: one directory walk per
-/// pass.
-fn pending_segments(
-    wal_dir: &Path,
+/// missing or does not match. Cold path: one directory walk per pass.
+fn pending_files(
+    dirs: &[ScanDir],
+    extension: Option<&str>,
+    rule: MarkerMatch,
     now: SystemTime,
     is_open: &dyn Fn(&Path) -> bool,
 ) -> Vec<Candidate> {
-    let markers = markers_dir(wal_dir);
-    // O(1) EXEMPT: cold upload pass, one entry per segment on disk
+    // O(1) EXEMPT: begin — cold upload pass, one entry per file on disk
     let mut out: Vec<(std::ffi::OsString, Candidate)> = Vec::with_capacity(256);
     let quiet = Duration::from_secs(RAW_UPLOAD_MIN_QUIET_SECS);
-    for dir in [
-        wal_dir.to_path_buf(),
-        wal_dir.join("replaying"),
-        wal_dir.join("archive"),
-    ] {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+    for scan in dirs {
+        let Ok(entries) = std::fs::read_dir(&scan.dir) else {
             continue;
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("wal") || is_open(&path) {
+            if extension.is_some_and(|ext| path.extension().and_then(|s| s.to_str()) != Some(ext))
+                || is_open(&path)
+            {
                 continue;
             }
             let Ok(meta) = entry.metadata() else {
@@ -553,14 +744,43 @@ fn pending_segments(
                 .ok()
                 .and_then(|m| now.duration_since(m).ok())
                 .is_some_and(|age| age >= quiet);
-            if !settled || marker_matches(&markers, &path, meta.len()) {
+            let marked = match rule {
+                MarkerMatch::Length => marker_matches(&scan.markers, &path, meta.len()),
+                MarkerMatch::LengthAndMtime => {
+                    marker_matches_file(&scan.markers, &path, meta.len(), mtime_secs_of(&meta))
+                }
+            };
+            if !settled || marked {
                 continue;
             }
-            out.push((entry.file_name(), Candidate { path }));
+            out.push((
+                entry.file_name(),
+                Candidate {
+                    path,
+                    markers: scan.markers.clone(),
+                },
+            ));
         }
     }
-    out.sort_by(|a, b| a.0.cmp(&b.0)); // O(1) EXEMPT: cold pass; name order == capture order
+    out.sort_by(|a, b| a.0.cmp(&b.0)); // name order == capture order for WAL and day files
+    // O(1) EXEMPT: end
     out.into_iter().map(|(_, c)| c).collect()
+}
+
+/// The WAL root, `replaying/` and `archive/`, all marked in `<wal>/uploaded`.
+fn wal_scan_dirs(wal_dir: &Path) -> Vec<ScanDir> {
+    let markers = markers_dir(wal_dir);
+    [
+        wal_dir.to_path_buf(),
+        wal_dir.join("replaying"),
+        wal_dir.join("archive"),
+    ]
+    .into_iter()
+    .map(|dir| ScanDir {
+        dir,
+        markers: markers.clone(),
+    })
+    .collect()
 }
 
 /// Totals of one pass.
@@ -570,15 +790,124 @@ pub struct UploadPassSummary {
     pub uploaded_sidecar: usize,
     pub reused: usize,
     pub failed: usize,
-    /// Segments still without a valid marker when the pass ended.
+    /// Files still without a valid marker when the pass ended.
     pub backlog_after: usize,
 }
 
 impl UploadPassSummary {
-    /// Segments newly marked this pass.
+    /// Files newly marked this pass.
     #[must_use]
     pub const fn marked(&self) -> usize {
         self.uploaded + self.uploaded_sidecar + self.reused
+    }
+
+    /// Field-wise sum, for a caller that runs several sets.
+    #[must_use]
+    pub const fn plus(self, other: Self) -> Self {
+        Self {
+            uploaded: self.uploaded + other.uploaded,
+            uploaded_sidecar: self.uploaded_sidecar + other.uploaded_sidecar,
+            reused: self.reused + other.reused,
+            failed: self.failed + other.failed,
+            backlog_after: self.backlog_after + other.backlog_after,
+        }
+    }
+}
+
+/// One set of non-WAL files the cold bucket keeps a verified copy of before
+/// their prune may delete them (operator Quotes 27 + 28).
+#[derive(Debug, Clone)]
+pub struct ColdFileSet {
+    /// Metric label and log name.
+    pub label: &'static str,
+    /// S3 key prefix.
+    pub prefix: &'static str,
+    /// Directories scanned; each keeps its markers in `<dir>/uploaded`.
+    pub dirs: Vec<PathBuf>,
+    /// File extension the set covers; `None` covers every regular file.
+    pub extension: Option<&'static str>,
+}
+
+impl ColdFileSet {
+    /// Sealed-candle spill files: the spill root, `replaying/` and
+    /// `archive/`, `*.bin` — exactly what `seal_spill::prune_spill_files`
+    /// may delete.
+    #[must_use]
+    pub fn seal_spill(spill_dir: &Path) -> Self {
+        Self {
+            label: "seal_spill",
+            prefix: SEAL_SPILL_S3_PREFIX,
+            dirs: vec![
+                spill_dir.to_path_buf(),
+                spill_dir.join(crate::seal_writer_task::SEAL_REPLAYING_SUBDIR),
+                spill_dir.join(crate::seal_writer_task::SEAL_ARCHIVE_SUBDIR),
+            ],
+            extension: Some("bin"),
+        }
+    }
+
+    /// Quarantined tick spill files: every file in `<tick spill>/quarantine`,
+    /// exactly what `tick_persistence::prune_quarantine` may delete.
+    #[must_use]
+    pub fn tick_quarantine(tick_spill_dir: &Path) -> Self {
+        Self {
+            label: "tick_quarantine",
+            prefix: TICK_QUARANTINE_S3_PREFIX,
+            dirs: vec![tick_spill_dir.join(crate::tick_spill_replay::QUARANTINE_DIR)],
+            extension: None,
+        }
+    }
+
+    /// Quarantined depth spill files: every file in
+    /// `<depth spill>/quarantine`.
+    #[must_use]
+    pub fn depth_quarantine(depth_spill_dir: &Path) -> Self {
+        Self {
+            label: "depth_quarantine",
+            prefix: DEPTH_QUARANTINE_S3_PREFIX,
+            dirs: vec![depth_spill_dir.join(crate::tick_spill_replay::QUARANTINE_DIR)],
+            extension: None,
+        }
+    }
+
+    fn scan_dirs(&self) -> Vec<ScanDir> {
+        self.dirs
+            .iter()
+            .map(|dir| ScanDir {
+                dir: dir.clone(),
+                markers: dir.join(UPLOADED_SUBDIR),
+            })
+            .collect()
+    }
+}
+
+/// Which files a pass covers and how their keys are built.
+#[derive(Clone, Copy)]
+enum PassKind<'a> {
+    /// WAL segments: `raw-frames/<IST date of the name's nanos>/...`.
+    Wal,
+    /// A [`ColdFileSet`]: `<prefix>/<IST date of the mtime>/...`.
+    Files(&'a ColdFileSet),
+}
+
+/// Uploads one candidate the way its pass kind needs.
+async fn upload_candidate<S: ColdObjectStore>(
+    store: &S,
+    kind: PassKind<'_>,
+    cand: &Candidate,
+) -> SegmentOutcome {
+    match kind {
+        PassKind::Wal => upload_segment(store, &cand.markers, &cand.path).await,
+        PassKind::Files(set) => {
+            let Some(name) = cand.path.file_name().and_then(|n| n.to_str()) else {
+                return SegmentOutcome::Failed {
+                    reason: "file path has no file name".to_string(),
+                };
+            };
+            let mtime = std::fs::metadata(&cand.path).map_or(0, |m| mtime_secs_of(&m));
+            let key = cold_file_key(set.prefix, name, mtime);
+            upload_file(store, &cand.markers, &cand.path, &key).await
+        }
     }
 }
 
@@ -612,48 +941,21 @@ async fn run_pass_with<S: ColdObjectStore>(
     is_open: &(dyn Fn(&Path) -> bool + Send + Sync),
     now: SystemTime,
 ) -> UploadPassSummary {
-    let wal_dir_owned = wal_dir.to_path_buf();
-    let pending = pending_segments(&wal_dir_owned, now, is_open);
-    let markers = markers_dir(wal_dir);
-    let mut summary = UploadPassSummary::default();
-    let mut consecutive_failures = 0usize;
-    let mut first_failure: Option<String> = None;
-    for cand in pending.iter().take(max_segments) {
-        if !should_continue() || consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-            break;
-        }
-        match upload_segment(store, &markers, &cand.path).await {
-            SegmentOutcome::Uploaded { key } => {
-                summary.uploaded += 1;
-                consecutive_failures = 0;
-                debug!(segment = %cand.path.display(), key = %key, "raw WAL segment uploaded and verified");
-            }
-            SegmentOutcome::UploadedSidecar { key } => {
-                summary.uploaded_sidecar += 1;
-                consecutive_failures = 0;
-                info!(
-                    segment = %cand.path.display(),
-                    key = %key,
-                    "raw WAL segment's canonical key held other bytes; uploaded to a \
-                     content-addressed key instead, nothing overwritten"
-                );
-            }
-            SegmentOutcome::Reused { key } => {
-                summary.reused += 1;
-                consecutive_failures = 0;
-                debug!(segment = %cand.path.display(), key = %key, "raw WAL segment already in S3, verified; marked");
-            }
-            SegmentOutcome::Failed { reason } => {
-                summary.failed += 1;
-                consecutive_failures += 1;
-                debug!(segment = %cand.path.display(), reason = %reason, "raw WAL segment upload failed");
-                if first_failure.is_none() {
-                    first_failure = Some(format!("{}: {reason}", cand.path.display()));
-                }
-            }
-        }
-    }
-    summary.backlog_after = pending.len().saturating_sub(summary.marked());
+    let pending = pending_files(
+        &wal_scan_dirs(wal_dir),
+        Some("wal"),
+        MarkerMatch::Length,
+        now,
+        is_open,
+    );
+    let (summary, first_failure) = upload_candidates(
+        store,
+        PassKind::Wal,
+        &pending,
+        max_segments,
+        should_continue,
+    )
+    .await;
     metrics::counter!(RAW_UPLOAD_OK_COUNTER).increment(summary.marked() as u64);
     metrics::counter!(RAW_UPLOAD_FAILED_COUNTER).increment(summary.failed as u64);
     // APPROVED: cast — a segment count, far below f64 precision loss.
@@ -685,6 +987,183 @@ async fn run_pass_with<S: ColdObjectStore>(
     summary
 }
 
+/// One upload pass over a [`ColdFileSet`]: the same rules as [`run_pass`]
+/// (quiet window, at most `max_files`, stop on `should_continue` or after
+/// [`MAX_CONSECUTIVE_FAILURES`] in a row), its own counters labelled `set`,
+/// and at most one coded line per pass.
+pub async fn run_file_pass<S: ColdObjectStore>(
+    store: &S,
+    set: &ColdFileSet,
+    max_files: usize,
+    should_continue: &(dyn Fn() -> bool + Send + Sync),
+    is_open: &(dyn Fn(&Path) -> bool + Send + Sync),
+) -> UploadPassSummary {
+    run_file_pass_with(
+        store,
+        set,
+        max_files,
+        should_continue,
+        is_open,
+        SystemTime::now(),
+    )
+    .await
+}
+
+/// [`run_file_pass`] with the clock injected.
+async fn run_file_pass_with<S: ColdObjectStore>(
+    store: &S,
+    set: &ColdFileSet,
+    max_files: usize,
+    should_continue: &(dyn Fn() -> bool + Send + Sync),
+    is_open: &(dyn Fn(&Path) -> bool + Send + Sync),
+    now: SystemTime,
+) -> UploadPassSummary {
+    let pending = pending_files(
+        &set.scan_dirs(),
+        set.extension,
+        MarkerMatch::LengthAndMtime,
+        now,
+        is_open,
+    );
+    let (summary, first_failure) = upload_candidates(
+        store,
+        PassKind::Files(set),
+        &pending,
+        max_files,
+        should_continue,
+    )
+    .await;
+    metrics::counter!(COLD_FILE_UPLOAD_OK_COUNTER, "set" => set.label)
+        .increment(summary.marked() as u64);
+    metrics::counter!(COLD_FILE_UPLOAD_FAILED_COUNTER, "set" => set.label)
+        .increment(summary.failed as u64);
+    // APPROVED: cast — a file count, far below f64 precision loss.
+    #[allow(clippy::cast_precision_loss)] // APPROVED: file count
+    metrics::gauge!(COLD_FILE_UPLOAD_BACKLOG_GAUGE, "set" => set.label)
+        .set(summary.backlog_after as f64);
+    if let Some(first) = first_failure {
+        error!(
+            code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
+            source = "cold_file_upload",
+            set = set.label,
+            failed = summary.failed,
+            marked = summary.marked(),
+            backlog = summary.backlog_after,
+            bucket = %store.bucket_name(),
+            first_failure = %first,
+            "spill or quarantine files could not be copied to S3 and verified; they stay \
+             on disk and their cleanup will not delete them until a copy is verified. \
+             Retried on the next pass."
+        );
+    } else if summary.marked() > 0 {
+        info!(
+            set = set.label,
+            uploaded = summary.uploaded,
+            uploaded_sidecar = summary.uploaded_sidecar,
+            reused = summary.reused,
+            backlog = summary.backlog_after,
+            bucket = %store.bucket_name(),
+            "spill or quarantine files copied to S3 and verified"
+        );
+    }
+    summary
+}
+
+/// The upload loop shared by both pass kinds. Returns the totals and the
+/// first failure, for the caller's one coded line.
+async fn upload_candidates<S: ColdObjectStore>(
+    store: &S,
+    kind: PassKind<'_>,
+    pending: &[Candidate],
+    max_files: usize,
+    should_continue: &(dyn Fn() -> bool + Send + Sync),
+) -> (UploadPassSummary, Option<String>) {
+    let mut summary = UploadPassSummary::default();
+    let mut consecutive_failures = 0usize;
+    let mut first_failure: Option<String> = None;
+    for cand in pending.iter().take(max_files) {
+        if !should_continue() || consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+            break;
+        }
+        match upload_candidate(store, kind, cand).await {
+            SegmentOutcome::Uploaded { key } => {
+                summary.uploaded += 1;
+                consecutive_failures = 0;
+                debug!(file = %cand.path.display(), key = %key, "file uploaded to the cold bucket and verified");
+            }
+            SegmentOutcome::UploadedSidecar { key } => {
+                summary.uploaded_sidecar += 1;
+                consecutive_failures = 0;
+                info!(
+                    file = %cand.path.display(),
+                    key = %key,
+                    "canonical key held other bytes; uploaded to a content-addressed key \
+                     instead, nothing overwritten"
+                );
+            }
+            SegmentOutcome::Reused { key } => {
+                summary.reused += 1;
+                consecutive_failures = 0;
+                debug!(file = %cand.path.display(), key = %key, "file already in the cold bucket, verified; marked");
+            }
+            SegmentOutcome::Failed { reason } => {
+                summary.failed += 1;
+                consecutive_failures += 1;
+                debug!(file = %cand.path.display(), reason = %reason, "cold-bucket upload failed");
+                if first_failure.is_none() {
+                    first_failure = Some(format!("{}: {reason}", cand.path.display()));
+                }
+            }
+        }
+    }
+    summary.backlog_after = pending.len().saturating_sub(summary.marked());
+    (summary, first_failure)
+}
+
+/// Uploads the sealed-candle spill files and the tick and depth quarantine
+/// files, in that order, after the WAL pass (plan item 45e-1, the two
+/// remaining ungated prunes). `today_spill_file` is the seal-spill day file
+/// the live writer may hold open — never uploaded, as its prune never
+/// deletes it. Each set gets at most `max_files`.
+pub async fn run_spill_and_quarantine_passes<S: ColdObjectStore>(
+    store: &S,
+    spill_dir: &Path,
+    tick_spill_dir: &Path,
+    depth_spill_dir: &Path,
+    today_spill_file: &str,
+    max_files: usize,
+    should_continue: &(dyn Fn() -> bool + Send + Sync),
+) -> UploadPassSummary {
+    let live = spill_dir.join(today_spill_file);
+    let spill_open = move |p: &Path| p == live.as_path();
+    let never_open = |_: &Path| false;
+    let spill = run_file_pass(
+        store,
+        &ColdFileSet::seal_spill(spill_dir),
+        max_files,
+        should_continue,
+        &spill_open,
+    )
+    .await;
+    let ticks = run_file_pass(
+        store,
+        &ColdFileSet::tick_quarantine(tick_spill_dir),
+        max_files,
+        should_continue,
+        &never_open,
+    )
+    .await;
+    let depth = run_file_pass(
+        store,
+        &ColdFileSet::depth_quarantine(depth_spill_dir),
+        max_files,
+        should_continue,
+        &never_open,
+    )
+    .await;
+    spill.plus(ticks).plus(depth)
+}
+
 /// Test hook for the WAL prune's tests: records a marker for `segment`
 /// claiming `raw_len` bytes. Kept below every production fn: the loss-counter
 /// guard treats the file's first `#[cfg(test)]` as the end of production code.
@@ -704,8 +1183,34 @@ pub(crate) fn write_marker_for_test(markers_dir: &Path, segment: &Path, raw_len:
         raw_sha256: String::new(),
         raw_len,
         raw_mtime_secs: 0,
+        first_frame_seq: None,
     };
     write_marker(markers_dir, name, &marker).expect("write test marker"); // APPROVED: test-only
+}
+
+#[cfg(test)]
+// TEST-EXEMPT: test-only helper for the spill and quarantine prune tests
+/// Records a marker in `<file's dir>/uploaded/` matching `path`'s current
+/// length and mtime, as a verified upload would.
+pub(crate) fn write_file_marker_for_test(path: &Path) {
+    let meta = std::fs::metadata(path).expect("stat"); // APPROVED: test-only
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unnamed"); // APPROVED: test-only
+    let marker = UploadMarker {
+        version: MARKER_VERSION,
+        bucket: "tv-test-cold".to_string(),
+        key: cold_file_key("test", name, mtime_secs_of(&meta)),
+        gzip_sha256: String::new(),
+        gzip_len: 0,
+        raw_sha256: String::new(),
+        raw_len: meta.len(),
+        raw_mtime_secs: mtime_secs_of(&meta),
+        first_frame_seq: None,
+    };
+    let markers = sibling_markers_dir(path).expect("parent"); // APPROVED: test-only
+    write_marker(&markers, name, &marker).expect("write test marker"); // APPROVED: test-only
 }
 
 #[cfg(test)]
@@ -1077,6 +1582,7 @@ mod tests {
             raw_sha256: "r".into(),
             raw_len: 5,
             raw_mtime_secs: 0,
+            first_frame_seq: None,
         };
         write_marker(&markers, "a.wal", &marker).expect("write"); // APPROVED: test-only
         write_marker(&markers, "b.wal", &marker).expect("write"); // APPROVED: test-only
@@ -1084,5 +1590,261 @@ mod tests {
         assert!(!markers.join("a.wal").exists());
         assert!(marker_matches(&markers, &dir.join("b.wal"), 5));
         assert!(!markers.join("a.wal.tmp").exists(), "no tmp left behind");
+    }
+
+    // ---- plan item 45e-1: spill and quarantine copies ----
+
+    const DAY_FILE: &str = "seals_v4-2026-09-21.bin";
+
+    #[test]
+    fn test_cold_file_key_uses_the_prefix_and_the_ist_date_of_the_mtime() {
+        // 1_790_000_000 s = 2026-09-21T13:33:20Z = 19:03:20 IST.
+        assert_eq!(
+            cold_file_key(SEAL_SPILL_S3_PREFIX, DAY_FILE, 1_790_000_000),
+            "seal-spill/2026-09-21/seals_v4-2026-09-21.bin.gz"
+        );
+        // 18:40 UTC is 00:10 IST the next day.
+        assert_eq!(
+            cold_file_key(TICK_QUARANTINE_S3_PREFIX, "ticks-1.ndjson", 1_790_016_000),
+            "tick-quarantine/2026-09-22/ticks-1.ndjson.gz"
+        );
+        assert!(cold_file_key(DEPTH_QUARANTINE_S3_PREFIX, "d", 0).starts_with("depth-quarantine/"));
+    }
+
+    #[test]
+    fn test_marker_matches_file_needs_the_length_and_the_mtime() {
+        let dir = temp_wal_dir("mf");
+        let file = plant(&dir, DAY_FILE, b"seal records");
+        let meta = std::fs::metadata(&file).expect("stat"); // APPROVED: test-only
+        let markers = sibling_markers_dir(&file).expect("parent"); // APPROVED: test-only
+        assert!(!marker_matches_file(
+            &markers,
+            &file,
+            meta.len(),
+            mtime_secs_of(&meta)
+        ));
+        write_file_marker_for_test(&file);
+        let mtime = mtime_secs_of(&meta);
+        assert!(marker_matches_file(&markers, &file, meta.len(), mtime));
+        assert!(!marker_matches_file(&markers, &file, meta.len() + 1, mtime));
+        assert!(
+            !marker_matches_file(&markers, &file, meta.len(), mtime + 1),
+            "a recreated day file of the same length is a different file"
+        );
+    }
+
+    #[test]
+    fn test_write_file_marker_for_test_records_the_files_length_and_mtime() {
+        let dir = temp_wal_dir("helper");
+        let file = plant(&dir, DAY_FILE, b"twelve bytes");
+        write_file_marker_for_test(&file);
+        let m = read_marker(&dir.join(UPLOADED_SUBDIR), DAY_FILE).expect("marker"); // APPROVED: test-only
+        let meta = std::fs::metadata(&file).expect("stat"); // APPROVED: test-only
+        assert_eq!(m.raw_len, 12);
+        assert_eq!(m.raw_mtime_secs, mtime_secs_of(&meta));
+    }
+
+    #[test]
+    fn test_sibling_markers_dir_is_uploaded_beside_the_file() {
+        assert_eq!(
+            sibling_markers_dir(Path::new("/x/spill/archive/a.bin")),
+            Some(PathBuf::from("/x/spill/archive/uploaded"))
+        );
+        assert_eq!(sibling_markers_dir(Path::new("/")), None);
+    }
+
+    #[test]
+    fn test_copy_gate_from_config_allows_delete_copy_in_s3_and_forget() {
+        assert_eq!(CopyGate::from_config(false), CopyGate::NotRequired);
+        assert_eq!(CopyGate::from_config(true), CopyGate::Required);
+        assert!(!CopyGate::NotRequired.copy_in_s3());
+        assert!(CopyGate::Required.copy_in_s3());
+
+        let dir = temp_wal_dir("gate");
+        let file = plant(&dir, DAY_FILE, b"seal records");
+        let meta = std::fs::metadata(&file).expect("stat"); // APPROVED: test-only
+        assert!(CopyGate::NotRequired.allows_delete(&file, &meta));
+        assert!(
+            !CopyGate::Required.allows_delete(&file, &meta),
+            "no marker, no delete"
+        );
+        write_file_marker_for_test(&file);
+        assert!(CopyGate::Required.allows_delete(&file, &meta));
+
+        // The file grows after the upload: the copy no longer covers it.
+        std::fs::write(&file, b"seal records and one more").expect("write"); // APPROVED: test-only
+        let grown = std::fs::metadata(&file).expect("stat"); // APPROVED: test-only
+        assert!(!CopyGate::Required.allows_delete(&file, &grown));
+
+        CopyGate::NotRequired.forget(&file);
+        assert!(dir.join(UPLOADED_SUBDIR).join(DAY_FILE).exists());
+        CopyGate::Required.forget(&file);
+        assert!(!dir.join(UPLOADED_SUBDIR).join(DAY_FILE).exists());
+    }
+
+    #[test]
+    fn test_upload_pass_summary_plus_adds_every_field() {
+        let a = UploadPassSummary {
+            uploaded: 1,
+            uploaded_sidecar: 2,
+            reused: 3,
+            failed: 4,
+            backlog_after: 5,
+        };
+        let b = UploadPassSummary {
+            uploaded: 10,
+            uploaded_sidecar: 20,
+            reused: 30,
+            failed: 40,
+            backlog_after: 50,
+        };
+        let s = a.plus(b);
+        assert_eq!(
+            (
+                s.uploaded,
+                s.uploaded_sidecar,
+                s.reused,
+                s.failed,
+                s.backlog_after
+            ),
+            (11, 22, 33, 44, 55)
+        );
+        assert_eq!(s.marked(), 66);
+    }
+
+    #[test]
+    fn test_cold_file_set_seal_spill_tick_quarantine_depth_quarantine_dirs() {
+        let spill = ColdFileSet::seal_spill(Path::new("/d/spill"));
+        assert_eq!(spill.prefix, SEAL_SPILL_S3_PREFIX);
+        assert_eq!(spill.extension, Some("bin"));
+        assert_eq!(
+            spill.dirs,
+            vec![
+                PathBuf::from("/d/spill"),
+                PathBuf::from("/d/spill/replaying"),
+                PathBuf::from("/d/spill/archive"),
+            ]
+        );
+        let ticks = ColdFileSet::tick_quarantine(Path::new("/d/spill/ticks"));
+        assert_eq!(ticks.prefix, TICK_QUARANTINE_S3_PREFIX);
+        assert_eq!(ticks.dirs, vec![PathBuf::from("/d/spill/ticks/quarantine")]);
+        assert_eq!(ticks.extension, None);
+        let depth = ColdFileSet::depth_quarantine(Path::new("/d/spill/depth"));
+        assert_eq!(depth.prefix, DEPTH_QUARANTINE_S3_PREFIX);
+        assert_eq!(depth.dirs, vec![PathBuf::from("/d/spill/depth/quarantine")]);
+        assert_ne!(ticks.label, depth.label);
+    }
+
+    #[tokio::test]
+    async fn test_upload_file_puts_under_the_given_key_and_marks_beside_the_file() {
+        let dir = temp_wal_dir("file");
+        let file = plant(&dir, DAY_FILE, b"seal records");
+        let store = FakeStore::default();
+        let markers = dir.join(UPLOADED_SUBDIR);
+        let key = "seal-spill/2026-09-21/seals_v4-2026-09-21.bin.gz";
+        let out = upload_file(&store, &markers, &file, key).await;
+        assert!(
+            matches!(out, SegmentOutcome::Uploaded { ref key } if key.starts_with("seal-spill/"))
+        );
+        let m = read_marker(&markers, DAY_FILE).expect("marker"); // APPROVED: test-only
+        assert_eq!(m.key, key);
+        assert_eq!(m.first_frame_seq, None);
+        let meta = std::fs::metadata(&file).expect("stat"); // APPROVED: test-only
+        assert!(CopyGate::Required.allows_delete(&file, &meta));
+    }
+
+    #[tokio::test]
+    async fn test_run_file_pass_uploads_every_spill_folder_and_a_second_pass_does_nothing() {
+        let dir = temp_wal_dir("spillpass");
+        std::fs::create_dir_all(dir.join("replaying")).expect("mkdir"); // APPROVED: test-only
+        std::fs::create_dir_all(dir.join("archive")).expect("mkdir"); // APPROVED: test-only
+        let top = plant(&dir, "seals_v4-2026-09-19.bin", b"a");
+        let staged = plant(&dir.join("replaying"), "seals_v4-2026-09-19.bin.1", b"bb");
+        let archived = plant(&dir.join("archive"), DAY_FILE, b"ccc");
+        let foreign = plant(&dir, "operator-notes.txt", b"not ours");
+        let set = ColdFileSet::seal_spill(&dir);
+        let store = FakeStore::default();
+        let never = |_: &Path| false;
+        let s =
+            run_file_pass_with(&store, &set, usize::MAX, &always, &never, SystemTime::now()).await;
+        assert_eq!((s.uploaded, s.failed, s.backlog_after), (2, 0, 0));
+        // `.bin.1` is not a `.bin` file: the spill prune never deletes it
+        // either, so the pass leaves it alone.
+        for f in [&top, &archived] {
+            let meta = std::fs::metadata(f).expect("stat"); // APPROVED: test-only
+            assert!(CopyGate::Required.allows_delete(f, &meta));
+        }
+        assert!(!dir.join("replaying").join(UPLOADED_SUBDIR).exists());
+        assert!(staged.exists() && foreign.exists());
+        let puts = store.puts.lock().expect("lock").clone(); // APPROVED: test-only
+        assert!(puts.iter().all(|k| k.starts_with("seal-spill/")));
+        let again = run_file_pass(&store, &set, usize::MAX, &always, &never).await;
+        assert_eq!(again.marked() + again.failed, 0);
+        assert_eq!(store.put_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_regression_file_pass_size_mismatch_writes_no_marker() {
+        let dir = temp_wal_dir("fileskew");
+        let file = plant(&dir, DAY_FILE, b"seal records");
+        let store = FakeStore {
+            head_len_skew: 1,
+            ..FakeStore::default()
+        };
+        let set = ColdFileSet::seal_spill(&dir);
+        let never = |_: &Path| false;
+        let s =
+            run_file_pass_with(&store, &set, usize::MAX, &always, &never, SystemTime::now()).await;
+        assert_eq!((s.marked(), s.failed, s.backlog_after), (0, 1, 1));
+        let meta = std::fs::metadata(&file).expect("stat"); // APPROVED: test-only
+        assert!(!CopyGate::Required.allows_delete(&file, &meta));
+        assert!(!dir.join(UPLOADED_SUBDIR).join(DAY_FILE).exists());
+    }
+
+    #[tokio::test]
+    async fn test_run_spill_and_quarantine_passes_skips_today_and_covers_both_quarantines() {
+        let spill = temp_wal_dir("all");
+        let ticks = spill.join("ticks");
+        let depth = spill.join("depth");
+        std::fs::create_dir_all(ticks.join("quarantine")).expect("mkdir"); // APPROVED: test-only
+        std::fs::create_dir_all(depth.join("quarantine")).expect("mkdir"); // APPROVED: test-only
+        let today = plant(&spill, DAY_FILE, b"live writer file");
+        let old = plant(&spill, "seals_v4-2026-09-18.bin", b"old");
+        let tq = plant(&ticks.join("quarantine"), "ticks-a.ndjson", b"t");
+        let dq = plant(&depth.join("quarantine"), "depth-a.ndjson", b"d");
+        // A file still in the tick spill root (not quarantined) is not this
+        // pass's business.
+        let pending_tick = plant(&ticks, "ticks-b.ndjson", b"pending");
+        let store = FakeStore::default();
+        let s = run_spill_and_quarantine_passes(
+            &store,
+            &spill,
+            &ticks,
+            &depth,
+            DAY_FILE,
+            usize::MAX,
+            &always,
+        )
+        .await;
+        assert_eq!((s.uploaded, s.failed), (3, 0));
+        for f in [&old, &tq, &dq] {
+            let meta = std::fs::metadata(f).expect("stat"); // APPROVED: test-only
+            assert!(
+                CopyGate::Required.allows_delete(f, &meta),
+                "{}",
+                f.display()
+            );
+        }
+        for f in [&today, &pending_tick] {
+            let meta = std::fs::metadata(f).expect("stat"); // APPROVED: test-only
+            assert!(
+                !CopyGate::Required.allows_delete(f, &meta),
+                "{}",
+                f.display()
+            );
+        }
+        let puts = store.puts.lock().expect("lock").clone(); // APPROVED: test-only
+        assert!(puts.iter().any(|k| k.starts_with("tick-quarantine/")));
+        assert!(puts.iter().any(|k| k.starts_with("depth-quarantine/")));
     }
 }
