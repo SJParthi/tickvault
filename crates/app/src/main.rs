@@ -1829,7 +1829,38 @@ async fn async_main() -> Result<()> {
     // boot arms) — deliberately NOT the Dhan-lane periodic health loop,
     // which never runs on a Groww-only boot. Prunes once at task start
     // (each daily prod boot reclaims immediately), then every 6 h.
-    tokio::spawn(async {
+    //
+    // Item 45e (2026-10-01, operator Quotes 27 + 28): every closed WAL segment
+    // is copied to `s3://tv-<env>-cold/raw-frames/` and verified, on its own
+    // task, and the prunes below delete only segments with that verified
+    // copy. With no explicit environment (a dev box) no uploader is built and
+    // the prunes delete as they did before.
+    // The bucket is resolved here, synchronously, so the boot never waits on
+    // AWS; the S3 client is built inside the uploader's own task.
+    let raw_upload_running = match tickvault_storage::wal_raw_upload::configured_raw_frames_bucket()
+    {
+        Some(bucket) => {
+            tokio::spawn(async move {
+                tickvault_storage::wal_raw_upload::RawFrameUploader::connect(bucket)
+                    .await
+                    .run_forever(tickvault_app::boot_helpers::ws_wal_dir())
+                    .await;
+            });
+            true
+        }
+        None => {
+            tracing::error!(
+                code =
+                    tickvault_common::error_code::ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
+                source = "raw_frames_uploader_disabled",
+                "raw WAL segment uploader NOT started: no explicit environment \
+                     (TV_ENVIRONMENT / ENVIRONMENT). The WAL prunes delete segments without \
+                     an S3 copy on this box. Expected only on a dev machine."
+            );
+            false
+        }
+    };
+    tokio::spawn(async move {
         use std::time::Duration;
         // Monotonic, so the pressure floor cannot be defeated by a wall-clock
         // jump (NTP step, DST, a container clock correction).
@@ -1841,6 +1872,7 @@ async fn async_main() -> Result<()> {
                 &wal_dir,
                 tickvault_common::constants::WS_WAL_ARCHIVE_RETENTION_SECS,
                 tickvault_common::constants::WS_WAL_ARCHIVE_MAX_BYTES,
+                raw_upload_running,
             );
             // 2026-08-25: the ACTIVE WAL set, bounded for the first time.
             // Only `archive/` was ever pruned, on the assumption that active
@@ -1859,6 +1891,7 @@ async fn async_main() -> Result<()> {
                 &wal_dir,
                 tickvault_common::constants::WS_WAL_ACTIVE_RETENTION_SECS,
                 tickvault_storage::ws_frame_spill::ws_wal_active_max_bytes(&wal_dir),
+                raw_upload_running,
             );
             // 2026-08-19: the SPILL retention sweep, wired for the first
             // time. `SPILL_FILE_MAX_AGE_SECS` was defined, documented and

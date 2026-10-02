@@ -278,6 +278,8 @@ pub mod wal_applied_watermark;
 // Deferred-depth marks (2026-09-29, plan item 45a): frames whose depth rows the
 // ingest shed skipped are kept from the WAL prunes until written back.
 pub mod wal_deferred_depth;
+// Raw WAL segments to S3 before any local delete (2026-10-01, plan item 45e).
+pub mod wal_raw_upload;
 
 // Stage-2 dead-WS sweep (2026-07-17): the `tick_persistence_testing` shim and
 // `spill_dir_test_lock` (both consumed only by the deleted tick benches/DHAT
