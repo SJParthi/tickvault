@@ -2017,9 +2017,27 @@ async fn async_main() -> Result<()> {
             &location,
             &payload,
         );
+        // Z11b (2026-10-02): under `panic = "abort"` (the release profile) the
+        // process dies the moment this hook returns, and every record still
+        // in the WAL spill channel dies with it — each one already reported to
+        // its socket as `Spilled`, and never resent by Dhan. Give the writer a
+        // bounded moment to empty the channel into the page cache, which
+        // survives the abort. Skipped (inside the call) when the writer itself
+        // panicked, and not run at all under unwinding, where the panic may be
+        // caught and the process lives on.
+        let wal_drain = if cfg!(panic = "abort") {
+            Some(
+                tickvault_storage::ws_frame_spill::drain_registered_for_abort(
+                    tickvault_storage::ws_frame_spill::WAL_ABORT_DRAIN_BUDGET,
+                ),
+            )
+        } else {
+            None
+        };
         tracing::error!(
             panic_location = %location,
             panic_payload = %payload,
+            wal_drain = ?wal_drain,
             "PANIC: tickvault crashed"
         );
         default_panic_hook(panic_info);

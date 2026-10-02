@@ -177,3 +177,52 @@ fn the_stop_timeout_is_documented_as_derived_not_guessed() {
         );
     }
 }
+
+/// Z11b (2026-10-02): under `panic = "abort"` the panic hook is the last code
+/// that runs, so it must give the WAL writer its bounded drain BEFORE handing
+/// over to the default hook (after which the process aborts), and after the
+/// synchronous panic line (which must never wait behind anything). The
+/// writer-thread skip lives inside `drain_registered_for_abort`; this pins
+/// that the hook reaches it and in which order.
+#[test]
+fn the_panic_hook_drains_the_wal_before_it_aborts() {
+    let main_rs = strip_comments(&read("crates/app/src/main.rs"));
+    let hook_at = main_rs
+        .find("std::panic::set_hook(")
+        .expect("main.rs installs a panic hook");
+    let hook = &main_rs[hook_at..];
+    let end = hook
+        .find("default_panic_hook(panic_info)")
+        .expect("the hook chains to the default hook");
+    let hook = &hook[..end];
+    let sync_line = hook
+        .find("append_panic_line_sync(")
+        .expect("the hook writes the synchronous panic line");
+    let drain = hook
+        .find("drain_registered_for_abort(")
+        .expect("the hook must drain the WAL spill before the default hook aborts the process");
+    assert!(
+        sync_line < drain,
+        "the synchronous panic line must be written before the WAL drain waits"
+    );
+    assert!(
+        hook.contains("WAL_ABORT_DRAIN_BUDGET"),
+        "the hook's WAL drain must be bounded by WAL_ABORT_DRAIN_BUDGET"
+    );
+
+    let spill_rs = read("crates/storage/src/ws_frame_spill.rs");
+    let body_at = spill_rs
+        .find("pub fn drain_registered_for_abort(")
+        .expect("drain_registered_for_abort exists");
+    let body = &spill_rs[body_at..];
+    let skip = body
+        .find("WAL_WRITER_THREAD_NAME")
+        .expect("the drain must skip the writer thread, which cannot wait for itself");
+    let wait = body
+        .find(".wait(")
+        .expect("the drain waits on the handshake");
+    assert!(
+        skip < wait,
+        "the writer-thread skip must come before any wait"
+    );
+}
