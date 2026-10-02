@@ -5269,10 +5269,11 @@ pub struct DrainCounters {
     /// Depth packets for an instrument dropped less than the grace ago -- the
     /// vendor is still allowed to act on the unsubscribe. Counted, not acted on.
     depth_unsubscribed_grace: metrics::Counter,
-    /// Redials actually ARMED by the ghost detector (after the per-socket cooldown).
-    depth_ghost_redials: metrics::Counter,
-    /// Sockets that hit the per-session ghost-redial ceiling and were told
-    /// to stop redialling (once per socket per session).
+    /// Repeat unsubscribes actually ARMED by the ghost detector (after the
+    /// per-socket cooldown). In place since 2026-10-01: nothing is redialled.
+    depth_ghost_unsubscribes: metrics::Counter,
+    /// Sockets that hit the per-session ghost-resend ceiling and stopped
+    /// re-sending the unsubscribe (once per socket per session).
     depth_ghost_exhausted: metrics::Counter,
     truncated: metrics::Counter,
     /// Main-feed packets whose vendor-stamped `message_length` (header bytes
@@ -5356,7 +5357,7 @@ pub fn counters() -> &'static DrainCounters {
         depth_length_mismatch: metrics::counter!(DEPTH_COUNTER, "outcome" => "length_mismatch"),
         depth_ghost: metrics::counter!(DEPTH_COUNTER, "outcome" => "ghost"),
         depth_unsubscribed_grace: metrics::counter!(DEPTH_COUNTER, "outcome" => "unsubscribed_grace"),
-        depth_ghost_redials: metrics::counter!(DEPTH_COUNTER, "outcome" => "ghost_redial"),
+        depth_ghost_unsubscribes: metrics::counter!(DEPTH_COUNTER, "outcome" => "ghost_unsubscribe"),
         depth_ghost_exhausted: metrics::counter!(DEPTH_COUNTER, "outcome" => "ghost_exhausted"),
         truncated: metrics::counter!(DRAIN_FRAMES_COUNTER, "outcome" => "truncated"),
         main_feed_length_mismatch: metrics::counter!(DRAIN_FRAMES_COUNTER, "outcome" => "length_mismatch"),
@@ -5457,7 +5458,7 @@ fn seed_drain_loss_baselines() {
     // so the ownership guard sees them as drain-owned.
     c.depth_ghost.increment(0);
     c.depth_unsubscribed_grace.increment(0);
-    c.depth_ghost_redials.increment(0);
+    c.depth_ghost_unsubscribes.increment(0);
     c.depth_ghost_exhausted.increment(0);
     // The depth family's LOSS labels, same reason: `refused` and `dropped` are
     // zero on a healthy lane, so their first non-zero sample is the event —
@@ -5560,12 +5561,16 @@ pub const SEALS_RESCUED_COUNTER: &str = "tv_dhan_feed_seals_rescued_total";
 /// * `ghost` — packets for an instrument this process unsubscribed at least
 ///   `GHOST_GRACE_SECS` ago and the vendor is STILL streaming. The signal that
 ///   the unsubscribe RequestCode was ignored; each one asks that socket to
-///   redial (`request_ghost_redial`, cooled down per socket, spaced pool-wide,
-///   and capped per socket per session). Expected 0.
-/// * `ghost_redial` — redials actually ARMED by the detector. Expected 0.
-/// * `ghost_exhausted` — sockets that took the session ceiling of ghost
-///   redials and still deliver the ghost: the vendor is not honouring the
-///   unsubscribe code at all. Once per socket per session. Expected 0.
+///   send the unsubscribe again, in place (`request_ghost_unsubscribe`,
+///   cooled down per socket, spaced pool-wide, and capped per socket per
+///   session). The socket is never closed for it, and the packets are still
+///   stored. Expected 0.
+/// * `ghost_unsubscribe` — repeat unsubscribes actually ARMED by the
+///   detector (2026-10-01; was `ghost_redial`, when the answer was a redial).
+///   Expected 0.
+/// * `ghost_exhausted` — sockets that took the session ceiling of repeat
+///   unsubscribes and still deliver the ghost: the vendor is not honouring the
+///   unsubscribe code for it. Once per socket per session. Expected 0.
 /// * `unsubscribed_grace` — packets for an instrument unsubscribed less than
 ///   the grace ago. Normal for a few seconds after every swap; counted so the
 ///   vendor's unsubscribe latency is measurable, never acted on.
@@ -5573,7 +5578,7 @@ pub const DEPTH_COUNTER: &str = "tv_dhan_feed_depth_total";
 
 /// Nanoseconds per second, as the `i64` the receipt clock is carried in.
 /// Used to turn `received_at_nanos` into the epoch-seconds the ghost detector
-/// and its redial register agree on.
+/// and its unsubscribe register agree on.
 const NANOS_PER_SEC_I64: i64 = 1_000_000_000;
 
 /// Counter: ILP flushes to QuestDB, by outcome.
@@ -7607,50 +7612,55 @@ async fn run_frame_drain(
                                     );
                                 }
                                 depth_refused = depth_refused.saturating_add(outcome.refused);
-                                // A ghost asks its socket to redial. The
-                                // register is cooled down per socket (180 s)
-                                // and taken by the connection task on its
-                                // next idle tick, so this is at most one
-                                // relaxed load and two stores per frame, and
-                                // the `error!` fires at most once per cooldown
-                                // per socket -- inherently throttled, no
-                                // power-of-two ladder needed.
+                                // A ghost asks its socket to send the
+                                // unsubscribe AGAIN, in place (scope lock
+                                // 2026-10-01; until then it asked for a
+                                // redial, which blanked every other contract
+                                // on the socket for the dial). The register is
+                                // cooled down per socket (180 s) and taken by
+                                // the connection task on its next idle tick,
+                                // so this is a few relaxed loads and stores per
+                                // frame, and the `error!` fires at most once
+                                // per cooldown per socket -- inherently
+                                // throttled, no power-of-two ladder needed.
+                                // The ghost's packets are stored either way:
+                                // nothing on this path drops a frame.
                                 //
-                                // After an 805 no ghost redial is ASKED for
-                                // (audit PR21): the connection task would
-                                // refuse it anyway, and asking first spent the
-                                // per-socket ceiling and logged a redial that
-                                // never happened. The ghost itself is still
-                                // counted above; one relaxed load, no store.
+                                // After an 805 no resend is ASKED for (audit
+                                // PR21): "too many requests" is the vendor's
+                                // word, and a resend is a request. The ghost
+                                // itself is still counted above; one relaxed
+                                // load, no store.
                                 if outcome.ghost > 0
                                     && !tickvault_core::websocket::pool_supervisor::rotation_halted()
                                 {
                                     use tickvault_core::websocket::pool_supervisor::{
-                                        GHOST_REDIAL_SESSION_CEILING, GhostRedialRefusal,
-                                        ghost_ceiling_first_hit, ghost_redials_taken,
-                                        request_ghost_redial,
+                                        GHOST_RESEND_SESSION_CEILING, GhostResendRefusal,
+                                        ghost_ceiling_first_hit, ghost_resends_taken,
+                                        request_ghost_unsubscribe,
                                     };
-                                    match request_ghost_redial(
+                                    // The two sentinels are unreachable by
+                                    // construction (the Ghost arm always records
+                                    // the id and segment before `outcome.ghost`
+                                    // can exceed zero) and are spelled out rather
+                                    // than unwrapped: a 0 security_id and an
+                                    // "UNKNOWN" segment are both values this
+                                    // codebase already reads as "absent", and an
+                                    // unknown segment byte is REFUSED by the
+                                    // register, so a future refactor that breaks
+                                    // the invariant sends nothing rather than a
+                                    // wrong instrument.
+                                    let (ghost_security_id, ghost_segment) = outcome
+                                        .ghost_instrument
+                                        .unwrap_or((0_u64, DEPTH_SEGMENT_UNKNOWN));
+                                    match request_ghost_unsubscribe(
                                         frame.connection_index,
+                                        ghost_security_id,
+                                        outcome.ghost_segment_code.unwrap_or(u8::MAX),
                                         received_at_nanos / NANOS_PER_SEC_I64,
                                     ) {
                                         Ok(()) => {
-                                            c.depth_ghost_redials.increment(1);
-                                            // The two sentinels are unreachable
-                                            // by construction (the Ghost arm
-                                            // always records the id before
-                                            // `outcome.ghost` can exceed zero)
-                                            // and are spelled out rather than
-                                            // unwrapped: a 0 security_id and an
-                                            // "UNKNOWN" segment are both values
-                                            // this codebase already reads as
-                                            // "absent", so a future refactor
-                                            // that breaks the invariant reports
-                                            // the break instead of panicking on
-                                            // the drain.
-                                            let (ghost_security_id, ghost_segment) = outcome
-                                                .ghost_instrument
-                                                .unwrap_or((0_u64, DEPTH_SEGMENT_UNKNOWN));
+                                            c.depth_ghost_unsubscribes.increment(1);
                                             error!(
                                                 code = ErrorCode::WsGapSubscriptionBatching.code_str(),
                                                 source = "unsubscribe_ignored",
@@ -7660,11 +7670,12 @@ async fn run_frame_drain(
                                                 segment = ghost_segment,
                                                 ghost_packets = outcome.ghost,
                                                 ghost_instrument_shared = outcome.ghost_instrument_shared,
-                                                redials_taken = ghost_redials_taken(frame.connection_index),
+                                                resends_taken = ghost_resends_taken(frame.connection_index),
                                                 "a depth socket is still delivering an instrument it was told to \
                                                  unsubscribe more than the grace ago -- the unsubscribe was ignored \
-                                                 or lost, so the socket is asked to redial and replay its current \
-                                                 set. `security_id` is the FIRST ghost in this frame; \
+                                                 or lost, so it is sent again on the live socket (no redial; every \
+                                                 other contract keeps streaming, and the ghost's packets are still \
+                                                 stored). `security_id` is the FIRST ghost in this frame; \
                                                  `ghost_packets` counts EVERY ghost packet in it, so the two are \
                                                  the same instrument only when `ghost_instrument_shared` is false \
                                                  (log-sink only; counted under `ghost` on the depth counter)"
@@ -7673,43 +7684,41 @@ async fn run_frame_drain(
                                         // Said ONCE per socket per session: after the
                                         // ceiling the ghost keeps being counted on every
                                         // frame, and a line per frame would be the flood.
-                                        Err(GhostRedialRefusal::SessionCeiling)
+                                        Err(GhostResendRefusal::SessionCeiling)
                                             if ghost_ceiling_first_hit(frame.connection_index) =>
                                         {
                                             c.depth_ghost_exhausted.increment(1);
                                             // The id is in hand here too, and this is
                                             // the arm that most needs it: MEASURED
-                                            // 2026-09-11, every socket reached the
-                                            // ceiling by 10:22 IST and 78.5% of the
-                                            // session's 5,345,436 ghost packets arrived
-                                            // AFTER that. Logging the instrument only on
-                                            // the redial arm names four fifths of the
+                                            // 2026-09-11 (when the answer was still a
+                                            // redial), every socket reached the ceiling
+                                            // by 10:22 IST and 78.5% of the session's
+                                            // 5,345,436 ghost packets arrived AFTER
+                                            // that. Logging the instrument only on the
+                                            // first arm names four fifths of the
                                             // evidence not at all.
-                                            let (ghost_security_id, ghost_segment) = outcome
-                                                .ghost_instrument
-                                                .unwrap_or((0_u64, DEPTH_SEGMENT_UNKNOWN));
                                             error!(
                                                 code = ErrorCode::WsGapSubscriptionBatching.code_str(),
-                                                source = "ghost_redial_exhausted",
+                                                source = "ghost_resend_exhausted",
                                                 connection_index = frame.connection_index,
                                                 endpoint = frame.endpoint.as_str(),
                                                 security_id = ghost_security_id,
                                                 segment = ghost_segment,
                                                 ghost_packets = outcome.ghost,
                                                 ghost_instrument_shared = outcome.ghost_instrument_shared,
-                                                ceiling = GHOST_REDIAL_SESSION_CEILING,
-                                                "a depth socket has been redialled the session ceiling of times \
-                                                 for a ghost instrument and STILL delivers it -- the unsubscribe \
-                                                 RequestCode is not honoured by the vendor. No further redials \
-                                                 this session; the socket keeps its working set and the ghost \
-                                                 keeps being counted (log-sink only; `ghost_exhausted` on the \
-                                                 depth counter). This is the read-out the scope lock names for \
-                                                 a wrong unsubscribe code."
+                                                ceiling = GHOST_RESEND_SESSION_CEILING,
+                                                "a depth socket has had its unsubscribe re-sent the session \
+                                                 ceiling of times for a ghost instrument and STILL delivers it \
+                                                 -- the vendor is not honouring the unsubscribe for it. No \
+                                                 further resends this session; the socket is NOT closed, keeps \
+                                                 its working set, and the ghost's packets keep being stored and \
+                                                 counted (log-sink only; `ghost_exhausted` on the depth counter)."
                                             );
                                         }
                                         // Cooling down, pool-spaced, already at the
-                                        // ceiling, or out of range: the ghost is already
-                                        // counted; nothing more to say per frame.
+                                        // ceiling, unknown segment or out of range: the
+                                        // ghost is already counted; nothing more to say
+                                        // per frame.
                                         Err(_) => {}
                                     }
                                 }
@@ -9202,6 +9211,12 @@ pub struct DepthFrameOutcome {
     /// that widening removed — the same reasoning `SubscribeInstrument`
     /// records at its own `security_id`.
     pub ghost_instrument: Option<(u64, &'static str)>,
+    /// The wire byte of [`Self::ghost_instrument`]'s segment, set with it.
+    ///
+    /// The label above is for joining log lines to stored rows; this is what
+    /// the repeat unsubscribe needs to name the instrument on the wire
+    /// (scope lock 2026-10-01). `None` exactly when `ghost_instrument` is.
+    pub ghost_segment_code: Option<u8>,
     /// True when a SECOND, DIFFERENT instrument also ghosted in this frame.
     ///
     /// Without it, `security_id` beside `ghost_packets` reads as "this
@@ -9949,7 +9964,10 @@ fn drain_depth_frame(
                     // the code is unknown: the same value `market_depth.segment`
                     // is written from, so the log line and the stored rows join.
                     match out.ghost_instrument {
-                        None => out.ghost_instrument = Some((header.security_id, segment)),
+                        None => {
+                            out.ghost_instrument = Some((header.security_id, segment));
+                            out.ghost_segment_code = Some(header.exchange_segment_code);
+                        }
                         Some((first_id, _)) if first_id != header.security_id => {
                             out.ghost_instrument_shared = true;
                         }
@@ -18153,11 +18171,6 @@ mod tests {
                         operator-armed probe on a depth-200 socket, never to a top-up"
                 )
             }
-            LiveSubscriptionCommand::RotateByRedial { .. } => {
-                panic!(
-                    "a top-up sent a RotateByRedial — rotation belongs to the depth-200 steering loop, never to a top-up"
-                )
-            }
         }
     }
 
@@ -18183,11 +18196,6 @@ mod tests {
                 panic!(
                     "a top-up sent a ProbeUnsubscribe — that command belongs to the\
                         operator-armed probe on a depth-200 socket, never to a top-up"
-                )
-            }
-            LiveSubscriptionCommand::RotateByRedial { .. } => {
-                panic!(
-                    "a top-up sent a RotateByRedial — rotation belongs to the depth-200 steering loop, never to a top-up"
                 )
             }
         }
@@ -23766,12 +23774,11 @@ mod tests {
              bypass the 805 gate in dial_planned_connections; route it through that function"
         );
 
-        // 4. The drain asks for no ghost redial after an 805: asking first
-        //    spent the per-socket ceiling and logged a redial that the
-        //    connection task then refused.
+        // 4. The drain asks for no ghost resend after an 805: "too many
+        //    requests" is the vendor's word, and a resend is a request.
         let ghost = production
-            .find("request_ghost_redial(\n")
-            .expect("the drain must still request ghost redials");
+            .find("request_ghost_unsubscribe(\n")
+            .expect("the drain must still request ghost unsubscribes");
         let guard = production[..ghost]
             .rfind("if outcome.ghost > 0")
             .expect("the ghost request sits under its own guard");

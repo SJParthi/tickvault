@@ -669,15 +669,14 @@ pub const SWAP_GUARD_REVERTED_METRIC: &str = "tv_dhan_ws_swap_guard_reverted_tot
 /// later is a config-free change; the counter exists now so the number is
 /// there when someone has a lever to spend.
 pub const PROBE_UNSUBSCRIBE_METRIC: &str = "tv_dhan_ws_probe_unsubscribe_total";
-/// Counter: outcomes of a depth-200 rotate-by-reconnect
-/// ([`LiveSubscriptionCommand::RotateByRedial`]). Label: `outcome`
-/// (`rotated` | `no_op` | `not_live` | `guard_refused` | `not_exactly_old` |
-/// `rotation_halted`).
+/// Counter: outcomes of a ghost contract's repeat unsubscribe
+/// ([`request_ghost_unsubscribe`], scope lock 2026-10-01). Label: `outcome`
+/// (`sent` | `wire_failed` | `timed_out` | `held_again` | `halted_805`).
 ///
-/// In-process only — not EMF-selected, not alarmed (the same budget position
-/// as [`PROBE_UNSUBSCRIBE_METRIC`]). The coded `warn!` on every refusal arm is
-/// the operator surface.
-pub const ROTATE_BY_REDIAL_METRIC: &str = "tv_dhan_ws_rotate_by_redial_total";
+/// In-process only — not EMF-selected, not alarmed: the drain's
+/// `tv_dhan_feed_depth_total{outcome="ghost"}` family is the operator surface,
+/// and this says only what became of each repeat request.
+pub const GHOST_UNSUBSCRIBE_METRIC: &str = "tv_dhan_ws_ghost_unsubscribe_total";
 
 // ---------------------------------------------------------------------------
 // Disconnect classification (WS-GAP-01)
@@ -842,21 +841,11 @@ pub enum ConnEvent {
     /// no data frame for [`FRAME_SILENCE_REDIAL_SECS`] inside the gate
     /// ([`FrameSilenceGate`]). Only meaningful in [`ConnPhase::Live`].
     FrameSilenceElapsed,
-    /// The frame drain saw this socket deliver an instrument that was
-    /// UNSUBSCRIBED more than [`GHOST_GRACE_SECS`] ago — the vendor ignored
-    /// (or never received) the unsubscribe. See [`request_ghost_redial`].
-    /// Only meaningful in [`ConnPhase::Live`].
-    GhostInstrumentDetected,
     /// The operator-armed unsubscribe probe asked this socket to close and
     /// re-dial so the replay can be observed WITHOUT the probed instrument
     /// ([`request_probe_close`]). Live sockets only; at most once per socket
     /// per process. Scope lock 2026-09-12, Arm B.
     ProbeCloseRequested,
-    /// The depth-200 steering loop rotated this socket's single contract by
-    /// swapping the guard and asking for a close-and-redial
-    /// ([`LiveSubscriptionCommand::RotateByRedial`]). Live sockets only.
-    /// Scope lock 2026-09-24.
-    RotationRequested,
     /// The main-feed overflow probe (plan item D7) released this socket from
     /// its 805 park. Accepted ONLY from `Parked(PoolOverflow)` on a MAIN-FEED
     /// slot; every other phase, park reason and endpoint ignores it, so depth
@@ -871,7 +860,7 @@ pub enum ConnEvent {
 }
 
 // ---------------------------------------------------------------------------
-// Ghost-instrument redial register (2026-09-08)
+// Ghost-instrument unsubscribe register (2026-09-08; in place since 2026-10-01)
 // ---------------------------------------------------------------------------
 
 /// How long after an instrument leaves every depth pool its frames are still
@@ -885,128 +874,176 @@ pub enum ConnEvent {
 /// with margin; a frame past it is a request Dhan did not honour.
 pub const GHOST_GRACE_SECS: i64 = 90;
 
-/// Minimum spacing between two ghost-triggered redials of ONE socket.
+/// Minimum spacing between two ghost unsubscribes re-sent on ONE socket.
 ///
-/// A redial replays the guard's set, which should clear the ghost; frames
-/// already queued in the ring from before the redial can still be classified
-/// afterwards, and must not trigger a second redial on their own. Three
-/// minutes is longer than any ring backlog and shorter than the ladder's
-/// park threshold, so a socket whose ghost genuinely persists still climbs
-/// the normal backoff rather than being redialled every second.
-pub const GHOST_REDIAL_COOLDOWN_SECS: i64 = 180;
+/// Frames already queued in the ring from before the resend can still be
+/// classified afterwards, and must not trigger a second resend on their own.
+/// Three minutes is longer than any ring backlog, so a contract whose stream
+/// genuinely persists is asked again at most every three minutes.
+pub const GHOST_RESEND_COOLDOWN_SECS: i64 = 180;
 
 /// One register slot per connection index the pool can ever assign.
 ///
 /// The main feed, depth-20 and depth-200 pools each own five indices and the
 /// order-update socket one; 32 leaves room for a future endpoint without a
 /// silent out-of-range drop (an index past the array is refused, and counted
-/// by the caller as such).
+/// by the caller as such). The probe and dial-generation registers share this
+/// width.
 pub const GHOST_REDIAL_SLOTS: usize = 32;
 
-/// Minimum spacing between two ghost-triggered redials ANYWHERE in the pool.
+/// Minimum spacing between two ghost unsubscribes re-sent ANYWHERE in the pool.
 ///
-/// The per-socket cooldown bounds one socket; it does not bound the pool. If
-/// every depth socket delivers a ghost in the same minute (an unsubscribe
-/// code Dhan ignores does exactly that, on every socket at once), sixteen
-/// per-socket registers arm in the same second and sixteen redials go out
-/// together — the shape Dhan answers with 805 ("too many requests") and this
-/// pool answers with a park. Twenty seconds spaces them to at most three a
-/// minute pool-wide; with the 180 s per-socket cooldown, sixteen ghosting
-/// sockets are all rebuilt inside ~5½ minutes instead of all at once. Found
-/// by the 2026-09-08 hostile sweep.
-pub const GHOST_REDIAL_POOL_SPACING_SECS: i64 = 20;
+/// An unsubscribe frame opens no connection, so this no longer guards against
+/// 805 the way it did when the remedy was a redial. It is kept because an
+/// unsubscribe code Dhan ignores makes every depth socket ghost in the same
+/// minute, and twenty seconds keeps that to at most three request frames a
+/// minute pool-wide instead of a burst of sixteen.
+pub const GHOST_RESEND_POOL_SPACING_SECS: i64 = 20;
 
-/// Ghost redials ONE socket may take in a session before the register
+/// Ghost unsubscribes ONE socket may re-send in a session before the register
 /// refuses to arm it again.
 ///
-/// A redial replays the guard's current set and clears a ghost that Dhan
-/// merely lost; a ghost that survives EVERY redial is an unsubscribe code Dhan
-/// does not honour at all, and redialling that socket every three minutes
-/// until the box stops is churn that repairs nothing and risks 805. Eight is
-/// 24 minutes of honest retrying; past it the socket keeps its (working) set
-/// and the ghost keeps being counted, which is the read-out the scope lock
-/// names for a wrong code. Found by the 2026-09-08 hostile sweep, which
-/// measured the previous behaviour as an unbounded, unpaged loop.
-pub const GHOST_REDIAL_SESSION_CEILING: u32 = 8;
+/// A resend clears a ghost whose first unsubscribe Dhan merely lost; a ghost
+/// that survives every resend is an unsubscribe Dhan does not act on, and
+/// asking again every three minutes until the box stops repairs nothing. Eight
+/// is 24 minutes of honest retrying; past it the socket keeps its set, the
+/// ghost's packets keep being stored and counted, and the ceiling is reported
+/// once.
+pub const GHOST_RESEND_SESSION_CEILING: u32 = 8;
 
-/// `true` while a ghost redial is armed for that slot and not yet taken.
+/// `true` while a ghost unsubscribe is armed for that slot and not yet taken.
 static GHOST_PENDING: [std::sync::atomic::AtomicBool; GHOST_REDIAL_SLOTS] =
     [const { std::sync::atomic::AtomicBool::new(false) }; GHOST_REDIAL_SLOTS];
+
+/// The ghost's `security_id`, valid while [`GHOST_PENDING`] is set.
+static GHOST_SECURITY_ID: [std::sync::atomic::AtomicU64; GHOST_REDIAL_SLOTS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; GHOST_REDIAL_SLOTS];
+
+/// The ghost's binary exchange-segment code, valid while [`GHOST_PENDING`] is
+/// set. Carried with the id because `security_id` alone is not unique
+/// (I-P1-11).
+static GHOST_SEGMENT_CODE: [std::sync::atomic::AtomicU8; GHOST_REDIAL_SLOTS] =
+    [const { std::sync::atomic::AtomicU8::new(u8::MAX) }; GHOST_REDIAL_SLOTS];
 
 /// Epoch seconds of the last ARMED request per slot, for the cooldown.
 static GHOST_LAST_ARMED: [std::sync::atomic::AtomicI64; GHOST_REDIAL_SLOTS] =
     [const { std::sync::atomic::AtomicI64::new(0) }; GHOST_REDIAL_SLOTS];
 
-/// Ghost redials ARMED per slot this process lifetime, for the ceiling.
+/// Ghost unsubscribes ARMED per slot this process lifetime, for the ceiling.
 static GHOST_ARMED_COUNT: [std::sync::atomic::AtomicU32; GHOST_REDIAL_SLOTS] =
     [const { std::sync::atomic::AtomicU32::new(0) }; GHOST_REDIAL_SLOTS];
 
-/// Epoch seconds of the last ghost redial ARMED on ANY slot, for the
+/// Epoch seconds of the last ghost unsubscribe ARMED on ANY slot, for the
 /// pool-wide spacing.
 static GHOST_POOL_LAST_ARMED: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
-/// Why a ghost-redial request was not armed.
+/// Why a ghost-unsubscribe request was not armed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GhostRedialRefusal {
+pub enum GhostResendRefusal {
     /// The index is past the register (never a panic — counted by the caller).
     OutOfRange,
-    /// This socket was redialled less than [`GHOST_REDIAL_COOLDOWN_SECS`] ago.
+    /// The segment code names no known segment, so no frame could carry it.
+    UnknownSegment,
+    /// This socket re-sent less than [`GHOST_RESEND_COOLDOWN_SECS`] ago.
     CoolingDown,
-    /// Another socket was redialled less than
-    /// [`GHOST_REDIAL_POOL_SPACING_SECS`] ago.
+    /// Another socket re-sent less than [`GHOST_RESEND_POOL_SPACING_SECS`] ago.
     PoolSpacing,
-    /// This socket has taken [`GHOST_REDIAL_SESSION_CEILING`] redials already;
+    /// This socket has re-sent [`GHOST_RESEND_SESSION_CEILING`] times already;
     /// the caller should say so ONCE and stop asking.
     SessionCeiling,
+    /// This socket still has an earlier request it has not taken. The pending
+    /// instrument is never overwritten: the take reads the id and segment
+    /// after it clears the flag, so a write while the flag is set could hand it
+    /// the new id with the old segment (a different instrument, I-P1-11).
+    StillPending,
 }
 
-/// Asks the connection at `connection_index` to redial because it delivered a
-/// ghost instrument. `Ok(())` if the request was ARMED; otherwise the reason
-/// it was refused.
+/// Asks the connection at `connection_index` to send the unsubscribe AGAIN for
+/// the ghost `(security_id, segment_code)` it is still delivering. `Ok(())` if
+/// the request was ARMED; otherwise the reason it was refused.
+///
+/// Until 2026-10-01 the remedy was to close the socket and redial it. The
+/// operator ruled that out ("isntead of disconenct reocnenct follow the
+/// unsubscribe and siubscribe apporach"), and Dhan confirmed on 2026-09-30 that
+/// RequestCode 25 with the subscribe's instrument details stops one
+/// instrument. A resend keeps every other contract on the socket streaming,
+/// where a redial blanked them all for the dial.
 ///
 /// Called from the frame drain, so it is a handful of relaxed loads and at
-/// most four atomic stores — no allocation, no lock, O(1). The connection
-/// task picks the request up on its next one-second idle tick
-/// ([`take_ghost_redial`]). The two-load-then-store shape is deliberately not
+/// most six atomic stores — no allocation, no lock, O(1). The connection task
+/// picks the request up on its next one-second idle tick
+/// ([`take_ghost_unsubscribe`]). The load-then-store shape is deliberately not
 /// a CAS: the only concurrent caller is the drain itself, one frame at a time,
 /// so a lost race is impossible and a CAS would buy nothing.
-pub fn request_ghost_redial(
+pub fn request_ghost_unsubscribe(
     connection_index: u8,
+    security_id: SecurityId,
+    segment_code: u8,
     now_epoch_secs: i64,
-) -> Result<(), GhostRedialRefusal> {
+) -> Result<(), GhostResendRefusal> {
     let idx = usize::from(connection_index);
-    let (Some(last), Some(pending), Some(count)) = (
+    let (Some(last), Some(pending), Some(count), Some(id_slot), Some(segment_slot)) = (
         GHOST_LAST_ARMED.get(idx),
         GHOST_PENDING.get(idx),
         GHOST_ARMED_COUNT.get(idx),
+        GHOST_SECURITY_ID.get(idx),
+        GHOST_SEGMENT_CODE.get(idx),
     ) else {
-        return Err(GhostRedialRefusal::OutOfRange);
+        return Err(GhostResendRefusal::OutOfRange);
     };
-    if count.load(std::sync::atomic::Ordering::Relaxed) >= GHOST_REDIAL_SESSION_CEILING {
-        return Err(GhostRedialRefusal::SessionCeiling);
+    if ExchangeSegment::from_byte(segment_code).is_none() {
+        return Err(GhostResendRefusal::UnknownSegment);
+    }
+    // Acquire pairs with the Release store in `take_ghost_unsubscribe`, which
+    // clears the flag only after it has read the slot. Once this reads
+    // `false` nothing is reading the slot, and nothing else writes it (the
+    // drain is the only caller), so the stores below can never tear a read.
+    if pending.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(GhostResendRefusal::StillPending);
+    }
+    if count.load(std::sync::atomic::Ordering::Relaxed) >= GHOST_RESEND_SESSION_CEILING {
+        return Err(GhostResendRefusal::SessionCeiling);
     }
     let previous = last.load(std::sync::atomic::Ordering::Relaxed);
-    if now_epoch_secs.saturating_sub(previous) < GHOST_REDIAL_COOLDOWN_SECS {
-        return Err(GhostRedialRefusal::CoolingDown);
+    if now_epoch_secs.saturating_sub(previous) < GHOST_RESEND_COOLDOWN_SECS {
+        return Err(GhostResendRefusal::CoolingDown);
     }
     let pool_previous = GHOST_POOL_LAST_ARMED.load(std::sync::atomic::Ordering::Relaxed);
-    if now_epoch_secs.saturating_sub(pool_previous) < GHOST_REDIAL_POOL_SPACING_SECS {
-        return Err(GhostRedialRefusal::PoolSpacing);
+    if now_epoch_secs.saturating_sub(pool_previous) < GHOST_RESEND_POOL_SPACING_SECS {
+        return Err(GhostResendRefusal::PoolSpacing);
     }
     last.store(now_epoch_secs, std::sync::atomic::Ordering::Relaxed);
     GHOST_POOL_LAST_ARMED.store(now_epoch_secs, std::sync::atomic::Ordering::Relaxed);
     count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    id_slot.store(security_id, std::sync::atomic::Ordering::Relaxed);
+    segment_slot.store(segment_code, std::sync::atomic::Ordering::Relaxed);
+    // Release: the id and segment stored above are visible to whoever
+    // observes `pending` with Acquire in `take_ghost_unsubscribe`.
     pending.store(true, std::sync::atomic::Ordering::Release);
     Ok(())
 }
 
-/// Ghost redials this slot has taken this process lifetime. `0` for an
+/// Ghost unsubscribes this slot has re-sent this process lifetime. `0` for an
 /// out-of-range index.
 #[must_use]
-pub fn ghost_redials_taken(connection_index: u8) -> u32 {
+pub fn ghost_resends_taken(connection_index: u8) -> u32 {
     GHOST_ARMED_COUNT
         .get(usize::from(connection_index))
         .map_or(0, |c| c.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Gives one request back to `connection_index`'s session ceiling, for a
+/// request that turned out not to be a ghost (the socket holds the contract
+/// again). Saturates at zero; an out-of-range index is a no-op. O(1), called
+/// from the connection task, never per tick.
+fn refund_ghost_resend(connection_index: u8) {
+    if let Some(count) = GHOST_ARMED_COUNT.get(usize::from(connection_index)) {
+        let _previous = count.fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |n| n.checked_sub(1),
+        );
+    }
 }
 
 /// Whether a slot's ceiling has already been reported, per slot.
@@ -1015,21 +1052,51 @@ static GHOST_CEILING_REPORTED: [std::sync::atomic::AtomicBool; GHOST_REDIAL_SLOT
 
 /// `true` the FIRST time it is asked per slot per process lifetime; `false`
 /// thereafter and for an out-of-range index. The drain uses it to report a
-/// socket reaching [`GHOST_REDIAL_SESSION_CEILING`] exactly once rather than
+/// socket reaching [`GHOST_RESEND_SESSION_CEILING`] exactly once rather than
 /// on every ghost frame after it.
 #[must_use]
 pub fn ghost_ceiling_first_hit(connection_index: u8) -> bool {
     GHOST_CEILING_REPORTED
         .get(usize::from(connection_index))
-        .is_some_and(|r| !r.swap(true, std::sync::atomic::Ordering::AcqRel))
+        // A relaxed load first: past the ceiling every ghost frame asks, and a
+        // read is cheaper than a read-modify-write on the drain.
+        .is_some_and(|r| {
+            !r.load(std::sync::atomic::Ordering::Relaxed)
+                && !r.swap(true, std::sync::atomic::Ordering::AcqRel)
+        })
 }
 
-/// Takes (and clears) a pending ghost redial for `connection_index`.
+/// Takes (and clears) a pending ghost unsubscribe for `connection_index`,
+/// returning the instrument to unsubscribe again. `None` when nothing is
+/// pending, for an out-of-range index, or (unreachable through
+/// [`request_ghost_unsubscribe`], which refuses it) an unknown segment code.
 #[must_use]
-pub fn take_ghost_redial(connection_index: u8) -> bool {
-    GHOST_PENDING
-        .get(usize::from(connection_index))
-        .is_some_and(|p| p.swap(false, std::sync::atomic::Ordering::AcqRel))
+pub fn take_ghost_unsubscribe(connection_index: u8) -> Option<SubscribeInstrument> {
+    let idx = usize::from(connection_index);
+    let (Some(pending), Some(id_slot), Some(segment_slot)) = (
+        GHOST_PENDING.get(idx),
+        GHOST_SECURITY_ID.get(idx),
+        GHOST_SEGMENT_CODE.get(idx),
+    ) else {
+        return None;
+    };
+    // Acquire pairs with the Release that published the request, so the id
+    // and segment read below are the ones stored with it.
+    if !pending.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    // Read BOTH before clearing the flag. `request_ghost_unsubscribe` writes
+    // the slot only after it sees the flag clear (Acquire), and this Release
+    // store is what it sees, so the pair can never tear. The connection task
+    // is the only taker per slot, so load-then-store loses no request.
+    let security_id = id_slot.load(std::sync::atomic::Ordering::Relaxed);
+    let segment_code = segment_slot.load(std::sync::atomic::Ordering::Relaxed);
+    pending.store(false, std::sync::atomic::Ordering::Release);
+    let segment = ExchangeSegment::from_byte(segment_code)?;
+    Some(SubscribeInstrument {
+        security_id,
+        segment,
+    })
 }
 
 /// The rotate-by-reconnect circuit breaker (2026-09-24 scope lock).
@@ -1051,7 +1118,12 @@ pub fn rotation_halted() -> bool {
 
 /// Counter of voluntary depth dials refused because an 805 has halted them
 /// for the process (audit PR21). Labelled by the path that asked, a fixed set:
-/// `ghost_redial`, `probe_close`, `attach`, `spawn`.
+/// `probe_close`, `attach`, `spawn`, and since 2026-10-01 the two in-place
+/// changes the breaker also stops at the connection: `swap` (a depth-200
+/// contract change) and `ghost_unsubscribe` (a repeat unsubscribe). The name
+/// predates those two; the counter is kept so its existing readers keep
+/// working. (`ghost_redial` retired 2026-10-01: a ghost is answered by a
+/// repeat unsubscribe on the live socket, never a redial.)
 pub const DIAL_REFUSED_AFTER_805_METRIC: &str = "tv_depth_dial_refused_after_805_total";
 
 /// Records one voluntary redial refused by the 805 breaker: a counter and a
@@ -1085,7 +1157,7 @@ pub fn refuse_voluntary_redial_after_805(slot: ConnectionSlot, path: &'static st
 // What this does NOT touch, by design and by the 2026-09-24 / 2026-09-26 REJECT
 // lists of the WebSocket scope lock: `ROTATION_HALTED` is never cleared, depth
 // sockets stay parked (depth recovery needs an owner decision), and depth
-// rotation, depth dials and `RotateByRedial` stay refused exactly as before.
+// rotation (an in-place swap since 2026-10-01) and depth dials stay refused.
 // Only MAIN-FEED slots parked for 805 can be released, and only through
 // `ConnEvent::OverflowProbeGranted`, which the supervisor accepts from
 // `Parked(PoolOverflow)` on the main feed and from nothing else.
@@ -1917,25 +1989,19 @@ pub enum ReconnectReason {
     TokenStale,
     /// The watchdog fired.
     IdleSilence,
-    /// The socket delivered an instrument it was told to drop
-    /// ([`ConnEvent::GhostInstrumentDetected`]); the redial replays the
-    /// guard's set so the vendor's view matches ours again.
-    GhostInstrument,
     /// The operator-armed unsubscribe probe asked for this socket to be closed
     /// and re-dialed so the replay can be observed WITHOUT the probed
     /// instrument (scope lock, 2026-09-12, Arm B).
     ///
-    /// Together with [`Self::RankedRotation`] it is one of the TWO reasons
-    /// that are not a fault, and the only two
+    /// The one reason that is not a fault, and the only one
     /// [`ReconnectReason::records_flap`] answers `false` for. See that method
     /// for why that exemption exists and why it is deliberately narrow.
+    ///
+    /// Two other deliberate redials existed until 2026-10-01: the depth-200
+    /// ranked rotation and the ghost-instrument redial. Both now act in place
+    /// with an unsubscribe frame (scope lock 2026-10-01), so neither closes a
+    /// socket and neither needs a reason here.
     ProbeClose,
-    /// The depth-200 steering loop rotated this one-instrument socket onto a
-    /// new contract by closing it and redialling
-    /// ([`LiveSubscriptionCommand::RotateByRedial`]). The guard already names
-    /// the new contract, so the replay subscribes it and never sends the old
-    /// one. Scope lock 2026-09-24. Not a fault, so it records no flap.
-    RankedRotation,
     /// A main-feed socket parked for 805 was released by the overflow probe
     /// (plan item D7): the test dial, or one of the releases after a pass.
     /// It DOES record a flap — a redial into an account that answered 805 is
@@ -1946,15 +2012,13 @@ pub enum ReconnectReason {
 
 impl ReconnectReason {
     /// Every reason, for pre-registration and the label-uniqueness pin.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 7] = [
         Self::DialFailed,
         Self::SubscribeFailed,
         Self::Disconnected,
         Self::TokenStale,
         Self::IdleSilence,
-        Self::GhostInstrument,
         Self::ProbeClose,
-        Self::RankedRotation,
         Self::OverflowProbe,
     ];
 
@@ -1967,9 +2031,7 @@ impl ReconnectReason {
             Self::Disconnected => "disconnected",
             Self::TokenStale => "token_stale",
             Self::IdleSilence => "idle_silence",
-            Self::GhostInstrument => "ghost_instrument",
             Self::ProbeClose => "probe_close",
-            Self::RankedRotation => "ranked_rotation",
             Self::OverflowProbe => "overflow_probe",
         }
     }
@@ -1983,7 +2045,7 @@ impl ReconnectReason {
     /// unconditionally — correct, because until then every redial was a
     /// FAULT, and the damper exists to slow a socket that keeps faulting.
     ///
-    /// [`Self::ProbeClose`] is the first redial that is not a fault: the
+    /// [`Self::ProbeClose`] is the one redial that is not a fault: the
     /// operator armed it, it happens once per session, and it is the
     /// measurement rather than a symptom. Recording it would spend one of the
     /// six slots in [`crate::websocket::reconnect_ladder::FLAP_WINDOW_MS`] on
@@ -1998,18 +2060,9 @@ impl ReconnectReason {
     /// attempt counter advances, the phase drops to backoff, health is
     /// reset, and the reconnect counter increments under `probe_close`, so
     /// the redial is never invisible.
-    ///
-    /// # 2026-09-24 — the second exemption
-    ///
-    /// [`Self::RankedRotation`] is the steering loop moving a depth-200 socket
-    /// onto a new contract (scope lock 2026-09-24). It is requested, capped at
-    /// one per socket per minute and five per minute pool-wide, and it is not
-    /// a symptom. Recording it would let the steering loop fill the flap
-    /// window on its own and damp the next genuine fault — finding 2 of the
-    /// 2026-09-11 (FOURTH) refusal, answered here rather than by a bypass.
     #[must_use]
     pub const fn records_flap(self) -> bool {
-        !matches!(self, Self::ProbeClose | Self::RankedRotation)
+        !matches!(self, Self::ProbeClose)
     }
 }
 
@@ -2569,41 +2622,10 @@ impl ConnectionSupervisor {
                 self.schedule_redial(ReconnectReason::IdleSilence, now)
             }
 
-            ConnEvent::GhostInstrumentDetected => {
-                // Only a LIVE socket can carry a ghost: a socket still dialing
-                // or subscribing has not been told to drop anything yet, and a
-                // backoff/parked socket delivers nothing at all.
-                if self.phase != ConnPhase::Live {
-                    return SupervisorAction::Continue;
-                }
-                self.reconnects = self.reconnects.saturating_add(1);
-                // WS-GAP-02: the vendor is still streaming an instrument this
-                // socket unsubscribed. Either the unsubscribe RequestCode is
-                // wrong for this endpoint (the 24-vs-25 split — 25 was proven
-                // IGNORED live on 2026-09-10 by exactly this arm firing 10
-                // times; 24 ships and is itself unverified until a session
-                // reads ghost = 0) or Dhan dropped the request.
-                // Both have the same remedy and neither has an ack to read:
-                // the redial replays the guard's CURRENT set, which does not
-                // include the ghost, so the vendor's view is rebuilt from
-                // ours. Bounded by the normal backoff ladder.
-                warn!(
-                    code = ErrorCode::WsGapSubscriptionBatching.code_str(),
-                    endpoint = self.slot.endpoint.as_str(),
-                    pool_index = self.slot.pool_index,
-                    source = "ghost_instrument",
-                    frames_on_this_connection = self.frames,
-                    "socket is still delivering an instrument it was told to unsubscribe — \
-                     re-dialing so the reconnect replay rebuilds the vendor's set from ours"
-                );
-                self.schedule_redial(ReconnectReason::GhostInstrument, now)
-            }
-
             ConnEvent::ProbeCloseRequested => {
-                // Same liveness gate as the ghost arm, for the same reason: a
-                // socket that is not Live has nothing to stop delivering, so
-                // closing it would measure nothing and would still cost a
-                // dial.
+                // Only a Live socket can be probed: a socket that is not Live
+                // has nothing to stop delivering, so closing it would measure
+                // nothing and would still cost a dial.
                 if self.phase != ConnPhase::Live {
                     return SupervisorAction::Continue;
                 }
@@ -2620,27 +2642,6 @@ impl ConnectionSupervisor {
                      be observed without the probed instrument"
                 );
                 self.schedule_redial(ReconnectReason::ProbeClose, now)
-            }
-
-            ConnEvent::RotationRequested => {
-                // Same liveness gate as the probe arm. The caller checks the
-                // returned action: a `Continue` here means the socket was not
-                // Live, so the caller reverts the guard swap it made.
-                if self.phase != ConnPhase::Live {
-                    return SupervisorAction::Continue;
-                }
-                // Not counted in `self.reconnects` for the same reason as the
-                // probe arm; visible under `ranked_rotation` in
-                // `enter_backoff`.
-                info!(
-                    endpoint = self.slot.endpoint.as_str(),
-                    pool_index = self.slot.pool_index,
-                    source = "ranked_rotation",
-                    frames_on_this_connection = self.frames,
-                    "depth steering rotated this socket onto a new contract — closing and \
-                     redialling so the replay subscribes only the new one"
-                );
-                self.schedule_redial(ReconnectReason::RankedRotation, now)
             }
         }
     }
@@ -3157,6 +3158,19 @@ impl SubscribeGuard {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.instruments.is_empty()
+    }
+
+    /// Whether this connection's set names `instrument`.
+    ///
+    /// O(n) in the instruments held by THIS connection and flagged as such,
+    /// the same shape as the scans in [`Self::try_swap`]. Its one caller is the
+    /// ghost unsubscribe, which only depth sockets reach (n is 1 on depth-200
+    /// and at most 50 on depth-20), at most once per socket per
+    /// [`GHOST_RESEND_COOLDOWN_SECS`].
+    #[must_use]
+    pub fn holds(&self, instrument: SubscribeInstrument) -> bool {
+        // O(1) EXEMPT: n is 1 (depth-200) or <= 50 (depth-20), cold path, at most once per 180 s per socket.
+        self.instruments.contains(&instrument)
     }
 
     /// Incarnation counter — bumped on every confirmed subscribe.
@@ -3723,35 +3737,6 @@ pub enum LiveSubscriptionCommand {
         /// typed `Option` for the same reason theirs are: tests that only
         /// care about the wire effect should not have to build a channel.
         ack: Option<tokio::sync::oneshot::Sender<ProbeUnsubscribeOutcome>>,
-    },
-    /// Move a depth-200 socket from `old` to `new` by RECONNECTING instead of
-    /// by an unsubscribe frame (scope lock, 2026-09-24).
-    ///
-    /// Dhan ignored the per-instrument depth unsubscribe on two consecutive
-    /// sessions, so a swap left the old contract streaming as a ghost. This
-    /// command never puts an unsubscribe on the wire: it rewrites the guard
-    /// (the reconnect replay) to name `new`, then closes the socket. The
-    /// redial subscribes ONLY what the guard names, so the vendor's view is
-    /// rebuilt from ours.
-    ///
-    /// Depth-200-only BY CONSTRUCTION, exactly like
-    /// [`Self::ProbeUnsubscribe`]: refused unless the guard holds EXACTLY ONE
-    /// instrument and it IS `old`. Refused outright once
-    /// [`rotation_halted`] reads true (any 805 this process). Refused, with
-    /// the guard restored, if the socket is not Live — a rotation must never
-    /// turn a dial in progress into a second dial.
-    ///
-    /// The close is NOT recorded as a flap (`ReconnectReason::RankedRotation`
-    /// is exempt), so a once-a-minute rotation cannot pathologise the socket's
-    /// reconnect ladder.
-    RotateByRedial {
-        /// The one instrument this socket holds now.
-        old: SubscribeInstrument,
-        /// The instrument the redial must subscribe instead.
-        new: SubscribeInstrument,
-        /// `Held` = the guard names `new` and a redial is scheduled (or the
-        /// rotation was a no-op). `NotHeld{refused}` = nothing changed.
-        ack: Option<tokio::sync::oneshot::Sender<SwapOutcome>>,
     },
 }
 
@@ -6176,6 +6161,96 @@ where
     (outcome, socket_decision)
 }
 
+/// Sends the unsubscribe AGAIN for a ghost contract: one this socket was told
+/// to drop and is still delivering (scope lock 2026-10-01, which replaced the
+/// close-and-redial that used to answer it).
+///
+/// Returns the outcome label (`sent` | `wire_failed` | `timed_out` |
+/// `held_again` | `halted_805`) and any socket decision that landed during the write. The
+/// write is bounded by [`SWAP_WIRE_BUDGET`] and [`await_write`] keeps reading
+/// frames while it waits, so a burst arriving during the write is drained, not
+/// left in the kernel buffer. Nothing here closes the socket.
+///
+/// `held_again`: the contract was put back on this socket (a swap brought it
+/// back) after the drain classified it. Unsubscribing it now would drop a
+/// contract we want, so nothing is sent.
+///
+/// Not per tick: at most once per [`GHOST_RESEND_COOLDOWN_SECS`] per socket,
+/// on the connection task's idle tick. [`SubscribeGuard::holds`] is a scan of
+/// at most 50 instruments.
+async fn resend_ghost_unsubscribe<S, K>(
+    socket: &mut S,
+    supervisor: &mut ConnectionSupervisor,
+    sink: &K,
+    throttle: &mut DrainThrottle,
+    guard: &SubscribeGuard,
+    ghost: SubscribeInstrument,
+) -> (&'static str, Option<SupervisorAction>)
+where
+    S: DhanFeedSocket,
+    K: FrameSink + ?Sized,
+{
+    if guard.holds(ghost) {
+        metrics::counter!(GHOST_UNSUBSCRIBE_METRIC, "outcome" => "held_again").increment(1);
+        // A contract a swap put back was never a ghost on this socket, so the
+        // request does not count against the session ceiling: otherwise
+        // re-entries inside the hysteresis band could use up the socket's
+        // budget and leave a real ghost later with no resend.
+        refund_ghost_resend(supervisor.slot().global_index);
+        return ("held_again", None);
+    }
+    // THE 805 BREAKER (scope lock 2026-10-01): after any 805 no ghost
+    // unsubscribe is sent. The drain stops asking once it trips, but a request
+    // armed (or stashed behind a ping) before the 805 is refused here.
+    if rotation_halted() {
+        metrics::counter!(DIAL_REFUSED_AFTER_805_METRIC, "path" => "ghost_unsubscribe")
+            .increment(1);
+        metrics::counter!(GHOST_UNSUBSCRIBE_METRIC, "outcome" => "halted_805").increment(1);
+        return ("halted_805", None);
+    }
+    let ticket = socket.send_unsubscribe(&[ghost]);
+    let wait = await_write(
+        socket,
+        supervisor,
+        sink,
+        throttle,
+        ticket,
+        Some(tokio::time::Instant::now() + SWAP_WIRE_BUDGET),
+    )
+    .await;
+    let outcome = match wait.outcome {
+        Ok(Ok(())) => "sent",
+        Ok(Err(_)) => "wire_failed",
+        Err(_elapsed) => "timed_out",
+    };
+    metrics::counter!(GHOST_UNSUBSCRIBE_METRIC, "outcome" => outcome).increment(1);
+    if outcome == "sent" {
+        info!(
+            source = "depth_unsubscribe_resent",
+            endpoint = supervisor.slot().endpoint.as_str(),
+            pool_index = supervisor.slot().pool_index,
+            security_id = ghost.security_id,
+            segment = ghost.segment.as_str(),
+            request_code = FEED_UNSUBSCRIBE_TWENTY_DEPTH,
+            "ghost contract unsubscribed again on the live socket, no redial; \
+             the vendor sends no acknowledgement, so this records only that we asked"
+        );
+    } else {
+        warn!(
+            code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+            source = "depth_unsubscribe_resend_failed",
+            endpoint = supervisor.slot().endpoint.as_str(),
+            pool_index = supervisor.slot().pool_index,
+            security_id = ghost.security_id,
+            segment = ghost.segment.as_str(),
+            outcome,
+            "the repeat unsubscribe for a ghost contract did not reach the wire; \
+             its packets keep being stored and the drain asks again after the cooldown"
+        );
+    }
+    (outcome, wait.socket_decision)
+}
+
 /// The drain loop. Returns as soon as the supervisor asks for anything other
 /// than [`SupervisorAction::Continue`].
 ///
@@ -6245,6 +6320,12 @@ where
     // behind a full send buffer must not stop the reader, which is the one
     // thing that can see the pong come back.
     let mut pending_ping: Option<WriteTicket> = None;
+
+    // A ghost contract this socket must unsubscribe AGAIN (scope lock
+    // 2026-10-01). Filled from the register on the one-second tick, sent at
+    // the top of the loop. Steady state is `None`, so the per-frame cost is
+    // one discriminant check.
+    let mut pending_ghost_unsubscribe: Option<SubscribeInstrument> = None;
 
     // When we last sent a client keepalive ping on this socket.
     //
@@ -6493,6 +6574,24 @@ where
                     }
                 }
                 Ok(LiveSubscriptionCommand::Swap { old, new, ack }) => {
+                    // THE 805 BREAKER, checked again where the write happens (scope
+                    // lock 2026-10-01: after any 805 no depth-200 change is sent).
+                    // The steering loop checks it when it plans, but a swap can sit
+                    // in this channel while the socket is down and an 805 trips on
+                    // another dial. Refused before the guard is touched, so the
+                    // caller reverts to `old` (`caller_should_unmark`).
+                    if supervisor.slot().endpoint == DhanEndpointType::Depth200 && rotation_halted()
+                    {
+                        metrics::counter!(DIAL_REFUSED_AFTER_805_METRIC, "path" => "swap")
+                            .increment(1);
+                        answer_swap(
+                            ack,
+                            SwapOutcome::NotHeld {
+                                reason: SwapOutcome::REASON_REFUSED,
+                            },
+                        );
+                        continue;
+                    }
                     match guard.try_swap(old, new) {
                         Ok(swap) if swap.is_no_op() => {
                             // The socket already carries what was asked for,
@@ -7193,96 +7292,6 @@ where
                         );
                     }
                 }
-                Ok(LiveSubscriptionCommand::RotateByRedial { old, new, ack }) => {
-                    // ROTATE BY RECONNECT (scope lock, 2026-09-24).
-                    //
-                    // Nested if/else, never `continue`, for the same reason
-                    // the probe arm above gives: the select below is what
-                    // polls `recv()` and so emits the pong.
-                    let held_one = guard.len() == 1;
-                    let holds_old = guard
-                        .batches()
-                        .flatten()
-                        .next()
-                        .copied()
-                        .is_some_and(|held| held == old);
-                    let refusal: Option<&'static str> = if rotation_halted() {
-                        Some("rotation_halted")
-                    } else if !(held_one && holds_old) {
-                        Some("not_exactly_old")
-                    } else {
-                        None
-                    };
-                    if let Some(why) = refusal {
-                        answer_swap(
-                            ack,
-                            SwapOutcome::NotHeld {
-                                reason: SwapOutcome::REASON_REFUSED,
-                            },
-                        );
-                        metrics::counter!(ROTATE_BY_REDIAL_METRIC, "outcome" => why).increment(1);
-                        warn!(
-                            code = ErrorCode::WsGapSubscriptionBatching.code_str(),
-                            source = "rotate_by_redial_refused",
-                            endpoint = supervisor.slot().endpoint.as_str(),
-                            pool_index = supervisor.slot().pool_index,
-                            held = guard.len(),
-                            reason = why,
-                            "depth rotation REFUSED before any close — nothing changed on \
-                             this socket; it keeps the contract it has"
-                        );
-                    } else {
-                        match guard.try_swap(old, new) {
-                            Ok(swap) if swap == SubscribeSwap::NO_OP => {
-                                answer_swap(ack, SwapOutcome::Held);
-                                metrics::counter!(ROTATE_BY_REDIAL_METRIC, "outcome" => "no_op")
-                                    .increment(1);
-                            }
-                            Ok(_) => {
-                                let decided = supervisor
-                                    .on_event(ConnEvent::RotationRequested, Instant::now());
-                                if decided == SupervisorAction::Continue {
-                                    // Not Live: the socket is not in a state
-                                    // where a close is a rotation. Put the
-                                    // guard back so the replay is unchanged.
-                                    let _reverted = guard.undo_swap(new, old);
-                                    answer_swap(
-                                        ack,
-                                        SwapOutcome::NotHeld {
-                                            reason: SwapOutcome::REASON_REFUSED,
-                                        },
-                                    );
-                                    metrics::counter!(
-                                        ROTATE_BY_REDIAL_METRIC,
-                                        "outcome" => "not_live"
-                                    )
-                                    .increment(1);
-                                } else {
-                                    answer_swap(ack, SwapOutcome::Held);
-                                    metrics::counter!(
-                                        ROTATE_BY_REDIAL_METRIC,
-                                        "outcome" => "rotated"
-                                    )
-                                    .increment(1);
-                                    action = decided;
-                                }
-                            }
-                            Err(_) => {
-                                answer_swap(
-                                    ack,
-                                    SwapOutcome::NotHeld {
-                                        reason: SwapOutcome::REASON_REFUSED,
-                                    },
-                                );
-                                metrics::counter!(
-                                    ROTATE_BY_REDIAL_METRIC,
-                                    "outcome" => "guard_refused"
-                                )
-                                .increment(1);
-                            }
-                        }
-                    }
-                }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                     // Every sender is gone: the attach sent its one overflow
@@ -7291,6 +7300,21 @@ where
                     // of this whole block exactly zero.
                     commands = None;
                 }
+            }
+        }
+
+        // GHOST UNSUBSCRIBE (scope lock 2026-10-01): the drain saw this socket
+        // still delivering a contract it was told to drop, so the unsubscribe
+        // is sent AGAIN, in place, on the live socket. One write at a time:
+        // never while a ping is on the wire.
+        if action == SupervisorAction::Continue
+            && pending_ping.is_none()
+            && let Some(ghost) = pending_ghost_unsubscribe.take()
+        {
+            let (_outcome, decided) =
+                resend_ghost_unsubscribe(socket, supervisor, sink, throttle, guard, ghost).await;
+            if let Some(decided) = decided {
+                action = decided;
             }
         }
 
@@ -7359,31 +7383,25 @@ where
                 // The ghost-instrument register, read on the SAME tick for the
                 // same reason the keepalive is: no new select arm, no new way
                 // to hold this task away from `recv`. One atomic swap a
-                // second. Only consulted when nothing else has already
-                // decided this socket's fate.
+                // second. The instrument is only STASHED here; the unsubscribe
+                // goes out at the top of the loop, where every other command's
+                // write is made (and only once no ping is on the wire), so it
+                // is never a second write in flight.
                 //
-                // Both registers ask for a VOLUNTARY close-and-redial, the same
-                // shape as rotate-by-reconnect, so both honour the 805 breaker
-                // the rotation arm reads (audit PR21, 2026-09-27): after Dhan
-                // has said the account is over its connection budget, a
-                // deliberate redial is one more connection into it. The
-                // request is taken (cleared) and refused, never left pending.
+                // Since 2026-10-01 this is an in-place unsubscribe, not a
+                // close-and-redial (scope lock 2026-10-01). The drain stops
+                // ASKING after an 805, and `resend_ghost_unsubscribe` refuses
+                // a request taken here after one, so nothing armed before the
+                // 805 reaches the wire after it.
                 if action == SupervisorAction::Continue
-                    && take_ghost_redial(supervisor.slot().global_index)
+                    && pending_ghost_unsubscribe.is_none()
                 {
-                    if rotation_halted() {
-                        refuse_voluntary_redial_after_805(supervisor.slot(), "ghost_redial");
-                    } else {
-                        action =
-                            supervisor.on_event(ConnEvent::GhostInstrumentDetected, Instant::now());
-                    }
+                    pending_ghost_unsubscribe =
+                        take_ghost_unsubscribe(supervisor.slot().global_index);
                 }
-                // The probe-close register, read on the same tick and AFTER
-                // the ghost register on purpose: if a socket has both pending,
-                // the ghost is the one that matters — it is a real vendor
-                // failure, while the probe is a diagnostic that can be re-armed
-                // on the next session. Taking the probe first would let a
-                // measurement pre-empt a fault.
+                // The probe-close register, read on the same tick. A ghost
+                // stashed above is still sent first at the top of the loop if
+                // the probe does not close the socket.
                 if action == SupervisorAction::Continue
                     && take_probe_close(supervisor.slot().global_index)
                 {
@@ -7588,6 +7606,10 @@ mod tests {
             l.store(0, std::sync::atomic::Ordering::Relaxed);
             c.store(0, std::sync::atomic::Ordering::Relaxed);
             r.store(false, std::sync::atomic::Ordering::Release);
+        }
+        for (id, segment) in GHOST_SECURITY_ID.iter().zip(GHOST_SEGMENT_CODE.iter()) {
+            id.store(0, std::sync::atomic::Ordering::Relaxed);
+            segment.store(u8::MAX, std::sync::atomic::Ordering::Relaxed);
         }
         GHOST_POOL_LAST_ARMED.store(0, std::sync::atomic::Ordering::Relaxed);
     }
@@ -8563,10 +8585,7 @@ mod tests {
     fn every_reason_except_the_probe_close_still_records_a_flap() {
         let now = t0();
         for reason in ReconnectReason::ALL {
-            if matches!(
-                reason,
-                ReconnectReason::ProbeClose | ReconnectReason::RankedRotation
-            ) {
+            if matches!(reason, ReconnectReason::ProbeClose) {
                 continue;
             }
             let mut s = sup(DhanEndpointType::Depth200, 0, now);
@@ -8599,9 +8618,10 @@ mod tests {
         );
     }
 
-    /// Exactly two reasons are exempt: the probe close and (2026-09-24) the
-    /// ranked depth-200 rotation. A future reason must not inherit the
-    /// exemption by resembling these.
+    /// Exactly one reason is exempt: the probe close. (The 2026-09-24 ranked
+    /// rotation was the second until 2026-10-01, when the change of contract
+    /// became an in-place swap and stopped being a redial at all.) A future
+    /// reason must not inherit the exemption by resembling it.
     #[test]
     fn exactly_one_reconnect_reason_is_exempt_from_the_flap_record() {
         let exempt: Vec<&'static str> = ReconnectReason::ALL
@@ -8611,7 +8631,7 @@ mod tests {
             .collect();
         assert_eq!(
             exempt,
-            vec!["probe_close", "ranked_rotation"],
+            vec!["probe_close"],
             "the flap exemption is deliberately narrow — adding a reason to it needs its own \
              dated quote in websocket-connection-scope-lock.md"
         );
@@ -9060,65 +9080,27 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Ghost-instrument redial: a LIVE socket that keeps delivering an
-    // instrument it was told to drop is torn down through the normal
-    // backoff ladder so the reconnect replay rebuilds the vendor's set.
+    // Ghost-instrument unsubscribe (in place since 2026-10-01): a LIVE
+    // socket that keeps delivering an instrument it was told to drop gets
+    // the unsubscribe AGAIN on the same socket. It is never closed for it.
     // ------------------------------------------------------------------
 
-    #[test]
-    fn a_live_socket_delivering_a_ghost_instrument_is_redialled_with_the_ghost_reason() {
-        let t = t0();
-        let mut s = sup(DhanEndpointType::Depth200, 0, t);
-        let _ = s.on_event(ConnEvent::BeginDial, t);
-        let _ = s.on_event(ConnEvent::DialSucceeded, t);
-        let _ = s.on_event(ConnEvent::SubscribeAcked, t);
-        assert_eq!(s.phase(), ConnPhase::Live);
+    /// NSE_FNO's wire byte; every ghost in these tests is a stock option.
+    const GHOST_TEST_SEGMENT_CODE: u8 = 2;
 
-        assert!(
-            matches!(
-                s.on_event(ConnEvent::GhostInstrumentDetected, t),
-                SupervisorAction::SleepThenDial { .. }
-            ),
-            "a live socket still streaming an unsubscribed contract must be redialled"
-        );
-        assert_eq!(s.phase(), ConnPhase::Backoff);
-        assert_eq!(s.last_redial_reason(), ReconnectReason::GhostInstrument);
-        assert_eq!(s.reconnects(), 1);
-        // A second detection while the redial is already in flight is a no-op.
-        assert_eq!(
-            s.on_event(ConnEvent::GhostInstrumentDetected, t),
-            SupervisorAction::Continue
-        );
-        assert_eq!(s.reconnects(), 1);
-    }
-
+    /// The supervisor no longer has ANY event that turns a ghost into a
+    /// redial: the only reasons left are faults and the probe. If someone
+    /// re-adds a ghost or rotation reason, this enumerates it and fails.
     #[test]
-    fn a_ghost_detection_before_the_socket_is_live_is_ignored() {
-        // A socket still subscribing has not been told to drop anything, so
-        // a "ghost" there is the previous incarnation's frame arriving late.
-        let t = t0();
-        let mut s = sup(DhanEndpointType::Depth20, 1, t);
-        let _ = s.on_event(ConnEvent::BeginDial, t);
-        let _ = s.on_event(ConnEvent::DialSucceeded, t);
-        assert_eq!(s.phase(), ConnPhase::Subscribing);
-        assert_eq!(
-            s.on_event(ConnEvent::GhostInstrumentDetected, t),
-            SupervisorAction::Continue
-        );
-        assert_eq!(s.phase(), ConnPhase::Subscribing);
-        assert_eq!(s.reconnects(), 0);
-    }
-
-    #[test]
-    fn the_ghost_reason_carries_its_own_metric_label() {
-        assert_eq!(
-            ReconnectReason::GhostInstrument.as_str(),
-            "ghost_instrument"
-        );
-        assert!(
-            ReconnectReason::ALL.contains(&ReconnectReason::GhostInstrument),
-            "the reason must be enumerated so the label tests cover it"
-        );
+    fn no_reconnect_reason_exists_for_a_ghost_or_a_rotation() {
+        for reason in ReconnectReason::ALL {
+            let label = reason.as_str();
+            assert!(
+                !label.contains("ghost") && !label.contains("rotation"),
+                "{label}: a ghost or a ranked change is answered in place by \
+                 unsubscribe and subscribe (scope lock 2026-10-01), never by a redial"
+            );
+        }
     }
 
     // The cross-task register: the drain arms a slot, the connection task
@@ -9127,141 +9109,325 @@ mod tests {
     static GHOST_REGISTER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn request_ghost_redial_arms_once_and_take_ghost_redial_takes_once() {
+    fn take_ghost_unsubscribe_returns_none_when_nothing_is_pending() {
+        let _guard = GHOST_REGISTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_ghost_redials_for_tests();
+        assert_eq!(take_ghost_unsubscribe(11), None, "nothing armed");
+        assert_eq!(take_ghost_unsubscribe(u8::MAX), None, "out of range");
+    }
+
+    /// `holds` is what stops a ghost resend from dropping a contract a swap
+    /// has since put back on the socket: it matches on the full identity,
+    /// `(security_id, segment)`, never the id alone (I-P1-11).
+    #[test]
+    fn subscribe_guard_holds_matches_id_and_segment_together() {
+        let guard = SubscribeGuard::try_new(DhanEndpointType::Depth20, vec![si(1), si(2)])
+            .expect("two instruments");
+        assert!(guard.holds(si(1)));
+        assert!(guard.holds(si(2)));
+        assert!(!guard.holds(si(3)));
+        let same_id_other_segment = SubscribeInstrument {
+            security_id: si(1).security_id,
+            segment: if si(1).segment == ExchangeSegment::NseEquity {
+                ExchangeSegment::NseFno
+            } else {
+                ExchangeSegment::NseEquity
+            },
+        };
+        assert!(
+            !guard.holds(same_id_other_segment),
+            "the same id on another segment is a different instrument"
+        );
+    }
+
+    #[test]
+    fn request_ghost_unsubscribe_arms_once_and_take_returns_the_instrument() {
         let _guard = GHOST_REGISTER_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         reset_ghost_redials_for_tests();
         let now = 1_000_000_i64;
         assert!(
-            request_ghost_redial(7, now).is_ok(),
+            request_ghost_unsubscribe(7, 52_175, GHOST_TEST_SEGMENT_CODE, now).is_ok(),
             "first request on a slot arms"
         );
-        assert!(take_ghost_redial(7), "the connection task takes it");
-        assert!(!take_ghost_redial(7), "taking clears the slot");
-        assert!(!take_ghost_redial(6), "another slot is untouched");
+        assert_eq!(
+            take_ghost_unsubscribe(7),
+            Some(SubscribeInstrument {
+                security_id: 52_175,
+                segment: ExchangeSegment::NseFno,
+            }),
+            "the connection task takes the exact instrument the drain named"
+        );
+        assert_eq!(take_ghost_unsubscribe(7), None, "taking clears the slot");
+        assert_eq!(take_ghost_unsubscribe(6), None, "another slot is untouched");
+    }
+
+    /// The segment is part of the identity (I-P1-11): an unknown segment byte
+    /// is refused before anything is armed, so a resend can never name a
+    /// different instrument with the same id.
+    #[test]
+    fn a_ghost_unsubscribe_with_an_unknown_segment_is_refused_and_arms_nothing() {
+        let _guard = GHOST_REGISTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_ghost_redials_for_tests();
+        assert_eq!(
+            request_ghost_unsubscribe(8, 52_175, 6, 1_500_000),
+            Err(GhostResendRefusal::UnknownSegment),
+            "6 is the gap in the vendor's segment enum"
+        );
+        assert_eq!(take_ghost_unsubscribe(8), None);
+        assert_eq!(ghost_resends_taken(8), 0, "a refusal does not count");
     }
 
     #[test]
-    fn request_ghost_redial_is_refused_inside_the_cooldown_and_allowed_after_it() {
+    fn request_ghost_unsubscribe_is_refused_inside_the_cooldown_and_allowed_after_it() {
         let _guard = GHOST_REGISTER_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         reset_ghost_redials_for_tests();
         let now = 2_000_000_i64;
-        assert!(request_ghost_redial(9, now).is_ok());
-        assert!(take_ghost_redial(9));
+        let code = GHOST_TEST_SEGMENT_CODE;
+        assert!(request_ghost_unsubscribe(9, 1, code, now).is_ok());
+        assert!(take_ghost_unsubscribe(9).is_some());
         // Inside the cooldown: refused, and nothing is re-armed.
         assert_eq!(
-            request_ghost_redial(9, now + GHOST_REDIAL_COOLDOWN_SECS - 1),
-            Err(GhostRedialRefusal::CoolingDown)
+            request_ghost_unsubscribe(9, 1, code, now + GHOST_RESEND_COOLDOWN_SECS - 1),
+            Err(GhostResendRefusal::CoolingDown)
         );
-        assert!(!take_ghost_redial(9));
+        assert_eq!(take_ghost_unsubscribe(9), None);
         // At the cooldown boundary: armed again.
-        assert!(request_ghost_redial(9, now + GHOST_REDIAL_COOLDOWN_SECS).is_ok());
-        assert!(take_ghost_redial(9));
-        assert_eq!(ghost_redials_taken(9), 2);
+        assert!(request_ghost_unsubscribe(9, 1, code, now + GHOST_RESEND_COOLDOWN_SECS).is_ok());
+        assert!(take_ghost_unsubscribe(9).is_some());
+        assert_eq!(ghost_resends_taken(9), 2);
     }
 
     #[test]
-    fn a_ghost_redial_request_for_an_out_of_range_connection_is_refused() {
+    fn a_ghost_unsubscribe_for_an_out_of_range_connection_is_refused() {
         let _guard = GHOST_REGISTER_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         reset_ghost_redials_for_tests();
         let idx = u8::try_from(GHOST_REDIAL_SLOTS).unwrap_or(u8::MAX);
+        let code = GHOST_TEST_SEGMENT_CODE;
         assert_eq!(
-            request_ghost_redial(idx, 3_000_000),
-            Err(GhostRedialRefusal::OutOfRange)
+            request_ghost_unsubscribe(idx, 1, code, 3_000_000),
+            Err(GhostResendRefusal::OutOfRange)
         );
-        assert!(!take_ghost_redial(idx));
+        assert_eq!(take_ghost_unsubscribe(idx), None);
         assert_eq!(
-            request_ghost_redial(u8::MAX, 3_000_000),
-            Err(GhostRedialRefusal::OutOfRange)
+            request_ghost_unsubscribe(u8::MAX, 1, code, 3_000_000),
+            Err(GhostResendRefusal::OutOfRange)
         );
-        assert!(!take_ghost_redial(u8::MAX));
-        assert_eq!(ghost_redials_taken(u8::MAX), 0);
+        assert_eq!(take_ghost_unsubscribe(u8::MAX), None);
+        assert_eq!(ghost_resends_taken(u8::MAX), 0);
         assert!(!ghost_ceiling_first_hit(u8::MAX));
     }
 
-    /// Sixteen sockets ghosting in the same second must not go out as
-    /// sixteen redials: the pool-wide spacing lets one through and refuses
-    /// the rest until it has elapsed (the 805 shape). The per-socket cooldown
-    /// is unchanged by it.
+    /// Sixteen sockets ghosting in the same second must not all write at
+    /// once: the pool-wide spacing lets one through and refuses the rest until
+    /// it has elapsed (an 805 is "too many requests", not only connections).
     #[test]
-    fn ghost_redials_are_spaced_pool_wide_so_a_storm_cannot_fan_out_at_once() {
+    fn ghost_resends_are_spaced_pool_wide_so_a_storm_cannot_fan_out_at_once() {
         let _guard = GHOST_REGISTER_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         reset_ghost_redials_for_tests();
         let now = 4_000_000_i64;
-        assert!(request_ghost_redial(1, now).is_ok());
+        let code = GHOST_TEST_SEGMENT_CODE;
+        assert!(request_ghost_unsubscribe(1, 1, code, now).is_ok());
         assert_eq!(
-            request_ghost_redial(2, now),
-            Err(GhostRedialRefusal::PoolSpacing),
+            request_ghost_unsubscribe(2, 2, code, now),
+            Err(GhostResendRefusal::PoolSpacing),
             "a DIFFERENT socket inside the pool spacing is refused"
         );
         assert_eq!(
-            request_ghost_redial(2, now + GHOST_REDIAL_POOL_SPACING_SECS - 1),
-            Err(GhostRedialRefusal::PoolSpacing)
+            request_ghost_unsubscribe(2, 2, code, now + GHOST_RESEND_POOL_SPACING_SECS - 1),
+            Err(GhostResendRefusal::PoolSpacing)
         );
-        assert!(request_ghost_redial(2, now + GHOST_REDIAL_POOL_SPACING_SECS).is_ok());
-        assert!(take_ghost_redial(1));
-        assert!(take_ghost_redial(2));
         assert!(
-            GHOST_REDIAL_POOL_SPACING_SECS < GHOST_REDIAL_COOLDOWN_SECS,
+            request_ghost_unsubscribe(2, 2, code, now + GHOST_RESEND_POOL_SPACING_SECS).is_ok()
+        );
+        assert!(take_ghost_unsubscribe(1).is_some());
+        assert!(take_ghost_unsubscribe(2).is_some());
+        assert!(
+            GHOST_RESEND_POOL_SPACING_SECS < GHOST_RESEND_COOLDOWN_SECS,
             "spacing tighter than the per-socket cooldown, or the cooldown is moot"
         );
     }
 
-    /// A socket whose ghost survives EVERY redial stops being redialled at the
+    /// A socket whose ghost survives EVERY resend stops being asked at the
     /// session ceiling, and the ceiling is reportable exactly once.
     #[test]
-    fn a_socket_stops_being_redialled_at_the_session_ceiling_and_says_so_once() {
+    fn a_socket_stops_resending_at_the_session_ceiling_and_says_so_once() {
         let _guard = GHOST_REGISTER_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         reset_ghost_redials_for_tests();
         let mut now = 5_000_000_i64;
-        for n in 0..GHOST_REDIAL_SESSION_CEILING {
-            assert!(request_ghost_redial(3, now).is_ok(), "arm #{n}");
-            assert!(take_ghost_redial(3));
-            now += GHOST_REDIAL_COOLDOWN_SECS;
+        let code = GHOST_TEST_SEGMENT_CODE;
+        for n in 0..GHOST_RESEND_SESSION_CEILING {
+            assert!(
+                request_ghost_unsubscribe(3, 1, code, now).is_ok(),
+                "arm #{n}"
+            );
+            assert!(take_ghost_unsubscribe(3).is_some());
+            now += GHOST_RESEND_COOLDOWN_SECS;
         }
-        assert_eq!(ghost_redials_taken(3), GHOST_REDIAL_SESSION_CEILING);
+        assert_eq!(ghost_resends_taken(3), GHOST_RESEND_SESSION_CEILING);
         assert_eq!(
-            request_ghost_redial(3, now),
-            Err(GhostRedialRefusal::SessionCeiling)
+            request_ghost_unsubscribe(3, 1, code, now),
+            Err(GhostResendRefusal::SessionCeiling)
         );
-        assert!(!take_ghost_redial(3), "nothing armed past the ceiling");
+        assert_eq!(
+            take_ghost_unsubscribe(3),
+            None,
+            "nothing armed past the ceiling"
+        );
         assert!(ghost_ceiling_first_hit(3), "reported once...");
         assert!(!ghost_ceiling_first_hit(3), "...and never again");
         assert!(
-            request_ghost_redial(4, now + GHOST_REDIAL_POOL_SPACING_SECS).is_ok(),
+            request_ghost_unsubscribe(4, 1, code, now + GHOST_RESEND_POOL_SPACING_SECS).is_ok(),
             "another socket is unaffected by a sibling's ceiling"
         );
+    }
+
+    /// A second request for the same socket while the first is still pending
+    /// is REFUSED and the pending instrument is kept: overwriting it while the
+    /// flag is set could let the take read the new id beside the old segment, a
+    /// different instrument (I-P1-11). Still ONE pending send, never two; the
+    /// refused ghost is asked for again on its next frame after the take.
+    #[test]
+    fn a_pending_ghost_unsubscribe_is_never_overwritten_and_is_taken_once() {
+        let _guard = GHOST_REGISTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_ghost_redials_for_tests();
+        let now = 6_000_000_i64;
+        let code = GHOST_TEST_SEGMENT_CODE;
+        assert!(request_ghost_unsubscribe(5, 11, code, now).is_ok());
+        assert_eq!(
+            request_ghost_unsubscribe(5, 22, 1, now + GHOST_RESEND_COOLDOWN_SECS),
+            Err(GhostResendRefusal::StillPending)
+        );
+        assert_eq!(
+            ghost_resends_taken(5),
+            1,
+            "a refused request does not count"
+        );
+        assert_eq!(
+            take_ghost_unsubscribe(5),
+            Some(SubscribeInstrument {
+                security_id: 11,
+                segment: ExchangeSegment::NseFno,
+            }),
+            "the pending pair is exactly the one armed, id and segment together"
+        );
+        assert_eq!(take_ghost_unsubscribe(5), None, "one send, not two");
+    }
+
+    /// The register under a real race: the drain thread arms pairs as fast
+    /// as the cooldown lets it while the connection thread takes them. Every
+    /// taken pair must be one that was armed together — id 1 only ever with
+    /// NSE_FNO, id 2 only ever with NSE_EQ. A torn read would hand the
+    /// connection a different instrument (I-P1-11).
+    #[test]
+    fn a_racing_take_never_reads_a_torn_id_and_segment_pair() {
+        let _guard = GHOST_REGISTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_ghost_redials_for_tests();
+        const SLOT: u8 = 12;
+        const ROUNDS: i64 = 20_000;
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let taker_done = std::sync::Arc::clone(&done);
+        let taker = std::thread::spawn(move || {
+            let mut taken = 0_u64;
+            loop {
+                if let Some(got) = take_ghost_unsubscribe(SLOT) {
+                    let expected = if got.security_id == 1 {
+                        ExchangeSegment::NseFno
+                    } else {
+                        ExchangeSegment::NseEquity
+                    };
+                    assert_eq!(got.segment, expected, "torn pair {got:?}");
+                    taken += 1;
+                } else if taker_done.load(Ordering::Acquire) {
+                    break;
+                }
+            }
+            taken
+        });
+        let mut armed = 0_u64;
+        for round in 0..ROUNDS {
+            // Lift the session ceiling so the race runs for every round.
+            GHOST_ARMED_COUNT[usize::from(SLOT)].store(0, Ordering::Relaxed);
+            let (id, code) = if round % 2 == 0 { (1, 2) } else { (2, 1) };
+            let now = (round + 1) * GHOST_RESEND_COOLDOWN_SECS;
+            if request_ghost_unsubscribe(SLOT, id, code, now).is_ok() {
+                armed += 1;
+            }
+        }
+        done.store(true, Ordering::Release);
+        let taken = taker.join().expect("taker thread");
+        let leftover = u64::from(take_ghost_unsubscribe(SLOT).is_some());
+        assert!(armed > 0, "ANTI-VACUITY: the race must actually arm");
+        assert_eq!(
+            armed,
+            taken + leftover,
+            "every armed request is taken exactly once"
+        );
+        reset_ghost_redials_for_tests();
+    }
+
+    /// A request that turns out not to be a ghost gives its place back, so
+    /// false verdicts cannot use up a socket's session ceiling; the refund
+    /// saturates at zero and ignores an out-of-range index.
+    #[test]
+    fn refund_ghost_resend_returns_one_place_and_saturates_at_zero() {
+        let _guard = GHOST_REGISTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_ghost_redials_for_tests();
+        let code = GHOST_TEST_SEGMENT_CODE;
+        assert!(request_ghost_unsubscribe(13, 1, code, 9_000_000).is_ok());
+        assert_eq!(ghost_resends_taken(13), 1);
+        refund_ghost_resend(13);
+        assert_eq!(ghost_resends_taken(13), 0, "the place is given back");
+        refund_ghost_resend(13);
+        assert_eq!(ghost_resends_taken(13), 0, "never below zero");
+        refund_ghost_resend(u8::MAX);
+        reset_ghost_redials_for_tests();
     }
 
     /// The taken-count is a plain read: zero before any arm, exactly the number
     /// of successful arms after, and zero (never a panic) for an index outside
     /// the register.
     #[test]
-    fn ghost_redials_taken_counts_successful_arms_and_reads_zero_out_of_range() {
+    fn ghost_resends_taken_counts_successful_arms_and_reads_zero_out_of_range() {
         let _guard = GHOST_REGISTER_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         reset_ghost_redials_for_tests();
-        assert_eq!(ghost_redials_taken(7), 0, "nothing armed yet");
-        assert!(request_ghost_redial(7, 9_000_000).is_ok());
-        assert_eq!(ghost_redials_taken(7), 1, "one successful arm");
+        let code = GHOST_TEST_SEGMENT_CODE;
+        assert_eq!(ghost_resends_taken(7), 0, "nothing armed yet");
+        assert!(request_ghost_unsubscribe(7, 1, code, 9_000_000).is_ok());
+        assert_eq!(ghost_resends_taken(7), 1, "one successful arm");
+        assert!(
+            take_ghost_unsubscribe(7).is_some(),
+            "taken, so the cooldown decides"
+        );
         assert_eq!(
-            request_ghost_redial(7, 9_000_000 + 1),
-            Err(GhostRedialRefusal::CoolingDown),
+            request_ghost_unsubscribe(7, 1, code, 9_000_000 + 1),
+            Err(GhostResendRefusal::CoolingDown),
             "a refused arm must not count"
         );
-        assert_eq!(ghost_redials_taken(7), 1);
+        assert_eq!(ghost_resends_taken(7), 1);
         assert_eq!(
-            ghost_redials_taken(u8::MAX),
+            ghost_resends_taken(u8::MAX),
             0,
             "out of range reads zero, never panics"
         );
@@ -14005,27 +14171,26 @@ mod tests {
         assert!(ProbeUnsubscribeOutcome::Dropped.verdict_admissible());
     }
 
-    // --- Rotate by reconnect (scope lock, 2026-09-24) -------------------
+    // --- In place, never a redial (scope lock, 2026-10-01) --------------
 
-    /// Sends one `RotateByRedial` and runs the loop to completion. Returns
-    /// the ack (if one came back) and the fake socket's final state.
-    async fn run_one_rotation(
-        endpoint: DhanEndpointType,
-        held: Vec<SubscribeInstrument>,
-        old: SubscribeInstrument,
-        new: SubscribeInstrument,
-    ) -> (Option<SwapOutcome>, FakeState) {
+    /// The depth-200 change of contract is an in-place unsubscribe then
+    /// subscribe on the SAME socket. Until 2026-10-01 it closed the socket and
+    /// redialled; the operator ruled that out ("isntead of disconenct
+    /// reocnenct follow the unsubscribe and siubscribe apporach").
+    #[tokio::test(start_paused = true)]
+    async fn a_depth_200_swap_never_closes_the_socket() {
         let st = std::sync::Arc::new(Mutex::new(FakeState {
             recv_events: one_scripted_frame(),
             ..FakeState::default()
         }));
         let sink = std::sync::Arc::new(RecordingSink::default());
-        let guard = SubscribeGuard::try_new(endpoint, held).expect("valid guard");
+        let guard = SubscribeGuard::try_new(DhanEndpointType::Depth200, vec![si(1)])
+            .expect("one instrument");
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         let (ack_tx, mut ack_rx) = tokio::sync::oneshot::channel();
-        tx.send(LiveSubscriptionCommand::RotateByRedial {
-            old,
-            new,
+        tx.send(LiveSubscriptionCommand::Swap {
+            old: si(1),
+            new: si(9),
             ack: Some(ack_tx),
         })
         .await
@@ -14034,7 +14199,7 @@ mod tests {
 
         let _ = run_connection_with_commands(
             fake(&st),
-            sup(endpoint, 0, t0()),
+            sup(DhanEndpointType::Depth200, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
             || async {},
@@ -14042,125 +14207,151 @@ mod tests {
         )
         .await;
 
-        let ack = ack_rx.try_recv().ok();
-        let state = std::mem::take(&mut *st.lock().expect("fake state"));
-        (ack, state)
+        assert_eq!(ack_rx.try_recv().ok(), Some(SwapOutcome::Held));
+        let s = st.lock().expect("fake state");
+        assert_eq!(s.connects, 1, "the change of contract must never redial");
+        assert_eq!(
+            s.wire_calls,
+            vec!["subscribe", "unsubscribe", "subscribe"],
+            "unsubscribe the old contract, then subscribe the new one, on the live socket"
+        );
+        assert_eq!(s.subscribed_ids, vec![1, 9]);
+        assert_eq!(
+            sink.accepted.lock().map(|g| g.len()).unwrap_or(0),
+            2,
+            "every frame around the change reaches the sink"
+        );
     }
 
-    /// THE HAPPY PATH, and the wire shape is the whole point: the socket is
-    /// closed and re-dialled, the replay subscribes ONLY the new contract,
-    /// and NO unsubscribe frame is ever sent. Dhan has not confirmed that it
-    /// honours a depth unsubscribe, so rotation must not depend on one.
+    /// The ghost answer: the unsubscribe goes out again on the same socket,
+    /// and nothing closes or dials it.
     #[tokio::test(start_paused = true)]
-    async fn a_rotation_redials_and_the_replay_carries_only_the_new_contract() {
-        let (ack, s) =
-            run_one_rotation(DhanEndpointType::Depth200, vec![si(1)], si(1), si(9)).await;
-        assert_eq!(ack, Some(SwapOutcome::Held));
+    async fn a_ghost_unsubscribe_resends_code_25_and_never_redials() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            idle_when_exhausted: true,
+            ..FakeState::default()
+        }));
+        let mut sock = fake(&st);
+        let mut supervisor = sup(DhanEndpointType::Depth200, 0, t0());
+        let sink = RecordingSink::default();
+        let mut throttle = DrainThrottle::default();
+        let guard = SubscribeGuard::try_new(DhanEndpointType::Depth200, vec![si(2)])
+            .expect("one instrument");
+
+        let (outcome, decided) = resend_ghost_unsubscribe(
+            &mut sock,
+            &mut supervisor,
+            &sink,
+            &mut throttle,
+            &guard,
+            si(1),
+        )
+        .await;
+
+        assert_eq!(outcome, "sent");
+        assert_eq!(decided, None, "nothing decided the socket's fate");
+        let s = st.lock().expect("fake state");
         assert_eq!(
-            s.connects, 2,
-            "ANTI-VACUITY: the rotation must actually re-dial, or the replay assertion \
-             below proves nothing"
+            s.wire_calls,
+            vec!["unsubscribe"],
+            "exactly one write: the resend"
         );
-        assert_eq!(
-            s.subscribed_ids,
-            vec![1, 9],
-            "the first dial subscribes the old contract; the redial's replay must carry \
-             the new one and nothing else"
-        );
-        assert_eq!(
-            s.unsubscribes, 0,
-            "rotation must never send an unsubscribe frame"
-        );
+        assert_eq!(s.connects, 0, "a ghost must never dial");
+        assert_eq!(s.closes, 0, "a ghost must never close the socket");
     }
 
-    /// Rotating onto the contract the socket already holds changes nothing:
-    /// no close, no redial, and the ack says the socket carries it.
+    /// A ghost the socket has since been told to carry again is wanted:
+    /// unsubscribing it would drop a live contract, so nothing is sent.
     #[tokio::test(start_paused = true)]
-    async fn a_rotation_onto_the_same_contract_is_a_no_op() {
-        let (ack, s) =
-            run_one_rotation(DhanEndpointType::Depth200, vec![si(1)], si(1), si(1)).await;
-        assert_eq!(ack, Some(SwapOutcome::Held));
-        assert_eq!(s.connects, 1, "a no-op must never close the socket");
-        assert_eq!(s.unsubscribes, 0);
+    async fn a_ghost_unsubscribe_for_a_held_instrument_sends_nothing() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            idle_when_exhausted: true,
+            ..FakeState::default()
+        }));
+        let mut sock = fake(&st);
+        let mut supervisor = sup(DhanEndpointType::Depth20, 0, t0());
+        let sink = RecordingSink::default();
+        let mut throttle = DrainThrottle::default();
+        let guard = SubscribeGuard::try_new(DhanEndpointType::Depth20, vec![si(1), si(2)])
+            .expect("two instruments");
+
+        let (outcome, decided) = resend_ghost_unsubscribe(
+            &mut sock,
+            &mut supervisor,
+            &sink,
+            &mut throttle,
+            &guard,
+            si(2),
+        )
+        .await;
+
+        assert_eq!(outcome, "held_again");
+        assert_eq!(decided, None);
+        assert!(
+            st.lock().expect("fake state").wire_calls.is_empty(),
+            "a held contract must never be unsubscribed"
+        );
     }
 
-    /// A socket that holds a DIFFERENT contract from the one the planner
-    /// believed is refused before any close: redialling it would replay a
-    /// set nobody chose.
+    /// A burst arriving while the resend is on the wire is read, not left in
+    /// the kernel buffer: every frame reaches the sink before the write is
+    /// answered, which is what keeps a slow write from costing ticks.
     #[tokio::test(start_paused = true)]
-    async fn a_rotation_naming_the_wrong_old_contract_is_refused_without_a_close() {
-        let (ack, s) =
-            run_one_rotation(DhanEndpointType::Depth200, vec![si(2)], si(1), si(9)).await;
-        assert_eq!(
-            ack,
-            Some(SwapOutcome::NotHeld {
-                reason: SwapOutcome::REASON_REFUSED
-            })
-        );
-        assert_eq!(
-            s.connects, 1,
-            "a refused rotation must never close the socket"
-        );
-        assert_eq!(s.subscribed_ids, vec![2], "the replay set is unchanged");
-    }
+    async fn a_ghost_unsubscribe_reads_a_burst_that_arrives_during_the_write() {
+        let burst: VecDeque<SocketEvent> = (0..32)
+            .map(|_| SocketEvent::Frame(Bytes::from_static(b"burst...")))
+            .collect();
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: burst,
+            idle_when_exhausted: true,
+            unsubscribe_delay: Some(Duration::from_millis(300)),
+            ..FakeState::default()
+        }));
+        let mut sock = fake(&st);
+        let mut supervisor = sup(DhanEndpointType::Depth20, 0, t0());
+        let sink = RecordingSink::default();
+        let mut throttle = DrainThrottle::default();
+        let guard = SubscribeGuard::try_new(DhanEndpointType::Depth20, vec![si(2)])
+            .expect("one instrument");
 
-    /// Rotation is a depth-200 shape — one instrument per socket. A socket
-    /// holding more than one is refused, because closing it would drop the
-    /// others' books for the length of a redial.
-    #[tokio::test(start_paused = true)]
-    async fn a_rotation_on_a_socket_holding_two_contracts_is_refused() {
-        let (ack, s) =
-            run_one_rotation(DhanEndpointType::Depth20, vec![si(1), si(2)], si(1), si(9)).await;
-        assert_eq!(
-            ack,
-            Some(SwapOutcome::NotHeld {
-                reason: SwapOutcome::REASON_REFUSED
-            })
-        );
-        assert_eq!(s.connects, 1);
-        assert_eq!(s.unsubscribes, 0);
-    }
+        let (outcome, _) = resend_ghost_unsubscribe(
+            &mut sock,
+            &mut supervisor,
+            &sink,
+            &mut throttle,
+            &guard,
+            si(1),
+        )
+        .await;
 
-    /// The supervisor half: a rotation request on a socket that is not Live
-    /// decides nothing. The connection loop reads that `Continue` and puts
-    /// the guard back, so the replay is never changed for a socket that did
-    /// not close.
-    #[test]
-    fn a_rotation_request_before_the_socket_is_live_decides_nothing() {
-        let mut s = sup(DhanEndpointType::Depth200, 0, t0());
+        assert_eq!(outcome, "sent");
         assert_eq!(
-            s.on_event(ConnEvent::RotationRequested, t0()),
-            SupervisorAction::Continue
+            sink.accepted.lock().map(|g| g.len()).unwrap_or(0),
+            32,
+            "every frame of the burst must reach the sink"
+        );
+        let s = st.lock().expect("fake state");
+        assert_eq!(
+            s.write_answers,
+            vec![("unsubscribe", 32)],
+            "ANTI-VACUITY: the burst was read WHILE the write was in flight"
         );
     }
 
-    /// A rotation redial is a CHOSEN close, so it must not feed the flap
-    /// damper. Otherwise five rotations a minute would read as a flapping
-    /// socket and push the next genuine fault onto the slow ladder.
-    #[test]
-    fn a_ranked_rotation_does_not_record_a_flap() {
-        assert!(!ReconnectReason::RankedRotation.records_flap());
-        assert_eq!(ReconnectReason::RankedRotation.as_str(), "ranked_rotation");
-    }
-
-    /// Audit PR21: the ghost and probe registers ask for a VOLUNTARY
-    /// close-and-redial, so both read the 805 breaker before acting, exactly
-    /// like the rotation arm.
+    /// Audit PR21: the probe register asks for a VOLUNTARY close-and-redial,
+    /// so it reads the 805 breaker before acting. (The ghost register no
+    /// longer redials since 2026-10-01; the drain reads the breaker before it
+    /// asks for a resend, pinned in the app crate.)
     #[test]
     fn voluntary_redials_check_the_805_breaker_before_acting() {
         let src = include_str!("pool_supervisor.rs");
         let test_marker = concat!("#[cfg(", "test)]");
         let production = src.split(test_marker).next().unwrap_or(src);
-        for (register, event) in [
-            (
-                "take_ghost_redial(supervisor",
-                "ConnEvent::GhostInstrumentDetected",
-            ),
-            (
-                "take_probe_close(supervisor",
-                "ConnEvent::ProbeCloseRequested",
-            ),
-        ] {
+        let (register, event) = (
+            "take_probe_close(supervisor",
+            "ConnEvent::ProbeCloseRequested",
+        );
+        {
             let at = production
                 .find(register)
                 .unwrap_or_else(|| panic!("{register} must still be read in the drain"));
@@ -14181,7 +14372,6 @@ mod tests {
     #[test]
     fn test_refuse_voluntary_redial_after_805_does_not_panic_and_names_the_path() {
         let slot = slot(DhanEndpointType::Depth20, 0);
-        refuse_voluntary_redial_after_805(slot, "ghost_redial");
         refuse_voluntary_redial_after_805(slot, "probe_close");
         assert_eq!(
             DIAL_REFUSED_AFTER_805_METRIC,
@@ -14191,8 +14381,10 @@ mod tests {
 
     /// The 805 breaker, pinned by source because the flag is process-global:
     /// setting it in a test would break every other rotation test running in
-    /// parallel. The PoolOverflow arm must set it, and the rotation arm must
-    /// read it before doing anything else.
+    /// parallel. The PoolOverflow arm must set it. The depth-200 change of
+    /// contract reads it in the steering task before it sends a swap (pinned
+    /// there, in the app crate), since 2026-10-01 the change is an ordinary
+    /// in-place swap rather than a redial arm of its own.
     #[test]
     fn an_805_halts_every_later_rotation() {
         let src = include_str!("pool_supervisor.rs");
@@ -14207,17 +14399,39 @@ mod tests {
             prod[overflow + park..].starts_with("self.park(ParkReason::PoolOverflow"),
             "the breaker must be latched in the 805 arm, immediately before its park"
         );
-        let rotate = prod
-            .find("Ok(LiveSubscriptionCommand::RotateByRedial")
-            .expect("rotation arm");
-        let arm = &prod[rotate..];
-        let halted = arm
-            .find("rotation_halted()")
-            .expect("the arm reads the breaker");
-        let swap = arm.find("try_swap(").expect("the arm swaps the guard");
+    }
+
+    /// The 805 breaker at the WRITE, not only at the plan (scope lock
+    /// 2026-10-01: after any 805 no depth-200 change and no ghost unsubscribe
+    /// is sent). A swap can wait in the channel while the socket is down and a
+    /// ghost request can be armed before the 805, so both are checked again
+    /// where they would reach the wire. Pinned by source for the same reason
+    /// as `an_805_halts_every_later_rotation`: the flag is process-global.
+    #[test]
+    fn an_805_refuses_a_queued_swap_and_a_pending_ghost_at_the_connection() {
+        let src = include_str!("pool_supervisor.rs");
+        let prod = src.split("#[cfg(test)]").next().expect("production half");
+        let swap_arm = prod
+            .find("Ok(LiveSubscriptionCommand::Swap { old, new, ack }) => {")
+            .expect("the swap arm");
+        let try_swap = prod[swap_arm..]
+            .find("guard.try_swap(old, new)")
+            .expect("the swap arm calls try_swap");
         assert!(
-            halted < swap,
-            "the breaker must be read BEFORE the guard is touched"
+            prod[swap_arm..swap_arm + try_swap].contains(
+                "supervisor.slot().endpoint == DhanEndpointType::Depth200 && rotation_halted()"
+            ),
+            "a depth-200 swap must be refused after an 805 BEFORE the guard is touched"
+        );
+        let resend = prod
+            .find("async fn resend_ghost_unsubscribe")
+            .expect("the resend");
+        let send = prod[resend..]
+            .find("socket.send_unsubscribe(&[ghost])")
+            .expect("the resend writes the unsubscribe");
+        assert!(
+            prod[resend..resend + send].contains("if rotation_halted() {"),
+            "a ghost unsubscribe must be refused after an 805 before it is written"
         );
     }
 
@@ -14240,7 +14454,7 @@ mod tests {
     ///
     /// Split across three tests named for the three functions (2026-09-12)
     /// so `pub-fn-test-guard` can find the coverage by name — the house
-    /// convention its sibling `request_ghost_redial_*` tests already use.
+    /// convention its sibling `request_ghost_unsubscribe_*` tests already use.
     /// Each owns its OWN slot index: the register is process-global and
     /// deliberately never cleared, so a shared index would make one test's
     /// pass depend on another's execution order.
@@ -14306,12 +14520,11 @@ mod tests {
         assert!(!probe_close_spent(out_of_range));
     }
 
-    /// A ghost redial and a probe close can both be pending on one socket.
-    /// The ghost must win: it is a FAULT and the probe is a MEASUREMENT,
-    /// and letting a measurement pre-empt a fault would delay the
-    /// remediation by a whole cooldown.
+    /// A ghost unsubscribe and a probe close can both be pending on one
+    /// socket. The ghost is taken first: it is a FAULT and the probe is a
+    /// MEASUREMENT, and a measurement must never pre-empt a remediation.
     #[test]
-    fn the_ghost_redial_is_taken_before_the_probe_close() {
+    fn the_ghost_unsubscribe_is_taken_before_the_probe_close() {
         let src = include_str!("pool_supervisor.rs");
         let production = src
             .split_once("\n#[cfg(test)]\nmod tests {")
@@ -14321,8 +14534,8 @@ mod tests {
             "anti-vacuity: the production half must contain the take fn"
         );
         let ghost = production
-            .find("take_ghost_redial(supervisor.slot().global_index)")
-            .expect("the connection task must take ghost redials");
+            .find("take_ghost_unsubscribe(supervisor.slot().global_index)")
+            .expect("the connection task must take ghost unsubscribes");
         let probe = production
             .find("take_probe_close(supervisor.slot().global_index)")
             .expect("the connection task must take probe closes");
@@ -15475,8 +15688,10 @@ mod tests {
         let src = include_str!("pool_supervisor.rs");
         let marker = concat!("#[cfg(", "test)]");
         let prod = src.split(marker).next().unwrap_or(src);
+        // The ranked rotation is an in-place swap since 2026-10-01 (scope
+        // lock); its connection arm checks the breaker before the guard moves.
         let rotate = prod
-            .find("Ok(LiveSubscriptionCommand::RotateByRedial")
+            .find("Ok(LiveSubscriptionCommand::Swap { old, new, ack })")
             .expect("rotation arm");
         let arm = &prod[rotate..];
         let arm = &arm[..arm.len().min(4_000)];

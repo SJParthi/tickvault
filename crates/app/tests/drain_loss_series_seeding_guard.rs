@@ -103,7 +103,7 @@ fn the_ghost_family_is_seeded_so_the_unsubscribe_code_verdict_is_readable() {
     for field in [
         "depth_ghost",
         "depth_unsubscribed_grace",
-        "depth_ghost_redials",
+        "depth_ghost_unsubscribes",
         "depth_ghost_exhausted",
         "depth_refused",
         "depth_dropped",
