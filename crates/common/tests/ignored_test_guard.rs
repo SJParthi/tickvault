@@ -247,6 +247,22 @@ const ALLOWED_IGNORED: &[(&str, &str)] = &[
         "crates/trading/tests/hot_path_latency.rs",
         "tick_hot_path_latency_distribution",
     ),
+    // Added 2026-10-02, same shape and same reason: the database half of the
+    // write path. The append harness times one ILP row append (no database);
+    // the live harness times a synchronous flush against a running QuestDB and
+    // returns early unless TV_QDB_HTTP is set, so it can never run in CI.
+    // Measured 2026-10-02 against a local QuestDB 9.3.5 (dev container,
+    // commit mode nosync): row append p99 1.2 us (tick) / 0.9 us (depth);
+    // flush of 1,000 ticks p50 3.3 ms, p99 23 ms; 10,000 depth rows p50
+    // 14 ms, p99 32 ms. With cairo.commit.mode=sync the flush was 6-8x slower.
+    (
+        "crates/storage/tests/ilp_write_latency.rs",
+        "ilp_append_cost_per_row",
+    ),
+    (
+        "crates/storage/tests/ilp_write_latency.rs",
+        "ilp_flush_and_visibility_latency_live_questdb",
+    ),
 ];
 
 struct Ignored {
