@@ -180,36 +180,6 @@ const DEPTH_SEGMENT_UNKNOWN: &str = tickvault_common::segment::segment_code_to_s
 const RANKED_OPTION_FAMILIES: [crate::volume_leaderboard::OptionFamily; 1] =
     [crate::volume_leaderboard::OptionFamily::Stock];
 
-/// One bit per [`crate::volume_leaderboard::OptionFamily`], for the per-tick
-/// membership test (2026-10-02).
-const fn option_family_bit(family: crate::volume_leaderboard::OptionFamily) -> u8 {
-    match family {
-        crate::volume_leaderboard::OptionFamily::Index => 1 << 0,
-        crate::volume_leaderboard::OptionFamily::Stock => 1 << 1,
-    }
-}
-
-/// [`RANKED_OPTION_FAMILIES`] folded into a bitmask at COMPILE time, so the
-/// list stays the single source and the per-tick test is one AND + compare.
-const RANKED_OPTION_FAMILY_MASK: u8 = {
-    let mut mask = 0u8;
-    let mut i = 0;
-    // O(1) EXEMPT: begin — const evaluation over a fixed-size array, run by the compiler, never at runtime.
-    while i < RANKED_OPTION_FAMILIES.len() {
-        mask |= option_family_bit(RANKED_OPTION_FAMILIES[i]);
-        i += 1;
-    }
-    // O(1) EXEMPT: end
-    mask
-};
-
-/// Whether `family` is ranked: one AND and one compare against a constant,
-/// in place of a `contains` walk over the array on the frame drain.
-#[inline]
-const fn is_ranked_option_family(family: crate::volume_leaderboard::OptionFamily) -> bool {
-    RANKED_OPTION_FAMILY_MASK & option_family_bit(family) != 0
-}
-
 /// Environment opt-in that must be `1` for the lane to run, on top of
 /// `[feeds] dhan_enabled`. Absent means OFF, which is the whole point.
 pub const DHAN_LIVE_FEED_ENV: &str = "TICKVAULT_DHAN_LIVE_FEED";
@@ -4461,11 +4431,10 @@ impl LiveIngest {
         // owner lookup is what identifies the family, and the depth and candle
         // paths need it regardless.
         //
-        // `RANKED_OPTION_FAMILIES` is the single source, folded at compile
-        // time into `RANKED_OPTION_FAMILY_MASK` (2026-10-02): one AND and one
-        // compare per tick whatever the list's length, and re-admitting a
-        // family stays one edit in one place.
-        if !is_ranked_option_family(owner.family) {
+        // `RANKED_OPTION_FAMILIES` is the single source: `contains` over a
+        // one-element array of a `Copy` enum compiles to one compare, and
+        // re-admitting a family stays one edit in one place.
+        if !RANKED_OPTION_FAMILIES.contains(&owner.family) {
             return;
         }
         let _ = self.leaderboard.observe(
@@ -19849,33 +19818,6 @@ mod tests {
                 assert_eq!(shed, wal_backed && !gate, "backed={wal_backed} gate={gate}");
             }
         }
-    }
-
-    /// The compile-time bitmask must agree with the list it is folded from,
-    /// for EVERY family value. The exhaustive `match` makes a new variant a
-    /// compile error here until it is added to the loop.
-    #[test]
-    fn is_ranked_option_family_agrees_with_the_array_for_every_family() {
-        use crate::volume_leaderboard::OptionFamily;
-        let every = [OptionFamily::Index, OptionFamily::Stock];
-        for family in every {
-            match family {
-                OptionFamily::Index | OptionFamily::Stock => {}
-            }
-            assert_eq!(
-                is_ranked_option_family(family),
-                RANKED_OPTION_FAMILIES.contains(&family),
-                "mask and array disagree for {family:?}"
-            );
-        }
-        // Distinct bits, so no two families can alias in the mask.
-        assert_ne!(
-            option_family_bit(OptionFamily::Index),
-            option_family_bit(OptionFamily::Stock)
-        );
-        // Today's policy, pinned: stock options only (2026-09-18 FOURTH).
-        assert!(is_ranked_option_family(OptionFamily::Stock));
-        assert!(!is_ranked_option_family(OptionFamily::Index));
     }
 
     /// Both production depth paths must route the shed through
