@@ -143,6 +143,10 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
         "logged — VERIFIED 2026-08-21: the emit lives in the shared helper record_depth_failure(), and every one of its SIX call sites in dhan_depth_universe.rs places it immediately before a tracing::error! carrying code=WS-GAP-02. The log therefore reaches errors.jsonl on every increment; it is simply one function away from the counter, which is the one thing this scanner cannot see. Pinned in-crate by failure_metric_tests::every_depth_failure_log_carries_an_error_code, which fails the build if any arm loses its code field. EMF-shipping it remains available as a ~$0.30/mo decision; the cheaper path is an errcode log-filter alarm on WS-GAP-02, which the code field above already makes possible and which needs a dated row in dhan-rest-only-noise-lock-2026-07-14.md first.",
     ),
     (
+        "tv_dhan_feed_backup_duplicates_dropped_total",
+        "NOT A LOSS COUNTER (added 2026-10-02 with the main-feed backup copies, scope lock 2026-10-02). It counts the SECOND copy of a packet the drain already folded from the contract's other socket (reason=identical) or a copy older than one already folded (reason=older). The data it measures is held, not lost: the first copy is folded and stored, and the WAL keeps both copies as raw frames. Shipping it would bill a healthy duplicate rate as if it were loss; the matching signal for a socket that stops is tv_dhan_feed_backup_only_arrivals_total.",
+    ),
+    (
         "tv_dhan_feed_ingest_seq_refused_total",
         "logged — the emit is counters().ingest_seq_refused, three levels of indirection from the literal (const -> struct field -> method), and the error! sits directly beside it; the scanner cannot follow that chain (verified 2026-08-12)",
     ),

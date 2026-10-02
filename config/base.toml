@@ -807,6 +807,16 @@ spot_universe_fno_underlyings_only = false
 # subscribes MORE than was asked for, never less.
 spot_universe_ntm_only = true
 
+# A second, backup copy of the most important contracts on another main-feed
+# socket, so a dropped socket does not cost their ticks. Operator 2026-10-02
+# ("go ahea ddude" / "dont b;ock go ahea ddude"), recorded verbatim in
+# `websocket-connection-scope-lock.md` BEFORE this key existed. The copies are
+# the option legs nearest the money, sent once after the contract attach, on
+# the spot socket (never the socket that carries the first copy), only into
+# free slots. The drain folds and writes ONE copy of each packet; the WAL keeps
+# both. 0 turns it off.
+backup_top_n = 1000
+
 # ===========================================================================
 # Daily timeframe-consistency verifier (operator directive 2026-07-13 —
 # "how will you guarantee that all our defined timeframes internally are

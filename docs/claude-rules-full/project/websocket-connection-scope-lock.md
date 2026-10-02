@@ -8336,3 +8336,61 @@ QuestDB before any socket dialled.
   changes an existing candle, or writes a row without `feed`.
 - Switches `market_depth` to array rows before the scratch-table test is
   recorded, or drops any level, side or packet in the conversion.
+
+### 2026-10-02 — A BACKUP COPY OF THE TOP CONTRACTS ON A SECOND MAIN-FEED SOCKET (duplicate subscriptions, inside the 5 x 5,000 caps)
+
+**Operator quotes (2026-10-02, preserve EXACTLY, typos included):**
+
+> "go ahea ddude"
+
+(11:51:46Z, project chat — the reply to a post listing five pending decisions,
+including "(5) a backup copy of the top 1,000 contracts on a second main-feed
+socket", with that option recommended.)
+
+> "dont b;ock go ahea ddude"
+
+(11:51:57Z, the work thread — the same approval, restated.)
+
+What the two lines answer: decision 5 — subscribe the most important contracts
+TWICE, on two different main-feed sockets, so that when one socket drops those
+contracts keep arriving on the other and no tick is missed for them.
+
+#### Measured and derived capacity (recorded before any code)
+
+| | count | label |
+|---|---:|---|
+| Main-feed cap, 5 sockets x 5,000 | 25,000 | Verified (`pool_budget.rs`) |
+| Spot set (indices + Nifty Total Market) | 868 | Measured on the box 2026-08-22 |
+| Index options, NIFTY + BANKNIFTY current expiry | 1,250 (range 542–2,037) | Measured 2026-08-22 |
+| Stock options at ATM ±25 | 20,220 | Measured 2026-08-22 |
+| Futures | 0 (were ~658) | Removed 2026-09-18 |
+| **Free main-feed slots today** | **~2,662** (range ~1,875–3,370 with the index-chain swing) | **Derived**, not re-measured |
+
+The four contract sockets are packed to 5,000 each; every free slot sits on the
+SPOT socket (868 spots + ~1,470 contract overflow). So the backup copies go on
+the spot socket, and a contract is backed up only when its first copy was
+dialed on a contract socket — the two copies are never on one socket.
+
+#### What this authorizes
+
+| Surface | Disposition |
+|---|---|
+| Duplicate main-feed subscription | Up to `[dhan_universe] backup_top_n` contracts (default **1,000**, `0` disables) subscribed a SECOND time on the spot socket, never on the socket that carries their first copy. Only free slots are used: never a sixth main-feed socket, never more than 5,000 on a socket, never a slot the authorized universe needs. Sent once, after the contract attach and its late top-up window are finished. |
+| Which contracts | The option legs nearest the money, ranked by distance from at-the-money in parts per million of the reference strike (index chains from the ladder centre, stock ladders from the spot-located ATM strike). Static for the day. |
+| Duplicate packets in the drain | For the backup set only: a packet byte-identical to one already accepted for that contract, or carrying an OLDER cumulative volume than the newest accepted, is **not folded and not written** (`ticks`, inline depth, `feed_aux_packets`), and is counted. The WAL still captures BOTH copies, so nothing received is lost — this is the dated quote for that drop disposition under the 2026-09-29 section. |
+| Proof counter | A copy accepted from one socket while the other socket of that pair had delivered no frame for 2 s is counted as a backup-only arrival. |
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Opens a sixth main-feed socket, puts more than 5,000 instruments on one, or
+  uses the depth-only second account for any main-feed or backup copy.
+- Places a backup copy on the socket that carries its first copy, or shrinks the
+  ATM window, the index chains or the spot set to make room for backups.
+- Sends the backups before the late top-up window closes, so a late-priced
+  contract finds no room.
+- Drops a backup-set packet that carries a NEWER cumulative volume, or drops
+  anything outside the backup set, or drops it before the WAL capture.
+- Counts or folds both copies of one packet (double volume, double ticks, or two
+  `ticks` rows for one packet).
+- Raises the default above 1,000 or re-ranks / re-subscribes the backup set
+  during the session without a fresh dated quote HERE.
