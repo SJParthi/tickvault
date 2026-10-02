@@ -95,6 +95,10 @@ pub const MAX_WS_READER_THREADS: usize = 4;
 /// readers separately from `tv-worker`.
 pub const WS_READER_THREAD_NAME: &str = "tv-ws-reader";
 
+/// Name of a blocking-pool thread of the reader runtime: unpinned, and named
+/// apart so `top -H` never mistakes it for a reader.
+pub const WS_READER_BLOCKING_THREAD_NAME: &str = "tv-ws-reader-bk";
+
 static READER_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
 /// Environment variable naming the core the reader threads pin to: a core
@@ -120,6 +124,14 @@ static PINNED_CORE: AtomicI64 = AtomicI64::new(-1);
 static PIN_FAILURES: AtomicU64 = AtomicU64::new(0);
 /// The last failed pin's OS error number (0 = none).
 static PIN_LAST_ERRNO: AtomicI32 = AtomicI32::new(0);
+/// Pin attempts made (passed or failed), so the boot report can wait for
+/// every worker's pin before it reads the outcome.
+static PIN_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+/// How long [`install_reader_runtime`] waits for every worker's pin attempt.
+const PIN_SETTLE_DEADLINE_SECS: u64 = 1;
+/// [`PIN_SETTLE_DEADLINE_SECS`] as a `Duration`.
+const PIN_SETTLE_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(PIN_SETTLE_DEADLINE_SECS);
 
 /// What the reader threads will do about core pinning, decided once in
 /// `main` from [`WS_READER_CORE_ENV`] and the process's allowed core set.
@@ -244,10 +256,13 @@ fn pin_this_reader_thread(core: usize) {
                 PIN_LAST_ERRNO.store(errno, Ordering::Relaxed);
             }
         }
+        // Last, with Release: a reader that sees the count sees the outcome.
+        PIN_ATTEMPTS.fetch_add(1, Ordering::Release);
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = core;
+        PIN_ATTEMPTS.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -294,6 +309,21 @@ mod affinity {
         }
     }
 
+    /// Restores the calling thread to `set` (the process's own core set).
+    /// A thread inherits its creator's affinity, so a blocking-pool thread
+    /// spawned from a pinned worker starts pinned until this runs.
+    pub(super) fn set_current_thread_mask(set: &libc::cpu_set_t) -> Result<(), i32> {
+        // SAFETY: `set` is a valid `cpu_set_t` and the size passed is its exact size; pid 0 is this thread.
+        let rc = unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), set) }; // SAFETY: see above
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EINVAL))
+        }
+    }
+
     fn empty_set() -> libc::cpu_set_t {
         // SAFETY: `cpu_set_t` is a plain array of integers; all-zero is the valid empty set.
         unsafe { std::mem::zeroed() } // SAFETY: see above
@@ -317,8 +347,17 @@ pub fn resolve_ws_reader_threads(raw: Option<&str>) -> usize {
 }
 
 /// Builds (but does not install) a reader runtime with `threads` workers,
-/// each pinned to `pin_core` when it is `Some` (also any blocking-pool
-/// thread this runtime starts; the read tasks start none).
+/// each pinned to `pin_core` when it is `Some`.
+///
+/// Only the workers are pinned. Tokio names each thread when it SPAWNS it,
+/// and it spawns the workers first, one after another, inside `build()`, so
+/// the first `threads` names handed out are the workers' — decided on the
+/// building thread, not by which thread happens to start running first. A
+/// later blocking-pool thread (`spawn_blocking`, or the hand-off a
+/// `block_in_place` makes; the read tasks use neither) is named
+/// [`WS_READER_BLOCKING_THREAD_NAME`] and put back on the core set the caller
+/// had when the runtime was built: a new thread inherits its creator's
+/// affinity, and its creator may be a pinned worker.
 ///
 /// Separate from [`install_reader_runtime`] so a test can build one without
 /// touching the process-global slot.
@@ -329,15 +368,55 @@ pub fn build_reader_runtime(
     threads: usize,
     pin_core: Option<usize>,
 ) -> std::io::Result<tokio::runtime::Runtime> {
+    let workers = threads.max(1);
+    let named = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder
-        .worker_threads(threads.max(1))
-        .thread_name(WS_READER_THREAD_NAME)
+        .worker_threads(workers)
+        .thread_name_fn(move || {
+            if named.fetch_add(1, Ordering::Relaxed) < workers {
+                // APPROVED: one name String per thread spawn (cold), never per frame
+                String::from(WS_READER_THREAD_NAME)
+            } else {
+                // APPROVED: one name String per thread spawn (cold), never per frame
+                String::from(WS_READER_BLOCKING_THREAD_NAME)
+            }
+        })
         .enable_all();
     if let Some(core) = pin_core {
-        builder.on_thread_start(move || pin_this_reader_thread(core));
+        #[cfg(target_os = "linux")]
+        let unpinned_set = affinity::allowed_cpu_set();
+        builder.on_thread_start(move || {
+            if std::thread::current().name() == Some(WS_READER_THREAD_NAME) {
+                pin_this_reader_thread(core);
+            } else {
+                // Best effort: on failure the thread stays on the reader's
+                // core, which is the behaviour before this fix, not a fault.
+                #[cfg(target_os = "linux")]
+                if let Some(set) = unpinned_set.as_ref() {
+                    let _restored = affinity::set_current_thread_mask(set);
+                }
+            }
+        });
     }
     builder.build()
+}
+
+/// Waits, at most `deadline`, until `expected` pin attempts have been
+/// recorded since `before`, so the boot report reads every worker's outcome
+/// rather than whichever pinned first. Returns whether they all arrived.
+fn wait_for_pin_attempts(before: u64, expected: u64, deadline: std::time::Duration) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        if PIN_ATTEMPTS.load(Ordering::Acquire).saturating_sub(before) >= expected {
+            return true;
+        }
+        if start.elapsed() >= deadline {
+            return false;
+        }
+        // APPROVED-BLOCKING: runs once in `main` before any runtime exists; at most `PIN_SETTLE_DEADLINE`. APPROVED: boot-only bounded wait, never on a hot path.
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
 }
 
 /// What [`install_reader_runtime`] did, for the boot log.
@@ -370,9 +449,19 @@ pub fn install_reader_runtime(
     if READER_RUNTIME.get().is_some() {
         return Ok(ReaderRuntimeInstall::AlreadyInstalled);
     }
+    let attempts_before = PIN_ATTEMPTS.load(Ordering::Acquire);
     let runtime = build_reader_runtime(threads, pin_core)?;
     // APPROVED-BLOCKING: runs once in `main`, before any runtime or socket exists, and waits only for one empty task on a fresh worker.
     let _warmed = runtime.block_on(runtime.spawn(async {}));
+    if pin_core.is_some() {
+        // A worker whose pin has not run yet would otherwise be missing from
+        // the boot report. One that never runs within the deadline counts as
+        // a failed pin, so the report says UNPINNED rather than pinned.
+        let expected = u64::try_from(threads).unwrap_or(u64::MAX);
+        if !wait_for_pin_attempts(attempts_before, expected, PIN_SETTLE_DEADLINE) {
+            PIN_FAILURES.fetch_add(1, Ordering::Relaxed);
+        }
+    }
     match READER_RUNTIME.set(runtime) {
         Ok(()) => Ok(ReaderRuntimeInstall::Installed(threads)),
         // A racing installer won; ours is dropped here, outside any async
@@ -575,6 +664,53 @@ mod tests {
         });
         assert!(only_that_core, "reader thread must run on core {core} only");
         assert_eq!(reader_pinned_core(), i64::try_from(core).expect("small"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_regression_build_reader_runtime_leaves_blocking_threads_unpinned() {
+        let Some(set) = affinity::allowed_cpu_set() else {
+            return;
+        };
+        let allowed = (0..=MAX_WS_READER_CORE)
+            .filter(|c| affinity::cpu_in_set(&set, *c))
+            .count();
+        let Some(core) = (1..=MAX_WS_READER_CORE).find(|c| affinity::cpu_in_set(&set, *c)) else {
+            return;
+        };
+        if allowed < 2 {
+            return; // one allowed core: pinned and unpinned look the same
+        }
+        let rt = build_reader_runtime(1, Some(core)).expect("one thread");
+        let blocking_allowed = rt.block_on(async {
+            tokio::task::spawn_blocking(|| {
+                assert_eq!(
+                    std::thread::current().name(),
+                    Some(WS_READER_BLOCKING_THREAD_NAME)
+                );
+                let mine = affinity::allowed_cpu_set().expect("own mask");
+                (0..=MAX_WS_READER_CORE)
+                    .filter(|c| affinity::cpu_in_set(&mine, *c))
+                    .count()
+            })
+            .await
+            .expect("blocking task ran")
+        });
+        assert_eq!(
+            blocking_allowed, allowed,
+            "a blocking-pool thread must keep the process's whole core set"
+        );
+    }
+
+    #[test]
+    fn test_wait_for_pin_attempts_returns_on_arrival_and_on_deadline() {
+        let now = PIN_ATTEMPTS.load(Ordering::Acquire);
+        assert!(wait_for_pin_attempts(now, 0, std::time::Duration::ZERO));
+        assert!(!wait_for_pin_attempts(
+            now,
+            u64::MAX,
+            std::time::Duration::from_millis(5)
+        ));
     }
 
     #[cfg(target_os = "linux")]

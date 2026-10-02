@@ -48,7 +48,8 @@
 //! # Complexity
 //!
 //! Per sample: O(fds) to list our sockets plus O(lines) over the two tables,
-//! each line one hash probe. Cold, 1 Hz, off the frame path. The inode set and
+//! each line one hash probe. Cold, 1 Hz, off the frame path, and the reads run
+//! on the blocking pool (`spawn_blocking`), never on a runtime worker. The inode set and
 //! the read buffers are reused across samples.
 
 use std::collections::HashSet;
@@ -338,7 +339,22 @@ async fn run_kernel_rx_queue_sampler(shutdown: Arc<tokio::sync::Notify>) {
             );
             continue;
         }
-        let Some(sample) = reader.sample() else {
+        // The /proc reads are blocking file I/O: they run on the blocking
+        // pool, never on a runtime worker the drain or a socket may need.
+        // The reader (and its buffers) travels there and back, so nothing is
+        // re-allocated per sample beyond the hand-off itself (once a second).
+        let (returned, sampled) = match tokio::task::spawn_blocking(move || {
+            let sample = reader.sample();
+            (reader, sample)
+        })
+        .await
+        {
+            Ok(pair) => pair,
+            // The sample panicked: start a fresh reader next second.
+            Err(_) => (ProcReader::new(), None),
+        };
+        reader = returned;
+        let Some(sample) = sampled else {
             if !unavailable_logged {
                 unavailable_logged = true;
                 info!(

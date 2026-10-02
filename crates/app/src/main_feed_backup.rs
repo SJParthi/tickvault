@@ -21,11 +21,19 @@
 //! the rows must see ONE: `ticks` keys on `capture_seq`, so two copies would be
 //! two rows, and a stale copy arriving late would feed the fold a cumulative
 //! volume that went backwards. [`BackupDedup`] keeps, per backup contract, a
-//! ring of recent packet fingerprints and the newest accepted
-//! `(cumulative volume, trade time)`. A packet byte-identical to one in the
-//! ring, or carrying an OLDER cumulative volume than the newest accepted, is
-//! dropped and counted. Anything else is accepted, whichever socket it came
-//! from — so when one socket is down the other's copies are simply accepted.
+//! ring of recent packet fingerprints (each with the socket it came on) and
+//! the newest accepted `(cumulative volume, trade time)`. A packet
+//! byte-identical to an unpaired ring entry from the OTHER socket, or older
+//! than the newest accepted, is dropped and counted; a same-socket identical
+//! repeat is a real repeat and is kept. Anything else is accepted, whichever
+//! socket it came from — so when one socket is down the other's copies are
+//! simply accepted.
+//!
+//! **Replay.** Each publication is also persisted ([`write_backup_set`]); the
+//! WAL replay rebuilds the table from it ([`ReplayBackup`]) and drops the
+//! second copies of the frames the live drain deduplicated with it. A replayed
+//! frame carries no socket, so there an identical unpaired entry from any
+//! socket matches.
 //!
 //! # Cost
 //!
@@ -34,12 +42,13 @@
 //! only a filter hit (the backup set, plus ~1.5% false positives at 1,000
 //! entries) pays one hash probe, and a backup contract's packet pays a
 //! fingerprint over its bytes (~20 word mixes for a 162-byte Full packet) and a
-//! 16-entry compare. O(1), zero allocation per packet. Installing a new set
-//! allocates once, on the first frame after a publication (once a day).
+//! 16-entry compare. O(1), zero allocation per packet. A new set is built by
+//! the publisher, off the drain; the drain adopts it with a pointer swap and
+//! hands its previous state back for the publisher to free.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 
 use arc_swap::ArcSwapOption;
 use tickvault_common::tick_types::ParsedTick;
@@ -133,9 +142,56 @@ pub fn plan_backup_set(
     }
     out
 }
+/// The membership half of a backup set: the pre-filter and the index. Built
+/// off the drain (by the publisher) and shared read-only.
+struct BackupTable {
+    filter: Box<[u64; FILTER_WORDS]>,
+    index: HashMap<(u64, u8), u32>,
+    len: usize,
+}
 
-fn published() -> &'static ArcSwapOption<Vec<(u64, u8)>> {
-    static SET: OnceLock<ArcSwapOption<Vec<(u64, u8)>>> = OnceLock::new();
+impl BackupTable {
+    /// Cold: allocates for the set. A repeated key is held once.
+    fn build(set: &[(u64, u8)]) -> Self {
+        let mut filter = Box::new([0u64; FILTER_WORDS]);
+        let mut index = HashMap::with_capacity(set.len());
+        for &(security_id, segment) in set {
+            if index.contains_key(&(security_id, segment)) {
+                continue;
+            }
+            let Ok(at) = u32::try_from(index.len()) else {
+                break;
+            };
+            index.insert((security_id, segment), at);
+            let bit = filter_bit(security_id, segment);
+            if let Some(word) = filter.get_mut(bit / 64) {
+                *word |= 1u64 << (bit % 64);
+            }
+        }
+        let len = index.len();
+        Self { filter, index, len }
+    }
+}
+
+/// What the publisher hands the drain alongside the shared table: the
+/// drain's fresh per-contract state, pre-built, and a slot the drain moves
+/// its previous state into so the publisher's thread frees it, never the
+/// drain.
+#[derive(Default)]
+struct Handoff {
+    fresh_slots: Option<Vec<Slot>>,
+    retired: Option<(Arc<BackupTable>, Vec<Slot>)>,
+}
+
+/// One publication.
+struct Prepared {
+    generation: u64,
+    table: Arc<BackupTable>,
+    handoff: Mutex<Handoff>,
+}
+
+fn published() -> &'static ArcSwapOption<Prepared> {
+    static SET: OnceLock<ArcSwapOption<Prepared>> = OnceLock::new();
     SET.get_or_init(ArcSwapOption::empty)
 }
 
@@ -146,22 +202,58 @@ static GENERATION: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 pub(crate) static TEST_PUBLISH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Publishes the confirmed backup set to the drain, which installs it on its
-/// next frame. Cold: once a day, after the subscribe is acknowledged.
+/// Publishes the backup set to the drain, which adopts it on its next frame.
+/// Cold: the table and the drain's fresh state are built HERE, on the
+/// publisher's task, so the drain pays a pointer swap. Called BEFORE the
+/// subscribe goes out (a copy can then never arrive undeduplicated), and
+/// again with the held subset or an empty set when the socket answers.
 pub fn publish_backup_set(set: &[SubscribeInstrument]) {
     let keys: Vec<(u64, u8)> = set
         .iter()
         .map(|i| (i.security_id, i.segment.binary_code()))
         .collect();
-    published().store(Some(std::sync::Arc::new(keys)));
-    GENERATION.fetch_add(1, Ordering::Release);
+    let table = Arc::new(BackupTable::build(&keys));
+    let fresh_slots = if table.len == 0 {
+        Vec::new()
+    } else {
+        vec![Slot::fresh(); table.len]
+    };
+    let generation = GENERATION.load(Ordering::Acquire).saturating_add(1);
+    // Replacing the previous publication drops it here, on the publisher,
+    // with whatever state the drain retired into it.
+    published().store(Some(Arc::new(Prepared {
+        generation,
+        table,
+        handoff: Mutex::new(Handoff {
+            fresh_slots: Some(fresh_slots),
+            retired: None,
+        }),
+    })));
+    GENERATION.fetch_max(generation, Ordering::Release);
 }
 
-/// Per-contract dedup state. 200 bytes, `Copy`.
+/// The contracts of the current publication (tests).
+#[cfg(test)]
+pub(crate) fn published_keys() -> Vec<(u64, u8)> {
+    let mut keys: Vec<(u64, u8)> = published()
+        .load_full()
+        .map(|p| p.table.index.keys().copied().collect())
+        .unwrap_or_default();
+    keys.sort_unstable();
+    keys
+}
+
+/// Per-contract dedup state, `Copy`.
 #[derive(Debug, Clone, Copy, Default)]
 struct Slot {
     fps: [u64; FINGERPRINT_RING],
+    /// The connection each fingerprint arrived on.
+    fp_conn: [u8; FINGERPRINT_RING],
+    /// Bit `i`: entry `i` already had its second copy dropped.
+    fp_paired: u32,
     aux: [u64; AUX_FINGERPRINT_RING],
+    aux_conn: [u8; AUX_FINGERPRINT_RING],
+    aux_paired: u32,
     next: u8,
     aux_next: u8,
     has_newest: bool,
@@ -207,17 +299,30 @@ impl Slot {
     }
 }
 
+/// The ring entry this packet is the SECOND copy of: the same fingerprint,
+/// not yet paired, from the OTHER socket. A same-socket identical repeat is a
+/// real repeat and matches nothing. A replayed frame carries no connection
+/// (`u8::MAX`), so on either side an unknown socket matches any socket.
+/// O(ring), a constant.
+#[inline]
+fn second_copy_of(fps: &[u64], conns: &[u8], paired: u32, fp: u64, conn: u8) -> Option<usize> {
+    fps.iter().zip(conns).enumerate().find_map(|(i, (&f, &c))| {
+        let other_socket = conn == u8::MAX || c == u8::MAX || c != conn;
+        (f == fp && paired & (1u32 << i) == 0 && other_socket).then_some(i)
+    })
+}
+
 /// The drain's backup dedup table. Owned by `LiveIngest`, single-threaded.
 pub struct BackupDedup {
     active: bool,
     generation_seen: u64,
-    filter: Box<[u64; FILTER_WORDS]>,
-    index: HashMap<(u64, u8), u32>,
+    table: Arc<BackupTable>,
     slots: Vec<Slot>,
     last_frame_millis: [u64; TRACKED_CONNECTIONS],
     dropped_identical: metrics::Counter,
     dropped_older: metrics::Counter,
     backup_only: metrics::Counter,
+    instruments: metrics::Gauge,
 }
 
 impl Default for BackupDedup {
@@ -277,8 +382,7 @@ impl BackupDedup {
         Self {
             active: false,
             generation_seen: 0,
-            filter: Box::new([0u64; FILTER_WORDS]),
-            index: HashMap::new(),
+            table: Arc::new(BackupTable::build(&[])),
             slots: Vec::new(),
             last_frame_millis: [0; TRACKED_CONNECTIONS],
             dropped_identical: metrics::counter!(
@@ -287,7 +391,23 @@ impl BackupDedup {
             ),
             dropped_older: metrics::counter!(BACKUP_DUPLICATES_DROPPED_COUNTER, "reason" => "older"),
             backup_only: metrics::counter!(BACKUP_ONLY_ARRIVALS_COUNTER),
+            instruments: metrics::gauge!(BACKUP_INSTRUMENTS_GAUGE),
         }
+    }
+
+    /// A table for the WAL replay: its drops are reported by the replay's
+    /// own outcome, so it does not touch the live series.
+    #[must_use]
+    fn for_replay(set: &[(u64, u8)]) -> Self {
+        let mut d = Self {
+            dropped_identical: metrics::Counter::noop(),
+            dropped_older: metrics::Counter::noop(),
+            backup_only: metrics::Counter::noop(),
+            instruments: metrics::Gauge::noop(),
+            ..Self::new()
+        };
+        d.install(set);
+        d
     }
 
     /// Contracts currently deduplicated.
@@ -302,40 +422,51 @@ impl BackupDedup {
         self.slots.is_empty()
     }
 
-    /// Replaces the set. Cold: allocates for the new set.
+    /// Replaces the set in place. Cold: allocates for the new set. The drain
+    /// never calls this; it adopts a publication in [`Self::on_frame`].
     pub fn install(&mut self, set: &[(u64, u8)]) {
-        self.filter.fill(0);
-        self.index.clear();
-        self.slots.clear();
-        self.index.reserve(set.len());
-        self.slots.reserve(set.len());
-        for &(security_id, segment) in set {
-            if self.index.contains_key(&(security_id, segment)) {
-                continue;
-            }
-            let Ok(at) = u32::try_from(self.slots.len()) else {
-                break;
-            };
-            self.index.insert((security_id, segment), at);
-            self.slots.push(Slot::fresh());
-            let bit = filter_bit(security_id, segment);
-            if let Some(word) = self.filter.get_mut(bit / 64) {
-                *word |= 1u64 << (bit % 64);
-            }
+        self.table = Arc::new(BackupTable::build(set));
+        self.slots = vec![Slot::fresh(); self.table.len];
+        self.active = !self.slots.is_empty();
+        self.instruments.set(self.slots.len() as f64);
+    }
+
+    /// Adopts one publication: a pointer swap for the table and the drain's
+    /// state, the previous pair moved into the publication for the publisher
+    /// to free. O(1), no allocation and no free in the normal case. `false`
+    /// when the hand-off is busy this instant (retried on the next frame).
+    fn adopt(&mut self, p: &Prepared) -> bool {
+        let mut handoff = match p.handoff.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return false,
+        };
+        // A second reader of one publication (tests run several ingests)
+        // builds its own state; the one production drain always finds it.
+        let slots = handoff
+            .fresh_slots
+            .take()
+            .unwrap_or_else(|| vec![Slot::fresh(); p.table.len]);
+        let old_slots = std::mem::replace(&mut self.slots, slots);
+        let old_table = std::mem::replace(&mut self.table, Arc::clone(&p.table));
+        if handoff.retired.is_none() {
+            handoff.retired = Some((old_table, old_slots));
         }
         self.active = !self.slots.is_empty();
-        metrics::gauge!(BACKUP_INSTRUMENTS_GAUGE).set(self.slots.len() as f64);
+        self.instruments.set(self.slots.len() as f64);
+        true
     }
 
     /// Per frame: picks up a newly published set (one relaxed load when there
     /// is none) and stamps the frame's connection as alive.
     #[inline]
     pub fn on_frame(&mut self, connection_index: u8, recv_millis: u64) {
-        let generation = GENERATION.load(Ordering::Acquire);
-        if generation != self.generation_seen {
-            self.generation_seen = generation;
-            let set = published().load_full();
-            self.install(set.as_deref().map_or(&[], Vec::as_slice));
+        if GENERATION.load(Ordering::Acquire) != self.generation_seen
+            && let Some(p) = published().load_full()
+            && p.generation != self.generation_seen
+            && self.adopt(&p)
+        {
+            self.generation_seen = p.generation;
         }
         if self.active
             && let Some(at) = self
@@ -352,11 +483,14 @@ impl BackupDedup {
             return None;
         }
         let bit = filter_bit(security_id, segment);
-        let word = self.filter.get(bit / 64).copied().unwrap_or(0);
+        let word = self.table.filter.get(bit / 64).copied().unwrap_or(0);
         if word & (1u64 << (bit % 64)) == 0 {
             return None;
         }
-        self.index.get(&(security_id, segment)).map(|&i| i as usize)
+        self.table
+            .index
+            .get(&(security_id, segment))
+            .map(|&i| i as usize)
     }
 
     /// Verdict for one tick packet (`packet` = that packet's bytes).
@@ -377,7 +511,14 @@ impl BackupDedup {
             let Some(slot) = self.slots.get_mut(at) else {
                 return BackupVerdict::NotBackup;
             };
-            if slot.fps.contains(&fp) {
+            if let Some(i) = second_copy_of(
+                &slot.fps,
+                &slot.fp_conn,
+                slot.fp_paired,
+                fp,
+                connection_index,
+            ) {
+                slot.fp_paired |= 1u32 << i;
                 self.dropped_identical.increment(1);
                 return BackupVerdict::DropIdentical;
             }
@@ -385,16 +526,19 @@ impl BackupDedup {
             let ltt = tick.exchange_timestamp;
             if slot.has_newest {
                 // Serial-number compare, so a u32 wrap of the vendor's
-                // cumulative reads as newer, not as a huge step back.
+                // cumulative reads as newer, not as a huge step back. A copy
+                // older than the newest accepted is a stale copy, however far
+                // behind the ring it lags.
                 let step = cum.wrapping_sub(slot.newest_cum) as i32;
                 if step < 0 || (step == 0 && ltt < slot.newest_ltt) {
                     self.dropped_older.increment(1);
                     return BackupVerdict::DropOlder;
                 }
-                if step > 0 || ltt > slot.newest_ltt {
+                if step > 0 {
                     slot.newest_cum = cum;
-                    slot.newest_ltt = ltt;
                 }
+                // The newest trade time never goes backwards.
+                slot.newest_ltt = slot.newest_ltt.max(ltt);
             } else {
                 slot.has_newest = true;
                 slot.newest_cum = cum;
@@ -402,6 +546,8 @@ impl BackupDedup {
             }
             let i = usize::from(slot.next) % FINGERPRINT_RING;
             slot.fps[i] = fp;
+            slot.fp_conn[i] = connection_index;
+            slot.fp_paired &= !(1u32 << i);
             slot.next = ((i + 1) % FINGERPRINT_RING) as u8;
             slot.learn(connection_index);
             slot.peer_of(connection_index)
@@ -415,10 +561,17 @@ impl BackupDedup {
         BackupVerdict::Accept
     }
 
-    /// Verdict for a previous-close or open-interest packet: a byte-identical
-    /// copy is dropped, anything else accepted. O(1), zero allocation.
+    /// Verdict for a previous-close or open-interest packet: the other
+    /// socket's byte-identical copy is dropped, anything else accepted.
+    /// O(1), zero allocation.
     #[inline]
-    pub fn admit_aux(&mut self, security_id: u64, segment: u8, packet: &[u8]) -> BackupVerdict {
+    pub fn admit_aux(
+        &mut self,
+        security_id: u64,
+        segment: u8,
+        packet: &[u8],
+        connection_index: u8,
+    ) -> BackupVerdict {
         let Some(at) = self.slot_of(security_id, segment) else {
             return BackupVerdict::NotBackup;
         };
@@ -426,14 +579,151 @@ impl BackupDedup {
         let Some(slot) = self.slots.get_mut(at) else {
             return BackupVerdict::NotBackup;
         };
-        if slot.aux.contains(&fp) {
+        if let Some(i) = second_copy_of(
+            &slot.aux,
+            &slot.aux_conn,
+            slot.aux_paired,
+            fp,
+            connection_index,
+        ) {
+            slot.aux_paired |= 1u32 << i;
             self.dropped_identical.increment(1);
             return BackupVerdict::DropIdentical;
         }
         let i = usize::from(slot.aux_next) % AUX_FINGERPRINT_RING;
         slot.aux[i] = fp;
+        slot.aux_conn[i] = connection_index;
+        slot.aux_paired &= !(1u32 << i);
         slot.aux_next = ((i + 1) % AUX_FINGERPRINT_RING) as u8;
         BackupVerdict::Accept
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The persisted set, for the WAL replay
+// ---------------------------------------------------------------------------
+
+/// Directory of the persisted set: the one every other daily artifact uses.
+const BACKUP_SET_DIR: &str = "data/instrument-cache";
+
+/// The persisted set. One file, overwritten by each publication; the
+/// publication instant inside it says which frames it covers.
+const BACKUP_SET_FILE: &str = "main-feed-backup-set.json";
+
+/// Counter: the WAL replay's backup set, by `outcome` (`loaded`, `missing`,
+/// `unreadable`). Once per lane start.
+pub const BACKUP_REPLAY_SET_COUNTER: &str = "tv_dhan_feed_backup_replay_set_total";
+
+/// What the replay needs to fold one copy of each packet exactly as the live
+/// drain did: the set and the instant the drain started deduplicating it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PersistedBackupSet {
+    /// UTC epoch nanos of the publication.
+    pub published_at_nanos: i64,
+    /// `(security_id, exchange_segment wire byte)`, rank order.
+    pub contracts: Vec<(u64, u8)>,
+}
+
+impl PersistedBackupSet {
+    /// The set as it is published now.
+    #[must_use]
+    pub fn from_set(set: &[SubscribeInstrument], published_at_nanos: i64) -> Self {
+        Self {
+            published_at_nanos,
+            contracts: set
+                .iter()
+                .map(|i| (i.security_id, i.segment.binary_code()))
+                .collect(),
+        }
+    }
+}
+
+/// Where the set is persisted.
+#[must_use]
+pub fn backup_set_path() -> std::path::PathBuf {
+    std::path::Path::new(BACKUP_SET_DIR).join(BACKUP_SET_FILE)
+}
+
+/// Writes the set atomically (temp file, synced, then rename), creating the
+/// directory if needed. Cold.
+pub fn write_backup_set(path: &std::path::Path, set: &PersistedBackupSet) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    let body = serde_json::to_vec(set).map_err(std::io::Error::other)?;
+    {
+        use std::io::Write as _;
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(&body)?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    if let Some(dir) = path.parent()
+        && let Err(err) = std::fs::File::open(dir).and_then(|d| d.sync_all())
+    {
+        tracing::debug!(path = %path.display(), %err, "backup set directory sync failed");
+    }
+    Ok(())
+}
+
+/// Reads the persisted set: `Ok(None)` when there is none, `Err` when a
+/// file exists and cannot be read or parsed. Cold.
+pub fn read_backup_set(path: &std::path::Path) -> Result<Option<PersistedBackupSet>, String> {
+    match std::fs::read(path) {
+        Ok(body) => serde_json::from_slice(&body)
+            .map(Some)
+            .map_err(|e| e.to_string()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+/// IST day number of a UTC epoch-nanos instant.
+#[inline]
+fn ist_day_of_nanos(nanos: i64) -> i64 {
+    let secs = nanos.div_euclid(1_000_000_000).saturating_add(i64::from(
+        tickvault_common::constants::IST_UTC_OFFSET_SECONDS,
+    ));
+    secs.div_euclid(86_400)
+}
+
+/// The WAL replay's dedup: the persisted set, applied only to frames the live
+/// drain deduplicated with it — received at or after its publication, on the
+/// same IST day (the vendor's cumulative restarts each day, so yesterday's
+/// newest volume must never judge today's).
+#[derive(Debug)]
+pub struct ReplayBackup {
+    dedup: BackupDedup,
+    from_nanos: i64,
+    day: i64,
+}
+
+impl ReplayBackup {
+    /// Builds the replay's table. Cold, once per lane start.
+    #[must_use]
+    pub fn new(set: &PersistedBackupSet) -> Self {
+        Self {
+            dedup: BackupDedup::for_replay(&set.contracts),
+            from_nanos: set.published_at_nanos,
+            day: ist_day_of_nanos(set.published_at_nanos),
+        }
+    }
+
+    /// Whether a frame received at `received_at_nanos` was deduplicated live
+    /// with this set. O(1).
+    #[inline]
+    #[must_use]
+    pub fn covers(&self, received_at_nanos: i64) -> bool {
+        received_at_nanos >= self.from_nanos
+            && self.from_nanos > 0
+            && ist_day_of_nanos(received_at_nanos) == self.day
+    }
+
+    /// The table, for the replayed packets it covers.
+    #[inline]
+    pub fn dedup_mut(&mut self) -> &mut BackupDedup {
+        &mut self.dedup
     }
 }
 
@@ -616,9 +906,9 @@ mod tests {
     fn test_admit_aux_drops_the_identical_previous_close_copy() {
         let mut d = dedup_with(&[42]);
         let pkt = [6u8, 16, 0, 2, 42, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8];
-        assert_eq!(d.admit_aux(42, SEG, &pkt), BackupVerdict::Accept);
-        assert_eq!(d.admit_aux(42, SEG, &pkt), BackupVerdict::DropIdentical);
-        assert_eq!(d.admit_aux(43, SEG, &pkt), BackupVerdict::NotBackup);
+        assert_eq!(d.admit_aux(42, SEG, &pkt, 0), BackupVerdict::Accept);
+        assert_eq!(d.admit_aux(42, SEG, &pkt, 4), BackupVerdict::DropIdentical);
+        assert_eq!(d.admit_aux(43, SEG, &pkt, 0), BackupVerdict::NotBackup);
     }
 
     #[test]
@@ -672,6 +962,232 @@ mod tests {
         assert!(GENERATION.load(Ordering::Acquire) > before);
     }
 
+    /// Attack-pass finding 4: a true same-socket identical repeat is a real
+    /// repeat and is kept; only the OTHER socket's copy is dropped, once per
+    /// accepted packet.
+    #[test]
+    fn test_regression_same_socket_identical_repeat_is_kept() {
+        let mut d = dedup_with(&[42]);
+        let t = tick(42, 100, 1_000, 10.0);
+        let b = bytes(&t, 7);
+        assert_eq!(d.admit_tick(&t, &b, 0, 10), BackupVerdict::Accept);
+        assert_eq!(
+            d.admit_tick(&t, &b, 0, 11),
+            BackupVerdict::Accept,
+            "the same socket repeating a packet is a real repeat"
+        );
+        // The other socket's two copies pair with the two accepted ones.
+        assert_eq!(d.admit_tick(&t, &b, 4, 12), BackupVerdict::DropIdentical);
+        assert_eq!(d.admit_tick(&t, &b, 4, 13), BackupVerdict::DropIdentical);
+        // A third copy from the other socket has nothing left to pair with.
+        assert_eq!(d.admit_tick(&t, &b, 4, 14), BackupVerdict::Accept);
+        // The same for previous-close / open-interest packets.
+        let pkt = [6u8, 16, 0, 2, 42, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8];
+        assert_eq!(d.admit_aux(42, SEG, &pkt, 0), BackupVerdict::Accept);
+        assert_eq!(d.admit_aux(42, SEG, &pkt, 0), BackupVerdict::Accept);
+        assert_eq!(d.admit_aux(42, SEG, &pkt, 4), BackupVerdict::DropIdentical);
+    }
+
+    /// Attack-pass finding 5a: a newer cumulative with an earlier trade time
+    /// no longer moves the newest trade time backwards, so a later lagging
+    /// copy at that earlier time cannot slip through.
+    #[test]
+    fn test_regression_newest_ltt_never_goes_backwards() {
+        let mut d = dedup_with(&[42]);
+        let a = tick(42, 100, 1_005, 10.0);
+        let b = tick(42, 110, 1_003, 10.0);
+        assert_eq!(d.admit_tick(&a, &bytes(&a, 0), 0, 1), BackupVerdict::Accept);
+        assert_eq!(d.admit_tick(&b, &bytes(&b, 0), 0, 2), BackupVerdict::Accept);
+        assert_eq!(
+            d.slots[0].newest_ltt, 1_005,
+            "max, never the later packet's"
+        );
+        assert_eq!(d.slots[0].newest_cum, 110);
+        let lag = tick(42, 110, 1_004, 10.0);
+        assert_eq!(
+            d.admit_tick(&lag, &bytes(&lag, 3), 4, 3),
+            BackupVerdict::DropOlder
+        );
+    }
+
+    /// Attack-pass finding 5b: a copy lagging more than the ring behind has
+    /// lost its fingerprint, and is still dropped as stale because it is
+    /// older than the newest accepted.
+    #[test]
+    fn test_regression_lagging_copy_beyond_the_ring_is_dropped_as_older() {
+        let mut d = dedup_with(&[42]);
+        let stream: Vec<ParsedTick> = (0..(FINGERPRINT_RING as u32 + 8))
+            .map(|i| tick(42, 100 + i, 1_000 + i, 10.0))
+            .collect();
+        for t in &stream {
+            assert_eq!(d.admit_tick(t, &bytes(t, 0), 0, 1), BackupVerdict::Accept);
+        }
+        // The backup socket delivers its copy of the very first packet now.
+        let first = &stream[0];
+        assert_eq!(
+            d.admit_tick(first, &bytes(first, 0), 4, 2),
+            BackupVerdict::DropOlder
+        );
+        // And a copy of the newest is still recognised as identical.
+        let last = &stream[stream.len() - 1];
+        assert_eq!(
+            d.admit_tick(last, &bytes(last, 0), 4, 3),
+            BackupVerdict::DropIdentical
+        );
+    }
+
+    /// Attack-pass finding 3: the publisher builds the table AND the drain's
+    /// fresh state; the drain adopts them with a swap and hands its previous
+    /// state back for the publisher to free.
+    #[test]
+    fn test_regression_publish_backup_set_builds_off_the_drain_and_adopt_swaps() {
+        let _guard = TEST_PUBLISH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        publish_backup_set(&[
+            SubscribeInstrument {
+                security_id: 42,
+                segment: ExchangeSegment::NseFno,
+            },
+            SubscribeInstrument {
+                security_id: 43,
+                segment: ExchangeSegment::NseFno,
+            },
+        ]);
+        assert_eq!(published_keys(), vec![(42, SEG), (43, SEG)]);
+        let p = published().load_full().expect("published");
+        {
+            let h = p.handoff.lock().expect("handoff");
+            assert_eq!(
+                h.fresh_slots.as_ref().map(Vec::len),
+                Some(2),
+                "the drain's state is pre-built by the publisher"
+            );
+            assert!(h.retired.is_none());
+        }
+        let mut d = BackupDedup::new();
+        d.on_frame(0, 1);
+        assert_eq!(d.len(), 2);
+        assert!(
+            Arc::ptr_eq(&d.table, &p.table),
+            "the table is shared, not rebuilt"
+        );
+        {
+            let h = p.handoff.lock().expect("handoff");
+            assert!(
+                h.fresh_slots.is_none(),
+                "the drain took the pre-built state"
+            );
+            assert!(h.retired.is_some(), "and handed its old state back");
+        }
+        // The next frame adopts nothing new.
+        d.on_frame(0, 2);
+        assert_eq!(d.generation_seen, p.generation);
+        publish_backup_set(&[]);
+        d.on_frame(0, 3);
+        assert!(
+            d.is_empty(),
+            "an empty publication deactivates the drain's table"
+        );
+    }
+
+    #[test]
+    fn test_write_backup_set_then_read_backup_set_roundtrips_and_missing_or_corrupt_reads_honestly()
+    {
+        let dir = std::env::temp_dir().join(format!(
+            "tv-backup-set-{}-{}",
+            std::process::id(),
+            packet_fingerprint(b"roundtrip")
+        ));
+        let path = dir.join("set.json");
+        assert_eq!(read_backup_set(&path), Ok(None), "absent reads as none");
+        let set = PersistedBackupSet::from_set(
+            &[SubscribeInstrument {
+                security_id: 42,
+                segment: ExchangeSegment::NseFno,
+            }],
+            1_700_000_000_000_000_000,
+        );
+        assert_eq!(
+            set.contracts,
+            vec![(42, SEG)],
+            "from_set keeps the composite key"
+        );
+        write_backup_set(&path, &set).expect("write");
+        assert_eq!(read_backup_set(&path), Ok(Some(set)));
+        std::fs::write(&path, b"{not json").expect("corrupt");
+        assert!(
+            read_backup_set(&path).is_err(),
+            "a corrupt file is an error"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn test_backup_set_path_sits_beside_the_other_daily_artifacts() {
+        let path = backup_set_path();
+        assert!(path.starts_with("data/instrument-cache"));
+        assert!(path.ends_with(BACKUP_SET_FILE));
+    }
+
+    /// Attack-pass finding 1: the replay applies the set only to frames the
+    /// live drain deduplicated with it.
+    #[test]
+    fn test_regression_replay_backup_covers_only_frames_after_publication_on_the_same_day() {
+        // 2026-10-02 10:00 IST = 04:30 UTC.
+        let published = 1_790_915_400i64 * 1_000_000_000;
+        let r = ReplayBackup::new(&PersistedBackupSet {
+            published_at_nanos: published,
+            contracts: vec![(42, SEG)],
+        });
+        assert!(r.covers(published));
+        assert!(r.covers(published + 3_600 * 1_000_000_000));
+        assert!(
+            !r.covers(published - 1),
+            "before the publication: one copy only"
+        );
+        assert!(
+            !r.covers(published + 86_400 * 1_000_000_000),
+            "the next day's cumulative restarts; yesterday's set never judges it"
+        );
+        assert!(
+            !r.covers(0),
+            "a frame with no receipt clock is never deduplicated"
+        );
+        let never = ReplayBackup::new(&PersistedBackupSet {
+            published_at_nanos: 0,
+            contracts: vec![(42, SEG)],
+        });
+        assert!(
+            !never.covers(published),
+            "a set with no instant covers nothing"
+        );
+    }
+
+    /// A replayed frame carries no socket: the second identical copy is still
+    /// dropped, and a third (the other socket's repeat) pairs with the next.
+    #[test]
+    fn test_regression_replay_unknown_socket_drops_the_second_copy() {
+        let mut r = ReplayBackup::new(&PersistedBackupSet {
+            published_at_nanos: 1,
+            contracts: vec![(42, SEG)],
+        });
+        let t = tick(42, 100, 1_000, 10.0);
+        let b = bytes(&t, 0);
+        let d = r.dedup_mut();
+        assert_eq!(d.admit_tick(&t, &b, u8::MAX, 0), BackupVerdict::Accept);
+        assert_eq!(
+            d.admit_tick(&t, &b, u8::MAX, 0),
+            BackupVerdict::DropIdentical
+        );
+        let pkt = [6u8, 16, 0, 2, 42, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8];
+        assert_eq!(d.admit_aux(42, SEG, &pkt, u8::MAX), BackupVerdict::Accept);
+        assert_eq!(
+            d.admit_aux(42, SEG, &pkt, u8::MAX),
+            BackupVerdict::DropIdentical
+        );
+    }
     proptest! {
         /// Two sockets carry the same stream of trades, each possibly
         /// delayed against the other, interleaved in any order. Whatever the

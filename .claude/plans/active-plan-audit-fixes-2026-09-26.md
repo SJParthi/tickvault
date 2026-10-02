@@ -2310,6 +2310,24 @@ Each is recorded first in its rule file.
 - [x] **R4-5 (decision 3) — Phone page HOT-PATH-STALL-01** when a hot task stalls 2 s in session
   (`hot_path_telemetry.rs` StallAlarm, CloudWatch filter + alarm, noise lock 2.8). Cannot fire
   if the whole process freezes.
+- [x] **R4-6 — Attack-pass fixes on round 4** (1 high, 3 medium, 4 low):
+  WAL replay dedups backup copies against the persisted set (`main_feed_backup.rs`
+  `write_backup_set` / `ReplayBackup`, `dhan_feed_stack.rs` `refold_wal_frames`); the set is
+  published before the Extend; the dedup table is built off the drain and adopted by pointer
+  swap; same-socket repeats kept, newest trade time never goes back; stall page quiet after
+  shutdown starts (`hot_path_telemetry::begin_shutdown`); an 805 episode with nothing parked
+  finishes after its wait (`pool_supervisor.rs` `OverflowEpisode::poll`); only reader workers
+  are pinned, helper threads restored (`reader_runtime.rs` `build_reader_runtime`); kernel
+  queue sampler reads `/proc` on the blocking pool; CLAUDE.md complexity rows for 9 structures.
+  Tests: test_regression_an_episode_with_nothing_parked_recovers_after_its_wait,
+  test_regression_build_reader_runtime_leaves_blocking_threads_unpinned,
+  test_regression_begin_shutdown_and_is_shutting_down_latch_the_alarm_quiet,
+  test_regression_replay_unknown_socket_drops_the_second_copy,
+  test_regression_refold_wal_frames_folds_one_copy_of_a_backup_packet,
+  test_regression_subscribe_main_feed_backup_publishes_before_the_extend,
+  test_regression_publish_backup_set_builds_off_the_drain_and_adopt_swaps,
+  test_regression_same_socket_identical_repeat_is_kept,
+  test_regression_newest_ltt_never_goes_backwards.
 
 R3 Z+ and guarantee matrix: covered by the shared matrix at the end of this plan. Tick path adds
 one histogram bucket update per frame (R3-11) and one bool per frame (R3-9); no allocation by

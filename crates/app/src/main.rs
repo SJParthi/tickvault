@@ -4939,6 +4939,9 @@ async fn run_process_runloop(
         class = ?shutdown_class,
         "shutdown classified"
     );
+    // The hot tasks wind down from here on purpose; the stall page must not
+    // read that as a stall (HOT-PATH-STALL-01, noise lock §2.8).
+    tickvault_storage::hot_path_telemetry::begin_shutdown();
     notifier.notify(NotificationEvent::ShutdownInitiated {
         class: shutdown_class,
     });

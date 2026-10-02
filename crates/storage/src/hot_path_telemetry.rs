@@ -57,7 +57,7 @@
 //! | [`publish_once`] | O(stages × buckets + tasks) = O(4 × 28 + 6), once a second, on its own thread |
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Number of latency buckets per stage. Bucket `k` holds samples in
@@ -214,6 +214,24 @@ impl TaskBeat {
 static STAGES: [StageStats; STAGE_COUNT] = [const { StageStats::new() }; STAGE_COUNT];
 static TASKS: [TaskBeat; TASK_COUNT] = [const { TaskBeat::new() }; TASK_COUNT];
 static ANCHOR: OnceLock<Instant> = OnceLock::new();
+
+/// Set once the process starts its shutdown. A planned stop inside the
+/// session window winds the hot tasks down on purpose, so their heartbeats
+/// age; the stall alarm treats the rest of the process as out of session
+/// rather than paging that wind-down as a stall.
+static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+
+/// Marks the process as shutting down: the stall alarm stays silent from
+/// here on. Idempotent; call it as soon as a stop signal is classified.
+pub fn begin_shutdown() {
+    SHUTTING_DOWN.store(true, Ordering::Relaxed);
+}
+
+/// True once [`begin_shutdown`] has been called.
+#[must_use]
+pub fn is_shutting_down() -> bool {
+    SHUTTING_DOWN.load(Ordering::Relaxed)
+}
 
 fn anchor() -> Instant {
     *ANCHOR.get_or_init(Instant::now)
@@ -517,7 +535,8 @@ pub fn spawn_publisher() -> std::io::Result<std::thread::JoinHandle<()>> {
             loop {
                 let now = Instant::now();
                 let readings = publish_once(&handles, now);
-                if let Some(line) = alarm.observe(now, in_session_now(), &readings) {
+                let in_session = in_session_now() && !is_shutting_down();
+                if let Some(line) = alarm.observe(now, in_session, &readings) {
                     report_stall(&line);
                 }
                 // APPROVED-BLOCKING: this is the publisher's own dedicated OS thread; sleeping here blocks nothing else, and it is why the publisher survives a wedged tokio runtime.
@@ -974,6 +993,24 @@ mod tests {
     fn test_stall_page_secs_f64_matches_the_integer_threshold() {
         assert_eq!(STALL_PAGE_SECS_F64.fract(), 0.0);
         assert_eq!(STALL_PAGE_SECS_F64 as u32, STALL_PAGE_SECS);
+    }
+
+    #[test]
+    fn test_regression_begin_shutdown_and_is_shutting_down_latch_the_alarm_quiet() {
+        // A planned stop in session must not page: once the flag is set the
+        // publisher passes `in_session = false`, which the alarm treats as
+        // silent and re-armed (see the out-of-session test).
+        begin_shutdown();
+        assert!(is_shutting_down());
+        begin_shutdown();
+        assert!(is_shutting_down(), "the flag never clears");
+        let mut alarm = StallAlarm::new();
+        let in_session = !is_shutting_down();
+        assert!(
+            alarm
+                .observe(Instant::now(), in_session, &drain_age(30.0))
+                .is_none()
+        );
     }
 
     #[test]

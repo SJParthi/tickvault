@@ -1707,6 +1707,12 @@ pub struct LiveIngest {
     /// two main-feed sockets (scope lock 2026-10-02). Inactive, and one `bool`
     /// test per packet, until the attach publishes the set.
     backup: crate::main_feed_backup::BackupDedup,
+    /// The WAL replay's copy of that dedup, rebuilt from the persisted set at
+    /// the first re-fold and dropped at the hand-over to live, so a replay
+    /// folds the same one copy the live drain did.
+    replay_backup: Option<crate::main_feed_backup::ReplayBackup>,
+    /// Whether the persisted set has been read for this lane (once).
+    replay_backup_loaded: bool,
     /// Cumulative volume per contract, ranked per option family.
     ///
     /// Beside `prev_close` and for the same reason: the drain is the only place
@@ -2802,6 +2808,8 @@ impl LiveIngest {
             // the `Arc` straight back out for the attach tasks.
             spot_prices: std::sync::Arc::new(crate::spot_price_store::SpotPriceStore::new()),
             backup: crate::main_feed_backup::BackupDedup::new(),
+            replay_backup: None,
+            replay_backup_loaded: false,
             aggregator: {
                 let mut aggregator =
                     MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, capacity);
@@ -4912,6 +4920,86 @@ impl LiveIngest {
         (emitted, dropped)
     }
 
+    /// Installs the WAL replay's backup dedup from a persisted set (scope
+    /// lock 2026-10-02). `None`, or an empty set, leaves replay as it was:
+    /// every copy is folded. Cold, once per lane start.
+    pub(crate) fn install_replay_backup(
+        &mut self,
+        set: Option<&crate::main_feed_backup::PersistedBackupSet>,
+    ) {
+        self.replay_backup_loaded = true;
+        self.replay_backup = set
+            .filter(|s| !s.contracts.is_empty())
+            .map(crate::main_feed_backup::ReplayBackup::new);
+    }
+
+    /// Reads the persisted backup set for the replay, once per lane start,
+    /// counted and logged once whatever the outcome. Cold.
+    fn load_replay_backup(&mut self) {
+        use crate::main_feed_backup::{
+            BACKUP_REPLAY_SET_COUNTER, backup_set_path, read_backup_set,
+        };
+        if self.replay_backup_loaded {
+            return;
+        }
+        let path = backup_set_path();
+        let set = match read_backup_set(&path) {
+            Ok(Some(set)) => {
+                metrics::counter!(BACKUP_REPLAY_SET_COUNTER, "outcome" => "loaded").increment(1);
+                info!(
+                    contracts = set.contracts.len(),
+                    published_at_nanos = set.published_at_nanos,
+                    "WAL replay: the main-feed backup set is loaded — replayed frames fold one \
+                     copy of each backed-up packet, as the live drain did"
+                );
+                Some(set)
+            }
+            Ok(None) => {
+                metrics::counter!(BACKUP_REPLAY_SET_COUNTER, "outcome" => "missing").increment(1);
+                info!(
+                    path = %path.display(),
+                    "WAL replay: no main-feed backup set is saved — replayed frames are folded \
+                     without backup dedup"
+                );
+                None
+            }
+            Err(err) => {
+                metrics::counter!(BACKUP_REPLAY_SET_COUNTER, "outcome" => "unreadable")
+                    .increment(1);
+                warn!(
+                    code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                    source = "backup_set_unreadable",
+                    path = %path.display(),
+                    %err,
+                    "WAL replay: the saved main-feed backup set could not be read — replayed \
+                     frames are folded without backup dedup, so both copies of a backed-up \
+                     packet may be written"
+                );
+                None
+            }
+        };
+        self.install_replay_backup(set.as_ref());
+    }
+
+    /// Whether the replay's dedup drops this replayed tick packet as a second
+    /// copy. O(1), zero allocation. A replayed frame carries no socket.
+    #[inline]
+    fn replay_backup_drops_tick(&mut self, tick: &ParsedTick, packet: &[u8]) -> bool {
+        self.replay_backup
+            .as_mut()
+            .is_some_and(|r| r.dedup_mut().admit_tick(tick, packet, u8::MAX, 0).is_drop())
+    }
+
+    /// The previous-close / open-interest form of the check above.
+    #[inline]
+    fn replay_backup_drops_aux(&mut self, security_id: u64, segment: u8, packet: &[u8]) -> bool {
+        self.replay_backup.as_mut().is_some_and(|r| {
+            r.dedup_mut()
+                .admit_aux(security_id, segment, packet, u8::MAX)
+                .is_drop()
+        })
+    }
+
     /// Hands the candle fold over to the live feed, once per lane start,
     /// before the first live frame: records when this process began capturing
     /// ([`MultiTfAggregator::set_live_capture_start`]) and ends any WAL replay
@@ -4922,6 +5010,8 @@ impl LiveIngest {
     /// # Complexity
     /// O(slots × TF), once per lane start.
     pub fn finish_wal_replay(&mut self, ended_on_gap: bool) {
+        // The replay's backup dedup is done with; live frames use `backup`.
+        self.replay_backup = None;
         // Every boot, replay or not: from here on a partial bar whose bucket
         // ended before this process began listening is a fragment of a bar
         // the previous process owned, never written (review round 3).
@@ -9079,6 +9169,7 @@ pub fn drain_main_feed_frame(
                     security_id,
                     exchange_segment_code,
                     &frame.bytes[offset..end],
+                    frame.connection_index,
                 )
                 .is_drop() =>
             {
@@ -12756,6 +12847,7 @@ async fn attach_depth_when_available(
                         spot_topup.as_ref(),
                         spot_topup_used,
                         &live_topups,
+                        &crate::main_feed_backup::backup_set_path(),
                     )
                     .await;
                 }
@@ -13819,6 +13911,7 @@ async fn attach_depth_when_available(
                         spot_topup.as_ref(),
                         spot_topup_used,
                         &live_topups,
+                        &crate::main_feed_backup::backup_set_path(),
                     )
                     .await;
                     return;
@@ -13874,9 +13967,47 @@ fn backup_socket_room(
     )
 }
 
-/// Subscribes the backup copies on the spot socket and, once the socket
-/// confirms them, publishes the set to the drain's dedup (scope lock
-/// 2026-10-02). Cold: once per attach. Returns how many were published.
+/// Persists `set` for the WAL replay, then publishes it to the drain's
+/// dedup. Persisted FIRST: a crash between the two leaves the replay a set
+/// it may not have needed (harmless), never copies it cannot recognise.
+/// Cold: one small file write off the async worker.
+async fn persist_and_publish_backup_set(
+    set: &[SubscribeInstrument],
+    published_at_nanos: i64,
+    persist_path: &std::path::Path,
+) {
+    use crate::main_feed_backup::{PersistedBackupSet, publish_backup_set, write_backup_set};
+    let persisted = PersistedBackupSet::from_set(set, published_at_nanos);
+    let path = persist_path.to_path_buf();
+    let written = tokio::task::spawn_blocking(move || write_backup_set(&path, &persisted)).await;
+    match written {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => warn!(
+            code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+            source = "backup_set_persist",
+            path = %persist_path.display(),
+            %err,
+            "main-feed backup: the set could not be saved for the crash replay — a replay of \
+             today's write-ahead log will write both copies of each backed-up packet"
+        ),
+        Err(err) => warn!(
+            code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+            source = "backup_set_persist",
+            %err,
+            "main-feed backup: the save task failed — a replay of today's write-ahead log \
+             will write both copies of each backed-up packet"
+        ),
+    }
+    publish_backup_set(set);
+}
+
+/// Subscribes the backup copies on the spot socket (scope lock 2026-10-02).
+/// Cold: once per attach. Returns how many are deduplicated afterwards.
+///
+/// The set is persisted and published to the drain's dedup BEFORE the
+/// subscribe goes out, so no second copy can arrive while the drain does not
+/// yet know the contract; the socket's answer then narrows it (the held
+/// subset on a truncation, nothing on a refusal).
 ///
 /// Only contracts whose first copy went through the POOL (a contract socket)
 /// are eligible, so the two copies are never on one socket, and never more
@@ -13888,8 +14019,9 @@ async fn subscribe_main_feed_backup(
     spot_topup: Option<&(tokio::sync::mpsc::Sender<LiveSubscriptionCommand>, usize)>,
     spot_topup_used: bool,
     live_topups: &[(tokio::sync::mpsc::Sender<LiveSubscriptionCommand>, usize)],
+    persist_path: &std::path::Path,
 ) -> usize {
-    use crate::main_feed_backup::{BACKUP_SUBSCRIBE_COUNTER, plan_backup_set, publish_backup_set};
+    use crate::main_feed_backup::{BACKUP_SUBSCRIBE_COUNTER, plan_backup_set};
     let outcome = |o: &'static str| metrics::counter!(BACKUP_SUBSCRIBE_COUNTER, "outcome" => o);
     if top_n == 0 {
         outcome("disabled").increment(1);
@@ -13921,12 +14053,17 @@ async fn subscribe_main_feed_backup(
     let Some((tx, _)) = spot_topup else {
         return 0;
     };
+    // One instant for every write of this attach: the replay dedups frames
+    // received from the first publication on.
+    let published_at_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    persist_and_publish_backup_set(&set, published_at_nanos, persist_path).await;
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
     if let Err(err) = tx.try_send(LiveSubscriptionCommand::Extend {
         more: set.clone(),
         ack: Some(ack_tx),
     }) {
         outcome("send_refused").increment(1);
+        persist_and_publish_backup_set(&[], published_at_nanos, persist_path).await;
         warn!(
             code = ErrorCode::WsGapSubscriptionBatching.code_str(),
             backup = set.len(),
@@ -13946,12 +14083,16 @@ async fn subscribe_main_feed_backup(
                 outcome("truncated").increment(1);
                 let cut: std::collections::HashSet<(u64, u8)> =
                     not_held.iter().map(contract_identity).collect();
-                set.into_iter()
+                let held: Vec<SubscribeInstrument> = set
+                    .into_iter()
                     .filter(|i| !cut.contains(&contract_identity(i)))
-                    .collect()
+                    .collect();
+                persist_and_publish_backup_set(&held, published_at_nanos, persist_path).await;
+                held
             }
             Ok(Ok(ExtendOutcome::Refused)) => {
                 outcome("refused").increment(1);
+                persist_and_publish_backup_set(&[], published_at_nanos, persist_path).await;
                 warn!(
                     code = ErrorCode::WsGapSubscriptionBatching.code_str(),
                     backup = set.len(),
@@ -13962,14 +14103,13 @@ async fn subscribe_main_feed_backup(
                 return 0;
             }
             // No answer: the guard may hold them. Deduplicating a contract that
-            // has only one copy changes nothing but a byte-identical re-send,
-            // so the set is published either way.
+            // has only one copy changes nothing but a cross-socket identical
+            // copy, so the published set stands.
             Ok(Err(_)) | Err(_) => {
                 outcome("unacknowledged").increment(1);
                 set
             }
         };
-    publish_backup_set(&held);
     info!(
         backup = held.len(),
         room,
@@ -13979,7 +14119,6 @@ async fn subscribe_main_feed_backup(
     );
     held.len()
 }
-
 /// Turns the attach's dialed depth channels into the rebalance's socket list.
 ///
 /// Pure, and separate from the spawn, because the FILTER is the load-bearing
@@ -14632,6 +14771,10 @@ pub struct WalRefoldOutcome {
     /// snapshot reads as the rule working rather than paging `WS-SPILL-01`
     /// every morning, while a genuinely lost tick still pages.
     pub refused_wrong_day: u64,
+    /// Second copies of a backup-set packet the replay skipped, exactly as
+    /// the live drain did (scope lock 2026-10-02). Not loss: the first copy
+    /// is folded and written.
+    pub backup_dropped: u64,
     /// Frames whose bytes could not be parsed at all.
     pub unparseable: u64,
     /// Packets the decoder REFUSED (2026-08-28).
@@ -15032,6 +15175,9 @@ pub fn refold_wal_frames(
     // see is counted instead of emitted, so it never overwrites the complete
     // candle the live process already stored under the same key.
     ingest.aggregator.set_replay_mode(true);
+    // Backup copies (scope lock 2026-10-02): the live drain folded ONE copy
+    // of each backed-up packet; the replay must too, or a re-fold writes both.
+    ingest.load_replay_backup();
     // `gaps` holds ascending indexes into `frames` of frames that follow a
     // gap in the replay; a cursor walks it once, O(1) per frame.
     let mut gap_cursor = 0usize;
@@ -15310,6 +15456,13 @@ pub fn refold_wal_frames(
             out.depth_frames = out.depth_frames.saturating_add(1);
             continue;
         }
+        // Whether the live drain deduplicated this frame with the persisted
+        // backup set (received after its publication, same day). One compare
+        // and one division per frame; `false` when no set is loaded.
+        let backup_covers = ingest
+            .replay_backup
+            .as_ref()
+            .is_some_and(|r| r.covers(*wal_received_at_nanos));
         let mut offset = 0usize;
         let mut packets = 0u32;
         while offset < bytes.len() {
@@ -15340,6 +15493,34 @@ pub fn refold_wal_frames(
             // to be classified here rather than silently joining the swallowed
             // set.
             match dispatch_frame(&bytes[offset..end], *wal_received_at_nanos) {
+                // The second copy of a backed-up packet: skipped whole, as the
+                // live drain skipped it — no inline depth, no fold, no row.
+                Ok(ParsedFrame::Tick(ref t) | ParsedFrame::TickWithDepth(ref t, _))
+                    if backup_covers && ingest.replay_backup_drops_tick(t, &bytes[offset..end]) =>
+                {
+                    out.backup_dropped = out.backup_dropped.saturating_add(1);
+                }
+                Ok(
+                    ParsedFrame::PreviousClose {
+                        security_id,
+                        exchange_segment_code,
+                        ..
+                    }
+                    | ParsedFrame::OiUpdate {
+                        security_id,
+                        exchange_segment_code,
+                        ..
+                    },
+                ) if backup_covers
+                    && ingest.replay_backup_drops_aux(
+                        security_id,
+                        exchange_segment_code,
+                        &bytes[offset..end],
+                    ) =>
+                {
+                    out.non_tick = out.non_tick.saturating_add(1);
+                    out.backup_dropped = out.backup_dropped.saturating_add(1);
+                }
                 Ok(ParsedFrame::TickWithDepth(tick, levels)) => {
                     // Depth FIRST, matching the live drain's order, and through
                     // the same function so the two cannot produce different
@@ -15417,6 +15598,8 @@ pub fn refold_wal_frames(
         .increment(out.undecodable);
     metrics::counter!("tv_dhan_wal_refolded_total", "outcome" => "non_tick")
         .increment(out.non_tick);
+    metrics::counter!("tv_dhan_wal_refolded_total", "outcome" => "backup_dropped")
+        .increment(out.backup_dropped);
     // Item 45h: the rows this replay re-offered to `feed_aux_packets` (non-tick
     // packets, connect snapshots, out-of-window ticks). A label value on the
     // existing series, so no new metric name.
@@ -26985,6 +27168,154 @@ mod frame_walk_accounting_tests {
         assert_eq!((a.backup_dropped, b.backup_dropped), (0, 0));
     }
 
+    /// Attack-pass finding 1: a WAL replay of both copies of a backed-up
+    /// packet folds ONE, exactly as the live drain did, once the persisted
+    /// set is installed; with no set it folds both, as before.
+    #[test]
+    fn test_regression_refold_wal_frames_folds_one_copy_of_a_backup_packet() {
+        const SID: u32 = 987_655;
+        let fno = ExchangeSegment::NseFno.binary_code();
+        let mut packet = ticker_packet(SID, 101.25, any_ltt());
+        packet[3] = fno;
+        let recv = any_recv_nanos();
+        let frames = [
+            (
+                1u64 << 21,
+                recv,
+                WalEndpoint::MainFeed,
+                bytes::Bytes::copy_from_slice(&packet),
+            ),
+            (
+                2u64 << 21,
+                recv,
+                WalEndpoint::MainFeed,
+                bytes::Bytes::copy_from_slice(&packet),
+            ),
+        ];
+        let set = crate::main_feed_backup::PersistedBackupSet {
+            published_at_nanos: recv - 1_000_000_000,
+            contracts: vec![(u64::from(SID), fno)],
+        };
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        ingest.install_replay_backup(Some(&set));
+        let out = refold_wal_frames(&mut ingest, &frames, &[]);
+        assert_eq!(out.refolded, 1, "one copy folds");
+        assert_eq!(
+            out.backup_dropped, 1,
+            "the second copy is skipped and counted"
+        );
+        assert_eq!(out.lost, 0);
+        ingest.finish_wal_replay(false);
+        assert!(ingest.replay_backup.is_none(), "dropped at the hand-over");
+
+        let mut plain = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        plain.install_replay_backup(None);
+        let out = refold_wal_frames(&mut plain, &frames, &[]);
+        assert_eq!(
+            (out.refolded, out.backup_dropped),
+            (2, 0),
+            "no set: as before"
+        );
+
+        // A set published AFTER these frames were received never touches them.
+        let late = crate::main_feed_backup::PersistedBackupSet {
+            published_at_nanos: recv + 1,
+            ..set
+        };
+        let mut later = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        later.install_replay_backup(Some(&late));
+        let out = refold_wal_frames(&mut later, &frames, &[]);
+        assert_eq!((out.refolded, out.backup_dropped), (2, 0));
+    }
+
+    /// Attack-pass finding 2: the set is persisted and published BEFORE the
+    /// subscribe goes out; a truncation republishes the held subset and a
+    /// refusal publishes an empty set.
+    #[test]
+    fn test_regression_subscribe_main_feed_backup_publishes_before_the_extend() {
+        let inst = |s: u64| SubscribeInstrument {
+            security_id: s,
+            segment: ExchangeSegment::NseFno,
+        };
+        let fno = ExchangeSegment::NseFno.binary_code();
+        let ranked = [inst(501), inst(502), inst(503)];
+        let pool: std::collections::HashSet<(u64, u8)> =
+            ranked.iter().map(|i| (i.security_id, fno)).collect();
+        let dir = std::env::temp_dir().join(format!(
+            "tv-backup-subscribe-{}-{}",
+            std::process::id(),
+            crate::main_feed_backup::packet_fingerprint(b"subscribe")
+        ));
+        let path = dir.join("set.json");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let _guard = crate::main_feed_backup::TEST_PUBLISH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Answered with a truncation: 503 never went out.
+        let (seen_at_send, held, final_keys) = runtime.block_on(async {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<LiveSubscriptionCommand>(4);
+            let responder = tokio::spawn(async move {
+                let Some(LiveSubscriptionCommand::Extend { more, ack, .. }) = rx.recv().await
+                else {
+                    return Vec::new();
+                };
+                let seen = crate::main_feed_backup::published_keys();
+                if let Some(ack) = ack {
+                    let _ = ack.send(ExtendOutcome::Truncated {
+                        not_held: vec![more[2]],
+                    });
+                }
+                seen
+            });
+            let spot = (tx, 100usize);
+            let held =
+                subscribe_main_feed_backup(10, &ranked, &pool, Some(&spot), false, &[], &path)
+                    .await;
+            let seen = responder.await.expect("responder");
+            (seen, held, crate::main_feed_backup::published_keys())
+        });
+        assert_eq!(
+            seen_at_send,
+            vec![(501, fno), (502, fno), (503, fno)],
+            "the set is published before the socket receives the subscribe"
+        );
+        assert_eq!(held, 2);
+        assert_eq!(final_keys, vec![(501, fno), (502, fno)], "the held subset");
+        let saved = crate::main_feed_backup::read_backup_set(&path)
+            .expect("readable")
+            .expect("saved");
+        assert_eq!(saved.contracts, vec![(501, fno), (502, fno)]);
+        assert!(saved.published_at_nanos > 0);
+
+        // Answered with a refusal: nothing is deduplicated.
+        let (held, final_keys) = runtime.block_on(async {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<LiveSubscriptionCommand>(4);
+            let responder = tokio::spawn(async move {
+                if let Some(LiveSubscriptionCommand::Extend { ack: Some(ack), .. }) =
+                    rx.recv().await
+                {
+                    let _ = ack.send(ExtendOutcome::Refused);
+                }
+            });
+            let spot = (tx, 100usize);
+            let held =
+                subscribe_main_feed_backup(10, &ranked, &pool, Some(&spot), false, &[], &path)
+                    .await;
+            responder.await.expect("responder");
+            (held, crate::main_feed_backup::published_keys())
+        });
+        assert_eq!(held, 0);
+        assert!(final_keys.is_empty(), "a refusal publishes an empty set");
+        let saved = crate::main_feed_backup::read_backup_set(&path)
+            .expect("readable")
+            .expect("saved");
+        assert!(saved.contracts.is_empty());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
     /// The backup's room is the spot socket's own room: before the contract
     /// overflow is handed to it, the room it was dialled with; after, the
     /// matching live top-up entry, already reduced by the overflow.

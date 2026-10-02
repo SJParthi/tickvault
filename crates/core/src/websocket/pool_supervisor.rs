@@ -1473,6 +1473,13 @@ impl OverflowEpisode {
         if let Some(bit) = 1u32.checked_shl(u32::from(global_index)) {
             self.parked_mask |= bit;
         }
+        // A late park from the 805 that this episode already waited out with
+        // nothing parked (`poll` kept `phase_since`): wait on, from that 805.
+        // A Recovered reached through a release has no `phase_since`, and a
+        // new 805 reaches `on_overflow` before any park.
+        if matches!(self.phase, OverflowEpisodePhase::Recovered) && self.phase_since.is_some() {
+            self.phase = OverflowEpisodePhase::Waiting;
+        }
     }
 
     /// Any socket, any endpoint, closed with 805.
@@ -1543,7 +1550,23 @@ impl OverflowEpisode {
                 let waited = self
                     .phase_since
                     .map_or(Duration::ZERO, |s| now.saturating_duration_since(s));
-                if self.parked_mask == 0 || !window_open || waited < Duration::from_secs(delay) {
+                if waited < Duration::from_secs(delay) {
+                    return OverflowEpisodeEffect::default();
+                }
+                // The 805 hit another pool and none of this pool's sockets
+                // parked within the whole wait: nothing to probe or release,
+                // so the episode is over, silently (nothing of this pool was
+                // down, so there is no recovery to report). Without this a
+                // depth-only 805 left the main episode Waiting for the
+                // session and the main-feed widen refused for the rest of the
+                // day. `phase_since` is KEPT: a socket of this pool that
+                // registers its park late reopens the wait from the same 805
+                // (`on_parked`).
+                if self.parked_mask == 0 {
+                    self.phase = OverflowEpisodePhase::Recovered;
+                    return OverflowEpisodeEffect::default();
+                }
+                if !window_open {
                     return OverflowEpisodeEffect::default();
                 }
                 let slot = self.take_lowest_parked();
@@ -16931,6 +16954,41 @@ mod tests {
             }
         );
         assert_eq!(s.park_reason(), Some(ParkReason::PoolOverflow));
+    }
+
+    #[test]
+    fn test_regression_an_episode_with_nothing_parked_recovers_after_its_wait() {
+        // A depth-only 805: the main episode enters Waiting with an empty
+        // parked mask. It must finish once the wait passes, or the main-feed
+        // widen stays refused for the session.
+        let start = t0();
+        let mut ep = episode_after_805(&[], start);
+        assert!(!ep.widen_permitted());
+        let early = ep.poll(start + secs(OVERFLOW_PROBE_DELAYS_SECS[0] - 1), true);
+        assert_eq!(early, OverflowEpisodeEffect::default());
+        assert_eq!(ep.phase, OverflowEpisodePhase::Waiting);
+
+        // Closed session window: still recovers (silently: nothing of this
+        // pool was down), and dials nothing.
+        let done = ep.poll(start + secs(OVERFLOW_PROBE_DELAYS_SECS[0]), false);
+        assert_eq!(done, OverflowEpisodeEffect::default());
+        assert_eq!(ep.phase, OverflowEpisodePhase::Recovered);
+        assert!(ep.widen_permitted());
+        assert_eq!(ep.probes_started, 0, "no probe was spent");
+
+        // A park from the same 805 that registers after that reopens the
+        // wait from the 805, so the next poll probes it.
+        ep.on_parked(4);
+        assert_eq!(ep.phase, OverflowEpisodePhase::Waiting);
+        assert!(!ep.widen_permitted());
+        let regrant = ep.poll(start + secs(OVERFLOW_PROBE_DELAYS_SECS[0] + 1), true);
+        assert_eq!(regrant.grant, Some(4));
+
+        // A socket that parks within the wait still gets its probe.
+        let mut parked_late = episode_after_805(&[], start);
+        parked_late.on_parked(3);
+        let granted = parked_late.poll(start + secs(OVERFLOW_PROBE_DELAYS_SECS[0]), true);
+        assert_eq!(granted.grant, Some(3));
     }
 
     #[test]
