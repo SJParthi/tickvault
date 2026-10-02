@@ -70,7 +70,7 @@ const DEPLOYED_COMPOSE_PATH: &str = "repo/deploy/docker/docker-compose.yml";
 ///
 /// It went unnoticed because something else was quietly covering for it: the
 /// deploy workflow runs its own `docker compose up` (with the correct path),
-/// and the systemd unit's `ExecStartPre` runs `ensure-questdb.sh` (also with
+/// and the systemd unit's `ExecStartPre` ran `ensure-questdb.sh` (also with
 /// the correct path). QuestDB was therefore always already up by the time the
 /// app looked, so `classify_compose_outcome` returned `DegradedServiceUp` and
 /// the boot continued. A permanently-broken function reported a degraded-but-
@@ -103,7 +103,7 @@ fn resolve_compose_path() -> Option<&'static str> {
 
 /// System-wide docker CLI plugin locations probed for the Compose v2 plugin
 /// binary when neither `docker compose` nor `docker-compose` resolves
-/// (issue #1505 — mirrors the `scripts/ensure-questdb.sh` rung-3c ladder).
+/// (issue #1505 — mirrors the `ensure_questdb` self-heal ladder).
 ///
 /// Deliberately EXCLUDES the per-user `~/.docker/cli-plugins/` directory:
 /// the systemd unit runs with `ProtectHome=true`, so a per-user plugin is
@@ -111,7 +111,7 @@ fn resolve_compose_path() -> Option<&'static str> {
 /// fallback — that invisibility is the #1505 root cause, and probing it
 /// here would make dev-shell behaviour diverge from the service context.
 /// Ratcheted by `test_compose_plugin_system_paths_are_system_wide`.
-const COMPOSE_PLUGIN_SYSTEM_PATHS: [&str; 3] = [
+pub(crate) const COMPOSE_PLUGIN_SYSTEM_PATHS: [&str; 3] = [
     "/usr/local/lib/docker/cli-plugins/docker-compose",
     "/usr/libexec/docker/cli-plugins/docker-compose",
     "/usr/lib/docker/cli-plugins/docker-compose",
@@ -210,14 +210,14 @@ pub fn classify_compose_outcome(
 // in the invoking context (e.g. the plugin lives under
 // `~/.docker/cli-plugins/`, hidden from the systemd service by
 // `ProtectHome=true`). That failure is DETERMINISTIC — retrying the same
-// invocation is noise, not recovery. Mirror the `scripts/ensure-questdb.sh`
+// invocation is noise, not recovery. Mirror the `ensure_questdb` self-heal
 // ladder (v2 → v1 → plugin-by-absolute-path) so a cold boot can bring
 // QuestDB up even when the `docker compose` front-end is broken, and fail
 // LOUDLY (once, with the actionable cause) when no compose front-end exists.
 
 /// A resolved, working Docker Compose front-end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ComposeCli {
+pub(crate) enum ComposeCli {
     /// `docker compose …` — the modern v2 plugin resolved by the docker CLI.
     DockerComposeV2,
     /// `docker-compose …` — the standalone v1 binary on `PATH`.
@@ -229,7 +229,7 @@ enum ComposeCli {
 
 impl ComposeCli {
     /// The program to exec for this front-end.
-    fn program(self) -> &'static str {
+    pub(crate) fn program(self) -> &'static str {
         match self {
             ComposeCli::DockerComposeV2 => "docker",
             ComposeCli::StandaloneV1 => "docker-compose",
@@ -238,7 +238,7 @@ impl ComposeCli {
     }
 
     /// Human-readable label for logs.
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             ComposeCli::DockerComposeV2 => "docker compose (v2 plugin)",
             ComposeCli::StandaloneV1 => "docker-compose (v1 standalone)",
@@ -1303,7 +1303,7 @@ async fn probe_command_succeeds(program: &str, args: &[&str]) -> bool {
 }
 
 /// True when `path` is an existing regular file with an execute bit set.
-fn is_executable_file(path: &str) -> bool {
+pub(crate) fn is_executable_file(path: &str) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1321,7 +1321,7 @@ fn is_executable_file(path: &str) -> bool {
 
 /// Resolves a working Compose front-end: `docker compose` (v2) →
 /// `docker-compose` (v1) → the plugin binary at a system path
-/// (issue #1505 — the same ladder as `scripts/ensure-questdb.sh`).
+/// (issue #1505 — the same ladder as the `ensure_questdb` self-heal).
 ///
 /// `None` means NO compose CLI exists in this context — a DETERMINISTIC
 /// failure (the `unknown shorthand flag: 'f'` class); callers log it loudly
@@ -1350,25 +1350,16 @@ async fn resolve_compose_cli() -> Option<ComposeCli> {
 /// The argument vector comes from the pure [`compose_cli_args`] builder so the
 /// R1 (2026-06-30) subcommand-before-`-f` ordering stays unit-ratcheted.
 async fn run_docker_compose_up(cli: ComposeCli, env_vars: &[(&str, String)]) -> Result<()> {
-    use tokio::process::Command;
-
-    let mut cmd = Command::new(spawn_program(cli.program()));
-    cmd.args(compose_cli_args(
+    let output = compose_output(
         cli,
         // Resolved, not the bare constant: on the deployed box the constant
         // points at a file that does not exist. See `resolve_compose_path`.
         resolve_compose_path().unwrap_or(DOCKER_COMPOSE_PATH),
         &["up", "-d", "--force-recreate"],
-    ));
-
-    for (key, value) in env_vars {
-        cmd.env(key, value);
-    }
-
-    let output = cmd
-        .output()
-        .await
-        .context("failed to execute docker compose — is Docker installed?")?;
+        env_vars,
+    )
+    .await
+    .context("failed to execute docker compose — is Docker installed?")?;
 
     if output.status.success() {
         info!("docker compose up -d completed successfully");
@@ -1381,6 +1372,30 @@ async fn run_docker_compose_up(cli: ComposeCli, env_vars: &[(&str, String)]) -> 
             stderr.trim()
         ))
     }
+}
+
+/// Runs one compose command through the resolved front-end and returns its
+/// output: `<front-end> [compose] -f <file> <tail…>` with `env_vars` added to
+/// the child's environment.
+///
+/// The ONE place compose is spawned, shared by the boot compose-up and by
+/// `tickvault ensure-questdb` (audit D6d), so the non-literal spawn count does
+/// not grow. The child is killed if the caller drops the future (a timeout).
+pub(crate) async fn compose_output<V: AsRef<std::ffi::OsStr>>(
+    cli: ComposeCli,
+    compose_path: &str,
+    tail: &[&str],
+    env_vars: &[(&str, V)],
+) -> std::io::Result<std::process::Output> {
+    use tokio::process::Command;
+
+    let mut cmd = Command::new(spawn_program(cli.program()));
+    cmd.args(compose_cli_args(cli, compose_path, tail));
+    for (key, value) in env_vars {
+        cmd.env(key, value);
+    }
+    cmd.kill_on_drop(true);
+    cmd.output().await
 }
 
 /// Polls a service until it becomes reachable or timeout expires.
