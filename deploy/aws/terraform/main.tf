@@ -697,8 +697,26 @@ resource "aws_s3_bucket" "tv_cold" {
   bucket = "tv-${var.environment}-cold"
 }
 
+# Zero loss (operator Quotes 27 + 28, 2026-09-29, plan item 45f): the cold
+# bucket KEEPS EVERYTHING. No `expiration` block, versioning Enabled, and no
+# `noncurrent_version_expiration` -- an overwrite or a delete leaves the old
+# version in place. The 1825-day expiry that used to sit in the rule below is
+# removed on purpose: SEBI's five years is a MINIMUM, and the operator's rule
+# is that nothing received is ever deleted. Pinned by
+# `aws_infra_wiring.rs::test_terraform_cold_bucket_keeps_everything`.
+resource "aws_s3_bucket_versioning" "tv_cold" {
+  bucket = aws_s3_bucket.tv_cold.id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
 resource "aws_s3_bucket_lifecycle_configuration" "tv_cold" {
   bucket = aws_s3_bucket.tv_cold.id
+
+  # Terraform's guidance for a versioned bucket: apply versioning first.
+  depends_on = [aws_s3_bucket_versioning.tv_cold]
 
   rule {
     id     = "tick-cold-tiering"
@@ -715,9 +733,24 @@ resource "aws_s3_bucket_lifecycle_configuration" "tv_cold" {
       days          = 365
       storage_class = "GLACIER_IR"
     }
+  }
 
-    expiration {
-      days = 1825 # 5 years per SEBI retention
+  # Raw WebSocket frames (plan item 45e) are the record of last resort and are
+  # read only to rebuild a lost day, so they go to the cheapest class after 30
+  # days. Where this overlaps the rule above, S3 applies the lower-cost
+  # transition (Inferred from AWS lifecycle docs, not yet observed on the
+  # bucket).
+  rule {
+    id     = "raw-frames-deep-archive"
+    status = "Enabled"
+
+    filter {
+      prefix = "raw-frames/"
+    }
+
+    transition {
+      days          = 30
+      storage_class = "DEEP_ARCHIVE"
     }
   }
 }
