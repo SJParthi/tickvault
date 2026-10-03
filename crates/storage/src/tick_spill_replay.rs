@@ -1166,7 +1166,44 @@ async fn run_replay_loop(dir: PathBuf, url: String, require_upload: bool) {
     // unhurried. That argument is about the SECOND round onward. It never
     // argued for entering the day with a full dir.
     loop {
-        let outcome = replay_spill_dir(&dir, &url, &client).await;
+        // ⚠ CHANGED 2026-10-03 (O(1) sweep S3): the round runs on the blocking
+        // pool. `replay_spill_dir` reads each spill file in 8 MiB chunks with
+        // `std::fs`, and the quarantine trim lists and deletes files — both
+        // block. On a tokio worker they held a thread that the frame drain and
+        // the socket readers also run on, for as long as a slow disk took.
+        // The HTTP posts still run on this runtime (`Handle::block_on` drives
+        // the future from the blocking thread; the runtime's drivers serve it).
+        let round_dir = dir.clone();
+        let round_url = url.clone();
+        let round_client = client.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let round = tokio::task::spawn_blocking(move || {
+            let outcome = runtime.block_on(replay_spill_dir(&round_dir, &round_url, &round_client));
+            // Trim quarantine on every round, not only at boot (2026-08-28,
+            // round-2 fix). Quarantine is written BY THIS LOOP during the
+            // session — a permanently-refused file is set aside here — so a
+            // boot-only trim lets a heavy-quarantine day ratchet past the
+            // ceiling mid-morning and re-disable the rescue tier until the
+            // next boot, which is the exact failure the trim exists to
+            // prevent. Cheap: it reads one flat directory and returns
+            // immediately when the bytes are inside budget.
+            //
+            // 2026-10-02: the budget is THIS directory's: the depth quarantine
+            // used to be trimmed against the tick spill ceiling. And a file is
+            // deleted only with a verified cold copy (plan item 45e-1).
+            let pruned = crate::tick_persistence::prune_quarantine(
+                &round_dir,
+                spill_max_bytes_for_dir(&round_dir),
+                require_upload,
+            );
+            (outcome, pruned)
+        })
+        .await;
+        // A panicked round ends this loop; the supervisor logs it, counts it
+        // and respawns after its backoff, exactly as for a panic here.
+        let Ok((outcome, pruned)) = round else {
+            return;
+        };
         if outcome.files_replayed > 0 || outcome.files_failed > 0 {
             info!(
                 files_replayed = outcome.files_replayed,
@@ -1175,22 +1212,6 @@ async fn run_replay_loop(dir: PathBuf, url: String, require_upload: bool) {
                 "tick spill drain round complete"
             );
         }
-        // Trim quarantine on every round, not only at boot (2026-08-28,
-        // round-2 fix). Quarantine is written BY THIS LOOP during the session —
-        // a permanently-refused file is set aside here — so a boot-only trim
-        // lets a heavy-quarantine day ratchet past the ceiling mid-morning and
-        // re-disable the rescue tier until the next boot, which is the exact
-        // failure the trim exists to prevent. Cheap: it reads one flat
-        // directory and returns immediately when the bytes are inside budget.
-        //
-        // 2026-10-02: the budget is THIS directory's: the depth quarantine
-        // used to be trimmed against the tick spill ceiling. And a file is
-        // deleted only with a verified cold copy (plan item 45e-1).
-        let pruned = crate::tick_persistence::prune_quarantine(
-            &dir,
-            spill_max_bytes_for_dir(&dir),
-            require_upload,
-        );
         if pruned > 0 {
             warn!(
                 files = pruned,
@@ -1834,6 +1855,29 @@ mod tests {
             "the drain must run BEFORE the first sleep — a boot-time backlog is \
              the defining case, not an edge case"
         );
+    }
+
+    #[test]
+    fn the_drain_round_runs_on_the_blocking_pool() {
+        // 2026-10-03 (O(1) sweep S3). The round reads spill files with
+        // `std::fs` and the trim lists and deletes files; both must run off
+        // the tokio workers the frame drain shares.
+        let src = include_str!("tick_spill_replay.rs");
+        let body = src
+            .split("async fn run_replay_loop")
+            .nth(1)
+            .expect("the drain loop must exist");
+        let body = &body[..body.find("\n}\n").expect("the loop function must end")];
+        let blocking = body
+            .find("spawn_blocking(")
+            .expect("the round must run on the blocking pool");
+        for step in ["replay_spill_dir(", "prune_quarantine("] {
+            let at = body.find(step).expect("the round step must exist");
+            assert!(
+                at > blocking,
+                "`{step}` must run inside the spawn_blocking closure, not on a worker"
+            );
+        }
     }
 
     #[test]

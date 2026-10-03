@@ -2023,55 +2023,64 @@ async fn async_main() -> Result<()> {
         let reclaim_clock = tokio::time::Instant::now();
         let mut last_pressure_reclaim_secs: Option<u64> = None;
         loop {
-            let wal_dir = tickvault_app::boot_helpers::ws_wal_dir();
-            let _outcome = tickvault_storage::ws_frame_spill::prune_archived_segments(
-                &wal_dir,
-                tickvault_common::constants::WS_WAL_ARCHIVE_RETENTION_SECS,
-                tickvault_common::constants::WS_WAL_ARCHIVE_MAX_BYTES,
-                require_raw_upload,
-            );
-            // 2026-08-25: the ACTIVE WAL set, bounded for the first time.
-            // Only `archive/` was ever pruned, on the assumption that active
-            // segments drain themselves via boot replay. They do not — the
-            // replay budget is 512 MiB per boot against continuous writing,
-            // so everything past the newest five segments was never replayed,
-            // never confirmed, never archived, and eligible for no bound.
-            // Measured on the prod box the day this landed: 244 active
-            // segments, 31 GB, oldest from the previous day, on a volume that
-            // was 94% full with free space cycling down to 1.94 GB — which is
-            // the condition that makes an ILP flush fail in the first place.
-            //
-            // Rides this same loop for the same reason the spill sweep does:
-            // same cadence, same cold path, one fewer task to supervise.
-            let _active = tickvault_storage::ws_frame_spill::prune_active_segments(
-                &wal_dir,
-                tickvault_common::constants::WS_WAL_ACTIVE_RETENTION_SECS,
-                tickvault_storage::ws_frame_spill::ws_wal_active_max_bytes(&wal_dir),
-                require_raw_upload,
-            );
-            // 2026-08-19: the SPILL retention sweep, wired for the first
-            // time. `SPILL_FILE_MAX_AGE_SECS` was defined, documented and
-            // unit-tested since 2026-07-13 with ZERO production consumers,
-            // and `clear_spill_for_date` — documented as "called by the
-            // writer task after read_all is fully replayed" — likewise had
-            // none. The writer chain only appends, so `data/spill/` grew for
-            // the life of the deployment with no age bound and no size bound.
-            // Rides this existing loop rather than spawning another task:
-            // same cadence, same cold path, one fewer thing to supervise.
-            let _spill = tickvault_storage::seal_spill::prune_spill_files(
-                std::path::Path::new("data/spill"),
-                tickvault_common::constants::SPILL_FILE_MAX_AGE_SECS,
-                require_raw_upload,
-            );
-            // The DLQ is MEASURED, never pruned — deliberately asymmetric
-            // with the spill sweep above. It holds the operator-readable
-            // record of seals that were LOST; deleting it to reclaim disk
-            // would destroy the evidence it exists to preserve. Nothing is
-            // written there in normal operation, so a growing DLQ IS the
-            // incident signal — publishing it makes that observable instead
-            // of something discovered when the volume fills.
-            let _dlq =
-                tickvault_storage::seal_dlq::record_dlq_bytes(std::path::Path::new("data/dlq"));
+            // ⚠ CHANGED 2026-10-03 (O(1) sweep S3): the four sweeps below list,
+            // stat and delete files, so they run on the blocking pool. On a
+            // tokio worker a slow or full disk held a thread the frame drain
+            // and the socket readers also run on, for the whole sweep.
+            let sweep = tokio::task::spawn_blocking(move || {
+                let wal_dir = tickvault_app::boot_helpers::ws_wal_dir();
+                let _outcome = tickvault_storage::ws_frame_spill::prune_archived_segments(
+                    &wal_dir,
+                    tickvault_common::constants::WS_WAL_ARCHIVE_RETENTION_SECS,
+                    tickvault_common::constants::WS_WAL_ARCHIVE_MAX_BYTES,
+                    require_raw_upload,
+                );
+                // 2026-08-25: the ACTIVE WAL set, bounded for the first time.
+                // Only `archive/` was ever pruned, on the assumption that active
+                // segments drain themselves via boot replay. They do not — the
+                // replay budget is 512 MiB per boot against continuous writing,
+                // so everything past the newest five segments was never replayed,
+                // never confirmed, never archived, and eligible for no bound.
+                // Measured on the prod box the day this landed: 244 active
+                // segments, 31 GB, oldest from the previous day, on a volume that
+                // was 94% full with free space cycling down to 1.94 GB — which is
+                // the condition that makes an ILP flush fail in the first place.
+                //
+                // Rides this same loop for the same reason the spill sweep does:
+                // same cadence, same cold path, one fewer task to supervise.
+                let _active = tickvault_storage::ws_frame_spill::prune_active_segments(
+                    &wal_dir,
+                    tickvault_common::constants::WS_WAL_ACTIVE_RETENTION_SECS,
+                    tickvault_storage::ws_frame_spill::ws_wal_active_max_bytes(&wal_dir),
+                    require_raw_upload,
+                );
+                // 2026-08-19: the SPILL retention sweep, wired for the first
+                // time. `SPILL_FILE_MAX_AGE_SECS` was defined, documented and
+                // unit-tested since 2026-07-13 with ZERO production consumers,
+                // and `clear_spill_for_date` — documented as "called by the
+                // writer task after read_all is fully replayed" — likewise had
+                // none. The writer chain only appends, so `data/spill/` grew for
+                // the life of the deployment with no age bound and no size bound.
+                // Rides this existing loop rather than spawning another task:
+                // same cadence, same cold path, one fewer thing to supervise.
+                let _spill = tickvault_storage::seal_spill::prune_spill_files(
+                    std::path::Path::new("data/spill"),
+                    tickvault_common::constants::SPILL_FILE_MAX_AGE_SECS,
+                    require_raw_upload,
+                );
+                // The DLQ is MEASURED, never pruned — deliberately asymmetric
+                // with the spill sweep above. It holds the operator-readable
+                // record of seals that were LOST; deleting it to reclaim disk
+                // would destroy the evidence it exists to preserve. Nothing is
+                // written there in normal operation, so a growing DLQ IS the
+                // incident signal — publishing it makes that observable instead
+                // of something discovered when the volume fills.
+                let _dlq =
+                    tickvault_storage::seal_dlq::record_dlq_bytes(std::path::Path::new("data/dlq"));
+            });
+            // The release build aborts on panic, so the only `Err` here is a
+            // runtime shutting down, when nothing is left to sweep for.
+            let _swept = sweep.await;
 
             // Wait for the scheduled interval OR a disk-pressure request,
             // whichever comes first (2026-09-01).
