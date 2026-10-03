@@ -187,3 +187,44 @@ fn queued_rescues_hold_and_release_a_watermark_floor() {
         );
     }
 }
+
+/// O(1) sweep, 2026-10-03: the frame drain calls `flush` BARE, because each
+/// writer moves the tokio worker aside itself at the only steps that block.
+/// This pins those steps, so a refactor that drops one puts a blocking file
+/// write or HTTP round trip back on a worker the runtime cannot reclaim.
+#[test]
+fn every_blocking_writer_step_runs_off_the_worker() {
+    let helper = production("off_worker.rs");
+    let body = body_of(&helper, "pub(crate) fn off_worker<T>(");
+    assert!(
+        body.contains("block_in_place") && body.contains("RuntimeFlavor::MultiThread"),
+        "off_worker must move the worker on a multi-thread runtime and only there"
+    );
+    for file in ["tick_persistence.rs", "depth_persistence.rs"] {
+        let src = production(file);
+        assert!(
+            body_of(&src, "fn spill_on_drain(").contains("off_worker(||"),
+            "{file}: the drain's inline spill write must run off the worker"
+        );
+        let mut producer_flushes = 0;
+        for line in src.lines().filter(|l| l.contains("sender.flush(")) {
+            if line.trim_start().starts_with("//")
+                || line.contains("sender.flush(&mut batch.buffer)")
+            {
+                // Comments, and the sink thread's own flush (a plain OS thread).
+                continue;
+            }
+            producer_flushes += 1;
+            assert!(
+                line.contains("off_worker(||"),
+                "{file}: a synchronous ILP round trip on the producer half runs on \
+                 the worker: `{}`",
+                line.trim()
+            );
+        }
+        assert!(
+            producer_flushes >= 1,
+            "{file}: no producer-half ILP flush found; the scan is stale"
+        );
+    }
+}

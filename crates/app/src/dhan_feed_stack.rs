@@ -7245,10 +7245,24 @@ fn flush_and_record(
     // of knowledge were kept in separate places is what produced this bug.
     // The cost of being wrong the cheap way is one worker swap at ~5 flushes
     // per second; the cost of being wrong the other way is this comment.
+    //
+    // ⚠ CHANGED 2026-10-03 (O(1) sweep) — the wrapper is gone from the drain,
+    // and the split-knowledge objection above is answered rather than
+    // overruled. The decision "does this flush block?" now lives in ONE
+    // place, the writer, at the exact step that blocks: `TickWriter` and
+    // `DepthWriter` run their synchronous ILP round trips and their inline
+    // spill writes through `tickvault_storage`'s `off_worker`, which is the
+    // same flavor-guarded `block_in_place` as `blocking_flush`. Nothing here
+    // has to be kept in step with `LiveIngest::flush`: whatever path a flush
+    // takes, the blocking step moves the worker aside and the hand-off path
+    // pays nothing. Before, every flush (about five a second) paid a worker
+    // hand-over for a `try_send`. Pinned by the storage guard
+    // `every_blocking_writer_step_runs_off_the_worker` and by
+    // `test_drain_never_flushes_bare_on_the_async_worker` below.
     if ingest.writer_is_offloaded() {
-        return blocking_flush(|| ingest.flush());
+        return ingest.flush();
     }
-    let rows = blocking_flush(|| ingest.flush());
+    let rows = ingest.flush();
     feed_health.record_ticks(
         Feed::Dhan,
         rows,
@@ -7304,7 +7318,9 @@ fn flush_depth(depth: Option<&mut DepthIngest>) {
     // visible in CloudWatch at all — and the delta, not the total, because a
     // cumulative would read alarming forever after one bad flush.
     let before = depth.dropped_rows();
-    if let Err(err) = blocking_flush(|| depth.flush()) {
+    // Bare since 2026-10-03: the writer moves the worker aside itself at the
+    // steps that block (see `flush_and_record`).
+    if let Err(err) = depth.flush() {
         // Deliberately `debug!`, not a second `error!`: the writer already
         // logged this failure at ERROR with the discarded row count, and
         // re-reporting it here would double every depth flush failure in the
@@ -23466,31 +23482,35 @@ mod tests {
         // counted — pinned at ZERO — rather than deleted, so re-introducing
         // the bare early return fails here by name instead of quietly
         // rebalancing the equality.
+        // ⚠ CHANGED 2026-10-03 (O(1) sweep). The two DRAIN flushes inside
+        // `flush_and_record` are now BARE, and that is correct for a reason
+        // this test can check: the writers move the worker aside themselves,
+        // at the only steps that block (the synchronous ILP round trip and
+        // the inline spill write), through `tickvault_storage`'s
+        // `off_worker`. The storage guard
+        // `every_blocking_writer_step_runs_off_the_worker` (storage) fails the build if
+        // either step loses it. Wrapping the whole flush here as well cost a
+        // worker hand-over about five times a second for a `try_send`.
+        //
+        // So the invariant is now: exactly two bare flushes, both inside the
+        // helper; every OTHER production `ingest.flush()` (the boot and
+        // catch-up paths, which do far more than a flush inside the wrapper)
+        // stays wrapped.
         let bare = production_half.matches("ingest.flush()").count();
         let wrapped = production_half
             .matches("blocking_flush(|| ingest.flush())")
             .count();
         let offloaded = production_half.matches("return ingest.flush();").count();
         assert_eq!(
-            offloaded, 0,
-            "found {offloaded} BARE offloaded flush(es). `LiveIngest::flush` \
-             flushes the inline-depth sink unconditionally and that is a \
-             blocking ILP-over-HTTP call — a bare `return ingest.flush();` puts \
-             it straight back on the async drain task, which is a tick-loss and \
-             disconnect path, not merely a slow one"
-        );
-        assert!(
-            production_half.contains("return blocking_flush(|| ingest.flush());"),
-            "the offloaded early return must still EXIST and must be wrapped — \
-             if it is gone entirely the writer split was deleted and the full \
-             flush is back on the drain"
+            offloaded, 1,
+            "the offloaded early return must still EXIST, bare — if it is gone \
+             the writer split was deleted and the full flush is back on the drain"
         );
         assert_eq!(
             bare,
-            wrapped + offloaded,
-            "every production ingest.flush() must be wrapped in blocking_flush; \
-             found {bare} call(s), {wrapped} wrapped and {offloaded} bare — the \
-             difference is a blocking HTTP call sitting on the async drain task"
+            wrapped + 2,
+            "found {bare} ingest.flush() call(s), {wrapped} wrapped: only the two \
+             drain flushes inside `flush_and_record` may be bare"
         );
 
         // The offload must be WIRED, not merely available. Seven of the nine
@@ -23604,16 +23624,18 @@ mod tests {
         let helper_end = production_half[helper_start..]
             .find("\nfn ")
             .map_or(production_half.len(), |off| helper_start + off);
-        let wrapped_in_helper = production_half[helper_start..helper_end]
-            .matches("blocking_flush(|| ingest.flush())")
-            .count();
+        let helper = &production_half[helper_start..helper_end];
+        let wrapped_in_helper = helper.matches("blocking_flush(|| ingest.flush())").count();
+        let bare_in_helper = helper.matches("ingest.flush()").count();
         assert_eq!(
-            wrapped_in_helper, 2,
-            "expected exactly TWO wrapped ingest.flush() calls INSIDE \
+            (bare_in_helper, wrapped_in_helper),
+            (2, 0),
+            "expected exactly TWO bare ingest.flush() calls INSIDE \
              `flush_and_record` — the offloaded early return and the \
-             synchronous fallback. Found {wrapped_in_helper}: either the helper \
-             was inlined back into the drain (which re-opens the \
-             four-sites-to-keep-in-sync problem) or a drain flush bypassed it"
+             synchronous fallback — and none wrapped (since 2026-10-03 the \
+             writers move the worker aside at their own blocking steps). Found \
+             {bare_in_helper} bare and {wrapped_in_helper} wrapped: either the \
+             helper was inlined back into the drain or a drain flush bypassed it"
         );
         let drain_wiring_at = production_half
             .find("let (frame_tx, frame_rx)")
