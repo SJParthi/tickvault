@@ -683,6 +683,14 @@ mod tests {
         }
         let rt = build_reader_runtime(1, Some(core)).expect("one thread");
         let blocking_allowed = rt.block_on(async {
+            // The worker is itself a task on the blocking pool's FIFO queue.
+            // If this `spawn_blocking` is queued before the worker's thread
+            // has popped it, the second thread can start first and take the
+            // worker, so each runs under the other's name. Running a spawned
+            // task proves a worker is already executing, so the blocking job
+            // below can only go to a new thread. Production builds the
+            // runtime at boot and spawns blocking work long after.
+            tokio::spawn(async {}).await.expect("a worker is running");
             tokio::task::spawn_blocking(|| {
                 assert_eq!(
                     std::thread::current().name(),
