@@ -190,8 +190,11 @@ fn both_lane_confirms_require_empty_producers_and_no_unlanded_batch() {
         lane.contains("ingest.writer.pending() == 0 && ingest.depth_pending_rows() == 0"),
         "rows retained in a producer after a full queue are RAM-only and must block the confirm"
     );
+    // `applied_watermark().unlanded_total()` and not the bare method: the
+    // replay pacing (audit R1) also reads it, once per wait, to end a wait
+    // early on a rescue, and that read is not a confirm snapshot.
     assert_eq!(
-        lane.matches(".unlanded_total()").count(),
+        lane.matches("applied_watermark().unlanded_total()").count(),
         2,
         "each refold snapshots the unlanded count before it folds"
     );
