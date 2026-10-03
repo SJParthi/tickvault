@@ -2427,6 +2427,25 @@ R3 Z+ and guarantee matrix: covered by the shared matrix at the end of this plan
 one histogram bucket update per frame (R3-11) and one bool per frame (R3-9); no allocation by
 construction (an allocation test for the telemetry is still open).
 
+### Added 2026-10-03 (health check on main 2fabc2e), riskiest first
+
+Operator 2026-10-03 09:28 UTC: "go", on the offered order: restart data-loss fix, then the token
+write, then candle warm-up (PR31b-2 (a), already listed above). Each fix ships as its own PR.
+
+- [x] **H1 — A catch-up drain that stops early no longer lets its leftover backlog be archived
+  unread.** The live lane's acks lifted the applied watermark past the segments the drain left,
+  and the next boot's replay skipped them as applied. The not-drained arm now marks
+  `[lowest waiting first seq, ceiling − 1]` unapplied and persists it before the live ring exists
+  (`ws_frame_spill.rs` `guard_pending_backlog`, `dhan_feed_stack.rs`). O(waiting segments) header
+  reads, once per boot, cold. Tests:
+  test_regression_leftover_backlog_is_replayed_after_live_acks_pass_it,
+  test_guard_pending_backlog_ignores_segments_at_or_above_the_ceiling,
+  an_unfinished_catchup_guards_its_leftover_backlog_before_the_live_drain.
+- [ ] **H2 — Token renewal no longer writes the token cache file on the socket reader worker.**
+  After an 807/809 renewal, `token_cache::save_token_cache` (a sync write and fsync) runs on the
+  single `tv-ws-reader` worker, so a slow disk stalls every socket. Move the write to the blocking
+  pool. Files: `crates/core/src/auth/token_manager.rs`, `crates/core/src/auth/token_cache.rs`.
+
 ## Edge Cases
 
 - PR1: log burst larger than the non-blocking buffer → lines dropped and counted, never blocking.

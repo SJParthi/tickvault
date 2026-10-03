@@ -360,3 +360,31 @@ fn the_sink_suspect_refusal_counter_is_seeded_at_zero() {
          ever be."
     );
 }
+
+/// 2026-10-03: a catch-up drain that stops early must mark the backlog it left
+/// unapplied, and persist that, before the live drain starts acking higher
+/// sequences; otherwise the next boot archives the leftover segments unread.
+#[test]
+fn an_unfinished_catchup_guards_its_leftover_backlog_before_the_live_drain() {
+    let lane = production("src/dhan_feed_stack.rs");
+    let snap = lane
+        .find("let catchup_ceiling_seq = tickvault_storage::ws_frame_spill::current_frame_seq();")
+        .expect("the catch-up snapshots the frame seq before its first round");
+    let guard = lane
+        .find("tickvault_storage::ws_frame_spill::guard_pending_backlog(")
+        .expect("the not-drained arm marks the leftover backlog");
+    let live = lane
+        .find("let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<CapturedFrame>(")
+        .expect("the live frame ring is created after the catch-up");
+    assert!(
+        snap < guard && guard < live,
+        "ceiling, then guard, then live ring"
+    );
+    let persist = lane[guard..]
+        .find("wm.persist_now();")
+        .expect("the guard is persisted");
+    assert!(
+        guard + persist < live,
+        "persisted before the live ring exists"
+    );
+}
