@@ -127,7 +127,6 @@ const SHELL_OPS_FILES: &[(&str, usize)] = &[
     ("scripts/diagnose-write-amplification.sh", 99),
     ("scripts/doctor.sh", 298),
     ("scripts/ensure-aws-cli.sh", 71),
-    ("scripts/ensure-questdb.sh", 230),
     ("scripts/ensure-ready.sh", 312),
     ("scripts/flaky-detect.sh", 93),
     ("scripts/mcp-doctor.sh", 97),
@@ -160,7 +159,9 @@ const SHELL_OPS_FILES: &[(&str, usize)] = &[
 
 /// Per systemd unit: how many `Exec*=` lines run a shell. Pinned EXACTLY:
 /// it may only go down, and the pin moves down in the same PR.
-const SYSTEMD_SHELL_EXEC_BUDGET: &[(&str, usize)] = &[("deploy/systemd/tickvault.service", 1)];
+/// Empty since 2026-10-01 (audit D6d): the last one, the QuestDB self-heal,
+/// is now `tickvault-host ensure-questdb`.
+const SYSTEMD_SHELL_EXEC_BUDGET: &[(&str, usize)] = &[];
 
 /// Shells a shebang may name for the file to count as a shell script.
 const SHELL_RUNTIMES: &[&str] = &["bash", "sh", "dash", "zsh", "ksh"];

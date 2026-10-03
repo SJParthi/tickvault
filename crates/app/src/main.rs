@@ -696,6 +696,13 @@ async fn async_main() -> Result<()> {
         let code = tickvault_app::holiday_gate::run(trading_day_gate_code).await;
         std::process::exit(code);
     }
+    // `tickvault ensure-questdb` (audit D6d; was scripts/ensure-questdb.sh):
+    // tickvault.service's ExecStartPre and the console's restart actions bring
+    // the QuestDB container up. After the provider install for its SSM client.
+    if tickvault_app::ensure_questdb::is_invocation(&cli_args) {
+        let code = tickvault_app::ensure_questdb::run().await;
+        std::process::exit(code);
+    }
 
     // -----------------------------------------------------------------------
     // Step 1: Load and validate configuration

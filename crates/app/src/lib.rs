@@ -186,6 +186,10 @@ pub mod volume_semantics_probe;
 // PR #3 (2026-05-19): `greeks_pipeline` module DELETED. Greeks
 // pipeline retired alongside the indices-only universe. Option Chain
 // REST overlay (PR #8) ships Dhan-computed greeks separately.
+/// `tickvault ensure-questdb`: bring the QuestDB container up (boot self-heal
+/// and the console's restart actions; audit D6d, replaced
+/// `scripts/ensure-questdb.sh`).
+pub mod ensure_questdb;
 /// `tickvault holiday-gate`: the boot-time NSE-holiday self-stop gate the
 /// holiday-gate systemd unit runs before the app (audit D6c; replaced
 /// `deploy/aws/holiday-gate.sh`).

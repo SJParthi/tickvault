@@ -91,19 +91,27 @@ WorkingDirectory=/opt/tickvault
 # container that was removed (down/wipe/reset). Without this, a missing QuestDB
 # makes the app crash-loop forever on BOOT-02.
 #
-# This calls scripts/ensure-questdb.sh (idempotent) instead of a bare
-# `docker compose ... up -d questdb`, which had THREE bugs (incident 2026-06-08):
+# The bare `docker compose ... up -d questdb` this replaced had THREE bugs
+# (incident 2026-06-08):
 #   (a) hosts without the `docker compose` v2 plugin → no-op (docker prints help);
 #   (b) the compose SERVICE name is `tv-questdb`, not `questdb`;
 #   (c) a recreate needs QDB_PG_* creds from SSM, absent from this unit's env.
-# The helper handles running/stopped/removed, tries compose v2→v1→plugin-path,
-# and falls back to `docker run` so the box recovers even with no compose.
-# Leading `-` = a transient hiccup does NOT hard-fail the unit; the app's own
-# 60s `wait_for_questdb_ready` is the real gate.
+# The self-heal was scripts/ensure-questdb.sh until 2026-10-01 (audit D6d); it
+# is now `tickvault ensure-questdb`, run from the root-owned copy
+# `bin/tickvault-host` (see tickvault-host-tuning.service: the deploy rollback
+# restores `bin/tickvault`, and a binary from before the port would ignore the
+# subcommand and boot the whole app here). It handles running/stopped/removed,
+# reads the PG creds from SSM itself, tries compose v2→v1→plugin-path, and
+# falls back to `docker run` so the box recovers even with no compose. Every
+# docker call inside is time-bounded, because TimeoutStartSec=infinity below
+# means systemd never kills a hung ExecStartPre.
+# Leading `-` = a transient hiccup (or a missing copy on a new instance before
+# its first deploy) does NOT hard-fail the unit; the app's own 60s
+# `wait_for_questdb_ready` is the real gate.
 # NOTE: still does NOT fix QuestDB CRASHING on start (disk-full / volume
 # corruption) — see docs/runbooks/aws-docker-daemon-dead.md (`docker logs
 # tv-questdb` + `df -h`).
-ExecStartPre=-/bin/bash /opt/tickvault/repo/scripts/ensure-questdb.sh
+ExecStartPre=-/opt/tickvault/bin/tickvault-host ensure-questdb
 
 # Boot can legitimately exceed systemd's default 90s TimeoutStartSec: the app
 # is Type=notify and only sends READY=1 AFTER its own boot gates complete —
@@ -360,9 +368,10 @@ ProtectHome=true
 # Docker socket exemption (2026-07-13, deploy-hang fix companion):
 # ProtectSystem=strict mounts the whole hierarchy read-only (except
 # /dev /proc /sys), and connect(2) on a unix socket needs WRITE access to the
-# socket inode — so every `docker …` call made by ExecStartPre
-# (ensure-questdb.sh) fails with EACCES in the SERVICE-USER context while the
-# SAME script works from an SSM/root shell (no sandbox). On a post-nuke boot
+# socket inode — so every `docker …` call made by ExecStartPre (then
+# ensure-questdb.sh, now `tickvault-host ensure-questdb`) fails with EACCES in
+# the SERVICE-USER context while the SAME call works from an SSM/root shell (no
+# sandbox). On a post-nuke boot
 # with no QuestDB container/image that meant the self-heal could never bring
 # QuestDB up → BOOT-02 halt at 08:30. The `-` prefix ignores a missing socket
 # (docker.service not yet up), so this can never fail the unit start; it only

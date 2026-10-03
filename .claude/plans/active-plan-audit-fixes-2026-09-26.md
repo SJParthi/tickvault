@@ -2280,9 +2280,9 @@ idle poll. No allocation on the tick path.
   `TICKVAULT_WS_READER_THREADS`, 0 = rollback), Prometheus-only telemetry
   (`hot_path_telemetry.rs`), ratchet `crates/common/tests/hot_path_no_blocking_guard.rs`
   (bite-proved). CPU pinning NOT added: needs `libc` as a direct dependency (owner approval).
-- [ ] **R3-12 (D6d) — `scripts/ensure-questdb.sh` replaced by `tickvault ensure-questdb`.**
-  Withdrawn from PR #2004 on 2026-10-03: PR #2005 is the dedicated, reworked version of the
-  same change, and keeping both would merge two diverging implementations. Delivered by #2005.
+- [x] **R3-12 (D6d) — `scripts/ensure-questdb.sh` replaced by `tickvault ensure-questdb`.**
+  Delivered by PR #2005, folded into #2004 on 2026-10-03 (the earlier copy here was reverted
+  first so only #2005's version lands).
 - [ ] **R3-13 (D11) — Special sessions (Muhurat).** Built inert on `wip/d11`, NOT merged: needs the
   owner to confirm date, hours and cost, and a compile + test run.
 - [ ] **R3-14 — WAL segment names from a monotonic source** (replay order across a clock step). Open.

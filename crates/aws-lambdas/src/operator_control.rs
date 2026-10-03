@@ -1444,10 +1444,12 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
             }
         }
         "restart-questdb" => {
-            // ensure-questdb.sh (create-or-restart) — robust to
+            // The on-box self-heal (create-or-restart), robust to
             // docker-compose v1/v2 absence + the CORRECT service name +
-            // SSM creds for the recreate case (incident 2026-06-08).
-            let cmds = ["bash /opt/tickvault/repo/scripts/ensure-questdb.sh".to_string()];
+            // SSM creds for the recreate case (incident 2026-06-08). Now the
+            // `ensure-questdb` subcommand of the installed binary (audit D6d).
+            let cmds =
+                [crate::operator_control_action_commands::ENSURE_QUESTDB_COMMAND.to_string()];
             match shell.ssm_shell(&cmds).await {
                 Ok(cid) => resp(
                     200,
@@ -4501,7 +4503,7 @@ mod tests {
         assert!(joined.contains("systemctl stop tickvault"));
         assert!(joined.contains("docker compose down -v"));
         assert!(joined.contains("docker system prune -af --volumes"));
-        assert!(joined.contains("ensure-questdb.sh"));
+        assert!(joined.contains("tickvault-host ensure-questdb"));
         assert!(joined.contains("systemctl restart tickvault"));
     }
 
@@ -4539,9 +4541,38 @@ mod tests {
         assert!(joined.contains("BARE-NUKE-RESULT"));
         assert!(joined.contains("bare-nuke-complete"));
         // the WHOLE POINT: it must NOT rebuild / restart the app
-        assert!(!joined.contains("ensure-questdb.sh"));
+        assert!(!joined.contains("ensure-questdb"));
         assert!(!joined.contains("systemctl restart tickvault"));
         assert!(!joined.contains("docker compose up"));
+    }
+
+    #[tokio::test]
+    async fn test_restart_questdb_calls_the_binary_only_behind_the_version_check() {
+        // Audit D6d (2026-10-01): the self-heal moved from a shell script into
+        // the binary. A binary that predates the port would ignore the
+        // unknown subcommand and boot the whole app, so the call must sit
+        // behind the check for the new binary's log prefix.
+        let shell = MockShell {
+            ssm_result: Ok("cmd-rq".to_string()),
+            ..MockShell::default()
+        };
+        let resp = post(&shell, json!({"action": "restart-questdb"})).await;
+        assert_eq!(status_of(&resp), 200);
+        let joined = shell.captured_joined();
+        let guard = "grep -qaF 'ensure-questdb: ' /opt/tickvault/bin/tickvault-host";
+        let call = "then /opt/tickvault/bin/tickvault-host ensure-questdb;";
+        let guard_at = joined.find(guard).expect("version check present");
+        let call_at = joined.find(call).expect("binary call present");
+        assert!(guard_at < call_at, "the check must run before the call");
+        assert_eq!(joined.matches("tickvault-host ensure-questdb").count(), 1);
+        assert!(joined.contains("ENSURE-QUESTDB-SKIPPED"));
+        // The reset's two self-heal lines use the same guarded command.
+        use crate::operator_control_action_commands::{
+            DOCKER_RESET_COMMANDS, ENSURE_QUESTDB_COMMAND,
+        };
+        let reset = DOCKER_RESET_COMMANDS.join("\n");
+        assert_eq!(reset.matches(ENSURE_QUESTDB_COMMAND).count(), 2);
+        assert!(!reset.contains("bash /opt/tickvault/repo/scripts/ensure-questdb.sh ||"));
     }
 
     // ---------------------------------------------------- class HtmlWipeButton
