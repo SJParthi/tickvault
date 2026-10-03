@@ -16845,6 +16845,25 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 "WAL catch-up drained the backlog completely — the applied-watermark's \
                  unapplied map is cleared for this session"
             );
+        } else {
+            // The drain stopped with segments still waiting. The live lane's
+            // acks are about to lift the watermark past them, and with no mark
+            // the next boot would archive them UNREAD (2026-10-03 audit). Mark
+            // the leftover range unapplied and persist it before any live ack.
+            let wm = tickvault_storage::wal_applied_watermark::applied_watermark();
+            if let Some((lo, hi)) = tickvault_storage::ws_frame_spill::guard_pending_backlog(
+                wm,
+                &crate::boot_helpers::ws_wal_dir(),
+                catchup_ceiling_seq,
+            ) {
+                wm.persist_now();
+                warn!(
+                    from_seq = lo,
+                    to_seq = hi,
+                    "WAL catch-up left segments for the next boot — their range is marked \
+                     unapplied so the next replay reads them instead of archiving them unread"
+                );
+            }
         }
         if rounds > 0 || catchup_memory_stopped || catchup_lag_stopped || catchup_pause_clock_out {
             // `catchup_memory_stopped` joins `exhausted` deliberately: all

@@ -4728,6 +4728,50 @@ pub fn confirm_replayed<P: AsRef<Path>>(wal_dir: P) {
     );
 }
 
+/// Protects the WAL backlog a catch-up drain did NOT reach (2026-10-03).
+///
+/// A drain that stops early (clock, round cap, memory, apply lag, a sink that
+/// stops answering) leaves segments as `*.wal` (or staged in `replaying/`)
+/// for the next boot. The live lane then acks frames with HIGHER sequences,
+/// which lifts the applied watermark past the leftover range; with no
+/// unapplied bucket over it, the next boot's replay would read every leftover
+/// segment as applied and archive it UNREAD — its ticks and depth never
+/// reaching the database, with no counter anywhere.
+///
+/// This marks `[lowest first frame_seq still waiting, ceiling_seq − 1]`
+/// unapplied, so the next replay reads those segments instead. Returns the
+/// marked range, or `None` when nothing below `ceiling_seq` is waiting. The
+/// caller persists the watermark. A range wider than the bucket table
+/// overflows it, which fails towards replaying everything.
+///
+/// O(waiting segments) header reads, cold: once per boot, after the drain.
+// TEST-EXEMPT: covered by test_regression_leftover_backlog_is_replayed_after_live_acks_pass_it + test_guard_pending_backlog_ignores_segments_at_or_above_the_ceiling
+pub fn guard_pending_backlog(
+    wm: &crate::wal_applied_watermark::AppliedWatermark,
+    wal_dir: &Path,
+    ceiling_seq: u64,
+) -> Option<(u64, u64)> {
+    let mut lowest: Option<u64> = None;
+    for dir in [wal_dir.to_path_buf(), wal_dir.join(REPLAYING_SUBDIR)] {
+        // O(1) EXEMPT: boot-time backlog guard, one header read per waiting segment
+        for seg in wal_segments_in(&dir) {
+            let seq = first_frame_seq_in_segment(&seg);
+            // `0` is an unreadable or v1 first record; such a segment is never
+            // skipped by the replay, so it needs no mark.
+            if seq > 0 {
+                lowest = Some(lowest.map_or(seq, |l| l.min(seq)));
+            }
+        }
+    }
+    let lo = lowest?;
+    let hi = ceiling_seq.checked_sub(1)?;
+    if lo > hi {
+        return None;
+    }
+    wm.note_unapplied_range(lo, hi);
+    Some((lo, hi))
+}
+
 /// Outcome of one `<wal_dir>/archive/` pruning pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ArchivePruneOutcome {
@@ -10757,6 +10801,79 @@ mod tests {
     fn replay_unguarded(dir: &Path) -> WalReplayBatch {
         replay_all_with_report_guarded(dir, usize::MAX, || None, None, WAL_REPLAY_RSS_STOP_PCT)
             .expect("replay")
+    }
+
+    /// 2026-10-03: a catch-up drain that stops early leaves segments for the
+    /// next boot, and the live lane's acks then lift the watermark past them.
+    /// Without the guard the next replay archives them unread; with it, every
+    /// leftover frame comes back.
+    #[test]
+    fn test_regression_leftover_backlog_is_replayed_after_live_acks_pass_it() {
+        // The bug, reproduced: live acks pass the leftover range, nothing
+        // marks it, and the replay archives all but the last segment unread.
+        let dir = tmp_dir("wm-leftover-unguarded");
+        for first in [0, 1_000, 2_000] {
+            write_wm_segment(&dir, first, 5, WalEndpoint::MainFeed);
+        }
+        let wm = crate::wal_applied_watermark::AppliedWatermark::new_for_tests();
+        wm.note_ticks_acked(wm_seq(5_000));
+        wm.note_depth_acked(wm_seq(5_000));
+        write_wm_watermark(&dir, &wm.snapshot());
+        let batch = replay_unguarded(&dir);
+        assert_eq!(
+            batch.skipped_segments, 2,
+            "the unguarded bug: two segments archived unread"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // The fix: the drain marks the leftover range before the live lane starts.
+        let dir = tmp_dir("wm-leftover-guarded");
+        for first in [0, 1_000, 2_000] {
+            write_wm_segment(&dir, first, 5, WalEndpoint::MainFeed);
+        }
+        let wm = crate::wal_applied_watermark::AppliedWatermark::new_for_tests();
+        let ceiling = wm_seq(3_000);
+        assert_eq!(
+            guard_pending_backlog(&wm, &dir, ceiling),
+            Some((wm_seq(0), ceiling - 1))
+        );
+        wm.note_ticks_acked(wm_seq(5_000));
+        wm.note_depth_acked(wm_seq(5_000));
+        write_wm_watermark(&dir, &wm.snapshot());
+        let batch = replay_unguarded(&dir);
+        assert_eq!(batch.skipped_segments, 0, "nothing is archived unread");
+        assert_eq!(batch.frames.len(), 15, "every leftover frame comes back");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Segments staged in `replaying/` are guarded too; segments written at or
+    /// above the ceiling (this session's) and an empty directory need nothing.
+    #[test]
+    fn test_guard_pending_backlog_ignores_segments_at_or_above_the_ceiling() {
+        let dir = tmp_dir("wm-guard-ceiling");
+        let wm = crate::wal_applied_watermark::AppliedWatermark::new_for_tests();
+        assert_eq!(
+            guard_pending_backlog(&wm, &dir, wm_seq(100)),
+            None,
+            "nothing waiting"
+        );
+        write_wm_segment(&dir, 200, 5, WalEndpoint::MainFeed);
+        assert_eq!(
+            guard_pending_backlog(&wm, &dir, wm_seq(100)),
+            None,
+            "only this session's segments"
+        );
+        assert_eq!(guard_pending_backlog(&wm, &dir, 0), None, "zero ceiling");
+        let replaying = dir.join(REPLAYING_SUBDIR);
+        std::fs::create_dir_all(&replaying).unwrap();
+        write_wm_segment(&replaying, 50, 5, WalEndpoint::MainFeed);
+        assert_eq!(
+            guard_pending_backlog(&wm, &dir, wm_seq(100)),
+            Some((wm_seq(50), wm_seq(100) - 1)),
+            "a staged segment is the lowest waiting one"
+        );
+        assert!(wm.snapshot().range_has_unapplied(wm_seq(50), wm_seq(54)));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -----------------------------------------------------------------------
