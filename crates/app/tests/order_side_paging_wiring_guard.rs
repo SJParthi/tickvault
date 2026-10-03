@@ -265,3 +265,106 @@ fn test_fill_lag_alarm_ships_disarmed_with_arming_description() {
         "fill-lag alarm shape drifted (tv_order_fill_lag_seconds Maximum > 10s)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Audit PR42a (2026-10-01): one shipped counter for three SEBI-row losses
+// ---------------------------------------------------------------------------
+
+const CHAIN_LOST_COUNTER: &str = "tv_order_audit_chain_lost_total";
+
+/// Everything before the first TOP-LEVEL `#[cfg(test)]` (column 0). The
+/// writers carry indented `#[cfg(test)]` helpers above their emit sites, so
+/// `production_region` would cut them off.
+fn before_test_module(body: &str) -> &str {
+    body.split("\n#[cfg(test)]").next().unwrap_or(body)
+}
+
+/// Each source the chain counter carries, with the file that emits it. The
+/// emit (`.increment(n)`) and the seed (`.increment(0)`) must both be there,
+/// in production code, under that source label.
+const CHAIN_LOST_SOURCES: &[(&str, &str)] = &[
+    (
+        "../storage/src/pnl_audit_persistence.rs",
+        "pnl_audit_discarded",
+    ),
+    (
+        "../storage/src/order_leg_pnl_persistence.rs",
+        "order_leg_pnl_discarded",
+    ),
+    ("src/dhan_order_push_observability.rs", "order_push_lagged"),
+];
+
+#[test]
+fn test_chain_lost_counter_is_emitted_and_seeded_at_every_source() {
+    for (file, source) in CHAIN_LOST_SOURCES {
+        let body = read_repo_file(file);
+        let prod = compact(&strip_line_comments(before_test_module(&body)));
+        let series = format!("\"{CHAIN_LOST_COUNTER}\",\"source\"=>\"{source}\")");
+        let emits: Vec<&str> = prod
+            .match_indices(&series)
+            .map(|(i, _)| &prod[i..])
+            .collect();
+        assert!(
+            emits
+                .iter()
+                .any(|tail| tail[series.len()..].starts_with(".increment(0)")),
+            "{file}: {CHAIN_LOST_COUNTER}{{source={source}}} is not seeded at 0, so its \
+             first loss would be the sample the CloudWatch agent drops"
+        );
+        assert!(
+            emits.iter().any(|tail| {
+                let rest = &tail[series.len()..];
+                rest.starts_with(".increment(") && !rest.starts_with(".increment(0)")
+            }),
+            "{file}: {CHAIN_LOST_COUNTER}{{source={source}}} is never incremented by the loss"
+        );
+    }
+}
+
+#[test]
+fn test_order_push_lag_is_a_coded_error() {
+    let body = read_repo_file("src/dhan_order_push_observability.rs");
+    let prod = compact(&strip_line_comments(production_region(&body)));
+    let arm = prod
+        .split("RecvError::Lagged(skipped))=>{")
+        .nth(1)
+        .expect("the Lagged arm is gone"); // APPROVED: test
+    let arm = arm.split("RecvError::Closed").next().unwrap_or(arm);
+    assert!(
+        arm.contains("error!(code=ErrorCode::Audit06OrderWriteFailed.code_str(),"),
+        "the order-push Lagged arm must log a coded AUDIT-06 error; skipped updates \
+         are lost SEBI rows"
+    );
+    assert!(
+        !arm.contains("warn!("),
+        "the order-push Lagged arm is back to a warn!"
+    );
+}
+
+#[test]
+fn test_chain_loss_alarm_sums_the_chain_lost_counter() {
+    let tf = compact(&strip_hcl_comments(&read_repo_file(ORDER_SIDE_TF)));
+    let block = tf
+        .split("resource\"aws_cloudwatch_metric_alarm\"\"order_audit_chain_loss\"{")
+        .nth(1)
+        .expect("order_audit_chain_loss alarm is gone"); // APPROVED: test
+    let block = block.split("resource\"").next().unwrap_or(block);
+    assert!(
+        block.contains(&format!("metric_name=\"{CHAIN_LOST_COUNTER}\"")),
+        "order_audit_chain_loss no longer reads {CHAIN_LOST_COUNTER}"
+    );
+    assert!(
+        block.contains("+FILL(m6,0)"),
+        "order_audit_chain_loss expression no longer sums m6"
+    );
+    assert!(
+        block.contains("ok_actions=[]"),
+        "the chain-loss alarm gained ok_actions"
+    );
+
+    let agent = read_repo_file("../../deploy/aws/cloudwatch-agent.json");
+    assert!(
+        agent.contains(&format!("|{CHAIN_LOST_COUNTER}|")),
+        "{CHAIN_LOST_COUNTER} is not in the EMF selector, so the alarm reads nothing"
+    );
+}
