@@ -2531,6 +2531,26 @@ write, then candle warm-up (PR31b-2 (a), already listed above). Each fix ships a
   `crates/app/src/{ws_audit_consumer,order_observability}.rs`. Tests:
   test_audit_consumers_never_flush_bare_on_the_worker,
   regenerate_summary_skips_a_file_last_written_before_the_window.
+- [x] **S3 — Spill replay, retention sweeps and the upload listing no longer block a shared worker.**
+  The tick spill replay read 8 MiB chunks and trimmed its quarantine with `std::fs` on a tokio
+  worker; the retention loop in `main.rs` ran the WAL archive and active prunes, the spill sweep
+  and the DLQ size reading inline; the raw-frame upload listed both directories (one stat and one
+  marker read per file) inline. The replay round now runs on the blocking pool (its HTTP posts
+  still run on the runtime via `Handle::block_on`), the retention pass runs in one
+  `spawn_blocking`, and the listings run through `off_worker`. Files:
+  `crates/storage/src/{tick_spill_replay,raw_frame_upload}.rs`, `crates/app/src/main.rs`,
+  `crates/app/tests/disk_retention_wiring_guard.rs`. Tests:
+  the_drain_round_runs_on_the_blocking_pool, test_retention_sweeps_run_on_the_blocking_pool,
+  every_listing_runs_off_the_worker. Honest limit: the work is still O(files) per pass; it no
+  longer holds a worker the drain and readers share.
+- [x] **S4 — API debug scans and the feed-state write no longer block a runtime worker.**
+  `/api/debug/logs/jsonl/latest`, `/api/debug/spill/status` and `/api/debug/cross-verify/latest`
+  listed directories with `std::fs` on the request worker and sorted every match to pick the
+  newest; the feed toggle wrote and fsynced `data/feed-state.json` inline. The scans and the
+  write now run on the blocking pool, the newest-file pick is one pass keeping the greatest name
+  (O(files), no list, no sort), and a failed join reads as a failed write. Files:
+  `crates/api/src/handlers/{debug,feeds}.rs`. Test:
+  every_handler_scan_runs_on_the_blocking_pool.
 
 ## Edge Cases
 
