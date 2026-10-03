@@ -222,7 +222,7 @@ Environment=TICKVAULT_DHAN_LIVE_FEED=1
 # (nr_throttled 18,594 / nr_periods 85,149).
 #
 # The partition, whose other halves live in deploy/docker/docker-compose.yml
-# (QuestDB + sidecars) and deploy/aws/host-tuning/apply-host-tuning.sh (IRQs):
+# (QuestDB + sidecars) and `tickvault host-tuning apply` (IRQs):
 #
 #   core 0  OS + NIC IRQ/softirq + the log sidecars
 #   core 1  THIS PROCESS — exclusive
@@ -244,7 +244,7 @@ Environment=TICKVAULT_DHAN_LIVE_FEED=1
 #
 # HOST-SIZE SAFETY. This names CPUs 1-2, which requires at least 3 cores. On a
 # smaller host the tuning unit REMOVES this setting via a drop-in before the
-# app starts (see apply-host-tuning.sh) rather than letting it pin the app
+# app starts (see `tickvault host-tuning apply`) rather than letting it pin the app
 # into a set the kernel cannot honour.
 #
 # ROLLBACK — no code change, no rebuild, no redeploy:

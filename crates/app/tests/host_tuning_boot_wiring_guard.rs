@@ -91,13 +91,13 @@ fn boot_unit_applies_both_halves_of_the_tuning() {
     // The non-sysctl half is the whole reason a BOOT unit is required: THP is a
     // /sys write and is lost on every reboot.
     assert!(
-        unit.contains("apply-host-tuning.sh"),
+        unit.contains("tickvault-host host-tuning apply"),
         "the unit must run the non-sysctl half (THP + clock) — THP is a /sys \
          write that does NOT survive a reboot, which is the single strongest \
          reason this unit exists"
     );
     assert!(
-        unit.contains("verify-net-tuning.sh"),
+        unit.contains("tickvault-host host-tuning verify"),
         "the unit must verify what it applied — applying without verifying is \
          how a silently-ineffective setting survives"
     );
@@ -447,4 +447,64 @@ fn test_the_questdb_memory_cap_is_derived_and_self_consistent() {
             }
         }
     }
+}
+
+/// The boot units run the subcommands from `bin/tickvault-host`, never from
+/// `bin/tickvault` (audit D6b, 2026-10-01).
+///
+/// A binary from before the port does not know `host-tuning`: it ignores the
+/// arguments and boots the whole trading app — here as root, inside a oneshot
+/// that `tickvault.service` is ordered behind, so the real app waits forever.
+/// The deploy rollback restores `bin/tickvault` from `bin/tickvault.backup`,
+/// which on the first deploy of the port IS such a binary. So the units must
+/// call a copy the rollback never touches, installed only after the smoke
+/// test passed, and the oneshot must carry a start timeout as a backstop.
+#[test]
+fn boot_units_never_run_the_rollback_restored_binary() {
+    let unit = read(UNIT);
+    for line in unit.lines().filter(|l| l.starts_with("Exec")) {
+        assert!(
+            !line.contains("/opt/tickvault/bin/tickvault "),
+            "{UNIT} runs `bin/tickvault` directly: {line}\nA rollback can put a \
+             pre-port binary there, which would boot the trading app as root in \
+             this oneshot. Run `/opt/tickvault/bin/tickvault-host` instead."
+        );
+    }
+    assert!(
+        unit.contains("/opt/tickvault/bin/tickvault-host host-tuning"),
+        "{UNIT} no longer calls the subcommand binary"
+    );
+    assert!(
+        unit.lines().any(|l| l.starts_with("TimeoutStartSec=")),
+        "{UNIT} has no start timeout. A oneshot defaults to none, and \
+         tickvault.service is ordered after it, so a hung step keeps the app down."
+    );
+
+    let deploy = read(DEPLOY);
+    let smoke = deploy
+        .find("bin/smoke_test.new --duration")
+        .expect("the deploy no longer smoke-tests the new binary");
+    let promote = deploy
+        .find("mv bin/tickvault.new")
+        .expect("the deploy no longer promotes the new binary");
+    let install = deploy
+        .find("install -m 0755 -o root -g root bin/tickvault bin/tickvault-host")
+        .expect(
+            "the deploy no longer installs bin/tickvault-host, so the boot units \
+             have nothing to run",
+        );
+    assert!(
+        smoke < promote && promote < install,
+        "bin/tickvault-host must be installed AFTER the smoke test and the \
+         promotion, so it only ever holds a binary that passed the smoke test"
+    );
+    let rollback = deploy
+        .find("cp -f bin/tickvault.backup bin/tickvault")
+        .expect("the deploy rollback no longer restores bin/tickvault");
+    let rollback_line = deploy[rollback..].lines().next().unwrap_or_default();
+    assert!(
+        !rollback_line.contains("tickvault-host"),
+        "the rollback touches bin/tickvault-host, which would let it restore a \
+         pre-port binary into the boot units"
+    );
 }

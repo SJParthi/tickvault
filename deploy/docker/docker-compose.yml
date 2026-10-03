@@ -182,7 +182,7 @@ services:
     # silently-unpartitioned prod box is the failure this whole change exists
     # to remove, and a loud docker error naming the exact fix is strictly
     # better than a quiet box that lost the isolation. The APP half has no such
-    # hazard — apply-host-tuning.sh removes its confinement automatically below
+    # hazard — `tickvault host-tuning apply` removes its confinement automatically below
     # 3 cores, because systemd cannot name the fix for you.
     cpuset: "${TV_QDB_CPUSET:-2,3}"
     # Kept alongside the cpuset deliberately. The cpuset is the hard placement
