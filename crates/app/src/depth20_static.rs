@@ -94,6 +94,15 @@ pub fn fno_spot_instruments(entries: &[MasterEntry]) -> Vec<SubscribeInstrument>
 /// Returns `Err` naming the path when the file is missing, unreadable or not a
 /// mapping artifact. The caller logs it and dials the index legs alone.
 pub fn read_fno_spot_instruments(date_ist: &str) -> Result<Vec<SubscribeInstrument>, String> {
+    // Sweep S5: the stat, read and parse run off the shared tokio worker,
+    // so the attach retry loop cannot hold the worker the socket readers use.
+    tickvault_storage::off_worker::off_worker(|| read_fno_spot_instruments_on_this_thread(date_ist))
+}
+
+/// The body of [`read_fno_spot_instruments`], run on whichever thread calls it.
+fn read_fno_spot_instruments_on_this_thread(
+    date_ist: &str,
+) -> Result<Vec<SubscribeInstrument>, String> {
     let path = crate::dhan_universe::fno_underlying_artifact_path(date_ist);
     // O(1) EXEMPT: cold path, one file read per attach attempt, never per tick.
     let body = std::fs::read_to_string(&path)

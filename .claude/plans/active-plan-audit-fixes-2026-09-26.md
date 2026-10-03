@@ -2551,6 +2551,26 @@ write, then candle warm-up (PR31b-2 (a), already listed above). Each fix ships a
   (O(files), no list, no sort), and a failed join reads as a failed write. Files:
   `crates/api/src/handlers/{debug,feeds}.rs`. Test:
   every_handler_scan_runs_on_the_blocking_pool.
+- [x] **S5 — The loops that keep running through the session no longer block a shared worker.**
+  A read-only audit of every production path left 14 sites that did disk, child-process or ILP
+  work bare on a tokio worker. Each now runs through `tickvault_storage::off_worker::off_worker`
+  (made public for this) or `spawn_blocking`: the disk-pressure `df` probe (60 s); the depth
+  attach retry loop's artifact, symbol-map, spot-list and seed reads (15 s / 60 s); the
+  held-today file write (per minute, on growth) and read; the close-of-session seed write and the
+  probe day latch; the audit spill drain's directory scans (60 s per table); the hourly log
+  retention sweeps and the `errors.log` cap; the OOM cgroup read (60 s); the partition export's
+  file steps, per-chunk gzip writes, `df` probe and audit flush (disk pressure can run it
+  mid-session); the stale-artifact sweep; the post-close ILP flushes (cross-verify, timeframe
+  consistency, scoreboard, connection and table-storage rollups) and the daily markers; the
+  `/board` RSS read. Files: `crates/storage/src/{lib,off_worker,audit_spill,oom_monitor,
+  partition_archive}.rs`, `crates/app/src/{main,disk_pressure_boot,dhan_contract_universe,
+  depth20_static,depth_seed,depth_subscription_view,depth_rebalance,dhan_universe,
+  daily_task_marker,dhan_live_crossverify_boot,tf_consistency_boot,feed_scoreboard_boot,
+  ws_connection_rollup,table_storage_rollup}.rs`, `crates/api/src/handlers/board.rs`,
+  `crates/app/tests/off_worker_sweep_guard.rs`. Tests:
+  every_session_loop_step_runs_off_the_worker, the_guard_bites_on_a_bare_call. Honest limits:
+  each step still costs what it did; only the worker it holds changes. Boot-only and shutdown-only
+  steps (the WAL replay, the mapping-artifact wait, shutdown joins) are left as they are.
 
 ## Edge Cases
 

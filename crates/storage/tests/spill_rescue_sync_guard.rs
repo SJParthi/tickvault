@@ -195,7 +195,7 @@ fn queued_rescues_hold_and_release_a_watermark_floor() {
 #[test]
 fn every_blocking_writer_step_runs_off_the_worker() {
     let helper = production("off_worker.rs");
-    let body = body_of(&helper, "pub(crate) fn off_worker<T>(");
+    let body = body_of(&helper, "pub fn off_worker<T>(");
     assert!(
         body.contains("block_in_place") && body.contains("RuntimeFlavor::MultiThread"),
         "off_worker must move the worker on a multi-thread runtime and only there"

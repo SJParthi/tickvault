@@ -51,7 +51,8 @@ fn marker_path_in(base: &Path, task: &str, date_ist: NaiveDate) -> PathBuf {
 /// `true` iff the marker file EXISTS. Any IO uncertainty => `false`
 /// (fail-open: run + notify again rather than silently skipping).
 fn marker_exists_in(base: &Path, task: &str, date_ist: NaiveDate) -> bool {
-    marker_path_in(base, task, date_ist).is_file()
+    // Sweep S5: the stat runs off the shared tokio worker.
+    tickvault_storage::off_worker::off_worker(|| marker_path_in(base, task, date_ist).is_file())
 }
 
 /// Best-effort marker write + bounded old-marker sweep. Never returns an
@@ -63,7 +64,10 @@ fn write_marker_in(base: &Path, task: &str, date_ist: NaiveDate) {
         "build={}\ndelivered_date_ist={date_ist}\n",
         tickvault_common::build_info::BUILD_GIT_SHA
     );
-    let write_result = std::fs::create_dir_all(base).and_then(|()| std::fs::write(&path, contents));
+    // Sweep S5: the write runs off the shared tokio worker.
+    let write_result = tickvault_storage::off_worker::off_worker(|| {
+        std::fs::create_dir_all(base).and_then(|()| std::fs::write(&path, contents))
+    });
     if let Err(err) = write_result {
         // Deliberately NOT an error! and NOT a flush/persist phrase — the
         // marker is advisory; losing it only means one duplicate card after
@@ -74,7 +78,7 @@ fn write_marker_in(base: &Path, task: &str, date_ist: NaiveDate) {
         );
         return;
     }
-    sweep_old_markers_in(base, task, date_ist);
+    tickvault_storage::off_worker::off_worker(|| sweep_old_markers_in(base, task, date_ist));
 }
 
 /// Removes same-task markers whose embedded date is older than

@@ -1110,8 +1110,9 @@ impl PartitionArchiveAuditWriter {
         let Some(sender) = self.sender.as_mut() else {
             anyhow::bail!("partition_archive_audit: no ILP sender (QuestDB unreachable)");
         };
-        sender
-            .flush(&mut self.buffer)
+        // Sweep S5: the ILP round trip runs off the shared tokio worker.
+        let buffer = &mut self.buffer;
+        crate::off_worker::off_worker(|| sender.flush(buffer))
             .context("partition_archive_audit ILP flush")?;
         self.pending = 0;
         Ok(())
@@ -1676,15 +1677,20 @@ impl PartitionArchiver {
         // exists for, since a full volume is also where `create_dir_all` is
         // most likely to have failed.
         let temp_dir = std::path::Path::new(ARCHIVE_TEMP_DIR);
-        let probe_path = if std::fs::create_dir_all(temp_dir).is_ok() {
-            temp_dir
-        } else {
-            // Could not create it — fall back to the volume's own root, which
-            // answers the same question ("how much room is on this disk") and
-            // is what the disk-pressure loop already probes.
-            std::path::Path::new(".")
-        };
-        let free_bytes = match crate::disk_health_watcher::probe_disk_free_bytes(probe_path) {
+        // Sweep S5: the mkdir and the `df` child process below run off the
+        // shared tokio worker; this pass can run mid-session under disk pressure.
+        let probe_path =
+            if crate::off_worker::off_worker(|| std::fs::create_dir_all(temp_dir)).is_ok() {
+                temp_dir
+            } else {
+                // Could not create it — fall back to the volume's own root, which
+                // answers the same question ("how much room is on this disk") and
+                // is what the disk-pressure loop already probes.
+                std::path::Path::new(".")
+            };
+        let free_bytes = match crate::off_worker::off_worker(|| {
+            crate::disk_health_watcher::probe_disk_free_bytes(probe_path)
+        }) {
             crate::disk_health_watcher::DiskHealthOutcome::Ok { free_bytes, .. } => {
                 Some(free_bytes)
             }
@@ -2538,7 +2544,7 @@ impl PartitionArchiver {
         // alternative under pressure is a full volume, which WAL-suspends
         // EVERY table at once (precedent: 2026-08-25, 14 tables suspended,
         // writes ACKed and never applied, box unreachable by SSM).
-        let spill_pending = Self::spill_dirs_have_pending_data();
+        let spill_pending = crate::off_worker::off_worker(Self::spill_dirs_have_pending_data);
         let list_sql = match hour_window_decision(
             hot_window_hours(table, self.cfg.depth_hot_hours),
             spill_pending,
@@ -2591,9 +2597,10 @@ impl PartitionArchiver {
     }
 
     /// Streams the partition's `/exp` CSV through gzip into the temp dir,
-    /// counting rows from the RAW byte stream. Cold path — the small
-    /// blocking encoder writes are bounded per chunk and the task runs
-    /// post-market on a multi-thread runtime.
+    /// counting rows from the RAW byte stream. The disk-pressure loop can
+    /// call this mid-session, so every file step and each chunk's gzip write
+    /// runs through [`crate::off_worker::off_worker`] (sweep S5): the worker
+    /// the frame drain and the socket readers share is moved aside first.
     async fn export_partition_csv(
         &self,
         table: &str,
@@ -2601,7 +2608,8 @@ impl PartitionArchiver {
         start: &str,
         end: &str,
     ) -> Result<ExportedCsv> {
-        std::fs::create_dir_all(&self.temp_dir).context("create archive temp dir")?;
+        crate::off_worker::off_worker(|| std::fs::create_dir_all(&self.temp_dir))
+            .context("create archive temp dir")?;
         let path = self.temp_dir.join(format!("{table}-{partition}.csv.gz"));
         let sql = build_export_sql(table, start, end);
 
@@ -2619,7 +2627,8 @@ impl PartitionArchiver {
             anyhow::bail!("/exp export returned {status}: {body}");
         }
 
-        let file = std::fs::File::create(&path).context("create archive temp file")?;
+        let file = crate::off_worker::off_worker(|| std::fs::File::create(&path))
+            .context("create archive temp file")?;
         // Review round 2: the compressed stream is SHA-256-hashed as it is
         // written — the digest is the content identity for the S3
         // reuse/conflict decision and travels on the conditional PutObject.
@@ -2634,12 +2643,16 @@ impl PartitionArchiver {
         while let Some(chunk) = response.chunk().await.context("/exp stream read failed")? {
             counter.update(&chunk);
             csv_bytes = csv_bytes.saturating_add(chunk.len() as u64);
-            encoder.write_all(&chunk).context("gzip write failed")?;
+            crate::off_worker::off_worker(|| encoder.write_all(&chunk))
+                .context("gzip write failed")?;
         }
-        let hashing_writer = encoder.finish().context("gzip finish failed")?;
-        let (mut writer, digest) = hashing_writer.finish();
-        writer.flush().context("temp file flush failed")?;
-        drop(writer);
+        let digest = crate::off_worker::off_worker(|| {
+            let hashing_writer = encoder.finish().context("gzip finish failed")?;
+            let (mut writer, digest) = hashing_writer.finish();
+            writer.flush().context("temp file flush failed")?;
+            drop(writer);
+            anyhow::Ok(digest)
+        })?;
         let gzip_sha256_b64 = base64_encode(&digest);
         let gzip_sha256_hex = hex_encode(&digest);
 
@@ -2650,7 +2663,7 @@ impl PartitionArchiver {
             remove_temp_file(&path);
             anyhow::bail!("/exp export returned an empty body (no CSV header)");
         }
-        let gzip_bytes = std::fs::metadata(&path)
+        let gzip_bytes = crate::off_worker::off_worker(|| std::fs::metadata(&path))
             .context("stat archive temp file")?
             .len();
         Ok(ExportedCsv {
@@ -2907,7 +2920,9 @@ impl PartitionArchiver {
     /// Clears stale temp files from a previous interrupted run (one file per
     /// in-flight partition; a crash mid-export leaves at most one).
     fn clean_temp_dir(&self) {
-        let Ok(entries) = std::fs::read_dir(&self.temp_dir) else {
+        // Sweep S5: the listing runs off the shared tokio worker.
+        let Ok(entries) = crate::off_worker::off_worker(|| std::fs::read_dir(&self.temp_dir))
+        else {
             return; // dir absent — created lazily at first export
         };
         for entry in entries.flatten() {
@@ -3069,7 +3084,8 @@ async fn read_body_capped(mut response: reqwest::Response) -> Result<String> {
 
 /// Best-effort temp-file removal (a leftover is cleaned at next run start).
 fn remove_temp_file(path: &Path) {
-    if let Err(err) = std::fs::remove_file(path) {
+    // Sweep S5: the unlink runs off the shared tokio worker.
+    if let Err(err) = crate::off_worker::off_worker(|| std::fs::remove_file(path)) {
         warn!(?err, path = %path.display(), "archive temp file removal failed");
     }
 }

@@ -1534,10 +1534,13 @@ pub async fn run_depth_rebalance(
     // that already spent its shot at 09:20 and empty a SECOND depth-200
     // socket. The latch file carries the IST day it was spent on.
     let probe_latch = crate::depth_unsubscribe_probe::day_latch_path();
-    let mut probe_run = crate::depth_unsubscribe_probe::probe_already_ran_today(
-        &probe_latch,
-        crate::depth_unsubscribe_probe::today_ymd_ist(),
-    );
+    // Sweep S5: the latch read runs off the shared tokio worker.
+    let mut probe_run = tickvault_storage::off_worker::off_worker(|| {
+        crate::depth_unsubscribe_probe::probe_already_ran_today(
+            &probe_latch,
+            crate::depth_unsubscribe_probe::today_ymd_ist(),
+        )
+    });
     let mut post_close_logged = false;
     let mut no_ranking_reported = false;
     let mut gainer_board_empty_reported = false;
@@ -1643,7 +1646,9 @@ pub async fn run_depth_rebalance(
             // BEFORE the arm, never after: a crash mid-probe must leave the
             // day spent. Declining a re-run costs one measurement; permitting
             // one costs a second emptied socket on a live steering path.
-            crate::depth_unsubscribe_probe::mark_probe_ran_today(&probe_latch, probe_day);
+            tickvault_storage::off_worker::off_worker(|| {
+                crate::depth_unsubscribe_probe::mark_probe_ran_today(&probe_latch, probe_day)
+            });
             crate::depth_unsubscribe_probe::run_configured(&probe_cfg, &mut sockets).await;
             // And again on the way out, so the very next heartbeat tick
             // reports a fresh age instead of carrying the block forward.
@@ -1942,7 +1947,10 @@ fn write_tomorrows_seed(
         return;
     }
     let path = crate::depth_seed::seed_path();
-    match crate::depth_seed::write_depth_seed(&path, &seed) {
+    // Sweep S5: the write, fsync and rename run off the shared tokio worker.
+    match tickvault_storage::off_worker::off_worker(|| {
+        crate::depth_seed::write_depth_seed(&path, &seed)
+    }) {
         Ok(()) => tracing::info!(
             path = %path.display(),
             depth_200 = seed.depth_200.len(),

@@ -422,7 +422,7 @@ pub async fn drain_audit_spill_dir(
     let name = table.table_name();
     let mut outcome = AuditDrainOutcome::default();
     quarantine_stale_tmp_files(dir, table);
-    for path in list_spill_files(dir) {
+    for path in crate::off_worker::off_worker(|| list_spill_files(dir)) {
         let payload = match tokio::fs::read(&path).await {
             Ok(payload) => payload,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
@@ -692,11 +692,13 @@ async fn run_drain_loop(dir: PathBuf, table: AuditSpillTable, url: String, quest
     let mut ensured = false;
     let mut pager = BacklogPager::default();
     loop {
-        if list_spill_files(&dir).is_empty() {
+        // Directory scans run off the shared worker (sweep S5): a slow disk
+        // must not hold the worker the frame drain and the readers use.
+        if crate::off_worker::off_worker(|| list_spill_files(&dir)).is_empty() {
             ensured = false;
             // A crash between write and rename leaves only a `.tmp`; it is
             // still set aside and counted when nothing else waits.
-            quarantine_stale_tmp_files(&dir, table);
+            crate::off_worker::off_worker(|| quarantine_stale_tmp_files(&dir, table));
         } else {
             if !ensured {
                 ensure_table(table, &questdb).await;
@@ -732,7 +734,7 @@ async fn run_drain_loop(dir: PathBuf, table: AuditSpillTable, url: String, quest
             }
         }
         let now_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        let oldest = oldest_spill_age_secs(&dir, now_nanos);
+        let oldest = crate::off_worker::off_worker(|| oldest_spill_age_secs(&dir, now_nanos));
         if pager.observe(oldest) {
             metrics::counter!(BACKLOG_PAGE_COUNTER, "stage" => BACKLOG_PAGE_STAGE).increment(1);
             error!(
