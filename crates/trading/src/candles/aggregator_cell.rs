@@ -3122,6 +3122,31 @@ mod tests {
         );
     }
 
+    /// Audit PR31b-2 (review 2026-10-03): `discard_carry` reports an
+    /// outstanding carry once and clears it, so `force_seal` has nothing left
+    /// to settle into the sealed bar.
+    #[test]
+    fn test_discard_carry_reports_an_outstanding_carry_once() {
+        let mut cell = AggregatorCell::empty();
+        let ord = TfIndex::S1.as_ordinal();
+        cell.last_sealed[ord].bucket_start_ist_secs = 33_300;
+        cell.last_sealed[ord].volume = 100;
+        cell.carried_upto[ord] = 1_500;
+        cell.carried_net[ord] = 400;
+        assert!(cell.discard_carry(TfIndex::S1));
+        assert_eq!(cell.carried_upto[ord], 0);
+        assert_eq!(cell.carried_net[ord], 0);
+        assert!(!cell.discard_carry(TfIndex::S1), "reported once");
+        assert!(
+            !cell.discard_carry(TfIndex::M1),
+            "no carry, nothing reported"
+        );
+        assert!(
+            cell.force_seal(TfIndex::S1).is_none(),
+            "a discarded carry never amends the sealed bar"
+        );
+    }
+
     /// Plan ITEM 47 review: after a replay gap only a frame with NO open
     /// bucket breaks its chain; an open bucket keeps it, so the next bucket
     /// chains to the re-based endpoint and keeps its rolling tick's volume.
