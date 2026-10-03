@@ -501,7 +501,7 @@ fn deploy_status_check_alarms_have_auto_recover_action() {
     );
 }
 
-const HOLIDAY_GATE_SH: &str = "deploy/aws/holiday-gate.sh";
+const HOLIDAY_GATE_RS: &str = "crates/app/src/holiday_gate.rs";
 const HOLIDAY_GATE_UNIT: &str = "deploy/systemd/tickvault-holiday-gate.service";
 const USER_DATA_TFTPL: &str = "deploy/aws/terraform/user-data.sh.tftpl";
 
@@ -513,7 +513,7 @@ const USER_DATA_TFTPL: &str = "deploy/aws/terraform/user-data.sh.tftpl";
 /// real trading day.
 #[test]
 fn holiday_gate_is_wired_and_fail_open() {
-    // 1. The app exposes the exit-code gate the script reads.
+    // 1. The app exposes the exit-code gate (also asked in-process by the gate).
     let main = read("crates/app/src/main.rs");
     assert!(
         main.contains("fn trading_day_gate_exit_code")
@@ -522,25 +522,33 @@ fn holiday_gate_is_wired_and_fail_open() {
         "main.rs must expose the --check-trading-day gate (exit 0=trading / 75=holiday)"
     );
 
-    // 2. The shell gate: override marker, fail-open on missing binary, stops the
-    //    box ONLY on the definitive 75 verdict, IMDSv2 token-required.
-    let sh = read(HOLIDAY_GATE_SH);
+    // 2. The gate itself (a shell script until 2026-10-01, audit D6c; now the
+    //    app's `holiday-gate` subcommand): override marker, stops the box ONLY
+    //    on the definitive 75 verdict, IMDSv2 token-required, fail-open.
+    let gate = read(HOLIDAY_GATE_RS);
     assert!(
-        sh.contains("ALLOW_HOLIDAY_RUN"),
+        gate.contains("ALLOW_HOLIDAY_RUN"),
         "gate must honour the /opt/tickvault/ALLOW_HOLIDAY_RUN override marker"
     );
     assert!(
-        sh.contains("ec2 stop-instances") && sh.contains("-ne 75"),
-        "gate must self-stop ONLY on the exit-75 verdict (fail-open on `-ne 75`)"
+        gate.contains("const HOLIDAY_EXIT: i32 = 75;")
+            && gate.contains("HOLIDAY_EXIT => Verdict::Stop,")
+            && gate.contains(".stop_instances()"),
+        "gate must self-stop ONLY on the exit-75 verdict (every other code starts the app)"
     );
     assert!(
-        sh.contains("X-aws-ec2-metadata-token"),
+        gate.contains("X-aws-ec2-metadata-token"),
         "gate must use IMDSv2 (token-required) to resolve the instance-id"
     );
-    // Fail-open evidence: missing binary and non-75 codes exit 0.
     assert!(
-        sh.contains("fail-open"),
+        gate.contains("fail-open"),
         "gate must document + implement the fail-open default (never stop on uncertainty)"
+    );
+    assert!(
+        main.contains("holiday_gate::is_invocation(&cli_args)")
+            && main.contains("holiday_gate::run(trading_day_gate_code)"),
+        "main.rs must dispatch `tickvault holiday-gate` to the gate with the same \
+         calendar check `--check-trading-day` uses"
     );
 
     // 3. Dedicated oneshot unit ordered BEFORE the app (NOT an ExecStartPre on
@@ -553,6 +561,11 @@ fn holiday_gate_is_wired_and_fail_open() {
     assert!(
         unit.contains("SuccessExitStatus=0 1"),
         "the holiday verdict (exit 1) must be a success status for the oneshot"
+    );
+    assert!(
+        unit.contains("ExecStart=-/opt/tickvault/bin/tickvault-host holiday-gate"),
+        "the gate must run the subcommand from the rollback-proof `tickvault-host` copy, \
+         fail-open (leading `-`) when that copy does not exist yet"
     );
 
     // 4. First-boot user-data installs + enables the gate unit.

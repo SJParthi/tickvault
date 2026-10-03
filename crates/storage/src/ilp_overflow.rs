@@ -249,6 +249,7 @@ mod tests {
         register_overflow_baseline("ws_event_audit");
         for table in [
             "ws_connection_daily",
+            "feed_gap_audit",
             "feed_scoreboard_daily",
             "table_storage_daily",
             "feed_episode_audit",

@@ -20,6 +20,28 @@
 /// Exit 3, not 1: the reset's SEBI step reserves `exit 1` for `sebi_abort`.
 pub const ON_BOX_LOCK_GUARD: &str = r#"NOW=$(date -u +%s); case "$NOW" in ''|*[!0-9]*) echo 'LOCKED-ON-BOX: the box clock could not be read, so nothing was stopped or deleted.'; exit 3 ;; esac; SOD=$(((NOW + 19800) % 86400)); if [ "$SOD" -ge 32400 ] && [ "$SOD" -lt 56700 ]; then echo 'LOCKED-ON-BOX: this reached the box inside the 09:00-15:45 IST lock, so nothing was stopped or deleted. Run it again after 15:45.'; exit 3; fi"#;
 
+/// Runs the database self-heal on the box (create-or-restart `tv-questdb`).
+///
+/// Was `bash /opt/tickvault/repo/scripts/ensure-questdb.sh` until 2026-10-01
+/// (audit D6d): the self-heal is now the `ensure-questdb` subcommand of the
+/// root-owned binary copy the deploy installs. The console Lambda can deploy
+/// before the box does, so the line first checks that the installed binary
+/// carries the subcommand (its log prefix, `ensure_questdb::LOG_PREFIX` in the
+/// app crate, is a string only the new binary contains). A binary that
+/// predates the port would ignore the unknown word and boot the whole app, so
+/// it is never called with it: the line falls back to the old script while
+/// the repo still has it, and otherwise prints a skip line and fails.
+/// A macro rather than a `const` so `concat!` can splice it into the longer
+/// reset lines below.
+macro_rules! ensure_questdb_cmd {
+    () => {
+        "if grep -qaF 'ensure-questdb: ' /opt/tickvault/bin/tickvault-host 2>/dev/null; then /opt/tickvault/bin/tickvault-host ensure-questdb; elif [ -f /opt/tickvault/repo/scripts/ensure-questdb.sh ]; then bash /opt/tickvault/repo/scripts/ensure-questdb.sh; else echo 'ENSURE-QUESTDB-SKIPPED: the installed binary predates the self-heal subcommand and the old script is gone'; false; fi"
+    };
+}
+
+/// The self-heal line on its own (see `ensure_questdb_cmd!`).
+pub const ENSURE_QUESTDB_COMMAND: &str = ensure_questdb_cmd!();
+
 /// legacy: `lambda_handler wipe-questdb cmds` (handler.py:1126-1197) — captured from the RUNNING oracle.
 pub const WIPE_QUESTDB_COMMANDS: [&str; 11] = [
     r#"set +e"#,
@@ -122,7 +144,7 @@ OUT=/opt/tickvault/data/sebi-preserve/$(date -u +%Y%m%dT%H%M%SZ)
 # never-delete definition — and a lockstep guard derives the expected
 # set from that source rather than restating it, so the two cannot drift
 # and the guard can never again assert a list against itself.
-SEBI='brutex_crossverify_cell_audit brutex_crossverify_daily cross_verify_1m_audit dhan_live_crossverify_cell_audit dhan_live_crossverify_daily dhan_rest_1m_tape feed_coverage_daily feed_episode_audit feed_parity_1m_audit feed_scoreboard_daily groww_cross_verify_1m_audit index_constituency instrument_fetch_audit instrument_lifecycle instrument_lifecycle_audit option_chain_1m option_contract_1m_rest order_audit order_leg_pnl order_update_events partition_archive_audit pnl_audit position_update_events prev_day_ohlcv rest_fetch_audit rest_option_chain_1m rest_option_contract_1m rest_spot_1m schema_reset_log spot_1m_rest spot_crossverify_cell_audit spot_crossverify_daily table_storage_daily tf_consistency_audit tick_conservation_audit ws_connection_daily ws_event_audit'
+SEBI='brutex_crossverify_cell_audit brutex_crossverify_daily cross_verify_1m_audit dhan_live_crossverify_cell_audit dhan_live_crossverify_daily dhan_rest_1m_tape feed_coverage_daily feed_episode_audit feed_gap_audit feed_parity_1m_audit feed_scoreboard_daily groww_cross_verify_1m_audit index_constituency instrument_fetch_audit instrument_lifecycle instrument_lifecycle_audit option_chain_1m option_contract_1m_rest order_audit order_leg_pnl order_update_events partition_archive_audit pnl_audit position_update_events prev_day_ohlcv rest_fetch_audit rest_option_chain_1m rest_option_contract_1m rest_spot_1m schema_reset_log spot_1m_rest spot_crossverify_cell_audit spot_crossverify_daily table_storage_daily tf_consistency_audit tick_conservation_audit ws_connection_daily ws_event_audit'
 ALL=$(curl -fsS --max-time 15 --get --data-urlencode 'query=SELECT table_name FROM tables()' "$QDB/exp" 2>/dev/null | tail -n +2 | tr -d '"\r' | sed '/^$/d')
 # 2026-09-27 (audit PR20): the "QuestDB did not answer => proceed" branch is
 # GONE. It deleted the volume with every 5-year table still inside it and
@@ -367,12 +389,16 @@ lock_check"#,
     // the app first. Before, it left the unit disabled (see the compose note
     // above). The volume was NOT removed here, so the database comes back on
     // the data it already had.
-    r#"if docker volume inspect tv-questdb-data >/dev/null 2>&1; then echo 'DOCKER-RESET-FAILED: tv-questdb-data still present (in-use) — NOT recreating to avoid re-attaching stale data. Holders:'; docker ps -a --filter volume=tv-questdb-data --format '{{.Names}} ({{.Status}})'; echo docker-reset-FAILED; bash /opt/tickvault/repo/scripts/ensure-questdb.sh || true; systemctl enable tickvault || true; systemctl start tickvault || true; exit 1; fi"#,
+    concat!(
+        r#"if docker volume inspect tv-questdb-data >/dev/null 2>&1; then echo 'DOCKER-RESET-FAILED: tv-questdb-data still present (in-use) — NOT recreating to avoid re-attaching stale data. Holders:'; docker ps -a --filter volume=tv-questdb-data --format '{{.Names}} ({{.Status}})'; echo docker-reset-FAILED; "#,
+        ensure_questdb_cmd!(),
+        r#" || true; systemctl enable tickvault || true; systemctl start tickvault || true; exit 1; fi"#
+    ),
     r#"echo 'OK: tv-questdb-data removed'"#,
     r#"rm -rf /opt/tickvault/data/instrument-cache /opt/tickvault/data/spill /opt/tickvault/data/dlq /opt/tickvault/data/ws_wal /opt/tickvault/data/groww 2>/dev/null || true"#,
     r#"rm -f /opt/tickvault/data/*/live-ticks.ndjson /opt/tickvault/data/*/*-status.json 2>/dev/null || true"#,
     r#"echo 'OK: host caches + feed capture/replay sources wiped (instrument-cache, spill, dlq, ws_wal, groww); logs preserved'"#,
-    r#"bash /opt/tickvault/repo/scripts/ensure-questdb.sh || true"#,
+    concat!(ensure_questdb_cmd!(), " || true"),
     r#"systemctl enable tickvault || true"#,
     r#"systemctl restart tickvault || true"#,
     r#"echo docker-reset-dispatched"#,
@@ -417,7 +443,7 @@ OUT=/opt/tickvault/data/sebi-preserve/$(date -u +%Y%m%dT%H%M%SZ)
 # never-delete definition — and a lockstep guard derives the expected
 # set from that source rather than restating it, so the two cannot drift
 # and the guard can never again assert a list against itself.
-SEBI='brutex_crossverify_cell_audit brutex_crossverify_daily cross_verify_1m_audit dhan_live_crossverify_cell_audit dhan_live_crossverify_daily dhan_rest_1m_tape feed_coverage_daily feed_episode_audit feed_parity_1m_audit feed_scoreboard_daily groww_cross_verify_1m_audit index_constituency instrument_fetch_audit instrument_lifecycle instrument_lifecycle_audit option_chain_1m option_contract_1m_rest order_audit order_leg_pnl order_update_events partition_archive_audit pnl_audit position_update_events prev_day_ohlcv rest_fetch_audit rest_option_chain_1m rest_option_contract_1m rest_spot_1m schema_reset_log spot_1m_rest spot_crossverify_cell_audit spot_crossverify_daily table_storage_daily tf_consistency_audit tick_conservation_audit ws_connection_daily ws_event_audit'
+SEBI='brutex_crossverify_cell_audit brutex_crossverify_daily cross_verify_1m_audit dhan_live_crossverify_cell_audit dhan_live_crossverify_daily dhan_rest_1m_tape feed_coverage_daily feed_episode_audit feed_gap_audit feed_parity_1m_audit feed_scoreboard_daily groww_cross_verify_1m_audit index_constituency instrument_fetch_audit instrument_lifecycle instrument_lifecycle_audit option_chain_1m option_contract_1m_rest order_audit order_leg_pnl order_update_events partition_archive_audit pnl_audit position_update_events prev_day_ohlcv rest_fetch_audit rest_option_chain_1m rest_option_contract_1m rest_spot_1m schema_reset_log spot_1m_rest spot_crossverify_cell_audit spot_crossverify_daily table_storage_daily tf_consistency_audit tick_conservation_audit ws_connection_daily ws_event_audit'
 ALL=$(curl -fsS --max-time 15 --get --data-urlencode 'query=SELECT table_name FROM tables()' "$QDB/exp" 2>/dev/null | tail -n +2 | tr -d '"\r' | sed '/^$/d')
 # 2026-09-27 (audit PR20): the "QuestDB did not answer => proceed" branch is
 # GONE. It deleted the volume with every 5-year table still inside it and

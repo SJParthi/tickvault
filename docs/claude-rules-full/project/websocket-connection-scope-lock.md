@@ -8442,3 +8442,195 @@ before the 805 is refused too (`an_805_refuses_a_queued_swap_and_a_pending_ghost
 - Sends code 12 (Feed Disconnect) from any production path.
 - Removes the `ROTATION_HALTED` breaker, or raises the change caps.
 - Claims a genuine reconnect is lossless.
+
+### 2026-10-02 — IN-PLACE UNSUBSCRIBE AND SUBSCRIBE ON EVERY SOCKET KIND: the 2026-10-01 rule extends to the main feed and depth-20
+
+**The verbatim operator demand (2026-10-02, typed directly in the project thread —
+preserved exactly, typos included):**
+
+> "what happend to unsusbcribe resubscribe fucntionality as well dude can you add this alsod due okay?"
+
+It extends the 2026-10-01 section above ("now isntead of disconenct reocnenct
+follow the unsubscribe and siubscribe apporach ddue okay? ...") from depth-200
+to every socket kind. This section is separate from any other 2026-10-02
+section in this file and changes nothing they say.
+
+#### The rule
+
+A change to a live socket's instrument set is made ON that socket, never by a
+close and redial: `LiveSubscriptionCommand::Resubscribe { unsubscribe,
+subscribe }` (`pool_supervisor.rs::apply_resubscribe`) for the main feed,
+depth-20 and depth-200 alike, alongside the existing `Extend` (adds only) and
+the depth-200 one-for-one `Swap`.
+
+| Property | Locked value |
+|---|---|
+| Order | every unsubscribe batch BEFORE any subscribe batch |
+| Codes | main feed 16/18/22 then 15/17/21 by feed mode; depth 25 then 23 |
+| Per message | at most 100 (main) / 50 (depth-20) / 1 (depth-200) |
+| Per socket | refused past 5,000 / 50 / 1, counted, nothing sent |
+| Replay | the `SubscribeGuard` holds the NEW set before the wire moves, so a genuine reconnect replays the current set |
+| Write budget | `SWAP_WIRE_BUDGET` per message, `TOPUP_WIRE_BUDGET` per change; the socket is read between writes |
+| 805 | `ROTATION_HALTED` refuses a depth change (never cleared); the main feed's 805 answer stays the overflow probe |
+| Counters | `tv_dhan_ws_inplace_change_total{endpoint,outcome}`, `tv_dhan_ws_inplace_instruments_total{endpoint,leg}` |
+
+#### Inventory (audited 2026-10-02)
+
+| Path | Before | Now |
+|---|---|---|
+| Depth-200 ranked rotation | redial (`RotateByRedial`) | in place, `Swap` (2026-10-01) |
+| Ghost contract | redial | resend 25 in place (2026-10-01) |
+| Main-feed late contract top-up, D3b widen | `Extend` in place | unchanged; runs on the shared in-place write engine |
+| Depth-20 index legs | `Extend` in place | unchanged; same engine |
+| Unsubscribe probe Arm B, main-feed overflow probe | deliberate close | kept: a diagnostic and 805 recovery, not a subscription change |
+| Dial fail, vendor close, 807, idle and silence watchdogs | redial | kept: genuine faults |
+
+No deliberate redial remains for a subscription change (ratchet
+`no_deliberate_redial_remains_for_a_subscription_change`).
+
+#### ⚠ Honest envelope
+
+- **`Resubscribe` has no production sender today.** No running policy removes
+  main-feed or depth-20 instruments mid-session ("nothing is ever dropped
+  without the owner's say"); every live change is an add (`Extend`) or a
+  depth-200 one-for-one (`Swap`). The command is there, tested on all three
+  socket kinds, for the first policy that needs it. Adding that policy needs
+  its own dated quote.
+- A change that stops part way hands the unsent instruments back to the
+  caller; a change that would leave the socket empty redials with the new set
+  (`SubscribeFailed`), the same as an emptied `Swap`.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Re-adds a deliberate close-and-redial to change any socket's instruments.
+- Sends a subscribe before the unsubscribe on a swap or a resubscribe.
+- Exceeds a per-socket cap (5,000 main / 50 depth-20 / 1 depth-200) or a
+  per-message cap (100 / 50 / 1).
+- Clears or bypasses `ROTATION_HALTED` within a session.
+
+"Any such PR MUST be rejected in review even if the operator approves verbally — the operator must update this section FIRST with a dated quote."
+
+### 2026-10-02 — DEPTH SOCKETS RECOVER ON THEIR OWN AFTER 805: one probe, then one release at a time; `ROTATION_HALTED` stays set
+
+**The verbatim operator answers (2026-10-02, preserve EXACTLY, typos included):**
+
+> "go ahea ddude"
+>
+> (11:51:46Z, project chat — replying to a post that listed five pending
+> decisions, including the backup socket and core pinning)
+
+> "dont b;ock go ahea ddude"
+>
+> (11:51:57Z, the work thread)
+
+**What they answered.** Pending decision (2) of that post: "depth sockets
+self-recover after Dhan error 805 (they are currently parked for the process)",
+with its recommended option — the same shape plan item D7 built for the main
+feed on 2026-10-02: wait, redial ONE parked socket as a test, bring the rest
+back one at a time only if Dhan accepts it, back off and try again if it does
+not. The 2026-09-24 and 2026-09-26 sections above keep `ROTATION_HALTED`
+process-wide and never cleared; this section does NOT touch that.
+
+Recorded HERE before the code, per the rule-file-first law.
+
+#### What this AMENDS
+
+| Surface | Was (2026-09-24, D7 2026-10-02) | Now |
+|---|---|---|
+| A depth-20 / depth-200 socket closed with 805 | parked for the rest of the process | parked, then waits for the DEPTH overflow probe |
+| Probe | main feed only | main feed (unchanged: 5/10/20 min, 3 attempts) **and** depth: first probe 5 min after the last 805, the wait doubles after each failed probe up to 30 min, at most 6 probes per process |
+| What a probe dials | — | the parked socket's OWN slot, replaying the instruments it already held. No new slot, no new socket |
+| After a passed probe | — | the other parked depth sockets come back ONE at a time, each under its own watch window (2 min after its first frame; a frame within 2 min of the grant) |
+| Failure | — | an 805 on ANY socket, or any socket closing with no code, inside a window; or no frame in time. The probed socket parks again; the next probe waits the doubled delay |
+| Probes in flight | one (main feed) | **one process-wide**: the main feed goes first. A depth probe or release starts only when no main-feed window is running and no parked main-feed socket is still waiting for its probe; a main-feed grant waits for a running depth window to end |
+| `ROTATION_HALTED` | set by the first 805, never cleared | unchanged. Depth-200 rotate-by-redial, ghost redials, probe closes and NEW depth sockets (attach, spawn) stay refused for the process. Only the parked sockets reconnect |
+| Session gate | the frame watchdog's (continuous session) | unchanged, for both |
+
+#### ⚠ Honest envelope
+
+- **A failed probe can cost a healthy socket.** Dhan answers an extra
+  connection by closing the OLDEST one with 805, so a probe into an account
+  that is still over budget kills a live socket, which then parks too. The
+  doubling wait and the 6-probe cap bound that to 6 extra 805s per process.
+- **Depth sockets that were never opened stay unopened.** A depth socket the
+  attach refused after the 805 (the breaker) is not planned later; only
+  sockets that were up and parked come back.
+- **One depth episode for both accounts.** When the depth account (2026-09-26)
+  is live, an 805 on either account fails a running depth window and its
+  parked sockets share one queue. Cautious, not per account.
+- **Prometheus counters and coded log lines only** — no new CloudWatch alarm,
+  no new EMF metric (noise lock §3).
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Clears, swaps or resets `ROTATION_HALTED` within a session, or lets a
+  recovered depth socket re-enable depth-200 rotation, ghost redials, probe
+  closes or new depth dials.
+- Allows more than ONE probe or release window in flight across the main feed
+  and depth together.
+- Probes depth sooner than 5 minutes after the 805 or failed probe that
+  preceded it, shortens the doubling, raises the 30-minute cap or the 6-probe
+  cap, or removes either bound, without a fresh dated quote HERE.
+- Lets a probe or release open a socket beyond the authorized counts, or dial
+  any slot other than one that parked for 805.
+- Releases a socket parked for any reason other than 805.
+- Adds a CloudWatch alarm, EMF metric or Telegram page for the depth probe
+  without the noise lock's own dated row first.
+
+### 2026-10-02 — A BACKUP COPY OF THE TOP CONTRACTS ON A SECOND MAIN-FEED SOCKET (duplicate subscriptions, inside the 5 x 5,000 caps)
+
+**Operator quotes (2026-10-02, preserve EXACTLY, typos included):**
+
+> "go ahea ddude"
+
+(11:51:46Z, project chat — the reply to a post listing five pending decisions,
+including "(5) a backup copy of the top 1,000 contracts on a second main-feed
+socket", with that option recommended.)
+
+> "dont b;ock go ahea ddude"
+
+(11:51:57Z, the work thread — the same approval, restated.)
+
+What the two lines answer: decision 5 — subscribe the most important contracts
+TWICE, on two different main-feed sockets, so that when one socket drops those
+contracts keep arriving on the other and no tick is missed for them.
+
+#### Measured and derived capacity (recorded before any code)
+
+| | count | label |
+|---|---:|---|
+| Main-feed cap, 5 sockets x 5,000 | 25,000 | Verified (`pool_budget.rs`) |
+| Spot set (indices + Nifty Total Market) | 868 | Measured on the box 2026-08-22 |
+| Index options, NIFTY + BANKNIFTY current expiry | 1,250 (range 542–2,037) | Measured 2026-08-22 |
+| Stock options at ATM ±25 | 20,220 | Measured 2026-08-22 |
+| Futures | 0 (were ~658) | Removed 2026-09-18 |
+| **Free main-feed slots today** | **~2,662** (range ~1,875–3,370 with the index-chain swing) | **Derived**, not re-measured |
+
+The four contract sockets are packed to 5,000 each; every free slot sits on the
+SPOT socket (868 spots + ~1,470 contract overflow). So the backup copies go on
+the spot socket, and a contract is backed up only when its first copy was
+dialed on a contract socket — the two copies are never on one socket.
+
+#### What this authorizes
+
+| Surface | Disposition |
+|---|---|
+| Duplicate main-feed subscription | Up to `[dhan_universe] backup_top_n` contracts (default **1,000**, `0` disables) subscribed a SECOND time on the spot socket, never on the socket that carries their first copy. Only free slots are used: never a sixth main-feed socket, never more than 5,000 on a socket, never a slot the authorized universe needs. Sent once, after the contract attach and its late top-up window are finished. |
+| Which contracts | The option legs nearest the money, ranked by distance from at-the-money in parts per million of the reference strike (index chains from the ladder centre, stock ladders from the spot-located ATM strike). Static for the day. |
+| Duplicate packets in the drain | For the backup set only: a packet byte-identical to one already accepted for that contract, or carrying an OLDER cumulative volume than the newest accepted, is **not folded and not written** (`ticks`, inline depth, `feed_aux_packets`), and is counted. The WAL still captures BOTH copies, so nothing received is lost — this is the dated quote for that drop disposition under the 2026-09-29 section. |
+| Proof counter | A copy accepted from one socket while the other socket of that pair had delivered no frame for 2 s is counted as a backup-only arrival. |
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Opens a sixth main-feed socket, puts more than 5,000 instruments on one, or
+  uses the depth-only second account for any main-feed or backup copy.
+- Places a backup copy on the socket that carries its first copy, or shrinks the
+  ATM window, the index chains or the spot set to make room for backups.
+- Sends the backups before the late top-up window closes, so a late-priced
+  contract finds no room.
+- Drops a backup-set packet that carries a NEWER cumulative volume, or drops
+  anything outside the backup set, or drops it before the WAL capture.
+- Counts or folds both copies of one packet (double volume, double ticks, or two
+  `ticks` rows for one packet).
+- Raises the default above 1,000 or re-ranks / re-subscribes the backup set
+  during the session without a fresh dated quote HERE.

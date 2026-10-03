@@ -27,6 +27,18 @@
 //!    skipped table-wide with one `warn!` — a suspended table's export and
 //!    recount see only APPLIED rows, so ACKed-but-unapplied rows would be
 //!    destroyed on `RESUME WAL` if we dropped its partitions.
+//!    **Per-partition WAL-APPLIED gate (2026-10-02):** a table that is not
+//!    suspended but merely BEHIND (`writerTxn < sequencerTxn`) has the same
+//!    blind spot — its acknowledged-but-unapplied rows are invisible to the
+//!    export and to both recounts, so the counts agree and the drop would
+//!    proceed. Immediately before each export AND again immediately before
+//!    each drop, a fresh `wal_tables()` probe must show the table not
+//!    suspended with `writerTxn == sequencerTxn`; otherwise (including an
+//!    unreadable probe or a table absent from it) the partition is kept,
+//!    the table is skipped for the rest of the run, and
+//!    `tv_partition_archive_skipped_total{reason="wal_not_applied"}` counts
+//!    it. The pre-drop re-read then compares `count()` AND `max(ts)` with
+//!    the values taken after the export.
 //! 2. **Export** — QuestDB HTTP `/exp` CSV of `SELECT * FROM <t> WHERE
 //!    ts >= '<start>' AND ts < '<end>'` (explicit ISO range predicates —
 //!    never integer literals against TIMESTAMP columns, never
@@ -101,7 +113,11 @@ use crate::partition_manager::{
     build_detach_list_sql, build_detach_list_sql_hours, is_valid_partition_name,
     parse_partition_rows, select_partitions_to_detach,
 };
-use crate::wal_suspension_watcher::parse_wal_tables_response;
+use crate::s3_cold::{
+    S3Cold, S3ObjectMeta, Sha256Writer, base64_encode, hex_encode, resolve_archive_bucket,
+    runtime_environment,
+};
+use crate::wal_suspension_watcher::{WalTableRow, parse_wal_tables_response};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -545,8 +561,14 @@ pub(crate) fn build_export_sql(table: &str, start: &str, end: &str) -> String {
 }
 
 /// Post-export recount SQL over the identical range (verify leg (a)).
+///
+/// Reads `count()` AND `max(ts)` in ONE statement (2026-10-02), so the two
+/// numbers come from the same snapshot. The pre-drop re-read compares both
+/// against the values taken right after the export: a late row stamped past
+/// everything the export saw moves `max(ts)` even in the unlikely case that
+/// the count happens to come back equal.
 pub(crate) fn build_count_sql(table: &str, start: &str, end: &str) -> String {
-    format!("SELECT count() FROM {table} WHERE ts >= '{start}' AND ts < '{end}'")
+    format!("SELECT count(), max(ts) FROM {table} WHERE ts >= '{start}' AND ts < '{end}'")
 }
 
 /// The DESTRUCTIVE drop DDL. Only callable from
@@ -557,18 +579,89 @@ fn build_drop_sql(table: &str, partition: &str) -> String {
     format!("ALTER TABLE {table} DROP PARTITION LIST '{partition}'")
 }
 
-/// Parses QuestDB's `/exec` JSON for a single-cell `count()` result.
-/// Fail-closed: anything unexpected → `None` (→ verify fails → keep).
-pub(crate) fn parse_count_response(json: &str) -> Option<u64> {
+/// One `count(), max(ts)` reading of a partition's range.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RangeTally {
+    /// `count()` over the range.
+    pub(crate) rows: u64,
+    /// `max(ts)` over the range as QuestDB renders it; `None` for an empty
+    /// range (QuestDB answers `null`).
+    pub(crate) max_ts: Option<String>,
+}
+
+/// Parses QuestDB's `/exec` JSON for the `count(), max(ts)` row.
+/// Fail-closed: anything unexpected → `None` (→ verify fails → keep). The
+/// `max(ts)` cell must be PRESENT (a string, or `null` for an empty range);
+/// a missing second cell or any other type is unexpected, not "no max".
+pub(crate) fn parse_count_response(json: &str) -> Option<RangeTally> {
     let parsed: serde_json::Value = serde_json::from_str(json).ok()?;
-    let cell = parsed
-        .get("dataset")?
-        .as_array()?
-        .first()?
-        .as_array()?
-        .first()?;
-    let n = cell.as_i64()?;
-    u64::try_from(n).ok()
+    let row = parsed.get("dataset")?.as_array()?.first()?.as_array()?;
+    let rows = u64::try_from(row.first()?.as_i64()?).ok()?;
+    let max_ts = match row.get(1)? {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(s) => Some(s.clone()),
+        _ => return None,
+    };
+    Some(RangeTally { rows, max_ts })
+}
+
+/// Whether a table's WAL is provably fully applied, read from one
+/// `wal_tables()` probe (2026-10-02).
+///
+/// A table whose WAL is BEHIND (`writerTxn < sequencerTxn`) holds rows that
+/// QuestDB has acknowledged and not yet applied. Those rows are invisible to
+/// the export and to both recounts, so the counts still agree, the S3 copy
+/// is "verified", and the drop proceeds; when the rows are applied they land
+/// in a partition that is gone, or after the export that was meant to hold
+/// them. Only [`Self::Applied`] lets the archiver export or drop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WalApplyVerdict {
+    /// Not suspended and `writerTxn == sequencerTxn`.
+    Applied,
+    /// WAL apply is suspended.
+    Suspended,
+    /// Committed transactions are still waiting to be applied.
+    Lagging { writer_txn: i64, sequencer_txn: i64 },
+    /// The table is not in `wal_tables()` at all — its state cannot be read.
+    NotReported,
+    /// The row lacks `writerTxn` or `sequencerTxn` (schema drift).
+    TxnUnreadable,
+}
+
+impl WalApplyVerdict {
+    /// Stable label for logs and the `cause` metric label.
+    pub(crate) const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::Suspended => "suspended",
+            Self::Lagging { .. } => "lagging",
+            Self::NotReported => "not_reported",
+            Self::TxnUnreadable => "txn_unreadable",
+        }
+    }
+}
+
+/// Classifies `table`'s WAL state from one `wal_tables()` row set.
+/// Fail-closed: only an exact `writerTxn == sequencerTxn` on a
+/// non-suspended row is [`WalApplyVerdict::Applied`].
+pub(crate) fn wal_apply_verdict(rows: &[WalTableRow], table: &str) -> WalApplyVerdict {
+    // O(1) EXEMPT: begin — linear scan over one wal_tables() row per table
+    // (tens of rows), on the once-per-partition cold archive path.
+    let Some(row) = rows.iter().find(|r| r.name == table) else {
+        return WalApplyVerdict::NotReported;
+    };
+    // O(1) EXEMPT: end
+    if row.suspended {
+        return WalApplyVerdict::Suspended;
+    }
+    match (row.writer_txn, row.sequencer_txn) {
+        (Some(w), Some(s)) if w == s => WalApplyVerdict::Applied,
+        (Some(writer_txn), Some(sequencer_txn)) => WalApplyVerdict::Lagging {
+            writer_txn,
+            sequencer_txn,
+        },
+        _ => WalApplyVerdict::TxnUnreadable,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -741,144 +834,6 @@ pub(crate) fn verify_archive(
         gzip_sha256_hex: gzip_sha256_hex.to_string(),
         _proof: VerifyProof,
     })
-}
-
-// ---------------------------------------------------------------------------
-// Content identity (pure — review round 2)
-// ---------------------------------------------------------------------------
-
-/// Standard base64 (RFC 4648, with padding) — exactly what S3's
-/// `x-amz-checksum-sha256` header carries. Hand-rolled for a fixed 32-byte
-/// digest rather than adding a new supply-chain root; pinned by a
-/// known-vector unit test below.
-pub(crate) fn base64_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
-        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-        out.push(ALPHABET[(triple >> 18) as usize & 0x3f] as char);
-        out.push(ALPHABET[(triple >> 12) as usize & 0x3f] as char);
-        out.push(if chunk.len() > 1 {
-            ALPHABET[(triple >> 6) as usize & 0x3f] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            ALPHABET[triple as usize & 0x3f] as char
-        } else {
-            '='
-        });
-    }
-    out
-}
-
-/// Lowercase hex of a digest (audit-row provenance column).
-pub(crate) fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    out
-}
-
-/// `Write` adapter folding every byte into a SHA-256 digest on its way to
-/// the inner writer — the gzip stream is hashed AS IT IS WRITTEN, so the
-/// content-identity digest covers exactly the bytes on disk (and therefore
-/// exactly the bytes S3 receives) with no second file read.
-struct Sha256Writer<W: Write> {
-    inner: W,
-    hasher: sha2::Sha256,
-}
-
-impl<W: Write> Sha256Writer<W> {
-    fn new(inner: W) -> Self {
-        use sha2::Digest as _;
-        Self {
-            inner,
-            hasher: sha2::Sha256::new(),
-        }
-    }
-
-    /// Consumes the adapter: `(inner writer, 32-byte digest)`.
-    fn finish(self) -> (W, [u8; 32]) {
-        use sha2::Digest as _;
-        (self.inner, self.hasher.finalize().into())
-    }
-}
-
-impl<W: Write> Write for Sha256Writer<W> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        use sha2::Digest as _;
-        let n = self.inner.write(buf)?;
-        self.hasher.update(&buf[..n]);
-        Ok(n)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Bucket resolution (pure + thin env shim)
-// ---------------------------------------------------------------------------
-
-/// Resolves the archive bucket (review round 1, F1b — FAIL-CLOSED): an
-/// explicit non-empty config value ALWAYS wins; an empty config derives the
-/// house cold bucket `tv-<env>-cold` (terraform `tv-${environment}-cold`)
-/// ONLY when the environment was EXPLICITLY provided by an env var. No
-/// explicit environment → `None` → the caller SKIPS archival entirely for
-/// the run. There is deliberately NO `"prod"` default here: a dev box /
-/// worktree / CI shell without env vars must never write (or overwrite)
-/// objects in the prod cold bucket.
-pub(crate) fn resolve_archive_bucket(
-    configured: &str,
-    environment: Option<&str>,
-) -> Option<String> {
-    let trimmed = configured.trim();
-    if !trimmed.is_empty() {
-        return Some(trimmed.to_string());
-    }
-    environment.map(|env| format!("tv-{env}-cold"))
-}
-
-/// Environment-name resolution from raw env-var reads (pure — testable
-/// without process-global env mutation). Precedence: `TV_ENVIRONMENT` →
-/// `ENVIRONMENT`. `None` when neither is set (F1b fail-closed — the
-/// SSM-path `"prod"` fallback in `secret_manager::resolve_environment` is
-/// DELIBERATELY not mirrored here). A value with characters outside
-/// `[a-zA-Z0-9-]` also resolves `None` (bucket-name safety, fail-closed).
-pub(crate) fn resolve_environment_from(
-    tv_environment: Option<&str>,
-    environment: Option<&str>,
-) -> Option<String> {
-    let candidate = tv_environment
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .or_else(|| environment.map(str::trim).filter(|s| !s.is_empty()))?;
-    if candidate
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-')
-    {
-        Some(candidate.to_string())
-    } else {
-        None
-    }
-}
-
-/// Reads the explicitly-set runtime environment name (`TV_ENVIRONMENT` →
-/// `ENVIRONMENT`); `None` when neither env var is set — archival is then
-/// skipped for the run (F1b fail-closed).
-fn runtime_environment() -> Option<String> {
-    resolve_environment_from(
-        std::env::var("TV_ENVIRONMENT").ok().as_deref(),
-        std::env::var("ENVIRONMENT").ok().as_deref(),
-    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1269,6 +1224,17 @@ pub struct ArchiveRunSummary {
     /// counter is touched, so a run that skipped every table for suspension
     /// is byte-identical to a run with nothing to do.
     pub tables_wal_suspended: u32,
+    /// Tables whose remaining partitions were skipped this run because a
+    /// per-partition `wal_tables()` check (before the export, or again
+    /// before the drop) could not prove the table's WAL fully applied —
+    /// lagging, suspended mid-run, absent from the probe, or the probe
+    /// itself failed. Counted once per table per run (2026-10-02).
+    ///
+    /// Separate from [`Self::tables_wal_suspended`], which is the run-start
+    /// snapshot: this one is the per-partition gate, and its most common
+    /// cause is a table that is merely behind, which clears on its own.
+    /// The daily scheduler reads it as "incomplete, retry".
+    pub tables_wal_not_applied: u32,
     /// True ONLY when this call returned without starting, because another
     /// pass already held [`ARCHIVE_PASS_LOCK`].
     ///
@@ -1295,6 +1261,18 @@ pub struct ArchiveRunSummary {
     pub held_unverified: u32,
 }
 
+/// How one `process_one` call ended, as far as the run loop cares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PartitionStep {
+    /// Dropped, kept, or failed for a partition-local reason — the next
+    /// partition of the same table is still attempted.
+    Done,
+    /// The table's WAL could not be proven fully applied (before the export
+    /// or before the drop). The partition is kept and the rest of the
+    /// table's partitions are skipped this run.
+    WalNotApplied,
+}
+
 /// Outcome of streaming one partition's `/exp` CSV through gzip to disk.
 struct ExportedCsv {
     rows: u64,
@@ -1307,23 +1285,13 @@ struct ExportedCsv {
     path: PathBuf,
 }
 
-/// S3 `HeadObject` metadata relevant to the reuse/conflict decision.
-struct S3ObjectMeta {
-    /// ContentLength.
-    len: u64,
-    /// `x-amz-checksum-sha256` attribute (base64), when the object carries
-    /// one. Our uploads ALWAYS set it; a foreign/legacy object may not.
-    checksum_sha256_b64: Option<String>,
-}
-
 /// QuestDB partition archiver — see the module docs for the full contract.
 pub struct PartitionArchiver {
     exec_url: String,
     exp_url: String,
     ddl_client: Client,
     export_client: Client,
-    s3: aws_sdk_s3::Client,
-    bucket: String,
+    cold: S3Cold,
     temp_dir: PathBuf,
     cfg: PartitionRetentionConfig,
     audit: PartitionArchiveAuditWriter,
@@ -1496,17 +1464,13 @@ impl PartitionArchiver {
             .timeout(Duration::from_secs(ARCHIVE_EXPORT_TIMEOUT_SECS))
             .build()
             .context("failed to create export HTTP client for partition archiver")?;
-        let aws_conf = aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .load()
-            .await;
-        let s3 = aws_sdk_s3::Client::new(&aws_conf);
+        let cold = S3Cold::connect(bucket).await;
         Ok(Some(Self {
             exec_url: format!("http://{}:{}/exec", questdb.host, questdb.http_port),
             exp_url: format!("http://{}:{}/exp", questdb.host, questdb.http_port),
             ddl_client,
             export_client,
-            s3,
-            bucket,
+            cold,
             temp_dir: PathBuf::from(ARCHIVE_TEMP_DIR),
             cfg: cfg.clone(),
             audit: PartitionArchiveAuditWriter::new(questdb),
@@ -1543,8 +1507,7 @@ impl PartitionArchiver {
                 .no_proxy()
                 .build()
                 .context("test export client")?,
-            s3,
-            bucket,
+            cold: S3Cold::from_client(s3, bucket),
             temp_dir,
             cfg,
             audit,
@@ -1755,8 +1718,12 @@ impl PartitionArchiver {
         // unapplied WAL backlog would be destroyed on `RESUME WAL` if we
         // dropped its partitions. Probe failure = cannot prove ANY table is
         // safe → skip the ENTIRE run (fail-closed; next daily run retries).
-        let suspended: Vec<String> = match self.fetch_wal_suspended_tables().await {
-            Ok(names) => names,
+        let suspended: Vec<String> = match self.fetch_wal_tables().await {
+            Ok(rows) => rows
+                .into_iter()
+                .filter(|r| r.suspended)
+                .map(|r| r.name)
+                .collect(), // O(1) EXEMPT: cold-path once-per-run probe
             Err(err) => {
                 error!(
                     ?err,
@@ -1852,8 +1819,24 @@ impl PartitionArchiver {
         let worklist = fair_share_worklist(worklist, self.cfg.max_partitions_per_run as usize);
         summary.partitions_considered = worklist.len() as u32;
 
+        // Tables whose WAL could not be proven applied this run. A table
+        // that fails the per-partition gate once is skipped for the rest of
+        // the run: its WAL state is a property of the whole table, and
+        // probing it again per partition would only repeat the refusal.
+        let mut wal_blocked: Vec<&'static str> = Vec::new();
         for (table, partition) in worklist {
-            self.process_one(table, &partition, &mut summary).await;
+            // O(1) EXEMPT: begin — at most one entry per swept table, cold
+            // once-per-run loop.
+            if wal_blocked.contains(&table) {
+                continue;
+            }
+            // O(1) EXEMPT: end
+            if self.process_one(table, &partition, &mut summary).await
+                == PartitionStep::WalNotApplied
+            {
+                wal_blocked.push(table);
+                summary.tables_wal_not_applied = summary.tables_wal_not_applied.saturating_add(1);
+            }
         }
 
         // Best-effort final audit flush (AUDIT-WS-01 class — never gates).
@@ -1876,9 +1859,10 @@ impl PartitionArchiver {
             failed = summary.failed,
             rows_archived = summary.rows_archived,
             held_unverified = summary.held_unverified,
+            tables_wal_not_applied = summary.tables_wal_not_applied,
             gzip_bytes_uploaded = summary.gzip_bytes_uploaded,
             csv_bytes_exported = summary.csv_bytes_exported,
-            bucket = %self.bucket,
+            bucket = %self.cold.bucket(),
             "partition archive cycle complete (archive→verify→drop)"
         );
 
@@ -1891,7 +1875,7 @@ impl PartitionArchiver {
         table: &'static str,
         partition: &str,
         summary: &mut ArchiveRunSummary,
-    ) {
+    ) -> PartitionStep {
         let Some((start, end)) = partition_range_bounds(partition) else {
             // Unreachable in practice (names pass the allowlist upstream);
             // fail-closed anyway.
@@ -1902,7 +1886,7 @@ impl PartitionArchiver {
                 "unparseable partition name",
                 summary,
             );
-            return;
+            return PartitionStep::Done;
         };
         let mut s3_key = canonical_archive_key(table, partition);
         // Did THIS run put the object there, or did it reuse an existing one?
@@ -1911,6 +1895,19 @@ impl PartitionArchiver {
         // dropped data, which is exactly what the never-overwrite policy
         // exists to prevent.
         let mut uploaded_this_run = false;
+
+        // 0b. WAL-APPLIED GATE, before the export (2026-10-02). The run-start
+        //     probe only refuses SUSPENDED tables. A table that is merely
+        //     BEHIND holds acknowledged rows the export and both recounts
+        //     cannot see, so every count agrees and the drop proceeds. The
+        //     after-close deferred-depth pass (morning `market_depth` hours,
+        //     15:45–17:15) and the spill replay / seal DLQ drain (yesterday's
+        //     partitions) all write into partitions this archiver can select.
+        //     Probed fresh here, per partition, because the run-start snapshot
+        //     can be minutes old by the time a late worklist item is reached.
+        if !self.wal_applied_gate(table, partition, "pre_export").await {
+            return PartitionStep::WalNotApplied;
+        }
 
         // 1. Export (stream + gzip + count) — one partition on disk at a time.
         let exported = match self
@@ -1926,7 +1923,7 @@ impl PartitionArchiver {
                     &format!("{err:#}"),
                     summary,
                 );
-                return;
+                return PartitionStep::Done;
             }
         };
         summary.csv_bytes_exported = summary
@@ -2050,7 +2047,7 @@ impl PartitionArchiver {
                             summary,
                         );
                         remove_temp_file(&exported.path);
-                        return;
+                        return PartitionStep::Done;
                     }
                     None => {
                         uploaded_this_run = true;
@@ -2066,7 +2063,7 @@ impl PartitionArchiver {
                                 summary,
                             );
                             remove_temp_file(&exported.path);
-                            return;
+                            return PartitionStep::Done;
                         }
                         summary.gzip_bytes_uploaded = summary
                             .gzip_bytes_uploaded
@@ -2108,7 +2105,7 @@ impl PartitionArchiver {
                         summary,
                     );
                     remove_temp_file(&exported.path);
-                    return;
+                    return PartitionStep::Done;
                 }
                 summary.gzip_bytes_uploaded = summary
                     .gzip_bytes_uploaded
@@ -2118,7 +2115,10 @@ impl PartitionArchiver {
         }
 
         // 3. Verify — recount AFTER the export + S3 head. All fail-closed.
-        let recount = self.recount_rows(table, &start, &end).await;
+        // The tally (count AND max(ts)) taken here is what the pre-drop
+        // re-read must reproduce exactly.
+        let verified_tally = self.recount_rows(table, &start, &end).await;
+        let recount = verified_tally.as_ref().map(|t| t.rows);
         let s3_len = self.head_object_meta(&s3_key).await.map(|m| m.len);
         let proof = match verify_archive(
             table,
@@ -2140,7 +2140,7 @@ impl PartitionArchiver {
                     summary,
                 );
                 remove_temp_file(&exported.path);
-                return;
+                return PartitionStep::Done;
             }
         };
         remove_temp_file(&exported.path);
@@ -2158,7 +2158,7 @@ impl PartitionArchiver {
                 &format!("verified-audit flush not ACKed — drop withheld: {err:#}"),
                 summary,
             );
-            return;
+            return PartitionStep::Done;
         }
 
         // 4b. LAST-MOMENT RECOUNT (2026-08-19) — close the write-during-drop
@@ -2188,17 +2188,42 @@ impl PartitionArchiver {
         //     without a table lock QuestDB does not offer. What it converts
         //     is the FAILURE MODE: silent loss becomes a counted, coded
         //     refusal that retries.
-        match self.recount_rows(table, &start, &end).await {
-            Some(rows) if rows == proof.rows => {}
+        //
+        //     WAL-APPLIED GATE, again (2026-10-02), and deliberately BEFORE
+        //     the recount rather than after it. The recount can only see
+        //     APPLIED rows. Proving `writerTxn == sequencerTxn` first means
+        //     every row acknowledged up to that instant is visible to the
+        //     recount that follows; checking after the recount would let a
+        //     row applied between the two pass both. A table that has fallen
+        //     behind since the export keeps this partition AND the S3 object:
+        //     the object is a correct copy of what was applied at export
+        //     time, and the next run either reuses it (nothing landed here)
+        //     or writes a content-addressed sidecar beside it.
+        if !self.wal_applied_gate(table, partition, "pre_drop").await {
+            metrics::counter!("tv_partition_drop_withheld_total").increment(1);
+            return PartitionStep::WalNotApplied;
+        }
+        //     The re-read compares count AND max(ts) with the values taken
+        //     right after the export; any difference keeps the partition.
+        let recheck = self.recount_rows(table, &start, &end).await;
+        match recheck {
+            Some(ref now) if Some(now) == verified_tally.as_ref() && now.rows == proof.rows => {}
             other => {
+                let verified_max = verified_tally
+                    .as_ref()
+                    .and_then(|t| t.max_ts.clone())
+                    .unwrap_or_default();
                 let detail = match other {
-                    Some(rows) => format!(
-                        "row count CHANGED between verify and drop: verified \
-                         {} rows, now {rows} — a writer touched this partition \
-                         (15:31 sweep / WAL replay / DLQ drain). The S3 copy is \
+                    Some(now) => format!(
+                        "partition CHANGED between verify and drop: verified \
+                         {} rows (max ts '{verified_max}'), now {} rows (max ts \
+                         '{}') — a writer touched this partition (15:31 sweep / \
+                         WAL replay / DLQ drain / deferred depth). The S3 copy is \
                          stale, so the partition is KEPT, the stale object is \
                          removed, and it is re-exported next run",
-                        proof.rows
+                        proof.rows,
+                        now.rows,
+                        now.max_ts.unwrap_or_default()
                     ),
                     None => format!(
                         "pre-drop recount UNAVAILABLE (verified {} rows) — \
@@ -2247,7 +2272,7 @@ impl PartitionArchiver {
                     &detail,
                     summary,
                 );
-                return;
+                return PartitionStep::Done;
             }
         }
 
@@ -2297,14 +2322,15 @@ impl PartitionArchiver {
                 );
             }
         }
+        PartitionStep::Done
     }
 
-    /// F3 (review round 1): probes `wal_tables()` and returns the
-    /// currently-SUSPENDED table names via the SAME by-column-name parser
-    /// the WAL-SUSPEND-01 watcher uses. Errors when the probe cannot
-    /// produce a usable answer — the caller then skips the ENTIRE run
-    /// (fail-closed: no drop without proof the table's WAL is applied).
-    async fn fetch_wal_suspended_tables(&self) -> Result<Vec<String>> {
+    /// F3 (review round 1): probes `wal_tables()` and returns every row via
+    /// the SAME by-column-name parser the WAL-SUSPEND-01 watcher uses. Errors
+    /// when the probe cannot produce a usable answer — the run-start caller
+    /// then skips the ENTIRE run, and the per-partition gate skips the table
+    /// (fail-closed: no export or drop without proof the WAL is applied).
+    async fn fetch_wal_tables(&self) -> Result<Vec<WalTableRow>> {
         let response = self
             .ddl_client
             .get(&self.exec_url)
@@ -2332,11 +2358,100 @@ impl PartitionArchiver {
                  suspended-table set is incomplete, refusing to archive on it"
             );
         }
-        Ok(rows
-            .into_iter()
-            .filter(|r| r.suspended)
-            .map(|r| r.name)
-            .collect()) // O(1) EXEMPT: cold-path once-per-run probe
+        Ok(rows)
+    }
+
+    /// Per-partition WAL-applied gate (2026-10-02). Probes `wal_tables()`
+    /// fresh and returns `true` ONLY when `table` is not suspended and its
+    /// `writerTxn == sequencerTxn`. Anything else — lagging, suspended,
+    /// absent from the probe, txn columns missing, or the probe itself
+    /// failing — returns `false` after counting
+    /// `tv_partition_archive_skipped_total{reason="wal_not_applied"}` and
+    /// logging once; the caller keeps the partition and skips the table for
+    /// the rest of the run.
+    ///
+    /// `stage` is `"pre_export"` or `"pre_drop"` (bounded metric label).
+    async fn wal_applied_gate(&self, table: &str, partition: &str, stage: &'static str) -> bool {
+        let verdict = match self.fetch_wal_tables().await {
+            Ok(rows) => wal_apply_verdict(&rows, table),
+            Err(err) => {
+                metrics::counter!(
+                    "tv_partition_archive_skipped_total",
+                    "reason" => "wal_not_applied",
+                    "cause" => "probe_failed",
+                    "stage" => stage
+                )
+                .increment(1);
+                error!(
+                    ?err,
+                    code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
+                    table,
+                    partition,
+                    stage,
+                    "partition archive: wal_tables() could not be read, so the table's \
+                     WAL cannot be proven applied — partition KEPT and the table skipped \
+                     this run (fail-closed; the next run retries)"
+                );
+                return false;
+            }
+        };
+        if verdict == WalApplyVerdict::Applied {
+            return true;
+        }
+        metrics::counter!(
+            "tv_partition_archive_skipped_total",
+            "reason" => "wal_not_applied",
+            "cause" => verdict.as_str(),
+            "stage" => stage
+        )
+        .increment(1);
+        match verdict {
+            WalApplyVerdict::Lagging {
+                writer_txn,
+                sequencer_txn,
+            } => {
+                // Expected and self-clearing (a writer is busy, or the
+                // after-close passes are still applying) — warn, not error.
+                warn!(
+                    code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
+                    table,
+                    partition,
+                    stage,
+                    writer_txn,
+                    sequencer_txn,
+                    "partition archive: table WAL is BEHIND (acknowledged rows not yet \
+                     applied would be invisible to the export and recount) — partition \
+                     KEPT and the table skipped this run; the next run retries"
+                );
+            }
+            WalApplyVerdict::Suspended => {
+                warn!(
+                    code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
+                    table,
+                    partition,
+                    stage,
+                    "partition archive: table became WAL-SUSPENDED during the run — \
+                     partition KEPT and the table skipped (see WAL-SUSPEND-01)"
+                );
+            }
+            WalApplyVerdict::NotReported
+            | WalApplyVerdict::TxnUnreadable
+            | WalApplyVerdict::Applied => {
+                // A table missing from wal_tables(), or a row with no txn
+                // columns, will not clear on its own — it needs a person.
+                error!(
+                    code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
+                    table,
+                    partition,
+                    stage,
+                    cause = verdict.as_str(),
+                    "partition archive: wal_tables() does not let the table's WAL be \
+                     proven applied — partition KEPT and the table skipped this run \
+                     (fail-closed)"
+                );
+            }
+        }
+        false
     }
 
     /// Is there anything in either spill directory that a replay could still
@@ -2560,20 +2675,7 @@ impl PartitionArchiver {
     /// never stored), and the stored attribute is the content identity a
     /// later run's reuse decision requires.
     async fn upload_to_s3(&self, path: &Path, key: &str, sha256_b64: &str) -> Result<()> {
-        let body = aws_sdk_s3::primitives::ByteStream::from_path(path)
-            .await
-            .context("open temp file for S3 upload")?;
-        self.s3
-            .put_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .if_none_match("*")
-            .checksum_sha256(sha256_b64)
-            .body(body)
-            .send()
-            .await
-            .context("S3 conditional PutObject (If-None-Match + checksum_sha256) failed")?;
-        Ok(())
+        self.cold.put_if_absent_path(path, key, sha256_b64).await
     }
 
     /// Removes an archive object this run uploaded, after a pre-drop mismatch.
@@ -2587,19 +2689,13 @@ impl PartitionArchiver {
     /// which the next run reports as `S3Conflict` — visible and diagnosable,
     /// never silent.
     async fn delete_s3_object(&self, key: &str) -> Result<()> {
-        self.s3
-            .delete_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-            .context("S3 DeleteObject for a stale post-mismatch archive object")?;
-        Ok(())
+        self.cold.delete(key).await
     }
 
     /// Post-export recount over the identical range (verify leg (a)).
+    /// Returns `count()` and `max(ts)` from one statement.
     /// `None` = unavailable → verify fails → partition kept.
-    async fn recount_rows(&self, table: &str, start: &str, end: &str) -> Option<u64> {
+    async fn recount_rows(&self, table: &str, start: &str, end: &str) -> Option<RangeTally> {
         let sql = build_count_sql(table, start, end);
         let response = self
             .ddl_client
@@ -2620,25 +2716,11 @@ impl PartitionArchiver {
     /// review-round-2 content identity; requested via
     /// `ChecksumMode::Enabled`, `None` when the object was written without
     /// one, e.g. a foreign/legacy object). `None` overall = object missing.
+    /// A failed HeadObject also reads `None` here (unchanged since the
+    /// 2026-10-02 move into `s3_cold`): the conditional PutObject that follows
+    /// turns a lost race into a loud 412, never an overwrite.
     async fn head_object_meta(&self, key: &str) -> Option<S3ObjectMeta> {
-        let head = self
-            .s3
-            .head_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
-            .send()
-            .await
-            .ok()?;
-        let len = head.content_length().and_then(|n| u64::try_from(n).ok())?;
-        Some(S3ObjectMeta {
-            len,
-            checksum_sha256_b64: head
-                .checksum_sha256()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(ToString::to_string),
-        })
+        self.cold.head(key).await.ok().flatten()
     }
 
     /// The ONLY destructive step — requires the [`VerifiedArchive`] proof,
@@ -3595,6 +3677,12 @@ mod tests {
         // market-data comparator here is now a MINUTE candle — the data that
         // actually still lives on the 15-day window.
         assert_eq!(retention_class("candles_1m"), RetentionClass::MarketData);
+        // Item 45h: the auxiliary packet table is market data on the 15-day
+        // window (archived, then detached), never Standard and never Intraday.
+        assert_eq!(
+            retention_class(crate::feed_aux_persistence::FEED_AUX_PACKETS_TABLE),
+            RetentionClass::MarketData
+        );
     }
 
     #[test]
@@ -3858,7 +3946,7 @@ mod tests {
         let count = build_count_sql("ticks", &start, &end);
         let export = build_export_sql("ticks", &start, &end);
         assert_eq!(
-            count.replace("count()", "*"),
+            count.replace("count(), max(ts)", "*"),
             export,
             "recount must cover the IDENTICAL range as the export"
         );
@@ -3874,13 +3962,113 @@ mod tests {
 
     #[test]
     fn test_parse_count_response_valid_and_garbage() {
-        let json = r#"{"columns":[{"name":"count","type":"LONG"}],"dataset":[[12345]],"count":1}"#;
-        assert_eq!(parse_count_response(json), Some(12345));
-        assert_eq!(parse_count_response(r#"{"dataset":[[0]]}"#), Some(0));
-        assert_eq!(parse_count_response(r#"{"dataset":[[-1]]}"#), None);
+        let json = r#"{"columns":[{"name":"count","type":"LONG"},{"name":"max","type":"TIMESTAMP"}],"dataset":[[12345,"2026-04-01T09:59:59.000000Z"]],"count":1}"#;
+        assert_eq!(
+            parse_count_response(json),
+            Some(RangeTally {
+                rows: 12345,
+                max_ts: Some("2026-04-01T09:59:59.000000Z".to_string()),
+            })
+        );
+        // Empty range: count 0, max(ts) null.
+        assert_eq!(
+            parse_count_response(r#"{"dataset":[[0,null]]}"#),
+            Some(RangeTally {
+                rows: 0,
+                max_ts: None
+            })
+        );
+        assert_eq!(parse_count_response(r#"{"dataset":[[-1,null]]}"#), None);
         assert_eq!(parse_count_response("not json"), None);
         assert_eq!(parse_count_response(r#"{"dataset":[]}"#), None);
-        assert_eq!(parse_count_response(r#"{"dataset":[["x"]]}"#), None);
+        assert_eq!(parse_count_response(r#"{"dataset":[["x",null]]}"#), None);
+        // Fail-closed: a missing max(ts) cell is not "no max".
+        assert_eq!(parse_count_response(r#"{"dataset":[[5]]}"#), None);
+        // Fail-closed: a max(ts) cell of the wrong type.
+        assert_eq!(parse_count_response(r#"{"dataset":[[5,7]]}"#), None);
+    }
+
+    fn wal_row(name: &str, suspended: bool, writer: Option<i64>, seq: Option<i64>) -> WalTableRow {
+        WalTableRow {
+            name: name.to_string(),
+            suspended,
+            writer_txn: writer,
+            sequencer_txn: seq,
+            error_tag: None,
+            error_message: None,
+        }
+    }
+
+    #[test]
+    fn test_wal_apply_verdict_only_exact_txn_equality_is_applied() {
+        let rows = vec![
+            wal_row("ticks", false, Some(42), Some(42)),
+            wal_row("market_depth", false, Some(40), Some(42)),
+            wal_row("candles_1m", true, Some(42), Some(42)),
+            wal_row("candles_5m", false, None, Some(42)),
+            wal_row("candles_15m", false, Some(42), None),
+        ];
+        assert_eq!(wal_apply_verdict(&rows, "ticks"), WalApplyVerdict::Applied);
+        assert_eq!(
+            wal_apply_verdict(&rows, "market_depth"),
+            WalApplyVerdict::Lagging {
+                writer_txn: 40,
+                sequencer_txn: 42
+            }
+        );
+        // Suspended wins even when the txns happen to match.
+        assert_eq!(
+            wal_apply_verdict(&rows, "candles_1m"),
+            WalApplyVerdict::Suspended
+        );
+        assert_eq!(
+            wal_apply_verdict(&rows, "candles_5m"),
+            WalApplyVerdict::TxnUnreadable
+        );
+        assert_eq!(
+            wal_apply_verdict(&rows, "candles_15m"),
+            WalApplyVerdict::TxnUnreadable
+        );
+        // A table the probe does not report cannot be proven applied.
+        assert_eq!(
+            wal_apply_verdict(&rows, "candles_1h"),
+            WalApplyVerdict::NotReported
+        );
+        assert_eq!(
+            wal_apply_verdict(&[], "ticks"),
+            WalApplyVerdict::NotReported
+        );
+        // A writer AHEAD of the sequencer is not equality either.
+        let ahead = vec![wal_row("ticks", false, Some(43), Some(42))];
+        assert!(matches!(
+            wal_apply_verdict(&ahead, "ticks"),
+            WalApplyVerdict::Lagging { .. }
+        ));
+    }
+
+    #[test]
+    fn test_wal_apply_verdict_labels_are_stable_and_distinct() {
+        let all = [
+            WalApplyVerdict::Applied,
+            WalApplyVerdict::Suspended,
+            WalApplyVerdict::Lagging {
+                writer_txn: 1,
+                sequencer_txn: 2,
+            },
+            WalApplyVerdict::NotReported,
+            WalApplyVerdict::TxnUnreadable,
+        ];
+        let labels: Vec<&str> = all.iter().map(WalApplyVerdict::as_str).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "applied",
+                "suspended",
+                "lagging",
+                "not_reported",
+                "txn_unreadable"
+            ]
+        );
     }
 
     // ---- verify decision (every failure combination → keep) ----------------
@@ -4018,103 +4206,6 @@ mod tests {
         );
         // rows = newlines − 1 header
         assert_eq!(streamed_newlines - 1, 3);
-    }
-
-    // ---- content identity: base64 / hex / Sha256Writer (review round 2) ----
-
-    #[test]
-    fn test_base64_encode_known_vectors() {
-        // RFC 4648 vectors + the well-known sha256("abc") digest in the
-        // exact wire format S3's x-amz-checksum-sha256 carries.
-        assert_eq!(base64_encode(b""), "");
-        assert_eq!(base64_encode(b"f"), "Zg==");
-        assert_eq!(base64_encode(b"fo"), "Zm8=");
-        assert_eq!(base64_encode(b"foo"), "Zm9v");
-        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
-        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
-        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
-        use sha2::Digest as _;
-        let digest: [u8; 32] = sha2::Sha256::digest(b"abc").into();
-        assert_eq!(
-            base64_encode(&digest),
-            "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=",
-            "sha256(\"abc\") base64 known vector"
-        );
-        assert_eq!(
-            hex_encode(&digest),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
-            "sha256(\"abc\") hex known vector"
-        );
-    }
-
-    #[test]
-    fn test_sha256_writer_digest_matches_oneshot_and_passes_bytes_through() {
-        use sha2::Digest as _;
-        let payload = b"the compressed archive bytes, split across writes";
-        let mut w = Sha256Writer::new(Vec::new());
-        w.write_all(&payload[..7]).expect("write 1");
-        w.write_all(&payload[7..]).expect("write 2");
-        w.flush().expect("flush");
-        let (inner, digest) = w.finish();
-        assert_eq!(
-            inner, payload,
-            "every byte must pass through to the inner writer"
-        );
-        let oneshot: [u8; 32] = sha2::Sha256::digest(payload).into();
-        assert_eq!(digest, oneshot, "streamed digest == one-shot digest");
-    }
-
-    // ---- bucket / environment resolution ------------------------------------
-
-    #[test]
-    fn test_resolve_archive_bucket_explicit_wins() {
-        assert_eq!(
-            resolve_archive_bucket("my-bucket", Some("prod")).as_deref(),
-            Some("my-bucket")
-        );
-        assert_eq!(
-            resolve_archive_bucket("  my-bucket  ", None).as_deref(),
-            Some("my-bucket"),
-            "explicit config needs no env var"
-        );
-    }
-
-    #[test]
-    fn test_resolve_archive_bucket_derives_cold_bucket_only_with_explicit_env() {
-        assert_eq!(
-            resolve_archive_bucket("", Some("prod")).as_deref(),
-            Some("tv-prod-cold")
-        );
-        assert_eq!(
-            resolve_archive_bucket("   ", Some("staging")).as_deref(),
-            Some("tv-staging-cold")
-        );
-        // F1b fail-closed: no explicit environment → NO bucket → archival
-        // skipped. A dev box can never default onto the prod cold bucket.
-        assert_eq!(resolve_archive_bucket("", None), None);
-        assert_eq!(resolve_archive_bucket("   ", None), None);
-    }
-
-    #[test]
-    fn test_resolve_environment_from_precedence_and_fail_closed() {
-        assert_eq!(
-            resolve_environment_from(Some("prod"), None).as_deref(),
-            Some("prod")
-        );
-        assert_eq!(
-            resolve_environment_from(Some("staging"), Some("prod")).as_deref(),
-            Some("staging")
-        );
-        assert_eq!(
-            resolve_environment_from(None, Some("dev-1")).as_deref(),
-            Some("dev-1")
-        );
-        // F1b: NO default — unset env vars resolve to None (skip archival).
-        assert_eq!(resolve_environment_from(None, None), None);
-        assert_eq!(resolve_environment_from(Some(""), Some("  ")), None);
-        // Bucket-hostile values also resolve None (fail-closed).
-        assert_eq!(resolve_environment_from(Some("../etc"), None), None);
-        assert_eq!(resolve_environment_from(Some("a b"), None), None);
     }
 
     // ---- audit table contract -----------------------------------------------
@@ -4695,32 +4786,81 @@ mod stub_integration_tests {
         wal_suspended: Vec<&'static str>,
         wal_status: u16,
     ) -> Responder {
+        let wal: WalStub = Arc::new(move |_probe| {
+            if wal_status != 200 {
+                return (wal_status, "{}".to_string());
+            }
+            (200, wal_tables_body(&wal_suspended, &[]))
+        });
+        qdb_responder_with(
+            partitions,
+            Arc::new(move |_call| (count, Some(STUB_MAX_TS.to_string()))),
+            csv_body,
+            wal,
+        )
+    }
+
+    /// `max(ts)` the plain stub reports for the partition range.
+    const STUB_MAX_TS: &str = "2026-04-01T09:59:59.000000Z";
+
+    /// `wal_tables()` behaviour: given the 0-based probe index, the status
+    /// and body to answer. Probe 0 is the run-start probe; for a single
+    /// partition, 1 is the pre-export gate and 2 the pre-drop gate.
+    type WalStub = Arc<dyn Fn(usize) -> (u16, String) + Send + Sync>;
+    /// `count(), max(ts)` behaviour: given the 0-based call index.
+    type TallyStub = Arc<dyn Fn(usize) -> (u64, Option<String>) + Send + Sync>;
+
+    /// A `wal_tables()` body listing EVERY swept table: those in
+    /// `suspended` suspended, those in `lagging` with `writerTxn` behind
+    /// `sequencerTxn`, every other one fully applied.
+    fn wal_tables_body(suspended: &[&str], lagging: &[&str]) -> String {
+        let rows: Vec<String> = swept_tables()
+            .into_iter()
+            .map(|n| {
+                let is_suspended = suspended.contains(&n);
+                let writer = if lagging.contains(&n) { 5 } else { 7 };
+                format!("[\"{n}\",{is_suspended},{writer},7]")
+            })
+            .collect();
+        format!(
+            "{{\"columns\":[{{\"name\":\"name\"}},{{\"name\":\"suspended\"}},\
+             {{\"name\":\"writerTxn\"}},{{\"name\":\"sequencerTxn\"}}],\
+             \"dataset\":[{}]}}",
+            rows.join(",")
+        )
+    }
+
+    fn qdb_responder_with(
+        partitions: Vec<&'static str>,
+        tally: TallyStub,
+        csv_body: &'static str,
+        wal: WalStub,
+    ) -> Responder {
+        let wal_probes = Arc::new(AtomicU64::new(0));
+        let tally_calls = Arc::new(AtomicU64::new(0));
         Arc::new(move |req: &SeenRequest| {
             let t = &req.target;
             if t.starts_with("/exp") {
                 return (200, Vec::new(), csv_body.as_bytes().to_vec());
             }
             if t.contains("wal_tables()") {
-                if wal_status != 200 {
-                    return (wal_status, Vec::new(), b"{}".to_vec());
-                }
-                let rows: Vec<String> = wal_suspended
-                    .iter()
-                    .map(|n| format!("[\"{n}\",true]"))
-                    .collect();
-                let body = format!(
-                    "{{\"columns\":[{{\"name\":\"name\"}},{{\"name\":\"suspended\"}}],\
-                     \"dataset\":[{}]}}",
-                    rows.join(",")
-                );
-                return (200, Vec::new(), body.into_bytes());
+                let idx = usize::try_from(wal_probes.fetch_add(1, Ordering::SeqCst))
+                    .unwrap_or(usize::MAX);
+                let (status, body) = wal(idx);
+                return (status, Vec::new(), body.into_bytes());
             }
             if t.contains("CREATE TABLE") || t.contains("DROP PARTITION") {
                 return (200, Vec::new(), b"{\"ddl\":\"OK\"}".to_vec());
             }
             if t.contains("count()") {
-                let body =
-                    format!("{{\"columns\":[{{\"name\":\"count\"}}],\"dataset\":[[{count}]]}}");
+                let idx = usize::try_from(tally_calls.fetch_add(1, Ordering::SeqCst))
+                    .unwrap_or(usize::MAX);
+                let (count, max_ts) = tally(idx);
+                let max_cell = max_ts.map_or_else(|| "null".to_string(), |m| format!("\"{m}\""));
+                let body = format!(
+                    "{{\"columns\":[{{\"name\":\"count\"}},{{\"name\":\"max\"}}],\
+                     \"dataset\":[[{count},{max_cell}]]}}"
+                );
                 return (200, Vec::new(), body.into_bytes());
             }
             if t.contains("table_partitions('ticks')") {
@@ -5294,6 +5434,267 @@ mod stub_integration_tests {
             "an unprovable WAL state must skip the whole run"
         );
         assert!(s3_log.lock().expect("s3 log").is_empty());
+    }
+
+    // Multi-thread runtime: the questdb-rs ILP flush is SYNC-blocking;
+    // a current_thread runtime would starve the stub server tasks while
+    // the flush blocks (deadlock until the request timeout).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_stub_wal_lagging_table_is_skipped_before_export() {
+        // `ticks` is behind on every probe: never suspended, so the
+        // run-start gate lets it through, and the per-partition gate must
+        // stop it before any export, for BOTH of its partitions.
+        let wal: WalStub = Arc::new(|_probe| (200, wal_tables_body(&[], &["ticks"])));
+        let (qdb_url, qdb_log) = spawn_stub(qdb_responder_with(
+            vec!["2026-04-01T09", "2026-04-01T10"],
+            Arc::new(|_call| (3, Some(STUB_MAX_TS.to_string()))),
+            CSV,
+            wal,
+        ))
+        .await;
+        let (ilp_url, _ilp_log) = spawn_stub(ilp_responder(204)).await;
+        let objects = Arc::new(Mutex::new(HashMap::new()));
+        let (s3_url, s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
+
+        let mut archiver =
+            build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200)).await;
+        let summary = archiver.run_archive_pass().await;
+
+        assert!(summary.pass_ran);
+        assert_eq!(summary.tables_wal_suspended, 0);
+        assert_eq!(summary.partitions_considered, 2);
+        assert_eq!(summary.tables_wal_not_applied, 1, "counted once per table");
+        assert_eq!(summary.verified, 0);
+        assert_eq!(summary.dropped, 0);
+        let qdb_reqs = qdb_log.lock().expect("qdb log").clone();
+        assert!(
+            !qdb_reqs.iter().any(|r| r.target.starts_with("/exp")),
+            "no export may run while the table's WAL is behind"
+        );
+        assert!(!qdb_reqs.iter().any(|r| r.target.contains("DROP PARTITION")));
+        // Run-start probe + ONE per-partition probe: the second partition
+        // of the blocked table is skipped without probing again.
+        assert_eq!(
+            qdb_reqs
+                .iter()
+                .filter(|r| r.target.contains("wal_tables()"))
+                .count(),
+            2
+        );
+        assert!(s3_log.lock().expect("s3 log").is_empty(), "no S3 traffic");
+        assert!(objects.lock().expect("objects").is_empty());
+    }
+
+    // Multi-thread runtime: the questdb-rs ILP flush is SYNC-blocking;
+    // a current_thread runtime would starve the stub server tasks while
+    // the flush blocks (deadlock until the request timeout).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_stub_wal_lag_between_export_and_drop_withholds_drop_and_keeps_s3_object() {
+        // Probe 0 = run start, 1 = pre-export (both applied); probe 2 =
+        // pre-drop, where the table has fallen behind.
+        let wal: WalStub = Arc::new(|probe| {
+            let lagging: &[&str] = if probe >= 2 { &["ticks"] } else { &[] };
+            (200, wal_tables_body(&[], lagging))
+        });
+        let (qdb_url, qdb_log) = spawn_stub(qdb_responder_with(
+            vec!["2026-04-01T09"],
+            Arc::new(|_call| (3, Some(STUB_MAX_TS.to_string()))),
+            CSV,
+            wal,
+        ))
+        .await;
+        let (ilp_url, _ilp_log) = spawn_stub(ilp_responder(204)).await;
+        let objects = Arc::new(Mutex::new(HashMap::new()));
+        let (s3_url, s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
+
+        let mut archiver =
+            build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200)).await;
+        let summary = archiver.run_archive_pass().await;
+
+        assert_eq!(summary.verified, 1, "the export itself verified");
+        assert_eq!(summary.dropped, 0, "the drop must be withheld");
+        assert_eq!(summary.tables_wal_not_applied, 1);
+        let qdb_reqs = qdb_log.lock().expect("qdb log").clone();
+        assert_eq!(
+            qdb_reqs
+                .iter()
+                .filter(|r| r.target.starts_with("/exp"))
+                .count(),
+            1
+        );
+        assert!(
+            !qdb_reqs.iter().any(|r| r.target.contains("DROP PARTITION")),
+            "no DROP while acknowledged rows may still be unapplied"
+        );
+        // The pre-drop gate runs BEFORE the pre-drop recount: only the
+        // verify recount was issued.
+        assert_eq!(
+            qdb_reqs
+                .iter()
+                .filter(|r| r.target.contains("count()"))
+                .count(),
+            1
+        );
+        // The S3 copy is KEPT (it is a correct copy of what was applied).
+        assert!(objects.lock().expect("objects").contains_key(TICKS_KEY));
+        assert!(
+            !s3_log
+                .lock()
+                .expect("s3 log")
+                .iter()
+                .any(|r| r.method == "DELETE"),
+            "the archived object must not be deleted on a WAL-lag refusal"
+        );
+    }
+
+    // Multi-thread runtime: the questdb-rs ILP flush is SYNC-blocking;
+    // a current_thread runtime would starve the stub server tasks while
+    // the flush blocks (deadlock until the request timeout).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_stub_unreadable_wal_tables_at_partition_gate_fails_closed() {
+        // The run-start probe succeeds; every later probe fails.
+        let wal: WalStub = Arc::new(|probe| {
+            if probe == 0 {
+                (200, wal_tables_body(&[], &[]))
+            } else {
+                (500, "{}".to_string())
+            }
+        });
+        let (qdb_url, qdb_log) = spawn_stub(qdb_responder_with(
+            vec!["2026-04-01T09"],
+            Arc::new(|_call| (3, Some(STUB_MAX_TS.to_string()))),
+            CSV,
+            wal,
+        ))
+        .await;
+        let (ilp_url, _ilp_log) = spawn_stub(ilp_responder(204)).await;
+        let objects = Arc::new(Mutex::new(HashMap::new()));
+        let (s3_url, _s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
+
+        let mut archiver =
+            build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200)).await;
+        let summary = archiver.run_archive_pass().await;
+
+        assert!(summary.pass_ran);
+        assert_eq!(summary.tables_wal_not_applied, 1);
+        assert_eq!(summary.dropped, 0);
+        let qdb_reqs = qdb_log.lock().expect("qdb log").clone();
+        assert!(!qdb_reqs.iter().any(|r| r.target.starts_with("/exp")));
+        assert!(!qdb_reqs.iter().any(|r| r.target.contains("DROP PARTITION")));
+        assert!(objects.lock().expect("objects").is_empty());
+    }
+
+    // Multi-thread runtime: the questdb-rs ILP flush is SYNC-blocking;
+    // a current_thread runtime would starve the stub server tasks while
+    // the flush blocks (deadlock until the request timeout).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_stub_table_absent_from_wal_tables_fails_closed() {
+        // `ticks` is missing from the probe entirely (only the run-start
+        // shape check passes, via an empty dataset).
+        let wal: WalStub = Arc::new(|_probe| {
+            (
+                200,
+                "{\"columns\":[{\"name\":\"name\"},{\"name\":\"suspended\"},\
+                 {\"name\":\"writerTxn\"},{\"name\":\"sequencerTxn\"}],\"dataset\":[]}"
+                    .to_string(),
+            )
+        });
+        let (qdb_url, qdb_log) = spawn_stub(qdb_responder_with(
+            vec!["2026-04-01T09"],
+            Arc::new(|_call| (3, Some(STUB_MAX_TS.to_string()))),
+            CSV,
+            wal,
+        ))
+        .await;
+        let (ilp_url, _ilp_log) = spawn_stub(ilp_responder(204)).await;
+        let objects = Arc::new(Mutex::new(HashMap::new()));
+        let (s3_url, _s3_log) = spawn_stub(s3_responder(objects)).await;
+
+        let mut archiver =
+            build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200)).await;
+        let summary = archiver.run_archive_pass().await;
+
+        assert_eq!(summary.tables_wal_not_applied, 1);
+        assert_eq!(summary.dropped, 0);
+        let qdb_reqs = qdb_log.lock().expect("qdb log").clone();
+        assert!(!qdb_reqs.iter().any(|r| r.target.starts_with("/exp")));
+    }
+
+    // Multi-thread runtime: the questdb-rs ILP flush is SYNC-blocking;
+    // a current_thread runtime would starve the stub server tasks while
+    // the flush blocks (deadlock until the request timeout).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_stub_fully_applied_table_probes_before_export_and_drop_then_drops() {
+        let (qdb_url, qdb_log) =
+            spawn_stub(qdb_responder(vec!["2026-04-01T09"], 3, CSV, vec![], 200)).await;
+        let (ilp_url, _ilp_log) = spawn_stub(ilp_responder(204)).await;
+        let objects = Arc::new(Mutex::new(HashMap::new()));
+        let (s3_url, _s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
+
+        let mut archiver =
+            build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200)).await;
+        let summary = archiver.run_archive_pass().await;
+
+        assert_eq!(summary.dropped, 1);
+        assert_eq!(summary.tables_wal_not_applied, 0);
+        let qdb_reqs = qdb_log.lock().expect("qdb log").clone();
+        let pos = |needle: &str| -> Vec<usize> {
+            qdb_reqs
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.target.contains(needle) || r.target.starts_with(needle))
+                .map(|(i, _)| i)
+                .collect()
+        };
+        let probes = pos("wal_tables()");
+        let exports = pos("/exp");
+        let drops = pos("DROP PARTITION");
+        let counts = pos("count()");
+        assert_eq!(probes.len(), 3, "run start + pre-export + pre-drop");
+        assert_eq!(exports.len(), 1);
+        assert_eq!(drops.len(), 1);
+        assert_eq!(counts.len(), 2, "verify recount + pre-drop re-read");
+        assert!(
+            probes[1] < exports[0],
+            "the pre-export gate precedes the export"
+        );
+        assert!(
+            probes[2] < counts[1] && counts[1] < drops[0],
+            "the pre-drop gate precedes the pre-drop re-read, which precedes the DROP"
+        );
+    }
+
+    // Multi-thread runtime: the questdb-rs ILP flush is SYNC-blocking;
+    // a current_thread runtime would starve the stub server tasks while
+    // the flush blocks (deadlock until the request timeout).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_stub_max_ts_change_before_drop_withholds_drop() {
+        // Same count both times, but a later max(ts) at the pre-drop
+        // re-read: rows changed after the export.
+        let tally: TallyStub = Arc::new(|call| {
+            if call == 0 {
+                (3, Some(STUB_MAX_TS.to_string()))
+            } else {
+                (3, Some("2026-04-01T09:59:59.500000Z".to_string()))
+            }
+        });
+        let wal: WalStub = Arc::new(|_probe| (200, wal_tables_body(&[], &[])));
+        let (qdb_url, qdb_log) =
+            spawn_stub(qdb_responder_with(vec!["2026-04-01T09"], tally, CSV, wal)).await;
+        let (ilp_url, _ilp_log) = spawn_stub(ilp_responder(204)).await;
+        let objects = Arc::new(Mutex::new(HashMap::new()));
+        let (s3_url, _s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
+
+        let mut archiver =
+            build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200)).await;
+        let summary = archiver.run_archive_pass().await;
+
+        assert_eq!(summary.verified, 1);
+        assert_eq!(summary.dropped, 0, "a moved max(ts) must withhold the drop");
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.tables_wal_not_applied, 0);
+        let qdb_reqs = qdb_log.lock().expect("qdb log").clone();
+        assert!(!qdb_reqs.iter().any(|r| r.target.contains("DROP PARTITION")));
     }
 
     // Multi-thread runtime: the questdb-rs ILP flush is SYNC-blocking;

@@ -157,7 +157,7 @@ resource "aws_iam_role_policy" "github_deploy" {
       {
         # NSE-holiday intentional-stop marker (2026-07-07 round-3 review
         # fix): aws-autopilot.sh reads /tickvault/<env>/holiday-stop-date
-        # (stamped by deploy/aws/holiday-gate.sh before its holiday
+        # (stamped by the holiday gate before its holiday
         # self-stop) so its every-15-min up-window self-start never fights
         # the intentional holiday stop — the pre-fix boot/stop war could
         # bracket the 09:20 IST alarm-gate sample and restore the holiday

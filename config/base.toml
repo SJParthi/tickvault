@@ -422,6 +422,13 @@ depth_hot_hours = 4
 # removed in #O3; the /metrics exporter (observability.rs, port 9091) is
 # independent and stays for CloudWatch scraping.
 
+# Raw WAL segments are copied to the cold S3 bucket (raw-frames/<IST date>/)
+# and verified before any local prune may delete them (plan item 45e-1,
+# operator Quotes 27 + 28, 2026-09-29). Keep this ON in every deployed
+# environment: `false` restores the old prune, which deletes without a copy.
+[raw_frame_archive]
+require_upload_before_prune = true
+
 [websocket]
 ping_interval_secs = 10
 pong_timeout_secs = 10
@@ -799,6 +806,16 @@ spot_universe_fno_underlyings_only = false
 # THROUGH to the full master-sourced set with a coded error — the session
 # subscribes MORE than was asked for, never less.
 spot_universe_ntm_only = true
+
+# A second, backup copy of the most important contracts on another main-feed
+# socket, so a dropped socket does not cost their ticks. Operator 2026-10-02
+# ("go ahea ddude" / "dont b;ock go ahea ddude"), recorded verbatim in
+# `websocket-connection-scope-lock.md` BEFORE this key existed. The copies are
+# the option legs nearest the money, sent once after the contract attach, on
+# the spot socket (never the socket that carries the first copy), only into
+# free slots. The drain folds and writes ONE copy of each packet; the WAL keeps
+# both. 0 turns it off.
+backup_top_n = 1000
 
 # ===========================================================================
 # Daily timeframe-consistency verifier (operator directive 2026-07-13 —

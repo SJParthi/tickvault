@@ -956,7 +956,7 @@ jobs:
       # connection and every console request 503s box-offline while the box is
       # RUNNING. Exposure unchanged: the box SG admits 9000 from the Lambda SG
       # ONLY (main.tf dynamic ingress) — never public. .env is read by EVERY
-      # compose caller (this step, user-data boot, infra.rs, ensure-questdb.sh),
+      # compose caller (this step, user-data boot, infra.rs, `tickvault ensure-questdb`),
       # so the bind persists across restarts. Idempotent grep-or-append.
       # Verify QuestDB is actually listening on 9000 (HTTP) within 30s
       # Console-shell HARD canary (2026-07-06 shell-hang fix; hard gate 2026-07-08): the console back lambda rewrites GET / -> /index.html, so /index.html must complete box-locally within 5s on every box deploy — this is the lane that ships QuestDB image bumps. curl -f fails on any code >= 400, and --max-time 5 fails an unframed keep-alive response whose body never completes (curl exit 28): completion-within-5s IS the framing assertion. Disclosed limitation: a framed 3xx at /index.html (< 400) passes curl -f here; the end-to-end proxy gate in terraform-apply.yml requires a literal 200 and catches that shape on the next in-window apply. Never probe bare / here: QuestDB answers it with an unframed keep-alive 301 that would hang this shell.
@@ -1027,6 +1027,12 @@ jobs:
         # NOT a subcommand of `tickvault`. The previous version
         # (`bin/tickvault.new smoke-test --duration 30`) was wrong and would
         # exit non-zero with "unrecognized subcommand".
+        # The holiday-gate and app units are copied only AFTER
+        # `bin/tickvault-host` is refreshed (audit D6c, D6d): they run
+        # `tickvault-host holiday-gate` and `tickvault-host ensure-questdb`, and
+        # a deploy that fails its smoke test must not leave a new unit pointing
+        # at an older copy that does not know that subcommand (it would ignore
+        # the argument and boot the whole app inside the unit).
         id: ssm
         # EXPRESSION-LENGTH LOCK (2026-08-18): this run block MUST stay free of
         # `${{ }}` interpolation. GitHub compiles any run script containing an
@@ -1069,8 +1075,6 @@ jobs:
               "echo ===== deployed config/production.toml line count + head =====",
               "wc -l config/production.toml repo/config/production.toml",
               "diff -q config/production.toml repo/config/production.toml || (echo FATAL: deployed config/production.toml differs from repo/config/production.toml after cp; diff config/production.toml repo/config/production.toml; exit 1)",
-              "if [ -f repo/deploy/systemd/tickvault.service ]; then cp -f repo/deploy/systemd/tickvault.service /etc/systemd/system/tickvault.service; fi",
-              "if [ -f repo/deploy/systemd/tickvault-holiday-gate.service ]; then cp -f repo/deploy/systemd/tickvault-holiday-gate.service /etc/systemd/system/tickvault-holiday-gate.service; fi",
               "if [ -f repo/deploy/systemd/tickvault-host-tuning.service ]; then cp -f repo/deploy/systemd/tickvault-host-tuning.service /etc/systemd/system/tickvault-host-tuning.service; fi",
               "rm -rf scripts/groww-sidecar && echo GROWW-SIDECAR-RETIRED: on-box sidecar source removed",
               "rm -rf /opt/tickvault/data/groww/venv && echo GROWW-VENV-RETIRED: stale sidecar venv removed",
@@ -1083,6 +1087,8 @@ jobs:
               "mv bin/smoke_test.new  bin/smoke_test",
               "chown ec2-user:ec2-user bin/tickvault bin/smoke_test",
               "install -m 0755 -o root -g root bin/tickvault bin/tickvault-host",
+              "if [ -f repo/deploy/systemd/tickvault-holiday-gate.service ]; then cp -f repo/deploy/systemd/tickvault-holiday-gate.service /etc/systemd/system/tickvault-holiday-gate.service; fi",
+              "if [ -f repo/deploy/systemd/tickvault.service ]; then cp -f repo/deploy/systemd/tickvault.service /etc/systemd/system/tickvault.service; fi",
               "grep -q \"^TV_QDB_HTTP_BIND=\" repo/deploy/docker/.env 2>/dev/null || echo \"TV_QDB_HTTP_BIND=0.0.0.0\" >> repo/deploy/docker/.env",
               "chown ec2-user:ec2-user repo/deploy/docker/.env",
               "if [ -f repo/deploy/docker/docker-compose.yml ]; then export TV_QUESTDB_PG_USER=$(aws ssm get-parameter --region ap-south-1 --name /tickvault/prod/questdb/pg-user --with-decryption --output text --query Parameter.Value 2>/dev/null || echo admin); export TV_QUESTDB_PG_PASSWORD=$(aws ssm get-parameter --region ap-south-1 --name /tickvault/prod/questdb/pg-password --with-decryption --output text --query Parameter.Value 2>/dev/null || echo quest); (cd repo/deploy/docker && { TV_QUESTDB_PG_USER=\"$TV_QUESTDB_PG_USER\" TV_QUESTDB_PG_PASSWORD=\"$TV_QUESTDB_PG_PASSWORD\" timeout 600 docker compose up -d && echo COMPOSE-UP-OK: first attempt; } || { echo \"WARN: compose up attempt 1 failed - a recreate leaves the old container renamed to <id>_<service> and the daemon can then refuse to start it; removing the containers of this compose project and retrying once (named volumes and data are untouched)\"; docker compose ps -aq 2>/dev/null | xargs -r docker rm -f >/dev/null 2>&1 || true; TV_QUESTDB_PG_USER=\"$TV_QUESTDB_PG_USER\" TV_QUESTDB_PG_PASSWORD=\"$TV_QUESTDB_PG_PASSWORD\" timeout 600 docker compose up -d && echo COMPOSE-UP-OK: recovered on attempt 2 after clearing stale containers; }) || (echo FATAL: docker compose up failed on BOTH attempts or exceeded 600s; docker compose -f repo/deploy/docker/docker-compose.yml ps -a || true; exit 1); else echo FATAL: docker-compose.yml missing from repo/deploy/docker; exit 1; fi",

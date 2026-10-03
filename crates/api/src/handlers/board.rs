@@ -33,9 +33,6 @@ use serde::Serialize;
 
 use crate::state::SharedAppState;
 
-/// QuestDB count queries are cold-path; keep each request bounded.
-const QUESTDB_BOARD_TIMEOUT_SECS: u64 = 3;
-
 /// "System status" strip values.
 #[derive(Debug, Serialize)]
 pub struct BoardStatus {
@@ -135,14 +132,15 @@ pub(crate) async fn compute_board_data(state: &SharedAppState) -> BoardDataRespo
     // QuestDB counts — three bounded queries, concurrently (max one timeout).
     let cfg = state.questdb_config();
     let base_url = format!("http://{}:{}", cfg.host, cfg.http_port);
-    let client = super::stats::build_stats_client(QUESTDB_BOARD_TIMEOUT_SECS);
+    // The shared pooled client; `query_count` sets the per-request timeout.
+    let client = state.questdb_http_client();
     let midnight = ist_today_midnight_literal();
     // `ticks_today` tile retired 2026-07-19 (BATCH-5) — the ticks writer is
     // gone, so no ticks query is issued anymore.
     let candles_sql = format!("SELECT count() FROM candles_1m WHERE ts >= '{midnight}'");
     let (probe, candles_1m_today) = tokio::join!(
-        super::stats::query_count(&client, &base_url, "SHOW TABLES"),
-        super::stats::query_count(&client, &base_url, &candles_sql),
+        super::stats::query_count(client, &base_url, "SHOW TABLES"),
+        super::stats::query_count(client, &base_url, &candles_sql),
     );
 
     BoardDataResponse {
@@ -186,6 +184,35 @@ fn ist_today_midnight_literal() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_board_uses_the_shared_client_and_builds_none() {
+        // 2026-10-02: the board handler sent each miss on a freshly built
+        // client. Production must use the shared pooled one.
+        let source = include_str!("board.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]\nmod tests")
+            .map_or(source, |(before, _)| before);
+        let builder_free: String = production
+            .split("\n#[cfg(test)]\n")
+            .enumerate()
+            .map(|(i, part)| {
+                if i == 0 {
+                    part
+                } else {
+                    part.split_once("\n\u{7d}\n").map_or("", |(_, rest)| rest)
+                }
+            })
+            .collect();
+        assert!(
+            !builder_free.contains("Client::builder"),
+            "the board handler must not build an HTTP client in production"
+        );
+        assert!(
+            production.contains("state.questdb_http_client()"),
+            "the board handler must use the shared QuestDB client"
+        );
+    }
     use crate::feed_state::FeedRuntimeState;
     use std::sync::Arc;
     use tickvault_common::config::{DhanConfig, FeedsConfig, InstrumentConfig, QuestDbConfig};

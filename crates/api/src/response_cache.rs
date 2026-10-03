@@ -3,7 +3,7 @@
 //!
 //! Two shapes, both COLD-path (HTTP API only, never the tick pipeline):
 //! - [`SingleSlotTtlCache`] — `/api/stats` (one JSON body, 5s TTL).
-//! - [`BoundedTtlCache`] — `/api/quote/{security_id}` (per-SID JSON body,
+//! - [`BoundedTtlCache`] — `/api/quote/{security_id}` (per-(SID, segment) JSON body,
 //!   1s TTL, hard entry cap; callers cache ONLY 200 bodies so
 //!   attacker-chosen garbage security_ids can never grow the map).
 //!
@@ -110,20 +110,28 @@ impl SingleSlotTtlCache {
 /// second at the endpoint, which is a larger problem than the scan.
 pub const QUOTE_CACHE_MAX_ENTRIES: usize = 2048;
 
+/// The quote cache key: `(security_id, segment code)` per I-P1-11.
+///
+/// 2026-10-02: was the bare `security_id`. The endpoint now takes an optional
+/// `?segment=`, and a response for one segment must never be served for
+/// another, so the segment is part of the request identity and of the key. A
+/// request without a segment uses [`QUOTE_SEGMENT_UNSPECIFIED`], which no
+/// exchange segment code uses.
+pub type QuoteCacheKey = (u64, u8);
+
+/// The segment half of a [`QuoteCacheKey`] for a request that named no
+/// segment. `u8::MAX` is not an exchange segment code (they are 0..=8).
+pub const QUOTE_SEGMENT_UNSPECIFIED: u8 = u8::MAX;
+
 /// Per-key TTL cache with a hard entry cap. At cap, NEW keys are
 /// skip-inserted (served fresh, never cached) — existing keys keep being
 /// overwritten in place, so the map can never exceed the cap and never
 /// evict-thrashes under attacker probing.
 ///
-/// Key = the quote endpoint's own key (`security_id` alone).
-// APPROVED: single-key map is correct by construction per I-P1-11 rule 2 —
-// the /api/quote/{security_id} endpoint itself is keyed on security_id
-// alone (its SQL is `WHERE security_id = X LATEST ON ts PARTITION BY
-// security_id` across ALL segments/feeds), so the cache key mirrors the
-// full request identity; no cross-segment entry can be dropped because no
-// segment ever enters the request.
+/// Key = [`QuoteCacheKey`], the composite `(security_id, segment code)`, so
+/// two segments that share a `security_id` are two entries (I-P1-11).
 pub struct BoundedTtlCache {
-    map: Mutex<HashMap<u64, (Instant, String)>>,
+    map: Mutex<HashMap<QuoteCacheKey, (Instant, String)>>,
     ttl: Duration,
     max_entries: usize,
 }
@@ -140,7 +148,7 @@ impl BoundedTtlCache {
 
     /// Returns the cached body for `key` when fresh. Lazily evicts an
     /// expired entry for that key so dead entries free their slot.
-    pub fn get(&self, key: u64) -> Option<String> {
+    pub fn get(&self, key: QuoteCacheKey) -> Option<String> {
         let mut guard = lock_recovering(&self.map);
         match guard.get(&key) {
             Some((stored_at, body)) if stored_at.elapsed() < self.ttl => Some(body.clone()),
@@ -173,7 +181,7 @@ impl BoundedTtlCache {
     /// [`QUOTE_CACHE_MAX_ENTRIES`]. Flagged, not relabelled; recorded in
     /// CLAUDE.md's non-O(1) table so a complexity claim elsewhere cannot
     /// read as covering it.
-    pub fn put(&self, key: u64, body: String) {
+    pub fn put(&self, key: QuoteCacheKey, body: String) {
         let mut guard = lock_recovering(&self.map);
         if guard.len() >= self.max_entries && !guard.contains_key(&key) {
             let ttl = self.ttl;
@@ -199,6 +207,11 @@ impl BoundedTtlCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The NSE_EQ segment code, for keys in the tests below.
+    const NSE_EQ: u8 = tickvault_common::constants::EXCHANGE_SEGMENT_NSE_EQ;
+    /// The IDX_I segment code.
+    const IDX_I: u8 = tickvault_common::constants::EXCHANGE_SEGMENT_IDX_I;
 
     #[test]
     fn test_single_slot_put_get_roundtrip() {
@@ -230,18 +243,18 @@ mod tests {
     #[test]
     fn test_bounded_cache_put_get_roundtrip() {
         let cache = BoundedTtlCache::new(Duration::from_secs(1), 4);
-        assert!(cache.get(13).is_none());
-        cache.put(13, "nifty".to_string());
-        assert_eq!(cache.get(13).as_deref(), Some("nifty"));
-        assert!(cache.get(25).is_none(), "other key still misses");
+        assert!(cache.get((13, NSE_EQ)).is_none());
+        cache.put((13, NSE_EQ), "nifty".to_string());
+        assert_eq!(cache.get((13, NSE_EQ)).as_deref(), Some("nifty"));
+        assert!(cache.get((25, NSE_EQ)).is_none(), "other key still misses");
     }
 
     #[test]
     fn test_bounded_cache_ttl_expiry_and_lazy_eviction() {
         let cache = BoundedTtlCache::new(Duration::from_millis(10), 4);
-        cache.put(13, "nifty".to_string());
+        cache.put((13, NSE_EQ), "nifty".to_string());
         std::thread::sleep(Duration::from_millis(25));
-        assert!(cache.get(13).is_none(), "expired entry misses");
+        assert!(cache.get((13, NSE_EQ)).is_none(), "expired entry misses");
         assert!(
             cache.is_empty(),
             "expired entry is lazily evicted on lookup"
@@ -254,14 +267,14 @@ mod tests {
     #[test]
     fn test_bounded_cache_at_cap_sweeps_expired_then_inserts() {
         let cache = BoundedTtlCache::new(Duration::from_millis(10), 2);
-        cache.put(1, "a".to_string());
-        cache.put(2, "b".to_string());
+        cache.put((1, NSE_EQ), "a".to_string());
+        cache.put((2, NSE_EQ), "b".to_string());
         std::thread::sleep(Duration::from_millis(25));
         // Both entries are dead. A NEW key at cap must sweep them and
         // insert instead of being skip-inserted forever.
-        cache.put(3, "c".to_string());
+        cache.put((3, NSE_EQ), "c".to_string());
         assert_eq!(
-            cache.get(3).as_deref(),
+            cache.get((3, NSE_EQ)).as_deref(),
             Some("c"),
             "new key must be cached after the expired sweep frees space"
         );
@@ -271,26 +284,55 @@ mod tests {
     #[test]
     fn test_bounded_cache_cap_skip_insert_for_new_keys() {
         let cache = BoundedTtlCache::new(Duration::from_secs(5), 2);
-        cache.put(1, "a".to_string());
-        cache.put(2, "b".to_string());
+        cache.put((1, NSE_EQ), "a".to_string());
+        cache.put((2, NSE_EQ), "b".to_string());
         // At cap: a NEW key is skip-inserted...
-        cache.put(3, "c".to_string());
-        assert!(cache.get(3).is_none(), "new key at cap must not be cached");
+        cache.put((3, NSE_EQ), "c".to_string());
+        assert!(
+            cache.get((3, NSE_EQ)).is_none(),
+            "new key at cap must not be cached"
+        );
         assert_eq!(cache.len(), 2, "map never exceeds the cap");
         // ...and the existing entries are untouched (no evict-thrash).
-        assert_eq!(cache.get(1).as_deref(), Some("a"));
-        assert_eq!(cache.get(2).as_deref(), Some("b"));
+        assert_eq!(cache.get((1, NSE_EQ)).as_deref(), Some("a"));
+        assert_eq!(cache.get((2, NSE_EQ)).as_deref(), Some("b"));
     }
 
     #[test]
     fn test_bounded_cache_only_present_key_overwrites_at_cap() {
         let cache = BoundedTtlCache::new(Duration::from_secs(5), 2);
-        cache.put(1, "a".to_string());
-        cache.put(2, "b".to_string());
+        cache.put((1, NSE_EQ), "a".to_string());
+        cache.put((2, NSE_EQ), "b".to_string());
         // Existing key overwrites in place even at cap.
-        cache.put(2, "b2".to_string());
-        assert_eq!(cache.get(2).as_deref(), Some("b2"));
+        cache.put((2, NSE_EQ), "b2".to_string());
+        assert_eq!(cache.get((2, NSE_EQ)).as_deref(), Some("b2"));
         assert_eq!(cache.len(), 2);
+    }
+
+    /// I-P1-11: the same `security_id` in two segments is two entries. A body
+    /// cached for one segment, or for a request that named none, is never
+    /// served for another.
+    #[test]
+    fn test_bounded_cache_keys_differ_by_segment() {
+        let cache = BoundedTtlCache::new(Duration::from_secs(5), 8);
+        cache.put((27, IDX_I), "finnifty-index".to_string());
+        assert!(cache.get((27, NSE_EQ)).is_none(), "another segment misses");
+        assert!(
+            cache.get((27, QUOTE_SEGMENT_UNSPECIFIED)).is_none(),
+            "an unspecified-segment request misses a segment-scoped entry"
+        );
+        cache.put((27, NSE_EQ), "equity".to_string());
+        assert_eq!(cache.get((27, IDX_I)).as_deref(), Some("finnifty-index"));
+        assert_eq!(cache.get((27, NSE_EQ)).as_deref(), Some("equity"));
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn test_quote_segment_unspecified_is_not_a_segment_code() {
+        assert_eq!(
+            tickvault_common::segment::segment_code_to_str(QUOTE_SEGMENT_UNSPECIFIED),
+            "UNKNOWN"
+        );
     }
 
     #[test]

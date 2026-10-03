@@ -94,8 +94,9 @@ use tickvault_api::state::{SharedAppState, SharedHealthStatus, SystemHealthStatu
 
 /// Exit code returned by the `--check-trading-day` gate.
 ///
-/// The holiday-gate shell script (`deploy/aws/holiday-gate.sh`) reads `$?` —
-/// NOT stdout (the app denies `print_stdout`/`print_stderr`). Contract:
+/// The holiday gate (`tickvault holiday-gate`, `holiday_gate.rs`; a shell
+/// script until 2026-10-01) reads this code, as does any operator running
+/// `tickvault --check-trading-day` by hand. Contract:
 /// - `0`  = today (IST) is a trading day → let the app start.
 /// - `75` = today is a weekend / NSE holiday → gate self-stops the instance.
 ///
@@ -107,11 +108,20 @@ fn trading_day_gate_exit_code(is_trading_day: bool) -> i32 {
 /// `--check-trading-day` short-circuit: load config → build the calendar →
 /// evaluate IST today → exit with [`trading_day_gate_exit_code`].
 ///
-/// FAIL-OPEN: any config/calendar load error exits `70`, which the gate script
+/// FAIL-OPEN: any config/calendar load error exits `70`, which the gate
 /// treats as "let the app start" — so the gate can NEVER stop the box on a real
 /// trading day because of a transient load failure. Single source of truth: the
 /// SAME `config/base.toml` NSE holiday list the app itself uses (no duplication).
 fn run_trading_day_gate() -> ! {
+    std::process::exit(trading_day_gate_code());
+}
+
+/// Exit code for the load error that the gate treats as "let the app start".
+const TRADING_DAY_GATE_LOAD_ERROR_EXIT: i32 = 70;
+
+/// The `--check-trading-day` verdict as an exit code, without exiting, so the
+/// in-process holiday gate asks the very same question.
+fn trading_day_gate_code() -> i32 {
     let config: ApplicationConfig = match Figment::new()
         .merge(Toml::file(CONFIG_BASE_PATH))
         .merge(Toml::file(CONFIG_LOCAL_PATH))
@@ -119,18 +129,16 @@ fn run_trading_day_gate() -> ! {
     {
         Ok(c) => c,
         // FAIL-OPEN on load error (exit 70 → gate lets the app start).
-        Err(_) => std::process::exit(70),
+        Err(_) => return TRADING_DAY_GATE_LOAD_ERROR_EXIT,
     };
     let calendar = match TradingCalendar::from_config(&config.trading) {
         Ok(c) => c,
-        Err(_) => std::process::exit(70),
+        Err(_) => return TRADING_DAY_GATE_LOAD_ERROR_EXIT,
     };
     let today_ist = (chrono::Utc::now()
         + chrono::TimeDelta::seconds(tickvault_common::constants::IST_UTC_OFFSET_SECONDS_I64))
     .date_naive();
-    std::process::exit(trading_day_gate_exit_code(
-        calendar.is_trading_day(today_ist),
-    ));
+    trading_day_gate_exit_code(calendar.is_trading_day(today_ist))
 }
 
 /// Metric name for the dedicated boot-completed CloudWatch signal.
@@ -415,6 +423,12 @@ const MAX_TOKIO_WORKER_THREADS: usize = 64;
 /// macros are banned house-wide, so the derivation is stashed here and emitted by
 /// `async_main` as a real `info!` once logging is up.
 static TOKIO_RUNTIME_SIZING: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+/// What `install_reader_runtime` did in `main`, for the boot log.
+static READER_RUNTIME_OUTCOME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+/// The reader threads' core-pin plan, resolved in `main`, for the boot log.
+static READER_CORE_PLAN: std::sync::OnceLock<
+    tickvault_core::websocket::reader_runtime::ReaderCorePlan,
+> = std::sync::OnceLock::new();
 
 /// Host-derived floor and ceiling for the resolved worker count.
 ///
@@ -483,6 +497,91 @@ fn resolve_tokio_worker_threads(raw: Option<&str>, host_derived: usize) -> usize
     }
 }
 
+/// What the boot log says about the reader threads' core pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReaderPinReport {
+    /// Every reader thread is on this core.
+    Pinned(i64),
+    /// Unpinned by design or by the host shape; an `info!` line.
+    Unpinned(&'static str),
+    /// The operator asked for a pin the process could not apply; a coded
+    /// `warn!` line, once.
+    Refused(&'static str),
+}
+
+/// Pure verdict from the plan, whether the reader runtime exists, and what
+/// its threads recorded.
+fn reader_pin_report(
+    plan: tickvault_core::websocket::reader_runtime::ReaderCorePlan,
+    runtime_installed: bool,
+    pinned_core: i64,
+    pin_failures: u64,
+) -> ReaderPinReport {
+    use tickvault_core::websocket::reader_runtime::ReaderCorePlan as Plan;
+    match plan {
+        Plan::Off => ReaderPinReport::Unpinned("TICKVAULT_WS_READER_CORE=off"),
+        Plan::Unsupported => ReaderPinReport::Unpinned("not Linux"),
+        Plan::DefaultNotAllowed => {
+            ReaderPinReport::Unpinned("core 1 is not in this process's allowed core set")
+        }
+        Plan::RefusedCoreZero => {
+            ReaderPinReport::Refused("core 0 is never used: it services network interrupts")
+        }
+        Plan::NotAllowed(_) => {
+            ReaderPinReport::Refused("the named core is not in this process's allowed core set")
+        }
+        Plan::Invalid => {
+            ReaderPinReport::Refused("TICKVAULT_WS_READER_CORE is not `off` or a core id")
+        }
+        Plan::Pin(_) if !runtime_installed => {
+            ReaderPinReport::Unpinned("no dedicated reader runtime (TICKVAULT_WS_READER_THREADS=0)")
+        }
+        Plan::Pin(_) if pin_failures > 0 || pinned_core < 0 => {
+            ReaderPinReport::Refused("the kernel refused the pin")
+        }
+        Plan::Pin(_) => ReaderPinReport::Pinned(pinned_core),
+    }
+}
+
+/// Logs the reader pin outcome once and sets `tv_ws_reader_pinned_core`
+/// (the core, or -1). Never fails boot.
+fn report_reader_core_pin(plan: tickvault_core::websocket::reader_runtime::ReaderCorePlan) {
+    use tickvault_core::websocket::reader_runtime as rr;
+    let pinned = rr::reader_pinned_core();
+    let (failures, errno) = rr::reader_pin_failures();
+    let report = reader_pin_report(
+        plan,
+        rr::reader_runtime_handle().is_some(),
+        pinned,
+        failures,
+    );
+    let gauge_value = match report {
+        ReaderPinReport::Pinned(core) => core,
+        _ => -1,
+    };
+    metrics::gauge!("tv_ws_reader_pinned_core")
+        .set(f64::from(i32::try_from(gauge_value).unwrap_or(-1)));
+    match report {
+        ReaderPinReport::Pinned(core) => {
+            info!(core, "socket reader threads pinned to their own core");
+        }
+        ReaderPinReport::Unpinned(reason) => {
+            info!(plan = ?plan, reason, "socket reader threads run unpinned");
+        }
+        ReaderPinReport::Refused(reason) => {
+            warn!(
+                code = tickvault_common::error_code::ErrorCode::HotPath03ReaderPinNotApplied
+                    .code_str(),
+                plan = ?plan,
+                reason,
+                failed_threads = failures,
+                os_errno = errno,
+                "socket reader threads run UNPINNED — the requested core pin was not applied"
+            );
+        }
+    }
+}
+
 fn main() -> Result<()> {
     // `tickvault host-tuning <action>` (audit D6b): the per-boot host tuning the
     // host-tuning unit runs as root. Dispatched before the runtime is built: it
@@ -510,6 +609,33 @@ fn main() -> Result<()> {
     // `enable_all` matches what `#[tokio::main]` installed (IO + time drivers).
     // Named threads so `top -H` / `perf` on the box can tell a runtime worker
     // apart from a blocking-pool thread while attributing a stall.
+    // The socket readers' own runtime (2026-10-02), built BEFORE the main
+    // runtime's `block_on` so dropping a losing racer can never happen inside
+    // async code. `0` in the env keeps the readers on the main runtime. The
+    // outcome travels to the boot log with the sizing line below.
+    let reader_raw =
+        std::env::var(tickvault_core::websocket::reader_runtime::WS_READER_THREADS_ENV).ok();
+    let reader_threads =
+        tickvault_core::websocket::reader_runtime::resolve_ws_reader_threads(reader_raw.as_deref());
+    // Core pinning for those threads (2026-10-02): resolved here, against the
+    // process's allowed core set, and reported by `async_main` once logging
+    // and the metrics recorder exist.
+    let core_raw =
+        std::env::var(tickvault_core::websocket::reader_runtime::WS_READER_CORE_ENV).ok();
+    let core_plan = tickvault_core::websocket::reader_runtime::resolve_ws_reader_core_for_process(
+        core_raw.as_deref(),
+    );
+    let _ = READER_CORE_PLAN.set(core_plan);
+    let _ = READER_RUNTIME_OUTCOME.set(
+        match tickvault_core::websocket::reader_runtime::install_reader_runtime(
+            reader_threads,
+            core_plan.core(),
+        ) {
+            Ok(outcome) => format!("{outcome:?}"),
+            Err(err) => format!("FAILED({err}) — readers share the main runtime"),
+        },
+    );
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads)
         .thread_name("tv-worker")
@@ -537,9 +663,9 @@ async fn async_main() -> Result<()> {
     // -----------------------------------------------------------------------
     // Step -1: Holiday-gate CLI short-circuit (cold path, no TLS / no runtime).
     // -----------------------------------------------------------------------
-    // `tickvault --check-trading-day` is invoked by the boot-time holiday gate
-    // (deploy/aws/holiday-gate.sh via the tickvault-holiday-gate.service oneshot)
-    // BEFORE the app proper starts. It exits 0 (trading day) / 75 (holiday) /
+    // `tickvault --check-trading-day` answers the holiday gate's question for an
+    // operator at a shell (the gate itself, `tickvault holiday-gate`, asks it
+    // in-process at Step 0.5 below). It exits 0 (trading day) / 75 (holiday) /
     // 70 (load error → fail-open). Must run before CryptoProvider install — the
     // gate needs no TLS and exits immediately.
     if std::env::args().any(|a| a == "--check-trading-day") {
@@ -557,6 +683,26 @@ async fn async_main() -> Result<()> {
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("failed to install rustls CryptoProvider — cannot proceed without TLS"); // APPROVED: bootstrap — TLS mandatory, failure is fatal
+
+    // -----------------------------------------------------------------------
+    // Step 0.5: `tickvault holiday-gate` (audit D6c; was deploy/aws/holiday-gate.sh)
+    // -----------------------------------------------------------------------
+    // Run by tickvault-holiday-gate.service before the app. Asks the same
+    // calendar as `--check-trading-day` and, on a definitive holiday, stamps
+    // the stop marker, pages and stops the instance. After the provider
+    // install because its IMDS and AWS clients use TLS.
+    let cli_args: Vec<String> = std::env::args().collect();
+    if tickvault_app::holiday_gate::is_invocation(&cli_args) {
+        let code = tickvault_app::holiday_gate::run(trading_day_gate_code).await;
+        std::process::exit(code);
+    }
+    // `tickvault ensure-questdb` (audit D6d; was scripts/ensure-questdb.sh):
+    // tickvault.service's ExecStartPre and the console's restart actions bring
+    // the QuestDB container up. After the provider install for its SSM client.
+    if tickvault_app::ensure_questdb::is_invocation(&cli_args) {
+        let code = tickvault_app::ensure_questdb::run().await;
+        std::process::exit(code);
+    }
 
     // -----------------------------------------------------------------------
     // Step 1: Load and validate configuration
@@ -908,6 +1054,32 @@ async fn async_main() -> Result<()> {
     // would allocate (Principle #1 violation). Must run post-install
     // because handles created pre-install resolve to a no-op counter.
     tickvault_core::parser::prewarm_dispatcher_counters();
+
+    // Live proof that nothing on the live path is waiting (2026-10-02):
+    // the publisher thread, plus one lateness probe per tokio runtime. AFTER
+    // the recorder install, like every pre-resolved handle above.
+    if let Err(err) = tickvault_storage::hot_path_telemetry::spawn_publisher() {
+        error!(
+            code = tickvault_common::error_code::ErrorCode::Boot02DeadlineExceeded.code_str(),
+            error = %err,
+            "the hot-path telemetry thread FAILED TO SPAWN — stage latency and task \
+             heartbeat gauges will not publish (host thread or memory limit)"
+        );
+    }
+    tokio::spawn(tickvault_storage::hot_path_telemetry::run_runtime_probe(
+        tickvault_storage::hot_path_telemetry::HotTask::MainRuntime,
+        tickvault_storage::hot_path_telemetry::Stage::MainRuntimeLag,
+        u64::MAX,
+    ));
+    if tickvault_core::websocket::reader_runtime::reader_runtime_handle().is_some() {
+        tickvault_core::websocket::reader_runtime::spawn_on_reader_runtime(
+            tickvault_storage::hot_path_telemetry::run_runtime_probe(
+                tickvault_storage::hot_path_telemetry::HotTask::ReaderRuntime,
+                tickvault_storage::hot_path_telemetry::Stage::ReaderRuntimeLag,
+                u64::MAX,
+            ),
+        );
+    }
 
     // -----------------------------------------------------------------------
     // STAGE-C: WebSocket frame WAL (write-ahead log) — durable spill
@@ -1837,7 +2009,14 @@ async fn async_main() -> Result<()> {
     // boot arms) — deliberately NOT the Dhan-lane periodic health loop,
     // which never runs on a Groww-only boot. Prunes once at task start
     // (each daily prod boot reclaims immediately), then every 6 h.
-    tokio::spawn(async {
+    //
+    // 2026-10-02 (plan item 45e-1, operator Quotes 27 + 28): every pass below
+    // deletes a WAL segment only when a verified S3 copy of it is recorded
+    // (`<wal_dir>/uploaded/<segment>`), unless the operator turned
+    // `[raw_frame_archive] require_upload_before_prune` off. The copies are
+    // made by the raw-frame uploader spawned right after this loop.
+    let require_raw_upload = config.raw_frame_archive.require_upload_before_prune;
+    tokio::spawn(async move {
         use std::time::Duration;
         // Monotonic, so the pressure floor cannot be defeated by a wall-clock
         // jump (NTP step, DST, a container clock correction).
@@ -1849,6 +2028,7 @@ async fn async_main() -> Result<()> {
                 &wal_dir,
                 tickvault_common::constants::WS_WAL_ARCHIVE_RETENTION_SECS,
                 tickvault_common::constants::WS_WAL_ARCHIVE_MAX_BYTES,
+                require_raw_upload,
             );
             // 2026-08-25: the ACTIVE WAL set, bounded for the first time.
             // Only `archive/` was ever pruned, on the assumption that active
@@ -1867,6 +2047,7 @@ async fn async_main() -> Result<()> {
                 &wal_dir,
                 tickvault_common::constants::WS_WAL_ACTIVE_RETENTION_SECS,
                 tickvault_storage::ws_frame_spill::ws_wal_active_max_bytes(&wal_dir),
+                require_raw_upload,
             );
             // 2026-08-19: the SPILL retention sweep, wired for the first
             // time. `SPILL_FILE_MAX_AGE_SECS` was defined, documented and
@@ -1880,6 +2061,7 @@ async fn async_main() -> Result<()> {
             let _spill = tickvault_storage::seal_spill::prune_spill_files(
                 std::path::Path::new("data/spill"),
                 tickvault_common::constants::SPILL_FILE_MAX_AGE_SECS,
+                require_raw_upload,
             );
             // The DLQ is MEASURED, never pruned — deliberately asymmetric
             // with the spill sweep above. It holds the operator-readable
@@ -1933,6 +2115,84 @@ async fn async_main() -> Result<()> {
         }
     });
 
+    // The raw-frame uploader (plan item 45e-1, operator Quotes 27 + 28,
+    // 2026-09-29): every sealed WAL segment is gzipped, put to the cold
+    // bucket under `raw-frames/<IST date>/` with a conditional create and a
+    // SHA-256 checksum, verified with HeadObject, and only then marked — and
+    // the prune above deletes nothing unmarked. Its own task and its own
+    // wake: every 2 minutes outside 09:00–15:40 IST (the session's disk and
+    // network belong to capture), and at once on disk pressure, when it runs
+    // a small batch even inside the session. After a batch that marked a
+    // segment it asks the prune to run, so the space actually comes back.
+    // Cold path: one directory walk per pass, and each segment's read, hash
+    // and gzip on a blocking thread — O(segment bytes), never on the drain.
+    let raw_upload_bucket = config.partition_retention.archive_bucket.clone();
+    tokio::spawn(async move {
+        use std::time::Duration;
+        use tickvault_storage::raw_frame_upload as raw_upload;
+        let Some(store) = tickvault_storage::s3_cold::S3Cold::load(&raw_upload_bucket).await else {
+            if require_raw_upload {
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::StorageGap04S3ArchiveFailed
+                        .code_str(),
+                    source = "raw_frame_upload",
+                    "raw-frame uploader not started: no cold bucket resolves for this \
+                     environment — the WAL prune will keep every segment, so the disk \
+                     only grows until a bucket is configured"
+                );
+            } else {
+                info!(
+                    "raw-frame uploader not started: no cold bucket, and the upload gate \
+                     is off in config"
+                );
+            }
+            return;
+        };
+        let now_utc_secs = || chrono::Utc::now().timestamp();
+        // First pass at start when the window is open, so a morning boot
+        // catches up on last night's segments before 09:00.
+        let mut by_pressure = false;
+        loop {
+            if by_pressure || raw_upload::upload_window_open(now_utc_secs()) {
+                let wal_dir = tickvault_app::boot_helpers::ws_wal_dir();
+                let max_segments = if raw_upload::upload_window_open(now_utc_secs()) {
+                    usize::MAX
+                } else {
+                    raw_upload::RAW_UPLOAD_PRESSURE_BATCH
+                };
+                let pressure = by_pressure;
+                let should_continue =
+                    move || pressure || raw_upload::upload_window_open(now_utc_secs());
+                let summary =
+                    raw_upload::run_pass(&store, &wal_dir, max_segments, &should_continue).await;
+                // Then the two prunes that delete other market data: the
+                // sealed-candle spill sweep and the tick / depth quarantine
+                // trims (plan item 45e-1, operator Quotes 27 + 28). Same
+                // schedule and batch as the WAL pass; today's spill day file
+                // is the one the live writer may hold open, so it is skipped.
+                let today_spill_file =
+                    tickvault_storage::seal_spill::live_spill_file_name(now_utc_secs());
+                let others = raw_upload::run_spill_and_quarantine_passes(
+                    &store,
+                    std::path::Path::new("data/spill"),
+                    std::path::Path::new(tickvault_storage::tick_persistence::TICK_SPILL_DIR),
+                    std::path::Path::new(tickvault_storage::depth_persistence::DEPTH_SPILL_DIR),
+                    &today_spill_file,
+                    max_segments,
+                    &should_continue,
+                )
+                .await;
+                if summary.marked() > 0 || others.marked() > 0 {
+                    tickvault_app::reclaim_signal::request_reclaim();
+                }
+            }
+            by_pressure = tickvault_app::reclaim_signal::wait_for_raw_upload_or(
+                Duration::from_secs(raw_upload::RAW_UPLOAD_INTERVAL_SECS),
+            )
+            .await;
+        }
+    });
+
     // Install panic hook: log at ERROR level (triggers Telegram via Loki → Grafana alerting).
     let default_panic_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
@@ -1955,9 +2215,27 @@ async fn async_main() -> Result<()> {
             &location,
             &payload,
         );
+        // Z11b (2026-10-02): under `panic = "abort"` (the release profile) the
+        // process dies the moment this hook returns, and every record still
+        // in the WAL spill channel dies with it — each one already reported to
+        // its socket as `Spilled`, and never resent by Dhan. Give the writer a
+        // bounded moment to empty the channel into the page cache, which
+        // survives the abort. Skipped (inside the call) when the writer itself
+        // panicked, and not run at all under unwinding, where the panic may be
+        // caught and the process lives on.
+        let wal_drain = if cfg!(panic = "abort") {
+            Some(
+                tickvault_storage::ws_frame_spill::drain_registered_for_abort(
+                    tickvault_storage::ws_frame_spill::WAL_ABORT_DRAIN_BUDGET,
+                ),
+            )
+        } else {
+            None
+        };
         tracing::error!(
             panic_location = %location,
             panic_payload = %payload,
+            wal_drain = ?wal_drain,
             "PANIC: tickvault crashed"
         );
         default_panic_hook(panic_info);
@@ -1989,6 +2267,12 @@ async fn async_main() -> Result<()> {
     // line carries the host allowance and its SOURCE, not just the answer.
     if let Some(sizing) = TOKIO_RUNTIME_SIZING.get() {
         info!(sizing = %sizing, "tokio runtime sizing");
+    }
+    if let Some(outcome) = READER_RUNTIME_OUTCOME.get() {
+        info!(outcome = %outcome, "socket reader runtime");
+    }
+    if let Some(plan) = READER_CORE_PLAN.get() {
+        report_reader_core_pin(*plan);
     }
 
     // Log trading day status — critical for operational awareness.
@@ -2272,6 +2556,7 @@ async fn async_main() -> Result<()> {
     let quarantine_pruned = tickvault_storage::tick_persistence::prune_quarantine(
         std::path::Path::new(tickvault_storage::tick_persistence::TICK_SPILL_DIR),
         tickvault_storage::tick_persistence::tick_spill_max_bytes(),
+        require_raw_upload,
     );
     if quarantine_pruned > 0 {
         warn!(
@@ -2286,6 +2571,7 @@ async fn async_main() -> Result<()> {
             std::path::PathBuf::from(tickvault_storage::tick_persistence::TICK_SPILL_DIR),
             &config.questdb.host,
             config.questdb.http_port,
+            require_raw_upload,
         );
 
     // The SAME drain, pointed at the depth rescue tier (2026-08-25).
@@ -2317,6 +2603,7 @@ async fn async_main() -> Result<()> {
             std::path::PathBuf::from(tickvault_storage::depth_persistence::DEPTH_SPILL_DIR),
             &config.questdb.host,
             config.questdb.http_port,
+            require_raw_upload,
         );
 
     // Feed-hardening Item 5 (2026-08-19): the watcher above MEASURES a filling
@@ -3090,6 +3377,9 @@ async fn async_main() -> Result<()> {
             // as every flag false, so a default build never empties a
             // depth-200 socket to measure anything.
             depth_unsubscribe_probe: config.depth_unsubscribe_probe,
+            // A second copy of the top contracts on another main-feed socket
+            // (scope lock 2026-10-02). 0 turns it off.
+            main_feed_backup_top_n: config.dhan_universe.backup_top_n,
             dhan_enabled: config.feeds.dhan_enabled,
             instance_lock_held: std::sync::Arc::clone(&dhan_instance_lock_held),
             // Frames a previous session captured but died before folding. The
@@ -3482,6 +3772,21 @@ static SEAL_ESCALATION_PENDING: std::sync::OnceLock<
 static SEAL_ESCALATION_THREAD: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> =
     std::sync::Mutex::new(None);
 
+/// The seal writer's spill directory, where its crash marker lives, so the
+/// shutdown can mark the marker clean once the escalation queue has drained
+/// (audit PR31b-1). Set once, beside `SEAL_WRITER_HANDLE`.
+static SEAL_UNWRITTEN_MARK_DIR: std::sync::OnceLock<std::path::PathBuf> =
+    std::sync::OnceLock::new();
+
+/// Budget for marking the crash marker clean at shutdown: one small write and
+/// a rename, which take milliseconds on a healthy disk. Bounded so a stalled
+/// disk cannot hold the shutdown before the WAL floor drains.
+const SEAL_UNWRITTEN_MARK_FINISH_BUDGET_SECS: u64 = 2;
+
+/// [`SEAL_UNWRITTEN_MARK_FINISH_BUDGET_SECS`] as a `Duration`.
+const SEAL_UNWRITTEN_MARK_FINISH_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(SEAL_UNWRITTEN_MARK_FINISH_BUDGET_SECS);
+
 /// Budget for draining the seal-escalation queue at shutdown.
 ///
 /// DERIVED, not guessed: the queue holds at most
@@ -3558,6 +3863,14 @@ fn spawn_seal_writer_loop(questdb_config: &tickvault_common::config::QuestDbConf
 
     match SealWriterRunner::new(questdb_config, SEAL_MAX_DRAIN_PER_CYCLE) {
         Ok(runner) => {
+            // Audit PR31b-2: keep what the previous process's crash marker
+            // said before the writer loop overwrites it. Published before the
+            // sender, so the candle warm-up, which waits for the sender, always
+            // finds it.
+            let _ = tickvault_storage::seal_writer_loop::publish_previous_unwritten(
+                tickvault_storage::seal_writer_loop::UnwrittenSealMark::in_dir(runner.spill_dir())
+                    .read_previous(),
+            );
             if !tickvault_storage::seal_writer_runner::set_global_seal_sender(runner.sender()) {
                 tracing::warn!(
                     "global seal sender already installed (idempotent skip) — first installer wins"
@@ -3714,6 +4027,7 @@ fn spawn_seal_writer_loop(questdb_config: &tickvault_common::config::QuestDbConf
                      wins; this runner will not be spawned"
                 );
             } else {
+                let _ = SEAL_UNWRITTEN_MARK_DIR.set(runner.spill_dir().to_path_buf());
                 let handle = tokio::spawn(async move {
                     run_seal_writer_loop(runner, seal_drain_interval(), cancel_rx).await
                 });
@@ -4405,6 +4719,20 @@ async fn build_shared_infra(
 /// honest limit of the guard below.
 const DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS: u64 = 30;
 
+/// How long shutdown waits for the Dhan feed sockets to close before it stops
+/// the lane drain (Z11d, 2026-10-02). Runs FIRST, before every other budget
+/// in the sequential sum `shutdown_budget_fits_systemd_guard.rs` checks.
+///
+/// Sized from the close path, not guessed: a socket sees the stop within one
+/// 1 s idle poll, then spends at most two 2 s `CLOSE_HANDSHAKE_WAIT`s (the
+/// Close write and the drain of the peer's reply). 5 s covers that and keeps
+/// the guard's 20 s margin at `TimeoutStopSec=145`.
+const DHAN_SOCKET_STOP_BUDGET_SECS: u64 = 5;
+
+/// [`DHAN_SOCKET_STOP_BUDGET_SECS`] as a `Duration`.
+const DHAN_SOCKET_STOP_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(DHAN_SOCKET_STOP_BUDGET_SECS);
+
 /// [`DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS`] as a `Duration`.
 const DHAN_LANE_SHUTDOWN_FLUSH_BUDGET: std::time::Duration =
     std::time::Duration::from_secs(DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS);
@@ -4658,6 +4986,9 @@ async fn run_process_runloop(
         class = ?shutdown_class,
         "shutdown classified"
     );
+    // The hot tasks wind down from here on purpose; the stall page must not
+    // read that as a stall (HOT-PATH-STALL-01, noise lock §2.8).
+    tickvault_storage::hot_path_telemetry::begin_shutdown();
     notifier.notify(NotificationEvent::ShutdownInitiated {
         class: shutdown_class,
     });
@@ -4672,6 +5003,34 @@ async fn run_process_runloop(
         warn!("second shutdown signal received — forcing immediate exit");
         std::process::exit(1);
     });
+
+    // 5a. Close the Dhan feed sockets FIRST (Z11d, 2026-10-02).
+    //
+    // Until this step the sockets took no stop signal: the notify below
+    // stops only the frame DRAIN, so every socket kept reading and appending
+    // to the WAL right up to process exit while the WAL writer was shut down
+    // beneath it (step 5d), and records that landed after the writer's last
+    // empty poll were dropped with its channel. `WsFrameSpill::shutdown`
+    // documents "call AFTER the sockets are closed"; this is what closes them.
+    // Each socket parks through `close_capturing`, so frames read during the
+    // close handshake still reach the WAL and the ring, and the drain, still
+    // running, folds them. Bounded: a socket that will not close in time is
+    // reported and left, never waited on past the stop timeout.
+    let sockets_left_open =
+        tickvault_app::dhan_feed_stack::stop_feed_sockets(DHAN_SOCKET_STOP_BUDGET).await;
+    if sockets_left_open == 0 {
+        info!("Dhan live feed: every socket closed before the lane drain was stopped");
+    } else {
+        error!(
+            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+            source = "socket_stop_incomplete",
+            sockets_left_open,
+            budget_secs = DHAN_SOCKET_STOP_BUDGET_SECS,
+            "Dhan live feed: sockets were still open when the socket-stop budget ran out — \
+             they may still append to the WAL while it shuts down, and those frames are \
+             counted as WAL drops rather than written"
+        );
+    }
 
     // 5b. Dhan live lane: seal + flush the day's tail (RESTORED 2026-08-14).
     //
@@ -4778,6 +5137,8 @@ async fn run_process_runloop(
     if let Some(stop) = SEAL_ESCALATION_STOP.get() {
         stop.store(true, std::sync::atomic::Ordering::Release);
     }
+    // Seals this step pages as lost, recorded in the crash marker below.
+    let mut seals_escalation_abandoned = 0_usize;
     let escalation_handle = SEAL_ESCALATION_THREAD
         .lock()
         .ok()
@@ -4817,12 +5178,53 @@ async fn run_process_runloop(
                 tickvault_storage::seal_writer_runner::SEAL_ESCALATION_ABANDONED_COUNTER
             )
             .increment(seals_abandoned as u64);
+            seals_escalation_abandoned = seals_abandoned;
             error!(
                 code = tickvault_common::error_code::ErrorCode::AggregatorDrop01.code_str(),
                 budget_secs = SEAL_ESCALATION_SHUTDOWN_BUDGET.as_secs(),
                 seals_abandoned,
                 "seal escalation: the queue did NOT drain within budget — exiting anyway so \
                  systemd does not SIGKILL us, but seals still queued are lost"
+            );
+        }
+    }
+
+    // 5b-2c. Crash marker (audit PR31b-1, 2026-10-01).
+    //
+    // Only now can nothing in this process still write a sealed candle: the
+    // writer (5b-2) and the escalation queue (5b-2b) are drained, or have been
+    // given up on and paged. The writer left the marker NOT clean while the
+    // escalation queue held seals, so a kill during 5b-2b is reported at the
+    // next boot. Marking it clean here, whatever the outcome above, stops the
+    // next boot paging a loss this shutdown already paged, including a writer
+    // that overran its budget.
+    //
+    // Bounded like every other wait on this path: the finish is a file write
+    // and a rename, and on a stalled disk an overrun writer can hold the
+    // marker's lock inside its own write. It runs on a blocking thread, and
+    // past the budget the shutdown goes on to 5b-3; the marker then keeps the
+    // count the writer last wrote, which the next boot reports.
+    if let Some(dir) = SEAL_UNWRITTEN_MARK_DIR.get() {
+        let dir = dir.clone();
+        let now = chrono::Utc::now().timestamp();
+        let finish = tokio::task::spawn_blocking(move || {
+            tickvault_storage::seal_writer_loop::finish_unwritten_mark_at_shutdown(
+                &dir,
+                seals_escalation_abandoned,
+                now,
+            )
+        });
+        if tokio::time::timeout(SEAL_UNWRITTEN_MARK_FINISH_BUDGET, finish)
+            .await
+            .is_err()
+        {
+            error!(
+                code =
+                    tickvault_common::error_code::ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                source = "unwritten_mark",
+                budget_secs = SEAL_UNWRITTEN_MARK_FINISH_BUDGET.as_secs(),
+                "seal writer: the crash marker could not be marked clean within budget — \
+                 the next boot may report the candles this shutdown already reported"
             );
         }
     }
@@ -4923,6 +5325,46 @@ async fn wait_for_shutdown_signal() -> &'static str {
 #[allow(clippy::assertions_on_constants)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reader_pin_report_covers_every_plan_and_never_reports_a_failed_pin_as_pinned() {
+        use tickvault_core::websocket::reader_runtime::ReaderCorePlan as Plan;
+        assert_eq!(
+            reader_pin_report(Plan::Pin(1), true, 1, 0),
+            ReaderPinReport::Pinned(1)
+        );
+        // The kernel refused: a coded warning, not a false "pinned".
+        assert!(matches!(
+            reader_pin_report(Plan::Pin(1), true, -1, 1),
+            ReaderPinReport::Refused(_)
+        ));
+        assert!(matches!(
+            reader_pin_report(Plan::Pin(1), true, 1, 1),
+            ReaderPinReport::Refused(_)
+        ));
+        assert!(matches!(
+            reader_pin_report(Plan::Pin(1), false, -1, 0),
+            ReaderPinReport::Unpinned(_)
+        ));
+        for plan in [Plan::Off, Plan::Unsupported, Plan::DefaultNotAllowed] {
+            assert!(
+                matches!(
+                    reader_pin_report(plan, true, -1, 0),
+                    ReaderPinReport::Unpinned(_)
+                ),
+                "{plan:?}"
+            );
+        }
+        for plan in [Plan::RefusedCoreZero, Plan::NotAllowed(7), Plan::Invalid] {
+            assert!(
+                matches!(
+                    reader_pin_report(plan, true, -1, 0),
+                    ReaderPinReport::Refused(_)
+                ),
+                "{plan:?}"
+            );
+        }
+    }
 
     #[test]
     fn stall_scan_reports_starved_only_when_it_can_see_nothing_and_should() {

@@ -1551,8 +1551,39 @@ in `aws-budget.md`"; it was not, until this note (added 2026-10-01, Item 48 of
 `raw-frames/` uploader exists and `main.tf` still carries
 `expiration { days = 1825 }`), so October pays nothing for this yet.
 
+**UPDATED 2026-10-01 (later the same day) — 45f has landed.** `main.tf` now
+carries no expiration on `tv-prod-cold`, versioning is `Enabled`, and
+`raw-frames/` moves to Deep Archive after 30 days. Its own cost this month is
+close to nothing: no object in the bucket is near five years old, and a
+version is kept only when an object is overwritten or deleted, which today
+happens only to per-commit deploy binaries under unique keys. The raw-frames
+line above still costs nothing until the 45e uploader exists.
+
 **What is NOT claimed.** The figure is Assumed until one month is billed, as the
 full rule file requires. It does not fit inside the $150 October line, which
 was already projected at about $150 before this (COST NOTE 2026-09-25); if the
 forecast goes over, that is a separate dated quote, per Quote 27's own
 "What this does NOT change" row.
+
+## COST NOTE 2026-10-01 — one order-audit loss counter shipped (+$0.30/mo)
+
+**Authorization:** the operator's standing go-ahead of 2026-10-01 ("don't block
+anything, everything is good to go ahead") and the zero-missing-data
+requirement of the same day, applied to plan item PR42 of
+`active-plan-audit-fixes-2026-09-26.md`.
+
+| Item | Cost |
+|---|---:|
+| `tv_order_audit_chain_lost_total` EMF name | $0.30 |
+| Sixth leg on the existing `order-audit-chain-loss` metric-math alarm | ~$0.10 |
+| **Total** | **~$0.40/mo** |
+
+Three SEBI-row losses reached no alarm: P&L audit rows discarded, leg P&L rows
+discarded, and order-push updates skipped by a consumer that fell behind. They
+share ONE new counter, labelled by `source`, instead of three EMF names: the
+agent folds the label into one summed series, the alarm needs only the sum,
+and each arm's coded log line names the source. Three names would have cost
+$0.90.
+
+**§2.3n's lever rule is NOT met.** No lever is taken. October is projected at
+about the $150 line before this (COST NOTE 2026-09-25); this adds about 0.3%.

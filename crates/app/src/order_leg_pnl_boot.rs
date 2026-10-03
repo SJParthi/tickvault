@@ -24,6 +24,7 @@ use metrics::counter;
 use tickvault_common::broker_order_events::next_event_seq;
 use tickvault_common::config::{OrderLegPnlConfig, QuestDbConfig};
 use tickvault_common::error_code::ErrorCode;
+use tickvault_storage::audit_spill::{AuditSpillTable, spawn_audit_spill_drain_once};
 use tickvault_storage::order_leg_pnl_persistence::{
     OrderLegPnlRecord, OrderLegPnlWriter, ensure_order_leg_pnl_table,
 };
@@ -161,14 +162,23 @@ fn flush_leg_pnl_writer(writer: &mut OrderLegPnlWriter) {
     if writer.pending() == 0 {
         return;
     }
-    if let Err(err) = writer.flush() {
+    // The flush is a blocking HTTP call and, when it fails, a disk-tier
+    // write with two fsyncs (audit PR42b); keep both off the async worker.
+    let flushed = if tokio::runtime::Handle::current().runtime_flavor()
+        == tokio::runtime::RuntimeFlavor::MultiThread
+    {
+        tokio::task::block_in_place(|| writer.flush())
+    } else {
+        writer.flush()
+    };
+    if let Err(err) = flushed {
         counter!("tv_order_leg_pnl_persist_errors_total", "stage" => "flush").increment(1);
         error!(
             code = ErrorCode::OrderPnl01PersistFailed.code_str(),
             stage = "flush",
             error = %err,
-            "order_leg_pnl: ILP flush refused — pending rows discarded \
-             (poisoned-buffer defense; DEDUP-idempotent re-appends)"
+            "order_leg_pnl: ILP flush refused and the disk tier refused the batch too — \
+             pending rows discarded (poisoned-buffer defense)"
         );
     }
 }
@@ -179,6 +189,8 @@ async fn run_order_leg_pnl_consumer(
     identity_index: SharedLegIdentityIndex,
 ) {
     ensure_order_leg_pnl_table(&questdb).await;
+    // Audit PR42b: the disk-tier drain starts only after the table is ensured.
+    spawn_audit_spill_drain_once(AuditSpillTable::OrderLegPnl, &questdb);
     let Some(mut guard) = ReceiverGuard::take(&rx_slot) else {
         error!(
             code = ErrorCode::OrderPnl01PersistFailed.code_str(),

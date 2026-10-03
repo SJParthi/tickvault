@@ -12,6 +12,11 @@
 use anyhow::{Context, Result};
 use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
 use tickvault_common::config::QuestDbConfig;
+
+use crate::audit_spill::{AuditSpill, AuditSpillTable, spill_failed_batch};
+
+/// This writer's disk-tier table (audit PR42b).
+const SPILL_TABLE: AuditSpillTable = AuditSpillTable::OrderLegPnl;
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::sanitize::sanitize_ilp_symbol;
 use tracing::{error, warn};
@@ -194,6 +199,10 @@ pub struct OrderLegPnlWriter {
     sender: Option<Sender>,
     buffer: Buffer,
     pending: usize,
+    /// Buffer length after the last whole row (audit PR42b).
+    committed_len: usize,
+    /// Disk tier for a failed flush (audit PR42b); `None` in `for_test`.
+    spill: Option<AuditSpill>,
 }
 
 impl OrderLegPnlWriter {
@@ -216,6 +225,13 @@ impl OrderLegPnlWriter {
         // BARE at its only emit site in `discard_pending`, so this creates the
         // identical series rather than a phantom sibling.
         metrics::counter!("tv_order_leg_pnl_rows_discarded_total").increment(0);
+        // The shipped twin (audit PR42a): this writer's discards also count on
+        // the one order-audit chain counter the CloudWatch alarm sums.
+        metrics::counter!(
+            "tv_order_audit_chain_lost_total",
+            "source" => "order_leg_pnl_discarded"
+        )
+        .increment(0);
         let conf = order_leg_pnl_ilp_http_conf(&config.host, config.http_port);
         match Sender::from_conf(&conf) {
             Ok(sender) => {
@@ -224,6 +240,8 @@ impl OrderLegPnlWriter {
                     sender: Some(sender),
                     buffer,
                     pending: 0,
+                    committed_len: 0,
+                    spill: Some(AuditSpill::for_table(SPILL_TABLE)),
                 }
             }
             Err(err) => {
@@ -232,6 +250,8 @@ impl OrderLegPnlWriter {
                     sender: None,
                     buffer: Buffer::new(ProtocolVersion::V1),
                     pending: 0,
+                    committed_len: 0,
+                    spill: Some(AuditSpill::for_table(SPILL_TABLE)),
                 }
             }
         }
@@ -244,6 +264,8 @@ impl OrderLegPnlWriter {
             sender: None,
             buffer: Buffer::new(ProtocolVersion::V1),
             pending: 0,
+            committed_len: 0,
+            spill: None,
         }
     }
 
@@ -344,6 +366,7 @@ impl OrderLegPnlWriter {
             .at(TimestampNanos::new(record.ts_ist_nanos))
             .context("order_leg_pnl: designated timestamp")?;
         self.pending = self.pending.saturating_add(1);
+        self.committed_len = self.buffer.len();
         // COUNTED AT APPEND, NOT AT ACK -- and the name does not say so.
         //
         // This increments when the row enters the BUFFER, before any flush. A
@@ -369,7 +392,9 @@ impl OrderLegPnlWriter {
         Ok(())
     }
 
-    /// Flush pending rows; a refused flush discards them (poisoned-buffer defense).
+    /// Flush pending rows. A refused flush goes to the disk tier (audit PR42b)
+    /// and reports `Ok`; only when the disk tier also refuses are the rows
+    /// discarded (poisoned-buffer defense, counted).
     pub fn flush(&mut self) -> Result<()> {
         if self.pending == 0 {
             return Ok(());
@@ -381,18 +406,21 @@ impl OrderLegPnlWriter {
         {
             Some(Ok(())) => {
                 self.pending = 0;
+                self.committed_len = 0;
                 Ok(())
             }
-            Some(Err(err)) => {
-                let dropped = self.discard_pending();
-                Err(anyhow::Error::new(err).context(format!(
-                    "order_leg_pnl: ILP flush rejected — {dropped} row(s) discarded (poisoned-buffer defense)"
-                )))
-            }
-            None => {
-                let dropped = self.discard_pending();
-                anyhow::bail!("order_leg_pnl: no ILP sender — {dropped} row(s) discarded")
-            }
+            Some(Err(err)) => match self.spill_or_discard() {
+                Ok(_spilled) => Ok(()),
+                Err(dropped) => Err(anyhow::Error::new(err).context(format!(
+                    "order_leg_pnl: ILP flush rejected and the disk tier refused the batch — {dropped} row(s) discarded (poisoned-buffer defense)"
+                ))),
+            },
+            None => match self.spill_or_discard() {
+                Ok(_spilled) => Ok(()),
+                Err(dropped) => {
+                    anyhow::bail!("order_leg_pnl: no ILP sender and the disk tier refused the batch — {dropped} row(s) discarded")
+                }
+            },
         }
     }
 
@@ -401,10 +429,43 @@ impl OrderLegPnlWriter {
         let dropped = self.pending;
         if dropped > 0 {
             metrics::counter!("tv_order_leg_pnl_rows_discarded_total").increment(dropped as u64);
+            metrics::counter!(
+                "tv_order_audit_chain_lost_total",
+                "source" => "order_leg_pnl_discarded"
+            )
+            .increment(dropped as u64);
         }
         self.buffer.clear();
         self.pending = 0;
+        self.committed_len = 0;
         dropped
+    }
+
+    /// Writes the pending rows to the disk tier (audit PR42b) and returns how
+    /// many were spilled, or discards them (counted) and returns `Err` with
+    /// how many were dropped when there is no spill target or it refused.
+    ///
+    /// Only the bytes of whole rows are written: `committed_len` is the buffer
+    /// length after the last fully appended row, so a row whose append failed
+    /// half-way never reaches the disk tier.
+    fn spill_or_discard(&mut self) -> std::result::Result<usize, usize> {
+        let rows = self.pending;
+        let len = self.committed_len.min(self.buffer.len());
+        let bytes = self.buffer.as_bytes().get(..len).unwrap_or_default();
+        if spill_failed_batch(self.spill.as_ref(), bytes, rows) {
+            self.buffer.clear();
+            self.pending = 0;
+            self.committed_len = 0;
+            return Ok(rows);
+        }
+        Err(self.discard_pending())
+    }
+
+    /// Points this writer's disk tier at `dir` (tests).
+    #[cfg(test)]
+    pub(crate) fn with_spill_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.spill = Some(AuditSpill::in_dir(SPILL_TABLE, dir));
+        self
     }
 }
 
@@ -538,5 +599,48 @@ mod tests {
         let floored = ist_midnight_nanos(ts);
         assert_eq!(floored % NANOS_PER_DAY, 0);
         assert!(ts - floored < NANOS_PER_DAY);
+    }
+
+    // Audit PR42b: a failed flush goes to the disk tier, not the bin.
+
+    #[test]
+    fn test_order_leg_pnl_failed_flush_spills_and_reports_ok() {
+        let dir = crate::audit_spill::test_support::TestDir::new();
+        let mut w = OrderLegPnlWriter::for_test().with_spill_dir(dir.path().to_path_buf());
+        w.append(&sample_record()).expect("append");
+        let expected = w.buffer.as_bytes().to_vec();
+        w.flush().expect("a spilled batch is not an error");
+        assert_eq!(w.pending(), 0);
+        let files = crate::tick_spill_replay::list_spill_files(dir.path());
+        assert_eq!(files.len(), 1);
+        assert_eq!(std::fs::read(&files[0]).expect("read"), expected);
+    }
+
+    #[test]
+    fn test_order_leg_pnl_refused_spill_still_discards_and_errors() {
+        let dir = crate::audit_spill::test_support::TestDir::new();
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, b"x").expect("write");
+        let mut w = OrderLegPnlWriter::for_test().with_spill_dir(blocker);
+        w.append(&sample_record()).expect("append");
+        let err = w.flush().expect_err("a refused spill is a loss");
+        assert!(err.to_string().contains("discarded"));
+        assert_eq!(w.pending(), 0);
+    }
+
+    #[test]
+    fn test_order_leg_pnl_writer_new_spills_to_the_production_dir() {
+        let cfg = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 1,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        let w = OrderLegPnlWriter::new(&cfg);
+        assert_eq!(
+            w.spill.as_ref().map(|s| s.dir().to_path_buf()),
+            Some(std::path::PathBuf::from("data/spill/audit/order_leg_pnl"))
+        );
+        assert!(OrderLegPnlWriter::for_test().spill.is_none());
     }
 }

@@ -267,14 +267,19 @@ pub async fn run_live_table_ddl_at_boot(questdb: &QuestDbConfig) -> bool {
         // security_id, segment`) and every replayed snapshot would duplicate.
         let volume_ok =
             tickvault_storage::top_volume_rank_persistence::ensure_top_volume_tables(questdb).await;
+        // 2026-10-02 (item 45h): `feed_aux_packets` rides the tick writer's
+        // buffer, so it must carry its 6-key DEDUP before the first frame too.
+        let feed_aux_ok =
+            tickvault_storage::feed_aux_persistence::ensure_feed_aux_table(questdb).await;
         // 2026-09-22 (SECOND): no view re-ensure here any more. The app
         // creates NO view; the retired ones are dropped once, before any table
         // DDL, by `run_candle_ddl_at_boot`.
-        if ticks_ok && depth_ok && volume_ok {
+        if ticks_ok && depth_ok && volume_ok && feed_aux_ok {
             info!(
                 attempt,
                 "live-table DDL boot complete — ticks (5-key DEDUP) + market_depth \
-                 (depth_kind DEDUP) + top_volume_1s/3s/5s/1m (6-key DEDUP each) ensured."
+                 (depth_kind DEDUP) + top_volume_1s/3s/5s/1m (6-key DEDUP each) + \
+                 feed_aux_packets (6-key DEDUP) ensured."
             );
             return true;
         }
@@ -285,6 +290,7 @@ pub async fn run_live_table_ddl_at_boot(questdb: &QuestDbConfig) -> bool {
                 ticks_ok,
                 depth_ok,
                 volume_ok,
+                feed_aux_ok,
                 backoff_secs = LIVE_TABLE_DDL_BACKOFF_SECS,
                 "live-table DDL refused — retrying so the session does not run on an \
                  ILP-auto-created table with the DEDUP key missing"
@@ -296,7 +302,7 @@ pub async fn run_live_table_ddl_at_boot(questdb: &QuestDbConfig) -> bool {
         code = tickvault_common::error_code::ErrorCode::HotPath02WriterQueueDrop.code_str(),
         attempts = LIVE_TABLE_DDL_ATTEMPTS,
         backoff_secs = LIVE_TABLE_DDL_BACKOFF_SECS,
-        "live-table DDL boot EXHAUSTED — ticks, market_depth and/or a top_volume_<tf> table could not be \
+        "live-table DDL boot EXHAUSTED — ticks, market_depth, feed_aux_packets and/or a top_volume_<tf> table could not be \
          ensured. Consequence: the first ILP write may auto-create the table \
          WITHOUT its DEDUP key — a replay then duplicates ticks and the two depth \
          pools overwrite each other's levels. The ensure keeps re-running in the \
@@ -358,7 +364,9 @@ async fn ensure_tables_once(questdb: &QuestDbConfig, tables: DdlTables) -> bool 
             let volume_ok =
                 tickvault_storage::top_volume_rank_persistence::ensure_top_volume_tables(questdb)
                     .await;
-            ticks_ok && depth_ok && volume_ok
+            let feed_aux_ok =
+                tickvault_storage::feed_aux_persistence::ensure_feed_aux_table(questdb).await;
+            ticks_ok && depth_ok && volume_ok && feed_aux_ok
         }
     }
 }

@@ -202,6 +202,35 @@ pub struct ApplicationConfig {
     /// behavior only (the engine's hardcoded `dry_run` blocks live POSTs).
     #[serde(default)]
     pub exit_orders: ExitOrdersConfig,
+    /// `[raw_frame_archive]` — raw WAL segments copied to the cold S3 bucket
+    /// and verified before any local delete (plan item 45e-1, operator Quotes
+    /// 27 + 28, 2026-09-29). Absent section ⇒ the upload IS required (fail
+    /// closed: the safe direction is keeping capture on disk).
+    #[serde(default)]
+    pub raw_frame_archive: RawFrameArchiveConfig,
+}
+
+/// `[raw_frame_archive]` — the raw WAL segment upload gate (plan item 45e-1).
+#[derive(Debug, Clone, Deserialize)]
+pub struct RawFrameArchiveConfig {
+    /// Every WAL prune pass (age, byte ceiling, 5% disk floor) deletes a
+    /// segment only when a verified copy of it is recorded in the cold bucket.
+    /// Default `true`. Set `false` ONLY on a box with no bucket (a dev box) —
+    /// with it off, capture can be deleted with no copy anywhere.
+    #[serde(default = "default_require_upload_before_prune")]
+    pub require_upload_before_prune: bool,
+}
+
+const fn default_require_upload_before_prune() -> bool {
+    true
+}
+
+impl Default for RawFrameArchiveConfig {
+    fn default() -> Self {
+        Self {
+            require_upload_before_prune: default_require_upload_before_prune(),
+        }
+    }
 }
 
 /// `[order_runtime]` — dry-run order-runtime configuration (2026-07-14).
@@ -1076,6 +1105,19 @@ pub struct DhanUniverseConfig {
     /// visible in the boot log.
     #[serde(default)]
     pub live_subscription_from_master: bool,
+
+    /// How many near-the-money option contracts get a SECOND, backup copy on
+    /// another main-feed socket, so a dropped socket does not cost their
+    /// ticks. `0` disables it. Default 1,000 (operator, 2026-10-02 —
+    /// `websocket-connection-scope-lock.md`, "2026-10-02 — A BACKUP COPY OF
+    /// THE TOP CONTRACTS"). Only free slots are used: the effective count is
+    /// `min(this, room on the backup socket)`.
+    #[serde(default = "default_main_feed_backup_top_n")]
+    pub backup_top_n: usize,
+}
+
+const fn default_main_feed_backup_top_n() -> usize {
+    1_000
 }
 
 const fn default_dhan_universe_target_secs() -> u32 {
@@ -1095,6 +1137,7 @@ impl Default for DhanUniverseConfig {
             live_subscription_from_master: false,
             spot_universe_fno_underlyings_only: false,
             spot_universe_ntm_only: false,
+            backup_top_n: default_main_feed_backup_top_n(),
         }
     }
 }
@@ -3591,6 +3634,7 @@ mod tests {
             dhan_universe: DhanUniverseConfig::default(),
             dhan_margin_gate: DhanMarginGateConfig::default(),
             exit_orders: ExitOrdersConfig::default(),
+            raw_frame_archive: RawFrameArchiveConfig::default(),
         }
     }
 
@@ -4650,6 +4694,29 @@ mod tests {
     }
 
     #[test]
+    fn test_dhan_universe_backup_top_n_defaults_to_1000_and_zero_disables() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            dhan_universe: DhanUniverseConfig,
+        }
+        // A section written before the key existed reads the operator's 1,000.
+        let absent: Wrapper = Figment::new()
+            .merge(Toml::string("[dhan_universe]\nenabled = true\n"))
+            .extract()
+            .expect("absent backup_top_n must default");
+        assert_eq!(absent.dhan_universe.backup_top_n, 1_000);
+        assert_eq!(DhanUniverseConfig::default().backup_top_n, 1_000);
+        let off: Wrapper = Figment::new()
+            .merge(Toml::string("[dhan_universe]\nbackup_top_n = 0\n"))
+            .extract()
+            .expect("0 parses");
+        assert_eq!(off.dhan_universe.backup_top_n, 0);
+    }
+
+    #[test]
     fn test_oms_reconcile_config_serde_defaults_and_round_trip() {
         use figment::Figment;
         use figment::providers::{Format, Toml};
@@ -5081,6 +5148,22 @@ mod tests {
             config.validate().is_ok(),
             "a DISABLED order_runtime section is never rejected"
         );
+    }
+
+    /// `[raw_frame_archive]` keeps the upload-before-prune gate ON unless
+    /// the operator writes `false` explicitly (plan item 45e-1).
+    #[test]
+    fn test_raw_frame_archive_requires_upload_unless_explicitly_off() {
+        assert!(RawFrameArchiveConfig::default().require_upload_before_prune);
+        let empty: RawFrameArchiveConfig =
+            toml::from_str("").expect("empty section must parse via defaults");
+        assert!(
+            empty.require_upload_before_prune,
+            "an absent key must keep the upload gate ON (fail closed)"
+        );
+        let off: RawFrameArchiveConfig =
+            toml::from_str("require_upload_before_prune = false").expect("explicit off parses");
+        assert!(!off.require_upload_before_prune);
     }
 
     /// 🔷 DHAN exit-order layer (Cluster B, 2026-07-14): the

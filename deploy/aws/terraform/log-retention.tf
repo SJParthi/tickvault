@@ -78,7 +78,7 @@ resource "aws_cloudwatch_metric_alarm" "logs_ingestion_runaway" {
 # ingestion — silence IS missing data — so treat_missing_data must be
 # "breaching" for this alarm to detect anything at all. That makes it a
 # guaranteed false-pager while the box is intentionally stopped (nightly /
-# weekend / weekday-NSE-holiday self-stop via holiday-gate.sh), so actions are
+# weekend / weekday-NSE-holiday self-stop via the holiday gate), so actions are
 # OFF by default and window-gated: the market-hours gate Lambda
 # (market-hours-liveness-alarm.tf) enables them 09:20-15:35 IST Mon-Fri —
 # and, per the 2026-07-07 review fix, ONLY after verifying the tv-app

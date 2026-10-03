@@ -508,3 +508,111 @@ fn boot_units_never_run_the_rollback_restored_binary() {
          pre-port binary into the boot units"
     );
 }
+
+/// The holiday gate (audit D6c) is the second boot unit on the subcommand
+/// binary, with one extra hazard: it is copied into /etc/systemd/system by the
+/// deploy, so the deploy must copy it only AFTER `bin/tickvault-host` holds a
+/// binary that knows `holiday-gate`. A deploy that fails its smoke test stops
+/// before the copy and leaves the previous unit in place.
+#[test]
+fn holiday_gate_unit_runs_the_subcommand_binary_and_is_copied_after_it() {
+    const HOLIDAY_UNIT: &str = "deploy/systemd/tickvault-holiday-gate.service";
+    let unit = read(HOLIDAY_UNIT);
+    let exec: Vec<&str> = unit.lines().filter(|l| l.starts_with("Exec")).collect();
+    assert_eq!(
+        exec,
+        ["ExecStart=-/opt/tickvault/bin/tickvault-host holiday-gate"],
+        "{HOLIDAY_UNIT} must run exactly the subcommand, from the rollback-proof \
+         copy, fail-open when the copy is missing"
+    );
+    assert!(
+        unit.lines().any(|l| l.starts_with("TimeoutStartSec=")),
+        "{HOLIDAY_UNIT} has no start timeout; tickvault.service waits behind it"
+    );
+
+    let deploy = read(DEPLOY);
+    let install = deploy
+        .find("install -m 0755 -o root -g root bin/tickvault bin/tickvault-host")
+        .expect("the deploy no longer installs bin/tickvault-host");
+    let copy = deploy
+        .find("cp -f repo/deploy/systemd/tickvault-holiday-gate.service")
+        .expect("the deploy no longer refreshes the holiday-gate unit");
+    assert!(
+        install < copy,
+        "the deploy copies the holiday-gate unit before bin/tickvault-host is \
+         refreshed, so a failed deploy can leave the new unit calling an older \
+         copy that would boot the whole app instead of the gate"
+    );
+}
+
+/// The QuestDB self-heal (audit D6d) runs from the app unit itself, as an
+/// `ExecStartPre`. The same two hazards as the holiday gate apply: it must
+/// call the rollback-proof copy, and the deploy must copy `tickvault.service`
+/// only after that copy knows `ensure-questdb`. The operator console also
+/// calls it over SSM, and its Lambda can deploy before the box, so every
+/// console call must first check the installed binary for the subcommand's
+/// log prefix, which no older binary contains.
+#[test]
+fn ensure_questdb_runs_the_subcommand_binary_and_every_caller_checks_for_it() {
+    const APP_UNIT: &str = "deploy/systemd/tickvault.service";
+    let unit = read(APP_UNIT);
+    let pre: Vec<&str> = unit
+        .lines()
+        .filter(|l| l.starts_with("ExecStartPre=") && l.contains("ensure-questdb"))
+        .collect();
+    assert_eq!(
+        pre,
+        ["ExecStartPre=-/opt/tickvault/bin/tickvault-host ensure-questdb"],
+        "{APP_UNIT} must run exactly the subcommand, from the rollback-proof \
+         copy, fail-open (the app's own compose ladder still runs)"
+    );
+    let live: Vec<&str> = unit
+        .lines()
+        .filter(|l| !l.starts_with('#') && l.contains("ensure-questdb.sh"))
+        .collect();
+    assert!(
+        live.is_empty(),
+        "{APP_UNIT} still calls the deleted script: {live:?}"
+    );
+
+    let deploy = read(DEPLOY);
+    let install = deploy
+        .find("install -m 0755 -o root -g root bin/tickvault bin/tickvault-host")
+        .expect("the deploy no longer installs bin/tickvault-host");
+    let copy = deploy
+        .find("cp -f repo/deploy/systemd/tickvault.service")
+        .expect("the deploy no longer refreshes the app unit");
+    assert!(
+        install < copy,
+        "the deploy copies tickvault.service before bin/tickvault-host is \
+         refreshed, so a failed deploy can leave the new ExecStartPre calling \
+         an older copy that would boot the whole app as a pre-step"
+    );
+
+    let marker = tickvault_app::ensure_questdb::LOG_PREFIX;
+    let guard = format!("grep -qaF '{marker}' /opt/tickvault/bin/tickvault-host");
+    for lambda in [
+        "crates/aws-lambdas/src/operator_control_action_commands.rs",
+        "crates/aws-lambdas/src/operator_control.rs",
+    ] {
+        let src = read(lambda);
+        for (n, line) in src.lines().enumerate() {
+            if line.contains("tickvault-host ensure-questdb")
+                && !line.trim_start().starts_with("//")
+                && !line.contains("assert")
+                && !line.contains("let call")
+            {
+                assert!(
+                    line.contains(&guard),
+                    "{lambda}:{} calls the subcommand without first checking \
+                     the installed binary for `{marker}`",
+                    n + 1
+                );
+            }
+        }
+    }
+    assert!(
+        read("crates/aws-lambdas/src/operator_control_action_commands.rs").contains(&guard),
+        "the console's self-heal command no longer checks the binary version"
+    );
+}

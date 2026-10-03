@@ -310,6 +310,7 @@ resource "aws_cloudwatch_metric_alarm" "order_fill_lag_high" {
 #   tv_order_audit_rows_discarded_total          -> crates/storage/src/order_audit_persistence.rs:479
 #   tv_order_audit_persist_errors_total          -> crates/app/src/order_observability.rs:564,575
 #                                                   crates/app/src/dhan_order_push_observability.rs:195,206
+#                                                   crates/storage/src/audit_spill.rs (run_drain_loop, stage=spill_backlog: rows waiting on disk for 30 min, once per backlog episode; ADDED 2026-10-01, audit PR42b)
 #   tv_order_update_events_dropped_total         -> crates/app/src/dhan_order_push_observability.rs:257
 #                                                   crates/trading/src/oms/groww/push/order_events.rs:384
 #   tv_order_update_events_persist_errors_total  -> crates/app/src/order_update_events_boot.rs:344,358,381,395
@@ -318,6 +319,18 @@ resource "aws_cloudwatch_metric_alarm" "order_fill_lag_high" {
 # All five are already in the EMF metric_selectors list in
 # user-data.sh.tftpl, so this adds NO new metric name and no new EMF cost —
 # it consumes five series we were already paying to ship.
+#
+# ADDED 2026-10-01 (audit PR42a) — a sixth leg, one counter for three losses
+# that no alarm saw:
+#   tv_order_audit_chain_lost_total{source}      -> crates/storage/src/pnl_audit_persistence.rs (discard_pending, source=pnl_audit_discarded)
+#                                                   crates/storage/src/order_leg_pnl_persistence.rs (discard_pending, source=order_leg_pnl_discarded)
+#                                                   crates/app/src/dhan_order_push_observability.rs (RecvError::Lagged, source=order_push_lagged)
+# ONE new EMF name rather than three (~$0.30/mo, not $0.90; aws-budget.md COST
+# NOTE 2026-10-01): the agent folds `source` into one summed series per host,
+# and the coded log line on each arm names which one it was. The per-writer
+# counters (tv_pnl_audit_rows_discarded_total,
+# tv_order_leg_pnl_rows_discarded_total, tv_dhan_order_push_lagged_total)
+# stay local on /metrics for the split.
 #
 # HONEST SCOPE: the order push channels run in PAPER mode today
 # (`[dhan_order_push] enabled`, `[groww_orders] order_push_enabled`, both
@@ -329,7 +342,7 @@ resource "aws_cloudwatch_metric_alarm" "order_audit_chain_loss" {
   # NOTE: AWS caps alarm_description at 1024 characters (terraform validate
   # failure, 2026-08-19). Long-form reasoning belongs in comments like this
   # one, which has no cap; the description is the pager text.
-  alarm_description = "SEBI order/position forensic chain LOST A ROW. Sums five counters: order_audit rows discarded, order_audit persist errors, order/position events dropped pre-persistence, order_update_events persist errors, order_update_events rows discarded. Five-year retention - these tables are the only record of what the system did with an order, and the broker event is not replayed. DO: (1) grep /tickvault/<env>/app for coded ORDER-AUDIT / ORDER-UPDATE lines - they name which mechanism, the stage (append vs flush) and the reason. (2) persist_errors points at QuestDB (ILP flush latency, WAL-suspended gauge); rows may still be re-appendable. (3) rows_discarded or events_dropped means it is already gone - record the window. Order push is receive-only PAPER today, so a breach now is the rehearsal failing, not live-order data."
+  alarm_description = "SEBI order/P&L forensic chain LOST A ROW, or rows are stuck on local disk. Sums six counters: order_audit rows discarded and persist errors, order/position events dropped, order_update_events persist errors and rows discarded, and one counter for pnl_audit / order_leg_pnl rows discarded and order-push updates skipped by a lagging consumer. Five-year retention, and the broker does not replay events. DO: (1) grep /tickvault/<env>/app for coded AUDIT-06 / ORDER-EVT / ORDER-PNL lines - they name the mechanism, stage and reason. (2) persist_errors points at QuestDB (ILP flush latency, WAL-suspended gauge); stage=spill_backlog means rows have waited 30 min on local disk under data/spill/audit - kept, not lost, but not yet in the database. (3) discarded, dropped or lagged means the rows are gone - record the window. Order push is receive-only PAPER today, so a breach now is the rehearsal failing, not live-order data."
 
   comparison_operator = "GreaterThanOrEqualToThreshold"
   threshold           = 1
@@ -347,16 +360,16 @@ resource "aws_cloudwatch_metric_alarm" "order_audit_chain_loss" {
   # restored when it was not (Rule 11, no false recovery).
   ok_actions = []
 
-  # Metric math: SUM of the five, with each leg's own metric NOT returned, so
+  # Metric math: SUM of the six (five until 2026-10-01), with each leg's own metric NOT returned, so
   # only the total drives the alarm state and CloudWatch charges for one alarm.
-  # FILL(m, 0) on each leg is load-bearing: an expression over five series
+  # FILL(m, 0) on each leg is load-bearing: an expression over several series
   # evaluates to no-data if ANY leg is missing, and a counter that never
   # incremented in the window legitimately has no sample — without FILL, the
-  # arithmetic would be silenced by the four healthy legs.
+  # arithmetic would be silenced by the healthy legs.
   metric_query {
     id          = "audit_loss_total"
-    expression  = "FILL(m1,0)+FILL(m2,0)+FILL(m3,0)+FILL(m4,0)+FILL(m5,0)"
-    label       = "order/position audit rows lost (all five mechanisms)"
+    expression  = "FILL(m1,0)+FILL(m2,0)+FILL(m3,0)+FILL(m4,0)+FILL(m5,0)+FILL(m6,0)"
+    label       = "order/P&L audit rows lost (all six legs)"
     return_data = true
   }
 
@@ -413,6 +426,18 @@ resource "aws_cloudwatch_metric_alarm" "order_audit_chain_loss" {
     return_data = false
     metric {
       metric_name = "tv_order_update_events_rows_discarded_total"
+      namespace   = local.app_namespace
+      period      = 300
+      stat        = "Sum"
+      dimensions  = local.app_dimensions
+    }
+  }
+
+  metric_query {
+    id          = "m6"
+    return_data = false
+    metric {
+      metric_name = "tv_order_audit_chain_lost_total"
       namespace   = local.app_namespace
       period      = 300
       stat        = "Sum"

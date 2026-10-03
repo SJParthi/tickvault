@@ -64,10 +64,15 @@
 //!
 //! # Honest limits (Rule 11)
 //!
-//! - **The data captured before this reset runs is DROPPED.** That is the
-//!   point of a fresh start. If a build without this module captured a session
-//!   first, that session's `ticks` / `market_depth` / candle / `top_volume`
-//!   rows go with it. None of them is a SEBI table.
+//! - **The data captured before this reset runs is RENAMED aside, not
+//!   dropped.** *(Changed 2026-10-02, plan item 45g D7, under the zero-loss
+//!   Quotes 27 + 28 — "no market-data delete, boot drops included, without a
+//!   verified copy".)* Until then a table whose rows were all older than the
+//!   first-boot marker was DROPPED. Now only a table QuestDB reports EMPTY is
+//!   dropped; every table holding rows goes to `<name>_pre_reset_<yyyymmdd>`,
+//!   so the fresh schema still starts empty and the old rows survive. Renamed
+//!   tables sit outside retention and cost disk until the operator removes
+//!   them by hand. None of them is a SEBI table.
 //! - **A refused in-session boot DEFERS the wipe.** The next out-of-session
 //!   boot RENAMES any table the in-session boot wrote into to
 //!   `<name>_pre_reset_<yyyymmdd>` (never drops it; see [`reset_action`]).
@@ -192,6 +197,7 @@ pub const SEBI_NEVER_RESET: &[&str] = &[
     "order_update_events",
     "position_update_events",
     "ws_event_audit",
+    "feed_gap_audit",
 ];
 
 /// Byte-wise `str` equality usable in a `const` context.
@@ -509,7 +515,9 @@ pub enum MarkerState {
 pub enum ResetAction {
     /// `DROP VIEW IF EXISTS` — the only statement a view name ever gets.
     DropView,
-    /// `DROP TABLE IF EXISTS` — only for a table provably older than the marker.
+    /// `DROP TABLE IF EXISTS` — only for a table QuestDB reports EMPTY. A table
+    /// holding rows, however old, is renamed, never dropped (plan item 45g D7:
+    /// no market data is deleted without a copy, Quotes 27 + 28).
     DropTable,
     /// `RENAME TABLE` to `<name>_pre_reset_<yyyymmdd>` — never a drop.
     Rename,
@@ -517,18 +525,25 @@ pub enum ResetAction {
     Skip,
 }
 
-/// Pure decision for one object. Fail-closed: anything not PROVABLY free of
-/// rows written after the marker is renamed, never dropped.
+/// Pure decision for one object. Fail-closed: only a table PROVABLY empty is
+/// dropped; anything holding rows, or unreadable, is renamed, never dropped.
+///
+/// (Plan item 45g D7, 2026-10-02: a table whose rows were all older than the
+/// marker used to be DROPPED. Those rows were captured market data with no
+/// copy, so it is now renamed like any other table with rows. The marker
+/// still matters to [`refine_rename`], which skips a table holding only rows
+/// written after the first boot.)
 #[must_use]
 pub const fn reset_action(kind: ObjectKind, newest: NewestRow, marker: MarkerState) -> ResetAction {
+    // The marker no longer decides a drop; it is read by `refine_rename`.
+    let _ = marker;
     match kind {
         ObjectKind::View => ResetAction::DropView,
         ObjectKind::Missing => ResetAction::Skip,
-        ObjectKind::Table => match (newest, marker) {
+        ObjectKind::Table => match newest {
             // An empty table has nothing to lose, marker or not.
-            (NewestRow::NoRows, _) => ResetAction::DropTable,
-            (NewestRow::At(t), MarkerState::Present(m)) if t < m => ResetAction::DropTable,
-            _ => ResetAction::Rename,
+            NewestRow::NoRows => ResetAction::DropTable,
+            NewestRow::At(_) | NewestRow::Unreadable => ResetAction::Rename,
         },
     }
 }
@@ -2007,7 +2022,8 @@ mod tests {
             (N::NoRows, M::Present(m), A::DropTable),
             (N::NoRows, M::Absent, A::DropTable),
             (N::NoRows, M::Unreadable, A::DropTable),
-            (N::At(m - 1), M::Present(m), A::DropTable),
+            // 45g D7: rows older than the marker are still market data.
+            (N::At(m - 1), M::Present(m), A::Rename),
             (N::At(m - 1), M::Absent, A::Rename),
             (N::At(m - 1), M::Unreadable, A::Rename),
             (N::At(m), M::Present(m), A::Rename),
@@ -2026,18 +2042,16 @@ mod tests {
     }
 
     proptest::proptest! {
-        /// Around the boundary: a table is dropped iff its newest row is
-        /// STRICTLY before the cutoff, and only when the marker is present.
+        /// Plan item 45g D7: a table holding ANY row is renamed, never
+        /// dropped, on either side of the marker and whatever the marker
+        /// state.
         #[test]
-        fn a_table_is_dropped_only_strictly_before_the_marker(
+        fn test_regression_a_table_with_rows_is_never_dropped(
             m in proptest::prelude::any::<i64>(),
-            d in -5_i64..=5,
+            d in proptest::prelude::any::<i64>(),
         ) {
             let t = m.saturating_add(d);
-            let got = reset_action(ObjectKind::Table, NewestRow::At(t), MarkerState::Present(m));
-            let want = if t < m { ResetAction::DropTable } else { ResetAction::Rename };
-            proptest::prop_assert_eq!(got, want);
-            for mk in [MarkerState::Absent, MarkerState::Unreadable] {
+            for mk in [MarkerState::Present(m), MarkerState::Absent, MarkerState::Unreadable] {
                 proptest::prop_assert_eq!(
                     reset_action(ObjectKind::Table, NewestRow::At(t), mk),
                     ResetAction::Rename
@@ -2202,10 +2216,12 @@ mod tests {
         );
         assert!(renames_of(&m, "ticks")[0].contains(&format!("'ticks_pre_reset_{RUN_DATE}'")));
         assert_eq!(seen_matching(&m, "DROP TABLE IF EXISTS ticks;"), 0);
+        // 45g D7: pre-marker rows are market data too, renamed aside.
+        assert_eq!(seen_matching(&m, "DROP TABLE IF EXISTS candles_1m;"), 0);
         assert_eq!(
-            seen_matching(&m, "DROP TABLE IF EXISTS candles_1m;"),
+            renames_of(&m, "candles_1m").len(),
             1,
-            "a table holding only pre-marker rows is still dropped"
+            "a table holding only pre-marker rows is renamed aside, never dropped"
         );
         assert_eq!(id_inserts(&m), 1);
         assert_eq!(
@@ -2241,7 +2257,8 @@ mod tests {
             "a table whose OLDEST row is post-marker is already fresh — never renamed"
         );
         assert_eq!(seen_matching(&m, "DROP TABLE IF EXISTS ticks;"), 0);
-        assert_eq!(seen_matching(&m, "DROP TABLE IF EXISTS candles_1m;"), 1);
+        assert_eq!(seen_matching(&m, "DROP TABLE IF EXISTS candles_1m;"), 0);
+        assert_eq!(renames_of(&m, "candles_1m").len(), 1);
         assert_eq!(id_inserts(&m), 1);
     }
 
@@ -2283,9 +2300,11 @@ mod tests {
     }
 
     /// The normal first boot (marker written THIS boot): rows from a
-    /// previous session are older than the cutoff and are dropped.
+    /// previous session are older than the cutoff. Until 2026-10-02 they
+    /// were dropped; under plan item 45g D7 every table holding them is
+    /// renamed aside and only the views are dropped.
     #[tokio::test]
-    async fn a_first_boot_run_still_drops_old_rows() {
+    async fn test_regression_a_first_boot_run_renames_old_rows_aside() {
         fn ancient(_: &str) -> Newest {
             Newest::Rows(9, Some(0))
         }
@@ -2298,8 +2317,13 @@ mod tests {
             run_fresh_start_reset_with(&client(), &url(&m), EVENING_UTC).await,
             ResetDecision::Run
         );
-        assert_eq!(seen_matching(&m, "RENAME"), 0);
-        assert_eq!(drops_seen(&m), drop_statements().len());
+        assert_eq!(
+            seen_matching(&m, "DROP TABLE"),
+            0,
+            "no table with rows is dropped"
+        );
+        assert_eq!(drops_seen(&m), RESET_VIEWS.len());
+        assert_eq!(seen_matching(&m, "RENAME TABLE"), RESET_TABLES.len());
         assert_eq!(id_inserts(&m), 1);
     }
 

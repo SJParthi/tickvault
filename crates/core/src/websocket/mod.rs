@@ -57,6 +57,7 @@ pub mod pool_budget;
 // (`DhanFeedSocket`) so every decision branch is unit-testable without a
 // network. Spawned by `tickvault_app::dhan_feed_stack`, DEFAULT-OFF.
 pub mod pool_supervisor;
+pub mod reader_runtime;
 pub mod reconnect_ladder;
 // Rebuilt 2026-08-11 with the operator-approved 16-connection revival
 // (websocket-connection-scope-lock.md, the two 2026-08-09 sections). Deleted

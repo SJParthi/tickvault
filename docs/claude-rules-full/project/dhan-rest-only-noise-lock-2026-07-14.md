@@ -4364,3 +4364,75 @@ endpoint, and the log line carries the numbers the page needs.
   chose the wait over both.
 - Routes this condition through `AGGREGATOR-DROP-01`. A wait is not a loss, and
   that page's text says candles were dropped.
+
+## §2.8 — 2026-10-02: a STALLED hot step on the Dhan live path gets a phone page (`HOT-PATH-STALL-01`)
+
+**The operator's words, verbatim (typos included), and what each answered:**
+
+1. Parthi, 2026-10-02 11:51:46Z, project chat: *"go ahea ddude"* — replying to a
+   post that listed five pending decisions, one of them "a phone (Telegram)
+   alert when a hot step stalls" with a recommended option.
+2. Parthi, 2026-10-02 11:51:57Z, the work thread: *"dont b;ock go ahea ddude"*.
+3. Parthi, 2026-10-02 12:40:54Z, project chat: *"go ahead approved everyhtign
+   dude okay?"* — a direct reply to a post that said "The phone alert and core
+   pinning still wait for you to reply there with \"approve stall alarm and
+   libc dependency\"."
+
+Quote 3 answers an ENUMERATED ask that names this page, so it is accepted in
+the same shape §2.6 and §2.7 accept a go-ahead on an enumerated option. It
+authorizes this ONE page and nothing wider. This dated row is the §3 record,
+written in the same change as the terraform and before it can deploy.
+
+**The condition.** The `tv-telemetry` OS thread (2026-10-02, Prometheus-only
+until now) already publishes per-task heartbeat ages and per-stage latency once
+a second. In session (09:00–15:40 IST) it now also checks seven signals: the
+heartbeat of the main tokio runtime, of the socket-reader runtime and of the
+frame drain, and the window's longest sample of the four hot-path stages
+(socket → WAL hand-off, ring dwell, main and reader runtime wake lag). A
+heartbeat at least `STALL_PAGE_SECS` (2 s) old, or a stage sample that long,
+starts an episode. The first stalled signal writes ONE coded line; it stays
+silent until it clears and then re-arms. At most one line per minute;
+episodes that start and end while the line is held back are counted into the
+next line. The socket reader's own heartbeat and the two ILP writer threads
+are NOT watched: the first ages whenever no frame arrives, the second run
+behind a queue off the socket path.
+
+| Alarm | Signal | Fires when | Why this shape |
+|---|---|---|---|
+| `tv-<env>-errcode-hot-path-stall-01` | log filter `{ $.code = "HOT-PATH-STALL-01" && $.level = "ERROR" }` | one line in one 300 s period | A 2 s stall is 20 missed probe beats and four missed drain flush ticks, yet far inside the 40 s Dhan waits before closing a socket that stopped answering pings. |
+
+`treat_missing_data = notBreaching`, NO `ok_actions`, no dimension (no
+per-connection, no per-instrument). The Telegram line names the broker:
+"🔷 DHAN: the live market data path stalled for 2 seconds or more — some
+prices may have been skipped; check the server". No EMF name is added.
+
+**Honest cost (AWS list price, ap-south-1):** +1 log metric filter (no charge
+for the filter) and +1 standard alarm at **$0.10 per alarm per month**. The
+filter's custom metric is **$0.30 per metric per month, prorated by the hour
+and charged only in hours it receives data**, so about $0 in a month with no
+stall. Total about **$0.10/mo**, at most **$0.40/mo** in a month where it
+fires every hour.
+
+**NOT claimed:**
+- That the page fires DURING a total freeze. If the whole process stops, this
+  thread stops too; the liveness alarms that treat missing data as breaching
+  cover that.
+- That 2 s is measured-optimal. No session has a baseline of these signals
+  yet. Changing it needs a measured baseline and its own dated row.
+- That a page proves ticks were lost. It proves the wait.
+- Coverage before 09:00 or after 15:40 IST: boot-time stalls and post-close
+  work never page.
+
+**What a PR that violates §2.8 looks like (REJECT):**
+- Adds `ok_actions` to the stall alarm, or a per-connection or per-instrument
+  dimension.
+- Emits the line level-triggered (every second while stalled) or more than
+  once a minute.
+- Pages on the 100 µs / 100 ms / 10 ms stage budgets; those count small
+  stalls for the dashboard and would page all day.
+- Watches the socket reader heartbeat or the ILP writer heartbeats without a
+  dated row here first.
+- Runs the check on a tokio runtime instead of the dedicated OS thread (a
+  wedged runtime would then hide its own stall).
+- Removes the 09:00–15:40 IST gate, or drops the broker name from the
+  Telegram line.

@@ -465,16 +465,21 @@ impl SealEscalationSink {
                 // shutdown, where every syscall counts against the budget.
                 for item in run {
                     let record = crate::seal_dlq::SealDlqRecord::from(&item.seal);
-                    if self.dlq.append_record(&record, item.now_unix_secs).is_err() {
+                    if self.dlq.append_record(&record, item.now_unix_secs).is_ok() {
+                        // Z6: a fuller copy committed later must be mirrored
+                        // to the spill, so the boot drain ends on it.
+                        self.spill.note_dead_lettered(&item.seal);
+                    } else {
                         metrics::counter!(SEAL_ESCALATION_LOST_COUNTER).increment(1);
                         on_lost(&item.seal);
                     }
                 }
             }
             // Written, sent to the DLQ or reported lost: either way no longer
-            // waiting in the queue.
-            self.pending
-                .fetch_sub(run_written, std::sync::atomic::Ordering::Relaxed);
+            // waiting in the queue. Through the spill (Z6), which raises its
+            // finished count before lowering the pending one, so its ledger
+            // never forgets a bar an older queued copy could still reach.
+            self.spill.note_escalation_finished(run_written);
             start = end;
         }
         spill_writes
@@ -572,28 +577,18 @@ pub enum OverflowOutcome {
 
 impl SealOverflow {
     /// Build an escalator over an existing pipeline's writers.
+    ///
+    /// The queued-seal count is the spill writer's own (audit PR40a, Z6), so
+    /// [`SealWriterRunner::unwritten_seals`] counts the escalation queue
+    /// without a handle to the thread, and the spill ledger can tell whether
+    /// an older copy of a bar may still be on its way to the spill. Every
+    /// escalator over one spill shares that one count.
     #[must_use]
     pub fn new(
         spill: std::sync::Arc<crate::seal_spill::SealSpillWriter>,
         dlq: std::sync::Arc<crate::seal_dlq::SealDlqWriter>,
     ) -> Self {
-        Self::with_pending(
-            spill,
-            dlq,
-            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        )
-    }
-
-    /// Build an escalator whose queued-seal count is shared with its caller
-    /// (audit PR40a). [`SealWriterRunner::overflow`] passes its own counter,
-    /// so the writer can include the escalation queue in
-    /// [`SealWriterRunner::unwritten_seals`] without a handle to the thread.
-    #[must_use]
-    pub fn with_pending(
-        spill: std::sync::Arc<crate::seal_spill::SealSpillWriter>,
-        dlq: std::sync::Arc<crate::seal_dlq::SealDlqWriter>,
-        pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    ) -> Self {
+        let pending = spill.escalation_pending();
         Self {
             spill,
             dlq,
@@ -661,6 +656,10 @@ impl SealOverflow {
         }
         let record = crate::seal_dlq::SealDlqRecord::from(serialised);
         if dlq.append_record(&record, now_unix_secs).is_ok() {
+            // Z6: recorded so a fuller copy committed later is mirrored to
+            // the spill. One more spill-lock probe, on a path that has just
+            // paid two file writes.
+            spill.note_dead_lettered(serialised);
             return OverflowOutcome::DlqWritten;
         }
         OverflowOutcome::Lost
@@ -953,8 +952,9 @@ pub struct SealWriterRunner {
     spill: std::sync::Arc<SealSpillWriter>,
     /// Mid-session replay of the spill (audit PR15).
     replay: MidSessionReplay,
-    /// Seals queued to the escalation thread and not yet on disk, shared with
-    /// the [`SealOverflow`] that [`Self::overflow`] builds (audit PR40a).
+    /// Seals queued to the escalation thread and not yet on disk: the spill
+    /// writer's own count, which the [`SealOverflow`] that [`Self::overflow`]
+    /// builds shares (audit PR40a, Z6).
     escalation_pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -978,9 +978,9 @@ impl SealWriterRunner {
             max_drain_per_cycle,
             spill_dir: production_spill_dir(),
             dlq_dir: production_dlq_dir(),
-            spill,
             replay: MidSessionReplay::default(),
-            escalation_pending: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            escalation_pending: spill.escalation_pending(),
+            spill,
         })
     }
 
@@ -1032,9 +1032,9 @@ impl SealWriterRunner {
             max_drain_per_cycle,
             spill_dir,
             dlq_dir,
-            spill,
             replay: MidSessionReplay::default(),
-            escalation_pending: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            escalation_pending: spill.escalation_pending(),
+            spill,
         }
     }
 
@@ -1082,11 +1082,7 @@ impl SealWriterRunner {
     /// installs belong on adjacent lines.
     #[must_use]
     pub fn overflow(&self) -> SealOverflow {
-        SealOverflow::with_pending(
-            self.pipeline.spill_handle(),
-            self.pipeline.dlq_handle(),
-            std::sync::Arc::clone(&self.escalation_pending),
-        )
+        SealOverflow::new(self.pipeline.spill_handle(), self.pipeline.dlq_handle())
     }
 
     /// Currently buffered ring depth (item observed by future
@@ -1907,6 +1903,7 @@ mod tests {
             spill_writer.with_appends_paused(|| {
                 entered_tx.send(()).expect("test channel open");
                 std::thread::sleep(held);
+                ((), false)
             });
         });
         entered_rx.recv().expect("the holder took the spill lock");
@@ -2746,6 +2743,112 @@ mod tests {
         );
         let got: std::collections::BTreeSet<i64> = seen.keys().copied().collect();
         assert_eq!(got, expected, "every seal acknowledged, none invented");
+        cleanup(&spill, &dlq);
+    }
+
+    // -----------------------------------------------------------------------
+    // Z6 — an older copy never lands after a fuller one committed live
+    // -----------------------------------------------------------------------
+
+    /// One copy of the same 1-minute bar with `ticks` ticks.
+    fn z6_copy(ticks: u32) -> BufferedSeal {
+        let mut seal = mk_seal(13, 2, TfIndex::M1, 34_260, 99.0);
+        seal.state.tick_count = ticks;
+        seal
+    }
+
+    /// Point the spill directory at a regular file so every spill write
+    /// fails, as on a dead disk.
+    fn z6_block_spill(spill: &std::path::Path) {
+        let _ = std::fs::remove_dir_all(spill);
+        std::fs::write(spill, b"not a directory").expect("block the spill dir");
+    }
+
+    fn z6_unblock_spill(spill: &std::path::Path) {
+        std::fs::remove_file(spill).expect("unblock");
+        std::fs::create_dir_all(spill).expect("spill dir");
+    }
+
+    /// Path B: the original is still in the escalation queue when its amend
+    /// commits live. The old ledger had nothing on disk to compare with, so
+    /// the escalation thread then wrote the original into the spill, and the
+    /// next replay put it over the amend.
+    #[test]
+    fn test_regression_z6_original_in_escalation_queue_is_not_written_after_live_amend() {
+        let (spill, dlq) = temp_pair("z6-path-b");
+        let runner = SealWriterRunner::for_test(spill.clone(), dlq.clone(), 16, 16, 16);
+        let mut overflow = runner.overflow();
+        let sink = overflow.split_escalation_offload();
+        let now = jan1_noon_utc();
+
+        assert_eq!(overflow.escalate(&z6_copy(4), now), OverflowOutcome::Queued);
+        assert_eq!(
+            runner.unwritten_seals(),
+            1,
+            "the runner and the spill share one queue count"
+        );
+        // The amend commits live while the original waits in the queue.
+        assert_eq!(runner.pipeline.note_live_commits(&[z6_copy(5)], now), 0);
+
+        drop(overflow);
+        let summary = sink.run(|_| panic!("no seal may be lost"));
+        assert_eq!(summary.records, 1);
+        assert_eq!(runner.unwritten_seals(), 0);
+        let on_disk = runner.spill.read_all(now).expect("read spill");
+        assert!(
+            on_disk.iter().all(|seal| seal.tick_count >= 5),
+            "the queued original reached the spill after its amend committed: {on_disk:?}"
+        );
+        cleanup(&spill, &dlq);
+    }
+
+    /// Path C, inline: the original went to the dead-letter file (the spill
+    /// was down). The old ledger never saw dead-letter writes, so the amend
+    /// committed later was not mirrored and the boot drain, reading the
+    /// dead-letter file, ended on the original.
+    #[test]
+    fn test_regression_z6_dead_lettered_original_mirrors_live_amend() {
+        let (spill, dlq) = temp_pair("z6-path-c-inline");
+        z6_block_spill(&spill);
+        let runner = SealWriterRunner::for_test(spill.clone(), dlq.clone(), 16, 16, 16);
+        let overflow = runner.overflow();
+        let now = jan1_noon_utc();
+        assert_eq!(
+            overflow.escalate(&z6_copy(4), now),
+            OverflowOutcome::DlqWritten
+        );
+
+        z6_unblock_spill(&spill);
+        assert_eq!(runner.pipeline.note_live_commits(&[z6_copy(5)], now), 1);
+        let on_disk = runner.spill.read_all(now).expect("read spill");
+        assert_eq!(on_disk.len(), 1);
+        assert_eq!(
+            on_disk[0].tick_count, 5,
+            "the amend is on disk for the boot drain"
+        );
+        cleanup(&spill, &dlq);
+    }
+
+    /// Path C through the escalation thread: a batch the spill refuses goes
+    /// to the dead-letter file record by record, and each is recorded.
+    #[test]
+    fn test_regression_z6_escalation_thread_dead_letter_mirrors_live_amend() {
+        let (spill, dlq) = temp_pair("z6-path-c-thread");
+        z6_block_spill(&spill);
+        let runner = SealWriterRunner::for_test(spill.clone(), dlq.clone(), 16, 16, 16);
+        let mut overflow = runner.overflow();
+        let sink = overflow.split_escalation_offload();
+        let now = jan1_noon_utc();
+        assert_eq!(overflow.escalate(&z6_copy(4), now), OverflowOutcome::Queued);
+        drop(overflow);
+        sink.run(|_| panic!("the dead-letter file is writable"));
+        assert_eq!(runner.unwritten_seals(), 0);
+
+        z6_unblock_spill(&spill);
+        assert_eq!(runner.pipeline.note_live_commits(&[z6_copy(5)], now), 1);
+        let on_disk = runner.spill.read_all(now).expect("read spill");
+        assert_eq!(on_disk.len(), 1);
+        assert_eq!(on_disk[0].tick_count, 5);
         cleanup(&spill, &dlq);
     }
 }

@@ -766,6 +766,11 @@ fn depth_spill_dir_bytes(dir: &Path) -> u64 {
 /// to the counted drop: **a spill that cannot be written must never mask the
 /// loss.** The spill filesystem is the one currently closest to full, so this
 /// arm is a live path, not a theoretical one.
+/// `sync`: `SPILL_SYNC_OFF_DRAIN` from the writer and rescue threads (the
+/// payload is `fdatasync`ed before `Ok`; Z8a, 2026-10-02),
+/// `SPILL_UNSYNCED_ON_DRAIN` from the drain's inline fallback, which must not
+/// block on the disk. A failed sync is an `Err` like a failed write, so the
+/// caller marks the range unapplied and counts the loss.
 fn spill_failed_depth_ilp(
     dir: &Path,
     payload: &[u8],
@@ -773,6 +778,7 @@ fn spill_failed_depth_ilp(
     now_unix_secs: i64,
     cap_bytes: u64,
     min_free_headroom_bytes: u64,
+    sync: Option<crate::tick_persistence::SpillSyncFn>,
 ) -> std::io::Result<PathBuf> {
     // O(1) EXEMPT: begin — cold path, runs only on a flush failure.
     std::fs::create_dir_all(dir)?;
@@ -942,6 +948,9 @@ fn spill_failed_depth_ilp(
         .open(&path)?;
     file.write_all(payload)?;
     file.flush()?;
+    if let Some(sync) = sync {
+        sync(&file)?;
+    }
     Ok(path)
     // O(1) EXEMPT: end
 }
@@ -1325,6 +1334,25 @@ impl DepthWriter {
         String::from_utf8(self.buffer.as_bytes().to_vec()).unwrap_or_default()
     }
 
+    /// Marks the pending rows as having NO write-ahead-log record behind them
+    /// (2026-10-02) — the depth twin of
+    /// `TickWriter::mark_pending_unbacked`.
+    ///
+    /// For a frame whose WAL append was REFUSED but which still entered the
+    /// ring. Its rows carry a non-zero capture sequence, so unmarked, a busy
+    /// rescue thread would hand them to a WAL replay that can never come.
+    /// Marked, they keep the inline spill. One `bool` store, no allocation.
+    pub fn mark_pending_unbacked(&mut self) {
+        self.pending_unbacked = true;
+    }
+
+    /// Whether the pending rows are marked as lacking WAL backing.
+    #[must_use]
+    // TEST-EXEMPT: accessor, asserted by `mark_pending_unbacked_keeps_depth_rows_in_the_inline_spill`.
+    pub fn pending_unbacked(&self) -> bool {
+        self.pending_unbacked
+    }
+
     /// Appends one prepared [`DepthRow`] to the ILP buffer (no flush).
     ///
     /// ILP requires every SYMBOL before any field column, so the four symbols
@@ -1683,16 +1711,27 @@ impl DepthWriter {
         let mut rescue_unavailable = false;
         if let Some(tx) = self.rescue.as_ref() {
             let protocol = self.buffer.protocol_version();
+            // Z7 (2026-10-02): hold the PERSISTED watermark below this batch
+            // until the rescue thread has synced it (or failed and marked it);
+            // see `TickPersistenceWriter::discard_pending`. At most 8 CASes,
+            // no allocation, no lock.
+            let wm = crate::wal_applied_watermark::applied_watermark();
+            let floor = wm.hold_rescue_floor(
+                crate::wal_applied_watermark::AppliedSink::Depth,
+                range.0,
+                range.1,
+            );
             let batch = DepthRescueBatch {
                 buffer: std::mem::replace(&mut self.buffer, Buffer::new(protocol)),
                 rows,
                 min_seq: range.0,
                 max_seq: range.1,
+                floor,
             };
             match tx.try_send(batch) {
                 Ok(()) => {
                     self.flush_counters.rescue_queued.increment(rows as u64);
-                    crate::wal_applied_watermark::applied_watermark().note_depth_handed_off();
+                    wm.note_depth_handed_off();
                     // Counted as rescued HERE, not on the thread, because the
                     // caller's log-wording branch reads this field one line
                     // after the call and a queued payload IS on its way to the
@@ -1708,11 +1747,19 @@ impl DepthWriter {
                     return rows;
                 }
                 Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                    // Never reached the thread: retract its floor; the arms
+                    // below mark or spill the range themselves.
+                    if let Some(floor) = returned.floor {
+                        wm.release_rescue_floor(floor);
+                    }
                     self.buffer = returned.buffer;
                     self.flush_counters.rescue_fallback_queue_full.increment(1);
                     rescue_unavailable = true;
                 }
                 Err(std::sync::mpsc::TrySendError::Disconnected(returned)) => {
+                    if let Some(floor) = returned.floor {
+                        wm.release_rescue_floor(floor);
+                    }
                     self.buffer = returned.buffer;
                     self.flush_counters.rescue_fallback_thread_gone.increment(1);
                     rescue_unavailable = true;
@@ -1751,12 +1798,14 @@ impl DepthWriter {
             return rows;
         }
 
+        // The drain's inline spill is NOT synced (see `SPILL_UNSYNCED_ON_DRAIN`).
         let landed = perform_depth_rescue(
             &self.spill_dir,
             self.buffer.as_bytes(),
             self.feed,
             rows,
             self.spill_min_free_headroom,
+            crate::tick_persistence::SPILL_UNSYNCED_ON_DRAIN,
         );
         note_rescue_outcome_depth(landed, range, false);
         if landed {
@@ -1824,6 +1873,7 @@ impl DepthWriter {
             spill_dir: self.spill_dir.clone(), // APPROVED: PathBuf moved into the rescue offload writer, once per process
             spill_min_free_headroom: self.spill_min_free_headroom,
             feed: self.feed,
+            spill_sync: crate::tick_persistence::SPILL_SYNC_OFF_DRAIN,
         };
         self.rescue = Some(tx);
         (sink, rx)
@@ -2233,6 +2283,11 @@ pub struct DepthRescueBatch {
     /// Lowest / highest `capture_seq` in this payload (`0` = unknown).
     min_seq: u64,
     max_seq: u64,
+    /// This batch's hold on the persisted watermark (Z7); released by the
+    /// rescue thread once the write is synced or has failed and been marked.
+    /// An abandoned batch (shutdown) never releases it, so the final persist
+    /// keeps the range replayable.
+    floor: Option<crate::wal_applied_watermark::RescueFloor>,
 }
 
 impl DepthRescueBatch {
@@ -2248,6 +2303,8 @@ pub struct DepthRescueSink {
     spill_dir: PathBuf,
     spill_min_free_headroom: u64,
     feed: Feed,
+    /// `SPILL_SYNC_OFF_DRAIN` in production; a test injects a failing sync.
+    spill_sync: Option<crate::tick_persistence::SpillSyncFn>,
 }
 
 impl DepthRescueSink {
@@ -2263,9 +2320,16 @@ impl DepthRescueSink {
             self.feed,
             batch.rows,
             self.spill_min_free_headroom,
+            self.spill_sync,
         );
         note_rescue_outcome_depth(landed, (batch.min_seq, batch.max_seq), false);
-        crate::wal_applied_watermark::applied_watermark().note_depth_completed();
+        let wm = crate::wal_applied_watermark::applied_watermark();
+        // Released only now: the spill is synced (Z8a) or the range is marked
+        // unapplied, so the persisted watermark may pass the batch (Z7).
+        if let Some(floor) = batch.floor {
+            wm.release_rescue_floor(floor);
+        }
+        wm.note_depth_completed();
     }
 }
 
@@ -2299,6 +2363,7 @@ fn perform_depth_rescue(
     feed: Feed,
     rows: usize,
     min_free_headroom_bytes: u64,
+    sync: Option<crate::tick_persistence::SpillSyncFn>,
 ) -> bool {
     let payload_len = payload.len();
     let now = std::time::SystemTime::now()
@@ -2311,6 +2376,7 @@ fn perform_depth_rescue(
         now,
         depth_spill_max_bytes(),
         min_free_headroom_bytes,
+        sync,
     ) {
         Ok(path) => {
             // BOTH counters, and the EMF-shipped one is not optional: it is the
@@ -2738,6 +2804,7 @@ impl DepthWriterSink {
             now,
             depth_spill_max_bytes(),
             self.spill_min_free_headroom,
+            crate::tick_persistence::SPILL_SYNC_OFF_DRAIN,
         ) {
             Ok(path) => {
                 note_rescue_outcome_depth(true, (batch.min_seq, batch.max_seq), true);
@@ -3338,6 +3405,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 2026-10-02: depth rows from a frame the WAL REFUSED carry a real capture
+    /// sequence yet exist in no WAL segment. Marked unbacked, a full rescue
+    /// queue must spill them inline, never defer them to the WAL.
+    #[test]
+    fn mark_pending_unbacked_keeps_depth_rows_in_the_inline_spill() {
+        let dir = spill_tmp("depth-rescue-unbacked");
+        let mut w = DepthWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (_sink, _rx) = w.split_rescue_offload();
+
+        for _ in 0..DEPTH_RESCUE_QUEUE_DEPTH {
+            w.append_row(&row()).expect("append");
+            assert_eq!(w.discard_pending(), 1);
+        }
+        w.append_row(&row()).expect("append");
+        assert!(!w.pending_unbacked(), "a non-zero sequence reads as backed");
+        w.mark_pending_unbacked();
+        assert!(w.pending_unbacked());
+        assert_eq!(w.discard_pending(), 1, "the rows are accounted for");
+        assert!(
+            !spill_files(&dir).is_empty(),
+            "an unbacked depth row must be written inline, never dropped as WAL-backed"
+        );
+        assert!(!w.pending_unbacked(), "discard_pending consumes the mark");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fresh depth writer reads as backed until marked.
+    #[test]
+    fn pending_unbacked_is_false_until_marked_on_a_depth_writer() {
+        let mut w = DepthWriter::for_test(Feed::Dhan);
+        assert!(!w.pending_unbacked());
+        w.mark_pending_unbacked();
+        assert!(w.pending_unbacked());
+    }
+
     /// A depth writer that was never split behaves exactly as before.
     #[test]
     fn an_unsplit_depth_writer_still_rescues_inline() {
@@ -3521,7 +3623,16 @@ mod tests {
              the false-OK this tier exists to avoid"
         );
         assert!(
-            spill_failed_depth_ilp(&dir, b"x\n", Feed::Dhan, 0, DEPTH_SPILL_MAX_BYTES, 0).is_err(),
+            spill_failed_depth_ilp(
+                &dir,
+                b"x\n",
+                Feed::Dhan,
+                0,
+                DEPTH_SPILL_MAX_BYTES,
+                0,
+                crate::tick_persistence::SPILL_SYNC_OFF_DRAIN
+            )
+            .is_err(),
             "the spill helper reports the failure rather than claiming success"
         );
         let _ = std::fs::remove_file(&dir);
@@ -3562,8 +3673,16 @@ mod tests {
         );
 
         // Under the cap: accepted. (Unchanged.)
-        spill_failed_depth_ilp(&dir, b"under\n", Feed::Dhan, 1_700_000_000, held + 1, 0)
-            .expect("below the cap the rescue must succeed -- otherwise the test is vacuous");
+        spill_failed_depth_ilp(
+            &dir,
+            b"under\n",
+            Feed::Dhan,
+            1_700_000_000,
+            held + 1,
+            0,
+            crate::tick_persistence::SPILL_SYNC_OFF_DRAIN,
+        )
+        .expect("below the cap the rescue must succeed -- otherwise the test is vacuous");
 
         // AT the cap: the outcome must AGREE with the classifier for whatever
         // free space this machine actually has.
@@ -3592,7 +3711,15 @@ mod tests {
             spill_free_bytes(&dir),
             DEPTH_SPILL_FREE_RESERVE_BYTES,
         );
-        let outcome = spill_failed_depth_ilp(&dir, b"over\n", Feed::Dhan, 1_700_000_000, held, 0);
+        let outcome = spill_failed_depth_ilp(
+            &dir,
+            b"over\n",
+            Feed::Dhan,
+            1_700_000_000,
+            held,
+            0,
+            crate::tick_persistence::SPILL_SYNC_OFF_DRAIN,
+        );
         match expected {
             SpillCeilingVerdict::OverCeilingWithRoom => {
                 outcome.expect(
@@ -4535,5 +4662,110 @@ mod tests {
             assert!(w.append_row(&r).is_ok(), "{label}: always Ok");
             assert_eq!(w.pending, want_pending, "{label}");
         }
+    }
+
+    // -- Z7 / Z8a (2026-10-02): queued-rescue floors and synced spills ------
+
+    /// A depth row at a sequence far above anything another test acks.
+    fn z7_row(k: u64) -> (DepthRow, u64) {
+        let seq = (1u64 << 61) + (k << 40);
+        let mut r = row();
+        r.capture_seq = i64::try_from(seq).expect("fits");
+        (r, seq)
+    }
+
+    #[test]
+    fn test_regression_depth_queued_rescue_holds_a_floor_until_the_rescue_thread_settles_it() {
+        let dir = spill_tmp("z7-depth-floor");
+        let mut w = DepthWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (sink, rx) = w.split_rescue_offload();
+        let (r, seq) = z7_row(1);
+        w.append_row(&r).expect("append");
+        assert_eq!(w.discard_pending(), 1);
+        let batch = rx.try_recv().expect("queued");
+        let wm = crate::wal_applied_watermark::applied_watermark();
+        let kind = crate::wal_applied_watermark::AppliedSink::Depth;
+        assert!(batch.floor.is_some());
+        assert!(wm.rescue_floor_is_held(kind, seq));
+        sink.rescue(&batch);
+        assert!(!wm.rescue_floor_is_held(kind, seq));
+        assert!(!wm.snapshot().range_has_unapplied(seq, seq));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_regression_depth_refused_rescue_hand_off_retracts_its_floor() {
+        let dir = spill_tmp("z7-depth-refused");
+        let mut w = DepthWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (sink, rx) = w.split_rescue_offload();
+        let wm = crate::wal_applied_watermark::applied_watermark();
+        let kind = crate::wal_applied_watermark::AppliedSink::Depth;
+        let mut queued = Vec::new();
+        for k in 0..DEPTH_RESCUE_QUEUE_DEPTH as u64 {
+            let (r, seq) = z7_row(10 + k);
+            w.append_row(&r).expect("append");
+            assert_eq!(w.discard_pending(), 1);
+            queued.push(seq);
+        }
+        let (r, refused) = z7_row(20);
+        w.append_row(&r).expect("append");
+        assert_eq!(w.discard_pending(), 1);
+        assert!(
+            !wm.rescue_floor_is_held(kind, refused),
+            "queue full: floor retracted"
+        );
+        assert!(
+            wm.snapshot().range_has_unapplied(refused, refused),
+            "deferred to the WAL"
+        );
+        for seq in &queued {
+            assert!(wm.rescue_floor_is_held(kind, *seq));
+        }
+        while let Ok(batch) = rx.try_recv() {
+            sink.rescue(&batch);
+        }
+        for seq in &queued {
+            assert!(!wm.rescue_floor_is_held(kind, *seq));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_regression_depth_rescue_sink_reports_a_failed_sync_as_a_failed_rescue() {
+        let dir = spill_tmp("z8a-depth-sync-fail");
+        let mut w = DepthWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (mut sink, rx) = w.split_rescue_offload();
+        sink.spill_sync = Some(|_| Err(std::io::Error::other("injected fdatasync failure")));
+        let (r, seq) = z7_row(30);
+        w.append_row(&r).expect("append");
+        assert_eq!(w.discard_pending(), 1);
+        let batch = rx.try_recv().expect("queued");
+        let wm = crate::wal_applied_watermark::applied_watermark();
+        let unlanded = wm.unlanded_total();
+        sink.rescue(&batch);
+        assert!(wm.unlanded_total() > unlanded);
+        assert!(wm.snapshot().range_has_unapplied(seq, seq));
+        assert!(!wm.rescue_floor_is_held(crate::wal_applied_watermark::AppliedSink::Depth, seq));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spill_failed_depth_ilp_returns_err_when_the_sync_fails() {
+        let dir = spill_tmp("z8a-depth-direct");
+        let failing: Option<crate::tick_persistence::SpillSyncFn> =
+            Some(|_| Err(std::io::Error::other("injected")));
+        assert!(
+            spill_failed_depth_ilp(
+                &dir,
+                b"x\n",
+                Feed::Dhan,
+                1_700_000_000,
+                u64::MAX,
+                0,
+                failing
+            )
+            .is_err()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

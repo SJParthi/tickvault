@@ -99,7 +99,10 @@ use tickvault_common::source_scan::strip_rust_comments;
 /// ratchet's own failure message demands.
 /// 160 -> 159 on 2026-09-27: measured by CI on the PR31a keyed-latch PR,
 /// which gave an existing candle-writer flush test real assertions.
-const ASSERTION_FREE_BUDGET: usize = 159;
+/// 159 -> 154 on 2026-10-02: measured on the zero-loss fixes PR, which
+/// deleted the per-minute depth steering report and its tests, and the
+/// per-request quote client and its tests. Nothing was rewritten to reach it.
+const ASSERTION_FREE_BUDGET: usize = 154;
 
 /// Substrings whose presence means the body asserts something.
 const ASSERTION_MARKERS: [&str; 12] = [

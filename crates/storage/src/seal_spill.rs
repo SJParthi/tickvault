@@ -185,8 +185,8 @@
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -198,7 +198,8 @@ use tickvault_common::error_code::ErrorCode;
 use tickvault_common::feed::Feed;
 use tickvault_trading::candles::{BufferedSeal, TfIndex};
 
-use crate::seal_spill_ledger::{SpillLedger, SpillVerdict};
+use crate::raw_frame_upload::CopyGate;
+use crate::seal_spill_ledger::{LiveCommit, QueueProgress, SpillLedger, SpillVerdict};
 
 /// Production spill directory — same parent as `tick_persistence.rs`'s
 /// `TICK_SPILL_DIR` for operational consistency.
@@ -731,6 +732,14 @@ const _: () = assert!(
     "SerializedSeal in-memory size exceeded SEAL_SPILL_RECORD_SIZE — bump record size + plan a forward migration."
 );
 
+/// The day file name the live spill writer opens at `now_unix_secs` (UTC):
+/// the one file in the spill root that may be held open, so neither the
+/// retention sweep nor the cold-bucket uploader touches it. Cold path.
+#[must_use]
+pub fn live_spill_file_name(now_unix_secs: i64) -> String {
+    ist_date_filename(now_unix_secs)
+}
+
 /// Returns today's IST date in `YYYY-MM-DD` form for the spill
 /// filename. Pure function for testability (clock injected by caller
 /// in tests).
@@ -774,27 +783,44 @@ struct OpenSpillFile {
 struct SpillState {
     /// Long-lived append handle for the current IST day (2026-08-10).
     open: Option<OpenSpillFile>,
-    /// Which copy of each slot's newest spilled bucket the spill holds. See
+    /// The fullest copy of each bar on disk and in the database. See
     /// [`crate::seal_spill_ledger`].
     ledger: SpillLedger,
-    /// Reused buffer for the fuller live copies appended by
-    /// [`SealSpillWriter::note_live_commits`].
+    /// Reused buffers for the live copies appended by
+    /// [`SealSpillWriter::note_live_commits`]: the bytes written, and the
+    /// copies to record once the write succeeded.
     mirror_scratch: Vec<u8>,
+    mirror_seals: Vec<SerializedSeal>,
+    /// Spill epoch (Z6): every append records the current one, and staging
+    /// the live files for the mid-session replay closes it. Starts at 1.
+    epoch: u32,
+    /// The newest epoch whose every append is in a staged file: set when a
+    /// staging moved every live file. `0` until then.
+    staged_through: u32,
 }
 
-/// Slots the spill ledger tracks: the aggregator's slot ceiling times the
-/// timeframe count, i.e. one entry for every bar that can still be amended.
-/// About 8.6 MiB of address space, allocated once per writer; only the
-/// control bytes (~256 KiB) are touched until a seal is spilled.
+/// Bars the spill ledger tracks at once (Z6: one entry per bar, `(slot,
+/// bucket)`, no longer one per slot). The aggregator's slot ceiling times
+/// the timeframe count, i.e. one whole round of every slot's bars. Entries are
+/// forgotten once the mid-session replay has consumed their copies; past this
+/// bound the ledger fails toward writing data (see the ledger's module docs).
+/// About 30 MiB of address space, allocated once per writer; only the control
+/// bytes (~512 KiB) are touched until a seal is spilled.
 pub const SEAL_SPILL_LEDGER_CAPACITY: usize = tickvault_trading::candles::SEAL_BUFFER_CAPACITY;
 
-/// Counter for the spill ledger (audit PR41a). One series per `kind`:
-/// `mirrored` (a fuller live copy appended after a spilled original),
-/// `older_not_written` (an older copy of a bucket the spill already holds a
-/// fuller copy of), `replay_older_skipped` (the mid-session replay dropped an
-/// older copy), `mirror_failed` (a fuller copy could not be appended; a later
-/// replay may write the older copy over it) and `untracked` (spilled past the
-/// ledger's capacity).
+/// Bars the boot drain records at most (Z6). Grown on demand, once per boot,
+/// only when files are staged. Past it a recovered copy is written untracked
+/// and counted (`boot_untracked`).
+pub const SEAL_BOOT_WRITTEN_CAPACITY: usize = 4 * SEAL_SPILL_LEDGER_CAPACITY;
+
+/// Counter for the spill ledger (audit PR41a, Z6). One series per `kind`:
+/// `mirrored` (a fuller live copy appended after an older copy on disk),
+/// `mirrored_overflow` (a live copy appended because the ledger was full and
+/// could not tell), `older_not_written` (an older copy of a bar the spill or
+/// the database already holds a fuller copy of), `replay_older_skipped` (the
+/// mid-session replay dropped an older copy), `mirror_failed` (a live copy
+/// could not be appended; a later replay may write the older copy over it)
+/// and `untracked` (written past the ledger's capacity).
 pub const SEAL_SPILL_SUPERSEDED_COUNTER: &str = "tv_seal_spill_superseded_total";
 
 /// Pre-resolved handles for [`SEAL_SPILL_SUPERSEDED_COUNTER`]. `untracked`
@@ -802,6 +828,7 @@ pub const SEAL_SPILL_SUPERSEDED_COUNTER: &str = "tv_seal_spill_superseded_total"
 /// fallback, where the counter macro is banned.
 struct SupersededCounters {
     mirrored: metrics::Counter,
+    mirrored_overflow: metrics::Counter,
     older_not_written: metrics::Counter,
     replay_older_skipped: metrics::Counter,
     mirror_failed: metrics::Counter,
@@ -812,6 +839,10 @@ impl SupersededCounters {
     fn resolve() -> Self {
         Self {
             mirrored: metrics::counter!(SEAL_SPILL_SUPERSEDED_COUNTER, "kind" => "mirrored"),
+            mirrored_overflow: metrics::counter!(
+                SEAL_SPILL_SUPERSEDED_COUNTER,
+                "kind" => "mirrored_overflow"
+            ),
             older_not_written: metrics::counter!(
                 SEAL_SPILL_SUPERSEDED_COUNTER,
                 "kind" => "older_not_written"
@@ -842,9 +873,17 @@ pub struct SealSpillWriter {
     /// the cached handle. Uncontended: the seal writer task is the single
     /// producer, so this is an uncontended lock/unlock pair, not a wait.
     state: Mutex<SpillState>,
-    /// `true` while the ledger tracks anything. Read without the lock, so a
-    /// writer cycle with nothing spilled never takes it.
-    ledger_tracking: AtomicBool,
+    /// `true` while the ledger tracks anything or has overflowed. Read
+    /// without the lock, so a writer cycle with nothing spilled never takes it.
+    ledger_active: AtomicBool,
+    /// Seals queued to the escalation thread and not yet finished with (Z6:
+    /// owned here so every escalator over this spill shares one count, and
+    /// the ledger can tell whether an older copy may still be on its way).
+    escalation_pending: Arc<AtomicUsize>,
+    /// Seals the escalation thread has finished with (written, sent to the
+    /// DLQ, or reported lost). Raised BEFORE `escalation_pending` is lowered,
+    /// so `pending + finished`, read in that order, never undercounts.
+    escalation_finished: AtomicU64,
     /// Pre-resolved handles for the two `append_seal` failure counters.
     ///
     /// `append_seal` is reachable from the FRAME-DRAIN task: the escalation
@@ -883,8 +922,13 @@ impl SealSpillWriter {
                 open: None,
                 ledger: SpillLedger::with_capacity(SEAL_SPILL_LEDGER_CAPACITY),
                 mirror_scratch: Vec::new(),
+                mirror_seals: Vec::new(),
+                epoch: 1,
+                staged_through: 0,
             }),
-            ledger_tracking: AtomicBool::new(false),
+            ledger_active: AtomicBool::new(false),
+            escalation_pending: Arc::new(AtomicUsize::new(0)),
+            escalation_finished: AtomicU64::new(0),
             err_no_handle: metrics::counter!(SPILL_WRITE_ERRORS_COUNTER, "stage" => "no_handle"),
             err_write: metrics::counter!(SPILL_WRITE_ERRORS_COUNTER, "stage" => "write"),
             superseded: SupersededCounters::resolve(),
@@ -987,11 +1031,17 @@ impl SealSpillWriter {
     pub fn append_seal(&self, seal: &SerializedSeal, now_unix_secs: i64) -> Result<()> {
         let bytes = seal.to_bytes();
         let mut state = self.lock_state();
-        let SpillState { open, ledger, .. } = &mut *state;
+        let SpillState {
+            open,
+            ledger,
+            epoch,
+            ..
+        } = &mut *state;
 
-        // Audit PR41a: the spill already holds a fuller copy of this bucket,
-        // so writing this one after it would make every replay end on the
-        // older copy. The fuller copy is on disk, which is what `Ok` promises.
+        // Audit PR41a, Z6: the spill or the database already holds a fuller
+        // copy of this bar, so writing this one would let a replay put the
+        // older copy back over it. The fuller copy is on disk or committed,
+        // which is what `Ok` promises.
         let verdict = ledger.verdict(seal);
         if verdict == SpillVerdict::OlderNotWritten {
             self.superseded.older_not_written.increment(1);
@@ -1039,7 +1089,7 @@ impl SealSpillWriter {
                 }
             };
         }
-        self.note_spilled(ledger, seal, verdict);
+        self.note_spilled(ledger, seal, verdict, *epoch);
         Ok(())
     }
 
@@ -1118,16 +1168,84 @@ impl SealSpillWriter {
         }
     }
 
-    /// Record a copy the spill now holds (audit PR41a). O(1), one hash probe.
-    fn note_spilled(&self, ledger: &mut SpillLedger, seal: &SerializedSeal, verdict: SpillVerdict) {
-        match verdict {
-            SpillVerdict::Write => {
-                ledger.record(seal);
-                self.ledger_tracking.store(true, Ordering::Release);
-            }
-            SpillVerdict::Untracked => self.superseded.untracked.increment(1),
-            SpillVerdict::OlderNotWritten => {}
+    /// Record a copy the spill now holds (audit PR41a, Z6). O(1): one hash
+    /// probe and two atomic loads.
+    fn note_spilled(
+        &self,
+        ledger: &mut SpillLedger,
+        seal: &SerializedSeal,
+        verdict: SpillVerdict,
+        epoch: u32,
+    ) {
+        if verdict == SpillVerdict::OlderNotWritten {
+            return;
         }
+        let (_, mark) = self.queue_progress();
+        if !ledger.record_on_disk(seal, epoch, false, false, mark) {
+            self.superseded.untracked.increment(1);
+        }
+        self.ledger_active
+            .store(ledger.is_active(), Ordering::Release);
+    }
+
+    /// Escalation-queue progress now, and the mark an entry updated now must
+    /// wait for before it may be forgotten (Z6).
+    ///
+    /// `pending` is read BEFORE `finished`, and the escalation thread raises
+    /// `finished` before it lowers `pending`, so a seal moving from one to the
+    /// other between the two loads is counted twice, never zero times: the
+    /// mark can only be late, which keeps an entry longer, never shorter.
+    ///
+    /// # Complexity
+    /// Two atomic loads.
+    fn queue_progress(&self) -> (QueueProgress, u64) {
+        let pending = self.escalation_pending.load(Ordering::SeqCst);
+        let finished = self.escalation_finished.load(Ordering::SeqCst);
+        let progress = QueueProgress {
+            written: finished,
+            idle: pending == 0,
+        };
+        let pending = u64::try_from(pending).unwrap_or(u64::MAX);
+        (progress, finished.saturating_add(pending))
+    }
+
+    /// The count of seals queued to the escalation thread and not yet
+    /// finished with. Every escalator over this spill shares it (Z6), so the
+    /// ledger always sees the queue the escalation thread drains.
+    #[must_use]
+    pub(crate) fn escalation_pending(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.escalation_pending)
+    }
+
+    /// The escalation thread finished with `count` queued seals (written to
+    /// the spill or the DLQ, or reported lost). Raises the finished count
+    /// first, then lowers the pending one; see [`Self::queue_progress`].
+    ///
+    /// # Complexity
+    /// Two atomic read-modify-writes. Escalation thread only.
+    pub(crate) fn note_escalation_finished(&self, count: usize) {
+        self.escalation_finished
+            .fetch_add(u64::try_from(count).unwrap_or(u64::MAX), Ordering::SeqCst);
+        self.escalation_pending.fetch_sub(count, Ordering::SeqCst);
+    }
+
+    /// Z6: a copy went to the dead-letter file instead of the spill. Recorded
+    /// so a fuller copy committed later is mirrored to the spill, and the
+    /// boot drain, which keeps the fullest copy of each bar across the spill
+    /// and dead-letter files, ends on it.
+    ///
+    /// # Complexity
+    /// O(1): the append lock, one hash probe and two atomic loads. Reached on
+    /// the dead-letter path only, which has already paid a file write.
+    pub(crate) fn note_dead_lettered(&self, seal: &SerializedSeal) {
+        let mut state = self.lock_state();
+        let SpillState { ledger, epoch, .. } = &mut *state;
+        let (_, mark) = self.queue_progress();
+        if !ledger.record_on_disk(seal, *epoch, true, false, mark) {
+            self.superseded.untracked.increment(1);
+        }
+        self.ledger_active
+            .store(ledger.is_active(), Ordering::Release);
     }
 
     /// Append several serialised seals with ONE `write(2)` (audit PR15).
@@ -1173,7 +1291,12 @@ impl SealSpillWriter {
     {
         let seals = seals.into_iter();
         let mut state = self.lock_state();
-        let SpillState { open, ledger, .. } = &mut *state;
+        let SpillState {
+            open,
+            ledger,
+            epoch,
+            ..
+        } = &mut *state;
 
         // Audit PR41a: serialised under the lock, because which copies are
         // written depends on what the spill already holds. A copy of a bucket
@@ -1254,44 +1377,66 @@ impl SealSpillWriter {
         // holds, so recording it changes nothing.
         for seal in seals {
             let verdict = ledger.verdict(seal);
-            self.note_spilled(ledger, seal, verdict);
+            self.note_spilled(ledger, seal, verdict, *epoch);
         }
         Ok(())
     }
 
-    /// Audit PR41a: append the fuller live copy of every bucket the spill
-    /// holds an older copy of, so every replay of the spill (mid-session or
-    /// the next boot's) writes the older copy first and this one last.
+    /// Audit PR41a, Z6: record what the live writer committed, and append to
+    /// the spill every committed copy that is fuller than a copy of the same
+    /// bar already on disk (spill or dead-letter), so the boot drain, which
+    /// keeps the fullest copy of each bar, ends on it.
+    ///
+    /// While the escalation queue holds anything, a committed copy of a bar
+    /// with no entry is recorded too, so an older copy still in the queue is
+    /// refused when it reaches the spill. While the ledger is overflowed,
+    /// every committed copy of an untracked bar is appended, because an older
+    /// copy may be on disk untracked.
     ///
     /// Called after a live flush succeeded, with the seals it committed.
     /// Returns how many copies were appended.
     ///
     /// # Complexity
-    /// One relaxed atomic load when the spill has held nothing this process
-    /// (the steady state). Otherwise O(committed): one hash probe per seal,
-    /// and one `write(2)` when any copy is appended. Runs on the seal writer
-    /// task, never on the frame drain. No allocation after the mirror buffer
-    /// has grown to the largest batch.
+    /// Two atomic loads when the ledger is empty and the queue idle (the
+    /// steady state). Otherwise O(committed): at most two hash probes per
+    /// seal, and one `write(2)` when any copy is appended. Runs on the seal
+    /// writer task, never on the frame drain. No allocation after the mirror
+    /// buffers have grown to the largest batch.
     pub fn note_live_commits(&self, committed: &[BufferedSeal], now_unix_secs: i64) -> usize {
-        if !self.ledger_tracking.load(Ordering::Acquire) || committed.is_empty() {
+        if committed.is_empty() {
             return 0;
         }
+        let queue_busy = self.escalation_pending.load(Ordering::SeqCst) > 0;
+        if !queue_busy && !self.ledger_active.load(Ordering::Acquire) {
+            return 0;
+        }
+        let (_, mark) = self.queue_progress();
         let mut state = self.lock_state();
         let SpillState {
             open,
             ledger,
             mirror_scratch,
+            mirror_seals,
+            epoch,
+            ..
         } = &mut *state;
         mirror_scratch.clear();
-        let mut mirrored = 0usize;
+        mirror_seals.clear();
+        let mut overflow_mirrored = 0usize;
         for seal in committed {
             let serialized = SerializedSeal::from(seal);
-            if ledger.live_supersedes(&serialized) {
-                mirror_scratch.extend_from_slice(&serialized.to_bytes());
-                mirrored += 1;
+            match ledger.on_live_commit(&serialized, queue_busy, *epoch, mark) {
+                LiveCommit::Nothing => continue,
+                LiveCommit::Mirror => {}
+                LiveCommit::MirrorOverflow => overflow_mirrored += 1,
             }
+            mirror_scratch.extend_from_slice(&serialized.to_bytes());
+            mirror_seals.push(serialized);
         }
-        if mirrored == 0 {
+        self.ledger_active
+            .store(ledger.is_active(), Ordering::Release);
+        let appended = mirror_seals.len();
+        if appended == 0 {
             return 0;
         }
         let written = self.current_file(open, now_unix_secs).and_then(|current| {
@@ -1301,45 +1446,49 @@ impl SealSpillWriter {
                 .context("failed to append fuller live copies to the seal spill")
         });
         if let Err(err) = written {
-            // The handle may be broken; the next append reopens it. A torn
-            // tail is not cut back here: the absorption path's batch write
-            // does that, and the readers stop at a short read.
+            // The handle may be broken; the next append reopens it, and the
+            // open cuts a torn tail back to a whole record (audit PR41c).
             *open = None;
             self.err_write.increment(1);
             self.superseded
                 .mirror_failed
-                .increment(u64::try_from(mirrored).unwrap_or(u64::MAX));
+                .increment(u64::try_from(appended).unwrap_or(u64::MAX));
             error!(
                 code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
                 ?err,
-                copies = mirrored,
+                copies = appended,
                 "seal spill: a fuller live copy of a spilled candle could not be appended — \
                  a later replay of the spill may write the older copy over the stored row"
             );
             return 0;
         }
-        for seal in committed {
-            let serialized = SerializedSeal::from(seal);
-            if ledger.live_supersedes(&serialized) {
-                ledger.record(&serialized);
+        for serialized in mirror_seals.iter() {
+            if !ledger.record_on_disk(serialized, *epoch, false, true, mark) {
+                self.superseded.untracked.increment(1);
             }
         }
+        self.ledger_active
+            .store(ledger.is_active(), Ordering::Release);
+        self.superseded.mirrored.increment(
+            u64::try_from(appended.saturating_sub(overflow_mirrored)).unwrap_or(u64::MAX),
+        );
         self.superseded
-            .mirrored
-            .increment(u64::try_from(mirrored).unwrap_or(u64::MAX));
-        mirrored
+            .mirrored_overflow
+            .increment(u64::try_from(overflow_mirrored).unwrap_or(u64::MAX));
+        appended
     }
 
-    /// Audit PR41a: `true` when `seal`, read back from the spill, is an older
-    /// copy of a bucket the spill also holds a fuller copy of. The
-    /// mid-session replay drops it (and counts it here), so the database never
-    /// holds the older copy, even briefly.
+    /// Audit PR41a, Z6: `true` when `seal`, read back from the spill, is less
+    /// full than a copy of the same bar already committed (live, or by an
+    /// earlier step of this replay). The mid-session replay drops it (and
+    /// counts it here), so a parked file resumed late can never put an older
+    /// copy back over a fuller one, whatever order the files replay in.
     ///
     /// # Complexity
-    /// One relaxed atomic load when the spill has held nothing this process,
-    /// otherwise one hash probe under the append lock.
+    /// One atomic load when the ledger is empty, otherwise one hash probe
+    /// under the append lock.
     pub fn replay_is_superseded(&self, seal: &BufferedSeal) -> bool {
-        if !self.ledger_tracking.load(Ordering::Acquire) {
+        if !self.ledger_active.load(Ordering::Acquire) {
             return false;
         }
         let older = self
@@ -1352,6 +1501,47 @@ impl SealSpillWriter {
         older
     }
 
+    /// Z6: the mid-session replay committed `seals`. Recorded as committed,
+    /// so an older copy of the same bar replayed after them is dropped.
+    ///
+    /// # Complexity
+    /// One atomic load when the ledger is empty, otherwise O(seals): one hash
+    /// probe each under the append lock. Seal writer task, cold.
+    pub fn note_replay_commits(&self, seals: &[BufferedSeal]) {
+        if seals.is_empty() || !self.ledger_active.load(Ordering::Acquire) {
+            return;
+        }
+        let mut state = self.lock_state();
+        for seal in seals {
+            state.ledger.on_replay_commit(&SerializedSeal::from(seal));
+        }
+    }
+
+    /// Z6: the mid-session replay has consumed every spill file staged up to
+    /// the last clean staging. Forget every bar whose copies can no longer be
+    /// written (see [`SpillLedger::forget_replayed`]). Returns how many bars
+    /// were forgotten.
+    ///
+    /// # Complexity
+    /// O(ledger capacity) under the append lock: one pass over the map. Seal
+    /// writer task, at most once per replay scan (30 s); every appender,
+    /// including the frame drain's inline fallback, waits for it.
+    pub fn forget_replayed(&self) -> usize {
+        if !self.ledger_active.load(Ordering::Acquire) {
+            return 0;
+        }
+        let mut state = self.lock_state();
+        let through = state.staged_through;
+        if through == 0 {
+            return 0;
+        }
+        let (progress, _) = self.queue_progress();
+        let forgotten = state.ledger.forget_replayed(through, progress);
+        self.ledger_active
+            .store(state.ledger.is_active(), Ordering::Release);
+        forgotten
+    }
+
     /// Run `f` while no append can reach the spill file (audit PR15).
     ///
     /// Holds the append lock for the duration of `f` and closes the cached
@@ -1360,13 +1550,25 @@ impl SealSpillWriter {
     /// in the moved inode. This is what lets the mid-session replay take the
     /// live file without losing a seal appended at the same instant.
     ///
+    /// `f` returns its result and whether it moved EVERY live spill file
+    /// (Z6). The pause closes the spill epoch: every append made before it
+    /// carries this epoch or an older one, and every append after it a newer
+    /// one. When `f` moved every live file, the epoch is recorded as staged,
+    /// and [`Self::forget_replayed`] may forget its copies once the replay has
+    /// consumed the staged files.
+    ///
     /// Every appender — the escalation thread, the drain's inline fallback
     /// and the writer's own rescue — waits on this lock while `f` runs, so
     /// `f` must be short: a directory listing and a few renames.
-    pub fn with_appends_paused<R>(&self, f: impl FnOnce() -> R) -> R {
+    pub fn with_appends_paused<R>(&self, f: impl FnOnce() -> (R, bool)) -> R {
         let mut state = self.lock_state();
         state.open = None;
-        let result = f();
+        let (result, moved_every_live_file) = f();
+        let closed = state.epoch;
+        state.epoch = closed.saturating_add(1);
+        if moved_every_live_file {
+            state.staged_through = closed;
+        }
         drop(state);
         result
     }
@@ -1600,12 +1802,37 @@ pub struct SpillPruneOutcome {
     /// Files skipped because they are TODAY's file — the one the live writer
     /// may hold an open descriptor to. Never deleted at any age.
     pub skipped_live: usize,
-    /// Aged files deleted from `archive/` (audit PR40b). Not a loss: the
-    /// replay had finished with them. Counted apart from [`Self::deleted`],
-    /// which covers the top level and `replaying/`, where a deleted record
-    /// was never re-ingested.
+    /// Aged files deleted from `archive/` (audit PR40b). Counted apart from
+    /// [`Self::deleted`], which covers the top level and `replaying/`, where a
+    /// deleted record was never re-ingested.
+    ///
+    /// NOT "no loss" (corrected 2026-10-02): `archive/` also holds files the
+    /// replay finished WITHOUT ingesting every record — undecodable records
+    /// and seals skipped as unrecovered stay there, and those files are their
+    /// only copy. A delete is lossless only with a verified cold copy; see
+    /// [`Self::archive_deleted_without_copy`].
     pub archive_deleted: usize,
+    /// Of every delete this sweep (any folder), how many had a verified copy
+    /// in the cold bucket (`[raw_frame_archive] require_upload_before_prune`
+    /// on). Those lose nothing.
+    pub deleted_with_copy: usize,
+    /// Non-empty `archive/` files deleted with NO verified copy (only
+    /// possible with the copy gate off). May hold undecodable or skipped
+    /// seals; reported as possible loss.
+    pub archive_deleted_without_copy: usize,
+    /// Aged files the sweep would have deleted but KEPT because no verified
+    /// cold copy is recorded for them yet (operator Quotes 27 + 28). Counted
+    /// as `tv_seal_spill_prune_refused_not_uploaded_total`.
+    pub refused_not_uploaded: usize,
+    /// Bytes held by `refused_not_uploaded`.
+    pub refused_not_uploaded_bytes: u64,
 }
+
+/// Counter: aged seal-spill files the retention sweep KEPT because no
+/// verified cold copy is recorded for them (plan item 45e-1). The sweep logs
+/// one coded STORAGE-GAP-04 line per pass that refuses any.
+pub const SEAL_SPILL_PRUNE_REFUSED_NOT_UPLOADED_COUNTER: &str =
+    "tv_seal_spill_prune_refused_not_uploaded_total";
 
 /// Deletes spill files older than `max_age_secs` — pure-testable core over an
 /// injected `now`.
@@ -1636,11 +1863,20 @@ pub struct SpillPruneOutcome {
 /// an unbounded directory fills the volume, and a full volume stops EVERY
 /// table on the box, including the live writes these seals would be replayed
 /// into. Bounded-and-loud beats unbounded-and-silent.
+///
+/// # The copy gate (plan item 45e-1, operator Quotes 27 + 28)
+///
+/// With `gate` = [`CopyGate::Required`] an aged file is deleted only when its
+/// marker in `<its folder>/uploaded/` records its current length and mtime —
+/// i.e. a verified gzip copy sits in the cold bucket under `seal-spill/`.
+/// Otherwise it is kept and counted in `refused_not_uploaded`; the uploader
+/// copies it on its next pass and the following sweep deletes it.
 #[must_use]
 pub fn prune_spill_files_at(
     spill_dir: &Path,
     max_age_secs: u64,
     now: std::time::SystemTime,
+    gate: CopyGate,
 ) -> SpillPruneOutcome {
     let mut outcome = SpillPruneOutcome::default();
     // NEVER delete a file the live writer may hold open (2026-08-19, found by
@@ -1679,6 +1915,7 @@ pub fn prune_spill_files_at(
         PrunedKind::Unreplayed,
         cutoff,
         now,
+        gate,
         &mut outcome,
     );
     // Audit PR40b: the two folders the replay moves files into. Until then
@@ -1687,8 +1924,10 @@ pub fn prune_spill_files_at(
     // figure. `replaying/` holds staged files NOT yet re-ingested, so an aged
     // one there is unreplayed data exactly like an aged top-level file and is
     // counted as lost. `archive/` holds files the replay finished with: their
-    // seals are in QuestDB, or were skipped and already paged as
-    // `seal_unrecovered` when they were skipped.
+    // seals are in QuestDB, or were skipped (undecodable, or paged as
+    // `seal_unrecovered`) — and for those skipped seals the archived file is
+    // the only copy, so an archive delete is lossless only with a verified
+    // cold copy (2026-10-02).
     //
     // No live-writer guard below: the writer only ever opens TODAY's file at
     // the top level, and a file moved into either folder was already closed
@@ -1699,6 +1938,7 @@ pub fn prune_spill_files_at(
         PrunedKind::Unreplayed,
         cutoff,
         now,
+        gate,
         &mut outcome,
     );
     prune_dir(
@@ -1707,6 +1947,7 @@ pub fn prune_spill_files_at(
         PrunedKind::Archived,
         cutoff,
         now,
+        gate,
         &mut outcome,
     );
     outcome
@@ -1717,7 +1958,9 @@ pub fn prune_spill_files_at(
 enum PrunedKind {
     /// Seals not yet re-ingested: a non-empty deletion is data loss.
     Unreplayed,
-    /// A file the replay finished with: nothing is lost by deleting it.
+    /// A file the replay finished with. Its ingested seals are in QuestDB,
+    /// but undecodable or skipped seals have no other copy, so a delete is
+    /// lossless only with a verified cold copy (2026-10-02).
     Archived,
 }
 
@@ -1729,6 +1972,7 @@ fn prune_dir(
     kind: PrunedKind,
     cutoff: std::time::Duration,
     now: std::time::SystemTime,
+    gate: CopyGate,
     outcome: &mut SpillPruneOutcome,
 ) {
     // O(1) EXEMPT: periodic cold retention sweep, never the per-seal append
@@ -1767,27 +2011,52 @@ fn prune_dir(
             outcome.bytes_after = outcome.bytes_after.saturating_add(len);
             continue;
         }
+        // Operator Quotes 27 + 28: no delete without a verified cold copy.
+        if !gate.allows_delete(&path, &meta) {
+            outcome.refused_not_uploaded += 1;
+            outcome.refused_not_uploaded_bytes =
+                outcome.refused_not_uploaded_bytes.saturating_add(len);
+            outcome.bytes_after = outcome.bytes_after.saturating_add(len);
+            continue;
+        }
         // O(1) EXEMPT: periodic cold retention sweep, never the per-seal append
         match std::fs::remove_file(&path) {
-            Ok(()) => match kind {
-                PrunedKind::Archived => outcome.archive_deleted += 1,
-                PrunedKind::Unreplayed => {
-                    outcome.deleted += 1;
-                    if len > 0 {
-                        outcome.deleted_non_empty += 1;
-                        outcome.records_lost = outcome
-                            .records_lost
-                            .saturating_add(len / SEAL_SPILL_RECORD_SIZE as u64);
+            Ok(()) => {
+                gate.forget(&path);
+                let with_copy = gate.copy_in_s3();
+                if with_copy {
+                    outcome.deleted_with_copy += 1;
+                }
+                match kind {
+                    PrunedKind::Archived => {
+                        outcome.archive_deleted += 1;
+                        if !with_copy && len > 0 {
+                            outcome.archive_deleted_without_copy += 1;
+                        }
+                    }
+                    PrunedKind::Unreplayed => {
+                        outcome.deleted += 1;
+                        // With a verified copy the records are in the cold
+                        // bucket, not lost.
+                        if len > 0 && !with_copy {
+                            outcome.deleted_non_empty += 1;
+                            outcome.records_lost = outcome
+                                .records_lost
+                                .saturating_add(len / SEAL_SPILL_RECORD_SIZE as u64);
+                        }
                     }
                 }
-            },
+            }
             Err(err) => {
                 outcome.failed += 1;
                 outcome.bytes_after = outcome.bytes_after.saturating_add(len);
-                warn!(
+                error!(
+                    code = ErrorCode::StorageGap05DiskPressureUnrelievable.code_str(),
+                    source = "spill_retention",
                     path = %path.display(),
                     error = %err,
-                    "spill retention sweep: remove_file failed — retried next pass"
+                    "spill retention sweep: remove_file failed — the file stays and is \
+                     retried next pass"
                 );
             }
         }
@@ -1804,8 +2073,43 @@ fn prune_dir(
 // layer only supplies SystemTime::now(), emits the coded log and sets the
 // gauge. Mirrors the sibling ws_frame_spill::prune_archived_segments wrapper.
 #[must_use]
-pub fn prune_spill_files(spill_dir: &Path, max_age_secs: u64) -> SpillPruneOutcome {
-    let outcome = prune_spill_files_at(spill_dir, max_age_secs, std::time::SystemTime::now());
+pub fn prune_spill_files(
+    spill_dir: &Path,
+    max_age_secs: u64,
+    require_upload: bool,
+) -> SpillPruneOutcome {
+    let outcome = prune_spill_files_at(
+        spill_dir,
+        max_age_secs,
+        std::time::SystemTime::now(),
+        CopyGate::from_config(require_upload),
+    );
+    // APPROVED: cast — a per-pass file count, always <= u64.
+    metrics::counter!(SEAL_SPILL_PRUNE_REFUSED_NOT_UPLOADED_COUNTER)
+        .increment(outcome.refused_not_uploaded as u64);
+    if outcome.refused_not_uploaded > 0 {
+        error!(
+            code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
+            source = "spill_retention",
+            files = outcome.refused_not_uploaded,
+            bytes = outcome.refused_not_uploaded_bytes,
+            max_age_secs,
+            "aged sealed-candle spill files were KEPT, not deleted: no verified copy of \
+             them is in the cold bucket yet. They are deleted once the uploader has copied \
+             them; a growing count means the uploader cannot reach the bucket."
+        );
+    }
+    if outcome.archive_deleted_without_copy > 0 {
+        error!(
+            code = ErrorCode::AggregatorDrop01.code_str(),
+            source = "spill_retention",
+            files = outcome.archive_deleted_without_copy,
+            max_age_secs,
+            "aged files in the spill archive were deleted with NO cold copy (the copy gate \
+             is off). They may have held undecodable or skipped seals, whose only copy they \
+             were — reported as possible loss."
+        );
+    }
     if outcome.deleted_non_empty > 0 {
         // Audit PR40b: this line carried the unregistered code
         // "SPILL-RETENTION-01", which nothing filtered on, so a deleted spill
@@ -1832,9 +2136,9 @@ pub fn prune_spill_files(spill_dir: &Path, max_age_secs: u64) -> SpillPruneOutco
     if outcome.archive_deleted > 0 {
         info!(
             archive_deleted = outcome.archive_deleted,
+            deleted_with_copy = outcome.deleted_with_copy,
             bytes_after = outcome.bytes_after,
-            "spill retention sweep: removed aged files from archive/ (already re-ingested, \
-             or skipped and paged when skipped)"
+            "spill retention sweep: removed aged files from archive/"
         );
     }
     metrics::gauge!("tv_seal_spill_bytes").set(outcome.bytes_after as f64);
@@ -2647,7 +2951,10 @@ mod tests {
             .expect("first append");
         let moved = dir.join("moved.bin");
         let live = writer.spill_path(now);
-        writer.with_appends_paused(|| std::fs::rename(&live, &moved).expect("rename"));
+        writer.with_appends_paused(|| {
+            std::fs::rename(&live, &moved).expect("rename");
+            ((), true)
+        });
         writer
             .append_seal(&mk_seal(13, 0, 1, 2, 2.0), now)
             .expect("second append");
@@ -3162,7 +3469,8 @@ mod tests {
             .unwrap_or(0);
         let live = ist_date_filename(now_secs);
         let path = write_aged(&dir, &live, SEAL_SPILL_RECORD_SIZE * 4, 10_000_000);
-        let out = prune_spill_files_at(&dir, 0, std::time::SystemTime::now());
+        let out =
+            prune_spill_files_at(&dir, 0, std::time::SystemTime::now(), CopyGate::NotRequired);
         assert!(path.exists(), "today's file must NEVER be unlinked");
         assert_eq!(out.deleted, 0);
         assert_eq!(out.skipped_live, 1, "and it must be reported, not silent");
@@ -3181,7 +3489,12 @@ mod tests {
             .unwrap_or(0);
         let older = ist_date_filename(now_secs - 3 * 86_400);
         let path = write_aged(&dir, &older, 0, 10_000);
-        let out = prune_spill_files_at(&dir, 3_600, std::time::SystemTime::now());
+        let out = prune_spill_files_at(
+            &dir,
+            3_600,
+            std::time::SystemTime::now(),
+            CopyGate::NotRequired,
+        );
         assert!(!path.exists(), "an old day's file is still eligible");
         assert_eq!(out.deleted, 1);
         assert_eq!(out.skipped_live, 0);
@@ -3192,7 +3505,12 @@ mod tests {
         let dir = spill_tmp("aged");
         let old = write_aged(&dir, "seals-20260101.bin", 0, 10_000);
         let fresh = write_aged(&dir, "seals-20260819.bin", 0, 10);
-        let out = prune_spill_files_at(&dir, 3_600, std::time::SystemTime::now());
+        let out = prune_spill_files_at(
+            &dir,
+            3_600,
+            std::time::SystemTime::now(),
+            CopyGate::NotRequired,
+        );
         assert_eq!(out.deleted, 1);
         assert!(!old.exists(), "aged file must go");
         assert!(fresh.exists(), "fresh file must stay");
@@ -3209,7 +3527,12 @@ mod tests {
             SEAL_SPILL_RECORD_SIZE * 7,
             10_000,
         );
-        let out = prune_spill_files_at(&dir, 3_600, std::time::SystemTime::now());
+        let out = prune_spill_files_at(
+            &dir,
+            3_600,
+            std::time::SystemTime::now(),
+            CopyGate::NotRequired,
+        );
         assert_eq!(out.deleted, 1);
         assert_eq!(out.deleted_non_empty, 1, "must flag it as non-empty");
         assert_eq!(out.records_lost, 7, "must report the exact record count");
@@ -3221,7 +3544,12 @@ mod tests {
         // reported as data loss, or the incident signal becomes noise.
         let dir = spill_tmp("empty");
         write_aged(&dir, "seals-20260101.bin", 0, 10_000);
-        let out = prune_spill_files_at(&dir, 3_600, std::time::SystemTime::now());
+        let out = prune_spill_files_at(
+            &dir,
+            3_600,
+            std::time::SystemTime::now(),
+            CopyGate::NotRequired,
+        );
         assert_eq!(out.deleted, 1);
         assert_eq!(out.deleted_non_empty, 0);
         assert_eq!(out.records_lost, 0);
@@ -3231,7 +3559,12 @@ mod tests {
     fn spill_sweep_never_touches_foreign_files() {
         let dir = spill_tmp("foreign");
         let note = write_aged(&dir, "operator-notes.txt", 4096, 10_000);
-        let out = prune_spill_files_at(&dir, 3_600, std::time::SystemTime::now());
+        let out = prune_spill_files_at(
+            &dir,
+            3_600,
+            std::time::SystemTime::now(),
+            CopyGate::NotRequired,
+        );
         assert_eq!(out.deleted, 0);
         assert!(
             note.exists(),
@@ -3243,10 +3576,20 @@ mod tests {
     fn spill_sweep_reports_remaining_bytes_and_handles_a_missing_dir() {
         let dir = spill_tmp("bytes");
         write_aged(&dir, "seals-20260819.bin", 512, 10);
-        let out = prune_spill_files_at(&dir, 3_600, std::time::SystemTime::now());
+        let out = prune_spill_files_at(
+            &dir,
+            3_600,
+            std::time::SystemTime::now(),
+            CopyGate::NotRequired,
+        );
         assert_eq!(out.bytes_after, 512, "surviving bytes must be reported");
         let missing = std::env::temp_dir().join("tv-spill-does-not-exist-xyz");
-        let out = prune_spill_files_at(&missing, 3_600, std::time::SystemTime::now());
+        let out = prune_spill_files_at(
+            &missing,
+            3_600,
+            std::time::SystemTime::now(),
+            CopyGate::NotRequired,
+        );
         assert_eq!(out, SpillPruneOutcome::default(), "missing dir is a no-op");
     }
 
@@ -3275,7 +3618,12 @@ mod tests {
         let fresh_archived = write_aged(&archive, "seals_v4-20260103.bin", 128, 10);
         let foreign = write_aged(&archive, "seal-unwritten.mark", 64, 10_000);
 
-        let out = prune_spill_files_at(&dir, 3_600, std::time::SystemTime::now());
+        let out = prune_spill_files_at(
+            &dir,
+            3_600,
+            std::time::SystemTime::now(),
+            CopyGate::NotRequired,
+        );
 
         assert!(!old_staged.exists() && !old_archived.exists());
         assert!(fresh_staged.exists() && fresh_archived.exists() && foreign.exists());
@@ -3283,8 +3631,11 @@ mod tests {
         assert_eq!(out.deleted, 1);
         assert_eq!(out.deleted_non_empty, 1);
         assert_eq!(out.records_lost, 3);
-        // An aged archived file is not a loss and is counted apart.
+        // An aged archived file is counted apart. With the copy gate off it
+        // may have held skipped seals, so a non-empty one is possible loss.
         assert_eq!(out.archive_deleted, 1);
+        assert_eq!(out.archive_deleted_without_copy, 1);
+        assert_eq!(out.deleted_with_copy, 0);
         // Both folders count against the disk figure.
         assert_eq!(out.bytes_after, 256 + 128);
     }
@@ -3305,11 +3656,130 @@ mod tests {
         std::fs::create_dir_all(&archive).expect("mkdir archive");
         let live = write_aged(&dir, &today, 128, 10_000);
         let archived_today = write_aged(&archive, &today, 128, 10_000);
-        let out = prune_spill_files_at(&dir, 3_600, now);
+        let out = prune_spill_files_at(&dir, 3_600, now, CopyGate::NotRequired);
         assert!(live.exists(), "the live file is never deleted");
         assert!(!archived_today.exists());
         assert_eq!(out.skipped_live, 1);
         assert_eq!(out.archive_deleted, 1);
+    }
+
+    #[test]
+    fn test_live_spill_file_name_is_the_writers_day_file() {
+        // 2026-09-21T13:33:20Z = 19:03:20 IST; 18:40 UTC is the next IST day.
+        assert_eq!(
+            live_spill_file_name(1_790_000_000),
+            "seals_v4-2026-09-21.bin"
+        );
+        assert_eq!(
+            live_spill_file_name(1_790_016_000),
+            "seals_v4-2026-09-22.bin"
+        );
+        assert_eq!(
+            live_spill_file_name(1_790_000_000),
+            ist_date_filename(1_790_000_000)
+        );
+    }
+
+    #[test]
+    fn test_prune_spill_files_at_keeps_an_aged_unreplayed_file_without_a_marker() {
+        // Operator Quotes 27 + 28: with the copy gate on, an aged file with
+        // no verified cold copy is KEPT, at the top level and in replaying/.
+        let dir = spill_tmp("gate-keep");
+        let replaying = dir.join(crate::seal_writer_task::SEAL_REPLAYING_SUBDIR);
+        std::fs::create_dir_all(&replaying).expect("mkdir replaying");
+        let top = write_aged(
+            &dir,
+            "seals_v4-2026-01-01.bin",
+            SEAL_SPILL_RECORD_SIZE * 2,
+            10_000,
+        );
+        let staged = write_aged(
+            &replaying,
+            "seals_v4-2026-01-02.bin",
+            SEAL_SPILL_RECORD_SIZE,
+            10_000,
+        );
+        let out = prune_spill_files_at(
+            &dir,
+            3_600,
+            std::time::SystemTime::now(),
+            CopyGate::Required,
+        );
+        assert!(top.exists() && staged.exists());
+        assert_eq!(out.refused_not_uploaded, 2);
+        assert_eq!(
+            out.refused_not_uploaded_bytes,
+            (SEAL_SPILL_RECORD_SIZE * 3) as u64
+        );
+        assert_eq!(
+            (out.deleted, out.deleted_non_empty, out.records_lost),
+            (0, 0, 0)
+        );
+        assert_eq!(out.bytes_after, (SEAL_SPILL_RECORD_SIZE * 3) as u64);
+    }
+
+    #[test]
+    fn test_prune_spill_files_at_deletes_an_aged_file_with_a_matching_marker() {
+        let dir = spill_tmp("gate-copy");
+        let top = write_aged(
+            &dir,
+            "seals_v4-2026-01-01.bin",
+            SEAL_SPILL_RECORD_SIZE * 2,
+            10_000,
+        );
+        crate::raw_frame_upload::write_file_marker_for_test(&top);
+        let marker = dir
+            .join(crate::raw_frame_upload::UPLOADED_SUBDIR)
+            .join("seals_v4-2026-01-01.bin");
+        assert!(marker.exists());
+        let out = prune_spill_files_at(
+            &dir,
+            3_600,
+            std::time::SystemTime::now(),
+            CopyGate::Required,
+        );
+        assert!(!top.exists());
+        assert_eq!(out.deleted, 1);
+        assert_eq!(out.deleted_with_copy, 1);
+        // The records are in the cold bucket: not counted as lost.
+        assert_eq!((out.deleted_non_empty, out.records_lost), (0, 0));
+        assert_eq!(out.refused_not_uploaded, 0);
+        assert!(!marker.exists(), "the deleted file's marker goes with it");
+    }
+
+    #[test]
+    fn test_prune_spill_files_at_keeps_an_archive_file_without_a_marker() {
+        let dir = spill_tmp("gate-archive");
+        let archive = dir.join(crate::seal_writer_task::SEAL_ARCHIVE_SUBDIR);
+        std::fs::create_dir_all(&archive).expect("mkdir archive");
+        let unmarked = write_aged(&archive, "seals_v4-2026-01-01.bin", 256, 10_000);
+        let marked = write_aged(&archive, "seals_v4-2026-01-02.bin", 128, 10_000);
+        crate::raw_frame_upload::write_file_marker_for_test(&marked);
+        // A marker for a file that changed since its upload covers nothing.
+        let changed = write_aged(&archive, "seals_v4-2026-01-03.bin", 64, 10_000);
+        crate::raw_frame_upload::write_file_marker_for_test(&changed);
+        std::fs::write(&changed, vec![1_u8; 65]).expect("rewrite");
+        let f = std::fs::File::options()
+            .write(true)
+            .open(&changed)
+            .expect("reopen");
+        f.set_times(
+            std::fs::FileTimes::new().set_modified(
+                std::time::SystemTime::now() - std::time::Duration::from_secs(10_000),
+            ),
+        )
+        .expect("set mtime");
+        let out = prune_spill_files_at(
+            &dir,
+            3_600,
+            std::time::SystemTime::now(),
+            CopyGate::Required,
+        );
+        assert!(unmarked.exists() && changed.exists());
+        assert!(!marked.exists());
+        assert_eq!(out.archive_deleted, 1);
+        assert_eq!(out.archive_deleted_without_copy, 0);
+        assert_eq!(out.refused_not_uploaded, 2);
     }
 
     #[test]
@@ -3327,7 +3797,7 @@ mod tests {
             .expect("open");
         f.set_times(std::fs::FileTimes::new().set_modified(now))
             .expect("mtime");
-        let out = prune_spill_files_at(&dir, 0, now);
+        let out = prune_spill_files_at(&dir, 0, now, CopyGate::NotRequired);
         assert_eq!(out.deleted, 0, "a file with zero age must survive");
         assert!(path.exists());
     }
@@ -3595,6 +4065,52 @@ mod pr41a_tests {
         let committed = [pr41a_buffered(&pr41a_copy(13, 1_727_760_000, 5, 40))];
         assert_eq!(writer.note_live_commits(&committed, now), 0);
         assert!(!writer.spill_path(now).exists(), "no file is created");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_note_dead_lettered_lets_a_fuller_live_commit_mirror_to_the_spill() {
+        // Z6: a copy that went to the dead-letter file is known to the ledger,
+        // so the amended copy committed live afterwards reaches the spill.
+        let dir = temp_spill_dir("z6-dlq-note");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        let now = pr41a_now();
+        let original = pr41a_copy(13, 1_727_760_000, 4, 40);
+        let amended = pr41a_copy(13, 1_727_760_000, 5, 40);
+        writer.note_dead_lettered(&original);
+        assert_eq!(
+            writer.note_live_commits(&[pr41a_buffered(&amended)], now),
+            1
+        );
+        assert_eq!(writer.read_all(now).expect("read"), vec![amended]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_note_replay_commits_supersedes_an_older_replayed_copy() {
+        let dir = temp_spill_dir("z6-replay-note");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        let now = pr41a_now();
+        let original = pr41a_copy(13, 1_727_760_000, 4, 40);
+        let amended = pr41a_copy(13, 1_727_760_000, 5, 40);
+        writer.append_seal(&original, now).expect("spill original");
+        writer.note_replay_commits(&[pr41a_buffered(&amended)]);
+        assert!(writer.replay_is_superseded(&pr41a_buffered(&original)));
+        assert!(!writer.replay_is_superseded(&pr41a_buffered(&amended)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_escalation_pending_is_shared_and_note_escalation_finished_lowers_it() {
+        let dir = temp_spill_dir("z6-escalation-count");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        let pending = writer.escalation_pending();
+        pending.fetch_add(3, Ordering::SeqCst);
+        assert_eq!(writer.escalation_pending().load(Ordering::SeqCst), 3);
+        writer.note_escalation_finished(2);
+        assert_eq!(pending.load(Ordering::SeqCst), 1);
+        writer.note_escalation_finished(1);
+        assert_eq!(pending.load(Ordering::SeqCst), 0);
         let _ = std::fs::remove_dir_all(dir);
     }
 

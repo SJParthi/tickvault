@@ -332,6 +332,23 @@ fn record_boot_drain_observability(outcome: &BootDrainOutcome) {
         metrics::counter!("tv_seal_writer_drain_total", "kind" => "boot_superseded")
             .increment(outcome.seals_superseded as u64);
     }
+    if outcome.seals_untracked > 0 {
+        metrics::counter!("tv_seal_writer_drain_total", "kind" => "boot_untracked")
+            .increment(outcome.seals_untracked as u64);
+    }
+    // S1: the summary that carries the older-copy guard across a stopped drain.
+    if outcome.summary_seeded > 0 {
+        metrics::counter!("tv_seal_writer_drain_total", "kind" => "boot_summary_seeded")
+            .increment(outcome.summary_seeded as u64);
+    }
+    if outcome.summary_refused > 0 {
+        metrics::counter!("tv_seal_writer_drain_total", "kind" => "boot_summary_refused")
+            .increment(outcome.summary_refused as u64);
+    }
+    if outcome.summary_not_persisted > 0 {
+        metrics::counter!("tv_seal_writer_drain_total", "kind" => "boot_summary_not_persisted")
+            .increment(outcome.summary_not_persisted as u64);
+    }
     let _ = report_unrecovered_seals(
         UnrecoveredStage::BootDrain,
         outcome
@@ -371,11 +388,44 @@ fn record_boot_drain_observability(outcome: &BootDrainOutcome) {
 // which does not exist yet; counting is what can ship now, and the watermark
 // rides PR31b.
 //
+// Shutdown order (audit PR31b-1, 2026-10-01). The writer's final drain is not
+// the last holder of seals: the escalation thread drains its queue (up to
+// 250,000 seals) after it, and main waits for that. So the writer no longer
+// marks the shutdown clean on its own:
+//
+// * On cancel, before its final drain, the writer writes the current count at
+//   once (no one-second throttle), because the close burst reached the queues
+//   after its last sample.
+// * After its final drain it marks clean only when it holds nothing at all,
+//   the escalation queue included. Otherwise it writes the remaining count,
+//   not clean, so a kill during the escalation wait is reported at the next
+//   boot.
+// * Main calls `finish_unwritten_mark_at_shutdown` once the escalation step is
+//   over, whatever its outcome: drained, panicked, or abandoned (every
+//   abandoned seal is already paged there). The same call covers a writer that
+//   overran its budget: main has paged that, so the next boot must not page it
+//   again. After the finish, no other write to that marker lands, so a
+//   still-running writer cannot turn it back to not clean.
+//
 // Honest limits:
-// * The marker is up to one second plus one cycle stale, so the reported
-//   number is the count at the last sample, not at the instant of death; the
-//   seals popped into the ILP buffer by the cycle in progress (at most
-//   `max_drain_per_cycle`) are in neither sample.
+// * The marker is up to one second plus one cycle stale while the loop runs,
+//   so the reported number is the count at the last sample, not at the instant
+//   of death; the seals popped into the ILP buffer by the cycle in progress (at
+//   most `max_drain_per_cycle`) are in neither sample.
+// * A count written after the final drain includes seals the drain itself
+//   could not place, which it has already paged. If the process is killed
+//   before main's finish, the next boot reports them again: counted twice,
+//   never missed.
+// * When the writer overran its budget, main's page does not say how many
+//   seals it still held, and the finish records none. The same holds when
+//   the lane's own join timed out and it can still queue seals after the
+//   finish: the lane's timeout line is the only report of those.
+// * The marker is not updated while the escalation queue drains, so a kill
+//   then reports the count at the writer's exit, which over-counts the seals
+//   already written by then.
+// * If the writer loop ever exits mid-session (every cancel sender dropped,
+//   unreachable today), nothing finishes the marker and it keeps its last
+//   count.
 // * The marker is renamed into place but not fsynced: it survives a process
 //   crash (the page cache outlives the process), not a host crash or power
 //   loss, like every other unflushed file on the box.
@@ -404,8 +454,16 @@ pub const SEAL_UNWRITTEN_MARK_FILE: &str = "seal-unwritten.mark";
 pub const SEAL_UNWRITTEN_MARK_EVERY_SECS: i64 = 1;
 
 /// First token of every marker line: names the format so a future change can
-/// be refused rather than misread.
-const SEAL_UNWRITTEN_MARK_HEADER: &str = "tv-seal-unwritten-v1";
+/// be refused rather than misread. `v2` (audit PR31b-2) adds `drained_at`.
+const SEAL_UNWRITTEN_MARK_HEADER: &str = "tv-seal-unwritten-v2";
+
+/// The `v1` header, still read so the first boot after the upgrade can use
+/// the marker the previous build left.
+const SEAL_UNWRITTEN_MARK_HEADER_V1: &str = "tv-seal-unwritten-v1";
+
+/// What `drained_at=` holds when no sample of this process ever saw the
+/// writer's queues empty.
+const SEAL_UNWRITTEN_MARK_DRAINED_UNKNOWN: &str = "unknown";
 
 /// What a marker file says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -416,14 +474,24 @@ pub struct UnwrittenSealRecord {
     pub clean: bool,
     /// Wall clock (unix seconds) of the sample.
     pub sampled_at_unix_secs: i64,
+    /// Wall clock (unix seconds) of the latest written sample that found the
+    /// writer holding no seal (audit PR31b-2). Every seal handed to the writer
+    /// before it was written, spilled or counted lost. `None` when no sample
+    /// of that process saw the queues empty, or the marker is `v1` and held
+    /// seals. The boot warm-up re-sends the candles sealed after it.
+    pub drained_at_unix_secs: Option<i64>,
 }
 
 impl UnwrittenSealRecord {
     /// The one-line text form written to the marker.
     #[must_use]
     pub fn to_line(&self) -> String {
+        let drained = self.drained_at_unix_secs.map_or_else(
+            || SEAL_UNWRITTEN_MARK_DRAINED_UNKNOWN.to_string(),
+            |secs| secs.to_string(),
+        );
         format!(
-            "{SEAL_UNWRITTEN_MARK_HEADER} unwritten={} clean={} sampled_at={}\n",
+            "{SEAL_UNWRITTEN_MARK_HEADER} unwritten={} clean={} sampled_at={} drained_at={drained}\n",
             self.unwritten,
             u8::from(self.clean),
             self.sampled_at_unix_secs
@@ -431,14 +499,18 @@ impl UnwrittenSealRecord {
     }
 
     /// Parse a marker line. `None` for anything that is not exactly the
-    /// current format, so a torn or foreign file is reported as unreadable
-    /// rather than read as a number.
+    /// current format or `v1`, so a torn or foreign file is reported as
+    /// unreadable rather than read as a number. A `v1` line has no
+    /// `drained_at`: it reads as its own sample time when it held no seal
+    /// (the queues were empty then) and as unknown otherwise.
     #[must_use]
     pub fn parse(text: &str) -> Option<Self> {
         let mut tokens = text.split_whitespace();
-        if tokens.next()? != SEAL_UNWRITTEN_MARK_HEADER {
-            return None;
-        }
+        let v1 = match tokens.next()? {
+            SEAL_UNWRITTEN_MARK_HEADER => false,
+            SEAL_UNWRITTEN_MARK_HEADER_V1 => true,
+            _ => return None,
+        };
         let unwritten = tokens.next()?.strip_prefix("unwritten=")?.parse().ok()?;
         let clean = match tokens.next()?.strip_prefix("clean=")? {
             "0" => false,
@@ -446,6 +518,14 @@ impl UnwrittenSealRecord {
             _ => return None,
         };
         let sampled_at_unix_secs = tokens.next()?.strip_prefix("sampled_at=")?.parse().ok()?;
+        let drained_at_unix_secs = if v1 {
+            (unwritten == 0).then_some(sampled_at_unix_secs)
+        } else {
+            match tokens.next()?.strip_prefix("drained_at=")? {
+                SEAL_UNWRITTEN_MARK_DRAINED_UNKNOWN => None,
+                secs => Some(secs.parse().ok()?),
+            }
+        };
         if tokens.next().is_some() {
             return None;
         }
@@ -453,8 +533,33 @@ impl UnwrittenSealRecord {
             unwritten,
             clean,
             sampled_at_unix_secs,
+            drained_at_unix_secs,
         })
     }
+}
+
+/// The latest wall-clock second at which any marker of this process recorded
+/// the writer holding no seal, or `i64::MIN` (audit PR31b-2). Read by
+/// [`finish_unwritten_mark_at_shutdown`], which has no marker of its own.
+static LAST_DRAINED_UNIX_SECS: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(i64::MIN);
+
+/// What the previous process's marker said, read by `main` before the seal
+/// writer starts and kept for the candle warm-up (audit PR31b-2). The writer
+/// loop overwrites the file with its own samples, so this is the only copy.
+static PREVIOUS_UNWRITTEN: std::sync::OnceLock<PreviousUnwritten> = std::sync::OnceLock::new();
+
+/// Keep the previous process's marker for this process (audit PR31b-2). The
+/// first call wins. O(1).
+pub fn publish_previous_unwritten(previous: PreviousUnwritten) -> bool {
+    PREVIOUS_UNWRITTEN.set(previous).is_ok()
+}
+
+/// The previous process's marker as `main` read it, or `None` before `main`
+/// published it (audit PR31b-2). O(1).
+#[must_use]
+pub fn previous_unwritten() -> Option<PreviousUnwritten> {
+    PREVIOUS_UNWRITTEN.get().copied()
 }
 
 /// What the previous process's marker said, as read at boot.
@@ -475,6 +580,9 @@ pub struct UnwrittenSealMark {
     path: std::path::PathBuf,
     last_written: Option<usize>,
     last_write_unix_secs: i64,
+    /// The latest sample that found the writer holding no seal (audit
+    /// PR31b-2); written as `drained_at`.
+    drained_at_unix_secs: Option<i64>,
     /// Latched on the first failed write and cleared by the next good one, so
     /// a full disk logs once per episode, not once per second.
     failing: bool,
@@ -488,6 +596,7 @@ impl UnwrittenSealMark {
             path: dir.join(SEAL_UNWRITTEN_MARK_FILE),
             last_written: None,
             last_write_unix_secs: i64::MIN,
+            drained_at_unix_secs: None,
             failing: false,
         }
     }
@@ -517,6 +626,9 @@ impl UnwrittenSealMark {
     /// # Complexity
     /// O(1). At most one small write and one rename per second.
     pub fn sample(&mut self, unwritten: usize, now_unix_secs: i64) -> bool {
+        // An empty writer is remembered even when nothing is written, so the
+        // next non-zero record names the latest instant it was seen empty.
+        self.note_drained(unwritten, now_unix_secs);
         if self.last_written == Some(unwritten) {
             return false;
         }
@@ -526,29 +638,52 @@ impl UnwrittenSealMark {
         if !due {
             return false;
         }
-        self.write(UnwrittenSealRecord {
-            unwritten,
-            clean: false,
-            sampled_at_unix_secs: now_unix_secs,
-        })
+        self.write_record(unwritten, false, now_unix_secs)
     }
 
     /// Record a clean shutdown after the final drain. Always writes.
     pub fn mark_clean(&mut self, unwritten: usize, now_unix_secs: i64) -> bool {
-        self.write(UnwrittenSealRecord {
+        self.write_record(unwritten, true, now_unix_secs)
+    }
+
+    /// Record `unwritten` as not clean now, without the one-second throttle
+    /// [`Self::sample`] applies (audit PR31b-1). Used on cancel, where the
+    /// close burst may have reached the queues after the last sample, and
+    /// after a final drain that left seals queued.
+    pub fn record_now(&mut self, unwritten: usize, now_unix_secs: i64) -> bool {
+        self.write_record(unwritten, false, now_unix_secs)
+    }
+
+    /// An empty writer moves `drained_at` to `now_unix_secs`, here and for
+    /// the shutdown finish (audit PR31b-2). O(1).
+    fn note_drained(&mut self, unwritten: usize, now_unix_secs: i64) {
+        if unwritten == 0 {
+            self.drained_at_unix_secs = Some(now_unix_secs);
+            LAST_DRAINED_UNIX_SECS.store(now_unix_secs, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Build and write the record for one sample (audit PR31b-2). O(1).
+    fn write_record(&mut self, unwritten: usize, clean: bool, now_unix_secs: i64) -> bool {
+        self.note_drained(unwritten, now_unix_secs);
+        let record = UnwrittenSealRecord {
             unwritten,
-            clean: true,
+            clean,
             sampled_at_unix_secs: now_unix_secs,
-        })
+            drained_at_unix_secs: self.drained_at_unix_secs,
+        };
+        self.write(record)
     }
 
     /// Write-then-rename, so a reader sees the old marker or the new one,
-    /// never half of either.
+    /// never half of either. Refused once the shutdown has finished this
+    /// marker ([`finish_unwritten_mark_at_shutdown`]).
     fn write(&mut self, record: UnwrittenSealRecord) -> bool {
-        let tmp = self.path.with_extension("mark.tmp");
-        let written = std::fs::write(&tmp, record.to_line().as_bytes())
-            .and_then(|()| std::fs::rename(&tmp, &self.path));
-        match written {
+        let finished = lock_finished_marks();
+        if finished.iter().any(|path| path == &self.path) {
+            return false;
+        }
+        match write_mark_file(&self.path, &record) {
             Ok(()) => {
                 self.last_written = Some(record.unwritten);
                 self.last_write_unix_secs = record.sampled_at_unix_secs;
@@ -556,19 +691,96 @@ impl UnwrittenSealMark {
                 true
             }
             Err(err) => {
-                metrics::counter!(SEAL_UNWRITTEN_MARK_ERRORS_COUNTER).increment(1);
-                if !self.failing {
-                    self.failing = true;
-                    tracing::warn!(
-                        path = %self.path.display(),
-                        error = %err,
-                        "seal writer: could not write the unwritten-seal marker — the live \
-                         count is still on tv_seal_unwritten, but a crash now would not be \
-                         reported at the next boot"
-                    );
-                }
+                // Counted on every failure, logged on the first of a run.
+                record_mark_write_failure(&self.path, &err, !self.failing);
+                self.failing = true;
                 false
             }
+        }
+    }
+}
+
+/// Markers the shutdown has finished in this process (audit PR31b-1). One
+/// entry in production; a test may finish several directories.
+static FINISHED_UNWRITTEN_MARKS: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// The finished-marker list. A panic while it was held cannot leave it
+/// half-written (every holder pushes or reads one entry), so a poisoned lock is
+/// used as is.
+fn lock_finished_marks() -> std::sync::MutexGuard<'static, Vec<std::path::PathBuf>> {
+    FINISHED_UNWRITTEN_MARKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Write `record` to `path` through a temporary file and a rename.
+fn write_mark_file(path: &std::path::Path, record: &UnwrittenSealRecord) -> std::io::Result<()> {
+    let tmp = path.with_extension("mark.tmp");
+    std::fs::write(&tmp, record.to_line().as_bytes()).and_then(|()| std::fs::rename(&tmp, path))
+}
+
+/// A failed marker write: counted every time, and when `log` is set reported
+/// as a coded error (audit PR31b-1; it was an uncoded warning). Log only:
+/// AGGREGATOR-SEAL-01 does not page.
+fn record_mark_write_failure(path: &std::path::Path, err: &std::io::Error, log: bool) {
+    metrics::counter!(SEAL_UNWRITTEN_MARK_ERRORS_COUNTER).increment(1);
+    if !log {
+        return;
+    }
+    error!(
+        code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+        source = "unwritten_mark",
+        path = %path.display(),
+        error = %err,
+        "seal writer: could not write the unwritten-seal marker. The live count is still \
+         on tv_seal_unwritten, but if the process dies now the next boot cannot report how \
+         many sealed candles it held"
+    );
+}
+
+/// Mark the shutdown clean once nothing in this process can still write a seal
+/// (audit PR31b-1). Main calls it after the escalation step, whatever its
+/// outcome; `seals_reported_lost` is what main has already paged (the
+/// abandoned escalation queue), recorded for the reader.
+///
+/// After this call no [`UnwrittenSealMark`] write to the same marker lands, so
+/// a writer that overran its budget cannot turn it back to not clean. Returns
+/// `true` when the clean record was written; a failure is counted and logged,
+/// and the marker then keeps the last count, which the next boot reports.
+///
+/// # Complexity
+/// O(finished markers), one in production, plus one small write and a rename.
+pub fn finish_unwritten_mark_at_shutdown(
+    dir: &std::path::Path,
+    seals_reported_lost: usize,
+    now_unix_secs: i64,
+) -> bool {
+    let path = dir.join(SEAL_UNWRITTEN_MARK_FILE);
+    let mut finished = lock_finished_marks();
+    if !finished.iter().any(|done| done == &path) {
+        finished.push(path.clone());
+    }
+    // Nothing reported lost: every seal is written now. Otherwise the latest
+    // instant this process saw the writer empty, so the next boot re-sends
+    // the candles sealed after it (audit PR31b-2).
+    let drained_at_unix_secs = if seals_reported_lost == 0 {
+        Some(now_unix_secs)
+    } else {
+        let last = LAST_DRAINED_UNIX_SECS.load(std::sync::atomic::Ordering::Relaxed);
+        (last != i64::MIN).then_some(last)
+    };
+    let record = UnwrittenSealRecord {
+        unwritten: seals_reported_lost,
+        clean: true,
+        sampled_at_unix_secs: now_unix_secs,
+        drained_at_unix_secs,
+    };
+    match write_mark_file(&path, &record) {
+        Ok(()) => true,
+        Err(err) => {
+            record_mark_write_failure(&path, &err, true);
+            false
         }
     }
 }
@@ -583,6 +795,8 @@ pub fn report_previous_unwritten(previous: PreviousUnwritten, now_unix_secs: i64
         PreviousUnwritten::Absent => 0,
         PreviousUnwritten::Unreadable => {
             tracing::warn!(
+                code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                source = "unwritten_mark",
                 "seal writer: the unwritten-seal marker from the previous process could not \
                  be read — whether it held unwritten seals when it ended is unknown"
             );
@@ -822,19 +1036,45 @@ fn run_cycle_with_replay(
     }
 }
 
-/// Rewrite the crash marker as a clean shutdown once the final drain is done.
-/// Whatever the drain could not place is already reported by the drain itself
-/// (and by the escalation thread's shutdown path), so the next boot must not
-/// report it a second time as a crash.
-fn mark_clean_after_final_drain(runner: &SealWriterRunner, mark: &mut UnwrittenSealMark) {
+/// Write the current count to the crash marker at once, on cancel, before the
+/// final drain (audit PR31b-1). The close burst can reach the queues after the
+/// last throttled sample, so a kill during the final drain would otherwise be
+/// reported short.
+fn record_unwritten_on_cancel(runner: &SealWriterRunner, mark: &mut UnwrittenSealMark) {
     let unwritten = runner.unwritten_seals();
     let now = utc_now_secs();
     if tokio::runtime::Handle::current().runtime_flavor()
         == tokio::runtime::RuntimeFlavor::MultiThread
     {
-        tokio::task::block_in_place(|| mark.mark_clean(unwritten, now));
+        tokio::task::block_in_place(|| mark.record_now(unwritten, now));
     } else {
-        mark.mark_clean(unwritten, now);
+        mark.record_now(unwritten, now);
+    }
+}
+
+/// Update the crash marker once the final drain is done (audit PR31b-1).
+///
+/// Clean only when nothing is held at all. The escalation queue is drained by
+/// main AFTER this returns, so while it holds seals the marker keeps the count,
+/// not clean: a kill during that wait is then reported at the next boot. Main
+/// marks the shutdown clean with [`finish_unwritten_mark_at_shutdown`] once the
+/// escalation step is over.
+fn mark_after_final_drain(runner: &SealWriterRunner, mark: &mut UnwrittenSealMark) {
+    let unwritten = runner.unwritten_seals();
+    let now = utc_now_secs();
+    let mut write = || {
+        if unwritten == 0 {
+            mark.mark_clean(0, now)
+        } else {
+            mark.record_now(unwritten, now)
+        }
+    };
+    if tokio::runtime::Handle::current().runtime_flavor()
+        == tokio::runtime::RuntimeFlavor::MultiThread
+    {
+        tokio::task::block_in_place(write);
+    } else {
+        write();
     }
 }
 
@@ -905,6 +1145,10 @@ pub async fn run_seal_writer_loop(
             records_undecodable = boot.records_undecodable,
             seals_append_failed = boot.seals_append_failed,
             seals_superseded = boot.seals_superseded,
+            seals_untracked = boot.seals_untracked,
+            summary_seeded = boot.summary_seeded,
+            summary_refused = boot.summary_refused,
+            summary_not_persisted = boot.summary_not_persisted,
             "seal writer boot recovery drain finished"
         );
     }
@@ -934,8 +1178,9 @@ pub async fn run_seal_writer_loop(
                     Ok(()) => {
                         if *cancel_rx.borrow() {
                             info!("seal writer loop cancelled — performing final drain");
+                            record_unwritten_on_cancel(&runner, &mut mark);
                             let final_outcome = final_drain(&mut runner, &mut progress);
-                            mark_clean_after_final_drain(&runner, &mut mark);
+                            mark_after_final_drain(&runner, &mut mark);
                             return final_outcome;
                         }
                         // A `false → false` change never happens; keep draining.
@@ -979,8 +1224,9 @@ pub async fn run_seal_writer_loop(
                              and replay at the next boot, but candles_* will stop gaining \
                              rows this session. Restart the process."
                         );
+                        record_unwritten_on_cancel(&runner, &mut mark);
                         let final_outcome = final_drain(&mut runner, &mut progress);
-                        mark_clean_after_final_drain(&runner, &mut mark);
+                        mark_after_final_drain(&runner, &mut mark);
                         return final_outcome;
                     }
                 }
@@ -1519,6 +1765,10 @@ mod tests {
             records_undecodable: 2,
             seals_append_failed: 3,
             seals_superseded: 4,
+            seals_untracked: 1,
+            summary_seeded: 6,
+            summary_refused: 1,
+            summary_not_persisted: 2,
         });
     }
 
@@ -1613,6 +1863,7 @@ mod tests {
             unwritten: 250_000,
             clean: false,
             sampled_at_unix_secs: 1_790_000_000,
+            drained_at_unix_secs: Some(1_789_999_000),
         };
         assert_eq!(UnwrittenSealRecord::parse(&record.to_line()), Some(record));
         let clean = UnwrittenSealRecord {
@@ -1620,9 +1871,20 @@ mod tests {
             ..record
         };
         assert_eq!(UnwrittenSealRecord::parse(&clean.to_line()), Some(clean));
+        let unknown = UnwrittenSealRecord {
+            drained_at_unix_secs: None,
+            ..record
+        };
+        assert_eq!(
+            UnwrittenSealRecord::parse(&unknown.to_line()),
+            Some(unknown)
+        );
         for bad in [
             "",
             "tv-seal-unwritten-v2 unwritten=1 clean=0 sampled_at=1",
+            "tv-seal-unwritten-v2 unwritten=1 clean=0 sampled_at=1 drained_at=x",
+            "tv-seal-unwritten-v2 unwritten=1 clean=0 sampled_at=1 drained_at=1 extra=1",
+            "tv-seal-unwritten-v3 unwritten=1 clean=0 sampled_at=1 drained_at=1",
             "tv-seal-unwritten-v1 unwritten=-1 clean=0 sampled_at=1",
             "tv-seal-unwritten-v1 unwritten=1 clean=2 sampled_at=1",
             "tv-seal-unwritten-v1 unwritten=1 clean=0",
@@ -1644,7 +1906,7 @@ mod tests {
     }
 
     #[test]
-    fn unwritten_mark_writes_only_on_change_and_at_most_once_a_second() {
+    fn test_mark_clean_and_sample_write_only_on_change_and_at_most_once_a_second() {
         let dir = temp_dir_for("rate");
         let mut mark = UnwrittenSealMark::in_dir(&dir);
         assert_eq!(mark.read_previous(), PreviousUnwritten::Absent);
@@ -1662,6 +1924,7 @@ mod tests {
                 unwritten: 30,
                 clean: false,
                 sampled_at_unix_secs: 900,
+                drained_at_unix_secs: None,
             })
         );
         assert!(mark.mark_clean(30, 900), "a clean mark always writes");
@@ -1771,6 +2034,100 @@ mod tests {
         );
     }
 
+    /// Audit PR31b-2: a `v1` marker left by the previous build still reads.
+    /// Holding no seal, its sample time is when the writer was empty; holding
+    /// seals, the empty instant is unknown.
+    #[test]
+    fn a_v1_marker_reads_with_drained_at_only_when_it_held_no_seal() {
+        assert_eq!(
+            UnwrittenSealRecord::parse("tv-seal-unwritten-v1 unwritten=0 clean=0 sampled_at=50"),
+            Some(UnwrittenSealRecord {
+                unwritten: 0,
+                clean: false,
+                sampled_at_unix_secs: 50,
+                drained_at_unix_secs: Some(50),
+            })
+        );
+        assert_eq!(
+            UnwrittenSealRecord::parse("tv-seal-unwritten-v1 unwritten=4 clean=1 sampled_at=50"),
+            Some(UnwrittenSealRecord {
+                unwritten: 4,
+                clean: true,
+                sampled_at_unix_secs: 50,
+                drained_at_unix_secs: None,
+            })
+        );
+    }
+
+    /// Audit PR31b-2: `drained_at` is the latest sample that saw the writer
+    /// empty, written or not, and a non-empty record carries it.
+    #[test]
+    fn a_marker_records_the_latest_instant_the_writer_was_empty() {
+        let dir = temp_dir_for("drained");
+        let mut mark = UnwrittenSealMark::in_dir(&dir);
+        assert!(mark.sample(0, 1_000), "first sample always writes");
+        assert!(
+            !mark.sample(0, 1_040),
+            "an unchanged count is not rewritten"
+        );
+        assert!(mark.sample(9, 1_041));
+        match mark.read_previous() {
+            PreviousUnwritten::Read(r) => {
+                assert_eq!(r.unwritten, 9);
+                assert_eq!(
+                    r.drained_at_unix_secs,
+                    Some(1_040),
+                    "the unwritten empty sample at 1_040 is the latest drained instant"
+                );
+            }
+            other => panic!("expected a marker, got {other:?}"),
+        }
+        assert!(mark.record_now(3, 1_050));
+        match mark.read_previous() {
+            PreviousUnwritten::Read(r) => assert_eq!(r.drained_at_unix_secs, Some(1_040)),
+            other => panic!("expected a marker, got {other:?}"),
+        }
+        let mut fresh = UnwrittenSealMark::in_dir(&dir);
+        assert!(fresh.record_now(5, 1_060));
+        match fresh.read_previous() {
+            PreviousUnwritten::Read(r) => assert_eq!(
+                r.drained_at_unix_secs, None,
+                "a process that never saw the writer empty cannot name an instant"
+            ),
+            other => panic!("expected a marker, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Audit PR31b-2: the shutdown finish names `now` when nothing was lost.
+    #[test]
+    fn the_shutdown_finish_is_drained_now_when_nothing_was_lost() {
+        let dir = temp_dir_for("finish_drained");
+        assert!(finish_unwritten_mark_at_shutdown(&dir, 0, 2_000));
+        match UnwrittenSealMark::in_dir(&dir).read_previous() {
+            PreviousUnwritten::Read(r) => {
+                assert!(r.clean);
+                assert_eq!(r.drained_at_unix_secs, Some(2_000));
+            }
+            other => panic!("expected a marker, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Audit PR31b-2: the previous marker is published once, first call wins.
+    #[test]
+    fn test_publish_previous_unwritten_stores_the_marker_once() {
+        let first = PreviousUnwritten::Absent;
+        let _ = publish_previous_unwritten(first);
+        let stored = previous_unwritten().expect("published");
+        assert!(!publish_previous_unwritten(PreviousUnwritten::Unreadable));
+        assert_eq!(
+            previous_unwritten(),
+            Some(stored),
+            "a second publish changes nothing"
+        );
+    }
+
     #[test]
     fn test_report_previous_unwritten_only_for_an_unclean_marker_holding_seals() {
         let unclean = |n| {
@@ -1778,6 +2135,7 @@ mod tests {
                 unwritten: n,
                 clean: false,
                 sampled_at_unix_secs: 100,
+                drained_at_unix_secs: None,
             })
         };
         assert_eq!(report_previous_unwritten(PreviousUnwritten::Absent, 200), 0);
@@ -1789,6 +2147,7 @@ mod tests {
                     unwritten: 7,
                     clean: true,
                     sampled_at_unix_secs: 100,
+                    drained_at_unix_secs: None,
                 }),
                 200
             ),
@@ -1876,11 +2235,154 @@ mod tests {
         let sample = body.find("mark.sample(").expect("claims the marker");
         let drain = body.find("runner.boot_drain()").expect("boot drain");
         assert!(read < sample && sample < drain);
+        // Audit PR31b-1: each final-drain exit writes the count on cancel, then
+        // drains, then updates the marker, in that order, and neither marks
+        // the shutdown clean on its own.
         assert_eq!(
-            body.matches("mark_clean_after_final_drain(&runner, &mut mark)")
+            body.matches("mark_after_final_drain(&runner, &mut mark)")
                 .count(),
             2,
-            "both final-drain exits mark the shutdown clean"
+            "both final-drain exits update the marker"
         );
+        assert!(!body.contains("mark.mark_clean("));
+        for exit in body
+            .split("record_unwritten_on_cancel(&runner, &mut mark);")
+            .skip(1)
+        {
+            let drain = exit.find("final_drain(&mut runner").expect("drains");
+            let update = exit
+                .find("mark_after_final_drain(&runner, &mut mark)")
+                .expect("updates");
+            assert!(drain < update, "the marker is updated after the drain");
+        }
+        assert_eq!(
+            body.matches("record_unwritten_on_cancel(&runner, &mut mark);")
+                .count(),
+            2,
+            "both final-drain exits record the count before draining"
+        );
+    }
+}
+
+/// Audit PR31b-1: the crash marker covers the escalation queue, which drains
+/// after the writer, and a shutdown that already paged its loss is not paged
+/// again at the next boot.
+#[cfg(test)]
+mod pr31b1_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn temp_pair(name: &str) -> (PathBuf, PathBuf) {
+        let mut base = std::env::temp_dir();
+        base.push(format!("tickvault-pr31b1-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let spill = base.join("spill");
+        let dlq = base.join("dlq");
+        std::fs::create_dir_all(&spill).expect("spill dir");
+        std::fs::create_dir_all(&dlq).expect("dlq dir");
+        (spill, dlq)
+    }
+
+    fn cleanup(spill: &std::path::Path) {
+        if let Some(base) = spill.parent() {
+            let _ = std::fs::remove_dir_all(base);
+        }
+    }
+
+    fn read(dir: &std::path::Path) -> UnwrittenSealRecord {
+        match UnwrittenSealMark::in_dir(dir).read_previous() {
+            PreviousUnwritten::Read(record) => record,
+            other => panic!("expected a marker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_record_now_writes_not_clean_without_the_throttle() {
+        let (spill, _dlq) = temp_pair("record-now");
+        let mut mark = UnwrittenSealMark::in_dir(&spill);
+        assert!(mark.sample(3, 1_000));
+        assert!(!mark.sample(9, 1_000), "a sample in the same second waits");
+        assert!(mark.record_now(9, 1_000), "record_now does not wait");
+        let record = read(&spill);
+        assert_eq!(record.unwritten, 9);
+        assert!(!record.clean);
+        cleanup(&spill);
+    }
+
+    #[test]
+    fn test_finish_unwritten_mark_at_shutdown_marks_clean_and_blocks_later_writes() {
+        let (spill, _dlq) = temp_pair("finish");
+        let mut writer_mark = UnwrittenSealMark::in_dir(&spill);
+        assert!(writer_mark.record_now(250_000, 1_000));
+        assert!(finish_unwritten_mark_at_shutdown(&spill, 7, 1_010));
+        let record = read(&spill);
+        assert!(record.clean);
+        assert_eq!(record.unwritten, 7, "the count main already paged");
+        // A writer that overran its budget finishes later: it must not turn
+        // the marker back to not clean, or the next boot pages it again.
+        assert!(!writer_mark.record_now(12, 1_020));
+        assert!(!writer_mark.sample(13, 1_030));
+        assert!(read(&spill).clean);
+        assert_eq!(
+            report_previous_unwritten(PreviousUnwritten::Read(read(&spill)), 1_040),
+            0,
+            "the next boot reports nothing"
+        );
+        // A second finish is harmless.
+        assert!(finish_unwritten_mark_at_shutdown(&spill, 7, 1_050));
+        cleanup(&spill);
+    }
+
+    #[test]
+    fn finishing_one_marker_leaves_another_directory_writable() {
+        let (finished, _dlq) = temp_pair("finish-one");
+        let (other, _dlq2) = temp_pair("finish-other");
+        assert!(finish_unwritten_mark_at_shutdown(&finished, 0, 1_000));
+        let mut mark = UnwrittenSealMark::in_dir(&other);
+        assert!(mark.record_now(4, 1_000));
+        assert_eq!(read(&other).unwritten, 4);
+        cleanup(&finished);
+        cleanup(&other);
+    }
+
+    #[test]
+    fn a_failed_finish_returns_false() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("tickvault-pr31b1-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!finish_unwritten_mark_at_shutdown(&dir, 0, 1_000));
+    }
+
+    #[tokio::test]
+    async fn a_final_drain_that_leaves_the_escalation_queue_holding_seals_is_not_clean() {
+        let (spill, dlq) = temp_pair("escalation-held");
+        let runner = SealWriterRunner::for_test(spill.clone(), dlq.clone(), 16, 16, 16);
+        let mut overflow = runner.overflow();
+        let sink = overflow.split_escalation_offload();
+        sink.pending_count()
+            .fetch_add(250, std::sync::atomic::Ordering::Relaxed);
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let task = tokio::spawn(run_seal_writer_loop(
+            runner,
+            Duration::from_secs(10),
+            cancel_rx,
+        ));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cancel_tx.send(true).expect("send");
+        let _ = tokio::time::timeout(Duration::from_millis(500), task)
+            .await
+            .expect("timeout")
+            .expect("panic");
+        let record = read(&spill);
+        assert!(
+            !record.clean,
+            "a kill while the escalation queue drains must be reported at the next boot"
+        );
+        assert_eq!(record.unwritten, 250);
+        // Main then finishes the shutdown once the escalation step is over.
+        assert!(finish_unwritten_mark_at_shutdown(&spill, 0, utc_now_secs()));
+        assert!(read(&spill).clean);
+        drop(sink);
+        cleanup(&spill);
     }
 }

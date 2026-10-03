@@ -93,7 +93,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::QUESTDB_TABLE_TICKS;
@@ -103,6 +103,10 @@ use tickvault_common::price_precision::{f32_to_f64_clean, round_to_2dp};
 use tickvault_common::sanitize::sanitize_ilp_symbol;
 use tickvault_common::segment::segment_code_to_str;
 use tickvault_common::tick_types::ParsedTick;
+
+use crate::feed_aux_persistence::{
+    AuxPacketKind, AuxPacketRow, FEED_AUX_ROWS_COUNTER, append_aux_row,
+};
 
 // ---------------------------------------------------------------------------
 // Table + key contract
@@ -347,6 +351,11 @@ pub struct TickRow {
     pub close: Option<f64>,
     /// Open interest. `None` → NULL.
     pub oi: Option<i64>,
+    /// Day-high open interest (Full packet bytes 38-41, NSE_FNO only). `None`
+    /// → NULL. Persisted since 2026-10-02 (item 45h); it never feeds a candle.
+    pub oi_day_high: Option<i64>,
+    /// Day-low open interest (Full packet bytes 42-45, NSE_FNO only). `None` → NULL.
+    pub oi_day_low: Option<i64>,
     /// Average traded price (VWAP). `None` → NULL.
     pub avg_price: Option<f64>,
     /// Last trade quantity. `None` → NULL.
@@ -492,6 +501,8 @@ impl TickRow {
             low: opt_price(tick.day_low),
             close: opt_price(tick.day_close),
             oi: opt_qty(tick.open_interest),
+            oi_day_high: opt_qty(tick.oi_day_high),
+            oi_day_low: opt_qty(tick.oi_day_low),
             avg_price: opt_price(tick.average_traded_price),
             last_trade_qty: (tick.last_trade_quantity != 0)
                 .then(|| i64::from(tick.last_trade_quantity)),
@@ -529,6 +540,8 @@ pub fn ticks_create_ddl() -> String {
             close DOUBLE, \
             volume LONG, \
             oi LONG, \
+            oi_day_high LONG, \
+            oi_day_low LONG, \
             avg_price DOUBLE, \
             last_trade_qty LONG, \
             total_buy_qty LONG, \
@@ -553,6 +566,8 @@ const TICKS_COLUMNS: &[(&str, &str)] = &[
     ("close", "DOUBLE"),
     ("volume", "LONG"),
     ("oi", "LONG"),
+    ("oi_day_high", "LONG"),
+    ("oi_day_low", "LONG"),
     ("avg_price", "DOUBLE"),
     ("last_trade_qty", "LONG"),
     ("total_buy_qty", "LONG"),
@@ -1168,6 +1183,38 @@ pub fn tick_spill_max_bytes() -> u64 {
     })
 }
 
+// O(1) EXEMPT: begin — the spill fdatasync runs only on the writer and
+// rescue threads after a failed flush, never on the frame drain (the drain's
+// inline spill passes no sync).
+/// How a spill write is made durable before its batch counts as rescued
+/// (Z8a, 2026-10-02). Injectable so a test can make the sync fail.
+pub(crate) type SpillSyncFn = fn(&std::fs::File) -> std::io::Result<()>;
+
+/// `fdatasync` on the spill file.
+///
+/// `File::flush` is a no-op for `std::fs::File`, so until 2026-10-02 a rescued
+/// payload sat in the page cache while the watermark it advanced was fsynced:
+/// a host crash kept the watermark, lost the spill bytes, and nothing counted
+/// it. A failed sync returns `Err`, which the callers treat exactly like a
+/// failed write: the range is marked unapplied and the loss counted.
+pub(crate) fn sync_spill_data(file: &std::fs::File) -> std::io::Result<()> {
+    file.sync_data()
+}
+// O(1) EXEMPT: end
+
+/// Writer thread and rescue thread: the spill is synced before the batch
+/// counts as rescued. Both run off the frame drain, so the wait blocks only
+/// them (a slow sync fills the rescue queue, whose overflow defers to the
+/// WAL — the safe direction).
+pub(crate) const SPILL_SYNC_OFF_DRAIN: Option<SpillSyncFn> = Some(sync_spill_data);
+
+/// The frame drain's own inline spill (rows with no WAL backing, or a busy
+/// rescue thread with unbacked rows). **Limitation:** NOT synced — an fsync
+/// there would block the task that empties the sockets. Those bytes reach the
+/// disk on the kernel's writeback, the same assumption the persisted
+/// watermark's durability lag (`WATERMARK_DURABILITY_LAG_SECS`) relies on.
+pub(crate) const SPILL_UNSYNCED_ON_DRAIN: Option<SpillSyncFn> = None;
+
 /// Appends a failed flush's ILP payload to the spill directory.
 ///
 /// # Why the payload is stored verbatim
@@ -1189,11 +1236,16 @@ pub fn tick_spill_max_bytes() -> u64 {
 /// `Err` when the directory cannot be created or the append fails. The caller
 /// treats that as "rescue unavailable" and falls back to the counted drop —
 /// a spill that cannot be written must never mask the loss.
+///
+/// `sync`: [`SPILL_SYNC_OFF_DRAIN`] from the writer and rescue threads (the
+/// payload is `fdatasync`ed before `Ok`), [`SPILL_UNSYNCED_ON_DRAIN`] from the
+/// drain's inline fallback. A failed sync is an `Err` like a failed write.
 fn spill_failed_ilp(
     dir: &Path,
     payload: &[u8],
     feed: Feed,
     now_unix_secs: i64,
+    sync: Option<SpillSyncFn>,
 ) -> std::io::Result<PathBuf> {
     // O(1) EXEMPT: begin — cold path, runs only on a flush failure.
     std::fs::create_dir_all(dir)?;
@@ -1359,6 +1411,9 @@ fn spill_failed_ilp(
         .open(&path)?;
     file.write_all(payload)?;
     file.flush()?;
+    if let Some(sync) = sync {
+        sync(&file)?;
+    }
     Ok(path)
     // O(1) EXEMPT: end
 }
@@ -1451,15 +1506,33 @@ pub const QUARANTINE_PRUNED_COUNTER: &str = "tv_tick_spill_quarantine_pruned_tot
 /// A directory that cannot be read is not an error here — there may simply be no
 /// quarantine yet, and failing a boot over a missing subdirectory would turn a
 /// housekeeping step into an outage.
-pub fn prune_quarantine(spill_dir: &Path, spill_max_bytes: u64) -> usize {
+///
+/// # The copy gate (plan item 45e-1, operator Quotes 27 + 28)
+///
+/// With `require_upload` on, a quarantined file is deleted only when its
+/// marker in `quarantine/uploaded/` records its current length and mtime —
+/// a verified gzip copy is in the cold bucket (`tick-quarantine/` or
+/// `depth-quarantine/`), so nothing is lost. A file with no such copy is
+/// KEPT even while the directory is over budget, counted on
+/// `tv_quarantine_prune_refused_not_uploaded_total`, with one coded line per
+/// pass. The cost, stated plainly: until the uploader catches up, quarantine
+/// may hold more than its share of the spill ceiling, and new rescues can be
+/// refused sooner. The operator's rule is that no market data leaves the box
+/// without a copy; the rescue tier's refusals stay counted and loud.
+///
+/// `spill_max_bytes` is the ceiling of the spill directory THIS quarantine
+/// belongs to — the tick one or the depth one (see
+/// `tick_spill_replay::spill_max_bytes_for_dir`).
+pub fn prune_quarantine(spill_dir: &Path, spill_max_bytes: u64, require_upload: bool) -> usize {
+    let gate = crate::raw_frame_upload::CopyGate::from_config(require_upload);
     let budget = spill_max_bytes / QUARANTINE_BUDGET_FRACTION;
     let dir = spill_dir.join(crate::tick_spill_replay::QUARANTINE_DIR);
-    // O(1) EXEMPT: begin — boot-time housekeeping over a flat directory, never
+    // O(1) EXEMPT: begin — cold housekeeping over a flat directory, never
     // on any per-tick or per-frame path.
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return 0;
     };
-    let mut files: Vec<(std::time::SystemTime, u64, std::path::PathBuf)> = entries
+    let mut files: Vec<(std::time::SystemTime, std::fs::Metadata, std::path::PathBuf)> = entries
         .filter_map(std::result::Result::ok)
         .filter_map(|e| {
             let meta = e.metadata().ok()?;
@@ -1468,42 +1541,96 @@ pub fn prune_quarantine(spill_dir: &Path, spill_max_bytes: u64) -> usize {
             }
             Some((
                 meta.modified().unwrap_or(std::time::UNIX_EPOCH),
-                meta.len(),
+                meta,
                 e.path(),
             ))
         })
         .collect();
-    let mut total: u64 = files.iter().map(|(_, len, _)| *len).sum();
+    let mut total: u64 = files.iter().map(|(_, meta, _)| meta.len()).sum();
     if total <= budget {
         return 0;
     }
     files.sort_by_key(|(mtime, _, _)| *mtime);
     let mut removed = 0usize;
-    for (_, len, path) in files {
+    let mut refused = 0usize;
+    let mut refused_bytes = 0u64;
+    for (_, meta, path) in files {
         if total <= budget {
             break;
         }
-        if std::fs::remove_file(&path).is_ok() {
-            total = total.saturating_sub(len);
-            removed += 1;
-            metrics::counter!(QUARANTINE_PRUNED_COUNTER).increment(1);
-            error!(
-                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
-                path = %path.display(),
-                bytes = len,
-                budget,
-                "DELETED a quarantined tick spill file to keep the quarantine directory \
-                 inside its share of the spill ceiling. Its recoverable lines are gone. \
-                 This is deliberate and it is the lesser loss: quarantine counts toward \
-                 the spill ceiling, so an unbounded quarantine would return StorageFull \
-                 for every future rescue — permanently disabling the tier that keeps \
-                 live ticks, for this process and every boot after it."
-            );
+        let len = meta.len();
+        if !gate.allows_delete(&path, &meta) {
+            refused += 1;
+            refused_bytes = refused_bytes.saturating_add(len);
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                gate.forget(&path);
+                total = total.saturating_sub(len);
+                removed += 1;
+                metrics::counter!(QUARANTINE_PRUNED_COUNTER).increment(1);
+                if gate.copy_in_s3() {
+                    info!(
+                        path = %path.display(),
+                        bytes = len,
+                        budget,
+                        "deleted a quarantined spill file to keep the quarantine directory \
+                         inside its share of the spill ceiling; a verified copy is in the \
+                         cold bucket, so nothing is lost"
+                    );
+                } else {
+                    error!(
+                        code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                        path = %path.display(),
+                        bytes = len,
+                        budget,
+                        "DELETED a quarantined spill file to keep the quarantine directory \
+                         inside its share of the spill ceiling, with NO cold copy (the copy \
+                         gate is off). Its recoverable lines are gone. This is deliberate \
+                         and it is the lesser loss: quarantine counts toward the spill \
+                         ceiling, so an unbounded quarantine would return StorageFull for \
+                         every future rescue — permanently disabling the tier that keeps \
+                         live data, for this process and every boot after it."
+                    );
+                }
+            }
+            Err(err) => {
+                error!(
+                    code = ErrorCode::StorageGap05DiskPressureUnrelievable.code_str(),
+                    path = %path.display(),
+                    error = %err,
+                    "could not delete a quarantined spill file to keep the quarantine \
+                     inside its budget — it stays and is retried on the next pass"
+                );
+            }
         }
     }
     // O(1) EXEMPT: end
+    if refused > 0 {
+        // APPROVED: cast — a per-pass file count, always <= u64.
+        metrics::counter!(QUARANTINE_PRUNE_REFUSED_NOT_UPLOADED_COUNTER).increment(refused as u64);
+        error!(
+            code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
+            source = "quarantine_prune",
+            dir = %dir.display(),
+            files = refused,
+            bytes = refused_bytes,
+            budget,
+            "quarantined spill files over the quarantine budget were KEPT, not deleted: no \
+             verified copy of them is in the cold bucket yet. They go once the uploader has \
+             copied them; until then the quarantine holds more than its share of the spill \
+             ceiling."
+        );
+    }
     removed
 }
+
+/// Counter: quarantined spill files the budget trim KEPT because no verified
+/// cold copy is recorded for them (plan item 45e-1). The trim logs one coded
+/// STORAGE-GAP-04 line per pass that refuses any.
+pub const QUARANTINE_PRUNE_REFUSED_NOT_UPLOADED_COUNTER: &str =
+    "tv_quarantine_prune_refused_not_uploaded_total";
 /// ILP-over-HTTP conf: per-flush server ACK (the 2026-07-05 fire-and-forget
 /// lesson) with `retry_timeout=0` (the caller owns retry cadence) and a bounded
 /// `request_timeout` so a hung flush cannot wedge the pipeline.
@@ -1711,6 +1838,25 @@ pub struct TickWriter {
     /// does not start the next batch from a zero-capacity buffer. `None`
     /// until [`TickWriter::split_for_offload`] runs (item 44g).
     spare_buffers: Option<std::sync::mpsc::Receiver<Buffer>>,
+    /// `tv_feed_aux_rows_total{kind}` handles, one per
+    /// [`AuxPacketKind`], resolved once so an append is a counter increment
+    /// and never a label-vector allocation (plan item 45h).
+    aux_counters: [metrics::Counter; 6],
+    /// `feed_aux_packets` rows appended by this writer over its life. The
+    /// buffer carries `ticks` and `feed_aux_packets` rows together, so
+    /// `pending` alone cannot say which table a pending row is for.
+    aux_rows_appended: u64,
+}
+
+/// Pre-resolves the per-kind `tv_feed_aux_rows_total` handles (plan item 45h).
+/// The label value is a `&'static str` from a closed set, resolved once per
+/// writer, so the append path never builds a label vector.
+fn aux_row_counters() -> [metrics::Counter; 6] {
+    AuxPacketKind::ALL.map(|k| {
+        let c = metrics::counter!(FEED_AUX_ROWS_COUNTER, "kind" => k.as_str());
+        c.increment(0);
+        c
+    })
 }
 
 /// Pre-resolved refusal counters -- one handle per reason, per writer.
@@ -2004,6 +2150,8 @@ impl TickWriter {
                     retained_spans: 0,
                     flush_counters: TickFlushCounters::new(feed),
                     spare_buffers: None,
+                    aux_counters: aux_row_counters(),
+                    aux_rows_appended: 0,
                 }
             }
             Err(err) => {
@@ -2028,6 +2176,8 @@ impl TickWriter {
                     retained_spans: 0,
                     flush_counters: TickFlushCounters::new(feed),
                     spare_buffers: None,
+                    aux_counters: aux_row_counters(),
+                    aux_rows_appended: 0,
                 }
             }
         }
@@ -2070,6 +2220,8 @@ impl TickWriter {
             retained_spans: 0,
             flush_counters: TickFlushCounters::new(feed),
             spare_buffers: None,
+            aux_counters: aux_row_counters(),
+            aux_rows_appended: 0,
         }
     }
 
@@ -2109,6 +2261,29 @@ impl TickWriter {
         // can never be deferred to it (2026-09-26 audit fix PR3).
         self.pending_unbacked = true;
         self.append_tick_with_seq(tick, next_capture_seq())
+    }
+
+    /// Marks the pending rows as having NO write-ahead-log record behind them
+    /// (2026-10-02).
+    ///
+    /// For a frame whose WAL append was REFUSED but which still entered the
+    /// ring (`CapturedFrame::wal_backed == false`). Its rows carry a non-zero,
+    /// replay-shaped `capture_seq`, so without this flag a busy rescue thread
+    /// would hand them "to the WAL for replay" and drop them — but no WAL
+    /// segment holds them, so that replay never comes. Marked, they keep the
+    /// inline spill: written, never dropped on that assumption.
+    ///
+    /// One `bool` store, no allocation. Sticky until `discard_pending`
+    /// consumes it; a stale `true` only costs one inline spill, never a row.
+    pub fn mark_pending_unbacked(&mut self) {
+        self.pending_unbacked = true;
+    }
+
+    /// Whether the pending rows are marked as lacking WAL backing.
+    #[must_use]
+    // TEST-EXEMPT: accessor, asserted by `mark_pending_unbacked_keeps_rows_in_the_inline_spill`.
+    pub fn pending_unbacked(&self) -> bool {
+        self.pending_unbacked
     }
 
     /// Appends a live tick with a caller-supplied, replay-stable `capture_seq`
@@ -2178,6 +2353,9 @@ impl TickWriter {
                     });
                     if !in_band {
                         self.out_of_window.note(TICK_TS_OUT_OF_BAND_REASON);
+                        // Refused by `ticks`, kept in `feed_aux_packets` (plan item 45h):
+                        // the row is stamped at receipt there, so no partition moves.
+                        self.persist_refused_tick(tick, capture_seq);
                         return Ok(());
                     }
                 }
@@ -2193,6 +2371,10 @@ impl TickWriter {
                     self.out_of_window.note(verdict.reason());
                 }
                 if verdict.is_refusal() {
+                    // Out of the 09:00-15:40 window: not a `ticks` row (operator,
+                    // 2026-09-05), but never dropped (operator, 2026-09-29) —
+                    // it goes to `feed_aux_packets`, stamped at receipt.
+                    self.persist_refused_tick(tick, capture_seq);
                     return Ok(());
                 }
                 self.append_row(&row)
@@ -2326,6 +2508,16 @@ impl TickWriter {
         if let Some(v) = row.oi {
             self.buffer.column_i64("oi", v).context("oi")?;
         }
+        if let Some(v) = row.oi_day_high {
+            self.buffer
+                .column_i64("oi_day_high", v)
+                .context("oi_day_high")?;
+        }
+        if let Some(v) = row.oi_day_low {
+            self.buffer
+                .column_i64("oi_day_low", v)
+                .context("oi_day_low")?;
+        }
         if let Some(v) = row.avg_price {
             self.buffer
                 .column_f64("avg_price", v)
@@ -2368,6 +2560,82 @@ impl TickWriter {
         self.last_capture_seq = self.last_capture_seq.max(row.capture_seq);
         self.note_pending_seq(row.capture_seq);
         Ok(())
+    }
+
+    /// Appends one `feed_aux_packets` row to this writer's ILP buffer (plan
+    /// item 45h).
+    ///
+    /// Same buffer as the `ticks` rows on purpose: the rows then share the
+    /// offload thread, the rescue tier, the spill files (an ILP payload may
+    /// name several tables) and the WAL applied-watermark range, so an aux row
+    /// is exactly as durable as a tick and needs no second writer. `pending`
+    /// counts it, so the size trigger and the flush see it.
+    ///
+    /// O(1), allocation-free apart from the buffer's amortised growth.
+    ///
+    /// # Errors
+    /// ILP buffer errors. The row is then a counted loss, exactly as a tick
+    /// append failure is: the frame is marked unapplied so the next replay
+    /// re-offers it, and `tv_ticks_dropped_total` is incremented.
+    pub fn append_aux(&mut self, row: &AuxPacketRow) -> Result<()> {
+        match append_aux_row(&mut self.buffer, self.feed.as_str(), row) {
+            Ok(()) => {
+                self.pending = self.pending.saturating_add(1);
+                self.aux_rows_appended = self.aux_rows_appended.saturating_add(1);
+                if let Some(c) = self.aux_counters.get(row.kind.index()) {
+                    c.increment(1);
+                }
+                self.note_pending_seq(row.capture_seq);
+                Ok(())
+            }
+            Err(err) => {
+                crate::wal_applied_watermark::applied_watermark()
+                    .note_unapplied(u64::try_from(row.capture_seq).unwrap_or(0));
+                self.flush_counters.append_dropped.increment(1);
+                self.flush_counters.append_failures =
+                    self.flush_counters.append_failures.saturating_add(1);
+                if self.flush_counters.append_failures.is_power_of_two() {
+                    error!(
+                        code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                        feed = self.feed.as_str(),
+                        security_id = row.security_id,
+                        kind = row.kind.as_str(),
+                        capture_seq = row.capture_seq,
+                        source = "ilp_append_failed",
+                        failures_so_far = self.flush_counters.append_failures,
+                        error = %err,
+                        "feed_aux_packets row could not be appended to the ILP buffer — \
+                         counted on tv_ticks_dropped_total and the frame marked unapplied \
+                         so the next replay re-offers it. Logged at powers of two."
+                    );
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// Persists a tick the `ticks` window or band gate refused as a
+    /// `feed_aux_packets` row of kind `out_of_window_tick`, stamped at receipt.
+    ///
+    /// Returns nothing on purpose: a failed append is already counted, logged
+    /// and marked unapplied inside [`Self::append_aux`]. Handing that `Err`
+    /// back would run the caller's tick-loss block a second time for the same
+    /// frame, and the window refusal itself is not a loss.
+    fn persist_refused_tick(&mut self, tick: &ParsedTick, capture_seq: i64) {
+        if let Some(row) =
+            AuxPacketRow::from_tick(AuxPacketKind::OutOfWindowTick, tick, capture_seq)
+        {
+            // Failure handled (counted + unapplied) inside `append_aux`.
+            let _handled = self.append_aux(&row).is_ok();
+        }
+        // `None` is unreachable: `from_parsed_tick` already proved the id
+        // fits, and the refusal is counted inside `from_header` either way.
+    }
+
+    /// `feed_aux_packets` rows this writer has appended over its life.
+    #[must_use]
+    pub const fn aux_rows_appended(&self) -> u64 {
+        self.aux_rows_appended
     }
 
     /// Widens the pending sequence range to cover one appended row.
@@ -2574,6 +2842,7 @@ impl TickWriter {
         let sink = TickRescueSink {
             spill_dir: self.spill_dir.clone(), // APPROVED: PathBuf moved into the rescue offload writer, once per process
             feed: self.feed,
+            spill_sync: SPILL_SYNC_OFF_DRAIN,
         };
         self.rescue = Some(tx);
         (sink, rx)
@@ -2748,11 +3017,24 @@ impl TickWriter {
         let mut rescue_unavailable = false;
         if let Some(tx) = self.rescue.as_ref() {
             let protocol = self.buffer.protocol_version();
+            // Z7 (2026-10-02): a queued batch is neither acked nor marked
+            // unapplied while the writer keeps acking LATER batches, so the
+            // PERSISTED watermark is held below it until the rescue thread
+            // has synced it (or failed and marked it). At most 8 CASes, no
+            // allocation, no lock; a full floor table marks the range
+            // unapplied instead (replay more).
+            let wm = crate::wal_applied_watermark::applied_watermark();
+            let floor = wm.hold_rescue_floor(
+                crate::wal_applied_watermark::AppliedSink::Ticks,
+                range.0,
+                range.1,
+            );
             let batch = RescueBatch {
                 buffer: std::mem::replace(&mut self.buffer, Buffer::new(protocol)),
                 rows: dropped,
                 min_seq: range.0,
                 max_seq: range.1,
+                floor,
             };
             match tx.try_send(batch) {
                 Ok(()) => {
@@ -2760,7 +3042,7 @@ impl TickWriter {
                     // Counted like a writer hand-off, so a replay confirm waits
                     // for the rescue thread too — a payload in THIS queue is
                     // not yet in any file.
-                    crate::wal_applied_watermark::applied_watermark().note_ticks_handed_off();
+                    wm.note_ticks_handed_off();
                     self.pending = 0;
                     self.install_spare_buffer(protocol);
                     return dropped;
@@ -2769,11 +3051,19 @@ impl TickWriter {
                     // The rescue thread is behind. Take the buffer BACK and
                     // write inline below — slower, but nothing is lost and
                     // nothing is reported as lost.
+                    // The batch never reached the thread, so its floor is
+                    // retracted; the arms below mark or spill the range.
+                    if let Some(floor) = returned.floor {
+                        wm.release_rescue_floor(floor);
+                    }
                     self.buffer = returned.buffer;
                     self.flush_counters.rescue_fallback_queue_full.increment(1);
                     rescue_unavailable = true;
                 }
                 Err(std::sync::mpsc::TrySendError::Disconnected(returned)) => {
+                    if let Some(floor) = returned.floor {
+                        wm.release_rescue_floor(floor);
+                    }
                     self.buffer = returned.buffer;
                     self.flush_counters.rescue_fallback_thread_gone.increment(1);
                     rescue_unavailable = true;
@@ -2820,8 +3110,14 @@ impl TickWriter {
             return dropped;
         }
 
-        let landed =
-            perform_tick_rescue(&self.spill_dir, self.buffer.as_bytes(), self.feed, dropped);
+        // The drain's inline spill is NOT synced (see `SPILL_UNSYNCED_ON_DRAIN`).
+        let landed = perform_tick_rescue(
+            &self.spill_dir,
+            self.buffer.as_bytes(),
+            self.feed,
+            dropped,
+            SPILL_UNSYNCED_ON_DRAIN,
+        );
         note_rescue_outcome_ticks(landed, range, false);
         self.buffer.clear();
         self.pending = 0;
@@ -2858,12 +3154,18 @@ fn note_rescue_outcome_ticks(landed: bool, range: (u64, u64), in_order: bool) {
 /// thread and the inline fallback in [`TickPersistenceWriter::discard_pending`].
 /// Two copies would have drifted, and the copy that drifted would have been the
 /// fallback — the one that only runs on the worst day.
-fn perform_tick_rescue(spill_dir: &Path, payload: &[u8], feed: Feed, dropped: usize) -> bool {
+fn perform_tick_rescue(
+    spill_dir: &Path,
+    payload: &[u8],
+    feed: Feed,
+    dropped: usize,
+    sync: Option<SpillSyncFn>,
+) -> bool {
     let payload_len = payload.len();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0_i64, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
-    match spill_failed_ilp(spill_dir, payload, feed, now) {
+    match spill_failed_ilp(spill_dir, payload, feed, now, sync) {
         Ok(path) => {
             // BOTH counters, and the alarmed one is not optional.
             //
@@ -2977,6 +3279,11 @@ pub struct RescueBatch {
     /// Lowest / highest `capture_seq` in this payload (`0` = unknown).
     min_seq: u64,
     max_seq: u64,
+    /// This batch's hold on the persisted watermark (Z7); released by the
+    /// rescue thread once the write is synced or has failed and been marked.
+    /// An abandoned batch (shutdown) never releases it, so the final persist
+    /// keeps the range replayable.
+    floor: Option<crate::wal_applied_watermark::RescueFloor>,
 }
 
 impl RescueBatch {
@@ -2995,6 +3302,8 @@ impl RescueBatch {
 pub struct TickRescueSink {
     spill_dir: PathBuf,
     feed: Feed,
+    /// [`SPILL_SYNC_OFF_DRAIN`] in production; a test injects a failing sync.
+    spill_sync: Option<SpillSyncFn>,
 }
 
 impl TickRescueSink {
@@ -3010,11 +3319,18 @@ impl TickRescueSink {
             batch.buffer.as_bytes(),
             self.feed,
             batch.rows,
+            self.spill_sync,
         );
         note_rescue_outcome_ticks(landed, (batch.min_seq, batch.max_seq), false);
+        let wm = crate::wal_applied_watermark::applied_watermark();
+        // Released only now: the spill is synced (Z8a) or the range is marked
+        // unapplied, so the persisted watermark may pass the batch (Z7).
+        if let Some(floor) = batch.floor {
+            wm.release_rescue_floor(floor);
+        }
         // The hand-off was counted when the producer queued this payload; the
         // replay confirm waits for this completion like any writer batch.
-        crate::wal_applied_watermark::applied_watermark().note_ticks_completed();
+        wm.note_ticks_completed();
     }
 }
 // ---------------------------------------------------------------------------
@@ -3388,7 +3704,13 @@ impl TickWriterSink {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0_i64, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
-        match spill_failed_ilp(&self.spill_dir, batch.buffer.as_bytes(), self.feed, now) {
+        match spill_failed_ilp(
+            &self.spill_dir,
+            batch.buffer.as_bytes(),
+            self.feed,
+            now,
+            SPILL_SYNC_OFF_DRAIN,
+        ) {
             Ok(path) => {
                 note_rescue_outcome_ticks(true, (batch.min_seq, batch.max_seq), true);
                 self.counters.dropped.increment(rows as u64);
@@ -3502,11 +3824,116 @@ mod tests {
         let mut w = TickWriter::for_test(Feed::Dhan);
         w.append_tick_with_seq(&tick, 1)
             .expect("a refusal is Ok(()) -- never an Err, which would be counted as a loss");
+        // Re-blessed 2026-10-02 (item 45h): the refused tick is no longer
+        // dropped — it lands as ONE `feed_aux_packets` row stamped at receipt.
+        // `ticks` still gets nothing, which is what this test exists to pin.
         assert_eq!(
-            w.pending(),
+            w.aux_rows_appended(),
+            1,
+            "the refused tick is kept as an auxiliary row"
+        );
+        assert_eq!(w.pending(), 1, "the only pending row is the aux row");
+        assert!(
+            !w.buffer_utf8().lines().any(|l| l.starts_with("ticks,")),
+            "a year-2052 stamp must be REFUSED from `ticks` even though its \
+             seconds-of-day sit inside the session window"
+        );
+    }
+
+    /// Item 45h: a tick stamped after 15:40 IST (the post-close closing-price
+    /// broadcast) is refused by the `ticks` window gate and WRITTEN to
+    /// `feed_aux_packets` as `out_of_window_tick`, with its trade fields and
+    /// trade time kept and its designated timestamp at receipt.
+    #[test]
+    fn test_append_aux_a_post_close_tick_is_written_to_feed_aux_not_ticks() {
+        let mut tick = sample_tick();
+        // 15:45:00 IST on the fixture's day: 12:30:00 + 3h15m.
+        tick.exchange_timestamp += 3 * 3600 + 15 * 60;
+        tick.received_at_nanos += (3 * 3600 + 15 * 60) * 1_000_000_000;
+        let mut w = TickWriter::for_test(Feed::Dhan);
+        w.append_tick_with_seq(&tick, 77).expect("refusal is Ok");
+        let buf = w.buffer_utf8();
+        assert!(!buf.lines().any(|l| l.starts_with("ticks,")), "{buf}");
+        let line = buf
+            .lines()
+            .find(|l| l.starts_with("feed_aux_packets,"))
+            .expect("the post-close tick must be written to feed_aux_packets");
+        assert!(line.contains(",kind=out_of_window_tick"), "{line}");
+        assert!(line.contains(",feed=dhan"), "{line}");
+        assert!(line.contains("ltp=23146.45"), "{line}");
+        assert!(line.contains("capture_seq=77i"), "{line}");
+        let receipt_ist =
+            tick.received_at_nanos + tickvault_common::constants::IST_UTC_OFFSET_NANOS;
+        assert!(
+            line.ends_with(&format!(" {receipt_ist}")),
+            "designated ts must be the receipt in IST: {line}"
+        );
+        assert_eq!(w.aux_rows_appended(), 1);
+        assert_eq!(w.pending(), 1);
+    }
+
+    /// `append_aux` counts the row as pending (so the size trigger and flush
+    /// see it) and widens the WAL sequence range like a tick.
+    #[test]
+    fn test_append_aux_counts_pending_and_appended() {
+        let mut w = TickWriter::for_test(Feed::Dhan);
+        let row = AuxPacketRow::from_header(
+            AuxPacketKind::MarketStatus,
+            13,
             0,
-            "a year-2052 stamp must be REFUSED even though its seconds-of-day \
-             sit inside the session window"
+            1_779_951_600_111_000_000,
+            1_779_951_600_111_000_000,
+        )
+        .expect("row");
+        w.append_aux(&row).expect("append");
+        w.append_aux(&row).expect("append");
+        assert_eq!(w.aux_rows_appended(), 2);
+        assert_eq!(w.pending(), 2);
+        assert_eq!(
+            w.buffer_utf8()
+                .lines()
+                .filter(|l| l.starts_with("feed_aux_packets,"))
+                .count(),
+            2
+        );
+    }
+
+    /// `aux_rows_appended` starts at zero and an in-window tick never moves it.
+    #[test]
+    fn test_aux_rows_appended_is_zero_for_an_in_window_tick() {
+        let mut w = TickWriter::for_test(Feed::Dhan);
+        assert_eq!(w.aux_rows_appended(), 0);
+        w.append_tick_with_seq(&sample_tick(), 5).expect("append");
+        assert_eq!(w.aux_rows_appended(), 0);
+        assert_eq!(w.pending(), 1);
+    }
+
+    /// Item 45h (a): the Full packet's day-high / day-low OI reach `ticks`;
+    /// a zero (Ticker / Quote packets, non-F&O) stays NULL, never `0`.
+    #[test]
+    fn test_ticks_carry_oi_day_high_and_low_and_null_them_when_zero() {
+        let mut tick = sample_tick();
+        tick.oi_day_high = 1_000_500;
+        tick.oi_day_low = 950_000;
+        let row = TickRow::from_parsed_tick(&tick, 9).expect("row");
+        assert_eq!(row.oi_day_high, Some(1_000_500));
+        assert_eq!(row.oi_day_low, Some(950_000));
+        let mut w = TickWriter::for_test(Feed::Dhan);
+        w.append_row(&row).expect("append");
+        let line = w.buffer_utf8();
+        assert!(line.contains("oi_day_high=1000500i"), "{line}");
+        assert!(line.contains("oi_day_low=950000i"), "{line}");
+
+        let zero = TickRow::from_parsed_tick(&sample_tick(), 9).expect("row");
+        assert_eq!(zero.oi_day_high, None);
+        assert_eq!(zero.oi_day_low, None);
+        let mut w = TickWriter::for_test(Feed::Dhan);
+        w.append_row(&zero).expect("append");
+        assert!(!w.buffer_utf8().contains("oi_day_"));
+        // DEDUP key unchanged by the new columns.
+        assert_eq!(
+            DEDUP_KEY_TICKS,
+            "ts, security_id, segment, capture_seq, feed"
         );
     }
 
@@ -4775,8 +5202,9 @@ mod tests {
     // ======================================================================
 
     // `Connection: close` is load-bearing, not decoration. `ensure_ticks_table`
-    // drives TWENTY DDL statements through ONE `reqwest::Client` — 1 CREATE plus
-    // one ADD COLUMN per entry in `TICKS_COLUMNS` (19) — and reqwest pools the
+    // drives TWENTY-TWO DDL statements through ONE `reqwest::Client` — 1 CREATE,
+    // one ADD COLUMN per entry in `TICKS_COLUMNS` (20) and the DEDUP ENABLE —
+    // and reqwest pools the
     // socket between them. This mock answers, then DROPS the stream, so without
     // the header reqwest can reuse a connection the mock has already closed and a
     // later statement fails, flipping the verdict to false. It is the pattern
@@ -5333,8 +5761,14 @@ mod tests {
         // lie and nobody would find out until they needed it.
         let dir = scratch_dir("verbatim");
         let payload = b"ticks,feed=dhan,segment=IDX_I security_id=13i 1700000000000000000\n";
-        let path = spill_failed_ilp(&dir, payload, Feed::Dhan, 1_700_000_000)
-            .expect("spill writes to a fresh dir");
+        let path = spill_failed_ilp(
+            &dir,
+            payload,
+            Feed::Dhan,
+            1_700_000_000,
+            SPILL_SYNC_OFF_DRAIN,
+        )
+        .expect("spill writes to a fresh dir");
         let written = std::fs::read(&path).expect("spill file is readable");
         assert_eq!(
             written.as_slice(),
@@ -5352,8 +5786,16 @@ mod tests {
         let dir = scratch_dir("append");
         let first = b"ticks first=1i 1700000000000000000\n";
         let second = b"ticks second=2i 1700000000000000001\n";
-        let p1 = spill_failed_ilp(&dir, first, Feed::Dhan, 1_700_000_000).expect("first spill");
-        let p2 = spill_failed_ilp(&dir, second, Feed::Dhan, 1_700_000_000).expect("second spill");
+        let p1 = spill_failed_ilp(&dir, first, Feed::Dhan, 1_700_000_000, SPILL_SYNC_OFF_DRAIN)
+            .expect("first spill");
+        let p2 = spill_failed_ilp(
+            &dir,
+            second,
+            Feed::Dhan,
+            1_700_000_000,
+            SPILL_SYNC_OFF_DRAIN,
+        )
+        .expect("second spill");
         assert_eq!(p1, p2, "same feed, same hour, same file");
         let written = std::fs::read(&p1).expect("readable");
         let mut expected = first.to_vec();
@@ -5367,8 +5809,22 @@ mod tests {
         // Bounded file count with a replayable granularity: an operator
         // repairing a known-bad window must not have to re-ingest the day.
         let dir = scratch_dir("split");
-        let a = spill_failed_ilp(&dir, b"a\n", Feed::Dhan, 1_700_000_000).expect("a");
-        let b = spill_failed_ilp(&dir, b"b\n", Feed::Dhan, 1_700_003_600).expect("b");
+        let a = spill_failed_ilp(
+            &dir,
+            b"a\n",
+            Feed::Dhan,
+            1_700_000_000,
+            SPILL_SYNC_OFF_DRAIN,
+        )
+        .expect("a");
+        let b = spill_failed_ilp(
+            &dir,
+            b"b\n",
+            Feed::Dhan,
+            1_700_003_600,
+            SPILL_SYNC_OFF_DRAIN,
+        )
+        .expect("b");
         assert_ne!(a, b, "a different hour is a different file");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5384,7 +5840,14 @@ mod tests {
             0,
             "a dir that does not exist reads 0"
         );
-        spill_failed_ilp(&dir, b"0123456789", Feed::Dhan, 1_700_000_000).expect("spill");
+        spill_failed_ilp(
+            &dir,
+            b"0123456789",
+            Feed::Dhan,
+            1_700_000_000,
+            SPILL_SYNC_OFF_DRAIN,
+        )
+        .expect("spill");
         assert_eq!(spill_dir_bytes(&dir), 10, "exactly the bytes written");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5403,7 +5866,14 @@ mod tests {
     #[test]
     fn quarantined_bytes_count_toward_the_spill_ceiling() {
         let dir = scratch_dir("quarantine-counts");
-        spill_failed_ilp(&dir, b"0123456789", Feed::Dhan, 1_700_000_000).expect("spill");
+        spill_failed_ilp(
+            &dir,
+            b"0123456789",
+            Feed::Dhan,
+            1_700_000_000,
+            SPILL_SYNC_OFF_DRAIN,
+        )
+        .expect("spill");
         assert_eq!(spill_dir_bytes(&dir), 10, "baseline: the live spill file");
 
         let q = dir.join(crate::tick_spill_replay::QUARANTINE_DIR);
@@ -5564,6 +6034,55 @@ mod tests {
             "no capture sequence -> inline spill, never a drop"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 2026-10-02: rows from a frame the WAL REFUSED carry a real, non-zero
+    /// capture sequence yet exist in no WAL segment. Marked unbacked, they must
+    /// take the inline spill when the rescue thread is gone — never the
+    /// "deferred to the WAL" drop, whose replay can never come.
+    #[test]
+    fn mark_pending_unbacked_keeps_rows_in_the_inline_spill() {
+        let dir = scratch_dir("unbacked-inline");
+        let mut writer = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (_sink, rx) = writer.split_rescue_offload();
+        drop(rx); // thread gone -> Disconnected on try_send
+        writer
+            .append_tick_with_seq(&sample_tick(), 1 << 20)
+            .expect("buffers without a sender");
+        assert!(
+            !writer.pending_unbacked(),
+            "a WAL-shaped sequence alone reads as backed"
+        );
+        writer.mark_pending_unbacked();
+        assert!(writer.pending_unbacked());
+
+        assert_eq!(writer.discard_pending(), 1, "the row left the buffer");
+
+        let spilled = std::fs::read_dir(&dir)
+            .expect("the inline rescue created the dir")
+            .filter_map(std::result::Result::ok)
+            .count();
+        assert_eq!(
+            spilled, 1,
+            "an unbacked row must be written inline, never dropped as WAL-backed"
+        );
+        assert!(
+            !writer.pending_unbacked(),
+            "discard_pending consumes the mark"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fresh writer reads as backed; the mark sets it and nothing but
+    /// `discard_pending` clears it.
+    #[test]
+    fn pending_unbacked_is_false_until_marked() {
+        let mut writer = TickWriter::for_test(Feed::Dhan);
+        assert!(!writer.pending_unbacked());
+        writer.mark_pending_unbacked();
+        assert!(writer.pending_unbacked());
+        writer.mark_pending_unbacked();
+        assert!(writer.pending_unbacked(), "marking twice is idempotent");
     }
 
     #[test]
@@ -5814,7 +6333,7 @@ mod tests {
             f.set_modified(t).expect("set mtime");
         }
 
-        let removed = prune_quarantine(&dir, ceiling);
+        let removed = prune_quarantine(&dir, ceiling, false);
 
         assert!(
             removed >= 3,
@@ -5829,6 +6348,51 @@ mod tests {
             q.join("d.ilp").exists(),
             "the NEWEST quarantined file must survive the trim"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Operator Quotes 27 + 28: with the copy gate on, a quarantined file over
+    /// the budget is deleted only when a verified cold copy is recorded; the
+    /// rest are kept even though the directory stays over budget.
+    #[test]
+    fn test_prune_quarantine_over_budget_keeps_files_without_a_marker() {
+        let dir = std::env::temp_dir().join(format!(
+            "tv-quarantine-gate-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let q = dir.join(crate::tick_spill_replay::QUARANTINE_DIR);
+        std::fs::create_dir_all(&q).expect("temp quarantine");
+        for (i, name) in ["a.ilp", "b.ilp", "c.ilp", "d.ilp"].iter().enumerate() {
+            std::fs::write(q.join(name), vec![b'x'; 60]).expect("write");
+            let t = std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(1_700_000_000 + i as u64 * 60);
+            let f = std::fs::File::options()
+                .write(true)
+                .open(q.join(name))
+                .expect("reopen");
+            f.set_modified(t).expect("set mtime");
+        }
+        // Only the second-oldest has a verified copy.
+        crate::raw_frame_upload::write_file_marker_for_test(&q.join("b.ilp"));
+
+        // Budget = 400 / 4 = 100 bytes against 240 on disk.
+        let removed = prune_quarantine(&dir, 400, true);
+
+        assert_eq!(removed, 1, "only the copied file may go");
+        assert!(!q.join("b.ilp").exists());
+        assert!(
+            !q.join(crate::raw_frame_upload::UPLOADED_SUBDIR)
+                .join("b.ilp")
+                .exists(),
+            "its marker goes with it"
+        );
+        for kept in ["a.ilp", "c.ilp", "d.ilp"] {
+            assert!(q.join(kept).exists(), "{kept} has no copy and must stay");
+        }
+        // The markers directory is never taken for a quarantined file.
+        assert!(q.join(crate::raw_frame_upload::UPLOADED_SUBDIR).is_dir());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5848,7 +6412,7 @@ mod tests {
         std::fs::create_dir_all(&q).expect("temp quarantine");
         std::fs::write(q.join("small.ilp"), b"tiny").expect("write");
 
-        assert_eq!(prune_quarantine(&dir, 4096), 0);
+        assert_eq!(prune_quarantine(&dir, 4096, false), 0);
         assert!(q.join("small.ilp").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5863,7 +6427,7 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_nanos())
         ));
-        assert_eq!(prune_quarantine(&dir, 4096), 0);
+        assert_eq!(prune_quarantine(&dir, 4096, false), 0);
     }
 
     #[test]
@@ -6040,5 +6604,150 @@ mod tests {
         );
         assert_eq!(c.throttle_tick(0), Some(1));
         assert_eq!(c.throttle_tick(1), Some(1));
+    }
+
+    // -- Z7 / Z8a (2026-10-02): queued-rescue floors and synced spills ------
+
+    /// Sequences far above anything another test in this binary acks, so the
+    /// shared global watermark answers about THIS test only.
+    fn z7_seq(k: u64) -> i64 {
+        i64::try_from((1u64 << 61) + (k << 40)).expect("fits")
+    }
+
+    #[test]
+    fn test_regression_tick_queued_rescue_holds_a_floor_until_the_rescue_thread_settles_it() {
+        let dir = scratch_dir("z7-floor");
+        let mut w = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (sink, rx) = w.split_rescue_offload();
+        let seq = z7_seq(1);
+        w.append_tick_with_seq(&sample_tick(), seq).expect("append");
+        assert_eq!(w.discard_pending(), 1);
+        let batch = rx.try_recv().expect("queued");
+        let wm = crate::wal_applied_watermark::applied_watermark();
+        let sink_kind = crate::wal_applied_watermark::AppliedSink::Ticks;
+        assert!(
+            batch.floor.is_some(),
+            "a WAL-backed queued batch holds a floor"
+        );
+        assert!(wm.rescue_floor_is_held(sink_kind, seq as u64));
+        sink.rescue(&batch);
+        assert!(
+            !wm.rescue_floor_is_held(sink_kind, seq as u64),
+            "the rescue thread releases the floor once the spill is synced"
+        );
+        assert!(
+            !wm.snapshot().range_has_unapplied(seq as u64, seq as u64),
+            "a landed rescue marks nothing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_regression_tick_refused_rescue_hand_off_retracts_its_floor() {
+        let dir = scratch_dir("z7-refused");
+        let mut w = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (_sink, rx) = w.split_rescue_offload();
+        drop(rx); // Disconnected
+        let seq = z7_seq(2);
+        w.append_tick_with_seq(&sample_tick(), seq).expect("append");
+        assert_eq!(w.discard_pending(), 1);
+        let wm = crate::wal_applied_watermark::applied_watermark();
+        assert!(
+            !wm.rescue_floor_is_held(crate::wal_applied_watermark::AppliedSink::Ticks, seq as u64),
+            "a hand-off the thread never received must not leave a floor behind"
+        );
+        assert!(
+            wm.snapshot().range_has_unapplied(seq as u64, seq as u64),
+            "the deferred-to-WAL arm marks the range itself"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_regression_tick_full_rescue_queue_retracts_the_refused_batch_floor() {
+        let dir = scratch_dir("z7-full");
+        let mut w = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (sink, rx) = w.split_rescue_offload();
+        let wm = crate::wal_applied_watermark::applied_watermark();
+        let kind = crate::wal_applied_watermark::AppliedSink::Ticks;
+        let mut queued = Vec::new();
+        for k in 0..RESCUE_QUEUE_DEPTH as u64 {
+            let seq = z7_seq(10 + k);
+            w.append_tick_with_seq(&sample_tick(), seq).expect("append");
+            assert_eq!(w.discard_pending(), 1);
+            queued.push(seq as u64);
+        }
+        let refused = z7_seq(20);
+        w.append_tick_with_seq(&sample_tick(), refused)
+            .expect("append");
+        assert_eq!(w.discard_pending(), 1);
+        assert!(!wm.rescue_floor_is_held(kind, refused as u64));
+        for seq in &queued {
+            assert!(
+                wm.rescue_floor_is_held(kind, *seq),
+                "queued batches still hold theirs"
+            );
+        }
+        while let Ok(batch) = rx.try_recv() {
+            sink.rescue(&batch);
+        }
+        for seq in &queued {
+            assert!(!wm.rescue_floor_is_held(kind, *seq));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_regression_tick_rescue_sink_reports_a_failed_sync_as_a_failed_rescue() {
+        let dir = scratch_dir("z8a-sync-fail");
+        let mut w = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (mut sink, rx) = w.split_rescue_offload();
+        sink.spill_sync = Some(|_| Err(std::io::Error::other("injected fdatasync failure")));
+        let seq = z7_seq(30);
+        w.append_tick_with_seq(&sample_tick(), seq).expect("append");
+        assert_eq!(w.discard_pending(), 1);
+        let batch = rx.try_recv().expect("queued");
+        let wm = crate::wal_applied_watermark::applied_watermark();
+        let unlanded = wm.unlanded_total();
+        sink.rescue(&batch);
+        assert!(
+            wm.unlanded_total() > unlanded,
+            "a spill that never reached the disk is counted as landing nowhere"
+        );
+        assert!(
+            wm.snapshot().range_has_unapplied(seq as u64, seq as u64),
+            "its range must replay from the WAL"
+        );
+        assert!(
+            !wm.rescue_floor_is_held(crate::wal_applied_watermark::AppliedSink::Ticks, seq as u64)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spill_failed_ilp_returns_err_when_the_sync_fails() {
+        let dir = scratch_dir("z8a-direct");
+        let failing: Option<SpillSyncFn> = Some(|_| Err(std::io::Error::other("injected")));
+        assert!(spill_failed_ilp(&dir, b"x\n", Feed::Dhan, 1_700_000_000, failing).is_err());
+        assert!(
+            spill_failed_ilp(
+                &dir,
+                b"y\n",
+                Feed::Dhan,
+                1_700_000_000,
+                SPILL_UNSYNCED_ON_DRAIN
+            )
+            .is_ok()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sync_spill_data_syncs_a_real_file() {
+        let dir = scratch_dir("z8a-sync-real");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let file = std::fs::File::create(dir.join("f")).expect("file");
+        sync_spill_data(&file).expect("fdatasync on a regular file");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -455,24 +455,120 @@ fn test_deploy_aws_resolves_account_id_at_runtime() {
     );
 }
 
+/// The text of one top-level `resource "<kind>" "<name>"` block in a
+/// terraform file, from its header to the next top-level `resource`, with
+/// `#` comments removed so a comment can neither satisfy nor trip a check.
+fn terraform_resource_block(content: &str, kind: &str, name: &str) -> String {
+    let header = format!("resource \"{kind}\" \"{name}\"");
+    let start = content
+        .find(&header)
+        .unwrap_or_else(|| panic!("main.tf must declare {header}")); // APPROVED: test
+    let rest = &content[start + header.len()..];
+    let end = rest.find("\nresource ").unwrap_or(rest.len());
+    let block = &content[start..start + header.len() + end];
+    block
+        .lines()
+        .map(|line| line.split('#').next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// ITEM 45f, operator Quotes 27 + 28 (2026-09-29): the cold bucket tiers
+/// objects down and never expires them, current or noncurrent.
 #[test]
-fn test_terraform_s3_lifecycle_matches_sebi_retention() {
+fn test_terraform_tv_cold_lifecycle_never_expires_and_tiers_down() {
     let content = std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/main.tf"))
         .expect("main.tf must be readable"); // APPROVED: test
-    // 5-year SEBI retention = 1825 days
+    let lifecycle =
+        terraform_resource_block(&content, "aws_s3_bucket_lifecycle_configuration", "tv_cold");
     assert!(
-        content.contains("days = 1825"),
-        "main.tf S3 lifecycle must have 1825-day (5-year SEBI) expiration"
+        !lifecycle.contains("expiration"),
+        "the tv_cold lifecycle must carry no `expiration` and no \
+         `noncurrent_version_expiration` (Quotes 27 + 28, 2026-09-29: nothing \
+         captured is ever deleted). Found:\n{lifecycle}"
     );
-    // 30-day transition to Intelligent-Tiering
     assert!(
-        content.contains("INTELLIGENT_TIERING"),
-        "main.tf S3 lifecycle must transition to Intelligent-Tiering"
+        lifecycle.contains("INTELLIGENT_TIERING"),
+        "the tv_cold lifecycle must transition to Intelligent-Tiering"
     );
-    // 1-year transition to Glacier IR
     assert!(
-        content.contains("GLACIER_IR"),
-        "main.tf S3 lifecycle must transition to Glacier IR"
+        lifecycle.contains("GLACIER_IR"),
+        "the tv_cold lifecycle must transition to Glacier IR"
+    );
+    assert!(
+        lifecycle.contains("prefix = \"raw-frames/\"") && lifecycle.contains("DEEP_ARCHIVE"),
+        "the tv_cold lifecycle must move raw-frames/ to Deep Archive (ITEM 45f)"
+    );
+    assert!(
+        lifecycle.contains("depends_on = [aws_s3_bucket_versioning.tv_cold]"),
+        "the tv_cold lifecycle must be applied after versioning is enabled"
+    );
+}
+
+/// ITEM 45f: versioning stays Enabled on the cold bucket, so an overwrite or
+/// a delete leaves the prior version. Suspending it is a Quote 27/28 REJECT.
+#[test]
+fn test_terraform_tv_cold_versioning_is_enabled() {
+    let content = std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/main.tf"))
+        .expect("main.tf must be readable"); // APPROVED: test
+    let versioning = terraform_resource_block(&content, "aws_s3_bucket_versioning", "tv_cold");
+    assert!(
+        versioning.contains("bucket = aws_s3_bucket.tv_cold.id"),
+        "tv_cold versioning must target the tv_cold bucket"
+    );
+    assert!(
+        versioning.contains("status = \"Enabled\"") && !versioning.contains("Suspended"),
+        "tv_cold versioning must be Enabled, never Suspended. Found:\n{versioning}"
+    );
+}
+
+/// The block of `main.tf` that starts at `header` and ends at the next
+/// top-level `}` (a line that is exactly `}`).
+fn terraform_block<'a>(content: &'a str, header: &str) -> &'a str {
+    let start = content
+        .find(header)
+        .unwrap_or_else(|| panic!("main.tf must declare {header}")); // APPROVED: test
+    let rest = &content[start..];
+    let end = rest.find("\n}\n").map_or(rest.len(), |i| i + 3);
+    &rest[..end]
+}
+
+/// Plan item 45f (operator Quotes 27 + 28, 2026-09-29): the cold bucket keeps
+/// everything. An `expiration` (current or noncurrent) or a suspended
+/// versioning would let S3 delete market data nobody holds another copy of.
+#[test]
+fn test_terraform_cold_bucket_keeps_everything() {
+    let content = std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/main.tf"))
+        .expect("main.tf must be readable"); // APPROVED: test
+    let lifecycle = terraform_block(
+        &content,
+        "resource \"aws_s3_bucket_lifecycle_configuration\" \"tv_cold\"",
+    );
+    for banned in [
+        "expiration",
+        "noncurrent_version_expiration",
+        "abort_incomplete_multipart_upload",
+    ] {
+        // abort_incomplete_multipart_upload is harmless in itself but is the
+        // usual neighbour of an expiry; keep the block expiry-free entirely so
+        // a reader never has to reason about which "expire" is safe.
+        assert!(
+            !lifecycle.contains(banned),
+            "the cold bucket lifecycle must not contain `{banned}`: nothing in \
+             tv-<env>-cold is ever expired (plan item 45f)"
+        );
+    }
+    assert!(
+        lifecycle.contains("prefix = \"raw-frames/\"") && lifecycle.contains("DEEP_ARCHIVE"),
+        "raw frames must move to Deep Archive, not be deleted"
+    );
+    let versioning = terraform_block(
+        &content,
+        "resource \"aws_s3_bucket_versioning\" \"tv_cold\"",
+    );
+    assert!(
+        versioning.contains("status = \"Enabled\""),
+        "the cold bucket must have versioning Enabled (never Suspended)"
     );
 }
 

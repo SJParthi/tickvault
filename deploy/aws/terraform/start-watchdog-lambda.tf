@@ -73,7 +73,7 @@ resource "aws_iam_role_policy" "start_watchdog" {
         # decide whether an out-of-hours running box is deliberate.
         # NSE-holiday intentional-stop marker (2026-07-07 round-3 review
         # fix): the 08:45 check reads /tickvault/<env>/holiday-stop-date
-        # (stamped by deploy/aws/holiday-gate.sh before its holiday
+        # (stamped by the holiday gate before its holiday
         # self-stop) so it never "heals" an intentional holiday stop — that
         # self-start both false-paged every holiday and fed the restart war
         # racing the 09:20 IST alarm-gate sample. Read-only, scoped to
@@ -140,7 +140,7 @@ resource "aws_lambda_function" "start_watchdog" {
       # it to run the box out of hours without the curfew guard stopping it).
       KEEP_ALIVE_PARAM = "/tickvault/${var.environment}/keep-alive-until"
       # NSE-holiday intentional-stop marker (2026-07-07 round-3 review fix):
-      # holiday-gate.sh stamps today's IST date here before its self-stop;
+      # the holiday gate stamps today's IST date here before its self-stop;
       # the 08:45 check skips the self-start + Critical page when it matches.
       HOLIDAY_STOP_PARAM = "/tickvault/${var.environment}/holiday-stop-date"
       # Audit PR30: the budget-stop latch — the 08:45 check skips the

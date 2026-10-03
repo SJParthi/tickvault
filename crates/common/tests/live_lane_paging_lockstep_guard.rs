@@ -185,6 +185,32 @@ fn the_connected_but_silent_page_exists() {
 }
 
 #[test]
+fn the_hot_path_stall_page_exists_without_a_false_recovery() {
+    // 2026-10-02, noise-lock §2.8: a stalled runtime or frame drain pauses
+    // the socket reads with no loss counter moving, so the stall line is the
+    // only evidence. Its page must exist, must not send an OK (a stall that
+    // ended is not a repair), and must have its dated authority on record.
+    let tf = read(ERRCODE_ALARMS);
+    let Some(start) = tf.find("\"hot-path-stall-01\" = {") else {
+        panic!("HOT-PATH-STALL-01 has no error_code_alerts entry in {ERRCODE_ALARMS}");
+    };
+    let block = &tf[start..start + tf[start..].find("\n    }").unwrap_or(0)];
+    assert!(
+        block.contains("$.code = \\\"HOT-PATH-STALL-01\\\" && $.level = \\\"ERROR\\\""),
+        "the hot-path-stall-01 filter must match the coded ERROR line"
+    );
+    assert!(
+        block.contains("ok_recovery = false"),
+        "the hot-path-stall-01 alarm must not send a recovery page"
+    );
+    let lock = read(NOISE_LOCK);
+    assert!(
+        lock.contains("§2.8") && lock.contains("HOT-PATH-STALL-01"),
+        "{NOISE_LOCK} must carry the dated §2.8 row naming HOT-PATH-STALL-01"
+    );
+}
+
+#[test]
 fn the_withdrawn_dead_monitor_is_not_resurrected() {
     // `tv_dhan_feed_drain_respawn_total` was named in the 2026-08-14 family and
     // has ZERO emit sites, because the drain is not respawned at all — if it

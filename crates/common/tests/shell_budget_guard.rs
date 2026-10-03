@@ -100,8 +100,7 @@ const SHELL_DEV_TOOLING_FILES: &[&str] = &[
 /// ADDITIONS ARE FORBIDDEN and a ceiling may never rise. A deletion removes
 /// the entry in the same PR; a ceiling may be lowered at any time.
 const SHELL_OPS_FILES: &[(&str, usize)] = &[
-    ("deploy/aws/holiday-gate.sh", 132),
-    ("deploy/aws/terraform/user-data.sh.tftpl", 267),
+    ("deploy/aws/terraform/user-data.sh.tftpl", 266),
     ("scripts/100pct-audit.sh", 378),
     ("scripts/all-green-equivalence-matrix.sh", 272),
     ("scripts/auto-fix-clear-spill-rollback.sh", 41),
@@ -128,7 +127,6 @@ const SHELL_OPS_FILES: &[(&str, usize)] = &[
     ("scripts/diagnose-write-amplification.sh", 99),
     ("scripts/doctor.sh", 298),
     ("scripts/ensure-aws-cli.sh", 71),
-    ("scripts/ensure-questdb.sh", 230),
     ("scripts/ensure-ready.sh", 312),
     ("scripts/flaky-detect.sh", 93),
     ("scripts/mcp-doctor.sh", 97),
@@ -161,10 +159,9 @@ const SHELL_OPS_FILES: &[(&str, usize)] = &[
 
 /// Per systemd unit: how many `Exec*=` lines run a shell. Pinned EXACTLY:
 /// it may only go down, and the pin moves down in the same PR.
-const SYSTEMD_SHELL_EXEC_BUDGET: &[(&str, usize)] = &[
-    ("deploy/systemd/tickvault-holiday-gate.service", 1),
-    ("deploy/systemd/tickvault.service", 1),
-];
+/// Empty since 2026-10-01 (audit D6d): the last one, the QuestDB self-heal,
+/// is now `tickvault-host ensure-questdb`.
+const SYSTEMD_SHELL_EXEC_BUDGET: &[(&str, usize)] = &[];
 
 /// Shells a shebang may name for the file to count as a shell script.
 const SHELL_RUNTIMES: &[&str] = &["bash", "sh", "dash", "zsh", "ksh"];

@@ -107,6 +107,190 @@ pub const APPLIED_PERSIST_FAILED_COUNTER: &str = "tv_wal_applied_watermark_persi
 /// implausible values). Replay proceeds in full.
 pub const APPLIED_INVALID_COUNTER: &str = "tv_wal_applied_watermark_invalid_total";
 
+/// How long an acknowledgement must have stood before the PERSISTED
+/// watermark may cover it (Z8b, 2026-10-02).
+///
+/// An ILP `2xx` means QuestDB wrote the rows into its files, not that they
+/// reached the disk: its default `cairo.commit.mode` is `nosync`, which leaves
+/// them in the kernel page cache. A host or kernel crash keeps the watermark
+/// file (it is fsynced before its rename) and can lose those pages, so a
+/// watermark persisted the instant it was acked can vouch for rows the disk
+/// never got, and the next boot archives their WAL segment unread.
+///
+/// Switching QuestDB to `sync` was MEASURED and rejected on 2026-10-02: a
+/// 1,000-row tick flush went from p50 3.3 ms to 21–26 ms and a 10,000-row
+/// depth flush from 14 ms to 37–42 ms. Instead the value written to disk is
+/// the watermark that was already acknowledged at least this long ago. Linux
+/// writes back dirty pages older than `dirty_expire_centisecs` (30 s by
+/// default) on a `dirty_writeback_centisecs` (5 s) cadence, so a commit older
+/// than ~35 s has normally reached the disk; 60 s leaves margin.
+///
+/// The RAM watermark is NOT delayed — only what is written to the file.
+///
+/// **Honest limit:** this relies on the kernel's writeback timing. It is not
+/// an fsync of QuestDB's files, and a host tuned with a longer
+/// `dirty_expire_centisecs`, or a disk too saturated to write back on time,
+/// can still lose acknowledged rows. A host crash replays at most the last
+/// ~60 s of frames more than strictly needed; the DEDUP keys absorb them.
+pub const WATERMARK_DURABILITY_LAG_SECS: u64 = 60;
+const WATERMARK_DURABILITY_LAG_NANOS: u64 = WATERMARK_DURABILITY_LAG_SECS * 1_000_000_000;
+/// Samples kept by [`DurabilityLag`]. With one slot per second at most, 128
+/// slots hold more than two minutes of history — over twice the lag.
+pub const DURABILITY_SAMPLE_SLOTS: usize = 128;
+/// A new sample slot opens at most this often; a persist inside the window
+/// refreshes the newest slot instead, so a burst of persists cannot push the
+/// samples the lag needs out of the ring.
+pub const DURABILITY_SAMPLE_SPACING_NANOS: u64 = 1_000_000_000;
+const _: () = assert!(
+    (DURABILITY_SAMPLE_SLOTS as u64 - 1) * DURABILITY_SAMPLE_SPACING_NANOS
+        > WATERMARK_DURABILITY_LAG_NANOS + DURABILITY_SAMPLE_SPACING_NANOS,
+    "the sample ring must outlive the durability lag"
+);
+
+/// Slots per sink for the queued-rescue floors (Z7, 2026-10-02). A sink's
+/// rescue queue holds `RESCUE_QUEUE_DEPTH` (2) batches plus the one its thread
+/// is writing, so three are live at most; eight leave room for a second
+/// writer of the same sink. A full table falls back to marking the batch's
+/// range unapplied, which only replays more.
+pub const RESCUE_FLOOR_SLOTS: usize = 8;
+/// Counter: a rescue hand-off found no free floor slot, so its range was
+/// marked unapplied instead (it is replayed next boot even if it lands).
+pub const RESCUE_FLOOR_FULL_COUNTER: &str = "tv_wal_rescue_floor_full_total";
+
+/// A queued rescue batch's hold on the persisted watermark (Z7). Returned by
+/// [`AppliedWatermark::hold_rescue_floor`], carried with the batch, and handed
+/// back to [`AppliedWatermark::release_rescue_floor`] once the rescue write is
+/// on disk (or has failed and marked its range unapplied).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RescueFloor {
+    sink: AppliedSink,
+    slot: u8,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DurabilitySample {
+    /// Monotonic nanos when the watermarks below were read. Every ack they
+    /// include happened at or before this instant.
+    taken_at: u64,
+    hwm_ticks: u64,
+    hwm_depth: u64,
+}
+
+/// The ring behind [`WATERMARK_DURABILITY_LAG_SECS`] (Z8b).
+///
+/// Fixed-size: [`DURABILITY_SAMPLE_SLOTS`] samples of `(time, ticks, depth)`
+/// in an array, so it never allocates after construction. Written and read
+/// only under the persist lock, about once a second, on the sink threads —
+/// never on the frame drain. [`Self::record`] is O(1); [`Self::durable_at`]
+/// is a newest-first scan bounded by [`DURABILITY_SAMPLE_SLOTS`] that stops
+/// at the first sample old enough, so in steady state it visits ~61 slots.
+#[derive(Debug)]
+pub struct DurabilityLag {
+    samples: [DurabilitySample; DURABILITY_SAMPLE_SLOTS],
+    newest: usize,
+    filled: usize,
+    newest_opened_at: u64,
+    durable_ticks: u64,
+    durable_depth: u64,
+}
+
+impl Default for DurabilityLag {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DurabilityLag {
+    /// An empty ring with a zero durable floor.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            samples: [DurabilitySample {
+                taken_at: 0,
+                hwm_ticks: 0,
+                hwm_depth: 0,
+            }; DURABILITY_SAMPLE_SLOTS],
+            newest: 0,
+            filled: 0,
+            newest_opened_at: 0,
+            durable_ticks: 0,
+            durable_depth: 0,
+        }
+    }
+
+    /// Raises the durable floor. The boot seed comes from the file the
+    /// previous process wrote, which was itself held back by the lag, so it
+    /// is as durable as anything this process can know.
+    pub fn seed(&mut self, hwm_ticks: u64, hwm_depth: u64) {
+        self.durable_ticks = self.durable_ticks.max(hwm_ticks);
+        self.durable_depth = self.durable_depth.max(hwm_depth);
+    }
+
+    /// Records the live watermarks as read at `now` (monotonic nanos). O(1).
+    pub fn record(&mut self, now: u64, hwm_ticks: u64, hwm_depth: u64) {
+        if self.filled == 0 {
+            self.newest = 0;
+            self.filled = 1;
+            self.newest_opened_at = now;
+        } else if now < self.newest_opened_at
+            || now
+                >= self
+                    .newest_opened_at
+                    .saturating_add(DURABILITY_SAMPLE_SPACING_NANOS)
+        {
+            self.newest = (self.newest + 1) % DURABILITY_SAMPLE_SLOTS;
+            self.filled = (self.filled + 1).min(DURABILITY_SAMPLE_SLOTS);
+            self.newest_opened_at = now;
+        }
+        // Inside the spacing window the newest slot is refreshed: its time
+        // moves forward with its values, so a slot never claims an older read
+        // than the one it holds.
+        self.samples[self.newest] = DurabilitySample {
+            taken_at: now,
+            hwm_ticks,
+            hwm_depth,
+        };
+    }
+
+    /// The watermarks that were already acknowledged at least `lag_nanos`
+    /// before `now`: the newest sample old enough, folded into the durable
+    /// floor (monotone). No sample old enough leaves the floor where it is —
+    /// the direction is always "replay more".
+    #[must_use]
+    pub fn durable_at(&mut self, now: u64, lag_nanos: u64) -> (u64, u64) {
+        // O(1) EXEMPT: bounded by DURABILITY_SAMPLE_SLOTS, once-a-second persist, off the drain
+        for back in 0..self.filled {
+            let at = (self.newest + DURABILITY_SAMPLE_SLOTS - back) % DURABILITY_SAMPLE_SLOTS;
+            let sample = self.samples[at];
+            if sample.taken_at <= now && now - sample.taken_at >= lag_nanos {
+                self.durable_ticks = self.durable_ticks.max(sample.hwm_ticks);
+                self.durable_depth = self.durable_depth.max(sample.hwm_depth);
+                break;
+            }
+        }
+        (self.durable_ticks, self.durable_depth)
+    }
+}
+
+/// Monotonic nanoseconds since the first call in this process. The durability
+/// lag measures elapsed time, so a wall-clock step (NTP) can neither release
+/// it early nor hold it forever.
+fn mono_nanos() -> u64 {
+    static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+    let epoch = EPOCH.get_or_init(std::time::Instant::now);
+    u64::try_from(epoch.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// `hwm` held strictly below `floor` (the lowest sequence of a queued rescue
+/// batch); `u64::MAX` means no floor.
+const fn cap_below_floor(hwm: u64, floor: u64) -> u64 {
+    if floor == u64::MAX || hwm < floor {
+        hwm
+    } else {
+        floor.saturating_sub(1)
+    }
+}
+
 /// Which sink a frame's rows go to; decides which watermark covers it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppliedSink {
@@ -300,26 +484,53 @@ impl AppliedSnapshot {
     /// mystery full replay.
     #[must_use]
     pub fn load(wal_dir: &Path) -> Option<Self> {
+        Self::load_quiet(wal_dir)
+            .inspect_err(|len| {
+                metrics::counter!(APPLIED_INVALID_COUNTER).increment(1);
+                warn!(
+                    path = %wal_dir.join(APPLIED_WATERMARK_FILE).display(),
+                    len,
+                    "WAL applied-watermark file rejected (short, wrong magic/version, bad crc, \
+                     implausible values, or written beside a DIFFERENT directory) — ignored; \
+                     this boot replays the WAL in full"
+                );
+            })
+            .ok()
+            .flatten()
+    }
+
+    /// S3 (2026-10-02): the highest `capture_seq` the file beside `wal_dir`
+    /// vouches for as applied, on either sink; `0` when there is no file or
+    /// it is rejected (a rejected file vouches for nothing, so no new
+    /// sequence can read as applied through it). Quiet: [`Self::load`] at the
+    /// bind reports a rejected file once.
+    ///
+    /// The WAL sequence is seeded past this as well as past the segments on
+    /// disk: once every segment is pruned, a backward clock step of less than
+    /// [`APPLIED_MAX_FUTURE_NANOS`] would otherwise mint sequences at or below
+    /// a watermark that still loads, and their segments would read as
+    /// applied — skipped on replay and deletable.
+    #[must_use]
+    pub fn persisted_high_water(wal_dir: &Path) -> u64 {
+        Self::load_quiet(wal_dir)
+            .ok()
+            .flatten()
+            .map_or(0, |snap| snap.hwm_ticks.max(snap.hwm_depth))
+    }
+
+    /// [`Self::load`] without the report. `Ok(None)` when absent, `Err(len)`
+    /// when present but rejected.
+    fn load_quiet(wal_dir: &Path) -> Result<Option<Self>, usize> {
         let path = wal_dir.join(APPLIED_WATERMARK_FILE);
-        let bytes = std::fs::read(&path).ok()?; // APPROVED: boot-time load, cold path
+        // APPROVED: boot-time load, cold path
+        let Ok(bytes) = std::fs::read(&path) else {
+            return Ok(None);
+        };
         let expected_tag = dir_tag_of(wal_dir);
-        let parsed = Self::from_bytes(&bytes, wall_nanos());
-        let foreign = parsed
-            .as_ref()
-            .is_some_and(|snap| snap.dir_tag != expected_tag);
-        if parsed.is_none() || foreign {
-            metrics::counter!(APPLIED_INVALID_COUNTER).increment(1);
-            warn!(
-                path = %path.display(),
-                len = bytes.len(),
-                foreign,
-                "WAL applied-watermark file rejected (short, wrong magic/version, bad crc, \
-                 implausible values, or written beside a DIFFERENT directory) — ignored; \
-                 this boot replays the WAL in full"
-            );
-            return None;
+        match Self::from_bytes(&bytes, wall_nanos()) {
+            Some(snap) if snap.dir_tag == expected_tag => Ok(Some(snap)),
+            _ => Err(bytes.len()),
         }
-        parsed
     }
 }
 
@@ -365,7 +576,9 @@ pub struct AppliedWatermark {
     depth_completed: AtomicU64,
     last_persist_nanos: AtomicU64,
     paths: OnceLock<(PathBuf, PathBuf)>,
-    persist_lock: Mutex<()>,
+    /// Serialises persists AND owns the durability-lag ring (Z8b): the ring is
+    /// only ever touched by the thread holding this lock.
+    persist_lock: Mutex<DurabilityLag>,
     /// [`dir_tag_of`] the bound directory; `0` until [`Self::bind`].
     dir_tag: AtomicU64,
     /// `true` while the QuestDB WAL-suspension probe says a table is suspended,
@@ -397,6 +610,18 @@ pub struct AppliedWatermark {
     /// it before and after a batch: a batch that lost rows must never have its
     /// WAL segment archived, because the segment is now the ONLY copy.
     unlanded: AtomicU64,
+    /// Lowest `capture_seq` of each rescue batch queued for (or being written
+    /// by) a rescue thread, per sink; `0` is a free slot (Z7, 2026-10-02).
+    ///
+    /// A queued batch is neither acked nor marked unapplied, while the writer
+    /// thread keeps acking LATER batches, so the high-water mark climbs over
+    /// it. Before these floors, a crash (OOM, `panic=abort`, SIGKILL) with a
+    /// batch still queued left a persisted watermark that vouched for rows in
+    /// neither QuestDB nor a spill file: the next boot archived their segment
+    /// unread and nothing counted the loss. The persisted value is now held
+    /// below the oldest floor; the RAM value is unchanged.
+    rescue_floors_ticks: [AtomicU64; RESCUE_FLOOR_SLOTS],
+    rescue_floors_depth: [AtomicU64; RESCUE_FLOOR_SLOTS],
 }
 
 static APPLIED: AppliedWatermark = AppliedWatermark::new();
@@ -429,7 +654,7 @@ impl AppliedWatermark {
             depth_completed: AtomicU64::new(0),
             last_persist_nanos: AtomicU64::new(0),
             paths: OnceLock::new(),
-            persist_lock: Mutex::new(()),
+            persist_lock: Mutex::new(DurabilityLag::new()),
             dir_tag: AtomicU64::new(0),
             sink_suspect: AtomicBool::new(false),
             healthy_ticks: AtomicU64::new(0),
@@ -438,6 +663,8 @@ impl AppliedWatermark {
             suspect_max_depth: AtomicU64::new(0),
             clean_probes: AtomicU64::new(0),
             unlanded: AtomicU64::new(0),
+            rescue_floors_ticks: [const { AtomicU64::new(0) }; RESCUE_FLOOR_SLOTS],
+            rescue_floors_depth: [const { AtomicU64::new(0) }; RESCUE_FLOOR_SLOTS],
         }
     }
 
@@ -466,6 +693,9 @@ impl AppliedWatermark {
     pub fn seed(&self, snap: &AppliedSnapshot) {
         self.hwm_ticks.fetch_max(snap.hwm_ticks, Ordering::AcqRel);
         self.hwm_depth.fetch_max(snap.hwm_depth, Ordering::AcqRel);
+        // The file was written with the durability lag already applied, so
+        // its values are the durable floor this process starts from (Z8b).
+        self.lock_lag().seed(snap.hwm_ticks, snap.hwm_depth);
         // The seeded value is the last clean point this process knows of; the
         // first probe of the session moves it or opens suspicion from here.
         self.healthy_ticks
@@ -808,6 +1038,119 @@ impl AppliedWatermark {
         }
     }
 
+    /// The snapshot as it is written to disk: the live state with both
+    /// high-water marks held back by the durability lag (Z8b) and below every
+    /// queued rescue floor (Z7). Cold: once per persist, under the lock.
+    fn durable_view(&self, lag: &mut DurabilityLag, mono_now: u64) -> AppliedSnapshot {
+        // The watermarks are read BEFORE the floors. A floor is pushed before
+        // its batch is handed off, and every ack that can lift the watermark
+        // past that batch happens after; so a watermark value read here that
+        // has passed the batch guarantees the floor is visible to the loads
+        // below (Acquire on the watermark, Release on the floor store).
+        let mut snap = self.snapshot();
+        let floor_ticks = self.rescue_floor_min(AppliedSink::Ticks);
+        let floor_depth = self.rescue_floor_min(AppliedSink::Depth);
+        lag.record(mono_now, snap.hwm_ticks, snap.hwm_depth);
+        let (durable_ticks, durable_depth) =
+            lag.durable_at(mono_now, WATERMARK_DURABILITY_LAG_NANOS);
+        snap.hwm_ticks = cap_below_floor(durable_ticks.min(snap.hwm_ticks), floor_ticks);
+        snap.hwm_depth = cap_below_floor(durable_depth.min(snap.hwm_depth), floor_depth);
+        snap
+    }
+
+    /// [`Self::durable_view`] taken under the lock, for tests that check the
+    /// persisted value without a file.
+    #[cfg(test)]
+    fn durable_view_at(&self, mono_now: u64) -> AppliedSnapshot {
+        let mut lag = self.lock_lag();
+        self.durable_view(&mut lag, mono_now)
+    }
+
+    /// The persist lock, recovered from poison (the guarded data is a ring of
+    /// plain integers; a panic mid-update can only leave it conservative).
+    fn lock_lag(&self) -> std::sync::MutexGuard<'_, DurabilityLag> {
+        self.persist_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn rescue_floors(&self, sink: AppliedSink) -> &[AtomicU64; RESCUE_FLOOR_SLOTS] {
+        match sink {
+            AppliedSink::Ticks => &self.rescue_floors_ticks,
+            AppliedSink::Depth => &self.rescue_floors_depth,
+        }
+    }
+
+    /// A rescue batch covering `[min_seq, max_seq]` is about to be handed to a
+    /// rescue thread (Z7). Until [`Self::release_rescue_floor`] is called, the
+    /// PERSISTED watermark for `sink` stays below `min_seq`, so a crash while
+    /// the batch is queued replays it rather than archiving its segment.
+    ///
+    /// Called on the frame drain, on the rescue arm only (never per tick): at
+    /// most [`RESCUE_FLOOR_SLOTS`] compare-and-swaps, no allocation, no lock —
+    /// O(RESCUE_FLOOR_SLOTS), a constant 8, not O(1). `None` when the batch
+    /// has no sequence (nothing in the WAL to protect) or when every slot is
+    /// taken; a full table marks the range unapplied instead and counts it,
+    /// which fails toward replay.
+    #[must_use]
+    pub fn hold_rescue_floor(
+        &self,
+        sink: AppliedSink,
+        min_seq: u64,
+        max_seq: u64,
+    ) -> Option<RescueFloor> {
+        if min_seq == 0 {
+            return None;
+        }
+        let floors = self.rescue_floors(sink);
+        // O(1) EXEMPT: bounded by RESCUE_FLOOR_SLOTS (8), rescue arm only
+        for (slot, cell) in floors.iter().enumerate() {
+            if cell
+                .compare_exchange(0, min_seq, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(RescueFloor {
+                    sink,
+                    slot: u8::try_from(slot).unwrap_or(u8::MAX),
+                });
+            }
+        }
+        metrics::counter!(RESCUE_FLOOR_FULL_COUNTER).increment(1);
+        self.note_unapplied_range(min_seq, max_seq.max(min_seq));
+        None
+    }
+
+    /// The rescue batch holding `floor` is settled: its spill write is on disk
+    /// (synced), or it failed and its range was marked unapplied, or the
+    /// hand-off was refused and the producer took the batch back. O(1).
+    pub fn release_rescue_floor(&self, floor: RescueFloor) {
+        if let Some(cell) = self.rescue_floors(floor.sink).get(usize::from(floor.slot)) {
+            cell.store(0, Ordering::Release);
+        }
+    }
+
+    /// Whether some slot of `sink` holds exactly `min_seq` (tests in the sink
+    /// modules check their batch's floor on the shared global).
+    #[cfg(test)]
+    pub(crate) fn rescue_floor_is_held(&self, sink: AppliedSink, min_seq: u64) -> bool {
+        self.rescue_floors(sink)
+            .iter()
+            .any(|c| c.load(Ordering::Acquire) == min_seq)
+    }
+
+    /// The lowest held floor for `sink`, or `u64::MAX` when none is held.
+    fn rescue_floor_min(&self, sink: AppliedSink) -> u64 {
+        let mut lowest = u64::MAX;
+        // O(1) EXEMPT: bounded by RESCUE_FLOOR_SLOTS (8), once-a-second persist
+        for cell in self.rescue_floors(sink) {
+            let held = cell.load(Ordering::Acquire);
+            if held != 0 {
+                lowest = lowest.min(held);
+            }
+        }
+        lowest
+    }
+
     /// Persists if at least [`APPLIED_PERSIST_INTERVAL_NANOS`] elapsed since
     /// the last persist. Returns whether a write was attempted. Cheap when not
     /// due: one load and one compare.
@@ -831,16 +1174,34 @@ impl AppliedWatermark {
     /// nothing to do. A failure is counted and warned, never propagated: this
     /// runs on a writer thread whose job is the network, and the fail-safe
     /// direction of a missing persist is "replay more".
+    ///
+    /// What is written is [`Self::snapshot`] with both high-water marks held
+    /// back twice: to the value acknowledged at least
+    /// [`WATERMARK_DURABILITY_LAG_SECS`] ago (Z8b), and strictly below the
+    /// lowest sequence of any rescue batch still queued (Z7). After a quiet
+    /// period of at least the lag, the next persist writes the live value, so
+    /// a stop after the close needs no special case; a stop inside a busy
+    /// minute leaves the next boot replaying that minute, which DEDUP absorbs.
     pub fn persist_now(&self) {
+        self.persist_at(mono_nanos());
+    }
+
+    /// [`Self::persist_now`] at an explicit monotonic instant (tests drive the
+    /// durability lag through this).
+    pub(crate) fn persist_at(&self, mono_now: u64) {
         let Some((path, tmp)) = self.paths.get() else {
             return;
         };
         // Serialise concurrent persists from the two sink threads. A held lock
         // means a snapshot at most one interval old is being written; skip.
-        let Ok(_guard) = self.persist_lock.try_lock() else {
-            return;
+        let mut lag = match self.persist_lock.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
         };
-        let mut snap = self.snapshot();
+        // The lock stays held through the write: two persists racing on the
+        // same tmp path would refuse each other at `create_new`.
+        let mut snap = self.durable_view(&mut lag, mono_now);
         snap.persisted_at_nanos = wall_nanos();
         let bytes = snap.to_bytes();
         let written = write_fresh(tmp, &bytes).and_then(|()| std::fs::rename(tmp, path));
@@ -983,7 +1344,10 @@ mod tests {
         wm.note_ticks_acked(seq(30));
         wm.note_depth_acked(seq(25));
         wm.note_unapplied(seq(10));
-        wm.persist_now();
+        // The acks are read at t0 and may reach the file only once they have
+        // stood for the durability lag (Z8b).
+        wm.persist_at(1);
+        wm.persist_at(1 + WATERMARK_DURABILITY_LAG_NANOS);
         assert!(dir.join(APPLIED_WATERMARK_FILE).exists());
         assert!(
             !dir.join(APPLIED_WATERMARK_TMP).exists(),
@@ -1203,6 +1567,31 @@ mod tests {
         .to_bytes();
         std::fs::write(a.join(APPLIED_WATERMARK_FILE), bytes).expect("write");
         assert!(AppliedSnapshot::load(&a).is_none());
+    }
+
+    #[test]
+    fn test_regression_s3_persisted_high_water_reads_only_a_valid_own_file() {
+        let a = scratch("s3_hwm_a");
+        let b = scratch("s3_hwm_b");
+        assert_eq!(AppliedSnapshot::persisted_high_water(&a), 0, "no file");
+        write_file_for_test(&a, seq(300), seq(700));
+        assert_eq!(
+            AppliedSnapshot::persisted_high_water(&a),
+            seq(700),
+            "the higher of the two sinks"
+        );
+        std::fs::copy(
+            a.join(APPLIED_WATERMARK_FILE),
+            b.join(APPLIED_WATERMARK_FILE),
+        )
+        .expect("copy");
+        assert_eq!(
+            AppliedSnapshot::persisted_high_water(&b),
+            0,
+            "another directory's file vouches for nothing here"
+        );
+        std::fs::write(a.join(APPLIED_WATERMARK_FILE), b"torn").expect("write");
+        assert_eq!(AppliedSnapshot::persisted_high_water(&a), 0, "damaged file");
     }
 
     #[test]
@@ -1605,4 +1994,358 @@ mod tests {
         assert!(first > 1_577_836_800_000_000_000);
         assert!(wall_nanos() >= first);
     }
+
+    // -----------------------------------------------------------------------
+    // Z8b — durability lag on the PERSISTED watermark (2026-10-02)
+    // -----------------------------------------------------------------------
+
+    const LAG: u64 = WATERMARK_DURABILITY_LAG_NANOS;
+    const SEC: u64 = 1_000_000_000;
+
+    #[test]
+    fn durability_lag_record_and_durable_at_never_exceed_the_value_acked_a_lag_ago() {
+        let mut lag = DurabilityLag::new();
+        // One ack a second for five minutes; the watermark at second `s` is s.
+        // Persisted at second `t`, the value must be the newest one read at
+        // least LAG earlier — never anything acked inside the last minute.
+        for t in 0..300u64 {
+            lag.record(t * SEC, t, t * 10);
+            let (ticks, depth) = lag.durable_at(t * SEC, LAG);
+            let expected = t.saturating_sub(WATERMARK_DURABILITY_LAG_SECS);
+            if t >= WATERMARK_DURABILITY_LAG_SECS {
+                assert_eq!((ticks, depth), (expected, expected * 10), "t={t}");
+            } else {
+                assert_eq!((ticks, depth), (0, 0), "nothing is a lag old yet at t={t}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_durable_at_catches_up_to_live_after_a_quiet_lag() {
+        let mut lag = DurabilityLag::new();
+        lag.record(10 * SEC, 500, 700);
+        assert_eq!(lag.durable_at(10 * SEC, LAG), (0, 0));
+        // Quiet: no new acks, persists keep sampling the same live value.
+        lag.record(40 * SEC, 500, 700);
+        assert_eq!(lag.durable_at(40 * SEC, LAG), (0, 0));
+        lag.record(10 * SEC + LAG, 500, 700);
+        assert_eq!(
+            lag.durable_at(10 * SEC + LAG, LAG),
+            (500, 700),
+            "after a quiet lag the persisted value equals the live one"
+        );
+    }
+
+    #[test]
+    fn durability_lag_seed_is_the_starting_floor_and_is_monotone() {
+        let mut lag = DurabilityLag::default();
+        lag.seed(100, 90);
+        lag.record(0, 150, 140);
+        assert_eq!(
+            lag.durable_at(1, LAG),
+            (100, 90),
+            "the seed stands until a sample ages"
+        );
+        lag.seed(50, 50);
+        assert_eq!(
+            lag.durable_at(2, LAG),
+            (100, 90),
+            "a lower seed never lowers it"
+        );
+        assert_eq!(lag.durable_at(LAG, LAG), (150, 140));
+    }
+
+    #[test]
+    fn durability_lag_record_burst_refreshes_the_newest_slot_instead_of_evicting() {
+        let mut lag = DurabilityLag::new();
+        lag.record(0, 1, 1);
+        lag.record(SEC, 2, 2);
+        // Ten thousand persists inside one second must not push the t=0 and
+        // t=1 s samples out of a 128-slot ring.
+        for i in 0..10_000u64 {
+            lag.record(2 * SEC + i * 1_000, 3 + i, 3 + i);
+        }
+        assert_eq!(lag.durable_at(SEC + LAG, LAG), (2, 2));
+        // The refreshed slot carries its LATEST read time, so its values are
+        // not released early.
+        let last_read = 2 * SEC + 9_999 * 1_000;
+        assert_eq!(lag.durable_at(last_read + LAG - 1, LAG), (2, 2));
+        assert_eq!(lag.durable_at(last_read + LAG, LAG), (10_002, 10_002));
+    }
+
+    #[test]
+    fn durability_lag_record_wraps_the_fixed_ring_without_growing() {
+        let mut lag = DurabilityLag::new();
+        let before = std::mem::size_of_val(&lag);
+        for t in 0..(4 * DURABILITY_SAMPLE_SLOTS as u64) {
+            lag.record(t * SEC, t, t);
+        }
+        assert_eq!(
+            std::mem::size_of_val(&lag),
+            before,
+            "a fixed array, no heap"
+        );
+        assert_eq!(lag.filled, DURABILITY_SAMPLE_SLOTS);
+        let now = (4 * DURABILITY_SAMPLE_SLOTS as u64 - 1) * SEC;
+        let expected = now / SEC - WATERMARK_DURABILITY_LAG_SECS;
+        assert_eq!(lag.durable_at(now, LAG), (expected, expected));
+    }
+
+    #[test]
+    fn durability_lag_ignores_a_sample_from_the_future() {
+        let mut lag = DurabilityLag::new();
+        lag.record(500 * SEC, 9, 9);
+        assert_eq!(lag.durable_at(SEC, LAG), (0, 0));
+    }
+
+    #[test]
+    fn test_regression_persisted_watermark_lags_acks_by_the_durability_lag() {
+        let dir = scratch("durability_lag");
+        let wm = AppliedWatermark::new_for_tests();
+        wm.bind(&dir);
+        wm.note_ticks_acked(seq(100));
+        wm.note_depth_acked(seq(100));
+        wm.persist_at(5 * SEC);
+        let first = AppliedSnapshot::load(&dir).expect("file");
+        assert_eq!(
+            (first.hwm_ticks, first.hwm_depth),
+            (0, 0),
+            "an ack seconds old may still be only in QuestDB's page cache"
+        );
+        // RAM is NOT delayed.
+        assert_eq!(wm.snapshot().hwm_ticks, seq(100));
+        wm.note_ticks_acked(seq(200));
+        wm.note_depth_acked(seq(200));
+        wm.persist_at(5 * SEC + LAG);
+        let second = AppliedSnapshot::load(&dir).expect("file");
+        assert_eq!(
+            (second.hwm_ticks, second.hwm_depth),
+            (seq(100), seq(100)),
+            "only what was acked a full lag ago is persisted"
+        );
+        wm.persist_at(5 * SEC + 2 * LAG);
+        let third = AppliedSnapshot::load(&dir).expect("file");
+        assert_eq!(third.hwm_ticks, seq(200), "a quiet lag later it catches up");
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn test_persist_at_writes_the_seeded_value_before_any_sample_ages() {
+        let dir = scratch("durability_seed");
+        let wm = AppliedWatermark::new_for_tests();
+        wm.bind(&dir);
+        wm.seed(&AppliedSnapshot {
+            hwm_ticks: seq(40),
+            hwm_depth: seq(40),
+            ..AppliedSnapshot::default()
+        });
+        wm.note_ticks_acked(seq(90));
+        wm.persist_at(SEC);
+        let loaded = AppliedSnapshot::load(&dir).expect("file");
+        assert_eq!(
+            loaded.hwm_ticks,
+            seq(40),
+            "the previous process's file is the floor, never zero"
+        );
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    // -----------------------------------------------------------------------
+    // Z7 — queued rescue floors (2026-10-02)
+    // -----------------------------------------------------------------------
+
+    fn floors_held(wm: &AppliedWatermark, sink: AppliedSink) -> usize {
+        wm.rescue_floors(sink)
+            .iter()
+            .filter(|c| c.load(Ordering::Acquire) != 0)
+            .count()
+    }
+
+    #[test]
+    fn hold_rescue_floor_holds_the_persisted_watermark_below_a_queued_batch() {
+        for sink in [AppliedSink::Ticks, AppliedSink::Depth] {
+            let wm = AppliedWatermark::new_for_tests();
+            let floor = wm.hold_rescue_floor(sink, seq(50), seq(60));
+            assert!(floor.is_some());
+            // The writer thread acks a LATER batch while ours sits queued.
+            wm.note_ticks_acked(seq(80));
+            wm.note_depth_acked(seq(80));
+            let view = wm.durable_view_at(LAG + SEC * 10);
+            let wm_view = wm.durable_view_at(2 * LAG + SEC * 10);
+            for v in [&view, &wm_view] {
+                let hwm = match sink {
+                    AppliedSink::Ticks => v.hwm_ticks,
+                    AppliedSink::Depth => v.hwm_depth,
+                };
+                assert!(
+                    hwm < seq(50),
+                    "{sink:?}: persisted {hwm} must stay below the queued batch"
+                );
+                assert!(!v.range_is_applied(sink, seq(50), seq(60)));
+            }
+            assert_eq!(wm.snapshot().hwm_ticks, seq(80), "RAM is unchanged");
+        }
+    }
+
+    #[test]
+    fn test_rescue_floor_is_held_tracks_hold_and_release() {
+        for sink in [AppliedSink::Ticks, AppliedSink::Depth] {
+            let wm = AppliedWatermark::new_for_tests();
+            assert!(!wm.rescue_floor_is_held(sink, seq(50)));
+            let floor = wm.hold_rescue_floor(sink, seq(50), seq(60)).expect("slot");
+            assert!(wm.rescue_floor_is_held(sink, seq(50)), "{sink:?}");
+            assert!(
+                !wm.rescue_floor_is_held(sink, seq(51)),
+                "exact min_seq only"
+            );
+            wm.release_rescue_floor(floor);
+            assert!(!wm.rescue_floor_is_held(sink, seq(50)), "{sink:?}");
+        }
+    }
+
+    #[test]
+    fn release_rescue_floor_lets_the_persisted_watermark_pass_the_batch() {
+        for sink in [AppliedSink::Ticks, AppliedSink::Depth] {
+            let wm = AppliedWatermark::new_for_tests();
+            let floor = wm.hold_rescue_floor(sink, seq(50), seq(60)).expect("slot");
+            wm.note_ticks_acked(seq(80));
+            wm.note_depth_acked(seq(80));
+            let _ = wm.durable_view_at(0);
+            wm.release_rescue_floor(floor);
+            assert_eq!(floors_held(&wm, sink), 0);
+            let view = wm.durable_view_at(LAG);
+            assert_eq!(
+                (view.hwm_ticks, view.hwm_depth),
+                (seq(80), seq(80)),
+                "{sink:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hold_rescue_floor_refused_hand_off_retracts_its_floor() {
+        // The producer holds, the `try_send` is refused, the producer
+        // releases: nothing is left held, the other sink is untouched.
+        let wm = AppliedWatermark::new_for_tests();
+        let floor = wm
+            .hold_rescue_floor(AppliedSink::Depth, seq(5), seq(6))
+            .expect("slot");
+        assert_eq!(floors_held(&wm, AppliedSink::Depth), 1);
+        assert_eq!(floors_held(&wm, AppliedSink::Ticks), 0);
+        wm.release_rescue_floor(floor);
+        assert_eq!(floors_held(&wm, AppliedSink::Depth), 0);
+    }
+
+    #[test]
+    fn hold_rescue_floor_ignores_a_batch_with_no_sequence() {
+        let wm = AppliedWatermark::new_for_tests();
+        assert!(
+            wm.hold_rescue_floor(AppliedSink::Ticks, 0, seq(9))
+                .is_none()
+        );
+        assert_eq!(floors_held(&wm, AppliedSink::Ticks), 0);
+        assert!(!wm.snapshot().overflowed);
+        assert!(wm.snapshot().buckets.iter().all(|(id, _)| *id == 0));
+    }
+
+    #[test]
+    fn hold_rescue_floor_on_a_full_table_marks_the_range_unapplied() {
+        let wm = AppliedWatermark::new_for_tests();
+        for i in 0..RESCUE_FLOOR_SLOTS as u64 {
+            assert!(
+                wm.hold_rescue_floor(AppliedSink::Ticks, seq(10 + i), seq(10 + i))
+                    .is_some()
+            );
+        }
+        let far = seq(5_000);
+        assert!(
+            wm.hold_rescue_floor(AppliedSink::Ticks, far, far + 10)
+                .is_none()
+        );
+        assert!(
+            wm.snapshot().range_has_unapplied(far, far),
+            "a batch that could not hold a floor must replay anyway"
+        );
+    }
+
+    #[test]
+    fn hold_rescue_floor_takes_the_lowest_of_several_queued_batches() {
+        let wm = AppliedWatermark::new_for_tests();
+        let a = wm
+            .hold_rescue_floor(AppliedSink::Ticks, seq(70), seq(71))
+            .expect("a");
+        let _b = wm
+            .hold_rescue_floor(AppliedSink::Ticks, seq(30), seq(31))
+            .expect("b");
+        wm.note_ticks_acked(seq(90));
+        wm.note_depth_acked(seq(90));
+        let _ = wm.durable_view_at(0);
+        assert!(wm.durable_view_at(LAG).hwm_ticks < seq(30));
+        wm.release_rescue_floor(a);
+        assert!(
+            wm.durable_view_at(LAG + SEC).hwm_ticks < seq(30),
+            "b still queued"
+        );
+    }
+
+    #[test]
+    fn test_regression_an_abandoned_rescue_survives_into_the_persisted_file() {
+        for sink in [AppliedSink::Ticks, AppliedSink::Depth] {
+            let dir = scratch("abandoned_rescue");
+            let wm = AppliedWatermark::new_for_tests();
+            wm.bind(&dir);
+            // A batch is queued for the rescue thread and never written
+            // (shutdown abandonment, OOM, SIGKILL): its floor is never released.
+            let _held = wm.hold_rescue_floor(sink, seq(50), seq(60));
+            wm.note_ticks_acked(seq(400));
+            wm.note_depth_acked(seq(400));
+            wm.persist_at(0);
+            wm.persist_at(10 * LAG);
+            let loaded = AppliedSnapshot::load(&dir).expect("file");
+            assert!(
+                !loaded.range_is_applied(sink, seq(50), seq(60)),
+                "{sink:?}: the next boot must replay the queued batch's range"
+            );
+            assert!(
+                loaded.range_is_applied(sink, seq(1), seq(40)),
+                "{sink:?}: everything below it is still skipped"
+            );
+            drop(std::fs::remove_dir_all(&dir));
+        }
+    }
+
+    #[test]
+    fn test_cap_below_floor_holds_strictly_below() {
+        assert_eq!(cap_below_floor(10, u64::MAX), 10);
+        assert_eq!(cap_below_floor(10, 20), 10);
+        assert_eq!(cap_below_floor(20, 20), 19);
+        assert_eq!(cap_below_floor(30, 20), 19);
+        assert_eq!(cap_below_floor(30, 1), 0);
+    }
+
+    #[test]
+    fn test_mono_nanos_is_monotone() {
+        let a = mono_nanos();
+        assert!(mono_nanos() >= a);
+    }
+}
+
+// Kept below the test module on purpose: `loss_counter_visibility_guard`
+// stops reading a file at its first column-0 `#[cfg(test)]`, so a test-only
+// item above production code hides that code's emit sites from the guard.
+
+/// Writes a valid watermark file for `wal_dir` holding the two high-water
+/// marks, as a persist would.
+#[cfg(test)]
+// TEST-EXEMPT: test-only helper for the S3 sequence-seed tests
+pub(crate) fn write_file_for_test(wal_dir: &Path, hwm_ticks: u64, hwm_depth: u64) {
+    let bytes = AppliedSnapshot {
+        hwm_ticks,
+        hwm_depth,
+        persisted_at_nanos: wall_nanos(),
+        dir_tag: dir_tag_of(wal_dir),
+        ..AppliedSnapshot::default()
+    }
+    .to_bytes();
+    std::fs::write(wal_dir.join(APPLIED_WATERMARK_FILE), bytes).expect("write watermark"); // APPROVED: test-only
 }
