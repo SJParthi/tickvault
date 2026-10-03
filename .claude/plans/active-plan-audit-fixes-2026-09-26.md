@@ -2468,6 +2468,19 @@ write, then candle warm-up (PR31b-2 (a), already listed above). Each fix ships a
   test_regression_h2_token_cache_write_never_runs_on_the_calling_worker,
   test_offload_blocking_without_a_runtime_runs_inline,
   test_regression_h2_cache_save_goes_through_the_offload.
+- [x] **H3 — Deploy security (PR36c; owner 2026-10-03: "security yes and deploy yes").** A pushed
+  v*.*.* tag passes the same All Green gate as a manual deploy and must name a commit already on
+  main; a pull request's terraform plan job holds no AWS credentials (fmt + offline validate only;
+  the live plan still runs on the push to main); SSH has no rule unless the `TF_VAR_OPERATOR_CIDR`
+  secret is set, and `emergency-fs-recover.yml` opens 22 to its own runner only for the run. Files:
+  `.github/workflows/{deploy-aws,terraform-apply,emergency-fs-recover}.yml`,
+  `deploy/aws/terraform/{main,variables}.tf`. Test: r21_manual_deploy_needs_main_and_all_green.
+  Honest limit: the long-lived keys stay repository secrets until the owner moves them into the
+  `prod` environment.
+- [ ] **H4 — The live feed never waits on a slow disk for its own backup write.** Unbacked tick and
+  depth rows with a busy rescue thread, and seals refused by a full escalation queue, are written
+  on the frame drain. Plan: park them in a bounded in-memory queue retried on later flushes and
+  drained at shutdown, inline only past the bound, counted.
 
 ## Edge Cases
 
