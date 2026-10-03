@@ -534,22 +534,6 @@ impl AppliedSnapshot {
     }
 }
 
-/// Writes a valid watermark file for `wal_dir` holding the two high-water
-/// marks, as a persist would.
-#[cfg(test)]
-// TEST-EXEMPT: test-only helper for the S3 sequence-seed tests
-pub(crate) fn write_file_for_test(wal_dir: &Path, hwm_ticks: u64, hwm_depth: u64) {
-    let bytes = AppliedSnapshot {
-        hwm_ticks,
-        hwm_depth,
-        persisted_at_nanos: wall_nanos(),
-        dir_tag: dir_tag_of(wal_dir),
-        ..AppliedSnapshot::default()
-    }
-    .to_bytes();
-    std::fs::write(wal_dir.join(APPLIED_WATERMARK_FILE), bytes).expect("write watermark"); // APPROVED: test-only
-}
-
 /// The directory identity stored in the file: FNV-1a 64 over the canonical
 /// path, or the path as given when it cannot be canonicalised (a directory
 /// that does not exist yet has no file to load anyway). Never `0`, so an
@@ -2344,4 +2328,24 @@ mod tests {
         let a = mono_nanos();
         assert!(mono_nanos() >= a);
     }
+}
+
+// Kept below the test module on purpose: `loss_counter_visibility_guard`
+// stops reading a file at its first column-0 `#[cfg(test)]`, so a test-only
+// item above production code hides that code's emit sites from the guard.
+
+/// Writes a valid watermark file for `wal_dir` holding the two high-water
+/// marks, as a persist would.
+#[cfg(test)]
+// TEST-EXEMPT: test-only helper for the S3 sequence-seed tests
+pub(crate) fn write_file_for_test(wal_dir: &Path, hwm_ticks: u64, hwm_depth: u64) {
+    let bytes = AppliedSnapshot {
+        hwm_ticks,
+        hwm_depth,
+        persisted_at_nanos: wall_nanos(),
+        dir_tag: dir_tag_of(wal_dir),
+        ..AppliedSnapshot::default()
+    }
+    .to_bytes();
+    std::fs::write(wal_dir.join(APPLIED_WATERMARK_FILE), bytes).expect("write watermark"); // APPROVED: test-only
 }
