@@ -995,6 +995,31 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
     the oldest open bucket minus lateness, with tick writes suppressed; a replayed frame whose
     bucket ended before the warm-up start gets no candle; plus a per-slot, per-frame refusal as a
     safety net, counted.
+  - **Re-checked 2026-10-01.** The core overwrite is already covered by plan item 47
+    (`mark_replay_gap`, `finish_replay`, the randomized `restart_differential.rs`). What is left
+    is split in two.
+  - [x] **PR31b-1 — the crash marker covers the candle queue drained last (2026-10-01).** The
+    seal writer marked its crash marker (`seal-unwritten.mark`) clean at the end of its own final
+    drain, but the escalation queue drains after it and can hold up to 250,000 sealed candles,
+    so a kill during that wait lost them behind a clean marker. Now: on cancel the writer writes
+    the count at once (`UnwrittenSealMark::record_now`), before its final drain; after the drain
+    it marks clean only when it holds nothing; `main` finishes the marker after the escalation
+    step whatever its outcome (`finish_unwritten_mark_at_shutdown`, 2 s budget on a blocking
+    thread, new step 5b-2c), and no later write to that marker lands. A failed marker write and
+    an unreadable marker at boot are coded (AGGREGATOR-SEAL-01). Honest limits: a count written
+    after the final drain includes residue the drain already paged (counted twice, never
+    missed); the marker is not updated during the escalation drain, so a kill there over-counts;
+    an overrun or lane-timeout page names no count; a writer that exits mid-session leaves the
+    marker unfinished. Tests: 5 in `seal_writer_loop::pr31b1_tests`,
+    `the_loop_reads_the_previous_marker_before_it_writes_its_own` updated,
+    `crates/app/tests/seal_unwritten_mark_shutdown_guard.rs` (4).
+  - [ ] **PR31b-2 — the rest.** (a) The WAL warm-up with archived segments and row 253, as the
+    chosen approach above. (b) NEW 2026-10-01: a CLEAN shutdown mid-session writes truncated
+    open bars as complete. `seal_open_buckets_at_close()` runs at lane exit
+    (dhan_feed_stack.rs, at the lane's shutdown seal) with no session gate, and
+    `restart_differential.rs` simulates crashes only, so it cannot see this. Gate the seal to
+    after the close (or mark those bars partial) and add the clean-shutdown case to the
+    differential.
 - [ ] **PR31c — PR31a's honest limits, closed one by one (zero data loss on every path,
   owner 2026-09-27).** (`storage`, `app`) Added 2026-09-27 so none of these lives only in the
   PR #1962 text. Each lands as its own small PR after PR31b.
@@ -1195,7 +1220,7 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
     note in aws-budget.md (the ring is 42.0 MB, the escalation queue ~36 MB, up to 750,000 seals
     across the three queues). Dated history that said 225,000 at nine frames is left as written.
   - Tests: `unwritten_seals_counts_channel_ring_and_escalation_queue`,
-    `unwritten_mark_writes_only_on_change_and_at_most_once_a_second`,
+    `test_mark_clean_and_sample_write_only_on_change_and_at_most_once_a_second`,
     `test_unwritten_seal_record_to_line_round_trips_and_parse_refuses_anything_else`,
     `test_unwritten_mark_in_dir_read_previous_reports_an_unreadable_file_as_unreadable`,
     `unwritten_mark_write_failure_is_counted_not_fatal`,
