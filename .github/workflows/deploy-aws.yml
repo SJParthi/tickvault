@@ -112,8 +112,15 @@ jobs:
       # retries. Honest limit: this check lives in the workflow file, so a
       # run from a branch that deletes it is not stopped here. That barrier
       # is the prod environment's deployment-branch rule (next step).
-      - name: Refuse a manual deploy of a commit that did not pass All Green
-        if: github.event_name == 'workflow_dispatch'
+      #
+      # Audit PR36c (2026-10-03, owner: "security yes"): a pushed v*.*.* tag
+      # also deploys, and it skipped this check, so a tag on any commit
+      # (a branch nobody merged, or one that failed CI) reached prod. A tag
+      # run now passes the same All Green check, and its commit must already
+      # be on main (the tag may name an older main commit, never one outside
+      # it). Undo: revert this step's `if:` to the dispatch-only form.
+      - name: Refuse a manual or tag deploy of a commit that did not pass All Green
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -122,10 +129,19 @@ jobs:
         run: |
           set -uo pipefail
           refuse() {
-            echo "::error::manual deploy refused: $1" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "::error::deploy refused: $1" | tee -a "$GITHUB_STEP_SUMMARY"
             exit 1
           }
-          if [ "$RUN_REF" != "refs/heads/main" ]; then
+          if [[ "$RUN_REF" == refs/tags/* ]]; then
+            # `behind` = the commit is an ancestor of main; `identical` = it
+            # is main's head. Anything else is not on main.
+            on_main=$(gh api "repos/${REPO}/compare/main...${RUN_SHA}" --jq '.status' 2>/dev/null) \
+              || refuse "could not compare ${RUN_SHA} with main"
+            case "$on_main" in
+              identical|behind) echo "✅ tag ${RUN_REF#refs/tags/} names ${RUN_SHA}, which is on main." | tee -a "$GITHUB_STEP_SUMMARY" ;;
+              *) refuse "tag ${RUN_REF#refs/tags/} names ${RUN_SHA}, which is not on main (compare status: ${on_main:-empty})" ;;
+            esac
+          elif [ "$RUN_REF" != "refs/heads/main" ]; then
             refuse "it was started from ${RUN_REF}; only main can be deployed by hand"
           fi
           # Prints the number of successful All Green runs (posted by GitHub
