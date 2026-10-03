@@ -124,7 +124,12 @@ permissions:
 
 env:
   TF_VAR_aws_region: ap-south-1
-  TF_VAR_operator_cidr: "0.0.0.0/0" # CI runs from GH IPs; SSH SG is locked by separate operator override
+  # Audit PR36c (2026-10-03, owner: "security yes"): this was "0.0.0.0/0",
+  # which opened SSH to the internet on every apply. Empty (the secret unset)
+  # means no SSH rule; shell access is SSM Session Manager. To allow one
+  # address: set the repository secret TF_VAR_OPERATOR_CIDR (e.g.
+  # 203.0.113.42/32) and re-run this workflow.
+  TF_VAR_operator_cidr: ${{ secrets.TF_VAR_OPERATOR_CIDR }}
   TF_VAR_operator_email: "sjparthi93@gmail.com" # registered alert destination
   TF_VAR_ami_id: ami-0fa0340d4a8bdd6ee
   # Operator portal: opt prod IN via CI (the terraform variable default stays
@@ -201,7 +206,21 @@ jobs:
           terraform_version: 1.9.8
           terraform_wrapper: false
 
+      # Audit PR36c (2026-10-03, owner: "security yes"): a pull request's plan
+      # job held the long-lived AWS keys, so any branch with a pull request
+      # had account-level credentials in a job it could edit. A pull request
+      # now gets NO AWS credentials: it checks formatting and validates the
+      # configuration offline (`init -backend=false` + `validate` below). The
+      # real plan, against the live state, runs on the push to main, before
+      # the apply, exactly as it always has. Undo: delete the `if:` lines that
+      # say `github.event_name != 'pull_request'` in this job and the two
+      # pull-request-only steps.
+      # Honest limit: the keys are still repository secrets, so a branch
+      # that edits this file in its own pull request can still read them.
+      # The barrier a branch cannot edit is moving them into the `prod`
+      # environment (Settings > Environments > prod), an owner setting.
       - name: Configure AWS credentials (OIDC if available, else access keys)
+        if: github.event_name != 'pull_request'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_TERRAFORM_ROLE_ARN }}
@@ -211,6 +230,7 @@ jobs:
           role-session-name: tv-github-terraform-plan-${{ github.run_id }}
 
       - name: Resolve AWS account id
+        if: github.event_name != 'pull_request'
         id: aws_account
         run: |
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
@@ -218,6 +238,7 @@ jobs:
           echo "Using AWS account ${ACCOUNT_ID}"
 
       - name: Bootstrap S3 state backend + DynamoDB lock (idempotent)
+        if: github.event_name != 'pull_request'
         run: bash scripts/aws-bootstrap-state-backend.sh "${{ steps.aws_account.outputs.account_id }}" "${{ env.AWS_REGION }}"
 
       # rust-only phase 2b-1 (2026-07-18): the 4 operational Lambdas
@@ -334,6 +355,7 @@ jobs:
       # Rust guard asserts this file stays perl-free.
 
       - name: terraform init (with S3 backend)
+        if: github.event_name != 'pull_request'
         run: |
           terraform -chdir=${{ env.TF_DIR }} init \
             -backend-config="bucket=tv-terraform-state-${{ steps.aws_account.outputs.account_id }}" \
@@ -376,6 +398,10 @@ jobs:
           terraform -chdir=${{ env.TF_DIR }} force-unlock -force "${LOCK_ID}"
           echo "state lock ${LOCK_ID} released; plan will now acquire its own"
 
+      - name: terraform init (offline, pull request only, no AWS credentials)
+        if: github.event_name == 'pull_request'
+        run: terraform -chdir=${{ env.TF_DIR }} init -backend=false -input=false
+
       - name: terraform validate
         run: terraform -chdir=${{ env.TF_DIR }} validate
 
@@ -385,6 +411,7 @@ jobs:
       # latch plans the rule ENABLED as before (the hourly hard-stop guard
       # still stops a breached box within the hour and disables it again).
       - name: Read the budget-stop latch
+        if: github.event_name != 'pull_request'
         run: |
           set -uo pipefail
           LATCH=$(aws ssm get-parameter --name "/tickvault-guard/prod/budget-stop-month" \
@@ -398,6 +425,7 @@ jobs:
           fi
 
       - name: terraform plan
+        if: github.event_name != 'pull_request'
         id: plan
         run: |
           set +e
@@ -416,18 +444,17 @@ jobs:
           echo "Plan exit code: ${EXIT_CODE} (0=no-changes, 2=changes-pending)"
 
       - name: Upload plan artifact
+        if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@v7
         with:
           name: terraform-plan-${{ github.sha }}
           path: ${{ env.TF_DIR }}/tfplan
           retention-days: 7
 
-      - name: Post plan summary on PR
+      - name: Report what a pull request checked
         if: github.event_name == 'pull_request'
         run: |
-          echo "Plan exit code: ${{ steps.plan.outputs.exitcode }} (0=no-changes, 2=changes-pending)"
-          # PR comment posting could be wired here via gh CLI; left as TODO
-          # to avoid pulling in an extra action. Plan output is in the job log.
+          echo "Pull request: format and offline validate passed. No AWS credentials were used; the plan against live state runs on the push to main." | tee -a "$GITHUB_STEP_SUMMARY"
 
   # ─────────────────────────────────────────────────────────────────
   # Job 2: market-hours guard — blocks apply during 09:00-15:45 IST Mon-Fri

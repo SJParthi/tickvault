@@ -415,7 +415,7 @@ fn check(c: &Case) -> Result<(), TestCaseError> {
     if c.clean_exit {
         // The lane's mid-session exit seal (audit PR31b-2).
         sweep(&mut previous, crash_secs, &mut stored);
-        previous.withhold_open_buckets();
+        let _ = previous.withhold_open_buckets();
     }
 
     // The restarted process: replay the WAL (some frames unreadable), hand

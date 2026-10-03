@@ -982,7 +982,7 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
     `test_flush_refuses_until_the_candle_tables_are_keyed`,
     `the_sink_sends_nothing_until_the_top_volume_tables_are_keyed`,
     `ensure_until_keyed_keeps_retrying_a_database_that_refuses`.
-- [ ] **PR31b — the restart rebuild never overwrites a fuller candle.** (`app`, `storage`,
+- [x] **PR31b — the restart rebuild never overwrites a fuller candle.** (`app`, `storage`,
   `trading`)
   - A restart in market hours rebuilds the open candles from the ticks it replays, which may be
     only part of them, and the UPSERT overwrites the fuller row already stored
@@ -1013,7 +1013,7 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
     marker unfinished. Tests: 5 in `seal_writer_loop::pr31b1_tests`,
     `the_loop_reads_the_previous_marker_before_it_writes_its_own` updated,
     `crates/app/tests/seal_unwritten_mark_shutdown_guard.rs` (4).
-  - [ ] **PR31b-2 — the rest.** (a) The WAL warm-up with archived segments and row 253, as the
+  - [x] **PR31b-2 — the rest.** (a) The WAL warm-up with archived segments and row 253, as the
     chosen approach above. (b) NEW 2026-10-01: a CLEAN shutdown mid-session writes truncated
     open bars as complete. `seal_open_buckets_at_close()` runs at lane exit
     (dhan_feed_stack.rs, at the lane's shutdown seal) with no session gate, and
@@ -1029,6 +1029,23 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
       cover them; that is #2010 part 2, not written yet.
     - Also from that review, for (a): `withhold_open_buckets` skips cells with no open bucket, so
       a settled late-trade carry that `force_seal_all` would re-emit is dropped uncounted.
+    - **(a) MEASURED 2026-10-03 and NOT built.** The `restart_differential.rs` model was run
+      with a restart that re-reads EVERY saved frame before the stop (the best a warm-up could
+      do) against one that re-reads none (what a clean exit leaves). Over 4,000 random days
+      (1,229 clean exits): of 25,832 bars that ended before the exit and are missing or short
+      in the database, the full re-read wrote 1; of 22,591 bars that spanned the exit, 0;
+      after crashes, 13 of 54,480. Each withheld bar either spans the restart's downtime or
+      ended within the late-trade margin of the exit, and the restart rules (rounds 18-25)
+      withhold both whatever was re-read. Deploys are also already blocked 09:00-15:45 IST.
+      So the warm-up would add boot time and about 1,800 lines for no rebuilt bars; the
+      10-second boot question is moot. **DROPPED 2026-10-03** (owner: "simply go ahead",
+      relayed by the coordinator, taking the recommendation to drop it).
+    - [x] Carry count (2026-10-03): `withhold_open_buckets` now drops an outstanding carry on a
+      timeframe with no bucket open and counts it on
+      `tv_candle_refold_partial_suppressed_total` (`AggregatorCell::discard_carry`); it is not
+      written, since a running process would settle it into a bucket the exit cannot know.
+      The exit log and docs no longer promise a rebuild. Test:
+      `test_regression_withhold_open_buckets_counts_a_dropped_carry` (fails without the fix).
 - [ ] **PR31c — PR31a's honest limits, closed one by one (zero data loss on every path,
   owner 2026-09-27).** (`storage`, `app`) Added 2026-09-27 so none of these lives only in the
   PR #1962 text. Each lands as its own small PR after PR31b.
@@ -2451,6 +2468,19 @@ write, then candle warm-up (PR31b-2 (a), already listed above). Each fix ships a
   test_regression_h2_token_cache_write_never_runs_on_the_calling_worker,
   test_offload_blocking_without_a_runtime_runs_inline,
   test_regression_h2_cache_save_goes_through_the_offload.
+- [x] **H3 — Deploy security (PR36c; owner 2026-10-03: "security yes and deploy yes").** A pushed
+  v*.*.* tag passes the same All Green gate as a manual deploy and must name a commit already on
+  main; a pull request's terraform plan job holds no AWS credentials (fmt + offline validate only;
+  the live plan still runs on the push to main); SSH has no rule unless the `TF_VAR_OPERATOR_CIDR`
+  secret is set, and `emergency-fs-recover.yml` opens 22 to its own runner only for the run. Files:
+  `.github/workflows/{deploy-aws,terraform-apply,emergency-fs-recover}.yml`,
+  `deploy/aws/terraform/{main,variables}.tf`. Test: r21_manual_deploy_needs_main_and_all_green.
+  Honest limit: the long-lived keys stay repository secrets until the owner moves them into the
+  `prod` environment.
+- [ ] **H4 — The live feed never waits on a slow disk for its own backup write.** Unbacked tick and
+  depth rows with a busy rescue thread, and seals refused by a full escalation queue, are written
+  on the frame drain. Plan: park them in a bounded in-memory queue retried on later flushes and
+  drained at shutdown, inline only past the bound, counted.
 
 ## Edge Cases
 

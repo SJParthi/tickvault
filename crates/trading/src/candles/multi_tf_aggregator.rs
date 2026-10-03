@@ -2825,7 +2825,8 @@ impl MultiTfAggregator {
     }
 
     /// Withholds every bucket still open, for a process that exits MID-SESSION
-    /// (audit PR31b-2). Returns how many it withheld; each is counted on
+    /// (audit PR31b-2). Returns how many buckets it withheld and how many
+    /// late-trade carries it dropped; each of both is counted on
     /// `tv_candle_refold_partial_suppressed_total`.
     ///
     /// A bucket still open when the process exits mid-session is missing
@@ -2841,13 +2842,33 @@ impl MultiTfAggregator {
     /// running process would also have left open reach this method. After the
     /// session ends, the caller keeps [`Self::force_seal_all`].
     ///
+    /// A timeframe with no bucket open may still hold a carry: units of a late
+    /// trade whose bucket the catch-up already sealed. A running process
+    /// settles them into this instrument's next bucket, or into the sealed bar
+    /// at the close; an exiting one cannot know which, so they are dropped
+    /// and counted rather than written into a bar that may not hold them
+    /// (review 2026-10-03: they used to be left in the cell and lost with the
+    /// process, uncounted).
+    ///
+    /// A restart cannot rebuild what this withholds. Each bucket either spans
+    /// the restart's downtime or ended within the late-trade margin of the
+    /// exit, and the restart's own rules withhold both (MEASURED 2026-10-03
+    /// on the `restart_differential.rs` model: replaying every saved frame
+    /// before a clean exit wrote 1 of 25,832 missing bars that ended before
+    /// the exit and 0 of 22,591 that spanned it).
+    ///
     /// # Complexity
     /// O(N × [`TF_COUNT`]). COLD: once, at a mid-session exit.
-    pub fn withhold_open_buckets(&mut self) -> usize {
+    pub fn withhold_open_buckets(&mut self) -> (usize, usize) {
         let mut withheld = 0_usize;
+        let mut carries = 0_usize;
         for slot in &mut self.slots {
             for tf in TfIndex::ALL {
                 if slot.cell.snapshot(tf).is_uninitialised() {
+                    if slot.cell.discard_carry(tf) {
+                        carries = carries.saturating_add(1);
+                        count_replay_partial_suppressed();
+                    }
                     continue;
                 }
                 // Discarded on purpose: the bar is truncated. `force_seal`
@@ -2859,7 +2880,7 @@ impl MultiTfAggregator {
                 }
             }
         }
-        withheld
+        (withheld, carries)
     }
 
     /// Watermark-aware intraday catch-up seal across every instrument: seals
@@ -5456,16 +5477,44 @@ mod tests {
             .iter()
             .filter(|tf| !agg.slots[0].cell.snapshot(**tf).is_uninitialised())
             .count();
-        let withheld = agg.withhold_open_buckets();
+        let (withheld, carries) = agg.withhold_open_buckets();
         assert!(written.contains(&(TfIndex::M1, OPEN + 60)));
         assert!(!written.iter().any(|w| *w == (TfIndex::M1, OPEN + 120)));
         assert_eq!(withheld, open_before);
         assert!(withheld > 0);
+        assert_eq!(carries, 0);
         // Nothing is left for a later seal to write.
-        assert_eq!(agg.withhold_open_buckets(), 0);
+        assert_eq!(agg.withhold_open_buckets(), (0, 0));
         let mut later = 0_usize;
         agg.force_seal_all(|_, _, _, _, _| later += 1);
         assert_eq!(later, 0, "a withheld bucket is never written later");
+    }
+
+    /// Review 2026-10-03: a late trade's carry left on a timeframe with no
+    /// bucket open was skipped by the mid-session exit and lost uncounted. It
+    /// is now dropped and counted, and nothing writes it later.
+    #[test]
+    fn test_regression_withhold_open_buckets_counts_a_dropped_carry() {
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        for (off, cum) in [(0_u32, 1_000_u32), (1, 1_100)] {
+            let t = tick(13, SEG_IDX, OPEN + off, 100.0, cum);
+            let _ = agg.consume_tick(Feed::Dhan, &t, None, ignore_seal);
+        }
+        // The catch-up seals the 1-second bucket; then a late trade for it
+        // arrives, so its units are carried with no 1-second bucket open.
+        let _ = agg.catch_up_seal_all(OPEN + 2, ignore_seal);
+        let late = tick(13, SEG_IDX, OPEN + 1, 100.0, 1_500);
+        let _ = agg.consume_tick(Feed::Dhan, &late, None, ignore_seal);
+        assert!(agg.slots[0].cell.snapshot(TfIndex::S1).is_uninitialised());
+
+        let (withheld, carries) = agg.withhold_open_buckets();
+        assert_eq!(carries, 1, "the 1-second carry is dropped and counted");
+        assert!(withheld > 0, "the longer frames' open buckets are withheld");
+        // Neither the carry nor a withheld bucket reaches a later seal.
+        let mut later = 0_usize;
+        agg.force_seal_all(|_, _, _, _, _| later += 1);
+        assert_eq!(later, 0);
+        assert_eq!(agg.withhold_open_buckets(), (0, 0));
     }
 
     /// Review round 2 (2026-09-29), candle finding 2: with no bucket open,

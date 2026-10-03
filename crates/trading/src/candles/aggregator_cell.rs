@@ -1628,6 +1628,23 @@ impl AggregatorCell {
         ConsumeOutcome::DiscardLate
     }
 
+    /// Drops `tf`'s outstanding carry, for a process that exits mid-session
+    /// (audit PR31b-2). Returns whether there was one.
+    ///
+    /// With no bucket open, a carry holds units of a late trade whose own
+    /// bucket the catch-up already sealed. A running process settles them
+    /// into the next bucket this instrument touches, or, if none comes before
+    /// the close, into the sealed bar ([`Self::force_seal`] case 2). An
+    /// exiting process cannot know which, and writing them into the sealed
+    /// bar could count them in a bar the uninterrupted day leaves without
+    /// them, so the caller drops them and counts the drop.
+    ///
+    /// # Complexity
+    /// O(1) — three array reads and three writes.
+    pub(crate) fn discard_carry(&mut self, tf: TfIndex) -> bool {
+        self.take_carry(tf.as_ordinal()) != UnattributedCarry::default()
+    }
+
     /// Day-boundary force-seal of one timeframe slot.
     ///
     /// Returns `Some(bar)` in exactly two cases, and `None` otherwise:
@@ -3102,6 +3119,31 @@ mod tests {
         assert!(
             cell.snapshot(TfIndex::M1).is_uninitialised(),
             "a slot that never opened must stay uninitialised"
+        );
+    }
+
+    /// Audit PR31b-2 (review 2026-10-03): `discard_carry` reports an
+    /// outstanding carry once and clears it, so `force_seal` has nothing left
+    /// to settle into the sealed bar.
+    #[test]
+    fn test_discard_carry_reports_an_outstanding_carry_once() {
+        let mut cell = AggregatorCell::empty();
+        let ord = TfIndex::S1.as_ordinal();
+        cell.last_sealed[ord].bucket_start_ist_secs = 33_300;
+        cell.last_sealed[ord].volume = 100;
+        cell.carried_upto[ord] = 1_500;
+        cell.carried_net[ord] = 400;
+        assert!(cell.discard_carry(TfIndex::S1));
+        assert_eq!(cell.carried_upto[ord], 0);
+        assert_eq!(cell.carried_net[ord], 0);
+        assert!(!cell.discard_carry(TfIndex::S1), "reported once");
+        assert!(
+            !cell.discard_carry(TfIndex::M1),
+            "no carry, nothing reported"
+        );
+        assert!(
+            cell.force_seal(TfIndex::S1).is_none(),
+            "a discarded carry never amends the sealed bar"
         );
     }
 
