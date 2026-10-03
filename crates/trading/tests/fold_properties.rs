@@ -53,9 +53,25 @@ fn tick(price: f32, ts_offset: u32, volume: u32, oi: u32, day_open: f32) -> Pars
 /// Prices including the corrupt shapes the parsers are proven to emit, plus
 /// the subnormal that is finite, positive and in range yet still widens to
 /// zero — the case `tick_price_is_sane` exists for.
+/// A listed price: a whole number of paise from 0.05 to 89,999.99.
+///
+/// Built from an integer, not from an `f32` range: proptest 1.11's `f32`
+/// range sampler can trip its own internal assertion
+/// (`float_samplers.rs:466`, `self.low - result < self.intervals.step`) on
+/// some seeds, which failed CI on an unrelated change (2026-10-03). An
+/// exchange price is a paise multiple anyway, so nothing is lost.
+fn listed_price() -> impl Strategy<Value = f32> {
+    (5u32..9_000_000).prop_map(|paise| {
+        // APPROVED: exact — every value below 2^24 is representable in f32.
+        #[allow(clippy::cast_precision_loss)]
+        let paise = paise as f32;
+        paise / 100.0
+    })
+}
+
 fn price() -> impl Strategy<Value = f32> {
     prop_oneof![
-        70 => (0.05f32..90_000.0),
+        70 => listed_price(),
         4 => Just(0.0f32),
         3 => Just(f32::NAN),
         3 => Just(f32::INFINITY),
@@ -98,7 +114,7 @@ fn open_interest() -> impl Strategy<Value = u32> {
 /// what every Ticker-mode instrument carries.
 fn ticks() -> impl Strategy<Value = Vec<ParsedTick>> {
     (
-        prop_oneof![3 => (0.05f32..90_000.0), 1 => Just(0.0f32)],
+        prop_oneof![3 => listed_price(), 1 => Just(0.0f32)],
         prop::collection::vec((price(), 0u32..59, 0u32..100_000, open_interest()), 1..24),
     )
         .prop_map(|(day_open, raw)| {
@@ -352,7 +368,7 @@ fn tick_based(
 
 /// A shared `day_open` that is the absent sentinel half the time.
 fn shared_day_open() -> impl Strategy<Value = f32> {
-    prop_oneof![1 => 0.05f32..90_000.0, 1 => Just(0.0f32)]
+    prop_oneof![1 => listed_price(), 1 => Just(0.0f32)]
 }
 
 /// One bucket's ticks at 09:15 or 10:00 (even odds), offsets free to repeat,
