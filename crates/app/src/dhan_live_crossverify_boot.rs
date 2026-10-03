@@ -704,9 +704,9 @@ fn persist_report(
     let mut batch_errors = 0_usize;
     let flush_if_full = |w: &mut DhanLiveXverifyAuditWriter, errs: &mut usize| {
         let failed = if w.pending() >= PERSIST_BATCH_ROWS {
-            w.flush().is_err()
+            tickvault_storage::off_worker::off_worker(|| w.flush()).is_err()
         } else {
-            w.flush_if_large().is_err()
+            tickvault_storage::off_worker::off_worker(|| w.flush_if_large()).is_err()
         };
         if failed {
             *errs = errs.saturating_add(1);
@@ -735,7 +735,7 @@ fn persist_report(
     );
     let daily_failed = writer.append_daily(&daily).is_err();
 
-    match writer.flush() {
+    match tickvault_storage::off_worker::off_worker(|| writer.flush()) {
         Ok(()) => {
             metrics::counter!(XVERIFY_PERSIST_ROWS_COUNTER)
                 .increment(c.findings.len() as u64 + report.rest_tape.len() as u64 + 1);
@@ -1013,9 +1013,9 @@ fn persist_option_findings(questdb: &QuestDbConfig, report: &RunReport) -> bool 
     let mut batch_errors = 0_usize;
     let mut flush_if_full = |w: &mut DhanLiveXverifyAuditWriter| {
         let failed = if w.pending() >= PERSIST_BATCH_ROWS {
-            w.flush().is_err()
+            tickvault_storage::off_worker::off_worker(|| w.flush()).is_err()
         } else {
-            w.flush_if_large().is_err()
+            tickvault_storage::off_worker::off_worker(|| w.flush_if_large()).is_err()
         };
         if failed {
             batch_errors = batch_errors.saturating_add(1);
@@ -1033,7 +1033,7 @@ fn persist_option_findings(questdb: &QuestDbConfig, report: &RunReport) -> bool 
         }
         flush_if_full(&mut writer);
     }
-    match writer.flush() {
+    match tickvault_storage::off_worker::off_worker(|| writer.flush()) {
         Ok(()) => {
             metrics::counter!(XVERIFY_PERSIST_ROWS_COUNTER)
                 .increment(c.findings.len() as u64 + report.rest_tape.len() as u64);

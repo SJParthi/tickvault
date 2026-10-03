@@ -1953,7 +1953,7 @@ pub async fn run_tf_consistency(
     // failed flush discards pending rows (poisoned-buffer defense) and the
     // run must not read Pass over unpersisted findings.
     let mut flush_degraded = false;
-    if let Err(err) = state.writer.flush() {
+    if let Err(err) = tickvault_storage::off_worker::off_worker(|| state.writer.flush()) {
         flush_degraded = true;
         metrics::counter!("tv_tf_verify_query_failures_total", "stage" => "flush_failed")
             .increment(1);

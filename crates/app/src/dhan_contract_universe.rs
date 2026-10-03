@@ -241,6 +241,15 @@ pub fn write_contract_artifact(date_ist: &str, rows: &[ContractRow]) -> anyhow::
 /// reported as "contracts are NOT in effect" rather than as an empty set that
 /// looks like a market with no derivatives.
 pub fn read_contract_artifact(date_ist: &str) -> anyhow::Result<std::sync::Arc<Vec<ContractRow>>> {
+    // Sweep S5: the stat, read and parse run off the shared tokio worker,
+    // so the attach retry loop cannot hold the worker the socket readers use.
+    tickvault_storage::off_worker::off_worker(|| read_contract_artifact_on_this_thread(date_ist))
+}
+
+/// The body of [`read_contract_artifact`], run on whichever thread calls it.
+fn read_contract_artifact_on_this_thread(
+    date_ist: &str,
+) -> anyhow::Result<std::sync::Arc<Vec<ContractRow>>> {
     let path = contract_artifact_path(date_ist);
     let stamp = artifact_stamp(&path);
 
@@ -1722,6 +1731,15 @@ type CachedSymbolMap = (
 /// re-reads, so a file that arrives late is picked up on the following minute
 /// rather than being negatively cached for the session.
 pub fn read_symbol_map(
+    date_ist: &str,
+) -> Result<std::sync::Arc<HashMap<String, (u64, u8)>>, String> {
+    // Sweep S5: the stat, read and parse run off the shared tokio worker,
+    // so the attach retry loop cannot hold the worker the socket readers use.
+    tickvault_storage::off_worker::off_worker(|| read_symbol_map_on_this_thread(date_ist))
+}
+
+/// The body of [`read_symbol_map`], run on whichever thread calls it.
+fn read_symbol_map_on_this_thread(
     date_ist: &str,
 ) -> Result<std::sync::Arc<HashMap<String, (u64, u8)>>, String> {
     let path = crate::dhan_universe::mapping_artifact_path(date_ist);

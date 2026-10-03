@@ -2310,7 +2310,7 @@ pub async fn reconcile_process_death_episodes(
                 ),
             }
         }
-        match writer.flush() {
+        match tickvault_storage::off_worker::off_worker(|| writer.flush()) {
             Ok(()) => {
                 flushed = true;
                 break;
@@ -2802,7 +2802,7 @@ pub async fn run_feed_scoreboard(
                         }
                     }
                 }
-                match writer.flush() {
+                match tickvault_storage::off_worker::off_worker(|| writer.flush()) {
                     Ok(()) => {
                         metrics::counter!("tv_feed_scoreboard_episode_rows_total")
                             .increment(appended);
@@ -3363,7 +3363,7 @@ pub async fn run_feed_scoreboard(
             );
         }
     }
-    if let Err(err) = writer.flush() {
+    if let Err(err) = tickvault_storage::off_worker::off_worker(|| writer.flush()) {
         error!(
             code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
             stage = "daily_flush",

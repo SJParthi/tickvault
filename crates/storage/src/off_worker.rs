@@ -34,7 +34,7 @@
 /// possible. See the module docs for when it is and is not.
 ///
 /// O(1) apart from `step` itself: one thread-local read and one compare.
-pub(crate) fn off_worker<T>(step: impl FnOnce() -> T) -> T {
+pub fn off_worker<T>(step: impl FnOnce() -> T) -> T {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
             tokio::task::block_in_place(step)

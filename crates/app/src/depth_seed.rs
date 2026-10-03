@@ -313,6 +313,13 @@ pub fn write_depth_seed(path: &std::path::Path, seed: &DepthSeed) -> std::io::Re
 /// parse failure is logged once at warn so a corrupt file is not silent.
 #[must_use]
 pub fn read_depth_seed(path: &std::path::Path) -> Option<DepthSeed> {
+    // Sweep S5: the stat, read and parse run off the shared tokio worker,
+    // so the attach retry loop cannot hold the worker the socket readers use.
+    tickvault_storage::off_worker::off_worker(|| read_depth_seed_on_this_thread(path))
+}
+
+/// The body of [`read_depth_seed`], run on whichever thread calls it.
+fn read_depth_seed_on_this_thread(path: &std::path::Path) -> Option<DepthSeed> {
     let body = std::fs::read(path).ok()?;
     match serde_json::from_slice::<DepthSeed>(&body) {
         Ok(seed) => Some(seed),

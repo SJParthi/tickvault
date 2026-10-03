@@ -135,7 +135,7 @@ pub async fn run_table_storage_rollup(
         }
         appended += 1;
     }
-    if let Err(err) = writer.flush() {
+    if let Err(err) = tickvault_storage::off_worker::off_worker(|| writer.flush()) {
         error!(
             code = "SCOREBOARD-01",
             stage = "table_storage_flush",
