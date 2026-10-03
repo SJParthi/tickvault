@@ -5009,15 +5009,16 @@ impl LiveIngest {
     /// trades after the exit. Writing them here wrote truncated bars as
     /// complete ones, and a later rewrite could not always fix them.
     ///
-    /// **Honest limit (hostile review, 2026-10-03):** today NOTHING rebuilds
-    /// them. A restart's WAL replay skips the segments already applied to the
-    /// database (the default), so a clean exit leaves no frames to rebuild
-    /// from, and the withheld bars stay missing and counted. "Still open"
-    /// here means not yet past the catch-up cutoff (the watermark minus the
-    /// late-trade margin), so it also covers bars of quiet contracts that
-    /// ended less than that margin before the exit. The rebuild is plan item
-    /// PR31b-2 (a), the candle warm-up that re-reads archived segments; it is
-    /// not written yet.
+    /// **Honest limit (hostile review, 2026-10-03):** nothing rebuilds them,
+    /// and nothing can. "Still open" here means not yet past the catch-up
+    /// cutoff (the watermark minus the late-trade margin), so each withheld
+    /// bar either spans the restart's downtime or ended within that margin of
+    /// the exit; a restart cannot prove either complete, and its own rules
+    /// withhold both even when it re-reads every saved frame. Measured on the
+    /// `restart_differential.rs` model on 2026-10-03: a full re-read wrote 1
+    /// of 25,832 such bars that ended before the exit and 0 of 22,591 that
+    /// spanned it, so plan item PR31b-2 (a), the candle warm-up, is not
+    /// built. The bars stay missing and counted.
     ///
     /// Returns `(emitted, dropped)` like [`Self::seal_open_buckets_at_close`].
     ///
@@ -5025,15 +5026,17 @@ impl LiveIngest {
     /// O(slots × TF). COLD — once, at a mid-session exit.
     pub fn seal_complete_buckets_at_mid_session_exit(&mut self) -> (u64, u64) {
         let sealed = self.catch_up_seal();
-        let withheld = self.aggregator.withhold_open_buckets();
-        if withheld > 0 {
+        let (withheld, carries) = self.aggregator.withhold_open_buckets();
+        if withheld > 0 || carries > 0 {
             warn!(
                 code = ErrorCode::WsGapConnectionState.code_str(),
                 withheld,
+                carries,
                 "candle fold: exiting during the session, so {withheld} open bar(s) were not \
-                 written. Each is missing the trades after the exit, so it is left missing \
-                 rather than written short. A restart does not rebuild them yet: the \
-                 candle warm-up that would is not written."
+                 written and {carries} late-trade carr(ies) were dropped. Each bar is missing \
+                 the trades after the exit, so it is left missing rather than written short. \
+                 A restart cannot rebuild them: each spans the restart's downtime or ended \
+                 within the late-trade margin, so no saved data can prove it complete."
             );
         }
         sealed
