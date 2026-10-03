@@ -620,11 +620,9 @@ impl UnwrittenSealMark {
                 true
             }
             Err(err) => {
-                metrics::counter!(SEAL_UNWRITTEN_MARK_ERRORS_COUNTER).increment(1);
-                if !self.failing {
-                    self.failing = true;
-                    report_mark_write_failure(&self.path, &err);
-                }
+                // Counted on every failure, logged on the first of a run.
+                record_mark_write_failure(&self.path, &err, !self.failing);
+                self.failing = true;
                 false
             }
         }
@@ -651,9 +649,14 @@ fn write_mark_file(path: &std::path::Path, record: &UnwrittenSealRecord) -> std:
     std::fs::write(&tmp, record.to_line().as_bytes()).and_then(|()| std::fs::rename(&tmp, path))
 }
 
-/// A failed marker write, as a coded error (audit PR31b-1; it was an uncoded
-/// warning). Log only: AGGREGATOR-SEAL-01 does not page.
-fn report_mark_write_failure(path: &std::path::Path, err: &std::io::Error) {
+/// A failed marker write: counted every time, and when `log` is set reported
+/// as a coded error (audit PR31b-1; it was an uncoded warning). Log only:
+/// AGGREGATOR-SEAL-01 does not page.
+fn record_mark_write_failure(path: &std::path::Path, err: &std::io::Error, log: bool) {
+    metrics::counter!(SEAL_UNWRITTEN_MARK_ERRORS_COUNTER).increment(1);
+    if !log {
+        return;
+    }
     error!(
         code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
         source = "unwritten_mark",
@@ -695,8 +698,7 @@ pub fn finish_unwritten_mark_at_shutdown(
     match write_mark_file(&path, &record) {
         Ok(()) => true,
         Err(err) => {
-            metrics::counter!(SEAL_UNWRITTEN_MARK_ERRORS_COUNTER).increment(1);
-            report_mark_write_failure(&path, &err);
+            record_mark_write_failure(&path, &err, true);
             false
         }
     }
