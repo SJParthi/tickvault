@@ -1020,6 +1020,15 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
     `restart_differential.rs` simulates crashes only, so it cannot see this. Gate the seal to
     after the close (or mark those bars partial) and add the clean-shutdown case to the
     differential.
+    - (b) delivered by PR #2009, folded into #2004 on 2026-10-03: a mid-session exit seals what
+      the catch-up would seal and withholds the rest (`seal_complete_buckets_at_mid_session_exit`).
+    - Hostile review 2026-10-03: until (a) lands, those withheld bars are LOST, not rebuilt: a
+      restart's replay skips segments already applied, so a market-hours deploy leaves every
+      open 3m-60m bar, and quiet contracts' bars that ended inside the late-trade margin, missing
+      (counted). Before (b) they were written short. (a) must re-read the archived segments that
+      cover them; that is #2010 part 2, not written yet.
+    - Also from that review, for (a): `withhold_open_buckets` skips cells with no open bucket, so
+      a settled late-trade carry that `force_seal_all` would re-emit is dropped uncounted.
 - [ ] **PR31c — PR31a's honest limits, closed one by one (zero data loss on every path,
   owner 2026-09-27).** (`storage`, `app`) Added 2026-09-27 so none of these lives only in the
   PR #1962 text. Each lands as its own small PR after PR31b.

@@ -1,7 +1,7 @@
 # Handoff — PR #2004 (zero-loss audit fixes)
 
 > Purpose: let a cold Claude session (any account) resume this work from the
-> repo alone. Updated after every milestone. Last updated: 2026-10-03 04:00 UTC.
+> repo alone. Updated after every milestone. Last updated: 2026-10-03 04:30 UTC.
 
 ## Where things are
 
@@ -47,30 +47,26 @@ CI runners are scarce (a full run took ~9 h of queue), so every open PR that is 
 folded into #2004 and merged with one CI run. Separate CI runs were cancelled (Parthi
 approved pausing the other threads' checks, 03:07 UTC).
 
-| PR | State at 2026-10-03 04:00 UTC | Next action |
+| PR | State at 2026-10-03 04:30 UTC | Next action |
 |---|---|---|
 | #2001 host tuning in Rust | MERGED (f55531ba9 on main) | none |
-| #2003 cold bucket keeps everything | FOLDED into #2004 (main.tf: #2003's version; both guard sets kept) | close after #2004 merges |
-| #2002 holiday gate in Rust | FOLDED into #2004 (no conflict) | close after #2004 merges |
-| #2005 ensure-questdb in Rust | FOLDED into #2004 (this branch's earlier D6d copy was reverted first) | close after #2004 merges |
-| #2006 crash marker (PR31b-1) | FOLDED; CLAUDE.md row added; loss-counter guard fix pushed here | close after #2004 merges |
-| #2007 + #2008 audit rows (PR42a/b) | FOLDED (42b branch carries 42a) | close after #2004 merges |
-| #2009 mid-session exit seal (PR31b-2b) | FOLDED; dhan_feed_stack conflict kept both methods. Its plan text is still not in the audit plan | close after #2004 merges |
-| #2010 candle warm-up (PR31b-2a) | NOT folded: WIP part 1 of 2 | its thread finishes it, merges main |
-| #2011 raw frames to S3 (45e) | NOT folded: #2004 already carries its own 45e-1 uploader (raw_frame_upload.rs); #2011 is a second, independent one (wal_raw_upload.rs). Keeping both = two uploaders | owner picks one; until then #2011 stays open |
-| #1968-#1971 opentelemetry bumps | FOLDED as one combined upgrade (0.33 / tracing-opentelemetry 0.34) | close after #2004 merges |
+| #2002, #2003, #2005, #2006, #2007, #2008, #2009, #1968-#1971 | FOLDED into #2004 and CLOSED with a comment | none |
+| #2010 candle warm-up, part 1 (crash marker v2, drained_at, boot disk high seq) | FOLDED (21b668f53) and CLOSED; part 2 (the warm-up itself, PR31b-2 (a)) is NOT written | write part 2 as a new PR after #2004 merges |
+| #2011 second raw-frame uploader | CLOSED as superseded by #2004's raw_frame_upload.rs; branch kept | none unless the owner wants it back |
 
-Merges: squash, only with All Green success on the exact head. After each merge confirm the
-PR's change is on main. Close a PR only if its content is verified already on main.
+Review of the fold (3 agents, 2026-10-03): 0 critical. Hostile HIGH: a mid-session exit now
+withholds open bars and nothing rebuilds them until PR31b-2 (a) lands (doc made honest, plan
+note added). Security HIGH (pre-existing, not in this diff): the deploy OIDC role trusts
+`environment:prod` from any branch; fixing it is a production IAM change, waiting on the owner.
+
+Merges: squash, only with All Green success on the exact head. After the merge confirm the
+change is on main.
 
 ## Next steps (exact)
 
-1. `git status` in the worktree; check PR #2004 CI on the latest head; fix any red.
-2. Check #2003 and #2001 merged (list open PRs). Then merge origin/main into this branch,
-   resolve overlaps keeping both sides, run targeted tests, push.
-3. Do #2002 as in the table. Then the combined opentelemetry upgrade.
-4. Update the PR body (Round 5 section) and publish comparison page version 5 to the same link.
-5. Update this file and push.
+1. Check PR #2004 CI on the latest head; fix any red; merge on All Green.
+2. Update comparison page version 5 on the same link.
+3. Then PR31b-2 (a), the candle warm-up, as a new PR from main.
 
 ## Open decisions (owner only)
 

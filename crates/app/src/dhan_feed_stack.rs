@@ -5006,10 +5006,18 @@ impl LiveIngest {
     /// PR31b-2): seals the buckets the catch-up would seal at this instant,
     /// then withholds every bucket still open
     /// ([`MultiTfAggregator::withhold_open_buckets`]). Those are missing the
-    /// trades after the exit. A restart the same day replays the WAL and
-    /// writes the ones its restart rules can prove complete; the rest stay
-    /// missing and counted. Writing them here wrote truncated bars as
+    /// trades after the exit. Writing them here wrote truncated bars as
     /// complete ones, and a later rewrite could not always fix them.
+    ///
+    /// **Honest limit (hostile review, 2026-10-03):** today NOTHING rebuilds
+    /// them. A restart's WAL replay skips the segments already applied to the
+    /// database (the default), so a clean exit leaves no frames to rebuild
+    /// from, and the withheld bars stay missing and counted. "Still open"
+    /// here means not yet past the catch-up cutoff (the watermark minus the
+    /// late-trade margin), so it also covers bars of quiet contracts that
+    /// ended less than that margin before the exit. The rebuild is plan item
+    /// PR31b-2 (a), the candle warm-up that re-reads archived segments; it is
+    /// not written yet.
     ///
     /// Returns `(emitted, dropped)` like [`Self::seal_open_buckets_at_close`].
     ///
@@ -5024,8 +5032,8 @@ impl LiveIngest {
                 withheld,
                 "candle fold: exiting during the session, so {withheld} open bar(s) were not \
                  written. Each is missing the trades after the exit, so it is left missing \
-                 rather than written short. A restart today rebuilds the ones its frame log \
-                 fully covers."
+                 rather than written short. A restart does not rebuild them yet: the \
+                 candle warm-up that would is not written."
             );
         }
         sealed
