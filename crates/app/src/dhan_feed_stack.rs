@@ -14887,6 +14887,10 @@ pub struct WalRefoldOutcome {
     /// `capture_seq` is derived from `(frame_seq, packet_index)`, both of which
     /// replay reproduces exactly.
     pub inline_depth_rows: u64,
+    /// Times a paced replay waited for the writer threads to drain before
+    /// handing them the next batch (audit R1, 2026-10-03). Zero when the
+    /// replay was not paced or the writers kept up.
+    pub pace_waits: u64,
 }
 /// Is this WAL frame from a DEPTH socket rather than the main feed?
 ///
@@ -15183,6 +15187,103 @@ fn refold_one_tick(
     }
 }
 
+/// Longest single wait a paced replay spends on the writer threads before it
+/// re-checks its deadline (audit R1). Short so the deadline is honoured to
+/// within a second; the wait returns as soon as the writers drain.
+pub const WAL_REPLAY_PACE_STEP_MILLIS: u64 = 1_000;
+
+/// Counter: waits a paced replay spent on the writer threads (audit R1).
+pub const WAL_REPLAY_PACE_WAITS_COUNTER: &str = "tv_wal_replay_pace_waits_total";
+
+/// Until when a WAL replay started at `ist_secs_of_day` paces itself on the
+/// writer threads (audit R1, 2026-10-03).
+///
+/// `None` inside the capture window: the replay runs before the sockets
+/// dial, so a wait there is live data nobody receives, and the old unpaced
+/// behaviour (rescue, replay again at the next out-of-session boot) is the
+/// better trade. Outside it, the same wall-clock budget the catch-up drain
+/// uses (`wal_catchup_budget_secs`), so a pre-open boot still stops pacing
+/// by 08:58.
+#[must_use]
+pub fn wal_replay_pace_until(ist_secs_of_day: u64, now: Instant) -> Option<Instant> {
+    let start = tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST as u64;
+    let end = TICK_PERSIST_END_SECS_OF_DAY_IST as u64;
+    if ist_secs_of_day >= start && ist_secs_of_day < end {
+        return None;
+    }
+    now.checked_add(std::time::Duration::from_secs(wal_catchup_budget_secs(
+        ist_secs_of_day,
+    )))
+}
+
+/// The pacing loop, with its effects passed in so it can be tested without a
+/// writer thread (audit R1).
+///
+/// Runs after a flush the caller already made. While rows are still held
+/// (that flush met a full queue) and the deadline has not passed, waits for
+/// the writers to drain in steps of at most `step`, and flushes again ONLY
+/// after a wait that saw them drain. A wait that timed out is never followed
+/// by a flush: each flush into a full queue counts a retained span, and the
+/// third one rescues the batch, which is the outcome this exists to prevent.
+/// Returns the waits spent.
+///
+/// O(1) per step; bounded by the deadline, never by the database.
+pub fn pace_after_replay_flush(
+    mut flush: impl FnMut(),
+    mut rows_held: impl FnMut() -> bool,
+    mut wait_drained: impl FnMut(std::time::Duration) -> bool,
+    mut now: impl FnMut() -> Instant,
+    pace_until: Option<Instant>,
+    step: std::time::Duration,
+) -> u32 {
+    let Some(until) = pace_until else {
+        return 0;
+    };
+    let mut waits = 0u32;
+    while rows_held() {
+        let at = now();
+        if at >= until {
+            break;
+        }
+        waits = waits.saturating_add(1);
+        if wait_drained(until.saturating_duration_since(at).min(step)) {
+            flush();
+        }
+    }
+    waits
+}
+
+/// [`pace_after_replay_flush`] on the real writers (audit R1).
+fn replay_pace_after_flush(ingest: &mut LiveIngest, pace_until: Option<Instant>) -> u32 {
+    if pace_until.is_none() {
+        return 0;
+    }
+    let wm = tickvault_storage::wal_applied_watermark::applied_watermark();
+    let ingest = std::cell::RefCell::new(ingest);
+    let waits = pace_after_replay_flush(
+        || {
+            blocking_flush(|| ingest.borrow_mut().flush());
+        },
+        || {
+            let ingest = ingest.borrow();
+            ingest.pending_rows() > 0 || ingest.depth_pending_rows() > 0
+        },
+        |step| {
+            // A fresh snapshot each step: a rescue elsewhere should end this
+            // wait early, not end the pacing.
+            let unlanded = wm.unlanded_total();
+            blocking_flush(|| wm.wait_for_offload_drained(step, unlanded))
+        },
+        Instant::now,
+        pace_until,
+        std::time::Duration::from_millis(WAL_REPLAY_PACE_STEP_MILLIS),
+    );
+    if waits > 0 {
+        metrics::counter!(WAL_REPLAY_PACE_WAITS_COUNTER).increment(u64::from(waits));
+    }
+    waits
+}
+
 /// Re-folds live-feed frames recovered from the write-ahead log.
 ///
 /// # Why this is safe to run twice
@@ -15209,10 +15310,33 @@ fn refold_one_tick(
 /// Never returns an error. An unparseable frame is counted and skipped rather
 /// than aborting the batch, because one corrupt frame must not cost the
 /// recovery of every other frame beside it.
+///
+/// # Pacing (audit R1, 2026-10-03)
+///
+/// Each size-triggered flush is paced on the writer threads until
+/// `pace_until`.
+///
+/// Unpaced, a replay folds as fast as it can read and hands the writers far
+/// more than a slow QuestDB absorbs. The producer then hits its retention
+/// bound and RESCUES the batch: to the spill tier, or, with the rescue thread
+/// busy, back to the WAL as an unapplied range. Measured on 3 Oct 2026: each
+/// boot re-folded the same 173 segments (1,477,447 frames, 14.2M depth
+/// rows), deferred ~27.7M rows back to the WAL, timed out the 30 s ack wait,
+/// and left 168 segments for the next boot. The rows deferred to the WAL are
+/// replayed again by the next boot, so the backlog never shrank and every
+/// boot logged ~10,000 coded lines doing it.
+///
+/// Paced, a flush that meets a full queue waits for the writers to drain
+/// before it hands over the next batch, so nothing reaches the retention
+/// bound while there is time. Past `pace_until` (or with `None`) it behaves
+/// exactly as before. `None` is chosen inside the capture window, where a
+/// second spent waiting is a second the sockets are not dialled
+/// (`wal_replay_pace_until`).
 pub fn refold_wal_frames(
     ingest: &mut LiveIngest,
     frames: &[(u64, i64, WalEndpoint, bytes::Bytes)],
     gaps: &[usize],
+    pace_until: Option<Instant>,
 ) -> WalRefoldOutcome {
     let mut out = WalRefoldOutcome::default();
     // Item 45h: the replay's `feed_aux_packets` rows, reported beside
@@ -15444,7 +15568,14 @@ pub fn refold_wal_frames(
             // the start limit then leaving the session with no app at all.
             // A slow boot costs part of a session; an OOM loop costs all of
             // it. Bounded memory wins.
+            //
+            // Paced (audit R1, 2026-10-03): until `pace_until`, a flush that
+            // met a full queue waits for the writers before the next batch, so
+            // the replay never reaches the retention bound and never rescues
+            // its own rows back to the WAL. See `pace_after_replay_flush`.
             blocking_flush(|| ingest.flush());
+            let waits = replay_pace_after_flush(ingest, pace_until);
+            out.pace_waits = out.pace_waits.saturating_add(u64::from(waits));
         }
         // TVW4 (2026-09-02): route by the RECORDED endpoint BEFORE any header
         // sniff. A depth frame goes through the SAME `drain_depth_frame` the
@@ -16319,12 +16450,17 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             let unlanded_before =
                 tickvault_storage::wal_applied_watermark::applied_watermark().unlanded_total();
             let (boot_frames, boot_gaps) = (&params.wal_replay_live_feed, &params.wal_replay_gaps);
-            let outcome = refold_wal_frames(&mut ingest, boot_frames, boot_gaps);
+            // Audit R1: outside the capture window the boot pass waits for
+            // the writers instead of rescuing its own rows back to the WAL.
+            let boot_pace_until = wal_replay_pace_until(now_ist_secs_of_day(), Instant::now());
+            let outcome = refold_wal_frames(&mut ingest, boot_frames, boot_gaps, boot_pace_until);
             if outcome.lost == 0 {
                 info!(
                     frames = params.wal_replay_live_feed.len(),
                     ticks = outcome.refolded,
                     replay_gaps = outcome.gaps_marked,
+                    paced = boot_pace_until.is_some(),
+                    pace_waits = outcome.pace_waits,
                     "recovered live-feed frames from the write-ahead log and folded them — \
                  ticks captured by a previous session are now in the database"
                 );
@@ -16805,7 +16941,11 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             }
             let unlanded_before =
                 tickvault_storage::wal_applied_watermark::applied_watermark().unlanded_total();
-            let outcome = refold_wal_frames(&mut ingest, &staged, &staged_gaps);
+            // Audit R1: paced like the boot pass, and never past this
+            // drain's own deadline.
+            let round_pace_until = wal_replay_pace_until(now_ist_secs_of_day(), Instant::now())
+                .map(|until| until.min(catchup_deadline.into_std()));
+            let outcome = refold_wal_frames(&mut ingest, &staged, &staged_gaps, round_pace_until);
             let flushed = blocking_flush(|| ingest.flush());
             // ACK BEFORE CONFIRMING — see `replay_rows_landed`. A timeout ends
             // the drain rather than re-offering the same batch to a sink that
@@ -16833,6 +16973,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 frames = staged.len(),
                 ticks = outcome.refolded,
                 rows_flushed = flushed,
+                pace_waits = outcome.pace_waits,
                 "WAL catch-up drain round complete"
             );
         }
@@ -24681,7 +24822,7 @@ mod wal_refold_tests {
             WalEndpoint::MainFeed,
             replay_ticker(13, yesterday_ist),
         );
-        let out = refold_wal_frames(&mut ingest(), &[snapshot], &[]);
+        let out = refold_wal_frames(&mut ingest(), &[snapshot], &[], None);
         assert_eq!(
             out.refused_wrong_day, 1,
             "the day rule refused it by design"
@@ -24700,7 +24841,7 @@ mod wal_refold_tests {
             WalEndpoint::MainFeed,
             replay_ticker(13, yesterday_ist),
         );
-        let out = refold_wal_frames(&mut ingest(), &[prior_session], &[]);
+        let out = refold_wal_frames(&mut ingest(), &[prior_session], &[], None);
         assert_eq!(
             out.lost, 0,
             "a tick received on the day it traded is real captured data — its \
@@ -24726,7 +24867,7 @@ mod wal_refold_tests {
             WalEndpoint::MainFeed,
             replay_ticker(13, yesterday_ist),
         );
-        let out = refold_wal_frames(&mut ingest(), &[no_receipt], &[]);
+        let out = refold_wal_frames(&mut ingest(), &[no_receipt], &[], None);
         assert_eq!(out.refolded, 0, "no receipt clock, no proof, no write-back");
     }
 
@@ -24792,9 +24933,9 @@ mod wal_refold_tests {
             )
         };
         let frames = vec![frame(1), frame(2), frame(3), frame(4)];
-        let out = refold_wal_frames(&mut ingest(), &frames, &[0, 2, 2, 9]);
+        let out = refold_wal_frames(&mut ingest(), &frames, &[0, 2, 2, 9], None);
         assert_eq!(out.gaps_marked, 2, "indexes 0 and 2, once each");
-        let none = refold_wal_frames(&mut ingest(), &frames, &[]);
+        let none = refold_wal_frames(&mut ingest(), &frames, &[], None);
         assert_eq!(none.gaps_marked, 0);
     }
 
@@ -24811,7 +24952,7 @@ mod wal_refold_tests {
         assert_eq!(prod.matches(call).count(), 1, "exactly one hand-over");
         let finish = prod.find(call).expect("hand-over present");
         let catch_up = prod
-            .find("refold_wal_frames(&mut ingest, &staged, &staged_gaps)")
+            .find("refold_wal_frames(&mut ingest, &staged, &staged_gaps, round_pace_until)")
             .expect("catch-up refold present");
         let spawn = prod
             .find("tokio::spawn(run_frame_drain(")
@@ -24872,7 +25013,7 @@ mod wal_refold_tests {
             WalEndpoint::MainFeed,
             bytes::Bytes::from(depth_frame(DEEP_DEPTH_FEED_CODE_ASK, 20)),
         )];
-        let out = refold_wal_frames(&mut ingest(), &frames, &[]);
+        let out = refold_wal_frames(&mut ingest(), &frames, &[], None);
         assert_eq!(out.depth_frames, 1, "the frame is a depth frame");
         assert_eq!(out.unparseable, 0, "and it is NOT reported as corruption");
         assert_eq!(out.undecodable, 0);
@@ -24994,6 +25135,151 @@ mod wal_refold_tests {
         assert_eq!(blocking_flush(|| 7_u64), 7);
     }
 
+    // ---- audit R1 (2026-10-03): the replay paces on the writers ----------
+
+    /// A simulated writer: `queue_full_flushes` flushes meet a full queue,
+    /// and each wait drains it after `drain_after_waits` waits.
+    struct PaceSim {
+        held: std::cell::Cell<bool>,
+        flushes: std::cell::Cell<u32>,
+        full_flushes_left: std::cell::Cell<u32>,
+        waits_until_drained: std::cell::Cell<u32>,
+        drain_after_waits: u32,
+        clock: std::cell::Cell<Instant>,
+    }
+
+    impl PaceSim {
+        fn new(queue_full_flushes: u32, drain_after_waits: u32) -> Self {
+            Self {
+                held: std::cell::Cell::new(false),
+                flushes: std::cell::Cell::new(0),
+                full_flushes_left: std::cell::Cell::new(queue_full_flushes),
+                waits_until_drained: std::cell::Cell::new(drain_after_waits),
+                drain_after_waits,
+                clock: std::cell::Cell::new(Instant::now()),
+            }
+        }
+        fn flush(&self) {
+            // A flush into a full queue while rows are already held is the
+            // retained span that rescues; the pacing must never do it.
+            assert!(
+                !(self.held.get() && self.waits_until_drained.get() > 0),
+                "flushed into a queue the last wait did not see drain"
+            );
+            self.flushes.set(self.flushes.get() + 1);
+            let left = self.full_flushes_left.get();
+            if left > 0 {
+                self.full_flushes_left.set(left - 1);
+                self.held.set(true);
+                self.waits_until_drained.set(self.drain_after_waits);
+            } else {
+                self.held.set(false);
+            }
+        }
+        fn wait(&self, step: std::time::Duration) -> bool {
+            self.clock.set(self.clock.get() + step);
+            let left = self.waits_until_drained.get().saturating_sub(1);
+            self.waits_until_drained.set(left);
+            left == 0
+        }
+    }
+
+    fn run_pace(sim: &PaceSim, pace_until: Option<Instant>) -> u32 {
+        // The refold flushes first, then paces.
+        sim.flush();
+        pace_after_replay_flush(
+            || sim.flush(),
+            || sim.held.get(),
+            |step| sim.wait(step),
+            || sim.clock.get(),
+            pace_until,
+            std::time::Duration::from_millis(WAL_REPLAY_PACE_STEP_MILLIS),
+        )
+    }
+
+    #[test]
+    fn test_pace_after_replay_flush_waits_for_the_writers_and_lands_its_rows() {
+        // Three full queues in a row, each draining after two waits.
+        let sim = PaceSim::new(3, 2);
+        let until = sim.clock.get() + std::time::Duration::from_secs(300);
+        let waits = run_pace(&sim, Some(until));
+        assert!(
+            !sim.held.get(),
+            "the paced flush must end with nothing held"
+        );
+        assert_eq!(sim.flushes.get(), 4, "one flush, then one per drained wait");
+        assert_eq!(waits, 6);
+    }
+
+    #[test]
+    fn an_unpaced_replay_flushes_once_and_never_waits() {
+        let sim = PaceSim::new(3, 2);
+        assert_eq!(run_pace(&sim, None), 0);
+        assert_eq!(sim.flushes.get(), 1);
+        assert!(sim.held.get(), "unpaced: rows stay held, as before R1");
+    }
+
+    #[test]
+    fn a_paced_replay_stops_waiting_at_its_deadline_without_a_flush() {
+        // A writer that never drains: the pacing must give up at the
+        // deadline and must not flush into the full queue on the way.
+        let sim = PaceSim::new(1, u32::MAX);
+        let start = sim.clock.get();
+        let until = start + std::time::Duration::from_millis(2_500);
+        let waits = run_pace(&sim, Some(until));
+        assert_eq!(sim.flushes.get(), 1, "no flush after a wait that timed out");
+        assert_eq!(waits, 3, "1 s + 1 s + the last 0.5 s");
+        assert_eq!(
+            sim.clock.get(),
+            until,
+            "the last step is clipped to the deadline"
+        );
+    }
+
+    #[test]
+    fn a_paced_replay_past_its_deadline_behaves_as_before() {
+        let sim = PaceSim::new(1, 1);
+        let past = sim.clock.get();
+        assert_eq!(run_pace(&sim, Some(past)), 0);
+        assert_eq!(sim.flushes.get(), 1);
+    }
+
+    #[test]
+    fn test_wal_replay_pace_until_is_none_inside_the_capture_window() {
+        let now = Instant::now();
+        let start = tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST as u64;
+        let end = TICK_PERSIST_END_SECS_OF_DAY_IST as u64;
+        assert_eq!(wal_replay_pace_until(start, now), None, "09:00 is live");
+        assert_eq!(wal_replay_pace_until(end - 1, now), None);
+        // After the close: the full catch-up budget.
+        assert_eq!(
+            wal_replay_pace_until(end, now),
+            Some(now + std::time::Duration::from_secs(WAL_CATCHUP_BUDGET_SECS))
+        );
+        // 08:30 pre-open: never past the 08:58 stop.
+        let at_0830 = 8 * 3_600 + 30 * 60;
+        let until = wal_replay_pace_until(at_0830, now).expect("pre-open is paced");
+        assert!(
+            until.duration_since(now).as_secs()
+                <= WAL_CATCHUP_PREOPEN_STOP_SECS_OF_DAY_IST.saturating_sub(at_0830)
+        );
+    }
+
+    #[test]
+    fn both_replay_passes_are_paced() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let production = src.split("#[cfg(test)]").next().unwrap_or("");
+        assert_eq!(
+            production.matches("refold_wal_frames(&mut ingest").count(),
+            2,
+            "the boot pass and the catch-up rounds must both call the paced refold"
+        );
+        assert!(
+            production.contains("let waits = replay_pace_after_flush(ingest, pace_until);"),
+            "the size-triggered replay flush must be the paced one"
+        );
+    }
+
     /// TVW4 (2026-09-02): a record that CARRIES the depth-20 endpoint is
     /// routed to the depth drain and its levels reach the depth sink — the
     /// recovery the legacy `depth_frames` bucket could never make.
@@ -25008,7 +25294,7 @@ mod wal_refold_tests {
             bytes::Bytes::from(depth20_wal_packet(13, DEEP_DEPTH_FEED_CODE_BID)),
         )];
         let mut with_sink = ingest().with_inline_depth(DepthIngest::for_test());
-        let out = refold_wal_frames(&mut with_sink, &frames, &[]);
+        let out = refold_wal_frames(&mut with_sink, &frames, &[], None);
         assert_eq!(
             out.depth_refolded_rows, 20,
             "every level is a row — nothing is sampled"
@@ -25043,7 +25329,7 @@ mod wal_refold_tests {
             WalEndpoint::Depth20,
             bytes::Bytes::from(depth20_wal_packet(13, DEEP_DEPTH_FEED_CODE_BID)),
         )];
-        let out = refold_wal_frames(&mut ingest(), &frames, &[]);
+        let out = refold_wal_frames(&mut ingest(), &frames, &[], None);
         assert_eq!(
             out.depth_frames, 1,
             "no sink: counted as an un-recovered depth frame"
@@ -25067,7 +25353,7 @@ mod wal_refold_tests {
             bytes::Bytes::from(depth200_wal_packet(72_271, DEEP_DEPTH_FEED_CODE_ASK, 7)),
         )];
         let mut with_sink = ingest().with_inline_depth(DepthIngest::for_test());
-        let out = refold_wal_frames(&mut with_sink, &frames, &[]);
+        let out = refold_wal_frames(&mut with_sink, &frames, &[], None);
         assert_eq!(out.depth_refolded_rows, 7, "seven rows in, seven rows out");
         assert_eq!(out.depth_refused, 0);
         assert_eq!(out.depth_frames, 0);
@@ -25249,7 +25535,7 @@ mod wal_refold_tests {
             WalEndpoint::MainFeed,
             bytes::Bytes::from(bytes),
         )];
-        let out = refold_wal_frames(&mut ingest(), &frames, &[]);
+        let out = refold_wal_frames(&mut ingest(), &frames, &[], None);
 
         assert_eq!(out.refolded, 0, "an OI packet carries no tick");
         assert_eq!(out.lost, 0, "and it is NOT a loss");
@@ -25331,7 +25617,7 @@ mod wal_refold_tests {
             bytes::Bytes::from(buf),
         )];
 
-        let without = refold_wal_frames(&mut ingest(), &frames, &[]);
+        let without = refold_wal_frames(&mut ingest(), &frames, &[], None);
         assert_eq!(
             without.inline_depth_rows, 0,
             "with no inline-depth sink there is nothing to append to"
@@ -25339,7 +25625,7 @@ mod wal_refold_tests {
 
         let mut with_sink = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4)
             .with_inline_depth(DepthIngest::for_test());
-        let with = refold_wal_frames(&mut with_sink, &frames, &[]);
+        let with = refold_wal_frames(&mut with_sink, &frames, &[], None);
 
         assert_eq!(
             with.inline_depth_rows, 10,
@@ -25377,7 +25663,7 @@ mod wal_refold_tests {
 
     #[test]
     fn test_refold_wal_frames_empty_batch_recovers_nothing() {
-        let out = refold_wal_frames(&mut ingest(), &[], &[]);
+        let out = refold_wal_frames(&mut ingest(), &[], &[], None);
         assert_eq!(out, WalRefoldOutcome::default());
     }
 
@@ -25392,7 +25678,7 @@ mod wal_refold_tests {
             WalEndpoint::MainFeed,
             bytes::Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF]),
         )];
-        let out = refold_wal_frames(&mut ingest(), &frames, &[]);
+        let out = refold_wal_frames(&mut ingest(), &frames, &[], None);
         assert_eq!(out.refolded, 0, "garbage must not produce ticks");
         assert_eq!(
             out.unparseable, 1,
@@ -25411,7 +25697,7 @@ mod wal_refold_tests {
             WalEndpoint::MainFeed,
             bytes::Bytes::from_static(&[2, 0, 0, 0]),
         )];
-        let out = refold_wal_frames(&mut ingest(), &frames, &[]);
+        let out = refold_wal_frames(&mut ingest(), &frames, &[], None);
         assert_eq!(out.refolded, 0);
         assert!(out.unparseable >= 1, "a truncated packet must be counted");
     }
@@ -25421,7 +25707,7 @@ mod wal_refold_tests {
         // The arithmetic guarantee the operator relies on: a tick is folded
         // XOR lost. If both could increment for one tick, a loss report could
         // be hidden behind a success count.
-        let out = refold_wal_frames(&mut ingest(), &[], &[]);
+        let out = refold_wal_frames(&mut ingest(), &[], &[], None);
         assert_eq!(out.refolded, 0);
         assert_eq!(out.lost, 0);
         // Structural: the fold's match arms are disjoint by construction —
@@ -27324,7 +27610,7 @@ mod frame_walk_accounting_tests {
         };
         let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
         ingest.install_replay_backup(Some(&history(&set)));
-        let out = refold_wal_frames(&mut ingest, &frames, &[]);
+        let out = refold_wal_frames(&mut ingest, &frames, &[], None);
         assert_eq!(out.refolded, 1, "one copy folds");
         assert_eq!(
             out.backup_dropped, 1,
@@ -27336,7 +27622,7 @@ mod frame_walk_accounting_tests {
 
         let mut plain = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
         plain.install_replay_backup(None);
-        let out = refold_wal_frames(&mut plain, &frames, &[]);
+        let out = refold_wal_frames(&mut plain, &frames, &[], None);
         assert_eq!(
             (out.refolded, out.backup_dropped),
             (2, 0),
@@ -27351,7 +27637,7 @@ mod frame_walk_accounting_tests {
         };
         let mut later = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
         later.install_replay_backup(Some(&history(&late)));
-        let out = refold_wal_frames(&mut later, &frames, &[]);
+        let out = refold_wal_frames(&mut later, &frames, &[], None);
         assert_eq!((out.refolded, out.backup_dropped), (2, 0));
     }
 
