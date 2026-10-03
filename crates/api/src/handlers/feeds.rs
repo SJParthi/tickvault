@@ -248,10 +248,18 @@ pub async fn set_feed(
     // needed; a brief overlap merely means the last toggle's snapshot wins,
     // which is the desired semantics for a single-operator control surface.
     let snap = state.feed_runtime().snapshot();
-    if let Err(err) = crate::feed_state_persist::persist_feed_state(
-        &snap,
-        &crate::feed_state_persist::feed_state_path(),
-    ) {
+    // The write fsyncs a file and renames it, so it runs on the blocking pool
+    // and never holds a runtime worker on a slow disk (O(1) sweep S4,
+    // 2026-10-03). A join failure is reported as a failed write.
+    let persisted = tokio::task::spawn_blocking(move || {
+        crate::feed_state_persist::persist_feed_state(
+            &snap,
+            &crate::feed_state_persist::feed_state_path(),
+        )
+    })
+    .await
+    .unwrap_or_else(|join| Err(std::io::Error::other(join.to_string())));
+    if let Err(err) = persisted {
         tracing::error!(
             ?err,
             feed = feed.as_str(),
