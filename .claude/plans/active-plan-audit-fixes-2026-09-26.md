@@ -2490,6 +2490,16 @@ write, then candle warm-up (PR31b-2 (a), already listed above). Each fix ships a
   test_regression_h4_the_depth_park_is_handed_on_or_written_never_dropped,
   the_drain_parks_a_refused_rescue_and_never_waits_to_retry_it. Honest limit: a parked batch is
   lost on a crash, where the old unsynced inline write would have kept it.
+- [x] **S1 — The drain's flushes no longer hand over their worker.** The frame drain called
+  every tick and depth flush inside `block_in_place` (about five a second) although the flush is
+  a `try_send` to the writer thread. The writers now move the worker aside themselves at the only
+  blocking steps (synchronous ILP round trip, inline spill write) via the crate-internal
+  `off_worker`; the drain calls `flush` bare. Files: `crates/storage/src/off_worker.rs`,
+  `crates/storage/src/{tick,depth}_persistence.rs`, `crates/storage/tests/spill_rescue_sync_guard.rs`,
+  `crates/app/src/dhan_feed_stack.rs`. Tests: every_blocking_writer_step_runs_off_the_worker,
+  a_nested_call_runs_inline_and_does_not_panic, runs_inline_on_a_current_thread_runtime_without_panicking,
+  test_drain_never_flushes_bare_on_the_async_worker. Measured: block_in_place p50 191 ns / p99
+  309 ns uncontended (debug), bare call 30 / 41 ns.
 
 ## Edge Cases
 
