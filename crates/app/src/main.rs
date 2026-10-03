@@ -3863,6 +3863,14 @@ fn spawn_seal_writer_loop(questdb_config: &tickvault_common::config::QuestDbConf
 
     match SealWriterRunner::new(questdb_config, SEAL_MAX_DRAIN_PER_CYCLE) {
         Ok(runner) => {
+            // Audit PR31b-2: keep what the previous process's crash marker
+            // said before the writer loop overwrites it. Published before the
+            // sender, so the candle warm-up, which waits for the sender, always
+            // finds it.
+            let _ = tickvault_storage::seal_writer_loop::publish_previous_unwritten(
+                tickvault_storage::seal_writer_loop::UnwrittenSealMark::in_dir(runner.spill_dir())
+                    .read_previous(),
+            );
             if !tickvault_storage::seal_writer_runner::set_global_seal_sender(runner.sender()) {
                 tracing::warn!(
                     "global seal sender already installed (idempotent skip) — first installer wins"
