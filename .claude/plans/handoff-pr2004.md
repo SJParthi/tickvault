@@ -1,7 +1,7 @@
 # Handoff — PR #2004 (zero-loss audit fixes)
 
 > Purpose: let a cold Claude session (any account) resume this work from the
-> repo alone. Updated after every milestone. Last updated: 2026-10-03 04:30 UTC.
+> repo alone. Updated after every milestone. Last updated: 2026-10-03 04:20 UTC (final for this session).
 
 ## Where things are
 
@@ -64,9 +64,23 @@ change is on main.
 
 ## Next steps (exact)
 
-1. Check PR #2004 CI on the latest head; fix any red; merge on All Green.
-2. Update comparison page version 5 on the same link.
-3. Then PR31b-2 (a), the candle warm-up, as a new PR from main.
+State at 2026-10-03 04:20 UTC (Parthi: merge, then stop and save):
+- #2004 head 1c1586645 (+ this handoff commit). Repo Guards failed on an earlier head because
+  two folded PRs had never reached CI; fixed (loopback binds marked APPROVED, five pub fns
+  TEST-EXEMPT, untested count back to 313). Local: every Repo Guards step passes; app lib
+  2,462, storage lib 1,744, trading lib 1,883, 0 failed.
+- Comparison page is at version 5 (https://claude.ai/artifact/ACvpJxrDNpHwi2GB1NNmuX).
+- Weekly usage was at 99% on 2026-10-03; Parthi asked to stop after the merge.
+
+1. If #2004 is not merged: read its CI on the latest head, fix any red, merge (squash,
+   expectedHeadSha) only on All Green success. Confirm it is on main.
+2. Then the candle warm-up, plan PR31b-2 (a), as a NEW PR from main. Design and code entry
+   points are in the plan's PR31b-2 notes and in project memory `candle-warmup-pr31b2a-design`.
+3. Owner decision pending: the deploy OIDC role trusts `environment:prod` from any branch
+   (security review HIGH, pre-existing on main). Pin to main only if Parthi agrees.
+4. Low findings, not fixed: host binary in an ec2-user-writable dir; audit spill files at
+   default umask; `.mark.tmp` follows a symlink; a failed first deploy leaves old units
+   pointing at deleted scripts once; the seal-mark doc does not mention its mutex.
 
 ## Open decisions (owner only)
 
