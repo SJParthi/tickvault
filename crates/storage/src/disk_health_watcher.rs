@@ -236,14 +236,32 @@ pub fn spawn_spill_disk_health_watcher(spill_dir: PathBuf) -> tokio::task::JoinH
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
-            match probe_disk_free_bytes(&spill_dir) {
+            // Both probes fork `df` and wait on it, and `statfs` on a stalled
+            // or full volume (the moment this probe matters) can hang. So they
+            // run on the blocking pool, never on a shared tokio worker (O(1)
+            // sweep, 2026-10-03). One PathBuf clone a minute.
+            let probe_dir = spill_dir.clone();
+            let (outcome, inodes) = tokio::task::spawn_blocking(move || {
+                (
+                    probe_disk_free_bytes(&probe_dir),
+                    probe_disk_free_inodes(&probe_dir),
+                )
+            })
+            .await
+            .unwrap_or((
+                DiskHealthOutcome::ProbeFailed {
+                    reason: "probe_task_failed",
+                },
+                None,
+            ));
+            match outcome {
                 DiskHealthOutcome::Ok {
                     free_bytes,
                     total_bytes,
                 } => {
                     m_free.set(free_bytes as f64);
                     m_total.set(total_bytes as f64);
-                    if let Some((free_inodes, total_inodes)) = probe_disk_free_inodes(&spill_dir) {
+                    if let Some((free_inodes, total_inodes)) = inodes {
                         m_free_inodes.set(free_inodes as f64);
                         m_total_inodes.set(total_inodes as f64);
                     }

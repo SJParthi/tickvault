@@ -487,11 +487,33 @@ pub fn spawn_resource_monitor(paths: ResourceMonitorPaths) -> tokio::task::JoinH
         loop {
             ticker.tick().await;
 
+            // Every read below is blocking: `/proc` and cgroup files, an
+            // O(open fds) directory listing, and a `df` fork that can hang on
+            // a stalled volume. They all run in one blocking-pool task and the
+            // async side only classifies (O(1) sweep, 2026-10-03).
+            let probe_paths = paths.clone();
+            let Ok(readings) = tokio::task::spawn_blocking(move || ProbeReadings {
+                fds: probe_open_fd_count(&probe_paths.proc_self_fd),
+                fd_limit: probe_max_open_files(&probe_paths.proc_self_limits),
+                rss: probe_vmrss_bytes(&probe_paths.proc_self_status),
+                ceiling: resolve_memory_ceiling(
+                    &probe_paths.cgroup_memory_max,
+                    &probe_paths.proc_meminfo,
+                ),
+                spill: probe_disk_free_bytes(&probe_paths.spill_dir),
+            })
+            .await
+            else {
+                m_probe_failed.increment(1);
+                warn!(
+                    "resource monitor: the probe task failed -- fd, memory and spill \
+                     headroom are UNKNOWN this cycle, not known-good."
+                );
+                continue;
+            };
+
             // RESOURCE-01 — open fd count vs LimitNOFILE.
-            match (
-                probe_open_fd_count(&paths.proc_self_fd),
-                probe_max_open_files(&paths.proc_self_limits),
-            ) {
+            match (readings.fds, readings.fd_limit) {
                 (Some(fds), limit_opt) => {
                     m_fds.set(fds as f64);
                     if let Some(limit) = limit_opt
@@ -530,7 +552,7 @@ pub fn spawn_resource_monitor(paths: ResourceMonitorPaths) -> tokio::task::JoinH
             }
 
             // RESOURCE-02 — VmRSS vs cgroup memory.max.
-            match probe_vmrss_bytes(&paths.proc_self_status) {
+            match readings.rss {
                 Some(rss) => {
                     m_rss.set(rss as f64);
                     // Ceiling, not "cgroup limit": with no cgroup limit the
@@ -538,8 +560,7 @@ pub fn spawn_resource_monitor(paths: ResourceMonitorPaths) -> tokio::task::JoinH
                     // is what RSS is measured against. Gating on the cgroup
                     // alone made this whole arm inert on the production box
                     // and then logged "RSS ok" — see `resolve_memory_ceiling`.
-                    let ceiling =
-                        resolve_memory_ceiling(&paths.cgroup_memory_max, &paths.proc_meminfo);
+                    let ceiling = readings.ceiling;
                     match ceiling.bytes() {
                         Some(limit) if is_at_or_above_pct(rss, limit, RSS_HIGH_PCT_THRESHOLD) => {
                             error!(
@@ -603,7 +624,7 @@ pub fn spawn_resource_monitor(paths: ResourceMonitorPaths) -> tokio::task::JoinH
             }
 
             // RESOURCE-03 — spill-dir free percent (reuse the disk-health probe).
-            match probe_disk_free_bytes(&paths.spill_dir) {
+            match readings.spill {
                 DiskHealthOutcome::Ok {
                     free_bytes,
                     total_bytes,
@@ -645,6 +666,15 @@ pub fn spawn_resource_monitor(paths: ResourceMonitorPaths) -> tokio::task::JoinH
             }
         }
     })
+}
+
+/// One cycle's raw readings, gathered on the blocking pool.
+struct ProbeReadings {
+    fds: Option<u64>,
+    fd_limit: Option<u64>,
+    rss: Option<u64>,
+    ceiling: MemoryCeiling,
+    spill: DiskHealthOutcome,
 }
 
 /// Supervise the resource monitor. [`spawn_resource_monitor`] runs an infinite

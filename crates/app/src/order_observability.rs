@@ -482,7 +482,7 @@ pub fn classify_order_side_reconcile(
 /// under `tokio::task::block_in_place` (other tasks migrate); on a
 /// current-thread runtime (the `#[tokio::test]` harness) it is called
 /// directly, because `block_in_place` panics there.
-fn blocking_flush<T>(flush: impl FnOnce() -> T) -> T {
+pub(crate) fn blocking_flush<T>(flush: impl FnOnce() -> T) -> T {
     if tokio::runtime::Handle::current().runtime_flavor()
         == tokio::runtime::RuntimeFlavor::MultiThread
     {
