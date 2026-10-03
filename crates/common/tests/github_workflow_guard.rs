@@ -557,7 +557,7 @@ fn r20_no_workflow_publishes_the_operator_key() {
 fn r21_manual_deploy_needs_main_and_all_green() {
     let body = read(DEPLOY_AWS_WORKFLOW);
     let start = body
-        .find("- name: Refuse a manual deploy of a commit that did not pass All Green")
+        .find("- name: Refuse a manual or tag deploy of a commit that did not pass All Green")
         .expect("manual-deploy gate step present");
     let pre = &body[..start];
     assert!(
@@ -575,6 +575,23 @@ fn r21_manual_deploy_needs_main_and_all_green() {
         step,
         "[ \"$RUN_REF\" != \"refs/heads/main\" ]",
         "only main can be deployed by hand",
+    );
+    // Audit PR36c (2026-10-03): a pushed v*.*.* tag runs the same gate, and
+    // its commit must already be on main.
+    must_contain(
+        step,
+        "if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')",
+        "the gate runs on every manual run AND every tag run",
+    );
+    must_contain(
+        step,
+        "compare/main...${RUN_SHA}",
+        "a tag's commit is compared with main",
+    );
+    must_contain(
+        step,
+        "identical|behind)",
+        "only a commit already on main (main's head or an ancestor) passes",
     );
     must_contain(step, "check_name=All%20Green", "reads the All Green check");
     must_contain(

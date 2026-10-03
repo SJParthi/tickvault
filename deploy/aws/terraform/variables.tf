@@ -132,14 +132,22 @@ variable "key_name" {
   default     = "tv-prod-key"
 }
 
+# Audit PR36c (2026-10-03, owner: "security yes"): this defaulted to
+# 0.0.0.0/0 and CI passed 0.0.0.0/0 on every apply, so port 22 was open to the
+# whole internet. Empty now means NO SSH rule at all. Shell access stays
+# available through SSM Session Manager (the instance role carries
+# AmazonSSMManagedInstanceCore, the same path every deploy uses):
+#   aws ssm start-session --target <instance-id>
+# To allow SSH from one address, set the repository secret
+# TF_VAR_OPERATOR_CIDR to e.g. 203.0.113.42/32 and re-run terraform-apply.
 variable "operator_cidr" {
-  description = "CIDR that may SSH into the instance. Tighten to your home/office IP."
+  description = "CIDR that may SSH into the instance, e.g. 203.0.113.42/32. Empty = no SSH ingress (use SSM Session Manager)."
   type        = string
-  default     = "0.0.0.0/0"
+  default     = ""
 
   validation {
-    condition     = length(var.operator_cidr) > 0
-    error_message = "operator_cidr must be a non-empty CIDR (e.g. 203.0.113.42/32)"
+    condition     = var.operator_cidr == "" || can(cidrhost(var.operator_cidr, 0))
+    error_message = "operator_cidr must be empty (no SSH) or a CIDR such as 203.0.113.42/32."
   }
 }
 

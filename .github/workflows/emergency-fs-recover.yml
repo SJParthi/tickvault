@@ -153,6 +153,28 @@ jobs:
           echo "ip=$IP"   >> "$GITHUB_OUTPUT"
           echo "az=$AZ"   >> "$GITHUB_OUTPUT"
           echo "public ip $IP in $AZ"
+          SG=$(aws ec2 describe-instances --instance-ids "$IID" --query 'Reservations[].Instances[].SecurityGroups[0].GroupId' --output text)
+          echo "sg=$SG" >> "$GITHUB_OUTPUT"
+
+      # Audit PR36c (2026-10-03, owner: "security yes"): port 22 is no longer
+      # open to the internet (terraform's operator_cidr is empty by default),
+      # and this recovery is the one path that NEEDS ssh, because a full disk
+      # stops the SSM agent. So it opens 22 to THIS runner's address only, for
+      # the length of the run, and the `always()` step below closes it again.
+      # Before 2026-10-03 the whole internet had it permanently.
+      - name: Open SSH to this runner only, for this run
+        id: ssh_open
+        env:
+          SG: ${{ steps.box.outputs.sg }}
+        run: |
+          set -euo pipefail
+          RUNNER_IP=$(curl -fsS --retry 3 https://checkip.amazonaws.com | tr -d '[:space:]')
+          [[ "$RUNNER_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::could not read this runner's public address ('$RUNNER_IP')"; exit 1; }
+          echo "cidr=${RUNNER_IP}/32" >> "$GITHUB_OUTPUT"
+          OUT=$(aws ec2 authorize-security-group-ingress --group-id "$SG" \
+                  --ip-permissions "IpProtocol=tcp,FromPort=22,ToPort=22,IpRanges=[{CidrIp=${RUNNER_IP}/32,Description=emergency-fs-recover-run}]" 2>&1) \
+            || case "$OUT" in *InvalidPermission.Duplicate*) echo "rule already present";; *) echo "::error::could not open port 22 to ${RUNNER_IP}/32: $OUT"; exit 1;; esac
+          echo "port 22 open to ${RUNNER_IP}/32 on $SG for this run"
 
       - name: Write the on-box recovery script
         env:
@@ -261,3 +283,17 @@ jobs:
           done
           rm -f eic_key eic_key.pub
           [ "$ok" = 1 ] || { echo "::error::recovery script never ran to completion"; exit 1; }
+
+      - name: Close the run's SSH opening again
+        if: always() && steps.ssh_open.outputs.cidr != ''
+        env:
+          SG: ${{ steps.box.outputs.sg }}
+          CIDR: ${{ steps.ssh_open.outputs.cidr }}
+        run: |
+          set -uo pipefail
+          if aws ec2 revoke-security-group-ingress --group-id "$SG" --protocol tcp --port 22 --cidr "$CIDR"; then
+            echo "port 22 closed to $CIDR"
+          else
+            echo "::error::could not close port 22 to $CIDR on $SG; the next terraform apply removes it, or revoke it by hand"
+            exit 1
+          fi

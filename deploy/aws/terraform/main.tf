@@ -15,7 +15,7 @@
 #
 # Deployed resources:
 #   - VPC with a single public subnet (no NAT to stay under budget)
-#   - Security group: SSH from operator_cidr, no inbound from market
+#   - Security group: SSH only from operator_cidr when set (none by default), no inbound from market
 #   - IAM role: SSM read+write+delete (instance lock) + CloudWatch write +
 #     SNS publish + S3 cold-tier read/write
 #   - EC2 t4g.medium (ARM Graviton2, 2 vCPU / 4 GiB — 2026-07-15 downsize lock;
@@ -141,12 +141,17 @@ resource "aws_security_group" "tv_app" {
   description = "DLT app: SSH from operator, egress to Dhan + AWS services"
   vpc_id      = aws_vpc.dlt.id
 
-  ingress {
-    description = "SSH from operator"
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = [var.operator_cidr]
+  # SSH only when operator_cidr is set (audit PR36c, 2026-10-03); empty by
+  # default, so no port is open to the internet. See variables.tf.
+  dynamic "ingress" {
+    for_each = var.operator_cidr == "" ? [] : [var.operator_cidr]
+    content {
+      description = "SSH from operator"
+      from_port   = 22
+      to_port     = 22
+      protocol    = "tcp"
+      cidr_blocks = [ingress.value]
+    }
   }
 
   # B4 QuestDB console (questdb-console.tf): the console's VPC back-Lambda
