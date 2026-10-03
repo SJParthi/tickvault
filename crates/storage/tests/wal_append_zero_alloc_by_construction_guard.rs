@@ -156,7 +156,7 @@ fn the_append_reserves_bytes_before_it_sends() {
         releases >= 4,
         "expected at least four byte-budget releases (the over-budget arm, the \
          channel-Full arm, the writer-Disconnected arm, and the writer's \
-         on-receipt release) but found {releases}. A missing release leaks the \
+         per-batch release) but found {releases}. A missing release leaks the \
          budget downward until the queue refuses everything."
     );
 }
