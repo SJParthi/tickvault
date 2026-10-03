@@ -1623,11 +1623,21 @@ impl TokenManager {
     }
 
     /// Saves the current token to the disk cache for fast crash recovery.
+    ///
+    /// The write (a file create, write and `fsync`, then a rename) runs on the
+    /// runtime's blocking pool, never on the calling task (audit-fixes H2,
+    /// 2026-10-03). A renewal after an 807/809 is called from a socket read
+    /// task on the reader runtime, so an inline `fsync` on a slow disk stalled
+    /// every socket that runtime serves. The blocking job re-reads the CURRENT
+    /// token under a process-wide lock, so two renewals close together can
+    /// never leave the older token as the cache's last write, and they never
+    /// share the temp file. Best-effort, as before: the cache only speeds up a
+    /// restart, and a write lost at exit means the next boot reads or mints a
+    /// token the usual way.
     fn save_current_token_to_cache(&self) {
-        let guard = self.token.load();
-        if let Some(token_state) = guard.as_ref().as_ref() {
-            token_cache::save_token_cache(token_state, &self.credentials.client_id);
-        }
+        let handle = Arc::clone(&self.token);
+        let client_id = self.credentials.client_id.clone();
+        offload_blocking(move || write_current_token_cache(&handle, &client_id));
     }
 
     /// Publishes the current token to SSM so peer consumers of the SAME Dhan
@@ -2033,6 +2043,40 @@ fn is_dhan_rate_limited(reason: &str) -> bool {
     reason.contains("every 2 minutes") || reason.contains("once every")
 }
 
+/// Serialises token-cache writes so the last write is always the newest token
+/// and two writers never share the temp file.
+static TOKEN_CACHE_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Writes whatever token is current at the moment the write runs.
+fn write_current_token_cache(handle: &TokenHandle, client_id: &secrecy::SecretString) {
+    let _held = TOKEN_CACHE_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let current = handle.load_full();
+    if let Some(token_state) = current.as_ref() {
+        token_cache::save_token_cache(token_state, client_id);
+    }
+}
+
+/// Runs `job` on the current runtime's blocking pool, or inline when there is
+/// no runtime (a synchronous caller has no task to stall). Returns `true` when
+/// the job was handed off. O(1) for the caller: one spawn.
+fn offload_blocking<F>(job: F) -> bool
+where
+    F: FnOnce() + Send + 'static,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => {
+            drop(runtime.spawn_blocking(job));
+            true
+        }
+        Err(_) => {
+            job();
+            false
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -2041,6 +2085,64 @@ fn is_dhan_rate_limited(reason: &str) -> bool {
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: test code
 mod tests {
     use super::*;
+
+    /// Audit-fixes H2 (2026-10-03): inside a runtime the token-cache write is
+    /// handed to the blocking pool and runs on another thread, so the calling
+    /// task (a socket read task after an 807/809) never waits on the fsync.
+    #[test]
+    fn test_regression_h2_token_cache_write_never_runs_on_the_calling_worker() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let caller = std::thread::current().id();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let offloaded = runtime.block_on(async move {
+            offload_blocking(move || {
+                drop(tx.send(std::thread::current().id()));
+            })
+        });
+        assert!(offloaded, "inside a runtime the write is handed off");
+        let ran_on = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the job ran");
+        assert_ne!(ran_on, caller, "the write ran on a blocking-pool thread");
+        drop(runtime);
+    }
+
+    /// Without a runtime there is no task to stall, and the write runs inline.
+    #[test]
+    fn test_offload_blocking_without_a_runtime_runs_inline() {
+        let caller = std::thread::current().id();
+        let ran_on = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let slot = std::sync::Arc::clone(&ran_on);
+        let offloaded = offload_blocking(move || {
+            *slot.lock().expect("slot") = Some(std::thread::current().id());
+        });
+        assert!(!offloaded);
+        assert_eq!(*ran_on.lock().expect("slot"), Some(caller));
+    }
+
+    /// The source keeps the cache write off the caller: the wrapper goes
+    /// through `offload_blocking`, and nothing else in this file calls
+    /// `save_token_cache` directly.
+    #[test]
+    fn test_regression_h2_cache_save_goes_through_the_offload() {
+        let src = include_str!("token_manager.rs");
+        let production = src
+            .split("// Tests\n// ----")
+            .next()
+            .expect("production part");
+        assert!(
+            production.contains(
+                "offload_blocking(move || write_current_token_cache(&handle, &client_id));"
+            )
+        );
+        assert_eq!(
+            production.matches("token_cache::save_token_cache(").count(),
+            1,
+            "only write_current_token_cache writes the cache"
+        );
+    }
 
     /// Adoption must PROVE the token works before skipping the mint.
     ///
