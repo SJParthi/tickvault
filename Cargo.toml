@@ -70,14 +70,14 @@ metrics-exporter-prometheus = "=0.18.3"
 # opentelemetry/opentelemetry_sdk/opentelemetry-otlp ^0.32. Bump all 4 together
 # or none (single-crate bumps split the dependency tree and fail to compile —
 # see .claude/plans/research/dep-decisions.md §1, dependabot PR #938 post-mortem).
-opentelemetry = "=0.32.0"
-opentelemetry_sdk = { version = "=0.32.1", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "=0.32.0", features = ["grpc-tonic"] }
+opentelemetry = "=0.33.0"
+opentelemetry_sdk = { version = "=0.33.0", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "=0.33.0", features = ["grpc-tonic"] }
 
 # ---- Section 5: Observability — Tracing ----
 tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", features = ["json", "env-filter"] }
-tracing-opentelemetry = "=0.33.0"
+tracing-opentelemetry = "=0.34.0"
 # Phase 2 of plans/active-plan.md: hourly-rotated ERROR-only JSONL stream
 # at data/logs/errors.jsonl so Claude Code / Loki / summary_writer can tail
 # a structured, append-only file instead of parsing journald prose.

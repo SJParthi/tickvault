@@ -469,7 +469,7 @@ Branch protection ON: **All Green** (the ci.yml fan-in over the ENTIRE PR suite)
 | Database | questdb-rs | 6.1.0 |
 | Cache | redis | 1.1.0 |
 | Metrics | metrics + prometheus-exporter | 0.24.3 / 0.18.1 |
-| Tracing | tracing + opentelemetry | 0.1.44 / 0.32.0 |
+| Tracing | tracing + opentelemetry | 0.1.44 / 0.33.0 |
 | Serialization | serde + serde_json | 1.0.228 / 1.0.149 |
 | Zero-copy | rkyv | 0.8.15 |
 | Auth | arc-swap + totp-rs | 1.9.0 / 5.7.1 |
