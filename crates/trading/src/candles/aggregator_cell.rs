@@ -1628,6 +1628,23 @@ impl AggregatorCell {
         ConsumeOutcome::DiscardLate
     }
 
+    /// Drops `tf`'s outstanding carry, for a process that exits mid-session
+    /// (audit PR31b-2). Returns whether there was one.
+    ///
+    /// With no bucket open, a carry holds units of a late trade whose own
+    /// bucket the catch-up already sealed. A running process settles them
+    /// into the next bucket this instrument touches, or, if none comes before
+    /// the close, into the sealed bar ([`Self::force_seal`] case 2). An
+    /// exiting process cannot know which, and writing them into the sealed
+    /// bar could count them in a bar the uninterrupted day leaves without
+    /// them, so the caller drops them and counts the drop.
+    ///
+    /// # Complexity
+    /// O(1) — three array reads and three writes.
+    pub(crate) fn discard_carry(&mut self, tf: TfIndex) -> bool {
+        self.take_carry(tf.as_ordinal()) != UnattributedCarry::default()
+    }
+
     /// Day-boundary force-seal of one timeframe slot.
     ///
     /// Returns `Some(bar)` in exactly two cases, and `None` otherwise:

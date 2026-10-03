@@ -1029,6 +1029,22 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
       cover them; that is #2010 part 2, not written yet.
     - Also from that review, for (a): `withhold_open_buckets` skips cells with no open bucket, so
       a settled late-trade carry that `force_seal_all` would re-emit is dropped uncounted.
+    - **(a) MEASURED 2026-10-03 and NOT built.** The `restart_differential.rs` model was run
+      with a restart that re-reads EVERY saved frame before the stop (the best a warm-up could
+      do) against one that re-reads none (what a clean exit leaves). Over 4,000 random days
+      (1,229 clean exits): of 25,832 bars that ended before the exit and are missing or short
+      in the database, the full re-read wrote 1; of 22,591 bars that spanned the exit, 0;
+      after crashes, 13 of 54,480. Each withheld bar either spans the restart's downtime or
+      ended within the late-trade margin of the exit, and the restart rules (rounds 18-25)
+      withhold both whatever was re-read. Deploys are also already blocked 09:00-15:45 IST.
+      So the warm-up would add boot time and about 1,800 lines for no rebuilt bars; the
+      10-second boot question is moot.
+    - [x] Carry count (2026-10-03): `withhold_open_buckets` now drops an outstanding carry on a
+      timeframe with no bucket open and counts it on
+      `tv_candle_refold_partial_suppressed_total` (`AggregatorCell::discard_carry`); it is not
+      written, since a running process would settle it into a bucket the exit cannot know.
+      The exit log and docs no longer promise a rebuild. Test:
+      `test_regression_withhold_open_buckets_counts_a_dropped_carry` (fails without the fix).
 - [ ] **PR31c — PR31a's honest limits, closed one by one (zero data loss on every path,
   owner 2026-09-27).** (`storage`, `app`) Added 2026-09-27 so none of these lives only in the
   PR #1962 text. Each lands as its own small PR after PR31b.
