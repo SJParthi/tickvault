@@ -1,7 +1,7 @@
 # Handoff — PR #2004 (zero-loss audit fixes)
 
 > Purpose: let a cold Claude session (any account) resume this work from the
-> repo alone. Updated after every milestone. Last updated: 2026-10-03 03:20 UTC.
+> repo alone. Updated after every milestone. Last updated: 2026-10-03 04:00 UTC.
 
 ## Where things are
 
@@ -41,17 +41,24 @@ All six are fixed with regression tests; see plan item R5 for test names.
 | S3 | low | `crates/storage/src/ws_frame_spill.rs` `seed_frame_seq_from_disk` | Seed the frame sequence from max(disk segments, persisted applied watermark + 1). |
 | L | limit | CLAUDE.md rows | Record: replay dedup can keep both copies when they straddle the applied-watermark skip or one was ring-shed (duplicate, never loss); `*.bin.N` / set-aside files are never uploaded or pruned. |
 
-## Merge round (Parthi 2026-10-02 17:33 UTC: "merge everything", no change lost, no overlap)
+## Merge round: ONE combined PR (Parthi 2026-10-03 03:07 UTC: "fold all into a single pr and merge")
 
-| PR | State at 2026-10-03 03:20 UTC | Next action |
+CI runners are scarce (a full run took ~9 h of queue), so every open PR that is finished is
+folded into #2004 and merged with one CI run. Separate CI runs were cancelled (Parthi
+approved pausing the other threads' checks, 03:07 UTC).
+
+| PR | State at 2026-10-03 04:00 UTC | Next action |
 |---|---|---|
 | #2001 host tuning in Rust | MERGED (f55531ba9 on main) | none |
-| #2003 bucket keeps everything | All Green passed, then behind main after #2001; branch updated 03:00, auto-merge armed | merges itself when green; confirm on main |
-| #2002 holiday gate in Rust | main merged in (1ea917213), 4 conflicts kept both sides, marked ready | merge when All Green passes; update branch again if behind |
-| #2004 this PR | D6d (ensure-questdb) REVERTED here: #2005 owns it (two diverging copies otherwise). main merged in | CI green, then mark ready and merge after #2003 and #2002 |
-| #2005 ensure-questdb in Rust | other thread; sole owner of D6d now | not ours |
-| #2006-#2011 | other threads; overlap #2004 only in shared files (main.rs, dhan_feed_stack.rs, seal_writer_loop.rs, ws_frame_spill.rs, storage lib.rs) | their threads merge main in after #2004 lands |
-| #1968-#1971 opentelemetry bumps | each fails alone (two opentelemetry versions in one build) | replace with ONE combined upgrade after #2004 merges; close the four only after it merges |
+| #2003 cold bucket keeps everything | FOLDED into #2004 (main.tf: #2003's version; both guard sets kept) | close after #2004 merges |
+| #2002 holiday gate in Rust | FOLDED into #2004 (no conflict) | close after #2004 merges |
+| #2005 ensure-questdb in Rust | FOLDED into #2004 (this branch's earlier D6d copy was reverted first) | close after #2004 merges |
+| #2006 crash marker (PR31b-1) | FOLDED; CLAUDE.md row added; loss-counter guard fix pushed here | close after #2004 merges |
+| #2007 + #2008 audit rows (PR42a/b) | FOLDED (42b branch carries 42a) | close after #2004 merges |
+| #2009 mid-session exit seal (PR31b-2b) | FOLDED; dhan_feed_stack conflict kept both methods. Its plan text is still not in the audit plan | close after #2004 merges |
+| #2010 candle warm-up (PR31b-2a) | NOT folded: WIP part 1 of 2 | its thread finishes it, merges main |
+| #2011 raw frames to S3 (45e) | NOT folded: #2004 already carries its own 45e-1 uploader (raw_frame_upload.rs); #2011 is a second, independent one (wal_raw_upload.rs). Keeping both = two uploaders | owner picks one; until then #2011 stays open |
+| #1968-#1971 opentelemetry bumps | FOLDED as one combined upgrade (0.33 / tracing-opentelemetry 0.34) | close after #2004 merges |
 
 Merges: squash, only with All Green success on the exact head. After each merge confirm the
 PR's change is on main. Close a PR only if its content is verified already on main.
