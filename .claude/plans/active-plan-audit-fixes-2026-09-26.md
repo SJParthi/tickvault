@@ -982,7 +982,7 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
     `test_flush_refuses_until_the_candle_tables_are_keyed`,
     `the_sink_sends_nothing_until_the_top_volume_tables_are_keyed`,
     `ensure_until_keyed_keeps_retrying_a_database_that_refuses`.
-- [ ] **PR31b — the restart rebuild never overwrites a fuller candle.** (`app`, `storage`,
+- [x] **PR31b — the restart rebuild never overwrites a fuller candle.** (`app`, `storage`,
   `trading`)
   - A restart in market hours rebuilds the open candles from the ticks it replays, which may be
     only part of them, and the UPSERT overwrites the fuller row already stored
@@ -1013,7 +1013,7 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
     marker unfinished. Tests: 5 in `seal_writer_loop::pr31b1_tests`,
     `the_loop_reads_the_previous_marker_before_it_writes_its_own` updated,
     `crates/app/tests/seal_unwritten_mark_shutdown_guard.rs` (4).
-  - [ ] **PR31b-2 — the rest.** (a) The WAL warm-up with archived segments and row 253, as the
+  - [x] **PR31b-2 — the rest.** (a) The WAL warm-up with archived segments and row 253, as the
     chosen approach above. (b) NEW 2026-10-01: a CLEAN shutdown mid-session writes truncated
     open bars as complete. `seal_open_buckets_at_close()` runs at lane exit
     (dhan_feed_stack.rs, at the lane's shutdown seal) with no session gate, and
@@ -1038,7 +1038,8 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
       ended within the late-trade margin of the exit, and the restart rules (rounds 18-25)
       withhold both whatever was re-read. Deploys are also already blocked 09:00-15:45 IST.
       So the warm-up would add boot time and about 1,800 lines for no rebuilt bars; the
-      10-second boot question is moot.
+      10-second boot question is moot. **DROPPED 2026-10-03** (owner: "simply go ahead",
+      relayed by the coordinator, taking the recommendation to drop it).
     - [x] Carry count (2026-10-03): `withhold_open_buckets` now drops an outstanding carry on a
       timeframe with no bucket open and counts it on
       `tv_candle_refold_partial_suppressed_total` (`AggregatorCell::discard_carry`); it is not
