@@ -82,7 +82,9 @@ const INSTANCE_RAM_GIB: &[(&str, u64)] = &[
 const NON_QUESTDB_NON_SOCKET_GIB_HIGH: u64 = 16;
 
 const SYSCTL_CONF: &str = "deploy/aws/sysctl/99-tickvault-net.conf";
-const VERIFIER: &str = "deploy/aws/sysctl/verify-net-tuning.sh";
+const VERIFIER: &str = "crates/app/src/host_tuning.rs";
+/// How the boot unit invokes the verifier (audit D6b, 2026-10-01).
+const VERIFIER_CALL: &str = "tickvault-host host-tuning verify";
 const USER_DATA: &str = "deploy/aws/terraform/user-data.sh.tftpl";
 const COMPOSE: &str = "deploy/docker/docker-compose.yml";
 const TF_VARS: &str = "deploy/aws/terraform/variables.tf";
@@ -373,11 +375,13 @@ fn user_data_runs_the_verifier_after_applying_the_sysctl_file() {
     // restarts every weekday, so the tuning it applied was silently stale on
     // every boot after the first. The unit re-applies it every boot.
     //
+    // 2026-10-01 (audit D6b) — the verifier is now `tickvault host-tuning
+    // verify`, a subcommand of the app binary, not a shell script.
+    //
     // The invariant is unchanged and still fully enforced — install, then
-    // apply, then verify, in that order. Only the file it is read from moved.
-    // Verifying BEFORE applying would describe the pre-tuning kernel, which is
-    // exactly the false-OK this chain exists to prevent, so the ORDER check is
-    // kept verbatim.
+    // apply, then verify, in that order. Verifying BEFORE applying would
+    // describe the pre-tuning kernel, which is exactly the false-OK this chain
+    // exists to prevent, so the ORDER check is kept verbatim.
     let unit = read("deploy/systemd/tickvault-host-tuning.service");
 
     assert!(
@@ -385,8 +389,8 @@ fn user_data_runs_the_verifier_after_applying_the_sysctl_file() {
         "the boot unit no longer installs the sysctl file"
     );
     assert!(
-        unit.contains("verify-net-tuning.sh"),
-        "the boot unit no longer runs verify-net-tuning.sh. Applying tuning \
+        unit.contains(VERIFIER_CALL),
+        "the boot unit no longer runs `{VERIFIER_CALL}`. Applying tuning \
          without verifying it lands is the false-OK this whole chain exists to \
          prevent."
     );
@@ -395,7 +399,7 @@ fn user_data_runs_the_verifier_after_applying_the_sysctl_file() {
         .find("sysctl --system")
         .expect("the boot unit no longer applies sysctls");
     let verify = unit
-        .find("verify-net-tuning.sh")
+        .find(VERIFIER_CALL)
         .expect("no verifier call in the boot unit");
     assert!(
         apply < verify,
@@ -434,59 +438,37 @@ fn verifier_checks_every_load_bearing_setting_the_sysctl_file_sets() {
     ] {
         assert!(
             verifier.contains(key),
-            "verify-net-tuning.sh does not check `{key}`, but \
-             99-tickvault-net.conf sets it. A verifier that covers a subset \
-             reports success it has not established."
+            "{VERIFIER} does not check `{key}`, but 99-tickvault-net.conf sets \
+             it. A verifier that covers a subset reports success it has not \
+             established."
         );
     }
 }
 
 #[test]
 fn verifier_exits_nonzero_when_the_kernel_is_untuned() {
-    // Runs the real script against THIS host, which is a stock CI container and
-    // therefore genuinely untuned. If the script ever returned 0 here it would
-    // be reporting a tuning that provably is not present.
-    let path = repo_root().join(VERIFIER);
-    let out = Command::new("bash")
-        .arg(&path)
-        .output()
-        .expect("could not execute verify-net-tuning.sh");
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Runs the real check against THIS host, which is a stock CI container and
+    // therefore genuinely untuned. If it ever reported zero failures here it
+    // would be reporting a tuning that provably is not present.
+    let (failures, report) = tickvault_app::host_tuning::verify_this_host();
 
     // A tuned host would legitimately pass; only assert the failure shape when
     // this host is actually untuned, so the guard cannot false-fail on a box
     // that has the settings applied.
-    if stdout.contains("BELOW") || stdout.contains("UNREADABLE") {
+    if report.contains("BELOW") || report.contains("UNREADABLE") {
         assert!(
-            !out.status.success(),
-            "verify-net-tuning.sh reported settings BELOW target yet exited 0 — \
-             a non-zero exit is the only part of this a caller can act on:\n{stdout}"
+            failures > 0,
+            "the verifier reported settings BELOW target yet counted no failure — \
+             the non-zero exit is the only part of this a caller can act on:\n{report}"
         );
         assert!(
-            stdout.contains("NOT APPLIED"),
+            report.contains("NOT APPLIED"),
             "a failing verification must say so in plain words, not just in an \
-             exit code nobody reads:\n{stdout}"
+             exit code nobody reads:\n{report}"
         );
     } else {
-        assert!(
-            out.status.success(),
-            "no failures reported yet exited non-zero"
-        );
+        assert_eq!(failures, 0, "no failures reported yet counted some");
     }
-}
-
-#[test]
-fn verifier_is_executable_and_syntactically_valid() {
-    let path = repo_root().join(VERIFIER);
-    let out = Command::new("bash")
-        .args(["-n", path.to_str().expect("path")])
-        .output()
-        .expect("bash -n failed to run");
-    assert!(
-        out.status.success(),
-        "verify-net-tuning.sh has a shell syntax error:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
 }
 
 // ---------------------------------------------------------------------------

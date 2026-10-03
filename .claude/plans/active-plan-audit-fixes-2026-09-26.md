@@ -419,7 +419,7 @@ inline (PR2, PR8, PR14).
     script is rule-locked to shell and needs an owner quote before it changes.
   - Series (2026-10-01, owned by the "Replace shell scripts with Rust" thread; one PR each,
     serial; the audit-plan thread skips D6):
-    - [ ] D6a — shell budget first: `crates/common/tests/shell_budget_guard.rs` freezes the 105
+    - [x] D6a — shell budget first: `crates/common/tests/shell_budget_guard.rs` freezes the 105
       shell files (46 developer tooling by file set; 59 others by file set AND line ceiling) and
       pins each systemd unit's shell `Exec*=` count (1 + 3 + 1). Rule lock §0.10. Test-only.
       Tests: `no_new_shell_files`, `shell_lists_shrink_only`, `ops_shell_files_never_grow`,
@@ -2160,7 +2160,7 @@ auotmate ddue okay?"):
   capacity it writes and counts (`kind=mirrored_overflow`, `untracked`, `boot_untracked`).
   **Honest limit:** a DLQ write does not consult the ledger before writing (it records after); a
   key the ledger could not track at capacity still replays in file order.
-  - Files: crates/storage/src/{seal_spill_ledger,seal_spill,seal_writer_task,seal_writer_runner,seal_absorption,seal_writer_loop}.rs
+  - Files: crates/storage/src/seal_spill_ledger.rs, crates/storage/src/seal_spill.rs, crates/storage/src/seal_writer_task.rs, crates/storage/src/seal_writer_runner.rs, crates/storage/src/seal_absorption.rs, crates/storage/src/seal_writer_loop.rs
   - Tests: `test_regression_z6_later_bucket_spilled_does_not_hide_amend`,
     `test_regression_z6_original_in_escalation_queue_is_not_written_after_live_amend`,
     `test_regression_z6_dead_lettered_original_mirrors_live_amend`,
@@ -2172,7 +2172,7 @@ auotmate ddue okay?"):
   before handing a batch to the rescue thread, retracts it if the hand-off is refused, and the
   rescue thread releases it only after the spill is synced or the range is marked unapplied. A full
   table marks the range unapplied and counts `tv_wal_rescue_floor_full_total`.
-  - Files: crates/storage/src/{wal_applied_watermark,tick_persistence,depth_persistence}.rs
+  - Files: crates/storage/src/wal_applied_watermark.rs, crates/storage/src/tick_persistence.rs, crates/storage/src/depth_persistence.rs
   - Tests: `test_regression_tick_queued_rescue_holds_a_floor_until_the_rescue_thread_settles_it`,
     `test_regression_depth_queued_rescue_holds_a_floor_until_the_rescue_thread_settles_it`,
     `test_regression_tick_refused_rescue_hand_off_retracts_its_floor`,
@@ -2280,8 +2280,9 @@ idle poll. No allocation on the tick path.
   `TICKVAULT_WS_READER_THREADS`, 0 = rollback), Prometheus-only telemetry
   (`hot_path_telemetry.rs`), ratchet `crates/common/tests/hot_path_no_blocking_guard.rs`
   (bite-proved). CPU pinning NOT added: needs `libc` as a direct dependency (owner approval).
-- [x] **R3-12 (D6d) — `scripts/ensure-questdb.sh` replaced by `tickvault ensure-questdb`**
-  (`ensure_questdb.rs`); script deleted, shell budget reduced.
+- [ ] **R3-12 (D6d) — `scripts/ensure-questdb.sh` replaced by `tickvault ensure-questdb`.**
+  Withdrawn from PR #2004 on 2026-10-03: PR #2005 is the dedicated, reworked version of the
+  same change, and keeping both would merge two diverging implementations. Delivered by #2005.
 - [ ] **R3-13 (D11) — Special sessions (Muhurat).** Built inert on `wip/d11`, NOT merged: needs the
   owner to confirm date, hours and cost, and a compile + test run.
 - [ ] **R3-14 — WAL segment names from a monotonic source** (replay order across a clock step). Open.

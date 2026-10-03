@@ -575,6 +575,14 @@ fn report_reader_core_pin(plan: tickvault_core::websocket::reader_runtime::Reade
 }
 
 fn main() -> Result<()> {
+    // `tickvault host-tuning <action>` (audit D6b): the per-boot host tuning the
+    // host-tuning unit runs as root. Dispatched before the runtime is built: it
+    // is synchronous, needs no TLS, and exits immediately.
+    let cli_args: Vec<String> = std::env::args().collect();
+    if let Some(code) = tickvault_app::host_tuning::run_cli(&cli_args) {
+        std::process::exit(code);
+    }
+
     let raw = std::env::var(TOKIO_WORKER_THREADS_ENV).ok();
     let (host_cpus, cpu_source) = host_cpu_allowance();
     let host_derived = clamp_worker_threads(host_cpus);

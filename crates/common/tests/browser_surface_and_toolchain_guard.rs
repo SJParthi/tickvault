@@ -436,18 +436,24 @@ const SPAWN_ALLOWLIST: &[(&str, &str)] = &[
         "docker",
         "compose health checks (infra.rs) + container tests",
     ),
-    (
-        "docker-compose",
-        "the standalone compose v1 binary, the last fallback rung of \
-         `tickvault ensure-questdb` (ensure_questdb.rs), which replaced the \
-         deleted shell script that already ran it. Same tool as `docker \
-         compose`, NOT a language runtime. Joined 2026-10-02 (plan item D6d).",
-    ),
     ("df", "disk-health watcher"),
     ("open", "operator convenience — opens a URL on the dev box"),
     (
         "chronyc",
         "clock-discipline verification for the latency claim",
+    ),
+    (
+        "systemctl",
+        "host tuning (`tickvault host-tuning`, audit D6b 2026-10-01): enable \
+         chronyd, stop irqbalance, daemon-reload after a drop-in change. A \
+         system service manager, not a language runtime; the shell script it \
+         replaced ran the same calls.",
+    ),
+    (
+        "modprobe",
+        "host tuning (`tickvault host-tuning bbr`, audit D6b 2026-10-01): load \
+         tcp_bbr before writing the sysctl that needs it. A kernel module \
+         loader, not a language runtime; the unit's former `/bin/sh -c` ran it.",
     ),
     (
         "/usr/bin/true",
@@ -564,15 +570,21 @@ fn spawn_allowlist_is_documented_and_has_no_language_runtime() {
     // manager -- and it is here because `infra.rs::spawn_program` substitutes it
     // in cfg(test) builds so `cargo test` can no longer run `docker compose up
     // --force-recreate` or `xdg-open` against the machine running the tests.
+    //
+    // `systemctl` and `modprobe` joined 2026-10-01 (audit D6b), turned by hand:
+    // the per-boot host tuning moved from shell into `tickvault host-tuning`,
+    // and those are the system tools the scripts already called. Moving the
+    // calls into Rust put them in front of this scan for the first time.
     const FROZEN: &[&str] = &[
         "git",
         "bash",
         "sh",
         "docker",
-        "docker-compose",
         "df",
         "open",
         "chronyc",
+        "systemctl",
+        "modprobe",
         "/usr/bin/true",
     ];
 

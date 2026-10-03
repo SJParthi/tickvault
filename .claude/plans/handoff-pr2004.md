@@ -1,13 +1,13 @@
 # Handoff — PR #2004 (zero-loss audit fixes)
 
 > Purpose: let a cold Claude session (any account) resume this work from the
-> repo alone. Updated after every milestone. Last updated: 2026-10-02 18:10 UTC.
+> repo alone. Updated after every milestone. Last updated: 2026-10-03 03:20 UTC.
 
 ## Where things are
 
 | Item | Value |
 |---|---|
-| PR | https://github.com/SJParthi/tickvault/pull/2004 — DRAFT, owner merges (never merge or arm auto-merge) |
+| PR | https://github.com/SJParthi/tickvault/pull/2004 — Parthi said "merge everything" (2026-10-02): merge it once All Green passes on the exact head |
 | Branch | `claude/project-thread-x09qc8` |
 | Last green head | `bd81c0a98` (All Green success); round 5 pushed after it |
 | Plan file | `.claude/plans/active-plan-audit-fixes-2026-09-26.md` (round items R4-1..R4-6 ticked) |
@@ -43,13 +43,15 @@ All six are fixed with regression tests; see plan item R5 for test names.
 
 ## Merge round (Parthi 2026-10-02 17:33 UTC: "merge everything", no change lost, no overlap)
 
-| PR | State at 18:10 UTC | Next action |
+| PR | State at 2026-10-03 03:20 UTC | Next action |
 |---|---|---|
-| #2003 bucket keeps everything | was green but behind; branch updated to main, CI re-running, auto-merge armed | merges itself when green; confirm its commit is on main |
-| #2001 host tuning in Rust | same as #2003 | merges itself when green; confirm on main |
-| #2002 holiday gate in Rust | conflicts; carries old copies of #1997 + #2001 commits | after #2001 lands: merge main into its branch (merge commit, no rebase), resolve, CI, mark ready, merge |
-| #2004 this PR | round 5 pushed; overlaps #2001/#2002/#2003 (deploy files, main.rs, shell_budget_guard, main.tf, aws_infra_wiring) and duplicates #2003's bucket change | after #2003/#2001 land: merge main in, keep BOTH sides' tests, CI green, mark ready, merge |
-| #1968-#1971 opentelemetry bumps | each fails alone (two opentelemetry versions in one build) | replace with ONE combined upgrade (all four crates + code changes in crates/app/src/observability.rs) on this branch after #2004 merges; close the four only after it merges |
+| #2001 host tuning in Rust | MERGED (f55531ba9 on main) | none |
+| #2003 bucket keeps everything | All Green passed, then behind main after #2001; branch updated 03:00, auto-merge armed | merges itself when green; confirm on main |
+| #2002 holiday gate in Rust | main merged in (1ea917213), 4 conflicts kept both sides, marked ready | merge when All Green passes; update branch again if behind |
+| #2004 this PR | D6d (ensure-questdb) REVERTED here: #2005 owns it (two diverging copies otherwise). main merged in | CI green, then mark ready and merge after #2003 and #2002 |
+| #2005 ensure-questdb in Rust | other thread; sole owner of D6d now | not ours |
+| #2006-#2011 | other threads; overlap #2004 only in shared files (main.rs, dhan_feed_stack.rs, seal_writer_loop.rs, ws_frame_spill.rs, storage lib.rs) | their threads merge main in after #2004 lands |
+| #1968-#1971 opentelemetry bumps | each fails alone (two opentelemetry versions in one build) | replace with ONE combined upgrade after #2004 merges; close the four only after it merges |
 
 Merges: squash, only with All Green success on the exact head. After each merge confirm the
 PR's change is on main. Close a PR only if its content is verified already on main.
