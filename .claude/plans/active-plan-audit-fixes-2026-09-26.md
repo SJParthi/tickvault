@@ -2477,10 +2477,19 @@ write, then candle warm-up (PR31b-2 (a), already listed above). Each fix ships a
   `deploy/aws/terraform/{main,variables}.tf`. Test: r21_manual_deploy_needs_main_and_all_green.
   Honest limit: the long-lived keys stay repository secrets until the owner moves them into the
   `prod` environment.
-- [ ] **H4 — The live feed never waits on a slow disk for its own backup write.** Unbacked tick and
-  depth rows with a busy rescue thread, and seals refused by a full escalation queue, are written
-  on the frame drain. Plan: park them in a bounded in-memory queue retried on later flushes and
-  drained at shutdown, inline only past the bound, counted.
+- [x] **H4 — The live feed never waits on a slow disk for its own backup write.** Unbacked tick and
+  depth rows with a busy rescue thread are parked in a bounded in-memory queue (8 batches, 128 MiB
+  per sink), retried on every flush and rescue, handed to the rescue thread at shutdown, written
+  inline only past the bound, counted (`tv_{tick,depth}_rescue_parked_total`, `_parked_bytes`).
+  Seals already park in the 250,000-deep escalation queue; unchanged. Files:
+  `crates/storage/src/{tick,depth}_persistence.rs`, `crates/storage/tests/spill_rescue_sync_guard.rs`.
+  Tests: test_regression_h4_a_parked_rescue_is_handed_on_by_the_next_flush,
+  test_regression_h4_closing_the_rescue_queue_hands_on_the_park,
+  test_regression_h4_a_parked_rescue_survives_a_dead_rescue_thread,
+  test_regression_h4_wal_backed_rows_are_deferred_not_parked,
+  test_regression_h4_the_depth_park_is_handed_on_or_written_never_dropped,
+  the_drain_parks_a_refused_rescue_and_never_waits_to_retry_it. Honest limit: a parked batch is
+  lost on a crash, where the old unsynced inline write would have kept it.
 
 ## Edge Cases
 

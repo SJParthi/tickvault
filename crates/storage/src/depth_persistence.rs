@@ -1067,6 +1067,13 @@ pub struct DepthWriter {
     /// Separate from `offload` on purpose: the rescue exists precisely for the
     /// two cases that queue cannot serve — it is FULL, or its thread is GONE.
     rescue: Option<std::sync::mpsc::SyncSender<DepthRescueBatch>>,
+    /// Depth rescue batches parked in RAM when the rescue queue is full (H4,
+    /// 2026-10-03); same shape and bounds as the tick writer's park, see
+    /// [`DEPTH_PARKED_RESCUE_MAX_BATCHES`]. Pre-sized by
+    /// [`DepthWriter::split_rescue_offload`], so parking never allocates.
+    parked_rescue: std::collections::VecDeque<DepthRescueBatch>,
+    /// ILP bytes held in `parked_rescue`.
+    parked_rescue_bytes: usize,
     /// Consecutive flush spans the producer has RETAINED because the hand-off
     /// queue was full. Bounded by [`MAX_DEPTH_RETAINED_FLUSH_SPANS`] so
     /// backpressure cannot silently widen a commit without limit.
@@ -1188,6 +1195,8 @@ impl DepthWriter {
                         crate::tick_persistence::DEPTH_SPILL_MIN_FREE_HEADROOM_BYTES,
                     offload: None,
                     rescue: None,
+                    parked_rescue: std::collections::VecDeque::new(),
+                    parked_rescue_bytes: 0,
                     retained_spans: 0,
                     flush_counters: DepthFlushCounters::new(feed),
                     spare_buffers: None,
@@ -1216,6 +1225,8 @@ impl DepthWriter {
                         crate::tick_persistence::DEPTH_SPILL_MIN_FREE_HEADROOM_BYTES,
                     offload: None,
                     rescue: None,
+                    parked_rescue: std::collections::VecDeque::new(),
+                    parked_rescue_bytes: 0,
                     retained_spans: 0,
                     flush_counters: DepthFlushCounters::new(feed),
                     spare_buffers: None,
@@ -1250,6 +1261,8 @@ impl DepthWriter {
             spill_min_free_headroom: 0,
             offload: None,
             rescue: None,
+            parked_rescue: std::collections::VecDeque::new(),
+            parked_rescue_bytes: 0,
             retained_spans: 0,
             flush_counters: DepthFlushCounters::new(feed),
             spare_buffers: None,
@@ -1706,6 +1719,8 @@ impl DepthWriter {
         // Off-drain hand-off. O(1), no syscall, no allocation: the `Buffer` is
         // MOVED, and the replacement is the same empty one `offload_flush`
         // already installs on every successful hand-off.
+        // H4: older parked batches go to the thread first.
+        self.retry_parked_rescue();
         let range = self.take_pending_range();
         let unbacked = std::mem::take(&mut self.pending_unbacked);
         let mut rescue_unavailable = false;
@@ -1747,6 +1762,19 @@ impl DepthWriter {
                     return rows;
                 }
                 Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                    // H4 (2026-10-03): rows the WAL cannot defer would be
+                    // written on the drain below; park them in RAM instead
+                    // while the bound allows. Counted as rescued now, like a
+                    // queued batch; the floor stays held.
+                    if (range.0 == 0 || unbacked) && self.park_rescue_fits(&returned) {
+                        self.park_rescue(returned);
+                        wm.note_depth_handed_off();
+                        self.rescued = self.rescued.saturating_add(rows as u64);
+                        self.pending = 0;
+                        self.dropped = self.dropped.saturating_add(rows as u64);
+                        self.install_spare_buffer(protocol);
+                        return rows;
+                    }
                     // Never reached the thread: retract its floor; the arms
                     // below mark or spill the range themselves.
                     if let Some(floor) = returned.floor {
@@ -1798,15 +1826,9 @@ impl DepthWriter {
             return rows;
         }
 
-        // The drain's inline spill is NOT synced (see `SPILL_UNSYNCED_ON_DRAIN`).
-        let landed = perform_depth_rescue(
-            &self.spill_dir,
-            self.buffer.as_bytes(),
-            self.feed,
-            rows,
-            self.spill_min_free_headroom,
-            crate::tick_persistence::SPILL_UNSYNCED_ON_DRAIN,
-        );
+        // Past the park's bound, a gone thread, or no rescue split at all:
+        // the drain's inline spill, NOT synced (see `spill_on_drain`).
+        let landed = self.spill_on_drain(self.buffer.as_bytes(), rows);
         note_rescue_outcome_depth(landed, range, false);
         if landed {
             self.rescued = self.rescued.saturating_add(rows as u64);
@@ -1876,6 +1898,9 @@ impl DepthWriter {
             spill_sync: crate::tick_persistence::SPILL_SYNC_OFF_DRAIN,
         };
         self.rescue = Some(tx);
+        // Once per process, so a park on the drain never allocates.
+        self.parked_rescue
+            .reserve_exact(DEPTH_PARKED_RESCUE_MAX_BATCHES);
         (sink, rx)
     }
 
@@ -1884,8 +1909,119 @@ impl DepthWriter {
     /// Leaves the writer in the INLINE state on purpose: a rescue after this
     /// point writes synchronously rather than being refused, so end-of-session
     /// levels still reach the spill tier.
+    ///
+    /// H4 (2026-10-03): every parked batch is handed to the rescue thread
+    /// first, with a BLOCKING send — shutdown only; see
+    /// `TickPersistenceWriter::close_rescue_offload` for why.
     pub fn close_rescue_offload(&mut self) {
-        self.rescue = None;
+        if let Some(tx) = self.rescue.take() {
+            while let Some(batch) = self.parked_rescue.pop_front() {
+                self.parked_rescue_bytes = self
+                    .parked_rescue_bytes
+                    .saturating_sub(batch.buffer.as_bytes().len());
+                let rows = batch.rows;
+                match tx.send(batch) {
+                    Ok(()) => self.flush_counters.rescue_queued.increment(rows as u64),
+                    Err(std::sync::mpsc::SendError(batch)) => {
+                        self.flush_counters.rescue_fallback_thread_gone.increment(1);
+                        self.spill_parked_on_drain(batch);
+                    }
+                }
+            }
+        }
+        // Unreachable with batches still parked (only a split writer parks),
+        // and written inline rather than dropped if it ever is.
+        while let Some(batch) = self.parked_rescue.pop_front() {
+            self.spill_parked_on_drain(batch);
+        }
+        self.parked_rescue_bytes = 0;
+        self.flush_counters.rescue_parked_bytes.set(0.0);
+    }
+
+    /// True when `batch` fits in the park without passing either bound.
+    fn park_rescue_fits(&self, batch: &DepthRescueBatch) -> bool {
+        self.parked_rescue.len() < DEPTH_PARKED_RESCUE_MAX_BATCHES
+            && self
+                .parked_rescue_bytes
+                .saturating_add(batch.buffer.as_bytes().len())
+                <= DEPTH_PARKED_RESCUE_MAX_BYTES
+    }
+
+    /// Parks one refused depth rescue batch in RAM (H4). O(1), no allocation,
+    /// floor kept.
+    fn park_rescue(&mut self, batch: DepthRescueBatch) {
+        self.parked_rescue_bytes = self
+            .parked_rescue_bytes
+            .saturating_add(batch.buffer.as_bytes().len());
+        self.flush_counters
+            .rescue_parked
+            .increment(batch.rows as u64);
+        self.parked_rescue.push_back(batch);
+        self.flush_counters
+            .rescue_parked_bytes
+            .set(self.parked_rescue_bytes as f64);
+    }
+
+    /// Hands parked depth rescue batches to the rescue thread, oldest first,
+    /// until its queue is full again (H4). One branch when nothing is parked;
+    /// never a wait. A gone thread is the one case written inline.
+    fn retry_parked_rescue(&mut self) {
+        if self.parked_rescue.is_empty() {
+            return;
+        }
+        while let Some(batch) = self.parked_rescue.pop_front() {
+            let bytes = batch.buffer.as_bytes().len();
+            let rows = batch.rows as u64;
+            let Some(tx) = self.rescue.as_ref() else {
+                self.parked_rescue_bytes = self.parked_rescue_bytes.saturating_sub(bytes);
+                self.spill_parked_on_drain(batch);
+                continue;
+            };
+            match tx.try_send(batch) {
+                Ok(()) => {
+                    self.parked_rescue_bytes = self.parked_rescue_bytes.saturating_sub(bytes);
+                    self.flush_counters.rescue_queued.increment(rows);
+                }
+                Err(std::sync::mpsc::TrySendError::Full(batch)) => {
+                    self.parked_rescue.push_front(batch);
+                    break;
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(batch)) => {
+                    self.parked_rescue_bytes = self.parked_rescue_bytes.saturating_sub(bytes);
+                    self.flush_counters.rescue_fallback_thread_gone.increment(1);
+                    self.spill_parked_on_drain(batch);
+                }
+            }
+        }
+        self.flush_counters
+            .rescue_parked_bytes
+            .set(self.parked_rescue_bytes as f64);
+    }
+
+    /// Writes a parked batch inline (thread gone) and completes it exactly as
+    /// the rescue thread would: outcome, floor, completion count. Its rows
+    /// were already counted as rescued and dropped when it was parked.
+    fn spill_parked_on_drain(&self, batch: DepthRescueBatch) {
+        let landed = self.spill_on_drain(batch.buffer.as_bytes(), batch.rows);
+        note_rescue_outcome_depth(landed, (batch.min_seq, batch.max_seq), false);
+        let wm = crate::wal_applied_watermark::applied_watermark();
+        if let Some(floor) = batch.floor {
+            wm.release_rescue_floor(floor);
+        }
+        wm.note_depth_completed();
+    }
+
+    /// The drain's only depth spill write, NOT synced (see
+    /// `SPILL_UNSYNCED_ON_DRAIN`).
+    fn spill_on_drain(&self, payload: &[u8], rows: usize) -> bool {
+        perform_depth_rescue(
+            &self.spill_dir,
+            payload,
+            self.feed,
+            rows,
+            self.spill_min_free_headroom,
+            crate::tick_persistence::SPILL_UNSYNCED_ON_DRAIN,
+        )
     }
 
     /// Closes the hand-off queue, so the writer thread sees the end of the
@@ -2003,6 +2139,9 @@ impl DepthWriter {
     pub fn flush(&mut self) -> Result<()> {
         // A republished name table is picked up at the next batch at the latest.
         self.contract_label = None;
+        // H4: a parked rescue goes to its thread first, even with nothing
+        // pending.
+        self.retry_parked_rescue();
         if self.pending == 0 {
             return Ok(());
         }
@@ -2256,6 +2395,23 @@ pub const DEPTH_FLUSH_QUEUE_DEPTH: usize = 4;
 /// the previous one is being written. Deeper would hold more rows that exist
 /// nowhere else, which is the trade the rescue tier exists to avoid.
 pub const DEPTH_RESCUE_QUEUE_DEPTH: usize = 2;
+
+/// Depth rescue batches the drain may PARK in RAM when the rescue queue is
+/// full (H4, 2026-10-03). Same bound and same trade as
+/// [`crate::tick_persistence::PARKED_RESCUE_MAX_BATCHES`]: only rows the WAL
+/// cannot defer are parked, a crash loses a parked batch where the old inline
+/// write would have kept it, and past the bound the drain writes inline as
+/// before, counted on `tv_depth_rescue_inline_fallback_total`.
+pub const DEPTH_PARKED_RESCUE_MAX_BATCHES: usize = 8;
+
+/// Byte bound on the depth park: four producer buffers at their cut-over size.
+pub const DEPTH_PARKED_RESCUE_MAX_BYTES: usize = 4 * MAX_DEPTH_PRODUCER_BUFFER_BYTES;
+
+/// Depth rows parked in RAM by the drain (H4). Not a loss counter.
+pub const DEPTH_RESCUE_PARKED_COUNTER: &str = "tv_depth_rescue_parked_total";
+
+/// Depth ILP bytes parked in RAM right now (H4).
+pub const DEPTH_RESCUE_PARKED_BYTES_GAUGE: &str = "tv_depth_rescue_parked_bytes";
 
 /// Depth rows handed to the rescue thread rather than written on the drain.
 pub const DEPTH_RESCUE_QUEUED_COUNTER: &str = "tv_depth_rescue_queued_total";
@@ -2578,6 +2734,10 @@ struct DepthFlushCounters {
     rescue_queued: metrics::Counter,
     rescue_fallback_queue_full: metrics::Counter,
     rescue_fallback_thread_gone: metrics::Counter,
+    /// Depth rows parked in RAM by the drain (H4).
+    rescue_parked: metrics::Counter,
+    /// Depth ILP bytes parked in RAM right now (H4).
+    rescue_parked_bytes: metrics::Gauge,
     /// Rows handed to the capture-at-receipt WAL instead of an inline spill
     /// write on the drain (2026-09-26 audit fix PR3).
     rescue_deferred_to_wal: metrics::Counter,
@@ -2603,6 +2763,8 @@ impl DepthFlushCounters {
                 "feed" => feed,
                 "reason" => "thread_gone"
             ),
+            rescue_parked: metrics::counter!(DEPTH_RESCUE_PARKED_COUNTER, "feed" => feed),
+            rescue_parked_bytes: metrics::gauge!(DEPTH_RESCUE_PARKED_BYTES_GAUGE, "feed" => feed),
             // Literal, not the const, so the shipped-metrics guard can see it.
             rescue_deferred_to_wal: metrics::counter!(
                 "tv_depth_rescue_deferred_to_wal_total",
@@ -3352,6 +3514,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Settles every queued and parked depth rescue batch, releasing the
+    /// watermark floors they hold for the other tests in this process.
+    fn settle_depth_rescues(
+        w: &mut DepthWriter,
+        sink: &DepthRescueSink,
+        rx: &std::sync::mpsc::Receiver<DepthRescueBatch>,
+    ) {
+        loop {
+            while let Ok(batch) = rx.try_recv() {
+                sink.rescue(&batch);
+            }
+            if w.parked_rescue.is_empty() {
+                break;
+            }
+            let _ = w.flush();
+        }
+    }
+
     /// A full depth rescue queue falls back to the OLD behaviour, never a drop,
     /// for rows with NO write-ahead-log backing (capture sequence 0). Rows
     /// that ARE in the WAL are deferred to it instead — see the next test.
@@ -3359,23 +3539,29 @@ mod tests {
     fn a_full_depth_rescue_queue_writes_inline_rather_than_dropping() {
         let dir = spill_tmp("depth-rescue-full");
         let mut w = DepthWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
-        let (_sink, _rx) = w.split_rescue_offload();
+        let (sink, rx) = w.split_rescue_offload();
         let unbacked = DepthRow {
             capture_seq: 0,
             ..row()
         };
 
-        for _ in 0..DEPTH_RESCUE_QUEUE_DEPTH {
+        // H4 (2026-10-03): the queue, then the park, absorb the burst.
+        for _ in 0..DEPTH_RESCUE_QUEUE_DEPTH + DEPTH_PARKED_RESCUE_MAX_BATCHES {
             w.append_row(&unbacked).expect("append");
             assert_eq!(w.discard_pending(), 1);
         }
+        assert!(
+            spill_files(&dir).is_empty(),
+            "queue and park absorb the burst without a file write on the drain"
+        );
         w.append_row(&unbacked).expect("append");
         assert_eq!(w.discard_pending(), 1);
 
         assert!(
             !spill_files(&dir).is_empty(),
-            "with the queue full the rescue must have been written inline"
+            "with the queue and the park full the rescue must have been written inline"
         );
+        settle_depth_rescues(&mut w, &sink, &rx);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3407,12 +3593,14 @@ mod tests {
 
     /// 2026-10-02: depth rows from a frame the WAL REFUSED carry a real capture
     /// sequence yet exist in no WAL segment. Marked unbacked, a full rescue
-    /// queue must spill them inline, never defer them to the WAL.
+    /// queue must spill them, never defer them to the WAL. Since H4
+    /// (2026-10-03) they are parked first, and reach the rescue thread once
+    /// it has room.
     #[test]
     fn mark_pending_unbacked_keeps_depth_rows_in_the_inline_spill() {
         let dir = spill_tmp("depth-rescue-unbacked");
         let mut w = DepthWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
-        let (_sink, _rx) = w.split_rescue_offload();
+        let (sink, rx) = w.split_rescue_offload();
 
         for _ in 0..DEPTH_RESCUE_QUEUE_DEPTH {
             w.append_row(&row()).expect("append");
@@ -3423,11 +3611,65 @@ mod tests {
         w.mark_pending_unbacked();
         assert!(w.pending_unbacked());
         assert_eq!(w.discard_pending(), 1, "the rows are accounted for");
+        assert_eq!(
+            w.parked_rescue.len(),
+            1,
+            "parked, never dropped as WAL-backed"
+        );
+        assert!(spill_files(&dir).is_empty(), "and not written on the drain");
+        assert!(!w.pending_unbacked(), "discard_pending consumes the mark");
+        for _ in 0..DEPTH_RESCUE_QUEUE_DEPTH {
+            sink.rescue(&rx.try_recv().expect("queued"));
+        }
+        w.flush().expect("nothing pending");
+        assert!(w.parked_rescue.is_empty());
+        let handed: Vec<_> = rx.try_iter().collect();
+        assert_eq!(handed.len(), 1, "the parked rows reached the thread");
+        for batch in &handed {
+            sink.rescue(batch);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// H4: shutdown hands the depth park to the rescue thread; a dead thread
+    /// gets the parked rows written inline, never dropped.
+    #[test]
+    fn test_regression_h4_the_depth_park_is_handed_on_or_written_never_dropped() {
+        let dir = spill_tmp("depth-h4-park");
+        let mut w = DepthWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (_sink, rx) = w.split_rescue_offload();
+        let unbacked = DepthRow {
+            capture_seq: 0,
+            ..row()
+        };
+        for _ in 0..DEPTH_RESCUE_QUEUE_DEPTH + 2 {
+            w.append_row(&unbacked).expect("append");
+            assert_eq!(w.discard_pending(), 1);
+        }
+        assert_eq!(w.parked_rescue.len(), 2);
+        for _ in 0..DEPTH_RESCUE_QUEUE_DEPTH {
+            rx.try_recv().expect("queued");
+        }
+        // One slot's worth goes on at close; the queue holds two, so both fit.
+        w.close_rescue_offload();
+        assert!(w.parked_rescue.is_empty());
+        assert_eq!(rx.try_iter().count(), 2);
+        assert!(spill_files(&dir).is_empty());
+
+        // A dead thread: the parked batch is written inline on the retry.
+        let mut w = DepthWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (_sink, rx) = w.split_rescue_offload();
+        for _ in 0..DEPTH_RESCUE_QUEUE_DEPTH + 1 {
+            w.append_row(&unbacked).expect("append");
+            assert_eq!(w.discard_pending(), 1);
+        }
+        drop(rx);
+        w.flush().expect("nothing pending");
+        assert!(w.parked_rescue.is_empty());
         assert!(
             !spill_files(&dir).is_empty(),
-            "an unbacked depth row must be written inline, never dropped as WAL-backed"
+            "the parked rows must be on disk"
         );
-        assert!(!w.pending_unbacked(), "discard_pending consumes the mark");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

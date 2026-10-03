@@ -87,14 +87,76 @@ fn off_drain_paths_sync_and_the_drain_inline_path_does_not() {
             unsynced, 1,
             "{file}: only the drain inline spill is unsynced"
         );
+        // H4 (2026-10-03): the one unsynced call lives in `spill_on_drain`,
+        // shared by `discard_pending` and the park's thread-gone arm.
+        assert!(
+            body_of(&src, "fn spill_on_drain(").contains("SPILL_UNSYNCED_ON_DRAIN"),
+            "{file}: the unsynced call must be the drain's spill_on_drain"
+        );
         let discard = body_of(&src, "pub fn discard_pending(");
         assert!(
-            discard.contains("SPILL_UNSYNCED_ON_DRAIN"),
-            "{file}: the unsynced call must be the drain's discard_pending"
+            discard.contains("self.spill_on_drain("),
+            "{file}: discard_pending must spill through spill_on_drain"
+        );
+        for drain_fn in [
+            "pub fn discard_pending(",
+            "fn retry_parked_rescue(",
+            "fn park_rescue(",
+            "fn spill_parked_on_drain(",
+        ] {
+            assert!(
+                !body_of(&src, drain_fn).contains("SPILL_SYNC_OFF_DRAIN"),
+                "{file}: {drain_fn} runs on the drain and must never block on an fsync"
+            );
+        }
+    }
+}
+
+/// H4 (2026-10-03): the drain PARKS a rescue it cannot hand off instead of
+/// writing it to disk, and never WAITS to hand a parked batch on. Only the
+/// shutdown close may block on the send.
+#[test]
+fn the_drain_parks_a_refused_rescue_and_never_waits_to_retry_it() {
+    for (file, max) in [
+        (
+            "tick_persistence.rs",
+            "pub const PARKED_RESCUE_MAX_BATCHES: usize = 8;",
+        ),
+        (
+            "depth_persistence.rs",
+            "pub const DEPTH_PARKED_RESCUE_MAX_BATCHES: usize = 8;",
+        ),
+    ] {
+        let src = production(file);
+        assert!(src.contains(max), "{file}: tick and depth share one bound");
+        let discard = body_of(&src, "pub fn discard_pending(");
+        let retry = discard
+            .find("self.retry_parked_rescue();")
+            .unwrap_or_else(|| panic!("{file}: discard_pending retries the park"));
+        let send = discard.find("try_send(batch)").expect("hand-off");
+        assert!(retry < send, "{file}: older parked batches go first");
+        let park = discard
+            .find("self.park_rescue(returned);")
+            .unwrap_or_else(|| panic!("{file}: a full queue parks"));
+        let inline = discard.find("self.spill_on_drain(").expect("inline");
+        assert!(
+            park < inline,
+            "{file}: the park is tried before the inline spill"
+        );
+        let retry_body = body_of(&src, "fn retry_parked_rescue(");
+        assert!(retry_body.contains("try_send(batch)"));
+        assert!(
+            !retry_body.contains(".send(batch)"),
+            "{file}: the drain must never wait on the rescue queue"
         );
         assert!(
-            !discard.contains("SPILL_SYNC_OFF_DRAIN"),
-            "{file}: the drain must never block on an fsync"
+            body_of(&src, "pub fn flush(&mut self)").contains("self.retry_parked_rescue();"),
+            "{file}: every flush retries the park"
+        );
+        let close = body_of(&src, "pub fn close_rescue_offload(");
+        assert!(
+            close.contains("tx.send(batch)"),
+            "{file}: shutdown hands every parked batch to the rescue thread"
         );
     }
 }
