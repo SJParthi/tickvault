@@ -1825,6 +1825,17 @@ pub struct TickWriter {
     /// the rescue exists precisely for the two cases where the offload queue
     /// cannot help — it is FULL, or its thread is GONE.
     rescue: Option<std::sync::mpsc::SyncSender<RescueBatch>>,
+    /// Rescue batches that met a FULL rescue queue and would otherwise have
+    /// been written to disk on the frame drain (H4, 2026-10-03): rows with no
+    /// write-ahead-log backing, which the WAL cannot defer. Parked in RAM
+    /// while [`PARKED_RESCUE_MAX_BATCHES`] and [`PARKED_RESCUE_MAX_BYTES`]
+    /// allow, retried at the start of every flush and every rescue, and handed
+    /// to the rescue thread by [`TickPersistenceWriter::close_rescue_offload`]
+    /// at shutdown. Each keeps its watermark floor while parked. Pre-sized by
+    /// [`TickWriter::split_rescue_offload`], so parking never allocates.
+    parked_rescue: std::collections::VecDeque<RescueBatch>,
+    /// ILP bytes held in `parked_rescue`.
+    parked_rescue_bytes: usize,
     /// Consecutive flushes whose rows the producer RETAINED because the queue
     /// was full. Reset to zero on every successful hand-off.
     ///
@@ -2147,6 +2158,8 @@ impl TickWriter {
                     spill_dir: PathBuf::from(TICK_SPILL_DIR),
                     offload: None,
                     rescue: None,
+                    parked_rescue: std::collections::VecDeque::new(),
+                    parked_rescue_bytes: 0,
                     retained_spans: 0,
                     flush_counters: TickFlushCounters::new(feed),
                     spare_buffers: None,
@@ -2173,6 +2186,8 @@ impl TickWriter {
                     spill_dir: PathBuf::from(TICK_SPILL_DIR),
                     offload: None,
                     rescue: None,
+                    parked_rescue: std::collections::VecDeque::new(),
+                    parked_rescue_bytes: 0,
                     retained_spans: 0,
                     flush_counters: TickFlushCounters::new(feed),
                     spare_buffers: None,
@@ -2217,6 +2232,8 @@ impl TickWriter {
             spill_dir: PathBuf::from(TICK_SPILL_DIR),
             offload: None,
             rescue: None,
+            parked_rescue: std::collections::VecDeque::new(),
+            parked_rescue_bytes: 0,
             retained_spans: 0,
             flush_counters: TickFlushCounters::new(feed),
             spare_buffers: None,
@@ -2677,6 +2694,9 @@ impl TickWriter {
     /// # Errors
     /// `Err` when disconnected or when the HTTP flush fails.
     pub fn flush(&mut self) -> Result<()> {
+        // H4: a parked rescue goes to its thread before anything else, so a
+        // quiet stretch with nothing pending still empties the park.
+        self.retry_parked_rescue();
         if self.pending == 0 {
             return Ok(());
         }
@@ -2845,6 +2865,8 @@ impl TickWriter {
             spill_sync: SPILL_SYNC_OFF_DRAIN,
         };
         self.rescue = Some(tx);
+        // Once per process, so a park on the drain never allocates.
+        self.parked_rescue.reserve_exact(PARKED_RESCUE_MAX_BATCHES);
         (sink, rx)
     }
 
@@ -2853,8 +2875,122 @@ impl TickWriter {
     /// Shutdown-only, and it leaves the writer in the INLINE state on purpose:
     /// a rescue after this point writes synchronously rather than being
     /// refused, so the end-of-session rows still reach the spill tier.
+    ///
+    /// H4 (2026-10-03): every parked batch is handed to the rescue thread
+    /// first, with a BLOCKING send. Shutdown only: waiting for the thread to
+    /// take one batch costs no more than the inline write it replaces, and the
+    /// thread syncs the file where an inline write would not. A thread that is
+    /// already gone gets the batch written inline instead, never dropped.
     pub fn close_rescue_offload(&mut self) {
-        self.rescue = None;
+        if let Some(tx) = self.rescue.take() {
+            while let Some(batch) = self.parked_rescue.pop_front() {
+                self.parked_rescue_bytes = self
+                    .parked_rescue_bytes
+                    .saturating_sub(batch.buffer.as_bytes().len());
+                let rows = batch.rows;
+                match tx.send(batch) {
+                    Ok(()) => self.flush_counters.rescue_queued.increment(rows as u64),
+                    Err(std::sync::mpsc::SendError(batch)) => {
+                        self.flush_counters.rescue_fallback_thread_gone.increment(1);
+                        self.spill_parked_on_drain(batch);
+                    }
+                }
+            }
+        }
+        // Unreachable with batches still parked (only a split writer parks),
+        // and written inline rather than dropped if it ever is.
+        while let Some(batch) = self.parked_rescue.pop_front() {
+            self.spill_parked_on_drain(batch);
+        }
+        self.parked_rescue_bytes = 0;
+        self.flush_counters.rescue_parked_bytes.set(0.0);
+    }
+
+    /// True when `batch` fits in the park without passing either bound.
+    fn park_rescue_fits(&self, batch: &RescueBatch) -> bool {
+        self.parked_rescue.len() < PARKED_RESCUE_MAX_BATCHES
+            && self
+                .parked_rescue_bytes
+                .saturating_add(batch.buffer.as_bytes().len())
+                <= PARKED_RESCUE_MAX_BYTES
+    }
+
+    /// Parks one refused rescue batch in RAM (H4). O(1), no allocation (the
+    /// queue was pre-sized when the rescue was split), floor kept.
+    fn park_rescue(&mut self, batch: RescueBatch) {
+        self.parked_rescue_bytes = self
+            .parked_rescue_bytes
+            .saturating_add(batch.buffer.as_bytes().len());
+        self.flush_counters
+            .rescue_parked
+            .increment(batch.rows as u64);
+        self.parked_rescue.push_back(batch);
+        self.flush_counters
+            .rescue_parked_bytes
+            .set(self.parked_rescue_bytes as f64);
+    }
+
+    /// Hands parked rescue batches to the rescue thread, oldest first, until
+    /// its queue is full again (H4). One branch when nothing is parked;
+    /// otherwise at most [`PARKED_RESCUE_MAX_BATCHES`] `try_send`s, never a
+    /// wait. A thread that has gone is the one case written inline, exactly
+    /// as an unparked rescue would be.
+    fn retry_parked_rescue(&mut self) {
+        if self.parked_rescue.is_empty() {
+            return;
+        }
+        while let Some(batch) = self.parked_rescue.pop_front() {
+            let bytes = batch.buffer.as_bytes().len();
+            let rows = batch.rows as u64;
+            let Some(tx) = self.rescue.as_ref() else {
+                self.parked_rescue_bytes = self.parked_rescue_bytes.saturating_sub(bytes);
+                self.spill_parked_on_drain(batch);
+                continue;
+            };
+            match tx.try_send(batch) {
+                Ok(()) => {
+                    self.parked_rescue_bytes = self.parked_rescue_bytes.saturating_sub(bytes);
+                    self.flush_counters.rescue_queued.increment(rows);
+                }
+                Err(std::sync::mpsc::TrySendError::Full(batch)) => {
+                    // Back to the FRONT: the capacity the pop freed is reused.
+                    self.parked_rescue.push_front(batch);
+                    break;
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(batch)) => {
+                    self.parked_rescue_bytes = self.parked_rescue_bytes.saturating_sub(bytes);
+                    self.flush_counters.rescue_fallback_thread_gone.increment(1);
+                    self.spill_parked_on_drain(batch);
+                }
+            }
+        }
+        self.flush_counters
+            .rescue_parked_bytes
+            .set(self.parked_rescue_bytes as f64);
+    }
+
+    /// Writes a parked batch inline, the one place a PARKED batch can reach
+    /// the disk on the drain (thread gone). Completes it exactly as the rescue
+    /// thread would: outcome, floor, completion count.
+    fn spill_parked_on_drain(&self, batch: RescueBatch) {
+        let landed = self.spill_on_drain(batch.buffer.as_bytes(), batch.rows);
+        note_rescue_outcome_ticks(landed, (batch.min_seq, batch.max_seq), false);
+        let wm = crate::wal_applied_watermark::applied_watermark();
+        if let Some(floor) = batch.floor {
+            wm.release_rescue_floor(floor);
+        }
+        wm.note_ticks_completed();
+    }
+
+    /// The drain's only spill write, NOT synced (see `SPILL_UNSYNCED_ON_DRAIN`).
+    fn spill_on_drain(&self, payload: &[u8], rows: usize) -> bool {
+        perform_tick_rescue(
+            &self.spill_dir,
+            payload,
+            self.feed,
+            rows,
+            SPILL_UNSYNCED_ON_DRAIN,
+        )
     }
 
     /// Hands the pending buffer to the writer thread without touching the
@@ -3012,6 +3148,9 @@ impl TickWriter {
         // Off-drain hand-off. O(1), no syscall, no allocation: the `Buffer` is
         // MOVED, and the replacement is the same empty one `offload_flush`
         // already installs on every successful hand-off.
+        // H4: older parked batches go to the thread first, so a freed slot is
+        // not taken by this newer one ahead of them.
+        self.retry_parked_rescue();
         let range = self.take_pending_range();
         let unbacked = std::mem::take(&mut self.pending_unbacked);
         let mut rescue_unavailable = false;
@@ -3048,6 +3187,18 @@ impl TickWriter {
                     return dropped;
                 }
                 Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                    // H4 (2026-10-03): rows the WAL cannot defer (no capture
+                    // sequence, or a frame the WAL refused) would be written
+                    // to disk on the drain below. Park them in RAM instead
+                    // while the bound allows; the next flush retries. The
+                    // floor stays held, since the batch is still on its way.
+                    if (range.0 == 0 || unbacked) && self.park_rescue_fits(&returned) {
+                        self.park_rescue(returned);
+                        wm.note_ticks_handed_off();
+                        self.pending = 0;
+                        self.install_spare_buffer(protocol);
+                        return dropped;
+                    }
                     // The rescue thread is behind. Take the buffer BACK and
                     // write inline below — slower, but nothing is lost and
                     // nothing is reported as lost.
@@ -3110,14 +3261,9 @@ impl TickWriter {
             return dropped;
         }
 
-        // The drain's inline spill is NOT synced (see `SPILL_UNSYNCED_ON_DRAIN`).
-        let landed = perform_tick_rescue(
-            &self.spill_dir,
-            self.buffer.as_bytes(),
-            self.feed,
-            dropped,
-            SPILL_UNSYNCED_ON_DRAIN,
-        );
+        // Past the park's bound, a gone thread, or no rescue split at all:
+        // the drain's inline spill, NOT synced (see `spill_on_drain`).
+        let landed = self.spill_on_drain(self.buffer.as_bytes(), dropped);
         note_rescue_outcome_ticks(landed, range, false);
         self.buffer.clear();
         self.pending = 0;
@@ -3239,6 +3385,31 @@ fn perform_tick_rescue(
 /// would hold more rows in memory that exist nowhere else, which is the trade
 /// the whole rescue tier exists to avoid.
 pub const RESCUE_QUEUE_DEPTH: usize = 2;
+
+/// Rescue batches the drain may PARK in RAM when the rescue queue is full,
+/// instead of writing them to disk itself (H4, 2026-10-03).
+///
+/// Only rows the WAL cannot defer are parked (no capture sequence, or a frame
+/// the WAL refused); every other refused rescue is handed to the WAL as before.
+/// The trade, stated plainly: a parked batch exists only in this process
+/// until the rescue thread writes it, exactly like a batch in the queue
+/// above, so a CRASH loses it where the old inline write would have kept it.
+/// What the park buys is that a slow disk no longer stalls the drain, which is
+/// the stall that makes Dhan skip ticks at its own side, uncounted. Past
+/// either bound the drain writes inline exactly as before, counted on
+/// `tv_tick_rescue_inline_fallback_total`.
+pub const PARKED_RESCUE_MAX_BATCHES: usize = 8;
+
+/// Byte bound on the park: four producer buffers at their cut-over size.
+/// 128 MiB per sink, held only while the disk is slower than the drain.
+pub const PARKED_RESCUE_MAX_BYTES: usize = 4 * MAX_PRODUCER_BUFFER_BYTES;
+
+/// Rows parked in RAM by the drain (H4). Not a loss counter: the matching
+/// `tv_tick_rescue_queued_total` increment comes when the park hands them on.
+pub const TICK_RESCUE_PARKED_COUNTER: &str = "tv_tick_rescue_parked_total";
+
+/// ILP bytes parked in RAM right now (H4).
+pub const TICK_RESCUE_PARKED_BYTES_GAUGE: &str = "tv_tick_rescue_parked_bytes";
 
 /// Rows handed to the rescue thread rather than written on the drain.
 ///
@@ -3478,6 +3649,10 @@ struct TickFlushCounters {
     rescue_queued: metrics::Counter,
     rescue_fallback_queue_full: metrics::Counter,
     rescue_fallback_thread_gone: metrics::Counter,
+    /// Rows parked in RAM by the drain (H4).
+    rescue_parked: metrics::Counter,
+    /// ILP bytes parked in RAM right now (H4).
+    rescue_parked_bytes: metrics::Gauge,
     /// `tv_ticks_dropped_total` on the ILP-append failure arm. Its seed stays
     /// in [`register_drop_baseline`]; this is the same series, pre-resolved.
     append_dropped: metrics::Counter,
@@ -3507,6 +3682,8 @@ impl TickFlushCounters {
                 "feed" => feed,
                 "reason" => "thread_gone"
             ),
+            rescue_parked: metrics::counter!(TICK_RESCUE_PARKED_COUNTER, "feed" => feed),
+            rescue_parked_bytes: metrics::gauge!(TICK_RESCUE_PARKED_BYTES_GAUGE, "feed" => feed),
             append_dropped: metrics::counter!("tv_ticks_dropped_total", "feed" => feed),
             // Literal, not the const, so the shipped-metrics guard can see it.
             rescue_deferred_to_wal: metrics::counter!(
@@ -5650,6 +5827,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Settles every queued and parked rescue batch through the sink, so the
+    /// watermark floors they hold are released for the other tests sharing
+    /// the process-wide floor table.
+    fn settle_rescues(
+        w: &mut TickWriter,
+        sink: &TickRescueSink,
+        rx: &std::sync::mpsc::Receiver<RescueBatch>,
+    ) {
+        loop {
+            while let Ok(batch) = rx.try_recv() {
+                sink.rescue(&batch);
+            }
+            if w.parked_rescue.is_empty() {
+                break;
+            }
+            let _ = w.flush();
+        }
+    }
+
     /// A full rescue queue falls back to the OLD behaviour, never to a drop.
     ///
     /// The whole point of the fallback: a slow drain is bad, a lost tick is
@@ -5660,27 +5856,159 @@ mod tests {
     /// write-ahead-log backing (a minted sequence, as `append_tick` uses).
     /// WAL-backed rows are deferred to the WAL instead — see
     /// `full_rescue_queue_defers_to_wal_without_file_io`.
+    ///
+    /// H4 (2026-10-03): the drain first PARKS such a batch in RAM, up to
+    /// [`PARKED_RESCUE_MAX_BATCHES`]; only past that bound does it write inline.
     #[test]
     fn a_full_rescue_queue_writes_inline_rather_than_dropping() {
         let dir = scratch_dir("rescue-full");
         let mut w = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
-        let (_sink, _rx) = w.split_rescue_offload();
+        let (sink, rx) = w.split_rescue_offload();
 
-        // Fill the queue: RESCUE_QUEUE_DEPTH payloads with nothing draining.
-        for _ in 0..RESCUE_QUEUE_DEPTH {
+        // Fill the queue, then the park, with nothing draining.
+        for _ in 0..RESCUE_QUEUE_DEPTH + PARKED_RESCUE_MAX_BATCHES {
             w.append_tick(&sample_tick()).expect("append");
             assert_eq!(w.discard_pending(), 1);
         }
-        // The next one cannot be queued and must therefore land on disk.
+        assert_eq!(
+            std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0),
+            0,
+            "queue and park absorb the burst without a file write on the drain"
+        );
+        // The next one fits nowhere and must therefore land on disk.
         w.append_tick(&sample_tick()).expect("append");
         assert_eq!(w.discard_pending(), 1);
 
         let files = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
         assert!(
             files > 0,
-            "with the queue full the rescue must have been written inline"
+            "with the queue and the park full the rescue must have been written inline"
+        );
+        settle_rescues(&mut w, &sink, &rx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// H4: a parked batch reaches the rescue thread on the next flush once the
+    /// queue has room, even with nothing pending, and oldest first.
+    #[test]
+    fn test_regression_h4_a_parked_rescue_is_handed_on_by_the_next_flush() {
+        let dir = scratch_dir("h4-park-retry");
+        let mut w = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (sink, rx) = w.split_rescue_offload();
+        for _ in 0..RESCUE_QUEUE_DEPTH + 2 {
+            w.append_tick(&sample_tick()).expect("append");
+            assert_eq!(w.discard_pending(), 1);
+        }
+        assert_eq!(w.parked_rescue.len(), 2, "two batches parked");
+        // The rescue thread takes what was queued.
+        let mut settled = Vec::new();
+        for _ in 0..RESCUE_QUEUE_DEPTH {
+            settled.push(rx.try_recv().expect("queued"));
+        }
+        w.flush()
+            .expect("nothing pending; the flush still retries the park");
+        assert!(
+            w.parked_rescue.is_empty(),
+            "the park emptied into the queue"
+        );
+        assert_eq!(w.parked_rescue_bytes, 0);
+        settled.extend(rx.try_iter());
+        assert_eq!(
+            settled.len(),
+            RESCUE_QUEUE_DEPTH + 2,
+            "both parked batches were handed on"
+        );
+        assert_eq!(
+            std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0),
+            0,
+            "nothing was written on the drain"
+        );
+        for batch in &settled {
+            sink.rescue(batch);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// H4: shutdown hands every parked batch to the rescue thread before the
+    /// queue closes, so nothing parked is left behind.
+    #[test]
+    fn test_regression_h4_closing_the_rescue_queue_hands_on_the_park() {
+        let dir = scratch_dir("h4-park-close");
+        let mut w = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (sink, rx) = w.split_rescue_offload();
+        for _ in 0..RESCUE_QUEUE_DEPTH + 1 {
+            w.append_tick(&sample_tick()).expect("append");
+            assert_eq!(w.discard_pending(), 1);
+        }
+        assert_eq!(w.parked_rescue.len(), 1);
+        for _ in 0..RESCUE_QUEUE_DEPTH {
+            sink.rescue(&rx.try_recv().expect("queued"));
+        }
+        w.close_rescue_offload();
+        assert!(w.parked_rescue.is_empty());
+        let handed: Vec<_> = rx.try_iter().collect();
+        assert_eq!(handed.len(), 1, "the parked batch reached the thread");
+        for batch in &handed {
+            sink.rescue(batch);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// H4: a parked batch whose rescue thread dies is written inline on the
+    /// next retry, never dropped.
+    #[test]
+    fn test_regression_h4_a_parked_rescue_survives_a_dead_rescue_thread() {
+        let dir = scratch_dir("h4-park-dead");
+        let mut w = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (sink, rx) = w.split_rescue_offload();
+        for _ in 0..RESCUE_QUEUE_DEPTH + 1 {
+            w.append_tick(&sample_tick()).expect("append");
+            assert_eq!(w.discard_pending(), 1);
+        }
+        assert_eq!(w.parked_rescue.len(), 1);
+        while let Ok(batch) = rx.try_recv() {
+            sink.rescue(&batch);
+        }
+        // The thread dies with the batch still parked.
+        drop(rx);
+        let _ = w.flush();
+        assert!(w.parked_rescue.is_empty());
+        assert!(
+            std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0) > 0,
+            "the parked rows must be on disk"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// H4: WAL-backed rows are never parked; the WAL defers them as before.
+    #[test]
+    fn test_regression_h4_wal_backed_rows_are_deferred_not_parked() {
+        let dir = scratch_dir("h4-park-backed");
+        let mut w = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (sink, rx) = w.split_rescue_offload();
+        for k in 0..RESCUE_QUEUE_DEPTH as i64 + 1 {
+            w.append_tick_with_seq(&sample_tick(), (1 << 20) + k)
+                .expect("append");
+            assert_eq!(w.discard_pending(), 1);
+        }
+        assert!(w.parked_rescue.is_empty(), "backed rows go to the WAL");
+        settle_rescues(&mut w, &sink, &rx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// H4: the park stays within its byte bound, and the bound is the same
+    /// on the tick and depth writers.
+    #[test]
+    fn the_rescue_park_is_bounded_like_the_depth_one() {
+        assert_eq!(
+            PARKED_RESCUE_MAX_BATCHES,
+            crate::depth_persistence::DEPTH_PARKED_RESCUE_MAX_BATCHES
+        );
+        assert_eq!(
+            PARKED_RESCUE_MAX_BYTES,
+            crate::depth_persistence::DEPTH_PARKED_RESCUE_MAX_BYTES
+        );
+        assert!(PARKED_RESCUE_MAX_BYTES <= 128 * 1024 * 1024);
     }
 
     /// A writer that was never split behaves exactly as before.
