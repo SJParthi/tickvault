@@ -956,6 +956,182 @@ mod tests {
     }
 
     #[test]
+    fn test_commit_pending_moves_pending_into_committed() {
+        let mut written = BootWritten::new(16);
+        let first = copy_of(21, 2, TfIndex::M1, 600, 3, 30);
+        assert!(written.record(&first));
+        // Appended, not yet flushed: nothing committed, nothing persisted.
+        assert_eq!(written.committed_len(), 0);
+        assert_eq!(written.encode_committed(16).0.len(), 16 + 4);
+
+        written.commit_pending();
+        assert_eq!(written.committed_len(), 1);
+        assert!(written.pending.is_empty(), "the batch is consumed");
+        // A second commit with nothing pending changes nothing.
+        written.commit_pending();
+        assert_eq!(written.committed_len(), 1);
+
+        // A fuller copy appended and committed raises the committed copy.
+        let fuller = copy_of(21, 2, TfIndex::M1, 600, 5, 50);
+        assert!(written.record(&fuller));
+        written.commit_pending();
+        let (bytes, _) = written.encode_committed(16);
+        let mut next = BootWritten::new(16);
+        next.seed_from_bytes(&bytes).expect("valid");
+        assert!(next.is_older(&first), "the fuller copy was committed");
+        assert!(!next.is_older(&fuller));
+
+        // A fuller copy whose flush FAILED leaves the committed copy where it
+        // was, although the drain still compares against the fuller one.
+        let failed = copy_of(21, 2, TfIndex::M1, 600, 9, 90);
+        assert!(written.record(&failed));
+        written.discard_pending();
+        written.commit_pending();
+        assert!(written.is_older(&fuller), "appended copy still compared");
+        let (bytes, _) = written.encode_committed(16);
+        let mut next = BootWritten::new(16);
+        next.seed_from_bytes(&bytes).expect("valid");
+        assert!(
+            !next.is_older(&fuller),
+            "the uncommitted fuller copy is never persisted"
+        );
+    }
+
+    #[test]
+    fn test_committed_len_counts_only_committed() {
+        let mut written = BootWritten::new(16);
+        assert_eq!(written.committed_len(), 0, "empty record");
+        for bucket in [600, 660, 720] {
+            assert!(written.record(&copy_of(22, 2, TfIndex::M1, bucket, 1, 1)));
+        }
+        written.commit_pending();
+        assert_eq!(written.committed_len(), 3);
+        // Two more bars appended, then their flush fails: still three.
+        assert!(written.record(&copy_of(22, 2, TfIndex::M1, 780, 1, 1)));
+        assert!(written.record(&copy_of(22, 2, TfIndex::M5, 600, 1, 1)));
+        written.discard_pending();
+        assert_eq!(written.committed_len(), 3);
+        // A bar committed twice is counted once.
+        assert!(written.record(&copy_of(22, 2, TfIndex::M1, 600, 2, 2)));
+        written.commit_pending();
+        assert_eq!(written.committed_len(), 3);
+        // The same key in another segment is another bar (I-P1-11).
+        assert!(written.record(&copy_of(22, 1, TfIndex::M1, 600, 1, 1)));
+        written.commit_pending();
+        assert_eq!(written.committed_len(), 4);
+        // Seeded bars count as committed.
+        let mut seeded = BootWritten::new(16);
+        seeded
+            .seed_from_bytes(&written.encode_committed(16).0)
+            .expect("valid");
+        assert_eq!(seeded.committed_len(), 4);
+    }
+
+    #[test]
+    fn test_encode_committed_then_seed_from_bytes_round_trips() {
+        let mut written = BootWritten::new(16);
+        let bars = [
+            copy_of(u64::MAX, 2, TfIndex::M1, 600, u32::MAX, u64::MAX),
+            copy_of(23, 1, TfIndex::M5, u32::MAX - 59, 7, 70),
+            copy_of(23, 2, TfIndex::M5, 900, 4, 0),
+        ];
+        for bar in &bars {
+            assert!(written.record(bar));
+        }
+        written.commit_pending();
+
+        let (bytes, dropped) = written.encode_committed(16);
+        assert_eq!(dropped, 0);
+        assert_eq!(&bytes[..8], b"TVBWSUM1");
+        assert_eq!(
+            bytes.len(),
+            16 + bars.len() * 27 + 4,
+            "header, one fixed record per bar, CRC trailer"
+        );
+        let mut next = BootWritten::new(16);
+        assert_eq!(
+            next.seed_from_bytes(&bytes),
+            Ok(BootSummarySeeded {
+                seeded: 3,
+                untracked: 0
+            })
+        );
+        // Every bar, at its boundary values, comes back exactly: the same
+        // copy is not older, one tick fewer is.
+        for bar in &bars {
+            assert!(!next.is_older(bar));
+        }
+        assert!(next.is_older(&copy_of(
+            u64::MAX,
+            2,
+            TfIndex::M1,
+            600,
+            u32::MAX - 1,
+            u64::MAX
+        )));
+        assert!(next.is_older(&copy_of(23, 1, TfIndex::M5, u32::MAX - 59, 6, 70)));
+        assert!(next.is_older(&copy_of(23, 2, TfIndex::M5, 900, 3, 0)));
+        // A copy under a key the file never held is not refused.
+        assert!(!next.is_older(&copy_of(23, 3, TfIndex::M5, 900, 1, 0)));
+        // Re-encoding the seeded record yields as many bars.
+        assert_eq!(next.encode_committed(16).0.len(), bytes.len());
+
+        // max_bars truncates and counts; zero keeps none and is still valid.
+        let (two, dropped) = written.encode_committed(2);
+        assert_eq!(dropped, 1);
+        assert_eq!(
+            BootWritten::new(16).seed_from_bytes(&two).map(|s| s.seeded),
+            Ok(2)
+        );
+        let (none, dropped) = written.encode_committed(0);
+        assert_eq!(dropped, 3);
+        assert_eq!(none.len(), 16 + 4);
+        assert_eq!(
+            BootWritten::new(16).seed_from_bytes(&none),
+            Ok(BootSummarySeeded::default())
+        );
+        // An empty record encodes as the same empty, valid summary.
+        let (empty, dropped) = BootWritten::new(16).encode_committed(16);
+        assert_eq!(dropped, 0);
+        assert_eq!(empty, none);
+
+        // Seeding into a record that already holds a fuller copy keeps the
+        // fuller one; a fuller seeded copy raises a smaller one.
+        let mut holder = BootWritten::new(16);
+        assert!(holder.record(&copy_of(23, 2, TfIndex::M5, 900, 9, 0)));
+        assert!(holder.record(&copy_of(23, 1, TfIndex::M5, u32::MAX - 59, 1, 1)));
+        holder.seed_from_bytes(&bytes).expect("valid");
+        assert!(holder.is_older(&copy_of(23, 2, TfIndex::M5, 900, 4, 0)));
+        assert!(!holder.is_older(&copy_of(23, 1, TfIndex::M5, u32::MAX - 59, 7, 70)));
+        assert!(holder.is_older(&copy_of(23, 1, TfIndex::M5, u32::MAX - 59, 1, 1)));
+
+        // A record count that claims more records than the bytes hold (here
+        // one that would overflow) is refused on length, and nothing seeds.
+        let mut lying = bytes.clone();
+        lying[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+        let mut probe = BootWritten::new(16);
+        assert_eq!(
+            probe.seed_from_bytes(&lying),
+            Err(BootSummaryRefused::Length)
+        );
+        assert_eq!(probe.committed_len(), 0, "nothing seeded from a refusal");
+        // A damaged record body is refused whole.
+        let mut flipped = bytes.clone();
+        let last_record_byte = bytes.len() - 5;
+        flipped[last_record_byte] ^= 0x80;
+        assert_eq!(
+            probe.seed_from_bytes(&flipped),
+            Err(BootSummaryRefused::Checksum)
+        );
+        assert_eq!(probe.committed_len(), 0);
+        // A wrong layout version is refused on magic, even with a valid CRC
+        // over an otherwise empty summary.
+        let (mut v2, _) = BootWritten::new(16).encode_committed(16);
+        v2[7] = b'2';
+        assert_eq!(probe.seed_from_bytes(&v2), Err(BootSummaryRefused::Magic));
+    }
+
+    #[test]
     fn test_regression_s1_summary_is_bounded_and_counts_what_it_drops() {
         let mut written = BootWritten::new(16);
         for bucket in [600, 660, 720] {

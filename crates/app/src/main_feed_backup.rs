@@ -1539,6 +1539,99 @@ mod tests {
     }
 
     #[test]
+    fn test_write_backup_history_round_trips_through_read_backup_history() {
+        let (dir, _) = temp_path(b"write-history");
+        // A directory that does not exist yet, two levels deep: the write
+        // must create it.
+        let nested = dir.join("a").join("b");
+        let path = nested.join("set.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!nested.exists());
+
+        let history = history_of(&[(TEN_AM - 30 * MIN, &[42, 43]), (TEN_AM, &[44])]);
+        write_backup_history(&path, &history).expect("write");
+        assert!(path.is_file(), "the history lands at the path");
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "the temp file is renamed away, never left behind"
+        );
+        assert_eq!(
+            read_backup_history(&path).expect("readable"),
+            Some(history.clone()),
+            "what is written is what is read"
+        );
+
+        // A second write replaces the whole file, never appends to it.
+        let replacement = history_of(&[(TEN_AM + MIN, &[45])]);
+        write_backup_history(&path, &replacement).expect("rewrite");
+        assert_eq!(
+            read_backup_history(&path).expect("readable"),
+            Some(replacement)
+        );
+
+        // An empty history round-trips as empty, not as absent.
+        write_backup_history(&path, &PersistedBackupHistory::default()).expect("empty");
+        assert_eq!(
+            read_backup_history(&path).expect("readable"),
+            Some(PersistedBackupHistory::default())
+        );
+
+        // The writer stores what it is given; the reader bounds it. An
+        // oversized, unordered history with an instant-less entry reads back
+        // ascending, at most BACKUP_HISTORY_MAX, newest kept, none instant-less.
+        let seven: &[u64] = &[7];
+        let eight: &[u64] = &[8];
+        let mut oversized: Vec<(i64, &[u64])> = (0..(BACKUP_HISTORY_MAX as i64 + 4))
+            .rev()
+            .map(|i| (TEN_AM + i * MIN, seven))
+            .collect();
+        oversized.push((0, eight));
+        write_backup_history(&path, &history_of(&oversized)).expect("oversized");
+        let read = read_backup_history(&path)
+            .expect("readable")
+            .expect("saved");
+        assert_eq!(read.publications.len(), BACKUP_HISTORY_MAX);
+        assert!(read.publications.iter().all(|p| p.published_at_nanos > 0));
+        assert!(
+            read.publications
+                .windows(2)
+                .all(|w| w[0].published_at_nanos < w[1].published_at_nanos),
+            "ascending by instant"
+        );
+        assert_eq!(
+            read.latest().map(|p| p.published_at_nanos),
+            Some(TEN_AM + (BACKUP_HISTORY_MAX as i64 + 3) * MIN)
+        );
+
+        // A path whose parent is a FILE cannot be written: an error, never a
+        // silent success.
+        let blocked = path.join("under-a-file.json");
+        assert!(write_backup_history(&blocked, &history).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_process_epoch_nanos_is_stable_within_a_process() {
+        let first = process_epoch_nanos();
+        assert!(first > 0, "a real UTC instant, not the unset 0");
+        let now = chrono::Utc::now()
+            .timestamp_nanos_opt()
+            .expect("now fits i64 nanos");
+        assert!(first <= now, "read once, never in the future");
+        // Every later read, from any thread, is the same instant.
+        assert_eq!(process_epoch_nanos(), first);
+        let from_threads: Vec<i64> = (0..4)
+            .map(|_| std::thread::spawn(process_epoch_nanos))
+            .map(|h| h.join().expect("thread"))
+            .collect();
+        assert!(from_threads.iter().all(|&e| e == first));
+        // And it is what a publication from this process carries.
+        let set = PersistedBackupSet::from_set(&[], TEN_AM);
+        assert_eq!(set.process_started_at_nanos, first);
+    }
+
+    #[test]
     fn test_backup_set_path_sits_beside_the_other_daily_artifacts() {
         let path = backup_set_path();
         assert!(path.starts_with("data/instrument-cache"));
