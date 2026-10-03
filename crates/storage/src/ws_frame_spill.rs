@@ -977,8 +977,8 @@ pub struct WsFrameSpill {
 /// instant after the request, nothing queued before it was still in memory.
 /// A writer that has exited stores `u64::MAX`.
 ///
-/// `queued_bytes == 0` alone would not do: the writer releases a record's
-/// bytes when it RECEIVES it, before the batch is written and flushed.
+/// `queued_bytes == 0` alone would not do: the writer releases a batch's
+/// bytes once the batch is off the channel, before it is flushed.
 #[derive(Debug, Default)]
 struct AbortDrain {
     req: AtomicU64,
@@ -2318,13 +2318,48 @@ fn writer_loop(
     abort_drain: &AbortDrain,
     syncer: &WalSyncer,
 ) -> anyhow::Result<()> {
-    /// Releases a record's byte reservation the instant it leaves the channel.
+    /// Releases the byte reservations of one batch of records taken off the
+    /// channel, in ONE `fetch_sub` at the end of the drain loop.
     ///
-    /// Called on RECEIPT, never after the write — a record that fails to
+    /// Counted on RECEIPT, never after the write: a record that fails to
     /// persist has still left the queue, and holding its bytes would shrink
     /// the budget by exactly the amount a failing disk keeps producing.
-    fn release(queued_bytes: &AtomicU64, record: &WalRecord) {
-        queued_bytes.fetch_sub(record.frame.len() as u64, Ordering::Relaxed);
+    ///
+    /// Why a batch and not one `fetch_sub` per record (2026-10-03): the
+    /// socket readers `fetch_add` the same counter on every frame, so a
+    /// per-record release bounced its cache line between the writer and the
+    /// reader cores on every frame (`ws_reader/wal_append` doubled after the
+    /// byte budget landed in #2004). One release per batch of up to 257
+    /// records cuts the writer's writes to that line by the batch size.
+    ///
+    /// The cost: a batch's bytes stay reserved while that batch is written
+    /// into the segment buffer, and released before its flush. So a slow disk
+    /// holds at most ONE batch (≤ 257 frames, a few MiB) against a budget of
+    /// at least `WAL_QUEUE_MIN_BYTES` (256 MiB), never the backlog behind it.
+    /// `Drop` releases too, so a panic mid-batch (the supervisor respawns the
+    /// writer on the same counter) cannot leak them.
+    struct PendingRelease<'a> {
+        queued_bytes: &'a AtomicU64,
+        bytes: u64,
+    }
+
+    impl PendingRelease<'_> {
+        fn add(&mut self, record: &WalRecord) {
+            self.bytes = self.bytes.saturating_add(record.frame.len() as u64);
+        }
+
+        fn release(&mut self) {
+            if self.bytes != 0 {
+                self.queued_bytes.fetch_sub(self.bytes, Ordering::Relaxed);
+                self.bytes = 0;
+            }
+        }
+    }
+
+    impl Drop for PendingRelease<'_> {
+        fn drop(&mut self) {
+            self.release();
+        }
     }
 
     // `None` = no open segment; the next record reopens one. A transient disk
@@ -2438,7 +2473,11 @@ fn writer_loop(
             }
         };
 
-        release(queued_bytes, &first);
+        let mut pending = PendingRelease {
+            queued_bytes,
+            bytes: 0,
+        };
+        pending.add(&first);
         #[cfg(test)]
         maybe_test_panic(&first);
         bytes_written +=
@@ -2448,7 +2487,7 @@ fn writer_loop(
         for _ in 0..256 {
             match rx.try_recv() {
                 Ok(r) => {
-                    release(queued_bytes, &r);
+                    pending.add(&r);
                     #[cfg(test)]
                     maybe_test_panic(&r);
                     bytes_written +=
@@ -2457,6 +2496,8 @@ fn writer_loop(
                 Err(_) => break,
             }
         }
+        // The whole batch has left the channel: one release, before the flush.
+        pending.release();
 
         match current.as_mut().map(Write::flush) {
             Some(Ok(())) => tally.flushed(),
@@ -9593,6 +9634,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The release runs before the batch's flush, so `persisted_count` can
+    /// lead it by one batch: poll rather than read once.
+    fn wait_until_queued_bytes_zero(spill: &WsFrameSpill) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while spill.queued_bytes.load(Ordering::Relaxed) != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "queued_bytes stuck at {} — a batch's reservation was never released",
+                spill.queued_bytes.load(Ordering::Relaxed)
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// 2026-10-03: the writer releases one batch's bytes in ONE `fetch_sub`
+    /// instead of one per record. Many frames, spanning several batches of
+    /// up to 257, must still return the counter to exactly zero.
+    #[test]
+    fn test_batched_release_returns_queued_bytes_to_zero() {
+        let dir = tmp_dir("batched-release");
+        let spill = WsFrameSpill::new(&dir).unwrap();
+        let frames = 1_000_u64;
+        for i in 0..frames {
+            assert_eq!(
+                spill.append(
+                    WsType::LiveFeed,
+                    vec![(i % 251) as u8; 100 + (i % 7) as usize]
+                ),
+                AppendOutcome::Spilled
+            );
+        }
+        wait_until_persisted(&spill, frames);
+        wait_until_queued_bytes_zero(&spill);
+        drop(spill);
+        std::thread::sleep(Duration::from_millis(50));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_writer_respawns_after_panic_sentinel() {
         let dir = tmp_dir("respawn");
@@ -9619,6 +9698,9 @@ mod tests {
             0,
             "respawn must keep the channel alive — no Disconnected drops"
         );
+        // The sentinel's bytes were added to the batch before the panic, so
+        // only `PendingRelease::drop` can have released them on the unwind.
+        wait_until_queued_bytes_zero(&spill);
         drop(spill);
         std::thread::sleep(Duration::from_millis(50));
         let _ = std::fs::remove_dir_all(&dir);
