@@ -281,6 +281,7 @@ pub mod feed_aux_persistence;
 // Real-time proof that the live path is not waiting (2026-10-02): per-stage
 // latency buckets, stall counters and task heartbeats, Prometheus only.
 pub mod hot_path_telemetry;
+mod off_worker;
 pub mod tick_persistence;
 // Automatic drain for the live-tick spill tier (2026-08-21): posts spilled
 // ILP bodies back to QuestDB's /write endpoint and truncates on success, so

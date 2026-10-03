@@ -2735,10 +2735,13 @@ impl TickWriter {
                  row(s) discarded"
             );
         }
+        // The synchronous ILP round trip: the other place a flush blocks, so
+        // it runs through `off_worker` (the drain calls `flush` bare).
+        let buffer = &mut self.buffer;
         let flushed = self
             .sender
             .as_mut()
-            .map(|sender| sender.flush(&mut self.buffer));
+            .map(|sender| crate::off_worker::off_worker(|| sender.flush(buffer)));
         match flushed {
             Some(Ok(())) => {
                 self.pending = 0;
@@ -2983,14 +2986,20 @@ impl TickWriter {
     }
 
     /// The drain's only spill write, NOT synced (see `SPILL_UNSYNCED_ON_DRAIN`).
+    ///
+    /// It is a file write (and possibly a `df` probe), so it runs through
+    /// `off_worker`: the drain calls `flush` bare, and this is one of the two
+    /// places a flush can block.
     fn spill_on_drain(&self, payload: &[u8], rows: usize) -> bool {
-        perform_tick_rescue(
-            &self.spill_dir,
-            payload,
-            self.feed,
-            rows,
-            SPILL_UNSYNCED_ON_DRAIN,
-        )
+        crate::off_worker::off_worker(|| {
+            perform_tick_rescue(
+                &self.spill_dir,
+                payload,
+                self.feed,
+                rows,
+                SPILL_UNSYNCED_ON_DRAIN,
+            )
+        })
     }
 
     /// Hands the pending buffer to the writer thread without touching the

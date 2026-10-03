@@ -2510,6 +2510,47 @@ write, then candle warm-up (PR31b-2 (a), already listed above). Each fix ships a
   limits: past the deadline, or inside the capture window, a replay still rescues as before; and
   an after-hours deploy that stops the box within a minute of the replay persists little progress,
   because the applied watermark is written 60 s behind the acks.
+- [x] **S1 — The drain's flushes no longer hand over their worker.** The frame drain called
+  every tick and depth flush inside `block_in_place` (about five a second) although the flush is
+  a `try_send` to the writer thread. The writers now move the worker aside themselves at the only
+  blocking steps (synchronous ILP round trip, inline spill write) via the crate-internal
+  `off_worker`; the drain calls `flush` bare. Files: `crates/storage/src/off_worker.rs`,
+  `crates/storage/src/{tick,depth}_persistence.rs`, `crates/storage/tests/spill_rescue_sync_guard.rs`,
+  `crates/app/src/dhan_feed_stack.rs`. Tests: every_blocking_writer_step_runs_off_the_worker,
+  a_nested_call_runs_inline_and_does_not_panic, runs_inline_on_a_current_thread_runtime_without_panicking,
+  test_drain_never_flushes_bare_on_the_async_worker. Measured: block_in_place p50 191 ns / p99
+  309 ns uncontended (debug), bare call 30 / 41 ns.
+- [x] **S2 — Disk probes, audit flushes and the error summary no longer block a shared worker.**
+  The disk-health watcher (`df`-style statvfs), the resource monitor (fd count, RSS, memory
+  ceiling, spill free space from `/proc`), the WAL auto-resume free-space probe and the hourly
+  error-summary rewrite ran as plain blocking calls on tokio workers; the WebSocket audit
+  consumer flushed its ILP writer bare. Each now runs in `spawn_blocking` (probes, summary) or
+  through `blocking_flush` (audit), and the summary skips files last written before its window
+  instead of re-reading the whole directory. Files: `crates/storage/src/{disk_health_watcher,
+  resource_monitor,wal_suspension_watcher}.rs`, `crates/core/src/notification/summary_writer.rs`,
+  `crates/app/src/{ws_audit_consumer,order_observability}.rs`. Tests:
+  test_audit_consumers_never_flush_bare_on_the_worker,
+  regenerate_summary_skips_a_file_last_written_before_the_window.
+- [x] **S3 — Spill replay, retention sweeps and the upload listing no longer block a shared worker.**
+  The tick spill replay read 8 MiB chunks and trimmed its quarantine with `std::fs` on a tokio
+  worker; the retention loop in `main.rs` ran the WAL archive and active prunes, the spill sweep
+  and the DLQ size reading inline; the raw-frame upload listed both directories (one stat and one
+  marker read per file) inline. The replay round now runs on the blocking pool (its HTTP posts
+  still run on the runtime via `Handle::block_on`), the retention pass runs in one
+  `spawn_blocking`, and the listings run through `off_worker`. Files:
+  `crates/storage/src/{tick_spill_replay,raw_frame_upload}.rs`, `crates/app/src/main.rs`,
+  `crates/app/tests/disk_retention_wiring_guard.rs`. Tests:
+  the_drain_round_runs_on_the_blocking_pool, test_retention_sweeps_run_on_the_blocking_pool,
+  every_listing_runs_off_the_worker. Honest limit: the work is still O(files) per pass; it no
+  longer holds a worker the drain and readers share.
+- [x] **S4 — API debug scans and the feed-state write no longer block a runtime worker.**
+  `/api/debug/logs/jsonl/latest`, `/api/debug/spill/status` and `/api/debug/cross-verify/latest`
+  listed directories with `std::fs` on the request worker and sorted every match to pick the
+  newest; the feed toggle wrote and fsynced `data/feed-state.json` inline. The scans and the
+  write now run on the blocking pool, the newest-file pick is one pass keeping the greatest name
+  (O(files), no list, no sort), and a failed join reads as a failed write. Files:
+  `crates/api/src/handlers/{debug,feeds}.rs`. Test:
+  every_handler_scan_runs_on_the_blocking_pool.
 
 ## Edge Cases
 

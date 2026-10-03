@@ -369,7 +369,10 @@ async fn run_feed_gap_audit_consumer(
                 .increment(1);
             continue;
         }
-        if let Err(err) = writer.flush() {
+        // A blocking ILP-over-HTTP round trip (the questdb-rs default retry
+        // loop applies, so it can take seconds against a stalled database):
+        // run it off the shared tokio worker (O(1) sweep, 2026-10-03).
+        if let Err(err) = crate::order_observability::blocking_flush(|| writer.flush()) {
             error!(
                 code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
                 ws_type = row.ws_type.as_str(),
@@ -545,7 +548,10 @@ async fn run_ws_event_audit_consumer(
                 .increment(1);
             continue;
         }
-        if let Err(err) = writer.flush() {
+        // A blocking ILP-over-HTTP round trip (the questdb-rs default retry
+        // loop applies, so it can take seconds against a stalled database):
+        // run it off the shared tokio worker (O(1) sweep, 2026-10-03).
+        if let Err(err) = crate::order_observability::blocking_flush(|| writer.flush()) {
             error!(
                 code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
                 ws_type = row.ws_type.as_str(),
@@ -613,6 +619,23 @@ mod tests {
     /// written. That is why this asserts on capacity and send-acceptance
     /// rather than on rows landing — a test claiming the latter without a
     /// database would be the false-OK this repo bans.
+    /// O(1) sweep 2026-10-03: both audit consumers flush through
+    /// `blocking_flush`, never bare on the shared tokio worker.
+    #[test]
+    fn test_audit_consumers_never_flush_bare_on_the_worker() {
+        let src = include_str!("ws_audit_consumer.rs");
+        let production = src.split(concat!("#[cfg(", "test)]")).next().unwrap_or(src);
+        let wrapped = production
+            .matches("blocking_flush(|| writer.flush())")
+            .count();
+        let all = production.matches("writer.flush()").count();
+        assert_eq!(wrapped, 2, "both consumers must flush off the worker");
+        assert_eq!(
+            all, wrapped,
+            "a bare writer.flush() sits on the tokio worker"
+        );
+    }
+
     #[tokio::test]
     async fn test_spawn_returns_a_sender_with_the_bounded_capacity() {
         let tx = spawn_ws_event_audit_consumer(unreachable_questdb());
