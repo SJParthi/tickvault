@@ -1551,6 +1551,14 @@ in `aws-budget.md`"; it was not, until this note (added 2026-10-01, Item 48 of
 `raw-frames/` uploader exists and `main.tf` still carries
 `expiration { days = 1825 }`), so October pays nothing for this yet.
 
+**UPDATED 2026-10-01 (later the same day) — 45f has landed.** `main.tf` now
+carries no expiration on `tv-prod-cold`, versioning is `Enabled`, and
+`raw-frames/` moves to Deep Archive after 30 days. Its own cost this month is
+close to nothing: no object in the bucket is near five years old, and a
+version is kept only when an object is overwritten or deleted, which today
+happens only to per-commit deploy binaries under unique keys. The raw-frames
+line above still costs nothing until the 45e uploader exists.
+
 **What is NOT claimed.** The figure is Assumed until one month is billed, as the
 full rule file requires. It does not fit inside the $150 October line, which
 was already projected at about $150 before this (COST NOTE 2026-09-25); if the

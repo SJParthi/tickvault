@@ -697,13 +697,9 @@ resource "aws_s3_bucket" "tv_cold" {
   bucket = "tv-${var.environment}-cold"
 }
 
-# Zero loss (operator Quotes 27 + 28, 2026-09-29, plan item 45f): the cold
-# bucket KEEPS EVERYTHING. No `expiration` block, versioning Enabled, and no
-# `noncurrent_version_expiration` -- an overwrite or a delete leaves the old
-# version in place. The 1825-day expiry that used to sit in the rule below is
-# removed on purpose: SEBI's five years is a MINIMUM, and the operator's rule
-# is that nothing received is ever deleted. Pinned by
-# `aws_infra_wiring.rs::test_terraform_cold_bucket_keeps_everything`.
+# Versioning ON (operator Quotes 27 + 28, 2026-09-29, ITEM 45f): an overwrite
+# or a delete leaves the prior version in place. Suspending it is a REJECT in
+# docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md.
 resource "aws_s3_bucket_versioning" "tv_cold" {
   bucket = aws_s3_bucket.tv_cold.id
 
@@ -712,10 +708,17 @@ resource "aws_s3_bucket_versioning" "tv_cold" {
   }
 }
 
+# Objects move to cheaper tiers and are NEVER expired (Quotes 27 + 28,
+# 2026-09-29, ITEM 45f). The 5-year expiry this block used to carry was
+# removed: SEBI's five years is a floor, not a ceiling, and the operator
+# ordered that nothing captured is ever deleted. No rule here may expire a
+# current or a noncurrent version; crates/common/tests/aws_infra_wiring.rs
+# fails the build if one is added.
 resource "aws_s3_bucket_lifecycle_configuration" "tv_cold" {
   bucket = aws_s3_bucket.tv_cold.id
 
-  # Terraform's guidance for a versioned bucket: apply versioning first.
+  # A lifecycle configuration on a versioned bucket must be applied after
+  # versioning is enabled.
   depends_on = [aws_s3_bucket_versioning.tv_cold]
 
   rule {
@@ -733,13 +736,20 @@ resource "aws_s3_bucket_lifecycle_configuration" "tv_cold" {
       days          = 365
       storage_class = "GLACIER_IR"
     }
+
+    # A version replaced or deleted is kept, on a cheaper tier.
+    noncurrent_version_transition {
+      noncurrent_days = 30
+      storage_class   = "GLACIER_IR"
+    }
   }
 
-  # Raw WebSocket frames (plan item 45e) are the record of last resort and are
-  # read only to rebuild a lost day, so they go to the cheapest class after 30
-  # days. Where this overlaps the rule above, S3 applies the lower-cost
-  # transition (Inferred from AWS lifecycle docs, not yet observed on the
-  # bucket).
+  # Raw capture-at-receipt WAL segments (ITEM 45e uploads them here). They are
+  # read back only to rebuild a day, so they go straight to Deep Archive after
+  # 30 days. This rule overlaps the one above on the same day; when two
+  # transitions to different classes fall due together, S3 takes the one with
+  # the lower storage cost, i.e. Deep Archive (Assumed from the AWS lifecycle
+  # documentation; not observed on this bucket yet).
   rule {
     id     = "raw-frames-deep-archive"
     status = "Enabled"
@@ -751,6 +761,11 @@ resource "aws_s3_bucket_lifecycle_configuration" "tv_cold" {
     transition {
       days          = 30
       storage_class = "DEEP_ARCHIVE"
+    }
+
+    noncurrent_version_transition {
+      noncurrent_days = 30
+      storage_class   = "DEEP_ARCHIVE"
     }
   }
 }
