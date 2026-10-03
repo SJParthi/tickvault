@@ -2441,10 +2441,16 @@ write, then candle warm-up (PR31b-2 (a), already listed above). Each fix ships a
   test_regression_leftover_backlog_is_replayed_after_live_acks_pass_it,
   test_guard_pending_backlog_ignores_segments_at_or_above_the_ceiling,
   an_unfinished_catchup_guards_its_leftover_backlog_before_the_live_drain.
-- [ ] **H2 — Token renewal no longer writes the token cache file on the socket reader worker.**
+- [x] **H2 — Token renewal no longer writes the token cache file on the socket reader worker.**
   After an 807/809 renewal, `token_cache::save_token_cache` (a sync write and fsync) runs on the
   single `tv-ws-reader` worker, so a slow disk stalls every socket. Move the write to the blocking
   pool. Files: `crates/core/src/auth/token_manager.rs`, `crates/core/src/auth/token_cache.rs`.
+  Done: `save_current_token_to_cache` hands the write to `spawn_blocking` (`offload_blocking`),
+  inline only when no runtime exists; `TOKEN_CACHE_WRITE_LOCK` keeps two writes in order and each
+  reads the newest token at write time. `token_cache.rs` needed no change. Tests:
+  test_regression_h2_token_cache_write_never_runs_on_the_calling_worker,
+  test_offload_blocking_without_a_runtime_runs_inline,
+  test_regression_h2_cache_save_goes_through_the_offload.
 
 ## Edge Cases
 
