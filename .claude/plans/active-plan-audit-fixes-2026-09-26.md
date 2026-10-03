@@ -419,7 +419,7 @@ inline (PR2, PR8, PR14).
     script is rule-locked to shell and needs an owner quote before it changes.
   - Series (2026-10-01, owned by the "Replace shell scripts with Rust" thread; one PR each,
     serial; the audit-plan thread skips D6):
-    - [ ] D6a — shell budget first: `crates/common/tests/shell_budget_guard.rs` freezes the 105
+    - [x] D6a — shell budget first: `crates/common/tests/shell_budget_guard.rs` freezes the 105
       shell files (46 developer tooling by file set; 59 others by file set AND line ceiling) and
       pins each systemd unit's shell `Exec*=` count (1 + 3 + 1). Rule lock §0.10. Test-only.
       Tests: `no_new_shell_files`, `shell_lists_shrink_only`, `ops_shell_files_never_grow`,
@@ -1299,6 +1299,9 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
 - PR41 — a replayed candle never replaces a fuller one, and one stuck spill file never holds the
   rest. (`storage`, `trading`) Split 2026-10-01 into PR41a (the never-replace rule and the file
   order) and PR41b (the stuck file, the suspect table, the replay gate and the record checksum).
+  PR41b split again 2026-10-01: the record checksum, the torn single-record cut-back and the
+  batch alignment check moved to PR41c, because a checksum needs a new spill format version and
+  its own reader migration.
 - [x] **PR41a — a replayed candle never replaces a fuller one.** (`storage`)
   - A replayed seal overwrote a newer corrected candle (a late trade re-folded a sealed bar),
     uncounted (seal_writer_task.rs:903-917, :1127-1175; aggregator_cell.rs:261-268). The honest
@@ -1340,7 +1343,7 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
     `pr41a_boot_drain_never_writes_an_older_copy_after_a_fuller_one`,
     `pr41a_boot_drain_writes_both_copies_when_the_older_comes_first`,
     `pr41a_staged_files_replay_oldest_write_first`.
-- [ ] **PR41b — one stuck spill file never holds the rest.** (`storage`)
+- [x] **PR41b — one stuck spill file never holds the rest.** (`storage`)
   - A candle the replay cannot flush is skipped and later files wait
     (seal_writer_task.rs:1209-1262): tell a flapping database from a bad record before skipping,
     and move past a stuck file.
@@ -1348,10 +1351,82 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
     keep the file until the table is healthy.
   - The replay gate opens only on live traffic, so a spill made after the last live write waits
     for the next boot: reopen it on a database health check too.
+  - Row 36 (c6#36): replay the dead-letter file mid-session, or record boot-only replay.
+  - Done 2026-10-01, all in `seal_writer_task.rs::MidSessionReplay`:
+    (1) `classify_replay_flush_failure`: a failed replay flush whose error is the transport
+    (`SocketError`, `CouldNotResolveAddr`, `TlsError`), the server's configuration or
+    authentication, or the candle tables not yet keyed (`CandleTablesNotKeyed`) never counts as a
+    strike against the record. Any other failure at a step of one record is a strike, the first
+    always and each later one only when the database accepted a write since the last failure (a
+    clean live flush or a clean probe). After `SEAL_REPLAY_STUCK_FAILURES` (12) failures at one
+    position with no progress, the file is parked where it stopped for `SEAL_REPLAY_PARK_SECS`
+    (600) and the next staged file goes ahead; the parked file resumes at the same record.
+    (2) While the QuestDB WAL-suspension watcher reports a suspended or lagging table, or cannot
+    see, nothing replays. A file read to its end waits until two more clean probes have reported
+    before it is archived; if suspicion begins first, it, the file being read and every parked file
+    are read again from their start (the DEDUP keys collapse what had landed). With no watcher
+    running, a finished file is archived at once, as before.
+    (3) The gate also opens once a clean probe has reported after the last failure and
+    `SEAL_REPLAY_HEALTHY_SECS` have passed since it. `AppliedWatermark::clean_probe_count` is new;
+    the runner feeds `ReplayProbe::current()` into `observe_probe` every cycle.
+    (4) Row 36 decided: the dead-letter file replays at boot only. A seal reaches it only when the
+    spill append itself failed, and the DLQ has no paused-append staging, so moving its file
+    mid-session could lose a seal appended at the same instant. Recorded in the replay's module
+    notes.
+  - Counted: `tv_seal_replay_total{kind="files_parked"|"files_rewound"}` (new), beside the
+    existing kinds. Parking is a coded `error!` (AGGREGATOR-SEAL-01); a rewind is a `warn!`.
+  - Honest limits: parking lets a later file reach the database before an older one; an older copy
+    of a bucket the spill also holds newer is dropped by the PR41a ledger, but a key the ledger could
+    not track is not. The strike evidence rule adds little beyond the gate, which already demands a
+    clean live flush or a clean probe before the retry; the transport classification is the real
+    separation. A refusal the database reports without naming a line (for example a 5xx after the
+    client's own retries) still counts as a strike.
+  - Tests: `classify_replay_flush_failure_tells_the_transport_from_a_refusal`,
+    `a_transport_failure_never_skips_a_record_and_a_stuck_file_is_parked_so_the_next_goes_ahead`,
+    `a_parked_file_resumes_at_its_record_after_the_park_window`,
+    `a_clean_probe_reopens_the_gate_without_live_traffic`, `a_suspect_table_closes_the_gate`,
+    `a_finished_file_waits_for_two_clean_probes_before_it_is_archived`,
+    `suspicion_before_confirmation_reads_the_file_again_from_its_start`,
+    `observe_probe_rewinds_the_file_being_read_and_every_parked_file_on_suspicion`,
+    `test_replay_probe_current_reads_the_process_watermark`,
+    `wal_applied_watermark::tests::clean_probe_count_counts_only_clean_probes`.
+- [x] **PR41c — every spilled candle record can be checked.** (`storage`)
   - The candle spill has no record checksum (row 136, seal_spill.rs:832-841, :907-916): cut back a
     torn single-record write the way the batch does, check alignment before a batch, add a
+    checksum. The 128-byte record is full, so the checksum needs a new format version (for
+    example reusing the legacy low-32 id at bytes 0..4, the full id being at 120..128) and a reader
+    that still accepts the current version during the rollout.
+  - Done 2026-10-01, in `seal_spill.rs`: spill format version 5. Bytes 0..4 hold a CRC-32
+    (IEEE, the in-crate `crc32_ieee`, no new dependency) of bytes 4..128, the version byte
+    included; the id is read from 120..128 only. `decode_spill_record` applies the version gate
+    and the checksum for every spill reader (the boot drain, the mid-session replay and
+    `read_all`), so they cannot disagree. Readers accept versions 4..=5
+    (`SEAL_SPILL_OLDEST_READABLE_VERSION`), because 4 → 5 renumbered no timeframe; a v4 record
+    must have matching low-32 and full ids, which is what refuses a v5 record whose version byte
+    flipped to 4. The dead-letter readers accept the same range. A record whose checksum fails
+    is refused and counted, and the read continues with the next record.
+    A failed single-record write is cut back to its last whole record, as the batch path does
+    (set aside if the cut fails); the day file is cut back when it is opened; a batch checks the
+    length it starts from and cuts a partial record off first.
+  - Counted: refused records add to the existing undecodable / `records_skipped` counts; one coded
+    `error!` (AGGREGATOR-SEAL-01) per file read or per replay step names how many failed the
     checksum.
-  - Row 36 (c6#36): replay the dead-letter file mid-session, or record boot-only replay.
+  - Honest limits: a v4 record still on disk during the rollout has only the id cross-check, not a
+    checksum. A record refused for its checksum is one candle not replayed; its bytes stay in the
+    archived file. A rollback to the v4 build refuses and archives every v5 record it drains, and
+    nothing re-reads `archive/`, so those candles need a manual re-ingest. If a day file ends
+    mid-record and can be neither cut back nor set aside, appends to it are refused and each seal
+    goes to the dead-letter tier.
+  - Tests: `to_bytes_writes_a_checksum_of_bytes_4_to_128_at_bytes_0_to_4`,
+    `decode_spill_record_refuses_a_flipped_bit_anywhere_in_the_record` (every bit of the record),
+    `a_v4_record_written_by_the_previous_build_still_decodes`,
+    `test_reseal_record_for_test_restores_a_valid_checksum`,
+    `read_all_skips_a_damaged_record_and_keeps_reading`,
+    `cut_back_to_whole_records_removes_only_a_partial_record`,
+    `a_torn_day_file_is_cut_back_when_it_is_opened`,
+    `a_batch_starts_on_a_record_boundary_even_on_an_open_handle`,
+    `boot_drain_reads_a_v4_record_and_refuses_a_damaged_one`, `boot_drain_reads_a_v4_dlq_line`,
+    `replay_skips_a_damaged_record_and_reingests_the_rest`.
 - [ ] **PR42 — order and P&L audit rows survive a database outage.** (`storage`, `app`, deploy)
   - Order and P&L audit rows are thrown away while the database is down
     (order_audit_persistence.rs:478-521; pnl_audit_persistence.rs:488;
@@ -1903,7 +1978,7 @@ Rows folded into existing items (the fix is named here so the item carries it):
 - PR43: row 127 (c6#123, also count and page the spots cut at the 250 cap).
 - PR42: row 188 (c6#169, also the order-update and position-update event writers).
 - PR41b: row 36 (c6#36, replay the dead-letter file mid-session, or record boot-only replay
-  below).
+  below). Decided 2026-10-01: boot-only, recorded in PR41b.
 - PR7: rows 115 (c6#112, measure contention on the shared capture counter) and 267 (c6#236,
   time a full 250,000-record shutdown drain on the production volume).
 - PR11: row 189 (c6#170, candle escalation and inline writes respect the free-space floor).
@@ -1970,18 +2045,25 @@ independent live-path fixes).
   - Tests: `a_trade_stamped_hours_ahead_of_its_receipt_cannot_freeze_the_price`,
     `a_trade_inside_the_skew_or_with_no_receipt_is_not_capped`,
     `trade_time_ceiling_is_the_receipt_in_ist_seconds_plus_the_skew`.
-- [ ] **R3 — a failed token renewal after an 807 pages at once.** (`app`, maybe `core`)
+- [x] **R3 — a failed token renewal after an 807 pages at once.** (`app`, `core`)
   - Verified: on renewal failure the 807 path only `warn!`s (dhan_feed_stack.rs:13719-13727);
     the Critical page waits for the profile watchdog (~30 min).
-  - Fix: route the failure to the existing allowed family (3) page (`TokenRenewalFailed`),
-    coalesced so 16 sockets failing together send one page; `warn!` becomes a coded `error!`.
-    No new Telegram family (noise lock §2 family 3 already covers it).
-- [ ] **R4 — an order update the parser cannot read is flagged, not hidden.** (`core`)
+  - Fix: `TokenManager::force_renewal_unless_replaced` sends the existing family (3)
+    `AuthenticationFailed` page once per token generation (one atomic swap on
+    `stale_credential_paged_generation`, so 16 sockets failing together send one page), and
+    never for the mint-cooldown skip or the RESILIENCE-03 refusal, which already page. The
+    app-side `warn!` is a coded `error!` throttled to powers of two. Both family (3) bodies now
+    name the Dhan live feed sockets. No new Telegram family.
+  - Tests: `test_stale_credential_failure_pages_only_on_terminal_failure_of_the_current_token`, `test_stale_credential_page_latch_fires_once_per_token_generation`, `test_force_renewal_unless_replaced_pages_family_3_once_per_token` (all in `token_manager.rs`).
+- [x] **R4 — an order update the parser cannot read is flagged, not hidden.** (`core`)
   - Verified: a frame that fails to deserialise is counted as a non-order message at `debug!`
     (order_update_connection.rs:961-987), so a vendor format change would drop every order
     update silently. Paper mode only today.
-  - Fix: a frame shaped like an order update that does not parse is counted on its own counter
-    and logged as a coded `error!` throttled to powers of two with a char-safe preview.
+  - Fix: a frame carrying the order envelope that fails the typed parse is counted on
+    `tv_order_update_frames_dropped_total{reason="unparseable_order"}` and logged as
+    ORDER-EVT-02 stage `typed_parse_failed`, throttled to powers of two, with the serde line
+    and column and the existing client-id-redacted excerpt.
+  - Tests: three in `order_update_connection.rs` (`looks_like_order_update` and the arm).
 - [x] **R5 — the candle fold starts a clean day if the process runs past midnight.**
   (`app`, `trading`) Verified first; if the day-rollover path already handles it, the item
   closes with the evidence instead of a code change.
@@ -1995,13 +2077,37 @@ independent live-path fixes).
   - Tests: `roll_trading_day_reseeds_the_fold_so_the_next_day_counts_volume` (control without
     the roll reads 0, with it 300); the wiring guard
     `the_ranking_daily_reset_fires_only_on_a_real_midnight_crossing` now pins the roll call.
-- [ ] **R6 — a bar opens at its earliest trade, not its first arrival.** (`trading`) Verified
+- [x] **R6 — a bar opens at its earliest trade, not its first arrival.** (`trading`) Verified
   first against the restart differential; ships only if the oracle and the replay rules agree.
-- [ ] **R7 — the instance lock re-reads after renewal and a machine that lost it stops
+  - Fix: `LiveCandleState::open_ts_ist_secs` (0 = pinned). The official day open and the
+    repeat-quote day-open stamp pin the open; a trade open records its own second.
+    `fold_in_bucket` and `fold_late_hlc` replace the open only with a strictly earlier trade,
+    so the first arrival keeps it within one second. State 152 -> 160 B, `BufferedSeal`
+    168 -> 176 B (now exactly at its assert), about +6 MB at the ceiling (`aws-budget.md`).
+  - Tests: `open_is_the_earliest_trade_not_the_first_arrival`,
+    `within_one_second_the_first_arrival_keeps_the_open`,
+    `the_official_day_open_is_never_superseded`,
+    `a_late_earlier_trade_amends_the_sealed_bars_open`, two proptests in `fold_properties.rs`;
+    each fails with the guard removed. `restart_differential` and
+    `first_trade_restart_differential` at 20,000 cases in release: 0 failures.
+    `dhat_multi_tf_fold` passes. Bench gate not run locally.
+- [x] **R7 — the instance lock re-reads after renewal and a machine that lost it stops
   dialling.** (`core`, `app`) SSM has no compare-and-set, so this narrows the window and makes
   the loss loud; it cannot close the race.
-- [ ] **R8 — the CLAUDE.md speed table matches the code.** (docs) Eight stale rows, both
-  directions, plus rows for R2's cap.
+  - Fix: every renewal and stale-takeover write is read back and classified from the SSM
+    versions (`classify_write`: held / held after contention / lost / inconclusive, the last
+    never treated as held). A takeover settles 10 s before its read-back and is not trusted
+    past a 5 s read-to-write window. Every Dhan socket sink carries the lock flag
+    (`WalRingSink::with_dial_permit`); while the lock is not held a dial waits, counted on
+    `tv_instance_lock_dial_refused_total` with one RESILIENCE-01 error per episode, and no live
+    socket is closed. Runbook §3.6.
+  - Tests: `classify_write_*`, renew/takeover read-back tests against the SSM stub,
+    `with_dial_permit_follows_the_lock_flag_and_defaults_to_permitted`,
+    `test_run_connection_waits_without_dialling_while_lock_not_held`.
+  - Honest limit: a process that lost the lock does not re-acquire it without a restart.
+- [x] **R8 — the CLAUDE.md speed table matches the code.** (docs) Five rows corrected after a
+  re-check in source (`gainer_eligible`, `plan_depth20_ranked_minute`, `catch_up_seal_all`,
+  `atm_pair_for`, `SpotPriceStore`), each as a dated note appended to its row.
 
 R-items Z+ and guarantee matrix: covered by the shared matrix at the end of this plan. Tick
 path: R1 removes four compares per tick; R2 adds one divide and one compare per spot tick; no

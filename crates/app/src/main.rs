@@ -1593,6 +1593,7 @@ async fn async_main() -> Result<()> {
         match observability::init_errors_jsonl_appender(observability::ERRORS_JSONL_DIR) {
             Ok((writer, guard)) => {
                 use tracing_subscriber::Layer as _;
+                use tracing_subscriber::filter::FilterExt as _;
                 // Keep the worker guard alive for the process lifetime —
                 // dropping it stops the background flush thread.
                 Box::leak(Box::new(guard));
@@ -1612,7 +1613,12 @@ async fn async_main() -> Result<()> {
                     .with_line_number(true)
                     .with_thread_ids(true)
                     .with_writer(writer)
-                    .with_filter(tracing_subscriber::filter::LevelFilter::ERROR);
+                    // 45d (2026-10-01): at most one line a second per
+                    // (call site, code, source) on this stream; app.log and
+                    // errors.log keep every line. See `log_coalescer`.
+                    .with_filter(tracing_subscriber::filter::LevelFilter::ERROR.and(
+                        tickvault_app::log_coalescer::ErrorCoalescer::new("errors_jsonl"),
+                    ));
                 Some(Box::new(layer))
             }
             Err(err) => {

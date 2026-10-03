@@ -5031,10 +5031,11 @@ pub struct DrainCounters {
     /// Depth packets for an instrument dropped less than the grace ago -- the
     /// vendor is still allowed to act on the unsubscribe. Counted, not acted on.
     depth_unsubscribed_grace: metrics::Counter,
-    /// Redials actually ARMED by the ghost detector (after the per-socket cooldown).
-    depth_ghost_redials: metrics::Counter,
-    /// Sockets that hit the per-session ghost-redial ceiling and were told
-    /// to stop redialling (once per socket per session).
+    /// Repeat unsubscribes actually ARMED by the ghost detector (after the
+    /// per-socket cooldown). In place since 2026-10-01: nothing is redialled.
+    depth_ghost_unsubscribes: metrics::Counter,
+    /// Sockets that hit the per-session ghost-resend ceiling and stopped
+    /// re-sending the unsubscribe (once per socket per session).
     depth_ghost_exhausted: metrics::Counter,
     truncated: metrics::Counter,
     /// Main-feed packets whose vendor-stamped `message_length` (header bytes
@@ -5116,7 +5117,7 @@ pub fn counters() -> &'static DrainCounters {
         depth_length_mismatch: metrics::counter!(DEPTH_COUNTER, "outcome" => "length_mismatch"),
         depth_ghost: metrics::counter!(DEPTH_COUNTER, "outcome" => "ghost"),
         depth_unsubscribed_grace: metrics::counter!(DEPTH_COUNTER, "outcome" => "unsubscribed_grace"),
-        depth_ghost_redials: metrics::counter!(DEPTH_COUNTER, "outcome" => "ghost_redial"),
+        depth_ghost_unsubscribes: metrics::counter!(DEPTH_COUNTER, "outcome" => "ghost_unsubscribe"),
         depth_ghost_exhausted: metrics::counter!(DEPTH_COUNTER, "outcome" => "ghost_exhausted"),
         truncated: metrics::counter!(DRAIN_FRAMES_COUNTER, "outcome" => "truncated"),
         main_feed_length_mismatch: metrics::counter!(DRAIN_FRAMES_COUNTER, "outcome" => "length_mismatch"),
@@ -5212,7 +5213,7 @@ fn seed_drain_loss_baselines() {
     // so the ownership guard sees them as drain-owned.
     c.depth_ghost.increment(0);
     c.depth_unsubscribed_grace.increment(0);
-    c.depth_ghost_redials.increment(0);
+    c.depth_ghost_unsubscribes.increment(0);
     c.depth_ghost_exhausted.increment(0);
     // The depth family's LOSS labels, same reason: `refused` and `dropped` are
     // zero on a healthy lane, so their first non-zero sample is the event —
@@ -5315,12 +5316,16 @@ pub const SEALS_RESCUED_COUNTER: &str = "tv_dhan_feed_seals_rescued_total";
 /// * `ghost` — packets for an instrument this process unsubscribed at least
 ///   `GHOST_GRACE_SECS` ago and the vendor is STILL streaming. The signal that
 ///   the unsubscribe RequestCode was ignored; each one asks that socket to
-///   redial (`request_ghost_redial`, cooled down per socket, spaced pool-wide,
-///   and capped per socket per session). Expected 0.
-/// * `ghost_redial` — redials actually ARMED by the detector. Expected 0.
-/// * `ghost_exhausted` — sockets that took the session ceiling of ghost
-///   redials and still deliver the ghost: the vendor is not honouring the
-///   unsubscribe code at all. Once per socket per session. Expected 0.
+///   send the unsubscribe again, in place (`request_ghost_unsubscribe`,
+///   cooled down per socket, spaced pool-wide, and capped per socket per
+///   session). The socket is never closed for it, and the packets are still
+///   stored. Expected 0.
+/// * `ghost_unsubscribe` — repeat unsubscribes actually ARMED by the
+///   detector (2026-10-01; was `ghost_redial`, when the answer was a redial).
+///   Expected 0.
+/// * `ghost_exhausted` — sockets that took the session ceiling of repeat
+///   unsubscribes and still deliver the ghost: the vendor is not honouring the
+///   unsubscribe code for it. Once per socket per session. Expected 0.
 /// * `unsubscribed_grace` — packets for an instrument unsubscribed less than
 ///   the grace ago. Normal for a few seconds after every swap; counted so the
 ///   vendor's unsubscribe latency is measurable, never acted on.
@@ -5328,7 +5333,7 @@ pub const DEPTH_COUNTER: &str = "tv_dhan_feed_depth_total";
 
 /// Nanoseconds per second, as the `i64` the receipt clock is carried in.
 /// Used to turn `received_at_nanos` into the epoch-seconds the ghost detector
-/// and its redial register agree on.
+/// and its unsubscribe register agree on.
 const NANOS_PER_SEC_I64: i64 = 1_000_000_000;
 
 /// Counter: ILP flushes to QuestDB, by outcome.
@@ -5476,9 +5481,12 @@ pub const WAL_CATCHUP_IN_SESSION_COUNTER: &str = "tv_dhan_wal_catchup_in_session
 ///
 /// **A boot just before 09:00 is clamped** (2026-09-22 hostile review): the
 /// full budget from 08:56 would drain until ~09:01 and dial after the
-/// pre-open began. Before the window the budget is therefore
-/// `min(full, seconds-until-09:00 + in-session)`, so the drain ends no later
-/// than 09:00 plus the in-session budget.
+/// pre-open began. Since 2026-10-01 (item 45c) the clamp is to
+/// [`WAL_CATCHUP_PREOPEN_STOP_SECS_OF_DAY_IST`] (08:58): before the window
+/// the budget is `max(in-session, min(full, seconds-until-08:58))`, so a
+/// boot up to 08:57:40 ends its drain by 08:58 and a later pre-open boot
+/// ends it within the in-session budget, as an in-session boot does. The
+/// round already running when the clock expires still finishes.
 #[must_use]
 pub const fn wal_catchup_budget_secs(ist_secs_of_day: u64) -> u64 {
     let start = tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST as u64;
@@ -5486,12 +5494,19 @@ pub const fn wal_catchup_budget_secs(ist_secs_of_day: u64) -> u64 {
     if ist_secs_of_day >= start && ist_secs_of_day < end {
         WAL_CATCHUP_IN_SESSION_BUDGET_SECS
     } else if ist_secs_of_day < start {
-        let until_open =
-            (start - ist_secs_of_day).saturating_add(WAL_CATCHUP_IN_SESSION_BUDGET_SECS);
-        if until_open < WAL_CATCHUP_BUDGET_SECS {
-            until_open
+        // 45c: stop by 08:58, not 09:00 + the in-session budget. Never below
+        // the in-session budget, so a boot just before the line is treated
+        // like one just after it rather than given a few seconds.
+        let until_stop = WAL_CATCHUP_PREOPEN_STOP_SECS_OF_DAY_IST.saturating_sub(ist_secs_of_day);
+        let capped = if until_stop < WAL_CATCHUP_BUDGET_SECS {
+            until_stop
         } else {
             WAL_CATCHUP_BUDGET_SECS
+        };
+        if capped < WAL_CATCHUP_IN_SESSION_BUDGET_SECS {
+            WAL_CATCHUP_IN_SESSION_BUDGET_SECS
+        } else {
+            capped
         }
     } else {
         WAL_CATCHUP_BUDGET_SECS
@@ -5588,6 +5603,78 @@ pub const fn wal_catchup_should_stop_for_memory(
         stop_pct,
     )
 }
+
+/// IST second of day by which a pre-open boot's WAL catch-up drain stops:
+/// 08:58:00 (plan item 45c, 2026-09-29 scope-lock "Boot WAL catch-up drain
+/// … Paced").
+///
+/// The drain runs BEFORE the sockets dial, and on 2026-09-29 the 08:31 boot
+/// drain was still loading QuestDB when the pre-open began. Two minutes ahead
+/// of 09:00 gives the dial and the subscribe batches room to finish before
+/// the first pre-open packet. A boot inside the last
+/// [`WAL_CATCHUP_IN_SESSION_BUDGET_SECS`] before this line, or after it, gets
+/// the in-session budget, the same bound a boot one minute later would get.
+pub const WAL_CATCHUP_PREOPEN_STOP_SECS_OF_DAY_IST: u64 = 8 * 3600 + 58 * 60;
+
+const _: () = assert!(
+    WAL_CATCHUP_PREOPEN_STOP_SECS_OF_DAY_IST
+        < tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST as u64,
+    "the pre-open stop line must fall before the capture window opens"
+);
+
+/// Seconds between apply-lag re-reads while the catch-up drain is paused.
+pub const WAL_CATCHUP_LAG_PAUSE_POLL_SECS: u64 = 5;
+
+/// Longest single pause, in seconds, before the drain stands down for apply
+/// lag and leaves the rest on disk.
+///
+/// The watcher polls QuestDB once a minute and releases a table only after
+/// `WAL_APPLY_LAG_RELEASE_POLLS` (2) falling polls, so a release can take two
+/// minutes to show. Three minutes covers that with one poll of margin; past
+/// it QuestDB is not catching up and more replay only adds to its backlog.
+pub const WAL_CATCHUP_LAG_PAUSE_MAX_SECS: u64 = 180;
+
+/// Counter: pause steps the catch-up drain took while QuestDB apply lag was
+/// growing. Local `/metrics` only (no EMF name).
+pub const WAL_CATCHUP_LAG_PAUSE_COUNTER: &str = "tv_wal_catchup_lag_pause_total";
+
+/// What the catch-up drain does before its next round, given the apply lag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatchupLagStep {
+    /// Apply lag is not growing: run the round.
+    Proceed,
+    /// Apply lag is growing and the pause has room left: wait one poll.
+    Pause,
+    /// Apply lag is still growing after the longest pause, or the drain's
+    /// clock has run out: stop and leave the rest as `*.wal` files.
+    Stop,
+}
+
+/// Should the WAL catch-up drain run its next round, wait, or stand down?
+///
+/// Pure, total and O(1). `lag_growing_tables` is
+/// `ingest_shed::wal_apply_lag_growing()`; `paused_secs` is how long this
+/// pause has lasted; `secs_left` is what remains of the drain's clock.
+///
+/// Fails OPEN on zero, exactly as the shed does: before the watcher's first
+/// poll the count reads zero, and refusing to drain on "not yet measured"
+/// would leave a real backlog on disk for nothing. The drain's clock and
+/// round cap still bound it there.
+#[must_use]
+pub const fn wal_catchup_lag_step(
+    lag_growing_tables: u32,
+    paused_secs: u64,
+    secs_left: u64,
+) -> CatchupLagStep {
+    if lag_growing_tables == 0 {
+        CatchupLagStep::Proceed
+    } else if paused_secs >= WAL_CATCHUP_LAG_PAUSE_MAX_SECS || secs_left == 0 {
+        CatchupLagStep::Stop
+    } else {
+        CatchupLagStep::Pause
+    }
+}
+
 /// The ring's byte ceiling — the bound the frame count alone does not give.
 ///
 /// `FRAME_RING_CAPACITY` bounds how MANY frames sit in the ring, not how much
@@ -7223,50 +7310,55 @@ async fn run_frame_drain(
                                     );
                                 }
                                 depth_refused = depth_refused.saturating_add(outcome.refused);
-                                // A ghost asks its socket to redial. The
-                                // register is cooled down per socket (180 s)
-                                // and taken by the connection task on its
-                                // next idle tick, so this is at most one
-                                // relaxed load and two stores per frame, and
-                                // the `error!` fires at most once per cooldown
-                                // per socket -- inherently throttled, no
-                                // power-of-two ladder needed.
+                                // A ghost asks its socket to send the
+                                // unsubscribe AGAIN, in place (scope lock
+                                // 2026-10-01; until then it asked for a
+                                // redial, which blanked every other contract
+                                // on the socket for the dial). The register is
+                                // cooled down per socket (180 s) and taken by
+                                // the connection task on its next idle tick,
+                                // so this is a few relaxed loads and stores per
+                                // frame, and the `error!` fires at most once
+                                // per cooldown per socket -- inherently
+                                // throttled, no power-of-two ladder needed.
+                                // The ghost's packets are stored either way:
+                                // nothing on this path drops a frame.
                                 //
-                                // After an 805 no ghost redial is ASKED for
-                                // (audit PR21): the connection task would
-                                // refuse it anyway, and asking first spent the
-                                // per-socket ceiling and logged a redial that
-                                // never happened. The ghost itself is still
-                                // counted above; one relaxed load, no store.
+                                // After an 805 no resend is ASKED for (audit
+                                // PR21): "too many requests" is the vendor's
+                                // word, and a resend is a request. The ghost
+                                // itself is still counted above; one relaxed
+                                // load, no store.
                                 if outcome.ghost > 0
                                     && !tickvault_core::websocket::pool_supervisor::rotation_halted()
                                 {
                                     use tickvault_core::websocket::pool_supervisor::{
-                                        GHOST_REDIAL_SESSION_CEILING, GhostRedialRefusal,
-                                        ghost_ceiling_first_hit, ghost_redials_taken,
-                                        request_ghost_redial,
+                                        GHOST_RESEND_SESSION_CEILING, GhostResendRefusal,
+                                        ghost_ceiling_first_hit, ghost_resends_taken,
+                                        request_ghost_unsubscribe,
                                     };
-                                    match request_ghost_redial(
+                                    // The two sentinels are unreachable by
+                                    // construction (the Ghost arm always records
+                                    // the id and segment before `outcome.ghost`
+                                    // can exceed zero) and are spelled out rather
+                                    // than unwrapped: a 0 security_id and an
+                                    // "UNKNOWN" segment are both values this
+                                    // codebase already reads as "absent", and an
+                                    // unknown segment byte is REFUSED by the
+                                    // register, so a future refactor that breaks
+                                    // the invariant sends nothing rather than a
+                                    // wrong instrument.
+                                    let (ghost_security_id, ghost_segment) = outcome
+                                        .ghost_instrument
+                                        .unwrap_or((0_u64, DEPTH_SEGMENT_UNKNOWN));
+                                    match request_ghost_unsubscribe(
                                         frame.connection_index,
+                                        ghost_security_id,
+                                        outcome.ghost_segment_code.unwrap_or(u8::MAX),
                                         received_at_nanos / NANOS_PER_SEC_I64,
                                     ) {
                                         Ok(()) => {
-                                            c.depth_ghost_redials.increment(1);
-                                            // The two sentinels are unreachable
-                                            // by construction (the Ghost arm
-                                            // always records the id before
-                                            // `outcome.ghost` can exceed zero)
-                                            // and are spelled out rather than
-                                            // unwrapped: a 0 security_id and an
-                                            // "UNKNOWN" segment are both values
-                                            // this codebase already reads as
-                                            // "absent", so a future refactor
-                                            // that breaks the invariant reports
-                                            // the break instead of panicking on
-                                            // the drain.
-                                            let (ghost_security_id, ghost_segment) = outcome
-                                                .ghost_instrument
-                                                .unwrap_or((0_u64, DEPTH_SEGMENT_UNKNOWN));
+                                            c.depth_ghost_unsubscribes.increment(1);
                                             error!(
                                                 code = ErrorCode::WsGapSubscriptionBatching.code_str(),
                                                 source = "unsubscribe_ignored",
@@ -7276,11 +7368,12 @@ async fn run_frame_drain(
                                                 segment = ghost_segment,
                                                 ghost_packets = outcome.ghost,
                                                 ghost_instrument_shared = outcome.ghost_instrument_shared,
-                                                redials_taken = ghost_redials_taken(frame.connection_index),
+                                                resends_taken = ghost_resends_taken(frame.connection_index),
                                                 "a depth socket is still delivering an instrument it was told to \
                                                  unsubscribe more than the grace ago -- the unsubscribe was ignored \
-                                                 or lost, so the socket is asked to redial and replay its current \
-                                                 set. `security_id` is the FIRST ghost in this frame; \
+                                                 or lost, so it is sent again on the live socket (no redial; every \
+                                                 other contract keeps streaming, and the ghost's packets are still \
+                                                 stored). `security_id` is the FIRST ghost in this frame; \
                                                  `ghost_packets` counts EVERY ghost packet in it, so the two are \
                                                  the same instrument only when `ghost_instrument_shared` is false \
                                                  (log-sink only; counted under `ghost` on the depth counter)"
@@ -7289,43 +7382,41 @@ async fn run_frame_drain(
                                         // Said ONCE per socket per session: after the
                                         // ceiling the ghost keeps being counted on every
                                         // frame, and a line per frame would be the flood.
-                                        Err(GhostRedialRefusal::SessionCeiling)
+                                        Err(GhostResendRefusal::SessionCeiling)
                                             if ghost_ceiling_first_hit(frame.connection_index) =>
                                         {
                                             c.depth_ghost_exhausted.increment(1);
                                             // The id is in hand here too, and this is
                                             // the arm that most needs it: MEASURED
-                                            // 2026-09-11, every socket reached the
-                                            // ceiling by 10:22 IST and 78.5% of the
-                                            // session's 5,345,436 ghost packets arrived
-                                            // AFTER that. Logging the instrument only on
-                                            // the redial arm names four fifths of the
+                                            // 2026-09-11 (when the answer was still a
+                                            // redial), every socket reached the ceiling
+                                            // by 10:22 IST and 78.5% of the session's
+                                            // 5,345,436 ghost packets arrived AFTER
+                                            // that. Logging the instrument only on the
+                                            // first arm names four fifths of the
                                             // evidence not at all.
-                                            let (ghost_security_id, ghost_segment) = outcome
-                                                .ghost_instrument
-                                                .unwrap_or((0_u64, DEPTH_SEGMENT_UNKNOWN));
                                             error!(
                                                 code = ErrorCode::WsGapSubscriptionBatching.code_str(),
-                                                source = "ghost_redial_exhausted",
+                                                source = "ghost_resend_exhausted",
                                                 connection_index = frame.connection_index,
                                                 endpoint = frame.endpoint.as_str(),
                                                 security_id = ghost_security_id,
                                                 segment = ghost_segment,
                                                 ghost_packets = outcome.ghost,
                                                 ghost_instrument_shared = outcome.ghost_instrument_shared,
-                                                ceiling = GHOST_REDIAL_SESSION_CEILING,
-                                                "a depth socket has been redialled the session ceiling of times \
-                                                 for a ghost instrument and STILL delivers it -- the unsubscribe \
-                                                 RequestCode is not honoured by the vendor. No further redials \
-                                                 this session; the socket keeps its working set and the ghost \
-                                                 keeps being counted (log-sink only; `ghost_exhausted` on the \
-                                                 depth counter). This is the read-out the scope lock names for \
-                                                 a wrong unsubscribe code."
+                                                ceiling = GHOST_RESEND_SESSION_CEILING,
+                                                "a depth socket has had its unsubscribe re-sent the session \
+                                                 ceiling of times for a ghost instrument and STILL delivers it \
+                                                 -- the vendor is not honouring the unsubscribe for it. No \
+                                                 further resends this session; the socket is NOT closed, keeps \
+                                                 its working set, and the ghost's packets keep being stored and \
+                                                 counted (log-sink only; `ghost_exhausted` on the depth counter)."
                                             );
                                         }
                                         // Cooling down, pool-spaced, already at the
-                                        // ceiling, or out of range: the ghost is already
-                                        // counted; nothing more to say per frame.
+                                        // ceiling, unknown segment or out of range: the
+                                        // ghost is already counted; nothing more to say
+                                        // per frame.
                                         Err(_) => {}
                                     }
                                 }
@@ -8730,6 +8821,12 @@ pub struct DepthFrameOutcome {
     /// that widening removed — the same reasoning `SubscribeInstrument`
     /// records at its own `security_id`.
     pub ghost_instrument: Option<(u64, &'static str)>,
+    /// The wire byte of [`Self::ghost_instrument`]'s segment, set with it.
+    ///
+    /// The label above is for joining log lines to stored rows; this is what
+    /// the repeat unsubscribe needs to name the instrument on the wire
+    /// (scope lock 2026-10-01). `None` exactly when `ghost_instrument` is.
+    pub ghost_segment_code: Option<u8>,
     /// True when a SECOND, DIFFERENT instrument also ghosted in this frame.
     ///
     /// Without it, `security_id` beside `ghost_packets` reads as "this
@@ -9461,7 +9558,10 @@ fn drain_depth_frame(
                     // the code is unknown: the same value `market_depth.segment`
                     // is written from, so the log line and the stored rows join.
                     match out.ghost_instrument {
-                        None => out.ghost_instrument = Some((header.security_id, segment)),
+                        None => {
+                            out.ghost_instrument = Some((header.security_id, segment));
+                            out.ghost_segment_code = Some(header.exchange_segment_code);
+                        }
                         Some((first_id, _)) if first_id != header.security_id => {
                             out.ghost_instrument_shared = true;
                         }
@@ -11577,6 +11677,8 @@ struct WidenCtx<'a> {
     live_topups: &'a mut Vec<(tokio::sync::mpsc::Sender<LiveSubscriptionCommand>, usize)>,
     main_feed_connections_used: &'a mut usize,
     contract_capacity: &'a mut Option<usize>,
+    /// R7 (2026-10-01): the dual-instance lock flag, for the widen's dials.
+    instance_lock_held: &'a Arc<AtomicBool>,
 }
 
 /// Room for NEW main-feed connections the widen may open. Zero once Dhan has
@@ -11708,6 +11810,7 @@ fn widen_running_session(
                                     // what these connections leave free.
                                     out_topups: Some(ctx.live_topups),
                                     out_depth_commands: None,
+                                    instance_lock_held: ctx.instance_lock_held,
                                 },
                             );
                             report_dial_shortfall(DIAL_HALF_MAIN_FEED, planned, dialed, attempts);
@@ -11902,6 +12005,9 @@ async fn attach_depth_when_available(
     // attach adds it once the rider writes it, and does not return while it
     // is still missing (until the 15:30 hard stop).
     mut widen: Option<RunningWiden>,
+    // R7 (2026-10-01): the process's dual-instance lock flag, wired into every
+    // socket this task dials so no dial happens while the lock is not held.
+    instance_lock_held: Arc<AtomicBool>,
 ) {
     // Publish a 0 for every contract-failure reason BEFORE the first attempt.
     //
@@ -12143,6 +12249,7 @@ async fn attach_depth_when_available(
                         live_topups: &mut live_topups,
                         main_feed_connections_used: &mut main_feed_connections_used,
                         contract_capacity: &mut contract_capacity,
+                        instance_lock_held: &instance_lock_held,
                     },
                     &today_date,
                     attempts,
@@ -12445,6 +12552,7 @@ async fn attach_depth_when_available(
                     live_topups: &mut live_topups,
                     main_feed_connections_used: &mut main_feed_connections_used,
                     contract_capacity: &mut contract_capacity,
+                    instance_lock_held: &instance_lock_held,
                 },
                 &today_date,
                 attempts.saturating_add(1),
@@ -12708,6 +12816,7 @@ async fn attach_depth_when_available(
                                 // makes it safe.
                                 out_topups: Some(&mut live_topups),
                                 out_depth_commands: None,
+                                instance_lock_held: &instance_lock_held,
                             },
                         );
                         // The TERMINAL verdict for today's selection, recorded
@@ -12892,6 +13001,7 @@ async fn attach_depth_when_available(
                                     ws_audit_tx: Some(&ws_audit_tx),
                                     out_topups: None,
                                     out_depth_commands: Some(&mut depth_commands),
+                                    instance_lock_held: &instance_lock_held,
                                 },
                             );
                             report_dial_shortfall(DIAL_HALF_DEPTH, planned, dialed, attempts);
@@ -13567,6 +13677,13 @@ struct DialContext<'a> {
     /// OLD one, and only the dial knows which connection got which. Deriving
     /// it later from the selection would be guessing at the pool's packing.
     out_depth_commands: Option<&'a mut DialedDepthCommands>,
+    /// The process's dual-instance lock-held flag (2026-10-01, R7). Wired into
+    /// every socket's sink so each dial — first dial, reconnect, 807 re-dial,
+    /// rotate, ghost redial — waits while this process does not hold the
+    /// lock. The boot gate checks it once before the first dial; this is what
+    /// keeps it checked for the life of the socket. Depth-account sockets are
+    /// gated too: same process, same lock.
+    instance_lock_held: &'a Arc<AtomicBool>,
 }
 
 fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize {
@@ -13581,6 +13698,7 @@ fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize 
         ws_audit_tx,
         mut out_topups,
         mut out_depth_commands,
+        instance_lock_held,
     } = ctx;
     let mut dialed = 0usize;
     for planned in plan.connections {
@@ -13699,7 +13817,9 @@ fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize 
             Some(tx) => sink.with_audit(tx.clone()),
             None => sink,
         };
-        let sink = Arc::new(sink);
+        // R7 (2026-10-01): no dial while this process does not hold the
+        // dual-instance lock. Live sockets are never closed by it.
+        let sink = Arc::new(sink.with_dial_permit(Arc::clone(instance_lock_held)));
         let guard = planned.guard;
         // Count it alive BEFORE the task starts, so the gauge can never read
         // high because a spawn lost a race with its own decrement.
@@ -13772,11 +13892,24 @@ fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize 
                     if let Some(manager) = global_token_manager()
                         && let Err(err) = manager.force_renewal_unless_replaced(dialled).await
                     {
-                        warn!(
-                            code = ErrorCode::WsGapConnectionState.code_str(),
-                            %err,
-                            "Dhan live feed could not refresh its token before re-dialing"
-                        );
+                        // R3 (2026-10-01): an error, not a warning; the token
+                        // manager pages once per dead token. Every socket
+                        // repeats this on each ladder step while the token
+                        // stays dead, so the line is throttled to powers of two.
+                        static RENEW_FAILURES: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        let seen = RENEW_FAILURES
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            .saturating_add(1);
+                        if seen.is_power_of_two() {
+                            error!(
+                                code = ErrorCode::WsGapConnectionState.code_str(),
+                                source = "stale_credential_renew_failed",
+                                seen,
+                                %err,
+                                "Dhan live feed could not refresh its token before re-dialing"
+                            );
+                        }
                     }
                 },
                 topup_rx,
@@ -15427,6 +15560,11 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         // WHICH bound bound, which is the difference between "the backlog is
         // big" and "this box cannot drain it".
         let mut catchup_memory_stopped = false;
+        // 45c: did the drain stand down because QuestDB apply lag kept
+        // growing through the longest pause?
+        let mut catchup_lag_stopped = false;
+        let lag_pause_counter = metrics::counter!(WAL_CATCHUP_LAG_PAUSE_COUNTER);
+        lag_pause_counter.increment(0);
         // `true` only when the final pass found NOTHING left on disk — no
         // frames, no deferred segments, no disk/frame-cap refusal. That is the
         // one state in which the applied-watermark's unapplied buckets can be
@@ -15469,6 +15607,55 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         )
         .bytes();
         while rounds < WAL_CATCHUP_MAX_ROUNDS && tokio::time::Instant::now() < catchup_deadline {
+            // APPLY-LAG PACING (45c) — checked BEFORE the round. While the
+            // watcher reports QuestDB apply lag growing, wait in short steps
+            // instead of adding another 512 MiB of replay to its backlog. The
+            // wait spends the drain's own clock, so it never keeps the sockets
+            // dark longer than the budget already allowed.
+            let mut lag_paused_secs = 0_u64;
+            loop {
+                let secs_left = catchup_deadline
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .as_secs();
+                let growing = tickvault_common::ingest_shed::wal_apply_lag_growing();
+                match wal_catchup_lag_step(growing, lag_paused_secs, secs_left) {
+                    CatchupLagStep::Proceed => break,
+                    CatchupLagStep::Stop => {
+                        catchup_lag_stopped = true;
+                        break;
+                    }
+                    CatchupLagStep::Pause => {
+                        if lag_paused_secs == 0 {
+                            info!(
+                                round = rounds,
+                                lag_growing_tables = growing,
+                                max_pause_secs = WAL_CATCHUP_LAG_PAUSE_MAX_SECS,
+                                "WAL catch-up drain pausing: QuestDB apply lag is growing"
+                            );
+                        }
+                        lag_pause_counter.increment(1);
+                        let step = WAL_CATCHUP_LAG_PAUSE_POLL_SECS.min(secs_left.max(1));
+                        tokio::time::sleep(std::time::Duration::from_secs(step)).await;
+                        lag_paused_secs = lag_paused_secs.saturating_add(step);
+                    }
+                }
+            }
+            if catchup_lag_stopped {
+                warn!(
+                    code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+                    source = "wal_catchup_apply_lag_stop",
+                    round = rounds,
+                    paused_secs = lag_paused_secs,
+                    lag_growing_tables = tickvault_common::ingest_shed::wal_apply_lag_growing(),
+                    "WAL catch-up drain STOPPED: QuestDB apply lag kept growing. Nothing is \
+                     lost — every segment the drain did not reach is still a `*.wal` file and \
+                     is re-read on the next boot."
+                );
+                break;
+            }
+            if tokio::time::Instant::now() >= catchup_deadline {
+                break;
+            }
             // MEMORY STOP — checked BEFORE the round, never after, because the
             // whole point is not to start work whose footprint we cannot hold.
             // One `/proc/self/status` read per round; the policy itself is the
@@ -15727,7 +15914,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                  unapplied map is cleared for this session"
             );
         }
-        if rounds > 0 || catchup_memory_stopped {
+        if rounds > 0 || catchup_memory_stopped || catchup_lag_stopped {
             // `catchup_memory_stopped` joins `exhausted` deliberately: all
             // three mean the SAME operational thing — the drain stood down
             // with work still on disk — and the counter exists to say that,
@@ -15736,10 +15923,13 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             // because the budget has $2.75 of margin to the automatic
             // STOP_EC2_INSTANCES line and a new EMF name is ~$0.30/mo.
             let exhausted = catchup_memory_stopped
+                || catchup_lag_stopped
                 || tokio::time::Instant::now() >= catchup_deadline
                 || rounds >= WAL_CATCHUP_MAX_ROUNDS;
             let stop_reason = if catchup_memory_stopped {
                 "memory"
+            } else if catchup_lag_stopped {
+                "apply_lag"
             } else if rounds >= WAL_CATCHUP_MAX_ROUNDS {
                 "round_cap"
             } else if exhausted {
@@ -15754,6 +15944,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 not_folded = catchup_not_folded,
                 budget_exhausted = exhausted,
                 memory_stopped = catchup_memory_stopped,
+                apply_lag_stopped = catchup_lag_stopped,
                 stop_reason,
                 "WAL catch-up drain finished — recovered a backlog that a single \
                  512 MiB replay batch could never have reached"
@@ -15958,6 +16149,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             ws_audit_tx: Some(&ws_audit_tx),
             out_topups: Some(&mut main_feed_topups),
             out_depth_commands: None,
+            instance_lock_held: &params.instance_lock_held,
         },
     );
     // `attempts = 0`: the boot dial happens once and has no retry loop behind
@@ -16015,6 +16207,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 .widen_universe
                 .clone()
                 .map(|source| RunningWiden::new(source, &params.main_feed_instruments)),
+            Arc::clone(&params.instance_lock_held),
         ));
     }
 
@@ -17503,11 +17696,6 @@ mod tests {
                         operator-armed probe on a depth-200 socket, never to a top-up"
                 )
             }
-            LiveSubscriptionCommand::RotateByRedial { .. } => {
-                panic!(
-                    "a top-up sent a RotateByRedial — rotation belongs to the depth-200 steering loop, never to a top-up"
-                )
-            }
         }
     }
 
@@ -17533,11 +17721,6 @@ mod tests {
                 panic!(
                     "a top-up sent a ProbeUnsubscribe — that command belongs to the\
                         operator-armed probe on a depth-200 socket, never to a top-up"
-                )
-            }
-            LiveSubscriptionCommand::RotateByRedial { .. } => {
-                panic!(
-                    "a top-up sent a RotateByRedial — rotation belongs to the depth-200 steering loop, never to a top-up"
                 )
             }
         }
@@ -23032,12 +23215,11 @@ mod tests {
              bypass the 805 gate in dial_planned_connections; route it through that function"
         );
 
-        // 4. The drain asks for no ghost redial after an 805: asking first
-        //    spent the per-socket ceiling and logged a redial that the
-        //    connection task then refused.
+        // 4. The drain asks for no ghost resend after an 805: "too many
+        //    requests" is the vendor's word, and a resend is a request.
         let ghost = production
-            .find("request_ghost_redial(\n")
-            .expect("the drain must still request ghost redials");
+            .find("request_ghost_unsubscribe(\n")
+            .expect("the drain must still request ghost unsubscribes");
         let guard = production[..ghost]
             .rfind("if outcome.ghost > 0")
             .expect("the ghost request sits under its own guard");
@@ -28351,7 +28533,10 @@ mod item_44_tests {
             let want = if (START..END).contains(&secs) {
                 WAL_CATCHUP_IN_SESSION_BUDGET_SECS
             } else if secs < START {
-                (START - secs + WAL_CATCHUP_IN_SESSION_BUDGET_SECS).min(WAL_CATCHUP_BUDGET_SECS)
+                WAL_CATCHUP_PREOPEN_STOP_SECS_OF_DAY_IST
+                    .saturating_sub(secs)
+                    .min(WAL_CATCHUP_BUDGET_SECS)
+                    .max(WAL_CATCHUP_IN_SESSION_BUDGET_SECS)
             } else {
                 WAL_CATCHUP_BUDGET_SECS
             };
@@ -28361,15 +28546,15 @@ mod item_44_tests {
 
     #[test]
     fn catchup_budget_boundaries_are_half_open() {
+        // 45c: after the 08:58 stop line a pre-open boot gets the in-session
+        // budget, the same as one minute later.
         assert_eq!(
             wal_catchup_budget_secs(32_399),
-            1 + WAL_CATCHUP_IN_SESSION_BUDGET_SECS
+            WAL_CATCHUP_IN_SESSION_BUDGET_SECS
         ); // 08:59:59
-        // A boot at 08:56 ends its drain by 09:00 + the in-session budget.
-        assert_eq!(
-            wal_catchup_budget_secs(32_160),
-            240 + WAL_CATCHUP_IN_SESSION_BUDGET_SECS
-        );
+        // A boot at 08:56 ends its drain by 08:58.
+        assert_eq!(wal_catchup_budget_secs(32_160), 120);
+        assert_eq!(WAL_CATCHUP_PREOPEN_STOP_SECS_OF_DAY_IST, 32_280);
         assert_eq!(wal_catchup_budget_secs(0), WAL_CATCHUP_BUDGET_SECS);
         assert_eq!(
             wal_catchup_budget_secs(32_400),
@@ -28383,6 +28568,80 @@ mod item_44_tests {
         assert_eq!(wal_catchup_budget_secs(u64::MAX), WAL_CATCHUP_BUDGET_SECS);
         assert_eq!(START, 32_400);
         assert_eq!(END, 56_400);
+    }
+
+    // 45c: a pre-open drain never runs past 08:58 unless the boot itself is
+    // inside the last in-session budget before that line.
+    #[test]
+    fn a_preopen_drain_ends_by_0858_or_within_the_in_session_budget() {
+        for secs in 0..START {
+            let end = secs + wal_catchup_budget_secs(secs);
+            let bound = WAL_CATCHUP_PREOPEN_STOP_SECS_OF_DAY_IST
+                .max(secs + WAL_CATCHUP_IN_SESSION_BUDGET_SECS);
+            assert!(end <= bound, "boot at {secs} ends at {end} past {bound}");
+            assert!(wal_catchup_budget_secs(secs) >= WAL_CATCHUP_IN_SESSION_BUDGET_SECS);
+            assert!(wal_catchup_budget_secs(secs) <= WAL_CATCHUP_BUDGET_SECS);
+        }
+        // The 08:30 boot keeps its full five minutes.
+        assert_eq!(wal_catchup_budget_secs(30_600), WAL_CATCHUP_BUDGET_SECS);
+    }
+
+    #[test]
+    fn test_wal_catchup_lag_step_covers_every_permutation() {
+        use CatchupLagStep::{Pause, Proceed, Stop};
+        let max = WAL_CATCHUP_LAG_PAUSE_MAX_SECS;
+        for growing in [0_u32, 1, 7, u32::MAX] {
+            for paused in [0_u64, 5, max - 1, max, max + 5, u64::MAX] {
+                for left in [0_u64, 1, 60, 300, u64::MAX] {
+                    let want = if growing == 0 {
+                        Proceed
+                    } else if paused >= max || left == 0 {
+                        Stop
+                    } else {
+                        Pause
+                    };
+                    assert_eq!(
+                        wal_catchup_lag_step(growing, paused, left),
+                        want,
+                        "growing={growing} paused={paused} left={left}"
+                    );
+                }
+            }
+        }
+    }
+
+    proptest! {
+        // Not growing always runs the round; growing never runs it.
+        #[test]
+        fn catchup_lag_step_never_runs_a_round_while_lag_grows(
+            growing in any::<u32>(),
+            paused in any::<u64>(),
+            left in any::<u64>(),
+        ) {
+            let step = wal_catchup_lag_step(growing, paused, left);
+            prop_assert_eq!(step == CatchupLagStep::Proceed, growing == 0);
+        }
+    }
+
+    #[test]
+    fn the_catchup_loop_consults_the_lag_step_before_each_round() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        let loop_at = prod
+            .find("while rounds < WAL_CATCHUP_MAX_ROUNDS")
+            .expect("catch-up loop");
+        let body = &prod[loop_at..];
+        let lag = body
+            .find("wal_catchup_lag_step(")
+            .expect("lag step in loop");
+        let replay = body
+            .find("replay_all_with_report_fenced(")
+            .expect("replay in loop");
+        assert!(lag < replay, "the lag step must run before the round reads");
+        assert!(
+            body.contains("tokio::time::sleep("),
+            "a pause must yield, not spin"
+        );
     }
 
     #[test]
