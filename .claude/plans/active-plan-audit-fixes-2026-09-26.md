@@ -2490,6 +2490,26 @@ write, then candle warm-up (PR31b-2 (a), already listed above). Each fix ships a
   test_regression_h4_the_depth_park_is_handed_on_or_written_never_dropped,
   the_drain_parks_a_refused_rescue_and_never_waits_to_retry_it. Honest limit: a parked batch is
   lost on a crash, where the old unsynced inline write would have kept it.
+- [x] **R1 — The startup replay waits for the database instead of re-deferring its own rows.**
+  Measured 3 Oct 2026 (deploys 962-964 and Friday's): every boot re-folded the same 173 WAL
+  segments (1,477,447 frames, 14.2M depth rows) faster than QuestDB absorbs them, so the producers
+  hit their retention bound and rescued ~27.7M rows back to the WAL as unapplied ranges, the 30 s
+  ack wait timed out, and 168 segments were left for the next boot: the backlog never shrank and
+  each boot logged ~10,000 coded lines. Outside the capture window the boot pass and each catch-up
+  round now pace every size-triggered flush on the writer threads (wait for a drain, flush again
+  only after a drain), until the catch-up budget's wall clock; inside it they behave as before, so
+  the sockets dial as soon as they did. Counted on `tv_wal_replay_pace_waits_total`, logged as
+  `pace_waits`. Files: `crates/app/src/dhan_feed_stack.rs`,
+  `crates/app/src/dhan_feed_stack/feed_aux_tests.rs`,
+  `crates/app/tests/wal_applied_watermark_wiring_guard.rs`. Tests:
+  test_pace_after_replay_flush_waits_for_the_writers_and_lands_its_rows,
+  an_unpaced_replay_flushes_once_and_never_waits,
+  a_paced_replay_stops_waiting_at_its_deadline_without_a_flush,
+  a_paced_replay_past_its_deadline_behaves_as_before,
+  test_wal_replay_pace_until_is_none_inside_the_capture_window, both_replay_passes_are_paced. Honest
+  limits: past the deadline, or inside the capture window, a replay still rescues as before; and
+  an after-hours deploy that stops the box within a minute of the replay persists little progress,
+  because the applied watermark is written 60 s behind the acks.
 
 ## Edge Cases
 

@@ -236,7 +236,7 @@ fn ingest_non_tick_at_a_replay_reproduces_the_live_rows() {
         WalEndpoint::MainFeed,
         bytes::Bytes::from(bytes),
     )];
-    let out = refold_wal_frames(&mut replay, &frames, &[]);
+    let out = refold_wal_frames(&mut replay, &frames, &[], None);
     assert_eq!(out.non_tick, 4);
     assert_eq!(
         live.writer.aux_rows_appended(),
