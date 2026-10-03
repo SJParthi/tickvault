@@ -653,7 +653,7 @@ jobs:
       # interpolations, docker-compose.yml lines ~168-169) on EVERY compose
       # invocation — they are NEVER persisted to the on-box .env; every proven
       # bring-up path fetches them from SSM at invocation time (deploy-aws.yml
-      # ~L634, tickvault ensure-questdb, infra.rs). Without them the recreate below fails
+      # ~L634, ensure-questdb.sh, infra.rs). Without them the recreate below fails
       # whole-file interpolation and the retune is unreachable in BOTH full and
       # retune-only mode. So: fetch both params (--with-decryption) and FAIL LOUDLY
       # on any SSM fetch failure or empty value (round 6 — the old `|| echo admin`

@@ -70,7 +70,7 @@ const DEPLOYED_COMPOSE_PATH: &str = "repo/deploy/docker/docker-compose.yml";
 ///
 /// It went unnoticed because something else was quietly covering for it: the
 /// deploy workflow runs its own `docker compose up` (with the correct path),
-/// and the systemd unit's `ExecStartPre` runs `tickvault ensure-questdb` (also with
+/// and the systemd unit's `ExecStartPre` runs `ensure-questdb.sh` (also with
 /// the correct path). QuestDB was therefore always already up by the time the
 /// app looked, so `classify_compose_outcome` returned `DegradedServiceUp` and
 /// the boot continued. A permanently-broken function reported a degraded-but-
@@ -103,8 +103,7 @@ fn resolve_compose_path() -> Option<&'static str> {
 
 /// System-wide docker CLI plugin locations probed for the Compose v2 plugin
 /// binary when neither `docker compose` nor `docker-compose` resolves
-/// (issue #1505 — mirrors rung 3c of the `tickvault ensure-questdb` ladder,
-/// `ensure_questdb.rs`, which adds the per-user path for its SSM caller).
+/// (issue #1505 — mirrors the `scripts/ensure-questdb.sh` rung-3c ladder).
 ///
 /// Deliberately EXCLUDES the per-user `~/.docker/cli-plugins/` directory:
 /// the systemd unit runs with `ProtectHome=true`, so a per-user plugin is
@@ -112,7 +111,7 @@ fn resolve_compose_path() -> Option<&'static str> {
 /// fallback — that invisibility is the #1505 root cause, and probing it
 /// here would make dev-shell behaviour diverge from the service context.
 /// Ratcheted by `test_compose_plugin_system_paths_are_system_wide`.
-pub(crate) const COMPOSE_PLUGIN_SYSTEM_PATHS: [&str; 3] = [
+const COMPOSE_PLUGIN_SYSTEM_PATHS: [&str; 3] = [
     "/usr/local/lib/docker/cli-plugins/docker-compose",
     "/usr/libexec/docker/cli-plugins/docker-compose",
     "/usr/lib/docker/cli-plugins/docker-compose",
@@ -211,14 +210,14 @@ pub fn classify_compose_outcome(
 // in the invoking context (e.g. the plugin lives under
 // `~/.docker/cli-plugins/`, hidden from the systemd service by
 // `ProtectHome=true`). That failure is DETERMINISTIC — retrying the same
-// invocation is noise, not recovery. Mirror the `tickvault ensure-questdb`
+// invocation is noise, not recovery. Mirror the `scripts/ensure-questdb.sh`
 // ladder (v2 → v1 → plugin-by-absolute-path) so a cold boot can bring
 // QuestDB up even when the `docker compose` front-end is broken, and fail
 // LOUDLY (once, with the actionable cause) when no compose front-end exists.
 
 /// A resolved, working Docker Compose front-end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ComposeCli {
+enum ComposeCli {
     /// `docker compose …` — the modern v2 plugin resolved by the docker CLI.
     DockerComposeV2,
     /// `docker-compose …` — the standalone v1 binary on `PATH`.
@@ -260,11 +259,7 @@ impl ComposeCli {
 /// `test_docker_compose_up_args_compose_subcommand_first` and
 /// `test_compose_cli_args_v1_and_plugin_have_no_compose_subcommand`.
 #[must_use]
-pub(crate) fn compose_cli_args<'a>(
-    cli: ComposeCli,
-    compose_path: &'a str,
-    tail: &[&'a str],
-) -> Vec<&'a str> {
+fn compose_cli_args<'a>(cli: ComposeCli, compose_path: &'a str, tail: &[&'a str]) -> Vec<&'a str> {
     let mut args: Vec<&'a str> = Vec::with_capacity(3 + tail.len());
     if matches!(cli, ComposeCli::DockerComposeV2) {
         args.push("compose");
@@ -1308,7 +1303,7 @@ async fn probe_command_succeeds(program: &str, args: &[&str]) -> bool {
 }
 
 /// True when `path` is an existing regular file with an execute bit set.
-pub(crate) fn is_executable_file(path: &str) -> bool {
+fn is_executable_file(path: &str) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1326,7 +1321,7 @@ pub(crate) fn is_executable_file(path: &str) -> bool {
 
 /// Resolves a working Compose front-end: `docker compose` (v2) →
 /// `docker-compose` (v1) → the plugin binary at a system path
-/// (issue #1505 — the same ladder as `tickvault ensure-questdb`).
+/// (issue #1505 — the same ladder as `scripts/ensure-questdb.sh`).
 ///
 /// `None` means NO compose CLI exists in this context — a DETERMINISTIC
 /// failure (the `unknown shorthand flag: 'f'` class); callers log it loudly

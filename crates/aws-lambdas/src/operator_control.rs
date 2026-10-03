@@ -1444,12 +1444,10 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
             }
         }
         "restart-questdb" => {
-            // `tickvault ensure-questdb` (create-or-restart; a Rust
-            // subcommand since plan item D6d, which retired the shell
-            // script) — robust to docker-compose v1/v2 absence + the CORRECT
-            // service name + SSM creds for the recreate case (incident
-            // 2026-06-08).
-            let cmds = ["/opt/tickvault/bin/tickvault ensure-questdb".to_string()];
+            // ensure-questdb.sh (create-or-restart) — robust to
+            // docker-compose v1/v2 absence + the CORRECT service name +
+            // SSM creds for the recreate case (incident 2026-06-08).
+            let cmds = ["bash /opt/tickvault/repo/scripts/ensure-questdb.sh".to_string()];
             match shell.ssm_shell(&cmds).await {
                 Ok(cid) => resp(
                     200,
@@ -4503,8 +4501,7 @@ mod tests {
         assert!(joined.contains("systemctl stop tickvault"));
         assert!(joined.contains("docker compose down -v"));
         assert!(joined.contains("docker system prune -af --volumes"));
-        assert!(joined.contains("/opt/tickvault/bin/tickvault ensure-questdb || true"));
-        assert!(!joined.contains("ensure-questdb.sh"));
+        assert!(joined.contains("ensure-questdb.sh"));
         assert!(joined.contains("systemctl restart tickvault"));
     }
 
@@ -4542,7 +4539,7 @@ mod tests {
         assert!(joined.contains("BARE-NUKE-RESULT"));
         assert!(joined.contains("bare-nuke-complete"));
         // the WHOLE POINT: it must NOT rebuild / restart the app
-        assert!(!joined.contains("ensure-questdb"));
+        assert!(!joined.contains("ensure-questdb.sh"));
         assert!(!joined.contains("systemctl restart tickvault"));
         assert!(!joined.contains("docker compose up"));
     }
@@ -5213,22 +5210,6 @@ data-pull phase, so the system is never blinded mid-trade";
             let resp = post(&shell, json!({"action": action, "force": true})).await;
             assert_eq!(status_of(&resp), 200, "{action}");
         }
-    }
-
-    #[tokio::test]
-    async fn test_restart_questdb_runs_the_rust_subcommand_not_the_retired_script() {
-        // Plan item D6d: the QuestDB self-heal is the app binary's
-        // `ensure-questdb` subcommand; the shell script it replaced is gone.
-        let shell = MockShell {
-            ssm_result: Ok("cmd-qdb".to_string()),
-            ..MockShell::default()
-        };
-        let resp = post(&shell, json!({"action": "restart-questdb", "force": true})).await;
-        assert_eq!(status_of(&resp), 200);
-        let joined = shell.captured_joined();
-        assert!(joined.contains("/opt/tickvault/bin/tickvault ensure-questdb"));
-        assert!(!joined.contains("ensure-questdb.sh"));
-        assert!(!joined.contains("bash "));
     }
 
     #[tokio::test]

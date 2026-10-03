@@ -130,6 +130,7 @@ const SHELL_OPS_FILES: &[(&str, usize)] = &[
     ("scripts/diagnose-write-amplification.sh", 99),
     ("scripts/doctor.sh", 298),
     ("scripts/ensure-aws-cli.sh", 71),
+    ("scripts/ensure-questdb.sh", 230),
     ("scripts/ensure-ready.sh", 312),
     ("scripts/flaky-detect.sh", 93),
     ("scripts/mcp-doctor.sh", 97),
@@ -165,6 +166,7 @@ const SHELL_OPS_FILES: &[(&str, usize)] = &[
 const SYSTEMD_SHELL_EXEC_BUDGET: &[(&str, usize)] = &[
     ("deploy/systemd/tickvault-holiday-gate.service", 1),
     ("deploy/systemd/tickvault-host-tuning.service", 3),
+    ("deploy/systemd/tickvault.service", 1),
 ];
 
 /// Shells a shebang may name for the file to count as a shell script.

@@ -2639,19 +2639,6 @@ fn guard_self_test() {
 /// The six that exist launch operator tooling (docker / git / aws CLIs).
 const NON_LITERAL_SPAWN_BUDGET: &[(&str, usize)] = &[
     ("crates/app/src/bin/tv_doctor.rs", 1),
-    // NEW at 1 on 2026-10-02 (plan item D6d), with the justification the
-    // failure message above demands. `tickvault ensure-questdb` replaced the
-    // shell script `scripts/ensure-questdb.sh`, deleted in the same PR, so a
-    // whole interpreted program left the product path. Its rung 3c runs the
-    // compose plugin by absolute path, and one of the four paths is
-    // `${HOME:-/home/ec2-user}/.docker/cli-plugins/docker-compose`, which is
-    // only known at run time: that is the one variable-program spawn. Every
-    // other spawn in the file is a literal (`docker`, `docker-compose`).
-    // The allowlist IS checked AT THE CALL SITE: `is_allowed_plugin_program`
-    // admits only an absolute `…/docker-compose` path with no `..` that is
-    // one of the process's own four rung 3c candidates, and refuses the
-    // spawn otherwise (`plugin_spawn_allowlist_admits_only_candidates`).
-    ("crates/app/src/ensure_questdb.rs", 1),
     // 4 -> 5 on 2026-09-05, and this is the justification the failure message
     // above demands. `Command::new("open")` (launch Docker Desktop) became
     // `Command::new(spawn_program("open"))` so a unit test can no longer launch
