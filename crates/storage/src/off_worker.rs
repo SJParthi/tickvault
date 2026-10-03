@@ -74,7 +74,7 @@ mod tests {
     /// prices what the drain stopped paying on every hand-off-only flush:
     /// `cargo test -p tickvault-storage --lib off_worker -- --ignored --nocapture`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore]
+    #[ignore = "wall-clock timing harness; a timing must never gate CI"]
     async fn block_in_place_cost_against_a_bare_call() {
         const ROUNDS: usize = 10_000;
         let mut hand_over = Vec::with_capacity(ROUNDS);

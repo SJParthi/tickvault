@@ -49,6 +49,18 @@ fn repo_root() -> PathBuf {
 /// This list may SHRINK freely. Growing it is a deliberate edit, in the same
 /// change, with the reason visible to a reviewer.
 const ALLOWED_IGNORED: &[(&str, &str)] = &[
+    // Added 2026-10-03 with sweep S1 (the drain flush no longer hands over
+    // its worker): the same wall-clock shape as the harnesses below -- it
+    // times `block_in_place` against a bare call and prints both, so a shared
+    // CI runner would make it a flake. It gates nothing; that the drain's
+    // writers step off the worker only at their blocking steps is pinned by
+    // the ordinary test `every_blocking_writer_step_runs_off_the_worker`.
+    //
+    //   cargo test -p tickvault-storage --lib off_worker -- --ignored --nocapture
+    (
+        "crates/storage/src/off_worker.rs",
+        "block_in_place_cost_against_a_bare_call",
+    ),
     // Added 2026-09-19 with the radix A/B it belongs to: the same wall-clock
     // shape as the other wall-clock harnesses here -- it times the leaderboard's
     // comparator against a candidate radix sort at four sizes and prints both
