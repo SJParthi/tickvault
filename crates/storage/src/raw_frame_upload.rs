@@ -1037,7 +1037,9 @@ async fn upload_candidate<S: ColdObjectStore>(
                     reason: "file path has no file name".to_string(),
                 };
             };
-            let mtime = std::fs::metadata(&cand.path).map_or(0, |m| mtime_secs_of(&m));
+            let mtime = crate::off_worker::off_worker(|| {
+                std::fs::metadata(&cand.path).map_or(0, |m| mtime_secs_of(&m))
+            });
             let key = cold_file_key(set.prefix, name, mtime);
             upload_file(store, &cand.markers, &cand.path, &key).await
         }
@@ -1075,13 +1077,17 @@ async fn run_pass_with<S: ColdObjectStore>(
     now: SystemTime,
 ) -> UploadPassSummary {
     retry_held_markers().await;
-    let pending = pending_files(
-        &wal_scan_dirs(wal_dir),
-        Some("wal"),
-        MarkerMatch::Length,
-        now,
-        is_open,
-    );
+    // 2026-10-03 (O(1) sweep S3): the listing stats every file in three
+    // directories and reads a marker per file, so it moves the worker aside.
+    let pending = crate::off_worker::off_worker(|| {
+        pending_files(
+            &wal_scan_dirs(wal_dir),
+            Some("wal"),
+            MarkerMatch::Length,
+            now,
+            is_open,
+        )
+    });
     let (summary, first_failure) = upload_candidates(
         store,
         PassKind::Wal,
@@ -1153,13 +1159,16 @@ async fn run_file_pass_with<S: ColdObjectStore>(
     now: SystemTime,
 ) -> UploadPassSummary {
     retry_held_markers().await;
-    let pending = pending_files(
-        &set.scan_dirs(),
-        set.extension,
-        MarkerMatch::LengthAndMtime,
-        now,
-        is_open,
-    );
+    // Same as the WAL pass: the listing blocks on the disk.
+    let pending = crate::off_worker::off_worker(|| {
+        pending_files(
+            &set.scan_dirs(),
+            set.extension,
+            MarkerMatch::LengthAndMtime,
+            now,
+            is_open,
+        )
+    });
     let (summary, first_failure) = upload_candidates(
         store,
         PassKind::Files(set),
@@ -1354,6 +1363,26 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+
+    /// 2026-10-03 (O(1) sweep S3): every listing of the upload directories
+    /// stats one file per entry, so each production call moves the worker
+    /// aside. A bare call would hold a tokio worker for a whole directory
+    /// walk on a slow disk.
+    #[test]
+    fn every_listing_runs_off_the_worker() {
+        let src = include_str!("raw_frame_upload.rs");
+        let production = &src[..src.find("#[cfg(test)]").expect("test modules exist")];
+        let bare_calls = production.matches("pending_files(").count();
+        let wrapped = production
+            .matches("off_worker(|| {\n        pending_files(")
+            .count();
+        // One definition, two wrapped calls.
+        assert_eq!(bare_calls, 3, "pending_files: one definition and two calls");
+        assert_eq!(
+            wrapped, 2,
+            "both pending_files calls must run inside off_worker"
+        );
+    }
 
     /// In-memory stand-in for the bucket. `head_len_skew` corrupts the
     /// length HeadObject reports for objects this store wrote.

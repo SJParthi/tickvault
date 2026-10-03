@@ -86,3 +86,34 @@ fn test_main_wires_errors_log_cap() {
          never a duplicated path literal"
     );
 }
+
+/// 2026-10-03 (O(1) sweep S3): every retention sweep lists, stats and
+/// deletes files, so all four run inside one `spawn_blocking` closure. On a
+/// tokio worker a slow or full disk held a thread that the frame drain and
+/// the socket readers also run on.
+#[test]
+fn test_retention_sweeps_run_on_the_blocking_pool() {
+    let src = read_main_rs();
+    let first = src
+        .find("ws_frame_spill::prune_archived_segments(")
+        .expect("prune call present");
+    let blocking = src[..first]
+        .rfind("spawn_blocking(")
+        .expect("the retention sweeps must run inside spawn_blocking");
+    let closure_end = blocking
+        + src[blocking..]
+            .find("            });")
+            .expect("the spawn_blocking closure must close");
+    for step in [
+        "ws_frame_spill::prune_archived_segments(",
+        "ws_frame_spill::prune_active_segments(",
+        "seal_spill::prune_spill_files(",
+        "seal_dlq::record_dlq_bytes(",
+    ] {
+        let at = src.find(step).expect("each sweep is present");
+        assert!(
+            at > blocking && at < closure_end,
+            "`{step}` must run inside the spawn_blocking closure, not on a tokio worker"
+        );
+    }
+}

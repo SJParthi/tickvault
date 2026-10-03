@@ -135,7 +135,14 @@ pub fn spawn(config: SummaryWriterConfig) -> JoinHandle<()> {
         );
         loop {
             tokio::time::sleep(config.refresh_interval).await;
-            match regenerate_summary(&config) {
+            // File reads, JSON parsing and an fsync: on the blocking pool,
+            // never on a shared tokio worker (O(1) sweep, 2026-10-03). One
+            // config clone a minute.
+            let job = config.clone();
+            let outcome = tokio::task::spawn_blocking(move || regenerate_summary(&job))
+                .await
+                .unwrap_or_else(|join| Err(anyhow::anyhow!("summary task failed: {join}")));
+            match outcome {
                 Ok(groups) => {
                     metrics::counter!(METRIC_REFRESH_TOTAL).increment(1);
                     debug!(signatures = groups, "errors.summary.md refreshed");
@@ -168,6 +175,13 @@ pub fn regenerate_summary(config: &SummaryWriterConfig) -> Result<usize> {
     let mut groups: HashMap<String, SignatureGroup> = HashMap::new();
 
     for path in files {
+        // A file last written before the cutoff holds no event inside the
+        // window (lines are appended in time order), so it is not read at
+        // all. Bounds the work to the files of the lookback window instead of
+        // every retained file (48 h) every minute (O(1) sweep, 2026-10-03).
+        if file_last_written_before(&path, cutoff_epoch) {
+            continue;
+        }
         let contents = match fs::read_to_string(&path) {
             Ok(c) => c,
             Err(err) => {
@@ -236,6 +250,18 @@ pub fn regenerate_summary(config: &SummaryWriterConfig) -> Result<usize> {
 /// Returns every `errors.jsonl*` file under `dir`, sorted newest-first
 /// by filename (the rolling appender's names sort lexicographically =
 /// chronologically).
+/// True only when the file's modification time is known and earlier than
+/// `cutoff_epoch`. An unreadable time reads as "maybe recent", so the file is
+/// still scanned (never hides an event).
+fn file_last_written_before(path: &Path, cutoff_epoch: i64) -> bool {
+    fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .and_then(|since| i64::try_from(since.as_secs()).ok())
+        .is_some_and(|written| written < cutoff_epoch)
+}
+
 fn discover_jsonl_files(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut files: Vec<PathBuf> = Vec::new();
     let entries = match fs::read_dir(dir) {
@@ -595,6 +621,42 @@ mod tests {
         let cfg = SummaryWriterConfig::new(&tmp);
         let count = regenerate_summary(&cfg).unwrap_or_else(|e| panic!("regen: {e}"));
         assert_eq!(count, 0, "old events must be filtered out");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn regenerate_summary_skips_a_file_last_written_before_the_window() {
+        let tmp = std::env::temp_dir().join(format!("tv-summary-stale-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap_or_else(|e| panic!("mkdir: {e}"));
+
+        // The event carries no timestamp, which the scan includes
+        // conservatively when it reads the file. The file itself was last
+        // written two hours ago, so it is not read at all.
+        let path = tmp.join("errors.jsonl.2099-01-01-01");
+        fs::write(
+            &path,
+            "{\"level\":\"ERROR\",\"target\":\"t\",\"code\":\"X\",\"message\":\"stale\"}\n",
+        )
+        .unwrap_or_else(|e| panic!("write: {e}"));
+        let cfg = SummaryWriterConfig::new(&tmp);
+        assert_eq!(
+            regenerate_summary(&cfg).unwrap_or_else(|e| panic!("regen: {e}")),
+            1,
+            "a fresh file is read"
+        );
+        let two_hours_ago = SystemTime::now() - Duration::from_secs(2 * 3600);
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .and_then(|file| file.set_modified(two_hours_ago))
+            .unwrap_or_else(|e| panic!("set mtime: {e}"));
+        assert_eq!(
+            regenerate_summary(&cfg).unwrap_or_else(|e| panic!("regen: {e}")),
+            0,
+            "a file last written before the window is skipped"
+        );
 
         let _ = fs::remove_dir_all(&tmp);
     }

@@ -2013,15 +2013,20 @@ impl DepthWriter {
 
     /// The drain's only depth spill write, NOT synced (see
     /// `SPILL_UNSYNCED_ON_DRAIN`).
+    ///
+    /// A file write, so it runs through `off_worker` (the drain calls `flush`
+    /// bare; see the tick writer's twin).
     fn spill_on_drain(&self, payload: &[u8], rows: usize) -> bool {
-        perform_depth_rescue(
-            &self.spill_dir,
-            payload,
-            self.feed,
-            rows,
-            self.spill_min_free_headroom,
-            crate::tick_persistence::SPILL_UNSYNCED_ON_DRAIN,
-        )
+        crate::off_worker::off_worker(|| {
+            perform_depth_rescue(
+                &self.spill_dir,
+                payload,
+                self.feed,
+                rows,
+                self.spill_min_free_headroom,
+                crate::tick_persistence::SPILL_UNSYNCED_ON_DRAIN,
+            )
+        })
     }
 
     /// Closes the hand-off queue, so the writer thread sees the end of the
@@ -2203,7 +2208,9 @@ impl DepthWriter {
             anyhow::bail!("market_depth writer disconnected; {dropped} row(s) discarded");
         };
         let started = std::time::Instant::now();
-        let first = sender.flush(&mut self.buffer);
+        // Synchronous ILP round trips (this and the one retry below) run
+        // through `off_worker`: the drain calls `flush` bare.
+        let first = crate::off_worker::off_worker(|| sender.flush(&mut self.buffer));
         let first_failure_elapsed = started.elapsed();
         let outcome = match first {
             Ok(()) => Ok(()),
@@ -2242,7 +2249,7 @@ impl DepthWriter {
                     "feed" => self.feed.as_str(),
                 )
                 .increment(1);
-                sender.flush(&mut self.buffer)
+                crate::off_worker::off_worker(|| sender.flush(&mut self.buffer))
             }
             Err(err) => {
                 if flush_failure_is_retryable(&err) {

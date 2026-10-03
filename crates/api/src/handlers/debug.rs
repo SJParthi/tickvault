@@ -59,7 +59,7 @@ pub async fn logs_summary() -> impl IntoResponse {
 /// Returns 404 if no errors.jsonl.* file exists yet.
 pub async fn logs_jsonl_latest() -> impl IntoResponse {
     let dir = resolve_logs_dir();
-    match newest_jsonl(&dir) {
+    match on_blocking_pool(move || newest_jsonl(&dir)).await.flatten() {
         Some(path) => read_text_file(&path, "application/x-ndjson; charset=utf-8").await,
         None => (
             StatusCode::NOT_FOUND,
@@ -98,6 +98,21 @@ fn resolve_spill_dir() -> PathBuf {
 /// drains. The `auto-fix-drain-spill.sh` script (M3) consumes this
 /// endpoint as its pre-flight check.
 pub async fn spill_status() -> impl IntoResponse {
+    // The scan stats every spill file, so it runs on the blocking pool and
+    // never on a runtime worker (O(1) sweep S4, 2026-10-03).
+    let body = on_blocking_pool(spill_status_body)
+        .await
+        .unwrap_or_else(|| "{\"error\":\"spill scan failed\"}".to_string());
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+}
+
+/// Builds the `spill_status` JSON body. Blocking: one `read_dir` and one
+/// `stat` per spill file, so callers run it on the blocking pool.
+fn spill_status_body() -> String {
     let dir = resolve_spill_dir();
     let exists = dir.is_dir();
 
@@ -134,12 +149,7 @@ pub async fn spill_status() -> impl IntoResponse {
         exists,
         categories
     );
-
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/json")],
-        body,
-    )
+    body
 }
 
 fn scan_spill_category(dir: &Path) -> (u64, u64, Option<String>) {
@@ -234,8 +244,9 @@ fn resolve_cross_verify_dir() -> PathBuf {
 /// `.csv` for the same date) and any foreign/symlinked file are never
 /// selected (2026-06-10 pre-impl security review).
 fn newest_cross_verify_csv(dir: &Path) -> Option<PathBuf> {
-    let entries = std::fs::read_dir(dir).ok()?;
-    let mut matches: Vec<PathBuf> = entries
+    // One pass keeping the greatest name: O(entries), no list, no sort.
+    std::fs::read_dir(dir)
+        .ok()?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| {
@@ -243,9 +254,7 @@ fn newest_cross_verify_csv(dir: &Path) -> Option<PathBuf> {
                 n.starts_with(CROSS_VERIFY_CSV_PREFIX) && n.ends_with(CROSS_VERIFY_CSV_SUFFIX)
             })
         })
-        .collect();
-    matches.sort();
-    matches.pop()
+        .max()
 }
 
 /// GET /api/debug/cross-verify/latest — the latest post-market 1-minute
@@ -282,7 +291,11 @@ pub async fn cross_verify_latest() -> impl IntoResponse {
             "{\"error\":\"no cross-verify run yet\"}".to_string(),
         )
     };
-    let Some(csv_path) = newest_cross_verify_csv(&dir) else {
+    let scan_dir = dir.clone();
+    let Some(csv_path) = on_blocking_pool(move || newest_cross_verify_csv(&scan_dir))
+        .await
+        .flatten()
+    else {
         return not_found();
     };
     // Bounded read (post-impl security review): a pathological mismatch
@@ -343,8 +356,9 @@ fn json_escape(s: &str) -> String {
 }
 
 fn newest_jsonl(dir: &Path) -> Option<PathBuf> {
-    let entries = std::fs::read_dir(dir).ok()?;
-    let mut matches: Vec<PathBuf> = entries
+    // One pass keeping the greatest name: O(entries), no list, no sort.
+    std::fs::read_dir(dir)
+        .ok()?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| {
@@ -352,9 +366,16 @@ fn newest_jsonl(dir: &Path) -> Option<PathBuf> {
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.starts_with(ERRORS_JSONL_PREFIX))
         })
-        .collect();
-    matches.sort();
-    matches.pop()
+        .max()
+}
+
+/// Runs a blocking directory scan on the blocking pool so it never holds a
+/// runtime worker. `None` only when the task panicked or the runtime is
+/// shutting down; callers answer as if nothing were found.
+async fn on_blocking_pool<T: Send + 'static>(
+    scan: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    tokio::task::spawn_blocking(scan).await.ok()
 }
 
 async fn read_text_file(
@@ -380,6 +401,43 @@ mod tests {
     use std::fs;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// O(1) sweep S4 (2026-10-03): every directory scan behind a handler
+    /// runs on the blocking pool. A bare `read_dir` in an async handler
+    /// holds a runtime worker for as long as the disk takes.
+    #[test]
+    fn every_handler_scan_runs_on_the_blocking_pool() {
+        let src = include_str!("debug.rs");
+        let production = &src[..src.find("#[cfg(test)]").expect("tests exist")];
+        for (handler, scan) in [
+            (
+                "pub async fn logs_jsonl_latest",
+                "on_blocking_pool(move || newest_jsonl(",
+            ),
+            (
+                "pub async fn spill_status",
+                "on_blocking_pool(spill_status_body)",
+            ),
+            (
+                "pub async fn cross_verify_latest",
+                "on_blocking_pool(move || newest_cross_verify_csv(",
+            ),
+        ] {
+            let rest = production.split(handler).nth(1).expect("handler exists");
+            // Up to the next top-level item, so one handler's check cannot
+            // be satisfied by its neighbour.
+            let end = ["\nfn ", "\npub ", "\nasync fn "]
+                .iter()
+                .filter_map(|item| rest.find(item))
+                .min()
+                .unwrap_or(rest.len());
+            let body = &rest[..end];
+            assert!(
+                body.contains(scan),
+                "{handler} must run its scan via `{scan}`"
+            );
+        }
+    }
 
     /// Process-global env-var lock. Plain `cargo test` runs every `#[test]`
     /// in this binary as a parallel THREAD of ONE process, and
