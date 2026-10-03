@@ -2500,6 +2500,17 @@ write, then candle warm-up (PR31b-2 (a), already listed above). Each fix ships a
   a_nested_call_runs_inline_and_does_not_panic, runs_inline_on_a_current_thread_runtime_without_panicking,
   test_drain_never_flushes_bare_on_the_async_worker. Measured: block_in_place p50 191 ns / p99
   309 ns uncontended (debug), bare call 30 / 41 ns.
+- [x] **S2 — Disk probes, audit flushes and the error summary no longer block a shared worker.**
+  The disk-health watcher (`df`-style statvfs), the resource monitor (fd count, RSS, memory
+  ceiling, spill free space from `/proc`), the WAL auto-resume free-space probe and the hourly
+  error-summary rewrite ran as plain blocking calls on tokio workers; the WebSocket audit
+  consumer flushed its ILP writer bare. Each now runs in `spawn_blocking` (probes, summary) or
+  through `blocking_flush` (audit), and the summary skips files last written before its window
+  instead of re-reading the whole directory. Files: `crates/storage/src/{disk_health_watcher,
+  resource_monitor,wal_suspension_watcher}.rs`, `crates/core/src/notification/summary_writer.rs`,
+  `crates/app/src/{ws_audit_consumer,order_observability}.rs`. Tests:
+  test_audit_consumers_never_flush_bare_on_the_worker,
+  regenerate_summary_skips_a_file_last_written_before_the_window.
 
 ## Edge Cases
 

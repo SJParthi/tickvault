@@ -1222,9 +1222,18 @@ async fn attempt_auto_resume(
 
     // Measured ONCE per poll, not per table: `df` is a subprocess, and the
     // answer cannot differ between two tables on the same volume.
-    let disk = match crate::disk_health_watcher::probe_disk_free_bytes(std::path::Path::new(
-        RESUME_DISK_PROBE_PATH,
-    )) {
+    // On the blocking pool: a `df` fork can hang on the very volume whose
+    // fullness suspended the table (O(1) sweep, 2026-10-03).
+    let probe = tokio::task::spawn_blocking(|| {
+        crate::disk_health_watcher::probe_disk_free_bytes(std::path::Path::new(
+            RESUME_DISK_PROBE_PATH,
+        ))
+    })
+    .await
+    .unwrap_or(crate::disk_health_watcher::DiskHealthOutcome::ProbeFailed {
+        reason: "probe_task_failed",
+    });
+    let disk = match probe {
         crate::disk_health_watcher::DiskHealthOutcome::Ok {
             free_bytes,
             total_bytes,
