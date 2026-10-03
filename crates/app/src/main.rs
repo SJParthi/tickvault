@@ -1872,7 +1872,10 @@ async fn async_main() -> Result<()> {
                 Path::new(observability::ERRORS_JSONL_DIR),
                 Path::new(observability::LEGACY_LOGS_DIR),
             ] {
-                match observability::sweep_errors_jsonl_retention(dir, RETENTION_HOURS) {
+                // Sweep S5: the directory walk runs off the shared worker.
+                match tickvault_storage::off_worker::off_worker(|| {
+                    observability::sweep_errors_jsonl_retention(dir, RETENTION_HOURS)
+                }) {
                     Ok(0) => {}
                     Ok(n) => tracing::info!(
                         deleted = n,
@@ -1894,10 +1897,12 @@ async fn async_main() -> Result<()> {
             // also live in the hourly machine app logs + errors.jsonl, so a
             // truncation loses nothing uniquely. Hosted here (the existing
             // hourly sweep task) rather than a new task.
-            match observability::cap_errors_log_size(
-                Path::new(tickvault_app::boot_helpers::ERROR_LOG_FILE_PATH),
-                observability::ERRORS_LOG_MAX_BYTES,
-            ) {
+            match tickvault_storage::off_worker::off_worker(|| {
+                observability::cap_errors_log_size(
+                    Path::new(tickvault_app::boot_helpers::ERROR_LOG_FILE_PATH),
+                    observability::ERRORS_LOG_MAX_BYTES,
+                )
+            }) {
                 Ok(None) => {}
                 Ok(Some(prev_bytes)) => tracing::info!(
                     prev_bytes,
@@ -1932,7 +1937,10 @@ async fn async_main() -> Result<()> {
                 Path::new(observability::ERRORS_JSONL_DIR),
                 Path::new(observability::LEGACY_LOGS_DIR),
             ] {
-                match observability::sweep_app_log_retention(dir, RETENTION_HOURS) {
+                // Sweep S5: the directory walk runs off the shared worker.
+                match tickvault_storage::off_worker::off_worker(|| {
+                    observability::sweep_app_log_retention(dir, RETENTION_HOURS)
+                }) {
                     Ok(0) => {}
                     Ok(n) => tracing::info!(
                         deleted = n,
@@ -1971,11 +1979,14 @@ async fn async_main() -> Result<()> {
                     cat.prefix()
                 );
                 for dir in [Path::new(cat.dir()), Path::new(legacy_dir.as_str())] {
-                    match tickvault_app::observability::sweep_category_log_retention(
-                        dir,
-                        cat.prefix(),
-                        RETENTION_HOURS,
-                    ) {
+                    // Sweep S5: the directory walk runs off the shared worker.
+                    match tickvault_storage::off_worker::off_worker(|| {
+                        tickvault_app::observability::sweep_category_log_retention(
+                            dir,
+                            cat.prefix(),
+                            RETENTION_HOURS,
+                        )
+                    }) {
                         Ok(0) => {}
                         Ok(n) => tracing::info!(
                             deleted = n,

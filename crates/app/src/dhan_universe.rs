@@ -1116,7 +1116,8 @@ async fn build_once(date: &str, questdb: &QuestDbConfig) -> anyhow::Result<JoinO
     // SEBI tables above are written. Ordering is the safety property -- a sweep
     // that ran first could delete the only artifact a failed build would have
     // left the lane, and the lane's fallback is four index SIDs.
-    let swept = sweep_stale_artifacts(date);
+    // Sweep S5: the directory walk runs off the shared tokio worker.
+    let swept = tickvault_storage::off_worker::off_worker(|| sweep_stale_artifacts(date));
     if swept.removed > 0 || swept.failed > 0 {
         info!(
             removed = swept.removed,

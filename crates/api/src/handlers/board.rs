@@ -148,7 +148,8 @@ pub(crate) async fn compute_board_data(state: &SharedAppState) -> BoardDataRespo
             uptime_secs,
             build_sha_short: tickvault_common::build_info::build_git_sha_short(),
             market_open,
-            mem_rss_bytes: read_proc_rss_bytes(),
+            // Sweep S5: the procfs read runs off the shared worker.
+            mem_rss_bytes: tickvault_storage::off_worker::off_worker(read_proc_rss_bytes),
         },
         feeds,
         db: BoardDb {

@@ -336,7 +336,11 @@ impl DepthSubscriptionView {
     /// day and is otherwise harmless: the set stays correct in RAM, and only a
     /// restart later the same day would lose the unsaved part.
     fn persist_held_today(&self, path: &std::path::Path, day: i64, keys: Vec<Key>) {
-        let Err(err) = write_held_today_file(path, day, keys) else {
+        // A file write once a minute at most, on the steering task: moved off
+        // the shared worker so a slow disk cannot hold the socket readers.
+        let written =
+            tickvault_storage::off_worker::off_worker(|| write_held_today_file(path, day, keys));
+        let Err(err) = written else {
             return;
         };
         let mut guard = self
@@ -368,10 +372,11 @@ impl DepthSubscriptionView {
     /// keeps the first path. Returns how many keys were reloaded.
     pub fn enable_held_today_persistence(&self, path: std::path::PathBuf, now_secs: i64) -> usize {
         let day = Self::ist_day_of(now_secs);
-        let restored = match read_held_today_file(&path) {
-            Some(file) if file.ist_day == day => file.keys,
-            _ => Vec::new(),
-        };
+        let restored =
+            match tickvault_storage::off_worker::off_worker(|| read_held_today_file(&path)) {
+                Some(file) if file.ist_day == day => file.keys,
+                _ => Vec::new(),
+            };
         let mut guard = self
             .held_today
             .lock()

@@ -235,7 +235,8 @@ pub fn spawn_oom_monitor(memory_events_path: PathBuf) -> tokio::task::JoinHandle
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
-            match probe_oom_kill_count(&memory_events_path) {
+            // Sweep S5: the cgroup read runs off the shared worker.
+            match crate::off_worker::off_worker(|| probe_oom_kill_count(&memory_events_path)) {
                 OomProbeOutcome::Ok { oom_kill_count } => match baseline {
                     None => {
                         baseline = Some(oom_kill_count);

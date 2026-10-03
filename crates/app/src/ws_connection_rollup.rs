@@ -558,7 +558,7 @@ pub async fn run_ws_connection_rollup(
         }
         appended += 1;
     }
-    if let Err(err) = writer.flush() {
+    if let Err(err) = tickvault_storage::off_worker::off_worker(|| writer.flush()) {
         error!(
             code = "SCOREBOARD-01",
             stage = "ws_connection_rollup_flush",
