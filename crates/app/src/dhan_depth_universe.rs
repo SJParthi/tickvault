@@ -1008,12 +1008,17 @@ pub async fn load_depth_universe_from_master(
 ///
 /// # Why this is its own function
 ///
-/// The per-minute rebalance ([`crate::depth_rebalance`]) needs the SAME slice
+/// The per-minute rebalance ([`crate::depth_rebalance`]) needed the SAME slice
 /// the attach selected from. Otherwise the strikes it reasons about could
 /// drift from the strikes actually subscribed, and a socket would move onto a
 /// contract the selector never considered — a well-formed subscription to the
 /// wrong instrument, which nothing downstream could tell apart from the right
 /// one. Extracting it is what makes "one path" a fact rather than a comment.
+///
+/// ⚠ 2026-10-02: the rebalance loop no longer calls this. Its per-minute
+/// result fed only a log count (the swaps come from the volume ranking), so
+/// the call was removed. The one caller is the attach
+/// ([`crate::depth_rebalance::load_attach_inputs`]), once per attach attempt.
 ///
 /// # Returns an empty slice on every failure
 ///
@@ -1047,9 +1052,10 @@ pub async fn load_depth_candidates(
         }
     };
     // RAM first: its size sets the database budget (see
-    // `fetch_spot_prices_backstop`). This runs once a MINUTE, so a stalled
-    // backstop consulted at its full budget would cost the steering loop ten
-    // of every sixty seconds for a read that can only add stragglers.
+    // `fetch_spot_prices_backstop`). This ran once a MINUTE until 2026-10-02
+    // (now once per attach attempt), so a stalled backstop consulted at its
+    // full budget cost the steering loop ten of every sixty seconds for a read
+    // that can only add stragglers.
     let ram = spot_store.snapshot_prices();
     let from_ram = ram.len();
     let mut prices = crate::dhan_contract_universe::fetch_spot_prices_backstop(
@@ -1068,9 +1074,10 @@ pub async fn load_depth_candidates(
     // a strike the contract set does not carry.
     //
     // The SPLIT is logged for the same reason the contract path logs it, and
-    // it matters MORE here: this runs once per minute against the contract
-    // path's once-per-attach, so a silently-unfed store would read exactly
-    // like a working one 375 times a session. The counts are taken before the
+    // it mattered more here while this ran once per minute (until
+    // 2026-10-02; now once per attach attempt, like the contract path): a
+    // silently-unfed store read exactly like a working one 375 times a
+    // session. The counts are taken before the
     // merge because `extend` makes the two sources indistinguishable after it.
     let from_questdb = prices.len();
     prices.extend(ram);
@@ -1081,7 +1088,7 @@ pub async fn load_depth_candidates(
     );
     // The same symbol map the contract path reads: depth groups by underlying
     // SYMBOL, and the spot prices come back keyed on (security_id, segment).
-    // SHARED, not re-parsed: this runs once a minute and the mapping artifact
+    // SHARED, not re-parsed: this can run on every attach retry and the mapping artifact
     // is written once per trading day. See `read_symbol_map` for why the cache
     // is guarded on the file's stat stamp rather than on the date alone.
     let symbols = crate::dhan_contract_universe::read_symbol_map(date_ist).unwrap_or_default();

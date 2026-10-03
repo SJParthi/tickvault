@@ -377,7 +377,7 @@ struct AppStateInner {
     /// TTL cache for the `/api/stats` response body (2026-07-09 audit
     /// hardening — public-funnel DoS/DB-load surface). Single slot, 5s TTL.
     stats_cache: crate::response_cache::SingleSlotTtlCache,
-    /// TTL cache for `/api/quote/{security_id}` 200 bodies. Per-SID, 1s TTL,
+    /// TTL cache for `/api/quote/{security_id}` 200 bodies. Per-(SID, segment), 1s TTL,
     /// hard entry cap; the handler caches ONLY 200 responses so garbage
     /// attacker-chosen security_ids can never grow the map.
     quote_cache: crate::response_cache::BoundedTtlCache,

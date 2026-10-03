@@ -115,6 +115,8 @@ pub mod dhan_live_crossverify_persistence;
 /// EPISODE (disconnect / stall / process death) with the blame verdict
 /// persisted — the month-end "who caused it" system-of-record.
 pub mod feed_episode_audit_persistence;
+// 2026-10-02: one row per live-feed reconnect gap (gap start, end, code).
+pub mod feed_gap_audit_persistence;
 /// Dual-feed scoreboard (operator 2026-07-10): the per-day per-feed
 /// scoreboard row + the per-instrument coverage detail table.
 pub mod feed_scoreboard_persistence;
@@ -204,10 +206,18 @@ pub mod partition_manager;
 // row-count- and size-verified; gated on [partition_retention]
 // archive_enabled (serde default false).
 pub mod partition_archive;
+pub mod s3_cold;
+// Plan item 45e-1 (2026-10-02): raw WAL segments uploaded to the cold bucket,
+// verified, and marked, before any WAL prune may delete them.
+pub mod raw_frame_upload;
 // Cluster-C order-side observability (2026-07-14): SEBI 5y order-lifecycle
 // audit — rebuild of the table deleted in #T4 (2026-05-20) on the modern
 // ILP-over-HTTP template with event-in-key DEDUP (AUDIT-06).
 pub mod order_audit_persistence;
+// Audit PR42b (2026-10-01): disk tier for the three order-side audit writers
+// (order_audit, pnl_audit, order_leg_pnl) — a failed flush is written to
+// data/spill/audit/<table>/ and replayed by one drain task per table.
+pub mod audit_spill;
 // Full-fidelity order/position push-event capture (design 2026-07-18;
 // ORDER-EVT-01): one row per received broker push event, BOTH feeds —
 // the capture companions of the lossy 11-field BrokerOrderEvent seam.
@@ -263,6 +273,14 @@ pub mod option_contract_1m_rest_persistence;
 // second-granular Dhan timestamps collapse every tick but the last in each
 // second).
 pub mod depth_persistence;
+// Plan item 45h (2026-10-02): the feed packets the parser decodes and the fold
+// does not use (open interest, previous close, market status, disconnect, the
+// connect snapshot, out-of-window ticks). Rows ride the `ticks` writer's
+// buffer, offload thread and spill tier.
+pub mod feed_aux_persistence;
+// Real-time proof that the live path is not waiting (2026-10-02): per-stage
+// latency buckets, stall counters and task heartbeats, Prometheus only.
+pub mod hot_path_telemetry;
 pub mod tick_persistence;
 // Automatic drain for the live-tick spill tier (2026-08-21): posts spilled
 // ILP bodies back to QuestDB's /write endpoint and truncates on success, so

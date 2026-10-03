@@ -1,29 +1,46 @@
 //! Quote endpoint — returns the latest tick for a given security from QuestDB.
 //!
 //! Cold-path HTTP endpoint. Queries QuestDB via its HTTP SQL API.
+//!
+//! # Identity (I-P1-11, 2026-10-02)
+//!
+//! `security_id` alone is not unique: Dhan reuses ids across segments (for
+//! example `27` is an `IDX_I` index and an `NSE_EQ` stock). The endpoint
+//! therefore takes an optional `?segment=` (`IDX_I`, `NSE_EQ`, `NSE_FNO`, ...).
+//! With it, the answer is that instrument's latest tick. Without it, the
+//! answer is the single instrument holding that id; if the id has ticks in
+//! more than one segment the endpoint answers **409** and lists them, instead
+//! of returning whichever was fresher. Before 2026-10-02 it returned the
+//! fresher one silently.
+//!
+//! # One HTTP client (2026-10-02)
+//!
+//! Requests go through the process's shared QuestDB client
+//! ([`SharedAppState::questdb_http_client`], pooled, built once) with a
+//! per-request timeout. Each cache miss used to build a new client, with its
+//! own connection pool and no connection reuse.
+
+use std::time::Duration;
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use tickvault_common::segment::{segment_code_to_str, segment_str_to_code};
 
-use crate::response_cache::cached_json_response;
+use crate::response_cache::{QUOTE_SEGMENT_UNSPECIFIED, cached_json_response};
 use crate::state::SharedAppState;
 
 /// Timeout for QuestDB quote queries (cold path, not tick processing).
 const QUESTDB_QUOTE_TIMEOUT_SECS: u64 = 3;
 
-/// Builds a reqwest client with the given timeout.
-///
-/// `reqwest::Client::builder().build()` only fails if the TLS backend
-/// cannot be initialised, which never happens at runtime. The function
-/// returns a default client as ultimate fallback.
-fn build_questdb_client(timeout_secs: u64) -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(timeout_secs))
-        .build()
-        .unwrap_or_default()
+/// Query parameters of `GET /api/quote/{security_id}`.
+#[derive(Debug, Default, Deserialize)]
+pub struct QuoteParams {
+    /// The exchange segment, as stored in `ticks.segment` (`NSE_EQ`, ...).
+    /// Optional; see the module docs for what its absence means.
+    pub segment: Option<String>,
 }
 
 /// Latest quote response for a single security.
@@ -57,18 +74,19 @@ pub struct QuoteResponse {
     pub timestamp: String,
 }
 
-/// `GET /api/quote/:security_id` — fetch the latest tick from QuestDB.
+/// `GET /api/quote/:security_id[?segment=SEG]` — the latest tick from QuestDB.
 ///
 /// 2026-07-09 audit hardening: successful (200) bodies are TTL-cached per
-/// security_id (1s, bounded map in [`SharedAppState`]) — "latest tick"
-/// honestly becomes "latest tick, ≤1s old". ONLY 200 responses are cached:
-/// 400/404/503 are never stored, so attacker-chosen garbage security_ids
-/// can never grow the map (only SIDs with real tick rows enter) and a
-/// negative entry can never mask a just-arrived first tick. The rate
+/// `(security_id, segment)` (1s, bounded map in [`SharedAppState`]) — "latest
+/// tick" honestly becomes "latest tick, ≤1s old". ONLY 200 responses are
+/// cached: 400/404/409/503 are never stored, so attacker-chosen garbage
+/// security_ids can never grow the map (only SIDs with real tick rows enter)
+/// and a negative entry can never mask a just-arrived first tick. The rate
 /// limiter in `crate::public_guard` runs BEFORE this handler (route_layer).
 pub async fn get_quote(
     State(state): State<SharedAppState>,
     Path(security_id): Path<u64>,
+    Query(params): Query<QuoteParams>,
 ) -> impl IntoResponse {
     // SECURITY: defense-in-depth guard against invalid security_id.
     // The u64 type from Axum's Path extractor already prevents SQL injection,
@@ -81,39 +99,74 @@ pub async fn get_quote(
             .into_response();
     }
 
-    if let Some(body) = state.quote_cache().get(security_id) {
+    // The segment is validated against the known set and only its CANONICAL
+    // string (a `&'static str` from the code) ever reaches the SQL, never the
+    // caller's text.
+    let segment_code = match params.segment.as_deref() {
+        None => None,
+        Some(raw) => match segment_str_to_code(raw) {
+            Some(code) => Some(code),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "unknown segment; expected one of IDX_I, NSE_EQ, NSE_FNO, \
+                                  NSE_CURRENCY, BSE_EQ, MCX_COMM, BSE_CURRENCY, BSE_FNO"
+                    })),
+                )
+                    .into_response();
+            }
+        },
+    };
+    let cache_key = (
+        security_id,
+        segment_code.unwrap_or(QUOTE_SEGMENT_UNSPECIFIED),
+    );
+
+    if let Some(body) = state.quote_cache().get(cache_key) {
         metrics::counter!("tv_api_cache_hits_total", "endpoint" => "quote").increment(1);
         return cached_json_response(body, "hit");
     }
 
     let cfg = state.questdb_config();
     let base_url = format!("http://{}:{}", cfg.host, cfg.http_port);
+    let client = state.questdb_http_client();
 
-    let client = build_questdb_client(QUESTDB_QUOTE_TIMEOUT_SECS);
-
-    match query_latest_tick(&client, &base_url, security_id).await {
-        Some(quote) => match serde_json::to_string(&quote) {
-            Ok(body) => {
-                // Cache ONLY the 200 body (see handler docs).
-                state.quote_cache().put(security_id, body.clone());
-                cached_json_response(body, "miss")
+    match query_latest_ticks(client, &base_url, security_id, segment_code).await {
+        Some(mut rows) if rows.len() == 1 => {
+            let Some(quote) = rows.pop() else {
+                return internal_error();
+            };
+            match serde_json::to_string(&quote) {
+                Ok(body) => {
+                    // Cache ONLY the 200 body (see handler docs).
+                    state.quote_cache().put(cache_key, body.clone());
+                    cached_json_response(body, "miss")
+                }
+                Err(_) => internal_error(),
             }
-            Err(_) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "failed to serialize quote response"})),
+        }
+        Some(rows) if rows.len() > 1 => {
+            // Only reachable without `?segment=`: with one, the query returns
+            // at most one row per (security_id, segment).
+            let segments: Vec<&str> = rows.iter().map(|q| q.segment.as_str()).collect();
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "security_id exists in multiple segments; pass ?segment=",
+                    "security_id": security_id,
+                    "segments": segments,
+                })),
             )
-                .into_response(),
-        },
+                .into_response()
+        }
+        // QuestDB answered with no row: it is reachable, there is no data.
+        Some(_) => not_found(),
         None => {
-            // Distinguish between QuestDB unreachable and no data.
-            // Try a simple connectivity check.
-            let reachable = check_questdb_reachable(&client, &base_url).await;
-            if reachable {
-                (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({"error": "no tick data found for this security_id"})),
-                )
-                    .into_response()
+            // The query failed. Distinguish QuestDB unreachable from a query
+            // QuestDB refused (for example a missing table).
+            if check_questdb_reachable(client, &base_url).await {
+                not_found()
             } else {
                 (
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -125,45 +178,96 @@ pub async fn get_quote(
     }
 }
 
-/// Queries QuestDB for the latest tick for a given security_id.
-async fn query_latest_tick(
+/// The 404 body: QuestDB is reachable and holds no tick for the request.
+fn not_found() -> axum::response::Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({"error": "no tick data found for this security_id"})),
+    )
+        .into_response()
+}
+
+/// The 500 body for a response that could not be built.
+fn internal_error() -> axum::response::Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({"error": "failed to serialize quote response"})),
+    )
+        .into_response()
+}
+
+/// The per-request timeout for every quote query. It overrides the shared
+/// client's own (longer) timeout for these requests only.
+const fn quote_timeout() -> Duration {
+    Duration::from_secs(QUESTDB_QUOTE_TIMEOUT_SECS)
+}
+
+/// The latest-tick SQL for one security id, optionally in one segment.
+///
+/// Partitioned by `(security_id, segment)`, so without a segment it returns
+/// one row PER SEGMENT the id has ticks in, which is what lets the handler
+/// see a collision instead of silently picking the fresher row. The segment
+/// text comes from [`segment_code_to_str`], never from the caller.
+#[must_use]
+fn build_latest_tick_sql(security_id: u64, segment_code: Option<u8>) -> String {
+    // The columns that exist in the `ticks` table: `feed`, `segment` (SYMBOL
+    // string, not a numeric code), `ltp`, `last_trade_qty`, `volume`, `oi`,
+    // `open`/`high`/`low`/`close`, `ts`. Within each partition the freshest
+    // row across ALL feeds wins; `feed` labels its source.
+    const COLUMNS: &str = "security_id, feed, segment, ltp, last_trade_qty, volume, oi, \
+                           open, high, low, close, ts";
+    match segment_code {
+        Some(code) => format!(
+            "SELECT {COLUMNS} FROM ticks WHERE security_id = {security_id} \
+             AND segment = '{}' LATEST ON ts PARTITION BY security_id, segment",
+            segment_code_to_str(code)
+        ),
+        None => format!(
+            "SELECT {COLUMNS} FROM ticks WHERE security_id = {security_id} \
+             LATEST ON ts PARTITION BY security_id, segment"
+        ),
+    }
+}
+
+/// Queries QuestDB for the latest tick of `security_id`, one row per segment
+/// (or only `segment_code`'s row when given).
+///
+/// `None` when the request failed or the answer was not a well-formed
+/// dataset (any malformed row makes the whole answer `None`, as one bad row
+/// is not evidence about the others). `Some(empty)` when QuestDB answered
+/// with no row.
+async fn query_latest_ticks(
     client: &reqwest::Client,
     base_url: &str,
     security_id: u64,
-) -> Option<QuoteResponse> {
-    // Query the columns that ACTUALLY EXIST in the `ticks` table
-    // (schema created by the retired tick writer — the table is read-only
-    // since the stage-2 dead-WS sweep, 2026-07-17; SEBI-retained rows):
-    // `feed`, `segment` (SYMBOL string — NOT a numeric code), `ltp`,
-    // `last_trade_qty`, `volume`, `oi`, `open`/`high`/`low`/`close`, `ts`.
-    // `LATEST ON ts PARTITION BY security_id` returns the single freshest row
-    // for this security across ALL feeds; `feed` labels its source.
-    let sql = format!(
-        "SELECT security_id, feed, segment, ltp, last_trade_qty, volume, oi, \
-         open, high, low, close, ts \
-         FROM ticks WHERE security_id = {security_id} \
-         LATEST ON ts PARTITION BY security_id"
-    );
-
+    segment_code: Option<u8>,
+) -> Option<Vec<QuoteResponse>> {
+    let sql = build_latest_tick_sql(security_id, segment_code);
     let url = format!("{base_url}/exec");
     let resp = client
         .get(&url)
+        .timeout(quote_timeout())
         .query(&[("query", sql.as_str())])
         .send()
         .await
         .ok()?;
     let body: serde_json::Value = resp.json().await.ok()?;
     let dataset = body.get("dataset")?.as_array()?;
-    let row = dataset.first()?.as_array()?;
+    dataset
+        .iter()
+        .map(|row| parse_quote_row(row.as_array()?))
+        .collect()
+}
 
-    // Column order matches SELECT: security_id(0), feed(1), segment(2),
-    // ltp(3), last_trade_qty(4), volume(5), oi(6), open(7), high(8),
-    // low(9), close(10), ts(11).
-    //
-    // Mandatory fields use `?` (security_id, feed, segment, ltp, ts). The
-    // remaining numeric fields are NULL for a Groww row (9-of-19 subset) — they
-    // map to `None` via `as_u64()` / `as_f64()` (JSON `null` or absent → `None`),
-    // never a misleading `0`/`0.0` and never a panic.
+/// Parses one `ticks` row in the [`build_latest_tick_sql`] column order:
+/// security_id(0), feed(1), segment(2), ltp(3), last_trade_qty(4), volume(5),
+/// oi(6), open(7), high(8), low(9), close(10), ts(11).
+///
+/// Mandatory fields use `?` (security_id, feed, segment, ltp, ts). The
+/// remaining numeric fields are NULL for a Groww row (9-of-19 subset) — they
+/// map to `None` via `as_u64()` / `as_f64()` (JSON `null` or absent → `None`),
+/// never a misleading `0`/`0.0` and never a panic.
+fn parse_quote_row(row: &[serde_json::Value]) -> Option<QuoteResponse> {
     Some(QuoteResponse {
         security_id: row.first()?.as_u64()?,
         feed: row.get(1)?.as_str()?.to_string(),
@@ -180,20 +284,255 @@ async fn query_latest_tick(
     })
 }
 
-/// Simple connectivity check — tries SHOW TABLES on QuestDB.
+/// Connectivity check — `SHOW TABLES` on QuestDB. Reachable means a 2xx
+/// answer: before 2026-10-02 any HTTP answer counted, so a QuestDB returning
+/// 5xx read as reachable and the handler answered 404 ("no data") instead of
+/// 503.
 async fn check_questdb_reachable(client: &reqwest::Client, base_url: &str) -> bool {
     let url = format!("{base_url}/exec");
     client
         .get(&url)
+        .timeout(quote_timeout())
         .query(&[("query", "SHOW TABLES")])
         .send()
         .await
-        .is_ok()
+        .is_ok_and(|resp| resp.status().is_success())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The latest tick for `security_id` when QuestDB returned exactly one
+    /// row, `None` otherwise. Keeps the row-parsing tests below on their
+    /// original one-row shape.
+    async fn query_one(
+        client: &reqwest::Client,
+        base_url: &str,
+        security_id: u64,
+    ) -> Option<QuoteResponse> {
+        let mut rows = query_latest_ticks(client, base_url, security_id, None).await?;
+        if rows.len() == 1 { rows.pop() } else { None }
+    }
+
+    /// A request with no `?segment=`.
+    fn no_segment() -> Query<QuoteParams> {
+        Query(QuoteParams::default())
+    }
+
+    /// A request with `?segment=<raw>`, exactly as the caller typed it.
+    fn with_segment(raw: &str) -> Query<QuoteParams> {
+        Query(QuoteParams {
+            segment: Some(raw.to_string()),
+        })
+    }
+
+    /// The mock's port, for [`mock_state`].
+    fn port_of(base_url: &str) -> u16 {
+        base_url
+            .rsplit(':')
+            .next()
+            .expect("port should exist")
+            .parse()
+            .expect("port should parse")
+    }
+
+    /// A one-shot mock answering with an arbitrary HTTP status line.
+    async fn start_status_mock_server(status_line: &'static str, body: &'static str) -> String {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind should succeed");
+        let addr = listener.local_addr().expect("local_addr should succeed");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 4096];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let response = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        });
+        format!("http://127.0.0.1:{}", addr.port())
+    }
+
+    /// The same id with ticks in two segments (I-P1-11: `27` is an IDX_I
+    /// index and an NSE_EQ stock).
+    const TWO_SEGMENT_ROWS: &str = r#"{"dataset":[[27,"dhan","IDX_I",21500.5,null,null,null,null,null,null,null,"2026-10-01T10:30:00.000000Z"],[27,"dhan","NSE_EQ",412.25,10,9000,null,410.0,415.0,409.0,411.0,"2026-10-01T10:30:01.000000Z"]]}"#;
+
+    // ---- SQL ----
+
+    #[test]
+    fn test_latest_tick_sql_without_a_segment_returns_one_row_per_segment() {
+        let sql = build_latest_tick_sql(27, None);
+        assert!(sql.contains("WHERE security_id = 27 LATEST ON ts"), "{sql}");
+        assert!(
+            sql.contains("PARTITION BY security_id, segment"),
+            "without a segment the query must keep each segment's row apart: {sql}"
+        );
+        assert!(!sql.contains("AND segment"), "{sql}");
+    }
+
+    #[test]
+    fn test_latest_tick_sql_with_a_segment_uses_the_canonical_name() {
+        let code = segment_str_to_code("NSE_EQ").expect("known segment");
+        let sql = build_latest_tick_sql(27, Some(code));
+        assert!(
+            sql.contains("WHERE security_id = 27 AND segment = 'NSE_EQ' LATEST ON ts"),
+            "{sql}"
+        );
+        assert!(sql.contains("PARTITION BY security_id, segment"), "{sql}");
+    }
+
+    // ---- multi-row parsing ----
+
+    #[tokio::test]
+    async fn test_query_latest_ticks_returns_every_segment_row() {
+        let base_url = start_mock_server(TWO_SEGMENT_ROWS).await;
+        let client = reqwest::Client::new();
+        let rows = query_latest_ticks(&client, &base_url, 27, None)
+            .await
+            .expect("a well-formed dataset");
+        let segments: Vec<&str> = rows.iter().map(|q| q.segment.as_str()).collect();
+        assert_eq!(segments, ["IDX_I", "NSE_EQ"]);
+    }
+
+    #[tokio::test]
+    async fn test_query_latest_ticks_one_malformed_row_fails_the_whole_answer() {
+        let body = r#"{"dataset":[[27,"dhan","IDX_I",21500.5,null,null,null,null,null,null,null,"ts"],[27]]}"#;
+        let base_url = start_mock_server(body).await;
+        let client = reqwest::Client::new();
+        assert!(
+            query_latest_ticks(&client, &base_url, 27, None)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_query_latest_ticks_empty_dataset_is_an_answer_not_a_failure() {
+        let base_url = start_mock_server(r#"{"dataset":[]}"#).await;
+        let client = reqwest::Client::new();
+        let rows = query_latest_ticks(&client, &base_url, 27, None).await;
+        assert!(rows.is_some_and(|r| r.is_empty()));
+    }
+
+    // ---- handler: segment ----
+
+    /// Two segments and no `?segment=`: 409 listing both, never a guess, and
+    /// never cached.
+    #[tokio::test]
+    async fn test_get_quote_two_segments_without_a_param_is_409_listing_both() {
+        let base_url = start_mock_server(TWO_SEGMENT_ROWS).await;
+        let state = mock_state(port_of(&base_url));
+        let response = get_quote(State(state.clone()), Path(27), no_segment())
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body readable");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(json["segments"], serde_json::json!(["IDX_I", "NSE_EQ"]));
+        assert_eq!(json["security_id"], serde_json::json!(27));
+        assert!(state.quote_cache().is_empty(), "a 409 is never cached");
+    }
+
+    /// `?segment=NSE_EQ` answers that instrument, and caches it under the
+    /// composite key only.
+    #[tokio::test]
+    async fn test_get_quote_with_a_segment_returns_that_row_and_caches_it_by_segment() {
+        let body = r#"{"dataset":[[27,"dhan","NSE_EQ",412.25,10,9000,null,410.0,415.0,409.0,411.0,"2026-10-01T10:30:01.000000Z"]]}"#;
+        let base_url = start_mock_server(body).await;
+        let state = mock_state(port_of(&base_url));
+        let response = get_quote(State(state.clone()), Path(27), with_segment("NSE_EQ"))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body readable");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(json["segment"], serde_json::json!("NSE_EQ"));
+
+        let nse_eq = segment_str_to_code("NSE_EQ").expect("known segment");
+        assert!(state.quote_cache().get((27, nse_eq)).is_some());
+        assert!(
+            state
+                .quote_cache()
+                .get((27, QUOTE_SEGMENT_UNSPECIFIED))
+                .is_none(),
+            "a segment-scoped body must not answer an unscoped request"
+        );
+
+        // The mock is exhausted: an unscoped request cannot be a cache hit.
+        let unscoped = get_quote(State(state), Path(27), no_segment())
+            .await
+            .into_response();
+        assert_ne!(unscoped.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_get_quote_unknown_segment_is_400_and_never_cached() {
+        let state = mock_state(1);
+        let response = get_quote(State(state.clone()), Path(27), with_segment("BOGUS"))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(state.quote_cache().is_empty());
+    }
+
+    /// The caller's text never reaches the SQL: anything outside the known
+    /// set, an injection attempt or a lowercase name included, is refused
+    /// before a query is built.
+    #[tokio::test]
+    async fn test_get_quote_injection_shaped_segment_is_400() {
+        for raw in ["nse_eq'--", "NSE_EQ' OR 1=1 --", "nse_eq", "", " NSE_EQ"] {
+            let state = mock_state(1);
+            let response = get_quote(State(state), Path(27), with_segment(raw))
+                .await
+                .into_response();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{raw:?}");
+        }
+    }
+
+    // ---- reachability ----
+
+    /// A QuestDB answering 5xx is not reachable for this check: before
+    /// 2026-10-02 it was, and the handler answered 404 instead of 503.
+    #[tokio::test]
+    async fn test_check_questdb_reachable_5xx_is_unreachable() {
+        let base_url =
+            start_status_mock_server("500 Internal Server Error", r#"{"error":"boom"}"#).await;
+        let client = reqwest::Client::new();
+        assert!(!check_questdb_reachable(&client, &base_url).await);
+    }
+
+    // ---- shared client ratchet ----
+
+    /// The handler uses the process's shared, pooled QuestDB client. Building
+    /// a client per request (the shape before 2026-10-02) opens a new pool on
+    /// every cache miss.
+    #[test]
+    fn test_quote_handler_uses_the_shared_client_and_builds_none() {
+        let source = include_str!("quote.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]")
+            .map_or(source, |(before, _)| before);
+        assert!(
+            !production.contains("Client::builder"),
+            "the quote handler must not build its own HTTP client"
+        );
+        assert!(
+            production.contains("state.questdb_http_client()"),
+            "the quote handler must use the shared QuestDB client"
+        );
+    }
 
     #[test]
     fn test_quote_response_serialization() {
@@ -251,7 +590,7 @@ mod tests {
             .timeout(std::time::Duration::from_secs(2))
             .build()
             .expect("client build should succeed");
-        let quote = query_latest_tick(&client, &base_url, 12345)
+        let quote = query_one(&client, &base_url, 12345)
             .await
             .expect("quote should be present");
         assert_eq!(quote.feed, "dhan");
@@ -274,7 +613,7 @@ mod tests {
             .timeout(std::time::Duration::from_secs(2))
             .build()
             .expect("client build should succeed");
-        let quote = query_latest_tick(&client, &base_url, 12345)
+        let quote = query_one(&client, &base_url, 12345)
             .await
             .expect("quote should be present");
         assert_eq!(quote.feed, "groww");
@@ -311,7 +650,7 @@ mod tests {
             .timeout(std::time::Duration::from_secs(2))
             .build()
             .expect("client build should succeed");
-        let quote = query_latest_tick(&client, &base_url, 1)
+        let quote = query_one(&client, &base_url, 1)
             .await
             .expect("quote should be present");
         assert_eq!(quote.security_id, 1);
@@ -326,7 +665,7 @@ mod tests {
             .timeout(std::time::Duration::from_millis(100))
             .build()
             .expect("client build should succeed");
-        let result = query_latest_tick(&client, "http://127.0.0.1:1", 12345).await;
+        let result = query_one(&client, "http://127.0.0.1:1", 12345).await;
         assert!(result.is_none());
     }
 
@@ -377,7 +716,7 @@ mod tests {
             .build()
             .expect("client build should succeed");
 
-        let result = query_latest_tick(&client, &base_url, 12345).await;
+        let result = query_one(&client, &base_url, 12345).await;
         assert!(result.is_some());
         let quote = result.expect("quote should be present");
         assert_eq!(quote.security_id, 12345);
@@ -395,7 +734,7 @@ mod tests {
             .build()
             .expect("client build should succeed");
 
-        let result = query_latest_tick(&client, &base_url, 99999).await;
+        let result = query_one(&client, &base_url, 99999).await;
         assert!(result.is_none());
     }
 
@@ -409,7 +748,7 @@ mod tests {
             .build()
             .expect("client build should succeed");
 
-        let result = query_latest_tick(&client, &base_url, 12345).await;
+        let result = query_one(&client, &base_url, 12345).await;
         assert!(result.is_none());
     }
 
@@ -423,7 +762,7 @@ mod tests {
             .build()
             .expect("client build should succeed");
 
-        let result = query_latest_tick(&client, &base_url, 12345).await;
+        let result = query_one(&client, &base_url, 12345).await;
         assert!(result.is_none());
     }
 
@@ -452,7 +791,7 @@ mod tests {
             .build()
             .expect("client build should succeed");
 
-        let result = query_latest_tick(&client, &base_url, 12345).await;
+        let result = query_one(&client, &base_url, 12345).await;
         assert!(result.is_none());
     }
 
@@ -469,7 +808,7 @@ mod tests {
             .build()
             .expect("client build should succeed");
 
-        let result = query_latest_tick(&client, &base_url, 12345).await;
+        let result = query_one(&client, &base_url, 12345).await;
         assert!(result.is_some());
         let quote = result.unwrap();
         assert_eq!(quote.last_traded_quantity, None);
@@ -550,9 +889,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_quote_questdb_unreachable_returns_503() {
-        // Port 1 is unreachable — both query_latest_tick and check_questdb_reachable fail
+        // Port 1 is unreachable — both query_latest_ticks and check_questdb_reachable fail
         let state = mock_state(1);
-        let response = get_quote(State(state), Path(12345)).await.into_response();
+        let response = get_quote(State(state), Path(12345), no_segment())
+            .await
+            .into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
@@ -562,9 +903,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_quote_no_data_returns_404() {
-        // First request: query_latest_tick returns empty dataset (None)
-        // Second request: check_questdb_reachable succeeds (reachable)
-        let responses = vec![r#"{"dataset":[]}"#, r#"{"dataset":[["ticks"]]}"#];
+        // An empty dataset is QuestDB answering with no row: 404 straight
+        // away, with no reachability probe (since 2026-10-02).
+        let responses = vec![r#"{"dataset":[]}"#];
         let base_url = start_multi_mock_server(responses).await;
         let port: u16 = base_url
             .rsplit(':')
@@ -574,7 +915,9 @@ mod tests {
             .expect("port should parse");
 
         let state = mock_state(port);
-        let response = get_quote(State(state), Path(99999)).await.into_response();
+        let response = get_quote(State(state), Path(99999), no_segment())
+            .await
+            .into_response();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
@@ -594,7 +937,9 @@ mod tests {
             .expect("port should parse");
 
         let state = mock_state(port);
-        let response = get_quote(State(state), Path(12345)).await.into_response();
+        let response = get_quote(State(state), Path(12345), no_segment())
+            .await
+            .into_response();
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -618,7 +963,7 @@ mod tests {
             .expect("port should parse");
 
         let state = mock_state(port);
-        let first = get_quote(State(state.clone()), Path(12345))
+        let first = get_quote(State(state.clone()), Path(12345), no_segment())
             .await
             .into_response();
         assert_eq!(first.status(), StatusCode::OK);
@@ -635,7 +980,9 @@ mod tests {
             .expect("first body readable");
 
         // Mock exhausted — only the cache can reproduce this 200.
-        let second = get_quote(State(state), Path(12345)).await.into_response();
+        let second = get_quote(State(state), Path(12345), no_segment())
+            .await
+            .into_response();
         assert_eq!(second.status(), StatusCode::OK);
         assert_eq!(
             second
@@ -660,10 +1007,8 @@ mod tests {
     #[tokio::test]
     async fn test_get_quote_404_is_never_cached() {
         let responses = vec![
-            // call 1: empty dataset → query miss...
+            // call 1: empty dataset → 404 (QuestDB answered, no probe).
             r#"{"dataset":[]}"#,
-            // ...then reachability probe succeeds → 404 verdict.
-            r#"{"dataset":[["ticks"]]}"#,
             // call 2: the first tick has arrived → 200.
             r#"{"dataset":[[777,"dhan","IDX_I",100.5,null,null,null,null,null,null,null,"2026-07-09T10:30:00.000000Z"]]}"#,
         ];
@@ -676,7 +1021,7 @@ mod tests {
             .expect("port should parse");
 
         let state = mock_state(port);
-        let first = get_quote(State(state.clone()), Path(777))
+        let first = get_quote(State(state.clone()), Path(777), no_segment())
             .await
             .into_response();
         assert_eq!(first.status(), StatusCode::NOT_FOUND);
@@ -685,7 +1030,9 @@ mod tests {
             "a 404 must never enter the cache"
         );
 
-        let second = get_quote(State(state), Path(777)).await.into_response();
+        let second = get_quote(State(state), Path(777), no_segment())
+            .await
+            .into_response();
         assert_eq!(
             second.status(),
             StatusCode::OK,
@@ -698,7 +1045,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_quote_zero_security_id_not_cached() {
         let state = mock_state(1);
-        let response = get_quote(State(state.clone()), Path(0))
+        let response = get_quote(State(state.clone()), Path(0), no_segment())
             .await
             .into_response();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -706,7 +1053,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // get_quote handler: timestamp field missing → None from query_latest_tick
+    // get_quote handler: timestamp field missing → None from query_latest_ticks
     // -----------------------------------------------------------------------
 
     #[tokio::test]
@@ -720,7 +1067,7 @@ mod tests {
             .build()
             .expect("client build should succeed");
 
-        let result = query_latest_tick(&client, &base_url, 12345).await;
+        let result = query_one(&client, &base_url, 12345).await;
         assert!(result.is_some());
         let quote = result.expect("quote should be present");
         assert!(quote.timestamp.is_empty());
@@ -740,7 +1087,7 @@ mod tests {
             .build()
             .expect("client build should succeed");
 
-        let result = query_latest_tick(&client, &base_url, 12345).await;
+        let result = query_one(&client, &base_url, 12345).await;
         assert!(result.is_none());
     }
 
@@ -759,7 +1106,7 @@ mod tests {
             .build()
             .expect("client build should succeed");
 
-        let result = query_latest_tick(&client, &base_url, 12345).await;
+        let result = query_one(&client, &base_url, 12345).await;
         assert!(result.is_none());
     }
 
@@ -778,7 +1125,7 @@ mod tests {
             .build()
             .expect("client build should succeed");
 
-        let result = query_latest_tick(&client, &base_url, 12345).await;
+        let result = query_one(&client, &base_url, 12345).await;
         assert!(result.is_none());
     }
 
@@ -797,7 +1144,7 @@ mod tests {
             .build()
             .expect("client build should succeed");
 
-        let result = query_latest_tick(&client, &base_url, 12345).await;
+        let result = query_one(&client, &base_url, 12345).await;
         assert!(result.is_none());
     }
 
@@ -812,7 +1159,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // query_latest_tick: partial row coverage — each ? branch exercised
+    // query_latest_ticks: partial row coverage — each ? branch exercised
     // -----------------------------------------------------------------------
 
     #[tokio::test]
@@ -824,7 +1171,7 @@ mod tests {
             .timeout(std::time::Duration::from_secs(2))
             .build()
             .unwrap();
-        assert!(query_latest_tick(&client, &base_url, 12345).await.is_none());
+        assert!(query_one(&client, &base_url, 12345).await.is_none());
     }
 
     #[tokio::test]
@@ -836,7 +1183,7 @@ mod tests {
             .timeout(std::time::Duration::from_secs(2))
             .build()
             .unwrap();
-        assert!(query_latest_tick(&client, &base_url, 12345).await.is_none());
+        assert!(query_one(&client, &base_url, 12345).await.is_none());
     }
 
     #[tokio::test]
@@ -848,7 +1195,7 @@ mod tests {
             .timeout(std::time::Duration::from_secs(2))
             .build()
             .unwrap();
-        assert!(query_latest_tick(&client, &base_url, 12345).await.is_none());
+        assert!(query_one(&client, &base_url, 12345).await.is_none());
     }
 
     #[tokio::test]
@@ -861,11 +1208,11 @@ mod tests {
             .timeout(std::time::Duration::from_secs(2))
             .build()
             .unwrap();
-        assert!(query_latest_tick(&client, &base_url, 12345).await.is_none());
+        assert!(query_one(&client, &base_url, 12345).await.is_none());
     }
 
     // -----------------------------------------------------------------------
-    // query_latest_tick: empty row (row.first()? returns None)
+    // query_latest_ticks: empty row (row.first()? returns None)
     // -----------------------------------------------------------------------
 
     #[tokio::test]
@@ -877,11 +1224,11 @@ mod tests {
             .timeout(std::time::Duration::from_secs(2))
             .build()
             .unwrap();
-        assert!(query_latest_tick(&client, &base_url, 12345).await.is_none());
+        assert!(query_one(&client, &base_url, 12345).await.is_none());
     }
 
     // -----------------------------------------------------------------------
-    // query_latest_tick: dataset element not an array
+    // query_latest_ticks: dataset element not an array
     // -----------------------------------------------------------------------
 
     #[tokio::test]
@@ -893,11 +1240,11 @@ mod tests {
             .timeout(std::time::Duration::from_secs(2))
             .build()
             .unwrap();
-        assert!(query_latest_tick(&client, &base_url, 12345).await.is_none());
+        assert!(query_one(&client, &base_url, 12345).await.is_none());
     }
 
     // -----------------------------------------------------------------------
-    // query_latest_tick: dataset is not an array
+    // query_latest_ticks: dataset is not an array
     // -----------------------------------------------------------------------
 
     #[tokio::test]
@@ -908,31 +1255,7 @@ mod tests {
             .timeout(std::time::Duration::from_secs(2))
             .build()
             .unwrap();
-        assert!(query_latest_tick(&client, &base_url, 12345).await.is_none());
-    }
-
-    // -----------------------------------------------------------------------
-    // build_questdb_client: success path
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_build_questdb_client_success() {
-        let _client = build_questdb_client(3);
-    }
-
-    // -----------------------------------------------------------------------
-    // build_questdb_client: various timeout values
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_build_questdb_client_zero_timeout() {
-        // Zero timeout is valid for reqwest — it means no timeout
-        let _client = build_questdb_client(0);
-    }
-
-    #[test]
-    fn test_build_questdb_client_large_timeout() {
-        let _client = build_questdb_client(3600);
+        assert!(query_one(&client, &base_url, 12345).await.is_none());
     }
 
     // -----------------------------------------------------------------------
@@ -962,18 +1285,6 @@ mod tests {
         assert!(json.contains("\"day_close\":null"));
     }
 
-    #[test]
-    fn test_build_questdb_client_succeeds() {
-        let _client = build_questdb_client(3);
-    }
-
-    #[test]
-    fn test_build_questdb_client_with_various_timeouts() {
-        let _c1 = build_questdb_client(1);
-        let _c2 = build_questdb_client(30);
-        let _c3 = build_questdb_client(0); // zero timeout still builds
-    }
-
     // -----------------------------------------------------------------------
     // get_quote handler: security_id == 0 → 400 Bad Request
     // -----------------------------------------------------------------------
@@ -981,7 +1292,9 @@ mod tests {
     #[tokio::test]
     async fn test_get_quote_zero_security_id_returns_400() {
         let state = mock_state(1);
-        let response = get_quote(State(state), Path(0)).await.into_response();
+        let response = get_quote(State(state), Path(0), no_segment())
+            .await
+            .into_response();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

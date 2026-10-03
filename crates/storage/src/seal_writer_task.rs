@@ -56,10 +56,10 @@ use tickvault_trading::candles::BufferedSeal;
 use crate::seal_absorption::{SealAbsorptionPipeline, SubmitOutcome};
 use crate::seal_dlq::SealDlqRecord;
 use crate::seal_spill::{
-    SEAL_SPILL_FORMAT_VERSION, SEAL_SPILL_LEDGER_CAPACITY, SEAL_SPILL_RECORD_SIZE, SerializedSeal,
+    SEAL_BOOT_WRITTEN_CAPACITY, SEAL_SPILL_FORMAT_VERSION, SEAL_SPILL_RECORD_SIZE, SerializedSeal,
     SpillRecordRead, decode_spill_record, seal_spill_version_is_readable,
 };
-use crate::seal_spill_ledger::SpillLedger;
+use crate::seal_spill_ledger::BootWritten;
 use crate::shadow_candle_writer::ShadowCandleWriter;
 
 /// Outcome counters for one [`drain_once`] cycle. Maps 1:1 to the
@@ -429,6 +429,21 @@ pub struct BootDrainOutcome {
     /// written a fuller copy of the same bucket. The fuller copy is the one
     /// the database keeps.
     pub seals_superseded: usize,
+    /// Z6: recovered seals written without being recorded, because the
+    /// drain's record of written bars was full. An older copy of such a bar
+    /// read later in the drain is written too.
+    pub seals_untracked: usize,
+    /// S1: bars seeded from the summary an earlier, stopped drain left
+    /// behind, so a file it left staged cannot replace them with an older copy.
+    pub summary_seeded: usize,
+    /// S1: summary files refused (damaged or unreadable) or bars in one the
+    /// record had no room for. A refused summary means this drain runs without
+    /// the earlier boot's guard, as every drain did before.
+    pub summary_refused: usize,
+    /// S1: committed bars this drain could NOT write to its summary (bound
+    /// reached, or the write failed) although files stay staged. A later boot
+    /// may write an older copy of such a bar.
+    pub summary_not_persisted: usize,
 }
 
 impl BootDrainOutcome {
@@ -741,6 +756,142 @@ fn staged_file_is_past_refusal_retry(path: &Path) -> bool {
         .is_some_and(|age| age.as_secs() > SEAL_REFUSED_FILE_RETRY_SECS)
 }
 
+/// S1 (2026-10-02): the summary of committed copies a boot drain leaves when
+/// it stops with files still staged, in the spill root beside `archive/`.
+/// Not a `.bin`, so neither the spill retention sweep nor the cold upload
+/// ever takes it for a seal file; the boot drain owns it alone.
+pub const SEAL_BOOT_SUMMARY_FILE: &str = "boot-committed.summary";
+
+/// Temporary name the summary is written under before the rename.
+const SEAL_BOOT_SUMMARY_TMP: &str = "boot-committed.summary.tmp";
+
+/// Seeds `written` from the summary a stopped drain left, if any. A missing
+/// file is the normal case. An unreadable or damaged one is refused whole,
+/// logged and counted: this drain then runs without that guard, exactly as
+/// every drain ran before S1, and never stops for it.
+///
+/// # Complexity
+/// O(bars in the file). Boot drain, once, cold.
+fn seed_from_boot_summary(
+    spill_dir: &Path,
+    written: &mut BootWritten,
+    outcome: &mut BootDrainOutcome,
+) {
+    let path = spill_dir.join(SEAL_BOOT_SUMMARY_FILE);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+        Err(err) => {
+            outcome.summary_refused += 1;
+            error!(
+                code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                ?path,
+                ?err,
+                "seal recovery: the summary of copies an earlier boot committed cannot be \
+                 read — this drain may write an older copy of a bar that boot committed"
+            );
+            return;
+        }
+    };
+    match written.seed_from_bytes(&bytes) {
+        Ok(seeded) => {
+            outcome.summary_seeded += seeded.seeded;
+            outcome.summary_refused += seeded.untracked;
+            if seeded.untracked > 0 {
+                error!(
+                    code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                    untracked = seeded.untracked,
+                    "seal recovery: the earlier boot's summary holds more bars than this \
+                     drain can track — an older copy of an untracked bar may be written"
+                );
+            }
+            info!(
+                seeded = seeded.seeded,
+                "seal recovery: seeded the copies an earlier, stopped drain committed"
+            );
+        }
+        Err(reason) => {
+            outcome.summary_refused += 1;
+            error!(
+                code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                ?path,
+                ?reason,
+                "seal recovery: the summary of copies an earlier boot committed is damaged \
+                 and refused whole — this drain may write an older copy of a bar that boot \
+                 committed"
+            );
+        }
+    }
+}
+
+/// Writes the committed half of `written` to the summary (temp file, sync,
+/// rename). A failure keeps any previous summary, which is a subset of this
+/// one (it was seeded), and counts every committed bar it could not add.
+///
+/// # Complexity
+/// O(bars) plus one file write. Boot drain, once, only when files stay staged.
+fn persist_boot_summary(spill_dir: &Path, written: &BootWritten, outcome: &mut BootDrainOutcome) {
+    let committed = written.committed_len();
+    if committed == 0 {
+        // Nothing committed and nothing seeded: there is nothing to guard.
+        remove_boot_summary(spill_dir);
+        return;
+    }
+    let (bytes, dropped) = written.encode_committed(SEAL_BOOT_WRITTEN_CAPACITY);
+    if dropped > 0 {
+        outcome.summary_not_persisted += dropped;
+        error!(
+            code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+            dropped,
+            bound = SEAL_BOOT_WRITTEN_CAPACITY,
+            "seal recovery: more committed bars than the summary bound — the next boot \
+             may write an older copy of the bars left out"
+        );
+    }
+    let path = spill_dir.join(SEAL_BOOT_SUMMARY_FILE);
+    let tmp = spill_dir.join(SEAL_BOOT_SUMMARY_TMP);
+    let result = std::fs::create_dir_all(spill_dir)
+        .and_then(|()| crate::wal_applied_watermark::write_fresh(&tmp, &bytes))
+        .and_then(|()| std::fs::rename(&tmp, &path));
+    match result {
+        Ok(()) => {
+            // The rename is durable once the directory is: best effort.
+            drop(std::fs::File::open(spill_dir).and_then(|dir| dir.sync_all()));
+            info!(
+                bars = committed - dropped,
+                "seal recovery: summary of committed copies kept for the next boot"
+            );
+        }
+        Err(err) => {
+            outcome.summary_not_persisted += committed - dropped;
+            drop(std::fs::remove_file(&tmp));
+            error!(
+                code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                ?path,
+                ?err,
+                bars = committed - dropped,
+                "seal recovery: the summary of committed copies could not be written — the \
+                 next boot may write an older copy of a bar this boot committed"
+            );
+        }
+    }
+}
+
+/// Removes the summary once no staged file is left to compare against.
+fn remove_boot_summary(spill_dir: &Path) {
+    let path = spill_dir.join(SEAL_BOOT_SUMMARY_FILE);
+    match std::fs::remove_file(&path) {
+        Ok(()) => info!("seal recovery: nothing left staged — summary of committed copies removed"),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => warn!(
+            code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+            ?path,
+            ?err,
+            "seal recovery: the stale summary of committed copies could not be removed"
+        ),
+    }
+}
+
 /// Boot-time recovery: reads every orphaned spill / DLQ file back and
 /// re-ingests it into QuestDB through `writer`.
 ///
@@ -765,6 +916,8 @@ pub fn drain_recovered_seals<S: SealSink>(
     }
     outcome.files_staged = staged.len();
     if staged.is_empty() {
+        // Nothing staged: no file is left that could hold an older copy.
+        remove_boot_summary(spill_dir);
         return outcome;
     }
 
@@ -773,9 +926,18 @@ pub fn drain_recovered_seals<S: SealSink>(
         "seal recovery: replaying orphaned spill/DLQ files from disk"
     );
 
-    // Audit PR41a: the fullest copy of each slot's newest bucket written so
-    // far in this drain. Allocated once per boot, only when files are staged.
-    let mut written = SpillLedger::with_capacity(SEAL_SPILL_LEDGER_CAPACITY);
+    // Audit PR41a, Z6: the fullest copy of each bar (slot and bucket) written
+    // so far in this drain, so the result does not depend on the order the
+    // spill and dead-letter files are read in. Grown on demand, once per
+    // boot, only when files are staged; past its cap a copy is written
+    // untracked and counted, never dropped.
+    let mut written = BootWritten::new(SEAL_BOOT_WRITTEN_CAPACITY);
+    // S1 (2026-10-02): the record above used to live for one drain only. A
+    // drain that committed a fuller copy, archived its file and then stopped
+    // on a dead database left a file holding an OLDER copy staged, and the
+    // next boot wrote it over the fuller row. The stopped drain now leaves a
+    // summary of what it committed; seed from it before reading any file.
+    seed_from_boot_summary(spill_dir, &mut written, &mut outcome);
     let mut halted = false;
     for path in &staged {
         if halted {
@@ -836,11 +998,12 @@ pub fn drain_recovered_seals<S: SealSink>(
         for chunk in records.chunks(batch) {
             let mut appended = 0usize;
             for record in chunk {
-                // Audit PR41a: a fuller copy of this bucket was already
+                // Audit PR41a, Z6: a fuller copy of this bar was already
                 // written in this drain (a dead-letter file can hold an older
-                // copy than a spill file read before it). Writing this one
-                // would replace the fuller row.
-                if written.replay_is_older(record) {
+                // copy than a spill file read before it, with other buckets of
+                // the same slot in between). Writing this one would replace
+                // the fuller row.
+                if written.is_older(record) {
                     outcome.seals_superseded += 1;
                     continue;
                 }
@@ -884,14 +1047,19 @@ pub fn drain_recovered_seals<S: SealSink>(
                     append_failed += 1;
                     continue;
                 }
-                written.record(record);
+                if !written.record(record) {
+                    outcome.seals_untracked += 1;
+                }
                 appended += 1;
             }
             if appended == 0 {
                 continue;
             }
             match writer.flush() {
-                Ok(()) => committed += appended,
+                Ok(()) => {
+                    committed += appended;
+                    written.commit_pending();
+                }
                 Err(flush_err) => {
                     error!(
                         code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
@@ -902,6 +1070,8 @@ pub fn drain_recovered_seals<S: SealSink>(
                     );
                     // Poison-buffer recovery, same reasoning as `drain_once`.
                     writer.discard_pending();
+                    // Not committed: never persisted as a fuller copy.
+                    written.discard_pending();
                     file_ok = false;
                     break;
                 }
@@ -948,6 +1118,15 @@ pub fn drain_recovered_seals<S: SealSink>(
             outcome.seals_left_pending += records.len().saturating_sub(committed);
             halted = true;
         }
+    }
+
+    // S1: a drain that leaves files staged hands what it (and every earlier
+    // stopped drain) committed to the next boot; one that leaves none removes
+    // the summary, since no staged copy is left to compare.
+    if outcome.files_left_pending > 0 {
+        persist_boot_summary(spill_dir, &written, &mut outcome);
+    } else {
+        remove_boot_summary(spill_dir);
     }
 
     if outcome.files_left_pending > 0 {
@@ -1481,6 +1660,22 @@ impl MidSessionReplay {
             self.last_scan = Some(now_unix_secs);
             outcome.files_staged = stage_live_spill_files(spill, spill_dir);
             let Some(path) = self.next_staged_file(spill_dir, now_unix_secs) else {
+                // Z6: every staged file is consumed. With nothing parked,
+                // waiting for confirmation or given up on, every copy appended
+                // up to the last clean staging has been replayed, so the spill
+                // ledger can forget the bars that can no longer be written.
+                if self.parked.is_empty()
+                    && self.awaiting_archive.is_empty()
+                    && self.skipped.is_empty()
+                {
+                    let forgotten = spill.forget_replayed();
+                    if forgotten > 0 {
+                        tracing::debug!(
+                            forgotten,
+                            "seal replay: spill ledger forgot bars whose copies are all replayed"
+                        );
+                    }
+                }
                 return outcome;
             };
             // A parked file resumes where it stopped.
@@ -1618,14 +1813,16 @@ impl MidSessionReplay {
             return;
         };
 
-        let mut appended = 0usize;
-        for seal in &self.batch {
-            // Audit PR41a: the spill also holds a fuller copy of this bucket,
-            // later in this file or in a later one. Writing this one would
-            // put the older copy over the stored row until that one is
-            // reached, or for good if it never is. Counted by the spill.
+        // Keep in `self.batch` only the seals handed to the writer, so a clean
+        // flush can record exactly those as committed (Z6).
+        let mut records_skipped = 0usize;
+        self.batch.retain(|seal| {
+            // Audit PR41a, Z6: a fuller copy of this bar was already committed
+            // (live, or by an earlier replay step: a later file replayed
+            // before this parked one resumed). Writing this one would put the
+            // older copy over the stored row. Counted by the spill.
             if spill.replay_is_superseded(seal) {
-                continue;
+                return false;
             }
             if let Err(append_err) = writer.append_seal(seal) {
                 error!(
@@ -1634,11 +1831,13 @@ impl MidSessionReplay {
                     security_id = seal.security_id,
                     "seal replay: append failed for a spilled seal"
                 );
-                outcome.records_skipped += 1;
-                continue;
+                records_skipped += 1;
+                return false;
             }
-            appended += 1;
-        }
+            true
+        });
+        outcome.records_skipped += records_skipped;
+        let appended = self.batch.len();
         if appended > 0 {
             if let Err(flush_err) = writer.flush() {
                 writer.discard_pending();
@@ -1648,6 +1847,7 @@ impl MidSessionReplay {
                 return;
             }
             outcome.seals_reingested += appended;
+            spill.note_replay_commits(&self.batch);
         }
 
         let consumed =
@@ -1881,17 +2081,28 @@ fn stage_live_spill_files(spill: &crate::seal_spill::SealSpillWriter, spill_dir:
     }
     spill.with_appends_paused(|| {
         let mut moved = 0usize;
+        let mut every_rename_ok = true;
         for path in &live {
             let Some(name) = path.file_name() else {
+                every_rename_ok = false;
                 continue;
             };
             let target = free_path(&replaying, name);
             match std::fs::rename(path, &target) {
                 Ok(()) => moved += 1,
-                Err(err) => warn!(?path, ?err, "seal replay: cannot stage a spill file"),
+                Err(err) => {
+                    every_rename_ok = false;
+                    warn!(?path, ?err, "seal replay: cannot stage a spill file");
+                }
             }
         }
-        moved
+        // Z6: the spill epoch closes only if NO live file is left behind. A
+        // file created after the unlocked listing above, or one whose rename
+        // failed, holds appends of the closing epoch; one more listing, under
+        // the lock, says whether any is left. O(1) EXEMPT: one directory
+        // listing per staging, at most once per scan interval.
+        let moved_every_live_file = every_rename_ok && live_spill_files(spill_dir).is_empty();
+        (moved, moved_every_live_file)
     })
 }
 
@@ -3865,5 +4076,429 @@ mod tests {
         sort_by_write_time(&mut files);
         assert_eq!(files, vec![aside, day]);
         cleanup(&spill, &dlq);
+    }
+
+    // -----------------------------------------------------------------------
+    // Z6 — the fullest copy of a bar wins, whatever order its copies replay in
+    // -----------------------------------------------------------------------
+
+    /// The tick count of the LAST row the sink committed for `bucket`: the
+    /// row the candle table keeps under its last-write-wins DEDUP key.
+    fn z6_final_ticks(committed: &[(u32, u32)], bucket: u32) -> Option<u32> {
+        committed
+            .iter()
+            .rev()
+            .find(|(b, _)| *b == bucket)
+            .map(|(_, ticks)| *ticks)
+    }
+
+    fn z6_spill(writer: &crate::seal_spill::SealSpillWriter, seal: &BufferedSeal, now: i64) {
+        writer
+            .append_seal(&SerializedSeal::from(seal), now)
+            .expect("spill append");
+    }
+
+    fn z6_dead_letter(dlq: &Path, seal: &BufferedSeal, now: i64) {
+        crate::seal_dlq::SealDlqWriter::with_dlq_dir_for_test(dlq.to_path_buf())
+            .append_record(&SealDlqRecord::from(&SerializedSeal::from(seal)), now)
+            .expect("dlq append");
+    }
+
+    /// Path A: the original spilled, then a LATER bucket of the same slot
+    /// spilled, then the amend committed live. The old one-entry-per-slot
+    /// ledger had replaced the original's entry with the later bucket's, so
+    /// the amend was never mirrored and the boot drain ended on the original.
+    #[test]
+    fn test_regression_z6_later_bucket_spilled_does_not_hide_amend() {
+        let (spill, dlq) = temp_pair("z6-path-a");
+        let t0 = jan1_noon_utc();
+        let writer = crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(spill.clone());
+        z6_spill(&writer, &copy_with_ticks(600, 4), t0);
+        z6_spill(&writer, &copy_with_ticks(660, 1), t0);
+        assert_eq!(
+            writer.note_live_commits(&[copy_with_ticks(600, 5)], t0),
+            1,
+            "the amend of the earlier bar must be mirrored behind its original"
+        );
+        drop(writer);
+
+        let mut sink = CopySink::default();
+        drain_recovered_seals(&mut sink, &spill, &dlq, 64);
+        assert_eq!(z6_final_ticks(&sink.committed, 600), Some(5));
+        assert_eq!(z6_final_ticks(&sink.committed, 660), Some(1));
+        cleanup(&spill, &dlq);
+    }
+
+    /// Path C at boot: the spill and the dead-letter file each hold a copy of
+    /// one bar, with a later bucket of the same slot between them. Either way
+    /// round, the drain's final row is the fuller copy.
+    #[test]
+    fn test_regression_z6_boot_drain_keeps_fullest_across_spill_and_dlq_with_intervening_bucket() {
+        for (spilled, dead_lettered) in [(5, 4), (4, 5)] {
+            let (spill, dlq) = temp_pair(&format!("z6-path-c-boot-{spilled}"));
+            let t0 = jan1_noon_utc();
+            let writer = crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(spill.clone());
+            z6_spill(&writer, &copy_with_ticks(600, spilled), t0);
+            z6_spill(&writer, &copy_with_ticks(660, 1), t0);
+            drop(writer);
+            z6_dead_letter(&dlq, &copy_with_ticks(600, dead_lettered), t0);
+
+            let mut sink = CopySink::default();
+            let outcome = drain_recovered_seals(&mut sink, &spill, &dlq, 64);
+            assert_eq!(
+                z6_final_ticks(&sink.committed, 600),
+                Some(5),
+                "spill copy {spilled}, dead-letter copy {dead_lettered}: {:?}",
+                sink.committed
+            );
+            assert_eq!(
+                z6_final_ticks(&sink.committed, 660),
+                Some(1),
+                "the later bucket between them is its own bar and is written"
+            );
+            assert_eq!(outcome.seals_untracked, 0);
+            cleanup(&spill, &dlq);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // S1 — the older-copy guard survives a drain that stops on a dead database
+    // -----------------------------------------------------------------------
+
+    /// A sink recording `(bucket, ticks)` that lets `ok_flushes` flushes
+    /// land and fails every one after (the database dies mid-drain).
+    struct S1DyingSink {
+        pending: Vec<(u32, u32)>,
+        committed: Vec<(u32, u32)>,
+        ok_flushes: usize,
+    }
+
+    impl SealSink for S1DyingSink {
+        fn append_seal(&mut self, seal: &BufferedSeal) -> anyhow::Result<()> {
+            self.pending
+                .push((seal.state.bucket_start_ist_secs, seal.state.tick_count));
+            Ok(())
+        }
+        fn flush(&mut self) -> anyhow::Result<()> {
+            if self.ok_flushes == 0 {
+                anyhow::bail!("connection refused");
+            }
+            self.ok_flushes -= 1;
+            self.committed.append(&mut self.pending);
+            Ok(())
+        }
+        fn discard_pending(&mut self) {
+            self.pending.clear();
+        }
+    }
+
+    /// Boot 1 commits the 5-tick copy from a spill file and archives it, then
+    /// the database dies on the dead-letter file, which also holds a 4-tick
+    /// copy of the same bar. Boot 2 must not write the 4-tick copy over the
+    /// 5-tick row, although it never re-reads the archived spill file.
+    #[test]
+    fn test_regression_s1_older_copy_left_staged_by_a_stopped_drain_is_refused_next_boot() {
+        let (spill, dlq) = temp_pair("s1-two-boots");
+        let t0 = jan1_noon_utc();
+        let writer = crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(spill.clone());
+        z6_spill(&writer, &copy_with_ticks(600, 5), t0);
+        drop(writer);
+        let dlq_writer = crate::seal_dlq::SealDlqWriter::with_dlq_dir_for_test(dlq.clone());
+        for seal in [copy_with_ticks(600, 4), copy_with_ticks(720, 1)] {
+            dlq_writer
+                .append_record(&SealDlqRecord::from(&SerializedSeal::from(&seal)), t0)
+                .expect("dlq append");
+        }
+        drop(dlq_writer);
+
+        let mut boot1 = S1DyingSink {
+            pending: Vec::new(),
+            committed: Vec::new(),
+            ok_flushes: 1,
+        };
+        let first = drain_recovered_seals(&mut boot1, &spill, &dlq, 64);
+        assert_eq!(boot1.committed, vec![(600, 5)]);
+        assert_eq!(first.files_archived, 1, "the spill file is archived");
+        assert_eq!(
+            first.files_left_pending, 1,
+            "the dead-letter file stays staged"
+        );
+        assert_eq!(first.summary_not_persisted, 0);
+        assert!(
+            spill.join(SEAL_BOOT_SUMMARY_FILE).is_file(),
+            "a stopped drain leaves its summary"
+        );
+
+        let mut boot2 = CopySink::default();
+        let second = drain_recovered_seals(&mut boot2, &spill, &dlq, 64);
+        assert_eq!(second.summary_seeded, 1);
+        assert_eq!(second.seals_superseded, 1, "the refusal is counted");
+        assert_eq!(
+            boot2.committed,
+            vec![(720, 1)],
+            "the 4-tick copy never replaces the 5-tick row"
+        );
+        assert_eq!(second.files_left_pending, 0);
+        assert!(
+            !spill.join(SEAL_BOOT_SUMMARY_FILE).exists(),
+            "a drain that finishes removes the summary"
+        );
+        cleanup(&spill, &dlq);
+    }
+
+    /// The guard is carried through more than one stopped drain: boot 2 also
+    /// dies, and boot 3 still refuses the older copy.
+    #[test]
+    fn test_regression_s1_summary_survives_two_stopped_drains() {
+        let (spill, dlq) = temp_pair("s1-three-boots");
+        let t0 = jan1_noon_utc();
+        let writer = crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(spill.clone());
+        z6_spill(&writer, &copy_with_ticks(600, 5), t0);
+        drop(writer);
+        // First dead-letter file: the one each dying boot stops on.
+        z6_dead_letter(&dlq, &copy_with_ticks(720, 1), t0);
+        let first = dlq.join("seals_v4-2026-01-01-a.ndjson");
+        std::fs::rename(dlq.join("seals_v4-2026-01-01.ndjson"), &first).expect("rename");
+        // Second dead-letter file, behind it: the older copy no dying boot reaches.
+        z6_dead_letter(&dlq, &copy_with_ticks(600, 4), t0);
+        let second = dlq.join("seals_v4-2026-01-01.ndjson");
+        let earlier =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_759_300_000);
+        for (path, offset) in [(&first, 0u64), (&second, 60)] {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .and_then(|f| f.set_modified(earlier + std::time::Duration::from_secs(offset)))
+                .expect("mtime");
+        }
+
+        let mut boot1 = S1DyingSink {
+            pending: Vec::new(),
+            committed: Vec::new(),
+            ok_flushes: 1,
+        };
+        drain_recovered_seals(&mut boot1, &spill, &dlq, 64);
+        assert_eq!(boot1.committed, vec![(600, 5)]);
+
+        let mut boot2 = S1DyingSink {
+            pending: Vec::new(),
+            committed: Vec::new(),
+            ok_flushes: 0,
+        };
+        let second = drain_recovered_seals(&mut boot2, &spill, &dlq, 64);
+        assert!(second.files_left_pending > 0);
+        assert!(spill.join(SEAL_BOOT_SUMMARY_FILE).is_file());
+
+        let mut boot3 = CopySink::default();
+        let third = drain_recovered_seals(&mut boot3, &spill, &dlq, 64);
+        assert_eq!(third.summary_seeded, 1);
+        assert_eq!(z6_final_ticks(&boot3.committed, 600), None);
+        assert_eq!(z6_final_ticks(&boot3.committed, 720), Some(1));
+        cleanup(&spill, &dlq);
+    }
+
+    /// A damaged summary is refused whole and counted; the drain still runs.
+    #[test]
+    fn test_regression_s1_damaged_summary_is_refused_and_the_drain_still_runs() {
+        let (spill, dlq) = temp_pair("s1-damaged");
+        let t0 = jan1_noon_utc();
+        std::fs::create_dir_all(&spill).expect("spill dir");
+        std::fs::write(spill.join(SEAL_BOOT_SUMMARY_FILE), b"garbage").expect("summary");
+        z6_dead_letter(&dlq, &copy_with_ticks(600, 4), t0);
+        let mut sink = CopySink::default();
+        let outcome = drain_recovered_seals(&mut sink, &spill, &dlq, 64);
+        assert_eq!(outcome.summary_refused, 1);
+        assert_eq!(outcome.summary_seeded, 0);
+        assert_eq!(sink.committed, vec![(600, 4)]);
+        assert!(!spill.join(SEAL_BOOT_SUMMARY_FILE).exists());
+        cleanup(&spill, &dlq);
+    }
+
+    /// A drain with nothing staged removes a leftover summary.
+    #[test]
+    fn test_regression_s1_nothing_staged_removes_a_leftover_summary() {
+        let (spill, dlq) = temp_pair("s1-empty");
+        std::fs::create_dir_all(&spill).expect("spill dir");
+        std::fs::write(spill.join(SEAL_BOOT_SUMMARY_FILE), b"x").expect("summary");
+        let mut sink = CopySink::default();
+        let outcome = drain_recovered_seals(&mut sink, &spill, &dlq, 64);
+        assert!(outcome.is_clean());
+        assert!(!spill.join(SEAL_BOOT_SUMMARY_FILE).exists());
+        cleanup(&spill, &dlq);
+    }
+
+    /// A sink recording `(bucket, ticks)` whose flushes die on the
+    /// connection while they carry the `poison` bucket, so the replay parks
+    /// the file at that record (audit PR41b).
+    #[derive(Default)]
+    struct Z6ParkingSink {
+        pending: Vec<(u32, u32)>,
+        committed: Vec<(u32, u32)>,
+        poison: Option<u32>,
+    }
+
+    impl SealSink for Z6ParkingSink {
+        fn append_seal(&mut self, seal: &BufferedSeal) -> anyhow::Result<()> {
+            self.pending
+                .push((seal.state.bucket_start_ist_secs, seal.state.tick_count));
+            Ok(())
+        }
+        fn flush(&mut self) -> anyhow::Result<()> {
+            if self
+                .poison
+                .is_some_and(|p| self.pending.iter().any(|(b, _)| *b == p))
+            {
+                return Err(anyhow::Error::new(questdb::Error::new(
+                    questdb::ErrorCode::SocketError,
+                    "injected: connection reset",
+                ))
+                .context("shadow flush: ILP send failed after reconnect retries"));
+            }
+            self.committed.append(&mut self.pending);
+            Ok(())
+        }
+        fn discard_pending(&mut self) {
+            self.pending.clear();
+        }
+    }
+
+    /// Path D: file F1 holds the original behind a record that cannot flush,
+    /// so F1 is parked; file F2 holds the amend and a later bucket of the
+    /// same slot, and replays first. When F1 resumes, the original must be
+    /// dropped: the old ledger compared it with the later bucket and wrote it
+    /// over the amend.
+    #[test]
+    fn test_regression_z6_parked_file_resumed_after_later_bucket_skips_older_copy() {
+        let (spill, dlq) = temp_pair("z6-path-d");
+        let writer = crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(spill.clone());
+        let t0 = jan1_noon_utc();
+        // F1 (day t0): a stuck record, then the original.
+        z6_spill(&writer, &copy_with_ticks(540, 1), t0);
+        z6_spill(&writer, &copy_with_ticks(600, 4), t0);
+        // F2 (the next day's file): the amend, then a later bucket.
+        z6_spill(&writer, &copy_with_ticks(600, 5), t0 + 86_400);
+        z6_spill(&writer, &copy_with_ticks(660, 1), t0 + 86_400);
+
+        let mut replay = MidSessionReplay::default();
+        let mut sink = Z6ParkingSink {
+            poison: Some(540),
+            ..Z6ParkingSink::default()
+        };
+        let mut now = t0 + 2 * 86_400;
+        replay.observe(&healthy_drain(), now);
+        for _ in 0..200 {
+            now += SEAL_REPLAY_HEALTHY_SECS;
+            let step = replay.step(&mut sink, &writer, &spill, true, now);
+            if step.flush_failed {
+                replay.observe(&healthy_drain(), now);
+            }
+            if sink.committed.iter().any(|(b, _)| *b == 660) {
+                break;
+            }
+        }
+        assert_eq!(replay.parked.len(), 1, "F1 is parked at the stuck record");
+        assert_eq!(z6_final_ticks(&sink.committed, 600), Some(5));
+
+        // The connection heals and F1 resumes after its park window.
+        sink.poison = None;
+        now += SEAL_REPLAY_PARK_SECS;
+        replay.observe(&healthy_drain(), now);
+        // Driven until F1 is read to its end and archived, so the original
+        // behind the stuck record is certainly read back (the step size is
+        // down to one record after the failures, so committing the stuck
+        // record alone does not mean the original was reached).
+        let mut archived = 0usize;
+        for _ in 0..50 {
+            now += SEAL_REPLAY_HEALTHY_SECS;
+            archived += replay
+                .step(&mut sink, &writer, &spill, true, now)
+                .files_archived;
+            if archived > 0 {
+                break;
+            }
+        }
+        assert_eq!(archived, 1, "F1 resumed and was read to its end");
+        assert!(replay.parked.is_empty());
+        assert!(
+            sink.committed.contains(&(540, 1)),
+            "F1 resumed: {:?}",
+            sink.committed
+        );
+        assert_eq!(
+            z6_final_ticks(&sink.committed, 600),
+            Some(5),
+            "the resumed file must not write the original over the amend: {:?}",
+            sink.committed
+        );
+        assert!(!sink.committed.contains(&(600, 4)));
+        cleanup(&spill, &dlq);
+    }
+
+    /// Where one copy of a bar is written before the boot drain reads it.
+    #[derive(Clone, Copy, Debug)]
+    enum Z6Tier {
+        Spill,
+        DeadLetter,
+    }
+
+    static Z6_PROPTEST_CASE: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(48))]
+
+        /// Any mix of copies of two bars of one slot, written to the spill
+        /// and the dead-letter file in any order: the boot drain's final row
+        /// for each bar is its fullest copy.
+        #[test]
+        fn z6_any_replay_order_ends_on_fullest_copy(
+            copies in proptest::collection::vec(
+                (
+                    proptest::prelude::prop_oneof![
+                        proptest::prelude::Just(600_u32),
+                        proptest::prelude::Just(660_u32),
+                    ],
+                    1_u32..=6,
+                    proptest::prelude::prop_oneof![
+                        proptest::prelude::Just(Z6Tier::Spill),
+                        proptest::prelude::Just(Z6Tier::DeadLetter),
+                    ],
+                ),
+                1..12,
+            )
+        ) {
+            let case = Z6_PROPTEST_CASE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let (spill, dlq) = temp_pair(&format!("z6-proptest-{case}"));
+            let t0 = jan1_noon_utc();
+            let writer =
+                crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(spill.clone());
+            for (bucket, ticks, tier) in &copies {
+                let seal = copy_with_ticks(*bucket, *ticks);
+                match tier {
+                    Z6Tier::Spill => z6_spill(&writer, &seal, t0),
+                    Z6Tier::DeadLetter => z6_dead_letter(&dlq, &seal, t0),
+                }
+            }
+            drop(writer);
+
+            let mut sink = CopySink::default();
+            drain_recovered_seals(&mut sink, &spill, &dlq, 64);
+            cleanup(&spill, &dlq);
+            for bucket in [600_u32, 660] {
+                let fullest = copies
+                    .iter()
+                    .filter(|(b, _, _)| *b == bucket)
+                    .map(|(_, ticks, _)| *ticks)
+                    .max();
+                proptest::prop_assert_eq!(
+                    z6_final_ticks(&sink.committed, bucket),
+                    fullest,
+                    "bucket {}: {:?} from {:?}",
+                    bucket,
+                    &sink.committed,
+                    &copies
+                );
+            }
+        }
     }
 }

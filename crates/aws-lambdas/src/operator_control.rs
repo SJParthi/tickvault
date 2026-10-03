@@ -66,6 +66,22 @@ pub const DATA_DESTRUCTIVE_LOCK_MSG: &str = "Data-destructive actions are locked
 every day (market hours plus a margin either side) — a wipe then destroys data \
 that can never be re-fetched. Run after 15:45.";
 
+/// Whether the console may run a [`DATA_DESTRUCTIVE`] action at all.
+///
+/// `false` since 2026-10-02 (plan item 45g D10). Daily-universe Quotes 27 +
+/// 28 (2026-09-29, "nothign shdou lneevr ever be missed or removed or
+/// deleted") record Quotes 21-26 as SPENT and require a fresh dated quote
+/// naming the data, and a verified copy, before any market-data delete. All
+/// three actions delete market data outright (TRUNCATE, or the Docker volume
+/// with the raw-frame WAL), so every request is refused with 409 at any hour.
+/// Re-enabling one is a code change that must cite that fresh quote.
+pub const CONSOLE_DATA_WIPES_AUTHORIZED: bool = false;
+
+/// Refusal text while [`CONSOLE_DATA_WIPES_AUTHORIZED`] is `false`.
+pub const CONSOLE_DATA_WIPES_REFUSED_MSG: &str = "Data-deleting actions are switched off: \
+nothing may delete market data without a verified copy and a fresh dated operator \
+approval naming the data. Nothing was stopped or deleted.";
+
 /// Start of the data-destructive lock, 09:00 IST (seconds-of-day).
 ///
 /// Wider than [`MKT_OPEN_SECS`] on purpose: the pre-open session and the
@@ -1239,6 +1255,8 @@ pub trait OpsShell {
     fn market_hours_now(&self) -> bool;
     /// [`is_data_destructive_locked`] at the current instant.
     fn data_destructive_locked_now(&self) -> bool;
+    /// [`CONSOLE_DATA_WIPES_AUTHORIZED`] in production.
+    fn data_wipes_authorized(&self) -> bool;
     /// legacy `int(time.time())`.
     fn now_epoch(&self) -> i64;
     /// legacy `os.environ.get(key, "")`.
@@ -1345,6 +1363,22 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
             }),
         );
     }
+    // Zero-loss gate (plan item 45g D10): no data-deleting action runs at any
+    // hour while CONSOLE_DATA_WIPES_AUTHORIZED is false.
+    if DATA_DESTRUCTIVE.contains(&action.as_str()) && !shell.data_wipes_authorized() {
+        tracing::warn!(
+            %action,
+            "operator-portal: data-deleting action refused (zero-loss lock)"
+        );
+        return resp(
+            409,
+            &json!({
+                "error": CONSOLE_DATA_WIPES_REFUSED_MSG,
+                "action": action,
+                "data_wipes_disabled": true,
+            }),
+        );
+    }
     if DESTRUCTIVE.contains(&action.as_str()) && shell.market_hours_now() && !force {
         return resp(
             409,
@@ -1410,10 +1444,12 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
             }
         }
         "restart-questdb" => {
-            // ensure-questdb.sh (create-or-restart) — robust to
+            // The on-box self-heal (create-or-restart), robust to
             // docker-compose v1/v2 absence + the CORRECT service name +
-            // SSM creds for the recreate case (incident 2026-06-08).
-            let cmds = ["bash /opt/tickvault/repo/scripts/ensure-questdb.sh".to_string()];
+            // SSM creds for the recreate case (incident 2026-06-08). Now the
+            // `ensure-questdb` subcommand of the installed binary (audit D6d).
+            let cmds =
+                [crate::operator_control_action_commands::ENSURE_QUESTDB_COMMAND.to_string()];
             match shell.ssm_shell(&cmds).await {
                 Ok(cid) => resp(
                     200,
@@ -1896,6 +1932,10 @@ impl OpsShell for AwsShell {
 
     fn data_destructive_locked_now(&self) -> bool {
         is_data_destructive_locked(Utc::now())
+    }
+
+    fn data_wipes_authorized(&self) -> bool {
+        CONSOLE_DATA_WIPES_AUTHORIZED
     }
 
     fn now_epoch(&self) -> i64 {
@@ -2461,6 +2501,11 @@ mod tests {
         /// pre-PR20 test's assumption); `Some(v)` pins it independently, for
         /// the 09:00-09:15 and 15:40-15:45 edges where the two differ.
         destructive_locked: Option<bool>,
+        /// `true` by default so the older tests keep exercising the gated
+        /// path a future dated quote would re-open; production returns
+        /// [`CONSOLE_DATA_WIPES_AUTHORIZED`] (`false`), pinned by
+        /// `test_regression_console_data_wipes_are_refused_at_any_hour`.
+        wipes_authorized: bool,
         now: i64,
         env: std::collections::HashMap<String, String>,
         ssm_result: Result<String, String>,
@@ -2483,6 +2528,7 @@ mod tests {
                 secret: AUTH_SECRET.to_string(),
                 market_hours: false,
                 destructive_locked: None,
+                wipes_authorized: true,
                 now: 1_780_000_000,
                 env: std::collections::HashMap::new(),
                 ssm_result: Ok("cid-1".to_string()),
@@ -2520,6 +2566,9 @@ mod tests {
         }
         fn data_destructive_locked_now(&self) -> bool {
             self.destructive_locked.unwrap_or(self.market_hours)
+        }
+        fn data_wipes_authorized(&self) -> bool {
+            self.wipes_authorized
         }
         fn now_epoch(&self) -> i64 {
             self.now
@@ -3492,6 +3541,41 @@ mod tests {
         assert_eq!(status_of(&resp), 409);
     }
 
+    /// Plan item 45g D10: while the zero-loss lock holds, every
+    /// data-deleting action is refused with 409 at ANY hour, with force and
+    /// the typed confirm word, and never reaches the box.
+    #[tokio::test]
+    async fn test_regression_console_data_wipes_are_refused_at_any_hour() {
+        const { assert!(!CONSOLE_DATA_WIPES_AUTHORIZED) };
+        // The production shell answers with the constant, not a copy of it.
+        let src = include_str!("operator_control.rs");
+        assert!(src.contains(concat!(
+            "fn data_wipes_authorized(&self) -> bool {\n",
+            "        CONSOLE_DATA_WIPES_AUTHORIZED\n"
+        )));
+        for locked in [false, true] {
+            let shell = MockShell {
+                wipes_authorized: CONSOLE_DATA_WIPES_AUTHORIZED,
+                market_hours: locked,
+                forbid_ssm: Some("a refused data-deleting action must never reach SSM"),
+                ..MockShell::default()
+            };
+            for resp in [
+                wipe(&shell, true, "WIPE").await,
+                docker_reset(&shell, true, "NUKE-DOCKER", AUTH_SECRET).await,
+                docker_nuke_bare(&shell, true, "ERASE").await,
+            ] {
+                assert_eq!(status_of(&resp), 409, "{resp}");
+                let body = body_of(&resp);
+                if !locked {
+                    assert_eq!(body["data_wipes_disabled"], json!(true), "{body}");
+                    assert_eq!(body["error"], json!(CONSOLE_DATA_WIPES_REFUSED_MSG));
+                }
+            }
+            assert!(shell.captured_joined().is_empty());
+        }
+    }
+
     #[test]
     fn test_wipe_is_in_destructive_set() {
         assert!(DESTRUCTIVE.contains(&"wipe-questdb"));
@@ -4419,7 +4503,7 @@ mod tests {
         assert!(joined.contains("systemctl stop tickvault"));
         assert!(joined.contains("docker compose down -v"));
         assert!(joined.contains("docker system prune -af --volumes"));
-        assert!(joined.contains("ensure-questdb.sh"));
+        assert!(joined.contains("tickvault-host ensure-questdb"));
         assert!(joined.contains("systemctl restart tickvault"));
     }
 
@@ -4457,9 +4541,38 @@ mod tests {
         assert!(joined.contains("BARE-NUKE-RESULT"));
         assert!(joined.contains("bare-nuke-complete"));
         // the WHOLE POINT: it must NOT rebuild / restart the app
-        assert!(!joined.contains("ensure-questdb.sh"));
+        assert!(!joined.contains("ensure-questdb"));
         assert!(!joined.contains("systemctl restart tickvault"));
         assert!(!joined.contains("docker compose up"));
+    }
+
+    #[tokio::test]
+    async fn test_restart_questdb_calls_the_binary_only_behind_the_version_check() {
+        // Audit D6d (2026-10-01): the self-heal moved from a shell script into
+        // the binary. A binary that predates the port would ignore the
+        // unknown subcommand and boot the whole app, so the call must sit
+        // behind the check for the new binary's log prefix.
+        let shell = MockShell {
+            ssm_result: Ok("cmd-rq".to_string()),
+            ..MockShell::default()
+        };
+        let resp = post(&shell, json!({"action": "restart-questdb"})).await;
+        assert_eq!(status_of(&resp), 200);
+        let joined = shell.captured_joined();
+        let guard = "grep -qaF 'ensure-questdb: ' /opt/tickvault/bin/tickvault-host";
+        let call = "then /opt/tickvault/bin/tickvault-host ensure-questdb;";
+        let guard_at = joined.find(guard).expect("version check present");
+        let call_at = joined.find(call).expect("binary call present");
+        assert!(guard_at < call_at, "the check must run before the call");
+        assert_eq!(joined.matches("tickvault-host ensure-questdb").count(), 1);
+        assert!(joined.contains("ENSURE-QUESTDB-SKIPPED"));
+        // The reset's two self-heal lines use the same guarded command.
+        use crate::operator_control_action_commands::{
+            DOCKER_RESET_COMMANDS, ENSURE_QUESTDB_COMMAND,
+        };
+        let reset = DOCKER_RESET_COMMANDS.join("\n");
+        assert_eq!(reset.matches(ENSURE_QUESTDB_COMMAND).count(), 2);
+        assert!(!reset.contains("bash /opt/tickvault/repo/scripts/ensure-questdb.sh ||"));
     }
 
     // ---------------------------------------------------- class HtmlWipeButton

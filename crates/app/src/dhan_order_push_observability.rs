@@ -29,6 +29,7 @@ use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::IST_UTC_OFFSET_NANOS;
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::order_types::OrderUpdate;
+use tickvault_storage::audit_spill::{AuditSpillTable, spawn_audit_spill_drain_once};
 use tickvault_storage::order_audit_persistence::{
     OrderAuditEvent, OrderAuditRow, OrderAuditWriter, ensure_order_audit_table,
 };
@@ -189,7 +190,8 @@ fn blocking_flush<T>(flush: impl FnOnce() -> T) -> T {
 }
 
 /// Append + flush one paper order_audit row. Failures are coded AUDIT-06
-/// (staged) — the writer's flush already discard-pends + counts.
+/// (staged). A failed flush spills the batch to the disk tier (audit PR42b);
+/// the writer discards and counts only when the disk tier refuses it too.
 fn persist_push_row(writer: &mut OrderAuditWriter, row: &OrderAuditRow) {
     if let Err(err) = writer.append_order_audit_row(row) {
         metrics::counter!("tv_order_audit_persist_errors_total", "stage" => "append").increment(1);
@@ -297,6 +299,8 @@ async fn run_dhan_order_push_consumer(
     events_tx: Option<mpsc::Sender<OrderUpdateEventRecord>>,
 ) {
     ensure_order_audit_table(&questdb).await;
+    // Audit PR42b: after the ensure (no-op if the order consumer started it).
+    spawn_audit_spill_drain_once(AuditSpillTable::OrderAudit, &questdb);
     let mut writer = OrderAuditWriter::new(&questdb);
     info!("dhan order push: paper-mode consumer draining (receive-only; no Telegram)");
     loop {

@@ -419,7 +419,7 @@ inline (PR2, PR8, PR14).
     script is rule-locked to shell and needs an owner quote before it changes.
   - Series (2026-10-01, owned by the "Replace shell scripts with Rust" thread; one PR each,
     serial; the audit-plan thread skips D6):
-    - [ ] D6a — shell budget first: `crates/common/tests/shell_budget_guard.rs` freezes the 105
+    - [x] D6a — shell budget first: `crates/common/tests/shell_budget_guard.rs` freezes the 105
       shell files (46 developer tooling by file set; 59 others by file set AND line ceiling) and
       pins each systemd unit's shell `Exec*=` count (1 + 3 + 1). Rule lock §0.10. Test-only.
       Tests: `no_new_shell_files`, `shell_lists_shrink_only`, `ops_shell_files_never_grow`,
@@ -1020,6 +1020,15 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
     `restart_differential.rs` simulates crashes only, so it cannot see this. Gate the seal to
     after the close (or mark those bars partial) and add the clean-shutdown case to the
     differential.
+    - (b) delivered by PR #2009, folded into #2004 on 2026-10-03: a mid-session exit seals what
+      the catch-up would seal and withholds the rest (`seal_complete_buckets_at_mid_session_exit`).
+    - Hostile review 2026-10-03: until (a) lands, those withheld bars are LOST, not rebuilt: a
+      restart's replay skips segments already applied, so a market-hours deploy leaves every
+      open 3m-60m bar, and quiet contracts' bars that ended inside the late-trade margin, missing
+      (counted). Before (b) they were written short. (a) must re-read the archived segments that
+      cover them; that is #2010 part 2, not written yet.
+    - Also from that review, for (a): `withhold_open_buckets` skips cells with no open bucket, so
+      a settled late-trade carry that `force_seal_all` would re-emit is dropped uncounted.
 - [ ] **PR31c — PR31a's honest limits, closed one by one (zero data loss on every path,
   owner 2026-09-27).** (`storage`, `app`) Added 2026-09-27 so none of these lives only in the
   PR #1962 text. Each lands as its own small PR after PR31b.
@@ -1473,8 +1482,28 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
     error (`source = "order_push_lagged"`). The per-writer counters stay local.
     Tests: `order_side_paging_wiring_guard` (emit and seed at every source, coded lag arm, alarm
     sums m6, selector carries the name); EMF count ratchet 102 → 103.
-  - [ ] **PR42b — the rows survive.** Disk tier for `order_audit`, `pnl_audit` and
-    `order_leg_pnl` (bounded spill, replayed under their DEDUP keys).
+  - [x] **PR42b — the rows survive (2026-10-01).** New module `storage::audit_spill`. A failed
+    flush of `order_audit`, `pnl_audit` or `order_leg_pnl` writes the batch's exact ILP bytes
+    (whole rows only) to one immutable file under `data/spill/audit/<table>/` (tmp, fsync,
+    rename, fsync dir) and the flush reports `Ok`. One drain task per table, spawned after its
+    `ensure_*_table`, POSTs the files to `/write` at once and every 60 s: a 2xx deletes the
+    file, a permanent 4xx moves it to `quarantine/` (kept) and counts its rows on
+    `tv_order_audit_chain_lost_total{source="<table>_spill_lost"}`, anything else stops the
+    round and keeps the file. No session-window filter (unlike the tick drain). Bounded at
+    64 MiB and 50,000 files per table; past that the batch is discarded and counted as before.
+    Replay is safe to repeat: each row keeps its own `ts`, the first column of every DEDUP key.
+    Tests: 15 in `audit_spill`, 3 or 4 per writer (spill, half-appended row left out, refused
+    spill still discards, production dir), two consumer tests updated (spilled rows count as
+    appended). Hostile review fixes: the drain pages once per backlog episode when the oldest
+    waiting file is 30 min old (`tv_order_audit_persist_errors_total{stage="spill_backlog"}`, an
+    existing leg of the order-audit chain-loss alarm, so no new metric or alarm cost); the cap
+    no longer counts `quarantine/`; a failed directory sync after the rename keeps the rows
+    instead of counting them lost; the drain re-runs the table's ensure before replaying a
+    backlog; the replay URL states `precision=n`; a stale `.tmp` counts its rows as lost; the
+    leg-P&L flush runs under `block_in_place`; the two consumer tests remove the spill files they
+    write. Honest limits: the daily reconcile counts a spilled row as appended while it is still
+    on disk (the 30-min page covers that window); a file over 8 MiB whose second chunk is
+    refused counts all its rows lost, though the first chunk was stored.
   - [ ] **PR42c — reconcile on lag. Needs an owner decision.** The order-push consumer holds no
     copy of the paper OMS order map, and fetching the broker order book is REST outside the
     allowed classes (`no-rest-except-live-feed-2026-06-27.md`). Options: share a read handle on
@@ -2153,6 +2182,269 @@ independent live-path fixes).
 R-items Z+ and guarantee matrix: covered by the shared matrix at the end of this plan. Tick
 path: R1 removes four compares per tick; R2 adds one divide and one compare per spot tick; no
 allocation in either (zero-alloc DHAT gates unchanged).
+
+### Added 2026-10-02 (zero-loss audit on main c4e66b6), riskiest first
+
+Owner: "see i dont want any ticks loss or single data loss". Every path a tick takes was traced
+(socket, write-ahead log, database, candles, every delete). Done in this change:
+
+- [x] **Z1 — frames read while a socket closes are kept.** (`core`) `await_close_handshake`
+  discarded every frame Dhan delivered between our Close and its reply, uncounted, on every
+  redial, rotation and park. Each data frame now reaches the sink through `close_capturing`
+  (the only close the supervisor uses); counted on `tv_dhan_ws_close_drain_frames_total`.
+  - Files: crates/core/src/websocket/connection.rs, crates/core/src/websocket/pool_supervisor.rs
+  - Tests: `test_regression_the_close_handshake_hands_on_every_data_frame`,
+    `test_regression_frames_read_during_close_reach_the_sink`,
+    `every_production_close_passes_its_frames_to_the_sink`.
+- [x] **Z2 — the write-ahead log syncs the last batch before a quiet spell.** (`storage`) Only a
+  new record could trigger the rate-limited sync, so after a lull the last batch waited for the
+  kernel's writeback. The idle arm now syncs an unsynced segment, at most once per interval.
+  - Files: crates/storage/src/ws_frame_spill.rs
+  - Tests: `test_regression_a_lull_syncs_the_last_batch`.
+- [x] **Z3 — the candle INT self-heal drops only a table proven empty.** (`storage`) It ran every
+  boot and dropped any candle table with an INT `security_id` without checking it was empty.
+  - Files: crates/storage/src/shadow_persistence.rs
+  - Tests: `test_regression_only_a_zero_count_proves_a_candle_table_empty`.
+- [x] **Z4 — a same-day future trade time cannot open a future candle.** (`trading`, `app`) R2 capped
+  the spot store; the fold had no cap. Refused (row kept) past `FOLD_FUTURE_TRADE_TIME_SKEW_SECS`
+  = 60 s ahead of receipt.
+  - Files: crates/trading/src/candles/multi_tf_aggregator.rs, crates/app/src/spot_price_store.rs
+  - Tests: `test_regression_a_same_day_future_stamp_never_opens_a_future_bucket`,
+    `test_a_same_day_stamp_within_the_skew_margin_still_folds`,
+    `test_future_skew_never_exceeds_the_candle_fold`.
+- [x] **Z5 — the error-log filter no longer turns on TRACE for the whole process; the catch-up
+  stop reason says "clock" when time ran out.** (`app`)
+  - Files: crates/app/src/log_coalescer.rs, crates/app/src/dhan_feed_stack.rs
+  - Tests: `test_regression_combined_error_filter_keeps_the_error_level_hint`,
+    `test_wal_catchup_lag_step_covers_every_permutation`.
+
+Second round, 2026-10-02 (owner: "yes fix evrryhtign ddue okay?", then "approved entirley fully
+auotmate ddue okay?"):
+
+- [x] **Z6 — a replayed candle never replaces a fuller copy of its bar.** (`storage`, commit
+  `ed4ded9fd`) The PR41a ledger is now one entry per bar (slot and bucket), holding the fullest copy
+  on disk and the fullest committed; every rule is a max, so the result does not depend on the order
+  copies reach the disk. Covers the four paths found: a later bucket spilled first, an original
+  still in the escalation queue, a dead-lettered original, a parked file resumed after a later one.
+  The boot drain keeps the fullest copy per bar across spill and DLQ. Pre-sized, never grows; at
+  capacity it writes and counts (`kind=mirrored_overflow`, `untracked`, `boot_untracked`).
+  **Honest limit:** a DLQ write does not consult the ledger before writing (it records after); a
+  key the ledger could not track at capacity still replays in file order.
+  - Files: crates/storage/src/seal_spill_ledger.rs, crates/storage/src/seal_spill.rs, crates/storage/src/seal_writer_task.rs, crates/storage/src/seal_writer_runner.rs, crates/storage/src/seal_absorption.rs, crates/storage/src/seal_writer_loop.rs
+  - Tests: `test_regression_z6_later_bucket_spilled_does_not_hide_amend`,
+    `test_regression_z6_original_in_escalation_queue_is_not_written_after_live_amend`,
+    `test_regression_z6_dead_lettered_original_mirrors_live_amend`,
+    `test_regression_z6_parked_file_resumed_after_later_bucket_skips_older_copy`,
+    `test_regression_z6_boot_drain_keeps_fullest_across_spill_and_dlq_with_intervening_bucket`,
+    `test_regression_z6_ledger_at_capacity_fails_toward_writing`.
+- [x] **Z7 — a queued rescue batch holds the persisted watermark below it.** (`storage`, commit
+  `b9ef33dda`) The drain holds a floor (fixed 8-slot CAS table per sink, no allocation, no lock)
+  before handing a batch to the rescue thread, retracts it if the hand-off is refused, and the
+  rescue thread releases it only after the spill is synced or the range is marked unapplied. A full
+  table marks the range unapplied and counts `tv_wal_rescue_floor_full_total`.
+  - Files: crates/storage/src/wal_applied_watermark.rs, crates/storage/src/tick_persistence.rs, crates/storage/src/depth_persistence.rs
+  - Tests: `test_regression_tick_queued_rescue_holds_a_floor_until_the_rescue_thread_settles_it`,
+    `test_regression_depth_queued_rescue_holds_a_floor_until_the_rescue_thread_settles_it`,
+    `test_regression_tick_refused_rescue_hand_off_retracts_its_floor`,
+    `test_regression_an_abandoned_rescue_survives_into_the_persisted_file`; DHAT
+    `dhat_rescue_floor_zero_alloc` (CI storage DHAT step 3 → 4).
+- [x] **Z8 — durability below the watermark.** (`storage`, commit `b9ef33dda`) (a) The writer-thread
+  and rescue-thread spills `fdatasync` before a batch counts as rescued; a failed sync is a failed
+  rescue. (b) QuestDB stays on its default commit mode (sync measured 6–8× slower per flush);
+  instead the persisted watermark is the value acknowledged at least
+  `WATERMARK_DURABILITY_LAG_SECS` (60 s) earlier. **Honest limits:** (b) relies on kernel writeback
+  timing, not an fsync of QuestDB's files; the drain's own inline spill stays unsynced so the drain
+  never waits on the disk; `confirm_replayed` archives on the acknowledgement.
+  - Tests: `test_regression_persisted_watermark_lags_acks_by_the_durability_lag`,
+    `test_regression_tick_rescue_sink_reports_a_failed_sync_as_a_failed_rescue`,
+    `spill_rescue_sync_guard.rs::the_spill_helper_fdatasyncs`.
+- [~] **Z9 — data with no stored copy is pruned.** PARTLY DONE.
+  - 45f done (`7fae8d31b`): the cold bucket has versioning, no expiration, `raw-frames/` goes to
+    DEEP_ARCHIVE. Test `test_terraform_cold_bucket_keeps_everything`.
+  - 45e-1 done (`66c3f8cd2`, `25c78fd65`): every WAL prune (age, byte ceiling, 5% floor) deletes a
+    segment only after a gzip copy is in `s3://<cold>/raw-frames/<IST date>/` and verified by
+    HeadObject (size + SHA-256); refusals counted on `tv_wal_prune_refused_not_uploaded_total`.
+    Tests `test_regression_age_prune_needs_a_matching_upload_marker`,
+    `test_regression_byte_prune_refuses_segments_without_a_verified_copy`,
+    `test_regression_floor_prune_needs_a_verified_copy_too`,
+    `test_regression_size_mismatch_after_upload_writes_no_marker`.
+  - 45g D7 (`9e2e86535`, a table with rows is renamed aside, never dropped), D8 (`8f4bcc857`, a
+    retired table is dropped only when a count proves it empty), D10 (`a229cb398`, the console
+    refuses every data-deleting action, `CONSOLE_DATA_WIPES_AUTHORIZED = false`) done.
+  - Open: 45e-2 (offload / re-hydrate), the seal-spill and quarantine prunes (D5/D6), 45h.
+  - **Trade-off chosen (default):** the prune gate fails CLOSED. If the bucket is unreachable for
+    days, the WAL disk fills instead of deleting an uncopied segment. Turning it off needs
+    `[raw_frame_archive] require_upload_before_prune = false`.
+- [~] **Z10 — a full WAL disk can deadlock replay.** PARTLY DONE: the uploader runs every 2 minutes
+  outside 09:00–15:40 IST and at once on disk pressure, so verified segments become prunable. Still
+  open: if S3 is also unreachable, replay below 40 GiB free still waits (45e-2).
+- [x] **Z11 — smaller loss paths.**
+  - [x] (a) WAL replay resyncs past a bad record instead of abandoning the rest of the segment
+    (`9714b4de2`, `65c306dbb`): `decode_record_at`, resync ceiling `WAL_RESYNC_MAX_FRAME_BYTES`
+    (4 MiB, const-asserted against every WAL-bound frame cap), skipped bytes counted and logged
+    (WS-SPILL-02 `source="mid_segment_resync"`). Tests
+    `test_regression_resync_recovers_records_after_a_mid_segment_crc_flip`,
+    `test_regression_corrupt_length_past_eof_is_counted_not_a_silent_tail`.
+  - [x] (b) the panic hook gives the WAL writer up to 2 s to flush everything queued before the abort
+    (`99e2f0456`, `a8fc3b9be`; tests `the_panic_hook_drains_the_wal_before_it_aborts`,
+    `test_regression_drain_for_abort_returns_once_the_queue_is_empty`). **Honest limit:** a panic on
+    the WAL writer thread itself still loses its queue, and an out-of-memory kill runs no hook.
+  - [x] (c) a frame refused by the WebSocket size cap logs a coded `error!` with
+    `source="frame_oversize"` and the cap, throttled to powers of two per endpoint; no new alarm
+    (`dcb26b1bf`; `test_regression_oversize_refusal_logs_error_with_source_frame_oversize`).
+  - [x] (d) shutdown closes the feed sockets first (up to 5 s; frames read during the close still
+    reach the WAL), then the lane, seals and WAL; records left in the writer's channel at exit are
+    counted (`0574db4b6`; `shutdown_closes_the_sockets_before_the_lane_and_the_wal`,
+    `test_regression_run_connection_parks_with_shutdown_and_captures_close_frames`,
+    `test_regression_records_enqueued_after_writer_exit_are_counted_not_silent`). Default chosen: a
+    shutdown park skips the park counter and the "parked permanently" error (logged at info), so the
+    `dhan-socket-parked` alarm does not page on every stop or deploy; the alarm itself is unchanged.
+    Stop budgets now sum to 125 s against `TimeoutStopSec=145` (the guard's 20 s floor).
+- [x] **Waste found by the sweep, fixed.** (`app`, `core`, `api`) The per-minute depth steering no
+  longer loads ~22,000 candidates and the movers every minute (`3b1adb524`; `plan_minute`,
+  `top_mover_pick` deleted; guard `the_steering_loop_runs_no_per_minute_candidate_or_movers_load`);
+  `PoolSupervisor::poll_all` (no caller) deleted; `/api/quote` uses the shared client, keys its cache
+  on `(security_id, segment)`, answers 409 on an ambiguous id (`c4e33f325`); `/api/stats` and the board
+  also reuse the shared client with a 3 s per-query timeout (`c3a3604ff`; tests
+  `test_stats_uses_the_shared_client_and_builds_none`, `test_board_uses_the_shared_client_and_builds_none`).
+- [x] **Z12 — CLAUDE.md speed table rows.** Added 2026-10-02: `classify_frame`, `blocking_flush` /
+  `append_inline_depth`, `rebuild_pending_paper` / `active_order_count`, plus rows for the new
+  rescue floors and `DurabilityLag`, `raw_frame_upload::run_pass`, `resync_from`; the PR41a ledger and
+  `SpotPriceStore` rows corrected. Original finding: `connection.rs::classify_frame` is O(packets) on the
+  socket read task; `blocking_flush` runs `block_in_place` on every flush. The 2026-10-02 workspace
+  sweep adds: `append_inline_depth` writes 10 rows per full packet; per order, `rebuild_pending_paper`
+  and `active_order_count` are O(orders) on every order event; the per-minute depth steering builds
+  ~22,000 candidate rows and two database queries used only for a log count (their consumers
+  `plan_minute` and `top_mover_pick` have no production caller); `/api/quote` builds a new HTTP
+  client per request. None is per tick. Full list: the 2026-10-02 audit page.
+
+Z-items Z+ and guarantee matrix: covered by the shared matrix at the end of this plan. Tick path:
+Z4 adds one add and one compare per tick; Z1 runs only on the close path; Z2 adds one flag test per
+idle poll. No allocation on the tick path.
+
+### Added 2026-10-02 (round 3: remaining loss paths, never-blocks, owner's 06:32 and 08:00 asks)
+
+- [x] **R3-1 — WAL sync off the writer thread.** `ws_frame_spill.rs`: `wal-syncer` thread; the
+  writer only flags a due sync. Test `test_writer_keeps_writing_while_sync_is_wedged` (bite-proved),
+  plus `tv_wal_fsync_backlog` / `_pending_ms` / `_inline_fallback_total`.
+- [x] **R3-2 — Failed flush/write counts its buffered records as lost.** `UnflushedTally`,
+  `tv_ws_frame_spill_unflushed_lost_total`, WS-SPILL-02. Test
+  `test_failed_segment_writer_counts_its_buffered_records_as_lost`.
+- [x] **R3-3 — Backward wall-clock step re-anchors the receipt clock.** Test
+  `test_backward_wall_step_reanchors_instead_of_freezing`.
+- [x] **R3-4 — Archive drop waits for applied WAL** (`partition_archive.rs`, `writerTxn ==
+  sequencerTxn` before export and before drop, fail closed, `STORAGE-GAP-04`).
+- [x] **R3-5 (D5/D6 part 1) — Spill and quarantine prunes gated on a verified S3 copy;**
+  quarantine never overwrites (`raw_frame_upload.rs`, `seal_spill.rs`, `tick_persistence.rs`,
+  `tick_spill_replay.rs`). Part 2 (rehydrate for the after-close pass) stays OPEN under 45e-2.
+- [x] **R3-6 (45h) — Unstored packet classes persisted:** `ticks.oi_day_high/low`, new
+  `feed_aux_packets` table with `feed` in the DEDUP key (`feed_aux_persistence.rs`).
+- [x] **R3-7 (D7, main feed only) — 805 overflow probe** in `pool_supervisor.rs`; ROTATION_HALTED is
+  never cleared (source-checked); depth sockets stay parked pending an owner decision.
+- [x] **R3-8 — `feed_gap_audit` table** (`feed_gap_audit_persistence.rs`, `ws_audit_consumer.rs`);
+  `ws_event_audit` carries the real close code, `down_secs` and attempts.
+- [x] **R3-9 — WAL-refused frames are not treated as WAL-backed** (`CapturedFrame.wal_backed`).
+- [x] **R3-10 — Kernel receive-queue sampler** (`kernel_rx_queue_sampler.rs`), WS-GAP-03 log on a
+  sustained backlog; no alarm (needs a dated quote).
+- [x] **R3-11 — Never-blocks:** dedicated reader runtime (`reader_runtime.rs`,
+  `TICKVAULT_WS_READER_THREADS`, 0 = rollback), Prometheus-only telemetry
+  (`hot_path_telemetry.rs`), ratchet `crates/common/tests/hot_path_no_blocking_guard.rs`
+  (bite-proved). CPU pinning NOT added: needs `libc` as a direct dependency (owner approval).
+- [x] **R3-12 (D6d) — `scripts/ensure-questdb.sh` replaced by `tickvault ensure-questdb`.**
+  Delivered by PR #2005, folded into #2004 on 2026-10-03 (the earlier copy here was reverted
+  first so only #2005's version lands).
+- [ ] **R3-13 (D11) — Special sessions (Muhurat).** Built inert on `wip/d11`, NOT merged: needs the
+  owner to confirm date, hours and cost, and a compile + test run.
+- [ ] **R3-14 — WAL segment names from a monotonic source** (replay order across a clock step). Open.
+
+### Added 2026-10-02 (round 4: owner approved decisions 2 to 5 and in-place resubscribe)
+
+Operator 2026-10-02: "go ahea ddude" / "dont b;ock go ahea ddude" (11:51), "what happend to
+unsusbcribe resubscribe fucntionality as well dude can you add this alsod due okay?" (11:59) and
+"go ahead approved everyhtign dude okay?" (12:40, naming the stall alarm and the libc dependency).
+Each is recorded first in its rule file.
+
+- [x] **R4-1 (decision 2) — Depth sockets recover on their own after 805.** `pool_supervisor.rs`
+  depth overflow episode (one probe process-wide, doubling wait 5 to 30 min, at most 6 probes),
+  `ROTATION_HALTED` never cleared; scope lock 2026-10-02 section. 9 tests incl. a 50,000-step
+  random driver; `tv_dhan_ws_depth_overflow_probe_total{outcome}`.
+- [x] **R4-2 (decision 5) — Backup copy of the top 1,000 contracts on the spot main-feed socket**
+  (`main_feed_backup.rs`, `[dhan_universe] backup_top_n`, 0 disables). First copy wins at the drain;
+  the WAL keeps both. Free-slot count (~2,662) is derived, not re-measured. Scope lock section.
+- [x] **R4-3 — In-place unsubscribe/resubscribe on every socket kind** (`LiveSubscriptionCommand::
+  Resubscribe`, unsubscribe batches first, per-socket caps refused and counted). Includes PR #1994
+  (depth-200 swap and ghost resend in place). No production sender yet: no live policy removes
+  instruments mid-session. Scope lock 2026-10-02 section.
+- [x] **R4-4 (decision 4) — Socket reader threads pinned to their own core** (`libc =0.2.185`,
+  `TICKVAULT_WS_READER_CORE`, default core 1 when allowed, never core 0, `tv_ws_reader_pinned_core`).
+  Benefit not measured.
+- [x] **R4-5 (decision 3) — Phone page HOT-PATH-STALL-01** when a hot task stalls 2 s in session
+  (`hot_path_telemetry.rs` StallAlarm, CloudWatch filter + alarm, noise lock 2.8). Cannot fire
+  if the whole process freezes.
+- [x] **R4-6 — Attack-pass fixes on round 4** (1 high, 3 medium, 4 low):
+  WAL replay dedups backup copies against the persisted set (`main_feed_backup.rs`
+  `write_backup_set` / `ReplayBackup`, `dhan_feed_stack.rs` `refold_wal_frames`); the set is
+  published before the Extend; the dedup table is built off the drain and adopted by pointer
+  swap; same-socket repeats kept, newest trade time never goes back; stall page quiet after
+  shutdown starts (`hot_path_telemetry::begin_shutdown`); an 805 episode with nothing parked
+  finishes after its wait (`pool_supervisor.rs` `OverflowEpisode::poll`); only reader workers
+  are pinned, helper threads restored (`reader_runtime.rs` `build_reader_runtime`); kernel
+  queue sampler reads `/proc` on the blocking pool; CLAUDE.md complexity rows for 9 structures.
+  Tests: test_regression_an_episode_with_nothing_parked_recovers_after_its_wait,
+  test_regression_build_reader_runtime_leaves_blocking_threads_unpinned,
+  test_regression_begin_shutdown_and_is_shutting_down_latch_the_alarm_quiet,
+  test_regression_replay_unknown_socket_drops_the_second_copy,
+  test_regression_refold_wal_frames_folds_one_copy_of_a_backup_packet,
+  test_regression_subscribe_main_feed_backup_publishes_before_the_extend,
+  test_regression_publish_backup_set_builds_off_the_drain_and_adopt_swaps,
+  test_regression_same_socket_identical_repeat_is_kept,
+  test_regression_newest_ltt_never_goes_backwards.
+- [x] **R5 — Round-5 attack-pass fixes** (2 medium, 4 low; 2026-10-02):
+  F1 the persisted backup set is a bounded history of publications and the replay uses the one
+  in force at each frame (`main_feed_backup.rs` `PersistedBackupHistory`, `ReplayBackup::select`);
+  F2 a new publication carries dedup state for contracts that stay (`BackupDedup::swap_in`);
+  F3 the main-feed widen flag is published only under the lock and an unprocessed 805 forces no
+  (`pool_supervisor.rs` `OVERFLOW_WIDEN_STATE`); S1 the boot drain's older-copy guard survives a
+  stopped drain (`seal_writer_task.rs` `drain_recovered_seals`, `seal_spill_ledger.rs`
+  `BootWritten`); S2 a verified upload whose marker write failed still satisfies the prune
+  (`raw_frame_upload.rs`); S3 the frame sequence is seeded above the persisted applied watermark
+  (`ws_frame_spill.rs` `seed_frame_seq_from_disk`, `wal_applied_watermark.rs`).
+  Tests: test_regression_805_never_published_over_by_a_stale_step,
+  test_regression_persisted_history_keeps_earlier_publications_bounded,
+  test_regression_replay_uses_the_publication_in_force_at_each_frame,
+  test_regression_replay_stops_a_publication_at_a_later_process_start,
+  test_regression_replay_switch_carries_state_like_the_live_adopt,
+  test_regression_adopt_carries_state_for_contracts_that_stay_in_the_set,
+  test_regression_s1_older_copy_left_staged_by_a_stopped_drain_is_refused_next_boot,
+  test_regression_s1_summary_survives_two_stopped_drains,
+  test_regression_s1_summary_is_bounded_and_counts_what_it_drops,
+  test_regression_s2_verified_upload_with_failed_marker_write_satisfies_the_prune,
+  test_regression_s2_unverified_file_is_never_covered_and_a_delete_forgets_the_record,
+  test_regression_s3_persisted_high_water_reads_only_a_valid_own_file,
+  test_regression_s3_reseed_clears_the_persisted_applied_watermark_with_no_segments.
+
+R3 Z+ and guarantee matrix: covered by the shared matrix at the end of this plan. Tick path adds
+one histogram bucket update per frame (R3-11) and one bool per frame (R3-9); no allocation by
+construction (an allocation test for the telemetry is still open).
+
+### Added 2026-10-03 (health check on main 2fabc2e), riskiest first
+
+Operator 2026-10-03 09:28 UTC: "go", on the offered order: restart data-loss fix, then the token
+write, then candle warm-up (PR31b-2 (a), already listed above). Each fix ships as its own PR.
+
+- [x] **H1 — A catch-up drain that stops early no longer lets its leftover backlog be archived
+  unread.** The live lane's acks lifted the applied watermark past the segments the drain left,
+  and the next boot's replay skipped them as applied. The not-drained arm now marks
+  `[lowest waiting first seq, ceiling − 1]` unapplied and persists it before the live ring exists
+  (`ws_frame_spill.rs` `guard_pending_backlog`, `dhan_feed_stack.rs`). O(waiting segments) header
+  reads, once per boot, cold. Tests:
+  test_regression_leftover_backlog_is_replayed_after_live_acks_pass_it,
+  test_guard_pending_backlog_ignores_segments_at_or_above_the_ceiling,
+  an_unfinished_catchup_guards_its_leftover_backlog_before_the_live_drain.
+- [ ] **H2 — Token renewal no longer writes the token cache file on the socket reader worker.**
+  After an 807/809 renewal, `token_cache::save_token_cache` (a sync write and fsync) runs on the
+  single `tv-ws-reader` worker, so a slow disk stalls every socket. Move the write to the blocking
+  pool. Files: `crates/core/src/auth/token_manager.rs`, `crates/core/src/auth/token_cache.rs`.
 
 ## Edge Cases
 

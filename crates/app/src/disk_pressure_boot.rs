@@ -472,6 +472,10 @@ async fn run_disk_pressure_loop(
                 // Rate-floored inside the sweep, so a long episode cannot turn
                 // a cold path into a hot loop.
                 crate::reclaim_signal::request_reclaim();
+                // The prune now deletes only segments with a verified S3
+                // copy (plan item 45e-1), so the uploader is woken too; it
+                // wakes the prune again once it has marked a segment.
+                crate::reclaim_signal::request_raw_upload();
 
                 metrics::counter!("tv_disk_pressure_passes_total").increment(1);
                 let dropped = run_one_pass(&questdb, &cfg).await;
@@ -510,6 +514,10 @@ async fn run_disk_pressure_loop(
                 // the only reclaim left, so ask for it here too — the pass
                 // arm above is not reached on an escalated poll.
                 crate::reclaim_signal::request_reclaim();
+                // The prune now deletes only segments with a verified S3
+                // copy (plan item 45e-1), so the uploader is woken too; it
+                // wakes the prune again once it has marked a segment.
+                crate::reclaim_signal::request_raw_upload();
 
                 metrics::counter!("tv_disk_pressure_unrelievable_total").increment(1);
                 error!(
@@ -564,6 +572,7 @@ async fn run_one_pass(questdb: &QuestDbConfig, cfg: &PartitionRetentionConfig) -
                 dropped = summary.dropped,
                 failed = summary.failed,
                 tables_wal_suspended = summary.tables_wal_suspended,
+                tables_wal_not_applied = summary.tables_wal_not_applied,
                 rows_archived = summary.rows_archived,
                 gzip_bytes_uploaded = summary.gzip_bytes_uploaded,
                 "disk-pressure archive pass complete (every drop had a verified S3 copy)"

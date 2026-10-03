@@ -185,6 +185,17 @@ impl<S> Filter<S> for ErrorCoalescer {
             false
         }
     }
+
+    /// `Some(TRACE)`, not the default `None`: this filter restricts no level,
+    /// and saying so keeps the level hint of whatever it is combined with.
+    /// `FilterExt::and` takes the minimum of the two hints and `None` is the
+    /// minimum of every `Option`, so the default turned
+    /// `LevelFilter::ERROR.and(coalescer)` into "no hint", which tracing reads
+    /// as TRACE for the whole subscriber. Every disabled `debug!`/`trace!` on
+    /// the frame drain then paid a callsite check it had skipped before 45d.
+    fn max_level_hint(&self) -> Option<tracing_subscriber::filter::LevelFilter> {
+        Some(tracing_subscriber::filter::LevelFilter::TRACE)
+    }
 }
 
 #[cfg(test)]
@@ -195,6 +206,19 @@ mod tests {
     use tracing_subscriber::filter::FilterExt as _;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::{Layer, Registry};
+
+    /// The `errors.jsonl` layer is `LevelFilter::ERROR.and(coalescer)`
+    /// (main.rs). Its combined hint must stay ERROR, so adding the coalescer
+    /// does not lift the whole subscriber's max level to TRACE.
+    #[test]
+    fn test_regression_combined_error_filter_keeps_the_error_level_hint() {
+        let combined =
+            tracing_subscriber::filter::LevelFilter::ERROR.and(ErrorCoalescer::new("hint_test"));
+        assert_eq!(
+            Filter::<Registry>::max_level_hint(&combined),
+            Some(tracing_subscriber::filter::LevelFilter::ERROR)
+        );
+    }
 
     #[test]
     fn same_key_same_second_is_coalesced_and_the_next_second_admits() {

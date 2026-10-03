@@ -713,6 +713,11 @@ pub struct ContractSelection {
     pub deduped: usize,
     /// Contracts the envelope could not fit even at an ATM window of zero.
     pub dropped_for_capacity: usize,
+    /// The selected option legs, NEAREST THE MONEY FIRST, capped at
+    /// [`crate::main_feed_backup::BACKUP_RANK_MAX`]. The head of this list is
+    /// what gets a backup copy on a second main-feed socket (scope lock
+    /// 2026-10-02). A subset of [`Self::instruments`], in rank order.
+    pub backup_rank: Vec<SubscribeInstrument>,
 }
 
 /// Maps a master row's `EXCH_ID` to the derivative segment we subscribe.
@@ -877,6 +882,9 @@ pub fn select_contract_universe(
     // never an index chain.
     let mut chosen: HashSet<(SecurityId, ExchangeSegment)> = HashSet::new();
     let mut picked: Vec<SubscribeInstrument> = Vec::new();
+    // Every pushed leg with its distance from the money, for the backup
+    // ranking (scope lock 2026-10-02). See `ContractSelection::backup_rank`.
+    let mut ranked: Vec<BackupRankEntry<'_>> = Vec::new();
 
     // 1. Index options — FULL chain, current expiry, exactly the two
     // authorized underlyings. No spot price needed: taking every strike is
@@ -938,7 +946,10 @@ pub fn select_contract_universe(
         });
         for c in chain {
             match push_contract(c, capacity, &mut chosen, &mut picked) {
-                PushOutcome::Added => out.index_options += 1,
+                PushOutcome::Added => {
+                    out.index_options += 1;
+                    ranked.push(BackupRankEntry::new(c, centre, 0));
+                }
                 PushOutcome::Duplicate => out.deduped += 1,
                 PushOutcome::NoRoom => out.dropped_for_capacity += 1,
             }
@@ -959,9 +970,13 @@ pub fn select_contract_universe(
             out.atm_window_used = window;
             out.atm_window_reason = "applied";
             for ladder in &ladders {
+                let reference = ladder.strikes.get(ladder.atm).copied().unwrap_or(0);
                 for c in ladder.within(window) {
                     match push_contract(c, capacity, &mut chosen, &mut picked) {
-                        PushOutcome::Added => out.stock_options += 1,
+                        PushOutcome::Added => {
+                            out.stock_options += 1;
+                            ranked.push(BackupRankEntry::new(c, reference, 1));
+                        }
                         PushOutcome::Duplicate => out.deduped += 1,
                         PushOutcome::NoRoom => out.dropped_for_capacity += 1,
                     }
@@ -999,7 +1014,79 @@ pub fn select_contract_universe(
     // subscribe batches, which is what makes a diff between days meaningful.
     picked.sort_unstable_by_key(|i| (i.segment as u8, i.security_id));
     out.instruments = picked;
+    out.backup_rank = backup_rank_from(ranked);
     out
+}
+
+/// One selected option leg with its distance from the money, for
+/// [`ContractSelection::backup_rank`].
+struct BackupRankEntry<'a> {
+    /// `|strike - reference| / reference`, in parts per million.
+    distance_ppm: u64,
+    /// 0 = index option, 1 = stock option (index first on a tie).
+    class: u8,
+    underlying: &'a str,
+    strike_paise: i64,
+    instrument: SubscribeInstrument,
+}
+
+impl<'a> BackupRankEntry<'a> {
+    fn new(c: &Contract<'a>, reference_paise: i64, class: u8) -> Self {
+        let distance_ppm = if reference_paise > 0 {
+            let gap = u64::try_from(
+                c.strike_paise
+                    .saturating_sub(reference_paise)
+                    .saturating_abs(),
+            )
+            .unwrap_or(u64::MAX);
+            gap.saturating_mul(1_000_000) / reference_paise.unsigned_abs()
+        } else {
+            u64::MAX
+        };
+        Self {
+            distance_ppm,
+            class,
+            underlying: c.underlying,
+            strike_paise: c.strike_paise,
+            instrument: SubscribeInstrument {
+                security_id: c.security_id,
+                segment: c.segment,
+            },
+        }
+    }
+}
+
+/// Orders the selected legs nearest-the-money first and keeps the head.
+///
+/// Distance is a PERCENTAGE of the reference strike, so a NIFTY strike 0.4%
+/// out ranks beside a stock strike 0.4% out rather than the index chain's 50
+/// rupee steps being compared with a stock's 20 rupee ones. Ties go to the
+/// index chain, then by name, strike and id, so the answer is a function of
+/// the data. O(k log k) over the selected legs, once per selection.
+fn backup_rank_from(mut ranked: Vec<BackupRankEntry<'_>>) -> Vec<SubscribeInstrument> {
+    ranked.sort_unstable_by(|a, b| {
+        (
+            a.distance_ppm,
+            a.class,
+            a.underlying,
+            a.strike_paise,
+            a.instrument.security_id,
+            a.instrument.segment as u8,
+        )
+            .cmp(&(
+                b.distance_ppm,
+                b.class,
+                b.underlying,
+                b.strike_paise,
+                b.instrument.security_id,
+                b.instrument.segment as u8,
+            ))
+    });
+    ranked
+        .into_iter()
+        .take(crate::main_feed_backup::BACKUP_RANK_MAX)
+        .map(|e| e.instrument)
+        .collect()
 }
 
 /// Whether a selection is still WAITING on spot prices rather than finished.
@@ -2352,6 +2439,44 @@ mod tests {
             src.contains("for outcome in SPOT_BACKSTOP_OUTCOMES"),
             "pre_register_spot_backstop_counters must seed from the list"
         );
+    }
+
+    /// Scope lock 2026-10-02: the backup ranking is nearest-the-money by
+    /// PERCENTAGE, index chain first on a tie, and a pure function of the data.
+    #[test]
+    fn test_backup_rank_from_orders_nearest_the_money_by_percentage() {
+        use tickvault_common::types::ExchangeSegment;
+        let leg = |id: u64, underlying: &'static str, strike_rupees: i64| super::Contract {
+            security_id: id,
+            segment: ExchangeSegment::NseFno,
+            expiry_ymd: 20_261_029,
+            strike_paise: strike_rupees * 100,
+            leg: super::OptionLeg::Call,
+            underlying,
+        };
+        let nifty_atm = leg(1, "NIFTY", 25_000);
+        let nifty_far = leg(2, "NIFTY", 25_500); // 2.0% out
+        let stock_near = leg(3, "RELIANCE", 1_404); // 0.29% out of 1,400
+        let stock_atm = leg(4, "RELIANCE", 1_400);
+        let entries = vec![
+            super::BackupRankEntry::new(&nifty_far, 2_500_000, 0),
+            super::BackupRankEntry::new(&stock_near, 140_000, 1),
+            super::BackupRankEntry::new(&stock_atm, 140_000, 1),
+            super::BackupRankEntry::new(&nifty_atm, 2_500_000, 0),
+        ];
+        let ids: Vec<u64> = super::backup_rank_from(entries)
+            .iter()
+            .map(|i| i.security_id)
+            .collect();
+        // Both at-the-money legs tie at 0 ppm; the index chain goes first.
+        assert_eq!(ids, vec![1, 4, 3, 2]);
+        // A reference of 0 (no price) ranks last, never first.
+        let unpriced = leg(5, "ABC", 100);
+        let ranked = super::backup_rank_from(vec![
+            super::BackupRankEntry::new(&unpriced, 0, 1),
+            super::BackupRankEntry::new(&nifty_far, 2_500_000, 0),
+        ]);
+        assert_eq!(ranked.last().map(|i| i.security_id), Some(5));
     }
 
     fn crow(id: u64) -> super::ContractRow {

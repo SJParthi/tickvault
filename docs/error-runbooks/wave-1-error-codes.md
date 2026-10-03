@@ -58,6 +58,32 @@ becomes fresh again.
 
 **Source:** `crates/core/src/pipeline/prev_close_writer.rs::try_enqueue_global`
 
+## HOT-PATH-03 — socket reader threads run unpinned (core pin refused)
+
+**Added 2026-10-02** with reader-thread core pinning (owner-approved `libc`
+dependency). **Severity:** Low. **Pages:** nothing (log-sink-only; boot never
+fails over it). Logged ONCE at boot as a coded `warn!`.
+
+**Trigger:** the reader threads (`tv-ws-reader`) were asked to pin to a core
+and did not: `TICKVAULT_WS_READER_CORE` named core 0 (never used — it services
+network interrupts), named a core outside the process's allowed set (the
+systemd unit's `AllowedCPUs`), was not `off` or a core id, or the kernel's
+`sched_setaffinity` refused (`os_errno`, usually `EINVAL` = 22). With no
+variable set and core 1 absent from the allowed set, the threads run
+unpinned with an `info!` line, not this code.
+
+**Check:** `tv_ws_reader_pinned_core` reads the pinned core, or -1.
+
+**Triage:**
+1. Read the line's `plan`, `reason`, `failed_threads`, `os_errno`.
+2. Fix the variable in the systemd unit (a core in `AllowedCPUs`, not 0), or
+   set it to `off`; restart in the next safe window. Unpinned readers still
+   run on their own runtime, so this is a lost optimisation, not an outage.
+
+**Source:** `crates/core/src/websocket/reader_runtime.rs`
+(`resolve_ws_reader_core`, `build_reader_runtime`) and
+`crates/app/src/main.rs::report_reader_core_pin`.
+
 ## PHASE2-01 — Phase 2 dispatch failed (LTPs absent or empty plan)
 
 **Trigger:** `run_phase2_scheduler` emitted `Phase2Failed` after one

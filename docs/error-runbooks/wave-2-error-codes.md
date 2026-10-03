@@ -456,3 +456,34 @@ monitoring — the operator inspects the `reason` + backtrace at leisure).
 **Source:** `crates/storage/src/disk_health_watcher.rs::spawn_supervised_spill_disk_health_watcher`,
 `crates/common/src/error_code.rs::DiskWatcher01Respawned`. Boot wiring:
 `crates/app/src/main.rs` (the `_disk_health_watcher_supervisor` spawn).
+
+### 2026-10-01 note — order and P&L audit rows go to disk when QuestDB is down (audit PR42b)
+
+A failed flush of `order_audit`, `pnl_audit` or `order_leg_pnl` no longer throws the rows
+away. They are written to `data/spill/audit/<table>/` and one drain task per table sends them
+to QuestDB once it answers (at once, then every 60 s). Each step logs AUDIT-06:
+
+- "written to the disk tier, not lost" — the rows are on disk and will be replayed. Nothing to do.
+- "QuestDB is not accepting the <table> spill backlog" — logged once per episode while the
+  replay keeps failing. DO: check QuestDB health (`make doctor`); the rows wait on disk.
+- "rows have waited on local disk for at least 1800s" — the oldest waiting file is 30 minutes
+  old. This pages the order-audit chain-loss alarm once per backlog episode
+  (`tv_order_audit_persist_errors_total{stage="spill_backlog"}`). The rows are kept, not lost.
+  DO: check QuestDB health and whether `/write` accepts rows for that table.
+- "the disk tier refused the batch" — the waiting files reached 64 MiB or 50,000 (quarantine
+  is not counted), or the write failed. These rows ARE lost and reach the order-audit
+  chain-loss alarm (`tv_order_audit_rows_discarded_total` for `order_audit`,
+  `tv_order_audit_chain_lost_total` for the two P&L tables). DO: check disk space and why the
+  backlog is not draining.
+- "QuestDB permanently refused an audit spill file" — the file moved to `quarantine/` and its
+  rows count as lost. DO: read the file by hand; it is kept, never deleted.
+- "never finished (crash between write and rename)" — a `.tmp` file older than one hour was set
+  aside in `quarantine/` and its rows count as lost. DO: read it by hand.
+
+Counters (box only, not shipped): `tv_audit_spill_rows_total{table}`,
+`tv_audit_spill_replayed_rows_total{table}`, `tv_audit_spill_refused_rows_total{table}`,
+`tv_audit_spill_quarantined_rows_total{table}`, `tv_audit_spill_replay_failed_total{table}`.
+Before replaying a backlog the drain re-runs the table's own create-and-DEDUP step, so a boot
+whose first attempt failed cannot let the replay create the table without its DEDUP key.
+Honest limit: the daily reconcile counts a spilled row as appended while it is still on disk;
+the 30-minute backlog page is what covers that window.

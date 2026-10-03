@@ -124,7 +124,9 @@
 //! **O(tracked)** and says so: it runs on the contract attach path (once per
 //! retry) and on the depth re-fit (**once a minute, all session** — the first
 //! draft said "at most once per retry" and was stale on arrival), never on
-//! the tick path. Space is O(instruments), hard-bounded by the cap below.
+//! the tick path. *(⚠ 2026-10-02: the depth steering loop no longer calls it
+//! per minute; the depth path now snapshots once per attach attempt, like the
+//! contract path.)* Space is O(instruments), hard-bounded by the cap below.
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
@@ -673,6 +675,19 @@ mod tests {
 
     const NSE_EQ: ExchangeSegment = ExchangeSegment::NseEquity;
     const IDX: ExchangeSegment = ExchangeSegment::IdxI;
+
+    /// The spot store and the candle fold judge the same shape (a trade time
+    /// ahead of our receipt). This store holds such a stamp at its ceiling;
+    /// the fold REFUSES the candle past its own margin. So the fold's margin
+    /// must be at least this one: a tick this store takes unchanged is never
+    /// refused a candle.
+    #[test]
+    fn test_future_skew_never_exceeds_the_candle_fold() {
+        assert!(
+            FUTURE_TRADE_TIME_SKEW_SECS
+                <= tickvault_trading::candles::multi_tf_aggregator::FOLD_FUTURE_TRADE_TIME_SKEW_SECS
+        );
+    }
 
     /// 2026-08-14 10:00:00 UTC — a fixed in-session trade time.
     const T0: u32 = 1_755_165_600;

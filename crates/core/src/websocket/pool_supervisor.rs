@@ -55,7 +55,6 @@
 //! | [`WalRingSink::accept`] | O(1), zero alloc *of ours* | WAL append + `try_send`; see the honesty note below |
 //! | [`SubscribeGuard::batches`] | O(1) per batch, zero alloc | slice `chunks`, no copy |
 //! | [`SubscribeGuard`] full iteration | **O(n) in instruments — NOT O(1)** | inherent: every instrument must be named on the wire. Cold path: once per connect, ≤5,000 items, ~50 messages |
-//! | [`PoolSupervisor::poll_all`] | **O(N) with N ≤ 16 — NOT O(1)** | bounded by the operator-authorized ceiling, so it is a fixed constant, but it is a scan and is labelled as one |
 //! | [`PoolSupervisor::admit`] | O(1), zero alloc | delegates to the four-counter [`PoolBudget`] |
 //!
 //! **Honesty on "zero allocation on the per-frame path."** The claim is exact
@@ -359,6 +358,27 @@ pub const SWAP_TOTAL_METRIC: &str = "tv_dhan_ws_swap_total";
 /// Counter: a swap was refused before any wire call (budget, ack pending,
 /// unknown socket). No labels.
 pub const SWAP_REFUSED_METRIC: &str = "tv_dhan_ws_swap_refused_total";
+
+/// Counter: how each in-place change (`LiveSubscriptionCommand::Resubscribe`,
+/// scope lock 2026-10-02) ended. Labels: `endpoint`, `outcome` (one of
+/// [`INPLACE_CHANGE_OUTCOMES`]). Every label is seeded at 0 per endpoint.
+pub const INPLACE_CHANGE_METRIC: &str = "tv_dhan_ws_inplace_change_total";
+
+/// Counter: instruments an in-place change put on the wire. Labels:
+/// `endpoint`, `leg` (`unsubscribe` | `subscribe`).
+pub const INPLACE_INSTRUMENTS_METRIC: &str = "tv_dhan_ws_inplace_instruments_total";
+
+/// Every `outcome` label of [`INPLACE_CHANGE_METRIC`].
+pub const INPLACE_CHANGE_OUTCOMES: [&str; 8] = [
+    "applied",
+    "no_op",
+    "refused_not_held",
+    "refused_over_cap",
+    "refused_halted_805",
+    "stopped",
+    "replay_pending",
+    "emptied_redial",
+];
 
 /// Counter: frame captured but the bounded ring refused it — the frame is
 /// durable in the WAL, the downstream consumer is behind. Label: `endpoint`.
@@ -847,6 +867,16 @@ pub enum ConnEvent {
     /// ([`request_probe_close`]). Live sockets only; at most once per socket
     /// per process. Scope lock 2026-09-12, Arm B.
     ProbeCloseRequested,
+    /// The overflow probe (plan item D7 for the main feed; the 2026-10-02
+    /// scope-lock section for depth) released this socket from its 805 park.
+    /// Accepted ONLY from `Parked(PoolOverflow)` on a market-data slot (main
+    /// feed, depth-20, depth-200); every other phase and park reason ignores
+    /// it. The redial runs on the normal damped ladder with this socket's
+    /// stagger. `ROTATION_HALTED` is not touched.
+    OverflowProbeGranted,
+    /// The overflow probe this socket was part of failed: close and park
+    /// again for 805. Market-data slots only; ignored once parked.
+    OverflowProbeFailed,
     /// Orderly shutdown.
     ShutdownRequested,
 }
@@ -1134,6 +1164,879 @@ pub fn refuse_voluntary_redial_after_805(slot: ConnectionSlot, path: &'static st
          more connection into an account already over its budget. The socket keeps its \
          current instruments; a restart clears the stop."
     );
+}
+
+// ---------------------------------------------------------------------------
+// Main-feed overflow probe (plan item D7, 2026-10-02)
+// ---------------------------------------------------------------------------
+//
+// After an 805 every socket that received it parks (`ParkReason::PoolOverflow`)
+// and, before this, stayed parked until the process restarted. D7's default
+// (owner asked 2026-09-26; the recommended option is what gets built until the
+// owner picks another): wait, redial ONE main-feed socket as a test, and bring
+// the rest back only if Dhan accepts it.
+//
+// What this does NOT touch, by design and by the 2026-09-24 / 2026-09-26 REJECT
+// lists of the WebSocket scope lock: `ROTATION_HALTED` is never cleared, and
+// depth rotation (an in-place swap since 2026-10-01) and NEW depth dials stay
+// refused exactly as before. Only slots parked for 805 can be released, and only through
+// `ConnEvent::OverflowProbeGranted`, which the supervisor accepts from
+// `Parked(PoolOverflow)` on a market-data slot and from nothing else.
+//
+// Depth (scope lock 2026-10-02, owner decision 2): parked depth sockets have
+// their OWN episode (`OverflowEpisodeKind::Depth`) with a doubling wait
+// (5 min to a 30 min cap, at most 6 probes). Both episodes sit under ONE lock
+// (`OVERFLOW_EPISODES`) so exactly one probe or release window runs
+// process-wide: the main feed goes first, depth waits while a main-feed window
+// runs or a parked main-feed socket still waits for its probe, and a main-feed
+// grant waits for a running depth window to end.
+
+/// Waits before probe 1, 2 and 3, each measured from the 805 (or the failed
+/// probe) that preceded it: 5, 10 and 20 minutes.
+pub const OVERFLOW_PROBE_DELAYS_SECS: [u64; 3] = [300, 600, 1_200];
+
+/// Probes per process lifetime. After the last one fails the parked main-feed
+/// sockets stay down for the session (only a restart brings them back).
+pub const OVERFLOW_PROBE_MAX_ATTEMPTS: u8 = 3;
+
+const _: () = assert!(OVERFLOW_PROBE_DELAYS_SECS.len() == OVERFLOW_PROBE_MAX_ATTEMPTS as usize);
+
+/// The watch window W after a probed (or released) socket's FIRST frame. Any
+/// 805, or any socket closing with no code (Dhan can deliver an 805 as a bare
+/// reset, plan row 314), inside it fails the probe. Dhan accepts a new socket
+/// and closes the OLDEST, so the probe itself is not the socket that would be
+/// hit — every socket is watched.
+pub const OVERFLOW_PROBE_WATCH_SECS: u64 = 120;
+
+/// A probed (or released) socket that delivers no frame this long after it
+/// was granted fails the probe: a socket that cannot prove itself is not a
+/// pass.
+pub const OVERFLOW_PROBE_FIRST_FRAME_DEADLINE_SECS: u64 = 120;
+
+/// Counter of overflow-probe outcomes, labelled by
+/// [`OverflowProbeOutcome::as_str`] (a fixed set). Prometheus only: no new
+/// alarm, no new EMF selection (noise lock §3).
+pub const OVERFLOW_PROBE_METRIC: &str = "tv_dhan_ws_overflow_probe_total";
+
+/// Depth (scope lock 2026-10-02): the wait before the FIRST depth probe,
+/// measured from the 805 that parked the socket. Each failed probe doubles the
+/// next wait, up to [`DEPTH_OVERFLOW_PROBE_MAX_DELAY_SECS`].
+pub const DEPTH_OVERFLOW_PROBE_BASE_DELAY_SECS: u64 = 300;
+
+/// The ceiling of the doubling depth wait: 30 minutes.
+pub const DEPTH_OVERFLOW_PROBE_MAX_DELAY_SECS: u64 = 1_800;
+
+/// Depth probes per process lifetime. A failed probe into an account still
+/// over budget costs Dhan's OLDEST depth socket (it answers with 805), so the
+/// count is capped; after the last failure parked depth sockets stay down.
+pub const DEPTH_OVERFLOW_PROBE_MAX_ATTEMPTS: u8 = 6;
+
+/// Counter of depth overflow-probe outcomes, labelled by
+/// [`OverflowProbeOutcome::as_str`]. A separate series from the main feed's,
+/// so the existing one keeps its meaning. Prometheus only (noise lock §3).
+pub const DEPTH_OVERFLOW_PROBE_METRIC: &str = "tv_dhan_ws_depth_overflow_probe_total";
+
+/// Which pool an overflow episode recovers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverflowEpisodeKind {
+    /// D7: 5/10/20 minutes, three probes.
+    MainFeed,
+    /// 2026-10-02: 5 minutes doubling to 30, six probes.
+    Depth,
+}
+
+impl OverflowEpisodeKind {
+    /// The pool an endpoint's 805 park joins; `None` for the order-update
+    /// socket, which never takes part.
+    const fn for_endpoint(endpoint: DhanEndpointType) -> Option<Self> {
+        match endpoint {
+            DhanEndpointType::MainFeed => Some(Self::MainFeed),
+            DhanEndpointType::Depth20 | DhanEndpointType::Depth200 => Some(Self::Depth),
+            DhanEndpointType::OrderUpdate => None,
+        }
+    }
+
+    /// The wait before probe `attempt` (0-based), or `None` once the probes
+    /// are spent.
+    fn delay_secs(self, attempt: u8) -> Option<u64> {
+        match self {
+            Self::MainFeed => OVERFLOW_PROBE_DELAYS_SECS
+                .get(usize::from(attempt))
+                .copied(),
+            Self::Depth => (attempt < DEPTH_OVERFLOW_PROBE_MAX_ATTEMPTS).then(|| {
+                DEPTH_OVERFLOW_PROBE_BASE_DELAY_SECS
+                    .checked_shl(u32::from(attempt))
+                    .unwrap_or(DEPTH_OVERFLOW_PROBE_MAX_DELAY_SECS)
+                    .min(DEPTH_OVERFLOW_PROBE_MAX_DELAY_SECS)
+            }),
+        }
+    }
+
+    const fn max_attempts(self) -> u8 {
+        match self {
+            Self::MainFeed => OVERFLOW_PROBE_MAX_ATTEMPTS,
+            Self::Depth => DEPTH_OVERFLOW_PROBE_MAX_ATTEMPTS,
+        }
+    }
+
+    const fn metric(self) -> &'static str {
+        match self {
+            Self::MainFeed => OVERFLOW_PROBE_METRIC,
+            Self::Depth => DEPTH_OVERFLOW_PROBE_METRIC,
+        }
+    }
+
+    const fn source(self) -> &'static str {
+        match self {
+            Self::MainFeed => "main_feed_overflow_probe",
+            Self::Depth => "depth_overflow_probe",
+        }
+    }
+}
+
+/// Where the main-feed overflow episode stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverflowEpisodePhase {
+    /// No 805 this process.
+    Quiet,
+    /// An 805 arrived; waiting out the delay before the next probe.
+    Waiting,
+    /// One parked main-feed socket is redialling as the test.
+    Probing,
+    /// The probe passed; between two releases (waiting for the session
+    /// window, or about to release the next slot).
+    Releasing,
+    /// One more parked main-feed socket is redialling, under its own window.
+    Resuming,
+    /// Every parked main-feed socket is back and passed its window.
+    Recovered,
+    /// The last probe failed. Parked main-feed sockets stay down for the
+    /// session.
+    DownForSession,
+}
+
+/// One outcome of the overflow episode. Each is logged once with a coded
+/// `error!` and counted on [`OVERFLOW_PROBE_METRIC`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverflowProbeOutcome {
+    /// A parked main-feed socket was released as the test dial.
+    ProbeGranted,
+    /// The probe passed its window.
+    ProbePassed,
+    /// After a pass, one more parked main-feed socket was released.
+    ReleaseGranted,
+    /// A released socket passed its own window.
+    ReleasePassed,
+    /// An 805 arrived inside a window.
+    FailedOverflow,
+    /// A socket closed with no code inside a window.
+    FailedBareReset,
+    /// The released socket delivered no frame in time.
+    FailedNoFrame,
+    /// Every parked main-feed socket is back.
+    Recovered,
+    /// No probes left; parked main-feed sockets stay down this session.
+    DownForSession,
+}
+
+impl OverflowProbeOutcome {
+    /// Every outcome, for the label-uniqueness pin.
+    pub const ALL: [Self; 9] = [
+        Self::ProbeGranted,
+        Self::ProbePassed,
+        Self::ReleaseGranted,
+        Self::ReleasePassed,
+        Self::FailedOverflow,
+        Self::FailedBareReset,
+        Self::FailedNoFrame,
+        Self::Recovered,
+        Self::DownForSession,
+    ];
+
+    /// Stable lowercase tag for logs and metric labels.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ProbeGranted => "probe_granted",
+            Self::ProbePassed => "probe_passed",
+            Self::ReleaseGranted => "release_granted",
+            Self::ReleasePassed => "release_passed",
+            Self::FailedOverflow => "failed_805",
+            Self::FailedBareReset => "failed_bare_reset",
+            Self::FailedNoFrame => "failed_no_frame",
+            Self::Recovered => "recovered",
+            Self::DownForSession => "down_for_session",
+        }
+    }
+}
+
+/// What one episode step asks the shell to do. Plain `Copy` data, so a step
+/// allocates nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct OverflowEpisodeEffect {
+    /// Up to two outcomes to log and count, in order.
+    outcomes: [Option<OverflowProbeOutcome>; 2],
+    /// A parked main-feed slot (global index) released to dial.
+    grant: Option<u8>,
+    /// A slot whose socket must close and park again (the failed probe).
+    repark: Option<u8>,
+}
+
+/// The overflow episode's decision core: pure, `Copy`, no clock of its own,
+/// no allocation. Every input is an event with the caller's monotonic `now`.
+///
+/// The process-wide instance lives in [`OVERFLOW_EPISODES`]; the unit tests
+/// drive their own values so they cannot race each other.
+#[derive(Debug, Clone, Copy)]
+struct OverflowEpisode {
+    /// Which pool this episode recovers: sets the wait and the probe cap.
+    kind: OverflowEpisodeKind,
+    phase: OverflowEpisodePhase,
+    /// This pool's slots (by global index, < 32) parked for 805 and waiting.
+    /// A bitmask, so add, remove and "lowest parked" are O(1).
+    parked_mask: u32,
+    /// Probes started this process. Never decreases.
+    probes_started: u8,
+    /// `Waiting`: when the wait began. `Probing`/`Resuming`: the grant.
+    phase_since: Option<Instant>,
+    /// The socket under watch in `Probing`/`Resuming`.
+    watched_slot: u8,
+    /// The watched socket's first frame, once seen.
+    first_frame_at: Option<Instant>,
+}
+
+impl OverflowEpisode {
+    /// The main-feed episode (D7).
+    const fn new() -> Self {
+        Self::of_kind(OverflowEpisodeKind::MainFeed)
+    }
+
+    /// The depth episode (scope lock 2026-10-02).
+    const fn new_depth() -> Self {
+        Self::of_kind(OverflowEpisodeKind::Depth)
+    }
+
+    const fn of_kind(kind: OverflowEpisodeKind) -> Self {
+        Self {
+            kind,
+            phase: OverflowEpisodePhase::Quiet,
+            parked_mask: 0,
+            probes_started: 0,
+            phase_since: None,
+            watched_slot: u8::MAX,
+            first_frame_at: None,
+        }
+    }
+
+    /// Whether the main feed may open NEW connections (the widen's room).
+    /// Only before any 805, or after every parked main-feed socket came back
+    /// and passed its window. Waiting, probing and resuming all answer no.
+    const fn widen_permitted(&self) -> bool {
+        matches!(
+            self.phase,
+            OverflowEpisodePhase::Quiet | OverflowEpisodePhase::Recovered
+        )
+    }
+
+    /// The socket under watch, if a window is running.
+    const fn watched(&self) -> Option<u8> {
+        match self.phase {
+            OverflowEpisodePhase::Probing | OverflowEpisodePhase::Resuming => {
+                Some(self.watched_slot)
+            }
+            _ => None,
+        }
+    }
+
+    const fn is_down(&self) -> bool {
+        matches!(self.phase, OverflowEpisodePhase::DownForSession)
+    }
+
+    /// Whether this episode holds the process-wide turn: a window is
+    /// running, or a parked socket of this pool still waits for its probe
+    /// or release. The depth episode grants nothing while the main feed
+    /// holds the turn.
+    const fn holds_turn(&self) -> bool {
+        match self.phase {
+            OverflowEpisodePhase::Probing | OverflowEpisodePhase::Resuming => true,
+            OverflowEpisodePhase::Waiting | OverflowEpisodePhase::Releasing => {
+                self.parked_mask != 0
+            }
+            OverflowEpisodePhase::Quiet
+            | OverflowEpisodePhase::Recovered
+            | OverflowEpisodePhase::DownForSession => false,
+        }
+    }
+
+    /// A socket of this pool parked for 805 and is waiting to be released.
+    fn on_parked(&mut self, global_index: u8) {
+        if let Some(bit) = 1u32.checked_shl(u32::from(global_index)) {
+            self.parked_mask |= bit;
+        }
+        // A late park from the 805 that this episode already waited out with
+        // nothing parked (`poll` kept `phase_since`): wait on, from that 805.
+        // A Recovered reached through a release has no `phase_since`, and a
+        // new 805 reaches `on_overflow` before any park.
+        if matches!(self.phase, OverflowEpisodePhase::Recovered) && self.phase_since.is_some() {
+            self.phase = OverflowEpisodePhase::Waiting;
+        }
+    }
+
+    /// Any socket, any endpoint, closed with 805.
+    fn on_overflow(&mut self, now: Instant) -> OverflowEpisodeEffect {
+        match self.phase {
+            OverflowEpisodePhase::Quiet => {
+                self.phase = OverflowEpisodePhase::Waiting;
+                self.phase_since = Some(now);
+                OverflowEpisodeEffect::default()
+            }
+            // Still over budget: the wait restarts from this 805.
+            OverflowEpisodePhase::Waiting => {
+                self.phase_since = Some(now);
+                OverflowEpisodeEffect::default()
+            }
+            OverflowEpisodePhase::Probing | OverflowEpisodePhase::Resuming => {
+                self.fail(OverflowProbeOutcome::FailedOverflow, now)
+            }
+            OverflowEpisodePhase::Releasing | OverflowEpisodePhase::Recovered => {
+                if self.probes_started >= self.kind.max_attempts() {
+                    self.phase = OverflowEpisodePhase::DownForSession;
+                    OverflowEpisodeEffect {
+                        outcomes: [Some(OverflowProbeOutcome::DownForSession), None],
+                        ..OverflowEpisodeEffect::default()
+                    }
+                } else {
+                    self.phase = OverflowEpisodePhase::Waiting;
+                    self.phase_since = Some(now);
+                    OverflowEpisodeEffect::default()
+                }
+            }
+            OverflowEpisodePhase::DownForSession => OverflowEpisodeEffect::default(),
+        }
+    }
+
+    /// Any socket closed with NO code. Inside a window this fails the probe:
+    /// Dhan can deliver an 805 as a bare reset. The watched socket itself is
+    /// included — a probe that cannot stay up is not a pass.
+    fn on_bare_reset(&mut self, now: Instant) -> OverflowEpisodeEffect {
+        match self.phase {
+            OverflowEpisodePhase::Probing | OverflowEpisodePhase::Resuming => {
+                self.fail(OverflowProbeOutcome::FailedBareReset, now)
+            }
+            _ => OverflowEpisodeEffect::default(),
+        }
+    }
+
+    /// The watched socket delivered its first frame. Starts its window.
+    fn on_first_frame(&mut self, global_index: u8, now: Instant) {
+        if self.watched() == Some(global_index) && self.first_frame_at.is_none() {
+            self.first_frame_at = Some(now);
+        }
+    }
+
+    /// Time-driven steps. `window_open` is the session gate: no probe and no
+    /// release is granted outside it; a running window keeps running.
+    fn poll(&mut self, now: Instant, window_open: bool) -> OverflowEpisodeEffect {
+        match self.phase {
+            OverflowEpisodePhase::Waiting => {
+                let Some(delay) = self.kind.delay_secs(self.probes_started) else {
+                    // Unreachable: a fourth wait is never entered. Fail closed.
+                    self.phase = OverflowEpisodePhase::DownForSession;
+                    return OverflowEpisodeEffect {
+                        outcomes: [Some(OverflowProbeOutcome::DownForSession), None],
+                        ..OverflowEpisodeEffect::default()
+                    };
+                };
+                let waited = self
+                    .phase_since
+                    .map_or(Duration::ZERO, |s| now.saturating_duration_since(s));
+                if waited < Duration::from_secs(delay) {
+                    return OverflowEpisodeEffect::default();
+                }
+                // The 805 hit another pool and none of this pool's sockets
+                // parked within the whole wait: nothing to probe or release,
+                // so the episode is over, silently (nothing of this pool was
+                // down, so there is no recovery to report). Without this a
+                // depth-only 805 left the main episode Waiting for the
+                // session and the main-feed widen refused for the rest of the
+                // day. `phase_since` is KEPT: a socket of this pool that
+                // registers its park late reopens the wait from the same 805
+                // (`on_parked`).
+                if self.parked_mask == 0 {
+                    self.phase = OverflowEpisodePhase::Recovered;
+                    return OverflowEpisodeEffect::default();
+                }
+                if !window_open {
+                    return OverflowEpisodeEffect::default();
+                }
+                let slot = self.take_lowest_parked();
+                self.probes_started = self.probes_started.saturating_add(1);
+                self.start_watch(OverflowEpisodePhase::Probing, slot, now);
+                OverflowEpisodeEffect {
+                    outcomes: [Some(OverflowProbeOutcome::ProbeGranted), None],
+                    grant: Some(slot),
+                    repark: None,
+                }
+            }
+            OverflowEpisodePhase::Probing | OverflowEpisodePhase::Resuming => {
+                match self.first_frame_at {
+                    None => {
+                        let granted_for = self
+                            .phase_since
+                            .map_or(Duration::ZERO, |s| now.saturating_duration_since(s));
+                        if granted_for
+                            >= Duration::from_secs(OVERFLOW_PROBE_FIRST_FRAME_DEADLINE_SECS)
+                        {
+                            self.fail(OverflowProbeOutcome::FailedNoFrame, now)
+                        } else {
+                            OverflowEpisodeEffect::default()
+                        }
+                    }
+                    Some(first) => {
+                        if now.saturating_duration_since(first)
+                            < Duration::from_secs(OVERFLOW_PROBE_WATCH_SECS)
+                        {
+                            return OverflowEpisodeEffect::default();
+                        }
+                        let passed = if self.phase == OverflowEpisodePhase::Probing {
+                            OverflowProbeOutcome::ProbePassed
+                        } else {
+                            OverflowProbeOutcome::ReleasePassed
+                        };
+                        self.phase = OverflowEpisodePhase::Releasing;
+                        self.first_frame_at = None;
+                        self.phase_since = None;
+                        let mut next = self.release_next(now, window_open);
+                        next.outcomes = [Some(passed), next.outcomes[0]];
+                        next
+                    }
+                }
+            }
+            OverflowEpisodePhase::Releasing => self.release_next(now, window_open),
+            OverflowEpisodePhase::Quiet
+            | OverflowEpisodePhase::Recovered
+            | OverflowEpisodePhase::DownForSession => OverflowEpisodeEffect::default(),
+        }
+    }
+
+    /// From `Releasing`: release the next parked slot, one at a time, or
+    /// finish when none is left.
+    fn release_next(&mut self, now: Instant, window_open: bool) -> OverflowEpisodeEffect {
+        if self.parked_mask == 0 {
+            self.phase = OverflowEpisodePhase::Recovered;
+            return OverflowEpisodeEffect {
+                outcomes: [Some(OverflowProbeOutcome::Recovered), None],
+                ..OverflowEpisodeEffect::default()
+            };
+        }
+        if !window_open {
+            return OverflowEpisodeEffect::default();
+        }
+        let slot = self.take_lowest_parked();
+        self.start_watch(OverflowEpisodePhase::Resuming, slot, now);
+        OverflowEpisodeEffect {
+            outcomes: [Some(OverflowProbeOutcome::ReleaseGranted), None],
+            grant: Some(slot),
+            repark: None,
+        }
+    }
+
+    fn start_watch(&mut self, phase: OverflowEpisodePhase, slot: u8, now: Instant) {
+        self.phase = phase;
+        self.watched_slot = slot;
+        self.phase_since = Some(now);
+        self.first_frame_at = None;
+    }
+
+    /// Lowest parked slot, removed from the mask. O(1). Callers check the
+    /// mask is non-empty first; an empty mask yields `u8::MAX`, which no
+    /// register accepts.
+    fn take_lowest_parked(&mut self) -> u8 {
+        if self.parked_mask == 0 {
+            return u8::MAX;
+        }
+        let slot = self.parked_mask.trailing_zeros();
+        self.parked_mask &= !(1u32 << slot);
+        u8::try_from(slot).unwrap_or(u8::MAX)
+    }
+
+    /// A window failed: re-park the watched socket; another probe later, or
+    /// down for the session once the attempts are spent.
+    fn fail(&mut self, outcome: OverflowProbeOutcome, now: Instant) -> OverflowEpisodeEffect {
+        let slot = self.watched_slot;
+        self.watched_slot = u8::MAX;
+        self.first_frame_at = None;
+        let then = if self.probes_started >= self.kind.max_attempts() {
+            self.phase = OverflowEpisodePhase::DownForSession;
+            self.phase_since = None;
+            Some(OverflowProbeOutcome::DownForSession)
+        } else {
+            self.phase = OverflowEpisodePhase::Waiting;
+            self.phase_since = Some(now);
+            None
+        };
+        OverflowEpisodeEffect {
+            outcomes: [Some(outcome), then],
+            grant: None,
+            repark: Some(slot),
+        }
+    }
+}
+
+/// Both overflow episodes, under one lock so exactly one probe or release
+/// window runs process-wide (scope lock 2026-10-02).
+///
+/// Ordering: the main feed goes first. The main episode may grant only while
+/// no depth window is running; the depth episode may grant only while the
+/// main episode does not hold the turn ([`OverflowEpisode::holds_turn`]: a
+/// main window running, or a parked main-feed socket still waiting). Every
+/// 805 and every bare reset feeds BOTH, so a window on one fails on a close
+/// anywhere.
+#[derive(Debug, Clone, Copy)]
+struct OverflowEpisodes {
+    main: OverflowEpisode,
+    depth: OverflowEpisode,
+}
+
+/// What one combined step asks of the shell: one effect per episode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct OverflowEpisodesEffect {
+    main: OverflowEpisodeEffect,
+    depth: OverflowEpisodeEffect,
+}
+
+impl OverflowEpisodes {
+    const fn new() -> Self {
+        Self {
+            main: OverflowEpisode::new(),
+            depth: OverflowEpisode::new_depth(),
+        }
+    }
+
+    /// The one socket under watch, from whichever episode runs a window.
+    const fn watched(&self) -> Option<u8> {
+        match self.main.watched() {
+            Some(slot) => Some(slot),
+            None => self.depth.watched(),
+        }
+    }
+
+    /// A socket parked for 805 joins its pool's episode. The order-update
+    /// socket never takes part.
+    fn on_parked(&mut self, endpoint: DhanEndpointType, global_index: u8) {
+        match OverflowEpisodeKind::for_endpoint(endpoint) {
+            Some(OverflowEpisodeKind::MainFeed) => self.main.on_parked(global_index),
+            Some(OverflowEpisodeKind::Depth) => self.depth.on_parked(global_index),
+            None => {}
+        }
+    }
+
+    fn on_overflow(&mut self, now: Instant) -> OverflowEpisodesEffect {
+        OverflowEpisodesEffect {
+            main: self.main.on_overflow(now),
+            depth: self.depth.on_overflow(now),
+        }
+    }
+
+    fn on_bare_reset(&mut self, now: Instant) -> OverflowEpisodesEffect {
+        OverflowEpisodesEffect {
+            main: self.main.on_bare_reset(now),
+            depth: self.depth.on_bare_reset(now),
+        }
+    }
+
+    fn on_first_frame(&mut self, global_index: u8, now: Instant) {
+        self.main.on_first_frame(global_index, now);
+        self.depth.on_first_frame(global_index, now);
+    }
+
+    /// Time-driven steps for both, main first. A grant needs the session
+    /// window AND the other episode out of the way.
+    fn poll(&mut self, now: Instant, window_open: bool) -> OverflowEpisodesEffect {
+        let main_may_grant = window_open && self.depth.watched().is_none();
+        let main = self.main.poll(now, main_may_grant);
+        let depth_may_grant = window_open && !self.main.holds_turn();
+        let depth = self.depth.poll(now, depth_may_grant);
+        OverflowEpisodesEffect { main, depth }
+    }
+}
+
+/// The process-wide overflow episodes (main feed and depth).
+///
+/// A `std` mutex, allocation-free, taken ONLY on cold paths: a socket closing
+/// with 805 or with no code, a socket parking, and the one-second poll of a
+/// parked socket (or of a socket opted into the probe). Never per frame: the
+/// first-frame report is the lock-free [`OVERFLOW_WATCHED_FIRST_FRAME`] flag,
+/// which the next poll stamps.
+static OVERFLOW_EPISODES: std::sync::Mutex<OverflowEpisodes> =
+    std::sync::Mutex::new(OverflowEpisodes::new());
+
+/// Set by the first 805 of the process and never cleared: the fast check
+/// that keeps every quiet socket off the episode lock.
+static OVERFLOW_ENGAGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Published main-feed widen verdict, for an O(1) read by the main-feed
+/// widen: bit 0 is [`OverflowEpisode::widen_permitted`], written ONLY under
+/// the [`OVERFLOW_EPISODES`] lock; the bits above count 805s noted but not yet
+/// applied to the episode (each adds [`WIDEN_PENDING_805`] before the lock and
+/// takes it back under the lock, after the episode has seen the 805). The
+/// widen may run only when the word is exactly [`WIDEN_PERMITTED_BIT`]: a yes
+/// and nothing pending. So a step that computed "yes" from the state before
+/// an 805 cannot publish a yes once that 805 is noted — the pending count
+/// already says no, in the same word (review 2026-10-02: a separate
+/// pre-lock `false` store could be overwritten by such a step).
+static OVERFLOW_WIDEN_STATE: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(WIDEN_PERMITTED_BIT);
+
+/// Bit 0 of [`OVERFLOW_WIDEN_STATE`]: the episode permits the widen.
+const WIDEN_PERMITTED_BIT: u32 = 1;
+
+/// One 805 noted and not yet applied, in [`OVERFLOW_WIDEN_STATE`].
+const WIDEN_PENDING_805: u32 = 2;
+
+/// Whether a widen word permits the widen. O(1).
+#[inline]
+fn widen_word_permits(word: &std::sync::atomic::AtomicU32) -> bool {
+    word.load(std::sync::atomic::Ordering::Acquire) == WIDEN_PERMITTED_BIT
+}
+
+/// An 805 is noted, before the episode lock: the widen reads no from here.
+#[inline]
+fn widen_word_note_805(word: &std::sync::atomic::AtomicU32) {
+    word.fetch_add(WIDEN_PENDING_805, std::sync::atomic::Ordering::AcqRel);
+}
+
+/// Under the episode lock: publishes the episode's verdict bit.
+#[inline]
+fn widen_word_publish(word: &std::sync::atomic::AtomicU32, permitted: bool) {
+    if permitted {
+        word.fetch_or(WIDEN_PERMITTED_BIT, std::sync::atomic::Ordering::AcqRel);
+    } else {
+        word.fetch_and(!WIDEN_PERMITTED_BIT, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Under the episode lock, AFTER the episode applied the 805 and its verdict
+/// was published: takes the pending mark back.
+#[inline]
+fn widen_word_settle_805(word: &std::sync::atomic::AtomicU32) {
+    word.fetch_sub(WIDEN_PENDING_805, std::sync::atomic::Ordering::AcqRel);
+}
+
+/// Published copy of the main episode's [`OverflowEpisode::is_down`].
+static OVERFLOW_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Published copy of the depth episode's [`OverflowEpisode::is_down`].
+static DEPTH_OVERFLOW_DOWN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Published copy of [`OverflowEpisodes::watched`] (`u8::MAX` = none). One
+/// slot for the whole process: at most one window runs at a time.
+static OVERFLOW_WATCHED_SLOT: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(u8::MAX);
+
+/// The watched socket delivered a frame since its grant. One relaxed load and
+/// one store on the first frame of a dial, never a lock.
+static OVERFLOW_WATCHED_FIRST_FRAME: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Per-slot "you may dial again" register, taken by the parked socket's task.
+static OVERFLOW_GRANT: [std::sync::atomic::AtomicBool; GHOST_REDIAL_SLOTS] =
+    [const { std::sync::atomic::AtomicBool::new(false) }; GHOST_REDIAL_SLOTS];
+
+/// Per-slot "close and park again" register, taken by the failed probe's task.
+static OVERFLOW_REPARK: [std::sync::atomic::AtomicBool; GHOST_REDIAL_SLOTS] =
+    [const { std::sync::atomic::AtomicBool::new(false) }; GHOST_REDIAL_SLOTS];
+
+/// Whether the main-feed widen may open NEW connections, by the overflow
+/// episode (D7) rather than by `ROTATION_HALTED`: yes before any 805, no from
+/// the 805 until every parked main-feed socket has come back and passed its
+/// watch window. O(1), one acquire load. Depth sockets read
+/// [`rotation_halted`] and are unaffected.
+#[must_use]
+pub fn main_feed_overflow_widen_permitted() -> bool {
+    widen_word_permits(&OVERFLOW_WIDEN_STATE)
+}
+
+/// Runs `step` on the process episodes, publishes the atomics, then reports
+/// and executes the effects OUTSIDE the lock. Cold path. `settles_805`: this
+/// step applies an 805 noted with [`widen_word_note_805`], whose pending mark
+/// is taken back here, after the post-805 verdict is published.
+fn overflow_episode_step(
+    settles_805: bool,
+    step: impl FnOnce(&mut OverflowEpisodes) -> OverflowEpisodesEffect,
+) {
+    let (effects, watched) = {
+        let mut eps = OVERFLOW_EPISODES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let watched_before = eps.watched();
+        let effects = step(&mut eps);
+        let watched = eps.watched();
+        widen_word_publish(&OVERFLOW_WIDEN_STATE, eps.main.widen_permitted());
+        if settles_805 {
+            widen_word_settle_805(&OVERFLOW_WIDEN_STATE);
+        }
+        OVERFLOW_DOWN.store(eps.main.is_down(), std::sync::atomic::Ordering::Release);
+        DEPTH_OVERFLOW_DOWN.store(eps.depth.is_down(), std::sync::atomic::Ordering::Release);
+        if watched != watched_before {
+            // A new window (or none): its first-frame flag starts clear.
+            OVERFLOW_WATCHED_FIRST_FRAME.store(false, std::sync::atomic::Ordering::Release);
+        }
+        OVERFLOW_WATCHED_SLOT.store(
+            watched.unwrap_or(u8::MAX),
+            std::sync::atomic::Ordering::Release,
+        );
+        (effects, watched)
+    };
+    apply_overflow_effect(OverflowEpisodeKind::MainFeed, effects.main, watched);
+    apply_overflow_effect(OverflowEpisodeKind::Depth, effects.depth, watched);
+}
+
+/// Sets the registers one episode's effect asks for and reports its outcomes.
+fn apply_overflow_effect(
+    kind: OverflowEpisodeKind,
+    effect: OverflowEpisodeEffect,
+    watched: Option<u8>,
+) {
+    if let Some(slot) = effect.repark
+        && let Some(flag) = OVERFLOW_REPARK.get(usize::from(slot))
+    {
+        flag.store(true, std::sync::atomic::Ordering::Release);
+    }
+    if let Some(slot) = effect.grant {
+        // A stale re-park request from an earlier failure must not undo this
+        // grant the moment the socket dials.
+        if let Some(flag) = OVERFLOW_REPARK.get(usize::from(slot)) {
+            flag.store(false, std::sync::atomic::Ordering::Release);
+        }
+        if let Some(flag) = OVERFLOW_GRANT.get(usize::from(slot)) {
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+    for outcome in effect.outcomes.into_iter().flatten() {
+        report_overflow_probe_outcome(kind, outcome, effect.grant.or(effect.repark), watched);
+    }
+}
+
+/// One coded error line and one counter increment per outcome. Cold: a few
+/// per episode, bounded by the probe caps and the socket counts.
+fn report_overflow_probe_outcome(
+    kind: OverflowEpisodeKind,
+    outcome: OverflowProbeOutcome,
+    slot: Option<u8>,
+    watched: Option<u8>,
+) {
+    metrics::counter!(kind.metric(), "outcome" => outcome.as_str()).increment(1);
+    match kind {
+        OverflowEpisodeKind::MainFeed => error!(
+            code = ErrorCode::WsGapDisconnectClassification.code_str(),
+            source = kind.source(),
+            outcome = outcome.as_str(),
+            connection_index = slot.map_or(-1, i32::from),
+            watched_connection = watched.map_or(-1, i32::from),
+            rotation_halted = rotation_halted(),
+            "main-feed overflow probe ({}): after Dhan closed a socket with 805, ONE parked \
+             main-feed socket is redialled as a test and the rest come back one at a time only \
+             if no socket is closed with 805 or with no code for two minutes after each one's \
+             first frame. Parked depth sockets follow through their own probe once the main \
+             feed is settled; depth rotation stays halted until a restart.",
+            outcome.as_str()
+        ),
+        OverflowEpisodeKind::Depth => error!(
+            code = ErrorCode::WsGapDisconnectClassification.code_str(),
+            source = kind.source(),
+            outcome = outcome.as_str(),
+            connection_index = slot.map_or(-1, i32::from),
+            watched_connection = watched.map_or(-1, i32::from),
+            rotation_halted = rotation_halted(),
+            "depth overflow probe ({}): after Dhan closed a socket with 805, ONE parked depth \
+             socket redials its own instruments as a test (5 minutes, doubling to 30, at most \
+             6 tries) and the rest come back one at a time only if no socket is closed with 805 \
+             or with no code for two minutes after each one's first frame. Depth-200 rotation \
+             and new depth sockets stay halted until a restart.",
+            outcome.as_str()
+        ),
+    }
+}
+
+/// Any socket closed: an 805 or a bare reset feeds the episodes. O(1) atomic
+/// check for every other close; the lock only when it matters.
+fn overflow_episode_note_disconnect(code: Option<DisconnectCode>, now: Instant) {
+    if classify_disconnect(code) == DisconnectClass::PoolOverflow {
+        OVERFLOW_ENGAGED.store(true, std::sync::atomic::Ordering::Release);
+        // Before the lock, so the widen reads no from this instant. It is a
+        // pending mark, not a flag store, so a concurrent step that computed
+        // "yes" from the state before this 805 cannot overwrite it; this
+        // 805's own step takes it back once the episode has applied it.
+        widen_word_note_805(&OVERFLOW_WIDEN_STATE);
+        overflow_episode_step(true, |eps| eps.on_overflow(now));
+    } else if code.is_none() && OVERFLOW_ENGAGED.load(std::sync::atomic::Ordering::Acquire) {
+        overflow_episode_step(false, |eps| eps.on_bare_reset(now));
+    }
+}
+
+/// First frame of a dial: one relaxed load; a store only for the watched
+/// socket. Lock-free on the read task.
+fn overflow_episode_note_first_frame(global_index: u8) {
+    if OVERFLOW_WATCHED_SLOT.load(std::sync::atomic::Ordering::Acquire) == global_index {
+        OVERFLOW_WATCHED_FIRST_FRAME.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// A socket parked for 805 and will wait for a grant from its pool's episode.
+fn overflow_episode_note_parked(endpoint: DhanEndpointType, global_index: u8) {
+    overflow_episode_step(false, |eps| {
+        eps.on_parked(endpoint, global_index);
+        OverflowEpisodesEffect::default()
+    });
+}
+
+/// The one-second poll: stamps the watched socket's first frame (from the
+/// lock-free flag) and runs the time-driven steps.
+fn overflow_episode_poll(now: Instant, window_open: bool) {
+    overflow_episode_step(false, |eps| {
+        if let Some(watched) = eps.watched()
+            && OVERFLOW_WATCHED_FIRST_FRAME.load(std::sync::atomic::Ordering::Acquire)
+        {
+            eps.on_first_frame(watched, now);
+        }
+        eps.poll(now, window_open)
+    });
+}
+
+/// Whether this endpoint's episode has spent its probes (parked sockets of
+/// that pool stay down for the session). O(1).
+fn overflow_episode_down_for(endpoint: DhanEndpointType) -> bool {
+    match OverflowEpisodeKind::for_endpoint(endpoint) {
+        Some(OverflowEpisodeKind::MainFeed) => {
+            OVERFLOW_DOWN.load(std::sync::atomic::Ordering::Acquire)
+        }
+        Some(OverflowEpisodeKind::Depth) => {
+            DEPTH_OVERFLOW_DOWN.load(std::sync::atomic::Ordering::Acquire)
+        }
+        None => true,
+    }
+}
+
+/// Takes (and clears) this slot's grant.
+fn take_overflow_grant(global_index: u8) -> bool {
+    OVERFLOW_GRANT
+        .get(usize::from(global_index))
+        .is_some_and(|f| f.swap(false, std::sync::atomic::Ordering::AcqRel))
+}
+
+/// Takes (and clears) this slot's re-park request.
+fn take_overflow_repark(global_index: u8) -> bool {
+    OVERFLOW_REPARK
+        .get(usize::from(global_index))
+        .is_some_and(|f| f.swap(false, std::sync::atomic::Ordering::AcqRel))
+}
+
+/// Whether the overflow probe may act now: the same session gate the frame
+/// watchdog uses, so no probe dials where the reconnect logic is gated off.
+fn overflow_probe_window_open(gate: FrameSilenceGate) -> bool {
+    gate.is_open()
 }
 
 /// A probe close is PENDING for this slot.
@@ -1432,17 +2335,24 @@ pub enum ReconnectReason {
     /// with an unsubscribe frame (scope lock 2026-10-01), so neither closes a
     /// socket and neither needs a reason here.
     ProbeClose,
+    /// A main-feed socket parked for 805 was released by the overflow probe
+    /// (plan item D7): the test dial, or one of the releases after a pass.
+    /// It DOES record a flap — a redial into an account that answered 805 is
+    /// exactly what the damper should weigh, and no reason gains a flap
+    /// exemption without its own dated quote.
+    OverflowProbe,
 }
 
 impl ReconnectReason {
     /// Every reason, for pre-registration and the label-uniqueness pin.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::DialFailed,
         Self::SubscribeFailed,
         Self::Disconnected,
         Self::TokenStale,
         Self::IdleSilence,
         Self::ProbeClose,
+        Self::OverflowProbe,
     ];
 
     /// Stable lowercase tag for logs and metric labels.
@@ -1455,6 +2365,7 @@ impl ReconnectReason {
             Self::TokenStale => "token_stale",
             Self::IdleSilence => "idle_silence",
             Self::ProbeClose => "probe_close",
+            Self::OverflowProbe => "overflow_probe",
         }
     }
 
@@ -1622,6 +2533,11 @@ pub struct ConnectionSupervisor {
     /// trading day for a socket that is healthy. Only a socket that was
     /// delivering, lost it, and came back is a reconnect.
     ever_delivered: bool,
+    /// The Dhan code the CURRENT outage's close carried, if any. Set on
+    /// [`ConnEvent::Disconnected`], cleared on [`ConnEvent::BeginDial`]. Read
+    /// ONLY to stamp the lifecycle audit row (`ws_event_audit.dhan_code`,
+    /// `feed_gap_audit.dhan_code`); the supervisor never branches on it.
+    last_disconnect_code: Option<u16>,
 }
 
 impl ConnectionSupervisor {
@@ -1647,6 +2563,7 @@ impl ConnectionSupervisor {
             park_reason: None,
             respawn_used: false,
             ever_delivered: false,
+            last_disconnect_code: None,
         }
     }
 
@@ -1725,15 +2642,48 @@ impl ConnectionSupervisor {
     /// Feeds one event through the state machine and returns the action the
     /// shell must take. Total, allocation-free, O(1).
     pub fn on_event(&mut self, event: ConnEvent, now: Instant) -> SupervisorAction {
-        // Parking is terminal and absorbs everything except a repeat shutdown.
+        // Parking is terminal and absorbs everything — with ONE exception:
+        // the overflow probe (D7 for the main feed, scope lock 2026-10-02 for
+        // depth) may release a market-data socket parked for 805. Every other
+        // park reason, the order-update socket and every other event stay
+        // absorbed exactly as before.
         if self.phase == ConnPhase::Parked {
+            if event == ConnEvent::OverflowProbeGranted
+                && self.park_reason == Some(ParkReason::PoolOverflow)
+                && OverflowEpisodeKind::for_endpoint(self.slot.endpoint).is_some()
+            {
+                self.park_reason = None;
+                info!(
+                    endpoint = self.slot.endpoint.as_str(),
+                    connection_index = self.slot.global_index,
+                    "socket parked for 805 released by the overflow probe — redialling its \
+                     own instruments on the damped ladder"
+                );
+                return self.schedule_redial(ReconnectReason::OverflowProbe, now);
+            }
             return SupervisorAction::Continue;
         }
 
         match event {
             ConnEvent::ShutdownRequested => self.park(ParkReason::Shutdown, now),
 
+            // Only meaningful while parked (handled above). A socket that is
+            // not parked has nothing to be released from.
+            ConnEvent::OverflowProbeGranted => SupervisorAction::Continue,
+
+            ConnEvent::OverflowProbeFailed => {
+                // The order-update socket never takes part in the probe.
+                if OverflowEpisodeKind::for_endpoint(self.slot.endpoint).is_none() {
+                    return SupervisorAction::Continue;
+                }
+                // Re-park for 805. `ROTATION_HALTED` is already set by the
+                // 805 that started the episode and is NOT touched here.
+                self.park(ParkReason::PoolOverflow, now)
+            }
+
             ConnEvent::BeginDial => {
+                // A new dial clears the previous close's code (audit rows).
+                self.last_disconnect_code = None;
                 self.phase = ConnPhase::Dialing;
                 self.proven_healthy = false;
                 self.healthy_since = None;
@@ -1800,6 +2750,9 @@ impl ConnectionSupervisor {
                 if !self.proven_healthy {
                     self.proven_healthy = true;
                     self.attempt = 0;
+                    // D7: the watched probe socket's first frame starts its
+                    // window. One relaxed load, no lock.
+                    overflow_episode_note_first_frame(self.slot.global_index);
                     // The true blind window: FIRST dial of the outage -> every
                     // retry -> subscribe dispatch -> Dhan applying it -> the
                     // book next changing. TAKEN, so a second frame cannot
@@ -1861,6 +2814,11 @@ impl ConnectionSupervisor {
 
             ConnEvent::Disconnected { code } => {
                 self.reconnects = self.reconnects.saturating_add(1);
+                self.last_disconnect_code = code.map(|c| c.as_u16());
+                // D7: every close feeds the main-feed overflow episode — an
+                // 805 starts (or fails) it, a close with no code fails a
+                // running window. O(1) atomic check otherwise.
+                overflow_episode_note_disconnect(code, now);
                 match classify_disconnect(code) {
                     DisconnectClass::PoolOverflow => {
                         error!(
@@ -2145,6 +3103,13 @@ impl ConnectionSupervisor {
         self.last_redial_reason
     }
 
+    /// The Dhan disconnect code the current outage's close carried (`None`
+    /// for a bare reset or a redial we chose) — for the AUDIT ROW only.
+    #[must_use]
+    pub const fn last_disconnect_code(&self) -> Option<u16> {
+        self.last_disconnect_code
+    }
+
     fn enter_backoff(&mut self, reason: ReconnectReason, verdict: FlapVerdict, now: Instant) {
         // Recorded at the ONE site every redial passes through, so the audit
         // row cannot disagree with the counter beside it.
@@ -2257,6 +3222,18 @@ impl ConnectionSupervisor {
 
         self.phase = ConnPhase::Parked;
         self.park_reason = Some(reason);
+        // A stop WE asked for (Z11d) is not a lost socket. It must not move
+        // `PARK_METRIC`, which the `dhan-socket-parked` alarm pages on with no
+        // reason filter, nor log the "parked permanently" error below: every
+        // socket parks this way on every mid-session stop and deploy restart.
+        if reason == ParkReason::Shutdown {
+            info!(
+                endpoint = self.slot.endpoint.as_str(),
+                connection_index = self.slot.global_index,
+                "Dhan live-feed socket closing for shutdown"
+            );
+            return SupervisorAction::Park { reason };
+        }
         metrics::counter!(
             PARK_METRIC,
             "endpoint" => self.slot.endpoint.as_str(),
@@ -2892,6 +3869,144 @@ impl SubscribeGuard {
             None => false,
         }
     }
+
+    /// The endpoint's per-message instrument cap (100 main feed, 50
+    /// depth-20, 1 depth-200), floored at 1 so `chunks` cannot panic.
+    fn per_message(&self) -> usize {
+        usize::try_from(self.endpoint.max_instruments_per_subscribe_message())
+            .unwrap_or(usize::MAX)
+            .max(1)
+    }
+
+    /// Records an in-place change of many instruments — the generic form of
+    /// [`Self::try_swap`] for every socket kind (scope lock 2026-10-02).
+    ///
+    /// Recorded BEFORE the wire moves, for the reason `try_swap` gives: the
+    /// guard is the replay, and a socket that closes mid-change must come
+    /// back with the requested set. The caller sends
+    /// [`ResubscribePlan::removed`] first, then the tail from
+    /// [`ResubscribePlan::subscribe_from`].
+    ///
+    /// An instrument named on both lists stays held and costs no wire call.
+    /// A subscribe the connection already holds is dropped loudly
+    /// (`drop_duplicates`), never sent twice.
+    ///
+    /// # Errors
+    ///
+    /// Fail-closed, guard untouched:
+    /// [`SubscribeGuardRefusal::NotSubscribed`] when an unsubscribe names an
+    /// instrument this connection does not hold (unsubscribing what was
+    /// never there would let the guard and the socket disagree), and
+    /// [`SubscribeGuardRefusal::TooManyInstruments`] when the set AFTER the
+    /// change would exceed the per-connection cap (5,000 / 50 / 1).
+    ///
+    /// # Complexity
+    ///
+    /// O(held + changes) with O(1)-average hash probes; cold path, once per
+    /// command, never per tick.
+    fn try_resubscribe(
+        &mut self,
+        unsubscribe: &[SubscribeInstrument],
+        subscribe: Vec<SubscribeInstrument>,
+    ) -> Result<ResubscribePlan, SubscribeGuardRefusal> {
+        // O(1) EXEMPT: begin — cold path, once per in-place command; sets sized by the connection cap.
+        // Keyed on the I-P1-11 composite `(security_id, segment)`.
+        let key = |i: &SubscribeInstrument| (i.security_id, i.segment);
+        let held: std::collections::HashSet<(SecurityId, ExchangeSegment)> =
+            self.instruments.iter().map(key).collect();
+        let staying_subscribed: std::collections::HashSet<(SecurityId, ExchangeSegment)> =
+            subscribe.iter().map(key).collect();
+        let mut removed: Vec<SubscribeInstrument> = Vec::with_capacity(unsubscribe.len());
+        let mut removed_set: std::collections::HashSet<(SecurityId, ExchangeSegment)> =
+            std::collections::HashSet::with_capacity(unsubscribe.len());
+        for instrument in unsubscribe {
+            if !held.contains(&key(instrument)) {
+                warn!(
+                    code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                    endpoint = self.endpoint.as_str(),
+                    held = self.instruments.len(),
+                    security_id = instrument.security_id,
+                    segment = instrument.segment.as_str(),
+                    "refusing an in-place change that unsubscribes an instrument this \
+                     connection does not hold"
+                );
+                return Err(SubscribeGuardRefusal::NotSubscribed {
+                    endpoint: self.endpoint,
+                });
+            }
+            // Named on both lists: it stays, and costs nothing on the wire.
+            if staying_subscribed.contains(&key(instrument)) {
+                continue;
+            }
+            if removed_set.insert(key(instrument)) {
+                removed.push(*instrument);
+            }
+        }
+        let kept: Vec<SubscribeInstrument> = self
+            .instruments
+            .iter()
+            .filter(|i| !removed_set.contains(&key(i)))
+            .copied()
+            .collect();
+        // O(1) EXEMPT: end
+        let adds = drop_duplicates(self.endpoint, "resubscribe", &kept, subscribe);
+        let max = self.endpoint.max_instruments_per_connection();
+        let after = kept.len().saturating_add(adds.len());
+        if u64::try_from(after).unwrap_or(u64::MAX) > u64::from(max) {
+            warn!(
+                code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                endpoint = self.endpoint.as_str(),
+                held = self.instruments.len(),
+                removing = removed.len(),
+                adding = adds.len(),
+                max,
+                "refusing an in-place change that would take a live connection past its \
+                 per-connection cap - the guard is left unchanged"
+            );
+            return Err(SubscribeGuardRefusal::TooManyInstruments {
+                endpoint: self.endpoint,
+                requested: after,
+                max,
+            });
+        }
+        self.instruments = kept;
+        let subscribe_from = self.instruments.len();
+        self.instruments.extend(adds);
+        Ok(ResubscribePlan {
+            removed,
+            subscribe_from,
+        })
+    }
+
+    /// Re-adds instruments an in-place change meant to remove but whose
+    /// unsubscribe never left: the socket still holds them, so the replay
+    /// must too. Skips any the guard already names, so it can never create a
+    /// duplicate. Cold path; O(held + put back).
+    fn put_back(&mut self, instruments: &[SubscribeInstrument]) {
+        // O(1) EXEMPT: begin — cold path, only after an in-place change stopped part-way.
+        for instrument in instruments {
+            if !self.instruments.contains(instrument) {
+                self.instruments.push(*instrument);
+            }
+        }
+        // O(1) EXEMPT: end
+    }
+}
+
+/// The wire work one [`SubscribeGuard::try_resubscribe`] implies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResubscribePlan {
+    /// Unsubscribe these FIRST, in per-message batches.
+    removed: Vec<SubscribeInstrument>,
+    /// Then subscribe the guard's tail from this index.
+    subscribe_from: usize,
+}
+
+impl ResubscribePlan {
+    /// No wire work: nothing leaves and nothing new arrives.
+    fn is_no_op(&self, guard_len: usize) -> bool {
+        self.removed.is_empty() && self.subscribe_from >= guard_len
+    }
 }
 
 /// The wire work one [`SubscribeGuard::try_swap`] implies.
@@ -3095,6 +4210,72 @@ pub enum LiveSubscriptionCommand {
         /// care about the wire effect should not have to build a channel.
         ack: Option<tokio::sync::oneshot::Sender<ProbeUnsubscribeOutcome>>,
     },
+    /// Change a socket's instruments IN PLACE, on any socket kind: unsubscribe
+    /// `unsubscribe`, then subscribe `subscribe`, on the open socket — no
+    /// close and no redial (scope lock 2026-10-02, operator: "what happend to
+    /// unsusbcribe resubscribe fucntionality as well dude can you add this
+    /// alsod due okay?"). The generic form of [`Self::Swap`] (one-for-one,
+    /// depth) and [`Self::Extend`] (add only).
+    ///
+    /// On the wire: main feed RequestCode 16/18/22 then 15/17/21 by feed mode
+    /// (indices in their own message), up to 100 instruments a message;
+    /// depth-20 25 then 23, up to 50; depth-200 25 then 23, one. The
+    /// unsubscribes always go out first, the guard (the reconnect replay) is
+    /// updated so a later genuine reconnect replays the CURRENT set, the
+    /// result after the change is refused if it would exceed the socket's cap
+    /// (5,000 / 50 / 1), and after any 805 a depth socket refuses it
+    /// (`ROTATION_HALTED`, never cleared). See `apply_resubscribe`.
+    Resubscribe {
+        /// Instruments to drop. Each must be held by this connection, or the
+        /// whole command is refused and nothing is sent.
+        unsubscribe: Vec<SubscribeInstrument>,
+        /// Instruments to add. One the connection already holds is dropped
+        /// loudly rather than subscribed twice.
+        subscribe: Vec<SubscribeInstrument>,
+        /// Where the connection reports what actually happened. `None` when
+        /// the sender does not need the answer; a dropped receiver is ignored.
+        ack: Option<tokio::sync::oneshot::Sender<ResubscribeOutcome>>,
+    },
+}
+
+/// What a [`LiveSubscriptionCommand::Resubscribe`] did to the socket. Sent
+/// once per command; the caller keeps its belief in step with this, because
+/// this matches the guard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResubscribeOutcome {
+    /// Every unsubscribe and subscribe reached the wire (or there was nothing
+    /// to send). The socket carries the requested set.
+    Applied,
+    /// Refused before anything was sent; the socket and guard are unchanged.
+    /// `reason` is one of the `REASON_*` constants.
+    Refused {
+        /// Why.
+        reason: &'static str,
+    },
+    /// The change stopped part-way (a write failed or its budget ran out);
+    /// the socket stayed up. The guard names what the socket holds, and these
+    /// two lists are the part that did NOT happen, for the caller to offer
+    /// again: instruments still subscribed that were meant to leave, and
+    /// instruments meant to arrive that are not subscribed.
+    Stopped {
+        /// Still on the socket although asked to leave.
+        not_unsubscribed: Vec<SubscribeInstrument>,
+        /// Not on the socket although asked for.
+        not_subscribed: Vec<SubscribeInstrument>,
+    },
+    /// The socket is being replaced (it closed mid-change, or the change left
+    /// it holding nothing and a redial was scheduled). The guard names the
+    /// requested set, so the reconnect replay delivers it: treat as held.
+    ReplayPending,
+}
+
+impl ResubscribeOutcome {
+    /// An unsubscribe named an instrument this connection does not hold.
+    pub const REASON_NOT_HELD: &'static str = "not_held";
+    /// The set after the change would exceed the socket's per-connection cap.
+    pub const REASON_OVER_CAP: &'static str = "over_cap";
+    /// A depth socket after an 805: `ROTATION_HALTED` refuses every change.
+    pub const REASON_HALTED_805: &'static str = "halted_805";
 }
 
 /// What a [`LiveSubscriptionCommand::Swap`] actually did to the socket.
@@ -3430,6 +4611,36 @@ pub trait FrameSink: Send + Sync + 'static {
     ) {
     }
 
+    /// [`FrameSink::on_lifecycle`] with the two facts a gap record needs: the
+    /// Dhan disconnect code that closed the socket (`None` when the vendor
+    /// sent none — a bare reset, a timeout, a local close) and how many
+    /// instruments the socket held at that moment. Same cold-path budget as
+    /// `on_lifecycle`.
+    ///
+    /// The default drops the two extra facts and forwards, so every sink that
+    /// only implements `on_lifecycle` keeps working unchanged.
+    fn on_lifecycle_detail(
+        &self,
+        kind: tickvault_common::ws_event_types::WsEventKind,
+        reason: &'static str,
+        _dhan_code: Option<u16>,
+        _instruments_held: u32,
+    ) {
+        self.on_lifecycle(kind, reason);
+    }
+
+    /// Does this socket wait for an overflow probe after an 805 park instead
+    /// of ending its task? (D7 for the main feed; scope lock 2026-10-02 for
+    /// depth.)
+    ///
+    /// Default `false`: every existing sink, test and bench keeps the old
+    /// "805 parks for the session" behaviour. The app opts the market-data
+    /// sinks (main feed, depth-20, depth-200) in through
+    /// [`WalRingSink::with_overflow_probe`].
+    fn overflow_probe_enabled(&self) -> bool {
+        false
+    }
+
     /// May this process OPEN a socket now? (2026-10-01, R7 — the
     /// dual-instance lock.)
     ///
@@ -3439,7 +4650,73 @@ pub trait FrameSink: Send + Sync + 'static {
     fn dial_permitted(&self) -> bool {
         true
     }
+
+    /// Has the process asked this socket to close for shutdown? (Z11d,
+    /// 2026-10-02.)
+    ///
+    /// Read at the top of every drain iteration, before every dial and between
+    /// backoff steps. O(1), no await. Default `false`, so every existing sink
+    /// is unchanged; [`WalRingSink::with_socket_stop`] wires the process's
+    /// [`SOCKET_STOP`].
+    fn stop_requested(&self) -> bool {
+        false
+    }
 }
+
+/// The process-wide request for every Dhan feed socket to close (Z11d,
+/// 2026-10-02).
+///
+/// # The hole it closes
+///
+/// A mid-session stop used to signal only the frame DRAIN: the socket tasks
+/// took no stop signal at all (`ConnEvent::ShutdownRequested` had no
+/// production emitter), so they kept reading and appending to the WAL right
+/// up to process exit, while `main` shut the WAL writer down underneath them.
+/// Records that landed after the writer's last empty poll were dropped with
+/// the channel. `WsFrameSpill::shutdown` documents "call AFTER the sockets are
+/// closed", and nothing closed them.
+///
+/// `main` now requests this first and waits for the sockets to park. Each
+/// socket closes through `close_capturing`, so frames read during the close
+/// handshake still reach the WAL, and the lane drain is still running to fold
+/// them.
+#[derive(Debug)]
+pub struct SocketStop {
+    requested: std::sync::atomic::AtomicBool,
+}
+
+impl SocketStop {
+    /// A stop that has not been requested.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            requested: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Asks every socket wired to this stop to close and park. Idempotent;
+    /// there is no un-request, because a parked socket never re-dials.
+    pub fn request(&self) {
+        self.requested
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether [`SocketStop::request`] has been called. One atomic load.
+    #[must_use]
+    pub fn is_requested(&self) -> bool {
+        self.requested.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl Default for SocketStop {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The one production [`SocketStop`]: wired into every feed socket's sink by
+/// the app's dial path and requested by `main` at shutdown.
+pub static SOCKET_STOP: SocketStop = SocketStop::new();
 
 /// How often a connection refused a dial by the dual-instance lock re-checks
 /// whether it may dial again (2026-10-01, R7). Matches the 5 s token-stale
@@ -3484,6 +4761,11 @@ pub struct WsLifecycleEvent {
     /// type `Copy`, and it means no caller can put unbounded vendor text into
     /// a forensic row.
     pub reason: &'static str,
+    /// The Dhan disconnect code that closed the socket, when the vendor sent
+    /// one. `None` on a connect, and on a close that carried no code.
+    pub dhan_code: Option<u16>,
+    /// How many instruments the socket held when the event happened.
+    pub instruments_held: u32,
 }
 
 /// One captured frame and the sequence it was stamped with at the read
@@ -3556,6 +4838,24 @@ pub struct CapturedFrame {
     /// read the same way live and on replay, makes the key collapse them.
     /// An `i64` copy: no allocation, and still no wall-clock read in this file.
     pub received_at_nanos: i64,
+    /// Whether this frame's WAL append SUCCEEDED (2026-10-02).
+    ///
+    /// `false` only on the `CapturedLiveOnly` arm: the write-ahead queue
+    /// refused the frame and it entered the ring anyway. Downstream code must
+    /// not assume such a frame can be re-offered by a replay, because no WAL
+    /// segment holds it. Two consequences, both enforced in the drain:
+    ///
+    ///   1. its depth is never SHED — shedding records the frame as deferred
+    ///      for the after-close pass, which re-reads WAL segments, so an
+    ///      unbacked shed was a silent loss reported as a deferral;
+    ///   2. its tick and depth rows are marked unbacked on the writers, so a
+    ///      busy rescue thread keeps them in the inline spill instead of
+    ///      dropping them on the assumption the WAL will restore them.
+    ///
+    /// A replayed frame is WAL-backed by definition and always carries
+    /// `true`. A `bool` copy: no allocation, `Bytes` stays the only heap
+    /// member.
+    pub wal_backed: bool,
     /// The frame exactly as it arrived. Never parsed on the read task.
     pub bytes: Bytes,
 }
@@ -3824,6 +5124,14 @@ pub struct WalRingSink {
     /// `None` by default — a sink built the old way may always dial. Set by
     /// [`WalRingSink::with_dial_permit`]; read once per dial, never per frame.
     dial_permit: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// The process's socket stop (Z11d). `None` by default — a sink built
+    /// the old way never stops on request. Set by
+    /// [`WalRingSink::with_socket_stop`].
+    socket_stop: Option<&'static SocketStop>,
+    /// Whether this socket waits for an overflow probe after an 805 park.
+    /// `false` by default; set by [`WalRingSink::with_overflow_probe`] for
+    /// market-data sinks (main feed, depth-20, depth-200).
+    overflow_probe: bool,
 }
 
 impl WalRingSink {
@@ -3868,6 +5176,8 @@ impl WalRingSink {
             ring_bytes_full: metrics::counter!(RING_BYTES_FULL_METRIC, "endpoint" => endpoint_label),
             audit_tx: None,
             dial_permit: None,
+            socket_stop: None,
+            overflow_probe: false,
         };
         sink.pre_register();
         sink
@@ -3883,6 +5193,27 @@ impl WalRingSink {
     #[must_use]
     pub fn with_dial_permit(mut self, held: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
         self.dial_permit = Some(held);
+        self
+    }
+
+    /// Lets the process close this socket for shutdown (Z11d): once `stop`
+    /// is requested the connection parks with `ParkReason::Shutdown`, closing
+    /// through `close_capturing`. A builder, same shape as
+    /// [`WalRingSink::with_dial_permit`], so every existing construction is
+    /// untouched.
+    #[must_use]
+    pub fn with_socket_stop(mut self, stop: &'static SocketStop) -> Self {
+        self.socket_stop = Some(stop);
+        self
+    }
+
+    /// Opts this socket into the overflow probe: after an 805 park it waits
+    /// for a probe grant from its pool's episode instead of ending its task.
+    /// Main feed (D7) and depth-20 / depth-200 (scope lock 2026-10-02);
+    /// ignored for the order-update socket, which has no episode.
+    #[must_use]
+    pub fn with_overflow_probe(mut self) -> Self {
+        self.overflow_probe = OverflowEpisodeKind::for_endpoint(self.endpoint).is_some();
         self
     }
 
@@ -3919,16 +5250,34 @@ impl WalRingSink {
 }
 
 impl FrameSink for WalRingSink {
+    fn stop_requested(&self) -> bool {
+        self.socket_stop.is_some_and(SocketStop::is_requested)
+    }
+
     fn dial_permitted(&self) -> bool {
         self.dial_permit
             .as_ref()
             .is_none_or(|held| held.load(std::sync::atomic::Ordering::Acquire))
     }
 
+    fn overflow_probe_enabled(&self) -> bool {
+        self.overflow_probe
+    }
+
     fn on_lifecycle(
         &self,
         kind: tickvault_common::ws_event_types::WsEventKind,
         reason: &'static str,
+    ) {
+        self.on_lifecycle_detail(kind, reason, None, 0);
+    }
+
+    fn on_lifecycle_detail(
+        &self,
+        kind: tickvault_common::ws_event_types::WsEventKind,
+        reason: &'static str,
+        dhan_code: Option<u16>,
+        instruments_held: u32,
     ) {
         let Some(tx) = self.audit_tx.as_ref() else {
             return;
@@ -3940,6 +5289,8 @@ impl FrameSink for WalRingSink {
             connection_index: self.connection_index,
             kind,
             reason,
+            dhan_code,
+            instruments_held,
         };
         // `try_send`, never `send`: a slow consumer may cost a forensic row,
         // and must never stall a socket. The drop is COUNTED rather than
@@ -4045,6 +5396,7 @@ impl FrameSink for WalRingSink {
                 connection_index: self.connection_index,
                 received_at,
                 received_at_nanos,
+                wal_backed: !wal_refused,
                 bytes: frame,
             })
             .is_err()
@@ -4208,6 +5560,30 @@ impl PoolSupervisor {
             // SWAP_WIRE_SEED_ANCHOR — deleting this line deletes the baseline.
             metrics::counter!(metric).increment(0);
         }
+        // The in-place change family (scope lock 2026-10-02), per endpoint
+        // that carries instruments.
+        for endpoint in [
+            DhanEndpointType::MainFeed,
+            DhanEndpointType::Depth20,
+            DhanEndpointType::Depth200,
+        ] {
+            for outcome in INPLACE_CHANGE_OUTCOMES {
+                metrics::counter!(
+                    INPLACE_CHANGE_METRIC,
+                    "endpoint" => endpoint.as_str(),
+                    "outcome" => outcome,
+                )
+                .increment(0);
+            }
+            for leg in [InPlaceLeg::Unsubscribe, InPlaceLeg::Subscribe] {
+                metrics::counter!(
+                    INPLACE_INSTRUMENTS_METRIC,
+                    "endpoint" => endpoint.as_str(),
+                    "leg" => leg.as_str(),
+                )
+                .increment(0);
+            }
+        }
         Self {
             budget: PoolBudget::new(),
             // Pre-sized to the hard ceiling rather than left unsized: the pool
@@ -4267,34 +5643,6 @@ impl PoolSupervisor {
         self.connections
             .iter_mut()
             .find(|c| c.slot().global_index == global_index)
-    }
-
-    /// Read-only view of every registered supervisor.
-    #[must_use]
-    pub fn connections(&self) -> &[ConnectionSupervisor] {
-        &self.connections
-    }
-
-    /// Runs the idle watchdog across every registered connection, returning the
-    /// slots that need re-dialing.
-    ///
-    /// **O(N), not O(1)** — a scan. N is bounded by the operator-authorized
-    /// ceiling of 16, so the cost is a fixed constant, but it is a scan and is
-    /// labelled as one rather than dressed up. It runs once per
-    /// [`IDLE_POLL_INTERVAL`] on the cold path, never per frame. The returned
-    /// `Vec` allocates; also cold path, and empty in the overwhelmingly common
-    /// case where nothing timed out.
-    pub fn poll_all(&mut self, now: Instant) -> Vec<(ConnectionSlot, SupervisorAction)> {
-        // Pre-sized to the ceiling: at most one action per connection, and the
-        // pool is hard-capped, so this never reallocates mid-sweep.
-        let mut due = Vec::with_capacity(MAX_TOTAL_DHAN_CONNECTIONS as usize);
-        for conn in &mut self.connections {
-            let action = conn.poll(now);
-            if action != SupervisorAction::Continue {
-                due.push((conn.slot(), action));
-            }
-        }
-        due
     }
 
     /// Releases one connection of `endpoint` back to the budget and forgets its
@@ -4478,7 +5826,14 @@ pub trait DhanFeedSocket: Send {
     /// [`FrameSink::accept`].
     fn recv(&mut self) -> impl std::future::Future<Output = SocketEvent> + Send;
     /// Close the socket, best effort.
-    fn close(&mut self) -> impl std::future::Future<Output = ()> + Send;
+    ///
+    /// Every data frame still read while the close handshake completes is
+    /// handed to `on_frame` (2026-10-02). The supervisor passes its sink, so a
+    /// frame Dhan delivers between our Close and its reply reaches the
+    /// write-ahead log like any other instead of being discarded uncounted.
+    fn close<F>(&mut self, on_frame: F) -> impl std::future::Future<Output = ()> + Send
+    where
+        F: FnMut(Bytes) + Send;
 }
 
 /// A transport-level failure. Opaque on purpose: policy lives in the
@@ -4730,6 +6085,397 @@ where
     None
 }
 
+/// Which message one in-place batch carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InPlaceLeg {
+    /// RequestCode 16/18/22 on the main feed (by feed mode), 25 on depth.
+    Unsubscribe,
+    /// RequestCode 15/17/21 on the main feed (by feed mode), 23 on depth.
+    Subscribe,
+}
+
+impl InPlaceLeg {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unsubscribe => "unsubscribe",
+            Self::Subscribe => "subscribe",
+        }
+    }
+}
+
+/// What writing one leg of an in-place change produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LegRun {
+    /// Instruments in batches the writer ACKNOWLEDGED.
+    sent: usize,
+    /// Instruments in the one batch whose write TIMED OUT (it may or may not
+    /// have landed); 0 when none did. Not included in `sent`.
+    timed_out: usize,
+    /// A write answered with an error, or the socket closed mid-leg.
+    failed: bool,
+    /// The whole-change budget ran out, or one write timed out.
+    budget_exhausted: bool,
+    /// A frame read during the leg decided this socket's fate (a `Closed`).
+    decided: Option<SupervisorAction>,
+}
+
+/// Writes one leg of an in-place change — paced, bounded, and reading the
+/// socket throughout. The ONE engine every change on a live socket goes
+/// through: the top-up (`Extend`) and the `Resubscribe` both call it.
+///
+/// # Bounds (why each exists)
+///
+/// These sends run ON the drain task, and Dhan closes a silent socket after
+/// 40 seconds; unbounded, a 5,000-instrument leg is 50 messages times the
+/// transport's 10 s send timeout. So: `deadline` caps the whole change, each
+/// write gets [`SWAP_WIRE_BUDGET`], and a per-message timeout stops the leg
+/// like an exhausted budget (a socket that cannot write one message in a
+/// second is sick, and the reconnect ladder is its answer). Between writes
+/// the pacing gap ([`SUBSCRIBE_BATCH_INTERVAL`], the dispatch's own 25 ms)
+/// READS the socket through [`read_until`] instead of sleeping, so the
+/// receive buffer keeps draining (scope lock "2026-09-22 (FOURTH)" item 6).
+///
+/// O(batches); each batch is a borrowed slice, so no allocation per message.
+#[allow(clippy::too_many_arguments)] // APPROVED: the drain's four borrowed parts plus the leg, its batches and the deadline; bundling them would only rename the borrow.
+async fn write_batches_in_place<'a, S, K, I>(
+    socket: &mut S,
+    supervisor: &mut ConnectionSupervisor,
+    sink: &K,
+    throttle: &mut DrainThrottle,
+    leg: InPlaceLeg,
+    batches: I,
+    deadline: tokio::time::Instant,
+) -> LegRun
+where
+    S: DhanFeedSocket,
+    K: FrameSink + ?Sized,
+    I: Iterator<Item = &'a [SubscribeInstrument]>,
+{
+    let mut run = LegRun {
+        sent: 0,
+        timed_out: 0,
+        failed: false,
+        budget_exhausted: false,
+        decided: None,
+    };
+    for batch in batches {
+        // `tokio::time::Instant`: a bound the test clock cannot advance is a
+        // bound nothing can prove.
+        if tokio::time::Instant::now() >= deadline {
+            run.budget_exhausted = true;
+            break;
+        }
+        let ticket = match leg {
+            InPlaceLeg::Unsubscribe => socket.send_unsubscribe(batch),
+            InPlaceLeg::Subscribe => socket.send_subscribe(batch),
+        };
+        let wait = await_write(
+            socket,
+            supervisor,
+            sink,
+            throttle,
+            ticket,
+            Some(tokio::time::Instant::now() + SWAP_WIRE_BUDGET),
+        )
+        .await;
+        if let Some(decided) = wait.socket_decision {
+            run.decided = Some(decided);
+            run.failed = true;
+            break;
+        }
+        match wait.outcome {
+            Ok(Ok(())) => run.sent += batch.len(),
+            Err(WireElapsed) => {
+                run.timed_out = batch.len();
+                run.budget_exhausted = true;
+                break;
+            }
+            Ok(Err(_)) => {
+                run.failed = true;
+                break;
+            }
+        }
+        let resume_at = tokio::time::Instant::now() + SUBSCRIBE_BATCH_INTERVAL;
+        if let Some(decided) = read_until(socket, supervisor, sink, throttle, resume_at).await {
+            run.decided = Some(decided);
+            run.failed = true;
+            break;
+        }
+    }
+    run
+}
+
+/// Whether `ROTATION_HALTED` refuses an in-place change on this socket kind.
+///
+/// Every DEPTH socket refuses after an 805 (scope lock 2026-10-01: no depth
+/// change and no ghost unsubscribe for the rest of the process). The main
+/// feed does not: an in-place message opens no connection, and the main
+/// feed's own 805 answer is the overflow probe. Pure, so the gate is tested
+/// without touching the process-global latch.
+const fn inplace_change_blocked_by_805(endpoint: DhanEndpointType, halted: bool) -> bool {
+    halted
+        && matches!(
+            endpoint,
+            DhanEndpointType::Depth20 | DhanEndpointType::Depth200
+        )
+}
+
+/// Sends a [`ResubscribeOutcome`] to whoever asked. A dropped receiver is not
+/// an error: the guard is truthful either way.
+fn answer_resubscribe(
+    ack: Option<tokio::sync::oneshot::Sender<ResubscribeOutcome>>,
+    outcome: ResubscribeOutcome,
+) {
+    if let Some(ack) = ack
+        && ack.send(outcome).is_err()
+    {
+        // Receiver gone: the caller stopped waiting. Nothing lost.
+    }
+}
+
+/// Applies one `LiveSubscriptionCommand::Resubscribe` on the live socket:
+/// unsubscribe first, then subscribe, in batches of the endpoint's
+/// per-message cap — never a close, never a redial for the change itself
+/// (scope lock 2026-10-02).
+///
+/// Returns the supervisor's next action: `Continue` unless the socket closed
+/// during the writes, or the change left the socket holding nothing it was
+/// asked to hold (then `SubscribeFailed`, the same fault path an emptied swap
+/// takes — a socket carrying nothing loses nothing by a redial, and the
+/// replay delivers the requested set).
+///
+/// # The guard is truthful on every arm
+///
+/// It is the reconnect replay, so after this returns it names what the socket
+/// holds, or — when the socket is about to be replaced — what was asked for:
+///
+/// | Ending | Guard | Caller told |
+/// |---|---|---|
+/// | all written | the requested set | `Applied` |
+/// | first unsubscribe refused, nothing landed | unchanged | `Stopped` (everything back) |
+/// | unsubscribe leg stopped part-way | unsent removes put back, no add | `Stopped` |
+/// | subscribe leg stopped part-way | removes gone, unsent adds cut | `Stopped` |
+/// | socket closed mid-change | the requested set | `ReplayPending` |
+/// | left holding nothing | the requested set, redial | `ReplayPending` |
+///
+/// A TIMED-OUT unsubscribe is counted as landed (if it did not, the old
+/// instruments keep streaming and are stored — no wanted data is lost); a
+/// TIMED-OUT subscribe is counted as not landed and handed back for a
+/// re-offer (if it did land, the guard dedups the re-offer). Both choices
+/// lean toward keeping the data the caller wants.
+#[allow(clippy::too_many_arguments)] // APPROVED: the drain's four borrowed parts, the guard and the command's three fields.
+async fn apply_resubscribe<S, K>(
+    socket: &mut S,
+    supervisor: &mut ConnectionSupervisor,
+    sink: &K,
+    throttle: &mut DrainThrottle,
+    guard: &mut SubscribeGuard,
+    unsubscribe: Vec<SubscribeInstrument>,
+    subscribe: Vec<SubscribeInstrument>,
+    ack: Option<tokio::sync::oneshot::Sender<ResubscribeOutcome>>,
+) -> SupervisorAction
+where
+    S: DhanFeedSocket,
+    K: FrameSink + ?Sized,
+{
+    let endpoint = supervisor.slot().endpoint;
+    let count = |label: &'static str| {
+        metrics::counter!(
+            INPLACE_CHANGE_METRIC,
+            "endpoint" => endpoint.as_str(),
+            "outcome" => label,
+        )
+        .increment(1);
+    };
+    // THE 805 BREAKER (scope lock 2026-10-01 / 2026-10-02): after any 805 no
+    // depth change is sent for the rest of the process. Checked here, where
+    // the write happens, so a change queued before the 805 is refused too.
+    // Never cleared. The main feed is not gated: an in-place message opens no
+    // connection, and the main feed's own 805 handling is the overflow probe.
+    if inplace_change_blocked_by_805(endpoint, rotation_halted()) {
+        metrics::counter!(DIAL_REFUSED_AFTER_805_METRIC, "path" => "resubscribe").increment(1);
+        count("refused_halted_805");
+        answer_resubscribe(
+            ack,
+            ResubscribeOutcome::Refused {
+                reason: ResubscribeOutcome::REASON_HALTED_805,
+            },
+        );
+        return SupervisorAction::Continue;
+    }
+    let plan = match guard.try_resubscribe(&unsubscribe, subscribe) {
+        Ok(plan) => plan,
+        Err(refusal) => {
+            let (label, reason) = match refusal {
+                SubscribeGuardRefusal::TooManyInstruments { .. } => {
+                    ("refused_over_cap", ResubscribeOutcome::REASON_OVER_CAP)
+                }
+                _ => ("refused_not_held", ResubscribeOutcome::REASON_NOT_HELD),
+            };
+            count(label);
+            error!(
+                code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                endpoint = endpoint.as_str(),
+                pool_index = supervisor.slot().pool_index,
+                held = guard.len(),
+                unsubscribe = unsubscribe.len(),
+                reason,
+                "in-place resubscribe REFUSED before anything was sent - this socket keeps \
+                 exactly the instruments it had"
+            );
+            answer_resubscribe(ack, ResubscribeOutcome::Refused { reason });
+            return SupervisorAction::Continue;
+        }
+    };
+    if plan.is_no_op(guard.len()) {
+        count("no_op");
+        answer_resubscribe(ack, ResubscribeOutcome::Applied);
+        return SupervisorAction::Continue;
+    }
+    let deadline = tokio::time::Instant::now() + TOPUP_WIRE_BUDGET;
+    let per_message = guard.per_message();
+
+    // UNSUBSCRIBE FIRST. On depth-200 (one instrument) and on any socket at
+    // its cap, subscribing first asks for more than the cap and Dhan answers
+    // 804. The order is the safety property, on every socket kind.
+    let unsub = write_batches_in_place(
+        socket,
+        supervisor,
+        sink,
+        throttle,
+        InPlaceLeg::Unsubscribe,
+        plan.removed.chunks(per_message),
+        deadline,
+    )
+    .await;
+    // A timed-out unsubscribe counts as landed (see the doc above).
+    let removed_landed = unsub.sent.saturating_add(unsub.timed_out);
+    metrics::counter!(
+        INPLACE_INSTRUMENTS_METRIC,
+        "endpoint" => endpoint.as_str(),
+        "leg" => InPlaceLeg::Unsubscribe.as_str(),
+    )
+    .increment(removed_landed as u64);
+    if let Some(decided) = unsub.decided {
+        // The socket is going away; the replay sends the requested set.
+        count("replay_pending");
+        answer_resubscribe(ack, ResubscribeOutcome::ReplayPending);
+        return decided;
+    }
+    if unsub.failed || unsub.budget_exhausted {
+        // Never subscribe after an unsubscribe that did not finish: the socket
+        // may still hold what was meant to leave. Make the guard truthful.
+        let not_subscribed = guard.take_from(plan.subscribe_from);
+        let not_unsubscribed = plan.removed.get(removed_landed..).unwrap_or(&[]).to_vec();
+        guard.put_back(&not_unsubscribed);
+        publish_connection_instruments(&supervisor.slot(), guard.len());
+        count("stopped");
+        error!(
+            code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+            source = "inplace_unsubscribe_stopped",
+            endpoint = endpoint.as_str(),
+            pool_index = supervisor.slot().pool_index,
+            removed = plan.removed.len(),
+            removed_landed,
+            not_unsubscribed = not_unsubscribed.len(),
+            not_subscribed = not_subscribed.len(),
+            write_failed = unsub.failed,
+            "in-place resubscribe stopped in its UNSUBSCRIBE leg - nothing new was subscribed; \
+             the socket stays up and keeps every instrument it still holds, and both lists go \
+             back to the caller"
+        );
+        answer_resubscribe(
+            ack,
+            ResubscribeOutcome::Stopped {
+                not_unsubscribed,
+                not_subscribed,
+            },
+        );
+        return SupervisorAction::Continue;
+    }
+
+    let sub = write_batches_in_place(
+        socket,
+        supervisor,
+        sink,
+        throttle,
+        InPlaceLeg::Subscribe,
+        guard.batches_from(plan.subscribe_from),
+        deadline,
+    )
+    .await;
+    metrics::counter!(
+        INPLACE_INSTRUMENTS_METRIC,
+        "endpoint" => endpoint.as_str(),
+        "leg" => InPlaceLeg::Subscribe.as_str(),
+    )
+    .increment(sub.sent as u64);
+    if let Some(decided) = sub.decided {
+        count("replay_pending");
+        answer_resubscribe(ack, ResubscribeOutcome::ReplayPending);
+        return decided;
+    }
+    if sub.failed || sub.budget_exhausted {
+        let landed_until = plan.subscribe_from.saturating_add(sub.sent);
+        if landed_until == 0 {
+            // The unsubscribes landed and no subscribe did: the socket holds
+            // NOTHING. Keep the requested set in the guard and redial, as an
+            // emptied swap does — the replay delivers it, and a socket that
+            // carries nothing has nothing to lose to the redial.
+            count("emptied_redial");
+            error!(
+                code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                source = "inplace_emptied_socket",
+                endpoint = endpoint.as_str(),
+                pool_index = supervisor.slot().pool_index,
+                requested = guard.len(),
+                "in-place resubscribe left the socket holding nothing - redialling so the \
+                 replay subscribes the requested set"
+            );
+            answer_resubscribe(ack, ResubscribeOutcome::ReplayPending);
+            return supervisor.on_event(ConnEvent::SubscribeFailed, Instant::now());
+        }
+        let not_subscribed = guard.take_from(landed_until);
+        publish_connection_instruments(&supervisor.slot(), guard.len());
+        count("stopped");
+        error!(
+            code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+            source = "inplace_subscribe_stopped",
+            endpoint = endpoint.as_str(),
+            pool_index = supervisor.slot().pool_index,
+            subscribed = sub.sent,
+            not_subscribed = not_subscribed.len(),
+            write_failed = sub.failed,
+            "in-place resubscribe stopped in its SUBSCRIBE leg - the socket stays up carrying \
+             what reached it; the rest goes back to the caller to offer again"
+        );
+        // Every unsubscribe landed, so nothing is left to remove: the plan's
+        // own buffer, emptied, is that list (no new allocation).
+        let mut not_unsubscribed = plan.removed;
+        not_unsubscribed.clear();
+        answer_resubscribe(
+            ack,
+            ResubscribeOutcome::Stopped {
+                not_unsubscribed,
+                not_subscribed,
+            },
+        );
+        return SupervisorAction::Continue;
+    }
+    count("applied");
+    info!(
+        endpoint = endpoint.as_str(),
+        pool_index = supervisor.slot().pool_index,
+        unsubscribed = plan.removed.len(),
+        subscribed = sub.sent,
+        total = guard.len(),
+        "in-place resubscribe applied on the live socket - unsubscribe then subscribe, no redial"
+    );
+    publish_connection_instruments(&supervisor.slot(), guard.len());
+    answer_resubscribe(ack, ResubscribeOutcome::Applied);
+    SupervisorAction::Continue
+}
+
 /// Why a supervised connection loop returned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionExit {
@@ -4766,6 +6512,127 @@ where
     Fut: std::future::Future<Output = ()> + Send,
 {
     run_connection_with_commands(socket, supervisor, guard, sink, refresh_token, None).await
+}
+
+/// Sleeps for `delay`, or less if the process asks the socket to stop (Z11d).
+///
+/// Backoff delays run to tens of seconds, which would hold a stopping socket
+/// past `main`'s wait for it. Checks every [`IDLE_POLL_INTERVAL`] and ends at
+/// exactly the same deadline as a plain sleep when nothing asks it to stop.
+/// `tokio::time`, so a paused test clock drives it like any other sleep.
+async fn sleep_unless_stopped<K>(delay: Duration, sink: &K)
+where
+    K: FrameSink + ?Sized,
+{
+    let deadline = tokio::time::Instant::now() + delay;
+    loop {
+        if sink.stop_requested() {
+            return;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return;
+        }
+        tokio::time::sleep_until((now + IDLE_POLL_INTERVAL).min(deadline)).await;
+    }
+}
+/// The instrument count of `guard` as the `u32` a lifecycle event carries.
+/// Saturates rather than wraps; a socket holds at most 5,000.
+fn guard_len_u32(guard: &SubscribeGuard) -> u32 {
+    u32::try_from(guard.len()).unwrap_or(u32::MAX)
+}
+
+/// A market-data socket parked for 805 waits here for an overflow probe grant
+/// instead of ending its task (D7 for the main feed; scope lock 2026-10-02
+/// for depth).
+///
+/// Polls the process episodes once per [`IDLE_POLL_INTERVAL`] — the poll is
+/// what lets the wait elapse, and it grants nothing outside the supervisor's
+/// session gate. Returns the supervisor's next action once this slot is
+/// granted, or `None` when the process asks the socket to stop or this pool's
+/// episode is down for the session; the caller then ends the task as parked.
+///
+/// The grant goes through [`ConnEvent::OverflowProbeGranted`], which the
+/// supervisor accepts only from `Parked(PoolOverflow)` on a market-data slot,
+/// so a grant can never revive any other park.
+async fn wait_for_overflow_grant<K>(
+    supervisor: &mut ConnectionSupervisor,
+    sink: &K,
+) -> Option<SupervisorAction>
+where
+    K: FrameSink + ?Sized,
+{
+    let slot = supervisor.slot().global_index;
+    let endpoint = supervisor.slot().endpoint;
+    // A re-park request left over from the failure that parked this socket
+    // is spent: the socket is parked. Cleared so it cannot undo a later
+    // grant.
+    if take_overflow_repark(slot) {
+        info!(
+            connection_index = slot,
+            "stale overflow re-park request cleared at park"
+        );
+    }
+    overflow_episode_note_parked(endpoint, slot);
+    loop {
+        if sink.stop_requested() || overflow_episode_down_for(endpoint) {
+            return None;
+        }
+        overflow_episode_poll(
+            Instant::now(),
+            overflow_probe_window_open(supervisor.frame_silence_gate()),
+        );
+        if take_overflow_grant(slot) {
+            let next = supervisor.on_event(ConnEvent::OverflowProbeGranted, Instant::now());
+            if next != SupervisorAction::Continue {
+                return Some(next);
+            }
+        }
+        tokio::time::sleep(IDLE_POLL_INTERVAL).await;
+    }
+}
+
+/// D7 / 2026-10-02: a socket opted into the overflow probe advances the
+/// episodes on its one-second tick, and takes its own re-park request.
+/// Returns the action a re-park produced (a `Park`), or `Continue`.
+///
+/// One atomic load when no 805 has happened this process — the common case
+/// for every session — so a quiet socket never touches the episode lock.
+fn overflow_probe_tick<K>(supervisor: &mut ConnectionSupervisor, sink: &K) -> SupervisorAction
+where
+    K: FrameSink + ?Sized,
+{
+    if !sink.overflow_probe_enabled()
+        || !OVERFLOW_ENGAGED.load(std::sync::atomic::Ordering::Acquire)
+    {
+        return SupervisorAction::Continue;
+    }
+    overflow_episode_poll(
+        Instant::now(),
+        overflow_probe_window_open(supervisor.frame_silence_gate()),
+    );
+    if take_overflow_repark(supervisor.slot().global_index) {
+        return supervisor.on_event(ConnEvent::OverflowProbeFailed, Instant::now());
+    }
+    SupervisorAction::Continue
+}
+
+/// Closes `socket`, handing every data frame read during the close handshake
+/// to `sink` (2026-10-02). The ONLY way the supervisor closes a socket: a
+/// close given a do-nothing callback would compile and silently restore the
+/// discard this replaced, so every close goes through here and a source pin
+/// (`every_production_close_passes_its_frames_to_the_sink`) holds it.
+async fn close_capturing<S, K>(socket: &mut S, sink: &K)
+where
+    S: DhanFeedSocket,
+    K: FrameSink + ?Sized,
+{
+    socket
+        .close(|frame| {
+            // The sink counts and reports its own refusals.
+            let _outcome = sink.accept(frame);
+        })
+        .await;
 }
 
 /// [`run_connection`] plus a channel that can change the LIVE subscription
@@ -4827,7 +6694,7 @@ where
     loop {
         match action {
             SupervisorAction::Park { reason } => {
-                socket.close().await;
+                close_capturing(&mut socket, &*sink).await;
                 // Parked for the session: the wire carries nothing from here.
                 publish_connection_instruments(&supervisor.slot(), 0);
                 // A park is PERMANENT — nothing re-dials this socket, and its
@@ -4838,9 +6705,11 @@ where
                 // operator asking "did any feed socket drop today?" got rows
                 // back, saw no live-feed rows, and read that as no drops
                 // rather than as not recorded.
-                sink.on_lifecycle(
+                sink.on_lifecycle_detail(
                     tickvault_common::ws_event_types::WsEventKind::Disconnected,
                     reason.as_str(),
+                    supervisor.last_disconnect_code(),
+                    guard_len_u32(&guard),
                 );
                 info!(
                     endpoint,
@@ -4850,7 +6719,21 @@ where
                     reconnects = supervisor.reconnects(),
                     "supervised Dhan connection parked"
                 );
-                return ConnectionExit::Parked(reason);
+                // D7 / 2026-10-02: a market-data socket (main feed, depth-20,
+                // depth-200) parked for 805 waits for its pool's overflow
+                // probe instead of ending, when the lane opted in. Every other
+                // reason, the order-update socket and every sink that did not
+                // opt in return exactly as before.
+                let probe_eligible = reason == ParkReason::PoolOverflow
+                    && OverflowEpisodeKind::for_endpoint(supervisor.slot().endpoint).is_some()
+                    && sink.overflow_probe_enabled();
+                if !probe_eligible {
+                    return ConnectionExit::Parked(reason);
+                }
+                match wait_for_overflow_grant(&mut supervisor, &*sink).await {
+                    Some(next) => action = next,
+                    None => return ConnectionExit::Parked(reason),
+                }
             }
 
             SupervisorAction::Continue => {
@@ -4859,42 +6742,65 @@ where
                 // every event and would otherwise spin here forever, so it is
                 // checked first; anything else re-enters the dial cycle.
                 if let Some(reason) = supervisor.park_reason() {
-                    socket.close().await;
+                    close_capturing(&mut socket, &*sink).await;
                     return ConnectionExit::Parked(reason);
                 }
                 action = supervisor.on_event(ConnEvent::BeginDial, Instant::now());
             }
 
             SupervisorAction::SleepThenDial { delay_ms } => {
-                socket.close().await;
+                close_capturing(&mut socket, &*sink).await;
                 guard.mark_lost();
                 // `mark_lost` is the honest edge: the subscription is gone and
                 // will have to be re-sent. Recorded BEFORE the sleep so the
                 // row's timestamp is the moment we lost the socket, not the
                 // moment we got around to re-dialing.
-                sink.on_lifecycle(
+                sink.on_lifecycle_detail(
                     tickvault_common::ws_event_types::WsEventKind::Disconnected,
                     supervisor.last_redial_reason().as_str(),
+                    supervisor.last_disconnect_code(),
+                    guard_len_u32(&guard),
                 );
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                sleep_unless_stopped(Duration::from_millis(delay_ms), &*sink).await;
                 action = supervisor.on_event(ConnEvent::BeginDial, Instant::now());
             }
 
             SupervisorAction::RefreshTokenThenDial { delay_ms } => {
-                socket.close().await;
+                close_capturing(&mut socket, &*sink).await;
                 guard.mark_lost();
-                sink.on_lifecycle(
+                sink.on_lifecycle_detail(
                     tickvault_common::ws_event_types::WsEventKind::Disconnected,
                     supervisor.last_redial_reason().as_str(),
+                    supervisor.last_disconnect_code(),
+                    guard_len_u32(&guard),
                 );
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                refresh_token().await;
+                sleep_unless_stopped(Duration::from_millis(delay_ms), &*sink).await;
+                // No credential round trip for a socket that is about to park.
+                if !sink.stop_requested() {
+                    refresh_token().await;
+                }
                 action = supervisor.on_event(ConnEvent::BeginDial, Instant::now());
             }
 
             SupervisorAction::Dial => {
                 // Nothing is on the wire until this dial's subscribe is acked.
                 publish_connection_instruments(&supervisor.slot(), 0);
+                // Z11d: a socket asked to stop never opens. Every dial path
+                // (first dial, every reconnect, the lock-refusal poll below)
+                // passes here, so this one check is what stops them all.
+                if sink.stop_requested() {
+                    action = supervisor.on_event(ConnEvent::ShutdownRequested, Instant::now());
+                    continue;
+                }
+                // D7: a probe that failed while this socket was between dials
+                // (no frame in time, or its window saw an 805 or a bare reset)
+                // re-parks it here instead of opening one more connection into
+                // an account that is over its budget.
+                let probe_action = overflow_probe_tick(&mut supervisor, &*sink);
+                if probe_action != SupervisorAction::Continue {
+                    action = probe_action;
+                    continue;
+                }
                 // 2026-10-01, R7: a process that no longer holds the
                 // dual-instance lock must not OPEN a socket — every dial
                 // (first dial, reconnect, 807 re-dial, rotate, ghost redial)
@@ -4928,7 +6834,7 @@ where
                              restart it to recover)"
                         );
                     }
-                    tokio::time::sleep(Duration::from_millis(DIAL_PERMIT_POLL_MS)).await;
+                    sleep_unless_stopped(Duration::from_millis(DIAL_PERMIT_POLL_MS), &*sink).await;
                     continue;
                 }
                 if dial_refusal_reported {
@@ -5002,9 +6908,11 @@ where
                 // time would have recorded twelve connections that never
                 // carried a byte. This edge is the first moment the socket can
                 // actually deliver.
-                sink.on_lifecycle(
+                sink.on_lifecycle_detail(
                     tickvault_common::ws_event_types::WsEventKind::Connected,
                     "subscribe_acked",
+                    None,
+                    guard_len_u32(&guard),
                 );
                 action = supervisor.on_event(ConnEvent::SubscribeAcked, Instant::now());
                 // Drain until something changes.
@@ -5384,6 +7292,14 @@ where
     let mut last_client_ping = Instant::now();
 
     while action == SupervisorAction::Continue {
+        // Z11d: the process asked this socket to close. One O(1) atomic load
+        // per iteration, no allocation; when idle the 1 s ticker below bounds
+        // how long it takes to be seen. Returning the park decision hands the
+        // close to the caller's `close_capturing`, so frames read during the
+        // close handshake still reach the WAL.
+        if sink.stop_requested() {
+            return supervisor.on_event(ConnEvent::ShutdownRequested, Instant::now());
+        }
         // Top-up check, BEFORE the select and deliberately not an arm of it.
         //
         // It was a select arm first. That is wrong, and the fake transport
@@ -5443,73 +7359,29 @@ where
                             // would pass every test and only ever fire in
                             // production, which is the worst of both.
                             let deadline = tokio::time::Instant::now() + TOPUP_WIRE_BUDGET;
-                            let mut sent = 0usize;
-                            let mut failed = false;
-                            let mut budget_exhausted = false;
+                            // The paced, bounded write loop is shared with the in-place
+                            // `Resubscribe` (scope lock 2026-10-02): one engine for every
+                            // change made on a live socket.
+                            let run = write_batches_in_place(
+                                socket,
+                                supervisor,
+                                sink,
+                                throttle,
+                                InPlaceLeg::Subscribe,
+                                guard.batches_from(start),
+                                deadline,
+                            )
+                            .await;
+                            let sent = run.sent;
+                            let budget_exhausted = run.budget_exhausted;
                             // Set when a socket event read in a pacing gap
                             // decided this socket's fate (a `Closed`). Handled
                             // exactly like a failed send: the guard keeps the
                             // whole set and the reconnect replay delivers it.
-                            let mut interrupted_by_socket = false;
-                            for batch in guard.batches_from(start) {
-                                if tokio::time::Instant::now() >= deadline {
-                                    budget_exhausted = true;
-                                    break;
-                                }
-                                // The write is awaited BESIDE `recv()`
-                                // (2026-09-22, plan item 44f), under the
-                                // same per-message budget as before.
-                                let ticket = socket.send_subscribe(batch);
-                                let wait = await_write(
-                                    socket,
-                                    supervisor,
-                                    sink,
-                                    throttle,
-                                    ticket,
-                                    Some(tokio::time::Instant::now() + SWAP_WIRE_BUDGET),
-                                )
-                                .await;
-                                if let Some(decided) = wait.socket_decision {
-                                    action = decided;
-                                    interrupted_by_socket = true;
-                                    failed = true;
-                                    break;
-                                }
-                                match wait.outcome {
-                                    Ok(Ok(())) => sent += batch.len(),
-                                    // A per-message timeout is a SICK SOCKET,
-                                    // not a failed send: treating it as the
-                                    // budget case keeps the guard truthful and
-                                    // lets the reconnect ladder do its job.
-                                    Err(WireElapsed) => {
-                                        budget_exhausted = true;
-                                        break;
-                                    }
-                                    Ok(Err(_)) => {
-                                        failed = true;
-                                        break;
-                                    }
-                                }
-                                // THE PACING GAP READS THE SOCKET (2026-09-22,
-                                // scope lock "2026-09-22 (FOURTH)" item 6).
-                                // Until then this was a bare 25 ms sleep, so a
-                                // 42-message top-up held the reader off
-                                // `recv()` for ~1 s of pacing alone — on the
-                                // main-feed socket, the busiest one we have.
-                                // The gap still paces the NEXT send exactly as
-                                // before; it now spends the wait draining
-                                // frames through the same handler the select
-                                // arm uses. Bounds: see `read_until`.
-                                let resume_at =
-                                    tokio::time::Instant::now() + SUBSCRIBE_BATCH_INTERVAL;
-                                if let Some(decided) =
-                                    read_until(socket, supervisor, sink, throttle, resume_at).await
-                                {
-                                    action = decided;
-                                    interrupted_by_socket = true;
-                                    failed = true;
-                                    break;
-                                }
+                            let interrupted_by_socket = run.decided.is_some();
+                            let failed = run.failed;
+                            if let Some(decided) = run.decided {
+                                action = decided;
                             }
                             if budget_exhausted {
                                 // Keep the guard honest: it is the reconnect
@@ -5611,6 +7483,25 @@ where
                             // Nothing to do and nothing lost.
                         }
                     }
+                }
+                Ok(LiveSubscriptionCommand::Resubscribe {
+                    unsubscribe,
+                    subscribe,
+                    ack,
+                }) => {
+                    // In place on any socket kind (scope lock 2026-10-02):
+                    // unsubscribe, then subscribe, on this open socket.
+                    action = apply_resubscribe(
+                        socket,
+                        supervisor,
+                        sink,
+                        throttle,
+                        guard,
+                        unsubscribe,
+                        subscribe,
+                        ack,
+                    )
+                    .await;
                 }
                 Ok(LiveSubscriptionCommand::Swap { old, new, ack }) => {
                     // THE 805 BREAKER, checked again where the write happens (scope
@@ -6450,6 +8341,13 @@ where
                         action = supervisor.on_event(ConnEvent::ProbeCloseRequested, Instant::now());
                     }
                 }
+                // D7 / 2026-10-02: the overflow probe, on the same tick. A quiet
+                // process pays one atomic load. A failed probe re-parks the
+                // probed socket here; every other socket only advances the
+                // episode timers.
+                if action == SupervisorAction::Continue {
+                    action = overflow_probe_tick(supervisor, sink);
+                }
             }
             // The keepalive ping's answer, polled IN the select so the read
             // arm above keeps running while the ping is on the wire (plan
@@ -6504,8 +8402,22 @@ where
         }
         SocketEvent::Frame(frame) => {
             // Two operations. That is the whole loop body.
+            let accept_started = Instant::now();
             let outcome = sink.accept(frame);
-            action = supervisor.on_event(ConnEvent::FrameReceived, Instant::now());
+            let accepted = Instant::now();
+            // Live proof the reader never waits (2026-10-02): the accept's
+            // own duration, and a heartbeat. Five relaxed atomics, no
+            // allocation; `accepted` is reused below, so the per-frame cost is
+            // ONE extra clock read.
+            tickvault_storage::hot_path_telemetry::record_stage(
+                tickvault_storage::hot_path_telemetry::Stage::SocketToWal,
+                accepted.saturating_duration_since(accept_started),
+            );
+            tickvault_storage::hot_path_telemetry::beat_at(
+                tickvault_storage::hot_path_telemetry::HotTask::WsReader,
+                accepted,
+            );
+            action = supervisor.on_event(ConnEvent::FrameReceived, accepted);
             if outcome == FrameSinkOutcome::WalDropped {
                 // Loud, but the reader does NOT stop draining:
                 // stopping would cost the pong and turn one lost
@@ -6649,7 +8561,8 @@ mod tests {
     /// reads as a stale count during the ones it skips — a parked socket
     /// still "holding 50" is the false-OK class. This pins every place the
     /// held set can change: the confirmed subscribe, the top-up success arm,
-    /// the dial (nothing held yet) and the park (nothing held any more).
+    /// the in-place resubscribe's three endings that keep the socket, the dial
+    /// (nothing held yet) and the park (nothing held any more).
     #[test]
     fn publish_connection_instruments_is_called_at_every_held_set_transition() {
         let src = include_str!("pool_supervisor.rs");
@@ -6683,8 +8596,10 @@ mod tests {
             })
             .count();
         assert_eq!(
-            sized, 2,
-            "the confirmed subscribe and the top-up arm must publish the live held count"
+            sized, 5,
+            "the confirmed subscribe, the top-up arm and the in-place resubscribe (applied, \
+             stopped in its unsubscribe leg, stopped in its subscribe leg) must publish the \
+             live held count"
         );
         assert!(
             src.contains("CONN_INSTRUMENTS_HELD_GAUGE: &str = \"tv_dhan_ws_conn_instruments\""),
@@ -9607,7 +11522,11 @@ mod tests {
             async fn recv(&mut self) -> SocketEvent {
                 SocketEvent::Closed { code: None }
             }
-            async fn close(&mut self) {}
+            async fn close<F>(&mut self, _on_frame: F)
+            where
+                F: FnMut(Bytes) + Send,
+            {
+            }
         }
         assert_eq!(Silent.last_dial_failure_reason(), "unknown");
     }
@@ -9651,6 +11570,47 @@ mod tests {
             published.received_at >= before && published.received_at <= after,
             "the receipt stamp must be taken inside accept() — it fell outside the \
              bracket taken around the call, so it was not stamped at receipt"
+        );
+        assert!(
+            published.wal_backed,
+            "a frame the WAL accepted must say so, or the drain stops shedding it"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 2026-10-02: a frame the WAL REFUSED still reaches the ring
+    /// (`CapturedLiveOnly`), and must arrive marked `wal_backed == false` —
+    /// otherwise the drain sheds its depth as a "deferral" and lets a busy
+    /// rescue drop its rows "to the WAL", neither of which a replay can honour.
+    #[test]
+    fn test_wal_ring_sink_marks_a_wal_refused_frame_unbacked() {
+        let dir = wal_dir("unbacked");
+        let spill = std::sync::Arc::new(
+            WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
+        );
+        // A stopped writer refuses every later append: the closest real
+        // reproduction of a WAL that cannot take the frame.
+        let _ = spill.shutdown(std::time::Duration::from_secs(5));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<CapturedFrame>(4);
+        let sink = WalRingSink::new(
+            std::sync::Arc::clone(&spill),
+            tx,
+            std::sync::Arc::new(RingByteBudget::new(usize::MAX)),
+            WsType::LiveFeed,
+            DhanEndpointType::MainFeed,
+            0,
+        );
+
+        assert_eq!(
+            sink.accept(Bytes::from_static(&[2u8, 16, 0, 0, 0, 0, 0, 0])),
+            FrameSinkOutcome::CapturedLiveOnly,
+            "a WAL refusal must still reach the ring"
+        );
+        let published = rx.try_recv().expect("the frame must still be published");
+        assert!(
+            !published.wal_backed,
+            "a frame the WAL refused must be marked unbacked"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -10018,33 +11978,6 @@ mod tests {
     }
 
     #[test]
-    fn test_pool_supervisor_poll_all_returns_only_the_expired_connections() {
-        let now = t0();
-        let mut pool = PoolSupervisor::new();
-        for _ in 0..3 {
-            let _ = pool.admit(DhanEndpointType::MainFeed, now);
-        }
-        // Drive two of them live; leave the third idle (never dialed).
-        for gi in [0u8, 1] {
-            if let Some(c) = pool.connection_mut(gi) {
-                let _ = c.on_event(ConnEvent::BeginDial, now);
-                let _ = c.on_event(ConnEvent::DialSucceeded, now);
-                let _ = c.on_event(ConnEvent::SubscribeAcked, now);
-            }
-        }
-        assert!(pool.poll_all(now).is_empty(), "nothing is idle yet");
-
-        let later = now + Duration::from_secs(60);
-        let due = pool.poll_all(later);
-        assert_eq!(due.len(), 2, "only the two live connections time out");
-        for (s, a) in &due {
-            assert_eq!(s.endpoint, DhanEndpointType::MainFeed);
-            assert!(matches!(a, SupervisorAction::SleepThenDial { .. }));
-        }
-        assert_eq!(pool.connections().len(), 3);
-    }
-
-    #[test]
     fn test_pool_supervisor_retire_frees_the_budget_slot() {
         let now = t0();
         let mut pool = PoolSupervisor::default();
@@ -10219,6 +12152,14 @@ mod tests {
         /// Submits (`kind>`) and answers (`<kind`) of DELAYED writes in the
         /// order they happened, so a test can prove two writes never overlap.
         write_log: Vec<&'static str>,
+        /// Frames the next `close` reads during its handshake and hands to
+        /// the caller, as the production close does (2026-10-02).
+        close_frames: Vec<Bytes>,
+        /// Every security id handed to `send_unsubscribe`, in order.
+        unsubscribed_ids: Vec<u64>,
+        /// `(kind, instruments)` per (un)subscribe message, in order — what
+        /// the in-place tests read to prove the 100-per-message split.
+        batch_sizes: Vec<(&'static str, usize)>,
     }
 
     struct FakeSocket {
@@ -10246,10 +12187,13 @@ mod tests {
             self.state.lock().map(|s| s.write_generation).unwrap_or(0)
         }
 
-        fn send_unsubscribe(&mut self, _batch: &[SubscribeInstrument]) -> WriteTicket {
+        fn send_unsubscribe(&mut self, batch: &[SubscribeInstrument]) -> WriteTicket {
             let (ok, delay) = match self.state.lock() {
                 Ok(mut s) => {
                     s.unsubscribes += 1;
+                    s.unsubscribed_ids
+                        .extend(batch.iter().map(|i| i.security_id));
+                    s.batch_sizes.push(("unsubscribe", batch.len()));
                     s.wire_calls.push("unsubscribe");
                     (
                         s.unsubscribe_results.pop_front().unwrap_or(true),
@@ -10277,6 +12221,7 @@ mod tests {
                 Ok(mut s) => {
                     s.subscribes += 1;
                     s.subscribed_ids.extend(batch.iter().map(|i| i.security_id));
+                    s.batch_sizes.push(("subscribe", batch.len()));
                     s.wire_calls.push("subscribe");
                     s.timeline.push("subscribe");
                     (
@@ -10360,11 +12305,22 @@ mod tests {
             }
         }
 
-        fn close(&mut self) -> impl std::future::Future<Output = ()> + Send {
+        fn close<F>(&mut self, mut on_frame: F) -> impl std::future::Future<Output = ()> + Send
+        where
+            F: FnMut(Bytes) + Send,
+        {
             let state = std::sync::Arc::clone(&self.state);
             async move {
-                if let Ok(mut s) = state.lock() {
-                    s.closes += 1;
+                let drained = match state.lock() {
+                    Ok(mut s) => {
+                        s.closes += 1;
+                        s.batch_sizes.push(("close", 0));
+                        std::mem::take(&mut s.close_frames)
+                    }
+                    Err(_) => Vec::new(),
+                };
+                for frame in drained {
+                    on_frame(frame);
                 }
             }
         }
@@ -11346,7 +13302,11 @@ mod tests {
                     }
                 }
             }
-            async fn close(&mut self) {}
+            async fn close<F>(&mut self, _on_frame: F)
+            where
+                F: FnMut(Bytes) + Send,
+            {
+            }
         }
 
         let st = std::sync::Arc::new(Mutex::new(FakeState {
@@ -12057,6 +14017,584 @@ mod tests {
         assert_eq!(sink.accepted.lock().map(|g| g.len()).unwrap_or(0), 1);
     }
 
+    // ------------------------------------------------------------------
+    // In-place resubscribe on every socket kind (scope lock 2026-10-02)
+    // ------------------------------------------------------------------
+
+    fn ids(v: &[SubscribeInstrument]) -> Vec<u64> {
+        v.iter().map(|i| i.security_id).collect()
+    }
+
+    fn held_ids(g: &SubscribeGuard) -> Vec<u64> {
+        g.batches().flatten().map(|i| i.security_id).collect()
+    }
+
+    #[test]
+    fn test_try_resubscribe_removes_first_then_appends_the_new_tail() {
+        let mut g = SubscribeGuard::try_new(DhanEndpointType::MainFeed, instruments(10))
+            .expect("inside cap");
+        let plan = g
+            .try_resubscribe(&instruments(3), instruments_from(10, 2))
+            .expect("holds every unsubscribe");
+        assert_eq!(ids(&plan.removed), vec![0, 1, 2]);
+        assert_eq!(
+            plan.subscribe_from, 7,
+            "the new tail starts after the 7 kept"
+        );
+        assert_eq!(held_ids(&g), (3..12).collect::<Vec<u64>>());
+    }
+
+    #[test]
+    fn test_try_resubscribe_refuses_an_unsubscribe_it_does_not_hold_and_changes_nothing() {
+        let mut g = SubscribeGuard::try_new(DhanEndpointType::MainFeed, instruments(5))
+            .expect("inside cap");
+        let refusal = g
+            .try_resubscribe(&[si(0), si(99)], instruments_from(10, 1))
+            .expect_err("99 is not held");
+        assert!(matches!(
+            refusal,
+            SubscribeGuardRefusal::NotSubscribed { .. }
+        ));
+        assert_eq!(
+            held_ids(&g),
+            vec![0, 1, 2, 3, 4],
+            "a refusal must not half-apply"
+        );
+    }
+
+    #[test]
+    fn test_try_resubscribe_keys_on_security_id_and_segment() {
+        // I-P1-11: the same numeric id in another segment is another instrument.
+        let idx = SubscribeInstrument {
+            security_id: 27,
+            segment: ExchangeSegment::IdxI,
+        };
+        let eq = SubscribeInstrument {
+            security_id: 27,
+            segment: ExchangeSegment::NseEquity,
+        };
+        let mut g =
+            SubscribeGuard::try_new(DhanEndpointType::MainFeed, vec![idx]).expect("inside cap");
+        assert!(g.try_resubscribe(&[eq], Vec::new()).is_err());
+        let plan = g.try_resubscribe(&[idx], vec![eq]).expect("idx is held");
+        assert_eq!(plan.removed, vec![idx]);
+        assert_eq!(g.batches().flatten().copied().collect::<Vec<_>>(), vec![eq]);
+    }
+
+    #[test]
+    fn test_try_resubscribe_refuses_past_each_socket_kinds_cap() {
+        for (endpoint, cap) in [
+            (DhanEndpointType::MainFeed, 5_000_usize),
+            (DhanEndpointType::Depth20, 50),
+            (DhanEndpointType::Depth200, 1),
+        ] {
+            let mut g = SubscribeGuard::try_new(endpoint, instruments(cap)).expect("at the cap");
+            let refusal = g
+                .try_resubscribe(&[], instruments_from(cap, 1))
+                .expect_err("one more than the cap");
+            assert!(
+                matches!(refusal, SubscribeGuardRefusal::TooManyInstruments { .. }),
+                "{endpoint:?}: {refusal:?}"
+            );
+            assert_eq!(
+                g.len(),
+                cap,
+                "{endpoint:?}: a refusal leaves the guard untouched"
+            );
+            // Swapping one out for one in stays at the cap and is allowed.
+            let plan = g
+                .try_resubscribe(&instruments(1), instruments_from(cap, 1))
+                .expect("one out, one in");
+            assert_eq!(plan.removed.len(), 1);
+            assert_eq!(g.len(), cap, "{endpoint:?}");
+        }
+    }
+
+    #[test]
+    fn test_try_resubscribe_same_instrument_on_both_lists_is_a_no_op() {
+        let mut g =
+            SubscribeGuard::try_new(DhanEndpointType::Depth20, instruments(3)).expect("inside cap");
+        let plan = g
+            .try_resubscribe(&instruments(1), instruments(1))
+            .expect("held");
+        assert!(plan.is_no_op(g.len()), "{plan:?}");
+        assert_eq!(held_ids(&g), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn test_put_back_restores_without_duplicating() {
+        let mut g = SubscribeGuard::try_new(DhanEndpointType::MainFeed, instruments(3))
+            .expect("inside cap");
+        let _ = g
+            .try_resubscribe(&instruments(2), Vec::new())
+            .expect("held");
+        assert_eq!(held_ids(&g), vec![2]);
+        g.put_back(&[si(0), si(1), si(2)]);
+        assert_eq!(held_ids(&g), vec![2, 0, 1], "2 is not added twice");
+    }
+
+    #[test]
+    fn test_inplace_change_blocked_by_805_gates_depth_only_and_only_when_halted() {
+        for endpoint in [DhanEndpointType::Depth20, DhanEndpointType::Depth200] {
+            assert!(inplace_change_blocked_by_805(endpoint, true));
+            assert!(!inplace_change_blocked_by_805(endpoint, false));
+        }
+        assert!(!inplace_change_blocked_by_805(
+            DhanEndpointType::MainFeed,
+            true
+        ));
+        assert!(!inplace_change_blocked_by_805(
+            DhanEndpointType::MainFeed,
+            false
+        ));
+    }
+
+    /// A slow reader: every pacing-gap read times out without consuming, so
+    /// the scripted events reach the drain only after the command finished.
+    fn quiet_reader() -> FakeState {
+        FakeState {
+            recv_delay: Some(Duration::from_millis(100)),
+            ..FakeState::default()
+        }
+    }
+
+    /// The writes made before the socket's FIRST close. A close may only
+    /// come at the end (the run's teardown, after the scripted events run
+    /// out); one between the change's writes would be a redial in disguise.
+    fn writes_before_close(s: &FakeState) -> Vec<(&'static str, usize)> {
+        let first_close = s.batch_sizes.iter().position(|b| b.0 == "close");
+        if let Some(at) = first_close {
+            assert!(
+                s.batch_sizes
+                    .get(at..)
+                    .into_iter()
+                    .flatten()
+                    .all(|b| b.0 == "close"),
+                "nothing may be written after a close: {:?}",
+                s.batch_sizes
+            );
+        }
+        s.batch_sizes
+            .get(..first_close.unwrap_or(s.batch_sizes.len()))
+            .map(<[_]>::to_vec)
+            .unwrap_or_default()
+    }
+
+    /// Runs ONE `Resubscribe` on a live connection over the fake socket.
+    async fn run_one_resubscribe(
+        endpoint: DhanEndpointType,
+        held: Vec<SubscribeInstrument>,
+        unsubscribe: Vec<SubscribeInstrument>,
+        subscribe: Vec<SubscribeInstrument>,
+        state: FakeState,
+    ) -> (
+        std::sync::Arc<Mutex<FakeState>>,
+        Option<ResubscribeOutcome>,
+        ConnectionExit,
+    ) {
+        let st = std::sync::Arc::new(Mutex::new(state));
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(endpoint, held).expect("inside cap");
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let (ack_tx, mut ack_rx) = tokio::sync::oneshot::channel();
+        tx.send(LiveSubscriptionCommand::Resubscribe {
+            unsubscribe,
+            subscribe,
+            ack: Some(ack_tx),
+        })
+        .await
+        .expect("channel open");
+        drop(tx);
+        let exit = run_connection_with_commands(
+            fake(&st),
+            sup(endpoint, 0, t0()),
+            guard,
+            sink,
+            || async {},
+            Some(rx),
+        )
+        .await;
+        (st, ack_rx.try_recv().ok(), exit)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_main_feed_resubscribe_unsubscribes_then_subscribes_in_place_in_batches_of_100() {
+        let (st, ack, _) = run_one_resubscribe(
+            DhanEndpointType::MainFeed,
+            instruments(250),
+            instruments(150),
+            instruments_from(250, 250),
+            quiet_reader(),
+        )
+        .await;
+        assert_eq!(ack, Some(ResubscribeOutcome::Applied));
+        let s = st.lock().expect("fake state");
+        assert_eq!(s.connects, 1, "an in-place change never redials");
+        assert_eq!(
+            writes_before_close(&s),
+            vec![
+                ("subscribe", 100),
+                ("subscribe", 100),
+                ("subscribe", 50),
+                ("unsubscribe", 100),
+                ("unsubscribe", 50),
+                ("subscribe", 100),
+                ("subscribe", 100),
+                ("subscribe", 50),
+            ],
+            "the 3-message dial, then every unsubscribe BEFORE any subscribe, split at 100"
+        );
+        assert_eq!(s.unsubscribed_ids, (0..150).collect::<Vec<u64>>());
+        assert_eq!(
+            s.subscribed_ids.get(250..).map(<[u64]>::to_vec),
+            Some((250..500).collect::<Vec<u64>>()),
+            "only the NEW instruments are subscribed, never a re-send of the kept 100"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_depth20_resubscribe_unsubscribes_then_subscribes_in_place() {
+        let (st, ack, _) = run_one_resubscribe(
+            DhanEndpointType::Depth20,
+            instruments(50),
+            instruments(10),
+            instruments_from(50, 10),
+            quiet_reader(),
+        )
+        .await;
+        assert_eq!(ack, Some(ResubscribeOutcome::Applied));
+        let s = st.lock().expect("fake state");
+        assert_eq!(s.connects, 1, "an in-place change never redials");
+        assert_eq!(
+            writes_before_close(&s),
+            vec![("subscribe", 50), ("unsubscribe", 10), ("subscribe", 10)],
+            "unsubscribe then subscribe on the same socket, no close between"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_depth200_resubscribe_changes_its_one_contract_in_place() {
+        let (st, ack, _) = run_one_resubscribe(
+            DhanEndpointType::Depth200,
+            vec![si(1)],
+            vec![si(1)],
+            vec![si(2)],
+            quiet_reader(),
+        )
+        .await;
+        assert_eq!(ack, Some(ResubscribeOutcome::Applied));
+        let s = st.lock().expect("fake state");
+        assert_eq!(s.connects, 1);
+        assert_eq!(s.wire_calls, vec!["subscribe", "unsubscribe", "subscribe"]);
+        assert_eq!(
+            writes_before_close(&s),
+            vec![("subscribe", 1), ("unsubscribe", 1), ("subscribe", 1)],
+            "the one contract changes on the same socket, no close between"
+        );
+        assert_eq!(s.unsubscribed_ids, vec![1]);
+        assert_eq!(s.subscribed_ids, vec![1, 2]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_resubscribe_past_the_cap_is_refused_and_sends_nothing() {
+        let (st, ack, _) = run_one_resubscribe(
+            DhanEndpointType::Depth20,
+            instruments(50),
+            Vec::new(),
+            instruments_from(50, 1),
+            quiet_reader(),
+        )
+        .await;
+        assert_eq!(
+            ack,
+            Some(ResubscribeOutcome::Refused {
+                reason: ResubscribeOutcome::REASON_OVER_CAP
+            })
+        );
+        let s = st.lock().expect("fake state");
+        assert_eq!(s.unsubscribes, 0);
+        assert_eq!(s.subscribes, 1, "only the dial's own subscribe");
+        assert_eq!(s.connects, 1);
+    }
+
+    /// A genuine reconnect AFTER an in-place change replays the NEW set.
+    #[tokio::test(start_paused = true)]
+    async fn a_reconnect_after_an_in_place_change_replays_the_new_set() {
+        let state = FakeState {
+            // The close arrives after the dial (1 message) and the change's
+            // subscribe (1 message); the terminator after the replay (1).
+            recv_events: VecDeque::from(vec![SocketEvent::Closed { code: None }]),
+            recv_after_subscribes: VecDeque::from(vec![2]),
+            terminator_after_subscribes: 3,
+            ..quiet_reader()
+        };
+        let (st, ack, exit) = run_one_resubscribe(
+            DhanEndpointType::MainFeed,
+            instruments(3),
+            instruments(2),
+            instruments_from(10, 2),
+            state,
+        )
+        .await;
+        assert_eq!(ack, Some(ResubscribeOutcome::Applied));
+        assert_eq!(exit, ConnectionExit::Parked(ParkReason::FatalDisconnect));
+        let s = st.lock().expect("fake state");
+        assert_eq!(s.connects, 2, "the genuine close redials");
+        assert_eq!(
+            s.subscribed_ids.get(5..).map(<[u64]>::to_vec),
+            Some(vec![2, 10, 11]),
+            "the replay carries the set after the change, never the removed 0 and 1"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_resubscribe_whose_first_unsubscribe_is_refused_sends_no_subscribe() {
+        let state = FakeState {
+            unsubscribe_results: VecDeque::from(vec![false]),
+            ..quiet_reader()
+        };
+        let (st, ack, _) = run_one_resubscribe(
+            DhanEndpointType::MainFeed,
+            instruments(5),
+            instruments(2),
+            instruments_from(10, 2),
+            state,
+        )
+        .await;
+        assert_eq!(
+            ack,
+            Some(ResubscribeOutcome::Stopped {
+                not_unsubscribed: instruments(2),
+                not_subscribed: instruments_from(10, 2),
+            })
+        );
+        let s = st.lock().expect("fake state");
+        assert_eq!(
+            s.subscribes, 1,
+            "never subscribe after an unsubscribe that did not land"
+        );
+        assert_eq!(s.connects, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_resubscribe_whose_subscribe_stops_part_way_hands_the_rest_back() {
+        let state = FakeState {
+            // dial (3 messages) ok, then the change's 2nd subscribe fails.
+            subscribe_results: VecDeque::from(vec![true, true, true, true, false]),
+            ..quiet_reader()
+        };
+        let (st, ack, _) = run_one_resubscribe(
+            DhanEndpointType::MainFeed,
+            instruments(250),
+            instruments(50),
+            instruments_from(250, 300),
+            state,
+        )
+        .await;
+        assert_eq!(
+            ack,
+            Some(ResubscribeOutcome::Stopped {
+                not_unsubscribed: Vec::new(),
+                not_subscribed: instruments_from(350, 200),
+            })
+        );
+        let s = st.lock().expect("fake state");
+        assert_eq!(
+            s.connects, 1,
+            "a socket still carrying data is not torn down"
+        );
+        assert_eq!(s.subscribes, 5, "nothing is sent after the failed message");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_resubscribe_that_leaves_the_socket_empty_redials_with_the_new_set() {
+        let state = FakeState {
+            // dial ok, the change's subscribe fails, the replay succeeds.
+            subscribe_results: VecDeque::from(vec![true, false, true]),
+            terminator_after_subscribes: 3,
+            ..quiet_reader()
+        };
+        let (st, ack, _) = run_one_resubscribe(
+            DhanEndpointType::Depth200,
+            vec![si(1)],
+            vec![si(1)],
+            vec![si(2)],
+            state,
+        )
+        .await;
+        assert_eq!(ack, Some(ResubscribeOutcome::ReplayPending));
+        let s = st.lock().expect("fake state");
+        assert_eq!(s.connects, 2, "an emptied socket redials");
+        assert_eq!(
+            s.subscribed_ids,
+            vec![1, 2, 2],
+            "and the replay lands the new contract"
+        );
+    }
+
+    /// Only the counters a scoped recorder sees: the refusal is COUNTED.
+    #[derive(Clone, Default)]
+    struct InPlaceCounters {
+        counts: std::sync::Arc<Mutex<std::collections::HashMap<String, u64>>>,
+    }
+
+    struct InPlaceCounter {
+        key: String,
+        counts: std::sync::Arc<Mutex<std::collections::HashMap<String, u64>>>,
+    }
+
+    impl metrics::CounterFn for InPlaceCounter {
+        fn increment(&self, value: u64) {
+            if let Ok(mut m) = self.counts.lock() {
+                *m.entry(self.key.clone()).or_insert(0) += value;
+            }
+        }
+        fn absolute(&self, value: u64) {
+            if let Ok(mut m) = self.counts.lock() {
+                m.insert(self.key.clone(), value);
+            }
+        }
+    }
+
+    impl metrics::Recorder for InPlaceCounters {
+        fn describe_counter(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_gauge(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_histogram(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn register_counter(
+            &self,
+            key: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            let mut rendered = key.name().to_string();
+            for label in key.labels() {
+                rendered.push_str(&format!(",{}={}", label.key(), label.value()));
+            }
+            metrics::Counter::from_arc(std::sync::Arc::new(InPlaceCounter {
+                key: rendered,
+                counts: std::sync::Arc::clone(&self.counts),
+            }))
+        }
+        fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            metrics::Gauge::noop()
+        }
+        fn register_histogram(
+            &self,
+            _: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
+    #[test]
+    fn test_a_refused_over_cap_resubscribe_is_counted_per_endpoint() {
+        let recorder = InPlaceCounters::default();
+        metrics::with_local_recorder(&recorder, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .start_paused(true)
+                .build()
+                .expect("runtime");
+            let (_, ack, _) = runtime.block_on(run_one_resubscribe(
+                DhanEndpointType::MainFeed,
+                instruments(5_000),
+                Vec::new(),
+                instruments_from(5_000, 1),
+                quiet_reader(),
+            ));
+            assert_eq!(
+                ack,
+                Some(ResubscribeOutcome::Refused {
+                    reason: ResubscribeOutcome::REASON_OVER_CAP
+                })
+            );
+        });
+        let key = format!("{INPLACE_CHANGE_METRIC},endpoint=main_feed,outcome=refused_over_cap");
+        let counted = recorder
+            .counts
+            .lock()
+            .map(|m| m.get(&key).copied().unwrap_or(0))
+            .unwrap_or(0);
+        assert_eq!(counted, 1, "a cap refusal must be counted: {key}");
+    }
+
+    /// RATCHET: no deliberate close-and-redial remains for a subscription
+    /// change (scope lock 2026-10-01, extended to every socket kind on
+    /// 2026-10-02). The only deliberate redial reasons left are the
+    /// operator-armed probe (a measurement, off) and the main-feed 805
+    /// recovery probe (a fault recovery).
+    #[test]
+    fn no_deliberate_redial_remains_for_a_subscription_change() {
+        let src = include_str!("pool_supervisor.rs");
+        let prod = src.split(concat!("#[cfg(", "test)]")).next().unwrap_or(src);
+        for gone in [
+            concat!("RotateBy", "Redial"),
+            concat!("Ranked", "Rotation"),
+            concat!("Ghost", "Instrument"),
+            concat!("request_ghost", "_redial"),
+            concat!("Rotation", "Requested"),
+        ] {
+            assert!(!prod.contains(gone), "{gone} is back in production code");
+        }
+        let labels: Vec<&str> = ReconnectReason::ALL.iter().map(|r| r.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "dial_failed",
+                "subscribe_failed",
+                "disconnected",
+                "token_stale",
+                "idle_silence",
+                "probe_close",
+                "overflow_probe",
+            ],
+            "a new redial reason needs a dated quote in the scope lock first"
+        );
+        // The in-place engine: unsubscribe leg before subscribe leg, and the
+        // only supervisor event it raises is the emptied-socket fault redial.
+        let at = prod
+            .find("async fn apply_resubscribe")
+            .expect("the in-place engine");
+        let body = &prod[at..];
+        let body = &body[..body.find("\n}\n").unwrap_or(body.len())];
+        let unsub = body
+            .find("InPlaceLeg::Unsubscribe,")
+            .expect("unsubscribe leg");
+        let sub = body.find("InPlaceLeg::Subscribe,").expect("subscribe leg");
+        assert!(unsub < sub, "the unsubscribe leg must be written first");
+        assert_eq!(body.matches("supervisor.on_event(").count(), 1);
+        assert!(body.contains("supervisor.on_event(ConnEvent::SubscribeFailed"));
+        assert!(
+            !body.contains(".close("),
+            "an in-place change never closes the socket"
+        );
+        assert!(
+            body.contains("inplace_change_blocked_by_805(endpoint, rotation_halted())"),
+            "the 805 breaker is checked where the write happens"
+        );
+        // Both the Extend and the Resubscribe arms run the one wire engine:
+        // one Extend call plus the two Resubscribe legs.
+        assert_eq!(prod.matches("write_batches_in_place(").count(), 3);
+    }
+
     /// The per-gap cap bounds a socket that is NEVER pending. Under a paused
     /// clock time cannot advance past the gap while events keep arriving
     /// ready, so without the cap this test would spin forever inside one gap.
@@ -12210,6 +14748,67 @@ mod tests {
         assert_eq!(
             s.connects, 1,
             "805 must never be retried — a retry kills a healthy sibling"
+        );
+    }
+
+    /// 2026-10-02 (zero-loss audit): a data frame Dhan delivers while our
+    /// close handshake completes reaches the sink. Before, the production close
+    /// read and DISCARDED it, with no count, on every redial and every park.
+    #[tokio::test(start_paused = true)]
+    async fn test_regression_frames_read_during_close_reach_the_sink() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: VecDeque::from(vec![SocketEvent::Closed {
+                code: Some(DisconnectCode::ExceededActiveConnections),
+            }]),
+            close_frames: vec![
+                Bytes::from_static(b"late-tick-1"),
+                Bytes::from_static(b"late-tick-2"),
+            ],
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::MainFeed, instruments(10))
+            .expect("inside cap");
+
+        let exit = run_connection(
+            fake(&st),
+            sup(DhanEndpointType::MainFeed, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+        )
+        .await;
+
+        assert_eq!(exit, ConnectionExit::Parked(ParkReason::PoolOverflow));
+        let accepted = sink.accepted.lock().expect("sink");
+        assert_eq!(
+            accepted.as_slice(),
+            &[
+                Bytes::from_static(b"late-tick-1"),
+                Bytes::from_static(b"late-tick-2")
+            ],
+            "every frame drained by the close must be handed to the sink, in order"
+        );
+    }
+
+    /// Every production close goes through `close_capturing`, so no close can
+    /// be given a do-nothing callback and silently discard frames again.
+    #[test]
+    fn every_production_close_passes_its_frames_to_the_sink() {
+        let src = include_str!("pool_supervisor.rs");
+        let marker = concat!("#[cfg(", "test)]");
+        let production = src.split(marker).next().unwrap_or(src);
+        assert!(
+            production
+                .matches("close_capturing(&mut socket, &*sink)")
+                .count()
+                >= 4,
+            "every redial and park arm must close through close_capturing"
+        );
+        let bare_closes = production.matches(".close(|").count();
+        assert_eq!(
+            bare_closes, 1,
+            "the only direct close is the one inside close_capturing"
         );
     }
 
@@ -14061,5 +16660,1331 @@ mod tests {
                 < arm.find("self.ever_delivered = true;").unwrap_or(0),
             "the flag must be read BEFORE it is set, or every dial reads as a re-dial"
         );
+    }
+
+    // -- Z11d: the process can close its sockets before the WAL stops ----------
+
+    /// Records frames like [`RecordingSink`] and answers `stop_requested`
+    /// from its own flag, so parallel tests never share a stop.
+    #[derive(Default)]
+    struct StopSink {
+        accepted: Mutex<Vec<Bytes>>,
+        stop: std::sync::atomic::AtomicBool,
+    }
+
+    impl FrameSink for StopSink {
+        fn accept(&self, frame: Bytes) -> FrameSinkOutcome {
+            if let Ok(mut g) = self.accepted.lock() {
+                g.push(frame);
+            }
+            FrameSinkOutcome::Captured
+        }
+
+        fn stop_requested(&self) -> bool {
+            self.stop.load(std::sync::atomic::Ordering::Acquire)
+        }
+    }
+
+    /// The pin for Z11d: a live socket used to take no stop signal at all,
+    /// so it kept appending to the WAL after `main` shut the writer down.
+    /// Asked to stop, it now parks with `Shutdown`, and the frames read
+    /// during its close handshake still reach the sink.
+    #[tokio::test(start_paused = true)]
+    async fn test_regression_run_connection_parks_with_shutdown_and_captures_close_frames() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: one_scripted_frame(),
+            idle_when_exhausted: true,
+            close_frames: vec![Bytes::from_static(b"close-tick")],
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(StopSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::MainFeed, instruments(10))
+            .expect("inside cap");
+        let task = tokio::spawn(run_connection(
+            fake(&st),
+            sup(DhanEndpointType::MainFeed, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+        ));
+        // Live and idle: both scripted frames drained, then the reader waits.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            !task.is_finished(),
+            "an idle live socket does not end on its own"
+        );
+        sink.stop.store(true, std::sync::atomic::Ordering::Release);
+        let exit = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("a stopped socket must park within the idle poll, not run on")
+            .expect("task");
+        assert_eq!(exit, ConnectionExit::Parked(ParkReason::Shutdown));
+        let accepted = sink.accepted.lock().expect("sink");
+        assert_eq!(
+            accepted.last(),
+            Some(&Bytes::from_static(b"close-tick")),
+            "the close handshake's frame reaches the sink"
+        );
+        assert_eq!(accepted.len(), 3, "two live frames, then the close frame");
+        let s = st.lock().expect("fake state");
+        assert_eq!(s.connects, 1, "a stopping socket never re-dials");
+        assert_eq!(s.closes, 1);
+    }
+
+    /// A stop that lands in a long backoff sleep ends it within one idle
+    /// poll, and the socket parks without dialing again.
+    #[tokio::test(start_paused = true)]
+    async fn test_stop_during_backoff_returns_without_dialing() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            connect_results: VecDeque::from(vec![false; 64]),
+            ..FakeState::default()
+        }));
+        let sink = std::sync::Arc::new(StopSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::MainFeed, instruments(10))
+            .expect("inside cap");
+        let task = tokio::spawn(run_connection(
+            fake(&st),
+            sup(DhanEndpointType::MainFeed, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+        ));
+        // 0 + 1 s + 2 s + 5 s of ladder (plus jitter) puts t = 10 s inside
+        // the 15 s step.
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let dials_at_stop = st.lock().expect("fake state").connects;
+        assert!(dials_at_stop >= 2, "the ladder must have been climbing");
+        let stopped_at = tokio::time::Instant::now();
+        sink.stop.store(true, std::sync::atomic::Ordering::Release);
+        let exit = tokio::time::timeout(Duration::from_secs(60), task)
+            .await
+            .expect("a stopped socket must not stay in backoff forever")
+            .expect("task");
+        assert_eq!(exit, ConnectionExit::Parked(ParkReason::Shutdown));
+        assert!(
+            stopped_at.elapsed() <= IDLE_POLL_INTERVAL,
+            "the backoff sleep must end within one idle poll, took {:?}",
+            stopped_at.elapsed()
+        );
+        assert_eq!(
+            st.lock().expect("fake state").connects,
+            dials_at_stop,
+            "no dial after the stop"
+        );
+    }
+
+    /// A socket asked to stop before its first dial never opens.
+    #[tokio::test(start_paused = true)]
+    async fn a_socket_stopped_before_its_first_dial_never_dials() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState::default()));
+        let sink = std::sync::Arc::new(StopSink::default());
+        sink.stop.store(true, std::sync::atomic::Ordering::Release);
+        let guard = SubscribeGuard::try_new(DhanEndpointType::MainFeed, instruments(10))
+            .expect("inside cap");
+        let exit = run_connection(
+            fake(&st),
+            sup(DhanEndpointType::MainFeed, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            || async {},
+        )
+        .await;
+        assert_eq!(exit, ConnectionExit::Parked(ParkReason::Shutdown));
+        assert_eq!(st.lock().expect("fake state").connects, 0);
+    }
+
+    /// `SocketStop` is a one-way latch, and a `WalRingSink` follows it only
+    /// when wired; the trait default never stops.
+    #[test]
+    fn test_socket_stop_request_is_requested_latches_and_with_socket_stop_wires_the_sink() {
+        let stop: &'static SocketStop = Box::leak(Box::new(SocketStop::new()));
+        assert!(!stop.is_requested());
+        stop.request();
+        stop.request();
+        assert!(
+            stop.is_requested(),
+            "idempotent, and there is no un-request"
+        );
+        assert!(!SocketStop::default().is_requested());
+
+        let dir = wal_dir("socket-stop");
+        let spill = std::sync::Arc::new(
+            WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel::<CapturedFrame>(4);
+        let build = || {
+            WalRingSink::new(
+                std::sync::Arc::clone(&spill),
+                tx.clone(),
+                std::sync::Arc::new(RingByteBudget::new(usize::MAX)),
+                WsType::LiveFeed,
+                DhanEndpointType::MainFeed,
+                0,
+            )
+        };
+        assert!(!build().stop_requested(), "unwired sinks never stop");
+        assert!(build().with_socket_stop(stop).stop_requested());
+        assert!(!RecordingSink::default().stop_requested(), "trait default");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A shutdown park is not a lost socket: it must stay off `PARK_METRIC`
+    /// (the `dhan-socket-parked` alarm has no reason filter) and off the
+    /// "parked permanently" error line.
+    #[test]
+    fn a_shutdown_park_never_reaches_the_paging_park_metric() {
+        let src = include_str!("pool_supervisor.rs");
+        let marker = concat!("#[cfg(", "test)]");
+        let production = src.split(marker).next().unwrap_or(src);
+        let park_at = production
+            .find("fn park(&mut self, reason: ParkReason")
+            .expect("park exists");
+        let park = &production[park_at..];
+        let quiet = park
+            .find("if reason == ParkReason::Shutdown {")
+            .expect("park must return early for a shutdown");
+        let metric = park
+            .find("PARK_METRIC,")
+            .expect("park still counts real parks");
+        assert!(
+            quiet < metric,
+            "the shutdown return must come before PARK_METRIC"
+        );
+    }
+    // --- D7: the main-feed overflow probe (2026-10-02) -------------------
+    //
+    // The decision core is `OverflowEpisode`, a pure value: these tests drive
+    // their OWN episode, never the process-wide one, so they cannot race each
+    // other or any other test.
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    /// An episode with `slots` parked for 805 and the 805 at `at`.
+    fn episode_after_805(slots: &[u8], at: Instant) -> OverflowEpisode {
+        let mut ep = OverflowEpisode::new();
+        for &slot in slots {
+            ep.on_parked(slot);
+        }
+        assert_eq!(ep.on_overflow(at), OverflowEpisodeEffect::default());
+        ep
+    }
+
+    /// Grants the first probe (window open, first delay elapsed).
+    fn grant_first_probe(ep: &mut OverflowEpisode, start: Instant) -> Instant {
+        let at = start + secs(OVERFLOW_PROBE_DELAYS_SECS[0]);
+        let effect = ep.poll(at, true);
+        assert_eq!(effect.outcomes[0], Some(OverflowProbeOutcome::ProbeGranted));
+        at
+    }
+
+    fn live_main_feed(pool_index: u8, now: Instant) -> ConnectionSupervisor {
+        let mut s = sup(DhanEndpointType::MainFeed, pool_index, now);
+        let _ = s.on_event(ConnEvent::BeginDial, now);
+        let _ = s.on_event(ConnEvent::DialSucceeded, now);
+        let _ = s.on_event(ConnEvent::SubscribeAcked, now);
+        s
+    }
+
+    #[test]
+    fn test_overflow_probe_only_from_pool_overflow_park() {
+        let now = t0();
+        // A MAIN-FEED socket parked for 805 is released, onto the ladder.
+        let mut overflow = live_main_feed(1, now);
+        let parked = overflow.on_event(
+            ConnEvent::Disconnected {
+                code: Some(DisconnectCode::ExceededActiveConnections),
+            },
+            now,
+        );
+        assert_eq!(
+            parked,
+            SupervisorAction::Park {
+                reason: ParkReason::PoolOverflow
+            }
+        );
+        let released = overflow.on_event(ConnEvent::OverflowProbeGranted, now);
+        assert_ne!(
+            released,
+            SupervisorAction::Continue,
+            "805 park on the main feed is released"
+        );
+        assert_ne!(overflow.phase(), ConnPhase::Parked);
+        assert_eq!(overflow.park_reason(), None);
+        assert_eq!(
+            overflow.last_redial_reason(),
+            ReconnectReason::OverflowProbe
+        );
+
+        // A main-feed socket parked for a FATAL code stays parked.
+        let mut fatal = live_main_feed(2, now);
+        let _ = fatal.on_event(
+            ConnEvent::Disconnected {
+                code: Some(DisconnectCode::AuthenticationFailed),
+            },
+            now,
+        );
+        assert_eq!(fatal.park_reason(), Some(ParkReason::FatalDisconnect));
+        assert_eq!(
+            fatal.on_event(ConnEvent::OverflowProbeGranted, now),
+            SupervisorAction::Continue
+        );
+        assert_eq!(fatal.phase(), ConnPhase::Parked);
+
+        // A DEPTH socket parked for 805 is released too (scope lock
+        // 2026-10-02): its grant comes from the depth episode, and a failure
+        // notice re-parks it for 805.
+        for endpoint in [DhanEndpointType::Depth20, DhanEndpointType::Depth200] {
+            let mut depth = sup(endpoint, 0, now);
+            let _ = depth.on_event(ConnEvent::BeginDial, now);
+            let _ = depth.on_event(ConnEvent::DialSucceeded, now);
+            let _ = depth.on_event(ConnEvent::SubscribeAcked, now);
+            let _ = depth.on_event(
+                ConnEvent::Disconnected {
+                    code: Some(DisconnectCode::ExceededActiveConnections),
+                },
+                now,
+            );
+            assert_eq!(depth.park_reason(), Some(ParkReason::PoolOverflow));
+            assert_ne!(
+                depth.on_event(ConnEvent::OverflowProbeGranted, now),
+                SupervisorAction::Continue,
+                "{endpoint:?} parked for 805 is released by its grant"
+            );
+            assert_ne!(depth.phase(), ConnPhase::Parked);
+            assert_eq!(depth.last_redial_reason(), ReconnectReason::OverflowProbe);
+            assert_eq!(
+                depth.on_event(ConnEvent::OverflowProbeFailed, now),
+                SupervisorAction::Park {
+                    reason: ParkReason::PoolOverflow
+                }
+            );
+            // A depth socket parked for a FATAL code stays parked.
+            let mut fatal = sup(endpoint, 1, now);
+            let _ = fatal.on_event(ConnEvent::BeginDial, now);
+            let _ = fatal.on_event(
+                ConnEvent::Disconnected {
+                    code: Some(DisconnectCode::AuthenticationFailed),
+                },
+                now,
+            );
+            assert_eq!(
+                fatal.on_event(ConnEvent::OverflowProbeGranted, now),
+                SupervisorAction::Continue
+            );
+            assert_eq!(fatal.phase(), ConnPhase::Parked);
+        }
+
+        // A live socket has nothing to be released from.
+        let mut live = live_main_feed(3, now);
+        assert_eq!(
+            live.on_event(ConnEvent::OverflowProbeGranted, now),
+            SupervisorAction::Continue
+        );
+        assert_ne!(live.phase(), ConnPhase::Parked);
+
+        // The episode grants only a slot that actually parked for 805.
+        let mut empty = episode_after_805(&[], now);
+        assert_eq!(
+            empty.poll(now + secs(OVERFLOW_PROBE_DELAYS_SECS[0]), true),
+            OverflowEpisodeEffect::default(),
+            "no parked main-feed slot = nothing to probe"
+        );
+    }
+
+    #[test]
+    fn test_overflow_probe_failed_reparks_the_probed_main_feed_socket() {
+        let now = t0();
+        let mut s = live_main_feed(4, now);
+        assert_eq!(
+            s.on_event(ConnEvent::OverflowProbeFailed, now),
+            SupervisorAction::Park {
+                reason: ParkReason::PoolOverflow
+            }
+        );
+        assert_eq!(s.park_reason(), Some(ParkReason::PoolOverflow));
+    }
+
+    #[test]
+    fn test_regression_an_episode_with_nothing_parked_recovers_after_its_wait() {
+        // A depth-only 805: the main episode enters Waiting with an empty
+        // parked mask. It must finish once the wait passes, or the main-feed
+        // widen stays refused for the session.
+        let start = t0();
+        let mut ep = episode_after_805(&[], start);
+        assert!(!ep.widen_permitted());
+        let early = ep.poll(start + secs(OVERFLOW_PROBE_DELAYS_SECS[0] - 1), true);
+        assert_eq!(early, OverflowEpisodeEffect::default());
+        assert_eq!(ep.phase, OverflowEpisodePhase::Waiting);
+
+        // Closed session window: still recovers (silently: nothing of this
+        // pool was down), and dials nothing.
+        let done = ep.poll(start + secs(OVERFLOW_PROBE_DELAYS_SECS[0]), false);
+        assert_eq!(done, OverflowEpisodeEffect::default());
+        assert_eq!(ep.phase, OverflowEpisodePhase::Recovered);
+        assert!(ep.widen_permitted());
+        assert_eq!(ep.probes_started, 0, "no probe was spent");
+
+        // A park from the same 805 that registers after that reopens the
+        // wait from the 805, so the next poll probes it.
+        ep.on_parked(4);
+        assert_eq!(ep.phase, OverflowEpisodePhase::Waiting);
+        assert!(!ep.widen_permitted());
+        let regrant = ep.poll(start + secs(OVERFLOW_PROBE_DELAYS_SECS[0] + 1), true);
+        assert_eq!(regrant.grant, Some(4));
+
+        // A socket that parks within the wait still gets its probe.
+        let mut parked_late = episode_after_805(&[], start);
+        parked_late.on_parked(3);
+        let granted = parked_late.poll(start + secs(OVERFLOW_PROBE_DELAYS_SECS[0]), true);
+        assert_eq!(granted.grant, Some(3));
+    }
+
+    #[test]
+    fn test_probe_fails_on_any_805_in_window() {
+        let start = t0();
+        let mut ep = episode_after_805(&[0, 1], start);
+        let granted = grant_first_probe(&mut ep, start);
+        assert_eq!(ep.watched(), Some(0));
+        ep.on_first_frame(0, granted + secs(1));
+
+        // An 805 on ANY socket, inside the window.
+        let fail = ep.on_overflow(granted + secs(60));
+        assert_eq!(
+            fail.outcomes,
+            [Some(OverflowProbeOutcome::FailedOverflow), None]
+        );
+        assert_eq!(fail.repark, Some(0), "the probed socket is re-parked");
+        assert_eq!(fail.grant, None);
+        assert_eq!(ep.phase, OverflowEpisodePhase::Waiting);
+        assert!(!ep.widen_permitted());
+
+        // The same holds while a RELEASED socket is under watch.
+        let mut resuming = episode_after_805(&[0, 1], start);
+        let granted = grant_first_probe(&mut resuming, start);
+        resuming.on_first_frame(0, granted);
+        let pass = resuming.poll(granted + secs(OVERFLOW_PROBE_WATCH_SECS), true);
+        assert_eq!(pass.grant, Some(1));
+        assert_eq!(resuming.phase, OverflowEpisodePhase::Resuming);
+        let fail = resuming.on_overflow(granted + secs(OVERFLOW_PROBE_WATCH_SECS + 5));
+        assert_eq!(fail.outcomes[0], Some(OverflowProbeOutcome::FailedOverflow));
+        assert_eq!(fail.repark, Some(1));
+    }
+
+    #[test]
+    fn test_probe_fails_on_sibling_bare_reset_in_window() {
+        let start = t0();
+        let mut ep = episode_after_805(&[2], start);
+        // Before any probe a bare reset changes nothing.
+        assert_eq!(
+            ep.on_bare_reset(start + secs(10)),
+            OverflowEpisodeEffect::default()
+        );
+        assert_eq!(ep.phase, OverflowEpisodePhase::Waiting);
+
+        let granted = grant_first_probe(&mut ep, start);
+        ep.on_first_frame(2, granted + secs(3));
+        let fail = ep.on_bare_reset(granted + secs(90));
+        assert_eq!(
+            fail.outcomes,
+            [Some(OverflowProbeOutcome::FailedBareReset), None]
+        );
+        assert_eq!(fail.repark, Some(2));
+        assert_eq!(ep.phase, OverflowEpisodePhase::Waiting);
+
+        // A bare reset AFTER the window passed is not a failure.
+        let mut passed = episode_after_805(&[2], start);
+        let granted = grant_first_probe(&mut passed, start);
+        passed.on_first_frame(2, granted);
+        let done = passed.poll(granted + secs(OVERFLOW_PROBE_WATCH_SECS), true);
+        assert_eq!(
+            done.outcomes,
+            [
+                Some(OverflowProbeOutcome::ProbePassed),
+                Some(OverflowProbeOutcome::Recovered)
+            ]
+        );
+        assert_eq!(
+            passed.on_bare_reset(granted + secs(OVERFLOW_PROBE_WATCH_SECS + 1)),
+            OverflowEpisodeEffect::default()
+        );
+    }
+
+    #[test]
+    fn test_resume_releases_one_slot_per_window() {
+        let start = t0();
+        let mut ep = episode_after_805(&[5, 3, 4], start);
+        // Not before the first delay, and never outside the session window.
+        assert_eq!(
+            ep.poll(start + secs(OVERFLOW_PROBE_DELAYS_SECS[0] - 1), true),
+            OverflowEpisodeEffect::default()
+        );
+        assert_eq!(
+            ep.poll(start + secs(OVERFLOW_PROBE_DELAYS_SECS[0]), false),
+            OverflowEpisodeEffect::default(),
+            "no probe outside the session window"
+        );
+        let granted = grant_first_probe(&mut ep, start);
+        assert_eq!(ep.watched(), Some(3), "lowest parked slot is the probe");
+
+        // The window runs from the FIRST FRAME, not the grant.
+        let first = granted + secs(20);
+        ep.on_first_frame(3, first);
+        assert_eq!(
+            ep.poll(first + secs(OVERFLOW_PROBE_WATCH_SECS - 1), true),
+            OverflowEpisodeEffect::default()
+        );
+        let next = ep.poll(first + secs(OVERFLOW_PROBE_WATCH_SECS), true);
+        assert_eq!(
+            next.outcomes,
+            [
+                Some(OverflowProbeOutcome::ProbePassed),
+                Some(OverflowProbeOutcome::ReleaseGranted)
+            ]
+        );
+        assert_eq!(next.grant, Some(4), "exactly one more slot");
+        assert_eq!(ep.parked_mask, 1 << 5, "slot 5 still waits its turn");
+
+        // Slot 5 waits for slot 4's whole window.
+        let first4 = first + secs(OVERFLOW_PROBE_WATCH_SECS + 2);
+        ep.on_first_frame(4, first4);
+        assert_eq!(
+            ep.poll(first4 + secs(30), true),
+            OverflowEpisodeEffect::default()
+        );
+        // A release that falls outside the session window waits for it.
+        let at = first4 + secs(OVERFLOW_PROBE_WATCH_SECS);
+        let held = ep.poll(at, false);
+        assert_eq!(
+            held.outcomes,
+            [Some(OverflowProbeOutcome::ReleasePassed), None]
+        );
+        assert_eq!(held.grant, None);
+        assert_eq!(ep.phase, OverflowEpisodePhase::Releasing);
+        let last = ep.poll(at + secs(1), true);
+        assert_eq!(last.grant, Some(5));
+
+        ep.on_first_frame(5, at + secs(2));
+        let done = ep.poll(at + secs(2 + OVERFLOW_PROBE_WATCH_SECS), true);
+        assert_eq!(
+            done.outcomes,
+            [
+                Some(OverflowProbeOutcome::ReleasePassed),
+                Some(OverflowProbeOutcome::Recovered)
+            ]
+        );
+        assert!(ep.widen_permitted());
+        assert_eq!(ep.probes_started, 1, "releases are not probes");
+    }
+
+    #[test]
+    fn test_probe_never_clears_rotation_halted() {
+        // Runtime half: an 805, a grant, and the breaker still reads halted.
+        let now = t0();
+        let mut s = live_main_feed(0, now);
+        let _ = s.on_event(
+            ConnEvent::Disconnected {
+                code: Some(DisconnectCode::ExceededActiveConnections),
+            },
+            now,
+        );
+        let _ = s.on_event(ConnEvent::OverflowProbeGranted, now);
+        let _ = s.on_event(ConnEvent::OverflowProbeFailed, now);
+        assert!(
+            rotation_halted(),
+            "an 805 latches the breaker and no probe step clears it"
+        );
+
+        // Source half: no production path can store false into the breaker,
+        // by any atomic write.
+        let src = include_str!("pool_supervisor.rs");
+        let marker = concat!("#[cfg(", "test)]");
+        let prod = src.split(marker).next().unwrap_or(src);
+        for banned in [
+            "ROTATION_HALTED.store(false",
+            "ROTATION_HALTED.swap(",
+            "ROTATION_HALTED.compare_exchange",
+            "ROTATION_HALTED.fetch_and(",
+            "ROTATION_HALTED.fetch_xor(",
+            "ROTATION_HALTED.fetch_update(",
+            "ROTATION_HALTED.fetch_nand(",
+        ] {
+            assert!(
+                !prod.contains(banned),
+                "the 805 breaker must never be cleared in-session: found {banned}"
+            );
+        }
+        let stores = prod.matches("ROTATION_HALTED.store(").count();
+        let true_stores = prod.matches("ROTATION_HALTED.store(true").count();
+        assert_eq!(stores, true_stores, "every store into the breaker sets it");
+        assert_eq!(true_stores, 1, "exactly one latch, in the 805 arm");
+        // The episode code itself never names the breaker as a write target.
+        let episode = prod
+            .split("// Main-feed overflow probe (plan item D7, 2026-10-02)")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("/// A probe close is PENDING for this slot.")
+                    .next()
+            })
+            .expect("the D7 block");
+        assert!(!episode.contains("ROTATION_HALTED."));
+    }
+
+    #[test]
+    fn test_rotate_by_redial_still_refused_after_successful_probe() {
+        // A full, successful episode leaves the breaker alone.
+        let start = t0();
+        let mut ep = episode_after_805(&[0], start);
+        let granted = grant_first_probe(&mut ep, start);
+        ep.on_first_frame(0, granted);
+        let done = ep.poll(granted + secs(OVERFLOW_PROBE_WATCH_SECS), true);
+        assert_eq!(done.outcomes[1], Some(OverflowProbeOutcome::Recovered));
+        assert!(ep.widen_permitted());
+
+        let now = t0();
+        let mut s = live_main_feed(1, now);
+        let _ = s.on_event(
+            ConnEvent::Disconnected {
+                code: Some(DisconnectCode::ExceededActiveConnections),
+            },
+            now,
+        );
+        let _ = s.on_event(ConnEvent::OverflowProbeGranted, now);
+        assert!(
+            rotation_halted(),
+            "a recovered main feed is not a reset breaker"
+        );
+
+        // The rotation, ghost and probe-close arms gate on the BREAKER, never
+        // on the episode's widen verdict.
+        let src = include_str!("pool_supervisor.rs");
+        let marker = concat!("#[cfg(", "test)]");
+        let prod = src.split(marker).next().unwrap_or(src);
+        // The ranked rotation is an in-place swap since 2026-10-01 (scope
+        // lock); its connection arm checks the breaker before the guard moves.
+        let rotate = prod
+            .find("Ok(LiveSubscriptionCommand::Swap { old, new, ack })")
+            .expect("rotation arm");
+        let arm = &prod[rotate..];
+        let arm = &arm[..arm.len().min(4_000)];
+        assert!(arm.contains("rotation_halted()"));
+        assert!(!arm.contains("main_feed_overflow_widen_permitted"));
+        assert!(!arm.contains("OVERFLOW_"));
+    }
+
+    #[test]
+    fn test_widen_room_zero_until_probe_passes() {
+        let start = t0();
+        let mut ep = OverflowEpisode::new();
+        assert!(ep.widen_permitted(), "no 805 = the widen may run");
+        ep.on_parked(0);
+        let _ = ep.on_overflow(start);
+        assert!(!ep.widen_permitted(), "waiting");
+        let granted = grant_first_probe(&mut ep, start);
+        assert!(!ep.widen_permitted(), "probing");
+        ep.on_first_frame(0, granted);
+        assert!(
+            !ep.widen_permitted(),
+            "still probing until the window passes"
+        );
+        let _ = ep.poll(granted + secs(OVERFLOW_PROBE_WATCH_SECS), true);
+        assert!(ep.widen_permitted(), "recovered");
+
+        // Two parked slots: the widen stays shut through the release.
+        let mut two = episode_after_805(&[0, 1], start);
+        let granted = grant_first_probe(&mut two, start);
+        two.on_first_frame(0, granted);
+        let _ = two.poll(granted + secs(OVERFLOW_PROBE_WATCH_SECS), true);
+        assert_eq!(two.phase, OverflowEpisodePhase::Resuming);
+        assert!(!two.widen_permitted(), "resuming");
+
+        // An 805 after recovery shuts it again.
+        let _ = ep.on_overflow(granted + secs(1_000));
+        assert!(!ep.widen_permitted());
+    }
+
+    #[test]
+    fn test_main_feed_overflow_widen_permitted_reads_the_published_flag() {
+        assert_eq!(
+            main_feed_overflow_widen_permitted(),
+            widen_word_permits(&OVERFLOW_WIDEN_STATE)
+        );
+    }
+
+    /// Review 2026-10-02 (F3): the 805 used to store `false` BEFORE the
+    /// episode lock, so a concurrent step that had computed "yes" from the
+    /// pre-805 state could store `true` over it — a stale yes until the
+    /// 805's own step ran. Replays that interleaving step by step on a local
+    /// word: from the moment the 805 is noted, no publication of a pre-805
+    /// "yes" can make the widen read yes.
+    #[test]
+    fn test_regression_805_never_published_over_by_a_stale_step() {
+        use std::sync::atomic::AtomicU32;
+        let word = AtomicU32::new(WIDEN_PERMITTED_BIT);
+        assert!(widen_word_permits(&word), "no 805 yet: yes");
+        // Thread A sees an 805 and notes it, before taking the lock.
+        widen_word_note_805(&word);
+        assert!(!widen_word_permits(&word), "no from the 805 itself");
+        // Thread B holds the lock with the PRE-805 episode and publishes its
+        // verdict: yes. Under the old flag this was the stale yes.
+        widen_word_publish(&word, true);
+        assert!(
+            !widen_word_permits(&word),
+            "a pre-805 yes published after the 805 is noted must not read yes"
+        );
+        // A second socket's 805 lands at the same time.
+        widen_word_note_805(&word);
+        // A takes the lock: the episode applies the 805 (verdict no), then
+        // the pending mark is taken back.
+        widen_word_publish(&word, false);
+        widen_word_settle_805(&word);
+        assert!(!widen_word_permits(&word), "the applied 805 says no");
+        // B's late pre-805 step again: still pending (the second 805).
+        widen_word_publish(&word, true);
+        assert!(
+            !widen_word_permits(&word),
+            "the second 805 is still pending"
+        );
+        widen_word_publish(&word, false);
+        widen_word_settle_805(&word);
+        assert!(!widen_word_permits(&word));
+        // Recovery (the probe passed): a step publishes yes with nothing
+        // pending, and the widen may run again.
+        widen_word_publish(&word, true);
+        assert!(widen_word_permits(&word), "recovered: yes");
+        assert_eq!(
+            word.load(std::sync::atomic::Ordering::Acquire),
+            WIDEN_PERMITTED_BIT
+        );
+    }
+
+    #[test]
+    fn test_probe_attempts_capped_at_3() {
+        let start = t0();
+        let mut ep = episode_after_805(&[0], start);
+        let mut wait_from = start;
+        for attempt in 0..usize::from(OVERFLOW_PROBE_MAX_ATTEMPTS) {
+            let delay = secs(OVERFLOW_PROBE_DELAYS_SECS[attempt]);
+            assert_eq!(
+                ep.poll(wait_from + delay - secs(1), true),
+                OverflowEpisodeEffect::default(),
+                "attempt {attempt} must wait its whole delay"
+            );
+            let granted = wait_from + delay;
+            assert_eq!(ep.poll(granted, true).grant, Some(0));
+            // No first frame: the probe fails at its deadline.
+            let failed_at = granted + secs(OVERFLOW_PROBE_FIRST_FRAME_DEADLINE_SECS);
+            let fail = ep.poll(failed_at, true);
+            assert_eq!(fail.outcomes[0], Some(OverflowProbeOutcome::FailedNoFrame));
+            assert_eq!(fail.repark, Some(0));
+            ep.on_parked(0);
+            wait_from = failed_at;
+            if attempt + 1 < usize::from(OVERFLOW_PROBE_MAX_ATTEMPTS) {
+                assert_eq!(fail.outcomes[1], None);
+                assert!(!ep.is_down());
+            } else {
+                assert_eq!(fail.outcomes[1], Some(OverflowProbeOutcome::DownForSession));
+            }
+        }
+        assert!(ep.is_down());
+        assert_eq!(ep.probes_started, OVERFLOW_PROBE_MAX_ATTEMPTS);
+        // Nothing grants again, however long the wait.
+        assert_eq!(
+            ep.poll(wait_from + secs(86_400), true),
+            OverflowEpisodeEffect::default()
+        );
+        assert_eq!(ep.on_overflow(wait_from), OverflowEpisodeEffect::default());
+        assert!(!ep.widen_permitted());
+        assert_eq!(OVERFLOW_PROBE_DELAYS_SECS, [300, 600, 1_200]);
+    }
+
+    #[test]
+    fn test_overflow_probe_outcome_labels_are_distinct() {
+        let labels: BTreeSet<&'static str> = OverflowProbeOutcome::ALL
+            .into_iter()
+            .map(OverflowProbeOutcome::as_str)
+            .collect();
+        assert_eq!(labels.len(), OverflowProbeOutcome::ALL.len());
+        assert_eq!(OVERFLOW_PROBE_METRIC, "tv_dhan_ws_overflow_probe_total");
+        assert_eq!(ReconnectReason::OverflowProbe.as_str(), "overflow_probe");
+        assert!(
+            ReconnectReason::OverflowProbe.records_flap(),
+            "a probe redial counts toward the flap floor"
+        );
+    }
+
+    #[test]
+    fn test_with_overflow_probe_opts_in_market_data_sockets() {
+        let dir = wal_dir("overflow-probe");
+        let spill = std::sync::Arc::new(
+            WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel::<CapturedFrame>(4);
+        let build = |endpoint| {
+            WalRingSink::new(
+                std::sync::Arc::clone(&spill),
+                tx.clone(),
+                std::sync::Arc::new(RingByteBudget::new(usize::MAX)),
+                WsType::LiveFeed,
+                endpoint,
+                0,
+            )
+        };
+        assert!(!build(DhanEndpointType::MainFeed).overflow_probe_enabled());
+        assert!(
+            build(DhanEndpointType::MainFeed)
+                .with_overflow_probe()
+                .overflow_probe_enabled()
+        );
+        for depth in [DhanEndpointType::Depth20, DhanEndpointType::Depth200] {
+            assert!(!build(depth).overflow_probe_enabled());
+            assert!(
+                build(depth).with_overflow_probe().overflow_probe_enabled(),
+                "{depth:?} recovers through the depth probe (scope lock 2026-10-02)"
+            );
+        }
+        assert!(
+            !build(DhanEndpointType::OrderUpdate)
+                .with_overflow_probe()
+                .overflow_probe_enabled(),
+            "the order-update socket has no overflow episode"
+        );
+        assert!(!RecordingSink::default().overflow_probe_enabled());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_on_lifecycle_detail_carries_code_and_instruments() {
+        let dir = wal_dir("lifecycle-detail");
+        let spill = std::sync::Arc::new(
+            WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel::<CapturedFrame>(4);
+        let (audit_tx, mut audit_rx) = tokio::sync::mpsc::channel::<WsLifecycleEvent>(4);
+        let sink = WalRingSink::new(
+            std::sync::Arc::clone(&spill),
+            tx,
+            std::sync::Arc::new(RingByteBudget::new(usize::MAX)),
+            WsType::LiveFeed,
+            DhanEndpointType::MainFeed,
+            2,
+        )
+        .with_audit(audit_tx);
+        sink.on_lifecycle_detail(
+            tickvault_common::ws_event_types::WsEventKind::Disconnected,
+            "pool_overflow",
+            Some(805),
+            4_321,
+        );
+        sink.on_lifecycle(
+            tickvault_common::ws_event_types::WsEventKind::DialStarted,
+            "begin_dial",
+        );
+        let first = audit_rx.try_recv().expect("detail event");
+        assert_eq!(first.dhan_code, Some(805));
+        assert_eq!(first.instruments_held, 4_321);
+        assert_eq!(first.connection_index, 2);
+        let second = audit_rx.try_recv().expect("plain event");
+        assert_eq!(second.dhan_code, None);
+        assert_eq!(second.instruments_held, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_supervisor_last_disconnect_code_tracks_the_close_and_clears_on_dial() {
+        let now = t0();
+        let mut s = live_main_feed(0, now);
+        assert_eq!(s.last_disconnect_code(), None);
+        let _ = s.on_event(
+            ConnEvent::Disconnected {
+                code: Some(DisconnectCode::InternalServerError),
+            },
+            now,
+        );
+        assert_eq!(s.last_disconnect_code(), Some(800));
+        let _ = s.on_event(ConnEvent::BeginDial, now);
+        assert_eq!(s.last_disconnect_code(), None);
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_overflow_grant_ends_when_the_socket_is_asked_to_stop() {
+        let stop: &'static SocketStop = Box::leak(Box::new(SocketStop::new()));
+        stop.request();
+        let dir = wal_dir("overflow-wait-stop");
+        let spill = std::sync::Arc::new(
+            WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel::<CapturedFrame>(4);
+        let sink = WalRingSink::new(
+            std::sync::Arc::clone(&spill),
+            tx,
+            std::sync::Arc::new(RingByteBudget::new(usize::MAX)),
+            WsType::LiveFeed,
+            DhanEndpointType::MainFeed,
+            31,
+        )
+        .with_overflow_probe()
+        .with_socket_stop(stop);
+        // Slot 31: the top of the register, used by no other test.
+        let mut s = ConnectionSupervisor::new(
+            ConnectionSlot {
+                account: crate::websocket::pool_budget::DhanAccount::Primary,
+                endpoint: DhanEndpointType::MainFeed,
+                pool_index: 0,
+                global_index: 31,
+            },
+            t0(),
+        );
+        assert_eq!(wait_for_overflow_grant(&mut s, &sink).await, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_park_arm_waits_for_the_probe_only_on_an_opted_in_market_data_805() {
+        let src = include_str!("pool_supervisor.rs");
+        let marker = concat!("#[cfg(", "test)]");
+        let prod = src.split(marker).next().unwrap_or(src);
+        let park = prod
+            .find("SupervisorAction::Park { reason } => {")
+            .expect("park arm");
+        let arm = &prod[park..];
+        let arm = &arm[..arm
+            .find("SupervisorAction::Continue => {")
+            .unwrap_or(arm.len())];
+        assert!(arm.contains("reason == ParkReason::PoolOverflow"));
+        assert!(arm.contains("OverflowEpisodeKind::for_endpoint(supervisor.slot().endpoint)"));
+        assert!(arm.contains("sink.overflow_probe_enabled()"));
+        let gate = arm.find("if !probe_eligible").expect("gate");
+        let wait = arm.find("wait_for_overflow_grant(").expect("wait");
+        assert!(gate < wait, "only an eligible socket waits");
+    }
+    // --- Depth self-recovery after 805 (scope lock 2026-10-02) ----------
+    //
+    // Same discipline as the D7 tests: every test drives its OWN
+    // `OverflowEpisodes` value, never the process-wide one.
+
+    /// Both episodes with `main` and `depth` slots parked and the 805 at `at`.
+    fn episodes_after_805(main: &[u8], depth: &[u8], at: Instant) -> OverflowEpisodes {
+        let mut eps = OverflowEpisodes::new();
+        for &slot in main {
+            eps.on_parked(DhanEndpointType::MainFeed, slot);
+        }
+        for &slot in depth {
+            eps.on_parked(DhanEndpointType::Depth200, slot);
+        }
+        assert_eq!(eps.on_overflow(at), OverflowEpisodesEffect::default());
+        eps
+    }
+
+    fn depth_delay(attempt: u8) -> Duration {
+        secs(
+            OverflowEpisodeKind::Depth
+                .delay_secs(attempt)
+                .expect("attempt within the depth cap"),
+        )
+    }
+
+    #[test]
+    fn test_depth_overflow_probe_delay_doubles_to_the_cap() {
+        let delays: Vec<Option<u64>> = (0..=DEPTH_OVERFLOW_PROBE_MAX_ATTEMPTS)
+            .map(|attempt| OverflowEpisodeKind::Depth.delay_secs(attempt))
+            .collect();
+        assert_eq!(
+            delays,
+            vec![
+                Some(300),
+                Some(600),
+                Some(1_200),
+                Some(1_800),
+                Some(1_800),
+                Some(1_800),
+                None
+            ]
+        );
+        assert_eq!(OverflowEpisodeKind::Depth.delay_secs(u8::MAX), None);
+        for attempt in 0..DEPTH_OVERFLOW_PROBE_MAX_ATTEMPTS {
+            let delay = OverflowEpisodeKind::Depth
+                .delay_secs(attempt)
+                .expect("within cap");
+            assert!(
+                (DEPTH_OVERFLOW_PROBE_BASE_DELAY_SECS..=DEPTH_OVERFLOW_PROBE_MAX_DELAY_SECS)
+                    .contains(&delay),
+                "never sooner than the cooldown, never past the cap"
+            );
+        }
+        assert_eq!(OverflowEpisodeKind::Depth.max_attempts(), 6);
+        // The main feed's D7 policy is unchanged.
+        assert_eq!(OverflowEpisodeKind::MainFeed.delay_secs(0), Some(300));
+        assert_eq!(OverflowEpisodeKind::MainFeed.delay_secs(2), Some(1_200));
+        assert_eq!(OverflowEpisodeKind::MainFeed.delay_secs(3), None);
+        assert_eq!(OverflowEpisodeKind::MainFeed.max_attempts(), 3);
+        // Which pool each endpoint joins.
+        assert_eq!(
+            OverflowEpisodeKind::for_endpoint(DhanEndpointType::MainFeed),
+            Some(OverflowEpisodeKind::MainFeed)
+        );
+        for depth in [DhanEndpointType::Depth20, DhanEndpointType::Depth200] {
+            assert_eq!(
+                OverflowEpisodeKind::for_endpoint(depth),
+                Some(OverflowEpisodeKind::Depth)
+            );
+        }
+        assert_eq!(
+            OverflowEpisodeKind::for_endpoint(DhanEndpointType::OrderUpdate),
+            None
+        );
+        assert_eq!(
+            DEPTH_OVERFLOW_PROBE_METRIC,
+            "tv_dhan_ws_depth_overflow_probe_total"
+        );
+        assert_ne!(
+            OverflowEpisodeKind::Depth.metric(),
+            OverflowEpisodeKind::MainFeed.metric()
+        );
+        assert_ne!(
+            OverflowEpisodeKind::Depth.source(),
+            OverflowEpisodeKind::MainFeed.source()
+        );
+    }
+
+    #[test]
+    fn test_depth_probe_waits_the_cooldown_then_grants_one_socket() {
+        let start = t0();
+        let mut eps = episodes_after_805(&[], &[12, 10, 11], start);
+        let base = secs(DEPTH_OVERFLOW_PROBE_BASE_DELAY_SECS);
+        assert_eq!(
+            eps.poll(start + base - secs(1), true),
+            OverflowEpisodesEffect::default(),
+            "nothing before the cooldown"
+        );
+        assert_eq!(
+            eps.poll(start + base, false),
+            OverflowEpisodesEffect::default(),
+            "nothing outside the session window"
+        );
+        let granted = eps.poll(start + base, true);
+        assert_eq!(granted.main, OverflowEpisodeEffect::default());
+        assert_eq!(
+            granted.depth.outcomes,
+            [Some(OverflowProbeOutcome::ProbeGranted), None]
+        );
+        assert_eq!(granted.depth.grant, Some(10), "the lowest parked slot");
+        assert_eq!(eps.watched(), Some(10));
+        // While the probe's window runs nothing else is granted.
+        for later in 1..OVERFLOW_PROBE_FIRST_FRAME_DEADLINE_SECS {
+            assert_eq!(eps.poll(start + base + secs(later), true).depth.grant, None);
+        }
+        assert_eq!(eps.depth.parked_mask, (1 << 11) | (1 << 12));
+    }
+
+    #[test]
+    fn test_depth_probe_success_releases_the_rest_one_by_one() {
+        let start = t0();
+        let mut eps = episodes_after_805(&[], &[5, 6, 7], start);
+        let granted = start + depth_delay(0);
+        assert_eq!(eps.poll(granted, true).depth.grant, Some(5));
+
+        let first = granted + secs(2);
+        eps.on_first_frame(5, first);
+        assert_eq!(
+            eps.poll(first + secs(OVERFLOW_PROBE_WATCH_SECS - 1), true),
+            OverflowEpisodesEffect::default()
+        );
+        let pass = eps.poll(first + secs(OVERFLOW_PROBE_WATCH_SECS), true);
+        assert_eq!(
+            pass.depth.outcomes,
+            [
+                Some(OverflowProbeOutcome::ProbePassed),
+                Some(OverflowProbeOutcome::ReleaseGranted)
+            ]
+        );
+        assert_eq!(pass.depth.grant, Some(6), "exactly one more socket");
+        assert_eq!(eps.depth.parked_mask, 1 << 7, "slot 7 waits its turn");
+
+        let first6 = first + secs(OVERFLOW_PROBE_WATCH_SECS + 3);
+        eps.on_first_frame(6, first6);
+        assert_eq!(eps.poll(first6 + secs(60), true).depth.grant, None);
+        let next = eps.poll(first6 + secs(OVERFLOW_PROBE_WATCH_SECS), true);
+        assert_eq!(
+            next.depth.outcomes,
+            [
+                Some(OverflowProbeOutcome::ReleasePassed),
+                Some(OverflowProbeOutcome::ReleaseGranted)
+            ]
+        );
+        assert_eq!(next.depth.grant, Some(7));
+
+        let first7 = first6 + secs(OVERFLOW_PROBE_WATCH_SECS + 1);
+        eps.on_first_frame(7, first7);
+        let done = eps.poll(first7 + secs(OVERFLOW_PROBE_WATCH_SECS), true);
+        assert_eq!(
+            done.depth.outcomes,
+            [
+                Some(OverflowProbeOutcome::ReleasePassed),
+                Some(OverflowProbeOutcome::Recovered)
+            ]
+        );
+        assert_eq!(eps.depth.phase, OverflowEpisodePhase::Recovered);
+        assert_eq!(eps.depth.probes_started, 1, "releases are not probes");
+        assert_eq!(eps.watched(), None);
+        assert!(!eps.depth.is_down());
+    }
+
+    #[test]
+    fn test_depth_probe_backs_off_on_repeated_805() {
+        let start = t0();
+        let mut eps = episodes_after_805(&[], &[9], start);
+        let mut wait_from = start;
+        for attempt in 0..DEPTH_OVERFLOW_PROBE_MAX_ATTEMPTS {
+            let delay = depth_delay(attempt);
+            assert_eq!(
+                eps.poll(wait_from + delay - secs(1), true).depth.grant,
+                None,
+                "attempt {attempt} must wait its whole (doubled) delay"
+            );
+            let granted = wait_from + delay;
+            assert_eq!(eps.poll(granted, true).depth.grant, Some(9));
+            eps.on_first_frame(9, granted + secs(1));
+            // Dhan answers with 805 again inside the window.
+            let failed_at = granted + secs(30);
+            let fail = eps.on_overflow(failed_at);
+            assert_eq!(
+                fail.depth.outcomes[0],
+                Some(OverflowProbeOutcome::FailedOverflow)
+            );
+            assert_eq!(fail.depth.repark, Some(9), "the probe socket parks again");
+            assert_eq!(fail.depth.grant, None);
+            eps.on_parked(DhanEndpointType::Depth200, 9);
+            wait_from = failed_at;
+            if attempt + 1 < DEPTH_OVERFLOW_PROBE_MAX_ATTEMPTS {
+                assert_eq!(fail.depth.outcomes[1], None);
+                assert!(!eps.depth.is_down());
+            } else {
+                assert_eq!(
+                    fail.depth.outcomes[1],
+                    Some(OverflowProbeOutcome::DownForSession)
+                );
+            }
+        }
+        assert!(eps.depth.is_down());
+        assert_eq!(eps.depth.probes_started, DEPTH_OVERFLOW_PROBE_MAX_ATTEMPTS);
+        assert_eq!(
+            eps.poll(wait_from + secs(86_400), true),
+            OverflowEpisodesEffect::default(),
+            "no probe after the cap, however long the wait"
+        );
+        // A bare reset inside a depth window fails it the same way.
+        let mut reset = episodes_after_805(&[], &[3], start);
+        let granted = start + depth_delay(0);
+        assert_eq!(reset.poll(granted, true).depth.grant, Some(3));
+        let fail = reset.on_bare_reset(granted + secs(10));
+        assert_eq!(
+            fail.depth.outcomes,
+            [Some(OverflowProbeOutcome::FailedBareReset), None]
+        );
+        assert_eq!(fail.depth.repark, Some(3));
+    }
+
+    #[test]
+    fn test_depth_waits_for_the_main_feed_turn() {
+        let start = t0();
+        let mut eps = episodes_after_805(&[0], &[10], start);
+        // Both delays elapse together: the main feed goes first.
+        let at = start + secs(OVERFLOW_PROBE_DELAYS_SECS[0]);
+        let first = eps.poll(at, true);
+        assert_eq!(first.main.grant, Some(0));
+        assert_eq!(first.depth.grant, None);
+        assert_eq!(eps.watched(), Some(0));
+        // While the main window runs, depth grants nothing.
+        eps.on_first_frame(0, at + secs(1));
+        assert_eq!(eps.poll(at + secs(60), true).depth.grant, None);
+        assert!(eps.main.holds_turn());
+        // The main window passes and the main feed recovers; depth probes in
+        // the same poll, because the main feed no longer holds the turn.
+        let done = eps.poll(at + secs(1 + OVERFLOW_PROBE_WATCH_SECS), true);
+        assert_eq!(
+            done.main.outcomes,
+            [
+                Some(OverflowProbeOutcome::ProbePassed),
+                Some(OverflowProbeOutcome::Recovered)
+            ]
+        );
+        assert_eq!(done.depth.grant, Some(10));
+        assert_eq!(eps.watched(), Some(10));
+        assert!(!eps.main.holds_turn());
+
+        // A main feed that is down for the session no longer holds the turn.
+        let mut down = OverflowEpisode::new();
+        down.phase = OverflowEpisodePhase::DownForSession;
+        down.parked_mask = 1;
+        assert!(!down.holds_turn());
+    }
+
+    #[test]
+    fn test_main_grant_waits_for_a_running_depth_window() {
+        let start = t0();
+        let mut eps = episodes_after_805(&[], &[10], start);
+        let at = start + depth_delay(0);
+        assert_eq!(eps.poll(at, true).depth.grant, Some(10));
+        // A main-feed socket from the same 805 registers late: its delay has
+        // elapsed, but the depth window is running.
+        eps.on_parked(DhanEndpointType::MainFeed, 1);
+        let held = eps.poll(at + secs(1), true);
+        assert_eq!(held.main.grant, None, "never two windows at once");
+        assert_eq!(eps.watched(), Some(10));
+        // The depth window passes (depth recovers); the next poll grants main.
+        eps.on_first_frame(10, at + secs(2));
+        let passed = eps.poll(at + secs(2 + OVERFLOW_PROBE_WATCH_SECS), true);
+        assert_eq!(passed.main.grant, None);
+        assert_eq!(
+            passed.depth.outcomes,
+            [
+                Some(OverflowProbeOutcome::ProbePassed),
+                Some(OverflowProbeOutcome::Recovered)
+            ]
+        );
+        let next = eps.poll(at + secs(3 + OVERFLOW_PROBE_WATCH_SECS), true);
+        assert_eq!(next.main.grant, Some(1));
+        assert_eq!(eps.watched(), Some(1));
+    }
+
+    #[test]
+    fn test_never_more_than_one_probe_window_in_flight() {
+        // A deterministic pseudo-random driver over every input the episodes
+        // take. The invariant must hold after every step.
+        let mut eps = OverflowEpisodes::new();
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut now = t0();
+        let mut grants = 0_u32;
+        let mut depth_grants = 0_u32;
+        for _ in 0..50_000 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let roll = (state >> 33) % 100;
+            now += secs((state >> 20) % 90);
+            let effects = match roll {
+                0..=3 => eps.on_overflow(now),
+                4..=7 => eps.on_bare_reset(now),
+                8..=27 => {
+                    let slot = u8::try_from((state >> 40) % 15).unwrap_or(0);
+                    let endpoint = match slot / 5 {
+                        0 => DhanEndpointType::MainFeed,
+                        1 => DhanEndpointType::Depth20,
+                        _ => DhanEndpointType::Depth200,
+                    };
+                    eps.on_parked(endpoint, slot);
+                    OverflowEpisodesEffect::default()
+                }
+                28..=47 => {
+                    if let Some(watched) = eps.watched() {
+                        eps.on_first_frame(watched, now);
+                    }
+                    OverflowEpisodesEffect::default()
+                }
+                _ => eps.poll(now, roll % 7 != 0),
+            };
+            let in_flight = usize::from(eps.main.watched().is_some())
+                + usize::from(eps.depth.watched().is_some());
+            assert!(in_flight <= 1, "two probe windows in flight: {eps:?}");
+            assert!(
+                effects.main.grant.is_none() || effects.depth.grant.is_none(),
+                "two grants in one step"
+            );
+            for (effect, is_depth) in [(effects.main, false), (effects.depth, true)] {
+                if let Some(slot) = effect.grant {
+                    grants += 1;
+                    if is_depth {
+                        depth_grants += 1;
+                    }
+                    assert_eq!(eps.watched(), Some(slot), "a grant is the watched socket");
+                }
+            }
+            assert!(eps.main.probes_started <= OVERFLOW_PROBE_MAX_ATTEMPTS);
+            assert!(eps.depth.probes_started <= DEPTH_OVERFLOW_PROBE_MAX_ATTEMPTS);
+        }
+        assert!(
+            grants > 0 && depth_grants > 0,
+            "the driver must exercise grants"
+        );
+    }
+
+    #[test]
+    fn test_depth_probe_never_clears_rotation_halted() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::Depth200, 0, now);
+        let _ = s.on_event(ConnEvent::BeginDial, now);
+        let _ = s.on_event(ConnEvent::DialSucceeded, now);
+        let _ = s.on_event(ConnEvent::SubscribeAcked, now);
+        let _ = s.on_event(
+            ConnEvent::Disconnected {
+                code: Some(DisconnectCode::ExceededActiveConnections),
+            },
+            now,
+        );
+        assert!(rotation_halted(), "the 805 latches the breaker");
+        let _ = s.on_event(ConnEvent::OverflowProbeGranted, now);
+        let _ = s.on_event(ConnEvent::BeginDial, now);
+        let _ = s.on_event(ConnEvent::DialSucceeded, now);
+        let _ = s.on_event(ConnEvent::FrameReceived, now);
+        assert!(
+            rotation_halted(),
+            "a recovered depth socket is not a reset breaker"
+        );
+
+        // The depth half lives inside the block the D7 source pin scans for
+        // breaker writes, so `test_probe_never_clears_rotation_halted` covers
+        // it; and the rotation, ghost and probe-close arms read the breaker,
+        // never the episodes.
+        let src = include_str!("pool_supervisor.rs");
+        let marker = concat!("#[cfg(", "test)]");
+        let prod = src.split(marker).next().unwrap_or(src);
+        let block = prod
+            .split("// Main-feed overflow probe (plan item D7, 2026-10-02)")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("/// A probe close is PENDING for this slot.")
+                    .next()
+            })
+            .expect("the D7 block");
+        assert!(block.contains("struct OverflowEpisodes"));
+        assert!(block.contains("DEPTH_OVERFLOW_PROBE_MAX_ATTEMPTS"));
+        assert!(!block.contains("ROTATION_HALTED."));
+    }
+
+    #[test]
+    fn test_overflow_episodes_poll_gates_each_episode_on_the_other() {
+        let src = include_str!("pool_supervisor.rs");
+        let marker = concat!("#[cfg(", "test)]");
+        let prod = src.split(marker).next().unwrap_or(src);
+        let poll = prod
+            .split("fn poll(&mut self, now: Instant, window_open: bool) -> OverflowEpisodesEffect")
+            .nth(1)
+            .expect("the combined poll");
+        let poll = &poll[..poll.find("\n    }\n").expect("end of poll")];
+        let main_gate = poll
+            .find("window_open && self.depth.watched().is_none()")
+            .expect("main waits for a running depth window");
+        let main_poll = poll.find("self.main.poll(").expect("main polled");
+        let depth_gate = poll
+            .find("window_open && !self.main.holds_turn()")
+            .expect("depth waits for the main feed's turn");
+        let depth_poll = poll.find("self.depth.poll(").expect("depth polled");
+        assert!(main_gate < main_poll && main_poll < depth_gate && depth_gate < depth_poll);
+        // One lock for both episodes; no second episode mutex anywhere.
+        assert_eq!(
+            prod.matches("std::sync::Mutex<OverflowEpisodes>").count(),
+            1
+        );
+        assert_eq!(prod.matches("std::sync::Mutex<OverflowEpisode>").count(), 0);
+        // The supervisor releases only an 805 park, and never the
+        // order-update socket.
+        let parked = prod
+            .find("if event == ConnEvent::OverflowProbeGranted")
+            .expect("grant arm");
+        let arm = &prod[parked..parked + 300];
+        assert!(arm.contains("Some(ParkReason::PoolOverflow)"));
+        assert!(arm.contains("OverflowEpisodeKind::for_endpoint(self.slot.endpoint).is_some()"));
     }
 }

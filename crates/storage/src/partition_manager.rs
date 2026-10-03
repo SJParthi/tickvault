@@ -52,6 +52,10 @@ const PARTITION_DDL_TIMEOUT_SECS: u64 = 30;
 // for the same reason it did. `top_volume` itself STAYS listed: no boot writes
 // it any more, but its already-captured partitions must still age out rather
 // than sit on the volume forever.
+// 2026-10-02 (item 45h): `feed_aux_packets` — the OI, previous-close,
+// market-status, disconnect, out-of-window-tick and connect-snapshot rows the
+// `ticks` table does not hold. HOUR-partitioned like `ticks`, on the
+// market-data window, archived before any detach like every table here.
 pub(crate) const HOUR_PARTITIONED_TABLES: &[&str] = &[
     "ticks",
     "market_depth",
@@ -60,6 +64,7 @@ pub(crate) const HOUR_PARTITIONED_TABLES: &[&str] = &[
     "top_volume_3s",
     "top_volume_5s",
     "top_volume_1m",
+    "feed_aux_packets",
 ];
 
 /// DAY-partitioned **audit + daily-data** tables the retention sweep DETACHes
@@ -132,6 +137,10 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // partition loses nothing that `ws_event_audit` and `feed_episode_audit`
     // do not still hold.
     "ws_connection_daily",
+    // (2026-10-02) one row per live-feed reconnect gap, paired from the
+    // `ws_event_audit` lifecycle rows by the app forwarder. Same SEBI-audit
+    // class + DAY partitioning; `feed` is in the DEDUP key.
+    "feed_gap_audit",
     // (2026-08-29, per-table disk-footprint measurement): one row per
     // (trading day, table) recording OBSERVED disk bytes. Same SEBI-audit
     // class + DAY partitioning as the scoreboard tables above. Swept with
@@ -872,7 +881,11 @@ mod tests {
                 "top_volume_3s",
                 "top_volume_5s",
                 "top_volume_1m",
+                "feed_aux_packets",
             ]
+        );
+        assert!(
+            HOUR_PARTITIONED_TABLES.contains(&crate::feed_aux_persistence::FEED_AUX_PACKETS_TABLE)
         );
         // Every live per-cadence table is swept — pinned against the
         // persistence module's own names, so a fifth cadence cannot land

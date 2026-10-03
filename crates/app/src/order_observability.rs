@@ -76,6 +76,7 @@ use tickvault_common::sanitize::capture_rest_error_body;
 use tickvault_common::trading_calendar::TradingCalendar;
 use tickvault_core::notification::events::NotificationEvent;
 use tickvault_core::notification::service::NotificationService;
+use tickvault_storage::audit_spill::{AuditSpillTable, spawn_audit_spill_drain_once};
 use tickvault_storage::order_audit_persistence::{
     OrderAuditEvent, OrderAuditRow, OrderAuditWriter, ensure_order_audit_table,
 };
@@ -580,8 +581,10 @@ fn alert_row_parts(alert: &OmsAlert) -> Option<AlertRowParts> {
 }
 
 /// Append + flush one order_audit row; ledger `appended` increments ONLY
-/// when both succeed. Failures are coded AUDIT-06 (staged) — the writer's
-/// flush already discard-pends + counts.
+/// when both succeed. A failed flush spills the batch to the disk tier (audit
+/// PR42b) and counts as appended, since the rows are kept and replayed; the
+/// writer discards and counts only when the disk tier refuses it too.
+/// Failures are coded AUDIT-06 (staged).
 fn persist_order_row(
     writer: &mut OrderAuditWriter,
     stats: &OrderSideDayStats,
@@ -647,6 +650,10 @@ pub(crate) async fn run_order_side_consumer(
     // Subsystem-owned lazy ensure (idempotent; coded failure arms inside).
     ensure_order_audit_table(&wiring.questdb).await;
     ensure_pnl_audit_table(&wiring.questdb).await;
+    // Audit PR42b: the disk-tier drains start only after both tables are
+    // ensured, so a replay never auto-creates a table without its DEDUP key.
+    spawn_audit_spill_drain_once(AuditSpillTable::OrderAudit, &wiring.questdb);
+    spawn_audit_spill_drain_once(AuditSpillTable::PnlAudit, &wiring.questdb);
 
     let mut order_writer = OrderAuditWriter::new(&wiring.questdb);
     let mut pnl_writer = PnlAuditWriter::new(&wiring.questdb);
@@ -1318,7 +1325,34 @@ mod tests {
     /// both ensures' unreachable arms, all match arms, `alert_row_parts`
     /// (4 alert variants), `base_row`, and the AUDIT-06 flush-fail stage
     /// per row-producing message. The ledger proves it: 8 row-producing
-    /// messages received, 0 appended (every flush refused), 0 dropped.
+    /// messages received, 8 appended (every flush refused, every batch kept on
+    /// the disk tier), 0 dropped.
+    /// Removes the spill files this test process wrote into the production
+    /// relative directory (`data/spill/audit/...`, gitignored), so repeated
+    /// runs do not accumulate files or creep toward the disk-tier cap. Only
+    /// files carrying this process id in their name are touched.
+    struct ProcessSpillCleanup;
+
+    impl Drop for ProcessSpillCleanup {
+        fn drop(&mut self) {
+            let marker = format!("-{}-", std::process::id());
+            for table in [AuditSpillTable::OrderAudit, AuditSpillTable::PnlAudit] {
+                let Ok(entries) = std::fs::read_dir(table.default_dir()) else {
+                    continue;
+                };
+                for path in entries.filter_map(Result::ok).map(|e| e.path()) {
+                    let ours = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.contains(&marker));
+                    if ours {
+                        let _removed = std::fs::remove_file(&path).is_ok();
+                    }
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_consumer_drains_every_variant_with_unreachable_questdb() {
         let (tx, rx) = mpsc::channel::<OrderSideMsg>(ORDER_SIDE_CHANNEL_CAPACITY);
@@ -1361,12 +1395,16 @@ mod tests {
             try_send_order_side(&tx, &stats, msg);
         }
         drop(tx);
+        let _cleanup = ProcessSpillCleanup;
         run_order_side_consumer(rx, test_wiring(true, vec![]), Arc::clone(&stats)).await;
         assert_eq!(stats.received.load(Ordering::Relaxed), 8);
+        // Audit PR42b: with QuestDB unreachable every failed flush is written
+        // to the disk tier (data/spill/audit/, relative to the test's working
+        // directory) and replayed later, so all eight rows count as appended.
         assert_eq!(
             stats.appended.load(Ordering::Relaxed),
-            0,
-            "unreachable QuestDB — every flush fails, appended never advances"
+            8,
+            "unreachable QuestDB — every row goes to the disk tier, none is lost"
         );
         assert_eq!(stats.dropped.load(Ordering::Relaxed), 0);
     }
@@ -1405,6 +1443,7 @@ mod tests {
             },
         );
         drop(tx);
+        let _cleanup = ProcessSpillCleanup;
         run_order_side_consumer(rx, wiring, Arc::clone(&stats)).await;
         // PnlEod is not row-producing; the skip branch leaves the ledger
         // untouched and the consumer exits cleanly.
@@ -1439,6 +1478,7 @@ mod tests {
             },
         );
         drop(tx);
+        let _cleanup = ProcessSpillCleanup;
         run_order_side_consumer(rx, wiring, Arc::clone(&stats)).await;
         // No row-producing message went through the channel; the ledger
         // holds only the pre-seeded values and the consumer exits cleanly
@@ -1470,12 +1510,13 @@ mod tests {
             },
         );
         drop(tx);
+        let _cleanup = ProcessSpillCleanup;
         run_order_side_consumer(rx, test_wiring(false, vec![]), Arc::clone(&stats)).await;
         assert_eq!(stats.received.load(Ordering::Relaxed), 1);
         assert_eq!(
             stats.appended.load(Ordering::Relaxed),
-            0,
-            "unreachable QuestDB — the live-mode row still fails at flush"
+            1,
+            "unreachable QuestDB — the live-mode row goes to the disk tier (audit PR42b)"
         );
     }
 
@@ -1493,6 +1534,7 @@ mod tests {
             },
         );
         drop(tx);
+        let _cleanup = ProcessSpillCleanup;
         run_order_side_consumer(rx, test_wiring(true, vec![]), Arc::clone(&stats)).await;
         assert_eq!(
             stats.received.load(Ordering::Relaxed),

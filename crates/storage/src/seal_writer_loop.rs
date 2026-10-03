@@ -332,6 +332,23 @@ fn record_boot_drain_observability(outcome: &BootDrainOutcome) {
         metrics::counter!("tv_seal_writer_drain_total", "kind" => "boot_superseded")
             .increment(outcome.seals_superseded as u64);
     }
+    if outcome.seals_untracked > 0 {
+        metrics::counter!("tv_seal_writer_drain_total", "kind" => "boot_untracked")
+            .increment(outcome.seals_untracked as u64);
+    }
+    // S1: the summary that carries the older-copy guard across a stopped drain.
+    if outcome.summary_seeded > 0 {
+        metrics::counter!("tv_seal_writer_drain_total", "kind" => "boot_summary_seeded")
+            .increment(outcome.summary_seeded as u64);
+    }
+    if outcome.summary_refused > 0 {
+        metrics::counter!("tv_seal_writer_drain_total", "kind" => "boot_summary_refused")
+            .increment(outcome.summary_refused as u64);
+    }
+    if outcome.summary_not_persisted > 0 {
+        metrics::counter!("tv_seal_writer_drain_total", "kind" => "boot_summary_not_persisted")
+            .increment(outcome.summary_not_persisted as u64);
+    }
     let _ = report_unrecovered_seals(
         UnrecoveredStage::BootDrain,
         outcome
@@ -674,11 +691,9 @@ impl UnwrittenSealMark {
                 true
             }
             Err(err) => {
-                metrics::counter!(SEAL_UNWRITTEN_MARK_ERRORS_COUNTER).increment(1);
-                if !self.failing {
-                    self.failing = true;
-                    report_mark_write_failure(&self.path, &err);
-                }
+                // Counted on every failure, logged on the first of a run.
+                record_mark_write_failure(&self.path, &err, !self.failing);
+                self.failing = true;
                 false
             }
         }
@@ -705,9 +720,14 @@ fn write_mark_file(path: &std::path::Path, record: &UnwrittenSealRecord) -> std:
     std::fs::write(&tmp, record.to_line().as_bytes()).and_then(|()| std::fs::rename(&tmp, path))
 }
 
-/// A failed marker write, as a coded error (audit PR31b-1; it was an uncoded
-/// warning). Log only: AGGREGATOR-SEAL-01 does not page.
-fn report_mark_write_failure(path: &std::path::Path, err: &std::io::Error) {
+/// A failed marker write: counted every time, and when `log` is set reported
+/// as a coded error (audit PR31b-1; it was an uncoded warning). Log only:
+/// AGGREGATOR-SEAL-01 does not page.
+fn record_mark_write_failure(path: &std::path::Path, err: &std::io::Error, log: bool) {
+    metrics::counter!(SEAL_UNWRITTEN_MARK_ERRORS_COUNTER).increment(1);
+    if !log {
+        return;
+    }
     error!(
         code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
         source = "unwritten_mark",
@@ -759,8 +779,7 @@ pub fn finish_unwritten_mark_at_shutdown(
     match write_mark_file(&path, &record) {
         Ok(()) => true,
         Err(err) => {
-            metrics::counter!(SEAL_UNWRITTEN_MARK_ERRORS_COUNTER).increment(1);
-            report_mark_write_failure(&path, &err);
+            record_mark_write_failure(&path, &err, true);
             false
         }
     }
@@ -1126,6 +1145,10 @@ pub async fn run_seal_writer_loop(
             records_undecodable = boot.records_undecodable,
             seals_append_failed = boot.seals_append_failed,
             seals_superseded = boot.seals_superseded,
+            seals_untracked = boot.seals_untracked,
+            summary_seeded = boot.summary_seeded,
+            summary_refused = boot.summary_refused,
+            summary_not_persisted = boot.summary_not_persisted,
             "seal writer boot recovery drain finished"
         );
     }
@@ -1742,6 +1765,10 @@ mod tests {
             records_undecodable: 2,
             seals_append_failed: 3,
             seals_superseded: 4,
+            seals_untracked: 1,
+            summary_seeded: 6,
+            summary_refused: 1,
+            summary_not_persisted: 2,
         });
     }
 

@@ -59,10 +59,9 @@ use tickvault_app::depth_rebalance::{MoverRow, REBALANCE_INTERVAL_SECS};
 use tickvault_app::depth20_layout::DEPTH_20_SOCKETS;
 use tickvault_app::depth20_name_board::{
     DEPTH20_INDEX_ATM_STRIKES_EACH_SIDE, DEPTH20_INSTRUMENT_BUDGET, DEPTH20_NAME_ENTRY_RANK,
-    DEPTH20_NAME_EXIT_RANK, DEPTH20_NAME_STOCK_SOCKETS, DEPTH20_PER_SOCKET,
-    DEPTH20_STOCK_ATM_STRIKES_EACH_SIDE, NameBoardPlan, NameMove, board_slot_cost,
-    build_name_layout, move_bps, move_bps_from_pct, name_moves, rank_names, slots_for_index_name,
-    slots_for_stock_name,
+    DEPTH20_NAME_STOCK_SOCKETS, DEPTH20_PER_SOCKET, DEPTH20_STOCK_ATM_STRIKES_EACH_SIDE,
+    NameBoardPlan, NameMove, board_slot_cost, build_name_layout, move_bps, move_bps_from_pct,
+    name_moves, rank_names, slots_for_index_name, slots_for_stock_name,
 };
 use tickvault_app::depth20_ranked_steer::{
     DEPTH_SWAP_COMMAND_CHANNEL_DEPTH, DEPTH200_SWAP_COMMAND_CHANNEL_DEPTH,

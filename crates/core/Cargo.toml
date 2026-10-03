@@ -45,6 +45,8 @@ rustls-native-certs = { workspace = true }
 aws-lc-rs = { workspace = true }
 # Groww native shadow client (PR-R1): fresh x-request-id per socket-token mint.
 uuid = { workspace = true }
+# 2026-10-02 (owner-approved): reader-thread core pinning, Linux only.
+libc = { workspace = true }
 loom = { workspace = true, optional = true }
 
 [features]

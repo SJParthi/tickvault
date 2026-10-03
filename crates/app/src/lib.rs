@@ -149,6 +149,9 @@ pub mod dhan_universe;
 /// unchanged verified archive→drop and REFUSES to delete anything further
 /// when nothing reclaimable remains (STORAGE-GAP-05). DEFAULT-OFF via serde.
 pub mod disk_pressure_boot;
+/// Backup copies of the top contracts on a second main-feed socket, and the
+/// drain-side dedup that folds one copy of each packet (scope lock 2026-10-02).
+pub mod main_feed_backup;
 /// RAM residency stores boot (operator directive 2026-07-16, PR-2):
 /// installs the month-deep spot bar rings + current-day chain minute ring,
 /// runs the bounded chain-day rehydrate, and publishes the depth gauges.
@@ -183,6 +186,10 @@ pub mod volume_semantics_probe;
 // PR #3 (2026-05-19): `greeks_pipeline` module DELETED. Greeks
 // pipeline retired alongside the indices-only universe. Option Chain
 // REST overlay (PR #8) ships Dhan-computed greeks separately.
+/// `tickvault ensure-questdb`: bring the QuestDB container up (boot self-heal
+/// and the console's restart actions; audit D6d, replaced
+/// `scripts/ensure-questdb.sh`).
+pub mod ensure_questdb;
 /// `tickvault holiday-gate`: the boot-time NSE-holiday self-stop gate the
 /// holiday-gate systemd unit runs before the app (audit D6c; replaced
 /// `deploy/aws/holiday-gate.sh`).
@@ -200,6 +207,11 @@ pub mod host_limits;
 /// two shell scripts and an inline `/bin/sh -c`).
 pub mod host_tuning;
 pub mod infra;
+/// Cold 1 s sampler of the kernel receive queue on our Dhan :443 sockets
+/// (`/proc/net/tcp` and `/proc/net/tcp6`), published as gauges with one
+/// edge-triggered coded line when it stays past 4 MiB. Reads nothing and stays
+/// quiet where `/proc` is absent.
+pub mod kernel_rx_queue_sampler;
 pub mod leg_identity;
 pub mod log_coalescer;
 // 2026-05-09 PR 5c.5-final (Bug 3 — movers retirement): the

@@ -218,7 +218,7 @@ services:
       # dynamic ingress) — never public, even when bound 0.0.0.0. Compose v2
       # loads .env from the compose file's project dir for EVERY caller
       # (deploy-aws.yml, user-data boot, infra.rs --force-recreate,
-      # ensure-questdb.sh), so the prod bind persists across all restarts.
+      # `tickvault ensure-questdb`), so the prod bind persists across all restarts.
       - "${TV_QDB_HTTP_BIND:-127.0.0.1}:9000:9000" # HTTP API + Web Console (dev default: localhost only)
       - "8812:8812"            # PostgreSQL wire protocol
       - "9009:9009"            # InfluxDB Line Protocol (high-speed ingestion)

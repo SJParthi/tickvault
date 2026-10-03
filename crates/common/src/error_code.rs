@@ -163,6 +163,16 @@ pub enum ErrorCode {
     HotPath01SyncFsFailed,
     /// HOT-PATH-02: hot-path writer queue full / closed / uninitialized.
     HotPath02WriterQueueDrop,
+    /// HOT-PATH-03: the socket reader threads run unpinned because the
+    /// requested core pin was refused (core 0, a core outside the allowed
+    /// set, an unparseable value, or the kernel said no). Boot continues.
+    HotPath03ReaderPinNotApplied,
+    /// HOT-PATH-STALL-01: in session, a hot task (a tokio runtime, the frame
+    /// drain) made no progress for at least two seconds, or one hot-path step
+    /// took that long. Socket reads may have waited and Dhan may have skipped
+    /// ticks. Edge-triggered, at most one line a minute; pages (noise-lock
+    /// §2.8, owner-approved 2026-10-02).
+    HotPathStall01,
     /// TICK-SPILL-01 — a rescued tick-spill file was PERMANENTLY refused by
     /// QuestDB and has been quarantined so the rest of the backlog can drain.
     ///
@@ -1067,6 +1077,8 @@ impl ErrorCode {
             // Wave 1 (PR #393)
             Self::HotPath01SyncFsFailed => "HOT-PATH-01",
             Self::HotPath02WriterQueueDrop => "HOT-PATH-02",
+            Self::HotPath03ReaderPinNotApplied => "HOT-PATH-03",
+            Self::HotPathStall01 => "HOT-PATH-STALL-01",
             Self::TickSpill01FileQuarantined => "TICK-SPILL-01",
             // PR #5 (2026-05-19): PHASE2-01 / PHASE2-02 retired.
             Self::PrevClose01IlpFailed => "PREVCLOSE-01",
@@ -1343,6 +1355,7 @@ impl ErrorCode {
             // TICK-SPILL-01: rescued ticks are on disk and unreplayable until
             // someone looks. High because the spill tier IS the loss guarantee.
             Self::TickSpill01FileQuarantined => Severity::High,
+            Self::HotPathStall01 => Severity::High,
             // TF-VERIFY-01/02 (operator 2026-07-13) — the daily
             // timeframe-consistency verifier found a TF-vs-1m divergence /
             // ran degraded. High: operator eyes required on every occurrence
@@ -1457,6 +1470,7 @@ impl ErrorCode {
             Self::InstrumentP2TradingDayGuard
             | Self::Dh910Other
             | Self::HotPath02WriterQueueDrop
+            | Self::HotPath03ReaderPinNotApplied
             | Self::WsGap04PostCloseSleep
             | Self::DiskWatcher01Respawned
             | Self::AuthGap03TokenForceRenewedOnWake
@@ -1506,10 +1520,12 @@ impl ErrorCode {
             }
             Self::HotPath01SyncFsFailed
             | Self::HotPath02WriterQueueDrop
+            | Self::HotPath03ReaderPinNotApplied
             | Self::PrevClose01IlpFailed
             | Self::PrevClose02FirstSeenInconsistency
             | Self::PrevOi01CacheEmptyAtBoot
             | Self::PrevClose04CacheEmptyAtBoot => "docs/error-runbooks/wave-1-error-codes.md",
+            Self::HotPathStall01 => "docs/error-runbooks/hot-path-stall-error-codes.md",
             Self::WsSpill01WriterRespawn | Self::WsSpill02FrameDropped => {
                 "docs/error-runbooks/ws-frame-spill-error-codes.md"
             }
@@ -1795,6 +1811,8 @@ impl ErrorCode {
             Self::OrderReady01GateRefused,
             Self::HotPath01SyncFsFailed,
             Self::HotPath02WriterQueueDrop,
+            Self::HotPath03ReaderPinNotApplied,
+            Self::HotPathStall01,
             Self::TickSpill01FileQuarantined,
             // PR #5 (2026-05-19): Phase201DispatchFailed + Phase202EmitGuardDropped retired.
             Self::PrevClose01IlpFailed,
