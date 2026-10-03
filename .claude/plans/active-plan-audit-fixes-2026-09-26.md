@@ -419,7 +419,7 @@ inline (PR2, PR8, PR14).
     script is rule-locked to shell and needs an owner quote before it changes.
   - Series (2026-10-01, owned by the "Replace shell scripts with Rust" thread; one PR each,
     serial; the audit-plan thread skips D6):
-    - [ ] D6a — shell budget first: `crates/common/tests/shell_budget_guard.rs` freezes the 105
+    - [x] D6a — shell budget first: `crates/common/tests/shell_budget_guard.rs` freezes the 105
       shell files (46 developer tooling by file set; 59 others by file set AND line ceiling) and
       pins each systemd unit's shell `Exec*=` count (1 + 3 + 1). Rule lock §0.10. Test-only.
       Tests: `no_new_shell_files`, `shell_lists_shrink_only`, `ops_shell_files_never_grow`,
