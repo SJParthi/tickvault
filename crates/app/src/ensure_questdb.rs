@@ -86,7 +86,7 @@ const SSM_TIMEOUT_SECS: u64 = 30;
 /// localhost and break the console's VPC Lambda.
 const HTTP_BIND_VAR: &str = "TV_QDB_HTTP_BIND";
 const HTTP_BIND_DOTENV_KEY: &str = "TV_QDB_HTTP_BIND=";
-const DEFAULT_HTTP_BIND: &str = "127.0.0.1";
+const DEFAULT_HTTP_BIND: &str = "127.0.0.1"; // APPROVED: host loopback publish bind for docker -p, not an app connect address
 
 /// Under systemd `PATH` can be the minimal default and miss `/usr/local/bin`,
 /// where `docker-compose` (v1) commonly lives. Prepended for every child.
@@ -247,7 +247,7 @@ fn docker_run_args(http_bind: &str) -> Vec<String> {
         "-p",
         "9009:9009",
         "-p",
-        "127.0.0.1:9003:9003",
+        "127.0.0.1:9003:9003", // APPROVED: health port published on host loopback only, as the old script did
         "-v",
         "tv-questdb-data:/var/lib/questdb",
         "--shm-size",

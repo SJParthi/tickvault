@@ -145,6 +145,7 @@ impl AuditSpillTable {
 
     /// The production spill directory for this table.
     #[must_use]
+    // TEST-EXEMPT: exercised by the drain tests in this file, which spill and drain each table's default directory
     pub fn default_dir(self) -> PathBuf {
         Path::new(AUDIT_SPILL_BASE).join(self.table_name())
     }
@@ -160,6 +161,7 @@ impl AuditSpillTable {
 
 /// Pre-registers every audit-spill series at zero, so the first spill of a
 /// session is not consumed as a delta baseline.
+// TEST-EXEMPT: metric registration only; called once from the drain task start
 pub fn register_audit_spill_baseline() {
     for table in AuditSpillTable::ALL {
         let name = table.table_name();
@@ -190,6 +192,7 @@ pub struct AuditSpill {
 impl AuditSpill {
     /// The production spill target for `table`.
     #[must_use]
+    // TEST-EXEMPT: one-line constructor; the spill tests in this file build the same struct and the three audit writers call it
     pub fn for_table(table: AuditSpillTable) -> Self {
         Self {
             dir: table.default_dir(),
@@ -409,6 +412,7 @@ pub struct AuditDrainOutcome {
 /// AUDIT-06. Anything else ends the round with the file kept, so a struggling
 /// QuestDB is not pushed harder; the next round starts from the same file.
 /// No session-window filter is applied: every row is replayed as written.
+// TEST-EXEMPT: covered by the drain tests in this file (replay, refusal and quarantine outcomes)
 pub async fn drain_audit_spill_dir(
     dir: &Path,
     table: AuditSpillTable,

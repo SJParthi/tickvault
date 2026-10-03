@@ -1381,6 +1381,7 @@ async fn run_docker_compose_up(cli: ComposeCli, env_vars: &[(&str, String)]) -> 
 /// The ONE place compose is spawned, shared by the boot compose-up and by
 /// `tickvault ensure-questdb` (audit D6d), so the non-literal spawn count does
 /// not grow. The child is killed if the caller drops the future (a timeout).
+// TEST-EXEMPT: spawns docker compose, so no unit test can run it here; callers are ensure_questdb and infra
 pub(crate) async fn compose_output<V: AsRef<std::ffi::OsStr>>(
     cli: ComposeCli,
     compose_path: &str,
