@@ -1027,6 +1027,10 @@ jobs:
         # NOT a subcommand of `tickvault`. The previous version
         # (`bin/tickvault.new smoke-test --duration 30`) was wrong and would
         # exit non-zero with "unrecognized subcommand".
+        # The holiday-gate unit is copied only AFTER `bin/tickvault-host` is
+        # refreshed (audit D6c): the unit runs `tickvault-host holiday-gate`,
+        # and a deploy that fails its smoke test must not leave a new unit
+        # pointing at an older copy that does not know that subcommand.
         id: ssm
         # EXPRESSION-LENGTH LOCK (2026-08-18): this run block MUST stay free of
         # `${{ }}` interpolation. GitHub compiles any run script containing an
@@ -1070,7 +1074,6 @@ jobs:
               "wc -l config/production.toml repo/config/production.toml",
               "diff -q config/production.toml repo/config/production.toml || (echo FATAL: deployed config/production.toml differs from repo/config/production.toml after cp; diff config/production.toml repo/config/production.toml; exit 1)",
               "if [ -f repo/deploy/systemd/tickvault.service ]; then cp -f repo/deploy/systemd/tickvault.service /etc/systemd/system/tickvault.service; fi",
-              "if [ -f repo/deploy/systemd/tickvault-holiday-gate.service ]; then cp -f repo/deploy/systemd/tickvault-holiday-gate.service /etc/systemd/system/tickvault-holiday-gate.service; fi",
               "if [ -f repo/deploy/systemd/tickvault-host-tuning.service ]; then cp -f repo/deploy/systemd/tickvault-host-tuning.service /etc/systemd/system/tickvault-host-tuning.service; fi",
               "rm -rf scripts/groww-sidecar && echo GROWW-SIDECAR-RETIRED: on-box sidecar source removed",
               "rm -rf /opt/tickvault/data/groww/venv && echo GROWW-VENV-RETIRED: stale sidecar venv removed",
@@ -1083,6 +1086,7 @@ jobs:
               "mv bin/smoke_test.new  bin/smoke_test",
               "chown ec2-user:ec2-user bin/tickvault bin/smoke_test",
               "install -m 0755 -o root -g root bin/tickvault bin/tickvault-host",
+              "if [ -f repo/deploy/systemd/tickvault-holiday-gate.service ]; then cp -f repo/deploy/systemd/tickvault-holiday-gate.service /etc/systemd/system/tickvault-holiday-gate.service; fi",
               "grep -q \"^TV_QDB_HTTP_BIND=\" repo/deploy/docker/.env 2>/dev/null || echo \"TV_QDB_HTTP_BIND=0.0.0.0\" >> repo/deploy/docker/.env",
               "chown ec2-user:ec2-user repo/deploy/docker/.env",
               "if [ -f repo/deploy/docker/docker-compose.yml ]; then export TV_QUESTDB_PG_USER=$(aws ssm get-parameter --region ap-south-1 --name /tickvault/prod/questdb/pg-user --with-decryption --output text --query Parameter.Value 2>/dev/null || echo admin); export TV_QUESTDB_PG_PASSWORD=$(aws ssm get-parameter --region ap-south-1 --name /tickvault/prod/questdb/pg-password --with-decryption --output text --query Parameter.Value 2>/dev/null || echo quest); (cd repo/deploy/docker && { TV_QUESTDB_PG_USER=\"$TV_QUESTDB_PG_USER\" TV_QUESTDB_PG_PASSWORD=\"$TV_QUESTDB_PG_PASSWORD\" timeout 600 docker compose up -d && echo COMPOSE-UP-OK: first attempt; } || { echo \"WARN: compose up attempt 1 failed - a recreate leaves the old container renamed to <id>_<service> and the daemon can then refuse to start it; removing the containers of this compose project and retrying once (named volumes and data are untouched)\"; docker compose ps -aq 2>/dev/null | xargs -r docker rm -f >/dev/null 2>&1 || true; TV_QUESTDB_PG_USER=\"$TV_QUESTDB_PG_USER\" TV_QUESTDB_PG_PASSWORD=\"$TV_QUESTDB_PG_PASSWORD\" timeout 600 docker compose up -d && echo COMPOSE-UP-OK: recovered on attempt 2 after clearing stale containers; }) || (echo FATAL: docker compose up failed on BOTH attempts or exceeded 600s; docker compose -f repo/deploy/docker/docker-compose.yml ps -a || true; exit 1); else echo FATAL: docker-compose.yml missing from repo/deploy/docker; exit 1; fi",

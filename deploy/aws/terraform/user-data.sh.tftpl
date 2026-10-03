@@ -249,7 +249,6 @@ cp /opt/tickvault/repo/deploy/systemd/tickvault.service /etc/systemd/system/
 # (config/base.toml NSE holiday list — single source of truth), and self-stops
 # the instance on a non-trading day. FAIL-OPEN: only a definitive holiday
 # verdict stops the box. Override: `touch /opt/tickvault/ALLOW_HOLIDAY_RUN`.
-chmod +x /opt/tickvault/repo/deploy/aws/holiday-gate.sh
 cp /opt/tickvault/repo/deploy/systemd/tickvault-holiday-gate.service /etc/systemd/system/
 
 # Host tuning as a BOOT unit, not a launch-time script (2026-08-15) — see the

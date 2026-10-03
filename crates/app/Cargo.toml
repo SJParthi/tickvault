@@ -52,6 +52,13 @@ reqwest = { workspace = true }
 # the instance role already holds the permissions; ZERO IAM change).
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }
+# 2026-10-01 (audit D6c): `tickvault holiday-gate` stamps the holiday-stop
+# marker (SSM), pages the operator (SNS) and stops this instance (EC2), the
+# three AWS CLI calls the shell gate made. All three are existing workspace
+# pins; ssm and sns were already in this binary through tickvault-core.
+aws-sdk-ec2 = { workspace = true }
+aws-sdk-sns = { workspace = true }
+aws-sdk-ssm = { workspace = true }
 # Event-driven (zero-poll) file watching for the Groww bridge tick-file tail
 # (operator 2026-06-28: "true zero latency, no polling"). Same crate + pin the
 # strategy hot-reloader uses (`crates/trading/src/strategy/hot_reload.rs`) —

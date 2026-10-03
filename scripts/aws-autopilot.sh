@@ -200,7 +200,7 @@ if [ "$STATE" = "running" ]; then
 elif [ "$STATE" = "stopped" ]; then
   if is_box_up_window; then
     # NSE-holiday intentional stop (2026-07-07 round-3 review fix):
-    # deploy/aws/holiday-gate.sh self-stops the box at boot on a weekday NSE
+    # the holiday gate self-stops the box at boot on a weekday NSE
     # holiday and stamps today's IST date into this SSM param. Before this
     # check, autopilot's holiday-blind up-window self-start re-booted the
     # stopped box every 15 min all holiday — a boot/stop war whose 1-3 min
