@@ -305,7 +305,16 @@ fn scan_corpus_exists_and_is_substantial() {
 /// constituent-unresolved, gate-closed, persist-failed, task-died and
 /// still-failing lines in `dhan_universe.rs` now carry `WS-GAP-03` with a
 /// `source` naming the arm.
-const UNCODED_ERROR_BUDGET: usize = 71;
+///
+/// 71 -> 61 (2026-10-04, workspace audit M3). Ten sites CODED with existing
+/// codes, none of them paged: the order-update broadcast drop
+/// (`ORDER-EVT-01`, stage `broadcast_no_receiver`), the order-update WAL drop
+/// and the boot WAL replay failure (`WS-SPILL-02`, with a `source`), the
+/// order-update server auth/API error (`WS-GAP-01`), the two token-renewal
+/// give-up lines and the token publish failure (`AUTH-GAP-01`), the two
+/// static-IP boot-check lines (`GAP-NET-01`), and the seal-writer construct
+/// failure (`AGGREGATOR-SEAL-01`).
+const UNCODED_ERROR_BUDGET: usize = 61;
 
 /// Per-crate uncoded-error budgets, for the crates the six-name list never
 /// reached.

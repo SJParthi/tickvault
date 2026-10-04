@@ -529,15 +529,13 @@ folded into them below), then PR18, PR19 and the decisions.
     (`seal_spill.rs::SealSpillWriter::sync_open_file`, called from
     `seal_writer_runner.rs::SealEscalationSink::run`): the escalation thread syncs the day file
     after each batch that empties its queue, at least once a second under a burst, and once at
-    exit; the day rotation moves the closing file aside under the lock and the escalation thread
-    syncs and closes it off the lock (the first version synced it under the lock; fixed the same
-    day). The lock is held only to take or `dup` a handle, so an inline append never waits for
-    the device; `append_seal` itself never syncs. Failures on
+    exit; the day rotation syncs the closing file. The lock is held only to `dup` the handle, so
+    an inline append never waits for the device; `append_seal` itself never syncs. Failures on
     `tv_seal_spill_sync_failed_total`, one coded `error!` per failing episode. Tests:
     `sync_open_file_is_a_no_op_with_nothing_open_and_keeps_the_handle_open`,
     `the_drain_reachable_append_never_syncs_and_the_sync_holds_no_lock` (bite-tested), and the
     two escalation-summary tests now pin `syncs`. Not done: the seal DLQ is still not synced,
-    and a seal the drain writes inline (escalation queue full) waits for the thread's next sync, and is not synced at all once the thread has exited.
+    and a seal the drain writes inline (escalation queue full) waits for the thread's next sync, or for the day rotation if the thread has exited.
   - A frame the capture log refused and later deferred to it is labelled "deferred"
     (pool_supervisor.rs:3924-4002, tick_persistence.rs:2791): fix the label; counter and alarm
     are already right.
@@ -2640,7 +2638,42 @@ write, then candle warm-up (PR31b-2 (a), already listed above). Each fix ships a
   `crates/common/tests/cloudwatch_app_alarms_wiring.rs`. Tests:
   test_emf_metric_selectors_name_count_is_pinned, every_alarmed_counter_is_registered_at_boot,
   every_live_alarm_has_a_plain_english_phrase. Honest limits: the log-drop and feed-inline thresholds have no measured
-  baseline (Assumed); the order-update drop `error!` still carries no code (audit M3).
+  baseline (Assumed). The order-update drop `error!` carries `ORDER-EVT-01` since P2.
+
+- [x] **P2 — Ten uncoded `error!` lines get existing codes; the weekly mutation run can start.**
+  Audit M3: ten failure lines carried no code, so coded-error triage could not find them. Each now
+  carries an existing code, none of them paged (no new page, no noise-lock row): the order-update
+  broadcast drop (`ORDER-EVT-01`, stage `broadcast_no_receiver`, runbook row added), the
+  order-update WAL drop and the boot WAL replay failure (`WS-SPILL-02` with a `source`; the spill
+  already counts the drop per frame type), the order-update server auth/API error (`WS-GAP-01`),
+  the two token-renewal give-up lines and the token publish failure (`AUTH-GAP-01`), the two
+  static-IP boot-check lines (`GAP-NET-01`), and the seal-writer construct failure
+  (`AGGREGATOR-SEAL-01`). The uncoded budget falls 71 → 61. Audit H2: `cargo mutants` copied the
+  tree without `.git`, so the guards that call `git ls-files` failed the unmutated baseline and
+  no mutant was ever tested; the workflow now runs `--in-place` (serial, disposable checkout).
+  Audit L3: the committed test-count baseline moves 12295 → 13559 (measured). Files:
+  `crates/core/src/websocket/order_update_connection.rs`, `crates/core/src/auth/token_manager.rs`,
+  `crates/core/src/auth/dhan_token_publisher.rs`, `crates/core/src/network/ip_verifier.rs`,
+  `crates/app/src/main.rs`, `crates/common/tests/error_code_tag_guard.rs`,
+  `docs/error-runbooks/order-update-events-error-codes.md`, `.github/workflows/mutation.yml`,
+  `.claude/hooks/.test-count-baseline`. Tests: uncoded_error_sites_may_only_shrink,
+  every_error_macro_tagged_with_a_known_code_carries_code_field. Honest limits: `--in-place` is
+  proven only by the next scheduled or dispatched mutation run (Assumed until then); 61 uncoded
+  `error!` lines remain.
+
+- [x] **P3 — A spill replay that fails part-way through a file keeps what it finished.** Audit N1:
+  when a later chunk of a spill file failed (QuestDB busy, a read error), the round dropped the
+  chunks it had already finished, so the next round restarted at the old offset and set the same
+  refused lines aside again, once per retry, into `<file>.rejected-lines`. The failure branch now
+  records `resume_from + accepted` (every finished chunk ends on a line boundary) and counts those
+  bytes as replayed. Also: quarantining a whole file now forgets its resume offset, so the next
+  file of the same name (names recur per feed and hour) starts at its first byte instead of a
+  stale offset. Files: `crates/storage/src/tick_spill_replay.rs`. Tests:
+  a_failure_later_in_a_file_does_not_set_the_same_line_aside_twice,
+  quarantining_a_file_forgets_its_resume_offset. Honest limits: a failure INSIDE a chunk still
+  re-sends that chunk next round (idempotent, the dedup keys carry the row identity); the offset
+  map lives in memory only, so after a restart a partly drained file is re-sent from the start and
+  its refused lines are set aside a second time, as before.
 
 ## Edge Cases
 

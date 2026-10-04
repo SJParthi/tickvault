@@ -258,6 +258,11 @@ fn quarantine_spill_file(dir: &Path, path: &Path) -> std::io::Result<std::path::
         .unwrap_or_else(|| std::ffi::OsStr::new("unnamed.ilp")); // APPROVED: infallible fallback, no panic on a pathological path
     let target = free_quarantine_path(&quarantine, name)?;
     std::fs::rename(path, &target)?;
+    // The name recurs (one file per feed and hour), so an offset left behind
+    // would make the NEXT file of this name start part-way in and skip its
+    // first bytes, or read as already drained while it is shorter than the
+    // stale offset.
+    forget_resume_offset(path);
     Ok(target)
 }
 
@@ -1164,6 +1169,25 @@ pub async fn replay_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillRe
         }
 
         if failed {
+            // Keep what this round finished. `accepted` counts only chunks
+            // that were fully handled (POSTed and accepted, refused as out of
+            // window, or their refused lines written to quarantine), each one
+            // cut on a line boundary, so `resume_from + accepted` is the start
+            // of the first chunk not handled. Before 2026-10-04 a failure
+            // later in the file dropped this, the next round restarted at the
+            // old offset, and every line already set aside was isolated and
+            // appended to `<file>.rejected-lines` again, once per retry (audit
+            // N1). Re-POSTing the accepted rows was harmless (they upsert onto
+            // themselves); the duplicate quarantine lines and the repeated
+            // bisection work were not.
+            if accepted > 0 {
+                record_resume_offset(&path, resume_from.saturating_add(accepted));
+                outcome.bytes_replayed = outcome
+                    .bytes_replayed
+                    .saturating_add(accepted.saturating_sub(refused_bytes));
+                metrics::counter!("tv_tick_spill_replayed_bytes_total")
+                    .increment(accepted.saturating_sub(refused_bytes));
+            }
             outcome.files_failed = outcome.files_failed.saturating_add(1);
             metrics::counter!("tv_tick_spill_replay_failed_total").increment(1);
             // Stop the whole round: QuestDB is unhappy and the rest of the
@@ -2918,6 +2942,145 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
         .expect("kept"); // APPROVED: test
         assert_eq!(kept, b"ticks,poison-torn\n");
         forget_resume_offset(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An HTTP responder that reads the WHOLE body (by `Content-Length`, so a
+    /// full 8 MiB chunk is answered only after it arrived): 400 for a body
+    /// containing `poison`, 503 for `busy` when `busy_is_transient`, 204
+    /// otherwise.
+    async fn spawn_full_body_server(
+        busy_is_transient: bool,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind"); // APPROVED: test
+        let addr = listener.local_addr().expect("addr"); // APPROVED: test
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut req: Vec<u8> = Vec::new();
+                let mut buf = vec![0_u8; 65536];
+                let mut body_start = None;
+                let mut content_len = 0_usize;
+                loop {
+                    let n = sock.read(&mut buf).await.unwrap_or(0); // APPROVED: test
+                    if n == 0 {
+                        break;
+                    }
+                    req.extend_from_slice(&buf[..n]);
+                    if body_start.is_none()
+                        && let Some(i) = req.windows(4).position(|w| w == b"\r\n\r\n")
+                    {
+                        body_start = Some(i + 4);
+                        let head = String::from_utf8_lossy(&req[..i]).to_ascii_lowercase();
+                        content_len = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse().ok())
+                            .unwrap_or(0);
+                    }
+                    if let Some(start) = body_start
+                        && req.len() >= start + content_len
+                    {
+                        break;
+                    }
+                }
+                let body = &req[body_start.unwrap_or(req.len()).min(req.len())..];
+                let has = |needle: &[u8]| body.windows(needle.len()).any(|w| w == needle);
+                let resp = if has(b"poison") {
+                    "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                } else if busy_is_transient && has(b"busy") {
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                } else {
+                    "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                };
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (format!("http://{addr}/write"), handle)
+    }
+
+    /// Audit N1 (2026-10-04): a transient failure LATER in a file used to
+    /// throw away what the round had finished, so the next round restarted
+    /// at the old offset and set the same refused line aside a second time.
+    ///
+    /// The file holds a full first chunk with one torn line and a second
+    /// chunk QuestDB answers 503. Round 1 sets the torn line aside, then
+    /// stops at the 503. Round 2 must resume at the second chunk.
+    ///
+    /// Bite-proof: drop the `record_resume_offset` in the `failed` branch and
+    /// round 2 re-sends the first chunk, isolates the torn line again, and the
+    /// kept file holds it twice.
+    #[tokio::test]
+    async fn a_failure_later_in_a_file_does_not_set_the_same_line_aside_twice() {
+        let dir = temp_dir("n1-resume");
+        let path = dir.join("ticks-dhan-1.ilp");
+        let torn: &[u8] = b"ticks,segment=NSE_EQ,feed=dhan secupoison\n";
+        let mut body: Vec<u8> = Vec::with_capacity(REPLAY_MAX_CHUNK_BYTES + 4096);
+        body.extend_from_slice(torn);
+        let mut sid: u64 = 0;
+        while body.len() <= REPLAY_MAX_CHUNK_BYTES {
+            sid += 1;
+            body.extend_from_slice(
+                format!("ticks,segment=NSE_EQ,feed=dhan security_id={sid}i 1\n").as_bytes(),
+            );
+        }
+        body.extend_from_slice(b"ticks,segment=NSE_EQ,feed=dhan busy=1i 1\n");
+        std::fs::write(&path, &body).expect("write"); // APPROVED: test
+        let client = crate::http_client::build_probe_client(30).expect("client"); // APPROVED: test
+
+        let (url, server) = spawn_full_body_server(true).await;
+        let first = replay_spill_dir(&dir, &url, &client).await;
+        server.abort();
+        assert_eq!(first.lines_set_aside, 1, "round 1 sets the torn line aside");
+        assert_eq!(first.files_failed, 1, "and stops at the 503");
+        assert!(
+            resume_offset_for(&path) > 0,
+            "the finished first chunk is remembered"
+        );
+
+        let (url, server) = spawn_full_body_server(false).await;
+        let second = replay_spill_dir(&dir, &url, &client).await;
+        server.abort();
+        assert_eq!(second.files_failed, 0);
+        assert_eq!(
+            second.lines_set_aside, 0,
+            "round 2 resumes past the first chunk and never isolates the torn line again"
+        );
+        let kept = std::fs::read(
+            dir.join(QUARANTINE_DIR)
+                .join(format!("ticks-dhan-1.ilp{REJECTED_LINES_SUFFIX}")),
+        )
+        .expect("kept"); // APPROVED: test
+        assert_eq!(kept, torn, "the torn line is kept exactly once");
+        forget_resume_offset(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Spill names recur (one per feed and hour). A quarantined file must not
+    /// leave its resume offset for the next file of the same name, or that
+    /// file starts part-way in and its first bytes are never replayed.
+    ///
+    /// Bite-proof: drop the `forget_resume_offset` in `quarantine_spill_file`
+    /// and the offset survives the move.
+    #[test]
+    fn quarantining_a_file_forgets_its_resume_offset() {
+        let dir = temp_dir("quarantine-forgets-offset");
+        let spill = dir.join("ticks-dhan-1.ilp");
+        std::fs::write(&spill, b"aaaa\nbbbb\n").expect("write"); // APPROVED: test
+        record_resume_offset(&spill, 5);
+        assert_eq!(resume_offset_for(&spill), 5);
+        quarantine_spill_file(&dir, &spill).expect("quarantine"); // APPROVED: test
+        assert_eq!(
+            resume_offset_for(&spill),
+            0,
+            "a new file of the same name starts at the beginning"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

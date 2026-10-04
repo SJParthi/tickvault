@@ -1510,6 +1510,7 @@ impl TokenManager {
                 consecutive_circuit_breaker_cycles =
                     consecutive_circuit_breaker_cycles.saturating_add(1);
                 error!(
+                    code = tickvault_common::error_code::ErrorCode::AuthGapTokenExpiry.code_str(),
                     attempts,
                     circuit_breaker_cycle = consecutive_circuit_breaker_cycles,
                     max_cycles =
@@ -1538,6 +1539,8 @@ impl TokenManager {
                     >= tickvault_common::constants::TOKEN_RENEWAL_MAX_CIRCUIT_BREAKER_CYCLES
                 {
                     error!(
+                        code =
+                            tickvault_common::error_code::ErrorCode::AuthGapTokenExpiry.code_str(),
                         "token renewal halted after {} consecutive failures — operator must intervene",
                         consecutive_circuit_breaker_cycles
                     );
