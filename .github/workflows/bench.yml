@@ -137,11 +137,20 @@ jobs:
           restore-keys: |
             criterion-baseline-${{ steps.hw.outputs.fingerprint }}-
 
+      # `--bench '*'` builds and runs the Criterion bench targets only. Plain
+      # `cargo bench --workspace` also builds every library and binary as a
+      # test harness (they default to `bench = true`) at release settings
+      # (thin LTO, one codegen unit), so the app crate's ~2,500 inline tests
+      # were compiled with full optimisation for no measurement; no crate in
+      # this workspace has a `#[bench]` function, so nothing is lost. Together
+      # with the EC2 SDK override in Cargo.toml's [profile.bench.package] this
+      # keeps the build inside the runner's memory; from 2026-10-03 the runner
+      # was killed (exit 143) in the middle of the bench build on every run.
       - name: Run benchmarks (workspace)
         id: bench
         run: |
           set -o pipefail
-          cargo bench --workspace 2>&1 | tee bench-output.log
+          cargo bench --workspace --bench '*' 2>&1 | tee bench-output.log
 
       # BENCH_BUDGET_MULTIPLIER rationale (measured, 2026-07-06 audit of all
       # 55 red runs): worst observed absolute misfit on ubuntu-latest is

@@ -283,5 +283,18 @@ codegen-units = 1         # Single codegen unit — better optimization at cost 
 strip = "symbols"         # Strip debug symbols from release binary
 panic = "abort"           # No stack unwinding in production — smaller, faster, no catch_unwind
 
+# Benchmarks only (`cargo bench`; the shipped binary is built with
+# [profile.release] and is unaffected). The app crate depends on the EC2 SDK
+# since the holiday gate moved into Rust (2026-10-01), so every bench build
+# compiles it. At [profile.release] settings that one crate peaked at 9.9 GB
+# and took 13 minutes on a 4-core, 15 GB machine, and the CI runner (16 GB) was
+# killed in the middle of the bench build on every run from 2026-10-03. No
+# benchmark calls into it. Measured on the same machine, -j1:
+#   opt-level 3, codegen-units 1:   9,903 MiB peak, 784 s
+#   opt-level 0, codegen-units 16:  6,177 MiB peak, 190 s
+[profile.bench.package.aws-sdk-ec2]
+opt-level = 0
+codegen-units = 16
+
 [profile.dev]
 # Keep defaults for dev — fast compilation, debug symbols, overflow checks on by default
