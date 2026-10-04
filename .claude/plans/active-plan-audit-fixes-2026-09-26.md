@@ -2753,6 +2753,23 @@ write, then candle warm-up (PR31b-2 (a), already listed above). Each fix ships a
   asked (2026-10-04) whether to keep the cap. `terraform fmt`/`validate` not run (no terraform
   CLI in the container).
 
+- [x] **M5/L8/L2 — Embedded shell, awk/jq and flaky tests are budgeted.** Before: the console's
+  SSM command strings, the shell inside workflow SSM commands, and awk/jq programs could grow
+  without any guard, and a test that failed once and passed on retry turned CI green. Now:
+  `crates/common/tests/shell_budget_guard.rs` pins the console's embedded shell per file (lines
+  and bytes), each workflow's SSM shell, every file's awk/jq use and the All Green jq program,
+  as ceilings that may only fall (a stale row fails too); the CI nextest profile sets
+  `flaky-result = "fail"` and requires nextest 0.9.131 or later. The rust-only lock §0.10 records
+  the rule. Files: `crates/common/tests/shell_budget_guard.rs`, `.config/nextest.toml`,
+  `.claude/rules/project/rust-only-forever-lock-2026-07-19.md`,
+  `docs/claude-rules-full/project/rust-only-forever-lock-2026-07-19.md`. Tests:
+  console_embedded_shell_never_grows, ssm_workflow_shell_never_grows, awk_jq_usage_never_grows,
+  all_green_jq_program_never_grows, embedded_shell_and_awk_jq_self_test,
+  nextest_ci_profile_fails_flaky_tests, nextest_flaky_self_test (shell_budget_guard 12 pass;
+  each table bite-checked). Verified with nextest 0.9.146, the version CI installs: a test that
+  passes only on retry is reported `FLKY-FL` and fails the run. Honest limit: a budget caps
+  growth; it does not remove the existing shell (that is the shrink-only follow-up).
+
 ## Edge Cases
 
 - PR1: log burst larger than the non-blocking buffer → lines dropped and counted, never blocking.
