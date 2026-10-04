@@ -269,6 +269,25 @@ any legacy call reappearing in `order_runtime.rs`. Bite-proven both directions.
 `a_long_and_a_short_on_one_id_in_two_segments_do_not_net` is the behavioural
 bite: revert one call to the legacy overload and both segment rows read 0.
 
+**⚠ CHANGED 2026-10-04 (audit M7) — the order now carries its segment, so
+three statements above are out of date.** `ManagedOrder` and
+`PlaceOrderRequest` gained `exchange_segment`; a plain order sends it on the
+wire, and super and forever orders book NSE_FNO. An unknown segment code is
+refused before any order exists (`resolve_order_segment_code`, counted on
+`tv_oms_unknown_order_segment_refused_total`, logged as `I-P1-11`).
+(a) `pending_paper` and the reconcile mirror are keyed on
+`(security_id, segment)`, so a mark fills only an order on its own segment and
+`segment_matches_first_seen` is REMOVED (the bite test
+`a_mark_on_another_segment_must_not_fill_a_pending_paper_order` still passes,
+now on the key). (b) The local reconcile compares per segment on both legs, so
+it now DOES catch a cross-segment mis-booking
+(`test_local_reconcile_catches_a_fill_booked_to_the_wrong_segment`); the
+"cannot detect" sentence above no longer holds. (c) `exit_execution.rs` closes
+and cancels only its own segment and is off the legacy-call baseline;
+`trading_pipeline.rs` (dead) is the one file left on it. **What has NOT
+changed:** Landmine 2 (the E9 cross-feed id-space mapping) is untouched, and
+there is still **no `dry_run = false` flip on the strength of this change.**
+
 ## §4. Scope guard — EXPLICITLY OUT (a violating PR is REJECTED)
 
 1. Strategy/indicator activation — §28 boundary; the runtime never

@@ -82,6 +82,7 @@ use tickvault_common::trading_calendar::TradingCalendar;
 use tickvault_core::auth::token_manager::TokenHandle;
 
 use tickvault_trading::indicator::{IndicatorEngine, IndicatorParams};
+use tickvault_trading::oms::types::resolve_order_segment_code;
 use tickvault_trading::oms::{
     OrderApiClient, OrderManagementSystem, OrderRateLimiter, PlaceOrderRequest,
 };
@@ -492,8 +493,18 @@ async fn run_trading_pipeline(
                                     let risk_result = risk_engine.check_order(tick.security_id, 1);
                                     match risk_result {
                                         RiskCheck::Approved => {
+                                            // I-P1-11 (audit M7): the order is placed in the
+                                            // tick's own segment; an unknown code is refused
+                                            // (counted + coded inside the resolver), never guessed.
+                                            let Some(order_segment) = resolve_order_segment_code(
+                                                tick.exchange_segment_code,
+                                                tick.security_id,
+                                            ) else {
+                                                continue;
+                                            };
                                             let request = PlaceOrderRequest {
                                                 security_id: tick.security_id,
+                                                exchange_segment: order_segment,
                                                 transaction_type: TransactionType::Buy,
                                                 order_type: OrderType::Market,
                                                 product_type: ProductType::Intraday,
@@ -568,8 +579,18 @@ async fn run_trading_pipeline(
                                     let risk_result = risk_engine.check_order(tick.security_id, -1);
                                     match risk_result {
                                         RiskCheck::Approved => {
+                                            // I-P1-11 (audit M7): the order is placed in the
+                                            // tick's own segment; an unknown code is refused
+                                            // (counted + coded inside the resolver), never guessed.
+                                            let Some(order_segment) = resolve_order_segment_code(
+                                                tick.exchange_segment_code,
+                                                tick.security_id,
+                                            ) else {
+                                                continue;
+                                            };
                                             let request = PlaceOrderRequest {
                                                 security_id: tick.security_id,
+                                                exchange_segment: order_segment,
                                                 transaction_type: TransactionType::Sell,
                                                 order_type: OrderType::Market,
                                                 product_type: ProductType::Intraday,
@@ -1913,6 +1934,7 @@ threshold = 25.0
         };
         let request = PlaceOrderRequest {
             security_id: tick.security_id,
+            exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Market,
             product_type: ProductType::Intraday,
@@ -1939,6 +1961,7 @@ threshold = 25.0
         };
         let request = PlaceOrderRequest {
             security_id: tick.security_id,
+            exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
             transaction_type: TransactionType::Sell,
             order_type: OrderType::Market,
             product_type: ProductType::Intraday,
@@ -1981,6 +2004,7 @@ threshold = 25.0
         // Place a market order (simulating EnterLong)
         let request = PlaceOrderRequest {
             security_id: 52432,
+            exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Market,
             product_type: ProductType::Intraday,
@@ -2043,6 +2067,7 @@ threshold = 25.0
         for i in 0..5_u32 {
             let request = PlaceOrderRequest {
                 security_id: 50000 + u64::from(i),
+                exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
                 transaction_type: if i % 2 == 0 {
                     TransactionType::Buy
                 } else {
@@ -3415,6 +3440,7 @@ threshold = 70.0
         // Place a paper order first
         let request = PlaceOrderRequest {
             security_id: 52432,
+            exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Market,
             product_type: ProductType::Intraday,
@@ -3558,6 +3584,7 @@ threshold = 30.0
         for sec_id in [100_u64, 200, 300] {
             let request = PlaceOrderRequest {
                 security_id: sec_id,
+                exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
                 transaction_type: TransactionType::Buy,
                 order_type: OrderType::Market,
                 product_type: ProductType::Intraday,

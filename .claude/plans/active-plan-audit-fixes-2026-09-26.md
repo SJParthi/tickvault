@@ -2697,6 +2697,85 @@ write, then candle warm-up (PR31b-2 (a), already listed above). Each fix ships a
   `crates/storage/tests/dhat_seal_queue_backlog.rs`. Test:
   dhat_seal_queue_backlog_never_allocates_where_the_tokio_queue_did.
 
+- [x] **M7 — Orders carry their exchange segment (I-P1-11).** `ManagedOrder` and
+  `PlaceOrderRequest` had no segment, so the paper filler, the reconcile mirror and the exit path
+  keyed on the bare `security_id` and two instruments sharing an id in different segments could
+  fill, net or close each other. Both now carry `exchange_segment`; a plain order sends it on the
+  wire, super and forever orders book NSE_FNO, and an unknown segment code is refused before any
+  order exists (`resolve_order_segment_code` / `resolve_order_segment_str`, counted on
+  `tv_oms_unknown_order_segment_refused_total{source}`, logged with `code = I-P1-11`).
+  `order_runtime` keys `mirror` and `pending_paper` on `(security_id, segment)` and drops
+  `segment_matches_first_seen`; `local_reconcile` compares per segment on both legs; the exit
+  path closes and cancels only its own segment and its bracket check reads NSE_FNO; the dead
+  pipeline books the tick's segment. Files: `crates/trading/src/oms/{types.rs,engine.rs,
+  reconciliation.rs,exit_rules.rs}`, `crates/trading/tests/{gap_enforcement.rs,oms_integration.rs,
+  safety_layer.rs}`, `crates/app/src/{order_runtime.rs,exit_execution.rs,trading_pipeline.rs}`,
+  `crates/app/tests/risk_segment_aware_call_guard.rs` (exit_execution off the baseline). Tests:
+  a_mark_on_another_segment_must_not_fill_a_pending_paper_order (bite-checked: fails with a
+  bare-sid lookup), test_local_reconcile_catches_a_fill_booked_to_the_wrong_segment,
+  test_execute_exit_closes_only_its_own_segment, test_execute_exit_refuses_an_unknown_segment_code.
+  Honest limits: Landmine 2 (the E9 cross-feed id-space mapping) is untouched and there is no
+  `dry_run` flip; `trading_pipeline.rs` still calls the legacy risk overloads (dead code, pinned
+  shrink-only); O(1), one hash probe per lookup.
+
+- [x] **M8 — Subscription changes are written to `ws_event_audit`.** An in-place swap, an
+  in-place resubscribe, a ghost unsubscribe resend and an 805 park reached a log line and a counter
+  only, and CloudWatch keeps logs 14 days, so which contract a socket carried when lived nowhere
+  durable. Four new kinds (`subscription_swapped`, `subscription_resubscribed`,
+  `ghost_unsubscribe_resent`, `overflow_parked`) and five nullable columns (`new_security_id`,
+  `new_segment`, `instruments_added`, `instruments_removed`, `instruments_held`; the old instrument
+  uses `security_id`/`segment`), self-healed with `ALTER ADD COLUMN IF NOT EXISTS`. The emit is one
+  `OnceLock` load and one `try_send` per command (never per tick); a full channel is counted on
+  `tv_ws_event_audit_dropped_total{reason="subscription_change"}`. The live-feed forwarder installs
+  the channel and writes the rows, and every row it writes gets a strictly increasing stamp
+  (`StrictStamp`, `max(now, last + 1)`), so two events of one kind on one socket inside one clock
+  tick cannot share a DEDUP key. Files: `crates/common/src/ws_event_types.rs`,
+  `crates/storage/src/ws_event_audit_persistence.rs`,
+  `crates/core/src/websocket/{pool_supervisor.rs,order_update_connection.rs}`,
+  `crates/app/src/{ws_audit_consumer.rs,dhan_rest_stack.rs}`. Tests:
+  test_subscription_change_kinds_round_trip_and_are_distinct,
+  a_swap_row_names_its_pool_both_contracts_and_the_outcome,
+  an_overflow_park_row_carries_the_805_code,
+  the_stamp_is_strictly_increasing_even_when_the_clock_stalls_or_steps_back (bite-checked: fails
+  with `<` in place of `<=`), the_forwarder_installs_the_subscription_channel_and_writes_its_rows,
+  install_subscription_audit_is_set_once. Honest limits: a resubscribe row carries counts, not the
+  instrument list; a row the bounded channel cannot take is counted and paged once per episode,
+  not kept; not run against a live QuestDB here.
+
+- [x] **M4/L4 — The operator console is harder to abuse.** The portal is a public URL behind one
+  shared secret that can stop the trading box. Before: CORS allowed any origin, the key sat in
+  `localStorage`, two server strings reached `innerHTML` unescaped, and nothing slowed a caller
+  guessing keys. Now: no CORS block on the Function URL or the API (same-origin only); the key is
+  kept in `sessionStorage`; both strings pass through `esc()`; a per-container failed-key guard
+  refuses a source after `AUTH_FAILURE_LIMIT` (10) wrong keys in `AUTH_FAILURE_WINDOW_SECS` (300)
+  with a 429, bounded at `AUTH_FAILURE_MAX_SOURCES` (4,096); reserved concurrency 3; an API
+  Gateway stage throttle (rate 2/s, burst 10). Files: `crates/aws-lambdas/src/{operator_control.rs,
+  operator_control_console.html}`, `deploy/aws/terraform/operator-control-lambda.tf`, new
+  `crates/aws-lambdas/tests/operator_portal_exposure_guard.rs`. Tests: aws-lambdas lib 613,
+  operator_portal_exposure_guard 4, browser_surface_and_toolchain_guard 12. Honest limits: the
+  guard is per container, so the ceiling is 3 × 10 per window per source and an address-rotating
+  caller is not limited by it; the secret's length is the real control. **Risk:** AWS refuses
+  reserved concurrency when the account limit is 10, and the apply runs on merge; the owner was
+  asked (2026-10-04) whether to keep the cap. `terraform fmt`/`validate` not run (no terraform
+  CLI in the container).
+
+- [x] **M5/L8/L2 — Embedded shell, awk/jq and flaky tests are budgeted.** Before: the console's
+  SSM command strings, the shell inside workflow SSM commands, and awk/jq programs could grow
+  without any guard, and a test that failed once and passed on retry turned CI green. Now:
+  `crates/common/tests/shell_budget_guard.rs` pins the console's embedded shell per file (lines
+  and bytes), each workflow's SSM shell, every file's awk/jq use and the All Green jq program,
+  as ceilings that may only fall (a stale row fails too); the CI nextest profile sets
+  `flaky-result = "fail"` and requires nextest 0.9.131 or later. The rust-only lock §0.10 records
+  the rule. Files: `crates/common/tests/shell_budget_guard.rs`, `.config/nextest.toml`,
+  `.claude/rules/project/rust-only-forever-lock-2026-07-19.md`,
+  `docs/claude-rules-full/project/rust-only-forever-lock-2026-07-19.md`. Tests:
+  console_embedded_shell_never_grows, ssm_workflow_shell_never_grows, awk_jq_usage_never_grows,
+  all_green_jq_program_never_grows, embedded_shell_and_awk_jq_self_test,
+  nextest_ci_profile_fails_flaky_tests, nextest_flaky_self_test (shell_budget_guard 12 pass;
+  each table bite-checked). Verified with nextest 0.9.146, the version CI installs: a test that
+  passes only on retry is reported `FLKY-FL` and fails the run. Honest limit: a budget caps
+  growth; it does not remove the existing shell (that is the shrink-only follow-up).
+
 ## Edge Cases
 
 - PR1: log burst larger than the non-blocking buffer → lines dropped and counted, never blocking.

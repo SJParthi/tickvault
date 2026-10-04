@@ -27,6 +27,12 @@ pub struct ManagedOrder {
     pub correlation_id: String,
     /// Dhan security identifier.
     pub security_id: u64,
+    /// Exchange segment the order was placed in. Together with `security_id`
+    /// this is the I-P1-11 composite instrument key — Dhan reuses one numeric
+    /// id across segments, so `security_id` alone does NOT name an instrument.
+    /// Taken from the placement request (plain orders) or from the segment
+    /// string the order was sent with on the wire (super / forever orders).
+    pub exchange_segment: ExchangeSegment,
     /// Buy or sell.
     pub transaction_type: TransactionType,
     /// Order execution type (LIMIT, MARKET, etc.).
@@ -134,6 +140,66 @@ pub fn parse_segment_chars(exchange: &str, segment: &str) -> Option<ExchangeSegm
     }
 }
 
+/// Refusal path shared by the two order-segment resolvers: one counter
+/// increment (static labels) plus one coded `error!`. Cold — reached only
+/// when a caller holds a segment value that names no known segment.
+fn refuse_unknown_order_segment(security_id: u64, source: &'static str) {
+    metrics::counter!("tv_oms_unknown_order_segment_refused_total", "source" => source)
+        .increment(1);
+    tracing::error!(
+        code =
+            tickvault_common::error_code::ErrorCode::InstrumentP1CrossSegmentCollision.code_str(),
+        security_id,
+        source,
+        "I-P1-11: order refused — its exchange segment names no known segment, so \
+         the order cannot be keyed on the composite (security_id, exchange_segment) \
+         instrument; never guessed"
+    );
+}
+
+/// Resolves the exchange segment an order is placed in from a numeric wire
+/// code (`ExchangeSegment::binary_code`, e.g. a tick header's byte 3).
+///
+/// `None` — never a guess, never a panic (annexure rule 15; code 6 is a gap)
+/// — when the code names no segment. The refusal is counted on
+/// `tv_oms_unknown_order_segment_refused_total{source="code"}` and logged
+/// with `code = I-P1-11`. O(1).
+#[must_use]
+pub fn resolve_order_segment_code(segment_code: u8, security_id: u64) -> Option<ExchangeSegment> {
+    let resolved = ExchangeSegment::from_byte(segment_code);
+    if resolved.is_none() {
+        refuse_unknown_order_segment(security_id, "code");
+    }
+    resolved
+}
+
+/// Resolves the exchange segment an order is placed in from the Dhan REST
+/// segment string the order carries on the wire (`"NSE_FNO"`, `"IDX_I"`, …
+/// — the exact inverse of [`ExchangeSegment::as_str`]).
+///
+/// `None` on an unknown string, counted on
+/// `tv_oms_unknown_order_segment_refused_total{source="wire_string"}` and
+/// logged with `code = I-P1-11`. O(1) — one match over at most eight
+/// literals.
+#[must_use]
+pub fn resolve_order_segment_str(wire_segment: &str, security_id: u64) -> Option<ExchangeSegment> {
+    let resolved = match wire_segment {
+        "IDX_I" => Some(ExchangeSegment::IdxI),
+        "NSE_EQ" => Some(ExchangeSegment::NseEquity),
+        "NSE_FNO" => Some(ExchangeSegment::NseFno),
+        "NSE_CURRENCY" => Some(ExchangeSegment::NseCurrency),
+        "BSE_EQ" => Some(ExchangeSegment::BseEquity),
+        "MCX_COMM" => Some(ExchangeSegment::McxComm),
+        "BSE_CURRENCY" => Some(ExchangeSegment::BseCurrency),
+        "BSE_FNO" => Some(ExchangeSegment::BseFno),
+        _ => None,
+    };
+    if resolved.is_none() {
+        refuse_unknown_order_segment(security_id, "wire_string");
+    }
+    resolved
+}
+
 // ---------------------------------------------------------------------------
 // Place Order Request
 // ---------------------------------------------------------------------------
@@ -145,6 +211,13 @@ pub fn parse_segment_chars(exchange: &str, segment: &str) -> Option<ExchangeSegm
 pub struct PlaceOrderRequest {
     /// Dhan security identifier.
     pub security_id: u64,
+    /// Exchange segment of the instrument (I-P1-11 — the order's instrument is
+    /// `(security_id, exchange_segment)`). Sent on the wire as
+    /// [`ExchangeSegment::as_str`] and stored on the tracked [`ManagedOrder`].
+    /// A caller holding a raw wire code or string resolves it with
+    /// [`resolve_order_segment_code`] / [`resolve_order_segment_str`], which
+    /// refuse an unknown value instead of guessing.
+    pub exchange_segment: ExchangeSegment,
     /// Buy or sell.
     pub transaction_type: TransactionType,
     /// Order execution type.
@@ -2137,6 +2210,13 @@ pub enum OmsError {
         expiry_date: String,
     },
 
+    /// I-P1-11: the order's exchange segment names no known segment, so the
+    /// order cannot be keyed on its composite `(security_id, segment)`
+    /// instrument. Refused before any HTTP call; counted on
+    /// `tv_oms_unknown_order_segment_refused_total`.
+    #[error("unknown exchange segment for security_id {security_id} — order refused (I-P1-11)")]
+    UnknownExchangeSegment { security_id: u64 },
+
     /// Maximum modifications per order exceeded.
     #[error("max modifications ({max}) exceeded for order {order_id}")]
     MaxModificationsExceeded { order_id: String, max: u32 },
@@ -2214,6 +2294,7 @@ mod tests {
             order_id: "1".to_owned(),
             correlation_id: "c1".to_owned(),
             security_id: 100,
+            exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -3105,6 +3186,7 @@ mod tests {
             order_id: "1".to_owned(),
             correlation_id: "c1".to_owned(),
             security_id: 100,
+            exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Market,
             product_type: ProductType::Intraday,
@@ -3173,6 +3255,7 @@ mod tests {
             order_id: "ORD-123".to_owned(),
             correlation_id: "COR-456".to_owned(),
             security_id: 52432,
+            exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -4332,5 +4415,62 @@ mod tests {
         };
         assert_eq!(placement.clone().legs.len(), 1);
         assert_eq!(placement.legs[0].leg, OrderLeg::TargetLeg);
+    }
+
+    // Audit M7 (2026-10-04): the order-segment resolvers. An unknown value
+    // is refused (None), never guessed, never a panic.
+    #[test]
+    fn test_resolve_order_segment_code_maps_every_known_code() {
+        for segment in [
+            ExchangeSegment::IdxI,
+            ExchangeSegment::NseEquity,
+            ExchangeSegment::NseFno,
+            ExchangeSegment::NseCurrency,
+            ExchangeSegment::BseEquity,
+            ExchangeSegment::McxComm,
+            ExchangeSegment::BseCurrency,
+            ExchangeSegment::BseFno,
+        ] {
+            assert_eq!(
+                resolve_order_segment_code(segment.binary_code(), 13),
+                Some(segment),
+                "{segment:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_order_segment_code_refuses_the_gap_and_unknown_codes() {
+        // Code 6 is the annexure gap between MCX_COMM (5) and BSE_CURRENCY (7).
+        for code in [6_u8, 9, 42, u8::MAX] {
+            assert_eq!(resolve_order_segment_code(code, 13), None, "code {code}");
+        }
+    }
+
+    #[test]
+    fn test_resolve_order_segment_str_round_trips_every_wire_string() {
+        for segment in [
+            ExchangeSegment::IdxI,
+            ExchangeSegment::NseEquity,
+            ExchangeSegment::NseFno,
+            ExchangeSegment::NseCurrency,
+            ExchangeSegment::BseEquity,
+            ExchangeSegment::McxComm,
+            ExchangeSegment::BseCurrency,
+            ExchangeSegment::BseFno,
+        ] {
+            assert_eq!(
+                resolve_order_segment_str(segment.as_str(), 13),
+                Some(segment),
+                "{segment:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_order_segment_str_refuses_unknown_and_wrong_case() {
+        for wire in ["", "nse_fno", "NSE", "NSE_FNO ", "IDX", "NSE_COMM"] {
+            assert_eq!(resolve_order_segment_str(wire, 13), None, "{wire:?}");
+        }
     }
 }
