@@ -2675,6 +2675,22 @@ write, then candle warm-up (PR31b-2 (a), already listed above). Each fix ships a
   map lives in memory only, so after a restart a partly drained file is re-sent from the start and
   its refused lines are set aside a second time, as before.
 
+- [x] **P4 — A failed half-open probe re-opens the order circuit breaker.** Found writing the H3
+  loom model: when the one half-open probe failed, `record_failure` left the old open window and
+  the spent probe flag in place, so `state()` read HalfOpen for ever and `check()` refused every
+  order, the next probe included, until a manual `reset()`. A failure while the probe is spent now
+  re-arms the open window from now and frees the probe (window stored before the flag is
+  released), and `check()` re-reads the state after winning the probe flag, so a failed probe is
+  never followed at once by another. Audit H3: the loom tests now drive the real struct through a
+  `crate::sync` shim (loom atomics under the `loom` feature, std atomics otherwise). Files:
+  `crates/trading/src/{sync.rs,lib.rs,oms/circuit_breaker.rs}`,
+  `crates/trading/tests/loom_circuit_breaker.rs`. Tests:
+  test_regression_failed_half_open_probe_rearms_the_open_window,
+  test_late_failure_while_open_keeps_the_open_window,
+  loom_failed_probe_reopens_and_allows_no_second_probe (both bite-checked: each fails with the
+  re-arm removed). Honest limits: only the breaker moved behind the shim here; the other loom files are unchanged
+  by this item; O(1), three atomics on the failure path.
+
 ## Edge Cases
 
 - PR1: log burst larger than the non-blocking buffer → lines dropped and counted, never blocking.
