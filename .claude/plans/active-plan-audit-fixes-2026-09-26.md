@@ -2022,6 +2022,23 @@ New items:
   `app`)
   - This item owns the PR40b corrections above: rows 187 (c6#168; `.overflow` as well as
     `.bin.N`) and 194 (exempt refused and poison files; move the prune after recovery).
+  - **Partly done 2026-10-04.** Row 187: `seal_spill::is_spill_record_name` /
+    `strip_copy_suffixes` match `.bin.N`, stacked `.bin.N.M` and `.bin.overflow`, and the prune,
+    the cold uploader (`ColdFileSet::seal_spill`, now `matches: fn(&Path) -> bool`) and the
+    replay staging (`staged_kind`) all use them; before, the first two matched `*.bin` only and
+    staging never read an `.overflow` file. Row 194, second half: instead of moving the call in
+    main.rs, `prune_spill_files` holds aged top-level and `replaying/` files
+    (`held_before_boot_drain`) until `drain_recovered_seals` has run over that folder in this
+    process (`note_boot_drain_ran`), which covers the 6-hourly and disk-pressure passes too.
+    Tests: `test_is_spill_record_name_and_strip_copy_suffixes_match_every_renamed_copy`,
+    `spill_sweep_prunes_renamed_copies_and_counts_their_records`,
+    `spill_sweep_keeps_aged_unreplayed_files_until_the_boot_drain_has_run`,
+    `test_note_boot_drain_ran_and_boot_drain_ran_are_per_directory`, `staging_reads_overflow_and_twice_renamed_copies`,
+    `the_boot_drain_lets_the_retention_sweep_delete_unreplayed_files`, and the updated
+    `test_run_file_pass_uploads_every_spill_folder_and_a_second_pass_does_nothing`. **Still
+    open:** exempting refused and poison files (with the copy gate on, the default, they are
+    deleted only with a verified cold copy), and row 296 below. Limit: with no boot drain in
+    the process (Dhan lane off) unreplayed files are never age-pruned; they are kept, not lost.
   - Row 296: report staged-for-retry seals as pending rather than unrecovered, page once, and
     fix the wiring test that pins the over-count (seal_writer_loop.rs:321-331, :1709-1750).
 - [ ] **OWNER-202 — exits refused at 25,000 tracked orders.** (decision only, no code)
@@ -2696,7 +2713,7 @@ Status of the rest, so the next session does not re-audit:
 
 | State | Items |
 |---|---|
-| Partly done (remaining work named in each item) | PR5, PR8 (shutdown/boot `blocking_flush`, seal-writer cycle, order observability flushes still `block_in_place`), D2 (waits on PR12), D3 (D3a/b/c-1 done; D3c-2/3 open), D5 (waits on PR11), D6 (D6e onward), PR16 (`df` fork with no timeout, drain still on the shared runtime, boot seal drain bare), PR17 (seal DLQ not synced; torn-line and seal-spill sync done 2026-10-04), PR18, PR19, D7 (808 policy open), D9 (D9b-3 open), PR24, PR28b (owner lock mode), PR31c, PR32 (hour-boundary late append in tick spill replay; unapplied-table overflow uncounted; archive blind to capture-log deferrals), PR33, PR36 (SSH done), PR39, PR42 (42a/42b done; 42c owner; order/position update event writers have no spill tier), PR55 (manual and tag deploys gated; input-in-shell and branch checks open), PR56 (alarm open), PR40b-f (S3 copy gate mitigates; `.bin.N` / `.overflow` never matched; boot prune still runs before the boot drain) |
+| Partly done (remaining work named in each item) | PR5, PR8 (shutdown/boot `blocking_flush`, seal-writer cycle, order observability flushes still `block_in_place`), D2 (waits on PR12), D3 (D3a/b/c-1 done; D3c-2/3 open), D5 (waits on PR11), D6 (D6e onward), PR16 (`df` fork with no timeout, drain still on the shared runtime, boot seal drain bare), PR17 (seal DLQ not synced; torn-line and seal-spill sync done 2026-10-04), PR18, PR19, D7 (808 policy open), D9 (D9b-3 open), PR24, PR28b (owner lock mode), PR31c, PR32 (hour-boundary late append in tick spill replay; unapplied-table overflow uncounted; archive blind to capture-log deferrals), PR33, PR36 (SSH done), PR39, PR42 (42a/42b done; 42c owner; order/position update event writers have no spill tier), PR55 (manual and tag deploys gated; input-in-shell and branch checks open), PR56 (alarm open), PR40b-f (renamed copies and the boot-drain hold done 2026-10-04; refused/poison exemption and row 296 open) |
 | Open, nothing built | PR6, PR7, PR9, PR10, PR11, PR12, PR13, PR14, D1, D4, D8, PR23, PR25, PR26, PR27, PR34, PR35, PR37, PR38, PR43, PR44, PR45, PR46, PR47, PR49, PR50, PR51, PR52, PR54, PR57, PR59, PR40c-f, PR40d-f |
 | Waiting on the owner | OWNER-202, PR42c, PR28b lock mode, D11/R3-13 (no `wip/d11` branch exists any more; the box curfew still blocks Sundays; the session is 2026-11-08) |
 | Dormant | PR48 (console wipes switched off by `CONSOLE_DATA_WIPES_AUTHORIZED = false`) |

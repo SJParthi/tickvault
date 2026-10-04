@@ -554,14 +554,11 @@ fn is_seal_file(path: &Path) -> bool {
 /// (`seals-2026-08-11.bin.1`) keep their kind via the embedded extension.
 fn staged_kind(path: &Path) -> Option<StagedKind> {
     let name = path.file_name().and_then(|n| n.to_str())?;
-    // Split off any `.N` collision suffix before classifying.
-    let base = name.rsplit_once('.').map_or(name, |(head, tail)| {
-        if tail.chars().all(|c| c.is_ascii_digit()) && !tail.is_empty() {
-            head
-        } else {
-            name
-        }
-    });
+    // Split off every `.N` collision suffix and the `.overflow` suffix
+    // `free_path` falls back to before classifying (PR40b-f: until 2026-10-04
+    // only one `.N` was split, so an `.overflow` file or a copy renamed twice
+    // was never staged, read or replayed).
+    let base = crate::seal_spill::strip_copy_suffixes(name);
     if base.ends_with(".bin") {
         Some(StagedKind::Spill)
     } else if base.ends_with(".ndjson") {
@@ -902,6 +899,21 @@ fn remove_boot_summary(spill_dir: &Path) {
 /// stay staged for the next boot) and reports exactly how many seals are
 /// still on disk rather than in the database.
 pub fn drain_recovered_seals<S: SealSink>(
+    writer: &mut S,
+    spill_dir: &Path,
+    dlq_dir: &Path,
+    max_batch: usize,
+) -> BootDrainOutcome {
+    let outcome = drain_recovered_seals_once(writer, spill_dir, dlq_dir, max_batch);
+    // PR40b-f: the retention sweep may now delete aged unreplayed files here.
+    // Whatever the drain found, it has read the folder; a file it left
+    // staged stays inside the age window or is reported when it ages out.
+    crate::seal_spill::note_boot_drain_ran(spill_dir);
+    outcome
+}
+
+/// One boot drain; see [`drain_recovered_seals`].
+fn drain_recovered_seals_once<S: SealSink>(
     writer: &mut S,
     spill_dir: &Path,
     dlq_dir: &Path,
@@ -4500,5 +4512,57 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn staging_reads_overflow_and_twice_renamed_copies() {
+        // PR40b-f: only one `.N` suffix was split, so a `.bin.overflow` file
+        // (free_path's last resort) or a copy renamed twice (`.bin.1.1`) was
+        // never staged, read or replayed.
+        for name in [
+            "seals_v4-2026-10-01.bin.overflow",
+            "seals_v4-2026-10-01.bin.1.1",
+        ] {
+            assert!(
+                matches!(staged_kind(Path::new(name)), Some(StagedKind::Spill)),
+                "{name} must classify as a spill file"
+            );
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "tv-seal-stage-overflow-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("seals_v4-2026-10-01.bin.overflow"), b"").expect("write");
+        let staged = stage_pending_files(&dir);
+        assert_eq!(
+            staged.len(),
+            1,
+            "the overflow file must be staged: {staged:?}"
+        );
+        assert!(staged[0].starts_with(dir.join(SEAL_REPLAYING_SUBDIR)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_boot_drain_lets_the_retention_sweep_delete_unreplayed_files() {
+        // PR40b-f: the sweep holds aged unreplayed files until the boot drain
+        // has read the folder, whatever the drain found.
+        let dir = std::env::temp_dir().join(format!(
+            "tv-seal-drain-marks-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        assert!(!crate::seal_spill::boot_drain_ran(&dir));
+        let mut sink = ReplaySink::default();
+        let _ = drain_recovered_seals(&mut sink, &dir, &dir, 8);
+        assert!(crate::seal_spill::boot_drain_ran(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
