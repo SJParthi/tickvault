@@ -529,13 +529,15 @@ folded into them below), then PR18, PR19 and the decisions.
     (`seal_spill.rs::SealSpillWriter::sync_open_file`, called from
     `seal_writer_runner.rs::SealEscalationSink::run`): the escalation thread syncs the day file
     after each batch that empties its queue, at least once a second under a burst, and once at
-    exit; the day rotation syncs the closing file. The lock is held only to `dup` the handle, so
-    an inline append never waits for the device; `append_seal` itself never syncs. Failures on
+    exit; the day rotation moves the closing file aside under the lock and the escalation thread
+    syncs and closes it off the lock (the first version synced it under the lock; fixed the same
+    day). The lock is held only to take or `dup` a handle, so an inline append never waits for
+    the device; `append_seal` itself never syncs. Failures on
     `tv_seal_spill_sync_failed_total`, one coded `error!` per failing episode. Tests:
     `sync_open_file_is_a_no_op_with_nothing_open_and_keeps_the_handle_open`,
     `the_drain_reachable_append_never_syncs_and_the_sync_holds_no_lock` (bite-tested), and the
     two escalation-summary tests now pin `syncs`. Not done: the seal DLQ is still not synced,
-    and a seal the drain writes inline (escalation queue full) waits for the thread's next sync, or for the day rotation if the thread has exited.
+    and a seal the drain writes inline (escalation queue full) waits for the thread's next sync, and is not synced at all once the thread has exited.
   - A frame the capture log refused and later deferred to it is labelled "deferred"
     (pool_supervisor.rs:3924-4002, tick_persistence.rs:2791): fix the label; counter and alarm
     are already right.

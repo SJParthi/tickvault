@@ -783,6 +783,13 @@ struct OpenSpillFile {
 struct SpillState {
     /// Long-lived append handle for the current IST day (2026-08-10).
     open: Option<OpenSpillFile>,
+    /// The previous IST day's handle, closed by a rotation and not yet
+    /// synced. The rotation only moves it here (the append path never waits
+    /// for the device); the escalation thread syncs and drops it in
+    /// [`SealSpillWriter::sync_open_file`]. At most one: a second rotation
+    /// before any sync closes the older one unsynced, which is the same
+    /// exposure the open file has until its own first sync.
+    rotated: Option<File>,
     /// The fullest copy of each bar on disk and in the database. See
     /// [`crate::seal_spill_ledger`].
     ledger: SpillLedger,
@@ -901,9 +908,9 @@ pub struct SealSpillWriter {
     /// affordable.
     err_no_handle: metrics::Counter,
     err_write: metrics::Counter,
-    /// Pre-resolved handle for a failed `sync_data` (PR17). The day-rotation
-    /// sync in `current_file` is reachable from the drain's inline fallback,
-    /// so it is resolved for the same reason as the two above.
+    /// Pre-resolved handle for a failed `sync_data` (PR17). Only the
+    /// escalation thread syncs, but the handle is resolved once like the two
+    /// above rather than per failure.
     err_sync: metrics::Counter,
     /// `true` while the last sync of the open day file failed, so a failing
     /// disk logs one `error!` per episode rather than one per sync (PR17).
@@ -931,6 +938,7 @@ impl SealSpillWriter {
             spill_dir,
             state: Mutex::new(SpillState {
                 open: None,
+                rotated: None,
                 ledger: SpillLedger::with_capacity(SEAL_SPILL_LEDGER_CAPACITY),
                 mirror_scratch: Vec::new(),
                 mirror_seals: Vec::new(),
@@ -982,22 +990,29 @@ impl SealSpillWriter {
     ///
     /// Called by the escalation thread (`tv-seal-escalate`) after it writes,
     /// never by `append_seal`, which the frame drain's inline fallback can
-    /// reach. The lock is held only to duplicate the handle (`try_clone`, one
-    /// `dup`), never across the `sync_data`, so an append is never made to
-    /// wait for the device. No open file is a no-op.
+    /// reach. The lock is held only to take the previous day's handle a
+    /// rotation left behind and to duplicate the open one (`try_clone`, one
+    /// `dup`), never across a `sync_data`, so an append is never made to wait
+    /// for the device. Nothing open and nothing rotated is a no-op.
     ///
-    /// Returns `true` when there was nothing to sync or the sync succeeded.
+    /// Returns `true` when there was nothing to sync or every sync succeeded.
     /// A failure is counted on `tv_seal_spill_sync_failed_total` and logged
     /// once per failing episode.
     pub(crate) fn sync_open_file(&self) -> bool {
-        let handle = {
-            let state = self.lock_state();
-            match state.open.as_ref() {
-                Some(open) => open.file.try_clone(),
-                None => return true,
-            }
+        let (rotated, handle) = {
+            let mut state = self.lock_state();
+            let rotated = state.rotated.take();
+            let handle = state.open.as_ref().map(|open| open.file.try_clone());
+            (rotated, handle)
         };
-        let outcome = handle.and_then(|file| file.sync_data());
+        if rotated.is_none() && handle.is_none() {
+            return true;
+        }
+        // The previous day's file first: its last seals are the oldest
+        // unsynced ones. It is dropped (closed) here, off the lock.
+        let rotated_outcome = rotated.map_or(Ok(()), |file| file.sync_data());
+        let open_outcome = handle.map_or(Ok(()), |file| file.and_then(|file| file.sync_data()));
+        let outcome = rotated_outcome.and(open_outcome);
         match outcome {
             Ok(()) => {
                 self.sync_failing.store(false, Ordering::Relaxed);
@@ -1088,6 +1103,7 @@ impl SealSpillWriter {
         let mut state = self.lock_state();
         let SpillState {
             open,
+            rotated,
             ledger,
             epoch,
             ..
@@ -1106,7 +1122,7 @@ impl SealSpillWriter {
         // Rotate only when the IST day actually changed (or nothing is open
         // yet, incl. after a write error dropped the handle). The check is an
         // integer compare — no filename is built on the steady-state path.
-        let current = self.current_file(open, now_unix_secs)?;
+        let current = self.current_file(open, rotated, now_unix_secs)?;
 
         // ONE `write(2)`. The file is unbuffered by design: the previous
         // implementation's `BufWriter::flush()` bought exactly this syscall
@@ -1153,23 +1169,20 @@ impl SealSpillWriter {
     fn current_file<'s>(
         &self,
         open: &'s mut Option<OpenSpillFile>,
+        rotated: &mut Option<File>,
         now_unix_secs: i64,
     ) -> Result<&'s mut OpenSpillFile> {
         let day = ist_day_number(now_unix_secs);
         if open.as_ref().is_none_or(|current| current.ist_day != day) {
-            // Close the previous day's handle BEFORE opening the next, so a
-            // rotation never holds two descriptors. PR17: sync it first, so the
-            // last seals of the day are on the device and not only in the page
-            // cache (the escalation thread syncs only the handle it finds open).
-            // Best effort and once per IST day, at midnight, outside the
-            // session. It can run on the drain's inline fallback (an error
-            // path) and then waits for the device once; a failure is counted.
-            if let Some(previous) = open.as_ref()
-                && previous.file.sync_data().is_err()
-            {
-                self.err_sync.increment(1);
+            // PR17: the previous day's last seals must reach the device, but
+            // this runs under the append lock and can be reached from the
+            // drain's inline fallback, so it never syncs here. The handle is
+            // moved to `rotated` (no syscall) and the escalation thread syncs
+            // and closes it off the lock in `sync_open_file`. Until then the
+            // rotation holds two descriptors.
+            if let Some(previous) = open.take() {
+                *rotated = Some(previous.file);
             }
-            *open = None;
             let path = self.spill_path(now_unix_secs);
             let mut file = self.open_append_handle(&path)?;
             // Audit PR41c: a file left with a torn tail (a crash mid-write,
@@ -1358,6 +1371,7 @@ impl SealSpillWriter {
         let mut state = self.lock_state();
         let SpillState {
             open,
+            rotated,
             ledger,
             epoch,
             ..
@@ -1377,7 +1391,7 @@ impl SealSpillWriter {
         if scratch.is_empty() {
             return Ok(());
         }
-        let current = self.current_file(open, now_unix_secs)?;
+        let current = self.current_file(open, rotated, now_unix_secs)?;
         let before = match current.file.metadata() {
             // Audit PR41c: the batch starts on a record boundary. The day
             // file was cut back when it was opened and every failed write
@@ -1479,6 +1493,7 @@ impl SealSpillWriter {
         let mut state = self.lock_state();
         let SpillState {
             open,
+            rotated,
             ledger,
             mirror_scratch,
             mirror_seals,
@@ -1504,12 +1519,14 @@ impl SealSpillWriter {
         if appended == 0 {
             return 0;
         }
-        let written = self.current_file(open, now_unix_secs).and_then(|current| {
-            current
-                .file
-                .write_all(mirror_scratch)
-                .context("failed to append fuller live copies to the seal spill")
-        });
+        let written = self
+            .current_file(open, rotated, now_unix_secs)
+            .and_then(|current| {
+                current
+                    .file
+                    .write_all(mirror_scratch)
+                    .context("failed to append fuller live copies to the seal spill")
+            });
         if let Err(err) = written {
             // The handle may be broken; the next append reopens it, and the
             // open cuts a torn tail back to a whole record (audit PR41c).
@@ -2711,11 +2728,12 @@ mod tests {
 
     #[test]
     fn the_drain_reachable_append_never_syncs_and_the_sync_holds_no_lock() {
-        // PR17: `append_seal` is reachable from the frame drain's inline
-        // fallback, so it must not wait for the device on every seal; only
-        // the day rotation (once a day, at midnight) syncs there. And the
-        // escalation thread's sync must not hold the append lock, or an
-        // inline append would wait for it.
+        // PR17: `append_seal` and the day rotation in `current_file` run under
+        // the append lock and are reachable from the frame drain's inline
+        // fallback, so neither may wait for the device. The escalation
+        // thread's `sync_open_file` is the only place that syncs, and it must
+        // not hold the append lock while it does, or an inline append would
+        // wait for it.
         let src = include_str!("seal_spill.rs");
         // Each body runs to the next doc comment at item indent (no brace
         // literals here: the banned-pattern scanner counts braces).
@@ -2732,9 +2750,14 @@ mod tests {
             !append.contains("sync_data") && !append.contains("sync_open_file"),
             "append_seal must never sync per seal"
         );
+        let rotation = body("fn current_file<'s>(");
+        assert!(
+            !rotation.contains("sync_data") && !rotation.contains("sync_all"),
+            "the day rotation runs under the append lock and must never sync"
+        );
         let sync = body("pub(crate) fn sync_open_file(");
         let lock_scope_end = sync
-            .find("let outcome")
+            .find("let rotated_outcome")
             .unwrap_or_else(|| panic!("the lock must be released before the sync"));
         assert!(
             sync[lock_scope_end..].contains("sync_data"),
@@ -2744,6 +2767,57 @@ mod tests {
             !sync[..lock_scope_end].contains("sync_data"),
             "sync_data must not run under the append lock"
         );
+        // Every sync call in this file is the one in `sync_open_file`. The
+        // needle is built at run time so this test does not count itself.
+        let call = [".sync", "_data("].concat();
+        assert_eq!(
+            src.matches(call.as_str()).count(),
+            sync[lock_scope_end..].matches(call.as_str()).count(),
+            "only sync_open_file may sync the spill files"
+        );
+    }
+
+    #[test]
+    fn test_sync_open_file_syncs_and_closes_the_handle_a_day_rotation_left_behind() {
+        // PR17: the rotation at IST midnight moves the previous day's handle
+        // aside without syncing it (it runs under the append lock); the next
+        // `sync_open_file` syncs it off the lock and closes it.
+        let dir = temp_spill_dir("sync-rotated");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        let day_one = chrono::Utc
+            .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
+            .single()
+            .unwrap_or_else(|| panic!("valid"))
+            .timestamp();
+        let day_two = day_one + 86_400;
+        let s1 = mk_seal(13, 0, 0, 1_716_000_900, 100.0);
+        let s2 = mk_seal(25, 0, 4, 1_716_001_500, 200.0);
+        writer
+            .append_seal(&s1, day_one)
+            .unwrap_or_else(|err| panic!("append day one: {err}"));
+        assert!(writer.lock_state().rotated.is_none(), "no rotation yet");
+        writer
+            .append_seal(&s2, day_two)
+            .unwrap_or_else(|err| panic!("append day two: {err}"));
+        assert!(
+            writer.lock_state().rotated.is_some(),
+            "the rotation must leave the previous day's handle for the sync"
+        );
+        assert!(writer.sync_open_file(), "both handles must sync");
+        assert!(
+            writer.lock_state().rotated.is_none(),
+            "the sync must close the rotated handle"
+        );
+        assert!(writer.lock_state().open.is_some(), "the open handle stays");
+        let first = writer
+            .read_all(day_one)
+            .unwrap_or_else(|err| panic!("read day one: {err}"));
+        let second = writer
+            .read_all(day_two)
+            .unwrap_or_else(|err| panic!("read day two: {err}"));
+        assert_eq!(first, vec![s1]);
+        assert_eq!(second, vec![s2]);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
