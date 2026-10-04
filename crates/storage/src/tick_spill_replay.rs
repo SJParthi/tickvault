@@ -562,7 +562,7 @@ pub const REPLAY_MAX_ISOLATION_POSTS_PER_CHUNK: usize = 1_024;
 
 /// What line isolation made of a chunk QuestDB permanently refused.
 #[derive(Debug, PartialEq, Eq)]
-pub enum LineIsolation {
+enum LineIsolation {
     /// Every other line is in QuestDB; these ranges (into the chunk) were
     /// refused one by one and must be set aside.
     Isolated(Vec<std::ops::Range<usize>>),
@@ -624,7 +624,7 @@ pub fn split_at_line_boundary(bytes: &[u8], range: std::ops::Range<usize>) -> Op
 /// so the refused lines are set aside and the file keeps draining. Cold path:
 /// runs only after a permanent refusal; allocates the range stack and one
 /// `Bytes` slice per POST (no copy).
-pub async fn isolate_refused_lines(
+async fn isolate_refused_lines(
     client: &Client,
     url: &str,
     chunk: &bytes::Bytes,
@@ -686,7 +686,7 @@ pub async fn isolate_refused_lines(
 /// cannot join it. Returns the bytes kept.
 ///
 /// Cold path, one file write per refused chunk.
-pub fn set_aside_rejected_lines(
+fn set_aside_rejected_lines(
     dir: &Path,
     spill_path: &Path,
     chunk: &[u8],
