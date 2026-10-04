@@ -536,8 +536,15 @@ folded into them below), then PR18, PR19 and the decisions.
     `tv_seal_spill_sync_failed_total`, one coded `error!` per failing episode. Tests:
     `sync_open_file_is_a_no_op_with_nothing_open_and_keeps_the_handle_open`,
     `the_drain_reachable_append_never_syncs_and_the_sync_holds_no_lock` (bite-tested), and the
-    two escalation-summary tests now pin `syncs`. Not done: the seal DLQ is still not synced,
-    and a seal the drain writes inline (escalation queue full) waits for the thread's next sync, and is not synced at all once the thread has exited.
+    two escalation-summary tests now pin `syncs`. **Done 2026-10-04 (L5):** the seal DLQ is synced (`SealDlqWriter::sync_written`), and
+    both tiers also sync a new day file's folder entry and a new folder. The writer cycle
+    (`run_one_cycle` step 3, `SealAbsorptionPipeline::sync_escalated`) syncs what the outage
+    cascade and the drain's inline fallback wrote, so those wait at most one 100 ms cycle, and
+    no longer depend on the escalation thread. Tests:
+    `test_sync_written_syncs_each_written_day_and_its_new_directory_entries`,
+    `test_append_record_never_syncs_and_sync_written_holds_no_lock`,
+    `test_sync_open_file_syncs_only_new_writes_and_new_directory_entries`,
+    `test_run_one_cycle_syncs_what_the_outage_cascade_wrote` (bite-tested).
   - A frame the capture log refused and later deferred to it is labelled "deferred"
     (pool_supervisor.rs:3924-4002, tick_persistence.rs:2791): fix the label; counter and alarm
     are already right.
@@ -2020,7 +2027,7 @@ New items:
 - [ ] **PR40c-f — finish the batching and append-pause proofs.** (`storage`)
   - Row 266 (c6#235): count writes at the disk call, and test an append racing the rename
     (seal_spill.rs:878-918, :962-968).
-- [ ] **PR40b-f — the spill prune never deletes unreplayed or refused candles.** (`storage`,
+- [x] **PR40b-f — the spill prune never deletes unreplayed or refused candles.** (`storage`,
   `app`)
   - This item owns the PR40b corrections above: rows 187 (c6#168; `.overflow` as well as
     `.bin.N`) and 194 (exempt refused and poison files; move the prune after recovery).
@@ -2037,12 +2044,31 @@ New items:
     `spill_sweep_keeps_aged_unreplayed_files_until_the_boot_drain_has_run`,
     `test_note_boot_drain_ran_and_boot_drain_ran_are_per_directory`, `staging_reads_overflow_and_twice_renamed_copies`,
     `the_boot_drain_lets_the_retention_sweep_delete_unreplayed_files`, and the updated
-    `test_run_file_pass_uploads_every_spill_folder_and_a_second_pass_does_nothing`. **Still
-    open:** exempting refused and poison files (with the copy gate on, the default, they are
-    deleted only with a verified cold copy), and row 296 below. Limit: with no boot drain in
+    `test_run_file_pass_uploads_every_spill_folder_and_a_second_pass_does_nothing`.
+  - **Done 2026-10-04 (remainder).** Row 194, first half: a staged file holding a seal the boot
+    drain or the replay gave up on (undecodable, refused past the retry window, a poison row)
+    moves to `refused/` (`SEAL_REFUSED_SUBDIR`), not `archive/`. The retention sweep never
+    deletes it, with the copy gate on or off; it counts the files and bytes (`refused_kept`,
+    gauge `tv_seal_spill_refused_files`), and the cold upload copies them
+    (`ColdFileSet::seal_spill` scans `refused/`; `is_seal_file_name` also matches staged DLQ
+    copies). Tests: `spill_sweep_never_deletes_refused_files_and_counts_them`,
+    `replay_moves_a_file_with_a_skipped_record_to_refused_not_archive`,
+    `replay_moves_a_file_with_a_poison_record_to_refused_and_counts_it_once`,
+    `test_cold_file_set_seal_spill_tick_quarantine_depth_quarantine_dirs`, and the updated
+    `a_refused_append_in_a_file_past_the_retry_window_is_archived_not_retried` and
+    `corrupt_tail_is_counted_not_silently_lost`. Limit: with no boot drain in
     the process (Dhan lane off) unreplayed files are never age-pruned; they are kept, not lost.
   - Row 296: report staged-for-retry seals as pending rather than unrecovered, page once, and
     fix the wiring test that pins the over-count (seal_writer_loop.rs:321-331, :1709-1750).
+    **Done 2026-10-04.** The boot drain reports a file's given-up seals once, when the file moves
+    to `refused/` (`seals_unrecovered`, `files_refused`, paged through
+    `report_unrecovered_seals(UnrecoveredStage::BootDrain, …)`); a seal left staged for the next
+    boot is pending, never unrecovered. The replay counts a skipped record once across re-reads
+    (per-file offset marks). Tests:
+    `boot_drain_moves_a_file_with_an_undecodable_record_to_refused_and_reports_it_once`,
+    `boot_drain_leaves_a_young_refused_append_pending_and_does_not_report_it_unrecovered`,
+    `replay_counts_a_damaged_record_once_when_a_failed_flush_reads_it_again` (bite-tested: 3
+    counts without the mark), and the wiring test now pins `outcome.seals_unrecovered`.
 - [ ] **OWNER-202 — exits refused at 25,000 tracked orders.** (decision only, no code)
   - Row 202 (c6#178): the order cap also refuses cancels (engine.rs:331-381, :2543-2593). The
     exit layer is frozen, so the owner is asked whether cancels may skip the cap. Nothing is built
@@ -2715,7 +2741,7 @@ Status of the rest, so the next session does not re-audit:
 
 | State | Items |
 |---|---|
-| Partly done (remaining work named in each item) | PR5, PR8 (shutdown/boot `blocking_flush`, seal-writer cycle, order observability flushes still `block_in_place`), D2 (waits on PR12), D3 (D3a/b/c-1 done; D3c-2/3 open), D5 (waits on PR11), D6 (D6e onward), PR16 (`df` fork with no timeout, drain still on the shared runtime, boot seal drain bare), PR17 (seal DLQ not synced; torn-line and seal-spill sync done 2026-10-04), PR18, PR19, D7 (808 policy open), D9 (D9b-3 open), PR24, PR28b (owner lock mode), PR31c, PR32 (hour-boundary late append in tick spill replay; unapplied-table overflow uncounted; archive blind to capture-log deferrals), PR33, PR36 (SSH done), PR39, PR42 (42a/42b done; 42c owner; order/position update event writers have no spill tier), PR55 (manual and tag deploys gated; input-in-shell and branch checks open), PR56 (alarm open), PR40b-f (renamed copies and the boot-drain hold done 2026-10-04; refused/poison exemption and row 296 open) |
+| Partly done (remaining work named in each item) | PR5, PR8 (shutdown/boot `blocking_flush`, seal-writer cycle, order observability flushes still `block_in_place`), D2 (waits on PR12), D3 (D3a/b/c-1 done; D3c-2/3 open), D5 (waits on PR11), D6 (D6e onward), PR16 (`df` fork with no timeout, drain still on the shared runtime, boot seal drain bare), PR17 (seal DLQ, torn-line and seal-spill sync done 2026-10-04; tick spill marker sync and the "deferred" label open), PR18, PR19, D7 (808 policy open), D9 (D9b-3 open), PR24, PR28b (owner lock mode), PR31c, PR32 (hour-boundary late append in tick spill replay; unapplied-table overflow uncounted; archive blind to capture-log deferrals), PR33, PR36 (SSH done), PR39, PR42 (42a/42b done; 42c owner; order/position update event writers have no spill tier), PR55 (manual and tag deploys gated; input-in-shell and branch checks open), PR56 (alarm open), PR40b-f (all parts done 2026-10-04; awaiting merge) |
 | Open, nothing built | PR6, PR7, PR9, PR10, PR11, PR12, PR13, PR14, D1, D4, D8, PR23, PR25, PR26, PR27, PR34, PR35, PR37, PR38, PR43, PR44, PR45, PR46, PR47, PR49, PR50, PR51, PR52, PR54, PR57, PR59, PR40c-f, PR40d-f |
 | Waiting on the owner | OWNER-202, PR42c, PR28b lock mode, D11/R3-13 (no `wip/d11` branch exists any more; the box curfew still blocks Sundays; the session is 2026-11-08) |
 | Dormant | PR48 (console wipes switched off by `CONSOLE_DATA_WIPES_AUTHORIZED = false`) |

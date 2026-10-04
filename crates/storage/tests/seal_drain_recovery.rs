@@ -41,8 +41,8 @@ use tickvault_storage::seal_dlq::{SealDlqRecord, SealDlqWriter};
 use tickvault_storage::seal_spill::{SealSpillWriter, SerializedSeal};
 use tickvault_storage::seal_writer_runner::SealWriterRunner;
 use tickvault_storage::seal_writer_task::{
-    SEAL_ARCHIVE_SUBDIR, SEAL_REFUSED_FILE_RETRY_SECS, SEAL_REPLAYING_SUBDIR, SealSink, drain_once,
-    drain_recovered_seals,
+    SEAL_ARCHIVE_SUBDIR, SEAL_REFUSED_FILE_RETRY_SECS, SEAL_REFUSED_SUBDIR, SEAL_REPLAYING_SUBDIR,
+    SealSink, drain_once, drain_recovered_seals,
 };
 use tickvault_storage::shadow_candle_writer::ShadowCandleWriter;
 use tickvault_trading::candles::{BufferedSeal, LiveCandleState, TfIndex};
@@ -387,8 +387,8 @@ fn a_refused_append_keeps_the_file_staged_and_is_counted() {
 }
 
 /// The retry is BOUNDED: a file whose seals were refused and which is older
-/// than the retry window is archived (bytes kept) instead of being re-read, and
-/// re-sent over newer bars, on every boot forever.
+/// than the retry window is moved out (to `refused/`, kept for good; PR40b-f)
+/// instead of being re-read, and re-sent over newer bars, on every boot forever.
 #[test]
 fn a_refused_append_in_a_file_past_the_retry_window_is_archived_not_retried() {
     let (spill, dlq) = unique_dirs("refused-old");
@@ -416,8 +416,14 @@ fn a_refused_append_in_a_file_past_the_retry_window_is_archived_not_retried() {
     assert_eq!(outcome.seals_reingested, 2);
     assert_eq!(outcome.seals_append_failed, 1, "still counted");
     assert_eq!(outcome.files_left_pending, 0, "not kept for another boot");
-    assert_eq!(outcome.files_archived, 1, "archived, bytes kept");
-    assert_eq!(subdir_file_count(&spill, SEAL_ARCHIVE_SUBDIR), 1);
+    assert_eq!(outcome.files_archived, 1, "moved out, bytes kept");
+    assert_eq!(
+        (outcome.files_refused, outcome.seals_unrecovered),
+        (1, 1),
+        "the given-up seal is reported once"
+    );
+    assert_eq!(subdir_file_count(&spill, SEAL_REFUSED_SUBDIR), 1);
+    assert_eq!(subdir_file_count(&spill, SEAL_ARCHIVE_SUBDIR), 0);
 
     cleanup(&spill, &dlq);
 }
@@ -537,8 +543,11 @@ fn corrupt_tail_is_counted_not_silently_lost() {
         "the legacy-format record is COUNTED, not silently decoded"
     );
     // The torn tail is not a record at all — it is truncated, so it is not
-    // counted as a decodable-but-bad record. The bytes survive in archive/.
-    assert_eq!(subdir_file_count(&spill, SEAL_ARCHIVE_SUBDIR), 1);
+    // counted as a decodable-but-bad record. The bytes survive in refused/,
+    // which the retention sweep never deletes (PR40b-f).
+    assert_eq!(outcome.seals_unrecovered, 1);
+    assert_eq!(subdir_file_count(&spill, SEAL_REFUSED_SUBDIR), 1);
+    assert_eq!(subdir_file_count(&spill, SEAL_ARCHIVE_SUBDIR), 0);
 
     cleanup(&spill, &dlq);
 }
