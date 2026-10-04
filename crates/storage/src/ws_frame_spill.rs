@@ -3551,11 +3551,94 @@ fn record_disk_size(r: &WalRecord) -> u64 {
     WAL_MIN_RECORD_V4 as u64 + r.frame.len() as u64
 }
 
+/// Counter: a new segment was named past the wall clock because the clock
+/// read at or below the newest segment name already used in its directory
+/// (a backward clock step, or a restart after one). R3-14.
+pub const WAL_SEGMENT_NAME_CLAMPED_COUNTER: &str = "tv_wal_segment_name_clamped_total";
+
+/// The newest segment name (its nanos) handed out per WAL directory in this
+/// process (R3-14, 2026-10-04).
+///
+/// Replay, the prune and the uploader all order segments by FILE NAME, and the
+/// name was the wall clock at rotation. A backward clock step between two
+/// rotations therefore named the newer segment BELOW the older one, and the
+/// next replay folded the newer frames first. The name is now
+/// `max(wall clock, newest name in this directory + 1)`, so names only rise.
+/// While the clock is sane the name is still the wall clock, which keeps the
+/// uploader's IST date (read from the name) correct; after a backward step it
+/// runs ahead of the clock by at most the step, until the clock catches up.
+///
+/// Keyed by directory so two writers on two directories (tests) never push
+/// each other's names. Touched only at segment rotation, on the writer thread:
+/// the first rotation in a directory lists `<dir>`, `replaying/` and
+/// `archive/` once, O(files); every later one is an O(1) probe under the lock.
+static SEGMENT_NAME_HIGH: std::sync::Mutex<Option<std::collections::HashMap<PathBuf, u128>>> =
+    std::sync::Mutex::new(None);
+
+/// The nanos in `ws-frames-<nanos>.wal`, or `None` for any other name.
+#[must_use]
+pub fn segment_name_nanos(name: &str) -> Option<u128> {
+    name.strip_prefix("ws-frames-")
+        .and_then(|s| s.strip_suffix(".wal"))
+        .and_then(|s| s.parse::<u128>().ok())
+}
+
+/// The greatest segment-name nanos under `wal_dir`, its `replaying/` and its
+/// `archive/`. `0` when there is none. Cold: first rotation per directory.
+fn highest_segment_name_on_disk(wal_dir: &Path) -> u128 {
+    let mut high = 0u128;
+    for dir in [
+        wal_dir.to_path_buf(),
+        wal_dir.join(REPLAYING_SUBDIR),
+        wal_dir.join(ARCHIVE_SUBDIR),
+    ] {
+        // O(1) EXEMPT: once per WAL directory per process, at its first segment rotation
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if let Some(n) = entry.file_name().to_str().and_then(segment_name_nanos) {
+                high = high.max(n);
+            }
+        }
+    }
+    high
+}
+
+/// The name (nanos) for the next segment in `wal_dir`, given the wall clock
+/// `now_nanos`: strictly above every name already used there. Returns the
+/// name and whether it had to be moved past the clock.
+fn next_segment_name_nanos(wal_dir: &Path, now_nanos: u128) -> (u128, bool) {
+    let mut guard = SEGMENT_NAME_HIGH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let map = guard.get_or_insert_with(std::collections::HashMap::new); // APPROVED: segment rotation, cold, once per directory
+    let high = match map.get(wal_dir) {
+        Some(h) => *h,
+        None => highest_segment_name_on_disk(wal_dir),
+    };
+    let name = now_nanos.max(high.saturating_add(1));
+    map.insert(wal_dir.to_path_buf(), name); // APPROVED: segment rotation on the background writer thread, not the per-frame append
+    (name, name != now_nanos)
+}
+
 fn open_new_segment(wal_dir: &Path) -> anyhow::Result<BufWriter<File>> {
-    let nanos = SystemTime::now()
+    let now_nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
+    let (nanos, clamped) = next_segment_name_nanos(wal_dir, now_nanos);
+    if clamped {
+        metrics::counter!(WAL_SEGMENT_NAME_CLAMPED_COUNTER).increment(1);
+        warn!(
+            source = "segment_name_clamped",
+            wall_nanos = %now_nanos,
+            named_nanos = %nanos,
+            "WAL segment named past the wall clock: the clock read at or below the newest \
+             segment name in this directory (a backward clock step). The name keeps rising so \
+             replay order stays capture order; no frame is lost"
+        );
+    }
     let path = wal_dir.join(format!("ws-frames-{:020}.wal", nanos)); // APPROVED: segment rotation on the background writer thread, not the per-frame append
     let f = OpenOptions::new()
         .create(true)
@@ -9495,6 +9578,90 @@ mod tests {
             FeedHealthVerdict::Degraded,
             "a real durable-loss drop surfaces Degraded even pre/post-market"
         );
+    }
+
+    #[test]
+    fn test_regression_segment_names_keep_rising_across_a_backward_clock_step() {
+        // R3-14: replay, prune and upload order segments by NAME, and the name
+        // was the wall clock. A clock stepped back between two rotations named
+        // the newer segment below the older one, so replay folded it first.
+        let dir = tmp_dir("seg-name-backward");
+        assert_eq!(next_segment_name_nanos(&dir, 1_000), (1_000, false));
+        // Clock stepped back: the name still rises, and the clamp is reported.
+        assert_eq!(next_segment_name_nanos(&dir, 500), (1_001, true));
+        assert_eq!(next_segment_name_nanos(&dir, 1_001), (1_002, true));
+        // Clock caught up: the name is the wall clock again.
+        assert_eq!(next_segment_name_nanos(&dir, 5_000), (5_000, false));
+        // Another directory is independent of this one.
+        let other = tmp_dir("seg-name-backward-other");
+        assert_eq!(next_segment_name_nanos(&other, 10), (10, false));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    #[test]
+    fn test_regression_segment_names_seed_past_every_name_on_disk_after_a_restart() {
+        // A restart after a backward step: the first name in the process must
+        // still sort after every segment an earlier process left in the live
+        // directory, `replaying/` or `archive/`.
+        let dir = tmp_dir("seg-name-seed");
+        std::fs::create_dir_all(dir.join(REPLAYING_SUBDIR)).unwrap();
+        std::fs::create_dir_all(dir.join(ARCHIVE_SUBDIR)).unwrap();
+        std::fs::write(dir.join("ws-frames-00000000000000004000.wal"), b"").unwrap();
+        std::fs::write(
+            dir.join(REPLAYING_SUBDIR)
+                .join("ws-frames-00000000000000006000.wal"),
+            b"",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(ARCHIVE_SUBDIR)
+                .join("ws-frames-00000000000000005000.wal"),
+            b"",
+        )
+        .unwrap();
+        // A foreign file never counts.
+        std::fs::write(dir.join("ws-frames-99999999999999999999.tmp"), b"").unwrap();
+        assert_eq!(next_segment_name_nanos(&dir, 100), (6_001, true));
+        clear_open_segment_under(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // And a real open is named through it: a segment an earlier process
+        // named in the far future (year 2255) still sorts before the new one.
+        let dir = tmp_dir("seg-name-seed-open");
+        std::fs::create_dir_all(dir.join(ARCHIVE_SUBDIR)).unwrap();
+        std::fs::write(
+            dir.join(ARCHIVE_SUBDIR)
+                .join("ws-frames-09000000000000000000.wal"),
+            b"",
+        )
+        .unwrap();
+        let _w = open_new_segment(&dir).unwrap();
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+            .filter(|n| segment_name_nanos(n).is_some())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["ws-frames-09000000000000000001.wal".to_string()],
+            "the opened segment is named past the newest name on disk"
+        );
+        clear_open_segment_under(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_segment_name_nanos_parses_only_segment_names() {
+        assert_eq!(
+            segment_name_nanos("ws-frames-01790000000000000000.wal"),
+            Some(1_790_000_000_000_000_000)
+        );
+        assert_eq!(segment_name_nanos("ws-frames-x.wal"), None);
+        assert_eq!(segment_name_nanos("ws-frames-1.wal.gz"), None);
+        assert_eq!(segment_name_nanos("other-1.wal"), None);
     }
 
     #[test]

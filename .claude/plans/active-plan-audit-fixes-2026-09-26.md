@@ -424,16 +424,20 @@ inline (PR2, PR8, PR14).
       pins each systemd unit's shell `Exec*=` count (1 + 3 + 1). Rule lock §0.10. Test-only.
       Tests: `no_new_shell_files`, `shell_lists_shrink_only`, `ops_shell_files_never_grow`,
       `systemd_units_never_add_shell`, `shell_budget_guard_self_test`.
-    - [ ] D6b — host tuning (3 of the 5 boot shell programs: verify-net-tuning.sh,
+    - [x] D6b — host tuning (3 of the 5 boot shell programs: verify-net-tuning.sh,
       apply-host-tuning.sh, the BBR `/bin/sh -c`) becomes `tickvault host-tuning` in `app`, same
       behaviour, pure core + thin I/O shell, unit tests on every branch. Unit pin 3 → 0; two
       ops entries removed; user-data `chmod` lines removed; the three host-tuning guards re-pointed.
-    - [ ] D6c — holiday gate becomes `tickvault holiday-gate` in `app` (IMDSv2 via reqwest; SSM
+    - [x] D6c — holiday gate becomes `tickvault holiday-gate` in `app` (IMDSv2 via reqwest; SSM
       marker, SNS page and StopInstances via the existing workspace AWS SDK pins). Same fail-open
       contract: stop only on a definitive holiday verdict. Unit pin 1 → 0.
-    - [ ] D6d — QuestDB self-heal becomes `tickvault ensure-questdb` in `app` (same ladder:
+    - [x] D6d — QuestDB self-heal becomes `tickvault ensure-questdb` in `app` (same ladder:
       running → start → pull → compose v2 → v1 → plugin path → docker run), and the operator
       console's SSM strings call the binary. Unit pin 1 → 0.
+    - Shipped (verified on main 2026-10-04): D6b in #2001 (`crates/app/src/host_tuning.rs`, unit
+      runs `tickvault-host host-tuning`); D6c in #2004 (`crates/app/src/holiday_gate.rs`,
+      `deploy/aws/holiday-gate.sh` deleted); D6d in #2004 as R3-12 (`ensure_questdb.rs`,
+      `scripts/ensure-questdb.sh` deleted). Only D6e onward is open.
     - [ ] D6e onward — the rest by risk: SSM command strings and `sh -c` spawns in Rust get a
       budget, then workflow `run:` steps and the Makefile get a budget, then operator scripts
       are ported or deleted (orphans first), each PR lowering the D6a lists.
@@ -630,7 +634,7 @@ folded into them below), then PR18, PR19 and the decisions.
       a READ-ONLY token source re-read from `/dhan-depth/access-token` (an 807 on the depth account
       re-reads, never mints: minting from the box would fight its Lambda); `account` label on
       every depth log, counter and alarm; the second pool static (no steering) until measured.
-- [ ] **D10 — no depth path relies on unsubscribe.** (`core`) Dhan depth unsubscribe (codes 25
+- [x] **D10 — no depth path relies on unsubscribe.** **OBSOLETE 2026-10-04:** the design reversed. #1994 swaps depth-200 in place (code 25 then 23), the owner ruled for unsubscribe/subscribe on 2026-10-01, and Dhan's 2026-09-30 reply confirms code 25; a ghost is answered by `request_ghost_unsubscribe`. Original text kept below. (`core`) Dhan depth unsubscribe (codes 25
   and 24) takes no effect and gets no reply (madefortrade topic 94234; Dhan "reviewing" as of
   2026-09-26). Depth-200 already rotates by redial and depth-20 is a static day set, but
   `send_unsubscribe` still has depth-pool call sites (pool_supervisor.rs swap paths). Verify
@@ -2372,7 +2376,7 @@ idle poll. No allocation on the tick path.
   first so only #2005's version lands).
 - [ ] **R3-13 (D11) — Special sessions (Muhurat).** Built inert on `wip/d11`, NOT merged: needs the
   owner to confirm date, hours and cost, and a compile + test run.
-- [ ] **R3-14 — WAL segment names from a monotonic source** (replay order across a clock step). Open.
+- [x] **R3-14 — WAL segment names from a monotonic source** (replay order across a clock step). **Done 2026-10-04** (`ws_frame_spill.rs::next_segment_name_nanos`): a new segment is named `max(wall nanos, highest name in the directory + 1)`, the highest seeded once per directory from the live, `replaying/` and `archive/` names, so names only rise across a backward clock step or a restart; a clamped name is counted on `tv_wal_segment_name_clamped_total`. Tests: `test_regression_segment_names_keep_rising_across_a_backward_clock_step`, `test_regression_segment_names_seed_past_every_name_on_disk_after_a_restart` (both fail with the clamp removed), `test_segment_name_nanos_parses_only_segment_names`. Storage lib 1,763 passed, integration tests all passed.
 
 ### Added 2026-10-02 (round 4: owner approved decisions 2 to 5 and in-place resubscribe)
 
@@ -2652,3 +2656,17 @@ See per-wave-guarantee-matrix.md. All 15 rows of the guarantee matrix and all 7 
 resilience matrix apply to every item. Rows that do not apply to an item are written
 `N/A — reason` in that item's PR body. Every "100%" claim in these PRs carries the §F envelope
 qualifier: 100% inside the tested envelope, with ratcheted regression coverage.
+
+### Reconciled 2026-10-04 against main `e461c3995` (every unticked item re-read in source)
+
+Four read-only checks re-read each open item against the code on main. No open item was fully
+done except the D6b/c/d boxes ticked above, and D10, which the in-place swap made obsolete.
+Status of the rest, so the next session does not re-audit:
+
+| State | Items |
+|---|---|
+| Partly done (remaining work named in each item) | PR5, PR8 (shutdown/boot `blocking_flush`, seal-writer cycle, order observability flushes still `block_in_place`), D2 (waits on PR12), D3 (D3a/b/c-1 done; D3c-2/3 open), D5 (waits on PR11), D6 (D6e onward), PR16 (`df` fork with no timeout, drain still on the shared runtime, boot seal drain bare), PR17 (candle seal spill never synced; torn spill line quarantines the rest of the file), PR18, PR19, D7 (808 policy open), D9 (D9b-3 open), PR24, PR28b (owner lock mode), PR31c, PR32 (hour-boundary late append in tick spill replay; unapplied-table overflow uncounted; archive blind to capture-log deferrals), PR33, PR36 (SSH done), PR39, PR42 (42a/42b done; 42c owner; order/position update event writers have no spill tier), PR55 (manual and tag deploys gated; input-in-shell and branch checks open), PR56 (alarm open), PR40b-f (S3 copy gate mitigates; `.bin.N` / `.overflow` never matched; boot prune still runs before the boot drain) |
+| Open, nothing built | PR6, PR7, PR9, PR10, PR11, PR12, PR13, PR14, D1, D4, D8, PR23, PR25, PR26, PR27, PR34, PR35, PR37, PR38, PR43, PR44, PR45, PR46, PR47, PR49, PR50, PR51, PR52, PR54, PR57, PR59, PR40c-f, PR40d-f |
+| Waiting on the owner | OWNER-202, PR42c, PR28b lock mode, D11/R3-13 (no `wip/d11` branch exists any more; the box curfew still blocks Sundays; the session is 2026-11-08) |
+| Dormant | PR48 (console wipes switched off by `CONSOLE_DATA_WIPES_AUTHORIZED = false`) |
+| Done in a later fold | PR40a follow-up (`escalation_pending` counted in `unwritten_seals`) |
