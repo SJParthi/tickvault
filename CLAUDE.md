@@ -259,7 +259,7 @@ not links in the library dependency order.)*
 | `websocket/` | Connection pool (max 5 WS), subscription builder (100 instruments/msg, string SecurityId), TLS (aws-lc-rs), order update WS (JSON, `wss://api-order-update.dhan.co`), depth connection (20-level 4×50 instruments, 200-level 4×1 instrument) |
 | `auth/` | Token manager (arc-swap, 24h JWT, 23h refresh), TOTP generator (RFC 6238), secret manager (AWS SSM), token cache (Valkey) |
 | `instrument/` | CSV downloader, CSV parser, universe builder (F&O filter), subscription planner, binary cache (rkyv zero-copy), daily scheduler, delta detector, S3 backup, validation, depth strike selector (ATM ± 10), depth rebalancer (60s spot drift check) |
-| `pipeline/` | `chain_day_store`, `chain_snapshot`, `feed_lag_monitor`, `tick_gap_detector`. **CORRECTED 2026-08-21** (found by the O(1) audit): this row said "Tick processor (SPSC 65K buffer), candle aggregator (21 timeframes from ticks)". Neither is here — no tick-processor module exists anywhere in the tree, and the aggregator lives under `crates/trading/src/candles/`, where `TF_COUNT` is **24**, not 21. Same failure mode as the storage table, which named seven deleted files. `gap-enforcement.md` still cites a pipeline tick-processor path as a live enforcement site and is stale for the same reason. *(The first draft of this correction NAMED the missing file and `claude_md_codebase_map_guard` rejected it — the guard bites on corrective prose too, which is the right behaviour.)* |
+| `pipeline/` | `chain_day_store`, `chain_snapshot`, `feed_lag_monitor`, `tick_gap_detector`. **CORRECTED 2026-08-21** (found by the O(1) audit): this row said "Tick processor (SPSC 65K buffer), candle aggregator (21 timeframes from ticks)". Neither is here — no tick-processor module exists anywhere in the tree, and the aggregator lives under `crates/trading/src/candles/`, where `TF_COUNT` is **24**, not 21. *(⚠ 2026-10-04: and it is **10** now, after the 2026-09-19 collapse and the 2026-09-22 `M10` add; read `tf_index.rs::TF_COUNT`, never this row.)* Same failure mode as the storage table, which named seven deleted files. `gap-enforcement.md` still cites a pipeline tick-processor path as a live enforcement site and is stale for the same reason. *(The first draft of this correction NAMED the missing file and `claude_md_codebase_map_guard` rejected it — the guard bites on corrective prose too, which is the right behaviour.)* |
 | `historical/` | Candle fetcher (Dhan REST, 90-day chunks), cross-verification |
 | `network/` | IP monitor, IP verifier (static IP for order APIs) |
 | `notification/` | Telegram alert EVENTS + severity types. **Corrected 2026-08-22: this said "(teloxide)". That crate has zero uses anywhere and its declaration is removed — Telegram delivery is SNS to a Lambda, not an in-process bot client.** |
@@ -437,11 +437,11 @@ linear flow with one main-feed + one order-update WebSocket. See
 
 ## KEY ARCHITECTURAL PATTERNS
 
-1. **Binary parsing:** Fixed-offset `from_le_bytes` reads — no loops, no allocation. Constants for all offsets.
+1. **Binary parsing:** Fixed-offset `from_le_bytes` reads, no allocation. Constants for all offsets. *(⚠ CORRECTED 2026-10-04: "no loops" is false for depth. A depth packet is O(levels), a loop over 20 or 200 levels, as the 2026-08-28 note under THREE PRINCIPLES records; a tick packet is O(1).)*
 2. **Token refresh:** `arc-swap` for lock-free reads during atomic swap. `Secret<String>` for zeroization.
 3. **Instrument cache:** `rkyv` zero-copy deserialization. Daily refresh, binary cache on disk.
 4. **Rate limiting:** `governor` GCRA algorithm. Dual limits (per-second burst + per-day cumulative).
-5. **Pipeline:** SPSC 65,536-buffer async channel. No blocking I/O in hot loop.
+5. **Pipeline:** bounded frame ring, no blocking I/O in the hot loop. *(⚠ CORRECTED 2026-10-04: this said "SPSC 65,536-buffer". The ring is one bounded `tokio::sync::mpsc` channel with many producers (one per socket read task), bounded by BOTH `FRAME_RING_CAPACITY` (frames) and `FRAME_RING_MAX_BYTES` (bytes) in `dhan_feed_stack.rs`. Read the constants, not this line.)*
 6. **State machine:** 10 implemented OMS transitions (26 target). Terminal states block outgoing. Pure function.
 7. **Circuit breaker:** 3-state FSM (Closed → Open → Half-Open). `failsafe` crate.
 
