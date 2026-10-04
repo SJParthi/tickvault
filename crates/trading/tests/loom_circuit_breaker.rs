@@ -1,35 +1,26 @@
 //! Loom concurrency tests for the OrderCircuitBreaker.
 //!
-//! The circuit breaker uses atomic operations (AtomicU32, AtomicU64, AtomicBool)
-//! for lock-free state management. These tests verify correctness under all
-//! possible thread interleavings using the Loom model checker.
-//!
-//! Tests 1-2 use the ACTUAL OrderCircuitBreaker struct. Thread scheduling is
-//! controlled by loom but the struct's internal std atomics are not intercepted
-//! (loom-compatible conditional imports would require `#[cfg(feature = "loom")]`
-//! in the source, which we avoid to keep production code clean). These tests
-//! still verify that no panics or logic errors occur under all thread
-//! interleavings that loom can control.
-//! Test 3 tests the CAS gate pattern directly with loom atomics.
+//! The breaker keeps its state in three atomics. Since audit H3
+//! (2026-10-04) it takes them from `tickvault_trading`'s `sync` shim, so with
+//! the crate's `loom` feature they ARE loom atomics and every test below
+//! drives the REAL production struct through every interleaving loom can
+//! produce, orderings included. (Before, the struct used std atomics, which
+//! loom cannot see, and the probe-gate test modelled a hand-written copy of
+//! the compare-exchange instead of the real one.)
 //!
 //! Run with: cargo test -p tickvault-trading --features loom --test loom_circuit_breaker
 
 #[cfg(feature = "loom")]
 mod loom_tests {
     use loom::sync::Arc;
+    use loom::sync::atomic::{AtomicU32, Ordering};
     use loom::thread;
 
     use tickvault_trading::oms::circuit_breaker::{CircuitState, OrderCircuitBreaker};
 
-    /// Verifies that concurrent record_failure + record_success on the ACTUAL
-    /// OrderCircuitBreaker never produces an inconsistent state.
-    ///
-    /// Thread 1: calls record_failure 3 times (enough to open the circuit)
-    /// Thread 2: calls record_success (resets failure counter)
-    ///
-    /// Loom exhaustively checks all interleavings. Final state must always be
-    /// either Closed (success reset after all failures) or Open (failures
-    /// completed after success).
+    /// Concurrent record_failure + record_success never leaves a state that
+    /// is not Closed or Open (the clock does not move inside a model, so
+    /// HalfOpen is unreachable from a fresh breaker).
     #[test]
     fn loom_concurrent_failure_and_success_real_struct() {
         loom::model(|| {
@@ -51,7 +42,6 @@ mod loom_tests {
             h1.join().unwrap();
             h2.join().unwrap();
 
-            // State must be valid: Closed or Open (never garbage)
             let state = cb.state();
             assert!(
                 state == CircuitState::Closed || state == CircuitState::Open,
@@ -60,9 +50,8 @@ mod loom_tests {
         });
     }
 
-    /// Verifies that concurrent record_failure from two threads opens the
-    /// circuit correctly — the failure counter must reach or exceed the
-    /// threshold regardless of interleaving.
+    /// Two threads' failures crossing the threshold together open the circuit
+    /// in every interleaving.
     #[test]
     fn loom_concurrent_failures_open_circuit() {
         loom::model(|| {
@@ -71,7 +60,7 @@ mod loom_tests {
             let cb1 = Arc::clone(&cb);
             let cb2 = Arc::clone(&cb);
 
-            // Each thread adds 2 failures → total 4, threshold is 3 → should open
+            // Each thread adds 2 failures, total 4; the threshold is 3.
             let h1 = thread::spawn(move || {
                 cb1.record_failure();
                 cb1.record_failure();
@@ -85,74 +74,84 @@ mod loom_tests {
             h1.join().unwrap();
             h2.join().unwrap();
 
-            // With 4 total failures and threshold 3, circuit must be Open
-            let state = cb.state();
+            assert_eq!(cb.failure_count(), 4);
             assert_eq!(
-                state,
+                cb.state(),
                 CircuitState::Open,
                 "4 failures must open circuit (threshold=3)"
             );
         });
     }
 
-    /// Verifies that the half-open probe gate (compare_exchange) correctly
-    /// allows exactly one thread through.
-    ///
-    /// This tests the CAS pattern directly because reaching HalfOpen state
-    /// requires elapsed time > reset_timeout, which loom cannot control.
-    /// The pattern verified here is identical to OrderCircuitBreaker::check()
-    /// in HalfOpen state.
+    /// The REAL half-open gate lets exactly one of two racing callers through.
     #[test]
     fn loom_half_open_probe_gate_exactly_one() {
         loom::model(|| {
-            let probe_sent = Arc::new(loom::sync::atomic::AtomicBool::new(false));
-            let allowed = Arc::new(loom::sync::atomic::AtomicU32::new(0));
+            let cb = Arc::new(OrderCircuitBreaker::new_half_open_for_model());
+            let allowed = Arc::new(AtomicU32::new(0));
 
-            let p1 = Arc::clone(&probe_sent);
-            let a1 = Arc::clone(&allowed);
-            let p2 = Arc::clone(&probe_sent);
-            let a2 = Arc::clone(&allowed);
+            let mut handles = Vec::new();
+            for _ in 0..2 {
+                let cb = Arc::clone(&cb);
+                let allowed = Arc::clone(&allowed);
+                handles.push(thread::spawn(move || {
+                    if cb.check().is_ok() {
+                        allowed.fetch_add(1, Ordering::Relaxed);
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
 
-            let h1 = thread::spawn(move || {
-                if p1
-                    .compare_exchange(
-                        false,
-                        true,
-                        loom::sync::atomic::Ordering::Relaxed,
-                        loom::sync::atomic::Ordering::Relaxed,
-                    )
-                    .is_ok()
-                {
-                    a1.fetch_add(1, loom::sync::atomic::Ordering::Relaxed);
-                }
-            });
-
-            let h2 = thread::spawn(move || {
-                if p2
-                    .compare_exchange(
-                        false,
-                        true,
-                        loom::sync::atomic::Ordering::Relaxed,
-                        loom::sync::atomic::Ordering::Relaxed,
-                    )
-                    .is_ok()
-                {
-                    a2.fetch_add(1, loom::sync::atomic::Ordering::Relaxed);
-                }
-            });
-
-            h1.join().unwrap();
-            h2.join().unwrap();
-
-            let total_allowed = allowed.load(loom::sync::atomic::Ordering::Relaxed);
             assert_eq!(
-                total_allowed, 1,
-                "exactly one thread must pass through half-open gate"
+                allowed.load(Ordering::Relaxed),
+                1,
+                "exactly one caller may pass the half-open gate"
+            );
+        });
+    }
+
+    /// A probe that fails re-opens the circuit: in no interleaving does a
+    /// second caller get a probe straight after the first one failed, and the
+    /// breaker never ends stuck half-open with its probe spent (the defect
+    /// this model found on 2026-10-04: every later request was refused until
+    /// a manual reset).
+    #[test]
+    fn loom_failed_probe_reopens_and_allows_no_second_probe() {
+        loom::model(|| {
+            let cb = Arc::new(OrderCircuitBreaker::new_half_open_for_model());
+            let allowed = Arc::new(AtomicU32::new(0));
+
+            let mut handles = Vec::new();
+            for _ in 0..2 {
+                let cb = Arc::clone(&cb);
+                let allowed = Arc::clone(&allowed);
+                handles.push(thread::spawn(move || {
+                    if cb.check().is_ok() {
+                        allowed.fetch_add(1, Ordering::Relaxed);
+                        // The probe fails.
+                        cb.record_failure();
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+
+            assert_eq!(
+                allowed.load(Ordering::Relaxed),
+                1,
+                "a failed probe must not be followed at once by another"
+            );
+            assert_eq!(
+                cb.state(),
+                CircuitState::Open,
+                "a failed probe re-opens the circuit for another reset timeout"
             );
         });
     }
 }
-
 // Standard (non-loom) concurrency tests that run in normal CI
 #[cfg(not(feature = "loom"))]
 mod std_concurrency_tests {
