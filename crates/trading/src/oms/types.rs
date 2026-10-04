@@ -4423,4 +4423,61 @@ mod tests {
         assert_eq!(placement.clone().legs.len(), 1);
         assert_eq!(placement.legs[0].leg, OrderLeg::TargetLeg);
     }
+
+    // Audit M7 (2026-10-04): the order-segment resolvers. An unknown value
+    // is refused (None), never guessed, never a panic.
+    #[test]
+    fn test_resolve_order_segment_code_maps_every_known_code() {
+        for segment in [
+            ExchangeSegment::IdxI,
+            ExchangeSegment::NseEquity,
+            ExchangeSegment::NseFno,
+            ExchangeSegment::NseCurrency,
+            ExchangeSegment::BseEquity,
+            ExchangeSegment::McxComm,
+            ExchangeSegment::BseCurrency,
+            ExchangeSegment::BseFno,
+        ] {
+            assert_eq!(
+                resolve_order_segment_code(segment.binary_code(), 13),
+                Some(segment),
+                "{segment:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_order_segment_code_refuses_the_gap_and_unknown_codes() {
+        // Code 6 is the annexure gap between MCX_COMM (5) and BSE_CURRENCY (7).
+        for code in [6_u8, 9, 42, u8::MAX] {
+            assert_eq!(resolve_order_segment_code(code, 13), None, "code {code}");
+        }
+    }
+
+    #[test]
+    fn test_resolve_order_segment_str_round_trips_every_wire_string() {
+        for segment in [
+            ExchangeSegment::IdxI,
+            ExchangeSegment::NseEquity,
+            ExchangeSegment::NseFno,
+            ExchangeSegment::NseCurrency,
+            ExchangeSegment::BseEquity,
+            ExchangeSegment::McxComm,
+            ExchangeSegment::BseCurrency,
+            ExchangeSegment::BseFno,
+        ] {
+            assert_eq!(
+                resolve_order_segment_str(segment.as_str(), 13),
+                Some(segment),
+                "{segment:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_order_segment_str_refuses_unknown_and_wrong_case() {
+        for wire in ["", "nse_fno", "NSE", "NSE_FNO ", "IDX", "NSE_COMM"] {
+            assert_eq!(resolve_order_segment_str(wire, 13), None, "{wire:?}");
+        }
+    }
 }

@@ -631,7 +631,7 @@ mod tests {
     /// Audit M8 (2026-10-04): the subscription-change columns are in the
     /// CREATE DDL and each has its own idempotent self-heal ALTER.
     #[test]
-    fn test_ws_event_audit_subscription_columns_in_ddl_and_self_heal() {
+    fn test_ws_event_audit_subscription_alter_ddls_heal_every_column_in_the_ddl() {
         let ddl = ws_event_audit_create_ddl();
         let alters = ws_event_audit_subscription_alter_ddls();
         assert_eq!(alters.len(), WS_EVENT_AUDIT_SUBSCRIPTION_COLUMNS.len());

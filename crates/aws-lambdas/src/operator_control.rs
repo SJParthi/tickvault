@@ -3163,7 +3163,7 @@ mod tests {
     }
 
     #[test]
-    fn guard_locks_out_at_the_limit_and_releases_after_the_window() {
+    fn test_record_failure_locks_out_at_the_limit_and_releases_after_the_window() {
         let g = AuthFailureGuard::new();
         let t0 = 1_000;
         for n in 1..AUTH_FAILURE_LIMIT {
@@ -3188,7 +3188,7 @@ mod tests {
     }
 
     #[test]
-    fn guard_restarts_a_stale_window_and_forgets_on_success() {
+    fn test_record_success_forgets_a_source_and_a_stale_window_restarts() {
         let g = AuthFailureGuard::new();
         for _ in 0..3 {
             g.record_failure("a", 0);
@@ -3205,7 +3205,7 @@ mod tests {
     }
 
     #[test]
-    fn guard_table_is_bounded_and_prunes_expired_windows() {
+    fn test_tracked_sources_is_bounded_and_prunes_expired_windows() {
         let g = AuthFailureGuard::new();
         for i in 0..AUTH_FAILURE_MAX_SOURCES {
             g.record_failure(&format!("s{i}"), 0);
