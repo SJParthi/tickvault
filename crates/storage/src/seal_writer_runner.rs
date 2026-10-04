@@ -220,7 +220,9 @@ pub struct SealOverflow {
 /// `the_queue_depth_is_drainable_inside_the_shutdown_budget`. It does NOT fit
 /// when the disk refuses the batch: the seals then go to the DLQ one record
 /// at a time, and whatever is still queued at the deadline is counted as
-/// abandoned at shutdown.
+/// abandoned at shutdown. Since PR17 the thread also syncs the day file:
+/// a full queue keeps every batch full, so it syncs at most once a second
+/// plus once at exit, about 6 extra `sync_data` calls inside the budget.
 ///
 /// Overflow is still NOT a loss: a full queue falls back to the inline
 /// cascade, degraded rather than lossy. Past one full burst of refusals
@@ -240,6 +242,11 @@ pub const SEAL_ESCALATION_BATCH: usize = 1_024;
 /// How often the escalation thread wakes to re-check its stop flag while the
 /// queue is empty.
 const SEAL_ESCALATION_STOP_POLL: std::time::Duration = std::time::Duration::from_millis(100); // APPROVED: this IS the named constant the rule asks for
+
+/// Longest the escalation thread lets written seals sit unsynced while a
+/// burst keeps the queue full (PR17). A batch that empties the queue is
+/// synced at once.
+const SEAL_ESCALATION_SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1); // APPROVED: this IS the named constant the rule asks for
 
 /// Seals handed to the escalation thread (the happy path once installed).
 pub const SEAL_ESCALATION_QUEUED_COUNTER: &str = "tv_seal_escalation_queued_total";
@@ -485,6 +492,15 @@ impl SealEscalationSink {
         spill_writes
     }
 
+    /// Syncs the day file once more before the thread exits, when the last
+    /// batch was full and so was not synced on its own (PR17).
+    fn final_sync(&self, unsynced: bool, summary: &mut SealEscalationRunSummary) {
+        if unsynced {
+            self.spill.sync_open_file();
+            summary.syncs += 1;
+        }
+    }
+
     /// Drain the queue until the sender is gone, or until the stop flag is set
     /// AND the queue is empty.
     ///
@@ -506,6 +522,12 @@ impl SealEscalationSink {
         let mut batch: Vec<SealEscalationItem> = Vec::with_capacity(SEAL_ESCALATION_BATCH);
         let mut scratch: Vec<u8> =
             Vec::with_capacity(SEAL_ESCALATION_BATCH * crate::seal_spill::SEAL_SPILL_RECORD_SIZE);
+        // PR17: the day file is synced after a batch that empties the queue,
+        // and at least once a second under a sustained burst, so a seal the
+        // spill holds reaches the device within about a second. The drain
+        // never syncs: only this thread does.
+        let mut unsynced = false;
+        let mut last_sync = std::time::Instant::now();
         loop {
             match self.rx.recv_timeout(SEAL_ESCALATION_STOP_POLL) {
                 Ok(first) => {
@@ -523,16 +545,29 @@ impl SealEscalationSink {
                     summary.batches += 1;
                     summary.records += batch.len();
                     summary.spill_writes += self.write_batch(&batch, &mut scratch, &on_lost);
+                    unsynced = true;
+                    if batch.len() < SEAL_ESCALATION_BATCH
+                        || last_sync.elapsed() >= SEAL_ESCALATION_SYNC_INTERVAL
+                    {
+                        self.spill.sync_open_file();
+                        summary.syncs += 1;
+                        unsynced = false;
+                        last_sync = std::time::Instant::now();
+                    }
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     // Only exit on an EMPTY queue: a pending item always
                     // returns `Ok` above, so a stop request can never cut the
                     // drain short.
                     if self.stop.load(Ordering::Acquire) {
+                        self.final_sync(unsynced, &mut summary);
                         return summary;
                     }
                 }
-                Err(RecvTimeoutError::Disconnected) => return summary,
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.final_sync(unsynced, &mut summary);
+                    return summary;
+                }
             }
         }
     }
@@ -548,6 +583,10 @@ pub struct SealEscalationRunSummary {
     /// Spill writes made: one per batch, plus one for a batch that straddles
     /// IST midnight. Each is one `append_seals` call, i.e. one `write(2)`.
     pub spill_writes: usize,
+    /// `sync_data` calls on the spill day file (PR17): one after each batch
+    /// that empties the queue, at least one a second under a burst, and one
+    /// at exit when the last batch was not yet synced.
+    pub syncs: usize,
 }
 
 /// What happened to a seal the writer channel refused.
@@ -2271,8 +2310,17 @@ mod tests {
                 batches: 5,
                 records: total,
                 spill_writes: 5,
+                syncs: summary.syncs,
             },
             "a queued burst must be written SEAL_ESCALATION_BATCH records per write"
+        );
+        // PR17: the last batch (7 records) empties the queue, so it is always
+        // synced; a full batch is synced only once a second has passed, which
+        // depends on the disk, so only the bounds are pinned.
+        assert!(
+            (1..=summary.batches).contains(&summary.syncs),
+            "the burst must be synced at least once and at most once per batch, got {}",
+            summary.syncs
         );
 
         let records = read_spill_records(&spill);
@@ -2327,6 +2375,7 @@ mod tests {
                 batches: 2,
                 records: 2,
                 spill_writes: 2,
+                syncs: 2,
             }
         );
         assert_eq!(read_spill_records(&spill).len(), 2);
