@@ -1889,7 +1889,7 @@ struct SealTally {
 /// Pinned by `tf_index::tests::tf_index_all_is_the_operators_nine`.
 #[allow(clippy::too_many_arguments)] // APPROVED: one seal's identity plus its two sinks and the tally
 fn route_catch_up_seal(
-    sender: Option<&tokio::sync::mpsc::Sender<BufferedSeal>>,
+    sender: Option<&tickvault_storage::seal_writer_runner::SealSender>,
     leaderboard: &mut crate::volume_leaderboard::VolumeLeaderboard,
     feed: tickvault_common::feed::Feed,
     security_id: u64,

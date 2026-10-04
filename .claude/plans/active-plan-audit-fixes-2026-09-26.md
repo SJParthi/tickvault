@@ -2677,8 +2677,25 @@ write, then candle warm-up (PR31b-2 (a), already listed above). Each fix ships a
   `crates/app/src/main_feed_backup.rs`. Tests:
   test_admit_tick_older_copy_is_kept_as_late_newer_from_backup_accepted,
   test_lagging_copy_beyond_the_ring_is_kept_as_late,
-  proptest_two_socket_interleave_never_double_counts. Honest limit: a copy more than 16 packets
-  behind is kept as a second `ticks` row.
+  proptest_two_socket_interleave_never_double_counts. **Amended the same day after review:** the
+  first draft kept every unmatched older packet, so a copy lagging past the ring was written
+  twice (scope lock 2026-10-02: one copy per packet). Now kept only when the ring still holds a
+  strictly older packet from the other socket (`ring_covers`); otherwise dropped as `older`,
+  counted. Tests: proptest_conflating_sockets_never_fold_a_packet_twice (bite-tested against
+  the first draft), test_regression_lagging_copy_beyond_the_ring_is_dropped_as_older. Honest
+  limit: a real packet the other socket skipped is dropped when it arrives more than the ring
+  behind, or with the same volume and trade time as a packet the other socket sent.
+- [x] **M1 review fixes.** The abandoned-shutdown scan marks each frame it counts as lost, so the
+  detached writer cannot count it again; records past the tally are counted unknown only when
+  the file ends short. File: `crates/storage/src/{wal_frame_fate,ws_frame_spill}.rs`. Test:
+  test_count_unflushed_sheds_marks_what_it_counts_so_a_late_loss_is_not_recounted.
+- [x] **N2 — The candle hand-off queue no longer allocates under a backlog.** The tokio `mpsc`
+  between the frame drain and the seal writer grew in 32-slot blocks as seals queued; it is now
+  a pre-sized bounded `crossbeam_channel` (`SealSender`), allocated once at build (≤ 46 MB
+  resident). Files: `crates/storage/src/seal_writer_runner.rs`,
+  `crates/app/src/{dhan_feed_stack,rest_candle_fold}.rs`,
+  `crates/storage/tests/dhat_seal_queue_backlog.rs`. Test:
+  dhat_seal_queue_backlog_never_allocates_where_the_tokio_queue_did.
 
 ## Edge Cases
 
