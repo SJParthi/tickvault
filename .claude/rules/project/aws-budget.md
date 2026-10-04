@@ -1587,3 +1587,24 @@ $0.90.
 
 **§2.3n's lever rule is NOT met.** No lever is taken. October is projected at
 about the $150 line before this (COST NOTE 2026-09-25); this adds about 0.3%.
+
+## COST NOTE 2026-10-04 — five data-at-risk pages over ten counters (+$3.50–4.00/mo)
+
+**Authorization:** the operator tapped "Page me" on the 2026-10-04 decision
+card, which named these counters and priced them at about $3 to $4 a month.
+Recorded in `dhan-rest-only-noise-lock-2026-07-14.md` §2.9 before the
+terraform, per the rule-file-first law.
+
+| Item | Cost |
+|---|---:|
+| 10 EMF names (3 cloud upload, 3 prune refused for no copy, order-update broadcast drops, log lines dropped, tick and depth inline fallback) | $3.00 |
+| 5 alarms (two 3-leg composites, one 2-leg composite, two single) | $0.50, or $1.00 if billed per referenced metric |
+| **Total** | **$3.50–4.00/mo** |
+
+**Budget position: NOT read live.** The session that wrote this had no
+read-only AWS key. The October ceiling is $150 (Quote 23) and the 2026-09-25
+note projected October at about that line before this change, so this adds
+about 2.5% to a month already projected at the line.
+
+**§2.3n's lever rule is NOT met.** No lever is taken. The operator chose the
+spend knowing the price.

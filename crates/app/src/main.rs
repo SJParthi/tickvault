@@ -1518,6 +1518,41 @@ async fn async_main() -> Result<()> {
     metrics::counter!("tv_wal_replay_corrupted_segments_total").increment(0);
     metrics::counter!("tv_disk_watcher_respawn_total").increment(0);
     metrics::counter!("tv_ws_frame_spill_drop_critical", "ws_type" => "live_feed").increment(0);
+    // The ten data-at-risk counters paged on 2026-10-04
+    // (deploy/aws/terraform/data-at-risk-alarms.tf, authority
+    // dhan-rest-only-noise-lock-2026-07-14.md §2.9). Several are emitted only at
+    // the failure site or only from a task that starts minutes after boot, so
+    // without these the first failure is the dropped baseline sample. Every
+    // label value the emit sites use is seeded, because the agent drops the
+    // first sample of each label set, not of each name.
+    metrics::counter!("tv_raw_frame_upload_failed_total").increment(0);
+    for set in ["seal_spill", "tick_quarantine", "depth_quarantine"] {
+        metrics::counter!("tv_cold_file_upload_failed_total", "set" => set).increment(0);
+    }
+    metrics::counter!("tv_raw_upload_marker_write_failed_total").increment(0);
+    for dir in ["archive", "active"] {
+        metrics::counter!("tv_wal_prune_refused_not_uploaded_total", "dir" => dir).increment(0);
+    }
+    metrics::counter!("tv_seal_spill_prune_refused_not_uploaded_total").increment(0);
+    metrics::counter!("tv_quarantine_prune_refused_not_uploaded_total").increment(0);
+    metrics::counter!("tv_order_update_broadcast_drops_total").increment(0);
+    for sink in ["app_log", "errors_jsonl"] {
+        metrics::counter!("tv_log_lines_dropped_total", "sink" => sink).increment(0);
+    }
+    for reason in ["queue_full", "thread_gone"] {
+        metrics::counter!(
+            "tv_tick_rescue_inline_fallback_total",
+            "feed" => "dhan",
+            "reason" => reason
+        )
+        .increment(0);
+        metrics::counter!(
+            "tv_depth_rescue_inline_fallback_total",
+            "feed" => "dhan",
+            "reason" => reason
+        )
+        .increment(0);
+    }
     // The seal-spill write-error counter (2026-08-28). Emitted only when the
     // producer-side durable tier's own append fails, which is the moment the
     // no-drop policy is leaning hardest on it — and, like the twenty above, it
