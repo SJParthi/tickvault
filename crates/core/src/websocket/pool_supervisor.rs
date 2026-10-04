@@ -5246,6 +5246,22 @@ impl WalRingSink {
         self.wal_dropped.increment(0);
         self.ring_full.increment(0);
         self.ring_bytes_full.increment(0);
+        tickvault_storage::wal_frame_fate::pre_register();
+    }
+
+    /// Audit M1 (2026-10-04): records that this frame was shed at the ring
+    /// while its only other copy is a WAL record still QUEUED for the writer.
+    /// If the writer then fails to write it, `wal_frame_fate` counts the frame
+    /// as lost on `tv_ticks_lost_total{source="wal_lost_after_shed"}`; if the
+    /// writer had already lost it, it is counted here. O(1), zero allocation:
+    /// one load and a CAS on one slot, shed arm only.
+    #[inline]
+    fn note_ring_shed(&self, seq: u64) {
+        let _mark = tickvault_storage::wal_frame_fate::frame_fate().note_shed(
+            seq,
+            tickvault_storage::wal_frame_fate::ShedKind::Ring,
+            self.ws_type,
+        );
     }
 }
 
@@ -5369,6 +5385,7 @@ impl FrameSink for WalRingSink {
                     return FrameSinkOutcome::WalDropped;
                 }
                 tickvault_storage::wal_applied_watermark::applied_watermark().note_unapplied(seq);
+                self.note_ring_shed(seq);
                 return FrameSinkOutcome::RingFull;
             }
             // Counted on `ring_full` ONLY, deliberately. That is exactly what
@@ -5383,6 +5400,7 @@ impl FrameSink for WalRingSink {
                     return FrameSinkOutcome::WalDropped;
                 }
                 tickvault_storage::wal_applied_watermark::applied_watermark().note_unapplied(seq);
+                self.note_ring_shed(seq);
                 return FrameSinkOutcome::RingFull;
             }
         }
@@ -5412,6 +5430,7 @@ impl FrameSink for WalRingSink {
                 return FrameSinkOutcome::WalDropped;
             }
             tickvault_storage::wal_applied_watermark::applied_watermark().note_unapplied(seq);
+            self.note_ring_shed(seq);
             return FrameSinkOutcome::RingFull;
         }
         // Reaching here with the class slot caps summing to the channel's

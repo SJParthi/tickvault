@@ -2652,6 +2652,34 @@ write, then candle warm-up (PR31b-2 (a), already listed above). Each fix ships a
   each step still costs what it did; only the worker it holds changes. Boot-only and shutdown-only
   steps (the WAL replay, the mapping-artifact wait, shutdown joins) are left as they are.
 
+### Added 2026-10-04 (deep audit, items M1 and M2)
+
+- [x] **M1 — A shed frame the WAL then fails to write is counted as lost.** A frame the ring or
+  the drain shed was marked unapplied and left to the WAL; a WAL write that failed afterwards
+  lost it with no count. New `wal_frame_fate` table records, per frame sequence, which side shed
+  it and whether the writer lost it; the side that completes the pair counts the loss
+  (`tv_wal_shed_frames_lost_total{shed}`, `tv_ticks_lost_total{source="wal_lost_after_shed"}`,
+  WS-SPILL-02). The drain refuses to shed a depth frame the writer already lost and writes it.
+  The writer reports every record of a discarded segment, every record it could not write, and
+  every record left in its queue at exit; an abandoned shutdown counts unflushed sheds. Files:
+  `crates/storage/src/{lib,wal_frame_fate,ws_frame_spill}.rs`,
+  `crates/core/src/websocket/pool_supervisor.rs`, `crates/app/src/dhan_feed_stack.rs`,
+  `crates/common/tests/loss_counter_visibility_guard.rs`. Tests:
+  test_note_shed_then_note_lost_counts_a_ring_shed_as_lost,
+  test_a_shed_racing_a_loss_is_counted_exactly_once,
+  test_discarded_writer_reports_a_shed_frame_as_lost,
+  test_records_left_at_writer_exit_are_reported_lost,
+  drain_may_shed_depth_refuses_a_frame_the_wal_writer_lost. Honest limits: a crash loses the
+  queue and the table; a slot reused by a newer frame makes the older fate unknown (counted).
+- [x] **M2 — The backup-copy dedup no longer drops an older packet that is not a copy.** Only a
+  packet matching the other socket's fingerprint is dropped; an older one is kept as late, in its
+  own 4-entry ring, so it never evicts the main ring and its twin is still dropped. File:
+  `crates/app/src/main_feed_backup.rs`. Tests:
+  test_admit_tick_older_copy_is_kept_as_late_newer_from_backup_accepted,
+  test_lagging_copy_beyond_the_ring_is_kept_as_late,
+  proptest_two_socket_interleave_never_double_counts. Honest limit: a copy more than 16 packets
+  behind is kept as a second `ticks` row.
+
 ## Edge Cases
 
 - PR1: log burst larger than the non-blocking buffer → lines dropped and counted, never blocking.

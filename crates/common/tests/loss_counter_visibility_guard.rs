@@ -144,7 +144,7 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
     ),
     (
         "tv_dhan_feed_backup_duplicates_dropped_total",
-        "NOT A LOSS COUNTER (added 2026-10-02 with the main-feed backup copies, scope lock 2026-10-02). It counts the SECOND copy of a packet the drain already folded from the contract's other socket (reason=identical) or a copy older than one already folded (reason=older). The data it measures is held, not lost: the first copy is folded and stored, and the WAL keeps both copies as raw frames. Shipping it would bill a healthy duplicate rate as if it were loss; the matching signal for a socket that stops is tv_dhan_feed_backup_only_arrivals_total.",
+        "NOT A LOSS COUNTER (added 2026-10-02 with the main-feed backup copies, scope lock 2026-10-02). It counts the SECOND copy of a packet the drain already folded from the contract's other socket (reason=identical). Since audit M2 (2026-10-04) a copy older than one already folded is no longer dropped: it is kept and counted on tv_dhan_feed_backup_late_accepted_total. The data it measures is held, not lost: the first copy is folded and stored, and the WAL keeps both copies as raw frames. Shipping it would bill a healthy duplicate rate as if it were loss; the matching signal for a socket that stops is tv_dhan_feed_backup_only_arrivals_total.",
     ),
     (
         "tv_dhan_feed_ingest_seq_refused_total",
@@ -206,6 +206,14 @@ const UNREACHABLE_ALLOWLIST: &[(&str, &str)] = &[
     (
         "tv_ticks_out_of_window_refused_total",
         "logged, and the guard cannot see it — VERIFIED 2026-09-05 by running this guard, not by reading the code. The emit is `counter.increment(1)` on a pre-resolved `metrics::Counter` held in an `OutOfWindowCounters` struct field, and the throttled `warn!` (code=STORAGE-GAP-01) sits on the next lines of the same `note()` body. That is the const -> struct field -> method chain already allowlisted above for tv_dhan_feed_ingest_seq_refused_total: the scanner follows a const NAME alias and a local `let h = metrics::counter!(..)` handle, but not this one, so it judges proximity at `tick_out_of_window_counters` — where no log sits — instead of at `note()`. That function exists so the const is named exactly ONCE outside its declaration: spelled at the three struct-literal sites it sat nine lines above the `error!` in the ILP-connect failure arm, and this guard passed the counter on the strength of a log about a completely different event. An accidental pass retires the question without answering it, which is worse than a recorded exemption. The handles are pre-resolved because the macro form allocated ONCE PER TICK on the drain task (DHAT measured 10,010 blocks over 10,000 ticks against a ceiling of 500, CI-caught 2026-09-05); the all-literal macro form is allocation-free and passes this guard, and was rejected because it cannot carry the `feed` label that every sibling loss counter carries and that the pluggable-feed contract needs. NOT EMF-shipped, deliberately: this counter measures the gate WORKING (outside 09:00-15:39:59 IST every tick increments it), so a series would chart normal behaviour rather than a defect, and an EMF name costs ~0.30 USD/mo against a September forecast of 130.39 with the automatic STOP_EC2_INSTANCES line at 135.00 — 4.61 of margin, and the noise lock's standing rule is that the next addition arrives with a LEVER, not a cost note.",
+    ),
+    (
+        "tv_wal_drain_shed_refused_total",
+        "NOT A LOSS COUNTER (added 2026-10-04, audit M1). It counts depth sheds the frame drain REFUSED because the frame's WAL record was already lost (reason=wal_lost) or the frame-fate table could not record the shed (reason=unrecordable); in both cases the rows are WRITTEN instead, so nothing is lost. Shipping it would bill a protective refusal as a loss. The loss itself, if the writer fails, is on tv_wal_shed_frames_lost_total below and on tv_ticks_lost_total.",
+    ),
+    (
+        "tv_wal_shed_frames_lost_total",
+        "double-billed, and logged — added 2026-10-04 (audit M1). The emit is a pre-resolved handle in wal_frame_fate::FateCounters (const -> struct field -> cold fn), which this scanner cannot follow; the coded `error!` (code=WS-SPILL-02, throttled by refusal_line_due) sits in the same `record_shed_loss` body, and WS-SPILL-02 has a CloudWatch log-filter alarm at threshold 1 (error-code-alarms.tf). For shed=ring the same increment also moves tv_ticks_lost_total{source=wal_lost_after_shed}, which IS in the EMF selector and alarmed (live-lane-alarms.tf), so shipping this name too would bill one loss twice for ~0.30 USD/mo. shed=drain_depth (depth rows, not ticks) reaches the operator through the WS-SPILL-02 line only.",
     ),
 ];
 
