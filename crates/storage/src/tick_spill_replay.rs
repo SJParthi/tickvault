@@ -111,10 +111,13 @@ pub struct SpillReplayOutcome {
     pub files_failed: usize,
     /// Files already empty — left alone for the age-based pruner.
     pub files_skipped_empty: usize,
-    /// Bytes QuestDB accepted this round.
     /// Files permanently refused and moved aside so the queue keeps moving.
     pub files_quarantined: usize,
+    /// Bytes QuestDB accepted this round.
     pub bytes_replayed: u64,
+    /// Single lines QuestDB refused inside an otherwise accepted chunk, kept
+    /// in `quarantine/<file>.rejected-lines` (PR17).
+    pub lines_set_aside: u64,
 }
 
 /// Splits an ILP payload into line-aligned byte ranges, each at most
@@ -537,6 +540,185 @@ fn is_feed_aux_line(line: &[u8]) -> bool {
 /// True when `nanos` is large enough to be a real market timestamp rather than
 /// a torn prefix, a zero, or a synthetic fixture value.
 ///
+/// Counter for single lines QuestDB refused inside a chunk it otherwise
+/// accepts, set aside to `quarantine/<file>.rejected-lines` (PR17).
+pub const REPLAY_LINES_REJECTED_COUNTER: &str = "tv_tick_spill_replay_lines_rejected_total";
+
+/// Suffix of the file, in the quarantine directory, that keeps the lines
+/// QuestDB refused one by one. Never deleted by the replay; the quarantine
+/// trim deletes it only once a verified cold copy exists (copy gate).
+pub const REJECTED_LINES_SUFFIX: &str = ".rejected-lines";
+
+/// Most lines one refused chunk may lose to line isolation before the whole
+/// file is quarantined instead. A torn line is one or two per crash or full
+/// disk; dozens mean the refusal is about the table, not a line.
+pub const REPLAY_MAX_REJECTED_LINES_PER_CHUNK: usize = 64;
+
+/// Most POSTs one refused chunk may spend finding its bad lines. Bisection
+/// finds one bad line in about log2(lines) POSTs (~17 for a full 8 MiB
+/// chunk), so this allows the line cap above with room, and bounds the load
+/// on a QuestDB that has just refused us.
+pub const REPLAY_MAX_ISOLATION_POSTS_PER_CHUNK: usize = 1_024;
+
+/// What line isolation made of a chunk QuestDB permanently refused.
+#[derive(Debug, PartialEq, Eq)]
+enum LineIsolation {
+    /// Every other line is in QuestDB; these ranges (into the chunk) were
+    /// refused one by one and must be set aside.
+    Isolated(Vec<std::ops::Range<usize>>),
+    /// No line was accepted, or the caps above were reached: quarantine the
+    /// whole file, as before PR17.
+    WholeFile,
+    /// QuestDB stopped answering or answered with a retryable status: stop
+    /// the round; the file is retried next round. Lines already accepted are
+    /// re-POSTed then, idempotently (the dedup keys carry the row identity).
+    Transient,
+}
+
+/// Where to split `range` of `bytes` into two non-empty runs of whole lines:
+/// the line boundary nearest the middle. `None` when the range holds one line
+/// (its only newline, if any, is its last byte).
+///
+/// O(range) at worst, cold path (line isolation only).
+#[must_use]
+pub fn split_at_line_boundary(bytes: &[u8], range: std::ops::Range<usize>) -> Option<usize> {
+    let start = range.start;
+    let end = range.end.min(bytes.len());
+    if end <= start.saturating_add(1) {
+        return None;
+    }
+    // The newline search starts one byte before the middle, so a boundary
+    // exactly AT the middle (the byte before it is a newline) is found.
+    let mid = (start + (end - start) / 2).saturating_sub(1).max(start);
+    // O(1) EXEMPT: begin — cold line isolation, bounded by the chunk size.
+    // A split point is the byte AFTER a newline, strictly inside the range.
+    let after = bytes[mid..end.saturating_sub(1)]
+        .iter()
+        .position(|b| *b == b'\n')
+        .map(|i| mid + i + 1);
+    let split = after.or_else(|| {
+        bytes[start..mid]
+            .iter()
+            .rposition(|b| *b == b'\n')
+            .map(|i| start + i + 1)
+    });
+    // O(1) EXEMPT: end
+    split.filter(|s| *s > start && *s < end)
+}
+
+/// Finds the lines QuestDB refuses in a chunk it permanently refused whole.
+///
+/// PR17: before this, one torn line (a crash or a full disk in the middle of
+/// a spill write) quarantined the whole file, so every intact row behind it
+/// stayed out of the database until an operator salvaged it. Now the chunk is
+/// split at line boundaries and each half re-POSTed; a refused half is split
+/// again, down to single lines. Accepted halves are in QuestDB; single lines
+/// still refused are returned to be set aside. QuestDB stays the judge, so
+/// nothing here parses ILP.
+///
+/// Bounded: at most [`REPLAY_MAX_ISOLATION_POSTS_PER_CHUNK`] POSTs and
+/// [`REPLAY_MAX_REJECTED_LINES_PER_CHUNK`] refused lines, past either the
+/// whole file is quarantined as before. A chunk with no accepted line is also
+/// `WholeFile` (the refusal may be about the table, not a line), unless
+/// `others_accepted`: other rows of the same file already reached QuestDB,
+/// so the refused lines are set aside and the file keeps draining. Cold path:
+/// runs only after a permanent refusal; allocates the range stack and one
+/// `Bytes` slice per POST (no copy).
+async fn isolate_refused_lines(
+    client: &Client,
+    url: &str,
+    chunk: &bytes::Bytes,
+    others_accepted: bool,
+) -> LineIsolation {
+    let Some(first_split) = split_at_line_boundary(chunk, 0..chunk.len()) else {
+        // One line, already refused. When other rows of the same file were
+        // accepted (a torn TAIL after good rows, the crash shape), the line
+        // is set aside like any other; when nothing was, the refusal may be
+        // about the table, so the file is quarantined as before.
+        return if others_accepted {
+            LineIsolation::Isolated(std::iter::once(0..chunk.len()).collect()) // APPROVED: cold path, one range
+        } else {
+            LineIsolation::WholeFile
+        };
+    };
+    // Right half pushed first so the left half is POSTed first: rows reach
+    // QuestDB roughly in file order (the dedup keys make order irrelevant).
+    let mut stack = vec![first_split..chunk.len(), 0..first_split]; // APPROVED: cold path, after a permanent refusal
+    let mut rejected: Vec<std::ops::Range<usize>> = Vec::new(); // APPROVED: cold path, at most REPLAY_MAX_REJECTED_LINES_PER_CHUNK
+    let mut posts = 0_usize;
+    let mut accepted_any = false;
+    while let Some(range) = stack.pop() {
+        if posts >= REPLAY_MAX_ISOLATION_POSTS_PER_CHUNK {
+            return LineIsolation::WholeFile;
+        }
+        posts = posts.saturating_add(1);
+        let body = chunk.slice(range.clone());
+        match client.post(url).body(body).send().await {
+            Ok(resp) if resp.status().is_success() => accepted_any = true,
+            Ok(resp) if is_permanent_refusal(resp.status().as_u16()) => {
+                match split_at_line_boundary(chunk, range.clone()) {
+                    Some(split) => {
+                        stack.push(split..range.end);
+                        stack.push(range.start..split);
+                    }
+                    None => {
+                        rejected.push(range);
+                        if rejected.len() > REPLAY_MAX_REJECTED_LINES_PER_CHUNK {
+                            return LineIsolation::WholeFile;
+                        }
+                    }
+                }
+            }
+            Ok(_) | Err(_) => return LineIsolation::Transient,
+        }
+    }
+    if accepted_any || others_accepted {
+        LineIsolation::Isolated(rejected)
+    } else {
+        LineIsolation::WholeFile
+    }
+}
+
+/// Appends the refused lines to `<dir>/quarantine/<file>.rejected-lines` and
+/// syncs it, so a line QuestDB will never take is kept on disk, byte for
+/// byte, and copied to the cold bucket like every quarantined file. A line
+/// with no trailing newline (a torn tail) gets one, so the next set-aside
+/// cannot join it. Returns the bytes kept.
+///
+/// Cold path, one file write per refused chunk.
+fn set_aside_rejected_lines(
+    dir: &Path,
+    spill_path: &Path,
+    chunk: &[u8],
+    rejected: &[std::ops::Range<usize>],
+) -> std::io::Result<u64> {
+    use std::io::Write as _;
+    let quarantine = dir.join(QUARANTINE_DIR);
+    std::fs::create_dir_all(&quarantine)?;
+    let name = spill_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("spill");
+    let target = quarantine.join(format!("{name}{REJECTED_LINES_SUFFIX}"));
+    let mut out: Vec<u8> = Vec::new(); // APPROVED: cold path, after a permanent refusal
+    // O(1) EXEMPT: begin — cold, bounded by REPLAY_MAX_REJECTED_LINES_PER_CHUNK lines.
+    for range in rejected {
+        let line = chunk.get(range.clone()).unwrap_or_default();
+        out.extend_from_slice(line);
+        if line.last() != Some(&b'\n') {
+            out.push(b'\n');
+        }
+    }
+    // O(1) EXEMPT: end
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&target)?;
+    file.write_all(&out)?;
+    file.sync_data()?;
+    Ok(out.len() as u64)
+}
+
 /// O(1): two integer compares against const bounds, no allocation.
 fn nanos_are_a_plausible_epoch(nanos: i64) -> bool {
     let secs = nanos.div_euclid(NANOS_PER_SECOND);
@@ -566,6 +748,7 @@ pub async fn replay_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillRe
         "dir" => dir_label(dir)
     )
     .increment(0);
+    metrics::counter!(REPLAY_LINES_REJECTED_COUNTER, "dir" => dir_label(dir)).increment(0);
     // ONE buffer for the whole round, reused across files: a fixed cost per
     // round rather than per file, and the thing that makes the peak resident
     // size independent of how large any spill file has grown.
@@ -772,6 +955,10 @@ pub async fn replay_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillRe
                     accepted = accepted.saturating_add(len);
                     continue;
                 }
+                // `Bytes` so line isolation below can re-POST slices of the
+                // same chunk without copying it (a refcount clone, O(1)).
+                let chunk = bytes::Bytes::from(chunk);
+                let sent = chunk.clone();
                 match client.post(url).body(chunk).send().await {
                     Ok(resp) if resp.status().is_success() => {
                         accepted = accepted.saturating_add(len);
@@ -779,6 +966,80 @@ pub async fn replay_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillRe
                     Ok(resp) => {
                         let status = resp.status().as_u16();
                         if is_permanent_refusal(status) {
+                            // PR17: a torn or malformed LINE must not cost the
+                            // whole file. Find the refused lines, keep them in
+                            // quarantine, and carry on with the rest; only a
+                            // refusal no single line explains falls through
+                            // to quarantining the file.
+                            match isolate_refused_lines(
+                                client,
+                                url,
+                                &sent,
+                                resume_from > 0 || accepted > refused_bytes,
+                            )
+                            .await
+                            {
+                                LineIsolation::Isolated(rejected) => {
+                                    let rejected_bytes: u64 =
+                                        rejected.iter().map(|r| r.len() as u64).sum();
+                                    match set_aside_rejected_lines(dir, &path, &sent, &rejected) {
+                                        Ok(_) => {
+                                            let lines = rejected.len() as u64;
+                                            metrics::counter!(
+                                                REPLAY_LINES_REJECTED_COUNTER,
+                                                "dir" => dir_label(dir)
+                                            )
+                                            .increment(lines);
+                                            outcome.lines_set_aside =
+                                                outcome.lines_set_aside.saturating_add(lines);
+                                            error!(
+                                                code = ErrorCode::TickSpill01FileQuarantined
+                                                    .code_str(),
+                                                path = %path.display(),
+                                                status,
+                                                lines,
+                                                bytes = rejected_bytes,
+                                                "QuestDB refused single lines in a spill chunk \
+                                                 (a torn or malformed row). They are kept in \
+                                                 quarantine as <file>.rejected-lines and are \
+                                                 NOT in the database; every other row of the \
+                                                 chunk was accepted and the drain carries on \
+                                                 with the rest of the file."
+                                            );
+                                            refused_bytes =
+                                                refused_bytes.saturating_add(rejected_bytes);
+                                            accepted = accepted.saturating_add(len);
+                                            continue;
+                                        }
+                                        Err(err) => {
+                                            warn!(
+                                                path = %path.display(),
+                                                status,
+                                                %err,
+                                                "spill lines QuestDB refused could NOT be \
+                                                 written to quarantine — the file is kept \
+                                                 intact and retried next round. The rows \
+                                                 already accepted are re-POSTed then, \
+                                                 idempotently."
+                                            );
+                                            failed = true;
+                                            break 'file;
+                                        }
+                                    }
+                                }
+                                LineIsolation::Transient => {
+                                    warn!(
+                                        path = %path.display(),
+                                        status,
+                                        "QuestDB stopped answering while the refused lines of \
+                                         a spill chunk were being isolated — the file is kept \
+                                         intact and retried next round"
+                                    );
+                                    failed = true;
+                                    break 'file;
+                                }
+                                LineIsolation::WholeFile => {}
+                            }
                             // The payload is wrong, not the server. Retrying can
                             // never change a malformed byte, and the round-stops-
                             // on-failure rule below would strand every file behind
@@ -2562,6 +2823,124 @@ mod tests {
              defect: on 2026-08-25 a 512 MB file holding 1,662,318 intact ticks \
              was never once attempted, because a 401 KB file ahead of it kept \
              being refused and the round stopped there every time"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- PR17 (2026-10-04): one torn line no longer costs the whole file ---
+
+    #[test]
+    fn split_at_line_boundary_splits_whole_lines_near_the_middle() {
+        let bytes = b"aa\nbb\ncc\ndd\n";
+        let split = split_at_line_boundary(bytes, 0..bytes.len()).expect("splits");
+        assert_eq!(split, 6, "the boundary nearest the middle");
+        assert_eq!(&bytes[..split], b"aa\nbb\n");
+        // A single line, with or without its newline, does not split.
+        assert_eq!(split_at_line_boundary(b"aa\n", 0..3), None);
+        assert_eq!(split_at_line_boundary(b"aaaa", 0..4), None);
+        assert_eq!(split_at_line_boundary(b"", 0..0), None);
+        // A sub-range of two lines splits between them.
+        assert_eq!(split_at_line_boundary(bytes, 3..9), Some(6));
+        // A torn tail (no final newline) is its own line.
+        let torn = b"aa\nbbbbbbbb";
+        assert_eq!(split_at_line_boundary(torn, 0..torn.len()), Some(3));
+    }
+
+    /// The defect: a torn line in the middle of a spill file used to
+    /// quarantine the whole file, so the intact rows behind it never reached
+    /// QuestDB. Now only the refused line is set aside, kept byte for byte.
+    ///
+    /// Bite-proof: make `isolate_refused_lines` return `WholeFile` and this
+    /// fails at `files_quarantined`.
+    #[tokio::test]
+    async fn a_torn_line_is_set_aside_and_the_rest_of_the_file_is_replayed() {
+        let dir = temp_dir("torn-mid");
+        let path = dir.join("ticks-dhan-1.ilp");
+        let body = b"ticks,segment=NSE_EQ,feed=dhan security_id=1i 1\n\
+ticks,segment=NSE_EQ,feed=dhan security_id=2i 2\n\
+ticks,segment=NSE_EQ,feed=dhan secupoison\n\
+ticks,segment=NSE_EQ,feed=dhan security_id=3i 3\n\
+ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
+        std::fs::write(&path, body).expect("write"); // APPROVED: test
+
+        let (url, server) = spawn_selective_server().await;
+        let client = crate::http_client::build_probe_client(5).expect("client"); // APPROVED: test
+        let out = replay_spill_dir(&dir, &url, &client).await;
+        server.abort();
+
+        assert_eq!(
+            out.files_quarantined, 0,
+            "one bad line must not quarantine the file"
+        );
+        assert_eq!(out.files_failed, 0);
+        assert_eq!(out.files_replayed, 1);
+        assert_eq!(out.lines_set_aside, 1);
+        let kept = std::fs::read(
+            dir.join(QUARANTINE_DIR)
+                .join(format!("ticks-dhan-1.ilp{REJECTED_LINES_SUFFIX}")),
+        )
+        .expect("the refused line is kept"); // APPROVED: test
+        assert_eq!(kept, b"ticks,segment=NSE_EQ,feed=dhan secupoison\n");
+        let line = b"ticks,segment=NSE_EQ,feed=dhan secupoison\n".len() as u64;
+        assert_eq!(
+            out.bytes_replayed,
+            body.len() as u64 - line,
+            "every other byte reached QuestDB"
+        );
+        forget_resume_offset(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A torn TAIL (the crash cut the last append) is set aside the same way
+    /// and gets a newline in the kept file, so the next set-aside cannot join
+    /// it.
+    #[tokio::test]
+    async fn a_torn_tail_is_set_aside_with_a_newline() {
+        let dir = temp_dir("torn-tail");
+        let path = dir.join("ticks-dhan-1.ilp");
+        std::fs::write(
+            &path,
+            b"ticks,segment=NSE_EQ,feed=dhan security_id=1i 1\nticks,poison-torn",
+        )
+        .expect("write"); // APPROVED: test
+
+        let (url, server) = spawn_selective_server().await;
+        let client = crate::http_client::build_probe_client(5).expect("client"); // APPROVED: test
+        let out = replay_spill_dir(&dir, &url, &client).await;
+        server.abort();
+
+        assert_eq!(out.files_quarantined, 0);
+        assert_eq!(out.lines_set_aside, 1);
+        let kept = std::fs::read(
+            dir.join(QUARANTINE_DIR)
+                .join(format!("ticks-dhan-1.ilp{REJECTED_LINES_SUFFIX}")),
+        )
+        .expect("kept"); // APPROVED: test
+        assert_eq!(kept, b"ticks,poison-torn\n");
+        forget_resume_offset(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A refusal no single line explains (every line refused: the table, not
+    /// a row) still quarantines the whole file, as before PR17.
+    #[tokio::test]
+    async fn a_chunk_with_every_line_refused_still_quarantines_the_file() {
+        let dir = temp_dir("all-refused");
+        let path = dir.join("ticks-dhan-1.ilp");
+        let body = b"poison 1\npoison 2\npoison 3\n";
+        std::fs::write(&path, body).expect("write"); // APPROVED: test
+
+        let (url, server) = spawn_selective_server().await;
+        let client = crate::http_client::build_probe_client(5).expect("client"); // APPROVED: test
+        let out = replay_spill_dir(&dir, &url, &client).await;
+        server.abort();
+
+        assert_eq!(out.files_quarantined, 1);
+        assert_eq!(out.lines_set_aside, 0);
+        assert_eq!(
+            std::fs::read(dir.join(QUARANTINE_DIR).join("ticks-dhan-1.ilp")).expect("moved"), // APPROVED: test
+            body.to_vec(),
+            "the file is moved intact"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

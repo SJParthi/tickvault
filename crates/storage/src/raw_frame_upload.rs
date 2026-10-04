@@ -842,12 +842,12 @@ struct Candidate {
 }
 
 /// Files still needing an upload, in file-name order: every regular file in
-/// `dirs` with `extension` (any, when `None`) that `is_open` does not claim,
+/// `dirs` that `matches` accepts and `is_open` does not claim,
 /// that has been quiet for [`RAW_UPLOAD_MIN_QUIET_SECS`], and whose marker is
 /// missing or does not match. Cold path: one directory walk per pass.
 fn pending_files(
     dirs: &[ScanDir],
-    extension: Option<&str>,
+    matches: fn(&Path) -> bool,
     rule: MarkerMatch,
     now: SystemTime,
     is_open: &dyn Fn(&Path) -> bool,
@@ -861,9 +861,7 @@ fn pending_files(
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if extension.is_some_and(|ext| path.extension().and_then(|s| s.to_str()) != Some(ext))
-                || is_open(&path)
-            {
+            if !matches(&path) || is_open(&path) {
                 continue;
             }
             let Ok(meta) = entry.metadata() else {
@@ -898,6 +896,23 @@ fn pending_files(
     out.sort_by(|a, b| a.0.cmp(&b.0)); // name order == capture order for WAL and day files
     // O(1) EXEMPT: end
     out.into_iter().map(|(_, c)| c).collect()
+}
+
+/// `*.wal`: a capture-log segment.
+fn is_wal_segment_path(path: &Path) -> bool {
+    path.extension().and_then(|s| s.to_str()) == Some("wal")
+}
+
+/// A seal spill record file (PR40b-f; see `seal_spill::is_spill_record_name`).
+fn is_seal_spill_record_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(crate::seal_spill::is_spill_record_name)
+}
+
+/// Every regular file (the quarantine sets).
+fn any_file(_path: &Path) -> bool {
+    true
 }
 
 /// The WAL root, `replaying/` and `archive/`, all marked in `<wal>/uploaded`.
@@ -957,14 +972,14 @@ pub struct ColdFileSet {
     pub prefix: &'static str,
     /// Directories scanned; each keeps its markers in `<dir>/uploaded`.
     pub dirs: Vec<PathBuf>,
-    /// File extension the set covers; `None` covers every regular file.
-    pub extension: Option<&'static str>,
+    /// Which file names in `dirs` the set covers.
+    pub matches: fn(&Path) -> bool,
 }
 
 impl ColdFileSet {
     /// Sealed-candle spill files: the spill root, `replaying/` and
-    /// `archive/`, `*.bin` — exactly what `seal_spill::prune_spill_files`
-    /// may delete.
+    /// `archive/`: `*.bin` and its renamed copies (`.bin.N`, `.bin.overflow`;
+    /// PR40b-f) — exactly what `seal_spill::prune_spill_files` may delete.
     #[must_use]
     pub fn seal_spill(spill_dir: &Path) -> Self {
         Self {
@@ -975,7 +990,7 @@ impl ColdFileSet {
                 spill_dir.join(crate::seal_writer_task::SEAL_REPLAYING_SUBDIR),
                 spill_dir.join(crate::seal_writer_task::SEAL_ARCHIVE_SUBDIR),
             ],
-            extension: Some("bin"),
+            matches: is_seal_spill_record_path,
         }
     }
 
@@ -987,7 +1002,7 @@ impl ColdFileSet {
             label: "tick_quarantine",
             prefix: TICK_QUARANTINE_S3_PREFIX,
             dirs: vec![tick_spill_dir.join(crate::tick_spill_replay::QUARANTINE_DIR)],
-            extension: None,
+            matches: any_file,
         }
     }
 
@@ -999,7 +1014,7 @@ impl ColdFileSet {
             label: "depth_quarantine",
             prefix: DEPTH_QUARANTINE_S3_PREFIX,
             dirs: vec![depth_spill_dir.join(crate::tick_spill_replay::QUARANTINE_DIR)],
-            extension: None,
+            matches: any_file,
         }
     }
 
@@ -1082,7 +1097,7 @@ async fn run_pass_with<S: ColdObjectStore>(
     let pending = crate::off_worker::off_worker(|| {
         pending_files(
             &wal_scan_dirs(wal_dir),
-            Some("wal"),
+            is_wal_segment_path,
             MarkerMatch::Length,
             now,
             is_open,
@@ -1163,7 +1178,7 @@ async fn run_file_pass_with<S: ColdObjectStore>(
     let pending = crate::off_worker::off_worker(|| {
         pending_files(
             &set.scan_dirs(),
-            set.extension,
+            set.matches,
             MarkerMatch::LengthAndMtime,
             now,
             is_open,
@@ -1880,7 +1895,27 @@ mod tests {
     fn test_cold_file_set_seal_spill_tick_quarantine_depth_quarantine_dirs() {
         let spill = ColdFileSet::seal_spill(Path::new("/d/spill"));
         assert_eq!(spill.prefix, SEAL_SPILL_S3_PREFIX);
-        assert_eq!(spill.extension, Some("bin"));
+        for name in [
+            "seals_v4-2026-10-01.bin",
+            "seals_v4-2026-10-01.bin.1",
+            "seals_v4-2026-10-01.bin.1.2",
+            "seals_v4-2026-10-01.bin.overflow",
+        ] {
+            assert!(
+                (spill.matches)(Path::new(name)),
+                "{name} is a spill record file"
+            );
+        }
+        for name in [
+            "seals_v4-2026-10-01.ndjson",
+            "boot-committed.summary",
+            "x.wal",
+        ] {
+            assert!(
+                !(spill.matches)(Path::new(name)),
+                "{name} is not a spill record file"
+            );
+        }
         assert_eq!(
             spill.dirs,
             vec![
@@ -1892,7 +1927,7 @@ mod tests {
         let ticks = ColdFileSet::tick_quarantine(Path::new("/d/spill/ticks"));
         assert_eq!(ticks.prefix, TICK_QUARANTINE_S3_PREFIX);
         assert_eq!(ticks.dirs, vec![PathBuf::from("/d/spill/ticks/quarantine")]);
-        assert_eq!(ticks.extension, None);
+        assert!((ticks.matches)(Path::new("anything.ilp")));
         let depth = ColdFileSet::depth_quarantine(Path::new("/d/spill/depth"));
         assert_eq!(depth.prefix, DEPTH_QUARANTINE_S3_PREFIX);
         assert_eq!(depth.dirs, vec![PathBuf::from("/d/spill/depth/quarantine")]);
@@ -1931,20 +1966,20 @@ mod tests {
         let never = |_: &Path| false;
         let s =
             run_file_pass_with(&store, &set, usize::MAX, &always, &never, SystemTime::now()).await;
-        assert_eq!((s.uploaded, s.failed, s.backlog_after), (2, 0, 0));
-        // `.bin.1` is not a `.bin` file: the spill prune never deletes it
-        // either, so the pass leaves it alone.
-        for f in [&top, &archived] {
+        assert_eq!((s.uploaded, s.failed, s.backlog_after), (3, 0, 0));
+        // PR40b-f: a renamed copy (`.bin.1`) holds spilled seals like any
+        // `.bin` file, and the spill prune now deletes it, so it is copied too.
+        // Until 2026-10-04 the pass left it alone and it stayed on disk for good.
+        for f in [&top, &staged, &archived] {
             let meta = std::fs::metadata(f).expect("stat"); // APPROVED: test-only
             assert!(CopyGate::Required.allows_delete(f, &meta));
         }
-        assert!(!dir.join("replaying").join(UPLOADED_SUBDIR).exists());
         assert!(staged.exists() && foreign.exists());
         let puts = store.puts.lock().expect("lock").clone(); // APPROVED: test-only
         assert!(puts.iter().all(|k| k.starts_with("seal-spill/")));
         let again = run_file_pass(&store, &set, usize::MAX, &always, &never).await;
         assert_eq!(again.marked() + again.failed, 0);
-        assert_eq!(store.put_count(), 2);
+        assert_eq!(store.put_count(), 3);
     }
 
     #[tokio::test]

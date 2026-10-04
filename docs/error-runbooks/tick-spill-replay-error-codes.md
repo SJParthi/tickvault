@@ -57,6 +57,24 @@ the condition it exists to survive. **That writer-side defect is NOT fixed by
 this code** — this code stops one torn file from taking the backlog with it.
 Repairing the append itself is separate and still open.
 
+### §1.1 Since 2026-10-04 (PR17): one bad LINE no longer costs the file
+
+When QuestDB permanently refuses a chunk, the replay first looks for the
+refused lines: it splits the chunk at line boundaries and re-POSTs each half,
+down to single lines (`isolate_refused_lines`, at most 1,024 POSTs and 64
+refused lines per chunk). Every accepted half is in the database. The lines
+still refused on their own are appended to
+`<spill_dir>/quarantine/<file>.rejected-lines` (synced, never deleted by the
+replay, uploaded to the cold bucket like every quarantined file) and the file
+keeps draining. A torn tail after good rows (the crash shape) is handled the
+same way, with a newline added in the kept file.
+
+The same `TICK-SPILL-01` line is logged, naming the line count instead of a
+moved file. The whole file is still quarantined, exactly as above, when no
+row of the file was accepted (the refusal is likely about the table, not a
+line) or when either cap is reached. Triage of a `.rejected-lines` file is
+§2 step 2 on that file; it holds only the refused lines.
+
 ## §2. Triage
 
 1. `mcp__tickvault-logs__tail_errors` — find `TICK-SPILL-01`. It names the
@@ -104,6 +122,7 @@ Repairing the append itself is separate and still open.
 | `tv_tick_spill_replay_quarantined_total` | files permanently refused and set aside |
 | `tv_tick_spill_replay_failed_total` | transient failures; the round stopped, file retried |
 | `tv_tick_spill_replayed_bytes_total` | bytes QuestDB accepted |
+| `tv_tick_spill_replay_lines_rejected_total{dir}` | single lines refused inside an otherwise accepted chunk, kept in `<file>.rejected-lines` (PR17) |
 
 A steady `failed` with a flat `replayed_bytes` was the live signature of the
 blocked queue. After this change that shape means a genuinely unhealthy

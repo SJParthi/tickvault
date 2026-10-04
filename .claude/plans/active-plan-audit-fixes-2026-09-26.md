@@ -424,16 +424,20 @@ inline (PR2, PR8, PR14).
       pins each systemd unit's shell `Exec*=` count (1 + 3 + 1). Rule lock §0.10. Test-only.
       Tests: `no_new_shell_files`, `shell_lists_shrink_only`, `ops_shell_files_never_grow`,
       `systemd_units_never_add_shell`, `shell_budget_guard_self_test`.
-    - [ ] D6b — host tuning (3 of the 5 boot shell programs: verify-net-tuning.sh,
+    - [x] D6b — host tuning (3 of the 5 boot shell programs: verify-net-tuning.sh,
       apply-host-tuning.sh, the BBR `/bin/sh -c`) becomes `tickvault host-tuning` in `app`, same
       behaviour, pure core + thin I/O shell, unit tests on every branch. Unit pin 3 → 0; two
       ops entries removed; user-data `chmod` lines removed; the three host-tuning guards re-pointed.
-    - [ ] D6c — holiday gate becomes `tickvault holiday-gate` in `app` (IMDSv2 via reqwest; SSM
+    - [x] D6c — holiday gate becomes `tickvault holiday-gate` in `app` (IMDSv2 via reqwest; SSM
       marker, SNS page and StopInstances via the existing workspace AWS SDK pins). Same fail-open
       contract: stop only on a definitive holiday verdict. Unit pin 1 → 0.
-    - [ ] D6d — QuestDB self-heal becomes `tickvault ensure-questdb` in `app` (same ladder:
+    - [x] D6d — QuestDB self-heal becomes `tickvault ensure-questdb` in `app` (same ladder:
       running → start → pull → compose v2 → v1 → plugin path → docker run), and the operator
       console's SSM strings call the binary. Unit pin 1 → 0.
+    - Shipped (verified on main 2026-10-04): D6b in #2001 (`crates/app/src/host_tuning.rs`, unit
+      runs `tickvault-host host-tuning`); D6c in #2004 (`crates/app/src/holiday_gate.rs`,
+      `deploy/aws/holiday-gate.sh` deleted); D6d in #2004 as R3-12 (`ensure_questdb.rs`,
+      `scripts/ensure-questdb.sh` deleted). Only D6e onward is open.
     - [ ] D6e onward — the rest by risk: SSM command strings and `sh -c` spawns in Rust get a
       budget, then workflow `run:` steps and the Makefile get a budget, then operator scripts
       are ported or deleted (orphans first), each PR lowering the D6a lists.
@@ -511,7 +515,27 @@ folded into them below), then PR18, PR19 and the decisions.
     (ws_frame_spill.rs:566; tick_persistence.rs:1344-1349, :2837, :3383): `sync_data` before the
     marker advances, off the drain.
   - A torn last line quarantines the whole hour (tick_spill_replay.rs:620-623): skip and count
-    the torn line, keep the rest.
+    the torn line, keep the rest. **Done 2026-10-04** (`tick_spill_replay.rs::isolate_refused_lines`): a
+    permanently refused chunk is bisected at line boundaries; refused single lines go to
+    `quarantine/<file>.rejected-lines` (synced, uploaded like any quarantined file), counted on
+    `tv_tick_spill_replay_lines_rejected_total`, and the file keeps draining. Covers a torn line
+    anywhere, not only last (re-check 6). Whole-file quarantine stays for a chunk with no
+    accepted row or past the caps (1,024 POSTs, 64 lines). Tests:
+    `a_torn_line_is_set_aside_and_the_rest_of_the_file_is_replayed`,
+    `a_torn_tail_is_set_aside_with_a_newline`,
+    `a_chunk_with_every_line_refused_still_quarantines_the_file`,
+    `split_at_line_boundary_splits_whole_lines_near_the_middle`.
+  - The candle seal spill was never synced. **Done 2026-10-04**
+    (`seal_spill.rs::SealSpillWriter::sync_open_file`, called from
+    `seal_writer_runner.rs::SealEscalationSink::run`): the escalation thread syncs the day file
+    after each batch that empties its queue, at least once a second under a burst, and once at
+    exit; the day rotation syncs the closing file. The lock is held only to `dup` the handle, so
+    an inline append never waits for the device; `append_seal` itself never syncs. Failures on
+    `tv_seal_spill_sync_failed_total`, one coded `error!` per failing episode. Tests:
+    `sync_open_file_is_a_no_op_with_nothing_open_and_keeps_the_handle_open`,
+    `the_drain_reachable_append_never_syncs_and_the_sync_holds_no_lock` (bite-tested), and the
+    two escalation-summary tests now pin `syncs`. Not done: the seal DLQ is still not synced,
+    and a seal the drain writes inline (escalation queue full) waits for the thread's next sync, or for the day rotation if the thread has exited.
   - A frame the capture log refused and later deferred to it is labelled "deferred"
     (pool_supervisor.rs:3924-4002, tick_persistence.rs:2791): fix the label; counter and alarm
     are already right.
@@ -630,7 +654,7 @@ folded into them below), then PR18, PR19 and the decisions.
       a READ-ONLY token source re-read from `/dhan-depth/access-token` (an 807 on the depth account
       re-reads, never mints: minting from the box would fight its Lambda); `account` label on
       every depth log, counter and alarm; the second pool static (no steering) until measured.
-- [ ] **D10 — no depth path relies on unsubscribe.** (`core`) Dhan depth unsubscribe (codes 25
+- [x] **D10 — no depth path relies on unsubscribe.** **OBSOLETE 2026-10-04:** the design reversed. #1994 swaps depth-200 in place (code 25 then 23), the owner ruled for unsubscribe/subscribe on 2026-10-01, and Dhan's 2026-09-30 reply confirms code 25; a ghost is answered by `request_ghost_unsubscribe`. Original text kept below. (`core`) Dhan depth unsubscribe (codes 25
   and 24) takes no effect and gets no reply (madefortrade topic 94234; Dhan "reviewing" as of
   2026-09-26). Depth-200 already rotates by redial and depth-20 is a static day set, but
   `send_unsubscribe` still has depth-pool call sites (pool_supervisor.rs swap paths). Verify
@@ -1998,6 +2022,23 @@ New items:
   `app`)
   - This item owns the PR40b corrections above: rows 187 (c6#168; `.overflow` as well as
     `.bin.N`) and 194 (exempt refused and poison files; move the prune after recovery).
+  - **Partly done 2026-10-04.** Row 187: `seal_spill::is_spill_record_name` /
+    `strip_copy_suffixes` match `.bin.N`, stacked `.bin.N.M` and `.bin.overflow`, and the prune,
+    the cold uploader (`ColdFileSet::seal_spill`, now `matches: fn(&Path) -> bool`) and the
+    replay staging (`staged_kind`) all use them; before, the first two matched `*.bin` only and
+    staging never read an `.overflow` file. Row 194, second half: instead of moving the call in
+    main.rs, `prune_spill_files` holds aged top-level and `replaying/` files
+    (`held_before_boot_drain`) until `drain_recovered_seals` has run over that folder in this
+    process (`note_boot_drain_ran`), which covers the 6-hourly and disk-pressure passes too.
+    Tests: `test_is_spill_record_name_and_strip_copy_suffixes_match_every_renamed_copy`,
+    `spill_sweep_prunes_renamed_copies_and_counts_their_records`,
+    `spill_sweep_keeps_aged_unreplayed_files_until_the_boot_drain_has_run`,
+    `test_note_boot_drain_ran_and_boot_drain_ran_are_per_directory`, `staging_reads_overflow_and_twice_renamed_copies`,
+    `the_boot_drain_lets_the_retention_sweep_delete_unreplayed_files`, and the updated
+    `test_run_file_pass_uploads_every_spill_folder_and_a_second_pass_does_nothing`. **Still
+    open:** exempting refused and poison files (with the copy gate on, the default, they are
+    deleted only with a verified cold copy), and row 296 below. Limit: with no boot drain in
+    the process (Dhan lane off) unreplayed files are never age-pruned; they are kept, not lost.
   - Row 296: report staged-for-retry seals as pending rather than unrecovered, page once, and
     fix the wiring test that pins the over-count (seal_writer_loop.rs:321-331, :1709-1750).
 - [ ] **OWNER-202 — exits refused at 25,000 tracked orders.** (decision only, no code)
@@ -2372,7 +2413,18 @@ idle poll. No allocation on the tick path.
   first so only #2005's version lands).
 - [ ] **R3-13 (D11) — Special sessions (Muhurat).** Built inert on `wip/d11`, NOT merged: needs the
   owner to confirm date, hours and cost, and a compile + test run.
-- [ ] **R3-14 — WAL segment names from a monotonic source** (replay order across a clock step). Open.
+- [x] **R3-14 — WAL segment names from a monotonic source** (replay order across a clock step). **Done 2026-10-04** (`ws_frame_spill.rs::next_segment_name_nanos`): a new segment is named `max(wall nanos, highest name in the directory + 1)`, the highest seeded once per directory from the live, `replaying/` and `archive/` names, so names only rise across a backward clock step or a restart; a clamped name is counted on `tv_wal_segment_name_clamped_total`. Tests: `test_regression_segment_names_keep_rising_across_a_backward_clock_step`, `test_regression_segment_names_seed_past_every_name_on_disk_after_a_restart` (both fail with the clamp removed), `test_segment_name_nanos_parses_only_segment_names`. Storage lib 1,763 passed, integration tests all passed.
+- [x] **L10 (audit thread, 2026-10-04) — the boot sequence probe trusted a corrupt record.**
+  **Done 2026-10-04** (`ws_frame_spill.rs::highest_frame_seq_in_segment`). Two defects, both
+  fixed: (1) the record giving the highest header sequence is now read whole and its CRC
+  checked; if it fails, the segment is re-walked verifying every record
+  (`tv_wal_seq_probe_corrupt_record_total`), so a flipped bit can no longer seed `capture_seq`
+  near the top of its range; (2) found while testing: the header walk's seek counted the CRC
+  twice, so every segment yielded only its FIRST record's sequence and the restart seed sat up to
+  one segment below the true high-water mark. Tests:
+  `test_regression_high_water_probe_reads_every_record_of_a_segment` (fails on the old seek),
+  `test_regression_a_corrupt_sequence_never_seeds_the_counter` (fails with the CRC check removed),
+  `test_first_frame_seq_refuses_a_corrupt_first_record`.
 
 ### Added 2026-10-02 (round 4: owner approved decisions 2 to 5 and in-place resubscribe)
 
@@ -2652,3 +2704,17 @@ See per-wave-guarantee-matrix.md. All 15 rows of the guarantee matrix and all 7 
 resilience matrix apply to every item. Rows that do not apply to an item are written
 `N/A — reason` in that item's PR body. Every "100%" claim in these PRs carries the §F envelope
 qualifier: 100% inside the tested envelope, with ratcheted regression coverage.
+
+### Reconciled 2026-10-04 against main `e461c3995` (every unticked item re-read in source)
+
+Four read-only checks re-read each open item against the code on main. No open item was fully
+done except the D6b/c/d boxes ticked above, and D10, which the in-place swap made obsolete.
+Status of the rest, so the next session does not re-audit:
+
+| State | Items |
+|---|---|
+| Partly done (remaining work named in each item) | PR5, PR8 (shutdown/boot `blocking_flush`, seal-writer cycle, order observability flushes still `block_in_place`), D2 (waits on PR12), D3 (D3a/b/c-1 done; D3c-2/3 open), D5 (waits on PR11), D6 (D6e onward), PR16 (`df` fork with no timeout, drain still on the shared runtime, boot seal drain bare), PR17 (seal DLQ not synced; torn-line and seal-spill sync done 2026-10-04), PR18, PR19, D7 (808 policy open), D9 (D9b-3 open), PR24, PR28b (owner lock mode), PR31c, PR32 (hour-boundary late append in tick spill replay; unapplied-table overflow uncounted; archive blind to capture-log deferrals), PR33, PR36 (SSH done), PR39, PR42 (42a/42b done; 42c owner; order/position update event writers have no spill tier), PR55 (manual and tag deploys gated; input-in-shell and branch checks open), PR56 (alarm open), PR40b-f (renamed copies and the boot-drain hold done 2026-10-04; refused/poison exemption and row 296 open) |
+| Open, nothing built | PR6, PR7, PR9, PR10, PR11, PR12, PR13, PR14, D1, D4, D8, PR23, PR25, PR26, PR27, PR34, PR35, PR37, PR38, PR43, PR44, PR45, PR46, PR47, PR49, PR50, PR51, PR52, PR54, PR57, PR59, PR40c-f, PR40d-f |
+| Waiting on the owner | OWNER-202, PR42c, PR28b lock mode, D11/R3-13 (no `wip/d11` branch exists any more; the box curfew still blocks Sundays; the session is 2026-11-08) |
+| Dormant | PR48 (console wipes switched off by `CONSOLE_DATA_WIPES_AUTHORIZED = false`) |
+| Done in a later fold | PR40a follow-up (`escalation_pending` counted in `unwritten_seals`) |
