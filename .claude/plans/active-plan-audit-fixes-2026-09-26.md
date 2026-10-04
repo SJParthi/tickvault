@@ -2736,6 +2736,23 @@ write, then candle warm-up (PR31b-2 (a), already listed above). Each fix ships a
   instrument list; a row the bounded channel cannot take is counted and paged once per episode,
   not kept; not run against a live QuestDB here.
 
+- [x] **M4/L4 — The operator console is harder to abuse.** The portal is a public URL behind one
+  shared secret that can stop the trading box. Before: CORS allowed any origin, the key sat in
+  `localStorage`, two server strings reached `innerHTML` unescaped, and nothing slowed a caller
+  guessing keys. Now: no CORS block on the Function URL or the API (same-origin only); the key is
+  kept in `sessionStorage`; both strings pass through `esc()`; a per-container failed-key guard
+  refuses a source after `AUTH_FAILURE_LIMIT` (10) wrong keys in `AUTH_FAILURE_WINDOW_SECS` (300)
+  with a 429, bounded at `AUTH_FAILURE_MAX_SOURCES` (4,096); reserved concurrency 3; an API
+  Gateway stage throttle (rate 2/s, burst 10). Files: `crates/aws-lambdas/src/{operator_control.rs,
+  operator_control_console.html}`, `deploy/aws/terraform/operator-control-lambda.tf`, new
+  `crates/aws-lambdas/tests/operator_portal_exposure_guard.rs`. Tests: aws-lambdas lib 613,
+  operator_portal_exposure_guard 4, browser_surface_and_toolchain_guard 12. Honest limits: the
+  guard is per container, so the ceiling is 3 × 10 per window per source and an address-rotating
+  caller is not limited by it; the secret's length is the real control. **Risk:** AWS refuses
+  reserved concurrency when the account limit is 10, and the apply runs on merge; the owner was
+  asked (2026-10-04) whether to keep the cap. `terraform fmt`/`validate` not run (no terraform
+  CLI in the container).
+
 ## Edge Cases
 
 - PR1: log burst larger than the non-blocking buffer → lines dropped and counted, never blocking.
