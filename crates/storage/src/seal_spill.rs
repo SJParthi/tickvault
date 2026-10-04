@@ -1891,6 +1891,11 @@ pub struct SpillPruneOutcome {
     pub refused_not_uploaded: usize,
     /// Bytes held by `refused_not_uploaded`.
     pub refused_not_uploaded_bytes: u64,
+    /// Aged files at the top level or in `replaying/` KEPT because this
+    /// process has not yet run the boot drain over this spill directory
+    /// (PR40b-f). Before that, an aged file is a file the replay has not
+    /// tried yet, not a file it failed to drain.
+    pub held_before_boot_drain: usize,
 }
 
 /// Counter: aged seal-spill files the retention sweep KEPT because no
@@ -1943,6 +1948,19 @@ pub fn prune_spill_files_at(
     now: std::time::SystemTime,
     gate: CopyGate,
 ) -> SpillPruneOutcome {
+    prune_spill_files_inner(spill_dir, max_age_secs, now, gate, false)
+}
+
+/// [`prune_spill_files_at`] with the PR40b-f boot-drain hold: when
+/// `hold_unreplayed` is set, aged files at the top level and in `replaying/`
+/// are kept and counted in `held_before_boot_drain` instead of deleted.
+fn prune_spill_files_inner(
+    spill_dir: &Path,
+    max_age_secs: u64,
+    now: std::time::SystemTime,
+    gate: CopyGate,
+    hold_unreplayed: bool,
+) -> SpillPruneOutcome {
     let mut outcome = SpillPruneOutcome::default();
     // NEVER delete a file the live writer may hold open (2026-08-19, found by
     // the adversarial audit — this sweep as first written could do exactly
@@ -1981,6 +1999,7 @@ pub fn prune_spill_files_at(
         cutoff,
         now,
         gate,
+        hold_unreplayed,
         &mut outcome,
     );
     // Audit PR40b: the two folders the replay moves files into. Until then
@@ -2004,6 +2023,7 @@ pub fn prune_spill_files_at(
         cutoff,
         now,
         gate,
+        hold_unreplayed,
         &mut outcome,
     );
     prune_dir(
@@ -2013,9 +2033,73 @@ pub fn prune_spill_files_at(
         cutoff,
         now,
         gate,
+        false,
         &mut outcome,
     );
     outcome
+}
+
+/// `name` without the copy suffixes the spill tier adds when it renames a
+/// file: every trailing `.<digits>` (`set_aside_torn_file`, and `free_path`
+/// on a name collision, which can stack: `.bin.1.1`) and `.overflow`
+/// (`free_path`'s last resort). PR40b-f. O(suffixes), cold.
+#[must_use]
+pub(crate) fn strip_copy_suffixes(name: &str) -> &str {
+    let mut base = name;
+    while let Some((head, tail)) = base.rsplit_once('.') {
+        let is_copy_suffix =
+            tail == "overflow" || (!tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()));
+        if !is_copy_suffix {
+            break;
+        }
+        base = head;
+    }
+    base
+}
+
+/// `true` for a seal spill record file name: `*.bin`, or a renamed copy of
+/// one (`*.bin.<digits>`, `*.bin.overflow`, stacked; see
+/// [`strip_copy_suffixes`]). PR40b-f: the prune, the cold uploader and the
+/// replay staging use the same suffix rule, so they agree on which files
+/// hold spilled seals; until 2026-10-04 the first two matched `*.bin` only.
+#[must_use]
+pub(crate) fn is_spill_record_name(name: &str) -> bool {
+    strip_copy_suffixes(name).ends_with(".bin")
+}
+
+/// Spill directories whose boot drain has run in this process (PR40b-f).
+/// One entry in production; the list exists so tests over temp directories
+/// cannot unblock each other. Cold: one push per boot drain, one scan per
+/// retention sweep.
+static BOOT_DRAINED_SPILL_DIRS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Records that the boot drain has read `spill_dir` (whatever it found), so
+/// the retention sweep may delete aged unreplayed files there from now on.
+pub(crate) fn note_boot_drain_ran(spill_dir: &Path) {
+    let mut dirs = BOOT_DRAINED_SPILL_DIRS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !dirs.iter().any(|d| same_dir(d, spill_dir)) {
+        dirs.push(spill_dir.to_path_buf());
+    }
+}
+
+/// `true` once the boot drain has run over `spill_dir` in this process.
+pub(crate) fn boot_drain_ran(spill_dir: &Path) -> bool {
+    BOOT_DRAINED_SPILL_DIRS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .any(|d| same_dir(d, spill_dir))
+}
+
+/// The same directory, spelled the same way or resolving to one place.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+            (Ok(x), Ok(y)) if x == y
+        )
 }
 
 /// What a deleted file in a swept directory held.
@@ -2038,6 +2122,7 @@ fn prune_dir(
     cutoff: std::time::Duration,
     now: std::time::SystemTime,
     gate: CopyGate,
+    hold: bool,
     outcome: &mut SpillPruneOutcome,
 ) {
     // O(1) EXEMPT: periodic cold retention sweep, never the per-seal append
@@ -2049,7 +2134,14 @@ fn prune_dir(
         // Only our own spill records. Anything else in the directory is left
         // strictly alone — deleting a file we did not write, to satisfy our
         // own budget, would be indefensible.
-        if path.extension().and_then(|s| s.to_str()) != Some("bin") {
+        // PR40b-f: `.bin.N` (set aside, or a name collision on staging) and
+        // `.bin.overflow` are spill records too; until 2026-10-04 only
+        // `*.bin` matched, so those were never pruned, uploaded or counted.
+        if !path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(is_spill_record_name)
+        {
             continue;
         }
         // The live-writer guard. Cheap, and it fails SAFE: an unreadable file
@@ -2073,6 +2165,11 @@ fn prune_dir(
             .and_then(|mtime| now.duration_since(mtime).ok())
             .is_some_and(|age| age > cutoff);
         if !aged_out {
+            outcome.bytes_after = outcome.bytes_after.saturating_add(len);
+            continue;
+        }
+        if hold {
+            outcome.held_before_boot_drain += 1;
             outcome.bytes_after = outcome.bytes_after.saturating_add(len);
             continue;
         }
@@ -2143,12 +2240,25 @@ pub fn prune_spill_files(
     max_age_secs: u64,
     require_upload: bool,
 ) -> SpillPruneOutcome {
-    let outcome = prune_spill_files_at(
+    // PR40b-f: until this process has run the boot drain over the folder,
+    // an aged unreplayed file has not been tried yet, so it is kept. The
+    // sweep runs once at task start, which can come before the drain, and
+    // after a week or more off it used to delete files the drain never read.
+    let hold_unreplayed = !boot_drain_ran(spill_dir);
+    let outcome = prune_spill_files_inner(
         spill_dir,
         max_age_secs,
         std::time::SystemTime::now(),
         CopyGate::from_config(require_upload),
+        hold_unreplayed,
     );
+    if outcome.held_before_boot_drain > 0 {
+        info!(
+            held = outcome.held_before_boot_drain,
+            "spill retention sweep: aged unreplayed spill files kept until the boot drain \
+             has read them"
+        );
+    }
     // APPROVED: cast — a per-pass file count, always <= u64.
     metrics::counter!(SEAL_SPILL_PRUNE_REFUSED_NOT_UPLOADED_COUNTER)
         .increment(outcome.refused_not_uploaded as u64);
@@ -3785,6 +3895,109 @@ mod tests {
         assert!(!archived_today.exists());
         assert_eq!(out.skipped_live, 1);
         assert_eq!(out.archive_deleted, 1);
+    }
+
+    #[test]
+    fn is_spill_record_name_matches_every_renamed_copy() {
+        // PR40b-f: the prune and the uploader matched `*.bin` only, so a
+        // set-aside or collision copy was never pruned, uploaded or counted.
+        for name in [
+            "seals_v4-2026-10-01.bin",
+            "seals_v4-2026-10-01.bin.1",
+            "seals_v4-2026-10-01.bin.12",
+            "seals_v4-2026-10-01.bin.1.3",
+            "seals_v4-2026-10-01.bin.overflow",
+            "seals_v4-2026-10-01.bin.overflow.2",
+        ] {
+            assert!(is_spill_record_name(name), "{name} holds spilled seals");
+        }
+        for name in [
+            "seals_v4-2026-10-01.ndjson",
+            "seals_v4-2026-10-01.ndjson.1",
+            "seals_v4-2026-10-01.bin.tmp",
+            "seal-unwritten.mark",
+            "bin",
+            "x.1",
+        ] {
+            assert!(!is_spill_record_name(name), "{name} is not a spill file");
+        }
+        assert_eq!(
+            strip_copy_suffixes("seals_v4-2026-10-01.bin.overflow.7"),
+            "seals_v4-2026-10-01.bin"
+        );
+    }
+
+    #[test]
+    fn spill_sweep_prunes_renamed_copies_and_counts_their_records() {
+        let dir = spill_tmp("renamed");
+        let archive = dir.join(crate::seal_writer_task::SEAL_ARCHIVE_SUBDIR);
+        std::fs::create_dir_all(&archive).expect("mkdir archive");
+        let set_aside = write_aged(
+            &dir,
+            "seals_v4-20260101.bin.1",
+            SEAL_SPILL_RECORD_SIZE * 2,
+            10_000,
+        );
+        let overflow = write_aged(&archive, "seals_v4-20260101.bin.overflow", 128, 10_000);
+        let out = prune_spill_files_at(
+            &dir,
+            3_600,
+            std::time::SystemTime::now(),
+            CopyGate::NotRequired,
+        );
+        assert!(!set_aside.exists() && !overflow.exists());
+        assert_eq!(out.deleted, 1);
+        assert_eq!(
+            out.records_lost, 2,
+            "a set-aside copy's records are counted"
+        );
+        assert_eq!(out.archive_deleted, 1);
+    }
+
+    #[test]
+    fn spill_sweep_keeps_aged_unreplayed_files_until_the_boot_drain_has_run() {
+        // PR40b-f: the sweep runs once at task start, which can come before
+        // the boot drain. After a week or more off, every unreplayed file is
+        // past the window and used to be deleted before the drain read it.
+        let dir = spill_tmp("held");
+        let replaying = dir.join(crate::seal_writer_task::SEAL_REPLAYING_SUBDIR);
+        let archive = dir.join(crate::seal_writer_task::SEAL_ARCHIVE_SUBDIR);
+        std::fs::create_dir_all(&replaying).expect("mkdir replaying");
+        std::fs::create_dir_all(&archive).expect("mkdir archive");
+        let top = write_aged(&dir, "seals_v4-20260101.bin", 128, 10_000);
+        let staged = write_aged(&replaying, "seals_v4-20260102.bin", 128, 10_000);
+        let archived = write_aged(&archive, "seals_v4-20260103.bin", 128, 10_000);
+        let now = std::time::SystemTime::now();
+
+        let held = prune_spill_files_inner(&dir, 3_600, now, CopyGate::NotRequired, true);
+        assert!(top.exists() && staged.exists(), "unreplayed files are kept");
+        assert!(
+            !archived.exists(),
+            "archive/ is not held: the drain is done with it"
+        );
+        assert_eq!(held.held_before_boot_drain, 2);
+        assert_eq!((held.deleted, held.records_lost), (0, 0));
+        assert_eq!(held.bytes_after, 256);
+
+        let after = prune_spill_files_inner(&dir, 3_600, now, CopyGate::NotRequired, false);
+        assert!(!top.exists() && !staged.exists());
+        assert_eq!(after.held_before_boot_drain, 0);
+        assert_eq!(after.deleted, 2);
+    }
+
+    #[test]
+    fn the_boot_drain_record_is_per_directory() {
+        let drained = spill_tmp("drained");
+        let other = spill_tmp("not-drained");
+        assert!(!boot_drain_ran(&drained));
+        note_boot_drain_ran(&drained);
+        note_boot_drain_ran(&drained);
+        assert!(boot_drain_ran(&drained));
+        assert!(
+            boot_drain_ran(&drained.join(".")),
+            "the same folder spelled differently"
+        );
+        assert!(!boot_drain_ran(&other), "another folder is still held");
     }
 
     #[test]
