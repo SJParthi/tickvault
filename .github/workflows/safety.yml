@@ -118,12 +118,17 @@ jobs:
         env:
           TV_SKIP_PERF_ASSERTIONS: "1"
         run: |
+          # pipefail (2026-10-04): without it this step read the exit code of
+          # `tee`, so a failing careful test run passed green. The exit code is
+          # captured first because PIPESTATUS is overwritten by the next command.
+          set -o pipefail
           # --test-threads=1: reduces memory pressure on CI runners
           # TV_SKIP_PERF_ASSERTIONS: skip timing assertions (instrumentation = 10-100x slower)
           cargo +${{ env.NIGHTLY_VERSION }} careful test --workspace \
             -- --test-threads=1 2>&1 | tee /tmp/careful-test.log || {
+            rc=${PIPESTATUS[0]}
             echo "test_failed=true" >> "$GITHUB_OUTPUT"
-            echo "=== cargo-careful test failed (exit code: ${PIPESTATUS[0]}) ==="
+            echo "=== cargo-careful test failed (exit code: ${rc}) ==="
             echo "=== Failed tests ==="
             grep -E "^test .+ FAILED|^failures:" /tmp/careful-test.log || true
             echo "=== Last 80 lines ==="
