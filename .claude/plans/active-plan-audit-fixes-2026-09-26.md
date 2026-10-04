@@ -524,8 +524,18 @@ folded into them below), then PR18, PR19 and the decisions.
     `a_torn_line_is_set_aside_and_the_rest_of_the_file_is_replayed`,
     `a_torn_tail_is_set_aside_with_a_newline`,
     `a_chunk_with_every_line_refused_still_quarantines_the_file`,
-    `split_at_line_boundary_splits_whole_lines_near_the_middle`. Still open in PR17: the candle
-    seal spill is never synced.
+    `split_at_line_boundary_splits_whole_lines_near_the_middle`.
+  - The candle seal spill was never synced. **Done 2026-10-04**
+    (`seal_spill.rs::SealSpillWriter::sync_open_file`, called from
+    `seal_writer_runner.rs::SealEscalationSink::run`): the escalation thread syncs the day file
+    after each batch that empties its queue, at least once a second under a burst, and once at
+    exit; the day rotation syncs the closing file. The lock is held only to `dup` the handle, so
+    an inline append never waits for the device; `append_seal` itself never syncs. Failures on
+    `tv_seal_spill_sync_failed_total`, one coded `error!` per failing episode. Tests:
+    `sync_open_file_is_a_no_op_with_nothing_open_and_keeps_the_handle_open`,
+    `the_drain_reachable_append_never_syncs_and_the_sync_holds_no_lock` (bite-tested), and the
+    two escalation-summary tests now pin `syncs`. Not done: the seal DLQ is still not synced,
+    and a seal the drain writes inline (escalation queue full) waits for the thread's next sync, or for the day rotation if the thread has exited.
   - A frame the capture log refused and later deferred to it is labelled "deferred"
     (pool_supervisor.rs:3924-4002, tick_persistence.rs:2791): fix the label; counter and alarm
     are already right.
@@ -2686,7 +2696,7 @@ Status of the rest, so the next session does not re-audit:
 
 | State | Items |
 |---|---|
-| Partly done (remaining work named in each item) | PR5, PR8 (shutdown/boot `blocking_flush`, seal-writer cycle, order observability flushes still `block_in_place`), D2 (waits on PR12), D3 (D3a/b/c-1 done; D3c-2/3 open), D5 (waits on PR11), D6 (D6e onward), PR16 (`df` fork with no timeout, drain still on the shared runtime, boot seal drain bare), PR17 (candle seal spill never synced; torn-line part done 2026-10-04), PR18, PR19, D7 (808 policy open), D9 (D9b-3 open), PR24, PR28b (owner lock mode), PR31c, PR32 (hour-boundary late append in tick spill replay; unapplied-table overflow uncounted; archive blind to capture-log deferrals), PR33, PR36 (SSH done), PR39, PR42 (42a/42b done; 42c owner; order/position update event writers have no spill tier), PR55 (manual and tag deploys gated; input-in-shell and branch checks open), PR56 (alarm open), PR40b-f (S3 copy gate mitigates; `.bin.N` / `.overflow` never matched; boot prune still runs before the boot drain) |
+| Partly done (remaining work named in each item) | PR5, PR8 (shutdown/boot `blocking_flush`, seal-writer cycle, order observability flushes still `block_in_place`), D2 (waits on PR12), D3 (D3a/b/c-1 done; D3c-2/3 open), D5 (waits on PR11), D6 (D6e onward), PR16 (`df` fork with no timeout, drain still on the shared runtime, boot seal drain bare), PR17 (seal DLQ not synced; torn-line and seal-spill sync done 2026-10-04), PR18, PR19, D7 (808 policy open), D9 (D9b-3 open), PR24, PR28b (owner lock mode), PR31c, PR32 (hour-boundary late append in tick spill replay; unapplied-table overflow uncounted; archive blind to capture-log deferrals), PR33, PR36 (SSH done), PR39, PR42 (42a/42b done; 42c owner; order/position update event writers have no spill tier), PR55 (manual and tag deploys gated; input-in-shell and branch checks open), PR56 (alarm open), PR40b-f (S3 copy gate mitigates; `.bin.N` / `.overflow` never matched; boot prune still runs before the boot drain) |
 | Open, nothing built | PR6, PR7, PR9, PR10, PR11, PR12, PR13, PR14, D1, D4, D8, PR23, PR25, PR26, PR27, PR34, PR35, PR37, PR38, PR43, PR44, PR45, PR46, PR47, PR49, PR50, PR51, PR52, PR54, PR57, PR59, PR40c-f, PR40d-f |
 | Waiting on the owner | OWNER-202, PR42c, PR28b lock mode, D11/R3-13 (no `wip/d11` branch exists any more; the box curfew still blocks Sundays; the session is 2026-11-08) |
 | Dormant | PR48 (console wipes switched off by `CONSOLE_DATA_WIPES_AUTHORIZED = false`) |

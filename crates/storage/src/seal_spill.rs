@@ -901,12 +901,23 @@ pub struct SealSpillWriter {
     /// affordable.
     err_no_handle: metrics::Counter,
     err_write: metrics::Counter,
+    /// Pre-resolved handle for a failed `sync_data` (PR17). The day-rotation
+    /// sync in `current_file` is reachable from the drain's inline fallback,
+    /// so it is resolved for the same reason as the two above.
+    err_sync: metrics::Counter,
+    /// `true` while the last sync of the open day file failed, so a failing
+    /// disk logs one `error!` per episode rather than one per sync (PR17).
+    sync_failing: AtomicBool,
     superseded: SupersededCounters,
 }
 
 /// Name of the spill-write failure counter. Both label values are
 /// compile-time literals, so the handle set is enumerable up front.
 const SPILL_WRITE_ERRORS_COUNTER: &str = "tv_seal_spill_write_errors_total";
+
+/// Failed `sync_data` calls on the seal spill day file (PR17). A failure
+/// means seals the spill reported written may be only in the page cache.
+pub const SEAL_SPILL_SYNC_FAILED_COUNTER: &str = "tv_seal_spill_sync_failed_total";
 
 impl SealSpillWriter {
     /// Production constructor. Uses `data/spill/`.
@@ -931,6 +942,8 @@ impl SealSpillWriter {
             escalation_finished: AtomicU64::new(0),
             err_no_handle: metrics::counter!(SPILL_WRITE_ERRORS_COUNTER, "stage" => "no_handle"),
             err_write: metrics::counter!(SPILL_WRITE_ERRORS_COUNTER, "stage" => "write"),
+            err_sync: metrics::counter!(SEAL_SPILL_SYNC_FAILED_COUNTER),
+            sync_failing: AtomicBool::new(false),
             superseded: SupersededCounters::resolve(),
         }
     }
@@ -962,6 +975,48 @@ impl SealSpillWriter {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Syncs the open day file to the device (PR17: the seal spill was never
+    /// synced, so a power loss could take seals it had reported written).
+    ///
+    /// Called by the escalation thread (`tv-seal-escalate`) after it writes,
+    /// never by `append_seal`, which the frame drain's inline fallback can
+    /// reach. The lock is held only to duplicate the handle (`try_clone`, one
+    /// `dup`), never across the `sync_data`, so an append is never made to
+    /// wait for the device. No open file is a no-op.
+    ///
+    /// Returns `true` when there was nothing to sync or the sync succeeded.
+    /// A failure is counted on `tv_seal_spill_sync_failed_total` and logged
+    /// once per failing episode.
+    pub(crate) fn sync_open_file(&self) -> bool {
+        let handle = {
+            let state = self.lock_state();
+            match state.open.as_ref() {
+                Some(open) => open.file.try_clone(),
+                None => return true,
+            }
+        };
+        let outcome = handle.and_then(|file| file.sync_data());
+        match outcome {
+            Ok(()) => {
+                self.sync_failing.store(false, Ordering::Relaxed);
+                true
+            }
+            Err(err) => {
+                self.err_sync.increment(1);
+                if !self.sync_failing.swap(true, Ordering::Relaxed) {
+                    error!(
+                        code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                        spill_dir = ?self.spill_dir,
+                        ?err,
+                        "seal spill: syncing the day file failed; seals reported written may \
+                         be lost on a power cut until a sync succeeds"
+                    );
+                }
+                false
+            }
+        }
     }
 
     /// Opens (creating as needed) the append handle for `path`.
@@ -1103,7 +1158,17 @@ impl SealSpillWriter {
         let day = ist_day_number(now_unix_secs);
         if open.as_ref().is_none_or(|current| current.ist_day != day) {
             // Close the previous day's handle BEFORE opening the next, so a
-            // rotation never holds two descriptors.
+            // rotation never holds two descriptors. PR17: sync it first, so the
+            // last seals of the day are on the device and not only in the page
+            // cache (the escalation thread syncs only the handle it finds open).
+            // Best effort and once per IST day, at midnight, outside the
+            // session. It can run on the drain's inline fallback (an error
+            // path) and then waits for the device once; a failure is counted.
+            if let Some(previous) = open.as_ref()
+                && previous.file.sync_data().is_err()
+            {
+                self.err_sync.increment(1);
+            }
             *open = None;
             let path = self.spill_path(now_unix_secs);
             let mut file = self.open_append_handle(&path)?;
@@ -2510,6 +2575,65 @@ mod tests {
         assert_eq!(drained[0], s1);
         assert_eq!(drained[1], s2);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sync_open_file_is_a_no_op_with_nothing_open_and_keeps_the_handle_open() {
+        // PR17: the escalation thread syncs the day file. Nothing open is a
+        // no-op; an open file syncs, and the append handle stays usable.
+        let dir = temp_spill_dir("sync-open-file");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        assert!(writer.sync_open_file(), "nothing open must read as synced");
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
+            .single()
+            .expect("valid")
+            .timestamp();
+        let s1 = mk_seal(13, 0, 0, 1_716_000_900, 100.0);
+        let s2 = mk_seal(25, 0, 4, 1_716_001_500, 200.0);
+        writer.append_seal(&s1, now).expect("append s1");
+        assert!(writer.sync_open_file(), "an open day file must sync");
+        writer.append_seal(&s2, now).expect("append after a sync");
+        let drained = writer.read_all(now).expect("read");
+        assert_eq!(drained, vec![s1, s2]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_drain_reachable_append_never_syncs_and_the_sync_holds_no_lock() {
+        // PR17: `append_seal` is reachable from the frame drain's inline
+        // fallback, so it must not wait for the device on every seal; only
+        // the day rotation (once a day, at midnight) syncs there. And the
+        // escalation thread's sync must not hold the append lock, or an
+        // inline append would wait for it.
+        let src = include_str!("seal_spill.rs");
+        // Each body runs to the next doc comment at item indent (no brace
+        // literals here: the banned-pattern scanner counts braces).
+        let body = |name: &str| {
+            let start = src
+                .find(name)
+                .unwrap_or_else(|| panic!("{name} must exist"));
+            let rest = &src[start..];
+            let end = rest.find("\n    ///").unwrap_or(rest.len());
+            &rest[..end]
+        };
+        let append = body("pub fn append_seal(");
+        assert!(
+            !append.contains("sync_data") && !append.contains("sync_open_file"),
+            "append_seal must never sync per seal"
+        );
+        let sync = body("pub(crate) fn sync_open_file(");
+        let lock_scope_end = sync
+            .find("let outcome")
+            .unwrap_or_else(|| panic!("the lock must be released before the sync"));
+        assert!(
+            sync[lock_scope_end..].contains("sync_data"),
+            "sync_data must run after the lock scope ends"
+        );
+        assert!(
+            !sync[..lock_scope_end].contains("sync_data"),
+            "sync_data must not run under the append lock"
+        );
     }
 
     #[test]
