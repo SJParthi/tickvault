@@ -2691,6 +2691,27 @@ write, then candle warm-up (PR31b-2 (a), already listed above). Each fix ships a
   re-arm removed). Honest limits: only the breaker moved behind the shim here; the other loom files are unchanged
   by this item; O(1), three atomics on the failure path.
 
+- [x] **M7 — Orders carry their exchange segment (I-P1-11).** `ManagedOrder` and
+  `PlaceOrderRequest` had no segment, so the paper filler, the reconcile mirror and the exit path
+  keyed on the bare `security_id` and two instruments sharing an id in different segments could
+  fill, net or close each other. Both now carry `exchange_segment`; a plain order sends it on the
+  wire, super and forever orders book NSE_FNO, and an unknown segment code is refused before any
+  order exists (`resolve_order_segment_code` / `resolve_order_segment_str`, counted on
+  `tv_oms_unknown_order_segment_refused_total{source}`, logged with `code = I-P1-11`).
+  `order_runtime` keys `mirror` and `pending_paper` on `(security_id, segment)` and drops
+  `segment_matches_first_seen`; `local_reconcile` compares per segment on both legs; the exit
+  path closes and cancels only its own segment and its bracket check reads NSE_FNO; the dead
+  pipeline books the tick's segment. Files: `crates/trading/src/oms/{types.rs,engine.rs,
+  reconciliation.rs,exit_rules.rs}`, `crates/trading/tests/{gap_enforcement.rs,oms_integration.rs,
+  safety_layer.rs}`, `crates/app/src/{order_runtime.rs,exit_execution.rs,trading_pipeline.rs}`,
+  `crates/app/tests/risk_segment_aware_call_guard.rs` (exit_execution off the baseline). Tests:
+  a_mark_on_another_segment_must_not_fill_a_pending_paper_order (bite-checked: fails with a
+  bare-sid lookup), test_local_reconcile_catches_a_fill_booked_to_the_wrong_segment,
+  test_execute_exit_closes_only_its_own_segment, test_execute_exit_refuses_an_unknown_segment_code.
+  Honest limits: Landmine 2 (the E9 cross-feed id-space mapping) is untouched and there is no
+  `dry_run` flip; `trading_pipeline.rs` still calls the legacy risk overloads (dead code, pinned
+  shrink-only); O(1), one hash probe per lookup.
+
 ## Edge Cases
 
 - PR1: log burst larger than the non-blocking buffer → lines dropped and counted, never blocking.
