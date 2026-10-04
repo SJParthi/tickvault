@@ -422,6 +422,8 @@ fn emit_order_update_ws_audit(
         down_secs: i64::try_from(down_secs).unwrap_or(i64::MAX),
         attempts: i64::from(attempts),
         market_hours: tickvault_common::market_hours::is_within_market_hours_ist(),
+        // The order-update socket changes no subscription (audit M8).
+        subscription: tickvault_common::ws_event_types::WsSubscriptionDetail::NONE,
     };
     // O(1) EXEMPT: end
     // 2026-07-05: upgraded from debug! (silent-loss window — the operator found

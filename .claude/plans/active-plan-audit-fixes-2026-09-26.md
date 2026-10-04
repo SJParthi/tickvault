@@ -2712,6 +2712,30 @@ write, then candle warm-up (PR31b-2 (a), already listed above). Each fix ships a
   `dry_run` flip; `trading_pipeline.rs` still calls the legacy risk overloads (dead code, pinned
   shrink-only); O(1), one hash probe per lookup.
 
+- [x] **M8 — Subscription changes are written to `ws_event_audit`.** An in-place swap, an
+  in-place resubscribe, a ghost unsubscribe resend and an 805 park reached a log line and a counter
+  only, and CloudWatch keeps logs 14 days, so which contract a socket carried when lived nowhere
+  durable. Four new kinds (`subscription_swapped`, `subscription_resubscribed`,
+  `ghost_unsubscribe_resent`, `overflow_parked`) and five nullable columns (`new_security_id`,
+  `new_segment`, `instruments_added`, `instruments_removed`, `instruments_held`; the old instrument
+  uses `security_id`/`segment`), self-healed with `ALTER ADD COLUMN IF NOT EXISTS`. The emit is one
+  `OnceLock` load and one `try_send` per command (never per tick); a full channel is counted on
+  `tv_ws_event_audit_dropped_total{reason="subscription_change"}`. The live-feed forwarder installs
+  the channel and writes the rows, and every row it writes gets a strictly increasing stamp
+  (`StrictStamp`, `max(now, last + 1)`), so two events of one kind on one socket inside one clock
+  tick cannot share a DEDUP key. Files: `crates/common/src/ws_event_types.rs`,
+  `crates/storage/src/ws_event_audit_persistence.rs`,
+  `crates/core/src/websocket/{pool_supervisor.rs,order_update_connection.rs}`,
+  `crates/app/src/{ws_audit_consumer.rs,dhan_rest_stack.rs}`. Tests:
+  test_subscription_change_kinds_round_trip_and_are_distinct,
+  a_swap_row_names_its_pool_both_contracts_and_the_outcome,
+  an_overflow_park_row_carries_the_805_code,
+  the_stamp_is_strictly_increasing_even_when_the_clock_stalls_or_steps_back (bite-checked: fails
+  with `<` in place of `<=`), the_forwarder_installs_the_subscription_channel_and_writes_its_rows,
+  install_subscription_audit_is_set_once. Honest limits: a resubscribe row carries counts, not the
+  instrument list; a row the bounded channel cannot take is counted and paged once per episode,
+  not kept; not run against a live QuestDB here.
+
 ## Edge Cases
 
 - PR1: log burst larger than the non-blocking buffer → lines dropped and counted, never blocking.

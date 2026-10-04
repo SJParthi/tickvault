@@ -889,7 +889,12 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
                     let connected = match row.event_kind {
                         WsEventKind::Connected
                         | WsEventKind::Reconnected
-                        | WsEventKind::SleepResumed => true,
+                        | WsEventKind::SleepResumed
+                        // Audit M8: these happen on an OPEN socket and never
+                        // on the order-update socket; never a down signal.
+                        | WsEventKind::SubscriptionSwapped
+                        | WsEventKind::SubscriptionResubscribed
+                        | WsEventKind::GhostUnsubscribeResent => true,
                         WsEventKind::Disconnected
                         | WsEventKind::DisconnectedOffHours
                         | WsEventKind::SleepEntered
@@ -901,7 +906,9 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
                         // socket healthy the instant it started dialing.
                         | WsEventKind::DialStarted
                         // A dial FAILED — emphatically not connected.
-                        | WsEventKind::DialFailed => false,
+                        | WsEventKind::DialFailed
+                        // An 805 park: the socket is down.
+                        | WsEventKind::OverflowParked => false,
                     };
                     // Health first: it is the operator-facing verdict and
                     // must not depend on the forensic write succeeding.
