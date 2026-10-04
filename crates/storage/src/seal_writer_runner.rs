@@ -492,11 +492,19 @@ impl SealEscalationSink {
         spill_writes
     }
 
+    /// Syncs the spill day file and every DLQ day file this thread (or the
+    /// drain's inline fallback) wrote since the last sync (PR17; the DLQ
+    /// since 2026-10-04). Off the drain, off both append locks.
+    fn sync_written(&self) {
+        self.spill.sync_open_file();
+        self.dlq.sync_written();
+    }
+
     /// Syncs the day file once more before the thread exits, when the last
     /// batch was full and so was not synced on its own (PR17).
     fn final_sync(&self, unsynced: bool, summary: &mut SealEscalationRunSummary) {
         if unsynced {
-            self.spill.sync_open_file();
+            self.sync_written();
             summary.syncs += 1;
         }
     }
@@ -549,7 +557,7 @@ impl SealEscalationSink {
                     if batch.len() < SEAL_ESCALATION_BATCH
                         || last_sync.elapsed() >= SEAL_ESCALATION_SYNC_INTERVAL
                     {
-                        self.spill.sync_open_file();
+                        self.sync_written();
                         summary.syncs += 1;
                         unsynced = false;
                         last_sync = std::time::Instant::now();
@@ -1200,6 +1208,11 @@ impl SealWriterRunner {
             now_unix_secs,
         );
 
+        // Step 3: sync whatever this cycle (or the escalation thread, or the
+        // drain's inline fallback) wrote to the spill or the DLQ. A no-op
+        // without a write since the last sync.
+        self.pipeline.sync_escalated();
+
         outcome
     }
 
@@ -1335,6 +1348,45 @@ mod tests {
         // via the rescue cascade.
         assert_eq!(outcome.drain.ring_seals_popped, 3);
         assert_eq!(outcome.drain.rescued_to_spill, 3);
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn test_run_one_cycle_syncs_what_the_outage_cascade_wrote() {
+        // 2026-10-04: seals the writer task spilled or dead-lettered while
+        // QuestDB was down reached the page cache only. Every cycle now syncs
+        // what tiers 2 and 3 wrote since the last one.
+        let (spill, dlq) = temp_pair("cycle-syncs");
+        let mut runner = SealWriterRunner::for_test(spill.clone(), dlq.clone(), 16, 16, 16);
+        let now = jan1_noon_utc();
+        let outcome = runner
+            .pipeline
+            .rescue_in_flight(mk_seal(13, 0, TfIndex::M1, 34_200, 101.5), now);
+        assert_eq!(outcome, SubmitOutcome::Spilled);
+        assert!(
+            runner.pipeline.spill_handle().has_unsynced_writes(),
+            "the spill holds an unsynced seal before the cycle"
+        );
+        let dlq_writer = runner.pipeline.dlq_handle();
+        dlq_writer
+            .append_record(
+                &crate::seal_dlq::SealDlqRecord::from(&crate::seal_spill::SerializedSeal::from(
+                    &mk_seal(25, 0, TfIndex::M1, 34_260, 99.0),
+                )),
+                now,
+            )
+            .unwrap_or_else(|err| panic!("dlq append: {err}"));
+        assert!(dlq_writer.has_unsynced_writes());
+        let cycle = runner.run_one_cycle(now);
+        assert!(cycle.is_idle(), "{cycle:?}");
+        assert!(
+            !runner.pipeline.spill_handle().has_unsynced_writes(),
+            "the cycle must sync the spill"
+        );
+        assert!(
+            !dlq_writer.has_unsynced_writes(),
+            "the cycle must sync the DLQ"
+        );
         cleanup(&spill, &dlq);
     }
 
