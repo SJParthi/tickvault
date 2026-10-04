@@ -2638,7 +2638,28 @@ write, then candle warm-up (PR31b-2 (a), already listed above). Each fix ships a
   `crates/common/tests/cloudwatch_app_alarms_wiring.rs`. Tests:
   test_emf_metric_selectors_name_count_is_pinned, every_alarmed_counter_is_registered_at_boot,
   every_live_alarm_has_a_plain_english_phrase. Honest limits: the log-drop and feed-inline thresholds have no measured
-  baseline (Assumed); the order-update drop `error!` still carries no code (audit M3).
+  baseline (Assumed). The order-update drop `error!` carries `ORDER-EVT-01` since P2.
+
+- [x] **P2 — Ten uncoded `error!` lines get existing codes; the weekly mutation run can start.**
+  Audit M3: ten failure lines carried no code, so coded-error triage could not find them. Each now
+  carries an existing code, none of them paged (no new page, no noise-lock row): the order-update
+  broadcast drop (`ORDER-EVT-01`, stage `broadcast_no_receiver`, runbook row added), the
+  order-update WAL drop and the boot WAL replay failure (`WS-SPILL-02` with a `source`; the spill
+  already counts the drop per frame type), the order-update server auth/API error (`WS-GAP-01`),
+  the two token-renewal give-up lines and the token publish failure (`AUTH-GAP-01`), the two
+  static-IP boot-check lines (`GAP-NET-01`), and the seal-writer construct failure
+  (`AGGREGATOR-SEAL-01`). The uncoded budget falls 71 → 61. Audit H2: `cargo mutants` copied the
+  tree without `.git`, so the guards that call `git ls-files` failed the unmutated baseline and
+  no mutant was ever tested; the workflow now runs `--in-place` (serial, disposable checkout).
+  Audit L3: the committed test-count baseline moves 12295 → 13559 (measured). Files:
+  `crates/core/src/websocket/order_update_connection.rs`, `crates/core/src/auth/token_manager.rs`,
+  `crates/core/src/auth/dhan_token_publisher.rs`, `crates/core/src/network/ip_verifier.rs`,
+  `crates/app/src/main.rs`, `crates/common/tests/error_code_tag_guard.rs`,
+  `docs/error-runbooks/order-update-events-error-codes.md`, `.github/workflows/mutation.yml`,
+  `.claude/hooks/.test-count-baseline`. Tests: uncoded_error_sites_may_only_shrink,
+  every_error_macro_tagged_with_a_known_code_carries_code_field. Honest limits: `--in-place` is
+  proven only by the next scheduled or dispatched mutation run (Assumed until then); 61 uncoded
+  `error!` lines remain.
 
 ## Edge Cases
 

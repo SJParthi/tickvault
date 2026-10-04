@@ -76,7 +76,11 @@ pub async fn verify_public_ip() -> Result<IpVerificationResult, ApplicationError
 
     // Step 3: Detect actual public IP
     let actual_ip = detect_public_ip().await.map_err(|reason| {
-        error!(reason = %reason, "public IP detection failed");
+        error!(
+            code = tickvault_common::error_code::ErrorCode::GapNetIpMonitor.code_str(),
+            reason = %reason,
+            "public IP detection failed"
+        );
         ApplicationError::IpVerificationFailed { reason }
     })?;
     info!(actual_ip_masked = %mask_ip(&actual_ip), "actual public IP detected");
@@ -84,6 +88,7 @@ pub async fn verify_public_ip() -> Result<IpVerificationResult, ApplicationError
     // Step 4: Compare
     if let Err(reason) = compare_ips(&expected_ip, &actual_ip) {
         error!(
+            code = tickvault_common::error_code::ErrorCode::GapNetIpMonitor.code_str(),
             expected = %mask_ip(&expected_ip),
             actual = %mask_ip(&actual_ip),
             "public IP does not match SSM static IP — BLOCKING BOOT"

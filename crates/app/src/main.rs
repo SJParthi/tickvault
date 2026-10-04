@@ -1283,6 +1283,8 @@ async fn async_main() -> Result<()> {
         }
         Err(err) => {
             error!(
+                code = tickvault_common::error_code::ErrorCode::WsSpill02FrameDropped.code_str(),
+                source = "boot_replay_failed",
                 ?err,
                 dir = %ws_wal_dir,
                 "STAGE-C: WAL replay failed — continuing boot with fresh WAL"
@@ -4098,6 +4100,8 @@ fn spawn_seal_writer_loop(questdb_config: &tickvault_common::config::QuestDbConf
         }
         Err(err) => {
             tracing::error!(
+                code =
+                    tickvault_common::error_code::ErrorCode::AggregatorSeal01IlpFailed.code_str(),
                 ?err,
                 "failed to construct SealWriterRunner — candles will NOT seal this session"
             );

@@ -116,6 +116,7 @@ async fn publish_dhan_token(token: String) {
         }
         Err(e) => {
             error!(
+                code = tickvault_common::error_code::ErrorCode::AuthGapTokenExpiry.code_str(),
                 param = %path,
                 error = %e,
                 "Dhan token publish FAILED (fail-soft). tickvault's own token is \
