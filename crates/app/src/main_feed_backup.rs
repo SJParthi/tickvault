@@ -26,9 +26,13 @@
 //! byte-identical to an unpaired ring entry from the OTHER socket is dropped
 //! and counted; a same-socket identical repeat is a real repeat and is kept.
 //! A packet older than the newest accepted that matches no such entry is KEPT
-//! and counted as late (audit M2, 2026-10-04): nothing shows the other socket
-//! ever delivered it, so dropping it could drop a real price, and the fold
-//! already refuses a stale cumulative for volume. Anything else is accepted,
+//! and counted as late when the ring still holds an older packet from the
+//! other socket (audit M2, 2026-10-04): each socket is in order, so that
+//! socket's copy would be in the ring, and the vendor skipped it there. When
+//! the ring cannot show that (a lag past the ring, equal keys, a replayed
+//! frame) the packet is dropped and counted as `older`, as before, so one
+//! packet is never written twice. The fold refuses a stale cumulative for
+//! volume either way. Anything else is accepted,
 //! whichever socket it came from — so when one socket is down the other's copies are
 //! simply accepted.
 //!
@@ -100,12 +104,16 @@ const TRACKED_CONNECTIONS: usize = 32;
 const FILTER_WORDS: usize = 1_024;
 
 /// Counter: backup-set packets dropped as a second copy (`reason` =
-/// `identical`: byte-identical to a packet the other socket delivered).
+/// `identical`: byte-identical to a packet the other socket delivered;
+/// `older`: older than the newest accepted, and the ring no longer reaches
+/// back far enough to show it is not a copy).
 pub const BACKUP_DUPLICATES_DROPPED_COUNTER: &str = "tv_dhan_feed_backup_duplicates_dropped_total";
 
 /// Counter: backup-set packets older than the newest accepted (lower
 /// cumulative volume, or the same volume and an earlier trade time) that match
-/// no packet from the other socket. Kept, not dropped (audit M2, 2026-10-04).
+/// no packet from the other socket while the ring still covers its place in
+/// that socket's stream, so it cannot be a copy. Kept, not dropped (audit M2,
+/// 2026-10-04).
 pub const BACKUP_LATE_ACCEPTED_COUNTER: &str = "tv_dhan_feed_backup_late_accepted_total";
 
 /// Counter: backup-set packets accepted from one socket while the other socket
@@ -128,18 +136,25 @@ pub enum BackupVerdict {
     Accept,
     /// A byte-identical copy of a packet already accepted.
     DropIdentical,
-    /// Older than the newest accepted, but not a copy of anything the other
-    /// socket delivered: kept and folded, counted as late (audit M2). Before
+    /// Older than the newest accepted, and provably not a copy: the ring
+    /// still holds the other socket's stream from before this packet, and no
+    /// entry matches. Kept and folded, counted as late (audit M2). Before
     /// 2026-10-04 this was dropped, which could drop a real price the other
     /// socket never sent.
     AcceptLate,
+    /// Older than the newest accepted, matching nothing, but the ring no
+    /// longer reaches back to its place in the other socket's stream (a lag
+    /// beyond the ring, or a replayed frame with no socket id): it may be a
+    /// copy whose twin was evicted, so it is dropped and counted, as before
+    /// 2026-10-04, rather than written twice.
+    DropOlder,
 }
 
 impl BackupVerdict {
     /// Whether the packet must be skipped by the fold and the writers.
     #[must_use]
     pub const fn is_drop(self) -> bool {
-        matches!(self, Self::DropIdentical)
+        matches!(self, Self::DropIdentical | Self::DropOlder)
     }
 }
 
@@ -288,6 +303,12 @@ struct Slot {
     fp_conn: [u8; FINGERPRINT_RING],
     /// Bit `i`: entry `i` already had its second copy dropped.
     fp_paired: u32,
+    /// Bit `i`: entry `i` holds a packet (an unwritten entry reads 0 / conn 0).
+    fp_filled: u32,
+    /// Cumulative volume and trade time of each entry, so a late packet can
+    /// be placed against the other socket's stream (audit M2).
+    fp_cum: [u32; FINGERPRINT_RING],
+    fp_ltt: [u32; FINGERPRINT_RING],
     aux: [u64; AUX_FINGERPRINT_RING],
     aux_conn: [u8; AUX_FINGERPRINT_RING],
     aux_paired: u32,
@@ -353,6 +374,29 @@ fn second_copy_of(fps: &[u64], conns: &[u8], paired: u32, fp: u64, conn: u8) -> 
     })
 }
 
+/// Whether the main ring still reaches back to `(cum, ltt)`'s place in the
+/// OTHER socket's stream (audit M2, 2026-10-04).
+///
+/// Each socket delivers a contract's packets in order, and the ring evicts
+/// oldest-arrived first. So if the ring holds an other-socket entry strictly
+/// older than this packet, every packet that socket sent after that entry,
+/// this packet's copy included, is still in the ring: a late packet matching
+/// none of them is not a copy. Equal keys, a replayed frame (no socket id) or
+/// no other-socket entry cannot be decided and return `false`. Serial-number
+/// compare on the cumulative, as in `admit_tick`. O(`FINGERPRINT_RING`), zero
+/// allocation.
+fn ring_covers(slot: &Slot, cum: u32, ltt: u32, conn: u8) -> bool {
+    if conn == u8::MAX {
+        return false;
+    }
+    (0..FINGERPRINT_RING).any(|i| {
+        let other = slot.fp_conn[i] != conn && slot.fp_conn[i] != u8::MAX;
+        let step = cum.wrapping_sub(slot.fp_cum[i]) as i32;
+        let packet_is_newer = step > 0 || (step == 0 && ltt > slot.fp_ltt[i]);
+        slot.fp_filled & (1u32 << i) != 0 && other && packet_is_newer
+    })
+}
+
 /// No publication adopted yet: a day no publication instant maps to.
 const NO_DAY: i64 = i64::MIN;
 
@@ -389,6 +433,7 @@ pub struct BackupDedup {
     slots: Vec<Slot>,
     last_frame_millis: [u64; TRACKED_CONNECTIONS],
     dropped_identical: metrics::Counter,
+    dropped_older: metrics::Counter,
     late_accepted: metrics::Counter,
     backup_only: metrics::Counter,
     instruments: metrics::Gauge,
@@ -462,6 +507,10 @@ impl BackupDedup {
                 BACKUP_DUPLICATES_DROPPED_COUNTER,
                 "reason" => "identical"
             ),
+            dropped_older: metrics::counter!(
+                BACKUP_DUPLICATES_DROPPED_COUNTER,
+                "reason" => "older"
+            ),
             late_accepted: metrics::counter!(BACKUP_LATE_ACCEPTED_COUNTER),
             backup_only: metrics::counter!(BACKUP_ONLY_ARRIVALS_COUNTER),
             instruments: metrics::gauge!(BACKUP_INSTRUMENTS_GAUGE),
@@ -474,6 +523,7 @@ impl BackupDedup {
     fn for_replay(set: &[(u64, u8)]) -> Self {
         let mut d = Self {
             dropped_identical: metrics::Counter::noop(),
+            dropped_older: metrics::Counter::noop(),
             late_accepted: metrics::Counter::noop(),
             backup_only: metrics::Counter::noop(),
             instruments: metrics::Gauge::noop(),
@@ -631,10 +681,10 @@ impl BackupDedup {
                 // cumulative reads as newer, not as a huge step back.
                 let step = cum.wrapping_sub(slot.newest_cum) as i32;
                 // Audit M2 (2026-10-04): older than the newest accepted, and
-                // not a copy of anything in the ring from the other socket.
-                // Nothing shows the other socket delivered it, so it is kept:
-                // the fold refuses its stale cumulative for volume and keeps
-                // its price.
+                // not a copy of anything in the ring from the other socket. It
+                // is kept when `ring_covers` shows that socket never sent it
+                // (the fold refuses its stale cumulative for volume and keeps
+                // its price), else dropped as older.
                 let late = step < 0 || (step == 0 && ltt < slot.newest_ltt);
                 if late {
                     // Its own ring, never the main one: a late packet evicting
@@ -651,6 +701,10 @@ impl BackupDedup {
                         slot.late_paired |= 1u32 << i;
                         self.dropped_identical.increment(1);
                         return BackupVerdict::DropIdentical;
+                    }
+                    if !ring_covers(slot, cum, ltt, connection_index) {
+                        self.dropped_older.increment(1);
+                        return BackupVerdict::DropOlder;
                     }
                     let i = usize::from(slot.late_next) % LATE_FINGERPRINT_RING;
                     slot.late[i] = fp;
@@ -675,6 +729,9 @@ impl BackupDedup {
             slot.fps[i] = fp;
             slot.fp_conn[i] = connection_index;
             slot.fp_paired &= !(1u32 << i);
+            slot.fp_filled |= 1u32 << i;
+            slot.fp_cum[i] = cum;
+            slot.fp_ltt[i] = ltt;
             slot.next = ((i + 1) % FINGERPRINT_RING) as u8;
             slot.learn(connection_index);
             slot.peer_of(connection_index)
@@ -1131,46 +1188,56 @@ mod tests {
     #[test]
     fn test_admit_tick_older_copy_is_kept_as_late_newer_from_backup_accepted() {
         let mut d = dedup_with(&[42]);
-        let (a, b2, c) = (
+        let (a, b2, c, d2) = (
             tick(42, 100, 1_000, 10.0),
             tick(42, 110, 1_001, 10.5),
             tick(42, 120, 1_002, 10.4),
+            tick(42, 130, 1_003, 10.6),
         );
-        // Primary (conn 0) delivers a and b; the backup (conn 4) lags.
+        // Primary (conn 0) delivers a and c, skipping b2; the backup (conn 4)
+        // lags.
         assert_eq!(
             d.admit_tick(&a, &bytes(&a, 1), 0, 10),
             BackupVerdict::Accept
         );
         assert_eq!(
-            d.admit_tick(&b2, &bytes(&b2, 1), 0, 11),
+            d.admit_tick(&c, &bytes(&c, 1), 0, 11),
             BackupVerdict::Accept
         );
-        // The backup's copy of `a` with a different book is OLDER, but the
-        // primary never delivered these bytes: kept as late (audit M2).
+        // The backup's `a` with a different book has the same key as the
+        // primary's `a`: which came first cannot be told, so it is dropped as
+        // older, never written twice.
         assert_eq!(
             d.admit_tick(&a, &bytes(&a, 9), 4, 12),
+            BackupVerdict::DropOlder
+        );
+        // The backup's `b2` is older than the newest, but the ring holds the
+        // primary's `a`, older still, and nothing after it matches: the
+        // primary never sent `b2`, so it is kept as late (audit M2).
+        assert_eq!(
+            d.admit_tick(&b2, &bytes(&b2, 1), 4, 13),
             BackupVerdict::AcceptLate
         );
-        // The primary's byte-identical copy of that late packet is a
-        // second copy and is dropped (the late ring pairs it).
+        // A byte-identical copy of that late packet from the other socket is
+        // a second copy and is dropped (the late ring pairs it).
         assert_eq!(
-            d.admit_tick(&a, &bytes(&a, 9), 0, 13),
+            d.admit_tick(&b2, &bytes(&b2, 1), 0, 14),
             BackupVerdict::DropIdentical
         );
         // The late packet did not enter the main ring: the backup's copy of
-        // `b2` still pairs with the primary's.
+        // `c` still pairs with the primary's.
         assert_eq!(
-            d.admit_tick(&b2, &bytes(&b2, 1), 4, 14),
+            d.admit_tick(&c, &bytes(&c, 1), 4, 15),
             BackupVerdict::DropIdentical
         );
-        // The primary goes silent; the backup's newer copy is accepted.
+        // The primary goes silent; the backup's newer packet is accepted.
         assert_eq!(
-            d.admit_tick(&c, &bytes(&c, 1), 4, 5_000),
+            d.admit_tick(&d2, &bytes(&d2, 1), 4, 5_000),
             BackupVerdict::Accept
         );
         // A same-trade, new-book update is a real repeat quote: accepted.
         assert_eq!(
-            d.admit_tick(&c, &bytes(&c, 2), 4, 5_001),
+            d.admit_tick(&d2, &bytes(&d2, 2), 4, 5_001),
             BackupVerdict::Accept
         );
     }
@@ -1188,8 +1255,16 @@ mod tests {
             d.admit_tick(&after, &bytes(&after, 0), 0, 2),
             BackupVerdict::Accept
         );
+        // Same key as the primary's `before`: undecidable, dropped as older.
         assert_eq!(
             d.admit_tick(&before, &bytes(&before, 3), 4, 3),
+            BackupVerdict::DropOlder
+        );
+        // Between the two across the wrap: older than the newest, newer than
+        // the primary's `before`, so provably not a copy and kept.
+        let mid = tick(42, u32::MAX - 1, 1_000, 10.0);
+        assert_eq!(
+            d.admit_tick(&mid, &bytes(&mid, 3), 4, 4),
             BackupVerdict::AcceptLate
         );
     }
@@ -1350,14 +1425,13 @@ mod tests {
         );
     }
 
-    /// Attack-pass finding 5b, revised by audit M2 (2026-10-04): a copy lagging
-    /// more than the ring behind has lost its fingerprint, so nothing shows
-    /// the other socket delivered it. It is kept and counted as late rather
-    /// than dropped (it may be a real price the other socket never sent); the
-    /// cost, recorded as an honest limit, is a second `ticks` row when it was
-    /// in fact a copy. The fold refuses its stale cumulative for volume.
+    /// Attack-pass finding 5b, kept by audit M2 (2026-10-04): a copy lagging
+    /// more than the ring behind has lost its fingerprint, and the ring no
+    /// longer holds the other socket's stream from before it, so whether it
+    /// is a copy cannot be told. It is dropped as older and counted, never
+    /// written twice (scope lock 2026-10-02: one copy of a packet).
     #[test]
-    fn test_lagging_copy_beyond_the_ring_is_kept_as_late() {
+    fn test_regression_lagging_copy_beyond_the_ring_is_dropped_as_older() {
         let mut d = dedup_with(&[42]);
         let stream: Vec<ParsedTick> = (0..(FINGERPRINT_RING as u32 + 8))
             .map(|i| tick(42, 100 + i, 1_000 + i, 10.0))
@@ -1369,7 +1443,7 @@ mod tests {
         let first = &stream[0];
         assert_eq!(
             d.admit_tick(first, &bytes(first, 0), 4, 2),
-            BackupVerdict::AcceptLate
+            BackupVerdict::DropOlder
         );
         // And a copy of the newest is still recognised as identical.
         let last = &stream[stream.len() - 1];
@@ -1932,8 +2006,7 @@ mod tests {
         /// order, the accepted stream's cumulative volume never goes
         /// backwards and sums to exactly the true total — volume is never
         /// double counted and never lost while either socket delivers. Audit
-        /// M2: every packet reaches the fold at least once (Accept or
-        /// AcceptLate), so no real price is dropped.
+        /// M2: every packet reaches the fold (Accept or AcceptLate).
         #[test]
         fn proptest_two_socket_interleave_never_double_counts(
             steps in proptest::collection::vec(1u32..50, 1..40),
@@ -1983,6 +2056,69 @@ mod tests {
             prop_assert_eq!(summed, u64::from(total));
             prop_assert_eq!(accepted.last().copied(), Some(total));
             prop_assert!(folded.iter().all(|f| *f), "a packet was dropped without being folded");
+        }
+
+        /// Review of audit M2 (2026-10-04): each socket may skip packets the
+        /// other delivers (the vendor conflates a slow consumer), and the two
+        /// stay within `lag` packets of each other, up to well past the ring.
+        /// Whatever the order, no packet is ever folded twice; within four
+        /// packets, every packet BOTH sockets delivered is folded exactly once.
+        #[test]
+        fn proptest_conflating_sockets_never_fold_a_packet_twice(
+            steps in proptest::collection::vec(1u32..50, 1..40),
+            carried_by in proptest::collection::vec(0u8..3, 40),
+            order in proptest::collection::vec(any::<bool>(), 0..120),
+            lag in 1usize..30,
+        ) {
+            let mut cum = 0u32;
+            let stream: Vec<(ParsedTick, Vec<u8>)> = steps
+                .iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    cum += *s;
+                    let t = tick(42, cum, 1_000 + i as u32, 10.0);
+                    let b = bytes(&t, 0);
+                    (t, b)
+                })
+                .collect();
+            // 0: both sockets carry the packet; 1: only socket 0; 2: only 4.
+            let on = |conn: u8, i: usize| match carried_by[i] {
+                0 => true,
+                1 => conn == 0,
+                _ => conn == 4,
+            };
+            let mut d = dedup_with(&[42]);
+            let mut folds = vec![0u32; stream.len()];
+            let (mut ia, mut ib) = (0usize, 0usize);
+            let mut k = 0usize;
+            while ia < stream.len() || ib < stream.len() {
+                let take_a = if ia >= stream.len() {
+                    false
+                } else if ib >= stream.len() || ia + lag <= ib {
+                    true
+                } else if ib + lag <= ia {
+                    false
+                } else {
+                    order.get(k).copied().unwrap_or(true)
+                };
+                k += 1;
+                let (conn, idx) = if take_a { (0u8, &mut ia) } else { (4u8, &mut ib) };
+                let at = *idx;
+                *idx += 1;
+                if !on(conn, at) {
+                    continue;
+                }
+                let (t, b) = &stream[at];
+                if !d.admit_tick(t, b, conn, k as u64).is_drop() {
+                    folds[at] += 1;
+                }
+            }
+            for (i, n) in folds.iter().enumerate() {
+                prop_assert!(*n <= 1, "packet {} folded {} times", i, n);
+                if carried_by[i] == 0 && lag <= 4 {
+                    prop_assert_eq!(*n, 1, "packet {} on both sockets was not folded", i);
+                }
+            }
         }
     }
 }

@@ -357,6 +357,13 @@ impl<const N: usize> FrameFate<N> {
     /// whose sequence is above the writer's last flush never reached the
     /// kernel.
     ///
+    /// Each counted slot is marked lost with a compare-and-swap first, so the
+    /// abandoned writer, still running detached, cannot count the same frame
+    /// again when it later fails a write or exits (review of audit M1,
+    /// 2026-10-04). Honest limit: if that writer instead completes its flush
+    /// before the process exits, a frame counted here did reach the kernel;
+    /// the count errs toward loss.
+    ///
     /// # Complexity
     /// O(N): one pass over the table, once, at an abandoned shutdown.
     pub fn count_unflushed_sheds(&self, flushed_seq: u64, ws_type: WsType) -> (u64, u64) {
@@ -365,15 +372,23 @@ impl<const N: usize> FrameFate<N> {
         let mut drain = 0u64;
         // O(1) EXEMPT: begin — once per abandoned shutdown, bounded by N
         for slot in &self.slots {
-            let v = slot.load(Ordering::Acquire);
-            let tag = v >> FLAG_BITS;
-            if tag <= floor || v & LOST != 0 {
-                continue;
-            }
-            if v & SHED_RING != 0 {
-                ring += 1;
-            } else if v & SHED_DRAIN != 0 {
-                drain += 1;
+            let mut v = slot.load(Ordering::Acquire);
+            loop {
+                let tag = v >> FLAG_BITS;
+                if tag <= floor || v & LOST != 0 || v & (SHED_RING | SHED_DRAIN) == 0 {
+                    break;
+                }
+                match slot.compare_exchange_weak(v, v | LOST, Ordering::AcqRel, Ordering::Acquire) {
+                    Ok(_) => {
+                        if v & SHED_RING != 0 {
+                            ring += 1;
+                        } else {
+                            drain += 1;
+                        }
+                        break;
+                    }
+                    Err(now) => v = now,
+                }
             }
         }
         // O(1) EXEMPT: end
@@ -531,6 +546,23 @@ mod tests {
         );
         // Flushed through base 25: base 20 reached the kernel.
         assert_eq!(t.count_unflushed_sheds(seq(25), LIVE), (1, 1));
+    }
+
+    /// Review of audit M1: the abandoned writer keeps running detached. A
+    /// frame the shutdown scan counted must not be counted again when that
+    /// writer later reports it lost, nor by a second scan.
+    #[test]
+    fn test_count_unflushed_sheds_marks_what_it_counts_so_a_late_loss_is_not_recounted() {
+        let t = FrameFate::<64>::new();
+        assert_eq!(t.note_shed(seq(40), ShedKind::Ring, LIVE), ShedMark::Marked);
+        assert_eq!(
+            t.note_shed(seq(41), ShedKind::DrainDepth, LIVE),
+            ShedMark::Marked
+        );
+        assert_eq!(t.count_unflushed_sheds(seq(10), LIVE), (1, 1));
+        assert_eq!(t.note_lost(seq(40), LIVE), LostFate::NotShed);
+        assert_eq!(t.note_lost(seq(41), LIVE), LostFate::NotShed);
+        assert_eq!(t.count_unflushed_sheds(seq(10), LIVE), (0, 0));
     }
 
     #[test]

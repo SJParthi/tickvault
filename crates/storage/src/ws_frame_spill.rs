@@ -2326,10 +2326,12 @@ impl<'a> UnflushedTally<'a> {
                 }
             }
             // O(1) EXEMPT: end
-        }
-        if self.untracked > 0 {
-            crate::wal_frame_fate::note_lost_untracked(self.untracked);
-            unknown = unknown.saturating_add(self.untracked);
+            // Records past the tally's capacity were written after every
+            // tracked one, so they are lost only when the file ends short.
+            if self.untracked > 0 {
+                crate::wal_frame_fate::note_lost_untracked(self.untracked);
+                unknown = unknown.saturating_add(self.untracked);
+            }
         }
         (ring, drain, unknown)
     }
