@@ -515,7 +515,17 @@ folded into them below), then PR18, PR19 and the decisions.
     (ws_frame_spill.rs:566; tick_persistence.rs:1344-1349, :2837, :3383): `sync_data` before the
     marker advances, off the drain.
   - A torn last line quarantines the whole hour (tick_spill_replay.rs:620-623): skip and count
-    the torn line, keep the rest.
+    the torn line, keep the rest. **Done 2026-10-04** (`tick_spill_replay.rs::isolate_refused_lines`): a
+    permanently refused chunk is bisected at line boundaries; refused single lines go to
+    `quarantine/<file>.rejected-lines` (synced, uploaded like any quarantined file), counted on
+    `tv_tick_spill_replay_lines_rejected_total`, and the file keeps draining. Covers a torn line
+    anywhere, not only last (re-check 6). Whole-file quarantine stays for a chunk with no
+    accepted row or past the caps (1,024 POSTs, 64 lines). Tests:
+    `a_torn_line_is_set_aside_and_the_rest_of_the_file_is_replayed`,
+    `a_torn_tail_is_set_aside_with_a_newline`,
+    `a_chunk_with_every_line_refused_still_quarantines_the_file`,
+    `split_at_line_boundary_splits_whole_lines_near_the_middle`. Still open in PR17: the candle
+    seal spill is never synced.
   - A frame the capture log refused and later deferred to it is labelled "deferred"
     (pool_supervisor.rs:3924-4002, tick_persistence.rs:2791): fix the label; counter and alarm
     are already right.
@@ -2377,6 +2387,17 @@ idle poll. No allocation on the tick path.
 - [ ] **R3-13 (D11) — Special sessions (Muhurat).** Built inert on `wip/d11`, NOT merged: needs the
   owner to confirm date, hours and cost, and a compile + test run.
 - [x] **R3-14 — WAL segment names from a monotonic source** (replay order across a clock step). **Done 2026-10-04** (`ws_frame_spill.rs::next_segment_name_nanos`): a new segment is named `max(wall nanos, highest name in the directory + 1)`, the highest seeded once per directory from the live, `replaying/` and `archive/` names, so names only rise across a backward clock step or a restart; a clamped name is counted on `tv_wal_segment_name_clamped_total`. Tests: `test_regression_segment_names_keep_rising_across_a_backward_clock_step`, `test_regression_segment_names_seed_past_every_name_on_disk_after_a_restart` (both fail with the clamp removed), `test_segment_name_nanos_parses_only_segment_names`. Storage lib 1,763 passed, integration tests all passed.
+- [x] **L10 (audit thread, 2026-10-04) — the boot sequence probe trusted a corrupt record.**
+  **Done 2026-10-04** (`ws_frame_spill.rs::highest_frame_seq_in_segment`). Two defects, both
+  fixed: (1) the record giving the highest header sequence is now read whole and its CRC
+  checked; if it fails, the segment is re-walked verifying every record
+  (`tv_wal_seq_probe_corrupt_record_total`), so a flipped bit can no longer seed `capture_seq`
+  near the top of its range; (2) found while testing: the header walk's seek counted the CRC
+  twice, so every segment yielded only its FIRST record's sequence and the restart seed sat up to
+  one segment below the true high-water mark. Tests:
+  `test_regression_high_water_probe_reads_every_record_of_a_segment` (fails on the old seek),
+  `test_regression_a_corrupt_sequence_never_seeds_the_counter` (fails with the CRC check removed),
+  `test_first_frame_seq_refuses_a_corrupt_first_record`.
 
 ### Added 2026-10-02 (round 4: owner approved decisions 2 to 5 and in-place resubscribe)
 
@@ -2665,7 +2686,7 @@ Status of the rest, so the next session does not re-audit:
 
 | State | Items |
 |---|---|
-| Partly done (remaining work named in each item) | PR5, PR8 (shutdown/boot `blocking_flush`, seal-writer cycle, order observability flushes still `block_in_place`), D2 (waits on PR12), D3 (D3a/b/c-1 done; D3c-2/3 open), D5 (waits on PR11), D6 (D6e onward), PR16 (`df` fork with no timeout, drain still on the shared runtime, boot seal drain bare), PR17 (candle seal spill never synced; torn spill line quarantines the rest of the file), PR18, PR19, D7 (808 policy open), D9 (D9b-3 open), PR24, PR28b (owner lock mode), PR31c, PR32 (hour-boundary late append in tick spill replay; unapplied-table overflow uncounted; archive blind to capture-log deferrals), PR33, PR36 (SSH done), PR39, PR42 (42a/42b done; 42c owner; order/position update event writers have no spill tier), PR55 (manual and tag deploys gated; input-in-shell and branch checks open), PR56 (alarm open), PR40b-f (S3 copy gate mitigates; `.bin.N` / `.overflow` never matched; boot prune still runs before the boot drain) |
+| Partly done (remaining work named in each item) | PR5, PR8 (shutdown/boot `blocking_flush`, seal-writer cycle, order observability flushes still `block_in_place`), D2 (waits on PR12), D3 (D3a/b/c-1 done; D3c-2/3 open), D5 (waits on PR11), D6 (D6e onward), PR16 (`df` fork with no timeout, drain still on the shared runtime, boot seal drain bare), PR17 (candle seal spill never synced; torn-line part done 2026-10-04), PR18, PR19, D7 (808 policy open), D9 (D9b-3 open), PR24, PR28b (owner lock mode), PR31c, PR32 (hour-boundary late append in tick spill replay; unapplied-table overflow uncounted; archive blind to capture-log deferrals), PR33, PR36 (SSH done), PR39, PR42 (42a/42b done; 42c owner; order/position update event writers have no spill tier), PR55 (manual and tag deploys gated; input-in-shell and branch checks open), PR56 (alarm open), PR40b-f (S3 copy gate mitigates; `.bin.N` / `.overflow` never matched; boot prune still runs before the boot drain) |
 | Open, nothing built | PR6, PR7, PR9, PR10, PR11, PR12, PR13, PR14, D1, D4, D8, PR23, PR25, PR26, PR27, PR34, PR35, PR37, PR38, PR43, PR44, PR45, PR46, PR47, PR49, PR50, PR51, PR52, PR54, PR57, PR59, PR40c-f, PR40d-f |
 | Waiting on the owner | OWNER-202, PR42c, PR28b lock mode, D11/R3-13 (no `wip/d11` branch exists any more; the box curfew still blocks Sundays; the session is 2026-11-08) |
 | Dormant | PR48 (console wipes switched off by `CONSOLE_DATA_WIPES_AUTHORIZED = false`) |
