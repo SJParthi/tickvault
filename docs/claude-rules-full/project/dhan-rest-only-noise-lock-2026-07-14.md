@@ -4436,3 +4436,77 @@ fires every hour.
   wedged runtime would then hide its own stall).
 - Removes the 09:00–15:40 IST gate, or drops the broker name from the
   Telegram line.
+
+## §2.9 — 2026-10-04: five DATA-AT-RISK pages — cloud backup failing, disk kept for want of a backup, order updates dropped, log lines dropped, the feed thread writing to disk itself
+
+**The operator's answer, as recorded by the platform:** Parthi, 2026-10-04
+08:18:24Z, the audit thread, tapped option A **"Page me"** on a decision card
+whose question read *"Phone you when data is at risk: failed cloud backups,
+dropped order updates, dropped log lines?"*. The card's context named about
+nine counters (cloud backup upload failures, backup marker write failures,
+files kept because they could not be backed up, order updates dropped, log
+lines dropped, saves that fell back to writing on the feed's own thread) and
+priced them at about $3 to $4 a month. Option A's consequence read *"Counters
+go to CloudWatch and each one phones you once when it starts going up,
+off-hours quiet where it makes sense."*
+
+The tap answers an ENUMERATED ask that names these counters and their price,
+so it is accepted in the same shape §2.6–§2.8 accept a go-ahead on an
+enumerated option. It authorizes the pages below and nothing wider. This dated
+row is the §3 record, written in the same change as the terraform and before
+it can deploy. Source: the 2026-10-04 workspace audit (counters counted on
+the box that reached no one).
+
+**Why these.** Each counter is already counted on the box and none reached
+CloudWatch, so each failure was visible only to someone reading `/metrics` on
+the host. Grouped by what the operator DOES, not by counter (the
+`market-data-persistence-loss` / `durable-floor-breach` precedent), so ten
+counters become five pages.
+
+| Alarm | Counters (summed) | Fires when | Telegram line |
+|---|---|---|---|
+| `tv-<env>-cold-backup-failing` | `tv_raw_frame_upload_failed_total`, `tv_cold_file_upload_failed_total`, `tv_raw_upload_marker_write_failed_total` | ≥ 1 in 2 of 3 consecutive 900 s periods | "Copies of captured market data are not reaching cloud storage — the files are kept on the server, but the disk will fill" |
+| `tv-<env>-disk-kept-not-backed-up` | `tv_wal_prune_refused_not_uploaded_total`, `tv_seal_spill_prune_refused_not_uploaded_total`, `tv_quarantine_prune_refused_not_uploaded_total` | ≥ 1 in one 900 s period | "Old market data files are due to be cleared but have no cloud copy, so they are kept — the disk will fill" |
+| `tv-<env>-order-update-dropped` | `tv_order_update_broadcast_drops_total` | ≥ 1 in one 300 s period | "🔷 DHAN: an order update from the broker reached nothing in the app — that update is missing" |
+| `tv-<env>-log-lines-dropped` | `tv_log_lines_dropped_total` | ≥ 1 in one 300 s period | "Log lines were dropped because the log writer fell behind — part of the record is missing" |
+| `tv-<env>-feed-thread-wrote-to-disk` | `tv_tick_rescue_inline_fallback_total`, `tv_depth_rescue_inline_fallback_total` | ≥ 1 in one 300 s period | "🔷 DHAN: the live price thread had to save to disk itself because the save helper was full or gone — prices may have been skipped while it waited" |
+
+All five: `treat_missing_data = notBreaching` (the box is stopped outside the
+trading window and these counters only move on a failure), NO `ok_actions`
+(a delta returning to zero never means the files were uploaded, the update
+arrived, or the lines came back), no dimension beyond `host`, NOT
+market-hours gated (uploads and prunes run mostly outside the session). The
+upload alarm alone waits for 2 of 3 periods, because one failed upload is
+retried on the next pass two minutes later; a failure that persists for half
+an hour is the page.
+
+Every counter is registered at 0 at boot (`main.rs`), so the CloudWatch
+agent's dropped first sample is the harmless zero, not the incident.
+
+**Honest cost (AWS list price, ap-south-1):** +10 EMF names at **$0.30 per
+metric per month** = $3.00, and +5 alarms at **$0.10 per alarm per month** =
+$0.50 on the house convention that a metric-math alarm bills as one alarm, or
+$1.00 if AWS bills per referenced metric (10). Total **$3.50 to $4.00/mo**.
+The budget was NOT read live on 2026-10-04 (no read-only key in the session
+that wrote this); the October ceiling is $150 per Quote 23, and the 2026-09-25
+note projected October at about that line before this change.
+
+**NOT claimed:**
+- That a page means data was LOST in every row. The two disk rows mean data is
+  KEPT and the disk is at risk; the order-update and log rows mean records are
+  gone; the feed-thread row means a wait, not proven loss.
+- That the thresholds are measured-optimal. No CloudWatch baseline exists for
+  any of the ten counters; changing a threshold needs one and its own dated
+  row.
+- That `tv_log_lines_dropped_total` never moves on a healthy day. Its buffer
+  is 128,000 lines and no drop has been observed, but that is Assumed, not
+  measured on the production host.
+
+**What a PR that violates §2.9 looks like (REJECT):**
+- Adds `ok_actions` to any of the five, or a per-connection, per-instrument or
+  per-file dimension.
+- Splits a group back into one alarm per counter without a dated row here.
+- Lowers the cold-backup alarm to a single period (one transient S3 failure
+  would page).
+- Drops the boot-time zero registration of any of the ten counters.
+- Adds a sixth counter to any group without a dated row here first.

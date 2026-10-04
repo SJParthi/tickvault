@@ -2624,6 +2624,22 @@ write, then candle warm-up (PR31b-2 (a), already listed above). Each fix ships a
   each step still costs what it did; only the worker it holds changes. Boot-only and shutdown-only
   steps (the WAL replay, the mapping-artifact wait, shutdown joins) are left as they are.
 
+### Added 2026-10-04 (workspace audit, owner tapped "Page me" on the data-at-risk card)
+
+- [x] **P1 — Five data-at-risk pages over ten counters that reached no one.** Failed cloud
+  backups, files kept on disk because no verified copy exists, dropped order updates, dropped log
+  lines and the feed thread writing a rescue to disk itself were each counted on the box and seen
+  by nobody. The ten counters join the main EMF selector, each is registered at 0 at boot (after
+  the recorder install, every label value), and five metric-math alarms sum them (`notBreaching`,
+  no `ok_actions`, `host` only; the cloud-backup alarm needs 2 of 3 × 900 s). Rule first:
+  noise-lock §2.9 and aws-budget COST NOTE 2026-10-04. Files: `crates/app/src/main.rs`,
+  `crates/aws-lambdas/src/telegram_webhook.rs`, `deploy/aws/cloudwatch-agent.json`,
+  `deploy/aws/terraform/data-at-risk-alarms.tf`,
+  `crates/common/tests/cloudwatch_app_alarms_wiring.rs`. Tests:
+  test_emf_metric_selectors_name_count_is_pinned, every_alarmed_counter_is_registered_at_boot,
+  every_live_alarm_has_a_plain_english_phrase. Honest limits: the log-drop and feed-inline thresholds have no measured
+  baseline (Assumed); the order-update drop `error!` still carries no code (audit M3).
+
 ## Edge Cases
 
 - PR1: log burst larger than the non-blocking buffer → lines dropped and counted, never blocking.
