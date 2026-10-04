@@ -3898,7 +3898,7 @@ mod tests {
     }
 
     #[test]
-    fn is_spill_record_name_matches_every_renamed_copy() {
+    fn test_is_spill_record_name_and_strip_copy_suffixes_match_every_renamed_copy() {
         // PR40b-f: the prune and the uploader matched `*.bin` only, so a
         // set-aside or collision copy was never pruned, uploaded or counted.
         for name in [
@@ -3986,7 +3986,7 @@ mod tests {
     }
 
     #[test]
-    fn the_boot_drain_record_is_per_directory() {
+    fn test_note_boot_drain_ran_and_boot_drain_ran_are_per_directory() {
         let drained = spill_tmp("drained");
         let other = spill_tmp("not-drained");
         assert!(!boot_drain_ran(&drained));

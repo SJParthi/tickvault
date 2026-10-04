@@ -2030,10 +2030,10 @@ New items:
     main.rs, `prune_spill_files` holds aged top-level and `replaying/` files
     (`held_before_boot_drain`) until `drain_recovered_seals` has run over that folder in this
     process (`note_boot_drain_ran`), which covers the 6-hourly and disk-pressure passes too.
-    Tests: `is_spill_record_name_matches_every_renamed_copy`,
+    Tests: `test_is_spill_record_name_and_strip_copy_suffixes_match_every_renamed_copy`,
     `spill_sweep_prunes_renamed_copies_and_counts_their_records`,
     `spill_sweep_keeps_aged_unreplayed_files_until_the_boot_drain_has_run`,
-    `the_boot_drain_record_is_per_directory`, `staging_reads_overflow_and_twice_renamed_copies`,
+    `test_note_boot_drain_ran_and_boot_drain_ran_are_per_directory`, `staging_reads_overflow_and_twice_renamed_copies`,
     `the_boot_drain_lets_the_retention_sweep_delete_unreplayed_files`, and the updated
     `test_run_file_pass_uploads_every_spill_folder_and_a_second_pass_does_nothing`. **Still
     open:** exempting refused and poison files (with the copy gate on, the default, they are
