@@ -85,6 +85,7 @@ impl OrderCircuitBreaker {
     /// with the real reset timeout. Compiled only with the `loom` feature.
     #[cfg(feature = "loom")]
     #[doc(hidden)]
+    // TEST-EXEMPT: model constructor, exercised by every test in tests/loom_circuit_breaker.rs
     pub fn new_half_open_for_model() -> Self {
         Self {
             consecutive_failures: AtomicU32::new(OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD),
