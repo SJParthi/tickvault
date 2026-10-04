@@ -2661,6 +2661,20 @@ write, then candle warm-up (PR31b-2 (a), already listed above). Each fix ships a
   proven only by the next scheduled or dispatched mutation run (Assumed until then); 61 uncoded
   `error!` lines remain.
 
+- [x] **P3 — A spill replay that fails part-way through a file keeps what it finished.** Audit N1:
+  when a later chunk of a spill file failed (QuestDB busy, a read error), the round dropped the
+  chunks it had already finished, so the next round restarted at the old offset and set the same
+  refused lines aside again, once per retry, into `<file>.rejected-lines`. The failure branch now
+  records `resume_from + accepted` (every finished chunk ends on a line boundary) and counts those
+  bytes as replayed. Also: quarantining a whole file now forgets its resume offset, so the next
+  file of the same name (names recur per feed and hour) starts at its first byte instead of a
+  stale offset. Files: `crates/storage/src/tick_spill_replay.rs`. Tests:
+  a_failure_later_in_a_file_does_not_set_the_same_line_aside_twice,
+  quarantining_a_file_forgets_its_resume_offset. Honest limits: a failure INSIDE a chunk still
+  re-sends that chunk next round (idempotent, the dedup keys carry the row identity); the offset
+  map lives in memory only, so after a restart a partly drained file is re-sent from the start and
+  its refused lines are set aside a second time, as before.
+
 ## Edge Cases
 
 - PR1: log burst larger than the non-blocking buffer → lines dropped and counted, never blocking.
