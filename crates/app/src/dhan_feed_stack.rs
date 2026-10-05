@@ -5620,6 +5620,7 @@ fn seed_drain_loss_baselines() {
     // `the_ws_lag_exclusion_family_is_seeded_on_every_label_set`.
     for reason in [
         "ltt_not_advanced",
+        "not_a_trade",
         "clamped_negative",
         "implausible_ltt",
         "unknown_connection_slot",
@@ -9126,24 +9127,29 @@ pub fn drain_main_feed_frame(
                 // that carry an LTT reach this arm (OI, PrevClose and
                 // MarketStatus decode to non-`Tick` variants), so a missing
                 // timestamp is a garbage one and is EXCLUDED, never zero.
-                if matches!(
-                    outcome,
+                //
+                // ⚠ CHANGED 2026-10-05: only a NEW trade the fold accepted is a
+                // lag sample. Every other outcome was recorded until today, and
+                // the out-of-session arm is the one that mattered: a contract
+                // that has not traded today carries an earlier day's trade time
+                // on every order-book change, so its "lag" is hours. Live that
+                // day, 6.0 million such ticks went into the histogram and read
+                // as option sockets #1-#3 delivering most packets over 60 s,
+                // while the socket-to-disk-log stage measured 99.8% at or under
+                // 131 us. Each excluded tick is counted, never dropped silently.
+                match outcome {
                     IngestOutcome::Folded {
-                        repeat_quote: true,
-                        ..
+                        repeat_quote: true, ..
+                    } => record_ws_lag_repeat_excluded(),
+                    IngestOutcome::Folded { .. } => {
+                        record_ws_lag(frame.connection_index, &tick, received_at_nanos);
+                        // Worst delay on a LIVE socket only: a replayed WAL
+                        // frame (`u8::MAX`) carries its replay time.
+                        if frame.connection_index != u8::MAX {
+                            record_ws_lag_max(tick.exchange_timestamp, received_at_nanos);
+                        }
                     }
-                ) {
-                    record_ws_lag_repeat_excluded();
-                } else {
-                    record_ws_lag(frame.connection_index, &tick, received_at_nanos);
-                    // Worst delay of a NEW trade on a LIVE socket only: a
-                    // replayed WAL frame (`u8::MAX`) carries its replay time,
-                    // and a refused tick is not a trade we kept.
-                    if frame.connection_index != u8::MAX
-                        && matches!(outcome, IngestOutcome::Folded { .. })
-                    {
-                        record_ws_lag_max(tick.exchange_timestamp, received_at_nanos);
-                    }
+                    _ => record_ws_lag_not_a_trade_excluded(),
                 }
                 match outcome {
                     IngestOutcome::Folded { .. } => {
@@ -10491,6 +10497,10 @@ struct WsLagHandles {
     /// previous packet). Its stamp is the time of an earlier trade, so its
     /// "lag" is how long the instrument has been quiet. Counted, not recorded.
     excluded_ltt_not_advanced: metrics::Counter,
+    /// A tick the fold did not accept as a trade, most often a contract that
+    /// has not traded today carrying an earlier day's trade time. Counted, not
+    /// recorded (2026-10-05).
+    excluded_not_a_trade: metrics::Counter,
 }
 
 impl WsLagHandles {
@@ -10515,6 +10525,10 @@ impl WsLagHandles {
             excluded_ltt_not_advanced: metrics::counter!(
                 WS_LAG_EXCLUDED_COUNTER,
                 "reason" => "ltt_not_advanced"
+            ),
+            excluded_not_a_trade: metrics::counter!(
+                WS_LAG_EXCLUDED_COUNTER,
+                "reason" => "not_a_trade"
             ),
         }
     }
@@ -11119,6 +11133,15 @@ pub fn record_ws_lag(connection_index: u8, tick: &ParsedTick, received_at_nanos:
 /// neither the histogram nor the 15:45 day distribution.
 pub fn record_ws_lag_repeat_excluded() {
     ws_lag_handles().excluded_ltt_not_advanced.increment(1);
+}
+
+/// Counts a tick the fold did not accept as a trade (out of session, an
+/// earlier trading day, a refused price or time, a failed write) as excluded
+/// from the delivery-lag measurement. Its stamp is not the time of a trade
+/// that just happened, so its "receipt − LTT" is not transit time. One
+/// relaxed atomic add; no allocation (2026-10-05).
+pub fn record_ws_lag_not_a_trade_excluded() {
+    ws_lag_handles().excluded_not_a_trade.increment(1);
 }
 
 /// Outcome of [`ws_lag_ms`] for a tick that DOES carry a usable timestamp.
@@ -18892,7 +18915,7 @@ mod tests {
             .find("let outcome = ingest.ingest_tick_at(&tick, frame.seq, packets, recv_millis);")
             .expect("the drain's fold call must exist");
         let excluded = prod
-            .find("record_ws_lag_repeat_excluded();")
+            .find("=> record_ws_lag_repeat_excluded(),")
             .expect("the drain must count repeats as excluded");
         let measured = prod
             .find("record_ws_lag(frame.connection_index, &tick, received_at_nanos);")
@@ -18905,6 +18928,49 @@ mod tests {
             prod.matches("record_ws_lag(frame.connection_index").count(),
             1,
             "exactly one live lag-recording site"
+        );
+    }
+
+    #[test]
+    fn test_record_ws_lag_not_a_trade_excluded_only_an_accepted_trade_is_a_lag_sample() {
+        // 2026-10-05: out-of-session ticks (a contract not traded today,
+        // carrying an earlier day's trade time) went into the lag histogram
+        // and read as option sockets delivering most packets over 60 s. The
+        // drain must record lag on the accepted-trade arm only and count
+        // every other outcome on its own exclusion reason.
+        record_ws_lag_not_a_trade_excluded();
+        let src = include_str!("dhan_feed_stack.rs");
+        let helper = src
+            .find("pub fn record_ws_lag_not_a_trade_excluded() {")
+            .map(|at| &src[at..])
+            .and_then(|tail| tail.find('}').map(|end| &tail[..end]))
+            .expect("the not-a-trade exclusion helper must exist");
+        assert!(
+            helper.contains(".excluded_not_a_trade.increment(1)"),
+            "a refused or out-of-session tick must increment the not_a_trade counter, got: {helper}"
+        );
+
+        let prod = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
+        let fold = prod
+            .find("let outcome = ingest.ingest_tick_at(&tick, frame.seq, packets, recv_millis);")
+            .expect("the drain's fold call must exist");
+        let arm = &prod[fold..];
+        let folded_arm = arm
+            .find("IngestOutcome::Folded { .. } => {")
+            .expect("lag must be recorded inside the accepted-trade arm");
+        let measured = arm
+            .find("record_ws_lag(frame.connection_index, &tick, received_at_nanos);")
+            .expect("the drain must still record real lag");
+        let other = arm
+            .find("_ => record_ws_lag_not_a_trade_excluded(),")
+            .expect("every other outcome must be counted as not a trade");
+        assert!(
+            folded_arm < measured && measured < other,
+            "the lag sample must sit inside the Folded arm, before the catch-all"
+        );
+        assert!(
+            src.contains("\"reason\" => \"not_a_trade\""),
+            "the exclusion reason label must be registered"
         );
     }
 
