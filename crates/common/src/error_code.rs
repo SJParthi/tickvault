@@ -173,6 +173,20 @@ pub enum ErrorCode {
     /// ticks. Edge-triggered, at most one line a minute; pages (noise-lock
     /// §2.8, owner-approved 2026-10-02).
     HotPathStall01,
+    /// BOOT-04: the durable frame log (WAL) could not be opened at boot, so
+    /// boot HALTS (fail-closed): running without it would let frames be lost
+    /// silently under back-pressure. Log-only; the box not coming up is what
+    /// the start watchdog notices.
+    Boot04WalInitFailed,
+    /// PROC-02: the process panicked. Logged by the panic hook with the
+    /// location, the payload and how the WAL drain went, just before the
+    /// default hook runs. Log-only; the restart is what systemd and the
+    /// liveness alarm notice.
+    Proc02Panic,
+    /// API-SERVER-01: the HTTP API server stopped with an error. `/health`,
+    /// `/api/feeds` and the MCP read endpoints are unreachable until a
+    /// restart; the feed and candles keep running. Log-only.
+    ApiServer01Stopped,
     /// TICK-SPILL-01 — a rescued tick-spill file was PERMANENTLY refused by
     /// QuestDB and has been quarantined so the rest of the backlog can drain.
     ///
@@ -1079,6 +1093,9 @@ impl ErrorCode {
             Self::HotPath02WriterQueueDrop => "HOT-PATH-02",
             Self::HotPath03ReaderPinNotApplied => "HOT-PATH-03",
             Self::HotPathStall01 => "HOT-PATH-STALL-01",
+            Self::Boot04WalInitFailed => "BOOT-04",
+            Self::Proc02Panic => "PROC-02",
+            Self::ApiServer01Stopped => "API-SERVER-01",
             Self::TickSpill01FileQuarantined => "TICK-SPILL-01",
             // PR #5 (2026-05-19): PHASE2-01 / PHASE2-02 retired.
             Self::PrevClose01IlpFailed => "PREVCLOSE-01",
@@ -1356,6 +1373,14 @@ impl ErrorCode {
             // someone looks. High because the spill tier IS the loss guarantee.
             Self::TickSpill01FileQuarantined => Severity::High,
             Self::HotPathStall01 => Severity::High,
+            // BOOT-04 halts boot, PROC-02 is a crash, API-SERVER-01 leaves the
+            // feed running. High, not Critical: each is already seen by another
+            // signal (start watchdog, liveness alarm, /health), and Critical
+            // would demand a new page (critical_errcode_alarm_coverage_guard).
+            // The triage rules escalate all three; none is auto-actioned.
+            Self::Boot04WalInitFailed | Self::Proc02Panic | Self::ApiServer01Stopped => {
+                Severity::High
+            }
             // TF-VERIFY-01/02 (operator 2026-07-13) — the daily
             // timeframe-consistency verifier found a TF-vs-1m divergence /
             // ran degraded. High: operator eyes required on every occurrence
@@ -1526,6 +1551,9 @@ impl ErrorCode {
             | Self::PrevOi01CacheEmptyAtBoot
             | Self::PrevClose04CacheEmptyAtBoot => "docs/error-runbooks/wave-1-error-codes.md",
             Self::HotPathStall01 => "docs/error-runbooks/hot-path-stall-error-codes.md",
+            Self::Boot04WalInitFailed | Self::Proc02Panic | Self::ApiServer01Stopped => {
+                "docs/error-runbooks/process-lifecycle-error-codes.md"
+            }
             Self::WsSpill01WriterRespawn | Self::WsSpill02FrameDropped => {
                 "docs/error-runbooks/ws-frame-spill-error-codes.md"
             }
@@ -1813,6 +1841,9 @@ impl ErrorCode {
             Self::HotPath02WriterQueueDrop,
             Self::HotPath03ReaderPinNotApplied,
             Self::HotPathStall01,
+            Self::Boot04WalInitFailed,
+            Self::Proc02Panic,
+            Self::ApiServer01Stopped,
             Self::TickSpill01FileQuarantined,
             // PR #5 (2026-05-19): Phase201DispatchFailed + Phase202EmitGuardDropped retired.
             Self::PrevClose01IlpFailed,
@@ -2315,7 +2346,9 @@ mod tests {
                 // 2026-09-05: the AWS Lambda operations family — 43 uncoded
                 // `error!` sites in crates/aws-lambdas, which no guard
                 // scanned until the crate list became filesystem discovery.
-                || s.starts_with("LAMBDA-");
+                || s.starts_with("LAMBDA-")
+                // 2026-10-05 (audit M3): the HTTP API server task stopped.
+                || s.starts_with("API-SERVER-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }

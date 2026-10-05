@@ -1367,6 +1367,8 @@ async fn async_main() -> Result<()> {
         }
         Err(err) => {
             error!(
+                code = tickvault_common::error_code::ErrorCode::Boot04WalInitFailed.code_str(),
+                source = "ws_frame_spill_init",
                 ?err,
                 dir = %ws_wal_dir,
                 "STAGE-C: failed to initialize WsFrameSpill — HALTING boot (fail-closed). \
@@ -2389,6 +2391,8 @@ async fn async_main() -> Result<()> {
             None
         };
         tracing::error!(
+            code = tickvault_common::error_code::ErrorCode::Proc02Panic.code_str(),
+            source = "panic_hook",
             panic_location = %location,
             panic_payload = %payload,
             wal_drain = ?wal_drain,
@@ -4838,7 +4842,12 @@ async fn build_shared_infra(
     info!(address = %bind_addr, "SHARED-INFRA BOOT: API server listening (/api/feeds reachable regardless of Dhan ON/OFF)");
     let api_handle = tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, router).await {
-            error!(?err, "API server error");
+            error!(
+                code = tickvault_common::error_code::ErrorCode::ApiServer01Stopped.code_str(),
+                source = "axum_serve",
+                ?err,
+                "API server stopped with an error: /health and /api/* are unreachable until a restart"
+            );
         }
     });
 
