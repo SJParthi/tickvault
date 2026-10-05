@@ -1357,7 +1357,12 @@ impl AggregatorCell {
                 BucketOpenContext {
                     use_day_open,
                     first_bucket_of_day,
-                    prev_close: net_volume_baseline(&self.last_sealed[ord], bucket_start),
+                    prev_close: bucket_sign_baseline(
+                        &self.last_sealed[ord],
+                        tf,
+                        bucket_start,
+                        prices.day_close,
+                    ),
                 },
                 cumulative_volume,
                 signed_tick_volume,
@@ -1533,7 +1538,8 @@ impl AggregatorCell {
             //
             // The day gate still applies — a bucket crossing can itself be a
             // day boundary when `force_seal_all` did not run overnight.
-            let prev_close_for_new_bucket = net_volume_baseline(&self.slots[ord], bucket_start);
+            let prev_close_for_new_bucket =
+                bucket_sign_baseline(&self.slots[ord], tf, bucket_start, prices.day_close);
             // SETTLE FIRST, then chain — order is the whole correctness of
             // this site, and `mem::replace` makes it easy to get wrong: it
             // evaluates its second argument (the new bucket) BEFORE swapping,
@@ -2120,6 +2126,46 @@ struct BucketOpenContext {
     /// Close of the previous sealed bar of this timeframe; `0.0` means "no
     /// baseline" and makes [`LiveCandleState::net_volume`] report `None`.
     prev_close: f64,
+}
+
+/// The baseline a NEW bar's sign (and its bar-on-bar percentage) is measured
+/// against.
+///
+/// The bucket holding the market open (09:15) is measured against the
+/// PREVIOUS DAY's close from the exchange packet; every other bucket against
+/// the previous sealed bar of this timeframe ([`net_volume_baseline`]).
+///
+/// # Why (operator, 2026-10-05)
+///
+/// The minute grid starts at 09:00, so a stock that quotes in the pre-open
+/// seals a pre-open bar at the auction price before 09:15. The 09:15 bar was
+/// then signed against that auction price, while the broker's chart (which
+/// has no pre-open bar) signs it against yesterday's close: ADANIENT on
+/// 2026-10-05 closed 09:15 at 2841.10, below the 2843.90 auction price and
+/// above yesterday's 2827.00, so the table stored a negative volume where the
+/// chart showed +45.81K. Asked whether to keep, fold the pre-open in, or sign
+/// against yesterday, the operator chose "Sign vs yesterday". This reverses,
+/// for this one bucket, the overnight-gap objection recorded on
+/// [`net_volume_baseline`]; the trade is deliberate.
+///
+/// The exchange close is the official previous close, not the broker's last
+/// one-minute close, so the two can still disagree when this bar's close lies
+/// between them. When the opening packet carries no previous close (`0.0`),
+/// the old baseline is used.
+///
+/// # Complexity
+/// O(1) — one predicate, one compare. No allocation.
+#[inline]
+fn bucket_sign_baseline(
+    prev_bar: &LiveCandleState,
+    tf: TfIndex,
+    bucket_start: u32,
+    prev_day_close: f64,
+) -> f64 {
+    if prev_day_close > 0.0 && is_days_first_session_bucket(tf, bucket_start) {
+        return prev_day_close;
+    }
+    net_volume_baseline(prev_bar, bucket_start)
 }
 
 /// The baseline a bar's net-volume sign is measured against: the close of the
@@ -2987,6 +3033,69 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Operator, 2026-10-05 ("Sign vs yesterday"): the bar holding 09:15 is
+    /// signed against the PREVIOUS DAY's close, never against a pre-open bar.
+    /// The ADANIENT shape: auction 2843.90, 09:15 close 2841.10, yesterday
+    /// 2827.00. Against the pre-open bar the volume went negative; the
+    /// broker's chart shows it positive. Both seal paths (sweep first, or the
+    /// 09:15 tick rolling the pre-open bar) and every timeframe agree.
+    #[test]
+    fn test_regression_the_0915_bar_is_signed_against_yesterdays_close() {
+        let strategy = FeedStrategy::DEFAULT;
+        for tf in TfIndex::ALL {
+            for sweep_first in [false, true] {
+                let mut cell = AggregatorCell::empty();
+                let mut pre = tick_at(OPEN - 420, 2843.90, 1_000);
+                pre.day_close = 2827.00;
+                cell.consume_tick(tf, &pre, 1_000, strategy, 1_000);
+                if sweep_first {
+                    let _ = cell.catch_up_seal(tf, OPEN);
+                }
+                let mut first = tick_at(OPEN, 2841.10, 46_810);
+                first.day_open = 2843.90;
+                first.day_close = 2827.00;
+                cell.consume_tick(tf, &first, 46_810, strategy, 46_810);
+                let bar = cell.snapshot(tf);
+                assert!(
+                    (bar.bucket_open_prev_close - f32_to_f64_clean(2827.00)).abs() < 1e-9,
+                    "{tf:?} sweep_first={sweep_first}: baseline was {}",
+                    bar.bucket_open_prev_close
+                );
+                assert!(
+                    bar.signed_volume() > 0,
+                    "{tf:?} sweep_first={sweep_first}: 09:15 closed above yesterday"
+                );
+            }
+        }
+    }
+
+    /// The bar AFTER 09:15 still compares against the bar before it, and a
+    /// 09:15 packet with no previous close falls back to the old baseline.
+    #[test]
+    fn only_the_market_open_bucket_uses_yesterdays_close() {
+        let strategy = FeedStrategy::DEFAULT;
+        let mut cell = AggregatorCell::empty();
+        let mut pre = tick_at(OPEN - 420, 2843.90, 1_000);
+        pre.day_close = 2827.00;
+        cell.consume_tick(TfIndex::M1, &pre, 1_000, strategy, 1_000);
+        let first = tick_at(OPEN, 2841.10, 46_810);
+        cell.consume_tick(TfIndex::M1, &first, 46_810, strategy, 46_810);
+        assert!(
+            (cell.snapshot(TfIndex::M1).bucket_open_prev_close - f32_to_f64_clean(2843.90)).abs()
+                < 1e-9,
+            "no previous close on the packet: the pre-open bar stays the baseline"
+        );
+        let mut next = tick_at(OPEN + 60, 2830.00, 50_000);
+        next.day_close = 2827.00;
+        cell.consume_tick(TfIndex::M1, &next, 46_810, strategy, 50_000);
+        let bar = cell.snapshot(TfIndex::M1);
+        assert!(
+            (bar.bucket_open_prev_close - f32_to_f64_clean(2841.10)).abs() < 1e-9,
+            "09:16 compares against 09:15, not yesterday"
+        );
+        assert!(bar.signed_volume() < 0, "09:16 fell against 09:15");
     }
 
     /// A repeated quote (same trade, new book/OI) refreshes ONLY the quote
