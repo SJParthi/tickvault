@@ -2981,3 +2981,15 @@ Status of the rest, so the next session does not re-audit:
   24 production files across api, app, core, storage and trading, plus
   `crates/common/tests/error_code_tag_guard.rs`. Tests: uncoded_error_sites_may_only_shrink,
   every_critical_code_with_an_emit_site_is_alarmed_or_allowlisted.
+
+- [x] **H3 (core) — a loom test drives the real ghost-unsubscribe register.** The six
+  per-slot registers move into `GhostRegister` (atomics from the new `crate::sync` shim:
+  std atomics normally, loom's under the `loom` feature); the public functions delegate
+  to the one static. The new loom test proves a take is never torn, no request is lost
+  or taken twice, and a pending request is never overwritten; bite-checked by clearing
+  the flag before reading the slot. Added to the CI loom lane (drift list, `--test`,
+  count 3 -> 4). Files: `crates/core/src/sync.rs`, `crates/core/src/lib.rs`,
+  `crates/core/src/websocket/pool_supervisor.rs`, `crates/core/tests/loom_ghost_register.rs`,
+  `.github/workflows/ci.yml`. Tests: a_take_racing_a_new_request_never_tears_loses_or_duplicates,
+  a_pending_request_is_never_overwritten_by_a_later_one,
+  a_racing_take_never_reads_a_torn_id_and_segment_pair.
