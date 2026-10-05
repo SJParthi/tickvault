@@ -211,6 +211,96 @@ fn emf_selected(root: &Path) -> BTreeSet<String> {
     tv_names(&tail[..end]).into_iter().collect()
 }
 
+/// Expand a `for_each` filter name such as `tv_loss_${each.value.group}_total`
+/// into one name per `group = "..."` value assigned in the same file.
+///
+/// ADDED 2026-10-05 with `loss-group-alarms.tf` (noise lock §2.10): its 55
+/// filters write six derived metrics through one interpolated name, and this
+/// guard read the raw template, so the six alarms looked unroutable. Only the
+/// `${each.value.<key>}` form is expanded; a name with any other
+/// interpolation is left as written, so it still fails rather than passing on
+/// a guess. A template with no matching values expands to nothing.
+fn expand_for_each(names: BTreeSet<String>, file: &str) -> BTreeSet<String> {
+    const OPEN: &str = "${each.value.";
+    let cleaned = strip_comments(file);
+    let mut out = BTreeSet::new();
+    for name in names {
+        let Some(at) = name.find(OPEN) else {
+            out.insert(name);
+            continue;
+        };
+        let after = &name[at + OPEN.len()..];
+        let Some(close) = after.find('}') else {
+            out.insert(name);
+            continue;
+        };
+        let key = &after[..close];
+        let (head, tail) = (&name[..at], &after[close + 1..]);
+        if tail.contains("${") || head.contains("${") {
+            out.insert(name);
+            continue;
+        }
+        for value in assigned_values(&cleaned, key) {
+            out.insert(format!("{head}{value}{tail}"));
+        }
+    }
+    out
+}
+
+/// Every `key = "value"` in the slice, as whole-word assignments.
+fn assigned_values(cleaned: &str, key: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let mut from = 0usize;
+    while let Some(rel) = cleaned[from..].find(key) {
+        let at = from + rel;
+        let prev_ok = at == 0
+            || !cleaned.as_bytes()[at - 1].is_ascii_alphanumeric()
+                && cleaned.as_bytes()[at - 1] != b'_';
+        let rest = cleaned[at + key.len()..].trim_start();
+        if prev_ok
+            && let Some(after_eq) = rest.strip_prefix('=')
+            && let Some(stripped) = after_eq.trim_start().strip_prefix('"')
+            && let Some(close) = stripped.find('"')
+        {
+            out.insert(stripped[..close].to_string());
+        }
+        from = at + key.len();
+    }
+    out
+}
+
+#[test]
+fn for_each_filter_names_expand_to_each_value() {
+    let tf = r#"
+        locals {
+          f = {
+            "a" = { group = "alpha", counter = "tv_x_total" }
+            "b" = { group = "beta",  counter = "tv_y_total" }
+            # group = "commented_out"
+          }
+        }
+    "#;
+    let mut names = BTreeSet::new();
+    names.insert("tv_loss_${each.value.group}_total".to_string());
+    names.insert("tv_plain_total".to_string());
+    names.insert("tv_${var.environment}_${each.value.group}".to_string());
+    let got = expand_for_each(names, tf);
+    let want: BTreeSet<String> = [
+        "tv_loss_alpha_total",
+        "tv_loss_beta_total",
+        "tv_plain_total",
+        "tv_${var.environment}_${each.value.group}",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect();
+    assert_eq!(
+        got, want,
+        "a for_each name must expand to one name per assigned value (never a \
+         commented one), and any other interpolation must stay as written so \
+         it still fails"
+    );
+}
 #[test]
 fn every_alarm_metric_can_actually_arrive() {
     let root = repo_root();
@@ -250,9 +340,9 @@ fn every_alarm_metric_can_actually_arrive() {
             &content,
             "aws_cloudwatch_metric_alarm",
         ));
-        log_filter_metrics.extend(metrics_in_resource_blocks(
+        log_filter_metrics.extend(expand_for_each(
+            metrics_in_resource_blocks(&content, "aws_cloudwatch_log_metric_filter"),
             &content,
-            "aws_cloudwatch_log_metric_filter",
         ));
     }
 
