@@ -1608,3 +1608,31 @@ about 2.5% to a month already projected at the line.
 
 **§2.3n's lever rule is NOT met.** No lever is taken. The operator chose the
 spend knowing the price.
+
+## COST NOTE 2026-10-05 — six loss-group pages over 55 counters (+$2.40/mo)
+
+**Authorization:** the operator tapped "Turn on" on the 2026-10-05 decision
+card ("Turn on the six extra phone alarms (H1) and the N3 counters?"), whose
+consequence priced the change at about $2.40 a month. Recorded in
+`dhan-rest-only-noise-lock-2026-07-14.md` §2.10 before the terraform, per the
+rule-file-first law.
+
+| Item | Cost |
+|---|---:|
+| 6 derived metrics (one `tv_loss_*` per group, `host` dimension) | $1.80 |
+| 6 alarms | $0.60 |
+| 55 log metric filters on `/tickvault/<env>/metrics` | $0.00 |
+| EMF names added | 0 |
+| **Total** | **$2.40/mo (upper bound)** |
+
+Derived metrics bill only for hours with datapoints; the seeded counters
+publish a zero every scrape while the box runs, so the box's running hours set
+the real figure, at or under the line above.
+
+**Budget position: NOT read live.** The session that wrote this could not run
+a CloudWatch or Cost Explorer read. The standing ceiling is $150 from October
+(Quote 23); this adds about 1.6% of it. Against the operator's ₹15,000 cap,
+$2.40 is about ₹205 at ~₹85/$ (Assumed rate).
+
+**§2.3n's lever rule is NOT met.** No lever is taken. The operator chose the
+spend knowing the price.
