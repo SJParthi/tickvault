@@ -269,11 +269,16 @@ pub async fn set_feed(
 /// Logs a failed write of the feed-state overlay. The toggle is already live,
 /// so this is the only signal that it will not survive a restart.
 fn log_overlay_persist_failure(err: &std::io::Error, feed: Feed) {
+    // Evaluated outside the macro: a call inside its field list leaves a
+    // never-taken copy in the macro's unused branch, which coverage counts
+    // as an uncovered line.
+    let code = tickvault_common::error_code::ErrorCode::StorageGap03AuditWriteFailed.code_str();
+    let feed_name = feed.as_str();
     tracing::error!(
-        code = tickvault_common::error_code::ErrorCode::StorageGap03AuditWriteFailed.code_str(),
+        code = code,
         source = "feed_state_overlay",
         ?err,
-        feed = feed.as_str(),
+        feed = feed_name,
         "failed to persist the feed-state overlay (data/feed-state.json) — \
          the runtime toggle is LIVE this session but will NOT survive a \
          restart until a feed-state write succeeds"
@@ -796,6 +801,12 @@ mod tests {
     fn test_log_overlay_persist_failure_logs_one_error() {
         let subscriber = Arc::new(CountErrors(std::sync::atomic::AtomicUsize::new(0)));
         tracing::subscriber::with_default(Arc::clone(&subscriber), || {
+            // The overlay write is reached inside a request span; drive every
+            // subscriber hook so the helper is exercised the way it runs.
+            let span = tracing::info_span!("set_feed", feed = tracing::field::Empty);
+            span.record("feed", "truedata");
+            span.follows_from(&span);
+            let _entered = span.enter();
             log_overlay_persist_failure(&std::io::Error::other("disk full"), Feed::Truedata);
         });
         assert_eq!(subscriber.0.load(std::sync::atomic::Ordering::Relaxed), 1);
