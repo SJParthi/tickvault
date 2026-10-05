@@ -15356,6 +15356,10 @@ fn refold_one_tick(
         // and this arm is no longer reached for it. What DOES reach here is a
         // tick whose FOLD-CLOCK second falls before 09:00 or at or after 15:40.
         //
+        // **REVERSED 2026-10-05:** candles start at 09:15 again
+        // (`CANDLE_SESSION_OPEN_SECS_OF_DAY_IST` = 33_300), so a 09:00-09:14
+        // pre-open tick reaches this arm once more: its row is written, no bar.
+        //
         // **RE-CORRECTED 2026-08-28, same day.** The sentence that stood here
         // read "the persistence window is wider than the candle window at both
         // ends". That is FALSE in both halves, and one grep settles it:
