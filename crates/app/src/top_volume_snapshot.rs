@@ -283,7 +283,9 @@ pub const fn floor_to_grid(ts_nanos: i64, period_secs: u64) -> i64 {
     }
 }
 
-/// The IST second-of-day the candle grid is anchored on: 09:00.
+/// The IST second-of-day the candle grid is anchored on: 09:15 (2026-10-05;
+/// it was 09:00 from 2026-08-28). Every cadence here divides 900 s, so the
+/// snapshot instants themselves do not move.
 ///
 /// MIRRORS `tickvault_trading::candles::tf_index::CANDLE_SESSION_OPEN_SECS_OF_DAY_IST`,
 /// which is `pub(crate)` there and so cannot be imported. Pinned to the same
@@ -291,7 +293,7 @@ pub const fn floor_to_grid(ts_nanos: i64, period_secs: u64) -> i64 {
 /// the reason the whole alignment exists: a snapshot that lands on a different
 /// grid from the candles cannot be joined to them, and the failure is silent —
 /// the query simply returns fewer rows.
-pub const SNAPSHOT_GRID_ANCHOR_SECS_OF_DAY_IST: i64 = 32_400;
+pub const SNAPSHOT_GRID_ANCHOR_SECS_OF_DAY_IST: i64 = 33_300;
 
 /// Nanoseconds from `now` to the NEXT boundary of a `period_secs` grid.
 ///
@@ -1640,8 +1642,8 @@ mod tests {
     fn the_snapshot_grid_anchor_matches_the_candle_grid_anchor() {
         // `tf_index::CANDLE_SESSION_OPEN_SECS_OF_DAY_IST` is `pub(crate)` in
         // the trading crate, so this pins the same literal that file's own
-        // test pins. 09:00 IST, NOT 09:15 and NOT midnight.
-        assert_eq!(SNAPSHOT_GRID_ANCHOR_SECS_OF_DAY_IST, 32_400);
+        // test pins. 09:15 IST (2026-10-05), NOT 09:00 and NOT midnight.
+        assert_eq!(SNAPSHOT_GRID_ANCHOR_SECS_OF_DAY_IST, 33_300);
     }
 
     /// Every fire must land on a multiple of its period from 09:00.

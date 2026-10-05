@@ -3072,20 +3072,17 @@ mod tests {
     }
 
     /// The bar AFTER 09:15 still compares against the bar before it, and a
-    /// 09:15 packet with no previous close falls back to the old baseline.
+    /// 09:15 packet with no previous close has no baseline (signed positive).
     #[test]
     fn only_the_market_open_bucket_uses_yesterdays_close() {
         let strategy = FeedStrategy::DEFAULT;
         let mut cell = AggregatorCell::empty();
-        let mut pre = tick_at(OPEN - 420, 2843.90, 1_000);
-        pre.day_close = 2827.00;
-        cell.consume_tick(TfIndex::M1, &pre, 1_000, strategy, 1_000);
         let first = tick_at(OPEN, 2841.10, 46_810);
-        cell.consume_tick(TfIndex::M1, &first, 46_810, strategy, 46_810);
-        assert!(
-            (cell.snapshot(TfIndex::M1).bucket_open_prev_close - f32_to_f64_clean(2843.90)).abs()
-                < 1e-9,
-            "no previous close on the packet: the pre-open bar stays the baseline"
+        cell.consume_tick(TfIndex::M1, &first, 0, strategy, 46_810);
+        assert_eq!(
+            cell.snapshot(TfIndex::M1).bucket_open_prev_close,
+            0.0,
+            "no previous close on the packet and no earlier bar today"
         );
         let mut next = tick_at(OPEN + 60, 2830.00, 50_000);
         next.day_close = 2827.00;
