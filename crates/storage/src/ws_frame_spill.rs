@@ -752,7 +752,7 @@ pub const WAL_SPILL_SHUTDOWN_INCOMPLETE_COUNTER: &str = "tv_wal_spill_shutdown_i
 /// NOTE: this is THIS module's own three-variant [`WsType`] (the WAL transport
 /// tag, `LiveFeed`/`OrderUpdate`/`TruedataFeed`), NOT the seven-variant
 /// `tickvault_common::ws_event_types::WsType` used for audit rows.
-const WS_TYPE_COUNT: usize = 3;
+pub(crate) const WS_TYPE_COUNT: usize = 3;
 
 /// Dense index for a [`WsType`], used only to address the pre-resolved counter
 /// tables in [`SpillDropCounters`].
@@ -761,7 +761,7 @@ const WS_TYPE_COUNT: usize = 3;
 /// `crates/common`: the index is an implementation detail of THIS module's
 /// counter tables, and widening `crates/common` would escalate every change
 /// here to a workspace-wide test run for no behavioural gain.
-const fn ws_type_index(ws_type: WsType) -> usize {
+pub(crate) const fn ws_type_index(ws_type: WsType) -> usize {
     // Exhaustive by construction — no `_` arm, so adding a `WsType` variant
     // fails THIS match at compile time rather than silently folding the new
     // transport's losses into another variant's counter.
@@ -814,7 +814,7 @@ pub const REFUSAL_LINE_STRIDE: u64 = 1 << 20;
 
 /// Every [`WsType`], in [`ws_type_index`] order — the build order for the
 /// counter tables. Kept beside the index so the two cannot drift.
-const WS_TYPES_BY_INDEX: [WsType; WS_TYPE_COUNT] =
+pub(crate) const WS_TYPES_BY_INDEX: [WsType; WS_TYPE_COUNT] =
     [WsType::LiveFeed, WsType::OrderUpdate, WsType::TruedataFeed];
 
 /// Loss counters resolved ONCE at construction, one handle per `WsType`.
@@ -1168,6 +1168,9 @@ impl WsFrameSpill {
         // fires once, on the bad boot, which is precisely the shape the agent's
         // first-sample rule swallows.
         metrics::counter!(WAL_REPLAY_RESTORE_FAILED_COUNTER).increment(0);
+        // Audit M1: the shed-then-lost counters, resolved before any socket
+        // dials so the reader's shed arm never allocates.
+        crate::wal_frame_fate::pre_register();
 
         let writer = thread::Builder::new()
             .name(WAL_WRITER_THREAD_NAME.to_string()) // APPROVED: one-shot constructor (thread name)
@@ -1659,6 +1662,22 @@ impl WsFrameSpill {
                     queued,
                     "WAL spill writer did not exit within the shutdown budget — abandoning it"
                 );
+                // Audit M1: what it still held never reaches the disk. A frame the
+                // reader or the drain shed above the last flush is a lost frame.
+                let (shed_ring, shed_drain) = crate::wal_frame_fate::frame_fate()
+                    .count_unflushed_sheds(
+                        crate::wal_frame_fate::flushed_high_seq(),
+                        WsType::LiveFeed,
+                    );
+                if shed_ring > 0 || shed_drain > 0 {
+                    error!(
+                        code = ErrorCode::WsSpill02FrameDropped.code_str(),
+                        shed_ring_lost = shed_ring,
+                        shed_drain_lost = shed_drain,
+                        "CRITICAL: the WAL writer was abandoned at shutdown holding frames \
+                         the reader or the drain had shed — those frames are lost"
+                    );
+                }
             }
         }
 
@@ -2145,6 +2164,7 @@ fn finalise_segment(
     }
     // Everything counted is in the kernel, and this segment takes no more
     // records: the next one starts its byte count at zero.
+    tally.flushed();
     tally.new_segment();
     if resolve_wal_fsync_interval().is_none() {
         return;
@@ -2187,14 +2207,23 @@ pub const WAL_UNFLUSHED_LOST_COUNTER: &str = "tv_ws_frame_spill_unflushed_lost_t
 /// Fixed size, built once per writer start: no allocation per record.
 /// O(1) per record; the failure path walks at most `UNFLUSHED_TALLY_CAPACITY`
 /// offsets, once per failure.
+///
+/// 2026-10-04 (audit M1): each entry also keeps the record's sequence and
+/// socket type, so a lost record is reported to `wal_frame_fate`, which
+/// counts it as a lost frame when the reader or the drain had shed it; and a
+/// good flush reports the highest sequence it covered.
 struct UnflushedTally<'a> {
     persisted: &'a AtomicU64,
     /// Bytes of counted records written to the current segment so far.
     segment_bytes: u64,
     ends: [u64; UNFLUSHED_TALLY_CAPACITY],
+    seqs: [u64; UNFLUSHED_TALLY_CAPACITY],
+    ws_types: [WsType; UNFLUSHED_TALLY_CAPACITY],
     len: usize,
     /// Records written past the capacity; on a loss they are counted lost.
     untracked: u64,
+    /// Highest sequence written since the last good flush.
+    high_seq: u64,
 }
 
 impl<'a> UnflushedTally<'a> {
@@ -2205,17 +2234,29 @@ impl<'a> UnflushedTally<'a> {
             persisted,
             segment_bytes: 0,
             ends: [0; UNFLUSHED_TALLY_CAPACITY],
+            seqs: [0; UNFLUSHED_TALLY_CAPACITY],
+            ws_types: [WsType::LiveFeed; UNFLUSHED_TALLY_CAPACITY],
             len: 0,
             untracked: 0,
+            high_seq: 0,
         }
     }
 
-    /// A record of `size` bytes went into the buffer and was counted.
-    fn note_written(&mut self, size: u64) {
+    /// A record of `size` bytes, sequence `seq`, went into the buffer and was
+    /// counted.
+    fn note_written(&mut self, size: u64, seq: u64, ws_type: WsType) {
         self.persisted.fetch_add(1, Ordering::Relaxed);
         self.segment_bytes = self.segment_bytes.saturating_add(size);
-        if let Some(slot) = self.ends.get_mut(self.len) {
-            *slot = self.segment_bytes;
+        self.high_seq = self.high_seq.max(seq);
+        let i = self.len;
+        if let (Some(end), Some(s), Some(t)) = (
+            self.ends.get_mut(i),
+            self.seqs.get_mut(i),
+            self.ws_types.get_mut(i),
+        ) {
+            *end = self.segment_bytes;
+            *s = seq;
+            *t = ws_type;
             self.len += 1;
         } else {
             self.untracked = self.untracked.saturating_add(1);
@@ -2224,14 +2265,24 @@ impl<'a> UnflushedTally<'a> {
 
     /// The buffer reached the kernel: nothing written so far can be lost to it.
     fn flushed(&mut self) {
-        self.len = 0;
-        self.untracked = 0;
+        if self.high_seq != 0 {
+            crate::wal_frame_fate::note_flushed_through(self.high_seq);
+        }
+        self.forget();
     }
 
-    /// A new segment starts (or the old one is abandoned).
+    /// Forgets every entry, without claiming they reached the kernel.
+    fn forget(&mut self) {
+        self.len = 0;
+        self.untracked = 0;
+        self.high_seq = 0;
+    }
+
+    /// A new segment starts. The caller has either flushed the old one
+    /// (`flushed`) or counted its losses (`discard_segment_writer`).
     fn new_segment(&mut self) {
         self.segment_bytes = 0;
-        self.flushed();
+        self.forget();
     }
 
     /// How many records written since the last good flush end past
@@ -2246,6 +2297,44 @@ impl<'a> UnflushedTally<'a> {
         // O(1) EXEMPT: end
         lost.saturating_add(self.untracked)
     }
+
+    /// Reports every record ending past `on_disk` to `wal_frame_fate` as lost.
+    /// Returns `(shed ring, shed drain, fate unknown)`. Failure path only.
+    fn report_lost_fates(&self, on_disk: u64) -> (u64, u64, u64) {
+        let fate = crate::wal_frame_fate::frame_fate();
+        let (mut ring, mut drain, mut unknown) = (0u64, 0u64, 0u64);
+        if on_disk < self.segment_bytes {
+            let n = self.len;
+            // O(1) EXEMPT: begin — failure path only, at most UNFLUSHED_TALLY_CAPACITY entries
+            for ((end, seq), ws_type) in self.ends[..n]
+                .iter()
+                .zip(&self.seqs[..n])
+                .zip(&self.ws_types[..n])
+            {
+                if *end <= on_disk {
+                    continue;
+                }
+                match fate.note_lost(*seq, *ws_type) {
+                    crate::wal_frame_fate::LostFate::WasShed(
+                        crate::wal_frame_fate::ShedKind::Ring,
+                    ) => ring += 1,
+                    crate::wal_frame_fate::LostFate::WasShed(
+                        crate::wal_frame_fate::ShedKind::DrainDepth,
+                    ) => drain += 1,
+                    crate::wal_frame_fate::LostFate::Unknown => unknown += 1,
+                    crate::wal_frame_fate::LostFate::NotShed => {}
+                }
+            }
+            // O(1) EXEMPT: end
+            // Records past the tally's capacity were written after every
+            // tracked one, so they are lost only when the file ends short.
+            if self.untracked > 0 {
+                crate::wal_frame_fate::note_lost_untracked(self.untracked);
+                unknown = unknown.saturating_add(self.untracked);
+            }
+        }
+        (ring, drain, unknown)
+    }
 }
 
 /// Drops a segment writer whose write or flush failed, WITHOUT a second flush,
@@ -2259,6 +2348,9 @@ fn discard_segment_writer(w: BufWriter<File>, tally: &mut UnflushedTally<'_>, st
     let (file, _unwritten) = w.into_parts();
     let on_disk = file.metadata().map_or(0, |m| m.len());
     let lost = tally.lost_beyond(on_disk);
+    // Audit M1: a lost record the reader or the drain had shed is a lost
+    // frame; `wal_frame_fate` counts it on the tick-loss counter.
+    let (shed_ring, shed_drain, fate_unknown) = tally.report_lost_fates(on_disk);
     tally.new_segment();
     if lost == 0 {
         return;
@@ -2275,6 +2367,9 @@ fn discard_segment_writer(w: BufWriter<File>, tally: &mut UnflushedTally<'_>, st
         code = ErrorCode::WsSpill02FrameDropped.code_str(),
         stage,
         lost_records = lost,
+        shed_ring_lost = shed_ring,
+        shed_drain_lost = shed_drain,
+        fate_unknown,
         on_disk_bytes = on_disk,
         "CRITICAL: WAL segment write failed — records already counted as persisted never \
          reached the file and are lost"
@@ -2296,7 +2391,16 @@ fn discard_segment_writer(w: BufWriter<File>, tally: &mut UnflushedTally<'_>, st
 /// one it replaces. Since Z11d `main` closes the sockets before the WAL, so
 /// this should read zero on every clean stop.
 fn count_records_left_at_writer_exit(rx: &Receiver<WalRecord>) -> usize {
-    let left = rx.try_iter().count();
+    // Audit M1: each record left behind is reported lost, so a shed frame
+    // among them is counted as a lost frame.
+    let fate = crate::wal_frame_fate::frame_fate();
+    let mut left = 0usize;
+    // O(1) EXEMPT: begin — once, at writer exit, bounded by the channel capacity
+    for r in rx.try_iter() {
+        let _fate = fate.note_lost(r.frame_seq, r.ws_type);
+        left += 1;
+    }
+    // O(1) EXEMPT: end
     if left > 0 {
         metrics::counter!(WAL_SPILL_SHUTDOWN_INCOMPLETE_COUNTER).increment(left as u64);
         error!(
@@ -2671,6 +2775,9 @@ fn persist_record_resilient(
             "stage" => "no_segment"
         )
         .increment(1);
+        // Audit M1: this record is lost; if the reader or the drain shed its
+        // frame, that is a lost frame, counted by `wal_frame_fate`.
+        let _fate = crate::wal_frame_fate::frame_fate().note_lost(r.frame_seq, r.ws_type);
         // BACKOFF (2026-08-24, audit): the two SIBLING I/O failure arms — the
         // flush arm and the `write_record` arm below — both sleep
         // `WAL_WRITER_IO_RETRY_BACKOFF` before returning. This one did not, and
@@ -2694,11 +2801,14 @@ fn persist_record_resilient(
     match write_record(w, r) {
         Ok(()) => {
             let size = record_disk_size(r);
-            tally.note_written(size);
+            tally.note_written(size, r.frame_seq, r.ws_type);
             size
         }
         Err(err) => {
             report_io_error("write_record", &err);
+            // Audit M1: this record is not in the tally (it never counted as
+            // written), so its fate is reported here.
+            let _fate = crate::wal_frame_fate::frame_fate().note_lost(r.frame_seq, r.ws_type);
             // Drop the possibly-corrupt writer without a second flush; the
             // records it still held are counted as lost. Reopen on the next
             // record.
@@ -7565,13 +7675,13 @@ mod tests {
         };
         for seq in 1..=3 {
             write_record(&mut w, &record(seq)).unwrap();
-            tally.note_written(record_disk_size(&record(seq)));
+            tally.note_written(record_disk_size(&record(seq)), seq, WsType::LiveFeed);
         }
         w.flush().unwrap();
         tally.flushed();
         for seq in 4..=5 {
             write_record(&mut w, &record(seq)).unwrap();
-            tally.note_written(record_disk_size(&record(seq)));
+            tally.note_written(record_disk_size(&record(seq)), seq, WsType::LiveFeed);
         }
         assert_eq!(persisted.load(Ordering::Relaxed), 5);
         let path = wal_files_in(&dir).pop().expect("one segment");
@@ -7590,12 +7700,89 @@ mod tests {
             "the discarded buffer must not be flushed on the way out"
         );
         // A partial write counts the record it cut in half as lost too.
-        tally.note_written(size);
-        tally.note_written(size);
+        tally.note_written(size, 0, WsType::LiveFeed);
+        tally.note_written(size, 0, WsType::LiveFeed);
         assert_eq!(tally.lost_beyond(size + 1), 1);
         assert_eq!(tally.lost_beyond(size - 1), 2);
         assert_eq!(tally.lost_beyond(2 * size), 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Audit M1 (2026-10-04): a buffered record lost with its segment writer
+    /// is reported to the frame-fate table, so a frame the reader had shed at
+    /// the ring is counted as a lost frame, and a frame the drain later tries
+    /// to shed is refused. A record that reached the file is not reported.
+    ///
+    /// Bite: before M1 the tally kept only byte offsets, so `discard` could
+    /// not name the lost records and both assertions on the fate fail.
+    #[test]
+    fn test_discarded_writer_reports_a_shed_frame_as_lost() {
+        use crate::wal_frame_fate::{LostFate, ShedKind, ShedMark, frame_fate};
+        // Bases above any wall-clock base (~2^43.6 in 2026), so a real loss
+        // another test reports into the process-wide table cannot hold the
+        // slot as a newer frame.
+        let seq = |b: u64| ((1u64 << 46) + b) << PACKET_INDEX_BITS;
+        let dir = tmp_dir("discard-fate");
+        let persisted = AtomicU64::new(0);
+        let mut tally = UnflushedTally::new(&persisted);
+        let mut w = open_new_segment(&dir).unwrap();
+        let record = |s: u64| WalRecord {
+            ws_type: WsType::LiveFeed,
+            frame_seq: s,
+            received_at_nanos: 1_000,
+            endpoint: WalEndpoint::MainFeed,
+            frame: Bytes::from(vec![7u8; 40]),
+        };
+        // Base 1 reaches the file; bases 2 and 3 stay buffered.
+        write_record(&mut w, &record(seq(1))).unwrap();
+        tally.note_written(record_disk_size(&record(seq(1))), seq(1), WsType::LiveFeed);
+        w.flush().unwrap();
+        tally.flushed();
+        assert!(crate::wal_frame_fate::flushed_high_seq() >= seq(1));
+        for b in [2, 3] {
+            write_record(&mut w, &record(seq(b))).unwrap();
+            tally.note_written(record_disk_size(&record(seq(b))), seq(b), WsType::LiveFeed);
+        }
+        assert_eq!(
+            frame_fate().note_shed(seq(2), ShedKind::Ring, WsType::LiveFeed),
+            ShedMark::Marked
+        );
+
+        discard_segment_writer(w, &mut tally, "test");
+
+        // Base 2 was shed: its loss was counted, and a second report is not.
+        assert_eq!(
+            frame_fate().note_lost(seq(2), WsType::LiveFeed),
+            LostFate::NotShed
+        );
+        // Base 3 was not shed, but its loss is recorded: the drain may not
+        // shed it now.
+        assert!(!frame_fate().allow_drain_shed(seq(3), WsType::LiveFeed));
+        // Base 1 reached the file: still sheddable.
+        assert!(frame_fate().allow_drain_shed(seq(1), WsType::LiveFeed));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Audit M1: a record the writer could not place in any segment is
+    /// reported lost, and so is every record left in the channel at exit.
+    #[test]
+    fn test_records_left_at_writer_exit_are_reported_lost() {
+        use crate::wal_frame_fate::frame_fate;
+        let seq = ((1u64 << 46) + 100) << PACKET_INDEX_BITS;
+        let (tx, rx) = crossbeam_channel::bounded(4);
+        tx.send(WalRecord {
+            ws_type: WsType::LiveFeed,
+            frame_seq: seq,
+            received_at_nanos: 1_000,
+            endpoint: WalEndpoint::MainFeed,
+            frame: Bytes::from_static(b"x"),
+        })
+        .unwrap();
+        assert_eq!(count_records_left_at_writer_exit(&rx), 1);
+        assert!(
+            !frame_fate().allow_drain_shed(seq, WsType::LiveFeed),
+            "a record left in the channel is lost; its frame must not be shed"
+        );
     }
 
     /// 2026-10-02: a wall-clock step back re-anchors receipts instead of

@@ -766,6 +766,13 @@ fn ist_date_filename(now_unix_secs: i64) -> String {
 /// [`ist_date_filename`] (which formats the same IST-shifted epoch as a UTC
 /// calendar date); pinned by
 /// `test_ist_day_number_agrees_with_ist_date_filename_across_boundaries`.
+/// Syncs a directory, so the entries created in it (a new day file, a new
+/// sub-directory) survive a power cut. Cold: once per created file, off any
+/// append lock.
+pub(crate) fn sync_directory(dir: &Path) -> std::io::Result<()> {
+    File::open(dir)?.sync_all()
+}
+
 pub(crate) fn ist_day_number(now_unix_secs: i64) -> i64 {
     now_unix_secs
         .saturating_add(i64::from(IST_UTC_OFFSET_SECONDS))
@@ -783,6 +790,13 @@ struct OpenSpillFile {
 struct SpillState {
     /// Long-lived append handle for the current IST day (2026-08-10).
     open: Option<OpenSpillFile>,
+    /// The previous IST day's handle, closed by a rotation and not yet
+    /// synced. The rotation only moves it here (the append path never waits
+    /// for the device); the escalation thread syncs and drops it in
+    /// [`SealSpillWriter::sync_open_file`]. At most one: a second rotation
+    /// before any sync closes the older one unsynced, which is the same
+    /// exposure the open file has until its own first sync.
+    rotated: Option<File>,
     /// The fullest copy of each bar on disk and in the database. See
     /// [`crate::seal_spill_ledger`].
     ledger: SpillLedger,
@@ -901,13 +915,27 @@ pub struct SealSpillWriter {
     /// affordable.
     err_no_handle: metrics::Counter,
     err_write: metrics::Counter,
-    /// Pre-resolved handle for a failed `sync_data` (PR17). The day-rotation
-    /// sync in `current_file` is reachable from the drain's inline fallback,
-    /// so it is resolved for the same reason as the two above.
+    /// Pre-resolved handle for a failed `sync_data` (PR17). Only the
+    /// escalation thread syncs, but the handle is resolved once like the two
+    /// above rather than per failure.
     err_sync: metrics::Counter,
     /// `true` while the last sync of the open day file failed, so a failing
     /// disk logs one `error!` per episode rather than one per sync (PR17).
     sync_failing: AtomicBool,
+    /// A day file (or the spill directory itself) was created and its
+    /// directory entry is not synced yet. Set by `open_append_handle`
+    /// (one `fstat` per open, no sync), cleared by `sync_open_file`, which
+    /// syncs the directory off the lock (2026-10-04: a new day file's entry
+    /// was never synced, so a power cut could lose the whole file even after
+    /// its data was synced).
+    dir_unsynced: AtomicBool,
+    /// The open day file was appended to since the last sync. Set under the
+    /// append lock by `current_file`, taken by `sync_open_file`, so a writer
+    /// that calls `sync_open_file` every cycle (the seal writer task, after
+    /// an outage spilled) syncs only when there is something to sync.
+    data_unsynced: AtomicBool,
+    /// The spill directory itself was created: its parent's entry too.
+    parent_unsynced: AtomicBool,
     superseded: SupersededCounters,
 }
 
@@ -931,6 +959,7 @@ impl SealSpillWriter {
             spill_dir,
             state: Mutex::new(SpillState {
                 open: None,
+                rotated: None,
                 ledger: SpillLedger::with_capacity(SEAL_SPILL_LEDGER_CAPACITY),
                 mirror_scratch: Vec::new(),
                 mirror_seals: Vec::new(),
@@ -944,6 +973,9 @@ impl SealSpillWriter {
             err_write: metrics::counter!(SPILL_WRITE_ERRORS_COUNTER, "stage" => "write"),
             err_sync: metrics::counter!(SEAL_SPILL_SYNC_FAILED_COUNTER),
             sync_failing: AtomicBool::new(false),
+            data_unsynced: AtomicBool::new(false),
+            dir_unsynced: AtomicBool::new(false),
+            parent_unsynced: AtomicBool::new(false),
             superseded: SupersededCounters::resolve(),
         }
     }
@@ -981,23 +1013,67 @@ impl SealSpillWriter {
     /// synced, so a power loss could take seals it had reported written).
     ///
     /// Called by the escalation thread (`tv-seal-escalate`) after it writes,
-    /// never by `append_seal`, which the frame drain's inline fallback can
-    /// reach. The lock is held only to duplicate the handle (`try_clone`, one
-    /// `dup`), never across the `sync_data`, so an append is never made to
-    /// wait for the device. No open file is a no-op.
+    /// and by the seal writer task after every cycle (2026-10-04: seals it
+    /// spilled during a database outage were never synced), never by
+    /// `append_seal`, which the frame drain's inline fallback can reach. The
+    /// lock is held only to take the previous day's handle a rotation left
+    /// behind, to duplicate the open one (`try_clone`, one `dup`) when it was
+    /// appended to since the last sync, and to take the directory flags,
+    /// never across a sync, so an append is never made to wait for the
+    /// device. Then the directory entries of a day file or spill directory
+    /// created since the last call are synced too. Nothing pending is one
+    /// lock and three atomic swaps.
     ///
-    /// Returns `true` when there was nothing to sync or the sync succeeded.
+    /// Returns `true` when there was nothing to sync or every sync succeeded.
     /// A failure is counted on `tv_seal_spill_sync_failed_total` and logged
     /// once per failing episode.
     pub(crate) fn sync_open_file(&self) -> bool {
-        let handle = {
-            let state = self.lock_state();
-            match state.open.as_ref() {
-                Some(open) => open.file.try_clone(),
-                None => return true,
-            }
+        let (rotated, handle, dir, parent) = {
+            let mut state = self.lock_state();
+            let rotated = state.rotated.take();
+            // The flags are set under this lock (by `current_file` and the
+            // `open_append_handle` it calls), so taking them here pairs each
+            // with the handle it was set for. A file with no append since the
+            // last sync is not synced again.
+            let handle = if self.data_unsynced.swap(false, Ordering::Relaxed) {
+                state.open.as_ref().map(|open| open.file.try_clone())
+            } else {
+                None
+            };
+            let dir = self.dir_unsynced.swap(false, Ordering::Relaxed);
+            let parent = self.parent_unsynced.swap(false, Ordering::Relaxed);
+            (rotated, handle, dir, parent)
         };
-        let outcome = handle.and_then(|file| file.sync_data());
+        if rotated.is_none() && handle.is_none() && !dir && !parent {
+            return true;
+        }
+        // The previous day's file first: its last seals are the oldest
+        // unsynced ones. It is dropped (closed) here, off the lock.
+        let rotated_outcome = rotated.map_or(Ok(()), |file| file.sync_data());
+        let open_outcome = handle
+            .map_or(Ok(()), |file| file.and_then(|file| file.sync_data()))
+            .inspect_err(|_| {
+                self.data_unsynced.store(true, Ordering::Relaxed);
+            });
+        // Then the directory entries of a file (or directory) created since
+        // the last call. A failure is put back for the next call.
+        let dir_outcome = if dir {
+            sync_directory(&self.spill_dir).inspect_err(|_| {
+                self.dir_unsynced.store(true, Ordering::Relaxed);
+            })
+        } else {
+            Ok(())
+        };
+        let parent_outcome = match self.spill_dir.parent() {
+            Some(parent_dir) if parent => sync_directory(parent_dir).inspect_err(|_| {
+                self.parent_unsynced.store(true, Ordering::Relaxed);
+            }),
+            _ => Ok(()),
+        };
+        let outcome = rotated_outcome
+            .and(open_outcome)
+            .and(dir_outcome)
+            .and(parent_outcome);
         match outcome {
             Ok(()) => {
                 self.sync_failing.store(false, Ordering::Relaxed);
@@ -1019,6 +1095,17 @@ impl SealSpillWriter {
         }
     }
 
+    /// Test probe: is anything written or created since the last sync?
+    #[cfg(test)]
+    // TEST-EXEMPT: test-only probe, exercised by the sync tests
+    pub(crate) fn has_unsynced_writes(&self) -> bool {
+        let state = self.lock_state();
+        state.rotated.is_some()
+            || self.data_unsynced.load(Ordering::Relaxed)
+            || self.dir_unsynced.load(Ordering::Relaxed)
+            || self.parent_unsynced.load(Ordering::Relaxed)
+    }
+
     /// Opens (creating as needed) the append handle for `path`.
     ///
     /// Still calls `create_dir_all` — the chaos suite injects "spill disk
@@ -1027,13 +1114,23 @@ impl SealSpillWriter {
     /// tier-3 DLQ escalation (`chaos_seal_disk_full_dlq_capture.rs`). Moving
     /// it off the per-append path did NOT move it off the per-OPEN path.
     fn open_append_handle(&self, path: &Path) -> Result<File> {
+        if !self.spill_dir.is_dir() {
+            self.parent_unsynced.store(true, Ordering::Relaxed);
+        }
         std::fs::create_dir_all(&self.spill_dir)
             .with_context(|| format!("failed to create spill dir {:?}", self.spill_dir))?;
-        std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)
-            .with_context(|| format!("failed to open spill file {path:?}"))
+            .with_context(|| format!("failed to open spill file {path:?}"))?;
+        // An empty file was (almost always) just created, so its directory
+        // entry must reach the device too. A false positive costs one extra
+        // directory sync. Once per open (once per IST day), never per seal.
+        if file.metadata().map_or(true, |meta| meta.len() == 0) {
+            self.dir_unsynced.store(true, Ordering::Relaxed);
+        }
+        Ok(file)
     }
 
     /// Returns the path of the spill file for the given UTC unix
@@ -1088,6 +1185,7 @@ impl SealSpillWriter {
         let mut state = self.lock_state();
         let SpillState {
             open,
+            rotated,
             ledger,
             epoch,
             ..
@@ -1106,7 +1204,7 @@ impl SealSpillWriter {
         // Rotate only when the IST day actually changed (or nothing is open
         // yet, incl. after a write error dropped the handle). The check is an
         // integer compare — no filename is built on the steady-state path.
-        let current = self.current_file(open, now_unix_secs)?;
+        let current = self.current_file(open, rotated, now_unix_secs)?;
 
         // ONE `write(2)`. The file is unbuffered by design: the previous
         // implementation's `BufWriter::flush()` bought exactly this syscall
@@ -1153,23 +1251,20 @@ impl SealSpillWriter {
     fn current_file<'s>(
         &self,
         open: &'s mut Option<OpenSpillFile>,
+        rotated: &mut Option<File>,
         now_unix_secs: i64,
     ) -> Result<&'s mut OpenSpillFile> {
         let day = ist_day_number(now_unix_secs);
         if open.as_ref().is_none_or(|current| current.ist_day != day) {
-            // Close the previous day's handle BEFORE opening the next, so a
-            // rotation never holds two descriptors. PR17: sync it first, so the
-            // last seals of the day are on the device and not only in the page
-            // cache (the escalation thread syncs only the handle it finds open).
-            // Best effort and once per IST day, at midnight, outside the
-            // session. It can run on the drain's inline fallback (an error
-            // path) and then waits for the device once; a failure is counted.
-            if let Some(previous) = open.as_ref()
-                && previous.file.sync_data().is_err()
-            {
-                self.err_sync.increment(1);
+            // PR17: the previous day's last seals must reach the device, but
+            // this runs under the append lock and can be reached from the
+            // drain's inline fallback, so it never syncs here. The handle is
+            // moved to `rotated` (no syscall) and the escalation thread syncs
+            // and closes it off the lock in `sync_open_file`. Until then the
+            // rotation holds two descriptors.
+            if let Some(previous) = open.take() {
+                *rotated = Some(previous.file);
             }
-            *open = None;
             let path = self.spill_path(now_unix_secs);
             let mut file = self.open_append_handle(&path)?;
             // Audit PR41c: a file left with a torn tail (a crash mid-write,
@@ -1221,7 +1316,13 @@ impl SealSpillWriter {
             *open = Some(OpenSpillFile { ist_day: day, file });
         }
         match open.as_mut() {
-            Some(current) => Ok(current),
+            Some(current) => {
+                // Every append goes through here, under the append lock: mark
+                // the open file as holding bytes the next `sync_open_file` must
+                // sync. One relaxed store, no syscall.
+                self.data_unsynced.store(true, Ordering::Relaxed);
+                Ok(current)
+            }
             None => {
                 // Structurally unreachable: the branch above either populated
                 // the slot or returned Err. Refuse loudly rather than assume.
@@ -1358,6 +1459,7 @@ impl SealSpillWriter {
         let mut state = self.lock_state();
         let SpillState {
             open,
+            rotated,
             ledger,
             epoch,
             ..
@@ -1377,7 +1479,7 @@ impl SealSpillWriter {
         if scratch.is_empty() {
             return Ok(());
         }
-        let current = self.current_file(open, now_unix_secs)?;
+        let current = self.current_file(open, rotated, now_unix_secs)?;
         let before = match current.file.metadata() {
             // Audit PR41c: the batch starts on a record boundary. The day
             // file was cut back when it was opened and every failed write
@@ -1479,6 +1581,7 @@ impl SealSpillWriter {
         let mut state = self.lock_state();
         let SpillState {
             open,
+            rotated,
             ledger,
             mirror_scratch,
             mirror_seals,
@@ -1504,12 +1607,14 @@ impl SealSpillWriter {
         if appended == 0 {
             return 0;
         }
-        let written = self.current_file(open, now_unix_secs).and_then(|current| {
-            current
-                .file
-                .write_all(mirror_scratch)
-                .context("failed to append fuller live copies to the seal spill")
-        });
+        let written = self
+            .current_file(open, rotated, now_unix_secs)
+            .and_then(|current| {
+                current
+                    .file
+                    .write_all(mirror_scratch)
+                    .context("failed to append fuller live copies to the seal spill")
+            });
         if let Err(err) = written {
             // The handle may be broken; the next append reopens it, and the
             // open cuts a torn tail back to a whole record (audit PR41c).
@@ -1876,6 +1981,9 @@ pub struct SpillPruneOutcome {
     /// and seals skipped as unrecovered stay there, and those files are their
     /// only copy. A delete is lossless only with a verified cold copy; see
     /// [`Self::archive_deleted_without_copy`].
+    /// Since PR40b-f (2026-10-04) a file with such a record moves to
+    /// `refused/` instead and is never deleted; files `archive/` held before
+    /// that keep the rule above.
     pub archive_deleted: usize,
     /// Of every delete this sweep (any folder), how many had a verified copy
     /// in the cold bucket (`[raw_frame_archive] require_upload_before_prune`
@@ -1896,7 +2004,16 @@ pub struct SpillPruneOutcome {
     /// (PR40b-f). Before that, an aged file is a file the replay has not
     /// tried yet, not a file it failed to drain.
     pub held_before_boot_drain: usize,
+    /// Files in `refused/` (PR40b-f): never deleted at any age, because they
+    /// hold seals a recovery path gave up on and are those seals' only copy.
+    /// Their bytes are in `bytes_after`.
+    pub refused_kept: usize,
 }
+
+/// Gauge: files in the spill folder's `refused/` (PR40b-f). They hold seals
+/// the boot drain or the replay gave up on and are never deleted; each was
+/// already paged when it was moved there. Set by every retention sweep.
+pub const SEAL_SPILL_REFUSED_FILES_GAUGE: &str = "tv_seal_spill_refused_files";
 
 /// Counter: aged seal-spill files the retention sweep KEPT because no
 /// verified cold copy is recorded for them (plan item 45e-1). The sweep logs
@@ -2036,7 +2153,34 @@ fn prune_spill_files_inner(
         false,
         &mut outcome,
     );
+    // PR40b-f: `refused/` is never pruned, at any age and whatever the copy
+    // gate says. It is only measured, so `tv_seal_spill_bytes` sees it.
+    count_kept_refused(
+        &spill_dir.join(crate::seal_writer_task::SEAL_REFUSED_SUBDIR),
+        &mut outcome,
+    );
     outcome
+}
+
+/// Counts the files in `refused/` and their bytes, deleting nothing
+/// (PR40b-f). O(files), on the cold retention sweep.
+fn count_kept_refused(dir: &Path, outcome: &mut SpillPruneOutcome) {
+    // O(1) EXEMPT: periodic cold retention sweep, never the per-seal append
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return; // missing dir: nothing was ever refused
+    };
+    for entry in entries.flatten() {
+        let is_record = entry.file_name().to_str().is_some_and(is_seal_file_name);
+        if !is_record {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata()
+            && meta.is_file()
+        {
+            outcome.refused_kept += 1;
+            outcome.bytes_after = outcome.bytes_after.saturating_add(meta.len());
+        }
+    }
 }
 
 /// `name` without the copy suffixes the spill tier adds when it renames a
@@ -2065,6 +2209,18 @@ pub(crate) fn strip_copy_suffixes(name: &str) -> &str {
 #[must_use]
 pub(crate) fn is_spill_record_name(name: &str) -> bool {
     strip_copy_suffixes(name).ends_with(".bin")
+}
+
+/// A spill record file, or a staged dead-letter copy (`seals_v4-*.ndjson`,
+/// legacy `seals-*.ndjson`, and their renamed copies), which `archive/` and
+/// `refused/` can hold: the boot drain and the replay move a staged file
+/// there whatever its kind. PR40b-f. O(suffixes), cold.
+#[must_use]
+pub(crate) fn is_seal_file_name(name: &str) -> bool {
+    is_spill_record_name(name)
+        || ((name.starts_with(crate::seal_writer_task::SEAL_FILE_PREFIX)
+            || name.starts_with(crate::seal_writer_task::LEGACY_SEAL_FILE_PREFIX))
+            && strip_copy_suffixes(name).ends_with(".ndjson"))
 }
 
 /// Spill directories whose boot drain has run in this process (PR40b-f).
@@ -2259,6 +2415,10 @@ pub fn prune_spill_files(
              has read them"
         );
     }
+    // PR40b-f: files held for good in refused/, so a growing pile is seen.
+    // APPROVED: cast — a file count, far below f64 precision loss.
+    #[allow(clippy::cast_precision_loss)] // APPROVED: a file count, far below 2^52
+    metrics::gauge!(SEAL_SPILL_REFUSED_FILES_GAUGE).set(outcome.refused_kept as f64);
     // APPROVED: cast — a per-pass file count, always <= u64.
     metrics::counter!(SEAL_SPILL_PRUNE_REFUSED_NOT_UPLOADED_COUNTER)
         .increment(outcome.refused_not_uploaded as u64);
@@ -2711,11 +2871,12 @@ mod tests {
 
     #[test]
     fn the_drain_reachable_append_never_syncs_and_the_sync_holds_no_lock() {
-        // PR17: `append_seal` is reachable from the frame drain's inline
-        // fallback, so it must not wait for the device on every seal; only
-        // the day rotation (once a day, at midnight) syncs there. And the
-        // escalation thread's sync must not hold the append lock, or an
-        // inline append would wait for it.
+        // PR17: `append_seal` and the day rotation in `current_file` run under
+        // the append lock and are reachable from the frame drain's inline
+        // fallback, so neither may wait for the device. The escalation
+        // thread's `sync_open_file` is the only place that syncs, and it must
+        // not hold the append lock while it does, or an inline append would
+        // wait for it.
         let src = include_str!("seal_spill.rs");
         // Each body runs to the next doc comment at item indent (no brace
         // literals here: the banned-pattern scanner counts braces).
@@ -2732,9 +2893,14 @@ mod tests {
             !append.contains("sync_data") && !append.contains("sync_open_file"),
             "append_seal must never sync per seal"
         );
+        let rotation = body("fn current_file<'s>(");
+        assert!(
+            !rotation.contains("sync_data") && !rotation.contains("sync_all"),
+            "the day rotation runs under the append lock and must never sync"
+        );
         let sync = body("pub(crate) fn sync_open_file(");
         let lock_scope_end = sync
-            .find("let outcome")
+            .find("let rotated_outcome")
             .unwrap_or_else(|| panic!("the lock must be released before the sync"));
         assert!(
             sync[lock_scope_end..].contains("sync_data"),
@@ -2744,6 +2910,100 @@ mod tests {
             !sync[..lock_scope_end].contains("sync_data"),
             "sync_data must not run under the append lock"
         );
+        // Every sync call in this file is the one in `sync_open_file`. The
+        // needle is built at run time so this test does not count itself.
+        let call = [".sync", "_data("].concat();
+        assert_eq!(
+            src.matches(call.as_str()).count(),
+            sync[lock_scope_end..].matches(call.as_str()).count(),
+            "only sync_open_file may sync the spill files"
+        );
+    }
+
+    #[test]
+    fn test_sync_open_file_syncs_only_new_writes_and_new_directory_entries() {
+        // 2026-10-04: the seal writer task now calls `sync_open_file` every
+        // cycle, so it must sync only what was written since the last call,
+        // and a new day file's directory entry (and a new spill directory's)
+        // must reach the device too.
+        let root = temp_spill_dir("sync-dir-entries");
+        let dir = root.join("spill");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        assert!(writer.sync_open_file(), "nothing written is a clean no-op");
+        assert!(!writer.has_unsynced_writes());
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
+            .single()
+            .unwrap_or_else(|| panic!("valid"))
+            .timestamp();
+        writer
+            .append_seal(&mk_seal(13, 0, 0, 1_716_000_900, 100.0), now)
+            .unwrap_or_else(|err| panic!("append: {err}"));
+        assert!(writer.data_unsynced.load(Ordering::Relaxed));
+        assert!(writer.dir_unsynced.load(Ordering::Relaxed), "new day file");
+        assert!(
+            writer.parent_unsynced.load(Ordering::Relaxed),
+            "new spill directory"
+        );
+        assert!(writer.sync_open_file(), "file and both entries must sync");
+        assert!(
+            !writer.has_unsynced_writes(),
+            "a clean sync clears every flag"
+        );
+        assert!(writer.sync_open_file(), "nothing new: a no-op");
+        // A later append to the same, non-empty file needs the file only.
+        writer
+            .append_seal(&mk_seal(25, 0, 4, 1_716_001_500, 200.0), now)
+            .unwrap_or_else(|err| panic!("append again: {err}"));
+        assert!(writer.data_unsynced.load(Ordering::Relaxed));
+        assert!(!writer.dir_unsynced.load(Ordering::Relaxed));
+        assert!(!writer.parent_unsynced.load(Ordering::Relaxed));
+        assert!(writer.sync_open_file());
+        assert!(!writer.has_unsynced_writes());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_sync_open_file_syncs_and_closes_the_handle_a_day_rotation_left_behind() {
+        // PR17: the rotation at IST midnight moves the previous day's handle
+        // aside without syncing it (it runs under the append lock); the next
+        // `sync_open_file` syncs it off the lock and closes it.
+        let dir = temp_spill_dir("sync-rotated");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        let day_one = chrono::Utc
+            .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
+            .single()
+            .unwrap_or_else(|| panic!("valid"))
+            .timestamp();
+        let day_two = day_one + 86_400;
+        let s1 = mk_seal(13, 0, 0, 1_716_000_900, 100.0);
+        let s2 = mk_seal(25, 0, 4, 1_716_001_500, 200.0);
+        writer
+            .append_seal(&s1, day_one)
+            .unwrap_or_else(|err| panic!("append day one: {err}"));
+        assert!(writer.lock_state().rotated.is_none(), "no rotation yet");
+        writer
+            .append_seal(&s2, day_two)
+            .unwrap_or_else(|err| panic!("append day two: {err}"));
+        assert!(
+            writer.lock_state().rotated.is_some(),
+            "the rotation must leave the previous day's handle for the sync"
+        );
+        assert!(writer.sync_open_file(), "both handles must sync");
+        assert!(
+            writer.lock_state().rotated.is_none(),
+            "the sync must close the rotated handle"
+        );
+        assert!(writer.lock_state().open.is_some(), "the open handle stays");
+        let first = writer
+            .read_all(day_one)
+            .unwrap_or_else(|err| panic!("read day one: {err}"));
+        let second = writer
+            .read_all(day_two)
+            .unwrap_or_else(|err| panic!("read day two: {err}"));
+        assert_eq!(first, vec![s1]);
+        assert_eq!(second, vec![s2]);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -3983,6 +4243,60 @@ mod tests {
         assert!(!top.exists() && !staged.exists());
         assert_eq!(after.held_before_boot_drain, 0);
         assert_eq!(after.deleted, 2);
+    }
+
+    #[test]
+    fn test_is_seal_file_name_matches_spill_records_and_staged_dlq_copies() {
+        for name in [
+            "seals_v4-2026-10-01.bin",
+            "seals_v4-2026-10-01.bin.2",
+            "seals_v4-2026-10-01.ndjson",
+            "seals_v4-2026-10-01.ndjson.1",
+            "seals-2026-09-18.ndjson.overflow",
+        ] {
+            assert!(is_seal_file_name(name), "{name}");
+        }
+        for name in [
+            "notes.ndjson",
+            "boot-committed.summary",
+            "x.wal",
+            "seals_v4-x.txt",
+        ] {
+            assert!(!is_seal_file_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn test_sync_directory_syncs_a_folder_and_errs_on_a_missing_one() {
+        let dir = spill_tmp("sync-dir");
+        assert!(sync_directory(&dir).is_ok());
+        assert!(sync_directory(&dir.join("missing")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spill_sweep_never_deletes_refused_files_and_counts_them() {
+        // PR40b-f: refused/ holds files with seals a recovery path gave up
+        // on; each is those seals' only copy, so no age deletes it, with the
+        // copy gate on or off.
+        let dir = spill_tmp("refused-kept");
+        let refused = dir.join(crate::seal_writer_task::SEAL_REFUSED_SUBDIR);
+        std::fs::create_dir_all(&refused).expect("mkdir refused");
+        let spill = write_aged(&refused, "seals_v4-20260101.bin", 256, 10_000_000);
+        let dlq_copy = write_aged(&refused, "seals_v4-20260101.ndjson.1", 64, 10_000_000);
+        let other = write_aged(&refused, "notes.txt", 8, 10_000_000);
+        let now = std::time::SystemTime::now();
+        for gate in [CopyGate::NotRequired, CopyGate::Required] {
+            let out = prune_spill_files_inner(&dir, 3_600, now, gate, false);
+            assert!(spill.exists() && dlq_copy.exists() && other.exists());
+            assert_eq!(out.refused_kept, 2, "both seal files are counted");
+            assert_eq!(out.bytes_after, 320, "their bytes are in the total");
+            assert_eq!(
+                (out.deleted, out.archive_deleted, out.records_lost),
+                (0, 0, 0)
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

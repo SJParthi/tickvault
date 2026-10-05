@@ -903,11 +903,12 @@ fn is_wal_segment_path(path: &Path) -> bool {
     path.extension().and_then(|s| s.to_str()) == Some("wal")
 }
 
-/// A seal spill record file (PR40b-f; see `seal_spill::is_spill_record_name`).
+/// A seal spill record file or a staged dead-letter copy (PR40b-f; see
+/// `seal_spill::is_seal_file_name`).
 fn is_seal_spill_record_path(path: &Path) -> bool {
     path.file_name()
         .and_then(|n| n.to_str())
-        .is_some_and(crate::seal_spill::is_spill_record_name)
+        .is_some_and(crate::seal_spill::is_seal_file_name)
 }
 
 /// Every regular file (the quarantine sets).
@@ -980,6 +981,8 @@ impl ColdFileSet {
     /// Sealed-candle spill files: the spill root, `replaying/` and
     /// `archive/`: `*.bin` and its renamed copies (`.bin.N`, `.bin.overflow`;
     /// PR40b-f) — exactly what `seal_spill::prune_spill_files` may delete.
+    /// Also `refused/`, which the prune never deletes: files holding a seal
+    /// the replay gave up on get a cold copy too.
     #[must_use]
     pub fn seal_spill(spill_dir: &Path) -> Self {
         Self {
@@ -989,6 +992,7 @@ impl ColdFileSet {
                 spill_dir.to_path_buf(),
                 spill_dir.join(crate::seal_writer_task::SEAL_REPLAYING_SUBDIR),
                 spill_dir.join(crate::seal_writer_task::SEAL_ARCHIVE_SUBDIR),
+                spill_dir.join(crate::seal_writer_task::SEAL_REFUSED_SUBDIR),
             ],
             matches: is_seal_spill_record_path,
         }
@@ -1900,17 +1904,16 @@ mod tests {
             "seals_v4-2026-10-01.bin.1",
             "seals_v4-2026-10-01.bin.1.2",
             "seals_v4-2026-10-01.bin.overflow",
+            // PR40b-f: staged DLQ copies refused/ may hold.
+            "seals_v4-2026-10-01.ndjson",
+            "seals-2026-09-18.ndjson.1",
         ] {
             assert!(
                 (spill.matches)(Path::new(name)),
                 "{name} is a spill record file"
             );
         }
-        for name in [
-            "seals_v4-2026-10-01.ndjson",
-            "boot-committed.summary",
-            "x.wal",
-        ] {
+        for name in ["notes.ndjson", "boot-committed.summary", "x.wal"] {
             assert!(
                 !(spill.matches)(Path::new(name)),
                 "{name} is not a spill record file"
@@ -1922,6 +1925,7 @@ mod tests {
                 PathBuf::from("/d/spill"),
                 PathBuf::from("/d/spill/replaying"),
                 PathBuf::from("/d/spill/archive"),
+                PathBuf::from("/d/spill/refused"),
             ]
         );
         let ticks = ColdFileSet::tick_quarantine(Path::new("/d/spill/ticks"));

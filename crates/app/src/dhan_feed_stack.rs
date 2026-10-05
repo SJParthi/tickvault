@@ -1889,7 +1889,7 @@ struct SealTally {
 /// Pinned by `tf_index::tests::tf_index_all_is_the_operators_nine`.
 #[allow(clippy::too_many_arguments)] // APPROVED: one seal's identity plus its two sinks and the tally
 fn route_catch_up_seal(
-    sender: Option<&tokio::sync::mpsc::Sender<BufferedSeal>>,
+    sender: Option<&tickvault_storage::seal_writer_runner::SealSender>,
     leaderboard: &mut crate::volume_leaderboard::VolumeLeaderboard,
     feed: tickvault_common::feed::Feed,
     security_id: u64,
@@ -7733,7 +7733,11 @@ async fn run_frame_drain(
                             Some(_) if depth_shed_verdict(
                                 frame.wal_backed,
                                 INGEST_SHED.allows_dedicated_depth(),
-                            ) == DepthShedVerdict::Shed => {
+                            ) == DepthShedVerdict::Shed
+                                // Audit M1: refused when the WAL writer
+                                // already lost the record; the rows are
+                                // then written by the next arm.
+                                && drain_may_shed_depth(&frame) => {
                                 c.shed_dedicated_depth.increment(1);
                                 // Item 45a: keep this frame's segment until the
                                 // after-close pass writes its depth back.
@@ -8825,6 +8829,21 @@ const fn depth_shed_verdict(wal_backed: bool, gate_allows: bool) -> DepthShedVer
     }
 }
 
+/// Audit M1 (2026-10-04): the second gate a depth shed passes, after
+/// [`depth_shed_verdict`] said `Shed`. A live frame is "WAL-backed" once its
+/// record is QUEUED, not written; if the writer has already lost the record,
+/// shedding would leave the rows nowhere, so they are written instead. Records
+/// the shed in `wal_frame_fate`, so a record the writer loses later is counted
+/// as lost depth. A replayed frame (`connection_index == u8::MAX`) came off a
+/// segment already on disk and skips the table.
+///
+/// O(1), zero allocation: one load and a CAS on one slot, shed path only.
+fn drain_may_shed_depth(frame: &CapturedFrame) -> bool {
+    frame.connection_index == u8::MAX
+        || tickvault_storage::wal_frame_fate::frame_fate()
+            .allow_drain_shed(frame.seq, WsType::LiveFeed)
+}
+
 /// Parses and folds ONE main-feed frame. Split out so the endpoint routing in
 /// the drain reads as routing rather than as a wall of parse logic.
 /// Decode one captured WebSocket frame and fold every packet it carries.
@@ -8994,7 +9013,10 @@ pub fn drain_main_feed_frame(
                     // them to a WAL that does not hold them.
                     let verdict =
                         depth_shed_verdict(frame.wal_backed, INGEST_SHED.allows_inline_depth());
-                    if verdict != DepthShedVerdict::Shed {
+                    // Audit M1: a shed the frame-fate table refuses (the WAL
+                    // writer already lost the record) is written instead.
+                    let shed = verdict == DepthShedVerdict::Shed && drain_may_shed_depth(frame);
+                    if !shed {
                         if verdict == DepthShedVerdict::WriteUnbackedPastShed {
                             c.depth_unbacked_not_shed.increment(1);
                         }
@@ -20502,6 +20524,42 @@ mod tests {
                 assert_eq!(shed, wal_backed && !gate, "backed={wal_backed} gate={gate}");
             }
         }
+    }
+
+    /// Audit M1 (2026-10-04): a live frame whose WAL record the writer already
+    /// lost is NOT shed (its rows would exist nowhere); a live frame not yet
+    /// lost is, and the shed is recorded; a replayed frame is always sheddable.
+    #[test]
+    fn drain_may_shed_depth_refuses_a_frame_the_wal_writer_lost() {
+        use tickvault_storage::wal_frame_fate::{LostFate, ShedKind, frame_fate};
+        use tickvault_storage::ws_frame_spill::PACKET_INDEX_BITS;
+        // Above any wall-clock base, so nothing else in this process holds
+        // the slot as a newer frame.
+        let seq = |b: u64| ((1u64 << 46) + 7_000 + b) << PACKET_INDEX_BITS;
+        let lost = depth_frame(Vec::new(), DhanEndpointType::Depth20, seq(1));
+        assert_eq!(
+            frame_fate().note_lost(lost.seq, WsType::LiveFeed),
+            LostFate::NotShed
+        );
+        assert!(
+            !drain_may_shed_depth(&lost),
+            "a lost record's rows must be written"
+        );
+
+        let kept = depth_frame(Vec::new(), DhanEndpointType::Depth20, seq(2));
+        assert!(drain_may_shed_depth(&kept));
+        // The shed is recorded: a later loss of the record is counted.
+        assert_eq!(
+            frame_fate().note_lost(kept.seq, WsType::LiveFeed),
+            LostFate::WasShed(ShedKind::DrainDepth)
+        );
+
+        let mut replayed = depth_frame(Vec::new(), DhanEndpointType::Depth20, seq(1));
+        replayed.connection_index = u8::MAX;
+        assert!(
+            drain_may_shed_depth(&replayed),
+            "a replayed frame is on disk"
+        );
     }
 
     /// Both production depth paths must route the shed through
