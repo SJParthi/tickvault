@@ -1334,6 +1334,8 @@ pub async fn replay_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillRe
                 // precisely, because the next round will re-POST them and a
                 // reader who assumed loss would be doubly wrong.
                 error!(
+                    code = ErrorCode::TickSpill01FileQuarantined.code_str(),
+                    source = "accepted_not_emptied",
                     path = %path.display(),
                     %err,
                     bytes = accepted,

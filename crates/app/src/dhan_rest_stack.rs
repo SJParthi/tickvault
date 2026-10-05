@@ -339,6 +339,8 @@ pub fn spawn_dhan_rest_stack(params: DhanRestStackParams) -> Option<tokio::task:
             && !join_err.is_cancelled()
         {
             error!(
+                code = ErrorCode::FeedSupervisor01Respawned.code_str(),
+                source = "bring_up_died",
                 ?join_err,
                 "Dhan REST-only stack bring-up task died before completing — the retained \
                  Dhan REST surface (spot_1m_rest / option_chain_1m) may be absent \
@@ -383,6 +385,8 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
                     attempt = attempt.saturating_add(1);
                     if dhan_rest_retry_should_log(attempt) {
                         error!(
+                            code = ErrorCode::Resilience03MintRefusedLockNotHeld.code_str(),
+                            source = "env_unresolved",
                             attempt,
                             error = %err,
                             "Dhan REST-only stack: cannot resolve environment for the \
@@ -630,6 +634,8 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
                     attempt = attempt.saturating_add(1);
                     if dhan_rest_retry_should_log(attempt) {
                         error!(
+                            code = ErrorCode::AuthGapTokenExpiry.code_str(),
+                            source = "auth_timeout",
                             timeout_secs = TOKEN_INIT_TIMEOUT_SECS,
                             attempt,
                             "Dhan REST-only stack authentication timed out — Dhan API may be \
@@ -776,6 +782,8 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
                     attempt = attempt.saturating_add(1);
                     if dhan_rest_retry_should_log(attempt) {
                         error!(
+                            code = ErrorCode::AuthGapTokenExpiry.code_str(),
+                            source = "client_id_fetch",
                             attempt,
                             error = %err,
                             "Dhan REST-only stack: client-id fetch failed — retrying in \
@@ -806,6 +814,8 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
     // ever fires, the invariant is broken — stay down loudly.
     if !claim_post_market_task_family_once() {
         error!(
+            code = ErrorCode::FeedSupervisor01Respawned.code_str(),
+            source = "double_claim",
             "Dhan REST-only stack: the Dhan-REST scheduled task family is ALREADY \
              claimed this process — refusing to double-spawn \
              spot_1m_rest/option_chain_1m; the sole-claimant invariant is broken, \
@@ -1015,6 +1025,8 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
                 // runtime — the leaked sender keeps the dummy channel open
                 // so the mark arm just idles.
                 error!(
+                    code = ErrorCode::OrderReady01GateRefused.code_str(),
+                    source = "mark_receiver_missing",
                     "order runtime: mark receiver slot was EMPTY at spawn — running \
                      mark-less (paper fills defer until marks return; investigate the \
                      boot wiring)"
@@ -1177,6 +1189,8 @@ where
                 Err(_) => "panic",
             };
             error!(
+                code = ErrorCode::FeedSupervisor01Respawned.code_str(),
+                source = "task_died",
                 task,
                 reason,
                 backoff_secs,

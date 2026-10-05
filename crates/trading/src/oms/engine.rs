@@ -821,6 +821,8 @@ impl OrderManagementSystem {
                 // unexpected live-mode attempts during the sandbox window.
                 metrics::counter!("tv_sandbox_gate_blocks_total").increment(1);
                 error!(
+                    code = ErrorCode::OmsGapDryRunSafety.code_str(),
+                    source = "sandbox_enforcement",
                     "SANDBOX ENFORCEMENT: live orders blocked pending explicit \
                      re-arm (sentinel 2099-12-31; a dated operator quote + \
                      constant edit are required to go live)"
@@ -1323,6 +1325,8 @@ impl OrderManagementSystem {
 
         if !is_valid_transition(old_status, new_status) {
             error!(
+                code = ErrorCode::OmsGapStateMachine.code_str(),
+                source = "invalid_transition",
                 order_id = %order_id,
                 from = %old_status.as_str(),
                 to = %new_status.as_str(),

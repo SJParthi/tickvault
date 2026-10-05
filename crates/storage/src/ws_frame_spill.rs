@@ -5064,6 +5064,8 @@ pub fn confirm_replayed<P: AsRef<Path>>(wal_dir: P) {
                 Err(err) => {
                     // Stays in `replaying/` → re-replayed next boot (DEDUP-safe).
                     error!(
+                        code = ErrorCode::HotPath01SyncFsFailed.code_str(),
+                        source = "replay_confirm_archive",
                         segment = ?seg,
                         error = %err,
                         "WAL replay confirm: could not archive staged segment — \

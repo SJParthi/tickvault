@@ -2975,3 +2975,9 @@ Status of the rest, so the next session does not re-audit:
   case-insensitive) and fails when it rises or falls without the ceiling moving with it. File:
   `crates/common/tests/rust_only_guard.rs`. Tests: banned_word_file_count_never_grows,
   banned_word_scan_self_test.
+- [x] **M3 (second pass) — 51 more uncoded `error!` lines carry a code.** Each gets an existing
+  code and a `source` naming the arm, picked so no CloudWatch filter matches it (no new page).
+  The ratchet drops 61 -> 10; the ten left are listed with their reasons at the budget. Files:
+  24 production files across api, app, core, storage and trading, plus
+  `crates/common/tests/error_code_tag_guard.rs`. Tests: uncoded_error_sites_may_only_shrink,
+  every_critical_code_with_an_emit_site_is_alarmed_or_allowlisted.
