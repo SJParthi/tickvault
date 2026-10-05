@@ -5620,6 +5620,7 @@ fn seed_drain_loss_baselines() {
     // `the_ws_lag_exclusion_family_is_seeded_on_every_label_set`.
     for reason in [
         "ltt_not_advanced",
+        "not_a_trade",
         "clamped_negative",
         "implausible_ltt",
         "unknown_connection_slot",
@@ -9104,24 +9105,29 @@ pub fn drain_main_feed_frame(
                 // that carry an LTT reach this arm (OI, PrevClose and
                 // MarketStatus decode to non-`Tick` variants), so a missing
                 // timestamp is a garbage one and is EXCLUDED, never zero.
-                if matches!(
-                    outcome,
+                //
+                // ⚠ CHANGED 2026-10-05: only a NEW trade the fold accepted is a
+                // lag sample. Every other outcome was recorded until today, and
+                // the out-of-session arm is the one that mattered: a contract
+                // that has not traded today carries an earlier day's trade time
+                // on every order-book change, so its "lag" is hours. Live that
+                // day, 6.0 million such ticks went into the histogram and read
+                // as option sockets #1-#3 delivering most packets over 60 s,
+                // while the socket-to-disk-log stage measured 99.8% at or under
+                // 131 us. Each excluded tick is counted, never dropped silently.
+                match outcome {
                     IngestOutcome::Folded {
-                        repeat_quote: true,
-                        ..
+                        repeat_quote: true, ..
+                    } => record_ws_lag_repeat_excluded(),
+                    IngestOutcome::Folded { .. } => {
+                        record_ws_lag(frame.connection_index, &tick, received_at_nanos);
+                        // Worst delay on a LIVE socket only: a replayed WAL
+                        // frame (`u8::MAX`) carries its replay time.
+                        if frame.connection_index != u8::MAX {
+                            record_ws_lag_max(tick.exchange_timestamp, received_at_nanos);
+                        }
                     }
-                ) {
-                    record_ws_lag_repeat_excluded();
-                } else {
-                    record_ws_lag(frame.connection_index, &tick, received_at_nanos);
-                    // Worst delay of a NEW trade on a LIVE socket only: a
-                    // replayed WAL frame (`u8::MAX`) carries its replay time,
-                    // and a refused tick is not a trade we kept.
-                    if frame.connection_index != u8::MAX
-                        && matches!(outcome, IngestOutcome::Folded { .. })
-                    {
-                        record_ws_lag_max(tick.exchange_timestamp, received_at_nanos);
-                    }
+                    _ => record_ws_lag_not_a_trade_excluded(),
                 }
                 match outcome {
                     IngestOutcome::Folded { .. } => {
@@ -10453,6 +10459,10 @@ struct WsLagHandles {
     /// previous packet). Its stamp is the time of an earlier trade, so its
     /// "lag" is how long the instrument has been quiet. Counted, not recorded.
     excluded_ltt_not_advanced: metrics::Counter,
+    /// A tick the fold did not accept as a trade, most often a contract that
+    /// has not traded today carrying an earlier day's trade time. Counted, not
+    /// recorded (2026-10-05).
+    excluded_not_a_trade: metrics::Counter,
 }
 
 impl WsLagHandles {
@@ -10482,6 +10492,10 @@ impl WsLagHandles {
             excluded_ltt_not_advanced: metrics::counter!(
                 WS_LAG_EXCLUDED_COUNTER,
                 "reason" => "ltt_not_advanced"
+            ),
+            excluded_not_a_trade: metrics::counter!(
+                WS_LAG_EXCLUDED_COUNTER,
+                "reason" => "not_a_trade"
             ),
         }
     }
@@ -10658,8 +10672,17 @@ pub struct ConnectionDelivery {
     pub frames: u64,
 }
 
-/// Every slot's delivery record at `now_millis`. Pure over the two statics, so
-/// the never-ticked and clock-stepped-backwards cases are unit tests.
+/// Every primary-account slot's delivery record at `now_millis`. Pure over the
+/// two statics, so the never-ticked and clock-stepped-backwards cases are unit
+/// tests.
+///
+/// Only the PRIMARY account's sixteen slots are reported. The depth account's
+/// ten slots (16..26, 2026-09-26) are tiled in the budget, but no code in this
+/// build dials them: the account has no config, no token read and no pool. The
+/// console listed them as ten extra depth-20 and depth-200 rows that said
+/// "never", which read as a second depth pool (operator, 2026-10-05: "why
+/// double time same dpeth 20 and dpeth 200 showing again"). When the depth
+/// account is wired, this filter widens with it.
 #[must_use]
 pub fn connection_deliveries(now_millis: i64) -> Vec<ConnectionDelivery> {
     PER_CONN_LAST_TICK_MILLIS
@@ -10668,7 +10691,11 @@ pub fn connection_deliveries(now_millis: i64) -> Vec<ConnectionDelivery> {
         .enumerate()
         .filter_map(|(index, (last, frames))| {
             let connection_index = u8::try_from(index).ok()?;
-            let endpoint = endpoint_for_slot(connection_index)?;
+            let (account, endpoint) =
+                tickvault_core::websocket::pool_budget::slot_owner(connection_index)?;
+            if account != tickvault_core::websocket::pool_budget::DhanAccount::Primary {
+                return None;
+            }
             let last = last.load(Ordering::Relaxed);
             let tick_age_secs = (last != 0).then(|| {
                 // saturating: a clock stepped backwards reads as 0 age, never
@@ -10685,7 +10712,8 @@ pub fn connection_deliveries(now_millis: i64) -> Vec<ConnectionDelivery> {
         .collect()
 }
 
-/// Publishes [`CONN_TICK_AGE_GAUGE`] and [`CONN_FRAMES_GAUGE`] for every slot.
+/// Publishes [`CONN_TICK_AGE_GAUGE`] and [`CONN_FRAMES_GAUGE`] for every slot
+/// [`connection_deliveries`] reports (the primary account's sixteen).
 ///
 /// Called from the drain's 30-second timer arm beside the worst-socket gauge.
 /// The labelled handles are resolved ONCE (at first publish, from the
@@ -10695,10 +10723,16 @@ pub fn connection_deliveries(now_millis: i64) -> Vec<ConnectionDelivery> {
 pub fn publish_connection_deliveries(now_millis: i64) {
     static HANDLES: std::sync::OnceLock<Vec<(metrics::Gauge, metrics::Gauge)>> =
         std::sync::OnceLock::new();
+    // Registered for the slots `connection_deliveries` reports and no others:
+    // the exporter renders a registered gauge even if it is never set, so a
+    // handle for an undialled depth-account slot would put its row back on
+    // the console as a "0 frames, never" socket.
     let handles = HANDLES.get_or_init(|| {
-        (0..MAX_TOTAL_DHAN_CONNECTIONS)
-            .map(|slot| {
-                let endpoint = endpoint_for_slot(slot).map_or("unknown", DhanEndpointType::as_str);
+        connection_deliveries(0)
+            .into_iter()
+            .map(|delivery| {
+                let slot = delivery.connection_index;
+                let endpoint = delivery.endpoint.as_str();
                 (
                     metrics::gauge!(
                         CONN_TICK_AGE_GAUGE,
@@ -10714,10 +10748,9 @@ pub fn publish_connection_deliveries(now_millis: i64) {
             })
             .collect()
     });
-    for delivery in connection_deliveries(now_millis) {
-        let Some((age, frames)) = handles.get(usize::from(delivery.connection_index)) else {
-            continue;
-        };
+    // `connection_deliveries` is a pure function of the slot layout, so it
+    // yields the same slots in the same order as the registration above.
+    for ((age, frames), delivery) in handles.iter().zip(connection_deliveries(now_millis)) {
         age.set(delivery.tick_age_secs.map_or(-1.0, |secs| {
             f64::from(u32::try_from(secs).unwrap_or(u32::MAX))
         }));
@@ -10946,6 +10979,15 @@ pub fn record_ws_lag(connection_index: u8, tick: &ParsedTick, received_at_nanos:
 /// neither the histogram nor the 15:45 day distribution.
 pub fn record_ws_lag_repeat_excluded() {
     ws_lag_handles().excluded_ltt_not_advanced.increment(1);
+}
+
+/// Counts a tick the fold did not accept as a trade (out of session, an
+/// earlier trading day, a refused price or time, a failed write) as excluded
+/// from the delivery-lag measurement. Its stamp is not the time of a trade
+/// that just happened, so its "receipt − LTT" is not transit time. One
+/// relaxed atomic add; no allocation (2026-10-05).
+pub fn record_ws_lag_not_a_trade_excluded() {
+    ws_lag_handles().excluded_not_a_trade.increment(1);
 }
 
 /// Outcome of [`ws_lag_ms`] for a tick that DOES carry a usable timestamp.
@@ -18640,7 +18682,7 @@ mod tests {
             .find("let outcome = ingest.ingest_tick_at(&tick, frame.seq, packets, recv_millis);")
             .expect("the drain's fold call must exist");
         let excluded = prod
-            .find("record_ws_lag_repeat_excluded();")
+            .find("=> record_ws_lag_repeat_excluded(),")
             .expect("the drain must count repeats as excluded");
         let measured = prod
             .find("record_ws_lag(frame.connection_index, &tick, received_at_nanos);")
@@ -18653,6 +18695,49 @@ mod tests {
             prod.matches("record_ws_lag(frame.connection_index").count(),
             1,
             "exactly one live lag-recording site"
+        );
+    }
+
+    #[test]
+    fn test_record_ws_lag_not_a_trade_excluded_only_an_accepted_trade_is_a_lag_sample() {
+        // 2026-10-05: out-of-session ticks (a contract not traded today,
+        // carrying an earlier day's trade time) went into the lag histogram
+        // and read as option sockets delivering most packets over 60 s. The
+        // drain must record lag on the accepted-trade arm only and count
+        // every other outcome on its own exclusion reason.
+        record_ws_lag_not_a_trade_excluded();
+        let src = include_str!("dhan_feed_stack.rs");
+        let helper = src
+            .find("pub fn record_ws_lag_not_a_trade_excluded() {")
+            .map(|at| &src[at..])
+            .and_then(|tail| tail.find('}').map(|end| &tail[..end]))
+            .expect("the not-a-trade exclusion helper must exist");
+        assert!(
+            helper.contains(".excluded_not_a_trade.increment(1)"),
+            "a refused or out-of-session tick must increment the not_a_trade counter, got: {helper}"
+        );
+
+        let prod = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
+        let fold = prod
+            .find("let outcome = ingest.ingest_tick_at(&tick, frame.seq, packets, recv_millis);")
+            .expect("the drain's fold call must exist");
+        let arm = &prod[fold..];
+        let folded_arm = arm
+            .find("IngestOutcome::Folded { .. } => {")
+            .expect("lag must be recorded inside the accepted-trade arm");
+        let measured = arm
+            .find("record_ws_lag(frame.connection_index, &tick, received_at_nanos);")
+            .expect("the drain must still record real lag");
+        let other = arm
+            .find("_ => record_ws_lag_not_a_trade_excluded(),")
+            .expect("every other outcome must be counted as not a trade");
+        assert!(
+            folded_arm < measured && measured < other,
+            "the lag sample must sit inside the Folded arm, before the catch-all"
+        );
+        assert!(
+            src.contains("\"reason\" => \"not_a_trade\""),
+            "the exclusion reason label must be registered"
         );
     }
 
@@ -30056,11 +30141,45 @@ mod connection_delivery_tests {
             before.frames + 2,
             "one count per data-bearing frame"
         );
-        // Rows exist for every slot, stamped or not, so the console can show
-        // the sixteen sockets rather than only the ones that happened to tick.
+        // Rows exist for every primary slot, stamped or not, so the console
+        // can show the sixteen sockets rather than only the ones that
+        // happened to tick.
+        assert_eq!(connection_deliveries(now).len(), PRIMARY_SLOTS);
+    }
+
+    /// The sixteen primary-account sockets.
+    const PRIMARY_SLOTS: usize = 16;
+
+    /// The depth account is not dialled by this build, so its ten slots must
+    /// not appear as ten extra "never" depth rows on the console (2026-10-05).
+    #[test]
+    fn connection_deliveries_report_only_the_primary_accounts_sixteen_slots() {
+        use tickvault_core::websocket::pool_budget::{DhanAccount, slot_owner};
+        let rows = connection_deliveries(1_757_300_000_000_i64);
+        assert_eq!(rows.len(), PRIMARY_SLOTS);
+        for row in &rows {
+            assert_eq!(
+                slot_owner(row.connection_index).map(|(account, _)| account),
+                Some(DhanAccount::Primary),
+                "slot {} is not a primary-account slot",
+                row.connection_index
+            );
+        }
+        let depth_slot = DhanAccount::Depth.jitter_base(DhanEndpointType::Depth20);
+        assert!(rows.iter().all(|d| d.connection_index != depth_slot));
         assert_eq!(
-            connection_deliveries(now).len(),
-            usize::from(MAX_TOTAL_DHAN_CONNECTIONS)
+            rows.iter()
+                .map(|d| d.endpoint)
+                .filter(|e| *e == DhanEndpointType::Depth20)
+                .count(),
+            5
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|d| d.endpoint)
+                .filter(|e| *e == DhanEndpointType::Depth200)
+                .count(),
+            5
         );
     }
 
@@ -30074,10 +30193,7 @@ mod connection_delivery_tests {
         publish_connection_deliveries(now + 30_000);
         // Publishing re-reads the same per-slot state the console reads:
         // every one of the sixteen sockets is still reported afterwards.
-        assert_eq!(
-            connection_deliveries(now + 30_000).len(),
-            MAX_TOTAL_DHAN_CONNECTIONS as usize
-        );
+        assert_eq!(connection_deliveries(now + 30_000).len(), PRIMARY_SLOTS);
     }
 
     /// A clock stepped backwards reads as age 0, never as a wrapped giant.
