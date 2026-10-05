@@ -933,31 +933,83 @@ pub const GHOST_RESEND_POOL_SPACING_SECS: i64 = 20;
 /// once.
 pub const GHOST_RESEND_SESSION_CEILING: u32 = 8;
 
-/// `true` while a ghost unsubscribe is armed for that slot and not yet taken.
-static GHOST_PENDING: [std::sync::atomic::AtomicBool; GHOST_REDIAL_SLOTS] =
-    [const { std::sync::atomic::AtomicBool::new(false) }; GHOST_REDIAL_SLOTS];
+/// The ghost-unsubscribe register: one slot per global connection index.
+///
+/// Production uses the one [`GHOST_REGISTER`] static through
+/// [`request_ghost_unsubscribe`] and [`take_ghost_unsubscribe`]. The type is
+/// public (hidden from docs) only so the loom lane can build its own instance
+/// and drive these exact methods through every interleaving (audit H3,
+/// `crates/core/tests/loom_ghost_register.rs`). Its atomics come from
+/// `crate::sync`: the std atomics in a normal build, loom's under the crate's
+/// `loom` feature. Fixed size, built once, O(1) per call, no allocation.
+#[doc(hidden)]
+pub struct GhostRegister {
+    /// `true` while a ghost unsubscribe is armed for that slot and not yet
+    /// taken.
+    pending: [crate::sync::AtomicBool; GHOST_REDIAL_SLOTS],
+    /// The ghost's `security_id`, valid while `pending` is set.
+    security_id: [crate::sync::AtomicU64; GHOST_REDIAL_SLOTS],
+    /// The ghost's binary exchange-segment code, valid while `pending` is set.
+    /// Carried with the id because `security_id` alone is not unique
+    /// (I-P1-11).
+    segment_code: [crate::sync::AtomicU8; GHOST_REDIAL_SLOTS],
+    /// Epoch seconds of the last ARMED request per slot, for the cooldown.
+    last_armed: [crate::sync::AtomicI64; GHOST_REDIAL_SLOTS],
+    /// Ghost unsubscribes ARMED per slot this process lifetime, for the
+    /// ceiling.
+    armed_count: [crate::sync::AtomicU32; GHOST_REDIAL_SLOTS],
+    /// Epoch seconds of the last ghost unsubscribe ARMED on ANY slot, for the
+    /// pool-wide spacing.
+    pool_last_armed: crate::sync::AtomicI64,
+}
 
-/// The ghost's `security_id`, valid while [`GHOST_PENDING`] is set.
-static GHOST_SECURITY_ID: [std::sync::atomic::AtomicU64; GHOST_REDIAL_SLOTS] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; GHOST_REDIAL_SLOTS];
+impl GhostRegister {
+    /// An empty register: nothing pending, no cooldown, no request counted.
+    #[cfg(not(feature = "loom"))]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            pending: [const { crate::sync::AtomicBool::new(false) }; GHOST_REDIAL_SLOTS],
+            security_id: [const { crate::sync::AtomicU64::new(0) }; GHOST_REDIAL_SLOTS],
+            segment_code: [const { crate::sync::AtomicU8::new(u8::MAX) }; GHOST_REDIAL_SLOTS],
+            last_armed: [const { crate::sync::AtomicI64::new(0) }; GHOST_REDIAL_SLOTS],
+            armed_count: [const { crate::sync::AtomicU32::new(0) }; GHOST_REDIAL_SLOTS],
+            pool_last_armed: crate::sync::AtomicI64::new(0),
+        }
+    }
 
-/// The ghost's binary exchange-segment code, valid while [`GHOST_PENDING`] is
-/// set. Carried with the id because `security_id` alone is not unique
-/// (I-P1-11).
-static GHOST_SEGMENT_CODE: [std::sync::atomic::AtomicU8; GHOST_REDIAL_SLOTS] =
-    [const { std::sync::atomic::AtomicU8::new(u8::MAX) }; GHOST_REDIAL_SLOTS];
+    /// An empty register (loom build: loom atomics have no `const` constructor).
+    #[cfg(feature = "loom")]
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            pending: std::array::from_fn(|_| crate::sync::AtomicBool::new(false)),
+            security_id: std::array::from_fn(|_| crate::sync::AtomicU64::new(0)),
+            segment_code: std::array::from_fn(|_| crate::sync::AtomicU8::new(u8::MAX)),
+            last_armed: std::array::from_fn(|_| crate::sync::AtomicI64::new(0)),
+            armed_count: std::array::from_fn(|_| crate::sync::AtomicU32::new(0)),
+            pool_last_armed: crate::sync::AtomicI64::new(0),
+        }
+    }
+}
 
-/// Epoch seconds of the last ARMED request per slot, for the cooldown.
-static GHOST_LAST_ARMED: [std::sync::atomic::AtomicI64; GHOST_REDIAL_SLOTS] =
-    [const { std::sync::atomic::AtomicI64::new(0) }; GHOST_REDIAL_SLOTS];
+#[cfg(not(feature = "loom"))]
+impl Default for GhostRegister {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
-/// Ghost unsubscribes ARMED per slot this process lifetime, for the ceiling.
-static GHOST_ARMED_COUNT: [std::sync::atomic::AtomicU32; GHOST_REDIAL_SLOTS] =
-    [const { std::sync::atomic::AtomicU32::new(0) }; GHOST_REDIAL_SLOTS];
+/// The process's one ghost-unsubscribe register.
+#[cfg(not(feature = "loom"))]
+static GHOST_REGISTER: GhostRegister = GhostRegister::new();
 
-/// Epoch seconds of the last ghost unsubscribe ARMED on ANY slot, for the
-/// pool-wide spacing.
-static GHOST_POOL_LAST_ARMED: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+// Under the `loom` feature only `--test loom_*` targets run, and they build
+// their own `GhostRegister`; this global exists so the crate still compiles.
+#[cfg(feature = "loom")]
+loom::lazy_static! {
+    static ref GHOST_REGISTER: GhostRegister = GhostRegister::new();
+}
 
 /// Why a ghost-unsubscribe request was not armed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1003,53 +1055,71 @@ pub fn request_ghost_unsubscribe(
     segment_code: u8,
     now_epoch_secs: i64,
 ) -> Result<(), GhostResendRefusal> {
-    let idx = usize::from(connection_index);
-    let (Some(last), Some(pending), Some(count), Some(id_slot), Some(segment_slot)) = (
-        GHOST_LAST_ARMED.get(idx),
-        GHOST_PENDING.get(idx),
-        GHOST_ARMED_COUNT.get(idx),
-        GHOST_SECURITY_ID.get(idx),
-        GHOST_SEGMENT_CODE.get(idx),
-    ) else {
-        return Err(GhostResendRefusal::OutOfRange);
-    };
-    if ExchangeSegment::from_byte(segment_code).is_none() {
-        return Err(GhostResendRefusal::UnknownSegment);
+    GHOST_REGISTER.request(connection_index, security_id, segment_code, now_epoch_secs)
+}
+
+impl GhostRegister {
+    /// [`request_ghost_unsubscribe`] on this register.
+    #[doc(hidden)]
+    pub fn request(
+        &self,
+        connection_index: u8,
+        security_id: SecurityId,
+        segment_code: u8,
+        now_epoch_secs: i64,
+    ) -> Result<(), GhostResendRefusal> {
+        let idx = usize::from(connection_index);
+        let (Some(last), Some(pending), Some(count), Some(id_slot), Some(segment_slot)) = (
+            self.last_armed.get(idx),
+            self.pending.get(idx),
+            self.armed_count.get(idx),
+            self.security_id.get(idx),
+            self.segment_code.get(idx),
+        ) else {
+            return Err(GhostResendRefusal::OutOfRange);
+        };
+        if ExchangeSegment::from_byte(segment_code).is_none() {
+            return Err(GhostResendRefusal::UnknownSegment);
+        }
+        // Acquire pairs with the Release store in `take_ghost_unsubscribe`, which
+        // clears the flag only after it has read the slot. Once this reads
+        // `false` nothing is reading the slot, and nothing else writes it (the
+        // drain is the only caller), so the stores below can never tear a read.
+        if pending.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(GhostResendRefusal::StillPending);
+        }
+        if count.load(std::sync::atomic::Ordering::Relaxed) >= GHOST_RESEND_SESSION_CEILING {
+            return Err(GhostResendRefusal::SessionCeiling);
+        }
+        let previous = last.load(std::sync::atomic::Ordering::Relaxed);
+        if now_epoch_secs.saturating_sub(previous) < GHOST_RESEND_COOLDOWN_SECS {
+            return Err(GhostResendRefusal::CoolingDown);
+        }
+        let pool_previous = self
+            .pool_last_armed
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if now_epoch_secs.saturating_sub(pool_previous) < GHOST_RESEND_POOL_SPACING_SECS {
+            return Err(GhostResendRefusal::PoolSpacing);
+        }
+        last.store(now_epoch_secs, std::sync::atomic::Ordering::Relaxed);
+        self.pool_last_armed
+            .store(now_epoch_secs, std::sync::atomic::Ordering::Relaxed);
+        count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        id_slot.store(security_id, std::sync::atomic::Ordering::Relaxed);
+        segment_slot.store(segment_code, std::sync::atomic::Ordering::Relaxed);
+        // Release: the id and segment stored above are visible to whoever
+        // observes `pending` with Acquire in `take_ghost_unsubscribe`.
+        pending.store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
     }
-    // Acquire pairs with the Release store in `take_ghost_unsubscribe`, which
-    // clears the flag only after it has read the slot. Once this reads
-    // `false` nothing is reading the slot, and nothing else writes it (the
-    // drain is the only caller), so the stores below can never tear a read.
-    if pending.load(std::sync::atomic::Ordering::Acquire) {
-        return Err(GhostResendRefusal::StillPending);
-    }
-    if count.load(std::sync::atomic::Ordering::Relaxed) >= GHOST_RESEND_SESSION_CEILING {
-        return Err(GhostResendRefusal::SessionCeiling);
-    }
-    let previous = last.load(std::sync::atomic::Ordering::Relaxed);
-    if now_epoch_secs.saturating_sub(previous) < GHOST_RESEND_COOLDOWN_SECS {
-        return Err(GhostResendRefusal::CoolingDown);
-    }
-    let pool_previous = GHOST_POOL_LAST_ARMED.load(std::sync::atomic::Ordering::Relaxed);
-    if now_epoch_secs.saturating_sub(pool_previous) < GHOST_RESEND_POOL_SPACING_SECS {
-        return Err(GhostResendRefusal::PoolSpacing);
-    }
-    last.store(now_epoch_secs, std::sync::atomic::Ordering::Relaxed);
-    GHOST_POOL_LAST_ARMED.store(now_epoch_secs, std::sync::atomic::Ordering::Relaxed);
-    count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    id_slot.store(security_id, std::sync::atomic::Ordering::Relaxed);
-    segment_slot.store(segment_code, std::sync::atomic::Ordering::Relaxed);
-    // Release: the id and segment stored above are visible to whoever
-    // observes `pending` with Acquire in `take_ghost_unsubscribe`.
-    pending.store(true, std::sync::atomic::Ordering::Release);
-    Ok(())
 }
 
 /// Ghost unsubscribes this slot has re-sent this process lifetime. `0` for an
 /// out-of-range index.
 #[must_use]
 pub fn ghost_resends_taken(connection_index: u8) -> u32 {
-    GHOST_ARMED_COUNT
+    GHOST_REGISTER
+        .armed_count
         .get(usize::from(connection_index))
         .map_or(0, |c| c.load(std::sync::atomic::Ordering::Relaxed))
 }
@@ -1059,7 +1129,10 @@ pub fn ghost_resends_taken(connection_index: u8) -> u32 {
 /// again). Saturates at zero; an out-of-range index is a no-op. O(1), called
 /// from the connection task, never per tick.
 fn refund_ghost_resend(connection_index: u8) {
-    if let Some(count) = GHOST_ARMED_COUNT.get(usize::from(connection_index)) {
+    if let Some(count) = GHOST_REGISTER
+        .armed_count
+        .get(usize::from(connection_index))
+    {
         let _previous = count.fetch_update(
             std::sync::atomic::Ordering::Relaxed,
             std::sync::atomic::Ordering::Relaxed,
@@ -1094,31 +1167,40 @@ pub fn ghost_ceiling_first_hit(connection_index: u8) -> bool {
 /// [`request_ghost_unsubscribe`], which refuses it) an unknown segment code.
 #[must_use]
 pub fn take_ghost_unsubscribe(connection_index: u8) -> Option<SubscribeInstrument> {
-    let idx = usize::from(connection_index);
-    let (Some(pending), Some(id_slot), Some(segment_slot)) = (
-        GHOST_PENDING.get(idx),
-        GHOST_SECURITY_ID.get(idx),
-        GHOST_SEGMENT_CODE.get(idx),
-    ) else {
-        return None;
-    };
-    // Acquire pairs with the Release that published the request, so the id
-    // and segment read below are the ones stored with it.
-    if !pending.load(std::sync::atomic::Ordering::Acquire) {
-        return None;
+    GHOST_REGISTER.take(connection_index)
+}
+
+impl GhostRegister {
+    /// [`take_ghost_unsubscribe`] on this register.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn take(&self, connection_index: u8) -> Option<SubscribeInstrument> {
+        let idx = usize::from(connection_index);
+        let (Some(pending), Some(id_slot), Some(segment_slot)) = (
+            self.pending.get(idx),
+            self.security_id.get(idx),
+            self.segment_code.get(idx),
+        ) else {
+            return None;
+        };
+        // Acquire pairs with the Release that published the request, so the id
+        // and segment read below are the ones stored with it.
+        if !pending.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        // Read BOTH before clearing the flag. `request_ghost_unsubscribe` writes
+        // the slot only after it sees the flag clear (Acquire), and this Release
+        // store is what it sees, so the pair can never tear. The connection task
+        // is the only taker per slot, so load-then-store loses no request.
+        let security_id = id_slot.load(std::sync::atomic::Ordering::Relaxed);
+        let segment_code = segment_slot.load(std::sync::atomic::Ordering::Relaxed);
+        pending.store(false, std::sync::atomic::Ordering::Release);
+        let segment = ExchangeSegment::from_byte(segment_code)?;
+        Some(SubscribeInstrument {
+            security_id,
+            segment,
+        })
     }
-    // Read BOTH before clearing the flag. `request_ghost_unsubscribe` writes
-    // the slot only after it sees the flag clear (Acquire), and this Release
-    // store is what it sees, so the pair can never tear. The connection task
-    // is the only taker per slot, so load-then-store loses no request.
-    let security_id = id_slot.load(std::sync::atomic::Ordering::Relaxed);
-    let segment_code = segment_slot.load(std::sync::atomic::Ordering::Relaxed);
-    pending.store(false, std::sync::atomic::Ordering::Release);
-    let segment = ExchangeSegment::from_byte(segment_code)?;
-    Some(SubscribeInstrument {
-        security_id,
-        segment,
-    })
 }
 
 /// The rotate-by-reconnect circuit breaker (2026-09-24 scope lock).
@@ -8857,10 +8939,11 @@ mod tests {
     use super::*;
     /// Test-only: clears every slot so tests do not see each other's requests.
     fn reset_ghost_redials_for_tests() {
-        for (((p, l), c), r) in GHOST_PENDING
+        for (((p, l), c), r) in GHOST_REGISTER
+            .pending
             .iter()
-            .zip(GHOST_LAST_ARMED.iter())
-            .zip(GHOST_ARMED_COUNT.iter())
+            .zip(GHOST_REGISTER.last_armed.iter())
+            .zip(GHOST_REGISTER.armed_count.iter())
             .zip(GHOST_CEILING_REPORTED.iter())
         {
             p.store(false, std::sync::atomic::Ordering::Release);
@@ -8868,11 +8951,17 @@ mod tests {
             c.store(0, std::sync::atomic::Ordering::Relaxed);
             r.store(false, std::sync::atomic::Ordering::Release);
         }
-        for (id, segment) in GHOST_SECURITY_ID.iter().zip(GHOST_SEGMENT_CODE.iter()) {
+        for (id, segment) in GHOST_REGISTER
+            .security_id
+            .iter()
+            .zip(GHOST_REGISTER.segment_code.iter())
+        {
             id.store(0, std::sync::atomic::Ordering::Relaxed);
             segment.store(u8::MAX, std::sync::atomic::Ordering::Relaxed);
         }
-        GHOST_POOL_LAST_ARMED.store(0, std::sync::atomic::Ordering::Relaxed);
+        GHOST_REGISTER
+            .pool_last_armed
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     use proptest::prelude::*;
@@ -10628,7 +10717,7 @@ mod tests {
         let mut armed = 0_u64;
         for round in 0..ROUNDS {
             // Lift the session ceiling so the race runs for every round.
-            GHOST_ARMED_COUNT[usize::from(SLOT)].store(0, Ordering::Relaxed);
+            GHOST_REGISTER.armed_count[usize::from(SLOT)].store(0, Ordering::Relaxed);
             let (id, code) = if round % 2 == 0 { (1, 2) } else { (2, 1) };
             let now = (round + 1) * GHOST_RESEND_COOLDOWN_SECS;
             if request_ghost_unsubscribe(SLOT, id, code, now).is_ok() {

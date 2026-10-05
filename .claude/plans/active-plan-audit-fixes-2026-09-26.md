@@ -2937,3 +2937,59 @@ Status of the rest, so the next session does not re-audit:
 | Waiting on the owner | OWNER-202, PR42c, PR28b lock mode, D11/R3-13 (no `wip/d11` branch exists any more; the box curfew still blocks Sundays; the session is 2026-11-08) |
 | Dormant | PR48 (console wipes switched off by `CONSOLE_DATA_WIPES_AUTHORIZED = false`) |
 | Done in a later fold | PR40a follow-up (`escalation_pending` counted in `unwritten_seals`) |
+
+### Added 2026-10-05 (deep audit, items M6, M10, N4 and L9)
+
+- [x] **M6 — The per-tick delivery-lag histogram no longer allocates.** `record_ws_lag` recorded
+  into a `metrics::Histogram`; the production recorder keeps each sample in a `metrics_util`
+  `AtomicBucket` that allocates a 64-slot block about every 64 samples per socket, invisible to
+  `dhat_ws_lag.rs`, which runs with no recorder. Each socket slot is now a fixed `WsLagSlot` (15
+  atomic bucket counts and a sum): a scan of 14 fixed bounds and two relaxed adds per tick, O(1),
+  no allocation. `publish_fold_depth` republishes the cumulative counts as the same
+  `tv_dhan_ws_lag_ms_{bucket,count,sum}` lines (counters set with `absolute`), so the operator
+  console reads what it read before. Files: `crates/app/src/dhan_feed_stack.rs`,
+  `crates/app/src/observability.rs`, `crates/app/tests/dhat_ws_lag_recorder.rs`,
+  `.github/workflows/ci.yml`, `CLAUDE.md`. Tests:
+  dhat_record_ws_lag_with_the_production_recorder_is_zero_allocation,
+  ws_lag_slot_renders_the_lines_a_prometheus_histogram_rendered,
+  ws_lag_slot_counts_a_sample_equal_to_a_bound_in_that_bucket,
+  ws_lag_bucket_bounds_match_the_ms_histogram_buckets. Also adds the merged
+  `dhat_seal_queue_backlog` (N2) to the CI DHAT lane, which failed its drift check without it.
+- [x] **M10 — A refused candle written by the drain moves the tokio worker aside first.** When
+  the escalation queue is full, `escalate` writes the seal itself; that write now runs inside
+  `off_worker`, as the tick writer's inline spill does, so the drain's worker is handed to the
+  runtime while it blocks. The midnight day-file sync already left the append lock (PR17). File:
+  `crates/storage/src/seal_writer_runner.rs`. Test: every_blocking_writer_step_runs_off_the_worker
+  (extended). Honest limit: the drain itself still waits for the write; only the worker's other
+  tasks keep running.
+- [x] **N4 — A future-named WAL segment is filed under its own date in the cold bucket.**
+  Segment names never fall, so after the clock once ran ahead every later segment kept a future
+  name and its raw-frame upload landed under a later day's folder. `segment_key` now uses the
+  file's mtime date when the name is more than a day ahead of it (counted on
+  `tv_raw_frame_upload_future_name_total`, one `warn!`); names are unchanged because replay orders
+  by them. File: `crates/storage/src/raw_frame_upload.rs`. Test:
+  segment_key_files_a_name_more_than_a_day_ahead_under_its_mtime_date.
+- [x] **L9 — The banned interpreter's name may only appear in fewer files.** No file in that
+  language exists; the word is in 263 files, some of them verbatim operator quotes that may not be
+  edited. `banned_word_file_count_never_grows` pins the count (tracked and untracked files, ASCII
+  case-insensitive) and fails when it rises or falls without the ceiling moving with it. File:
+  `crates/common/tests/rust_only_guard.rs`. Tests: banned_word_file_count_never_grows,
+  banned_word_scan_self_test.
+- [x] **M3 (second pass) — 51 more uncoded `error!` lines carry a code.** Each gets an existing
+  code and a `source` naming the arm, picked so no CloudWatch filter matches it (no new page).
+  The ratchet drops 61 -> 10; the ten left are listed with their reasons at the budget. Files:
+  24 production files across api, app, core, storage and trading, plus
+  `crates/common/tests/error_code_tag_guard.rs`. Tests: uncoded_error_sites_may_only_shrink,
+  every_critical_code_with_an_emit_site_is_alarmed_or_allowlisted.
+
+- [x] **H3 (core) — a loom test drives the real ghost-unsubscribe register.** The six
+  per-slot registers move into `GhostRegister` (atomics from the new `crate::sync` shim:
+  std atomics normally, loom's under the `loom` feature); the public functions delegate
+  to the one static. The new loom test proves a take is never torn, no request is lost
+  or taken twice, and a pending request is never overwritten; bite-checked by clearing
+  the flag before reading the slot. Added to the CI loom lane (drift list, `--test`,
+  count 3 -> 4). Files: `crates/core/src/sync.rs`, `crates/core/src/lib.rs`,
+  `crates/core/src/websocket/pool_supervisor.rs`, `crates/core/tests/loom_ghost_register.rs`,
+  `.github/workflows/ci.yml`. Tests: a_take_racing_a_new_request_never_tears_loses_or_duplicates,
+  a_pending_request_is_never_overwritten_by_a_later_one,
+  a_racing_take_never_reads_a_torn_id_and_segment_pair.

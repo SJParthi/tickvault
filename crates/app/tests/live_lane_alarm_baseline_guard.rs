@@ -146,8 +146,14 @@ fn park_counter_baseline_is_inside_the_constructor_and_covers_every_label() {
     let text = production_text(&src);
     // Scoped to the constructor's own braces: a helper defined elsewhere in
     // the file, or code sitting between `new` and `admit`, cannot satisfy this.
+    // Searched from `impl PoolSupervisor {` on, because the file holds other
+    // `new()` constructors (the ghost-unsubscribe register's, 2026-10-05) and
+    // the first match in the file is not this one.
+    let impl_start = text
+        .find("impl PoolSupervisor {")
+        .unwrap_or_else(|| panic!("pool_supervisor.rs: `impl PoolSupervisor {{` not found"));
     let ctor = compact(fn_body(
-        &text,
+        &text[impl_start..],
         "pub fn new() -> Self {",
         "pool_supervisor.rs",
     ));

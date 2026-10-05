@@ -186,6 +186,8 @@ pub fn emit_metrics_for_verdict(verdict: QuestDbHealthVerdict, poller: &QuestDbH
             metrics::gauge!("tv_questdb_disconnected_seconds").set(down_for.as_secs_f64());
             metrics::counter!("tv_questdb_disconnect_events_total").increment(1);
             tracing::error!(
+                code = tickvault_common::error_code::ErrorCode::Boot01QuestDbSlow.code_str(),
+                source = "questdb_down_30s",
                 down_for_secs = down_for.as_secs(),
                 disconnect_events_total = poller.disconnect_events_total(),
                 "S3-1 CRITICAL: QuestDB has been disconnected for >30s — tick ring buffer \
@@ -197,6 +199,8 @@ pub fn emit_metrics_for_verdict(verdict: QuestDbHealthVerdict, poller: &QuestDbH
             metrics::gauge!("tv_questdb_connected").set(0.0);
             metrics::gauge!("tv_questdb_disconnected_seconds").set(down_for.as_secs_f64());
             tracing::error!(
+                code = tickvault_common::error_code::ErrorCode::Boot01QuestDbSlow.code_str(),
+                source = "questdb_down_300s",
                 down_for_secs = down_for.as_secs(),
                 "S3-1 FATAL: QuestDB has been disconnected for >300s. Ring buffer and \
                  spill file are approaching capacity. Restart QuestDB or the app now."

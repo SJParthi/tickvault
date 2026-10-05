@@ -488,6 +488,8 @@ impl NotificationService {
                         // independent — different chat channel / retry).
                         if !failed_parts.is_empty() {
                             error!(
+                                code = tickvault_common::error_code::ErrorCode::Telegram01Dropped.code_str(),
+                                source = "chunked_send_partial",
                                 total_chunks = total,
                                 failed_chunks = failed_parts.len(),
                                 failed_part_numbers = ?failed_parts,

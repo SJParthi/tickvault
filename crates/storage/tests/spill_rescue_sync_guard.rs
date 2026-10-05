@@ -227,4 +227,19 @@ fn every_blocking_writer_step_runs_off_the_worker() {
             "{file}: no producer-half ILP flush found; the scan is stale"
         );
     }
+    // Audit M10 (2026-10-05): a refused candle the escalation thread cannot
+    // take is written by the caller, the frame drain. Both calls of the
+    // inline cascade in `escalate` must move the worker aside first.
+    let runner = production("seal_writer_runner.rs");
+    let escalate = body_of(&runner, "pub fn escalate(&self, seal: &BufferedSeal");
+    let calls = escalate.matches("Self::escalate_inline(").count();
+    let wrapped = escalate.matches("off_worker(|| {\n").count();
+    assert_eq!(
+        calls, 2,
+        "escalate's inline calls changed; re-check the scan"
+    );
+    assert_eq!(
+        wrapped, calls,
+        "every inline seal escalation on the caller must run off the worker"
+    );
 }

@@ -83,6 +83,8 @@ async fn publish_dhan_token(token: String) {
         Err(e) => {
             // No token value in the log — only the failure class.
             error!(
+                code = tickvault_common::error_code::ErrorCode::AuthGapTokenExpiry.code_str(),
+                source = "publish_env_unresolved",
                 error = %e,
                 "Dhan token publish skipped: could not resolve environment. \
                  tickvault's own token is unaffected (in-memory); peers may \

@@ -183,6 +183,8 @@ impl OrderApiClient {
         }
         metrics::counter!("tv_alerts_gate_blocks_total", "op" => operation).increment(1);
         error!(
+            code = ErrorCode::OmsGapDryRunSafety.code_str(),
+            source = "alerts_gate",
             operation,
             "alerts gate DISARMED: /alerts request refused (dormant surface, no live conditional/multi orders)"
         );

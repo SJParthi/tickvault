@@ -243,6 +243,8 @@ impl ActivityWatchdog {
                 // longer false-page on Dhan-server idle TCP resets.
                 if is_within_trading_session_ist() {
                     error!(
+                        code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                        source = "activity_watchdog_fired",
                         label = %self.label,
                         threshold_secs = self.threshold.as_secs(),
                         silent_secs = silent_for.as_secs(),
@@ -374,6 +376,8 @@ pub fn spawn_with_panic_notify(watchdog: ActivityWatchdog) -> tokio::task::JoinH
                 .or_else(|| panic_payload.downcast_ref::<String>().map(String::as_str))
                 .unwrap_or("<non-string panic payload>");
             error!(
+                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                source = "activity_watchdog_panicked",
                 label = %label,
                 panic = %panic_msg,
                 "CRITICAL: WS activity watchdog task PANICKED — firing \

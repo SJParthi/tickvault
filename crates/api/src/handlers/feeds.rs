@@ -261,6 +261,8 @@ pub async fn set_feed(
     .unwrap_or_else(|join| Err(std::io::Error::other(join.to_string())));
     if let Err(err) = persisted {
         tracing::error!(
+            code = tickvault_common::error_code::ErrorCode::StorageGap03AuditWriteFailed.code_str(),
+            source = "feed_state_overlay",
             ?err,
             feed = feed.as_str(),
             "failed to persist the feed-state overlay (data/feed-state.json) — \

@@ -111,6 +111,8 @@ pub async fn run_candle_ddl_at_boot(questdb: &QuestDbConfig) {
     }
     if !ready {
         error!(
+            code = tickvault_common::error_code::ErrorCode::Boot01QuestDbSlow.code_str(),
+            source = "candle_ddl_skipped",
             attempts = CANDLE_DDL_READINESS_ATTEMPTS,
             backoff_secs = CANDLE_DDL_READINESS_BACKOFF_SECS,
             "candle DDL boot: QuestDB not ready within the quiet probe bound — \

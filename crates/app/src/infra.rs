@@ -345,6 +345,8 @@ pub async fn ensure_infra_running(questdb_config: &QuestDbConfig) {
         None => {
             metrics::counter!("tv_boot_compose_cli_unavailable_total").increment(1);
             tracing::error!(
+                code = tickvault_common::error_code::ErrorCode::Boot01QuestDbSlow.code_str(),
+                source = "compose_cli_missing",
                 probed_system_paths = ?COMPOSE_PLUGIN_SYSTEM_PATHS,
                 "no usable Docker Compose CLI in this context — `docker compose`, \
                  `docker-compose`, and the system plugin paths all failed to \
@@ -365,6 +367,8 @@ pub async fn ensure_infra_running(questdb_config: &QuestDbConfig) {
             // time, and a "recreate churn" counter blaming the wrong cause.
             metrics::counter!("tv_boot_compose_file_missing_total").increment(1);
             tracing::error!(
+                code = tickvault_common::error_code::ErrorCode::Boot01QuestDbSlow.code_str(),
+                source = "compose_file_missing",
                 compose_cli = cli.label(),
                 candidates = ?[DOCKER_COMPOSE_PATH, DEPLOYED_COMPOSE_PATH],
                 working_dir = ?std::env::current_dir().ok(),
@@ -428,6 +432,8 @@ pub async fn ensure_infra_running(questdb_config: &QuestDbConfig) {
         }
         ComposeOutcome::Critical => {
             tracing::error!(
+                code = tickvault_common::error_code::ErrorCode::Boot01QuestDbSlow.code_str(),
+                source = "compose_up_failed",
                 "docker compose up failed after {COMPOSE_UP_MAX_RETRIES} attempts and \
                  QuestDB is unreachable — services may not be available. \
                  Telegram CRITICAL alert should fire."

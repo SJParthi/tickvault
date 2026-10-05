@@ -352,6 +352,8 @@ async fn emit_boot_completed_when_feed_live(
             // WITHHOLD the alive signal so the boot-heartbeat alarm pages on the
             // MISSING metric, and name the dead feed(s) for the operator.
             error!(
+                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                source = "boot_no_feed_live",
                 dhan_enabled,
                 dhan_running,
                 wait_secs = BOOT_COMPLETED_FEED_LIVENESS_WAIT_SECS,
@@ -737,6 +739,8 @@ async fn async_main() -> Result<()> {
     .date_naive();
     if let Err(e) = config.strategy.check_sandbox_window(today_ist) {
         error!(
+            code = tickvault_common::error_code::ErrorCode::OmsGapDryRunSafety.code_str(),
+            source = "sandbox_window_boot",
             error = %e,
             "S6-Step4 BOOT BLOCKED: sandbox-only window violation"
         );
@@ -3207,6 +3211,8 @@ async fn async_main() -> Result<()> {
     ) {
         tickvault_app::dhan_feed_stack::FeedStackGate::DisabledByEnv => {
             error!(
+                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                source = "live_feed_env_missing",
                 env_var = tickvault_app::dhan_feed_stack::DHAN_LIVE_FEED_ENV,
                 "config enables the Dhan live feed but the environment opt-in is missing, so NO \
                  live market data will flow this session — no ticks, no live candles, and the \
@@ -4249,6 +4255,8 @@ async fn build_shared_infra(
         Ok(n) => n,
         Err(reason) => {
             error!(
+                code = tickvault_common::error_code::ErrorCode::Telegram01Dropped.code_str(),
+                source = "notifier_init_failed",
                 reason = %reason,
                 "SHARED-INFRA BOOT: strict notifier init failed — REFUSING BOOT (systemd will restart)"
             );

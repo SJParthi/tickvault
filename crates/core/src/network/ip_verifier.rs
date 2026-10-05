@@ -70,7 +70,7 @@ pub async fn verify_public_ip() -> Result<IpVerificationResult, ApplicationError
 
     // Step 2: Validate expected IP format
     validate_ipv4_format(&expected_ip).map_err(|reason| {
-        error!(reason = %reason, "SSM static IP is not a valid IPv4 address");
+        error!(code = tickvault_common::error_code::ErrorCode::GapNetIpMonitor.code_str(), source = "ssm_ip_invalid", reason = %reason, "SSM static IP is not a valid IPv4 address");
         ApplicationError::IpVerificationFailed { reason }
     })?;
 
@@ -456,6 +456,8 @@ pub async fn get_ip(
         let captured_body = capture_rest_error_body(&body);
         let redacted_url = redact_url_params(&url);
         error!(
+            code = tickvault_common::error_code::ErrorCode::GapNetIpMonitor.code_str(),
+            source = "get_ip_non_2xx",
             status = %status,
             url = %redacted_url,
             body = %captured_body,
