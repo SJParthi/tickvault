@@ -10658,8 +10658,17 @@ pub struct ConnectionDelivery {
     pub frames: u64,
 }
 
-/// Every slot's delivery record at `now_millis`. Pure over the two statics, so
-/// the never-ticked and clock-stepped-backwards cases are unit tests.
+/// Every primary-account slot's delivery record at `now_millis`. Pure over the
+/// two statics, so the never-ticked and clock-stepped-backwards cases are unit
+/// tests.
+///
+/// Only the PRIMARY account's sixteen slots are reported. The depth account's
+/// ten slots (16..26, 2026-09-26) are tiled in the budget, but no code in this
+/// build dials them: the account has no config, no token read and no pool. The
+/// console listed them as ten extra depth-20 and depth-200 rows that said
+/// "never", which read as a second depth pool (operator, 2026-10-05: "why
+/// double time same dpeth 20 and dpeth 200 showing again"). When the depth
+/// account is wired, this filter widens with it.
 #[must_use]
 pub fn connection_deliveries(now_millis: i64) -> Vec<ConnectionDelivery> {
     PER_CONN_LAST_TICK_MILLIS
@@ -10668,7 +10677,11 @@ pub fn connection_deliveries(now_millis: i64) -> Vec<ConnectionDelivery> {
         .enumerate()
         .filter_map(|(index, (last, frames))| {
             let connection_index = u8::try_from(index).ok()?;
-            let endpoint = endpoint_for_slot(connection_index)?;
+            let (account, endpoint) =
+                tickvault_core::websocket::pool_budget::slot_owner(connection_index)?;
+            if account != tickvault_core::websocket::pool_budget::DhanAccount::Primary {
+                return None;
+            }
             let last = last.load(Ordering::Relaxed);
             let tick_age_secs = (last != 0).then(|| {
                 // saturating: a clock stepped backwards reads as 0 age, never
@@ -10685,7 +10698,8 @@ pub fn connection_deliveries(now_millis: i64) -> Vec<ConnectionDelivery> {
         .collect()
 }
 
-/// Publishes [`CONN_TICK_AGE_GAUGE`] and [`CONN_FRAMES_GAUGE`] for every slot.
+/// Publishes [`CONN_TICK_AGE_GAUGE`] and [`CONN_FRAMES_GAUGE`] for every slot
+/// [`connection_deliveries`] reports (the primary account's sixteen).
 ///
 /// Called from the drain's 30-second timer arm beside the worst-socket gauge.
 /// The labelled handles are resolved ONCE (at first publish, from the
@@ -10695,10 +10709,16 @@ pub fn connection_deliveries(now_millis: i64) -> Vec<ConnectionDelivery> {
 pub fn publish_connection_deliveries(now_millis: i64) {
     static HANDLES: std::sync::OnceLock<Vec<(metrics::Gauge, metrics::Gauge)>> =
         std::sync::OnceLock::new();
+    // Registered for the slots `connection_deliveries` reports and no others:
+    // the exporter renders a registered gauge even if it is never set, so a
+    // handle for an undialled depth-account slot would put its row back on
+    // the console as a "0 frames, never" socket.
     let handles = HANDLES.get_or_init(|| {
-        (0..MAX_TOTAL_DHAN_CONNECTIONS)
-            .map(|slot| {
-                let endpoint = endpoint_for_slot(slot).map_or("unknown", DhanEndpointType::as_str);
+        connection_deliveries(0)
+            .into_iter()
+            .map(|delivery| {
+                let slot = delivery.connection_index;
+                let endpoint = delivery.endpoint.as_str();
                 (
                     metrics::gauge!(
                         CONN_TICK_AGE_GAUGE,
@@ -10714,10 +10734,9 @@ pub fn publish_connection_deliveries(now_millis: i64) {
             })
             .collect()
     });
-    for delivery in connection_deliveries(now_millis) {
-        let Some((age, frames)) = handles.get(usize::from(delivery.connection_index)) else {
-            continue;
-        };
+    // `connection_deliveries` is a pure function of the slot layout, so it
+    // yields the same slots in the same order as the registration above.
+    for ((age, frames), delivery) in handles.iter().zip(connection_deliveries(now_millis)) {
         age.set(delivery.tick_age_secs.map_or(-1.0, |secs| {
             f64::from(u32::try_from(secs).unwrap_or(u32::MAX))
         }));
@@ -30056,11 +30075,45 @@ mod connection_delivery_tests {
             before.frames + 2,
             "one count per data-bearing frame"
         );
-        // Rows exist for every slot, stamped or not, so the console can show
-        // the sixteen sockets rather than only the ones that happened to tick.
+        // Rows exist for every primary slot, stamped or not, so the console
+        // can show the sixteen sockets rather than only the ones that
+        // happened to tick.
+        assert_eq!(connection_deliveries(now).len(), PRIMARY_SLOTS);
+    }
+
+    /// The sixteen primary-account sockets.
+    const PRIMARY_SLOTS: usize = 16;
+
+    /// The depth account is not dialled by this build, so its ten slots must
+    /// not appear as ten extra "never" depth rows on the console (2026-10-05).
+    #[test]
+    fn connection_deliveries_report_only_the_primary_accounts_sixteen_slots() {
+        use tickvault_core::websocket::pool_budget::{DhanAccount, slot_owner};
+        let rows = connection_deliveries(1_757_300_000_000_i64);
+        assert_eq!(rows.len(), PRIMARY_SLOTS);
+        for row in &rows {
+            assert_eq!(
+                slot_owner(row.connection_index).map(|(account, _)| account),
+                Some(DhanAccount::Primary),
+                "slot {} is not a primary-account slot",
+                row.connection_index
+            );
+        }
+        let depth_slot = DhanAccount::Depth.jitter_base(DhanEndpointType::Depth20);
+        assert!(rows.iter().all(|d| d.connection_index != depth_slot));
         assert_eq!(
-            connection_deliveries(now).len(),
-            usize::from(MAX_TOTAL_DHAN_CONNECTIONS)
+            rows.iter()
+                .map(|d| d.endpoint)
+                .filter(|e| *e == DhanEndpointType::Depth20)
+                .count(),
+            5
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|d| d.endpoint)
+                .filter(|e| *e == DhanEndpointType::Depth200)
+                .count(),
+            5
         );
     }
 
@@ -30074,10 +30127,7 @@ mod connection_delivery_tests {
         publish_connection_deliveries(now + 30_000);
         // Publishing re-reads the same per-slot state the console reads:
         // every one of the sixteen sockets is still reported afterwards.
-        assert_eq!(
-            connection_deliveries(now + 30_000).len(),
-            MAX_TOTAL_DHAN_CONNECTIONS as usize
-        );
+        assert_eq!(connection_deliveries(now + 30_000).len(), PRIMARY_SLOTS);
     }
 
     /// A clock stepped backwards reads as age 0, never as a wrapped giant.
