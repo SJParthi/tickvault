@@ -11,6 +11,12 @@
 //! using the Loom model checker.
 //!
 //! Run with: cargo test -p tickvault-core --features loom --test loom_tick_dedup
+//!
+//! PATTERN MODEL (audit H3, 2026-10-05): this file models the pattern, not
+//! production code, so a change to the real code cannot fail it. The storage
+//! gate it was written for was deleted on 2026-07-18; the counter and mutex
+//! patterns it keeps have no production type of their own to drive.
+//! `real_code_loom_guard.rs` caps such files and may only shrink.
 
 #[cfg(feature = "loom")]
 mod loom_tests {

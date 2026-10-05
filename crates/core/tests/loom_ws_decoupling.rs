@@ -22,6 +22,11 @@
 //!
 //! Run with:
 //!   cargo test -p tickvault-core --features loom --test loom_ws_decoupling
+//!
+//! PATTERN MODEL (audit H3, 2026-10-05): this file models the pattern, not
+//! production code, so a change to the real code cannot fail it. The real
+//! path is a tokio `mpsc` frame ring plus the WAL writer thread, which loom
+//! cannot run. `real_code_loom_guard.rs` caps such files and may only shrink.
 
 #[cfg(feature = "loom")]
 mod loom_tests {

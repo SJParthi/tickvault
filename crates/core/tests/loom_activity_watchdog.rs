@@ -28,6 +28,13 @@
 //!
 //! Run with:
 //!   cargo test -p tickvault-core --features loom --test loom_activity_watchdog
+//!
+//! PATTERN MODEL (audit H3, 2026-10-05): this file models the pattern, not
+//! production code, so a change to the real code cannot fail it. The real
+//! `ActivityWatchdog::run` is a tokio task (an interval timer and a `Notify`),
+//! which loom cannot run; the only state it shares with the reader is one
+//! `Relaxed` counter. `real_code_loom_guard.rs` caps such files and may only
+//! shrink.
 
 #[cfg(feature = "loom")]
 mod loom_tests {
