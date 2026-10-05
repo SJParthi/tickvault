@@ -738,6 +738,42 @@ rules:
       database, a blocking step) needs an operator to read the stage and
       heartbeat gauges.
 
+  - name: boot-04-wal-init-failed-escalate
+    match:
+      code: BOOT-04
+    action: escalate
+    runbook_path: docs/error-runbooks/process-lifecycle-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      BOOT-04 = the durable frame log could not be opened at boot, so boot
+      halts on purpose. The cause is disk space or permissions on
+      the WAL directory, which an operator must fix; never auto-actioned.
+
+  - name: proc-02-panic-escalate
+    match:
+      code: PROC-02
+    action: escalate
+    runbook_path: docs/error-runbooks/process-lifecycle-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      PROC-02 = the process panicked; the panic hook logged the location,
+      the message and the WAL drain result. A panic is a bug that
+      needs a code fix; never auto-actioned.
+
+  - name: api-server-01-stopped-escalate
+    match:
+      code: API-SERVER-01
+    action: escalate
+    runbook_path: docs/error-runbooks/process-lifecycle-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      API-SERVER-01 = the HTTP API server task returned an error; /health
+      and /api/* stop answering until a restart while the feed keeps
+      running. A restart is an operator decision, so this escalates.
+
   - name: prev-close-01-ilp-failed-escalate
     match:
       code: PREVCLOSE-01
