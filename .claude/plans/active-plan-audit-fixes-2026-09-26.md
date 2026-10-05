@@ -2652,50 +2652,72 @@ write, then candle warm-up (PR31b-2 (a), already listed above). Each fix ships a
   each step still costs what it did; only the worker it holds changes. Boot-only and shutdown-only
   steps (the WAL replay, the mapping-artifact wait, shutdown joins) are left as they are.
 
-### Added 2026-10-04 (deep audit, items M1 and M2)
+### Added 2026-10-04 (workspace audit, owner tapped "Page me" on the data-at-risk card)
 
-- [x] **M1 — A shed frame the WAL then fails to write is counted as lost.** A frame the ring or
-  the drain shed was marked unapplied and left to the WAL; a WAL write that failed afterwards
-  lost it with no count. New `wal_frame_fate` table records, per frame sequence, which side shed
-  it and whether the writer lost it; the side that completes the pair counts the loss
-  (`tv_wal_shed_frames_lost_total{shed}`, `tv_ticks_lost_total{source="wal_lost_after_shed"}`,
-  WS-SPILL-02). The drain refuses to shed a depth frame the writer already lost and writes it.
-  The writer reports every record of a discarded segment, every record it could not write, and
-  every record left in its queue at exit; an abandoned shutdown counts unflushed sheds. Files:
-  `crates/storage/src/{lib,wal_frame_fate,ws_frame_spill}.rs`,
-  `crates/core/src/websocket/pool_supervisor.rs`, `crates/app/src/dhan_feed_stack.rs`,
-  `crates/common/tests/loss_counter_visibility_guard.rs`. Tests:
-  test_note_shed_then_note_lost_counts_a_ring_shed_as_lost,
-  test_a_shed_racing_a_loss_is_counted_exactly_once,
-  test_discarded_writer_reports_a_shed_frame_as_lost,
-  test_records_left_at_writer_exit_are_reported_lost,
-  drain_may_shed_depth_refuses_a_frame_the_wal_writer_lost. Honest limits: a crash loses the
-  queue and the table; a slot reused by a newer frame makes the older fate unknown (counted).
-- [x] **M2 — The backup-copy dedup no longer drops an older packet that is not a copy.** Only a
-  packet matching the other socket's fingerprint is dropped; an older one is kept as late, in its
-  own 4-entry ring, so it never evicts the main ring and its twin is still dropped. File:
-  `crates/app/src/main_feed_backup.rs`. Tests:
-  test_admit_tick_older_copy_is_kept_as_late_newer_from_backup_accepted,
-  test_lagging_copy_beyond_the_ring_is_kept_as_late,
-  proptest_two_socket_interleave_never_double_counts. **Amended the same day after review:** the
-  first draft kept every unmatched older packet, so a copy lagging past the ring was written
-  twice (scope lock 2026-10-02: one copy per packet). Now kept only when the ring still holds a
-  strictly older packet from the other socket (`ring_covers`); otherwise dropped as `older`,
-  counted. Tests: proptest_conflating_sockets_never_fold_a_packet_twice (bite-tested against
-  the first draft), test_regression_lagging_copy_beyond_the_ring_is_dropped_as_older. Honest
-  limit: a real packet the other socket skipped is dropped when it arrives more than the ring
-  behind, or with the same volume and trade time as a packet the other socket sent.
-- [x] **M1 review fixes.** The abandoned-shutdown scan marks each frame it counts as lost, so the
-  detached writer cannot count it again; records past the tally are counted unknown only when
-  the file ends short. File: `crates/storage/src/{wal_frame_fate,ws_frame_spill}.rs`. Test:
-  test_count_unflushed_sheds_marks_what_it_counts_so_a_late_loss_is_not_recounted.
-- [x] **N2 — The candle hand-off queue no longer allocates under a backlog.** The tokio `mpsc`
-  between the frame drain and the seal writer grew in 32-slot blocks as seals queued; it is now
-  a pre-sized bounded `crossbeam_channel` (`SealSender`), allocated once at build (≤ 46 MB
-  resident). Files: `crates/storage/src/seal_writer_runner.rs`,
-  `crates/app/src/{dhan_feed_stack,rest_candle_fold}.rs`,
-  `crates/storage/tests/dhat_seal_queue_backlog.rs`. Test:
-  dhat_seal_queue_backlog_never_allocates_where_the_tokio_queue_did.
+- [x] **P1 — Five data-at-risk pages over ten counters that reached no one.** Failed cloud
+  backups, files kept on disk because no verified copy exists, dropped order updates, dropped log
+  lines and the feed thread writing a rescue to disk itself were each counted on the box and seen
+  by nobody. The ten counters join the main EMF selector, each is registered at 0 at boot (after
+  the recorder install, every label value), and five metric-math alarms sum them (`notBreaching`,
+  no `ok_actions`, `host` only; the cloud-backup alarm needs 2 of 3 × 900 s). Rule first:
+  noise-lock §2.9 and aws-budget COST NOTE 2026-10-04. Files: `crates/app/src/main.rs`,
+  `crates/aws-lambdas/src/telegram_webhook.rs`, `deploy/aws/cloudwatch-agent.json`,
+  `deploy/aws/terraform/data-at-risk-alarms.tf`,
+  `crates/common/tests/cloudwatch_app_alarms_wiring.rs`. Tests:
+  test_emf_metric_selectors_name_count_is_pinned, every_alarmed_counter_is_registered_at_boot,
+  every_live_alarm_has_a_plain_english_phrase. Honest limits: the log-drop and feed-inline thresholds have no measured
+  baseline (Assumed). The order-update drop `error!` carries `ORDER-EVT-01` since P2.
+
+- [x] **P2 — Ten uncoded `error!` lines get existing codes; the weekly mutation run can start.**
+  Audit M3: ten failure lines carried no code, so coded-error triage could not find them. Each now
+  carries an existing code, none of them paged (no new page, no noise-lock row): the order-update
+  broadcast drop (`ORDER-EVT-01`, stage `broadcast_no_receiver`, runbook row added), the
+  order-update WAL drop and the boot WAL replay failure (`WS-SPILL-02` with a `source`; the spill
+  already counts the drop per frame type), the order-update server auth/API error (`WS-GAP-01`),
+  the two token-renewal give-up lines and the token publish failure (`AUTH-GAP-01`), the two
+  static-IP boot-check lines (`GAP-NET-01`), and the seal-writer construct failure
+  (`AGGREGATOR-SEAL-01`). The uncoded budget falls 71 → 61. Audit H2: `cargo mutants` copied the
+  tree without `.git`, so the guards that call `git ls-files` failed the unmutated baseline and
+  no mutant was ever tested; the workflow now runs `--in-place` (serial, disposable checkout).
+  Audit L3: the committed test-count baseline moves 12295 → 13559 (measured). Files:
+  `crates/core/src/websocket/order_update_connection.rs`, `crates/core/src/auth/token_manager.rs`,
+  `crates/core/src/auth/dhan_token_publisher.rs`, `crates/core/src/network/ip_verifier.rs`,
+  `crates/app/src/main.rs`, `crates/common/tests/error_code_tag_guard.rs`,
+  `docs/error-runbooks/order-update-events-error-codes.md`, `.github/workflows/mutation.yml`,
+  `.claude/hooks/.test-count-baseline`. Tests: uncoded_error_sites_may_only_shrink,
+  every_error_macro_tagged_with_a_known_code_carries_code_field. Honest limits: `--in-place` is
+  proven only by the next scheduled or dispatched mutation run (Assumed until then); 61 uncoded
+  `error!` lines remain.
+
+- [x] **P3 — A spill replay that fails part-way through a file keeps what it finished.** Audit N1:
+  when a later chunk of a spill file failed (QuestDB busy, a read error), the round dropped the
+  chunks it had already finished, so the next round restarted at the old offset and set the same
+  refused lines aside again, once per retry, into `<file>.rejected-lines`. The failure branch now
+  records `resume_from + accepted` (every finished chunk ends on a line boundary) and counts those
+  bytes as replayed. Also: quarantining a whole file now forgets its resume offset, so the next
+  file of the same name (names recur per feed and hour) starts at its first byte instead of a
+  stale offset. Files: `crates/storage/src/tick_spill_replay.rs`. Tests:
+  a_failure_later_in_a_file_does_not_set_the_same_line_aside_twice,
+  quarantining_a_file_forgets_its_resume_offset. Honest limits: a failure INSIDE a chunk still
+  re-sends that chunk next round (idempotent, the dedup keys carry the row identity); the offset
+  map lives in memory only, so after a restart a partly drained file is re-sent from the start and
+  its refused lines are set aside a second time, as before.
+
+- [x] **P4 — A failed half-open probe re-opens the order circuit breaker.** Found writing the H3
+  loom model: when the one half-open probe failed, `record_failure` left the old open window and
+  the spent probe flag in place, so `state()` read HalfOpen for ever and `check()` refused every
+  order, the next probe included, until a manual `reset()`. A failure while the probe is spent now
+  re-arms the open window from now and frees the probe (window stored before the flag is
+  released), and `check()` re-reads the state after winning the probe flag, so a failed probe is
+  never followed at once by another. Audit H3: the loom tests now drive the real struct through a
+  `crate::sync` shim (loom atomics under the `loom` feature, std atomics otherwise). Files:
+  `crates/trading/src/{sync.rs,lib.rs,oms/circuit_breaker.rs}`,
+  `crates/trading/tests/loom_circuit_breaker.rs`. Tests:
+  test_regression_failed_half_open_probe_rearms_the_open_window,
+  test_late_failure_while_open_keeps_the_open_window,
+  loom_failed_probe_reopens_and_allows_no_second_probe (both bite-checked: each fails with the
+  re-arm removed). Honest limits: only the breaker moved behind the shim here; the other loom files are unchanged
+  by this item; O(1), three atomics on the failure path.
 
 - [x] **M7 — Orders carry their exchange segment (I-P1-11).** `ManagedOrder` and
   `PlaceOrderRequest` had no segment, so the paper filler, the reconcile mirror and the exit path
@@ -2775,6 +2797,51 @@ write, then candle warm-up (PR31b-2 (a), already listed above). Each fix ships a
   each table bite-checked). Verified with nextest 0.9.146, the version CI installs: a test that
   passes only on retry is reported `FLKY-FL` and fails the run. Honest limit: a budget caps
   growth; it does not remove the existing shell (that is the shrink-only follow-up).
+
+### Added 2026-10-04 (deep audit, items M1 and M2)
+
+- [x] **M1 — A shed frame the WAL then fails to write is counted as lost.** A frame the ring or
+  the drain shed was marked unapplied and left to the WAL; a WAL write that failed afterwards
+  lost it with no count. New `wal_frame_fate` table records, per frame sequence, which side shed
+  it and whether the writer lost it; the side that completes the pair counts the loss
+  (`tv_wal_shed_frames_lost_total{shed}`, `tv_ticks_lost_total{source="wal_lost_after_shed"}`,
+  WS-SPILL-02). The drain refuses to shed a depth frame the writer already lost and writes it.
+  The writer reports every record of a discarded segment, every record it could not write, and
+  every record left in its queue at exit; an abandoned shutdown counts unflushed sheds. Files:
+  `crates/storage/src/{lib,wal_frame_fate,ws_frame_spill}.rs`,
+  `crates/core/src/websocket/pool_supervisor.rs`, `crates/app/src/dhan_feed_stack.rs`,
+  `crates/common/tests/loss_counter_visibility_guard.rs`. Tests:
+  test_note_shed_then_note_lost_counts_a_ring_shed_as_lost,
+  test_a_shed_racing_a_loss_is_counted_exactly_once,
+  test_discarded_writer_reports_a_shed_frame_as_lost,
+  test_records_left_at_writer_exit_are_reported_lost,
+  drain_may_shed_depth_refuses_a_frame_the_wal_writer_lost. Honest limits: a crash loses the
+  queue and the table; a slot reused by a newer frame makes the older fate unknown (counted).
+- [x] **M2 — The backup-copy dedup no longer drops an older packet that is not a copy.** Only a
+  packet matching the other socket's fingerprint is dropped; an older one is kept as late, in its
+  own 4-entry ring, so it never evicts the main ring and its twin is still dropped. File:
+  `crates/app/src/main_feed_backup.rs`. Tests:
+  test_admit_tick_older_copy_is_kept_as_late_newer_from_backup_accepted,
+  test_lagging_copy_beyond_the_ring_is_kept_as_late,
+  proptest_two_socket_interleave_never_double_counts. **Amended the same day after review:** the
+  first draft kept every unmatched older packet, so a copy lagging past the ring was written
+  twice (scope lock 2026-10-02: one copy per packet). Now kept only when the ring still holds a
+  strictly older packet from the other socket (`ring_covers`); otherwise dropped as `older`,
+  counted. Tests: proptest_conflating_sockets_never_fold_a_packet_twice (bite-tested against
+  the first draft), test_regression_lagging_copy_beyond_the_ring_is_dropped_as_older. Honest
+  limit: a real packet the other socket skipped is dropped when it arrives more than the ring
+  behind, or with the same volume and trade time as a packet the other socket sent.
+- [x] **M1 review fixes.** The abandoned-shutdown scan marks each frame it counts as lost, so the
+  detached writer cannot count it again; records past the tally are counted unknown only when
+  the file ends short. File: `crates/storage/src/{wal_frame_fate,ws_frame_spill}.rs`. Test:
+  test_count_unflushed_sheds_marks_what_it_counts_so_a_late_loss_is_not_recounted.
+- [x] **N2 — The candle hand-off queue no longer allocates under a backlog.** The tokio `mpsc`
+  between the frame drain and the seal writer grew in 32-slot blocks as seals queued; it is now
+  a pre-sized bounded `crossbeam_channel` (`SealSender`), allocated once at build (≤ 46 MB
+  resident). Files: `crates/storage/src/seal_writer_runner.rs`,
+  `crates/app/src/{dhan_feed_stack,rest_candle_fold}.rs`,
+  `crates/storage/tests/dhat_seal_queue_backlog.rs`. Test:
+  dhat_seal_queue_backlog_never_allocates_where_the_tokio_queue_did.
 
 ## Edge Cases
 
