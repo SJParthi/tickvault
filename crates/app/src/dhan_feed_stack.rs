@@ -10460,14 +10460,30 @@ fn ws_lag_whole_ms(exchange_timestamp: u32, received_at_nanos: i64) -> Option<i6
 /// The emitted series are byte-identical to before
 /// (`tv_dhan_ws_lag_ms{connection="0".."15"}`), which is what makes this a safe
 /// refactor: no dashboard, alarm, or EMF selector can tell the difference.
+///
+/// # ⚠ CHANGED 2026-10-05 (audit M6): no `metrics::Histogram` on this path
+///
+/// Resolving the handle once removed the LABEL allocation and left the
+/// RECORDER's: `metrics-exporter-prometheus` stores every histogram sample in
+/// a `metrics_util` `AtomicBucket`, a list of 64-slot blocks that allocates a
+/// new block each time the tail fills and frees them only at a scrape. So the
+/// per-tick `record` still allocated about once every 64 ticks per socket, and
+/// `dhat_ws_lag.rs` could not see it because it runs with no recorder (every
+/// handle is a no-op there). Each slot is now a fixed [`WsLagSlot`] of atomic
+/// bucket counts: three relaxed adds per tick, no allocation, recorder or
+/// not. `publish_fold_depth` republishes them as the same
+/// `tv_dhan_ws_lag_ms_{bucket,count,sum}` lines a histogram rendered, so the
+/// operator console reads what it read before. Pinned by
+/// `crates/app/tests/dhat_ws_lag_recorder.rs`, which installs the production
+/// recorder.
 struct WsLagHandles {
     /// Indexed by connection slot. Built once; never resized.
-    per_connection: [metrics::Histogram; MAX_TOTAL_DHAN_CONNECTIONS as usize],
+    per_connection: [WsLagSlot; MAX_TOTAL_DHAN_CONNECTIONS as usize],
     /// Fallback for a slot outside the pool budget. Should be unreachable —
     /// `ConnectionSlot` is allocated from the same budget — but a hot-path
     /// index must never panic and must never allocate, so it degrades into a
     /// counted bucket instead.
-    unknown_connection: metrics::Histogram,
+    unknown_connection: WsLagSlot,
     unknown_slot: metrics::Counter,
     excluded_clamped_negative: metrics::Counter,
     excluded_implausible_ltt: metrics::Counter,
@@ -10480,15 +10496,10 @@ struct WsLagHandles {
 impl WsLagHandles {
     fn new() -> Self {
         Self {
-            // `to_string()` here runs at most 16 times, at first-tick, on the
-            // cold path — not per tick. That is the whole point of the cache.
-            per_connection: std::array::from_fn(
-                |slot| metrics::histogram!(WS_LAG_HISTOGRAM, "connection" => slot.to_string()),
-            ),
-            unknown_connection: metrics::histogram!(
-                WS_LAG_HISTOGRAM,
-                "connection" => "unknown"
-            ),
+            // No metric is registered here: each slot registers its exposition
+            // counters on the cold publish path, the first time it has a sample.
+            per_connection: std::array::from_fn(|_| WsLagSlot::new()),
+            unknown_connection: WsLagSlot::new(),
             unknown_slot: metrics::counter!(
                 WS_LAG_EXCLUDED_COUNTER,
                 "reason" => "unknown_connection_slot"
@@ -10510,7 +10521,7 @@ impl WsLagHandles {
 
     /// The histogram for one slot. Out-of-range degrades to a counted bucket —
     /// never a panic, never an allocation.
-    fn histogram_for(&self, connection_index: u8) -> &metrics::Histogram {
+    fn histogram_for(&self, connection_index: u8) -> &WsLagSlot {
         match self.per_connection.get(connection_index as usize) {
             Some(histogram) => histogram,
             None => {
@@ -10518,6 +10529,127 @@ impl WsLagHandles {
                 &self.unknown_connection
             }
         }
+    }
+
+    /// Republishes every slot that gained samples since its last publish.
+    /// Cold: called from `publish_fold_depth`, never per tick.
+    fn publish(&self) {
+        for (slot, lag) in self.per_connection.iter().enumerate() {
+            lag.publish(|| slot.to_string());
+        }
+        self.unknown_connection.publish(|| "unknown".to_owned());
+    }
+}
+
+/// Upper bounds, in milliseconds, of the delivery-lag buckets. The same set
+/// the generic `_ms` histogram buckets carry
+/// (`observability::API_MS_HISTOGRAM_BUCKETS`, pinned equal by
+/// `ws_lag_bucket_bounds_match_the_ms_histogram_buckets`), so the published
+/// `le` values are the ones the old histogram rendered.
+const WS_LAG_BUCKET_BOUNDS_MS: [u64; 14] = [
+    1, 5, 10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000, 60_000,
+];
+
+/// One count per bound plus the overflow (`+Inf`) bucket.
+const WS_LAG_BUCKET_SLOTS: usize = WS_LAG_BUCKET_BOUNDS_MS.len() + 1;
+
+/// The `le` label of each bucket, in [`WS_LAG_BUCKET_BOUNDS_MS`] order.
+const WS_LAG_BUCKET_LE: [&str; WS_LAG_BUCKET_SLOTS] = [
+    "1", "5", "10", "25", "50", "100", "250", "500", "1000", "2500", "5000", "10000", "30000",
+    "60000", "+Inf",
+];
+
+/// Exposition names, the three a Prometheus histogram named
+/// [`WS_LAG_HISTOGRAM`] renders.
+const WS_LAG_BUCKET_SERIES: &str = "tv_dhan_ws_lag_ms_bucket";
+const WS_LAG_COUNT_SERIES: &str = "tv_dhan_ws_lag_ms_count";
+const WS_LAG_SUM_SERIES: &str = "tv_dhan_ws_lag_ms_sum";
+
+/// One socket's delivery-lag histogram as fixed atomic counts (audit M6).
+///
+/// `record_ms` is three relaxed `fetch_add`s and a scan of the 14 fixed bounds:
+/// O(1), constant, zero allocation. The counts are NON-cumulative; `publish`
+/// turns them into the cumulative `le` series on the cold path.
+struct WsLagSlot {
+    buckets: [std::sync::atomic::AtomicU64; WS_LAG_BUCKET_SLOTS],
+    sum_ms: std::sync::atomic::AtomicU64,
+    /// Total samples at the last publish; a slot with no new sample is skipped.
+    published: std::sync::atomic::AtomicU64,
+    /// Exposition counters, registered the first time this slot publishes.
+    counters: OnceLock<WsLagSlotCounters>,
+}
+
+struct WsLagSlotCounters {
+    buckets: [metrics::Counter; WS_LAG_BUCKET_SLOTS],
+    count: metrics::Counter,
+    sum: metrics::Counter,
+}
+
+impl WsLagSlot {
+    fn new() -> Self {
+        Self {
+            buckets: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+            sum_ms: std::sync::atomic::AtomicU64::new(0),
+            published: std::sync::atomic::AtomicU64::new(0),
+            counters: OnceLock::new(),
+        }
+    }
+
+    /// Records one sample. `le` semantics: a sample equal to a bound lands in
+    /// that bound's bucket, as a Prometheus histogram counts it.
+    #[inline]
+    fn record_ms(&self, ms: u64) {
+        let index = WS_LAG_BUCKET_BOUNDS_MS
+            .iter()
+            .position(|&bound| ms <= bound)
+            .unwrap_or(WS_LAG_BUCKET_BOUNDS_MS.len());
+        if let Some(bucket) = self.buckets.get(index) {
+            bucket.fetch_add(1, Ordering::Relaxed);
+        }
+        self.sum_ms.fetch_add(ms, Ordering::Relaxed);
+    }
+
+    /// Cumulative bucket counts; the last entry is the total.
+    fn cumulative(&self) -> [u64; WS_LAG_BUCKET_SLOTS] {
+        let mut out = [0_u64; WS_LAG_BUCKET_SLOTS];
+        let mut running = 0_u64;
+        for (slot, bucket) in out.iter_mut().zip(&self.buckets) {
+            running = running.saturating_add(bucket.load(Ordering::Relaxed));
+            *slot = running;
+        }
+        out
+    }
+
+    /// Sets the exposition counters to the current cumulative counts. O(15)
+    /// loads per slot; registers the counters (allocates their keys) once, the
+    /// first time the slot has a sample. `_count` is the `+Inf` bucket, so the
+    /// two can never disagree.
+    fn publish(&self, label: impl FnOnce() -> String) {
+        let cumulative = self.cumulative();
+        let total = cumulative[WS_LAG_BUCKET_SLOTS - 1];
+        if total == self.published.load(Ordering::Relaxed) {
+            return;
+        }
+        let counters = self.counters.get_or_init(|| {
+            let connection = label();
+            WsLagSlotCounters {
+                buckets: std::array::from_fn(|i| {
+                    metrics::counter!(
+                        WS_LAG_BUCKET_SERIES,
+                        "connection" => connection.clone(),
+                        "le" => WS_LAG_BUCKET_LE[i]
+                    )
+                }),
+                count: metrics::counter!(WS_LAG_COUNT_SERIES, "connection" => connection.clone()),
+                sum: metrics::counter!(WS_LAG_SUM_SERIES, "connection" => connection),
+            }
+        });
+        for (counter, value) in counters.buckets.iter().zip(cumulative) {
+            counter.absolute(value);
+        }
+        counters.count.absolute(total);
+        counters.sum.absolute(self.sum_ms.load(Ordering::Relaxed));
+        self.published.store(total, Ordering::Relaxed);
     }
 }
 
@@ -10917,7 +11049,6 @@ pub fn record_ws_lag(connection_index: u8, tick: &ParsedTick, received_at_nanos:
     let handles = ws_lag_handles();
     match ws_lag_ms(tick.exchange_timestamp, received_at_nanos) {
         Some(WsLag::Measured(ms)) => {
-            handles.histogram_for(connection_index).record(ms);
             // Also fold into the DAY distribution the 15:45 scoreboard
             // persists. Added 2026-09-05: the fold lost its last production
             // caller on 2026-07-17 and the 2026-08-09 Dhan revival did not
@@ -10934,13 +11065,14 @@ pub fn record_ws_lag(connection_index: u8, tick: &ParsedTick, received_at_nanos:
             // APPROVED: exact round-trip of a whole-millisecond i64; see above.
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let day_ms = ms.max(0.0) as u64;
+            handles.histogram_for(connection_index).record_ms(day_ms);
             tickvault_core::pipeline::feed_lag_monitor::record_day_lag_ms(
                 tickvault_common::feed::Feed::Dhan,
                 day_ms,
             );
         }
         Some(WsLag::ClampedNegative) => {
-            handles.histogram_for(connection_index).record(0.0);
+            handles.histogram_for(connection_index).record_ms(0);
             handles.excluded_clamped_negative.increment(1);
             // Counted as a zero-lag sample in the day distribution too, so the
             // scoreboard's sample count matches the histogram's. Dropping it
@@ -11015,6 +11147,9 @@ fn publish_fold_depth(ingest: &LiveIngest) {
     metrics::gauge!(RING_DWELL_MAX_MS_GAUGE)
         .set(RING_DWELL_PEAK.publish(take_ring_dwell_max_ms(), now_ms));
     metrics::gauge!(WS_LAG_MAX_MS_GAUGE).set(WS_LAG_PEAK.publish(take_ws_lag_max_ms(), now_ms));
+    // The lag histogram's buckets ride the same publish (audit M6): the tick
+    // path only adds to atomics; the exposition counters are set here.
+    ws_lag_handles().publish();
     metrics::gauge!(MAIN_RECONNECT_RECOVERY_MAX_MS_GAUGE)
         .set(MAIN_RECONNECT_PEAK.publish(take_main_feed_reconnect_recovery_max_ms(), now_ms));
 }
@@ -18574,6 +18709,82 @@ mod tests {
         assert!(agent.contains("\"metrics_collection_interval\": 60"));
         assert!(prom.contains("scrape_interval: 60s"));
         assert_eq!(PEAK_HOLD_WINDOW_MS, 60_000);
+    }
+
+    #[test]
+    fn ws_lag_bucket_bounds_match_the_ms_histogram_buckets() {
+        // The published `le` values must be the ones the old histogram
+        // rendered, or the console's percentile walk changes meaning.
+        let bounds: Vec<f64> = WS_LAG_BUCKET_BOUNDS_MS
+            .iter()
+            .map(|&b| f64::from(u32::try_from(b).expect("bounds fit u32")))
+            .collect();
+        assert_eq!(bounds, crate::observability::API_MS_HISTOGRAM_BUCKETS);
+        for (bound, le) in WS_LAG_BUCKET_BOUNDS_MS.iter().zip(WS_LAG_BUCKET_LE) {
+            assert_eq!(bound.to_string(), le);
+        }
+        assert_eq!(WS_LAG_BUCKET_LE[WS_LAG_BUCKET_SLOTS - 1], "+Inf");
+        for series in [WS_LAG_BUCKET_SERIES, WS_LAG_COUNT_SERIES, WS_LAG_SUM_SERIES] {
+            assert!(series.starts_with(WS_LAG_HISTOGRAM));
+        }
+    }
+
+    #[test]
+    fn ws_lag_slot_counts_a_sample_equal_to_a_bound_in_that_bucket() {
+        let slot = WsLagSlot::new();
+        for ms in [0, 1, 2, 5, 60_000, 60_001, u64::MAX / 4] {
+            slot.record_ms(ms);
+        }
+        let cumulative = slot.cumulative();
+        // le=1 holds 0 and 1; le=5 adds 2 and 5; le=60000 adds 60000;
+        // +Inf adds the two above every bound.
+        assert_eq!(cumulative[0], 2);
+        assert_eq!(cumulative[1], 4);
+        assert_eq!(cumulative[WS_LAG_BUCKET_SLOTS - 2], 5);
+        assert_eq!(cumulative[WS_LAG_BUCKET_SLOTS - 1], 7);
+    }
+
+    #[test]
+    fn ws_lag_slot_renders_the_lines_a_prometheus_histogram_rendered() {
+        // Audit M6: the console greps `tv_dhan_ws_lag_ms_{bucket,count}`. The
+        // fixed slot must render the same sample lines a real histogram with
+        // the production `_ms` buckets renders for the same samples.
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new()
+            .set_buckets_for_metric(
+                metrics_exporter_prometheus::Matcher::Suffix("_ms".to_owned()),
+                crate::observability::API_MS_HISTOGRAM_BUCKETS,
+            )
+            .expect("valid buckets")
+            .build_recorder();
+        let handle = recorder.handle();
+        let samples = [0_u64, 3, 250, 251, 999, 4_000, 61_000];
+        metrics::with_local_recorder(&recorder, || {
+            let reference = metrics::histogram!("ref_lag_ms", "connection" => "7");
+            let slot = WsLagSlot::new();
+            for ms in samples {
+                // APPROVED: test samples are far below 2^53.
+                #[allow(clippy::cast_precision_loss)]
+                reference.record(ms as f64);
+                slot.record_ms(ms);
+            }
+            slot.publish(|| "7".to_owned());
+            // A second publish with no new sample changes nothing.
+            slot.publish(|| "7".to_owned());
+        });
+        let rendered = handle.render();
+        let lines = |prefix: &str| -> Vec<String> {
+            let mut out: Vec<String> = rendered
+                .lines()
+                .filter(|l| l.starts_with(prefix))
+                .map(|l| l.replacen(prefix, "", 1))
+                .collect();
+            out.sort();
+            out
+        };
+        let ours = lines("tv_dhan_ws_lag_ms_");
+        let reference = lines("ref_lag_ms_");
+        assert!(!ours.is_empty(), "no lag lines rendered:\n{rendered}");
+        assert_eq!(ours, reference, "rendered:\n{rendered}");
     }
 
     #[test]

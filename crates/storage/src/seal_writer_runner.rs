@@ -835,18 +835,26 @@ impl SealOverflow {
                     // that makes the caller wait on the disk. The queued arm
                     // above reads no clock.
                     let started = std::time::Instant::now();
-                    let outcome = Self::escalate_inline(
-                        &self.spill,
-                        &self.dlq,
-                        &item.seal,
-                        item.now_unix_secs,
-                    );
+                    // Audit M10: the write blocks, so the tokio worker is
+                    // moved aside first, as the tick writer does for its
+                    // inline spill. The drain still waits for the write; the
+                    // other tasks on its worker do not.
+                    let outcome = crate::off_worker::off_worker(|| {
+                        Self::escalate_inline(
+                            &self.spill,
+                            &self.dlq,
+                            &item.seal,
+                            item.now_unix_secs,
+                        )
+                    });
                     self.note_inline_wait(started.elapsed(), outcome, item.now_unix_secs);
                     return outcome;
                 }
             }
         }
-        Self::escalate_inline(&self.spill, &self.dlq, &serialised, now_unix_secs)
+        crate::off_worker::off_worker(|| {
+            Self::escalate_inline(&self.spill, &self.dlq, &serialised, now_unix_secs)
+        })
     }
 }
 

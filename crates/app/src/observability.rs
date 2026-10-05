@@ -213,7 +213,7 @@ const TICK_NS_HISTOGRAM_BUCKETS: &[f64] = &[
 /// Grafana `histogram_quantile` queries show "No data".
 ///
 /// Range: 1 ms → 60 s, roughly log-spaced.
-const API_MS_HISTOGRAM_BUCKETS: &[f64] = &[
+pub(crate) const API_MS_HISTOGRAM_BUCKETS: &[f64] = &[
     1.0,      // 1 ms
     5.0,      // 5 ms
     10.0,     // 10 ms
