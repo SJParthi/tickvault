@@ -52,19 +52,19 @@ locals {
     "close-drain-discarded" = { group = "market_data_refused", counter = "tv_dhan_ws_close_drain_discarded_total", slice = "" }
     "feed-aux-refused"      = { group = "market_data_refused", counter = "tv_feed_aux_rows_refused_total", slice = "" }
     # Depth only: the tick tier writes blind (not loss), depth refuses.
-    "depth-probe-blind"         = { group = "market_data_refused", counter = "tv_spill_free_probe_blind_total", slice = " && $.tier = \"depth\"" }
+    "depth-probe-blind"           = { group = "market_data_refused", counter = "tv_spill_free_probe_blind_total", slice = " && $.tier = \"depth\"" }
     "spill-replay-lines-rejected" = { group = "market_data_refused", counter = "tv_tick_spill_replay_lines_rejected_total", slice = "" }
-    "candle-int-heal-refused"   = { group = "market_data_refused", counter = "tv_candle_int_self_heal_refused_total", slice = "" }
-    "top-volume-rows-discarded" = { group = "market_data_refused", counter = "tv_top_volume_rank_rows_discarded_total", slice = "" }
-    "top-volume-append-failed"  = { group = "market_data_refused", counter = "tv_top_volume_rank_append_failed_total", slice = "" }
+    "candle-int-heal-refused"     = { group = "market_data_refused", counter = "tv_candle_int_self_heal_refused_total", slice = "" }
+    "top-volume-rows-discarded"   = { group = "market_data_refused", counter = "tv_top_volume_rank_rows_discarded_total", slice = "" }
+    "top-volume-append-failed"    = { group = "market_data_refused", counter = "tv_top_volume_rank_append_failed_total", slice = "" }
 
     # ---- 2. subscription coverage lost -------------------------------------
     # spawn_skipped only: gave_up_outstanding_sockets can happen on a flat open.
-    "dial-incomplete"            = { group = "subscription_gap", counter = "tv_dhan_dial_incomplete_total", slice = " && $.stage = \"spawn_skipped\"" }
-    "subscribe-dispatch-failed"  = { group = "subscription_gap", counter = "tv_dhan_ws_subscribe_dispatch_failed_total", slice = "" }
-    "topup-failed"               = { group = "subscription_gap", counter = "tv_dhan_ws_topup_failed_total", slice = "" }
-    "swap-failed"                = { group = "subscription_gap", counter = "tv_dhan_ws_swap_failed_total", slice = "" }
-    "swap-timeout"               = { group = "subscription_gap", counter = "tv_dhan_ws_swap_timeout_total", slice = "" }
+    "dial-incomplete"           = { group = "subscription_gap", counter = "tv_dhan_dial_incomplete_total", slice = " && $.stage = \"spawn_skipped\"" }
+    "subscribe-dispatch-failed" = { group = "subscription_gap", counter = "tv_dhan_ws_subscribe_dispatch_failed_total", slice = "" }
+    "topup-failed"              = { group = "subscription_gap", counter = "tv_dhan_ws_topup_failed_total", slice = "" }
+    "swap-failed"               = { group = "subscription_gap", counter = "tv_dhan_ws_swap_failed_total", slice = "" }
+    "swap-timeout"              = { group = "subscription_gap", counter = "tv_dhan_ws_swap_timeout_total", slice = "" }
     # ack_pending / not_held retry next minute; rotation_halted follows an 805.
     "rebalance-swaps-refused" = { group = "subscription_gap", counter = "tv_depth_rebalance_swaps_refused_total", slice = " && ($.reason = \"no_socket\" || $.reason = \"channel_full\" || $.reason = \"channel_closed\")" }
     # empty_selection only: partial_selection is normal at a 09:00 attach.
@@ -74,24 +74,24 @@ locals {
     "ws-audit-write-errors"       = { group = "audit_rows", counter = "tv_ws_event_audit_write_errors_total", slice = "" }
     "feed-gap-audit-write-errors" = { group = "audit_rows", counter = "tv_feed_gap_audit_write_errors_total", slice = "" }
     # live_feed_forward already pages through HOT-PATH-02.
-    "ws-audit-dropped"              = { group = "audit_rows", counter = "tv_ws_event_audit_dropped_total", slice = " && $.reason != \"live_feed_forward\"" }
-    "order-update-ws-audit-dropped" = { group = "audit_rows", counter = "tv_order_update_ws_audit_dropped_total", slice = "" }
-    "xverify-persist-errors"        = { group = "audit_rows", counter = "tv_dhan_feed_xverify_persist_errors_total", slice = "" }
-    "xverify-audit-rows-discarded"  = { group = "audit_rows", counter = "tv_dhan_live_xverify_audit_rows_discarded_total", slice = "" }
+    "ws-audit-dropped"               = { group = "audit_rows", counter = "tv_ws_event_audit_dropped_total", slice = " && $.reason != \"live_feed_forward\"" }
+    "order-update-ws-audit-dropped"  = { group = "audit_rows", counter = "tv_order_update_ws_audit_dropped_total", slice = "" }
+    "xverify-persist-errors"         = { group = "audit_rows", counter = "tv_dhan_feed_xverify_persist_errors_total", slice = "" }
+    "xverify-audit-rows-discarded"   = { group = "audit_rows", counter = "tv_dhan_live_xverify_audit_rows_discarded_total", slice = "" }
     "tf-verify-audit-rows-discarded" = { group = "audit_rows", counter = "tv_tf_verify_audit_rows_discarded_total", slice = "" }
-    "audit-spill-refused"           = { group = "audit_rows", counter = "tv_audit_spill_refused_rows_total", slice = "" }
-    "audit-spill-quarantined"       = { group = "audit_rows", counter = "tv_audit_spill_quarantined_rows_total", slice = "" }
-    "audit-spill-replay-failed"     = { group = "audit_rows", counter = "tv_audit_spill_replay_failed_total", slice = "" }
-    "pnl-audit-persist-errors"      = { group = "audit_rows", counter = "tv_pnl_audit_persist_errors_total", slice = "" }
-    "order-leg-pnl-persist-errors"  = { group = "audit_rows", counter = "tv_order_leg_pnl_persist_errors_total", slice = "" }
-    "order-leg-pnl-dropped"         = { group = "audit_rows", counter = "tv_order_leg_pnl_dropped_total", slice = "" }
-    "order-alert-dropped"           = { group = "audit_rows", counter = "tv_order_alert_dropped_total", slice = "" }
+    "audit-spill-refused"            = { group = "audit_rows", counter = "tv_audit_spill_refused_rows_total", slice = "" }
+    "audit-spill-quarantined"        = { group = "audit_rows", counter = "tv_audit_spill_quarantined_rows_total", slice = "" }
+    "audit-spill-replay-failed"      = { group = "audit_rows", counter = "tv_audit_spill_replay_failed_total", slice = "" }
+    "pnl-audit-persist-errors"       = { group = "audit_rows", counter = "tv_pnl_audit_persist_errors_total", slice = "" }
+    "order-leg-pnl-persist-errors"   = { group = "audit_rows", counter = "tv_order_leg_pnl_persist_errors_total", slice = "" }
+    "order-leg-pnl-dropped"          = { group = "audit_rows", counter = "tv_order_leg_pnl_dropped_total", slice = "" }
+    "order-alert-dropped"            = { group = "audit_rows", counter = "tv_order_alert_dropped_total", slice = "" }
 
     # ---- 4. durability sync failing (N3: WAL and seal sync failures) -------
-    "wal-fsync-errors"                = { group = "durability_sync", counter = "tv_wal_fsync_errors_total", slice = "" }
-    "seal-spill-sync-failed"          = { group = "durability_sync", counter = "tv_seal_spill_sync_failed_total", slice = "" }
-    "seal-unwritten-mark-errors"      = { group = "durability_sync", counter = "tv_seal_unwritten_mark_errors_total", slice = "" }
-    "deferred-depth-persist-failed"   = { group = "durability_sync", counter = "tv_wal_deferred_depth_persist_failed_total", slice = "" }
+    "wal-fsync-errors"                 = { group = "durability_sync", counter = "tv_wal_fsync_errors_total", slice = "" }
+    "seal-spill-sync-failed"           = { group = "durability_sync", counter = "tv_seal_spill_sync_failed_total", slice = "" }
+    "seal-unwritten-mark-errors"       = { group = "durability_sync", counter = "tv_seal_unwritten_mark_errors_total", slice = "" }
+    "deferred-depth-persist-failed"    = { group = "durability_sync", counter = "tv_wal_deferred_depth_persist_failed_total", slice = "" }
     "applied-watermark-persist-failed" = { group = "durability_sync", counter = "tv_wal_applied_watermark_persist_failed_total", slice = "" }
 
     # ---- 5. order path dropped (paper mode today) --------------------------
@@ -112,7 +112,7 @@ locals {
     "spot-price-store-refused" = { group = "bound_or_blind", counter = "tv_spot_price_store_refused_total", slice = "" }
     "prev-close-store-refused" = { group = "bound_or_blind", counter = "tv_prev_close_store_refused_total", slice = "" }
     # zero_lot_window is normal; non_monotonic already logs VOLUME-MONO-01.
-    "volume-leaderboard-refused" = { group = "bound_or_blind", counter = "tv_volume_leaderboard_refused_total", slice = " && ($.reason = \"capacity\" || $.reason = \"window_bar_missing\")" }
+    "volume-leaderboard-refused"    = { group = "bound_or_blind", counter = "tv_volume_leaderboard_refused_total", slice = " && ($.reason = \"capacity\" || $.reason = \"window_bar_missing\")" }
     "depth-view-dropped-refused"    = { group = "bound_or_blind", counter = "tv_depth_view_dropped_refused_total", slice = "" }
     "depth-view-held-today-refused" = { group = "bound_or_blind", counter = "tv_depth_view_held_today_refused_total", slice = "" }
     "wal-lag-tracker-refused"       = { group = "bound_or_blind", counter = "tv_wal_lag_tracker_refused_total", slice = "" }
