@@ -296,6 +296,37 @@ fn free_quarantine_path(
     ))
 }
 
+/// Start of the daily window in which the DEPTH spill is not replayed: 08:00
+/// IST, before the box's 08:30 start, so a boot never replays depth spill
+/// ahead of the open.
+pub const DEPTH_REPLAY_HOLD_START_SECS_OF_DAY_IST: u32 = 8 * 3600;
+
+/// End of that window: the session close, 15:40 IST. From here the depth
+/// spill drains as before, while the sockets are quiet.
+pub const DEPTH_REPLAY_HOLD_END_SECS_OF_DAY_IST: u32 =
+    tickvault_common::constants::TICK_PERSIST_END_SECS_OF_DAY_IST;
+
+/// Whether the depth spill replay waits at this IST second of the day.
+///
+/// # Why (2026-10-05, operator: "go woith your recomemndation dude")
+///
+/// The box's disk is capped at its 156 MB/s baseline once its burst balance
+/// runs out, which on 2026-10-05 happened at about 10:00 IST: the balance fell
+/// from 90% at 08:30 to 0% at 10:00 with writes peaking near 500 MB/s, and
+/// `market_depth` then fell 54,093 WAL transactions behind, with no row of the
+/// day visible. Replaying a 7 to 14 GB depth spill from 08:30 spent that burst
+/// before the open and kept competing with live depth all session.
+///
+/// Holding the replay to after the close is a deferral, never a drop: the
+/// files stay on disk (the depth spill keeps accepting past its soft cap while
+/// the volume has room), and the raw frames are in the WAL. Ticks are not held;
+/// only the depth directory is. O(1).
+#[must_use]
+pub fn depth_replay_held_at(secs_of_day_ist: u32) -> bool {
+    (DEPTH_REPLAY_HOLD_START_SECS_OF_DAY_IST..DEPTH_REPLAY_HOLD_END_SECS_OF_DAY_IST)
+        .contains(&secs_of_day_ist)
+}
+
 /// Whether `dir` is the depth spill directory (as opposed to the tick one).
 #[must_use]
 pub fn is_depth_spill_dir(dir: &Path) -> bool {
@@ -1420,6 +1451,10 @@ async fn run_replay_loop(dir: PathBuf, url: String, require_upload: bool) {
         }
     };
     register_replay_baseline();
+    let holds_in_session = is_depth_spill_dir(&dir);
+    if holds_in_session {
+        metrics::counter!("tv_depth_spill_replay_held_total").increment(0);
+    }
     // DRAIN FIRST, THEN SLEEP (2026-08-25). This loop slept 300s before its
     // first round, and that ordering cost 1,695,983 ticks on the live box this
     // morning — permanently, in a single event.
@@ -1464,8 +1499,19 @@ async fn run_replay_loop(dir: PathBuf, url: String, require_upload: bool) {
         let round_url = url.clone();
         let round_client = client.clone();
         let runtime = tokio::runtime::Handle::current();
+        // The depth directory waits for the close (see `depth_replay_held_at`).
+        // The quarantine trim below still runs every round.
+        let held = holds_in_session
+            && depth_replay_held_at(tickvault_common::market_hours::now_ist_secs_of_day());
+        if held {
+            metrics::counter!("tv_depth_spill_replay_held_total").increment(1);
+        }
         let round = tokio::task::spawn_blocking(move || {
-            let outcome = runtime.block_on(replay_spill_dir(&round_dir, &round_url, &round_client));
+            let outcome = if held {
+                SpillReplayOutcome::default()
+            } else {
+                runtime.block_on(replay_spill_dir(&round_dir, &round_url, &round_client))
+            };
             // Trim quarantine on every round, not only at boot (2026-08-28,
             // round-2 fix). Quarantine is written BY THIS LOOP during the
             // session — a permanently-refused file is set aside here — so a
@@ -2199,6 +2245,58 @@ mod tests {
         assert!(
             decl.contains("loop {"),
             "the supervisor must respawn, not exit after one death"
+        );
+    }
+
+    #[test]
+    fn test_depth_replay_held_at_covers_08_00_to_the_close_only() {
+        // 2026-10-05: the depth spill replay waits from 08:00 to 15:40 IST so
+        // it cannot spend the disk burst before the open or compete with live
+        // depth during the session.
+        assert!(!depth_replay_held_at(8 * 3600 - 1), "07:59:59 drains");
+        assert!(depth_replay_held_at(8 * 3600), "08:00 holds");
+        assert!(depth_replay_held_at(8 * 3600 + 30 * 60), "08:30 boot holds");
+        assert!(depth_replay_held_at(12 * 3600), "midday holds");
+        assert!(depth_replay_held_at(56_400 - 1), "15:39:59 holds");
+        assert!(!depth_replay_held_at(56_400), "15:40 drains");
+        assert!(!depth_replay_held_at(17 * 3600), "17:00 drains");
+        assert_eq!(
+            DEPTH_REPLAY_HOLD_END_SECS_OF_DAY_IST,
+            tickvault_common::constants::TICK_PERSIST_END_SECS_OF_DAY_IST
+        );
+    }
+
+    #[test]
+    fn test_depth_replay_held_at_is_applied_to_the_depth_directory_only() {
+        assert!(is_depth_spill_dir(Path::new(
+            crate::depth_persistence::DEPTH_SPILL_DIR
+        )));
+        assert!(!is_depth_spill_dir(Path::new(
+            crate::tick_persistence::TICK_SPILL_DIR
+        )));
+        let src = include_str!("tick_spill_replay.rs");
+        let body = src
+            .split("async fn run_replay_loop")
+            .nth(1)
+            .expect("the replay loop must exist");
+        let body = &body[..body.find("\n\u{7d}\n").unwrap_or(body.len())];
+        assert!(
+            body.contains("let holds_in_session = is_depth_spill_dir(&dir);"),
+            "the hold must be scoped to the depth directory, never the tick one"
+        );
+        assert!(
+            body.contains("holds_in_session\n            && depth_replay_held_at("),
+            "a held round must consult the IST window"
+        );
+        assert!(
+            body.contains("tv_depth_spill_replay_held_total"),
+            "every held round must be counted"
+        );
+        let trim = body.find("prune_quarantine(").expect("trim");
+        let held = body.find("let outcome = if held").expect("held branch");
+        assert!(
+            held < trim,
+            "the quarantine trim still runs on a held round"
         );
     }
 
