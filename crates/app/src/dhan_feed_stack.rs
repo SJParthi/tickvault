@@ -18699,7 +18699,7 @@ mod tests {
     }
 
     #[test]
-    fn test_regression_only_an_accepted_new_trade_is_a_lag_sample() {
+    fn test_record_ws_lag_not_a_trade_excluded_only_an_accepted_trade_is_a_lag_sample() {
         // 2026-10-05: out-of-session ticks (a contract not traded today,
         // carrying an earlier day's trade time) went into the lag histogram
         // and read as option sockets delivering most packets over 60 s. The
