@@ -4177,7 +4177,13 @@ attempt and Page rows). Recorded BEFORE the code.
 - Fewer pages, never more per day: every final-failure page writes the paged
   marker, and while it exists a later final failure the same day is a coded
   `warn!` (`xverify_already_paged_today`) instead of a second page. The
-  divergence page (`xverify_diverged`) is unaffected.
+  divergence page (`xverify_diverged`) is unaffected. `xverify_vacuous` IS
+  affected, and this is stated rather than changed (third 51b review): after
+  any same-day page (for example `skipped_no_time` at a 17:20 restart), a
+  final failure that compared zero minutes logs `xverify_already_paged_today`
+  with `reason = "vacuous"` and does not page; the page already sent says
+  today is unverified and S3 is held, and exempting it would make two pages
+  in one day.
 - A persist the code stops on purpose at its deadline (`xverify_persist_stopped_at_deadline`,
   `xverify_options_persist_stopped_at_deadline`) no longer adds to
   `tv_dhan_feed_xverify_persist_errors_total` or
