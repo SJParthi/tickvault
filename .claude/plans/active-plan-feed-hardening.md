@@ -6228,3 +6228,68 @@ Revert the commits. No schema, data or infrastructure change.
 New counter `tv_depth_spill_replay_held_total`; new label `reason="not_a_trade"` on an already-shipped counter (one more CloudWatch series, about $0.30 a month, Assumed).
 
 Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
+
+## ITEM 51 — Live-socket fast lane (2026-10-06)
+
+Approved 2026-10-06 by the owner: "Go ahead with whatever you want dude" and "See do everything whatever is recommended dude okay?" (relayed to the implementing session by the coordinator's workflow; Risk: confirm against the owner thread before merge). Fifteen serial PRs from the fast-lane specs; each PR ticks its own sub-item and appends its own paragraph to each section below. No new plan file (five active plans; a sixth trips plan-gate V7).
+
+- [x] 51a — **805 probe attribution (PR 1).** A close with no code fails a running probe or release window only on the probed socket, or when another socket's drop is corroborated as an eviction (another of our sockets, not the closer and not a same-burst member, began a dial in the last 20 s), or when a dropped sibling is not back within 120 s. Before, any sibling blip after an 805 burned one of the 3 main-feed (6 depth) probes, never refunded (Verified in source at 60bdfd97a).
+  - Files: crates/core/src/websocket/pool_supervisor.rs, docs/claude-rules-full/project/websocket-connection-scope-lock.md, .claude/rules/project/websocket-connection-scope-lock.md, CLAUDE.md
+  - Tests: test_probe_survives_one_sibling_blip_that_heals, test_probed_socket_bare_reset_still_fails, test_sibling_drop_right_after_probe_dial_fails_at_once, test_two_separate_blips_in_one_window_do_not_fail, test_flapping_sibling_is_not_cascade_evidence, test_cascade_after_burst_fails, test_simultaneous_burst_is_one_event, test_evictee_close_processed_before_evictor_dial_completes, test_unhealed_sibling_fails_at_its_own_deadline, test_pass_deferral_is_capped, test_suspect_that_parks_for_non_805_is_dropped, test_watched_idle_redial_fails_window, test_blip_then_805_fails_once_as_805, test_805_then_blip_no_double_fail, test_blip_on_watched_and_805_single_failure, test_depth_window_attribution, test_depth_window_deferred_keeps_main_waiting, test_out_of_range_slot_fails_closed, test_recent_dial_mask_on_local_table, test_record_dial_begin_ignores_out_of_range_slot, test_overflow_attribution_constants_are_locked, proptest_attribution_rules, test_overflow_attribution_call_sites_are_wired, test_overflow_episode_region_never_allocates, test_scope_lock_records_the_overflow_probe_attribution
+- [ ] 51b — log-drop filter (spec fl-log-drop, PR 2).
+  - Files: filled in by its PR
+  - Tests: filled in by its PR
+- [ ] 51c — reader-memory measurement (spec fl-reader-memory, PR 3).
+  - Files: filled in by its PR
+  - Tests: filled in by its PR
+- [ ] 51d — 808 policy, part 1 (spec fl-808, PR 4).
+  - Files: filled in by its PR
+  - Tests: filled in by its PR
+- [ ] 51e — 808 policy, part 2, incl. the stale `dhan-socket-parked` description (spec fl-808, PR 5).
+  - Files: filled in by its PR
+  - Tests: filled in by its PR
+- [ ] 51f — boot telemetry spawn and boot code (PR 6).
+  - Files: filled in by its PR
+  - Tests: filled in by its PR
+- [ ] 51g — data-silent detection, main feed and depth-20, shadow mode (spec fl-data-silent, PR 7).
+  - Files: filled in by its PR
+  - Tests: filled in by its PR
+- [ ] 51h — data-silent detection, depth-200 backstop and cross-feed check (spec fl-data-silent, PR 8).
+  - Files: filled in by its PR
+  - Tests: filled in by its PR
+- [ ] 51i — live-proof gate (spec fl-live-proof, PR 9).
+  - Files: filled in by its PR
+  - Tests: filled in by its PR
+- [ ] 51j — socket receive-buffer measurement (PR 10).
+  - Files: filled in by its PR
+  - Tests: filled in by its PR
+- [ ] 51k — EMF selection change (PR 11).
+  - Files: filled in by its PR
+  - Tests: filled in by its PR
+- [ ] 51l — data-silent Act flip, gated on the shadow week (PR 12).
+  - Files: filled in by its PR
+  - Tests: filled in by its PR
+- [ ] 51m — live-proof page, after its decision card (spec fl-live-proof, PR 13).
+  - Files: filled in by its PR
+  - Tests: filled in by its PR
+- [ ] 51n — live-proof EMF names, after its decision card (spec fl-live-proof, PR 14).
+  - Files: filled in by its PR
+  - Tests: filled in by its PR
+- [ ] 51o — WAL replay log (spec fl-wal-replay-log, PR 15).
+  - Files: filled in by its PR
+  - Tests: filled in by its PR
+
+### Design
+51a: `OverflowEpisode` (pure, `Copy`, no heap) gains a per-slot suspect mask, a per-slot close stamp, a 2 s burst mask and a settle instant. `on_bare_reset(slot, recent_dials, now)` fails at once for the probed slot, for an out-of-range slot (fail closed) and when `recent_dials & !closer & !burst` is non-zero; otherwise it notes the slot. A sibling heals at its own `DialSucceeded`; `poll` fails a suspect older than 120 s, holds a pass while any suspect or settle time remains, and fails a window still unsettled 120 s after its watch would have ended. `recent_dials` comes from a static `[AtomicU64; 32]` of per-slot BeginDial instants (one Release store per dial), scanned O(32) only on a no-code close while an episode is engaged. The probed socket's idle watchdog fails its window. Verified: the change is confined to cold supervisor arms; the frame path is untouched.
+### Edge Cases
+51a: two separate blips in one window (each heals, no foreign dial in 20 s: pass); a flapping sibling (its own dial never corroborates its own close); a burst of closes within 2 s (one event; members' redials do not corroborate each other); the evicted socket's close processed before the evicting dial completes (BeginDial, not DialSucceeded, is the stamp); a blip then an 805, an 805 then a blip, and both on the watched socket (exactly one failure, one repark); slot 40 (fails closed); a depth window deferred while main sockets wait (main never grants: one window process-wide). Assumed: Dhan evicts at accept time, within the 15 s dial timeout of our dial.
+### Failure Modes
+51a: a foreign process's dial is invisible (Risk), so a single foreign eviction whose victim reconnects reads as a blip and the window can pass; the next 805 or corroborated close still fails it. Any of our sockets dialling within 20 s before an unrelated blip fails the window (errs toward fail). A box-wide network blip that also drops the probed socket still fails. A sibling that never reconnects, or keeps flapping, fails the window at its 120 s deadline or the deferral cap; a probe is never refunded.
+### Test Plan
+51a: `CARGO_INCREMENTAL=0 cargo test -p tickvault-core --lib overflow` and `--lib pool_supervisor`; the scope-lock guards (`tick_gap_reset_wiring_guard`, `top_volume_stock_only_guard`, `instance_type_lock_guard`); `cargo test -p tickvault-common --test claude_md_codebase_map_guard`; banned-pattern, pub-fn-test, pub-fn-wiring, plan-gate and per-item-guarantee hooks.
+### Rollback
+51a: revert the commit. No schema, data, config or infrastructure change; the episodes go back to failing on any no-code close.
+### Observability
+51a: five new outcome labels on the existing `tv_dhan_ws_overflow_probe_total` / `tv_dhan_ws_depth_overflow_probe_total` counters (`sibling_reset_noted`, `sibling_healed`, `failed_eviction_corroborated`, `failed_sibling_unhealed`, `failed_watched_silent`); the two notes log a coded `warn!`, the failures a coded `error!`, both with `sibling_connection`. Prometheus only: no page, alarm, EMF name or Telegram change.
+
+Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.

@@ -1283,12 +1283,45 @@ pub const OVERFLOW_PROBE_MAX_ATTEMPTS: u8 = 3;
 
 const _: () = assert!(OVERFLOW_PROBE_DELAYS_SECS.len() == OVERFLOW_PROBE_MAX_ATTEMPTS as usize);
 
-/// The watch window W after a probed (or released) socket's FIRST frame. Any
-/// 805, or any socket closing with no code (Dhan can deliver an 805 as a bare
-/// reset, plan row 314), inside it fails the probe. Dhan accepts a new socket
-/// and closes the OLDEST, so the probe itself is not the socket that would be
-/// hit — every socket is watched.
+/// The watch window W after a probed (or released) socket's FIRST frame. The
+/// window passes only if no 805 arrives anywhere, the probed socket stays up,
+/// and any other socket that drops reconnects without knocking another off.
+/// Dhan accepts a new socket and closes the OLDEST, so the probe itself is not
+/// the socket that would be hit — every socket is watched; Dhan can also
+/// deliver an 805 as a bare reset (plan row 314). Scope lock 2026-10-06: a
+/// sibling's no-code close fails the window only when it is corroborated as
+/// an eviction ([`OVERFLOW_PROBE_EVICTION_ATTRIBUTION_SECS`]) or the sibling
+/// does not reconnect in [`OVERFLOW_PROBE_SIBLING_HEAL_DEADLINE_SECS`].
 pub const OVERFLOW_PROBE_WATCH_SECS: u64 = 120;
+
+/// A sibling's no-code close inside a window is corroborated as an eviction
+/// when another socket of this process (not the closer, not a member of the
+/// same burst) BEGAN a dial at most this long before it: BeginDial to accept
+/// is bounded by the 15 s dial timeout, plus 5 s for the evicted socket's
+/// close to reach its supervisor. It is also the settle time after a sibling
+/// heals, since that redial could itself still evict someone. Scope lock
+/// 2026-10-06.
+pub const OVERFLOW_PROBE_EVICTION_ATTRIBUTION_SECS: u64 = 20;
+
+const _: () =
+    assert!(OVERFLOW_PROBE_EVICTION_ATTRIBUTION_SECS > super::connection::DIAL_TIMEOUT.as_secs());
+
+/// No-code closes within this long of a burst's FIRST close are one event:
+/// the burst members' own redials never corroborate each other. Assumed to
+/// cover one server-side multi-close.
+pub const OVERFLOW_PROBE_SIBLING_BURST_MS: u64 = 2_000;
+
+/// A sibling noted inside a window that has not completed a dial this long
+/// after its close fails the window; and a window still unsettled this long
+/// after its watch would have ended fails too (bounds the pass deferral).
+/// Room for two full ladder-plus-dial attempts.
+pub const OVERFLOW_PROBE_SIBLING_HEAL_DEADLINE_SECS: u64 = 120;
+
+const _: () = assert!(
+    OVERFLOW_PROBE_SIBLING_HEAL_DEADLINE_SECS * 1_000
+        > 2 * (super::reconnect_ladder::RECONNECT_DELAY_WITH_JITTER_MAX_MS
+            + super::connection::DIAL_TIMEOUT.as_secs() * 1_000)
+);
 
 /// A probed (or released) socket that delivers no frame this long after it
 /// was granted fails the probe: a socket that cannot prove itself is not a
@@ -1411,7 +1444,8 @@ pub enum OverflowProbeOutcome {
     ReleasePassed,
     /// An 805 arrived inside a window.
     FailedOverflow,
-    /// A socket closed with no code inside a window.
+    /// The probed socket closed with no code inside its window (or a slot
+    /// outside the register closed: fails closed).
     FailedBareReset,
     /// The released socket delivered no frame in time.
     FailedNoFrame,
@@ -1419,11 +1453,24 @@ pub enum OverflowProbeOutcome {
     Recovered,
     /// No probes left; parked main-feed sockets stay down this session.
     DownForSession,
+    /// A NOTE, not a failure: another socket closed with no code inside a
+    /// window, with no recent dial to blame. Watched until it reconnects.
+    SiblingResetNoted,
+    /// A NOTE: a noted sibling completed its redial.
+    SiblingHealed,
+    /// Another socket's no-code close came right after one of our dials (not
+    /// its own, not a same-burst member's): an eviction.
+    FailedEvictionCorroborated,
+    /// A noted sibling did not reconnect in time, or the window stayed
+    /// unsettled past the deferral cap.
+    FailedSiblingUnhealed,
+    /// The probed socket's own idle watchdog fired (no frame, no ping).
+    FailedWatchedSilent,
 }
 
 impl OverflowProbeOutcome {
     /// Every outcome, for the label-uniqueness pin.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 14] = [
         Self::ProbeGranted,
         Self::ProbePassed,
         Self::ReleaseGranted,
@@ -1433,7 +1480,19 @@ impl OverflowProbeOutcome {
         Self::FailedNoFrame,
         Self::Recovered,
         Self::DownForSession,
+        Self::SiblingResetNoted,
+        Self::SiblingHealed,
+        Self::FailedEvictionCorroborated,
+        Self::FailedSiblingUnhealed,
+        Self::FailedWatchedSilent,
     ];
+
+    /// Whether this outcome is a note (logged at `warn!`), not a step of the
+    /// probe (logged at `error!`).
+    #[must_use]
+    pub const fn is_note(self) -> bool {
+        matches!(self, Self::SiblingResetNoted | Self::SiblingHealed)
+    }
 
     /// Stable lowercase tag for logs and metric labels.
     #[must_use]
@@ -1448,6 +1507,11 @@ impl OverflowProbeOutcome {
             Self::FailedNoFrame => "failed_no_frame",
             Self::Recovered => "recovered",
             Self::DownForSession => "down_for_session",
+            Self::SiblingResetNoted => "sibling_reset_noted",
+            Self::SiblingHealed => "sibling_healed",
+            Self::FailedEvictionCorroborated => "failed_eviction_corroborated",
+            Self::FailedSiblingUnhealed => "failed_sibling_unhealed",
+            Self::FailedWatchedSilent => "failed_watched_silent",
         }
     }
 }
@@ -1462,6 +1526,8 @@ struct OverflowEpisodeEffect {
     grant: Option<u8>,
     /// A slot whose socket must close and park again (the failed probe).
     repark: Option<u8>,
+    /// The sibling slot (global index) the outcome is about, for the log.
+    sibling: Option<u8>,
 }
 
 /// The overflow episode's decision core: pure, `Copy`, no clock of its own,
@@ -1485,6 +1551,18 @@ struct OverflowEpisode {
     watched_slot: u8,
     /// The watched socket's first frame, once seen.
     first_frame_at: Option<Instant>,
+    /// Scope lock 2026-10-06: sibling slots that closed with no code inside
+    /// the window, with no recent dial to blame, and have not redialled yet.
+    suspect_mask: u32,
+    /// Each suspect's own close instant (its heal deadline runs from here).
+    suspect_since: [Option<Instant>; GHOST_REDIAL_SLOTS],
+    /// The first close of the current burst of no-code closes.
+    burst_start: Option<Instant>,
+    /// The slots that closed in the current burst.
+    burst_mask: u32,
+    /// Until when the last heal's redial could still evict someone: no pass
+    /// before it.
+    settle_until: Option<Instant>,
 }
 
 impl OverflowEpisode {
@@ -1507,7 +1585,27 @@ impl OverflowEpisode {
             phase_since: None,
             watched_slot: u8::MAX,
             first_frame_at: None,
+            suspect_mask: 0,
+            suspect_since: [None; GHOST_REDIAL_SLOTS],
+            burst_start: None,
+            burst_mask: 0,
+            settle_until: None,
         }
+    }
+
+    /// Forgets every sibling note: a window starts, fails or passes.
+    fn clear_attribution(&mut self) {
+        self.suspect_mask = 0;
+        self.suspect_since = [None; GHOST_REDIAL_SLOTS];
+        self.burst_start = None;
+        self.burst_mask = 0;
+        self.settle_until = None;
+    }
+
+    /// Whether a window may not pass yet: a sibling has not healed, or the
+    /// last heal's redial could still evict someone.
+    fn unsettled(&self, now: Instant) -> bool {
+        self.suspect_mask != 0 || self.settle_until.is_some_and(|until| until > now)
     }
 
     /// Whether the main feed may open NEW connections (the widen's room).
@@ -1597,15 +1695,115 @@ impl OverflowEpisode {
         }
     }
 
-    /// Any socket closed with NO code. Inside a window this fails the probe:
-    /// Dhan can deliver an 805 as a bare reset. The watched socket itself is
-    /// included — a probe that cannot stay up is not a pass.
-    fn on_bare_reset(&mut self, now: Instant) -> OverflowEpisodeEffect {
-        match self.phase {
-            OverflowEpisodePhase::Probing | OverflowEpisodePhase::Resuming => {
-                self.fail(OverflowProbeOutcome::FailedBareReset, now)
-            }
-            _ => OverflowEpisodeEffect::default(),
+    /// Socket `slot` closed with NO code (scope lock 2026-10-06). Inside a
+    /// window:
+    ///
+    /// - the probed socket itself fails the window (a probe that cannot stay
+    ///   up is not a pass), and so does a slot outside the register (fails
+    ///   closed);
+    /// - another socket's close fails it at once when it is corroborated as
+    ///   an eviction: `recent_dials` (slots that BEGAN a dial in the last
+    ///   [`OVERFLOW_PROBE_EVICTION_ATTRIBUTION_SECS`]) holds a slot other than
+    ///   the closer and other than a member of the same burst of closes
+    ///   ([`OVERFLOW_PROBE_SIBLING_BURST_MS`]). Dhan evicts the oldest socket
+    ///   when it accepts a new one, so that is the probe (or a cascade)
+    ///   costing a socket;
+    /// - otherwise the sibling is NOTED and must reconnect within
+    ///   [`OVERFLOW_PROBE_SIBLING_HEAL_DEADLINE_SECS`]; the window cannot pass
+    ///   until it has, plus the settle time.
+    ///
+    /// So the window passes only if no 805 arrives anywhere, the probed socket
+    /// stays up, and any other socket that drops reconnects without knocking
+    /// another off. O(1), no allocation.
+    fn on_bare_reset(
+        &mut self,
+        slot: u8,
+        recent_dials: u32,
+        now: Instant,
+    ) -> OverflowEpisodeEffect {
+        if self.watched().is_none() {
+            return OverflowEpisodeEffect::default();
+        }
+        if slot == self.watched_slot {
+            return self.fail(OverflowProbeOutcome::FailedBareReset, now);
+        }
+        let Some(bit) = 1u32.checked_shl(u32::from(slot)) else {
+            return self.fail(OverflowProbeOutcome::FailedBareReset, now);
+        };
+        let joins_burst = self.burst_start.is_some_and(|start| {
+            now.saturating_duration_since(start)
+                <= Duration::from_millis(OVERFLOW_PROBE_SIBLING_BURST_MS)
+        });
+        if !joins_burst {
+            self.burst_start = Some(now);
+            self.burst_mask = 0;
+        }
+        self.burst_mask |= bit;
+        let evictors = recent_dials & !bit & !self.burst_mask;
+        if evictors != 0 {
+            let mut effect = self.fail(OverflowProbeOutcome::FailedEvictionCorroborated, now);
+            effect.sibling = Some(slot);
+            return effect;
+        }
+        self.suspect_mask |= bit;
+        if let Some(since) = self.suspect_since.get_mut(usize::from(slot))
+            && since.is_none()
+        {
+            *since = Some(now);
+        }
+        OverflowEpisodeEffect {
+            outcomes: [Some(OverflowProbeOutcome::SiblingResetNoted), None],
+            sibling: Some(slot),
+            ..OverflowEpisodeEffect::default()
+        }
+    }
+
+    /// A noted sibling completed a dial: it healed. Its redial could itself
+    /// still evict someone, so the window settles for
+    /// [`OVERFLOW_PROBE_EVICTION_ATTRIBUTION_SECS`] before it may pass.
+    fn on_sibling_dialled(&mut self, slot: u8, now: Instant) -> OverflowEpisodeEffect {
+        let Some(bit) = 1u32.checked_shl(u32::from(slot)) else {
+            return OverflowEpisodeEffect::default();
+        };
+        if self.watched().is_none() || self.suspect_mask & bit == 0 {
+            return OverflowEpisodeEffect::default();
+        }
+        self.suspect_mask &= !bit;
+        if let Some(since) = self.suspect_since.get_mut(usize::from(slot)) {
+            *since = None;
+        }
+        let settle = now
+            .checked_add(Duration::from_secs(
+                OVERFLOW_PROBE_EVICTION_ATTRIBUTION_SECS,
+            ))
+            .unwrap_or(now);
+        self.settle_until = Some(self.settle_until.map_or(settle, |until| until.max(settle)));
+        OverflowEpisodeEffect {
+            outcomes: [Some(OverflowProbeOutcome::SiblingHealed), None],
+            sibling: Some(slot),
+            ..OverflowEpisodeEffect::default()
+        }
+    }
+
+    /// A noted sibling parked for a reason other than 805: it opens no
+    /// connection, so it is dropped from the window (no settle time).
+    fn on_sibling_left(&mut self, slot: u8) {
+        if let Some(bit) = 1u32.checked_shl(u32::from(slot)) {
+            self.suspect_mask &= !bit;
+        }
+        if let Some(since) = self.suspect_since.get_mut(usize::from(slot)) {
+            *since = None;
+        }
+    }
+
+    /// A socket's idle watchdog fired (no frame and no ping): for the probed
+    /// socket that fails the window. Any other socket's own redial is not
+    /// evidence of anything here; its BeginDial is recorded like every dial.
+    fn on_watched_self_redial(&mut self, slot: u8, now: Instant) -> OverflowEpisodeEffect {
+        if self.watched() == Some(slot) {
+            self.fail(OverflowProbeOutcome::FailedWatchedSilent, now)
+        } else {
+            OverflowEpisodeEffect::default()
         }
     }
 
@@ -1658,9 +1856,33 @@ impl OverflowEpisode {
                     outcomes: [Some(OverflowProbeOutcome::ProbeGranted), None],
                     grant: Some(slot),
                     repark: None,
+                    sibling: None,
                 }
             }
             OverflowEpisodePhase::Probing | OverflowEpisodePhase::Resuming => {
+                // Scope lock 2026-10-06: a noted sibling that has not
+                // redialled within its own deadline fails the window.
+                // O(popcount), at most 32.
+                let mut pending = self.suspect_mask;
+                while pending != 0 {
+                    let s = pending.trailing_zeros();
+                    pending &= !(1u32 << s);
+                    let overdue = self
+                        .suspect_since
+                        .get(usize::try_from(s).unwrap_or(usize::MAX))
+                        .copied()
+                        .flatten()
+                        .is_none_or(|since| {
+                            now.saturating_duration_since(since)
+                                >= Duration::from_secs(OVERFLOW_PROBE_SIBLING_HEAL_DEADLINE_SECS)
+                        });
+                    if overdue {
+                        let mut effect =
+                            self.fail(OverflowProbeOutcome::FailedSiblingUnhealed, now);
+                        effect.sibling = u8::try_from(s).ok();
+                        return effect;
+                    }
+                }
                 match self.first_frame_at {
                     None => {
                         let granted_for = self
@@ -1680,6 +1902,27 @@ impl OverflowEpisode {
                         {
                             return OverflowEpisodeEffect::default();
                         }
+                        // No pass while a noted sibling has not healed, or
+                        // inside the settle time after the last heal. The
+                        // deferral is capped: still unsettled this long after
+                        // the watch would have ended fails the window.
+                        if self.unsettled(now) {
+                            let cap = Duration::from_secs(
+                                OVERFLOW_PROBE_WATCH_SECS
+                                    + OVERFLOW_PROBE_SIBLING_HEAL_DEADLINE_SECS,
+                            );
+                            if now.saturating_duration_since(first) < cap {
+                                return OverflowEpisodeEffect::default();
+                            }
+                            let lowest = self.suspect_mask.trailing_zeros();
+                            let mut effect =
+                                self.fail(OverflowProbeOutcome::FailedSiblingUnhealed, now);
+                            effect.sibling = u8::try_from(lowest)
+                                .ok()
+                                .filter(|s| usize::from(*s) < GHOST_REDIAL_SLOTS);
+                            return effect;
+                        }
+                        self.clear_attribution();
                         let passed = if self.phase == OverflowEpisodePhase::Probing {
                             OverflowProbeOutcome::ProbePassed
                         } else {
@@ -1704,6 +1947,9 @@ impl OverflowEpisode {
     /// From `Releasing`: release the next parked slot, one at a time, or
     /// finish when none is left.
     fn release_next(&mut self, now: Instant, window_open: bool) -> OverflowEpisodeEffect {
+        // Only reached after a pass (which cleared every note) or from
+        // `Releasing`, which takes no sibling notes.
+        debug_assert!(self.suspect_mask == 0);
         if self.parked_mask == 0 {
             self.phase = OverflowEpisodePhase::Recovered;
             return OverflowEpisodeEffect {
@@ -1720,6 +1966,7 @@ impl OverflowEpisode {
             outcomes: [Some(OverflowProbeOutcome::ReleaseGranted), None],
             grant: Some(slot),
             repark: None,
+            sibling: None,
         }
     }
 
@@ -1728,6 +1975,7 @@ impl OverflowEpisode {
         self.watched_slot = slot;
         self.phase_since = Some(now);
         self.first_frame_at = None;
+        self.clear_attribution();
     }
 
     /// Lowest parked slot, removed from the mask. O(1). Callers check the
@@ -1748,6 +1996,7 @@ impl OverflowEpisode {
         let slot = self.watched_slot;
         self.watched_slot = u8::MAX;
         self.first_frame_at = None;
+        self.clear_attribution();
         let then = if self.probes_started >= self.kind.max_attempts() {
             self.phase = OverflowEpisodePhase::DownForSession;
             self.phase_since = None;
@@ -1761,6 +2010,7 @@ impl OverflowEpisode {
             outcomes: [Some(outcome), then],
             grant: None,
             repark: Some(slot),
+            sibling: None,
         }
     }
 }
@@ -1772,8 +2022,9 @@ impl OverflowEpisode {
 /// no depth window is running; the depth episode may grant only while the
 /// main episode does not hold the turn ([`OverflowEpisode::holds_turn`]: a
 /// main window running, or a parked main-feed socket still waiting). Every
-/// 805 and every bare reset feeds BOTH, so a window on one fails on a close
-/// anywhere.
+/// 805 and every bare reset feeds BOTH. A window passes only if no 805
+/// arrives anywhere, the probed socket stays up, and any other socket that
+/// drops reconnects without knocking another off (scope lock 2026-10-06).
 #[derive(Debug, Clone, Copy)]
 struct OverflowEpisodes {
     main: OverflowEpisode,
@@ -1820,10 +2071,40 @@ impl OverflowEpisodes {
         }
     }
 
-    fn on_bare_reset(&mut self, now: Instant) -> OverflowEpisodesEffect {
+    /// Socket `slot` closed with no code; `recent_dials` holds the slots that
+    /// began a dial in the last [`OVERFLOW_PROBE_EVICTION_ATTRIBUTION_SECS`].
+    /// Feeds both; only the episode running a window acts.
+    fn on_bare_reset(
+        &mut self,
+        slot: u8,
+        recent_dials: u32,
+        now: Instant,
+    ) -> OverflowEpisodesEffect {
         OverflowEpisodesEffect {
-            main: self.main.on_bare_reset(now),
-            depth: self.depth.on_bare_reset(now),
+            main: self.main.on_bare_reset(slot, recent_dials, now),
+            depth: self.depth.on_bare_reset(slot, recent_dials, now),
+        }
+    }
+
+    /// Socket `slot` completed a dial (a noted sibling heals).
+    fn on_sibling_dialled(&mut self, slot: u8, now: Instant) -> OverflowEpisodesEffect {
+        OverflowEpisodesEffect {
+            main: self.main.on_sibling_dialled(slot, now),
+            depth: self.depth.on_sibling_dialled(slot, now),
+        }
+    }
+
+    /// Socket `slot` parked for a reason other than 805.
+    fn on_sibling_left(&mut self, slot: u8) {
+        self.main.on_sibling_left(slot);
+        self.depth.on_sibling_left(slot);
+    }
+
+    /// Socket `slot`'s idle watchdog fired.
+    fn on_watched_self_redial(&mut self, slot: u8, now: Instant) -> OverflowEpisodesEffect {
+        OverflowEpisodesEffect {
+            main: self.main.on_watched_self_redial(slot, now),
+            depth: self.depth.on_watched_self_redial(slot, now),
         }
     }
 
@@ -1856,6 +2137,64 @@ static OVERFLOW_EPISODES: std::sync::Mutex<OverflowEpisodes> =
 /// Set by the first 805 of the process and never cleared: the fast check
 /// that keeps every quiet socket off the episode lock.
 static OVERFLOW_ENGAGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Scope lock 2026-10-06: when each slot (global index) last BEGAN a dial, in
+/// milliseconds since [`OVERFLOW_DIAL_EPOCH`] plus one (0 = never). Written
+/// with one Release store at every BeginDial, engaged or not, so a dial that
+/// began just before an 805 is still known. Read O(32) only on a no-code
+/// close while an episode is engaged ([`recent_dial_mask`]).
+static OVERFLOW_DIAL_BEGIN_MS: [std::sync::atomic::AtomicU64; GHOST_REDIAL_SLOTS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; GHOST_REDIAL_SLOTS];
+
+/// The zero of [`OVERFLOW_DIAL_BEGIN_MS`]: the first instant any slot used it.
+static OVERFLOW_DIAL_EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+/// Published `main.suspect_mask | depth.suspect_mask`, written ONLY under the
+/// [`OVERFLOW_EPISODES`] lock: the lock-free check that keeps every dial and
+/// park of a socket that is not a noted sibling off the episode lock.
+static OVERFLOW_SUSPECT_MASK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// `now` in [`OVERFLOW_DIAL_BEGIN_MS`] units: milliseconds since `epoch`,
+/// saturating (an instant before the epoch reads 0). O(1).
+fn dial_begin_ms(epoch: Instant, now: Instant) -> u64 {
+    u64::try_from(now.saturating_duration_since(epoch).as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Stamps `slot`'s dial start into `table` (stored as `ms + 1`, so 0 keeps
+/// meaning never). A slot outside the table is ignored. O(1), one Release
+/// store, no allocation.
+fn record_dial_begin(
+    table: &[std::sync::atomic::AtomicU64; GHOST_REDIAL_SLOTS],
+    slot: u8,
+    ms: u64,
+) {
+    if let Some(cell) = table.get(usize::from(slot)) {
+        cell.store(ms.saturating_add(1), std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// The slots whose stamp in `table` is within `within_ms` of `now_ms`: bit
+/// `i` set when slot `i` began a dial at most `within_ms` ago. A stamp later
+/// than `now_ms` (another task's later clock reading) reads as recent, which
+/// errs toward failing a window, never toward passing one. O(32) Acquire
+/// loads, saturating arithmetic, no allocation.
+fn recent_dial_mask(
+    table: &[std::sync::atomic::AtomicU64; GHOST_REDIAL_SLOTS],
+    now_ms: u64,
+    within_ms: u64,
+) -> u32 {
+    let mut mask = 0u32;
+    for (i, cell) in table.iter().enumerate() {
+        let v = cell.load(std::sync::atomic::Ordering::Acquire);
+        if v != 0
+            && now_ms.saturating_add(1).saturating_sub(v) <= within_ms
+            && let Some(bit) = u32::try_from(i).ok().and_then(|i| 1u32.checked_shl(i))
+        {
+            mask |= bit;
+        }
+    }
+    mask
+}
 
 /// Published main-feed widen verdict, for an O(1) read by the main-feed
 /// widen: bit 0 is [`OverflowEpisode::widen_permitted`], written ONLY under
@@ -1969,6 +2308,10 @@ fn overflow_episode_step(
             watched.unwrap_or(u8::MAX),
             std::sync::atomic::Ordering::Release,
         );
+        OVERFLOW_SUSPECT_MASK.store(
+            eps.main.suspect_mask | eps.depth.suspect_mask,
+            std::sync::atomic::Ordering::Release,
+        );
         (effects, watched)
     };
     apply_overflow_effect(OverflowEpisodeKind::MainFeed, effects.main, watched);
@@ -1997,54 +2340,97 @@ fn apply_overflow_effect(
         }
     }
     for outcome in effect.outcomes.into_iter().flatten() {
-        report_overflow_probe_outcome(kind, outcome, effect.grant.or(effect.repark), watched);
+        report_overflow_probe_outcome(
+            kind,
+            outcome,
+            effect.grant.or(effect.repark),
+            watched,
+            effect.sibling,
+        );
     }
 }
 
-/// One coded error line and one counter increment per outcome. Cold: a few
-/// per episode, bounded by the probe caps and the socket counts.
+/// One coded log line and one counter increment per outcome: `warn!` for a
+/// sibling note ([`OverflowProbeOutcome::is_note`]), `error!` for every step
+/// of the probe. Cold: a few per episode, bounded by the probe caps and the
+/// socket counts.
 fn report_overflow_probe_outcome(
     kind: OverflowEpisodeKind,
     outcome: OverflowProbeOutcome,
     slot: Option<u8>,
     watched: Option<u8>,
+    sibling: Option<u8>,
 ) {
     metrics::counter!(kind.metric(), "outcome" => outcome.as_str()).increment(1);
-    match kind {
-        OverflowEpisodeKind::MainFeed => error!(
+    match (kind, outcome.is_note()) {
+        (OverflowEpisodeKind::MainFeed, false) => error!(
             code = ErrorCode::WsGapDisconnectClassification.code_str(),
             source = kind.source(),
             outcome = outcome.as_str(),
             connection_index = slot.map_or(-1, i32::from),
             watched_connection = watched.map_or(-1, i32::from),
+            sibling_connection = sibling.map_or(-1, i32::from),
             rotation_halted = rotation_halted(),
             "main-feed overflow probe ({}): after Dhan closed a socket with 805, ONE parked \
-             main-feed socket is redialled as a test and the rest come back one at a time only \
-             if no socket is closed with 805 or with no code for two minutes after each one's \
-             first frame. Parked depth sockets follow through their own probe once the main \
-             feed is settled; depth rotation stays halted until a restart.",
+             main-feed socket is redialled as a test and the rest come back one at a time. \
+             Each passes only if, for two minutes after its first frame, no 805 arrives \
+             anywhere, the probed socket stays up, and any other socket that drops reconnects \
+             without knocking another off. Parked depth sockets follow through their own probe \
+             once the main feed is settled; depth rotation stays halted until a restart.",
             outcome.as_str()
         ),
-        OverflowEpisodeKind::Depth => error!(
+        (OverflowEpisodeKind::MainFeed, true) => warn!(
             code = ErrorCode::WsGapDisconnectClassification.code_str(),
             source = kind.source(),
             outcome = outcome.as_str(),
             connection_index = slot.map_or(-1, i32::from),
             watched_connection = watched.map_or(-1, i32::from),
+            sibling_connection = sibling.map_or(-1, i32::from),
+            rotation_halted = rotation_halted(),
+            "main-feed overflow probe ({}): another socket dropped with no code while a parked \
+             socket is being tested after an 805, and nothing we dialled just before can have \
+             knocked it off. The test is not failed for this; it passes only once that socket \
+             has reconnected (within two minutes) without knocking another off.",
+            outcome.as_str()
+        ),
+        (OverflowEpisodeKind::Depth, false) => error!(
+            code = ErrorCode::WsGapDisconnectClassification.code_str(),
+            source = kind.source(),
+            outcome = outcome.as_str(),
+            connection_index = slot.map_or(-1, i32::from),
+            watched_connection = watched.map_or(-1, i32::from),
+            sibling_connection = sibling.map_or(-1, i32::from),
             rotation_halted = rotation_halted(),
             "depth overflow probe ({}): after Dhan closed a socket with 805, ONE parked depth \
              socket redials its own instruments as a test (5 minutes, doubling to 30, at most \
-             6 tries) and the rest come back one at a time only if no socket is closed with 805 \
-             or with no code for two minutes after each one's first frame. Depth-200 rotation \
-             and new depth sockets stay halted until a restart.",
+             6 tries) and the rest come back one at a time. Each passes only if, for two \
+             minutes after its first frame, no 805 arrives anywhere, the probed socket stays \
+             up, and any other socket that drops reconnects without knocking another off. \
+             Depth-200 rotation and new depth sockets stay halted until a restart.",
+            outcome.as_str()
+        ),
+        (OverflowEpisodeKind::Depth, true) => warn!(
+            code = ErrorCode::WsGapDisconnectClassification.code_str(),
+            source = kind.source(),
+            outcome = outcome.as_str(),
+            connection_index = slot.map_or(-1, i32::from),
+            watched_connection = watched.map_or(-1, i32::from),
+            sibling_connection = sibling.map_or(-1, i32::from),
+            rotation_halted = rotation_halted(),
+            "depth overflow probe ({}): another socket dropped with no code while a parked \
+             depth socket is being tested after an 805, and nothing we dialled just before can \
+             have knocked it off. The test is not failed for this; it passes only once that \
+             socket has reconnected (within two minutes) without knocking another off.",
             outcome.as_str()
         ),
     }
 }
 
 /// Any socket closed: an 805 or a bare reset feeds the episodes. O(1) atomic
-/// check for every other close; the lock only when it matters.
-fn overflow_episode_note_disconnect(code: Option<DisconnectCode>, now: Instant) {
+/// check for every other close; the lock only when it matters. A bare reset
+/// carries the closing slot and, computed under the lock, the slots that began
+/// a dial in the last [`OVERFLOW_PROBE_EVICTION_ATTRIBUTION_SECS`]: O(32).
+fn overflow_episode_note_disconnect(code: Option<DisconnectCode>, global_index: u8, now: Instant) {
     if classify_disconnect(code) == DisconnectClass::PoolOverflow {
         OVERFLOW_ENGAGED.store(true, std::sync::atomic::Ordering::Release);
         // Before the lock, so the widen reads no from this instant. It is a
@@ -2054,8 +2440,68 @@ fn overflow_episode_note_disconnect(code: Option<DisconnectCode>, now: Instant) 
         widen_word_note_805(&OVERFLOW_WIDEN_STATE);
         overflow_episode_step(true, |eps| eps.on_overflow(now));
     } else if code.is_none() && OVERFLOW_ENGAGED.load(std::sync::atomic::Ordering::Acquire) {
-        overflow_episode_step(false, |eps| eps.on_bare_reset(now));
+        let epoch = *OVERFLOW_DIAL_EPOCH.get_or_init(|| now);
+        overflow_episode_step(false, |eps| {
+            let recent = recent_dial_mask(
+                &OVERFLOW_DIAL_BEGIN_MS,
+                dial_begin_ms(epoch, now),
+                OVERFLOW_PROBE_EVICTION_ATTRIBUTION_SECS * 1_000,
+            );
+            eps.on_bare_reset(global_index, recent, now)
+        });
     }
+}
+
+/// A socket began a dial: one Release store into the dial-start table, every
+/// dial, engaged or not (scope lock 2026-10-06). O(1), no lock.
+fn overflow_note_dial_begin(global_index: u8, now: Instant) {
+    let epoch = *OVERFLOW_DIAL_EPOCH.get_or_init(|| now);
+    record_dial_begin(
+        &OVERFLOW_DIAL_BEGIN_MS,
+        global_index,
+        dial_begin_ms(epoch, now),
+    );
+}
+
+/// A socket completed a dial: one Acquire load; the episode lock only when
+/// this socket is a noted sibling, which then heals. Once per dial.
+fn overflow_episode_note_dial_succeeded(global_index: u8, now: Instant) {
+    if !suspect_bit_set(global_index) {
+        return;
+    }
+    overflow_episode_step(false, |eps| eps.on_sibling_dialled(global_index, now));
+}
+
+/// A socket's idle watchdog fired: the episode lock only when an episode is
+/// engaged and this is the socket under watch, which then fails its window.
+fn overflow_episode_note_self_redial(global_index: u8, now: Instant) {
+    if !OVERFLOW_ENGAGED.load(std::sync::atomic::Ordering::Acquire)
+        || OVERFLOW_WATCHED_SLOT.load(std::sync::atomic::Ordering::Acquire) != global_index
+    {
+        return;
+    }
+    overflow_episode_step(false, |eps| eps.on_watched_self_redial(global_index, now));
+}
+
+/// A socket parked for a reason other than 805: one Acquire load; the lock
+/// only when it is a noted sibling, which is then dropped from the window.
+fn overflow_episode_note_left(global_index: u8) {
+    if !suspect_bit_set(global_index) {
+        return;
+    }
+    overflow_episode_step(false, |eps| {
+        eps.on_sibling_left(global_index);
+        OverflowEpisodesEffect::default()
+    });
+}
+
+/// Whether `global_index` is a noted sibling of a running window, from the
+/// published [`OVERFLOW_SUSPECT_MASK`]. O(1), one Acquire load.
+fn suspect_bit_set(global_index: u8) -> bool {
+    1u32.checked_shl(u32::from(global_index))
+        .is_some_and(|bit| {
+            OVERFLOW_SUSPECT_MASK.load(std::sync::atomic::Ordering::Acquire) & bit != 0
+        })
 }
 
 /// First frame of a dial: one relaxed load; a store only for the watched
@@ -2779,6 +3225,10 @@ impl ConnectionSupervisor {
                 // cover a dial that hangs forever without ever completing.
                 self.watchdog.record_activity(now);
                 self.last_frame_at = now;
+                // Scope lock 2026-10-06: every dial start is stamped (one
+                // store), so a sibling's no-code close right after it reads
+                // as an eviction this dial caused.
+                overflow_note_dial_begin(self.slot.global_index, now);
                 SupervisorAction::Dial
             }
 
@@ -2798,6 +3248,9 @@ impl ConnectionSupervisor {
                 // unsubscribe probe's re-dial defence cannot be defeated by a
                 // path that forgot to report. See `dial_generation`.
                 bump_dial_generation(self.slot.global_index);
+                // Scope lock 2026-10-06: a noted sibling heals at its own
+                // completed dial (one atomic load otherwise).
+                overflow_episode_note_dial_succeeded(self.slot.global_index, now);
                 SupervisorAction::Subscribe
             }
 
@@ -2897,10 +3350,12 @@ impl ConnectionSupervisor {
             ConnEvent::Disconnected { code } => {
                 self.reconnects = self.reconnects.saturating_add(1);
                 self.last_disconnect_code = code.map(|c| c.as_u16());
-                // D7: every close feeds the main-feed overflow episode — an
-                // 805 starts (or fails) it, a close with no code fails a
-                // running window. O(1) atomic check otherwise.
-                overflow_episode_note_disconnect(code, now);
+                // D7: every close feeds the overflow episodes — an 805 starts
+                // (or fails) them; a close with no code fails a running
+                // window on the probed socket, or on another socket when it
+                // is corroborated as an eviction, and is otherwise noted
+                // (scope lock 2026-10-06). O(1) atomic check otherwise.
+                overflow_episode_note_disconnect(code, self.slot.global_index, now);
                 match classify_disconnect(code) {
                     DisconnectClass::PoolOverflow => {
                         error!(
@@ -3007,10 +3462,18 @@ impl ConnectionSupervisor {
                     "socket silent past the idle threshold — reconnecting on our terms before \
                      Dhan closes it at 40s"
                 );
+                // Scope lock 2026-10-06: the probed socket going silent fails
+                // its window. No other socket's own redial is evidence of
+                // anything; its BeginDial is stamped like every dial.
+                overflow_episode_note_self_redial(self.slot.global_index, now);
                 self.schedule_redial(ReconnectReason::IdleSilence, now)
             }
 
             ConnEvent::FrameSilenceElapsed => {
+                // Scope lock 2026-10-06: deliberately NOT fed to the overflow
+                // episode. A quiet depth contract is legitimate, so a
+                // frame-silence redial never fails a probe window; only the
+                // probed socket's idle watchdog does.
                 // Only a LIVE socket can be data-silent in a way that means
                 // anything: while dialing or subscribing no frame is expected,
                 // and backoff/parked are covered by `is_watchdog_eligible`.
@@ -3304,6 +3767,12 @@ impl ConnectionSupervisor {
 
         self.phase = ConnPhase::Parked;
         self.park_reason = Some(reason);
+        // Scope lock 2026-10-06: a noted sibling that parks for any reason
+        // but 805 opens no connection, so it leaves the probe window (one
+        // atomic load otherwise). After the respawn return: a respawn redials.
+        if reason != ParkReason::PoolOverflow {
+            overflow_episode_note_left(self.slot.global_index);
+        }
         // A stop WE asked for (Z11d) is not a lost socket. It must not move
         // `PARK_METRIC`, which the `dhan-socket-parked` alarm pages on with no
         // reason filter, nor log the "parked permanently" error below: every
@@ -17493,31 +17962,62 @@ mod tests {
     }
 
     #[test]
-    fn test_probe_fails_on_sibling_bare_reset_in_window() {
+    fn test_probe_survives_one_sibling_blip_that_heals() {
+        // Scope lock 2026-10-06: a sibling's no-code close with no recent
+        // dial to blame is NOTED, not a failure; the window passes once it
+        // has reconnected and the settle time has run.
         let start = t0();
         let mut ep = episode_after_805(&[2], start);
         // Before any probe a bare reset changes nothing.
         assert_eq!(
-            ep.on_bare_reset(start + secs(10)),
+            ep.on_bare_reset(0, 0, start + secs(10)),
             OverflowEpisodeEffect::default()
         );
         assert_eq!(ep.phase, OverflowEpisodePhase::Waiting);
 
         let granted = grant_first_probe(&mut ep, start);
-        ep.on_first_frame(2, granted + secs(3));
-        let fail = ep.on_bare_reset(granted + secs(90));
+        let first = granted + secs(3);
+        ep.on_first_frame(2, first);
+        let noted = ep.on_bare_reset(0, 0, granted + secs(90));
         assert_eq!(
-            fail.outcomes,
-            [Some(OverflowProbeOutcome::FailedBareReset), None]
+            noted.outcomes,
+            [Some(OverflowProbeOutcome::SiblingResetNoted), None]
         );
-        assert_eq!(fail.repark, Some(2));
-        assert_eq!(ep.phase, OverflowEpisodePhase::Waiting);
+        assert_eq!(
+            noted.repark, None,
+            "a noted sibling never re-parks the probe"
+        );
+        assert_eq!(noted.grant, None);
+        assert_eq!(noted.sibling, Some(0));
+        assert_eq!(ep.phase, OverflowEpisodePhase::Probing);
+        assert_eq!(ep.suspect_mask, 1);
 
-        // A bare reset AFTER the window passed is not a failure.
-        let mut passed = episode_after_805(&[2], start);
-        let granted = grant_first_probe(&mut passed, start);
-        passed.on_first_frame(2, granted);
-        let done = passed.poll(granted + secs(OVERFLOW_PROBE_WATCH_SECS), true);
+        let healed_at = granted + secs(110);
+        let healed = ep.on_sibling_dialled(0, healed_at);
+        assert_eq!(
+            healed.outcomes,
+            [Some(OverflowProbeOutcome::SiblingHealed), None]
+        );
+        assert_eq!(healed.sibling, Some(0));
+        assert_eq!(ep.suspect_mask, 0);
+        // The watch has run, but the heal's own redial could still evict
+        // someone: no pass inside the settle time.
+        assert_eq!(
+            ep.poll(first + secs(OVERFLOW_PROBE_WATCH_SECS), true),
+            OverflowEpisodeEffect::default()
+        );
+        assert_eq!(
+            ep.poll(
+                healed_at + secs(OVERFLOW_PROBE_EVICTION_ATTRIBUTION_SECS)
+                    - Duration::from_millis(1),
+                true
+            ),
+            OverflowEpisodeEffect::default()
+        );
+        let done = ep.poll(
+            healed_at + secs(OVERFLOW_PROBE_EVICTION_ATTRIBUTION_SECS),
+            true,
+        );
         assert_eq!(
             done.outcomes,
             [
@@ -17525,8 +18025,12 @@ mod tests {
                 Some(OverflowProbeOutcome::Recovered)
             ]
         );
+        assert_eq!(ep.probes_started, 1);
+        assert!(ep.widen_permitted());
+
+        // A bare reset AFTER the window passed is not a failure.
         assert_eq!(
-            passed.on_bare_reset(granted + secs(OVERFLOW_PROBE_WATCH_SECS + 1)),
+            ep.on_bare_reset(0, u32::MAX, healed_at + secs(60)),
             OverflowEpisodeEffect::default()
         );
     }
@@ -17826,6 +18330,40 @@ mod tests {
             .map(OverflowProbeOutcome::as_str)
             .collect();
         assert_eq!(labels.len(), OverflowProbeOutcome::ALL.len());
+        assert_eq!(OverflowProbeOutcome::ALL.len(), 14);
+        let notes: Vec<OverflowProbeOutcome> = OverflowProbeOutcome::ALL
+            .into_iter()
+            .filter(|o| o.is_note())
+            .collect();
+        assert_eq!(
+            notes,
+            vec![
+                OverflowProbeOutcome::SiblingResetNoted,
+                OverflowProbeOutcome::SiblingHealed
+            ],
+            "only the two sibling notes log at warn"
+        );
+        for (outcome, label) in [
+            (
+                OverflowProbeOutcome::SiblingResetNoted,
+                "sibling_reset_noted",
+            ),
+            (OverflowProbeOutcome::SiblingHealed, "sibling_healed"),
+            (
+                OverflowProbeOutcome::FailedEvictionCorroborated,
+                "failed_eviction_corroborated",
+            ),
+            (
+                OverflowProbeOutcome::FailedSiblingUnhealed,
+                "failed_sibling_unhealed",
+            ),
+            (
+                OverflowProbeOutcome::FailedWatchedSilent,
+                "failed_watched_silent",
+            ),
+        ] {
+            assert_eq!(outcome.as_str(), label);
+        }
         assert_eq!(OVERFLOW_PROBE_METRIC, "tv_dhan_ws_overflow_probe_total");
         assert_eq!(ReconnectReason::OverflowProbe.as_str(), "overflow_probe");
         assert!(
@@ -18194,11 +18732,11 @@ mod tests {
             OverflowEpisodesEffect::default(),
             "no probe after the cap, however long the wait"
         );
-        // A bare reset inside a depth window fails it the same way.
+        // The probed depth socket closing with no code fails it the same way.
         let mut reset = episodes_after_805(&[], &[3], start);
         let granted = start + depth_delay(0);
         assert_eq!(reset.poll(granted, true).depth.grant, Some(3));
-        let fail = reset.on_bare_reset(granted + secs(10));
+        let fail = reset.on_bare_reset(3, 0, granted + secs(10));
         assert_eq!(
             fail.depth.outcomes,
             [Some(OverflowProbeOutcome::FailedBareReset), None]
@@ -18286,7 +18824,11 @@ mod tests {
             now += secs((state >> 20) % 90);
             let effects = match roll {
                 0..=3 => eps.on_overflow(now),
-                4..=7 => eps.on_bare_reset(now),
+                4..=7 => {
+                    let slot = u8::try_from((state >> 40) % 15).unwrap_or(0);
+                    let recent = u32::try_from((state >> 8) & 0x7FFF).unwrap_or(0);
+                    eps.on_bare_reset(slot, recent, now)
+                }
                 8..=27 => {
                     let slot = u8::try_from((state >> 40) % 15).unwrap_or(0);
                     let endpoint = match slot / 5 {
@@ -18302,6 +18844,19 @@ mod tests {
                         eps.on_first_frame(watched, now);
                     }
                     OverflowEpisodesEffect::default()
+                }
+                48..=53 => {
+                    let slot = u8::try_from((state >> 40) % 15).unwrap_or(0);
+                    eps.on_sibling_dialled(slot, now)
+                }
+                54..=55 => {
+                    let slot = u8::try_from((state >> 40) % 15).unwrap_or(0);
+                    eps.on_sibling_left(slot);
+                    OverflowEpisodesEffect::default()
+                }
+                56 => {
+                    let slot = u8::try_from((state >> 40) % 15).unwrap_or(0);
+                    eps.on_watched_self_redial(slot, now)
                 }
                 _ => eps.poll(now, roll % 7 != 0),
             };
@@ -18328,6 +18883,782 @@ mod tests {
             grants > 0 && depth_grants > 0,
             "the driver must exercise grants"
         );
+    }
+
+    // --- Scope lock 2026-10-06: overflow probe attribution ---------------
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    /// A main episode probing `probe` (parked with `others`), its first
+    /// frame one second after the grant. Returns the grant instant.
+    fn probing(probe: u8, others: &[u8], start: Instant) -> (OverflowEpisode, Instant) {
+        let mut slots = vec![probe];
+        slots.extend_from_slice(others);
+        let mut ep = episode_after_805(&slots, start);
+        let granted = grant_first_probe(&mut ep, start);
+        assert_eq!(ep.watched(), Some(probe));
+        ep.on_first_frame(probe, granted + secs(1));
+        (ep, granted)
+    }
+
+    fn local_dial_table() -> [std::sync::atomic::AtomicU64; GHOST_REDIAL_SLOTS] {
+        [const { std::sync::atomic::AtomicU64::new(0) }; GHOST_REDIAL_SLOTS]
+    }
+
+    #[test]
+    fn test_overflow_attribution_constants_are_locked() {
+        assert_eq!(OVERFLOW_PROBE_EVICTION_ATTRIBUTION_SECS, 20);
+        assert_eq!(OVERFLOW_PROBE_SIBLING_BURST_MS, 2_000);
+        assert_eq!(OVERFLOW_PROBE_SIBLING_HEAL_DEADLINE_SECS, 120);
+        assert!(
+            OVERFLOW_PROBE_EVICTION_ATTRIBUTION_SECS
+                > super::super::connection::DIAL_TIMEOUT.as_secs()
+        );
+        assert!(
+            OVERFLOW_PROBE_SIBLING_HEAL_DEADLINE_SECS * 1_000
+                > 2 * (RECONNECT_DELAY_WITH_JITTER_MAX_MS
+                    + super::super::connection::DIAL_TIMEOUT.as_secs() * 1_000)
+        );
+        assert!(OVERFLOW_PROBE_SIBLING_BURST_MS < OVERFLOW_PROBE_EVICTION_ATTRIBUTION_SECS * 1_000);
+    }
+
+    #[test]
+    fn test_probed_socket_bare_reset_still_fails() {
+        let start = t0();
+        let (mut ep, granted) = probing(2, &[3], start);
+        let fail = ep.on_bare_reset(2, 0, granted + secs(30));
+        assert_eq!(
+            fail.outcomes,
+            [Some(OverflowProbeOutcome::FailedBareReset), None]
+        );
+        assert_eq!(fail.repark, Some(2));
+        assert_eq!(fail.sibling, None);
+        assert_eq!(ep.phase, OverflowEpisodePhase::Waiting);
+
+        // And while a RELEASED socket is under watch.
+        let (mut r, granted) = probing(2, &[3], start);
+        let pass = r.poll(granted + secs(1 + OVERFLOW_PROBE_WATCH_SECS), true);
+        assert_eq!(pass.grant, Some(3));
+        assert_eq!(r.phase, OverflowEpisodePhase::Resuming);
+        let fail = r.on_bare_reset(3, 0, granted + secs(OVERFLOW_PROBE_WATCH_SECS + 20));
+        assert_eq!(
+            fail.outcomes,
+            [Some(OverflowProbeOutcome::FailedBareReset), None]
+        );
+        assert_eq!(fail.repark, Some(3));
+    }
+
+    #[test]
+    fn test_sibling_drop_right_after_probe_dial_fails_at_once() {
+        // The probe's own dial (its bit in recent_dials) evicted the oldest
+        // socket: today's guard, kept.
+        let start = t0();
+        let (mut ep, granted) = probing(2, &[], start);
+        let fail = ep.on_bare_reset(0, 1 << 2, granted + secs(2));
+        assert_eq!(
+            fail.outcomes,
+            [Some(OverflowProbeOutcome::FailedEvictionCorroborated), None]
+        );
+        assert_eq!(fail.repark, Some(2), "the probe is re-parked");
+        assert_eq!(fail.sibling, Some(0));
+        assert_eq!(ep.phase, OverflowEpisodePhase::Waiting);
+        assert_eq!(ep.suspect_mask, 0);
+    }
+
+    #[test]
+    fn test_two_separate_blips_in_one_window_do_not_fail() {
+        let start = t0();
+        let (mut ep, granted) = probing(4, &[], start);
+        let first = granted + secs(1);
+        let a = ep.on_bare_reset(0, 0, granted + secs(10));
+        assert_eq!(a.outcomes[0], Some(OverflowProbeOutcome::SiblingResetNoted));
+        assert_eq!(
+            ep.on_sibling_dialled(0, granted + secs(40)).outcomes[0],
+            Some(OverflowProbeOutcome::SiblingHealed)
+        );
+        // Slot 0's dial began 60 s earlier: outside the attribution window,
+        // so the caller's mask no longer holds it.
+        let b = ep.on_bare_reset(1, 0, granted + secs(100));
+        assert_eq!(b.outcomes[0], Some(OverflowProbeOutcome::SiblingResetNoted));
+        let healed = granted + secs(110);
+        assert_eq!(
+            ep.on_sibling_dialled(1, healed).outcomes[0],
+            Some(OverflowProbeOutcome::SiblingHealed)
+        );
+        assert_eq!(
+            ep.poll(first + secs(OVERFLOW_PROBE_WATCH_SECS), true),
+            OverflowEpisodeEffect::default()
+        );
+        let done = ep.poll(
+            healed + secs(OVERFLOW_PROBE_EVICTION_ATTRIBUTION_SECS),
+            true,
+        );
+        assert_eq!(done.outcomes[0], Some(OverflowProbeOutcome::ProbePassed));
+    }
+
+    #[test]
+    fn test_flapping_sibling_is_not_cascade_evidence() {
+        let start = t0();
+        let (mut ep, granted) = probing(4, &[], start);
+        let _ = ep.on_bare_reset(0, 0, granted + secs(10));
+        let _ = ep.on_sibling_dialled(0, granted + secs(11));
+        // Slot 0 drops again; its OWN dial is in the mask and never counts.
+        let again = ep.on_bare_reset(0, 1 << 0, granted + secs(20));
+        assert_eq!(
+            again.outcomes,
+            [Some(OverflowProbeOutcome::SiblingResetNoted), None]
+        );
+        assert_eq!(again.repark, None);
+        assert_eq!(ep.suspect_mask, 1);
+        assert_eq!(ep.phase, OverflowEpisodePhase::Probing);
+    }
+
+    #[test]
+    fn test_cascade_after_burst_fails() {
+        let start = t0();
+        let (mut ep, granted) = probing(4, &[], start);
+        let _ = ep.on_bare_reset(0, 0, granted + secs(30));
+        // Slot 0 began redialling; slot 1 drops 3 s later (a new burst).
+        let fail = ep.on_bare_reset(1, 1 << 0, granted + secs(33));
+        assert_eq!(
+            fail.outcomes,
+            [Some(OverflowProbeOutcome::FailedEvictionCorroborated), None]
+        );
+        assert_eq!(fail.sibling, Some(1));
+        assert_eq!(fail.repark, Some(4));
+    }
+
+    #[test]
+    fn test_simultaneous_burst_is_one_event() {
+        let start = t0();
+        let (mut ep, granted) = probing(4, &[], start);
+        let t = granted + secs(30);
+        let _ = ep.on_bare_reset(0, 0, t);
+        // Slot 0's redial began between the two closes: it is a burst
+        // member, so it does not corroborate slot 1's close.
+        let second = ep.on_bare_reset(1, 1 << 0, t + ms(500));
+        assert_eq!(
+            second.outcomes,
+            [Some(OverflowProbeOutcome::SiblingResetNoted), None]
+        );
+        assert_eq!(ep.suspect_mask, 0b11);
+        let _ = ep.on_sibling_dialled(0, t + secs(2));
+        let healed = t + secs(3);
+        let _ = ep.on_sibling_dialled(1, healed);
+        let done = ep.poll(granted + secs(1 + OVERFLOW_PROBE_WATCH_SECS), true);
+        assert_eq!(done.outcomes[0], Some(OverflowProbeOutcome::ProbePassed));
+        // The burst boundary is inclusive at 2 s and exclusive after it.
+        let (mut edge, granted) = probing(4, &[], start);
+        let t = granted + secs(30);
+        let _ = edge.on_bare_reset(0, 0, t);
+        let joined = edge.on_bare_reset(1, 1 << 0, t + ms(OVERFLOW_PROBE_SIBLING_BURST_MS));
+        assert_eq!(
+            joined.outcomes[0],
+            Some(OverflowProbeOutcome::SiblingResetNoted)
+        );
+        let (mut late, granted) = probing(4, &[], start);
+        let t = granted + secs(30);
+        let _ = late.on_bare_reset(0, 0, t);
+        let fail = late.on_bare_reset(1, 1 << 0, t + ms(OVERFLOW_PROBE_SIBLING_BURST_MS + 1));
+        assert_eq!(
+            fail.outcomes[0],
+            Some(OverflowProbeOutcome::FailedEvictionCorroborated)
+        );
+    }
+
+    #[test]
+    fn test_evictee_close_processed_before_evictor_dial_completes() {
+        // Slot 3 BEGAN a dial (stamped) and has not completed it; sibling 1's
+        // close reaches its supervisor first. The BeginDial stamp, not the
+        // completed dial, is what corroborates.
+        let table = local_dial_table();
+        record_dial_begin(&table, 3, 100_000);
+        let recent = recent_dial_mask(
+            &table,
+            105_000,
+            OVERFLOW_PROBE_EVICTION_ATTRIBUTION_SECS * 1_000,
+        );
+        assert_eq!(recent, 1 << 3);
+        let start = t0();
+        let (mut ep, granted) = probing(4, &[], start);
+        let fail = ep.on_bare_reset(1, recent, granted + secs(60));
+        assert_eq!(
+            fail.outcomes[0],
+            Some(OverflowProbeOutcome::FailedEvictionCorroborated)
+        );
+        assert_eq!(fail.sibling, Some(1));
+    }
+
+    #[test]
+    fn test_unhealed_sibling_fails_at_its_own_deadline() {
+        let start = t0();
+        let (mut ep, granted) = probing(4, &[], start);
+        let noted_at = granted + secs(10);
+        let _ = ep.on_bare_reset(0, 0, noted_at);
+        assert_eq!(
+            ep.poll(
+                noted_at + secs(OVERFLOW_PROBE_SIBLING_HEAL_DEADLINE_SECS - 1),
+                true
+            ),
+            OverflowEpisodeEffect::default()
+        );
+        let fail = ep.poll(
+            noted_at + secs(OVERFLOW_PROBE_SIBLING_HEAL_DEADLINE_SECS),
+            true,
+        );
+        assert_eq!(
+            fail.outcomes,
+            [Some(OverflowProbeOutcome::FailedSiblingUnhealed), None]
+        );
+        assert_eq!(fail.repark, Some(4));
+        assert_eq!(fail.sibling, Some(0));
+
+        // Per-slot stamps: a second suspect keeps its full deadline after
+        // the first heals.
+        let (mut ep, granted) = probing(4, &[], start);
+        let _ = ep.on_bare_reset(0, 0, granted + secs(10));
+        let second = granted + secs(100);
+        let _ = ep.on_bare_reset(1, 0, second);
+        let _ = ep.on_sibling_dialled(0, granted + secs(105));
+        assert_eq!(
+            ep.poll(granted + secs(130), true),
+            OverflowEpisodeEffect::default(),
+            "slot 0 healed; slot 0's old deadline is gone"
+        );
+        assert_eq!(
+            ep.poll(
+                second + secs(OVERFLOW_PROBE_SIBLING_HEAL_DEADLINE_SECS - 1),
+                true
+            ),
+            OverflowEpisodeEffect::default()
+        );
+        let fail = ep.poll(
+            second + secs(OVERFLOW_PROBE_SIBLING_HEAL_DEADLINE_SECS),
+            true,
+        );
+        assert_eq!(fail.sibling, Some(1));
+
+        // Unhealed siblings spend probes like any failure: the third goes
+        // down for the session (no refund).
+        let mut ep = episode_after_805(&[4], start);
+        let mut wait_from = start;
+        for (attempt, delay) in OVERFLOW_PROBE_DELAYS_SECS.iter().enumerate() {
+            let granted = wait_from + secs(*delay);
+            assert_eq!(ep.poll(granted, true).grant, Some(4));
+            ep.on_first_frame(4, granted + secs(1));
+            let _ = ep.on_bare_reset(0, 0, granted + secs(5));
+            let failed_at = granted + secs(5 + OVERFLOW_PROBE_SIBLING_HEAL_DEADLINE_SECS);
+            let fail = ep.poll(failed_at, true);
+            assert_eq!(
+                fail.outcomes[0],
+                Some(OverflowProbeOutcome::FailedSiblingUnhealed)
+            );
+            ep.on_parked(4);
+            wait_from = failed_at;
+            if attempt + 1 == usize::from(OVERFLOW_PROBE_MAX_ATTEMPTS) {
+                assert_eq!(fail.outcomes[1], Some(OverflowProbeOutcome::DownForSession));
+            }
+        }
+        assert!(ep.is_down());
+        assert_eq!(ep.probes_started, OVERFLOW_PROBE_MAX_ATTEMPTS);
+    }
+
+    #[test]
+    fn test_pass_deferral_is_capped() {
+        let start = t0();
+        let mut eps = episodes_after_805(&[4], &[10], start);
+        let at = start + secs(OVERFLOW_PROBE_DELAYS_SECS[0]);
+        assert_eq!(eps.poll(at, true).main.grant, Some(4));
+        let first = at + secs(1);
+        eps.on_first_frame(4, first);
+        let cap =
+            first + secs(OVERFLOW_PROBE_WATCH_SECS + OVERFLOW_PROBE_SIBLING_HEAL_DEADLINE_SECS);
+        // Slot 0 flaps forever: drops every 15 s and redials 5 s later, with
+        // no foreign dial to blame. The window never settles.
+        let mut t = first + secs(2);
+        while t < cap {
+            let noted = eps.on_bare_reset(0, 0, t);
+            assert_eq!(
+                noted.main.outcomes[0],
+                Some(OverflowProbeOutcome::SiblingResetNoted)
+            );
+            let _ = eps.on_sibling_dialled(0, t + secs(5));
+            let polled = eps.poll(t + secs(10), true);
+            if t + secs(10) < cap {
+                assert_eq!(polled.main, OverflowEpisodeEffect::default());
+                assert_eq!(polled.depth.grant, None, "no depth grant while deferred");
+                assert!(eps.main.holds_turn());
+                assert_eq!(eps.watched(), Some(4));
+            }
+            t += secs(15);
+            if t + secs(10) >= cap {
+                break;
+            }
+        }
+        let fail = eps.poll(cap, true);
+        assert_eq!(
+            fail.main.outcomes[0],
+            Some(OverflowProbeOutcome::FailedSiblingUnhealed)
+        );
+        assert_eq!(fail.main.repark, Some(4));
+    }
+
+    #[test]
+    fn test_suspect_that_parks_for_non_805_is_dropped() {
+        let start = t0();
+        let (mut ep, granted) = probing(4, &[], start);
+        let _ = ep.on_bare_reset(0, 0, granted + secs(10));
+        ep.on_sibling_left(0);
+        assert_eq!(ep.suspect_mask, 0);
+        assert_eq!(ep.settle_until, None, "a parked socket adds no connection");
+        let done = ep.poll(granted + secs(1 + OVERFLOW_PROBE_WATCH_SECS), true);
+        assert_eq!(done.outcomes[0], Some(OverflowProbeOutcome::ProbePassed));
+    }
+
+    #[test]
+    fn test_watched_idle_redial_fails_window() {
+        let start = t0();
+        let (mut ep, granted) = probing(4, &[], start);
+        assert_eq!(
+            ep.on_watched_self_redial(0, granted + secs(20)),
+            OverflowEpisodeEffect::default()
+        );
+        let fail = ep.on_watched_self_redial(4, granted + secs(30));
+        assert_eq!(
+            fail.outcomes,
+            [Some(OverflowProbeOutcome::FailedWatchedSilent), None]
+        );
+        assert_eq!(fail.repark, Some(4));
+        // Outside a window it does nothing.
+        assert_eq!(
+            ep.on_watched_self_redial(4, granted + secs(31)),
+            OverflowEpisodeEffect::default()
+        );
+    }
+
+    fn assert_attribution_cleared(ep: &OverflowEpisode) {
+        assert_eq!(ep.suspect_mask, 0);
+        assert_eq!(ep.suspect_since, [None; GHOST_REDIAL_SLOTS]);
+        assert_eq!(ep.burst_start, None);
+        assert_eq!(ep.burst_mask, 0);
+        assert_eq!(ep.settle_until, None);
+    }
+
+    #[test]
+    fn test_blip_then_805_fails_once_as_805() {
+        let start = t0();
+        let (mut ep, granted) = probing(4, &[], start);
+        let _ = ep.on_bare_reset(0, 0, granted + secs(10));
+        let failed_at = granted + secs(20);
+        let fail = ep.on_overflow(failed_at);
+        assert_eq!(
+            fail.outcomes,
+            [Some(OverflowProbeOutcome::FailedOverflow), None]
+        );
+        assert_eq!(fail.repark, Some(4));
+        assert_eq!(ep.probes_started, 1);
+        assert_attribution_cleared(&ep);
+        assert_eq!(
+            ep.on_sibling_dialled(0, granted + secs(25)),
+            OverflowEpisodeEffect::default(),
+            "a late heal does nothing"
+        );
+        ep.on_parked(4);
+        let regrant = ep.poll(failed_at + secs(OVERFLOW_PROBE_DELAYS_SECS[1]), true);
+        assert_eq!(regrant.grant, Some(4));
+        assert_attribution_cleared(&ep);
+    }
+
+    #[test]
+    fn test_805_then_blip_no_double_fail() {
+        let start = t0();
+        let (mut ep, granted) = probing(4, &[], start);
+        let fail = ep.on_overflow(granted + secs(10));
+        assert_eq!(fail.outcomes[0], Some(OverflowProbeOutcome::FailedOverflow));
+        assert_eq!(ep.phase, OverflowEpisodePhase::Waiting);
+        assert_eq!(
+            ep.on_bare_reset(0, 0, granted + secs(11)),
+            OverflowEpisodeEffect::default()
+        );
+        assert_eq!(
+            ep.on_bare_reset(4, u32::MAX, granted + secs(12)),
+            OverflowEpisodeEffect::default()
+        );
+        assert_eq!(ep.probes_started, 1);
+    }
+
+    #[test]
+    fn test_blip_on_watched_and_805_single_failure() {
+        let start = t0();
+        for bare_first in [true, false] {
+            let (mut ep, granted) = probing(4, &[], start);
+            let t = granted + secs(30);
+            let effects = if bare_first {
+                [ep.on_bare_reset(4, 0, t), ep.on_overflow(t)]
+            } else {
+                [ep.on_overflow(t), ep.on_bare_reset(4, 0, t)]
+            };
+            let failures = effects
+                .iter()
+                .flat_map(|e| e.outcomes)
+                .flatten()
+                .filter(|o| o.as_str().starts_with("failed_"))
+                .count();
+            let reparks = effects.iter().filter(|e| e.repark.is_some()).count();
+            assert_eq!(failures, 1, "bare_first={bare_first}");
+            assert_eq!(reparks, 1, "bare_first={bare_first}");
+            assert_eq!(ep.probes_started, 1);
+        }
+    }
+
+    #[test]
+    fn test_depth_window_attribution() {
+        let start = t0();
+        let granted = start + depth_delay(0);
+        // Heal.
+        let mut eps = episodes_after_805(&[], &[9], start);
+        assert_eq!(eps.poll(granted, true).depth.grant, Some(9));
+        eps.on_first_frame(9, granted + secs(1));
+        let noted = eps.on_bare_reset(0, 0, granted + secs(10));
+        assert_eq!(noted.main, OverflowEpisodeEffect::default());
+        assert_eq!(
+            noted.depth.outcomes[0],
+            Some(OverflowProbeOutcome::SiblingResetNoted)
+        );
+        let healed = eps.on_sibling_dialled(0, granted + secs(20));
+        assert_eq!(
+            healed.depth.outcomes[0],
+            Some(OverflowProbeOutcome::SiblingHealed)
+        );
+        let done = eps.poll(granted + secs(1 + OVERFLOW_PROBE_WATCH_SECS), true);
+        assert_eq!(
+            done.depth.outcomes[0],
+            Some(OverflowProbeOutcome::ProbePassed)
+        );
+        // Corroborated.
+        let mut eps = episodes_after_805(&[], &[9], start);
+        let _ = eps.poll(granted, true);
+        let fail = eps.on_bare_reset(0, 1 << 9, granted + secs(2));
+        assert_eq!(
+            fail.depth.outcomes[0],
+            Some(OverflowProbeOutcome::FailedEvictionCorroborated)
+        );
+        assert_eq!(fail.depth.repark, Some(9));
+        assert_eq!(fail.depth.sibling, Some(0));
+        // Unhealed.
+        let mut eps = episodes_after_805(&[], &[9], start);
+        let _ = eps.poll(granted, true);
+        let noted_at = granted + secs(5);
+        let _ = eps.on_bare_reset(1, 0, noted_at);
+        let fail = eps.poll(
+            noted_at + secs(OVERFLOW_PROBE_SIBLING_HEAL_DEADLINE_SECS),
+            true,
+        );
+        assert_eq!(
+            fail.depth.outcomes[0],
+            Some(OverflowProbeOutcome::FailedSiblingUnhealed)
+        );
+        assert_eq!(fail.depth.sibling, Some(1));
+    }
+
+    #[test]
+    fn test_depth_window_deferred_keeps_main_waiting() {
+        let start = t0();
+        let mut eps = episodes_after_805(&[], &[10], start);
+        let at = start + depth_delay(0);
+        assert_eq!(eps.poll(at, true).depth.grant, Some(10));
+        eps.on_parked(DhanEndpointType::MainFeed, 1);
+        eps.on_first_frame(10, at + secs(1));
+        let _ = eps.on_bare_reset(0, 0, at + secs(100));
+        for t in [at + secs(121), at + secs(124)] {
+            let held = eps.poll(t, true);
+            assert_eq!(held.main.grant, None, "never two windows at once");
+            assert_eq!(held.depth, OverflowEpisodeEffect::default());
+            assert_eq!(eps.watched(), Some(10));
+        }
+        let healed = at + secs(125);
+        let _ = eps.on_sibling_dialled(0, healed);
+        let settling = eps.poll(at + secs(130), true);
+        assert_eq!(settling.main.grant, None);
+        assert_eq!(settling.depth, OverflowEpisodeEffect::default());
+        let passed = eps.poll(
+            healed + secs(OVERFLOW_PROBE_EVICTION_ATTRIBUTION_SECS),
+            true,
+        );
+        assert_eq!(passed.main.grant, None);
+        assert_eq!(
+            passed.depth.outcomes,
+            [
+                Some(OverflowProbeOutcome::ProbePassed),
+                Some(OverflowProbeOutcome::Recovered)
+            ]
+        );
+        let next = eps.poll(
+            healed + secs(OVERFLOW_PROBE_EVICTION_ATTRIBUTION_SECS + 1),
+            true,
+        );
+        assert_eq!(next.main.grant, Some(1));
+    }
+
+    #[test]
+    fn test_out_of_range_slot_fails_closed() {
+        let start = t0();
+        let (mut ep, granted) = probing(4, &[], start);
+        assert_eq!(
+            ep.on_sibling_dialled(40, granted + secs(2)),
+            OverflowEpisodeEffect::default()
+        );
+        ep.on_sibling_left(40);
+        let fail = ep.on_bare_reset(40, 0, granted + secs(3));
+        assert_eq!(
+            fail.outcomes,
+            [Some(OverflowProbeOutcome::FailedBareReset), None]
+        );
+        assert_eq!(fail.repark, Some(4));
+    }
+
+    #[test]
+    fn test_recent_dial_mask_on_local_table() {
+        let table = local_dial_table();
+        let within = OVERFLOW_PROBE_EVICTION_ATTRIBUTION_SECS * 1_000;
+        assert_eq!(recent_dial_mask(&table, 50_000, within), 0, "never dialled");
+        record_dial_begin(&table, 3, 1_000);
+        assert_eq!(recent_dial_mask(&table, 1_000, within), 1 << 3, "just now");
+        assert_eq!(recent_dial_mask(&table, 11_000, within), 1 << 3, "inside");
+        assert_eq!(
+            recent_dial_mask(&table, 21_000, within),
+            1 << 3,
+            "exact edge"
+        );
+        assert_eq!(recent_dial_mask(&table, 21_001, within), 0, "past");
+        // A stamp later than `now` (another task's later clock) reads as
+        // recent: errs toward fail.
+        record_dial_begin(&table, 5, 50_000);
+        assert_eq!(
+            recent_dial_mask(&table, 10_000, within),
+            (1 << 3) | (1 << 5)
+        );
+        // `dial_begin_ms` saturates before the epoch.
+        let epoch = t0() + secs(10);
+        assert_eq!(dial_begin_ms(epoch, epoch + ms(1_500)), 1_500);
+        assert_eq!(dial_begin_ms(epoch, epoch - secs(5)), 0);
+    }
+
+    #[test]
+    fn test_record_dial_begin_ignores_out_of_range_slot() {
+        let table = local_dial_table();
+        record_dial_begin(&table, 32, 5);
+        record_dial_begin(&table, u8::MAX, 5);
+        assert!(
+            table
+                .iter()
+                .all(|c| c.load(std::sync::atomic::Ordering::Acquire) == 0)
+        );
+        record_dial_begin(&table, 0, u64::MAX);
+        assert_eq!(
+            table[0].load(std::sync::atomic::Ordering::Acquire),
+            u64::MAX,
+            "saturating, never wraps to 0 (never)"
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+        #[test]
+        fn proptest_attribution_rules(
+            ops in proptest::collection::vec((0u8..8, 0u8..40, any::<u32>(), 0u64..60_000), 1..300)
+        ) {
+            let mut eps = OverflowEpisodes::new();
+            let mut now = t0();
+            for (op, raw_slot, raw_mask, advance_ms) in ops {
+                // Mostly in-range slots with a small pool, so notes and heals
+                // meet; mostly empty dial masks, so siblings get noted.
+                let slot = if raw_slot >= 36 { raw_slot } else { raw_slot % 16 };
+                let mask = if raw_mask % 4 == 0 { raw_mask & 0xFFFF } else { 0 };
+                now += Duration::from_millis(advance_ms);
+                let before = eps;
+                let effects = match op {
+                    0 => eps.on_overflow(now),
+                    1 | 2 => eps.on_bare_reset(slot, mask, now),
+                    3 => eps.on_sibling_dialled(slot, now),
+                    4 => {
+                        eps.on_sibling_left(slot);
+                        OverflowEpisodesEffect::default()
+                    }
+                    5 => eps.on_watched_self_redial(slot, now),
+                    6 => {
+                        let endpoint = match slot % 3 {
+                            0 => DhanEndpointType::MainFeed,
+                            1 => DhanEndpointType::Depth20,
+                            _ => DhanEndpointType::Depth200,
+                        };
+                        eps.on_parked(endpoint, slot % 15);
+                        if let Some(watched) = eps.watched() {
+                            eps.on_first_frame(watched, now);
+                        }
+                        OverflowEpisodesEffect::default()
+                    }
+                    _ => eps.poll(now, raw_mask % 5 != 0),
+                };
+                let in_flight = usize::from(eps.main.watched().is_some())
+                    + usize::from(eps.depth.watched().is_some());
+                prop_assert!(in_flight <= 1);
+                prop_assert!(effects.main.grant.is_none() || effects.depth.grant.is_none());
+                prop_assert!(eps.main.probes_started <= OVERFLOW_PROBE_MAX_ATTEMPTS);
+                prop_assert!(eps.depth.probes_started <= DEPTH_OVERFLOW_PROBE_MAX_ATTEMPTS);
+                for (effect, ep_before) in [(effects.main, before.main), (effects.depth, before.depth)] {
+                    for outcome in effect.outcomes.into_iter().flatten() {
+                        match outcome {
+                            OverflowProbeOutcome::FailedOverflow => prop_assert_eq!(op, 0),
+                            OverflowProbeOutcome::FailedBareReset => {
+                                prop_assert!(op == 1 || op == 2);
+                                prop_assert!(
+                                    ep_before.watched() == Some(slot)
+                                        || usize::from(slot) >= GHOST_REDIAL_SLOTS
+                                );
+                            }
+                            OverflowProbeOutcome::FailedEvictionCorroborated => {
+                                prop_assert!(op == 1 || op == 2);
+                                let bit = 1u32.checked_shl(u32::from(slot)).unwrap_or(0);
+                                prop_assert!(mask & !bit != 0, "the closer's own dial never corroborates");
+                                prop_assert!(ep_before.watched().is_some());
+                            }
+                            OverflowProbeOutcome::FailedSiblingUnhealed => {
+                                prop_assert_eq!(op, 7);
+                                prop_assert!(ep_before.unsettled(now) || ep_before.suspect_mask != 0);
+                            }
+                            OverflowProbeOutcome::FailedWatchedSilent => {
+                                prop_assert_eq!(op, 5);
+                                prop_assert_eq!(ep_before.watched(), Some(slot));
+                            }
+                            OverflowProbeOutcome::ProbePassed | OverflowProbeOutcome::ReleasePassed => {
+                                prop_assert_eq!(op, 7);
+                                prop_assert!(!ep_before.unsettled(now), "no pass while unsettled");
+                            }
+                            OverflowProbeOutcome::SiblingResetNoted => {
+                                prop_assert!(op == 1 || op == 2);
+                                prop_assert!(ep_before.watched().is_some());
+                                prop_assert!(ep_before.watched() != Some(slot));
+                            }
+                            OverflowProbeOutcome::SiblingHealed => prop_assert_eq!(op, 3),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_overflow_attribution_call_sites_are_wired() {
+        let src = include_str!("pool_supervisor.rs");
+        let marker = concat!("#[cfg(", "test)]");
+        let prod = src.split(marker).next().unwrap_or(src);
+        assert!(
+            prod.contains("overflow_episode_note_disconnect(code, self.slot.global_index, now)")
+        );
+        let arm = |start: &str, end: &str| -> String {
+            let at = prod.find(start).expect("arm exists");
+            let rest = &prod[at..];
+            rest[..rest.find(end).expect("arm end")].to_string()
+        };
+        assert!(
+            arm("ConnEvent::BeginDial => {", "SupervisorAction::Dial")
+                .contains("overflow_note_dial_begin(self.slot.global_index, now)")
+        );
+        assert!(
+            arm(
+                "ConnEvent::DialSucceeded => {",
+                "SupervisorAction::Subscribe"
+            )
+            .contains("overflow_episode_note_dial_succeeded(self.slot.global_index, now)")
+        );
+        let idle = arm(
+            "ConnEvent::IdleElapsed => {",
+            "ConnEvent::FrameSilenceElapsed => {",
+        );
+        assert!(idle.contains("overflow_episode_note_self_redial(self.slot.global_index, now)"));
+        assert!(!idle.contains("on_bare_reset"));
+        let silence = arm(
+            "ConnEvent::FrameSilenceElapsed => {",
+            "self.schedule_redial(",
+        );
+        assert!(!silence.contains("on_bare_reset"));
+        assert!(!silence.contains("overflow_episode_note_"));
+        // park(): the non-805 hook runs after the respawn return.
+        let park = arm("fn park(&mut self, reason: ParkReason", "PARK_METRIC,");
+        let respawn = park
+            .find("return self.schedule_redial(ReconnectReason::Disconnected, now);")
+            .expect("respawn return");
+        let left = park
+            .find("overflow_episode_note_left(self.slot.global_index)")
+            .expect("park feeds the episodes");
+        assert!(respawn < left);
+        assert!(park.contains("if reason != ParkReason::PoolOverflow {"));
+        // The suspect mask is published inside the episode lock block.
+        let step = arm(
+            "fn overflow_episode_step(",
+            "apply_overflow_effect(OverflowEpisodeKind::MainFeed",
+        );
+        let store = step
+            .find("OVERFLOW_SUSPECT_MASK.store(")
+            .expect("published");
+        let lock_end = step
+            .find("(effects, watched)\n    };")
+            .expect("lock block end");
+        assert!(step.find(".lock()").expect("lock") < store && store < lock_end);
+    }
+
+    #[test]
+    fn test_overflow_episode_region_never_allocates() {
+        // A source pin in place of a DHAT gate (no dhat_*.rs drives the
+        // supervisor): the episode core holds only `Copy` data.
+        let src = include_str!("pool_supervisor.rs");
+        let marker = concat!("#[cfg(", "test)]");
+        let prod = src.split(marker).next().unwrap_or(src);
+        let start = prod
+            .find("enum OverflowEpisodeKind {")
+            .expect("region start");
+        let end = prod.find("static OVERFLOW_EPISODES:").expect("region end");
+        for line in prod[start..end].lines() {
+            let code = line.trim_start();
+            if code.starts_with("//") {
+                continue;
+            }
+            for banned in [
+                "Vec<",
+                "Vec::",
+                "vec!",
+                "Box<",
+                "Box::",
+                "String",
+                "format!",
+                ".to_string(",
+            ] {
+                assert!(
+                    !code.contains(banned),
+                    "allocation in the episode core: {line}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_scope_lock_records_the_overflow_probe_attribution() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/claude-rules-full/project/websocket-connection-scope-lock.md"
+        );
+        let text = std::fs::read_to_string(path).expect("scope lock readable");
+        assert!(text.contains(
+            "### 2026-10-06 — OVERFLOW PROBE ATTRIBUTION: a close with no code fails a probe only on the probed socket, or when another socket's drop is corroborated as an eviction"
+        ));
+        assert!(text.contains("the probed socket closing with no code still fails a probe"));
+        assert!(text.contains("\"Go ahead with whatever you want dude\""));
+        // The 2026-10-02 sections it amends are still there.
+        assert!(text.contains("### 2026-10-02 — DEPTH SOCKETS RECOVER ON THEIR OWN AFTER 805"));
     }
 
     #[test]

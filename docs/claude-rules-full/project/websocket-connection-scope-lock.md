@@ -8696,3 +8696,80 @@ longer the 09:15 open.
 - Sealing any bar whose bucket starts before 09:15, in any timeframe.
 - Dropping or gating pre-open rows from `ticks` or the WAL under cover of this quote.
 - Moving the candle grid start again without a fresh dated quote here first.
+
+### 2026-10-06 — OVERFLOW PROBE ATTRIBUTION: a close with no code fails a probe only on the probed socket, or when another socket's drop is corroborated as an eviction
+
+**Owner (2026-10-06, verbatim):** "Go ahead with whatever you want dude" and
+"See do everything whatever is recommended dude okay?"
+
+*(Provenance: both quotes reached the implementing session through the
+coordinator's workflow on 2026-10-06, as the approval for the recommended
+fast-lane plan. Confirm them against the owner thread before merge.)*
+
+**What was wrong (measured in source on main 60bdfd97a).** Once any 805 had
+happened, EVERY close with no code on ANY socket failed a running probe or
+release window (main feed rule D7 / plan R3-7, and the depth "Failure" row of
+"2026-10-02 — DEPTH SOCKETS RECOVER ON THEIR OWN AFTER 805"). A probe is never
+refunded and the caps are 3 (main feed) and 6 (depth), so one unrelated blip on
+a healthy sibling burned a probe, and three such blips left the parked sockets
+dark for the session.
+
+Recorded HERE before the code, per the rule-file-first law.
+
+#### What this AMENDS
+
+| Surface | Was (D7 2026-10-02; depth 2026-10-02 "Failure" row) | Now |
+|---|---|---|
+| Main-feed window (D7) | fails on an 805 anywhere, on any socket closing with no code, or on no first frame in time | fails on an 805 anywhere; **the probed socket closing with no code, or its own idle watchdog firing**; no first frame in time; **another socket's no-code close that is corroborated as an eviction**; or **a dropped socket that does not reconnect within 120 s** |
+| Depth window ("Failure" row) | "an 805 on ANY socket, or any socket closing with no code, inside a window; or no frame in time" | the same five failure rules as the main-feed row above. The probed socket parks again and the next probe waits the doubled delay, as before |
+| Corroboration | — | some OTHER socket of this process (not the closing one, and not one that closed in the same burst of no-code closes within 2 s) BEGAN a dial in the last 20 s (`OVERFLOW_PROBE_EVICTION_ATTRIBUTION_SECS`, longer than the 15 s dial timeout). Dhan evicts the oldest socket when a new one is accepted, so a drop right after one of our dials is the probe (or a cascade) costing a socket |
+| A sibling blip that heals | failed the window | noted (`sibling_reset_noted`, a coded `warn!`). It heals at its own successful dial (`sibling_healed`); the window cannot pass until every noted sibling has healed and 20 s have passed since the last heal (that dial could still evict someone) |
+| Pass deferral | — | bounded: a window still unsettled 120 s after its watch would have ended fails (`failed_sibling_unhealed`) |
+| A noted sibling that parks for a reason other than 805 | — | dropped from the window (it opens no connection) |
+
+Unchanged: the probed socket closing with no code still fails a probe, as before.
+
+#### Kept, unchanged
+
+- One probe or release window in flight process-wide; the main feed goes first.
+- `ROTATION_HALTED` is never cleared, read or written by the episodes.
+- The caps: 3 main-feed probes, 6 depth probes, no refund; the delays (5/10/20
+  min; 5 min doubling to 30), the 2-minute first-frame deadline and the
+  2-minute watch.
+- No new socket, no new dial: healing a sibling is its own normal redial.
+- Socket caps 5,000 / 50 / 1 per socket.
+- No new page, alarm, EMF metric or Telegram message: Prometheus labels on the
+  existing probe counters and coded log lines only.
+
+#### ⚠ Honest limits
+
+- **A foreign process's dials cannot be seen.** The usual cause of an 805 is a
+  second login elsewhere. A single eviction caused by a foreign dial, whose
+  victim reconnects cleanly, now reads as a healed blip and the window can
+  pass; the next 805 or a corroborated close still fails it.
+- **A blip on the box's own network that also drops the probed socket still
+  fails the probe** (the probed-socket rule). The fix covers only drops that
+  leave the probed socket up.
+- **A frame-silence redial (`FrameSilenceElapsed`) does not fail a window**:
+  a quiet depth contract is legitimate. Only the probed socket's idle
+  watchdog (no frame and no ping for 40 s) does.
+- **Errs toward fail, never toward pass**: any of our sockets beginning a dial
+  within 20 s before an unrelated blip fails the window; a cascade faster than
+  2 s is grouped as one burst and caught only by the next close or the 120 s
+  heal deadline.
+- **Assumed:** Dhan evicts at accept time, within the dial timeout of our
+  dial. An eviction more than 20 s after our dial reads as a blip.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Ignores sibling no-code closes inside a window with no corroboration check
+  (no recent-dial test and no heal deadline).
+- Removes "an 805 on any socket fails the window".
+- Passes a window while a noted sibling has not healed, or inside the settle
+  time after the last heal.
+- Refunds a probe, or raises the 3 / 6 probe caps, under cover of this section.
+- Opens a socket, or dials anything other than the sibling's own normal
+  redial, to heal a sibling.
+- Opens a second window while one is deferred.
+- Counts the closing socket's own dial, or a dial by a member of the same burst
+  of closes, as corroboration.
