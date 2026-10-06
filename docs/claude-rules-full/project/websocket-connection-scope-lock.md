@@ -8851,3 +8851,28 @@ REJECT (review round 4):
 - Drops the stamp on a `timeout` or `connect` failure, or keeps it on an
   `upgrade_refused` one.
 - Lets the supervisor's backoff branch on the dial failure reason.
+
+#### Review round 5 (2026-10-06, same day, same owner approval)
+
+Two more gaps, both measured in source on this branch before the fix:
+
+| Surface | Was | Now |
+|---|---|---|
+| The probed DEPTH socket torn down for frame silence | its frame-silence redial reached no episode hook (round 3 kept depth silence out on purpose) and it kept its first frame, and a redial whose dials kept failing produced only dial failures, which have no episode hook. So a deferred window could pass, and release the next parked socket, while the probed socket was not connected: probe first frame at F, a sibling noted at F+200, the probe's frame silence at F+300, the sibling healed at F+310, a pass at F+330 with the probe still down | the probed depth socket's frame-silence redial marks it down (`watched_down`) without failing the window and without restarting its watch, so a quiet contract stays legal. The window cannot pass until that socket completes a dial again, and then waits the 20 s settle time after it (that dial could still evict someone), as after a sibling heals. The note clears at the probed socket's DialSucceeded (one more Acquire load of `OVERFLOW_WATCHED_SLOT` per dial; the lock only for the socket under watch). The deferral cap (380 s from the first frame) and the 740 s bound from the grant still end the wait, as `failed_deferral_exhausted` |
+| The eviction stamp | taken at BeginDial only. The shell then passes the shutdown, re-park and dual-instance-lock gates before `connect()`, and the lock gate can hold a dial in 5 s polls, so BeginDial-to-accept was bounded by the 15 s dial timeout only while no gate waited. Not reachable today: the lock flag only goes false after it was first held, and never back to true in the same process (`spawn_instance_lock_heartbeat` stores false and exits), so a held dial never connects | the dial is stamped again immediately before `connect()`, after every gate (one Release store); the BeginDial stamp stays, so it still errs toward fail. The 20 s attribution window now runs from the connect call |
+
+**Honest limit:** the probed depth socket's frame-silence redial does not join
+the 2 s burst of closes (this process started it), so its own dial corroborates
+a sibling's no-code close within 20 s of it. Errs toward fail.
+
+REJECT (review round 5):
+
+- Lets a window pass while the probed socket is redialling after a depth
+  frame-silence teardown and has not completed a dial since, or without the
+  settle time after that dial.
+- Fails the window, or restarts its watch, on a depth socket's frame silence
+  (round 3 still stands: a quiet depth contract is legitimate). The round-3
+  REJECT row "feeds a depth socket's frame silence to the window" now reads:
+  feeds it as a failure or a watch restart.
+- Removes the stamp taken immediately before `connect()`, or puts a wait
+  between it and the connect.

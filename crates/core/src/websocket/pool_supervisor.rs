@@ -1296,9 +1296,11 @@ pub const OVERFLOW_PROBE_WATCH_SECS: u64 = 120;
 
 /// A sibling's no-code close inside a window is corroborated as an eviction
 /// when another socket of this process (not the closer, not a member of the
-/// same burst) BEGAN a dial at most this long before it: BeginDial to accept
-/// is bounded by the 15 s dial timeout, plus 5 s for the evicted socket's
-/// close to reach its supervisor. It is also the settle time after a sibling
+/// same burst) BEGAN a dial at most this long before it: a dial is stamped at
+/// BeginDial and again immediately before `connect()` (after the shutdown,
+/// re-park and dual-instance-lock gates, which can hold a dial), and the
+/// connect is bounded by the 15 s dial timeout, plus 5 s for the evicted
+/// socket's close to reach its supervisor. It is also the settle time after a sibling
 /// heals, since that redial could itself still evict someone. Scope lock
 /// 2026-10-06.
 pub const OVERFLOW_PROBE_EVICTION_ATTRIBUTION_SECS: u64 = 20;
@@ -1664,6 +1666,10 @@ struct OverflowEpisode {
     /// The watched socket already spent its one watch restart (a close with a
     /// code other than 805) in this window.
     watch_restarted: bool,
+    /// Review fix 2026-10-06, round 5: the watched socket is redialling after
+    /// a teardown that neither fails nor restarts its watch (a depth socket's
+    /// frame silence). No pass until its next completed dial.
+    watched_down: bool,
 }
 
 impl OverflowEpisode {
@@ -1693,6 +1699,7 @@ impl OverflowEpisode {
             burst_mask: 0,
             settle_until: None,
             watch_restarted: false,
+            watched_down: false,
         }
     }
 
@@ -1703,12 +1710,17 @@ impl OverflowEpisode {
         self.burst_start = None;
         self.burst_mask = 0;
         self.settle_until = None;
+        self.watched_down = false;
     }
 
-    /// Whether a window may not pass yet: a sibling has not healed, or the
-    /// last heal's redial could still evict someone.
+    /// Whether a window may not pass yet: a sibling has not healed, the last
+    /// heal's redial could still evict someone, or the watched socket is
+    /// redialling and has not completed a dial yet (review fix 2026-10-06,
+    /// round 5).
     fn unsettled(&self, now: Instant) -> bool {
-        self.suspect_mask != 0 || self.settle_until.is_some_and(|until| until > now)
+        self.suspect_mask != 0
+            || self.watched_down
+            || self.settle_until.is_some_and(|until| until > now)
     }
 
     /// Whether the running window has reached
@@ -2027,6 +2039,37 @@ impl OverflowEpisode {
             sibling: Some(slot),
             ..OverflowEpisodeEffect::default()
         }
+    }
+
+    /// Review fix 2026-10-06, round 5: the watched socket is redialling after
+    /// a teardown that neither fails nor restarts its watch (a DEPTH socket's
+    /// frame silence: a quiet contract is legitimate). The window keeps its
+    /// first frame and its watch, but cannot pass until the socket completes a
+    /// dial again ([`Self::on_watched_dialled`]); the deferral cap and
+    /// [`OVERFLOW_PROBE_WINDOW_MAX_SECS`] bound the wait. Any other slot is
+    /// ignored. O(1).
+    fn on_watched_redialling(&mut self, slot: u8) {
+        if self.watched() == Some(slot) {
+            self.watched_down = true;
+        }
+    }
+
+    /// The watched socket completed a dial after
+    /// [`Self::on_watched_redialling`]: it is up again. That dial could itself
+    /// still evict someone, so the window settles for
+    /// [`OVERFLOW_PROBE_EVICTION_ATTRIBUTION_SECS`] before it may pass, as
+    /// after a sibling heals. Any other dial is ignored here. O(1).
+    fn on_watched_dialled(&mut self, slot: u8, now: Instant) {
+        if self.watched() != Some(slot) || !self.watched_down {
+            return;
+        }
+        self.watched_down = false;
+        let settle = now
+            .checked_add(Duration::from_secs(
+                OVERFLOW_PROBE_EVICTION_ATTRIBUTION_SECS,
+            ))
+            .unwrap_or(now);
+        self.settle_until = Some(self.settle_until.map_or(settle, |until| until.max(settle)));
     }
 
     /// A noted sibling parked for a reason other than 805: it opens no
@@ -2355,6 +2398,21 @@ impl OverflowEpisodes {
     fn on_sibling_left(&mut self, slot: u8) {
         self.main.on_sibling_left(slot);
         self.depth.on_sibling_left(slot);
+    }
+
+    /// Socket `slot` is redialling after a depth frame-silence teardown. Only
+    /// the episode watching it acts.
+    fn on_watched_redialling(&mut self, slot: u8) {
+        self.main.on_watched_redialling(slot);
+        self.depth.on_watched_redialling(slot);
+    }
+
+    /// Socket `slot` completed a dial: the watched socket is up again, and a
+    /// noted sibling heals.
+    fn on_dialled(&mut self, slot: u8, now: Instant) -> OverflowEpisodesEffect {
+        self.main.on_watched_dialled(slot, now);
+        self.depth.on_watched_dialled(slot, now);
+        self.on_sibling_dialled(slot, now)
     }
 
     /// Socket `slot` closed with a code other than 805. Feeds both; only the
@@ -2881,13 +2939,17 @@ fn overflow_note_dial_failed(global_index: u8, reason: &str) {
     note_dial_failed_in(&OVERFLOW_DIAL_BEGIN_MS, global_index, reason);
 }
 
-/// A socket completed a dial: one Acquire load; the episode lock only when
-/// this socket is a noted sibling, which then heals. Once per dial.
+/// A socket completed a dial: two Acquire loads; the episode lock only when
+/// this socket is a noted sibling, which then heals, or the socket under watch
+/// (up again after a depth frame-silence redial, review fix 2026-10-06, round
+/// 5). Once per dial.
 fn overflow_episode_note_dial_succeeded(global_index: u8, now: Instant) {
-    if !suspect_bit_set(global_index) {
+    if !suspect_bit_set(global_index)
+        && OVERFLOW_WATCHED_SLOT.load(std::sync::atomic::Ordering::Acquire) != global_index
+    {
         return;
     }
-    overflow_episode_step(false, |eps| eps.on_sibling_dialled(global_index, now));
+    overflow_episode_step(false, |eps| eps.on_dialled(global_index, now));
 }
 
 /// A socket's idle watchdog fired: the episode lock only when an episode is
@@ -2913,6 +2975,23 @@ fn overflow_episode_note_watched_torn_down(global_index: u8, now: Instant) {
         return;
     }
     overflow_episode_step(false, |eps| eps.on_watched_torn_down(global_index, now));
+}
+
+/// A depth socket under watch was torn down for frame silence and will
+/// redial: the episode lock only when an episode is engaged and this is the
+/// socket under watch, whose window then cannot pass until it completes a dial
+/// again (review fix 2026-10-06, round 5). Neither a failure nor a watch
+/// restart: a quiet depth contract is legitimate. Two atomic loads otherwise.
+fn overflow_episode_note_watched_redialling(global_index: u8) {
+    if !OVERFLOW_ENGAGED.load(std::sync::atomic::Ordering::Acquire)
+        || OVERFLOW_WATCHED_SLOT.load(std::sync::atomic::Ordering::Acquire) != global_index
+    {
+        return;
+    }
+    overflow_episode_step(false, |eps| {
+        eps.on_watched_redialling(global_index);
+        OverflowEpisodesEffect::default()
+    });
 }
 
 /// A socket parked for a reason other than 805: two Acquire loads; the lock
@@ -3920,14 +3999,18 @@ impl ConnectionSupervisor {
                 if self.phase != ConnPhase::Live {
                     return SupervisorAction::Continue;
                 }
-                // Scope lock 2026-10-06: a DEPTH socket's frame silence is
-                // deliberately NOT fed to the overflow episode (a quiet depth
-                // contract is legitimate). A MAIN-FEED socket is never
-                // legitimately silent while this gate is open, and this
-                // redial tears it down, so the probed main-feed socket's watch
-                // restarts once (review fix 2026-10-06, round 3).
+                // Scope lock 2026-10-06: a DEPTH socket's frame silence
+                // neither fails nor restarts an overflow window (a quiet depth
+                // contract is legitimate), but the probed depth socket is down
+                // until its next completed dial, so the window cannot pass
+                // before then (review fix 2026-10-06, round 5). A MAIN-FEED
+                // socket is never legitimately silent while this gate is open,
+                // and this redial tears it down, so the probed main-feed
+                // socket's watch restarts once (review fix 2026-10-06, round 3).
                 if self.slot.endpoint == DhanEndpointType::MainFeed {
                     overflow_episode_note_watched_torn_down(self.slot.global_index, now);
+                } else {
+                    overflow_episode_note_watched_redialling(self.slot.global_index);
                 }
                 self.reconnects = self.reconnects.saturating_add(1);
                 // WS-GAP-03: the transport is alive and the subscription is
@@ -8157,6 +8240,12 @@ where
                         pool_index, "dual-instance lock held again — dial permitted, resuming"
                     );
                 }
+                // Review fix 2026-10-06, round 5: stamp the dial again where it
+                // actually leaves the process, after every gate that can hold
+                // it. The BeginDial stamp stays (it errs toward fail); this one
+                // keeps BeginDial-to-accept inside the attribution window even
+                // if a gate above waited. One Release store.
+                overflow_note_dial_begin(supervisor.slot().global_index, Instant::now());
                 let event = match socket.connect().await {
                     Ok(()) => ConnEvent::DialSucceeded,
                     Err(_) => {
@@ -20560,6 +20649,94 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_depth_frame_silence_holds_the_pass_until_the_watched_socket_redials() {
+        // Review fix 2026-10-06, round 5. The review scenario: a depth probe
+        // W (slot 6) shows its first frame at F, sibling S (slot 7) drops
+        // with no code at F+200 and is noted, W's quiet contract trips frame
+        // silence at F+300 and W redials, S heals at F+310 and its settle
+        // time ends at F+330. Before the fix the poll at F+330 passed the
+        // probe while W was down.
+        let start = t0();
+        let scenario = || {
+            let mut eps = episodes_after_805(&[], &[6], start);
+            let granted = start + depth_delay(0);
+            assert_eq!(eps.poll(granted, true).depth.grant, Some(6));
+            let first = granted + secs(10);
+            eps.on_first_frame(6, first);
+            assert_eq!(
+                eps.on_bare_reset(7, 0, first + secs(200)).depth.outcomes[0],
+                Some(OverflowProbeOutcome::SiblingResetNoted)
+            );
+            // A sibling's redialling is not the watched socket's.
+            eps.on_watched_redialling(7);
+            assert!(!eps.depth.watched_down);
+            eps.on_watched_redialling(6);
+            assert!(eps.depth.watched_down);
+            assert!(!eps.main.watched_down, "only the episode watching it");
+            assert_eq!(
+                eps.on_dialled(7, first + secs(310)).depth.outcomes[0],
+                Some(OverflowProbeOutcome::SiblingHealed)
+            );
+            (eps, first)
+        };
+
+        // W never completes a dial: no pass at F+330, and the deferral cap
+        // fails the window, re-parking W.
+        let (mut down, first) = scenario();
+        assert_eq!(
+            down.poll(first + secs(330), true),
+            OverflowEpisodesEffect::default(),
+            "no pass while the probed socket is down"
+        );
+        assert_eq!(
+            down.poll(first + secs(OVERFLOW_PROBE_DEFERRAL_CAP_SECS - 1), true),
+            OverflowEpisodesEffect::default()
+        );
+        let capped = down.poll(first + secs(OVERFLOW_PROBE_DEFERRAL_CAP_SECS), true);
+        assert_eq!(
+            capped.depth.outcomes[0],
+            Some(OverflowProbeOutcome::FailedDeferralExhausted)
+        );
+        assert_eq!(capped.depth.repark, Some(6));
+        assert!(!down.depth.watched_down, "a failed window forgets it");
+
+        // W completes a dial at F+340: the window settles for the
+        // attribution time after it (its dial could still evict someone),
+        // then passes.
+        let (mut up, first) = scenario();
+        assert_eq!(
+            up.poll(first + secs(330), true),
+            OverflowEpisodesEffect::default()
+        );
+        let healed = first + secs(340);
+        assert_eq!(up.on_dialled(6, healed), OverflowEpisodesEffect::default());
+        assert!(!up.depth.watched_down);
+        assert_eq!(
+            up.poll(
+                healed + secs(OVERFLOW_PROBE_EVICTION_ATTRIBUTION_SECS - 1),
+                true
+            ),
+            OverflowEpisodesEffect::default()
+        );
+        assert_eq!(
+            up.poll(
+                healed + secs(OVERFLOW_PROBE_EVICTION_ATTRIBUTION_SECS),
+                true
+            )
+            .depth
+            .outcomes[0],
+            Some(OverflowProbeOutcome::ProbePassed)
+        );
+
+        // No window running: nothing is recorded.
+        let mut quiet = OverflowEpisode::new_depth();
+        quiet.on_watched_redialling(6);
+        assert!(!quiet.watched_down);
+        quiet.on_watched_dialled(6, start);
+        assert_eq!(quiet.settle_until, None);
+    }
+
     // ---- Review fixes 2026-10-06, round 4: window bound, refused dials ----
 
     #[test]
@@ -21065,6 +21242,43 @@ mod tests {
             .expect("frame silence feeds the episode on the main feed");
         assert!(gate < main_only && main_only < torn);
         assert!(!silence.contains("overflow_episode_note_self_redial"));
+        // Review fix 2026-10-06 (round 5): a depth socket's frame silence
+        // holds the pass until its next completed dial (no fail, no restart).
+        let redialling = silence
+            .find("overflow_episode_note_watched_redialling(self.slot.global_index)")
+            .expect("depth frame silence reaches the episode");
+        assert!(torn < redialling);
+        let redial_glue = arm(
+            "fn overflow_episode_note_watched_redialling(",
+            "fn overflow_episode_note_left(",
+        );
+        assert!(redial_glue.contains("eps.on_watched_redialling(global_index)"));
+        assert!(redial_glue.contains("OVERFLOW_WATCHED_SLOT.load("));
+        assert!(!redial_glue.contains("on_watched_torn_down"));
+        let dialled_glue = arm(
+            "fn overflow_episode_note_dial_succeeded(",
+            "fn overflow_episode_note_self_redial(",
+        );
+        assert!(dialled_glue.contains("eps.on_dialled(global_index, now)"));
+        assert!(dialled_glue.contains("OVERFLOW_WATCHED_SLOT.load("));
+        // Review fix 2026-10-06 (round 5): the shell stamps the dial again
+        // after every gate that can hold it, immediately before the connect.
+        let shell = arm(
+            "SupervisorAction::Dial => {",
+            "SupervisorAction::Subscribe => {",
+        );
+        let permit = shell
+            .find("if !sink.dial_permitted() {")
+            .expect("permit gate");
+        let restamp = shell
+            .find("overflow_note_dial_begin(supervisor.slot().global_index, Instant::now());")
+            .expect("restamp before connect");
+        let connect = shell.find("socket.connect().await").expect("connect");
+        assert!(permit < restamp && restamp < connect);
+        assert!(
+            !shell[restamp..connect].contains(".await"),
+            "nothing waits between them"
+        );
         let subscribe = arm(
             "ConnEvent::SubscribeFailed => {",
             "self.schedule_redial(ReconnectReason::SubscribeFailed, now)",
@@ -21075,7 +21289,7 @@ mod tests {
         );
         let torn_glue = arm(
             "fn overflow_episode_note_watched_torn_down(",
-            "fn overflow_episode_note_left(",
+            "fn overflow_episode_note_watched_redialling(",
         );
         assert!(torn_glue.contains("eps.on_watched_torn_down(global_index, now)"));
         assert!(torn_glue.contains("OVERFLOW_WATCHED_SLOT.load("));
@@ -21190,6 +21404,13 @@ mod tests {
                 "Lets a window pass after the probed socket was torn down by this process"
             )
         );
+        // Review round 5: the probed depth socket's frame-silence redial and
+        // the pre-connect stamp.
+        assert!(text.contains("#### Review round 5 (2026-10-06, same day, same owner approval)"));
+        assert!(
+            text.contains("Lets a window pass while the probed socket is redialling after a depth")
+        );
+        assert!(text.contains("Removes the stamp taken immediately before `connect()`"));
         assert!(text.contains("\"Go ahead with whatever you want dude\""));
         // The 2026-10-02 sections it amends are still there.
         assert!(text.contains("### 2026-10-02 — DEPTH SOCKETS RECOVER ON THEIR OWN AFTER 805"));
