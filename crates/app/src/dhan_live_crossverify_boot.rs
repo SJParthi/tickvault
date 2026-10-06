@@ -320,6 +320,28 @@ pub const XVERIFY_MAX_ATTEMPTS_PER_DAY: u32 = 4;
 /// allowed to end at 17:30 could be killed half-way.
 pub const EVENING_STOP_SECS_OF_DAY_IST: u64 = 17 * 3_600 + 30 * 60;
 
+/// 17:45 IST — when the start watchdog's `stop_check` fires on weekdays
+/// (`deploy/aws/terraform/start-watchdog-lambda.tf`,
+/// `cron(15 12 ? * MON-FRI *)`). It stops any box launched before the 17:30
+/// trigger and does NOT read the keep-alive override. Pinned to that cron by
+/// `test_evening_start_follows_the_start_watchdog_stop_check_and_curfew`
+/// (§12.15.8, second 51b review).
+pub const START_WATCHDOG_STOP_CHECK_SECS_OF_DAY_IST: u64 = 17 * 3_600 + 45 * 60;
+
+/// Room after the `stop_check` fires for its stop to land (EventBridge
+/// delivery, the Lambda's StopInstances call, the guest shutdown) before the
+/// evening attempt starts. That 300 s is enough is Assumed (§12.15.8).
+pub const XVERIFY_STOP_CHECK_MARGIN_SECS: u64 = 300;
+
+/// 17:50 IST — the earliest an unshrunk attempt starts after the 17:23 end
+/// bound: the evening attempt of a day whose only attempt was skipped for
+/// time, and a manual evening boot (§12.15.8). Before the second 51b review
+/// this was 17:45 (`SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST`), the instant
+/// the `stop_check` fires, so the attempt raced the stop. Derived, never a
+/// literal.
+pub const XVERIFY_EVENING_START_SECS_OF_DAY_IST: u64 =
+    START_WATCHDOG_STOP_CHECK_SECS_OF_DAY_IST + XVERIFY_STOP_CHECK_MARGIN_SECS;
+
 /// 17:24 IST — one minute before the scheduled-stop window opens. Derived from
 /// the `shutdown_class` constant, never a literal (§12.15.8).
 pub const XVERIFY_DEADLINE_SECS_OF_DAY_IST: u64 =
@@ -358,8 +380,11 @@ const _: () = assert!(
         && XVERIFY_DEADLINE_SECS_OF_DAY_IST < SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST as u64
         && (SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST as u64) < EVENING_STOP_SECS_OF_DAY_IST
         && EVENING_STOP_SECS_OF_DAY_IST < SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST as u64
-        && (SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST as u64) < SECS_PER_DAY,
-    "15:41 < 17:23 < 17:24 < 17:25 < 17:30 < 17:45 < midnight"
+        && (SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST as u64)
+            <= START_WATCHDOG_STOP_CHECK_SECS_OF_DAY_IST
+        && START_WATCHDOG_STOP_CHECK_SECS_OF_DAY_IST < XVERIFY_EVENING_START_SECS_OF_DAY_IST
+        && XVERIFY_EVENING_START_SECS_OF_DAY_IST < SECS_PER_DAY,
+    "15:41 < 17:23 < 17:24 < 17:25 < 17:30 < 17:45 <= 17:45 < 17:50 < midnight"
 );
 
 /// Same-day retries, by the reason the previous attempt failed. Local
@@ -391,7 +416,7 @@ pub enum AttemptFailure {
     AuditRowsLost,
     /// No attempt ran in this process: the only one was skipped because too
     /// little time was left before 17:23 IST, and the one evening attempt at
-    /// 17:45 could not start either (§12.15.8). Pages `xverify_failed` unless
+    /// 17:50 could not start either (§12.15.8). Pages `xverify_failed` unless
     /// today's paged marker shows a page already went out.
     SkippedNoTime,
 }
@@ -470,9 +495,9 @@ pub const fn attempt_is_last(
 /// The run budget for a full attempt starting at `now_secs_of_day`, or `None`
 /// when it should not start (§12.15.8).
 ///
-/// - At or after the scheduled-stop window's end (17:45, a manual evening
-///   boot after the weekday stop has fired) and before midnight: the
-///   configured budget, unchanged.
+/// - At or after [`XVERIFY_EVENING_START_SECS_OF_DAY_IST`] (17:50, five minutes
+///   after the 17:45 start-watchdog `stop_check`; a manual evening boot) and
+///   before midnight: the configured budget, unchanged.
 /// - Otherwise the configured budget when the whole attempt (token wait,
 ///   budget, persist margin) ends by [`XVERIFY_LAST_END_SECS_OF_DAY_IST`];
 ///   else the room left, when that is at least
@@ -487,7 +512,7 @@ pub const fn attempt_budget_secs(now_secs_of_day: u64, config_budget_secs: u64) 
     if now_secs_of_day >= SECS_PER_DAY {
         return None;
     }
-    if now_secs_of_day >= SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST as u64 {
+    if now_secs_of_day >= XVERIFY_EVENING_START_SECS_OF_DAY_IST {
         return Some(config_budget_secs);
     }
     // `attempt_max_secs(0)` is the fixed part: token wait plus persist margin.
@@ -774,17 +799,23 @@ where
 /// A full attempt with too little time left is skipped, never started. When
 /// an earlier attempt in this process did run and fail, the day ends with
 /// THAT failure, so it pages as usual. When nothing ran before it in this
-/// process (a start between about 17:15 and 17:45), the day does not end
+/// process (a start between about 17:15 and 17:50), the day does not end
 /// there (§12.15.8, 51b review): `on_first_skip` reports the day at once,
 /// BEFORE any wait, because the scheduled stop may end the process first
 /// (`run_day` pages it unless today's paged marker shows a page already went
 /// out); then the loop sleeps until
-/// [`SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST`] (17:45) and, on the same IST
+/// [`XVERIFY_EVENING_START_SECS_OF_DAY_IST`] (17:50) and, on the same IST
 /// day, makes ONE full attempt with the configured budget. The skipped
-/// attempt is not counted, so that attempt is number 1 and the last. A
-/// process alive at 17:45 means the scheduled stop did not happen, so the
-/// attempt is not cut by it. The wait happens at most once; a second skip
-/// ends the day [`AttemptFailure::SkippedNoTime`].
+/// attempt is not counted, so that attempt is number 1 and the last. Two
+/// scheduled stops act on a weekday box before 17:50: the start watchdog's
+/// 17:45 `stop_check` (any box launched before 17:30, keep-alive ignored) and
+/// its hourly `curfew_check` (17:35: no keep-alive, past the launch grace).
+/// The attempt therefore starts five minutes after the `stop_check`, never at
+/// the same instant: a weekday box launched before 17:30 is stopped during
+/// the wait and the attempt never starts (the day was already reported); a
+/// box started by hand after 17:30, or a weekend session kept up by
+/// keep-alive, runs it (second 51b review). The wait happens at most once; a
+/// second skip ends the day [`AttemptFailure::SkippedNoTime`].
 /// O(1) per attempt, at most [`XVERIFY_MAX_ATTEMPTS_PER_DAY`] attempts and
 /// one evening wait.
 async fn drive_day<N, S, K, A, Fut>(
@@ -858,10 +889,11 @@ where
                         Err(previous.unwrap_or(AttemptFailure::SkippedNoTime))
                     } else {
                         // Nothing ran here: report the day now, then wait
-                        // for 17:45 and try once more (§12.15.8, 51b review).
+                        // for 17:50, after the 17:45 start-watchdog
+                        // stop_check, and try once more (§12.15.8, 51b review).
                         on_first_skip();
                         waited_for_evening = true;
-                        let evening = u64::from(SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST);
+                        let evening = XVERIFY_EVENING_START_SECS_OF_DAY_IST;
                         tokio::time::sleep(Duration::from_secs(evening.saturating_sub(start)))
                             .await;
                         if !still_today() {
@@ -1067,7 +1099,7 @@ fn report_final_failure(
                  started too late to finish before the evening stop. Today's candles are \
                  UNVERIFIED and today's S3 archive stays held. Not paged again: the note at \
                  `path` shows a page already went out today. If the box is still up at \
-                 17:45, one more attempt runs then"
+                 17:50, one more attempt runs then"
             );
         } else {
             warn!(
@@ -1098,7 +1130,7 @@ fn report_final_failure(
             "Dhan 1-minute cross-verification could not run today before the evening \
              stop (the box started or restarted too late) and no alert went out today — \
              today's candles are UNVERIFIED and today's S3 archive stays held. If the box \
-             is still up at 17:45, one more attempt runs then"
+             is still up at 17:50, one more attempt runs then"
         ),
         AttemptFailure::Vacuous => error!(
             code = ErrorCode::WsGapConnectionState.code_str(),
@@ -2764,6 +2796,89 @@ mod tests {
         assert!(!prod.contains("= 62_580") && !prod.contains("= 62_640"));
     }
 
+    /// The `schedule_expression` cron fields of one terraform resource block,
+    /// read from code lines only (comments skipped).
+    fn tf_cron_fields(tf: &str, resource: &str) -> Vec<String> {
+        let start = tf
+            .find(resource)
+            .unwrap_or_else(|| panic!("start-watchdog-lambda.tf lost `{resource}`"));
+        let block = &tf[start..];
+        let block = &block[..block.find("\n}").unwrap_or(block.len())];
+        let line = block
+            .lines()
+            .map(str::trim_start)
+            .find(|l| !l.starts_with('#') && l.starts_with("schedule_expression"))
+            .unwrap_or_else(|| panic!("`{resource}` has no schedule_expression"));
+        let open = line.find("cron(").expect("a cron() schedule") + 5;
+        let close = line[open..].find(')').expect("a closed cron()") + open;
+        line[open..close]
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// §12.15.8 (second 51b review): the evening attempt starts after BOTH
+    /// start-watchdog stops that act on a weekday box after 17:30 have had
+    /// their margin. The 17:45 `stop_check` (any box launched before 17:30,
+    /// keep-alive ignored) is pinned to its terraform cron, and the hourly
+    /// `curfew_check`'s latest firing at or before the evening start is at
+    /// least the same margin earlier. Before this, the attempt started at
+    /// 17:45, the stop_check's own instant.
+    #[test]
+    fn test_evening_start_follows_the_start_watchdog_stop_check_and_curfew() {
+        const IST_OFFSET_SECS: u64 = 5 * 3_600 + 30 * 60;
+        let tf = include_str!("../../../deploy/aws/terraform/start-watchdog-lambda.tf");
+
+        let stop_check = tf_cron_fields(
+            tf,
+            "resource \"aws_cloudwatch_event_rule\" \"start_watchdog_stop_check\"",
+        );
+        assert_eq!(
+            stop_check.get(4).map(String::as_str),
+            Some("MON-FRI"),
+            "{stop_check:?}"
+        );
+        let minute: u64 = stop_check[0].parse().expect("a fixed stop_check minute");
+        let hour: u64 = stop_check[1].parse().expect("a fixed stop_check hour");
+        let stop_check_ist = (hour * 3_600 + minute * 60 + IST_OFFSET_SECS) % SECS_PER_DAY;
+        assert_eq!(
+            stop_check_ist, START_WATCHDOG_STOP_CHECK_SECS_OF_DAY_IST,
+            "the start-watchdog stop_check moved; move START_WATCHDOG_STOP_CHECK_SECS_OF_DAY_IST \
+             and re-check §12.15.8's evening attempt with it"
+        );
+        assert_eq!(
+            XVERIFY_EVENING_START_SECS_OF_DAY_IST,
+            START_WATCHDOG_STOP_CHECK_SECS_OF_DAY_IST + XVERIFY_STOP_CHECK_MARGIN_SECS
+        );
+        assert!(XVERIFY_STOP_CHECK_MARGIN_SECS >= 300);
+        assert!(
+            u64::from(SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST)
+                < XVERIFY_EVENING_START_SECS_OF_DAY_IST
+        );
+
+        let curfew = tf_cron_fields(
+            tf,
+            "resource \"aws_cloudwatch_event_rule\" \"start_watchdog_curfew_check\"",
+        );
+        assert_eq!(curfew.get(1).map(String::as_str), Some("*"), "{curfew:?}");
+        let curfew_minute_utc: u64 = curfew[0].parse().expect("a fixed curfew minute");
+        // IST is UTC + 5:30, so an hourly UTC minute lands at minute + 30 IST.
+        let curfew_offset_ist = ((curfew_minute_utc + 30) % 60) * 60;
+        let since_last_curfew =
+            (XVERIFY_EVENING_START_SECS_OF_DAY_IST % 3_600 + 3_600 - curfew_offset_ist) % 3_600;
+        assert!(
+            since_last_curfew >= XVERIFY_STOP_CHECK_MARGIN_SECS,
+            "the hourly curfew_check fires {since_last_curfew} s before the evening start; \
+             it must have its margin too"
+        );
+
+        // The production loop sleeps to the evening start, never the window end.
+        let prod = prod_src();
+        assert!(prod.contains("let evening = XVERIFY_EVENING_START_SECS_OF_DAY_IST;"));
+        assert!(prod.contains("if now_secs_of_day >= XVERIFY_EVENING_START_SECS_OF_DAY_IST {"));
+        assert!(!prod.contains("let evening = u64::from(SCHEDULED_STOP_WINDOW_END"));
+    }
+
     #[test]
     fn test_default_run_budget_mirror_matches_the_config_default() {
         assert_eq!(
@@ -2841,13 +2956,22 @@ mod tests {
             assert_eq!(attempt_budget_secs(now, 600), None, "now={now}");
         }
         let window_start = u64::from(SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST);
-        let window_end = u64::from(SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST);
+        let evening_start = XVERIFY_EVENING_START_SECS_OF_DAY_IST;
         assert_eq!(attempt_budget_secs(window_start, 600), None);
         assert_eq!(attempt_budget_secs(EVENING_STOP_SECS_OF_DAY_IST, 600), None);
-        assert_eq!(attempt_budget_secs(window_end - 1, 600), None);
-        // A manual evening boot after the stop window runs the configured
-        // budget, as before §12.15.8.
-        assert_eq!(attempt_budget_secs(window_end, 600), Some(600));
+        assert_eq!(attempt_budget_secs(evening_start - 1, 600), None);
+        // §12.15.8 (second 51b review): the 17:45 window end is the instant the
+        // start-watchdog stop_check fires, so an unshrunk attempt there would
+        // race it. Refused until five minutes later.
+        let window_end = u64::from(SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST);
+        assert_eq!(attempt_budget_secs(window_end, 600), None);
+        assert_eq!(
+            attempt_budget_secs(START_WATCHDOG_STOP_CHECK_SECS_OF_DAY_IST, 600),
+            None
+        );
+        // A manual evening boot from 17:50 runs the configured budget, as
+        // before §12.15.8.
+        assert_eq!(attempt_budget_secs(evening_start, 600), Some(600));
         assert_eq!(attempt_budget_secs(SECS_PER_DAY - 1, 600), Some(600));
         // A nonsense clock never runs, and nothing wraps.
         assert_eq!(attempt_budget_secs(SECS_PER_DAY, 600), None);
@@ -2864,7 +2988,9 @@ mod tests {
     #[test]
     fn test_attempt_budget_secs_every_second_of_the_day() {
         let window_start = u64::from(SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST);
-        let window_end = u64::from(SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST);
+        // §12.15.8 (second 51b review): unshrunk attempts start only from
+        // 17:50, five minutes after the start-watchdog stop_check.
+        let window_end = XVERIFY_EVENING_START_SECS_OF_DAY_IST;
         for config in [0_u64, 1, 60, 119, 120, 121, 599, 600, 601, 3_600, u64::MAX] {
             for now in 0..SECS_PER_DAY {
                 match attempt_budget_secs(now, config) {
@@ -2876,7 +3002,10 @@ mod tests {
                                 "now={now} config={config} budget={budget}"
                             );
                         } else {
-                            assert!(now >= window_end, "ran inside the stop window: {now}");
+                            assert!(
+                                now >= window_end,
+                                "ran before the 17:50 evening start: {now}"
+                            );
                             assert_eq!(budget, config);
                         }
                         if budget < XVERIFY_MIN_ATTEMPT_BUDGET_SECS {
@@ -3135,16 +3264,16 @@ mod tests {
             previous_end = Some(end);
         }
         // §12.15.8 (51b review): a first attempt with no time is reported at
-        // once, at the skip and before any wait, then retried ONCE at 17:45
+        // once, at the skip and before any wait, then retried ONCE at 17:50
         // with the configured budget, as attempt 1 and the last.
         let skipped_first = attempt_budget_secs(first_start, config).is_none();
         assert_eq!(sim.skip_notices, u32::from(skipped_first));
         if skipped_first {
             assert_eq!(sim.notice_at, Some(first_start), "reported before the wait");
-            let evening = sim.plans.first().copied().expect("the 17:45 attempt ran");
+            let evening = sim.plans.first().copied().expect("the 17:50 attempt ran");
             assert_eq!(
                 evening.start_secs_of_day,
-                u64::from(SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST)
+                XVERIFY_EVENING_START_SECS_OF_DAY_IST
             );
             assert_eq!(evening.number, 1);
             assert_eq!(evening.run_budget_secs, config);
@@ -3274,19 +3403,19 @@ mod tests {
     }
 
     /// A late boot catch-up: too little time skips the attempt without
-    /// calling it, reports the day at once and retries once at 17:45; a
+    /// calling it, reports the day at once and retries once at 17:50; a
     /// little more time shrinks the budget and the timeout follows the shrunk
     /// budget; a configured budget below the floor runs.
     #[tokio::test(start_paused = true)]
     async fn test_drive_day_late_start_shrinks_or_skips() {
         let fixed = attempt_max_secs(0);
         let last = XVERIFY_LAST_END_SECS_OF_DAY_IST;
-        let evening_start = u64::from(SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST);
+        let evening_start = XVERIFY_EVENING_START_SECS_OF_DAY_IST;
         let skip_at = last - fixed - XVERIFY_MIN_ATTEMPT_BUDGET_SECS + 1;
         let skipped = simulate(skip_at, 600, |_, _| (Some(0), Ok(())), None).await;
         assert_eq!(skipped.skip_notices, 1, "the day is reported at the skip");
         assert_eq!(skipped.notice_at, Some(skip_at));
-        assert_eq!(skipped.plans.len(), 1, "only the 17:45 attempt runs");
+        assert_eq!(skipped.plans.len(), 1, "only the 17:50 attempt runs");
         assert_eq!(
             skipped.plans.first().map(|p| p.start_secs_of_day),
             Some(evening_start)
@@ -3335,18 +3464,23 @@ mod tests {
     /// §12.15.8 (51b review): the finding's scenario. A Saturday special
     /// session, the process restarted at 17:30 with no stop cron. The day is
     /// reported at once (before the wait, which a weekday stop would cut),
-    /// then verified at 17:45 instead of being given up until the next day.
-    /// Every skip start in the window behaves the same; the 17:45 attempt's
-    /// own failure is the day's failure.
+    /// then verified at 17:50 instead of being given up until the next day.
+    /// Every skip start up to 17:50 behaves the same, the 17:45 instant the
+    /// start-watchdog stop_check fires included (second 51b review: the
+    /// attempt used to start at that same instant); the 17:50 attempt's own
+    /// failure is the day's failure.
     #[tokio::test(start_paused = true)]
-    async fn test_drive_day_skip_reports_at_once_then_retries_once_at_the_window_end() {
-        let evening = u64::from(SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST);
+    async fn test_drive_day_skip_reports_at_once_then_retries_once_after_the_stop_check() {
+        let evening = XVERIFY_EVENING_START_SECS_OF_DAY_IST;
+        assert_eq!(evening, 17 * 3_600 + 50 * 60, "17:50 IST");
         for start in [
             XVERIFY_LAST_END_SECS_OF_DAY_IST - attempt_max_secs(0) - 119,
             XVERIFY_LAST_END_SECS_OF_DAY_IST - 300,
             62_580,
             62_645,
             63_000,
+            u64::from(SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST),
+            START_WATCHDOG_STOP_CHECK_SECS_OF_DAY_IST + 1,
             evening - 1,
         ] {
             let ok = simulate(start, 600, |_, _| (Some(30), Ok(())), None).await;
@@ -3367,7 +3501,7 @@ mod tests {
             assert_eq!(failed.plans.len(), 1, "one evening attempt, never more");
             assert!(failed.plans.iter().all(|p| p.is_last));
         }
-        // A clock that never reaches 17:45 (nonsense, but bounded): the loop
+        // A clock that never reaches 17:50 (nonsense, but bounded): the loop
         // waits once, skips again and ends `SkippedNoTime`; nothing ran.
         let ran = std::cell::Cell::new(0_u32);
         let notices = std::cell::Cell::new(0_u32);
