@@ -8752,9 +8752,13 @@ Unchanged: the probed socket closing with no code still fails a probe, as before
 - **A blip on the box's own network that also drops the probed socket still
   fails the probe** (the probed-socket rule). The fix covers only drops that
   leave the probed socket up.
-- **A frame-silence redial (`FrameSilenceElapsed`) does not fail a window**:
-  a quiet depth contract is legitimate. Only the probed socket's idle
-  watchdog (no frame and no ping for 40 s) does.
+- **A depth socket's frame-silence redial (`FrameSilenceElapsed`) does not
+  fail a window**: a quiet depth contract is legitimate. Only the probed
+  socket's idle watchdog (no frame and no ping for 40 s) does. *(⚠ CORRECTED
+  2026-10-06, review round 3: this row said every frame-silence redial, and
+  the reason fits depth only. A MAIN-FEED socket is never legitimately silent
+  while the frame-silence gate is open, so the probed main-feed socket's
+  frame-silence redial now restarts its watch like a coded close, below.)*
 - **Errs toward fail, never toward pass**: any of our sockets beginning a dial
   within 20 s before an unrelated blip fails the window; a cascade faster than
   2 s is grouped as one burst and caught only by the next close or the 120 s
@@ -8793,3 +8797,26 @@ Unchanged: the probed socket closing with no code still fails a probe, as before
   other than 805 without a fresh first frame and a full watch after it,
   restarts its watch more than once per window, or lets it pass after the
   probed socket parked for any reason but 805 or shutdown.
+
+#### Review round 3 (2026-10-06, same day, same owner approval)
+
+Two gaps a third review found in the rows above, both measured in source on
+this branch before the fix:
+
+| Surface | Was | Now |
+|---|---|---|
+| The probed socket's own close with a code other than 805, and the burst | only a SIBLING's coded close joined the 2 s burst. The probed socket's first such close restarts its watch (above) instead of failing it, and its redial is an immediate fresh dial into the account, so that redial corroborated a sibling's bare reset from the same Dhan-side incident and spent a probe | the probed socket's close joins the current 2 s burst like any other coded closer, so its own redial never corroborates a no-code close from the same incident. Outside the burst its dial still corroborates, as for every socket |
+| The probed socket torn down by this process | only a no-code close, a coded close, its idle watchdog, a non-805 park and an 805 reached the window. A redial this process starts itself (a subscribe batch that could not be sent, `SubscribeFailed`; or main-feed data silence, `FrameSilenceElapsed`) after the first frame left the watch running on the OLD first frame, so the window could pass while the probed socket was down | that teardown counts like a coded close of the probed socket: the first restarts its watch (fresh first frame within 120 s, full watch after it, `watched_restarted`), a second such event in the window fails it (`failed_watched_closed`), and it joins the burst. Depth frame silence stays out (a quiet depth contract is legitimate). The operator-armed probe close cannot run during a window: it is refused once `ROTATION_HALTED` is set, which the 805 that starts every window sets |
+
+**Honest limit:** the one watch restart per window is shared: a token-expiry
+close followed by a failed subscribe in the same window fails it. Errs toward
+fail.
+
+REJECT (review round 3):
+
+- Leaves the probed socket's own coded close out of the burst, so its redial
+  corroborates a no-code close from the same incident.
+- Lets a window pass after the probed socket was torn down by this process
+  (a failed subscribe, or main-feed data silence) without a fresh first frame
+  and a full watch after it; or feeds a depth socket's frame silence to the
+  window.

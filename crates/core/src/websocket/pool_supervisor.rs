@@ -1484,12 +1484,14 @@ pub enum OverflowProbeOutcome {
     FailedWatchedSilent,
     /// A NOTE (review fix 2026-10-06): the probed socket closed with a code
     /// other than 805 for the first time in its window (a token refresh, a
-    /// transient Dhan error). Its watch restarts: it needs a fresh first frame
-    /// in time and a full watch after it.
+    /// transient Dhan error), or this process tore it down to redial it (a
+    /// failed subscribe, or main-feed data silence; round 3). Its watch
+    /// restarts: it needs a fresh first frame in time and a full watch after
+    /// it.
     WatchedRestarted,
-    /// The probed socket closed with a code other than 805 a second time in
-    /// its window, or parked for a reason other than 805 (a credential or
-    /// subscription error). A probe that cannot stay up is not a pass.
+    /// The probed socket went down that way a second time in its window, or
+    /// parked for a reason other than 805 (a credential or subscription
+    /// error). A probe that cannot stay up is not a pass.
     FailedWatchedClosed,
     /// The pass was still deferred past the note cutoff and another socket
     /// dropped, or (a fail-closed safety net) the window was still unsettled
@@ -1570,8 +1572,9 @@ impl OverflowProbeOutcome {
             }
             Self::WatchedRestarted => {
                 "the socket under test closed with a code other than 805 (for example the \
-                 daily token expiry). Its two-minute watch starts again from its next first \
-                 frame; a second such close fails the test."
+                 daily token expiry), or we redialled it ourselves (a subscribe that could not \
+                 be sent, or no data on the main feed). Its two-minute watch starts again from \
+                 its next first frame; a second such close fails the test."
             }
             _ => "",
         }
@@ -1876,29 +1879,60 @@ impl OverflowEpisode {
     ///   redial never corroborates a no-code close from the same incident;
     /// - a slot outside the register fails closed.
     ///
+    /// The probed socket's own close joins the burst too (review fix
+    /// 2026-10-06, round 3): since its first such close restarts the watch
+    /// instead of failing it, its redial is a fresh dial into the account
+    /// that only retakes the place it just gave up.
+    ///
     /// O(1), no allocation.
     fn on_coded_close(&mut self, slot: u8, now: Instant) -> OverflowEpisodeEffect {
         if self.watched().is_none() {
             return OverflowEpisodeEffect::default();
         }
         if slot == self.watched_slot {
-            if self.watch_restarted {
-                return self.fail(OverflowProbeOutcome::FailedWatchedClosed, now);
-            }
-            self.watch_restarted = true;
-            self.first_frame_at = None;
-            self.phase_since = Some(now);
-            return OverflowEpisodeEffect {
-                outcomes: [Some(OverflowProbeOutcome::WatchedRestarted), None],
-                restart_watch: true,
-                ..OverflowEpisodeEffect::default()
-            };
+            return self.watched_went_down(now);
         }
         let Some(bit) = 1u32.checked_shl(u32::from(slot)) else {
             return self.fail(OverflowProbeOutcome::FailedBareReset, now);
         };
         self.join_burst(bit, now);
         self.note_sibling(slot, bit, now)
+    }
+
+    /// The probed socket went down for a reason that is not an eviction: a
+    /// close with a code other than 805, or a teardown this process started
+    /// itself (a subscribe that could not be sent, or main-feed data silence;
+    /// review fix 2026-10-06, round 3). Any other slot is ignored here: a
+    /// sibling's own teardown is seen through its BeginDial stamp like every
+    /// dial. O(1), no allocation.
+    fn on_watched_torn_down(&mut self, slot: u8, now: Instant) -> OverflowEpisodeEffect {
+        if self.watched() != Some(slot) {
+            return OverflowEpisodeEffect::default();
+        }
+        self.watched_went_down(now)
+    }
+
+    /// The probed socket is down and will redial. Its FIRST such event in the
+    /// window restarts its watch (a fresh first frame within
+    /// [`OVERFLOW_PROBE_FIRST_FRAME_DEADLINE_SECS`] and a full watch after
+    /// it); a SECOND fails the window. Either way it joins the current burst
+    /// of closes, so its own redial never corroborates a sibling's no-code
+    /// close from the same incident. O(1).
+    fn watched_went_down(&mut self, now: Instant) -> OverflowEpisodeEffect {
+        if self.watch_restarted {
+            return self.fail(OverflowProbeOutcome::FailedWatchedClosed, now);
+        }
+        if let Some(bit) = 1u32.checked_shl(u32::from(self.watched_slot)) {
+            self.join_burst(bit, now);
+        }
+        self.watch_restarted = true;
+        self.first_frame_at = None;
+        self.phase_since = Some(now);
+        OverflowEpisodeEffect {
+            outcomes: [Some(OverflowProbeOutcome::WatchedRestarted), None],
+            restart_watch: true,
+            ..OverflowEpisodeEffect::default()
+        }
     }
 
     /// Socket `slot` parked for a reason other than 805 and other than an
@@ -2282,6 +2316,15 @@ impl OverflowEpisodes {
         }
     }
 
+    /// Socket `slot` was torn down by this process (subscribe failed, or
+    /// main-feed data silence). Only the episode watching it acts.
+    fn on_watched_torn_down(&mut self, slot: u8, now: Instant) -> OverflowEpisodesEffect {
+        OverflowEpisodesEffect {
+            main: self.main.on_watched_torn_down(slot, now),
+            depth: self.depth.on_watched_torn_down(slot, now),
+        }
+    }
+
     /// Socket `slot`'s idle watchdog fired.
     fn on_watched_self_redial(&mut self, slot: u8, now: Instant) -> OverflowEpisodesEffect {
         OverflowEpisodesEffect {
@@ -2558,7 +2601,8 @@ fn report_overflow_probe_outcome(
              main-feed socket is redialled as a test and the rest come back one at a time. \
              Each passes only if, for two minutes after its first frame, no 805 arrives \
              anywhere, the probed socket stays up (one restart of its watch is allowed after a \
-             close Dhan gives a reason for, such as the daily token expiry), and any other \
+             close Dhan gives a reason for, such as the daily token expiry, or a redial we \
+             start ourselves after a failed subscribe or data silence), and any other \
              socket that drops reconnects without knocking another off. Parked depth sockets \
              follow through their own probe once the main feed is settled; depth rotation stays \
              halted until a restart.",
@@ -2589,7 +2633,8 @@ fn report_overflow_probe_outcome(
              6 tries) and the rest come back one at a time. Each passes only if, for two \
              minutes after its first frame, no 805 arrives anywhere, the probed socket stays \
              up (one restart of its watch is allowed after a close Dhan gives a reason for, \
-             such as the daily token expiry), and any other socket that drops reconnects \
+             such as the daily token expiry, or a redial we start ourselves after a failed \
+             subscribe), and any other socket that drops reconnects \
              without knocking another off. Depth-200 rotation and new depth sockets stay halted \
              until a restart.",
             outcome.as_str()
@@ -2758,6 +2803,20 @@ fn overflow_episode_note_self_redial(global_index: u8, now: Instant) {
         return;
     }
     overflow_episode_step(false, |eps| eps.on_watched_self_redial(global_index, now));
+}
+
+/// This process tore a socket down to redial it (a subscribe that could not
+/// be sent, or main-feed data silence): the episode lock only when an episode
+/// is engaged and this is the socket under watch, whose watch then restarts
+/// once and fails on a second such event (review fix 2026-10-06, round 3).
+/// Two atomic loads otherwise.
+fn overflow_episode_note_watched_torn_down(global_index: u8, now: Instant) {
+    if !OVERFLOW_ENGAGED.load(std::sync::atomic::Ordering::Acquire)
+        || OVERFLOW_WATCHED_SLOT.load(std::sync::atomic::Ordering::Acquire) != global_index
+    {
+        return;
+    }
+    overflow_episode_step(false, |eps| eps.on_watched_torn_down(global_index, now));
 }
 
 /// A socket parked for a reason other than 805: two Acquire loads; the lock
@@ -3551,6 +3610,10 @@ impl ConnectionSupervisor {
                     pool_index = self.slot.pool_index,
                     "subscribe batch could not be sent — tearing the socket down and re-dialing"
                 );
+                // Review fix 2026-10-06 (round 3): the probed socket torn down
+                // here is not up, so its watch restarts once (a second such
+                // teardown fails the window). Two atomic loads otherwise.
+                overflow_episode_note_watched_torn_down(self.slot.global_index, now);
                 self.schedule_redial(ReconnectReason::SubscribeFailed, now)
             }
 
@@ -3755,15 +3818,20 @@ impl ConnectionSupervisor {
             }
 
             ConnEvent::FrameSilenceElapsed => {
-                // Scope lock 2026-10-06: deliberately NOT fed to the overflow
-                // episode. A quiet depth contract is legitimate, so a
-                // frame-silence redial never fails a probe window; only the
-                // probed socket's idle watchdog does.
                 // Only a LIVE socket can be data-silent in a way that means
                 // anything: while dialing or subscribing no frame is expected,
                 // and backoff/parked are covered by `is_watchdog_eligible`.
                 if self.phase != ConnPhase::Live {
                     return SupervisorAction::Continue;
+                }
+                // Scope lock 2026-10-06: a DEPTH socket's frame silence is
+                // deliberately NOT fed to the overflow episode (a quiet depth
+                // contract is legitimate). A MAIN-FEED socket is never
+                // legitimately silent while this gate is open, and this
+                // redial tears it down, so the probed main-feed socket's watch
+                // restarts once (review fix 2026-10-06, round 3).
+                if self.slot.endpoint == DhanEndpointType::MainFeed {
+                    overflow_episode_note_watched_torn_down(self.slot.global_index, now);
                 }
                 self.reconnects = self.reconnects.saturating_add(1);
                 // WS-GAP-03: the transport is alive and the subscription is
@@ -20277,6 +20345,114 @@ mod tests {
     }
 
     #[test]
+    fn test_watched_coded_close_joins_the_burst_so_its_redial_never_corroborates() {
+        // Review fix 2026-10-06 (round 3): one Dhan-side incident sends 800
+        // to the PROBED socket (slot 4) and a bare reset to slot 2. Slot 4's
+        // watch restarts and its ladder redials at once (its BeginDial stamp
+        // is in `recent_dials`); that redial only retakes the place slot 4
+        // gave up, so slot 2's close must be noted, not read as an eviction.
+        let start = t0();
+        let (mut ep, granted) = probing(4, &[], start);
+        let t = granted + secs(30);
+        let coded = ep.on_coded_close(4, t);
+        assert_eq!(
+            coded.outcomes,
+            [Some(OverflowProbeOutcome::WatchedRestarted), None]
+        );
+        assert_eq!(ep.burst_mask, 1 << 4);
+        let bare = ep.on_bare_reset(2, 1 << 4, t + ms(375));
+        assert_eq!(
+            bare.outcomes,
+            [Some(OverflowProbeOutcome::SiblingResetNoted), None]
+        );
+        assert_eq!(bare.repark, None);
+        assert_eq!(ep.phase, OverflowEpisodePhase::Probing);
+        assert_eq!(ep.probes_started, 1);
+
+        // The other order: the bare reset starts the burst, the probed
+        // socket's coded close joins it, and a third bare reset inside the
+        // burst is not blamed on the probed socket's redial.
+        let (mut ep, granted) = probing(4, &[], start);
+        let t = granted + secs(30);
+        let _ = ep.on_bare_reset(2, 0, t);
+        let _ = ep.on_coded_close(4, t + ms(300));
+        assert_eq!(ep.burst_mask, (1 << 2) | (1 << 4));
+        let third = ep.on_bare_reset(3, 1 << 4, t + ms(1_000));
+        assert_eq!(
+            third.outcomes[0],
+            Some(OverflowProbeOutcome::SiblingResetNoted)
+        );
+
+        // Outside the burst the probed socket's redial still corroborates.
+        let (mut late, granted) = probing(4, &[], start);
+        let t = granted + secs(30);
+        let _ = late.on_coded_close(4, t);
+        let fail = late.on_bare_reset(2, 1 << 4, t + ms(OVERFLOW_PROBE_SIBLING_BURST_MS + 1));
+        assert_eq!(
+            fail.outcomes[0],
+            Some(OverflowProbeOutcome::FailedEvictionCorroborated)
+        );
+        assert_eq!(fail.sibling, Some(2));
+        assert_eq!(fail.repark, Some(4));
+    }
+
+    #[test]
+    fn test_watched_teardown_restarts_the_watch_once_and_never_passes_while_down() {
+        // Review fix 2026-10-06 (round 3): the probed socket torn down by
+        // this process (a subscribe that could not be sent, or main-feed data
+        // silence) after its first frame must not pass on the OLD first frame.
+        let start = t0();
+        let (mut ep, granted) = probing(4, &[], start);
+        let t = granted + secs(30);
+        // A sibling's own teardown is not an episode event.
+        assert_eq!(
+            ep.on_watched_torn_down(1, t),
+            OverflowEpisodeEffect::default()
+        );
+        let torn = ep.on_watched_torn_down(4, t);
+        assert_eq!(
+            torn.outcomes,
+            [Some(OverflowProbeOutcome::WatchedRestarted), None]
+        );
+        assert!(torn.restart_watch);
+        assert_eq!(torn.repark, None);
+        assert_eq!(ep.first_frame_at, None);
+        assert_eq!(ep.burst_mask, 1 << 4);
+        // Past the old first frame's watch: no pass, the socket has not shown
+        // a new first frame.
+        let old_watch_end = granted + secs(1) + secs(OVERFLOW_PROBE_WATCH_SECS) + secs(1);
+        let held = ep.poll(old_watch_end, true);
+        assert_eq!(held.outcomes, [None, None]);
+        assert_eq!(ep.phase, OverflowEpisodePhase::Probing);
+        // No new first frame within the deadline from the teardown: fails.
+        let no_frame = ep.poll(t + secs(OVERFLOW_PROBE_FIRST_FRAME_DEADLINE_SECS), true);
+        assert_eq!(
+            no_frame.outcomes[0],
+            Some(OverflowProbeOutcome::FailedNoFrame)
+        );
+        assert_eq!(no_frame.repark, Some(4));
+
+        // A second teardown (or a coded close after one) fails the window.
+        let (mut twice, granted) = probing(4, &[], start);
+        let t = granted + secs(30);
+        let _ = twice.on_watched_torn_down(4, t);
+        twice.on_first_frame(4, t + secs(2));
+        let second = twice.on_coded_close(4, t + secs(10));
+        assert_eq!(
+            second.outcomes[0],
+            Some(OverflowProbeOutcome::FailedWatchedClosed)
+        );
+        assert_eq!(second.repark, Some(4));
+
+        // No window running: nothing happens.
+        let mut quiet = OverflowEpisode::new();
+        assert_eq!(
+            quiet.on_watched_torn_down(4, start),
+            OverflowEpisodeEffect::default()
+        );
+    }
+
+    #[test]
     fn test_every_note_has_plain_words_and_no_step_does() {
         for outcome in OverflowProbeOutcome::ALL {
             assert_eq!(
@@ -20292,7 +20468,7 @@ mod tests {
         #![proptest_config(ProptestConfig::with_cases(256))]
         #[test]
         fn proptest_attribution_rules(
-            ops in proptest::collection::vec((0u8..8, 0u8..40, any::<u32>(), 0u64..60_000), 1..300)
+            ops in proptest::collection::vec((0u8..9, 0u8..40, any::<u32>(), 0u64..60_000), 1..300)
         ) {
             let mut eps = OverflowEpisodes::new();
             let mut now = t0();
@@ -20322,6 +20498,7 @@ mod tests {
                         }
                         OverflowEpisodesEffect::default()
                     }
+                    8 => eps.on_watched_torn_down(slot, now),
                     _ => eps.poll(now, raw_mask % 5 != 0),
                 };
                 let in_flight = usize::from(eps.main.watched().is_some())
@@ -20345,6 +20522,15 @@ mod tests {
                                 prop_assert_eq!(op, 1);
                                 let bit = 1u32.checked_shl(u32::from(slot)).unwrap_or(0);
                                 prop_assert!(mask & !bit != 0, "the closer's own dial never corroborates");
+                                // Round 3: no member of the running burst
+                                // (the probed socket's own coded close
+                                // included) corroborates either.
+                                let burst_running = ep_before.burst_start.is_some_and(|s| {
+                                    now.saturating_duration_since(s)
+                                        <= Duration::from_millis(OVERFLOW_PROBE_SIBLING_BURST_MS)
+                                });
+                                let prior = if burst_running { ep_before.burst_mask } else { 0 };
+                                prop_assert!(mask & !bit & !prior != 0, "a burst member's dial never corroborates");
                                 prop_assert!(ep_before.watched().is_some());
                             }
                             OverflowProbeOutcome::FailedSiblingUnhealed => {
@@ -20357,13 +20543,13 @@ mod tests {
                                 prop_assert!(past_cutoff);
                             }
                             OverflowProbeOutcome::WatchedRestarted => {
-                                prop_assert_eq!(op, 2);
+                                prop_assert!(op == 2 || op == 8);
                                 prop_assert_eq!(ep_before.watched(), Some(slot));
                                 prop_assert!(!ep_before.watch_restarted);
                                 prop_assert!(effect.restart_watch);
                             }
                             OverflowProbeOutcome::FailedWatchedClosed => {
-                                prop_assert!(op == 2 || op == 4);
+                                prop_assert!(op == 2 || op == 4 || op == 8);
                                 prop_assert_eq!(ep_before.watched(), Some(slot));
                                 prop_assert!(op == 4 || ep_before.watch_restarted);
                             }
@@ -20439,7 +20625,34 @@ mod tests {
             "self.schedule_redial(",
         );
         assert!(!silence.contains("on_bare_reset"));
-        assert!(!silence.contains("overflow_episode_note_"));
+        // Review fix 2026-10-06 (round 3): a main-feed socket's frame-silence
+        // teardown reaches the episode (after the Live gate); depth's never
+        // does.
+        let gate = silence
+            .find("if self.phase != ConnPhase::Live {")
+            .expect("live gate");
+        let main_only = silence
+            .find("if self.slot.endpoint == DhanEndpointType::MainFeed {")
+            .expect("main-feed only");
+        let torn = silence
+            .find("overflow_episode_note_watched_torn_down(self.slot.global_index, now)")
+            .expect("frame silence feeds the episode on the main feed");
+        assert!(gate < main_only && main_only < torn);
+        assert!(!silence.contains("overflow_episode_note_self_redial"));
+        let subscribe = arm(
+            "ConnEvent::SubscribeFailed => {",
+            "self.schedule_redial(ReconnectReason::SubscribeFailed, now)",
+        );
+        assert!(
+            subscribe
+                .contains("overflow_episode_note_watched_torn_down(self.slot.global_index, now)")
+        );
+        let torn_glue = arm(
+            "fn overflow_episode_note_watched_torn_down(",
+            "fn overflow_episode_note_left(",
+        );
+        assert!(torn_glue.contains("eps.on_watched_torn_down(global_index, now)"));
+        assert!(torn_glue.contains("OVERFLOW_WATCHED_SLOT.load("));
         // park(): the non-805 hook runs after the respawn return.
         let park = arm("fn park(&mut self, reason: ParkReason", "PARK_METRIC,");
         let respawn = park
@@ -20542,6 +20755,15 @@ mod tests {
         // Review fix: a coded close joins the burst too.
         assert!(text.contains("same burst of closes within 2 s, with a code or without"));
         assert!(text.contains("Leaves a sibling that closed with a code other than 805 out of"));
+        // Review round 3: the probed socket's own coded close and its own
+        // teardowns.
+        assert!(text.contains("#### Review round 3 (2026-10-06, same day, same owner approval)"));
+        assert!(text.contains("Leaves the probed socket's own coded close out of the burst"));
+        assert!(
+            text.contains(
+                "Lets a window pass after the probed socket was torn down by this process"
+            )
+        );
         assert!(text.contains("\"Go ahead with whatever you want dude\""));
         // The 2026-10-02 sections it amends are still there.
         assert!(text.contains("### 2026-10-02 — DEPTH SOCKETS RECOVER ON THEIR OWN AFTER 805"));
