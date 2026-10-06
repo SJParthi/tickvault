@@ -9032,5 +9032,7 @@ REJECT (review round 10):
 
 - Raises `OVERFLOW_PROBE_WINDOW_MAX_SECS` above 740 s, or the grant note
   cutoff above 600 s, without a fresh dated owner quote recorded in this file
-  first (the round-4 row, unchanged).
+  first. The bound is the round-4 row, unchanged; the 600 s cutoff is new
+  here and derives from it (740 - 120 - 20), so it cannot rise without the
+  bound rising.
 - Moves a bound and the REJECT row that forbids moving it in the same change.
