@@ -680,24 +680,27 @@ fn mutation_weekly_sweep_is_sharded_with_a_timeout_it_can_finish_in() {
 #[test]
 fn mutation_push_run_mutates_only_the_changed_lines() {
     let wf = read(MUTATION_WORKFLOW);
-    must_contain(
-        &wf,
-        "git diff \"$before\" HEAD -- crates/core crates/trading crates/common > mutants.diff",
-        "push run diff is limited to the critical crates",
-    );
-    must_contain(
-        &wf,
-        "echo \"in_diff=--in-diff mutants.diff\" >> \"$GITHUB_OUTPUT\"",
-        "push run passes the diff to cargo mutants",
-    );
-    must_contain(
-        &wf,
-        "${{ steps.changed.outputs.in_diff }}",
-        "cargo mutants receives the in-diff argument",
-    );
-    must_contain(
-        &wf,
-        "--in-place",
-        "the unmutated baseline keeps .git (2026-10-04)",
-    );
+    for (needle, label) in [
+        (
+            "git diff \"$before\" HEAD -- crates/core crates/trading crates/common > mutants.diff",
+            "push run diff is limited to the critical crates",
+        ),
+        (
+            "echo \"in_diff=--in-diff mutants.diff\" >> \"$GITHUB_OUTPUT\"",
+            "push run passes the diff to cargo mutants",
+        ),
+        (
+            "${{ steps.changed.outputs.in_diff }}",
+            "cargo mutants receives the in-diff argument",
+        ),
+        (
+            "--in-place",
+            "the unmutated baseline keeps .git (2026-10-04)",
+        ),
+    ] {
+        assert!(
+            wf.contains(needle),
+            "{label}: expected to contain {needle:?}"
+        );
+    }
 }
