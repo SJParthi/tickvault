@@ -5825,32 +5825,32 @@ No new metric. 48a changes only the text of existing pages.
 
 Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
 
-## ITEM CANDLE-0915 — DESIGN ADDENDUM (added 2026-10-05, operator: "only startin g 9.15 am timestamps aloen only shodul be considered rigth dude ... yesterday close vs only today's startign 9.15 am")
+## ITEM 49 — Depth backlog and feed-delay figures (2026-10-05)
 
-- [x] Sign the 09:15 bucket of every timeframe against the previous day's close (`aggregator_cell.rs::bucket_sign_baseline`), and start candles at 09:15 (`tf_index.rs::CANDLE_SESSION_OPEN_SECS_OF_DAY_IST` = 33_300; `top_volume_snapshot.rs::SNAPSHOT_GRID_ANCHOR_SECS_OF_DAY_IST` = 33_300)
-  - Files: crates/trading/src/candles/aggregator_cell.rs, crates/trading/src/candles/tf_index.rs, crates/trading/src/candles/multi_tf_aggregator.rs, crates/app/src/top_volume_snapshot.rs, crates/app/src/dhan_feed_stack.rs (comment), crates/storage/src/shadow_candle_writer.rs (comments)
-  - Tests: test_regression_the_0915_bar_is_signed_against_yesterdays_close, only_the_market_open_bucket_uses_yesterdays_close, equity_pre_open_match_proof_age_decides, s04_pre_open_stamp_is_refused_by_the_fold
+Approved by Parthiban 2026-10-05 ("go woith your recomemndation dude", answering the depth decision card whose recommended option was Both). Finding (Verified, read-only AWS): the r8g.xlarge disk burst balance runs out about 10:00 IST, after which the box is capped at 156 MB/s; `market_depth` was 54,093 WAL transactions behind with no row of the day visible, and the depth spill drain was replaying 7–14 GB from the 08:30 boot onward.
 
-## Design (Item CANDLE-0915)
+- [x] 49a — **Socket page listed 26 sockets, so depth-20 and depth-200 appeared twice.** `connection_deliveries` and its gauges now cover the primary account's 16 slots only (`pool_budget::slot_owner`).
+  - Files: crates/app/src/dhan_feed_stack.rs
+  - Tests: connection_deliveries_report_only_the_primary_accounts_sixteen_slots
+- [x] 49b — **Per-socket delay counted out-of-session ticks.** A contract not traded today carries an earlier day's trade time on every book change; about 6.0 million such ticks read as option sockets delivering most packets over 60 s. Only an accepted new trade is now a sample; the rest count on `tv_dhan_ws_lag_excluded_total{reason="not_a_trade"}`.
+  - Files: crates/app/src/dhan_feed_stack.rs, crates/app/tests/drain_loss_series_seeding_guard.rs
+  - Tests: test_record_ws_lag_not_a_trade_excluded_only_an_accepted_trade_is_a_lag_sample, the_ws_lag_exclusion_family_is_seeded_on_every_label_set
+- [x] 49c — **Depth spill replay held 08:00–15:40 IST.** The depth directory's drain skips its round inside that window (counted on `tv_depth_spill_replay_held_total`) and drains after the close; the tick directory is unchanged and the quarantine trim still runs. A deferral, never a drop: the spill keeps accepting past its soft cap while the volume has room, and the raw frames are in the WAL.
+  - Files: crates/storage/src/tick_spill_replay.rs
+  - Tests: test_depth_replay_held_at_covers_08_00_to_the_close_only, test_depth_replay_held_at_is_applied_to_the_depth_directory_only
+- [ ] 49d — **One `market_depth` row per packet with level arrays.** Not started: the scope lock allows array rows only after a QuestDB scratch-table test, and this session has no QuestDB to run one against.
 
-One constant moves (09:00 → 09:15); the existing `out_of_session` gate in `MultiTfAggregator::consume_tick` then refuses pre-open ticks for the fold only. The 09:15 bucket's sign baseline reads the packet's previous-day close (`bucket_sign_baseline`), O(1), no allocation. Raw tick and WAL paths are untouched.
+### Design
+49a and 49b change only what is measured or shown. 49c is a time-of-day gate on the depth drain loop, O(1) per 300 s round.
+### Edge Cases
+49c: a round at exactly 08:00 holds and at exactly 15:40 drains; a holiday run holds until 15:40 too (time of day only). 49b: a repeat stays on `ltt_not_advanced`; a replayed WAL frame still never feeds the worst-delay gauge.
+### Failure Modes
+49c: if the after-close window is too short to drain a day's depth spill, the backlog carries to the next evening; the spill stays bounded by the free-space reserve, past which depth rescues are refused as before. 49b: after a mid-day restart the first packet per instrument still adds one sample.
+### Test Plan
+`cargo test -p tickvault-app --lib` (ws_lag, connection_deliver, not_a_trade), `--test drain_loss_series_seeding_guard`; `cargo test -p tickvault-storage --lib tick_spill_replay`.
+### Rollback
+Revert the commits. No schema, data or infrastructure change.
+### Observability
+New counter `tv_depth_spill_replay_held_total`; new label `reason="not_a_trade"` on an already-shipped counter (one more CloudWatch series, about $0.30 a month, Assumed).
 
-## Edge Cases (Item CANDLE-0915)
-
-No previous close on the 09:15 packet keeps the same-day baseline; a boot at or after 09:15 is mid-session as before; the auction quantity rides in the first trade's cumulative and is seeded (missing, never poured into 09:15); the top-volume grid instants are unchanged because every cadence divides 900 s.
-
-## Failure Modes (Item CANDLE-0915)
-
-A wrong constant would seal pre-open bars again (pinned by the tf_index pin test) or refuse 09:15 ticks (pinned by the gate test, OPEN accepted). The shadow writer's window check stays as defence in depth.
-
-## Test Plan (Item CANDLE-0915)
-
-`cargo test -p tickvault-trading` (all, including the restart differential and both first-trade attack suites), `cargo test -p tickvault-app`, `cargo test -p tickvault-storage --lib shadow`.
-
-## Rollback (Item CANDLE-0915)
-
-Revert the PR: the constant returns to 32_400 and the 09:15 baseline to the same-day previous bar. Stored rows are not rewritten either way.
-
-## Observability (Item CANDLE-0915)
-
-Pre-open ticks reach `IngestOutcome::WrittenOutOfSession` (row written, no bar), already counted; the 15:41 cross-verify compares our 09:15 bar against the vendor's.
+Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
