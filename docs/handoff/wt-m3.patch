@@ -1,0 +1,655 @@
+diff --git a/.claude/plans/active-plan-audit-fixes-2026-09-26.md b/.claude/plans/active-plan-audit-fixes-2026-09-26.md
+index f36b43b55..59ec294c2 100644
+--- a/.claude/plans/active-plan-audit-fixes-2026-09-26.md
++++ b/.claude/plans/active-plan-audit-fixes-2026-09-26.md
+@@ -2981,6 +2981,23 @@ Status of the rest, so the next session does not re-audit:
+   24 production files across api, app, core, storage and trading, plus
+   `crates/common/tests/error_code_tag_guard.rs`. Tests: uncoded_error_sites_may_only_shrink,
+   every_critical_code_with_an_emit_site_is_alarmed_or_allowlisted.
++- [x] **M3 (third pass) — the seven uncoded `error!` lines outside the frozen area carry a code.**
++  Six new Medium codes, none matched by any CloudWatch filter (no new page, no new alarm or
++  filter, no shrink-only exemption entry): WS-SPILL-03 (WAL init failure, boot halts; the halt
++  is still paged by the existing boot-heartbeat and liveness alarms), WS-SPILL-04 (unreadable WAL
++  segment skipped at replay; already paged by the existing durable-floor-breach counter alarm),
++  PROC-03 (panic hook, also on the synchronous errors.log line), API-SERVER-01 (API server exit),
++  TICK-GAP-01 (both tick-gap tracker lines, `source` instrument_gap / reconnect_backfill_window;
++  not RISK-GAP-03, which pages on every line) and PIPELINE-LAG-01 (trading pipeline broadcast
++  lag). The ratchet drops 10 -> 3; the three left are the frozen indicator/strategy lines. Files:
++  `crates/common/src/error_code.rs`, `crates/app/src/main.rs`, `crates/app/src/observability.rs`,
++  `crates/app/src/trading_pipeline.rs`, `crates/storage/src/ws_frame_spill.rs`,
++  `crates/trading/src/risk/tick_gap_tracker.rs`, `crates/common/tests/error_code_tag_guard.rs`,
++  `docs/error-runbooks/audit-m3-error-codes.md`, `docs/error-runbooks/ws-frame-spill-error-codes.md`,
++  `.claude/triage/error-rules.yaml`, `docs/audit-2026-10-04.md`. Tests:
++  uncoded_error_sites_may_only_shrink, test_audit_m3_codes_contract,
++  every_error_code_variant_has_a_triage_rule, every_error_code_variant_appears_in_a_rule_file,
++  test_append_panic_line_sync_panic_hook_writes_errors_log_synchronously.
+ 
+ - [x] **H3 (core) — a loom test drives the real ghost-unsubscribe register.** The six
+   per-slot registers move into `GhostRegister` (atomics from the new `crate::sync` shim:
+diff --git a/.claude/triage/error-rules.yaml b/.claude/triage/error-rules.yaml
+index 8348490fb..f5baade52 100644
+--- a/.claude/triage/error-rules.yaml
++++ b/.claude/triage/error-rules.yaml
+@@ -2273,3 +2273,83 @@ rules:
+       auto-retry a mint: Dhan permits ONE active token per account, so a
+       retry racing another minter invalidates whichever token currently
+       works.
++
++  # Audit M3 (2026-10-06): the last uncoded error lines outside the frozen
++  # indicator/strategy area. All six are Medium and unalarmed; runbook
++  # docs/error-runbooks/audit-m3-error-codes.md.
++  - name: ws-spill-03-wal-init-failed-escalate
++    match:
++      code: WS-SPILL-03
++    action: escalate
++    runbook_path: docs/error-runbooks/audit-m3-error-codes.md
++    confidence: 1.0
++    cooldown_secs: 300
++    justification: >-
++      WS-SPILL-03 = the frame WAL could not be opened at boot, so boot halts
++      and systemd restarts into the same fault. The cause is the volume (full,
++      read-only or a permission change). Escalate; never auto-fixed, and never
++      worked around by running without the WAL.
++
++  - name: ws-spill-04-wal-segment-unreadable-escalate
++    match:
++      code: WS-SPILL-04
++    action: escalate
++    runbook_path: docs/error-runbooks/audit-m3-error-codes.md
++    confidence: 1.0
++    cooldown_secs: 300
++    justification: >-
++      WS-SPILL-04 = a WAL segment could not be read at boot replay and was
++      skipped; its frames are not re-folded and the next segment follows a
++      gap. Already paged by durable-floor-breach on the corrupted-segment
++      counter. Escalate so the window is recorded.
++
++  - name: proc-03-panicked-escalate
++    match:
++      code: PROC-03
++    action: escalate
++    runbook_path: docs/error-runbooks/audit-m3-error-codes.md
++    confidence: 1.0
++    cooldown_secs: 60
++    justification: >-
++      PROC-03 = the process panicked; under panic=abort it dies and systemd
++      restarts it. Every panic is a defect at panic_location. Escalate; a
++      restart does not fix the cause.
++
++  - name: api-server-01-exited-escalate
++    match:
++      code: API-SERVER-01
++    action: escalate
++    runbook_path: docs/error-runbooks/audit-m3-error-codes.md
++    confidence: 1.0
++    cooldown_secs: 3600
++    justification: >-
++      API-SERVER-01 = the HTTP API stopped serving. Trading lanes keep running;
++      /health and /api are unreachable until a restart, which is an operator
++      decision because it reconnects every socket.
++
++  - name: tick-gap-01-tracker-gap-escalate
++    match:
++      code: TICK-GAP-01
++    action: escalate
++    runbook_path: docs/error-runbooks/audit-m3-error-codes.md
++    confidence: 0.8
++    cooldown_secs: 600
++    justification: >-
++      TICK-GAP-01 = the per-instrument tick-gap tracker saw a silent
++      instrument (source=instrument_gap) or opened a reconnect backfill window
++      (source=reconnect_backfill_window). Dormant today. One illiquid
++      instrument is not a feed fault; compare with the live lane's silence
++      gauges before acting.
++
++  - name: pipeline-lag-01-ticks-skipped-escalate
++    match:
++      code: PIPELINE-LAG-01
++    action: escalate
++    runbook_path: docs/error-runbooks/audit-m3-error-codes.md
++    confidence: 0.9
++    cooldown_secs: 600
++    justification: >-
++      PIPELINE-LAG-01 = the trading pipeline's broadcast receiver skipped at
++      least the error threshold of ticks, so their signals were not
++      evaluated; the ticks themselves are captured elsewhere. Dormant today.
++      Look for a stall on the pipeline task.
+diff --git a/crates/app/src/main.rs b/crates/app/src/main.rs
+index c7773e04e..5be3eef83 100644
+--- a/crates/app/src/main.rs
++++ b/crates/app/src/main.rs
+@@ -1367,6 +1367,7 @@ async fn async_main() -> Result<()> {
+         }
+         Err(err) => {
+             error!(
++                code = tickvault_common::error_code::ErrorCode::WsSpill03WalInitFailed.code_str(),
+                 ?err,
+                 dir = %ws_wal_dir,
+                 "STAGE-C: failed to initialize WsFrameSpill — HALTING boot (fail-closed). \
+@@ -1378,8 +1379,14 @@ async fn async_main() -> Result<()> {
+             // should never ever be lost … irrespective of any situation").
+             // The WAL is the durable floor of the ring → spill → WAL chain; if it
+             // can't init, the guarantee is void, so we REFUSE to run. systemd
+-            // Restart=always re-launches and the operator is paged by the ERROR
+-            // above — a loud restart loop beats a silent lossy session.
++            // Restart=always re-launches; a loud restart loop beats a silent
++            // lossy session. (Corrected 2026-10-06, audit M3: this said "the
++            // operator is paged by the ERROR above", but that line carried no
++            // code and no filter matched it. It now carries WS-SPILL-03, which
++            // is deliberately NOT alarmed; the page comes from the existing
++            // boot-heartbeat and market-hours liveness alarms, because a
++            // halted boot never publishes `tv_boot_completed`. This line names
++            // the cause in triage.)
+             std::process::exit(1);
+         }
+     };
+@@ -2389,6 +2396,7 @@ async fn async_main() -> Result<()> {
+             None
+         };
+         tracing::error!(
++            code = tickvault_common::error_code::ErrorCode::Proc03Panicked.code_str(),
+             panic_location = %location,
+             panic_payload = %payload,
+             wal_drain = ?wal_drain,
+@@ -4861,7 +4869,11 @@ async fn build_shared_infra(
+     info!(address = %bind_addr, "SHARED-INFRA BOOT: API server listening (/api/feeds reachable regardless of Dhan ON/OFF)");
+     let api_handle = tokio::spawn(async move {
+         if let Err(err) = axum::serve(listener, router).await {
+-            error!(?err, "API server error");
++            error!(
++                code = tickvault_common::error_code::ErrorCode::ApiServer01Exited.code_str(),
++                ?err,
++                "API server error — the HTTP API stopped serving; trading lanes are unaffected"
++            );
+         }
+     });
+ 
+diff --git a/crates/app/src/observability.rs b/crates/app/src/observability.rs
+index d397075a7..9ffa9a453 100644
+--- a/crates/app/src/observability.rs
++++ b/crates/app/src/observability.rs
+@@ -535,6 +535,9 @@ pub fn append_panic_line_sync(path: &std::path::Path, location: &str, payload: &
+         "target": "tickvault_app::panic",
+         "fields": {
+             "message": "PANIC: tickvault crashed",
++            // Audit M3 (2026-10-06): the same code the tracing line carries,
++            // so a crash is findable by code in this file too.
++            "code": tickvault_common::error_code::ErrorCode::Proc03Panicked.code_str(),
+             "panic_location": location,
+             "panic_payload": payload,
+         },
+@@ -880,6 +883,7 @@ mod tests {
+         assert_eq!(line["level"], "ERROR");
+         assert_eq!(line["fields"]["panic_location"], "src/x.rs:1:2");
+         assert_eq!(line["fields"]["panic_payload"], "boom \"quoted\"");
++        assert_eq!(line["fields"]["code"], "PROC-03");
+         let _ = std::fs::remove_dir_all(&dir);
+     }
+ 
+diff --git a/crates/app/src/trading_pipeline.rs b/crates/app/src/trading_pipeline.rs
+index 16b996c5f..1f78bc4c8 100644
+--- a/crates/app/src/trading_pipeline.rs
++++ b/crates/app/src/trading_pipeline.rs
+@@ -693,6 +693,7 @@ async fn run_trading_pipeline(
+                         m_pipeline_lagged.increment(skipped);
+                         if skipped >= TRADING_PIPELINE_LAG_ERROR_THRESHOLD {
+                             error!(
++                                code = tickvault_common::error_code::ErrorCode::PipelineLag01TicksSkipped.code_str(),
+                                 skipped,
+                                 threshold = TRADING_PIPELINE_LAG_ERROR_THRESHOLD,
+                                 "trading pipeline SEVERE lag — >1k ticks skipped \
+diff --git a/crates/common/src/error_code.rs b/crates/common/src/error_code.rs
+index c3dfbda72..e620c15b8 100644
+--- a/crates/common/src/error_code.rs
++++ b/crates/common/src/error_code.rs
+@@ -1031,6 +1031,62 @@ pub enum ErrorCode {
+     /// consumer would make an existing alarm fire for a different component.
+     /// Severity::Medium.
+     LambdaMint01TokenMintFailed,
++    // -----------------------------------------------------------------------
++    // Audit M3 (2026-10-06): the last uncoded `error!` lines outside the
++    // frozen indicator/strategy area. Each had no fitting code, or its only
++    // fitting code pages (RISK-GAP-03, WS-SPILL-02 match on any line). Every
++    // one is Medium ON PURPOSE, the LAMBDA-* precedent: a High or Critical
++    // code makes `error_code_alarm_coverage_guard` demand a new CloudWatch
++    // alarm (a new page, which the Dhan noise lock forbids without a dated
++    // quote) or an entry on a shrink-only exemption list. No metric filter
++    // matches any of them, so coding them adds no page. Where the condition
++    // already pages, it is through an EXISTING alarm named in the runbook.
++    // Runbook: docs/error-runbooks/audit-m3-error-codes.md.
++    // -----------------------------------------------------------------------
++    /// WS-SPILL-03: the durable frame WAL could not be opened at boot, so
++    /// boot halts (`process::exit(1)`) rather than run without the zero-loss
++    /// floor. The halt itself is paged by the existing boot-heartbeat and
++    /// market-hours liveness alarms (the process never publishes
++    /// `tv_boot_completed`); this line names WHY. Severity::Medium.
++    WsSpill03WalInitFailed,
++    /// WS-SPILL-04: a WAL segment could not be read at boot replay and was
++    /// skipped. Replay does not delete it (it is staged with the other read
++    /// segments); its frames are not re-folded, and the next segment is
++    /// marked as following a gap. The event already pages through the
++    /// existing `durable-floor-breach` alarm on
++    /// `tv_wal_replay_corrupted_segments_total`; WS-SPILL-02 (a frame the
++    /// writer dropped) would have added a second page for the same event and
++    /// blurred what that code means.
++    /// Severity::Medium.
++    WsSpill04SegmentUnreadable,
++    /// PROC-03: the process panicked (the panic hook). Under the release
++    /// profile's `panic = "abort"` the process then dies and systemd
++    /// restarts it; the death is paged by the existing liveness alarms, and
++    /// this line carries the location, payload and the WAL abort-drain
++    /// result. (PROC-02 is reserved for the container restart loop.)
++    /// Severity::Medium.
++    Proc03Panicked,
++    /// API-SERVER-01: the HTTP API server (`axum::serve`) returned an error
++    /// and stopped serving. The trading lanes keep running; `/health`,
++    /// `/api/*` and the MCP read paths are unreachable until a restart.
++    /// Severity::Medium.
++    ApiServer01Exited,
++    /// TICK-GAP-01: the per-instrument tick-gap tracker saw an instrument go
++    /// silent past the error threshold (`source = "instrument_gap"`,
++    /// edge-latched per instrument), or opened a backfill window after a
++    /// WebSocket reconnect (`source = "reconnect_backfill_window"`). Not
++    /// RISK-GAP-03, whose filter pages on every line: a per-instrument page
++    /// for an illiquid option is noise. Dormant today (the tracker has no
++    /// production tick producer). Severity::Medium.
++    TickGap01TrackerGap,
++    /// PIPELINE-LAG-01: the trading pipeline's tick-broadcast receiver fell
++    /// behind and the broadcast skipped at least
++    /// `TRADING_PIPELINE_LAG_ERROR_THRESHOLD` ticks in one receive, so
++    /// signals for those ticks were not evaluated. The ticks themselves are
++    /// still captured (the WAL and the candle fold are separate consumers).
++    /// Dormant today (the trading pipeline has no production spawn site).
++    /// Severity::Medium.
++    PipelineLag01TicksSkipped,
+ }
+ 
+ impl ErrorCode {
+@@ -1220,6 +1276,13 @@ impl ErrorCode {
+             Self::LambdaPortal01ActionFailed => "LAMBDA-PORTAL-01",
+             Self::LambdaProv01ShaUnknown => "LAMBDA-PROV-01",
+             Self::LambdaMint01TokenMintFailed => "LAMBDA-MINT-01",
++            // Audit M3 (2026-10-06)
++            Self::WsSpill03WalInitFailed => "WS-SPILL-03",
++            Self::WsSpill04SegmentUnreadable => "WS-SPILL-04",
++            Self::Proc03Panicked => "PROC-03",
++            Self::ApiServer01Exited => "API-SERVER-01",
++            Self::TickGap01TrackerGap => "TICK-GAP-01",
++            Self::PipelineLag01TicksSkipped => "PIPELINE-LAG-01",
+         }
+     }
+ 
+@@ -1465,6 +1528,15 @@ impl ErrorCode {
+             | Self::LambdaPortal01ActionFailed
+             | Self::LambdaProv01ShaUnknown
+             | Self::LambdaMint01TokenMintFailed => Severity::Medium,
++            // Audit M3 (2026-10-06): Medium for the same forced reason as
++            // LAMBDA-* above — no new alarm, no shrink-only exemption entry.
++            // See the block comment at the variants.
++            Self::WsSpill03WalInitFailed
++            | Self::WsSpill04SegmentUnreadable
++            | Self::Proc03Panicked
++            | Self::ApiServer01Exited
++            | Self::TickGap01TrackerGap
++            | Self::PipelineLag01TicksSkipped => Severity::Medium,
+             // Low: trading-day / Dhan other
+             // PR #6a (2026-05-19): I-P1-01 (DailyScheduler) + I-P1-02 (DeltaFieldCoverage) retired
+             Self::InstrumentP2TradingDayGuard
+@@ -1657,6 +1729,13 @@ impl ErrorCode {
+             | Self::LambdaMint01TokenMintFailed => {
+                 "docs/error-runbooks/lambda-ops-error-codes.md"
+             }
++            // Audit M3 (2026-10-06): the last uncoded error lines.
++            Self::WsSpill03WalInitFailed
++            | Self::WsSpill04SegmentUnreadable
++            | Self::Proc03Panicked
++            | Self::ApiServer01Exited
++            | Self::TickGap01TrackerGap
++            | Self::PipelineLag01TicksSkipped => "docs/error-runbooks/audit-m3-error-codes.md",
+             Self::Scoreboard01AggregationDegraded => {
+                 "docs/error-runbooks/dual-feed-scoreboard-error-codes.md"
+             }
+@@ -1924,6 +2003,13 @@ impl ErrorCode {
+             Self::LambdaPortal01ActionFailed,
+             Self::LambdaProv01ShaUnknown,
+             Self::LambdaMint01TokenMintFailed,
++            // Audit M3 (2026-10-06)
++            Self::WsSpill03WalInitFailed,
++            Self::WsSpill04SegmentUnreadable,
++            Self::Proc03Panicked,
++            Self::ApiServer01Exited,
++            Self::TickGap01TrackerGap,
++            Self::PipelineLag01TicksSkipped,
+         ]
+     }
+ }
+@@ -2109,6 +2195,36 @@ mod tests {
+     // assert a different contract under the old name. SPOT1M-02 keeps its
+     // own coverage via `test_all_codes_roundtrip`.
+ 
++    #[test]
++    fn test_audit_m3_codes_contract() {
++        // Audit M3 (2026-10-06): six codes for the last uncoded error lines.
++        // Every one is Medium (no new alarm, no shrink-only exemption entry)
++        // and shares one runbook; none reuses a code an alarm filter matches.
++        let expected = [
++            (ErrorCode::WsSpill03WalInitFailed, "WS-SPILL-03"),
++            (ErrorCode::WsSpill04SegmentUnreadable, "WS-SPILL-04"),
++            (ErrorCode::Proc03Panicked, "PROC-03"),
++            (ErrorCode::ApiServer01Exited, "API-SERVER-01"),
++            (ErrorCode::TickGap01TrackerGap, "TICK-GAP-01"),
++            (ErrorCode::PipelineLag01TicksSkipped, "PIPELINE-LAG-01"),
++        ];
++        for (code, s) in expected {
++            assert_eq!(code.code_str(), s);
++            assert_eq!(s.parse::<ErrorCode>(), Ok(code));
++            assert_eq!(code.severity(), Severity::Medium, "{s}");
++            assert!(code.is_auto_triage_safe(), "{s}");
++            assert_eq!(
++                code.runbook_path(),
++                "docs/error-runbooks/audit-m3-error-codes.md"
++            );
++            assert!(ErrorCode::all().contains(&code), "{s} missing from all()");
++            // The codes whose alarms page on any line must never be reused
++            // for these lines.
++            assert_ne!(s, "WS-SPILL-02");
++            assert_ne!(s, "RISK-GAP-03");
++        }
++    }
++
+     #[test]
+     fn test_tf_verify_codes_contract() {
+         // Daily timeframe-consistency verifier (operator 2026-07-13).
+@@ -2315,7 +2431,13 @@ mod tests {
+                 // 2026-09-05: the AWS Lambda operations family — 43 uncoded
+                 // `error!` sites in crates/aws-lambdas, which no guard
+                 // scanned until the crate list became filesystem discovery.
+-                || s.starts_with("LAMBDA-");
++                || s.starts_with("LAMBDA-")
++                // Audit M3 (2026-10-06): the last uncoded error lines —
++                // the API server exit, the tick-gap tracker and the
++                // trading pipeline's broadcast lag.
++                || s.starts_with("API-SERVER-")
++                || s.starts_with("TICK-GAP-")
++                || s.starts_with("PIPELINE-LAG-");
+             assert!(has_known_prefix, "unexpected code prefix: {s}");
+         }
+     }
+diff --git a/crates/common/tests/error_code_tag_guard.rs b/crates/common/tests/error_code_tag_guard.rs
+index 641d0f8e6..d3064481d 100644
+--- a/crates/common/tests/error_code_tag_guard.rs
++++ b/crates/common/tests/error_code_tag_guard.rs
+@@ -334,7 +334,24 @@ fn scan_corpus_exists_and_is_substantial() {
+ /// any crash would page at boot); the WAL init failure, the panic hook and the
+ /// API server exit (no existing code fits; each needs its own code and
+ /// runbook).
+-const UNCODED_ERROR_BUDGET: usize = 10;
++///
++/// 10 -> 3 (2026-10-06, workspace audit M3, third pass). The seven above
++/// that sit outside the frozen area are CODED, with six new Medium codes
++/// that no CloudWatch filter matches (checked against every `pattern` in
++/// `deploy/aws/terraform/*.tf`: the filters match exact code strings, and
++/// none names these), so this step adds no page:
++/// `WS-SPILL-03` (WAL init failure; the halted boot is still paged by the
++/// existing boot-heartbeat and liveness alarms), `WS-SPILL-04` (unreadable
++/// WAL segment skipped at replay), `PROC-03` (the panic hook),
++/// `API-SERVER-01` (the API server exit), `TICK-GAP-01` (both tick-gap
++/// tracker lines, `source` = `instrument_gap` / `reconnect_backfill_window`)
++/// and `PIPELINE-LAG-01` (the trading pipeline's broadcast lag). Runbook:
++/// `docs/error-runbooks/audit-m3-error-codes.md`.
++///
++/// The three left are the frozen-area lines (`indicator/engine.rs` and two
++/// in `strategy/hot_reload.rs`); they change only with a fresh dated
++/// operator approval under `daily-universe-scope-expansion` §28.
++const UNCODED_ERROR_BUDGET: usize = 3;
+ 
+ /// Per-crate uncoded-error budgets, for the crates the six-name list never
+ /// reached.
+diff --git a/crates/storage/src/ws_frame_spill.rs b/crates/storage/src/ws_frame_spill.rs
+index 7894cf343..48c9b1d72 100644
+--- a/crates/storage/src/ws_frame_spill.rs
++++ b/crates/storage/src/ws_frame_spill.rs
+@@ -4487,7 +4487,17 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
+                 corrupted += 1;
+                 gap_pending = true;
+                 real_gap = true;
+-                error!(segment = ?path, error = %err, "WAL segment corrupted; skipping");
++                // WS-SPILL-04, not WS-SPILL-02 (audit M3, 2026-10-06): the
++                // corrupted-segment counter below already pages through the
++                // existing durable-floor-breach alarm, and WS-SPILL-02 pages
++                // on any line, so it would page the same event twice. The
++                // next segment is marked as following a gap.
++                error!(
++                    code = ErrorCode::WsSpill04SegmentUnreadable.code_str(),
++                    segment = ?path,
++                    error = %err,
++                    "WAL segment corrupted; skipping"
++                );
+             }
+         }
+         consumed += 1;
+diff --git a/crates/trading/src/risk/tick_gap_tracker.rs b/crates/trading/src/risk/tick_gap_tracker.rs
+index 4dec129f7..a01feed6b 100644
+--- a/crates/trading/src/risk/tick_gap_tracker.rs
++++ b/crates/trading/src/risk/tick_gap_tracker.rs
+@@ -289,7 +289,11 @@ impl TickGapTracker {
+             // branch below (gap_secs < WARN) once ticks resume normally.
+             self.total_errors = self.total_errors.saturating_add(1);
+             if !state.error_gap_alerted {
++                // TICK-GAP-01, not RISK-GAP-03: that code's filter pages on
++                // every line, and this fires once per silent instrument.
+                 error!(
++                    code = tickvault_common::error_code::ErrorCode::TickGap01TrackerGap.code_str(),
++                    source = "instrument_gap",
+                     security_id = security_id,
+                     gap_secs = gap_secs,
+                     last_ts = state.last_exchange_timestamp,
+@@ -552,6 +556,8 @@ impl TickGapTracker {
+         )
+         .increment(active.len() as u64);
+         tracing::error!(
++            code = tickvault_common::error_code::ErrorCode::TickGap01TrackerGap.code_str(),
++            source = "reconnect_backfill_window",
+             connection_label = connection_label,
+             recently_active_count = active.len(),
+             window_secs = window_secs,
+diff --git a/docs/audit-2026-10-04.md b/docs/audit-2026-10-04.md
+index cd81698bb..8bb223a60 100644
+--- a/docs/audit-2026-10-04.md
++++ b/docs/audit-2026-10-04.md
+@@ -26,6 +26,7 @@ deploy). C1, H2 and H4 are updated from the 2026-10-05 scheduled runs
+ | L10 | A damaged WAL record could seed the sequence to the ceiling | Fixed. The highest-sequence record is re-read with its CRC; on failure the file is walked with every record checked. **Verified** by two regression tests. |
+ | C1 | Fuzzing reported green without running | `pipefail` on main: a failed build now fails the run. **Verified 2026-10-06:** in run 37284566310, 5 of 6 targets fuzzed the full hour with the "prove the fuzzer actually ran" step passing and no crash; the sixth (`ws_frame_wal_replay`) lost its runner at minute 59 after about 10.3 million inputs, and its re-run (attempt 2) passed, proof step included. |
+ | L11 | The same reader only saw the first record of each segment | Fixed. The walk jumps to the true next record. **Verified** by a test that fails on the old code. |
++| M3 | Error lines with no code | Fixed (branch `claude/audit-m3`, 2026-10-06; on main once it merges with All Green). 71 down to 3. The 2026-10-05 pass coded 51 with existing codes; this pass codes the last 7 outside the frozen area with six new Medium codes that no alarm filter matches, so no new page: WS-SPILL-03 (WAL init; the halted boot is still paged by the existing boot-heartbeat and liveness alarms), WS-SPILL-04 (unreadable WAL segment at replay; already paged by the existing `durable-floor-breach` counter alarm), PROC-03 (panic hook), API-SERVER-01 (API server exit), TICK-GAP-01 (both tick-gap tracker lines, by `source`) and PIPELINE-LAG-01 (trading pipeline lag). Runbook `docs/error-runbooks/audit-m3-error-codes.md`; triage rules added. The guard holds the count at 3: the indicator/strategy lines, frozen under the §28 operator rule and left on purpose. **Verified** by `uncoded_error_sites_may_only_shrink` (bite-checked: budget 0 lists exactly the 3 frozen sites) and the cross-ref and triage guards. |
+ 
+ ## Fixed in PR #2022 (merged 2026-10-06)
+ 
+@@ -60,7 +61,6 @@ deploy). C1, H2 and H4 are updated from the 2026-10-05 scheduled runs
+ | H1 | Most loss counters never reach an alarm | Five pages over ten counters (noise-lock §2.9), and six more pages over 55 counters (noise-lock §2.10, user tapped "Turn on" 2026-10-05, about $2.40 a month), both in #2022. Every source counter is registered at zero at boot (guard `every_loss_group_filter_counter_is_registered_at_boot`). | About 85 loss counters are still not forwarded. Some were left out on purpose because they move on a normal day (listed in §2.10). **Assumed:** none of the 55 moves on a normal day; no CloudWatch baseline was read. |
+ | H3 | Loom tests model hand-written code | The circuit-breaker loom test drives the real struct, and a new loom test drives the real ghost-unsubscribe register (in #2022; bite-checked: clearing the flag before reading the slot fails it). | The three older core loom files (activity watchdog, tick dedup, socket decoupling) still model copies. **Limitation:** with the take on the spawned thread loom explored only one interleaving (measured; Assumed cause: loom 0.7 tracks only the last access to each atomic), so the test puts the take on the main thread and asserts it saw both outcomes. |
+ | H4 | Sanitizer checks red, one step hid failures | The hiding step is fixed on main. **2026-10-06, Verified:** AddressSanitizer and ThreadSanitizer both passed in run 37315301479. | The next scheduled run must be green. **2026-10-06:** cargo-careful failed in that run and again on one re-run, both in the BUILD step: "Free space left: 0 MB", then the linker died with "signal 7 [Bus error]" (the issue #1836 class). The job had none of the three disk measures the sanitizer jobs got on 2026-10-01; this PR gives it the same ones (free the unused toolchains, no debug info for dependencies, workspace feature unification), pinned by `careful_job_frees_runner_disk_and_drops_dependency_debug_info`. **2026-10-06, Verified:** with these measures cargo-careful built and passed its tests on this PR's branch (Safety Net run 37417726577). The 2026-10-12 scheduled run on main is the last check. |
+-| M3 | Error lines with no code | 71 down to 10 (51 coded on 2026-10-05, each with a `source` and a code no alarm filter matches, so no new page); the guard holds the count at 10. | 10 left: 3 in the frozen indicator/strategy area, 4 whose only fitting code would page (tick-gap x2, pipeline lag, WAL corrupt-segment skip), 3 with no fitting code (WAL init, panic hook, API server exit; each needs a new code and runbook). |
+ | L6 | Some merged commits never tested on their own | A catch-up run covers the newest merges. | One older commit still has no run of its own. |
+ 
+ ## Open
+diff --git a/docs/error-runbooks/audit-m3-error-codes.md b/docs/error-runbooks/audit-m3-error-codes.md
+new file mode 100644
+index 000000000..450060d44
+--- /dev/null
++++ b/docs/error-runbooks/audit-m3-error-codes.md
+@@ -0,0 +1,149 @@
++# Audit M3 — the last uncoded error lines (WS-SPILL-03, WS-SPILL-04, PROC-03, API-SERVER-01, TICK-GAP-01, PIPELINE-LAG-01)
++
++> **Authority:** CLAUDE.md > `operator-charter-forever.md` > this file.
++> **Added:** 2026-10-06 (workspace audit M3, third pass; `docs/audit-2026-10-04.md` row M3).
++> **Cross-ref:** `crates/common/tests/error_code_rule_file_crossref.rs` requires every
++> code string below to appear here verbatim; `runbook_path()` for all six variants
++> points at this file. `crates/common/tests/error_code_tag_guard.rs` holds the
++> remaining uncoded `error!` count at 3 (all in the frozen indicator/strategy area).
++
++---
++
++## Why these six codes exist
++
++Every CloudWatch metric filter that pages reads `$.code`. An `error!` with no code
++reaches the log file and nothing else: it cannot be counted, alarmed or found by code
++in triage. After the 2026-10-05 pass, ten such lines were left. Three sit in the
++frozen indicator/strategy area and stay as they are. The other seven get the six
++codes below.
++
++**None of them pages.** All six are `Severity::Medium` and no metric filter matches
++any of them (the filters in `deploy/aws/terraform/error-code-alarms.tf` match exact
++code strings, and none names these). That is deliberate: the Dhan noise lock forbids
++a new page without a dated operator quote, and a High or Critical code would make
++`error_code_alarm_coverage_guard` demand an alarm or an entry on a shrink-only
++exemption list. Where the underlying condition already pages, it pages through an
++EXISTING alarm, named in each section.
++
++| Code | Where | Pages? |
++|---|---|---|
++| WS-SPILL-03 | `crates/app/src/main.rs`, STAGE-C WAL init | No new page. The halted boot is paged by the existing boot-heartbeat and market-hours liveness alarms. |
++| WS-SPILL-04 | `crates/storage/src/ws_frame_spill.rs`, boot replay | No new page. The event already pages through the existing `durable-floor-breach` alarm (counter `tv_wal_replay_corrupted_segments_total`). |
++| PROC-03 | `crates/app/src/main.rs`, panic hook | No new page. The process death is paged by the existing liveness alarms. |
++| API-SERVER-01 | `crates/app/src/main.rs`, API server task | No. |
++| TICK-GAP-01 | `crates/trading/src/risk/tick_gap_tracker.rs` (two lines) | No. Dormant today. |
++| PIPELINE-LAG-01 | `crates/app/src/trading_pipeline.rs` | No. Dormant today. |
++
++---
++
++## WS-SPILL-03 — the frame WAL could not be opened at boot
++
++**What happened:** STAGE-C could not create or open the write-ahead log directory. The
++WAL is the durable floor for every received frame, so the boot refuses to continue
++and exits with status 1. systemd restarts the service; the same fault repeats until
++it is fixed.
++
++**What pages:** not this line. A halted boot never publishes `tv_boot_completed`, so
++the boot-heartbeat alarm (`deploy/aws/terraform/boot-heartbeat-alarm.tf`) and, in
++session, the market-hours liveness alarm
++(`deploy/aws/terraform/market-hours-liveness-alarm.tf`) fire. This line tells you WHY.
++
++**Do:**
++1. Read the `err` and `dir` fields on the line.
++2. `df -h /data` and `ls -la` on the WAL directory: a full or read-only volume, or a
++   permission change, is the usual cause.
++3. Fix the volume, then let systemd restart the service (or restart it by hand).
++4. Never work around it by disabling the WAL: running without it allows silent frame
++   loss under backpressure.
++
++## WS-SPILL-04 — a WAL segment could not be read at boot replay
++
++**What happened:** boot replay could not read one WAL segment at all (for example it
++was cut short by a crash or the file is damaged). Replay skips it, counts it on
++`tv_wal_replay_corrupted_segments_total`, and marks the next segment as following a
++gap, so the candles across that gap are rebuilt as partial rather than as complete.
++Replay does not delete the segment; it is staged with the other segments it read.
++
++**What pages:** the existing `durable-floor-breach` alarm
++(`deploy/aws/terraform/loss-and-retention-alarms.tf`) sums that counter. This code was
++chosen instead of WS-SPILL-02 because WS-SPILL-02 pages on any line and means "the
++writer dropped a frame"; using it here would page the same event twice and blur
++what it means.
++
++**Do:**
++1. Note the `segment` and `error` fields and the time window the segment covers.
++2. Those frames were not re-folded in this process. If the segment's raw copy was
++   uploaded to the cold bucket, it can be inspected there.
++3. Check for a crash or power loss just before the boot (journal, `PROC-03` lines).
++
++## PROC-03 — the process panicked
++
++**What happened:** a thread panicked. The panic hook first writes one line
++synchronously to `data/logs/machine/errors.log` (it carries `"code": "PROC-03"` too),
++then, under the release profile's `panic = "abort"`, gives the WAL writer a bounded
++moment to empty its queue (`wal_drain` field), logs this line and lets the process
++abort. systemd restarts it.
++
++**What pages:** not this line. The process death is paged by the existing liveness
++alarms. (PROC-02 is reserved for a container restart loop and is not used here.)
++
++**Do:**
++1. Read `panic_location` and `panic_payload`: they name the source line and message.
++2. Read `wal_drain`: it says whether the WAL queue was emptied before the abort.
++3. Treat every panic as a defect: open a fix for the named location. A panic that
++   repeats on every boot is a restart loop.
++
++## API-SERVER-01 — the HTTP API server stopped
++
++**What happened:** `axum::serve` returned an error, so the HTTP API stopped serving.
++The trading lanes, capture and persistence keep running; `/health`, `/api/*` and the
++log-reading tools that call the API are unreachable until a restart.
++
++**What pages:** nothing. The live-lane alarms are unaffected because they do not read
++the API.
++
++**Do:**
++1. Read the `err` field (usually an accept-loop I/O error).
++2. Restart the service after market hours, or during the session only if the API is
++   needed: a restart is a reconnect for every socket.
++
++## TICK-GAP-01 — the per-instrument tick-gap tracker saw a gap
++
++**What happened:** one of two lines, told apart by `source`:
++
++- `source = "instrument_gap"`: an instrument went silent past the error threshold.
++  The line fires once per instrument per gap (edge-latched) and clears when ticks
++  resume.
++- `source = "reconnect_backfill_window"`: a WebSocket reconnect opened a backfill
++  window for the instruments that were recently active.
++
++**Why not RISK-GAP-03:** that code's filter pages on every line, and this tracker can
++fire once per silent instrument, which for illiquid options is normal. The live
++lane's own silence check, which does page under RISK-GAP-03, is a different, rate
++limited path.
++
++**Dormant today:** the tracker has no production tick producer, so these lines do not
++fire in the running system.
++
++**Do:** if it ever fires, compare `security_id`, `gap_secs` and the timestamps with
++the live lane's silence gauges before acting; a single illiquid instrument is not a
++feed fault.
++
++## PIPELINE-LAG-01 — the trading pipeline skipped ticks
++
++**What happened:** the trading pipeline's receiver on the tick broadcast fell so far
++behind that the broadcast skipped at least the error threshold of ticks in one
++receive (`skipped` field). Signals for those ticks were not evaluated. The ticks
++themselves are not lost: the WAL and the candle fold are separate consumers.
++
++**Dormant today:** the trading pipeline has no production spawn site.
++
++**Do:** if it fires, look for a stall on the pipeline task (CPU, a blocking call)
++around the time of the line.
++
++---
++
++## Trigger
++
++Read when triaging any of the six codes above, or when editing the lines named in the
++table.
+diff --git a/docs/error-runbooks/ws-frame-spill-error-codes.md b/docs/error-runbooks/ws-frame-spill-error-codes.md
+index ce64e7ab5..a76c58c91 100644
+--- a/docs/error-runbooks/ws-frame-spill-error-codes.md
++++ b/docs/error-runbooks/ws-frame-spill-error-codes.md
+@@ -155,6 +155,20 @@ arm), `crates/common/src/error_code.rs::WsSpill02FrameDropped`.
+ 
+ ---
+ 
++## §2a. WS-SPILL-03 and WS-SPILL-04 (added 2026-10-06, audit M3)
++
++Two more codes in this family, both Medium and neither alarmed. Their runbook is
++`docs/error-runbooks/audit-m3-error-codes.md`:
++
++- **WS-SPILL-03** — the WAL could not be opened at boot, so boot halts. The halt is
++  paged by the existing boot-heartbeat and liveness alarms.
++- **WS-SPILL-04** — a WAL segment could not be read at boot replay and was skipped.
++  The event already pages through `durable-floor-breach` on
++  `tv_wal_replay_corrupted_segments_total`; WS-SPILL-02 was not reused because it
++  would page the same event a second time.
++
++---
++
+ ## §3. Trigger / auto-load
+ 
+ This rule activates when editing:

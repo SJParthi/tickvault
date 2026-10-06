@@ -1,0 +1,1561 @@
+diff --git a/.claude/rules/project/testing.md b/.claude/rules/project/testing.md
+index 3ddc40e87..9f2c142bc 100644
+--- a/.claude/rules/project/testing.md
++++ b/.claude/rules/project/testing.md
+@@ -101,7 +101,8 @@ These test types run weekly (Monday) in CI, not on every push:
+ - Run for minimum 1 hour per target per week
+ 
+ ### Loom Concurrency
+-- `cargo test -p tickvault-core --features loom --test loom_tick_dedup`
++- `cargo test -p tickvault-core --features loom --test loom_activity_watchdog --test loom_ghost_register --test loom_ws_decoupling`
++- Each core loom file drives the REAL production type (audit H3, 2026-10-06); `loom_tick_dedup` was deleted because every model in it was a hand-written copy of code that no longer exists
+ - Feature-gated: replaces std atomics with Loom mocks for exhaustive interleaving
+ - NOT in standard `cargo test` — requires separate compilation
+ 
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 5cf499fc7..cbc317c4b 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -1043,7 +1043,6 @@ jobs:
+           expected=$(LC_ALL=C sort <<'EOF'
+           crates/core/tests/loom_activity_watchdog.rs
+           crates/core/tests/loom_ghost_register.rs
+-          crates/core/tests/loom_tick_dedup.rs
+           crates/core/tests/loom_ws_decoupling.rs
+           crates/trading/tests/loom_circuit_breaker.rs
+           EOF
+@@ -1080,7 +1079,6 @@ jobs:
+           cargo test -p tickvault-core --features loom \
+             --test loom_activity_watchdog \
+             --test loom_ghost_register \
+-            --test loom_tick_dedup \
+             --test loom_ws_decoupling 2>&1 | tee /tmp/loom-core.log
+           if grep -q "running 0 tests" /tmp/loom-core.log; then
+             echo "::error::A loom target in tickvault-core ran 0 tests — the crate's 'loom' feature is not reaching the cfg gate, so these binaries are EMPTY and this lane would pass vacuously."
+@@ -1092,8 +1090,8 @@ jobs:
+           # targets had actually run (first live run, 2026-08-09). Mirrors the DHAT
+           # lane above, which has always used this form.
+           executed=$(grep -c 'Running.*tests/loom_' /tmp/loom-core.log || true)
+-          if [ "$executed" -ne 4 ]; then
+-            echo "::error::Expected 4 executed loom targets in tickvault-core, saw $executed — a --test flag was dropped from this step while the file and drift-list entry survived, silently un-gating that target."
++          if [ "$executed" -ne 3 ]; then
++            echo "::error::Expected 3 executed loom targets in tickvault-core, saw $executed — a --test flag was dropped from this step while the file and drift-list entry survived, silently un-gating that target."
+             exit 1
+           fi
+ 
+diff --git a/crates/core/src/sync.rs b/crates/core/src/sync.rs
+index 09f6c12ed..3336bc671 100644
+--- a/crates/core/src/sync.rs
++++ b/crates/core/src/sync.rs
+@@ -5,17 +5,29 @@
+ //! interleaving. Without it they are the std atomics, unchanged: no cost and
+ //! no behaviour change in a normal build.
+ //!
+-//! Audit H3 (2026-10-05): the core loom tests modelled hand-written copies of
+-//! the code, so a change to the real orderings could not fail them. Only the
+-//! ghost-unsubscribe register (`websocket::pool_supervisor`) moves behind this
+-//! shim; everything else in the crate keeps the std atomics.
++//! Audit H3 (2026-10-05, finished 2026-10-06): the core loom tests modelled
++//! hand-written copies of the code, so a change to the real orderings could
++//! not fail them. Three production structures now take their atomics from
++//! here, and each has a loom file that drives the real methods:
++//!
++//! | Structure | Loom file |
++//! |---|---|
++//! | `websocket::pool_supervisor::GhostRegister` | `tests/loom_ghost_register.rs` |
++//! | `websocket::pool_supervisor::RingByteBudget` | `tests/loom_ws_decoupling.rs` |
++//! | `websocket::activity_watchdog::{ProgressProbe, note_activity}` and the counter it reads | `tests/loom_activity_watchdog.rs` |
++//!
++//! Everything else in the crate keeps the std atomics.
+ //!
+ //! The `loom` feature is enabled only by the loom CI lane, and only together
+ //! with `--test loom_*` targets: loom atomics panic outside `loom::model`, so
+ //! the crate's ordinary unit tests must never run with it.
+ 
+ #[cfg(feature = "loom")]
+-pub(crate) use loom::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU32, AtomicU64};
++pub(crate) use loom::sync::atomic::{
++    AtomicBool, AtomicI64, AtomicU8, AtomicU32, AtomicU64, AtomicUsize,
++};
+ 
+ #[cfg(not(feature = "loom"))]
+-pub(crate) use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU32, AtomicU64};
++pub(crate) use std::sync::atomic::{
++    AtomicBool, AtomicI64, AtomicU8, AtomicU32, AtomicU64, AtomicUsize,
++};
+diff --git a/crates/core/src/websocket/activity_watchdog.rs b/crates/core/src/websocket/activity_watchdog.rs
+index 8df40b134..cfefa2efd 100644
+--- a/crates/core/src/websocket/activity_watchdog.rs
++++ b/crates/core/src/websocket/activity_watchdog.rs
+@@ -28,9 +28,14 @@
+ //!   the task on disconnect and respawns before the next `run_read_loop`.
+ 
+ use std::sync::Arc;
+-use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::atomic::Ordering;
+ use std::time::Duration;
+ 
++// `crate::sync` (audit H3): the std `AtomicU64` in a normal build, loom's
++// under the crate's `loom` feature, so `tests/loom_activity_watchdog.rs`
++// drives the real `note_activity` / `ProgressProbe` through every interleaving.
++use crate::sync::AtomicU64;
++
+ use tickvault_common::market_hours::is_within_trading_session_ist;
+ use tokio::sync::Notify;
+ // NOTE: Use `tokio::time::Instant` instead of `std::time::Instant` so the
+@@ -156,6 +161,60 @@ pub const WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS: u64 = 14400;
+ /// instruments for depth-20).
+ pub const WATCHDOG_THRESHOLD_DEPTH_DEFERRED_SECS: u64 = 14400;
+ 
++/// Records one inbound frame on a connection's activity counter.
++///
++/// The read loop's only write to the counter, once per `Some(Ok(_))` frame:
++/// one relaxed `fetch_add`, O(1), no allocation. Relaxed is enough because
++/// the watchdog asks only "did the counter move", never what else the reader
++/// wrote; coherence on one atomic already forbids it from seeing the counter
++/// go backwards. Driven under loom by `tests/loom_activity_watchdog.rs`.
++#[inline]
++pub fn note_activity(counter: &AtomicU64) {
++    counter.fetch_add(1, Ordering::Relaxed);
++}
++
++/// The watchdog's per-poll progress decision, kept apart from its timer so
++/// the loom lane can drive the exact code [`ActivityWatchdog::run`] runs.
++///
++/// Holds the last counter value the watchdog saw. [`Self::advanced`] reads the
++/// counter once and catches up to it in one step, however many frames
++/// arrived since the last poll, so a later poll never reports progress for
++/// frames an earlier poll already counted. Copy, two words, O(1), no
++/// allocation. Hidden from docs: public only for the loom test.
++#[doc(hidden)]
++#[derive(Debug, Clone, Copy)]
++pub struct ProgressProbe {
++    last_seen: u64,
++}
++
++impl ProgressProbe {
++    /// A probe that has seen the counter's current value.
++    #[must_use]
++    pub fn start(counter: &AtomicU64) -> Self {
++        Self {
++            last_seen: counter.load(Ordering::Relaxed),
++        }
++    }
++
++    /// `true` when the counter moved since the previous poll (or since
++    /// [`Self::start`]), in which case the probe now holds the new value.
++    #[must_use]
++    pub fn advanced(&mut self, counter: &AtomicU64) -> bool {
++        let current = counter.load(Ordering::Relaxed);
++        if current == self.last_seen {
++            return false;
++        }
++        self.last_seen = current;
++        true
++    }
++
++    /// The last counter value this probe saw.
++    #[must_use]
++    pub const fn last_seen(&self) -> u64 {
++        self.last_seen
++    }
++}
++
+ /// Per-connection activity watchdog.
+ ///
+ /// Construct with [`ActivityWatchdog::new`], share the [`Arc<AtomicU64>`]
+@@ -204,7 +263,7 @@ impl ActivityWatchdog {
+     // TEST-EXEMPT: covered by watchdog_does_not_fire_when_counter_advances, watchdog_fires_on_sustained_silence_past_threshold, watchdog_resets_on_late_activity — hook name-matcher doesn't pick up behaviour-named tests
+     pub async fn run(self) {
+         let poll = Duration::from_secs(WATCHDOG_POLL_INTERVAL_SECS);
+-        let mut last_counter = self.counter.load(Ordering::Relaxed);
++        let mut probe = ProgressProbe::start(&self.counter);
+         let mut last_advance = Instant::now();
+         let mut ticker = tokio::time::interval(poll);
+         // Skip missed ticks so long stalls (e.g. during a stop-the-world
+@@ -217,9 +276,7 @@ impl ActivityWatchdog {
+         ticker.tick().await;
+         loop {
+             ticker.tick().await;
+-            let current = self.counter.load(Ordering::Relaxed);
+-            if current != last_counter {
+-                last_counter = current;
++            if probe.advanced(&self.counter) {
+                 last_advance = Instant::now();
+                 continue;
+             }
+@@ -418,6 +475,48 @@ mod tests {
+         (handle, counter, notify)
+     }
+ 
++    #[test]
++    fn test_note_activity_bumps_the_counter_by_exactly_one() {
++        let counter = AtomicU64::new(41);
++        note_activity(&counter);
++        assert_eq!(counter.load(Ordering::Relaxed), 42);
++    }
++
++    #[test]
++    fn test_progress_probe_start_holds_the_current_value() {
++        let counter = AtomicU64::new(7);
++        let probe = ProgressProbe::start(&counter);
++        assert_eq!(probe.last_seen(), 7);
++    }
++
++    /// Several frames between two polls count as ONE advance, and the next
++    /// poll with no new frame reports none: the probe catches up in one step.
++    #[test]
++    fn test_progress_probe_advanced_catches_up_in_one_step() {
++        let counter = AtomicU64::new(0);
++        let mut probe = ProgressProbe::start(&counter);
++        assert!(!probe.advanced(&counter), "no frame, no progress");
++        note_activity(&counter);
++        note_activity(&counter);
++        note_activity(&counter);
++        assert!(probe.advanced(&counter));
++        assert_eq!(probe.last_seen(), 3);
++        assert!(
++            !probe.advanced(&counter),
++            "frames already counted must not read as progress again"
++        );
++    }
++
++    /// The counter wraps at `u64::MAX`; a wrapped value is still a change.
++    #[test]
++    fn test_progress_probe_last_seen_follows_a_wrapping_counter() {
++        let counter = AtomicU64::new(u64::MAX);
++        let mut probe = ProgressProbe::start(&counter);
++        note_activity(&counter);
++        assert!(probe.advanced(&counter));
++        assert_eq!(probe.last_seen(), 0);
++    }
++
+     #[tokio::test(start_paused = true)]
+     async fn watchdog_does_not_fire_when_counter_advances() {
+         // SCENARIO: counter is bumped every poll window — watchdog must NEVER fire.
+diff --git a/crates/core/src/websocket/order_update_connection.rs b/crates/core/src/websocket/order_update_connection.rs
+index 3058782cc..c40e73adb 100644
+--- a/crates/core/src/websocket/order_update_connection.rs
++++ b/crates/core/src/websocket/order_update_connection.rs
+@@ -58,7 +58,7 @@ const ORDER_UPDATE_OUTAGE_PAGE_FAILURE_THRESHOLD: u32 = 3;
+ /// and far below `WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS`.
+ const ORDER_UPDATE_RECONNECT_STABILITY_SECS: u64 = 60;
+ use crate::websocket::activity_watchdog::{
+-    ActivityWatchdog, WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS, build_heartbeat_gauge,
++    ActivityWatchdog, WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS, build_heartbeat_gauge, note_activity,
+     spawn_with_panic_notify,
+ };
+ use crate::websocket::tls::build_websocket_tls_connector;
+@@ -749,7 +749,7 @@ async fn connect_and_listen(
+     // Binary. Dhan's server pings every 10s, so even in a no-order window
+     // the counter advances constantly and the watchdog never fires a
+     // false positive. It only fires when the socket is truly dead.
+-    let activity_counter = Arc::new(AtomicU64::new(0));
++    let activity_counter = Arc::new(crate::sync::AtomicU64::new(0));
+     let watchdog_notify = Arc::new(tokio::sync::Notify::new());
+     let watchdog = ActivityWatchdog::new(
+         // O(1) EXEMPT: watchdog label built once per spawn, not per frame (cold path)
+@@ -814,7 +814,7 @@ async fn connect_and_listen(
+         // STAGE-C.3: bump the activity counter on every Some(Ok(_)) event.
+         // ZL-P0-1: also set heartbeat gauge.
+         if matches!(frame_result, Some(Ok(_))) {
+-            activity_counter.fetch_add(1, Ordering::Relaxed);
++            note_activity(&activity_counter);
+             m_last_frame_epoch.set(chrono::Utc::now().timestamp() as f64);
+         }
+ 
+diff --git a/crates/core/src/websocket/pool_supervisor.rs b/crates/core/src/websocket/pool_supervisor.rs
+index c4d9e5fe1..f2fadeb5b 100644
+--- a/crates/core/src/websocket/pool_supervisor.rs
++++ b/crates/core/src/websocket/pool_supervisor.rs
+@@ -5236,12 +5236,20 @@ pub enum RingReserve {
+     SlotsFull,
+ }
+ 
++/// The per-class byte and frame budget of the shared frame ring (see the
++/// notes above [`RingReserve`]).
++///
++/// Its two counters come from `crate::sync` (audit H3): the std atomics in a
++/// normal build, loom's under the crate's `loom` feature, so
++/// `crates/core/tests/loom_ws_decoupling.rs` drives these exact
++/// `try_reserve_detailed` / `release` methods through every interleaving of
++/// several socket readers and the drain.
+ #[derive(Debug)]
+ pub struct RingByteBudget {
+-    resident: std::sync::atomic::AtomicUsize,
++    resident: crate::sync::AtomicUsize,
+     cap: usize,
+     /// Frames currently reserved by this class. See `slot_cap`.
+-    slots: std::sync::atomic::AtomicUsize,
++    slots: crate::sync::AtomicUsize,
+     /// Per-class ceiling on the NUMBER of frames resident in the shared ring.
+     ///
+     /// ADDED 2026-08-29, and it closes a real hole rather than adding belt to
+@@ -5266,14 +5274,18 @@ pub struct RingByteBudget {
+ 
+ impl RingByteBudget {
+     /// A budget capped at `cap` resident bytes.
++    #[cfg(not(feature = "loom"))]
+     #[must_use]
+     pub const fn new(cap: usize) -> Self {
+-        Self {
+-            resident: std::sync::atomic::AtomicUsize::new(0),
+-            cap,
+-            slots: std::sync::atomic::AtomicUsize::new(0),
+-            slot_cap: usize::MAX,
+-        }
++        Self::with_slot_cap(cap, usize::MAX)
++    }
++
++    /// A budget capped at `cap` resident bytes (loom build: loom atomics have
++    /// no `const` constructor).
++    #[cfg(feature = "loom")]
++    #[must_use]
++    pub fn new(cap: usize) -> Self {
++        Self::with_slot_cap(cap, usize::MAX)
+     }
+ 
+     /// A budget capped at `cap` resident bytes AND `slot_cap` resident frames.
+@@ -5283,12 +5295,26 @@ impl RingByteBudget {
+     /// makes the shared-pool refusal unreachable: if every admitted frame
+     /// held a per-class slot and the class caps add up to the channel size,
+     /// the channel can never be full when a reservation succeeded.
++    #[cfg(not(feature = "loom"))]
+     #[must_use]
+     pub const fn with_slot_cap(cap: usize, slot_cap: usize) -> Self {
+         Self {
+-            resident: std::sync::atomic::AtomicUsize::new(0),
++            resident: crate::sync::AtomicUsize::new(0),
++            cap,
++            slots: crate::sync::AtomicUsize::new(0),
++            slot_cap,
++        }
++    }
++
++    /// [`Self::with_slot_cap`] for the loom build (loom atomics have no
++    /// `const` constructor).
++    #[cfg(feature = "loom")]
++    #[must_use]
++    pub fn with_slot_cap(cap: usize, slot_cap: usize) -> Self {
++        Self {
++            resident: crate::sync::AtomicUsize::new(0),
+             cap,
+-            slots: std::sync::atomic::AtomicUsize::new(0),
++            slots: crate::sync::AtomicUsize::new(0),
+             slot_cap,
+         }
+     }
+diff --git a/crates/core/tests/loom_activity_watchdog.rs b/crates/core/tests/loom_activity_watchdog.rs
+index d5cfdb3c7..2c06ab9b6 100644
+--- a/crates/core/tests/loom_activity_watchdog.rs
++++ b/crates/core/tests/loom_activity_watchdog.rs
+@@ -1,239 +1,175 @@
+-//! T1.3 — Loom concurrency model for the activity watchdog + read loop race.
++//! Loom model of the REAL activity-watchdog progress check (audit H3,
++//! rewritten 2026-10-06).
+ //!
+-//! Production invariant this test protects:
++//! Until 2026-10-06 this file modelled a hand-written copy: an `AtomicBool`
++//! standing in for `tokio::sync::Notify` and a compare-and-swap "fire at most
++//! once" guard that the production watchdog never had (it fires by calling
++//! `notify_one` and returning, so it cannot fire twice). A change to the real
++//! code could not fail it. Those three models are deleted.
+ //!
+-//!   > In every possible interleaving of the WS reader thread and the
+-//!   > activity watchdog task, one of the following holds:
+-//!   >   (a) The reader bumps the counter forward before the watchdog
+-//!   >       observes a stall → watchdog does NOT fire.
+-//!   >   (b) The reader stalls completely → watchdog fires EXACTLY once
+-//!   >       via `notify_one()`, and the read loop returns `WatchdogFired`
+-//!   >       exactly once.
+-//!   > No interleaving produces: double-fire, lost-notify, or a reader
+-//!   > that continues running after `notify_one()` has been observed.
++//! What crosses threads in production is one counter: the order-update read
++//! loop bumps it per frame (`note_activity`) and the watchdog task reads it
++//! once per poll (`ProgressProbe::advanced`, the exact call inside
++//! `ActivityWatchdog::run`). Under the crate's `loom` feature that counter is
++//! loom's `AtomicU64` (`crate::sync`), so this file drives those two real
++//! functions through every interleaving loom explores.
+ //!
+-//! This is a tighter companion to `loom_ws_decoupling.rs`. That file
+-//! proves the WAL path never blocks the reader; this file proves the
+-//! shutdown path (watchdog → Notify → read loop exit) is race-free.
++//! Not modelled, stated plainly: the tokio timer and `Notify` (loom cannot run
++//! a tokio runtime). The fire path is covered by the paused-clock unit tests in
++//! `activity_watchdog.rs` (`watchdog_fires_on_sustained_silence_past_threshold`
++//! and its two siblings).
+ //!
+-//! The loom model collapses the production code to its atomic shape:
++//! What it proves, in every interleaving:
+ //!
+-//!   - `counter: AtomicU64` — the reader bumps, the watchdog reads.
+-//!   - `notified: AtomicBool` — a hand-rolled "did the watchdog fire"
+-//!     flag. Production uses `tokio::sync::Notify`, which loom cannot
+-//!     model directly. An AtomicBool with Acquire/Release semantics is
+-//!     semantically equivalent for the notify-once-check-once pattern.
+-//!   - `reader_exits: AtomicBool` — set by the reader when it observes
+-//!     `notified == true` and decides to stop.
++//! - a poll never reports progress that was not made: the advances a probe
++//!   reports are at most the frames recorded;
++//! - once the reader has stopped (joined), one poll catches up to EVERY frame,
++//!   and the poll after it reports no progress: frames counted once are never
++//!   counted again (a probe that re-reported them would hold off the watchdog
++//!   on a dead socket);
++//! - both outcomes of the race are explored: a concurrent poll sometimes sees
++//!   the frames and sometimes does not (anti-vacuity, see the loom note).
+ //!
+ //! Run with:
+ //!   cargo test -p tickvault-core --features loom --test loom_activity_watchdog
+ 
+ #[cfg(feature = "loom")]
+ mod loom_tests {
++    use std::sync::atomic::{AtomicUsize, Ordering};
++
+     use loom::sync::Arc;
+-    use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering};
++    use loom::sync::atomic::AtomicU64;
+     use loom::thread;
+-
+-    /// Minimal shape of the (reader, watchdog) pair. The reader is a
+-    /// single loop iteration; the watchdog is a single observation.
+-    struct WatchdogState {
+-        counter: AtomicU64,
+-        notified: AtomicBool,
+-        reader_exits: AtomicBool,
+-    }
+-
+-    impl WatchdogState {
+-        fn new() -> Arc<Self> {
+-            Arc::new(Self {
+-                counter: AtomicU64::new(0),
+-                notified: AtomicBool::new(false),
+-                reader_exits: AtomicBool::new(false),
+-            })
+-        }
+-    }
+-
+-    /// **Invariant 1** — reader that bumps ONCE before the watchdog
+-    /// observation must NOT cause a fire. Equivalent to the healthy-ops
+-    /// case (live feed actively flowing).
++    use tickvault_core::websocket::activity_watchdog::{ProgressProbe, note_activity};
++
++    /// Frames the reader records in each model.
++    const FRAMES: u64 = 2;
++
++    /// The reader records frames on its own thread while the watchdog polls.
++    ///
++    /// The polls run on the MAIN thread, the shape `loom_ghost_register.rs`
++    /// measured as necessary there: with its take on a spawned thread loom
++    /// explored a single execution (Assumed cause: loom 0.7 tracks only the
++    /// last access to each atomic). Measured 2026-10-06 for THIS model: the
++    /// mirror shape (polls spawned, frames on main) also explored both
++    /// outcomes, in 195 executions, so the limitation does not bite here; the
++    /// shape is kept for consistency, and the anti-vacuity asserts below fail
++    /// if a loom change ever collapses this model to one outcome.
+     #[test]
+-    fn watchdog_does_not_fire_when_reader_advances_counter_first() {
++    fn a_poll_never_reports_progress_it_did_not_see_and_never_counts_a_frame_twice() {
++        static POLL_SAW_PROGRESS: AtomicUsize = AtomicUsize::new(0);
++        static POLL_SAW_NONE: AtomicUsize = AtomicUsize::new(0);
++
+         loom::model(|| {
+-            let state = WatchdogState::new();
+-            let last_seen = 0u64;
++            let counter = Arc::new(AtomicU64::new(0));
++            let mut probe = ProgressProbe::start(&counter);
+ 
+-            // Reader: bump counter once, then check if notified.
+-            let s_reader = Arc::clone(&state);
++            let reader_counter = Arc::clone(&counter);
+             let reader = thread::spawn(move || {
+-                // Simulate one frame through the read loop.
+-                s_reader.counter.fetch_add(1, Ordering::Relaxed);
+-                // Before "await"-ing the next frame, check the notify flag.
+-                if s_reader.notified.load(Ordering::Acquire) {
+-                    s_reader.reader_exits.store(true, Ordering::Release);
++                for _ in 0..FRAMES {
++                    note_activity(&reader_counter);
+                 }
+             });
+ 
+-            // Watchdog: one observation — if counter has advanced, do
+-            // NOT fire. This is the "fast path" of the production
+-            // watchdog loop (every 5s).
+-            let s_watchdog = Arc::clone(&state);
+-            let watchdog = thread::spawn(move || {
+-                let current = s_watchdog.counter.load(Ordering::Relaxed);
+-                if current == last_seen {
+-                    // Only fires if counter stayed put.
+-                    s_watchdog.notified.store(true, Ordering::Release);
++            // The watchdog polls three times while the reader records two
++            // frames, so "advances <= frames" is not true by construction.
++            let mut advances = 0_u64;
++            for _ in 0..3 {
++                if probe.advanced(&counter) {
++                    advances += 1;
++                    POLL_SAW_PROGRESS.fetch_add(1, Ordering::Relaxed);
++                } else {
++                    POLL_SAW_NONE.fetch_add(1, Ordering::Relaxed);
+                 }
+-            });
+-
+-            reader.join().expect("reader join");
+-            watchdog.join().expect("watchdog join");
+-
+-            // Either the reader won the race and the counter advanced
+-            // BEFORE the watchdog observed it — no fire.
+-            // Or the watchdog observed last_seen==0==current BEFORE the
+-            // reader bumped — then it fired, but the reader has already
+-            // exited cleanly.
+-            //
+-            // The invariant: if the watchdog fires, the reader MUST
+-            // have exited cleanly. Never deadlock, never miss the
+-            // notify.
+-            let fired = state.notified.load(Ordering::Acquire);
+-            let exited = state.reader_exits.load(Ordering::Acquire);
+-            if fired {
+-                // Either the reader observed the fire and exited, or the
+-                // reader had already finished its one-shot iteration and
+-                // never checked — both are fine for a one-shot model.
+-                let _ = exited; // purely documentary
++                // Coherence on one atomic: a later poll never sees less.
++                assert!(probe.last_seen() <= FRAMES);
+             }
+-        });
+-    }
+-
+-    /// **Invariant 2** — the watchdog fires EXACTLY ONCE in any
+-    /// interleaving. The production watchdog task calls `notify_one()`
+-    /// and returns; a second fire is a bug. Loom's state-space
+-    /// exhaustion verifies this across every schedule.
+-    #[test]
+-    fn watchdog_fires_at_most_once_across_interleavings() {
+-        loom::model(|| {
+-            let state = WatchdogState::new();
+-            let fire_count = Arc::new(AtomicU64::new(0));
+-
+-            // Watchdog observation #1: reads counter, if stale, "fires".
+-            let s1 = Arc::clone(&state);
+-            let fc1 = Arc::clone(&fire_count);
+-            let w1 = thread::spawn(move || {
+-                let c = s1.counter.load(Ordering::Relaxed);
+-                if c == 0 {
+-                    // CAS guard — only the first firer wins.
+-                    if s1
+-                        .notified
+-                        .compare_exchange(false, true, Ordering::Release, Ordering::Relaxed)
+-                        .is_ok()
+-                    {
+-                        fc1.fetch_add(1, Ordering::Relaxed);
+-                    }
+-                }
+-            });
+-
+-            // Watchdog observation #2: same logic, racing against #1.
+-            // In production this cannot happen (one watchdog per
+-            // connection), but the CAS guard must hold regardless.
+-            let s2 = Arc::clone(&state);
+-            let fc2 = Arc::clone(&fire_count);
+-            let w2 = thread::spawn(move || {
+-                let c = s2.counter.load(Ordering::Relaxed);
+-                if c == 0
+-                    && s2
+-                        .notified
+-                        .compare_exchange(false, true, Ordering::Release, Ordering::Relaxed)
+-                        .is_ok()
+-                {
+-                    fc2.fetch_add(1, Ordering::Relaxed);
+-                }
+-            });
+-
+-            w1.join().expect("w1 join");
+-            w2.join().expect("w2 join");
++            assert!(
++                advances <= FRAMES,
++                "{advances} advances for {FRAMES} frames"
++            );
+ 
+-            // INVARIANT: at most one CAS fire regardless of interleaving.
+-            let fires = fire_count.load(Ordering::Relaxed);
++            reader.join().expect("reader thread");
++
++            // The join orders every bump before this poll: it must catch up
++            // to all of them in one step...
++            let before = probe.last_seen();
++            let caught_up = probe.advanced(&counter);
++            assert_eq!(probe.last_seen(), FRAMES, "probe missed a frame");
++            // ...reporting progress exactly when the racing polls had not
++            // already reached the final value...
++            assert_eq!(caught_up, before != FRAMES);
++            // ...and with no new frame, no poll may report progress again.
+             assert!(
+-                fires <= 1,
+-                "watchdog fired {fires} times — CAS guard broken in interleaving"
++                !probe.advanced(&counter),
++                "a frame already counted read as progress a second time"
+             );
++            assert!(!probe.advanced(&counter));
+         });
++
++        // ANTI-VACUITY: loom must have explored both outcomes of a racing poll.
++        assert!(
++            POLL_SAW_PROGRESS.load(Ordering::Relaxed) > 0,
++            "no execution let a racing poll see a frame"
++        );
++        assert!(
++            POLL_SAW_NONE.load(Ordering::Relaxed) > 0,
++            "no execution let a racing poll miss the frames"
++        );
+     }
+ 
+-    /// **Invariant 3** — when the watchdog fires, the reader observes
+-    /// the notify on its NEXT check. No lost notifications: the
+-    /// Release/Acquire pair guarantees the reader sees the store.
++    /// No frame, no progress: a silent reader never moves the probe, in any
++    /// interleaving of the probe's start and its polls.
+     #[test]
+-    fn reader_observes_watchdog_notify_after_release_store() {
++    fn a_silent_connection_never_reads_as_progress() {
+         loom::model(|| {
+-            let state = WatchdogState::new();
+-
+-            // Watchdog stores the fire flag first.
+-            let s_watchdog = Arc::clone(&state);
++            let counter = Arc::new(AtomicU64::new(0));
++            let poll_counter = Arc::clone(&counter);
+             let watchdog = thread::spawn(move || {
+-                s_watchdog.notified.store(true, Ordering::Release);
++                let mut probe = ProgressProbe::start(&poll_counter);
++                (probe.advanced(&poll_counter), probe.advanced(&poll_counter))
+             });
+-
+-            // Reader reads after (scheduler may interleave arbitrarily).
+-            let s_reader = Arc::clone(&state);
+-            let reader = thread::spawn(move || s_reader.notified.load(Ordering::Acquire));
+-
+-            watchdog.join().expect("watchdog join");
+-            let observed = reader.join().expect("reader join");
+-
+-            // The reader observes either `false` (it ran first) or
+-            // `true` (watchdog finished before reader load). The
+-            // Release/Acquire pair means there is NO third possibility
+-            // — no torn read, no visibility delay.
+-            assert!(observed || !observed, "atomic bool is always valid");
+-
+-            // Final state: the watchdog's store is visible if we read
+-            // it again after the joins.
+-            let final_flag = state.notified.load(Ordering::Acquire);
+-            assert!(
+-                final_flag,
+-                "after watchdog join, notify flag MUST be observed as true"
+-            );
++            let (first, second) = watchdog.join().expect("watchdog thread");
++            assert!(!first && !second, "progress reported on a silent socket");
+         });
+     }
+ }
+ 
+-// Standard (non-loom) sanity tests so the file participates in every
+-// CI run, not just the weekly loom-feature one.
++// Standard (non-loom) stress test on the same real functions, so the file
++// runs in the ordinary suite too.
+ #[cfg(not(feature = "loom"))]
+ mod std_tests {
+     use std::sync::Arc;
+-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
++    use std::sync::atomic::AtomicU64;
+     use std::thread;
+ 
++    use tickvault_core::websocket::activity_watchdog::{ProgressProbe, note_activity};
++
++    /// A reader records 100,000 frames while the watchdog polls in a loop.
++    /// The probe never runs ahead of the frames, and after the reader stops
++    /// one poll catches up to the exact total and the next reports nothing.
+     #[test]
+-    fn stress_watchdog_cas_fires_at_most_once_across_many_racers() {
+-        let notified = Arc::new(AtomicBool::new(false));
+-        let fire_count = Arc::new(AtomicU64::new(0));
+-        let mut handles = Vec::new();
+-        for _ in 0..32 {
+-            let notified = Arc::clone(&notified);
+-            let fire_count = Arc::clone(&fire_count);
+-            handles.push(thread::spawn(move || {
+-                if notified
+-                    .compare_exchange(false, true, Ordering::Release, Ordering::Relaxed)
+-                    .is_ok()
+-                {
+-                    fire_count.fetch_add(1, Ordering::Relaxed);
+-                }
+-            }));
+-        }
+-        for h in handles {
+-            h.join().expect("join");
++    fn stress_probe_tracks_a_busy_reader_exactly() {
++        const FRAMES: u64 = 100_000;
++        let counter = Arc::new(AtomicU64::new(0));
++        let reader_counter = Arc::clone(&counter);
++        let reader = thread::spawn(move || {
++            for _ in 0..FRAMES {
++                note_activity(&reader_counter);
++            }
++        });
++        let mut probe = ProgressProbe::start(&counter);
++        let mut previous = probe.last_seen();
++        while !reader.is_finished() {
++            if probe.advanced(&counter) {
++                assert!(probe.last_seen() > previous, "the probe went backwards");
++                previous = probe.last_seen();
++            }
++            assert!(probe.last_seen() <= FRAMES);
+         }
+-        assert_eq!(
+-            fire_count.load(Ordering::Relaxed),
+-            1,
+-            "exactly one racer must win the CAS fire"
+-        );
++        reader.join().expect("reader thread");
++        let _ = probe.advanced(&counter);
++        assert_eq!(probe.last_seen(), FRAMES);
++        assert!(!probe.advanced(&counter));
+     }
+ }
+diff --git a/crates/core/tests/loom_tick_dedup.rs b/crates/core/tests/loom_tick_dedup.rs
+deleted file mode 100644
+index 5a9ad9166..000000000
+--- a/crates/core/tests/loom_tick_dedup.rs
++++ /dev/null
+@@ -1,345 +0,0 @@
+-//! Loom concurrency tests for tick pipeline atomic patterns.
+-//!
+-//! The tick processor uses several shared atomic primitives across tasks:
+-//! - storage-gate `Arc<AtomicBool>` — writer opens/closes, tick processor reads
+-//!   (the former `scheduler::StorageGate` module was DELETED 2026-07-18,
+-//!   dead-code batch 2; the atomic PATTERN under test is unchanged)
+-//! - Atomic tick counters — multiple producers increment, monitor reads
+-//! - Connection health atomics — reconnection counter + state mutex
+-//!
+-//! These tests verify correctness under all possible thread interleavings
+-//! using the Loom model checker.
+-//!
+-//! Run with: cargo test -p tickvault-core --features loom --test loom_tick_dedup
+-
+-#[cfg(feature = "loom")]
+-mod loom_tests {
+-    use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+-    use loom::sync::{Arc, Mutex};
+-    use loom::thread;
+-
+-    // -----------------------------------------------------------------------
+-    // storage-gate pattern: writer stores, tick processor loads
+-    // -----------------------------------------------------------------------
+-
+-    /// Verifies that a gate opened by the scheduler is visible to the tick
+-    /// processor across threads — mirrors the storage-gate pattern where
+-    /// the scheduler opens/closes the gate and the tick processor checks it
+-    /// on every tick.
+-    #[test]
+-    fn test_storage_gate_visibility_after_join() {
+-        loom::model(|| {
+-            let gate = Arc::new(AtomicBool::new(false));
+-            let g1 = Arc::clone(&gate);
+-
+-            let t1 = thread::spawn(move || {
+-                g1.store(true, Ordering::Release);
+-            });
+-
+-            t1.join().unwrap();
+-
+-            // After join, the store must be visible.
+-            assert!(gate.load(Ordering::Acquire));
+-        });
+-    }
+-
+-    /// Verifies that concurrent open/close of the storage gate never
+-    /// produces a value other than true or false (i.e., no torn reads).
+-    /// The tick processor must always see a valid boolean.
+-    #[test]
+-    fn test_storage_gate_concurrent_open_close() {
+-        loom::model(|| {
+-            let gate = Arc::new(AtomicBool::new(false));
+-            let g_opener = Arc::clone(&gate);
+-            let g_closer = Arc::clone(&gate);
+-
+-            let opener = thread::spawn(move || {
+-                g_opener.store(true, Ordering::Release);
+-            });
+-
+-            let closer = thread::spawn(move || {
+-                g_closer.store(false, Ordering::Release);
+-            });
+-
+-            opener.join().unwrap();
+-            closer.join().unwrap();
+-
+-            // Final value must be a valid boolean (true or false).
+-            // Exact value depends on interleaving — both are correct.
+-            let val = gate.load(Ordering::Acquire);
+-            assert!(val || !val, "AtomicBool must be true or false");
+-        });
+-    }
+-
+-    /// Verifies that a reader running concurrently with a writer always
+-    /// sees either the old or new value — never a torn/invalid state.
+-    /// This mirrors the hot-path pattern: tick processor reads the gate
+-    /// while the scheduler may be toggling it.
+-    #[test]
+-    fn test_storage_gate_reader_during_write() {
+-        loom::model(|| {
+-            let gate = Arc::new(AtomicBool::new(false));
+-            let g_writer = Arc::clone(&gate);
+-            let g_reader = Arc::clone(&gate);
+-
+-            let writer = thread::spawn(move || {
+-                g_writer.store(true, Ordering::Release);
+-            });
+-
+-            let reader = thread::spawn(move || {
+-                // Must see either false (before write) or true (after write).
+-                let val = g_reader.load(Ordering::Acquire);
+-                assert!(val || !val);
+-                val
+-            });
+-
+-            writer.join().unwrap();
+-            let _read_value = reader.join().unwrap();
+-        });
+-    }
+-
+-    // -----------------------------------------------------------------------
+-    // Tick counter pattern: concurrent atomic increments
+-    // -----------------------------------------------------------------------
+-
+-    /// Tests that atomic counter increments from multiple threads
+-    /// do not lose updates — mirrors the tick counter pattern where
+-    /// multiple WebSocket connections feed ticks to the processor.
+-    #[test]
+-    fn test_concurrent_tick_counter_no_lost_updates() {
+-        loom::model(|| {
+-            let counter = Arc::new(AtomicU64::new(0));
+-            let c1 = Arc::clone(&counter);
+-            let c2 = Arc::clone(&counter);
+-
+-            let t1 = thread::spawn(move || {
+-                c1.fetch_add(1, Ordering::Relaxed);
+-                c1.fetch_add(1, Ordering::Relaxed);
+-            });
+-
+-            let t2 = thread::spawn(move || {
+-                c2.fetch_add(1, Ordering::Relaxed);
+-            });
+-
+-            t1.join().unwrap();
+-            t2.join().unwrap();
+-
+-            assert_eq!(counter.load(Ordering::SeqCst), 3);
+-        });
+-    }
+-
+-    // -----------------------------------------------------------------------
+-    // Connection health pattern: Mutex<State> + AtomicU64 reconnection counter
+-    // -----------------------------------------------------------------------
+-
+-    /// Connection state — mirrors `ConnectionState` in websocket/types.rs.
+-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+-    enum MockConnectionState {
+-        Disconnected,
+-        Connecting,
+-        Connected,
+-        Reconnecting,
+-    }
+-
+-    /// Verifies that concurrent state mutation (via Mutex) and reconnection
+-    /// counter increment (via AtomicU64) are consistent — the health()
+-    /// method reads both, and must never observe a half-updated snapshot
+-    /// within a single lock acquisition.
+-    #[test]
+-    fn test_connection_health_state_and_counter_consistency() {
+-        loom::model(|| {
+-            let state = Arc::new(Mutex::new(MockConnectionState::Disconnected));
+-            let reconnections = Arc::new(AtomicU64::new(0));
+-
+-            let s1 = Arc::clone(&state);
+-            let r1 = Arc::clone(&reconnections);
+-
+-            // Simulate reconnection: update state + increment counter.
+-            let reconnector = thread::spawn(move || {
+-                {
+-                    let mut guard = s1.lock().unwrap();
+-                    *guard = MockConnectionState::Reconnecting;
+-                }
+-                r1.fetch_add(1, Ordering::Release);
+-                {
+-                    let mut guard = s1.lock().unwrap();
+-                    *guard = MockConnectionState::Connected;
+-                }
+-            });
+-
+-            // Simulate health check: read state + counter.
+-            let s2 = Arc::clone(&state);
+-            let r2 = Arc::clone(&reconnections);
+-            let health_reader = thread::spawn(move || {
+-                let current_state = *s2.lock().unwrap();
+-                let recon_count = r2.load(Ordering::Acquire);
+-                (current_state, recon_count)
+-            });
+-
+-            reconnector.join().unwrap();
+-            let (observed_state, observed_count) = health_reader.join().unwrap();
+-
+-            // State must be a valid variant.
+-            assert!(
+-                observed_state == MockConnectionState::Disconnected
+-                    || observed_state == MockConnectionState::Reconnecting
+-                    || observed_state == MockConnectionState::Connected,
+-                "unexpected state: {observed_state:?}"
+-            );
+-
+-            // Counter must be 0 or 1.
+-            assert!(
+-                observed_count <= 1,
+-                "unexpected reconnection count: {observed_count}"
+-            );
+-        });
+-    }
+-
+-    /// Verifies that multiple concurrent reconnections correctly accumulate
+-    /// in the atomic counter — no lost increments.
+-    #[test]
+-    fn test_reconnection_counter_no_lost_increments() {
+-        loom::model(|| {
+-            let counter = Arc::new(AtomicU64::new(0));
+-            let c1 = Arc::clone(&counter);
+-            let c2 = Arc::clone(&counter);
+-
+-            let t1 = thread::spawn(move || {
+-                c1.fetch_add(1, Ordering::Relaxed);
+-            });
+-
+-            let t2 = thread::spawn(move || {
+-                c2.fetch_add(1, Ordering::Relaxed);
+-            });
+-
+-            t1.join().unwrap();
+-            t2.join().unwrap();
+-
+-            assert_eq!(
+-                counter.load(Ordering::SeqCst),
+-                2,
+-                "two reconnections must both be counted"
+-            );
+-        });
+-    }
+-}
+-
+-// Standard (non-loom) concurrency tests that run in normal CI.
+-#[cfg(not(feature = "loom"))]
+-mod std_concurrency_tests {
+-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+-    use std::sync::{Arc, Mutex};
+-    use std::thread;
+-
+-    /// Stress test: concurrent storage gate toggling never panics.
+-    #[test]
+-    fn stress_storage_gate_concurrent_toggle() {
+-        let gate = Arc::new(AtomicBool::new(false));
+-        let mut handles = vec![];
+-
+-        for i in 0..8 {
+-            let gate = Arc::clone(&gate);
+-            handles.push(thread::spawn(move || {
+-                for _ in 0..10_000 {
+-                    if i % 2 == 0 {
+-                        gate.store(true, Ordering::Release);
+-                    } else {
+-                        gate.store(false, Ordering::Release);
+-                    }
+-                    let _ = gate.load(Ordering::Acquire);
+-                }
+-            }));
+-        }
+-
+-        for h in handles {
+-            h.join().unwrap();
+-        }
+-
+-        // Gate must be a valid boolean after all threads finish.
+-        let final_val = gate.load(Ordering::Acquire);
+-        // Verify the atomic value is a valid boolean (0 or 1)
+-        let raw = if final_val { 1_u8 } else { 0_u8 };
+-        assert!(raw <= 1, "atomic bool must be 0 or 1, got {raw}");
+-    }
+-
+-    /// Stress test: concurrent tick counter increments never lose updates.
+-    #[test]
+-    fn stress_tick_counter_no_lost_updates() {
+-        let counter = Arc::new(AtomicU64::new(0));
+-        let mut handles = vec![];
+-
+-        for _ in 0..8 {
+-            let counter = Arc::clone(&counter);
+-            handles.push(thread::spawn(move || {
+-                for _ in 0..10_000 {
+-                    counter.fetch_add(1, Ordering::Relaxed);
+-                }
+-            }));
+-        }
+-
+-        for h in handles {
+-            h.join().unwrap();
+-        }
+-
+-        assert_eq!(counter.load(Ordering::SeqCst), 80_000);
+-    }
+-
+-    /// Stress test: concurrent state mutation + counter increment.
+-    #[test]
+-    fn stress_connection_health_concurrent_access() {
+-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+-        enum State {
+-            Disconnected,
+-            Connected,
+-            Reconnecting,
+-        }
+-
+-        let state = Arc::new(Mutex::new(State::Disconnected));
+-        let counter = Arc::new(AtomicU64::new(0));
+-        let mut handles = vec![];
+-
+-        // Writer threads: simulate reconnections.
+-        for _ in 0..4 {
+-            let state = Arc::clone(&state);
+-            let counter = Arc::clone(&counter);
+-            handles.push(thread::spawn(move || {
+-                for _ in 0..1_000 {
+-                    {
+-                        let mut guard = state.lock().unwrap();
+-                        *guard = State::Reconnecting;
+-                    }
+-                    counter.fetch_add(1, Ordering::Release);
+-                    {
+-                        let mut guard = state.lock().unwrap();
+-                        *guard = State::Connected;
+-                    }
+-                }
+-            }));
+-        }
+-
+-        // Reader threads: simulate health checks.
+-        for _ in 0..4 {
+-            let state = Arc::clone(&state);
+-            let counter = Arc::clone(&counter);
+-            handles.push(thread::spawn(move || {
+-                for _ in 0..1_000 {
+-                    let s = *state.lock().unwrap();
+-                    let c = counter.load(Ordering::Acquire);
+-                    assert!(
+-                        s == State::Disconnected
+-                            || s == State::Connected
+-                            || s == State::Reconnecting
+-                    );
+-                    // Counter monotonically increases.
+-                    assert!(c <= 4_000);
+-                }
+-            }));
+-        }
+-
+-        for h in handles {
+-            h.join().unwrap();
+-        }
+-
+-        assert_eq!(counter.load(Ordering::SeqCst), 4_000);
+-    }
+-}
+diff --git a/crates/core/tests/loom_ws_decoupling.rs b/crates/core/tests/loom_ws_decoupling.rs
+index ea59aa2a7..e860a2dd7 100644
+--- a/crates/core/tests/loom_ws_decoupling.rs
++++ b/crates/core/tests/loom_ws_decoupling.rs
+@@ -1,296 +1,237 @@
+-//! STAGE-D P7.1 — Loom concurrency model for the WS → WAL decoupling.
++//! Loom model of the REAL frame-ring budget the socket readers share (audit
++//! H3, rewritten 2026-10-06).
+ //!
+-//! The production invariant we need to preserve mechanically:
++//! Until 2026-10-06 this file modelled a hand-written copy of the WS -> WAL
++//! hand-off: a `Mutex<Vec<u8>>` as the WAL and a `Mutex<Option<u8>>` as a
++//! capacity-one channel. Neither exists in production (the WAL is the storage
++//! crate's queued writer, the ring a bounded `tokio::sync::mpsc` the readers
++//! `try_send` into, and the reader takes no lock), so a change to the real
++//! code could not fail it. Those models are deleted.
+ //!
+-//!   > The WS read loop never blocks on the downstream consumer. In every
+-//!   > interleaving, the reader can bump its activity counter and hand a
+-//!   > frame to the WAL path without waiting on the consumer side of the
+-//!   > channel, even when the consumer task has stalled completely.
++//! The lock-free structure every socket reader shares on that hand-off is the
++//! ring's per-class budget, `RingByteBudget`: each reader reserves bytes and a
++//! slot before `try_send` (`WalRingSink::accept`), and the drain releases them
++//! as frames leave the ring. Under the crate's `loom` feature its two counters
++//! are loom's `AtomicUsize` (`crate::sync`), so this file drives the exact
++//! `try_reserve_detailed` and `release` methods through every interleaving.
+ //!
+-//! This model abstracts the production structure down to its atomic
+-//! shape to keep loom's state space tractable:
++//! Not modelled, stated plainly: the tokio channel and the WAL writer (loom
++//! cannot run them). That the reader never awaits on either is pinned by the
++//! `FrameSink::accept` signature (no `async`) and the pool supervisor tests.
+ //!
+-//!   - `activity_counter: AtomicU64` — the watchdog counter bumped by the
+-//!     read loop on every Some(Ok(_)) frame.
+-//!   - `wal_queue: Mutex<Vec<u8>>` — a bounded "WAL ring" placeholder that
+-//!     the reader appends to (`push`) without ever blocking.
+-//!   - `live_channel: Mutex<Option<u8>>` — a capacity-1 live channel the
+-//!     reader tries to `try_send` into. When full, the reader MUST NOT
+-//!     block; instead it records a backpressure event and moves on.
+-//!   - `backpressure_counter: AtomicU64` — incremented when the live
+-//!     channel was full (the WAL is still durable, so no data loss).
++//! What it proves, in every interleaving:
++//!
++//! - concurrent readers never reserve past the byte cap or the slot cap;
++//! - a reservation refused for bytes hands its slot back (a leak would shrink
++//!   the class's slot budget a frame at a time until it refused everything);
++//! - a reservation racing the drain's release ends with the counters exactly
++//!   matching the frames that hold a reservation;
++//! - both outcomes of each race are explored (anti-vacuity, see the loom note).
+ //!
+ //! Run with:
+ //!   cargo test -p tickvault-core --features loom --test loom_ws_decoupling
+ 
+ #[cfg(feature = "loom")]
+ mod loom_tests {
+-    use loom::sync::atomic::{AtomicU64, Ordering};
+-    use loom::sync::{Arc, Mutex};
+-    use loom::thread;
+-
+-    /// Minimal shape of the WS → WAL path.
+-    struct WsState {
+-        activity_counter: AtomicU64,
+-        wal_queue: Mutex<Vec<u8>>,
+-        live_channel: Mutex<Option<u8>>, // capacity-1 bounded channel
+-        backpressure_counter: AtomicU64,
+-    }
+-
+-    impl WsState {
+-        fn new() -> Arc<Self> {
+-            Arc::new(Self {
+-                activity_counter: AtomicU64::new(0),
+-                wal_queue: Mutex::new(Vec::new()),
+-                live_channel: Mutex::new(None),
+-                backpressure_counter: AtomicU64::new(0),
+-            })
+-        }
+-
+-        /// Simulates one iteration of the WS read loop: counter bump,
+-        /// durable WAL append, non-blocking live try_send.
+-        ///
+-        /// This function MUST return quickly regardless of consumer
+-        /// state. Returning means "reader is unblocked and ready for
+-        /// the next frame".
+-        fn read_loop_once(&self, frame: u8) {
+-            // STAGE-C.3: activity watchdog counter bump. Relaxed is
+-            // sufficient because the watchdog only checks forward
+-            // progress, not ordering.
+-            self.activity_counter.fetch_add(1, Ordering::Relaxed);
++    use std::sync::atomic::{AtomicUsize, Ordering};
+ 
+-            // STAGE-C.1: durable WAL append. The reader holds the WAL
+-            // mutex briefly — bounded by a memcpy in production (one
+-            // Vec<u8> push). Loom sees this as a short critical section,
+-            // NOT a block on the consumer.
+-            self.wal_queue
+-                .lock()
+-                .expect("loom: wal_queue lock")
+-                .push(frame);
+-
+-            // STAGE-C.2: non-blocking live try_send. If the slot is
+-            // already full we IMMEDIATELY record a backpressure event
+-            // and return — we never await on the consumer.
+-            let mut live = self.live_channel.lock().expect("loom: live_channel lock");
+-            if live.is_none() {
+-                *live = Some(frame);
+-            } else {
+-                // Capacity-1 channel is full. In production the WAL
+-                // already has the frame, so we log a WARN and move on.
+-                self.backpressure_counter.fetch_add(1, Ordering::Release);
+-            }
+-            // Mutex guards drop here — reader is done with this frame.
+-        }
+-
+-        /// Simulates the consumer task draining one frame from the
+-        /// live channel. In production this is a full tick processor +
+-        /// QuestDB write; for the loom model we only need to observe
+-        /// that draining it unblocks the next reader try_send.
+-        fn consumer_drain_once(&self) -> Option<u8> {
+-            let mut live = self.live_channel.lock().expect("loom: live_channel lock");
+-            live.take()
+-        }
+-    }
++    use loom::sync::Arc;
++    use loom::thread;
++    use tickvault_core::websocket::pool_supervisor::{RingByteBudget, RingReserve};
+ 
+-    /// Model 1 — slow consumer never blocks the reader.
++    /// Two readers race for a byte budget only one of them fits in.
+     ///
+-    /// The reader produces two frames while the consumer is paused.
+-    /// Loom explores every possible interleaving. Invariants:
+-    ///   - Every frame is recorded in the WAL (no loss).
+-    ///   - The activity counter advanced by 2 (reader never spun).
+-    ///   - At most one frame is in the live channel at any moment.
+-    ///   - The backpressure counter is either 0 or 1, never torn.
++    /// The second reservation runs on the MAIN thread, the shape
++    /// `loom_ghost_register.rs` measured as necessary there (with its take on
++    /// a spawned thread loom explored one execution; Assumed cause: loom 0.7
++    /// tracks only the last access to each atomic). Measured 2026-10-06 for
++    /// THIS model: with both reservations on spawned threads loom still
++    /// explored both winners (both are compare-and-swap loops), so the
++    /// limitation does not bite here; the anti-vacuity asserts below fail if
++    /// a loom change ever collapses it to one winner.
+     #[test]
+-    fn reader_never_blocks_on_slow_consumer() {
+-        loom::model(|| {
+-            let state = WsState::new();
+-
+-            let s1 = Arc::clone(&state);
+-            let reader = thread::spawn(move || {
+-                s1.read_loop_once(0xAA);
+-                s1.read_loop_once(0xBB);
+-            });
+-
+-            reader.join().expect("loom: reader join");
+-
+-            // Invariant 1: WAL contains both frames regardless of interleaving.
+-            let wal = state.wal_queue.lock().expect("loom: wal lock");
+-            assert_eq!(wal.len(), 2, "WAL must contain both frames");
+-            assert_eq!(*wal, vec![0xAA, 0xBB]);
+-            drop(wal);
+-
+-            // Invariant 2: activity counter advanced by exactly 2.
+-            assert_eq!(
+-                state.activity_counter.load(Ordering::Relaxed),
+-                2,
+-                "activity counter must reflect both frames"
+-            );
+-
+-            // Invariant 3: live channel has at most 1 slot; since
+-            // no consumer ran, exactly one frame is sitting in it.
+-            let live = state.live_channel.lock().expect("loom: live lock");
+-            assert!(live.is_some(), "live channel must hold one frame");
+-            drop(live);
++    fn two_readers_never_reserve_past_the_byte_cap_and_the_loser_returns_its_slot() {
++        static SPAWNED_WON: AtomicUsize = AtomicUsize::new(0);
++        static MAIN_WON: AtomicUsize = AtomicUsize::new(0);
+ 
+-            // Invariant 4: backpressure counter is exactly 1 — the
+-            // second frame could not fit in the capacity-1 slot, so
+-            // the WAL absorbed it (no loss, no block).
++        loom::model(|| {
++            // 10 bytes, 6-byte frames: exactly one fits.
++            let budget = Arc::new(RingByteBudget::with_slot_cap(10, 4));
++            let reader_budget = Arc::clone(&budget);
++            let reader = thread::spawn(move || reader_budget.try_reserve_detailed(6));
++            let main = budget.try_reserve_detailed(6);
++            let spawned = reader.join().expect("reader thread");
++
++            let granted = [spawned, main]
++                .iter()
++                .filter(|r| **r == RingReserve::Granted)
++                .count();
++            assert_eq!(granted, 1, "spawned {spawned:?}, main {main:?}");
++            for outcome in [spawned, main] {
++                assert!(
++                    matches!(outcome, RingReserve::Granted | RingReserve::BytesFull),
++                    "unexpected {outcome:?}"
++                );
++            }
++            assert_eq!(budget.resident(), 6, "bytes held past the one grant");
+             assert_eq!(
+-                state.backpressure_counter.load(Ordering::Acquire),
++                budget.slots_resident(),
+                 1,
+-                "backpressure counter must equal frames that spilled only to WAL"
++                "the refused reservation kept its slot"
+             );
++            if spawned == RingReserve::Granted {
++                SPAWNED_WON.fetch_add(1, Ordering::Relaxed);
++            } else {
++                MAIN_WON.fetch_add(1, Ordering::Relaxed);
++            }
++
++            // The drain releases the one frame: the class is empty again.
++            budget.release(6);
++            assert_eq!(budget.resident(), 0);
++            assert_eq!(budget.slots_resident(), 0);
+         });
++
++        assert!(
++            SPAWNED_WON.load(Ordering::Relaxed) > 0,
++            "no execution let the spawned reader win"
++        );
++        assert!(
++            MAIN_WON.load(Ordering::Relaxed) > 0,
++            "no execution let the main reader win"
++        );
+     }
+ 
+-    /// Model 2 — concurrent reader + consumer.
+-    ///
+-    /// Both threads run simultaneously. Loom explores every
+-    /// possible interleaving. Invariants:
+-    ///   - WAL always has the frame (durability is independent of consumer).
+-    ///   - The consumer either drains the frame or doesn't — both are fine.
+-    ///   - The reader never observes the consumer's state (zero coupling).
+-    ///   - Backpressure counter is 0 or 1, depending on interleaving.
++    /// Two readers race for the last frame slot; bytes are plentiful.
+     #[test]
+-    fn reader_and_consumer_never_deadlock() {
+-        loom::model(|| {
+-            let state = WsState::new();
+-
+-            let s_reader = Arc::clone(&state);
+-            let reader = thread::spawn(move || {
+-                s_reader.read_loop_once(0x11);
+-            });
+-
+-            let s_consumer = Arc::clone(&state);
+-            let consumer = thread::spawn(move || s_consumer.consumer_drain_once());
+-
+-            reader.join().expect("loom: reader join");
+-            let drained = consumer.join().expect("loom: consumer join");
+-
+-            // Invariant: WAL contains the frame in EVERY interleaving.
+-            let wal = state.wal_queue.lock().expect("loom: wal lock");
+-            assert_eq!(wal.len(), 1, "WAL must always contain the frame");
+-            assert_eq!(wal[0], 0x11);
+-            drop(wal);
++    fn two_readers_never_reserve_past_the_slot_cap() {
++        static SPAWNED_WON: AtomicUsize = AtomicUsize::new(0);
++        static MAIN_WON: AtomicUsize = AtomicUsize::new(0);
+ 
+-            // The consumer either saw the frame (drained == Some(0x11))
+-            // or it ran first (drained == None). Either is correct —
+-            // the WS→WAL decoupling does NOT require a happens-before
+-            // relationship between reader and consumer.
+-            assert!(matches!(drained, None | Some(0x11)));
++        loom::model(|| {
++            let budget = Arc::new(RingByteBudget::with_slot_cap(1_000, 1));
++            let reader_budget = Arc::clone(&budget);
++            let reader = thread::spawn(move || reader_budget.try_reserve_detailed(5));
++            let main = budget.try_reserve_detailed(7);
++            let spawned = reader.join().expect("reader thread");
++
++            match (spawned, main) {
++                (RingReserve::Granted, RingReserve::SlotsFull) => {
++                    assert_eq!(budget.resident(), 5);
++                    SPAWNED_WON.fetch_add(1, Ordering::Relaxed);
++                }
++                (RingReserve::SlotsFull, RingReserve::Granted) => {
++                    assert_eq!(budget.resident(), 7);
++                    MAIN_WON.fetch_add(1, Ordering::Relaxed);
++                }
++                other => panic!("slot cap 1 broken: {other:?}"),
++            }
++            assert_eq!(budget.slots_resident(), 1);
+         });
++
++        assert!(SPAWNED_WON.load(Ordering::Relaxed) > 0);
++        assert!(MAIN_WON.load(Ordering::Relaxed) > 0);
+     }
+ 
+-    /// Model 3 — a stalled consumer still lets the reader make progress.
+-    ///
+-    /// The consumer thread acquires the live-channel mutex, holds it
+-    /// briefly, and releases. While held, the reader attempts to push.
+-    /// In production the reader uses `try_send`, so mutex contention
+-    /// inside loom is a faithful stand-in: the reader can always make
+-    /// forward progress on the activity counter and the WAL, even if
+-    /// the live-channel lock is contended.
+-    ///
+-    /// NOTE: because `loom::sync::Mutex::lock` is blocking, this model
+-    /// reflects the production guarantee via a slightly different
+-    /// assertion: the reader completes within a bounded number of
+-    /// scheduler steps for every interleaving.
++    /// A reader reserves while the drain releases the frame that fills the
++    /// budget. Whichever wins, the counters end equal to what is held.
+     #[test]
+-    fn reader_makes_progress_under_live_channel_contention() {
+-        loom::model(|| {
+-            let state = WsState::new();
++    fn a_reserve_racing_the_drain_release_leaves_exact_counters() {
++        static GRANTED: AtomicUsize = AtomicUsize::new(0);
++        static REFUSED: AtomicUsize = AtomicUsize::new(0);
+ 
+-            let s_reader = Arc::clone(&state);
+-            let reader = thread::spawn(move || {
+-                s_reader.read_loop_once(0x42);
+-            });
++        loom::model(|| {
++            let budget = Arc::new(RingByteBudget::with_slot_cap(10, 4));
++            // One 6-byte frame already sits in the ring.
++            assert_eq!(budget.try_reserve_detailed(6), RingReserve::Granted);
+ 
+-            // The consumer immediately drains. In loom's scheduler this
+-            // may run before, during, or after the reader — each
+-            // interleaving is explored.
+-            let s_consumer = Arc::clone(&state);
+-            let consumer = thread::spawn(move || {
+-                let _ = s_consumer.consumer_drain_once();
+-            });
++            let drain_budget = Arc::clone(&budget);
++            let drain = thread::spawn(move || drain_budget.release(6));
+ 
+-            reader.join().expect("loom: reader join");
+-            consumer.join().expect("loom: consumer join");
++            let reserved = budget.try_reserve_detailed(6);
++            drain.join().expect("drain thread");
+ 
+-            // Reader always completed — no deadlock, no panic, no lost
+-            // frame in the WAL.
+-            let wal = state.wal_queue.lock().expect("loom: wal lock");
+-            assert_eq!(wal.len(), 1);
+-            drop(wal);
+-            assert_eq!(state.activity_counter.load(Ordering::Relaxed), 1);
++            match reserved {
++                RingReserve::Granted => {
++                    assert_eq!(budget.resident(), 6);
++                    assert_eq!(budget.slots_resident(), 1);
++                    GRANTED.fetch_add(1, Ordering::Relaxed);
++                }
++                RingReserve::BytesFull => {
++                    assert_eq!(budget.resident(), 0);
++                    assert_eq!(
++                        budget.slots_resident(),
++                        0,
++                        "the refused reservation kept its slot"
++                    );
++                    REFUSED.fetch_add(1, Ordering::Relaxed);
++                }
++                RingReserve::SlotsFull => panic!("slot cap 4 cannot be full"),
++            }
+         });
++
++        assert!(
++            GRANTED.load(Ordering::Relaxed) > 0,
++            "no execution let the release land first"
++        );
++        assert!(
++            REFUSED.load(Ordering::Relaxed) > 0,
++            "no execution let the reserve land first"
++        );
+     }
+ }
+ 
+-// Standard (non-loom) stress test so the file contributes to the
+-// normal CI run as well as the loom model.
++// Standard (non-loom) stress test on the same real budget, so the file runs
++// in the ordinary suite too.
+ #[cfg(not(feature = "loom"))]
+-mod std_stress_tests {
++mod std_tests {
+     use std::sync::Arc;
+-    use std::sync::Mutex;
+-    use std::sync::atomic::{AtomicU64, Ordering};
++    use std::sync::atomic::{AtomicUsize, Ordering};
+     use std::thread;
+ 
+-    /// Stress: 8 concurrent WS readers, 1 slow consumer. The readers
+-    /// must never deadlock on the capacity-1 live channel, and the WAL
+-    /// must end up with every frame even though most frames overflow
+-    /// into "backpressure" path.
+-    #[test]
+-    fn stress_ws_readers_never_deadlock_under_slow_consumer() {
+-        let wal: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::with_capacity(8_000)));
+-        let live: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
+-        let activity = Arc::new(AtomicU64::new(0));
+-        let backpressure = Arc::new(AtomicU64::new(0));
++    use tickvault_core::websocket::pool_supervisor::{RingByteBudget, RingReserve};
+ 
+-        let mut handles = Vec::new();
+-        for r in 0..8 {
+-            let wal = Arc::clone(&wal);
+-            let live = Arc::clone(&live);
+-            let activity = Arc::clone(&activity);
+-            let backpressure = Arc::clone(&backpressure);
++    /// Eight readers reserve and release 10,000 frames each against a budget
++    /// far smaller than the demand. Every granted reservation sees the
++    /// budget within its caps, and once every frame is released the class
++    /// holds nothing: no byte and no slot leaked through a refusal.
++    #[test]
++    fn stress_readers_and_releases_never_breach_or_leak_the_budget() {
++        const CAP: usize = 64;
++        const SLOTS: usize = 3;
++        let budget = Arc::new(RingByteBudget::with_slot_cap(CAP, SLOTS));
++        let granted = Arc::new(AtomicUsize::new(0));
++        let refused = Arc::new(AtomicUsize::new(0));
++        let mut handles = Vec::with_capacity(8);
++        for reader in 0..8_usize {
++            let budget = Arc::clone(&budget);
++            let granted = Arc::clone(&granted);
++            let refused = Arc::clone(&refused);
+             handles.push(thread::spawn(move || {
+-                for i in 0..1000 {
+-                    let frame = (r * 1000 + i) as u32;
+-                    activity.fetch_add(1, Ordering::Relaxed);
+-                    wal.lock().expect("wal lock").push(frame);
+-                    let mut slot = live.lock().expect("live lock");
+-                    if slot.is_none() {
+-                        *slot = Some(frame);
+-                    } else {
+-                        backpressure.fetch_add(1, Ordering::Release);
++                for i in 0..10_000_usize {
++                    let len = 1 + (reader * 7 + i) % 40;
++                    match budget.try_reserve_detailed(len) {
++                        RingReserve::Granted => {
++                            assert!(budget.resident() <= CAP);
++                            assert!(budget.slots_resident() <= SLOTS);
++                            granted.fetch_add(1, Ordering::Relaxed);
++                            budget.release(len);
++                        }
++                        RingReserve::BytesFull | RingReserve::SlotsFull => {
++                            refused.fetch_add(1, Ordering::Relaxed);
++                        }
+                     }
+                 }
+             }));
+         }
+-
+-        // Slow consumer: drains at a trickle, must not starve readers.
+-        let live_consumer = Arc::clone(&live);
+-        handles.push(thread::spawn(move || {
+-            for _ in 0..200 {
+-                let _ = live_consumer.lock().expect("live lock").take();
+-                thread::yield_now();
+-            }
+-        }));
+-
+         for h in handles {
+-            h.join().expect("stress join");
++            h.join().expect("reader thread");
+         }
+-
+-        // Every frame landed in the WAL — total = 8 readers × 1000 frames.
+-        let wal = wal.lock().expect("wal lock");
+-        assert_eq!(wal.len(), 8_000, "all frames durable in WAL");
+-        drop(wal);
+-
+-        // Activity counter saw every frame.
+-        assert_eq!(activity.load(Ordering::Relaxed), 8_000);
+-
+-        // Backpressure counter + frames-in-slot cover all frames that
+-        // could not fit the capacity-1 live channel. Sanity check: it
+-        // is bounded above by the total number of reader frames.
+-        let bp = backpressure.load(Ordering::Acquire);
+-        assert!(bp <= 8_000);
++        assert_eq!(budget.resident(), 0, "bytes leaked");
++        assert_eq!(budget.slots_resident(), 0, "slots leaked");
++        assert_eq!(
++            granted.load(Ordering::Relaxed) + refused.load(Ordering::Relaxed),
++            80_000
++        );
++        assert!(granted.load(Ordering::Relaxed) > 0);
+     }
+ }
