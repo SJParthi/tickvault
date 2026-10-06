@@ -7294,6 +7294,32 @@ fn flush_and_record(
 /// inert depending on how many refusals happened to have occurred.
 /// `test_a_counter_shaped_value_does_not_silently_work_as_a_clock` pins the
 /// consequence.
+/// Whether one 30 s silence scan leaves something to page about.
+///
+/// `silent` counts every instrument past its expected quiet ceiling, and that
+/// INCLUDES the never-ticked ones (`counts_toward_alarm` is
+/// `Exceeded | NeverTicked`). Until 2026-10-06 the latch re-armed only when
+/// `silent == 0 && never == 0`. A far strike that never trades all day keeps
+/// `never > 0` until the close, so on any such day the page fired once near
+/// 09:16 and never again: a contract or a whole socket going quiet at 11:00
+/// paged nobody (audit 2026-10-06, finding F1).
+///
+/// The two signals are now judged apart:
+/// * `silent - never` instruments ticked and then went quiet. That episode
+///   re-arms whenever it clears, however many never-ticked ones remain.
+/// * never-ticked instruments are reported ONCE per session
+///   (`never_reported`); the set is one-way within a session (an instrument
+///   leaves it only by ticking), so re-paging it would restate a fact.
+///
+/// The 30-minute `SILENCE_PAGE_COOLDOWN_SECS` between pages is unchanged, so
+/// re-arming cannot turn into a page storm.
+///
+/// O(1), pure.
+fn silence_scan_pending(silent: u64, never: u64, never_reported: bool) -> bool {
+    let went_quiet = silent.saturating_sub(never);
+    went_quiet > 0 || (never > 0 && !never_reported)
+}
+
 fn silence_page_is_cooling(last_page_secs: Option<u64>, now_secs: u64, cooldown: u64) -> bool {
     // saturating_sub, because a clock that steps backwards (NTP correction)
     // must not wrap into a gigantic elapsed value and silently clear the
@@ -7511,6 +7537,9 @@ async fn run_frame_drain(
     // once, the falling edge logs recovery at info and re-arms.
     let mut silent_scans: u32 = 0;
     let mut silence_reported = false;
+    // Never-ticked instruments are paged once per session; see
+    // `silence_scan_pending` for why this is a separate latch.
+    let mut never_reported = false;
     // Latch for the detector-blindness report below. Once the slot table is
     // full it stays full, so this fires once per session rather than every 30s.
     let mut detector_blind_reported = false;
@@ -8462,28 +8491,31 @@ async fn run_frame_drain(
                 {
                     silent_scans = 0;
                     silence_reported = false;
+                    never_reported = false;
                     continue;
                 }
-                if silent == 0 {
+                if !silence_scan_pending(silent, never, never_reported) {
                     if silence_reported {
                         info!(
-                            "Dhan live feed: every tracked instrument is ticking again \
-                             within its own expected cadence"
+                            silent,
+                            never_ticked = never,
+                            "Dhan live feed: every instrument that has ticked is ticking \
+                             again within its own expected cadence"
                         );
                     }
                     silent_scans = 0;
-                    // Re-arm only once nothing is left in the never-ticked
-                    // set. `never_ticked` is one-way within a session — an
-                    // instrument leaves it only by producing something, which
-                    // also removes it from `silent` — so re-paging while it is
-                    // non-zero restates a fact that cannot have changed.
+                    // Re-arm whenever the went-quiet episode clears, even
+                    // while never-ticked instruments remain: those were
+                    // reported once (`never_reported`) and cannot change
+                    // except by ticking. Until 2026-10-06 this re-armed only
+                    // at `never == 0`, which a never-traded far strike keeps
+                    // false all day, so the page fired once per session
+                    // (see `silence_scan_pending`).
                     //
                     // This gate alone is NOT what stops the page storm; see
                     // the cooldown at the emit below, and the measured numbers
                     // recorded there.
-                    if never == 0 {
-                        silence_reported = false;
-                    }
+                    silence_reported = false;
                     continue;
                 }
                 silent_scans = silent_scans.saturating_add(1);
@@ -8526,6 +8558,9 @@ async fn run_frame_drain(
                     silence_page_is_cooling(last_silence_page, now_secs, SILENCE_PAGE_COOLDOWN_SECS);
                 if silent_scans >= SILENCE_SCANS_BEFORE_ALERT && !silence_reported && !cooling {
                     silence_reported = true;
+                    if never > 0 {
+                        never_reported = true;
+                    }
                     last_silence_page = Some(now_secs);
                     error!(
                         code = ErrorCode::RiskGapTickGap.code_str(),
@@ -26132,7 +26167,70 @@ mod host_sizing_tests {
 
 #[cfg(test)]
 mod silence_latch_tests {
-    use super::silence_page_is_cooling;
+    use super::{silence_page_is_cooling, silence_scan_pending};
+
+    /// Audit 2026-10-06 F1: never-ticked far strikes must not hold the latch.
+    ///
+    /// Replays a day scan by scan through the same latch the drain keeps:
+    /// 40 far strikes never trade (they stay in both `silent` and `never`
+    /// all day); at 09:16 the went-quiet set is empty; at 11:00 three
+    /// contracts that had been ticking go quiet. Under the old rule
+    /// (re-arm only at `silent == 0 && never == 0`) the 11:00 episode never
+    /// paged; it must page now.
+    #[test]
+    fn a_contract_going_quiet_mid_session_pages_although_far_strikes_never_ticked() {
+        let never = 40u64;
+        // (silent, never) per scan: open, quiet morning, 11:00 episode x3, clear.
+        let scans = [
+            (never, never),
+            (never, never),
+            (never, never),
+            (never, never),
+            (never + 3, never),
+            (never + 3, never),
+            (never + 3, never),
+            (never, never),
+        ];
+        let mut silent_scans = 0u32;
+        let mut silence_reported = false;
+        let mut never_reported = false;
+        let mut pages = Vec::new();
+        for (i, (silent, nv)) in scans.iter().copied().enumerate() {
+            if !silence_scan_pending(silent, nv, never_reported) {
+                silent_scans = 0;
+                silence_reported = false;
+                continue;
+            }
+            silent_scans += 1;
+            if silent_scans >= 2 && !silence_reported {
+                silence_reported = true;
+                if nv > 0 {
+                    never_reported = true;
+                }
+                pages.push(i);
+            }
+        }
+        assert_eq!(
+            pages,
+            vec![1, 5],
+            "one page for the never-ticked strikes at the open, one for the \
+             11:00 episode; the old latch gave only the first"
+        );
+    }
+
+    #[test]
+    fn silence_scan_pending_truth_table() {
+        // Nothing silent.
+        assert!(!silence_scan_pending(0, 0, false));
+        // Only never-ticked: pending until reported once, then quiet.
+        assert!(silence_scan_pending(5, 5, false));
+        assert!(!silence_scan_pending(5, 5, true));
+        // Went quiet after ticking: always pending, reported or not.
+        assert!(silence_scan_pending(6, 5, true));
+        assert!(silence_scan_pending(1, 0, true));
+        // A count inconsistency (never > silent) never underflows into a page.
+        assert!(!silence_scan_pending(2, 5, true));
+    }
 
     /// RISK-GAP-03 must be rate-limited between PAGES, not just per episode.
     ///
