@@ -1004,7 +1004,31 @@ impl DhanLiveXverifyAuditWriter {
         self.pending = 0;
         dropped
     }
+
+    /// Drop every buffered-but-unflushed row because the caller chose to stop
+    /// writing, not because a write failed (2026-10-06, §12.15.8: the
+    /// cross-verification persist stops itself at its attempt's deadline).
+    /// Returns the dropped count; counted on the local-only
+    /// [`DHAN_LIVE_XVERIFY_AUDIT_ROWS_ABANDONED_COUNTER`], never on
+    /// `tv_dhan_live_xverify_audit_rows_discarded_total`, which is a §2.10
+    /// `audit_rows` member and pages: a deliberate stop of a recomputable
+    /// write is not a lost audit row. The caller must log the stop. O(1).
+    pub fn abandon_pending(&mut self) -> usize {
+        let dropped = self.pending;
+        if dropped > 0 {
+            metrics::counter!(DHAN_LIVE_XVERIFY_AUDIT_ROWS_ABANDONED_COUNTER)
+                .increment(dropped as u64);
+        }
+        self.buffer.clear();
+        self.pending = 0;
+        dropped
+    }
 }
+
+/// Rows [`DhanLiveXverifyAuditWriter::abandon_pending`] dropped on purpose.
+/// Local `/metrics` only: no EMF name, filter or alarm reads it (§12.15.8).
+pub const DHAN_LIVE_XVERIFY_AUDIT_ROWS_ABANDONED_COUNTER: &str =
+    "tv_dhan_live_xverify_audit_rows_abandoned_total";
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -1476,6 +1500,31 @@ mod tests {
         assert_eq!(w.discard_pending(), 2);
         assert_eq!(w.pending(), 0);
         assert_eq!(w.discard_pending(), 0, "discarding twice is a no-op");
+    }
+
+    /// A deliberate stop drops the buffer like a discard, but counts on its
+    /// own local counter, never on the paging discard counter (§12.15.8).
+    #[test]
+    fn abandon_pending_returns_the_dropped_count_clears_and_never_counts_as_discarded() {
+        let mut w = DhanLiveXverifyAuditWriter::for_test();
+        w.append_cell(&sample_cell()).expect("append");
+        w.append_daily(&sample_daily()).expect("append");
+        assert_eq!(w.abandon_pending(), 2);
+        assert_eq!(w.pending(), 0);
+        assert!(w.buffer_utf8().is_empty());
+        assert_eq!(w.abandon_pending(), 0, "abandoning twice is a no-op");
+        let src = include_str!("dhan_live_crossverify_persistence.rs");
+        let body = src
+            .split("pub fn abandon_pending(")
+            .nth(1)
+            .and_then(|s| s.split("\n    }\n").next())
+            .expect("abandon_pending exists");
+        assert!(body.contains("DHAN_LIVE_XVERIFY_AUDIT_ROWS_ABANDONED_COUNTER"));
+        assert!(!body.contains("rows_discarded_total"));
+        assert_eq!(
+            DHAN_LIVE_XVERIFY_AUDIT_ROWS_ABANDONED_COUNTER,
+            "tv_dhan_live_xverify_audit_rows_abandoned_total"
+        );
     }
 
     #[test]

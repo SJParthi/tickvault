@@ -35,7 +35,8 @@ use tickvault_storage::dhan_live_crossverify_persistence::DhanLiveXverifyAuditWr
 use tracing::{error, info, warn};
 
 use crate::daily_task_marker::{
-    MarkerDurability, daily_marker_exists, daily_marker_path, try_write_daily_marker_keeping,
+    MarkerDurability, daily_marker_exists, daily_marker_path, try_write_daily_marker,
+    try_write_daily_marker_keeping,
 };
 use crate::dhan_live_crossverify::{
     DayComparison, DhanLiveCrossverifyConfig, RUN_SECS_OF_DAY_IST, RunReport,
@@ -50,6 +51,13 @@ use crate::volume_leaderboard::OptionFamily;
 /// Marker task name. The S3 archive gate in `main.rs` reads the same constant,
 /// so the writer and the reader can never disagree about the file name.
 pub const CROSSVERIFY_MARKER_TASK: &str = "dhan_live_crossverify";
+
+/// Paged-day marker task name (2026-10-06, §12.15.8, 51b review). Written
+/// after every page of a final failure, so the day is paged once across
+/// processes and a day whose only attempt was skipped for time is paged
+/// exactly when no page went out today. Kept the default 7 days: it is read
+/// only on the day it names.
+pub const CROSSVERIFY_PAGED_MARKER_TASK: &str = "dhan_live_crossverify_paged";
 
 /// Days a cross-verification marker is kept (2026-10-06, plan item 51a,
 /// `no-rest` §12.15.7).
@@ -102,8 +110,16 @@ pub use crate::dhan_feed_stack::XVERIFY_RUNS_COUNTER;
 /// `persist_option_findings`): it still counts every row of a pass whose final
 /// flush succeeded.
 pub const XVERIFY_PERSIST_ROWS_COUNTER: &str = "tv_dhan_feed_xverify_rows_total";
-/// Persist failures (the final flush was refused).
+/// Persist failures (the final flush was refused). A §2.10 `audit_rows`
+/// member: every increment pages `tv-<env>-audit-rows-lost`, so a deliberate
+/// stop at the deadline never touches it (§12.15.8).
 pub const XVERIFY_PERSIST_ERRORS_COUNTER: &str = "tv_dhan_feed_xverify_persist_errors_total";
+/// Audit persists stopped on purpose at their deadline, by `pass` (`spot`,
+/// `options`). Local `/metrics` only: no EMF name, filter or alarm reads it
+/// (§12.15.8, 51b review). The day's last attempt still pages
+/// `xverify_failed` (`reason = "not_persisted"`).
+pub const XVERIFY_PERSIST_DEADLINE_STOPS_COUNTER: &str =
+    "tv_dhan_xverify_persist_deadline_stops_total";
 /// Subscribed instruments the comparator cannot target (F&O etc.).
 pub const XVERIFY_UNVERIFIABLE_COUNTER: &str = "tv_dhan_xverify_targets_unverifiable_total";
 
@@ -374,7 +390,9 @@ pub enum AttemptFailure {
     /// (2026-10-06, §12.15.7). The day is not recorded on an incomplete audit.
     AuditRowsLost,
     /// No attempt ran in this process: the only one was skipped because too
-    /// little time was left before 17:23 IST (§12.15.8). Logged, never paged.
+    /// little time was left before 17:23 IST, and the one evening attempt at
+    /// 17:45 could not start either (§12.15.8). Pages `xverify_failed` unless
+    /// today's paged marker shows a page already went out.
     SkippedNoTime,
 }
 
@@ -531,8 +549,11 @@ pub struct PersistOutcome {
     /// attempt's deadline (§12.15.8). `final_flush_ok` is then `false`.
     pub deadline_reached: bool,
     /// Rows never appended because the persist stopped at the deadline (the
-    /// daily row included). Rows already buffered are in `rows_discarded`.
+    /// daily row included).
     pub rows_not_written_at_deadline: usize,
+    /// Rows already buffered when the persist stopped at the deadline,
+    /// abandoned on purpose (`abandon_pending`), never counted as discarded.
+    pub rows_abandoned_at_deadline: usize,
 }
 
 /// The persist half of an attempt's verdict. `NotPersisted` when the final
@@ -751,29 +772,40 @@ where
 /// runs under no timeout.
 ///
 /// A full attempt with too little time left is skipped, never started. When
-/// no attempt ran before it in this process, the day ends
-/// [`AttemptFailure::SkippedNoTime`], which `run_day` logs and does not page:
-/// a restart late in the window must not page a second time for a day an
-/// earlier process already paged, and a page must not fire for a comparison
-/// that never ran. When an earlier attempt in this process did run and fail,
-/// the day ends with THAT failure, so it still pages (§12.15.8).
-/// O(1) per attempt, at most [`XVERIFY_MAX_ATTEMPTS_PER_DAY`] attempts.
-async fn drive_day<N, S, A, Fut>(
+/// an earlier attempt in this process did run and fail, the day ends with
+/// THAT failure, so it pages as usual. When nothing ran before it in this
+/// process (a start between about 17:15 and 17:45), the day does not end
+/// there (§12.15.8, 51b review): `on_first_skip` reports the day at once,
+/// BEFORE any wait, because the scheduled stop may end the process first
+/// (`run_day` pages it unless today's paged marker shows a page already went
+/// out); then the loop sleeps until
+/// [`SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST`] (17:45) and, on the same IST
+/// day, makes ONE full attempt with the configured budget. The skipped
+/// attempt is not counted, so that attempt is number 1 and the last. A
+/// process alive at 17:45 means the scheduled stop did not happen, so the
+/// attempt is not cut by it. The wait happens at most once; a second skip
+/// ends the day [`AttemptFailure::SkippedNoTime`].
+/// O(1) per attempt, at most [`XVERIFY_MAX_ATTEMPTS_PER_DAY`] attempts and
+/// one evening wait.
+async fn drive_day<N, S, K, A, Fut>(
     today: chrono::NaiveDate,
     config_budget_secs: u64,
     mut now_secs_of_day: N,
     mut still_today: S,
+    mut on_first_skip: K,
     mut attempt: A,
 ) -> DayResult
 where
     N: FnMut() -> u64,
     S: FnMut() -> bool,
+    K: FnMut(),
     A: FnMut(AttemptPlan) -> Fut,
     Fut: Future<Output = Result<(), AttemptFailure>>,
 {
     let max_attempt_secs = attempt_max_secs(config_budget_secs);
     let mut attempts: u32 = 0;
     let mut previous: Option<AttemptFailure> = None;
+    let mut waited_for_evening = false;
     loop {
         attempts = attempts.saturating_add(1);
         let start = now_secs_of_day();
@@ -820,9 +852,29 @@ where
                          left to run it before the evening stop; this attempt does not \
                          record today"
                     );
-                    // §12.15.8: an earlier failure in this process still
-                    // pages; a day on which nothing ran does not.
-                    Err(previous.unwrap_or(AttemptFailure::SkippedNoTime))
+                    // §12.15.8: an earlier failure in this process ends the
+                    // day with that failure, which pages as usual.
+                    if previous.is_some() || waited_for_evening {
+                        Err(previous.unwrap_or(AttemptFailure::SkippedNoTime))
+                    } else {
+                        // Nothing ran here: report the day now, then wait
+                        // for 17:45 and try once more (§12.15.8, 51b review).
+                        on_first_skip();
+                        waited_for_evening = true;
+                        let evening = u64::from(SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST);
+                        tokio::time::sleep(Duration::from_secs(evening.saturating_sub(start)))
+                            .await;
+                        if !still_today() {
+                            return DayResult {
+                                attempts,
+                                failure: Some(AttemptFailure::SkippedNoTime),
+                                day_changed: true,
+                            };
+                        }
+                        // The skipped attempt is not counted.
+                        attempts = attempts.saturating_sub(1);
+                        continue;
+                    }
                 }
             },
         };
@@ -890,6 +942,10 @@ async fn run_day(
         deps.config.run_budget_secs,
         now_ist_secs_of_day,
         || today_ist().0 == today,
+        // §12.15.8 (51b review): a day whose only attempt here was skipped
+        // for time is reported before the evening wait, which the scheduled
+        // stop may cut short.
+        || page_final_failure_once(AttemptFailure::SkippedNoTime, today, 0, targets.len()),
         |plan: AttemptPlan| async move {
             match plan.kind {
                 AttemptKind::MarkerOnly => {
@@ -919,7 +975,7 @@ async fn run_day(
         return;
     }
     if let Some(failure) = result.failure {
-        report_final_failure(failure, today, result.attempts, targets.len());
+        page_final_failure_once(failure, today, result.attempts, targets.len());
     }
     // §12.15.6: the depth-held option pass runs ONCE, after the spot check's
     // outcome is final. It never writes the day marker and never pages.
@@ -946,31 +1002,103 @@ async fn run_day(
     }
 }
 
-/// Pages once, after the last attempt of the day. Each arm is its own
-/// `error!` so every alarmed `source` stays a literal the alarm filter can
-/// match. The one exception is [`AttemptFailure::SkippedNoTime`]: no attempt
-/// ran in this process, so there is nothing new to page about; it is a coded
-/// `warn!` on a source no alarm filter matches (§12.15.8).
-fn report_final_failure(
+/// Reports the day's final failure once per IST day, across processes
+/// (§12.15.8, 51b review): reads today's paged marker, reports through
+/// [`report_final_failure`], and writes the marker when that paged. A marker
+/// that cannot be written leaves the page standing and is a coded `warn!`; a
+/// later failure the same day then pages again (loud, never silent). One file
+/// stat, plus one small file write after a page; cold, at most twice a day.
+fn page_final_failure_once(
     failure: AttemptFailure,
     today: chrono::NaiveDate,
     attempts: u32,
     targets: usize,
 ) {
-    let reason = failure.as_str();
-    match failure {
-        AttemptFailure::SkippedNoTime => warn!(
+    let paged_today = daily_marker_exists(CROSSVERIFY_PAGED_MARKER_TASK, today);
+    if !report_final_failure(failure, today, attempts, targets, paged_today) {
+        return;
+    }
+    if let Err(err) = try_write_daily_marker(CROSSVERIFY_PAGED_MARKER_TASK, today) {
+        warn!(
             code = ErrorCode::WsGapConnectionState.code_str(),
-            source = "xverify_day_not_attempted",
+            source = "xverify_paged_marker_write_failed",
+            %today,
+            ?err,
+            path = %daily_marker_path(CROSSVERIFY_PAGED_MARKER_TASK, today).display(),
+            "Dhan 1-minute cross-verification paged, but could not save the note that \
+             today was paged; a later failure today may page again; check disk space \
+             and permissions on the state folder"
+        );
+    }
+}
+
+/// Reports the day's final failure. Returns `true` when it paged.
+///
+/// When `paged_today` (today's paged marker exists), a page already went out
+/// today, from this process or an earlier one, so nothing pages: a coded
+/// `warn!` on a source no alarm filter matches (`xverify_day_not_attempted`
+/// for a day nothing ran on here, `xverify_already_paged_today` otherwise).
+/// Otherwise each arm is its own `error!` so every alarmed `source` stays a
+/// literal the alarm filter can match; [`AttemptFailure::SkippedNoTime`] (no
+/// attempt ran in this process) pages `xverify_failed`, because nobody has
+/// been told today is unverified (§12.15.8, 51b review). Pure apart from the
+/// log line. O(1).
+fn report_final_failure(
+    failure: AttemptFailure,
+    today: chrono::NaiveDate,
+    attempts: u32,
+    targets: usize,
+    paged_today: bool,
+) -> bool {
+    let reason = failure.as_str();
+    if paged_today {
+        let path = daily_marker_path(CROSSVERIFY_PAGED_MARKER_TASK, today);
+        if failure == AttemptFailure::SkippedNoTime {
+            warn!(
+                code = ErrorCode::WsGapConnectionState.code_str(),
+                source = "xverify_day_not_attempted",
+                %today,
+                attempts,
+                targets,
+                reason,
+                path = %path.display(),
+                last_end_ist_secs = XVERIFY_LAST_END_SECS_OF_DAY_IST,
+                "Dhan 1-minute cross-verification did not run today in this process: it \
+                 started too late to finish before the evening stop. Today's candles are \
+                 UNVERIFIED and today's S3 archive stays held. Not paged again: the note at \
+                 `path` shows a page already went out today. If the box is still up at \
+                 17:45, one more attempt runs then"
+            );
+        } else {
+            warn!(
+                code = ErrorCode::WsGapConnectionState.code_str(),
+                source = "xverify_already_paged_today",
+                %today,
+                attempts,
+                targets,
+                reason,
+                path = %path.display(),
+                "Dhan 1-minute cross-verification did not record today after every \
+                 same-day attempt — today's candles are UNVERIFIED and today's S3 archive \
+                 stays held. Not paged again: the note at `path` shows a page already \
+                 went out today"
+            );
+        }
+        return false;
+    }
+    match failure {
+        AttemptFailure::SkippedNoTime => error!(
+            code = ErrorCode::WsGapConnectionState.code_str(),
+            source = "xverify_failed",
             %today,
             attempts,
             targets,
             reason,
             last_end_ist_secs = XVERIFY_LAST_END_SECS_OF_DAY_IST,
-            "Dhan 1-minute cross-verification did not run today in this process: it \
-             started too late to finish before the evening stop. Today's candles are \
-             UNVERIFIED and today's S3 archive stays held. Not paged: no check ran here, \
-             and an earlier process that ran one has already paged"
+            "Dhan 1-minute cross-verification could not run today before the evening \
+             stop (the box started or restarted too late) and no alert went out today — \
+             today's candles are UNVERIFIED and today's S3 archive stays held. If the box \
+             is still up at 17:45, one more attempt runs then"
         ),
         AttemptFailure::Vacuous => error!(
             code = ErrorCode::WsGapConnectionState.code_str(),
@@ -1014,12 +1142,14 @@ fn report_final_failure(
              stays held"
         ),
     }
+    true
 }
 
 /// One attempt. Returns `Ok` only when the day's marker was written.
 ///
 /// Per-attempt problems log at `warn!` with sources no alarm filter matches;
-/// the page fires once, from [`report_final_failure`], after the last attempt.
+/// the page fires once per day, from [`report_final_failure`], after the last
+/// attempt.
 /// The divergence page is the exception: it is a finding about the data, not
 /// about the attempt, so it fires on the first attempt that measures it and
 /// `divergence_paged` stops a retry from paging it again.
@@ -1276,7 +1406,8 @@ fn persist_report(
 /// before each row it checks that a flush of the buffer, started now, would
 /// end by `deadline` in the ILP client's worst case
 /// ([`DhanLiveXverifyAuditWriter::flush_worst_case`]). When it would not, the
-/// persist stops: the buffered rows are discarded and counted, the rows not
+/// persist stops: the buffered rows are abandoned (counted locally, never on a
+/// §2.10 loss-group counter, since a deliberate stop is not a lost row), the rows not
 /// yet appended are counted, and the outcome is `NotPersisted`, so no marker
 /// is written. The check runs per row, not only before a flush, because a
 /// buffer that cannot be flushed in time now cannot be later either: the
@@ -1326,10 +1457,11 @@ fn persist_report_into(
         };
     // §12.15.8: stop when the buffer could no longer be flushed by the
     // deadline. `remaining` counts the rows not yet appended, the daily row
-    // included.
+    // included. The buffer is ABANDONED, not discarded: a deliberate stop of
+    // a recomputable write must not reach the §2.10 `audit_rows` page.
     let stop_at_deadline =
         |w: &mut DhanLiveXverifyAuditWriter, out: &mut PersistOutcome, remaining: usize| {
-            out.rows_discarded = out.rows_discarded.saturating_add(w.discard_pending());
+            out.rows_abandoned_at_deadline = w.abandon_pending();
             out.rows_not_written_at_deadline = remaining;
             out.deadline_reached = true;
             out.final_flush_ok = false;
@@ -1408,13 +1540,22 @@ fn finish_persist(
     let c = &report.comparison;
     metrics::counter!(XVERIFY_PERSIST_ROWS_COUNTER).increment(out.rows_flushed as u64);
     if out.deadline_reached {
-        metrics::counter!(XVERIFY_PERSIST_ERRORS_COUNTER).increment(1);
+        // §12.15.8 (51b review): a deliberate stop counts only locally. It
+        // never touches `XVERIFY_PERSIST_ERRORS_COUNTER` or the writer's
+        // discard counter, both §2.10 `audit_rows` members that page per
+        // attempt. Rows an earlier batch flush really lost were already
+        // counted there by the writer, and are named here (`rows_discarded`).
+        metrics::counter!(XVERIFY_PERSIST_DEADLINE_STOPS_COUNTER, "pass" => "spot").increment(1);
         warn!(
             code = ErrorCode::WsGapConnectionState.code_str(),
             source = "xverify_persist_stopped_at_deadline",
             rows_flushed = out.rows_flushed,
-            rows_discarded = out.rows_discarded,
+            rows_abandoned = out.rows_abandoned_at_deadline,
             rows_not_written = out.rows_not_written_at_deadline,
+            rows_discarded = out.rows_discarded,
+            batch_errors,
+            cell_errors = out.cell_append_errors,
+            tape_errors = out.tape_append_errors,
             findings = c.findings.len(),
             tape_rows = report.rest_tape.len(),
             last_end_ist_secs = XVERIFY_LAST_END_SECS_OF_DAY_IST,
@@ -1719,7 +1860,8 @@ async fn run_option_pass(
 ///
 /// §12.15.8: it stops at `deadline` the same way the spot persist does: before
 /// each row it checks that a flush of the buffer would end by `deadline` in
-/// the ILP client's worst case, and otherwise discards the buffer, logs
+/// the ILP client's worst case, and otherwise abandons the buffer (counted
+/// locally, never on a §2.10 loss-group counter), logs
 /// `xverify_options_persist_stopped_at_deadline` and returns `false`.
 fn persist_option_findings(
     questdb: &QuestDbConfig,
@@ -1791,13 +1933,17 @@ fn persist_option_findings_into(
         }
     }
     if stopped || !flush_fits(writer, now(), deadline) {
-        let discarded = writer.discard_pending();
-        metrics::counter!(XVERIFY_PERSIST_ERRORS_COUNTER).increment(1);
+        // §12.15.8 (51b review): abandoned, counted locally only; the option
+        // pass never pages (§12.15.6), so never a §2.10 loss-group counter.
+        let abandoned = writer.abandon_pending();
+        metrics::counter!(XVERIFY_PERSIST_DEADLINE_STOPS_COUNTER, "pass" => "options").increment(1);
         warn!(
             code = ErrorCode::WsGapConnectionState.code_str(),
             source = "xverify_options_persist_stopped_at_deadline",
-            discarded,
+            abandoned,
             not_written = total - appended,
+            row_errors,
+            batch_errors,
             "Dhan option cross-check stopped saving its audit rows: the next write could \
              not finish within the option check's time limit, so it ends before the \
              evening stop"
@@ -2061,7 +2207,14 @@ mod tests {
         assert!(ok_arm.is_some(), "run_once writes the marker on its Ok arm");
         let run_day = fn_body(prod, "async fn run_day(");
         assert!(run_day.contains("AttemptKind::MarkerOnly => {"));
-        assert!(!prod.contains("write_daily_marker("));
+        // The only other marker write is the paged-day marker (§12.15.8,
+        // 51b review), a different task the S3 gate never reads.
+        assert_eq!(prod.matches("write_daily_marker(").count(), 1);
+        assert_eq!(
+            prod.matches("try_write_daily_marker(CROSSVERIFY_PAGED_MARKER_TASK, today)")
+                .count(),
+            1
+        );
     }
 
     /// `classify_attempt` returns `Ok` exactly when the marker rule holds:
@@ -2233,6 +2386,7 @@ mod tests {
                 tape_append_errors,
                 deadline_reached: false,
                 rows_not_written_at_deadline: 0,
+                rows_abandoned_at_deadline: 0,
             };
             let lost = rows_discarded > 0 || cell_append_errors > 0 || tape_append_errors > 0;
             let expected = if !final_flush_ok || !daily_appended {
@@ -2346,6 +2500,7 @@ mod tests {
         assert!(!out.daily_appended);
         assert_eq!(out.rows_not_written_at_deadline, 5 + 3 + 1, "{out:?}");
         assert_eq!(out.rows_discarded, 0);
+        assert_eq!(out.rows_abandoned_at_deadline, 0);
         assert_eq!(out.rows_flushed, 0);
         assert_eq!(writer.pending(), 0);
         assert_eq!(persist_verdict(&out), Err(AttemptFailure::NotPersisted));
@@ -2372,9 +2527,10 @@ mod tests {
         assert_eq!(reads.get(), 4, "one reading per row until the stop");
         assert!(out.deadline_reached);
         // Rows 0 and 1 went in a failed batch flush (no sender), row 2 was
-        // buffered and discarded at the stop; 2 findings, 3 tape rows and
+        // buffered and abandoned at the stop (not discarded: §12.15.8); 2 findings, 3 tape rows and
         // the daily row were never appended.
-        assert_eq!(out.rows_discarded, 3, "{out:?}");
+        assert_eq!(out.rows_discarded, 2, "{out:?}");
+        assert_eq!(out.rows_abandoned_at_deadline, 1, "{out:?}");
         assert_eq!(out.rows_not_written_at_deadline, 6, "{out:?}");
         assert_eq!(writer.pending(), 0);
         assert_eq!(persist_verdict(&out), Err(AttemptFailure::NotPersisted));
@@ -2406,7 +2562,10 @@ mod tests {
             let deadline = t0 + Duration::from_millis(deadline_ms);
             let out = persist_report_into(&mut writer, &report, 0, 5, batch, deadline, clock);
             proptest::prop_assert_eq!(
-                out.rows_flushed + out.rows_discarded + out.rows_not_written_at_deadline,
+                out.rows_flushed
+                    + out.rows_discarded
+                    + out.rows_abandoned_at_deadline
+                    + out.rows_not_written_at_deadline,
                 findings + tape + 1
             );
             proptest::prop_assert_eq!(writer.pending(), 0);
@@ -2810,6 +2969,10 @@ mod tests {
         finished: u64,
         /// The paused-clock instant of `first_start`.
         t0: tokio::time::Instant,
+        /// Times `on_first_skip` was called (§12.15.8, 51b review).
+        skip_notices: u32,
+        /// Seconds of day of the last skip notice.
+        notice_at: Option<u64>,
     }
 
     fn day() -> chrono::NaiveDate {
@@ -2830,6 +2993,8 @@ mod tests {
         let plans = std::cell::RefCell::new(Vec::new());
         let ends = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let sleeps = std::cell::Cell::new(0_u32);
+        let skip_notices = std::cell::Cell::new(0_u32);
+        let notice_at = std::cell::Cell::new(None);
         let result = drive_day(
             day(),
             config_budget,
@@ -2837,6 +3002,10 @@ mod tests {
             || {
                 sleeps.set(sleeps.get() + 1);
                 day_changes_after.is_none_or(|after| sleeps.get() <= after)
+            },
+            || {
+                skip_notices.set(skip_notices.get() + 1);
+                notice_at.set(Some(now()));
             },
             |plan: AttemptPlan| {
                 plans.borrow_mut().push(plan);
@@ -2862,6 +3031,8 @@ mod tests {
             ends,
             finished,
             t0,
+            skip_notices: skip_notices.get(),
+            notice_at: notice_at.get(),
         }
     }
 
@@ -2963,9 +3134,26 @@ mod tests {
             }
             previous_end = Some(end);
         }
+        // §12.15.8 (51b review): a first attempt with no time is reported at
+        // once, at the skip and before any wait, then retried ONCE at 17:45
+        // with the configured budget, as attempt 1 and the last.
+        let skipped_first = attempt_budget_secs(first_start, config).is_none();
+        assert_eq!(sim.skip_notices, u32::from(skipped_first));
+        if skipped_first {
+            assert_eq!(sim.notice_at, Some(first_start), "reported before the wait");
+            let evening = sim.plans.first().copied().expect("the 17:45 attempt ran");
+            assert_eq!(
+                evening.start_secs_of_day,
+                u64::from(SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST)
+            );
+            assert_eq!(evening.number, 1);
+            assert_eq!(evening.run_budget_secs, config);
+            assert!(evening.is_last);
+            assert_eq!(sim.plans.len(), 1);
+        }
         // A skipped attempt (no plan) is always the final, last one. With no
-        // attempt before it, the day ends `SkippedNoTime` (not paged);
-        // after a real failure, with that failure (paged).
+        // attempt before it, the day ends `SkippedNoTime`; after a real
+        // failure, with that failure.
         if sim.plans.len() < r.attempts as usize {
             assert_eq!(sim.plans.len() + 1, r.attempts as usize);
             if sim.plans.is_empty() {
@@ -3086,24 +3274,34 @@ mod tests {
     }
 
     /// A late boot catch-up: too little time skips the attempt without
-    /// calling it; a little more time shrinks the budget and the timeout
-    /// follows the shrunk budget; a configured budget below the floor runs.
+    /// calling it, reports the day at once and retries once at 17:45; a
+    /// little more time shrinks the budget and the timeout follows the shrunk
+    /// budget; a configured budget below the floor runs.
     #[tokio::test(start_paused = true)]
     async fn test_drive_day_late_start_shrinks_or_skips() {
         let fixed = attempt_max_secs(0);
         let last = XVERIFY_LAST_END_SECS_OF_DAY_IST;
+        let evening_start = u64::from(SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST);
         let skip_at = last - fixed - XVERIFY_MIN_ATTEMPT_BUDGET_SECS + 1;
         let skipped = simulate(skip_at, 600, |_, _| (Some(0), Ok(())), None).await;
-        assert!(skipped.plans.is_empty(), "a skipped attempt must not run");
+        assert_eq!(skipped.skip_notices, 1, "the day is reported at the skip");
+        assert_eq!(skipped.notice_at, Some(skip_at));
+        assert_eq!(skipped.plans.len(), 1, "only the 17:45 attempt runs");
+        assert_eq!(
+            skipped.plans.first().map(|p| p.start_secs_of_day),
+            Some(evening_start)
+        );
+        assert_eq!(skipped.plans.first().map(|p| p.run_budget_secs), Some(600));
         assert_eq!(skipped.result.attempts, 1);
-        assert_eq!(skipped.result.failure, Some(AttemptFailure::SkippedNoTime));
-        assert_eq!(skipped.finished, skip_at);
+        assert_eq!(skipped.result.failure, None);
+        assert_eq!(skipped.finished, evening_start);
 
         let shrink_at = last - fixed - 200;
         let shrunk = simulate(shrink_at, 600, |_, _| (None, Ok(())), None).await;
         assert_eq!(shrunk.plans.first().map(|p| p.run_budget_secs), Some(200));
         assert_eq!(shrunk.plans.first().map(|p| p.is_last), Some(true));
         assert_eq!(shrunk.result.failure, Some(AttemptFailure::Incomplete));
+        assert_eq!(shrunk.skip_notices, 0);
         assert_eq!(
             shrunk.finished, last,
             "the timeout follows the shrunk budget"
@@ -3120,7 +3318,7 @@ mod tests {
         assert_eq!(small.result.failure, None);
 
         // An evening boot after the stop window runs once, unshrunk.
-        let evening = u64::from(SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST) + 2_820;
+        let evening = evening_start + 2_820;
         let late = simulate(
             evening,
             600,
@@ -3131,65 +3329,173 @@ mod tests {
         assert_eq!(late.plans.first().map(|p| p.run_budget_secs), Some(600));
         assert_eq!(late.result.attempts, 1);
         assert_eq!(late.result.failure, Some(AttemptFailure::Vacuous));
+        assert_eq!(late.skip_notices, 0);
     }
 
-    /// §12.15.8: a skip with no attempt before it in this process is
-    /// `SkippedNoTime` (logged, not paged: a restart at 17:24 must not page a
-    /// day an earlier process already paged). A skip after a real failure in
-    /// this process (here forced by a clock jump during the retry sleep) ends
-    /// the day with THAT failure, so the page still fires.
+    /// §12.15.8 (51b review): the finding's scenario. A Saturday special
+    /// session, the process restarted at 17:30 with no stop cron. The day is
+    /// reported at once (before the wait, which a weekday stop would cut),
+    /// then verified at 17:45 instead of being given up until the next day.
+    /// Every skip start in the window behaves the same; the 17:45 attempt's
+    /// own failure is the day's failure.
     #[tokio::test(start_paused = true)]
-    async fn test_drive_day_skip_pages_only_after_an_attempt_that_ran() {
-        for start in [62_645_u64, 62_580, XVERIFY_LAST_END_SECS_OF_DAY_IST - 300] {
-            let first = drive_day(
-                day(),
+    async fn test_drive_day_skip_reports_at_once_then_retries_once_at_the_window_end() {
+        let evening = u64::from(SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST);
+        for start in [
+            XVERIFY_LAST_END_SECS_OF_DAY_IST - attempt_max_secs(0) - 119,
+            XVERIFY_LAST_END_SECS_OF_DAY_IST - 300,
+            62_580,
+            62_645,
+            63_000,
+            evening - 1,
+        ] {
+            let ok = simulate(start, 600, |_, _| (Some(30), Ok(())), None).await;
+            assert_eq!(ok.skip_notices, 1, "start {start}");
+            assert_eq!(ok.notice_at, Some(start), "start {start}");
+            assert_eq!(ok.result.failure, None, "start {start}");
+            assert_eq!(ok.result.attempts, 1);
+            assert_eq!(ok.finished, evening + 30);
+            let failed = simulate(
+                start,
                 600,
-                || start,
-                || true,
-                |_plan: AttemptPlan| async { Ok(()) },
+                |_, _| (Some(0), Err(AttemptFailure::Vacuous)),
+                None,
             )
             .await;
-            assert_eq!(first.attempts, 1);
-            assert_eq!(
-                first.failure,
-                Some(AttemptFailure::SkippedNoTime),
-                "start {start}"
-            );
+            assert_eq!(failed.skip_notices, 1);
+            assert_eq!(failed.result.failure, Some(AttemptFailure::Vacuous));
+            assert_eq!(failed.plans.len(), 1, "one evening attempt, never more");
+            assert!(failed.plans.iter().all(|p| p.is_last));
         }
+        // A clock that never reaches 17:45 (nonsense, but bounded): the loop
+        // waits once, skips again and ends `SkippedNoTime`; nothing ran.
+        let ran = std::cell::Cell::new(0_u32);
+        let notices = std::cell::Cell::new(0_u32);
+        let stuck = drive_day(
+            day(),
+            600,
+            || 62_645,
+            || true,
+            || notices.set(notices.get() + 1),
+            |_plan: AttemptPlan| {
+                ran.set(ran.get() + 1);
+                async { Ok(()) }
+            },
+        )
+        .await;
+        assert_eq!(ran.get(), 0);
+        assert_eq!(notices.get(), 1, "the evening wait happens at most once");
+        assert_eq!(stuck.attempts, 1);
+        assert_eq!(stuck.failure, Some(AttemptFailure::SkippedNoTime));
+        assert!(!stuck.day_changed);
+        // The day changes during the evening wait: no attempt, no report.
+        let gone = simulate(62_645, 600, |_, _| (Some(0), Ok(())), Some(0)).await;
+        assert!(gone.result.day_changed);
+        assert!(gone.plans.is_empty());
+        assert_eq!(gone.skip_notices, 1);
+        // A skip after a real failure in this process (forced by a clock jump
+        // during the retry sleep) ends the day with THAT failure: no notice,
+        // no evening wait.
         let readings = std::cell::Cell::new(0_u32);
         let jumping = || {
             readings.set(readings.get() + 1);
             if readings.get() == 1 { 56_460 } else { 62_500 }
         };
-        let ran = std::cell::Cell::new(0_u32);
+        let after_failure_ran = std::cell::Cell::new(0_u32);
+        let after_failure_notices = std::cell::Cell::new(0_u32);
         let after_failure = drive_day(
             day(),
             600,
             jumping,
             || true,
+            || after_failure_notices.set(after_failure_notices.get() + 1),
             |_plan: AttemptPlan| {
-                ran.set(ran.get() + 1);
+                after_failure_ran.set(after_failure_ran.get() + 1);
                 async { Err(AttemptFailure::RunFailed) }
             },
         )
         .await;
-        assert_eq!(ran.get(), 1, "the second attempt was skipped, not run");
+        assert_eq!(after_failure_ran.get(), 1, "the second attempt was skipped");
+        assert_eq!(after_failure_notices.get(), 0);
         assert_eq!(after_failure.attempts, 2);
         assert_eq!(after_failure.failure, Some(AttemptFailure::RunFailed));
     }
 
-    /// The skipped day's final report is a coded `warn!`, not a page.
+    /// §12.15.8 (51b review): one page per IST day across processes. With no
+    /// page today every final failure pages, `SkippedNoTime` included (before
+    /// the review it only logged, on the unchecked belief that an earlier
+    /// process had paged); with today's paged marker present none does.
     #[test]
-    fn test_skipped_day_is_logged_not_paged() {
-        let body = fn_body(prod_src(), "fn report_final_failure(");
-        let arm = body
+    fn test_report_final_failure_pages_unless_today_was_already_paged() {
+        for failure in [
+            AttemptFailure::NoToken,
+            AttemptFailure::RunFailed,
+            AttemptFailure::Vacuous,
+            AttemptFailure::NotPersisted,
+            AttemptFailure::Incomplete,
+            AttemptFailure::MarkerNotWritten,
+            AttemptFailure::AuditRowsLost,
+            AttemptFailure::SkippedNoTime,
+        ] {
+            assert!(
+                report_final_failure(failure, day(), 1, 10, false),
+                "{failure:?} must page when nobody was told today"
+            );
+            assert!(
+                !report_final_failure(failure, day(), 1, 10, true),
+                "{failure:?} must not page twice in a day"
+            );
+        }
+    }
+
+    /// The emit side of the rule above: the unpaged `SkippedNoTime` arm is an
+    /// `error!` on the alarmed `xverify_failed` source; the already-paged
+    /// branch is coded `warn!`s only; the wrapper reads and writes the paged
+    /// marker around it; `run_day` reports only through the wrapper, at the
+    /// skip and after the loop; the paged marker cannot collide with the
+    /// day marker the S3 gate reads, nor be swept by its sweep.
+    #[test]
+    fn test_skipped_day_pages_unless_paged_and_the_paged_marker_is_wired() {
+        let prod = prod_src();
+        let body = fn_body(prod, "fn report_final_failure(");
+        let paged_at = body.find("if paged_today {").expect("paged branch");
+        let match_at = body.find("match failure {").expect("page arms");
+        assert!(paged_at < match_at, "the paged check comes first");
+        let paged_branch = &body[paged_at..match_at];
+        assert!(!paged_branch.contains("error!("));
+        assert!(paged_branch.contains("source = \"xverify_day_not_attempted\""));
+        assert!(paged_branch.contains("source = \"xverify_already_paged_today\""));
+        assert!(paged_branch.contains("return false;"));
+        let arms = &body[match_at..];
+        let arm = arms
             .split("AttemptFailure::SkippedNoTime => ")
             .nth(1)
             .expect("report_final_failure must name SkippedNoTime");
         let arm = &arm[..arm.find("AttemptFailure::Vacuous =>").unwrap_or(arm.len())];
-        assert!(arm.starts_with("warn!("), "{arm}");
-        assert!(arm.contains("source = \"xverify_day_not_attempted\""));
-        assert!(!arm.contains("xverify_failed"));
+        assert!(arm.starts_with("error!("), "{arm}");
+        assert!(arm.contains("source = \"xverify_failed\""));
+        assert!(arm.contains("code = ErrorCode::WsGapConnectionState.code_str()"));
+        let wrapper = fn_body(prod, "fn page_final_failure_once(");
+        let read_at = wrapper
+            .find("daily_marker_exists(CROSSVERIFY_PAGED_MARKER_TASK, today)")
+            .expect("reads today's paged marker");
+        let report_at = wrapper
+            .find("report_final_failure(failure, today, attempts, targets, paged_today)")
+            .expect("reports with it");
+        let write_at = wrapper
+            .find("try_write_daily_marker(CROSSVERIFY_PAGED_MARKER_TASK, today)")
+            .expect("writes the paged marker");
+        assert!(read_at < report_at && report_at < write_at);
+        assert!(wrapper.contains("source = \"xverify_paged_marker_write_failed\""));
+        let run_day = fn_body(prod, "async fn run_day(");
+        assert_eq!(run_day.matches("page_final_failure_once(").count(), 2);
+        assert!(run_day.contains(
+            "|| page_final_failure_once(AttemptFailure::SkippedNoTime, today, 0, targets.len())"
+        ));
+        assert_eq!(prod.matches("report_final_failure(failure").count(), 1);
+        assert_ne!(CROSSVERIFY_PAGED_MARKER_TASK, CROSSVERIFY_MARKER_TASK);
+        assert!(!CROSSVERIFY_PAGED_MARKER_TASK.starts_with(&format!("{CROSSVERIFY_MARKER_TASK}-")));
+        assert!(!CROSSVERIFY_MARKER_TASK.starts_with(&format!("{CROSSVERIFY_PAGED_MARKER_TASK}-")));
     }
 
     /// The day changing during a retry sleep stops the loop without a page.
@@ -3296,11 +3602,54 @@ mod tests {
         assert!(!run_day.contains("now_ist_secs_of_day()"));
     }
 
+    /// Every `.tf` file under `deploy/aws/terraform`, concatenated. Every
+    /// CloudWatch alarm and log metric filter lives there (the error-code
+    /// filters, the §2.9 and §2.10 `/metrics` loss filters, and the rest), so
+    /// a name absent from all of them cannot page.
+    fn all_terraform() -> String {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/aws/terraform");
+        let mut paths: Vec<_> = std::fs::read_dir(&dir)
+            .expect("terraform dir")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "tf"))
+            .collect();
+        paths.sort();
+        assert!(
+            paths.len() > 10,
+            "terraform scan found only {} files",
+            paths.len()
+        );
+        paths
+            .iter()
+            .map(|p| std::fs::read_to_string(p).expect("read tf"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The string value of `const <ident>: &str = "..."` in `src`.
+    fn const_value<'a>(src: &'a str, ident: &str) -> &'a str {
+        let decl = format!("const {ident}: &str =");
+        let after = src
+            .split(decl.as_str())
+            .nth(1)
+            .unwrap_or_else(|| panic!("no declaration of {ident}"));
+        let open = after.find('"').expect("opening quote");
+        let rest = &after[open + 1..];
+        &rest[..rest.find('"').expect("closing quote")]
+    }
+
     /// The new lines are coded `warn!`s on sources no alarm filter matches.
+    /// Paging can also come from what the line's branch COUNTS (a §2.10
+    /// `/metrics` filter turns a counter into a page), so for the two
+    /// deliberate deadline stops this also checks every counter the branch
+    /// increments, directly or through a writer method, against every
+    /// terraform file (51b review: the first version read one file and gave a
+    /// false OK while both stops paged `audit-rows-lost`).
     #[test]
     fn test_time_bound_sources_are_coded_and_match_no_alarm_filter() {
         let prod = prod_src();
-        let tf = include_str!("../../../deploy/aws/terraform/error-code-alarms.tf");
+        let tf = all_terraform();
         for source in [
             "xverify_attempt_timed_out",
             "xverify_attempt_skipped_no_time",
@@ -3308,6 +3657,8 @@ mod tests {
             "xverify_persist_stopped_at_deadline",
             "xverify_options_persist_stopped_at_deadline",
             "xverify_day_not_attempted",
+            "xverify_already_paged_today",
+            "xverify_paged_marker_write_failed",
         ] {
             let emit = format!("source = \"{source}\"");
             let at = prod
@@ -3325,6 +3676,86 @@ mod tests {
             );
             assert!(!tf.contains(source), "{source} must stay log-sink-only");
         }
+
+        // The writer methods a branch may call, and the counter each bumps,
+        // pinned against the storage source so the table cannot drift.
+        let storage = include_str!("../../storage/src/dhan_live_crossverify_persistence.rs");
+        let discard_body = storage
+            .split("fn discard_pending(")
+            .nth(1)
+            .and_then(|s| s.split("\n    }\n").next())
+            .expect("discard_pending");
+        assert!(discard_body.contains("\"tv_dhan_live_xverify_audit_rows_discarded_total\""));
+        let abandon_body = storage
+            .split("fn abandon_pending(")
+            .nth(1)
+            .and_then(|s| s.split("\n    }\n").next())
+            .expect("abandon_pending");
+        assert!(abandon_body.contains("DHAN_LIVE_XVERIFY_AUDIT_ROWS_ABANDONED_COUNTER"));
+        let abandoned = const_value(storage, "DHAN_LIVE_XVERIFY_AUDIT_ROWS_ABANDONED_COUNTER");
+
+        // The scan must see the loss filters at all: the paging counters ARE
+        // in them, so a broken scan cannot pass vacuously.
+        for paging in [
+            const_value(prod, "XVERIFY_PERSIST_ERRORS_COUNTER"),
+            "tv_dhan_live_xverify_audit_rows_discarded_total",
+        ] {
+            assert!(tf.contains(paging), "{paging} is expected in a loss filter");
+        }
+
+        let report_into = fn_body(prod, "fn persist_report_into(");
+        let finish = fn_body(prod, "fn finish_persist(");
+        let options = fn_body(prod, "fn persist_option_findings_into(");
+        let slice = |body: &'static str, from: &str, to: &str| -> &'static str {
+            let at = body.find(from).unwrap_or_else(|| panic!("no {from}"));
+            let rest = &body[at..];
+            &rest[..rest.find(to).unwrap_or_else(|| panic!("no {to}")) + to.len()]
+        };
+        let branches = [
+            slice(report_into, "let stop_at_deadline =", "};"),
+            slice(finish, "if out.deadline_reached {", "return out;"),
+            slice(
+                options,
+                "if stopped || !flush_fits(writer, now(), deadline) {",
+                "return OptionPersist::StoppedAtDeadline;",
+            ),
+        ];
+        let mut counted = Vec::new();
+        for branch in branches {
+            for forbidden in ["discard_pending(", ".flush()", "flush_if_large("] {
+                assert!(
+                    !branch.contains(forbidden),
+                    "a deadline stop must not call {forbidden}: it bumps a paging counter"
+                );
+            }
+            if branch.contains("abandon_pending()") {
+                counted.push(abandoned.to_string());
+            }
+            for (at, _) in branch.match_indices("metrics::counter!(") {
+                let arg = branch[at + "metrics::counter!(".len()..].trim_start();
+                let name = if let Some(lit) = arg.strip_prefix('"') {
+                    lit[..lit.find('"').expect("closing quote")].to_string()
+                } else {
+                    let end = arg
+                        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                        .unwrap_or(arg.len());
+                    const_value(prod, &arg[..end]).to_string()
+                };
+                counted.push(name);
+            }
+        }
+        assert!(counted.contains(&abandoned.to_string()));
+        assert!(
+            counted
+                .contains(&const_value(prod, "XVERIFY_PERSIST_DEADLINE_STOPS_COUNTER").to_string())
+        );
+        for name in &counted {
+            assert!(
+                !tf.contains(name.as_str()),
+                "a deliberate deadline stop counts on {name}, which a terraform \
+                 alarm or filter reads: it would page per attempt"
+            );
+        }
     }
 
     /// The retry loop must use the pure bound and page only after it, and
@@ -3337,8 +3768,9 @@ mod tests {
         assert!(drive.contains("attempt_is_last("));
         assert!(drive.contains("XVERIFY_RETRY_INTERVAL_SECS"));
         assert!(!drive.contains("report_final_failure("));
+        assert!(!drive.contains("page_final_failure_once("));
         let body = fn_body(prod, "async fn run_day(");
-        assert!(body.contains("report_final_failure("));
+        assert!(body.contains("page_final_failure_once("));
         assert!(body.contains("divergence_paged"));
         let run_once = fn_body(prod, "async fn run_once(");
         for alarmed in ["\"xverify_failed\"", "\"xverify_vacuous\""] {
@@ -3599,7 +4031,7 @@ mod tests {
     fn test_run_option_pass_runs_after_the_spot_retry_loop_ends() {
         let body = fn_body(prod_src(), "async fn run_day(");
         let call = body.find("run_option_pass(deps, today, day_start_ist_nanos");
-        let loop_end = body.find("report_final_failure(");
+        let loop_end = body.rfind("page_final_failure_once(failure");
         assert!(call.is_some(), "run_day must call run_option_pass");
         assert!(loop_end.is_some() && body.contains("drive_day("));
         assert!(
