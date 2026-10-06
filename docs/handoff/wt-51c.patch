@@ -1,3 +1,20 @@
+diff --git a/.claude/plans/active-plan-feed-hardening.md b/.claude/plans/active-plan-feed-hardening.md
+index 06563d5aa..191b7defe 100644
+--- a/.claude/plans/active-plan-feed-hardening.md
++++ b/.claude/plans/active-plan-feed-hardening.md
+@@ -6364,9 +6364,9 @@ Approved by Parthiban 2026-10-06: "Go ahead with whatever you want dude" and "Se
+ - [x] 51b — **Attempt time bounds: every attempt ends before the 17:25 scheduled-stop window.** Each attempt runs under `tokio::time::timeout` with an end bound of 17:23 (62,580 s), the retry interval moves 900 → 760 s so four worst-case attempts still fit (56,460 + 960 + 3 × 1,720 = 62,580), and a late attempt runs with a shrunk budget instead of past the stop. The last attempt is decided once, before it starts (`attempt_is_last`, from start + `attempt_max_secs`), and a marker-only attempt uses the same rule; the day loop is `drive_day`, with the clock, the day check and the attempt injected. A late attempt below 120 s is skipped (`xverify_attempt_skipped_no_time`); a manual evening boot at or after 17:50 runs once, unshrunk. The option pass runs under its own timeout (`timed_out` label). The timeout cannot cut the synchronous audit persist after the last `.await`, so the persist stops itself at the timeout's own instant: before each row it checks that a flush of the buffer would end by then in the ILP client's worst case (`DhanLiveXverifyAuditWriter::flush_worst_case`: 5 s + bytes at 102,400 B/s, both now written into the writer's conf), and otherwise abandons what is left (`DhanLiveXverifyAuditWriter::abandon_pending`, counted on the local-only `tv_dhan_live_xverify_audit_rows_abandoned_total` and `tv_dhan_xverify_persist_deadline_stops_total{pass}`, never on a §2.10 loss-group counter, which would page `audit-rows-lost` per attempt) and fails `not_persisted` (`xverify_persist_stopped_at_deadline`); the option persist does the same (`xverify_options_persist_stopped_at_deadline`); the marker is not written past the deadline. A day whose only attempt in this process is skipped for time is reported at once and then retried ONCE at 17:50 (`XVERIFY_EVENING_START_SECS_OF_DAY_IST`: the 17:45 start-watchdog `stop_check` plus 300 s, the 17:45 pinned to its terraform cron) if the process is still up: a box started by hand after 17:30 or a weekend special session no longer loses the day, and the attempt never starts on a weekday box launched before 17:30, which the `stop_check` (keep-alive ignored) or the hourly curfew stops during the wait. The day is paged once across processes through a same-day paged marker (`dhan_live_crossverify_paged`): a skipped day pages `xverify_failed` (`reason = "skipped_no_time"`) unless the marker shows a page already went out (then `xverify_day_not_attempted`), and a later final failure while it exists logs `xverify_already_paged_today` instead of paging again; a skip after a real failure still pages that failure.
+   - Files: crates/app/src/dhan_live_crossverify_boot.rs, crates/storage/src/dhan_live_crossverify_persistence.rs, docs/claude-rules-full/project/no-rest-except-live-feed-2026-06-27.md, .claude/rules/project/no-rest-except-live-feed-2026-06-27.md, docs/claude-rules-full/project/dhan-rest-only-noise-lock-2026-07-14.md, docs/error-runbooks/dhan-live-crossverify-error-codes.md
+   - Tests: test_deadline_and_last_end_derive_from_the_scheduled_stop_window, test_default_run_budget_mirror_matches_the_config_default, test_worst_case_day_fits_every_attempt_before_the_last_end, test_retry_delay_secs_bounds, test_option_pass_fits_bounds_on_last_end, test_attempt_budget_secs_shrinks_then_refuses, test_attempt_budget_secs_every_second_of_the_day, is_last_is_decided_once_from_start_plus_attempt_max, proptest_is_last_never_strands_a_retry, test_drive_day_every_start_second_ends_by_the_last_end, test_drive_day_worst_case_hangs_end_exactly_at_the_last_end, test_drive_day_marker_only_attempt_as_the_last, test_drive_day_late_start_shrinks_or_skips, test_drive_day_day_change_stops_retrying, test_bounded_attempt_keeps_a_result_finished_synchronously_past_the_limit, test_bounded_attempt_times_out_as_incomplete_at_the_limit, test_every_attempt_start_consults_attempt_budget_secs_and_is_wrapped_in_timeout, test_time_bound_sources_are_coded_and_match_no_alarm_filter, test_run_day_retries_through_the_pure_bound, test_every_xverify_alarm_source_has_a_live_error_emit, test_persist_report_into_writes_nothing_past_the_deadline, test_persist_report_into_stops_at_the_first_flush_that_cannot_end_by_the_deadline, test_persist_report_into_never_acts_without_room_before_the_deadline, test_persist_option_findings_into_stops_at_the_deadline, test_drive_day_skip_reports_at_once_then_retries_once_after_the_stop_check, test_evening_start_follows_the_start_watchdog_stop_check_and_curfew, test_report_final_failure_pages_unless_today_was_already_paged, test_skipped_day_pages_unless_paged_and_the_paged_marker_is_wired, test_marker_write_needs_a_complete_run, abandon_pending_returns_the_dropped_count_clears_and_never_counts_as_discarded, test_flush_worst_case_is_timeout_plus_bytes_at_min_throughput, ilp_conf_targets_the_configured_questdb_http_port, test_persist_report_into_stops_on_the_bytes_term_of_the_worst_case, test_marker_step_refuses_the_marker_past_the_deadline, test_drive_day_evening_attempt_survives_a_wall_clock_stepped_back, test_drive_day_evening_attempt_with_a_huge_budget_does_not_panic, test_option_pass_refuses_a_changed_day, test_runbook_skip_rows_agree_with_the_evening_attempt
+-- [ ] 51c — **Verdict and late window: a degraded run no longer hides a real divergence, and the excused end-of-day window is derived, not a literal.** The tail excuse comes from the seal constants (`LATE_SEAL_WINDOW_MINUTES`, five minutes), an `Excuse` carries why a minute was not judged, and outside the excused window a failed vendor fetch can only add `missing_rest`.
+-  - Files: crates/app/src/dhan_live_crossverify.rs, crates/app/src/dhan_live_crossverify_boot.rs
+-  - Tests: named in that PR (Partial never masks Diverged; the excused window equals the derived constant)
++- [x] 51c — **Verdict and late window: a degraded run no longer hides a real divergence, and the excused end-of-day window is derived, not a literal.** The tail excuse comes from the seal constants (`LATE_SEAL_WINDOW_MINUTES` = (`CATCHUP_LATENESS_MARGIN_SECS` + 60) / 60 rounded up, five minutes; `TAIL_UNSEALED_MINUTES` deleted), and outside the excused window a failed vendor fetch can only add `missing_rest`. The verdict is `decide_outcome` over `VerdictInputs { rest_incomplete, missing: MissingJudgeable, late: LateWindowPolicy }`: a price difference or a judged missing traded/index minute is `diverged` whatever else happened; a failed fetch or spent budget, a truncated live read (`missing_live_unjudged`), a REST hole or an excused late minute (`late_excused`) holds the day at `partial`, never `clean`; the vacuous outcomes are unchanged. Production judges with `Excuse { sealed_through: None }` until 51d. Daily table gains `late_excused`, `missing_live_unjudged`, `missing_judgeable` (ALTER self-heal, DEDUP unchanged); `tail_unsealed` kept and written 0. Rule §12.15.9 first.
++  - Files: crates/app/src/dhan_live_crossverify.rs, crates/app/src/dhan_live_crossverify_boot.rs, crates/app/src/dhan_feed_stack.rs, crates/storage/src/dhan_live_crossverify_persistence.rs, docs/claude-rules-full/project/no-rest-except-live-feed-2026-06-27.md, .claude/rules/project/no-rest-except-live-feed-2026-06-27.md, docs/error-runbooks/dhan-live-crossverify-error-codes.md
++  - Tests: a_failed_fetch_no_longer_hides_a_real_divergence, a_rest_incomplete_run_with_no_finding_is_partial_never_clean, a_truncated_live_read_never_judges_missing_minutes_but_still_flags_price_divergence, late_seal_window_minutes_is_derived_from_the_catch_up_margin, is_late_window_minute_with_known_sealed_through_excuses_only_buckets_ending_after_it, is_late_window_minute_with_none_excuses_the_last_window, strict_policy_counts_a_missing_1539_traded_minute_as_real_diverged, missing_live_late_counts_traded_and_index_minutes_only, excuse_downgrades_clean_to_partial_only_when_late_excused_gt_zero_never_upgrades_degraded_or_diverged, the_late_window_reaches_neither_half_of_the_traded_split_under_excuse, decide_outcome_matches_the_oracle_on_every_permutation, compare_day_in_scope_every_piece_under_every_input, a_sealed_through_value_at_every_minute_of_the_last_10, verdict_inputs_for_run_maps_every_observation, daily_row_carries_the_late_and_unjudged_counts, summary_line_names_minutes_not_yet_judged, proptest_verdict_is_never_clean_when_anything_is_incomplete_excused_or_unjudged, compare_day_degraded_downgrades_clean_to_partial_never_up, late_excused_and_unjudged_columns_self_heal_and_dedup_keys_unchanged
+ - [ ] 51d — **Readiness before the read: the seal sweep, the seal writer and QuestDB have caught up to the close.** A static `CATCHUP_PROGRESS` publishes each completed sweep's floor cutoff (an overrun never raises it); the seal writer's drained sample and today's staged spill files are checked; `fetch_wal_tables` moves to `wal_suspension_watcher` with a new `wal_applied_through`. Earlier attempts retry before any vendor call; the last attempt proceeds with the late minutes unjudged and never pages on them.
+   - Files: crates/app/src/dhan_live_crossverify_boot.rs, crates/app/src/dhan_feed_stack.rs, crates/storage/src/wal_suspension_watcher.rs, crates/storage/src/partition_archive.rs
+   - Tests: named in that PR (an overrun never raises the published floor; not-ready retries before any REST call)
 diff --git a/.claude/rules/project/no-rest-except-live-feed-2026-06-27.md b/.claude/rules/project/no-rest-except-live-feed-2026-06-27.md
 index c4ac256d4..8c24c52d3 100644
 --- a/.claude/rules/project/no-rest-except-live-feed-2026-06-27.md
@@ -12,10 +29,10 @@ index c4ac256d4..8c24c52d3 100644
  - Removes the AUTH REST calls or the token minter, or the daily master CSV / niftyindices constituent fetch.
 diff --git a/crates/app/proptest-regressions/dhan_live_crossverify.txt b/crates/app/proptest-regressions/dhan_live_crossverify.txt
 new file mode 100644
-index 000000000..415696c5b
+index 000000000..05554612b
 --- /dev/null
 +++ b/crates/app/proptest-regressions/dhan_live_crossverify.txt
-@@ -0,0 +1,7 @@
+@@ -0,0 +1,8 @@
 +# Seeds for failure cases proptest has generated in the past. It is
 +# automatically read and these particular cases re-run before any
 +# novel cases are generated.
@@ -23,6 +40,7 @@ index 000000000..415696c5b
 +# It is recommended to check this file in to source control so that
 +# everyone who runs the test benefits from these saved cases.
 +cc e5552592a5e8365b5ddb268ce6e7a7beb5607843789cdb26788b9269df4eb09b # shrinks to mins = [(0, 0, 3)], rest_incomplete = false, truncated = true, policy_ix = 0
++cc 710a8fc28d8ce34ebdcd682f8822369c264a178560953d49e4433676de12e8d7 # shrinks to mins = [(0, 0, 3)], rest_incomplete = true, truncated = false, policy_ix = 0
 diff --git a/crates/app/src/dhan_feed_stack.rs b/crates/app/src/dhan_feed_stack.rs
 index e288e84dd..2f7c38597 100644
 --- a/crates/app/src/dhan_feed_stack.rs
@@ -47,7 +65,7 @@ index e288e84dd..2f7c38597 100644
  /// How often the lane asks the gap detector what it has recorded.
  ///
 diff --git a/crates/app/src/dhan_live_crossverify.rs b/crates/app/src/dhan_live_crossverify.rs
-index 556b03f10..970af5e94 100644
+index 556b03f10..7dfb95824 100644
 --- a/crates/app/src/dhan_live_crossverify.rs
 +++ b/crates/app/src/dhan_live_crossverify.rs
 @@ -49,8 +49,11 @@
@@ -217,7 +235,7 @@ index 556b03f10..970af5e94 100644
 +    if c.minutes_compared > 0 {
 +        let real = c.cells_diverged > 0
 +            || (judged && (c.missing_live_traded > 0 || c.missing_live_index > 0));
-+                                                                                                          if real {
++        if real {
 +            DhanLiveXverifyOutcome::Diverged
 +        } else if inputs.rest_incomplete
 +            || !judged
@@ -565,7 +583,28 @@ index 556b03f10..970af5e94 100644
          ),
          DhanLiveXverifyOutcome::NoData => "⚠️ Dhan live-vs-official check found no data on \
               either side today — nothing was compared, so nothing is proven."
-@@ -1949,6 +2188,10 @@ pub async fn run_cross_verification(
+@@ -1179,13 +1418,17 @@ pub fn format_summary_line(cmp: &DayComparison) -> String {
+         DhanLiveXverifyOutcome::Partial | DhanLiveXverifyOutcome::Diverged => format!(
+             "⚠️ Dhan live-vs-official check: {} minute(s) compared, {} price \
+              difference(s), {} minute(s) we never received, {} minute(s) only \
+-             we had. Typical difference ₹{:.2}, worst ₹{:.2}. Neither side is \
+-             the official truth on its own — compare against previous days \
+-             before acting.",
++             we had, {} minute(s) not yet judged. Typical difference ₹{:.2}, \
++             worst ₹{:.2}. Neither side is the official truth on its own — \
++             compare against previous days before acting.",
+             cmp.minutes_compared,
+             cmp.cells_diverged,
+             cmp.missing_live,
+             cmp.missing_rest,
++            // §12.15.9: excused late minutes and minutes a cut-short read
++            // could not judge; either holds the day at `partial`, so the
++            // line must name them or a partial day reads as all zeros.
++            cmp.late_excused.saturating_add(cmp.missing_live_unjudged),
+             rupees(cmp.noise_p50_paise),
+             rupees(cmp.noise_max_paise),
+         ),
+@@ -1949,6 +2192,10 @@ pub async fn run_cross_verification(
      }
  
      let degraded = truncated || budget_elapsed || rest_failures > 0;
@@ -576,7 +615,7 @@ index 556b03f10..970af5e94 100644
      let run_ts = deterministic_run_ts_nanos(day_start_ist_nanos);
      // The scope set: exactly what this run ASKED the vendor for. A live
      // instrument outside it was never requested, so calling its minutes
-@@ -1966,7 +2209,7 @@ pub async fn run_cross_verification(
+@@ -1966,7 +2213,7 @@ pub async fn run_cross_verification(
          day_start_ist_nanos,
          run_ts,
          cfg.tolerance_paise,
@@ -585,7 +624,7 @@ index 556b03f10..970af5e94 100644
      );
  
      if rest_failures > 0 {
-@@ -2035,10 +2278,21 @@ mod tests {
+@@ -2035,10 +2282,21 @@ mod tests {
              day_start_ist_nanos,
              run_ts_ist_nanos,
              tolerance_paise,
@@ -608,7 +647,7 @@ index 556b03f10..970af5e94 100644
      fn bar(o: f64, h: f64, l: f64, c: f64) -> PaiseBar {
          PaiseBar::from_rupees(o, h, l, c, 100).expect("finite")
      }
-@@ -2551,32 +2805,64 @@ mod tests {
+@@ -2551,32 +2809,64 @@ mod tests {
          );
          assert!(!cmp.outcome.is_pass());
      }
@@ -689,7 +728,7 @@ index 556b03f10..970af5e94 100644
          assert_eq!(cmp.missing_live, 1);
      }
  
-@@ -2620,23 +2906,40 @@ mod tests {
+@@ -2620,23 +2910,40 @@ mod tests {
          );
      }
  
@@ -744,7 +783,7 @@ index 556b03f10..970af5e94 100644
      }
  
      #[test]
-@@ -2712,6 +3015,10 @@ mod tests {
+@@ -2712,6 +3019,10 @@ mod tests {
          assert_eq!(cmp.outcome, DhanLiveXverifyOutcome::Blind);
      }
  
@@ -755,7 +794,7 @@ index 556b03f10..970af5e94 100644
      #[test]
      fn compare_day_degraded_downgrades_clean_to_partial_never_up() {
          let b = bar(100.0, 101.0, 99.0, 100.5);
-@@ -2721,6 +3028,10 @@ mod tests {
+@@ -2721,6 +3032,10 @@ mod tests {
          assert_eq!(cmp.outcome, DhanLiveXverifyOutcome::Partial);
          assert!(!cmp.outcome.is_pass(), "a degraded run is never a pass");
          assert!(cmp.outcome.is_measured(), "but it did compare something");
@@ -766,7 +805,7 @@ index 556b03f10..970af5e94 100644
      }
  
      // =======================================================================
-@@ -3891,7 +4202,7 @@ mod tests {
+@@ -3891,7 +4206,7 @@ mod tests {
              DAY_START_NANOS,
              RUN_TS,
              0,
@@ -775,7 +814,7 @@ index 556b03f10..970af5e94 100644
          );
          assert_eq!(
              cmp.missing_rest, 0,
-@@ -3920,7 +4231,7 @@ mod tests {
+@@ -3920,7 +4235,7 @@ mod tests {
              DAY_START_NANOS,
              RUN_TS,
              0,
@@ -784,7 +823,7 @@ index 556b03f10..970af5e94 100644
          );
          assert_eq!(
              cmp.instruments, 1,
-@@ -3942,7 +4253,7 @@ mod tests {
+@@ -3942,7 +4257,7 @@ mod tests {
              DAY_START_NANOS,
              RUN_TS,
              0,
@@ -793,7 +832,7 @@ index 556b03f10..970af5e94 100644
          );
          assert_eq!(
              cmp.missing_rest, 1,
-@@ -3963,7 +4274,7 @@ mod tests {
+@@ -3963,7 +4278,7 @@ mod tests {
              DAY_START_NANOS,
              RUN_TS,
              0,
@@ -802,7 +841,7 @@ index 556b03f10..970af5e94 100644
          );
          assert_eq!(cmp.missing_rest, 1, "an empty scope filters nothing");
      }
-@@ -3981,7 +4292,7 @@ mod tests {
+@@ -3981,7 +4296,7 @@ mod tests {
              DAY_START_NANOS,
              RUN_TS,
              0,
@@ -811,7 +850,7 @@ index 556b03f10..970af5e94 100644
          );
          assert_eq!(
              cmp.instruments, 0,
-@@ -3998,7 +4309,15 @@ mod tests {
+@@ -3998,7 +4313,15 @@ mod tests {
              live.push(side(id, OPEN, bar(100.0, 101.0, 99.0, 100.5)));
          }
          let scope = scope_of(&[(0, "IDX_I"), (1, "IDX_I"), (2, "IDX_I")]);
@@ -828,7 +867,7 @@ index 556b03f10..970af5e94 100644
          assert_eq!(
              cmp.missing_rest, 3,
              "3 targeted instruments produce 3 findings — not 200. That ratio \
-@@ -4101,4 +4420,617 @@ mod tests {
+@@ -4101,4 +4424,638 @@ mod tests {
          assert_eq!(cmp.minutes_compared, 1, "prices are still compared");
          assert_eq!(cmp.volume_cells, 0, "09:15 volume is not scored");
      }
@@ -1002,7 +1041,8 @@ index 556b03f10..970af5e94 100644
 +        );
 +        assert!(code.iter().all(|l| !l.contains(old_fn)));
 +        assert!(
-+            code.iter().any(|l| l.contains("CATCHUP_LATENESS_MARGIN_SECS + 60")),
++            code.iter()
++                .any(|l| l.contains("CATCHUP_LATENESS_MARGIN_SECS + 60")),
 +            "the window is derived from the catch-up margin"
 +        );
 +    }
@@ -1375,6 +1415,26 @@ index 556b03f10..970af5e94 100644
 +        assert!(body.contains("verdict_inputs_for_run(budget_elapsed, rest_failures, truncated)"));
 +    }
 +
++    /// A day held at `partial` only by an excused late minute must not read
++    /// as all zeros: the summary line names the minutes not yet judged.
++    #[test]
++    fn summary_line_names_minutes_not_yet_judged() {
++        let live = vec![eq_bar(1, OPEN, 500)];
++        let rest = vec![
++            eq_bar(1, OPEN, 500),
++            eq_bar(1, SESSION_CLOSE_SECS_OF_DAY_IST - 60, 9),
++        ];
++        let cmp = unscoped(&live, &rest, excuse_inputs(None));
++        assert_eq!(cmp.outcome, DhanLiveXverifyOutcome::Partial);
++        let line = format_summary_line(&cmp);
++        assert!(line.contains("1 minute(s) not yet judged"), "{line}");
++        let cmp = unscoped(&live, &rest, verdict_inputs_for_run(false, 0, true));
++        assert!(format_summary_line(&cmp).contains("1 minute(s) not yet judged"));
++        let cmp = unscoped(&live, &rest, strict_inputs(false));
++        assert_eq!(cmp.outcome, DhanLiveXverifyOutcome::Diverged);
++        assert!(format_summary_line(&cmp).contains("0 minute(s) not yet judged"));
++    }
++
 +    #[test]
 +    fn daily_row_carries_the_late_and_unjudged_counts() {
 +        let live = vec![eq_bar(1, OPEN, 500)];
@@ -1474,7 +1534,7 @@ index 98927df0d..34441f194 100644
              noise_p95_paise: 0,
              noise_max_paise: 0,
 diff --git a/crates/storage/src/dhan_live_crossverify_persistence.rs b/crates/storage/src/dhan_live_crossverify_persistence.rs
-index 14029a52c..0dcef0ca1 100644
+index 14029a52c..8093e482e 100644
 --- a/crates/storage/src/dhan_live_crossverify_persistence.rs
 +++ b/crates/storage/src/dhan_live_crossverify_persistence.rs
 @@ -64,7 +64,8 @@
@@ -1746,10 +1806,12 @@ index 14029a52c..0dcef0ca1 100644
      #[test]
      fn append_daily_writes_the_outcome_symbol_and_noise_stats() {
          let mut w = DhanLiveXverifyAuditWriter::for_test();
-@@ -1643,11 +1808,17 @@ mod tests {
+@@ -1642,12 +1807,18 @@ mod tests {
+             !DhanLiveXverifyCellKind::OutOfSession.is_real_divergence(),
              "a row outside [09:15, 15:30) is recorded, never classified"
          );
-         // Exactly three of the five kinds are real.
+-        // Exactly three of the five kinds are real.
++        // Exactly three of the seven kinds are real.
 +        // 2026-10-06 (§12.15.9): an excused late minute and an unjudged
 +        // minute are recorded, never real.
 +        assert!(!DhanLiveXverifyCellKind::LateExcused.is_real_divergence());
@@ -1848,3 +1910,32 @@ index abc714e59..7a66c6250 100644
 +  that day (51d).
 +
 +**What a PR that violates §12.15.9 looks like (REJECT):** a literal count of excused end-of-session minutes, or a late window not derived from the catch-up margin; letting `rest_incomplete` (a failed fetch or the budget) hide a judged missing minute or a price divergence; an excused or unjudged minute that leaves the day `clean`; any input that turns a `diverged` day into anything else; excusing a minute under `Strict`; changing `is_catastrophic_divergence` or any page under cover of this section; dropping the `tail_unsealed` column or kind; a new alarm, filter or page source for these findings without its own dated row in the noise lock.
+diff --git a/docs/error-runbooks/dhan-live-crossverify-error-codes.md b/docs/error-runbooks/dhan-live-crossverify-error-codes.md
+index 07c280bf8..709dfcad9 100644
+--- a/docs/error-runbooks/dhan-live-crossverify-error-codes.md
++++ b/docs/error-runbooks/dhan-live-crossverify-error-codes.md
+@@ -127,3 +127,24 @@ after the limit. That the database client gives up at its request timeout
+ plus the bytes at its minimum throughput is read from its source; that the
+ HTTP timeout covers the whole request is assumed. The marker write is one
+ small file and is not bounded on a stalled disk.
++
++## §4. 2026-10-06 — the verdict and the late window: columns and cell kinds (plan ITEM 51c)
++
++Authority: `no-rest-except-live-feed-2026-06-27.md` §12.15.9. No new log
++source, alarm, filter or page: the existing `finished` line of
++`crates/app/src/dhan_live_crossverify_boot.rs` carries the new counts, and
++`xverify_diverged` stays price-only.
++
++| Column / field / kind | Where | Means | Operator action |
++|---|---|---|---|
++| `late_excused` (LONG), cell kind `late_excused` | `dhan_live_crossverify_daily`, `dhan_live_crossverify_cell_audit`, `finished` line | a traded or index minute missing from our side inside the end-of-session window (`LATE_SEAL_WINDOW_MINUTES`, 15:35 to 15:39 today) that may not have sealed by the read; never real, holds the day at `partial` | none for one day; if it is non-zero most days, check the seal catch-up (plan item 51d judges these minutes once the read waits for the seal) |
++| `missing_live_unjudged` (LONG), cell kind `missing_live_unjudged` | same | the live read hit its row cap, so a missing traded or index minute could not be told from an unread one; never real, holds the day at `partial` | check the `live_truncated` count on the `finished` line; a cap hit means the day's live rows outgrew the read cap |
++| `missing_judgeable` (SYMBOL: `judged` / `live_truncated`) | `dhan_live_crossverify_daily`, `finished` line | whether missing minutes were judged on this run | `live_truncated`: as the row above |
++| `missing_live_late` | `finished` line only | traded or index minutes missing in the late window, whatever the policy; a measurement for plan item 51d | none |
++| `tail_unsealed` column and kind | both tables | the old literal two-minute tail; written 0 from 2026-10-06 and kept for older rows | none |
++
++**Behaviour change:** a day with a price difference or a judged missing traded
++or index minute now reads `diverged` even when a vendor fetch failed or the
++budget ran out (it read `partial`). Query by day, not by `outcome`: the daily
++DEDUP key includes `outcome`, so re-running an old day that now reads
++differently adds a second row.

@@ -9,6 +9,7 @@ session. First read CLAUDE.md, .claude/rules/project/ (auto-loaded), the audit
 file docs/audit-2026-10-04.md, and this handoff: branch
 claude/handoff-2026-10-06, folder docs/handoff/ (HANDOFF.md, *.patch, specs/).
 Do NOT merge the handoff branch; it only carries files. Delete it when done.
+The 51c patch now also contains its local commit; apply it on origin/main.
 
 STANDING RULES (owner, verbatim spirit): label every claim Verified, Assumed or
 Risk. Rust only. Hot paths O(1), never block, zero tick loss. Merge only on
@@ -28,10 +29,7 @@ everything whatever is recommended dude okay?", "fix and resoleve evryhtign
 then emrge and dpeloy okay?".
 
 ORDER OF WORK (serial, one PR open at a time):
-1. PR #2032 (branch claude/fast-lane-2, ITEM 52a, 805 probe attribution).
-   Draft, head 63a105f9f (or later). Drive CI to All Green on the head SHA,
-   mark ready (re-runs CI ~25 min), confirm ci.yml auto-merge merged it,
-   subscribe to PR activity. Fix any red CI by root cause.
+1. PR #2032 MERGED 2026-10-06 18:07Z as ba5ffb0b4. Nothing to do; skip to 2.
 2. 51c — post-market cross-verify: a failed fetch never hides a divergence;
    derived late window; new rule §12.15.9. Work in progress =
    docs/handoff/wt-51c.patch (base 145276dad). `git checkout -b
@@ -67,9 +65,9 @@ Report status as a plain table (item, state, Verified/Assumed/Risk).
 | Item | State |
 |---|---|
 | #2022, #2026, #2028, #2029, #2030, #2031 | Merged. Deploy 10:11Z succeeded on 750a45701 (#2031 ships at next 08:30 IST start) |
-| #2032 (52a) | Open draft, head 63a105f9f, 403 scoped tests pass locally; CI pending |
-| 51c | Uncommitted WIP, 7 files, +1,321/−126 |
-| Depth step 1 | Uncommitted WIP, 9 files, +2,704/−41 |
+| #2032 (52a) | MERGED 18:07Z as ba5ffb0b4 (All Green on 63a105f9f) |
+| 51c | 1 local commit a5c24ace9 + patch, 9 files, +1,375/−133; hostile review rounds running (snapshot 18:21Z) |
+| Depth step 1 | Uncommitted WIP, 10 files, +3,321/−41; still implementing (snapshot 18:21Z) |
 | Audit H3 | Uncommitted WIP, 9 files, +483/−815 |
 | Audit M3 | Uncommitted WIP, 12 files, +439/−7 |
 | Unknown | Why deploys at 07:09Z and 09:46Z failed; whether #2022 terraform alarms are applied |
