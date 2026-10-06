@@ -213,11 +213,13 @@ pub const FOLD_BAR_CHANNEL_CAPACITY: usize = 4096;
 /// That is latent, not live: the lane is `enabled = false`. But "safe" was
 /// the wrong word and is retracted here rather than left standing.
 ///
-/// **Re-enabling this lane requires moving this constant to 32_400 AND
-/// regenerating the golden fold fixtures in the same change** — on top of
-/// solving the candle-key collision that stood it down, which is a schema
-/// decision, not a config flip.
-pub const FOLD_SESSION_OPEN_SECS_OF_DAY_IST: u32 = 32_400;
+/// **Re-enabling this lane requires** solving the candle-key collision that
+/// stood it down, which is a schema decision, not a config flip.
+///
+/// **2026-10-05:** back to 33_300 (09:15) with the live grid (operator:
+/// candles start at 09:15, no pre-open bar in any timeframe), so this fold
+/// and `TfIndex::bucket_start` share one anchor again.
+pub const FOLD_SESSION_OPEN_SECS_OF_DAY_IST: u32 = 33_300;
 
 /// Session close, IST seconds-of-day (15:40:00), exclusive.
 ///
@@ -227,9 +229,8 @@ pub const FOLD_SESSION_OPEN_SECS_OF_DAY_IST: u32 = 32_400;
 pub const FOLD_SESSION_CLOSE_SECS_OF_DAY_IST: u32 = 56_400;
 
 const _: () = assert!(
-    MARKET_OPEN_IST_NANOS - FOLD_SESSION_OPEN_SECS_OF_DAY_IST as i64 * 1_000_000_000
-        == 900 * 1_000_000_000,
-    "the fold session must open exactly 15 minutes before the market (09:00 vs 09:15)"
+    FOLD_SESSION_OPEN_SECS_OF_DAY_IST as i64 * 1_000_000_000 == MARKET_OPEN_IST_NANOS,
+    "the fold session opens at the market open (09:15 IST)"
 );
 const _: () = assert!(
     FOLD_SESSION_CLOSE_SECS_OF_DAY_IST as i64 * 1_000_000_000 == MARKET_CLOSE_IST_NANOS,
@@ -2692,7 +2693,8 @@ mod tests {
         // the live ring empty for D1 and the parity assert below fires.
         let mut bars = Vec::new();
         // 2026-08-28: 385 -> 400 minutes (fold session open 09:15 -> 09:00).
-        for m in 0..400u32 {
+        // 2026-10-05: back to 385 (fold session open 09:00 -> 09:15).
+        for m in 0..385u32 {
             let px = 100.0 + f64::from(m) * 0.05;
             bars.push(bar_at(m, px, px + 0.5, px - 0.5, px + 0.1, i64::from(m)));
         }
@@ -2741,7 +2743,8 @@ mod tests {
         // FOLD_SESSION_OPEN_SECS_OF_DAY_IST, which moved 09:15 -> 09:00, so
         // the SAME wall-clock final minute (15:39) is now 399 minutes from
         // the session open rather than 384.
-        let last = 399;
+        // 2026-10-05: back to 384 (the session opens at 09:15 again).
+        let last = 384;
         let sealed_early = fold_all(&mut e, &[bar_at(0, 100.0, 100.0, 100.0, 100.0, 1)]);
         assert_eq!(sealed_early.len(), 1); // M1 only
         let outcome = e.fold_bar(&bar_at(last, 200.0, 201.0, 199.0, 200.5, 2));
@@ -2766,7 +2769,8 @@ mod tests {
             .expect("the widest frame must seal at close");
         assert_eq!(last_m60.bucket.close, 200.5);
         assert_eq!(last_m60.bucket.volume, 2);
-        // 09:00 + 6h = the 15:00 bucket, which is the one 15:39 lands in.
+        // OPEN + 6h = the last hour bucket (15:15 on the 09:15 anchor), the
+        // one 15:39 lands in.
         assert_eq!(last_m60.bucket.bucket_start_ist_secs, OPEN + 6 * 3_600);
     }
 
@@ -3008,7 +3012,8 @@ mod tests {
         // 400 minutes. At 385 the loop stopped at 15:24 and left every
         // frame's final bucket open - which is what `open_bucket_count() == 0`
         // below was reporting as 6.
-        for i in 0u32..400 {
+        // 2026-10-05: back to 385 (the session opens at 09:15 again).
+        for i in 0u32..385 {
             let base = 100.0 + f64::from(i) * 0.5;
             bars.push(bar_at(
                 i,
@@ -3428,7 +3433,7 @@ mod tests {
             sealed
                 .iter()
                 .any(|s| s.tf == TfIndex::M60 && s.bucket.bucket_start_ist_secs == OPEN),
-            "the old day's 09:00 hour bucket must seal on the day roll"
+            "the old day's first hour bucket must seal on the day roll"
         );
         assert_eq!(state.day_map_len(), 1, "day-map restarts for the new day");
         let day1 = state.current_day().expect("rolled day set");

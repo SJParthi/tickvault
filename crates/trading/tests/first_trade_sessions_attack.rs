@@ -189,36 +189,36 @@ fn first_trade_above_u16_ltq_seeds() {
 // ---------------------------------------------------------------- equities
 
 /// Row 3. The auction match packet carries LTQ = matched quantity.
+///
+/// 2026-10-05: candles start at 09:15 again, so the 09:07:50 match packet is
+/// refused by the fold (no pre-open bar in any timeframe) and the first
+/// continuous trade carries the auction in its cumulative (5,100 against its
+/// own 100): it seeds, and 09:15 reads 0 (true 100), never 5,100. Same shape
+/// as row 5 below.
 #[test]
 fn equity_pre_open_match_proof_age_decides() {
-    // Proof 09:05, match printed at 09:07:50 (170 s later): seeds.
-    let mut a = agg();
-    let mut b = Bars::default();
-    b.push(&mut a, &stale(10, EQ, 1, at(1, 9, 5, 0)));
-    b.push(&mut a, &trade(10, EQ, at(1, 9, 7, 50), 5_000, 5_000));
-    b.push(&mut a, &trade(10, EQ, at(1, 9, 15, 2), 5_100, 100));
-    b.close(&mut a);
-    assert_eq!(b.vol(10, EQ, TfIndex::M1, at(1, 9, 7, 50)), Some(0));
-    assert_eq!(b.vol(10, EQ, TfIndex::M1, at(1, 9, 15, 2)), Some(100));
+    for (sid, proof) in [(10, at(1, 9, 5, 0)), (11, at(1, 9, 7, 30))] {
+        let mut a = agg();
+        let mut b = Bars::default();
+        b.push(&mut a, &stale(sid, EQ, 1, proof));
+        b.push(&mut a, &trade(sid, EQ, at(1, 9, 7, 50), 5_000, 5_000));
+        b.push(&mut a, &trade(sid, EQ, at(1, 9, 15, 2), 5_100, 100));
+        b.close(&mut a);
+        assert!(
+            b.0.keys().all(|k| k.3 >= at(1, 9, 15, 0)),
+            "no bar before 09:15"
+        );
+        assert_eq!(b.vol(sid, EQ, TfIndex::M1, at(1, 9, 15, 2)), Some(0));
+        assert_eq!(b.vol(sid, EQ, TfIndex::M60, at(1, 9, 15, 2)), Some(0));
+    }
 
-    // Proof 09:07:30 (book update), match 09:07:50: true 5,000 in 09:07.
-    let mut a = agg();
-    let mut b = Bars::default();
-    b.push(&mut a, &stale(11, EQ, 1, at(1, 9, 7, 30)));
-    b.push(&mut a, &trade(11, EQ, at(1, 9, 7, 50), 5_000, 5_000));
-    b.push(&mut a, &trade(11, EQ, at(1, 9, 15, 2), 5_100, 100));
-    b.close(&mut a);
-    assert_eq!(b.vol(11, EQ, TfIndex::M1, at(1, 9, 7, 50)), Some(5_000));
-    assert_eq!(b.vol(11, EQ, TfIndex::M1, at(1, 9, 15, 2)), Some(100));
-    assert_eq!(b.vol(11, EQ, TfIndex::M60, at(1, 9, 15, 2)), Some(5_100));
-
-    // An auction bigger than u16 cannot prove itself: seeds.
+    // An auction bigger than u16: refused before 09:15 as well.
     let mut a = agg();
     let mut b = Bars::default();
     b.push(&mut a, &stale(14, EQ, 1, at(1, 9, 7, 30)));
     b.push(&mut a, &trade(14, EQ, at(1, 9, 7, 50), 250_000, u16::MAX));
     b.close(&mut a);
-    assert_eq!(b.vol(14, EQ, TfIndex::M1, at(1, 9, 7, 50)), Some(0));
+    assert!(b.0.is_empty(), "no bar before 09:15");
 }
 
 /// Row 4.
