@@ -704,3 +704,54 @@ fn mutation_push_run_mutates_only_the_changed_lines() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// cargo-careful runner disk (2026-10-06, the issue #1836 class). The weekly
+// run and its re-run died linking with "Free space left: 0 MB" and an lld
+// "Bus error". The job now carries the sanitizer jobs' three disk measures.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn careful_job_frees_runner_disk_and_drops_dependency_debug_info() {
+    let wf = read(".github/workflows/safety.yml");
+    let start = wf.find("\n  careful:\n").expect("careful job present");
+    let end = wf[start..]
+        .find("\n  sanitizer-asan:\n")
+        .map(|i| start + i)
+        .expect("asan job follows careful");
+    let job = &wf[start..end];
+    for (needle, label) in [
+        (
+            "Free runner disk space",
+            "frees the preinstalled toolchains",
+        ),
+        (
+            "sudo rm -rf /usr/share/dotnet",
+            "the cleanup actually removes something",
+        ),
+        (
+            "CARGO_PROFILE_DEV_DEBUG: line-tables-only",
+            "line tables for our crates",
+        ),
+        (
+            "CARGO_RESOLVER_FEATURE_UNIFICATION: workspace",
+            "one feature set for every -p",
+        ),
+        (
+            "Report runner disk (issue 1836)",
+            "df after the build either way",
+        ),
+    ] {
+        assert!(
+            job.contains(needle),
+            "careful job {label}: expected {needle:?}"
+        );
+    }
+    let no_dep_debug = job
+        .matches("--config 'profile.dev.package.\"*\".debug=false'")
+        .count();
+    assert_eq!(
+        no_dep_debug, 2,
+        "both careful cargo calls (build and test) must drop dependency debug info, else the test step relinks with full debug info"
+    );
+}
