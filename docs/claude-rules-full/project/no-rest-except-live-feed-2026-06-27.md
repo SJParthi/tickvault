@@ -2268,21 +2268,31 @@ filters, or the hold ceiling.
 | Gap between attempts | `XVERIFY_RETRY_INTERVAL_SECS` = **760 s** (supersedes §12.15.5's 900 s) |
 | Worst case with the default budget | 4 attempts of 960 s each, 760 s apart, end **exactly** at 17:23: 56,460 + 960 + 3 × 1,720 = 62,580 (compile-time asserted and pinned by test; supersedes §12.15.5's "fit before 17:30") |
 | Last start | an attempt is started only if its full length (token wait 300 s + run budget + 60 s persist margin) ends by 17:23 (supersedes §12.15.5's "finish by 17:30") |
-| Shrunk budget | `attempt_budget_secs(now, config)`: the configured budget, or, when that would end after 17:23, the room left (`17:23 − now − 300 − 60`). A room below **120 s** (`XVERIFY_MIN_ATTEMPT_BUDGET_SECS`) skips the attempt: coded `warn!`, `source = "xverify_attempt_skipped_no_time"`, the attempt fails `incomplete`. A run cut short by a shrunk budget ends `budget_elapsed`, which is `incomplete`, so it never writes the marker |
+| Shrunk budget | `attempt_budget_secs(now, config)`: the configured budget, or, when that would end after 17:23, the room left (`17:23 − now − 300 − 60`). A room below **120 s** (`XVERIFY_MIN_ATTEMPT_BUDGET_SECS`) skips the attempt: coded `warn!`, `source = "xverify_attempt_skipped_no_time"`. When no attempt ran before it in this process the day ends `skipped_no_time` and is NOT paged (see Page); after a real failure in this process the day ends with that failure A run cut short by a shrunk budget ends `budget_elapsed`, which is `incomplete`, so it never writes the marker |
 | Timeout | every full attempt runs under `tokio::time::timeout(attempt_max_secs(budget))`. On elapse: coded `warn!`, `source = "xverify_attempt_timed_out"`, the attempt fails `incomplete`. The option pass runs under `timeout(attempt_max_secs(150))`; on elapse `source = "xverify_options_timed_out"`, outcome label `timed_out` |
+| Persist bound | the timeout can stop an attempt only at an `.await`, and the audit persist runs synchronously after the last one, so the persist bounds itself to the SAME instant (the attempt's `deadline` = its start + `attempt_max_secs(budget)`, the instant the timeout fires). Before each row it checks that a flush of the buffer, started now, ends by the deadline in the ILP client's worst case: `request_timeout` 5 s + buffer bytes at `request_min_throughput` 102,400 B/s (questdb-rs 6.1.0's own formula; both pinned in the writer's conf, `DhanLiveXverifyAuditWriter::flush_worst_case`). If not, it stops: buffered rows discarded and counted, unwritten rows counted, coded `warn!` `source = "xverify_persist_stopped_at_deadline"`, the attempt fails `not_persisted`, no marker. The marker is not written past the deadline (`xverify_attempt_timed_out`, `stage = "marker"`). The option pass's persist does the same against its own timeout instant (`xverify_options_persist_stopped_at_deadline`) |
 | Last attempt | decided ONCE, before the attempt: `is_last = retry_delay_secs(n, start + attempt_max, attempt_max).is_none()` (`attempt_is_last`), from the configured budget. After the attempt the same value is used: last → the one page; otherwise sleep 760 s and try again. A marker-only attempt (§12.15.7) uses the same rule |
 | Option pass (§12.15.6) | starts only if it ends by 17:23 (`option_pass_fits`), as before but on the new bound |
 | After the stop window | an attempt that starts at or after **17:45** (`SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST`, a manual evening boot after the weekday stop cron has fired) runs once with the configured budget, under the timeout, as before this change. Starts from about 17:15 up to 17:45 are skipped |
-| Page | unchanged: once, after the last attempt, on `xverify_failed` / `xverify_vacuous`. The new sources are log-sink-only; no alarm, filter, EMF name or page is added |
+| Page | once, after the last attempt, on `xverify_failed` / `xverify_vacuous`, as before, with one exception: a day on which NO attempt ran in this process (its only attempt was skipped for time) ends `skipped_no_time` and is a coded `warn!`, `source = "xverify_day_not_attempted"`, not a page. Otherwise a restart between about 17:15 and 17:45 would page a second time for a day an earlier process already paged, or page for a comparison that never ran. The new sources are log-sink-only; no alarm, filter, EMF name or page is added |
 
 **⚠ Honest limits (Rule 11).**
 - `tokio::time::timeout` can stop an attempt only at an `.await`. The audit
-  persist and the marker write run synchronously after the comparison returns,
-  so a persist that is still running at the limit finishes, and its result
-  stands. Its time is meant to fit in the 60 s persist margin; that it always
-  does is **Assumed**, not measured. A later attempt's start is re-checked
-  against 17:23 (its budget shrinks), so a late persist cannot push the NEXT
-  attempt past the bound.
+  persist runs synchronously after the comparison returns, so it bounds itself
+  (the Persist bound row): it never STARTS a flush whose worst case ends after
+  the deadline. That the client really gives up at `request_timeout` +
+  bytes / `request_min_throughput` is **Verified** by reading questdb-rs 6.1.0
+  (`sender/mod.rs`, `retry_timeout=0`, so no retry on top); that the HTTP
+  agent's timeout covers connect and the whole response is **Assumed**. The
+  appends between checks are CPU only (microseconds a row). The marker write
+  is one small file, `sync_all` and rename; on a stalled disk it is not
+  bounded (**Risk**, the same file write the marker has always done).
+- The persist bound is honest in the SAFE direction: on a slow but healthy
+  QuestDB near the deadline it stops early (a flush of 20,000 rows at about
+  272 B a row has a worst case near 58 s), so the attempt fails
+  `not_persisted` and no marker is written, where an unbounded persist might
+  have finished. That trades a possibly verified day for never running into
+  the stop window.
 - A run that hits its budget can still be inside one vendor fetch (up to
   `fetch_timeout_secs`, 10 s by default) or a live read. The timeout cuts it
   there; a run cut by the timeout persists nothing for that attempt.
@@ -2294,4 +2304,4 @@ filters, or the hold ceiling.
 - On a weekend special session there is no stop cron at all; the 17:23 bound
   still applies, which only costs time.
 
-**What a PR that violates §12.15.8 looks like (REJECT):** an attempt that starts before the 17:25 scheduled-stop window and can end after 17:23; an attempt with no `tokio::time::timeout`; lengthening `attempt_max_secs` (token wait, persist margin, or the default budget) without re-checking the four-attempt fit to 17:23; deciding the last attempt from the attempt's end time, or revising it after the attempt; a bound written as a literal instead of derived from `shutdown_class`; writing the marker from a run cut short by a shrunk budget or a timeout; a new alarm, filter or page source for these lines without its own dated row in the noise lock.
+**What a PR that violates §12.15.8 looks like (REJECT):** an attempt that starts before the 17:25 scheduled-stop window and can end after 17:23; an attempt with no `tokio::time::timeout`; an audit persist that starts a flush whose worst case (`flush_worst_case`) ends after the attempt's deadline, or writes the marker past it; a persist deadline that is not the timeout's own instant; paging `xverify_failed` for a day on which no attempt ran in this process; lengthening `attempt_max_secs` (token wait, persist margin, or the default budget) without re-checking the four-attempt fit to 17:23; deciding the last attempt from the attempt's end time, or revising it after the attempt; a bound written as a literal instead of derived from `shutdown_class`; writing the marker from a run cut short by a shrunk budget or a timeout; a new alarm, filter or page source for these lines without its own dated row in the noise lock.
