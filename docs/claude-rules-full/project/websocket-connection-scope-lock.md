@@ -8721,10 +8721,12 @@ Recorded HERE before the code, per the rule-file-first law.
 | Surface | Was (D7 2026-10-02; depth 2026-10-02 "Failure" row) | Now |
 |---|---|---|
 | Main-feed window (D7) | fails on an 805 anywhere, on any socket closing with no code, or on no first frame in time | fails on an 805 anywhere; **the probed socket closing with no code, or its own idle watchdog firing**; no first frame in time; **another socket's no-code close that is corroborated as an eviction**; or **a dropped socket that does not reconnect within 120 s** |
-| Depth window ("Failure" row) | "an 805 on ANY socket, or any socket closing with no code, inside a window; or no frame in time" | the same five failure rules as the main-feed row above. The probed socket parks again and the next probe waits the doubled delay, as before |
+| Depth window ("Failure" row) | "an 805 on ANY socket, or any socket closing with no code, inside a window; or no frame in time" | the same failure rules as the main-feed rows (this one and the review-fix rows below). The probed socket parks again and the next probe waits the doubled delay, as before |
 | Corroboration | — | some OTHER socket of this process (not the closing one, and not one that closed in the same burst of no-code closes within 2 s) BEGAN a dial in the last 20 s (`OVERFLOW_PROBE_EVICTION_ATTRIBUTION_SECS`, longer than the 15 s dial timeout). Dhan evicts the oldest socket when a new one is accepted, so a drop right after one of our dials is the probe (or a cascade) costing a socket |
 | A sibling blip that heals | failed the window | noted (`sibling_reset_noted`, a coded `warn!`). It heals at its own successful dial (`sibling_healed`); the window cannot pass until every noted sibling has healed and 20 s have passed since the last heal (that dial could still evict someone) |
-| Pass deferral | — | bounded: a window still unsettled 120 s after its watch would have ended fails (`failed_sibling_unhealed`) |
+| Pass deferral | — | bounded (review fix, same day): a sibling is noted only until 240 s after the probed socket's first frame (the watch plus one heal deadline); a sibling dropping later while the pass is still deferred fails the window (`failed_deferral_exhausted`). Every note taken in time keeps its own 120 s heal deadline and its 20 s settle, so a window lasts at most 380 s after its first frame, and that cap (a fail-closed safety net, `failed_deferral_exhausted`) is never reached while a sibling is inside its own deadline or only the settle time is left. *(The first draft capped the deferral at 240 s, which failed a window whose sibling healed at F+225, inside its own deadline, and a sibling that dropped at F+235 five seconds after it was noted.)* |
+| The probed socket closing with a code other than 805 | did not fail the window (only an 805 or a no-code close did), so a window could pass while the probed socket was down or parked | review fix, same day: its FIRST such close in the window (for example the daily 807 token expiry) restarts its watch: it needs a fresh first frame within 120 s and a full 120 s watch after it (`watched_restarted`, a coded `warn!`). A second such close, or the probed socket parking for any reason but 805 or an orderly shutdown (808, 804 after its respawn), fails the window (`failed_watched_closed`) |
+| Another socket closing with a code other than 805 | ignored | noted like an uncorroborated no-code close (Dhan said why, so it is never read as an eviction): the window cannot pass until it has redialled, within 120 s |
 | A noted sibling that parks for a reason other than 805 | — | dropped from the window (it opens no connection) |
 
 Unchanged: the probed socket closing with no code still fails a probe, as before.
@@ -8759,6 +8761,13 @@ Unchanged: the probed socket closing with no code still fails a probe, as before
   heal deadline.
 - **Assumed:** Dhan evicts at accept time, within the dial timeout of our
   dial. An eviction more than 20 s after our dial reads as a blip.
+- **One watch restart per window** (review fix): two coded closes of the
+  probed socket in one window (for example two 807s while the token refresh
+  lags) fail it and spend the probe. Errs toward fail.
+- **A drop after the note cutoff fails a deferred window** (review fix): a
+  sibling blip more than 240 s after the probed socket's first frame, while
+  an earlier sibling still holds the pass, spends the probe. Without the cutoff
+  a sibling flapping for ever would hold the one process-wide window for ever.
 
 #### What a PR that violates this section looks like (REJECT)
 
@@ -8773,3 +8782,11 @@ Unchanged: the probed socket closing with no code still fails a probe, as before
 - Opens a second window while one is deferred.
 - Counts the closing socket's own dial, or a dial by a member of the same burst
   of closes, as corroboration.
+- (review fix) Lets the deferral cap fail a window while a noted sibling is
+  still inside its own heal deadline or only the settle time after a heal is
+  left; or notes a sibling past the note cutoff, so a window can run without
+  bound.
+- (review fix) Lets a window pass after the probed socket closed with a code
+  other than 805 without a fresh first frame and a full watch after it,
+  restarts its watch more than once per window, or lets it pass after the
+  probed socket parked for any reason but 805 or shutdown.
