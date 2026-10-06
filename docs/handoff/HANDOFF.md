@@ -66,8 +66,8 @@ Report status as a plain table (item, state, Verified/Assumed/Risk).
 |---|---|
 | #2022, #2026, #2028, #2029, #2030, #2031 | Merged. Deploy 10:11Z succeeded on 750a45701 (#2031 ships at next 08:30 IST start) |
 | #2032 (52a) | MERGED 18:07Z as ba5ffb0b4 (All Green on 63a105f9f) |
-| 51c | 1 local commit a5c24ace9 + patch, 9 files, +1,375/−133; hostile review rounds running (snapshot 18:21Z) |
-| Depth step 1 | Uncommitted WIP, 10 files, +3,321/−41; still implementing (snapshot 18:21Z) |
+| 51c | 2 local commits (a5c24ace9, 79ab81304) + fix-round edits; patch 9 files, +1,523/−133; review loop running (snapshot 18:53Z) |
+| Depth step 1 | 1 local commit 59f396505 + fix-round edits; patch 10 files, +3,462/−42; review loop running (snapshot 18:53Z) |
 | Audit H3 | Uncommitted WIP, 9 files, +483/−815 |
 | Audit M3 | Uncommitted WIP, 12 files, +439/−7 |
 | Unknown | Why deploys at 07:09Z and 09:46Z failed; whether #2022 terraform alarms are applied |

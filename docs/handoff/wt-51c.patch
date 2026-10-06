@@ -1,5 +1,5 @@
 diff --git a/.claude/plans/active-plan-feed-hardening.md b/.claude/plans/active-plan-feed-hardening.md
-index 06563d5aa..191b7defe 100644
+index 06563d5aa..d6b5952de 100644
 --- a/.claude/plans/active-plan-feed-hardening.md
 +++ b/.claude/plans/active-plan-feed-hardening.md
 @@ -6364,9 +6364,9 @@ Approved by Parthiban 2026-10-06: "Go ahead with whatever you want dude" and "Se
@@ -9,21 +9,21 @@ index 06563d5aa..191b7defe 100644
 -- [ ] 51c — **Verdict and late window: a degraded run no longer hides a real divergence, and the excused end-of-day window is derived, not a literal.** The tail excuse comes from the seal constants (`LATE_SEAL_WINDOW_MINUTES`, five minutes), an `Excuse` carries why a minute was not judged, and outside the excused window a failed vendor fetch can only add `missing_rest`.
 -  - Files: crates/app/src/dhan_live_crossverify.rs, crates/app/src/dhan_live_crossverify_boot.rs
 -  - Tests: named in that PR (Partial never masks Diverged; the excused window equals the derived constant)
-+- [x] 51c — **Verdict and late window: a degraded run no longer hides a real divergence, and the excused end-of-day window is derived, not a literal.** The tail excuse comes from the seal constants (`LATE_SEAL_WINDOW_MINUTES` = (`CATCHUP_LATENESS_MARGIN_SECS` + 60) / 60 rounded up, five minutes; `TAIL_UNSEALED_MINUTES` deleted), and outside the excused window a failed vendor fetch can only add `missing_rest`. The verdict is `decide_outcome` over `VerdictInputs { rest_incomplete, missing: MissingJudgeable, late: LateWindowPolicy }`: a price difference or a judged missing traded/index minute is `diverged` whatever else happened; a failed fetch or spent budget, a truncated live read (`missing_live_unjudged`), a REST hole or an excused late minute (`late_excused`) holds the day at `partial`, never `clean`; the vacuous outcomes are unchanged. Production judges with `Excuse { sealed_through: None }` until 51d. Daily table gains `late_excused`, `missing_live_unjudged`, `missing_judgeable` (ALTER self-heal, DEDUP unchanged); `tail_unsealed` kept and written 0. Rule §12.15.9 first.
++- [x] 51c — **Verdict and late window: a degraded run no longer hides a real divergence, and the excused end-of-day window is derived, not a literal.** The tail excuse comes from the seal constants (`LATE_SEAL_WINDOW_MINUTES` = (`CATCHUP_LATENESS_MARGIN_SECS` + `LAST_FOLDED_TRADE_SLACK_SECS`) / 60 rounded up, five minutes; the 60 s slack is how far before the close the newest folded trade stamp may stop, Assumed, since the cutoff follows the watermark and not the read time; `TAIL_UNSEALED_MINUTES` deleted), and outside the excused window a failed vendor fetch can only add `missing_rest`. The verdict is `decide_outcome` over `VerdictInputs { rest_incomplete, missing: MissingJudgeable, late: LateWindowPolicy }`: a price difference or a judged missing traded/index minute is `diverged` whatever else happened; a failed fetch or spent budget, a truncated live read (`missing_live_unjudged`), a REST hole or an excused late minute (`late_excused`) holds the day at `partial`, never `clean`; the vacuous outcomes are unchanged. Production judges with `Excuse { sealed_through: None }` until 51d. Daily table gains `late_excused`, `missing_live_unjudged`, `missing_judgeable` (ALTER self-heal, DEDUP unchanged); `tail_unsealed` kept and written 0. Rule §12.15.9 first; its Honest limits name the other inputs that fake a judged missing live minute until 51d (a sealed bar not yet readable at the read, a live row skipped as malformed).
 +  - Files: crates/app/src/dhan_live_crossverify.rs, crates/app/src/dhan_live_crossverify_boot.rs, crates/app/src/dhan_feed_stack.rs, crates/storage/src/dhan_live_crossverify_persistence.rs, docs/claude-rules-full/project/no-rest-except-live-feed-2026-06-27.md, .claude/rules/project/no-rest-except-live-feed-2026-06-27.md, docs/error-runbooks/dhan-live-crossverify-error-codes.md
-+  - Tests: a_failed_fetch_no_longer_hides_a_real_divergence, a_rest_incomplete_run_with_no_finding_is_partial_never_clean, a_truncated_live_read_never_judges_missing_minutes_but_still_flags_price_divergence, late_seal_window_minutes_is_derived_from_the_catch_up_margin, is_late_window_minute_with_known_sealed_through_excuses_only_buckets_ending_after_it, is_late_window_minute_with_none_excuses_the_last_window, strict_policy_counts_a_missing_1539_traded_minute_as_real_diverged, missing_live_late_counts_traded_and_index_minutes_only, excuse_downgrades_clean_to_partial_only_when_late_excused_gt_zero_never_upgrades_degraded_or_diverged, the_late_window_reaches_neither_half_of_the_traded_split_under_excuse, decide_outcome_matches_the_oracle_on_every_permutation, compare_day_in_scope_every_piece_under_every_input, a_sealed_through_value_at_every_minute_of_the_last_10, verdict_inputs_for_run_maps_every_observation, daily_row_carries_the_late_and_unjudged_counts, summary_line_names_minutes_not_yet_judged, proptest_verdict_is_never_clean_when_anything_is_incomplete_excused_or_unjudged, compare_day_degraded_downgrades_clean_to_partial_never_up, late_excused_and_unjudged_columns_self_heal_and_dedup_keys_unchanged
++  - Tests: a_failed_fetch_no_longer_hides_a_real_divergence, a_rest_incomplete_run_with_no_finding_is_partial_never_clean, a_truncated_live_read_never_judges_missing_minutes_but_still_flags_price_divergence, late_seal_window_minutes_is_derived_from_the_catch_up_margin, late_window_covers_every_unsealed_bucket_only_when_the_last_trade_is_within_the_slack, is_late_window_minute_with_known_sealed_through_excuses_only_buckets_ending_after_it, is_late_window_minute_with_none_excuses_the_last_window, strict_policy_counts_a_missing_1539_traded_minute_as_real_diverged, missing_live_late_counts_traded_and_index_minutes_only, excuse_downgrades_clean_to_partial_only_when_late_excused_gt_zero_never_upgrades_degraded_or_diverged, the_late_window_reaches_neither_half_of_the_traded_split_under_excuse, decide_outcome_matches_the_oracle_on_every_permutation, compare_day_in_scope_every_piece_under_every_input, a_sealed_through_value_at_every_minute_of_the_last_10, verdict_inputs_for_run_maps_every_observation, daily_row_carries_the_late_and_unjudged_counts, summary_line_names_minutes_not_yet_judged, proptest_verdict_is_never_clean_when_anything_is_incomplete_excused_or_unjudged, compare_day_degraded_downgrades_clean_to_partial_never_up, late_excused_and_unjudged_columns_self_heal_and_dedup_keys_unchanged, a_live_bar_unreadable_at_the_read_is_judged_missing_and_diverged_until_51d
  - [ ] 51d — **Readiness before the read: the seal sweep, the seal writer and QuestDB have caught up to the close.** A static `CATCHUP_PROGRESS` publishes each completed sweep's floor cutoff (an overrun never raises it); the seal writer's drained sample and today's staged spill files are checked; `fetch_wal_tables` moves to `wal_suspension_watcher` with a new `wal_applied_through`. Earlier attempts retry before any vendor call; the last attempt proceeds with the late minutes unjudged and never pages on them.
    - Files: crates/app/src/dhan_live_crossverify_boot.rs, crates/app/src/dhan_feed_stack.rs, crates/storage/src/wal_suspension_watcher.rs, crates/storage/src/partition_archive.rs
    - Tests: named in that PR (an overrun never raises the published floor; not-ready retries before any REST call)
 diff --git a/.claude/rules/project/no-rest-except-live-feed-2026-06-27.md b/.claude/rules/project/no-rest-except-live-feed-2026-06-27.md
-index c4ac256d4..8c24c52d3 100644
+index c4ac256d4..db1c78638 100644
 --- a/.claude/rules/project/no-rest-except-live-feed-2026-06-27.md
 +++ b/.claude/rules/project/no-rest-except-live-feed-2026-06-27.md
 @@ -13,6 +13,7 @@
  - **§12.15 (2026-09-24) RESTORED — verification only:** `POST /v2/charts/intraday`, interval `"1"`, ONCE per trading day after 15:41 IST, for the main-feed spot/index targets (plus the §12.15.6 depth-held option pass). Never written to `ticks` / `candles_*`. The daily S3 archive of day D is **held until a `dhan_live_crossverify` day marker exists for D** (marker only on a MEASURED verdict; hold ceiling `MAX_CROSSVERIFY_HOLD_DAYS`; disk-pressure leg NOT gated). The live lane never waits for the verifier.
  - **§12.15.7 (2026-10-06) the day marker means what it says:** the marker counts only after tmp + fsync + rename and a strict content read; "persisted" means zero audit rows discarded or refused; a failed marker write is a failed attempt, retried marker-only and paged only after the last attempt on the existing `xverify_failed` source; cross-verification markers are kept 400 days. REJECT: a unit-returning marker write, an `is_file()`-only reader, a sweep shorter than the gated hold lookback, counting a discarded row as persisted.
  - **§12.15.8 (2026-10-06) every attempt ends by 17:23 under a timeout:** the end bound is the 17:25 scheduled-stop window minus 120 s (17:23), retries are 760 s apart, a late attempt runs with a shrunk budget or is skipped below 120 s, every full attempt runs under `tokio::time::timeout`, the synchronous audit persist after its last `.await` stops itself at the same instant (it never starts a flush whose worst case, 5 s + bytes at 100 KiB/s, ends after it), the last attempt is decided once, before it starts, a day's only attempt skipped for time is reported at once and retried once at 17:50 (after the 17:45 start-watchdog stop_check) if the process is still up, and the day is paged once across processes (a same-day paged marker; a skipped day pages `xverify_failed` `skipped_no_time` unless that marker exists). A deliberate persist stop at the deadline never counts on a §2.10 loss-group counter. A marker-only attempt is one file write under no timeout. REJECT: an attempt that can end after 17:23, a persist flush started past the deadline, lengthening `attempt_max_secs`, deciding the last attempt from its end time, a skipped day that neither pages nor finds the paged marker, a second page while the paged marker exists, a deadline stop counted on a loss-group counter, starting the evening attempt (or an unshrunk after-window attempt) before `XVERIFY_EVENING_START_SECS_OF_DAY_IST` (17:50).
-+- **§12.15.9 (2026-10-06) a failed fetch never hides a real divergence; the end-of-session excuse is derived and never Clean:** a price divergence or a judged missing traded/index minute is `diverged` even when a vendor fetch failed or the budget ran out; only a truncated live read turns missing-minute judging off (`missing_live_unjudged`); the excused window is `LATE_SEAL_WINDOW_MINUTES`, derived from the catch-up margin (5 today), and an excused minute (`late_excused`) holds the day at `partial`; `Strict` excuses nothing. REJECT: a literal tail count, a failed fetch hiding a finding, an excused or unjudged minute leaving the day `clean`, any input downgrading `diverged`.
++- **§12.15.9 (2026-10-06) a failed fetch never hides a real divergence; the end-of-session excuse is derived and never Clean:** a price divergence or a judged missing traded/index minute is `diverged` even when a vendor fetch failed or the budget ran out; only a truncated live read turns missing-minute judging off (`missing_live_unjudged`), though until 51d a sealed bar not yet readable at the read (queued, spilled, or not yet applied by QuestDB) or a live row skipped as malformed also reads as a judged missing minute and so `diverged`; the excused window is `LATE_SEAL_WINDOW_MINUTES`, derived from the catch-up margin plus an Assumed 60 s slack for the newest folded trade stamp before the close (5 today; the cutoff follows that stamp, not the read time), and an excused minute (`late_excused`) holds the day at `partial`; `Strict` excuses nothing. REJECT: a literal tail count, a failed fetch hiding a finding, an excused or unjudged minute leaving the day `clean`, any input downgrading `diverged`.
  
  **REJECT (headlines from §12.6 / §12.10.6 / §12.15.4):**
  - Removes the AUTH REST calls or the token minter, or the daily master CSV / niftyindices constituent fetch.
@@ -65,7 +65,7 @@ index e288e84dd..2f7c38597 100644
  /// How often the lane asks the gap detector what it has recorded.
  ///
 diff --git a/crates/app/src/dhan_live_crossverify.rs b/crates/app/src/dhan_live_crossverify.rs
-index 556b03f10..7dfb95824 100644
+index 556b03f10..a09417ace 100644
 --- a/crates/app/src/dhan_live_crossverify.rs
 +++ b/crates/app/src/dhan_live_crossverify.rs
 @@ -49,8 +49,11 @@
@@ -93,7 +93,7 @@ index 556b03f10..7dfb95824 100644
  // ---------------------------------------------------------------------------
  // Time constants — every one of these is in an EXPLICIT unit
  // ---------------------------------------------------------------------------
-@@ -140,12 +147,161 @@ const _: () = assert!(
+@@ -140,12 +147,184 @@ const _: () = assert!(
      "the run must be stamped after the last minute it compares"
  );
  
@@ -101,33 +101,49 @@ index 556b03f10..7dfb95824 100644
 +/// How many trailing session minutes a read may find not yet sealed on the
 +/// LIVE side: the end-of-session window the [`LateWindowPolicy::Excuse`]
 +/// policy may excuse.
++///
++/// **DERIVED, never a literal (2026-10-06, plan ITEM 51c,
++/// `no-rest-except-live-feed-2026-06-27.md` §12.15.9).** This replaced the
++/// literal `TAIL_UNSEALED_MINUTES = 2`, written for the old 15:31 run. A quiet
++/// instrument's bucket seals only when the catch-up cutoff
++/// (`LiveIngest::catch_up_cutoff`: `min(watermark, wall)` minus
++/// `dhan_feed_stack::CATCHUP_LATENESS_MARGIN_SECS`) reaches the bucket's end.
++/// The watermark is the newest folded TRADE STAMP, so once frames stop at the
++/// close the cutoff stops moving: a read at 15:41 and a read at 17:00 see the
++/// same buckets sealed, and the run time does not enter. With the newest
++/// folded trade at or after 15:39:00 the cutoff is at or after 15:35:00, so
++/// only the 15:35 to 15:39 buckets can still be open; two literal minutes
++/// counted three of them as real loss.
  ///
 -/// At 15:31 the 15:29 bucket has only just closed and the 15:28 seal may still
 -/// be in flight, so a live-side gap there is EXPECTED, not evidence of loss.
 -/// Dhan's REST tape, being a post-hoc query, always has them.
 -pub const TAIL_UNSEALED_MINUTES: i64 = 2;
-+/// **DERIVED, never a literal (2026-10-06, plan ITEM 51c,
-+/// `no-rest-except-live-feed-2026-06-27.md` §12.15.9).** This replaced the
-+/// literal `TAIL_UNSEALED_MINUTES = 2`, written for the old 15:31 run. A quiet
-+/// instrument's bucket seals only when the catch-up cutoff
-+/// (`min(watermark, wall)` minus `dhan_feed_stack::CATCHUP_LATENESS_MARGIN_SECS`)
-+/// passes the bucket's end, so at the 15:41 read the cutoff is at most 15:37
-+/// and the 15:35 to 15:37 buckets can still be open. Two literal minutes
-+/// counted those as real loss. The window is the margin plus one minute, in
-+/// whole minutes: (240 + 60) / 60 = 5 today, the buckets 15:35 to 15:39.
-+pub const LATE_SEAL_WINDOW_MINUTES: i64 =
-+    (crate::dhan_feed_stack::CATCHUP_LATENESS_MARGIN_SECS + 60).div_ceil(60) as i64;
++/// The window is the margin plus [`LAST_FOLDED_TRADE_SLACK_SECS`], in whole
++/// minutes: (240 + 60) / 60 = 5 today. **Assumed, not checked:** it covers
++/// every unsealed bucket only when the feed's newest folded trade stamp is
++/// within that slack of the close. A feed whose stamps stop earlier (sockets
++/// down from 15:38:40, sparse closing stamps) leaves buckets before 15:35
++/// open, and a traded minute missing there reads as real loss until plan
++/// item 51d replaces this window with the published seal progress.
++/// *(Corrected in review 2026-10-06: the first text said the +60 was the
++/// minute between the close and the run, and asserted that at compile time.
++/// That dependency does not exist.)*
++pub const LATE_SEAL_WINDOW_MINUTES: i64 = (crate::dhan_feed_stack::CATCHUP_LATENESS_MARGIN_SECS
++    + LAST_FOLDED_TRADE_SLACK_SECS)
++    .div_ceil(60) as i64;
++
++/// How far before the close the feed's newest folded trade stamp may stop
++/// and [`LATE_SEAL_WINDOW_MINUTES`] still cover every bucket the catch-up
++/// seal has left open at the read (§12.15.9). **Assumed:** nothing measures
++/// or checks the closing stamps against it.
++const LAST_FOLDED_TRADE_SLACK_SECS: u32 = 60;
 +
 +const _: () = assert!(
 +    LATE_SEAL_WINDOW_MINUTES * SECS_PER_MINUTE
-+        >= crate::dhan_feed_stack::CATCHUP_LATENESS_MARGIN_SECS as i64,
-+    "the late window must cover the catch-up lateness margin"
-+);
-+const _: () = assert!(
-+    LATE_SEAL_WINDOW_MINUTES * SECS_PER_MINUTE
 +        >= crate::dhan_feed_stack::CATCHUP_LATENESS_MARGIN_SECS as i64
-+            + (RUN_SECS_OF_DAY_IST - SESSION_CLOSE_SECS_OF_DAY_IST),
-+    "the late window must cover the margin plus the gap between the close and the run"
++            + LAST_FOLDED_TRADE_SLACK_SECS as i64,
++    "the late window must cover the catch-up margin plus the assumed last-trade slack"
 +);
 +const _: () = assert!(
 +    LATE_SEAL_WINDOW_MINUTES > 0
@@ -182,6 +198,13 @@ index 556b03f10..7dfb95824 100644
 +/// Only the truncated live read turns judging off: it reads
 +/// `ORDER BY ts ASC LIMIT`, so the cap cuts the END of the day and every
 +/// minute after the cut would otherwise read as lost.
++///
++/// It is the one such input this run can detect, not the only one that can
++/// fake a missing live minute: until plan item 51d, a sealed bar not yet
++/// readable at the read (queued, spilled, or not yet applied by QuestDB's
++/// WAL) and a live row [`parse_live_dataset`] skips as malformed each read as
++/// a judged missing minute anywhere in the day, and the day reads `diverged`
++/// (§12.15.9 Honest limits).
 +#[must_use]
 +pub fn verdict_inputs_for_run(
 +    budget_elapsed: bool,
@@ -260,7 +283,7 @@ index 556b03f10..7dfb95824 100644
  
  /// Minutes in the COMPARED session window, derived from this module's own two
  /// bounds so the row cap below can never disagree with the window the
-@@ -438,15 +594,33 @@ pub fn is_in_session(minute_ts_ist_nanos: i64, day_start_ist_nanos: i64) -> bool
+@@ -438,15 +617,33 @@ pub fn is_in_session(minute_ts_ist_nanos: i64, day_start_ist_nanos: i64) -> bool
      (SESSION_OPEN_SECS_OF_DAY_IST..SESSION_CLOSE_SECS_OF_DAY_IST).contains(&s)
  }
  
@@ -301,7 +324,7 @@ index 556b03f10..7dfb95824 100644
  }
  
  // ---------------------------------------------------------------------------
-@@ -712,8 +886,28 @@ pub struct DayComparison {
+@@ -712,8 +909,28 @@ pub struct DayComparison {
      /// not mean — in particular that it is uninformative for `IDX_I`.
      pub missing_live_zero_volume: i64,
      pub missing_rest: i64,
@@ -330,7 +353,7 @@ index 556b03f10..7dfb95824 100644
      /// Median divergence magnitude in paise — what NORMAL looks like.
      pub noise_p50_paise: i64,
      pub noise_p95_paise: i64,
-@@ -782,9 +976,11 @@ fn percentile(sorted: &[i64], p: f64) -> i64 {
+@@ -782,9 +999,11 @@ fn percentile(sorted: &[i64], p: f64) -> i64 {
  
  /// Compare one day of our LIVE capture against Dhan's official REST tape.
  ///
@@ -345,7 +368,7 @@ index 556b03f10..7dfb95824 100644
  ///
  /// Classification:
  ///
-@@ -792,7 +988,8 @@ fn percentile(sorted: &[i64], p: f64) -> i64 {
+@@ -792,7 +1011,8 @@ fn percentile(sorted: &[i64], p: f64) -> i64 {
  /// |---|---|---|
  /// | both sides, field differs > tolerance | `diverged` | **yes** |
  /// | REST has it, live doesn't (mid-session) | `missing_live` | **yes** — the closest proxy we have for packet loss |
@@ -355,7 +378,7 @@ index 556b03f10..7dfb95824 100644
  /// | live has it, REST doesn't | `missing_rest` | **no** — the REST tape is sparse by construction; reported as `Partial`, never `Clean`, never `Diverged` |
  /// | either side outside `[09:15, 15:30)` | `out_of_session` | no |
  #[must_use]
-@@ -824,7 +1021,7 @@ pub fn compare_day_in_scope(
+@@ -824,7 +1044,7 @@ pub fn compare_day_in_scope(
      day_start_ist_nanos: i64,
      run_ts_ist_nanos: i64,
      tolerance_paise: i64,
@@ -364,7 +387,7 @@ index 556b03f10..7dfb95824 100644
  ) -> DayComparison {
      use std::collections::{BTreeMap, BTreeSet};
  
-@@ -873,9 +1070,23 @@ pub fn compare_day_in_scope(
+@@ -873,9 +1093,23 @@ pub fn compare_day_in_scope(
      let mut missing_live_traded: i64 = 0;
      let mut missing_live_zero_volume: i64 = 0;
      let mut missing_rest: i64 = 0;
@@ -389,7 +412,7 @@ index 556b03f10..7dfb95824 100644
      let session_open_minute = day_start_ist_nanos
          .saturating_add(SESSION_OPEN_SECS_OF_DAY_IST.saturating_mul(NANOS_PER_SEC));
  
-@@ -951,12 +1162,34 @@ pub fn compare_day_in_scope(
+@@ -951,12 +1185,34 @@ pub fn compare_day_in_scope(
                  }
              }
              (None, Some(r)) => {
@@ -430,7 +453,7 @@ index 556b03f10..7dfb95824 100644
                  } else {
                      missing_live = missing_live.saturating_add(1);
                      // Split the one number that could not be acted on. See
-@@ -971,7 +1204,7 @@ pub fn compare_day_in_scope(
+@@ -971,7 +1227,7 @@ pub fn compare_day_in_scope(
                      // An index carries no volume, so the traded/untraded
                      // split says nothing about it — and it ticks every
                      // second, so a minute it is missing IS lost data.
@@ -439,7 +462,7 @@ index 556b03f10..7dfb95824 100644
                          missing_live_index = missing_live_index.saturating_add(1);
                      }
                      DhanLiveXverifyCellKind::MissingLive
-@@ -1028,60 +1261,59 @@ pub fn compare_day_in_scope(
+@@ -1028,60 +1284,59 @@ pub fn compare_day_in_scope(
      // that compared nothing lands on Blind / NoData / Degraded — every one of
      // which `is_pass() == false`. This is the structural answer to the
      // predecessor's blind-since-birth failure.
@@ -553,7 +576,7 @@ index 556b03f10..7dfb95824 100644
  
      DayComparison {
          outcome,
-@@ -1095,6 +1327,10 @@ pub fn compare_day_in_scope(
+@@ -1095,6 +1350,10 @@ pub fn compare_day_in_scope(
          missing_rest,
          tail_unsealed,
          out_of_session,
@@ -564,7 +587,7 @@ index 556b03f10..7dfb95824 100644
          noise_p50_paise,
          noise_p95_paise,
          noise_max_paise,
-@@ -1131,6 +1367,9 @@ pub fn daily_row(
+@@ -1131,6 +1390,9 @@ pub fn daily_row(
          noise_max_paise: cmp.noise_max_paise,
          tolerance_paise,
          outcome: cmp.outcome,
@@ -574,7 +597,7 @@ index 556b03f10..7dfb95824 100644
      }
  }
  
-@@ -1163,7 +1402,7 @@ pub fn format_summary_line(cmp: &DayComparison) -> String {
+@@ -1163,7 +1425,7 @@ pub fn format_summary_line(cmp: &DayComparison) -> String {
              "🆘 Dhan live-vs-official check PROVED NOTHING today: {} minute(s) \
               of data existed but NONE lined up, so nothing was actually \
               compared. This is not a pass — the check itself needs attention.",
@@ -583,7 +606,7 @@ index 556b03f10..7dfb95824 100644
          ),
          DhanLiveXverifyOutcome::NoData => "⚠️ Dhan live-vs-official check found no data on \
               either side today — nothing was compared, so nothing is proven."
-@@ -1179,13 +1418,17 @@ pub fn format_summary_line(cmp: &DayComparison) -> String {
+@@ -1179,13 +1441,17 @@ pub fn format_summary_line(cmp: &DayComparison) -> String {
          DhanLiveXverifyOutcome::Partial | DhanLiveXverifyOutcome::Diverged => format!(
              "⚠️ Dhan live-vs-official check: {} minute(s) compared, {} price \
               difference(s), {} minute(s) we never received, {} minute(s) only \
@@ -604,18 +627,20 @@ index 556b03f10..7dfb95824 100644
              rupees(cmp.noise_p50_paise),
              rupees(cmp.noise_max_paise),
          ),
-@@ -1949,6 +2192,10 @@ pub async fn run_cross_verification(
+@@ -1949,6 +2215,12 @@ pub async fn run_cross_verification(
      }
  
      let degraded = truncated || budget_elapsed || rest_failures > 0;
 +    // §12.15.9: a failed fetch or a spent budget only keeps the day from
 +    // reading `clean`; a truncated live read alone turns missing-minute
-+    // judging off. Neither can hide a real finding.
++    // judging off. Neither can hide a real finding. Until 51d, a bar not yet
++    // readable or a row skipped as malformed (`live_malformed`) still reads as
++    // a judged missing minute (§12.15.9 Honest limits).
 +    let inputs = verdict_inputs_for_run(budget_elapsed, rest_failures, truncated);
      let run_ts = deterministic_run_ts_nanos(day_start_ist_nanos);
      // The scope set: exactly what this run ASKED the vendor for. A live
      // instrument outside it was never requested, so calling its minutes
-@@ -1966,7 +2213,7 @@ pub async fn run_cross_verification(
+@@ -1966,7 +2238,7 @@ pub async fn run_cross_verification(
          day_start_ist_nanos,
          run_ts,
          cfg.tolerance_paise,
@@ -624,7 +649,7 @@ index 556b03f10..7dfb95824 100644
      );
  
      if rest_failures > 0 {
-@@ -2035,10 +2282,21 @@ mod tests {
+@@ -2035,10 +2307,21 @@ mod tests {
              day_start_ist_nanos,
              run_ts_ist_nanos,
              tolerance_paise,
@@ -647,7 +672,7 @@ index 556b03f10..7dfb95824 100644
      fn bar(o: f64, h: f64, l: f64, c: f64) -> PaiseBar {
          PaiseBar::from_rupees(o, h, l, c, 100).expect("finite")
      }
-@@ -2551,32 +2809,64 @@ mod tests {
+@@ -2551,32 +2834,64 @@ mod tests {
          );
          assert!(!cmp.outcome.is_pass());
      }
@@ -728,7 +753,7 @@ index 556b03f10..7dfb95824 100644
          assert_eq!(cmp.missing_live, 1);
      }
  
-@@ -2620,23 +2910,40 @@ mod tests {
+@@ -2620,23 +2935,40 @@ mod tests {
          );
      }
  
@@ -783,7 +808,7 @@ index 556b03f10..7dfb95824 100644
      }
  
      #[test]
-@@ -2712,6 +3019,10 @@ mod tests {
+@@ -2712,6 +3044,10 @@ mod tests {
          assert_eq!(cmp.outcome, DhanLiveXverifyOutcome::Blind);
      }
  
@@ -794,7 +819,7 @@ index 556b03f10..7dfb95824 100644
      #[test]
      fn compare_day_degraded_downgrades_clean_to_partial_never_up() {
          let b = bar(100.0, 101.0, 99.0, 100.5);
-@@ -2721,6 +3032,10 @@ mod tests {
+@@ -2721,6 +3057,10 @@ mod tests {
          assert_eq!(cmp.outcome, DhanLiveXverifyOutcome::Partial);
          assert!(!cmp.outcome.is_pass(), "a degraded run is never a pass");
          assert!(cmp.outcome.is_measured(), "but it did compare something");
@@ -805,7 +830,7 @@ index 556b03f10..7dfb95824 100644
      }
  
      // =======================================================================
-@@ -3891,7 +4206,7 @@ mod tests {
+@@ -3891,7 +4231,7 @@ mod tests {
              DAY_START_NANOS,
              RUN_TS,
              0,
@@ -814,7 +839,7 @@ index 556b03f10..7dfb95824 100644
          );
          assert_eq!(
              cmp.missing_rest, 0,
-@@ -3920,7 +4235,7 @@ mod tests {
+@@ -3920,7 +4260,7 @@ mod tests {
              DAY_START_NANOS,
              RUN_TS,
              0,
@@ -823,7 +848,7 @@ index 556b03f10..7dfb95824 100644
          );
          assert_eq!(
              cmp.instruments, 1,
-@@ -3942,7 +4257,7 @@ mod tests {
+@@ -3942,7 +4282,7 @@ mod tests {
              DAY_START_NANOS,
              RUN_TS,
              0,
@@ -832,7 +857,7 @@ index 556b03f10..7dfb95824 100644
          );
          assert_eq!(
              cmp.missing_rest, 1,
-@@ -3963,7 +4278,7 @@ mod tests {
+@@ -3963,7 +4303,7 @@ mod tests {
              DAY_START_NANOS,
              RUN_TS,
              0,
@@ -841,7 +866,7 @@ index 556b03f10..7dfb95824 100644
          );
          assert_eq!(cmp.missing_rest, 1, "an empty scope filters nothing");
      }
-@@ -3981,7 +4296,7 @@ mod tests {
+@@ -3981,7 +4321,7 @@ mod tests {
              DAY_START_NANOS,
              RUN_TS,
              0,
@@ -850,7 +875,7 @@ index 556b03f10..7dfb95824 100644
          );
          assert_eq!(
              cmp.instruments, 0,
-@@ -3998,7 +4313,15 @@ mod tests {
+@@ -3998,7 +4338,15 @@ mod tests {
              live.push(side(id, OPEN, bar(100.0, 101.0, 99.0, 100.5)));
          }
          let scope = scope_of(&[(0, "IDX_I"), (1, "IDX_I"), (2, "IDX_I")]);
@@ -867,7 +892,7 @@ index 556b03f10..7dfb95824 100644
          assert_eq!(
              cmp.missing_rest, 3,
              "3 targeted instruments produce 3 findings — not 200. That ratio \
-@@ -4101,4 +4424,638 @@ mod tests {
+@@ -4101,4 +4449,722 @@ mod tests {
          assert_eq!(cmp.minutes_compared, 1, "prices are still compared");
          assert_eq!(cmp.volume_cells, 0, "09:15 volume is not scored");
      }
@@ -954,6 +979,49 @@ index 556b03f10..7dfb95824 100644
 +        }
 +    }
 +
++    /// §12.15.9 Honest limit, pinned so the rule text cannot drift from the
++    /// code: the truncated read is NOT the only input that fakes a missing
++    /// live minute. A live row the read skips as malformed, and a sealed bar
++    /// absent from the read because it is not yet readable (queued, spilled
++    /// or not yet applied), are each a judged `missing_live` mid-session, and
++    /// the day reads `diverged` even when a vendor fetch failed. If 51d (or
++    /// anything else) stops judging these minutes, this test fails and the
++    /// rule's Honest limits must be amended with it.
++    #[test]
++    fn a_live_bar_unreadable_at_the_read_is_judged_missing_and_diverged_until_51d() {
++        let mid = OPEN + 600;
++        let body = format!(
++            r#"{{"dataset":[
++                [{ts_open},1,"NSE_EQ",100.0,101.0,99.0,100.5,500],
++                [{ts_mid},1,"NSE_EQ",null,101.0,99.0,100.5,300]
++            ]}}"#,
++            ts_open = minute(OPEN),
++            ts_mid = minute(mid)
++        );
++        let (malformed_live, truncated, malformed) = parse_live_dataset(&body, 100).expect("parse");
++        assert!(!truncated);
++        assert_eq!(malformed, 1, "the mid-session row is skipped as malformed");
++        // A bar not yet readable never reaches the read at all.
++        let unapplied_live = vec![eq_bar(1, OPEN, 500)];
++        let rest = vec![eq_bar(1, OPEN, 500), eq_bar(1, mid, 300)];
++
++        for live in [&malformed_live, &unapplied_live] {
++            for (budget, failures) in [(false, 0), (false, 1), (true, 0)] {
++                let inputs = verdict_inputs_for_run(budget, failures, truncated);
++                assert_eq!(inputs.missing, MissingJudgeable::Judged);
++                let cmp = unscoped(live, &rest, inputs);
++                assert_eq!(cmp.missing_live_traded, 1);
++                assert_eq!(cmp.missing_live_unjudged, 0);
++                assert_eq!(cmp.late_excused, 0, "mid-session, outside the window");
++                assert_eq!(
++                    cmp.outcome,
++                    DhanLiveXverifyOutcome::Diverged,
++                    "budget={budget} failures={failures}"
++                );
++            }
++        }
++    }
++
 +    /// A read cut at its row cap drops the END of the day, so a missing
 +    /// minute cannot be told from an unread one: no missing traded or index
 +    /// minute is judged. A price difference on a minute present on both
@@ -1012,18 +1080,18 @@ index 556b03f10..7dfb95824 100644
 +    #[test]
 +    fn late_seal_window_minutes_is_derived_from_the_catch_up_margin() {
 +        let margin = i64::from(crate::dhan_feed_stack::CATCHUP_LATENESS_MARGIN_SECS);
-+        assert_eq!(LATE_SEAL_WINDOW_MINUTES, (margin + 60 + 59) / 60);
++        let slack = i64::from(LAST_FOLDED_TRADE_SLACK_SECS);
++        assert_eq!(slack, 60, "the assumed last-trade slack (§12.15.9)");
++        assert_eq!(LATE_SEAL_WINDOW_MINUTES, (margin + slack + 59) / 60);
 +        assert_eq!(
 +            LATE_SEAL_WINDOW_MINUTES, 5,
 +            "240 s margin today: 15:35 to 15:39"
 +        );
-+        // The window covers the measured delivery lag rounded to the margin,
-+        // plus the minute between the close and the run.
++        // The margin covers the measured delivery lag; the window covers the
++        // margin plus the slack. The run time is deliberately absent: the
++        // cutoff follows the watermark, not the read.
 +        let lag = i64::from(crate::dhan_feed_stack::MEASURED_MAX_DELIVERY_LAG_SECS);
-+        assert!(
-+            LATE_SEAL_WINDOW_MINUTES * 60
-+                >= lag + (RUN_SECS_OF_DAY_IST - SESSION_CLOSE_SECS_OF_DAY_IST)
-+        );
++        assert!(LATE_SEAL_WINDOW_MINUTES * 60 >= lag + slack);
 +        // No literal tail count survives in the production half.
 +        let src = include_str!("dhan_live_crossverify.rs");
 +        let marker = concat!("#[cfg(", "test)]");
@@ -1042,9 +1110,50 @@ index 556b03f10..7dfb95824 100644
 +        assert!(code.iter().all(|l| !l.contains(old_fn)));
 +        assert!(
 +            code.iter()
-+                .any(|l| l.contains("CATCHUP_LATENESS_MARGIN_SECS + 60")),
++                .any(|l| l.contains("CATCHUP_LATENESS_MARGIN_SECS")),
 +            "the window is derived from the catch-up margin"
 +        );
++        assert!(
++            code.iter()
++                .any(|l| l.contains("+ LAST_FOLDED_TRADE_SLACK_SECS")),
++            "the window adds the named slack, never a bare literal"
++        );
++        assert!(
++            code.iter()
++                .all(|l| !l.contains("RUN_SECS_OF_DAY_IST - SESSION_CLOSE_SECS_OF_DAY_IST")),
++            "the run time must not enter the late window: the cutoff follows the watermark"
++        );
++    }
++
++    /// The window against the real seal rule (§12.15.9 review fix). The
++    /// catch-up cutoff after the close is the newest folded trade stamp `w`
++    /// minus the margin, whatever the read time; a bucket seals when its end
++    /// is at or before the cutoff (`AggregatorCell::would_catch_up_seal`).
++    /// The derived window covers every bucket still open exactly when `w` is
++    /// within `LAST_FOLDED_TRADE_SLACK_SECS` of the close, and not otherwise:
++    /// the 15:38:40 case leaves the 15:34 bucket open and outside the window.
++    #[test]
++    fn late_window_covers_every_unsealed_bucket_only_when_the_last_trade_is_within_the_slack() {
++        let close = SESSION_CLOSE_SECS_OF_DAY_IST;
++        let margin = i64::from(crate::dhan_feed_stack::CATCHUP_LATENESS_MARGIN_SECS);
++        let slack = i64::from(LAST_FOLDED_TRADE_SLACK_SECS);
++        for last_trade in (close - 900)..close {
++            let cutoff = last_trade - margin;
++            let open_buckets_covered = (SESSION_OPEN_SECS_OF_DAY_IST..close)
++                .step_by(60)
++                .filter(|b| b + 60 > cutoff)
++                .all(|b| is_late_window_minute(minute(b), DAY_START_NANOS, None));
++            assert_eq!(
++                open_buckets_covered,
++                last_trade >= close - slack,
++                "newest folded trade at {last_trade}"
++            );
++        }
++        // The finding's scenario, by name: the stamps stop at 15:38:40.
++        let cutoff = close - 80 - margin;
++        let b1534 = close - 360;
++        assert!(b1534 + 60 > cutoff, "the 15:34 bucket is still open");
++        assert!(!is_late_window_minute(minute(b1534), DAY_START_NANOS, None));
 +    }
 +
 +    #[test]
@@ -1534,7 +1643,7 @@ index 98927df0d..34441f194 100644
              noise_p95_paise: 0,
              noise_max_paise: 0,
 diff --git a/crates/storage/src/dhan_live_crossverify_persistence.rs b/crates/storage/src/dhan_live_crossverify_persistence.rs
-index 14029a52c..8093e482e 100644
+index 14029a52c..dc7dec9ee 100644
 --- a/crates/storage/src/dhan_live_crossverify_persistence.rs
 +++ b/crates/storage/src/dhan_live_crossverify_persistence.rs
 @@ -64,7 +64,8 @@
@@ -1605,7 +1714,7 @@ index 14029a52c..8093e482e 100644
      /// reported categories, never evidence of a feed problem (the doctrine:
      /// separate expected fluctuation from real divergence).
      #[must_use]
-@@ -276,6 +305,42 @@ impl DhanLiveXverifyOutcome {
+@@ -276,6 +305,45 @@ impl DhanLiveXverifyOutcome {
      }
  }
  
@@ -1618,7 +1727,10 @@ index 14029a52c..8093e482e 100644
 +/// cap can: it reads `ORDER BY ts ASC LIMIT`, so the cap drops the END of the
 +/// day and every minute after the cut would read as lost. That is the one
 +/// input that turns judging off today; plan item 51d adds the readiness
-+/// reasons.
++/// reasons. Until then a `judged` day can still count a minute as missing
++/// whose sealed bar was not yet readable at the read (queued, spilled, or not
++/// yet applied by QuestDB's WAL) or whose live row was skipped as malformed;
++/// §12.15.9 records this under its Honest limits.
 +#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 +pub enum DhanLiveXverifyMissingJudgeable {
 +    /// Every missing traded or index minute outside the excused window is
@@ -1648,7 +1760,7 @@ index 14029a52c..8093e482e 100644
  /// One live-vs-REST cell finding, ready for ILP write.
  ///
  /// Both sides' raw rupee values are retained verbatim (never rounded on the
-@@ -349,6 +414,16 @@ pub struct DhanLiveXverifyDailyRow {
+@@ -349,6 +417,16 @@ pub struct DhanLiveXverifyDailyRow {
      /// re-baselining history.
      pub tolerance_paise: i64,
      pub outcome: DhanLiveXverifyOutcome,
@@ -1665,7 +1777,7 @@ index 14029a52c..8093e482e 100644
  }
  
  /// One minute of the vendor's own tape, exactly as fetched.
-@@ -423,7 +498,10 @@ pub fn dhan_live_xverify_daily_create_ddl() -> String {
+@@ -423,7 +501,10 @@ pub fn dhan_live_xverify_daily_create_ddl() -> String {
              noise_p95_paise  LONG, \
              noise_max_paise  LONG, \
              tolerance_paise  LONG, \
@@ -1677,7 +1789,7 @@ index 14029a52c..8093e482e 100644
          ) timestamp(ts) PARTITION BY DAY \
          DEDUP UPSERT KEYS({DEDUP_KEY_DHAN_LIVE_XVERIFY_DAILY});"
      )
-@@ -508,6 +586,9 @@ const DAILY_COLUMNS: &[(&str, &str)] = &[
+@@ -508,6 +589,9 @@ const DAILY_COLUMNS: &[(&str, &str)] = &[
      ("noise_max_paise", "LONG"),
      ("tolerance_paise", "LONG"),
      ("outcome", "SYMBOL"),
@@ -1687,7 +1799,7 @@ index 14029a52c..8093e482e 100644
  ];
  
  /// The full ordered DDL statement list (CREATE → per-column `ALTER ADD COLUMN
-@@ -837,6 +918,8 @@ impl DhanLiveXverifyAuditWriter {
+@@ -837,6 +921,8 @@ impl DhanLiveXverifyAuditWriter {
              .context("feed")?
              .symbol("outcome", r.outcome.as_str())
              .context("outcome")?
@@ -1696,7 +1808,7 @@ index 14029a52c..8093e482e 100644
              .column_ts(
                  "trading_date_ist",
                  TimestampNanos::new(r.trading_date_ist_nanos),
-@@ -868,6 +951,10 @@ impl DhanLiveXverifyAuditWriter {
+@@ -868,6 +954,10 @@ impl DhanLiveXverifyAuditWriter {
              .context("noise_max_paise")?
              .column_i64("tolerance_paise", r.tolerance_paise)
              .context("tolerance_paise")?
@@ -1707,7 +1819,7 @@ index 14029a52c..8093e482e 100644
              .at(TimestampNanos::new(r.run_ts_ist_nanos))
              .context("designated timestamp")?;
          self.pending = self.pending.saturating_add(1);
-@@ -1072,6 +1159,9 @@ mod tests {
+@@ -1072,6 +1162,9 @@ mod tests {
              noise_max_paise: 60,
              tolerance_paise: 0,
              outcome: DhanLiveXverifyOutcome::Diverged,
@@ -1717,7 +1829,7 @@ index 14029a52c..8093e482e 100644
          }
      }
  
-@@ -1241,6 +1331,9 @@ mod tests {
+@@ -1241,6 +1334,9 @@ mod tests {
              "noise_max_paise",
              "tolerance_paise",
              "outcome",
@@ -1727,7 +1839,7 @@ index 14029a52c..8093e482e 100644
          ] {
              assert!(ddl.contains(tok), "daily DDL missing `{tok}`: {ddl}");
          }
-@@ -1378,6 +1471,78 @@ mod tests {
+@@ -1378,6 +1474,78 @@ mod tests {
          assert!(!tags.contains("live_value"), "columns must follow symbols");
      }
  
@@ -1806,7 +1918,7 @@ index 14029a52c..8093e482e 100644
      #[test]
      fn append_daily_writes_the_outcome_symbol_and_noise_stats() {
          let mut w = DhanLiveXverifyAuditWriter::for_test();
-@@ -1642,12 +1807,18 @@ mod tests {
+@@ -1642,12 +1810,18 @@ mod tests {
              !DhanLiveXverifyCellKind::OutOfSession.is_real_divergence(),
              "a row outside [09:15, 15:30) is recorded, never classified"
          );
@@ -1827,10 +1939,10 @@ index 14029a52c..8093e482e 100644
          ];
          assert_eq!(kinds.iter().filter(|k| k.is_real_divergence()).count(), 3);
 diff --git a/docs/claude-rules-full/project/no-rest-except-live-feed-2026-06-27.md b/docs/claude-rules-full/project/no-rest-except-live-feed-2026-06-27.md
-index abc714e59..7a66c6250 100644
+index abc714e59..31b4fd54a 100644
 --- a/docs/claude-rules-full/project/no-rest-except-live-feed-2026-06-27.md
 +++ b/docs/claude-rules-full/project/no-rest-except-live-feed-2026-06-27.md
-@@ -2364,3 +2364,79 @@ filters, or the hold ceiling.
+@@ -2364,3 +2364,106 @@ filters, or the hold ceiling.
    attempt changes the page timing this section fixes.
  
  **What a PR that violates §12.15.8 looks like (REJECT):** an attempt that starts before the 17:25 scheduled-stop window and can end after 17:23 (beyond the whole second the wall clock is read in, Honest limits); an attempt with no `tokio::time::timeout`; an audit persist that starts a flush whose worst case (`flush_worst_case`, of the buffer that flush sends) ends after the attempt's deadline, or writes the marker past it; a persist deadline that is not the timeout's own instant; a day whose only attempt was skipped for time that neither pages nor finds today's paged marker (a silent unverified day); paging a final failure while today's paged marker exists; reporting a skipped day only after the evening wait; ending the day on a skip without the 17:50 evening attempt, or waiting for it more than once; starting the evening attempt, or an unshrunk after-window attempt, before `XVERIFY_EVENING_START_SECS_OF_DAY_IST`, or moving the start-watchdog `stop_check` or `curfew_check` cron without the pinned constants moving with it; counting a deliberate deadline stop of the audit persist on `tv_dhan_feed_xverify_persist_errors_total`, `tv_dhan_live_xverify_audit_rows_discarded_total` or any other counter a §2.10 loss-group filter reads; lengthening `attempt_max_secs` (token wait, persist margin, or the default budget) without re-checking the four-attempt fit to 17:23; deciding the last attempt from the attempt's end time, or revising it after the attempt; a bound written as a literal instead of derived from `shutdown_class`; writing the marker from a run cut short by a shrunk budget or a timeout; a new alarm, filter or page source for these lines without its own dated row in the noise lock.
@@ -1862,8 +1974,16 @@ index abc714e59..7a66c6250 100644
 +- The end-of-session excuse was the literal `TAIL_UNSEALED_MINUTES = 2`
 +  (15:38 and 15:39), written for the old 15:31 run. A quiet instrument's
 +  bucket seals only once the catch-up cutoff (`min(watermark, wall)` minus
-+  `CATCHUP_LATENESS_MARGIN_SECS`, 240 s) passes its end, so at the 15:41 read
-+  the 15:35 to 15:37 buckets can still be open. They were counted as real loss.
++  `CATCHUP_LATENESS_MARGIN_SECS`, 240 s) passes its end. The watermark is
++  the newest folded trade stamp, and once frames stop at the close the
++  cutoff stops moving: a read at 15:41 and a read at 17:00 see the same
++  buckets sealed. With the last folded trade at 15:39 the cutoff is 15:35,
++  so the 15:35 to 15:39 buckets can still be open, and three of them sat
++  outside the literal two. They were counted as real loss.
++  *(Corrected in review the same day: the first text said the cutoff is "at
++  the 15:41 read at most 15:37" and that the window covers "the one minute
++  between the close and the run". The run time does not move the cutoff;
++  the newest folded trade stamp does.)*
 +- An excused minute left the day `clean`, so a day whose last minutes were
 +  never checked read as fully verified.
 +
@@ -1873,8 +1993,8 @@ index abc714e59..7a66c6250 100644
 +| Real finding | `cells_diverged > 0`, or (`missing` is `judged` and a traded or index minute is missing from our side outside the excused window) |
 +| Outcome, something compared | real → `diverged`; else `rest_incomplete`, not judged, `missing_rest > 0`, `late_excused > 0` or `missing_live_unjudged > 0` → `partial`; else `clean` |
 +| Outcome, nothing compared | unchanged: `degraded` when `rest_incomplete` or not judged, else `blind` (rows seen) or `no_data` |
-+| Why a failed fetch cannot hide anything | a target whose vendor fetch failed has no vendor bars, so it can add only `missing_rest`, never a false `missing_live`. The truncated live read is the one input that can fake a missing live minute, so it alone turns missing-minute judging off |
-+| Late window | `LATE_SEAL_WINDOW_MINUTES = (CATCHUP_LATENESS_MARGIN_SECS + 60) / 60`, rounded up: **5** today (15:35 to 15:39). Compile-time asserted to cover the margin plus the one minute between the close and the run. `TAIL_UNSEALED_MINUTES` is deleted |
++| Why a failed fetch cannot hide anything | a target whose vendor fetch failed has no vendor bars, so it can add only `missing_rest`, never a false `missing_live`. The truncated live read is the one input this run can DETECT that fakes a missing live minute, so it alone turns missing-minute judging off. It is NOT the only input that can fake one: until plan item 51d, a sealed bar that is not yet readable when the read runs (still queued for the seal writer, staged in a spill file after a QuestDB outage, or ACKed but not yet applied by QuestDB's WAL), and a live row the read skips as malformed (counted on the `finished` line as `malformed_rows`), each read as a judged `missing_live`, anywhere in the day, and the day reads `diverged` (see the Honest limits) |
++| Late window | `LATE_SEAL_WINDOW_MINUTES = (CATCHUP_LATENESS_MARGIN_SECS + LAST_FOLDED_TRADE_SLACK_SECS) / 60`, rounded up: **5** today ((240 + 60) / 60, 15:35 to 15:39). `LAST_FOLDED_TRADE_SLACK_SECS` = 60 is how far before the close the feed's newest folded trade stamp may stop: the window covers every unsealed bucket only when that stamp is at or after 15:39:00. That is **Assumed**, not measured or checked. The read time does not enter: the cutoff follows the watermark, not the run. Compile-time asserted to cover the margin plus that slack. `TAIL_UNSEALED_MINUTES` is deleted |
 +| `Excuse` | `Excuse { sealed_through: None }` excuses the last `LATE_SEAL_WINDOW_MINUTES` session minutes; `Excuse { sealed_through: Some(t) }` excuses every session bucket that ends after `t`. A traded or index minute missing there is counted in `late_excused` with cell kind `late_excused`, is not real, and holds the day at `partial` at best |
 +| `Strict` | no minute is excused. A traded or index minute missing anywhere, 15:38 and 15:39 included, is `missing_live` and real |
 +| Not judged | a traded or index minute missing from our side is counted in `missing_live_unjudged` with cell kind `missing_live_unjudged`, is not real, and holds the day at `partial` at best. A not-judged minute is never also counted as excused |
@@ -1904,17 +2024,36 @@ index abc714e59..7a66c6250 100644
 +- Until 51d, a REAL loss of a traded or index minute at 15:35 to 15:39 is
 +  never judged: the day reads `partial`, never `diverged`, for it. Price
 +  differences in those minutes (present on both sides) are still judged.
++- Until 51d, a sealed bar that is not yet readable when the read runs
++  (queued for the seal writer, staged in a spill file not yet replayed, or
++  ACKed but not yet applied by QuestDB's WAL, whose apply lag has been
++  measured climbing through the session) is a judged `missing_live` wherever
++  it falls in the day, not only in the excused window, and so is a live row
++  the read skips as malformed (`malformed_rows` on the `finished` line). A
++  traded or index minute missing for either reason reads as real loss and
++  the day reads `diverged`. This change makes that larger: such a day used
++  to read `partial` whenever any vendor fetch failed, and now reads
++  `diverged`. Before treating a `diverged` day as packet loss, check
++  `malformed_rows`, the WAL apply lag and the spill directory for that day
++  (pinned by
++  `a_live_bar_unreadable_at_the_read_is_judged_missing_and_diverged_until_51d`).
 +- A truncated live read judges no missing minute for the whole day, including
 +  minutes early in the day that the read did return.
 +- The excused window is the derived constant, not the actual seal progress of
 +  that day (51d).
++- A feed whose newest folded trade stamp stops more than
++  `LAST_FOLDED_TRADE_SLACK_SECS` (60 s) before the close (sockets down from
++  15:38:40, or sparse closing stamps) leaves buckets before 15:35 unsealed at
++  the read; a traded minute missing there is counted as real and the day
++  reads `diverged` for a minute that was only unsealed, not lost. Until 51d
++  replaces the window with the published seal progress.
 +
 +**What a PR that violates §12.15.9 looks like (REJECT):** a literal count of excused end-of-session minutes, or a late window not derived from the catch-up margin; letting `rest_incomplete` (a failed fetch or the budget) hide a judged missing minute or a price divergence; an excused or unjudged minute that leaves the day `clean`; any input that turns a `diverged` day into anything else; excusing a minute under `Strict`; changing `is_catastrophic_divergence` or any page under cover of this section; dropping the `tail_unsealed` column or kind; a new alarm, filter or page source for these findings without its own dated row in the noise lock.
 diff --git a/docs/error-runbooks/dhan-live-crossverify-error-codes.md b/docs/error-runbooks/dhan-live-crossverify-error-codes.md
-index 07c280bf8..709dfcad9 100644
+index 07c280bf8..793cda1f7 100644
 --- a/docs/error-runbooks/dhan-live-crossverify-error-codes.md
 +++ b/docs/error-runbooks/dhan-live-crossverify-error-codes.md
-@@ -127,3 +127,24 @@ after the limit. That the database client gives up at its request timeout
+@@ -127,3 +127,33 @@ after the limit. That the database client gives up at its request timeout
  plus the bytes at its minimum throughput is read from its source; that the
  HTTP timeout covers the whole request is assumed. The marker write is one
  small file and is not bounded on a stalled disk.
@@ -1939,3 +2078,12 @@ index 07c280bf8..709dfcad9 100644
 +budget ran out (it read `partial`). Query by day, not by `outcome`: the daily
 +DEDUP key includes `outcome`, so re-running an old day that now reads
 +differently adds a second row.
++
++**A `diverged` day is not always packet loss (until plan item 51d).** A
++traded or index minute is also missing from our side when its sealed bar was
++not readable at the read (still queued for the seal writer, staged in a spill
++file not yet replayed, or not yet applied by QuestDB's WAL) or when the read
++skipped its row as malformed. Before treating a `diverged` day as lost ticks,
++check `malformed_rows` on the `finished` line, the WAL apply lag at the read
++and the spill directory for that day, then re-run the day once QuestDB has
++caught up.

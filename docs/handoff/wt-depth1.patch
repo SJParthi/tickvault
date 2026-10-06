@@ -1,5 +1,5 @@
 diff --git a/.claude/plans/active-plan-feed-hardening.md b/.claude/plans/active-plan-feed-hardening.md
-index 29583a427..a7201e60a 100644
+index f41215dc5..65f4ec6bc 100644
 --- a/.claude/plans/active-plan-feed-hardening.md
 +++ b/.claude/plans/active-plan-feed-hardening.md
 @@ -6354,6 +6354,28 @@ Each refused level stays in its slot as NaN (reads back null; positions stay ali
@@ -32,7 +32,7 @@ index 29583a427..a7201e60a 100644
  
  Approved by Parthiban 2026-10-06: "Go ahead with whatever you want dude" and "See do everything whatever is recommended dude okay?", answering the recommended cross-verification hardening list (five findings: the day marker, the read that runs too early, missing minutes that never page, a day with no run at all, and targets fixed at boot). Rule authority: `no-rest-except-live-feed-2026-06-27.md` §12.15.7 onward and the noise lock §2.5 notes, each dated and recorded before its code. Ten serial PRs, one sub-item each. Findings Verified by reading `origin/main` at `60bdfd97a`; cargo was not run for the findings.
 diff --git a/CLAUDE.md b/CLAUDE.md
-index 7a1c6fa54..f81fb0736 100644
+index 19e1c3862..2668ed05f 100644
 --- a/CLAUDE.md
 +++ b/CLAUDE.md
 @@ -118,6 +118,7 @@ this list is now stated as audited-as-of a date rather than as exhaustive.
@@ -526,10 +526,10 @@ index c4a757e03..df3349043 100644
              .is_err()
 diff --git a/crates/storage/src/depth_spill_frame.rs b/crates/storage/src/depth_spill_frame.rs
 new file mode 100644
-index 000000000..eaec190ad
+index 000000000..860d677c6
 --- /dev/null
 +++ b/crates/storage/src/depth_spill_frame.rs
-@@ -0,0 +1,1512 @@
+@@ -0,0 +1,1571 @@
 +//! Length-framed records for the depth spill tier (plan item 49d-1,
 +//! 2026-10-06).
 +//!
@@ -1186,16 +1186,24 @@ index 000000000..eaec190ad
 +
 +/// Writes one prebuilt header and its chunk per record. No CRC here: the
 +/// headers were built before the lock.
++///
++/// `whole` is raised by each record's full length (header plus payload) as
++/// soon as that record is written in full, so on an error it holds the bytes
++/// of the records that DID land whole. The caller cuts back to that point and
++/// keeps them (review 2026-10-06: cutting back to the batch start threw away
++/// whole, checksummed records the old text tier would have kept).
 +fn write_v1_records<W: Write>(
 +    out: &mut W,
 +    payload: &[u8],
 +    ranges: &[std::ops::Range<usize>],
 +    headers: &[[u8; FRAME_HEADER_BYTES]],
++    whole: &mut u64,
 +) -> io::Result<()> {
 +    // O(1) EXEMPT: begin — cold rescue path, at most four records per batch.
 +    for (range, header) in ranges.iter().zip(headers) {
 +        out.write_all(header)?;
 +        out.write_all(&payload[range.clone()])?;
++        *whole += (FRAME_HEADER_BYTES + range.len()) as u64;
 +    }
 +    // O(1) EXEMPT: end
 +    Ok(())
@@ -1208,10 +1216,14 @@ index 000000000..eaec190ad
 +/// sync) and the [`DirSyncTicket`] read under the lock (for
 +/// [`sync_dir_entries`]).
 +///
-+/// On a failed write the file is cut back to its length before this call,
-+/// so a half-written record never sits in front of later appends. If the
-+/// cut-back also fails, a coded `error!` names the file; the replay's resync
-+/// sets the fragment aside later.
++/// On a failed write the file is cut back to the end of the last record this
++/// call wrote in full, so a half-written record never sits in front of later
++/// appends while the batch's whole records stay replayable (as the text tier
++/// kept every whole line it had written). The call still returns the error,
++/// so the caller counts the batch as not landed and marks its range
++/// unapplied; a row then reaching QuestDB twice (refold and replay) upserts
++/// onto itself under the depth DEDUP key. If the cut-back also fails, a coded
++/// `error!` names the file; the replay's resync sets the fragment aside later.
 +///
 +/// Never syncs: the lock must never be held across an fsync, or the drain's
 +/// inline fallback could wait on another appender's disk flush.
@@ -1246,21 +1258,24 @@ index 000000000..eaec190ad
 +        .append(true)
 +        .open(path)?;
 +    let start = file.metadata()?.len();
-+    let written = write_with_test_hooks(&mut file, payload, &ranges, &headers);
++    let mut whole: u64 = 0;
++    let written = write_with_test_hooks(&mut file, payload, &ranges, &headers, &mut whole);
 +    if let Err(err) = written {
-+        if let Err(cut_err) = cut_back(&file, start) {
++        let keep = start + whole;
++        if let Err(cut_err) = cut_back(&file, keep) {
 +            error!(
 +                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
 +                source = "depth_framed_cut_back_failed",
 +                path = %path.display(),
 +                start,
++                keep,
 +                %cut_err,
 +                write_error = %err,
 +                "a depth spill write failed part-way and the file could not be cut back \
 +                 to its last whole record. The partial record stays in the file; the \
 +                 spill replay recognises it by its checksum and sets it aside in \
-+                 quarantine, so later records still replay. This batch itself was not \
-+                 written (the caller counts it)."
++                 quarantine, so later records still replay. The batch's whole records \
++                 stay and replay; the caller still counts the batch as not landed."
 +            );
 +        }
 +        return Err(err);
@@ -1275,8 +1290,9 @@ index 000000000..eaec190ad
 +    payload: &[u8],
 +    ranges: &[std::ops::Range<usize>],
 +    headers: &[[u8; FRAME_HEADER_BYTES]],
++    whole: &mut u64,
 +) -> io::Result<()> {
-+    write_v1_records(file, payload, ranges, headers)
++    write_v1_records(file, payload, ranges, headers, whole)
 +}
 +
 +#[cfg(not(test))]
@@ -1290,6 +1306,7 @@ index 000000000..eaec190ad
 +    payload: &[u8],
 +    ranges: &[std::ops::Range<usize>],
 +    headers: &[[u8; FRAME_HEADER_BYTES]],
++    whole: &mut u64,
 +) -> io::Result<()> {
 +    match test_hooks::FAIL_WRITE_AFTER.with(std::cell::Cell::take) {
 +        Some(budget) => {
@@ -1297,9 +1314,9 @@ index 000000000..eaec190ad
 +                inner: file,
 +                left: budget,
 +            };
-+            write_v1_records(&mut out, payload, ranges, headers)
++            write_v1_records(&mut out, payload, ranges, headers, whole)
 +        }
-+        None => write_v1_records(file, payload, ranges, headers),
++        None => write_v1_records(file, payload, ranges, headers, whole),
 +    }
 +}
 +
@@ -1679,6 +1696,48 @@ index 000000000..eaec190ad
 +        let _ = std::fs::remove_dir_all(&dir);
 +    }
 +
++    /// Review 2026-10-06: a multi-record batch that fails part-way through
++    /// record 2 keeps record 1 (whole, checksummed) instead of cutting the
++    /// file back to the batch start. Bite-check: with the cut-back target set
++    /// to `start` again, `framed_payloads` is empty and this fails.
++    #[test]
++    fn a_batch_failing_in_its_second_record_keeps_its_first_whole_record() {
++        let dir = scratch("cut-back-multi");
++        let path = dir.join("depth-dhan-1.ilpf");
++        // Three lines, each over half a record, so each is its own record.
++        let line_len = FRAMED_MAX_PAYLOAD / 2 + 1;
++        let line = |c: u8| {
++            let mut l = b"market_depth a=".to_vec();
++            l.resize(line_len - 1, c);
++            l.push(b'\n');
++            l
++        };
++        let (l1, l2, l3) = (line(b'1'), line(b'2'), line(b'3'));
++        let mut batch = l1.clone();
++        batch.extend_from_slice(&l2);
++        batch.extend_from_slice(&l3);
++        assert_eq!(
++            crate::tick_spill_replay::ilp_chunk_ranges(&batch, FRAMED_MAX_PAYLOAD).len(),
++            3,
++            "three records"
++        );
++        test_hooks::FAIL_WRITE_AFTER
++            .with(|c| c.set(Some(FRAME_HEADER_BYTES + line_len + FRAME_HEADER_BYTES + 5)));
++        append_v1_records(&path, &batch, (1, 3)).expect_err("injected failure");
++        assert_eq!(
++            std::fs::metadata(&path).expect("stat").len(),
++            (FRAME_HEADER_BYTES + line_len) as u64,
++            "the file ends on record 1's boundary"
++        );
++        assert_eq!(framed_payloads(&path), l1, "record 1 still replays");
++        // A later append lands at a record boundary, after record 1.
++        append_v1_records(&path, b"market_depth a=9i 9\n", (4, 4)).expect("later append");
++        let mut want = l1;
++        want.extend_from_slice(b"market_depth a=9i 9\n");
++        assert_eq!(framed_payloads(&path), want);
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
 +    #[test]
 +    fn a_failed_cut_back_leaves_a_fragment_the_reader_sets_aside_and_later_records_replay() {
 +        let dir = scratch("cut-back-fails");
@@ -2044,10 +2103,10 @@ index 000000000..eaec190ad
 +}
 diff --git a/crates/storage/src/depth_spill_framed_replay.rs b/crates/storage/src/depth_spill_framed_replay.rs
 new file mode 100644
-index 000000000..589e8f543
+index 000000000..7cdeb5155
 --- /dev/null
 +++ b/crates/storage/src/depth_spill_framed_replay.rs
-@@ -0,0 +1,1212 @@
+@@ -0,0 +1,1284 @@
 +//! Replay of the length-framed depth spill (`.ilpf`, plan item 49d-1,
 +//! 2026-10-06).
 +//!
@@ -2364,6 +2423,18 @@ index 000000000..589e8f543
 +        Ok(resp) if is_permanent_refusal(resp.status().as_u16()) => {
 +            let status = resp.status().as_u16();
 +            match isolate_refused_lines(client, url, &sent, progress.any_accepted).await {
++                LineIsolation::Isolated(rejected)
++                    if rejected.iter().map(|r| r.len() as u64).sum::<u64>()
++                        >= sent.len() as u64 =>
++                {
++                    // Review 2026-10-06: every line of this record was refused.
++                    // `isolate_refused_lines` answers `Isolated` here whenever an
++                    // earlier record of the file was accepted, so without this
++                    // arm a table-level refusal after one good record never
++                    // counted as "refused whole" and drained the whole backlog
++                    // into `.rejected-lines` instead of quarantining the file.
++                    refused_whole(dir, path, status, bytes, rows, progress, outcome)
++                }
 +                LineIsolation::Isolated(rejected) => {
 +                    let rejected_bytes: u64 = rejected.iter().map(|r| r.len() as u64).sum();
 +                    if let Err(err) = set_aside_rejected_lines(dir, path, &sent, &rejected) {
@@ -2373,10 +2444,10 @@ index 000000000..589e8f543
 +                    metrics::counter!(REPLAY_LINES_REJECTED_COUNTER, "dir" => dir_label(dir))
 +                        .increment(lines);
 +                    outcome.lines_set_aside = outcome.lines_set_aside.saturating_add(lines);
++                    // At least one line of the record was accepted (the arm
++                    // above takes a record refused line for line).
 +                    let accepted = (sent.len() as u64).saturating_sub(rejected_bytes);
-+                    if accepted > 0 {
-+                        progress.any_accepted = true;
-+                    }
++                    progress.any_accepted = true;
 +                    progress.refused_whole_in_a_row = 0;
 +                    note_replayed(outcome, accepted);
 +                    error!(
@@ -2398,23 +2469,35 @@ index 000000000..589e8f543
 +                    "QuestDB stopped answering while refused lines were isolated".to_string(),
 +                ),
 +                LineIsolation::WholeFile => {
-+                    // Finding 2026-10-06: one framed record is one rescue
-+                    // batch, often a single row, so it alone must not decide
-+                    // the file's fate. Set it aside and carry on, unless
-+                    // records keep being refused whole (a table-level
-+                    // refusal).
-+                    progress.refused_whole_in_a_row =
-+                        progress.refused_whole_in_a_row.saturating_add(1);
-+                    if progress.refused_whole_in_a_row >= FRAMED_REFUSED_WHOLE_IN_A_ROW_QUARANTINE {
-+                        quarantine_whole_file(dir, path, status, outcome)
-+                    } else {
-+                        set_aside_record(dir, path, SetAside::Refused, bytes, rows, outcome)
-+                    }
++                    refused_whole(dir, path, status, bytes, rows, progress, outcome)
 +                }
 +            }
 +        }
 +        Ok(resp) => RecordEnd::Retry("post", format!("HTTP {}", resp.status().as_u16())),
 +        Err(err) => RecordEnd::Retry("post", describe_send_error(&err).to_string()),
++    }
++}
++
++/// A record QuestDB refused whole (no line of it accepted). Finding
++/// 2026-10-06: one framed record is one rescue batch, often a single row, so
++/// it alone must not decide the file's fate. Set it aside and carry on,
++/// unless records keep being refused whole (a table-level refusal): at
++/// [`FRAMED_REFUSED_WHOLE_IN_A_ROW_QUARANTINE`] in a row the file is
++/// quarantined. O(1) plus the set-aside write.
++fn refused_whole(
++    dir: &Path,
++    path: &Path,
++    status: u16,
++    bytes: &[u8],
++    rows: u64,
++    progress: &mut FileProgress,
++    outcome: &mut SpillReplayOutcome,
++) -> RecordEnd {
++    progress.refused_whole_in_a_row = progress.refused_whole_in_a_row.saturating_add(1);
++    if progress.refused_whole_in_a_row >= FRAMED_REFUSED_WHOLE_IN_A_ROW_QUARANTINE {
++        quarantine_whole_file(dir, path, status, outcome)
++    } else {
++        set_aside_record(dir, path, SetAside::Refused, bytes, rows, outcome)
 +    }
 +}
 +
@@ -3037,6 +3120,54 @@ index 000000000..589e8f543
 +        cleanup(&dir, &path);
 +    }
 +
++    /// Review 2026-10-06: a table-level refusal that starts AFTER a record of
++    /// the file was accepted. `isolate_refused_lines` then answers `Isolated`
++    /// with every line refused, which the first version counted as a partial
++    /// acceptance: the counter reset, every small record was drained into
++    /// `.rejected-lines` and the file removed. Now a record refused line for
++    /// line counts as refused whole, and the third quarantines the file.
++    /// Bite-check: without the all-lines-refused arm, `files_quarantined` is
++    /// 0, `.rejected-lines` holds every poison line and the file is gone.
++    #[tokio::test]
++    async fn records_refused_line_for_line_after_an_accepted_one_still_quarantine_the_file() {
++        let dir = depth_dir("whole-after-good");
++        let path = dir.join("depth-dhan-1.ilpf");
++        append_v1_records(&path, &lines(0..2), (1, 1)).expect("good");
++        append_v1_records(&path, b"market_depth poison=1i 1\n", (2, 2)).expect("p1");
++        append_v1_records(
++            &path,
++            b"market_depth poison=2i 2\nmarket_depth poison=3i 3\n",
++            (3, 3),
++        )
++        .expect("p2");
++        append_v1_records(
++            &path,
++            b"market_depth poison=4i 4\nmarket_depth poison=5i 5\nmarket_depth poison=6i 6\n",
++            (4, 4),
++        )
++        .expect("p3");
++        append_v1_records(&path, &lines(2..4), (5, 5)).expect("good");
++        let on_disk = std::fs::read(&path).expect("read");
++        let server = spawn_recording_server(false, None).await;
++        let out = replay_framed_spill_dir(&dir, &server.url, &client()).await;
++        assert_eq!(out.files_quarantined, 1, "the file is quarantined");
++        assert_eq!(
++            quarantined(&dir, "depth-dhan-1.ilpf"),
++            on_disk,
++            "moved intact"
++        );
++        assert!(
++            quarantined(&dir, "depth-dhan-1.ilpf.rejected-lines").is_empty(),
++            "nothing was drained into .rejected-lines"
++        );
++        assert!(
++            !quarantined(&dir, "depth-dhan-1.ilpf.refused-records").is_empty(),
++            "the records refused before the third are kept whole"
++        );
++        assert!(!path.exists());
++        cleanup(&dir, &path);
++    }
++
 +    /// A table-level refusal: every record is refused whole. The third in a
 +    /// row moves the whole file to quarantine (the first two are also kept
 +    /// as `.refused-records`), so the replay does not grind through a file
@@ -3277,7 +3408,7 @@ index 19e216e62..00b59181e 100644
  // does not use (open interest, previous close, market status, disconnect, the
  // connect snapshot, out-of-window ticks). Rows ride the `ticks` writer's
 diff --git a/crates/storage/src/tick_spill_replay.rs b/crates/storage/src/tick_spill_replay.rs
-index fbc4b5ea4..53faf4ef5 100644
+index fbc4b5ea4..cb9d0ddb1 100644
 --- a/crates/storage/src/tick_spill_replay.rs
 +++ b/crates/storage/src/tick_spill_replay.rs
 @@ -120,6 +120,24 @@ pub struct SpillReplayOutcome {
@@ -3389,7 +3520,28 @@ index fbc4b5ea4..53faf4ef5 100644
      dir: &Path,
      spill_path: &Path,
      chunk: &[u8],
-@@ -1506,11 +1527,29 @@ async fn run_replay_loop(dir: PathBuf, url: String, require_upload: bool) {
+@@ -794,10 +815,19 @@ pub async fn replay_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillRe
+     // written to. Everything before it has been closed by the hour rollover.
+     // That distinction is what makes the truncate below provably safe: a closed
+     // file has no appender, so emptying it cannot destroy anything.
++    //
++    // Review 2026-10-06: with the depth writer on the framed format
++    // (`DEPTH_SPILL_WRITES_FRAMED`), nothing appends to a depth `.ilp` file
++    // any more, so no legacy depth text file can be "the live one". Without
++    // this, the newest legacy file stayed the last entry forever: drained by
++    // resume offset, never emptied, re-sent whole after every restart, and
++    // counted against the depth spill ceiling for good.
++    let text_appender_exists =
++        !(is_depth_spill_dir(dir) && crate::depth_persistence::DEPTH_SPILL_WRITES_FRAMED);
+     let files = list_spill_files(dir);
+     let last_index = files.len().saturating_sub(1);
+     for (file_index, path) in files.into_iter().enumerate() {
+-        let writer_may_still_append = file_index == last_index;
++        let writer_may_still_append = text_appender_exists && file_index == last_index;
+         // Size from METADATA, never from a materialised read. This is the
+         // 2026-09-03 fix: `std::fs::read` here held a 21 GB file in RAM.
+         let file_len = match std::fs::metadata(&path) {
+@@ -1506,11 +1536,29 @@ async fn run_replay_loop(dir: PathBuf, url: String, require_upload: bool) {
          if held {
              metrics::counter!("tv_depth_spill_replay_held_total").increment(1);
          }
@@ -3420,7 +3572,7 @@ index fbc4b5ea4..53faf4ef5 100644
              };
              // Trim quarantine on every round, not only at boot (2026-08-28,
              // round-2 fix). Quarantine is written BY THIS LOOP during the
-@@ -2204,7 +2243,11 @@ mod tests {
+@@ -2204,7 +2252,11 @@ mod tests {
          let blocking = body
              .find("spawn_blocking(")
              .expect("the round must run on the blocking pool");
@@ -3433,7 +3585,7 @@ index fbc4b5ea4..53faf4ef5 100644
              let at = body.find(step).expect("the round step must exist");
              assert!(
                  at > blocking,
-@@ -3267,4 +3310,75 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
+@@ -3267,4 +3319,75 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
              "the replay call site compares against this label"
          );
      }
@@ -3482,7 +3634,7 @@ index fbc4b5ea4..53faf4ef5 100644
 +        let url = "http://127.0.0.1:1/write";
 +        assert_eq!(
 +            isolate_refused_lines(&client, url, &line, true).await,
-+            LineIsolation::Isolated(vec![0..line.len()]),
++            LineIsolation::Isolated(std::iter::once(0..line.len()).collect()),
 +            "other rows of the file were accepted: set the line aside"
 +        );
 +        assert_eq!(
