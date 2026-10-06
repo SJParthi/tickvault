@@ -2104,10 +2104,10 @@ Recorded before the code, per the rule-file-first law. It changes WHEN the §12.
 | Aspect | Locked value |
 |---|---|
 | Attempts per trading day | at most `XVERIFY_MAX_ATTEMPTS_PER_DAY` = **4**, the first included |
-| Gap between attempts | `XVERIFY_RETRY_INTERVAL_SECS` = **900 s** |
+| Gap between attempts | `XVERIFY_RETRY_INTERVAL_SECS` = **900 s** *(superseded 2026-10-06, §12.15.8: **760 s**)* |
 | Longest attempt | token wait (300 s) + `run_budget_secs` (600 s default) + 60 s persist margin = **960 s** |
-| Last start | an attempt is started only if it can finish by the **17:30 IST** evening stop |
-| Worst case with the default budget | all 4 attempts fit before 17:30 exactly (pinned by test) |
+| Last start | an attempt is started only if it can finish by the **17:30 IST** evening stop *(superseded 2026-10-06, §12.15.8: it must finish by **17:23 IST**, before the 17:25 scheduled-stop window; the 17:30 bound was a defect)* |
+| Worst case with the default budget | all 4 attempts fit before 17:30 exactly (pinned by test) *(superseded 2026-10-06, §12.15.8: still 4 attempts, ending exactly at 17:23)* |
 | Page | ONCE per day, after the last attempt: `xverify_vacuous` or `xverify_failed`. Each attempt only logs a `warn!` with a source no filter matches |
 | Divergence page | fires on the first attempt that measures it; a retry never pages it again |
 | Marker rule | unchanged — `should_write_marker && run_is_complete`, now expressed by `classify_attempt` and proven equal across every outcome |
@@ -2117,7 +2117,7 @@ Recorded before the code, per the rule-file-first law. It changes WHEN the §12.
 
 **⚠ Honest limit.** A boot catch-up that starts after about 17:14 IST gets no retry, because its next attempt could not finish before 17:30. That day falls back to the §12.15.2 hold ceiling, as before.
 
-**What a PR that violates §12.15.5 looks like (REJECT):** pages `xverify_failed` or `xverify_vacuous` on every attempt; starts an attempt that could still be running at 17:30; raises the attempt count or shortens the interval without re-checking the evening-stop fit; writes the marker on any condition other than `classify_attempt` returning `Ok` in the same attempt, or in the immediately previous same-process attempt when that attempt failed only with `MarkerNotWritten` *(amended 2026-10-06, §12.15.7: the marker-only retry)*.
+**What a PR that violates §12.15.5 looks like (REJECT):** pages `xverify_failed` or `xverify_vacuous` on every attempt; starts an attempt that could still be running at 17:30 *(amended 2026-10-06, §12.15.8: at 17:23)*; raises the attempt count or shortens the interval without re-checking the evening-stop fit; writes the marker on any condition other than `classify_attempt` returning `Ok` in the same attempt, or in the immediately previous same-process attempt when that attempt failed only with `MarkerNotWritten` *(amended 2026-10-06, §12.15.7: the marker-only retry)*.
 
 ### §12.15.6 — 2026-09-25: the depth-held OPTION contracts are checked too, in a separate pass
 
@@ -2231,3 +2231,67 @@ its alarms, or the hold ceiling.
 - A refusal that repeats on every attempt (a schema conflict) leaves the day unmarked; it archives after the hold ceiling, loudly.
 
 **What a PR that violates §12.15.7 looks like (REJECT):** a marker write that returns unit or whose result can be dropped; a marker reader that only checks `is_file()`; a cross-verification sweep horizon shorter than the gated hold lookback; counting a discarded or refused audit row as persisted; a marker-only retry that re-runs the check, re-fetches the tape or re-pages the divergence; a new alarm, filter or page source for these failures without its own dated row in the noise lock.
+
+### §12.15.8 — 2026-10-06: every attempt ends by 17:23, under a timeout, and the last attempt is decided once
+
+**The verbatim owner approvals (2026-10-06, typed directly in-session — preserve EXACTLY, typos included):**
+
+> "Go ahead with whatever you want dude"
+
+> "See do everything whatever is recommended dude okay?"
+
+Given in direct response to the recommended cross-verification hardening list
+(plan ITEM 51, `.claude/plans/active-plan-feed-hardening.md`). This section is
+sub-item **51b** and is recorded HERE before the code, per the rule-file-first
+law. It changes WHEN an attempt may run and how long it may take. It does not
+change what the check compares, the marker rule (§12.15.7), the alarms, their
+filters, or the hold ceiling.
+
+**The gap (Verified by reading the code at `750a45701`).**
+- §12.15.5 bounded every attempt by the 17:30 IST evening stop
+  (`EVENING_STOP_SECS_OF_DAY_IST`). The box's scheduled-stop window starts at
+  **17:25** (`shutdown_class::SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST` =
+  62,700), because the stop cron's jitter is absorbed from there. An attempt
+  allowed to end at 17:30 could be killed by the stop half-way. **The old
+  17:30 bound was a defect, not a margin.**
+- Nothing enforced the bound. `attempt_max_secs` was a calculation; an attempt
+  that ran long (a slow token, a slow QuestDB read, a vendor fetch past the
+  budget) simply kept going.
+- Whether an attempt was the last was decided AFTER it, from its actual end
+  time. Plan item 51d needs to know BEFORE the read whether a not-ready read
+  may be retried, so the decision must be made once, before the attempt, and
+  never revised.
+
+| Aspect | Locked value |
+|---|---|
+| End bound | `XVERIFY_LAST_END_SECS_OF_DAY_IST` = **17:23 IST** (62,580) = `XVERIFY_DEADLINE_SECS_OF_DAY_IST` (17:24, 62,640) − 60 s, where the deadline = the scheduled-stop window start (17:25) − 60 s. Both derived from the `shutdown_class` constant, never literals; compile-time asserted `RUN (15:41) < LAST_END < DEADLINE < 17:25 ≤ 17:30` |
+| Gap between attempts | `XVERIFY_RETRY_INTERVAL_SECS` = **760 s** (supersedes §12.15.5's 900 s) |
+| Worst case with the default budget | 4 attempts of 960 s each, 760 s apart, end **exactly** at 17:23: 56,460 + 960 + 3 × 1,720 = 62,580 (compile-time asserted and pinned by test; supersedes §12.15.5's "fit before 17:30") |
+| Last start | an attempt is started only if its full length (token wait 300 s + run budget + 60 s persist margin) ends by 17:23 (supersedes §12.15.5's "finish by 17:30") |
+| Shrunk budget | `attempt_budget_secs(now, config)`: the configured budget, or, when that would end after 17:23, the room left (`17:23 − now − 300 − 60`). A room below **120 s** (`XVERIFY_MIN_ATTEMPT_BUDGET_SECS`) skips the attempt: coded `warn!`, `source = "xverify_attempt_skipped_no_time"`, the attempt fails `incomplete`. A run cut short by a shrunk budget ends `budget_elapsed`, which is `incomplete`, so it never writes the marker |
+| Timeout | every full attempt runs under `tokio::time::timeout(attempt_max_secs(budget))`. On elapse: coded `warn!`, `source = "xverify_attempt_timed_out"`, the attempt fails `incomplete`. The option pass runs under `timeout(attempt_max_secs(150))`; on elapse `source = "xverify_options_timed_out"`, outcome label `timed_out` |
+| Last attempt | decided ONCE, before the attempt: `is_last = retry_delay_secs(n, start + attempt_max, attempt_max).is_none()` (`attempt_is_last`), from the configured budget. After the attempt the same value is used: last → the one page; otherwise sleep 760 s and try again. A marker-only attempt (§12.15.7) uses the same rule |
+| Option pass (§12.15.6) | starts only if it ends by 17:23 (`option_pass_fits`), as before but on the new bound |
+| After the stop window | an attempt that starts at or after **17:45** (`SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST`, a manual evening boot after the weekday stop cron has fired) runs once with the configured budget, under the timeout, as before this change. Starts from about 17:15 up to 17:45 are skipped |
+| Page | unchanged: once, after the last attempt, on `xverify_failed` / `xverify_vacuous`. The new sources are log-sink-only; no alarm, filter, EMF name or page is added |
+
+**⚠ Honest limits (Rule 11).**
+- `tokio::time::timeout` can stop an attempt only at an `.await`. The audit
+  persist and the marker write run synchronously after the comparison returns,
+  so a persist that is still running at the limit finishes, and its result
+  stands. Its time is meant to fit in the 60 s persist margin; that it always
+  does is **Assumed**, not measured. A later attempt's start is re-checked
+  against 17:23 (its budget shrinks), so a late persist cannot push the NEXT
+  attempt past the bound.
+- A run that hits its budget can still be inside one vendor fetch (up to
+  `fetch_timeout_secs`, 10 s by default) or a live read. The timeout cuts it
+  there; a run cut by the timeout persists nothing for that attempt.
+- Deciding the last attempt from the latest possible end is conservative: with
+  the default budget, a first attempt that starts after 16:38:20 gets no retry,
+  even if it fails in a second. §12.15.5's "after about 17:14" no longer holds.
+- That no scheduled stop comes after 17:45 is **Assumed** from the stop cron
+  (weekday-only, 17:30) and the window `shutdown_class` uses for its jitter.
+- On a weekend special session there is no stop cron at all; the 17:23 bound
+  still applies, which only costs time.
+
+**What a PR that violates §12.15.8 looks like (REJECT):** an attempt that starts before the 17:25 scheduled-stop window and can end after 17:23; an attempt with no `tokio::time::timeout`; lengthening `attempt_max_secs` (token wait, persist margin, or the default budget) without re-checking the four-attempt fit to 17:23; deciding the last attempt from the attempt's end time, or revising it after the attempt; a bound written as a literal instead of derived from `shutdown_class`; writing the marker from a run cut short by a shrunk budget or a timeout; a new alarm, filter or page source for these lines without its own dated row in the noise lock.
