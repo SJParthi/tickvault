@@ -19,7 +19,9 @@
 //! Complexity: cold path, once a day. Target building is O(subscribed); the
 //! comparison itself is documented in `dhan_live_crossverify`.
 
+use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use secrecy::{ExposeSecret, SecretString};
@@ -39,6 +41,9 @@ use crate::dhan_live_crossverify::{
     DayComparison, DhanLiveCrossverifyConfig, RUN_SECS_OF_DAY_IST, RunReport,
     SESSION_CLOSE_SECS_OF_DAY_IST, XverifyTarget, daily_row, deterministic_run_ts_nanos,
     run_cross_verification,
+};
+use crate::shutdown_class::{
+    SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST, SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST,
 };
 use crate::volume_leaderboard::OptionFamily;
 
@@ -284,18 +289,60 @@ pub const TOKEN_WAIT_MAX_POLLS: u32 = 60;
 /// day then never got a marker, and its S3 archive waited the full hold
 /// ceiling before archiving unverified. A same-day retry gives a transient
 /// failure (slow token, QuestDB busy, vendor blip) three more chances.
-pub const XVERIFY_RETRY_INTERVAL_SECS: u64 = 900;
+///
+/// 2026-10-06 (§12.15.8): 900 → 760 s, so four worst-case attempts still end
+/// by [`XVERIFY_LAST_END_SECS_OF_DAY_IST`] (compile-time asserted below).
+pub const XVERIFY_RETRY_INTERVAL_SECS: u64 = 760;
 
 /// The most attempts one trading day gets, the first one included.
 pub const XVERIFY_MAX_ATTEMPTS_PER_DAY: u32 = 4;
 
-/// 17:30 IST — the scheduled evening stop of the box. An attempt that could
-/// still be running at this time is not started, because the stop would kill
-/// it half-way.
+/// 17:30 IST — when the weekday stop cron fires. Kept for documentation and
+/// the ordering assert only: since 2026-10-06 (§12.15.8) no attempt is bounded
+/// by it, because the scheduled-stop window opens 5 minutes earlier, at
+/// [`SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST`] (17:25), and an attempt
+/// allowed to end at 17:30 could be killed half-way.
 pub const EVENING_STOP_SECS_OF_DAY_IST: u64 = 17 * 3_600 + 30 * 60;
+
+/// 17:24 IST — one minute before the scheduled-stop window opens. Derived from
+/// the `shutdown_class` constant, never a literal (§12.15.8).
+pub const XVERIFY_DEADLINE_SECS_OF_DAY_IST: u64 =
+    SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST as u64 - 60;
+
+/// 17:23 IST — the latest an attempt or the option pass may end, when it
+/// started before the scheduled-stop window (§12.15.8).
+pub const XVERIFY_LAST_END_SECS_OF_DAY_IST: u64 = XVERIFY_DEADLINE_SECS_OF_DAY_IST - 60;
+
+/// The smallest run budget a late attempt is shrunk to. Below it the attempt
+/// is skipped: a run that short compares too little to record the day.
+pub const XVERIFY_MIN_ATTEMPT_BUDGET_SECS: u64 = 120;
 
 /// Room left after the run budget for the audit flush and the marker write.
 const PERSIST_MARGIN_SECS: u64 = 60;
+
+/// The default `run_budget_secs`, mirrored here so the four-attempt fit can be
+/// asserted at compile time. Pinned to `DhanLiveCrossverifyConfig::default()`
+/// by `test_default_run_budget_mirror_matches_the_config_default`.
+const XVERIFY_DEFAULT_RUN_BUDGET_SECS: u64 = 600;
+
+const _: () = assert!(
+    XVERIFY_RUN_AT_SECS_OF_DAY_IST
+        + attempt_max_secs(XVERIFY_DEFAULT_RUN_BUDGET_SECS)
+        + (XVERIFY_MAX_ATTEMPTS_PER_DAY as u64 - 1)
+            * (XVERIFY_RETRY_INTERVAL_SECS + attempt_max_secs(XVERIFY_DEFAULT_RUN_BUDGET_SECS))
+        <= XVERIFY_LAST_END_SECS_OF_DAY_IST,
+    "four worst-case attempts with the default budget must end by 17:23 IST"
+);
+
+const _: () = assert!(
+    XVERIFY_RUN_AT_SECS_OF_DAY_IST < XVERIFY_LAST_END_SECS_OF_DAY_IST
+        && XVERIFY_LAST_END_SECS_OF_DAY_IST < XVERIFY_DEADLINE_SECS_OF_DAY_IST
+        && XVERIFY_DEADLINE_SECS_OF_DAY_IST < SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST as u64
+        && (SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST as u64) < EVENING_STOP_SECS_OF_DAY_IST
+        && EVENING_STOP_SECS_OF_DAY_IST < SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST as u64
+        && (SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST as u64) < SECS_PER_DAY,
+    "15:41 < 17:23 < 17:24 < 17:25 < 17:30 < 17:45 < midnight"
+);
 
 /// Same-day retries, by the reason the previous attempt failed. Local
 /// `/metrics` only; the final failure still pages through the existing
@@ -354,7 +401,8 @@ pub const fn attempt_max_secs(run_budget_secs: u64) -> u64 {
 
 /// Seconds to wait before the next same-day attempt, or `None` when there is
 /// no next attempt: the day's attempts are used up, or the next attempt could
-/// still be running at the evening stop. Pure, O(1).
+/// still be running at [`XVERIFY_LAST_END_SECS_OF_DAY_IST`] (17:23 IST; the
+/// 17:30 bound before 2026-10-06 was a defect, §12.15.8). Pure, O(1).
 #[must_use]
 pub const fn retry_delay_secs(
     attempts_made: u32,
@@ -367,10 +415,70 @@ pub const fn retry_delay_secs(
     let next_end = now_secs_of_day
         .saturating_add(XVERIFY_RETRY_INTERVAL_SECS)
         .saturating_add(attempt_max_secs);
-    if next_end > EVENING_STOP_SECS_OF_DAY_IST {
+    if next_end > XVERIFY_LAST_END_SECS_OF_DAY_IST {
         return None;
     }
     Some(XVERIFY_RETRY_INTERVAL_SECS)
+}
+
+/// Whether attempt number `attempt_number` (1-based), starting at
+/// `start_secs_of_day`, is the day's last (§12.15.8).
+///
+/// Decided ONCE, before the attempt, from the LATEST end it can have
+/// (`start + attempt_max_secs`), and never revised afterwards. An attempt that
+/// is not the last therefore always leaves room for the next one, however
+/// early it actually ends, and a decision made before the read (plan item
+/// 51d) can never disagree with the retry loop. Pure, O(1).
+#[must_use]
+pub const fn attempt_is_last(
+    attempt_number: u32,
+    start_secs_of_day: u64,
+    attempt_max_secs: u64,
+) -> bool {
+    retry_delay_secs(
+        attempt_number,
+        start_secs_of_day.saturating_add(attempt_max_secs),
+        attempt_max_secs,
+    )
+    .is_none()
+}
+
+/// The run budget for a full attempt starting at `now_secs_of_day`, or `None`
+/// when it should not start (§12.15.8).
+///
+/// - At or after the scheduled-stop window's end (17:45, a manual evening
+///   boot after the weekday stop has fired) and before midnight: the
+///   configured budget, unchanged.
+/// - Otherwise the configured budget when the whole attempt (token wait,
+///   budget, persist margin) ends by [`XVERIFY_LAST_END_SECS_OF_DAY_IST`];
+///   else the room left, when that is at least
+///   [`XVERIFY_MIN_ATTEMPT_BUDGET_SECS`]; else `None`.
+/// - A clock reading of a day or more is nonsense and returns `None`.
+///
+/// A shrunk run that stops at its budget ends `budget_elapsed`, which
+/// [`run_is_complete`] reads as incomplete, so it never writes the marker.
+/// Pure, O(1).
+#[must_use]
+pub const fn attempt_budget_secs(now_secs_of_day: u64, config_budget_secs: u64) -> Option<u64> {
+    if now_secs_of_day >= SECS_PER_DAY {
+        return None;
+    }
+    if now_secs_of_day >= SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST as u64 {
+        return Some(config_budget_secs);
+    }
+    // `attempt_max_secs(0)` is the fixed part: token wait plus persist margin.
+    let Some(room) = XVERIFY_LAST_END_SECS_OF_DAY_IST
+        .checked_sub(now_secs_of_day.saturating_add(attempt_max_secs(0)))
+    else {
+        return None;
+    };
+    if config_budget_secs <= room {
+        Some(config_budget_secs)
+    } else if room >= XVERIFY_MIN_ATTEMPT_BUDGET_SECS {
+        Some(room)
+    } else {
+        None
+    }
 }
 
 /// Whether one finished attempt recorded the day, and if not, why. The
@@ -550,82 +658,248 @@ pub fn spawn_dhan_live_crossverify(
     })
 }
 
-/// Runs today's check, retrying on the same day until it records the day or
-/// the retry window closes. Each attempt is bounded by the token wait and the
-/// run budget; the number of attempts is bounded by
-/// [`XVERIFY_MAX_ATTEMPTS_PER_DAY`] and by the evening stop.
-async fn run_day(
-    deps: &CrossverifyBootDeps,
-    targets: &[XverifyTarget],
+/// One attempt as the day loop plans it, before it starts (§12.15.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AttemptPlan {
+    /// 1-based attempt number.
+    number: u32,
+    /// IST seconds of day when the attempt starts.
+    start_secs_of_day: u64,
+    /// Full run or marker-only (§12.15.7).
+    kind: AttemptKind,
+    /// The run budget of a full attempt, from [`attempt_budget_secs`]; `0`
+    /// for a marker-only attempt.
+    run_budget_secs: u64,
+    /// Decided once, before the attempt, by [`attempt_is_last`].
+    is_last: bool,
+}
+
+/// How the day loop ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DayResult {
+    /// Attempts made, the first included.
+    attempts: u32,
+    /// `None` when an attempt recorded the day; otherwise the last failure.
+    failure: Option<AttemptFailure>,
+    /// The IST day changed during a retry sleep; nothing more is done today.
+    day_changed: bool,
+}
+
+/// Runs `attempt` under `tokio::time::timeout(limit_secs)` (§12.15.8). An
+/// elapsed timeout is an incomplete attempt: coded `warn!`, no marker, no
+/// page. The timeout can stop an attempt only at an `.await`, so a persist
+/// already running when the limit passes finishes and its result stands.
+async fn bounded_attempt<F>(
     today: chrono::NaiveDate,
-    day_start_ist_nanos: i64,
-) {
-    let max_attempt_secs = attempt_max_secs(deps.config.run_budget_secs);
+    attempt_number: u32,
+    limit_secs: u64,
+    attempt: F,
+) -> Result<(), AttemptFailure>
+where
+    F: Future<Output = Result<(), AttemptFailure>>,
+{
+    match tokio::time::timeout(Duration::from_secs(limit_secs), attempt).await {
+        Ok(outcome) => outcome,
+        Err(_elapsed) => {
+            warn!(
+                code = ErrorCode::WsGapConnectionState.code_str(),
+                source = "xverify_attempt_timed_out",
+                %today,
+                attempt = attempt_number,
+                limit_secs,
+                last_end_ist_secs = XVERIFY_LAST_END_SECS_OF_DAY_IST,
+                "Dhan 1-minute cross-verification attempt did not finish within its time \
+                 limit and was stopped, so it ends before the evening stop; this attempt \
+                 does not record today"
+            );
+            Err(AttemptFailure::Incomplete)
+        }
+    }
+}
+
+/// The same-day retry loop, with the clock, the day check and the attempt
+/// injected so every permutation is testable against a paused clock.
+///
+/// Before each attempt it decides, once, whether the attempt is the last
+/// ([`attempt_is_last`]) and, for a full attempt, its budget
+/// ([`attempt_budget_secs`]); a full attempt runs under [`bounded_attempt`].
+/// After a failed attempt the SAME `is_last` decides: the last returns the
+/// failure for the one page, any other sleeps
+/// [`XVERIFY_RETRY_INTERVAL_SECS`]. A marker-only attempt (§12.15.7) is one
+/// synchronous file write: it gets the same `is_last` rule and no budget.
+/// O(1) per attempt, at most [`XVERIFY_MAX_ATTEMPTS_PER_DAY`] attempts.
+async fn drive_day<N, S, A, Fut>(
+    today: chrono::NaiveDate,
+    config_budget_secs: u64,
+    mut now_secs_of_day: N,
+    mut still_today: S,
+    mut attempt: A,
+) -> DayResult
+where
+    N: FnMut() -> u64,
+    S: FnMut() -> bool,
+    A: FnMut(AttemptPlan) -> Fut,
+    Fut: Future<Output = Result<(), AttemptFailure>>,
+{
+    let max_attempt_secs = attempt_max_secs(config_budget_secs);
     let mut attempts: u32 = 0;
-    let mut divergence_paged = false;
     let mut previous: Option<AttemptFailure> = None;
     loop {
         attempts = attempts.saturating_add(1);
+        let start = now_secs_of_day();
+        // §12.15.8: decided once, before the attempt, from the latest end it
+        // can have; never revised from the attempt's actual end.
+        let is_last = attempt_is_last(attempts, start, max_attempt_secs);
         let outcome = match next_attempt_kind(previous) {
             AttemptKind::MarkerOnly => {
-                // §12.15.7: the previous attempt compared and persisted
-                // everything and failed only to save the marker. Re-running
-                // the check would re-fetch the vendor tape for nothing, so
-                // this attempt only writes the marker.
-                record_day(today)
-            }
-            AttemptKind::Full => {
-                run_once(
-                    deps,
-                    targets,
-                    today,
-                    day_start_ist_nanos,
-                    &mut divergence_paged,
-                )
+                attempt(AttemptPlan {
+                    number: attempts,
+                    start_secs_of_day: start,
+                    kind: AttemptKind::MarkerOnly,
+                    run_budget_secs: 0,
+                    is_last,
+                })
                 .await
             }
+            AttemptKind::Full => match attempt_budget_secs(start, config_budget_secs) {
+                Some(budget) => {
+                    let plan = AttemptPlan {
+                        number: attempts,
+                        start_secs_of_day: start,
+                        kind: AttemptKind::Full,
+                        run_budget_secs: budget,
+                        is_last,
+                    };
+                    bounded_attempt(today, attempts, attempt_max_secs(budget), attempt(plan)).await
+                }
+                None => {
+                    warn!(
+                        code = ErrorCode::WsGapConnectionState.code_str(),
+                        source = "xverify_attempt_skipped_no_time",
+                        %today,
+                        attempt = attempts,
+                        start_ist_secs = start,
+                        last_end_ist_secs = XVERIFY_LAST_END_SECS_OF_DAY_IST,
+                        config_budget_secs,
+                        "Dhan 1-minute cross-verification attempt skipped: too little time \
+                         left to run it before the evening stop; this attempt does not \
+                         record today"
+                    );
+                    Err(AttemptFailure::Incomplete)
+                }
+            },
         };
         let failure = match outcome {
             Ok(()) => {
                 if attempts > 1 {
                     info!(%today, attempts, "Dhan 1-minute cross-verification recorded on a same-day retry");
                 }
-                break;
+                return DayResult {
+                    attempts,
+                    failure: None,
+                    day_changed: false,
+                };
             }
             Err(failure) => failure,
         };
         previous = Some(failure);
-        match retry_delay_secs(attempts, now_ist_secs_of_day(), max_attempt_secs) {
-            Some(delay) => {
-                metrics::counter!(XVERIFY_RETRIES_COUNTER, "reason" => failure.as_str())
-                    .increment(1);
-                warn!(
-                    code = ErrorCode::WsGapConnectionState.code_str(),
-                    source = "xverify_retry",
-                    %today,
-                    reason = failure.as_str(),
-                    attempt = attempts,
-                    max_attempts = XVERIFY_MAX_ATTEMPTS_PER_DAY,
-                    retry_in_secs = delay,
-                    "Dhan 1-minute cross-verification did not record today — retrying later today"
-                );
-                tokio::time::sleep(Duration::from_secs(delay)).await;
-                // The day can only change here if the process ran past
-                // midnight, which the evening-stop bound rules out; checked
-                // anyway so a retry can never verify the wrong day.
-                if today_ist().0 != today {
-                    return;
+        if is_last {
+            return DayResult {
+                attempts,
+                failure: Some(failure),
+                day_changed: false,
+            };
+        }
+        metrics::counter!(XVERIFY_RETRIES_COUNTER, "reason" => failure.as_str()).increment(1);
+        warn!(
+            code = ErrorCode::WsGapConnectionState.code_str(),
+            source = "xverify_retry",
+            %today,
+            reason = failure.as_str(),
+            attempt = attempts,
+            max_attempts = XVERIFY_MAX_ATTEMPTS_PER_DAY,
+            retry_in_secs = XVERIFY_RETRY_INTERVAL_SECS,
+            "Dhan 1-minute cross-verification did not record today — retrying later today"
+        );
+        tokio::time::sleep(Duration::from_secs(XVERIFY_RETRY_INTERVAL_SECS)).await;
+        // The day can only change here if the process ran past midnight,
+        // which the end bound rules out for an attempt that is not the last;
+        // checked anyway so a retry can never verify the wrong day.
+        if !still_today() {
+            return DayResult {
+                attempts,
+                failure: Some(failure),
+                day_changed: true,
+            };
+        }
+    }
+}
+
+/// Runs today's check, retrying on the same day until it records the day or
+/// the retry window closes, then the option pass. Each attempt is bounded by
+/// its timeout and ends by 17:23 IST when it starts before the scheduled-stop
+/// window (§12.15.8); the number of attempts is bounded by
+/// [`XVERIFY_MAX_ATTEMPTS_PER_DAY`] and by that end bound.
+async fn run_day(
+    deps: &CrossverifyBootDeps,
+    targets: &[XverifyTarget],
+    today: chrono::NaiveDate,
+    day_start_ist_nanos: i64,
+) {
+    let divergence_paged = AtomicBool::new(false);
+    let paged = &divergence_paged;
+    let result = drive_day(
+        today,
+        deps.config.run_budget_secs,
+        now_ist_secs_of_day,
+        || today_ist().0 == today,
+        |plan: AttemptPlan| async move {
+            match plan.kind {
+                AttemptKind::MarkerOnly => {
+                    // §12.15.7: the previous attempt compared and persisted
+                    // everything and failed only to save the marker.
+                    // Re-running the check would re-fetch the vendor tape for
+                    // nothing, so this attempt only writes the marker.
+                    record_day(today)
+                }
+                AttemptKind::Full => {
+                    // §12.15.8: the budget may be shrunk for a late attempt.
+                    let cfg = DhanLiveCrossverifyConfig {
+                        run_budget_secs: plan.run_budget_secs,
+                        ..deps.config
+                    };
+                    run_once(deps, &cfg, targets, today, day_start_ist_nanos, paged).await
                 }
             }
-            None => {
-                report_final_failure(failure, today, attempts, targets.len());
-                break;
-            }
-        }
+        },
+    )
+    .await;
+    if result.day_changed {
+        return;
+    }
+    if let Some(failure) = result.failure {
+        report_final_failure(failure, today, result.attempts, targets.len());
     }
     // §12.15.6: the depth-held option pass runs ONCE, after the spot check's
     // outcome is final. It never writes the day marker and never pages.
-    run_option_pass(deps, today, day_start_ist_nanos).await;
+    // §12.15.8: it runs under its own timeout, so it too ends by 17:23.
+    let option_limit_secs = attempt_max_secs(XVERIFY_OPTION_PASS_BUDGET_SECS);
+    let option_pass = tokio::time::timeout(
+        Duration::from_secs(option_limit_secs),
+        run_option_pass(deps, today, day_start_ist_nanos),
+    )
+    .await;
+    if option_pass.is_err() {
+        metrics::counter!(XVERIFY_OPTION_PASS_COUNTER, "outcome" => "timed_out").increment(1);
+        warn!(
+            code = ErrorCode::WsGapConnectionState.code_str(),
+            source = "xverify_options_timed_out",
+            %today,
+            limit_secs = option_limit_secs,
+            "Dhan option cross-check did not finish within its time limit and was stopped, \
+             so it ends before the evening stop"
+        );
+    }
 }
 
 /// Pages once, after the last attempt of the day. Each arm is its own
@@ -690,12 +964,18 @@ fn report_final_failure(
 /// The divergence page is the exception: it is a finding about the data, not
 /// about the attempt, so it fires on the first attempt that measures it and
 /// `divergence_paged` stops a retry from paging it again.
+///
+/// `cfg` is the comparator config with this attempt's run budget, which
+/// [`attempt_budget_secs`] may have shrunk (§12.15.8). `divergence_paged` is
+/// an `AtomicBool` because each attempt is a separate future of the injected
+/// day loop; one `swap` per catastrophic attempt, cold.
 async fn run_once(
     deps: &CrossverifyBootDeps,
+    cfg: &DhanLiveCrossverifyConfig,
     targets: &[XverifyTarget],
     today: chrono::NaiveDate,
     day_start_ist_nanos: i64,
-    divergence_paged: &mut bool,
+    divergence_paged: &AtomicBool,
 ) -> Result<(), AttemptFailure> {
     let Some(jwt) = wait_for_jwt().await else {
         metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "no_token").increment(1);
@@ -717,7 +997,7 @@ async fn run_once(
         targets,
         today,
         day_start_ist_nanos,
-        &deps.config,
+        cfg,
     )
     .await;
     drop(jwt);
@@ -760,12 +1040,11 @@ async fn run_once(
                 &deps.questdb,
                 &report,
                 day_start_ist_nanos,
-                deps.config.tolerance_paise,
+                cfg.tolerance_paise,
             );
             let persist = persist_verdict(&persisted);
             let persisted_ok = persist.is_ok();
-            if is_catastrophic_divergence(c) && !*divergence_paged {
-                *divergence_paged = true;
+            if is_catastrophic_divergence(c) && !divergence_paged.swap(true, Ordering::Relaxed) {
                 metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "diverged").increment(1);
                 error!(
                     code = ErrorCode::WsGapConnectionState.code_str(),
@@ -1093,18 +1372,21 @@ where
     out
 }
 
-/// Whether the option pass can still finish before the evening stop, starting
-/// now. Pure, O(1).
+/// Whether the option pass can still finish by
+/// [`XVERIFY_LAST_END_SECS_OF_DAY_IST`] (17:23 IST, §12.15.8), starting now.
+/// Pure, O(1).
 #[must_use]
 pub const fn option_pass_fits(now_secs_of_day: u64) -> bool {
     now_secs_of_day.saturating_add(attempt_max_secs(XVERIFY_OPTION_PASS_BUDGET_SECS))
-        <= EVENING_STOP_SECS_OF_DAY_IST
+        <= XVERIFY_LAST_END_SECS_OF_DAY_IST
 }
 
 /// Every `outcome` label the option pass can publish. Seeded at zero at the
 /// start of each pass so a label reads as a real zero on `/metrics` rather
-/// than an absent series.
-pub const XVERIFY_OPTION_PASS_OUTCOMES: [&str; 8] = [
+/// than an absent series. `timed_out` is published by `run_day` when the
+/// pass's timeout elapses (§12.15.8).
+pub const XVERIFY_OPTION_PASS_OUTCOMES: [&str; 9] = [
+    "timed_out",
     "skipped_late",
     "no_targets",
     "no_token",
@@ -1827,9 +2109,10 @@ mod tests {
     /// The marker-only branch writes the marker and nothing else.
     #[test]
     fn test_marker_only_attempt_never_reruns_the_check() {
+        let drive = fn_body(prod_src(), "async fn drive_day<");
+        assert!(drive.contains("next_attempt_kind(previous)"));
+        assert!(drive.contains("previous = Some(failure);"));
         let run_day = fn_body(prod_src(), "async fn run_day(");
-        assert!(run_day.contains("next_attempt_kind(previous)"));
-        assert!(run_day.contains("previous = Some(failure);"));
         let start = run_day
             .find("AttemptKind::MarkerOnly => {")
             .expect("run_day must branch on the attempt kind");
@@ -1894,33 +2177,666 @@ mod tests {
             None
         );
         assert_eq!(retry_delay_secs(u32::MAX, run, max), None);
-        // The next attempt would still be running at the evening stop.
-        let last_start = EVENING_STOP_SECS_OF_DAY_IST - XVERIFY_RETRY_INTERVAL_SECS - max;
+        // §12.15.8: the next attempt must end by 17:23, not 17:30.
+        let last_start = XVERIFY_LAST_END_SECS_OF_DAY_IST - XVERIFY_RETRY_INTERVAL_SECS - max;
         assert!(retry_delay_secs(1, last_start, max).is_some());
         assert_eq!(retry_delay_secs(1, last_start + 1, max), None);
+        // The 17:30 bound would still allow this one; it must not.
+        let old_bound_start = EVENING_STOP_SECS_OF_DAY_IST - XVERIFY_RETRY_INTERVAL_SECS - max;
+        assert_eq!(retry_delay_secs(1, old_bound_start, max), None);
         // After the stop (a manual evening boot catch-up): no retry, no overflow.
+        assert_eq!(
+            retry_delay_secs(1, XVERIFY_LAST_END_SECS_OF_DAY_IST, max),
+            None
+        );
         assert_eq!(retry_delay_secs(1, EVENING_STOP_SECS_OF_DAY_IST, max), None);
         assert_eq!(retry_delay_secs(1, u64::MAX, max), None);
         assert_eq!(retry_delay_secs(1, run, u64::MAX), None);
     }
 
-    /// With the default budget, a 15:41 run whose every attempt takes the
-    /// longest it can still gets all its attempts in before 17:30.
     #[test]
-    fn test_worst_case_day_fits_every_attempt_before_the_evening_stop() {
+    fn test_deadline_and_last_end_derive_from_the_scheduled_stop_window() {
+        let stop = u64::from(SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST);
+        assert_eq!(stop, 17 * 3_600 + 25 * 60, "the window opens at 17:25");
+        assert_eq!(XVERIFY_DEADLINE_SECS_OF_DAY_IST, stop - 60);
+        assert_eq!(
+            XVERIFY_LAST_END_SECS_OF_DAY_IST,
+            XVERIFY_DEADLINE_SECS_OF_DAY_IST - 60
+        );
+        assert_eq!(XVERIFY_DEADLINE_SECS_OF_DAY_IST, 62_640, "17:24");
+        assert_eq!(XVERIFY_LAST_END_SECS_OF_DAY_IST, 62_580, "17:23");
+        assert!(XVERIFY_RUN_AT_SECS_OF_DAY_IST < XVERIFY_LAST_END_SECS_OF_DAY_IST);
+        assert!(stop < EVENING_STOP_SECS_OF_DAY_IST);
+        assert!(
+            EVENING_STOP_SECS_OF_DAY_IST < u64::from(SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST)
+        );
+        // Neither bound is a literal in production code.
+        let prod = prod_src();
+        assert!(prod.contains("SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST as u64 - 60;"));
+        assert!(prod.contains("XVERIFY_DEADLINE_SECS_OF_DAY_IST - 60;"));
+        assert!(!prod.contains("= 62_580") && !prod.contains("= 62_640"));
+    }
+
+    #[test]
+    fn test_default_run_budget_mirror_matches_the_config_default() {
+        assert_eq!(
+            DhanLiveCrossverifyConfig::default().run_budget_secs,
+            XVERIFY_DEFAULT_RUN_BUDGET_SECS,
+            "the four-attempt compile-time fit is asserted against this mirror"
+        );
+    }
+
+    /// With the default budget, a 15:41 run whose every attempt takes the
+    /// longest it can gets all its attempts in, the last one ending exactly at
+    /// 17:23 (§12.15.8). The last-attempt decision is the conservative one.
+    #[test]
+    fn test_worst_case_day_fits_every_attempt_before_the_last_end() {
         let max = attempt_max_secs(600);
-        let mut now = XVERIFY_RUN_AT_SECS_OF_DAY_IST;
+        assert_eq!(max, 960);
+        let mut start = XVERIFY_RUN_AT_SECS_OF_DAY_IST;
+        let mut starts = Vec::new();
         let mut attempts = 0_u32;
-        loop {
+        let end = loop {
             attempts += 1;
-            now += max;
-            assert!(now <= EVENING_STOP_SECS_OF_DAY_IST);
-            match retry_delay_secs(attempts, now, max) {
-                Some(delay) => now += delay,
-                None => break,
+            starts.push(start);
+            assert_eq!(attempt_budget_secs(start, 600), Some(600), "never shrunk");
+            let is_last = attempt_is_last(attempts, start, max);
+            let end = start + max;
+            assert!(end <= XVERIFY_LAST_END_SECS_OF_DAY_IST);
+            if is_last {
+                break end;
+            }
+            start = end + XVERIFY_RETRY_INTERVAL_SECS;
+        };
+        assert_eq!(attempts, XVERIFY_MAX_ATTEMPTS_PER_DAY);
+        // 15:41:00, 16:09:40, 16:38:20, 17:07:00.
+        assert_eq!(starts, vec![56_460, 58_180, 59_900, 61_620]);
+        assert_eq!(
+            end, XVERIFY_LAST_END_SECS_OF_DAY_IST,
+            "ends exactly at 17:23"
+        );
+        // One more second of interval and the fourth attempt no longer fits.
+        assert!(
+            56_460 + max + 3 * (XVERIFY_RETRY_INTERVAL_SECS + 1 + max)
+                > XVERIFY_LAST_END_SECS_OF_DAY_IST
+        );
+    }
+
+    #[test]
+    fn test_attempt_budget_secs_shrinks_then_refuses() {
+        let last = XVERIFY_LAST_END_SECS_OF_DAY_IST;
+        let fixed = attempt_max_secs(0);
+        assert_eq!(fixed, 360, "token wait 300 s + persist margin 60 s");
+        let run = XVERIFY_RUN_AT_SECS_OF_DAY_IST;
+        assert_eq!(attempt_budget_secs(run, 600), Some(600));
+        // Exactly the full budget fits, then one second less.
+        assert_eq!(attempt_budget_secs(last - fixed - 600, 600), Some(600));
+        assert_eq!(attempt_budget_secs(last - fixed - 599, 600), Some(599));
+        assert_eq!(attempt_budget_secs(last - fixed - 200, 600), Some(200));
+        // The floor, then one second past it.
+        assert_eq!(
+            attempt_budget_secs(last - fixed - XVERIFY_MIN_ATTEMPT_BUDGET_SECS, 600),
+            Some(XVERIFY_MIN_ATTEMPT_BUDGET_SECS)
+        );
+        assert_eq!(
+            attempt_budget_secs(last - fixed - XVERIFY_MIN_ATTEMPT_BUDGET_SECS + 1, 600),
+            None
+        );
+        // A configured budget below the floor is never refused for its size,
+        // only when it does not fit.
+        assert_eq!(attempt_budget_secs(run, 60), Some(60));
+        assert_eq!(attempt_budget_secs(last - fixed - 60, 60), Some(60));
+        assert_eq!(attempt_budget_secs(last - fixed - 59, 60), None);
+        assert_eq!(attempt_budget_secs(last - fixed - 110, 100), Some(100));
+        assert_eq!(attempt_budget_secs(last - fixed - 119, 600), None);
+        // At the end bound, inside the stop window, and up to its end: refused.
+        for now in [last - fixed, last, XVERIFY_DEADLINE_SECS_OF_DAY_IST] {
+            assert_eq!(attempt_budget_secs(now, 600), None, "now={now}");
+        }
+        let window_start = u64::from(SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST);
+        let window_end = u64::from(SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST);
+        assert_eq!(attempt_budget_secs(window_start, 600), None);
+        assert_eq!(attempt_budget_secs(EVENING_STOP_SECS_OF_DAY_IST, 600), None);
+        assert_eq!(attempt_budget_secs(window_end - 1, 600), None);
+        // A manual evening boot after the stop window runs the configured
+        // budget, as before §12.15.8.
+        assert_eq!(attempt_budget_secs(window_end, 600), Some(600));
+        assert_eq!(attempt_budget_secs(SECS_PER_DAY - 1, 600), Some(600));
+        // A nonsense clock never runs, and nothing wraps.
+        assert_eq!(attempt_budget_secs(SECS_PER_DAY, 600), None);
+        assert_eq!(attempt_budget_secs(u64::MAX, 600), None);
+        assert_eq!(attempt_budget_secs(run, u64::MAX), Some(last - run - fixed));
+        assert_eq!(attempt_budget_secs(0, 600), Some(600));
+    }
+
+    /// Every second of the day, for budgets around every boundary: a granted
+    /// budget never exceeds the configured one, an attempt that starts before
+    /// the stop window always ends by 17:23, a budget below the floor is only
+    /// ever the configured one, and a refusal happens only when the full
+    /// configured attempt does not fit.
+    #[test]
+    fn test_attempt_budget_secs_every_second_of_the_day() {
+        let window_start = u64::from(SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST);
+        let window_end = u64::from(SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST);
+        for config in [0_u64, 1, 60, 119, 120, 121, 599, 600, 601, 3_600, u64::MAX] {
+            for now in 0..SECS_PER_DAY {
+                match attempt_budget_secs(now, config) {
+                    Some(budget) => {
+                        assert!(budget <= config, "now={now} config={config}");
+                        if now < window_start {
+                            assert!(
+                                now + attempt_max_secs(budget) <= XVERIFY_LAST_END_SECS_OF_DAY_IST,
+                                "now={now} config={config} budget={budget}"
+                            );
+                        } else {
+                            assert!(now >= window_end, "ran inside the stop window: {now}");
+                            assert_eq!(budget, config);
+                        }
+                        if budget < XVERIFY_MIN_ATTEMPT_BUDGET_SECS {
+                            assert_eq!(budget, config, "shrunk below the floor: {now}");
+                        }
+                    }
+                    None => {
+                        assert!(now < window_end, "an evening boot was refused: {now}");
+                        assert!(
+                            now.saturating_add(attempt_max_secs(config))
+                                > XVERIFY_LAST_END_SECS_OF_DAY_IST,
+                            "a fitting attempt was refused: now={now} config={config}"
+                        );
+                    }
+                }
             }
         }
-        assert_eq!(attempts, XVERIFY_MAX_ATTEMPTS_PER_DAY);
+    }
+
+    /// The last attempt is decided once, before it starts, from its latest
+    /// possible end (§12.15.8). For every start second from 15:41 to
+    /// midnight and every attempt number: an attempt that is not the last
+    /// leaves room for the next one at its full budget, however early it
+    /// ends; and the decision equals the old rule evaluated at the latest end.
+    #[test]
+    fn is_last_is_decided_once_from_start_plus_attempt_max() {
+        for config in [60_u64, 120, 600, 900] {
+            let max = attempt_max_secs(config);
+            for start in XVERIFY_RUN_AT_SECS_OF_DAY_IST..SECS_PER_DAY {
+                for n in [1_u32, 2, 3, 4, 5, u32::MAX] {
+                    let is_last = attempt_is_last(n, start, max);
+                    assert_eq!(is_last, retry_delay_secs(n, start + max, max).is_none());
+                    if n >= XVERIFY_MAX_ATTEMPTS_PER_DAY {
+                        assert!(is_last, "attempt {n} must be the last");
+                    }
+                    if is_last {
+                        continue;
+                    }
+                    // Any actual end from the start to the latest end.
+                    for end in [start, start + max / 2, start + max] {
+                        assert!(retry_delay_secs(n, end, max).is_some());
+                        let next = end + XVERIFY_RETRY_INTERVAL_SECS;
+                        assert!(next + max <= XVERIFY_LAST_END_SECS_OF_DAY_IST);
+                        assert_eq!(
+                            attempt_budget_secs(next, config),
+                            Some(config),
+                            "a planned retry must never be shrunk or skipped"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(4_096))]
+        /// Random starts, attempt numbers and budgets: a not-last attempt
+        /// always leaves a full next attempt that ends by 17:23.
+        #[test]
+        fn proptest_is_last_never_strands_a_retry(
+            start in 0_u64..(2 * SECS_PER_DAY),
+            n in 1_u32..=6,
+            config in 1_u64..=4_000,
+        ) {
+            let max = attempt_max_secs(config);
+            if !attempt_is_last(n, start, max) {
+                proptest::prop_assert!(n < XVERIFY_MAX_ATTEMPTS_PER_DAY);
+                let next = start + max + XVERIFY_RETRY_INTERVAL_SECS;
+                proptest::prop_assert!(next + max <= XVERIFY_LAST_END_SECS_OF_DAY_IST);
+                proptest::prop_assert_eq!(attempt_budget_secs(next, config), Some(config));
+            }
+        }
+    }
+
+    // ---- drive_day against a paused clock (§12.15.8) ----
+
+    /// One simulated attempt: how long it takes (`None` = hangs until its
+    /// timeout) and what it returns.
+    type Step = (Option<u64>, Result<(), AttemptFailure>);
+
+    /// What one simulated day did.
+    struct Sim {
+        result: DayResult,
+        /// Plans of the attempts that were actually called, in order.
+        plans: Vec<AttemptPlan>,
+        /// `(attempt number, seconds of day)` for each attempt that finished on
+        /// its own; an attempt cut by its timeout has no entry.
+        ends: Vec<(u32, u64)>,
+        /// Seconds of day when `drive_day` returned.
+        finished: u64,
+    }
+
+    fn day() -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(2026, 10, 6).unwrap_or_default()
+    }
+
+    /// Runs `drive_day` from `first_start` on the paused clock, with attempt
+    /// `n` following `script(n, plan)`, and `still_today` false after
+    /// `day_changes_after` retry sleeps.
+    async fn simulate(
+        first_start: u64,
+        config_budget: u64,
+        script: impl Fn(u32, &AttemptPlan) -> Step,
+        day_changes_after: Option<u32>,
+    ) -> Sim {
+        let t0 = tokio::time::Instant::now();
+        let now = move || first_start + t0.elapsed().as_secs();
+        let plans = std::cell::RefCell::new(Vec::new());
+        let ends = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let sleeps = std::cell::Cell::new(0_u32);
+        let result = drive_day(
+            day(),
+            config_budget,
+            now,
+            || {
+                sleeps.set(sleeps.get() + 1);
+                day_changes_after.is_none_or(|after| sleeps.get() <= after)
+            },
+            |plan: AttemptPlan| {
+                plans.borrow_mut().push(plan);
+                let (duration, outcome) = script(plan.number, &plan);
+                let ends = std::rc::Rc::clone(&ends);
+                let number = plan.number;
+                async move {
+                    match duration {
+                        Some(secs) => tokio::time::sleep(Duration::from_secs(secs)).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                    ends.borrow_mut().push((number, now()));
+                    outcome
+                }
+            },
+        )
+        .await;
+        let finished = now();
+        let ends = ends.borrow().clone();
+        Sim {
+            result,
+            plans: plans.into_inner(),
+            ends,
+            finished,
+        }
+    }
+
+    /// A step that fails `failures` times, then succeeds instantly.
+    fn fail_then_succeed(
+        failures: u32,
+        fail: impl Fn(u32) -> Step,
+    ) -> impl Fn(u32, &AttemptPlan) -> Step {
+        move |n, _plan| {
+            if n <= failures {
+                fail(n)
+            } else {
+                (Some(0), Ok(()))
+            }
+        }
+    }
+
+    /// When called attempt `i` (0-based) ended: its own record, else (cut by
+    /// its timeout) one interval before the next attempt, else when the day
+    /// returned (minus the interval when a skipped attempt followed it).
+    fn attempt_end(sim: &Sim, i: usize) -> u64 {
+        let number = u32::try_from(i).unwrap_or(u32::MAX) + 1;
+        if let Some(&(_, end)) = sim.ends.iter().find(|(n, _)| *n == number) {
+            return end;
+        }
+        if let Some(next) = sim.plans.get(i + 1) {
+            return next.start_secs_of_day - XVERIFY_RETRY_INTERVAL_SECS;
+        }
+        if number == sim.result.attempts {
+            sim.finished
+        } else {
+            sim.finished - XVERIFY_RETRY_INTERVAL_SECS
+        }
+    }
+
+    /// Checks the §12.15.8 invariants on one simulated day.
+    fn check_day(sim: &Sim, first_start: u64, config: u64, failures: u32) {
+        let stop_window = u64::from(SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST);
+        let r = sim.result;
+        assert!(r.attempts >= 1 && r.attempts <= XVERIFY_MAX_ATTEMPTS_PER_DAY);
+        assert!(!r.day_changed);
+        // Every called attempt: budget, end bound, is_last decided once.
+        let mut previous_end: Option<u64> = None;
+        for (i, plan) in sim.plans.iter().enumerate() {
+            let number = u32::try_from(i).unwrap_or(u32::MAX) + 1;
+            assert_eq!(plan.number, number);
+            if let Some(end) = previous_end {
+                assert_eq!(
+                    plan.start_secs_of_day,
+                    end + XVERIFY_RETRY_INTERVAL_SECS,
+                    "a retry starts one interval after the previous end"
+                );
+            }
+            let end = attempt_end(sim, i);
+            if !sim.ends.iter().any(|(n, _)| *n == number) {
+                // Cut by its timeout: exactly at the attempt's own limit.
+                assert_eq!(
+                    end,
+                    plan.start_secs_of_day + attempt_max_secs(plan.run_budget_secs)
+                );
+            }
+            if plan.kind == AttemptKind::Full && plan.start_secs_of_day < stop_window {
+                assert!(
+                    plan.start_secs_of_day + attempt_max_secs(plan.run_budget_secs)
+                        <= XVERIFY_LAST_END_SECS_OF_DAY_IST
+                );
+                assert!(
+                    end <= XVERIFY_LAST_END_SECS_OF_DAY_IST,
+                    "attempt {number} from {first_start} ended at {end}"
+                );
+            }
+            if number >= 2 && plan.kind == AttemptKind::Full {
+                assert_eq!(plan.run_budget_secs, config, "a retry is never shrunk");
+            }
+            let final_attempt = number == r.attempts;
+            if final_attempt && r.failure.is_some() {
+                assert!(plan.is_last, "the paging attempt was not decided last");
+            }
+            if !final_attempt {
+                assert!(
+                    !plan.is_last,
+                    "an attempt decided last was followed by another"
+                );
+            }
+            previous_end = Some(end);
+        }
+        // A skipped attempt (no plan) is always the final, last one.
+        if sim.plans.len() < r.attempts as usize {
+            assert_eq!(sim.plans.len() + 1, r.attempts as usize);
+            assert_eq!(r.failure, Some(AttemptFailure::Incomplete));
+        }
+        // Recorded exactly when an attempt after the scripted failures ran.
+        assert_eq!(r.failure.is_none(), r.attempts > failures);
+        if r.failure.is_none() {
+            assert_eq!(r.attempts, failures + 1);
+        }
+    }
+
+    /// Every start second from 15:41 to 17:23, every failure count 1..=4,
+    /// with attempts that hang to their timeout, fail at once, or alternate:
+    /// no attempt ends after 17:23, `is_last` is decided once and agrees with
+    /// what the loop did, and at most four attempts run.
+    #[tokio::test(start_paused = true)]
+    async fn test_drive_day_every_start_second_ends_by_the_last_end() {
+        let patterns: [fn(u32) -> Step; 4] = [
+            |_| (None, Err(AttemptFailure::RunFailed)),
+            |_| (Some(0), Err(AttemptFailure::RunFailed)),
+            |n| {
+                if n % 2 == 1 {
+                    (None, Err(AttemptFailure::RunFailed))
+                } else {
+                    (Some(5), Err(AttemptFailure::NotPersisted))
+                }
+            },
+            // §12.15.7: a marker failure, then marker-only attempts.
+            |_| (Some(0), Err(AttemptFailure::MarkerNotWritten)),
+        ];
+        let mut sims = 0_u32;
+        for first_start in XVERIFY_RUN_AT_SECS_OF_DAY_IST..=XVERIFY_LAST_END_SECS_OF_DAY_IST {
+            for failures in 1..=XVERIFY_MAX_ATTEMPTS_PER_DAY {
+                for pattern in patterns {
+                    let sim =
+                        simulate(first_start, 600, fail_then_succeed(failures, pattern), None)
+                            .await;
+                    check_day(&sim, first_start, 600, failures);
+                    sims += 1;
+                }
+            }
+        }
+        assert_eq!(sims, (62_580 - 56_460 + 1) * 4 * 4);
+    }
+
+    /// The worst case on the paused clock: four attempts that each hang to
+    /// their timeout start at 15:41:00, 16:09:40, 16:38:20 and 17:07:00, and
+    /// the day returns its failure exactly at 17:23.
+    #[tokio::test(start_paused = true)]
+    async fn test_drive_day_worst_case_hangs_end_exactly_at_the_last_end() {
+        let sim = simulate(
+            XVERIFY_RUN_AT_SECS_OF_DAY_IST,
+            600,
+            |_, _| (None, Err(AttemptFailure::RunFailed)),
+            None,
+        )
+        .await;
+        let starts: Vec<u64> = sim.plans.iter().map(|p| p.start_secs_of_day).collect();
+        assert_eq!(starts, vec![56_460, 58_180, 59_900, 61_620]);
+        assert_eq!(sim.result.attempts, 4);
+        // A timed-out attempt is incomplete, whatever it would have returned.
+        assert_eq!(sim.result.failure, Some(AttemptFailure::Incomplete));
+        assert_eq!(sim.finished, XVERIFY_LAST_END_SECS_OF_DAY_IST);
+        assert!(sim.ends.is_empty(), "every attempt was cut by its timeout");
+        let lasts: Vec<bool> = sim.plans.iter().map(|p| p.is_last).collect();
+        assert_eq!(lasts, vec![false, false, false, true]);
+    }
+
+    /// A marker-only attempt as the last: it gets the same once-decided
+    /// `is_last`, no budget, and its failure is the day's final failure.
+    #[tokio::test(start_paused = true)]
+    async fn test_drive_day_marker_only_attempt_as_the_last() {
+        let sim = simulate(
+            XVERIFY_RUN_AT_SECS_OF_DAY_IST,
+            600,
+            |n, _| match n {
+                1 => (None, Err(AttemptFailure::RunFailed)),
+                _ => (Some(0), Err(AttemptFailure::MarkerNotWritten)),
+            },
+            None,
+        )
+        .await;
+        let kinds: Vec<AttemptKind> = sim.plans.iter().map(|p| p.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                AttemptKind::Full,
+                AttemptKind::Full,
+                AttemptKind::MarkerOnly,
+                AttemptKind::MarkerOnly
+            ]
+        );
+        let last = sim.plans.last().copied();
+        assert_eq!(last.map(|p| p.is_last), Some(true));
+        assert_eq!(last.map(|p| p.run_budget_secs), Some(0));
+        assert_eq!(sim.result.failure, Some(AttemptFailure::MarkerNotWritten));
+        // The same day, the marker-only attempt succeeding records it.
+        let ok = simulate(
+            XVERIFY_RUN_AT_SECS_OF_DAY_IST,
+            600,
+            |n, _| match n {
+                1 => (Some(0), Err(AttemptFailure::MarkerNotWritten)),
+                _ => (Some(0), Ok(())),
+            },
+            None,
+        )
+        .await;
+        assert_eq!(ok.result.failure, None);
+        assert_eq!(ok.result.attempts, 2);
+        assert_eq!(
+            ok.plans.get(1).map(|p| p.kind),
+            Some(AttemptKind::MarkerOnly)
+        );
+    }
+
+    /// A late boot catch-up: too little time skips the attempt without
+    /// calling it; a little more time shrinks the budget and the timeout
+    /// follows the shrunk budget; a configured budget below the floor runs.
+    #[tokio::test(start_paused = true)]
+    async fn test_drive_day_late_start_shrinks_or_skips() {
+        let fixed = attempt_max_secs(0);
+        let last = XVERIFY_LAST_END_SECS_OF_DAY_IST;
+        let skip_at = last - fixed - XVERIFY_MIN_ATTEMPT_BUDGET_SECS + 1;
+        let skipped = simulate(skip_at, 600, |_, _| (Some(0), Ok(())), None).await;
+        assert!(skipped.plans.is_empty(), "a skipped attempt must not run");
+        assert_eq!(skipped.result.attempts, 1);
+        assert_eq!(skipped.result.failure, Some(AttemptFailure::Incomplete));
+        assert_eq!(skipped.finished, skip_at);
+
+        let shrink_at = last - fixed - 200;
+        let shrunk = simulate(shrink_at, 600, |_, _| (None, Ok(())), None).await;
+        assert_eq!(shrunk.plans.first().map(|p| p.run_budget_secs), Some(200));
+        assert_eq!(shrunk.plans.first().map(|p| p.is_last), Some(true));
+        assert_eq!(shrunk.result.failure, Some(AttemptFailure::Incomplete));
+        assert_eq!(
+            shrunk.finished, last,
+            "the timeout follows the shrunk budget"
+        );
+
+        let small = simulate(
+            XVERIFY_RUN_AT_SECS_OF_DAY_IST,
+            60,
+            |_, _| (Some(0), Ok(())),
+            None,
+        )
+        .await;
+        assert_eq!(small.plans.first().map(|p| p.run_budget_secs), Some(60));
+        assert_eq!(small.result.failure, None);
+
+        // An evening boot after the stop window runs once, unshrunk.
+        let evening = u64::from(SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST) + 2_820;
+        let late = simulate(
+            evening,
+            600,
+            |_, _| (Some(1), Err(AttemptFailure::Vacuous)),
+            None,
+        )
+        .await;
+        assert_eq!(late.plans.first().map(|p| p.run_budget_secs), Some(600));
+        assert_eq!(late.result.attempts, 1);
+        assert_eq!(late.result.failure, Some(AttemptFailure::Vacuous));
+    }
+
+    /// The day changing during a retry sleep stops the loop without a page.
+    #[tokio::test(start_paused = true)]
+    async fn test_drive_day_day_change_stops_retrying() {
+        let sim = simulate(
+            XVERIFY_RUN_AT_SECS_OF_DAY_IST,
+            600,
+            |_, _| (Some(0), Err(AttemptFailure::RunFailed)),
+            Some(0),
+        )
+        .await;
+        assert!(sim.result.day_changed);
+        assert_eq!(sim.result.attempts, 1);
+    }
+
+    /// The timeout can stop an attempt only at an `.await`. Work that runs
+    /// synchronously past the limit (the audit persist and the marker write)
+    /// finishes, and its result stands — success and failure alike.
+    #[tokio::test]
+    async fn test_bounded_attempt_keeps_a_result_finished_synchronously_past_the_limit() {
+        for outcome in [Ok(()), Err(AttemptFailure::AuditRowsLost)] {
+            let got = bounded_attempt(day(), 1, 0, async move {
+                // A persist that is still running when the limit passes.
+                std::thread::sleep(Duration::from_millis(20));
+                outcome
+            })
+            .await;
+            assert_eq!(got, outcome);
+        }
+    }
+
+    /// An attempt still waiting at its limit is stopped and is incomplete.
+    #[tokio::test(start_paused = true)]
+    async fn test_bounded_attempt_times_out_as_incomplete_at_the_limit() {
+        let t0 = tokio::time::Instant::now();
+        let got = bounded_attempt(day(), 1, 960, async {
+            tokio::time::sleep(Duration::from_secs(961)).await;
+            Ok(())
+        })
+        .await;
+        assert_eq!(got, Err(AttemptFailure::Incomplete));
+        assert_eq!(t0.elapsed(), Duration::from_secs(960));
+        // Work that completes exactly at the limit is kept: the attempt is
+        // polled before its timer.
+        let at_limit = bounded_attempt(day(), 1, 960, async {
+            tokio::time::sleep(Duration::from_secs(960)).await;
+            Ok(())
+        })
+        .await;
+        assert_eq!(at_limit, Ok(()));
+    }
+
+    /// `run_day` runs every attempt through `drive_day`, which consults
+    /// `attempt_budget_secs` and `attempt_is_last` before each attempt and
+    /// wraps every full attempt in `tokio::time::timeout`; the option pass has
+    /// its own timeout.
+    #[test]
+    fn test_every_attempt_start_consults_attempt_budget_secs_and_is_wrapped_in_timeout() {
+        let prod = prod_src();
+        let drive = fn_body(prod, "async fn drive_day<");
+        let loop_at = drive.find("loop {").expect("drive_day loops");
+        let body = &drive[loop_at..];
+        let is_last_at = body.find("attempt_is_last(").expect("is_last decided");
+        let kind_at = body
+            .find("next_attempt_kind(previous)")
+            .expect("kind decided");
+        let budget_at = body
+            .find("attempt_budget_secs(start")
+            .expect("budget decided");
+        let bounded_at = body.find("bounded_attempt(").expect("timeout wrapper");
+        assert!(is_last_at < kind_at && kind_at < budget_at && budget_at < bounded_at);
+        // Never re-decided from the attempt's end.
+        let after = &body[bounded_at..];
+        assert!(!after.contains("retry_delay_secs("));
+        assert!(!after.contains("attempt_is_last("));
+        assert!(after.contains("if is_last {"));
+        let bounded = fn_body(prod, "async fn bounded_attempt<");
+        assert!(bounded.contains("tokio::time::timeout("));
+        assert!(bounded.contains("source = \"xverify_attempt_timed_out\""));
+        assert!(bounded.contains("Err(AttemptFailure::Incomplete)"));
+        assert!(drive.contains("source = \"xverify_attempt_skipped_no_time\""));
+        let run_day = fn_body(prod, "async fn run_day(");
+        assert!(run_day.contains("drive_day("));
+        assert!(run_day.contains("run_budget_secs: plan.run_budget_secs"));
+        assert!(run_day.contains("tokio::time::timeout("));
+        assert!(run_day.contains("source = \"xverify_options_timed_out\""));
+        // run_once is reached only through the driver.
+        assert_eq!(prod.matches("run_once(deps,").count(), 1);
+        assert!(!run_day.contains("now_ist_secs_of_day()"));
+    }
+
+    /// The new lines are coded `warn!`s on sources no alarm filter matches.
+    #[test]
+    fn test_time_bound_sources_are_coded_and_match_no_alarm_filter() {
+        let prod = prod_src();
+        let tf = include_str!("../../../deploy/aws/terraform/error-code-alarms.tf");
+        for source in [
+            "xverify_attempt_timed_out",
+            "xverify_attempt_skipped_no_time",
+            "xverify_options_timed_out",
+        ] {
+            let emit = format!("source = \"{source}\"");
+            let at = prod
+                .find(emit.as_str())
+                .unwrap_or_else(|| panic!("no emit of {source}"));
+            let head = &prod[..at];
+            let warn_at = head.rfind("warn!(").unwrap_or(0);
+            assert!(
+                warn_at > head.rfind("error!(").unwrap_or(0),
+                "{source} is not a warn!"
+            );
+            assert!(
+                head[warn_at..].contains("code = ErrorCode::WsGapConnectionState.code_str()"),
+                "{source} carries no code"
+            );
+            assert!(!tf.contains(source), "{source} must stay log-sink-only");
+        }
     }
 
     /// The retry loop must use the pure bound and page only after it, and
@@ -1928,28 +2844,22 @@ mod tests {
     /// once-per-day divergence page.
     #[test]
     fn test_run_day_retries_through_the_pure_bound() {
-        let src = include_str!("dhan_live_crossverify_boot.rs");
-        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
-        let body = prod
-            .split("async fn run_day(")
-            .nth(1)
-            .and_then(|s| s.split("\n}\n").next())
-            .unwrap_or("");
-        assert!(body.contains("retry_delay_secs("));
+        let prod = prod_src();
+        let drive = fn_body(prod, "async fn drive_day<");
+        assert!(drive.contains("attempt_is_last("));
+        assert!(drive.contains("XVERIFY_RETRY_INTERVAL_SECS"));
+        assert!(!drive.contains("report_final_failure("));
+        let body = fn_body(prod, "async fn run_day(");
         assert!(body.contains("report_final_failure("));
         assert!(body.contains("divergence_paged"));
-        let run_once = prod
-            .split("async fn run_once(")
-            .nth(1)
-            .and_then(|s| s.split("\n}\n").next())
-            .unwrap_or("");
+        let run_once = fn_body(prod, "async fn run_once(");
         for alarmed in ["\"xverify_failed\"", "\"xverify_vacuous\""] {
             assert!(
                 !run_once.contains(alarmed),
                 "run_once must not page {alarmed} per attempt"
             );
         }
-        assert!(run_once.contains("!*divergence_paged"));
+        assert!(run_once.contains("!divergence_paged.swap(true, Ordering::Relaxed)"));
         assert!(prod.contains("run_day(&deps, &targets, today, day_start_ist_nanos)"));
     }
 
@@ -2161,10 +3071,14 @@ mod tests {
     }
 
     #[test]
-    fn test_option_pass_fits_respects_the_evening_stop() {
+    fn test_option_pass_fits_bounds_on_last_end() {
         let need = attempt_max_secs(XVERIFY_OPTION_PASS_BUDGET_SECS);
-        assert!(option_pass_fits(EVENING_STOP_SECS_OF_DAY_IST - need));
-        assert!(!option_pass_fits(EVENING_STOP_SECS_OF_DAY_IST - need + 1));
+        let last = XVERIFY_LAST_END_SECS_OF_DAY_IST;
+        assert!(option_pass_fits(last - need));
+        assert!(!option_pass_fits(last - need + 1));
+        assert!(!option_pass_fits(last));
+        // §12.15.8: the old 17:30 bound would still have started this one.
+        assert!(!option_pass_fits(EVENING_STOP_SECS_OF_DAY_IST - need));
         assert!(!option_pass_fits(EVENING_STOP_SECS_OF_DAY_IST));
         assert!(!option_pass_fits(u64::MAX), "saturating add never wraps");
         assert!(option_pass_fits(0));
@@ -2197,10 +3111,11 @@ mod tests {
     fn test_run_option_pass_runs_after_the_spot_retry_loop_ends() {
         let body = fn_body(prod_src(), "async fn run_day(");
         let call = body.find("run_option_pass(deps, today, day_start_ist_nanos)");
-        let last_break = body.rfind("break;");
+        let loop_end = body.find("report_final_failure(");
         assert!(call.is_some(), "run_day must call run_option_pass");
+        assert!(loop_end.is_some() && body.contains("drive_day("));
         assert!(
-            call > last_break,
+            call > loop_end,
             "the option pass must run after the spot loop, never inside a retry"
         );
         let run_once = fn_body(prod_src(), "async fn run_once(");
@@ -2276,6 +3191,16 @@ mod tests {
             rest = &after[end..];
         }
         assert!(found >= 5, "scan found only {found} literal labels");
+        // §12.15.8: `run_day` publishes `timed_out` for the pass.
+        let run_day = fn_body(prod_src(), "async fn run_day(");
+        let at = run_day
+            .find(marker)
+            .expect("run_day publishes the timeout label");
+        let after = &run_day[at + marker.len()..];
+        let label = &after[..after.find('"').unwrap_or(0)];
+        assert_eq!(label, "timed_out");
+        assert!(XVERIFY_OPTION_PASS_OUTCOMES.contains(&label));
+        assert_eq!(run_day.matches(marker).count(), 1);
         for label in ["vacuous", "measured", "partial"] {
             assert!(XVERIFY_OPTION_PASS_OUTCOMES.contains(&label));
         }

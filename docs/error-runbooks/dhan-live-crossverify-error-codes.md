@@ -91,3 +91,23 @@ alarmed; the other sources are log-sink-only.
 **Honest limit:** markers deleted by the old 7-day sweep before this change
 cannot be recovered; those days take the hold-ceiling override once their
 partitions age past the hot window.
+
+## §3. 2026-10-06 — attempt time bounds: sources (plan ITEM 51b)
+
+Authority: `no-rest-except-live-feed-2026-06-27.md` §12.15.8. Every line
+below is emitted with `code = "WS-GAP-03"` (`ErrorCode::WsGapConnectionState`)
+from `crates/app/src/dhan_live_crossverify_boot.rs`. All three are
+log-sink-only (no alarm, no filter, no page). When the attempt they describe
+was the day's last, the existing `xverify_failed` page fires after it with
+`reason = "incomplete"`.
+
+| Line | Level | Means | Operator action |
+|---|---|---|---|
+| `source = "xverify_attempt_timed_out"` | WARN (per attempt) | the attempt (token wait + run + persist) did not finish within its limit (`limit_secs`) and was stopped, so it could not run into the 17:25 scheduled stop; this attempt does not record today | check how long the token took and whether QuestDB or the vendor was slow (`make doctor`); the next attempt, if any, runs at full budget |
+| `source = "xverify_attempt_skipped_no_time"` | WARN (per attempt) | the attempt started too late to run at least 120 s of comparison and still end by 17:23 IST, so it was not started (`start_ist_secs`); typically a restart between about 17:15 and 17:45 | none needed for the attempt itself; if the day stayed unverified, a restart after 17:45 or the next day's run cannot re-check it today — the S3 hold ceiling applies |
+| `source = "xverify_options_timed_out"` | WARN (once a day at most) | the depth-held option pass did not finish within its limit and was stopped; outcome label `timed_out` on `tv_dhan_xverify_option_pass_total` | none required (the option pass never holds S3 or pages); if it repeats, check vendor latency |
+
+**Honest limit:** the timeout can stop an attempt only while it waits (token,
+database read, vendor fetch). The audit write and the marker write run after
+the comparison returns and are not cut; their time is meant to fit in the
+60 s persist margin.
