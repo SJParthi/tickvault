@@ -1,5 +1,5 @@
 diff --git a/.claude/plans/active-plan-feed-hardening.md b/.claude/plans/active-plan-feed-hardening.md
-index f41215dc5..65f4ec6bc 100644
+index f41215dc5..9251f57c4 100644
 --- a/.claude/plans/active-plan-feed-hardening.md
 +++ b/.claude/plans/active-plan-feed-hardening.md
 @@ -6354,6 +6354,28 @@ Each refused level stays in its slot as NaN (reads back null; positions stay ali
@@ -8,15 +8,15 @@ index f41215dc5..65f4ec6bc 100644
  
 +### Sub-items
 +
-+- [x] 49d-1 — **Length-framed depth spill tier and its replay** (step 1 of the proposed sequence; no array rows, no table change). A failed `market_depth` flush is rescued to `data/spill/depth/depth-{feed}-{hour}.ilpf` as kind-1 framed records (64-byte header with two CRC-32s, then the ILP V1 lines byte for byte); the replay streams each file through one window and posts each record, and legacy text `.ilp` files still drain through the text pass. Fixes from the 2026-10-06 review of this change, in the same PR: every directory entry a synced append has not synced yet is synced, whoever created the file (`depth_spill_frame::sync_dir_entries`); the payload CRC and row count are built before the append lock (`build_v1_headers`); a record refused whole is set aside on its own and only `FRAMED_REFUSED_WHOLE_IN_A_ROW_QUARANTINE` (3) in a row quarantine the file; a corrupt or torn span counts the rows its own CRC-checked header declares (`rows_in_span`).
++- [x] 49d-1 — **Length-framed depth spill tier and its replay** (step 1 of the proposed sequence; no array rows, no table change). A failed `market_depth` flush is rescued to `data/spill/depth/depth-{feed}-{hour}.ilpf` as kind-1 framed records (64-byte header with two CRC-32s, then the ILP V1 lines byte for byte); the replay streams each file through one window and posts each record, and legacy text `.ilp` files still drain through the text pass. Fixes from the 2026-10-06 review of this change, in the same PR: every directory entry a synced append has not synced yet is synced, whoever created the file (`depth_spill_frame::sync_dir_entries`); the payload CRC and row count are built before the append lock (`build_v1_headers`); a record refused whole is set aside on its own and only `FRAMED_REFUSED_WHOLE_IN_A_ROW_QUARANTINE` (3) in a row quarantine the file; a corrupt or torn span counts the rows its own CRC-checked header declares (`rows_in_span`). Second review round (same day, same PR): a failed write is cut back to the last whole record of the batch, not the batch start (`write_v1_records` reports the whole bytes); a record refused line for line after an earlier record was accepted counts as refused whole (`refused_whole`); and with the writer on the framed format no legacy depth `.ilp` file is treated as live, so a drained one is emptied (`replay_spill_dir`, `text_appender_exists`).
 +  - Files: crates/storage/src/depth_spill_frame.rs, crates/storage/src/depth_spill_framed_replay.rs, crates/storage/src/depth_persistence.rs, crates/storage/src/tick_spill_replay.rs, crates/storage/src/lib.rs, crates/storage/tests/session_window_gate_guard.rs, crates/storage/tests/spill_rescue_sync_guard.rs, docs/error-runbooks/tick-spill-replay-error-codes.md, CLAUDE.md
-+  - Tests: header_layout_is_pinned_byte_for_byte, encode_header_round_trips_every_field, decode_header_refuses_each_defect, every_single_bit_flip_in_the_header_is_refused, payload_ok_detects_any_single_bit_flip, next_record_start_skips_garbage_and_a_false_magic, an_undecidable_candidate_at_the_window_end_is_undecided_not_found, next_span_still_advances_on_a_record_larger_than_a_tiny_window, append_v1_records_splits_a_large_payload_into_records_of_at_most_8_mib, a_failed_write_is_cut_back_to_the_last_whole_record, a_failed_cut_back_leaves_a_fragment_the_reader_sets_aside_and_later_records_replay, an_over_long_line_is_refused_before_any_byte_is_written, append_lock_keeps_concurrent_appenders_from_interleaving_records, crash_permutations_never_lose_a_byte, sync_dir_entries_marks_only_what_it_synced_and_a_removal_voids_the_mark, forget_removed_unmarks_and_the_synced_list_stays_bounded, sync_parent_dir_syncs_the_directory_and_counts, list_framed_spill_files_sees_only_framed_files, register_frame_baseline_seeds_every_reason, replay_framed_spill_dir_posts_every_record_and_removes_the_drained_file, text_and_framed_files_in_one_dir_both_drain, a_torn_tail_is_set_aside_at_every_cut_offset, mid_file_corruption_resyncs_and_keeps_the_exact_bytes, a_transient_failure_resumes_at_the_record_boundary_and_posts_nothing_twice, a_refused_kind1_record_isolates_lines_and_drains_the_rest, a_poison_first_record_is_set_aside_and_the_good_records_after_it_drain, records_refused_whole_three_in_a_row_quarantine_the_file, a_kind2_record_with_newlines_and_spaces_is_set_aside_whole_never_posted, a_wrong_table_record_is_never_posted, an_out_of_window_line_inside_a_record_is_refused_on_the_arrival_clock, appends_after_the_snapshot_survive_and_resume_at_a_record_boundary, set_aside_failure_keeps_the_file_and_the_offset, an_unreachable_questdb_keeps_the_file_and_stops_the_round, the_framed_replay_never_reads_a_whole_file_into_memory, the_spill_file_is_framed_and_only_the_framed_lister_sees_it, the_text_branch_still_writes_legacy_ilp, a_synced_spill_syncs_the_directory_entries_an_unsynced_create_left, the_framed_depth_append_cuts_back_and_never_syncs_under_its_lock, framed_replay_filters_every_kind1_record_on_the_arrival_clock
++  - Tests: header_layout_is_pinned_byte_for_byte, encode_header_round_trips_every_field, decode_header_refuses_each_defect, every_single_bit_flip_in_the_header_is_refused, payload_ok_detects_any_single_bit_flip, next_record_start_skips_garbage_and_a_false_magic, an_undecidable_candidate_at_the_window_end_is_undecided_not_found, next_span_still_advances_on_a_record_larger_than_a_tiny_window, append_v1_records_splits_a_large_payload_into_records_of_at_most_8_mib, a_failed_write_is_cut_back_to_the_last_whole_record, a_batch_failing_in_its_second_record_keeps_its_first_whole_record, a_failed_cut_back_leaves_a_fragment_the_reader_sets_aside_and_later_records_replay, an_over_long_line_is_refused_before_any_byte_is_written, append_lock_keeps_concurrent_appenders_from_interleaving_records, crash_permutations_never_lose_a_byte, sync_dir_entries_marks_only_what_it_synced_and_a_removal_voids_the_mark, forget_removed_unmarks_and_the_synced_list_stays_bounded, sync_parent_dir_syncs_the_directory_and_counts, list_framed_spill_files_sees_only_framed_files, register_frame_baseline_seeds_every_reason, replay_framed_spill_dir_posts_every_record_and_removes_the_drained_file, text_and_framed_files_in_one_dir_both_drain, a_torn_tail_is_set_aside_at_every_cut_offset, mid_file_corruption_resyncs_and_keeps_the_exact_bytes, a_transient_failure_resumes_at_the_record_boundary_and_posts_nothing_twice, a_refused_kind1_record_isolates_lines_and_drains_the_rest, a_poison_first_record_is_set_aside_and_the_good_records_after_it_drain, records_refused_whole_three_in_a_row_quarantine_the_file, records_refused_line_for_line_after_an_accepted_one_still_quarantine_the_file, a_kind2_record_with_newlines_and_spaces_is_set_aside_whole_never_posted, a_wrong_table_record_is_never_posted, an_out_of_window_line_inside_a_record_is_refused_on_the_arrival_clock, appends_after_the_snapshot_survive_and_resume_at_a_record_boundary, set_aside_failure_keeps_the_file_and_the_offset, an_unreachable_questdb_keeps_the_file_and_stops_the_round, the_framed_replay_never_reads_a_whole_file_into_memory, the_spill_file_is_framed_and_only_the_framed_lister_sees_it, the_text_branch_still_writes_legacy_ilp, a_synced_spill_syncs_the_directory_entries_an_unsynced_create_left, the_framed_depth_append_cuts_back_and_never_syncs_under_its_lock, framed_replay_filters_every_kind1_record_on_the_arrival_clock
 +- [ ] 49d-2 — New array-row table, pinned V2 sender, byte-based flush, default OFF (step 2 of the proposed sequence; its own PR).
 +
 +### Design
-+49d-1. Record layout in `depth_spill_frame.rs` (magic `TVDF`, version 1, kind, payload length ≤ `FRAMED_MAX_PAYLOAD` = one replay POST body, rows, `capture_seq` range, payload CRC-32, header CRC-32). `append_v1_records` splits the payload on line boundaries (`ilp_chunk_ranges`), builds every header before it takes `DEPTH_SPILL_APPEND`, then under the lock opens, `fstat`s, writes and on failure cuts back to the length before the call; it never syncs. `spill_failed_depth_ilp` writes the framed file when `DEPTH_SPILL_WRITES_FRAMED` (true), syncs the payload on the synced paths, then `sync_dir_entries` syncs the file's entry and the spill directory's entry when this process has not synced them yet (tracked in `AppendState` under the same lock, at most 64 entries, cleared when full; a replay removal voids a mark in flight). Spill writes stay where they were (writer thread, rescue thread, parked rescue, the drain's inline fallback through `off_worker`); nothing new runs on the drain. `replay_framed_spill_dir` runs after the text pass in the depth directory round: snapshot the length under the lock, stream from the resume offset through one `REPLAY_STREAM_BUFFER_BYTES` window (`FramedCursor`), filter each kind-1 `market_depth` record on the arrival clock and POST it; a permanent refusal isolates lines; a record refused whole is set aside as `.refused-records`, three in a row quarantine the file; corrupt bytes, a torn tail, kind 2 and other tables are set aside byte for byte; at the end the file is removed under the lock only if it did not grow.
++49d-1. Record layout in `depth_spill_frame.rs` (magic `TVDF`, version 1, kind, payload length ≤ `FRAMED_MAX_PAYLOAD` = one replay POST body, rows, `capture_seq` range, payload CRC-32, header CRC-32). `append_v1_records` splits the payload on line boundaries (`ilp_chunk_ranges`), builds every header before it takes `DEPTH_SPILL_APPEND`, then under the lock opens, `fstat`s, writes and on failure cuts back to the end of the last record it wrote in full; it never syncs. `spill_failed_depth_ilp` writes the framed file when `DEPTH_SPILL_WRITES_FRAMED` (true), syncs the payload on the synced paths, then `sync_dir_entries` syncs the file's entry and the spill directory's entry when this process has not synced them yet (tracked in `AppendState` under the same lock, at most 64 entries, cleared when full; a replay removal voids a mark in flight). Spill writes stay where they were (writer thread, rescue thread, parked rescue, the drain's inline fallback through `off_worker`); nothing new runs on the drain. `replay_framed_spill_dir` runs after the text pass in the depth directory round: snapshot the length under the lock, stream from the resume offset through one `REPLAY_STREAM_BUFFER_BYTES` window (`FramedCursor`), filter each kind-1 `market_depth` record on the arrival clock and POST it; a permanent refusal isolates lines; a record refused whole is set aside as `.refused-records`, three in a row quarantine the file; corrupt bytes, a torn tail, kind 2 and other tables are set aside byte for byte; at the end the file is removed under the lock only if it did not grow.
 +### Edge Cases
-+49d-1: a crash mid-append (torn tail at every cut offset); a failed write with a failed cut-back (fragment resynced and set aside); bit rot in a header or payload (CRC refuses, resync to the next whole record); a false magic inside a payload; a record larger than the window (asserted impossible, tiny-window test still advances); an append landing while the replay drains (beyond the snapshot, kept for the next round); two appenders at once (lock, no interleave); the drain's unsynced inline fallback creating the hour file and a synced append following it; the replay removing a file between an append and its directory sync; the spill directory created by this write; a one-row poison batch first in an hour followed by good batches; every record refused (table-level); a line longer than one record (refused before any byte); legacy `.ilp` files in the same folder; kind-2 bytes holding `\n` and spaces.
++49d-1: a crash mid-append (torn tail at every cut offset); a failed write with a failed cut-back (fragment resynced and set aside); bit rot in a header or payload (CRC refuses, resync to the next whole record); a false magic inside a payload; a record larger than the window (asserted impossible, tiny-window test still advances); an append landing while the replay drains (beyond the snapshot, kept for the next round); two appenders at once (lock, no interleave); the drain's unsynced inline fallback creating the hour file and a synced append following it; the replay removing a file between an append and its directory sync; the spill directory created by this write; a one-row poison batch first in an hour followed by good batches; every record refused (table-level); a line longer than one record (refused before any byte); legacy `.ilp` files in the same folder; kind-2 bytes holding `\n` and spaces; a multi-record batch whose write fails in its second record (the first stays and replays); a table-level refusal that starts after an earlier record was accepted (refused line for line, still quarantines on the third); the newest legacy depth `.ilp` after the switch (emptied, not held as live).
 +### Failure Modes
 +49d-1: a failed file sync or directory sync is an `Err`, so the caller marks the range unapplied and counts it as today, and the next synced append retries the directory sync; a failed set-aside or POST stops the round and resumes at the record boundary; a refused record is kept in quarantine and counted on `tv_tick_spill_replay_lines_rejected_total{dir="depth"}` (the `market-data-refused` loss group, no new counter in it); a whole-file quarantine keeps every byte; a crash leaves at most a torn tail, set aside and counted. Honest limits (also in the CLAUDE.md row): the drain's inline fallback can wait for another appender's open, `fstat` and write; only the innermost level `create_dir_all` makes is directory-synced; a false magic with a valid header CRC (about 2^-32) at a window edge can set real bytes aside (kept); the CRC cost is Assumed (~20 ms per 8 MiB) until the `#[ignore]`d harness is run on the prod box.
 +### Test Plan
@@ -32,14 +32,14 @@ index f41215dc5..65f4ec6bc 100644
  
  Approved by Parthiban 2026-10-06: "Go ahead with whatever you want dude" and "See do everything whatever is recommended dude okay?", answering the recommended cross-verification hardening list (five findings: the day marker, the read that runs too early, missing minutes that never page, a day with no run at all, and targets fixed at boot). Rule authority: `no-rest-except-live-feed-2026-06-27.md` §12.15.7 onward and the noise lock §2.5 notes, each dated and recorded before its code. Ten serial PRs, one sub-item each. Findings Verified by reading `origin/main` at `60bdfd97a`; cargo was not run for the findings.
 diff --git a/CLAUDE.md b/CLAUDE.md
-index 19e1c3862..2668ed05f 100644
+index 19e1c3862..309e12c5c 100644
 --- a/CLAUDE.md
 +++ b/CLAUDE.md
 @@ -118,6 +118,7 @@ this list is now stated as audited-as-of a date rather than as exhaustive.
  | `crates/storage/src/ws_frame_spill.rs::resync_from` | **ADDED 2026-10-02** (audit Z11a). After a bad WAL record, replay scans forward byte by byte for the next record with a valid magic, type, length ≤ `WAL_RESYNC_MAX_FRAME_BYTES` (4 MiB) and a matching CRC: **O(skipped bytes × candidates)**, worst case O(segment bytes) per gap, with one CRC over at most 4 MiB per candidate that passes the cheap checks. Cold boot replay only; zero allocation until a CRC matches. Before this, one flipped bit abandoned up to ~700,000 frames of a 128 MiB segment. Skipped bytes are counted (`tv_wal_replay_resyncs_total`, WS-SPILL-02 `source="mid_segment_resync"`). |
  | `crates/storage/src/ws_frame_spill.rs::{next_segment_name_nanos, SEGMENT_NAME_HIGH}` | **ADDED 2026-10-04** (plan item R3-14), in the same change. A segment is named `max(wall nanos, highest name in its directory + 1)`, so replay, prune and the raw upload, which all order segments by name, keep frame order across a backward clock step or a restart. `SEGMENT_NAME_HIGH` is a `Mutex<HashMap<PathBuf, u128>>` with one entry per WAL directory (one in production; tests add one per temp directory, never removed). The first rotation in a directory lists the live, `replaying/` and `archive/` names, **O(files)**, once; every later rotation is one lock and one hash probe, **O(1)**. Runs at segment rotation only, never per frame. A clamped name is counted on `tv_wal_segment_name_clamped_total` with one uncoded `warn!`. **Honest limit:** after a backward step the name runs ahead of the wall clock by at most the step, so the raw upload files that segment under the date its name carries, not the wall date. |
  | `crates/storage/src/tick_spill_replay.rs::{isolate_refused_lines, split_at_line_boundary, set_aside_rejected_lines}` | **ADDED 2026-10-04** (plan item PR17), in the same change. When QuestDB permanently refuses a replay chunk, the chunk is bisected at line boundaries and each half re-POSTed, down to single lines: about log2(lines) POSTs per refused line (~17 for a full 8 MiB chunk), at most `REPLAY_MAX_ISOLATION_POSTS_PER_CHUNK` (1,024) POSTs and `REPLAY_MAX_REJECTED_LINES_PER_CHUNK` (64) refused lines, past either the whole file is quarantined as before. Each split is an **O(range)** newline search; slices share the chunk's `Bytes` (no copy). Refused lines are appended to `quarantine/<file>.rejected-lines` with one write and one `sync_data` per chunk. Cold: the replay task only, and only after a permanent refusal. **Honest limit:** a truncated line that is still valid ILP (cut inside its timestamp digits) is accepted by QuestDB and is not caught here, as before. |
-+| `crates/storage/src/depth_spill_frame.rs::{append_v1_records, sync_dir_entries, next_record_start, FramedCursor, DEPTH_SPILL_APPEND, AppendState}` → `crates/storage/src/depth_spill_framed_replay.rs::replay_framed_spill_dir` | **ADDED 2026-10-06** (plan item 49d-1), in the same change that created them. The depth spill is now length-framed (`depth-{feed}-{hour}.ilpf`): each record is a 64-byte header (magic, version, kind, length, rows, `capture_seq` range, a CRC-32 of the payload and of the header) plus the payload, so a future ILP V2 array batch (raw `f64` bytes, `'\n'` and `' '` among them) can never be cut on a newline by the replay. `append_v1_records` is **O(payload)** per failed batch (one CRC pass and one newline count BEFORE the lock, then one write and one `fstat` under it; at most four 8 MiB records for the 32 MiB producer cap), on the cold rescue paths only (writer thread, rescue thread, the drain's inline fallback through `off_worker`, the after-close pass), never per tick; zero allocation apart from the line-range and header `Vec`s. `DEPTH_SPILL_APPEND` is a process-wide `Mutex<AppendState>` held for open, stat, write and cut-back by appenders (the headers are built before it is taken; source-scanned) and for stat, remove and quarantine by the replay, **never across an fsync, a POST or a quarantine write** (source-scan `the_framed_depth_append_cuts_back_and_never_syncs_under_its_lock`). A failed write is cut back to the file's length before the call (`set_len`); a failed cut-back is a coded `HOT-PATH-02` and the replay sets the fragment aside. A synced write syncs every directory entry this process has not synced yet (`sync_dir_entries`: the file's entry, whoever created the file, the drain's unsynced inline fallback included, and the spill directory's own entry), outside the lock; `AppendState` lists the synced entries (at most `DIR_ENTRY_SYNCED_LIMIT` = 64, scanned linearly, cleared when full, which only makes the next synced append sync again), and a replay remove or quarantine voids any mark in flight. `replay_framed_spill_dir` is **O(file bytes)** per round through one `REPLAY_STREAM_BUFFER_BYTES` (32 MiB) window, allocated only when a framed file exists and after the text pass has dropped its own; a resync (`next_record_start`) is **O(scanned bytes)** plus one payload CRC per candidate whose header CRC passes. A record QuestDB refuses whole is set aside as `.refused-records` and the replay carries on; only `FRAMED_REFUSED_WHOLE_IN_A_ROW_QUARANTINE` (3) in a row quarantine the whole file. A corrupt or torn span opening with a CRC-checked header counts that header's rows. It runs on the replay task's blocking thread after the text pass, held 08:00–15:40 IST with it. The file length is read under the lock, so every judgement inside it is final and a drained file is removed only if it did not grow. **Honest limits:** (a) the drain's inline fallback can now wait for another appender's open, `fstat` and write (not its CRC and not its sync, both outside the lock) and pays its own CRC, same class as the inline write it already does, unmeasured; when `create_dir_all` creates more than one level, only the innermost level's entry is synced; (b) one process appends at a time (the dual-instance lock), Assumed; a second process's interleave is resynced and set aside, never posted and never deleted; (c) after a whole-file quarantine, bytes appended after the snapshot go to quarantine with the file (kept, counted per file); (d) a false magic with a valid header CRC (about 2^-32 per candidate) at a window edge can set a few real bytes aside rather than replay them, kept and uploaded; (e) kind-2 records are never posted in this step, they are set aside; (f) the CRC cost (Assumed ~20 ms per 8 MiB) has an `#[ignore]`d harness, `framed_crc_cost_on_32_mib`, not yet run on the prod box. |
++| `crates/storage/src/depth_spill_frame.rs::{append_v1_records, sync_dir_entries, next_record_start, FramedCursor, DEPTH_SPILL_APPEND, AppendState}` → `crates/storage/src/depth_spill_framed_replay.rs::replay_framed_spill_dir` | **ADDED 2026-10-06** (plan item 49d-1), in the same change that created them. The depth spill is now length-framed (`depth-{feed}-{hour}.ilpf`): each record is a 64-byte header (magic, version, kind, length, rows, `capture_seq` range, a CRC-32 of the payload and of the header) plus the payload, so a future ILP V2 array batch (raw `f64` bytes, `'\n'` and `' '` among them) can never be cut on a newline by the replay. `append_v1_records` is **O(payload)** per failed batch (one CRC pass and one newline count BEFORE the lock, then one write and one `fstat` under it; at most four 8 MiB records for the 32 MiB producer cap), on the cold rescue paths only (writer thread, rescue thread, the drain's inline fallback through `off_worker`, the after-close pass), never per tick; zero allocation apart from the line-range and header `Vec`s. `DEPTH_SPILL_APPEND` is a process-wide `Mutex<AppendState>` held for open, stat, write and cut-back by appenders (the headers are built before it is taken; source-scanned) and for stat, remove and quarantine by the replay, **never across an fsync, a POST or a quarantine write** (source-scan `the_framed_depth_append_cuts_back_and_never_syncs_under_its_lock`). A failed write is cut back to the end of the last record that call wrote in full (`set_len`), so a batch failing in its second record keeps its first, and still returns the error (the batch counts as not landed; a row reaching QuestDB twice upserts onto itself); a failed cut-back is a coded `HOT-PATH-02` and the replay sets the fragment aside. A synced write syncs every directory entry this process has not synced yet (`sync_dir_entries`: the file's entry, whoever created the file, the drain's unsynced inline fallback included, and the spill directory's own entry), outside the lock; `AppendState` lists the synced entries (at most `DIR_ENTRY_SYNCED_LIMIT` = 64, scanned linearly, cleared when full, which only makes the next synced append sync again), and a replay remove or quarantine voids any mark in flight. `replay_framed_spill_dir` is **O(file bytes)** per round through one `REPLAY_STREAM_BUFFER_BYTES` (32 MiB) window, allocated only when a framed file exists and after the text pass has dropped its own; a resync (`next_record_start`) is **O(scanned bytes)** plus one payload CRC per candidate whose header CRC passes. A record QuestDB refuses whole (including one refused line for line after an earlier record was accepted) is set aside as `.refused-records` and the replay carries on; only `FRAMED_REFUSED_WHOLE_IN_A_ROW_QUARANTINE` (3) in a row quarantine the whole file. A corrupt or torn span opening with a CRC-checked header counts that header's rows. It runs on the replay task's blocking thread after the text pass, held 08:00–15:40 IST with it. While the writer is on the framed format, the text pass treats no depth `.ilp` file as live, so a fully drained legacy file is emptied rather than kept behind a resume offset. The file length is read under the lock, so every judgement inside it is final and a drained file is removed only if it did not grow. **Honest limits:** (a) the drain's inline fallback can now wait for another appender's open, `fstat` and write (not its CRC and not its sync, both outside the lock) and pays its own CRC, same class as the inline write it already does, unmeasured; when `create_dir_all` creates more than one level, only the innermost level's entry is synced; (b) one process appends at a time (the dual-instance lock), Assumed; a second process's interleave is resynced and set aside, never posted and never deleted; (c) after a whole-file quarantine, bytes appended after the snapshot go to quarantine with the file (kept, counted per file); (d) a false magic with a valid header CRC (about 2^-32 per candidate) at a window edge can set a few real bytes aside rather than replay them, kept and uploaded; (e) kind-2 records are never posted in this step, they are set aside; (f) the CRC cost (Assumed ~20 ms per 8 MiB) has an `#[ignore]`d harness, `framed_crc_cost_on_32_mib`, not yet run on the prod box. |
  | `crates/storage/src/seal_spill.rs::SealSpillWriter::sync_open_file` → `seal_writer_runner.rs::SealEscalationSink::run` | **ADDED 2026-10-04** (plan item PR17), in the same change. The seal spill day file is now synced: one `dup` under the append lock, then `sync_data` with the lock released, **O(1)** syscalls per call, on the `tv-seal-escalate` thread only, after each batch that empties the queue and at most once a second under a burst (`SEAL_ESCALATION_SYNC_INTERVAL`), plus once at exit. The day rotation in `current_file` runs under the append lock, so it does NOT sync: it moves the closing day's handle aside (`SpillState::rotated`, at most one, no syscall), and the next `sync_open_file` syncs and closes it off the lock (fixed 2026-10-04 the same day: the first version synced the closing file under the lock, where the drain's inline fallback could wait on it). Neither `append_seal` nor `current_file` syncs, and `sync_open_file` holds the only sync calls in the file (source-scan `the_drain_reachable_append_never_syncs_and_the_sync_holds_no_lock`, bite-tested; `test_sync_open_file_syncs_and_closes_the_handle_a_day_rotation_left_behind`). A rotation made by the inline fallback is synced by the escalation thread's next write or its exit, like any inline append. **Honest limit:** the seal DLQ is still not synced. *(⚠ FIXED 2026-10-04 (PR17 remainder, L5): `SealDlqWriter::sync_written` syncs every day file written since the last call, plus the folder and its parent when either gained an entry; the append records the day under a short lock and never syncs, and the sync runs with the lock released (source-scan `test_append_record_never_syncs_and_sync_written_holds_no_lock`). The spill tier likewise now syncs only after a write, and syncs the folder and its parent when a day file or the folder is new. Both run from the escalation thread and from `run_one_cycle` step 3 (`SealAbsorptionPipeline::sync_escalated`), which covers the files the outage cascade writes when QuestDB is down, so a power loss after the cycle loses none of them. Cost: at most two `sync_data` and two directory syncs per 100 ms cycle, only after a write; nothing on the frame drain.)* |
  | `crates/storage/src/seal_spill.rs::{BOOT_DRAINED_SPILL_DIRS, is_spill_record_name, strip_copy_suffixes}` | **ADDED 2026-10-04** (plan item PR40b-f), in the same change. `BOOT_DRAINED_SPILL_DIRS` is a `Mutex<Vec<PathBuf>>` of spill folders the boot drain has read in this process: one push per boot drain (one entry in production), one scan per retention sweep, **O(dirs)**, cold; until a folder is in it the sweep keeps aged top-level and `replaying/` files (`held_before_boot_drain`). `strip_copy_suffixes` is **O(suffixes)** per file name, on the cold sweep, upload listing and staging. **Honest limit:** a process that never runs the boot drain (Dhan lane off) never age-prunes unreplayed spill files; they are kept. **ADDED 2026-10-04 (PR40b-f remainder):** a staged file holding a seal the boot drain or the replay gave up on (undecodable, refused past the retry window, or a poison row) moves to `refused/` (`SEAL_REFUSED_SUBDIR`) instead of `archive/`; the retention sweep never deletes it (`count_kept_refused`, **O(files)** per sweep, cold; gauge `tv_seal_spill_refused_files`) and the cold upload copies it. The boot drain reports those seals once, when the file moves (`seals_unrecovered`), so a file left pending for the next boot is not reported as lost; the replay counts each skipped record once across re-reads (per-file offset marks, O(1) per record). |
  | `crates/storage/src/seal_writer_runner.rs::{SealSender, SEAL_MPSC_CAPACITY}` | **ADDED 2026-10-04** (audit N2), in the same change. The sealed-candle hand-off queue from the frame drain to the seal writer was a tokio `mpsc`, which grows its buffer in 32-slot blocks as items queue, so under a backlog (a slow database, the midnight seal burst) the drain's `try_send` allocated, and no DHAT test queued a backlog. It is now a bounded `crossbeam_channel` array (`SealSender`, refusal type `SealTrySendError`), every slot allocated and written once when the runner is built: **SPACE is fixed**, `SEAL_MPSC_CAPACITY` (250,000) × (8 + `size_of::<BufferedSeal>()` ≤ 176 B) ≤ 46 MB resident from boot, where the tokio queue was ~0 at rest and ~42 MB at the peak of a burst. `try_send` and `try_recv` stay **O(1)**, non-blocking, and allocate nothing (`dhat_seal_queue_backlog`: a full queue plus 1,000 refused sends, 0 bytes; the same backlog through a tokio `mpsc` allocates, asserted in the same test). No AWS cost; the instance is unchanged. |
@@ -526,10 +526,10 @@ index c4a757e03..df3349043 100644
              .is_err()
 diff --git a/crates/storage/src/depth_spill_frame.rs b/crates/storage/src/depth_spill_frame.rs
 new file mode 100644
-index 000000000..860d677c6
+index 000000000..ea4760b6a
 --- /dev/null
 +++ b/crates/storage/src/depth_spill_frame.rs
-@@ -0,0 +1,1571 @@
+@@ -0,0 +1,1587 @@
 +//! Length-framed records for the depth spill tier (plan item 49d-1,
 +//! 2026-10-06).
 +//!
@@ -564,7 +564,7 @@ index 000000000..860d677c6
 +//! | 16..24 | lowest `capture_seq` of the batch (0 = unknown) |
 +//! | 24..32 | highest `capture_seq` of the batch |
 +//! | 32..40 | lowest row timestamp, nanos (0 = not recorded; always 0 here) |
-+//! | 40..48 | highest row timestamp, nanos (same) |
++//! | 40..48 | highest row timestamp, nanos (same; both ignored on read, so a later writer may fill them) |
 +//! | 48..52 | CRC-32 (IEEE) of the payload |
 +//! | 52..60 | reserved, 0 |
 +//! | 60..64 | CRC-32 (IEEE) of bytes 0..60 |
@@ -751,11 +751,12 @@ index 000000000..860d677c6
 +    if kind != FRAME_KIND_ILP_V1_LINES && kind != FRAME_KIND_ILP_V2_BATCH {
 +        return Err(FrameDefect::BadKind);
 +    }
-+    // O(1) EXEMPT: a fixed 18-byte check, not a scan.
-+    let reserved_clear = bytes[6] == 0
-+        && bytes[7] == 0
-+        && bytes[32..48].iter().all(|b| *b == 0)
-+        && bytes[52..60].iter().all(|b| *b == 0);
++    // Bytes 32..48 (the timestamp range) are NOT checked: they are reserved
++    // for a later writer to fill, and a reader that refused them would set a
++    // later build's valid records aside (review 2026-10-06). This build
++    // writes them as 0 and ignores them.
++    // O(1) EXEMPT: a fixed 10-byte check, not a scan.
++    let reserved_clear = bytes[6] == 0 && bytes[7] == 0 && bytes[52..60].iter().all(|b| *b == 0);
 +    if !reserved_clear {
 +        return Err(FrameDefect::NonZeroReserved);
 +    }
@@ -1544,7 +1545,7 @@ index 000000000..860d677c6
 +        let mut bad = good;
 +        bad[5] = 3;
 +        assert_eq!(decode_header(&resign(bad)), Err(FrameDefect::BadKind));
-+        for at in [6, 7, 32, 47, 52, 59] {
++        for at in [6, 7, 52, 59] {
 +            let mut bad = good;
 +            bad[at] = 1;
 +            assert_eq!(
@@ -1567,6 +1568,21 @@ index 000000000..860d677c6
 +            decode_header(&resign(v2)).map(|h| h.kind),
 +            Ok(FRAME_KIND_ILP_V2_BATCH)
 +        );
++    }
++
++    /// Review 2026-10-06: bytes 32..48 (timestamp range) are reserved for a
++    /// later writer to fill, so this reader must decode a header that fills
++    /// them. Bite-check: with 32..48 back in the reserved check this fails
++    /// with `NonZeroReserved`.
++    #[test]
++    fn a_header_with_the_timestamp_range_filled_still_decodes() {
++        let mut h = encode_header(FRAME_KIND_ILP_V1_LINES, b"x\n", 1, (1, 2));
++        h[32..40].copy_from_slice(&1_700_000_000_000_000_000_u64.to_le_bytes());
++        h[40..48].copy_from_slice(&u64::MAX.to_le_bytes());
++        let d = decode_header(&resign(h)).expect("timestamps are ignored on read");
++        assert_eq!(d.rows, 1);
++        assert_eq!((d.min_seq, d.max_seq), (1, 2));
++        assert!(payload_ok(&d, b"x\n"));
 +    }
 +
 +    #[test]
@@ -2103,10 +2119,10 @@ index 000000000..860d677c6
 +}
 diff --git a/crates/storage/src/depth_spill_framed_replay.rs b/crates/storage/src/depth_spill_framed_replay.rs
 new file mode 100644
-index 000000000..7cdeb5155
+index 000000000..306c3eb9a
 --- /dev/null
 +++ b/crates/storage/src/depth_spill_framed_replay.rs
-@@ -0,0 +1,1284 @@
+@@ -0,0 +1,1380 @@
 +//! Replay of the length-framed depth spill (`.ilpf`, plan item 49d-1,
 +//! 2026-10-06).
 +//!
@@ -2501,14 +2517,36 @@ index 000000000..7cdeb5155
 +    }
 +}
 +
-+/// Rows a corrupt or torn span holds, for the loss counters. When the span
-+/// opens with a header that passes its own CRC (the payload CRC failed, or
-+/// the payload was torn), that header's row count is the best figure there
-+/// is, and an 8 MiB record holds tens of thousands of rows. Otherwise 1: no
-+/// trustworthy count exists (finding 2026-10-06: every corrupt span used to
-+/// count 1, under-reporting a corrupt record by its whole row count). O(1).
++/// Rows a corrupt or torn span holds, for the loss counters. Walks the span
++/// and adds the row count of every header that passes its own CRC (its
++/// payload CRC failed, or its payload was torn): adjacent corrupt records
++/// merge into one span, and each one's rows are lost (review 2026-10-06:
++/// counting only the span's first header under-reported every later record
++/// in it). After a counted header the walk resumes past that header only,
++/// never past its claimed payload, because a torn record can hold a later
++/// append inside its claimed length. 1 when no header in the span decodes:
++/// no trustworthy count exists. O(span bytes), cold, no allocation.
 +fn rows_in_span(bytes: &[u8]) -> u64 {
-+    crate::depth_spill_frame::decode_header(bytes).map_or(1, |h| u64::from(h.rows.max(1)))
++    let magic = crate::depth_spill_frame::FRAME_MAGIC;
++    let mut rows = 0_u64;
++    let mut found = false;
++    let mut at = 0_usize;
++    // O(1) EXEMPT: begin — cold walk over a span already set aside.
++    while let Some(rel) = bytes
++        .get(at..)
++        .and_then(|rest| rest.windows(magic.len()).position(|w| w == magic))
++    {
++        let k = at + rel;
++        if let Ok(h) = crate::depth_spill_frame::decode_header(&bytes[k..]) {
++            found = true;
++            rows = rows.saturating_add(u64::from(h.rows.max(1)));
++            at = k + FRAME_HEADER_BYTES;
++        } else {
++            at = k + 1;
++        }
++    }
++    // O(1) EXEMPT: end
++    if found { rows } else { 1 }
 +}
 +
 +/// True when the payload's first line is a `market_depth` row: the table
@@ -2941,6 +2979,21 @@ index 000000000..7cdeb5155
 +        want.sort();
 +        assert_eq!(posted, want.join("\n"));
 +        assert!(!framed.exists());
++        // Review 2026-10-06: the legacy text file has no appender (depth
++        // writes framed), so the round EMPTIES it rather than leaving it
++        // whole behind a resume offset. Bite-check: with the
++        // `text_appender_exists` gate removed from `replay_spill_dir`, the
++        // file keeps its 5 lines and this fails.
++        assert_eq!(
++            std::fs::metadata(&text).map(|m| m.len()).unwrap_or(0),
++            0,
++            "the legacy text file is emptied"
++        );
++        assert_eq!(
++            resume_offset_for(&text),
++            0,
++            "no resume offset is left behind"
++        );
 +        cleanup(&dir, &framed);
 +        forget_resume_offset(&text);
 +    }
@@ -3021,6 +3074,65 @@ index 000000000..7cdeb5155
 +            out.lines_set_aside, 3,
 +            "the corrupt record's own CRC-checked header says 3 rows"
 +        );
++        cleanup(&dir, &path);
++    }
++
++    /// Review 2026-10-06: a record whose header fills the reserved timestamp
++    /// range (as a later writer may, then rolled back to this reader) is
++    /// posted, never set aside. Bite-check: with bytes 32..48 back in
++    /// `decode_header`'s reserved check, the record is set aside as corrupt
++    /// and nothing is posted.
++    #[tokio::test]
++    async fn a_record_with_the_timestamp_range_filled_replays() {
++        let dir = depth_dir("ts-filled");
++        let path = dir.join("depth-dhan-1.ilpf");
++        let mut rec = record(FRAME_KIND_ILP_V1_LINES, &lines(0..3));
++        rec[32..40].copy_from_slice(&7_u64.to_le_bytes());
++        rec[40..48].copy_from_slice(&9_u64.to_le_bytes());
++        let crc = crate::wal_applied_watermark::crc32_ieee(&rec[0..60]);
++        rec[60..64].copy_from_slice(&crc.to_le_bytes());
++        std::fs::write(&path, &rec).expect("write");
++        let server = spawn_recording_server(false, None).await;
++        let out = replay_framed_spill_dir(&dir, &server.url, &client()).await;
++        assert_eq!(server.all_posted(), lines(0..3), "the record is posted");
++        assert_eq!(out.lines_set_aside, 0);
++        assert_eq!(out.files_replayed, 1);
++        assert!(!path.exists());
++        cleanup(&dir, &path);
++    }
++
++    /// Review 2026-10-06: two ADJACENT records with bad payloads merge into
++    /// one corrupt span. Both records' rows are lost, so both are counted,
++    /// not only the first header's. Bite-check: with `rows_in_span` reading
++    /// only the span's first header, this counts 3, not 3 + 4.
++    #[tokio::test]
++    async fn adjacent_corrupt_records_count_every_records_rows() {
++        let dir = depth_dir("corrupt-adjacent");
++        let path = dir.join("depth-dhan-1.ilpf");
++        let a = record(FRAME_KIND_ILP_V1_LINES, &lines(0..2));
++        let mut b = record(FRAME_KIND_ILP_V1_LINES, &lines(2..5));
++        let mut c = record(FRAME_KIND_ILP_V1_LINES, &lines(5..9));
++        let d = record(FRAME_KIND_ILP_V1_LINES, &lines(9..11));
++        b[FRAME_HEADER_BYTES + 10] ^= 0x20;
++        c[FRAME_HEADER_BYTES + 12] ^= 0x20;
++        let mut file = a.clone();
++        file.extend_from_slice(&b);
++        file.extend_from_slice(&c);
++        file.extend_from_slice(&d);
++        std::fs::write(&path, &file).expect("write");
++        let server = spawn_recording_server(false, None).await;
++        let out = replay_framed_spill_dir(&dir, &server.url, &client()).await;
++        let mut want = lines(0..2);
++        want.extend_from_slice(&lines(9..11));
++        assert_eq!(server.all_posted(), want, "a and d replay");
++        let mut kept = b.clone();
++        kept.extend_from_slice(&c);
++        assert_eq!(
++            quarantined(&dir, "depth-dhan-1.ilpf.corrupt-bytes"),
++            kept,
++            "b and c are one span, kept byte for byte"
++        );
++        assert_eq!(out.lines_set_aside, 3 + 4, "b's 3 rows and c's 4 rows");
 +        cleanup(&dir, &path);
 +    }
 +
@@ -3713,10 +3825,10 @@ index 6ce369c8a..12a27417e 100644
 +    );
 +}
 diff --git a/crates/storage/tests/spill_rescue_sync_guard.rs b/crates/storage/tests/spill_rescue_sync_guard.rs
-index 54eb6e693..5ddb55cdc 100644
+index 54eb6e693..3f094f756 100644
 --- a/crates/storage/tests/spill_rescue_sync_guard.rs
 +++ b/crates/storage/tests/spill_rescue_sync_guard.rs
-@@ -243,3 +243,82 @@ fn every_blocking_writer_step_runs_off_the_worker() {
+@@ -243,3 +243,101 @@ fn every_blocking_writer_step_runs_off_the_worker() {
          "every inline seal escalation on the caller must run off the worker"
      );
  }
@@ -3740,13 +3852,32 @@ index 54eb6e693..5ddb55cdc 100644
 +        .find("write_with_test_hooks(")
 +        .expect("the append writes the records");
 +    assert!(lock < write, "the lock is taken before any byte is written");
++    // Review 2026-10-06: the cut-back keeps the batch's whole records. The
++    // target is the length before the call plus the bytes of the records
++    // written in full, which `write_v1_records` raises only after a record's
++    // payload write returned.
++    let keep = append
++        .find("let keep = start + whole;")
++        .expect("the cut-back target is the end of the last whole record");
 +    let cut = append
-+        .find("cut_back(&file, start)")
++        .find("cut_back(&file, keep)")
 +        .expect("a failed write is cut back");
-+    assert!(cut > write, "the cut-back runs in the write's error arm");
++    assert!(
++        write < keep && keep < cut,
++        "the cut-back runs in the write's error arm"
++    );
 +    assert!(
 +        body_of(&frame, "fn cut_back(").contains("file.set_len(start)"),
-+        "the cut-back truncates to the length before this append"
++        "the cut-back truncates the file to the target it is given"
++    );
++    let writer = body_of(&frame, "fn write_v1_records<");
++    let payload_write = writer
++        .find("out.write_all(&payload[range.clone()])?;")
++        .expect("the record payload is written");
++    let counted = writer.find("*whole +=").expect("whole records are counted");
++    assert!(
++        payload_write < counted,
++        "a record counts as whole only after its payload write returned"
 +    );
 +    for banned in ["sync_data(", "sync_all(", "sync(&"] {
 +        assert!(

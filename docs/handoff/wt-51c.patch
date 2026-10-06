@@ -1,5 +1,5 @@
 diff --git a/.claude/plans/active-plan-feed-hardening.md b/.claude/plans/active-plan-feed-hardening.md
-index 06563d5aa..d6b5952de 100644
+index 06563d5aa..5da10968b 100644
 --- a/.claude/plans/active-plan-feed-hardening.md
 +++ b/.claude/plans/active-plan-feed-hardening.md
 @@ -6364,9 +6364,9 @@ Approved by Parthiban 2026-10-06: "Go ahead with whatever you want dude" and "Se
@@ -9,9 +9,9 @@ index 06563d5aa..d6b5952de 100644
 -- [ ] 51c — **Verdict and late window: a degraded run no longer hides a real divergence, and the excused end-of-day window is derived, not a literal.** The tail excuse comes from the seal constants (`LATE_SEAL_WINDOW_MINUTES`, five minutes), an `Excuse` carries why a minute was not judged, and outside the excused window a failed vendor fetch can only add `missing_rest`.
 -  - Files: crates/app/src/dhan_live_crossverify.rs, crates/app/src/dhan_live_crossverify_boot.rs
 -  - Tests: named in that PR (Partial never masks Diverged; the excused window equals the derived constant)
-+- [x] 51c — **Verdict and late window: a degraded run no longer hides a real divergence, and the excused end-of-day window is derived, not a literal.** The tail excuse comes from the seal constants (`LATE_SEAL_WINDOW_MINUTES` = (`CATCHUP_LATENESS_MARGIN_SECS` + `LAST_FOLDED_TRADE_SLACK_SECS`) / 60 rounded up, five minutes; the 60 s slack is how far before the close the newest folded trade stamp may stop, Assumed, since the cutoff follows the watermark and not the read time; `TAIL_UNSEALED_MINUTES` deleted), and outside the excused window a failed vendor fetch can only add `missing_rest`. The verdict is `decide_outcome` over `VerdictInputs { rest_incomplete, missing: MissingJudgeable, late: LateWindowPolicy }`: a price difference or a judged missing traded/index minute is `diverged` whatever else happened; a failed fetch or spent budget, a truncated live read (`missing_live_unjudged`), a REST hole or an excused late minute (`late_excused`) holds the day at `partial`, never `clean`; the vacuous outcomes are unchanged. Production judges with `Excuse { sealed_through: None }` until 51d. Daily table gains `late_excused`, `missing_live_unjudged`, `missing_judgeable` (ALTER self-heal, DEDUP unchanged); `tail_unsealed` kept and written 0. Rule §12.15.9 first; its Honest limits name the other inputs that fake a judged missing live minute until 51d (a sealed bar not yet readable at the read, a live row skipped as malformed).
++- [x] 51c — **Verdict and late window: a degraded run no longer hides a real divergence, and the excused end-of-day window is derived, not a literal.** The tail excuse comes from the seal constants (`LATE_SEAL_WINDOW_MINUTES` = (`CATCHUP_LATENESS_MARGIN_SECS` + `LAST_FOLDED_TRADE_SLACK_SECS`) / 60 rounded up, five minutes; the 60 s slack is how far before the close the newest folded trade stamp may stop, Assumed, since the cutoff follows the watermark and not the read time; `TAIL_UNSEALED_MINUTES` deleted), and outside the excused window a failed vendor fetch can only add `missing_rest`. The verdict is `decide_outcome` over `VerdictInputs { rest_incomplete, missing: MissingJudgeable, late: LateWindowPolicy }`: a price difference or a judged missing traded/index minute is `diverged` whatever else happened; a failed fetch or spent budget, a truncated live read (`missing_live_unjudged`), a REST hole or an excused late minute (`late_excused`) holds the day at `partial`, never `clean`; the vacuous outcomes are unchanged. Production judges with `Excuse { sealed_through: None }` until 51d. Daily table gains `late_excused`, `missing_live_unjudged`, `missing_judgeable` (ALTER self-heal, DEDUP unchanged); `tail_unsealed` kept and written 0. Rule §12.15.9 first; its Honest limits name the other inputs that fake a judged missing live minute until 51d (a sealed bar not yet readable at the read, a live row skipped as malformed). Review fix: every attempt stamps one `attempt_at` reading on its daily row and every cell, and `run_complete` on the daily row (ALTER self-heal, not in any DEDUP key), so a same-day retry that reads differently (`diverged` then `partial`) leaves rows a reader can order; §12.15.9 and runbook §4 say how to pick the final row.
 +  - Files: crates/app/src/dhan_live_crossverify.rs, crates/app/src/dhan_live_crossverify_boot.rs, crates/app/src/dhan_feed_stack.rs, crates/storage/src/dhan_live_crossverify_persistence.rs, docs/claude-rules-full/project/no-rest-except-live-feed-2026-06-27.md, .claude/rules/project/no-rest-except-live-feed-2026-06-27.md, docs/error-runbooks/dhan-live-crossverify-error-codes.md
-+  - Tests: a_failed_fetch_no_longer_hides_a_real_divergence, a_rest_incomplete_run_with_no_finding_is_partial_never_clean, a_truncated_live_read_never_judges_missing_minutes_but_still_flags_price_divergence, late_seal_window_minutes_is_derived_from_the_catch_up_margin, late_window_covers_every_unsealed_bucket_only_when_the_last_trade_is_within_the_slack, is_late_window_minute_with_known_sealed_through_excuses_only_buckets_ending_after_it, is_late_window_minute_with_none_excuses_the_last_window, strict_policy_counts_a_missing_1539_traded_minute_as_real_diverged, missing_live_late_counts_traded_and_index_minutes_only, excuse_downgrades_clean_to_partial_only_when_late_excused_gt_zero_never_upgrades_degraded_or_diverged, the_late_window_reaches_neither_half_of_the_traded_split_under_excuse, decide_outcome_matches_the_oracle_on_every_permutation, compare_day_in_scope_every_piece_under_every_input, a_sealed_through_value_at_every_minute_of_the_last_10, verdict_inputs_for_run_maps_every_observation, daily_row_carries_the_late_and_unjudged_counts, summary_line_names_minutes_not_yet_judged, proptest_verdict_is_never_clean_when_anything_is_incomplete_excused_or_unjudged, compare_day_degraded_downgrades_clean_to_partial_never_up, late_excused_and_unjudged_columns_self_heal_and_dedup_keys_unchanged, a_live_bar_unreadable_at_the_read_is_judged_missing_and_diverged_until_51d
++  - Tests: a_failed_fetch_no_longer_hides_a_real_divergence, a_rest_incomplete_run_with_no_finding_is_partial_never_clean, a_truncated_live_read_never_judges_missing_minutes_but_still_flags_price_divergence, late_seal_window_minutes_is_derived_from_the_catch_up_margin, late_window_covers_every_unsealed_bucket_only_when_the_last_trade_is_within_the_slack, is_late_window_minute_with_known_sealed_through_excuses_only_buckets_ending_after_it, is_late_window_minute_with_none_excuses_the_last_window, strict_policy_counts_a_missing_1539_traded_minute_as_real_diverged, missing_live_late_counts_traded_and_index_minutes_only, excuse_downgrades_clean_to_partial_only_when_late_excused_gt_zero_never_upgrades_degraded_or_diverged, the_late_window_reaches_neither_half_of_the_traded_split_under_excuse, decide_outcome_matches_the_oracle_on_every_permutation, compare_day_in_scope_every_piece_under_every_input, a_sealed_through_value_at_every_minute_of_the_last_10, verdict_inputs_for_run_maps_every_observation, daily_row_carries_the_late_and_unjudged_counts, summary_line_names_minutes_not_yet_judged, proptest_verdict_is_never_clean_when_anything_is_incomplete_excused_or_unjudged, compare_day_degraded_downgrades_clean_to_partial_never_up, late_excused_and_unjudged_columns_self_heal_and_dedup_keys_unchanged, a_live_bar_unreadable_at_the_read_is_judged_missing_and_diverged_until_51d, attempt_at_and_run_complete_self_heal_reach_the_wire_and_stay_out_of_dedup, test_every_persisted_row_carries_one_attempt_stamp_and_the_run_complete_flag, daily_row_carries_every_count_and_the_applied_tolerance
  - [ ] 51d — **Readiness before the read: the seal sweep, the seal writer and QuestDB have caught up to the close.** A static `CATCHUP_PROGRESS` publishes each completed sweep's floor cutoff (an overrun never raises it); the seal writer's drained sample and today's staged spill files are checked; `fetch_wal_tables` moves to `wal_suspension_watcher` with a new `wal_applied_through`. Earlier attempts retry before any vendor call; the last attempt proceeds with the late minutes unjudged and never pages on them.
    - Files: crates/app/src/dhan_live_crossverify_boot.rs, crates/app/src/dhan_feed_stack.rs, crates/storage/src/wal_suspension_watcher.rs, crates/storage/src/partition_archive.rs
    - Tests: named in that PR (an overrun never raises the published floor; not-ready retries before any REST call)
@@ -65,7 +65,7 @@ index e288e84dd..2f7c38597 100644
  /// How often the lane asks the gap detector what it has recorded.
  ///
 diff --git a/crates/app/src/dhan_live_crossverify.rs b/crates/app/src/dhan_live_crossverify.rs
-index 556b03f10..a09417ace 100644
+index 556b03f10..bcd1f6845 100644
 --- a/crates/app/src/dhan_live_crossverify.rs
 +++ b/crates/app/src/dhan_live_crossverify.rs
 @@ -49,8 +49,11 @@
@@ -587,17 +587,52 @@ index 556b03f10..a09417ace 100644
          noise_p50_paise,
          noise_p95_paise,
          noise_max_paise,
-@@ -1131,6 +1390,9 @@ pub fn daily_row(
+@@ -1106,6 +1365,24 @@ pub fn compare_day_in_scope(
+     }
+ }
+ 
++/// Which attempt wrote a set of audit rows (§12.15.9 review).
++///
++/// Every attempt of a day writes its daily row at the same deterministic `ts`
++/// and the daily DEDUP key includes `outcome`, so an incomplete attempt that is
++/// retried and a retry that reads differently (for example `diverged` while a
++/// sealed bar is still unapplied, then `partial` once it is readable) leave two
++/// rows. `at_ist_nanos` is read ONCE per attempt and written on its daily row
++/// and on every cell it writes, so a reader takes the daily row with the newest
++/// `attempt_at` and that attempt's cells by equality. Not in any DEDUP key.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct AttemptStamp {
++    /// Wall clock when the attempt's persist began, IST nanoseconds.
++    pub at_ist_nanos: i64,
++    /// `run_is_complete` for that attempt: every target fetched, budget not
++    /// spent, live read not truncated.
++    pub run_complete: bool,
++}
++
+ /// Build the daily audit row from a comparison. Pure.
+ #[must_use]
+ pub fn daily_row(
+@@ -1113,6 +1390,7 @@ pub fn daily_row(
+     day_start_ist_nanos: i64,
+     run_ts_ist_nanos: i64,
+     tolerance_paise: i64,
++    attempt: AttemptStamp,
+ ) -> DhanLiveXverifyDailyRow {
+     DhanLiveXverifyDailyRow {
+         run_ts_ist_nanos,
+@@ -1131,6 +1409,11 @@ pub fn daily_row(
          noise_max_paise: cmp.noise_max_paise,
          tolerance_paise,
          outcome: cmp.outcome,
 +        late_excused: cmp.late_excused,
 +        missing_live_unjudged: cmp.missing_live_unjudged,
 +        missing_judgeable: cmp.missing_judgeable,
++        attempt_at_ist_nanos: attempt.at_ist_nanos,
++        run_complete: attempt.run_complete,
      }
  }
  
-@@ -1163,7 +1425,7 @@ pub fn format_summary_line(cmp: &DayComparison) -> String {
+@@ -1163,7 +1446,7 @@ pub fn format_summary_line(cmp: &DayComparison) -> String {
              "🆘 Dhan live-vs-official check PROVED NOTHING today: {} minute(s) \
               of data existed but NONE lined up, so nothing was actually \
               compared. This is not a pass — the check itself needs attention.",
@@ -606,7 +641,7 @@ index 556b03f10..a09417ace 100644
          ),
          DhanLiveXverifyOutcome::NoData => "⚠️ Dhan live-vs-official check found no data on \
               either side today — nothing was compared, so nothing is proven."
-@@ -1179,13 +1441,17 @@ pub fn format_summary_line(cmp: &DayComparison) -> String {
+@@ -1179,13 +1462,17 @@ pub fn format_summary_line(cmp: &DayComparison) -> String {
          DhanLiveXverifyOutcome::Partial | DhanLiveXverifyOutcome::Diverged => format!(
              "⚠️ Dhan live-vs-official check: {} minute(s) compared, {} price \
               difference(s), {} minute(s) we never received, {} minute(s) only \
@@ -627,7 +662,7 @@ index 556b03f10..a09417ace 100644
              rupees(cmp.noise_p50_paise),
              rupees(cmp.noise_max_paise),
          ),
-@@ -1949,6 +2215,12 @@ pub async fn run_cross_verification(
+@@ -1949,6 +2236,12 @@ pub async fn run_cross_verification(
      }
  
      let degraded = truncated || budget_elapsed || rest_failures > 0;
@@ -640,7 +675,7 @@ index 556b03f10..a09417ace 100644
      let run_ts = deterministic_run_ts_nanos(day_start_ist_nanos);
      // The scope set: exactly what this run ASKED the vendor for. A live
      // instrument outside it was never requested, so calling its minutes
-@@ -1966,7 +2238,7 @@ pub async fn run_cross_verification(
+@@ -1966,7 +2259,7 @@ pub async fn run_cross_verification(
          day_start_ist_nanos,
          run_ts,
          cfg.tolerance_paise,
@@ -649,7 +684,7 @@ index 556b03f10..a09417ace 100644
      );
  
      if rest_failures > 0 {
-@@ -2035,10 +2307,21 @@ mod tests {
+@@ -2035,10 +2328,21 @@ mod tests {
              day_start_ist_nanos,
              run_ts_ist_nanos,
              tolerance_paise,
@@ -672,7 +707,18 @@ index 556b03f10..a09417ace 100644
      fn bar(o: f64, h: f64, l: f64, c: f64) -> PaiseBar {
          PaiseBar::from_rupees(o, h, l, c, 100).expect("finite")
      }
-@@ -2551,32 +2834,64 @@ mod tests {
+@@ -2054,6 +2358,10 @@ mod tests {
+ 
+     const OPEN: i64 = SESSION_OPEN_SECS_OF_DAY_IST;
+     const RUN_TS: i64 = 42;
++    const TEST_ATTEMPT: AttemptStamp = AttemptStamp {
++        at_ist_nanos: 7,
++        run_complete: true,
++    };
+ 
+     // =======================================================================
+     // THE #1474 REGRESSION LOCK — the bug that blinded the predecessor
+@@ -2551,32 +2859,64 @@ mod tests {
          );
          assert!(!cmp.outcome.is_pass());
      }
@@ -753,7 +799,7 @@ index 556b03f10..a09417ace 100644
          assert_eq!(cmp.missing_live, 1);
      }
  
-@@ -2620,23 +2935,40 @@ mod tests {
+@@ -2620,23 +2960,40 @@ mod tests {
          );
      }
  
@@ -808,7 +854,7 @@ index 556b03f10..a09417ace 100644
      }
  
      #[test]
-@@ -2712,6 +3044,10 @@ mod tests {
+@@ -2712,6 +3069,10 @@ mod tests {
          assert_eq!(cmp.outcome, DhanLiveXverifyOutcome::Blind);
      }
  
@@ -819,7 +865,7 @@ index 556b03f10..a09417ace 100644
      #[test]
      fn compare_day_degraded_downgrades_clean_to_partial_never_up() {
          let b = bar(100.0, 101.0, 99.0, 100.5);
-@@ -2721,6 +3057,10 @@ mod tests {
+@@ -2721,6 +3082,10 @@ mod tests {
          assert_eq!(cmp.outcome, DhanLiveXverifyOutcome::Partial);
          assert!(!cmp.outcome.is_pass(), "a degraded run is never a pass");
          assert!(cmp.outcome.is_measured(), "but it did compare something");
@@ -830,7 +876,31 @@ index 556b03f10..a09417ace 100644
      }
  
      // =======================================================================
-@@ -3891,7 +4231,7 @@ mod tests {
+@@ -3133,8 +3498,22 @@ mod tests {
+             0,
+             false,
+         );
+-        let row = daily_row(&cmp, DAY_START_NANOS, RUN_TS, 0);
++        let attempt = AttemptStamp {
++            at_ist_nanos: RUN_TS + 13 * 60 * 1_000_000_000,
++            run_complete: true,
++        };
++        let row = daily_row(&cmp, DAY_START_NANOS, RUN_TS, 0, attempt);
+         assert_eq!(row.trading_date_ist_nanos, DAY_START_NANOS);
++        // §12.15.9 review: the attempt stamp rides the row unchanged, and is
++        // distinct from the deterministic `ts` every attempt shares.
++        assert_eq!(row.attempt_at_ist_nanos, attempt.at_ist_nanos);
++        assert_ne!(row.attempt_at_ist_nanos, row.run_ts_ist_nanos);
++        assert!(row.run_complete);
++        let incomplete = AttemptStamp {
++            run_complete: false,
++            ..attempt
++        };
++        assert!(!daily_row(&cmp, DAY_START_NANOS, RUN_TS, 0, incomplete).run_complete);
+         assert_eq!(row.run_ts_ist_nanos, RUN_TS);
+         assert_eq!(row.minutes_compared, cmp.minutes_compared);
+         assert_eq!(row.cells_diverged, cmp.cells_diverged);
+@@ -3891,7 +4270,7 @@ mod tests {
              DAY_START_NANOS,
              RUN_TS,
              0,
@@ -839,7 +909,7 @@ index 556b03f10..a09417ace 100644
          );
          assert_eq!(
              cmp.missing_rest, 0,
-@@ -3920,7 +4260,7 @@ mod tests {
+@@ -3920,7 +4299,7 @@ mod tests {
              DAY_START_NANOS,
              RUN_TS,
              0,
@@ -848,7 +918,7 @@ index 556b03f10..a09417ace 100644
          );
          assert_eq!(
              cmp.instruments, 1,
-@@ -3942,7 +4282,7 @@ mod tests {
+@@ -3942,7 +4321,7 @@ mod tests {
              DAY_START_NANOS,
              RUN_TS,
              0,
@@ -857,7 +927,7 @@ index 556b03f10..a09417ace 100644
          );
          assert_eq!(
              cmp.missing_rest, 1,
-@@ -3963,7 +4303,7 @@ mod tests {
+@@ -3963,7 +4342,7 @@ mod tests {
              DAY_START_NANOS,
              RUN_TS,
              0,
@@ -866,7 +936,7 @@ index 556b03f10..a09417ace 100644
          );
          assert_eq!(cmp.missing_rest, 1, "an empty scope filters nothing");
      }
-@@ -3981,7 +4321,7 @@ mod tests {
+@@ -3981,7 +4360,7 @@ mod tests {
              DAY_START_NANOS,
              RUN_TS,
              0,
@@ -875,7 +945,7 @@ index 556b03f10..a09417ace 100644
          );
          assert_eq!(
              cmp.instruments, 0,
-@@ -3998,7 +4338,15 @@ mod tests {
+@@ -3998,7 +4377,15 @@ mod tests {
              live.push(side(id, OPEN, bar(100.0, 101.0, 99.0, 100.5)));
          }
          let scope = scope_of(&[(0, "IDX_I"), (1, "IDX_I"), (2, "IDX_I")]);
@@ -892,7 +962,7 @@ index 556b03f10..a09417ace 100644
          assert_eq!(
              cmp.missing_rest, 3,
              "3 targeted instruments produce 3 findings — not 200. That ratio \
-@@ -4101,4 +4449,722 @@ mod tests {
+@@ -4101,4 +4488,722 @@ mod tests {
          assert_eq!(cmp.minutes_compared, 1, "prices are still compared");
          assert_eq!(cmp.volume_cells, 0, "09:15 volume is not scored");
      }
@@ -1552,13 +1622,13 @@ index 556b03f10..a09417ace 100644
 +            eq_bar(1, SESSION_CLOSE_SECS_OF_DAY_IST - 60, 9),
 +        ];
 +        let cmp = unscoped(&live, &rest, excuse_inputs(None));
-+        let row = daily_row(&cmp, DAY_START_NANOS, RUN_TS, 0);
++        let row = daily_row(&cmp, DAY_START_NANOS, RUN_TS, 0, TEST_ATTEMPT);
 +        assert_eq!(row.late_excused, 1);
 +        assert_eq!(row.missing_live_unjudged, 0);
 +        assert_eq!(row.missing_judgeable, MissingJudgeable::Judged);
 +        assert_eq!(row.tail_unsealed, 0);
 +        let cmp = unscoped(&live, &rest, verdict_inputs_for_run(false, 0, true));
-+        let row = daily_row(&cmp, DAY_START_NANOS, RUN_TS, 0);
++        let row = daily_row(&cmp, DAY_START_NANOS, RUN_TS, 0, TEST_ATTEMPT);
 +        assert_eq!(row.missing_live_unjudged, 1);
 +        assert_eq!(row.missing_judgeable, MissingJudgeable::LiveTruncated);
 +    }
@@ -1616,9 +1686,21 @@ index 556b03f10..a09417ace 100644
 +    }
  }
 diff --git a/crates/app/src/dhan_live_crossverify_boot.rs b/crates/app/src/dhan_live_crossverify_boot.rs
-index 98927df0d..34441f194 100644
+index 98927df0d..f6bc6292c 100644
 --- a/crates/app/src/dhan_live_crossverify_boot.rs
 +++ b/crates/app/src/dhan_live_crossverify_boot.rs
+@@ -39,9 +39,9 @@ use crate::daily_task_marker::{
+     try_write_daily_marker_keeping,
+ };
+ use crate::dhan_live_crossverify::{
+-    DayComparison, DhanLiveCrossverifyConfig, RUN_SECS_OF_DAY_IST, RunReport,
++    AttemptStamp, DayComparison, DhanLiveCrossverifyConfig, RUN_SECS_OF_DAY_IST, RunReport,
+     SESSION_CLOSE_SECS_OF_DAY_IST, XverifyTarget, daily_row, deterministic_run_ts_nanos,
+-    run_cross_verification,
++    fetched_at_ist_nanos_now, run_cross_verification,
+ };
+ use crate::shutdown_class::{
+     SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST, SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST,
 @@ -1265,7 +1265,10 @@ async fn run_once(
                  missing_live = c.missing_live,
                  missing_live_traded = c.missing_live_traded,
@@ -1631,7 +1713,220 @@ index 98927df0d..34441f194 100644
                  out_of_session = c.out_of_session,
                  noise_p50_paise = c.noise_p50_paise,
                  noise_p95_paise = c.noise_p95_paise,
-@@ -2125,6 +2128,10 @@ mod tests {
+@@ -1282,13 +1285,24 @@ async fn run_once(
+                 vacuous = c.is_vacuous(),
+                 "Dhan 1-minute cross-verification finished"
+             );
+-            let persisted = persist_report(
+-                &deps.questdb,
+-                &report,
+-                day_start_ist_nanos,
+-                cfg.tolerance_paise,
+-                deadline,
++            let complete = run_is_complete(
++                report.budget_elapsed,
++                report.live_truncated,
++                report.rest_failures,
++                targets.len(),
+             );
++            // §12.15.9 review: one wall-clock reading per attempt, written on
++            // its daily row and every cell, so the day's latest attempt and
++            // its own findings can be told apart from an earlier attempt's.
++            let rows = PersistRows {
++                day_start_ist_nanos,
++                tolerance_paise: cfg.tolerance_paise,
++                attempt: AttemptStamp {
++                    at_ist_nanos: fetched_at_ist_nanos_now(),
++                    run_complete: complete,
++                },
++            };
++            let persisted = persist_report(&deps.questdb, &report, rows, deadline);
+             let persist = persist_verdict(&persisted);
+             let persisted_ok = persist.is_ok();
+             if is_catastrophic_divergence(c) && !divergence_paged.swap(true, Ordering::Relaxed) {
+@@ -1307,12 +1321,6 @@ async fn run_once(
+                      as untrustworthy until this is explained."
+                 );
+             }
+-            let complete = run_is_complete(
+-                report.budget_elapsed,
+-                report.live_truncated,
+-                report.rest_failures,
+-                targets.len(),
+-            );
+             let verdict =
+                 classify_attempt(c.is_vacuous(), c.outcome.is_measured(), persist, complete);
+             // The marker condition must stay exactly `should_write_marker`
+@@ -1457,21 +1465,28 @@ fn flush_fits(
+         .is_some_and(|end| end <= deadline)
+ }
+ 
++/// What the spot persist stamps on its rows: the day, the applied tolerance,
++/// and the attempt that wrote them (§12.15.9 review).
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++struct PersistRows {
++    day_start_ist_nanos: i64,
++    tolerance_paise: i64,
++    attempt: AttemptStamp,
++}
++
+ /// Persists the run through the production writer, in batches of
+ /// [`PERSIST_BATCH_ROWS`], stopping at `deadline`. See [`persist_report_into`].
+ fn persist_report(
+     questdb: &QuestDbConfig,
+     report: &RunReport,
+-    day_start_ist_nanos: i64,
+-    tolerance_paise: i64,
++    rows: PersistRows,
+     deadline: tokio::time::Instant,
+ ) -> PersistOutcome {
+     let mut writer = DhanLiveXverifyAuditWriter::new(questdb);
+     persist_report_into(
+         &mut writer,
+         report,
+-        day_start_ist_nanos,
+-        tolerance_paise,
++        rows,
+         PERSIST_BATCH_ROWS,
+         deadline,
+         tokio::time::Instant::now,
+@@ -1502,8 +1517,7 @@ fn persist_report(
+ fn persist_report_into(
+     writer: &mut DhanLiveXverifyAuditWriter,
+     report: &RunReport,
+-    day_start_ist_nanos: i64,
+-    tolerance_paise: i64,
++    rows: PersistRows,
+     batch_rows: usize,
+     deadline: tokio::time::Instant,
+     mut now: impl FnMut() -> tokio::time::Instant,
+@@ -1569,7 +1583,10 @@ fn persist_report_into(
+             stop_at_deadline(writer, &mut out, total - appended);
+             return finish_persist(report, out, batch_errors, None);
+         }
+-        if writer.append_cell(finding).is_err() {
++        if writer
++            .append_cell(finding, rows.attempt.at_ist_nanos)
++            .is_err()
++        {
+             out.cell_append_errors = out.cell_append_errors.saturating_add(1);
+         }
+         appended += 1;
+@@ -1597,9 +1614,10 @@ fn persist_report_into(
+     }
+     let daily = daily_row(
+         c,
+-        day_start_ist_nanos,
+-        deterministic_run_ts_nanos(day_start_ist_nanos),
+-        tolerance_paise,
++        rows.day_start_ist_nanos,
++        deterministic_run_ts_nanos(rows.day_start_ist_nanos),
++        rows.tolerance_paise,
++        rows.attempt,
+     );
+     out.daily_appended = writer.append_daily(&daily).is_ok();
+     if !flush_fits(writer, now(), deadline) {
+@@ -1972,8 +1990,15 @@ fn persist_option_findings(
+     deadline: tokio::time::Instant,
+ ) -> bool {
+     let mut writer = DhanLiveXverifyAuditWriter::new(questdb);
+-    persist_option_findings_into(&mut writer, report, deadline, tokio::time::Instant::now)
+-        == OptionPersist::Flushed
++    // One reading for the pass (§12.15.9 review), as the spot persist does.
++    let attempt_at_ist_nanos = fetched_at_ist_nanos_now();
++    persist_option_findings_into(
++        &mut writer,
++        report,
++        attempt_at_ist_nanos,
++        deadline,
++        tokio::time::Instant::now,
++    ) == OptionPersist::Flushed
+ }
+ 
+ /// What the option persist did (§12.15.8).
+@@ -1992,6 +2017,7 @@ enum OptionPersist {
+ fn persist_option_findings_into(
+     writer: &mut DhanLiveXverifyAuditWriter,
+     report: &RunReport,
++    attempt_at_ist_nanos: i64,
+     deadline: tokio::time::Instant,
+     mut now: impl FnMut() -> tokio::time::Instant,
+ ) -> OptionPersist {
+@@ -2019,7 +2045,7 @@ fn persist_option_findings_into(
+             stopped = true;
+             break;
+         }
+-        if writer.append_cell(finding).is_err() {
++        if writer.append_cell(finding, attempt_at_ist_nanos).is_err() {
+             row_errors = row_errors.saturating_add(1);
+         }
+         appended += 1;
+@@ -2103,6 +2129,64 @@ fn persist_option_findings_into(
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++
++    /// The attempt stamp the persist tests write (§12.15.9 review).
++    const TEST_ATTEMPT_AT: i64 = 9;
++
++    fn test_rows() -> PersistRows {
++        PersistRows {
++            day_start_ist_nanos: 0,
++            tolerance_paise: 5,
++            attempt: AttemptStamp {
++                at_ist_nanos: TEST_ATTEMPT_AT,
++                run_complete: true,
++            },
++        }
++    }
++
++    /// §12.15.9 review: every attempt writes its daily row at the same
++    /// deterministic `ts` and `outcome` is in the DEDUP key, so an incomplete
++    /// attempt (say `diverged`, a sealed bar still unapplied) and its complete
++    /// retry (`partial`) leave two rows. Each attempt reads the clock ONCE,
++    /// before its persist, and stamps that reading on its daily row and on
++    /// every cell; `run_complete` on the row is the same `run_is_complete`
++    /// value the marker decision uses. The option pass stamps its cells too.
++    #[test]
++    fn test_every_persisted_row_carries_one_attempt_stamp_and_the_run_complete_flag() {
++        let prod = prod_src();
++        let run_once = fn_body(prod, "async fn run_once(");
++        assert_eq!(
++            run_once.matches("fetched_at_ist_nanos_now()").count(),
++            1,
++            "one clock reading per attempt"
++        );
++        assert_eq!(
++            run_once.matches("run_is_complete(").count(),
++            1,
++            "the stamped flag and the marker decision must be one value"
++        );
++        let stamp = run_once
++            .find("run_complete: complete")
++            .expect("stamped flag");
++        let persist = run_once.find("persist_report(").expect("persist call");
++        let verdict = run_once.find("classify_attempt(").expect("marker decision");
++        assert!(
++            stamp < persist && persist < verdict,
++            "stamp, persist, then decide"
++        );
++        assert!(run_once[verdict..].contains("persist, complete)"));
++
++        let into = fn_body(prod, "fn persist_report_into(");
++        assert!(into.contains("append_cell(finding, rows.attempt.at_ist_nanos)"));
++        assert!(
++            into.contains("rows.attempt,"),
++            "the daily row takes the same stamp"
++        );
++        let options = fn_body(prod, "fn persist_option_findings(");
++        assert_eq!(options.matches("fetched_at_ist_nanos_now()").count(), 1);
++        let options_into = fn_body(prod, "fn persist_option_findings_into(");
++        assert!(options_into.contains("append_cell(finding, attempt_at_ist_nanos)"));
++    }
+     use tickvault_storage::dhan_live_crossverify_persistence::DhanLiveXverifyOutcome;
+ 
+     fn instrument(security_id: u64, segment: ExchangeSegment) -> SubscribeInstrument {
+@@ -2125,6 +2209,10 @@ mod tests {
              missing_rest: 0,
              tail_unsealed: 0,
              out_of_session: 0,
@@ -1642,8 +1937,106 @@ index 98927df0d..34441f194 100644
              noise_p50_paise: 0,
              noise_p95_paise: 0,
              noise_max_paise: 0,
+@@ -2583,7 +2671,7 @@ mod tests {
+         let mut writer = DhanLiveXverifyAuditWriter::for_test();
+         let t0 = tokio::time::Instant::now();
+         let far = t0 + Duration::from_secs(86_400);
+-        let out = persist_report_into(&mut writer, &report, 0, 5, 2, far, || t0);
++        let out = persist_report_into(&mut writer, &report, test_rows(), 2, far, || t0);
+         assert!(!out.deadline_reached);
+         assert_eq!(out.rows_not_written_at_deadline, 0);
+         assert!(out.daily_appended);
+@@ -2620,7 +2708,7 @@ mod tests {
+         let report = report_with(5, 3);
+         let mut writer = DhanLiveXverifyAuditWriter::for_test();
+         let t0 = tokio::time::Instant::now();
+-        let out = persist_report_into(&mut writer, &report, 0, 5, 2, t0, || t0);
++        let out = persist_report_into(&mut writer, &report, test_rows(), 2, t0, || t0);
+         assert!(out.deadline_reached);
+         assert!(!out.final_flush_ok);
+         assert!(!out.daily_appended);
+@@ -2652,7 +2740,7 @@ mod tests {
+             at
+         };
+         let deadline = t0 + Duration::from_secs(7);
+-        let out = persist_report_into(&mut writer, &report, 0, 5, 2, deadline, clock);
++        let out = persist_report_into(&mut writer, &report, test_rows(), 2, deadline, clock);
+         assert_eq!(reads.get(), 3, "one reading per row until the stop");
+         assert!(out.deadline_reached);
+         // Rows 0 and 1 went in a failed batch flush (no sender), row 2 was
+@@ -2679,7 +2767,7 @@ mod tests {
+         let mut probe = DhanLiveXverifyAuditWriter::for_test();
+         let mut stop_row = None;
+         for (i, f) in report.comparison.findings.iter().enumerate() {
+-            assert!(probe.append_cell(f).is_ok());
++            assert!(probe.append_cell(f, 0).is_ok());
+             if probe.flush_worst_case() > room {
+                 stop_row = Some(i + 1);
+                 break;
+@@ -2689,7 +2777,7 @@ mod tests {
+         assert!(stop_row > 1 && stop_row < 4_000, "{stop_row}");
+         let mut writer = DhanLiveXverifyAuditWriter::for_test();
+         let t0 = tokio::time::Instant::now();
+-        let out = persist_report_into(&mut writer, &report, 0, 5, 10_000, t0 + room, || t0);
++        let out = persist_report_into(&mut writer, &report, test_rows(), 10_000, t0 + room, || t0);
+         assert!(out.deadline_reached, "{out:?}");
+         assert_eq!(out.rows_abandoned_at_deadline, stop_row, "{out:?}");
+         assert_eq!(out.rows_not_written_at_deadline, 4_001 - stop_row);
+@@ -2698,7 +2786,7 @@ mod tests {
+         // The same for the option persist.
+         let mut writer = DhanLiveXverifyAuditWriter::for_test();
+         assert_eq!(
+-            persist_option_findings_into(&mut writer, &report, t0 + room, || t0),
++            persist_option_findings_into(&mut writer, &report, TEST_ATTEMPT_AT, t0 + room, || t0),
+             OptionPersist::StoppedAtDeadline
+         );
+         assert_eq!(writer.pending(), 0);
+@@ -2757,7 +2845,7 @@ mod tests {
+                 t0 + Duration::from_millis(at_ms)
+             };
+             let deadline = t0 + Duration::from_millis(deadline_ms);
+-            let out = persist_report_into(&mut writer, &report, 0, 5, batch, deadline, clock);
++            let out = persist_report_into(&mut writer, &report, test_rows(), batch, deadline, clock);
+             proptest::prop_assert_eq!(
+                 out.rows_flushed
+                     + out.rows_discarded
+@@ -2796,21 +2884,21 @@ mod tests {
+         let mut w = DhanLiveXverifyAuditWriter::for_test();
+         let empty = report_with(0, 0);
+         assert_eq!(
+-            persist_option_findings_into(&mut w, &empty, far, || t0),
++            persist_option_findings_into(&mut w, &empty, TEST_ATTEMPT_AT, far, || t0),
+             OptionPersist::Flushed
+         );
+         assert_eq!(
+-            persist_option_findings_into(&mut w, &empty, t0, || t0),
++            persist_option_findings_into(&mut w, &empty, TEST_ATTEMPT_AT, t0, || t0),
+             OptionPersist::Flushed
+         );
+         let rows = report_with(4, 2);
+         assert_eq!(
+-            persist_option_findings_into(&mut w, &rows, t0, || t0),
++            persist_option_findings_into(&mut w, &rows, TEST_ATTEMPT_AT, t0, || t0),
+             OptionPersist::StoppedAtDeadline
+         );
+         assert_eq!(w.pending(), 0);
+         assert_eq!(
+-            persist_option_findings_into(&mut w, &rows, far, || t0),
++            persist_option_findings_into(&mut w, &rows, TEST_ATTEMPT_AT, far, || t0),
+             OptionPersist::Failed
+         );
+         assert_eq!(w.pending(), 0);
+@@ -4010,7 +4098,7 @@ mod tests {
+         // run_once is reached only through the driver.
+         assert_eq!(prod.matches("run_once(deps,").count(), 1);
+         let run_once = fn_body(prod, "async fn run_once(");
+-        assert!(run_once.contains("cfg.tolerance_paise,\n                deadline,"));
++        assert!(run_once.contains("persist_report(&deps.questdb, &report, rows, deadline)"));
+         assert!(!run_day.contains("now_ist_secs_of_day()"));
+     }
+ 
 diff --git a/crates/storage/src/dhan_live_crossverify_persistence.rs b/crates/storage/src/dhan_live_crossverify_persistence.rs
-index 14029a52c..dc7dec9ee 100644
+index 14029a52c..ad916b1cb 100644
 --- a/crates/storage/src/dhan_live_crossverify_persistence.rs
 +++ b/crates/storage/src/dhan_live_crossverify_persistence.rs
 @@ -64,7 +64,8 @@
@@ -1760,7 +2153,7 @@ index 14029a52c..dc7dec9ee 100644
  /// One live-vs-REST cell finding, ready for ILP write.
  ///
  /// Both sides' raw rupee values are retained verbatim (never rounded on the
-@@ -349,6 +417,16 @@ pub struct DhanLiveXverifyDailyRow {
+@@ -349,6 +417,28 @@ pub struct DhanLiveXverifyDailyRow {
      /// re-baselining history.
      pub tolerance_paise: i64,
      pub outcome: DhanLiveXverifyOutcome,
@@ -1774,10 +2167,32 @@ index 14029a52c..dc7dec9ee 100644
 +    pub missing_live_unjudged: i64,
 +    /// Whether missing minutes were judged on this run, and if not, why.
 +    pub missing_judgeable: DhanLiveXverifyMissingJudgeable,
++    /// When the attempt that wrote this row persisted it (IST nanoseconds,
++    /// one reading per attempt). Every attempt of a day writes its daily row at
++    /// the same deterministic `ts`, and `outcome` is in the DEDUP key, so two
++    /// attempts that read differently leave two rows: the row with the newest
++    /// `attempt_at` is the day's latest verdict (§12.15.9 review). Not in the
++    /// DEDUP key.
++    pub attempt_at_ist_nanos: i64,
++    /// `true` when that attempt fetched every target and neither the run budget
++    /// nor the live read cap cut it short (`run_is_complete`). An attempt that
++    /// is not complete is retried, so its row is never the last word unless no
++    /// later attempt ran.
++    pub run_complete: bool,
  }
  
  /// One minute of the vendor's own tape, exactly as fetched.
-@@ -423,7 +501,10 @@ pub fn dhan_live_xverify_daily_create_ddl() -> String {
+@@ -396,7 +486,8 @@ pub fn dhan_live_xverify_cell_audit_create_ddl() -> String {
+             rest_value       DOUBLE, \
+             live_volume      LONG, \
+             rest_volume      LONG, \
+-            diff_paise       LONG\
++            diff_paise       LONG, \
++            attempt_at       TIMESTAMP\
+         ) timestamp(ts) PARTITION BY DAY \
+         DEDUP UPSERT KEYS({DEDUP_KEY_DHAN_LIVE_XVERIFY_CELL_AUDIT});"
+     )
+@@ -423,7 +514,12 @@ pub fn dhan_live_xverify_daily_create_ddl() -> String {
              noise_p95_paise  LONG, \
              noise_max_paise  LONG, \
              tolerance_paise  LONG, \
@@ -1785,21 +2200,62 @@ index 14029a52c..dc7dec9ee 100644
 +            outcome          SYMBOL, \
 +            late_excused     LONG, \
 +            missing_live_unjudged LONG, \
-+            missing_judgeable SYMBOL\
++            missing_judgeable SYMBOL, \
++            attempt_at       TIMESTAMP, \
++            run_complete     BOOLEAN\
          ) timestamp(ts) PARTITION BY DAY \
          DEDUP UPSERT KEYS({DEDUP_KEY_DHAN_LIVE_XVERIFY_DAILY});"
      )
-@@ -508,6 +589,9 @@ const DAILY_COLUMNS: &[(&str, &str)] = &[
+@@ -488,6 +584,7 @@ const CELL_AUDIT_COLUMNS: &[(&str, &str)] = &[
+     ("live_volume", "LONG"),
+     ("rest_volume", "LONG"),
+     ("diff_paise", "LONG"),
++    ("attempt_at", "TIMESTAMP"),
+ ];
+ 
+ /// Every daily-row column, for the idempotent `ALTER ADD COLUMN` self-heal.
+@@ -508,6 +605,11 @@ const DAILY_COLUMNS: &[(&str, &str)] = &[
      ("noise_max_paise", "LONG"),
      ("tolerance_paise", "LONG"),
      ("outcome", "SYMBOL"),
 +    ("late_excused", "LONG"),
 +    ("missing_live_unjudged", "LONG"),
 +    ("missing_judgeable", "SYMBOL"),
++    ("attempt_at", "TIMESTAMP"),
++    ("run_complete", "BOOLEAN"),
  ];
  
  /// The full ordered DDL statement list (CREATE → per-column `ALTER ADD COLUMN
-@@ -837,6 +921,8 @@ impl DhanLiveXverifyAuditWriter {
+@@ -739,9 +841,18 @@ impl DhanLiveXverifyAuditWriter {
+     /// Appends one cell finding row. Symbols BEFORE columns (the ILP
+     /// tags-before-fields rule).
+     ///
++    /// `attempt_at_ist_nanos` is one reading per attempt (§12.15.9 review): a
++    /// finding an earlier attempt wrote and a later one did not keeps the
++    /// earlier stamp, so the day's latest findings are the rows whose
++    /// `attempt_at` equals the latest daily row's.
++    ///
+     /// # Errors
+     /// Propagates ILP buffer errors (table/column append failure).
+-    pub fn append_cell(&mut self, f: &DhanLiveXverifyCellFinding) -> Result<()> {
++    pub fn append_cell(
++        &mut self,
++        f: &DhanLiveXverifyCellFinding,
++        attempt_at_ist_nanos: i64,
++    ) -> Result<()> {
+         self.buffer
+             .table(DHAN_LIVE_XVERIFY_CELL_AUDIT_TABLE)
+             .context("table")?
+@@ -772,6 +883,8 @@ impl DhanLiveXverifyAuditWriter {
+             .context("rest_volume")?
+             .column_i64("diff_paise", f.diff_paise)
+             .context("diff_paise")?
++            .column_ts("attempt_at", TimestampNanos::new(attempt_at_ist_nanos))
++            .context("attempt_at")?
+             .at(TimestampNanos::new(f.run_ts_ist_nanos))
+             .context("designated timestamp")?;
+         self.pending = self.pending.saturating_add(1);
+@@ -837,6 +950,8 @@ impl DhanLiveXverifyAuditWriter {
              .context("feed")?
              .symbol("outcome", r.outcome.as_str())
              .context("outcome")?
@@ -1808,7 +2264,7 @@ index 14029a52c..dc7dec9ee 100644
              .column_ts(
                  "trading_date_ist",
                  TimestampNanos::new(r.trading_date_ist_nanos),
-@@ -868,6 +954,10 @@ impl DhanLiveXverifyAuditWriter {
+@@ -868,6 +983,14 @@ impl DhanLiveXverifyAuditWriter {
              .context("noise_max_paise")?
              .column_i64("tolerance_paise", r.tolerance_paise)
              .context("tolerance_paise")?
@@ -1816,20 +2272,26 @@ index 14029a52c..dc7dec9ee 100644
 +            .context("late_excused")?
 +            .column_i64("missing_live_unjudged", r.missing_live_unjudged)
 +            .context("missing_live_unjudged")?
++            .column_ts("attempt_at", TimestampNanos::new(r.attempt_at_ist_nanos))
++            .context("attempt_at")?
++            .column_bool("run_complete", r.run_complete)
++            .context("run_complete")?
              .at(TimestampNanos::new(r.run_ts_ist_nanos))
              .context("designated timestamp")?;
          self.pending = self.pending.saturating_add(1);
-@@ -1072,6 +1162,9 @@ mod tests {
+@@ -1072,6 +1195,11 @@ mod tests {
              noise_max_paise: 60,
              tolerance_paise: 0,
              outcome: DhanLiveXverifyOutcome::Diverged,
 +            late_excused: 4,
 +            missing_live_unjudged: 0,
 +            missing_judgeable: DhanLiveXverifyMissingJudgeable::Judged,
++            attempt_at_ist_nanos: 3,
++            run_complete: false,
          }
      }
  
-@@ -1241,6 +1334,9 @@ mod tests {
+@@ -1241,6 +1369,9 @@ mod tests {
              "noise_max_paise",
              "tolerance_paise",
              "outcome",
@@ -1839,7 +2301,16 @@ index 14029a52c..dc7dec9ee 100644
          ] {
              assert!(ddl.contains(tok), "daily DDL missing `{tok}`: {ddl}");
          }
-@@ -1378,6 +1474,78 @@ mod tests {
+@@ -1361,7 +1492,7 @@ mod tests {
+     #[test]
+     fn append_cell_emits_symbols_before_columns_and_counts_pending() {
+         let mut w = DhanLiveXverifyAuditWriter::for_test();
+-        w.append_cell(&sample_cell()).expect("append");
++        w.append_cell(&sample_cell(), 7).expect("append");
+         assert_eq!(w.pending(), 1);
+         let line = w.buffer_utf8();
+         assert!(line.contains(DHAN_LIVE_XVERIFY_CELL_AUDIT_TABLE));
+@@ -1378,6 +1509,160 @@ mod tests {
          assert!(!tags.contains("live_value"), "columns must follow symbols");
      }
  
@@ -1915,10 +2386,139 @@ index 14029a52c..dc7dec9ee 100644
 +        assert!(!DhanLiveXverifyMissingJudgeable::LiveTruncated.is_judged());
 +    }
 +
++    /// 2026-10-06 (§12.15.9 review). Every attempt of a day writes its daily
++    /// row at the same deterministic `ts` and `outcome` is in the DEDUP key,
++    /// so a retry that reads differently leaves a second row. `attempt_at`
++    /// (one reading per attempt, on the daily row AND every cell) and
++    /// `run_complete` (daily) let a reader pick the latest attempt and its
++    /// own findings. Both reach an old table through the ALTER self-heal with
++    /// the CREATE's type, ride the ILP line as fields with the matching wire
++    /// type, and stay OUT of every DEDUP key: in the key they would turn each
++    /// retry's rows into new rows instead of upserting the same finding.
++    #[test]
++    fn attempt_at_and_run_complete_self_heal_reach_the_wire_and_stay_out_of_dedup() {
++        let statements = dhan_live_xverify_ddl_statements();
++        let daily = dhan_live_xverify_daily_create_ddl();
++        let cell = dhan_live_xverify_cell_audit_create_ddl();
++        for (table, ddl, columns, col, ty) in [
++            (
++                DHAN_LIVE_XVERIFY_DAILY_TABLE,
++                &daily,
++                DAILY_COLUMNS,
++                "attempt_at",
++                "TIMESTAMP",
++            ),
++            (
++                DHAN_LIVE_XVERIFY_DAILY_TABLE,
++                &daily,
++                DAILY_COLUMNS,
++                "run_complete",
++                "BOOLEAN",
++            ),
++            (
++                DHAN_LIVE_XVERIFY_CELL_AUDIT_TABLE,
++                &cell,
++                CELL_AUDIT_COLUMNS,
++                "attempt_at",
++                "TIMESTAMP",
++            ),
++        ] {
++            let alter = format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {ty};");
++            assert!(statements.contains(&alter), "missing self-heal: {alter}");
++            assert!(columns.contains(&(col, ty)), "{table}.{col} must be {ty}");
++            assert!(
++                ddl.split_whitespace()
++                    .collect::<Vec<_>>()
++                    .windows(2)
++                    .any(|w| w[0] == col && w[1].trim_end_matches([',', ')']) == ty),
++                "{table} CREATE must declare {col} {ty}: {ddl}"
++            );
++        }
++        for key in [
++            DEDUP_KEY_DHAN_LIVE_XVERIFY_DAILY,
++            DEDUP_KEY_DHAN_LIVE_XVERIFY_CELL_AUDIT,
++        ] {
++            assert!(!key.contains("attempt_at"), "{key}");
++            assert!(!key.contains("run_complete"), "{key}");
++        }
++
++        // The wire: a TIMESTAMP field is `<micros>t`, a BOOLEAN is `t`/`f`,
++        // and both are fields, never tags.
++        let mut row = sample_daily();
++        row.attempt_at_ist_nanos = 1_759_751_460_123_456_000;
++        row.run_complete = true;
++        let mut w = DhanLiveXverifyAuditWriter::for_test();
++        w.append_daily(&row).expect("append");
++        let line = w.buffer_utf8();
++        let (tags, fields) = line.split_at(line.find(' ').expect("tags then fields"));
++        assert!(!tags.contains("attempt_at") && !tags.contains("run_complete"));
++        assert!(fields.contains("attempt_at=1759751460123456t"), "{line}");
++        assert!(fields.contains("run_complete=t"), "{line}");
++        row.run_complete = false;
++        let mut w = DhanLiveXverifyAuditWriter::for_test();
++        w.append_daily(&row).expect("append");
++        assert!(w.buffer_utf8().contains("run_complete=f"));
++
++        let mut w = DhanLiveXverifyAuditWriter::for_test();
++        w.append_cell(&sample_cell(), 1_759_751_460_123_456_000)
++            .expect("append");
++        let line = w.buffer_utf8();
++        let (tags, fields) = line.split_at(line.find(' ').expect("tags then fields"));
++        assert!(!tags.contains("attempt_at"));
++        assert!(fields.contains("attempt_at=1759751460123456t"), "{line}");
++    }
++
      #[test]
      fn append_daily_writes_the_outcome_symbol_and_noise_stats() {
          let mut w = DhanLiveXverifyAuditWriter::for_test();
-@@ -1642,12 +1810,18 @@ mod tests {
+@@ -1416,7 +1701,7 @@ mod tests {
+         let mut w = DhanLiveXverifyAuditWriter::for_test();
+         // Well under the threshold: nothing should be offered for flush.
+         for _ in 0..50 {
+-            w.append_cell(&sample_cell()).expect("append");
++            w.append_cell(&sample_cell(), 7).expect("append");
+         }
+         assert!(
+             w.buffer_len() < DhanLiveXverifyAuditWriter::FLUSH_THRESHOLD_BYTES,
+@@ -1433,7 +1718,7 @@ mod tests {
+         // as the production caller is, so this cannot silently spin if the row
+         // width changes.
+         while w.buffer_len() < DhanLiveXverifyAuditWriter::FLUSH_THRESHOLD_BYTES {
+-            w.append_cell(&sample_cell()).expect("append");
++            w.append_cell(&sample_cell(), 7).expect("append");
+         }
+         let rows_at_threshold = w.pending();
+         assert!(
+@@ -1480,7 +1765,7 @@ mod tests {
+     #[test]
+     fn flush_without_sender_errors_and_discards_the_poisoned_buffer() {
+         let mut w = DhanLiveXverifyAuditWriter::for_test();
+-        w.append_cell(&sample_cell()).expect("append");
++        w.append_cell(&sample_cell(), 7).expect("append");
+         w.append_daily(&sample_daily()).expect("append");
+         assert_eq!(w.pending(), 2);
+         let err = w.flush().expect_err("disconnected writer must fail loudly");
+@@ -1495,8 +1780,8 @@ mod tests {
+     #[test]
+     fn discard_pending_returns_the_dropped_count_and_clears() {
+         let mut w = DhanLiveXverifyAuditWriter::for_test();
+-        w.append_cell(&sample_cell()).expect("append");
+-        w.append_cell(&sample_cell()).expect("append");
++        w.append_cell(&sample_cell(), 7).expect("append");
++        w.append_cell(&sample_cell(), 7).expect("append");
+         assert_eq!(w.discard_pending(), 2);
+         assert_eq!(w.pending(), 0);
+         assert_eq!(w.discard_pending(), 0, "discarding twice is a no-op");
+@@ -1507,7 +1792,7 @@ mod tests {
+     #[test]
+     fn abandon_pending_returns_the_dropped_count_clears_and_never_counts_as_discarded() {
+         let mut w = DhanLiveXverifyAuditWriter::for_test();
+-        w.append_cell(&sample_cell()).expect("append");
++        w.append_cell(&sample_cell(), 7).expect("append");
+         w.append_daily(&sample_daily()).expect("append");
+         assert_eq!(w.abandon_pending(), 2);
+         assert_eq!(w.pending(), 0);
+@@ -1642,12 +1927,18 @@ mod tests {
              !DhanLiveXverifyCellKind::OutOfSession.is_real_divergence(),
              "a row outside [09:15, 15:30) is recorded, never classified"
          );
@@ -1939,10 +2539,10 @@ index 14029a52c..dc7dec9ee 100644
          ];
          assert_eq!(kinds.iter().filter(|k| k.is_real_divergence()).count(), 3);
 diff --git a/docs/claude-rules-full/project/no-rest-except-live-feed-2026-06-27.md b/docs/claude-rules-full/project/no-rest-except-live-feed-2026-06-27.md
-index abc714e59..31b4fd54a 100644
+index abc714e59..3c99b1138 100644
 --- a/docs/claude-rules-full/project/no-rest-except-live-feed-2026-06-27.md
 +++ b/docs/claude-rules-full/project/no-rest-except-live-feed-2026-06-27.md
-@@ -2364,3 +2364,106 @@ filters, or the hold ceiling.
+@@ -2364,3 +2364,125 @@ filters, or the hold ceiling.
    attempt changes the page timing this section fixes.
  
  **What a PR that violates §12.15.8 looks like (REJECT):** an attempt that starts before the 17:25 scheduled-stop window and can end after 17:23 (beyond the whole second the wall clock is read in, Honest limits); an attempt with no `tokio::time::timeout`; an audit persist that starts a flush whose worst case (`flush_worst_case`, of the buffer that flush sends) ends after the attempt's deadline, or writes the marker past it; a persist deadline that is not the timeout's own instant; a day whose only attempt was skipped for time that neither pages nor finds today's paged marker (a silent unverified day); paging a final failure while today's paged marker exists; reporting a skipped day only after the evening wait; ending the day on a skip without the 17:50 evening attempt, or waiting for it more than once; starting the evening attempt, or an unshrunk after-window attempt, before `XVERIFY_EVENING_START_SECS_OF_DAY_IST`, or moving the start-watchdog `stop_check` or `curfew_check` cron without the pinned constants moving with it; counting a deliberate deadline stop of the audit persist on `tv_dhan_feed_xverify_persist_errors_total`, `tv_dhan_live_xverify_audit_rows_discarded_total` or any other counter a §2.10 loss-group filter reads; lengthening `attempt_max_secs` (token wait, persist margin, or the default budget) without re-checking the four-attempt fit to 17:23; deciding the last attempt from the attempt's end time, or revising it after the attempt; a bound written as a literal instead of derived from `shutdown_class`; writing the marker from a run cut short by a shrunk budget or a timeout; a new alarm, filter or page source for these lines without its own dated row in the noise lock.
@@ -2000,16 +2600,29 @@ index abc714e59..31b4fd54a 100644
 +| Not judged | a traded or index minute missing from our side is counted in `missing_live_unjudged` with cell kind `missing_live_unjudged`, is not real, and holds the day at `partial` at best. A not-judged minute is never also counted as excused |
 +| A zero-volume minute | a non-index minute Dhan printed with volume 0 is never real, in or out of the window: it stays `missing_live` (`missing_live_zero_volume`), as since §46b |
 +| Production today | the spot check and the §12.15.6 option pass both judge with `Excuse { sealed_through: None }` and `rest_incomplete`/`missing` from the run. Plan item 51d replaces `None` with the published seal progress and uses `Strict` when the live side is known final |
-+| Persistence | the daily table gains `late_excused LONG`, `missing_live_unjudged LONG`, `missing_judgeable SYMBOL` (`judged` / `live_truncated`) through `ALTER ADD COLUMN IF NOT EXISTS`; the cell audit gains kinds `late_excused` and `missing_live_unjudged`. DEDUP keys unchanged. The `tail_unsealed` column and cell kind are KEPT for history and written 0 from this change |
++| Persistence | the daily table gains `late_excused LONG`, `missing_live_unjudged LONG`, `missing_judgeable SYMBOL` (`judged` / `live_truncated`) through `ALTER ADD COLUMN IF NOT EXISTS`; the cell audit gains kinds `late_excused` and `missing_live_unjudged`. DEDUP keys unchanged. The `tail_unsealed` column and cell kind are KEPT for history and written 0 from this change. *(Review, same day:)* the daily table also gains `attempt_at TIMESTAMP` and `run_complete BOOLEAN`, and the cell audit `attempt_at TIMESTAMP`, through the same self-heal; `attempt_at` is ONE wall-clock reading per attempt (IST), written on that attempt's daily row and on every cell it writes (the §12.15.6 option pass stamps its own cells the same way); `run_complete` is the attempt's `run_is_complete`, the value the marker decision uses. Neither is in a DEDUP key |
 +| Page, alarms, marker, S3 | unchanged. `xverify_diverged` stays price-only (`is_catastrophic_divergence` untouched). `partial` and `diverged` are both measured, so the marker and the §12.15.2 hold behave exactly as before. No new alarm, filter, page source or EMF name |
 +
 +**Behaviour changes, recorded (Verified by reading the code; the size of each is Unknown until the daily table is queried).**
 +- Some days move from `partial` to `diverged`: a real finding no longer hides
 +  behind a failed fetch. Nothing reads `outcome` except the daily table, and
 +  the S3 gate reads `is_measured`, which covers both.
-+- The daily DEDUP key includes `outcome`, so a re-run of an old day that now
-+  reads differently adds a second row under the same deterministic `ts`
-+  instead of replacing the first.
++- The daily DEDUP key includes `outcome`, and every attempt of a day writes
++  its daily row at the same deterministic `ts`, so two attempts that read
++  differently leave two rows for the day instead of one. *(Corrected in
++  review the same day: this said only "a re-run of an old day". The common
++  case is the SAME-DAY retry: an attempt with a failed fetch or a spent budget
++  persists its rows and is retried, and the retry can read differently. Such
++  pairs existed before this change (`partial` then `clean`, `degraded` then
++  `clean`); this change adds `diverged` then `partial`, for a sealed bar not
++  yet readable at the first read that the retry reads.)* Cells behave the
++  same way: a finding an earlier attempt wrote and the retry did not (the bar
++  became readable) stays in the cell audit. The day's verdict is the daily
++  row with the newest `attempt_at`, and that attempt's findings are the cells
++  with the same `attempt_at`; `run_complete` says whether that attempt fetched
++  everything. The marker and the S3 hold are unchanged: they follow the
++  attempt that wrote the marker, which is always the last one that ran that
++  day.
 +- Some days move from `clean` to `partial`: a day whose only gap was a traded
 +  or index minute at 15:38 or 15:39 read `clean`; it now reads `partial` with
 +  `late_excused > 0`.
@@ -2037,6 +2650,12 @@ index abc714e59..31b4fd54a 100644
 +  `malformed_rows`, the WAL apply lag and the spill directory for that day
 +  (pinned by
 +  `a_live_bar_unreadable_at_the_read_is_judged_missing_and_diverged_until_51d`).
++- Rows written before this change have no `attempt_at` (it reads null), so for
++  those days the attempts cannot be ordered and every row of the day must be
++  read. `attempt_at` is the wall clock: a backward clock step of more than the
++  gap between two attempts (at least a few minutes) would order them wrongly.
++  A day re-run by a later process stamps the time of that re-run, which is
++  newer than every earlier attempt, as intended.
 +- A truncated live read judges no missing minute for the whole day, including
 +  minutes early in the day that the read did return.
 +- The excused window is the derived constant, not the actual seal progress of
@@ -2048,12 +2667,12 @@ index abc714e59..31b4fd54a 100644
 +  reads `diverged` for a minute that was only unsealed, not lost. Until 51d
 +  replaces the window with the published seal progress.
 +
-+**What a PR that violates §12.15.9 looks like (REJECT):** a literal count of excused end-of-session minutes, or a late window not derived from the catch-up margin; letting `rest_incomplete` (a failed fetch or the budget) hide a judged missing minute or a price divergence; an excused or unjudged minute that leaves the day `clean`; any input that turns a `diverged` day into anything else; excusing a minute under `Strict`; changing `is_catastrophic_divergence` or any page under cover of this section; dropping the `tail_unsealed` column or kind; a new alarm, filter or page source for these findings without its own dated row in the noise lock.
++**What a PR that violates §12.15.9 looks like (REJECT):** a literal count of excused end-of-session minutes, or a late window not derived from the catch-up margin; letting `rest_incomplete` (a failed fetch or the budget) hide a judged missing minute or a price divergence; an excused or unjudged minute that leaves the day `clean`; any input that turns a `diverged` day into anything else; excusing a minute under `Strict`; changing `is_catastrophic_divergence` or any page under cover of this section; dropping the `tail_unsealed` column or kind; dropping `attempt_at` or `run_complete`, reading `attempt_at` more than once per attempt, or putting either in a DEDUP key; a new alarm, filter or page source for these findings without its own dated row in the noise lock.
 diff --git a/docs/error-runbooks/dhan-live-crossverify-error-codes.md b/docs/error-runbooks/dhan-live-crossverify-error-codes.md
-index 07c280bf8..793cda1f7 100644
+index 07c280bf8..e2589e499 100644
 --- a/docs/error-runbooks/dhan-live-crossverify-error-codes.md
 +++ b/docs/error-runbooks/dhan-live-crossverify-error-codes.md
-@@ -127,3 +127,33 @@ after the limit. That the database client gives up at its request timeout
+@@ -127,3 +127,55 @@ after the limit. That the database client gives up at its request timeout
  plus the bytes at its minimum throughput is read from its source; that the
  HTTP timeout covers the whole request is assumed. The marker write is one
  small file and is not bounded on a stalled disk.
@@ -2072,12 +2691,34 @@ index 07c280bf8..793cda1f7 100644
 +| `missing_judgeable` (SYMBOL: `judged` / `live_truncated`) | `dhan_live_crossverify_daily`, `finished` line | whether missing minutes were judged on this run | `live_truncated`: as the row above |
 +| `missing_live_late` | `finished` line only | traded or index minutes missing in the late window, whatever the policy; a measurement for plan item 51d | none |
 +| `tail_unsealed` column and kind | both tables | the old literal two-minute tail; written 0 from 2026-10-06 and kept for older rows | none |
++| `attempt_at` (TIMESTAMP), `run_complete` (BOOLEAN) | `dhan_live_crossverify_daily` (both), `dhan_live_crossverify_cell_audit` (`attempt_at`) | `attempt_at`: when the attempt that wrote the row persisted it, one reading per attempt; `run_complete`: that attempt fetched every target and was not cut short | pick the day's final row and its cells with them (below) |
 +
 +**Behaviour change:** a day with a price difference or a judged missing traded
 +or index minute now reads `diverged` even when a vendor fetch failed or the
-+budget ran out (it read `partial`). Query by day, not by `outcome`: the daily
-+DEDUP key includes `outcome`, so re-running an old day that now reads
-+differently adds a second row.
++budget ran out (it read `partial`).
++
++**A day can have more than one daily row, and the same day's retry is the
++usual cause.** Every attempt writes its daily row at the same `ts`, and the
++daily DEDUP key includes `outcome`. An attempt with a failed vendor fetch or a
++spent budget persists its rows and is retried; if the retry reads differently
++(for example `diverged` at 15:41 because one sealed bar was still waiting in
++QuestDB's WAL, then `partial` at 15:54 once it was readable) both rows stay.
++Cells the first attempt wrote and the retry did not (that missing minute) stay
++too. Query by day, never by `outcome`, and take the newest attempt:
++
++```sql
++SELECT * FROM dhan_live_crossverify_daily
++WHERE trading_date_ist = '<day>T00:00:00.000000Z'
++ORDER BY attempt_at DESC LIMIT 1;
++
++SELECT * FROM dhan_live_crossverify_cell_audit
++WHERE trading_date_ist = '<day>T00:00:00.000000Z'
++  AND attempt_at = '<attempt_at from the row above>';
++```
++
++`run_complete = false` on that newest row means the day's last attempt did not
++finish either, and no day marker was written for it. A row with a null
++`attempt_at` was written before 2026-10-06; for such a day, read every row. The two queries are Assumed: they were not run against a live QuestDB when written.
 +
 +**A `diverged` day is not always packet loss (until plan item 51d).** A
 +traded or index minute is also missing from our side when its sealed bar was
