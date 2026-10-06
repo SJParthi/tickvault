@@ -1622,7 +1622,7 @@ struct OverflowEpisode {
     suspect_mask: u32,
     /// Each suspect's own close instant (its heal deadline runs from here).
     suspect_since: [Option<Instant>; GHOST_REDIAL_SLOTS],
-    /// The first close of the current burst of no-code closes.
+    /// The first close of the current burst of sibling closes, coded or not.
     burst_start: Option<Instant>,
     /// The slots that closed in the current burst.
     burst_mask: u32,
@@ -1800,6 +1800,24 @@ impl OverflowEpisode {
         let Some(bit) = 1u32.checked_shl(u32::from(slot)) else {
             return self.fail(OverflowProbeOutcome::FailedBareReset, now);
         };
+        self.join_burst(bit, now);
+        let evictors = recent_dials & !bit & !self.burst_mask;
+        if evictors != 0 {
+            let mut effect = self.fail(OverflowProbeOutcome::FailedEvictionCorroborated, now);
+            effect.sibling = Some(slot);
+            return effect;
+        }
+        self.note_sibling(slot, bit, now)
+    }
+
+    /// Adds sibling `bit` to the current burst of closes, or starts a new
+    /// burst when the last one began more than
+    /// [`OVERFLOW_PROBE_SIBLING_BURST_MS`] ago. Every close of a sibling, with
+    /// a code or without, joins: one Dhan-side incident can reach some sockets
+    /// as a disconnect packet and others as a bare reset, and a member's own
+    /// redial must never corroborate another member's close (review fix
+    /// 2026-10-06). O(1).
+    fn join_burst(&mut self, bit: u32, now: Instant) {
         let joins_burst = self.burst_start.is_some_and(|start| {
             now.saturating_duration_since(start)
                 <= Duration::from_millis(OVERFLOW_PROBE_SIBLING_BURST_MS)
@@ -1809,13 +1827,6 @@ impl OverflowEpisode {
             self.burst_mask = 0;
         }
         self.burst_mask |= bit;
-        let evictors = recent_dials & !bit & !self.burst_mask;
-        if evictors != 0 {
-            let mut effect = self.fail(OverflowProbeOutcome::FailedEvictionCorroborated, now);
-            effect.sibling = Some(slot);
-            return effect;
-        }
-        self.note_sibling(slot, bit, now)
     }
 
     /// Whether the note cutoff ([`OVERFLOW_PROBE_NOTE_CUTOFF_SECS`] after the
@@ -1861,6 +1872,8 @@ impl OverflowEpisode {
     ///   probe); a SECOND such close fails the window;
     /// - another socket is noted like an uncorroborated no-code close: the
     ///   window cannot pass until it has redialled;
+    ///   it also joins the current burst of closes, so its own immediate
+    ///   redial never corroborates a no-code close from the same incident;
     /// - a slot outside the register fails closed.
     ///
     /// O(1), no allocation.
@@ -1884,6 +1897,7 @@ impl OverflowEpisode {
         let Some(bit) = 1u32.checked_shl(u32::from(slot)) else {
             return self.fail(OverflowProbeOutcome::FailedBareReset, now);
         };
+        self.join_burst(bit, now);
         self.note_sibling(slot, bit, now)
     }
 
@@ -20210,6 +20224,59 @@ mod tests {
     }
 
     #[test]
+    fn test_coded_close_joins_the_burst_so_its_redial_never_corroborates() {
+        // Review fix 2026-10-06: one Dhan-side incident sends 800 to slot 1
+        // and a bare reset to slot 2. Slot 1's damped ladder redials at once
+        // (its BeginDial stamp is in `recent_dials`); slot 2's close must be
+        // noted, not read as an eviction.
+        let start = t0();
+        let (mut ep, granted) = probing(4, &[], start);
+        let t = granted + secs(30);
+        let coded = ep.on_coded_close(1, t);
+        assert_eq!(
+            coded.outcomes,
+            [Some(OverflowProbeOutcome::SiblingResetNoted), None]
+        );
+        assert_eq!(ep.burst_mask, 1 << 1);
+        let bare = ep.on_bare_reset(2, 1 << 1, t + ms(600));
+        assert_eq!(
+            bare.outcomes,
+            [Some(OverflowProbeOutcome::SiblingResetNoted), None]
+        );
+        assert_eq!(bare.repark, None);
+        assert_eq!(ep.suspect_mask, 0b110);
+        assert_eq!(ep.phase, OverflowEpisodePhase::Probing);
+        assert_eq!(ep.probes_started, 1);
+
+        // The other order: the bare reset starts the burst, the coded close
+        // joins it, and a third bare reset inside the burst is not blamed on
+        // the coded closer's redial.
+        let (mut ep, granted) = probing(4, &[], start);
+        let t = granted + secs(30);
+        let _ = ep.on_bare_reset(2, 0, t);
+        let _ = ep.on_coded_close(1, t + ms(300));
+        assert_eq!(ep.burst_mask, 0b110);
+        let third = ep.on_bare_reset(3, 1 << 1, t + ms(1_000));
+        assert_eq!(
+            third.outcomes[0],
+            Some(OverflowProbeOutcome::SiblingResetNoted)
+        );
+
+        // Outside the burst the coded closer's redial still corroborates: a
+        // bare reset more than the burst after it is a cascade.
+        let (mut late, granted) = probing(4, &[], start);
+        let t = granted + secs(30);
+        let _ = late.on_coded_close(1, t);
+        let fail = late.on_bare_reset(2, 1 << 1, t + ms(OVERFLOW_PROBE_SIBLING_BURST_MS + 1));
+        assert_eq!(
+            fail.outcomes[0],
+            Some(OverflowProbeOutcome::FailedEvictionCorroborated)
+        );
+        assert_eq!(fail.sibling, Some(2));
+        assert_eq!(fail.repark, Some(4));
+    }
+
+    #[test]
     fn test_every_note_has_plain_words_and_no_step_does() {
         for outcome in OverflowProbeOutcome::ALL {
             assert_eq!(
@@ -20472,6 +20539,9 @@ mod tests {
             "### 2026-10-06 — OVERFLOW PROBE ATTRIBUTION: a close with no code fails a probe only on the probed socket, or when another socket's drop is corroborated as an eviction"
         ));
         assert!(text.contains("the probed socket closing with no code still fails a probe"));
+        // Review fix: a coded close joins the burst too.
+        assert!(text.contains("same burst of closes within 2 s, with a code or without"));
+        assert!(text.contains("Leaves a sibling that closed with a code other than 805 out of"));
         assert!(text.contains("\"Go ahead with whatever you want dude\""));
         // The 2026-10-02 sections it amends are still there.
         assert!(text.contains("### 2026-10-02 — DEPTH SOCKETS RECOVER ON THEIR OWN AFTER 805"));
