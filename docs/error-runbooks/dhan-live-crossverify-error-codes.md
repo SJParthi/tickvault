@@ -68,3 +68,26 @@ It cannot catch Dhan being wrong, and it cannot see loss that happens upstream
 at the vendor's side — Dhan's published architecture skips a slow consumer
 forward to "the latest available state" with no sequence number, so ticks
 discarded there are invisible to every counter we own.
+
+---
+
+## §2. 2026-10-06 — the day marker: failure reasons and sources (plan ITEM 51a)
+
+Authority: `no-rest-except-live-feed-2026-06-27.md` §12.15.7 and the noise
+lock §2.5 note of the same date. Every line below is emitted with
+`code = "WS-GAP-03"` (`ErrorCode::WsGapConnectionState`) from
+`crates/app/src/dhan_live_crossverify_boot.rs`, except `xverify_marker_keep_short`,
+which `crates/app/src/main.rs` emits once at boot. Only `xverify_failed` is
+alarmed; the other sources are log-sink-only.
+
+| Line | Level | Means | Operator action |
+|---|---|---|---|
+| `source = "xverify_failed"`, `reason = "marker_not_written"` | ERROR (pages, last attempt only) | the comparison finished and every audit row was accepted, but the day marker file could not be saved on any attempt; today's S3 archive stays held | free disk space, then check permissions on `data/state/daily`; a restart re-runs the check and writes the marker |
+| `source = "xverify_failed"`, `reason = "audit_rows_lost"` | ERROR (pages, last attempt only) | on every attempt some cell, tape or daily rows were discarded by a failed flush or refused at append, so the day was not recorded | check QuestDB health and disk first (`make doctor`); the `xverify_persist_partial` / `xverify_persist_failed` lines carry `rows_discarded`; a restart re-runs the check (DEDUP-idempotent) |
+| `source = "xverify_attempt_marker_write_failed"` | WARN (per attempt) | this attempt could not save the marker; the next attempt only writes the marker (no new vendor fetch) | free disk space, then check permissions on `data/state/daily`; the `path` field names the file |
+| `source = "xverify_marker_dir_sync_failed"` | WARN | the marker was saved and renamed into place, but the folder sync failed; the day IS recorded, a host crash could lose it | free disk space, then check permissions on `data/state/daily`; no re-run is needed |
+| `source = "xverify_marker_keep_short"` | WARN (once at boot) | a configured archive hot window plus the 3-day hold comes within 3 days of the 400-day marker keep, so a verified day could read as unverified | lower the hot window in `[partition_retention]` or raise `CROSSVERIFY_MARKER_KEEP_DAYS`; free disk space, then check permissions on `data/state/daily` if markers are missing |
+
+**Honest limit:** markers deleted by the old 7-day sweep before this change
+cannot be recovered; those days take the hold-ceiling override once their
+partitions age past the hot window.

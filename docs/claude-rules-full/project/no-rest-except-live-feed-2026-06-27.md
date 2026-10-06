@@ -2117,7 +2117,7 @@ Recorded before the code, per the rule-file-first law. It changes WHEN the §12.
 
 **⚠ Honest limit.** A boot catch-up that starts after about 17:14 IST gets no retry, because its next attempt could not finish before 17:30. That day falls back to the §12.15.2 hold ceiling, as before.
 
-**What a PR that violates §12.15.5 looks like (REJECT):** pages `xverify_failed` or `xverify_vacuous` on every attempt; starts an attempt that could still be running at 17:30; raises the attempt count or shortens the interval without re-checking the evening-stop fit; writes the marker on any condition other than `classify_attempt` returning `Ok`.
+**What a PR that violates §12.15.5 looks like (REJECT):** pages `xverify_failed` or `xverify_vacuous` on every attempt; starts an attempt that could still be running at 17:30; raises the attempt count or shortens the interval without re-checking the evening-stop fit; writes the marker on any condition other than `classify_attempt` returning `Ok` in the same attempt, or in the immediately previous same-process attempt when that attempt failed only with `MarkerNotWritten` *(amended 2026-10-06, §12.15.7: the marker-only retry)*.
 
 ### §12.15.6 — 2026-09-25: the depth-held OPTION contracts are checked too, in a separate pass
 
@@ -2181,3 +2181,53 @@ every publish instead of on growth; writes it while holding the set's lock or
 from the frame drain; reloads keys from an earlier IST day; counts a cut-short
 pass as `measured`; or adds an alarm or EMF name for the pass counter without
 its own dated row and a lever.
+
+### §12.15.7 — 2026-10-06: the day marker means what it says
+
+**The verbatim owner approvals (2026-10-06, typed directly in-session — preserve EXACTLY, typos included):**
+
+> "Go ahead with whatever you want dude"
+
+> "See do everything whatever is recommended dude okay?"
+
+Given in direct response to the recommended cross-verification hardening list
+(plan ITEM 51, `.claude/plans/active-plan-feed-hardening.md`). This section is
+sub-item **51a** and is recorded HERE before the code, per the rule-file-first
+law. It changes what "recorded" means for the §12.15.2 marker. It does not
+change what the check compares, when it runs, its attempt count, its spacing,
+its alarms, or the hold ceiling.
+
+**The gap (Verified by reading the code at `60bdfd97a`).**
+- The marker write returned nothing. A failed write logged one uncoded `warn!`,
+  and the attempt still logged "recorded" and returned success, so there was
+  no retry and no page while the S3 hold stayed on.
+- The write was an in-place `std::fs::write`, and the reader checked only that
+  a file existed, so a torn or zero-length marker read as a verified day.
+- A mid-run audit flush that failed discarded its rows, yet the run still
+  counted as persisted when the final flush and the daily row landed. The
+  marker then released the S3 hold with incomplete cell and tape tables.
+- Every marker write swept same-task markers older than 7 days, while the
+  archive gate reads markers for partitions up to the largest hot window
+  (90 days) plus the 3-day hold. A verified day then read as unverified and
+  logged a false "archived WITHOUT a cross-verification" line.
+
+| Aspect | Locked value |
+|---|---|
+| "Persisted" | every finding, tape row and daily row was ACKed by the database, with **zero** rows discarded and **zero** rows refused at append. One lost row makes the attempt fail with `reason = audit_rows_lost` |
+| Marker write | temp file `<task>-<date>.marker.tmp`, `fsync`, `rename` to the final name, then `fsync` of the folder (and of its parent if the folder was just created). A failure before the rename is an error; a failure of the folder sync after the rename is a coded `warn!` and counts as written |
+| Marker read | the file must contain the exact line `delivered_date_ist=<date>`, read through a 4 KiB cap. Empty, torn, wrong-date and unreadable files read as absent (fail-open: the check re-runs) |
+| Marker write failure | a failed attempt with `reason = marker_not_written`. The next attempt is **marker-only**: it writes the marker and nothing else (no token wait, no vendor fetch, no persist, no divergence page). Attempt count, 900 s spacing and the 17:30 fit are unchanged |
+| Page | only after the last attempt, on the existing `xverify_failed` source, whose meaning is unchanged: the check did not record today after every attempt |
+| Marker keep | cross-verification markers are kept **400 days** (`CROSSVERIFY_MARKER_KEEP_DAYS`), compile-time asserted above 90 + `MAX_CROSSVERIFY_HOLD_DAYS`. Other daily markers keep 7 days. A boot `warn!` (`source = "xverify_marker_keep_short"`) fires once if a configured gated hot window plus the hold comes within 3 days of the keep |
+| Rows counter | For the spot check, `tv_dhan_feed_xverify_rows_total` counts rows the database ACKed, never rows that were discarded. The §12.15.6 option pass still adds every row of a pass whose final flush landed, a discarded chunk included (its discards count on `tv_dhan_live_xverify_audit_rows_discarded_total`); 51b–51j may narrow that |
+| Option pass (§12.15.6) | unchanged: it keeps its discard-then-continue shape on purpose, because it writes no marker and never pages |
+
+**⚠ Honest limits (Rule 11).**
+- A database ACK means accepted into QuestDB's WAL, not applied. A WAL-suspended table still ACKs.
+- Only the marker folder and at most its parent are fsynced. A newly created grandparent (`data/state`) is not, so after a host crash the marker can be lost. A lost marker is the safe direction: the day re-runs or stays held.
+- Markers the 7-day sweep already deleted before this change cannot be recovered. Those days still take the hold-ceiling override and log the false line once their partitions age past the hot window.
+- MarketData-class tables keep a 15-day hot window, longer than the 3-day hold, so for them the gate can only Proceed or Override, never Hold. The hold bites on Depth and Intraday only. The 400-day keep fixes the false override, not this.
+- The fixed temp name assumes one writer per task, which the single-instance lock provides.
+- A refusal that repeats on every attempt (a schema conflict) leaves the day unmarked; it archives after the hold ceiling, loudly.
+
+**What a PR that violates §12.15.7 looks like (REJECT):** a marker write that returns unit or whose result can be dropped; a marker reader that only checks `is_file()`; a cross-verification sweep horizon shorter than the gated hold lookback; counting a discarded or refused audit row as persisted; a marker-only retry that re-runs the check, re-fetches the tape or re-pages the divergence; a new alarm, filter or page source for these failures without its own dated row in the noise lock.

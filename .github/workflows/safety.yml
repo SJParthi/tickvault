@@ -52,10 +52,42 @@ env:
 
 jobs:
   # ---- cargo-careful: Extra debug checks ----
+  #
+  # RUNNER DISK (2026-10-06, the issue #1836 class). The 2026-10-05 weekly run
+  # and its re-run both died in the BUILD step: "Free space left: 0 MB", then
+  # "ld terminated with signal 7 [Bus error]" in rust-lld linking test
+  # binaries. This job had none of the three disk measures the sanitizer
+  # jobs below received on 2026-10-01, so it gets the same ones: free the
+  # unused preinstalled toolchains, line tables for our crates and no debug
+  # info for dependencies (the `--config` on each cargo call; cargo-careful
+  # passes it through to cargo), and workspace feature unification. The
+  # extra careful checks (debug assertions in std, extra UB checks) are
+  # unchanged; only debug info shrinks.
   careful:
     name: "cargo-careful test"
     runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_UNSTABLE_FEATURE_UNIFICATION: "true"
+      CARGO_RESOLVER_FEATURE_UNIFICATION: workspace
     steps:
+      - name: Free runner disk space (see the job comment above)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "=== df -h BEFORE cleanup ==="
+          df -h /
+          sudo rm -rf /usr/share/dotnet \
+                      /usr/local/lib/android \
+                      /opt/ghc \
+                      /usr/local/share/boost \
+                      /opt/hostedtoolcache/CodeQL || true
+          if command -v docker >/dev/null 2>&1; then
+            sudo docker system prune -af >/dev/null 2>&1 || true
+          fi
+          echo "=== df -h AFTER cleanup ==="
+          df -h /
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install nightly toolchain (required by cargo-careful)
@@ -77,11 +109,20 @@ jobs:
       - name: Build with cargo-careful
         id: build
         run: |
-          cargo +${{ env.NIGHTLY_VERSION }} careful test --workspace --no-run 2>&1 || {
+          cargo +${{ env.NIGHTLY_VERSION }} careful test --workspace \
+            --config 'profile.dev.package."*".debug=false' \
+            --no-run 2>&1 || {
             echo "build_failed=true" >> "$GITHUB_OUTPUT"
             echo "::error::cargo-careful build failed (not a test finding). Look for a compiler error (nightly compatibility) or 'No space left on device' / a linker 'Bus error' (runner disk full, see #1836)."
             exit 1
           }
+
+      - name: "Report runner disk (issue 1836)"
+        if: always()
+        shell: bash
+        run: |
+          df -h /
+          du -sh target 2>/dev/null || true
 
       - name: Auto-close cargo-careful build-failure issue on green build
         if: steps.build.outcome == 'success'
@@ -125,6 +166,7 @@ jobs:
           # --test-threads=1: reduces memory pressure on CI runners
           # TV_SKIP_PERF_ASSERTIONS: skip timing assertions (instrumentation = 10-100x slower)
           cargo +${{ env.NIGHTLY_VERSION }} careful test --workspace \
+            --config 'profile.dev.package."*".debug=false' \
             -- --test-threads=1 2>&1 | tee /tmp/careful-test.log || {
             rc=${PIPESTATUS[0]}
             echo "test_failed=true" >> "$GITHUB_OUTPUT"

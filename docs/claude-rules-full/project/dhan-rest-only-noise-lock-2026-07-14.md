@@ -4133,6 +4133,31 @@ the pre-removal bill is −$0.10/mo. No new EMF metric name.
 alone; sets `ok_recovery = true`; adds a fourth xverify alarm without its own
 dated row.
 
+**2026-10-06 note — two new `reason` values on `xverify_failed`, no new page.**
+Owner approvals, verbatim: "Go ahead with whatever you want dude" and "See do
+everything whatever is recommended dude okay?" (plan ITEM 51a;
+`no-rest-except-live-feed-2026-06-27.md` §12.15.7). Recorded BEFORE the code.
+
+- **NO** new alarm, metric filter, `source`, Telegram phrase, EMF name,
+  dimension or `ok_actions`. No terraform change.
+- `xverify_failed` keeps its documented meaning: the check did not record
+  today after every same-day attempt. Its `reason` field gains two values,
+  `marker_not_written` (the comparison finished and every row was accepted,
+  but the day marker could not be saved to disk) and `audit_rows_lost` (some
+  audit rows were discarded or refused). Both used to log "recorded" and
+  release the S3 hold falsely; they now fail the attempt and page only after
+  the last one, as every other `reason` does. The filter matches `code`,
+  `level` and `source` only, so it already covers them.
+- Three per-attempt `warn!` sources are added, none of them filtered:
+  `xverify_attempt_marker_write_failed`, `xverify_marker_dir_sync_failed` and
+  `xverify_marker_keep_short`.
+- **Double page, accepted:** a mid-run audit discard already pages through the
+  §2.10 `audit_rows` group (`tv_dhan_live_xverify_audit_rows_discarded_total`
+  and `tv_dhan_feed_xverify_persist_errors_total` are members), and if every
+  attempt then loses rows the final `xverify_failed` (`reason =
+  audit_rows_lost`) pages again. The two say different things (rows lost; the
+  day not recorded), so both stay.
+
 ---
 
 ## §2.6 — 2026-09-25: three live-lane pages for DELAY, not only for loss — feed delay, main-feed reconnect time, blank new depth contracts
@@ -4610,3 +4635,33 @@ the standing ceiling is $150 per Quote 23.
 - Lowers the durability alarm to a single period.
 - Drops the boot-time zero registration of any counter in a group.
 - Adds a counter to a group, or widens a slice, without a dated row here.
+
+## §2.11 — 2026-10-06: `RISK-GAP-03` re-arms after each silence episode (no new page)
+
+Owner, 2026-10-06: "Go ahead with whatever you want dude", and on the
+recommended-fixes list, "See do everything whatever is recommended dude okay?".
+
+**What was wrong (Verified from code, `crates/app/src/dhan_feed_stack.rs`):** the
+30-second silence arm counted never-ticked contracts inside "silent". Far
+option strikes that never trade keep that count above zero all day, so after
+the first page the episode never ended, the latch never cleared, and a
+contract that went quiet later in the session never paged. The page this file
+already allows (one per episode, `RISK-GAP-03` log filter) had quietly become
+one per day.
+
+**What changed:** the arm pages when a contract that HAD ticked goes quiet
+(`silent − never`), and reports never-ticked contracts once per session.
+`silence_scan_pending` holds the rule; the existing 30-minute cooldown,
+continuous-session gate, holiday gate and the dead-class report are
+unchanged. Pinned by
+`a_contract_going_quiet_mid_session_pages_although_far_strikes_never_ticked`
+and `silence_scan_pending_truth_table`.
+
+**Allowed set unchanged:** no new code, alarm, filter, metric, dimension or
+`ok_actions`. The page can now fire more than once a day, at most once per 30
+minutes, which is what §2.3's "one per episode" always said. Cost unchanged.
+
+**What a PR that violates §2.11 looks like (REJECT):**
+- Counts never-ticked contracts toward re-arming the page again, so far
+  strikes latch it for the day.
+- Removes the 30-minute cooldown or pages never-ticked contracts every scan.

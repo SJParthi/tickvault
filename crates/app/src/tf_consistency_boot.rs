@@ -2268,7 +2268,33 @@ pub fn spawn_tf_consistency_tasks(
                 if status_label == "pass"
                     && let Some(d) = marker_date
                 {
-                    crate::daily_task_marker::write_daily_marker(TF_CONSISTENCY_MARKER_TASK, d);
+                    // 2026-10-06 (plan item 51a): the write now reports its
+                    // result. A failure changes nothing here except the log:
+                    // a restart may re-send today's card (noisy-not-silent).
+                    match crate::daily_task_marker::try_write_daily_marker(
+                        TF_CONSISTENCY_MARKER_TASK,
+                        d,
+                    ) {
+                        Ok(crate::daily_task_marker::MarkerDurability::Durable) => {}
+                        Ok(crate::daily_task_marker::MarkerDurability::RenamedNotDirSynced) => {
+                            warn!(
+                                code = ErrorCode::TfVerify02RunDegraded.code_str(),
+                                source = "tf_marker_write_failed",
+                                durability = "renamed_not_dir_synced",
+                                "tf_consistency: today's delivered marker was saved but its \
+                                 folder was not synced to disk — a restart may re-send today's card"
+                            );
+                        }
+                        Err(err) => {
+                            warn!(
+                                code = ErrorCode::TfVerify02RunDegraded.code_str(),
+                                source = "tf_marker_write_failed",
+                                ?err,
+                                "tf_consistency: today's delivered marker could not be saved — \
+                                 a restart may re-send today's card"
+                            );
+                        }
+                    }
                 }
             }
             Ok(Ok(None)) => {} // non-trading-day skip / refused force — no page.
@@ -3832,5 +3858,35 @@ mod tests {
         // The real-limit arithmetic backing the reasoning: a truncated
         // (> cap-row) response cannot be all in-session (375 max).
         assert!(TF_VERIFY_1M_ROW_LIMIT > 375);
+    }
+
+    /// 2026-10-06 (plan item 51a): the PASS-day marker write's result is
+    /// matched, and a failure (or an unsynced folder) logs a coded warn. No
+    /// behaviour change: a restart may re-send today's card.
+    #[test]
+    fn test_pass_marker_write_failure_is_logged_coded() {
+        let prod = OWN_SRC.split("#[cfg(test)]").next().unwrap_or("");
+        let at = prod
+            .find("match crate::daily_task_marker::try_write_daily_marker(")
+            .expect("the PASS marker write must be matched, not dropped");
+        let arm = &prod[at..];
+        let arm = &arm[..arm.find("Ok(Ok(None))").unwrap_or(arm.len())];
+        assert!(arm.contains("TF_CONSISTENCY_MARKER_TASK"));
+        assert!(arm.contains("MarkerDurability::RenamedNotDirSynced"));
+        assert!(arm.contains("Err(err)"));
+        assert_eq!(
+            arm.matches("code = ErrorCode::TfVerify02RunDegraded.code_str()")
+                .count(),
+            2,
+            "both failure arms must be coded"
+        );
+        assert_eq!(
+            arm.matches("source = \"tf_marker_write_failed\"").count(),
+            2
+        );
+        assert!(
+            !prod.contains("daily_task_marker::write_daily_marker("),
+            "the unit-returning writer must not come back"
+        );
     }
 }

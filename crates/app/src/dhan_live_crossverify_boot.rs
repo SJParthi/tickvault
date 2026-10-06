@@ -32,7 +32,9 @@ use tickvault_core::websocket::pool_supervisor::SubscribeInstrument;
 use tickvault_storage::dhan_live_crossverify_persistence::DhanLiveXverifyAuditWriter;
 use tracing::{error, info, warn};
 
-use crate::daily_task_marker::{daily_marker_exists, write_daily_marker};
+use crate::daily_task_marker::{
+    MarkerDurability, daily_marker_exists, daily_marker_path, try_write_daily_marker_keeping,
+};
 use crate::dhan_live_crossverify::{
     DayComparison, DhanLiveCrossverifyConfig, RUN_SECS_OF_DAY_IST, RunReport,
     SESSION_CLOSE_SECS_OF_DAY_IST, XverifyTarget, daily_row, deterministic_run_ts_nanos,
@@ -44,12 +46,56 @@ use crate::volume_leaderboard::OptionFamily;
 /// so the writer and the reader can never disagree about the file name.
 pub const CROSSVERIFY_MARKER_TASK: &str = "dhan_live_crossverify";
 
+/// Days a cross-verification marker is kept (2026-10-06, plan item 51a,
+/// `no-rest` §12.15.7).
+///
+/// The S3 archive gate reads a day's marker when that day's partitions age
+/// out of their hot window, which is up to the largest GATED window
+/// (`retention_days`, 90 by default; `market_data_hot_days` 15; depth and
+/// intraday 1, raised to their floors by `effective_hot_days`) plus
+/// [`tickvault_storage::partition_archive::MAX_CROSSVERIFY_HOLD_DAYS`]. The
+/// default 7-day sweep deleted markers long before that, so verified days read
+/// as unverified and logged a false "archived WITHOUT a cross-verification"
+/// line. The disk-pressure leg is not gated, so `pressure_hot_days` does not
+/// count. Cost: about 400 files of about 60 bytes.
+pub const CROSSVERIFY_MARKER_KEEP_DAYS: i64 = 400;
+
+const _: () = assert!(
+    CROSSVERIFY_MARKER_KEEP_DAYS
+        > 90 + tickvault_storage::partition_archive::MAX_CROSSVERIFY_HOLD_DAYS,
+    "the cross-verification marker keep must outlast the default gated hold lookback"
+);
+
+/// Days of slack the boot check wants between the gated hold lookback and the
+/// marker keep.
+const CROSSVERIFY_MARKER_KEEP_SLACK_DAYS: i64 = 3;
+
+/// Whether the configured gated hot window (the largest of the gated
+/// `[partition_retention]` windows, `pressure_hot_days` excluded) plus the
+/// hold comes within [`CROSSVERIFY_MARKER_KEEP_SLACK_DAYS`] of
+/// [`CROSSVERIFY_MARKER_KEEP_DAYS`]. When it does, a verified day's marker can
+/// be swept before the archive gate reads it. Raw configured days are used:
+/// the floors `effective_hot_days` applies (1 and 2 days) only raise tiny
+/// values. Pure, O(1).
+#[must_use]
+pub fn crossverify_marker_keep_is_short(gated_hot_days_max: u32) -> bool {
+    i64::from(gated_hot_days_max)
+        .saturating_add(tickvault_storage::partition_archive::MAX_CROSSVERIFY_HOLD_DAYS)
+        .saturating_add(CROSSVERIFY_MARKER_KEEP_SLACK_DAYS)
+        >= CROSSVERIFY_MARKER_KEEP_DAYS
+}
+
 /// Runs counter, labelled by `outcome`
 /// (`measured` / `vacuous` / `diverged` / `failed` / `no_token`). Re-exported
 /// from the feed stack, which has owned the name since 2026-08-26, so one
 /// metric has exactly one declaration.
 pub use crate::dhan_feed_stack::XVERIFY_RUNS_COUNTER;
-/// Rows the run persisted (findings + vendor tape + the daily row).
+/// Rows persisted (findings + vendor tape + the daily row). Since 2026-10-06
+/// the spot check counts only rows the database ACKed, never a discarded one
+/// (discards count on `tv_dhan_live_xverify_audit_rows_discarded_total`). The
+/// §12.15.6 option pass keeps its old shape on purpose (see
+/// `persist_option_findings`): it still counts every row of a pass whose final
+/// flush succeeded.
 pub const XVERIFY_PERSIST_ROWS_COUNTER: &str = "tv_dhan_feed_xverify_rows_total";
 /// Persist failures (the final flush was refused).
 pub const XVERIFY_PERSIST_ERRORS_COUNTER: &str = "tv_dhan_feed_xverify_persist_errors_total";
@@ -270,6 +316,14 @@ pub enum AttemptFailure {
     /// The comparison ran but did not cover the day (budget, truncation,
     /// too many vendor fetch failures, or a non-measured outcome).
     Incomplete,
+    /// The comparison finished and every audit row was ACKed, but the day
+    /// marker could not be saved to disk (2026-10-06, §12.15.7). The next
+    /// attempt only writes the marker.
+    MarkerNotWritten,
+    /// The final flush and the daily row landed, but some cell or tape rows
+    /// were discarded by a failed mid-run flush or refused at append
+    /// (2026-10-06, §12.15.7). The day is not recorded on an incomplete audit.
+    AuditRowsLost,
 }
 
 impl AttemptFailure {
@@ -282,6 +336,8 @@ impl AttemptFailure {
             Self::Vacuous => "vacuous",
             Self::NotPersisted => "not_persisted",
             Self::Incomplete => "incomplete",
+            Self::MarkerNotWritten => "marker_not_written",
+            Self::AuditRowsLost => "audit_rows_lost",
         }
     }
 }
@@ -319,12 +375,13 @@ pub const fn retry_delay_secs(
 
 /// Whether one finished attempt recorded the day, and if not, why. The
 /// checks run in a fixed order so the reason names the first thing that went
-/// wrong. `Ok` is exactly the condition under which the marker is written.
-/// Pure, O(1).
+/// wrong: vacuous, then not measured, then the persist verdict (its own
+/// variant, from [`persist_verdict`]), then an incomplete run. `Ok` is exactly
+/// the condition under which the marker is written. Pure, O(1).
 pub fn classify_attempt(
     vacuous: bool,
     measured: bool,
-    persisted_ok: bool,
+    persist: Result<(), AttemptFailure>,
     complete: bool,
 ) -> Result<(), AttemptFailure> {
     if vacuous {
@@ -333,13 +390,68 @@ pub fn classify_attempt(
     if !measured {
         return Err(AttemptFailure::Incomplete);
     }
-    if !persisted_ok {
-        return Err(AttemptFailure::NotPersisted);
-    }
+    persist?;
     if !complete {
         return Err(AttemptFailure::Incomplete);
     }
     Ok(())
+}
+
+/// What persisting one run actually did, counted per flush (2026-10-06,
+/// §12.15.7).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PersistOutcome {
+    /// The final flush was ACKed.
+    pub final_flush_ok: bool,
+    /// The daily summary row was appended to the buffer.
+    pub daily_appended: bool,
+    /// Rows a failed flush discarded (mid-run or final).
+    pub rows_discarded: usize,
+    /// Rows the database ACKed.
+    pub rows_flushed: usize,
+    /// Cell findings the buffer refused at append.
+    pub cell_append_errors: usize,
+    /// Vendor tape rows the buffer refused at append.
+    pub tape_append_errors: usize,
+}
+
+/// The persist half of an attempt's verdict. `NotPersisted` when the final
+/// flush failed or the daily row never reached the buffer; otherwise
+/// `AuditRowsLost` when any row was discarded or refused; otherwise `Ok`. A
+/// database ACK means accepted into QuestDB's WAL, not applied. Pure, O(1).
+pub fn persist_verdict(outcome: &PersistOutcome) -> Result<(), AttemptFailure> {
+    if !outcome.final_flush_ok || !outcome.daily_appended {
+        return Err(AttemptFailure::NotPersisted);
+    }
+    if outcome.rows_discarded > 0
+        || outcome.cell_append_errors > 0
+        || outcome.tape_append_errors > 0
+    {
+        return Err(AttemptFailure::AuditRowsLost);
+    }
+    Ok(())
+}
+
+/// What the next same-day attempt does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttemptKind {
+    /// Token wait, vendor fetch, comparison, persist, marker.
+    Full,
+    /// Only the marker write: the previous attempt finished and persisted
+    /// everything, and failed only to save the marker.
+    MarkerOnly,
+}
+
+/// The next attempt's kind, from the immediately previous attempt's failure
+/// in this process. Marker-only exactly after `MarkerNotWritten`, so a marker
+/// is never written on the strength of any other earlier result. Pure, O(1).
+#[must_use]
+pub fn next_attempt_kind(prev: Option<AttemptFailure>) -> AttemptKind {
+    if prev == Some(AttemptFailure::MarkerNotWritten) {
+        AttemptKind::MarkerOnly
+    } else {
+        AttemptKind::Full
+    }
 }
 
 /// Calls `read` until it returns `Some`, sleeping `poll_secs` between calls,
@@ -451,16 +563,28 @@ async fn run_day(
     let max_attempt_secs = attempt_max_secs(deps.config.run_budget_secs);
     let mut attempts: u32 = 0;
     let mut divergence_paged = false;
+    let mut previous: Option<AttemptFailure> = None;
     loop {
         attempts = attempts.saturating_add(1);
-        let outcome = run_once(
-            deps,
-            targets,
-            today,
-            day_start_ist_nanos,
-            &mut divergence_paged,
-        )
-        .await;
+        let outcome = match next_attempt_kind(previous) {
+            AttemptKind::MarkerOnly => {
+                // §12.15.7: the previous attempt compared and persisted
+                // everything and failed only to save the marker. Re-running
+                // the check would re-fetch the vendor tape for nothing, so
+                // this attempt only writes the marker.
+                record_day(today)
+            }
+            AttemptKind::Full => {
+                run_once(
+                    deps,
+                    targets,
+                    today,
+                    day_start_ist_nanos,
+                    &mut divergence_paged,
+                )
+                .await
+            }
+        };
         let failure = match outcome {
             Ok(()) => {
                 if attempts > 1 {
@@ -470,6 +594,7 @@ async fn run_day(
             }
             Err(failure) => failure,
         };
+        previous = Some(failure);
         match retry_delay_secs(attempts, now_ist_secs_of_day(), max_attempt_secs) {
             Some(delay) => {
                 metrics::counter!(XVERIFY_RETRIES_COUNTER, "reason" => failure.as_str())
@@ -525,10 +650,26 @@ fn report_final_failure(
              today — today's candles are UNVERIFIED and today's S3 archive stays held. \
              This is not a pass; it is no measurement at all."
         ),
+        // §12.15.7: the same alarmed source; its meaning ("did not record
+        // today after every attempt") is exactly what this day is.
+        AttemptFailure::MarkerNotWritten => error!(
+            code = ErrorCode::WsGapConnectionState.code_str(),
+            source = "xverify_failed",
+            %today,
+            attempts,
+            targets,
+            reason,
+            path = %daily_marker_path(CROSSVERIFY_MARKER_TASK, today).display(),
+            "Dhan 1-minute cross-verification: comparison finished and every row was \
+             accepted by the database, but the day marker could not be saved to disk; \
+             today's S3 archive stays held; check disk space and permissions on the \
+             state folder"
+        ),
         AttemptFailure::NoToken
         | AttemptFailure::RunFailed
         | AttemptFailure::NotPersisted
-        | AttemptFailure::Incomplete => error!(
+        | AttemptFailure::Incomplete
+        | AttemptFailure::AuditRowsLost => error!(
             code = ErrorCode::WsGapConnectionState.code_str(),
             source = "xverify_failed",
             %today,
@@ -615,12 +756,14 @@ async fn run_once(
                 vacuous = c.is_vacuous(),
                 "Dhan 1-minute cross-verification finished"
             );
-            let persisted_ok = persist_report(
+            let persisted = persist_report(
                 &deps.questdb,
                 &report,
                 day_start_ist_nanos,
                 deps.config.tolerance_paise,
             );
+            let persist = persist_verdict(&persisted);
+            let persisted_ok = persist.is_ok();
             if is_catastrophic_divergence(c) && !*divergence_paged {
                 *divergence_paged = true;
                 metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "diverged").increment(1);
@@ -644,12 +787,8 @@ async fn run_once(
                 report.rest_failures,
                 targets.len(),
             );
-            let verdict = classify_attempt(
-                c.is_vacuous(),
-                c.outcome.is_measured(),
-                persisted_ok,
-                complete,
-            );
+            let verdict =
+                classify_attempt(c.is_vacuous(), c.outcome.is_measured(), persist, complete);
             // The marker condition must stay exactly `should_write_marker`
             // plus a complete run; the two pure functions agree by test.
             debug_assert_eq!(
@@ -657,26 +796,28 @@ async fn run_once(
                 should_write_marker(c, persisted_ok) && complete
             );
             match verdict {
-                Ok(()) => {
-                    write_daily_marker(CROSSVERIFY_MARKER_TASK, today);
-                    info!(%today, "Dhan 1-minute cross-verification recorded — today's S3 archive may proceed");
+                Ok(()) => record_day(today),
+                Err(failure) => {
+                    warn!(
+                        code = ErrorCode::WsGapConnectionState.code_str(),
+                        source = "xverify_attempt_unrecorded",
+                        reason = failure.as_str(),
+                        targets = targets.len(),
+                        minutes_compared = c.minutes_compared,
+                        missing_live = c.missing_live,
+                        missing_rest = c.missing_rest,
+                        rest_failures = report.rest_failures,
+                        budget_elapsed = report.budget_elapsed,
+                        live_truncated = report.live_truncated,
+                        persisted_ok,
+                        rows_discarded = persisted.rows_discarded,
+                        cell_append_errors = persisted.cell_append_errors,
+                        tape_append_errors = persisted.tape_append_errors,
+                        "Dhan 1-minute cross-verification attempt did not record today"
+                    );
+                    Err(failure)
                 }
-                Err(failure) => warn!(
-                    code = ErrorCode::WsGapConnectionState.code_str(),
-                    source = "xverify_attempt_unrecorded",
-                    reason = failure.as_str(),
-                    targets = targets.len(),
-                    minutes_compared = c.minutes_compared,
-                    missing_live = c.missing_live,
-                    missing_rest = c.missing_rest,
-                    rest_failures = report.rest_failures,
-                    budget_elapsed = report.budget_elapsed,
-                    live_truncated = report.live_truncated,
-                    persisted_ok,
-                    "Dhan 1-minute cross-verification attempt did not record today"
-                ),
             }
-            verdict
         }
         Err(err) => {
             metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "failed").increment(1);
@@ -691,41 +832,124 @@ async fn run_once(
     }
 }
 
-/// Persists the run. Returns `true` only when the final flush succeeded AND the
-/// daily row was appended — that is what the marker depends on.
+/// Writes today's marker: the ONLY marker-write site of the cross-verification
+/// (2026-10-06, §12.15.7). Called from `run_once`'s `Ok` arm and from the
+/// marker-only retry in `run_day`.
+///
+/// A folder-sync failure after the rename still counts as recorded: the marker
+/// is in place and the strict reader accepts it, so the hold really is
+/// released. A write error fails the attempt with `MarkerNotWritten`.
+fn record_day(today: chrono::NaiveDate) -> Result<(), AttemptFailure> {
+    match try_write_daily_marker_keeping(
+        CROSSVERIFY_MARKER_TASK,
+        today,
+        CROSSVERIFY_MARKER_KEEP_DAYS,
+    ) {
+        Ok(MarkerDurability::Durable) => {
+            info!(%today, "Dhan 1-minute cross-verification recorded — today's S3 archive may proceed");
+            Ok(())
+        }
+        Ok(MarkerDurability::RenamedNotDirSynced) => {
+            warn!(
+                code = ErrorCode::WsGapConnectionState.code_str(),
+                source = "xverify_marker_dir_sync_failed",
+                %today,
+                path = %daily_marker_path(CROSSVERIFY_MARKER_TASK, today).display(),
+                "Dhan 1-minute cross-verification marker was saved, but its folder could \
+                 not be synced to disk; the day is recorded, a host crash could lose it"
+            );
+            info!(%today, "Dhan 1-minute cross-verification recorded — today's S3 archive may proceed");
+            Ok(())
+        }
+        Err(err) => {
+            warn!(
+                code = ErrorCode::WsGapConnectionState.code_str(),
+                source = "xverify_attempt_marker_write_failed",
+                %today,
+                ?err,
+                path = %daily_marker_path(CROSSVERIFY_MARKER_TASK, today).display(),
+                "Dhan 1-minute cross-verification finished and persisted, but the day \
+                 marker could not be saved; the next attempt only writes the marker"
+            );
+            Err(AttemptFailure::MarkerNotWritten)
+        }
+    }
+}
+
+/// Persists the run through the production writer, in batches of
+/// [`PERSIST_BATCH_ROWS`]. See [`persist_report_into`].
 fn persist_report(
     questdb: &QuestDbConfig,
     report: &RunReport,
     day_start_ist_nanos: i64,
     tolerance_paise: i64,
-) -> bool {
-    let c = &report.comparison;
+) -> PersistOutcome {
     let mut writer = DhanLiveXverifyAuditWriter::new(questdb);
+    persist_report_into(
+        &mut writer,
+        report,
+        day_start_ist_nanos,
+        tolerance_paise,
+        PERSIST_BATCH_ROWS,
+    )
+}
+
+/// Appends every finding, every vendor tape row and the daily row, flushing
+/// every `batch_rows` rows, and counts what each flush did. A failed flush
+/// discards its pending rows (the writer's poisoned-buffer defence), so those
+/// rows are counted as discarded, never as persisted (2026-10-06, §12.15.7).
+/// O(findings + tape rows), once per attempt, cold.
+fn persist_report_into(
+    writer: &mut DhanLiveXverifyAuditWriter,
+    report: &RunReport,
+    day_start_ist_nanos: i64,
+    tolerance_paise: i64,
+    batch_rows: usize,
+) -> PersistOutcome {
+    let c = &report.comparison;
+    let mut out = PersistOutcome::default();
     let mut batch_errors = 0_usize;
-    let flush_if_full = |w: &mut DhanLiveXverifyAuditWriter, errs: &mut usize| {
-        let failed = if w.pending() >= PERSIST_BATCH_ROWS {
-            tickvault_storage::off_worker::off_worker(|| w.flush()).is_err()
-        } else {
-            tickvault_storage::off_worker::off_worker(|| w.flush_if_large()).is_err()
-        };
-        if failed {
-            *errs = errs.saturating_add(1);
+    // Counts the rows a flush took with it: on `Err` they were discarded; on
+    // `Ok` with an empty buffer they were ACKed. An `Ok` that left rows
+    // pending flushed nothing.
+    let account = |out: &mut PersistOutcome,
+                   errs: &mut usize,
+                   before: usize,
+                   flushed: anyhow::Result<()>,
+                   after: usize| {
+        match flushed {
+            Err(_) => {
+                out.rows_discarded = out.rows_discarded.saturating_add(before);
+                *errs = errs.saturating_add(1);
+            }
+            Ok(()) if after == 0 => {
+                out.rows_flushed = out.rows_flushed.saturating_add(before);
+            }
+            Ok(()) => {}
         }
     };
+    let flush_if_full =
+        |w: &mut DhanLiveXverifyAuditWriter, out: &mut PersistOutcome, errs: &mut usize| {
+            let before = w.pending();
+            let flushed = if before >= batch_rows {
+                tickvault_storage::off_worker::off_worker(|| w.flush())
+            } else {
+                tickvault_storage::off_worker::off_worker(|| w.flush_if_large())
+            };
+            account(out, errs, before, flushed, w.pending());
+        };
 
-    let mut cell_errors = 0_usize;
     for finding in &c.findings {
         if writer.append_cell(finding).is_err() {
-            cell_errors = cell_errors.saturating_add(1);
+            out.cell_append_errors = out.cell_append_errors.saturating_add(1);
         }
-        flush_if_full(&mut writer, &mut batch_errors);
+        flush_if_full(writer, &mut out, &mut batch_errors);
     }
-    let mut tape_errors = 0_usize;
     for row in &report.rest_tape {
         if writer.append_rest_tape(row).is_err() {
-            tape_errors = tape_errors.saturating_add(1);
+            out.tape_append_errors = out.tape_append_errors.saturating_add(1);
         }
-        flush_if_full(&mut writer, &mut batch_errors);
+        flush_if_full(writer, &mut out, &mut batch_errors);
     }
     let daily = daily_row(
         c,
@@ -733,42 +957,64 @@ fn persist_report(
         deterministic_run_ts_nanos(day_start_ist_nanos),
         tolerance_paise,
     );
-    let daily_failed = writer.append_daily(&daily).is_err();
+    out.daily_appended = writer.append_daily(&daily).is_ok();
 
-    match tickvault_storage::off_worker::off_worker(|| writer.flush()) {
-        Ok(()) => {
-            metrics::counter!(XVERIFY_PERSIST_ROWS_COUNTER)
-                .increment(c.findings.len() as u64 + report.rest_tape.len() as u64 + 1);
-            if cell_errors > 0 || tape_errors > 0 || batch_errors > 0 || daily_failed {
+    let before = writer.pending();
+    let final_flush = tickvault_storage::off_worker::off_worker(|| writer.flush());
+    out.final_flush_ok = final_flush.is_ok();
+    let final_err = final_flush.as_ref().err().map(|e| format!("{e:#}"));
+    account(
+        &mut out,
+        &mut batch_errors,
+        before,
+        final_flush,
+        writer.pending(),
+    );
+    metrics::counter!(XVERIFY_PERSIST_ROWS_COUNTER).increment(out.rows_flushed as u64);
+
+    match final_err {
+        None => {
+            if out.cell_append_errors > 0
+                || out.tape_append_errors > 0
+                || batch_errors > 0
+                || !out.daily_appended
+            {
                 error!(
                     code = ErrorCode::WsGapConnectionState.code_str(),
                     source = "xverify_persist_partial",
-                    cell_errors,
-                    tape_errors,
+                    cell_errors = out.cell_append_errors,
+                    tape_errors = out.tape_append_errors,
                     batch_errors,
-                    daily_failed,
+                    rows_discarded = out.rows_discarded,
+                    daily_failed = !out.daily_appended,
                     findings = c.findings.len(),
                     tape_rows = report.rest_tape.len(),
                     "Dhan 1-minute cross-verification persisted with gaps — the audit \
-                     tables are incomplete for today"
+                     tables are incomplete for today, so today's S3 archive stays held; \
+                     this attempt fails and is retried only if the day's window allows \
+                     (see xverify_retry / xverify_failed)"
                 );
             }
-            !daily_failed
         }
-        Err(err) => {
-            let discarded = writer.discard_pending();
+        Some(err) => {
+            // `flush` already discarded on `Err` (poisoned-buffer defence);
+            // this keeps the buffer empty even if that ever changes. The rows
+            // were counted as discarded above, so nothing is added here.
+            let _already_empty = writer.discard_pending();
             metrics::counter!(XVERIFY_PERSIST_ERRORS_COUNTER).increment(1);
             error!(
                 code = ErrorCode::WsGapConnectionState.code_str(),
                 source = "xverify_persist_failed",
-                ?err,
-                discarded,
+                %err,
+                rows_discarded = out.rows_discarded,
                 "Dhan 1-minute cross-verification could NOT be persisted — today's \
-                 comparison exists only in this log stream and today's S3 archive stays held"
+                 comparison exists only in this log stream; today's S3 archive stays \
+                 held; this attempt fails and is retried only if the day's window \
+                 allows (see xverify_retry / xverify_failed)"
             );
-            false
         }
     }
+    out
 }
 
 // ── §12.15.6 — the day's depth-held OPTION contracts, checked separately ──
@@ -1006,6 +1252,13 @@ async fn run_option_pass(
 /// Persists the option pass's cell findings and vendor tape. NO daily row: the
 /// daily DEDUP key `(ts, trading_date_ist, feed, outcome)` would collide with
 /// the spot row. Returns `true` when the final flush succeeded.
+///
+/// It keeps its discard-then-continue shape ON PURPOSE (2026-10-06,
+/// §12.15.7): a failed mid-run flush loses that chunk and the pass still
+/// reports success once the final flush lands. Unlike the spot check
+/// ([`persist_report_into`]) it writes no marker and never pages (§12.15.6),
+/// so a partial write here holds nothing back and hides nothing alarmed; the
+/// gap is logged on `xverify_options_persist_partial`.
 fn persist_option_findings(questdb: &QuestDbConfig, report: &RunReport) -> bool {
     let c = &report.comparison;
     let mut writer = DhanLiveXverifyAuditWriter::new(questdb);
@@ -1255,14 +1508,14 @@ mod tests {
         assert!(!run_is_complete(false, false, 1, 0));
     }
 
+    /// §12.15.7: exactly one marker write in the production file, inside
+    /// `record_day`; `record_day` is called only from `run_once`'s `Ok` arm and
+    /// from `run_day`'s marker-only branch; a write error maps to
+    /// `MarkerNotWritten`.
     #[test]
     fn test_marker_write_needs_a_complete_run() {
-        let src = include_str!("dhan_live_crossverify_boot.rs");
-        let body = src
-            .split("async fn run_once(")
-            .nth(1)
-            .and_then(|s| s.split("\n}\n").next())
-            .unwrap_or("");
+        let prod = prod_src();
+        let body = fn_body(prod, "async fn run_once(");
         assert!(
             body.contains("classify_attempt("),
             "the marker decision must go through classify_attempt"
@@ -1271,23 +1524,32 @@ mod tests {
             body.contains("run_is_complete("),
             "the marker must also require a complete run"
         );
+        assert!(body.contains("persist_verdict("));
         assert_eq!(
-            body.matches("write_daily_marker(").count(),
+            prod.matches("try_write_daily_marker_keeping(").count(),
             1,
-            "exactly one marker write, on the Ok arm"
+            "exactly one marker write in the production file"
         );
-        let ok_arm = body.find("Ok(()) => {").unwrap_or(usize::MAX);
-        assert_ne!(ok_arm, usize::MAX, "an Ok arm must exist");
-        let write = body.find("write_daily_marker(").unwrap_or(0);
-        assert!(
-            write > ok_arm,
-            "the marker write must sit inside the Ok arm"
+        let record = fn_body(prod, "fn record_day(");
+        assert!(record.contains("try_write_daily_marker_keeping("));
+        assert!(record.contains("CROSSVERIFY_MARKER_KEEP_DAYS"));
+        assert!(record.contains("Err(AttemptFailure::MarkerNotWritten)"));
+        assert_eq!(
+            prod.matches("record_day(").count(),
+            3,
+            "the definition plus exactly two call sites"
         );
+        let ok_arm = body.find("Ok(()) => record_day(today)");
+        assert!(ok_arm.is_some(), "run_once writes the marker on its Ok arm");
+        let run_day = fn_body(prod, "async fn run_day(");
+        assert!(run_day.contains("AttemptKind::MarkerOnly => {"));
+        assert!(!prod.contains("write_daily_marker("));
     }
 
-    /// `classify_attempt` returns `Ok` exactly when the old marker rule held:
-    /// `should_write_marker && complete`. Checked over every outcome, both
-    /// vacuous and measured minute counts, and every persisted/complete pair.
+    /// `classify_attempt` returns `Ok` exactly when the marker rule holds:
+    /// `should_write_marker(persist_verdict is Ok) && complete`. Checked over
+    /// every outcome, both vacuous and measured minute counts, every persist
+    /// verdict and both completeness values.
     #[test]
     fn test_classify_attempt_agrees_with_the_marker_rule_everywhere() {
         let outcomes = [
@@ -1298,21 +1560,26 @@ mod tests {
             DhanLiveXverifyOutcome::Blind,
             DhanLiveXverifyOutcome::Degraded,
         ];
+        let persists = [
+            Ok(()),
+            Err(AttemptFailure::NotPersisted),
+            Err(AttemptFailure::AuditRowsLost),
+        ];
         for outcome in outcomes {
             for minutes in [0_i64, 375] {
                 let c = comparison(outcome, minutes, 0);
-                for persisted_ok in [false, true] {
+                for persist in persists {
                     for complete in [false, true] {
                         let verdict = classify_attempt(
                             c.is_vacuous(),
                             c.outcome.is_measured(),
-                            persisted_ok,
+                            persist,
                             complete,
                         );
                         assert_eq!(
                             verdict.is_ok(),
-                            should_write_marker(&c, persisted_ok) && complete,
-                            "{outcome:?} minutes={minutes} persisted={persisted_ok} \
+                            should_write_marker(&c, persist.is_ok()) && complete,
+                            "{outcome:?} minutes={minutes} persist={persist:?} \
                              complete={complete}"
                         );
                     }
@@ -1324,20 +1591,39 @@ mod tests {
     #[test]
     fn test_classify_attempt_names_the_first_problem() {
         use AttemptFailure::*;
-        assert_eq!(classify_attempt(true, true, true, true), Err(Vacuous));
-        assert_eq!(classify_attempt(true, false, false, false), Err(Vacuous));
+        assert_eq!(classify_attempt(true, true, Ok(()), true), Err(Vacuous));
+        assert_eq!(
+            classify_attempt(true, false, Err(NotPersisted), false),
+            Err(Vacuous)
+        );
+        // Vacuous beats a lost audit row.
+        assert_eq!(
+            classify_attempt(true, true, Err(AuditRowsLost), true),
+            Err(Vacuous)
+        );
         // Degraded with minutes compared: not vacuous, not measured.
-        assert_eq!(classify_attempt(false, false, true, true), Err(Incomplete));
         assert_eq!(
-            classify_attempt(false, true, false, true),
+            classify_attempt(false, false, Ok(()), true),
+            Err(Incomplete)
+        );
+        assert_eq!(
+            classify_attempt(false, true, Err(NotPersisted), true),
             Err(NotPersisted)
         );
         assert_eq!(
-            classify_attempt(false, true, false, false),
+            classify_attempt(false, true, Err(NotPersisted), false),
             Err(NotPersisted)
         );
-        assert_eq!(classify_attempt(false, true, true, false), Err(Incomplete));
-        assert_eq!(classify_attempt(false, true, true, true), Ok(()));
+        // A lost audit row beats an incomplete run.
+        assert_eq!(
+            classify_attempt(false, true, Err(AuditRowsLost), false),
+            Err(AuditRowsLost)
+        );
+        assert_eq!(
+            classify_attempt(false, true, Ok(()), false),
+            Err(Incomplete)
+        );
+        assert_eq!(classify_attempt(false, true, Ok(()), true), Ok(()));
     }
 
     #[test]
@@ -1348,11 +1634,239 @@ mod tests {
             AttemptFailure::Vacuous,
             AttemptFailure::NotPersisted,
             AttemptFailure::Incomplete,
+            AttemptFailure::MarkerNotWritten,
+            AttemptFailure::AuditRowsLost,
         ];
         let mut labels: Vec<&str> = all.iter().map(|f| f.as_str()).collect();
         labels.sort_unstable();
         labels.dedup();
         assert_eq!(labels.len(), all.len());
+        assert_eq!(
+            AttemptFailure::MarkerNotWritten.as_str(),
+            "marker_not_written"
+        );
+        assert_eq!(AttemptFailure::AuditRowsLost.as_str(), "audit_rows_lost");
+    }
+
+    /// The keep outlasts every default gated hold lookback, and the boot
+    /// check flags a configured window that comes within the slack. The
+    /// disk-pressure window is not an input at all.
+    #[test]
+    fn test_crossverify_marker_keep_is_short_and_keep_exceeds_every_gated_hold_lookback() {
+        use tickvault_storage::partition_archive::MAX_CROSSVERIFY_HOLD_DAYS;
+        assert!(CROSSVERIFY_MARKER_KEEP_DAYS > 90 + MAX_CROSSVERIFY_HOLD_DAYS);
+        assert!(CROSSVERIFY_MARKER_KEEP_DAYS > crate::daily_task_marker::DAILY_MARKER_SWEEP_DAYS);
+        for days in [0_u32, 1, 15, 90, 300, 393] {
+            assert!(
+                !crossverify_marker_keep_is_short(days),
+                "{days} gated days must fit the keep"
+            );
+        }
+        for days in [394_u32, 397, 400, 10_000, u32::MAX] {
+            assert!(
+                crossverify_marker_keep_is_short(days),
+                "{days} gated days must be flagged"
+            );
+        }
+        let main_rs = include_str!("main.rs");
+        let at = main_rs
+            .find("crossverify_marker_keep_is_short(")
+            .expect("main.rs must run the boot check");
+        let start = main_rs[..at]
+            .rfind("let _dhan_crossverify")
+            .expect("the check sits in the cross-verification spawn block");
+        let head = &main_rs[start..at];
+        for gated in [
+            "retention_days",
+            "market_data_hot_days",
+            "depth_hot_days",
+            "intraday_hot_days",
+        ] {
+            assert!(head.contains(gated), "{gated} must feed the boot check");
+        }
+        assert!(
+            !head.contains(".pressure_hot_days"),
+            "the ungated disk-pressure window must not feed the boot check"
+        );
+        assert!(main_rs.contains("source = \"xverify_marker_keep_short\""));
+    }
+
+    proptest::proptest! {
+        /// `persist_verdict` is `Ok` iff the final flush and the daily row
+        /// landed and no row was discarded or refused; `NotPersisted` wins
+        /// over `AuditRowsLost`.
+        #[test]
+        fn test_persist_verdict_any_lost_row_is_a_failed_attempt(
+            final_flush_ok in proptest::bool::ANY,
+            daily_appended in proptest::bool::ANY,
+            rows_discarded in 0_usize..3,
+            rows_flushed in 0_usize..100_000,
+            cell_append_errors in 0_usize..3,
+            tape_append_errors in 0_usize..3,
+        ) {
+            let outcome = PersistOutcome {
+                final_flush_ok,
+                daily_appended,
+                rows_discarded,
+                rows_flushed,
+                cell_append_errors,
+                tape_append_errors,
+            };
+            let lost = rows_discarded > 0 || cell_append_errors > 0 || tape_append_errors > 0;
+            let expected = if !final_flush_ok || !daily_appended {
+                Err(AttemptFailure::NotPersisted)
+            } else if lost {
+                Err(AttemptFailure::AuditRowsLost)
+            } else {
+                Ok(())
+            };
+            proptest::prop_assert_eq!(persist_verdict(&outcome), expected);
+        }
+    }
+
+    fn finding(
+        i: i64,
+    ) -> tickvault_storage::dhan_live_crossverify_persistence::DhanLiveXverifyCellFinding {
+        tickvault_storage::dhan_live_crossverify_persistence::DhanLiveXverifyCellFinding {
+            run_ts_ist_nanos: 1_000,
+            trading_date_ist_nanos: 0,
+            security_id: 13,
+            segment: "IDX_I".to_string(),
+            minute_ts_ist_nanos: i * 60_000_000_000,
+            kind: tickvault_storage::dhan_live_crossverify_persistence::DhanLiveXverifyCellKind::Diverged,
+            field: "open",
+            live_value: 100.0,
+            rest_value: 101.0,
+            live_volume: 0,
+            rest_volume: 0,
+            diff_paise: 100,
+        }
+    }
+
+    fn tape_row(i: i64) -> tickvault_storage::dhan_live_crossverify_persistence::DhanRestTapeRow {
+        tickvault_storage::dhan_live_crossverify_persistence::DhanRestTapeRow {
+            minute_ts_ist_nanos: i * 60_000_000_000,
+            trading_date_ist_nanos: 0,
+            security_id: 13,
+            segment: "IDX_I".to_string(),
+            instrument: "INDEX".to_string(),
+            open: 100.0,
+            high: 101.0,
+            low: 99.0,
+            close: 100.5,
+            volume: 0,
+            fetched_at_nanos: 2_000,
+        }
+    }
+
+    /// With no sender every flush fails and discards, so every appended row
+    /// (5 findings + 3 tape rows + the daily row) must be counted as
+    /// discarded and none as flushed — rows, not batches. Coverage limit: the
+    /// "final flush Ok after a mid-run discard" branch is pinned by the
+    /// `persist_verdict` proptest, because the test writer has no sender.
+    #[test]
+    fn test_persist_report_into_counts_rows_discarded_not_batches() {
+        let mut c = comparison(DhanLiveXverifyOutcome::Diverged, 375, 5);
+        c.findings = (0..5).map(finding).collect();
+        let report = RunReport {
+            comparison: c,
+            rest_failures: 0,
+            rest_failure_breakdown: Default::default(),
+            degraded: false,
+            malformed_rows: 0,
+            budget_elapsed: false,
+            live_truncated: false,
+            rest_tape: (0..3).map(tape_row).collect(),
+        };
+        let mut writer = DhanLiveXverifyAuditWriter::for_test();
+        let out = persist_report_into(&mut writer, &report, 0, 5, 2);
+        assert!(out.daily_appended);
+        assert!(!out.final_flush_ok);
+        assert_eq!(out.cell_append_errors, 0);
+        assert_eq!(out.tape_append_errors, 0);
+        assert_eq!(out.rows_discarded, 5 + 3 + 1, "{out:?}");
+        assert_eq!(out.rows_flushed, 0);
+        assert_eq!(writer.pending(), 0);
+        assert_eq!(persist_verdict(&out), Err(AttemptFailure::NotPersisted));
+    }
+
+    #[test]
+    fn test_persist_rows_counter_counts_only_flushed_rows() {
+        let body = fn_body(prod_src(), "fn persist_report_into(");
+        assert!(
+            body.contains(
+                "metrics::counter!(XVERIFY_PERSIST_ROWS_COUNTER).increment(out.rows_flushed as u64)"
+            ),
+            "the rows counter must count ACKed rows only"
+        );
+        assert!(
+            !body.contains("increment(c.findings.len()"),
+            "the rows counter must never count appended rows"
+        );
+    }
+
+    #[test]
+    fn test_next_attempt_kind_after_marker_failure_is_marker_only() {
+        assert_eq!(
+            next_attempt_kind(Some(AttemptFailure::MarkerNotWritten)),
+            AttemptKind::MarkerOnly
+        );
+        assert_eq!(next_attempt_kind(None), AttemptKind::Full);
+        for other in [
+            AttemptFailure::NoToken,
+            AttemptFailure::RunFailed,
+            AttemptFailure::Vacuous,
+            AttemptFailure::NotPersisted,
+            AttemptFailure::Incomplete,
+            AttemptFailure::AuditRowsLost,
+        ] {
+            assert_eq!(next_attempt_kind(Some(other)), AttemptKind::Full);
+        }
+    }
+
+    /// The marker-only branch writes the marker and nothing else.
+    #[test]
+    fn test_marker_only_attempt_never_reruns_the_check() {
+        let run_day = fn_body(prod_src(), "async fn run_day(");
+        assert!(run_day.contains("next_attempt_kind(previous)"));
+        assert!(run_day.contains("previous = Some(failure);"));
+        let start = run_day
+            .find("AttemptKind::MarkerOnly => {")
+            .expect("run_day must branch on the attempt kind");
+        let branch = &run_day[start..];
+        let branch = &branch[..branch.find("AttemptKind::Full =>").unwrap_or(branch.len())];
+        assert!(branch.contains("record_day("));
+        for forbidden in [
+            "run_once(",
+            "run_cross_verification(",
+            "wait_for_jwt(",
+            "divergence_paged",
+            "persist_report",
+        ] {
+            assert!(
+                !branch.contains(forbidden),
+                "the marker-only attempt must not call {forbidden}"
+            );
+        }
+    }
+
+    /// A day whose marker could not be saved on any attempt pages on the
+    /// existing `xverify_failed` source, from its own `error!` arm.
+    #[test]
+    fn test_marker_not_written_final_failure_pages_on_existing_xverify_failed() {
+        let body = fn_body(prod_src(), "fn report_final_failure(");
+        let start = body
+            .find("AttemptFailure::MarkerNotWritten => error!(")
+            .expect("MarkerNotWritten must have its own error! arm");
+        let arm = &body[start..];
+        let arm = &arm[..arm.find("AttemptFailure::NoToken").unwrap_or(arm.len())];
+        assert!(arm.contains("source = \"xverify_failed\""));
+        assert!(arm.contains("code = ErrorCode::WsGapConnectionState.code_str()"));
+        assert!(arm.contains("the day marker could not be saved to disk"));
+        assert!(
+            body.contains("| AttemptFailure::AuditRowsLost => error!("),
+            "AuditRowsLost joins the existing xverify_failed arm"
+        );
     }
 
     #[test]
@@ -1515,9 +2029,9 @@ mod tests {
     fn test_the_fetched_vendor_tape_is_persisted_not_discarded() {
         let src = include_str!("dhan_live_crossverify_boot.rs");
         let body = src
-            .split("fn persist_report(")
+            .split("fn persist_report_into(")
             .nth(1)
-            .expect("persist_report must exist");
+            .expect("persist_report_into must exist");
         let end = body.find("\n}\n").unwrap_or(body.len());
         let body = &body[..end];
         assert!(body.contains("append_rest_tape("));
@@ -1702,6 +2216,8 @@ mod tests {
         ] {
             assert!(!body.is_empty());
             assert!(!body.contains("write_daily_marker"));
+            assert!(!body.contains("record_day("));
+            assert!(!body.contains("persist_report_into("));
             assert!(!body.contains("append_daily"));
             assert!(!body.contains("daily_row("));
             for alarmed in [

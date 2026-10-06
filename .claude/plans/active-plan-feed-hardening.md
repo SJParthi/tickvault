@@ -6229,81 +6229,256 @@ New counter `tv_depth_spill_replay_held_total`; new label `reason="not_a_trade"`
 
 Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
 
-## ITEM 51 — Live-socket fast lane (2026-10-06)
+## ITEM 50 — Fast-lane follow-ups (2026-10-06)
+
+Approved by Parthiban 2026-10-06 ("Go ahead with whatever you want dude"; "See do everything whatever is recommended dude okay?"). Found by the 2026-10-06 fast-lane attack (read-only review of the socket read path, the frame ring and the drain).
+
+- [x] 50a — **The silence page stopped re-arming once far strikes never ticked.** The arm counted never-ticked contracts as silent, so the episode never ended and a contract going quiet later never paged. It now pages on contracts that went quiet (`silent − never`) and reports never-ticked ones once per session (`silence_scan_pending`). Rule row: noise lock §2.11.
+  - Files: crates/app/src/dhan_feed_stack.rs, docs/claude-rules-full/project/dhan-rest-only-noise-lock-2026-07-14.md
+  - Tests: a_contract_going_quiet_mid_session_pages_although_far_strikes_never_ticked, silence_scan_pending_truth_table
+- [x] 50b — **`tv_doctor` read metrics from port 9090; the exporter listens on 9091** (`config/base.toml` `metrics_port`). Every metrics check reported unreachable.
+  - Files: crates/app/src/bin/tv_doctor.rs
+  - Tests: default_metrics_url_uses_the_configured_exporter_port
+- [x] 50c — **Two Dhan reference docs still said our depth unsubscribe sends code 24.** Annotated with the code sent (25, `FEED_UNSUBSCRIBE_TWENTY_DEPTH`), the 2026-09-12 probe and Dhan's 2026-09-30 reply. Docs only.
+  - Files: docs/dhan-ref/04-full-market-depth-websocket.md, docs/dhan-ref/08-annexure-enums.md
+  - Tests: (docs only)
+- [x] 50d — **Audit H2, second half: the weekly mutation sweep could never finish.** The workflow's own header puts a full sweep at ~18 hours, and the job was capped at 60 minutes, so after the 2026-10-04 baseline fix every weekly run would still be killed at the cap. The scheduled and dispatched sweep now runs as 8 shards (`--shard k/8`) with up to 350 minutes each; a push run mutates only the changed lines (`--in-diff`) within 60 minutes. The repository is public, so the runner minutes are free (Verified: visibility public).
+  - Files: .github/workflows/mutation.yml, crates/common/tests/github_workflow_guard.rs
+  - Tests: mutation_weekly_sweep_is_sharded_with_a_timeout_it_can_finish_in, mutation_push_run_mutates_only_the_changed_lines
+
+### Design
+50a is a pure function over two counts and one session latch, called on the 30 s silence arm: O(1), no allocation. The O(n) scan itself is unchanged. 50b changes one constant. 50c is docs. 50d is CI only: a matrix of 8 shards on schedule and dispatch, one job on push.
+### Edge Cases
+50a: every silent contract never ticked (reported once, then quiet until it ticks and goes quiet again); never-ticked count falling while others go quiet (pages on the went-quiet count); the market-hours gate resets the session latch; a backwards clock step still cannot clear the cooldown (existing test).
+### Failure Modes
+50a: a truly dead class still reports through the dead-class path (unchanged). If the never-ticked count rises mid-session after the once-per-session report, it is not reported again until the next session; the gauge `tv_dhan_feed_instruments_never_ticked` still shows it.
+50d: the ~18 h sweep figure is the header's estimate (Assumed); if one shard still exceeds 350 minutes it is cancelled and the run is red, never green. A push touching only non-source lines leaves `--in-diff` with nothing to mutate; cargo-mutants then tests no mutant and the results file still carries its summary (Assumed; a missing or empty file fails the run loudly, as before).
+### Test Plan
+`cargo test -p tickvault-app --lib silence` (19 passed locally on this branch); `cargo test -p tickvault-app --bin tv_doctor`; `cargo test -p tickvault-common --test github_workflow_guard mutation` (2 passed; bite-checked by restoring the flat 60-minute cap); CI full suite. 50d is proven only by the next Monday sweep.
+### Rollback
+Revert the commits. No schema, data, alarm or infrastructure change.
+### Observability
+No new metric or alarm. `RISK-GAP-03` can fire again within a session, at most once per 30 minutes (§2.11).
+
+Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
+
+## ITEM 49d / 45i — Depth array rows: scratch-table test RESULT (2026-10-06)
+
+The scope lock (2026-09-29) allows `market_depth` array rows only after a
+QuestDB scratch-table test. The test ran on 2026-10-06 against a LOCAL
+QuestDB 9.3.5 (the official `questdb-9.3.5-rt-linux-x86-64` release, sha256
+`83fb995f175716628c58564426be9f055c35ea218ad3d399e2ceb3e7ec7be028`), the same
+version as production. It did NOT run on the production box: AWS is
+read-only for these sessions. Harness: a throwaway Rust program on
+`questdb-rs =6.1.0` (the pinned client), outside the repository.
+
+Two scratch tables with the production column set and DEDUP shape:
+`md_scalar` (one row per level, ILP v1, the current layout) and `md_array`
+(one row per packet, `price` / `quantity` / `orders` as `DOUBLE[]`, a
+`levels` count, DEDUP key without `level`, ILP v2). The same depth-200
+packets went to both: 50 instruments, bid and ask, mostly 200 levels, about
+5% partial books, about 1% empty books.
+
+| Check | Result | Label |
+|---|---|---|
+| `CREATE TABLE … DOUBLE[] … WAL DEDUP UPSERT KEYS(…)` and `ADD COLUMN IF NOT EXISTS … DOUBLE[]` | accepted | Verified |
+| Every level read back, element by element (`a.price[s.level]`), 963,191 levels | 963,191 exact on price, quantity and orders | Verified |
+| Per-packet level count and sums | 4,948 of 4,948 packets with levels match | Verified |
+| Replay of the identical 5,000 packets (both tables) | row counts unchanged (DEDUP holds) | Verified |
+| Several packets in one second, distinct `capture_seq` | all kept | Verified |
+| Empty book (0 levels) | stored as one row with empty arrays; today's layout stores nothing for it | Verified |
+| NaN element (refused price) | reads back null in its own slot; positions stay aligned | Verified |
+| Disk bytes written by QuestDB (`/proc/<pid>/io write_bytes`), 5,000 packets | 1,041 MB per-level vs 94 MB arrays (11x) | Verified |
+| Same, 50,000 packets (9.64 M levels) | 10.68 GB vs 0.79 GB (13.5x) | Verified |
+| ILP bytes sent, 50,000 packets | 1.84 GB vs 0.24 GB (7.6x) | Verified |
+| Wall time to write and apply, 50,000 packets | 34 s vs 10 s | Verified (local disk, not the r8g.xlarge EBS) |
+| Table size on disk after both runs | 1,050 MB vs 641 MB | Verified (includes 16 MB preallocated files) |
+| Same test, depth-20 (200,000 packets, 3,856,888 levels) | 4.65 GB vs 0.37 GB written (12.6x); 1,207 vs 96 B per level | Verified |
+| Same test, inline 5-level depth (800,000 packets, 3,855,713 levels) | 4.30 GB vs 1.54 GB written (2.8x); 1,115 vs 400 B per level, about 1.9 KB fixed per row | Verified |
+| Level counts in both layouts, every run | identical | Verified |
+| The same ratio on the production EBS volume | not measured | Assumed |
+
+Projected day at the 2026-08-24 row counts (Assumed): depth writes about 1,774 GB per session today against about 340 GB as arrays (5.2x), roughly 74 MB/s against 14 MB/s over the session. The cap that ran out at 10:00 IST on 2026-10-05 is the r8g.xlarge instance EBS bandwidth (about 156 MB/s baseline, Assumed from AWS docs), not the gp3 volume, so faster volume settings do not lift it.
+
+### What the switch has to change (found by tracing every reader and writer)
+
+- No production SQL reads `market_depth` columns. The 15:41 depth-held pass
+  reads the in-memory subscription view. Archive exports use `SELECT *`.
+- **Column types cannot change in place**, so the switch writes a NEW table
+  and the old `market_depth` keeps its rows (never deleted; retention as
+  today).
+- **ILP v2 is required** (arrays do not exist in v1); v2 also writes f64 as
+  binary.
+- **Blocker for a naive switch: the depth spill tier is newline-delimited ILP
+  text.** `tick_spill_replay` chunks, bisects and window-filters on `\n` and
+  reads the timestamp after the last space. Binary v2 bytes contain both, so
+  a spilled v2 batch would be cut apart on replay.
+- Row builders: `drain_depth_frame` (d20/d200), `append_inline_depth` (d5),
+  the boot WAL refold and the after-close deferred depth pass all go through
+  them, so they move together.
+- Guards that pin the schema, DEDUP key, row width and DHAT budgets move in
+  the same PR.
+
+### First-draft recommendation (WITHDRAWN 2026-10-06 — see the attack results below)
+
+Replace the depth ILP spill with the existing deferral: when a depth flush
+fails, mark its `capture_seq` range in `DeferredDepth` (as a shed frame is
+marked today) instead of writing ILP bytes to `data/spill/depth`. The raw
+frames are already in the WAL, pinned by the mark, and the after-close pass
+rewrites them. That removes the text-only spill from the depth path instead
+of inventing a binary spill format. Risk: depth rows lost to a failed flush
+become visible after 15:45 rather than within the session.
+
+### Attack results on the design (2026-10-06, six experiments on the scratch QuestDB plus code review)
+
+Arrays: conditional GO. Spill replacement as first drafted: NO-GO.
+
+| Severity | Finding | Fix required in the switch |
+|---|---|---|
+| CRITICAL | Rows from frames the WAL refused (`!frame.wal_backed`) have no segment to re-read; dropping the ILP spill loses them | Keep a durable tier for unbacked rows, length-framed (v2 bytes contain `\n` and spaces, so the text spill and `tick_spill_replay` line splitting cannot carry them) |
+| CRITICAL | A deferral mark reaches disk at most once a second and `persist_now` swallows errors; a crash after the rescue floor is released lets the watermark pass the batch, the segment reads applied and is pruned | Persist and fsync the mark, check the result, only then release the floor; on failure use `note_unapplied_range` |
+| HIGH | A failed batch spans many buckets and mixes inline and dedicated rows; marking the whole range can collide and set `overflowed` | Track the exact buckets and kinds per batch |
+| HIGH | A writer that sends a row without the three arrays sets them to NULL (seen: a v1 row with the same key wiped a book) | One writer on a pinned v2 sender, guard test; the old spill replayer never points at the new table |
+| HIGH | With no version pinned the client negotiates ILP v3 and a v2 buffer fails at flush; auto mode also calls `/settings` at construction | Pin `protocol_version=2`, test it |
+| HIGH | `DEPTH_FLUSH_ROW_THRESHOLD` counts rows; 10,000 array rows ≈ 48 MB, above `MAX_DEPTH_PRODUCER_BUFFER_BYTES` (32 MiB) | Flush by bytes (8–16 MiB) and restate the queue-bytes bound |
+| MEDIUM | `/exp` exports arrays as quoted text; `/imp` refuses DOUBLE[]; `cast(text as double[])` returns NULL when the text has a `null` token | A restore step that rewrites null to NaN |
+| MEDIUM | One row inserted out of order into a 40,000-row hour partition rewrote 187 MiB | The after-close pass writes whole buckets in time order |
+| MEDIUM | Marks from before the switch would be rewritten into the new table | Route rewrites by date |
+
+Each refused level stays in its slot as NaN (reads back null; positions stay aligned), never a skipped element, so no level, side or packet is dropped.
+
+### Proposed sequence (one PR at a time)
+
+1. Length-framed binary spill tier for depth rows plus its replay (no switch yet; test with v1 rows first).
+2. New table `market_depth` successor with DOUBLE[] columns, pinned v2 sender, byte-based flush, behind `[depth] array_rows = false` (default OFF).
+3. Builders (d20, d200, inline d5 as one bid+ask row each), refold and after-close pass routed by date.
+4. Turn on after one session on the scratch table in prod (operator step), then keep the old table's rows (never deleted; retention as today).
+
+## ITEM 51 — Dhan 15:41 cross-verification hardening (2026-10-06)
+
+Approved by Parthiban 2026-10-06: "Go ahead with whatever you want dude" and "See do everything whatever is recommended dude okay?", answering the recommended cross-verification hardening list (five findings: the day marker, the read that runs too early, missing minutes that never page, a day with no run at all, and targets fixed at boot). Rule authority: `no-rest-except-live-feed-2026-06-27.md` §12.15.7 onward and the noise lock §2.5 notes, each dated and recorded before its code. Ten serial PRs, one sub-item each. Findings Verified by reading `origin/main` at `60bdfd97a`; cargo was not run for the findings.
+
+- [x] 51a — **The day marker is written atomically, read strictly, kept 400 days, and never written when audit rows were lost.** tmp + fsync + rename + folder fsync returning `io::Result<MarkerDurability>`; the reader needs the exact `delivered_date_ist=<date>` line; crossverify markers keep 400 days; a discarded or refused audit row fails the attempt (`audit_rows_lost`); a failed marker write fails the attempt (`marker_not_written`) and the next attempt is marker-only; daily-archive latch held in process; tf marker failure logged coded.
+  - Files: crates/app/src/daily_task_marker.rs, crates/app/src/dhan_live_crossverify_boot.rs, crates/app/src/daily_archive_boot.rs, crates/app/src/tf_consistency_boot.rs, crates/app/src/main.rs, crates/app/tests/tf_consistency_wiring_guard.rs, docs/claude-rules-full/project/no-rest-except-live-feed-2026-06-27.md, docs/claude-rules-full/project/dhan-rest-only-noise-lock-2026-07-14.md, docs/error-runbooks/dhan-live-crossverify-error-codes.md
+  - Tests: test_write_marker_is_atomic_leaves_no_tmp_and_complete_contents, test_write_marker_overwrites_a_stale_tmp_left_by_a_crash, test_write_marker_returns_err_on_unwritable_base, test_write_marker_returns_err_when_rename_target_is_a_directory, test_marker_exists_rejects_empty_torn_or_wrong_date_marker, test_marker_exists_accepts_the_legacy_marker_format, test_marker_exists_reads_at_most_4kib, test_sweep_removes_stale_same_task_tmp_only, test_keep_days_parameter_controls_the_sweep_horizon, test_write_marker_orders_sync_rename_dirsync, test_crossverify_marker_keep_is_short_and_keep_exceeds_every_gated_hold_lookback, test_persist_verdict_any_lost_row_is_a_failed_attempt, test_persist_report_into_counts_rows_discarded_not_batches, test_persist_rows_counter_counts_only_flushed_rows, test_next_attempt_kind_after_marker_failure_is_marker_only, test_marker_only_attempt_never_reruns_the_check, test_marker_write_needs_a_complete_run, test_marker_not_written_final_failure_pages_on_existing_xverify_failed, test_latch_marker_failure_still_latches_in_process, test_pass_marker_write_failure_is_logged_coded
+- [ ] 51b — **Attempt time bounds: every attempt ends before the 17:25 scheduled-stop window.** Each attempt runs under `tokio::time::timeout` with an end bound of 17:23 (62,580 s), the retry interval moves 900 → 760 s so four worst-case attempts still fit (56,460 + 960 + 3 × 1,720 = 62,580), and a late attempt runs with a shrunk budget instead of past the stop.
+  - Files: crates/app/src/dhan_live_crossverify_boot.rs, docs/claude-rules-full/project/no-rest-except-live-feed-2026-06-27.md
+  - Tests: named in that PR (worst-case four attempts end by 17:23; a timed-out attempt is Incomplete)
+- [ ] 51c — **Verdict and late window: a degraded run no longer hides a real divergence, and the excused end-of-day window is derived, not a literal.** The tail excuse comes from the seal constants (`LATE_SEAL_WINDOW_MINUTES`, five minutes), an `Excuse` carries why a minute was not judged, and outside the excused window a failed vendor fetch can only add `missing_rest`.
+  - Files: crates/app/src/dhan_live_crossverify.rs, crates/app/src/dhan_live_crossverify_boot.rs
+  - Tests: named in that PR (Partial never masks Diverged; the excused window equals the derived constant)
+- [ ] 51d — **Readiness before the read: the seal sweep, the seal writer and QuestDB have caught up to the close.** A static `CATCHUP_PROGRESS` publishes each completed sweep's floor cutoff (an overrun never raises it); the seal writer's drained sample and today's staged spill files are checked; `fetch_wal_tables` moves to `wal_suspension_watcher` with a new `wal_applied_through`. Earlier attempts retry before any vendor call; the last attempt proceeds with the late minutes unjudged and never pages on them.
+  - Files: crates/app/src/dhan_live_crossverify_boot.rs, crates/app/src/dhan_feed_stack.rs, crates/storage/src/wal_suspension_watcher.rs, crates/storage/src/partition_archive.rs
+  - Tests: named in that PR (an overrun never raises the published floor; not-ready retries before any REST call)
+- [ ] 51e — **Targets at fire, measured in shadow.** The live main-feed spot set is published to a dated per-day file (min-merged, like `depth-held-today.json`), the 15:41 run reads that day's own record, and coverage in planned instrument-minutes is persisted on the daily row without changing any verdict.
+  - Files: crates/app/src/dhan_live_crossverify_boot.rs, crates/app/src/dhan_live_universe.rs, crates/storage/src/dhan_live_crossverify_persistence.rs
+  - Tests: named in that PR (a widen at 15:29 does not read as full coverage; a restart keeps the earlier subscribe second)
+- [ ] 51f — **Coverage enforced: a run that did not cover the subscribed universe does not release the S3 hold.** A post-compare Clean-to-Partial downgrade (never touching Diverged) and a refusal on the four-index fallback day, which pages as a deliberate second page naming the upstream alarm.
+  - Files: crates/app/src/dhan_live_crossverify.rs, crates/app/src/dhan_live_crossverify_boot.rs, docs/claude-rules-full/project/no-rest-except-live-feed-2026-06-27.md, docs/claude-rules-full/project/dhan-rest-only-noise-lock-2026-07-14.md
+  - Tests: named in that PR (a fallback day writes no marker; Diverged is never downgraded)
+- [ ] 51g — **Catch-up and supervisor: a day with no run is found and run.** The past-day catch-up runs whatever today's marker says, days at their last chance first; the final-page state is a persisted marker; a supervisor reports at 17:24 only if the worker never reported.
+  - Files: crates/app/src/dhan_live_crossverify_boot.rs, crates/app/src/main.rs
+  - Tests: named in that PR (an afternoon boot catches up an unmarked earlier day; the supervisor fires only without a worker report)
+- [ ] 51h — **Missing minutes judged and stored in shadow.** Missing minutes are judged only when the seal pipeline is drained and QuestDB has settled; unjudged misses are stored as their own cell kind; a persisted `missing_minutes_would_page` shadow records what a page would have said. No page change.
+  - Files: crates/app/src/dhan_live_crossverify.rs, crates/storage/src/dhan_live_crossverify_persistence.rs
+  - Tests: named in that PR (an unsettled run never judges a missing minute)
+- [ ] 51i — **No-run and hold-override alarms, with the legacy-marker source split.** Markers kept since `CROSSVERIFY_MARKERS_KEPT_SINCE` are trusted for the override page; earlier days log on a separate unalarmed source, so the swept-marker residual cannot page. A new dated noise-lock section (the next free §2.x number; §2.11 is taken by the fast-lane PR) and a §2.5 note first.
+  - Files: crates/app/src/dhan_live_crossverify_boot.rs, crates/storage/src/partition_archive.rs, deploy/aws/terraform/error-code-alarms.tf, docs/claude-rules-full/project/dhan-rest-only-noise-lock-2026-07-14.md
+  - Tests: named in that PR (a pre-cutoff day never reaches the alarmed source)
+- [ ] 51j — **The missing-minutes page.** Wired only after a measured shadow baseline from 51h; a new dated noise-lock section (the next free §2.x number) first.
+  - Files: crates/app/src/dhan_live_crossverify_boot.rs, deploy/aws/terraform/error-code-alarms.tf, docs/claude-rules-full/project/dhan-rest-only-noise-lock-2026-07-14.md
+  - Tests: named in that PR (index pages need a run of two or more moving minutes)
+
+### Design
+51a (this PR, cold paths only). `daily_task_marker::write_marker_in(base, task, date, keep_days) -> io::Result<MarkerDurability>`: note whether the folder exists, create it, write `<task>-<date>.marker.tmp` (create + truncate, so a crash leftover is overwritten), `sync_all`, `rename` to the final name, then open and `sync_all` the folder (and its parent if it was just created). A failure up to the rename is `Err`; a folder-sync failure after it is `Ok(RenamedNotDirSynced)`. The reader reads at most 4 KiB and needs the exact `delivered_date_ist=<date>` line. The sweep takes `keep_days` and also removes stale same-task temp files. `write_daily_marker` (unit return) is removed; callers use `try_write_daily_marker` (7 days) or `try_write_daily_marker_keeping`. In the cross-verification task, `persist_report_into` counts rows discarded and rows flushed per flush; `persist_verdict` turns any lost row into `AuditRowsLost`; `classify_attempt` takes that verdict; `record_day` is the only marker write and maps a write error to `MarkerNotWritten`; `next_attempt_kind` makes the attempt after `MarkerNotWritten` marker-only. `CROSSVERIFY_MARKER_KEEP_DAYS = 400`, compile-time asserted above 90 + `MAX_CROSSVERIFY_HOLD_DAYS`, with a boot check (`crossverify_marker_keep_is_short`) over the gated configured hot windows. The daily archive latches the day in process before it writes its marker. 51b–51j: each PR's design is recorded in its own rule section (§12.15.8 onward) before its code; the outlines are in the sub-items above.
+### Edge Cases
+51a: a temp file left by a crash (overwritten); a directory squatting on the final path (rename fails, `Err`); a file squatting on the folder path (`Err`); an empty, torn, wrong-date or over-4-KiB marker (reads absent); the legacy two-line marker (reads present); a folder sync that fails after the rename (written, coded warn); a marker write that fails on the last attempt (pages `xverify_failed`, reason `marker_not_written`); a marker-only retry near 17:14 that no longer fits (refused by the unchanged fit check, then paged); a day with zero findings and zero tape rows (only the daily row must land). 51b–51j: listed in each PR.
+### Failure Modes
+51a: a stricter reader turns a legacy torn marker into an absent one, so today's check re-runs once (DEDUP-idempotent) and a past day takes the hold-ceiling override; the archive may re-sweep once and the timeframe check may re-send one card — all fail open. `audit_rows_lost` triggers a full retry and a vendor re-fetch, the same load as the existing `not_persisted` retry. A refusal that repeats on every attempt leaves the day unmarked until the hold ceiling. A host crash can lose a marker whose grandparent folder was just created; that only re-runs or holds the day. Markers the old 7-day sweep already deleted are not recovered (residual handled by 51i's source split).
+### Test Plan
+51a: `CARGO_INCREMENTAL=0 cargo test -p tickvault-app --lib` with filters `daily_task_marker`, `dhan_live_crossverify_boot`, `daily_archive_boot`, `tf_consistency_boot`, plus `--test tf_consistency_wiring_guard`; clippy `-D warnings` on the app lib; a bite check on one new test. 51b–51j: scoped tests named in each PR, plus the existing `test_every_xverify_alarm_source_has_a_live_error_emit`.
+### Rollback
+51a: revert the commits. The marker file format is unchanged, so markers written by either build read in the other (the old reader only checks that the file exists). No schema, table, alarm or infrastructure change. 51b–51j: each PR reverts on its own; 51i and 51j carry terraform that reverts with them.
+### Observability
+51a: no new metric name, alarm, filter or page. `xverify_failed` gains `reason` values `marker_not_written` and `audit_rows_lost`; new unalarmed `warn!` sources `xverify_attempt_marker_write_failed`, `xverify_marker_dir_sync_failed`, `xverify_marker_keep_short`, `daily_archive_latch_marker_failed`, `tf_marker_write_failed`, all coded. `tv_dhan_feed_xverify_rows_total` now counts only rows the database ACKed for the spot check; the §12.15.6 option pass still adds every row of a pass whose final flush landed, a discarded chunk included. Discards still count on `tv_dhan_live_xverify_audit_rows_discarded_total` (§2.10 `audit_rows` group). Runbook rows in `docs/error-runbooks/dhan-live-crossverify-error-codes.md` §2. 51b–51j: listed in each PR.
+
+Per-item guarantee matrix: see .claude/rules/project/per-wave-guarantee-matrix.md (15-row + 7-row), applied as for ITEM 45.
+
+## ITEM 52 — Live-socket fast lane (2026-10-06)
 
 Approved 2026-10-06 by the owner: "Go ahead with whatever you want dude" and "See do everything whatever is recommended dude okay?" (relayed to the implementing session by the coordinator's workflow; Risk: confirm against the owner thread before merge). Fifteen serial PRs from the fast-lane specs; each PR ticks its own sub-item and appends its own paragraph to each section below. No new plan file (five active plans; a sixth trips plan-gate V7).
 
-- [x] 51a — **805 probe attribution (PR 1).** A close with no code fails a running probe or release window only on the probed socket, or when another socket's drop is corroborated as an eviction (another of our sockets, not the closer and not a same-burst member, began a dial in the last 20 s), or when a dropped sibling is not back within 120 s. Before, any sibling blip after an 805 burned one of the 3 main-feed (6 depth) probes, never refunded (Verified in source at 60bdfd97a).
+- [x] 52a — **805 probe attribution (PR 1).** A close with no code fails a running probe or release window only on the probed socket, or when another socket's drop is corroborated as an eviction (another of our sockets, not the closer and not a same-burst member, began a dial in the last 20 s), or when a dropped sibling is not back within 120 s. Before, any sibling blip after an 805 burned one of the 3 main-feed (6 depth) probes, never refunded (Verified in source at 60bdfd97a).
   - Files: crates/core/src/websocket/pool_supervisor.rs, docs/claude-rules-full/project/websocket-connection-scope-lock.md, .claude/rules/project/websocket-connection-scope-lock.md, CLAUDE.md
   - Tests: test_probe_survives_one_sibling_blip_that_heals, test_probed_socket_bare_reset_still_fails, test_sibling_drop_right_after_probe_dial_fails_at_once, test_two_separate_blips_in_one_window_do_not_fail, test_flapping_sibling_is_not_cascade_evidence, test_cascade_after_burst_fails, test_simultaneous_burst_is_one_event, test_evictee_close_processed_before_evictor_dial_completes, test_unhealed_sibling_fails_at_its_own_deadline, test_pass_deferral_is_capped, test_suspect_that_parks_for_non_805_is_dropped, test_watched_idle_redial_fails_window, test_blip_then_805_fails_once_as_805, test_805_then_blip_no_double_fail, test_blip_on_watched_and_805_single_failure, test_depth_window_attribution, test_depth_window_deferred_keeps_main_waiting, test_out_of_range_slot_fails_closed, test_recent_dial_mask_on_local_table, test_record_dial_begin_ignores_out_of_range_slot, test_overflow_attribution_constants_are_locked, proptest_attribution_rules, test_overflow_attribution_call_sites_are_wired, test_overflow_episode_region_never_allocates, test_scope_lock_records_the_overflow_probe_attribution, test_deferral_cap_covers_every_note_and_its_settle, test_heal_inside_its_own_deadline_passes_after_the_settle, test_drop_during_a_deferral_keeps_its_own_deadline, test_overflow_close_route_table, test_bare_reset_glue_attributes_a_stamped_dial, test_suspect_and_park_gates_reach_the_episode, test_watched_coded_close_restarts_its_watch_once, test_watched_808_parks_and_fails_the_window, test_coded_sibling_close_is_noted_and_must_heal, test_coded_close_joins_the_burst_so_its_redial_never_corroborates, test_every_note_has_plain_words_and_no_step_does, test_watched_coded_close_joins_the_burst_so_its_redial_never_corroborates, test_watched_teardown_restarts_the_watch_once_and_never_passes_while_down
   - Review fixes (same PR, 2026-10-06): (1) the pass-deferral cap now covers each note's own deadline and settle time (notes stop at a cutoff, the window fails on a later drop); (2) the shell glue (dial stamp, close read, suspect and park gates) is factored into pure functions the tests drive; (3) a close with a code other than 805 now reaches the episodes: the probed socket's first such close restarts its watch, a second or a non-805 park fails the window, and a sibling's is noted.
   - Review round 3 (same PR, 2026-10-06): (4) the probed socket's own coded close joins the 2 s burst, so its immediate redial never corroborates a sibling's no-code close from the same incident; (5) a teardown this process starts on the probed socket (`SubscribeFailed`, or main-feed `FrameSilenceElapsed`) counts like its coded close (one shared watch restart, a second fails), so a window can no longer pass on the old first frame while the probed socket is down.
-- [ ] 51b — log-drop filter (spec fl-log-drop, PR 2).
+- [ ] 52b — log-drop filter (spec fl-log-drop, PR 2).
   - Files: filled in by its PR
   - Tests: filled in by its PR
-- [ ] 51c — reader-memory measurement (spec fl-reader-memory, PR 3).
+- [ ] 52c — reader-memory measurement (spec fl-reader-memory, PR 3).
   - Files: filled in by its PR
   - Tests: filled in by its PR
-- [ ] 51d — 808 policy, part 1 (spec fl-808, PR 4).
+- [ ] 52d — 808 policy, part 1 (spec fl-808, PR 4).
   - Files: filled in by its PR
   - Tests: filled in by its PR
-- [ ] 51e — 808 policy, part 2, incl. the stale `dhan-socket-parked` description (spec fl-808, PR 5).
+- [ ] 52e — 808 policy, part 2, incl. the stale `dhan-socket-parked` description (spec fl-808, PR 5).
   - Files: filled in by its PR
   - Tests: filled in by its PR
-- [ ] 51f — boot telemetry spawn and boot code (PR 6).
+- [ ] 52f — boot telemetry spawn and boot code (PR 6).
   - Files: filled in by its PR
   - Tests: filled in by its PR
-- [ ] 51g — data-silent detection, main feed and depth-20, shadow mode (spec fl-data-silent, PR 7).
+- [ ] 52g — data-silent detection, main feed and depth-20, shadow mode (spec fl-data-silent, PR 7).
   - Files: filled in by its PR
   - Tests: filled in by its PR
-- [ ] 51h — data-silent detection, depth-200 backstop and cross-feed check (spec fl-data-silent, PR 8).
+- [ ] 52h — data-silent detection, depth-200 backstop and cross-feed check (spec fl-data-silent, PR 8).
   - Files: filled in by its PR
   - Tests: filled in by its PR
-- [ ] 51i — live-proof gate (spec fl-live-proof, PR 9).
+- [ ] 52i — live-proof gate (spec fl-live-proof, PR 9).
   - Files: filled in by its PR
   - Tests: filled in by its PR
-- [ ] 51j — socket receive-buffer measurement (PR 10).
+- [ ] 52j — socket receive-buffer measurement (PR 10).
   - Files: filled in by its PR
   - Tests: filled in by its PR
-- [ ] 51k — EMF selection change (PR 11).
+- [ ] 52k — EMF selection change (PR 11).
   - Files: filled in by its PR
   - Tests: filled in by its PR
-- [ ] 51l — data-silent Act flip, gated on the shadow week (PR 12).
+- [ ] 52l — data-silent Act flip, gated on the shadow week (PR 12).
   - Files: filled in by its PR
   - Tests: filled in by its PR
-- [ ] 51m — live-proof page, after its decision card (spec fl-live-proof, PR 13).
+- [ ] 52m — live-proof page, after its decision card (spec fl-live-proof, PR 13).
   - Files: filled in by its PR
   - Tests: filled in by its PR
-- [ ] 51n — live-proof EMF names, after its decision card (spec fl-live-proof, PR 14).
+- [ ] 52n — live-proof EMF names, after its decision card (spec fl-live-proof, PR 14).
   - Files: filled in by its PR
   - Tests: filled in by its PR
-- [ ] 51o — WAL replay log (spec fl-wal-replay-log, PR 15).
+- [ ] 52o — WAL replay log (spec fl-wal-replay-log, PR 15).
   - Files: filled in by its PR
   - Tests: filled in by its PR
 
 ### Design
-51a: `OverflowEpisode` (pure, `Copy`, no heap) gains a per-slot suspect mask, a per-slot close stamp, a 2 s burst mask and a settle instant. `on_bare_reset(slot, recent_dials, now)` fails at once for the probed slot, for an out-of-range slot (fail closed) and when `recent_dials & !closer & !burst` is non-zero; otherwise it notes the slot. A sibling heals at its own `DialSucceeded`; `poll` fails a suspect older than 120 s, holds a pass while any suspect or settle time remains, and fails a window still unsettled 120 s after its watch would have ended. `recent_dials` comes from a static `[AtomicU64; 32]` of per-slot BeginDial instants (one Release store per dial), scanned O(32) only on a no-code close while an episode is engaged. The probed socket's idle watchdog fails its window. Verified: the change is confined to cold supervisor arms; the frame path is untouched.
-51a review fixes: notes are taken only until `OVERFLOW_PROBE_NOTE_CUTOFF_SECS` (watch + heal deadline = 240 s after the first frame); the deferral cap `OVERFLOW_PROBE_DEFERRAL_CAP_SECS` (cutoff + heal deadline + settle = 380 s) covers every note taken in time, so it is a fail-closed safety net with its own label. `overflow_close_route` routes a close (805, no code, other code, ignore); `on_coded_close` restarts the probed socket's watch once (clears its published first-frame flag) and notes a sibling; a sibling's coded close also joins the 2 s burst (`join_burst`, shared with `on_bare_reset`), so a coded closer's immediate redial never corroborates a no-code close from the same incident (Verified by test, bite-checked: without the join the test fails); `on_left` fails the window when the probed socket parks for a reason other than 805 or shutdown. The shell calls `stamp_dial_begin`, `bare_reset_recent_dials`, `published_suspect_mask`, `suspect_bit_in` and `left_reaches_episode`, the same functions the glue tests drive on local tables.
-51a review round 3: `on_coded_close` and the new `on_watched_torn_down` share `watched_went_down`, which joins the burst before restarting the watch (or fails on a second event). The state machine calls `overflow_episode_note_watched_torn_down` (same two-load gate as the idle hook) from the `SubscribeFailed` arm and, after the Live gate, from the `FrameSilenceElapsed` arm for the main feed only. Cold arms only; the frame path is untouched (Verified by `test_overflow_attribution_call_sites_are_wired`).
+52a: `OverflowEpisode` (pure, `Copy`, no heap) gains a per-slot suspect mask, a per-slot close stamp, a 2 s burst mask and a settle instant. `on_bare_reset(slot, recent_dials, now)` fails at once for the probed slot, for an out-of-range slot (fail closed) and when `recent_dials & !closer & !burst` is non-zero; otherwise it notes the slot. A sibling heals at its own `DialSucceeded`; `poll` fails a suspect older than 120 s, holds a pass while any suspect or settle time remains, and fails a window still unsettled 120 s after its watch would have ended. `recent_dials` comes from a static `[AtomicU64; 32]` of per-slot BeginDial instants (one Release store per dial), scanned O(32) only on a no-code close while an episode is engaged. The probed socket's idle watchdog fails its window. Verified: the change is confined to cold supervisor arms; the frame path is untouched.
+52a review fixes: notes are taken only until `OVERFLOW_PROBE_NOTE_CUTOFF_SECS` (watch + heal deadline = 240 s after the first frame); the deferral cap `OVERFLOW_PROBE_DEFERRAL_CAP_SECS` (cutoff + heal deadline + settle = 380 s) covers every note taken in time, so it is a fail-closed safety net with its own label. `overflow_close_route` routes a close (805, no code, other code, ignore); `on_coded_close` restarts the probed socket's watch once (clears its published first-frame flag) and notes a sibling; a sibling's coded close also joins the 2 s burst (`join_burst`, shared with `on_bare_reset`), so a coded closer's immediate redial never corroborates a no-code close from the same incident (Verified by test, bite-checked: without the join the test fails); `on_left` fails the window when the probed socket parks for a reason other than 805 or shutdown. The shell calls `stamp_dial_begin`, `bare_reset_recent_dials`, `published_suspect_mask`, `suspect_bit_in` and `left_reaches_episode`, the same functions the glue tests drive on local tables.
+52a review round 3: `on_coded_close` and the new `on_watched_torn_down` share `watched_went_down`, which joins the burst before restarting the watch (or fails on a second event). The state machine calls `overflow_episode_note_watched_torn_down` (same two-load gate as the idle hook) from the `SubscribeFailed` arm and, after the Live gate, from the `FrameSilenceElapsed` arm for the main feed only. Cold arms only; the frame path is untouched (Verified by `test_overflow_attribution_call_sites_are_wired`).
 ### Edge Cases
-51a: two separate blips in one window (each heals, no foreign dial in 20 s: pass); a flapping sibling (its own dial never corroborates its own close); a burst of closes within 2 s (one event; members' redials do not corroborate each other); the evicted socket's close processed before the evicting dial completes (BeginDial, not DialSucceeded, is the stamp); a blip then an 805, an 805 then a blip, and both on the watched socket (exactly one failure, one repark); slot 40 (fails closed); a depth window deferred while main sockets wait (main never grants: one window process-wide). Assumed: Dhan evicts at accept time, within the 15 s dial timeout of our dial.
-51a review fixes: a sibling healing inside its own deadline at F+225 passes at F+245 (the old F+240 cap failed it); a sibling dropping at F+215 while the pass is deferred keeps its own deadline (F+335); a note 1 ms before the cutoff healed 1 ms before its deadline still passes before the cap; the probed socket closing with 807 (watch restarts, needs a fresh first frame), twice (fails), with 808 (restart, then the park fails it), and with no fresh frame in time (fails as no frame), in Probing and Resuming; a sibling closing with a code (noted, must heal); a shutdown park of the probed socket (does not fail).
-51a review round 3: 800 on the probed socket then a sibling bare reset 375 ms later with the probed socket's dial stamped (noted, not failed); the reverse order and a third close inside the burst (noted); the same outside the burst (fails, corroborated); a teardown after the first frame and a poll past the OLD watch end (no pass), then no fresh frame in time (fails as no frame); a teardown then a coded close (fails); a sibling's teardown and no window running (no effect).
+52a: two separate blips in one window (each heals, no foreign dial in 20 s: pass); a flapping sibling (its own dial never corroborates its own close); a burst of closes within 2 s (one event; members' redials do not corroborate each other); the evicted socket's close processed before the evicting dial completes (BeginDial, not DialSucceeded, is the stamp); a blip then an 805, an 805 then a blip, and both on the watched socket (exactly one failure, one repark); slot 40 (fails closed); a depth window deferred while main sockets wait (main never grants: one window process-wide). Assumed: Dhan evicts at accept time, within the 15 s dial timeout of our dial.
+52a review fixes: a sibling healing inside its own deadline at F+225 passes at F+245 (the old F+240 cap failed it); a sibling dropping at F+215 while the pass is deferred keeps its own deadline (F+335); a note 1 ms before the cutoff healed 1 ms before its deadline still passes before the cap; the probed socket closing with 807 (watch restarts, needs a fresh first frame), twice (fails), with 808 (restart, then the park fails it), and with no fresh frame in time (fails as no frame), in Probing and Resuming; a sibling closing with a code (noted, must heal); a shutdown park of the probed socket (does not fail).
+52a review round 3: 800 on the probed socket then a sibling bare reset 375 ms later with the probed socket's dial stamped (noted, not failed); the reverse order and a third close inside the burst (noted); the same outside the burst (fails, corroborated); a teardown after the first frame and a poll past the OLD watch end (no pass), then no fresh frame in time (fails as no frame); a teardown then a coded close (fails); a sibling's teardown and no window running (no effect).
 ### Failure Modes
-51a: a foreign process's dial is invisible (Risk), so a single foreign eviction whose victim reconnects reads as a blip and the window can pass; the next 805 or corroborated close still fails it. Any of our sockets dialling within 20 s before an unrelated blip fails the window (errs toward fail). A box-wide network blip that also drops the probed socket still fails. A sibling that never reconnects, or keeps flapping, fails the window at its 120 s deadline or the deferral cap; a probe is never refunded.
-51a review fixes: a sibling dropping after the note cutoff (watch + 120 s after the first frame) while the pass is still deferred fails the window (`failed_deferral_exhausted`), so a flapping sibling cannot hold the one process-wide window; the window lasts at most 380 s after its first frame (Verified by `proptest_attribution_rules`). The probed socket gets ONE watch restart per window: a second coded close (for example two 807s in a row while the token refresh lags) fails it and spends the probe (Risk, accepted: errs toward fail). A coded sibling close that does not heal in 120 s (a token refresh failing for two minutes) fails the window.
-51a review round 3: the one watch restart is shared between coded closes and our own teardowns, so a token-expiry close plus a failed subscribe in one window fails it (Risk, accepted: errs toward fail). The operator-armed probe close never runs in a window (refused once `ROTATION_HALTED` is set, which every window's 805 sets; Verified in source).
+52a: a foreign process's dial is invisible (Risk), so a single foreign eviction whose victim reconnects reads as a blip and the window can pass; the next 805 or corroborated close still fails it. Any of our sockets dialling within 20 s before an unrelated blip fails the window (errs toward fail). A box-wide network blip that also drops the probed socket still fails. A sibling that never reconnects, or keeps flapping, fails the window at its 120 s deadline or the deferral cap; a probe is never refunded.
+52a review fixes: a sibling dropping after the note cutoff (watch + 120 s after the first frame) while the pass is still deferred fails the window (`failed_deferral_exhausted`), so a flapping sibling cannot hold the one process-wide window; the window lasts at most 380 s after its first frame (Verified by `proptest_attribution_rules`). The probed socket gets ONE watch restart per window: a second coded close (for example two 807s in a row while the token refresh lags) fails it and spends the probe (Risk, accepted: errs toward fail). A coded sibling close that does not heal in 120 s (a token refresh failing for two minutes) fails the window.
+52a review round 3: the one watch restart is shared between coded closes and our own teardowns, so a token-expiry close plus a failed subscribe in one window fails it (Risk, accepted: errs toward fail). The operator-armed probe close never runs in a window (refused once `ROTATION_HALTED` is set, which every window's 805 sets; Verified in source).
 ### Test Plan
-51a: `CARGO_INCREMENTAL=0 cargo test -p tickvault-core --lib overflow` and `--lib pool_supervisor`; the scope-lock guards (`tick_gap_reset_wiring_guard`, `top_volume_stock_only_guard`, `instance_type_lock_guard`); `cargo test -p tickvault-common --test claude_md_codebase_map_guard`; banned-pattern, pub-fn-test, pub-fn-wiring, plan-gate and per-item-guarantee hooks.
-51a review fixes: the same scoped commands; each fix bite-checked (old cap, a dropped `* 1_000`, a watched park that does not fail: 7 tests fail, restored: all pass).
-51a review round 3: the same scoped commands; bite-checked (without the burst join and the `SubscribeFailed` hook, three tests fail: the two new ones and the wiring pin); `proptest_attribution_rules` gains the teardown op and asserts no burst member's dial corroborates.
+52a: `CARGO_INCREMENTAL=0 cargo test -p tickvault-core --lib overflow` and `--lib pool_supervisor`; the scope-lock guards (`tick_gap_reset_wiring_guard`, `top_volume_stock_only_guard`, `instance_type_lock_guard`); `cargo test -p tickvault-common --test claude_md_codebase_map_guard`; banned-pattern, pub-fn-test, pub-fn-wiring, plan-gate and per-item-guarantee hooks.
+52a review fixes: the same scoped commands; each fix bite-checked (old cap, a dropped `* 1_000`, a watched park that does not fail: 7 tests fail, restored: all pass).
+52a review round 3: the same scoped commands; bite-checked (without the burst join and the `SubscribeFailed` hook, three tests fail: the two new ones and the wiring pin); `proptest_attribution_rules` gains the teardown op and asserts no burst member's dial corroborates.
 ### Rollback
-51a: revert the commit. No schema, data, config or infrastructure change; the episodes go back to failing on any no-code close.
-51a review fixes: revert with the 51a commits; no data or config change.
-51a review round 3: revert its commit; no data or config change.
+52a: revert the commit. No schema, data, config or infrastructure change; the episodes go back to failing on any no-code close.
+52a review fixes: revert with the 52a commits; no data or config change.
+52a review round 3: revert its commit; no data or config change.
 ### Observability
-51a: five new outcome labels on the existing `tv_dhan_ws_overflow_probe_total` / `tv_dhan_ws_depth_overflow_probe_total` counters (`sibling_reset_noted`, `sibling_healed`, `failed_eviction_corroborated`, `failed_sibling_unhealed`, `failed_watched_silent`); the two notes log a coded `warn!`, the failures a coded `error!`, both with `sibling_connection`. Prometheus only: no page, alarm, EMF name or Telegram change.
-51a review fixes: three more labels on the same two counters: `watched_restarted` (a note, coded `warn!`), `failed_watched_closed` and `failed_deferral_exhausted` (coded `error!`). Prometheus only: no page, alarm, EMF name or Telegram change.
-51a review round 3: no new label; the teardown reuses `watched_restarted` / `failed_watched_closed`, whose plain-words text now names it. Prometheus only: no page, alarm, EMF name or Telegram change.
+52a: five new outcome labels on the existing `tv_dhan_ws_overflow_probe_total` / `tv_dhan_ws_depth_overflow_probe_total` counters (`sibling_reset_noted`, `sibling_healed`, `failed_eviction_corroborated`, `failed_sibling_unhealed`, `failed_watched_silent`); the two notes log a coded `warn!`, the failures a coded `error!`, both with `sibling_connection`. Prometheus only: no page, alarm, EMF name or Telegram change.
+52a review fixes: three more labels on the same two counters: `watched_restarted` (a note, coded `warn!`), `failed_watched_closed` and `failed_deferral_exhausted` (coded `error!`). Prometheus only: no page, alarm, EMF name or Telegram change.
+52a review round 3: no new label; the teardown reuses `watched_restarted` / `failed_watched_closed`, whose plain-words text now names it. Prometheus only: no page, alarm, EMF name or Telegram change.
 
 Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
