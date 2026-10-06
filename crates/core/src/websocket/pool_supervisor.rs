@@ -3322,9 +3322,33 @@ fn suspect_bit_set(global_index: u8) -> bool {
 /// First frame of a dial: one relaxed load; a store only for the watched
 /// socket. Lock-free on the read task.
 fn overflow_episode_note_first_frame(global_index: u8) {
-    if OVERFLOW_WATCHED_SLOT.load(std::sync::atomic::Ordering::Acquire) == global_index {
-        OVERFLOW_WATCHED_FIRST_FRAME.store(global_index, std::sync::atomic::Ordering::Release);
+    first_frame_note_in(
+        &OVERFLOW_WATCHED_SLOT,
+        &OVERFLOW_WATCHED_FIRST_FRAME,
+        global_index,
+    );
+}
+
+/// The read-task half of the first-frame report, over the words passed in:
+/// `global_index` stores ITS OWN slot into `first_frame_word`, and only when
+/// `watched_word` names it. O(1), one Acquire load and at most one store.
+fn first_frame_note_in(
+    watched_word: &std::sync::atomic::AtomicU8,
+    first_frame_word: &std::sync::atomic::AtomicU8,
+    global_index: u8,
+) {
+    if watched_word.load(std::sync::atomic::Ordering::Acquire) == global_index {
+        first_frame_word.store(global_index, std::sync::atomic::Ordering::Release);
     }
+}
+
+/// The poll half: whether `first_frame_word` reports a first frame for
+/// `watched`, the slot under watch NOW. Equality, not "any slot": a late
+/// store from the previous window's socket carries that socket's slot and so
+/// never reads as the new window's first frame (round 9). O(1), one Acquire
+/// load.
+fn first_frame_seen_for(first_frame_word: &std::sync::atomic::AtomicU8, watched: u8) -> bool {
+    first_frame_word.load(std::sync::atomic::Ordering::Acquire) == watched
 }
 
 /// A socket parked for 805 and will wait for a grant from its pool's episode.
@@ -3340,7 +3364,7 @@ fn overflow_episode_note_parked(endpoint: DhanEndpointType, global_index: u8) {
 fn overflow_episode_poll(now: Instant, window_open: bool) {
     overflow_episode_step(false, |eps| {
         if let Some(watched) = eps.watched()
-            && OVERFLOW_WATCHED_FIRST_FRAME.load(std::sync::atomic::Ordering::Acquire) == watched
+            && first_frame_seen_for(&OVERFLOW_WATCHED_FIRST_FRAME, watched)
         {
             eps.on_first_frame(watched, now);
         }
@@ -22584,6 +22608,56 @@ mod tests {
             )
             .contains("suspect_bit_in(&OVERFLOW_SUSPECT_MASK, global_index)")
         );
+    }
+
+    /// Round 9 review follow-up: the first-frame word holds the reporting
+    /// SLOT, and the poll stamps only when it equals the slot under watch. A
+    /// store from the previous window's socket (it read itself as watched
+    /// just before a pass granted the next socket and cleared the word) must
+    /// never stamp a first frame for the new window.
+    #[test]
+    fn test_regression_stale_first_frame_from_previous_window_never_stamps_the_new_one() {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        let watched_word = AtomicU8::new(u8::MAX);
+        let first_frame = AtomicU8::new(u8::MAX);
+        // No window: nothing is watched, so no slot reports and none reads seen.
+        first_frame_note_in(&watched_word, &first_frame, 3);
+        assert_eq!(first_frame.load(Ordering::Acquire), u8::MAX);
+        // Window A watches slot 3. Another slot's frame is not a report.
+        watched_word.store(3, Ordering::Release);
+        first_frame_note_in(&watched_word, &first_frame, 7);
+        assert!(!first_frame_seen_for(&first_frame, 3));
+        // Slot 3's own first frame is seen for window A.
+        first_frame_note_in(&watched_word, &first_frame, 3);
+        assert!(first_frame_seen_for(&first_frame, 3));
+        // A pass grants slot 5: the step clears the word and publishes 5.
+        first_frame.store(u8::MAX, Ordering::Release);
+        watched_word.store(5, Ordering::Release);
+        assert!(!first_frame_seen_for(&first_frame, 5));
+        // The late store from slot 3 lands after the clear: it read the
+        // watched word (3) before the pass, and stores its own slot.
+        first_frame.store(3, Ordering::Release);
+        assert!(
+            !first_frame_seen_for(&first_frame, 5),
+            "a stale store from the previous window's slot stamped the new window"
+        );
+        // Slot 3 re-reading now (watched = 5) does not report at all.
+        first_frame.store(u8::MAX, Ordering::Release);
+        first_frame_note_in(&watched_word, &first_frame, 3);
+        assert_eq!(first_frame.load(Ordering::Acquire), u8::MAX);
+        // Slot 5's own first frame is seen for window B.
+        first_frame_note_in(&watched_word, &first_frame, 5);
+        assert!(first_frame_seen_for(&first_frame, 5));
+        assert!(!first_frame_seen_for(&first_frame, 3));
+        // The production paths go through these helpers over the statics.
+        let src = include_str!("pool_supervisor.rs");
+        let marker = concat!("#[cfg(", "test)]");
+        let prod = src.split(marker).next().unwrap_or(src);
+        assert!(prod.contains(concat!(
+            "first_frame_note_in(\n        &OVERFLOW_WATCHED_SLOT,\n",
+            "        &OVERFLOW_WATCHED_FIRST_FRAME,"
+        )));
+        assert!(prod.contains("first_frame_seen_for(&OVERFLOW_WATCHED_FIRST_FRAME, watched)"));
     }
 
     #[test]

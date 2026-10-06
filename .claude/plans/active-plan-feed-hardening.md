@@ -6524,6 +6524,6 @@ Approved 2026-10-06 by the owner: "Go ahead with whatever you want dude" and "Se
 52a review round 6: no new label, counter, page, alarm or filter; a note refused past the grant cutoff ends as `failed_deferral_exhausted`.
 52a review round 7: no new label, counter, page, alarm or filter; the failure that leads to the held state is already logged once.
 52a review round 8: no new label, counter, page, alarm or filter.
-52a review round 9: one new outcome label, `held_after_failed_window`, on the existing `tv_dhan_ws_overflow_probe_total` / `tv_dhan_ws_depth_overflow_probe_total` counters (a note, coded `warn!` with `WS-GAP-03`, at most once per held state). The note lines now read "... after an 805: <detail>". A late heal reuses `failed_sibling_unhealed`. Prometheus only: no page, alarm, EMF name, filter or Telegram change.
+52a review round 9: one new outcome label, `held_after_failed_window`, on the existing `tv_dhan_ws_overflow_probe_total` / `tv_dhan_ws_depth_overflow_probe_total` counters (a note, coded `warn!` with `WS-GAP-01`, at most once per held state). The note lines now read "... after an 805: <detail>". A late heal reuses `failed_sibling_unhealed`. Prometheus only: no page, alarm, EMF name, filter or Telegram change.
 
 Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
