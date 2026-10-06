@@ -657,48 +657,44 @@ struct LocalReconcileReport {
 
 /// Compares (leg 1) the runtime's FillEvent-folded net-lots mirror against
 /// the risk engine's positions over the UNION of both key sets, and
-/// (leg 2, C7) the per-sid signed fold of every tracked order's cumulative
-/// `traded_qty` lots against the risk engine's net lots.
+/// (leg 2, C7) the per-instrument signed fold of every tracked order's
+/// cumulative `traded_qty` lots against the risk engine's net lots.
 ///
 /// Leg-2 honesty: valid for the DRY-RUN book (PAPER order ids never
 /// re-index, so `all_orders()` holds one entry per order); the live-mode
 /// correlation re-index keeps a stale clone under the old order_no and
 /// would double-count — the caller only runs this in dry-run.
 ///
-/// # I-P1-11 coverage, stated honestly (2026-08-29)
-/// Both legs compare BARE-SID SUMS, via `net_lots_for_any_segment`. That is
-/// forced, not chosen: the mirror folds `FillEvent`s per sid, and leg 2 folds
-/// `ManagedOrder.traded_qty` — and `ManagedOrder` has no segment field at all.
-/// Summing the engine's composite rows back down to a bare sid is the only
-/// comparison that is apples-to-apples against either input.
+/// # I-P1-11 coverage (audit M7, 2026-10-04)
+/// Both legs compare per COMPOSITE `(security_id, segment)` instrument: the
+/// mirror is keyed on the segment `apply_fill` books to, and every
+/// `ManagedOrder` now records the segment it was placed in. So a fill booked
+/// to the wrong segment row now shows as a divergence on both rows. Until
+/// 2026-10-04 both legs compared bare-sid sums (`ManagedOrder` had no segment
+/// field), which a cross-segment mis-booking left unchanged.
 ///
-/// The consequence is worth naming rather than leaving to be discovered: this
-/// reconcile CANNOT detect a cross-segment mis-booking. If a fill for
-/// `(27, NseEquity)` were booked to `(27, IdxI)`, both legs would still balance,
-/// because the sum over segments is unchanged. What catches that is
-/// `observe_segment`'s collision counter and the fact that the fill path now
-/// carries the segment through to the engine — not this check. This reconcile
-/// answers "did every fill reach the engine", which is a different question.
+/// # Performance
+/// O(mirror + positions + orders), cold: runs on the reconcile heartbeat.
 fn local_reconcile(
     oms: &OrderManagementSystem,
     risk: &RiskEngine,
-    mirror: &HashMap<u64, i64>,
+    mirror: &HashMap<(u64, ExchangeSegment), i64>,
 ) -> LocalReconcileReport {
     let mut report = LocalReconcileReport::default();
     // Leg 1: mirror vs risk over the UNION of keys (C7 — a risk-side
     // position absent from the mirror is a divergence too).
-    let mut sids: HashSet<u64> = mirror.keys().copied().collect();
-    sids.extend(risk.tracked_security_ids());
-    for &sid in &sids {
+    let mut keys: HashSet<(u64, ExchangeSegment)> = mirror.keys().copied().collect();
+    keys.extend(risk.position_keys());
+    for &(sid, segment) in &keys {
         report.sids_checked += 1;
-        let mirror_lots = mirror.get(&sid).copied().unwrap_or(0);
-        if risk.net_lots_for_any_segment(sid) != mirror_lots {
+        let mirror_lots = mirror.get(&(sid, segment)).copied().unwrap_or(0);
+        if i64::from(risk.net_lots_for_in_segment(sid, segment)) != mirror_lots {
             report.divergences += 1;
         }
     }
-    // Leg 2: per-sid signed order fold (floor of cumulatives — the same
-    // math the engine's fill delta uses) vs risk net lots.
-    let mut folded: HashMap<u64, i64> = HashMap::with_capacity(mirror.len());
+    // Leg 2: per-instrument signed order fold (floor of cumulatives — the
+    // same math the engine's fill delta uses) vs risk net lots.
+    let mut folded: HashMap<(u64, ExchangeSegment), i64> = HashMap::with_capacity(mirror.len());
     for order in oms.all_orders().values() {
         let lot = i64::from(order.lot_size.max(1));
         let lots = order.traded_qty.max(0) / lot;
@@ -706,13 +702,15 @@ fn local_reconcile(
             TransactionType::Buy => lots,
             TransactionType::Sell => -lots,
         };
-        *folded.entry(order.security_id).or_insert(0) += signed;
+        *folded
+            .entry((order.security_id, order.exchange_segment))
+            .or_insert(0) += signed;
     }
-    let mut fold_sids: HashSet<u64> = folded.keys().copied().collect();
-    fold_sids.extend(risk.tracked_security_ids());
-    for &sid in &fold_sids {
-        let fold_lots = folded.get(&sid).copied().unwrap_or(0);
-        if risk.net_lots_for_any_segment(sid) != fold_lots {
+    let mut fold_keys: HashSet<(u64, ExchangeSegment)> = folded.keys().copied().collect();
+    fold_keys.extend(risk.position_keys());
+    for &(sid, segment) in &fold_keys {
+        let fold_lots = folded.get(&(sid, segment)).copied().unwrap_or(0);
+        if i64::from(risk.net_lots_for_in_segment(sid, segment)) != fold_lots {
             report.order_fold_divergences += 1;
         }
     }
@@ -796,11 +794,12 @@ impl SelfTestState {
 
 /// Book-side runtime state folded by the loop arms.
 struct BookState {
-    /// Σ FillEvent net-lots mirror per sid (the local reconcile invariant).
-    /// I-P1-11 note: sid-keyed by design THIS PR — the first-seen-segment
-    /// tripwire below makes a cross-segment collision LOUD; the composite
-    /// key rewrite is the mandatory pre-live follow-up.
-    mirror: HashMap<u64, i64>,
+    /// Σ FillEvent net-lots mirror per COMPOSITE `(security_id, segment)`
+    /// instrument (the local reconcile invariant). Keyed on the same row the
+    /// risk engine books the fill to, so a fill on one segment can never
+    /// balance a position on another (I-P1-11, audit M7 2026-10-04; it was
+    /// keyed on the bare sid until then).
+    mirror: HashMap<(u64, ExchangeSegment), i64>,
     /// First-seen segment code per sid (the I-P1-11 tripwire). Footprint
     /// (HP-6): while armed, EVERY sid the tap forwards gets an entry — the
     /// mark source is the DHAN per-minute REST legs (≤4 spot indices + the
@@ -813,12 +812,14 @@ struct BookState {
     /// counter keeps counting per event; the LOG fires once per sid per
     /// day (audit-findings Rule 4 — edge-triggered alerts only).
     tripwire_reported: HashSet<u64>,
-    /// HP-2: sid → pending PAPER order ids — the O(1) per-mark filler
-    /// index. REBUILT (O(N_all_orders), cold — order events are low-rate)
+    /// HP-2: composite `(security_id, segment)` → pending PAPER order ids —
+    /// the O(1) per-mark filler index. Composite since audit M7 (2026-10-04):
+    /// `ManagedOrder` records its segment, so a mark on another segment of the
+    /// same numeric id finds nothing to fill. REBUILT (O(N_all_orders), cold — order events are low-rate)
     /// via [`Self::rebuild_pending_paper`] after every order-mutating
     /// event; per-mark reads are one HashMap lookup, zero alloc on the
     /// no-pending path.
-    pending_paper: HashMap<u64, Vec<String>>,
+    pending_paper: HashMap<(u64, ExchangeSegment), Vec<String>>,
 }
 
 impl BookState {
@@ -917,17 +918,18 @@ impl BookState {
         for order in oms.all_orders().values() {
             if !order.is_terminal() && order.order_id.starts_with("PAPER-") {
                 self.pending_paper
-                    .entry(order.security_id)
+                    .entry((order.security_id, order.exchange_segment))
                     .or_default()
                     .push(order.order_id.clone());
             }
         }
     }
 
-    /// O(1) per-mark check: does this sid have a pending paper order?
-    fn has_pending_paper(&self, sid: u64) -> bool {
+    /// O(1) per-mark check: does this composite instrument have a pending
+    /// paper order?
+    fn has_pending_paper(&self, sid: u64, segment: ExchangeSegment) -> bool {
         // Entries are inserted non-empty by construction (rebuild).
-        self.pending_paper.contains_key(&sid)
+        self.pending_paper.contains_key(&(sid, segment))
     }
 
     /// Records the segment this numeric `security_id` was seen in, and reports
@@ -998,36 +1000,6 @@ impl BookState {
                 }
             }
         }
-    }
-
-    /// Does this event's segment match the one this numeric sid was FIRST seen
-    /// in? Unknown sid, or an unmappable code, answers `true`.
-    ///
-    /// # Why this survived the tripwire's disarming (2026-08-29)
-    /// `observe_segment` stopped refusing events because the risk engine now
-    /// keys the composite `(security_id, segment)` row, so two segments no
-    /// longer net. That reasoning covers the ENGINE. It does not cover
-    /// `pending_paper`, which is keyed on the bare `security_id` because
-    /// `ManagedOrder` carries no segment at all — so `has_pending_paper` cannot
-    /// tell an IdxI order from an NseEquity one on the same numeric id.
-    ///
-    /// Without this gate, disarming the tripwire would OPEN a path that has
-    /// never been reachable: a mark arriving on segment B would fill a pending
-    /// paper order actually placed on segment A, and `synthesize_paper_fill`
-    /// stamps the fill with the MARK's segment — booking the position to the
-    /// wrong composite row at the very moment the composite row started
-    /// mattering. The old refusal was load-bearing for exactly this one path
-    /// and for nothing else, so it is kept here and only here.
-    ///
-    /// # Performance
-    /// O(1) — one hash lookup.
-    fn segment_matches_first_seen(&self, sid: u64, segment_code: u8) -> bool {
-        if segment_code == SEGMENT_CODE_UNKNOWN {
-            return true;
-        }
-        self.tripwire
-            .get(&sid)
-            .is_none_or(|&first| first == segment_code)
     }
 }
 
@@ -1222,7 +1194,10 @@ fn apply_fill(
     // ceiling, which stops the inflow. `can_admit_sid` still bounds the
     // tripwire, whose growth axis is different (every cadence-fetched contract
     // id, fill or no fill).
-    *book.mirror.entry(fill.security_id).or_insert(0) += i64::from(fill.fill_lots);
+    *book
+        .mirror
+        .entry((fill.security_id, fill_segment))
+        .or_insert(0) += i64::from(fill.fill_lots);
     let kind = if fill.order_id.starts_with("PAPER-") {
         "paper"
     } else {
@@ -1628,8 +1603,11 @@ async fn process_mark(
     // order reach the risk engine's market_prices map (keeps it small).
     // HP-2: both checks are O(1) lookups — NO per-mark scan/alloc over the
     // whole order book (the pending index is rebuilt on order events).
-    let has_position = risk.net_lots_for_any_segment(mark.security_id) != 0;
-    let has_pending_paper = book.has_pending_paper(mark.security_id);
+    // Composite lookups (audit M7): a position or pending order on another
+    // segment of the same numeric id is a different instrument and must not
+    // admit this mark.
+    let has_position = risk.net_lots_for_in_segment(mark.security_id, mark_segment) != 0;
+    let has_pending_paper = book.has_pending_paper(mark.security_id, mark_segment);
     if !(has_position || has_pending_paper) {
         return;
     }
@@ -1646,22 +1624,19 @@ async fn process_mark(
     // Next-mark paper filler (F12 fill-once: the pending index holds
     // non-terminal PAPER orders only, and a filled order goes terminal
     // Traded + drops out on the rebuild).
-    // `pending_paper` is bare-sid (ManagedOrder has no segment), so a mark on
-    // a DIFFERENT segment of the same numeric id must not fill this order —
-    // `synthesize_paper_fill` would stamp the fill with the mark's segment and
-    // book the position to the wrong composite row. See
-    // `segment_matches_first_seen`.
-    if paper_fill
-        && oms.is_dry_run()
-        && has_pending_paper
-        && book.segment_matches_first_seen(mark.security_id, mark.segment_code)
-    {
-        // Cold branch by construction (only reached when THIS sid has a
-        // pending paper order); the id Vec clone is bounded by that sid's
-        // pending count (1-2 in practice — self-test legs).
+    // `pending_paper` is keyed on the composite `(security_id, segment)` since
+    // audit M7 (2026-10-04), so a mark on a DIFFERENT segment of the same
+    // numeric id finds no pending order here and cannot fill one placed on
+    // another segment (`synthesize_paper_fill` stamps the MARK's segment).
+    // Until then the index was bare-sid and `segment_matches_first_seen`
+    // closed that path; the key now closes it by construction.
+    if paper_fill && oms.is_dry_run() && has_pending_paper {
+        // Cold branch by construction (only reached when THIS instrument has
+        // a pending paper order); the id Vec clone is bounded by its pending
+        // count (1-2 in practice — self-test legs).
         let pending: Vec<String> = book
             .pending_paper
-            .get(&mark.security_id)
+            .get(&(mark.security_id, mark_segment))
             .cloned()
             .unwrap_or_default();
         for order_id in pending {
@@ -2002,6 +1977,7 @@ async fn start_self_test_entry(
 ) {
     let request = PlaceOrderRequest {
         security_id: sid,
+        exchange_segment: tickvault_common::types::ExchangeSegment::IdxI,
         transaction_type: TransactionType::Buy,
         order_type: OrderType::Market,
         product_type: ProductType::Intraday,
@@ -2059,6 +2035,7 @@ async fn advance_self_test_on_fill(
             // Place the close (opposite side, same 1-lot size).
             let request = PlaceOrderRequest {
                 security_id: sid,
+                exchange_segment: tickvault_common::types::ExchangeSegment::IdxI,
                 transaction_type: TransactionType::Sell,
                 order_type: OrderType::Market,
                 product_type: ProductType::Intraday,
@@ -2213,6 +2190,7 @@ mod tests {
     ) -> String {
         oms.place_order(PlaceOrderRequest {
             security_id: sid,
+            exchange_segment: tickvault_common::types::ExchangeSegment::IdxI,
             transaction_type: side,
             order_type: OrderType::Market,
             product_type: ProductType::Intraday,
@@ -2370,7 +2348,7 @@ mod tests {
         };
         assert!(apply_fill(&mut risk, &mut book, &fill, None));
         assert_eq!(risk.net_lots_for(13), 2, "fill must reach the risk engine");
-        assert_eq!(book.mirror.get(&13), Some(&2));
+        assert_eq!(book.mirror.get(&(13, ExchangeSegment::IdxI)), Some(&2));
     }
     /// I-P1-11 BITE TEST (2026-08-29): a long in one segment and a short in
     /// another, on the SAME numeric id, must not net.
@@ -2435,17 +2413,16 @@ mod tests {
         );
     }
 
-    /// BITE TEST for the paper-filler segment gate (2026-08-29).
-    ///
-    /// `pending_paper` is keyed on the bare `security_id` because
-    /// `ManagedOrder` has no segment field. Disarming the old tripwire removed
-    /// the accident that kept this path shut, so the gate is what keeps it shut
-    /// deliberately: a mark on segment B must not fill an order placed on
+    /// BITE TEST: a mark on segment B must not fill a paper order placed on
     /// segment A, because `synthesize_paper_fill` stamps the fill with the
     /// MARK's segment and would book the position to the wrong composite row.
     ///
-    /// Delete the `segment_matches_first_seen` clause in `process_mark` and
-    /// this test fails: the NSE_EQ mark fills the IDX_I order.
+    /// Since audit M7 (2026-10-04) `ManagedOrder` records its segment and
+    /// `pending_paper` is keyed on `(security_id, segment)`, so the KEY keeps
+    /// this path shut. The sid is deliberately NOT pre-observed on any segment:
+    /// the old `segment_matches_first_seen` gate relied on that observation,
+    /// and the key must hold without it. Key `pending_paper` on the bare sid
+    /// again and this test fails: the NSE_EQ mark fills the IDX_I order.
     #[tokio::test]
     async fn a_mark_on_another_segment_must_not_fill_a_pending_paper_order() {
         let ctx = make_ctx();
@@ -2454,12 +2431,10 @@ mod tests {
         let mut book = BookState::new();
         let mut self_test = SelfTestState::new();
 
-        // The sid is first seen on IDX_I — as it would be from its own mark.
-        book.observe_segment(27, 0);
-
         let order_id = oms
             .place_order(PlaceOrderRequest {
                 security_id: 27,
+                exchange_segment: tickvault_common::types::ExchangeSegment::IdxI,
                 transaction_type: TransactionType::Buy,
                 order_type: OrderType::Market,
                 product_type: ProductType::Intraday,
@@ -2473,7 +2448,11 @@ mod tests {
             .await
             .expect("paper placement never fails"); // APPROVED: test
         book.rebuild_pending_paper(&oms);
-        assert!(book.has_pending_paper(27));
+        assert!(book.has_pending_paper(27, ExchangeSegment::IdxI));
+        assert!(
+            !book.has_pending_paper(27, ExchangeSegment::NseEquity),
+            "the pending index is per composite instrument"
+        );
 
         // A mark for the SAME numeric id on a DIFFERENT segment.
         process_mark(
@@ -2502,7 +2481,7 @@ mod tests {
             "and no position may be booked on any segment"
         );
 
-        // The order's OWN segment still fills it — the gate blocks the wrong
+        // The order's OWN segment still fills it — the key blocks the wrong
         // segment, it does not break the right one.
         process_mark(
             &mut oms,
@@ -2536,16 +2515,6 @@ mod tests {
         );
         book.observe_segment(13, 0);
         assert_eq!(book.tripwire.get(&13), Some(&0));
-        assert!(book.segment_matches_first_seen(13, 0));
-        assert!(
-            book.segment_matches_first_seen(13, SEGMENT_CODE_UNKNOWN),
-            "unknown is compatible with anything"
-        );
-        assert!(
-            !book.segment_matches_first_seen(13, 2),
-            "a real divergence must still be reported as a mismatch — this is \
-             what stops a segment-2 mark filling a segment-0 pending order"
-        );
     }
 
     // -------------------------------------------------------------------
@@ -2557,6 +2526,7 @@ mod tests {
             order_id: order_id.to_string(),
             correlation_id: "corr".to_string(),
             security_id: 13,
+            exchange_segment: tickvault_common::types::ExchangeSegment::IdxI,
             transaction_type: side,
             order_type: OrderType::Market,
             product_type: ProductType::Intraday,
@@ -2634,9 +2604,49 @@ mod tests {
         assert_eq!(ok.divergences, 0, "mirror==net_lots after a clean fill");
         assert_eq!(ok.order_fold_divergences, 0, "order fold matches too");
         // Poison the mirror → the mirror leg must flag it.
-        book.mirror.insert(13, 99);
+        book.mirror.insert((13, ExchangeSegment::IdxI), 99);
         let bad = local_reconcile(&oms, &risk, &book.mirror);
         assert_eq!(bad.divergences, 1, "a poisoned mirror must be flagged");
+    }
+
+    /// Audit M7 (2026-10-04): a fill booked to the WRONG segment of the same
+    /// numeric id is now a divergence. The order is placed on IDX_I; its fill
+    /// arrives stamped NSE_EQ, so risk and the mirror book it to `(13, NSE_EQ)`.
+    /// The order fold puts it on `(13, IDX_I)`, so both rows disagree.
+    ///
+    /// The old bare-sid reconcile summed every segment of id 13 on both sides
+    /// (1 == 1) and reported zero divergences; key the order fold on the bare
+    /// sid again and this test fails.
+    #[tokio::test]
+    async fn test_local_reconcile_catches_a_fill_booked_to_the_wrong_segment() {
+        let mut oms = make_oms();
+        let mut risk = make_risk();
+        let mut book = BookState::new();
+        let order_id = place_paper(&mut oms, 13, TransactionType::Buy).await;
+        let order = oms.order(&order_id).cloned().expect("tracked"); // APPROVED: test
+        assert_eq!(order.exchange_segment, ExchangeSegment::IdxI);
+        // Segment code 1 = NSE_EQ: the fill names another instrument.
+        let synthetic = synthesize_paper_fill(&order, 100.0, 1).expect("fill"); // APPROVED: test
+        let fill = oms
+            .handle_order_update(&synthetic)
+            .ok()
+            .flatten()
+            .expect("fill event"); // APPROVED: test
+        assert!(apply_fill(&mut risk, &mut book, &fill, None));
+        assert_eq!(
+            risk.net_lots_for_in_segment(13, ExchangeSegment::NseEquity),
+            1,
+            "the fill is booked where its segment says"
+        );
+        let report = local_reconcile(&oms, &risk, &book.mirror);
+        assert_eq!(
+            report.divergences, 0,
+            "mirror and risk move together, so leg 1 agrees"
+        );
+        assert_eq!(
+            report.order_fold_divergences, 2,
+            "the order's IDX_I row and the fill's NSE_EQ row both disagree"
+        );
     }
 
     /// C7 second leg: a fill LOST between the engine and `record_fill` (the
@@ -3134,6 +3144,7 @@ mod tests {
         let order_id = oms
             .place_order(PlaceOrderRequest {
                 security_id: 13,
+                exchange_segment: tickvault_common::types::ExchangeSegment::IdxI,
                 transaction_type: TransactionType::Buy,
                 order_type: OrderType::Market,
                 product_type: ProductType::Intraday,
@@ -3147,7 +3158,7 @@ mod tests {
             .await
             .expect("paper placement never fails"); // APPROVED: test
         book.rebuild_pending_paper(&oms);
-        assert!(book.has_pending_paper(13));
+        assert!(book.has_pending_paper(13, ExchangeSegment::IdxI));
 
         // 2. FILL: a mark @400 through the REAL arm-2 body — the paper
         //    filler synthesizes the fill through the canonical arm-1 path.
@@ -3271,18 +3282,21 @@ mod tests {
     async fn test_pending_paper_index_tracks_placements_and_fills() {
         let mut oms = make_oms();
         let mut book = BookState::new();
-        assert!(!book.has_pending_paper(13));
+        assert!(!book.has_pending_paper(13, ExchangeSegment::IdxI));
         let order_id = place_paper(&mut oms, 13, TransactionType::Buy).await;
         book.rebuild_pending_paper(&oms);
-        assert!(book.has_pending_paper(13));
-        assert!(!book.has_pending_paper(14), "index is per-sid");
+        assert!(book.has_pending_paper(13, ExchangeSegment::IdxI));
+        assert!(
+            !book.has_pending_paper(14, ExchangeSegment::IdxI),
+            "index is per-sid"
+        );
         // Fill → terminal → drops out on rebuild.
         let order = oms.order(&order_id).cloned().expect("tracked"); // APPROVED: test
         let synthetic = synthesize_paper_fill(&order, 100.0, 0).expect("fill"); // APPROVED: test
         let _ = oms.handle_order_update(&synthetic);
         book.rebuild_pending_paper(&oms);
         assert!(
-            !book.has_pending_paper(13),
+            !book.has_pending_paper(13, ExchangeSegment::IdxI),
             "a terminal order must leave the pending index"
         );
     }
@@ -3328,7 +3342,7 @@ mod tests {
              (a later paper fill would open a ghost position — C6)"
         );
         assert!(
-            !book.has_pending_paper(13),
+            !book.has_pending_paper(13, ExchangeSegment::IdxI),
             "the pending index must drop the cancelled order"
         );
     }
@@ -3365,7 +3379,10 @@ mod tests {
         .await;
         assert_eq!(self_test.phase, SelfTestPhase::Idle);
         assert_eq!(self_test.last_run_day, today, "the skip latches the day");
-        assert!(!book.has_pending_paper(13), "no order was ever placed");
+        assert!(
+            !book.has_pending_paper(13, ExchangeSegment::IdxI),
+            "no order was ever placed"
+        );
     }
 
     /// 2026-09-23: with the mark channel closed the self-test must never
@@ -3617,8 +3634,10 @@ mod tests {
         // A pending paper order for sid 555 WITHOUT any position — the mark
         // passes the has_pending_paper gate, but emit_leg_pnl finds no
         // position entry and must emit nothing.
-        book.pending_paper
-            .insert(555, vec!["PAPER-PEND".to_string()]);
+        book.pending_paper.insert(
+            (555, ExchangeSegment::NseFno),
+            vec!["PAPER-PEND".to_string()],
+        );
         process_mark(
             &mut oms,
             &mut risk,
@@ -3721,7 +3740,7 @@ mod tests {
         // Risk recorded it, so the mirror MUST have recorded it too.
         assert_eq!(risk.net_lots_for(42), 3, "risk always records the fill");
         assert_eq!(
-            book.mirror.get(&42),
+            book.mirror.get(&(42, ExchangeSegment::IdxI)),
             Some(&3),
             "the mirror must move with risk — a refused mirror key is read as 0 \
              and reported as a permanent divergence"

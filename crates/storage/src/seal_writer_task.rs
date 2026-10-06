@@ -362,6 +362,13 @@ pub const SEAL_REPLAYING_SUBDIR: &str = "replaying";
 /// never re-inject.
 pub const SEAL_ARCHIVE_SUBDIR: &str = "archive";
 
+/// Kept-for-good directory (PR40b-f, 2026-10-04): a file a recovery path
+/// finished with while some of its seals could not be decoded or were refused
+/// by the writer or the database. Those seals are in no other place, so the
+/// retention sweep never deletes this folder; the cold uploader copies it.
+/// Never re-globbed, like `archive/`.
+pub const SEAL_REFUSED_SUBDIR: &str = "refused";
+
 /// Filename prefix of the files the CURRENT writers produce, for both the
 /// spill (`.bin`) and the DLQ (`.ndjson`): `seals_v4-YYYY-MM-DD.*`.
 ///
@@ -421,6 +428,15 @@ pub struct BootDrainOutcome {
     /// Records that could not be decoded (corrupt tail / legacy format /
     /// unknown timeframe ordinal). Their bytes survive in `archive/`.
     pub records_undecodable: usize,
+    /// Seals given up on for good in this drain: undecodable records and
+    /// refused seals of the files it moved out of `replaying/` (into
+    /// `refused/`). Seals of a file left staged for a retry are NOT here (they
+    /// are in `seals_left_pending`), so a file refused on several boots pages
+    /// once, when it is moved (row 296).
+    pub seals_unrecovered: usize,
+    /// Files moved to `refused/` rather than `archive/` because they hold
+    /// seals given up on (PR40b-f).
+    pub files_refused: usize,
     /// Decoded seals the writer refused to append. Their file is NOT archived
     /// (audit PR31): it stays in `replaying/` so the next boot retries it, and
     /// these seals are also counted in `seals_left_pending`.
@@ -554,14 +570,11 @@ fn is_seal_file(path: &Path) -> bool {
 /// (`seals-2026-08-11.bin.1`) keep their kind via the embedded extension.
 fn staged_kind(path: &Path) -> Option<StagedKind> {
     let name = path.file_name().and_then(|n| n.to_str())?;
-    // Split off any `.N` collision suffix before classifying.
-    let base = name.rsplit_once('.').map_or(name, |(head, tail)| {
-        if tail.chars().all(|c| c.is_ascii_digit()) && !tail.is_empty() {
-            head
-        } else {
-            name
-        }
-    });
+    // Split off every `.N` collision suffix and the `.overflow` suffix
+    // `free_path` falls back to before classifying (PR40b-f: until 2026-10-04
+    // only one `.N` was split, so an `.overflow` file or a copy renamed twice
+    // was never staged, read or replayed).
+    let base = crate::seal_spill::strip_copy_suffixes(name);
     if base.ends_with(".bin") {
         Some(StagedKind::Spill)
     } else if base.ends_with(".ndjson") {
@@ -692,15 +705,21 @@ fn read_staged_dlq(path: &Path) -> Option<(Vec<SerializedSeal>, usize)> {
     Some((out, undecodable))
 }
 
-/// Moves a confirmed file from `replaying/` to `archive/`.
-fn archive_staged(path: &Path) -> std::io::Result<()> {
+/// Moves a confirmed file from `replaying/` to `archive/`, or to `refused/`
+/// when `refused` (some of its seals were given up on, so the file is their
+/// only copy and must outlive the archive's retention; PR40b-f).
+fn archive_staged(path: &Path, refused: bool) -> std::io::Result<()> {
     let Some(replaying_dir) = path.parent() else {
         return Ok(());
     };
     let Some(root) = replaying_dir.parent() else {
         return Ok(());
     };
-    let archive = root.join(SEAL_ARCHIVE_SUBDIR);
+    let archive = root.join(if refused {
+        SEAL_REFUSED_SUBDIR
+    } else {
+        SEAL_ARCHIVE_SUBDIR
+    });
     std::fs::create_dir_all(&archive)?;
     let Some(name) = path.file_name() else {
         return Ok(());
@@ -907,6 +926,21 @@ pub fn drain_recovered_seals<S: SealSink>(
     dlq_dir: &Path,
     max_batch: usize,
 ) -> BootDrainOutcome {
+    let outcome = drain_recovered_seals_once(writer, spill_dir, dlq_dir, max_batch);
+    // PR40b-f: the retention sweep may now delete aged unreplayed files here.
+    // Whatever the drain found, it has read the folder; a file it left
+    // staged stays inside the age window or is reported when it ages out.
+    crate::seal_spill::note_boot_drain_ran(spill_dir);
+    outcome
+}
+
+/// One boot drain; see [`drain_recovered_seals`].
+fn drain_recovered_seals_once<S: SealSink>(
+    writer: &mut S,
+    spill_dir: &Path,
+    dlq_dir: &Path,
+    max_batch: usize,
+) -> BootDrainOutcome {
     let mut outcome = BootDrainOutcome::default();
     let batch = max_batch.max(1);
 
@@ -981,11 +1015,14 @@ pub fn drain_recovered_seals<S: SealSink>(
         };
         outcome.records_undecodable += undecodable;
         outcome.seals_recovered += records.len();
+        // This file's undecodable records, for the page and the `refused/` move
+        // when it leaves `replaying/` (row 296: once, not per boot).
+        let mut file_undecodable = undecodable;
         if undecodable > 0 {
             warn!(
                 ?path,
                 undecodable,
-                "seal recovery: records could not be decoded — bytes retained in archive/"
+                "seal recovery: records could not be decoded — the file is kept for good in refused/"
             );
         }
 
@@ -1010,6 +1047,7 @@ pub fn drain_recovered_seals<S: SealSink>(
                 let Some(seal) = record.try_into_buffered_seal() else {
                     // Forward-compat guard: unknown tf ordinal.
                     outcome.records_undecodable += 1;
+                    file_undecodable += 1;
                     outcome.seals_recovered = outcome.seals_recovered.saturating_sub(1);
                     continue;
                 };
@@ -1092,7 +1130,7 @@ pub fn drain_recovered_seals<S: SealSink>(
             if append_failed > 0 {
                 // Bounded retry: a file older than the retry window has been
                 // refused on every boot since, so the refusal is in the data,
-                // not the moment. Archive it (its bytes stay in archive/) rather
+                // not the moment. Move it out (kept in refused/) rather
                 // than re-send its good seals over newer bars every morning.
                 error!(
                     code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
@@ -1100,11 +1138,20 @@ pub fn drain_recovered_seals<S: SealSink>(
                     append_failed,
                     retry_secs = SEAL_REFUSED_FILE_RETRY_SECS,
                     "seal recovery: seals in this file were refused on every boot for the \
-                     whole retry window — archived NOT re-ingested; the bytes stay in archive/"
+                     whole retry window — NOT re-ingested; the file is kept for good in refused/"
                 );
             }
-            match archive_staged(path) {
-                Ok(()) => outcome.files_archived += 1,
+            // PR40b-f: a file holding seals given up on is their only copy, so
+            // it goes to `refused/`, which the retention sweep never deletes.
+            let unrecovered = file_undecodable.saturating_add(append_failed);
+            match archive_staged(path, unrecovered > 0) {
+                Ok(()) => {
+                    outcome.files_archived += 1;
+                    if unrecovered > 0 {
+                        outcome.files_refused += 1;
+                        outcome.seals_unrecovered += unrecovered;
+                    }
+                }
                 Err(err) => {
                     // Re-ingest succeeded but the rename did not. The file
                     // stays staged; the next boot re-reads it and QuestDB's
@@ -1144,8 +1191,8 @@ pub fn drain_recovered_seals<S: SealSink>(
             seals_append_failed = outcome.seals_append_failed,
             seals_reingested = outcome.seals_reingested,
             files_archived = outcome.files_archived,
-            "seal recovery finished with refused seals archived NOT re-ingested — \
-             their bytes are in archive/"
+            "seal recovery finished with refused seals NOT re-ingested — their \
+             bytes are kept for good in refused/"
         );
     } else {
         info!(
@@ -1451,6 +1498,19 @@ struct ReplayCursor {
     /// Either moving on since means the database accepted something in
     /// between.
     evidence_mark: (u64, u64),
+    /// Some seal of this file was skipped (undecodable, or refused in every
+    /// attempt): when finished the file goes to `refused/`, never `archive/`
+    /// (PR40b-f).
+    refused: bool,
+    /// Byte offset below which every undecodable record has already been
+    /// counted, so a step re-read after a failed flush or a rewind does not
+    /// count (and page) the same record again (row 296).
+    counted_through: u64,
+    /// The same for a seal skipped as refused in every attempt.
+    refused_counted_through: u64,
+    /// The same for a seal the writer refused to append; moved only when
+    /// the step that read it is committed.
+    append_counted_through: u64,
 }
 
 impl ReplayCursor {
@@ -1462,6 +1522,10 @@ impl ReplayCursor {
             single_record_failures: 0,
             failures_at_offset: 0,
             evidence_mark: (0, 0),
+            refused: false,
+            counted_through: 0,
+            refused_counted_through: 0,
+            append_counted_through: 0,
         }
     }
 
@@ -1486,6 +1550,8 @@ struct ParkedFile {
 #[derive(Debug)]
 struct AwaitingArchive {
     path: PathBuf,
+    /// The file holds a seal the replay skipped: it goes to `refused/`.
+    refused: bool,
     /// Clean probes reported when its last record was flushed.
     clean_probes_at_finish: u64,
 }
@@ -1522,6 +1588,10 @@ pub struct MidSessionReplay {
     awaiting_archive: Vec<AwaitingArchive>,
     /// Reused decode buffer, at most one step's worth of seals.
     batch: Vec<BufferedSeal>,
+    /// The file offset of each seal in `batch`, same order, so a seal the
+    /// writer refuses is counted once however often its step is re-read
+    /// (row 296). Reused like `batch`.
+    batch_offsets: Vec<u64>,
 }
 
 impl MidSessionReplay {
@@ -1725,11 +1795,12 @@ impl MidSessionReplay {
                 continue;
             }
             let entry = self.awaiting_archive.swap_remove(i);
-            match archive_staged(&entry.path) {
+            match archive_staged(&entry.path, entry.refused) {
                 Ok(()) => {
                     outcome.files_archived += 1;
                     info!(
                         path = ?entry.path,
+                        refused = entry.refused,
                         "seal replay: spill file re-ingested, confirmed by QuestDB, archived"
                     );
                 }
@@ -1815,8 +1886,20 @@ impl MidSessionReplay {
 
         // Keep in `self.batch` only the seals handed to the writer, so a clean
         // flush can record exactly those as committed (Z6).
-        let mut records_skipped = 0usize;
+        // Refused seals of this step not counted by an earlier read of it
+        // (row 296). Counted only once the step is committed below: a failed
+        // flush re-reads the same records, which must not count them twice.
+        let append_counted_through = self
+            .cursor
+            .as_ref()
+            .map_or(0, |cursor| cursor.append_counted_through);
+        let mut refused_in_step = 0usize;
+        let mut fresh_refused = 0usize;
+        let mut index = 0usize;
+        let offsets = &self.batch_offsets;
         self.batch.retain(|seal| {
+            let record_offset = offsets.get(index).copied().unwrap_or(u64::MAX);
+            index += 1;
             // Audit PR41a, Z6: a fuller copy of this bar was already committed
             // (live, or by an earlier replay step: a later file replayed
             // before this parked one resumed). Writing this one would put the
@@ -1831,12 +1914,14 @@ impl MidSessionReplay {
                     security_id = seal.security_id,
                     "seal replay: append failed for a spilled seal"
                 );
-                records_skipped += 1;
+                refused_in_step += 1;
+                if record_offset >= append_counted_through {
+                    fresh_refused += 1;
+                }
                 return false;
             }
             true
         });
-        outcome.records_skipped += records_skipped;
         let appended = self.batch.len();
         if appended > 0 {
             if let Err(flush_err) = writer.flush() {
@@ -1852,7 +1937,14 @@ impl MidSessionReplay {
 
         let consumed =
             u64::try_from(records_read.saturating_mul(SEAL_SPILL_RECORD_SIZE)).unwrap_or(u64::MAX);
+        outcome.records_skipped += fresh_refused;
         if let Some(cursor) = self.cursor.as_mut() {
+            if refused_in_step > 0 {
+                cursor.refused = true;
+            }
+            cursor.append_counted_through = cursor
+                .append_counted_through
+                .max(offset.saturating_add(consumed));
             cursor.offset = cursor.offset.saturating_add(consumed);
             cursor.single_record_failures = 0;
             cursor.failures_at_offset = 0;
@@ -1869,6 +1961,7 @@ impl MidSessionReplay {
     /// The file has been read to its end. With a QuestDB watcher running it
     /// waits for two clean probes behind it; without one it is archived now.
     fn finish_file(&mut self, path: PathBuf, outcome: &mut ReplayOutcome) {
+        let refused = self.cursor.as_ref().is_some_and(|cursor| cursor.refused);
         if self.probe.is_running() {
             if self.awaiting_archive.len() >= SEAL_REPLAY_HELD_LIMIT {
                 // Hold the file at its end; the next step tries again once
@@ -1877,16 +1970,22 @@ impl MidSessionReplay {
             }
             self.awaiting_archive.push(AwaitingArchive {
                 path,
+                refused,
                 clean_probes_at_finish: self.probe.clean_probes,
             });
             self.cursor = None;
             self.last_scan = None;
             return;
         }
-        match archive_staged(&path) {
+        match archive_staged(&path, refused) {
             Ok(()) => {
                 outcome.files_archived += 1;
-                info!(?path, "seal replay: spill file re-ingested and archived");
+                info!(
+                    ?path,
+                    refused,
+                    "seal replay: spill file re-ingested and archived (to refused/ when it \
+                     holds a skipped seal)"
+                );
                 self.cursor = None;
                 self.last_scan = None;
             }
@@ -1944,10 +2043,16 @@ impl MidSessionReplay {
             }
             if cursor.single_record_failures >= SEAL_REPLAY_POISON_FAILURES {
                 let record_bytes = u64::try_from(SEAL_SPILL_RECORD_SIZE).unwrap_or(u64::MAX);
+                cursor.refused = true;
+                // Counted once: a rewind that reaches this record again skips
+                // it again without a second page (row 296).
+                if cursor.offset >= cursor.refused_counted_through {
+                    outcome.records_skipped += 1;
+                    cursor.refused_counted_through = cursor.offset.saturating_add(record_bytes);
+                }
                 cursor.offset = cursor.offset.saturating_add(record_bytes);
                 cursor.single_record_failures = 0;
                 cursor.failures_at_offset = 0;
-                outcome.records_skipped += 1;
                 error!(
                     code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
                     ?flush_err,
@@ -1955,7 +2060,7 @@ impl MidSessionReplay {
                     offset,
                     "seal replay: the database refused this one spilled seal in every attempt, \
                      and accepted other writes in between — skipped; its bytes stay in the \
-                     file, which moves to archive/"
+                     file, which is kept for good in refused/"
                 );
                 return;
             }
@@ -2017,16 +2122,19 @@ impl MidSessionReplay {
         file.seek(std::io::SeekFrom::Start(offset)).ok()?;
         let mut reader = BufReader::new(file);
         self.batch.clear();
+        self.batch_offsets.clear();
         let mut buf = [0u8; SEAL_SPILL_RECORD_SIZE];
         let mut records_read = 0usize;
         // One coded line per step, not per record, however many are damaged.
         let mut checksum_refused = 0usize;
+        let mut at_eof = false;
+        let mut read_failed = false;
         while records_read < step_records {
             match reader.read_exact(&mut buf) {
                 Ok(()) => {}
                 Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    note_checksum_refused(path, checksum_refused);
-                    return Some((records_read, true));
+                    at_eof = true;
+                    break;
                 }
                 Err(err) => {
                     warn!(
@@ -2034,28 +2142,56 @@ impl MidSessionReplay {
                         ?err,
                         "seal replay: read error in a staged spill file"
                     );
-                    self.batch.clear();
-                    return None;
+                    read_failed = true;
+                    break;
                 }
             }
+            let record_offset = offset.saturating_add(
+                u64::try_from(records_read.saturating_mul(SEAL_SPILL_RECORD_SIZE))
+                    .unwrap_or(u64::MAX),
+            );
             records_read += 1;
             // The same version and checksum gate as the boot drain.
-            match decode_spill_record(&buf) {
+            let skipped = match decode_spill_record(&buf) {
                 SpillRecordRead::Seal(seal) => match seal.try_into_buffered_seal() {
-                    Some(seal) => self.batch.push(seal),
-                    None => outcome.records_skipped += 1,
+                    Some(seal) => {
+                        self.batch.push(seal);
+                        self.batch_offsets.push(record_offset);
+                        false
+                    }
+                    None => true,
                 },
-                SpillRecordRead::OtherVersion => outcome.records_skipped += 1,
+                SpillRecordRead::OtherVersion => true,
                 SpillRecordRead::ChecksumMismatch => {
-                    outcome.records_skipped += 1;
                     checksum_refused += 1;
+                    true
+                }
+            };
+            if skipped && let Some(cursor) = self.cursor.as_mut() {
+                // Counted once per record: a step re-read after a failed
+                // flush, or after a rewind, reads it again (row 296).
+                cursor.refused = true;
+                if record_offset >= cursor.counted_through {
+                    outcome.records_skipped += 1;
                 }
             }
         }
+        if let Some(cursor) = self.cursor.as_mut() {
+            let read_end = offset.saturating_add(
+                u64::try_from(records_read.saturating_mul(SEAL_SPILL_RECORD_SIZE))
+                    .unwrap_or(u64::MAX),
+            );
+            cursor.counted_through = cursor.counted_through.max(read_end);
+        }
         note_checksum_refused(path, checksum_refused);
-        // Exactly one step's worth read: the file may end right here, which
-        // the next step discovers with a zero-record read.
-        Some((records_read, false))
+        if read_failed {
+            self.batch.clear();
+            return None;
+        }
+        // Exactly one step's worth read (or the end of the file): when a full
+        // step was read the file may end right here, which the next step
+        // discovers with a zero-record read.
+        Some((records_read, at_eof))
     }
 }
 
@@ -4500,5 +4636,210 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn staging_reads_overflow_and_twice_renamed_copies() {
+        // PR40b-f: only one `.N` suffix was split, so a `.bin.overflow` file
+        // (free_path's last resort) or a copy renamed twice (`.bin.1.1`) was
+        // never staged, read or replayed.
+        for name in [
+            "seals_v4-2026-10-01.bin.overflow",
+            "seals_v4-2026-10-01.bin.1.1",
+        ] {
+            assert!(
+                matches!(staged_kind(Path::new(name)), Some(StagedKind::Spill)),
+                "{name} must classify as a spill file"
+            );
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "tv-seal-stage-overflow-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("seals_v4-2026-10-01.bin.overflow"), b"").expect("write");
+        let staged = stage_pending_files(&dir);
+        assert_eq!(
+            staged.len(),
+            1,
+            "the overflow file must be staged: {staged:?}"
+        );
+        assert!(staged[0].starts_with(dir.join(SEAL_REPLAYING_SUBDIR)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_boot_drain_lets_the_retention_sweep_delete_unreplayed_files() {
+        // PR40b-f: the sweep holds aged unreplayed files until the boot drain
+        // has read the folder, whatever the drain found.
+        let dir = std::env::temp_dir().join(format!(
+            "tv-seal-drain-marks-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        assert!(!crate::seal_spill::boot_drain_ran(&dir));
+        let mut sink = ReplaySink::default();
+        let _ = drain_recovered_seals(&mut sink, &dir, &dir, 8);
+        assert!(crate::seal_spill::boot_drain_ran(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------
+    // PR40b-f: files holding seals a recovery path gave up on go to
+    // refused/, are paged once, and a skip is counted once.
+    // -----------------------------------------------------------------
+
+    /// A sink whose writer refuses one bucket at append time.
+    #[derive(Default)]
+    struct RefuseAppendSink {
+        refuse: u32,
+        pending: Vec<u32>,
+        committed: Vec<u32>,
+    }
+
+    impl SealSink for RefuseAppendSink {
+        fn append_seal(&mut self, seal: &BufferedSeal) -> anyhow::Result<()> {
+            if seal.state.bucket_start_ist_secs == self.refuse {
+                anyhow::bail!("injected append refusal");
+            }
+            self.pending.push(seal.state.bucket_start_ist_secs);
+            Ok(())
+        }
+        fn flush(&mut self) -> anyhow::Result<()> {
+            self.committed.append(&mut self.pending);
+            Ok(())
+        }
+        fn discard_pending(&mut self) {
+            self.pending.clear();
+        }
+    }
+
+    /// Flips one byte inside record `index` of the spill day file of `now`.
+    fn damage_record(writer: &crate::seal_spill::SealSpillWriter, now: i64, index: usize) {
+        let path = writer.spill_path(now);
+        let mut bytes = std::fs::read(&path).expect("read");
+        bytes[SEAL_SPILL_RECORD_SIZE * index + 64] ^= 0x01;
+        std::fs::write(&path, &bytes).expect("write");
+    }
+
+    #[test]
+    fn boot_drain_moves_a_file_with_an_undecodable_record_to_refused_and_reports_it_once() {
+        let (spill, dlq) = temp_pair("pr40bf-boot-refused");
+        let writer = crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(spill.clone());
+        let t0 = jan1_noon_utc();
+        spill_range(&writer, 0, 3, t0);
+        damage_record(&writer, t0, 1);
+        spill_range(&writer, 10, 2, t0 + 86_400);
+
+        let mut sink = ReplaySink::default();
+        let first = drain_recovered_seals(&mut sink, &spill, &dlq, 64);
+        assert_eq!(first.files_archived, 2);
+        assert_eq!(
+            (first.files_refused, first.seals_unrecovered),
+            (1, 1),
+            "the damaged file is refused and its one record reported"
+        );
+        assert_eq!(first.files_left_pending, 0);
+        assert_eq!(count_bin(&spill.join(SEAL_REFUSED_SUBDIR)), 1);
+        assert_eq!(count_bin(&spill.join(SEAL_ARCHIVE_SUBDIR)), 1);
+        assert_eq!(sink.committed, vec![0, 2, 10, 11]);
+
+        // The next boot never reads refused/ again, so nothing is paged twice.
+        let second = drain_recovered_seals(&mut sink, &spill, &dlq, 64);
+        assert_eq!((second.files_refused, second.seals_unrecovered), (0, 0));
+        assert_eq!(count_bin(&spill.join(SEAL_REFUSED_SUBDIR)), 1);
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn boot_drain_leaves_a_young_refused_append_pending_and_does_not_report_it_unrecovered() {
+        let (spill, dlq) = temp_pair("pr40bf-boot-pending");
+        let writer = crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(spill.clone());
+        let t0 = jan1_noon_utc();
+        spill_range(&writer, 0, 3, t0);
+        let mut sink = RefuseAppendSink {
+            refuse: 1,
+            ..RefuseAppendSink::default()
+        };
+        let outcome = drain_recovered_seals(&mut sink, &spill, &dlq, 64);
+        assert_eq!(
+            (outcome.files_left_pending, outcome.seals_left_pending),
+            (1, 1)
+        );
+        assert_eq!(
+            (outcome.files_refused, outcome.seals_unrecovered),
+            (0, 0),
+            "a seal the next boot retries is pending, not given up on"
+        );
+        assert_eq!(count_bin(&spill.join(SEAL_REFUSED_SUBDIR)), 0);
+        assert_eq!(count_bin(&spill.join(SEAL_REPLAYING_SUBDIR)), 1);
+        assert_eq!(sink.committed, vec![0, 2]);
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn replay_moves_a_file_with_a_skipped_record_to_refused_not_archive() {
+        let (spill, dlq) = temp_pair("pr40bf-replay-refused");
+        let writer = crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(spill.clone());
+        let t0 = jan1_noon_utc();
+        spill_n(&writer, 3, t0);
+        damage_record(&writer, t0, 1);
+        let mut replay = MidSessionReplay::default();
+        let mut sink = ReplaySink::default();
+        replay.observe(&healthy_drain(), t0);
+        let out = replay.step(&mut sink, &writer, &spill, true, t0 + 60);
+        assert_eq!((out.seals_reingested, out.records_skipped), (2, 1));
+        assert_eq!(out.files_archived, 1);
+        assert_eq!(count_bin(&spill.join(SEAL_REFUSED_SUBDIR)), 1);
+        assert_eq!(count_bin(&spill.join(SEAL_ARCHIVE_SUBDIR)), 0);
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn replay_counts_a_damaged_record_once_when_a_failed_flush_reads_it_again() {
+        let (spill, dlq) = temp_pair("pr40bf-replay-once");
+        let writer = crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(spill.clone());
+        let t0 = jan1_noon_utc();
+        spill_n(&writer, 3, t0);
+        damage_record(&writer, t0, 1);
+        let mut replay = MidSessionReplay::default();
+        let mut sink = ReplaySink {
+            fail_flushes: 2,
+            ..ReplaySink::default()
+        };
+        let sum = run_replay_to_end(&mut replay, &mut sink, &writer, &spill, t0, 50);
+        assert_eq!(sink.flushes, 3, "two failed reads, then one that lands");
+        assert_eq!(sum.records_skipped, 1, "one damaged record, counted once");
+        assert_eq!(sum.seals_reingested, 2);
+        assert_eq!(sum.files_archived, 1);
+        assert_eq!(sink.committed, vec![0, 2]);
+        assert_eq!(count_bin(&spill.join(SEAL_REFUSED_SUBDIR)), 1);
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn replay_moves_a_file_with_a_poison_record_to_refused_and_counts_it_once() {
+        let (spill, dlq) = temp_pair("pr40bf-replay-poison");
+        let writer = crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(spill.clone());
+        let t0 = jan1_noon_utc();
+        spill_n(&writer, 40, t0);
+        let mut replay = MidSessionReplay::default();
+        let mut sink = ReplaySink {
+            poison: Some(17),
+            ..ReplaySink::default()
+        };
+        let sum = run_replay_to_end(&mut replay, &mut sink, &writer, &spill, t0, 200);
+        assert_eq!(sum.files_archived, 1);
+        assert_eq!(sum.records_skipped, 1);
+        assert_eq!(sink.committed.len(), 39);
+        assert_eq!(count_bin(&spill.join(SEAL_REFUSED_SUBDIR)), 1);
+        assert_eq!(count_bin(&spill.join(SEAL_ARCHIVE_SUBDIR)), 0);
+        cleanup(&spill, &dlq);
     }
 }

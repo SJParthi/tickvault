@@ -349,12 +349,15 @@ fn record_boot_drain_observability(outcome: &BootDrainOutcome) {
         metrics::counter!("tv_seal_writer_drain_total", "kind" => "boot_summary_not_persisted")
             .increment(outcome.summary_not_persisted as u64);
     }
-    let _ = report_unrecovered_seals(
-        UnrecoveredStage::BootDrain,
-        outcome
-            .records_undecodable
-            .saturating_add(outcome.seals_append_failed),
-    );
+    // Row 296: page the seals given up on for good, once, when their file
+    // leaves `replaying/`. A file staged for another try is pending
+    // (`boot_pending` above), not unrecovered, so a file refused on several
+    // boots no longer pages on each of them.
+    if outcome.seals_unrecovered > 0 {
+        metrics::counter!("tv_seal_writer_drain_total", "kind" => "boot_unrecovered")
+            .increment(outcome.seals_unrecovered as u64);
+    }
+    let _ = report_unrecovered_seals(UnrecoveredStage::BootDrain, outcome.seals_unrecovered);
 }
 
 // ---------------------------------------------------------------------------
@@ -838,8 +841,8 @@ pub fn report_previous_unwritten(previous: PreviousUnwritten, now_unix_secs: i64
 // at `warn!` or under AGGREGATOR-SEAL-01, which no alarm filters on:
 //
 // * the boot drain, for a record it cannot decode (most often a file written
-//   by an older build) and for a seal the writer refuses; the file moves to
-//   `archive/` and nothing retries it;
+//   by an older build) and for a seal the writer refuses; once the file leaves
+//   `replaying/` (into `refused/`, kept for good) nothing retries it;
 // * the mid-session replay, for the same two cases plus a seal the database
 //   refused in every attempt; the cursor moves past it and nothing retries it.
 //
@@ -888,9 +891,9 @@ pub fn report_unrecovered_seals(stage: UnrecoveredStage, unrecovered: usize) -> 
         seals_unrecovered = unrecovered,
         "seal recovery gave up on {} sealed candle(s) for good: they could not be decoded, \
          the writer refused them, or the database refused them in every attempt. They are \
-         NOT in QuestDB and nothing retries them. Their bytes stay in the spill archive/ \
-         folder until the retention sweep removes them; their ticks are still in the \
-         capture log.",
+         NOT in QuestDB and nothing retries them. Their file is kept for good in the \
+         spill refused/ folder (the retention sweep never deletes it, the cold uploader \
+         copies it); their ticks are still in the capture log.",
         unrecovered
     );
     unrecovered
@@ -1769,6 +1772,8 @@ mod tests {
             summary_seeded: 6,
             summary_refused: 1,
             summary_not_persisted: 2,
+            seals_unrecovered: 5,
+            files_refused: 1,
         });
     }
 
@@ -2002,9 +2007,8 @@ mod tests {
             .expect("boot fan-out");
         assert!(
             boot.contains("UnrecoveredStage::BootDrain")
-                && boot.contains("records_undecodable")
-                && boot.contains("seals_append_failed"),
-            "the boot drain must page undecodable AND refused seals"
+                && boot.contains("outcome.seals_unrecovered"),
+            "the boot drain must page the seals it gave up on (undecodable and refused)"
         );
         let replay = prod
             .split("fn record_replay_observability")

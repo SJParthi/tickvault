@@ -933,31 +933,83 @@ pub const GHOST_RESEND_POOL_SPACING_SECS: i64 = 20;
 /// once.
 pub const GHOST_RESEND_SESSION_CEILING: u32 = 8;
 
-/// `true` while a ghost unsubscribe is armed for that slot and not yet taken.
-static GHOST_PENDING: [std::sync::atomic::AtomicBool; GHOST_REDIAL_SLOTS] =
-    [const { std::sync::atomic::AtomicBool::new(false) }; GHOST_REDIAL_SLOTS];
+/// The ghost-unsubscribe register: one slot per global connection index.
+///
+/// Production uses the one [`GHOST_REGISTER`] static through
+/// [`request_ghost_unsubscribe`] and [`take_ghost_unsubscribe`]. The type is
+/// public (hidden from docs) only so the loom lane can build its own instance
+/// and drive these exact methods through every interleaving (audit H3,
+/// `crates/core/tests/loom_ghost_register.rs`). Its atomics come from
+/// `crate::sync`: the std atomics in a normal build, loom's under the crate's
+/// `loom` feature. Fixed size, built once, O(1) per call, no allocation.
+#[doc(hidden)]
+pub struct GhostRegister {
+    /// `true` while a ghost unsubscribe is armed for that slot and not yet
+    /// taken.
+    pending: [crate::sync::AtomicBool; GHOST_REDIAL_SLOTS],
+    /// The ghost's `security_id`, valid while `pending` is set.
+    security_id: [crate::sync::AtomicU64; GHOST_REDIAL_SLOTS],
+    /// The ghost's binary exchange-segment code, valid while `pending` is set.
+    /// Carried with the id because `security_id` alone is not unique
+    /// (I-P1-11).
+    segment_code: [crate::sync::AtomicU8; GHOST_REDIAL_SLOTS],
+    /// Epoch seconds of the last ARMED request per slot, for the cooldown.
+    last_armed: [crate::sync::AtomicI64; GHOST_REDIAL_SLOTS],
+    /// Ghost unsubscribes ARMED per slot this process lifetime, for the
+    /// ceiling.
+    armed_count: [crate::sync::AtomicU32; GHOST_REDIAL_SLOTS],
+    /// Epoch seconds of the last ghost unsubscribe ARMED on ANY slot, for the
+    /// pool-wide spacing.
+    pool_last_armed: crate::sync::AtomicI64,
+}
 
-/// The ghost's `security_id`, valid while [`GHOST_PENDING`] is set.
-static GHOST_SECURITY_ID: [std::sync::atomic::AtomicU64; GHOST_REDIAL_SLOTS] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; GHOST_REDIAL_SLOTS];
+impl GhostRegister {
+    /// An empty register: nothing pending, no cooldown, no request counted.
+    #[cfg(not(feature = "loom"))]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            pending: [const { crate::sync::AtomicBool::new(false) }; GHOST_REDIAL_SLOTS],
+            security_id: [const { crate::sync::AtomicU64::new(0) }; GHOST_REDIAL_SLOTS],
+            segment_code: [const { crate::sync::AtomicU8::new(u8::MAX) }; GHOST_REDIAL_SLOTS],
+            last_armed: [const { crate::sync::AtomicI64::new(0) }; GHOST_REDIAL_SLOTS],
+            armed_count: [const { crate::sync::AtomicU32::new(0) }; GHOST_REDIAL_SLOTS],
+            pool_last_armed: crate::sync::AtomicI64::new(0),
+        }
+    }
 
-/// The ghost's binary exchange-segment code, valid while [`GHOST_PENDING`] is
-/// set. Carried with the id because `security_id` alone is not unique
-/// (I-P1-11).
-static GHOST_SEGMENT_CODE: [std::sync::atomic::AtomicU8; GHOST_REDIAL_SLOTS] =
-    [const { std::sync::atomic::AtomicU8::new(u8::MAX) }; GHOST_REDIAL_SLOTS];
+    /// An empty register (loom build: loom atomics have no `const` constructor).
+    #[cfg(feature = "loom")]
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            pending: std::array::from_fn(|_| crate::sync::AtomicBool::new(false)),
+            security_id: std::array::from_fn(|_| crate::sync::AtomicU64::new(0)),
+            segment_code: std::array::from_fn(|_| crate::sync::AtomicU8::new(u8::MAX)),
+            last_armed: std::array::from_fn(|_| crate::sync::AtomicI64::new(0)),
+            armed_count: std::array::from_fn(|_| crate::sync::AtomicU32::new(0)),
+            pool_last_armed: crate::sync::AtomicI64::new(0),
+        }
+    }
+}
 
-/// Epoch seconds of the last ARMED request per slot, for the cooldown.
-static GHOST_LAST_ARMED: [std::sync::atomic::AtomicI64; GHOST_REDIAL_SLOTS] =
-    [const { std::sync::atomic::AtomicI64::new(0) }; GHOST_REDIAL_SLOTS];
+#[cfg(not(feature = "loom"))]
+impl Default for GhostRegister {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
-/// Ghost unsubscribes ARMED per slot this process lifetime, for the ceiling.
-static GHOST_ARMED_COUNT: [std::sync::atomic::AtomicU32; GHOST_REDIAL_SLOTS] =
-    [const { std::sync::atomic::AtomicU32::new(0) }; GHOST_REDIAL_SLOTS];
+/// The process's one ghost-unsubscribe register.
+#[cfg(not(feature = "loom"))]
+static GHOST_REGISTER: GhostRegister = GhostRegister::new();
 
-/// Epoch seconds of the last ghost unsubscribe ARMED on ANY slot, for the
-/// pool-wide spacing.
-static GHOST_POOL_LAST_ARMED: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+// Under the `loom` feature only `--test loom_*` targets run, and they build
+// their own `GhostRegister`; this global exists so the crate still compiles.
+#[cfg(feature = "loom")]
+loom::lazy_static! {
+    static ref GHOST_REGISTER: GhostRegister = GhostRegister::new();
+}
 
 /// Why a ghost-unsubscribe request was not armed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1003,53 +1055,71 @@ pub fn request_ghost_unsubscribe(
     segment_code: u8,
     now_epoch_secs: i64,
 ) -> Result<(), GhostResendRefusal> {
-    let idx = usize::from(connection_index);
-    let (Some(last), Some(pending), Some(count), Some(id_slot), Some(segment_slot)) = (
-        GHOST_LAST_ARMED.get(idx),
-        GHOST_PENDING.get(idx),
-        GHOST_ARMED_COUNT.get(idx),
-        GHOST_SECURITY_ID.get(idx),
-        GHOST_SEGMENT_CODE.get(idx),
-    ) else {
-        return Err(GhostResendRefusal::OutOfRange);
-    };
-    if ExchangeSegment::from_byte(segment_code).is_none() {
-        return Err(GhostResendRefusal::UnknownSegment);
+    GHOST_REGISTER.request(connection_index, security_id, segment_code, now_epoch_secs)
+}
+
+impl GhostRegister {
+    /// [`request_ghost_unsubscribe`] on this register.
+    #[doc(hidden)]
+    pub fn request(
+        &self,
+        connection_index: u8,
+        security_id: SecurityId,
+        segment_code: u8,
+        now_epoch_secs: i64,
+    ) -> Result<(), GhostResendRefusal> {
+        let idx = usize::from(connection_index);
+        let (Some(last), Some(pending), Some(count), Some(id_slot), Some(segment_slot)) = (
+            self.last_armed.get(idx),
+            self.pending.get(idx),
+            self.armed_count.get(idx),
+            self.security_id.get(idx),
+            self.segment_code.get(idx),
+        ) else {
+            return Err(GhostResendRefusal::OutOfRange);
+        };
+        if ExchangeSegment::from_byte(segment_code).is_none() {
+            return Err(GhostResendRefusal::UnknownSegment);
+        }
+        // Acquire pairs with the Release store in `take_ghost_unsubscribe`, which
+        // clears the flag only after it has read the slot. Once this reads
+        // `false` nothing is reading the slot, and nothing else writes it (the
+        // drain is the only caller), so the stores below can never tear a read.
+        if pending.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(GhostResendRefusal::StillPending);
+        }
+        if count.load(std::sync::atomic::Ordering::Relaxed) >= GHOST_RESEND_SESSION_CEILING {
+            return Err(GhostResendRefusal::SessionCeiling);
+        }
+        let previous = last.load(std::sync::atomic::Ordering::Relaxed);
+        if now_epoch_secs.saturating_sub(previous) < GHOST_RESEND_COOLDOWN_SECS {
+            return Err(GhostResendRefusal::CoolingDown);
+        }
+        let pool_previous = self
+            .pool_last_armed
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if now_epoch_secs.saturating_sub(pool_previous) < GHOST_RESEND_POOL_SPACING_SECS {
+            return Err(GhostResendRefusal::PoolSpacing);
+        }
+        last.store(now_epoch_secs, std::sync::atomic::Ordering::Relaxed);
+        self.pool_last_armed
+            .store(now_epoch_secs, std::sync::atomic::Ordering::Relaxed);
+        count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        id_slot.store(security_id, std::sync::atomic::Ordering::Relaxed);
+        segment_slot.store(segment_code, std::sync::atomic::Ordering::Relaxed);
+        // Release: the id and segment stored above are visible to whoever
+        // observes `pending` with Acquire in `take_ghost_unsubscribe`.
+        pending.store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
     }
-    // Acquire pairs with the Release store in `take_ghost_unsubscribe`, which
-    // clears the flag only after it has read the slot. Once this reads
-    // `false` nothing is reading the slot, and nothing else writes it (the
-    // drain is the only caller), so the stores below can never tear a read.
-    if pending.load(std::sync::atomic::Ordering::Acquire) {
-        return Err(GhostResendRefusal::StillPending);
-    }
-    if count.load(std::sync::atomic::Ordering::Relaxed) >= GHOST_RESEND_SESSION_CEILING {
-        return Err(GhostResendRefusal::SessionCeiling);
-    }
-    let previous = last.load(std::sync::atomic::Ordering::Relaxed);
-    if now_epoch_secs.saturating_sub(previous) < GHOST_RESEND_COOLDOWN_SECS {
-        return Err(GhostResendRefusal::CoolingDown);
-    }
-    let pool_previous = GHOST_POOL_LAST_ARMED.load(std::sync::atomic::Ordering::Relaxed);
-    if now_epoch_secs.saturating_sub(pool_previous) < GHOST_RESEND_POOL_SPACING_SECS {
-        return Err(GhostResendRefusal::PoolSpacing);
-    }
-    last.store(now_epoch_secs, std::sync::atomic::Ordering::Relaxed);
-    GHOST_POOL_LAST_ARMED.store(now_epoch_secs, std::sync::atomic::Ordering::Relaxed);
-    count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    id_slot.store(security_id, std::sync::atomic::Ordering::Relaxed);
-    segment_slot.store(segment_code, std::sync::atomic::Ordering::Relaxed);
-    // Release: the id and segment stored above are visible to whoever
-    // observes `pending` with Acquire in `take_ghost_unsubscribe`.
-    pending.store(true, std::sync::atomic::Ordering::Release);
-    Ok(())
 }
 
 /// Ghost unsubscribes this slot has re-sent this process lifetime. `0` for an
 /// out-of-range index.
 #[must_use]
 pub fn ghost_resends_taken(connection_index: u8) -> u32 {
-    GHOST_ARMED_COUNT
+    GHOST_REGISTER
+        .armed_count
         .get(usize::from(connection_index))
         .map_or(0, |c| c.load(std::sync::atomic::Ordering::Relaxed))
 }
@@ -1059,7 +1129,10 @@ pub fn ghost_resends_taken(connection_index: u8) -> u32 {
 /// again). Saturates at zero; an out-of-range index is a no-op. O(1), called
 /// from the connection task, never per tick.
 fn refund_ghost_resend(connection_index: u8) {
-    if let Some(count) = GHOST_ARMED_COUNT.get(usize::from(connection_index)) {
+    if let Some(count) = GHOST_REGISTER
+        .armed_count
+        .get(usize::from(connection_index))
+    {
         let _previous = count.fetch_update(
             std::sync::atomic::Ordering::Relaxed,
             std::sync::atomic::Ordering::Relaxed,
@@ -1094,31 +1167,40 @@ pub fn ghost_ceiling_first_hit(connection_index: u8) -> bool {
 /// [`request_ghost_unsubscribe`], which refuses it) an unknown segment code.
 #[must_use]
 pub fn take_ghost_unsubscribe(connection_index: u8) -> Option<SubscribeInstrument> {
-    let idx = usize::from(connection_index);
-    let (Some(pending), Some(id_slot), Some(segment_slot)) = (
-        GHOST_PENDING.get(idx),
-        GHOST_SECURITY_ID.get(idx),
-        GHOST_SEGMENT_CODE.get(idx),
-    ) else {
-        return None;
-    };
-    // Acquire pairs with the Release that published the request, so the id
-    // and segment read below are the ones stored with it.
-    if !pending.load(std::sync::atomic::Ordering::Acquire) {
-        return None;
+    GHOST_REGISTER.take(connection_index)
+}
+
+impl GhostRegister {
+    /// [`take_ghost_unsubscribe`] on this register.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn take(&self, connection_index: u8) -> Option<SubscribeInstrument> {
+        let idx = usize::from(connection_index);
+        let (Some(pending), Some(id_slot), Some(segment_slot)) = (
+            self.pending.get(idx),
+            self.security_id.get(idx),
+            self.segment_code.get(idx),
+        ) else {
+            return None;
+        };
+        // Acquire pairs with the Release that published the request, so the id
+        // and segment read below are the ones stored with it.
+        if !pending.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        // Read BOTH before clearing the flag. `request_ghost_unsubscribe` writes
+        // the slot only after it sees the flag clear (Acquire), and this Release
+        // store is what it sees, so the pair can never tear. The connection task
+        // is the only taker per slot, so load-then-store loses no request.
+        let security_id = id_slot.load(std::sync::atomic::Ordering::Relaxed);
+        let segment_code = segment_slot.load(std::sync::atomic::Ordering::Relaxed);
+        pending.store(false, std::sync::atomic::Ordering::Release);
+        let segment = ExchangeSegment::from_byte(segment_code)?;
+        Some(SubscribeInstrument {
+            security_id,
+            segment,
+        })
     }
-    // Read BOTH before clearing the flag. `request_ghost_unsubscribe` writes
-    // the slot only after it sees the flag clear (Acquire), and this Release
-    // store is what it sees, so the pair can never tear. The connection task
-    // is the only taker per slot, so load-then-store loses no request.
-    let security_id = id_slot.load(std::sync::atomic::Ordering::Relaxed);
-    let segment_code = segment_slot.load(std::sync::atomic::Ordering::Relaxed);
-    pending.store(false, std::sync::atomic::Ordering::Release);
-    let segment = ExchangeSegment::from_byte(segment_code)?;
-    Some(SubscribeInstrument {
-        security_id,
-        segment,
-    })
 }
 
 /// The rotate-by-reconnect circuit breaker (2026-09-24 scope lock).
@@ -4366,7 +4448,18 @@ impl SwapOutcome {
 /// A dropped receiver is not an error: the caller stopped waiting, and the
 /// guard is already truthful either way. Spelled as a match rather than
 /// `let _ =` because `clippy::let_underscore_must_use` is on.
-fn answer_swap(ack: Option<tokio::sync::oneshot::Sender<SwapOutcome>>, outcome: SwapOutcome) {
+/// `audit` (audit M8, 2026-10-04): the swap and the socket's instrument
+/// count afterwards; when present, one `subscription_swapped` row is handed to
+/// the audit channel before the caller is told. `None` for a no-op swap (the
+/// socket already carried `new`: nothing changed, nothing to record).
+fn answer_swap(
+    ack: Option<tokio::sync::oneshot::Sender<SwapOutcome>>,
+    outcome: SwapOutcome,
+    audit: Option<(SwapAudit, u32)>,
+) {
+    if let Some((swap, held)) = audit {
+        emit_subscription_audit(swap.event(&outcome, held));
+    }
     if let Some(ack) = ack
         && ack.send(outcome).is_err()
     {
@@ -4766,6 +4859,258 @@ pub struct WsLifecycleEvent {
     pub dhan_code: Option<u16>,
     /// How many instruments the socket held when the event happened.
     pub instruments_held: u32,
+}
+
+/// One change to WHAT a live socket is subscribed to, WITHOUT a timestamp
+/// (audit M8, 2026-10-04): an in-place swap, an in-place resubscribe, a
+/// ghost unsubscribe resent, or an 805 park joining its overflow episode.
+///
+/// Until this existed those four reached a log line and a counter only, and
+/// CloudWatch keeps logs for 14 days; the record of which contract a socket
+/// carried when — the SEBI audit trail — lived nowhere durable. The app's
+/// live-feed forwarder stamps the time (this file never reads the wall
+/// clock, see [`WsLifecycleEvent`]) and writes one `ws_event_audit` row.
+///
+/// Every field is `Copy`, so building one allocates nothing. Instruments are
+/// carried by their composite `(security_id, segment)` key (I-P1-11); a
+/// multi-instrument resubscribe carries COUNTS, never a list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WsSubscriptionAuditEvent {
+    /// Which endpoint's pool the socket belongs to (the row's `ws_type`).
+    pub endpoint: DhanEndpointType,
+    /// The socket's GLOBAL connection index — the same index the lifecycle
+    /// rows carry, so a socket's subscription history and its connection
+    /// history join on `(ws_type, connection_index)`.
+    pub connection_index: u8,
+    /// One of the four subscription-change kinds.
+    pub kind: tickvault_common::ws_event_types::WsEventKind,
+    /// A fixed machine outcome slug (`applied`, `refused`, `wire_failed`,
+    /// `sent`, `pool_overflow`, ...). `&'static str`: no vendor text.
+    pub reason: &'static str,
+    /// The Dhan close code, for an 805 park; `None` otherwise.
+    pub dhan_code: Option<u16>,
+    /// The instruments and counts the row carries.
+    pub detail: tickvault_common::ws_event_types::WsSubscriptionDetail,
+}
+
+/// `tv_ws_event_audit_dropped_total{reason}` label for a subscription-change
+/// event the bounded channel could not take. Same counter every other
+/// `ws_event_audit` drop is counted on.
+pub const SUBSCRIPTION_AUDIT_DROP_REASON: &str = "subscription_change";
+
+/// The process's subscription-change audit channel (audit M8). Set once by
+/// the app's live-feed forwarder through [`install_subscription_audit`].
+///
+/// A process-wide sender rather than a field on the socket's sink: the sink
+/// type's lifecycle side-channel carries `Copy` connection facts only, and
+/// every emit site below already runs on the connection task with the slot
+/// in hand. Unset (tests, benches, a lane without the forwarder) means the
+/// emit is a no-op, exactly like a sink built without `with_audit`.
+static SUBSCRIPTION_AUDIT_TX: std::sync::OnceLock<
+    tokio::sync::mpsc::Sender<WsSubscriptionAuditEvent>,
+> = std::sync::OnceLock::new();
+
+/// Installs the process's subscription-change audit channel. Returns `false`
+/// when one is already installed (the first one stays; a second forwarder
+/// would never receive anything, so the caller logs it).
+pub fn install_subscription_audit(tx: tokio::sync::mpsc::Sender<WsSubscriptionAuditEvent>) -> bool {
+    SUBSCRIPTION_AUDIT_TX.set(tx).is_ok()
+}
+
+/// Hands one subscription-change event to the installed channel, if any.
+///
+/// Per COMMAND, never per tick or per frame: a swap, a resubscribe, a ghost
+/// resend (at most once per cooldown per socket) or an 805 park. O(1): one
+/// `OnceLock` load and one `try_send`; never blocks and never awaits.
+fn emit_subscription_audit(event: WsSubscriptionAuditEvent) {
+    if let Some(tx) = SUBSCRIPTION_AUDIT_TX.get() {
+        let _delivered = try_emit_subscription_audit(tx, event);
+    }
+}
+
+/// `try_send`, never `send`: a slow consumer may cost a forensic row and must
+/// never stall a socket. A refused event is COUNTED on the shared drop
+/// counter, never swallowed. Returns whether the channel took it.
+fn try_emit_subscription_audit(
+    tx: &tokio::sync::mpsc::Sender<WsSubscriptionAuditEvent>,
+    event: WsSubscriptionAuditEvent,
+) -> bool {
+    if tx.try_send(event).is_ok() {
+        return true;
+    }
+    metrics::counter!(
+        "tv_ws_event_audit_dropped_total",
+        "reason" => SUBSCRIPTION_AUDIT_DROP_REASON
+    )
+    .increment(1);
+    false
+}
+
+/// A [`SubscribeInstrument`] as the audit row's composite instrument key.
+const fn audit_instrument(
+    instrument: SubscribeInstrument,
+) -> tickvault_common::ws_event_types::WsAuditInstrument {
+    tickvault_common::ws_event_types::WsAuditInstrument {
+        security_id: instrument.security_id,
+        segment: instrument.segment,
+    }
+}
+
+/// What one `LiveSubscriptionCommand::Swap` is about, captured when the
+/// command is taken so every exit of the swap arm can write its audit row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SwapAudit {
+    endpoint: DhanEndpointType,
+    connection_index: u8,
+    old: SubscribeInstrument,
+    new: SubscribeInstrument,
+}
+
+impl SwapAudit {
+    const fn new(slot: ConnectionSlot, old: SubscribeInstrument, new: SubscribeInstrument) -> Self {
+        Self {
+            endpoint: slot.endpoint,
+            connection_index: slot.global_index,
+            old,
+            new,
+        }
+    }
+
+    /// The audit event for a swap that ended with `outcome`, the socket then
+    /// holding `held` instruments. `added` is 1 only when `new` reached the
+    /// wire; `removed` is 1 when the unsubscribe for `old` landed (applied,
+    /// or the emptied path whose unsubscribe landed or timed out).
+    fn event(self, outcome: &SwapOutcome, held: u32) -> WsSubscriptionAuditEvent {
+        let (reason, added, removed) = match outcome {
+            SwapOutcome::Held => ("applied", 1, 1),
+            SwapOutcome::NotHeld { reason } => (
+                *reason,
+                0,
+                u32::from(*reason == SwapOutcome::REASON_EMPTIED),
+            ),
+        };
+        WsSubscriptionAuditEvent {
+            endpoint: self.endpoint,
+            connection_index: self.connection_index,
+            kind: tickvault_common::ws_event_types::WsEventKind::SubscriptionSwapped,
+            reason,
+            dhan_code: None,
+            detail: tickvault_common::ws_event_types::WsSubscriptionDetail {
+                instrument: Some(audit_instrument(self.old)),
+                new_instrument: Some(audit_instrument(self.new)),
+                added: Some(added),
+                removed: Some(removed),
+                held: Some(held),
+            },
+        }
+    }
+}
+
+/// What one `LiveSubscriptionCommand::Resubscribe` is about, captured before
+/// the command's lists are consumed. Names an instrument only when exactly
+/// one left (or arrived); a larger change is recorded as counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResubscribeAudit {
+    endpoint: DhanEndpointType,
+    connection_index: u8,
+    single_out: Option<SubscribeInstrument>,
+    single_in: Option<SubscribeInstrument>,
+}
+
+impl ResubscribeAudit {
+    fn new(
+        slot: ConnectionSlot,
+        unsubscribe: &[SubscribeInstrument],
+        subscribe: &[SubscribeInstrument],
+    ) -> Self {
+        let single = |list: &[SubscribeInstrument]| match list {
+            [one] => Some(*one),
+            _ => None,
+        };
+        Self {
+            endpoint: slot.endpoint,
+            connection_index: slot.global_index,
+            single_out: single(unsubscribe),
+            single_in: single(subscribe),
+        }
+    }
+
+    /// The audit event: `reason` is the outcome slug, `added` / `removed` what
+    /// LANDED on the wire, `held` the socket's count afterwards.
+    fn event(
+        self,
+        reason: &'static str,
+        added: usize,
+        removed: usize,
+        held: usize,
+    ) -> WsSubscriptionAuditEvent {
+        let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        WsSubscriptionAuditEvent {
+            endpoint: self.endpoint,
+            connection_index: self.connection_index,
+            kind: tickvault_common::ws_event_types::WsEventKind::SubscriptionResubscribed,
+            reason,
+            dhan_code: None,
+            detail: tickvault_common::ws_event_types::WsSubscriptionDetail {
+                instrument: self.single_out.map(audit_instrument),
+                new_instrument: self.single_in.map(audit_instrument),
+                added: Some(count(added)),
+                removed: Some(count(removed)),
+                held: Some(count(held)),
+            },
+        }
+    }
+
+    fn emit(self, reason: &'static str, added: usize, removed: usize, held: usize) {
+        emit_subscription_audit(self.event(reason, added, removed, held));
+    }
+}
+
+/// The audit event for a ghost unsubscribe resend (`outcome` is the label
+/// [`resend_ghost_unsubscribe`] returned).
+fn ghost_resend_audit_event(
+    slot: ConnectionSlot,
+    ghost: SubscribeInstrument,
+    outcome: &'static str,
+    held: u32,
+) -> WsSubscriptionAuditEvent {
+    WsSubscriptionAuditEvent {
+        endpoint: slot.endpoint,
+        connection_index: slot.global_index,
+        kind: tickvault_common::ws_event_types::WsEventKind::GhostUnsubscribeResent,
+        reason: outcome,
+        dhan_code: None,
+        detail: tickvault_common::ws_event_types::WsSubscriptionDetail {
+            instrument: Some(audit_instrument(ghost)),
+            new_instrument: None,
+            added: Some(0),
+            removed: Some(u32::from(outcome == "sent")),
+            held: Some(held),
+        },
+    }
+}
+
+/// The audit event for a socket parked because Dhan closed it with 805.
+/// `held` is how many instruments it carried when it went dark.
+fn overflow_park_audit_event(
+    slot: ConnectionSlot,
+    dhan_code: Option<u16>,
+    held: u32,
+) -> WsSubscriptionAuditEvent {
+    WsSubscriptionAuditEvent {
+        endpoint: slot.endpoint,
+        connection_index: slot.global_index,
+        kind: tickvault_common::ws_event_types::WsEventKind::OverflowParked,
+        reason: ParkReason::PoolOverflow.as_str(),
+        dhan_code,
+        detail: tickvault_common::ws_event_types::WsSubscriptionDetail {
+            instrument: None,
+            new_instrument: None,
+            added: None,
+            removed: None,
+            held: Some(held),
+        },
+    }
 }
 
 /// One captured frame and the sequence it was stamped with at the read
@@ -5246,6 +5591,22 @@ impl WalRingSink {
         self.wal_dropped.increment(0);
         self.ring_full.increment(0);
         self.ring_bytes_full.increment(0);
+        tickvault_storage::wal_frame_fate::pre_register();
+    }
+
+    /// Audit M1 (2026-10-04): records that this frame was shed at the ring
+    /// while its only other copy is a WAL record still QUEUED for the writer.
+    /// If the writer then fails to write it, `wal_frame_fate` counts the frame
+    /// as lost on `tv_ticks_lost_total{source="wal_lost_after_shed"}`; if the
+    /// writer had already lost it, it is counted here. O(1), zero allocation:
+    /// one load and a CAS on one slot, shed arm only.
+    #[inline]
+    fn note_ring_shed(&self, seq: u64) {
+        let _mark = tickvault_storage::wal_frame_fate::frame_fate().note_shed(
+            seq,
+            tickvault_storage::wal_frame_fate::ShedKind::Ring,
+            self.ws_type,
+        );
     }
 }
 
@@ -5369,6 +5730,7 @@ impl FrameSink for WalRingSink {
                     return FrameSinkOutcome::WalDropped;
                 }
                 tickvault_storage::wal_applied_watermark::applied_watermark().note_unapplied(seq);
+                self.note_ring_shed(seq);
                 return FrameSinkOutcome::RingFull;
             }
             // Counted on `ring_full` ONLY, deliberately. That is exactly what
@@ -5383,6 +5745,7 @@ impl FrameSink for WalRingSink {
                     return FrameSinkOutcome::WalDropped;
                 }
                 tickvault_storage::wal_applied_watermark::applied_watermark().note_unapplied(seq);
+                self.note_ring_shed(seq);
                 return FrameSinkOutcome::RingFull;
             }
         }
@@ -5412,6 +5775,7 @@ impl FrameSink for WalRingSink {
                 return FrameSinkOutcome::WalDropped;
             }
             tickvault_storage::wal_applied_watermark::applied_watermark().note_unapplied(seq);
+            self.note_ring_shed(seq);
             return FrameSinkOutcome::RingFull;
         }
         // Reaching here with the class slot caps summing to the channel's
@@ -6279,6 +6643,11 @@ where
     K: FrameSink + ?Sized,
 {
     let endpoint = supervisor.slot().endpoint;
+    // Audit M8 (2026-10-04): one `subscription_resubscribed` row per command
+    // that is not a no-op, refused ones included. Captured here, before the
+    // lists are consumed; it names an instrument only for a one-instrument
+    // leg and otherwise records counts. Per command, never per frame.
+    let audit = ResubscribeAudit::new(supervisor.slot(), &unsubscribe, &subscribe);
     let count = |label: &'static str| {
         metrics::counter!(
             INPLACE_CHANGE_METRIC,
@@ -6295,6 +6664,7 @@ where
     if inplace_change_blocked_by_805(endpoint, rotation_halted()) {
         metrics::counter!(DIAL_REFUSED_AFTER_805_METRIC, "path" => "resubscribe").increment(1);
         count("refused_halted_805");
+        audit.emit(ResubscribeOutcome::REASON_HALTED_805, 0, 0, guard.len());
         answer_resubscribe(
             ack,
             ResubscribeOutcome::Refused {
@@ -6323,6 +6693,7 @@ where
                 "in-place resubscribe REFUSED before anything was sent - this socket keeps \
                  exactly the instruments it had"
             );
+            audit.emit(reason, 0, 0, guard.len());
             answer_resubscribe(ack, ResubscribeOutcome::Refused { reason });
             return SupervisorAction::Continue;
         }
@@ -6359,6 +6730,7 @@ where
     if let Some(decided) = unsub.decided {
         // The socket is going away; the replay sends the requested set.
         count("replay_pending");
+        audit.emit("replay_pending", 0, removed_landed, guard.len());
         answer_resubscribe(ack, ResubscribeOutcome::ReplayPending);
         return decided;
     }
@@ -6384,6 +6756,7 @@ where
              the socket stays up and keeps every instrument it still holds, and both lists go \
              back to the caller"
         );
+        audit.emit("stopped", 0, removed_landed, guard.len());
         answer_resubscribe(
             ack,
             ResubscribeOutcome::Stopped {
@@ -6412,6 +6785,7 @@ where
     .increment(sub.sent as u64);
     if let Some(decided) = sub.decided {
         count("replay_pending");
+        audit.emit("replay_pending", sub.sent, removed_landed, guard.len());
         answer_resubscribe(ack, ResubscribeOutcome::ReplayPending);
         return decided;
     }
@@ -6432,6 +6806,7 @@ where
                 "in-place resubscribe left the socket holding nothing - redialling so the \
                  replay subscribes the requested set"
             );
+            audit.emit("emptied_redial", 0, removed_landed, guard.len());
             answer_resubscribe(ack, ResubscribeOutcome::ReplayPending);
             return supervisor.on_event(ConnEvent::SubscribeFailed, Instant::now());
         }
@@ -6451,6 +6826,7 @@ where
         );
         // Every unsubscribe landed, so nothing is left to remove: the plan's
         // own buffer, emptied, is that list (no new allocation).
+        audit.emit("stopped", sub.sent, removed_landed, guard.len());
         let mut not_unsubscribed = plan.removed;
         not_unsubscribed.clear();
         answer_resubscribe(
@@ -6472,6 +6848,7 @@ where
         "in-place resubscribe applied on the live socket - unsubscribe then subscribe, no redial"
     );
     publish_connection_instruments(&supervisor.slot(), guard.len());
+    audit.emit("applied", sub.sent, removed_landed, guard.len());
     answer_resubscribe(ack, ResubscribeOutcome::Applied);
     SupervisorAction::Continue
 }
@@ -6711,6 +7088,17 @@ where
                     supervisor.last_disconnect_code(),
                     guard_len_u32(&guard),
                 );
+                // Audit M8 (2026-10-04): an 805 park also writes its own
+                // `overflow_parked` row, the queryable marker of the overflow
+                // episode, with the instruments the socket held. Once per
+                // park, never per frame.
+                if reason == ParkReason::PoolOverflow {
+                    emit_subscription_audit(overflow_park_audit_event(
+                        supervisor.slot(),
+                        supervisor.last_disconnect_code(),
+                        guard_len_u32(&guard),
+                    ));
+                }
                 info!(
                     endpoint,
                     pool_index,
@@ -7504,6 +7892,11 @@ where
                     .await;
                 }
                 Ok(LiveSubscriptionCommand::Swap { old, new, ack }) => {
+                    // Audit M8 (2026-10-04): every exit of this arm except the
+                    // no-op writes one `subscription_swapped` row, through
+                    // `answer_swap`. Per COMMAND, never per frame: `Copy`
+                    // fields only, one `try_send`.
+                    let swap_audit = SwapAudit::new(supervisor.slot(), old, new);
                     // THE 805 BREAKER, checked again where the write happens (scope
                     // lock 2026-10-01: after any 805 no depth-200 change is sent).
                     // The steering loop checks it when it plans, but a swap can sit
@@ -7514,19 +7907,22 @@ where
                     {
                         metrics::counter!(DIAL_REFUSED_AFTER_805_METRIC, "path" => "swap")
                             .increment(1);
-                        answer_swap(
-                            ack,
-                            SwapOutcome::NotHeld {
-                                reason: SwapOutcome::REASON_REFUSED,
-                            },
-                        );
+                        let outcome = SwapOutcome::NotHeld {
+                            reason: SwapOutcome::REASON_REFUSED,
+                        };
+                        // The ack says `refused` (the caller reverts); the
+                        // audit row says WHY: the 805 breaker.
+                        let mut refused = swap_audit.event(&outcome, guard_len_u32(guard));
+                        refused.reason = ResubscribeOutcome::REASON_HALTED_805;
+                        emit_subscription_audit(refused);
+                        answer_swap(ack, outcome, None);
                         continue;
                     }
                     match guard.try_swap(old, new) {
                         Ok(swap) if swap.is_no_op() => {
                             // The socket already carries what was asked for,
                             // and the caller is told so.
-                            answer_swap(ack, SwapOutcome::Held);
+                            answer_swap(ack, SwapOutcome::Held, None);
                             // The socket already carries what was asked for.
                             // Not counted and not logged: this is the ORDINARY
                             // minute, and a line per socket per minute would
@@ -7956,6 +8352,7 @@ where
                                         SwapOutcome::NotHeld {
                                             reason: SwapOutcome::REASON_EMPTIED,
                                         },
+                                        Some((swap_audit, guard_len_u32(guard))),
                                     );
                                     action = supervisor
                                         .on_event(ConnEvent::SubscribeFailed, Instant::now());
@@ -7975,6 +8372,7 @@ where
                                             SwapOutcome::REASON_WIRE_FAILED
                                         },
                                     },
+                                    Some((swap_audit, guard_len_u32(guard))),
                                 );
                                 // The socket's own decision (a close read
                                 // during the write) is handed back to the loop
@@ -7991,7 +8389,11 @@ where
                                      current at-the-money contract without a re-dial"
                                 );
                                 metrics::counter!(SWAP_TOTAL_METRIC).increment(1);
-                                answer_swap(ack, SwapOutcome::Held);
+                                answer_swap(
+                                    ack,
+                                    SwapOutcome::Held,
+                                    Some((swap_audit, guard_len_u32(guard))),
+                                );
                             }
                         }
                         Err(_) => {
@@ -8000,6 +8402,7 @@ where
                                 SwapOutcome::NotHeld {
                                     reason: SwapOutcome::REASON_REFUSED,
                                 },
+                                Some((swap_audit, guard_len_u32(guard))),
                             );
                             // Fail-closed and LOUD at the emit site, for the
                             // same reason the refused top-up is: `try_swap`
@@ -8241,8 +8644,18 @@ where
             && pending_ping.is_none()
             && let Some(ghost) = pending_ghost_unsubscribe.take()
         {
-            let (_outcome, decided) =
+            let (outcome, decided) =
                 resend_ghost_unsubscribe(socket, supervisor, sink, throttle, guard, ghost).await;
+            // Audit M8 (2026-10-04): one `ghost_unsubscribe_resent` row per
+            // resend decision, whatever its outcome (`sent`, `wire_failed`,
+            // `timed_out`, `held_again`, `halted_805`). At most once per
+            // cooldown per socket; never per frame.
+            emit_subscription_audit(ghost_resend_audit_event(
+                supervisor.slot(),
+                ghost,
+                outcome,
+                guard_len_u32(guard),
+            ));
             if let Some(decided) = decided {
                 action = decided;
             }
@@ -8526,10 +8939,11 @@ mod tests {
     use super::*;
     /// Test-only: clears every slot so tests do not see each other's requests.
     fn reset_ghost_redials_for_tests() {
-        for (((p, l), c), r) in GHOST_PENDING
+        for (((p, l), c), r) in GHOST_REGISTER
+            .pending
             .iter()
-            .zip(GHOST_LAST_ARMED.iter())
-            .zip(GHOST_ARMED_COUNT.iter())
+            .zip(GHOST_REGISTER.last_armed.iter())
+            .zip(GHOST_REGISTER.armed_count.iter())
             .zip(GHOST_CEILING_REPORTED.iter())
         {
             p.store(false, std::sync::atomic::Ordering::Release);
@@ -8537,11 +8951,17 @@ mod tests {
             c.store(0, std::sync::atomic::Ordering::Relaxed);
             r.store(false, std::sync::atomic::Ordering::Release);
         }
-        for (id, segment) in GHOST_SECURITY_ID.iter().zip(GHOST_SEGMENT_CODE.iter()) {
+        for (id, segment) in GHOST_REGISTER
+            .security_id
+            .iter()
+            .zip(GHOST_REGISTER.segment_code.iter())
+        {
             id.store(0, std::sync::atomic::Ordering::Relaxed);
             segment.store(u8::MAX, std::sync::atomic::Ordering::Relaxed);
         }
-        GHOST_POOL_LAST_ARMED.store(0, std::sync::atomic::Ordering::Relaxed);
+        GHOST_REGISTER
+            .pool_last_armed
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     use proptest::prelude::*;
@@ -10297,7 +10717,7 @@ mod tests {
         let mut armed = 0_u64;
         for round in 0..ROUNDS {
             // Lift the session ceiling so the race runs for every round.
-            GHOST_ARMED_COUNT[usize::from(SLOT)].store(0, Ordering::Relaxed);
+            GHOST_REGISTER.armed_count[usize::from(SLOT)].store(0, Ordering::Relaxed);
             let (id, code) = if round % 2 == 0 { (1, 2) } else { (2, 1) };
             let now = (round + 1) * GHOST_RESEND_COOLDOWN_SECS;
             if request_ghost_unsubscribe(SLOT, id, code, now).is_ok() {
@@ -17986,5 +18406,252 @@ mod tests {
         let arm = &prod[parked..parked + 300];
         assert!(arm.contains("Some(ParkReason::PoolOverflow)"));
         assert!(arm.contains("OverflowEpisodeKind::for_endpoint(self.slot.endpoint).is_some()"));
+    }
+}
+
+/// Audit M8 (2026-10-04): the four subscription-change audit rows.
+#[cfg(test)]
+mod subscription_audit_tests {
+    use super::*;
+    use tickvault_common::ws_event_types::{WsAuditInstrument, WsEventKind};
+
+    fn slot(endpoint: DhanEndpointType, global_index: u8) -> ConnectionSlot {
+        ConnectionSlot {
+            account: crate::websocket::pool_budget::DhanAccount::Primary,
+            endpoint,
+            pool_index: 0,
+            global_index,
+        }
+    }
+
+    fn inst(security_id: SecurityId, segment: ExchangeSegment) -> SubscribeInstrument {
+        SubscribeInstrument {
+            security_id,
+            segment,
+        }
+    }
+
+    fn production() -> &'static str {
+        let src = include_str!("pool_supervisor.rs");
+        src.split("#[cfg(test)]").next().unwrap_or(src)
+    }
+
+    #[test]
+    fn the_emit_try_sends_and_counts_a_drop_instead_of_blocking() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<WsSubscriptionAuditEvent>(1);
+        let event = overflow_park_audit_event(slot(DhanEndpointType::Depth200, 12), Some(805), 1);
+        assert!(try_emit_subscription_audit(&tx, event));
+        // Full: refused at once, never awaited.
+        assert!(!try_emit_subscription_audit(&tx, event));
+        assert_eq!(rx.try_recv().ok(), Some(event));
+        drop(rx);
+        // Closed: also refused, also counted, never a panic.
+        assert!(!try_emit_subscription_audit(&tx, event));
+    }
+
+    #[test]
+    fn a_swap_row_names_both_instruments_by_composite_key_and_its_outcome() {
+        let old = inst(52_175, ExchangeSegment::NseFno);
+        let new = inst(52_176, ExchangeSegment::NseFno);
+        let audit = SwapAudit::new(slot(DhanEndpointType::Depth200, 12), old, new);
+        let held = audit.event(&SwapOutcome::Held, 1);
+        assert_eq!(held.kind, WsEventKind::SubscriptionSwapped);
+        assert_eq!(held.connection_index, 12);
+        assert_eq!(held.endpoint, DhanEndpointType::Depth200);
+        assert_eq!(held.reason, "applied");
+        assert_eq!(
+            held.detail.instrument,
+            Some(WsAuditInstrument {
+                security_id: 52_175,
+                segment: ExchangeSegment::NseFno
+            })
+        );
+        assert_eq!(
+            held.detail.new_instrument,
+            Some(WsAuditInstrument {
+                security_id: 52_176,
+                segment: ExchangeSegment::NseFno
+            })
+        );
+        assert_eq!(
+            (held.detail.added, held.detail.removed, held.detail.held),
+            (Some(1), Some(1), Some(1))
+        );
+        let refused = audit.event(
+            &SwapOutcome::NotHeld {
+                reason: SwapOutcome::REASON_REFUSED,
+            },
+            1,
+        );
+        assert_eq!(refused.reason, "refused");
+        assert_eq!(
+            (refused.detail.added, refused.detail.removed),
+            (Some(0), Some(0))
+        );
+        let emptied = audit.event(
+            &SwapOutcome::NotHeld {
+                reason: SwapOutcome::REASON_EMPTIED,
+            },
+            1,
+        );
+        assert_eq!(emptied.reason, "emptied");
+        assert_eq!(
+            (emptied.detail.added, emptied.detail.removed),
+            (Some(0), Some(1))
+        );
+    }
+
+    #[test]
+    fn a_resubscribe_row_carries_counts_and_names_only_a_single_instrument() {
+        let a = inst(1, ExchangeSegment::NseFno);
+        let b = inst(1, ExchangeSegment::NseEquity);
+        let c = inst(3, ExchangeSegment::NseFno);
+        let s = slot(DhanEndpointType::MainFeed, 2);
+        let multi = ResubscribeAudit::new(s, &[a, b], &[c]).event("applied", 1, 2, 4_000);
+        assert_eq!(multi.kind, WsEventKind::SubscriptionResubscribed);
+        assert_eq!(multi.detail.instrument, None, "two left: counts only");
+        assert_eq!(
+            multi.detail.new_instrument,
+            Some(WsAuditInstrument {
+                security_id: 3,
+                segment: ExchangeSegment::NseFno
+            })
+        );
+        assert_eq!(
+            (multi.detail.added, multi.detail.removed, multi.detail.held),
+            (Some(1), Some(2), Some(4_000))
+        );
+        let single = ResubscribeAudit::new(s, &[b], &[]).event("refused", 0, 0, 10);
+        // Same id, other segment: the row keeps the segment (I-P1-11).
+        assert_eq!(
+            single.detail.instrument,
+            Some(WsAuditInstrument {
+                security_id: 1,
+                segment: ExchangeSegment::NseEquity
+            })
+        );
+        assert_eq!(single.detail.new_instrument, None);
+        let huge = ResubscribeAudit::new(s, &[], &[]).event("applied", usize::MAX, 0, 0);
+        assert_eq!(huge.detail.added, Some(u32::MAX), "saturates, never wraps");
+    }
+
+    #[test]
+    fn a_ghost_row_and_an_overflow_park_row() {
+        let ghost = inst(52_175, ExchangeSegment::NseFno);
+        let s = slot(DhanEndpointType::Depth20, 7);
+        let sent = ghost_resend_audit_event(s, ghost, "sent", 49);
+        assert_eq!(sent.kind, WsEventKind::GhostUnsubscribeResent);
+        assert_eq!(sent.reason, "sent");
+        assert_eq!(sent.detail.removed, Some(1));
+        assert_eq!(sent.detail.held, Some(49));
+        assert_eq!(
+            sent.detail.instrument.map(|i| (i.security_id, i.segment)),
+            Some((52_175, ExchangeSegment::NseFno))
+        );
+        let held_again = ghost_resend_audit_event(s, ghost, "held_again", 50);
+        assert_eq!(held_again.detail.removed, Some(0));
+        let park = overflow_park_audit_event(s, Some(805), 50);
+        assert_eq!(park.kind, WsEventKind::OverflowParked);
+        assert_eq!(park.reason, ParkReason::PoolOverflow.as_str());
+        assert_eq!(park.dhan_code, Some(805));
+        assert_eq!(park.detail.held, Some(50));
+        assert_eq!(park.detail.instrument, None);
+    }
+
+    /// Every swap exit except the no-op passes its audit to `answer_swap`,
+    /// and the 805-breaker exit emits its own row.
+    #[test]
+    fn every_swap_exit_writes_an_audit_row() {
+        let prod = production();
+        let arm = prod
+            .find("Ok(LiveSubscriptionCommand::Swap { old, new, ack }) => {")
+            .expect("the swap arm");
+        let end = prod[arm..]
+            .find("Ok(LiveSubscriptionCommand::ProbeUnsubscribe {")
+            .expect("the next arm");
+        let body = &prod[arm..arm + end];
+        assert!(body.contains("let swap_audit = SwapAudit::new(supervisor.slot(), old, new);"));
+        let calls = body.matches("answer_swap(").count();
+        let audited = body
+            .matches("Some((swap_audit, guard_len_u32(guard))),")
+            .count();
+        let unaudited = body
+            .matches("answer_swap(ack, SwapOutcome::Held, None);")
+            .count()
+            + body.matches("answer_swap(ack, outcome, None);").count();
+        assert_eq!(unaudited, 2, "only the no-op and the 805 exit pass None");
+        assert_eq!(
+            audited + unaudited,
+            calls,
+            "an answer_swap with no audit row"
+        );
+        assert!(body.contains("refused.reason = ResubscribeOutcome::REASON_HALTED_805;"));
+        assert!(body.contains("emit_subscription_audit(refused);"));
+    }
+
+    /// Every resubscribe exit except the no-op writes an audit row.
+    #[test]
+    fn every_resubscribe_exit_writes_an_audit_row() {
+        let prod = production();
+        let start = prod
+            .find("async fn apply_resubscribe")
+            .expect("apply_resubscribe");
+        let end = prod[start..]
+            .find("\n/// Why a supervised connection loop returned.")
+            .expect("end of apply_resubscribe");
+        let body = &prod[start..start + end];
+        assert!(body.contains(
+            "let audit = ResubscribeAudit::new(supervisor.slot(), &unsubscribe, &subscribe);"
+        ));
+        let answers = body.matches("answer_resubscribe(").count();
+        let emits = body.matches("audit.emit(").count();
+        assert_eq!(emits + 1, answers, "every non-no-op answer is audited");
+    }
+
+    #[test]
+    fn the_ghost_resend_and_the_805_park_write_audit_rows() {
+        let prod = production();
+        let call = prod
+            .find(
+                "resend_ghost_unsubscribe(socket, supervisor, sink, throttle, guard, ghost).await;",
+            )
+            .expect("the resend call");
+        assert!(
+            prod[call..call + 600].contains("emit_subscription_audit(ghost_resend_audit_event("),
+            "the ghost resend must write its audit row"
+        );
+        let park = prod
+            .find("SupervisorAction::Park { reason } => {")
+            .expect("the park arm");
+        let arm = &prod[park..park + 3_000];
+        assert!(arm.contains("if reason == ParkReason::PoolOverflow {"));
+        assert!(arm.contains("emit_subscription_audit(overflow_park_audit_event("));
+    }
+
+    /// The process channel installs once; a second install is refused and
+    /// the first channel keeps receiving.
+    #[test]
+    fn install_subscription_audit_is_set_once() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<WsSubscriptionAuditEvent>(4_096);
+        let first = install_subscription_audit(tx);
+        let (tx2, _rx2) = tokio::sync::mpsc::channel::<WsSubscriptionAuditEvent>(1);
+        assert!(
+            !install_subscription_audit(tx2),
+            "a second install must be refused"
+        );
+        if first {
+            // Unique marker: other tests in this process may emit too.
+            let marker =
+                overflow_park_audit_event(slot(DhanEndpointType::Depth200, 31), Some(4_242), 7);
+            emit_subscription_audit(marker);
+            let mut found = false;
+            while let Ok(event) = rx.try_recv() {
+                if event == marker {
+                    found = true;
+                    break;
+                }
+            }
+            assert!(found, "the installed channel must receive the emit");
+        }
     }
 }

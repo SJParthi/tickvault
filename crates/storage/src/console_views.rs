@@ -169,6 +169,8 @@ async fn run_view_drop(client: &Client, base_url: &str, view: &str) {
         Err(err) => {
             metrics::counter!(VIEW_DDL_COUNTER, "outcome" => "transport").increment(1);
             error!(
+                code = tickvault_common::error_code::ErrorCode::Boot01QuestDbSlow.code_str(),
+                source = "retired_view_drop",
                 view,
                 ?err,
                 "retired view DROP request failed — retries next boot"

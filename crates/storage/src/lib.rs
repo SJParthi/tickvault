@@ -299,6 +299,9 @@ pub mod wal_applied_watermark;
 // Deferred-depth marks (2026-09-29, plan item 45a): frames whose depth rows the
 // ingest shed skipped are kept from the WAL prunes until written back.
 pub mod wal_deferred_depth;
+// Frame fate (2026-10-04, audit M1): a shed frame whose WAL record the writer
+// then loses is counted as a lost frame, not a WAL hiccup.
+pub mod wal_frame_fate;
 
 // Stage-2 dead-WS sweep (2026-07-17): the `tick_persistence_testing` shim and
 // `spill_dir_test_lock` (both consumed only by the deleted tick benches/DHAT

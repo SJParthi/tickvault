@@ -4,11 +4,11 @@
 //! struct with a single sync `run_one_cycle` entry point that the
 //! eventual tokio loop (item 1.2f.5) will call on a timer:
 //!
-//! - **Producer side**: `tokio::sync::mpsc::Sender<BufferedSeal>` —
+//! - **Producer side**: [`SealSender`] (a bounded `crossbeam_channel`) —
 //!   the future aggregator hot path uses this to enqueue seals via
 //!   `try_send` (non-blocking on overflow).
 //! - **Consumer side** (this struct):
-//!   - `tokio::sync::mpsc::Receiver<BufferedSeal>` — drained
+//!   - the matching `crossbeam_channel::Receiver<BufferedSeal>` — drained
 //!     non-blockingly via `try_recv`.
 //!   - [`SealAbsorptionPipeline`] — owned, single-threaded, holds the
 //!     local ring + spill + DLQ.
@@ -58,9 +58,23 @@
 //! - Reconnect throttle for `ShadowCandleWriter` (item 1.2f.5).
 //! - Boot wiring + Prom counter increments (item 1.4).
 
-use tokio::sync::mpsc;
-
 use tickvault_trading::candles::BufferedSeal;
+
+/// The producer side of the sealed-candle hand-off queue (audit N2,
+/// 2026-10-04).
+///
+/// A bounded `crossbeam_channel` (array flavour), not a tokio `mpsc`: the
+/// tokio channel grows its buffer in 32-slot blocks as items queue, so under
+/// a backlog a `try_send` on the frame drain allocated. The array channel
+/// allocates all [`SEAL_MPSC_CAPACITY`] slots once, when the runner is built,
+/// and `try_send` never allocates after that. `try_send` and `try_recv` are
+/// non-blocking and O(1), as before.
+pub type SealSender = crossbeam_channel::Sender<BufferedSeal>;
+
+/// The refusal a full or disconnected [`SealSender`] returns; it carries the
+/// seal back (`into_inner`). Re-exported so producers in other crates name
+/// the queue's own type rather than depending on `crossbeam_channel`.
+pub use crossbeam_channel::TrySendError as SealTrySendError;
 
 use crate::seal_absorption::{SealAbsorptionPipeline, SubmitOutcome};
 use crate::seal_dlq::SealDlqWriter;
@@ -107,8 +121,7 @@ fn production_dlq_dir() -> std::path::PathBuf {
 /// counter increment per call site and continue. The legacy
 /// `candles_1s` path is still feeding production trading; only the
 /// new shadow-table pipeline goes dark.
-static GLOBAL_SEAL_SENDER: std::sync::OnceLock<mpsc::Sender<BufferedSeal>> =
-    std::sync::OnceLock::new();
+static GLOBAL_SEAL_SENDER: std::sync::OnceLock<SealSender> = std::sync::OnceLock::new();
 
 /// Install the global seal Sender. Idempotent — returns `true` on
 /// first install; subsequent calls return `false` and do NOT replace
@@ -117,7 +130,7 @@ static GLOBAL_SEAL_SENDER: std::sync::OnceLock<mpsc::Sender<BufferedSeal>> =
 /// Caller (typically the boot sequence in `main.rs`) MUST call this
 /// BEFORE moving the `SealWriterRunner` into its `tokio::spawn` block,
 /// because `runner.sender()` becomes inaccessible after the move.
-pub fn set_global_seal_sender(sender: mpsc::Sender<BufferedSeal>) -> bool {
+pub fn set_global_seal_sender(sender: SealSender) -> bool {
     GLOBAL_SEAL_SENDER.set(sender).is_ok()
 }
 
@@ -137,7 +150,7 @@ pub fn set_global_seal_sender(sender: mpsc::Sender<BufferedSeal>) -> bool {
 /// [`global_seal_overflow`] instead; only a seal that fails BOTH the spill
 /// and the DLQ is genuinely lost, and that case fires AGGREGATOR-DROP-01.
 #[must_use]
-pub fn global_seal_sender() -> Option<&'static mpsc::Sender<BufferedSeal>> {
+pub fn global_seal_sender() -> Option<&'static SealSender> {
     GLOBAL_SEAL_SENDER.get()
 }
 
@@ -220,7 +233,9 @@ pub struct SealOverflow {
 /// `the_queue_depth_is_drainable_inside_the_shutdown_budget`. It does NOT fit
 /// when the disk refuses the batch: the seals then go to the DLQ one record
 /// at a time, and whatever is still queued at the deadline is counted as
-/// abandoned at shutdown.
+/// abandoned at shutdown. Since PR17 the thread also syncs the day file:
+/// a full queue keeps every batch full, so it syncs at most once a second
+/// plus once at exit, about 6 extra `sync_data` calls inside the budget.
 ///
 /// Overflow is still NOT a loss: a full queue falls back to the inline
 /// cascade, degraded rather than lossy. Past one full burst of refusals
@@ -240,6 +255,11 @@ pub const SEAL_ESCALATION_BATCH: usize = 1_024;
 /// How often the escalation thread wakes to re-check its stop flag while the
 /// queue is empty.
 const SEAL_ESCALATION_STOP_POLL: std::time::Duration = std::time::Duration::from_millis(100); // APPROVED: this IS the named constant the rule asks for
+
+/// Longest the escalation thread lets written seals sit unsynced while a
+/// burst keeps the queue full (PR17). A batch that empties the queue is
+/// synced at once.
+const SEAL_ESCALATION_SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1); // APPROVED: this IS the named constant the rule asks for
 
 /// Seals handed to the escalation thread (the happy path once installed).
 pub const SEAL_ESCALATION_QUEUED_COUNTER: &str = "tv_seal_escalation_queued_total";
@@ -485,6 +505,23 @@ impl SealEscalationSink {
         spill_writes
     }
 
+    /// Syncs the spill day file and every DLQ day file this thread (or the
+    /// drain's inline fallback) wrote since the last sync (PR17; the DLQ
+    /// since 2026-10-04). Off the drain, off both append locks.
+    fn sync_written(&self) {
+        self.spill.sync_open_file();
+        self.dlq.sync_written();
+    }
+
+    /// Syncs the day file once more before the thread exits, when the last
+    /// batch was full and so was not synced on its own (PR17).
+    fn final_sync(&self, unsynced: bool, summary: &mut SealEscalationRunSummary) {
+        if unsynced {
+            self.sync_written();
+            summary.syncs += 1;
+        }
+    }
+
     /// Drain the queue until the sender is gone, or until the stop flag is set
     /// AND the queue is empty.
     ///
@@ -506,6 +543,12 @@ impl SealEscalationSink {
         let mut batch: Vec<SealEscalationItem> = Vec::with_capacity(SEAL_ESCALATION_BATCH);
         let mut scratch: Vec<u8> =
             Vec::with_capacity(SEAL_ESCALATION_BATCH * crate::seal_spill::SEAL_SPILL_RECORD_SIZE);
+        // PR17: the day file is synced after a batch that empties the queue,
+        // and at least once a second under a sustained burst, so a seal the
+        // spill holds reaches the device within about a second. The drain
+        // never syncs: only this thread does.
+        let mut unsynced = false;
+        let mut last_sync = std::time::Instant::now();
         loop {
             match self.rx.recv_timeout(SEAL_ESCALATION_STOP_POLL) {
                 Ok(first) => {
@@ -523,16 +566,29 @@ impl SealEscalationSink {
                     summary.batches += 1;
                     summary.records += batch.len();
                     summary.spill_writes += self.write_batch(&batch, &mut scratch, &on_lost);
+                    unsynced = true;
+                    if batch.len() < SEAL_ESCALATION_BATCH
+                        || last_sync.elapsed() >= SEAL_ESCALATION_SYNC_INTERVAL
+                    {
+                        self.sync_written();
+                        summary.syncs += 1;
+                        unsynced = false;
+                        last_sync = std::time::Instant::now();
+                    }
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     // Only exit on an EMPTY queue: a pending item always
                     // returns `Ok` above, so a stop request can never cut the
                     // drain short.
                     if self.stop.load(Ordering::Acquire) {
+                        self.final_sync(unsynced, &mut summary);
                         return summary;
                     }
                 }
-                Err(RecvTimeoutError::Disconnected) => return summary,
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.final_sync(unsynced, &mut summary);
+                    return summary;
+                }
             }
         }
     }
@@ -548,6 +604,10 @@ pub struct SealEscalationRunSummary {
     /// Spill writes made: one per batch, plus one for a batch that straddles
     /// IST midnight. Each is one `append_seals` call, i.e. one `write(2)`.
     pub spill_writes: usize,
+    /// `sync_data` calls on the spill day file (PR17): one after each batch
+    /// that empties the queue, at least one a second under a burst, and one
+    /// at exit when the last batch was not yet synced.
+    pub syncs: usize,
 }
 
 /// What happened to a seal the writer channel refused.
@@ -775,18 +835,26 @@ impl SealOverflow {
                     // that makes the caller wait on the disk. The queued arm
                     // above reads no clock.
                     let started = std::time::Instant::now();
-                    let outcome = Self::escalate_inline(
-                        &self.spill,
-                        &self.dlq,
-                        &item.seal,
-                        item.now_unix_secs,
-                    );
+                    // Audit M10: the write blocks, so the tokio worker is
+                    // moved aside first, as the tick writer does for its
+                    // inline spill. The drain still waits for the write; the
+                    // other tasks on its worker do not.
+                    let outcome = crate::off_worker::off_worker(|| {
+                        Self::escalate_inline(
+                            &self.spill,
+                            &self.dlq,
+                            &item.seal,
+                            item.now_unix_secs,
+                        )
+                    });
                     self.note_inline_wait(started.elapsed(), outcome, item.now_unix_secs);
                     return outcome;
                 }
             }
         }
-        Self::escalate_inline(&self.spill, &self.dlq, &serialised, now_unix_secs)
+        crate::off_worker::off_worker(|| {
+            Self::escalate_inline(&self.spill, &self.dlq, &serialised, now_unix_secs)
+        })
     }
 }
 
@@ -858,11 +926,15 @@ pub fn global_seal_overflow() -> Option<&'static SealOverflow> {
 /// `TF_COUNT` and both follow, and the ratchet below fails the build if
 /// they ever diverge again.
 ///
-/// Cost at the derived value: the mpsc allocates its buffer lazily per
-/// queued item (tokio `mpsc` does NOT pre-allocate capacity slots), so
-/// the steady-state cost is ~0 and the worst case equals the burst
-/// itself — 250,000 × ≤168 B ≈ **42 MB**, matching the ring, 0.12% of
-/// the r8g.xlarge 32 GiB host (operator Quote 13, 2026-08-08).
+/// Cost at the derived value: **⚠ CHANGED 2026-10-04 (audit N2)** — the
+/// queue is now a pre-sized `crossbeam_channel` array ([`SealSender`]), so
+/// every slot is allocated and written once when the runner is built: about
+/// 250,000 × (8 + `size_of::<BufferedSeal>()`, at most 176 B, asserted at
+/// compile time in `seal_ring.rs`) ≤ **46 MB resident from boot**,
+/// where the tokio channel it replaced was ~0 at rest and grew to ~42 MB only
+/// during a burst, allocating as it grew (on the frame drain's `try_send`).
+/// 0.13% of the r8g.xlarge 32 GiB host (operator Quote 13, 2026-08-08); no
+/// AWS cost, the instance is unchanged.
 pub const SEAL_MPSC_CAPACITY: usize = tickvault_trading::candles::SEAL_BUFFER_CAPACITY;
 
 /// Outcome of one [`SealWriterRunner::run_one_cycle`] call.
@@ -931,9 +1003,9 @@ impl CycleOutcome {
 pub struct SealWriterRunner {
     /// Cloneable producer-side handle. The future aggregator wiring
     /// holds clones of this; this struct holds the receiver.
-    sender: mpsc::Sender<BufferedSeal>,
+    sender: SealSender,
     /// Consumer-side mpsc receiver. Drained non-blockingly per cycle.
-    receiver: mpsc::Receiver<BufferedSeal>,
+    receiver: crossbeam_channel::Receiver<BufferedSeal>,
     /// Owned absorption pipeline (local ring + spill + DLQ).
     pipeline: SealAbsorptionPipeline,
     /// Owned ILP writer.
@@ -969,7 +1041,7 @@ impl SealWriterRunner {
         let writer = ShadowCandleWriter::new(questdb_config)?;
         let pipeline = SealAbsorptionPipeline::new();
         let spill = pipeline.spill_handle();
-        let (sender, receiver) = mpsc::channel(SEAL_MPSC_CAPACITY);
+        let (sender, receiver) = crossbeam_channel::bounded(SEAL_MPSC_CAPACITY);
         Ok(Self {
             sender,
             receiver,
@@ -1023,7 +1095,7 @@ impl SealWriterRunner {
             dlq_dir.clone(),
         );
         let spill = pipeline.spill_handle();
-        let (sender, receiver) = mpsc::channel(mpsc_capacity);
+        let (sender, receiver) = crossbeam_channel::bounded(mpsc_capacity);
         Self {
             sender,
             receiver,
@@ -1070,7 +1142,7 @@ impl SealWriterRunner {
     /// these clones into the per-instrument cell hot-path so the
     /// `try_send(seal)` call can fire from any thread without blocking.
     #[must_use]
-    pub fn sender(&self) -> mpsc::Sender<BufferedSeal> {
+    pub fn sender(&self) -> SealSender {
         self.sender.clone()
     }
 
@@ -1103,8 +1175,8 @@ impl SealWriterRunner {
     /// between two samples.
     ///
     /// # Complexity
-    /// O(1): three length reads (`tokio::sync::mpsc::Receiver::len` is a
-    /// counter read, not a walk).
+    /// O(1): three length reads (`crossbeam_channel::Receiver::len` on a
+    /// bounded channel reads two indices, not a walk).
     #[must_use]
     pub fn unwritten_seals(&self) -> usize {
         self.receiver
@@ -1148,8 +1220,8 @@ impl SealWriterRunner {
                         SubmitOutcome::Dropped(_) => outcome.mpsc_submit_dropped += 1,
                     }
                 }
-                Err(mpsc::error::TryRecvError::Empty) => break,
-                Err(mpsc::error::TryRecvError::Disconnected) => break,
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => break,
             }
         }
 
@@ -1160,6 +1232,11 @@ impl SealWriterRunner {
             self.max_drain_per_cycle,
             now_unix_secs,
         );
+
+        // Step 3: sync whatever this cycle (or the escalation thread, or the
+        // drain's inline fallback) wrote to the spill or the DLQ. A no-op
+        // without a write since the last sync.
+        self.pipeline.sync_escalated();
 
         outcome
     }
@@ -1300,6 +1377,45 @@ mod tests {
     }
 
     #[test]
+    fn test_run_one_cycle_syncs_what_the_outage_cascade_wrote() {
+        // 2026-10-04: seals the writer task spilled or dead-lettered while
+        // QuestDB was down reached the page cache only. Every cycle now syncs
+        // what tiers 2 and 3 wrote since the last one.
+        let (spill, dlq) = temp_pair("cycle-syncs");
+        let mut runner = SealWriterRunner::for_test(spill.clone(), dlq.clone(), 16, 16, 16);
+        let now = jan1_noon_utc();
+        let outcome = runner
+            .pipeline
+            .rescue_in_flight(mk_seal(13, 0, TfIndex::M1, 34_200, 101.5), now);
+        assert_eq!(outcome, SubmitOutcome::Spilled);
+        assert!(
+            runner.pipeline.spill_handle().has_unsynced_writes(),
+            "the spill holds an unsynced seal before the cycle"
+        );
+        let dlq_writer = runner.pipeline.dlq_handle();
+        dlq_writer
+            .append_record(
+                &crate::seal_dlq::SealDlqRecord::from(&crate::seal_spill::SerializedSeal::from(
+                    &mk_seal(25, 0, TfIndex::M1, 34_260, 99.0),
+                )),
+                now,
+            )
+            .unwrap_or_else(|err| panic!("dlq append: {err}"));
+        assert!(dlq_writer.has_unsynced_writes());
+        let cycle = runner.run_one_cycle(now);
+        assert!(cycle.is_idle(), "{cycle:?}");
+        assert!(
+            !runner.pipeline.spill_handle().has_unsynced_writes(),
+            "the cycle must sync the spill"
+        );
+        assert!(
+            !dlq_writer.has_unsynced_writes(),
+            "the cycle must sync the DLQ"
+        );
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
     fn test_run_one_cycle_mpsc_overflows_ring_into_spill() {
         // Ring capacity 2, mpsc capacity 8 → 5 seals submitted means
         // ring overflows by 3 → 3 evicted to spill BEFORE the drain
@@ -1359,7 +1475,7 @@ mod tests {
         tx.try_send(s2).expect("ok 2");
         let result = tx.try_send(s3);
         match result {
-            Err(mpsc::error::TrySendError::Full(returned)) => {
+            Err(SealTrySendError::Full(returned)) => {
                 assert_eq!(returned.security_id, 51);
                 assert_eq!(returned.state.close, 300.0);
             }
@@ -1508,15 +1624,15 @@ mod tests {
         // test installed it). The accessor signature is the contract;
         // null-before-install is a property of OnceLock itself, not
         // our wrapper.
-        let _: Option<&'static mpsc::Sender<BufferedSeal>> = global_seal_sender();
+        let _: Option<&'static SealSender> = global_seal_sender();
     }
 
     #[test]
     fn test_set_global_seal_sender_is_idempotent() {
         // The OnceLock semantics: only the FIRST set() succeeds.
         // Subsequent calls return Err (we wrap as `false`).
-        let (tx_a, _rx_a) = mpsc::channel::<BufferedSeal>(8);
-        let (tx_b, _rx_b) = mpsc::channel::<BufferedSeal>(8);
+        let (tx_a, _rx_a) = crossbeam_channel::bounded::<BufferedSeal>(8);
+        let (tx_b, _rx_b) = crossbeam_channel::bounded::<BufferedSeal>(8);
         let first = set_global_seal_sender(tx_a);
         let second = set_global_seal_sender(tx_b);
         // First MAY be true (if no prior install) OR false (if another
@@ -2271,8 +2387,17 @@ mod tests {
                 batches: 5,
                 records: total,
                 spill_writes: 5,
+                syncs: summary.syncs,
             },
             "a queued burst must be written SEAL_ESCALATION_BATCH records per write"
+        );
+        // PR17: the last batch (7 records) empties the queue, so it is always
+        // synced; a full batch is synced only once a second has passed, which
+        // depends on the disk, so only the bounds are pinned.
+        assert!(
+            (1..=summary.batches).contains(&summary.syncs),
+            "the burst must be synced at least once and at most once per batch, got {}",
+            summary.syncs
         );
 
         let records = read_spill_records(&spill);
@@ -2327,6 +2452,7 @@ mod tests {
                 batches: 2,
                 records: 2,
                 spill_writes: 2,
+                syncs: 2,
             }
         );
         assert_eq!(read_spill_records(&spill).len(), 2);

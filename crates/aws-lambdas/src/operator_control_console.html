@@ -242,7 +242,7 @@
 
 <script>
 const $=id=>document.getElementById(id);
-let TOKEN=localStorage.getItem('tv_token')||'';
+let TOKEN=sessionStorage.getItem('tv_token')||''; try{ localStorage.removeItem('tv_token'); }catch(e){}
 let timer=null, lastTicks=0, curTab='overview';
 
 function toast(m){ const t=$('toast'); t.textContent=m; t.classList.add('show'); clearTimeout(t._h); t._h=setTimeout(()=>t.classList.remove('show'),2600); }
@@ -250,8 +250,8 @@ function esc(s){ return String(s).replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&
 function setLive(on){ $('livedot').classList.toggle('on',on); $('livetxt').textContent=on?'live':'offline'; }
 
 function unlock(){ const v=($('tok').value||'').trim(); if(!v){ toast('Paste your key first'); return; }
-  TOKEN=v; localStorage.setItem('tv_token',v); $('lock').hidden=true; $('app').hidden=false; startAuto(); loadOverview(); }
-function lock(){ TOKEN=''; localStorage.removeItem('tv_token'); $('tok').value=''; stopAuto(); $('app').hidden=true; $('lock').hidden=false; setLive(false); toast('Locked — key forgotten on this device'); }
+  TOKEN=v; sessionStorage.setItem('tv_token',v); $('lock').hidden=true; $('app').hidden=false; startAuto(); loadOverview(); }
+function lock(){ TOKEN=''; sessionStorage.removeItem('tv_token'); $('tok').value=''; stopAuto(); $('app').hidden=true; $('lock').hidden=false; setLive(false); toast('Locked — key forgotten in this tab'); }
 
 function tab(name){ curTab=name; document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active',t.dataset.t===name));
   document.querySelectorAll('section[data-tab]').forEach(s=>s.hidden=s.dataset.tab!==name);
@@ -298,8 +298,8 @@ async function loadOverview(){ $('refbtn').innerHTML='<span class="spin">🔄</s
   // animated fabricated 0 (the _sum_counts docstring contract).
   if(j.rows_today_total==null||j.rows_today_total===''){ $('ticksbig').textContent='—'; lastTicks=0; }
   else countUp($('ticksbig'), j.rows_today_total);
-  $('p_inst').innerHTML='<span class="'+(running?'ok':'bad')+'">'+(j.instance_state||'?')+'</span>';
-  $('p_app').innerHTML='<span class="'+(appOk?'ok':'bad')+'">'+(appOk?'up':(j.app||'down'))+'</span>';
+  $('p_inst').innerHTML='<span class="'+(running?'ok':'bad')+'">'+esc(j.instance_state||'?')+'</span>';
+  $('p_app').innerHTML='<span class="'+(appOk?'ok':'bad')+'">'+(appOk?'up':esc(j.app||'down'))+'</span>';
   $('p_mkt').innerHTML='<span class="'+(j.market_hours?'warn':'')+'">'+(j.market_hours?'OPEN':'closed')+'</span>';
   // Danger-zone hard-lock label: data-destructive actions are server-refused
   // (409, no force escape) while the market is open — surface that BEFORE a click.
@@ -551,11 +551,11 @@ function startAuto(){ stopAuto(); if($('auto').checked) timer=setInterval(()=>{ 
 function stopAuto(){ if(timer){ clearInterval(timer); timer=null; } }
 function autotoggle(){ $('auto').checked?startAuto():stopAuto(); }
 
-// A URL ending in #key=<secret> (or ?key=) saves the device key, strips it from the
+// A URL ending in #key=<secret> (or ?key=) keeps the key for this tab only, strips it from the
 // address bar and unlocks. No alert sends such a link since 2026-09-27 (audit PR36a:
 // the key reached email and SMS history); the paste form above is the normal path.
 (function(){ var k=(location.hash.match(/key=([^&]+)/)||[])[1] || new URLSearchParams(location.search).get('key');
-  if(k){ try{ k=decodeURIComponent(k); }catch(e){} TOKEN=k; localStorage.setItem('tv_token',TOKEN);
+  if(k){ try{ k=decodeURIComponent(k); }catch(e){} TOKEN=k; sessionStorage.setItem('tv_token',TOKEN);
     try{ history.replaceState(null,'',location.pathname); }catch(e){} } })();
 if(TOKEN){ $('tok').value=TOKEN; $('lock').hidden=true; $('app').hidden=false; startAuto(); loadOverview(); }
 </script>

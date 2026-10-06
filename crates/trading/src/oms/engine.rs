@@ -26,6 +26,7 @@ use tickvault_common::order_types::{
     OrderStatus, OrderType, OrderUpdate, OrderValidity, TransactionType,
 };
 use tickvault_common::sanitize::capture_rest_error_body;
+use tickvault_common::types::ExchangeSegment;
 
 use super::api_client::OrderApiClient;
 use super::circuit_breaker::OrderCircuitBreaker;
@@ -44,6 +45,7 @@ use super::types::{
     PlaceForeverOcoRequest, PlaceOrderRequest, PlaceSuperOrderRequest, ReconciliationReport,
     SEGMENT_CODE_UNKNOWN, SUPER_ORDER_STATUS_ACCEPTED_UNPARSED_BODY, SlicingResponse,
     SuperOrderLegSnapshot, SuperOrderPlacement, VerifyState, parse_segment_chars,
+    resolve_order_segment_str,
 };
 
 // ---------------------------------------------------------------------------
@@ -751,6 +753,7 @@ impl OrderManagementSystem {
                 order_id: paper_order_id.clone(),
                 correlation_id: correlation_id.clone(),
                 security_id: request.security_id,
+                exchange_segment: request.exchange_segment,
                 transaction_type: request.transaction_type,
                 order_type: request.order_type,
                 product_type: request.product_type,
@@ -818,6 +821,8 @@ impl OrderManagementSystem {
                 // unexpected live-mode attempts during the sandbox window.
                 metrics::counter!("tv_sandbox_gate_blocks_total").increment(1);
                 error!(
+                    code = ErrorCode::OmsGapDryRunSafety.code_str(),
+                    source = "sandbox_enforcement",
                     "SANDBOX ENFORCEMENT: live orders blocked pending explicit \
                      re-arm (sentinel 2099-12-31; a dated operator quote + \
                      constant edit are required to go live)"
@@ -835,7 +840,11 @@ impl OrderManagementSystem {
         let dhan_request = DhanPlaceOrderRequest {
             dhan_client_id: self.client_id.clone(),
             transaction_type: request.transaction_type.as_str().to_owned(),
-            exchange_segment: EXCHANGE_SEGMENT_NSE_FNO.to_owned(),
+            // I-P1-11 (2026-10-04): the instrument's OWN segment, the same one
+            // the tracked `ManagedOrder` records. This was the constant
+            // `NSE_FNO` for every order whatever its instrument, so the wire
+            // and the order book could name two different instruments.
+            exchange_segment: request.exchange_segment.as_str().to_owned(),
             product_type: request.product_type.as_str().to_owned(),
             order_type: request.order_type.as_str().to_owned(),
             validity: request.validity.as_str().to_owned(),
@@ -905,6 +914,7 @@ impl OrderManagementSystem {
             order_id: response.order_id.clone(),
             correlation_id: correlation_id.clone(),
             security_id: request.security_id,
+            exchange_segment: request.exchange_segment,
             transaction_type: request.transaction_type,
             order_type: request.order_type,
             product_type: request.product_type,
@@ -1315,6 +1325,8 @@ impl OrderManagementSystem {
 
         if !is_valid_transition(old_status, new_status) {
             error!(
+                code = ErrorCode::OmsGapStateMachine.code_str(),
+                source = "invalid_transition",
                 order_id = %order_id,
                 from = %old_status.as_str(),
                 to = %new_status.as_str(),
@@ -1737,6 +1749,12 @@ impl OrderManagementSystem {
         // Step 0a: pure-rule validation (exit_rules — zero I/O).
         exit_rules::validate_super_order_request(&request)?;
 
+        // I-P1-11: the segment this order is booked under is the one its wire
+        // body carries (super orders send the `EXCHANGE_SEGMENT_NSE_FNO`
+        // constant). Parsed, never assumed; an unknown string refuses here,
+        // before any gate or HTTP call.
+        let order_segment = wire_order_segment(EXCHANGE_SEGMENT_NSE_FNO, request.security_id)?;
+
         // Step 0b: relative price ordering (BUY target > entry etc.).
         // LIMIT entries only — MARKET entries carry price 0.0 (U1).
         if request.order_type == OrderType::Limit {
@@ -1776,6 +1794,7 @@ impl OrderManagementSystem {
                 order_id: entry_order_id.clone(),
                 correlation_id: correlation_id.clone(),
                 security_id: request.security_id,
+                exchange_segment: order_segment,
                 transaction_type: request.transaction_type,
                 order_type: request.order_type,
                 product_type: request.product_type,
@@ -1992,6 +2011,7 @@ impl OrderManagementSystem {
             order_id: entry_order_id.clone(),
             correlation_id: correlation_id.clone(),
             security_id: request.security_id,
+            exchange_segment: order_segment,
             transaction_type: request.transaction_type,
             order_type: request.order_type,
             product_type: request.product_type,
@@ -2387,6 +2407,10 @@ impl OrderManagementSystem {
         // OCO-leg completeness, I-P0-03 expiry gate).
         exit_rules::validate_forever_oco(&request)?;
 
+        // I-P1-11: booked under the segment the forever body carries (see
+        // `build_forever_request`). Parsed, never assumed.
+        let order_segment = wire_order_segment(EXCHANGE_SEGMENT_NSE_FNO, request.security_id)?;
+
         // Steps 1+2: rate limiter + circuit breaker.
         self.check_order_gates()?;
 
@@ -2403,6 +2427,7 @@ impl OrderManagementSystem {
                 order_id: paper_order_id.clone(),
                 correlation_id: correlation_id.clone(),
                 security_id: request.security_id,
+                exchange_segment: order_segment,
                 transaction_type: request.transaction_type,
                 order_type: request.order_type,
                 product_type: request.product_type,
@@ -2493,6 +2518,7 @@ impl OrderManagementSystem {
             order_id: response.order_id.clone(),
             correlation_id: correlation_id.clone(),
             security_id: request.security_id,
+            exchange_segment: order_segment,
             transaction_type: request.transaction_type,
             order_type: request.order_type,
             product_type: request.product_type,
@@ -2570,6 +2596,7 @@ impl OrderManagementSystem {
                     order_id: paper_order_id.clone(),
                     correlation_id: correlation_id.clone(),
                     security_id: request.security_id,
+                    exchange_segment: request.exchange_segment,
                     transaction_type: request.transaction_type,
                     order_type: request.order_type,
                     product_type: request.product_type,
@@ -2619,7 +2646,7 @@ impl OrderManagementSystem {
         let dhan_request = DhanPlaceOrderRequest {
             dhan_client_id: self.client_id.clone(),
             transaction_type: request.transaction_type.as_str().to_owned(),
-            exchange_segment: EXCHANGE_SEGMENT_NSE_FNO.to_owned(),
+            exchange_segment: request.exchange_segment.as_str().to_owned(),
             product_type: request.product_type.as_str().to_owned(),
             order_type: request.order_type.as_str().to_owned(),
             validity: request.validity.as_str().to_owned(),
@@ -2747,6 +2774,7 @@ impl OrderManagementSystem {
                 order_id: resp.order_id.clone(),
                 correlation_id: correlation_id.clone(),
                 security_id: request.security_id,
+                exchange_segment: request.exchange_segment,
                 transaction_type: request.transaction_type,
                 order_type: request.order_type,
                 product_type: request.product_type,
@@ -3431,6 +3459,16 @@ fn build_super_modify_request(
     }
 }
 
+/// I-P1-11: resolves the segment an order is BOOKED under from the segment
+/// string its wire body carries, so the order book and the broker can never
+/// name two different instruments. An unknown string refuses the order
+/// (counted + coded inside [`resolve_order_segment_str`]) — never a guess.
+/// O(1).
+fn wire_order_segment(wire_segment: &str, security_id: u64) -> Result<ExchangeSegment, OmsError> {
+    resolve_order_segment_str(wire_segment, security_id)
+        .ok_or(OmsError::UnknownExchangeSegment { security_id })
+}
+
 /// Builds the Forever/OCO wire body. SINGLE omits every second-leg field;
 /// OCO carries all three BY CONSTRUCTION (`OcoSecondLeg`). The flag
 /// strings are the `ForeverOrderFlag` wire literals.
@@ -3774,6 +3812,7 @@ mod tests {
             order_id: order_id.to_owned(),
             correlation_id: "corr-1".to_owned(),
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -4305,6 +4344,7 @@ mod tests {
             order_id: "2".to_owned(),
             correlation_id: "corr-2".to_owned(),
             security_id: 100,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -4398,6 +4438,7 @@ mod tests {
 
         let request = PlaceOrderRequest {
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -4433,6 +4474,7 @@ mod tests {
 
         let make_request = || PlaceOrderRequest {
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Market,
             product_type: ProductType::Intraday,
@@ -4466,6 +4508,7 @@ mod tests {
 
         let request = PlaceOrderRequest {
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Sell,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -4560,6 +4603,7 @@ mod tests {
 
         let request = PlaceOrderRequest {
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Market,
             product_type: ProductType::Intraday,
@@ -4595,6 +4639,7 @@ mod tests {
 
         let request = PlaceOrderRequest {
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::StopLoss,
             product_type: ProductType::Intraday,
@@ -4630,6 +4675,7 @@ mod tests {
 
         let request = PlaceOrderRequest {
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Market,
             product_type: ProductType::Intraday,
@@ -4802,6 +4848,7 @@ mod tests {
 
         let request = PlaceOrderRequest {
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -4866,6 +4913,7 @@ mod tests {
     fn test_validate_order_fields_limit_order_valid() {
         let request = PlaceOrderRequest {
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -4883,6 +4931,7 @@ mod tests {
     fn test_validate_order_fields_market_order_valid() {
         let request = PlaceOrderRequest {
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Market,
             product_type: ProductType::Intraday,
@@ -4900,6 +4949,7 @@ mod tests {
     fn test_validate_order_fields_market_nonzero_price() {
         let request = PlaceOrderRequest {
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Market,
             product_type: ProductType::Intraday,
@@ -4918,6 +4968,7 @@ mod tests {
     fn test_validate_order_fields_sl_with_trigger() {
         let request = PlaceOrderRequest {
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::StopLoss,
             product_type: ProductType::Intraday,
@@ -4935,6 +4986,7 @@ mod tests {
     fn test_validate_order_fields_sl_zero_trigger() {
         let request = PlaceOrderRequest {
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::StopLoss,
             product_type: ProductType::Intraday,
@@ -4953,6 +5005,7 @@ mod tests {
     fn test_validate_order_fields_slm_zero_trigger() {
         let request = PlaceOrderRequest {
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Sell,
             order_type: OrderType::StopLossMarket,
             product_type: ProductType::Intraday,
@@ -4971,6 +5024,7 @@ mod tests {
     fn test_validate_order_fields_slm_with_trigger() {
         let request = PlaceOrderRequest {
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Sell,
             order_type: OrderType::StopLossMarket,
             product_type: ProductType::Intraday,
@@ -4993,6 +5047,7 @@ mod tests {
         let yesterday = chrono::Utc::now().date_naive() - chrono::Duration::days(1);
         let request = PlaceOrderRequest {
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -5017,6 +5072,7 @@ mod tests {
         let tomorrow = chrono::Utc::now().date_naive() + chrono::Duration::days(1);
         let request = PlaceOrderRequest {
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -5037,6 +5093,7 @@ mod tests {
     fn test_validate_no_expiry_date_passes() {
         let request = PlaceOrderRequest {
             security_id: 11536,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -5621,6 +5678,7 @@ mod tests {
 
         let request = PlaceOrderRequest {
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::StopLossMarket,
             product_type: ProductType::Intraday,
@@ -5685,6 +5743,7 @@ mod tests {
             order_id: "active-1".to_owned(),
             correlation_id: "c1".to_owned(),
             security_id: 100,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -5860,6 +5919,7 @@ mod tests {
     fn make_place_request() -> PlaceOrderRequest {
         PlaceOrderRequest {
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -5949,6 +6009,7 @@ mod tests {
             order_id: "1".to_owned(),
             correlation_id: "corr-1".to_owned(),
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -6000,6 +6061,7 @@ mod tests {
             order_id: "1".to_owned(),
             correlation_id: "corr-1".to_owned(),
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -6048,6 +6110,7 @@ mod tests {
             order_id: "1".to_owned(),
             correlation_id: "corr-1".to_owned(),
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -6096,6 +6159,7 @@ mod tests {
             order_id: "1".to_owned(),
             correlation_id: "corr-1".to_owned(),
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -6135,6 +6199,7 @@ mod tests {
             order_id: "1".to_owned(),
             correlation_id: "corr-1".to_owned(),
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -6173,6 +6238,7 @@ mod tests {
             order_id: "1".to_owned(),
             correlation_id: "corr-1".to_owned(),
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -6213,6 +6279,7 @@ mod tests {
             order_id: "1".to_owned(),
             correlation_id: "corr-1".to_owned(),
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -6254,6 +6321,7 @@ mod tests {
             order_id: order_id.to_owned(),
             correlation_id: format!("corr-{order_id}"),
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -6773,6 +6841,7 @@ mod tests {
             order_id: order_id.to_owned(),
             correlation_id: "corr-1".to_owned(),
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -7324,6 +7393,7 @@ mod tests {
             order_id: order_id.to_owned(),
             correlation_id: format!("corr-{order_id}"),
             security_id: 49081,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,

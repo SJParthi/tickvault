@@ -463,20 +463,30 @@ mod tests {
         };
         let handle = spawn(cfg);
 
-        // Wait long enough for at least one refresh tick.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Poll for the first refresh instead of sleeping a fixed 200 ms:
+        // on a loaded CI runner the first tick can land later, and this
+        // test passed only on retry in CI (2026-10-05). The file is
+        // written by rename, so a non-empty read is a complete one.
+        let summary_path = tmp.join(SUMMARY_FILENAME);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut body = String::new();
+        while tokio::time::Instant::now() < deadline {
+            body = fs::read_to_string(&summary_path).unwrap_or_default();
+            if !body.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
 
         // Summary file should now exist — spawn drove regenerate_summary
         // at least once via the interval tick.
-        let summary_path = tmp.join(SUMMARY_FILENAME);
         assert!(
             summary_path.exists(),
-            "spawn() should have produced {} within 200ms",
+            "spawn() should have produced {} within 10s",
             summary_path.display()
         );
         // Content should include either the empty marker or a populated
         // table — both indicate the writer ran.
-        let body = fs::read_to_string(&summary_path).unwrap_or_default();
         assert!(
             !body.is_empty(),
             "summary file produced by spawn() must not be empty"

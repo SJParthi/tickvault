@@ -111,6 +111,7 @@ use tickvault_common::constants::{MARKET_CLOSE_IST_NANOS, MARKET_OPEN_IST_NANOS}
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::feed::Feed;
 use tickvault_common::types::SecurityId;
+use tickvault_storage::seal_writer_runner::SealTrySendError;
 use tickvault_trading::candles::{BufferedSeal, LiveCandleState, TF_COUNT, TfIndex};
 use tickvault_trading::in_mem::spot_bar_store::{RamBar, SlotKey, spot_bar_store};
 use tokio::sync::mpsc;
@@ -1726,8 +1727,8 @@ fn emit_seals(feed: Feed, security_id: SecurityId, segment_code: u8, sealed: &[S
         let seal = sealed_bucket_to_seal(feed, security_id, segment_code, s);
         match sender.try_send(seal) {
             Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => dropped_full += 1,
-            Err(mpsc::error::TrySendError::Closed(_)) => dropped_closed += 1,
+            Err(SealTrySendError::Full(_)) => dropped_full += 1,
+            Err(SealTrySendError::Disconnected(_)) => dropped_closed += 1,
         }
     }
     let delivered = sealed.len() - dropped_full - dropped_closed;
@@ -1827,7 +1828,7 @@ async fn emit_seals_paced(
                     delivered += 1;
                     break;
                 }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(SealTrySendError::Disconnected(_)) => {
                     // Seal-writer gone (shutdown) — pacing cannot help, and
                     // EVERY remaining seal in this slice is undeliverable:
                     // count them ALL as dropped (round-2 LOW-1 — the old
@@ -1837,20 +1838,18 @@ async fn emit_seals_paced(
                     dropped_closed = sealed.len() - delivered - dropped_full;
                     break 'seals;
                 }
-                Err(mpsc::error::TrySendError::Full(returned)) => {
-                    match catchup_pace_action(*waited_ms) {
-                        PaceAction::SleepAndRetry { sleep_ms } => {
-                            counter!("tv_rest_candle_fold_paced_waits_total").increment(1);
-                            *waited_ms = waited_ms.saturating_add(sleep_ms);
-                            tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
-                            seal = returned;
-                        }
-                        PaceAction::GiveUp => {
-                            dropped_full += 1;
-                            break;
-                        }
+                Err(SealTrySendError::Full(returned)) => match catchup_pace_action(*waited_ms) {
+                    PaceAction::SleepAndRetry { sleep_ms } => {
+                        counter!("tv_rest_candle_fold_paced_waits_total").increment(1);
+                        *waited_ms = waited_ms.saturating_add(sleep_ms);
+                        tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+                        seal = returned;
                     }
-                }
+                    PaceAction::GiveUp => {
+                        dropped_full += 1;
+                        break;
+                    }
+                },
             }
         }
     }

@@ -352,6 +352,8 @@ async fn emit_boot_completed_when_feed_live(
             // WITHHOLD the alive signal so the boot-heartbeat alarm pages on the
             // MISSING metric, and name the dead feed(s) for the operator.
             error!(
+                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                source = "boot_no_feed_live",
                 dhan_enabled,
                 dhan_running,
                 wait_secs = BOOT_COMPLETED_FEED_LIVENESS_WAIT_SECS,
@@ -737,6 +739,8 @@ async fn async_main() -> Result<()> {
     .date_naive();
     if let Err(e) = config.strategy.check_sandbox_window(today_ist) {
         error!(
+            code = tickvault_common::error_code::ErrorCode::OmsGapDryRunSafety.code_str(),
+            source = "sandbox_window_boot",
             error = %e,
             "S6-Step4 BOOT BLOCKED: sandbox-only window violation"
         );
@@ -1283,6 +1287,8 @@ async fn async_main() -> Result<()> {
         }
         Err(err) => {
             error!(
+                code = tickvault_common::error_code::ErrorCode::WsSpill02FrameDropped.code_str(),
+                source = "boot_replay_failed",
                 ?err,
                 dir = %ws_wal_dir,
                 "STAGE-C: WAL replay failed — continuing boot with fresh WAL"
@@ -1518,6 +1524,136 @@ async fn async_main() -> Result<()> {
     metrics::counter!("tv_wal_replay_corrupted_segments_total").increment(0);
     metrics::counter!("tv_disk_watcher_respawn_total").increment(0);
     metrics::counter!("tv_ws_frame_spill_drop_critical", "ws_type" => "live_feed").increment(0);
+    // The ten data-at-risk counters paged on 2026-10-04
+    // (deploy/aws/terraform/data-at-risk-alarms.tf, authority
+    // dhan-rest-only-noise-lock-2026-07-14.md §2.9). Several are emitted only at
+    // the failure site or only from a task that starts minutes after boot, so
+    // without these the first failure is the dropped baseline sample. Every
+    // label value the emit sites use is seeded, because the agent drops the
+    // first sample of each label set, not of each name.
+    metrics::counter!("tv_raw_frame_upload_failed_total").increment(0);
+    for set in ["seal_spill", "tick_quarantine", "depth_quarantine"] {
+        metrics::counter!("tv_cold_file_upload_failed_total", "set" => set).increment(0);
+    }
+    metrics::counter!("tv_raw_upload_marker_write_failed_total").increment(0);
+    for dir in ["archive", "active"] {
+        metrics::counter!("tv_wal_prune_refused_not_uploaded_total", "dir" => dir).increment(0);
+    }
+    metrics::counter!("tv_seal_spill_prune_refused_not_uploaded_total").increment(0);
+    metrics::counter!("tv_quarantine_prune_refused_not_uploaded_total").increment(0);
+    metrics::counter!("tv_order_update_broadcast_drops_total").increment(0);
+    for sink in ["app_log", "errors_jsonl"] {
+        metrics::counter!("tv_log_lines_dropped_total", "sink" => sink).increment(0);
+    }
+    for reason in ["queue_full", "thread_gone"] {
+        metrics::counter!(
+            "tv_tick_rescue_inline_fallback_total",
+            "feed" => "dhan",
+            "reason" => reason
+        )
+        .increment(0);
+        metrics::counter!(
+            "tv_depth_rescue_inline_fallback_total",
+            "feed" => "dhan",
+            "reason" => reason
+        )
+        .increment(0);
+    }
+    // The counters behind the six loss-group pages of 2026-10-05
+    // (deploy/aws/terraform/loss-group-alarms.tf, authority
+    // dhan-rest-only-noise-lock-2026-07-14.md §2.10). Same reason as the block
+    // above: most are emitted only at the failure site, so the first failure
+    // would be the dropped baseline sample. Counters already seeded at zero
+    // where their owner is built (the spill probe, the replay rejects, the
+    // ranking discards, the audit-spill tables, the rebalance and depth-universe
+    // reasons, the depth view) are not repeated here. Every label value the
+    // filters slice on is seeded.
+    for endpoint in tickvault_core::websocket::pool_budget::DhanEndpointType::ALL {
+        let endpoint = endpoint.as_str();
+        metrics::counter!("tv_dhan_ws_close_drain_discarded_total", "endpoint" => endpoint)
+            .increment(0);
+        metrics::counter!("tv_dhan_ws_subscribe_dispatch_failed_total", "endpoint" => endpoint)
+            .increment(0);
+    }
+    metrics::counter!("tv_feed_aux_rows_refused_total", "reason" => "security_id_width")
+        .increment(0);
+    metrics::counter!("tv_candle_int_self_heal_refused_total").increment(0);
+    metrics::counter!("tv_top_volume_rank_append_failed_total").increment(0);
+    for (half, stage) in [
+        ("main_feed", "spawn_skipped"),
+        ("depth", "spawn_skipped"),
+        ("depth", "gave_up_outstanding_sockets"),
+    ] {
+        metrics::counter!("tv_dhan_dial_incomplete_total", "half" => half, "stage" => stage)
+            .increment(0);
+    }
+    metrics::counter!("tv_dhan_ws_topup_failed_total").increment(0);
+    metrics::counter!("tv_dhan_ws_swap_failed_total").increment(0);
+    metrics::counter!("tv_dhan_ws_swap_timeout_total").increment(0);
+    for stage in ["append", "flush"] {
+        metrics::counter!("tv_ws_event_audit_write_errors_total", "stage" => stage).increment(0);
+        metrics::counter!("tv_feed_gap_audit_write_errors_total", "stage" => stage).increment(0);
+    }
+    for reason in [
+        "subscription_change",
+        "live_feed_lifecycle",
+        "live_feed_forward",
+        "full",
+        "closed",
+    ] {
+        metrics::counter!("tv_ws_event_audit_dropped_total", "reason" => reason).increment(0);
+    }
+    metrics::counter!("tv_order_update_ws_audit_dropped_total").increment(0);
+    metrics::counter!("tv_dhan_feed_xverify_persist_errors_total").increment(0);
+    for stage in ["append", "flush", "ensure_client_build", "ensure_ddl"] {
+        metrics::counter!("tv_pnl_audit_persist_errors_total", "stage" => stage).increment(0);
+        metrics::counter!("tv_order_leg_pnl_persist_errors_total", "stage" => stage).increment(0);
+    }
+    for reason in ["full", "closed"] {
+        metrics::counter!("tv_order_leg_pnl_dropped_total", "reason" => reason).increment(0);
+        metrics::counter!("tv_order_alert_dropped_total", "reason" => reason).increment(0);
+    }
+    metrics::counter!("tv_wal_fsync_errors_total").increment(0);
+    metrics::counter!("tv_seal_spill_sync_failed_total").increment(0);
+    metrics::counter!("tv_seal_unwritten_mark_errors_total").increment(0);
+    metrics::counter!("tv_wal_deferred_depth_persist_failed_total").increment(0);
+    metrics::counter!("tv_wal_applied_watermark_persist_failed_total").increment(0);
+    for reason in ["too_large", "unparseable_order"] {
+        metrics::counter!("tv_order_update_frames_dropped_total", "reason" => reason).increment(0);
+    }
+    metrics::counter!("tv_order_update_hollow_decode_total").increment(0);
+    metrics::counter!("tv_order_update_receiver_lagged_total").increment(0);
+    metrics::counter!("tv_mark_forward_dropped_total").increment(0);
+    metrics::counter!("tv_order_runtime_mark_producer_lost_total").increment(0);
+    metrics::counter!("tv_oms_unknown_segment_fills_refused_total").increment(0);
+    for reason in ["invalid_price", "pnl_overflow"] {
+        metrics::counter!("tv_risk_fill_rejected_total", "reason" => reason).increment(0);
+    }
+    metrics::counter!("tv_oms_fill_price_rejected_total").increment(0);
+    metrics::counter!("tv_oms_order_book_full_total").increment(0);
+    metrics::counter!("tv_order_runtime_sid_refused_total").increment(0);
+    metrics::counter!("tv_oms_order_aliases_refused_total").increment(0);
+    for reason in ["id_too_long", "capacity"] {
+        metrics::counter!("tv_oms_correlations_refused_total", "reason" => reason).increment(0);
+    }
+    metrics::counter!("tv_spot_price_store_refused_total").increment(0);
+    metrics::counter!("tv_prev_close_store_refused_total").increment(0);
+    for family in ["index", "stock"] {
+        for reason in ["capacity", "window_bar_missing"] {
+            metrics::counter!(
+                "tv_volume_leaderboard_refused_total",
+                "family" => family,
+                "reason" => reason
+            )
+            .increment(0);
+        }
+    }
+    metrics::counter!("tv_wal_lag_tracker_refused_total").increment(0);
+    metrics::counter!("tv_spill_dir_health_check_failed_total").increment(0);
+    metrics::counter!("tv_resource_monitor_probe_failed_total").increment(0);
+    metrics::counter!("tv_oom_monitor_probe_failed_total").increment(0);
+    metrics::counter!("tv_ws_activity_watchdog_panicked_total", "label" => "order-update")
+        .increment(0);
     // The seal-spill write-error counter (2026-08-28). Emitted only when the
     // producer-side durable tier's own append fails, which is the moment the
     // no-drop policy is leaning hardest on it — and, like the twenty above, it
@@ -3170,6 +3306,8 @@ async fn async_main() -> Result<()> {
     ) {
         tickvault_app::dhan_feed_stack::FeedStackGate::DisabledByEnv => {
             error!(
+                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                source = "live_feed_env_missing",
                 env_var = tickvault_app::dhan_feed_stack::DHAN_LIVE_FEED_ENV,
                 "config enables the Dhan live feed but the environment opt-in is missing, so NO \
                  live market data will flow this session — no ticks, no live candles, and the \
@@ -4063,6 +4201,8 @@ fn spawn_seal_writer_loop(questdb_config: &tickvault_common::config::QuestDbConf
         }
         Err(err) => {
             tracing::error!(
+                code =
+                    tickvault_common::error_code::ErrorCode::AggregatorSeal01IlpFailed.code_str(),
                 ?err,
                 "failed to construct SealWriterRunner — candles will NOT seal this session"
             );
@@ -4210,6 +4350,8 @@ async fn build_shared_infra(
         Ok(n) => n,
         Err(reason) => {
             error!(
+                code = tickvault_common::error_code::ErrorCode::Telegram01Dropped.code_str(),
+                source = "notifier_init_failed",
                 reason = %reason,
                 "SHARED-INFRA BOOT: strict notifier init failed — REFUSING BOOT (systemd will restart)"
             );

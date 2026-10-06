@@ -59,7 +59,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install nightly toolchain (required by cargo-careful)
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: ${{ env.NIGHTLY_VERSION }}
           components: rust-src
@@ -118,12 +118,17 @@ jobs:
         env:
           TV_SKIP_PERF_ASSERTIONS: "1"
         run: |
+          # pipefail (2026-10-04): without it this step read the exit code of
+          # `tee`, so a failing careful test run passed green. The exit code is
+          # captured first because PIPESTATUS is overwritten by the next command.
+          set -o pipefail
           # --test-threads=1: reduces memory pressure on CI runners
           # TV_SKIP_PERF_ASSERTIONS: skip timing assertions (instrumentation = 10-100x slower)
           cargo +${{ env.NIGHTLY_VERSION }} careful test --workspace \
             -- --test-threads=1 2>&1 | tee /tmp/careful-test.log || {
+            rc=${PIPESTATUS[0]}
             echo "test_failed=true" >> "$GITHUB_OUTPUT"
-            echo "=== cargo-careful test failed (exit code: ${PIPESTATUS[0]}) ==="
+            echo "=== cargo-careful test failed (exit code: ${rc}) ==="
             echo "=== Failed tests ==="
             grep -E "^test .+ FAILED|^failures:" /tmp/careful-test.log || true
             echo "=== Last 80 lines ==="
@@ -280,7 +285,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install nightly toolchain (required by sanitizers)
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: ${{ env.NIGHTLY_VERSION }}
           components: rust-src
@@ -563,7 +568,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install nightly toolchain
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: ${{ env.NIGHTLY_VERSION }}
           components: rust-src

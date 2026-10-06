@@ -30,6 +30,8 @@ env:
   # Pin nightly to a specific date for reproducible builds.
   # Update periodically after verifying the new nightly compiles cleanly.
   NIGHTLY_VERSION: nightly-2026-03-15
+  # The runner's glibc triple. Never let cargo-fuzz pick it: see the build step.
+  FUZZ_TARGET_TRIPLE: x86_64-unknown-linux-gnu
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -93,7 +95,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install nightly toolchain (required by cargo-fuzz)
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: ${{ env.NIGHTLY_VERSION }}
           components: rust-src
@@ -119,11 +121,21 @@ jobs:
             echo "No fuzz targets configured yet — skipping."
           fi
 
+      # FUZZ_TARGET_TRIPLE (2026-10-04): cargo-fuzz defaults `--target` to the
+      # platform cargo-fuzz ITSELF was built for. install-action ships a
+      # static musl build, so every target compiled for
+      # x86_64-unknown-linux-musl, which AddressSanitizer refuses ("sanitizer
+      # is incompatible with statically linked libc"). The build died in
+      # ~4 s on every target, and because the step piped into `tee` without
+      # pipefail, the step read the exit code of `tee` (0) and the run step
+      # fuzzed for 0 s, all reported green (run 36397058798, 2026-09-28).
+      # Both steps now pass the glibc triple explicitly and set pipefail.
       - name: Build fuzz target (${{ matrix.target }})
         id: build
         if: steps.check.outputs.exists == 'true'
         run: |
-          cargo +${{ env.NIGHTLY_VERSION }} fuzz build ${{ matrix.target }} 2>&1 | tee /tmp/fuzz-build.log || {
+          set -o pipefail
+          cargo +${{ env.NIGHTLY_VERSION }} fuzz build --target "${FUZZ_TARGET_TRIPLE}" ${{ matrix.target }} 2>&1 | tee /tmp/fuzz-build.log || {
             echo "build_failed=true" >> "$GITHUB_OUTPUT"
             echo "::error::Fuzz target ${{ matrix.target }} failed to BUILD (not a crash). Check nightly compatibility."
             echo "=== Last 50 lines of build log ==="
@@ -141,14 +153,17 @@ jobs:
           # per aws-budget.md. Manual dispatch can go higher for deep runs.
           FUZZ_SECS: ${{ github.event.inputs.fuzz_duration_secs || '3600' }}
         run: |
+          set -o pipefail
           # -rss_limit_mb=4096: increase RSS limit for ASan-instrumented builds.
-          # -max_total_time=$FUZZ_SECS: stop after N seconds if no crash found.
-          # outer `timeout` matches to prevent runaway.
-          timeout "${FUZZ_SECS}" cargo +${{ env.NIGHTLY_VERSION }} fuzz run ${{ matrix.target }} \
+          # -max_total_time=$FUZZ_SECS: libFuzzer stops itself after N seconds
+          # and exits 0 if no crash was found. The outer `timeout` is a
+          # runaway backstop only, so it gets a margin: at the same N it raced
+          # libFuzzer's own clean stop.
+          timeout "$((FUZZ_SECS + 300))" cargo +${{ env.NIGHTLY_VERSION }} fuzz run --target "${FUZZ_TARGET_TRIPLE}" ${{ matrix.target }} \
             -- -max_total_time="${FUZZ_SECS}" -rss_limit_mb=4096 2>&1 | tee /tmp/fuzz-run.log || {
             EXIT_CODE=${PIPESTATUS[0]}
             if [ "$EXIT_CODE" -eq 124 ]; then
-              echo "Fuzz run completed (timeout reached — no crashes found)"
+              echo "Fuzz run stopped by the backstop timeout (no crash found)"
             else
               echo "=== Fuzz run failed (exit code $EXIT_CODE) ==="
               echo "=== Last 50 lines ==="
@@ -164,6 +179,31 @@ jobs:
               fi
             fi
           }
+
+      # Anti-vacuity (2026-10-04): a green run step is not proof that anything
+      # was fuzzed — on 2026-09-28 every target "ran" for 0 s and passed. Pass
+      # only when libFuzzer's own log shows it started and finished its timed
+      # run with a non-zero number of executions.
+      - name: Prove the fuzzer actually ran (${{ matrix.target }})
+        if: steps.fuzz.outcome == 'success'
+        run: |
+          set -euo pipefail
+          if ! grep -qE 'INITED' /tmp/fuzz-run.log; then
+            echo "::error::libFuzzer never reached INITED for ${{ matrix.target }}: nothing was fuzzed. Refusing to pass vacuously."
+            exit 1
+          fi
+          done_line=$(grep -oE 'Done [0-9]+ runs in [0-9]+ second' /tmp/fuzz-run.log | tail -1 || true)
+          if [ -z "$done_line" ]; then
+            echo "::error::no libFuzzer 'Done N runs' line for ${{ matrix.target }}: the timed run did not complete. Refusing to pass vacuously."
+            exit 1
+          fi
+          runs=$(printf '%s\n' "$done_line" | awk '{print $2}')
+          secs=$(printf '%s\n' "$done_line" | awk '{print $5}')
+          if [ "$runs" -eq 0 ]; then
+            echo "::error::libFuzzer reported 0 executions for ${{ matrix.target }}. Refusing to pass vacuously."
+            exit 1
+          fi
+          echo "${{ matrix.target }}: ${runs} executions in ${secs} s, no crash." | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Upload crash artifacts
         if: failure() && steps.fuzz.outputs.fuzz_crashed == 'true'

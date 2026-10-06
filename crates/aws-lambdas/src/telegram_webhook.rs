@@ -153,7 +153,7 @@ pub const GENERIC_SAFE_LINE: &str = "🔔 Alert received — details are in the 
 ///
 /// O(n) scan per lookup — cold path (a handful of alarm renders per SNS
 /// batch), deliberately not a hash map so the table stays a reviewable literal.
-pub const ALARM_PHRASES: [(&str, &str); 115] = [
+pub const ALARM_PHRASES: [(&str, &str); 126] = [
     // ---- capacity + candle building ----
     (
         "aggregator-refusal-rate-high",
@@ -324,6 +324,47 @@ pub const ALARM_PHRASES: [(&str, &str); 115] = [
         "offload-writer-shutdown-incomplete",
         "The app shut down before it finished saving everything it was holding",
     ),
+    (
+        "cold-backup-failing",
+        "Copies of captured market data are not reaching cloud storage — the files are kept on the server, but the disk will fill",
+    ),
+    (
+        "disk-kept-not-backed-up",
+        "Old market data files are due to be cleared but have no cloud copy, so they are kept — the disk will fill",
+    ),
+    (
+        "log-lines-dropped",
+        "Log lines were dropped because the log writer fell behind — part of the record is missing",
+    ),
+    (
+        "feed-thread-wrote-to-disk",
+        "🔷 DHAN: the live price thread had to save to disk itself because the save helper was full or gone — prices may have been skipped while it waited",
+    ),
+    // ---- loss groups (noise lock §2.10, 2026-10-05) ----
+    (
+        "market-data-refused",
+        "🔷 DHAN: some received market data could not be saved and was set aside or refused — part of the record is missing",
+    ),
+    (
+        "subscription-coverage-lost",
+        "🔷 DHAN: some planned price or depth connections did not start or did not take their contracts — those contracts are getting no data",
+    ),
+    (
+        "audit-rows-lost",
+        "Some audit history rows could not be saved — there is a gap in the record",
+    ),
+    (
+        "durability-sync-failing",
+        "The server could not confirm saved data to disk — a power cut now could lose the newest data",
+    ),
+    (
+        "order-path-dropped",
+        "🔷 DHAN: an order update, fill or price meant for the order system was dropped or refused — check the order book",
+    ),
+    (
+        "safety-bound-or-monitor-blind",
+        "A size limit was reached or a health check could not read the server — something may be going unwatched",
+    ),
     // ---- Dhan live feed ----
     (
         "dhan-live-lane-down",
@@ -404,6 +445,10 @@ pub const ALARM_PHRASES: [(&str, &str); 115] = [
         "Orders are taking too long to be filled",
     ),
     ("order-audit-chain-loss", "Order history rows were lost"),
+    (
+        "order-update-dropped",
+        "🔷 DHAN: an order update from the broker reached nothing in the app — that update is missing",
+    ),
     (
         "daily-loss-breach",
         "Today's trading loss has crossed the limit you set",

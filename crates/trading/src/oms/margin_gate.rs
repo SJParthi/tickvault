@@ -526,6 +526,8 @@ impl MarginGate {
                 // text is bounded + redacted through the house sanitize
                 // choke point (uniform with the REST legs below).
                 error!(
+                    code = tickvault_common::error_code::ErrorCode::RiskGapPreTrade.code_str(),
+                    source = "margin_gate_token",
                     stage = DegradedStage::Token.as_str(),
                     sanitized = %capture_rest_error_body(&err.to_string()),
                     "dhan margin gate: entry check degraded — no access token; refusing \
@@ -546,6 +548,8 @@ impl MarginGate {
                 // The error string can embed the raw broker body —
                 // bounded + redacted per the house sanitize choke point.
                 error!(
+                    code = tickvault_common::error_code::ErrorCode::RiskGapPreTrade.code_str(),
+                    source = "margin_gate_margin_call",
                     stage = DegradedStage::MarginCall.as_str(),
                     sanitized = %capture_rest_error_body(&err.to_string()),
                     "dhan margin gate: entry check degraded — margin calculator call \
@@ -562,6 +566,8 @@ impl MarginGate {
                 // The error string can embed the raw broker body —
                 // bounded + redacted per the house sanitize choke point.
                 error!(
+                    code = tickvault_common::error_code::ErrorCode::RiskGapPreTrade.code_str(),
+                    source = "margin_gate_fund_limit",
                     stage = DegradedStage::FundLimitCall.as_str(),
                     sanitized = %capture_rest_error_body(&err.to_string()),
                     "dhan margin gate: entry check degraded — fund limit call failed; \

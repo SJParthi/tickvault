@@ -223,7 +223,7 @@ fn the_ws_lag_exclusion_family_is_seeded_on_every_label_set() {
         .collect();
     assert_eq!(
         emitted.len(),
-        4,
+        5,
         "WsLagHandles::new reasons changed: {emitted:?}"
     );
     for reason in emitted {

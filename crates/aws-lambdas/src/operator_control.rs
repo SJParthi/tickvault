@@ -272,6 +272,190 @@ pub fn authorized(headers: &Value, secret: &str) -> bool {
     verify_slices_are_equal(presented.as_bytes(), secret.as_bytes()).is_ok()
 }
 
+// ------------------------------------------------- failed-key-attempt guard
+//
+// Audit M4 (2026-10-04). The portal is a public URL behind one shared
+// secret, and that secret can stop the trading box and run a root shell on
+// it. The compare above is constant-time and fails closed; what it did not
+// do was slow down a caller guessing keys. This guard refuses a source
+// after `AUTH_FAILURE_LIMIT` failed attempts inside one
+// `AUTH_FAILURE_WINDOW_SECS` window.
+//
+// HONEST LIMIT: the table lives in ONE warm Lambda container. A cold start
+// begins with an empty table, and with reserved concurrency N there are at
+// most N tables, so the real ceiling is `N × AUTH_FAILURE_LIMIT` attempts
+// per window per source, not a global one. A caller rotating source
+// addresses is not limited by it at all; the API Gateway stage throttle
+// (terraform) is the only global rate bound. The defence that actually
+// holds is the secret's length — rotating it is an operator action.
+
+/// Failed attempts a single source may make inside one window before it is
+/// refused (429) without the secret even being read.
+pub const AUTH_FAILURE_LIMIT: u32 = 10;
+/// Length of the counting window, measured from the source's first failure.
+pub const AUTH_FAILURE_WINDOW_SECS: i64 = 300;
+/// Sources tracked per container. A new source past this, after expired
+/// windows are pruned, is not counted (and that is logged), so the table is
+/// bounded in memory.
+pub const AUTH_FAILURE_MAX_SOURCES: usize = 4_096;
+// A first failure is never a lockout, so `record_failure` may return
+// `Counted(1)` for a new source without checking the limit.
+const _: () = assert!(AUTH_FAILURE_LIMIT > 1);
+/// A source address longer than this is truncated before it becomes a key.
+const AUTH_SOURCE_MAX_CHARS: usize = 64;
+
+/// The caller's address as API Gateway v2 / the Function URL report it
+/// (`requestContext.http.sourceIp` — set by AWS, not by a client header).
+/// Missing or empty → `"unknown"`, which is one shared bucket.
+pub fn source_ip(event: &Value) -> String {
+    match event
+        .pointer("/requestContext/http/sourceIp")
+        .and_then(Value::as_str)
+        .map(str::trim)
+    {
+        Some(s) if !s.is_empty() => s.chars().take(AUTH_SOURCE_MAX_CHARS).collect(),
+        _ => "unknown".to_string(),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AuthFailures {
+    window_start: i64,
+    failures: u32,
+}
+
+/// Verdict of [`AuthFailureGuard::check`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthGate {
+    /// The source may present a key.
+    Allowed,
+    /// The source used its attempts; refused until the window ends.
+    Refused {
+        /// Seconds until the source's window ends.
+        retry_after_secs: i64,
+    },
+}
+
+/// Outcome of [`AuthFailureGuard::record_failure`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthFailureRecord {
+    /// Counted; the source has this many failures in its window.
+    Counted(u32),
+    /// This failure reached the limit: the source is now refused.
+    LockedOut,
+    /// The table is full of live windows; this failure was not counted.
+    /// `untracked_total` is the container's running count of such misses.
+    Untracked {
+        /// Running count of uncounted failures in this container.
+        untracked_total: u64,
+    },
+}
+
+/// Per-container table of failed key attempts per source. Every operation
+/// takes one lock and one hash probe — O(1) — except a failure arriving
+/// while the table is full, which prunes expired windows first:
+/// O(`AUTH_FAILURE_MAX_SOURCES`), bounded, and only on that path.
+#[derive(Debug)]
+pub struct AuthFailureGuard {
+    table: std::sync::Mutex<std::collections::HashMap<String, AuthFailures>>,
+    untracked_total: std::sync::atomic::AtomicU64,
+}
+
+impl Default for AuthFailureGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AuthFailureGuard {
+    /// An empty table.
+    pub fn new() -> Self {
+        Self {
+            table: std::sync::Mutex::new(std::collections::HashMap::new()),
+            untracked_total: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn table(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, AuthFailures>> {
+        self.table
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// May `source` present a key at `now`? An expired window is dropped.
+    pub fn check(&self, source: &str, now: i64) -> AuthGate {
+        let mut table = self.table();
+        let Some(entry) = table.get(source).copied() else {
+            return AuthGate::Allowed;
+        };
+        let ends = entry.window_start.saturating_add(AUTH_FAILURE_WINDOW_SECS);
+        if now >= ends || now < entry.window_start {
+            // Window over (or the clock stepped back past its start): forget.
+            table.remove(source);
+            return AuthGate::Allowed;
+        }
+        if entry.failures >= AUTH_FAILURE_LIMIT {
+            AuthGate::Refused {
+                retry_after_secs: ends - now,
+            }
+        } else {
+            AuthGate::Allowed
+        }
+    }
+
+    /// Count one failed attempt by `source` at `now`.
+    pub fn record_failure(&self, source: &str, now: i64) -> AuthFailureRecord {
+        let mut table = self.table();
+        if let Some(entry) = table.get_mut(source) {
+            let ends = entry.window_start.saturating_add(AUTH_FAILURE_WINDOW_SECS);
+            if now >= ends || now < entry.window_start {
+                *entry = AuthFailures {
+                    window_start: now,
+                    failures: 1,
+                };
+                return AuthFailureRecord::Counted(1);
+            }
+            entry.failures = entry.failures.saturating_add(1);
+            return if entry.failures == AUTH_FAILURE_LIMIT {
+                AuthFailureRecord::LockedOut
+            } else {
+                AuthFailureRecord::Counted(entry.failures)
+            };
+        }
+        if table.len() >= AUTH_FAILURE_MAX_SOURCES {
+            table.retain(|_, e| {
+                now >= e.window_start
+                    && now < e.window_start.saturating_add(AUTH_FAILURE_WINDOW_SECS)
+            });
+        }
+        if table.len() >= AUTH_FAILURE_MAX_SOURCES {
+            let untracked_total = self
+                .untracked_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .saturating_add(1);
+            return AuthFailureRecord::Untracked { untracked_total };
+        }
+        table.insert(
+            source.to_string(),
+            AuthFailures {
+                window_start: now,
+                failures: 1,
+            },
+        );
+        AuthFailureRecord::Counted(1)
+    }
+
+    /// A correct key from `source`: forget its failures.
+    pub fn record_success(&self, source: &str) {
+        self.table().remove(source);
+    }
+
+    /// Sources currently tracked (tests and diagnostics).
+    pub fn tracked_sources(&self) -> usize {
+        self.table().len()
+    }
+}
+
 // The static gate regexes cannot fail to compile; the `Option` + fail-closed
 // arms below exist only to satisfy the no-unwrap/no-expect charter lints.
 static SQL_BANNED_RE: LazyLock<Option<Regex>> = LazyLock::new(|| {
@@ -1293,6 +1477,8 @@ pub trait OpsShell {
     /// legacy `_main_sha()` — GitHub main HEAD, 60s cache / 600s max-age,
     /// fail-soft to "unknown".
     async fn main_sha(&self) -> String;
+    /// Audit M4: this container's failed-key table.
+    fn auth_failures(&self) -> &AuthFailureGuard;
 }
 
 /// legacy 500 arm: `except Exception: _resp(500, {"error": "action failed",
@@ -1326,11 +1512,55 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
         return html_resp(&footer);
     }
 
+    // Audit M4: a source that used up its failed attempts is refused before
+    // the secret is read or compared.
+    let source = source_ip(event);
+    let guard = shell.auth_failures();
+    if let AuthGate::Refused { retry_after_secs } = guard.check(&source, shell.now_epoch()) {
+        return resp(
+            429,
+            &json!({
+                "error": "too many wrong keys from this address — try again later",
+                "retry_after_secs": retry_after_secs,
+            }),
+        );
+    }
+
     let headers = event.get("headers").cloned().unwrap_or(Value::Null);
     let secret = shell.control_secret().await;
     if !authorized(&headers, &secret) {
+        // An unreadable secret (empty) is our failure, not the caller's:
+        // it is refused as before but not counted against the source.
+        if !secret.is_empty() {
+            match guard.record_failure(&source, shell.now_epoch()) {
+                AuthFailureRecord::LockedOut => {
+                    tracing::error!(
+                        code = "LAMBDA-PORTAL-01",
+                        action = "auth",
+                        %source,
+                        failures = AUTH_FAILURE_LIMIT,
+                        window_secs = AUTH_FAILURE_WINDOW_SECS,
+                        "operator-portal: source refused after repeated wrong keys (per-container count)"
+                    );
+                }
+                AuthFailureRecord::Untracked { untracked_total }
+                    if untracked_total.is_power_of_two() =>
+                {
+                    tracing::error!(
+                        code = "LAMBDA-PORTAL-01",
+                        action = "auth",
+                        %source,
+                        untracked_total,
+                        max_sources = AUTH_FAILURE_MAX_SOURCES,
+                        "operator-portal: failed-key table full, wrong key not counted"
+                    );
+                }
+                AuthFailureRecord::Counted(_) | AuthFailureRecord::Untracked { .. } => {}
+            }
+        }
         return resp(401, &json!({"error": "unauthorized"}));
     }
+    guard.record_success(&source);
 
     // legacy: `raw = event.get("body") or "{}"`; dict passthrough, else
     // json.loads (fail → 400). Ledger deviation: a parsed NON-OBJECT payload
@@ -1819,6 +2049,8 @@ pub struct AwsShell {
     param_cache: std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>,
     /// legacy `_main_sha_cache` — (value, fetched_at).
     main_sha_cache: std::sync::Mutex<(String, Option<std::time::Instant>)>,
+    /// Audit M4: failed key attempts per source, this container only.
+    auth_failures: AuthFailureGuard,
 }
 
 fn lock_unpoisoned<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -1854,6 +2086,7 @@ impl AwsShell {
             gh_token_param: std::env::var("OPERATOR_GITHUB_TOKEN_PARAM").unwrap_or_default(),
             param_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             main_sha_cache: std::sync::Mutex::new((String::new(), None)),
+            auth_failures: AuthFailureGuard::new(),
         }
     }
 
@@ -1922,6 +2155,10 @@ impl AwsShell {
 }
 
 impl OpsShell for AwsShell {
+    fn auth_failures(&self) -> &AuthFailureGuard {
+        &self.auth_failures
+    }
+
     async fn control_secret(&self) -> String {
         self.cached_param(&self.secret_param).await
     }
@@ -2520,6 +2757,7 @@ mod tests {
         cost: String,
         captured: std::sync::Mutex<Vec<Vec<String>>>,
         captured_sync: std::sync::Mutex<Vec<Vec<String>>>,
+        auth_failures: AuthFailureGuard,
     }
 
     impl Default for MockShell {
@@ -2541,6 +2779,7 @@ mod tests {
                 cost: String::new(),
                 captured: std::sync::Mutex::new(Vec::new()),
                 captured_sync: std::sync::Mutex::new(Vec::new()),
+                auth_failures: AuthFailureGuard::new(),
             }
         }
     }
@@ -2558,6 +2797,9 @@ mod tests {
     }
 
     impl OpsShell for MockShell {
+        fn auth_failures(&self) -> &AuthFailureGuard {
+            &self.auth_failures
+        }
         async fn control_secret(&self) -> String {
             self.secret.clone()
         }
@@ -2823,13 +3065,209 @@ mod tests {
         // only, no new lines. The note above the `#key=` link reader no longer
         // says a Telegram alert sends that link: the alert now carries the
         // portal URL alone, because the key reached email and SMS history.
+        //
+        // RE-BLESSED 2026-10-04 (audit L4) — 46,999 -> 47,075 bytes, no new
+        // lines. The key moves from localStorage to sessionStorage (it no
+        // longer outlives the tab, and a key left by an older build is
+        // removed on load), and the two overview pills `p_inst` / `p_app`
+        // now pass the server's strings through `esc()` like every other
+        // field. Pinned separately by `console_escapes_both_overview_pills`
+        // and `console_never_writes_the_key_to_local_storage`.
         let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, CONSOLE_HTML.as_bytes());
         let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
-            "b0a0323d54b75560d1cfd3ad4fec5469e47200e8dee7f3460f75b0a85cf2cf06"
+            "f1e6230ff2d6bb545181cb69edf3d75dd7f08921711ba68035dea0d0dadacfe8"
         );
-        assert_eq!(CONSOLE_HTML.len(), 46_999);
+        assert_eq!(CONSOLE_HTML.len(), 47_075);
+    }
+
+    // ------------------------------------------------ audit L4 source scans
+    /// The script line that writes pill `id`'s innerHTML.
+    fn pill_render_line(id: &str) -> &'static str {
+        let needle = format!("$('{id}').innerHTML=");
+        CONSOLE_HTML
+            .lines()
+            .find(|l| l.contains(&needle))
+            .unwrap_or_else(|| panic!("no render line for pill {id}"))
+    }
+
+    #[test]
+    fn console_escapes_both_overview_pills() {
+        // The server's strings reach innerHTML only through `esc()`.
+        assert!(pill_render_line("p_inst").contains("esc(j.instance_state"));
+        assert!(pill_render_line("p_app").contains("esc(j.app"));
+        // and the raw forms are gone
+        assert!(!CONSOLE_HTML.contains("+(j.instance_state"));
+        assert!(!CONSOLE_HTML.contains(":(j.app"));
+    }
+
+    #[test]
+    fn console_escape_helper_escapes_markup() {
+        // The helper both pills rely on still escapes the three markup
+        // characters (text position: quotes need no escaping there).
+        let helper = CONSOLE_HTML
+            .lines()
+            .find(|l| l.starts_with("function esc(s)"))
+            .expect("esc helper present");
+        for pair in ["'<':'&lt;'", "'>':'&gt;'", "'&':'&amp;'"] {
+            assert!(helper.contains(pair), "esc() lost {pair}");
+        }
+    }
+
+    #[test]
+    fn console_never_writes_the_key_to_local_storage() {
+        // Allowed: one removeItem that clears a key an older build left.
+        assert!(!CONSOLE_HTML.contains("localStorage.setItem"));
+        assert!(!CONSOLE_HTML.contains("localStorage.getItem"));
+        assert_eq!(CONSOLE_HTML.matches("localStorage").count(), 1);
+        assert!(CONSOLE_HTML.contains("localStorage.removeItem('tv_token')"));
+        assert!(CONSOLE_HTML.contains("sessionStorage.getItem('tv_token')"));
+        // A key arriving in the address is stripped from it after reading.
+        let reader = CONSOLE_HTML
+            .lines()
+            .position(|l| l.contains("location.hash.match(/key="))
+            .expect("address-key reader present");
+        let block: String = CONSOLE_HTML
+            .lines()
+            .skip(reader)
+            .take(3)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(block.contains("history.replaceState(null,'',location.pathname)"));
+    }
+
+    // ------------------------------------------------ audit M4 auth guard
+    fn post_from(source: &str, token: &str) -> Value {
+        let mut ev = post_event(&json!({"action": "status"}), Some(token));
+        ev["requestContext"]["http"]["sourceIp"] = json!(source);
+        ev
+    }
+
+    #[test]
+    fn source_ip_reads_request_context_and_defaults_to_unknown() {
+        assert_eq!(
+            source_ip(&json!({"requestContext": {"http": {"sourceIp": "203.0.113.7"}}})),
+            "203.0.113.7"
+        );
+        assert_eq!(source_ip(&json!({})), "unknown");
+        assert_eq!(
+            source_ip(&json!({"requestContext": {"http": {"sourceIp": "  "}}})),
+            "unknown"
+        );
+        let long = "x".repeat(500);
+        assert_eq!(
+            source_ip(&json!({"requestContext": {"http": {"sourceIp": long}}})).len(),
+            64
+        );
+    }
+
+    #[test]
+    fn test_record_failure_locks_out_at_the_limit_and_releases_after_the_window() {
+        let g = AuthFailureGuard::new();
+        let t0 = 1_000;
+        for n in 1..AUTH_FAILURE_LIMIT {
+            assert_eq!(g.check("a", t0), AuthGate::Allowed);
+            assert_eq!(g.record_failure("a", t0), AuthFailureRecord::Counted(n));
+        }
+        assert_eq!(g.record_failure("a", t0), AuthFailureRecord::LockedOut);
+        assert_eq!(
+            g.check("a", t0 + 10),
+            AuthGate::Refused {
+                retry_after_secs: AUTH_FAILURE_WINDOW_SECS - 10
+            }
+        );
+        // Another source is unaffected.
+        assert_eq!(g.check("b", t0), AuthGate::Allowed);
+        // At the window's end the source is forgotten.
+        assert_eq!(
+            g.check("a", t0 + AUTH_FAILURE_WINDOW_SECS),
+            AuthGate::Allowed
+        );
+        assert_eq!(g.tracked_sources(), 0);
+    }
+
+    #[test]
+    fn test_record_success_forgets_a_source_and_a_stale_window_restarts() {
+        let g = AuthFailureGuard::new();
+        for _ in 0..3 {
+            g.record_failure("a", 0);
+        }
+        // A failure after the window opens a fresh one.
+        assert_eq!(
+            g.record_failure("a", AUTH_FAILURE_WINDOW_SECS + 1),
+            AuthFailureRecord::Counted(1)
+        );
+        // A clock that steps back behind the window start also restarts it.
+        assert_eq!(g.record_failure("a", 0), AuthFailureRecord::Counted(1));
+        g.record_success("a");
+        assert_eq!(g.tracked_sources(), 0);
+    }
+
+    #[test]
+    fn test_tracked_sources_is_bounded_and_prunes_expired_windows() {
+        let g = AuthFailureGuard::new();
+        for i in 0..AUTH_FAILURE_MAX_SOURCES {
+            g.record_failure(&format!("s{i}"), 0);
+        }
+        assert_eq!(g.tracked_sources(), AUTH_FAILURE_MAX_SOURCES);
+        // Full of live windows: a new source is not counted, and says so.
+        assert_eq!(
+            g.record_failure("new", 1),
+            AuthFailureRecord::Untracked { untracked_total: 1 }
+        );
+        assert_eq!(
+            g.record_failure("new2", 1),
+            AuthFailureRecord::Untracked { untracked_total: 2 }
+        );
+        assert_eq!(g.tracked_sources(), AUTH_FAILURE_MAX_SOURCES);
+        // Once those windows expire, the prune makes room.
+        assert_eq!(
+            g.record_failure("new", AUTH_FAILURE_WINDOW_SECS),
+            AuthFailureRecord::Counted(1)
+        );
+        assert_eq!(g.tracked_sources(), 1);
+    }
+
+    #[tokio::test]
+    async fn route_refuses_a_source_after_repeated_wrong_keys() {
+        let shell = MockShell::default();
+        for _ in 0..AUTH_FAILURE_LIMIT {
+            let r = route(&post_from("198.51.100.9", "wrong"), &shell).await;
+            assert_eq!(status_of(&r), 401);
+        }
+        // Even the RIGHT key is refused from that source until the window ends.
+        let r = route(&post_from("198.51.100.9", AUTH_SECRET), &shell).await;
+        assert_eq!(status_of(&r), 429);
+        assert!(body_of(&r)["retry_after_secs"].as_i64().unwrap() > 0);
+        // A different source still gets in.
+        let r = route(&post_from("198.51.100.10", AUTH_SECRET), &shell).await;
+        assert_ne!(status_of(&r), 401);
+        assert_ne!(status_of(&r), 429);
+    }
+
+    #[tokio::test]
+    async fn route_does_not_count_wrong_keys_while_the_secret_is_unreadable() {
+        let shell = MockShell {
+            secret: String::new(),
+            ..MockShell::default()
+        };
+        for _ in 0..(AUTH_FAILURE_LIMIT * 2) {
+            let r = route(&post_from("198.51.100.9", "anything"), &shell).await;
+            assert_eq!(status_of(&r), 401);
+        }
+        assert_eq!(shell.auth_failures.tracked_sources(), 0);
+    }
+
+    #[tokio::test]
+    async fn route_clears_a_source_after_a_correct_key() {
+        let shell = MockShell::default();
+        for _ in 0..(AUTH_FAILURE_LIMIT - 1) {
+            route(&post_from("198.51.100.9", "wrong"), &shell).await;
+        }
+        let r = route(&post_from("198.51.100.9", AUTH_SECRET), &shell).await;
+        assert_ne!(status_of(&r), 401);
+        assert_eq!(shell.auth_failures.tracked_sources(), 0);
     }
 
     // --------------------------------------------------------- class ParseView
@@ -2968,7 +3406,8 @@ mod tests {
     fn test_html_contains_no_secret() {
         // The page is a static shell — it must NOT embed any token/secret.
         assert!(!CONSOLE_HTML.contains("Bearer s3cret"));
-        assert!(CONSOLE_HTML.contains("localStorage")); // token kept client-side only
+        // token kept client-side only, per tab (audit L4: sessionStorage)
+        assert!(CONSOLE_HTML.contains("sessionStorage.setItem('tv_token'"));
     }
 
     #[test]

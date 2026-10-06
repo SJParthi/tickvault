@@ -130,6 +130,43 @@ pub enum WsEventKind {
     /// Like `DialStarted` it must NOT set `saw_any_event`: a failed dial is the
     /// socket doing nothing, which is exactly what makes the day not clean.
     DialFailed,
+    /// An in-place one-for-one instrument swap on a live socket
+    /// (`LiveSubscriptionCommand::Swap`: unsubscribe `old`, then subscribe
+    /// `new`, no redial).
+    ///
+    /// ADDED 2026-10-04 (audit M8). Before this, every swap reached a log line
+    /// and a counter only, and CloudWatch keeps logs for 14 days; the SEBI
+    /// audit trail of WHICH contract a depth socket carried WHEN lived
+    /// nowhere durable. The row carries the old instrument in
+    /// `security_id`/`segment`, the new one in `new_security_id`/`new_segment`,
+    /// and the outcome slug (`applied`, `refused`, `wire_failed`, ...) in
+    /// `reason`. Not an up kind and not a disconnect: the socket stayed open.
+    SubscriptionSwapped,
+    /// An in-place multi-instrument change on a live socket
+    /// (`LiveSubscriptionCommand::Resubscribe`: unsubscribes, then
+    /// subscribes, no redial). ADDED 2026-10-04 (audit M8).
+    ///
+    /// Carries COUNTS (`instruments_added` / `instruments_removed`, what
+    /// landed) rather than a list: a main-feed change can name thousands of
+    /// instruments and a forensic row must stay bounded. When exactly one
+    /// instrument left or arrived it is also named in the instrument columns.
+    SubscriptionResubscribed,
+    /// The unsubscribe for a ghost contract (one this socket was told to drop
+    /// and still delivers) was sent AGAIN on the live socket
+    /// (`resend_ghost_unsubscribe`). ADDED 2026-10-04 (audit M8). The ghost is
+    /// named in `security_id`/`segment`; `reason` is the resend outcome
+    /// (`sent`, `wire_failed`, `timed_out`, `held_again`, `halted_805`).
+    GhostUnsubscribeResent,
+    /// A market-data socket was parked because Dhan closed it with 805 (too
+    /// many connections) and joined its pool's overflow episode. ADDED
+    /// 2026-10-04 (audit M8).
+    ///
+    /// The generic `disconnected` row with reason `pool_overflow` is still
+    /// written for the same park; this kind is the distinct, queryable marker
+    /// of the 805 episode itself (`where event_kind = 'overflow_parked'`), and
+    /// it carries how many instruments the socket held when it went dark. Not
+    /// an up kind.
+    OverflowParked,
 }
 
 impl WsEventKind {
@@ -146,12 +183,30 @@ impl WsEventKind {
             Self::StallRestarted => "stall_restarted",
             Self::DialStarted => "dial_started",
             Self::DialFailed => "dial_failed",
+            Self::SubscriptionSwapped => "subscription_swapped",
+            Self::SubscriptionResubscribed => "subscription_resubscribed",
+            Self::GhostUnsubscribeResent => "ghost_unsubscribe_resent",
+            Self::OverflowParked => "overflow_parked",
         }
+    }
+
+    /// Whether this kind records a change to WHAT a live socket is subscribed
+    /// to (audit M8, 2026-10-04) rather than a connection lifecycle step.
+    /// These rows never open or close a feed gap.
+    #[must_use]
+    pub const fn is_subscription_change(self) -> bool {
+        matches!(
+            self,
+            Self::SubscriptionSwapped
+                | Self::SubscriptionResubscribed
+                | Self::GhostUnsubscribeResent
+                | Self::OverflowParked
+        )
     }
 
     /// All variants — lets tests assert exhaustiveness + wire-label uniqueness.
     #[must_use]
-    pub const fn all() -> [WsEventKind; 9] {
+    pub const fn all() -> [WsEventKind; 13] {
         [
             Self::Connected,
             Self::Disconnected,
@@ -162,12 +217,65 @@ impl WsEventKind {
             Self::StallRestarted,
             Self::DialStarted,
             Self::DialFailed,
+            Self::SubscriptionSwapped,
+            Self::SubscriptionResubscribed,
+            Self::GhostUnsubscribeResent,
+            Self::OverflowParked,
         ]
     }
 }
 
 /// `dhan_code` sentinel meaning "no Dhan disconnect code" (transport error).
 pub const WS_EVENT_NO_DHAN_CODE: i64 = -1;
+
+/// One instrument named on a `ws_event_audit` row, by its composite key.
+///
+/// `security_id` alone is not unique (I-P1-11): the segment always travels
+/// with it, and the row stores both (`security_id` LONG + `segment` SYMBOL).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct WsAuditInstrument {
+    /// Dhan `SecurityId`.
+    pub security_id: crate::types::SecurityId,
+    /// The instrument's exchange segment.
+    pub segment: crate::types::ExchangeSegment,
+}
+
+/// The subscription facts a `ws_event_audit` row can carry (audit M8,
+/// 2026-10-04). Every field is optional and an absent one is written as
+/// NULL (the column is simply left out of that ILP row), so a lifecycle row
+/// that has none of them reads exactly as it did before the columns existed.
+///
+/// `Copy`, no heap: building one allocates nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WsSubscriptionDetail {
+    /// The instrument that LEFT (swap `old`, the ghost, or the single
+    /// unsubscribed instrument of a resubscribe). Columns `security_id`,
+    /// `segment`.
+    pub instrument: Option<WsAuditInstrument>,
+    /// The instrument that ARRIVED (swap `new`, or the single subscribed
+    /// instrument of a resubscribe). Columns `new_security_id`, `new_segment`.
+    pub new_instrument: Option<WsAuditInstrument>,
+    /// How many instruments were subscribed by the change (what landed).
+    /// Column `instruments_added`.
+    pub added: Option<u32>,
+    /// How many instruments were unsubscribed by the change (what landed).
+    /// Column `instruments_removed`.
+    pub removed: Option<u32>,
+    /// How many instruments the socket held after the event. Column
+    /// `instruments_held`.
+    pub held: Option<u32>,
+}
+
+impl WsSubscriptionDetail {
+    /// No subscription facts: every column NULL.
+    pub const NONE: Self = Self {
+        instrument: None,
+        new_instrument: None,
+        added: None,
+        removed: None,
+        held: None,
+    };
+}
 
 /// One WebSocket lifecycle event, ready for the `ws_event_audit` table.
 ///
@@ -211,6 +319,9 @@ pub struct WsEventAuditRow {
     pub attempts: i64,
     /// `true` when the event happened inside [09:00, 15:30) IST.
     pub market_hours: bool,
+    /// Instruments and counts for a subscription-change row (audit M8,
+    /// 2026-10-04); [`WsSubscriptionDetail::NONE`] on every other row.
+    pub subscription: WsSubscriptionDetail,
 }
 
 #[cfg(test)]
@@ -252,6 +363,10 @@ mod tests {
                 "stall_restarted",
                 "dial_started",
                 "dial_failed",
+                "subscription_swapped",
+                "subscription_resubscribed",
+                "ghost_unsubscribe_resent",
+                "overflow_parked",
             ]
         );
         let unique: HashSet<&str> = labels.iter().copied().collect();
@@ -272,7 +387,8 @@ mod tests {
         // `all()` array drives the persistence
         // round-trip test, so a kind missing from it would never have had its
         // ILP append exercised.
-        assert_eq!(WsEventKind::all().len(), 9);
+        // 9 -> 13 on 2026-10-04 (audit M8): the four subscription-change kinds.
+        assert_eq!(WsEventKind::all().len(), 13);
     }
 
     #[test]
@@ -346,6 +462,73 @@ mod tests {
         ] {
             assert_ne!(label, reserved);
         }
+    }
+
+    /// Audit M8 (2026-10-04): every subscription-change kind round-trips
+    /// to its own stable label, is classified as a subscription change, and
+    /// never collides with a lifecycle label a consumer string-matches.
+    #[test]
+    fn test_subscription_change_kinds_round_trip_and_are_distinct() {
+        let expected = [
+            (WsEventKind::SubscriptionSwapped, "subscription_swapped"),
+            (
+                WsEventKind::SubscriptionResubscribed,
+                "subscription_resubscribed",
+            ),
+            (
+                WsEventKind::GhostUnsubscribeResent,
+                "ghost_unsubscribe_resent",
+            ),
+            (WsEventKind::OverflowParked, "overflow_parked"),
+        ];
+        for (kind, label) in expected {
+            assert_eq!(kind.as_str(), label);
+            assert!(kind.is_subscription_change(), "{label}");
+            assert!(
+                WsEventKind::all().contains(&kind),
+                "a kind absent from all() never gets its ILP append exercised"
+            );
+            // Round trip: the label resolves back to exactly this kind.
+            let back: Vec<WsEventKind> = WsEventKind::all()
+                .into_iter()
+                .filter(|k| k.as_str() == label)
+                .collect();
+            assert_eq!(back, vec![kind]);
+        }
+        // The nine lifecycle kinds are NOT subscription changes, so a gap
+        // tracker keyed on them is unaffected.
+        let lifecycle = WsEventKind::all()
+            .into_iter()
+            .filter(|k| !k.is_subscription_change())
+            .count();
+        assert_eq!(lifecycle, 9);
+    }
+
+    #[test]
+    fn test_subscription_detail_none_is_all_null_and_default() {
+        assert_eq!(WsSubscriptionDetail::NONE, WsSubscriptionDetail::default());
+        assert!(WsSubscriptionDetail::NONE.instrument.is_none());
+        assert!(WsSubscriptionDetail::NONE.new_instrument.is_none());
+        assert!(WsSubscriptionDetail::NONE.added.is_none());
+        assert!(WsSubscriptionDetail::NONE.removed.is_none());
+        assert!(WsSubscriptionDetail::NONE.held.is_none());
+    }
+
+    #[test]
+    fn test_audit_instrument_is_the_composite_key() {
+        // I-P1-11: the same id in two segments is two instruments.
+        use crate::types::ExchangeSegment;
+        let a = WsAuditInstrument {
+            security_id: 27,
+            segment: ExchangeSegment::IdxI,
+        };
+        let b = WsAuditInstrument {
+            security_id: 27,
+            segment: ExchangeSegment::NseEquity,
+        };
+        assert_ne!(a, b);
+        let set: HashSet<WsAuditInstrument> = [a, b].into_iter().collect();
+        assert_eq!(set.len(), 2);
     }
 
     #[test]

@@ -752,7 +752,7 @@ pub const WAL_SPILL_SHUTDOWN_INCOMPLETE_COUNTER: &str = "tv_wal_spill_shutdown_i
 /// NOTE: this is THIS module's own three-variant [`WsType`] (the WAL transport
 /// tag, `LiveFeed`/`OrderUpdate`/`TruedataFeed`), NOT the seven-variant
 /// `tickvault_common::ws_event_types::WsType` used for audit rows.
-const WS_TYPE_COUNT: usize = 3;
+pub(crate) const WS_TYPE_COUNT: usize = 3;
 
 /// Dense index for a [`WsType`], used only to address the pre-resolved counter
 /// tables in [`SpillDropCounters`].
@@ -761,7 +761,7 @@ const WS_TYPE_COUNT: usize = 3;
 /// `crates/common`: the index is an implementation detail of THIS module's
 /// counter tables, and widening `crates/common` would escalate every change
 /// here to a workspace-wide test run for no behavioural gain.
-const fn ws_type_index(ws_type: WsType) -> usize {
+pub(crate) const fn ws_type_index(ws_type: WsType) -> usize {
     // Exhaustive by construction — no `_` arm, so adding a `WsType` variant
     // fails THIS match at compile time rather than silently folding the new
     // transport's losses into another variant's counter.
@@ -814,7 +814,7 @@ pub const REFUSAL_LINE_STRIDE: u64 = 1 << 20;
 
 /// Every [`WsType`], in [`ws_type_index`] order — the build order for the
 /// counter tables. Kept beside the index so the two cannot drift.
-const WS_TYPES_BY_INDEX: [WsType; WS_TYPE_COUNT] =
+pub(crate) const WS_TYPES_BY_INDEX: [WsType; WS_TYPE_COUNT] =
     [WsType::LiveFeed, WsType::OrderUpdate, WsType::TruedataFeed];
 
 /// Loss counters resolved ONCE at construction, one handle per `WsType`.
@@ -1168,6 +1168,9 @@ impl WsFrameSpill {
         // fires once, on the bad boot, which is precisely the shape the agent's
         // first-sample rule swallows.
         metrics::counter!(WAL_REPLAY_RESTORE_FAILED_COUNTER).increment(0);
+        // Audit M1: the shed-then-lost counters, resolved before any socket
+        // dials so the reader's shed arm never allocates.
+        crate::wal_frame_fate::pre_register();
 
         let writer = thread::Builder::new()
             .name(WAL_WRITER_THREAD_NAME.to_string()) // APPROVED: one-shot constructor (thread name)
@@ -1659,6 +1662,22 @@ impl WsFrameSpill {
                     queued,
                     "WAL spill writer did not exit within the shutdown budget — abandoning it"
                 );
+                // Audit M1: what it still held never reaches the disk. A frame the
+                // reader or the drain shed above the last flush is a lost frame.
+                let (shed_ring, shed_drain) = crate::wal_frame_fate::frame_fate()
+                    .count_unflushed_sheds(
+                        crate::wal_frame_fate::flushed_high_seq(),
+                        WsType::LiveFeed,
+                    );
+                if shed_ring > 0 || shed_drain > 0 {
+                    error!(
+                        code = ErrorCode::WsSpill02FrameDropped.code_str(),
+                        shed_ring_lost = shed_ring,
+                        shed_drain_lost = shed_drain,
+                        "CRITICAL: the WAL writer was abandoned at shutdown holding frames \
+                         the reader or the drain had shed — those frames are lost"
+                    );
+                }
             }
         }
 
@@ -2145,6 +2164,7 @@ fn finalise_segment(
     }
     // Everything counted is in the kernel, and this segment takes no more
     // records: the next one starts its byte count at zero.
+    tally.flushed();
     tally.new_segment();
     if resolve_wal_fsync_interval().is_none() {
         return;
@@ -2187,14 +2207,23 @@ pub const WAL_UNFLUSHED_LOST_COUNTER: &str = "tv_ws_frame_spill_unflushed_lost_t
 /// Fixed size, built once per writer start: no allocation per record.
 /// O(1) per record; the failure path walks at most `UNFLUSHED_TALLY_CAPACITY`
 /// offsets, once per failure.
+///
+/// 2026-10-04 (audit M1): each entry also keeps the record's sequence and
+/// socket type, so a lost record is reported to `wal_frame_fate`, which
+/// counts it as a lost frame when the reader or the drain had shed it; and a
+/// good flush reports the highest sequence it covered.
 struct UnflushedTally<'a> {
     persisted: &'a AtomicU64,
     /// Bytes of counted records written to the current segment so far.
     segment_bytes: u64,
     ends: [u64; UNFLUSHED_TALLY_CAPACITY],
+    seqs: [u64; UNFLUSHED_TALLY_CAPACITY],
+    ws_types: [WsType; UNFLUSHED_TALLY_CAPACITY],
     len: usize,
     /// Records written past the capacity; on a loss they are counted lost.
     untracked: u64,
+    /// Highest sequence written since the last good flush.
+    high_seq: u64,
 }
 
 impl<'a> UnflushedTally<'a> {
@@ -2205,17 +2234,29 @@ impl<'a> UnflushedTally<'a> {
             persisted,
             segment_bytes: 0,
             ends: [0; UNFLUSHED_TALLY_CAPACITY],
+            seqs: [0; UNFLUSHED_TALLY_CAPACITY],
+            ws_types: [WsType::LiveFeed; UNFLUSHED_TALLY_CAPACITY],
             len: 0,
             untracked: 0,
+            high_seq: 0,
         }
     }
 
-    /// A record of `size` bytes went into the buffer and was counted.
-    fn note_written(&mut self, size: u64) {
+    /// A record of `size` bytes, sequence `seq`, went into the buffer and was
+    /// counted.
+    fn note_written(&mut self, size: u64, seq: u64, ws_type: WsType) {
         self.persisted.fetch_add(1, Ordering::Relaxed);
         self.segment_bytes = self.segment_bytes.saturating_add(size);
-        if let Some(slot) = self.ends.get_mut(self.len) {
-            *slot = self.segment_bytes;
+        self.high_seq = self.high_seq.max(seq);
+        let i = self.len;
+        if let (Some(end), Some(s), Some(t)) = (
+            self.ends.get_mut(i),
+            self.seqs.get_mut(i),
+            self.ws_types.get_mut(i),
+        ) {
+            *end = self.segment_bytes;
+            *s = seq;
+            *t = ws_type;
             self.len += 1;
         } else {
             self.untracked = self.untracked.saturating_add(1);
@@ -2224,14 +2265,24 @@ impl<'a> UnflushedTally<'a> {
 
     /// The buffer reached the kernel: nothing written so far can be lost to it.
     fn flushed(&mut self) {
-        self.len = 0;
-        self.untracked = 0;
+        if self.high_seq != 0 {
+            crate::wal_frame_fate::note_flushed_through(self.high_seq);
+        }
+        self.forget();
     }
 
-    /// A new segment starts (or the old one is abandoned).
+    /// Forgets every entry, without claiming they reached the kernel.
+    fn forget(&mut self) {
+        self.len = 0;
+        self.untracked = 0;
+        self.high_seq = 0;
+    }
+
+    /// A new segment starts. The caller has either flushed the old one
+    /// (`flushed`) or counted its losses (`discard_segment_writer`).
     fn new_segment(&mut self) {
         self.segment_bytes = 0;
-        self.flushed();
+        self.forget();
     }
 
     /// How many records written since the last good flush end past
@@ -2246,6 +2297,44 @@ impl<'a> UnflushedTally<'a> {
         // O(1) EXEMPT: end
         lost.saturating_add(self.untracked)
     }
+
+    /// Reports every record ending past `on_disk` to `wal_frame_fate` as lost.
+    /// Returns `(shed ring, shed drain, fate unknown)`. Failure path only.
+    fn report_lost_fates(&self, on_disk: u64) -> (u64, u64, u64) {
+        let fate = crate::wal_frame_fate::frame_fate();
+        let (mut ring, mut drain, mut unknown) = (0u64, 0u64, 0u64);
+        if on_disk < self.segment_bytes {
+            let n = self.len;
+            // O(1) EXEMPT: begin — failure path only, at most UNFLUSHED_TALLY_CAPACITY entries
+            for ((end, seq), ws_type) in self.ends[..n]
+                .iter()
+                .zip(&self.seqs[..n])
+                .zip(&self.ws_types[..n])
+            {
+                if *end <= on_disk {
+                    continue;
+                }
+                match fate.note_lost(*seq, *ws_type) {
+                    crate::wal_frame_fate::LostFate::WasShed(
+                        crate::wal_frame_fate::ShedKind::Ring,
+                    ) => ring += 1,
+                    crate::wal_frame_fate::LostFate::WasShed(
+                        crate::wal_frame_fate::ShedKind::DrainDepth,
+                    ) => drain += 1,
+                    crate::wal_frame_fate::LostFate::Unknown => unknown += 1,
+                    crate::wal_frame_fate::LostFate::NotShed => {}
+                }
+            }
+            // O(1) EXEMPT: end
+            // Records past the tally's capacity were written after every
+            // tracked one, so they are lost only when the file ends short.
+            if self.untracked > 0 {
+                crate::wal_frame_fate::note_lost_untracked(self.untracked);
+                unknown = unknown.saturating_add(self.untracked);
+            }
+        }
+        (ring, drain, unknown)
+    }
 }
 
 /// Drops a segment writer whose write or flush failed, WITHOUT a second flush,
@@ -2259,6 +2348,9 @@ fn discard_segment_writer(w: BufWriter<File>, tally: &mut UnflushedTally<'_>, st
     let (file, _unwritten) = w.into_parts();
     let on_disk = file.metadata().map_or(0, |m| m.len());
     let lost = tally.lost_beyond(on_disk);
+    // Audit M1: a lost record the reader or the drain had shed is a lost
+    // frame; `wal_frame_fate` counts it on the tick-loss counter.
+    let (shed_ring, shed_drain, fate_unknown) = tally.report_lost_fates(on_disk);
     tally.new_segment();
     if lost == 0 {
         return;
@@ -2275,6 +2367,9 @@ fn discard_segment_writer(w: BufWriter<File>, tally: &mut UnflushedTally<'_>, st
         code = ErrorCode::WsSpill02FrameDropped.code_str(),
         stage,
         lost_records = lost,
+        shed_ring_lost = shed_ring,
+        shed_drain_lost = shed_drain,
+        fate_unknown,
         on_disk_bytes = on_disk,
         "CRITICAL: WAL segment write failed — records already counted as persisted never \
          reached the file and are lost"
@@ -2296,7 +2391,16 @@ fn discard_segment_writer(w: BufWriter<File>, tally: &mut UnflushedTally<'_>, st
 /// one it replaces. Since Z11d `main` closes the sockets before the WAL, so
 /// this should read zero on every clean stop.
 fn count_records_left_at_writer_exit(rx: &Receiver<WalRecord>) -> usize {
-    let left = rx.try_iter().count();
+    // Audit M1: each record left behind is reported lost, so a shed frame
+    // among them is counted as a lost frame.
+    let fate = crate::wal_frame_fate::frame_fate();
+    let mut left = 0usize;
+    // O(1) EXEMPT: begin — once, at writer exit, bounded by the channel capacity
+    for r in rx.try_iter() {
+        let _fate = fate.note_lost(r.frame_seq, r.ws_type);
+        left += 1;
+    }
+    // O(1) EXEMPT: end
     if left > 0 {
         metrics::counter!(WAL_SPILL_SHUTDOWN_INCOMPLETE_COUNTER).increment(left as u64);
         error!(
@@ -2671,6 +2775,9 @@ fn persist_record_resilient(
             "stage" => "no_segment"
         )
         .increment(1);
+        // Audit M1: this record is lost; if the reader or the drain shed its
+        // frame, that is a lost frame, counted by `wal_frame_fate`.
+        let _fate = crate::wal_frame_fate::frame_fate().note_lost(r.frame_seq, r.ws_type);
         // BACKOFF (2026-08-24, audit): the two SIBLING I/O failure arms — the
         // flush arm and the `write_record` arm below — both sleep
         // `WAL_WRITER_IO_RETRY_BACKOFF` before returning. This one did not, and
@@ -2694,11 +2801,14 @@ fn persist_record_resilient(
     match write_record(w, r) {
         Ok(()) => {
             let size = record_disk_size(r);
-            tally.note_written(size);
+            tally.note_written(size, r.frame_seq, r.ws_type);
             size
         }
         Err(err) => {
             report_io_error("write_record", &err);
+            // Audit M1: this record is not in the tally (it never counted as
+            // written), so its fate is reported here.
+            let _fate = crate::wal_frame_fate::frame_fate().note_lost(r.frame_seq, r.ws_type);
             // Drop the possibly-corrupt writer without a second flush; the
             // records it still held are counted as lost. Reopen on the next
             // record.
@@ -3364,7 +3474,8 @@ pub fn highest_frame_seq_on_disk(wal_dir: &Path) -> u64 {
     highest
 }
 
-/// Header-only walk of one segment, returning the greatest `frame_seq` in it.
+/// Header-only walk of one segment, returning the greatest `frame_seq` in it,
+/// CRC-verified (audit L10, 2026-10-04).
 ///
 /// Deliberately tolerant: this is a best-effort high-water probe, not a replay.
 /// A torn tail, an unknown magic, or a short read simply ends the walk and
@@ -3372,11 +3483,86 @@ pub fn highest_frame_seq_on_disk(wal_dir: &Path) -> u64 {
 /// clock alone, and refusing to boot over a torn tail would turn a safety net
 /// into an outage. Corruption accounting belongs to [`replay_segment`], which
 /// walks the same files moments later and reports it properly.
+///
+/// # Why the winning record is checked (L10)
+///
+/// The walk reads only headers, so until 2026-10-04 a flipped byte in a
+/// record's sequence field was taken at face value. A flip in a high bit
+/// reads as a huge sequence, the seed jumps there, and every later frame is
+/// minted at `prev + 1` from it: toward the top of the range, where
+/// [`packet_capture_seq`] values saturate and distinct ticks share a dedup
+/// key and upsert each other away. Now the record that gave the highest
+/// sequence is read whole and its CRC checked (one record, O(1) extra). Only
+/// when it fails does the probe walk the segment again, verifying every
+/// record and ignoring the corrupt ones: O(segment bytes), rare, counted on
+/// `tv_wal_seq_probe_corrupt_record_total`.
 fn highest_frame_seq_in_segment(path: &Path) -> u64 {
+    let (highest, best_offset) = header_walk_highest_frame_seq(path);
+    if highest == 0 {
+        return 0;
+    }
     let Ok(mut f) = File::open(path) else {
         return 0;
     };
+    if let RecordProbe::Intact { frame_seq, .. } = record_at(&mut f, best_offset)
+        && frame_seq == highest
+    {
+        return highest;
+    }
+    metrics::counter!(WAL_SEQ_PROBE_CORRUPT_RECORD_COUNTER).increment(1);
+    let verified = verified_walk_highest_frame_seq(&mut f);
+    warn!(
+        path = %path.display(),
+        header_high = highest,
+        verified_high = verified,
+        "WAL sequence probe: the record carrying the highest sequence in this segment \
+         fails its checksum, so its sequence was ignored and the segment re-read with \
+         every record verified. Seeding from a corrupt sequence could push capture_seq \
+         to the top of its range, where distinct ticks would share a dedup key."
+    );
+    verified
+}
+
+/// Counter: segments whose highest header sequence came from a record that
+/// failed its CRC (audit L10).
+pub const WAL_SEQ_PROBE_CORRUPT_RECORD_COUNTER: &str = "tv_wal_seq_probe_corrupt_record_total";
+
+/// Every record in the segment read and CRC-checked; the greatest sequence of
+/// an INTACT record. A corrupt record is skipped by its header length, as the
+/// header walk does; the walk ends where no header parses. Cold: boot only,
+/// and only after the winning record failed its check. O(segment bytes).
+fn verified_walk_highest_frame_seq(f: &mut File) -> u64 {
+    let mut offset = 0u64;
     let mut highest = 0u64;
+    // O(1) EXEMPT: begin — boot-time seed, rare corrupt-record path, bounded by one segment
+    loop {
+        match record_at(f, offset) {
+            RecordProbe::Intact {
+                frame_seq,
+                record_len,
+            } => {
+                highest = highest.max(frame_seq);
+                offset = offset.saturating_add(record_len);
+            }
+            RecordProbe::Corrupt { record_len } => {
+                offset = offset.saturating_add(record_len);
+            }
+            RecordProbe::End => return highest,
+        }
+    }
+    // O(1) EXEMPT: end
+}
+
+/// The header walk itself: the greatest header `frame_seq` and the offset of
+/// the record that carries it. Payloads are seeked past, never read.
+fn header_walk_highest_frame_seq(path: &Path) -> (u64, u64) {
+    let Ok(mut f) = File::open(path) else {
+        return (0, 0);
+    };
+    let mut highest = 0u64;
+    let mut best_offset = 0u64;
+    // Offset of the record whose header is being read.
+    let mut offset = 0u64;
     // One header at a time; v4 is the largest at 30 bytes. The buffer MUST be
     // the largest header — a 29-byte buffer against a 30-byte v4 header read
     // `filled < min_rec` on every record and returned 0, which re-seeded
@@ -3388,11 +3574,11 @@ fn highest_frame_seq_in_segment(path: &Path) -> u64 {
             match std::io::Read::read(&mut f, &mut head[filled..]) {
                 Ok(0) => break,
                 Ok(n) => filled += n,
-                Err(_) => return highest,
+                Err(_) => return (highest, best_offset),
             }
         }
         if filled < WAL_MIN_RECORD_V1 {
-            return highest;
+            return (highest, best_offset);
         }
         let magic = &head[0..4];
         let is_v4 = magic == WAL_MAGIC_V4;
@@ -3400,7 +3586,7 @@ fn highest_frame_seq_in_segment(path: &Path) -> u64 {
         let is_v2 = magic == WAL_MAGIC_V2;
         let is_v1 = magic == WAL_MAGIC;
         if !is_v1 && !is_v2 && !is_v3 && !is_v4 {
-            return highest;
+            return (highest, best_offset);
         }
         let min_rec = if is_v4 {
             WAL_MIN_RECORD_V4
@@ -3412,7 +3598,7 @@ fn highest_frame_seq_in_segment(path: &Path) -> u64 {
             WAL_MIN_RECORD_V1
         };
         if filled < min_rec {
-            return highest;
+            return (highest, best_offset);
         }
         // v1: [magic|ws|len|frame|crc]                      -> len at 5
         // v2: [magic|ws|seq(8)|len|frame|crc]                -> seq at 5, len at 13
@@ -3430,24 +3616,29 @@ fn highest_frame_seq_in_segment(path: &Path) -> u64 {
         if (is_v2 || is_v3 || is_v4)
             && let Ok(seq_bytes) = <[u8; 8]>::try_from(&head[5..13])
         {
-            highest = highest.max(u64::from_le_bytes(seq_bytes));
+            let seq = u64::from_le_bytes(seq_bytes);
+            if seq > highest {
+                highest = seq;
+                best_offset = offset;
+            }
         }
         let Ok(len_bytes) = <[u8; 4]>::try_from(&head[len_off..len_off + 4]) else {
-            return highest;
+            return (highest, best_offset);
         };
         let frame_len = u64::from(u32::from_le_bytes(len_bytes));
-        // Skip the payload and its 4-byte CRC. The header read may have
-        // over-read into the payload, so the seek is relative to where the
-        // header actually ended, not to where the cursor now sits.
-        let over_read = i64::try_from(filled - min_rec).unwrap_or(i64::MAX);
-        let Ok(skip) = i64::try_from(frame_len + 4) else {
-            return highest;
-        };
-        let Some(delta) = skip.checked_sub(over_read) else {
-            return highest;
-        };
-        if std::io::Seek::seek(&mut f, std::io::SeekFrom::Current(delta)).is_err() {
-            return highest;
+        // The next record starts right after this one's payload and CRC.
+        // `min_rec` already counts the 4-byte CRC, so a record is
+        // `min_rec + frame_len` bytes. Seek to that ABSOLUTE offset.
+        //
+        // FIXED 2026-10-04 (L10): this was a relative seek of
+        // `frame_len + 4 - over_read`, which counted the CRC twice and landed
+        // 4 bytes into the next record. That read as an unknown magic and
+        // ended the walk, so every segment yielded only its FIRST record's
+        // sequence and the restart seed sat as far below the true high-water
+        // mark as one segment holds frames.
+        offset = offset.saturating_add(min_rec as u64 + frame_len);
+        if std::io::Seek::seek(&mut f, std::io::SeekFrom::Start(offset)).is_err() {
+            return (highest, best_offset);
         }
     }
 }
@@ -3551,11 +3742,94 @@ fn record_disk_size(r: &WalRecord) -> u64 {
     WAL_MIN_RECORD_V4 as u64 + r.frame.len() as u64
 }
 
+/// Counter: a new segment was named past the wall clock because the clock
+/// read at or below the newest segment name already used in its directory
+/// (a backward clock step, or a restart after one). R3-14.
+pub const WAL_SEGMENT_NAME_CLAMPED_COUNTER: &str = "tv_wal_segment_name_clamped_total";
+
+/// The newest segment name (its nanos) handed out per WAL directory in this
+/// process (R3-14, 2026-10-04).
+///
+/// Replay, the prune and the uploader all order segments by FILE NAME, and the
+/// name was the wall clock at rotation. A backward clock step between two
+/// rotations therefore named the newer segment BELOW the older one, and the
+/// next replay folded the newer frames first. The name is now
+/// `max(wall clock, newest name in this directory + 1)`, so names only rise.
+/// While the clock is sane the name is still the wall clock, which keeps the
+/// uploader's IST date (read from the name) correct; after a backward step it
+/// runs ahead of the clock by at most the step, until the clock catches up.
+///
+/// Keyed by directory so two writers on two directories (tests) never push
+/// each other's names. Touched only at segment rotation, on the writer thread:
+/// the first rotation in a directory lists `<dir>`, `replaying/` and
+/// `archive/` once, O(files); every later one is an O(1) probe under the lock.
+static SEGMENT_NAME_HIGH: std::sync::Mutex<Option<std::collections::HashMap<PathBuf, u128>>> =
+    std::sync::Mutex::new(None);
+
+/// The nanos in `ws-frames-<nanos>.wal`, or `None` for any other name.
+#[must_use]
+pub fn segment_name_nanos(name: &str) -> Option<u128> {
+    name.strip_prefix("ws-frames-")
+        .and_then(|s| s.strip_suffix(".wal"))
+        .and_then(|s| s.parse::<u128>().ok())
+}
+
+/// The greatest segment-name nanos under `wal_dir`, its `replaying/` and its
+/// `archive/`. `0` when there is none. Cold: first rotation per directory.
+fn highest_segment_name_on_disk(wal_dir: &Path) -> u128 {
+    let mut high = 0u128;
+    for dir in [
+        wal_dir.to_path_buf(),
+        wal_dir.join(REPLAYING_SUBDIR),
+        wal_dir.join(ARCHIVE_SUBDIR),
+    ] {
+        // O(1) EXEMPT: once per WAL directory per process, at its first segment rotation
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if let Some(n) = entry.file_name().to_str().and_then(segment_name_nanos) {
+                high = high.max(n);
+            }
+        }
+    }
+    high
+}
+
+/// The name (nanos) for the next segment in `wal_dir`, given the wall clock
+/// `now_nanos`: strictly above every name already used there. Returns the
+/// name and whether it had to be moved past the clock.
+fn next_segment_name_nanos(wal_dir: &Path, now_nanos: u128) -> (u128, bool) {
+    let mut guard = SEGMENT_NAME_HIGH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let map = guard.get_or_insert_with(std::collections::HashMap::new); // APPROVED: segment rotation, cold, once per directory
+    let high = match map.get(wal_dir) {
+        Some(h) => *h,
+        None => highest_segment_name_on_disk(wal_dir),
+    };
+    let name = now_nanos.max(high.saturating_add(1));
+    map.insert(wal_dir.to_path_buf(), name); // APPROVED: segment rotation on the background writer thread, not the per-frame append
+    (name, name != now_nanos)
+}
+
 fn open_new_segment(wal_dir: &Path) -> anyhow::Result<BufWriter<File>> {
-    let nanos = SystemTime::now()
+    let now_nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
+    let (nanos, clamped) = next_segment_name_nanos(wal_dir, now_nanos);
+    if clamped {
+        metrics::counter!(WAL_SEGMENT_NAME_CLAMPED_COUNTER).increment(1);
+        warn!(
+            source = "segment_name_clamped",
+            wall_nanos = %now_nanos,
+            named_nanos = %nanos,
+            "WAL segment named past the wall clock: the clock read at or below the newest \
+             segment name in this directory (a backward clock step). The name keeps rising so \
+             replay order stays capture order; no frame is lost"
+        );
+    }
     let path = wal_dir.join(format!("ws-frames-{:020}.wal", nanos)); // APPROVED: segment rotation on the background writer thread, not the per-frame append
     let f = OpenOptions::new()
         .create(true)
@@ -4465,60 +4739,97 @@ pub const fn applied_sink_for(endpoint: WalEndpoint) -> crate::wal_applied_water
 /// plausibly lower number would narrow that range and let a segment be
 /// skipped while its real tail sits above the watermark.
 pub(crate) fn first_frame_seq_in_segment(path: &Path) -> u64 {
-    // A frame larger than this in the first record is not a record this
-    // writer produced; refuse to allocate for it.
-    const FIRST_RECORD_PROBE_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
     let Ok(mut f) = File::open(path) else {
         return 0;
     };
+    match record_at(&mut f, 0) {
+        RecordProbe::Intact { frame_seq, .. } => frame_seq,
+        RecordProbe::Corrupt { .. } | RecordProbe::End => 0,
+    }
+}
+
+/// What [`record_at`] found at an offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordProbe {
+    /// A v2–v4 record whose CRC matches.
+    Intact { frame_seq: u64, record_len: u64 },
+    /// A record whose header parses with a plausible length but whose CRC
+    /// does not match (or a v1 record, which carries no sequence). Its length
+    /// is still the best guess for where the next record starts.
+    Corrupt { record_len: u64 },
+    /// No parsable record here: end of file, a torn header, an unknown magic,
+    /// an implausible length, or a read error.
+    End,
+}
+
+/// Reads the record at `offset` and verifies its CRC. Cold: boot sequence
+/// probes and the replay skip pass only; allocates one buffer the size of
+/// the record.
+fn record_at(f: &mut File, offset: u64) -> RecordProbe {
+    // A frame larger than this is not a record this writer produced; refuse
+    // to allocate for it.
+    const RECORD_PROBE_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+    if std::io::Seek::seek(f, std::io::SeekFrom::Start(offset)).is_err() {
+        return RecordProbe::End;
+    }
     let mut head = [0u8; WAL_MIN_RECORD_V4];
     let mut filled = 0usize;
     while filled < head.len() {
-        match std::io::Read::read(&mut f, &mut head[filled..]) {
+        match std::io::Read::read(f, &mut head[filled..]) {
             Ok(0) => break,
             Ok(n) => filled += n,
-            Err(_) => return 0,
+            Err(_) => return RecordProbe::End,
         }
     }
     let magic = &head[0..4];
     let is_v4 = magic == WAL_MAGIC_V4;
     let is_v3 = magic == WAL_MAGIC_V3;
     let is_v2 = magic == WAL_MAGIC_V2;
+    let is_v1 = magic == WAL_MAGIC;
     let (min_rec, len_off) = if is_v4 {
         (WAL_MIN_RECORD_V4, 22)
     } else if is_v3 {
         (WAL_MIN_RECORD_V3, 21)
     } else if is_v2 {
         (WAL_MIN_RECORD_V2, 13)
+    } else if is_v1 {
+        (WAL_MIN_RECORD_V1, 5)
     } else {
-        return 0;
+        return RecordProbe::End;
     };
     if filled < min_rec {
-        return 0;
+        return RecordProbe::End;
+    }
+    let Some(frame_len) = head
+        .get(len_off..len_off + 4)
+        .and_then(|b| b.try_into().ok())
+        .map(|b| u32::from_le_bytes(b) as usize)
+    else {
+        return RecordProbe::End;
+    };
+    if frame_len > RECORD_PROBE_MAX_FRAME_BYTES {
+        return RecordProbe::End;
+    }
+    let record_len = len_off + 4 + frame_len + 4;
+    if is_v1 {
+        // No sequence to recover; the length still says where the next
+        // record starts.
+        return RecordProbe::Corrupt {
+            record_len: record_len as u64,
+        };
     }
     let Some(frame_seq) = head
         .get(5..13)
         .and_then(|b| b.try_into().ok())
         .map(u64::from_le_bytes)
     else {
-        return 0;
+        return RecordProbe::End;
     };
-    let Some(frame_len) = head
-        .get(len_off..len_off + 4)
-        .and_then(|b| b.try_into().ok())
-        .map(|b| u32::from_le_bytes(b) as usize)
-    else {
-        return 0;
-    };
-    if frame_len > FIRST_RECORD_PROBE_MAX_FRAME_BYTES {
-        return 0;
-    }
-    let record_len = len_off + 4 + frame_len + 4;
-    let mut record = vec![0u8; record_len]; // APPROVED: boot replay skip pass, one record, cold path
+    let mut record = vec![0u8; record_len]; // APPROVED: boot probe / replay skip pass, one record, cold path
     let copied = filled.min(record_len);
     record[..copied].copy_from_slice(&head[..copied]);
-    if copied < record_len && std::io::Read::read_exact(&mut f, &mut record[copied..]).is_err() {
-        return 0;
+    if copied < record_len && std::io::Read::read_exact(f, &mut record[copied..]).is_err() {
+        return RecordProbe::End;
     }
     let frame = &record[len_off + 4..len_off + 4 + frame_len];
     let len_le = &record[len_off..len_off + 4];
@@ -4542,12 +4853,17 @@ pub(crate) fn first_frame_seq_in_segment(path: &Path) -> u64 {
         .and_then(|b| b.try_into().ok())
         .map(u32::from_le_bytes)
     else {
-        return 0;
+        return RecordProbe::End;
     };
     if actual != expected {
-        return 0;
+        return RecordProbe::Corrupt {
+            record_len: record_len as u64,
+        };
     }
-    frame_seq
+    RecordProbe::Intact {
+        frame_seq,
+        record_len: record_len as u64,
+    }
 }
 
 /// [`replay_all_with_report`] with the disk probe and the per-boot frame count
@@ -4748,6 +5064,8 @@ pub fn confirm_replayed<P: AsRef<Path>>(wal_dir: P) {
                 Err(err) => {
                     // Stays in `replaying/` → re-replayed next boot (DEDUP-safe).
                     error!(
+                        code = ErrorCode::HotPath01SyncFsFailed.code_str(),
+                        source = "replay_confirm_archive",
                         segment = ?seg,
                         error = %err,
                         "WAL replay confirm: could not archive staged segment — \
@@ -7359,13 +7677,13 @@ mod tests {
         };
         for seq in 1..=3 {
             write_record(&mut w, &record(seq)).unwrap();
-            tally.note_written(record_disk_size(&record(seq)));
+            tally.note_written(record_disk_size(&record(seq)), seq, WsType::LiveFeed);
         }
         w.flush().unwrap();
         tally.flushed();
         for seq in 4..=5 {
             write_record(&mut w, &record(seq)).unwrap();
-            tally.note_written(record_disk_size(&record(seq)));
+            tally.note_written(record_disk_size(&record(seq)), seq, WsType::LiveFeed);
         }
         assert_eq!(persisted.load(Ordering::Relaxed), 5);
         let path = wal_files_in(&dir).pop().expect("one segment");
@@ -7384,12 +7702,89 @@ mod tests {
             "the discarded buffer must not be flushed on the way out"
         );
         // A partial write counts the record it cut in half as lost too.
-        tally.note_written(size);
-        tally.note_written(size);
+        tally.note_written(size, 0, WsType::LiveFeed);
+        tally.note_written(size, 0, WsType::LiveFeed);
         assert_eq!(tally.lost_beyond(size + 1), 1);
         assert_eq!(tally.lost_beyond(size - 1), 2);
         assert_eq!(tally.lost_beyond(2 * size), 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Audit M1 (2026-10-04): a buffered record lost with its segment writer
+    /// is reported to the frame-fate table, so a frame the reader had shed at
+    /// the ring is counted as a lost frame, and a frame the drain later tries
+    /// to shed is refused. A record that reached the file is not reported.
+    ///
+    /// Bite: before M1 the tally kept only byte offsets, so `discard` could
+    /// not name the lost records and both assertions on the fate fail.
+    #[test]
+    fn test_discarded_writer_reports_a_shed_frame_as_lost() {
+        use crate::wal_frame_fate::{LostFate, ShedKind, ShedMark, frame_fate};
+        // Bases above any wall-clock base (~2^43.6 in 2026), so a real loss
+        // another test reports into the process-wide table cannot hold the
+        // slot as a newer frame.
+        let seq = |b: u64| ((1u64 << 46) + b) << PACKET_INDEX_BITS;
+        let dir = tmp_dir("discard-fate");
+        let persisted = AtomicU64::new(0);
+        let mut tally = UnflushedTally::new(&persisted);
+        let mut w = open_new_segment(&dir).unwrap();
+        let record = |s: u64| WalRecord {
+            ws_type: WsType::LiveFeed,
+            frame_seq: s,
+            received_at_nanos: 1_000,
+            endpoint: WalEndpoint::MainFeed,
+            frame: Bytes::from(vec![7u8; 40]),
+        };
+        // Base 1 reaches the file; bases 2 and 3 stay buffered.
+        write_record(&mut w, &record(seq(1))).unwrap();
+        tally.note_written(record_disk_size(&record(seq(1))), seq(1), WsType::LiveFeed);
+        w.flush().unwrap();
+        tally.flushed();
+        assert!(crate::wal_frame_fate::flushed_high_seq() >= seq(1));
+        for b in [2, 3] {
+            write_record(&mut w, &record(seq(b))).unwrap();
+            tally.note_written(record_disk_size(&record(seq(b))), seq(b), WsType::LiveFeed);
+        }
+        assert_eq!(
+            frame_fate().note_shed(seq(2), ShedKind::Ring, WsType::LiveFeed),
+            ShedMark::Marked
+        );
+
+        discard_segment_writer(w, &mut tally, "test");
+
+        // Base 2 was shed: its loss was counted, and a second report is not.
+        assert_eq!(
+            frame_fate().note_lost(seq(2), WsType::LiveFeed),
+            LostFate::NotShed
+        );
+        // Base 3 was not shed, but its loss is recorded: the drain may not
+        // shed it now.
+        assert!(!frame_fate().allow_drain_shed(seq(3), WsType::LiveFeed));
+        // Base 1 reached the file: still sheddable.
+        assert!(frame_fate().allow_drain_shed(seq(1), WsType::LiveFeed));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Audit M1: a record the writer could not place in any segment is
+    /// reported lost, and so is every record left in the channel at exit.
+    #[test]
+    fn test_records_left_at_writer_exit_are_reported_lost() {
+        use crate::wal_frame_fate::frame_fate;
+        let seq = ((1u64 << 46) + 100) << PACKET_INDEX_BITS;
+        let (tx, rx) = crossbeam_channel::bounded(4);
+        tx.send(WalRecord {
+            ws_type: WsType::LiveFeed,
+            frame_seq: seq,
+            received_at_nanos: 1_000,
+            endpoint: WalEndpoint::MainFeed,
+            frame: Bytes::from_static(b"x"),
+        })
+        .unwrap();
+        assert_eq!(count_records_left_at_writer_exit(&rx), 1);
+        assert!(
+            !frame_fate().allow_drain_shed(seq, WsType::LiveFeed),
+            "a record left in the channel is lost; its frame must not be shed"
+        );
     }
 
     /// 2026-10-02: a wall-clock step back re-anchors receipts instead of
@@ -9495,6 +9890,90 @@ mod tests {
             FeedHealthVerdict::Degraded,
             "a real durable-loss drop surfaces Degraded even pre/post-market"
         );
+    }
+
+    #[test]
+    fn test_regression_segment_names_keep_rising_across_a_backward_clock_step() {
+        // R3-14: replay, prune and upload order segments by NAME, and the name
+        // was the wall clock. A clock stepped back between two rotations named
+        // the newer segment below the older one, so replay folded it first.
+        let dir = tmp_dir("seg-name-backward");
+        assert_eq!(next_segment_name_nanos(&dir, 1_000), (1_000, false));
+        // Clock stepped back: the name still rises, and the clamp is reported.
+        assert_eq!(next_segment_name_nanos(&dir, 500), (1_001, true));
+        assert_eq!(next_segment_name_nanos(&dir, 1_001), (1_002, true));
+        // Clock caught up: the name is the wall clock again.
+        assert_eq!(next_segment_name_nanos(&dir, 5_000), (5_000, false));
+        // Another directory is independent of this one.
+        let other = tmp_dir("seg-name-backward-other");
+        assert_eq!(next_segment_name_nanos(&other, 10), (10, false));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    #[test]
+    fn test_regression_segment_names_seed_past_every_name_on_disk_after_a_restart() {
+        // A restart after a backward step: the first name in the process must
+        // still sort after every segment an earlier process left in the live
+        // directory, `replaying/` or `archive/`.
+        let dir = tmp_dir("seg-name-seed");
+        std::fs::create_dir_all(dir.join(REPLAYING_SUBDIR)).unwrap();
+        std::fs::create_dir_all(dir.join(ARCHIVE_SUBDIR)).unwrap();
+        std::fs::write(dir.join("ws-frames-00000000000000004000.wal"), b"").unwrap();
+        std::fs::write(
+            dir.join(REPLAYING_SUBDIR)
+                .join("ws-frames-00000000000000006000.wal"),
+            b"",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(ARCHIVE_SUBDIR)
+                .join("ws-frames-00000000000000005000.wal"),
+            b"",
+        )
+        .unwrap();
+        // A foreign file never counts.
+        std::fs::write(dir.join("ws-frames-99999999999999999999.tmp"), b"").unwrap();
+        assert_eq!(next_segment_name_nanos(&dir, 100), (6_001, true));
+        clear_open_segment_under(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // And a real open is named through it: a segment an earlier process
+        // named in the far future (year 2255) still sorts before the new one.
+        let dir = tmp_dir("seg-name-seed-open");
+        std::fs::create_dir_all(dir.join(ARCHIVE_SUBDIR)).unwrap();
+        std::fs::write(
+            dir.join(ARCHIVE_SUBDIR)
+                .join("ws-frames-09000000000000000000.wal"),
+            b"",
+        )
+        .unwrap();
+        let _w = open_new_segment(&dir).unwrap();
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+            .filter(|n| segment_name_nanos(n).is_some())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["ws-frames-09000000000000000001.wal".to_string()],
+            "the opened segment is named past the newest name on disk"
+        );
+        clear_open_segment_under(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_segment_name_nanos_parses_only_segment_names() {
+        assert_eq!(
+            segment_name_nanos("ws-frames-01790000000000000000.wal"),
+            Some(1_790_000_000_000_000_000)
+        );
+        assert_eq!(segment_name_nanos("ws-frames-x.wal"), None);
+        assert_eq!(segment_name_nanos("ws-frames-1.wal.gz"), None);
+        assert_eq!(segment_name_nanos("other-1.wal"), None);
     }
 
     #[test]
@@ -12709,6 +13188,86 @@ mod tests {
         let started = Instant::now();
         let o = drain_registered_for_abort(Duration::from_millis(300));
         assert!(started.elapsed() < Duration::from_secs(2), "{o:?}");
+    }
+
+    // --- L10 (2026-10-04): the boot high-water probe checks the record CRC ---
+
+    fn l10_segment(tag: &str, records: &[Vec<u8>]) -> PathBuf {
+        let dir = tmp_dir(tag);
+        let seg = dir.join("ws-frames-00000000000000000001.wal");
+        let bytes: Vec<u8> = records.iter().flatten().copied().collect();
+        std::fs::write(&seg, &bytes).expect("write segment");
+        dir
+    }
+
+    /// The probe must walk every record of a segment, not stop after the
+    /// first: frames of different sizes, so a wrong seek lands mid-record.
+    #[test]
+    fn test_regression_high_water_probe_reads_every_record_of_a_segment() {
+        let records = vec![
+            encode_v4_record_raw(WsType::LiveFeed, 100, 1, 0, &[1; 7]),
+            encode_v4_record_raw(WsType::LiveFeed, 200, 2, 0, &[2; 50]),
+            encode_v4_record_raw(WsType::LiveFeed, 300, 3, 0, &[]),
+            encode_v4_record_raw(WsType::LiveFeed, 400, 4, 0, &[3; 3]),
+        ];
+        let dir = l10_segment("l10-every", &records);
+        assert_eq!(
+            highest_frame_seq_on_disk(&dir),
+            400,
+            "the high-water mark is the LAST record's sequence"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// L10: a flipped high byte in one record's sequence field read as a huge
+    /// sequence and seeded the counter there. It now fails its CRC and is
+    /// ignored; the intact records still set the high-water mark.
+    #[test]
+    fn test_regression_a_corrupt_sequence_never_seeds_the_counter() {
+        let mut records = vec![
+            encode_v4_record_raw(WsType::LiveFeed, 100, 1, 0, &[1; 7]),
+            encode_v4_record_raw(WsType::LiveFeed, 200, 2, 0, &[2; 9]),
+            encode_v4_record_raw(WsType::LiveFeed, 300, 3, 0, &[3; 5]),
+        ];
+        // Highest byte of the middle record's frame_seq (bytes 5..13).
+        records[1][12] = 0x7F;
+        let dir = l10_segment("l10-corrupt-mid", &records);
+        assert_eq!(
+            highest_frame_seq_on_disk(&dir),
+            300,
+            "a sequence whose record fails its CRC must not become the seed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut records = vec![
+            encode_v4_record_raw(WsType::LiveFeed, 100, 1, 0, &[1; 7]),
+            encode_v4_record_raw(WsType::LiveFeed, 200, 2, 0, &[2; 9]),
+        ];
+        records[1][12] = 0x7F;
+        let dir = l10_segment("l10-corrupt-last", &records);
+        assert_eq!(
+            highest_frame_seq_on_disk(&dir),
+            100,
+            "when the newest record is the corrupt one, the intact one before it wins"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `first_frame_seq_in_segment` keeps its contract after the refactor:
+    /// the first record's sequence when intact, 0 when its CRC fails.
+    #[test]
+    fn test_first_frame_seq_refuses_a_corrupt_first_record() {
+        let mut records = vec![encode_v4_record_raw(WsType::LiveFeed, 77, 1, 0, &[1; 4])];
+        let dir = l10_segment("l10-first-ok", &records);
+        let seg = dir.join("ws-frames-00000000000000000001.wal");
+        assert_eq!(first_frame_seq_in_segment(&seg), 77);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        records[0][6] ^= 0x01;
+        let dir = l10_segment("l10-first-bad", &records);
+        let seg = dir.join("ws-frames-00000000000000000001.wal");
+        assert_eq!(first_frame_seq_in_segment(&seg), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

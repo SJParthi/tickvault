@@ -1889,7 +1889,7 @@ struct SealTally {
 /// Pinned by `tf_index::tests::tf_index_all_is_the_operators_nine`.
 #[allow(clippy::too_many_arguments)] // APPROVED: one seal's identity plus its two sinks and the tally
 fn route_catch_up_seal(
-    sender: Option<&tokio::sync::mpsc::Sender<BufferedSeal>>,
+    sender: Option<&tickvault_storage::seal_writer_runner::SealSender>,
     leaderboard: &mut crate::volume_leaderboard::VolumeLeaderboard,
     feed: tickvault_common::feed::Feed,
     security_id: u64,
@@ -5620,6 +5620,7 @@ fn seed_drain_loss_baselines() {
     // `the_ws_lag_exclusion_family_is_seeded_on_every_label_set`.
     for reason in [
         "ltt_not_advanced",
+        "not_a_trade",
         "clamped_negative",
         "implausible_ltt",
         "unknown_connection_slot",
@@ -7733,7 +7734,11 @@ async fn run_frame_drain(
                             Some(_) if depth_shed_verdict(
                                 frame.wal_backed,
                                 INGEST_SHED.allows_dedicated_depth(),
-                            ) == DepthShedVerdict::Shed => {
+                            ) == DepthShedVerdict::Shed
+                                // Audit M1: refused when the WAL writer
+                                // already lost the record; the rows are
+                                // then written by the next arm.
+                                && drain_may_shed_depth(&frame) => {
                                 c.shed_dedicated_depth.increment(1);
                                 // Item 45a: keep this frame's segment until the
                                 // after-close pass writes its depth back.
@@ -8825,6 +8830,21 @@ const fn depth_shed_verdict(wal_backed: bool, gate_allows: bool) -> DepthShedVer
     }
 }
 
+/// Audit M1 (2026-10-04): the second gate a depth shed passes, after
+/// [`depth_shed_verdict`] said `Shed`. A live frame is "WAL-backed" once its
+/// record is QUEUED, not written; if the writer has already lost the record,
+/// shedding would leave the rows nowhere, so they are written instead. Records
+/// the shed in `wal_frame_fate`, so a record the writer loses later is counted
+/// as lost depth. A replayed frame (`connection_index == u8::MAX`) came off a
+/// segment already on disk and skips the table.
+///
+/// O(1), zero allocation: one load and a CAS on one slot, shed path only.
+fn drain_may_shed_depth(frame: &CapturedFrame) -> bool {
+    frame.connection_index == u8::MAX
+        || tickvault_storage::wal_frame_fate::frame_fate()
+            .allow_drain_shed(frame.seq, WsType::LiveFeed)
+}
+
 /// Parses and folds ONE main-feed frame. Split out so the endpoint routing in
 /// the drain reads as routing rather than as a wall of parse logic.
 /// Decode one captured WebSocket frame and fold every packet it carries.
@@ -8994,7 +9014,10 @@ pub fn drain_main_feed_frame(
                     // them to a WAL that does not hold them.
                     let verdict =
                         depth_shed_verdict(frame.wal_backed, INGEST_SHED.allows_inline_depth());
-                    if verdict != DepthShedVerdict::Shed {
+                    // Audit M1: a shed the frame-fate table refuses (the WAL
+                    // writer already lost the record) is written instead.
+                    let shed = verdict == DepthShedVerdict::Shed && drain_may_shed_depth(frame);
+                    if !shed {
                         if verdict == DepthShedVerdict::WriteUnbackedPastShed {
                             c.depth_unbacked_not_shed.increment(1);
                         }
@@ -9104,24 +9127,29 @@ pub fn drain_main_feed_frame(
                 // that carry an LTT reach this arm (OI, PrevClose and
                 // MarketStatus decode to non-`Tick` variants), so a missing
                 // timestamp is a garbage one and is EXCLUDED, never zero.
-                if matches!(
-                    outcome,
+                //
+                // ⚠ CHANGED 2026-10-05: only a NEW trade the fold accepted is a
+                // lag sample. Every other outcome was recorded until today, and
+                // the out-of-session arm is the one that mattered: a contract
+                // that has not traded today carries an earlier day's trade time
+                // on every order-book change, so its "lag" is hours. Live that
+                // day, 6.0 million such ticks went into the histogram and read
+                // as option sockets #1-#3 delivering most packets over 60 s,
+                // while the socket-to-disk-log stage measured 99.8% at or under
+                // 131 us. Each excluded tick is counted, never dropped silently.
+                match outcome {
                     IngestOutcome::Folded {
-                        repeat_quote: true,
-                        ..
+                        repeat_quote: true, ..
+                    } => record_ws_lag_repeat_excluded(),
+                    IngestOutcome::Folded { .. } => {
+                        record_ws_lag(frame.connection_index, &tick, received_at_nanos);
+                        // Worst delay on a LIVE socket only: a replayed WAL
+                        // frame (`u8::MAX`) carries its replay time.
+                        if frame.connection_index != u8::MAX {
+                            record_ws_lag_max(tick.exchange_timestamp, received_at_nanos);
+                        }
                     }
-                ) {
-                    record_ws_lag_repeat_excluded();
-                } else {
-                    record_ws_lag(frame.connection_index, &tick, received_at_nanos);
-                    // Worst delay of a NEW trade on a LIVE socket only: a
-                    // replayed WAL frame (`u8::MAX`) carries its replay time,
-                    // and a refused tick is not a trade we kept.
-                    if frame.connection_index != u8::MAX
-                        && matches!(outcome, IngestOutcome::Folded { .. })
-                    {
-                        record_ws_lag_max(tick.exchange_timestamp, received_at_nanos);
-                    }
+                    _ => record_ws_lag_not_a_trade_excluded(),
                 }
                 match outcome {
                     IngestOutcome::Folded { .. } => {
@@ -10438,14 +10466,30 @@ fn ws_lag_whole_ms(exchange_timestamp: u32, received_at_nanos: i64) -> Option<i6
 /// The emitted series are byte-identical to before
 /// (`tv_dhan_ws_lag_ms{connection="0".."15"}`), which is what makes this a safe
 /// refactor: no dashboard, alarm, or EMF selector can tell the difference.
+///
+/// # ⚠ CHANGED 2026-10-05 (audit M6): no `metrics::Histogram` on this path
+///
+/// Resolving the handle once removed the LABEL allocation and left the
+/// RECORDER's: `metrics-exporter-prometheus` stores every histogram sample in
+/// a `metrics_util` `AtomicBucket`, a list of 64-slot blocks that allocates a
+/// new block each time the tail fills and frees them only at a scrape. So the
+/// per-tick `record` still allocated about once every 64 ticks per socket, and
+/// `dhat_ws_lag.rs` could not see it because it runs with no recorder (every
+/// handle is a no-op there). Each slot is now a fixed [`WsLagSlot`] of atomic
+/// bucket counts: three relaxed adds per tick, no allocation, recorder or
+/// not. `publish_fold_depth` republishes them as the same
+/// `tv_dhan_ws_lag_ms_{bucket,count,sum}` lines a histogram rendered, so the
+/// operator console reads what it read before. Pinned by
+/// `crates/app/tests/dhat_ws_lag_recorder.rs`, which installs the production
+/// recorder.
 struct WsLagHandles {
     /// Indexed by connection slot. Built once; never resized.
-    per_connection: [metrics::Histogram; MAX_TOTAL_DHAN_CONNECTIONS as usize],
+    per_connection: [WsLagSlot; MAX_TOTAL_DHAN_CONNECTIONS as usize],
     /// Fallback for a slot outside the pool budget. Should be unreachable —
     /// `ConnectionSlot` is allocated from the same budget — but a hot-path
     /// index must never panic and must never allocate, so it degrades into a
     /// counted bucket instead.
-    unknown_connection: metrics::Histogram,
+    unknown_connection: WsLagSlot,
     unknown_slot: metrics::Counter,
     excluded_clamped_negative: metrics::Counter,
     excluded_implausible_ltt: metrics::Counter,
@@ -10453,20 +10497,19 @@ struct WsLagHandles {
     /// previous packet). Its stamp is the time of an earlier trade, so its
     /// "lag" is how long the instrument has been quiet. Counted, not recorded.
     excluded_ltt_not_advanced: metrics::Counter,
+    /// A tick the fold did not accept as a trade, most often a contract that
+    /// has not traded today carrying an earlier day's trade time. Counted, not
+    /// recorded (2026-10-05).
+    excluded_not_a_trade: metrics::Counter,
 }
 
 impl WsLagHandles {
     fn new() -> Self {
         Self {
-            // `to_string()` here runs at most 16 times, at first-tick, on the
-            // cold path — not per tick. That is the whole point of the cache.
-            per_connection: std::array::from_fn(
-                |slot| metrics::histogram!(WS_LAG_HISTOGRAM, "connection" => slot.to_string()),
-            ),
-            unknown_connection: metrics::histogram!(
-                WS_LAG_HISTOGRAM,
-                "connection" => "unknown"
-            ),
+            // No metric is registered here: each slot registers its exposition
+            // counters on the cold publish path, the first time it has a sample.
+            per_connection: std::array::from_fn(|_| WsLagSlot::new()),
+            unknown_connection: WsLagSlot::new(),
             unknown_slot: metrics::counter!(
                 WS_LAG_EXCLUDED_COUNTER,
                 "reason" => "unknown_connection_slot"
@@ -10483,12 +10526,16 @@ impl WsLagHandles {
                 WS_LAG_EXCLUDED_COUNTER,
                 "reason" => "ltt_not_advanced"
             ),
+            excluded_not_a_trade: metrics::counter!(
+                WS_LAG_EXCLUDED_COUNTER,
+                "reason" => "not_a_trade"
+            ),
         }
     }
 
     /// The histogram for one slot. Out-of-range degrades to a counted bucket —
     /// never a panic, never an allocation.
-    fn histogram_for(&self, connection_index: u8) -> &metrics::Histogram {
+    fn histogram_for(&self, connection_index: u8) -> &WsLagSlot {
         match self.per_connection.get(connection_index as usize) {
             Some(histogram) => histogram,
             None => {
@@ -10496,6 +10543,127 @@ impl WsLagHandles {
                 &self.unknown_connection
             }
         }
+    }
+
+    /// Republishes every slot that gained samples since its last publish.
+    /// Cold: called from `publish_fold_depth`, never per tick.
+    fn publish(&self) {
+        for (slot, lag) in self.per_connection.iter().enumerate() {
+            lag.publish(|| slot.to_string());
+        }
+        self.unknown_connection.publish(|| "unknown".to_owned());
+    }
+}
+
+/// Upper bounds, in milliseconds, of the delivery-lag buckets. The same set
+/// the generic `_ms` histogram buckets carry
+/// (`observability::API_MS_HISTOGRAM_BUCKETS`, pinned equal by
+/// `ws_lag_bucket_bounds_match_the_ms_histogram_buckets`), so the published
+/// `le` values are the ones the old histogram rendered.
+const WS_LAG_BUCKET_BOUNDS_MS: [u64; 14] = [
+    1, 5, 10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000, 60_000,
+];
+
+/// One count per bound plus the overflow (`+Inf`) bucket.
+const WS_LAG_BUCKET_SLOTS: usize = WS_LAG_BUCKET_BOUNDS_MS.len() + 1;
+
+/// The `le` label of each bucket, in [`WS_LAG_BUCKET_BOUNDS_MS`] order.
+const WS_LAG_BUCKET_LE: [&str; WS_LAG_BUCKET_SLOTS] = [
+    "1", "5", "10", "25", "50", "100", "250", "500", "1000", "2500", "5000", "10000", "30000",
+    "60000", "+Inf",
+];
+
+/// Exposition names, the three a Prometheus histogram named
+/// [`WS_LAG_HISTOGRAM`] renders.
+const WS_LAG_BUCKET_SERIES: &str = "tv_dhan_ws_lag_ms_bucket";
+const WS_LAG_COUNT_SERIES: &str = "tv_dhan_ws_lag_ms_count";
+const WS_LAG_SUM_SERIES: &str = "tv_dhan_ws_lag_ms_sum";
+
+/// One socket's delivery-lag histogram as fixed atomic counts (audit M6).
+///
+/// `record_ms` is three relaxed `fetch_add`s and a scan of the 14 fixed bounds:
+/// O(1), constant, zero allocation. The counts are NON-cumulative; `publish`
+/// turns them into the cumulative `le` series on the cold path.
+struct WsLagSlot {
+    buckets: [std::sync::atomic::AtomicU64; WS_LAG_BUCKET_SLOTS],
+    sum_ms: std::sync::atomic::AtomicU64,
+    /// Total samples at the last publish; a slot with no new sample is skipped.
+    published: std::sync::atomic::AtomicU64,
+    /// Exposition counters, registered the first time this slot publishes.
+    counters: OnceLock<WsLagSlotCounters>,
+}
+
+struct WsLagSlotCounters {
+    buckets: [metrics::Counter; WS_LAG_BUCKET_SLOTS],
+    count: metrics::Counter,
+    sum: metrics::Counter,
+}
+
+impl WsLagSlot {
+    fn new() -> Self {
+        Self {
+            buckets: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+            sum_ms: std::sync::atomic::AtomicU64::new(0),
+            published: std::sync::atomic::AtomicU64::new(0),
+            counters: OnceLock::new(),
+        }
+    }
+
+    /// Records one sample. `le` semantics: a sample equal to a bound lands in
+    /// that bound's bucket, as a Prometheus histogram counts it.
+    #[inline]
+    fn record_ms(&self, ms: u64) {
+        let index = WS_LAG_BUCKET_BOUNDS_MS
+            .iter()
+            .position(|&bound| ms <= bound)
+            .unwrap_or(WS_LAG_BUCKET_BOUNDS_MS.len());
+        if let Some(bucket) = self.buckets.get(index) {
+            bucket.fetch_add(1, Ordering::Relaxed);
+        }
+        self.sum_ms.fetch_add(ms, Ordering::Relaxed);
+    }
+
+    /// Cumulative bucket counts; the last entry is the total.
+    fn cumulative(&self) -> [u64; WS_LAG_BUCKET_SLOTS] {
+        let mut out = [0_u64; WS_LAG_BUCKET_SLOTS];
+        let mut running = 0_u64;
+        for (slot, bucket) in out.iter_mut().zip(&self.buckets) {
+            running = running.saturating_add(bucket.load(Ordering::Relaxed));
+            *slot = running;
+        }
+        out
+    }
+
+    /// Sets the exposition counters to the current cumulative counts. O(15)
+    /// loads per slot; registers the counters (allocates their keys) once, the
+    /// first time the slot has a sample. `_count` is the `+Inf` bucket, so the
+    /// two can never disagree.
+    fn publish(&self, label: impl FnOnce() -> String) {
+        let cumulative = self.cumulative();
+        let total = cumulative[WS_LAG_BUCKET_SLOTS - 1];
+        if total == self.published.load(Ordering::Relaxed) {
+            return;
+        }
+        let counters = self.counters.get_or_init(|| {
+            let connection = label();
+            WsLagSlotCounters {
+                buckets: std::array::from_fn(|i| {
+                    metrics::counter!(
+                        WS_LAG_BUCKET_SERIES,
+                        "connection" => connection.clone(),
+                        "le" => WS_LAG_BUCKET_LE[i]
+                    )
+                }),
+                count: metrics::counter!(WS_LAG_COUNT_SERIES, "connection" => connection.clone()),
+                sum: metrics::counter!(WS_LAG_SUM_SERIES, "connection" => connection),
+            }
+        });
+        for (counter, value) in counters.buckets.iter().zip(cumulative) {
+            counter.absolute(value);
+        }
+        counters.count.absolute(total);
+        counters.sum.absolute(self.sum_ms.load(Ordering::Relaxed));
+        self.published.store(total, Ordering::Relaxed);
     }
 }
 
@@ -10658,8 +10826,17 @@ pub struct ConnectionDelivery {
     pub frames: u64,
 }
 
-/// Every slot's delivery record at `now_millis`. Pure over the two statics, so
-/// the never-ticked and clock-stepped-backwards cases are unit tests.
+/// Every primary-account slot's delivery record at `now_millis`. Pure over the
+/// two statics, so the never-ticked and clock-stepped-backwards cases are unit
+/// tests.
+///
+/// Only the PRIMARY account's sixteen slots are reported. The depth account's
+/// ten slots (16..26, 2026-09-26) are tiled in the budget, but no code in this
+/// build dials them: the account has no config, no token read and no pool. The
+/// console listed them as ten extra depth-20 and depth-200 rows that said
+/// "never", which read as a second depth pool (operator, 2026-10-05: "why
+/// double time same dpeth 20 and dpeth 200 showing again"). When the depth
+/// account is wired, this filter widens with it.
 #[must_use]
 pub fn connection_deliveries(now_millis: i64) -> Vec<ConnectionDelivery> {
     PER_CONN_LAST_TICK_MILLIS
@@ -10668,7 +10845,11 @@ pub fn connection_deliveries(now_millis: i64) -> Vec<ConnectionDelivery> {
         .enumerate()
         .filter_map(|(index, (last, frames))| {
             let connection_index = u8::try_from(index).ok()?;
-            let endpoint = endpoint_for_slot(connection_index)?;
+            let (account, endpoint) =
+                tickvault_core::websocket::pool_budget::slot_owner(connection_index)?;
+            if account != tickvault_core::websocket::pool_budget::DhanAccount::Primary {
+                return None;
+            }
             let last = last.load(Ordering::Relaxed);
             let tick_age_secs = (last != 0).then(|| {
                 // saturating: a clock stepped backwards reads as 0 age, never
@@ -10685,7 +10866,8 @@ pub fn connection_deliveries(now_millis: i64) -> Vec<ConnectionDelivery> {
         .collect()
 }
 
-/// Publishes [`CONN_TICK_AGE_GAUGE`] and [`CONN_FRAMES_GAUGE`] for every slot.
+/// Publishes [`CONN_TICK_AGE_GAUGE`] and [`CONN_FRAMES_GAUGE`] for every slot
+/// [`connection_deliveries`] reports (the primary account's sixteen).
 ///
 /// Called from the drain's 30-second timer arm beside the worst-socket gauge.
 /// The labelled handles are resolved ONCE (at first publish, from the
@@ -10695,10 +10877,16 @@ pub fn connection_deliveries(now_millis: i64) -> Vec<ConnectionDelivery> {
 pub fn publish_connection_deliveries(now_millis: i64) {
     static HANDLES: std::sync::OnceLock<Vec<(metrics::Gauge, metrics::Gauge)>> =
         std::sync::OnceLock::new();
+    // Registered for the slots `connection_deliveries` reports and no others:
+    // the exporter renders a registered gauge even if it is never set, so a
+    // handle for an undialled depth-account slot would put its row back on
+    // the console as a "0 frames, never" socket.
     let handles = HANDLES.get_or_init(|| {
-        (0..MAX_TOTAL_DHAN_CONNECTIONS)
-            .map(|slot| {
-                let endpoint = endpoint_for_slot(slot).map_or("unknown", DhanEndpointType::as_str);
+        connection_deliveries(0)
+            .into_iter()
+            .map(|delivery| {
+                let slot = delivery.connection_index;
+                let endpoint = delivery.endpoint.as_str();
                 (
                     metrics::gauge!(
                         CONN_TICK_AGE_GAUGE,
@@ -10714,10 +10902,9 @@ pub fn publish_connection_deliveries(now_millis: i64) {
             })
             .collect()
     });
-    for delivery in connection_deliveries(now_millis) {
-        let Some((age, frames)) = handles.get(usize::from(delivery.connection_index)) else {
-            continue;
-        };
+    // `connection_deliveries` is a pure function of the slot layout, so it
+    // yields the same slots in the same order as the registration above.
+    for ((age, frames), delivery) in handles.iter().zip(connection_deliveries(now_millis)) {
         age.set(delivery.tick_age_secs.map_or(-1.0, |secs| {
             f64::from(u32::try_from(secs).unwrap_or(u32::MAX))
         }));
@@ -10895,7 +11082,6 @@ pub fn record_ws_lag(connection_index: u8, tick: &ParsedTick, received_at_nanos:
     let handles = ws_lag_handles();
     match ws_lag_ms(tick.exchange_timestamp, received_at_nanos) {
         Some(WsLag::Measured(ms)) => {
-            handles.histogram_for(connection_index).record(ms);
             // Also fold into the DAY distribution the 15:45 scoreboard
             // persists. Added 2026-09-05: the fold lost its last production
             // caller on 2026-07-17 and the 2026-08-09 Dhan revival did not
@@ -10912,13 +11098,14 @@ pub fn record_ws_lag(connection_index: u8, tick: &ParsedTick, received_at_nanos:
             // APPROVED: exact round-trip of a whole-millisecond i64; see above.
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let day_ms = ms.max(0.0) as u64;
+            handles.histogram_for(connection_index).record_ms(day_ms);
             tickvault_core::pipeline::feed_lag_monitor::record_day_lag_ms(
                 tickvault_common::feed::Feed::Dhan,
                 day_ms,
             );
         }
         Some(WsLag::ClampedNegative) => {
-            handles.histogram_for(connection_index).record(0.0);
+            handles.histogram_for(connection_index).record_ms(0);
             handles.excluded_clamped_negative.increment(1);
             // Counted as a zero-lag sample in the day distribution too, so the
             // scoreboard's sample count matches the histogram's. Dropping it
@@ -10946,6 +11133,15 @@ pub fn record_ws_lag(connection_index: u8, tick: &ParsedTick, received_at_nanos:
 /// neither the histogram nor the 15:45 day distribution.
 pub fn record_ws_lag_repeat_excluded() {
     ws_lag_handles().excluded_ltt_not_advanced.increment(1);
+}
+
+/// Counts a tick the fold did not accept as a trade (out of session, an
+/// earlier trading day, a refused price or time, a failed write) as excluded
+/// from the delivery-lag measurement. Its stamp is not the time of a trade
+/// that just happened, so its "receipt − LTT" is not transit time. One
+/// relaxed atomic add; no allocation (2026-10-05).
+pub fn record_ws_lag_not_a_trade_excluded() {
+    ws_lag_handles().excluded_not_a_trade.increment(1);
 }
 
 /// Outcome of [`ws_lag_ms`] for a tick that DOES carry a usable timestamp.
@@ -10993,6 +11189,9 @@ fn publish_fold_depth(ingest: &LiveIngest) {
     metrics::gauge!(RING_DWELL_MAX_MS_GAUGE)
         .set(RING_DWELL_PEAK.publish(take_ring_dwell_max_ms(), now_ms));
     metrics::gauge!(WS_LAG_MAX_MS_GAUGE).set(WS_LAG_PEAK.publish(take_ws_lag_max_ms(), now_ms));
+    // The lag histogram's buckets ride the same publish (audit M6): the tick
+    // path only adds to atomics; the exposition counters are set here.
+    ws_lag_handles().publish();
     metrics::gauge!(MAIN_RECONNECT_RECOVERY_MAX_MS_GAUGE)
         .set(MAIN_RECONNECT_PEAK.publish(take_main_feed_reconnect_recovery_max_ms(), now_ms));
 }
@@ -18559,6 +18758,82 @@ mod tests {
     }
 
     #[test]
+    fn ws_lag_bucket_bounds_match_the_ms_histogram_buckets() {
+        // The published `le` values must be the ones the old histogram
+        // rendered, or the console's percentile walk changes meaning.
+        let bounds: Vec<f64> = WS_LAG_BUCKET_BOUNDS_MS
+            .iter()
+            .map(|&b| f64::from(u32::try_from(b).expect("bounds fit u32")))
+            .collect();
+        assert_eq!(bounds, crate::observability::API_MS_HISTOGRAM_BUCKETS);
+        for (bound, le) in WS_LAG_BUCKET_BOUNDS_MS.iter().zip(WS_LAG_BUCKET_LE) {
+            assert_eq!(bound.to_string(), le);
+        }
+        assert_eq!(WS_LAG_BUCKET_LE[WS_LAG_BUCKET_SLOTS - 1], "+Inf");
+        for series in [WS_LAG_BUCKET_SERIES, WS_LAG_COUNT_SERIES, WS_LAG_SUM_SERIES] {
+            assert!(series.starts_with(WS_LAG_HISTOGRAM));
+        }
+    }
+
+    #[test]
+    fn ws_lag_slot_counts_a_sample_equal_to_a_bound_in_that_bucket() {
+        let slot = WsLagSlot::new();
+        for ms in [0, 1, 2, 5, 60_000, 60_001, u64::MAX / 4] {
+            slot.record_ms(ms);
+        }
+        let cumulative = slot.cumulative();
+        // le=1 holds 0 and 1; le=5 adds 2 and 5; le=60000 adds 60000;
+        // +Inf adds the two above every bound.
+        assert_eq!(cumulative[0], 2);
+        assert_eq!(cumulative[1], 4);
+        assert_eq!(cumulative[WS_LAG_BUCKET_SLOTS - 2], 5);
+        assert_eq!(cumulative[WS_LAG_BUCKET_SLOTS - 1], 7);
+    }
+
+    #[test]
+    fn ws_lag_slot_renders_the_lines_a_prometheus_histogram_rendered() {
+        // Audit M6: the console greps `tv_dhan_ws_lag_ms_{bucket,count}`. The
+        // fixed slot must render the same sample lines a real histogram with
+        // the production `_ms` buckets renders for the same samples.
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new()
+            .set_buckets_for_metric(
+                metrics_exporter_prometheus::Matcher::Suffix("_ms".to_owned()),
+                crate::observability::API_MS_HISTOGRAM_BUCKETS,
+            )
+            .expect("valid buckets")
+            .build_recorder();
+        let handle = recorder.handle();
+        let samples = [0_u64, 3, 250, 251, 999, 4_000, 61_000];
+        metrics::with_local_recorder(&recorder, || {
+            let reference = metrics::histogram!("ref_lag_ms", "connection" => "7");
+            let slot = WsLagSlot::new();
+            for ms in samples {
+                // APPROVED: test samples are far below 2^53.
+                #[allow(clippy::cast_precision_loss)]
+                reference.record(ms as f64);
+                slot.record_ms(ms);
+            }
+            slot.publish(|| "7".to_owned());
+            // A second publish with no new sample changes nothing.
+            slot.publish(|| "7".to_owned());
+        });
+        let rendered = handle.render();
+        let lines = |prefix: &str| -> Vec<String> {
+            let mut out: Vec<String> = rendered
+                .lines()
+                .filter(|l| l.starts_with(prefix))
+                .map(|l| l.replacen(prefix, "", 1))
+                .collect();
+            out.sort();
+            out
+        };
+        let ours = lines("tv_dhan_ws_lag_ms_");
+        let reference = lines("ref_lag_ms_");
+        assert!(!ours.is_empty(), "no lag lines rendered:\n{rendered}");
+        assert_eq!(ours, reference, "rendered:\n{rendered}");
+    }
+
+    #[test]
     fn record_ws_lag_uses_resolved_handles_and_never_allocates_per_tick() {
         // The first cut of `record_ws_lag` built its label with
         // `connection_index.to_string()`, which allocated a String AND — because
@@ -18644,7 +18919,7 @@ mod tests {
             .find("let outcome = ingest.ingest_tick_at(&tick, frame.seq, packets, recv_millis);")
             .expect("the drain's fold call must exist");
         let excluded = prod
-            .find("record_ws_lag_repeat_excluded();")
+            .find("=> record_ws_lag_repeat_excluded(),")
             .expect("the drain must count repeats as excluded");
         let measured = prod
             .find("record_ws_lag(frame.connection_index, &tick, received_at_nanos);")
@@ -18657,6 +18932,49 @@ mod tests {
             prod.matches("record_ws_lag(frame.connection_index").count(),
             1,
             "exactly one live lag-recording site"
+        );
+    }
+
+    #[test]
+    fn test_record_ws_lag_not_a_trade_excluded_only_an_accepted_trade_is_a_lag_sample() {
+        // 2026-10-05: out-of-session ticks (a contract not traded today,
+        // carrying an earlier day's trade time) went into the lag histogram
+        // and read as option sockets delivering most packets over 60 s. The
+        // drain must record lag on the accepted-trade arm only and count
+        // every other outcome on its own exclusion reason.
+        record_ws_lag_not_a_trade_excluded();
+        let src = include_str!("dhan_feed_stack.rs");
+        let helper = src
+            .find("pub fn record_ws_lag_not_a_trade_excluded() {")
+            .map(|at| &src[at..])
+            .and_then(|tail| tail.find('}').map(|end| &tail[..end]))
+            .expect("the not-a-trade exclusion helper must exist");
+        assert!(
+            helper.contains(".excluded_not_a_trade.increment(1)"),
+            "a refused or out-of-session tick must increment the not_a_trade counter, got: {helper}"
+        );
+
+        let prod = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
+        let fold = prod
+            .find("let outcome = ingest.ingest_tick_at(&tick, frame.seq, packets, recv_millis);")
+            .expect("the drain's fold call must exist");
+        let arm = &prod[fold..];
+        let folded_arm = arm
+            .find("IngestOutcome::Folded { .. } => {")
+            .expect("lag must be recorded inside the accepted-trade arm");
+        let measured = arm
+            .find("record_ws_lag(frame.connection_index, &tick, received_at_nanos);")
+            .expect("the drain must still record real lag");
+        let other = arm
+            .find("_ => record_ws_lag_not_a_trade_excluded(),")
+            .expect("every other outcome must be counted as not a trade");
+        assert!(
+            folded_arm < measured && measured < other,
+            "the lag sample must sit inside the Folded arm, before the catch-all"
+        );
+        assert!(
+            src.contains("\"reason\" => \"not_a_trade\""),
+            "the exclusion reason label must be registered"
         );
     }
 
@@ -20506,6 +20824,42 @@ mod tests {
                 assert_eq!(shed, wal_backed && !gate, "backed={wal_backed} gate={gate}");
             }
         }
+    }
+
+    /// Audit M1 (2026-10-04): a live frame whose WAL record the writer already
+    /// lost is NOT shed (its rows would exist nowhere); a live frame not yet
+    /// lost is, and the shed is recorded; a replayed frame is always sheddable.
+    #[test]
+    fn drain_may_shed_depth_refuses_a_frame_the_wal_writer_lost() {
+        use tickvault_storage::wal_frame_fate::{LostFate, ShedKind, frame_fate};
+        use tickvault_storage::ws_frame_spill::PACKET_INDEX_BITS;
+        // Above any wall-clock base, so nothing else in this process holds
+        // the slot as a newer frame.
+        let seq = |b: u64| ((1u64 << 46) + 7_000 + b) << PACKET_INDEX_BITS;
+        let lost = depth_frame(Vec::new(), DhanEndpointType::Depth20, seq(1));
+        assert_eq!(
+            frame_fate().note_lost(lost.seq, WsType::LiveFeed),
+            LostFate::NotShed
+        );
+        assert!(
+            !drain_may_shed_depth(&lost),
+            "a lost record's rows must be written"
+        );
+
+        let kept = depth_frame(Vec::new(), DhanEndpointType::Depth20, seq(2));
+        assert!(drain_may_shed_depth(&kept));
+        // The shed is recorded: a later loss of the record is counted.
+        assert_eq!(
+            frame_fate().note_lost(kept.seq, WsType::LiveFeed),
+            LostFate::WasShed(ShedKind::DrainDepth)
+        );
+
+        let mut replayed = depth_frame(Vec::new(), DhanEndpointType::Depth20, seq(1));
+        replayed.connection_index = u8::MAX;
+        assert!(
+            drain_may_shed_depth(&replayed),
+            "a replayed frame is on disk"
+        );
     }
 
     /// Both production depth paths must route the shed through
@@ -30060,11 +30414,45 @@ mod connection_delivery_tests {
             before.frames + 2,
             "one count per data-bearing frame"
         );
-        // Rows exist for every slot, stamped or not, so the console can show
-        // the sixteen sockets rather than only the ones that happened to tick.
+        // Rows exist for every primary slot, stamped or not, so the console
+        // can show the sixteen sockets rather than only the ones that
+        // happened to tick.
+        assert_eq!(connection_deliveries(now).len(), PRIMARY_SLOTS);
+    }
+
+    /// The sixteen primary-account sockets.
+    const PRIMARY_SLOTS: usize = 16;
+
+    /// The depth account is not dialled by this build, so its ten slots must
+    /// not appear as ten extra "never" depth rows on the console (2026-10-05).
+    #[test]
+    fn connection_deliveries_report_only_the_primary_accounts_sixteen_slots() {
+        use tickvault_core::websocket::pool_budget::{DhanAccount, slot_owner};
+        let rows = connection_deliveries(1_757_300_000_000_i64);
+        assert_eq!(rows.len(), PRIMARY_SLOTS);
+        for row in &rows {
+            assert_eq!(
+                slot_owner(row.connection_index).map(|(account, _)| account),
+                Some(DhanAccount::Primary),
+                "slot {} is not a primary-account slot",
+                row.connection_index
+            );
+        }
+        let depth_slot = DhanAccount::Depth.jitter_base(DhanEndpointType::Depth20);
+        assert!(rows.iter().all(|d| d.connection_index != depth_slot));
         assert_eq!(
-            connection_deliveries(now).len(),
-            usize::from(MAX_TOTAL_DHAN_CONNECTIONS)
+            rows.iter()
+                .map(|d| d.endpoint)
+                .filter(|e| *e == DhanEndpointType::Depth20)
+                .count(),
+            5
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|d| d.endpoint)
+                .filter(|e| *e == DhanEndpointType::Depth200)
+                .count(),
+            5
         );
     }
 
@@ -30078,10 +30466,7 @@ mod connection_delivery_tests {
         publish_connection_deliveries(now + 30_000);
         // Publishing re-reads the same per-slot state the console reads:
         // every one of the sixteen sockets is still reported afterwards.
-        assert_eq!(
-            connection_deliveries(now + 30_000).len(),
-            MAX_TOTAL_DHAN_CONNECTIONS as usize
-        );
+        assert_eq!(connection_deliveries(now + 30_000).len(), PRIMARY_SLOTS);
     }
 
     /// A clock stepped backwards reads as age 0, never as a wrapped giant.

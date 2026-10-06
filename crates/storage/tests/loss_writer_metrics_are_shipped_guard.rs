@@ -95,7 +95,13 @@ const DELIBERATELY_LOCAL_ONLY: &[(&str, &str)] = &[
      release (-$3.60/mo), bundled with an instance recreate. Ship this name in \
      the change that takes that lever, or in any change that otherwise returns \
      the maximal month below $117 — not before, because a name that stops the \
-     trading box mid-month costs more than the blindness it cures.",
+     trading box mid-month costs more than the blindness it cures. \
+     AMENDED 2026-10-05 (noise lock §2.10): the DEPTH slice, where rows are \
+     refused, is now paged by `tv-<env>-market-data-refused` through a log \
+     metric filter on the metrics log (deploy/aws/terraform/loss-group-alarms.tf). \
+     That route adds no EMF name, so it does not touch the selector this guard \
+     reads, and the name stays out of the selector. The tick slice (wrote \
+     blind, nothing refused) is still not alarmed.",
     ),
 ];
 

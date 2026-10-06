@@ -274,7 +274,7 @@ This file is the governance lock; the mechanical teeth are the guard test + scan
 - GROWS the `rust_only_guard.rs` allowlist (it may only shrink, never grow).
 - Removes, softens, or `#[ignore]`s the guard test, or deletes/weakens this rule file.
 - Adds a non-Rust runtime dependency to any product-path component.
-- Re-introduces a deleted non-Rust component (e.g. a Python sidecar) into the runtime rather than as a reference/doc note.
+- Re-introduces a deleted non-Rust component (e.g. a non-Rust sidecar) into the runtime rather than as a reference/doc note.
 
 Any such PR MUST be rejected in review even if the operator approves verbally — the operator must update THIS file FIRST with a fresh dated quote, only then can the PR land.
 
@@ -992,6 +992,28 @@ operator, CI gate scripts) is frozen by file set AND by length.
 Workflow `run:` steps, the Makefile, SSM command strings built inside Rust
 (the operator console), and `Command::new("sh")` spawns. The plan item records
 them; this section is amended when each lands.
+
+### 2026-10-04 — the embedded shell and the awk/jq programs are budgeted (audit M5, L8)
+
+Two places ran root shell on the production server without being a shell
+file, and two text languages ran with no count at all. Four more shrink-only
+tests in the same guard, ceilings measured 2026-10-04:
+
+| Test | What it pins |
+|---|---|
+| `console_embedded_shell_never_grows` | string-literal lines and bytes of the two console Lambda files that send shell over SSM (`operator_control_action_commands.rs` 537 / 34,447 B, `operator_control_commands.rs` 27 / 1,766 B) |
+| `ssm_workflow_shell_never_grows` | per workflow, the `commands=[…]` elements and bytes sent by `ssm send-command` (aws-control 22 / 1,486 B, deploy-aws 95 / 11,980 B, downsize-instance 43 / 3,767 B, grow-ebs-volume 9 / 353 B); an `ssm send-command` with no parseable payload fails |
+| `awk_jq_usage_never_grows` | per file, the word count of `awk`/`gawk`/`mawk`/`jq` on non-comment lines (69 files); a `*.awk` or `*.jq` program file is forbidden |
+| `all_green_jq_program_never_grows` | the All Green jq program in `ci.yml`, 21 lines (its semantics stay pinned by merge-gate-lock §5.1) |
+
+`.config/nextest.toml` also now fails a test that needed its retry
+(`flaky-result = "fail"`, audit L2), pinned by
+`nextest_ci_profile_fails_flaky_tests`. Each table was bite-checked: lowering
+any one ceiling by one fails its test. **Honest limits:** the console shell is
+frozen, not yet ported to Rust; awk/jq are counted by word, so a name built
+from a variable is not seen; Rust literals are read only up to the first
+`#[cfg(test)]` line. Workflow `run:` steps, the Makefile's shell and
+`Command::new("sh")` spawns are still not budgeted.
 
 ### What a PR that violates §0.10 looks like (REJECT)
 

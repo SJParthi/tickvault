@@ -58,12 +58,30 @@ pub fn spawn_ws_event_audit_consumer(
 pub fn spawn_live_feed_lifecycle_audit(
     questdb_cfg: tickvault_common::config::QuestDbConfig,
 ) -> tokio::sync::mpsc::Sender<tickvault_core::websocket::pool_supervisor::WsLifecycleEvent> {
-    use tickvault_core::websocket::pool_supervisor::WsLifecycleEvent;
+    use tickvault_core::websocket::pool_supervisor::{
+        WsLifecycleEvent, WsSubscriptionAuditEvent, install_subscription_audit,
+    };
 
     let rows_tx = spawn_ws_event_audit_consumer(questdb_cfg.clone());
     let gap_tx = spawn_feed_gap_audit_consumer(questdb_cfg);
     let (tx, mut rx) =
         tokio::sync::mpsc::channel::<WsLifecycleEvent>(WS_EVENT_AUDIT_CHANNEL_CAPACITY);
+    // Audit M8 (2026-10-04): subscription changes (swap, resubscribe, ghost
+    // resend, 805 park) reach the same table through their own bounded
+    // channel. It is installed process-wide because every emit site runs on
+    // a connection task that holds no handle on this forwarder.
+    let (sub_tx, mut sub_rx) =
+        tokio::sync::mpsc::channel::<WsSubscriptionAuditEvent>(WS_EVENT_AUDIT_CHANNEL_CAPACITY);
+    let sub_installed = install_subscription_audit(sub_tx);
+    if !sub_installed {
+        error!(
+            code = tickvault_common::error_code::ErrorCode::HotPath02WriterQueueDrop.code_str(),
+            source = "ws_subscription_audit_not_installed",
+            "ws_event_audit: a subscription-change channel was already installed, so this \
+             forwarder receives none; swap, resubscribe, ghost-resend and 805-park rows go \
+             to the first forwarder only"
+        );
+    }
     tokio::spawn(async move {
         // One latch per forwarder: a drop EPISODE is a property of this
         // channel, and the page for it is said once per episode (see
@@ -75,10 +93,15 @@ pub fn spawn_live_feed_lifecycle_audit(
         let mut gaps = GapTracker::new();
         let mut stop_poll = tokio::time::interval(GAP_STOP_POLL_INTERVAL);
         let mut stop_seen = false;
+        // Audit M8: every row this forwarder writes gets a STRICTLY increasing
+        // stamp, so two events on one socket inside one clock tick cannot
+        // share a DEDUP key and collapse into one row.
+        let mut stamp = StrictStamp::new();
+        let mut sub_open = sub_installed;
         loop {
             tokio::select! {
                 maybe = rx.recv() => {
-                    let now_ist_nanos = now_ist_nanos();
+                    let now_ist_nanos = stamp.next(now_ist_nanos());
                     let Some(event) = maybe else {
                         // Every socket is gone: a gap still open is written
                         // closed at this instant rather than lost.
@@ -96,6 +119,24 @@ pub fn spawn_live_feed_lifecycle_audit(
                         gaps.close_all(now_ist_nanos, |row| forward_gap_row(&gap_tx, row));
                     }
                     match rows_tx.try_send(lifecycle_row(event, now_ist_nanos, step)) {
+                        Ok(()) => {
+                            let _ = record_forward_ok(&latch, &event);
+                        }
+                        Err(TrySendError::Full(_)) => {
+                            let _ = record_forward_drop(&latch, &event, "full");
+                        }
+                        Err(TrySendError::Closed(_)) => {
+                            let _ = record_forward_drop(&latch, &event, "closed");
+                        }
+                    }
+                }
+                maybe = sub_rx.recv(), if sub_open => {
+                    let Some(event) = maybe else {
+                        sub_open = false;
+                        continue;
+                    };
+                    let row = subscription_row(event, stamp.next(now_ist_nanos()));
+                    match rows_tx.try_send(row) {
                         Ok(()) => {
                             let _ = record_forward_ok(&latch, &event);
                         }
@@ -412,7 +453,7 @@ async fn run_feed_gap_audit_consumer(
 /// new metric name and no new alarm.
 fn record_forward_drop(
     latch: &DropLatch,
-    event: &tickvault_core::websocket::pool_supervisor::WsLifecycleEvent,
+    event: &impl ForwardedEvent,
     reason: &'static str,
 ) -> bool {
     metrics::counter!(
@@ -426,10 +467,10 @@ fn record_forward_drop(
             code = tickvault_common::error_code::ErrorCode::HotPath02WriterQueueDrop.code_str(),
             source = "ws_event_audit_row_dropped",
             reason,
-            endpoint = event.endpoint.as_str(),
-            connection_index = event.connection_index,
-            event_kind = event.kind.as_str(),
-            event_reason = event.reason,
+            endpoint = event.endpoint().as_str(),
+            connection_index = event.connection_index(),
+            event_kind = event.kind().as_str(),
+            event_reason = event.reason(),
             "ws_event_audit: a socket-lifecycle row was DROPPED before it reached the \
              writer ({reason}) — the audit table is now MISSING this socket's history \
              and will keep missing rows until the consumer drains. Counted on every \
@@ -442,22 +483,134 @@ fn record_forward_drop(
 /// A socket-lifecycle audit row reached the consumer. Closes an open drop
 /// episode (one `info!` on the falling edge); routine otherwise. Returns
 /// whether this call closed an episode.
-fn record_forward_ok(
-    latch: &DropLatch,
-    event: &tickvault_core::websocket::pool_supervisor::WsLifecycleEvent,
-) -> bool {
+fn record_forward_ok(latch: &DropLatch, event: &impl ForwardedEvent) -> bool {
     let recovered = latch.on_ok();
     if recovered {
         info!(
-            endpoint = event.endpoint.as_str(),
-            connection_index = event.connection_index,
-            event_kind = event.kind.as_str(),
+            endpoint = event.endpoint().as_str(),
+            connection_index = event.connection_index(),
+            event_kind = event.kind().as_str(),
             "ws_event_audit: socket-lifecycle rows are reaching the writer again — the \
              drop episode is over (rows dropped during it are gone; the count is in \
              tv_ws_event_audit_dropped_total)"
         );
     }
     recovered
+}
+
+/// The facts the forwarder's drop and recovery lines name, shared by the two
+/// event types it forwards (lifecycle and, since audit M8, subscription
+/// changes). Every accessor is a field read.
+trait ForwardedEvent {
+    fn endpoint(&self) -> tickvault_core::websocket::pool_budget::DhanEndpointType;
+    fn connection_index(&self) -> u8;
+    fn kind(&self) -> tickvault_common::ws_event_types::WsEventKind;
+    fn reason(&self) -> &'static str;
+}
+
+impl ForwardedEvent for tickvault_core::websocket::pool_supervisor::WsLifecycleEvent {
+    fn endpoint(&self) -> tickvault_core::websocket::pool_budget::DhanEndpointType {
+        self.endpoint
+    }
+    fn connection_index(&self) -> u8 {
+        self.connection_index
+    }
+    fn kind(&self) -> tickvault_common::ws_event_types::WsEventKind {
+        self.kind
+    }
+    fn reason(&self) -> &'static str {
+        self.reason
+    }
+}
+
+impl ForwardedEvent for tickvault_core::websocket::pool_supervisor::WsSubscriptionAuditEvent {
+    fn endpoint(&self) -> tickvault_core::websocket::pool_budget::DhanEndpointType {
+        self.endpoint
+    }
+    fn connection_index(&self) -> u8 {
+        self.connection_index
+    }
+    fn kind(&self) -> tickvault_common::ws_event_types::WsEventKind {
+        self.kind
+    }
+    fn reason(&self) -> &'static str {
+        self.reason
+    }
+}
+
+/// A strictly increasing IST-nanos stamp for the rows one forwarder writes
+/// (audit M8, 2026-10-04).
+///
+/// `ws_event_audit`'s DEDUP key is `(ts, trading_date_ist, feed, ws_type,
+/// connection_index, event_kind)`, so two events of one kind on one socket
+/// stamped with the same nanosecond would UPSERT into ONE row and the first
+/// would vanish. A swap whose refusal and retry land inside one clock tick
+/// is exactly that shape. Each stamp is `max(now, previous + 1)`: O(1), no
+/// allocation, and a backward clock step can only hold the stamp still
+/// (advanced one nanosecond per row), never move it back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StrictStamp {
+    last: Option<i64>,
+}
+
+impl StrictStamp {
+    const fn new() -> Self {
+        Self { last: None }
+    }
+
+    fn next(&mut self, now_ist_nanos: i64) -> i64 {
+        let stamp = match self.last {
+            Some(last) if now_ist_nanos <= last => last.saturating_add(1),
+            _ => now_ist_nanos,
+        };
+        self.last = Some(stamp);
+        stamp
+    }
+}
+
+/// The authorized per-endpoint socket cap, as the audit row's `pool_size`.
+/// Not a live count: a row records ONE socket's event and must not imply a
+/// fleet-wide reading it cannot have.
+fn pool_size_of(endpoint: tickvault_core::websocket::pool_budget::DhanEndpointType) -> i64 {
+    use tickvault_core::websocket::pool_budget::DhanEndpointType;
+    let cap = match endpoint {
+        DhanEndpointType::Depth20 => tickvault_common::constants::MAX_TWENTY_DEPTH_CONNECTIONS,
+        DhanEndpointType::Depth200 => {
+            tickvault_common::constants::MAX_TWO_HUNDRED_DEPTH_CONNECTIONS
+        }
+        _ => tickvault_common::constants::MAX_WEBSOCKET_CONNECTIONS,
+    };
+    i64::try_from(cap).unwrap_or(i64::MAX)
+}
+
+/// Widens one subscription-change event (audit M8, 2026-10-04) into the
+/// audit row, at a given instant. Split out of the spawn wrapper so the
+/// mapping is asserted without a runtime or a database.
+fn subscription_row(
+    event: tickvault_core::websocket::pool_supervisor::WsSubscriptionAuditEvent,
+    now_ist_nanos: i64,
+) -> tickvault_common::ws_event_types::WsEventAuditRow {
+    let nanos_per_day: i64 = 86_400 * 1_000_000_000;
+    tickvault_common::ws_event_types::WsEventAuditRow {
+        event_ts_ist_nanos: now_ist_nanos,
+        trading_date_ist_nanos: now_ist_nanos - now_ist_nanos.rem_euclid(nanos_per_day),
+        feed: tickvault_common::feed::Feed::Dhan,
+        ws_type: ws_type_of(event.endpoint),
+        connection_index: i64::from(event.connection_index),
+        pool_size: pool_size_of(event.endpoint),
+        event_kind: event.kind,
+        source: event.endpoint.as_str().to_string(),
+        reason: event.reason.to_string(),
+        dhan_code: event.dhan_code.map_or(
+            tickvault_common::ws_event_types::WS_EVENT_NO_DHAN_CODE,
+            i64::from,
+        ),
+        // A subscription change never closes a feed gap.
+        down_secs: 0,
+        attempts: 0,
+        market_hours: tickvault_common::market_hours::is_within_market_hours_ist(),
+        subscription: event.detail,
+    }
 }
 
 /// Widens one socket lifecycle event into the audit row, at a given instant.
@@ -471,7 +624,6 @@ fn lifecycle_row(
     step: GapStep,
 ) -> tickvault_common::ws_event_types::WsEventAuditRow {
     use tickvault_common::ws_event_types::WsEventAuditRow;
-    use tickvault_core::websocket::pool_budget::DhanEndpointType;
 
     let nanos_per_day: i64 = 86_400 * 1_000_000_000;
     WsEventAuditRow {
@@ -488,18 +640,7 @@ fn lifecycle_row(
         // The authorized per-endpoint cap, not a live count: this row records
         // ONE socket's event and must not imply a fleet-wide reading it
         // cannot have.
-        pool_size: match event.endpoint {
-            DhanEndpointType::Depth20 => {
-                i64::try_from(tickvault_common::constants::MAX_TWENTY_DEPTH_CONNECTIONS)
-                    .unwrap_or(i64::MAX)
-            }
-            DhanEndpointType::Depth200 => {
-                i64::try_from(tickvault_common::constants::MAX_TWO_HUNDRED_DEPTH_CONNECTIONS)
-                    .unwrap_or(i64::MAX)
-            }
-            _ => i64::try_from(tickvault_common::constants::MAX_WEBSOCKET_CONNECTIONS)
-                .unwrap_or(i64::MAX),
-        },
+        pool_size: pool_size_of(event.endpoint),
         event_kind: event.kind,
         source: event.endpoint.as_str().to_string(),
         reason: event.reason.to_string(),
@@ -513,6 +654,12 @@ fn lifecycle_row(
         down_secs: step.down_secs,
         attempts: step.attempts,
         market_hours: tickvault_common::market_hours::is_within_market_hours_ist(),
+        // A lifecycle row carries no subscription change; its instrument
+        // count is recorded (audit M8, 2026-10-04).
+        subscription: tickvault_common::ws_event_types::WsSubscriptionDetail {
+            held: Some(event.instruments_held),
+            ..tickvault_common::ws_event_types::WsSubscriptionDetail::NONE
+        },
     }
 }
 
@@ -685,6 +832,7 @@ mod tests {
             down_secs: 0,
             attempts: 0,
             market_hours: false,
+            subscription: tickvault_common::ws_event_types::WsSubscriptionDetail::NONE,
         };
 
         for i in 0..WS_EVENT_AUDIT_CHANNEL_CAPACITY {
@@ -999,5 +1147,152 @@ mod feed_gap_tests {
         assert_eq!(open_row.down_secs, 90, "no longer hard-coded to 0");
         assert_eq!(open_row.attempts, 0);
         assert_eq!(open_row.event_kind, WsEventKind::Connected);
+    }
+}
+
+/// Audit M8 (2026-10-04): subscription changes reach `ws_event_audit`
+/// through this forwarder, every row it writes has a strictly increasing
+/// stamp, and a dropped subscription row is counted and paged like a
+/// lifecycle one.
+#[cfg(test)]
+mod subscription_row_tests {
+    use super::{StrictStamp, record_forward_drop, record_forward_ok, subscription_row};
+    use tickvault_common::types::ExchangeSegment;
+    use tickvault_common::ws_event_types::{
+        WS_EVENT_NO_DHAN_CODE, WsAuditInstrument, WsEventKind, WsSubscriptionDetail, WsType,
+    };
+    use tickvault_core::websocket::audit_drop_latch::DropLatch;
+    use tickvault_core::websocket::pool_budget::DhanEndpointType;
+    use tickvault_core::websocket::pool_supervisor::WsSubscriptionAuditEvent;
+
+    fn swap_event() -> WsSubscriptionAuditEvent {
+        WsSubscriptionAuditEvent {
+            endpoint: DhanEndpointType::Depth200,
+            connection_index: 12,
+            kind: WsEventKind::SubscriptionSwapped,
+            reason: "applied",
+            dhan_code: None,
+            detail: WsSubscriptionDetail {
+                instrument: Some(WsAuditInstrument {
+                    security_id: 52_175,
+                    segment: ExchangeSegment::NseFno,
+                }),
+                new_instrument: Some(WsAuditInstrument {
+                    security_id: 52_176,
+                    segment: ExchangeSegment::NseFno,
+                }),
+                added: Some(1),
+                removed: Some(1),
+                held: Some(1),
+            },
+        }
+    }
+
+    #[test]
+    fn a_swap_row_names_its_pool_both_contracts_and_the_outcome() {
+        let row = subscription_row(swap_event(), 1_700_000_000_000_000_000);
+        assert_eq!(row.ws_type, WsType::Depth200);
+        assert_eq!(row.connection_index, 12);
+        assert_eq!(row.pool_size, 5, "the AUTHORIZED cap, not a live count");
+        assert_eq!(row.event_kind, WsEventKind::SubscriptionSwapped);
+        assert_eq!(row.reason, "applied");
+        assert_eq!(row.source, DhanEndpointType::Depth200.as_str());
+        assert_eq!(row.dhan_code, WS_EVENT_NO_DHAN_CODE);
+        assert_eq!(row.down_secs, 0, "a subscription change never closes a gap");
+        assert_eq!(row.attempts, 0);
+        assert_eq!(row.subscription, swap_event().detail);
+        assert_eq!(row.feed, tickvault_common::feed::Feed::Dhan);
+    }
+
+    #[test]
+    fn an_overflow_park_row_carries_the_805_code() {
+        let event = WsSubscriptionAuditEvent {
+            endpoint: DhanEndpointType::MainFeed,
+            connection_index: 3,
+            kind: WsEventKind::OverflowParked,
+            reason: "pool_overflow",
+            dhan_code: Some(805),
+            detail: WsSubscriptionDetail {
+                held: Some(4_200),
+                ..WsSubscriptionDetail::NONE
+            },
+        };
+        let row = subscription_row(event, 1_700_000_000_000_000_000);
+        assert_eq!(row.ws_type, WsType::MainFeed);
+        assert_eq!(row.dhan_code, 805);
+        assert_eq!(row.subscription.held, Some(4_200));
+        assert!(row.subscription.instrument.is_none());
+    }
+
+    #[test]
+    fn the_subscription_row_trading_date_is_the_events_own_ist_day() {
+        let nanos_per_day = 86_400_i64 * 1_000_000_000;
+        let midnight = 1_700_000_000_000_000_000_i64 - 1_700_000_000_000_000_000 % nanos_per_day;
+        let late = midnight + nanos_per_day - 1;
+        let row = subscription_row(swap_event(), late);
+        assert_eq!(row.event_ts_ist_nanos, late);
+        assert_eq!(row.trading_date_ist_nanos, midnight);
+    }
+
+    #[test]
+    fn the_stamp_is_strictly_increasing_even_when_the_clock_stalls_or_steps_back() {
+        let mut stamp = StrictStamp::new();
+        assert_eq!(
+            stamp.next(1_000),
+            1_000,
+            "the first stamp is the clock itself"
+        );
+        assert_eq!(
+            stamp.next(1_000),
+            1_001,
+            "a stalled clock still advances one ns"
+        );
+        assert_eq!(stamp.next(1_000), 1_002);
+        assert_eq!(
+            stamp.next(500),
+            1_003,
+            "a backward step never moves the stamp back"
+        );
+        assert_eq!(stamp.next(5_000), 5_000, "a clock ahead of the stamp wins");
+        let mut previous = i64::MIN;
+        for now in [7, 7, 6, 9, 9, 9, 3, 20] {
+            let next = stamp.next(now);
+            assert!(next > previous, "stamp {next} did not pass {previous}");
+            previous = next;
+        }
+    }
+
+    #[test]
+    fn the_stamp_saturates_rather_than_wrapping_at_the_top_of_the_range() {
+        let mut stamp = StrictStamp::new();
+        assert_eq!(stamp.next(i64::MAX), i64::MAX);
+        assert_eq!(
+            stamp.next(i64::MAX),
+            i64::MAX,
+            "saturates, never wraps negative"
+        );
+    }
+
+    #[test]
+    fn a_dropped_subscription_row_is_loud_once_per_episode() {
+        let latch = DropLatch::new();
+        let event = swap_event();
+        assert!(!record_forward_ok(&latch, &event));
+        assert!(record_forward_drop(&latch, &event, "full"));
+        assert!(!record_forward_drop(&latch, &event, "full"));
+        assert!(record_forward_ok(&latch, &event));
+    }
+
+    /// The forwarder is the only production installer, so a source scan pins
+    /// that it installs the channel and writes the rows (the spawn wrapper
+    /// itself needs a runtime and a database).
+    #[test]
+    fn the_forwarder_installs_the_subscription_channel_and_writes_its_rows() {
+        let src = include_str!("ws_audit_consumer.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        assert!(prod.contains("install_subscription_audit(sub_tx)"));
+        assert!(prod.contains("maybe = sub_rx.recv(), if sub_open =>"));
+        assert!(prod.contains("subscription_row(event, stamp.next(now_ist_nanos()))"));
+        assert!(prod.contains("let now_ist_nanos = stamp.next(now_ist_nanos());"));
     }
 }
