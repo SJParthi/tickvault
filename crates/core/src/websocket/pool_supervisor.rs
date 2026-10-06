@@ -1372,6 +1372,28 @@ const _: () = assert!(
         > OVERFLOW_PROBE_FIRST_FRAME_DEADLINE_SECS + OVERFLOW_PROBE_DEFERRAL_CAP_SECS
 );
 
+/// Review fix 2026-10-06, round 6: no sibling is noted later than this long
+/// after the window's GRANT. A note keeps its own heal deadline
+/// ([`OVERFLOW_PROBE_SIBLING_HEAL_DEADLINE_SECS`]) and the settle time after
+/// its heal ([`OVERFLOW_PROBE_EVICTION_ATTRIBUTION_SECS`]), and
+/// [`OVERFLOW_PROBE_WINDOW_MAX_SECS`] must never fail a window inside either.
+/// The cutoff from the first frame ([`OVERFLOW_PROBE_NOTE_CUTOFF_SECS`]) runs
+/// from the LATEST first frame, which a watch restart clears, so after a
+/// restart it alone allowed notes as late as about 860 s from the grant,
+/// logged as "the test is not failed for this" and then failed at 740 s.
+/// A sibling dropping past this cutoff fails the window at once
+/// (`failed_deferral_exhausted`). 600 s = 740 - 120 - 20. A window with no
+/// restart notes nothing past 120 + 240 = 360 s, so this cutoff only bites
+/// after a restart.
+pub const OVERFLOW_PROBE_GRANT_NOTE_CUTOFF_SECS: u64 = OVERFLOW_PROBE_WINDOW_MAX_SECS
+    - OVERFLOW_PROBE_SIBLING_HEAL_DEADLINE_SECS
+    - OVERFLOW_PROBE_EVICTION_ATTRIBUTION_SECS;
+
+const _: () = assert!(
+    OVERFLOW_PROBE_GRANT_NOTE_CUTOFF_SECS
+        > OVERFLOW_PROBE_FIRST_FRAME_DEADLINE_SECS + OVERFLOW_PROBE_NOTE_CUTOFF_SECS
+);
+
 /// Counter of overflow-probe outcomes, labelled by
 /// [`OverflowProbeOutcome::as_str`] (a fixed set). Prometheus only: no new
 /// alarm, no new EMF selection (noise lock §3).
@@ -1895,14 +1917,23 @@ impl OverflowEpisode {
         self.burst_mask |= bit;
     }
 
-    /// Whether the note cutoff ([`OVERFLOW_PROBE_NOTE_CUTOFF_SECS`] after the
-    /// watched socket's first frame) has passed. Before the first frame every
-    /// note is taken (the first-frame deadline bounds that phase).
+    /// Whether the note cutoff has passed: [`OVERFLOW_PROBE_NOTE_CUTOFF_SECS`]
+    /// after the watched socket's first frame, or (review fix 2026-10-06,
+    /// round 6) [`OVERFLOW_PROBE_GRANT_NOTE_CUTOFF_SECS`] after the grant,
+    /// which a watch restart never resets, so every note taken can still be
+    /// honoured inside [`OVERFLOW_PROBE_WINDOW_MAX_SECS`]. Before the first
+    /// frame the first-frame deadline bounds the phase. A window with no
+    /// grant instant reads as past it (fails closed). O(1).
     fn past_note_cutoff(&self, now: Instant) -> bool {
-        self.first_frame_at.is_some_and(|first| {
+        let past_first = self.first_frame_at.is_some_and(|first| {
             now.saturating_duration_since(first)
                 >= Duration::from_secs(OVERFLOW_PROBE_NOTE_CUTOFF_SECS)
-        })
+        });
+        let past_grant = self.granted_at.is_none_or(|granted| {
+            now.saturating_duration_since(granted)
+                >= Duration::from_secs(OVERFLOW_PROBE_GRANT_NOTE_CUTOFF_SECS)
+        });
+        past_first || past_grant
     }
 
     /// Notes sibling `slot` (`bit` is its mask bit): the window cannot pass
@@ -20762,7 +20793,10 @@ mod tests {
         // a sibling (healed at G+477, settling to G+497), an 807 on the probed
         // socket at G+494 (its one watch restart), a fresh first frame at G+613
         // and a new deferral. Before the fix the window ran on to about G+993
-        // (613 + 380); now it ends at G+740.
+        // (613 + 380); now it ends at G+740. Round 6: a sibling can no longer
+        // be noted past G+600, so the new deferral here is the probed socket
+        // itself redialling (`watched_down`), the one state that can still
+        // hold a pass to the bound.
         let start = t0();
         let mut ep = episode_after_805(&[4], start);
         let granted = grant_first_probe(&mut ep, start);
@@ -20790,10 +20824,8 @@ mod tests {
         );
         let refirst = granted + secs(613);
         ep.on_first_frame(4, refirst);
-        assert_eq!(
-            ep.on_bare_reset(1, 0, refirst + secs(83)).outcomes[0],
-            Some(OverflowProbeOutcome::SiblingResetNoted)
-        );
+        ep.on_watched_redialling(4);
+        assert!(ep.watched_down);
         let max = granted + secs(OVERFLOW_PROBE_WINDOW_MAX_SECS);
         assert_eq!(ep.poll(max - ms(1), true), OverflowEpisodeEffect::default());
         assert_eq!(ep.phase, OverflowEpisodePhase::Probing);
@@ -20803,9 +20835,128 @@ mod tests {
             Some(OverflowProbeOutcome::FailedDeferralExhausted)
         );
         assert_eq!(fail.repark, Some(4));
-        assert_eq!(fail.sibling, Some(1));
+        assert_eq!(fail.sibling, None);
         assert_eq!(ep.granted_at, None);
         assert!(ep.watched().is_none());
+    }
+
+    /// Polls `ep` once a second over `from..=to` (seconds after `granted`)
+    /// and asserts each poll does nothing.
+    fn polls_do_nothing(ep: &mut OverflowEpisode, granted: Instant, from: u64, to: u64) {
+        for s in from..=to {
+            assert_eq!(
+                ep.poll(granted + secs(s), true),
+                OverflowEpisodeEffect::default(),
+                "poll at G+{s}"
+            );
+        }
+    }
+
+    /// A window deferred by two siblings, then its probed socket's one watch
+    /// restart at G+440, a fresh first frame at G+450, and a third sibling
+    /// noted at G+560 (heal deadline G+680) that keeps the pass deferred past
+    /// the fresh watch's end at G+570. Returns the episode and the grant.
+    fn window_restarted_at_440() -> (OverflowEpisode, Instant) {
+        let start = t0();
+        let mut ep = episode_after_805(&[4], start);
+        let granted = grant_first_probe(&mut ep, start);
+        ep.on_first_frame(4, granted + secs(100));
+        polls_do_nothing(&mut ep, granted, 1, 199);
+        assert_eq!(
+            ep.on_bare_reset(1, 0, granted + secs(200)).outcomes[0],
+            Some(OverflowProbeOutcome::SiblingResetNoted)
+        );
+        polls_do_nothing(&mut ep, granted, 200, 309);
+        let _ = ep.on_sibling_dialled(1, granted + secs(310));
+        polls_do_nothing(&mut ep, granted, 310, 319);
+        assert_eq!(
+            ep.on_bare_reset(2, 0, granted + secs(320)).outcomes[0],
+            Some(OverflowProbeOutcome::SiblingResetNoted)
+        );
+        polls_do_nothing(&mut ep, granted, 320, 429);
+        let _ = ep.on_sibling_dialled(2, granted + secs(430));
+        polls_do_nothing(&mut ep, granted, 430, 439);
+        assert_eq!(
+            ep.on_coded_close(4, granted + secs(440)).outcomes[0],
+            Some(OverflowProbeOutcome::WatchedRestarted)
+        );
+        polls_do_nothing(&mut ep, granted, 440, 449);
+        ep.on_first_frame(4, granted + secs(450));
+        polls_do_nothing(&mut ep, granted, 450, 559);
+        assert_eq!(
+            ep.on_bare_reset(5, 0, granted + secs(560)).outcomes[0],
+            Some(OverflowProbeOutcome::SiblingResetNoted)
+        );
+        (ep, granted)
+    }
+
+    #[test]
+    fn test_no_sibling_is_noted_past_the_grant_cutoff_after_a_restart() {
+        // Review round 6: after the restart the cutoff from the fresh first
+        // frame is G+690, but a note at G+601 could not get its 120 s heal
+        // deadline and 20 s settle before the 740 s bound. Before the fix it
+        // was noted ("the test is not failed for this") and the window then
+        // failed at G+740 inside that sibling's own settle time.
+        assert_eq!(OVERFLOW_PROBE_GRANT_NOTE_CUTOFF_SECS, 600);
+        for late in [600, 601, 689] {
+            let (mut ep, granted) = window_restarted_at_440();
+            if late > 679 {
+                polls_do_nothing(&mut ep, granted, 560, 678);
+                let _ = ep.on_sibling_dialled(5, granted + secs(679));
+                polls_do_nothing(&mut ep, granted, 679, late - 1);
+            } else {
+                polls_do_nothing(&mut ep, granted, 560, late - 1);
+            }
+            assert_eq!(ep.phase, OverflowEpisodePhase::Probing, "still deferred");
+            assert!(!ep.past_note_cutoff(granted + secs(600) - ms(1)));
+            assert!(ep.past_note_cutoff(granted + secs(late)));
+            // The cutoff from the fresh first frame alone (G+450 + 240) would
+            // still take this note: the grant cutoff is what refuses it.
+            assert!(
+                granted + secs(late)
+                    < ep.first_frame_at.expect("fresh first frame")
+                        + secs(OVERFLOW_PROBE_NOTE_CUTOFF_SECS)
+            );
+            let fail = ep.on_bare_reset(3, 0, granted + secs(late));
+            assert_eq!(
+                fail.outcomes[0],
+                Some(OverflowProbeOutcome::FailedDeferralExhausted),
+                "a drop at G+{late} fails at once"
+            );
+            assert_eq!(fail.sibling, Some(3));
+            assert_eq!(fail.repark, Some(4));
+            // A coded sibling close past the cutoff likewise.
+            let (mut ep, granted) = window_restarted_at_440();
+            assert_eq!(
+                ep.on_coded_close(3, granted + secs(late)).outcomes[0],
+                Some(OverflowProbeOutcome::FailedDeferralExhausted)
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_note_just_inside_the_grant_cutoff_is_honoured_by_the_bound() {
+        // A note at G+599 heals at the last instant of its own deadline
+        // (G+718.999) and settles by G+738.999: the window passes before the
+        // bound, never failing inside that sibling's deadline or settle.
+        let (mut ep, granted) = window_restarted_at_440();
+        polls_do_nothing(&mut ep, granted, 560, 598);
+        assert_eq!(
+            ep.on_bare_reset(3, 0, granted + secs(599)).outcomes[0],
+            Some(OverflowProbeOutcome::SiblingResetNoted)
+        );
+        polls_do_nothing(&mut ep, granted, 599, 678);
+        let _ = ep.on_sibling_dialled(5, granted + secs(679));
+        polls_do_nothing(&mut ep, granted, 679, 718);
+        assert_eq!(
+            ep.on_sibling_dialled(3, granted + secs(719) - ms(1))
+                .outcomes[0],
+            Some(OverflowProbeOutcome::SiblingHealed)
+        );
+        polls_do_nothing(&mut ep, granted, 719, 738);
+        let pass = ep.poll(granted + secs(739), true);
+        assert_eq!(pass.outcomes[0], Some(OverflowProbeOutcome::ProbePassed));
+        assert!(granted + secs(739) < granted + secs(OVERFLOW_PROBE_WINDOW_MAX_SECS));
     }
 
     #[test]
@@ -20961,6 +21112,7 @@ mod tests {
             note2_ms in 120_000u64..240_000,
             heal2_ms in 60_000u64..120_000,
             noise in proptest::collection::vec((2u8..4, 0u64..900_000, 0u64..125_000), 0..4),
+            down in proptest::option::of((0u64..200_000, 0u64..300_000)),
         ) {
             let start = t0();
             let mut ep = episode_after_805(&[4], start);
@@ -20991,6 +21143,13 @@ mod tests {
                 events.push((at, 3, slot));
                 events.push((at + heal, 4, slot));
             }
+            // Round 6: the probed socket itself redialling after the restart
+            // (`watched_down`, a depth frame silence) is the one deferral the
+            // grant note cutoff does not bound; only the window bound does.
+            if let Some((down_ms, back_ms)) = down {
+                events.push((refirst + down_ms, 5, 4));
+                events.push((refirst + down_ms + back_ms, 6, 4));
+            }
             for s in 0..=1_200u64 {
                 events.push((s * 1_000, 9, 0));
             }
@@ -21019,6 +21178,12 @@ mod tests {
                     4 => {
                         let _ = ep.on_sibling_dialled(slot, now);
                     }
+                    5 => {
+                        if restarted {
+                            ep.on_watched_redialling(slot);
+                        }
+                    }
+                    6 => ep.on_watched_dialled(slot, now),
                     _ => {
                         let _ = ep.poll(now, true);
                         if ep.watched().is_some() {
@@ -21048,149 +21213,319 @@ mod tests {
         }
     }
 
-    proptest! {
-        #![proptest_config(ProptestConfig::with_cases(256))]
-        #[test]
-        fn proptest_attribution_rules(
-            ops in proptest::collection::vec((0u8..9, 0u8..40, any::<u32>(), 0u64..60_000), 1..300)
-        ) {
-            let mut eps = OverflowEpisodes::new();
-            let mut now = t0();
-            for (op, raw_slot, raw_mask, advance_ms) in ops {
-                // Mostly in-range slots with a small pool, so notes and heals
-                // meet; mostly empty dial masks, so siblings get noted.
-                let slot = if raw_slot >= 36 { raw_slot } else { raw_slot % 16 };
-                let mask = if raw_mask % 4 == 0 { raw_mask & 0xFFFF } else { 0 };
-                now += Duration::from_millis(advance_ms);
-                let before = eps;
-                let effects = match op {
-                    0 => eps.on_overflow(now),
-                    1 => eps.on_bare_reset(slot, mask, now),
-                    2 => eps.on_coded_close(slot, now),
-                    3 => eps.on_sibling_dialled(slot, now),
-                    4 => eps.on_left(slot, now),
-                    5 => eps.on_watched_self_redial(slot, now),
-                    6 => {
-                        let endpoint = match slot % 3 {
-                            0 => DhanEndpointType::MainFeed,
-                            1 => DhanEndpointType::Depth20,
-                            _ => DhanEndpointType::Depth200,
-                        };
-                        eps.on_parked(endpoint, slot % 15);
-                        if let Some(watched) = eps.watched() {
-                            eps.on_first_frame(watched, now);
-                        }
-                        OverflowEpisodesEffect::default()
+    /// What a run of [`check_attribution_ops`] reached, so a test can prove
+    /// the generator exercises a state rather than assert over nothing.
+    #[derive(Debug, Default, Clone, Copy)]
+    struct AttributionCoverage {
+        /// Ops after which a running window had its probed socket down
+        /// (`watched_down`, review round 5).
+        watched_down_running: u64,
+        /// Passes of a window whose probed socket had been down earlier in
+        /// that window and dialled again.
+        passes_after_watched_down: u64,
+        /// Passes of any window.
+        passes: u64,
+    }
+
+    /// The generator for [`check_attribution_ops`]: `(op, slot, mask, advance)`.
+    /// Ops 9 and 10 (review round 6) drive the probed socket's own redial
+    /// (`on_watched_redialling`) and completed dial (`on_dialled`), mostly on
+    /// the slot under watch.
+    fn attribution_ops() -> impl Strategy<Value = Vec<(u8, u8, u32, u64)>> {
+        // Weighted so windows run long enough to pass: a uniform pick of the
+        // eleven ops failed almost every window first (one pass in 256 runs,
+        // measured), which left the pass checks below nearly vacuous.
+        let op = prop_oneof![
+            1 => Just(0u8),
+            3 => Just(1u8),
+            2 => Just(2u8),
+            3 => Just(3u8),
+            1 => Just(4u8),
+            1 => Just(5u8),
+            4 => Just(6u8),
+            8 => Just(7u8),
+            1 => Just(8u8),
+            2 => Just(9u8),
+            3 => Just(10u8),
+        ];
+        proptest::collection::vec((op, 0u8..40, any::<u32>(), 0u64..60_000), 1..300)
+    }
+
+    /// The attribution invariants over one random run of episode events.
+    fn check_attribution_ops(
+        ops: Vec<(u8, u8, u32, u64)>,
+        cov: &mut AttributionCoverage,
+    ) -> Result<(), TestCaseError> {
+        // Per episode (main, depth): its probed socket went down in the
+        // running window and has dialled again since.
+        let mut was_down = [false; 2];
+        let mut eps = OverflowEpisodes::new();
+        let mut now = t0();
+        for (op, raw_slot, raw_mask, advance_ms) in ops {
+            // Mostly in-range slots with a small pool, so notes and heals
+            // meet; mostly empty dial masks, so siblings get noted.
+            let slot = if raw_slot >= 36 {
+                raw_slot
+            } else {
+                raw_slot % 16
+            };
+            let mask = if raw_mask % 4 == 0 {
+                raw_mask & 0xFFFF
+            } else {
+                0
+            };
+            now += Duration::from_millis(advance_ms);
+            let before = eps;
+            let effects = match op {
+                0 => eps.on_overflow(now),
+                1 => eps.on_bare_reset(slot, mask, now),
+                2 => eps.on_coded_close(slot, now),
+                3 => {
+                    // Mostly heal a noted sibling, so notes can resolve.
+                    let suspects = eps.main.suspect_mask | eps.depth.suspect_mask;
+                    let target = if raw_mask % 3 == 0 || suspects == 0 {
+                        slot
+                    } else {
+                        u8::try_from(suspects.trailing_zeros()).unwrap_or(slot)
+                    };
+                    eps.on_sibling_dialled(target, now)
+                }
+                4 => eps.on_left(slot, now),
+                5 => eps.on_watched_self_redial(slot, now),
+                6 => {
+                    let endpoint = match slot % 3 {
+                        0 => DhanEndpointType::MainFeed,
+                        1 => DhanEndpointType::Depth20,
+                        _ => DhanEndpointType::Depth200,
+                    };
+                    eps.on_parked(endpoint, slot % 15);
+                    if let Some(watched) = eps.watched() {
+                        eps.on_first_frame(watched, now);
                     }
-                    8 => eps.on_watched_torn_down(slot, now),
-                    _ => eps.poll(now, raw_mask % 5 != 0),
-                };
-                let in_flight = usize::from(eps.main.watched().is_some())
-                    + usize::from(eps.depth.watched().is_some());
-                prop_assert!(in_flight <= 1);
-                prop_assert!(effects.main.grant.is_none() || effects.depth.grant.is_none());
-                prop_assert!(eps.main.probes_started <= OVERFLOW_PROBE_MAX_ATTEMPTS);
-                prop_assert!(eps.depth.probes_started <= DEPTH_OVERFLOW_PROBE_MAX_ATTEMPTS);
-                for (effect, ep_before, ep_after) in [
-                    (effects.main, before.main, eps.main),
-                    (effects.depth, before.depth, eps.depth),
-                ] {
-                    for outcome in effect.outcomes.into_iter().flatten() {
-                        match outcome {
-                            OverflowProbeOutcome::FailedOverflow => prop_assert_eq!(op, 0),
-                            OverflowProbeOutcome::FailedBareReset => {
-                                prop_assert!(op == 1 || op == 2);
-                                prop_assert!(
-                                    (op == 1 && ep_before.watched() == Some(slot))
-                                        || usize::from(slot) >= GHOST_REDIAL_SLOTS
-                                );
-                            }
-                            OverflowProbeOutcome::FailedEvictionCorroborated => {
-                                prop_assert_eq!(op, 1);
-                                let bit = 1u32.checked_shl(u32::from(slot)).unwrap_or(0);
-                                prop_assert!(mask & !bit != 0, "the closer's own dial never corroborates");
-                                // Round 3: no member of the running burst
-                                // (the probed socket's own coded close
-                                // included) corroborates either.
-                                let burst_running = ep_before.burst_start.is_some_and(|s| {
-                                    now.saturating_duration_since(s)
-                                        <= Duration::from_millis(OVERFLOW_PROBE_SIBLING_BURST_MS)
-                                });
-                                let prior = if burst_running { ep_before.burst_mask } else { 0 };
-                                prop_assert!(mask & !bit & !prior != 0, "a burst member's dial never corroborates");
-                                prop_assert!(ep_before.watched().is_some());
-                            }
-                            OverflowProbeOutcome::FailedSiblingUnhealed => {
-                                prop_assert_eq!(op, 7);
-                                prop_assert!(ep_before.suspect_mask != 0, "only a noted sibling is unhealed");
-                            }
-                            OverflowProbeOutcome::FailedDeferralExhausted => {
-                                prop_assert!(op == 1 || op == 2 || op == 7);
-                                // Round 4: or, on a poll, the window reached
-                                // its bound from the grant.
-                                let past_cutoff = ep_before.past_note_cutoff(now);
-                                prop_assert!(past_cutoff || (op == 7 && ep_before.window_overrun(now)));
-                            }
-                            OverflowProbeOutcome::WatchedRestarted => {
-                                prop_assert!(op == 2 || op == 8);
-                                prop_assert_eq!(ep_before.watched(), Some(slot));
-                                prop_assert!(!ep_before.watch_restarted);
-                                prop_assert!(effect.restart_watch);
-                                // Round 4: a restart never moves the grant.
-                                prop_assert_eq!(ep_after.granted_at, ep_before.granted_at);
-                                prop_assert!(ep_after.granted_at.is_some());
-                            }
-                            OverflowProbeOutcome::FailedWatchedClosed => {
-                                prop_assert!(op == 2 || op == 4 || op == 8);
-                                prop_assert_eq!(ep_before.watched(), Some(slot));
-                                prop_assert!(op == 4 || ep_before.watch_restarted);
-                            }
-                            OverflowProbeOutcome::FailedWatchedSilent => {
-                                prop_assert_eq!(op, 5);
-                                prop_assert_eq!(ep_before.watched(), Some(slot));
-                            }
-                            OverflowProbeOutcome::ProbePassed | OverflowProbeOutcome::ReleasePassed => {
-                                prop_assert_eq!(op, 7);
-                                prop_assert!(!ep_before.unsettled(now), "no pass while unsettled");
-                            }
-                            OverflowProbeOutcome::SiblingResetNoted => {
-                                prop_assert!(op == 1 || op == 2);
-                                prop_assert!(ep_before.watched().is_some());
-                                prop_assert!(ep_before.watched() != Some(slot));
-                                prop_assert!(!ep_before.past_note_cutoff(now), "no note past the cutoff");
-                            }
-                            OverflowProbeOutcome::SiblingHealed => prop_assert_eq!(op, 3),
-                            _ => {}
-                        }
+                    OverflowEpisodesEffect::default()
+                }
+                8 => eps.on_watched_torn_down(slot, now),
+                9 | 10 => {
+                    let target = if raw_mask % 3 == 0 {
+                        slot
+                    } else {
+                        eps.watched().unwrap_or(slot)
+                    };
+                    if op == 9 {
+                        eps.on_watched_redialling(target);
+                        OverflowEpisodesEffect::default()
+                    } else {
+                        eps.on_dialled(target, now)
                     }
                 }
-                // The pass deferral is bounded: after any poll, a running
-                // window is never older than the cap from its first frame.
-                if op == 7 {
-                    for ep in [&eps.main, &eps.depth] {
-                        if ep.watched().is_some()
-                            && let Some(f) = ep.first_frame_at
-                        {
+                _ => eps.poll(now, raw_mask % 5 != 0),
+            };
+            let in_flight = usize::from(eps.main.watched().is_some())
+                + usize::from(eps.depth.watched().is_some());
+            prop_assert!(in_flight <= 1);
+            prop_assert!(effects.main.grant.is_none() || effects.depth.grant.is_none());
+            prop_assert!(eps.main.probes_started <= OVERFLOW_PROBE_MAX_ATTEMPTS);
+            prop_assert!(eps.depth.probes_started <= DEPTH_OVERFLOW_PROBE_MAX_ATTEMPTS);
+            for (effect, ep_before, ep_after) in [
+                (effects.main, before.main, eps.main),
+                (effects.depth, before.depth, eps.depth),
+            ] {
+                for outcome in effect.outcomes.into_iter().flatten() {
+                    match outcome {
+                        OverflowProbeOutcome::FailedOverflow => prop_assert_eq!(op, 0),
+                        OverflowProbeOutcome::FailedBareReset => {
+                            prop_assert!(op == 1 || op == 2);
                             prop_assert!(
-                                now.saturating_duration_since(f)
-                                    < Duration::from_secs(OVERFLOW_PROBE_DEFERRAL_CAP_SECS)
+                                (op == 1 && ep_before.watched() == Some(slot))
+                                    || usize::from(slot) >= GHOST_REDIAL_SLOTS
                             );
                         }
-                        // Round 4: and never older than the window bound
-                        // from its GRANT, which a watch restart keeps.
-                        if ep.watched().is_some() {
-                            let granted = ep.granted_at;
-                            prop_assert!(granted.is_some());
-                            let within = granted.is_some_and(|g| {
-                                now.saturating_duration_since(g)
-                                    < Duration::from_secs(OVERFLOW_PROBE_WINDOW_MAX_SECS)
+                        OverflowProbeOutcome::FailedEvictionCorroborated => {
+                            prop_assert_eq!(op, 1);
+                            let bit = 1u32.checked_shl(u32::from(slot)).unwrap_or(0);
+                            prop_assert!(
+                                mask & !bit != 0,
+                                "the closer's own dial never corroborates"
+                            );
+                            // Round 3: no member of the running burst
+                            // (the probed socket's own coded close
+                            // included) corroborates either.
+                            let burst_running = ep_before.burst_start.is_some_and(|s| {
+                                now.saturating_duration_since(s)
+                                    <= Duration::from_millis(OVERFLOW_PROBE_SIBLING_BURST_MS)
                             });
-                            prop_assert!(within, "a running window outlived its bound from the grant");
+                            let prior = if burst_running {
+                                ep_before.burst_mask
+                            } else {
+                                0
+                            };
+                            prop_assert!(
+                                mask & !bit & !prior != 0,
+                                "a burst member's dial never corroborates"
+                            );
+                            prop_assert!(ep_before.watched().is_some());
                         }
+                        OverflowProbeOutcome::FailedSiblingUnhealed => {
+                            prop_assert_eq!(op, 7);
+                            prop_assert!(
+                                ep_before.suspect_mask != 0,
+                                "only a noted sibling is unhealed"
+                            );
+                        }
+                        OverflowProbeOutcome::FailedDeferralExhausted => {
+                            prop_assert!(op == 1 || op == 2 || op == 7);
+                            // Round 4: or, on a poll, the window reached
+                            // its bound from the grant.
+                            let past_cutoff = ep_before.past_note_cutoff(now);
+                            prop_assert!(past_cutoff || (op == 7 && ep_before.window_overrun(now)));
+                        }
+                        OverflowProbeOutcome::WatchedRestarted => {
+                            prop_assert!(op == 2 || op == 8);
+                            prop_assert_eq!(ep_before.watched(), Some(slot));
+                            prop_assert!(!ep_before.watch_restarted);
+                            prop_assert!(effect.restart_watch);
+                            // Round 4: a restart never moves the grant.
+                            prop_assert_eq!(ep_after.granted_at, ep_before.granted_at);
+                            prop_assert!(ep_after.granted_at.is_some());
+                        }
+                        OverflowProbeOutcome::FailedWatchedClosed => {
+                            prop_assert!(op == 2 || op == 4 || op == 8);
+                            prop_assert_eq!(ep_before.watched(), Some(slot));
+                            prop_assert!(op == 4 || ep_before.watch_restarted);
+                        }
+                        OverflowProbeOutcome::FailedWatchedSilent => {
+                            prop_assert_eq!(op, 5);
+                            prop_assert_eq!(ep_before.watched(), Some(slot));
+                        }
+                        OverflowProbeOutcome::ProbePassed | OverflowProbeOutcome::ReleasePassed => {
+                            prop_assert_eq!(op, 7);
+                            prop_assert!(!ep_before.unsettled(now), "no pass while unsettled");
+                            // Round 5: never while the probed socket is
+                            // down after its own redial.
+                            prop_assert!(
+                                !ep_before.watched_down,
+                                "no pass while the probed socket is down"
+                            );
+                        }
+                        OverflowProbeOutcome::SiblingResetNoted => {
+                            prop_assert!(op == 1 || op == 2);
+                            prop_assert!(ep_before.watched().is_some());
+                            prop_assert!(ep_before.watched() != Some(slot));
+                            prop_assert!(
+                                !ep_before.past_note_cutoff(now),
+                                "no note past the cutoff"
+                            );
+                        }
+                        OverflowProbeOutcome::SiblingHealed => prop_assert!(op == 3 || op == 10),
+                        _ => {}
+                    }
+                }
+            }
+            // Round 5/6: `watched_down` only ever marks a running
+            // window, and clears when that window ends.
+            for (i, (ep_before, ep_after, effect)) in [
+                (before.main, eps.main, effects.main),
+                (before.depth, eps.depth, effects.depth),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                prop_assert!(!ep_after.watched_down || ep_after.watched().is_some());
+                let passed = effect.outcomes.into_iter().flatten().any(|o| {
+                    matches!(
+                        o,
+                        OverflowProbeOutcome::ProbePassed | OverflowProbeOutcome::ReleasePassed
+                    )
+                });
+                if passed {
+                    cov.passes += 1;
+                }
+                if passed && was_down[i] {
+                    cov.passes_after_watched_down += 1;
+                }
+                if ep_after.watched() != ep_before.watched()
+                    || ep_after.granted_at != ep_before.granted_at
+                {
+                    was_down[i] = false;
+                }
+                if ep_after.watched_down {
+                    prop_assert!(ep_after.watched().is_some());
+                    cov.watched_down_running += 1;
+                    was_down[i] = true;
+                }
+            }
+            // The pass deferral is bounded: after any poll, a running
+            // window is never older than the cap from its first frame.
+            if op == 7 {
+                for ep in [&eps.main, &eps.depth] {
+                    if ep.watched().is_some()
+                        && let Some(f) = ep.first_frame_at
+                    {
+                        prop_assert!(
+                            now.saturating_duration_since(f)
+                                < Duration::from_secs(OVERFLOW_PROBE_DEFERRAL_CAP_SECS)
+                        );
+                    }
+                    // Round 4: and never older than the window bound
+                    // from its GRANT, which a watch restart keeps.
+                    if ep.watched().is_some() {
+                        let granted = ep.granted_at;
+                        prop_assert!(granted.is_some());
+                        let within = granted.is_some_and(|g| {
+                            now.saturating_duration_since(g)
+                                < Duration::from_secs(OVERFLOW_PROBE_WINDOW_MAX_SECS)
+                        });
+                        prop_assert!(within, "a running window outlived its bound from the grant");
                     }
                 }
             }
         }
+        Ok(())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+        #[test]
+        fn proptest_attribution_rules(ops in attribution_ops()) {
+            let mut cov = AttributionCoverage::default();
+            check_attribution_ops(ops, &mut cov)?;
+        }
+    }
+
+    /// Round 6: the randomized invariants above are only as good as the states
+    /// the generator reaches. Over a fixed, seeded run of the same generator
+    /// this proves it really puts a running window's probed socket down
+    /// (`watched_down`) and passes such a window after it dialled again, so
+    /// the "no pass while the probed socket is down" check is not vacuous.
+    #[test]
+    fn test_attribution_generator_reaches_the_probed_socket_down() {
+        use proptest::test_runner::{Config, RngAlgorithm, TestRng, TestRunner};
+        let mut runner = TestRunner::new_with_rng(
+            Config {
+                cases: 256,
+                failure_persistence: None,
+                ..Config::default()
+            },
+            TestRng::deterministic_rng(RngAlgorithm::ChaCha),
+        );
+        let total = std::cell::Cell::new(AttributionCoverage::default());
+        runner
+            .run(&attribution_ops(), |ops| {
+                let mut cov = total.get();
+                let result = check_attribution_ops(ops, &mut cov);
+                total.set(cov);
+                result
+            })
+            .expect("the attribution invariants hold on the seeded run");
+        let cov = total.get();
+        assert!(
+            cov.watched_down_running > 0,
+            "the generator never put a running window's probed socket down: {cov:?}"
+        );
+        assert!(
+            cov.passes_after_watched_down > 0,
+            "the generator never passed a window after its probed socket dialled again: {cov:?}"
+        );
     }
 
     #[test]
@@ -21411,6 +21746,10 @@ mod tests {
             text.contains("Lets a window pass while the probed socket is redialling after a depth")
         );
         assert!(text.contains("Removes the stamp taken immediately before `connect()`"));
+        assert!(text.contains("#### Review round 6 (2026-10-06, same day, same owner approval)"));
+        assert!(text.contains(
+            "Notes a sibling later than `OVERFLOW_PROBE_GRANT_NOTE_CUTOFF_SECS` from the"
+        ));
         assert!(text.contains("\"Go ahead with whatever you want dude\""));
         // The 2026-10-02 sections it amends are still there.
         assert!(text.contains("### 2026-10-02 — DEPTH SOCKETS RECOVER ON THEIR OWN AFTER 805"));
