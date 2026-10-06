@@ -318,6 +318,8 @@ pub const XVERIFY_LAST_END_SECS_OF_DAY_IST: u64 = XVERIFY_DEADLINE_SECS_OF_DAY_I
 pub const XVERIFY_MIN_ATTEMPT_BUDGET_SECS: u64 = 120;
 
 /// Room left after the run budget for the audit flush and the marker write.
+/// Not a promise the persist fits: the persist stops itself at the attempt's
+/// deadline (§12.15.8, [`persist_report_into`]).
 const PERSIST_MARGIN_SECS: u64 = 60;
 
 /// The default `run_budget_secs`, mirrored here so the four-attempt fit can be
@@ -371,6 +373,9 @@ pub enum AttemptFailure {
     /// were discarded by a failed mid-run flush or refused at append
     /// (2026-10-06, §12.15.7). The day is not recorded on an incomplete audit.
     AuditRowsLost,
+    /// No attempt ran in this process: the only one was skipped because too
+    /// little time was left before 17:23 IST (§12.15.8). Logged, never paged.
+    SkippedNoTime,
 }
 
 impl AttemptFailure {
@@ -385,6 +390,7 @@ impl AttemptFailure {
             Self::Incomplete => "incomplete",
             Self::MarkerNotWritten => "marker_not_written",
             Self::AuditRowsLost => "audit_rows_lost",
+            Self::SkippedNoTime => "skipped_no_time",
         }
     }
 }
@@ -521,6 +527,12 @@ pub struct PersistOutcome {
     pub cell_append_errors: usize,
     /// Vendor tape rows the buffer refused at append.
     pub tape_append_errors: usize,
+    /// The persist stopped because its next flush could not end by the
+    /// attempt's deadline (§12.15.8). `final_flush_ok` is then `false`.
+    pub deadline_reached: bool,
+    /// Rows never appended because the persist stopped at the deadline (the
+    /// daily row included). Rows already buffered are in `rows_discarded`.
+    pub rows_not_written_at_deadline: usize,
 }
 
 /// The persist half of an attempt's verdict. `NotPersisted` when the final
@@ -672,6 +684,12 @@ struct AttemptPlan {
     run_budget_secs: u64,
     /// Decided once, before the attempt, by [`attempt_is_last`].
     is_last: bool,
+    /// When a full attempt's timeout fires: its start plus
+    /// [`attempt_max_secs`] of its budget. The audit persist, which runs
+    /// synchronously after the last `.await` and so cannot be cut by the
+    /// timeout, stops itself here (§12.15.8). `None` for a marker-only
+    /// attempt, which is one file write.
+    deadline: Option<tokio::time::Instant>,
 }
 
 /// How the day loop ended.
@@ -685,20 +703,23 @@ struct DayResult {
     day_changed: bool,
 }
 
-/// Runs `attempt` under `tokio::time::timeout(limit_secs)` (§12.15.8). An
-/// elapsed timeout is an incomplete attempt: coded `warn!`, no marker, no
-/// page. The timeout can stop an attempt only at an `.await`, so a persist
-/// already running when the limit passes finishes and its result stands.
+/// Runs `attempt` under `tokio::time::timeout_at(deadline)` (§12.15.8), where
+/// `deadline` is `limit_secs` after the attempt started. An elapsed timeout is
+/// an incomplete attempt: coded `warn!`, no marker, no page. The timeout can
+/// stop an attempt only at an `.await`; the synchronous audit persist after
+/// the last `.await` is bounded by the same `deadline` itself
+/// ([`persist_report_into`]), so it never runs past it.
 async fn bounded_attempt<F>(
     today: chrono::NaiveDate,
     attempt_number: u32,
     limit_secs: u64,
+    deadline: tokio::time::Instant,
     attempt: F,
 ) -> Result<(), AttemptFailure>
 where
     F: Future<Output = Result<(), AttemptFailure>>,
 {
-    match tokio::time::timeout(Duration::from_secs(limit_secs), attempt).await {
+    match tokio::time::timeout_at(deadline, attempt).await {
         Ok(outcome) => outcome,
         Err(_elapsed) => {
             warn!(
@@ -726,7 +747,16 @@ where
 /// After a failed attempt the SAME `is_last` decides: the last returns the
 /// failure for the one page, any other sleeps
 /// [`XVERIFY_RETRY_INTERVAL_SECS`]. A marker-only attempt (§12.15.7) is one
-/// synchronous file write: it gets the same `is_last` rule and no budget.
+/// synchronous file write: it gets the same `is_last` rule and no budget, and
+/// runs under no timeout.
+///
+/// A full attempt with too little time left is skipped, never started. When
+/// no attempt ran before it in this process, the day ends
+/// [`AttemptFailure::SkippedNoTime`], which `run_day` logs and does not page:
+/// a restart late in the window must not page a second time for a day an
+/// earlier process already paged, and a page must not fire for a comparison
+/// that never ran. When an earlier attempt in this process did run and fail,
+/// the day ends with THAT failure, so it still pages (§12.15.8).
 /// O(1) per attempt, at most [`XVERIFY_MAX_ATTEMPTS_PER_DAY`] attempts.
 async fn drive_day<N, S, A, Fut>(
     today: chrono::NaiveDate,
@@ -758,19 +788,24 @@ where
                     kind: AttemptKind::MarkerOnly,
                     run_budget_secs: 0,
                     is_last,
+                    deadline: None,
                 })
                 .await
             }
             AttemptKind::Full => match attempt_budget_secs(start, config_budget_secs) {
                 Some(budget) => {
+                    // One instant for the timeout and the persist's own stop.
+                    let limit_secs = attempt_max_secs(budget);
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(limit_secs);
                     let plan = AttemptPlan {
                         number: attempts,
                         start_secs_of_day: start,
                         kind: AttemptKind::Full,
                         run_budget_secs: budget,
                         is_last,
+                        deadline: Some(deadline),
                     };
-                    bounded_attempt(today, attempts, attempt_max_secs(budget), attempt(plan)).await
+                    bounded_attempt(today, attempts, limit_secs, deadline, attempt(plan)).await
                 }
                 None => {
                     warn!(
@@ -785,7 +820,9 @@ where
                          left to run it before the evening stop; this attempt does not \
                          record today"
                     );
-                    Err(AttemptFailure::Incomplete)
+                    // §12.15.8: an earlier failure in this process still
+                    // pages; a day on which nothing ran does not.
+                    Err(previous.unwrap_or(AttemptFailure::SkippedNoTime))
                 }
             },
         };
@@ -868,7 +905,11 @@ async fn run_day(
                         run_budget_secs: plan.run_budget_secs,
                         ..deps.config
                     };
-                    run_once(deps, &cfg, targets, today, day_start_ist_nanos, paged).await
+                    // A full plan always carries its deadline; `now` (stop at
+                    // once, no marker) is the fail-safe if it ever did not.
+                    let deadline = plan.deadline.unwrap_or_else(tokio::time::Instant::now);
+                    let day = (today, day_start_ist_nanos);
+                    run_once(deps, &cfg, targets, day, paged, deadline).await
                 }
             }
         },
@@ -883,10 +924,13 @@ async fn run_day(
     // §12.15.6: the depth-held option pass runs ONCE, after the spot check's
     // outcome is final. It never writes the day marker and never pages.
     // §12.15.8: it runs under its own timeout, so it too ends by 17:23.
+    // The persist, which the timeout cannot cut, stops itself at the same
+    // instant.
     let option_limit_secs = attempt_max_secs(XVERIFY_OPTION_PASS_BUDGET_SECS);
-    let option_pass = tokio::time::timeout(
-        Duration::from_secs(option_limit_secs),
-        run_option_pass(deps, today, day_start_ist_nanos),
+    let option_deadline = tokio::time::Instant::now() + Duration::from_secs(option_limit_secs);
+    let option_pass = tokio::time::timeout_at(
+        option_deadline,
+        run_option_pass(deps, today, day_start_ist_nanos, option_deadline),
     )
     .await;
     if option_pass.is_err() {
@@ -904,7 +948,9 @@ async fn run_day(
 
 /// Pages once, after the last attempt of the day. Each arm is its own
 /// `error!` so every alarmed `source` stays a literal the alarm filter can
-/// match.
+/// match. The one exception is [`AttemptFailure::SkippedNoTime`]: no attempt
+/// ran in this process, so there is nothing new to page about; it is a coded
+/// `warn!` on a source no alarm filter matches (§12.15.8).
 fn report_final_failure(
     failure: AttemptFailure,
     today: chrono::NaiveDate,
@@ -913,6 +959,19 @@ fn report_final_failure(
 ) {
     let reason = failure.as_str();
     match failure {
+        AttemptFailure::SkippedNoTime => warn!(
+            code = ErrorCode::WsGapConnectionState.code_str(),
+            source = "xverify_day_not_attempted",
+            %today,
+            attempts,
+            targets,
+            reason,
+            last_end_ist_secs = XVERIFY_LAST_END_SECS_OF_DAY_IST,
+            "Dhan 1-minute cross-verification did not run today in this process: it \
+             started too late to finish before the evening stop. Today's candles are \
+             UNVERIFIED and today's S3 archive stays held. Not paged: no check ran here, \
+             and an earlier process that ran one has already paged"
+        ),
         AttemptFailure::Vacuous => error!(
             code = ErrorCode::WsGapConnectionState.code_str(),
             source = "xverify_vacuous",
@@ -968,14 +1027,17 @@ fn report_final_failure(
 /// `cfg` is the comparator config with this attempt's run budget, which
 /// [`attempt_budget_secs`] may have shrunk (§12.15.8). `divergence_paged` is
 /// an `AtomicBool` because each attempt is a separate future of the injected
-/// day loop; one `swap` per catastrophic attempt, cold.
+/// day loop; one `swap` per catastrophic attempt, cold. `deadline` is the
+/// instant this attempt's timeout fires: the audit persist, which runs
+/// synchronously after the last `.await` and so cannot be cut by the timeout,
+/// stops itself there, and the marker is not written past it (§12.15.8).
 async fn run_once(
     deps: &CrossverifyBootDeps,
     cfg: &DhanLiveCrossverifyConfig,
     targets: &[XverifyTarget],
-    today: chrono::NaiveDate,
-    day_start_ist_nanos: i64,
+    (today, day_start_ist_nanos): (chrono::NaiveDate, i64),
     divergence_paged: &AtomicBool,
+    deadline: tokio::time::Instant,
 ) -> Result<(), AttemptFailure> {
     let Some(jwt) = wait_for_jwt().await else {
         metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "no_token").increment(1);
@@ -1041,6 +1103,7 @@ async fn run_once(
                 &report,
                 day_start_ist_nanos,
                 cfg.tolerance_paise,
+                deadline,
             );
             let persist = persist_verdict(&persisted);
             let persisted_ok = persist.is_ok();
@@ -1075,6 +1138,22 @@ async fn run_once(
                 should_write_marker(c, persisted_ok) && complete
             );
             match verdict {
+                // §12.15.8: a persist that finished never started a flush it
+                // could not end by the deadline, so this is a belt: past the
+                // deadline the marker is not written and the attempt ends.
+                Ok(()) if tokio::time::Instant::now() > deadline => {
+                    warn!(
+                        code = ErrorCode::WsGapConnectionState.code_str(),
+                        source = "xverify_attempt_timed_out",
+                        %today,
+                        stage = "marker",
+                        last_end_ist_secs = XVERIFY_LAST_END_SECS_OF_DAY_IST,
+                        "Dhan 1-minute cross-verification attempt reached its time limit \
+                         before writing the day marker, so it ends before the evening \
+                         stop; this attempt does not record today"
+                    );
+                    Err(AttemptFailure::Incomplete)
+                }
                 Ok(()) => record_day(today),
                 Err(failure) => {
                     warn!(
@@ -1155,13 +1234,25 @@ fn record_day(today: chrono::NaiveDate) -> Result<(), AttemptFailure> {
     }
 }
 
+/// Whether a flush of the writer's current buffer, started now, ends by
+/// `deadline` even in the ILP client's worst case (§12.15.8). O(1).
+fn flush_fits(
+    writer: &DhanLiveXverifyAuditWriter,
+    now: tokio::time::Instant,
+    deadline: tokio::time::Instant,
+) -> bool {
+    now.checked_add(writer.flush_worst_case())
+        .is_some_and(|end| end <= deadline)
+}
+
 /// Persists the run through the production writer, in batches of
-/// [`PERSIST_BATCH_ROWS`]. See [`persist_report_into`].
+/// [`PERSIST_BATCH_ROWS`], stopping at `deadline`. See [`persist_report_into`].
 fn persist_report(
     questdb: &QuestDbConfig,
     report: &RunReport,
     day_start_ist_nanos: i64,
     tolerance_paise: i64,
+    deadline: tokio::time::Instant,
 ) -> PersistOutcome {
     let mut writer = DhanLiveXverifyAuditWriter::new(questdb);
     persist_report_into(
@@ -1170,6 +1261,8 @@ fn persist_report(
         day_start_ist_nanos,
         tolerance_paise,
         PERSIST_BATCH_ROWS,
+        deadline,
+        tokio::time::Instant::now,
     )
 }
 
@@ -1177,6 +1270,18 @@ fn persist_report(
 /// every `batch_rows` rows, and counts what each flush did. A failed flush
 /// discards its pending rows (the writer's poisoned-buffer defence), so those
 /// rows are counted as discarded, never as persisted (2026-10-06, §12.15.7).
+///
+/// §12.15.8: the persist runs synchronously after the attempt's last
+/// `.await`, so the attempt's timeout cannot stop it. It bounds itself:
+/// before each row it checks that a flush of the buffer, started now, would
+/// end by `deadline` in the ILP client's worst case
+/// ([`DhanLiveXverifyAuditWriter::flush_worst_case`]). When it would not, the
+/// persist stops: the buffered rows are discarded and counted, the rows not
+/// yet appended are counted, and the outcome is `NotPersisted`, so no marker
+/// is written. The check runs per row, not only before a flush, because a
+/// buffer that cannot be flushed in time now cannot be later either: the
+/// clock only advances and the final flush is still owed. So every flush this
+/// starts ends by `deadline`.
 /// O(findings + tape rows), once per attempt, cold.
 fn persist_report_into(
     writer: &mut DhanLiveXverifyAuditWriter,
@@ -1184,6 +1289,8 @@ fn persist_report_into(
     day_start_ist_nanos: i64,
     tolerance_paise: i64,
     batch_rows: usize,
+    deadline: tokio::time::Instant,
+    mut now: impl FnMut() -> tokio::time::Instant,
 ) -> PersistOutcome {
     let c = &report.comparison;
     let mut out = PersistOutcome::default();
@@ -1217,17 +1324,43 @@ fn persist_report_into(
             };
             account(out, errs, before, flushed, w.pending());
         };
+    // §12.15.8: stop when the buffer could no longer be flushed by the
+    // deadline. `remaining` counts the rows not yet appended, the daily row
+    // included.
+    let stop_at_deadline =
+        |w: &mut DhanLiveXverifyAuditWriter, out: &mut PersistOutcome, remaining: usize| {
+            out.rows_discarded = out.rows_discarded.saturating_add(w.discard_pending());
+            out.rows_not_written_at_deadline = remaining;
+            out.deadline_reached = true;
+            out.final_flush_ok = false;
+        };
+    let total = c
+        .findings
+        .len()
+        .saturating_add(report.rest_tape.len())
+        .saturating_add(1);
+    let mut appended = 0_usize;
 
     for finding in &c.findings {
+        if !flush_fits(writer, now(), deadline) {
+            stop_at_deadline(writer, &mut out, total - appended);
+            return finish_persist(report, out, batch_errors, None);
+        }
         if writer.append_cell(finding).is_err() {
             out.cell_append_errors = out.cell_append_errors.saturating_add(1);
         }
+        appended += 1;
         flush_if_full(writer, &mut out, &mut batch_errors);
     }
     for row in &report.rest_tape {
+        if !flush_fits(writer, now(), deadline) {
+            stop_at_deadline(writer, &mut out, total - appended);
+            return finish_persist(report, out, batch_errors, None);
+        }
         if writer.append_rest_tape(row).is_err() {
             out.tape_append_errors = out.tape_append_errors.saturating_add(1);
         }
+        appended += 1;
         flush_if_full(writer, &mut out, &mut batch_errors);
     }
     let daily = daily_row(
@@ -1237,6 +1370,11 @@ fn persist_report_into(
         tolerance_paise,
     );
     out.daily_appended = writer.append_daily(&daily).is_ok();
+    if !flush_fits(writer, now(), deadline) {
+        out.daily_appended = false;
+        stop_at_deadline(writer, &mut out, 0);
+        return finish_persist(report, out, batch_errors, None);
+    }
 
     let before = writer.pending();
     let final_flush = tickvault_storage::off_worker::off_worker(|| writer.flush());
@@ -1249,8 +1387,44 @@ fn persist_report_into(
         final_flush,
         writer.pending(),
     );
-    metrics::counter!(XVERIFY_PERSIST_ROWS_COUNTER).increment(out.rows_flushed as u64);
+    if final_err.is_some() {
+        // `flush` already discarded on `Err` (poisoned-buffer defence);
+        // this keeps the buffer empty even if that ever changes. The rows
+        // were counted as discarded above, so nothing is added here.
+        let _already_empty = writer.discard_pending();
+    }
+    finish_persist(report, out, batch_errors, final_err)
+}
 
+/// Publishes the persist's counters and its one log line. Split out of
+/// [`persist_report_into`] so the deadline stop and the normal end log the
+/// same way. O(1).
+fn finish_persist(
+    report: &RunReport,
+    out: PersistOutcome,
+    batch_errors: usize,
+    final_err: Option<String>,
+) -> PersistOutcome {
+    let c = &report.comparison;
+    metrics::counter!(XVERIFY_PERSIST_ROWS_COUNTER).increment(out.rows_flushed as u64);
+    if out.deadline_reached {
+        metrics::counter!(XVERIFY_PERSIST_ERRORS_COUNTER).increment(1);
+        warn!(
+            code = ErrorCode::WsGapConnectionState.code_str(),
+            source = "xverify_persist_stopped_at_deadline",
+            rows_flushed = out.rows_flushed,
+            rows_discarded = out.rows_discarded,
+            rows_not_written = out.rows_not_written_at_deadline,
+            findings = c.findings.len(),
+            tape_rows = report.rest_tape.len(),
+            last_end_ist_secs = XVERIFY_LAST_END_SECS_OF_DAY_IST,
+            "Dhan 1-minute cross-verification stopped saving its audit rows: the next \
+             write could not finish within the attempt's time limit, so the attempt ends \
+             before the evening stop; this attempt does not record today and today's S3 \
+             archive stays held"
+        );
+        return out;
+    }
     match final_err {
         None => {
             if out.cell_append_errors > 0
@@ -1276,10 +1450,6 @@ fn persist_report_into(
             }
         }
         Some(err) => {
-            // `flush` already discarded on `Err` (poisoned-buffer defence);
-            // this keeps the buffer empty even if that ever changes. The rows
-            // were counted as discarded above, so nothing is added here.
-            let _already_empty = writer.discard_pending();
             metrics::counter!(XVERIFY_PERSIST_ERRORS_COUNTER).increment(1);
             error!(
                 code = ErrorCode::WsGapConnectionState.code_str(),
@@ -1420,10 +1590,15 @@ pub const fn option_pass_outcome(
 ///
 /// It never writes or blocks the day marker, never appends a daily row, and
 /// never pages: a catastrophic divergence is one `warn!` (§12.15.6).
+///
+/// `deadline` is the instant its timeout fires (§12.15.8); the audit persist,
+/// which runs synchronously and cannot be cut by that timeout, stops itself
+/// there (`persist_option_findings`).
 async fn run_option_pass(
     deps: &CrossverifyBootDeps,
     today: chrono::NaiveDate,
     day_start_ist_nanos: i64,
+    deadline: tokio::time::Instant,
 ) {
     for label in XVERIFY_OPTION_PASS_OUTCOMES {
         metrics::counter!(XVERIFY_OPTION_PASS_COUNTER, "outcome" => label).increment(0);
@@ -1482,7 +1657,7 @@ async fn run_option_pass(
     match result {
         Ok(report) => {
             let c = &report.comparison;
-            let persisted_ok = persist_option_findings(&deps.questdb, &report);
+            let persisted_ok = persist_option_findings(&deps.questdb, &report, deadline);
             let label =
                 option_pass_outcome(c.is_vacuous(), report.budget_elapsed, report.rest_failures);
             metrics::counter!(XVERIFY_OPTION_PASS_COUNTER, "outcome" => label).increment(1);
@@ -1541,9 +1716,41 @@ async fn run_option_pass(
 /// ([`persist_report_into`]) it writes no marker and never pages (§12.15.6),
 /// so a partial write here holds nothing back and hides nothing alarmed; the
 /// gap is logged on `xverify_options_persist_partial`.
-fn persist_option_findings(questdb: &QuestDbConfig, report: &RunReport) -> bool {
-    let c = &report.comparison;
+///
+/// §12.15.8: it stops at `deadline` the same way the spot persist does: before
+/// each row it checks that a flush of the buffer would end by `deadline` in
+/// the ILP client's worst case, and otherwise discards the buffer, logs
+/// `xverify_options_persist_stopped_at_deadline` and returns `false`.
+fn persist_option_findings(
+    questdb: &QuestDbConfig,
+    report: &RunReport,
+    deadline: tokio::time::Instant,
+) -> bool {
     let mut writer = DhanLiveXverifyAuditWriter::new(questdb);
+    persist_option_findings_into(&mut writer, report, deadline, tokio::time::Instant::now)
+        == OptionPersist::Flushed
+}
+
+/// What the option persist did (§12.15.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OptionPersist {
+    /// The final flush was ACKed (mid-run chunks may still have been lost).
+    Flushed,
+    /// The final flush failed; its rows were discarded.
+    Failed,
+    /// The persist stopped before a flush it could not end by the deadline.
+    StoppedAtDeadline,
+}
+
+/// The body of [`persist_option_findings`], with the writer and the clock
+/// injected. O(findings + tape rows), once per day, cold.
+fn persist_option_findings_into(
+    writer: &mut DhanLiveXverifyAuditWriter,
+    report: &RunReport,
+    deadline: tokio::time::Instant,
+    mut now: impl FnMut() -> tokio::time::Instant,
+) -> OptionPersist {
+    let c = &report.comparison;
     let mut row_errors = 0_usize;
     let mut batch_errors = 0_usize;
     let mut flush_if_full = |w: &mut DhanLiveXverifyAuditWriter| {
@@ -1556,17 +1763,46 @@ fn persist_option_findings(questdb: &QuestDbConfig, report: &RunReport) -> bool 
             batch_errors = batch_errors.saturating_add(1);
         }
     };
+    let total = c.findings.len().saturating_add(report.rest_tape.len());
+    let mut appended = 0_usize;
+    let mut stopped = false;
     for finding in &c.findings {
+        if !flush_fits(writer, now(), deadline) {
+            stopped = true;
+            break;
+        }
         if writer.append_cell(finding).is_err() {
             row_errors = row_errors.saturating_add(1);
         }
-        flush_if_full(&mut writer);
+        appended += 1;
+        flush_if_full(writer);
     }
-    for row in &report.rest_tape {
-        if writer.append_rest_tape(row).is_err() {
-            row_errors = row_errors.saturating_add(1);
+    if !stopped {
+        for row in &report.rest_tape {
+            if !flush_fits(writer, now(), deadline) {
+                stopped = true;
+                break;
+            }
+            if writer.append_rest_tape(row).is_err() {
+                row_errors = row_errors.saturating_add(1);
+            }
+            appended += 1;
+            flush_if_full(writer);
         }
-        flush_if_full(&mut writer);
+    }
+    if stopped || !flush_fits(writer, now(), deadline) {
+        let discarded = writer.discard_pending();
+        metrics::counter!(XVERIFY_PERSIST_ERRORS_COUNTER).increment(1);
+        warn!(
+            code = ErrorCode::WsGapConnectionState.code_str(),
+            source = "xverify_options_persist_stopped_at_deadline",
+            discarded,
+            not_written = total - appended,
+            "Dhan option cross-check stopped saving its audit rows: the next write could \
+             not finish within the option check's time limit, so it ends before the \
+             evening stop"
+        );
+        return OptionPersist::StoppedAtDeadline;
     }
     match tickvault_storage::off_worker::off_worker(|| writer.flush()) {
         Ok(()) => {
@@ -1582,7 +1818,7 @@ fn persist_option_findings(questdb: &QuestDbConfig, report: &RunReport) -> bool 
                      incomplete for today's option contracts"
                 );
             }
-            true
+            OptionPersist::Flushed
         }
         Err(err) => {
             let discarded = writer.discard_pending();
@@ -1595,7 +1831,7 @@ fn persist_option_findings(questdb: &QuestDbConfig, report: &RunReport) -> bool 
                 "Dhan option cross-check could NOT be persisted — today's option \
                  comparison exists only in this log stream"
             );
-            false
+            OptionPersist::Failed
         }
     }
 }
@@ -1918,6 +2154,7 @@ mod tests {
             AttemptFailure::Incomplete,
             AttemptFailure::MarkerNotWritten,
             AttemptFailure::AuditRowsLost,
+            AttemptFailure::SkippedNoTime,
         ];
         let mut labels: Vec<&str> = all.iter().map(|f| f.as_str()).collect();
         labels.sort_unstable();
@@ -1928,6 +2165,7 @@ mod tests {
             "marker_not_written"
         );
         assert_eq!(AttemptFailure::AuditRowsLost.as_str(), "audit_rows_lost");
+        assert_eq!(AttemptFailure::SkippedNoTime.as_str(), "skipped_no_time");
     }
 
     /// The keep outlasts every default gated hold lookback, and the boot
@@ -1993,6 +2231,8 @@ mod tests {
                 rows_flushed,
                 cell_append_errors,
                 tape_append_errors,
+                deadline_reached: false,
+                rows_not_written_at_deadline: 0,
             };
             let lost = rows_discarded > 0 || cell_append_errors > 0 || tape_append_errors > 0;
             let expected = if !final_flush_ok || !daily_appended {
@@ -2061,7 +2301,11 @@ mod tests {
             rest_tape: (0..3).map(tape_row).collect(),
         };
         let mut writer = DhanLiveXverifyAuditWriter::for_test();
-        let out = persist_report_into(&mut writer, &report, 0, 5, 2);
+        let t0 = tokio::time::Instant::now();
+        let far = t0 + Duration::from_secs(86_400);
+        let out = persist_report_into(&mut writer, &report, 0, 5, 2, far, || t0);
+        assert!(!out.deadline_reached);
+        assert_eq!(out.rows_not_written_at_deadline, 0);
         assert!(out.daily_appended);
         assert!(!out.final_flush_ok);
         assert_eq!(out.cell_append_errors, 0);
@@ -2072,9 +2316,153 @@ mod tests {
         assert_eq!(persist_verdict(&out), Err(AttemptFailure::NotPersisted));
     }
 
+    fn report_with(findings: usize, tape: usize) -> RunReport {
+        let mut c = comparison(DhanLiveXverifyOutcome::Diverged, 375, 5);
+        let to_i64 = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
+        c.findings = (0..findings).map(|i| finding(to_i64(i))).collect();
+        RunReport {
+            comparison: c,
+            rest_failures: 0,
+            rest_failure_breakdown: Default::default(),
+            degraded: false,
+            malformed_rows: 0,
+            budget_elapsed: false,
+            live_truncated: false,
+            rest_tape: (0..tape).map(|i| tape_row(to_i64(i))).collect(),
+        }
+    }
+
+    /// §12.15.8: with the deadline already passed, no row is appended and no
+    /// flush starts; every row is counted as not written, and the attempt is
+    /// `NotPersisted`, so no marker.
+    #[test]
+    fn test_persist_report_into_writes_nothing_past_the_deadline() {
+        let report = report_with(5, 3);
+        let mut writer = DhanLiveXverifyAuditWriter::for_test();
+        let t0 = tokio::time::Instant::now();
+        let out = persist_report_into(&mut writer, &report, 0, 5, 2, t0, || t0);
+        assert!(out.deadline_reached);
+        assert!(!out.final_flush_ok);
+        assert!(!out.daily_appended);
+        assert_eq!(out.rows_not_written_at_deadline, 5 + 3 + 1, "{out:?}");
+        assert_eq!(out.rows_discarded, 0);
+        assert_eq!(out.rows_flushed, 0);
+        assert_eq!(writer.pending(), 0);
+        assert_eq!(persist_verdict(&out), Err(AttemptFailure::NotPersisted));
+    }
+
+    /// §12.15.8: the persist stops at the first row whose buffer could not be
+    /// flushed by the deadline in the ILP client's worst case (5 s plus the
+    /// bytes at 100 KiB/s). The clock advances 1 s per reading; the deadline
+    /// is 7 s out, so readings at 0, 1 and 2 s fit (2 s + 5 s with an empty
+    /// buffer is exactly 7 s) and the reading at 3 s does not.
+    #[test]
+    fn test_persist_report_into_stops_at_the_first_flush_that_cannot_end_by_the_deadline() {
+        let report = report_with(5, 3);
+        let mut writer = DhanLiveXverifyAuditWriter::for_test();
+        let t0 = tokio::time::Instant::now();
+        let reads = std::cell::Cell::new(0_u64);
+        let clock = || {
+            let at = t0 + Duration::from_secs(reads.get());
+            reads.set(reads.get() + 1);
+            at
+        };
+        let deadline = t0 + Duration::from_secs(7);
+        let out = persist_report_into(&mut writer, &report, 0, 5, 2, deadline, clock);
+        assert_eq!(reads.get(), 4, "one reading per row until the stop");
+        assert!(out.deadline_reached);
+        // Rows 0 and 1 went in a failed batch flush (no sender), row 2 was
+        // buffered and discarded at the stop; 2 findings, 3 tape rows and
+        // the daily row were never appended.
+        assert_eq!(out.rows_discarded, 3, "{out:?}");
+        assert_eq!(out.rows_not_written_at_deadline, 6, "{out:?}");
+        assert_eq!(writer.pending(), 0);
+        assert_eq!(persist_verdict(&out), Err(AttemptFailure::NotPersisted));
+    }
+
+    proptest::proptest! {
+        /// Whatever the clock and deadline: every row is accounted for once
+        /// (flushed, discarded or not written), and every clock reading the
+        /// persist acted on left at least the 5 s request timeout before the
+        /// deadline, so no flush it started could end after it.
+        #[test]
+        fn test_persist_report_into_never_acts_without_room_before_the_deadline(
+            findings in 0_usize..40,
+            tape in 0_usize..40,
+            batch in 1_usize..10,
+            step_ms in 0_u64..3_000,
+            deadline_ms in 0_u64..90_000,
+        ) {
+            let report = report_with(findings, tape);
+            let mut writer = DhanLiveXverifyAuditWriter::for_test();
+            let t0 = tokio::time::Instant::now();
+            let readings = std::cell::RefCell::new(Vec::new());
+            let clock = || {
+                let n = u64::try_from(readings.borrow().len()).unwrap_or(u64::MAX);
+                let at_ms = n.saturating_mul(step_ms);
+                readings.borrow_mut().push(at_ms);
+                t0 + Duration::from_millis(at_ms)
+            };
+            let deadline = t0 + Duration::from_millis(deadline_ms);
+            let out = persist_report_into(&mut writer, &report, 0, 5, batch, deadline, clock);
+            proptest::prop_assert_eq!(
+                out.rows_flushed + out.rows_discarded + out.rows_not_written_at_deadline,
+                findings + tape + 1
+            );
+            proptest::prop_assert_eq!(writer.pending(), 0);
+            proptest::prop_assert!(persist_verdict(&out).is_err());
+            let readings = readings.into_inner();
+            let acted = if out.deadline_reached {
+                &readings[..readings.len().saturating_sub(1)]
+            } else {
+                &readings[..]
+            };
+            for &at_ms in acted {
+                proptest::prop_assert!(at_ms + 5_000 <= deadline_ms, "{at_ms} {deadline_ms}");
+            }
+            if out.deadline_reached {
+                proptest::prop_assert!(!out.final_flush_ok);
+            } else {
+                proptest::prop_assert_eq!(out.rows_not_written_at_deadline, 0);
+            }
+        }
+    }
+
+    /// §12.15.8: the option persist stops the same way. An empty report with
+    /// room flushes nothing and succeeds; the same report past the deadline
+    /// stops before the final flush; rows with room reach the (absent)
+    /// sender and fail.
+    #[test]
+    fn test_persist_option_findings_into_stops_at_the_deadline() {
+        let t0 = tokio::time::Instant::now();
+        let far = t0 + Duration::from_secs(86_400);
+        let mut w = DhanLiveXverifyAuditWriter::for_test();
+        let empty = report_with(0, 0);
+        assert_eq!(
+            persist_option_findings_into(&mut w, &empty, far, || t0),
+            OptionPersist::Flushed
+        );
+        assert_eq!(
+            persist_option_findings_into(&mut w, &empty, t0, || t0),
+            OptionPersist::StoppedAtDeadline
+        );
+        let rows = report_with(4, 2);
+        assert_eq!(
+            persist_option_findings_into(&mut w, &rows, t0, || t0),
+            OptionPersist::StoppedAtDeadline
+        );
+        assert_eq!(w.pending(), 0);
+        assert_eq!(
+            persist_option_findings_into(&mut w, &rows, far, || t0),
+            OptionPersist::Failed
+        );
+        assert_eq!(w.pending(), 0);
+    }
+
     #[test]
     fn test_persist_rows_counter_counts_only_flushed_rows() {
-        let body = fn_body(prod_src(), "fn persist_report_into(");
+        let body = fn_body(prod_src(), "fn finish_persist(");
+        assert!(fn_body(prod_src(), "fn persist_report_into(").contains("finish_persist("));
         assert!(
             body.contains(
                 "metrics::counter!(XVERIFY_PERSIST_ROWS_COUNTER).increment(out.rows_flushed as u64)"
@@ -2420,6 +2808,8 @@ mod tests {
         ends: Vec<(u32, u64)>,
         /// Seconds of day when `drive_day` returned.
         finished: u64,
+        /// The paused-clock instant of `first_start`.
+        t0: tokio::time::Instant,
     }
 
     fn day() -> chrono::NaiveDate {
@@ -2471,6 +2861,7 @@ mod tests {
             plans: plans.into_inner(),
             ends,
             finished,
+            t0,
         }
     }
 
@@ -2532,6 +2923,21 @@ mod tests {
                     plan.start_secs_of_day + attempt_max_secs(plan.run_budget_secs)
                 );
             }
+            // §12.15.8: the persist's own stop is the timeout's instant;
+            // a marker-only attempt carries none.
+            match plan.kind {
+                AttemptKind::Full => assert_eq!(
+                    plan.deadline,
+                    Some(
+                        sim.t0
+                            + Duration::from_secs(
+                                plan.start_secs_of_day - first_start
+                                    + attempt_max_secs(plan.run_budget_secs)
+                            )
+                    )
+                ),
+                AttemptKind::MarkerOnly => assert_eq!(plan.deadline, None),
+            }
             if plan.kind == AttemptKind::Full && plan.start_secs_of_day < stop_window {
                 assert!(
                     plan.start_secs_of_day + attempt_max_secs(plan.run_budget_secs)
@@ -2557,10 +2963,16 @@ mod tests {
             }
             previous_end = Some(end);
         }
-        // A skipped attempt (no plan) is always the final, last one.
+        // A skipped attempt (no plan) is always the final, last one. With no
+        // attempt before it, the day ends `SkippedNoTime` (not paged);
+        // after a real failure, with that failure (paged).
         if sim.plans.len() < r.attempts as usize {
             assert_eq!(sim.plans.len() + 1, r.attempts as usize);
-            assert_eq!(r.failure, Some(AttemptFailure::Incomplete));
+            if sim.plans.is_empty() {
+                assert_eq!(r.failure, Some(AttemptFailure::SkippedNoTime));
+            } else {
+                assert_ne!(r.failure, Some(AttemptFailure::SkippedNoTime));
+            }
         }
         // Recorded exactly when an attempt after the scripted failures ran.
         assert_eq!(r.failure.is_none(), r.attempts > failures);
@@ -2684,7 +3096,7 @@ mod tests {
         let skipped = simulate(skip_at, 600, |_, _| (Some(0), Ok(())), None).await;
         assert!(skipped.plans.is_empty(), "a skipped attempt must not run");
         assert_eq!(skipped.result.attempts, 1);
-        assert_eq!(skipped.result.failure, Some(AttemptFailure::Incomplete));
+        assert_eq!(skipped.result.failure, Some(AttemptFailure::SkippedNoTime));
         assert_eq!(skipped.finished, skip_at);
 
         let shrink_at = last - fixed - 200;
@@ -2721,6 +3133,65 @@ mod tests {
         assert_eq!(late.result.failure, Some(AttemptFailure::Vacuous));
     }
 
+    /// §12.15.8: a skip with no attempt before it in this process is
+    /// `SkippedNoTime` (logged, not paged: a restart at 17:24 must not page a
+    /// day an earlier process already paged). A skip after a real failure in
+    /// this process (here forced by a clock jump during the retry sleep) ends
+    /// the day with THAT failure, so the page still fires.
+    #[tokio::test(start_paused = true)]
+    async fn test_drive_day_skip_pages_only_after_an_attempt_that_ran() {
+        for start in [62_645_u64, 62_580, XVERIFY_LAST_END_SECS_OF_DAY_IST - 300] {
+            let first = drive_day(
+                day(),
+                600,
+                || start,
+                || true,
+                |_plan: AttemptPlan| async { Ok(()) },
+            )
+            .await;
+            assert_eq!(first.attempts, 1);
+            assert_eq!(
+                first.failure,
+                Some(AttemptFailure::SkippedNoTime),
+                "start {start}"
+            );
+        }
+        let readings = std::cell::Cell::new(0_u32);
+        let jumping = || {
+            readings.set(readings.get() + 1);
+            if readings.get() == 1 { 56_460 } else { 62_500 }
+        };
+        let ran = std::cell::Cell::new(0_u32);
+        let after_failure = drive_day(
+            day(),
+            600,
+            jumping,
+            || true,
+            |_plan: AttemptPlan| {
+                ran.set(ran.get() + 1);
+                async { Err(AttemptFailure::RunFailed) }
+            },
+        )
+        .await;
+        assert_eq!(ran.get(), 1, "the second attempt was skipped, not run");
+        assert_eq!(after_failure.attempts, 2);
+        assert_eq!(after_failure.failure, Some(AttemptFailure::RunFailed));
+    }
+
+    /// The skipped day's final report is a coded `warn!`, not a page.
+    #[test]
+    fn test_skipped_day_is_logged_not_paged() {
+        let body = fn_body(prod_src(), "fn report_final_failure(");
+        let arm = body
+            .split("AttemptFailure::SkippedNoTime => ")
+            .nth(1)
+            .expect("report_final_failure must name SkippedNoTime");
+        let arm = &arm[..arm.find("AttemptFailure::Vacuous =>").unwrap_or(arm.len())];
+        assert!(arm.starts_with("warn!("), "{arm}");
+        assert!(arm.contains("source = \"xverify_day_not_attempted\""));
+        assert!(!arm.contains("xverify_failed"));
+    }
+
     /// The day changing during a retry sleep stops the loop without a page.
     #[tokio::test(start_paused = true)]
     async fn test_drive_day_day_change_stops_retrying() {
@@ -2736,12 +3207,15 @@ mod tests {
     }
 
     /// The timeout can stop an attempt only at an `.await`. Work that runs
-    /// synchronously past the limit (the audit persist and the marker write)
-    /// finishes, and its result stands — success and failure alike.
+    /// synchronously past the limit finishes, and its result stands — success
+    /// and failure alike. That is why the audit persist bounds itself to the
+    /// same deadline (the `persist_report_into` deadline tests) rather than
+    /// relying on this timeout.
     #[tokio::test]
     async fn test_bounded_attempt_keeps_a_result_finished_synchronously_past_the_limit() {
         for outcome in [Ok(()), Err(AttemptFailure::AuditRowsLost)] {
-            let got = bounded_attempt(day(), 1, 0, async move {
+            let at = tokio::time::Instant::now();
+            let got = bounded_attempt(day(), 1, 0, at, async move {
                 // A persist that is still running when the limit passes.
                 std::thread::sleep(Duration::from_millis(20));
                 outcome
@@ -2755,7 +3229,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_bounded_attempt_times_out_as_incomplete_at_the_limit() {
         let t0 = tokio::time::Instant::now();
-        let got = bounded_attempt(day(), 1, 960, async {
+        let got = bounded_attempt(day(), 1, 960, t0 + Duration::from_secs(960), async {
             tokio::time::sleep(Duration::from_secs(961)).await;
             Ok(())
         })
@@ -2764,7 +3238,8 @@ mod tests {
         assert_eq!(t0.elapsed(), Duration::from_secs(960));
         // Work that completes exactly at the limit is kept: the attempt is
         // polled before its timer.
-        let at_limit = bounded_attempt(day(), 1, 960, async {
+        let t1 = tokio::time::Instant::now();
+        let at_limit = bounded_attempt(day(), 1, 960, t1 + Duration::from_secs(960), async {
             tokio::time::sleep(Duration::from_secs(960)).await;
             Ok(())
         })
@@ -2797,17 +3272,27 @@ mod tests {
         assert!(!after.contains("attempt_is_last("));
         assert!(after.contains("if is_last {"));
         let bounded = fn_body(prod, "async fn bounded_attempt<");
-        assert!(bounded.contains("tokio::time::timeout("));
+        assert!(bounded.contains("tokio::time::timeout_at(deadline, attempt)"));
         assert!(bounded.contains("source = \"xverify_attempt_timed_out\""));
         assert!(bounded.contains("Err(AttemptFailure::Incomplete)"));
         assert!(drive.contains("source = \"xverify_attempt_skipped_no_time\""));
         let run_day = fn_body(prod, "async fn run_day(");
         assert!(run_day.contains("drive_day("));
         assert!(run_day.contains("run_budget_secs: plan.run_budget_secs"));
-        assert!(run_day.contains("tokio::time::timeout("));
+        assert!(run_day.contains("tokio::time::timeout_at("));
+        // The timeout and the persist's own stop are one instant.
+        assert!(
+            drive.contains("bounded_attempt(today, attempts, limit_secs, deadline, attempt(plan))")
+        );
+        assert!(drive.contains("deadline: Some(deadline)"));
+        assert!(
+            run_day.contains("run_option_pass(deps, today, day_start_ist_nanos, option_deadline)")
+        );
         assert!(run_day.contains("source = \"xverify_options_timed_out\""));
         // run_once is reached only through the driver.
         assert_eq!(prod.matches("run_once(deps,").count(), 1);
+        let run_once = fn_body(prod, "async fn run_once(");
+        assert!(run_once.contains("cfg.tolerance_paise,\n                deadline,"));
         assert!(!run_day.contains("now_ist_secs_of_day()"));
     }
 
@@ -2820,6 +3305,9 @@ mod tests {
             "xverify_attempt_timed_out",
             "xverify_attempt_skipped_no_time",
             "xverify_options_timed_out",
+            "xverify_persist_stopped_at_deadline",
+            "xverify_options_persist_stopped_at_deadline",
+            "xverify_day_not_attempted",
         ] {
             let emit = format!("source = \"{source}\"");
             let at = prod
@@ -3110,7 +3598,7 @@ mod tests {
     #[test]
     fn test_run_option_pass_runs_after_the_spot_retry_loop_ends() {
         let body = fn_body(prod_src(), "async fn run_day(");
-        let call = body.find("run_option_pass(deps, today, day_start_ist_nanos)");
+        let call = body.find("run_option_pass(deps, today, day_start_ist_nanos");
         let loop_end = body.find("report_final_failure(");
         assert!(call.is_some(), "run_day must call run_option_pass");
         assert!(loop_end.is_some() && body.contains("drive_day("));

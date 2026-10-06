@@ -627,12 +627,26 @@ pub async fn ensure_dhan_live_crossverify_tables(questdb_config: &QuestDbConfig)
     }
 }
 
+/// The writer's ILP-over-HTTP request timeout, in milliseconds.
+pub const DHAN_LIVE_XVERIFY_ILP_REQUEST_TIMEOUT_MS: u64 = 5_000;
+
+/// The writer's ILP-over-HTTP minimum throughput, bytes per second. The
+/// client lets one flush run `request_timeout + bytes / this` before it gives
+/// up (questdb-rs 6.1.0, `sender/mod.rs`). 102,400 is the library default,
+/// written out so [`DhanLiveXverifyAuditWriter::flush_worst_case`] cannot
+/// drift from what the client does (2026-10-06, §12.15.8).
+pub const DHAN_LIVE_XVERIFY_ILP_MIN_THROUGHPUT_BYTES_PER_SEC: u64 = 102_400;
+
 /// ILP-over-HTTP conf — per-flush server ACK (the 2026-07-05
 /// fire-and-forget lesson) + the shadow-writer knobs.
 fn dhan_live_xverify_ilp_http_conf(config: &QuestDbConfig) -> String {
     format!(
-        "http::addr={}:{};protocol_version=1;retry_timeout=0;request_timeout=5000;",
-        config.host, config.http_port
+        "http::addr={}:{};protocol_version=1;retry_timeout=0;request_timeout={};\
+         request_min_throughput={};",
+        config.host,
+        config.http_port,
+        DHAN_LIVE_XVERIFY_ILP_REQUEST_TIMEOUT_MS,
+        DHAN_LIVE_XVERIFY_ILP_MIN_THROUGHPUT_BYTES_PER_SEC
     )
 }
 
@@ -957,6 +971,23 @@ impl DhanLiveXverifyAuditWriter {
                 );
             }
         }
+    }
+
+    /// The longest one [`Self::flush`] of the current buffer can block: the
+    /// request timeout plus the buffer's bytes at the minimum throughput, as
+    /// the ILP client computes it, rounded up to a whole millisecond. With
+    /// `retry_timeout=0` there is no retry on top. A caller with a deadline
+    /// starts a flush only when `now + this` is still before it (2026-10-06,
+    /// §12.15.8). O(1): one `len()` and integer arithmetic.
+    #[must_use]
+    pub fn flush_worst_case(&self) -> std::time::Duration {
+        let bytes = u64::try_from(self.buffer.len()).unwrap_or(u64::MAX);
+        let extra_ms = bytes
+            .saturating_mul(1_000)
+            .div_ceil(DHAN_LIVE_XVERIFY_ILP_MIN_THROUGHPUT_BYTES_PER_SEC);
+        std::time::Duration::from_millis(
+            DHAN_LIVE_XVERIFY_ILP_REQUEST_TIMEOUT_MS.saturating_add(extra_ms),
+        )
     }
 
     /// Drop every buffered-but-unflushed row (poisoned-buffer defense).
@@ -1458,7 +1489,29 @@ mod tests {
         let conf = dhan_live_xverify_ilp_http_conf(&cfg);
         assert!(conf.contains("http::addr=questdb.internal:9009"));
         assert!(conf.contains("retry_timeout=0"));
-        assert!(conf.contains("request_timeout=5000"));
+        assert!(conf.contains("request_timeout=5000;"));
+        assert!(conf.contains("request_min_throughput=102400;"));
+        // The conf must parse: a typo here is a writer with no sender, which
+        // discards every row.
+        assert!(Sender::from_conf(&conf).is_ok());
+    }
+
+    /// The worst case follows the ILP client's own formula: 5 s, plus the
+    /// buffer's bytes at 102,400 B/s, rounded up to a millisecond.
+    #[test]
+    fn test_flush_worst_case_is_timeout_plus_bytes_at_min_throughput() {
+        let mut w = DhanLiveXverifyAuditWriter::for_test();
+        assert_eq!(w.flush_worst_case(), std::time::Duration::from_secs(5));
+        w.append_daily(&sample_daily()).expect("append");
+        let bytes = u64::try_from(w.buffer_len()).expect("len");
+        assert!(bytes > 0);
+        let want_ms = 5_000 + (bytes * 1_000).div_ceil(102_400);
+        assert_eq!(
+            w.flush_worst_case(),
+            std::time::Duration::from_millis(want_ms)
+        );
+        // 20,000 rows at the measured ~272 B/row is ~53 s on top of the 5 s.
+        assert!(w.flush_worst_case() > std::time::Duration::from_secs(5));
     }
 
     /// `is_measured` gates the keep-better rerun guard: get it wrong and a
