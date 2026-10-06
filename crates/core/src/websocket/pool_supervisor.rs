@@ -1347,6 +1347,23 @@ pub const OVERFLOW_PROBE_DEFERRAL_CAP_SECS: u64 = OVERFLOW_PROBE_NOTE_CUTOFF_SEC
 /// pass.
 pub const OVERFLOW_PROBE_FIRST_FRAME_DEADLINE_SECS: u64 = 120;
 
+/// Review fix 2026-10-06, round 8: after a failed window the probed socket is
+/// asked to close and park again, and until it has, it still holds its
+/// episode's turn (`reparking_mask`), so the depth episode cannot slip a
+/// grant in ahead of the main feed in the gap. The socket takes the request
+/// on its next one-second tick while connected, or at its next dial while
+/// redialling: at most one full ladder step plus one dial timeout plus one
+/// tick. A socket that never re-parks (it shut down, or parked for another
+/// reason without reaching the episode) releases the turn after this long.
+pub const OVERFLOW_PROBE_REPARK_HOLD_SECS: u64 = OVERFLOW_PROBE_FIRST_FRAME_DEADLINE_SECS;
+
+const _: () = assert!(
+    OVERFLOW_PROBE_REPARK_HOLD_SECS * 1_000
+        > super::reconnect_ladder::RECONNECT_DELAY_WITH_JITTER_MAX_MS
+            + super::connection::DIAL_TIMEOUT.as_secs() * 1_000
+            + 1_000
+);
+
 /// Review fix 2026-10-06, round 4: the longest a probe or release window may
 /// run from its GRANT, across the probed socket's one watch restart. The
 /// deferral cap and the note cutoff run from the LATEST first frame, and a
@@ -1699,6 +1716,14 @@ struct OverflowEpisode {
     /// silent `Recovered` would re-permit the main-feed widen with no probe
     /// ever passed. Cleared only by a pass.
     failed_since_pass: bool,
+    /// Review fix 2026-10-06, round 8: slots of this pool whose window failed
+    /// and that were asked to park again but have not re-parked yet. They
+    /// hold the turn like a parked slot ([`Self::holds_turn`]). Cleared at the
+    /// slot's park, when it leaves, or [`OVERFLOW_PROBE_REPARK_HOLD_SECS`]
+    /// after the latest failure (`reparking_until`).
+    reparking_mask: u32,
+    /// When `reparking_mask` is cleared if no park arrives first.
+    reparking_until: Option<Instant>,
 }
 
 impl OverflowEpisode {
@@ -1730,6 +1755,18 @@ impl OverflowEpisode {
             watch_restarted: false,
             watched_down: false,
             failed_since_pass: false,
+            reparking_mask: 0,
+            reparking_until: None,
+        }
+    }
+
+    /// Drops `slot` from the slots still to re-park. O(1).
+    fn clear_reparking(&mut self, slot: u8) {
+        if let Some(bit) = 1u32.checked_shl(u32::from(slot)) {
+            self.reparking_mask &= !bit;
+        }
+        if self.reparking_mask == 0 {
+            self.reparking_until = None;
         }
     }
 
@@ -1801,12 +1838,15 @@ impl OverflowEpisode {
     /// Whether this episode holds the process-wide turn: a window is
     /// running, or a parked socket of this pool still waits for its probe
     /// or release. The depth episode grants nothing while the main feed
-    /// holds the turn.
+    /// holds the turn. Review fix 2026-10-06, round 8: a socket whose window
+    /// failed and that has not re-parked yet counts as parked
+    /// (`reparking_mask`), so the gap between a failure and the re-park
+    /// cannot hand the turn to the depth episode.
     const fn holds_turn(&self) -> bool {
         match self.phase {
             OverflowEpisodePhase::Probing | OverflowEpisodePhase::Resuming => true,
             OverflowEpisodePhase::Waiting | OverflowEpisodePhase::Releasing => {
-                self.parked_mask != 0
+                (self.parked_mask | self.reparking_mask) != 0
             }
             OverflowEpisodePhase::Quiet
             | OverflowEpisodePhase::Recovered
@@ -1819,6 +1859,7 @@ impl OverflowEpisode {
         if let Some(bit) = 1u32.checked_shl(u32::from(global_index)) {
             self.parked_mask |= bit;
         }
+        self.clear_reparking(global_index);
         // A late park from the 805 that this episode already waited out with
         // nothing parked (`poll` kept `phase_since`): wait on, from that 805.
         // A Recovered reached through a release has no `phase_since`, and a
@@ -2048,8 +2089,11 @@ impl OverflowEpisode {
         if self.watched() == Some(slot) {
             // `repark` names the slot for the log. Its register is harmless:
             // the socket's task ends at a non-805 park, and a later grant
-            // clears the register first.
-            return self.fail(OverflowProbeOutcome::FailedWatchedClosed, now);
+            // clears the register first. It never re-parks, so it does not
+            // hold the turn as a re-parking slot (round 8).
+            let effect = self.fail(OverflowProbeOutcome::FailedWatchedClosed, now);
+            self.clear_reparking(slot);
+            return effect;
         }
         self.on_sibling_left(slot);
         OverflowEpisodeEffect::default()
@@ -2114,11 +2158,14 @@ impl OverflowEpisode {
     }
 
     /// A noted sibling parked for a reason other than 805: it opens no
-    /// connection, so it is dropped from the window (no settle time).
+    /// connection, so it is dropped from the window (no settle time). A slot
+    /// still to re-park after a failed window will not re-park either, so it
+    /// stops holding the turn (round 8).
     fn on_sibling_left(&mut self, slot: u8) {
         if let Some(bit) = 1u32.checked_shl(u32::from(slot)) {
             self.suspect_mask &= !bit;
         }
+        self.clear_reparking(slot);
         if let Some(since) = self.suspect_since.get_mut(usize::from(slot)) {
             *since = None;
         }
@@ -2145,6 +2192,12 @@ impl OverflowEpisode {
     /// Time-driven steps. `window_open` is the session gate: no probe and no
     /// release is granted outside it; a running window keeps running.
     fn poll(&mut self, now: Instant, window_open: bool) -> OverflowEpisodeEffect {
+        // Round 8: a failed socket that has not re-parked within
+        // `OVERFLOW_PROBE_REPARK_HOLD_SECS` gives the turn up. O(1).
+        if self.reparking_until.is_some_and(|until| now >= until) {
+            self.reparking_mask = 0;
+            self.reparking_until = None;
+        }
         match self.phase {
             OverflowEpisodePhase::Waiting => {
                 let Some(delay) = self.kind.delay_secs(self.probes_started) else {
@@ -2359,6 +2412,14 @@ impl OverflowEpisode {
         } else {
             self.phase = OverflowEpisodePhase::Waiting;
             self.phase_since = Some(now);
+            // Round 8: until it re-parks, the failed socket holds the turn.
+            if let Some(bit) = 1u32.checked_shl(u32::from(slot)) {
+                self.reparking_mask |= bit;
+                self.reparking_until = Some(
+                    now.checked_add(Duration::from_secs(OVERFLOW_PROBE_REPARK_HOLD_SECS))
+                        .unwrap_or(now),
+                );
+            }
             None
         };
         OverflowEpisodeEffect {
@@ -2542,6 +2603,15 @@ static OVERFLOW_ENGAGED: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 /// began just before an 805 is still known. Read O(32) only on a no-code
 /// close while an episode is engaged ([`recent_dial_mask`]).
 static OVERFLOW_DIAL_BEGIN_MS: [std::sync::atomic::AtomicU64; GHOST_REDIAL_SLOTS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; GHOST_REDIAL_SLOTS];
+
+/// Review fix 2026-10-06, round 8: each slot's [`OVERFLOW_DIAL_BEGIN_MS`]
+/// value as it stood when the slot's CURRENT dial attempt began (its
+/// BeginDial). A dial that proves it opened no socket puts this back instead
+/// of 0, so it drops only its own stamp and never an earlier attempt's (a
+/// timeout that Dhan may still have accepted). Written and read only by the
+/// slot's own connection task. O(1), one Release store per BeginDial.
+static OVERFLOW_DIAL_PRIOR_MS: [std::sync::atomic::AtomicU64; GHOST_REDIAL_SLOTS] =
     [const { std::sync::atomic::AtomicU64::new(0) }; GHOST_REDIAL_SLOTS];
 
 /// The zero of [`OVERFLOW_DIAL_BEGIN_MS`]: the first instant any slot used it.
@@ -2874,6 +2944,27 @@ fn stamp_dial_begin(
     record_dial_begin(table, slot, dial_stamp_ms(epoch, now));
 }
 
+/// A NEW dial attempt of `slot` begins (its BeginDial): keeps the slot's
+/// current stamp in `prior` (the newest earlier dial that may have been
+/// accepted), then stamps `now`. The re-stamp right before `connect()` is
+/// [`stamp_dial_begin`] alone, so it never moves `prior` (review fix
+/// 2026-10-06, round 8). O(1), one load and two Release stores.
+fn stamp_dial_attempt(
+    table: &[std::sync::atomic::AtomicU64; GHOST_REDIAL_SLOTS],
+    prior: &[std::sync::atomic::AtomicU64; GHOST_REDIAL_SLOTS],
+    epoch: &std::sync::OnceLock<Instant>,
+    slot: u8,
+    now: Instant,
+) {
+    if let (Some(cell), Some(kept)) = (table.get(usize::from(slot)), prior.get(usize::from(slot))) {
+        kept.store(
+            cell.load(std::sync::atomic::Ordering::Acquire),
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+    stamp_dial_begin(table, epoch, slot, now);
+}
+
 /// Review fix 2026-10-06, round 4: whether a failed dial's transport `reason`
 /// PROVES Dhan opened no WebSocket for it, so the dial evicted nobody: the
 /// server answered the upgrade with a status other than 101
@@ -2886,20 +2977,29 @@ fn dial_failure_proves_no_accept(reason: &str) -> bool {
 }
 
 /// A dial of `slot` failed with `reason`. When the failure proves no socket
-/// was accepted, the slot's dial stamp in `table` is cleared (one Release
-/// store of 0), so a slot stuck in a refused-dial loop never corroborates
-/// another socket's no-code close; otherwise the stamp stays (errs toward
-/// failing a window). Only the slot's own connection task writes its cell.
-/// O(1), no allocation, no lock.
+/// was accepted, the slot's dial stamp in `table` goes back to the value it
+/// held before this attempt began (`prior`, kept by [`stamp_dial_attempt`]):
+/// this attempt's own stamp is dropped, so a slot stuck in a refused-dial
+/// loop never corroborates another socket's no-code close, while an EARLIER
+/// attempt that timed out (Dhan may still have accepted it) keeps
+/// corroborating for its full window (review fix 2026-10-06, round 8; it
+/// stored 0 before, which erased that evidence and erred toward a pass).
+/// Otherwise the stamp stays (errs toward failing a window). Only the slot's
+/// own connection task writes its cells. O(1), no allocation, no lock.
 fn note_dial_failed_in(
     table: &[std::sync::atomic::AtomicU64; GHOST_REDIAL_SLOTS],
+    prior: &[std::sync::atomic::AtomicU64; GHOST_REDIAL_SLOTS],
     slot: u8,
     reason: &str,
 ) {
     if dial_failure_proves_no_accept(reason)
-        && let Some(cell) = table.get(usize::from(slot))
+        && let (Some(cell), Some(kept)) =
+            (table.get(usize::from(slot)), prior.get(usize::from(slot)))
     {
-        cell.store(0, std::sync::atomic::Ordering::Release);
+        cell.store(
+            kept.load(std::sync::atomic::Ordering::Acquire),
+            std::sync::atomic::Ordering::Release,
+        );
     }
 }
 
@@ -2976,9 +3076,25 @@ fn overflow_episode_note_disconnect(code: Option<DisconnectCode>, global_index: 
     }
 }
 
-/// A socket began a dial: one Release store into the dial-start table, every
-/// dial, engaged or not (scope lock 2026-10-06). O(1), no lock.
+/// A socket began a dial attempt (its BeginDial): keeps the slot's previous
+/// stamp for a refusal to fall back to, then one Release store into the
+/// dial-start table, every dial, engaged or not (scope lock 2026-10-06;
+/// round 8). O(1), no lock.
 fn overflow_note_dial_begin(global_index: u8, now: Instant) {
+    stamp_dial_attempt(
+        &OVERFLOW_DIAL_BEGIN_MS,
+        &OVERFLOW_DIAL_PRIOR_MS,
+        &OVERFLOW_DIAL_EPOCH,
+        global_index,
+        now,
+    );
+}
+
+/// The same dial attempt is stamped again right before `connect()` (review
+/// fix 2026-10-06, round 5). It does not move the kept stamp, so a refusal
+/// still falls back past both of this attempt's stamps (round 8). O(1), one
+/// Release store, no lock.
+fn overflow_note_dial_connect(global_index: u8, now: Instant) {
     stamp_dial_begin(
         &OVERFLOW_DIAL_BEGIN_MS,
         &OVERFLOW_DIAL_EPOCH,
@@ -2987,12 +3103,18 @@ fn overflow_note_dial_begin(global_index: u8, now: Instant) {
     );
 }
 
-/// A socket's dial failed with the transport's `reason`: drops its dial stamp
-/// when the failure proves no socket was accepted (review fix 2026-10-06,
-/// round 4). Eviction evidence only; the supervisor's backoff never reads the
-/// reason. O(1), at most one Release store, no lock.
+/// A socket's dial failed with the transport's `reason`: drops this attempt's
+/// dial stamp when the failure proves no socket was accepted (review fix
+/// 2026-10-06, round 4), falling back to the stamp the slot held before the
+/// attempt (round 8). Eviction evidence only; the supervisor's backoff never
+/// reads the reason. O(1), at most one load and one Release store, no lock.
 fn overflow_note_dial_failed(global_index: u8, reason: &str) {
-    note_dial_failed_in(&OVERFLOW_DIAL_BEGIN_MS, global_index, reason);
+    note_dial_failed_in(
+        &OVERFLOW_DIAL_BEGIN_MS,
+        &OVERFLOW_DIAL_PRIOR_MS,
+        global_index,
+        reason,
+    );
 }
 
 /// A socket completed a dial: two Acquire loads; the episode lock only when
@@ -8301,7 +8423,7 @@ where
                 // it. The BeginDial stamp stays (it errs toward fail); this one
                 // keeps BeginDial-to-accept inside the attribution window even
                 // if a gate above waited. One Release store.
-                overflow_note_dial_begin(supervisor.slot().global_index, Instant::now());
+                overflow_note_dial_connect(supervisor.slot().global_index, Instant::now());
                 let event = match socket.connect().await {
                     Ok(()) => ConnEvent::DialSucceeded,
                     Err(_) => {
@@ -19397,6 +19519,89 @@ mod tests {
         assert!(!down.holds_turn());
     }
 
+    /// Review fix 2026-10-06, round 8: between a failed main window and the
+    /// failed socket's re-park, the main feed still holds the turn, so the
+    /// depth episode cannot grant ahead of it. A socket that leaves for good
+    /// gives the turn up at once, and one that never re-parks gives it up
+    /// after `OVERFLOW_PROBE_REPARK_HOLD_SECS`.
+    #[test]
+    fn test_depth_cannot_take_the_turn_while_a_failed_main_socket_reparks() {
+        let start = t0();
+        let at = start + secs(OVERFLOW_PROBE_DELAYS_SECS[0]);
+        assert!(at >= start + depth_delay(0), "depth's own wait has passed");
+        let failed = |eps: &mut OverflowEpisodes| {
+            assert_eq!(eps.poll(at, true).main.grant, Some(0));
+            eps.on_first_frame(0, at + secs(1));
+            // Sibling 3 drops with no code while slot 0's grant dial is
+            // recent: the main window fails in slot 3's step.
+            let fail = eps.on_bare_reset(3, 1 << 0, at + secs(10));
+            assert_eq!(
+                fail.main.outcomes[0],
+                Some(OverflowProbeOutcome::FailedEvictionCorroborated)
+            );
+            assert_eq!(fail.main.repark, Some(0));
+            assert_eq!(eps.main.phase, OverflowEpisodePhase::Waiting);
+            assert_eq!(eps.main.parked_mask, 0, "slot 0 has not re-parked yet");
+        };
+
+        // The gap: another socket's tick polls before slot 0 re-parks.
+        let mut eps = episodes_after_805(&[0], &[10], start);
+        failed(&mut eps);
+        assert!(eps.main.holds_turn(), "the re-parking slot holds the turn");
+        for gap in [11, 12, 40, 100] {
+            assert_eq!(eps.poll(at + secs(gap), true).depth.grant, None, "{gap}");
+        }
+        assert_eq!(eps.watched(), None);
+        // Slot 0 re-parks: the main feed still holds the turn, now as parked.
+        eps.on_parked(DhanEndpointType::MainFeed, 0);
+        assert_eq!(eps.main.reparking_mask, 0);
+        assert!(eps.main.holds_turn());
+        assert_eq!(eps.poll(at + secs(101), true).depth.grant, None);
+        // The main feed's second probe goes first.
+        let second = at + secs(10 + OVERFLOW_PROBE_DELAYS_SECS[1]);
+        let next = eps.poll(second, true);
+        assert_eq!(next.main.grant, Some(0));
+        assert_eq!(next.depth.grant, None);
+
+        // A slot that never re-parks gives the turn up after the hold.
+        let mut eps = episodes_after_805(&[0], &[10], start);
+        failed(&mut eps);
+        let hold_end = at + secs(10 + OVERFLOW_PROBE_REPARK_HOLD_SECS);
+        assert_eq!(eps.poll(hold_end - secs(1), true).depth.grant, None);
+        assert_eq!(eps.poll(hold_end, true).depth.grant, Some(10));
+
+        // A slot that left (shutdown, or any non-805 park reaching the
+        // episodes) gives the turn up at once.
+        let mut eps = episodes_after_805(&[0], &[10], start);
+        failed(&mut eps);
+        eps.on_sibling_left(0);
+        assert!(!eps.main.holds_turn());
+        assert_eq!(eps.poll(at + secs(11), true).depth.grant, Some(10));
+
+        // The probed socket leaving for good (808) fails the window and never
+        // re-parks: it does not hold the turn.
+        let mut eps = episodes_after_805(&[0], &[10], start);
+        assert_eq!(eps.poll(at, true).main.grant, Some(0));
+        let left = eps.on_left(0, at + secs(5));
+        assert_eq!(
+            left.main.outcomes[0],
+            Some(OverflowProbeOutcome::FailedWatchedClosed)
+        );
+        assert_eq!(eps.main.reparking_mask, 0);
+        assert!(!eps.main.holds_turn());
+        assert_eq!(eps.poll(at + secs(6), true).depth.grant, Some(10));
+
+        // A failure that ends the episode for the session holds nothing.
+        let mut down = OverflowEpisode::new();
+        down.probes_started = down.kind.max_attempts();
+        down.phase = OverflowEpisodePhase::Probing;
+        down.watched_slot = 2;
+        let _ = down.fail(OverflowProbeOutcome::FailedNoFrame, start);
+        assert_eq!(down.phase, OverflowEpisodePhase::DownForSession);
+        assert_eq!(down.reparking_mask, 0);
+        assert!(!down.holds_turn());
+    }
+
     #[test]
     fn test_main_grant_waits_for_a_running_depth_window() {
         let start = t0();
@@ -21179,17 +21384,22 @@ mod tests {
     #[test]
     fn test_a_refused_dial_loop_never_corroborates_a_sibling_close() {
         let table = local_dial_table();
+        let prior = local_dial_table();
         let epoch = std::sync::OnceLock::new();
         let start = t0();
         stamp_dial_begin(&table, &epoch, 9, start);
         let (mut ep, granted) = probing(4, &[], start);
-        // Depth-20 slot 7 retries every 10 s; every upgrade is refused.
+        // Depth-20 slot 7 retries every 10 s; every upgrade is refused. Each
+        // attempt is stamped at BeginDial and again before the connect, as in
+        // production.
         let mut last = granted;
         for k in 0..5u64 {
             last = granted + secs(10 * k);
+            stamp_dial_attempt(&table, &prior, &epoch, 7, last);
             stamp_dial_begin(&table, &epoch, 7, last);
             note_dial_failed_in(
                 &table,
+                &prior,
                 7,
                 super::super::connection::DIAL_FAILURE_UPGRADE_REFUSED,
             );
@@ -21203,16 +21413,18 @@ mod tests {
         );
         // A dial that never left the process proves the same.
         for reason in ["no_token", "tls_config", "bad_url"] {
-            stamp_dial_begin(&table, &epoch, 7, close);
-            note_dial_failed_in(&table, 7, reason);
+            stamp_dial_attempt(&table, &prior, &epoch, 7, close);
+            note_dial_failed_in(&table, &prior, 7, reason);
             assert_eq!(
                 bare_reset_recent_dials(&table, &epoch, close + secs(1)) & (1 << 7),
                 0
             );
         }
         // An out-of-range slot is ignored.
+        stamp_dial_attempt(&table, &prior, &epoch, 40, close);
         note_dial_failed_in(
             &table,
+            &prior,
             40,
             super::super::connection::DIAL_FAILURE_UPGRADE_REFUSED,
         );
@@ -21222,14 +21434,15 @@ mod tests {
     fn test_a_timed_out_dial_still_corroborates_a_sibling_close() {
         for reason in ["timeout", "connect"] {
             let table = local_dial_table();
+            let prior = local_dial_table();
             let epoch = std::sync::OnceLock::new();
             let start = t0();
             stamp_dial_begin(&table, &epoch, 9, start);
             let (mut ep, granted) = probing(4, &[], start);
             let began = granted + secs(10);
-            stamp_dial_begin(&table, &epoch, 7, began);
+            stamp_dial_attempt(&table, &prior, &epoch, 7, began);
             // The dial gives up at its 15 s timeout: acceptance unknown.
-            note_dial_failed_in(&table, 7, reason);
+            note_dial_failed_in(&table, &prior, 7, reason);
             let close = began + secs(OVERFLOW_PROBE_EVICTION_ATTRIBUTION_SECS);
             let recent = bare_reset_recent_dials(&table, &epoch, close);
             assert_eq!(recent & (1 << 7), 1 << 7, "{reason}");
@@ -21238,6 +21451,57 @@ mod tests {
                 fail.outcomes[0],
                 Some(OverflowProbeOutcome::FailedEvictionCorroborated),
                 "{reason}"
+            );
+        }
+    }
+
+    /// Review fix 2026-10-06, round 8: a refused RETRY drops only its own
+    /// stamp. The earlier attempt timed out (Dhan may have accepted it late
+    /// and evicted the oldest socket), so its stamp must still corroborate a
+    /// sibling's no-code close inside its 20 s; before the fix the refusal
+    /// stored 0 and the eviction read as an uncorroborated blip.
+    #[test]
+    fn test_a_refused_retry_keeps_an_earlier_timed_out_dial_as_evidence() {
+        for refusal in [
+            super::super::connection::DIAL_FAILURE_UPGRADE_REFUSED,
+            "no_token",
+            "tls_config",
+            "bad_url",
+        ] {
+            let table = local_dial_table();
+            let prior = local_dial_table();
+            let epoch = std::sync::OnceLock::new();
+            let start = t0();
+            stamp_dial_begin(&table, &epoch, 9, start);
+            let (mut ep, granted) = probing(4, &[], start);
+            // Slot 7: attempt 1 at T (BeginDial and the connect re-stamp),
+            // timed out at T+15 (stamp kept).
+            let t = granted + secs(10);
+            stamp_dial_attempt(&table, &prior, &epoch, 7, t);
+            stamp_dial_begin(&table, &epoch, 7, t);
+            note_dial_failed_in(&table, &prior, 7, "timeout");
+            // Attempt 2 at T+16.2, refused at T+16.4.
+            let retry = t + Duration::from_millis(16_200);
+            stamp_dial_attempt(&table, &prior, &epoch, 7, retry);
+            stamp_dial_begin(&table, &epoch, 7, retry);
+            note_dial_failed_in(&table, &prior, 7, refusal);
+            // Slot 0 (evicted by attempt 1) closes with no code at T+17.
+            let close = t + secs(17);
+            let recent = bare_reset_recent_dials(&table, &epoch, close);
+            assert_eq!(recent & (1 << 7), 1 << 7, "{refusal}");
+            let fail = ep.on_bare_reset(0, recent, close);
+            assert_eq!(
+                fail.outcomes[0],
+                Some(OverflowProbeOutcome::FailedEvictionCorroborated),
+                "{refusal}"
+            );
+            assert_eq!(fail.sibling, Some(0));
+            // The timed-out stamp still ages out on its own 20 s.
+            let late = t + secs(OVERFLOW_PROBE_EVICTION_ATTRIBUTION_SECS + 1);
+            assert_eq!(
+                bare_reset_recent_dials(&table, &epoch, late) & (1 << 7),
+                0,
+                "{refusal}"
             );
         }
     }
@@ -21831,7 +22095,7 @@ mod tests {
             .find("if !sink.dial_permitted() {")
             .expect("permit gate");
         let restamp = shell
-            .find("overflow_note_dial_begin(supervisor.slot().global_index, Instant::now());")
+            .find("overflow_note_dial_connect(supervisor.slot().global_index, Instant::now());")
             .expect("restamp before connect");
         let connect = shell.find("socket.connect().await").expect("connect");
         assert!(permit < restamp && restamp < connect);
@@ -21895,6 +22159,25 @@ mod tests {
         );
         assert!(dial.contains("stamp_dial_begin("));
         assert!(dial.contains("&OVERFLOW_DIAL_EPOCH"));
+        // Round 8: BeginDial keeps the previous stamp; the connect re-stamp
+        // does not; a refusal falls back to the kept stamp, never to 0.
+        let begin = arm(
+            "fn overflow_note_dial_begin(",
+            "fn overflow_note_dial_connect(",
+        );
+        assert!(begin.contains("stamp_dial_attempt("));
+        assert!(begin.contains("&OVERFLOW_DIAL_PRIOR_MS"));
+        let connect = arm(
+            "fn overflow_note_dial_connect(",
+            "fn overflow_note_dial_failed(",
+        );
+        assert!(connect.contains("stamp_dial_begin("));
+        assert!(!connect.contains("OVERFLOW_DIAL_PRIOR_MS"));
+        let failed = arm(
+            "fn overflow_note_dial_failed(",
+            "fn overflow_episode_note_dial_succeeded(",
+        );
+        assert!(failed.contains("&OVERFLOW_DIAL_PRIOR_MS"));
         let left = arm("fn overflow_episode_note_left(", "fn suspect_bit_set(");
         assert!(left.contains("left_reaches_episode("));
         assert!(left.contains("eps.on_left(global_index, now)"));

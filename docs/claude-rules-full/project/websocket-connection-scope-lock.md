@@ -8922,3 +8922,31 @@ REJECT (review round 7):
   anywhere but a pass.
 - Removes the expected-outcome checks from `proptest_attribution_rules`, or
   the high-slot example.
+
+#### Review round 8 (2026-10-06, same day, same owner approval)
+
+Two more gaps, both measured in source on this branch before the fix:
+
+| Surface | Was | Now |
+|---|---|---|
+| Main feed first, after a failed main window | a failed window moves the main episode to `Waiting` and asks the probed socket to close and park again, but that socket comes back into `parked_mask` only once it takes the request (its next one-second tick while connected, or its next dial while redialling, up to a full ladder step later). If it was the only main-feed socket parked, `holds_turn` read false in that gap (`Waiting` with nothing parked), and any other socket's poll let the depth episode grant first, into an account that had just failed a probe; the main feed's next probe then waited behind the depth window (up to 740 s). Not new on this branch (the same gap followed `failed_no_frame`), but the round 1–7 failure paths that run on another socket's step made it common | a failed window marks its socket in `reparking_mask`, which holds the turn exactly like a parked slot (`holds_turn` reads either mask). The mark clears when the socket parks (805), when it leaves (a non-805 park or a shutdown that reaches the episodes), or `OVERFLOW_PROBE_REPARK_HOLD_SECS` (**120 s**, more than one ladder step plus one dial timeout plus one tick, asserted at compile time) after the failure, so a socket that never re-parks cannot hold the turn for ever. The probed socket parking for a reason other than 805 fails its window and never re-parks, so it is not marked. A failure that ends the episode for the session marks nothing. One `u32` and one instant, O(1). Verified by `test_depth_cannot_take_the_turn_while_a_failed_main_socket_reparks` (bite-checked: without the mark it fails) |
+| A refused retry after a timed-out dial | a dial refused at the upgrade (or that never left the process) stored 0 into the slot's one dial stamp. By then the same attempt's BeginDial had already overwritten an EARLIER attempt's stamp, so the 0 also erased a dial that timed out on our side and that Dhan may still have accepted (round 4 keeps a timeout's stamp for exactly that reason). An eviction inside that earlier attempt's 20 s then read as an uncorroborated blip, which errs toward a pass | BeginDial keeps the slot's previous stamp (`OVERFLOW_DIAL_PRIOR_MS`, one load and one Release store, written and read only by the slot's own task); the re-stamp immediately before `connect()` (`overflow_note_dial_connect`) does not move it; a refusal puts the kept stamp back instead of 0. So a refusal drops only its own attempt's stamps, a refused-dial loop still never corroborates (its kept stamp is 0 or ages out on its own 20 s), and an earlier timeout keeps corroborating for its full window. O(1). Verified by `test_a_refused_retry_keeps_an_earlier_timed_out_dial_as_evidence` (bite-checked: storing 0 fails it) and `test_a_refused_dial_loop_never_corroborates_a_sibling_close` |
+
+**Honest limits:**
+
+- A failed socket that parks for a non-805 reason or shuts down without
+  reaching the episodes (only a noted sibling or the socket under watch
+  reaches them) keeps the main feed's turn until the 120 s hold runs out. The
+  depth episode waits that much longer. Errs toward main first.
+- A failed socket that reaches its next tick or dial more than 120 s after
+  the failure (Assumed rare: the ladder is at most about 31 s and a dial times
+  out at 15 s, but a token refresh before a redial is not bounded here) gives
+  the turn up before it re-parks, as before this round.
+
+REJECT (review round 8):
+
+- Lets the depth episode grant while a failed main-feed socket has not
+  re-parked, inside the 120 s hold; marks a socket that left for good; or
+  lets the mark outlive `OVERFLOW_PROBE_REPARK_HOLD_SECS`.
+- Stores 0 (or anything but the stamp kept at BeginDial) on a refused dial,
+  or lets the pre-connect re-stamp move the kept stamp.
