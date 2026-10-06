@@ -8634,3 +8634,65 @@ dialed on a contract socket — the two copies are never on one socket.
   `ticks` rows for one packet).
 - Raises the default above 1,000 or re-ranks / re-subscribes the backup set
   during the session without a fresh dated quote HERE.
+
+### 2026-10-05 — THE 09:15 BAR IS SIGNED AGAINST YESTERDAY'S CLOSE, NOT THE PRE-OPEN BAR
+
+**Operator (2026-10-05, verbatim, typos kept):** "bri why especilaly for one
+minute for this query adani ent 9.15 am volume is different dude ic ant
+understand dud ehwy this si different ddue taht too when in dhan chart it is
+psoitive why in our db one minute minus and different volume dude why?"
+Offered three choices (keep as is; fold the pre-open into 09:15; sign 09:15
+against yesterday), the operator chose **"Sign vs yesterday"** on 2026-10-05.
+
+**What changes (narrows the 2026-09-18 (FOURTH) sign rule for one bucket):**
+the bucket of each timeframe that holds the market open (09:15) takes its sign
+baseline (`bucket_open_prev_close`, which also drives the bar-on-bar
+percentage) from the previous day's close carried on the exchange packet,
+instead of from a pre-open bar sealed earlier that day. Every other bar keeps
+the previous bar of the same timeframe. A 09:15 packet with no previous close
+keeps the old baseline. Pre-open bars, every volume, every price and the minute
+grid are unchanged.
+
+**Why:** the grid starts at 09:00, so a stock quoting in the pre-open seals a
+bar at the auction price; ADANIENT 09:15 closed at 2841.10, below the 2843.90
+auction and above yesterday's 2827.00, so `candles_1m` stored −volume where
+Dhan's chart showed +45.81K. This deliberately reverses, for that one bucket,
+the overnight-gap objection recorded on `net_volume_baseline`.
+
+**Honest limits:** the packet's previous close is the official close, not the
+broker's last one-minute close, so the sign can still differ when the 09:15
+close lies between them. The 09:15 volume still excludes the auction quantity
+(it stays in the pre-open bar), so its size can still differ from the chart.
+
+**REJECT:**
+- Signing any bar other than the market-open bucket against the previous day.
+- Moving pre-open volume or prices into 09:15 under cover of this quote.
+- Changing the sign or volume of any other bar.
+
+### 2026-10-05 (SECOND) — CANDLES START AT 09:15; NO PRE-OPEN BAR IN ANY TIMEFRAME
+
+**Operator (2026-10-05, verbatim, typos kept):** "oh you are correct dude see
+only startin g 9.15 am timestamps aloen only shodul be considered rigth dude am
+i rigth dude why are you even considering this pre open auction price dude why
+broi why? yesterday close vs only today's startign 9.15 am shodu lbe considered
+right dude am i rigth dude tel lme dude okay?"
+
+**What changes (reverses the candle half of "2026-08-28 — CANDLES FROM 09:00"):**
+`CANDLE_SESSION_OPEN_SECS_OF_DAY_IST` is 33_300 (09:15) again. The fold refuses
+every tick before 09:15, so no timeframe seals a pre-open bar, and the first
+bucket of every timeframe starts at 09:15. The 09:15 bucket is still signed
+against the previous day's close (the section above). The `top_volume`
+snapshot grid anchor moves with it (every cadence divides 900 s, so no
+snapshot instant moves). **Raw ticks are unchanged:** the `ticks` table, the
+WAL and the 09:00 persistence window still keep every pre-open packet.
+
+**Honest limits:** the first continuous trade carries the auction quantity in
+its day cumulative, so it seeds the volume baseline: the 09:15 bar misses that
+first trade's own quantity unless the untraded-today proof holds (missing,
+never wrong; the pre-2026-08-28 behaviour). The pre-open auction price is no
+longer the 09:15 open.
+
+**REJECT:**
+- Sealing any bar whose bucket starts before 09:15, in any timeframe.
+- Dropping or gating pre-open rows from `ticks` or the WAL under cover of this quote.
+- Moving the candle grid start again without a fresh dated quote here first.

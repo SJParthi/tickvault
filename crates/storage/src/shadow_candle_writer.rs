@@ -178,8 +178,8 @@ pub const CANDLE_OUT_OF_WINDOW_COUNTER: &str = "tv_candle_rows_out_of_window_ref
 /// FINAL BAR of every emitted timeframe, every session, plus every rescued bar
 /// — while reporting success. Gating the bucket is safe by construction:
 /// `TfIndex::bucket_start` anchors every bucket at
-/// `CANDLE_SESSION_OPEN_SECS_OF_DAY_IST` (09:00) and is monotone within the
-/// day, so the first emitted bucket is 09:00:00 and the last one-minute bucket
+/// `CANDLE_SESSION_OPEN_SECS_OF_DAY_IST` (09:15 since 2026-10-05) and is monotone within the
+/// day, so the first emitted bucket is 09:15:00 and the last one-minute bucket
 /// opens at 15:39:00 — both inside the window at its inclusive and exclusive
 /// edges respectively.
 ///
@@ -458,15 +458,15 @@ impl ShadowCandleWriter {
         // Two upstream facts make every bucket that reaches this writer
         // in-window by construction:
         //   * `tf_index::bucket_start` CLAMPS the bucket-open to
-        //     `CANDLE_SESSION_OPEN_SECS_OF_DAY_IST` (32_400 = 09:00), so no
-        //     bucket can open earlier -- including D1, which stamps 09:00
+        //     `CANDLE_SESSION_OPEN_SECS_OF_DAY_IST` (33_300 = 09:15), so no
+        //     bucket can open earlier -- including D1, which stamps 09:15
         //     rather than midnight; and
         //   * `MultiTfAggregator::consume` refuses the tick outright
         //     (`out_of_session`) unless its fold clock is inside
         //     `[CANDLE_SESSION_OPEN.., MARKET_CLOSE_SECS_OF_DAY_IST)` =
-        //     `[09:00, 15:40)` -- byte-identical to the persist window.
+        //     `[09:15, 15:40)` -- inside the persist window.
         //
-        // So a folded bar's `timestamp_ist_nanos` is always >= 09:00 and always
+        // So a folded bar's `timestamp_ist_nanos` is always >= 09:15 and always
         // < 15:40, and this check cannot refuse one. It is kept anyway, at two
         // integer compares per seal, because the redundancy is the point: the
         // fold window is a `trading`-crate constant and this is a `storage`

@@ -200,13 +200,13 @@ fn s03_first_trade_minutes_after_open_seeds() {
     assert_bars(&got, &[], &[(OPEN + 61, 650)]);
 }
 
-// 4. Early: an F&O packet stamped 09:10, 30 s after a proof -> lands at 09:10.
+// 4. Early: an F&O packet stamped 09:10, 30 s after a proof. Candles start
+// at 09:15 (2026-10-05), so the fold refuses it: no bar in any timeframe.
 #[test]
-fn s04_pre_open_stamp_lands_at_its_own_second() {
+fn s04_pre_open_stamp_is_refused_by_the_fold() {
     let p = DAY + 33_000;
     let got = run(&[stale(FNO, p - 30), tk(FNO, p, 13.0, 100, 100, p)]);
-    let t = [(p, 100)];
-    assert_bars(&got, &t, &t);
+    assert_bars(&got, &[], &[(p, 100)]);
 }
 
 // 5. Duplicated first-trade packet (x3, same LTQ) -> no double count.
@@ -583,7 +583,9 @@ fn s24_trade_packet_overtaken_by_stale_snapshot() {
     assert_bars(&got, &t, &t);
 }
 
-// 25. Equity auction traded (seeded, no proof), then a stale snapshot.
+// 25. Equity auction traded before 09:15 (refused by the fold), then a stale
+// snapshot. The first continuous trade carries the auction in its cumulative
+// (50,400 against its own 400), so it seeds: missing, never 50,400.
 #[test]
 fn s25_equity_auction_trade_then_stale_snapshot() {
     let got = run(&[
@@ -591,11 +593,7 @@ fn s25_equity_auction_trade_then_stale_snapshot() {
         stale(EQ, OPEN - 1),
         tk(EQ, OPEN + 2, 812.0, 50_400, 400, OPEN + 2),
     ]);
-    assert_bars(
-        &got,
-        &[(OPEN + 2, 400)],
-        &[(DAY + 32_880, 50_000), (OPEN + 2, 400)],
-    );
+    assert_bars(&got, &[], &[(DAY + 32_880, 50_000), (OPEN + 2, 400)]);
 }
 
 // 26. Former over-count: reconnect at 10:00 receives a prior-day copy for a
@@ -777,7 +775,7 @@ mod randomized {
             trades in prop::collection::vec(trade(), 1..12),
         ) {
             let seg = seg_of(seg_pick);
-            let t0 = DAY + 32_400 + t0_off;
+            let t0 = OPEN + t0_off;
             let (stream, truth) = build(seg, t0, proof_lead, skew, n_proofs, &trades, None);
             let got = run(&stream);
             let total: u64 = truth.iter().map(|t| t.1).sum();
@@ -812,7 +810,7 @@ mod randomized {
             trades in prop::collection::vec(trade(), 2..12),
         ) {
             let seg = seg_of(seg_pick);
-            let t0 = DAY + 32_400 + t0_off;
+            let t0 = OPEN + t0_off;
             let (stream, truth) = build(seg, t0, proof_lead, skew, n_proofs, &trades, Some(head));
             let got = run(&stream);
             let over = over_counts(&diff(&got, &bars_of(&truth)));
@@ -837,7 +835,7 @@ mod randomized {
             trades in prop::collection::vec(trade(), 1..12),
         ) {
             let seg = seg_of(seg_pick);
-            let t0 = DAY + 32_400 + t0_off;
+            let t0 = OPEN + t0_off;
             let (stream, truth) = build(seg, t0, proof_lead, skew, n_proofs, &trades, None);
             let got = run(&stream);
             let folded: Vec<&ParsedTick> = stream.iter().filter(|t| t.exchange_timestamp > DAY).collect();

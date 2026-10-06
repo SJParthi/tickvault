@@ -3661,10 +3661,10 @@ mod tests {
     pub(super) const DAY: u32 = 1_779_321_600;
     /// 09:15:00 IST of [`DAY`].
     const OPEN: u32 = DAY + 33_300;
-    /// 2026-08-28: the CANDLE session opens at 09:00, fifteen minutes before
-    /// the market. Session-gate tests must use THIS, not `OPEN` - a tick at
-    /// 09:14 is now legitimately in-session (it is a pre-open auction tick),
-    /// so asserting it is gated would be asserting the bug this change fixed.
+    /// 09:00:00 IST of [`DAY`], the start of the pre-open auction. From
+    /// 2026-08-28 to 2026-10-05 this was also the candle session open; the
+    /// candle session opens at 09:15 again (`OPEN`), so a tick here is
+    /// refused by the fold.
     pub(super) const CANDLE_OPEN: u32 = DAY + 32_400;
 
     pub(super) const SEG_IDX: u8 = 0;
@@ -4159,7 +4159,9 @@ mod tests {
         const SID: u64 = GAP_SID;
         const OTHER: u64 = GAP_SID + 7;
         let mut pkts: Vec<RestartPkt> = vec![
-            (SID, 21_000, 1000.0, 70, 21_000),
+            // 2026-10-05: 21_660 (15:16), inside the 15:15 hour now that the
+            // grid starts at 09:15 (it was 21_000, inside the 15:00 hour).
+            (SID, 21_660, 1000.0, 70, 21_660),
             (SID, 21_840, 1001.0, 110, 21_840),
             // Traded in the downtime: seen only by the uninterrupted run.
             (SID, 21_960, 1009.0, 150, 21_960),
@@ -4172,7 +4174,7 @@ mod tests {
         pkts.sort_by_key(|p| p.4);
         let truth = restart_bars_until(&pkts, None, true);
         let written = restart_bars_until(&pkts, Some((21_900, 22_020, &[])), true);
-        let hour = (SID, TfIndex::M60, TfIndex::M60.bucket_start(OPEN + 21_000));
+        let hour = (SID, TfIndex::M60, TfIndex::M60.bucket_start(OPEN + 21_660));
         assert_eq!(truth.get(&hour).map(|b| b.volume), Some(80));
         assert!(
             !written.contains_key(&hour),
@@ -4190,7 +4192,10 @@ mod tests {
     /// are withheld too. `behind`: seconds the box clock runs behind.
     #[test]
     fn test_regression_boot_just_before_the_open_withholds_what_it_missed() {
-        let open = CANDLE_OPEN;
+        // 2026-10-05: the candle session opens at 09:15 again, so the boot
+        // window is measured from there; the comments below keep the 09:00
+        // clock times of the original review.
+        let open = OPEN;
         let run = |boot: u32, first: u32, behind: u32| {
             let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
             agg.set_live_capture_start(boot);
@@ -4849,28 +4854,30 @@ mod tests {
             first_bars.len()
         };
         let all = TF_COUNT;
-        // 08:55 IST: five minutes before the 09:00 session open, so its
-        // sockets were listening by then.
-        assert_eq!(run(OPEN - 1_200, false, None), all, "pre-market boot");
+        // 2026-10-05: the candle session opens at 09:15 again, so every boot
+        // instant below moved by +900 s; the comments keep the original
+        // review's reasoning. 09:10 IST: five minutes before the session
+        // open, so its sockets were listening by then.
+        assert_eq!(run(OPEN - 300, false, None), all, "pre-market boot");
         // Review round 24: the capture start is read BEFORE the sockets are
         // dialled, so a boot less than five minutes before the open, or at
         // 09:00:00 exactly, may still be dialling when pre-open packets start
         // at 09:00 (round 20 read "09:00:00" as "nothing could have arrived
         // yet"). This instrument's first receipt, 09:15:05, is its capture
         // start, exactly as after the replay confirmed at 09:00:02 below.
-        assert_eq!(run(OPEN - 1_199, false, None), 0, "boot at 08:55:01");
-        assert_eq!(run(OPEN - 900, false, None), 0, "boot at 09:00:00");
+        assert_eq!(run(OPEN - 299, false, None), 0, "boot at 09:10:01");
+        assert_eq!(run(OPEN, false, None), 0, "boot at 09:15:00");
         // After 09:00, pre-open packets carrying prices but no volume may have
         // arrived while nobody listened, so a first bar that began before the
         // instrument was known to be captured is withheld, not written without
         // them (review round 21 withdrew round 20's 09:07 bound): a boot at
         // 09:05, and an 08:59:40 boot whose replay folded nothing and whose
         // first frame confirmed the capture start at 09:00:02.
-        assert_eq!(run(OPEN - 600, false, None), 0, "boot at 09:05");
+        assert_eq!(run(OPEN - 200, false, None), 0, "boot at 09:11:40");
         assert_eq!(
-            run(OPEN - 920, true, Some(OPEN - 898)),
+            run(OPEN - 20, true, Some(OPEN + 2)),
             0,
-            "capture start confirmed at 09:00:02"
+            "capture start confirmed at 09:15:02"
         );
         // 09:15:10: a restart in the session; every first bar began before
         // this instrument was known to be captured.
@@ -9755,10 +9762,10 @@ mod tests {
     #[test]
     fn test_multi_tf_aggregator_gates_ticks_outside_the_candle_session() {
         let mut agg = MultiTfAggregator::default();
-        // 2026-08-28: `CANDLE_OPEN - 1` (08:59:59) replaces `OPEN - 1`
-        // (09:14:59) as the last gated second - the fifteen pre-open minutes
-        // between them are now captured, which is the point of the change.
-        for ts in [CANDLE_OPEN - 1, DAY, DAY + 56_400, DAY + 86_399] {
+        // 2026-10-05: the candle session opens at the market open again, so
+        // the pre-open auction (09:00-09:14:59) is gated, and 09:14:59 is the
+        // last gated second.
+        for ts in [CANDLE_OPEN, OPEN - 1, DAY, DAY + 56_400, DAY + 86_399] {
             let stats = agg.consume_tick(
                 Feed::Dhan,
                 &tick(13, SEG_IDX, ts, 100.0, 1),
@@ -9770,11 +9777,11 @@ mod tests {
             assert!(stats.out_of_session, "ts {ts} must be gated");
             assert!(!stats.folded());
         }
-        // The first in-session second IS accepted - 09:00:00, the first
-        // second of the NSE pre-open call auction.
+        // The first in-session second IS accepted - 09:15:00, the market
+        // open.
         let stats = agg.consume_tick(
             Feed::Dhan,
-            &tick(13, SEG_IDX, CANDLE_OPEN, 100.0, 1),
+            &tick(13, SEG_IDX, OPEN, 100.0, 1),
             None,
             ignore_seal,
         );
@@ -11807,8 +11814,8 @@ mod out_of_band_timestamp_tests {
     fn an_in_band_stamp_is_untouched_by_the_split() {
         let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::REFOLD, 4);
 
-        let mut t = tick(13, SEG_IDX, CANDLE_OPEN + 60, 100.0, 10);
-        t.received_at_nanos = (i64::from(CANDLE_OPEN) + 62 - 19_800) * 1_000_000_000;
+        let mut t = tick(13, SEG_IDX, CANDLE_OPEN + 960, 100.0, 10);
+        t.received_at_nanos = (i64::from(CANDLE_OPEN) + 962 - 19_800) * 1_000_000_000;
 
         let stats = agg.consume_tick(Feed::Dhan, &t, None, ignore_seal);
 
@@ -11829,7 +11836,7 @@ mod out_of_band_timestamp_tests {
             "an instrument with no slot has no price"
         );
 
-        let t = tick(77, 2, CANDLE_OPEN + 60, 101.25, 500);
+        let t = tick(77, 2, CANDLE_OPEN + 960, 101.25, 500);
         let _ = agg.consume_tick(Feed::Dhan, &t, None, ignore_seal);
 
         let got = agg
@@ -11846,7 +11853,7 @@ mod out_of_band_timestamp_tests {
         // I-P1-11: Dhan reuses the same numeric id across segments. Keyed on the
         // bare id, an index would answer with a same-numbered option's price.
         let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
-        let t = tick(27, 2, CANDLE_OPEN + 60, 55.5, 100);
+        let t = tick(27, 2, CANDLE_OPEN + 960, 55.5, 100);
         let _ = agg.consume_tick(Feed::Dhan, &t, None, ignore_seal);
         assert!(agg.last_ltp(Feed::Dhan, 27, 2).is_some());
         assert_eq!(

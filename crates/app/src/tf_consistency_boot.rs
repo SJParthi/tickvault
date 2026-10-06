@@ -193,22 +193,19 @@ const SECS_PER_DAY: i64 = 86_400;
 /// `TfIndex::bucket_start` anchors. Left at 09:15 it would have reported the
 /// day's fifteen pre-open buckets as unexpected extras on every timeframe,
 /// every day - a self-inflicted alarm about the feature working correctly.
-/// The drift assert below therefore moves from the market-open constant to an
-/// explicit ordering check; `MARKET_OPEN_IST_NANOS` itself is UNCHANGED and
-/// still means 09:15 everywhere else in the tree.
-const SESSION_OPEN_SECS_OF_DAY_IST: u32 = 32_400;
+/// **REVERSED 2026-10-05** (operator: candles start at 09:15, no pre-open
+/// bar in any timeframe): `TfIndex::bucket_start` anchors at 09:15 again, so
+/// this grid does too. Left at 09:00 it would expect fifteen pre-open
+/// buckets the fold no longer seals, and would label M30/H1 windows 09:00 /
+/// 09:30 while the stored rows sit at 09:15 / 09:45.
+const SESSION_OPEN_SECS_OF_DAY_IST: u32 = 33_300;
 /// 15:30:00 IST as seconds-of-day (exclusive session close).
 // 2026-08-07: 55_800 (15:30) -> 56_400 (15:40) with the NSE CAS change of
 // 2026-08-03 (see `MARKET_CLOSE_IST_NANOS`); the assert below pins the drift.
 const SESSION_CLOSE_SECS_OF_DAY_IST: u32 = 56_400;
 const _: () = assert!(
-    SESSION_OPEN_SECS_OF_DAY_IST as i64 * NANOS_PER_SEC < MARKET_OPEN_IST_NANOS,
-    "the candle session must open BEFORE the market open, never at or after it"
-);
-const _: () = assert!(
-    MARKET_OPEN_IST_NANOS - SESSION_OPEN_SECS_OF_DAY_IST as i64 * NANOS_PER_SEC
-        == 900 * NANOS_PER_SEC,
-    "the pre-open capture window is exactly 15 minutes (09:00-09:15 IST)"
+    SESSION_OPEN_SECS_OF_DAY_IST as i64 * NANOS_PER_SEC == MARKET_OPEN_IST_NANOS,
+    "the candle grid opens at the market open (09:15 IST)"
 );
 const _: () = assert!(
     SESSION_CLOSE_SECS_OF_DAY_IST as i64 * NANOS_PER_SEC == MARKET_CLOSE_IST_NANOS,
@@ -2612,15 +2609,15 @@ mod tests {
     #[test]
     fn test_bucket_grid_daily_counts_all_3_tfs() {
         // 2026-08-28: 385 -> 400 minute session (09:00 pre-open open).
-        // M3 129->134, M5 77->80, M15 26->27.
+        // 2026-10-05: back to 385 (candles start at 09:15 again).
         let expected: [(TfIndex, usize); 3] =
-            [(TfIndex::M3, 134), (TfIndex::M5, 80), (TfIndex::M15, 27)];
+            [(TfIndex::M3, 129), (TfIndex::M5, 77), (TfIndex::M15, 26)];
         for (tf, count) in expected {
             let grid = bucket_grid(tf.seconds_per_bucket());
             assert_eq!(grid.len(), count, "window count for {}", tf.display_name());
-            // ceil(400 / S_minutes) cross-check computed independently.
+            // ceil(385 / S_minutes) cross-check computed independently.
             let s_min = (tf.seconds_per_bucket() / 60) as usize;
-            assert_eq!(count, 400usize.div_ceil(s_min), "{}", tf.display_name());
+            assert_eq!(count, 385usize.div_ceil(s_min), "{}", tf.display_name());
             // Exactly the last window is final; every end ≤ 15:30.
             assert!(grid.last().is_some_and(|w| w.is_final));
             assert_eq!(grid.iter().filter(|w| w.is_final).count(), 1);
@@ -2633,30 +2630,29 @@ mod tests {
 
     #[test]
     fn test_bucket_grid_partial_final_windows_truncate_at_close() {
-        // 2026-08-28: from a 09:00 open the 400-minute session is EVEN, so
-        // M2's last window is now a full two minutes [15:38, 15:40) rather
-        // than the single-minute partial the 09:15/385 grid produced.
+        // 2026-10-05: from the 09:15 open the 385-minute session is ODD, so
+        // M2's last window is the single-minute partial [15:39, 15:40).
         let m2 = bucket_grid(120);
         let last = m2.last().expect("windows");
-        assert_eq!(last.start_secs_of_day, 15 * 3600 + 38 * 60);
+        assert_eq!(last.start_secs_of_day, 15 * 3600 + 39 * 60);
         assert_eq!(
             last.end_effective_secs_of_day,
             SESSION_CLOSE_SECS_OF_DAY_IST
         );
-        // H1's last window is [15:00, 16:00) effective 15:40 — clock-aligned
-        // since 2026-08-28 (was 15:15 on the 09:15-relative grid).
+        // H1's last window is [15:15, 16:15) effective 15:40 (09:15-relative
+        // grid again since 2026-10-05).
         let h1 = bucket_grid(3_600);
         let last = h1.last().expect("windows");
-        assert_eq!(last.start_secs_of_day, 15 * 3600);
+        assert_eq!(last.start_secs_of_day, 15 * 3600 + 15 * 60);
         assert_eq!(
             last.end_effective_secs_of_day,
             SESSION_CLOSE_SECS_OF_DAY_IST
         );
-        // H4's last window is [13:00, 17:00) effective 15:40 — clock-aligned
-        // since 2026-08-28 (was 13:15 on the 09:15-relative grid).
+        // H4's last window is [13:15, 17:15) effective 15:40 (09:15-relative
+        // grid again since 2026-10-05).
         let h4 = bucket_grid(14_400);
         let last = h4.last().expect("windows");
-        assert_eq!(last.start_secs_of_day, 13 * 3600);
+        assert_eq!(last.start_secs_of_day, 13 * 3600 + 15 * 60);
         assert_eq!(
             last.end_effective_secs_of_day,
             SESSION_CLOSE_SECS_OF_DAY_IST
@@ -2723,19 +2719,19 @@ mod tests {
                 .iter()
                 .any(|w| w.start_secs_of_day == 33_300)
         );
-        // 2026-08-28: H1 and M30 are the two frames whose grid MOVED with
-        // the 09:00 anchor (900 s does not divide 3_600 or 1_800). H1's
-        // labels are now clock-aligned 09:00/10:00/... so 15:00 replaces
-        // 15:15; M30's are 09:00/09:30/... so 09:30 (34_200) replaces 09:45.
+        // 2026-10-05: H1 and M30 are the two frames whose grid moves with
+        // the anchor (900 s does not divide 3_600 or 1_800). Back on the
+        // 09:15 anchor, H1's labels are 09:15/10:15/.../15:15 and M30's are
+        // 09:15/09:45/..., so 15:15 (54_900) and 09:45 (35_100) are on grid.
         assert!(
             bucket_grid(3_600)
                 .iter()
-                .any(|w| w.start_secs_of_day == 54_000)
+                .any(|w| w.start_secs_of_day == 54_900)
         );
         assert!(
             bucket_grid(1_800)
                 .iter()
-                .any(|w| w.start_secs_of_day == 34_200)
+                .any(|w| w.start_secs_of_day == 35_100)
         );
     }
 
@@ -2748,10 +2744,9 @@ mod tests {
         assert!(!is_on_grid(i64::from(SESSION_CLOSE_SECS_OF_DAY_IST), 300));
         assert!(!is_on_grid(0, 300));
         assert!(!is_on_grid(-60, 300));
-        // H1 grid: 15:00 on (2026-08-28 - clock-aligned from the 09:00
-        // anchor; 15:15 was the 09:15-relative label and is now OFF grid).
-        assert!(is_on_grid(54_000, 3_600));
-        assert!(!is_on_grid(54_900, 3_600));
+        // H1 grid: 15:15 on, 15:00 off (09:15 anchor again since 2026-10-05).
+        assert!(is_on_grid(54_900, 3_600));
+        assert!(!is_on_grid(54_000, 3_600));
         assert!(!is_on_grid(54_060, 3_600));
     }
 
@@ -3476,17 +3471,13 @@ mod tests {
 
     #[test]
     fn test_session_bounds_agree_with_common_constants() {
-        assert_eq!(SESSION_OPEN_SECS_OF_DAY_IST, 32_400);
+        // 2026-10-05: back to 09:15 (candles start at the market open).
+        assert_eq!(SESSION_OPEN_SECS_OF_DAY_IST, 33_300);
         // 2026-08-07: 15:30 -> 15:40 (NSE CAS change 2026-08-03).
         assert_eq!(SESSION_CLOSE_SECS_OF_DAY_IST, 56_400);
-        // 2026-08-28: the grid open is deliberately EARLIER than the market
-        // open, so this is an ordering check now, not equality. Equality here
-        // is what would silently drag the candle grid back to 09:15.
-        assert!(i64::from(SESSION_OPEN_SECS_OF_DAY_IST) * NANOS_PER_SEC < MARKET_OPEN_IST_NANOS);
         assert_eq!(
-            MARKET_OPEN_IST_NANOS - i64::from(SESSION_OPEN_SECS_OF_DAY_IST) * NANOS_PER_SEC,
-            900 * NANOS_PER_SEC,
-            "the pre-open capture window is exactly 15 minutes"
+            i64::from(SESSION_OPEN_SECS_OF_DAY_IST) * NANOS_PER_SEC,
+            MARKET_OPEN_IST_NANOS
         );
         assert_eq!(
             i64::from(SESSION_CLOSE_SECS_OF_DAY_IST) * NANOS_PER_SEC,
@@ -3529,15 +3520,14 @@ mod tests {
         // Boundary: exactly 15:40:00 is OUT of session (close is exclusive).
         let at_close = vec![row(56_400, 1.0, 1.0, 1.0, 1.0, 0, 1)];
         assert!(has_out_of_session_1m_row(&at_close, DAY_START));
-        // Boundary: 08:59:59 is OUT; 09:00:00 and 15:29:00 are IN.
-        // 2026-08-28: 09:14:59 (33_299) is now legitimately IN session - it
-        // is a pre-open auction minute, which is the whole point of the
-        // change. The out-of-session boundary moved to 08:59:59 (32_399).
-        let before_preopen = vec![row(32_399, 1.0, 1.0, 1.0, 1.0, 0, 1)];
-        assert!(has_out_of_session_1m_row(&before_preopen, DAY_START));
+        // Boundary: 09:14:59 is OUT; 09:15:00 and 15:39:00 are IN.
+        // 2026-10-05: no pre-open bar exists any more, so a 09:00-09:14 1m
+        // row is out of session again.
+        let before_open = vec![row(33_299, 1.0, 1.0, 1.0, 1.0, 0, 1)];
+        assert!(has_out_of_session_1m_row(&before_open, DAY_START));
+        let pre_open = vec![row(32_400, 1.0, 1.0, 1.0, 1.0, 0, 1)];
+        assert!(has_out_of_session_1m_row(&pre_open, DAY_START));
         let in_session = vec![
-            row(32_400, 1.0, 1.0, 1.0, 1.0, 0, 1),
-            row(33_299, 1.0, 1.0, 1.0, 1.0, 0, 1),
             row(33_300, 1.0, 1.0, 1.0, 1.0, 0, 1),
             row(55_740, 1.0, 1.0, 1.0, 1.0, 0, 1),
         ];
