@@ -4158,6 +4158,41 @@ everything whatever is recommended dude okay?" (plan ITEM 51a;
   audit_rows_lost`) pages again. The two say different things (rows lost; the
   day not recorded), so both stay.
 
+**2026-10-06 note (51b review) — `xverify_failed` gains `reason =
+"skipped_no_time"` and pages once per day across processes; a deliberate
+persist stop leaves the §2.10 group.** Same owner approvals as the note above
+(plan ITEM 51b; `no-rest-except-live-feed-2026-06-27.md` §12.15.8, its Evening
+attempt and Page rows). Recorded BEFORE the code.
+
+- **NO** new alarm, metric filter, EMF name, dimension or `ok_actions`. No
+  terraform change.
+- `xverify_failed` gains one emit condition and keeps its meaning (today's
+  check did not record; S3 is held): a day whose only attempt in this process
+  was skipped for time pages it at the skip, `reason = "skipped_no_time"`,
+  unless today's paged marker (task `dhan_live_crossverify_paged`) shows a page
+  already went out. Before the review the code only logged that day, on the
+  unchecked belief that an earlier process had paged; when that process died
+  before its last attempt, or none ran, the day was unverified and nobody was
+  told.
+- Fewer pages, never more per day: every final-failure page writes the paged
+  marker, and while it exists a later final failure the same day is a coded
+  `warn!` (`xverify_already_paged_today`) instead of a second page. The
+  divergence page (`xverify_diverged`) is unaffected.
+- A persist the code stops on purpose at its deadline (`xverify_persist_stopped_at_deadline`,
+  `xverify_options_persist_stopped_at_deadline`) no longer adds to
+  `tv_dhan_feed_xverify_persist_errors_total` or
+  `tv_dhan_live_xverify_audit_rows_discarded_total`: those are §2.10
+  `audit_rows` members, so each stop paged `tv-<env>-audit-rows-lost` per
+  attempt, against §12.15.5 (page once, after the last attempt) and §12.15.6
+  (the option pass never pages). The rows are recomputable and the day's last
+  attempt still pages `xverify_failed` (`reason = "not_persisted"`). The stop
+  is counted on the local-only `tv_dhan_xverify_persist_deadline_stops_total`
+  and `tv_dhan_live_xverify_audit_rows_abandoned_total`. A flush that FAILS
+  still counts on both §2.10 members and still pages, unchanged. This narrows
+  what reaches the group; it adds no counter to it and widens no slice.
+- New log-sink-only coded `warn!` sources: `xverify_already_paged_today`,
+  `xverify_paged_marker_write_failed`.
+
 ---
 
 ## §2.6 — 2026-09-25: three live-lane pages for DELAY, not only for loss — feed delay, main-feed reconnect time, blank new depth contracts

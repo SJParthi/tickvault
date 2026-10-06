@@ -96,21 +96,29 @@ partitions age past the hot window.
 
 Authority: `no-rest-except-live-feed-2026-06-27.md` §12.15.8. Every line
 below is emitted with `code = "WS-GAP-03"` (`ErrorCode::WsGapConnectionState`)
-from `crates/app/src/dhan_live_crossverify_boot.rs`. All six are
-log-sink-only (no alarm, no filter, no page). When the attempt they describe
-was the day's last, the existing `xverify_failed` page fires after it with
-`reason = "incomplete"` (`"not_persisted"` after a persist stopped at the
-deadline), except on a day on which no attempt ran in this process, which ends
-on `xverify_day_not_attempted` and does not page.
+from `crates/app/src/dhan_live_crossverify_boot.rs`. Every row is
+log-sink-only (no alarm, no filter, no page) except the one
+`xverify_failed` row, which is the existing page. When the attempt a line
+describes was the day's last, the existing `xverify_failed` page fires after
+it with `reason = "incomplete"` (`"not_persisted"` after a persist stopped at
+the deadline), unless today's paged marker shows the day was already paged
+(then `xverify_already_paged_today`). A persist stopped at its deadline counts
+only on the local-only `tv_dhan_xverify_persist_deadline_stops_total{pass}`
+and `tv_dhan_live_xverify_audit_rows_abandoned_total`, never on the
+`audit-rows-lost` page's counters: a failed flush still pages there, a
+deliberate stop does not.
 
 | Line | Level | Means | Operator action |
 |---|---|---|---|
 | `source = "xverify_attempt_timed_out"` | WARN (per attempt) | the attempt (token wait + run) did not finish within its limit (`limit_secs`) and was stopped at its last wait, or (`stage = "marker"`) it reached the limit before writing the marker; either way it ends before the 17:25 scheduled stop; this attempt does not record today | check how long the token took and whether QuestDB or the vendor was slow (`make doctor`); the next attempt, if any, runs at full budget |
-| `source = "xverify_attempt_skipped_no_time"` | WARN (per attempt) | the attempt started too late to run at least 120 s of comparison and still end by 17:23 IST, so it was not started (`start_ist_secs`); typically a restart between about 17:15 and 17:45 | none needed for the attempt itself; if the day stayed unverified, a restart after 17:45 or the next day's run cannot re-check it today — the S3 hold ceiling applies |
+| `source = "xverify_attempt_skipped_no_time"` | WARN (per attempt) | the attempt started too late to run at least 120 s of comparison and still end by 17:23 IST, so it was not started (`start_ist_secs`); typically a restart between about 17:15 and 17:45. When nothing ran before it in this process, the day is reported at once (next rows) and one attempt is made at 17:45 if the box is still up | none for the attempt itself; if the box is meant to stay up this evening, leave it up past 17:45 and the day is checked then |
+| `source = "xverify_failed"`, `reason = "skipped_no_time"` | ERROR (pages, once a day at most) | the day's only attempt in this process was skipped for time and no page went out today (no paged marker), so nobody had been told today is unverified; today's S3 archive stays held. One attempt follows at 17:45 if the box is still up | if the box stays up, wait for the 17:45 attempt (its result is logged; a failure does not page again); otherwise today cannot be re-checked and the S3 hold ceiling applies |
+| `source = "xverify_day_not_attempted"` | WARN (once a day at most) | as above, but today's paged marker (`path`) shows a page already went out today, so this process does not page again; today's S3 archive stays held | nothing more for the page; if the box stays up past 17:45 one more attempt runs |
+| `source = "xverify_already_paged_today"` | WARN (once a day at most) | a final failure (`reason`) after today's page already went out (paged marker `path`); not paged again | the earlier page's action applies; the S3 hold stays until a later run records the day or the hold ceiling |
+| `source = "xverify_paged_marker_write_failed"` | WARN | a page went out but the paged marker could not be saved, so a later failure the same day may page again | free disk space, then check permissions on `data/state/daily` |
 | `source = "xverify_options_timed_out"` | WARN (once a day at most) | the depth-held option pass did not finish within its limit and was stopped; outcome label `timed_out` on `tv_dhan_xverify_option_pass_total` | none required (the option pass never holds S3 or pages); if it repeats, check vendor latency |
-| `source = "xverify_persist_stopped_at_deadline"` | WARN (per attempt) | the audit persist stopped because its next flush, in the database client's worst case (5 s + the buffer at 100 KiB/s), could not finish by the attempt's limit; buffered rows were discarded (`rows_discarded`), the rest never written (`rows_not_written`); the attempt fails `not_persisted`, no marker | check QuestDB write latency and apply lag (`make doctor`); the comparison is recomputable, so the next attempt or the next day re-writes it (DEDUP-idempotent) |
-| `source = "xverify_options_persist_stopped_at_deadline"` | WARN (once a day at most) | the option pass's audit persist stopped the same way before its own limit (`discarded`, `not_written`) | none required (the option pass never holds S3 or pages); if it repeats, check QuestDB write latency |
-| `source = "xverify_day_not_attempted"` | WARN (once a day at most) | the day's only attempt in this process was skipped for time (see `xverify_attempt_skipped_no_time`), so nothing was compared here and nothing is paged; today's S3 archive stays held | if an earlier process already paged `xverify_failed` today, nothing more; otherwise today cannot be re-checked before the stop, and the S3 hold ceiling applies |
+| `source = "xverify_persist_stopped_at_deadline"` | WARN (per attempt) | the audit persist stopped because its next flush, in the database client's worst case (5 s + the buffer at 100 KiB/s), could not finish by the attempt's limit; buffered rows were abandoned (`rows_abandoned`), the rest never written (`rows_not_written`); the attempt fails `not_persisted`, no marker | check QuestDB write latency and apply lag (`make doctor`); the comparison is recomputable, so the next attempt or the next day re-writes it (DEDUP-idempotent) |
+| `source = "xverify_options_persist_stopped_at_deadline"` | WARN (once a day at most) | the option pass's audit persist stopped the same way before its own limit (`abandoned`, `not_written`) | none required (the option pass never holds S3 or pages); if it repeats, check QuestDB write latency |
 
 **Honest limit:** the timeout can stop an attempt only while it waits (token,
 database read, vendor fetch). The audit write runs after the comparison
