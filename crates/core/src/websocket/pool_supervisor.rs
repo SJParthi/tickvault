@@ -1692,6 +1692,13 @@ struct OverflowEpisode {
     /// a teardown that neither fails nor restarts its watch (a depth socket's
     /// frame silence). No pass until its next completed dial.
     watched_down: bool,
+    /// Review fix 2026-10-06, round 7: a window of this episode failed and no
+    /// window has passed since. A wait that then finds nothing of this pool
+    /// parked does NOT end the episode as `Recovered`: the failed socket may
+    /// have left for good (parked for 808, say) and never re-parks, and a
+    /// silent `Recovered` would re-permit the main-feed widen with no probe
+    /// ever passed. Cleared only by a pass.
+    failed_since_pass: bool,
 }
 
 impl OverflowEpisode {
@@ -1722,6 +1729,7 @@ impl OverflowEpisode {
             settle_until: None,
             watch_restarted: false,
             watched_down: false,
+            failed_since_pass: false,
         }
     }
 
@@ -2032,7 +2040,9 @@ impl OverflowEpisode {
     /// Socket `slot` parked for a reason other than 805 and other than an
     /// orderly shutdown (review fix 2026-10-06). The probed socket parking
     /// fails the window: it will not come back this session, so it cannot
-    /// pass. A noted sibling is dropped from the window (it opens no
+    /// pass. It never re-parks either, so the episode it leaves `Waiting`
+    /// cannot end as `Recovered` with nothing parked (round 7,
+    /// `failed_since_pass`): the main-feed widen stays refused. A noted sibling is dropped from the window (it opens no
     /// connection). O(1).
     fn on_left(&mut self, slot: u8, now: Instant) -> OverflowEpisodeEffect {
         if self.watched() == Some(slot) {
@@ -2160,8 +2170,19 @@ impl OverflowEpisode {
                 // day. `phase_since` is KEPT: a socket of this pool that
                 // registers its park late reopens the wait from the same 805
                 // (`on_parked`).
+                //
+                // Review fix 2026-10-06, round 7: only when no window of this
+                // episode has failed since the last pass. After a failed
+                // window whose socket left for good (a non-805 park ends its
+                // task, so it never re-parks) nothing is parked either, but
+                // the account last answered 805 and no probe has passed: the
+                // episode stays `Waiting`, the widen stays refused, and the
+                // failure was already logged. A later 805 park reopens the
+                // normal probe from here.
                 if self.parked_mask == 0 {
-                    self.phase = OverflowEpisodePhase::Recovered;
+                    if !self.failed_since_pass {
+                        self.phase = OverflowEpisodePhase::Recovered;
+                    }
                     return OverflowEpisodeEffect::default();
                 }
                 if !window_open {
@@ -2247,6 +2268,7 @@ impl OverflowEpisode {
                             return self.fail_deferral_exhausted(now);
                         }
                         self.clear_attribution();
+                        self.failed_since_pass = false;
                         let passed = if self.phase == OverflowEpisodePhase::Probing {
                             OverflowProbeOutcome::ProbePassed
                         } else {
@@ -2319,7 +2341,9 @@ impl OverflowEpisode {
     }
 
     /// A window failed: re-park the watched socket; another probe later, or
-    /// down for the session once the attempts are spent.
+    /// down for the session once the attempts are spent. Until a later window
+    /// passes, a wait that finds nothing parked keeps the episode `Waiting`
+    /// (`failed_since_pass`).
     fn fail(&mut self, outcome: OverflowProbeOutcome, now: Instant) -> OverflowEpisodeEffect {
         let slot = self.watched_slot;
         self.watched_slot = u8::MAX;
@@ -2327,6 +2351,7 @@ impl OverflowEpisode {
         self.first_frame_at = None;
         self.watch_restarted = false;
         self.clear_attribution();
+        self.failed_since_pass = true;
         let then = if self.probes_started >= self.kind.max_attempts() {
             self.phase = OverflowEpisodePhase::DownForSession;
             self.phase_since = None;
@@ -20469,6 +20494,154 @@ mod tests {
         }
     }
 
+    /// Review round 7: the probed socket was the ONLY one parked for 805 and
+    /// it parks for 808 inside its window. Its task ends, so it never
+    /// re-parks; the wait then finds nothing parked. That must not end the
+    /// episode as a silent `Recovered`, which would re-permit the main-feed
+    /// widen with no probe ever passed.
+    #[test]
+    fn test_a_failed_window_whose_socket_left_never_recovers_silently() {
+        let start = t0();
+        let (mut ep, granted) = probing(2, &[], start);
+        assert!(!ep.widen_permitted());
+        let left_at = granted + secs(30);
+        let fail = ep.on_left(2, left_at);
+        assert_eq!(
+            fail.outcomes,
+            [Some(OverflowProbeOutcome::FailedWatchedClosed), None],
+            "the failure is reported, once"
+        );
+        assert_eq!(ep.parked_mask, 0, "the socket never re-parks");
+        // Every poll through and well past the next delay: no outcome, no
+        // grant, and the widen stays refused.
+        let delay = OVERFLOW_PROBE_DELAYS_SECS[1];
+        for s in [1, delay - 1, delay, delay + 1, 5 * delay] {
+            assert_eq!(
+                ep.poll(left_at + secs(s), true),
+                OverflowEpisodeEffect::default(),
+                "+{s} s"
+            );
+            assert_eq!(ep.phase, OverflowEpisodePhase::Waiting, "+{s} s");
+            assert!(!ep.widen_permitted(), "+{s} s");
+        }
+        assert_eq!(ep.probes_started, 1, "no probe granted to nothing");
+        // A later 805 that parks a socket probes as normal, and only its pass
+        // ends the episode as Recovered.
+        let again = left_at + secs(6 * delay);
+        assert_eq!(ep.on_overflow(again), OverflowEpisodeEffect::default());
+        ep.on_parked(3);
+        assert_eq!(
+            ep.poll(again + secs(delay), true).outcomes[0],
+            Some(OverflowProbeOutcome::ProbeGranted)
+        );
+        let granted2 = again + secs(delay);
+        ep.on_first_frame(3, granted2 + secs(1));
+        let pass = ep.poll(granted2 + secs(1 + OVERFLOW_PROBE_WATCH_SECS), true);
+        assert_eq!(
+            pass.outcomes,
+            [
+                Some(OverflowProbeOutcome::ProbePassed),
+                Some(OverflowProbeOutcome::Recovered)
+            ]
+        );
+        assert!(ep.widen_permitted());
+    }
+
+    /// Review round 7: the same holds for a failed RELEASE whose socket left,
+    /// and for a failure through any path (here: no first frame). An 805 that
+    /// parked nothing of this pool, with no window ever failed, still ends
+    /// the episode silently (the depth-only case).
+    #[test]
+    fn test_only_an_episode_with_no_failed_window_recovers_with_nothing_parked() {
+        let start = t0();
+        // Release: probe 2 passes, slot 3 is released, then parks for 808.
+        let (mut ep, granted) = probing(2, &[3], start);
+        let released = granted + secs(1 + OVERFLOW_PROBE_WATCH_SECS);
+        assert_eq!(
+            ep.poll(released, true).outcomes,
+            [
+                Some(OverflowProbeOutcome::ProbePassed),
+                Some(OverflowProbeOutcome::ReleaseGranted)
+            ]
+        );
+        assert_eq!(
+            ep.on_left(3, released + secs(10)).outcomes[0],
+            Some(OverflowProbeOutcome::FailedWatchedClosed)
+        );
+        let _ = ep.poll(
+            released + secs(10 + 10 * OVERFLOW_PROBE_DELAYS_SECS[2]),
+            true,
+        );
+        assert_eq!(ep.phase, OverflowEpisodePhase::Waiting);
+        assert!(!ep.widen_permitted());
+        // No first frame, and the socket never re-parks.
+        let (mut ep, granted) = {
+            let mut ep = episode_after_805(&[5], start);
+            let g = grant_first_probe(&mut ep, start);
+            (ep, g)
+        };
+        let failed_at = granted + secs(OVERFLOW_PROBE_FIRST_FRAME_DEADLINE_SECS);
+        assert_eq!(
+            ep.poll(failed_at, true).outcomes[0],
+            Some(OverflowProbeOutcome::FailedNoFrame)
+        );
+        let _ = ep.poll(failed_at + secs(10 * OVERFLOW_PROBE_DELAYS_SECS[2]), true);
+        assert_eq!(ep.phase, OverflowEpisodePhase::Waiting);
+        assert!(!ep.widen_permitted());
+        // No window ever ran: the depth-only 805 still ends silently.
+        let mut ep = episode_after_805(&[], start);
+        assert_eq!(
+            ep.poll(start + secs(OVERFLOW_PROBE_DELAYS_SECS[0]), true),
+            OverflowEpisodeEffect::default()
+        );
+        assert_eq!(ep.phase, OverflowEpisodePhase::Recovered);
+        assert!(ep.widen_permitted());
+    }
+
+    /// Review round 7: depth sockets sit at global index 8 and up. A no-code
+    /// close from such a slot follows the same rules as a low one: the probed
+    /// depth socket's own close fails its window, and a depth sibling knocked
+    /// off right after another socket's dial is an eviction.
+    #[test]
+    fn test_high_slot_closers_follow_the_same_attribution_rules() {
+        let start = t0();
+        let granted = start + depth_delay(0);
+        // The probed depth socket (slot 9) drops with no code.
+        let mut eps = episodes_after_805(&[], &[9, 12], start);
+        let _ = eps.poll(granted, true);
+        assert_eq!(eps.depth.watched(), Some(9));
+        let own = eps.on_bare_reset(9, 0, granted + secs(5));
+        assert_eq!(
+            own.depth.outcomes[0],
+            Some(OverflowProbeOutcome::FailedBareReset)
+        );
+        assert_eq!(own.depth.repark, Some(9));
+        // A depth sibling (slot 13) drops right after the probed socket's own
+        // dial (slot 9): corroborated eviction.
+        let mut eps = episodes_after_805(&[], &[9, 12], start);
+        let _ = eps.poll(granted, true);
+        let evicted = eps.on_bare_reset(13, 1 << 9, granted + secs(5));
+        assert_eq!(
+            evicted.depth.outcomes[0],
+            Some(OverflowProbeOutcome::FailedEvictionCorroborated)
+        );
+        assert_eq!(evicted.depth.sibling, Some(13));
+        // A depth sibling dropping during a MAIN-FEED probe, right after the
+        // probe's dial (slot 2): corroborated too.
+        let (mut ep, granted) = probing(2, &[], start);
+        let fail = ep.on_bare_reset(14, 1 << 2, granted + secs(5));
+        assert_eq!(
+            fail.outcomes[0],
+            Some(OverflowProbeOutcome::FailedEvictionCorroborated)
+        );
+        // A probed main-feed socket at a high slot fails on its own close.
+        let (mut ep, granted) = probing(10, &[], start);
+        assert_eq!(
+            ep.on_bare_reset(10, 0, granted + secs(5)).outcomes[0],
+            Some(OverflowProbeOutcome::FailedBareReset)
+        );
+    }
+
     #[test]
     fn test_coded_sibling_close_is_noted_and_must_heal() {
         let start = t0();
@@ -21419,6 +21592,58 @@ mod tests {
                         OverflowProbeOutcome::SiblingHealed => prop_assert!(op == 3 || op == 10),
                         _ => {}
                     }
+                }
+                // Review round 7: the other direction. Every no-code close
+                // inside a window gets the outcome its rule asks for, so a
+                // rule that stops firing (for a depth slot, say) fails here,
+                // not only a rule that fires wrongly.
+                if op == 1
+                    && let Some(watched) = ep_before.watched()
+                {
+                    let bit = 1u32.checked_shl(u32::from(slot));
+                    let expected = match bit {
+                        _ if slot == watched => OverflowProbeOutcome::FailedBareReset,
+                        None => OverflowProbeOutcome::FailedBareReset,
+                        Some(bit) => {
+                            let burst_running = ep_before.burst_start.is_some_and(|s| {
+                                now.saturating_duration_since(s)
+                                    <= Duration::from_millis(OVERFLOW_PROBE_SIBLING_BURST_MS)
+                            });
+                            let burst = bit
+                                | if burst_running {
+                                    ep_before.burst_mask
+                                } else {
+                                    0
+                                };
+                            if mask & !bit & !burst != 0 {
+                                OverflowProbeOutcome::FailedEvictionCorroborated
+                            } else if ep_before.past_note_cutoff(now) {
+                                OverflowProbeOutcome::FailedDeferralExhausted
+                            } else {
+                                OverflowProbeOutcome::SiblingResetNoted
+                            }
+                        }
+                    };
+                    prop_assert_eq!(effect.outcomes[0], Some(expected), "slot {}", slot);
+                }
+                // And a noted sibling past its own heal deadline fails the
+                // window at the next poll, every time.
+                if op == 7 && ep_before.watched().is_some() {
+                    let mut overdue = false;
+                    for s in 0..GHOST_REDIAL_SLOTS {
+                        if ep_before.suspect_mask & (1u32 << s) != 0 {
+                            overdue |= ep_before.suspect_since[s].is_none_or(|since| {
+                                now.saturating_duration_since(since)
+                                    >= Duration::from_secs(
+                                        OVERFLOW_PROBE_SIBLING_HEAL_DEADLINE_SECS,
+                                    )
+                            });
+                        }
+                    }
+                    prop_assert_eq!(
+                        effect.outcomes[0] == Some(OverflowProbeOutcome::FailedSiblingUnhealed),
+                        overdue
+                    );
                 }
             }
             // Round 5/6: `watched_down` only ever marks a running

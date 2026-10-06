@@ -8900,3 +8900,25 @@ REJECT (review round 6):
 - Removes the probed-socket redial and dial ops from
   `proptest_attribution_rules`, or the seeded coverage test that proves the
   generator reaches them.
+
+#### Review round 7 (2026-10-06, same day, same owner approval)
+
+Two more gaps, both measured in source on this branch before the fix:
+
+| Surface | Was | Now |
+|---|---|---|
+| A failed window whose probed socket left for good | the probed socket parking for a reason other than 805 (808, 804 after its respawn) fails the window, and its task ends, so it never re-parks. If it was the only socket of its pool parked for 805, the next wait found nothing parked and took the branch written for a depth-only 805 ("none of this pool's sockets parked"): the episode ended as `Recovered` with no log line, and the main-feed widen was permitted again although no probe had passed. A new socket could then open into an account that last answered 805, and Dhan would evict an older healthy one. The same held after any failure (no first frame, for example) whose socket never re-parked | every failed window sets `failed_since_pass`, and only a pass clears it. While it is set, a wait that finds nothing parked keeps the episode `Waiting` (the widen stays refused, no grant to nothing); a later 805 park is probed as normal and only its pass ends the episode as `Recovered`. An 805 with no window of this pool ever failed (the depth-only case) still ends silently as before. The failure itself is already logged once (`failed_watched_closed`, `failed_no_frame` and so on). One bool, O(1). Verified by `test_a_failed_window_whose_socket_left_never_recovers_silently` and `test_only_an_episode_with_no_failed_window_recovers_with_nothing_parked` (bite-checked: both fail without the guard) |
+| The randomized attribution test | checked only one direction: when a failure fired, its rule matched. It never checked that a matching input produced the failure, and every example used low slot numbers, so limiting the eviction rule, or the probed socket's own no-code close, to slots below 8 (every depth socket) passed every test | `proptest_attribution_rules` now computes the expected outcome of every no-code close inside a window (probed socket or a slot outside the register: `failed_bare_reset`; corroborated: `failed_eviction_corroborated`; past the cutoff: `failed_deferral_exhausted`; else `sibling_reset_noted`) and checks that a poll fails the window as `failed_sibling_unhealed` exactly when a noted sibling is past its 120 s heal deadline; `test_high_slot_closers_follow_the_same_attribution_rules` drives closers at global index 8 and up. Bite-checked: limiting the eviction rule, the probed-socket rule or the heal deadline to slots below 8 each fails it |
+
+**Honest limit:** after a failed window whose socket left for good, the
+widen stays refused for the rest of the session unless another 805 parks a
+socket of that pool and its probe passes. A main-feed widen is lost for the
+day; no running socket is touched. Errs toward refusing.
+
+REJECT (review round 7):
+
+- Ends an episode as `Recovered` with nothing parked after a window of it
+  failed and no window has passed since, or clears `failed_since_pass`
+  anywhere but a pass.
+- Removes the expected-outcome checks from `proptest_attribution_rules`, or
+  the high-slot example.
