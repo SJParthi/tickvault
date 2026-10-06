@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc e6cdaa4fef6b88245046ff5d5ada21cf8cd1ee8229bbe9943e2d67213e1e04d9 # shrinks to ops = [(0, 0, 0, 0), (6, 0, 0, 26812), (1, 0, 0, 45839), (1, 0, 0, 40030), (1, 0, 0, 26607), (1, 0, 0, 25423), (1, 0, 0, 46699), (1, 0, 0, 28591), (7, 0, 42520671, 59999), (6, 0, 0, 0), (3, 0, 0, 39011), (1, 1, 763094485, 46455), (7, 0, 0, 34534)]
+cc e29c374788fadb27f60e9d2988c33b6963caa0e5ac9e394258f359528bb2637d # shrinks to first_ms = 85493, note_a_ms = 6669, heal1_ms = 119584, heal1b_ms = 113465, settle_ms = 12439, refirst_ms = 71351, note2_ms = 120000, heal2_ms = 60000, noise = [(2, 620001, 100000)]

@@ -8724,7 +8724,7 @@ Recorded HERE before the code, per the rule-file-first law.
 | Depth window ("Failure" row) | "an 805 on ANY socket, or any socket closing with no code, inside a window; or no frame in time" | the same failure rules as the main-feed rows (this one and the review-fix rows below). The probed socket parks again and the next probe waits the doubled delay, as before |
 | Corroboration | — | some OTHER socket of this process (not the closing one, and not one that closed in the same burst of closes within 2 s, with a code or without) BEGAN a dial in the last 20 s (`OVERFLOW_PROBE_EVICTION_ATTRIBUTION_SECS`, longer than the 15 s dial timeout). Dhan evicts the oldest socket when a new one is accepted, so a drop right after one of our dials is the probe (or a cascade) costing a socket |
 | A sibling blip that heals | failed the window | noted (`sibling_reset_noted`, a coded `warn!`). It heals at its own successful dial (`sibling_healed`); the window cannot pass until every noted sibling has healed and 20 s have passed since the last heal (that dial could still evict someone) |
-| Pass deferral | — | bounded (review fix, same day): a sibling is noted only until 240 s after the probed socket's first frame (the watch plus one heal deadline); a sibling dropping later while the pass is still deferred fails the window (`failed_deferral_exhausted`). Every note taken in time keeps its own 120 s heal deadline and its 20 s settle, so a window lasts at most 380 s after its first frame, and that cap (a fail-closed safety net, `failed_deferral_exhausted`) is never reached while a sibling is inside its own deadline or only the settle time is left. *(The first draft capped the deferral at 240 s, which failed a window whose sibling healed at F+225, inside its own deadline, and a sibling that dropped at F+235 five seconds after it was noted.)* |
+| Pass deferral | — | bounded (review fix, same day): a sibling is noted only until 240 s after the probed socket's first frame (the watch plus one heal deadline); a sibling dropping later while the pass is still deferred fails the window (`failed_deferral_exhausted`). Every note taken in time keeps its own 120 s heal deadline and its 20 s settle, so a pass is deferred at most 380 s after the probed socket's LATEST first frame *(⚠ CORRECTED, review round 4 below: a watch restart clears that frame, so this is not the window's length; the window is bounded at 740 s from its grant)*, and that cap (a fail-closed safety net, `failed_deferral_exhausted`) is never reached while a sibling is inside its own deadline or only the settle time is left. *(The first draft capped the deferral at 240 s, which failed a window whose sibling healed at F+225, inside its own deadline, and a sibling that dropped at F+235 five seconds after it was noted.)* |
 | The probed socket closing with a code other than 805 | did not fail the window (only an 805 or a no-code close did), so a window could pass while the probed socket was down or parked | review fix, same day: its FIRST such close in the window (for example the daily 807 token expiry) restarts its watch: it needs a fresh first frame within 120 s and a full 120 s watch after it (`watched_restarted`, a coded `warn!`). A second such close, or the probed socket parking for any reason but 805 or an orderly shutdown (808, 804 after its respawn), fails the window (`failed_watched_closed`) |
 | Another socket closing with a code other than 805 | ignored | noted like an uncorroborated no-code close (Dhan said why, so it is never read as an eviction): the window cannot pass until it has redialled, within 120 s. It also joins the current 2 s burst of closes (review fix, same day): one Dhan-side incident can reach some sockets as a disconnect packet (800) and others as a bare reset, and the coded closer redials at once, so before this fix its own dial corroborated the bare reset from the same incident and spent a probe |
 | A noted sibling that parks for a reason other than 805 | — | dropped from the window (it opens no connection) |
@@ -8820,3 +8820,34 @@ REJECT (review round 3):
   (a failed subscribe, or main-feed data silence) without a fresh first frame
   and a full watch after it; or feeds a depth socket's frame silence to the
   window.
+
+#### Review round 4 (2026-10-06, same day, same owner approval)
+
+Two more gaps, both measured in source on this branch before the fix:
+
+| Surface | Was | Now |
+|---|---|---|
+| How long a window can run | "a window lasts at most 380 s after its first frame" (the Pass deferral row above). The 380 s cap and the 240 s note cutoff run from the probed socket's LATEST first frame, and its one watch restart clears that frame, so the clock started over: grant, first frame at +119 s, a deferral to +498 s, an 807 there, a fresh first frame at +617 s and a new deferral ran to about +997 s. All that time the window held the one process-wide turn and no parked depth socket could be granted. The 380 s figure was not a bound on the window. | bounded from the GRANT: `OVERFLOW_PROBE_WINDOW_MAX_SECS` = **740 s** = 120 (first-frame deadline) + 380 (deferral cap) for the window as granted, plus 120 (first-frame deadline) + 120 (watch) for its one restart. The grant instant is kept in `granted_at`, which a restart never resets. Past 740 s the next poll (once a second) fails the window as `failed_deferral_exhausted`, unless that poll passes it, so the true bound is **740 s from the grant, plus at most one poll**. A window with no restart still ends by 120 + 380 = 500 s, so the bound only bites after a restart: a restart buys a fresh first frame and a full watch, never a second deferral. The 380 s cap from the latest first frame still holds as well. Verified by `proptest_window_bound_holds_from_the_grant_across_restarts` (bite-checked: with the bound disabled it fails at 740 s) and `proptest_attribution_rules`. |
+| A dial that fails | its BeginDial stamp stayed for 20 s and counted as eviction corroboration, so a socket stuck in a refused-dial loop (the 2026-08-12 HTTP 400 blackout, a 429 storm) re-stamped every 30–45 s and most unrelated sibling blips failed the window | a dial the server refused at the upgrade (a response other than 101, new transport label `upgrade_refused`, which was `connect` before) or that never left the process (`no_token`, `tls_config`, `bad_url`) drops the slot's stamp (one Release store of 0, in the connection task's DialFailed arm, `overflow_note_dial_failed`). Dhan evicts only when it ACCEPTS a socket, and such a dial accepted nothing. A `timeout` or a `connect` error keeps the stamp: acceptance is unknown there, so it still errs toward fail. The supervisor's backoff still never reads the reason. |
+
+**Honest limits:**
+
+- A refused dial still counts from its BeginDial until the refusal arrives
+  (usually well under a second, at most the 15 s dial timeout): a sibling's
+  no-code close in that span is corroborated. Errs toward fail.
+- A dial that times out, or fails with a TCP, TLS or I/O error, keeps its
+  stamp for the full 20 s, so a timeout loop can still fail a window on an
+  unrelated blip. Errs toward fail.
+- A restart in the last few seconds of the 500 s a window can run without one
+  can leave its fresh watch ending just past 740 s; the window then fails at
+  the bound instead of passing. Errs toward fail.
+
+REJECT (review round 4):
+
+- Measures the window's bound from anything a watch restart resets, or states
+  the window's length as the 380 s cap.
+- Raises `OVERFLOW_PROBE_WINDOW_MAX_SECS` or lets a restart buy a second
+  deferral without a fresh dated quote here.
+- Drops the stamp on a `timeout` or `connect` failure, or keeps it on an
+  `upgrade_refused` one.
+- Lets the supervisor's backoff branch on the dial failure reason.
