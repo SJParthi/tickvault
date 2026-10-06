@@ -4635,3 +4635,33 @@ the standing ceiling is $150 per Quote 23.
 - Lowers the durability alarm to a single period.
 - Drops the boot-time zero registration of any counter in a group.
 - Adds a counter to a group, or widens a slice, without a dated row here.
+
+## §2.11 — 2026-10-06: `RISK-GAP-03` re-arms after each silence episode (no new page)
+
+Owner, 2026-10-06: "Go ahead with whatever you want dude", and on the
+recommended-fixes list, "See do everything whatever is recommended dude okay?".
+
+**What was wrong (Verified from code, `crates/app/src/dhan_feed_stack.rs`):** the
+30-second silence arm counted never-ticked contracts inside "silent". Far
+option strikes that never trade keep that count above zero all day, so after
+the first page the episode never ended, the latch never cleared, and a
+contract that went quiet later in the session never paged. The page this file
+already allows (one per episode, `RISK-GAP-03` log filter) had quietly become
+one per day.
+
+**What changed:** the arm pages when a contract that HAD ticked goes quiet
+(`silent − never`), and reports never-ticked contracts once per session.
+`silence_scan_pending` holds the rule; the existing 30-minute cooldown,
+continuous-session gate, holiday gate and the dead-class report are
+unchanged. Pinned by
+`a_contract_going_quiet_mid_session_pages_although_far_strikes_never_ticked`
+and `silence_scan_pending_truth_table`.
+
+**Allowed set unchanged:** no new code, alarm, filter, metric, dimension or
+`ok_actions`. The page can now fire more than once a day, at most once per 30
+minutes, which is what §2.3's "one per episode" always said. Cost unchanged.
+
+**What a PR that violates §2.11 looks like (REJECT):**
+- Counts never-ticked contracts toward re-arming the page again, so far
+  strikes latch it for the day.
+- Removes the 30-minute cooldown or pages never-ticked contracts every scan.

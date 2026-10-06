@@ -76,7 +76,8 @@ discarded there are invisible to every counter we own.
 Authority: `no-rest-except-live-feed-2026-06-27.md` §12.15.7 and the noise
 lock §2.5 note of the same date. Every line below is emitted with
 `code = "WS-GAP-03"` (`ErrorCode::WsGapConnectionState`) from
-`crates/app/src/dhan_live_crossverify_boot.rs`. Only `xverify_failed` is
+`crates/app/src/dhan_live_crossverify_boot.rs`, except `xverify_marker_keep_short`,
+which `crates/app/src/main.rs` emits once at boot. Only `xverify_failed` is
 alarmed; the other sources are log-sink-only.
 
 | Line | Level | Means | Operator action |

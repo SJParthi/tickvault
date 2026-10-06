@@ -990,8 +990,9 @@ fn persist_report_into(
                     findings = c.findings.len(),
                     tape_rows = report.rest_tape.len(),
                     "Dhan 1-minute cross-verification persisted with gaps — the audit \
-                     tables are incomplete for today, so today's S3 archive stays held \
-                     and the attempt will retry"
+                     tables are incomplete for today, so today's S3 archive stays held; \
+                     this attempt fails and is retried only if the day's window allows \
+                     (see xverify_retry / xverify_failed)"
                 );
             }
         }
@@ -1008,7 +1009,8 @@ fn persist_report_into(
                 rows_discarded = out.rows_discarded,
                 "Dhan 1-minute cross-verification could NOT be persisted — today's \
                  comparison exists only in this log stream; today's S3 archive stays \
-                 held and the attempt will retry"
+                 held; this attempt fails and is retried only if the day's window \
+                 allows (see xverify_retry / xverify_failed)"
             );
         }
     }

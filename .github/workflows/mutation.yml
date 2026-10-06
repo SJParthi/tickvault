@@ -54,10 +54,26 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # 2026-10-06 (audit H2, second half): the weekly sweep could never finish.
+  # The header above measures a full sweep as ~18-hour-class, and the job was
+  # capped at 60 minutes, so even after the unmutated-baseline fix
+  # (`--in-place`, 2026-10-04) every weekly run would be killed at the cap.
+  # The scheduled / dispatched sweep is now split into MUTATION_SHARDS
+  # parallel jobs (`cargo mutants --shard k/n`), each up to 350 minutes
+  # (GitHub's job ceiling is 360). The repository is public, so standard
+  # runner minutes are free. A push run mutates only the lines the push
+  # changed (`--in-diff`), which is what fits in 60 minutes; it was the
+  # whole crate before, and the push history records it cancelled at the cap.
   mutants:
-    name: "Mutation Testing (critical crates)"
+    name: "Mutation Testing (critical crates, shard ${{ matrix.shard }})"
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: ${{ github.event_name == 'push' && 60 || 350 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ github.event_name == 'push' && fromJSON('[0]') || fromJSON('[0, 1, 2, 3, 4, 5, 6, 7]') }}
+    env:
+      MUTATION_SHARDS: ${{ github.event_name == 'push' && 1 || 8 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -86,10 +102,13 @@ jobs:
             before="${{ github.event.before }}"
             if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$before" 2>/dev/null; then
               # Force-push / new branch: fall back to the last commit.
-              CHANGED=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || git ls-files)
-            else
-              CHANGED=$(git diff --name-only "$before" HEAD)
+              before="HEAD~1"
             fi
+            CHANGED=$(git diff --name-only "$before" HEAD)
+            # Only the changed lines are mutated on a push (see the job
+            # comment); the diff is limited to the three critical crates.
+            git diff "$before" HEAD -- crates/core crates/trading crates/common > mutants.diff
+            echo "in_diff=--in-diff mutants.diff" >> "$GITHUB_OUTPUT"
           else
             # schedule / workflow_dispatch: no diff range — full weekly
             # sweep over ALL critical crates.
@@ -136,6 +155,8 @@ jobs:
         run: |
           set -euo pipefail
           cargo mutants ${{ steps.changed.outputs.packages }} \
+            ${{ steps.changed.outputs.in_diff }} \
+            --shard "${{ matrix.shard }}/${MUTATION_SHARDS}" \
             --in-place \
             --timeout=120 \
             --no-shuffle \
@@ -221,6 +242,6 @@ jobs:
         if: always() && steps.changed.outputs.skip == 'false'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: mutation-results
+          name: mutation-results-shard-${{ matrix.shard }}
           path: mutation-results.txt
           retention-days: 30

@@ -6229,6 +6229,131 @@ New counter `tv_depth_spill_replay_held_total`; new label `reason="not_a_trade"`
 
 Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
 
+## ITEM 50 — Fast-lane follow-ups (2026-10-06)
+
+Approved by Parthiban 2026-10-06 ("Go ahead with whatever you want dude"; "See do everything whatever is recommended dude okay?"). Found by the 2026-10-06 fast-lane attack (read-only review of the socket read path, the frame ring and the drain).
+
+- [x] 50a — **The silence page stopped re-arming once far strikes never ticked.** The arm counted never-ticked contracts as silent, so the episode never ended and a contract going quiet later never paged. It now pages on contracts that went quiet (`silent − never`) and reports never-ticked ones once per session (`silence_scan_pending`). Rule row: noise lock §2.11.
+  - Files: crates/app/src/dhan_feed_stack.rs, docs/claude-rules-full/project/dhan-rest-only-noise-lock-2026-07-14.md
+  - Tests: a_contract_going_quiet_mid_session_pages_although_far_strikes_never_ticked, silence_scan_pending_truth_table
+- [x] 50b — **`tv_doctor` read metrics from port 9090; the exporter listens on 9091** (`config/base.toml` `metrics_port`). Every metrics check reported unreachable.
+  - Files: crates/app/src/bin/tv_doctor.rs
+  - Tests: default_metrics_url_uses_the_configured_exporter_port
+- [x] 50c — **Two Dhan reference docs still said our depth unsubscribe sends code 24.** Annotated with the code sent (25, `FEED_UNSUBSCRIBE_TWENTY_DEPTH`), the 2026-09-12 probe and Dhan's 2026-09-30 reply. Docs only.
+  - Files: docs/dhan-ref/04-full-market-depth-websocket.md, docs/dhan-ref/08-annexure-enums.md
+  - Tests: (docs only)
+- [x] 50d — **Audit H2, second half: the weekly mutation sweep could never finish.** The workflow's own header puts a full sweep at ~18 hours, and the job was capped at 60 minutes, so after the 2026-10-04 baseline fix every weekly run would still be killed at the cap. The scheduled and dispatched sweep now runs as 8 shards (`--shard k/8`) with up to 350 minutes each; a push run mutates only the changed lines (`--in-diff`) within 60 minutes. The repository is public, so the runner minutes are free (Verified: visibility public).
+  - Files: .github/workflows/mutation.yml, crates/common/tests/github_workflow_guard.rs
+  - Tests: mutation_weekly_sweep_is_sharded_with_a_timeout_it_can_finish_in, mutation_push_run_mutates_only_the_changed_lines
+
+### Design
+50a is a pure function over two counts and one session latch, called on the 30 s silence arm: O(1), no allocation. The O(n) scan itself is unchanged. 50b changes one constant. 50c is docs. 50d is CI only: a matrix of 8 shards on schedule and dispatch, one job on push.
+### Edge Cases
+50a: every silent contract never ticked (reported once, then quiet until it ticks and goes quiet again); never-ticked count falling while others go quiet (pages on the went-quiet count); the market-hours gate resets the session latch; a backwards clock step still cannot clear the cooldown (existing test).
+### Failure Modes
+50a: a truly dead class still reports through the dead-class path (unchanged). If the never-ticked count rises mid-session after the once-per-session report, it is not reported again until the next session; the gauge `tv_dhan_feed_instruments_never_ticked` still shows it.
+50d: the ~18 h sweep figure is the header's estimate (Assumed); if one shard still exceeds 350 minutes it is cancelled and the run is red, never green. A push touching only non-source lines leaves `--in-diff` with nothing to mutate; cargo-mutants then tests no mutant and the results file still carries its summary (Assumed; a missing or empty file fails the run loudly, as before).
+### Test Plan
+`cargo test -p tickvault-app --lib silence` (19 passed locally on this branch); `cargo test -p tickvault-app --bin tv_doctor`; `cargo test -p tickvault-common --test github_workflow_guard mutation` (2 passed; bite-checked by restoring the flat 60-minute cap); CI full suite. 50d is proven only by the next Monday sweep.
+### Rollback
+Revert the commits. No schema, data, alarm or infrastructure change.
+### Observability
+No new metric or alarm. `RISK-GAP-03` can fire again within a session, at most once per 30 minutes (§2.11).
+
+Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
+
+## ITEM 49d / 45i — Depth array rows: scratch-table test RESULT (2026-10-06)
+
+The scope lock (2026-09-29) allows `market_depth` array rows only after a
+QuestDB scratch-table test. The test ran on 2026-10-06 against a LOCAL
+QuestDB 9.3.5 (the official `questdb-9.3.5-rt-linux-x86-64` release, sha256
+`83fb995f175716628c58564426be9f055c35ea218ad3d399e2ceb3e7ec7be028`), the same
+version as production. It did NOT run on the production box: AWS is
+read-only for these sessions. Harness: a throwaway Rust program on
+`questdb-rs =6.1.0` (the pinned client), outside the repository.
+
+Two scratch tables with the production column set and DEDUP shape:
+`md_scalar` (one row per level, ILP v1, the current layout) and `md_array`
+(one row per packet, `price` / `quantity` / `orders` as `DOUBLE[]`, a
+`levels` count, DEDUP key without `level`, ILP v2). The same depth-200
+packets went to both: 50 instruments, bid and ask, mostly 200 levels, about
+5% partial books, about 1% empty books.
+
+| Check | Result | Label |
+|---|---|---|
+| `CREATE TABLE … DOUBLE[] … WAL DEDUP UPSERT KEYS(…)` and `ADD COLUMN IF NOT EXISTS … DOUBLE[]` | accepted | Verified |
+| Every level read back, element by element (`a.price[s.level]`), 963,191 levels | 963,191 exact on price, quantity and orders | Verified |
+| Per-packet level count and sums | 4,948 of 4,948 packets with levels match | Verified |
+| Replay of the identical 5,000 packets (both tables) | row counts unchanged (DEDUP holds) | Verified |
+| Several packets in one second, distinct `capture_seq` | all kept | Verified |
+| Empty book (0 levels) | stored as one row with empty arrays; today's layout stores nothing for it | Verified |
+| NaN element (refused price) | reads back null in its own slot; positions stay aligned | Verified |
+| Disk bytes written by QuestDB (`/proc/<pid>/io write_bytes`), 5,000 packets | 1,041 MB per-level vs 94 MB arrays (11x) | Verified |
+| Same, 50,000 packets (9.64 M levels) | 10.68 GB vs 0.79 GB (13.5x) | Verified |
+| ILP bytes sent, 50,000 packets | 1.84 GB vs 0.24 GB (7.6x) | Verified |
+| Wall time to write and apply, 50,000 packets | 34 s vs 10 s | Verified (local disk, not the r8g.xlarge EBS) |
+| Table size on disk after both runs | 1,050 MB vs 641 MB | Verified (includes 16 MB preallocated files) |
+| Same test, depth-20 (200,000 packets, 3,856,888 levels) | 4.65 GB vs 0.37 GB written (12.6x); 1,207 vs 96 B per level | Verified |
+| Same test, inline 5-level depth (800,000 packets, 3,855,713 levels) | 4.30 GB vs 1.54 GB written (2.8x); 1,115 vs 400 B per level, about 1.9 KB fixed per row | Verified |
+| Level counts in both layouts, every run | identical | Verified |
+| The same ratio on the production EBS volume | not measured | Assumed |
+
+Projected day at the 2026-08-24 row counts (Assumed): depth writes about 1,774 GB per session today against about 340 GB as arrays (5.2x), roughly 74 MB/s against 14 MB/s over the session. The cap that ran out at 10:00 IST on 2026-10-05 is the r8g.xlarge instance EBS bandwidth (about 156 MB/s baseline, Assumed from AWS docs), not the gp3 volume, so faster volume settings do not lift it.
+
+### What the switch has to change (found by tracing every reader and writer)
+
+- No production SQL reads `market_depth` columns. The 15:41 depth-held pass
+  reads the in-memory subscription view. Archive exports use `SELECT *`.
+- **Column types cannot change in place**, so the switch writes a NEW table
+  and the old `market_depth` keeps its rows (never deleted; retention as
+  today).
+- **ILP v2 is required** (arrays do not exist in v1); v2 also writes f64 as
+  binary.
+- **Blocker for a naive switch: the depth spill tier is newline-delimited ILP
+  text.** `tick_spill_replay` chunks, bisects and window-filters on `\n` and
+  reads the timestamp after the last space. Binary v2 bytes contain both, so
+  a spilled v2 batch would be cut apart on replay.
+- Row builders: `drain_depth_frame` (d20/d200), `append_inline_depth` (d5),
+  the boot WAL refold and the after-close deferred depth pass all go through
+  them, so they move together.
+- Guards that pin the schema, DEDUP key, row width and DHAT budgets move in
+  the same PR.
+
+### First-draft recommendation (WITHDRAWN 2026-10-06 — see the attack results below)
+
+Replace the depth ILP spill with the existing deferral: when a depth flush
+fails, mark its `capture_seq` range in `DeferredDepth` (as a shed frame is
+marked today) instead of writing ILP bytes to `data/spill/depth`. The raw
+frames are already in the WAL, pinned by the mark, and the after-close pass
+rewrites them. That removes the text-only spill from the depth path instead
+of inventing a binary spill format. Risk: depth rows lost to a failed flush
+become visible after 15:45 rather than within the session.
+
+### Attack results on the design (2026-10-06, six experiments on the scratch QuestDB plus code review)
+
+Arrays: conditional GO. Spill replacement as first drafted: NO-GO.
+
+| Severity | Finding | Fix required in the switch |
+|---|---|---|
+| CRITICAL | Rows from frames the WAL refused (`!frame.wal_backed`) have no segment to re-read; dropping the ILP spill loses them | Keep a durable tier for unbacked rows, length-framed (v2 bytes contain `\n` and spaces, so the text spill and `tick_spill_replay` line splitting cannot carry them) |
+| CRITICAL | A deferral mark reaches disk at most once a second and `persist_now` swallows errors; a crash after the rescue floor is released lets the watermark pass the batch, the segment reads applied and is pruned | Persist and fsync the mark, check the result, only then release the floor; on failure use `note_unapplied_range` |
+| HIGH | A failed batch spans many buckets and mixes inline and dedicated rows; marking the whole range can collide and set `overflowed` | Track the exact buckets and kinds per batch |
+| HIGH | A writer that sends a row without the three arrays sets them to NULL (seen: a v1 row with the same key wiped a book) | One writer on a pinned v2 sender, guard test; the old spill replayer never points at the new table |
+| HIGH | With no version pinned the client negotiates ILP v3 and a v2 buffer fails at flush; auto mode also calls `/settings` at construction | Pin `protocol_version=2`, test it |
+| HIGH | `DEPTH_FLUSH_ROW_THRESHOLD` counts rows; 10,000 array rows ≈ 48 MB, above `MAX_DEPTH_PRODUCER_BUFFER_BYTES` (32 MiB) | Flush by bytes (8–16 MiB) and restate the queue-bytes bound |
+| MEDIUM | `/exp` exports arrays as quoted text; `/imp` refuses DOUBLE[]; `cast(text as double[])` returns NULL when the text has a `null` token | A restore step that rewrites null to NaN |
+| MEDIUM | One row inserted out of order into a 40,000-row hour partition rewrote 187 MiB | The after-close pass writes whole buckets in time order |
+| MEDIUM | Marks from before the switch would be rewritten into the new table | Route rewrites by date |
+
+Each refused level stays in its slot as NaN (reads back null; positions stay aligned), never a skipped element, so no level, side or packet is dropped.
+
+### Proposed sequence (one PR at a time)
+
+1. Length-framed binary spill tier for depth rows plus its replay (no switch yet; test with v1 rows first).
+2. New table `market_depth` successor with DOUBLE[] columns, pinned v2 sender, byte-based flush, behind `[depth] array_rows = false` (default OFF).
+3. Builders (d20, d200, inline d5 as one bid+ask row each), refold and after-close pass routed by date.
+4. Turn on after one session on the scratch table in prod (operator step), then keep the old table's rows (never deleted; retention as today).
+
 ## ITEM 51 — Dhan 15:41 cross-verification hardening (2026-10-06)
 
 Approved by Parthiban 2026-10-06: "Go ahead with whatever you want dude" and "See do everything whatever is recommended dude okay?", answering the recommended cross-verification hardening list (five findings: the day marker, the read that runs too early, missing minutes that never page, a day with no run at all, and targets fixed at boot). Rule authority: `no-rest-except-live-feed-2026-06-27.md` §12.15.7 onward and the noise lock §2.5 notes, each dated and recorded before its code. Ten serial PRs, one sub-item each. Findings Verified by reading `origin/main` at `60bdfd97a`; cargo was not run for the findings.
@@ -6275,6 +6400,6 @@ Approved by Parthiban 2026-10-06: "Go ahead with whatever you want dude" and "Se
 ### Rollback
 51a: revert the commits. The marker file format is unchanged, so markers written by either build read in the other (the old reader only checks that the file exists). No schema, table, alarm or infrastructure change. 51b–51j: each PR reverts on its own; 51i and 51j carry terraform that reverts with them.
 ### Observability
-51a: no new metric name, alarm, filter or page. `xverify_failed` gains `reason` values `marker_not_written` and `audit_rows_lost`; new unalarmed `warn!` sources `xverify_attempt_marker_write_failed`, `xverify_marker_dir_sync_failed`, `xverify_marker_keep_short`, `daily_archive_latch_marker_failed`, `tf_marker_write_failed`, all coded. `tv_dhan_feed_xverify_rows_total` now counts only rows the database ACKed. Discards still count on `tv_dhan_live_xverify_audit_rows_discarded_total` (§2.10 `audit_rows` group). Runbook rows in `docs/error-runbooks/dhan-live-crossverify-error-codes.md` §2. 51b–51j: listed in each PR.
+51a: no new metric name, alarm, filter or page. `xverify_failed` gains `reason` values `marker_not_written` and `audit_rows_lost`; new unalarmed `warn!` sources `xverify_attempt_marker_write_failed`, `xverify_marker_dir_sync_failed`, `xverify_marker_keep_short`, `daily_archive_latch_marker_failed`, `tf_marker_write_failed`, all coded. `tv_dhan_feed_xverify_rows_total` now counts only rows the database ACKed for the spot check; the §12.15.6 option pass still adds every row of a pass whose final flush landed, a discarded chunk included. Discards still count on `tv_dhan_live_xverify_audit_rows_discarded_total` (§2.10 `audit_rows` group). Runbook rows in `docs/error-runbooks/dhan-live-crossverify-error-codes.md` §2. 51b–51j: listed in each PR.
 
 Per-item guarantee matrix: see .claude/rules/project/per-wave-guarantee-matrix.md (15-row + 7-row), applied as for ITEM 45.

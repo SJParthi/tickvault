@@ -2219,7 +2219,7 @@ its alarms, or the hold ceiling.
 | Marker write failure | a failed attempt with `reason = marker_not_written`. The next attempt is **marker-only**: it writes the marker and nothing else (no token wait, no vendor fetch, no persist, no divergence page). Attempt count, 900 s spacing and the 17:30 fit are unchanged |
 | Page | only after the last attempt, on the existing `xverify_failed` source, whose meaning is unchanged: the check did not record today after every attempt |
 | Marker keep | cross-verification markers are kept **400 days** (`CROSSVERIFY_MARKER_KEEP_DAYS`), compile-time asserted above 90 + `MAX_CROSSVERIFY_HOLD_DAYS`. Other daily markers keep 7 days. A boot `warn!` (`source = "xverify_marker_keep_short"`) fires once if a configured gated hot window plus the hold comes within 3 days of the keep |
-| Rows counter | `tv_dhan_feed_xverify_rows_total` counts rows the database ACKed, never rows that were discarded |
+| Rows counter | For the spot check, `tv_dhan_feed_xverify_rows_total` counts rows the database ACKed, never rows that were discarded. The §12.15.6 option pass still adds every row of a pass whose final flush landed, a discarded chunk included (its discards count on `tv_dhan_live_xverify_audit_rows_discarded_total`); 51b–51j may narrow that |
 | Option pass (§12.15.6) | unchanged: it keeps its discard-then-continue shape on purpose, because it writes no marker and never pages |
 
 **⚠ Honest limits (Rule 11).**
