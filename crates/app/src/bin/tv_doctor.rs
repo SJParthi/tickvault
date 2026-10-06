@@ -24,7 +24,7 @@
 //! tv-doctor                         # plain text report
 //! tv-doctor --format markdown       # markdown-formatted (default)
 //! tv-doctor --format json           # machine-readable
-//! tv-doctor --metrics-url http://localhost:9090/metrics   # override
+//! tv-doctor --metrics-url http://127.0.0.1:9091/metrics   # override
 //! ```
 //!
 //! Exit codes:
@@ -39,7 +39,11 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_JOURNAL_LINES: usize = 200;
-const DEFAULT_METRICS_URL: &str = "http://localhost:9090/metrics";
+/// The app's Prometheus exporter: `config/base.toml` `metrics_port = 9091`.
+/// Until 2026-10-06 this said 9090, so the default report always read
+/// "metrics-unreachable" (audit 2026-10-06). Pinned against the config by
+/// `default_metrics_url_uses_the_configured_exporter_port`.
+const DEFAULT_METRICS_URL: &str = "http://127.0.0.1:9091/metrics";
 const DEFAULT_SPILL_DIR: &str = "/opt/tickvault/data/spill";
 
 fn main() {
@@ -241,4 +245,26 @@ fn print_json(r: &Report) {
     );
     println!("  \"journal_tail\": \"{}\"", escape(&r.journal_tail));
     println!("}}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DEFAULT_METRICS_URL;
+
+    /// The default must follow the exporter port the app actually binds,
+    /// read from the shipped config rather than restated here.
+    #[test]
+    fn default_metrics_url_uses_the_configured_exporter_port() {
+        let base = include_str!("../../../../config/base.toml");
+        let port = base
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("metrics_port"))
+            .and_then(|rest| rest.split('=').nth(1))
+            .map(|v| v.trim().to_string())
+            .expect("config/base.toml must set metrics_port");
+        assert!(
+            DEFAULT_METRICS_URL.contains(&format!(":{port}/metrics")),
+            "tv-doctor default {DEFAULT_METRICS_URL} does not use metrics_port = {port}"
+        );
+    }
 }
