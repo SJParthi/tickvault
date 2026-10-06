@@ -430,6 +430,8 @@ pub fn spawn_dhan_order_push_consumer(
                 .saturating_mul(1_u64 << consecutive_abnormal_exits.saturating_sub(1).min(8))
                 .min(DHAN_ORDER_PUSH_RESPAWN_BACKOFF_CAP_SECS);
             error!(
+                code = ErrorCode::OrderEvt01PersistFailed.code_str(),
+                source = "consumer_respawn",
                 reason,
                 backoff_secs,
                 consecutive_abnormal_exits,

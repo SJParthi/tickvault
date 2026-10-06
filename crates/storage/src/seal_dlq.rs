@@ -48,17 +48,21 @@
 
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
 use chrono::{TimeZone, Utc};
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
+use tickvault_common::error_code::ErrorCode;
 use tickvault_common::feed::Feed;
 
 use crate::seal_spill::{
-    SEAL_SPILL_FORMAT_VERSION, SerializedSeal, seal_spill_version_is_readable,
+    SEAL_SPILL_FORMAT_VERSION, SerializedSeal, ist_day_number, seal_spill_version_is_readable,
+    sync_directory,
 };
 
 /// Production DLQ directory — sibling of `data/spill/` so operators
@@ -254,21 +258,62 @@ fn ist_date_filename(now_unix_secs: i64) -> String {
     dt.format("seals_v4-%Y-%m-%d.ndjson").to_string()
 }
 
+/// Counter for a failed DLQ sync, one series per `reason`.
+pub const SEAL_DLQ_SYNC_FAILED_COUNTER: &str = "tv_seal_dlq_sync_failed_total";
+
 /// Append-only NDJSON DLQ writer. One instance lives in the writer
 /// task; `append_record` is the single producer entry point.
 pub struct SealDlqWriter {
     /// DLQ directory — production uses `SEAL_DLQ_DIR`; tests
     /// override via `with_dlq_dir_for_test`.
     dlq_dir: PathBuf,
+    /// Day files written since the last [`Self::sync_written`], and whether
+    /// a directory entry was created (2026-10-04: the DLQ was flushed to the
+    /// page cache and never synced, so a power cut could take records it had
+    /// reported written).
+    unsynced: Mutex<DlqUnsynced>,
+    /// Edge latch for the sync-failure `error!`: one line per failing
+    /// episode, cleared by the next clean sync.
+    sync_failing: AtomicBool,
+}
+
+/// What [`SealDlqWriter::sync_written`] still has to sync. Two day slots
+/// suffice: the writers sync at least once a second while the DLQ is
+/// written, so only the IST midnight can separate two days between syncs. A
+/// third day before any sync replaces the older slot and is counted
+/// (`reason="slot_overflow"`); that day's file is then synced by nobody.
+#[derive(Default)]
+struct DlqUnsynced {
+    /// `(IST day number, a unix second inside that day)` per written day.
+    days: [Option<(i64, i64)>; 2],
+    /// A new day file was created: the DLQ directory entry needs a sync.
+    dir: bool,
+    /// The DLQ directory itself was created: its parent's entry too.
+    parent: bool,
+}
+
+impl DlqUnsynced {
+    /// Records a write to the day holding `now_unix_secs`. O(1).
+    fn note_day(&mut self, now_unix_secs: i64) {
+        let day = ist_day_number(now_unix_secs);
+        if self.days.iter().flatten().any(|(held, _)| *held == day) {
+            return;
+        }
+        if let Some(free) = self.days.iter_mut().find(|slot| slot.is_none()) {
+            *free = Some((day, now_unix_secs));
+            return;
+        }
+        metrics::counter!(SEAL_DLQ_SYNC_FAILED_COUNTER, "reason" => "slot_overflow").increment(1);
+        let oldest = usize::from(self.days[1].map(|(d, _)| d) < self.days[0].map(|(d, _)| d));
+        self.days[oldest] = Some((day, now_unix_secs));
+    }
 }
 
 impl SealDlqWriter {
     /// Production constructor. Uses `data/dlq/`.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            dlq_dir: PathBuf::from(SEAL_DLQ_DIR),
-        }
+        Self::with_dlq_dir_for_test(PathBuf::from(SEAL_DLQ_DIR))
     }
 
     /// Test constructor. Tests pass an isolated `tempdir` to allow
@@ -276,7 +321,97 @@ impl SealDlqWriter {
     #[must_use]
     // TEST-EXEMPT: test-only helper used as construction source by every test in this module (test_append_record_then_read_all_roundtrip, test_seal_dlq_writer_clear_*, test_seal_dlq_writer_skips_corrupt_lines_gracefully, etc.). Separate name-matched test would be redundant.
     pub fn with_dlq_dir_for_test(dir: PathBuf) -> Self {
-        Self { dlq_dir: dir }
+        Self {
+            dlq_dir: dir,
+            unsynced: Mutex::new(DlqUnsynced::default()),
+            sync_failing: AtomicBool::new(false),
+        }
+    }
+
+    fn lock_unsynced(&self) -> std::sync::MutexGuard<'_, DlqUnsynced> {
+        self.unsynced
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Test probe: is any DLQ write or created entry still unsynced?
+    #[cfg(test)]
+    // TEST-EXEMPT: test-only probe, exercised by the sync tests
+    pub(crate) fn has_unsynced_writes(&self) -> bool {
+        let unsynced = self.lock_unsynced();
+        unsynced.days.iter().any(Option::is_some) || unsynced.dir || unsynced.parent
+    }
+
+    /// Syncs every DLQ day file written since the last call, and the DLQ
+    /// directory entry when a day file (or the directory) was created.
+    ///
+    /// `append_record` never syncs: the frame drain's inline fallback can
+    /// reach it, and it must not wait for the device. The seal writer task
+    /// (after a cycle that escalated) and the escalation thread (after a
+    /// batch, and at exit) call this instead, off the drain. The lock is held
+    /// only to take the pending set, never across a sync. **O(days ≤ 2)**
+    /// opens and syncs, plus at most two directory syncs.
+    ///
+    /// Returns `true` when there was nothing to sync or every sync succeeded.
+    /// A failed item is put back so the next call retries it, counted on
+    /// `tv_seal_dlq_sync_failed_total{reason="sync"}`, and logged once per
+    /// failing episode. A day file removed since (replayed and cleared) has
+    /// nothing left to lose and is skipped.
+    pub fn sync_written(&self) -> bool {
+        let pending = std::mem::take(&mut *self.lock_unsynced());
+        if pending.days.iter().all(Option::is_none) && !pending.dir && !pending.parent {
+            return true;
+        }
+        let mut failed = DlqUnsynced::default();
+        let mut first_err: Option<std::io::Error> = None;
+        for (day, now_unix_secs) in pending.days.into_iter().flatten() {
+            let path = self.dlq_path(now_unix_secs);
+            let outcome = match std::fs::OpenOptions::new().append(true).open(&path) {
+                Ok(file) => file.sync_data(),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(err) => Err(err),
+            };
+            if let Err(err) = outcome {
+                failed.days[usize::from(failed.days[0].is_some())] = Some((day, now_unix_secs));
+                first_err.get_or_insert(err);
+            }
+        }
+        if pending.dir
+            && let Err(err) = sync_directory(&self.dlq_dir)
+        {
+            failed.dir = true;
+            first_err.get_or_insert(err);
+        }
+        if pending.parent
+            && let Some(parent) = self.dlq_dir.parent()
+            && let Err(err) = sync_directory(parent)
+        {
+            failed.parent = true;
+            first_err.get_or_insert(err);
+        }
+        let Some(err) = first_err else {
+            self.sync_failing.store(false, Ordering::Relaxed);
+            return true;
+        };
+        metrics::counter!(SEAL_DLQ_SYNC_FAILED_COUNTER, "reason" => "sync").increment(1);
+        {
+            let mut unsynced = self.lock_unsynced();
+            for (_, now_unix_secs) in failed.days.into_iter().flatten() {
+                unsynced.note_day(now_unix_secs);
+            }
+            unsynced.dir |= failed.dir;
+            unsynced.parent |= failed.parent;
+        }
+        if !self.sync_failing.swap(true, Ordering::Relaxed) {
+            error!(
+                code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                dlq_dir = ?self.dlq_dir,
+                ?err,
+                "seal dead-letter: syncing the day file failed; records reported written may \
+                 be lost on a power cut until a sync succeeds"
+            );
+        }
+        false
     }
 
     /// Returns the path of the DLQ file for the given UTC unix
@@ -296,6 +431,7 @@ impl SealDlqWriter {
     /// `error!(code = ErrorCode::AggregatorDrop01.code_str())` per
     /// the AGGREGATOR-DROP-01 runbook.
     pub fn append_record(&self, record: &SealDlqRecord, now_unix_secs: i64) -> Result<()> {
+        let created_dir = !self.dlq_dir.is_dir();
         std::fs::create_dir_all(&self.dlq_dir)
             .with_context(|| format!("failed to create dlq dir {:?}", self.dlq_dir))?;
         let path = self.dlq_path(now_unix_secs);
@@ -304,6 +440,17 @@ impl SealDlqWriter {
             .append(true)
             .open(&path)
             .with_context(|| format!("failed to open dlq file {path:?}"))?;
+        // An empty file was (almost always) just created: its directory entry
+        // must reach the device too. A false positive costs one extra
+        // directory sync. Recorded before the write so a write that fails
+        // after a partial line still gets that line synced.
+        let created_file = file.metadata().map_or(true, |meta| meta.len() == 0);
+        {
+            let mut unsynced = self.lock_unsynced();
+            unsynced.note_day(now_unix_secs);
+            unsynced.dir |= created_file;
+            unsynced.parent |= created_dir;
+        }
         let mut writer = BufWriter::new(file);
         let line = serde_json::to_string(record)
             .with_context(|| "failed to serialise SealDlqRecord to JSON")?;
@@ -803,6 +950,123 @@ mod tests {
         assert_eq!(drained[0], r1);
         assert_eq!(drained[1], r2);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_sync_written_syncs_each_written_day_and_its_new_directory_entries() {
+        // 2026-10-04: the DLQ was flushed to the page cache and never synced.
+        // `append_record` records what to sync (it never syncs: the drain's
+        // inline fallback reaches it); `sync_written` syncs it and clears it.
+        let root = temp_dlq_dir("sync-written");
+        let dir = root.join("dlq");
+        let writer = SealDlqWriter::with_dlq_dir_for_test(dir.clone());
+        assert!(writer.sync_written(), "nothing written is a clean no-op");
+        let day_one = chrono::Utc
+            .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
+            .single()
+            .unwrap_or_else(|| panic!("valid"))
+            .timestamp();
+        let day_two = day_one + 86_400;
+        let record = SealDlqRecord::from(&mk_serialized_seal(13, 0, 0, 1_716_000_900, 100.0));
+        writer
+            .append_record(&record, day_one)
+            .unwrap_or_else(|err| panic!("append day one: {err}"));
+        writer
+            .append_record(&record, day_two)
+            .unwrap_or_else(|err| panic!("append day two: {err}"));
+        {
+            let unsynced = writer.lock_unsynced();
+            assert_eq!(
+                unsynced.days.iter().flatten().count(),
+                2,
+                "both days must be pending"
+            );
+            assert!(unsynced.dir, "a new day file's entry must be pending");
+            assert!(unsynced.parent, "the created directory's entry too");
+        }
+        assert!(writer.sync_written(), "both days must sync");
+        assert!(!writer.has_unsynced_writes(), "a clean sync clears the set");
+        // A second record on an existing, non-empty file needs no directory
+        // sync, only the file.
+        writer
+            .append_record(&record, day_two)
+            .unwrap_or_else(|err| panic!("append again: {err}"));
+        {
+            let unsynced = writer.lock_unsynced();
+            assert!(!unsynced.dir && !unsynced.parent, "no new entry was made");
+            assert_eq!(unsynced.days.iter().flatten().count(), 1);
+        }
+        // A day file replayed and removed in between has nothing to lose.
+        writer
+            .clear_dlq_for_date(day_two)
+            .unwrap_or_else(|err| panic!("clear: {err}"));
+        assert!(writer.sync_written(), "a removed day file is skipped");
+        assert!(!writer.has_unsynced_writes());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_note_day_keeps_the_two_newest_days_when_a_third_arrives_unsynced() {
+        let mut unsynced = DlqUnsynced::default();
+        unsynced.note_day(0);
+        unsynced.note_day(86_400);
+        unsynced.note_day(86_400 + 60);
+        assert_eq!(
+            unsynced.days.iter().flatten().count(),
+            2,
+            "same day is one slot"
+        );
+        unsynced.note_day(2 * 86_400);
+        let mut days: Vec<i64> = unsynced.days.iter().flatten().map(|(d, _)| *d).collect();
+        days.sort_unstable();
+        assert_eq!(
+            days,
+            vec![ist_day_number(86_400), ist_day_number(2 * 86_400)],
+            "the oldest day is the one given up"
+        );
+    }
+
+    #[test]
+    fn test_append_record_never_syncs_and_sync_written_holds_no_lock() {
+        // `append_record` is reachable from the frame drain's inline fallback,
+        // so it must never wait for the device; `sync_written` must release
+        // the lock before it syncs, or an inline append would wait for it.
+        let src = include_str!("seal_dlq.rs");
+        let body = |name: &str| {
+            let start = src
+                .find(name)
+                .unwrap_or_else(|| panic!("{name} must exist"));
+            let rest = &src[start..];
+            let end = rest.find("\n    ///").unwrap_or(rest.len());
+            &rest[..end]
+        };
+        let append = body("pub fn append_record(");
+        assert!(
+            !append.contains("sync_data") && !append.contains("sync_all"),
+            "append_record must never sync"
+        );
+        let sync = body("pub fn sync_written(");
+        let taken = sync
+            .find("std::mem::take")
+            .unwrap_or_else(|| panic!("the pending set must be taken"));
+        // The guard is a temporary of the `take` statement, so it is dropped
+        // at that statement's end, before any sync.
+        assert!(
+            sync[taken..].starts_with("std::mem::take(&mut *self.lock_unsynced());"),
+            "the lock must live only for the take"
+        );
+        assert!(!sync[..taken].contains("sync_data"));
+        let first_sync = sync
+            .find("sync_data")
+            .unwrap_or_else(|| panic!("the day files must be synced"));
+        let after_take = taken + "std::mem::take(&mut *self.lock_unsynced());".len();
+        assert!(
+            sync[after_take..first_sync]
+                .matches("lock_unsynced")
+                .count()
+                == 0,
+            "no lock may be held across a sync"
+        );
     }
 
     #[test]

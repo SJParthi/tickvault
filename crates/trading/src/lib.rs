@@ -40,6 +40,7 @@ pub mod oms;
 pub mod orphan_position_watchdog;
 pub mod risk;
 pub mod strategy;
+pub(crate) mod sync;
 
 #[cfg(test)]
 mod tests {

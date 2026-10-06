@@ -12,8 +12,9 @@
 //! - Failure threshold: consecutive failures before opening
 //! - Reset timeout: time before transitioning from Open to Half-Open
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
+
+use crate::sync::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use tracing::{error, info, warn};
 
@@ -77,6 +78,24 @@ impl OrderCircuitBreaker {
         }
     }
 
+    /// A breaker already past its open window, waiting for its first probe.
+    ///
+    /// For the loom model only (audit H3): loom cannot advance the wall clock,
+    /// so a model reaches HalfOpen by opening the circuit at epoch second 1
+    /// with the real reset timeout. Compiled only with the `loom` feature.
+    #[cfg(feature = "loom")]
+    #[doc(hidden)]
+    // TEST-EXEMPT: model constructor, exercised by every test in tests/loom_circuit_breaker.rs
+    pub fn new_half_open_for_model() -> Self {
+        Self {
+            consecutive_failures: AtomicU32::new(OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD),
+            failure_threshold: OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD,
+            opened_at_secs: AtomicU64::new(1),
+            reset_timeout: Duration::from_secs(OMS_CIRCUIT_BREAKER_RESET_SECS),
+            half_open_probe_sent: AtomicBool::new(false),
+        }
+    }
+
     /// Checks if a request is allowed through the circuit breaker.
     ///
     /// # Returns
@@ -95,9 +114,20 @@ impl OrderCircuitBreaker {
                 // Only allow one probe request in HalfOpen state.
                 if self
                     .half_open_probe_sent
-                    .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()
                 {
+                    // A failed probe re-arms the open window and then frees
+                    // this flag (record_failure). If we won the flag from that
+                    // release, our HalfOpen reading above may predate the new
+                    // window: re-read it and give the flag back while the
+                    // circuit is open again, so a failed probe is never
+                    // followed at once by another.
+                    if self.state() != CircuitState::HalfOpen {
+                        self.half_open_probe_sent.store(false, Ordering::Release);
+                        warn!("circuit breaker re-opened after a failed probe — rejecting");
+                        return Err(OmsError::CircuitBreakerOpen);
+                    }
                     info!("circuit breaker HALF-OPEN — allowing one probe request");
                     Ok(())
                 } else {
@@ -153,6 +183,25 @@ impl OrderCircuitBreaker {
                     threshold = self.failure_threshold,
                     "OMS-GAP-03: circuit breaker OPEN — Dhan API failures exceeded threshold. \
                      ALL order submissions blocked until recovery."
+                );
+            } else if self.half_open_probe_sent.load(Ordering::Acquire) {
+                // Audit 2026-10-04 (found writing the H3 loom model): the
+                // circuit was already open and the half-open probe was spent,
+                // so this failure is the probe's (or one in flight with it).
+                // Before, `opened_at` kept its OLD value and the probe flag
+                // stayed set: `state()` read HalfOpen for ever and `check()`
+                // refused every request, including the next probe, until a
+                // manual `reset()`. Re-arm the open window from now and free
+                // the probe, so another probe is allowed one reset timeout
+                // later. The window is stored before the flag is released, so
+                // the `check()` that wins the next probe re-reads it and backs
+                // off while the new window is still open. O(1), three atomics.
+                self.opened_at_secs.store(now_secs, Ordering::Release);
+                self.half_open_probe_sent.store(false, Ordering::Release);
+                metrics::gauge!("tv_circuit_breaker_state").set(1.0_f64);
+                warn!(
+                    failures = new_count,
+                    "circuit breaker half-open probe failed — staying OPEN for another reset timeout"
                 );
             }
         }
@@ -430,6 +479,56 @@ mod tests {
 
         // Now can send requests normally
         assert!(cb.check().is_ok());
+    }
+
+    /// Audit 2026-10-04: a failed half-open probe left the old open window
+    /// and a spent probe flag in place, so the breaker read HalfOpen for ever
+    /// and refused every request, the next probe included, until a manual
+    /// reset. It must re-open for another reset timeout and then allow a new
+    /// probe.
+    #[test]
+    fn test_regression_failed_half_open_probe_rearms_the_open_window() {
+        let cb = OrderCircuitBreaker {
+            consecutive_failures: AtomicU32::new(OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD),
+            failure_threshold: OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD,
+            opened_at_secs: AtomicU64::new(1),
+            reset_timeout: Duration::from_secs(OMS_CIRCUIT_BREAKER_RESET_SECS),
+            half_open_probe_sent: AtomicBool::new(false),
+        };
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+        assert!(cb.check().is_ok(), "the first probe is allowed");
+
+        // The probe fails.
+        cb.record_failure();
+
+        assert_eq!(
+            cb.state(),
+            CircuitState::Open,
+            "a failed probe re-opens the circuit for another reset timeout"
+        );
+        assert!(cb.opened_at_secs.load(Ordering::Relaxed) > 1);
+        assert!(!cb.half_open_probe_sent.load(Ordering::Relaxed));
+        assert!(cb.check().is_err(), "no probe inside the new window");
+
+        // Once the new window has passed, exactly one probe is allowed again.
+        cb.opened_at_secs.store(1, Ordering::Relaxed);
+        assert!(cb.check().is_ok(), "the next window allows a probe");
+        assert!(cb.check().is_err(), "and only one");
+    }
+
+    /// A failure while open with no probe spent (a late failure from before
+    /// the circuit opened) does not move the open window.
+    #[test]
+    fn test_late_failure_while_open_keeps_the_open_window() {
+        let cb = OrderCircuitBreaker::new();
+        for _ in 0..OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD {
+            cb.record_failure();
+        }
+        let opened_at = cb.opened_at_secs.load(Ordering::Relaxed);
+        assert_ne!(opened_at, 0);
+        cb.record_failure();
+        assert_eq!(cb.opened_at_secs.load(Ordering::Relaxed), opened_at);
+        assert_eq!(cb.state(), CircuitState::Open);
     }
 
     // -----------------------------------------------------------------------

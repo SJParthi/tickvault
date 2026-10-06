@@ -16,7 +16,7 @@
 //! | File | Why it was left | Reachability |
 //! |---|---|---|
 //! | `trading_pipeline.rs` | `spawn_trading_pipeline` has ZERO production call sites, pinned by `order_side_wiring_guard.rs`; the health handler reports the pipeline as `retired` | dead |
-//! | `exit_execution.rs` | behind the four-gate exit-order lockout (`dhan-exit-order-lockout-2026-07-14.md`) — config default-off, dispatcher early-return, `dry_run` hardcoded, ratchet | gated |
+//! | `exit_execution.rs` | behind the four-gate exit-order lockout (`dhan-exit-order-lockout-2026-07-14.md`) — config default-off, dispatcher early-return, `dry_run` hardcoded, ratchet. **Migrated 2026-10-04 (audit M7):** every call now names the order's segment, so the file is off the baseline | gated |
 //!
 //! Migrating dormant code carries its own risk and buys nothing today. What
 //! this guard buys is that the defect cannot SPREAD: a new legacy call site
@@ -47,10 +47,7 @@ const LEGACY_METHODS: &[&str] = &[
 /// A file whose count drops must be updated here in the same change; a file
 /// that reaches zero must be removed from the list entirely, so the baseline
 /// can never quietly outlive the thing it bounds.
-const LEGACY_CALL_BASELINE: &[(&str, usize)] = &[
-    ("crates/app/src/exit_execution.rs", 3),
-    ("crates/app/src/trading_pipeline.rs", 3),
-];
+const LEGACY_CALL_BASELINE: &[(&str, usize)] = &[("crates/app/src/trading_pipeline.rs", 3)];
 
 /// Everything before the first `#[cfg(test)]` line — this workspace puts its
 /// unit tests in a trailing `mod tests`, so that marker is the production edge.

@@ -233,6 +233,19 @@ impl SealAbsorptionPipeline {
         Arc::clone(&self.dlq)
     }
 
+    /// Syncs what tiers 2 and 3 wrote since the last call: the spill day
+    /// file, the DLQ day files, and any directory entry they created
+    /// (2026-10-04: seals spilled while QuestDB was down were written to
+    /// the page cache only). The seal writer task calls this after every
+    /// cycle, off the frame drain; with nothing written it is two locks and
+    /// a few atomic swaps, no syscall. Returns `true` when both syncs
+    /// succeeded or had nothing to do.
+    pub fn sync_escalated(&self) -> bool {
+        let spill = self.spill.sync_open_file();
+        let dlq = self.dlq.sync_written();
+        spill && dlq
+    }
+
     /// Producer entry point. Infallible by design — every absorption
     /// failure escalates one tier deeper. Worst case returns
     /// [`SubmitOutcome::Dropped`] carrying the lost seal.
@@ -1125,6 +1138,33 @@ mod tests {
         let on_disk = p.spill_handle().read_all(now).expect("read spill");
         assert_eq!(on_disk.len(), 1);
         assert_eq!(on_disk[0].tick_count, 5);
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn test_sync_escalated_syncs_what_both_tiers_wrote() {
+        let (spill, dlq) = temp_pair("sync-escalated");
+        let mut p =
+            SealAbsorptionPipeline::with_capacity_and_dirs_for_test(1, spill.clone(), dlq.clone());
+        let now = jan1_noon_utc();
+        assert!(p.sync_escalated(), "nothing written: nothing to do");
+        let s1 = mk_buffered_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0);
+        let s2 = mk_buffered_seal(25, 0, TfIndex::M1, 1_716_024_300, 200.0);
+        assert_eq!(p.submit(s1, now), SubmitOutcome::Buffered);
+        assert_eq!(p.submit(s2, now), SubmitOutcome::Spilled);
+        let record =
+            crate::seal_dlq::SealDlqRecord::from(&crate::seal_spill::SerializedSeal::from(
+                &mk_buffered_seal(51, 0, TfIndex::M1, 1_716_024_900, 300.0),
+            ));
+        p.dlq_handle()
+            .append_record(&record, now)
+            .expect("dlq append");
+        assert!(p.spill_handle().has_unsynced_writes());
+        assert!(p.dlq_handle().has_unsynced_writes());
+
+        assert!(p.sync_escalated(), "both syncs succeed");
+        assert!(!p.spill_handle().has_unsynced_writes());
+        assert!(!p.dlq_handle().has_unsynced_writes());
         cleanup(&spill, &dlq);
     }
 }

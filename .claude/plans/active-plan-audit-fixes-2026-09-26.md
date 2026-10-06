@@ -529,13 +529,22 @@ folded into them below), then PR18, PR19 and the decisions.
     (`seal_spill.rs::SealSpillWriter::sync_open_file`, called from
     `seal_writer_runner.rs::SealEscalationSink::run`): the escalation thread syncs the day file
     after each batch that empties its queue, at least once a second under a burst, and once at
-    exit; the day rotation syncs the closing file. The lock is held only to `dup` the handle, so
-    an inline append never waits for the device; `append_seal` itself never syncs. Failures on
+    exit; the day rotation moves the closing file aside under the lock and the escalation thread
+    syncs and closes it off the lock (the first version synced it under the lock; fixed the same
+    day). The lock is held only to take or `dup` a handle, so an inline append never waits for
+    the device; `append_seal` itself never syncs. Failures on
     `tv_seal_spill_sync_failed_total`, one coded `error!` per failing episode. Tests:
     `sync_open_file_is_a_no_op_with_nothing_open_and_keeps_the_handle_open`,
     `the_drain_reachable_append_never_syncs_and_the_sync_holds_no_lock` (bite-tested), and the
-    two escalation-summary tests now pin `syncs`. Not done: the seal DLQ is still not synced,
-    and a seal the drain writes inline (escalation queue full) waits for the thread's next sync, or for the day rotation if the thread has exited.
+    two escalation-summary tests now pin `syncs`. **Done 2026-10-04 (L5):** the seal DLQ is synced (`SealDlqWriter::sync_written`), and
+    both tiers also sync a new day file's folder entry and a new folder. The writer cycle
+    (`run_one_cycle` step 3, `SealAbsorptionPipeline::sync_escalated`) syncs what the outage
+    cascade and the drain's inline fallback wrote, so those wait at most one 100 ms cycle, and
+    no longer depend on the escalation thread. Tests:
+    `test_sync_written_syncs_each_written_day_and_its_new_directory_entries`,
+    `test_append_record_never_syncs_and_sync_written_holds_no_lock`,
+    `test_sync_open_file_syncs_only_new_writes_and_new_directory_entries`,
+    `test_run_one_cycle_syncs_what_the_outage_cascade_wrote` (bite-tested).
   - A frame the capture log refused and later deferred to it is labelled "deferred"
     (pool_supervisor.rs:3924-4002, tick_persistence.rs:2791): fix the label; counter and alarm
     are already right.
@@ -2018,7 +2027,7 @@ New items:
 - [ ] **PR40c-f — finish the batching and append-pause proofs.** (`storage`)
   - Row 266 (c6#235): count writes at the disk call, and test an append racing the rename
     (seal_spill.rs:878-918, :962-968).
-- [ ] **PR40b-f — the spill prune never deletes unreplayed or refused candles.** (`storage`,
+- [x] **PR40b-f — the spill prune never deletes unreplayed or refused candles.** (`storage`,
   `app`)
   - This item owns the PR40b corrections above: rows 187 (c6#168; `.overflow` as well as
     `.bin.N`) and 194 (exempt refused and poison files; move the prune after recovery).
@@ -2035,12 +2044,31 @@ New items:
     `spill_sweep_keeps_aged_unreplayed_files_until_the_boot_drain_has_run`,
     `test_note_boot_drain_ran_and_boot_drain_ran_are_per_directory`, `staging_reads_overflow_and_twice_renamed_copies`,
     `the_boot_drain_lets_the_retention_sweep_delete_unreplayed_files`, and the updated
-    `test_run_file_pass_uploads_every_spill_folder_and_a_second_pass_does_nothing`. **Still
-    open:** exempting refused and poison files (with the copy gate on, the default, they are
-    deleted only with a verified cold copy), and row 296 below. Limit: with no boot drain in
+    `test_run_file_pass_uploads_every_spill_folder_and_a_second_pass_does_nothing`.
+  - **Done 2026-10-04 (remainder).** Row 194, first half: a staged file holding a seal the boot
+    drain or the replay gave up on (undecodable, refused past the retry window, a poison row)
+    moves to `refused/` (`SEAL_REFUSED_SUBDIR`), not `archive/`. The retention sweep never
+    deletes it, with the copy gate on or off; it counts the files and bytes (`refused_kept`,
+    gauge `tv_seal_spill_refused_files`), and the cold upload copies them
+    (`ColdFileSet::seal_spill` scans `refused/`; `is_seal_file_name` also matches staged DLQ
+    copies). Tests: `spill_sweep_never_deletes_refused_files_and_counts_them`,
+    `replay_moves_a_file_with_a_skipped_record_to_refused_not_archive`,
+    `replay_moves_a_file_with_a_poison_record_to_refused_and_counts_it_once`,
+    `test_cold_file_set_seal_spill_tick_quarantine_depth_quarantine_dirs`, and the updated
+    `a_refused_append_in_a_file_past_the_retry_window_is_archived_not_retried` and
+    `corrupt_tail_is_counted_not_silently_lost`. Limit: with no boot drain in
     the process (Dhan lane off) unreplayed files are never age-pruned; they are kept, not lost.
   - Row 296: report staged-for-retry seals as pending rather than unrecovered, page once, and
     fix the wiring test that pins the over-count (seal_writer_loop.rs:321-331, :1709-1750).
+    **Done 2026-10-04.** The boot drain reports a file's given-up seals once, when the file moves
+    to `refused/` (`seals_unrecovered`, `files_refused`, paged through
+    `report_unrecovered_seals(UnrecoveredStage::BootDrain, …)`); a seal left staged for the next
+    boot is pending, never unrecovered. The replay counts a skipped record once across re-reads
+    (per-file offset marks). Tests:
+    `boot_drain_moves_a_file_with_an_undecodable_record_to_refused_and_reports_it_once`,
+    `boot_drain_leaves_a_young_refused_append_pending_and_does_not_report_it_unrecovered`,
+    `replay_counts_a_damaged_record_once_when_a_failed_flush_reads_it_again` (bite-tested: 3
+    counts without the mark), and the wiring test now pins `outcome.seals_unrecovered`.
 - [ ] **OWNER-202 — exits refused at 25,000 tracked orders.** (decision only, no code)
   - Row 202 (c6#178): the order cap also refuses cancels (engine.rs:331-381, :2543-2593). The
     exit layer is frozen, so the owner is asked whether cancels may skip the cap. Nothing is built
@@ -2624,6 +2652,197 @@ write, then candle warm-up (PR31b-2 (a), already listed above). Each fix ships a
   each step still costs what it did; only the worker it holds changes. Boot-only and shutdown-only
   steps (the WAL replay, the mapping-artifact wait, shutdown joins) are left as they are.
 
+### Added 2026-10-04 (workspace audit, owner tapped "Page me" on the data-at-risk card)
+
+- [x] **P1 — Five data-at-risk pages over ten counters that reached no one.** Failed cloud
+  backups, files kept on disk because no verified copy exists, dropped order updates, dropped log
+  lines and the feed thread writing a rescue to disk itself were each counted on the box and seen
+  by nobody. The ten counters join the main EMF selector, each is registered at 0 at boot (after
+  the recorder install, every label value), and five metric-math alarms sum them (`notBreaching`,
+  no `ok_actions`, `host` only; the cloud-backup alarm needs 2 of 3 × 900 s). Rule first:
+  noise-lock §2.9 and aws-budget COST NOTE 2026-10-04. Files: `crates/app/src/main.rs`,
+  `crates/aws-lambdas/src/telegram_webhook.rs`, `deploy/aws/cloudwatch-agent.json`,
+  `deploy/aws/terraform/data-at-risk-alarms.tf`,
+  `crates/common/tests/cloudwatch_app_alarms_wiring.rs`. Tests:
+  test_emf_metric_selectors_name_count_is_pinned, every_alarmed_counter_is_registered_at_boot,
+  every_live_alarm_has_a_plain_english_phrase. Honest limits: the log-drop and feed-inline thresholds have no measured
+  baseline (Assumed). The order-update drop `error!` carries `ORDER-EVT-01` since P2.
+
+- [x] **P2 — Ten uncoded `error!` lines get existing codes; the weekly mutation run can start.**
+  Audit M3: ten failure lines carried no code, so coded-error triage could not find them. Each now
+  carries an existing code, none of them paged (no new page, no noise-lock row): the order-update
+  broadcast drop (`ORDER-EVT-01`, stage `broadcast_no_receiver`, runbook row added), the
+  order-update WAL drop and the boot WAL replay failure (`WS-SPILL-02` with a `source`; the spill
+  already counts the drop per frame type), the order-update server auth/API error (`WS-GAP-01`),
+  the two token-renewal give-up lines and the token publish failure (`AUTH-GAP-01`), the two
+  static-IP boot-check lines (`GAP-NET-01`), and the seal-writer construct failure
+  (`AGGREGATOR-SEAL-01`). The uncoded budget falls 71 → 61. Audit H2: `cargo mutants` copied the
+  tree without `.git`, so the guards that call `git ls-files` failed the unmutated baseline and
+  no mutant was ever tested; the workflow now runs `--in-place` (serial, disposable checkout).
+  Audit L3: the committed test-count baseline moves 12295 → 13559 (measured). Files:
+  `crates/core/src/websocket/order_update_connection.rs`, `crates/core/src/auth/token_manager.rs`,
+  `crates/core/src/auth/dhan_token_publisher.rs`, `crates/core/src/network/ip_verifier.rs`,
+  `crates/app/src/main.rs`, `crates/common/tests/error_code_tag_guard.rs`,
+  `docs/error-runbooks/order-update-events-error-codes.md`, `.github/workflows/mutation.yml`,
+  `.claude/hooks/.test-count-baseline`. Tests: uncoded_error_sites_may_only_shrink,
+  every_error_macro_tagged_with_a_known_code_carries_code_field. Honest limits: `--in-place` is
+  proven only by the next scheduled or dispatched mutation run (Assumed until then); 61 uncoded
+  `error!` lines remain.
+
+- [x] **P3 — A spill replay that fails part-way through a file keeps what it finished.** Audit N1:
+  when a later chunk of a spill file failed (QuestDB busy, a read error), the round dropped the
+  chunks it had already finished, so the next round restarted at the old offset and set the same
+  refused lines aside again, once per retry, into `<file>.rejected-lines`. The failure branch now
+  records `resume_from + accepted` (every finished chunk ends on a line boundary) and counts those
+  bytes as replayed. Also: quarantining a whole file now forgets its resume offset, so the next
+  file of the same name (names recur per feed and hour) starts at its first byte instead of a
+  stale offset. Files: `crates/storage/src/tick_spill_replay.rs`. Tests:
+  a_failure_later_in_a_file_does_not_set_the_same_line_aside_twice,
+  quarantining_a_file_forgets_its_resume_offset. Honest limits: a failure INSIDE a chunk still
+  re-sends that chunk next round (idempotent, the dedup keys carry the row identity); the offset
+  map lives in memory only, so after a restart a partly drained file is re-sent from the start and
+  its refused lines are set aside a second time, as before.
+
+- [x] **P4 — A failed half-open probe re-opens the order circuit breaker.** Found writing the H3
+  loom model: when the one half-open probe failed, `record_failure` left the old open window and
+  the spent probe flag in place, so `state()` read HalfOpen for ever and `check()` refused every
+  order, the next probe included, until a manual `reset()`. A failure while the probe is spent now
+  re-arms the open window from now and frees the probe (window stored before the flag is
+  released), and `check()` re-reads the state after winning the probe flag, so a failed probe is
+  never followed at once by another. Audit H3: the loom tests now drive the real struct through a
+  `crate::sync` shim (loom atomics under the `loom` feature, std atomics otherwise). Files:
+  `crates/trading/src/{sync.rs,lib.rs,oms/circuit_breaker.rs}`,
+  `crates/trading/tests/loom_circuit_breaker.rs`. Tests:
+  test_regression_failed_half_open_probe_rearms_the_open_window,
+  test_late_failure_while_open_keeps_the_open_window,
+  loom_failed_probe_reopens_and_allows_no_second_probe (both bite-checked: each fails with the
+  re-arm removed). Honest limits: only the breaker moved behind the shim here; the other loom files are unchanged
+  by this item; O(1), three atomics on the failure path.
+
+- [x] **M7 — Orders carry their exchange segment (I-P1-11).** `ManagedOrder` and
+  `PlaceOrderRequest` had no segment, so the paper filler, the reconcile mirror and the exit path
+  keyed on the bare `security_id` and two instruments sharing an id in different segments could
+  fill, net or close each other. Both now carry `exchange_segment`; a plain order sends it on the
+  wire, super and forever orders book NSE_FNO, and an unknown segment code is refused before any
+  order exists (`resolve_order_segment_code` / `resolve_order_segment_str`, counted on
+  `tv_oms_unknown_order_segment_refused_total{source}`, logged with `code = I-P1-11`).
+  `order_runtime` keys `mirror` and `pending_paper` on `(security_id, segment)` and drops
+  `segment_matches_first_seen`; `local_reconcile` compares per segment on both legs; the exit
+  path closes and cancels only its own segment and its bracket check reads NSE_FNO; the dead
+  pipeline books the tick's segment. Files: `crates/trading/src/oms/{types.rs,engine.rs,
+  reconciliation.rs,exit_rules.rs}`, `crates/trading/tests/{gap_enforcement.rs,oms_integration.rs,
+  safety_layer.rs}`, `crates/app/src/{order_runtime.rs,exit_execution.rs,trading_pipeline.rs}`,
+  `crates/app/tests/risk_segment_aware_call_guard.rs` (exit_execution off the baseline). Tests:
+  a_mark_on_another_segment_must_not_fill_a_pending_paper_order (bite-checked: fails with a
+  bare-sid lookup), test_local_reconcile_catches_a_fill_booked_to_the_wrong_segment,
+  test_execute_exit_closes_only_its_own_segment, test_execute_exit_refuses_an_unknown_segment_code.
+  Honest limits: Landmine 2 (the E9 cross-feed id-space mapping) is untouched and there is no
+  `dry_run` flip; `trading_pipeline.rs` still calls the legacy risk overloads (dead code, pinned
+  shrink-only); O(1), one hash probe per lookup.
+
+- [x] **M8 — Subscription changes are written to `ws_event_audit`.** An in-place swap, an
+  in-place resubscribe, a ghost unsubscribe resend and an 805 park reached a log line and a counter
+  only, and CloudWatch keeps logs 14 days, so which contract a socket carried when lived nowhere
+  durable. Four new kinds (`subscription_swapped`, `subscription_resubscribed`,
+  `ghost_unsubscribe_resent`, `overflow_parked`) and five nullable columns (`new_security_id`,
+  `new_segment`, `instruments_added`, `instruments_removed`, `instruments_held`; the old instrument
+  uses `security_id`/`segment`), self-healed with `ALTER ADD COLUMN IF NOT EXISTS`. The emit is one
+  `OnceLock` load and one `try_send` per command (never per tick); a full channel is counted on
+  `tv_ws_event_audit_dropped_total{reason="subscription_change"}`. The live-feed forwarder installs
+  the channel and writes the rows, and every row it writes gets a strictly increasing stamp
+  (`StrictStamp`, `max(now, last + 1)`), so two events of one kind on one socket inside one clock
+  tick cannot share a DEDUP key. Files: `crates/common/src/ws_event_types.rs`,
+  `crates/storage/src/ws_event_audit_persistence.rs`,
+  `crates/core/src/websocket/{pool_supervisor.rs,order_update_connection.rs}`,
+  `crates/app/src/{ws_audit_consumer.rs,dhan_rest_stack.rs}`. Tests:
+  test_subscription_change_kinds_round_trip_and_are_distinct,
+  a_swap_row_names_its_pool_both_contracts_and_the_outcome,
+  an_overflow_park_row_carries_the_805_code,
+  the_stamp_is_strictly_increasing_even_when_the_clock_stalls_or_steps_back (bite-checked: fails
+  with `<` in place of `<=`), the_forwarder_installs_the_subscription_channel_and_writes_its_rows,
+  install_subscription_audit_is_set_once. Honest limits: a resubscribe row carries counts, not the
+  instrument list; a row the bounded channel cannot take is counted and paged once per episode,
+  not kept; not run against a live QuestDB here.
+
+- [x] **M4/L4 — The operator console is harder to abuse.** The portal is a public URL behind one
+  shared secret that can stop the trading box. Before: CORS allowed any origin, the key sat in
+  `localStorage`, two server strings reached `innerHTML` unescaped, and nothing slowed a caller
+  guessing keys. Now: no CORS block on the Function URL or the API (same-origin only); the key is
+  kept in `sessionStorage`; both strings pass through `esc()`; a per-container failed-key guard
+  refuses a source after `AUTH_FAILURE_LIMIT` (10) wrong keys in `AUTH_FAILURE_WINDOW_SECS` (300)
+  with a 429, bounded at `AUTH_FAILURE_MAX_SOURCES` (4,096); reserved concurrency 3; an API
+  Gateway stage throttle (rate 2/s, burst 10). Files: `crates/aws-lambdas/src/{operator_control.rs,
+  operator_control_console.html}`, `deploy/aws/terraform/operator-control-lambda.tf`, new
+  `crates/aws-lambdas/tests/operator_portal_exposure_guard.rs`. Tests: aws-lambdas lib 613,
+  operator_portal_exposure_guard 4, browser_surface_and_toolchain_guard 12. Honest limits: the
+  guard is per container, so the ceiling is 3 × 10 per window per source and an address-rotating
+  caller is not limited by it; the secret's length is the real control. **Risk:** AWS refuses
+  reserved concurrency when the account limit is 10, and the apply runs on merge; the owner was
+  asked (2026-10-04) whether to keep the cap. `terraform fmt`/`validate` not run (no terraform
+  CLI in the container).
+
+- [x] **M5/L8/L2 — Embedded shell, awk/jq and flaky tests are budgeted.** Before: the console's
+  SSM command strings, the shell inside workflow SSM commands, and awk/jq programs could grow
+  without any guard, and a test that failed once and passed on retry turned CI green. Now:
+  `crates/common/tests/shell_budget_guard.rs` pins the console's embedded shell per file (lines
+  and bytes), each workflow's SSM shell, every file's awk/jq use and the All Green jq program,
+  as ceilings that may only fall (a stale row fails too); the CI nextest profile sets
+  `flaky-result = "fail"` and requires nextest 0.9.131 or later. The rust-only lock §0.10 records
+  the rule. Files: `crates/common/tests/shell_budget_guard.rs`, `.config/nextest.toml`,
+  `.claude/rules/project/rust-only-forever-lock-2026-07-19.md`,
+  `docs/claude-rules-full/project/rust-only-forever-lock-2026-07-19.md`. Tests:
+  console_embedded_shell_never_grows, ssm_workflow_shell_never_grows, awk_jq_usage_never_grows,
+  all_green_jq_program_never_grows, embedded_shell_and_awk_jq_self_test,
+  nextest_ci_profile_fails_flaky_tests, nextest_flaky_self_test (shell_budget_guard 12 pass;
+  each table bite-checked). Verified with nextest 0.9.146, the version CI installs: a test that
+  passes only on retry is reported `FLKY-FL` and fails the run. Honest limit: a budget caps
+  growth; it does not remove the existing shell (that is the shrink-only follow-up).
+
+### Added 2026-10-04 (deep audit, items M1 and M2)
+
+- [x] **M1 — A shed frame the WAL then fails to write is counted as lost.** A frame the ring or
+  the drain shed was marked unapplied and left to the WAL; a WAL write that failed afterwards
+  lost it with no count. New `wal_frame_fate` table records, per frame sequence, which side shed
+  it and whether the writer lost it; the side that completes the pair counts the loss
+  (`tv_wal_shed_frames_lost_total{shed}`, `tv_ticks_lost_total{source="wal_lost_after_shed"}`,
+  WS-SPILL-02). The drain refuses to shed a depth frame the writer already lost and writes it.
+  The writer reports every record of a discarded segment, every record it could not write, and
+  every record left in its queue at exit; an abandoned shutdown counts unflushed sheds. Files:
+  `crates/storage/src/{lib,wal_frame_fate,ws_frame_spill}.rs`,
+  `crates/core/src/websocket/pool_supervisor.rs`, `crates/app/src/dhan_feed_stack.rs`,
+  `crates/common/tests/loss_counter_visibility_guard.rs`. Tests:
+  test_note_shed_then_note_lost_counts_a_ring_shed_as_lost,
+  test_a_shed_racing_a_loss_is_counted_exactly_once,
+  test_discarded_writer_reports_a_shed_frame_as_lost,
+  test_records_left_at_writer_exit_are_reported_lost,
+  drain_may_shed_depth_refuses_a_frame_the_wal_writer_lost. Honest limits: a crash loses the
+  queue and the table; a slot reused by a newer frame makes the older fate unknown (counted).
+- [x] **M2 — The backup-copy dedup no longer drops an older packet that is not a copy.** Only a
+  packet matching the other socket's fingerprint is dropped; an older one is kept as late, in its
+  own 4-entry ring, so it never evicts the main ring and its twin is still dropped. File:
+  `crates/app/src/main_feed_backup.rs`. Tests:
+  test_admit_tick_older_copy_is_kept_as_late_newer_from_backup_accepted,
+  test_lagging_copy_beyond_the_ring_is_kept_as_late,
+  proptest_two_socket_interleave_never_double_counts. **Amended the same day after review:** the
+  first draft kept every unmatched older packet, so a copy lagging past the ring was written
+  twice (scope lock 2026-10-02: one copy per packet). Now kept only when the ring still holds a
+  strictly older packet from the other socket (`ring_covers`); otherwise dropped as `older`,
+  counted. Tests: proptest_conflating_sockets_never_fold_a_packet_twice (bite-tested against
+  the first draft), test_regression_lagging_copy_beyond_the_ring_is_dropped_as_older. Honest
+  limit: a real packet the other socket skipped is dropped when it arrives more than the ring
+  behind, or with the same volume and trade time as a packet the other socket sent.
+- [x] **M1 review fixes.** The abandoned-shutdown scan marks each frame it counts as lost, so the
+  detached writer cannot count it again; records past the tally are counted unknown only when
+  the file ends short. File: `crates/storage/src/{wal_frame_fate,ws_frame_spill}.rs`. Test:
+  test_count_unflushed_sheds_marks_what_it_counts_so_a_late_loss_is_not_recounted.
+- [x] **N2 — The candle hand-off queue no longer allocates under a backlog.** The tokio `mpsc`
+  between the frame drain and the seal writer grew in 32-slot blocks as seals queued; it is now
+  a pre-sized bounded `crossbeam_channel` (`SealSender`), allocated once at build (≤ 46 MB
+  resident). Files: `crates/storage/src/seal_writer_runner.rs`,
+  `crates/app/src/{dhan_feed_stack,rest_candle_fold}.rs`,
+  `crates/storage/tests/dhat_seal_queue_backlog.rs`. Test:
+  dhat_seal_queue_backlog_never_allocates_where_the_tokio_queue_did.
+
 ## Edge Cases
 
 - PR1: log burst larger than the non-blocking buffer → lines dropped and counted, never blocking.
@@ -2713,8 +2932,64 @@ Status of the rest, so the next session does not re-audit:
 
 | State | Items |
 |---|---|
-| Partly done (remaining work named in each item) | PR5, PR8 (shutdown/boot `blocking_flush`, seal-writer cycle, order observability flushes still `block_in_place`), D2 (waits on PR12), D3 (D3a/b/c-1 done; D3c-2/3 open), D5 (waits on PR11), D6 (D6e onward), PR16 (`df` fork with no timeout, drain still on the shared runtime, boot seal drain bare), PR17 (seal DLQ not synced; torn-line and seal-spill sync done 2026-10-04), PR18, PR19, D7 (808 policy open), D9 (D9b-3 open), PR24, PR28b (owner lock mode), PR31c, PR32 (hour-boundary late append in tick spill replay; unapplied-table overflow uncounted; archive blind to capture-log deferrals), PR33, PR36 (SSH done), PR39, PR42 (42a/42b done; 42c owner; order/position update event writers have no spill tier), PR55 (manual and tag deploys gated; input-in-shell and branch checks open), PR56 (alarm open), PR40b-f (renamed copies and the boot-drain hold done 2026-10-04; refused/poison exemption and row 296 open) |
+| Partly done (remaining work named in each item) | PR5, PR8 (shutdown/boot `blocking_flush`, seal-writer cycle, order observability flushes still `block_in_place`), D2 (waits on PR12), D3 (D3a/b/c-1 done; D3c-2/3 open), D5 (waits on PR11), D6 (D6e onward), PR16 (`df` fork with no timeout, drain still on the shared runtime, boot seal drain bare), PR17 (seal DLQ, torn-line and seal-spill sync done 2026-10-04; tick spill marker sync and the "deferred" label open), PR18, PR19, D7 (808 policy open), D9 (D9b-3 open), PR24, PR28b (owner lock mode), PR31c, PR32 (hour-boundary late append in tick spill replay; unapplied-table overflow uncounted; archive blind to capture-log deferrals), PR33, PR36 (SSH done), PR39, PR42 (42a/42b done; 42c owner; order/position update event writers have no spill tier), PR55 (manual and tag deploys gated; input-in-shell and branch checks open), PR56 (alarm open), PR40b-f (all parts done 2026-10-04; awaiting merge) |
 | Open, nothing built | PR6, PR7, PR9, PR10, PR11, PR12, PR13, PR14, D1, D4, D8, PR23, PR25, PR26, PR27, PR34, PR35, PR37, PR38, PR43, PR44, PR45, PR46, PR47, PR49, PR50, PR51, PR52, PR54, PR57, PR59, PR40c-f, PR40d-f |
 | Waiting on the owner | OWNER-202, PR42c, PR28b lock mode, D11/R3-13 (no `wip/d11` branch exists any more; the box curfew still blocks Sundays; the session is 2026-11-08) |
 | Dormant | PR48 (console wipes switched off by `CONSOLE_DATA_WIPES_AUTHORIZED = false`) |
 | Done in a later fold | PR40a follow-up (`escalation_pending` counted in `unwritten_seals`) |
+
+### Added 2026-10-05 (deep audit, items M6, M10, N4 and L9)
+
+- [x] **M6 — The per-tick delivery-lag histogram no longer allocates.** `record_ws_lag` recorded
+  into a `metrics::Histogram`; the production recorder keeps each sample in a `metrics_util`
+  `AtomicBucket` that allocates a 64-slot block about every 64 samples per socket, invisible to
+  `dhat_ws_lag.rs`, which runs with no recorder. Each socket slot is now a fixed `WsLagSlot` (15
+  atomic bucket counts and a sum): a scan of 14 fixed bounds and two relaxed adds per tick, O(1),
+  no allocation. `publish_fold_depth` republishes the cumulative counts as the same
+  `tv_dhan_ws_lag_ms_{bucket,count,sum}` lines (counters set with `absolute`), so the operator
+  console reads what it read before. Files: `crates/app/src/dhan_feed_stack.rs`,
+  `crates/app/src/observability.rs`, `crates/app/tests/dhat_ws_lag_recorder.rs`,
+  `.github/workflows/ci.yml`, `CLAUDE.md`. Tests:
+  dhat_record_ws_lag_with_the_production_recorder_is_zero_allocation,
+  ws_lag_slot_renders_the_lines_a_prometheus_histogram_rendered,
+  ws_lag_slot_counts_a_sample_equal_to_a_bound_in_that_bucket,
+  ws_lag_bucket_bounds_match_the_ms_histogram_buckets. Also adds the merged
+  `dhat_seal_queue_backlog` (N2) to the CI DHAT lane, which failed its drift check without it.
+- [x] **M10 — A refused candle written by the drain moves the tokio worker aside first.** When
+  the escalation queue is full, `escalate` writes the seal itself; that write now runs inside
+  `off_worker`, as the tick writer's inline spill does, so the drain's worker is handed to the
+  runtime while it blocks. The midnight day-file sync already left the append lock (PR17). File:
+  `crates/storage/src/seal_writer_runner.rs`. Test: every_blocking_writer_step_runs_off_the_worker
+  (extended). Honest limit: the drain itself still waits for the write; only the worker's other
+  tasks keep running.
+- [x] **N4 — A future-named WAL segment is filed under its own date in the cold bucket.**
+  Segment names never fall, so after the clock once ran ahead every later segment kept a future
+  name and its raw-frame upload landed under a later day's folder. `segment_key` now uses the
+  file's mtime date when the name is more than a day ahead of it (counted on
+  `tv_raw_frame_upload_future_name_total`, one `warn!`); names are unchanged because replay orders
+  by them. File: `crates/storage/src/raw_frame_upload.rs`. Test:
+  segment_key_files_a_name_more_than_a_day_ahead_under_its_mtime_date.
+- [x] **L9 — The banned interpreter's name may only appear in fewer files.** No file in that
+  language exists; the word is in 263 files, some of them verbatim operator quotes that may not be
+  edited. `banned_word_file_count_never_grows` pins the count (tracked and untracked files, ASCII
+  case-insensitive) and fails when it rises or falls without the ceiling moving with it. File:
+  `crates/common/tests/rust_only_guard.rs`. Tests: banned_word_file_count_never_grows,
+  banned_word_scan_self_test.
+- [x] **M3 (second pass) — 51 more uncoded `error!` lines carry a code.** Each gets an existing
+  code and a `source` naming the arm, picked so no CloudWatch filter matches it (no new page).
+  The ratchet drops 61 -> 10; the ten left are listed with their reasons at the budget. Files:
+  24 production files across api, app, core, storage and trading, plus
+  `crates/common/tests/error_code_tag_guard.rs`. Tests: uncoded_error_sites_may_only_shrink,
+  every_critical_code_with_an_emit_site_is_alarmed_or_allowlisted.
+
+- [x] **H3 (core) — a loom test drives the real ghost-unsubscribe register.** The six
+  per-slot registers move into `GhostRegister` (atomics from the new `crate::sync` shim:
+  std atomics normally, loom's under the `loom` feature); the public functions delegate
+  to the one static. The new loom test proves a take is never torn, no request is lost
+  or taken twice, and a pending request is never overwritten; bite-checked by clearing
+  the flag before reading the slot. Added to the CI loom lane (drift list, `--test`,
+  count 3 -> 4). Files: `crates/core/src/sync.rs`, `crates/core/src/lib.rs`,
+  `crates/core/src/websocket/pool_supervisor.rs`, `crates/core/tests/loom_ghost_register.rs`,
+  `.github/workflows/ci.yml`. Tests: a_take_racing_a_new_request_never_tears_loses_or_duplicates,
+  a_pending_request_is_never_overwritten_by_a_later_one,
+  a_racing_take_never_reads_a_torn_id_and_segment_pair.

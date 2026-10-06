@@ -1249,7 +1249,14 @@ async fn run_drop_ddl(client: &Client, base_url: &str, object: &str, ddl: &str) 
             drop_status_counts_as_answered(Some(resp.status().as_u16()))
         }
         Err(err) => {
-            error!(object, ?err, "legacy candle DROP request failed");
+            error!(
+                code =
+                    tickvault_common::error_code::ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                source = "legacy_candle_drop",
+                object,
+                ?err,
+                "legacy candle DROP request failed"
+            );
             drop_status_counts_as_answered(None)
         }
     }
@@ -1296,7 +1303,14 @@ async fn run_ddl(client: &Client, base_url: &str, table: &str, ddl: &str) -> boo
             false
         }
         Err(err) => {
-            error!(table, ?err, "DDL request failed");
+            error!(
+                code =
+                    tickvault_common::error_code::ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                source = "candle_ddl",
+                table,
+                ?err,
+                "DDL request failed"
+            );
             false
         }
     }

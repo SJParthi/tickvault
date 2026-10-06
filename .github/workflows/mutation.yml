@@ -124,9 +124,19 @@ jobs:
         # binary; `--test-threads` is a libtest (test binary) flag, so the
         # correct shape preserving the original intent (bound test
         # parallelism to 2 threads) is `-- -- --test-threads=2`.
+        #
+        # `--in-place` (2026-10-04): by default cargo-mutants copies the tree
+        # into a scratch directory WITHOUT `.git`, so every guard test that
+        # calls `git ls-files` (browser_surface_and_toolchain_guard and five
+        # more) failed the UNMUTATED baseline and no mutant was ever tested
+        # (runs 35579483816, 36404195621: "cargo test failed in an unmutated
+        # tree"). Mutating the CI checkout in place keeps `.git`; the checkout
+        # is disposable and the run is serial (no `-j`), which `--in-place`
+        # requires.
         run: |
           set -euo pipefail
           cargo mutants ${{ steps.changed.outputs.packages }} \
+            --in-place \
             --timeout=120 \
             --no-shuffle \
             -- -- --test-threads=2 \

@@ -1587,3 +1587,52 @@ $0.90.
 
 **§2.3n's lever rule is NOT met.** No lever is taken. October is projected at
 about the $150 line before this (COST NOTE 2026-09-25); this adds about 0.3%.
+
+## COST NOTE 2026-10-04 — five data-at-risk pages over ten counters (+$3.50–4.00/mo)
+
+**Authorization:** the operator tapped "Page me" on the 2026-10-04 decision
+card, which named these counters and priced them at about $3 to $4 a month.
+Recorded in `dhan-rest-only-noise-lock-2026-07-14.md` §2.9 before the
+terraform, per the rule-file-first law.
+
+| Item | Cost |
+|---|---:|
+| 10 EMF names (3 cloud upload, 3 prune refused for no copy, order-update broadcast drops, log lines dropped, tick and depth inline fallback) | $3.00 |
+| 5 alarms (two 3-leg composites, one 2-leg composite, two single) | $0.50, or $1.00 if billed per referenced metric |
+| **Total** | **$3.50–4.00/mo** |
+
+**Budget position: NOT read live.** The session that wrote this had no
+read-only AWS key. The October ceiling is $150 (Quote 23) and the 2026-09-25
+note projected October at about that line before this change, so this adds
+about 2.5% to a month already projected at the line.
+
+**§2.3n's lever rule is NOT met.** No lever is taken. The operator chose the
+spend knowing the price.
+
+## COST NOTE 2026-10-05 — six loss-group pages over 55 counters (+$2.40/mo)
+
+**Authorization:** the operator tapped "Turn on" on the 2026-10-05 decision
+card ("Turn on the six extra phone alarms (H1) and the N3 counters?"), whose
+consequence priced the change at about $2.40 a month. Recorded in
+`dhan-rest-only-noise-lock-2026-07-14.md` §2.10 before the terraform, per the
+rule-file-first law.
+
+| Item | Cost |
+|---|---:|
+| 6 derived metrics (one `tv_loss_*` per group, `host` dimension) | $1.80 |
+| 6 alarms | $0.60 |
+| 55 log metric filters on `/tickvault/<env>/metrics` | $0.00 |
+| EMF names added | 0 |
+| **Total** | **$2.40/mo (upper bound)** |
+
+Derived metrics bill only for hours with datapoints; the seeded counters
+publish a zero every scrape while the box runs, so the box's running hours set
+the real figure, at or under the line above.
+
+**Budget position: NOT read live.** The session that wrote this could not run
+a CloudWatch or Cost Explorer read. The standing ceiling is $150 from October
+(Quote 23); this adds about 1.6% of it. Against the operator's ₹15,000 cap,
+$2.40 is about ₹205 at ~₹85/$ (Assumed rate).
+
+**§2.3n's lever rule is NOT met.** No lever is taken. The operator chose the
+spend knowing the price.

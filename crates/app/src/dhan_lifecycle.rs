@@ -654,7 +654,11 @@ async fn fetch_known_instruments(
         ))
         .build()
     else {
-        tracing::error!("lifecycle: HTTP client build failed — absence pass skipped");
+        tracing::error!(
+            code = tickvault_common::error_code::ErrorCode::HttpClient01BuildFailed.code_str(),
+            source = "lifecycle_absence_pass",
+            "lifecycle: HTTP client build failed — absence pass skipped"
+        );
         return Vec::new();
     };
     let sql = build_known_instruments_query();
@@ -666,11 +670,17 @@ async fn fetch_known_instruments(
     {
         Ok(resp) if resp.status().is_success() => resp.text().await.ok(),
         Ok(resp) => {
-            tracing::error!(status = %resp.status(), "lifecycle: known-instruments query non-2xx");
+            tracing::error!(code = tickvault_common::error_code::ErrorCode::InstrumentP1SingleRowLifecycle.code_str(), source = "known_query_non_2xx", status = %resp.status(), "lifecycle: known-instruments query non-2xx");
             None
         }
         Err(err) => {
-            tracing::error!(?err, "lifecycle: known-instruments query failed");
+            tracing::error!(
+                code = tickvault_common::error_code::ErrorCode::InstrumentP1SingleRowLifecycle
+                    .code_str(),
+                source = "known_query_failed",
+                ?err,
+                "lifecycle: known-instruments query failed"
+            );
             None
         }
     };
@@ -679,6 +689,9 @@ async fn fetch_known_instruments(
         Ok(k) => k,
         Err(err) => {
             tracing::error!(
+                code = tickvault_common::error_code::ErrorCode::InstrumentP1SingleRowLifecycle
+                    .code_str(),
+                source = "known_query_unparseable",
                 err,
                 "lifecycle: known-instruments response unparseable — the absence pass is \
                  SKIPPED this run. Instruments that vanished from today's master keep \

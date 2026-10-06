@@ -422,6 +422,8 @@ fn emit_order_update_ws_audit(
         down_secs: i64::try_from(down_secs).unwrap_or(i64::MAX),
         attempts: i64::from(attempts),
         market_hours: tickvault_common::market_hours::is_within_market_hours_ist(),
+        // The order-update socket changes no subscription (audit M8).
+        subscription: tickvault_common::ws_event_types::WsSubscriptionDetail::NONE,
     };
     // O(1) EXEMPT: end
     // 2026-07-05: upgraded from debug! (silent-loss window — the operator found
@@ -848,7 +850,13 @@ async fn connect_and_listen(
                         tickvault_storage::ws_frame_spill::next_frame_seq(),
                     );
                     if outcome == AppendOutcome::Dropped {
+                        // The spill counts the drop itself, per frame type
+                        // (`drop_critical` / `ticks_lost_*`); this line names
+                        // the frame type the spill's own log line does not.
                         error!(
+                            code = tickvault_common::error_code::ErrorCode::WsSpill02FrameDropped
+                                .code_str(),
+                            source = "order_update_wal",
                             "CRITICAL: WAL spill dropped OrderUpdate frame — disk writer stalled"
                         );
                     }
@@ -933,6 +941,9 @@ async fn connect_and_listen(
                         if let Err(err) = order_sender.send(update) {
                             metrics::counter!("tv_order_update_broadcast_drops_total").increment(1);
                             error!(
+                                code = tickvault_common::error_code::ErrorCode::OrderEvt01PersistFailed
+                                    .code_str(),
+                                stage = "broadcast_no_receiver",
                                 order_no = %err.0.order_no,
                                 "order update broadcast dropped — no active receivers \
                                  (OMS subscriber likely crashed or channel torn down)"
@@ -961,6 +972,8 @@ async fn connect_and_listen(
                         match classify_auth_response(&text) {
                             AuthResponseKind::Failed(reason) => {
                                 error!(
+                                    code = tickvault_common::error_code::ErrorCode::WsGapDisconnectClassification
+                                        .code_str(),
                                     reason = %reason,
                                     "order update WebSocket auth/API error from server"
                                 );

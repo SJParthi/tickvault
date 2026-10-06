@@ -211,6 +211,8 @@ pub fn spawn_supervised_disk_pressure_loop(
                 }
                 Err(err) => {
                     error!(
+                        code = ErrorCode::DiskWatcher01Respawned.code_str(),
+                        source = "disk_pressure_loop",
                         ?err,
                         "disk-pressure loop died — respawning (the volume is unwatched \
                          until it returns)"

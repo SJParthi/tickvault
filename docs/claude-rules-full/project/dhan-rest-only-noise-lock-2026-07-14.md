@@ -4436,3 +4436,177 @@ fires every hour.
   wedged runtime would then hide its own stall).
 - Removes the 09:00–15:40 IST gate, or drops the broker name from the
   Telegram line.
+
+## §2.9 — 2026-10-04: five DATA-AT-RISK pages — cloud backup failing, disk kept for want of a backup, order updates dropped, log lines dropped, the feed thread writing to disk itself
+
+**The operator's answer, as recorded by the platform:** Parthi, 2026-10-04
+08:18:24Z, the audit thread, tapped option A **"Page me"** on a decision card
+whose question read *"Phone you when data is at risk: failed cloud backups,
+dropped order updates, dropped log lines?"*. The card's context named about
+nine counters (cloud backup upload failures, backup marker write failures,
+files kept because they could not be backed up, order updates dropped, log
+lines dropped, saves that fell back to writing on the feed's own thread) and
+priced them at about $3 to $4 a month. Option A's consequence read *"Counters
+go to CloudWatch and each one phones you once when it starts going up,
+off-hours quiet where it makes sense."*
+
+The tap answers an ENUMERATED ask that names these counters and their price,
+so it is accepted in the same shape §2.6–§2.8 accept a go-ahead on an
+enumerated option. It authorizes the pages below and nothing wider. This dated
+row is the §3 record, written in the same change as the terraform and before
+it can deploy. Source: the 2026-10-04 workspace audit (counters counted on
+the box that reached no one).
+
+**Why these.** Each counter is already counted on the box and none reached
+CloudWatch, so each failure was visible only to someone reading `/metrics` on
+the host. Grouped by what the operator DOES, not by counter (the
+`market-data-persistence-loss` / `durable-floor-breach` precedent), so ten
+counters become five pages.
+
+| Alarm | Counters (summed) | Fires when | Telegram line |
+|---|---|---|---|
+| `tv-<env>-cold-backup-failing` | `tv_raw_frame_upload_failed_total`, `tv_cold_file_upload_failed_total`, `tv_raw_upload_marker_write_failed_total` | ≥ 1 in 2 of 3 consecutive 900 s periods | "Copies of captured market data are not reaching cloud storage — the files are kept on the server, but the disk will fill" |
+| `tv-<env>-disk-kept-not-backed-up` | `tv_wal_prune_refused_not_uploaded_total`, `tv_seal_spill_prune_refused_not_uploaded_total`, `tv_quarantine_prune_refused_not_uploaded_total` | ≥ 1 in one 900 s period | "Old market data files are due to be cleared but have no cloud copy, so they are kept — the disk will fill" |
+| `tv-<env>-order-update-dropped` | `tv_order_update_broadcast_drops_total` | ≥ 1 in one 300 s period | "🔷 DHAN: an order update from the broker reached nothing in the app — that update is missing" |
+| `tv-<env>-log-lines-dropped` | `tv_log_lines_dropped_total` | ≥ 1 in one 300 s period | "Log lines were dropped because the log writer fell behind — part of the record is missing" |
+| `tv-<env>-feed-thread-wrote-to-disk` | `tv_tick_rescue_inline_fallback_total`, `tv_depth_rescue_inline_fallback_total` | ≥ 1 in one 300 s period | "🔷 DHAN: the live price thread had to save to disk itself because the save helper was full or gone — prices may have been skipped while it waited" |
+
+All five: `treat_missing_data = notBreaching` (the box is stopped outside the
+trading window and these counters only move on a failure), NO `ok_actions`
+(a delta returning to zero never means the files were uploaded, the update
+arrived, or the lines came back), no dimension beyond `host`, NOT
+market-hours gated (uploads and prunes run mostly outside the session). The
+upload alarm alone waits for 2 of 3 periods, because one failed upload is
+retried on the next pass two minutes later; a failure that persists for half
+an hour is the page.
+
+Every counter is registered at 0 at boot (`main.rs`), so the CloudWatch
+agent's dropped first sample is the harmless zero, not the incident.
+
+**Honest cost (AWS list price, ap-south-1):** +10 EMF names at **$0.30 per
+metric per month** = $3.00, and +5 alarms at **$0.10 per alarm per month** =
+$0.50 on the house convention that a metric-math alarm bills as one alarm, or
+$1.00 if AWS bills per referenced metric (10). Total **$3.50 to $4.00/mo**.
+The budget was NOT read live on 2026-10-04 (no read-only key in the session
+that wrote this); the October ceiling is $150 per Quote 23, and the 2026-09-25
+note projected October at about that line before this change.
+
+**NOT claimed:**
+- That a page means data was LOST in every row. The two disk rows mean data is
+  KEPT and the disk is at risk; the order-update and log rows mean records are
+  gone; the feed-thread row means a wait, not proven loss.
+- That the thresholds are measured-optimal. No CloudWatch baseline exists for
+  any of the ten counters; changing a threshold needs one and its own dated
+  row.
+- That `tv_log_lines_dropped_total` never moves on a healthy day. Its buffer
+  is 128,000 lines and no drop has been observed, but that is Assumed, not
+  measured on the production host.
+
+**What a PR that violates §2.9 looks like (REJECT):**
+- Adds `ok_actions` to any of the five, or a per-connection, per-instrument or
+  per-file dimension.
+- Splits a group back into one alarm per counter without a dated row here.
+- Lowers the cold-backup alarm to a single period (one transient S3 failure
+  would page).
+- Drops the boot-time zero registration of any of the ten counters.
+- Adds a sixth counter to any group without a dated row here first.
+
+## §2.10 — 2026-10-05: six LOSS-GROUP pages over counters that were counted and reached no one (audit H1, N3)
+
+**The operator's answer, as recorded by the platform:** Parthi, 2026-10-05
+04:00:50Z, tapped option A **"Turn on"** on a decision card in the project
+chat whose question read *"Turn on the six extra phone alarms (H1) and the N3
+counters?"*. Option A's consequence read *"The audit thread adds them to PR
+#2022, which costs about $2.40 a month and stays well under the 15k INR cap."*
+The card was posted because a general "go ahead" did not name this change;
+the tap does.
+
+The six alarms are the six groups the 2026-10-04 audit's H1 inventory
+proposed, and N3 (socket-audit write failures, WAL and seal sync failures) is
+carried by groups 3 and 4. The tap answers an ENUMERATED, priced ask, so it is
+accepted in the same shape as §2.9. It authorizes the pages below and nothing
+wider. This dated row is the §3 record, written in the same change as the
+terraform (`deploy/aws/terraform/loss-group-alarms.tf`) and before it can
+deploy.
+
+**Why these.** Every counter below already counts a refusal, a drop or a
+failure on the box, and before this change none reached CloudWatch: some log a
+coded line that no filter reads (AUDIT-WS-01, STORAGE-GAP-03, AUDIT-06,
+AGGREGATOR-SEAL-01), some log at `warn!` (the WAL sync failure), some log
+nothing. Grouped by what the operator DOES, as in §2.9.
+
+**Route, and why it is cheaper than §2.9.** No EMF name is added. Each
+counter already ships as a plain JSON event to `/tickvault/<env>/metrics`
+every 60 s scrape; one log metric filter per counter extracts its per-scrape
+delta into ONE derived metric per group (a distinct `tv_loss_*` name, never a
+raw counter name, per the seal-drop naming rule). 55 filters (filters are
+free; the log group holds about 60 of its 100), 6 derived metrics, 6 alarms.
+
+| Alarm | Derived metric | Counters (summed) | Fires when | Telegram line |
+|---|---|---|---|---|
+| `tv-<env>-market-data-refused` | `tv_loss_market_data_refused_total` | `tv_dhan_ws_close_drain_discarded_total`, `tv_feed_aux_rows_refused_total`, `tv_spill_free_probe_blind_total` (`tier = "depth"` only; the tick tier writes blind, which is not loss), `tv_tick_spill_replay_lines_rejected_total`, `tv_candle_int_self_heal_refused_total`, `tv_top_volume_rank_rows_discarded_total`, `tv_top_volume_rank_append_failed_total` | ≥ 1 in one 300 s period | "🔷 DHAN: some received market data could not be saved and was set aside or refused — part of the record is missing" |
+| `tv-<env>-subscription-coverage-lost` | `tv_loss_subscription_gap_total` | `tv_dhan_dial_incomplete_total` (`stage = "spawn_skipped"` only), `tv_dhan_ws_subscribe_dispatch_failed_total`, `tv_dhan_ws_topup_failed_total`, `tv_dhan_ws_swap_failed_total`, `tv_dhan_ws_swap_timeout_total`, `tv_depth_rebalance_swaps_refused_total` (`reason` = `no_socket`, `channel_full` or `channel_closed` only), `tv_dhan_depth_universe_failed_total` (`reason = "empty_selection"` only) | ≥ 1 in one 300 s period | "🔷 DHAN: some planned price or depth connections did not start or did not take their contracts — those contracts are getting no data" |
+| `tv-<env>-audit-rows-lost` | `tv_loss_audit_rows_total` | `tv_ws_event_audit_write_errors_total`, `tv_feed_gap_audit_write_errors_total`, `tv_ws_event_audit_dropped_total` (every `reason` except `live_feed_forward`, which already pages through HOT-PATH-02), `tv_order_update_ws_audit_dropped_total`, `tv_dhan_feed_xverify_persist_errors_total`, `tv_dhan_live_xverify_audit_rows_discarded_total`, `tv_tf_verify_audit_rows_discarded_total`, `tv_audit_spill_refused_rows_total`, `tv_audit_spill_quarantined_rows_total`, `tv_audit_spill_replay_failed_total`, `tv_pnl_audit_persist_errors_total`, `tv_order_leg_pnl_persist_errors_total`, `tv_order_leg_pnl_dropped_total`, `tv_order_alert_dropped_total` | ≥ 1 in one 300 s period | "Some audit history rows could not be saved — there is a gap in the record" |
+| `tv-<env>-durability-sync-failing` | `tv_loss_durability_sync_total` | `tv_wal_fsync_errors_total`, `tv_seal_spill_sync_failed_total`, `tv_seal_unwritten_mark_errors_total`, `tv_wal_deferred_depth_persist_failed_total`, `tv_wal_applied_watermark_persist_failed_total` | ≥ 1 in 2 of 3 consecutive 300 s periods | "The server could not confirm saved data to disk — a power cut now could lose the newest data" |
+| `tv-<env>-order-path-dropped` | `tv_loss_order_path_total` | `tv_order_update_frames_dropped_total`, `tv_order_update_hollow_decode_total`, `tv_order_update_receiver_lagged_total`, `tv_mark_forward_dropped_total`, `tv_order_runtime_mark_producer_lost_total`, `tv_oms_unknown_segment_fills_refused_total`, `tv_risk_fill_rejected_total`, `tv_oms_fill_price_rejected_total`, `tv_oms_order_book_full_total`, `tv_order_runtime_sid_refused_total`, `tv_oms_order_aliases_refused_total`, `tv_oms_correlations_refused_total` | ≥ 1 in one 300 s period | "🔷 DHAN: an order update, fill or price meant for the order system was dropped or refused — check the order book" |
+| `tv-<env>-safety-bound-or-monitor-blind` | `tv_loss_bound_or_blind_total` | `tv_spot_price_store_refused_total`, `tv_prev_close_store_refused_total`, `tv_volume_leaderboard_refused_total` (`reason` = `capacity` or `window_bar_missing` only), `tv_depth_view_dropped_refused_total`, `tv_depth_view_held_today_refused_total`, `tv_wal_lag_tracker_refused_total`, `tv_spill_dir_health_check_failed_total`, `tv_resource_monitor_probe_failed_total`, `tv_oom_monitor_probe_failed_total`, `tv_ws_activity_watchdog_panicked_total` | ≥ 1 in one 300 s period | "A size limit was reached or a health check could not read the server — something may be going unwatched" |
+
+All six: `treat_missing_data = notBreaching`, NO `ok_actions` (a delta
+returning to zero never brings a row back), `host` dimension only, NOT
+market-hours gated (dials, audit writes and syncs all run outside the
+session too, and a dial that fails at 08:55 costs the session that follows).
+The durability alarm alone waits for 2 of 3 periods, because a sync is
+retried on the next attempt and one transient device error is not the page;
+a device that keeps failing is.
+
+**Left out on purpose, with the reason (each was in the H1 inventory):**
+- `tv_wal_fsync_inline_fallback_total` — every clean shutdown increments it
+  (the syncer is stopping, so the closing segment is synced inline). It is a
+  wait, not a failed sync.
+- `tv_depth_rebalance_swaps_refused_total` reasons `ack_pending`, `not_held`
+  and `rotation_halted` — the first two are retried the next minute by
+  design, the third follows an 805, which already pages.
+- `tv_dhan_dial_incomplete_total` stage `gave_up_outstanding_sockets` and
+  `tv_dhan_depth_universe_failed_total` reason `partial_selection` — both can
+  happen on a normal morning (a depth-200 mover that never resolves on a flat
+  open; a 09:00 attach with no traded stock option yet).
+- `tv_risk_mark_capacity_refused_total` — refused only for an instrument with
+  no position, whose mark is never read.
+- `tv_orphan_position_watchdog_fetch_failures_total` — that path already sends
+  its own Telegram line.
+- The two merges into existing alarms and the two optional alarms on
+  already-selected metrics (about $0.80 more) — not on the card.
+
+Every counter in a group is registered at 0 at boot for every label value its
+emit sites use (`main.rs`, or beside the emit site where a seed already ran
+before the first possible increment), so the CloudWatch agent's dropped first
+sample is the zero, not the incident. Ratchet:
+`crates/app/tests/alarmed_counters_are_seeded_guard.rs`
+(`every_loss_group_filter_counter_is_registered_at_boot`).
+
+**Honest cost (AWS list price, ap-south-1):** 6 derived metrics at **$0.30
+per metric per month** = $1.80, and 6 alarms at **$0.10** = $0.60. Metric
+filters are free. Total **$2.40/mo**, the figure on the card; derived metrics
+bill only for hours with datapoints, so this is an upper bound. The budget was
+NOT read live (the session that wrote this could not run a CloudWatch query);
+the standing ceiling is $150 per Quote 23.
+
+**NOT claimed:**
+- That every page means data was lost. The bound-or-blind and coverage rows
+  can mean a contract or a monitor went unwatched; the durability row means a
+  power cut COULD lose data, not that it did.
+- That none of these counters moves on a healthy production day. No
+  CloudWatch baseline was read for any of the 55. A counter that turns out to
+  tick daily is itself a finding (a probe that is always blind, a cap that is
+  always hit) and needs its own dated row to slice out.
+- That the delta model is live-verified for the metrics log group. It is the
+  same residual `seal-drop-alarm.tf` records: if the field ever proved
+  cumulative, Sum overcounts and pages too eagerly (loud, never silent).
+
+**What a PR that violates §2.10 looks like (REJECT):**
+- Adds `ok_actions` to any of the six, or a dimension beyond `host`.
+- Publishes a group under a raw counter name instead of its `tv_loss_*` name.
+- Splits a group into one alarm per counter without a dated row here.
+- Lowers the durability alarm to a single period.
+- Drops the boot-time zero registration of any counter in a group.
+- Adds a counter to a group, or widens a slice, without a dated row here.
