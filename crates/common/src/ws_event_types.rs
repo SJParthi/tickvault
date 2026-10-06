@@ -118,7 +118,8 @@ pub enum WsEventKind {
     /// records that we tried; this one records why we did not get through, and
     /// the `reason` travels into `ws_event_audit.reason` as one of the
     /// transport's bounded labels — `no_token`, `tls_config`, `bad_url`,
-    /// `timeout`, `connect`.
+    /// `timeout`, `connect`, and (2026-10-06) `upgrade_refused` for a
+    /// response other than 101, which was `connect` before.
     ///
     /// The classification already existed. It went to a counter labelled
     /// `endpoint` + `reason`, and the EMF processor folds label values into one

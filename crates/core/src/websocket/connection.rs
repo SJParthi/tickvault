@@ -439,6 +439,23 @@ pub const CLIENT_KEEPALIVE_PING_METRIC: &str = "tv_dhan_ws_client_keepalive_ping
 /// Counter: a dial failed. Labels: `endpoint`, `reason`.
 pub const DIAL_FAILED_METRIC: &str = "tv_dhan_ws_dial_failed_total";
 
+/// The `reason` of a dial the server answered with an HTTP status other than
+/// 101 (review fix 2026-10-06, round 4). Dhan opened no WebSocket for it, so
+/// it can never have evicted another socket; before, it was counted as
+/// `connect` with every transport error.
+pub const DIAL_FAILURE_UPGRADE_REFUSED: &str = "upgrade_refused";
+
+/// The bounded `reason` of a dial whose handshake returned an error: a
+/// non-101 response is [`DIAL_FAILURE_UPGRADE_REFUSED`], anything else
+/// (TCP, TLS, I/O, protocol) is `connect`. O(1), no allocation.
+fn dial_failure_label(err: &tokio_tungstenite::tungstenite::Error) -> &'static str {
+    if matches!(err, tokio_tungstenite::tungstenite::Error::Http(_)) {
+        DIAL_FAILURE_UPGRADE_REFUSED
+    } else {
+        "connect"
+    }
+}
+
 /// Counter: a subscribe message could not be sent. Labels: `endpoint`, `reason`.
 pub const SUBSCRIBE_FAILED_METRIC: &str = "tv_dhan_ws_subscribe_failed_total";
 
@@ -1167,7 +1184,14 @@ impl DhanSocketParams {
         // dial_failed: the socket never opened at all. On a cold 08:30 boot
         // this is the FIRST thing that can go wrong and the first sample is
         // exactly the one the agent discards.
-        for reason in ["bad_url", "connect", "no_token", "timeout", "tls_config"] {
+        for reason in [
+            "bad_url",
+            "connect",
+            "no_token",
+            "timeout",
+            "tls_config",
+            DIAL_FAILURE_UPGRADE_REFUSED,
+        ] {
             metrics::counter!(
                 DIAL_FAILED_METRIC,
                 "endpoint" => endpoint.as_str(),
@@ -1913,7 +1937,12 @@ impl<T: FeedTokenSource> DhanFeedSocket for DhanFeedSocketImpl<T> {
                 Ok(())
             }
             Err(err) => {
-                self.count_dial_failure("connect");
+                // Review fix 2026-10-06, round 4: a response other than 101
+                // (HTTP 400, 401, 429 ...) proves the server opened no
+                // WebSocket, so this dial evicted nobody; the 805 probe
+                // attribution drops its dial stamp on this label. Every other
+                // failure here stays `connect`.
+                self.count_dial_failure(dial_failure_label(&err));
                 warn!(
                     code = ErrorCode::WsGapConnectionState.code_str(),
                     endpoint = endpoint.as_str(),
@@ -2279,6 +2308,35 @@ mod tests {
         TWO_HUNDRED_DEPTH_PACKET_SIZE,
     };
     use tickvault_common::types::{ExchangeSegment, SecurityId};
+
+    /// Review fix 2026-10-06, round 4: a non-101 answer (the 2026-08-12 HTTP
+    /// 400 blackout, a 429 storm) is labelled `upgrade_refused`, the label the
+    /// 805 probe attribution reads as "no socket opened"; every other
+    /// handshake error stays `connect`.
+    #[test]
+    fn test_dial_failure_label_separates_a_refused_upgrade() {
+        use tokio_tungstenite::tungstenite::Error;
+        use tokio_tungstenite::tungstenite::http::Response;
+        for status in [400u16, 401, 403, 429, 500, 503] {
+            let response = Response::builder()
+                .status(status)
+                .body(None)
+                .expect("a response with a valid status builds");
+            assert_eq!(
+                dial_failure_label(&Error::Http(Box::new(response))),
+                DIAL_FAILURE_UPGRADE_REFUSED,
+                "HTTP {status}"
+            );
+        }
+        assert_eq!(dial_failure_label(&Error::ConnectionClosed), "connect");
+        assert_eq!(
+            dial_failure_label(&Error::Io(std::io::Error::from(
+                std::io::ErrorKind::ConnectionRefused
+            ))),
+            "connect"
+        );
+        assert_eq!(DIAL_FAILURE_UPGRADE_REFUSED, "upgrade_refused");
+    }
 
     /// The keepalive ping must NOT share the subscribe timeout.
     ///
