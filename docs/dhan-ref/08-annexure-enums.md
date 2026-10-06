@@ -445,6 +445,8 @@ Others: `RSI_14`, `ATR_14`, `STOCHASTIC`, `STOCHRSI_14`, `MACD_26`, `MACD_12`, `
 
 ## 2026-09-10 — LIVE VERDICT: Unsubscribe Full Market Depth is **24**; code 25 is IGNORED by Dhan
 
+> **⚠ SUPERSEDED (recorded 2026-10-06).** The code went back to **25** after the next day's session measured the same ghost shape on code 24 (`websocket-connection-scope-lock.md`, 2026-09-11 measurements and §"2026-09-12 — THE TWO-ARMED UNSUBSCRIBE PROBE: code 25 CONFIRMED"). Dhan's 2026-09-30 reply states RequestCode 25 unsubscribes one instrument (`docs/dhan-support/2026-09-13-depth-unsubscribe-ignored.md`). The code sends 25 (`FEED_UNSUBSCRIBE_TWENTY_DEPTH`). This section is kept as the 2026-09-10 record.
+
 §(b) above recorded the 24-vs-25 split as "UNVERIFIED-LIVE both ways" and said
 any future depth work "MUST live-probe before trusting either value". The probe
 ran on 2026-09-10, the first session with the ghost-instrument family seeded, and
