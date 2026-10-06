@@ -4133,6 +4133,31 @@ the pre-removal bill is −$0.10/mo. No new EMF metric name.
 alone; sets `ok_recovery = true`; adds a fourth xverify alarm without its own
 dated row.
 
+**2026-10-06 note — two new `reason` values on `xverify_failed`, no new page.**
+Owner approvals, verbatim: "Go ahead with whatever you want dude" and "See do
+everything whatever is recommended dude okay?" (plan ITEM 51a;
+`no-rest-except-live-feed-2026-06-27.md` §12.15.7). Recorded BEFORE the code.
+
+- **NO** new alarm, metric filter, `source`, Telegram phrase, EMF name,
+  dimension or `ok_actions`. No terraform change.
+- `xverify_failed` keeps its documented meaning: the check did not record
+  today after every same-day attempt. Its `reason` field gains two values,
+  `marker_not_written` (the comparison finished and every row was accepted,
+  but the day marker could not be saved to disk) and `audit_rows_lost` (some
+  audit rows were discarded or refused). Both used to log "recorded" and
+  release the S3 hold falsely; they now fail the attempt and page only after
+  the last one, as every other `reason` does. The filter matches `code`,
+  `level` and `source` only, so it already covers them.
+- Three per-attempt `warn!` sources are added, none of them filtered:
+  `xverify_attempt_marker_write_failed`, `xverify_marker_dir_sync_failed` and
+  `xverify_marker_keep_short`.
+- **Double page, accepted:** a mid-run audit discard already pages through the
+  §2.10 `audit_rows` group (`tv_dhan_live_xverify_audit_rows_discarded_total`
+  and `tv_dhan_feed_xverify_persist_errors_total` are members), and if every
+  attempt then loses rows the final `xverify_failed` (`reason =
+  audit_rows_lost`) pages again. The two say different things (rows lost; the
+  day not recorded), so both stay.
+
 ---
 
 ## §2.6 — 2026-09-25: three live-lane pages for DELAY, not only for loss — feed delay, main-feed reconnect time, blank new depth contracts

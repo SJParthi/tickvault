@@ -11,6 +11,7 @@
 - **KEEP:** AUTH REST (`generateAccessToken`, `RenewToken`, the minter Lambda); INSTRUMENT IDENTITY REST (Dhan detailed master CSV, niftyindices constituents); non-broker HTTP (QuestDB, Telegram, AWS SDK). **ORDER SIDE untouched.**
 - **REMOVED:** per-minute spot-1m pull, per-minute option-chain pull, expirylist.
 - **§12.15 (2026-09-24) RESTORED — verification only:** `POST /v2/charts/intraday`, interval `"1"`, ONCE per trading day after 15:41 IST, for the main-feed spot/index targets (plus the §12.15.6 depth-held option pass). Never written to `ticks` / `candles_*`. The daily S3 archive of day D is **held until a `dhan_live_crossverify` day marker exists for D** (marker only on a MEASURED verdict; hold ceiling `MAX_CROSSVERIFY_HOLD_DAYS`; disk-pressure leg NOT gated). The live lane never waits for the verifier.
+- **§12.15.7 (2026-10-06) the day marker means what it says:** the marker counts only after tmp + fsync + rename and a strict content read; "persisted" means zero audit rows discarded or refused; a failed marker write is a failed attempt, retried marker-only and paged only after the last attempt on the existing `xverify_failed` source; cross-verification markers are kept 400 days. REJECT: a unit-returning marker write, an `is_file()`-only reader, a sweep shorter than the gated hold lookback, counting a discarded row as persisted.
 
 **REJECT (headlines from §12.6 / §12.10.6 / §12.15.4):**
 - Removes the AUTH REST calls or the token minter, or the daily master CSV / niftyindices constituent fetch.

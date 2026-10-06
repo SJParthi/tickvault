@@ -92,7 +92,7 @@ fn test_tf_consistency_boot_module_is_not_a_stub() {
         "TfConsistencySummary",      // the one-per-run Telegram summary
         "TfConsistencyAborted",      // the supervisor abort page
         "daily_marker_exists(",      // once-per-day RunCatchUp gate (2026-07-15)
-        "write_daily_marker(",       // marker written on PASS only (G4a, fix round 2)
+        "try_write_daily_marker(",   // marker written on PASS only (G4a, fix round 2)
         "should_notify_summary(",    // no_data log-only predicate (2026-07-15)
         "daily_marker_path(",        // G11: the skip line names the exact marker path
         r#"status_label == "pass""#, // G4a: PASS is the ONLY marker-sealing verdict
