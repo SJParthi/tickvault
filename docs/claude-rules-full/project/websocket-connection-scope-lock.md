@@ -8827,7 +8827,7 @@ Two more gaps, both measured in source on this branch before the fix:
 
 | Surface | Was | Now |
 |---|---|---|
-| How long a window can run | "a window lasts at most 380 s after its first frame" (the Pass deferral row above). The 380 s cap and the 240 s note cutoff run from the probed socket's LATEST first frame, and its one watch restart clears that frame, so the clock started over: grant, first frame at +119 s, a deferral to +498 s, an 807 there, a fresh first frame at +617 s and a new deferral ran to about +997 s. All that time the window held the one process-wide turn and no parked depth socket could be granted. The 380 s figure was not a bound on the window. | bounded from the GRANT: `OVERFLOW_PROBE_WINDOW_MAX_SECS` = **740 s** = 120 (first-frame deadline) + 380 (deferral cap) for the window as granted, plus 120 (first-frame deadline) + 120 (watch) for its one restart. The grant instant is kept in `granted_at`, which a restart never resets. Past 740 s the next poll (once a second) fails the window as `failed_deferral_exhausted`, unless that poll passes it, so the true bound is **740 s from the grant, plus at most one poll**. *(⚠ CORRECTED, review round 9 below: three of those instants are stamped by a poll, so the bound is now 743 s, 740 plus 3 s of poll slack.)* A window with no restart still ends by 120 + 380 = 500 s, so the bound only bites after a restart: a restart buys a fresh first frame and a full watch, never a second deferral. The 380 s cap from the latest first frame still holds as well. Verified by `proptest_window_bound_holds_from_the_grant_across_restarts` (bite-checked: with the bound disabled it fails at 740 s) and `proptest_attribution_rules`. |
+| How long a window can run | "a window lasts at most 380 s after its first frame" (the Pass deferral row above). The 380 s cap and the 240 s note cutoff run from the probed socket's LATEST first frame, and its one watch restart clears that frame, so the clock started over: grant, first frame at +119 s, a deferral to +498 s, an 807 there, a fresh first frame at +617 s and a new deferral ran to about +997 s. All that time the window held the one process-wide turn and no parked depth socket could be granted. The 380 s figure was not a bound on the window. | bounded from the GRANT: `OVERFLOW_PROBE_WINDOW_MAX_SECS` = **740 s** = 120 (first-frame deadline) + 380 (deferral cap) for the window as granted, plus 120 (first-frame deadline) + 120 (watch) for its one restart. The grant instant is kept in `granted_at`, which a restart never resets. Past 740 s the next poll (once a second) fails the window as `failed_deferral_exhausted`, unless that poll passes it, so the true bound is **740 s from the grant, plus at most one poll**. *(⚠ Review round 9 below raised this to 743 s, 740 plus 3 s of poll slack, with no fresh dated quote; review round 10 WITHDREW that raise under the round-4 REJECT row below, so the bound is 740 s again.)* A window with no restart still ends by 120 + 380 = 500 s, so the bound only bites after a restart: a restart buys a fresh first frame and a full watch, never a second deferral. The 380 s cap from the latest first frame still holds as well. Verified by `proptest_window_bound_holds_from_the_grant_across_restarts` (bite-checked: with the bound disabled it fails at 740 s) and `proptest_attribution_rules`. |
 | A dial that fails | its BeginDial stamp stayed for 20 s and counted as eviction corroboration, so a socket stuck in a refused-dial loop (the 2026-08-12 HTTP 400 blackout, a 429 storm) re-stamped every 30–45 s and most unrelated sibling blips failed the window | a dial the server refused at the upgrade (a response other than 101, new transport label `upgrade_refused`, which was `connect` before) or that never left the process (`no_token`, `tls_config`, `bad_url`) drops the slot's stamp (one Release store of 0, in the connection task's DialFailed arm, `overflow_note_dial_failed`). Dhan evicts only when it ACCEPTS a socket, and such a dial accepted nothing. A `timeout` or a `connect` error keeps the stamp: acceptance is unknown there, so it still errs toward fail. The supervisor's backoff still never reads the reason. |
 
 **Honest limits:**
@@ -8961,7 +8961,7 @@ branch before the fix:
 
 | Surface | Was | Now |
 |---|---|---|
-| The 740 s bound and poll timing | the bound was built from exact deadlines, but three of its instants are STAMPED by a poll, not taken at the event: the first frame (the read task sets a flag, the next poll stamps it), the deferral cap (it fails at the first poll past it, so the restart can land up to a poll later) and the restart's fresh first frame. A late poll (a busy runtime) could therefore end a restarted watch a second or two past 740 s, and the poll inside that watch failed the window as `failed_deferral_exhausted` although the probed socket stayed up for its whole restarted watch | `OVERFLOW_PROBE_WINDOW_MAX_SECS` = **743 s**: 740 plus `OVERFLOW_PROBE_POLL_SLACK_SECS` (3 s, one one-second poll per stamped instant). The grant note cutoff stays **600 s** (743 − 3 − 120 − 20): the slack is kept for the polls, never spent on later notes. The bound is now **743 s from the grant, plus at most one poll**. A poll delayed by more than the slack can still fail such a window at the bound (errs toward fail). Verified by `test_a_window_that_settles_at_its_bound_still_passes`, rewritten on a reachable one-second-poll timeline (bite-checked: with no slack it fails at the G+740.5 poll) |
+| The 740 s bound and poll timing | the bound was built from exact deadlines, but three of its instants are STAMPED by a poll, not taken at the event: the first frame (the read task sets a flag, the next poll stamps it), the deferral cap (it fails at the first poll past it, so the restart can land up to a poll later) and the restart's fresh first frame. A late poll (a busy runtime) could therefore end a restarted watch a second or two past 740 s, and the poll inside that watch failed the window as `failed_deferral_exhausted` although the probed socket stayed up for its whole restarted watch | *(⚠ WITHDRAWN by review round 10 below: raising the bound needed a fresh dated quote under the round-4 REJECT row and none was recorded, so the bound is 740 s again and the late-poll case is an honest limit.)* `OVERFLOW_PROBE_WINDOW_MAX_SECS` = **743 s**: 740 plus `OVERFLOW_PROBE_POLL_SLACK_SECS` (3 s, one one-second poll per stamped instant). The grant note cutoff stays **600 s** (743 − 3 − 120 − 20): the slack is kept for the polls, never spent on later notes. The bound is now **743 s from the grant, plus at most one poll**. A poll delayed by more than the slack can still fail such a window at the bound (errs toward fail). Verified by `test_a_window_that_settles_at_its_bound_still_passes`, rewritten on a reachable one-second-poll timeline (bite-checked: with no slack it fails at the G+740.5 poll) |
 | A noted sibling's heal at its deadline | the 120 s heal deadline was checked only by the poll, so a sibling whose dial completed between the deadline and the next poll counted as healed: the window could pass although that sibling took more than 120 s, which errs toward pass | a dial that completes at or past the noted sibling's own deadline fails the window as `failed_sibling_unhealed`, exactly as that poll would have (one compare, O(1)). Verified by `test_a_heal_past_its_deadline_fails_without_waiting_for_a_poll` and the extended `proptest_attribution_rules` (a heal outcome only inside the deadline, an unhealed outcome from a heal only past it); both bite-checked |
 | A failed probe that leaves for good | round 8 said the probed socket parking for a reason other than 805 is never marked as re-parking. False after its one watch restart: its next coded close (808, say) fails the window in the close's own step, which marks it re-parking and clears the published watched slot, so the 808 park that follows was neither the socket under watch nor a noted sibling and reached no episode. The dead socket then held the main feed's turn for the full 120 s hold. The round-8 test passed only because it called the episode method directly, skipping the production gate | a non-805 park or a shutdown of a slot whose re-park request is still pending reaches the episodes (`left_reaches_episode` reads `OVERFLOW_REPARK`, one more Acquire load, cold), which clears the mark at once. Verified through the production gate by `test_a_failed_probe_that_leaves_for_good_reaches_the_episode_through_its_repark` (bite-checked: without the new clause it fails) |
 | The held state after a failed window | round 7 kept an episode `Waiting` after a failed window whose socket left for good, but nothing said so: no line, no counter. The only line the owner ever saw was the earlier failure, whose text says the next parked socket will be redialled as a test, which never happens | the poll that finds the wait over with nothing parked while a window has failed since the last pass reports it ONCE: outcome `held_after_failed_window` on the existing `tv_dhan_ws_overflow_probe_total` counter and a coded `warn!` (`WS-GAP-03`) saying the pool is not recovered and, for the main feed, that no new connection is opened until another 805 parks a socket and its probe passes. Edge-latched (`held_reported`), re-armed by a park or a pass. One bool, O(1). No new alarm, filter or page. Verified by `test_a_failed_window_whose_socket_left_never_recovers_silently` (it pinned the silence before; bite-checked) |
@@ -8981,7 +8981,8 @@ while a noted SIBLING is inside its own heal deadline or settle.
 **Honest limits (round 9):**
 
 - A poll delayed by more than the 3 s slack can still fail a restarted window
-  at the bound. Errs toward fail.
+  at the bound. Errs toward fail. *(⚠ Review round 10: with the slack withdrawn,
+  a poll late by any amount at a poll-stamped instant can.)*
 - The first-frame slot cannot tell an old dial of the SAME socket from its new
   one after a watch restart (the restart clears it, as before).
 - A stale first-frame store landing after the newly granted socket's own would
@@ -8990,7 +8991,8 @@ while a noted SIBLING is inside its own heal deadline or settle.
 
 REJECT (review round 9):
 
-- Raises `OVERFLOW_PROBE_WINDOW_MAX_SECS` above 743 s, spends the poll slack
+- *(⚠ WITHDRAWN by review round 10 below; the round-4 row stands unchanged.)*
+  Raises `OVERFLOW_PROBE_WINDOW_MAX_SECS` above 743 s, spends the poll slack
   on later notes (a grant note cutoff above 600 s), or removes the slack
   without re-deriving the bound. The round-4 row "Raises
   `OVERFLOW_PROBE_WINDOW_MAX_SECS`" now reads: above 743 s.
@@ -8999,3 +9001,36 @@ REJECT (review round 9):
   re-park request is pending.
 - Leaves the held state silent, or reports it more than once per held state.
 - Stamps a first frame from a report that does not name the slot under watch.
+
+#### Review round 10 (2026-10-06, same day, same owner approval)
+
+One finding from a review of round 9, measured on this branch before the fix:
+
+| Surface | Was | Now |
+|---|---|---|
+| The window bound | round 9 raised `OVERFLOW_PROBE_WINDOW_MAX_SECS` from 740 s to 743 s (`OVERFLOW_PROBE_POLL_SLACK_SECS`, 3 s) and, in the same change, rewrote the round-4 REJECT row ("Raises `OVERFLOW_PROBE_WINDOW_MAX_SECS` ... without a fresh dated quote here") to read "above 743 s". It cited only "same owner approval", the approval the round-4 row was written under, and recorded no fresh dated quote. That is the bypass the rule-file-first law forbids: the bound and the rule that forbids moving it moved together | the raise is WITHDRAWN. `OVERFLOW_PROBE_WINDOW_MAX_SECS` = **740 s** again (120 + 380 + 120 + 120) and `OVERFLOW_PROBE_POLL_SLACK_SECS` is removed; the grant note cutoff stays **600 s** (740 − 120 − 20). The round-4 REJECT row stands as written: raising the bound needs a fresh dated owner quote recorded here first. Verified by `test_window_max_is_derived_and_only_bites_after_a_restart` (asserts 740 and 600; bite-checked: with the 3 s slack it fails) |
+
+**Honest limit (round 10), the case round 9 tried to fix.** Three instants the
+bound is built from are stamped by a poll, not taken at the event: the first
+frame (the read task sets a flag, the next poll stamps it), the deferral cap
+(it fails at the first poll past it, so a watch restart can land up to a poll
+later) and the restart's fresh first frame. A restart at the end of a full
+deferral whose polls run late can end its fresh watch a second or two past
+740 s, and the poll inside that watch fails the window as
+`failed_deferral_exhausted` although the probed socket stayed up. That burns
+one probe of the session's 3 (main feed) or 6 (depth). Errs toward fail, and
+it is the round-4 honest limit ("a restart in the last few seconds ... fails
+at the bound instead of passing") extended to late polls. Pinned by
+`test_a_late_poll_can_fail_a_restarted_window_at_its_bound` (bite-checked:
+with the 743 s bound the G+740.5 poll does nothing and the test fails); the
+on-time case still passes at the bound
+(`test_a_window_that_settles_at_its_bound_still_passes`). Removing the limit
+without moving the bound would mean stamping those three instants at the
+event; that is not done here.
+
+REJECT (review round 10):
+
+- Raises `OVERFLOW_PROBE_WINDOW_MAX_SECS` above 740 s, or the grant note
+  cutoff above 600 s, without a fresh dated owner quote recorded in this file
+  first (the round-4 row, unchanged).
+- Moves a bound and the REJECT row that forbids moving it in the same change.

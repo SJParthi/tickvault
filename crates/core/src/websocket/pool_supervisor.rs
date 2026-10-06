@@ -1379,31 +1379,31 @@ const _: () = assert!(
 /// bought a whole second deferral: about 1,000 s holding the one
 /// process-wide turn, where the docs said 380 s.
 ///
-/// 743 s = 120 (first-frame deadline) + 380 (deferral cap) for the window as
-/// granted, plus 120 (first-frame deadline) + 120 (watch) for the restart,
-/// plus [`OVERFLOW_PROBE_POLL_SLACK_SECS`] (3 s, round 9). A restart buys a
-/// fresh first frame and a full watch, never a second deferral. A window with
-/// no restart ends by 120 + 380 = 500 s, so this bound only bites after a
-/// restart. Past it the next poll fails the window as
-/// `failed_deferral_exhausted`, unless that poll passes it; the grant instant
-/// is kept in `granted_at`, which a restart never resets.
+/// 740 s = 120 (first-frame deadline) + 380 (deferral cap) for the window as
+/// granted, plus 120 (first-frame deadline) + 120 (watch) for the restart. A
+/// restart buys a fresh first frame and a full watch, never a second
+/// deferral. A window with no restart ends by 120 + 380 = 500 s, so this
+/// bound only bites after a restart. Past it the next poll (once a second)
+/// fails the window as `failed_deferral_exhausted`, unless that poll passes
+/// it; the grant instant is kept in `granted_at`, which a restart never
+/// resets.
+///
+/// Review round 10 (2026-10-06): round 9 raised this to 743 s (3 s of poll
+/// slack). The scope lock's round-4 REJECT row forbids raising it without a
+/// fresh dated owner quote, and round 9 recorded none, so the raise is
+/// withdrawn and the bound is 740 s again. Honest limit, errs toward fail:
+/// three of the instants it is built from are stamped by a poll, not taken at
+/// the event (the first frame: the read task sets a flag and the next poll
+/// stamps it; the deferral cap: it fails at the first poll past it, so a
+/// watch restart can land up to a poll later; the restart's fresh first
+/// frame). A restart near the end of a full deferral whose polls run late can
+/// therefore end its fresh watch a second or two past 740 s, and the poll
+/// inside that watch fails the window at the bound although the probed socket
+/// stayed up (`test_a_late_poll_can_fail_a_restarted_window_at_its_bound`).
 pub const OVERFLOW_PROBE_WINDOW_MAX_SECS: u64 = OVERFLOW_PROBE_FIRST_FRAME_DEADLINE_SECS
     + OVERFLOW_PROBE_DEFERRAL_CAP_SECS
     + OVERFLOW_PROBE_FIRST_FRAME_DEADLINE_SECS
-    + OVERFLOW_PROBE_WATCH_SECS
-    + OVERFLOW_PROBE_POLL_SLACK_SECS;
-
-/// Review fix 2026-10-06, round 9: poll granularity in
-/// [`OVERFLOW_PROBE_WINDOW_MAX_SECS`]. Every instant the bound is built from
-/// is STAMPED by a poll, not taken at the event: the first frame (the read
-/// task sets a flag and the next poll stamps it), the deferral cap (it fails
-/// at the first poll past it, so the restart can land up to a poll later),
-/// and the restart's fresh first frame. Each can run up to one poll gap late,
-/// so a restarted window that stayed up for its whole watch could end a few
-/// seconds past 740 s and fail at the bound. One [`IDLE_POLL_INTERVAL`] per
-/// stamped instant. A poll delayed by more than that can still fail such a
-/// window at the bound (errs toward fail).
-pub const OVERFLOW_PROBE_POLL_SLACK_SECS: u64 = 3 * IDLE_POLL_INTERVAL.as_secs();
+    + OVERFLOW_PROBE_WATCH_SECS;
 
 const _: () = assert!(
     OVERFLOW_PROBE_WINDOW_MAX_SECS
@@ -1420,11 +1420,10 @@ const _: () = assert!(
 /// restart it alone allowed notes as late as about 860 s from the grant,
 /// logged as "the test is not failed for this" and then failed at the bound.
 /// A sibling dropping past this cutoff fails the window at once
-/// (`failed_deferral_exhausted`). 600 s = 743 - 3 (poll slack, round 9, kept
-/// for the polls) - 120 - 20. A window with no restart notes nothing past
-/// 120 + 240 = 360 s, so this cutoff only bites after a restart.
+/// (`failed_deferral_exhausted`). 600 s = 740 - 120 - 20. A window with no
+/// restart notes nothing past 120 + 240 = 360 s, so this cutoff only bites
+/// after a restart.
 pub const OVERFLOW_PROBE_GRANT_NOTE_CUTOFF_SECS: u64 = OVERFLOW_PROBE_WINDOW_MAX_SECS
-    - OVERFLOW_PROBE_POLL_SLACK_SECS
     - OVERFLOW_PROBE_SIBLING_HEAL_DEADLINE_SECS
     - OVERFLOW_PROBE_EVICTION_ATTRIBUTION_SECS;
 
@@ -21438,20 +21437,17 @@ mod tests {
                 + OVERFLOW_PROBE_DEFERRAL_CAP_SECS
                 + OVERFLOW_PROBE_FIRST_FRAME_DEADLINE_SECS
                 + OVERFLOW_PROBE_WATCH_SECS
-                + OVERFLOW_PROBE_POLL_SLACK_SECS
         );
-        // Round 9: three poll-stamped instants, one poll of slack each.
-        assert_eq!(
-            OVERFLOW_PROBE_POLL_SLACK_SECS,
-            3 * IDLE_POLL_INTERVAL.as_secs()
-        );
-        assert_eq!(OVERFLOW_PROBE_WINDOW_MAX_SECS, 743);
-        // The grant note cutoff keeps the slack for the polls: 600 s.
+        // Review round 10: the scope lock's round-4 REJECT row forbids
+        // raising the bound without a fresh dated owner quote, so it stays
+        // 740 s (round 9's 743 s raise is withdrawn).
+        assert_eq!(OVERFLOW_PROBE_WINDOW_MAX_SECS, 740);
+        // Every note keeps its heal deadline and settle inside the bound: 600 s.
+        assert_eq!(OVERFLOW_PROBE_GRANT_NOTE_CUTOFF_SECS, 600);
         assert_eq!(
             OVERFLOW_PROBE_GRANT_NOTE_CUTOFF_SECS
                 + OVERFLOW_PROBE_SIBLING_HEAL_DEADLINE_SECS
-                + OVERFLOW_PROBE_EVICTION_ATTRIBUTION_SECS
-                + OVERFLOW_PROBE_POLL_SLACK_SECS,
+                + OVERFLOW_PROBE_EVICTION_ATTRIBUTION_SECS,
             OVERFLOW_PROBE_WINDOW_MAX_SECS
         );
         // A window with no restart ends by first-frame deadline + cap.
@@ -21467,8 +21463,7 @@ mod tests {
         // a sibling (healed at G+477, settling to G+497), an 807 on the probed
         // socket at G+494 (its one watch restart), a fresh first frame at G+613
         // and a new deferral. Before the fix the window ran on to about G+993
-        // (613 + 380); now it ends at G+743 (740 plus 3 s of poll slack,
-        // round 9). Round 6: a sibling can no longer
+        // (613 + 380); now it ends at G+740. Round 6: a sibling can no longer
         // be noted past G+600, so the new deferral here is the probed socket
         // itself redialling (`watched_down`), the one state that can still
         // hold a pass to the bound.
@@ -21634,23 +21629,16 @@ mod tests {
         assert!(granted + secs(739) < granted + secs(OVERFLOW_PROBE_WINDOW_MAX_SECS));
     }
 
-    #[test]
-    fn test_a_window_that_settles_at_its_bound_still_passes() {
-        // Review round 9 (rewritten): a reachable timeline, polled once a
-        // second. The first frame is stamped by the G+120 poll. Sibling 0
-        // drops at G+230, before the watch ends at G+240, and heals at
-        // G+349.8 (inside its 120 s deadline), settling until G+369.8; sibling
-        // 1 drops at G+359.9 (inside the 240 s note cutoff), heals at G+479.8
-        // and settles until G+499.8, so the pass stays deferred. The probed
-        // socket takes its one watch restart (an 807) at G+499.99, before the
-        // cap poll at G+500. Its fresh first frame arrives at G+619.95, inside
-        // the restart's 120 s deadline, but the poll that stamps it runs late,
-        // at G+621.5 (a busy runtime), so its watch ends at G+741.5. Polls
-        // then run once a second from G+622.5. The G+740.5 poll is inside that
-        // watch and past 740 s: with no poll slack in the bound it failed the
-        // window as `failed_deferral_exhausted`, although the probed socket
-        // stayed up for its whole restarted watch. With the slack (743 s) it
-        // does nothing, and the G+741.5 poll passes the window.
+    /// A reachable timeline polled once a second at whole seconds: the first
+    /// frame is stamped by the G+120 poll. Sibling 0 drops at G+230, before
+    /// the watch ends at G+240, and heals at G+349.8 (inside its 120 s
+    /// deadline), settling until G+369.8; sibling 1 drops at G+359.9 (inside
+    /// the 240 s note cutoff), heals at G+479.8 and settles until G+499.8, so
+    /// the pass stays deferred. The probed socket takes its one watch restart
+    /// (an 807) at G+499.99, before the cap poll at G+500, and nothing happens
+    /// on the polls up to G+619. Returns the episode and the grant; the
+    /// restart's fresh first frame is the caller's.
+    fn window_restarted_at_the_end_of_a_full_deferral() -> (OverflowEpisode, Instant) {
         let start = t0();
         let mut ep = episode_after_805(&[4], start);
         let granted = grant_first_probe(&mut ep, start);
@@ -21683,24 +21671,53 @@ mod tests {
             Some(OverflowProbeOutcome::WatchedRestarted)
         );
         polls_do_nothing(&mut ep, granted, 500, 619);
-        // The fresh first frame arrived at G+619.95; the late poll stamps it.
+        (ep, granted)
+    }
+
+    #[test]
+    fn test_a_window_that_settles_at_its_bound_still_passes() {
+        // The restart's fresh first frame arrives at G+619.95 and the on-time
+        // G+620 poll stamps it, so its watch ends at G+740: the poll at the
+        // bound passes the window. A pass on the poll at the bound is a pass,
+        // not a failure.
+        let (mut ep, granted) = window_restarted_at_the_end_of_a_full_deferral();
+        ep.on_first_frame(4, granted + secs(620));
+        polls_do_nothing(&mut ep, granted, 620, 739);
+        let pass = ep.poll(granted + secs(OVERFLOW_PROBE_WINDOW_MAX_SECS), true);
+        assert_eq!(pass.outcomes[0], Some(OverflowProbeOutcome::ProbePassed));
+    }
+
+    #[test]
+    fn test_a_late_poll_can_fail_a_restarted_window_at_its_bound() {
+        // Honest limit (review round 10): the same timeline, but the poll that
+        // stamps the fresh first frame runs late, at G+621.5 (a busy runtime),
+        // so the watch ends at G+741.5. Polls then run once a second from
+        // G+622.5. The G+740.5 poll is inside that watch and past the 740 s
+        // bound, so it fails the window as `failed_deferral_exhausted`
+        // although the probed socket stayed up. Errs toward fail. Round 9
+        // raised the bound to 743 s to pass this window; that raise needed a
+        // fresh dated owner quote under the scope lock's round-4 REJECT row
+        // and had none, so it is withdrawn.
+        let (mut ep, granted) = window_restarted_at_the_end_of_a_full_deferral();
+        let at = |s: u64, millis: u64| granted + secs(s) + ms(millis);
         let stamped = at(621, 500);
         ep.on_first_frame(4, stamped);
         assert_eq!(ep.poll(stamped, true), OverflowEpisodeEffect::default());
-        for s in 622..=740 {
+        for s in 622..=739 {
             assert_eq!(
                 ep.poll(at(s, 500), true),
                 OverflowEpisodeEffect::default(),
                 "poll at G+{s}.5"
             );
         }
-        assert!(
-            at(740, 500) > granted + secs(740),
-            "past the unslacked bound"
+        assert!(at(740, 500) > granted + secs(OVERFLOW_PROBE_WINDOW_MAX_SECS));
+        let fail = ep.poll(at(740, 500), true);
+        assert_eq!(
+            fail.outcomes[0],
+            Some(OverflowProbeOutcome::FailedDeferralExhausted)
         );
-        let pass = ep.poll(at(741, 500), true);
-        assert_eq!(pass.outcomes[0], Some(OverflowProbeOutcome::ProbePassed));
-        assert!(at(741, 500) < granted + secs(OVERFLOW_PROBE_WINDOW_MAX_SECS));
+        assert_eq!(fail.repark, Some(4));
+        assert_eq!(ep.granted_at, None);
     }
 
     #[test]
