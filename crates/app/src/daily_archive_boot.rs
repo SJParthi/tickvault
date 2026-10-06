@@ -479,6 +479,11 @@ async fn run_daily_archive_loop(
         metrics::counter!("tv_daily_archive_attempts_total", "outcome" => outcome).increment(0);
     }
     let completed_gauge = metrics::gauge!("tv_daily_archive_completed_today");
+    // 2026-10-06 (plan item 51a): the day this process latched, held in RAM.
+    // The marker can fail to save; without this latch every tick would
+    // re-run a finished sweep until the attempt cap, then log a false
+    // "did NOT complete" error.
+    let mut latched_day: Option<i32> = None;
 
     loop {
         ticker.tick().await;
@@ -490,7 +495,8 @@ async fn run_daily_archive_loop(
         let today = today_date.num_days_from_ce();
 
         let completed_today =
-            crate::daily_task_marker::daily_marker_exists(DAILY_ARCHIVE_MARKER_TASK, today_date);
+            crate::daily_task_marker::daily_marker_exists(DAILY_ARCHIVE_MARKER_TASK, today_date)
+                || latched_day == Some(today);
         completed_gauge.set(if completed_today { 1.0 } else { 0.0 });
 
         let decision = archive_tick(
@@ -559,17 +565,41 @@ async fn run_daily_archive_loop(
         }
 
         if outcome.latches_the_day() {
-            // Durable, so a crash-restart three seconds later does not re-run
-            // a sweep that already finished. `write_daily_marker` is fail-open
-            // by design: an unwritable marker costs a redundant sweep, never a
-            // skipped one.
-            crate::daily_task_marker::write_daily_marker(DAILY_ARCHIVE_MARKER_TASK, today_date);
+            // Latch in RAM FIRST, so this process never repeats a finished
+            // sweep even if the marker cannot be saved. The marker makes it
+            // durable, so a crash-restart three seconds later does not re-run
+            // it either; a marker that fails to save costs at most one
+            // redundant sweep after a restart, never a skipped one.
+            latched_day = Some(today);
             completed_gauge.set(1.0);
-            info!(
-                attempt,
-                "daily partition archive COMPLETE for today — latched (durable marker \
-                 written; a restart will not repeat it)"
-            );
+            match crate::daily_task_marker::try_write_daily_marker(
+                DAILY_ARCHIVE_MARKER_TASK,
+                today_date,
+            ) {
+                Ok(crate::daily_task_marker::MarkerDurability::Durable) => info!(
+                    attempt,
+                    "daily partition archive COMPLETE for today — latched (durable marker \
+                     written; a restart will not repeat it)"
+                ),
+                Ok(crate::daily_task_marker::MarkerDurability::RenamedNotDirSynced) => warn!(
+                    code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
+                    source = "daily_archive_latch_marker_failed",
+                    attempt,
+                    durability = "renamed_not_dir_synced",
+                    "daily partition archive COMPLETED; only its latch marker was not saved \
+                     durably — this process will not repeat it, a restart may repeat the \
+                     sweep once"
+                ),
+                Err(err) => warn!(
+                    code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
+                    source = "daily_archive_latch_marker_failed",
+                    attempt,
+                    ?err,
+                    "daily partition archive COMPLETED; only its latch marker was not saved \
+                     durably — this process will not repeat it, a restart may repeat the \
+                     sweep once"
+                ),
+            }
         } else {
             warn!(
                 attempt,
@@ -935,6 +965,51 @@ mod tests {
              close — the later attempts would never be reached",
             DAILY_ARCHIVE_POLL.as_secs()
         );
+    }
+
+    /// 2026-10-06 (plan item 51a): a latch marker that fails to save must not
+    /// make this process re-run a finished sweep. The day is latched in RAM
+    /// before the write, `completed_today` reads that latch, and the failure
+    /// arm says the archive COMPLETED so a grep for STORAGE-GAP-04 is not read
+    /// as an archive failure.
+    #[test]
+    fn test_latch_marker_failure_still_latches_in_process() {
+        let src = include_str!("daily_archive_boot.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        let body = prod
+            .split("async fn run_daily_archive_loop(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap_or("");
+        assert!(!body.is_empty(), "the loop body must exist");
+        assert!(
+            body.contains("|| latched_day == Some(today);"),
+            "completed_today must OR the in-process latch"
+        );
+        let latch = body
+            .find("latched_day = Some(today);")
+            .unwrap_or(usize::MAX);
+        let write = body
+            .find("daily_task_marker::try_write_daily_marker(")
+            .unwrap_or(0);
+        assert_ne!(latch, usize::MAX, "the day must be latched in RAM");
+        assert!(latch < write, "latch BEFORE the marker write");
+        let failure = &body[write..];
+        assert_eq!(
+            failure
+                .matches("code = ErrorCode::StorageGap04S3ArchiveFailed.code_str()")
+                .count(),
+            2,
+            "both failure arms must be coded"
+        );
+        assert_eq!(
+            failure
+                .matches("source = \"daily_archive_latch_marker_failed\"")
+                .count(),
+            2
+        );
+        assert!(failure.contains("archive COMPLETED"));
+        assert!(!prod.contains("daily_task_marker::write_daily_marker("));
     }
 }
 
