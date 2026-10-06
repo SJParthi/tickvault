@@ -456,19 +456,56 @@ fn ist_date(utc_secs: i64) -> String {
         )
 }
 
+/// A segment name more than this far ahead of the file's own mtime is not
+/// trusted for the date folder (audit N4).
+pub const SEGMENT_NAME_AHEAD_OF_MTIME_LIMIT_SECS: i64 = 86_400;
+
+/// Segments filed under their mtime's date because their name ran more than
+/// [`SEGMENT_NAME_AHEAD_OF_MTIME_LIMIT_SECS`] ahead of it.
+pub const RAW_FRAME_UPLOAD_FUTURE_NAME_COUNTER: &str = "tv_raw_frame_upload_future_name_total";
+
 /// The canonical key for a segment: `raw-frames/<IST date>/<name>.gz`. The
 /// date comes from the nanos in `ws-frames-<nanos>.wal`, or from the mtime
 /// when the name carries none.
+///
+/// # A name from the future (audit N4, 2026-10-05)
+///
+/// Segment names never fall (`ws_frame_spill::next_segment_name_nanos` takes
+/// `max(wall clock, newest name + 1)`), so after the clock once ran ahead,
+/// every later segment keeps a future name until the real clock catches up.
+/// Filing those by name put a day's capture under a later day's folder. When
+/// the name is more than a day ahead of the file's mtime (and the mtime is
+/// known), the mtime's date is used instead. The name itself is unchanged,
+/// because replay orders segments by it. Deterministic: a sealed segment's
+/// mtime does not change, so the key is stable across passes.
 #[must_use]
 pub fn segment_key(segment_name: &str, mtime_secs: u64) -> String {
     let nanos = segment_name
         .strip_prefix("ws-frames-")
         .and_then(|s| s.strip_suffix(".wal"))
         .and_then(|s| s.parse::<u128>().ok());
-    let secs = nanos.map_or_else(
-        || i64::try_from(mtime_secs).unwrap_or(i64::MAX),
-        |n| i64::try_from(n / 1_000_000_000).unwrap_or(i64::MAX),
-    );
+    let mtime = i64::try_from(mtime_secs).unwrap_or(i64::MAX);
+    let secs = match nanos {
+        None => mtime,
+        Some(n) => {
+            let named = i64::try_from(n / 1_000_000_000).unwrap_or(i64::MAX);
+            if mtime_secs != 0
+                && named.saturating_sub(mtime) > SEGMENT_NAME_AHEAD_OF_MTIME_LIMIT_SECS
+            {
+                metrics::counter!(RAW_FRAME_UPLOAD_FUTURE_NAME_COUNTER).increment(1);
+                tracing::warn!(
+                    segment = segment_name,
+                    named_secs = named,
+                    mtime_secs = mtime,
+                    "raw frame upload: the segment name is more than a day ahead of the file's \
+                     own time (the clock once ran ahead); filed under the file's date instead"
+                );
+                mtime
+            } else {
+                named
+            }
+        }
+    };
     dated_key(RAW_FRAME_S3_PREFIX, secs, segment_name)
 }
 
@@ -903,11 +940,12 @@ fn is_wal_segment_path(path: &Path) -> bool {
     path.extension().and_then(|s| s.to_str()) == Some("wal")
 }
 
-/// A seal spill record file (PR40b-f; see `seal_spill::is_spill_record_name`).
+/// A seal spill record file or a staged dead-letter copy (PR40b-f; see
+/// `seal_spill::is_seal_file_name`).
 fn is_seal_spill_record_path(path: &Path) -> bool {
     path.file_name()
         .and_then(|n| n.to_str())
-        .is_some_and(crate::seal_spill::is_spill_record_name)
+        .is_some_and(crate::seal_spill::is_seal_file_name)
 }
 
 /// Every regular file (the quarantine sets).
@@ -980,6 +1018,8 @@ impl ColdFileSet {
     /// Sealed-candle spill files: the spill root, `replaying/` and
     /// `archive/`: `*.bin` and its renamed copies (`.bin.N`, `.bin.overflow`;
     /// PR40b-f) — exactly what `seal_spill::prune_spill_files` may delete.
+    /// Also `refused/`, which the prune never deletes: files holding a seal
+    /// the replay gave up on get a cold copy too.
     #[must_use]
     pub fn seal_spill(spill_dir: &Path) -> Self {
         Self {
@@ -989,6 +1029,7 @@ impl ColdFileSet {
                 spill_dir.to_path_buf(),
                 spill_dir.join(crate::seal_writer_task::SEAL_REPLAYING_SUBDIR),
                 spill_dir.join(crate::seal_writer_task::SEAL_ARCHIVE_SUBDIR),
+                spill_dir.join(crate::seal_writer_task::SEAL_REFUSED_SUBDIR),
             ],
             matches: is_seal_spill_record_path,
         }
@@ -1504,6 +1545,19 @@ mod tests {
     }
 
     #[test]
+    fn segment_key_files_a_name_more_than_a_day_ahead_under_its_mtime_date() {
+        // Audit N4: name 2026-09-22 (1_790_016_000 s), mtime two days earlier.
+        let name = format!("ws-frames-{:020}.wal", 1_790_016_000u128 * 1_000_000_000);
+        let mtime = 1_790_016_000 - 2 * 86_400;
+        assert!(segment_key(&name, mtime).starts_with("raw-frames/2026-09-20/"));
+        // Within a day the name still decides; unknown mtime (0) keeps the name.
+        assert!(segment_key(&name, 1_790_016_000 - 3_600).starts_with("raw-frames/2026-09-22/"));
+        assert!(segment_key(&name, 0).starts_with("raw-frames/2026-09-22/"));
+        // A name behind its mtime (normal: the mtime is the last write) keeps the name.
+        assert!(segment_key(&name, 1_790_016_000 + 7_200).starts_with("raw-frames/2026-09-22/"));
+    }
+
+    #[test]
     fn segment_key_uses_the_ist_date_of_the_segment_nanos() {
         // 1_790_000_000 s = 2026-09-21T13:33:20Z = 19:03:20 IST, same day.
         assert_eq!(
@@ -1900,17 +1954,16 @@ mod tests {
             "seals_v4-2026-10-01.bin.1",
             "seals_v4-2026-10-01.bin.1.2",
             "seals_v4-2026-10-01.bin.overflow",
+            // PR40b-f: staged DLQ copies refused/ may hold.
+            "seals_v4-2026-10-01.ndjson",
+            "seals-2026-09-18.ndjson.1",
         ] {
             assert!(
                 (spill.matches)(Path::new(name)),
                 "{name} is a spill record file"
             );
         }
-        for name in [
-            "seals_v4-2026-10-01.ndjson",
-            "boot-committed.summary",
-            "x.wal",
-        ] {
+        for name in ["notes.ndjson", "boot-committed.summary", "x.wal"] {
             assert!(
                 !(spill.matches)(Path::new(name)),
                 "{name} is not a spill record file"
@@ -1922,6 +1975,7 @@ mod tests {
                 PathBuf::from("/d/spill"),
                 PathBuf::from("/d/spill/replaying"),
                 PathBuf::from("/d/spill/archive"),
+                PathBuf::from("/d/spill/refused"),
             ]
         );
         let ticks = ColdFileSet::tick_quarantine(Path::new("/d/spill/ticks"));

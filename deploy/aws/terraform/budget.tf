@@ -378,10 +378,22 @@ data "aws_iam_policy_document" "budget_action_permissions" {
     resources = ["arn:aws:ssm:${var.aws_region}::automation-definition/AWS-StopEC2Instance:*"]
   }
   # Stop the tv-app box ONLY (ARN-scoped, like the killswitch Lambda).
+  # Until 2026-10-04 this statement carried resources = ["*"] beside this
+  # same comment, so the role could stop ANY instance in the account. The
+  # stop is now pinned to the tv-app ARN with the killswitch's own form.
   statement {
     sid       = "StopTvAppOnly"
     effect    = "Allow"
-    actions   = ["ec2:StopInstances", "ec2:DescribeInstances", "ec2:DescribeInstanceStatus"]
+    actions   = ["ec2:StopInstances"]
+    resources = ["arn:aws:ec2:${var.aws_region}:*:instance/${aws_instance.tv_app.id}"]
+  }
+  # The automation polls the instance state while it stops. EC2 Describe
+  # calls do not support resource-level permissions, so they stay on "*";
+  # they are read-only.
+  statement {
+    sid       = "DescribeForStopAutomation"
+    effect    = "Allow"
+    actions   = ["ec2:DescribeInstances", "ec2:DescribeInstanceStatus"]
     resources = ["*"]
   }
   # SSM Automation passes this same role onward.

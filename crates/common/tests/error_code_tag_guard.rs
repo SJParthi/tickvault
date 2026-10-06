@@ -305,7 +305,36 @@ fn scan_corpus_exists_and_is_substantial() {
 /// constituent-unresolved, gate-closed, persist-failed, task-died and
 /// still-failing lines in `dhan_universe.rs` now carry `WS-GAP-03` with a
 /// `source` naming the arm.
-const UNCODED_ERROR_BUDGET: usize = 71;
+///
+/// 71 -> 61 (2026-10-04, workspace audit M3). Ten sites CODED with existing
+/// codes, none of them paged: the order-update broadcast drop
+/// (`ORDER-EVT-01`, stage `broadcast_no_receiver`), the order-update WAL drop
+/// and the boot WAL replay failure (`WS-SPILL-02`, with a `source`), the
+/// order-update server auth/API error (`WS-GAP-01`), the two token-renewal
+/// give-up lines and the token publish failure (`AUTH-GAP-01`), the two
+/// static-IP boot-check lines (`GAP-NET-01`), and the seal-writer construct
+/// failure (`AGGREGATOR-SEAL-01`).
+///
+/// 61 -> 10 (2026-10-05, workspace audit M3, second pass). Fifty-one sites
+/// CODED, each with an existing code and a `source` naming the arm, and each
+/// code picked so no CloudWatch filter matches it (the filters match
+/// `WS-SPILL-0x`, `RISK-GAP-03`, `BOOT-02/03`, `PROC-01`, `RESOURCE-02`,
+/// `STORAGE-GAP-05` and others on any source, and `WS-GAP-02/03` and
+/// `OMS-GAP-06` only on named sources none of these use). So this step adds
+/// no page. **Correction to the step above:** "none of them paged" was wrong
+/// for the two `WS-SPILL-02` lines; that code pages on any ERROR line, so
+/// those two now reach the existing frame-drop alarm (a real loss, an
+/// existing alarm, no new alarm).
+///
+/// The ten left, and why: three in `crates/trading/src/indicator/` and
+/// `strategy/` (frozen area, `daily-universe-scope-expansion` §28); the two
+/// `tick_gap_tracker.rs` lines and the trading-pipeline lag line (the only
+/// fitting code, `RISK-GAP-03`, pages per instrument); the WAL corrupt-segment
+/// skip (the only fitting code, `WS-SPILL-02`, pages, and a torn segment after
+/// any crash would page at boot); the WAL init failure, the panic hook and the
+/// API server exit (no existing code fits; each needs its own code and
+/// runbook).
+const UNCODED_ERROR_BUDGET: usize = 10;
 
 /// Per-crate uncoded-error budgets, for the crates the six-name list never
 /// reached.

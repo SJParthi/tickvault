@@ -218,6 +218,24 @@ const KNOWN_GAUGES: &[&str] = &[
     "tv_dhan_ws_main_reconnect_recovery_max_ms",
 ];
 
+/// The six derived metrics behind the loss-group pages (2026-10-05,
+/// `loss-group-alarms.tf`, noise lock §2.10). No app code emits these: each is
+/// the OUTPUT of log metric filters over the metrics log, one filter per source
+/// counter. What must be seeded is every SOURCE counter, which
+/// `every_loss_group_filter_counter_is_registered_at_boot` checks instead.
+const DERIVED_LOSS_GROUP_METRICS: &[&str] = &[
+    "tv_loss_market_data_refused_total",
+    "tv_loss_subscription_gap_total",
+    "tv_loss_audit_rows_total",
+    "tv_loss_durability_sync_total",
+    "tv_loss_order_path_total",
+    "tv_loss_bound_or_blind_total",
+];
+
+/// The number of source counters the loss groups read. Moves only with a dated
+/// row in noise lock §2.10.
+const LOSS_GROUP_FILTER_COUNT: usize = 55;
+
 /// Maps `const NAME: &str = "tv_...";` to its literal, workspace-wide, so a
 /// registration written through a named constant (the house style for a metric
 /// with a documented meaning) is not read as a miss.
@@ -485,6 +503,7 @@ fn every_alarmed_counter_is_registered_at_boot() {
         if KNOWN_GAUGES.contains(&name.as_str())
             || KNOWN_NO_PRODUCER.contains(&name.as_str())
             || SEEDED_VIA_HANDLE.iter().any(|(n, _)| n == name)
+            || DERIVED_LOSS_GROUP_METRICS.contains(&name.as_str())
         {
             continue;
         }
@@ -702,5 +721,109 @@ fn the_comment_stripper_hides_commented_out_code_and_keeps_real_code() {
     assert!(
         strip_rust_comments(escaped).contains("tv_probe_total"),
         "an escaped quote ended the string early and swallowed real code"
+    );
+}
+
+/// Every `counter = "tv_..."` source named in `loss-group-alarms.tf`.
+fn loss_group_filter_counters() -> Vec<String> {
+    let src = read("deploy/aws/terraform/loss-group-alarms.tf");
+    let mut out = Vec::new();
+    for line in src.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        let Some(at) = trimmed.find("counter") else {
+            continue;
+        };
+        let rest = trimmed[at + "counter".len()..].trim_start();
+        let Some(rest) = rest.strip_prefix('=') else {
+            continue;
+        };
+        let Some(inner) = rest.trim().strip_prefix('"') else {
+            continue;
+        };
+        if let Some(name) = inner.split('"').next()
+            && name.starts_with("tv_")
+        {
+            out.push(name.to_owned());
+        }
+    }
+    out
+}
+
+/// The loss-group pages (2026-10-05, noise lock §2.10) read 55 source counters
+/// through log metric filters. Each source is exposed to the same dropped
+/// first sample as any alarmed counter, so each must be registered at 0 at
+/// boot, either in `main.rs` or beside its owner, or named in
+/// `SEEDED_VIA_HANDLE` with its seeding site.
+#[test]
+fn every_loss_group_filter_counter_is_registered_at_boot() {
+    let counters = loss_group_filter_counters();
+    assert_eq!(
+        counters.len(),
+        LOSS_GROUP_FILTER_COUNT,
+        "loss-group-alarms.tf names {} source counters, expected {}. A change \
+         to the set needs a dated row in noise lock §2.10 and this constant \
+         moved with it.",
+        counters.len(),
+        LOSS_GROUP_FILTER_COUNT
+    );
+    let unique: std::collections::BTreeSet<&str> = counters.iter().map(String::as_str).collect();
+    assert_eq!(
+        unique.len(),
+        counters.len(),
+        "a source counter is listed twice"
+    );
+
+    let registered = zero_registered_names();
+    let missing: Vec<&str> = counters
+        .iter()
+        .map(String::as_str)
+        .filter(|name| {
+            !registered.contains(*name) && !SEEDED_VIA_HANDLE.iter().any(|(n, _)| n == name)
+        })
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "LOSS-GROUP SOURCE COUNTER NEVER REGISTERED: {missing:?}. Its first \
+         failure would be the dropped baseline sample and the page would not \
+         fire. Seed it with `increment(0)` for every label value the filter \
+         slices on, in the post-recorder block of crates/app/src/main.rs."
+    );
+}
+
+/// The six alarms must name exactly the six derived metrics the filters
+/// publish into, so no page reads a metric nothing writes.
+#[test]
+fn the_loss_group_alarms_read_the_metrics_the_filters_write() {
+    let alarmed: std::collections::BTreeSet<String> = alarmed_metric_names()
+        .into_iter()
+        .filter(|(_, file)| file == "loss-group-alarms.tf")
+        .map(|(name, _)| name)
+        .collect();
+    let derived: std::collections::BTreeSet<String> = DERIVED_LOSS_GROUP_METRICS
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+    assert_eq!(
+        alarmed, derived,
+        "the alarms in loss-group-alarms.tf and DERIVED_LOSS_GROUP_METRICS disagree"
+    );
+    let src = read("deploy/aws/terraform/loss-group-alarms.tf");
+    assert!(
+        src.contains("name      = \"tv_loss_${each.value.group}_total\""),
+        "the filters no longer publish into tv_loss_<group>_total, so this check \
+         reads the wrong shape"
+    );
+    // The filters write `tv_loss_<group>_total` for every group a filter names.
+    let written: std::collections::BTreeSet<String> = src
+        .match_indices("group = \"")
+        .filter_map(|(at, m)| src[at + m.len()..].split('"').next())
+        .map(|group| format!("tv_loss_{group}_total"))
+        .collect();
+    assert_eq!(
+        written, derived,
+        "the groups the filters write and the metrics the alarms read disagree"
     );
 }

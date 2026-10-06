@@ -479,6 +479,8 @@ impl DayOhlcTracker {
         if pinned.len() >= Self::MAX_TRACKED_INSTRUMENTS {
             metrics::counter!("tv_day_ohlc_tracker_refused_total").increment(1);
             tracing::error!(
+                code = tickvault_common::error_code::ErrorCode::RamStore01Degraded.code_str(),
+                source = "day_ohlc_full",
                 security_id,
                 ?segment,
                 tracked = pinned.len(),

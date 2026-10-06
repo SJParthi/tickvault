@@ -71,6 +71,7 @@ operator inspects, never manually re-persists first).
 | `append` | an ILP buffer append was rejected — the row is skipped, the loop continues |
 | `flush` | the ILP-over-HTTP flush was refused by the per-request server ACK (the 2026-07-05 fire-and-forget lesson) — pending rows DISCARDED (`discard_pending`, the poisoned-buffer defense; `tv_order_update_events_rows_discarded_total` counts) |
 | `sink_drop` | a producer's bounded-sink `try_send` was refused (full/closed) — the event's capture row is LOST, counted PER EVENT `tv_order_update_events_dropped_total{reason="full"\|"closed"}`; the coded `error!` is EDGE-LATCHED per channel on BOTH feeds (audit-findings Rule 4 — the episode's first drop is loud, subsequent drops are `debug!`+counter, a successful publish re-arms); the push read loop is never blocked |
+| `broadcast_no_receiver` | (added 2026-10-04) the order-update WebSocket parsed an update but its in-process broadcast had NO receiver (the order-book subscriber task crashed or the channel was torn down) — that update reached NOTHING in the app. Counted on `tv_order_update_broadcast_drops_total`, which pages through `tv-<env>-order-update-dropped` (noise-lock §2.9). The capture row may still be written by the separate events sink; the order book did not see the update, so reconcile against the broker order book |
 
 **Triage:**
 1. `mcp__tickvault-logs__tail_errors` — find `ORDER-EVT-01`; the `stage`

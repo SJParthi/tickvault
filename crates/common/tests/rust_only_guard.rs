@@ -4154,3 +4154,64 @@ fn dollar_rooted_program_paths_are_command_position_self_test() {
         );
     }
 }
+
+/// Files in this checkout (tracked, or untracked and not ignored) whose bytes
+/// contain the banned interpreter's name, ASCII case-insensitive. Audit L9,
+/// 2026-10-05: no file in that language exists, but the word itself was in
+/// 263 files (vendor references, archived plans, rule files quoting the
+/// operator verbatim, and this guard's own prose). Verbatim operator quotes
+/// may not be edited, so zero is not reachable; the count may only fall.
+/// Lower this number in the same change that removes a mention.
+const BANNED_WORD_FILE_CEILING: usize = 263;
+
+fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|w| w.eq_ignore_ascii_case(needle))
+}
+
+#[test]
+fn banned_word_file_count_never_grows() {
+    let root = repo_root();
+    let needle = banned_token().into_bytes();
+    let mut with_word: Vec<String> = Vec::new();
+    for path in git_ls_files_including_untracked(&[]) {
+        // A tracked file deleted in the working tree is not a mention.
+        let Ok(bytes) = std::fs::read(root.join(&path)) else {
+            continue;
+        };
+        if contains_ascii_case_insensitive(&bytes, &needle) {
+            with_word.push(path);
+        }
+    }
+    assert!(
+        with_word.len() <= BANNED_WORD_FILE_CEILING,
+        "the banned interpreter's name now appears in {} files, above the ceiling of {}. \
+         A new mention was added; reword it (say \"the banned interpreter\"). Files:\n{}",
+        with_word.len(),
+        BANNED_WORD_FILE_CEILING,
+        with_word.join("\n")
+    );
+    assert_eq!(
+        with_word.len(),
+        BANNED_WORD_FILE_CEILING,
+        "the banned interpreter's name now appears in fewer files ({}); lower \
+         BANNED_WORD_FILE_CEILING to match, so the ratchet keeps the gain",
+        with_word.len()
+    );
+}
+
+#[test]
+fn banned_word_scan_self_test() {
+    let needle = banned_token().into_bytes();
+    let mut upper = needle.clone();
+    upper.make_ascii_uppercase();
+    assert!(contains_ascii_case_insensitive(&upper, &needle));
+    assert!(contains_ascii_case_insensitive(
+        &[b"x ".as_slice(), &needle, b" y"].concat(),
+        &needle
+    ));
+    assert!(!contains_ascii_case_insensitive(b"pyth on", &needle));
+    assert!(!contains_ascii_case_insensitive(b"", &needle));
+}

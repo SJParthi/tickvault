@@ -427,6 +427,8 @@ impl SpotBarStore {
         if slots.len() >= MAX_SPOT_BAR_SLOTS {
             metrics::counter!("tv_spot_bar_slots_exhausted_total").increment(1);
             tracing::error!(
+                code = tickvault_common::error_code::ErrorCode::RamStore01Degraded.code_str(),
+                source = "spot_bar_slots_full",
                 feed = key.feed.as_str(),
                 security_id = key.security_id,
                 cap = MAX_SPOT_BAR_SLOTS,

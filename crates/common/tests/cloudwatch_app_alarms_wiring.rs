@@ -1135,10 +1135,21 @@ fn test_emf_metric_selectors_name_count_is_pinned() {
     // the coded log line names the source. Summed into
     // tv-<env>-order-audit-chain-loss. +$0.30/mo, aws-budget.md
     // "COST NOTE 2026-10-01".
+    //
+    // 2026-10-04: 103 -> 113, the ten §2.9 data-at-risk counters (owner tapped
+    // "Page me"): the three cloud-backup upload failure counters, the three
+    // prune-refused-not-uploaded counters, the order-update broadcast drops,
+    // the dropped log lines, and the tick/depth inline-rescue fallbacks.
+    // Summed into five alarms by metric math. Authorized by
+    // dhan-rest-only-noise-lock-2026-07-14.md §2.9. +$3.00/mo names + 5
+    // alarms (~$0.50-1.00, metric math bills per metric), aws-budget.md
+    // "COST NOTE 2026-10-04".
     assert_eq!(
         names.len(),
-        103,
-        "Z+ L2 VERIFY ratchet: expected exactly 103 names in the MAIN EMF \
+        113,
+        "Z+ L2 VERIFY ratchet: expected exactly 113 names in the MAIN EMF \
+         (2026-10-04: 103 -> 113, the ten §2.9 data-at-risk counters, see aws-budget.md \
+         COST NOTE 2026-10-04.) \
          (2026-10-01: 102 -> 103, tv_order_audit_chain_lost_total, see aws-budget.md \
          COST NOTE 2026-10-01.) \
          (2026-09-25: 99 -> 102, the three §2.6 alarm inputs, see aws-budget.md \

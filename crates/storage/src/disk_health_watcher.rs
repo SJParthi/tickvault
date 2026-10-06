@@ -225,6 +225,8 @@ pub fn spawn_spill_disk_health_watcher(spill_dir: PathBuf) -> tokio::task::JoinH
         // Ensure the dir exists so `df` doesn't fail the probe.
         if let Err(err) = std::fs::create_dir_all(&spill_dir) {
             error!(
+                code = tickvault_common::error_code::ErrorCode::Resource03SpillFreeLow.code_str(),
+                source = "spill_dir_create",
                 ?err,
                 path = %spill_dir.display(),
                 "could not create spill dir for health watcher"
@@ -273,6 +275,8 @@ pub fn spawn_spill_disk_health_watcher(spill_dir: PathBuf) -> tokio::task::JoinH
                     let threshold_bytes = spill_disk_free_critical_threshold(total_bytes);
                     if free_bytes < threshold_bytes {
                         error!(
+                            code = tickvault_common::error_code::ErrorCode::Resource03SpillFreeLow.code_str(),
+                            source = "spill_free_below_threshold",
                             path = %spill_dir.display(),
                             free_bytes,
                             total_bytes,
@@ -292,6 +296,8 @@ pub fn spawn_spill_disk_health_watcher(spill_dir: PathBuf) -> tokio::task::JoinH
                 DiskHealthOutcome::ProbeFailed { reason } => {
                     m_failed.increment(1);
                     error!(
+                        code = tickvault_common::error_code::ErrorCode::Resource03SpillFreeLow.code_str(),
+                        source = "probe_failed",
                         path = %spill_dir.display(),
                         reason,
                         "spill disk health probe failed — operator has no free-space signal"

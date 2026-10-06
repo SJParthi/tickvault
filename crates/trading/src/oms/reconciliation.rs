@@ -202,6 +202,7 @@ mod tests {
             order_id: order_id.to_owned(),
             correlation_id: "corr-1".to_owned(),
             security_id: 100,
+            exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,

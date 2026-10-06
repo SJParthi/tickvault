@@ -9,6 +9,12 @@
 # `terminate-after` gives the test 10 seconds to print its panic hook
 # before nextest SIGKILLs it.
 
+# `flaky-result` (profile.ci below) needs nextest 0.9.131 or later. An older
+# nextest would ignore that key and let a flaky test pass silently again, so
+# it must refuse to run instead (exit 92, REQUIRED_VERSION_NOT_MET). CI
+# installs the latest release through taiki-e/install-action.
+nextest-version = { required = "0.9.131" }
+
 [profile.default]
 # Per-test timeout. Tests that exceed this are killed and reported FAIL.
 slow-timeout = { period = "60s", terminate-after = 2 }
@@ -22,9 +28,12 @@ leak-timeout = "200ms"
 [profile.ci]
 slow-timeout = { period = "90s", terminate-after = 2 }
 leak-timeout = "500ms"
-# Fail-fast off by default (set via CLI); enable retries on flakes that
-# pass on rerun (common for timing-sensitive integration tests).
+# A failing test is retried once so the log shows whether it is flaky, but a
+# test that needed the retry FAILS the run (audit L2, 2026-10-04): before
+# this a flaky test passed silently. Pinned by
+# `crates/common/tests/shell_budget_guard.rs::nextest_ci_profile_fails_flaky_tests`.
 retries = { backoff = "fixed", count = 1, delay = "1s" }
+flaky-result = "fail"
 failure-output = "immediate-final"
 success-output = "never"
 status-level = "fail"
