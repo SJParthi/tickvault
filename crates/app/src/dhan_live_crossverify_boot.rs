@@ -342,6 +342,12 @@ pub const XVERIFY_STOP_CHECK_MARGIN_SECS: u64 = 300;
 pub const XVERIFY_EVENING_START_SECS_OF_DAY_IST: u64 =
     START_WATCHDOG_STOP_CHECK_SECS_OF_DAY_IST + XVERIFY_STOP_CHECK_MARGIN_SECS;
 
+/// How many times the evening wait re-sleeps when the wall clock reads short
+/// of [`XVERIFY_EVENING_START_SECS_OF_DAY_IST`] after the first sleep (a clock
+/// stepped back during the wait; 51b review). Bounded so a clock that keeps
+/// stepping back cannot hold the loop.
+const XVERIFY_EVENING_RESLEEP_MAX: u32 = 3;
+
 /// 17:24 IST — one minute before the scheduled-stop window opens. Derived from
 /// the `shutdown_class` constant, never a literal (§12.15.8).
 pub const XVERIFY_DEADLINE_SECS_OF_DAY_IST: u64 =
@@ -858,7 +864,11 @@ where
             AttemptKind::Full => match attempt_budget_secs(start, config_budget_secs) {
                 Some(budget) => {
                     // One instant for the timeout and the persist's own stop.
-                    let limit_secs = attempt_max_secs(budget);
+                    // Capped at a day (51b review): an evening budget is not
+                    // shrunk, and `Instant + Duration` panics on overflow,
+                    // which with `panic = "abort"` would stop the whole
+                    // process for a huge configured `run_budget_secs`.
+                    let limit_secs = attempt_max_secs(budget).min(SECS_PER_DAY);
                     let deadline = tokio::time::Instant::now() + Duration::from_secs(limit_secs);
                     let plan = AttemptPlan {
                         number: attempts,
@@ -896,6 +906,18 @@ where
                         let evening = XVERIFY_EVENING_START_SECS_OF_DAY_IST;
                         tokio::time::sleep(Duration::from_secs(evening.saturating_sub(start)))
                             .await;
+                        // The sleep runs on the monotonic clock, the gate on
+                        // the wall clock: a wall clock stepped back during
+                        // the wait wakes short of 17:50 and would skip the
+                        // one evening attempt (51b review). Sleep the
+                        // shortfall, a bounded number of times.
+                        for _ in 0..XVERIFY_EVENING_RESLEEP_MAX {
+                            let shortfall = evening.saturating_sub(now_secs_of_day());
+                            if shortfall == 0 {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_secs(shortfall)).await;
+                        }
                         if !still_today() {
                             return DayResult {
                                 attempts,
@@ -1299,11 +1321,11 @@ async fn run_once(
                 verdict.is_ok(),
                 should_write_marker(c, persisted_ok) && complete
             );
-            match verdict {
+            match marker_step(verdict, tokio::time::Instant::now(), deadline) {
                 // §12.15.8: a persist that finished never started a flush it
                 // could not end by the deadline, so this is a belt: past the
                 // deadline the marker is not written and the attempt ends.
-                Ok(()) if tokio::time::Instant::now() > deadline => {
+                MarkerStep::PastDeadline => {
                     warn!(
                         code = ErrorCode::WsGapConnectionState.code_str(),
                         source = "xverify_attempt_timed_out",
@@ -1316,8 +1338,8 @@ async fn run_once(
                     );
                     Err(AttemptFailure::Incomplete)
                 }
-                Ok(()) => record_day(today),
-                Err(failure) => {
+                MarkerStep::Write => record_day(today),
+                MarkerStep::Unrecorded(failure) => {
                     warn!(
                         code = ErrorCode::WsGapConnectionState.code_str(),
                         source = "xverify_attempt_unrecorded",
@@ -1349,6 +1371,34 @@ async fn run_once(
             );
             Err(AttemptFailure::RunFailed)
         }
+    }
+}
+
+/// What `run_once` does with an attempt's verdict (§12.15.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarkerStep {
+    /// The verdict is `Ok` and the deadline has not passed: write the marker.
+    Write,
+    /// The verdict is `Ok` but the deadline has passed: no marker, the
+    /// attempt fails `incomplete`.
+    PastDeadline,
+    /// The verdict is a failure: no marker.
+    Unrecorded(AttemptFailure),
+}
+
+/// The marker decision, pure so its deadline arm is tested (§12.15.8, 51b
+/// review): the attempt's timeout cannot stop a persist that returns `Ok`
+/// late, so this arm is the only thing that keeps the marker from being
+/// written past the deadline. `now == deadline` still writes. O(1).
+fn marker_step(
+    verdict: Result<(), AttemptFailure>,
+    now: tokio::time::Instant,
+    deadline: tokio::time::Instant,
+) -> MarkerStep {
+    match verdict {
+        Ok(()) if now > deadline => MarkerStep::PastDeadline,
+        Ok(()) => MarkerStep::Write,
+        Err(failure) => MarkerStep::Unrecorded(failure),
     }
 }
 
@@ -1434,17 +1484,20 @@ fn persist_report(
 /// rows are counted as discarded, never as persisted (2026-10-06, §12.15.7).
 ///
 /// §12.15.8: the persist runs synchronously after the attempt's last
-/// `.await`, so the attempt's timeout cannot stop it. It bounds itself:
-/// before each row it checks that a flush of the buffer, started now, would
-/// end by `deadline` in the ILP client's worst case
-/// ([`DhanLiveXverifyAuditWriter::flush_worst_case`]). When it would not, the
+/// `.await`, so the attempt's timeout cannot stop it. It bounds itself: for
+/// each row it reads the clock once and checks, before the append and again
+/// after it (on the buffer a batch flush would send), that a flush of the
+/// buffer started at that reading would end by `deadline` in the ILP client's
+/// worst case ([`DhanLiveXverifyAuditWriter::flush_worst_case`]). When it
+/// would not, the
 /// persist stops: the buffered rows are abandoned (counted locally, never on a
 /// §2.10 loss-group counter, since a deliberate stop is not a lost row), the rows not
 /// yet appended are counted, and the outcome is `NotPersisted`, so no marker
 /// is written. The check runs per row, not only before a flush, because a
 /// buffer that cannot be flushed in time now cannot be later either: the
 /// clock only advances and the final flush is still owed. So every flush this
-/// starts ends by `deadline`.
+/// starts ends by `deadline`, plus the CPU time between the clock reading
+/// and the flush call (one append, microseconds).
 /// O(findings + tape rows), once per attempt, cold.
 fn persist_report_into(
     writer: &mut DhanLiveXverifyAuditWriter,
@@ -1505,8 +1558,14 @@ fn persist_report_into(
         .saturating_add(1);
     let mut appended = 0_usize;
 
+    // One clock reading per row, checked twice: before the append (so a
+    // persist past its deadline appends nothing) and after it, on the buffer
+    // `flush_if_full` would actually send (51b review: checking only before
+    // the append let a batch flush start one row larger than the one
+    // checked).
     for finding in &c.findings {
-        if !flush_fits(writer, now(), deadline) {
+        let at = now();
+        if !flush_fits(writer, at, deadline) {
             stop_at_deadline(writer, &mut out, total - appended);
             return finish_persist(report, out, batch_errors, None);
         }
@@ -1514,10 +1573,15 @@ fn persist_report_into(
             out.cell_append_errors = out.cell_append_errors.saturating_add(1);
         }
         appended += 1;
+        if !flush_fits(writer, at, deadline) {
+            stop_at_deadline(writer, &mut out, total - appended);
+            return finish_persist(report, out, batch_errors, None);
+        }
         flush_if_full(writer, &mut out, &mut batch_errors);
     }
     for row in &report.rest_tape {
-        if !flush_fits(writer, now(), deadline) {
+        let at = now();
+        if !flush_fits(writer, at, deadline) {
             stop_at_deadline(writer, &mut out, total - appended);
             return finish_persist(report, out, batch_errors, None);
         }
@@ -1525,6 +1589,10 @@ fn persist_report_into(
             out.tape_append_errors = out.tape_append_errors.saturating_add(1);
         }
         appended += 1;
+        if !flush_fits(writer, at, deadline) {
+            stop_at_deadline(writer, &mut out, total - appended);
+            return finish_persist(report, out, batch_errors, None);
+        }
         flush_if_full(writer, &mut out, &mut batch_errors);
     }
     let daily = daily_row(
@@ -1776,7 +1844,10 @@ async fn run_option_pass(
     for label in XVERIFY_OPTION_PASS_OUTCOMES {
         metrics::counter!(XVERIFY_OPTION_PASS_COUNTER, "outcome" => label).increment(0);
     }
-    if !option_pass_fits(now_ist_secs_of_day()) {
+    // 51b review: `option_pass_fits` reads seconds of day with no date, so an
+    // evening attempt that ran past midnight would otherwise start the pass
+    // for yesterday against today's (empty) held set.
+    if today_ist().0 != today || !option_pass_fits(now_ist_secs_of_day()) {
         metrics::counter!(XVERIFY_OPTION_PASS_COUNTER, "outcome" => "skipped_late").increment(1);
         info!(%today, "Dhan option cross-check skipped — it could not finish before the evening stop");
         return;
@@ -1891,7 +1962,7 @@ async fn run_option_pass(
 /// gap is logged on `xverify_options_persist_partial`.
 ///
 /// §12.15.8: it stops at `deadline` the same way the spot persist does: before
-/// each row it checks that a flush of the buffer would end by `deadline` in
+/// and after each append it checks that a flush of the buffer would end by `deadline` in
 /// the ILP client's worst case, and otherwise abandons the buffer (counted
 /// locally, never on a §2.10 loss-group counter), logs
 /// `xverify_options_persist_stopped_at_deadline` and returns `false`.
@@ -1940,8 +2011,11 @@ fn persist_option_findings_into(
     let total = c.findings.len().saturating_add(report.rest_tape.len());
     let mut appended = 0_usize;
     let mut stopped = false;
+    // Checked before and after each append on one reading, as in
+    // `persist_report_into` (51b review).
     for finding in &c.findings {
-        if !flush_fits(writer, now(), deadline) {
+        let at = now();
+        if !flush_fits(writer, at, deadline) {
             stopped = true;
             break;
         }
@@ -1949,11 +2023,16 @@ fn persist_option_findings_into(
             row_errors = row_errors.saturating_add(1);
         }
         appended += 1;
+        if !flush_fits(writer, at, deadline) {
+            stopped = true;
+            break;
+        }
         flush_if_full(writer);
     }
     if !stopped {
         for row in &report.rest_tape {
-            if !flush_fits(writer, now(), deadline) {
+            let at = now();
+            if !flush_fits(writer, at, deadline) {
                 stopped = true;
                 break;
             }
@@ -1961,10 +2040,17 @@ fn persist_option_findings_into(
                 row_errors = row_errors.saturating_add(1);
             }
             appended += 1;
+            if !flush_fits(writer, at, deadline) {
+                stopped = true;
+                break;
+            }
             flush_if_full(writer);
         }
     }
-    if stopped || !flush_fits(writer, now(), deadline) {
+    // An empty buffer owes no flush (`flush` of nothing is a no-op `Ok`), so
+    // it is never a deadline stop (51b review: it used to log one, a false
+    // failure signal).
+    if stopped || (writer.pending() > 0 && !flush_fits(writer, now(), deadline)) {
         // §12.15.8 (51b review): abandoned, counted locally only; the option
         // pass never pages (§12.15.6), so never a §2.10 loss-group counter.
         let abandoned = writer.abandon_pending();
@@ -2235,8 +2321,16 @@ mod tests {
             3,
             "the definition plus exactly two call sites"
         );
-        let ok_arm = body.find("Ok(()) => record_day(today)");
-        assert!(ok_arm.is_some(), "run_once writes the marker on its Ok arm");
+        let ok_arm = body.find("MarkerStep::Write => record_day(today)");
+        assert!(
+            ok_arm.is_some(),
+            "run_once writes the marker on its Write arm"
+        );
+        assert!(
+            body.contains("match marker_step(verdict, tokio::time::Instant::now(), deadline) {"),
+            "the marker decision reads the clock against the attempt's deadline"
+        );
+        assert!(body.contains("MarkerStep::PastDeadline => {"));
         let run_day = fn_body(prod, "async fn run_day(");
         assert!(run_day.contains("AttemptKind::MarkerOnly => {"));
         // The only other marker write is the paged-day marker (§12.15.8,
@@ -2541,8 +2635,11 @@ mod tests {
     /// §12.15.8: the persist stops at the first row whose buffer could not be
     /// flushed by the deadline in the ILP client's worst case (5 s plus the
     /// bytes at 100 KiB/s). The clock advances 1 s per reading; the deadline
-    /// is 7 s out, so readings at 0, 1 and 2 s fit (2 s + 5 s with an empty
-    /// buffer is exactly 7 s) and the reading at 3 s does not.
+    /// is 7 s out. Readings at 0 and 1 s fit before and after their append.
+    /// At 2 s the empty buffer fits (2 s + 5 s is exactly 7 s) but the buffer
+    /// after the append does not (the row's bytes add a few milliseconds), so
+    /// the persist stops there, after the append and before any flush (51b
+    /// review: the check used to run only before the append).
     #[test]
     fn test_persist_report_into_stops_at_the_first_flush_that_cannot_end_by_the_deadline() {
         let report = report_with(5, 3);
@@ -2556,11 +2653,11 @@ mod tests {
         };
         let deadline = t0 + Duration::from_secs(7);
         let out = persist_report_into(&mut writer, &report, 0, 5, 2, deadline, clock);
-        assert_eq!(reads.get(), 4, "one reading per row until the stop");
+        assert_eq!(reads.get(), 3, "one reading per row until the stop");
         assert!(out.deadline_reached);
         // Rows 0 and 1 went in a failed batch flush (no sender), row 2 was
-        // buffered and abandoned at the stop (not discarded: §12.15.8); 2 findings, 3 tape rows and
-        // the daily row were never appended.
+        // appended and abandoned at the stop (not discarded: §12.15.8); 2
+        // findings, 3 tape rows and the daily row were never appended.
         assert_eq!(out.rows_discarded, 2, "{out:?}");
         assert_eq!(out.rows_abandoned_at_deadline, 1, "{out:?}");
         assert_eq!(out.rows_not_written_at_deadline, 6, "{out:?}");
@@ -2568,11 +2665,79 @@ mod tests {
         assert_eq!(persist_verdict(&out), Err(AttemptFailure::NotPersisted));
     }
 
+    /// §12.15.8 (51b review): the bytes term of the worst case bounds the
+    /// persist, not only the 5 s request timeout. The batch is larger than the
+    /// report, so no flush empties the buffer; the clock is frozen 6 s before
+    /// the deadline. A writer that dropped `flush_worst_case`'s bytes term
+    /// (`now + 5 s <= deadline`) would never stop here. The expected stop row
+    /// is measured on a second writer fed the same rows: the first whose
+    /// buffer's worst case exceeds the 6 s left.
+    #[test]
+    fn test_persist_report_into_stops_on_the_bytes_term_of_the_worst_case() {
+        let report = report_with(4_000, 0);
+        let room = Duration::from_secs(6);
+        let mut probe = DhanLiveXverifyAuditWriter::for_test();
+        let mut stop_row = None;
+        for (i, f) in report.comparison.findings.iter().enumerate() {
+            assert!(probe.append_cell(f).is_ok());
+            if probe.flush_worst_case() > room {
+                stop_row = Some(i + 1);
+                break;
+            }
+        }
+        let stop_row = stop_row.expect("4,000 rows exceed 1 s at 100 KiB/s");
+        assert!(stop_row > 1 && stop_row < 4_000, "{stop_row}");
+        let mut writer = DhanLiveXverifyAuditWriter::for_test();
+        let t0 = tokio::time::Instant::now();
+        let out = persist_report_into(&mut writer, &report, 0, 5, 10_000, t0 + room, || t0);
+        assert!(out.deadline_reached, "{out:?}");
+        assert_eq!(out.rows_abandoned_at_deadline, stop_row, "{out:?}");
+        assert_eq!(out.rows_not_written_at_deadline, 4_001 - stop_row);
+        assert_eq!(out.rows_flushed + out.rows_discarded, 0);
+        assert_eq!(writer.pending(), 0);
+        // The same for the option persist.
+        let mut writer = DhanLiveXverifyAuditWriter::for_test();
+        assert_eq!(
+            persist_option_findings_into(&mut writer, &report, t0 + room, || t0),
+            OptionPersist::StoppedAtDeadline
+        );
+        assert_eq!(writer.pending(), 0);
+    }
+
+    /// §12.15.8 (51b review): the marker is written only for an `Ok` verdict
+    /// reached by the deadline. The timeout cannot stop a persist that
+    /// returns `Ok` late, so this arm is the only thing that keeps the marker
+    /// from being written past it.
+    #[test]
+    fn test_marker_step_refuses_the_marker_past_the_deadline() {
+        let t0 = tokio::time::Instant::now();
+        let later = t0 + Duration::from_millis(1);
+        assert_eq!(
+            marker_step(Ok(()), t0, t0),
+            MarkerStep::Write,
+            "at the deadline"
+        );
+        assert_eq!(marker_step(Ok(()), t0, later), MarkerStep::Write);
+        assert_eq!(marker_step(Ok(()), later, t0), MarkerStep::PastDeadline);
+        for failure in [AttemptFailure::NotPersisted, AttemptFailure::Vacuous] {
+            assert_eq!(
+                marker_step(Err(failure), later, t0),
+                MarkerStep::Unrecorded(failure)
+            );
+            assert_eq!(
+                marker_step(Err(failure), t0, later),
+                MarkerStep::Unrecorded(failure)
+            );
+        }
+    }
+
     proptest::proptest! {
         /// Whatever the clock and deadline: every row is accounted for once
         /// (flushed, discarded or not written), and every clock reading the
         /// persist acted on left at least the 5 s request timeout before the
-        /// deadline, so no flush it started could end after it.
+        /// deadline. That is the floor of the bound, not all of it: the
+        /// bytes term is pinned by
+        /// `test_persist_report_into_stops_on_the_bytes_term_of_the_worst_case`.
         #[test]
         fn test_persist_report_into_never_acts_without_room_before_the_deadline(
             findings in 0_usize..40,
@@ -2619,10 +2784,11 @@ mod tests {
         }
     }
 
-    /// §12.15.8: the option persist stops the same way. An empty report with
-    /// room flushes nothing and succeeds; the same report past the deadline
-    /// stops before the final flush; rows with room reach the (absent)
-    /// sender and fail.
+    /// §12.15.8: the option persist stops the same way. An empty report
+    /// flushes nothing and succeeds, with room or without (51b review: an
+    /// empty buffer owes no flush, so it is not a deadline stop); rows past
+    /// the deadline stop before the final flush; rows with room reach the
+    /// (absent) sender and fail.
     #[test]
     fn test_persist_option_findings_into_stops_at_the_deadline() {
         let t0 = tokio::time::Instant::now();
@@ -2635,7 +2801,7 @@ mod tests {
         );
         assert_eq!(
             persist_option_findings_into(&mut w, &empty, t0, || t0),
-            OptionPersist::StoppedAtDeadline
+            OptionPersist::Flushed
         );
         let rows = report_with(4, 2);
         assert_eq!(
@@ -3355,6 +3521,118 @@ mod tests {
         assert_eq!(lasts, vec![false, false, false, true]);
     }
 
+    /// 51b review: the evening wait sleeps on the monotonic clock but the
+    /// attempt is gated on the wall clock. A wall clock stepped back 2 s during
+    /// the wait wakes at 17:49:58; the loop sleeps the shortfall and still
+    /// makes the one evening attempt, instead of skipping it a second time
+    /// and ending the day `skipped_no_time`.
+    #[tokio::test(start_paused = true)]
+    async fn test_drive_day_evening_attempt_survives_a_wall_clock_stepped_back() {
+        let evening = XVERIFY_EVENING_START_SECS_OF_DAY_IST;
+        let first_start = 63_000_u64;
+        let t0 = tokio::time::Instant::now();
+        let stepped = std::cell::Cell::new(false);
+        let now = || {
+            let wall = first_start + t0.elapsed().as_secs();
+            if stepped.get() { wall - 2 } else { wall }
+        };
+        let starts = std::cell::RefCell::new(Vec::new());
+        let result = drive_day(
+            day(),
+            600,
+            now,
+            || true,
+            || stepped.set(true),
+            |plan: AttemptPlan| {
+                starts.borrow_mut().push(plan.start_secs_of_day);
+                async { Ok(()) }
+            },
+        )
+        .await;
+        assert_eq!(result.failure, None, "{result:?}");
+        assert_eq!(result.attempts, 1);
+        assert_eq!(starts.into_inner(), vec![evening]);
+        assert_eq!(now(), evening, "woke once more for the 2 s shortfall");
+    }
+
+    /// 51b review: an evening attempt keeps the configured budget unshrunk,
+    /// and a huge one (`u64::MAX`, which `validate` accepts) must not overflow
+    /// `Instant + Duration` (a panic, and `panic = "abort"` would stop the
+    /// whole process). The limit is capped at a day.
+    #[tokio::test(start_paused = true)]
+    async fn test_drive_day_evening_attempt_with_a_huge_budget_does_not_panic() {
+        let sim = simulate(
+            XVERIFY_EVENING_START_SECS_OF_DAY_IST,
+            u64::MAX,
+            |_, _| (Some(1), Ok(())),
+            None,
+        )
+        .await;
+        assert_eq!(sim.result.failure, None);
+        let plan = sim.plans.first().copied().expect("one attempt ran");
+        assert_eq!(plan.run_budget_secs, u64::MAX);
+        assert_eq!(
+            plan.deadline,
+            Some(sim.t0 + Duration::from_secs(SECS_PER_DAY)),
+            "the limit is capped at a day"
+        );
+    }
+
+    /// 51b review: the option pass refuses to start once the IST day has
+    /// changed (an evening attempt that ran past midnight), so it never
+    /// compares yesterday against today's empty held set.
+    #[test]
+    fn test_option_pass_refuses_a_changed_day() {
+        let body = fn_body(prod_src(), "async fn run_option_pass(");
+        assert!(
+            body.contains(
+                "if today_ist().0 != today || !option_pass_fits(now_ist_secs_of_day()) {"
+            ),
+            "the option pass checks the day before it checks the time"
+        );
+    }
+
+    /// 51b review: the runbook's operator actions for a skipped day agree
+    /// with §12.15.8 and the code: a start at or after 17:50 runs one full
+    /// attempt (`attempt_budget_secs` returns the configured budget), so the
+    /// runbook must never tell the operator today cannot be re-checked by a
+    /// restart then, nor that a retry always runs at full budget.
+    #[test]
+    fn test_runbook_skip_rows_agree_with_the_evening_attempt() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/error-runbooks/dhan-live-crossverify-error-codes.md");
+        let runbook = std::fs::read_to_string(&path).unwrap_or_default();
+        let row = |source: &str| {
+            runbook
+                .lines()
+                .find(|l| l.starts_with(&format!("| `source = \"{source}\"`")))
+                .unwrap_or("")
+                .to_string()
+        };
+        let skipped = row("xverify_attempt_skipped_no_time");
+        assert!(skipped.contains("17:50"), "{skipped}");
+        let failed = runbook
+            .lines()
+            .find(|l| l.contains("`reason = \"skipped_no_time\"`") && l.starts_with("| `source"))
+            .unwrap_or("");
+        assert!(failed.contains("at or after 17:50"), "{failed}");
+        let timed_out = row("xverify_attempt_timed_out");
+        assert!(!timed_out.is_empty());
+        for text in [skipped.as_str(), failed, timed_out.as_str()] {
+            assert!(!text.contains("cannot be re-checked"), "{text}");
+            assert!(!text.contains("cannot re-check"), "{text}");
+            assert!(!text.contains("runs at full budget"), "{text}");
+        }
+        assert_eq!(
+            attempt_budget_secs(XVERIFY_EVENING_START_SECS_OF_DAY_IST, 600),
+            Some(600)
+        );
+        assert!(should_catch_up(
+            XVERIFY_EVENING_START_SECS_OF_DAY_IST,
+            false
+        ));
+    }
+
     /// A marker-only attempt as the last: it gets the same once-decided
     /// `is_last`, no budget, and its failure is the day's final failure.
     #[tokio::test(start_paused = true)]
@@ -3850,7 +4128,7 @@ mod tests {
             slice(finish, "if out.deadline_reached {", "return out;"),
             slice(
                 options,
-                "if stopped || !flush_fits(writer, now(), deadline) {",
+                "if stopped || (writer.pending() > 0 && !flush_fits(writer, now(), deadline)) {",
                 "return OptionPersist::StoppedAtDeadline;",
             ),
         ];
