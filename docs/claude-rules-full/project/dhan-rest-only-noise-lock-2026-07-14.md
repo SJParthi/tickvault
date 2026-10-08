@@ -4133,6 +4133,72 @@ the pre-removal bill is −$0.10/mo. No new EMF metric name.
 alone; sets `ok_recovery = true`; adds a fourth xverify alarm without its own
 dated row.
 
+**2026-10-06 note — two new `reason` values on `xverify_failed`, no new page.**
+Owner approvals, verbatim: "Go ahead with whatever you want dude" and "See do
+everything whatever is recommended dude okay?" (plan ITEM 51a;
+`no-rest-except-live-feed-2026-06-27.md` §12.15.7). Recorded BEFORE the code.
+
+- **NO** new alarm, metric filter, `source`, Telegram phrase, EMF name,
+  dimension or `ok_actions`. No terraform change.
+- `xverify_failed` keeps its documented meaning: the check did not record
+  today after every same-day attempt. Its `reason` field gains two values,
+  `marker_not_written` (the comparison finished and every row was accepted,
+  but the day marker could not be saved to disk) and `audit_rows_lost` (some
+  audit rows were discarded or refused). Both used to log "recorded" and
+  release the S3 hold falsely; they now fail the attempt and page only after
+  the last one, as every other `reason` does. The filter matches `code`,
+  `level` and `source` only, so it already covers them.
+- Three per-attempt `warn!` sources are added, none of them filtered:
+  `xverify_attempt_marker_write_failed`, `xverify_marker_dir_sync_failed` and
+  `xverify_marker_keep_short`.
+- **Double page, accepted:** a mid-run audit discard already pages through the
+  §2.10 `audit_rows` group (`tv_dhan_live_xverify_audit_rows_discarded_total`
+  and `tv_dhan_feed_xverify_persist_errors_total` are members), and if every
+  attempt then loses rows the final `xverify_failed` (`reason =
+  audit_rows_lost`) pages again. The two say different things (rows lost; the
+  day not recorded), so both stay.
+
+**2026-10-06 note (51b review) — `xverify_failed` gains `reason =
+"skipped_no_time"` and pages once per day across processes; a deliberate
+persist stop leaves the §2.10 group.** Same owner approvals as the note above
+(plan ITEM 51b; `no-rest-except-live-feed-2026-06-27.md` §12.15.8, its Evening
+attempt and Page rows). Recorded BEFORE the code.
+
+- **NO** new alarm, metric filter, EMF name, dimension or `ok_actions`. No
+  terraform change.
+- `xverify_failed` gains one emit condition and keeps its meaning (today's
+  check did not record; S3 is held): a day whose only attempt in this process
+  was skipped for time pages it at the skip, `reason = "skipped_no_time"`,
+  unless today's paged marker (task `dhan_live_crossverify_paged`) shows a page
+  already went out. Before the review the code only logged that day, on the
+  unchecked belief that an earlier process had paged; when that process died
+  before its last attempt, or none ran, the day was unverified and nobody was
+  told.
+- Fewer pages, never more per day: every final-failure page writes the paged
+  marker, and while it exists a later final failure the same day is a coded
+  `warn!` (`xverify_already_paged_today`) instead of a second page. The
+  divergence page (`xverify_diverged`) is unaffected. `xverify_vacuous` IS
+  affected, and this is stated rather than changed (third 51b review): after
+  any same-day page (for example `skipped_no_time` at a 17:20 restart), a
+  final failure that compared zero minutes logs `xverify_already_paged_today`
+  with `reason = "vacuous"` and does not page; the page already sent says
+  today is unverified and S3 is held, and exempting it would make two pages
+  in one day.
+- A persist the code stops on purpose at its deadline (`xverify_persist_stopped_at_deadline`,
+  `xverify_options_persist_stopped_at_deadline`) no longer adds to
+  `tv_dhan_feed_xverify_persist_errors_total` or
+  `tv_dhan_live_xverify_audit_rows_discarded_total`: those are §2.10
+  `audit_rows` members, so each stop paged `tv-<env>-audit-rows-lost` per
+  attempt, against §12.15.5 (page once, after the last attempt) and §12.15.6
+  (the option pass never pages). The rows are recomputable and the day's last
+  attempt still pages `xverify_failed` (`reason = "not_persisted"`). The stop
+  is counted on the local-only `tv_dhan_xverify_persist_deadline_stops_total`
+  and `tv_dhan_live_xverify_audit_rows_abandoned_total`. A flush that FAILS
+  still counts on both §2.10 members and still pages, unchanged. This narrows
+  what reaches the group; it adds no counter to it and widens no slice.
+- New log-sink-only coded `warn!` sources: `xverify_already_paged_today`,
+  `xverify_paged_marker_write_failed`.
+
 ---
 
 ## §2.6 — 2026-09-25: three live-lane pages for DELAY, not only for loss — feed delay, main-feed reconnect time, blank new depth contracts
@@ -4610,3 +4676,33 @@ the standing ceiling is $150 per Quote 23.
 - Lowers the durability alarm to a single period.
 - Drops the boot-time zero registration of any counter in a group.
 - Adds a counter to a group, or widens a slice, without a dated row here.
+
+## §2.11 — 2026-10-06: `RISK-GAP-03` re-arms after each silence episode (no new page)
+
+Owner, 2026-10-06: "Go ahead with whatever you want dude", and on the
+recommended-fixes list, "See do everything whatever is recommended dude okay?".
+
+**What was wrong (Verified from code, `crates/app/src/dhan_feed_stack.rs`):** the
+30-second silence arm counted never-ticked contracts inside "silent". Far
+option strikes that never trade keep that count above zero all day, so after
+the first page the episode never ended, the latch never cleared, and a
+contract that went quiet later in the session never paged. The page this file
+already allows (one per episode, `RISK-GAP-03` log filter) had quietly become
+one per day.
+
+**What changed:** the arm pages when a contract that HAD ticked goes quiet
+(`silent − never`), and reports never-ticked contracts once per session.
+`silence_scan_pending` holds the rule; the existing 30-minute cooldown,
+continuous-session gate, holiday gate and the dead-class report are
+unchanged. Pinned by
+`a_contract_going_quiet_mid_session_pages_although_far_strikes_never_ticked`
+and `silence_scan_pending_truth_table`.
+
+**Allowed set unchanged:** no new code, alarm, filter, metric, dimension or
+`ok_actions`. The page can now fire more than once a day, at most once per 30
+minutes, which is what §2.3's "one per episode" always said. Cost unchanged.
+
+**What a PR that violates §2.11 looks like (REJECT):**
+- Counts never-ticked contracts toward re-arming the page again, so far
+  strikes latch it for the day.
+- Removes the 30-minute cooldown or pages never-ticked contracts every scan.

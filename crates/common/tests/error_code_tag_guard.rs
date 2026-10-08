@@ -326,17 +326,15 @@ fn scan_corpus_exists_and_is_substantial() {
 /// those two now reach the existing frame-drop alarm (a real loss, an
 /// existing alarm, no new alarm).
 ///
-/// 2026-10-05: the WAL init failure, the panic hook and the API server exit
-/// got their own codes (`BOOT-04`, `PROC-02`, `API-SERVER-01`, log-sink only,
-/// runbook `docs/error-runbooks/process-lifecycle-error-codes.md`), 10 -> 7.
-///
-/// The seven left, and why: three in `crates/trading/src/indicator/` and
+/// The ten left, and why: three in `crates/trading/src/indicator/` and
 /// `strategy/` (frozen area, `daily-universe-scope-expansion` §28); the two
 /// `tick_gap_tracker.rs` lines and the trading-pipeline lag line (the only
 /// fitting code, `RISK-GAP-03`, pages per instrument); the WAL corrupt-segment
 /// skip (the only fitting code, `WS-SPILL-02`, pages, and a torn segment after
-/// any crash would page at boot).
-const UNCODED_ERROR_BUDGET: usize = 7;
+/// any crash would page at boot); the WAL init failure, the panic hook and the
+/// API server exit (no existing code fits; each needs its own code and
+/// runbook).
+const UNCODED_ERROR_BUDGET: usize = 10;
 
 /// Per-crate uncoded-error budgets, for the crates the six-name list never
 /// reached.

@@ -628,3 +628,130 @@ fn r21_manual_deploy_needs_main_and_all_green() {
         "a missing branch rule is a visible warning",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Mutation lane (audit H2, 2026-10-06). The weekly full sweep is ~18-hour
+// class and the job was capped at 60 minutes, so it could never finish. The
+// sweep is sharded and each shard gets GitHub's long job timeout; a push run
+// mutates only the changed lines.
+// ---------------------------------------------------------------------------
+
+const MUTATION_WORKFLOW: &str = ".github/workflows/mutation.yml";
+
+#[test]
+fn mutation_weekly_sweep_is_sharded_with_a_timeout_it_can_finish_in() {
+    let wf = read(MUTATION_WORKFLOW);
+    must_contain(
+        &wf,
+        "fromJSON('[0, 1, 2, 3, 4, 5, 6, 7]')",
+        "mutation sweep shard matrix",
+    );
+    must_contain(
+        &wf,
+        "MUTATION_SHARDS: ${{ github.event_name == 'push' && 1 || 8 }}",
+        "mutation shard count matches the matrix",
+    );
+    must_contain(
+        &wf,
+        "--shard \"${{ matrix.shard }}/${MUTATION_SHARDS}\"",
+        "cargo mutants runs one shard per job",
+    );
+    must_contain(
+        &wf,
+        "timeout-minutes: ${{ github.event_name == 'push' && 60 || 350 }}",
+        "scheduled shards get the long timeout",
+    );
+    must_contain(
+        &wf,
+        "fail-fast: false",
+        "one shard's result never cancels the others",
+    );
+    must_contain(
+        &wf,
+        "name: mutation-results-shard-${{ matrix.shard }}",
+        "each shard uploads its own results",
+    );
+    assert!(
+        !wf.contains("    timeout-minutes: 60\n"),
+        "a flat 60-minute cap on the mutation job is back; the weekly sweep cannot finish in it"
+    );
+}
+
+#[test]
+fn mutation_push_run_mutates_only_the_changed_lines() {
+    let wf = read(MUTATION_WORKFLOW);
+    for (needle, label) in [
+        (
+            "git diff \"$before\" HEAD -- crates/core crates/trading crates/common > mutants.diff",
+            "push run diff is limited to the critical crates",
+        ),
+        (
+            "echo \"in_diff=--in-diff mutants.diff\" >> \"$GITHUB_OUTPUT\"",
+            "push run passes the diff to cargo mutants",
+        ),
+        (
+            "${{ steps.changed.outputs.in_diff }}",
+            "cargo mutants receives the in-diff argument",
+        ),
+        (
+            "--in-place",
+            "the unmutated baseline keeps .git (2026-10-04)",
+        ),
+    ] {
+        assert!(
+            wf.contains(needle),
+            "{label}: expected to contain {needle:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// cargo-careful runner disk (2026-10-06, the issue #1836 class). The weekly
+// run and its re-run died linking with "Free space left: 0 MB" and an lld
+// "Bus error". The job now carries the sanitizer jobs' three disk measures.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn careful_job_frees_runner_disk_and_drops_dependency_debug_info() {
+    let wf = read(".github/workflows/safety.yml");
+    let start = wf.find("\n  careful:\n").expect("careful job present");
+    let end = wf[start..]
+        .find("\n  sanitizer-asan:\n")
+        .map(|i| start + i)
+        .expect("asan job follows careful");
+    let job = &wf[start..end];
+    for (needle, label) in [
+        (
+            "Free runner disk space",
+            "frees the preinstalled toolchains",
+        ),
+        (
+            "sudo rm -rf /usr/share/dotnet",
+            "the cleanup actually removes something",
+        ),
+        (
+            "CARGO_PROFILE_DEV_DEBUG: line-tables-only",
+            "line tables for our crates",
+        ),
+        (
+            "CARGO_RESOLVER_FEATURE_UNIFICATION: workspace",
+            "one feature set for every -p",
+        ),
+        (
+            "Report runner disk (issue 1836)",
+            "df after the build either way",
+        ),
+    ] {
+        assert!(
+            job.contains(needle),
+            "careful job {label}: expected {needle:?}"
+        );
+    }
+    let no_dep_debug = job
+        .matches("--config 'profile.dev.package.\"*\".debug=false'")
+        .count();
+    assert_eq!(
+        no_dep_debug, 2,
+        "both careful cargo calls (build and test) must drop dependency debug info, else the test step relinks with full debug info"
+    );
+}

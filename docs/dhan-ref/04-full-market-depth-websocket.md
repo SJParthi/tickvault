@@ -277,7 +277,7 @@ pub struct TwoHundredDepthPacket {
 
 9. **Disconnect code `805`** — same as Live Market Feed, >5 connections kills the oldest.
 
-10. **Unsubscribe code is 24** — the reference client's `subscribe_code + 1`. Until 2026-09-10 this rule called that an SDK BUG and said the Annexure value was **25**; the live wire ignored every code-25 unsubscribe on 2026-09-10 (20 ignored, 10 ghost redials, 8 instruments on 5 depth-200 sockets in 30 minutes) and our implementation now sends 24. See `08-annexure-enums.md` end note.
+10. **Unsubscribe code is 24** — the reference client's `subscribe_code + 1`. Until 2026-09-10 this rule called that an SDK BUG and said the Annexure value was **25**; the live wire ignored every code-25 unsubscribe on 2026-09-10 (20 ignored, 10 ghost redials, 8 instruments on 5 depth-200 sockets in 30 minutes) and our implementation now sends 24. See `08-annexure-enums.md` end note. *(⚠ CORRECTED 2026-10-06: the sentence above is stale. The 2026-09-12 two-armed probe re-confirmed **25** (`websocket-connection-scope-lock.md` §"2026-09-12 — THE TWO-ARMED UNSUBSCRIBE PROBE"), Dhan's 2026-09-30 reply states RequestCode 25 unsubscribes one instrument (`docs/dhan-support/2026-09-13-depth-unsubscribe-ignored.md`), and the code sends 25 (`FEED_UNSUBSCRIBE_TWENTY_DEPTH`, pinned by a test in `constants.rs`). Ghost packets after a code-25 unsubscribe were still measured on 2026-09-10 and 2026-09-24, so the ghost counter, not this note, is the check.)*
 
 ---
 

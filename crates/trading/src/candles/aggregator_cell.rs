@@ -3071,6 +3071,44 @@ mod tests {
         }
     }
 
+    /// The same ruling through both SEAL paths. Pre-open ticks never reach a
+    /// cell any more, so the only bar that can still be open when the 09:15
+    /// tick arrives is yesterday's last one (no day-close seal ran). With the
+    /// sweep first, 09:15 opens an EMPTY slot (`fold`'s open path); without
+    /// it, the 09:15 tick ROLLS yesterday's bar (the bucket-crossing path).
+    /// Both must sign 09:15 against yesterday's close carried on the packet,
+    /// not against yesterday's last bar.
+    #[test]
+    fn the_0915_bar_is_signed_against_yesterdays_close_on_both_seal_paths() {
+        let strategy = FeedStrategy::DEFAULT;
+        for tf in TfIndex::ALL {
+            for sweep_first in [false, true] {
+                let mut cell = AggregatorCell::empty();
+                // 15:15 IST yesterday, last trade 2850.00.
+                let yesterday = tick_at(OPEN - 86_400 + 21_600, 2850.00, 1_000);
+                cell.consume_tick(tf, &yesterday, 0, strategy, 1_000);
+                if sweep_first {
+                    let _ = cell.catch_up_seal(tf, OPEN);
+                }
+                let mut first = tick_at(OPEN, 2841.10, 46_810);
+                first.day_open = 2843.90;
+                first.day_close = 2827.00;
+                cell.consume_tick(tf, &first, 0, strategy, 46_810);
+                let bar = cell.snapshot(tf);
+                assert!(
+                    (bar.bucket_open_prev_close - f32_to_f64_clean(2827.00)).abs() < 1e-9,
+                    "{tf:?} sweep_first={sweep_first}: baseline was {}, want yesterday's close",
+                    bar.bucket_open_prev_close
+                );
+                assert!(
+                    bar.signed_volume() > 0,
+                    "{tf:?} sweep_first={sweep_first}: 09:15 closed above yesterday's close \
+                     and below yesterday's last bar; it must read positive"
+                );
+            }
+        }
+    }
+
     /// The bar AFTER 09:15 still compares against the bar before it, and a
     /// 09:15 packet with no previous close has no baseline (signed positive).
     #[test]

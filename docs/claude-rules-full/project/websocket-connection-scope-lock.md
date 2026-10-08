@@ -8696,3 +8696,343 @@ longer the 09:15 open.
 - Sealing any bar whose bucket starts before 09:15, in any timeframe.
 - Dropping or gating pre-open rows from `ticks` or the WAL under cover of this quote.
 - Moving the candle grid start again without a fresh dated quote here first.
+
+### 2026-10-06 — OVERFLOW PROBE ATTRIBUTION: a close with no code fails a probe only on the probed socket, or when another socket's drop is corroborated as an eviction
+
+**Owner (2026-10-06, verbatim):** "Go ahead with whatever you want dude" and
+"See do everything whatever is recommended dude okay?"
+
+*(Provenance: both quotes reached the implementing session through the
+coordinator's workflow on 2026-10-06, as the approval for the recommended
+fast-lane plan. Confirm them against the owner thread before merge.)*
+
+**What was wrong (measured in source on main 60bdfd97a).** Once any 805 had
+happened, EVERY close with no code on ANY socket failed a running probe or
+release window (main feed rule D7 / plan R3-7, and the depth "Failure" row of
+"2026-10-02 — DEPTH SOCKETS RECOVER ON THEIR OWN AFTER 805"). A probe is never
+refunded and the caps are 3 (main feed) and 6 (depth), so one unrelated blip on
+a healthy sibling burned a probe, and three such blips left the parked sockets
+dark for the session.
+
+Recorded HERE before the code, per the rule-file-first law.
+
+#### What this AMENDS
+
+| Surface | Was (D7 2026-10-02; depth 2026-10-02 "Failure" row) | Now |
+|---|---|---|
+| Main-feed window (D7) | fails on an 805 anywhere, on any socket closing with no code, or on no first frame in time | fails on an 805 anywhere; **the probed socket closing with no code, or its own idle watchdog firing**; no first frame in time; **another socket's no-code close that is corroborated as an eviction**; or **a dropped socket that does not reconnect within 120 s** |
+| Depth window ("Failure" row) | "an 805 on ANY socket, or any socket closing with no code, inside a window; or no frame in time" | the same failure rules as the main-feed rows (this one and the review-fix rows below). The probed socket parks again and the next probe waits the doubled delay, as before |
+| Corroboration | — | some OTHER socket of this process (not the closing one, and not one that closed in the same burst of closes within 2 s, with a code or without) BEGAN a dial in the last 20 s (`OVERFLOW_PROBE_EVICTION_ATTRIBUTION_SECS`, longer than the 15 s dial timeout). Dhan evicts the oldest socket when a new one is accepted, so a drop right after one of our dials is the probe (or a cascade) costing a socket |
+| A sibling blip that heals | failed the window | noted (`sibling_reset_noted`, a coded `warn!`). It heals at its own successful dial (`sibling_healed`); the window cannot pass until every noted sibling has healed and 20 s have passed since the last heal (that dial could still evict someone) |
+| Pass deferral | — | bounded (review fix, same day): a sibling is noted only until 240 s after the probed socket's first frame (the watch plus one heal deadline); a sibling dropping later while the pass is still deferred fails the window (`failed_deferral_exhausted`). Every note taken in time keeps its own 120 s heal deadline and its 20 s settle, so a pass is deferred at most 380 s after the probed socket's LATEST first frame *(⚠ CORRECTED, review round 4 below: a watch restart clears that frame, so this is not the window's length; the window is bounded at 740 s from its grant)*, and that cap (a fail-closed safety net, `failed_deferral_exhausted`) is never reached while a sibling is inside its own deadline or only the settle time is left *(⚠ CORRECTED, review round 9 below: true of SIBLING notes only; the probed depth socket's own frame-silence redial has no cutoff and can hold the pass into the cap)*. *(⚠ CORRECTED, review round 6 below: after a watch restart the 740 s bound from the grant could fail a window while a note taken late was still inside its deadline or settle; notes now stop 600 s after the grant, so it cannot.)* *(The first draft capped the deferral at 240 s, which failed a window whose sibling healed at F+225, inside its own deadline, and a sibling that dropped at F+235 five seconds after it was noted.)* |
+| The probed socket closing with a code other than 805 | did not fail the window (only an 805 or a no-code close did), so a window could pass while the probed socket was down or parked | review fix, same day: its FIRST such close in the window (for example the daily 807 token expiry) restarts its watch: it needs a fresh first frame within 120 s and a full 120 s watch after it (`watched_restarted`, a coded `warn!`). A second such close, or the probed socket parking for any reason but 805 or an orderly shutdown (808, 804 after its respawn), fails the window (`failed_watched_closed`) |
+| Another socket closing with a code other than 805 | ignored | noted like an uncorroborated no-code close (Dhan said why, so it is never read as an eviction): the window cannot pass until it has redialled, within 120 s. It also joins the current 2 s burst of closes (review fix, same day): one Dhan-side incident can reach some sockets as a disconnect packet (800) and others as a bare reset, and the coded closer redials at once, so before this fix its own dial corroborated the bare reset from the same incident and spent a probe |
+| A noted sibling that parks for a reason other than 805 | — | dropped from the window (it opens no connection) |
+
+Unchanged: the probed socket closing with no code still fails a probe, as before.
+
+#### Kept, unchanged
+
+- One probe or release window in flight process-wide; the main feed goes first.
+- `ROTATION_HALTED` is never cleared, read or written by the episodes.
+- The caps: 3 main-feed probes, 6 depth probes, no refund; the delays (5/10/20
+  min; 5 min doubling to 30), the 2-minute first-frame deadline and the
+  2-minute watch.
+- No new socket, no new dial: healing a sibling is its own normal redial.
+- Socket caps 5,000 / 50 / 1 per socket.
+- No new page, alarm, EMF metric or Telegram message: Prometheus labels on the
+  existing probe counters and coded log lines only.
+
+#### ⚠ Honest limits
+
+- **A foreign process's dials cannot be seen.** The usual cause of an 805 is a
+  second login elsewhere. A single eviction caused by a foreign dial, whose
+  victim reconnects cleanly, now reads as a healed blip and the window can
+  pass; the next 805 or a corroborated close still fails it.
+- **A blip on the box's own network that also drops the probed socket still
+  fails the probe** (the probed-socket rule). The fix covers only drops that
+  leave the probed socket up.
+- **A depth socket's frame-silence redial (`FrameSilenceElapsed`) does not
+  fail a window**: a quiet depth contract is legitimate. Only the probed
+  socket's idle watchdog (no frame and no ping for 40 s) does. *(⚠ CORRECTED
+  2026-10-06, review round 3: this row said every frame-silence redial, and
+  the reason fits depth only. A MAIN-FEED socket is never legitimately silent
+  while the frame-silence gate is open, so the probed main-feed socket's
+  frame-silence redial now restarts its watch like a coded close, below.)*
+- **Errs toward fail, never toward pass**: any of our sockets beginning a dial
+  within 20 s before an unrelated blip fails the window; a cascade faster than
+  2 s is grouped as one burst and caught only by the next close or the 120 s
+  heal deadline.
+- **Assumed:** Dhan evicts at accept time, within the dial timeout of our
+  dial. An eviction more than 20 s after our dial reads as a blip.
+- **One watch restart per window** (review fix): two coded closes of the
+  probed socket in one window (for example two 807s while the token refresh
+  lags) fail it and spend the probe. Errs toward fail.
+- **A drop after the note cutoff fails a deferred window** (review fix): a
+  sibling blip more than 240 s after the probed socket's first frame, while
+  an earlier sibling still holds the pass, spends the probe. Without the cutoff
+  a sibling flapping for ever would hold the one process-wide window for ever.
+
+#### What a PR that violates this section looks like (REJECT)
+
+- Ignores sibling no-code closes inside a window with no corroboration check
+  (no recent-dial test and no heal deadline).
+- Removes "an 805 on any socket fails the window".
+- Passes a window while a noted sibling has not healed, or inside the settle
+  time after the last heal.
+- Refunds a probe, or raises the 3 / 6 probe caps, under cover of this section.
+- Opens a socket, or dials anything other than the sibling's own normal
+  redial, to heal a sibling.
+- Opens a second window while one is deferred.
+- Counts the closing socket's own dial, or a dial by a member of the same burst
+  of closes, as corroboration.
+- (review fix) Leaves a sibling that closed with a code other than 805 out of
+  the burst, so its own redial corroborates a no-code close from the same
+  incident.
+- (review fix) Lets the deferral cap fail a window while a noted sibling is
+  still inside its own heal deadline or only the settle time after a heal is
+  left; or notes a sibling past the note cutoff, so a window can run without
+  bound.
+- (review fix) Lets a window pass after the probed socket closed with a code
+  other than 805 without a fresh first frame and a full watch after it,
+  restarts its watch more than once per window, or lets it pass after the
+  probed socket parked for any reason but 805 or shutdown.
+
+#### Review round 3 (2026-10-06, same day, same owner approval)
+
+Two gaps a third review found in the rows above, both measured in source on
+this branch before the fix:
+
+| Surface | Was | Now |
+|---|---|---|
+| The probed socket's own close with a code other than 805, and the burst | only a SIBLING's coded close joined the 2 s burst. The probed socket's first such close restarts its watch (above) instead of failing it, and its redial is an immediate fresh dial into the account, so that redial corroborated a sibling's bare reset from the same Dhan-side incident and spent a probe | the probed socket's close joins the current 2 s burst like any other coded closer, so its own redial never corroborates a no-code close from the same incident. Outside the burst its dial still corroborates, as for every socket |
+| The probed socket torn down by this process | only a no-code close, a coded close, its idle watchdog, a non-805 park and an 805 reached the window. A redial this process starts itself (a subscribe batch that could not be sent, `SubscribeFailed`; or main-feed data silence, `FrameSilenceElapsed`) after the first frame left the watch running on the OLD first frame, so the window could pass while the probed socket was down | that teardown counts like a coded close of the probed socket: the first restarts its watch (fresh first frame within 120 s, full watch after it, `watched_restarted`), a second such event in the window fails it (`failed_watched_closed`), and it joins the burst. Depth frame silence stays out (a quiet depth contract is legitimate). The operator-armed probe close cannot run during a window: it is refused once `ROTATION_HALTED` is set, which the 805 that starts every window sets |
+
+**Honest limit:** the one watch restart per window is shared: a token-expiry
+close followed by a failed subscribe in the same window fails it. Errs toward
+fail.
+
+REJECT (review round 3):
+
+- Leaves the probed socket's own coded close out of the burst, so its redial
+  corroborates a no-code close from the same incident.
+- Lets a window pass after the probed socket was torn down by this process
+  (a failed subscribe, or main-feed data silence) without a fresh first frame
+  and a full watch after it; or feeds a depth socket's frame silence to the
+  window.
+
+#### Review round 4 (2026-10-06, same day, same owner approval)
+
+Two more gaps, both measured in source on this branch before the fix:
+
+| Surface | Was | Now |
+|---|---|---|
+| How long a window can run | "a window lasts at most 380 s after its first frame" (the Pass deferral row above). The 380 s cap and the 240 s note cutoff run from the probed socket's LATEST first frame, and its one watch restart clears that frame, so the clock started over: grant, first frame at +119 s, a deferral to +498 s, an 807 there, a fresh first frame at +617 s and a new deferral ran to about +997 s. All that time the window held the one process-wide turn and no parked depth socket could be granted. The 380 s figure was not a bound on the window. | bounded from the GRANT: `OVERFLOW_PROBE_WINDOW_MAX_SECS` = **740 s** = 120 (first-frame deadline) + 380 (deferral cap) for the window as granted, plus 120 (first-frame deadline) + 120 (watch) for its one restart. The grant instant is kept in `granted_at`, which a restart never resets. Past 740 s the next poll (once a second) fails the window as `failed_deferral_exhausted`, unless that poll passes it, so the true bound is **740 s from the grant, plus at most one poll**. *(⚠ Review round 9 below raised this to 743 s, 740 plus 3 s of poll slack, with no fresh dated quote; review round 10 WITHDREW that raise under the round-4 REJECT row below, so the bound is 740 s again.)* A window with no restart still ends by 120 + 380 = 500 s, so the bound only bites after a restart: a restart buys a fresh first frame and a full watch, never a second deferral. The 380 s cap from the latest first frame still holds as well. Verified by `proptest_window_bound_holds_from_the_grant_across_restarts` (bite-checked: with the bound disabled it fails at 740 s) and `proptest_attribution_rules`. |
+| A dial that fails | its BeginDial stamp stayed for 20 s and counted as eviction corroboration, so a socket stuck in a refused-dial loop (the 2026-08-12 HTTP 400 blackout, a 429 storm) re-stamped every 30–45 s and most unrelated sibling blips failed the window | a dial the server refused at the upgrade (a response other than 101, new transport label `upgrade_refused`, which was `connect` before) or that never left the process (`no_token`, `tls_config`, `bad_url`) drops the slot's stamp (one Release store of 0, in the connection task's DialFailed arm, `overflow_note_dial_failed`). Dhan evicts only when it ACCEPTS a socket, and such a dial accepted nothing. A `timeout` or a `connect` error keeps the stamp: acceptance is unknown there, so it still errs toward fail. The supervisor's backoff still never reads the reason. |
+
+**Honest limits:**
+
+- A refused dial still counts from its BeginDial until the refusal arrives
+  (usually well under a second, at most the 15 s dial timeout): a sibling's
+  no-code close in that span is corroborated. Errs toward fail.
+- A dial that times out, or fails with a TCP, TLS or I/O error, keeps its
+  stamp for the full 20 s, so a timeout loop can still fail a window on an
+  unrelated blip. Errs toward fail.
+- A restart in the last few seconds of the 500 s a window can run without one
+  can leave its fresh watch ending just past 740 s; the window then fails at
+  the bound instead of passing. Errs toward fail.
+
+REJECT (review round 4):
+
+- Measures the window's bound from anything a watch restart resets, or states
+  the window's length as the 380 s cap.
+- Raises `OVERFLOW_PROBE_WINDOW_MAX_SECS` or lets a restart buy a second
+  deferral without a fresh dated quote here.
+- Drops the stamp on a `timeout` or `connect` failure, or keeps it on an
+  `upgrade_refused` one.
+- Lets the supervisor's backoff branch on the dial failure reason.
+
+#### Review round 5 (2026-10-06, same day, same owner approval)
+
+Two more gaps, both measured in source on this branch before the fix:
+
+| Surface | Was | Now |
+|---|---|---|
+| The probed DEPTH socket torn down for frame silence | its frame-silence redial reached no episode hook (round 3 kept depth silence out on purpose) and it kept its first frame, and a redial whose dials kept failing produced only dial failures, which have no episode hook. So a deferred window could pass, and release the next parked socket, while the probed socket was not connected: probe first frame at F, a sibling noted at F+200, the probe's frame silence at F+300, the sibling healed at F+310, a pass at F+330 with the probe still down | the probed depth socket's frame-silence redial marks it down (`watched_down`) without failing the window and without restarting its watch, so a quiet contract stays legal. The window cannot pass until that socket completes a dial again, and then waits the 20 s settle time after it (that dial could still evict someone), as after a sibling heals. The note clears at the probed socket's DialSucceeded (one more Acquire load of `OVERFLOW_WATCHED_SLOT` per dial; the lock only for the socket under watch). The deferral cap (380 s from the first frame) and the 740 s bound from the grant still end the wait, as `failed_deferral_exhausted` |
+| The eviction stamp | taken at BeginDial only. The shell then passes the shutdown, re-park and dual-instance-lock gates before `connect()`, and the lock gate can hold a dial in 5 s polls, so BeginDial-to-accept was bounded by the 15 s dial timeout only while no gate waited. Not reachable today: the lock flag only goes false after it was first held, and never back to true in the same process (`spawn_instance_lock_heartbeat` stores false and exits), so a held dial never connects | the dial is stamped again immediately before `connect()`, after every gate (one Release store); the BeginDial stamp stays, so it still errs toward fail. The 20 s attribution window now runs from the connect call |
+
+**Honest limit:** the probed depth socket's frame-silence redial does not join
+the 2 s burst of closes (this process started it), so its own dial corroborates
+a sibling's no-code close within 20 s of it. Errs toward fail.
+
+REJECT (review round 5):
+
+- Lets a window pass while the probed socket is redialling after a depth
+  frame-silence teardown and has not completed a dial since, or without the
+  settle time after that dial.
+- Fails the window, or restarts its watch, on a depth socket's frame silence
+  (round 3 still stands: a quiet depth contract is legitimate). The round-3
+  REJECT row "feeds a depth socket's frame silence to the window" now reads:
+  feeds it as a failure or a watch restart.
+- Removes the stamp taken immediately before `connect()`, or puts a wait
+  between it and the connect.
+
+#### Review round 6 (2026-10-06, same day, same owner approval)
+
+Two more gaps, both measured in source on this branch before the fix:
+
+| Surface | Was | Now |
+|---|---|---|
+| Notes after a watch restart | the note cutoff ran only from the LATEST first frame (240 s after it), and a watch restart clears that frame. So after a restart a sibling was still noted, with the warn line "The test is not failed for this; it passes only once that socket has reconnected (within two minutes)", as late as about 860 s from the grant, where the 740 s bound from the grant (round 4) failed the window before that note's own 120 s heal deadline or its 20 s settle could run out. Example: grant G, first frame G+100, a deferral, an 807 on the probed socket at G+470, a fresh first frame at G+480 (cutoff now G+720), a sibling noted at G+715 and healed at G+730, the window failed at G+740 as `failed_deferral_exhausted` inside that sibling's settle time. The Pass deferral row above, and the round-1 REJECT row on the deferral cap, said that never happens. The round-4 honest limit named only a restart in the last seconds of the 500 s | no sibling is noted later than `OVERFLOW_PROBE_GRANT_NOTE_CUTOFF_SECS` = **600 s** after the GRANT (740 − 120 − 20), which a restart never resets: a sibling that drops past it fails the window at once as `failed_deferral_exhausted`, as a drop past the 240 s cutoff already did. Every note taken therefore keeps its full heal deadline and settle inside the 740 s bound, and the warn line is true of every note. A window with no restart notes nothing past 120 + 240 = 360 s, so the new cutoff only bites after a restart. One more compare per sibling close, O(1). Verified by `test_no_sibling_is_noted_past_the_grant_cutoff_after_a_restart` (bite-checked: without the grant cutoff it fails) and `test_a_note_just_inside_the_grant_cutoff_is_honoured_by_the_bound` |
+| The randomized attribution test | `proptest_attribution_rules` had no op for the probed socket's own redial or its completed dial, so `watched_down` (round 5) was never set and the "no pass while unsettled" check never covered it; measured on a seeded run, the uniform op mix also passed one window in 256 runs, so the pass checks themselves were nearly vacuous | two ops drive `on_watched_redialling` and `on_dialled`, mostly on the slot under watch; heals mostly target a noted sibling; the op mix is weighted so windows run long enough to pass. Every pass asserts the probed socket was not down, and `watched_down` is asserted only ever on a running window. `test_attribution_generator_reaches_the_probed_socket_down` runs the same generator on a fixed seed and fails if it never set `watched_down` on a running window or never passed a window after its probed socket dialled again (measured: 621 and 11, with 64 passes in 256 runs). Bite-checked: with `watched_down` removed from the pass gate, the proptest and the coverage test fail. `proptest_window_bound_holds_from_the_grant_across_restarts` also generates the probed socket going down after its restart, the one deferral the grant cutoff does not bound; bite-checked: with the bound disabled it fails |
+
+**Honest limit:** a sibling drop between 600 s from the grant and the 240 s
+cutoff from a post-restart first frame now fails the window at once, where
+before it was noted and could still pass if it healed quickly. It costs a
+probe sooner and only after a restart. Errs toward fail.
+
+REJECT (review round 6):
+
+- Notes a sibling later than `OVERFLOW_PROBE_GRANT_NOTE_CUTOFF_SECS` from the
+  grant, measures that cutoff from anything a watch restart resets, or logs a
+  note as "not failed" when the 740 s bound cannot honour its heal deadline
+  and settle time.
+- Removes the probed-socket redial and dial ops from
+  `proptest_attribution_rules`, or the seeded coverage test that proves the
+  generator reaches them.
+
+#### Review round 7 (2026-10-06, same day, same owner approval)
+
+Two more gaps, both measured in source on this branch before the fix:
+
+| Surface | Was | Now |
+|---|---|---|
+| A failed window whose probed socket left for good | the probed socket parking for a reason other than 805 (808, 804 after its respawn) fails the window, and its task ends, so it never re-parks. If it was the only socket of its pool parked for 805, the next wait found nothing parked and took the branch written for a depth-only 805 ("none of this pool's sockets parked"): the episode ended as `Recovered` with no log line, and the main-feed widen was permitted again although no probe had passed. A new socket could then open into an account that last answered 805, and Dhan would evict an older healthy one. The same held after any failure (no first frame, for example) whose socket never re-parked | every failed window sets `failed_since_pass`, and only a pass clears it. While it is set, a wait that finds nothing parked keeps the episode `Waiting` (the widen stays refused, no grant to nothing); a later 805 park is probed as normal and only its pass ends the episode as `Recovered`. An 805 with no window of this pool ever failed (the depth-only case) still ends silently as before. The failure itself is already logged once (`failed_watched_closed`, `failed_no_frame` and so on). One bool, O(1). Verified by `test_a_failed_window_whose_socket_left_never_recovers_silently` and `test_only_an_episode_with_no_failed_window_recovers_with_nothing_parked` (bite-checked: both fail without the guard) |
+| The randomized attribution test | checked only one direction: when a failure fired, its rule matched. It never checked that a matching input produced the failure, and every example used low slot numbers, so limiting the eviction rule, or the probed socket's own no-code close, to slots below 8 (every depth socket) passed every test | `proptest_attribution_rules` now computes the expected outcome of every no-code close inside a window (probed socket or a slot outside the register: `failed_bare_reset`; corroborated: `failed_eviction_corroborated`; past the cutoff: `failed_deferral_exhausted`; else `sibling_reset_noted`) and checks that a poll fails the window as `failed_sibling_unhealed` exactly when a noted sibling is past its 120 s heal deadline; `test_high_slot_closers_follow_the_same_attribution_rules` drives closers at global index 8 and up. Bite-checked: limiting the eviction rule, the probed-socket rule or the heal deadline to slots below 8 each fails it |
+
+**Honest limit:** after a failed window whose socket left for good, the
+widen stays refused for the rest of the session unless another 805 parks a
+socket of that pool and its probe passes. A main-feed widen is lost for the
+day; no running socket is touched. Errs toward refusing.
+
+REJECT (review round 7):
+
+- Ends an episode as `Recovered` with nothing parked after a window of it
+  failed and no window has passed since, or clears `failed_since_pass`
+  anywhere but a pass.
+- Removes the expected-outcome checks from `proptest_attribution_rules`, or
+  the high-slot example.
+
+#### Review round 8 (2026-10-06, same day, same owner approval)
+
+Two more gaps, both measured in source on this branch before the fix:
+
+| Surface | Was | Now |
+|---|---|---|
+| Main feed first, after a failed main window | a failed window moves the main episode to `Waiting` and asks the probed socket to close and park again, but that socket comes back into `parked_mask` only once it takes the request (its next one-second tick while connected, or its next dial while redialling, up to a full ladder step later). If it was the only main-feed socket parked, `holds_turn` read false in that gap (`Waiting` with nothing parked), and any other socket's poll let the depth episode grant first, into an account that had just failed a probe; the main feed's next probe then waited behind the depth window (up to 740 s). Not new on this branch (the same gap followed `failed_no_frame`), but the round 1–7 failure paths that run on another socket's step made it common | a failed window marks its socket in `reparking_mask`, which holds the turn exactly like a parked slot (`holds_turn` reads either mask). The mark clears when the socket parks (805), when it leaves (a non-805 park or a shutdown that reaches the episodes), or `OVERFLOW_PROBE_REPARK_HOLD_SECS` (**120 s**, more than one ladder step plus one dial timeout plus one tick, asserted at compile time) after the failure, so a socket that never re-parks cannot hold the turn for ever. The probed socket parking for a reason other than 805 fails its window and never re-parks, so it is not marked *(⚠ CORRECTED, review round 9: not after its one watch restart, when a coded close fails the window first and marks it; its park then reaches the episodes through its pending re-park request)*. A failure that ends the episode for the session marks nothing. One `u32` and one instant, O(1). Verified by `test_depth_cannot_take_the_turn_while_a_failed_main_socket_reparks` (bite-checked: without the mark it fails) |
+| A refused retry after a timed-out dial | a dial refused at the upgrade (or that never left the process) stored 0 into the slot's one dial stamp. By then the same attempt's BeginDial had already overwritten an EARLIER attempt's stamp, so the 0 also erased a dial that timed out on our side and that Dhan may still have accepted (round 4 keeps a timeout's stamp for exactly that reason). An eviction inside that earlier attempt's 20 s then read as an uncorroborated blip, which errs toward a pass | BeginDial keeps the slot's previous stamp (`OVERFLOW_DIAL_PRIOR_MS`, one load and one Release store, written and read only by the slot's own task); the re-stamp immediately before `connect()` (`overflow_note_dial_connect`) does not move it; a refusal puts the kept stamp back instead of 0. So a refusal drops only its own attempt's stamps, a refused-dial loop still never corroborates (its kept stamp is 0 or ages out on its own 20 s), and an earlier timeout keeps corroborating for its full window. O(1). Verified by `test_a_refused_retry_keeps_an_earlier_timed_out_dial_as_evidence` (bite-checked: storing 0 fails it) and `test_a_refused_dial_loop_never_corroborates_a_sibling_close` |
+
+**Honest limits:**
+
+- A failed socket that parks for a non-805 reason or shuts down without
+  reaching the episodes (only a noted sibling or the socket under watch
+  reaches them) keeps the main feed's turn until the 120 s hold runs out. The
+  depth episode waits that much longer. Errs toward main first. *(⚠ CORRECTED
+  in review round 9 below: a failed socket whose re-park request is still
+  pending now reaches the episodes on any non-805 park or shutdown, so this
+  limit is left only for a socket that neither re-parks nor leaves.)*
+- A failed socket that reaches its next tick or dial more than 120 s after
+  the failure (Assumed rare: the ladder is at most about 31 s and a dial times
+  out at 15 s, but a token refresh before a redial is not bounded here) gives
+  the turn up before it re-parks, as before this round.
+
+REJECT (review round 8):
+
+- Lets the depth episode grant while a failed main-feed socket has not
+  re-parked, inside the 120 s hold; marks a socket that left for good; or
+  lets the mark outlive `OVERFLOW_PROBE_REPARK_HOLD_SECS`.
+- Stores 0 (or anything but the stamp kept at BeginDial) on a refused dial,
+  or lets the pre-connect re-stamp move the kept stamp.
+
+#### Review round 9 (2026-10-06, same day, same owner approval)
+
+Six more gaps from a low-severity review pass, each measured in source on this
+branch before the fix:
+
+| Surface | Was | Now |
+|---|---|---|
+| The 740 s bound and poll timing | the bound was built from exact deadlines, but three of its instants are STAMPED by a poll, not taken at the event: the first frame (the read task sets a flag, the next poll stamps it), the deferral cap (it fails at the first poll past it, so the restart can land up to a poll later) and the restart's fresh first frame. A late poll (a busy runtime) could therefore end a restarted watch a second or two past 740 s, and the poll inside that watch failed the window as `failed_deferral_exhausted` although the probed socket stayed up for its whole restarted watch | *(⚠ WITHDRAWN by review round 10 below: raising the bound needed a fresh dated quote under the round-4 REJECT row and none was recorded, so the bound is 740 s again and the late-poll case is an honest limit.)* `OVERFLOW_PROBE_WINDOW_MAX_SECS` = **743 s**: 740 plus `OVERFLOW_PROBE_POLL_SLACK_SECS` (3 s, one one-second poll per stamped instant). The grant note cutoff stays **600 s** (743 − 3 − 120 − 20): the slack is kept for the polls, never spent on later notes. The bound is now **743 s from the grant, plus at most one poll**. A poll delayed by more than the slack can still fail such a window at the bound (errs toward fail). Verified by `test_a_window_that_settles_at_its_bound_still_passes`, rewritten on a reachable one-second-poll timeline (bite-checked: with no slack it fails at the G+740.5 poll) |
+| A noted sibling's heal at its deadline | the 120 s heal deadline was checked only by the poll, so a sibling whose dial completed between the deadline and the next poll counted as healed: the window could pass although that sibling took more than 120 s, which errs toward pass | a dial that completes at or past the noted sibling's own deadline fails the window as `failed_sibling_unhealed`, exactly as that poll would have (one compare, O(1)). Verified by `test_a_heal_past_its_deadline_fails_without_waiting_for_a_poll` and the extended `proptest_attribution_rules` (a heal outcome only inside the deadline, an unhealed outcome from a heal only past it); both bite-checked |
+| A failed probe that leaves for good | round 8 said the probed socket parking for a reason other than 805 is never marked as re-parking. False after its one watch restart: its next coded close (808, say) fails the window in the close's own step, which marks it re-parking and clears the published watched slot, so the 808 park that follows was neither the socket under watch nor a noted sibling and reached no episode. The dead socket then held the main feed's turn for the full 120 s hold. The round-8 test passed only because it called the episode method directly, skipping the production gate | a non-805 park or a shutdown of a slot whose re-park request is still pending reaches the episodes (`left_reaches_episode` reads `OVERFLOW_REPARK`, one more Acquire load, cold), which clears the mark at once. Verified through the production gate by `test_a_failed_probe_that_leaves_for_good_reaches_the_episode_through_its_repark` (bite-checked: without the new clause it fails) |
+| The held state after a failed window | round 7 kept an episode `Waiting` after a failed window whose socket left for good, but nothing said so: no line, no counter. The only line the owner ever saw was the earlier failure, whose text says the next parked socket will be redialled as a test, which never happens | the poll that finds the wait over with nothing parked while a window has failed since the last pass reports it ONCE: outcome `held_after_failed_window` on the existing `tv_dhan_ws_overflow_probe_total` counter and a coded `warn!` (`WS-GAP-01`) saying the pool is not recovered and, for the main feed, that no new connection is opened until another 805 parks a socket and its probe passes. Edge-latched (`held_reported`), re-armed by a park or a pass. One bool, O(1). No new alarm, filter or page. Verified by `test_a_failed_window_whose_socket_left_never_recovers_silently` (it pinned the silence before; bite-checked) |
+| The first-frame report | `OVERFLOW_WATCHED_FIRST_FRAME` was a bool with no slot. A store from the previous window's socket that read its own slot as watched just before a pass granted the next socket could land after the grant cleared the flag, and the next poll then stamped a first frame for a socket that had not dialled | the flag holds the global index whose first frame was seen (`AtomicU8`, `u8::MAX` = none) and the poll stamps only when it equals the slot under watch. Same cost: one load and one store on the first frame of a dial |
+| Stated lock sites and costs | the `OVERFLOW_EPISODES` comment listed only an 805, a no-code close, a park and the poll; the DialSucceeded arm said "one atomic load otherwise" | the comment lists every lock site (any close while engaged, coded or not; DialSucceeded of a noted sibling or the socket under watch; a non-805 park or shutdown of a noted sibling, the socket under watch or a pending re-park; the socket under watch's idle, failed-subscribe and frame-silence teardowns; the poll) and the per-event loads; the arm says two loads |
+
+**The Pass deferral row above, corrected (round 9).** It says the 380 s cap
+"is never reached while a sibling is inside its own deadline or only the
+settle time is left". True of SIBLING notes. The probed DEPTH socket's own
+frame-silence redial (`watched_down`, round 5) has no note cutoff and no heal
+deadline, and its completed dial starts a 20 s settle, so the cap CAN fail a
+window while that redial is still running or only its settle is left
+(`failed_deferral_exhausted`). Honest limit; errs toward fail. The round-1
+REJECT row on the deferral cap therefore reads: lets the cap fail a window
+while a noted SIBLING is inside its own heal deadline or settle.
+
+**Honest limits (round 9):**
+
+- A poll delayed by more than the 3 s slack can still fail a restarted window
+  at the bound. Errs toward fail. *(⚠ Review round 10: with the slack withdrawn,
+  a poll late by any amount at a poll-stamped instant can.)*
+- The first-frame slot cannot tell an old dial of the SAME socket from its new
+  one after a watch restart (the restart clears it, as before).
+- A stale first-frame store landing after the newly granted socket's own would
+  hide that frame and fail the window (errs toward fail); it cannot in
+  practice, since the new socket must dial before its first frame.
+
+REJECT (review round 9):
+
+- *(⚠ WITHDRAWN by review round 10 below; the round-4 row stands unchanged.)*
+  Raises `OVERFLOW_PROBE_WINDOW_MAX_SECS` above 743 s, spends the poll slack
+  on later notes (a grant note cutoff above 600 s), or removes the slack
+  without re-deriving the bound. The round-4 row "Raises
+  `OVERFLOW_PROBE_WINDOW_MAX_SECS`" now reads: above 743 s.
+- Counts a sibling's dial at or past its own heal deadline as a heal.
+- Lets a failed probe's non-805 park or shutdown miss the episodes while its
+  re-park request is pending.
+- Leaves the held state silent, or reports it more than once per held state.
+- Stamps a first frame from a report that does not name the slot under watch.
+
+#### Review round 10 (2026-10-06, same day, same owner approval)
+
+One finding from a review of round 9, measured on this branch before the fix:
+
+| Surface | Was | Now |
+|---|---|---|
+| The window bound | round 9 raised `OVERFLOW_PROBE_WINDOW_MAX_SECS` from 740 s to 743 s (`OVERFLOW_PROBE_POLL_SLACK_SECS`, 3 s) and, in the same change, rewrote the round-4 REJECT row ("Raises `OVERFLOW_PROBE_WINDOW_MAX_SECS` ... without a fresh dated quote here") to read "above 743 s". It cited only "same owner approval", the approval the round-4 row was written under, and recorded no fresh dated quote. That is the bypass the rule-file-first law forbids: the bound and the rule that forbids moving it moved together | the raise is WITHDRAWN. `OVERFLOW_PROBE_WINDOW_MAX_SECS` = **740 s** again (120 + 380 + 120 + 120) and `OVERFLOW_PROBE_POLL_SLACK_SECS` is removed; the grant note cutoff stays **600 s** (740 − 120 − 20). The round-4 REJECT row stands as written: raising the bound needs a fresh dated owner quote recorded here first. Verified by `test_window_max_is_derived_and_only_bites_after_a_restart` (asserts 740 and 600; bite-checked: with the 3 s slack it fails) |
+
+**Honest limit (round 10), the case round 9 tried to fix.** Three instants the
+bound is built from are stamped by a poll, not taken at the event: the first
+frame (the read task sets a flag, the next poll stamps it), the deferral cap
+(it fails at the first poll past it, so a watch restart can land up to a poll
+later) and the restart's fresh first frame. A restart at the end of a full
+deferral whose polls run late can end its fresh watch a second or two past
+740 s, and the poll inside that watch fails the window as
+`failed_deferral_exhausted` although the probed socket stayed up. That burns
+one probe of the session's 3 (main feed) or 6 (depth). Errs toward fail, and
+it is the round-4 honest limit ("a restart in the last few seconds ... fails
+at the bound instead of passing") extended to late polls. Pinned by
+`test_a_late_poll_can_fail_a_restarted_window_at_its_bound` (bite-checked:
+with the 743 s bound the G+740.5 poll does nothing and the test fails); the
+on-time case still passes at the bound
+(`test_a_window_that_settles_at_its_bound_still_passes`). Removing the limit
+without moving the bound would mean stamping those three instants at the
+event; that is not done here.
+
+REJECT (review round 10):
+
+- Raises `OVERFLOW_PROBE_WINDOW_MAX_SECS` above 740 s, or the grant note
+  cutoff above 600 s, without a fresh dated owner quote recorded in this file
+  first. The bound is the round-4 row, unchanged; the 600 s cutoff is new
+  here and derives from it (740 - 120 - 20), so it cannot rise without the
+  bound rising.
+- Moves a bound and the REJECT row that forbids moving it in the same change.

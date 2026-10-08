@@ -4128,6 +4128,7 @@ dependencies = [
 name = "tickvault-app"
 version = "0.1.0"
 dependencies = [
+ "ahash",
  "anyhow",
  "arc-swap",
  "aws-config",
@@ -4310,6 +4311,7 @@ dependencies = [
 name = "tickvault-trading"
 version = "0.1.0"
 dependencies = [
+ "ahash",
  "chrono",
  "chrono-tz",
  "criterion",

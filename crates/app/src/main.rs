@@ -3603,6 +3603,29 @@ async fn async_main() -> Result<()> {
     // lane ON: with it off there are no `feed='dhan'` candles to compare, and
     // the S3 gate above is not armed either.
     let _dhan_crossverify = config.feeds.dhan_enabled.then(|| {
+        // §12.15.7 (2026-10-06): the archive gate reads a day's marker when
+        // that day's partitions leave their hot window. The gated windows are
+        // checked against the marker keep; `pressure_hot_days` is left out
+        // because the disk-pressure leg is not gated.
+        let retention = &config.partition_retention;
+        let gated_hot_days_max = retention
+            .retention_days
+            .max(retention.market_data_hot_days)
+            .max(retention.depth_hot_days)
+            .max(retention.intraday_hot_days);
+        if tickvault_app::dhan_live_crossverify_boot::crossverify_marker_keep_is_short(
+            gated_hot_days_max,
+        ) {
+            warn!(
+                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                source = "xverify_marker_keep_short",
+                gated_hot_days_max,
+                keep_days = tickvault_app::dhan_live_crossverify_boot::CROSSVERIFY_MARKER_KEEP_DAYS,
+                "a configured archive hot window plus the cross-verification hold comes \
+                 within 3 days of the marker keep — a verified day's marker could be swept \
+                 before the S3 archive gate reads it, and the day would archive as unverified"
+            );
+        }
         tickvault_app::dhan_live_crossverify_boot::spawn_dhan_live_crossverify(
             tickvault_app::dhan_live_crossverify_boot::CrossverifyBootDeps {
                 questdb_exec_url: format!(
