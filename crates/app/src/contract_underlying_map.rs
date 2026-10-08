@@ -86,6 +86,11 @@ use crate::volume_leaderboard::OptionFamily;
 /// contract answer for another's.
 pub type ContractKey = (u64, ExchangeSegment);
 
+/// The contract-to-owner table [`ContractUnderlyingMap::owner_of`] probes on
+/// every option tick. Hashed with `ahash` rather than SipHash (audit plan
+/// PR10): faster on a short integer key, and still keyed at random per process.
+pub type OwnerMap = HashMap<ContractKey, ContractOwner, ahash::RandomState>;
+
 /// Ceiling on tracked contracts. Matches the authorized subscription universe
 /// and every other per-instrument map in the lane, so one figure covers them
 /// all and there is no second number to keep in step.
@@ -232,9 +237,11 @@ pub struct SnapshotBuild {
 /// A later leg for the same contract overwrites an earlier one — the chain is
 /// a snapshot of one minute, so a repeat is a re-observation, not a conflict.
 #[must_use]
-pub fn build_snapshot(legs: &[LegIds]) -> (HashMap<ContractKey, ContractOwner>, SnapshotBuild) {
-    let mut map: HashMap<ContractKey, ContractOwner> =
-        HashMap::with_capacity(legs.len().min(MAX_TRACKED_CONTRACTS));
+pub fn build_snapshot(legs: &[LegIds]) -> (OwnerMap, SnapshotBuild) {
+    let mut map: OwnerMap = HashMap::with_capacity_and_hasher(
+        legs.len().min(MAX_TRACKED_CONTRACTS),
+        ahash::RandomState::new(),
+    );
     let mut refusals = Vec::new();
 
     for leg in legs {
@@ -539,7 +546,7 @@ pub fn order_selected_first(
 /// The published mapping. Cheap to clone — it is one `Arc`.
 #[derive(Debug, Clone)]
 pub struct ContractUnderlyingMap {
-    inner: Arc<ArcSwap<HashMap<ContractKey, ContractOwner>>>,
+    inner: Arc<ArcSwap<OwnerMap>>,
     /// Human-readable contract labels, resolved ONCE per publish.
     ///
     /// A SECOND snapshot rather than a field on [`ContractOwner`], and that is
@@ -562,7 +569,7 @@ impl ContractUnderlyingMap {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            inner: Arc::new(ArcSwap::from_pointee(OwnerMap::default())),
             labels: Arc::new(ArcSwap::from_pointee(HashMap::new())),
         }
     }
@@ -571,7 +578,7 @@ impl ContractUnderlyingMap {
     ///
     /// Readers in flight keep the old snapshot until they drop it, so a
     /// rebuild can never hand the drain a half-built map.
-    pub fn publish(&self, snapshot: HashMap<ContractKey, ContractOwner>) {
+    pub fn publish(&self, snapshot: OwnerMap) {
         self.inner.store(Arc::new(snapshot));
     }
 
@@ -748,7 +755,7 @@ mod tests {
 
     /// Projects the owner back to the bare underlying id, so the existing
     /// assertions keep reading as "which underlying did this land under".
-    fn under(map: &HashMap<ContractKey, ContractOwner>, key: ContractKey) -> Option<u64> {
+    fn under(map: &OwnerMap, key: ContractKey) -> Option<u64> {
         map.get(&key).map(|o| o.underlying_id)
     }
 

@@ -22,6 +22,9 @@ reqwest = { workspace = true }
 secrecy = { workspace = true }
 metrics = { workspace = true }
 papaya = { workspace = true }
+# ahash: the faster hasher for the candle fold's per-tick slot index, audit
+# plan PR10. Already a pinned workspace dep; no new crate enters the build.
+ahash = { workspace = true }
 parking_lot = { workspace = true }
 loom = { workspace = true, optional = true }
 # The NATS-over-WS transport deps (aws-lc-rs, tokio-tungstenite,
@@ -49,6 +52,10 @@ harness = false
 
 [[bench]]
 name = "obi"
+harness = false
+
+[[bench]]
+name = "candle_fold"
 harness = false
 
 # bar_cache_lookup bench DELETED with the dead `in_mem::bar_cache` module

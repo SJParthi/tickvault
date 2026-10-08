@@ -49,6 +49,15 @@
 //! This table is owned outright by ONE tokio task and is only ever reached
 //! through `&mut MultiTfAggregator`, so there is nothing to make lock-free.
 //! `DashMap` is banned on hot paths regardless.
+//!
+//! # Why the `ahash` hasher
+//!
+//! The map is probed once per tick, on a key of three small integers. The
+//! standard library's default SipHash is built to resist hash flooding and
+//! is slow on short keys; `ahash` is faster on them and still draws a random
+//! key per process (audit plan PR10, the same hasher `TickGapDetector` uses).
+//! The probe is a small part of the fold: `benches/candle_fold.rs` measures
+//! the whole per-tick cost.
 
 use std::collections::HashMap;
 
@@ -657,7 +666,7 @@ pub struct MultiTfAggregator {
     /// reordered, so an index handed out stays valid for the process life.
     slots: Vec<InstrumentSlot>,
     /// Composite identity → dense index into [`Self::slots`]. O(1) average.
-    index: HashMap<CompositeKey, u32>,
+    index: HashMap<CompositeKey, u32, ahash::RandomState>,
     /// Late-tick policy applied to every fold. A PARAMETER — see
     /// [`FeedStrategy`] / [`crate::candles::LatePolicy`] for the documented
     /// default ([`FeedStrategy::DEFAULT`] = `Refold`).
@@ -916,7 +925,7 @@ impl MultiTfAggregator {
         let cap = cap.min(AGGREGATOR_MAX_SLOTS);
         Self {
             slots: Vec::with_capacity(cap),
-            index: HashMap::with_capacity(cap),
+            index: HashMap::with_capacity_and_hasher(cap, ahash::RandomState::new()),
             strategy,
             watermark_secs: 0,
             slots_exhausted_total: 0,
