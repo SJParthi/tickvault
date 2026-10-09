@@ -3104,3 +3104,85 @@ are written `N/A — reason` in the PR body).
   `docs/claude-rules-full/project/operator-charter-forever.md`,
   `crates/common/tests/wave4_section8_wording_guard.rs`. Test:
   templates_call_the_weekend_test_calendar_maths_not_a_chaos_test.
+
+## Stress-audit fix 2 — disk and ops (2026-10-09)
+
+Crates touched: `storage`, `api` (commit A); `common` guard tests plus `.github/workflows/`
+(commit B). Two local commits so they can ship as two PRs.
+
+- [x] **BND-1 — drained spill files no longer defer the hour-window depth archive forever.**
+  `spill_dirs_have_pending_data` counted ANY entry in the tick and depth spill folders. A
+  drained spill file is emptied to 0 bytes and kept (the replay skips it), so after the first
+  spill the archive fell back to the day path for good
+  (`tv_partition_archive_hour_window_deferred_total`). A folder now counts as pending only
+  when it holds a NON-EMPTY regular file at its top level, whatever its extension (so the
+  framed `.dspl` depth spill landing separately is covered); 0-byte files and `quarantine/`
+  (never replayed) do not count; anything unclassifiable (unreadable folder or entry, symlink,
+  unknown sub-folder) still counts as pending. Drained files are NOT deleted: the replay keeps
+  them on purpose so the age sweep can tell drained from abandoned.
+  Files: `crates/storage/src/partition_archive.rs`.
+  Tests: test_regression_drained_spill_files_and_quarantine_are_not_pending,
+  a_non_empty_spill_file_of_any_extension_is_pending,
+  a_missing_or_empty_spill_folder_is_not_pending, an_unknown_sub_folder_counts_as_pending,
+  hour_window_defers_to_the_day_path_while_spill_data_is_pending (updated),
+  an_unreadable_spill_directory_defers_rather_than_permits (now calls the real function; the
+  test-only mirror of the old rule is removed).
+- [x] **GAP-3 — the public quote endpoint no longer runs an unbounded scan on a miss.**
+  `/api/quote/{security_id}` ran `LATEST ON ts` over all of `ticks` with no time bound, and a
+  miss was never cached. The query now carries `ts > dateadd('d', -QUOTE_LOOKBACK_DAYS, now())`
+  (7 days; `ts` is IST wall-clock stored as UTC and `now()` is UTC, so the window is 7 days
+  plus 5 h 30 min, wider never narrower), and a clean miss (QuestDB answered, no row) is cached
+  for the same 1 s TTL inside the same capped `BoundedTtlCache`. The 409 multi-segment answer,
+  400s, 503 and a 404 after a FAILED query are still never cached.
+  Files: `crates/api/src/handlers/quote.rs`, `crates/api/src/response_cache.rs`, `CLAUDE.md`
+  (dated note on the `BoundedTtlCache::put` row).
+  Tests: test_regression_latest_tick_sql_is_bounded_to_the_lookback_window,
+  test_regression_a_miss_is_cached_and_the_repeat_does_not_query,
+  test_get_quote_cached_404_expires_and_a_first_tick_is_seen (was
+  test_get_quote_404_is_never_cached).
+
+### Design
+
+BND-1: one free function `spill_dir_has_pending_data(path)` in `storage`'s
+`partition_archive.rs`, one `read_dir` and one `lstat` per top-level entry, called for both
+spill folders from the existing off-worker check. The rule keys on byte length, not on the
+extension list, so a new spill format needs no change here. GAP-3: the `api` crate's quote SQL
+gains a WHERE time bound before `LATEST ON`; a miss stores an empty-string sentinel (a
+serialized quote is a JSON object and never empty) in the existing quote cache, and a cache hit
+on the sentinel answers 404.
+
+### Edge Cases
+
+BND-1: missing folder (not pending); empty folder (not pending); only 0-byte files plus a
+non-empty `quarantine/` (not pending); a non-empty file of any extension (pending); the live
+hour file fully drained but not yet emptied (still non-empty, so pending until the hour rolls
+and the replay empties it: bounded, one hour); unknown sub-folder or symlink (pending); path is
+a file (pending). GAP-3: an id last ticked more than 7 days ago now reads 404; a first tick
+arriving inside a cached miss's second is seen up to 1 s late (same staleness as a cached 200);
+a segment-scoped miss never answers an unscoped request (composite key).
+
+### Failure Modes
+
+BND-1: an unreadable folder or entry fails toward "pending", so the archive takes the proven
+day path, never an unsafe hour drop; the pre-drop recount still guards every drop. GAP-3: the
+cache cap (2048) still bounds memory with garbage ids, every entry expires after 1 s, and the
+public limiter (5 requests a second) keeps the cap out of reach; a failed query is still
+probed for reachability and never cached.
+
+### Test Plan
+
+`cargo test -p tickvault-storage` and `cargo test -p tickvault-api`; each regression test was
+run against the old logic (temporarily restored) and failed, then passed with the fix. Clippy
+`-D warnings` on both crates, `cargo fmt --check`, banned-pattern scanner, pub-fn test guard
+and plan gate.
+
+### Rollback
+
+Revert the commit. BND-1 reverts to "any entry defers" (safe, only slower archival); GAP-3
+reverts to the unbounded query and uncached misses. No schema, config or data change.
+
+### Observability
+
+BND-1: `tv_partition_archive_hour_window_deferred_total` should stop climbing on every run
+once the spill folders hold only drained files. GAP-3: `tv_api_cache_hits_total{endpoint=quote}`
+now also counts cached misses. No new metric, alarm or page (noise lock).
