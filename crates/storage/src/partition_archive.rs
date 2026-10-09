@@ -275,7 +275,13 @@ pub enum RetentionClass {
 /// Checked BEFORE the market-data test in [`retention_class`], because
 /// `market_depth` is also HOUR-partitioned and would otherwise be swept on
 /// the 15-day market-data window by virtue of that membership alone.
-const DEPTH_TABLES: [&str; 1] = [crate::depth_persistence::MARKET_DEPTH_TABLE];
+///
+/// `market_depth_book` (2026-10-09, plan item 49e step 3) holds the same depth
+/// as array rows, so it takes the same window.
+const DEPTH_TABLES: [&str; 2] = [
+    crate::depth_persistence::MARKET_DEPTH_TABLE,
+    crate::depth_persistence::MARKET_DEPTH_BOOK_TABLE,
+];
 
 /// True when `table` belongs to the [`RetentionClass::Intraday`] window —
 /// `ticks` plus every SUB-MINUTE candle table.
@@ -3917,6 +3923,21 @@ mod tests {
             HOUR_PARTITIONED_TABLES.contains(&crate::depth_persistence::MARKET_DEPTH_TABLE),
             "market_depth must be in a swept-table list or its retention class \
              never runs and the table grows until the disk dies"
+        );
+    }
+
+    #[test]
+    fn market_depth_book_is_swept_on_the_depth_window_like_market_depth() {
+        // Plan item 49e step 3: the array-row table holds the same depth, so
+        // it must take the depth window, never the 15-day market-data one it
+        // would get from HOUR-list membership alone.
+        let book = crate::depth_persistence::MARKET_DEPTH_BOOK_TABLE;
+        assert_eq!(retention_class(book), RetentionClass::Depth);
+        assert!(HOUR_PARTITIONED_TABLES.contains(&book));
+        let c = cfg(90, 35);
+        assert_eq!(
+            hot_window_days(book, &c),
+            hot_window_days(crate::depth_persistence::MARKET_DEPTH_TABLE, &c)
         );
     }
 

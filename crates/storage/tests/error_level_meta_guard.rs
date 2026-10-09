@@ -63,6 +63,11 @@ const FAILURE_WORDS: &[&str] = &["fail", "could not", "cannot", "couldn't", "not
 const REVIEWED_WARN_SITES: &[(&str, &str, &str)] = &[
     // ---- app ----
     (
+        "crates/app/src/depth_book_since.rs",
+        "the start instant could not be saved",
+        "the instant still applies to this process; a later boot records a later one, so replayed frames go to market_depth (plan item 49e step 3 honest limit); no market data is lost",
+    ),
+    (
         "crates/app/src/depth_subscription_view.rs",
         "could not save the depth held-today set",
         "latched once per process; only a same-day restart loses the held-before list, no market data is lost",

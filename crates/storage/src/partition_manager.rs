@@ -59,6 +59,9 @@ const PARTITION_DDL_TIMEOUT_SECS: u64 = 30;
 pub(crate) const HOUR_PARTITIONED_TABLES: &[&str] = &[
     "ticks",
     "market_depth",
+    // 2026-10-09 (plan item 49e step 3): the array-row depth table, swept on
+    // the same depth window as `market_depth` (see `partition_archive`).
+    "market_depth_book",
     "top_volume",
     "top_volume_1s",
     "top_volume_3s",
@@ -876,6 +879,7 @@ mod tests {
             &[
                 "ticks",
                 "market_depth",
+                "market_depth_book",
                 "top_volume",
                 "top_volume_1s",
                 "top_volume_3s",
@@ -886,6 +890,11 @@ mod tests {
         );
         assert!(
             HOUR_PARTITIONED_TABLES.contains(&crate::feed_aux_persistence::FEED_AUX_PACKETS_TABLE)
+        );
+        // Plan item 49e step 3: the array-row depth table is HOUR-partitioned
+        // like the level table, pinned against its own name.
+        assert!(
+            HOUR_PARTITIONED_TABLES.contains(&crate::depth_persistence::MARKET_DEPTH_BOOK_TABLE)
         );
         // Every live per-cadence table is swept — pinned against the
         // persistence module's own names, so a fifth cadence cannot land
