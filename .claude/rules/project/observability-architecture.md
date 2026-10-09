@@ -321,8 +321,8 @@ Every variant carries:
 | 14 | same::`every_runbook_path_exists_on_disk` | `runbook_path()` always resolves to a real file |
 | 15 | `crates/common/tests/error_code_tag_guard.rs::every_error_macro_tagged_with_a_known_code_carries_code_field` | Every `error!` that mentions a code in its message MUST also have `code = ErrorCode::X.code_str()` |
 | 16 | same::`tagged_prefix_set_is_non_empty` | Guard setup sanity |
-| 17 | `crates/storage/tests/error_level_meta_guard.rs::flush_persist_broadcast_failures_must_use_error_level` | No flush/persist/drain failure may be logged at `warn!` |
-| 18 | same::`phrases_list_is_non_empty_and_lowercase` | Guard setup sanity |
+| 17 | `crates/storage/tests/error_level_meta_guard.rs::write_failure_warns_are_errors_or_reviewed` | Every `warn!` whose text pairs a durability word (flush, persist, spill, write, ...) with a failure word is either `error!`, marked `// APPROVED:`, or listed in `REVIEWED_WARN_SITES` with a reason; a stale list entry also fails (rewritten 2026-10-09: the old phrase list matched none of the code) |
+| 18 | same::`reviewed_list_is_lowercase_and_reasoned` + five `bite_*` tests | Guard setup sanity, and proof the scanner catches a two-line warn, a continued string and `tracing::warn!` |
 | 19 | `crates/app/src/observability.rs::test_histogram_buckets_are_non_empty_and_monotonic` | Prometheus `_duration_ns` buckets stay monotonic |
 | 20 | same::`init_errors_jsonl_appender_creates_directory` | JSONL sink does the side-effect it promises |
 | 21 | same::`sweep_errors_jsonl_retention_*` (4 tests) | 48h retention sweeper preserves fresh, deletes old, ignores unrelated, handles missing dir |
@@ -424,9 +424,11 @@ summary file and drives the above flow.
 
 ## What future sessions MUST NOT do
 
-1. **Do not re-audit WARN→ERROR for flush/persist/drain sites.** The 28
-   phrases in `crates/storage/tests/error_level_meta_guard.rs` are
-   ratcheted. Adding a new flush handler? The meta-guard tells you the
+1. **Do not re-audit WARN→ERROR for flush/persist/drain sites.** Every
+   such `warn!` is ratcheted in `crates/storage/tests/error_level_meta_guard.rs`
+   (`REVIEWED_WARN_SITES`, each with the reason it stays a warning; until
+   2026-10-09 the guard checked 28 fixed phrases that no longer appeared in
+   the code, so it could not fail). Adding a new flush handler? The meta-guard tells you the
    pattern by example. Don't scan the codebase from scratch.
 2. **Do not duplicate the ErrorCode enum.** If a new code is needed,
    add a variant + a rule-file mention in the SAME PR. The cross-ref
@@ -438,8 +440,11 @@ summary file and drives the above flow.
    Alloy/Loki scrapers, the summary writer, and the triage hook all
    hard-code these.
 5. **Do not introduce a new `warn!` on a flush/persist/drain failure.**
-   The meta-guard regexes these phrases; violations fail the build.
-   Use `error!` with a `code =` field.
+   The meta-guard reads every `warn!` body and fails the build on one it has
+   not seen. Use `error!` with a `code =` field, or add the site to
+   `REVIEWED_WARN_SITES` with the reason it stays a warning (for example,
+   a counter already pages through a loss-group alarm, so `error!` would
+   page twice).
 6. **Do not log at ERROR without a `code =` field** if the message
    mentions a known code prefix (I-P*, OMS-*, WS-*, STORAGE-*, etc.).
    The tag-guard fails the build.

@@ -172,7 +172,7 @@ When ANY PR body / commit message / Telegram message / docs writes "100% guarant
 > the derived seal-ring capacity `AGGREGATOR_MAX_SLOTS × TF_COUNT` (never restate this as a number: the docs quoted 200,000, then 525,000, 600,000 and 225,000 as `TF_COUNT` moved, and each went stale. Read the constant) (constant `SEAL_BUFFER_CAPACITY`, ratcheted by `seal_ring.rs`) → NDJSON spill → DLQ;
 > bench-gated O(1) hot path;
 > composite-key uniqueness;
-> chaos-tested 65h Fri 16:00 IST → Mon 09:00 IST weekend sleep/wake.
+> calendar-tested 65h Fri 16:00 IST → Mon 09:00 IST weekend sleep-until-open schedule (date arithmetic only; no socket is held open across it).
 > Beyond the envelope, DLQ NDJSON catches every payload as recoverable text."
 
 **Anything stronger ("WebSocket never disconnects" / "QuestDB never fails" without envelope) = REJECT IN REVIEW.**
