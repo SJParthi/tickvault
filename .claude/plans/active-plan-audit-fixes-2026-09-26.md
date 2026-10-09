@@ -3105,10 +3105,13 @@ are written `N/A — reason` in the PR body).
   `crates/common/tests/wave4_section8_wording_guard.rs`. Test:
   templates_call_the_weekend_test_calendar_maths_not_a_chaos_test.
 
-## Stress-audit fix 2 — disk and ops (2026-10-09)
+### Added 2026-10-09 (stress audit fix 2, findings BND-1 and GAP-3: archive and quote)
 
-Crates touched: `storage`, `api` (commit A); `common` guard tests plus `.github/workflows/`
-(commit B). Two local commits so they can ship as two PRs.
+Guarantee matrix: see per-wave-guarantee-matrix.md (all 15 + 7 rows apply; rows that do not
+are written `N/A — reason` in the PR body).
+
+Crates touched: `storage`, `api`. The workflow findings found in the same pass (OPS-2, RO-5,
+RO-1) ship in their own PR.
 
 - [x] **BND-1 — drained spill files no longer defer the hour-window depth archive forever.**
   `spill_dirs_have_pending_data` counted ANY entry in the tick and depth spill folders. A
@@ -3141,7 +3144,7 @@ Crates touched: `storage`, `api` (commit A); `common` guard tests plus `.github/
   test_get_quote_cached_404_expires_and_a_first_tick_is_seen (was
   test_get_quote_404_is_never_cached).
 
-### Design
+#### Design
 
 BND-1: one free function `spill_dir_has_pending_data(path)` in `storage`'s
 `partition_archive.rs`, one `read_dir` and one `lstat` per top-level entry, called for both
@@ -3151,7 +3154,7 @@ gains a WHERE time bound before `LATEST ON`; a miss stores an empty-string senti
 serialized quote is a JSON object and never empty) in the existing quote cache, and a cache hit
 on the sentinel answers 404.
 
-### Edge Cases
+#### Edge Cases
 
 BND-1: missing folder (not pending); empty folder (not pending); only 0-byte files plus a
 non-empty `quarantine/` (not pending); a non-empty file of any extension (pending); the live
@@ -3161,7 +3164,7 @@ a file (pending). GAP-3: an id last ticked more than 7 days ago now reads 404; a
 arriving inside a cached miss's second is seen up to 1 s late (same staleness as a cached 200);
 a segment-scoped miss never answers an unscoped request (composite key).
 
-### Failure Modes
+#### Failure Modes
 
 BND-1: an unreadable folder or entry fails toward "pending", so the archive takes the proven
 day path, never an unsafe hour drop; the pre-drop recount still guards every drop. GAP-3: the
@@ -3169,19 +3172,19 @@ cache cap (2048) still bounds memory with garbage ids, every entry expires after
 public limiter (5 requests a second) keeps the cap out of reach; a failed query is still
 probed for reachability and never cached.
 
-### Test Plan
+#### Test Plan
 
 `cargo test -p tickvault-storage` and `cargo test -p tickvault-api`; each regression test was
 run against the old logic (temporarily restored) and failed, then passed with the fix. Clippy
 `-D warnings` on both crates, `cargo fmt --check`, banned-pattern scanner, pub-fn test guard
 and plan gate.
 
-### Rollback
+#### Rollback
 
 Revert the commit. BND-1 reverts to "any entry defers" (safe, only slower archival); GAP-3
 reverts to the unbounded query and uncached misses. No schema, config or data change.
 
-### Observability
+#### Observability
 
 BND-1: `tv_partition_archive_hour_window_deferred_total` should stop climbing on every run
 once the spill folders hold only drained files. GAP-3: `tv_api_cache_hits_total{endpoint=quote}`
