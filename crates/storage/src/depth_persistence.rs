@@ -179,14 +179,12 @@
 //! rather than quietly rewritten because an auditor checking the intra-frame
 //! collision would have read that paragraph and concluded it was handled.)*
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
 use tracing::{error, warn};
 
-use crate::tick_spill_replay::SPILL_FILE_EXTENSION;
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::QUESTDB_TABLE_MARKET_DEPTH;
 use tickvault_common::error_code::ErrorCode;
@@ -736,14 +734,13 @@ fn depth_spill_dir_bytes(dir: &Path) -> u64 {
 
 /// Appends a failed flush's ILP payload to the depth spill directory.
 ///
-/// # Why the payload is stored verbatim
+/// # Why the payload is framed (changed 2026-10-09, plan item 49e)
 ///
-/// `Buffer::as_bytes()` is InfluxDB line protocol — byte-for-byte the body
-/// QuestDB's own `/write` endpoint accepts. So the file needs no bespoke
-/// format and no parser: replay is POSTing the bytes back, which is exactly
-/// what `tick_spill_replay` already does for every `.ilp` file in a directory.
-/// The extension is taken from that module's own constant so the two cannot
-/// silently diverge.
+/// `Buffer::as_bytes()` is the body QuestDB's `/write` endpoint accepts, and
+/// replay still POSTs it back unchanged. Until 2026-10-09 it was appended as
+/// raw text and read back by cutting at newlines, which breaks for ILP v2
+/// (binary values contain newlines). It is now written as length-framed
+/// records (`depth_spill_frame`), each POSTed whole on replay.
 ///
 /// # Why replaying it twice is safe
 ///
@@ -937,17 +934,28 @@ fn spill_failed_depth_ilp(
 
     // One file per feed per hour: bounded file count, and an operator replaying
     // a known-bad window does not have to read one ever-growing file.
+    //
+    // ⚠ CHANGED 2026-10-09 (plan item 49e): the payload is written as
+    // length-framed records (`depth_spill_frame`), not as raw ILP text, so a
+    // binary ILP v2 batch can be spilled once the array table lands. The
+    // `.dspl` files are drained by `depth_spill_frame::replay_framed_spill_dir`;
+    // `.ilp` files an older binary left behind still drain through the text
+    // replay.
     let hour = now_unix_secs / 3_600;
     let path = dir.join(format!(
-        "depth-{}-{hour}.{SPILL_FILE_EXTENSION}",
-        feed.as_str()
+        "depth-{}-{hour}.{}",
+        feed.as_str(),
+        crate::depth_spill_frame::DEPTH_FRAMED_SPILL_EXTENSION
     ));
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)?;
-    file.write_all(payload)?;
-    file.flush()?;
+    crate::depth_spill_frame::append_framed_records(
+        &mut file,
+        payload,
+        crate::depth_spill_frame::ILP_VERSION_1,
+    )?;
     if let Some(sync) = sync {
         sync(&file)?;
     }
@@ -3450,6 +3458,31 @@ mod tests {
         dir
     }
 
+    /// The ILP text held in one framed spill file: every whole record's
+    /// payload, in order. Empty when the file is missing. Panics on a torn
+    /// or corrupt record, because a spill this writer just made must be whole.
+    fn read_spill_payload(path: &Path) -> String {
+        use crate::depth_spill_frame::{RecordAt, read_record_at};
+        let Ok(file) = std::fs::File::open(path) else {
+            return String::new();
+        };
+        let len = file.metadata().expect("spill metadata").len();
+        let mut offset = 0_u64;
+        let mut scratch = Vec::new();
+        let mut text = String::new();
+        while offset < len {
+            match read_record_at(&file, offset, len, &mut scratch).expect("spill read") {
+                RecordAt::Whole { version, next } => {
+                    assert_eq!(version, crate::depth_spill_frame::ILP_VERSION_1);
+                    text.push_str(std::str::from_utf8(&scratch).expect("ILP v1 is text"));
+                    offset = next;
+                }
+                other => panic!("record at {offset} of {path:?} is not whole: {other:?}"),
+            }
+        }
+        text
+    }
+
     fn spill_files(dir: &Path) -> Vec<PathBuf> {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return Vec::new();
@@ -3748,7 +3781,7 @@ mod tests {
 
         let files = spill_files(&dir);
         assert_eq!(files.len(), 1, "exactly one depth spill file: {files:?}");
-        let body = std::fs::read_to_string(&files[0]).expect("spill readable");
+        let body = read_spill_payload(&files[0]);
         assert_eq!(
             body.lines().filter(|l| !l.trim().is_empty()).count(),
             20,
@@ -3765,11 +3798,12 @@ mod tests {
     }
 
     #[test]
-    fn the_spill_file_is_replayable_by_the_existing_tick_replay_contract() {
-        // Reuse, not reinvention: `tick_spill_replay` drains every file with
-        // this extension by POSTing it verbatim to /write. If that module
-        // renames the extension, this fails rather than silently orphaning the
-        // depth spill.
+    fn the_spill_file_is_framed_and_drained_by_the_framed_replay() {
+        // Changed 2026-10-09 (plan item 49e): the depth spill is written as
+        // length-framed records. The framed replay must SEE the file, and the
+        // text replay must NOT, because the text replay would POST the binary
+        // headers to /write and quarantine the whole file. If either lister
+        // changes, this fails rather than orphaning or corrupting the spill.
         let dir = spill_tmp("extension");
         let mut w = DepthWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
         w.append_row(&row()).expect("append");
@@ -3778,13 +3812,21 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(
             files[0].extension().and_then(|e| e.to_str()),
-            Some(SPILL_FILE_EXTENSION),
-            "the depth spill must be drainable by tick_spill_replay: {files:?}"
+            Some(crate::depth_spill_frame::DEPTH_FRAMED_SPILL_EXTENSION),
+            "the depth spill must be a framed file: {files:?}"
         );
         assert_eq!(
-            crate::tick_spill_replay::list_spill_files(&dir).len(),
-            1,
-            "the shared replay lister must SEE the depth spill file"
+            crate::depth_spill_frame::list_framed_spill_files(&dir),
+            files,
+            "the framed replay lister must SEE the depth spill file"
+        );
+        assert!(
+            crate::tick_spill_replay::list_spill_files(&dir).is_empty(),
+            "the text replay must never read a framed file"
+        );
+        assert!(
+            read_spill_payload(&files[0]).contains(MARKET_DEPTH_TABLE),
+            "the framed record holds the ILP row"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3830,10 +3872,7 @@ mod tests {
         let _ = w.flush();
 
         let files = spill_files(&dir);
-        let body: String = files
-            .iter()
-            .map(|p| std::fs::read_to_string(p).expect("readable"))
-            .collect();
+        let body: String = files.iter().map(|p| read_spill_payload(p)).collect();
         let lines: Vec<&str> = body.lines().filter(|l| !l.trim().is_empty()).collect();
         assert_eq!(lines.len(), 30, "both batches are on disk");
         let mut keys = std::collections::BTreeSet::new();
@@ -3909,11 +3948,7 @@ mod tests {
         let dir = spill_tmp("at-cap");
         std::fs::create_dir_all(&dir).expect("mk dir");
         let seeded = b"already-here\n";
-        std::fs::write(
-            dir.join(format!("depth-dhan-0.{SPILL_FILE_EXTENSION}")),
-            seeded,
-        )
-        .expect("seed");
+        std::fs::write(dir.join("depth-dhan-0.ilp"), seeded).expect("seed");
         let held = depth_spill_dir_bytes(&dir);
         assert_eq!(
             held,
@@ -3975,10 +4010,10 @@ mod tests {
                     "this machine has room, so the rescue must be ALLOWED -- refusing \
                      with room is what discarded 238,615,500 rows onto a 55%-empty disk",
                 );
-                let body = std::fs::read_to_string(
-                    dir.join(format!("depth-dhan-472222.{SPILL_FILE_EXTENSION}")),
-                )
-                .unwrap_or_default();
+                let body = read_spill_payload(&dir.join(format!(
+                    "depth-dhan-472222.{}",
+                    crate::depth_spill_frame::DEPTH_FRAMED_SPILL_EXTENSION
+                )));
                 assert!(
                     body.contains("over"),
                     "an allowed rescue must actually have written the row: {body}"
@@ -3992,10 +4027,10 @@ mod tests {
                 );
                 assert_eq!(err.kind(), std::io::ErrorKind::StorageFull);
                 // The refusal is a REFUSAL, not a partial write.
-                let body = std::fs::read_to_string(
-                    dir.join(format!("depth-dhan-472222.{SPILL_FILE_EXTENSION}")),
-                )
-                .unwrap_or_default();
+                let body = read_spill_payload(&dir.join(format!(
+                    "depth-dhan-472222.{}",
+                    crate::depth_spill_frame::DEPTH_FRAMED_SPILL_EXTENSION
+                )));
                 assert!(
                     !body.contains("over"),
                     "a refused rescue must write NOTHING, not a truncated row: {body}"

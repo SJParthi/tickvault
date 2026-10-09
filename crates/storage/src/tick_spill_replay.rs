@@ -120,6 +120,23 @@ pub struct SpillReplayOutcome {
     pub lines_set_aside: u64,
 }
 
+impl SpillReplayOutcome {
+    /// Adds another round's counts to this one (the depth directory drains
+    /// its `.ilp` and its framed `.dspl` files in one round).
+    pub fn absorb(&mut self, other: Self) {
+        self.files_replayed = self.files_replayed.saturating_add(other.files_replayed);
+        self.files_failed = self.files_failed.saturating_add(other.files_failed);
+        self.files_skipped_empty = self
+            .files_skipped_empty
+            .saturating_add(other.files_skipped_empty);
+        self.files_quarantined = self
+            .files_quarantined
+            .saturating_add(other.files_quarantined);
+        self.bytes_replayed = self.bytes_replayed.saturating_add(other.bytes_replayed);
+        self.lines_set_aside = self.lines_set_aside.saturating_add(other.lines_set_aside);
+    }
+}
+
 /// Splits an ILP payload into line-aligned byte ranges, each at most
 /// `max_chunk` bytes.
 ///
@@ -402,7 +419,7 @@ fn resume_offsets() -> &'static std::sync::Mutex<std::collections::HashMap<std::
 }
 
 /// The byte offset this file has already been drained to, or 0.
-fn resume_offset_for(path: &Path) -> u64 {
+pub(crate) fn resume_offset_for(path: &Path) -> u64 {
     resume_offsets()
         .lock()
         .map(|m| m.get(path).copied().unwrap_or(0))
@@ -411,7 +428,7 @@ fn resume_offset_for(path: &Path) -> u64 {
 
 /// Record how far a file has been drained. MONOTONE: never moves backwards, so
 /// a short round cannot un-drain bytes a longer one already delivered.
-fn record_resume_offset(path: &Path, offset: u64) {
+pub(crate) fn record_resume_offset(path: &Path, offset: u64) {
     if let Ok(mut m) = resume_offsets().lock() {
         let slot = m.entry(path.to_path_buf()).or_insert(0);
         *slot = (*slot).max(offset);
@@ -420,7 +437,7 @@ fn record_resume_offset(path: &Path, offset: u64) {
 
 /// Forget a file we will never read again, so the map cannot grow without
 /// bound as hours roll over.
-fn forget_resume_offset(path: &Path) {
+pub(crate) fn forget_resume_offset(path: &Path) {
     if let Ok(mut m) = resume_offsets().lock() {
         m.remove(path);
     }
@@ -598,7 +615,7 @@ pub const REPLAY_MAX_ISOLATION_POSTS_PER_CHUNK: usize = 1_024;
 
 /// What line isolation made of a chunk QuestDB permanently refused.
 #[derive(Debug, PartialEq, Eq)]
-enum LineIsolation {
+pub(crate) enum LineIsolation {
     /// Every other line is in QuestDB; these ranges (into the chunk) were
     /// refused one by one and must be set aside.
     Isolated(Vec<std::ops::Range<usize>>),
@@ -660,7 +677,7 @@ pub fn split_at_line_boundary(bytes: &[u8], range: std::ops::Range<usize>) -> Op
 /// so the refused lines are set aside and the file keeps draining. Cold path:
 /// runs only after a permanent refusal; allocates the range stack and one
 /// `Bytes` slice per POST (no copy).
-async fn isolate_refused_lines(
+pub(crate) async fn isolate_refused_lines(
     client: &Client,
     url: &str,
     chunk: &bytes::Bytes,
@@ -722,7 +739,7 @@ async fn isolate_refused_lines(
 /// cannot join it. Returns the bytes kept.
 ///
 /// Cold path, one file write per refused chunk.
-fn set_aside_rejected_lines(
+pub(crate) fn set_aside_rejected_lines(
     dir: &Path,
     spill_path: &Path,
     chunk: &[u8],
@@ -1510,7 +1527,22 @@ async fn run_replay_loop(dir: PathBuf, url: String, require_upload: bool) {
             let outcome = if held {
                 SpillReplayOutcome::default()
             } else {
-                runtime.block_on(replay_spill_dir(&round_dir, &round_url, &round_client))
+                let mut outcome =
+                    runtime.block_on(replay_spill_dir(&round_dir, &round_url, &round_client));
+                // The depth directory also holds length-framed `.dspl` files
+                // (plan item 49e, 2026-10-09). Older `.ilp` files drain first;
+                // a failed text round leaves the framed files for the next
+                // round, as any failure stops the round.
+                if holds_in_session && outcome.files_failed == 0 {
+                    outcome.absorb(runtime.block_on(
+                        crate::depth_spill_frame::replay_framed_spill_dir(
+                            &round_dir,
+                            &round_url,
+                            &round_client,
+                        ),
+                    ));
+                }
+                outcome
             };
             // Trim quarantine on every round, not only at boot (2026-08-28,
             // round-2 fix). Quarantine is written BY THIS LOOP during the

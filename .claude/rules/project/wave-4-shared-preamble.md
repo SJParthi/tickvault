@@ -245,17 +245,20 @@ When the PR description quotes "100% guarantee", it MUST be phrased exactly:
 > `seal_ring.rs::test_seal_buffer_capacity_constant_is_locked_value`)
 > -> NDJSON spill -> DLQ; bench-gated
 > O(1) hot path; composite-key uniqueness;
-> chaos-tested 65h Fri 16:00 IST -> Mon 09:00 IST weekend sleep/wake
-> (`crates/core/tests/ws_sleep_resilience.rs`). Beyond the envelope,
+> calendar-tested 65h Fri 16:00 IST -> Mon 09:00 IST weekend sleep-until-open
+> schedule (`crates/core/tests/ws_sleep_resilience.rs` -- date arithmetic only:
+> no socket is held open across it; the box is stopped overnight and at
+> weekends). Beyond the envelope,
 > DLQ NDJSON catches every payload as recoverable text."
 
 Promising "WebSocket never disconnects" or "QuestDB never fails"
 without the envelope qualifier = REJECT IN REVIEW.
 
 Outstanding (Wave-6 backlog): >65h dormant sleep across long-weekend
-holidays (Fri -> Tue) is NOT yet pinned by a chaos test. The
-`secs_until_next_market_open` calendar handles arbitrary holiday gaps,
-but the chaos sweep only exercises the 65h weekend case. See
+holidays (Fri -> Tue) has a CALENDAR test only
+(`test_long_weekend_monday_holiday_sleep_wakes_on_tuesday`); no test holds a
+socket across any sleep, 65h or longer (corrected 2026-10-09: this paragraph
+and the template above called the calendar test a "chaos sweep"). See
 `.claude/plans/active-plan-wave-6-backlog.md` item W6-2 for the
 extension to a 92h Mon-holiday wake test.
 
