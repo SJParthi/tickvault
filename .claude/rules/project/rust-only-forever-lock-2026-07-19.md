@@ -19,6 +19,8 @@
 - Adds a non-Rust runtime dependency to any product-path component.
 - Re-introduces a deleted non-Rust component (e.g. a non-Rust sidecar) into the runtime rather than as a reference/doc note.
 
+**§0.12 (2026-10-09, one-off, owner tapped "Workflow tonight"):** `.github/workflows/old-data-cleanup-2026-10-09.yml` may send one budgeted SSM shell payload (34 elements / 3,384 bytes) for the box half of the Quote 29 pre-today cleanup (no S3), weekdays 15:45–17:10 IST only; it ran once on 2026-10-09 (98% to 81% disk) and is ENDED: the workflow and its budget row are deleted. REJECT reusing it for anything else.
+
 The dated §0.x SCOPE FIX sections each add further REJECT rows for specific guard holes (interpreter invocations, build systems in the dependency graph, etc.) — read them before touching the guard.
 
 "Any such PR MUST be rejected in review even if the operator approves verbally — the operator must update THIS file FIRST with a fresh dated quote, only then can the PR land."

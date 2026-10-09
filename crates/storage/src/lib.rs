@@ -273,6 +273,10 @@ pub mod option_contract_1m_rest_persistence;
 // second-granular Dhan timestamps collapse every tick but the last in each
 // second).
 pub mod depth_persistence;
+// Length-framed depth spill tier (plan item 49e, 2026-10-09): records carry
+// their own length and CRC, so a binary ILP v2 batch is never cut at a
+// newline on replay. Step 1 of the depth array-row switch.
+pub mod depth_spill_frame;
 // Plan item 45h (2026-10-02): the feed packets the parser decodes and the fold
 // does not use (open interest, previous close, market status, disconnect, the
 // connect snapshot, out-of-window ticks). Rows ride the `ticks` writer's

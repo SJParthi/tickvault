@@ -1050,3 +1050,56 @@ component enters the product path.
 **REJECT:** any other `libc` call site added without its own reason recorded
 here; a version range or an unpinned `libc`; using this approval to add any
 other FFI crate; pinning any thread to core 0.
+
+## §0.12. 2026-10-09 — ONE-OFF SSM shell for the Quote 29 old-data cleanup (owner-approved)
+
+**Operator words (verbatim, typos included):**
+
+- Parthi, 2026-10-09 09:39 UTC, thread "Live server alerts and full disk":
+  *"nope i wont run anythign dude evryhting needs to be automated dude okay?"*
+  (he will not run the cleanup scripts himself).
+- Parthi, 2026-10-09 09:46 UTC, decision card "Automate the old-data cleanup
+  with a one-off workflow, or build it into the app?" — tapped **"Workflow
+  tonight"**. The card stated that a one-off workflow sends shell commands to
+  the box and that this rule forbids that unless he allows it there.
+
+**What is authorized:** one workflow,
+`.github/workflows/old-data-cleanup-2026-10-09.yml`, that sends one SSM
+`AWS-RunShellScript` payload of 34 elements / 3,384 bytes (budget row in
+`crates/common/tests/shell_budget_guard.rs`). It covers the BOX half of
+Quote 29 only: it deletes frame-log, spill, hold, dead-letter and temp files
+last written before 2026-10-09 IST and queues `DROP PARTITION` for the 17
+market-data tables. It does nothing in S3 (no automated identity may delete
+object versions there, and widening IAM is forbidden). It is dispatch-only,
+reports before it deletes (`mode=dry`), needs a typed confirmation to delete,
+runs only on weekdays 15:45–17:10 IST (after the close and before the 17:30
+stop), shares the deploy concurrency group and refuses while a deploy is
+queued or running, refuses after 2026-10-12 IST, fails on any QuestDB error,
+and never stops the app. The app keeps running because Quote 29c records the
+run with the app left running; after the close the frame log no longer grows
+and nothing it deletes is open.
+
+**Correction recorded:** the 09:46 UTC card said the disk would fill
+"tomorrow". Today is Friday and the box does not run at weekends, so the
+estimate is Monday 2026-10-12 before noon (Assumed). Parthi was told at
+10:03 UTC. The choice on the card is unaffected.
+
+**Why not Rust:** the disk was 95.6% full at 14:46 IST and the box stops at
+17:30 IST; a `tickvault-host` subcommand needs a reviewed code change plus a
+deploy before it can run. Parthi was offered the Rust route on the same card
+and chose the workflow.
+
+**Removal:** the workflow file and its budget row are deleted in the first
+PR after the run (or after 2026-10-12 IST, whichever comes first). This
+exception then ends.
+
+**REJECT:** reusing this exception for any other workflow or payload;
+raising the row's ceiling; keeping the workflow after 2026-10-12 IST;
+widening its delete scope beyond Quote 29; adding a schedule or push trigger
+to it; any S3 delete or IAM change under cover of it.
+
+**ENDED 2026-10-09.** The job ran once that day after the close: a report-only
+pass at 16:14 IST, then the delete at 16:16 IST (GitHub runs 37919370600 and
+37919602693). The root volume went from 98% to 81% used. The workflow file and
+its budget row were deleted in the follow-up PR, so this exception authorizes
+nothing further; any new SSM shell needs its own dated section here.
