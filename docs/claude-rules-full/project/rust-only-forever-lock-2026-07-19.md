@@ -1050,3 +1050,39 @@ component enters the product path.
 **REJECT:** any other `libc` call site added without its own reason recorded
 here; a version range or an unpinned `libc`; using this approval to add any
 other FFI crate; pinning any thread to core 0.
+
+## §0.12. 2026-10-09 — ONE-OFF SSM shell for the Quote 29 old-data cleanup (owner-approved)
+
+**Operator words (verbatim, typos included):**
+
+- Parthi, 2026-10-09 09:39 UTC, thread "Live server alerts and full disk":
+  *"nope i wont run anythign dude evryhting needs to be automated dude okay?"*
+  (he will not run the cleanup scripts himself).
+- Parthi, 2026-10-09 09:46 UTC, decision card "Automate the old-data cleanup
+  with a one-off workflow, or build it into the app?" — tapped **"Workflow
+  tonight"**. The card stated that a one-off workflow sends shell commands to
+  the box and that this rule forbids that unless he allows it there.
+
+**What is authorized:** one workflow,
+`.github/workflows/old-data-cleanup-2026-10-09.yml`, that sends one SSM
+`AWS-RunShellScript` payload of 33 elements / 2,952 bytes (budget row in
+`crates/common/tests/shell_budget_guard.rs`) to delete market data dated
+before 2026-10-09 IST, exactly the scope Quote 29 / 29c record in
+`daily-universe-scope-expansion-2026-05-27.md`. It is dispatch-only, reports
+before it deletes (`mode=dry`), needs a typed confirmation to delete, refuses
+inside 09:00–15:45 IST on weekdays, refuses while a deploy is queued or
+running, refuses after 2026-10-12 IST, and never stops the app.
+
+**Why not Rust:** the disk was 95.6% full at 14:46 IST and the box stops at
+17:30 IST; a `tickvault-host` subcommand needs a reviewed code change plus a
+deploy before it can run. Parthi was offered the Rust route on the same card
+and chose the workflow.
+
+**Removal:** the workflow file and its budget row are deleted in the first
+PR after the run (or after 2026-10-12 IST, whichever comes first). This
+exception then ends.
+
+**REJECT:** reusing this exception for any other workflow or payload;
+raising the row's ceiling; keeping the workflow after 2026-10-12 IST;
+widening its delete scope beyond Quote 29; adding a schedule or push trigger
+to it; any S3 delete or IAM change under cover of it.
