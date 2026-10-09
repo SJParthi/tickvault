@@ -208,15 +208,15 @@ jobs:
             --comment "tickvault full status" \
             --parameters 'commands=[
               "echo ===APP===",
-              "systemctl is-active tickvault 2>/dev/null || echo inactive",
+              "systemctl is-active tickvault||true",
               "echo ===DOCKER===",
               "docker ps --format \"{{.Names}} {{.Status}}\" 2>/dev/null || echo none",
               "echo ===ROWS===",
-              "for t in ticks candles_1m option_chain_minute_snapshot instrument_lifecycle; do c=$(curl -s \"http://localhost:9000/exec?query=select%20count(*)%20from%20$t\" 2>/dev/null | grep -oE \"\\[\\[[0-9]+\" | grep -oE \"[0-9]+\" | head -1); echo \"$t=${c:-NA}\"; done",
+              "for t in ticks candles_1m market_depth instrument_lifecycle; do c=$(curl -s \"http://localhost:9000/exec?query=select%20count(*)%20from%20$t\" 2>/dev/null | grep -oE \"\\[\\[[0-9]+\" | grep -oE \"[0-9]+\" | head -1); echo \"$t=${c:-NA}\"; done",
               "echo ===FEED_SPLIT===",
               "fs=$(curl -s \"http://localhost:9000/exec?query=select%20feed%2C%20count(*)%20from%20ticks%20group%20by%20feed\" 2>/dev/null | grep -oE \"\\[\\\"[^\\\"]+\\\",[0-9]+\\]\" | sed -E \"s/\\[\\\"([^\\\"]+)\\\",([0-9]+)\\]/\\1=\\2/\"); if [ -n \"$fs\" ]; then echo \"$fs\"; else echo no-feed-rows; fi",
               "echo ===LOGS===",
-              "journalctl -u tickvault -n 12 --no-pager 2>/dev/null | tail -12 || echo no-logs",
+              "journalctl -u tickvault -n 12 --no-pager 2>/dev/null || echo no-logs",
               "echo ===ERRORS===",
               "tail -3 /opt/tickvault/data/logs/errors.summary.md 2>/dev/null || echo no-summary"
             ]' \
@@ -355,7 +355,7 @@ jobs:
           IID=${{ steps.iid.outputs.id }}
           CMD=$(aws ssm send-command --region "$AWS_REGION" --instance-ids "$IID" \
             --document-name AWS-RunShellScript \
-            --parameters 'commands=["systemctl restart tickvault","sleep 5","systemctl is-active --quiet tickvault && echo RESTARTED-OK || (echo FAIL; exit 1)"]' \
+            --parameters 'commands=["systemctl reset-failed tickvault;systemctl restart tickvault;sleep 5;systemctl is-active -q tickvault&&echo RESTARTED-OK||(echo FAIL;exit 1)"]' \
             --query Command.CommandId --output text)
           aws ssm wait command-executed --region "$AWS_REGION" --command-id "$CMD" --instance-id "$IID" || true
           aws ssm get-command-invocation --region "$AWS_REGION" --command-id "$CMD" --instance-id "$IID" \
@@ -440,7 +440,7 @@ jobs:
           # Restart the app so it dials the feed out from the new IP.
           CMD=$(aws ssm send-command --region "$AWS_REGION" --instance-ids "$IID" \
             --document-name AWS-RunShellScript \
-            --parameters 'commands=["systemctl restart tickvault","sleep 5","systemctl is-active --quiet tickvault && echo RESTARTED-OK || (echo FAIL; exit 1)"]' \
+            --parameters 'commands=["systemctl reset-failed tickvault;systemctl restart tickvault;sleep 5;systemctl is-active -q tickvault&&echo RESTARTED-OK||(echo FAIL;exit 1)"]' \
             --query Command.CommandId --output text)
           for i in $(seq 1 20); do
             ST=$(aws ssm get-command-invocation --region "$AWS_REGION" --command-id "$CMD" --instance-id "$IID" --query Status --output text 2>/dev/null || echo Pending)
