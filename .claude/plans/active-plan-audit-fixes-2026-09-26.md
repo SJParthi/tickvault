@@ -3043,6 +3043,14 @@ Status of the rest, so the next session does not re-audit:
     has passed, that volume is in no 1/3/5 s bar (the short bucket holding the first packet
     starts after 09:15 and seeds), so the 5 s bars of 09:15 can sum to less than the 1 m bar.
     A `false` choice that received no auction packet seeds the first bar as before.
+  - Review 2026-10-09 (speed, security, correctness): no default-reachable over-count found.
+    Fixed: a pre-match packet with day cumulative 0 is no longer recorded as a known
+    auction of 0 (test `a_pre_match_zero_is_not_taken_as_a_known_auction`). Latent: the
+    F&O baseline is 0 whatever the choice, so if futures (which have a pre-open since
+    Dec 2023) ever re-enter the subscription, their auction lands in the 09:15 bars; today
+    futures are not subscribed. Unknown: whether Dhan's equity cumulative includes the
+    08:45-09:00 block-deal window; under the default it would land in the 09:15 bar too.
+    The 09:15 bars' net direction stays unclassified, as the first bar's already was.
 
 ### Added 2026-10-09 (stress audit, findings OBS-1/TG-1 and TG-3)
 
