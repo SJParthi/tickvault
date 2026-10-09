@@ -101,7 +101,8 @@ These test types run weekly (Monday) in CI, not on every push:
 - Run for minimum 1 hour per target per week
 
 ### Loom Concurrency
-- `cargo test -p tickvault-core --features loom --test loom_tick_dedup`
+- `cargo test -p tickvault-core --features loom --test loom_activity_watchdog --test loom_ghost_register --test loom_ws_decoupling`
+- Each core loom file drives the REAL production type (audit H3, 2026-10-06); `loom_tick_dedup` was deleted because every model in it was a hand-written copy of code that no longer exists
 - Feature-gated: replaces std atomics with Loom mocks for exhaustive interleaving
 - NOT in standard `cargo test` — requires separate compilation
 

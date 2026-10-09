@@ -58,7 +58,7 @@ const ORDER_UPDATE_OUTAGE_PAGE_FAILURE_THRESHOLD: u32 = 3;
 /// and far below `WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS`.
 const ORDER_UPDATE_RECONNECT_STABILITY_SECS: u64 = 60;
 use crate::websocket::activity_watchdog::{
-    ActivityWatchdog, WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS, build_heartbeat_gauge,
+    ActivityWatchdog, WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS, build_heartbeat_gauge, note_activity,
     spawn_with_panic_notify,
 };
 use crate::websocket::tls::build_websocket_tls_connector;
@@ -749,7 +749,7 @@ async fn connect_and_listen(
     // Binary. Dhan's server pings every 10s, so even in a no-order window
     // the counter advances constantly and the watchdog never fires a
     // false positive. It only fires when the socket is truly dead.
-    let activity_counter = Arc::new(AtomicU64::new(0));
+    let activity_counter = Arc::new(crate::sync::AtomicU64::new(0));
     let watchdog_notify = Arc::new(tokio::sync::Notify::new());
     let watchdog = ActivityWatchdog::new(
         // O(1) EXEMPT: watchdog label built once per spawn, not per frame (cold path)
@@ -814,7 +814,7 @@ async fn connect_and_listen(
         // STAGE-C.3: bump the activity counter on every Some(Ok(_)) event.
         // ZL-P0-1: also set heartbeat gauge.
         if matches!(frame_result, Some(Ok(_))) {
-            activity_counter.fetch_add(1, Ordering::Relaxed);
+            note_activity(&activity_counter);
             m_last_frame_epoch.set(chrono::Utc::now().timestamp() as f64);
         }
 

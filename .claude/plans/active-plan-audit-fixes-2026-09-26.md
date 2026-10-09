@@ -3015,6 +3015,24 @@ Status of the rest, so the next session does not re-audit:
   a_pending_request_is_never_overwritten_by_a_later_one,
   a_racing_take_never_reads_a_torn_id_and_segment_pair.
 
+- [x] **H3 (core, rest) — the other core loom files drive real code.** Rebuilt 2026-10-09 on a
+  fresh branch from main (the handoff branch is read only). `loom_activity_watchdog` now drives
+  the real `ProgressProbe` and `note_activity` that `ActivityWatchdog::run` and the order-update
+  reader use (the counter is `crate::sync::AtomicU64`); `loom_ws_decoupling` drives the real
+  `RingByteBudget::try_reserve_detailed` and `release` (its two counters are
+  `crate::sync::AtomicUsize`; `new` and `with_slot_cap` stay `const` outside loom).
+  `loom_tick_dedup` is deleted: every model in it copied code that no longer exists. CI loom
+  lane: drift list and `--test` drop `loom_tick_dedup`, count 4 -> 3. Files:
+  `crates/core/src/sync.rs`, `crates/core/src/websocket/activity_watchdog.rs`,
+  `crates/core/src/websocket/order_update_connection.rs`,
+  `crates/core/src/websocket/pool_supervisor.rs`, `crates/core/tests/loom_activity_watchdog.rs`,
+  `crates/core/tests/loom_ws_decoupling.rs`, `.github/workflows/ci.yml`,
+  `.claude/rules/project/testing.md`. Tests:
+  two_readers_never_reserve_past_the_byte_cap_and_the_loser_returns_its_slot,
+  two_readers_never_reserve_past_the_slot_cap, a_reserve_racing_the_drain_release_leaves_exact_counters,
+  stress_readers_and_releases_never_breach_or_leak_the_budget. Honest limit: the tokio channel
+  and the WAL writer are not modelled (loom cannot run them).
+
 ### Added 2026-10-09 (ADANIENT 09:15 volume mismatch)
 
 - [x] **V1 — The day's first trade fills every bar that holds 09:15.** Reported 2026-10-09 by
