@@ -1367,6 +1367,7 @@ async fn async_main() -> Result<()> {
         }
         Err(err) => {
             error!(
+                code = tickvault_common::error_code::ErrorCode::WsSpill03WalInitFailed.code_str(),
                 ?err,
                 dir = %ws_wal_dir,
                 "STAGE-C: failed to initialize WsFrameSpill — HALTING boot (fail-closed). \
@@ -1378,8 +1379,14 @@ async fn async_main() -> Result<()> {
             // should never ever be lost … irrespective of any situation").
             // The WAL is the durable floor of the ring → spill → WAL chain; if it
             // can't init, the guarantee is void, so we REFUSE to run. systemd
-            // Restart=always re-launches and the operator is paged by the ERROR
-            // above — a loud restart loop beats a silent lossy session.
+            // Restart=always re-launches; a loud restart loop beats a silent
+            // lossy session. (Corrected 2026-10-06, audit M3: this said "the
+            // operator is paged by the ERROR above", but that line carried no
+            // code and no filter matched it. It now carries WS-SPILL-03, which
+            // is deliberately NOT alarmed; the page comes from the existing
+            // boot-heartbeat and market-hours liveness alarms, because a
+            // halted boot never publishes `tv_boot_completed`. This line names
+            // the cause in triage.)
             std::process::exit(1);
         }
     };
@@ -2389,6 +2396,7 @@ async fn async_main() -> Result<()> {
             None
         };
         tracing::error!(
+            code = tickvault_common::error_code::ErrorCode::Proc03Panicked.code_str(),
             panic_location = %location,
             panic_payload = %payload,
             wal_drain = ?wal_drain,
@@ -4861,7 +4869,11 @@ async fn build_shared_infra(
     info!(address = %bind_addr, "SHARED-INFRA BOOT: API server listening (/api/feeds reachable regardless of Dhan ON/OFF)");
     let api_handle = tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, router).await {
-            error!(?err, "API server error");
+            error!(
+                code = tickvault_common::error_code::ErrorCode::ApiServer01Exited.code_str(),
+                ?err,
+                "API server error — the HTTP API stopped serving; trading lanes are unaffected"
+            );
         }
     });
 

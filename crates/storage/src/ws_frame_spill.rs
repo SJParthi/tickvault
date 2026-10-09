@@ -4487,7 +4487,17 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
                 corrupted += 1;
                 gap_pending = true;
                 real_gap = true;
-                error!(segment = ?path, error = %err, "WAL segment corrupted; skipping");
+                // WS-SPILL-04, not WS-SPILL-02 (audit M3, 2026-10-06): the
+                // corrupted-segment counter below already pages through the
+                // existing durable-floor-breach alarm, and WS-SPILL-02 pages
+                // on any line, so it would page the same event twice. The
+                // next segment is marked as following a gap.
+                error!(
+                    code = ErrorCode::WsSpill04SegmentUnreadable.code_str(),
+                    segment = ?path,
+                    error = %err,
+                    "WAL segment corrupted; skipping"
+                );
             }
         }
         consumed += 1;
