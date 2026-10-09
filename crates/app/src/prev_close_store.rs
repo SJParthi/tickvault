@@ -47,6 +47,10 @@
 //! composite key. Zero allocation after construction in the steady state:
 //! the map is pre-sized to the cap and `record` on a tracked instrument
 //! overwrites in place. Space is O(instruments), hard-bounded by the cap.
+//!
+//! The map hashes with `ahash` rather than the standard library's SipHash
+//! (audit plan PR10). `ahash` is faster on a short integer key and still
+//! draws a random key per process, so crafted collisions stay as hard to aim.
 
 use std::collections::HashMap;
 
@@ -91,7 +95,7 @@ pub enum RecordOutcome {
 /// aggregator's own header records the same decision for the same reason.
 #[derive(Debug)]
 pub struct PrevCloseStore {
-    closes: HashMap<PrevCloseKey, f64>,
+    closes: HashMap<PrevCloseKey, f64, ahash::RandomState>,
     refused_at_capacity: u64,
     rejected_values: u64,
 }
@@ -112,7 +116,10 @@ impl PrevCloseStore {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            closes: HashMap::with_capacity(MAX_TRACKED_INSTRUMENTS),
+            closes: HashMap::with_capacity_and_hasher(
+                MAX_TRACKED_INSTRUMENTS,
+                ahash::RandomState::new(),
+            ),
             refused_at_capacity: 0,
             rejected_values: 0,
         }

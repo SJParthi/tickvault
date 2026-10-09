@@ -219,6 +219,15 @@ inline (PR2, PR8, PR14).
     (depth_persistence.rs:1606-1617); pre-size it next to the tick writer's and count the miss. The
     tick row writer has the database client re-check column names on every row (row 105,
     tick_persistence.rs:2263-2362); no item covered it until now.
+  - Progress 2026-10-08 (hash half only; the item stays open): the three maps above plus the
+    two folded in (`volume_leaderboard.rs` `volumes`, `contract_underlying_map.rs` owner map)
+    hash with `ahash::RandomState`, pinned by `per_tick_maps_use_ahash` in
+    `crates/app/tests/per_tick_maps_use_ahash_guard.rs`. New bench `trading/benches/candle_fold.rs`.
+    Measured on the fold: 712 → 687 µs per 500 ticks at 20,000 instruments (p = 0.20) and
+    703 → 672 µs at 500 (p = 0.45), inside noise. A callgrind profile puts about 77% of the fold's
+    instructions in `f32_to_f64_clean` (four to five calls per tick), not in the hash probe.
+    Still open: Re-check 6 above and the PR10 rows folded in further down (buffer pre-sizes,
+    label table, keepalive counters, delay timer, depth writer name checks).
 - [ ] **PR11 — disk ballast and token recovery without a restart.** (`storage`, `core`, `app`)
   - Disk headroom gauges and alarms already exist (disk_pressure_boot.rs:242, app-alarms.tf:312,
     :376). Missing: an ENOSPC ballast — a pre-allocated reserve file on the data volume, released

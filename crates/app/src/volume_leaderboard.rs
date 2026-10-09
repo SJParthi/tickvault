@@ -783,7 +783,10 @@ pub const fn window_lots_milli(delta_units: u32, lot_size: u32) -> Option<u64> {
 
 #[derive(Debug)]
 struct Family {
-    volumes: HashMap<ContractKey, Tracked>,
+    /// Hashed with `ahash` rather than SipHash (audit plan PR10): `observe`
+    /// probes it on every option tick, and `ahash` is faster on a short integer
+    /// key while still keyed at random per process.
+    volumes: HashMap<ContractKey, Tracked, ahash::RandomState>,
     /// Keys that have TRADED since each window's last sweep — the work list.
     ///
     /// One list per cadence slot, holding exactly the contracts whose
@@ -915,7 +918,10 @@ impl Family {
             // Pre-sized: an unsized map reallocates and rehashes ~15 times on
             // its way to the authorized universe, and every one of those lands
             // on the per-tick path.
-            volumes: HashMap::with_capacity(MAX_TRACKED_CONTRACTS),
+            volumes: HashMap::with_capacity_and_hasher(
+                MAX_TRACKED_CONTRACTS,
+                ahash::RandomState::new(),
+            ),
             // Pre-sized for the same reason, and `from_fn` rather than an
             // array literal because a `Vec` is not `Copy`.
             dirty: std::array::from_fn(|_| Vec::with_capacity(MAX_TRACKED_CONTRACTS)),

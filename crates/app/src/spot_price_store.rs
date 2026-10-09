@@ -127,6 +127,10 @@
 //! the tick path. *(⚠ 2026-10-02: the depth steering loop no longer calls it
 //! per minute; the depth path now snapshots once per attach attempt, like the
 //! contract path.)* Space is O(instruments), hard-bounded by the cap below.
+//!
+//! The map hashes with `ahash` rather than SipHash (audit plan PR10): it is
+//! faster on a short integer key, still draws a random key per process, and
+//! `record` probes this map on every spot tick.
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
@@ -347,7 +351,7 @@ fn packed_price(word: u64) -> f32 {
 #[derive(Debug)]
 pub struct SpotPriceStore {
     /// `(exchange_secs << 32) | f32 bits` per instrument — see the header.
-    prices: PapayaHashMap<SpotPriceKey, AtomicU64>,
+    prices: PapayaHashMap<SpotPriceKey, AtomicU64, ahash::RandomState>,
     /// The IST day a trade time must belong to. Ticks from an earlier day are
     /// refused. Set at construction, advanced by [`Self::reset_daily`].
     trading_day: AtomicI64,
@@ -387,7 +391,7 @@ impl SpotPriceStore {
     #[must_use]
     pub fn for_trading_day(ist_day: i64) -> Self {
         Self {
-            prices: PapayaHashMap::new(),
+            prices: PapayaHashMap::with_hasher(ahash::RandomState::new()),
             trading_day: AtomicI64::new(ist_day),
             rejected_value: AtomicU64::new(0),
             stale_day: AtomicU64::new(0),
