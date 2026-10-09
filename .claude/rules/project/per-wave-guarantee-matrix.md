@@ -66,8 +66,10 @@ qualified exactly:
 > `seal_ring.rs::test_seal_buffer_capacity_constant_is_locked_value`)
 > → NDJSON spill → DLQ; bench-gated
 > O(1) hot path; composite-key uniqueness;
-> chaos-tested 65h Fri 16:00 IST → Mon 09:00 IST weekend sleep/wake
-> (`crates/core/tests/ws_sleep_resilience.rs`). Beyond the envelope,
+> calendar-tested 65h Fri 16:00 IST → Mon 09:00 IST weekend sleep-until-open
+> schedule (`crates/core/tests/ws_sleep_resilience.rs` — date arithmetic only:
+> no socket is held open across it; the box is stopped overnight and at
+> weekends). Beyond the envelope,
 > DLQ NDJSON catches every payload as recoverable text. Outstanding
 > (Wave-6): >65h holiday-weekend dormant sleep test (W6-2)."
 

@@ -46,7 +46,7 @@ hallucination and is REJECTED in review.
 | Operator "absolute" | Honest, enforced envelope | Evidence required |
 |---|---|---|
 | Zero tick loss | Bounded zero loss inside the chaos envelope: ring → spill NDJSON → DLQ; beyond it, DLQ catches every payload as recoverable text | `seal_ring.rs` (SEAL_BUFFER_CAPACITY ratchet) + seal-chain chaos tests *(zero_tick_loss_alert_guard.rs retired 2026-07-18 with the dead tick chain)* |
-| WS never disconnects | DETECT ≤5s, reconnect with `SubscribeRxGuard`, sleep-until-open post-close; SEBI 24h JWT forces ≥1 reconnect/day by law | pool watchdog + `ws_sleep_resilience` tests |
+| WS never disconnects | DETECT ≤5s, reconnect with `SubscribeRxGuard`, sleep-until-open post-close; SEBI 24h JWT forces ≥1 reconnect/day by law | pool watchdog + `ws_sleep_resilience` tests (calendar arithmetic only; no socket is held across a sleep) |
 | Never slow / hanged | Hot path: DHAT ≤ budget alloc, Criterion p99 ≤ budget; tick-gap >30s → Telegram | DHAT tests + Criterion + bench-gate |
 | QuestDB never fails | ABSORB via 3-tier rescue→spill→DLQ + schema self-heal; alert if disconnected >30s | chaos_questdb tests |
 | Strict O(1) everywhere | **O(1) per-tick + per-lookup (proven)**; inherently-O(N) build steps are flagged honestly, never faked as O(1) | DHAT + Criterion + explicit N flag |

@@ -26,7 +26,7 @@ where the answer is "trust me".
 | Claim | Proof file | Test name |
 |---|---|---|
 | Every `error!` reaches Telegram (Loki→ERROR routing) + CloudWatch alarms→SNS 4-channel fan-out | `crates/core/src/notification/service.rs` + `deploy/aws/terraform/app-alarms.tf` | `crates/common/tests/cloudwatch_app_alarms_wiring.rs` (the Prometheus `tickvault-alerts.yml` + `resilience_sla_alert_guard` cited here previously were retired #O2/#O3) |
-| No flush/drain/persist failure is silenced as WARN | `crates/storage/tests/error_level_meta_guard.rs` | `flush_persist_broadcast_failures_must_use_error_level` |
+| No flush/drain/persist failure is silenced as WARN | `crates/storage/tests/error_level_meta_guard.rs` | `write_failure_warns_are_errors_or_reviewed` |
 | 54 error codes, every one documented in a rule file | `crates/common/src/error_code.rs` | `every_error_code_variant_appears_in_a_rule_file` |
 | Every rule-file code has an ErrorCode variant | `crates/common/tests/error_code_rule_file_crossref.rs` | `every_rule_file_code_has_an_enum_variant` |
 | Every ErrorCode runbook path exists on disk | same file | `every_runbook_path_exists_on_disk` |
