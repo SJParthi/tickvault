@@ -6354,6 +6354,34 @@ Each refused level stays in its slot as NaN (reads back null; positions stay ali
 3. Builders (d20, d200, inline d5 as one bid+ask row each), refold and after-close pass routed by date.
 4. Turn on after one session on the scratch table in prod (operator step), then keep the old table's rows (never deleted; retention as today).
 
+## ITEM 49e — Step 1: length-framed depth spill tier (2026-10-09)
+
+- [x] Framed spill writer and replay for depth rows — Files: crates/storage/src/depth_spill_frame.rs, crates/storage/src/depth_persistence.rs, crates/storage/src/tick_spill_replay.rs, crates/storage/src/ws_frame_spill.rs, crates/storage/src/lib.rs — Tests: test_replay_posts_each_record_whole_and_truncates_a_closed_file, test_concurrent_appends_never_interleave_records, the_spill_file_is_framed_and_drained_by_the_framed_replay
+
+### Design
+
+`spill_failed_depth_ilp` writes `depth-{feed}-{hour}.dspl` instead of `.ilp`. Each record is a 16-byte header (magic `TVDS`, version, 3 zero bytes, payload length u32 LE, CRC-32 of header bytes 4..12 plus the payload) followed by the payload. Version 1 is ILP text, cut at line boundaries into records of at most `REPLAY_MAX_CHUNK_BYTES`; version 2 (binary ILP, step 2) is one record. Appends take one process-wide lock so the writer thread, the rescue thread and the drain's inline fallback never interleave a record. The replay runs on the existing replay loop after the text replay, only when that round had no failure and outside the depth hold window: oldest file first, one POST per whole record, resume offsets in memory, closed files truncated (never deleted) once read, the live file never truncated. Old `.ilp` depth files still drain through the text replay.
+
+### Edge Cases
+
+A torn tail on the live file waits for the writer; on a closed file it is set aside. Garbage between records is skipped by scanning for the next valid header and set aside. A record past 64 MiB, a non-zero reserved byte, an unknown version or a CRC mismatch reads as corrupt. A file that grows while being read is not truncated. An empty payload writes nothing.
+
+### Failure Modes
+
+A transient POST failure (5xx, 408, 429, connect error) stops the round and keeps the offset. A permanent refusal sets the record aside in quarantine: a v1 record is bisected to the refused lines (`.rejected-lines`), a v2 record is kept whole (`.rejected-records`). Corrupt bytes go to `.corrupt-bytes`. Nothing is deleted; quarantine counts toward the spill cap as before.
+
+### Test Plan
+
+11 unit tests in `depth_spill_frame` (round trip v1/v2, large v1 cut into whole-line records, header refusal, torn and CRC reads, replay posts each record and truncates a closed file, live torn tail waits, corrupt-bytes resync, closed torn tail quarantined, refused v2 kept whole, v1 line isolation, concurrent appends never interleave, text replay never sees `.dspl`). The depth persistence tests read the spill through the framed reader.
+
+### Rollback
+
+Revert the PR. `.dspl` files left on disk are not read by the old binary, so drain them first (the replay loop does this within one round once QuestDB is up) or keep them for step 2.
+
+### Observability
+
+`tv_depth_framed_spill_set_aside_total{reason=refused|corrupt|torn_tail}` counts set-aside events; replay outcomes add to the existing `SpillReplayOutcome` counters; every set-aside logs `TICK-SPILL-01` at error level with the file and byte range.
+
 ## ITEM 51 — Dhan 15:41 cross-verification hardening (2026-10-06)
 
 Approved by Parthiban 2026-10-06: "Go ahead with whatever you want dude" and "See do everything whatever is recommended dude okay?", answering the recommended cross-verification hardening list (five findings: the day marker, the read that runs too early, missing minutes that never page, a day with no run at all, and targets fixed at boot). Rule authority: `no-rest-except-live-feed-2026-06-27.md` §12.15.7 onward and the noise lock §2.5 notes, each dated and recorded before its code. Ten serial PRs, one sub-item each. Findings Verified by reading `origin/main` at `60bdfd97a`; cargo was not run for the findings.

@@ -3925,7 +3925,7 @@ const CRC32_TABLE: [u32; 256] = {
     table
 };
 
-fn crc32_ieee_of(chunks: &[&[u8]]) -> u32 {
+pub(crate) fn crc32_ieee_of(chunks: &[&[u8]]) -> u32 {
     let mut c: u32 = 0xFFFF_FFFF;
     for chunk in chunks {
         for &b in *chunk {

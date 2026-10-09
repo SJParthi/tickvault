@@ -330,6 +330,43 @@ const REVIEWED_WARN_SITES: &[(&str, &str, &str)] = &[
         "could not re-check a drained spill file",
         "the file is not truncated, so no bytes can be lost; retried next round",
     ),
+    // The framed depth spill replay (plan item 49e) mirrors the text replay
+    // above: every one of these keeps the file whole and retries next round.
+    (
+        "crates/storage/src/depth_spill_frame.rs",
+        "could not read a spill file",
+        "the file is kept and retried next round",
+    ),
+    (
+        "crates/storage/src/depth_spill_frame.rs",
+        "could not open a spill file",
+        "the file is kept and retried next round",
+    ),
+    (
+        "crates/storage/src/depth_spill_frame.rs",
+        "could not re-check a drained framed depth spill file",
+        "the file is not truncated, so no bytes can be lost; retried next round",
+    ),
+    (
+        "crates/storage/src/depth_spill_frame.rs",
+        "could not read a record",
+        "the file is kept at the same offset and retried next round",
+    ),
+    (
+        "crates/storage/src/depth_spill_frame.rs",
+        "resync could not read",
+        "the file is kept at the same offset and retried next round",
+    ),
+    (
+        "crates/storage/src/depth_spill_frame.rs",
+        "could not be written to quarantine",
+        "the file is kept intact and retried next round",
+    ),
+    (
+        "crates/storage/src/depth_spill_frame.rs",
+        "could not reach questdb",
+        "the file is kept intact and retried next round",
+    ),
     (
         "crates/storage/src/seal_absorption.rs",
         "tier-2 spill failed",
