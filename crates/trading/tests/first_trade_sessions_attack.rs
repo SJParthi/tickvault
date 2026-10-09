@@ -5,6 +5,14 @@
 //! quantity in `last_trade_quantity`. Each assertion states the bar the fold
 //! must write: the true volume where the first trade is provably the day's
 //! whole volume, else 0 (seeded: may under-report, never over-report).
+//!
+//! 2026-10-09 (ADANIENT): the bucket of each timeframe that HOLDS 09:15
+//! takes the first trade's whole day cumulative, proof or no proof, since
+//! everything in it traded inside that bucket (auction volume included, the
+//! default "Match Dhan" choice). The proof rules above now decide only the
+//! buckets after it (a 1-second bar after 09:15:00, the 09:16 minute, ...),
+//! so several assertions below that read 0 for a 09:15 bar now read the
+//! cumulative.
 
 use std::collections::HashMap;
 
@@ -156,7 +164,8 @@ fn lost_first_trade_across_a_minute_boundary_never_over_counts() {
 }
 
 /// Two fills between two packets (Dhan conflation): LTQ is the last fill,
-/// cumulative both. Seeds (documented limit (2)).
+/// cumulative both. The 1-second bar seeds (documented limit (2)); the 09:15
+/// minute holds both fills (2026-10-09).
 #[test]
 fn conflated_first_two_fills_seed() {
     let mut a = agg();
@@ -164,11 +173,13 @@ fn conflated_first_two_fills_seed() {
     b.push(&mut a, &stale(5, FNO, 1, at(1, 9, 15, 0)));
     b.push(&mut a, &trade(5, FNO, at(1, 9, 15, 3), 75, 50));
     b.close(&mut a);
-    assert_eq!(b.vol(5, FNO, TfIndex::M1, at(1, 9, 15, 3)), Some(0));
+    assert_eq!(b.vol(5, FNO, TfIndex::S1, at(1, 9, 15, 3)), Some(0));
+    assert_eq!(b.vol(5, FNO, TfIndex::M1, at(1, 9, 15, 3)), Some(75));
 }
 
 /// LTQ is u16 on the wire: a first trade above 65,535 can never prove itself
-/// and seeds (missing, never wrong). Exactly 65,535 still lands.
+/// and its 1-second bar seeds (missing, never wrong). Exactly 65,535 still
+/// lands. The 09:15 minute holds the cumulative either way (2026-10-09).
 #[test]
 fn first_trade_above_u16_ltq_seeds() {
     for (cum, ltq, expect) in [(65_535u32, u16::MAX, 65_535u64), (70_000, 4_464, 0)] {
@@ -179,8 +190,13 @@ fn first_trade_above_u16_ltq_seeds() {
         b.push(&mut a, &trade(6, FNO, at(1, 9, 15, 4), cum, ltq));
         b.close(&mut a);
         assert_eq!(
-            b.vol(6, FNO, TfIndex::M1, at(1, 9, 15, 4)),
+            b.vol(6, FNO, TfIndex::S1, at(1, 9, 15, 4)),
             Some(expect),
+            "cum={cum}"
+        );
+        assert_eq!(
+            b.vol(6, FNO, TfIndex::M1, at(1, 9, 15, 4)),
+            Some(u64::from(cum)),
             "cum={cum}"
         );
     }
@@ -195,6 +211,9 @@ fn first_trade_above_u16_ltq_seeds() {
 /// continuous trade carries the auction in its cumulative (5,100 against its
 /// own 100): it seeds, and 09:15 reads 0 (true 100), never 5,100. Same shape
 /// as row 5 below.
+///
+/// 2026-10-09: under the default "Match Dhan" choice the 09:15 bars include
+/// the auction, so they read 5,100; the 1-second bar still seeds.
 #[test]
 fn equity_pre_open_match_proof_age_decides() {
     for (sid, proof) in [(10, at(1, 9, 5, 0)), (11, at(1, 9, 7, 30))] {
@@ -208,8 +227,9 @@ fn equity_pre_open_match_proof_age_decides() {
             b.0.keys().all(|k| k.3 >= at(1, 9, 15, 0)),
             "no bar before 09:15"
         );
-        assert_eq!(b.vol(sid, EQ, TfIndex::M1, at(1, 9, 15, 2)), Some(0));
-        assert_eq!(b.vol(sid, EQ, TfIndex::M60, at(1, 9, 15, 2)), Some(0));
+        assert_eq!(b.vol(sid, EQ, TfIndex::M1, at(1, 9, 15, 2)), Some(5_100));
+        assert_eq!(b.vol(sid, EQ, TfIndex::M60, at(1, 9, 15, 2)), Some(5_100));
+        assert_eq!(b.vol(sid, EQ, TfIndex::S1, at(1, 9, 15, 2)), Some(0));
     }
 
     // An auction bigger than u16: refused before 09:15 as well.
@@ -221,7 +241,8 @@ fn equity_pre_open_match_proof_age_decides() {
     assert!(b.0.is_empty(), "no bar before 09:15");
 }
 
-/// Row 4.
+/// Row 4. The proof decides the 1-second bar; the 09:15 minute holds the
+/// cumulative either way (2026-10-09).
 #[test]
 fn equity_proof_at_091204_vs_091205() {
     for (proof, expect) in [(at(1, 9, 12, 4), 0u64), (at(1, 9, 12, 5), 300)] {
@@ -230,7 +251,8 @@ fn equity_proof_at_091204_vs_091205() {
         b.push(&mut a, &stale(12, EQ, 1, proof));
         b.push(&mut a, &trade(12, EQ, at(1, 9, 15, 30), 300, 300));
         b.close(&mut a);
-        assert_eq!(b.vol(12, EQ, TfIndex::M1, at(1, 9, 15, 30)), Some(expect));
+        assert_eq!(b.vol(12, EQ, TfIndex::S1, at(1, 9, 15, 30)), Some(expect));
+        assert_eq!(b.vol(12, EQ, TfIndex::M1, at(1, 9, 15, 30)), Some(300));
     }
 }
 
@@ -238,6 +260,9 @@ fn equity_proof_at_091204_vs_091205() {
 /// 09:13 packet is a proof; the first continuous trade carries the auction
 /// in its cumulative (5,100) against its own 100, so it seeds: 09:15 reads 0
 /// (true 100), never 5,100.
+///
+/// 2026-10-09: under the default "Match Dhan" choice the 09:15 bars include
+/// the auction and read 5,100; the 1-second bar after 09:15:00 still seeds.
 #[test]
 fn equity_if_post_match_packets_kept_prior_day_ltt_auction_is_not_poured_in() {
     let mut a = agg();
@@ -256,7 +281,7 @@ fn equity_if_post_match_packets_kept_prior_day_ltt_auction_is_not_poured_in() {
     );
     b.push(&mut a, &trade(13, EQ, at(1, 9, 15, 2), 5_100, 100));
     b.close(&mut a);
-    assert_eq!(b.vol(13, EQ, TfIndex::M1, at(1, 9, 15, 2)), Some(0));
+    assert_eq!(b.vol(13, EQ, TfIndex::M1, at(1, 9, 15, 2)), Some(5_100));
     assert_eq!(b.vol(13, EQ, TfIndex::S1, at(1, 9, 15, 2)), Some(0));
 }
 
@@ -289,9 +314,15 @@ fn bse_segments_follow_their_nse_twins() {
     b.push(&mut a, &stale(22, BSE_EQ, 1, at(1, 9, 13, 0)));
     b.push(&mut a, &trade(22, BSE_EQ, at(1, 9, 15, 30), 40, 40));
     b.close(&mut a);
-    assert_eq!(b.vol(20, BSE_FNO, TfIndex::M1, at(1, 9, 15, 30)), Some(40));
-    assert_eq!(b.vol(21, BSE_EQ, TfIndex::M1, at(1, 9, 15, 30)), Some(0));
-    assert_eq!(b.vol(22, BSE_EQ, TfIndex::M1, at(1, 9, 15, 30)), Some(40));
+    // The proof decides the 1-second bar; the 09:15 minute holds the
+    // cumulative either way (2026-10-09).
+    assert_eq!(b.vol(20, BSE_FNO, TfIndex::S1, at(1, 9, 15, 30)), Some(40));
+    assert_eq!(b.vol(21, BSE_EQ, TfIndex::S1, at(1, 9, 15, 30)), Some(0));
+    assert_eq!(b.vol(22, BSE_EQ, TfIndex::S1, at(1, 9, 15, 30)), Some(40));
+    for sid in [20, 21, 22] {
+        let seg = if sid == 20 { BSE_FNO } else { BSE_EQ };
+        assert_eq!(b.vol(sid, seg, TfIndex::M1, at(1, 9, 15, 30)), Some(40));
+    }
 }
 
 /// Row 8 (was latent). Currency/MCX/other segments are never extended to the
@@ -329,7 +360,10 @@ fn proof_from_previous_day_never_holds_without_day_close() {
     b.push(&mut a, &stale(30, FNO, 1, at(1, 15, 35, 0)));
     b.push(&mut a, &trade(30, FNO, at(2, 9, 15, 2), 70, 70));
     b.close(&mut a);
-    assert_eq!(b.vol(30, FNO, TfIndex::M1, at(2, 9, 15, 2)), Some(0));
+    // The proof does not hold, so the 1-second bar seeds; the 09:15 minute
+    // holds the cumulative regardless (2026-10-09).
+    assert_eq!(b.vol(30, FNO, TfIndex::S1, at(2, 9, 15, 2)), Some(0));
+    assert_eq!(b.vol(30, FNO, TfIndex::M1, at(2, 9, 15, 2)), Some(70));
     assert!(!untraded_proof_holds(
         at(1, 23, 59, 59),
         at(2, 0, 0, 1),
@@ -357,8 +391,11 @@ fn after_day_close_a_post_midnight_proof_is_extended_for_options_only() {
     b.push(&mut a, &trade(31, FNO, at(2, 9, 15, 20), 25, 25));
     b.push(&mut a, &trade(32, EQ, at(2, 9, 15, 20), 25, 25));
     b.close(&mut a);
+    assert_eq!(b.vol(31, FNO, TfIndex::S1, at(2, 9, 15, 20)), Some(25));
+    assert_eq!(b.vol(32, EQ, TfIndex::S1, at(2, 9, 15, 20)), Some(0));
+    // The 09:15 minute holds the cumulative either way (2026-10-09).
     assert_eq!(b.vol(31, FNO, TfIndex::M1, at(2, 9, 15, 20)), Some(25));
-    assert_eq!(b.vol(32, EQ, TfIndex::M1, at(2, 9, 15, 20)), Some(0));
+    assert_eq!(b.vol(32, EQ, TfIndex::M1, at(2, 9, 15, 20)), Some(25));
 }
 
 #[test]
@@ -412,9 +449,14 @@ fn u32_and_receipt_extremes() {
     b.push(&mut a, &trade(51, FNO, at(1, 9, 15, 3), 20, 20));
     b.close(&mut a);
     assert_eq!(
-        b.vol(51, FNO, TfIndex::M1, at(1, 9, 15, 3)),
+        b.vol(51, FNO, TfIndex::S1, at(1, 9, 15, 3)),
         Some(0),
         "pinned future proof: seeds"
+    );
+    assert_eq!(
+        b.vol(51, FNO, TfIndex::M1, at(1, 9, 15, 3)),
+        Some(20),
+        "the 09:15 minute holds the cumulative (2026-10-09)"
     );
     for (p, tr) in [
         (u32::MAX, u32::MAX),
@@ -464,12 +506,15 @@ fn replay_records_no_proof() {
     assert!(a.lookup(Feed::Dhan, 71, FNO).is_none());
     let _ = a.finish_replay(false, |_, _, _, _, _| {});
     let mut b = Bars::default();
-    // 70: no live proof -> seeds. 71: live proof at 09:15:00 -> lands.
+    // 70: no live proof -> its 1-second bar seeds. 71: live proof at
+    // 09:15:00 -> lands. The 09:15 minute holds both (2026-10-09).
     b.push(&mut a, &tk(71, FNO, 0, 0.0, 0, 0, at(1, 9, 15, 0)));
     b.push(&mut a, &trade(70, FNO, at(1, 9, 15, 5), 30, 30));
     b.push(&mut a, &trade(71, FNO, at(1, 9, 15, 5), 30, 30));
     b.close(&mut a);
-    assert_eq!(b.vol(70, FNO, TfIndex::M1, at(1, 9, 15, 5)), Some(0));
+    assert_eq!(b.vol(70, FNO, TfIndex::S1, at(1, 9, 15, 5)), Some(0));
+    assert_eq!(b.vol(71, FNO, TfIndex::S1, at(1, 9, 15, 5)), Some(30));
+    assert_eq!(b.vol(70, FNO, TfIndex::M1, at(1, 9, 15, 5)), Some(30));
     assert_eq!(b.vol(71, FNO, TfIndex::M1, at(1, 9, 15, 5)), Some(30));
 }
 
@@ -508,9 +553,14 @@ fn proof_slots_can_push_a_trading_key_into_exhaustion() {
     assert_eq!(a.slots_exhausted_total(), 1);
     b.close(&mut a);
     assert_eq!(
-        b.vol(7, FNO, TfIndex::M1, at(1, 9, 15, 5)),
+        b.vol(7, FNO, TfIndex::S1, at(1, 9, 15, 5)),
         Some(0),
         "late proof: seeds"
+    );
+    assert_eq!(
+        b.vol(7, FNO, TfIndex::M1, at(1, 9, 15, 5)),
+        Some(44),
+        "the 09:15 minute holds the cumulative (2026-10-09)"
     );
 }
 

@@ -1874,7 +1874,7 @@ fn widen_range_to_include(state: &mut LiveCandleState, price: f64) {
 /// # Complexity
 /// O(1) — one remainder, one bucket alignment, one compare.
 #[inline]
-fn is_days_first_session_bucket(tf: TfIndex, bucket_start: u32) -> bool {
+pub(crate) fn is_days_first_session_bucket(tf: TfIndex, bucket_start: u32) -> bool {
     let day_start = bucket_start - (bucket_start % 86_400);
     // `saturating_add`, not `+` (2026-08-25). The release profile is
     // `overflow-checks = true, panic = "abort"`, so an overflowing add here

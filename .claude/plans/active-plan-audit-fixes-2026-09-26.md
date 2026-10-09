@@ -3002,3 +3002,44 @@ Status of the rest, so the next session does not re-audit:
   `.github/workflows/ci.yml`. Tests: a_take_racing_a_new_request_never_tears_loses_or_duplicates,
   a_pending_request_is_never_overwritten_by_a_later_one,
   a_racing_take_never_reads_a_torn_id_and_segment_pair.
+
+### Added 2026-10-09 (ADANIENT 09:15 volume mismatch)
+
+- [x] **V1 — The day's first trade fills every bar that holds 09:15.** Reported 2026-10-09 by
+  the owner: ADANIENT's 5 s bars from 09:15:05 matched Dhan's chart and the 09:15 1 m bar did
+  not. Cause (Verified in source): Dhan sends a day-cumulative volume, and a slot's first tick
+  only seeds `last_cumulative`, so the volume up to and including the first trade the fold sees
+  reached no bar on any timeframe. In the bucket of each timeframe that holds 09:15
+  (`is_days_first_session_bucket`) that volume is attributable: nothing trades between the
+  pre-open match (~09:08) and 09:15, so it is auction volume plus trades made after 09:15, all
+  inside that bucket, whatever packets were lost. Those buckets now open on
+  `first_session_bucket_baseline` instead of the seed; every later bucket keeps the seed, so a
+  lost packet can never pour volume into a later bar. Only on a live seed in a process that was
+  listening before the open (no replay, no pending gap, not a mid-session boot). Derivatives:
+  baseline 0. Equities: baseline 0 when `FIRST_BAR_INCLUDES_PRE_OPEN_AUCTION` is `true` (the
+  default, "Match Dhan"), otherwise the auction volume read from a live pre-open trade packet
+  (`InstrumentSlot::pre_open_auction_volume`, same slot budget as the PR58 proof, cleared at the
+  day reset), and the seed when none was received. Other segments: the seed. Cost: one mask test
+  per timeframe per tick; O(`TF_COUNT`) once on a seeding tick; no allocation.
+  Files: `crates/trading/src/candles/multi_tf_aggregator.rs`,
+  `crates/trading/src/candles/aggregator_cell.rs`. Tests:
+  test_regression_the_days_first_trade_fills_every_bar_holding_0915,
+  the_first_bar_rule_never_reaches_a_bucket_after_the_one_holding_0915,
+  a_boot_after_the_open_keeps_the_seed_and_an_early_boot_does_not,
+  a_replay_or_a_segment_without_a_clean_first_bar_keeps_the_seed,
+  opening_only_counts_the_first_bar_from_the_recorded_auction,
+  a_replayed_auction_packet_is_not_recorded, the_day_reset_clears_the_auction_volume,
+  first_session_bucket_baseline_by_segment_and_choice (bite-checked: 10 tests fail without
+  the fix). Seven older tests now pin the new 09:15 volumes, each in both choices where it
+  matters.
+  - **Reverses, under the default, the PR58 review's "an equity auction is never poured into
+    the open bar".** `test_regression_an_equity_auction_is_never_poured_into_the_open_bar` keeps
+    that behaviour for the opening-only choice and pins 50,400 for the default.
+  - **Blocks merge:** the owner's pick on the "Match Dhan / Opening only" card, and, for Match
+    Dhan, a dated owner quote recorded in `websocket-connection-scope-lock.md` first, since its
+    2026-10-05 (SECOND) REJECT row forbids folding pre-open into 09:15 under that quote. Whether
+    Dhan's own 09:15 bar includes the auction is Assumed, not checked against a stored row.
+  - Honest limits: when the day's first packet arrives after a 1/3/5 s bucket that holds 09:15
+    has passed, that volume is in no 1/3/5 s bar (the short bucket holding the first packet
+    starts after 09:15 and seeds), so the 5 s bars of 09:15 can sum to less than the 1 m bar.
+    A `false` choice that received no auction packet seeds the first bar as before.

@@ -68,7 +68,9 @@ use tickvault_common::constants::{
 use tickvault_common::feed::Feed;
 use tickvault_common::tick_types::ParsedTick;
 
-use crate::candles::aggregator_cell::{AggregatorCell, ConsumeOutcome, FeedStrategy, TickPrices};
+use crate::candles::aggregator_cell::{
+    AggregatorCell, ConsumeOutcome, FeedStrategy, TickPrices, is_days_first_session_bucket,
+};
 use crate::candles::tf_index::{
     CANDLE_SESSION_OPEN_SECS_OF_DAY_IST, MARKET_CLOSE_SECS_OF_DAY_IST, fold_clock_ist_secs,
 };
@@ -150,6 +152,67 @@ pub const FOLD_FUTURE_TRADE_TIME_SKEW_SECS: i64 = 60;
 /// it may be extended to the 09:15 open, because nothing trades in between;
 /// an earlier one may not, since the pre-open match can trade after it.
 pub const PRE_OPEN_MATCH_DONE_SECS_OF_DAY_IST: u32 = 33_120;
+
+/// Whether an equity's FIRST session bar (the bucket of each timeframe that
+/// holds 09:15) counts the pre-open auction volume (2026-10-09, ADANIENT).
+///
+/// `true` puts the auction volume in the 09:15 bar, which is how the broker's
+/// own chart is believed to show it (Assumed: not yet checked against a
+/// stored row). `false` counts only the trades from 09:15 on, and then the
+/// first bar takes the day's volume only when the auction volume is known
+/// (see [`first_session_bucket_baseline`]). The operator chooses; flipping
+/// this one value is the whole switch.
+pub const FIRST_BAR_INCLUDES_PRE_OPEN_AUCTION: bool = true;
+
+/// `InstrumentSlot::pre_open_auction_volume` before any pre-open trade packet
+/// was received for the key today.
+const AUCTION_VOLUME_UNKNOWN: u64 = u64::MAX;
+
+/// The volume baseline the day's first trade may open the FIRST session
+/// bucket of a timeframe with, or `None` to seed as before (2026-10-09).
+///
+/// Dhan sends a day-cumulative volume, not per-trade volume. Until this
+/// existed, the first trade the fold saw only seeded the baseline, so every
+/// trade before it and in it reached no bar: the 09:15 bar of every stock was
+/// short (measured on ADANIENT, 2026-10-09: the 5 s bars from 09:15:05 on
+/// matched the broker's chart, the 1 m 09:15 bar did not). In the bucket that
+/// holds 09:15, though, the day's cumulative is fully attributable: nothing
+/// trades between the pre-open match (~09:08) and 09:15, so every unit of it
+/// is either auction volume or a trade made between 09:15 and this one, and
+/// all of those belong to this bucket. That holds whatever packets were lost
+/// before this one; it is why only the day's first session bucket is ever
+/// given more than the seed, and a later bucket (whose start may come after
+/// a lost trade) never is.
+/// - derivative segments: `Some(0)`; they have no pre-open session since
+///   futures left the subscription (2026-09-18).
+/// - equity segments: `Some(0)` when `include_auction`; otherwise the auction
+///   volume read from a live pre-open trade packet, and `None` when no such
+///   packet was received. "Not traded" is never inferred from a proof here:
+///   a reader that stalled can take a proof after the match while the
+///   match packet itself was lost (review 2026-10-01), and the auction would
+///   then land in the bar this choice keeps it out of.
+/// - every other segment: `None`. Indices carry no volume, and currency and
+///   commodity trade from 09:00, so their cumulative at the first trade can
+///   hold trades from before the first bucket.
+///
+/// O(1), no allocation, no panic on any input.
+#[must_use]
+fn first_session_bucket_baseline(
+    segment_code: u8,
+    include_auction: bool,
+    auction_volume: u64,
+) -> Option<u64> {
+    if segment_code == EXCHANGE_SEGMENT_NSE_FNO || segment_code == EXCHANGE_SEGMENT_BSE_FNO {
+        return Some(0);
+    }
+    if segment_code != EXCHANGE_SEGMENT_NSE_EQ && segment_code != EXCHANGE_SEGMENT_BSE_EQ {
+        return None;
+    }
+    if include_auction {
+        return Some(0);
+    }
+    (auction_volume != AUCTION_VOLUME_UNKNOWN).then_some(auction_volume)
+}
 
 /// The share of the slot table an "untraded today" proof may NOT create a slot
 /// in (audit PR58): the last 1/20 of it. At the 25,000 ceiling that keeps
@@ -324,6 +387,14 @@ struct InstrumentSlot {
     /// one trade, whatever was lost. Anything else seeds as before, which can
     /// under-report a bar but never over-report one.
     ///
+    /// **Changed 2026-10-09 (ADANIENT 09:15 volume):** on a live seed, every
+    /// bucket that holds 09:15 now opens on `first_session_bucket_baseline`
+    /// instead (0 for options; for an equity, 0 when the first bar includes
+    /// the pre-open auction, the default, else the recorded auction volume).
+    /// So this proof now decides only the buckets AFTER the one holding
+    /// 09:15, and an equity's auction in its 09:15 bars is intended under
+    /// that default, not the defect described above.
+    ///
     /// Honest limits: (1) the first bar's net direction is null, since the
     /// day's first trade has no earlier price to classify it against; (2) a
     /// first trade made of two fills between two packets, or larger than the
@@ -337,6 +408,13 @@ struct InstrumentSlot {
     /// of every contract was missing from its first bar. Cleared with the
     /// seed at the day reset.
     untraded_proof_ist_secs: u32,
+    /// The day-cumulative volume of the latest pre-open trade packet received
+    /// live today (the equity auction match), or [`AUCTION_VOLUME_UNKNOWN`].
+    /// Recorded only when the first bar excludes the auction
+    /// ([`FIRST_BAR_INCLUDES_PRE_OPEN_AUCTION`] `false`), and read once, when
+    /// the slot seeds (see [`first_session_bucket_baseline`]). Cleared at
+    /// the day reset.
+    pre_open_auction_volume: u64,
     /// Replay-gap bookkeeping (plan ITEM 47, 2026-09-29). Bit
     /// `tf.as_ordinal()` set = the OPEN bucket of that timeframe may be
     /// missing ticks that a gapped WAL replay skipped, so it is PARTIAL.
@@ -703,6 +781,9 @@ pub struct MultiTfAggregator {
     /// mode. Since review round 19 the test is whether the bucket STARTED by
     /// then, since one that straddles it may be missing downtime trades.
     live_capture_from_secs: u32,
+    /// [`FIRST_BAR_INCLUDES_PRE_OPEN_AUCTION`], held per aggregator so a test
+    /// can run both choices.
+    first_bar_includes_auction: bool,
     /// The latest frame the replay folded, IST seconds: its receipt, or its
     /// trade second when a frame carries none. It stands for when the
     /// previous process stopped capturing, so [`Self::finish_replay`] can tell
@@ -934,6 +1015,7 @@ impl MultiTfAggregator {
             replay_gap_epoch: 0,
             replay_suppressed_total: 0,
             live_capture_from_secs: 0,
+            first_bar_includes_auction: FIRST_BAR_INCLUDES_PRE_OPEN_AUCTION,
             replay_last_frame_secs: 0,
             capture_start_provisional: false,
             catch_up_margin_secs: DEFAULT_CATCH_UP_MARGIN_SECS,
@@ -1160,18 +1242,62 @@ impl MultiTfAggregator {
     /// O(1): one hash probe, plus one push into the pre-sized slot table on
     /// first sight.
     fn record_untraded_proof(&mut self, key: CompositeKey, received_at_nanos: i64) {
+        let Some((idx, proof)) = self.live_proof_slot(key, received_at_nanos) else {
+            return;
+        };
+        if let Some(slot) = self.slots.get_mut(idx)
+            && !slot.volume_baseline_seeded
+        {
+            slot.untraded_proof_ist_secs = slot.untraded_proof_ist_secs.max(proof);
+        }
+    }
+
+    /// Record the day-cumulative volume of a live pre-open trade packet (an
+    /// equity's auction match) for `key`, when the first bar excludes the
+    /// auction (2026-10-09; see [`first_session_bucket_baseline`]). Same
+    /// gates and slot budget as [`Self::record_untraded_proof`]; only ever
+    /// moves up. O(1).
+    fn record_pre_open_auction(
+        &mut self,
+        key: CompositeKey,
+        received_at_nanos: i64,
+        cumulative: u64,
+    ) {
+        if self.first_bar_includes_auction {
+            return;
+        }
+        let Some((idx, _)) = self.live_proof_slot(key, received_at_nanos) else {
+            return;
+        };
+        if let Some(slot) = self.slots.get_mut(idx)
+            && !slot.volume_baseline_seeded
+        {
+            slot.pre_open_auction_volume = if slot.pre_open_auction_volume == AUCTION_VOLUME_UNKNOWN
+            {
+                cumulative
+            } else {
+                slot.pre_open_auction_volume.max(cumulative)
+            };
+        }
+    }
+
+    /// The slot a live proof for `key` may be kept on, with the proof's IST
+    /// receipt second, or `None` (see [`Self::record_untraded_proof`]).
+    fn live_proof_slot(
+        &mut self,
+        key: CompositeKey,
+        received_at_nanos: i64,
+    ) -> Option<(usize, u32)> {
         // Never during a WAL replay (review 2026-10-01): a proof-created slot
         // is unseeded at the hand-over, `finish_replay` gives it the hand-over
         // gap, and its first live trade then withholds the first bar of every
         // timeframe. The live connect snapshot proves the key again.
         if self.replay_mode {
-            return;
+            return None;
         }
-        let Some(proof) = receipt_ist_secs_of(received_at_nanos) else {
-            return;
-        };
+        let proof = receipt_ist_secs_of(received_at_nanos)?;
         if proof / 86_400 < self.watermark_secs / 86_400 {
-            return;
+            return None;
         }
         let idx = if let Some(&idx) = self.index.get(&key) {
             Some(idx as usize)
@@ -1180,17 +1306,13 @@ impl MultiTfAggregator {
             let proof_ceiling =
                 capacity.saturating_sub(capacity / UNTRADED_PROOF_SLOT_RESERVE_DIVISOR);
             if self.slots.len() >= proof_ceiling {
-                return;
+                return None;
             }
             // Below the ceiling, so `slot_index` creates the slot and never
             // reaches its exhaustion arm.
             self.slot_index(key)
         };
-        if let Some(slot) = idx.and_then(|idx| self.slots.get_mut(idx))
-            && !slot.volume_baseline_seeded
-        {
-            slot.untraded_proof_ist_secs = slot.untraded_proof_ist_secs.max(proof);
-        }
+        idx.map(|idx| (idx, proof))
     }
 
     /// Resolves a composite identity to its dense slot, allocating on first
@@ -1308,6 +1430,7 @@ impl MultiTfAggregator {
             // this slot folds replaces it with a real observation.
             volume_baseline_seeded: false,
             untraded_proof_ist_secs: 0,
+            pre_open_auction_volume: AUCTION_VOLUME_UNKNOWN,
             // A new slot's first buckets are partial in every mode: the tick
             // that opens them seeds the baseline and adds none of its own
             // volume, and during a replay the frames before it may have been
@@ -1888,6 +2011,18 @@ impl MultiTfAggregator {
         let out_of_session = secs_of_day < CANDLE_SESSION_OPEN_SECS_OF_DAY_IST
             || secs_of_day >= MARKET_CLOSE_SECS_OF_DAY_IST;
         if out_of_session {
+            // An equity's pre-open trade packet carries the auction volume
+            // (2026-10-09). Kept only when the first bar excludes it.
+            if secs_of_day < CANDLE_SESSION_OPEN_SECS_OF_DAY_IST
+                && (tick.exchange_segment_code == EXCHANGE_SEGMENT_NSE_EQ
+                    || tick.exchange_segment_code == EXCHANGE_SEGMENT_BSE_EQ)
+            {
+                self.record_pre_open_auction(
+                    (feed, tick.security_id, tick.exchange_segment_code),
+                    tick.received_at_nanos,
+                    cumulative_volume_override.unwrap_or_else(|| u64::from(tick.volume)),
+                );
+            }
             return ConsumeStats {
                 out_of_session: true,
                 ..ConsumeStats::default()
@@ -2103,6 +2238,35 @@ impl MultiTfAggregator {
             }
         }
         let baseline = slot.last_cumulative;
+        // THE DAY'S FIRST SESSION BAR (2026-10-09, ADANIENT). The seed above
+        // leaves every trade up to and including this one out of every bar.
+        // In the bucket of each timeframe that holds 09:15 that volume is
+        // attributable (see `first_session_bucket_baseline`), so those buckets
+        // open on `first_base` instead. Only on a live seed in a process that
+        // was listening before the open: a replay, a pending gap or a
+        // mid-session boot keep the seed, since their first bars are withheld
+        // or rebuilt by the rules above. O(TF_COUNT) on a seeding tick only;
+        // every other tick pays one mask test per timeframe.
+        let mut first_base = baseline;
+        let mut first_bucket_mask: u16 = 0;
+        if seeded_now
+            && !replay_mode
+            && !gap_now
+            && !capture_is_mid_session(live_from, fold_secs)
+            && let Some(base) = first_session_bucket_baseline(
+                tick.exchange_segment_code,
+                self.first_bar_includes_auction,
+                slot.pre_open_auction_volume,
+            )
+            && base < baseline
+        {
+            first_base = base;
+            for tf in TfIndex::ALL {
+                if is_days_first_session_bucket(tf, tf.bucket_start(fold_secs)) {
+                    first_bucket_mask |= replay_tf_bit(tf);
+                }
+            }
+        }
         let mut stats = ConsumeStats::default();
 
         // `prices` was widened above the price gate — ONCE per tick, not once
@@ -2429,11 +2593,19 @@ impl MultiTfAggregator {
                     Released::Nothing => {}
                 }
             }
+            // The day's first session bucket of this timeframe opens on
+            // `first_base` and takes this tick's whole delta, whose side is
+            // unknown (the day's first trade has no earlier price).
+            let (tf_baseline, tf_signed) = if first_bucket_mask & replay_tf_bit(tf) != 0 {
+                (first_base, None)
+            } else {
+                (baseline, signed_tick_volume)
+            };
             match slot.cell.consume_tick_with_extremes(
                 tf,
                 tick,
                 prices,
-                baseline,
+                tf_baseline,
                 strategy,
                 cumulative_volume,
                 extremes,
@@ -2441,7 +2613,7 @@ impl MultiTfAggregator {
                 // `Some(signed_tick_volume)`, which made every live bar
                 // "classified" by construction and left the fold's own `None`
                 // arm dead code.
-                signed_tick_volume,
+                tf_signed,
                 // Derived ONCE at :748, above this loop — the same hoisting
                 // contract as `prices` and `cumulative_volume`. Passing it
                 // down rather than recomputing it saves 48 conversions per
@@ -2778,6 +2950,7 @@ impl MultiTfAggregator {
             slot.last_cumulative = 0;
             slot.volume_baseline_seeded = false;
             slot.untraded_proof_ist_secs = 0;
+            slot.pre_open_auction_volume = AUCTION_VOLUME_UNKNOWN;
             // Nothing carries across the day boundary, so neither does a
             // late tick's mark on the next bucket (review round 7), nor a
             // hand-over still waiting for this instrument's first live trade:
@@ -2999,6 +3172,13 @@ impl MultiTfAggregator {
             }
         }
         (emitted, end)
+    }
+
+    /// Test-only: run the other first-bar auction choice
+    /// ([`FIRST_BAR_INCLUDES_PRE_OPEN_AUCTION`]).
+    #[cfg(test)]
+    fn set_first_bar_includes_auction_for_test(&mut self, on: bool) {
+        self.first_bar_includes_auction = on;
     }
 
     /// Turns WAL-replay mode on or off (plan ITEM 47).
@@ -4281,8 +4461,9 @@ mod tests {
                 minutes.insert(st.bucket_start_ist_secs, st.volume);
             }
         });
-        // max-10 seeds; +5, +9 across the wrap, +2.
-        assert_eq!(minutes.get(&OPEN), Some(&16));
+        // The 09:15 minute holds the day's first trade's whole cumulative
+        // (max-10, 2026-10-09 ADANIENT fix), then +5, +9 across the wrap, +2.
+        assert_eq!(minutes.get(&OPEN), Some(&(u64::from(max) - 10 + 16)));
         assert_eq!(minutes.get(&(OPEN + 60)), Some(&7));
         assert_eq!(minutes.get(&(OPEN + 120)), Some(&8));
 
@@ -6365,8 +6546,19 @@ mod tests {
                 .any(|(tf, start, _)| *tf == TfIndex::S1 && *start == OPEN + 300),
             "live mode still emits the bar the re-seeding tick opened"
         );
+        // The bars holding 09:15 carry the day's first 1,010 (the volume
+        // traded up to the first packet belongs to the opening bar, 2026-10-09
+        // ADANIENT fix); every other bar carries at most the 110 after the
+        // gap. None carries the skipped span's 733,406.
         assert!(
-            live.iter().all(|(_, _, v)| v.abs() <= 110),
+            live.iter().all(|(tf, start, v)| {
+                let bound = if is_days_first_session_bucket(*tf, *start) {
+                    1_010
+                } else {
+                    110
+                };
+                v.abs() <= bound
+            }),
             "and it never carries the skipped span: {live:?}"
         );
     }
@@ -7837,7 +8029,10 @@ mod tests {
             "no receipt, no proof and no slot"
         );
         let _ = push(&mut agg, &live(OPEN + 4, 9.0, 75, OPEN + 4));
-        assert_eq!(bar_volume(&agg, TfIndex::M1), 0);
+        // No proof, so the 1-second bar seeds as before PR58. The 09:15
+        // minute holds the whole first cumulative regardless (2026-10-09).
+        assert_eq!(bar_volume(&agg, TfIndex::S1), 0);
+        assert_eq!(bar_volume(&agg, TfIndex::M1), 75);
     }
 
     #[test]
@@ -7896,22 +8091,33 @@ mod tests {
     fn test_regression_an_equity_auction_is_never_poured_into_the_open_bar() {
         // Review 2026-10-01: a reader that stalled read a stale snapshot at
         // 09:12:30, after the 09:08 auction (50,000) whose packet was missed.
-        // The first trade we fold carries 50,400 against its own 400, so it
-        // seeds instead of writing 50,400 into every 09:15 bar.
-        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
-        let eq = EXCHANGE_SEGMENT_NSE_EQ;
-        let _ = push(
-            &mut agg,
-            &live_seg(eq, OPEN - 86_400 + 22_000, 500.0, 9_000, OPEN - 150),
-        );
-        let mut t = live_seg(eq, OPEN + 2, 501.0, 50_400, OPEN + 2);
-        t.last_trade_quantity = 400;
-        let _ = push(&mut agg, &t);
-        assert_eq!(
-            agg.snapshot(Feed::Dhan, FIRST_SID, eq, TfIndex::M1)
-                .map_or(u64::MAX, |st| st.volume),
-            0
-        );
+        // The first trade we fold carries 50,400 against its own 400. With the
+        // opening bars excluding the auction, nothing proves how much of the
+        // 50,400 is the auction, so the trade seeds instead of writing 50,400
+        // into every 09:15 bar. The 1-second bar seeds in both modes.
+        //
+        // 2026-10-09 (ADANIENT): with the opening bars INCLUDING the auction
+        // (the default, `FIRST_BAR_INCLUDES_PRE_OPEN_AUCTION`), the whole
+        // 50,400 belongs to the bars holding 09:15, which is exactly what an
+        // uninterrupted run writes there.
+        for (include_auction, minute) in [(false, 0_u64), (true, 50_400)] {
+            let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+            agg.set_first_bar_includes_auction_for_test(include_auction);
+            let eq = EXCHANGE_SEGMENT_NSE_EQ;
+            let _ = push(
+                &mut agg,
+                &live_seg(eq, OPEN - 86_400 + 22_000, 500.0, 9_000, OPEN - 150),
+            );
+            let mut t = live_seg(eq, OPEN + 2, 501.0, 50_400, OPEN + 2);
+            t.last_trade_quantity = 400;
+            let _ = push(&mut agg, &t);
+            let volume = |tf| {
+                agg.snapshot(Feed::Dhan, FIRST_SID, eq, tf)
+                    .map_or(u64::MAX, |st| st.volume)
+            };
+            assert_eq!(volume(TfIndex::M1), minute, "include={include_auction}");
+            assert_eq!(volume(TfIndex::S1), 0, "include={include_auction}");
+        }
     }
 
     #[test]
@@ -7964,34 +8170,253 @@ mod tests {
         assert!(zero_time_priced.untraded_timestamp);
         assert!(!agg.index.contains_key(&key));
         let _ = push(&mut agg, &live(OPEN + 4, 9.0, 75, OPEN + 4));
-        assert_eq!(bar_volume(&agg, TfIndex::M1), 0);
+        // No proof: the 1-second bar seeds; the 09:15 minute holds the first
+        // cumulative regardless (2026-10-09).
+        assert_eq!(bar_volume(&agg, TfIndex::S1), 0);
+        assert_eq!(bar_volume(&agg, TfIndex::M1), 75);
     }
 
     #[test]
     fn an_equity_whose_pre_open_match_packet_was_lost_still_seeds() {
         // An equity's 09:05 snapshot proves no trade yet, but the 09:08
         // pre-open match can trade after it. If that packet is lost, the first
-        // accepted trade at 09:15:02 carries the match volume, which must not
-        // land in the 09:15 bar. It seeds, as before PR58.
+        // accepted trade at 09:15:02 carries the match volume. With the
+        // opening bars excluding the auction, it must not land in the 09:15
+        // bar: it seeds, as before PR58. With them including the auction
+        // (the default since 2026-10-09), all 40,000 belong to that bar.
         const EQ: u8 = 1;
+        for (include_auction, minute) in [(false, 0_u64), (true, 40_000)] {
+            let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+            agg.set_first_bar_includes_auction_for_test(include_auction);
+            let stale = push(
+                &mut agg,
+                &live_seg(
+                    EQ,
+                    OPEN - 86_400 + 22_000,
+                    810.0,
+                    900_000,
+                    CANDLE_OPEN + 300,
+                ),
+            );
+            assert!(stale.stale_trading_day);
+            let _ = push(&mut agg, &live_seg(EQ, OPEN + 2, 812.0, 40_000, OPEN + 2));
+            assert_eq!(
+                agg.snapshot(Feed::Dhan, FIRST_SID, EQ, TfIndex::M1)
+                    .map_or(u64::MAX, |st| st.volume),
+                minute,
+                "include={include_auction}"
+            );
+        }
+    }
+
+    /// Every timeframe's open-bar volume for `(FIRST_SID, seg)`, in
+    /// ordinal order; `u64::MAX` where no bar is open.
+    fn volumes_by_tf(agg: &MultiTfAggregator, seg: u8) -> [u64; TF_COUNT] {
+        let mut out = [u64::MAX; TF_COUNT];
+        for tf in TfIndex::ALL {
+            out[tf.as_ordinal()] = agg
+                .snapshot(Feed::Dhan, FIRST_SID, seg, tf)
+                .map_or(u64::MAX, |st| st.volume);
+        }
+        out
+    }
+
+    /// The volume each timeframe's bar must hold after the day's first trade
+    /// at `ts` with day cumulative `cum`: all of it in the bucket holding
+    /// 09:15, none in any other (2026-10-09).
+    fn expected_first_trade_volumes(ts: u32, cum: u64) -> [u64; TF_COUNT] {
+        let mut out = [0; TF_COUNT];
+        for tf in TfIndex::ALL {
+            if is_days_first_session_bucket(tf, tf.bucket_start(ts)) {
+                out[tf.as_ordinal()] = cum;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn test_regression_the_days_first_trade_fills_every_bar_holding_0915() {
+        // 2026-10-09 (ADANIENT): the 5 s bars from 09:15:05 on matched the
+        // broker's chart and the 09:15 minute did not. The first trade the
+        // fold saw only seeded the baseline, so its volume, and every trade
+        // before it, reached no bar. BITE PROOF: without the first-bar
+        // baseline every bar below reads 0.
+        for (seg, cum) in [(2_u8, 650_u32), (EXCHANGE_SEGMENT_NSE_EQ, 40_000)] {
+            let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+            let _ = push(&mut agg, &live_seg(seg, OPEN + 2, 13.0, cum, OPEN + 2));
+            let got = volumes_by_tf(&agg, seg);
+            assert_eq!(
+                got,
+                expected_first_trade_volumes(OPEN + 2, u64::from(cum)),
+                "segment {seg}"
+            );
+            let at = |tf: TfIndex| got[tf.as_ordinal()];
+            assert_eq!(at(TfIndex::M1), u64::from(cum), "the 09:15 minute");
+            assert_eq!(at(TfIndex::S5), u64::from(cum), "the 09:15:00 5 s bar");
+            assert_eq!(at(TfIndex::M60), u64::from(cum), "the 09:00 hour");
+            // 09:15:02 opens a 1-second bucket of its own, after 09:15:00.
+            assert_eq!(at(TfIndex::S1), 0, "a later 1-second bucket seeds");
+            // The next trade counts only its own quantity.
+            let _ = push(
+                &mut agg,
+                &live_seg(seg, OPEN + 3, 13.05, cum + 50, OPEN + 3),
+            );
+            let after = volumes_by_tf(&agg, seg);
+            assert_eq!(after[TfIndex::M1.as_ordinal()], u64::from(cum) + 50);
+            assert_eq!(after[TfIndex::S1.as_ordinal()], 50);
+        }
+    }
+
+    #[test]
+    fn the_first_bar_rule_never_reaches_a_bucket_after_the_one_holding_0915() {
+        // First trade at 09:30: every trade since 09:15 lies in the 09:00
+        // hour, so that bar takes the day cumulative; the 09:30 minute and the
+        // 09:30 quarter hour start after 09:15 and seed.
         let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
-        let stale = push(
+        let _ = push(&mut agg, &live(OPEN + 900, 13.0, 5_000, OPEN + 900));
+        let got = volumes_by_tf(&agg, 2);
+        assert_eq!(got, expected_first_trade_volumes(OPEN + 900, 5_000));
+        assert_eq!(got[TfIndex::M1.as_ordinal()], 0);
+        assert_eq!(got[TfIndex::M15.as_ordinal()], 0);
+        assert_eq!(got[TfIndex::M60.as_ordinal()], 5_000);
+    }
+
+    #[test]
+    fn a_boot_after_the_open_keeps_the_seed_and_an_early_boot_does_not() {
+        // A process that began listening at 09:25 cannot tell what traded
+        // before it, so the 09:00 hour seeds as before. A boot at 08:30
+        // listened through the open, so the hour holds the day cumulative.
+        for (capture, hour) in [(OPEN + 600, 0_u64), (CANDLE_OPEN - 1_800, 5_000)] {
+            let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+            agg.set_live_capture_start(capture);
+            let _ = push(&mut agg, &live(OPEN + 700, 13.0, 5_000, OPEN + 700));
+            let got = volumes_by_tf(&agg, 2);
+            assert_eq!(got[TfIndex::M60.as_ordinal()], hour, "capture {capture}");
+            assert_eq!(got[TfIndex::M1.as_ordinal()], 0, "capture {capture}");
+        }
+    }
+
+    #[test]
+    fn a_replay_or_a_segment_without_a_clean_first_bar_keeps_the_seed() {
+        // A WAL replay rebuilds its first bars by the replay rules.
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        agg.set_replay_mode(true);
+        let _ = push(&mut agg, &live(OPEN + 2, 13.0, 650, OPEN + 2));
+        assert_eq!(bar_volume(&agg, TfIndex::M1), 0, "replay");
+        // Currency and commodity trade from 09:00, so their cumulative at the
+        // first fold can hold trades from before 09:15; indices and unknown
+        // segments get no first-bar volume either.
+        for seg in [0_u8, 3, 5, 7, 9, u8::MAX] {
+            let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+            let _ = push(&mut agg, &live_seg(seg, OPEN + 2, 13.0, 650, OPEN + 2));
+            let m1 = agg
+                .snapshot(Feed::Dhan, FIRST_SID, seg, TfIndex::M1)
+                .map_or(0, |st| st.volume);
+            assert_eq!(m1, 0, "segment {seg}");
+        }
+    }
+
+    #[test]
+    fn opening_only_counts_the_first_bar_from_the_recorded_auction() {
+        let eq = EXCHANGE_SEGMENT_NSE_EQ;
+        let key = (Feed::Dhan, FIRST_SID, eq);
+        for include_auction in [false, true] {
+            let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+            agg.set_first_bar_includes_auction_for_test(include_auction);
+            // The 09:08 auction match, received live, then an older copy.
+            let auction = push(
+                &mut agg,
+                &live_seg(eq, CANDLE_OPEN + 480, 800.0, 50_000, CANDLE_OPEN + 485),
+            );
+            assert!(auction.out_of_session);
+            let _ = push(
+                &mut agg,
+                &live_seg(eq, CANDLE_OPEN + 470, 800.0, 49_000, CANDLE_OPEN + 490),
+            );
+            let recorded = agg
+                .index
+                .get(&key)
+                .map(|&idx| agg.slots[idx as usize].pre_open_auction_volume);
+            if include_auction {
+                assert_eq!(recorded, None, "nothing kept when the bar includes it");
+            } else {
+                assert_eq!(recorded, Some(50_000), "only ever moves up");
+            }
+            let _ = push(&mut agg, &live_seg(eq, OPEN + 2, 801.0, 50_400, OPEN + 2));
+            let got = volumes_by_tf(&agg, eq);
+            let first = if include_auction { 50_400 } else { 400 };
+            assert_eq!(
+                got[TfIndex::M1.as_ordinal()],
+                first,
+                "include={include_auction}"
+            );
+            assert_eq!(got[TfIndex::S5.as_ordinal()], first);
+            assert_eq!(got[TfIndex::S1.as_ordinal()], 0);
+        }
+    }
+
+    #[test]
+    fn a_replayed_auction_packet_is_not_recorded() {
+        let eq = EXCHANGE_SEGMENT_NSE_EQ;
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        agg.set_first_bar_includes_auction_for_test(false);
+        agg.set_replay_mode(true);
+        let _ = push(
             &mut agg,
-            &live_seg(
-                EQ,
-                OPEN - 86_400 + 22_000,
-                810.0,
-                900_000,
-                CANDLE_OPEN + 300,
-            ),
+            &live_seg(eq, CANDLE_OPEN + 480, 800.0, 50_000, CANDLE_OPEN + 485),
         );
-        assert!(stale.stale_trading_day);
-        let _ = push(&mut agg, &live_seg(EQ, OPEN + 2, 812.0, 40_000, OPEN + 2));
+        assert!(!agg.index.contains_key(&(Feed::Dhan, FIRST_SID, eq)));
+    }
+
+    #[test]
+    fn the_day_reset_clears_the_auction_volume() {
+        let eq = EXCHANGE_SEGMENT_NSE_EQ;
+        let key = (Feed::Dhan, FIRST_SID, eq);
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        agg.set_first_bar_includes_auction_for_test(false);
+        let _ = push(
+            &mut agg,
+            &live_seg(eq, CANDLE_OPEN + 480, 800.0, 50_000, CANDLE_OPEN + 485),
+        );
         assert_eq!(
-            agg.snapshot(Feed::Dhan, FIRST_SID, EQ, TfIndex::M1)
-                .map_or(u64::MAX, |st| st.volume),
-            0
+            agg.slots[agg.index[&key] as usize].pre_open_auction_volume,
+            50_000
         );
+        let _ = agg.force_seal_all(|_, _, _, _, _| {});
+        let idx = agg.slot_index(key).expect("slot");
+        assert_eq!(
+            agg.slots[idx].pre_open_auction_volume,
+            AUCTION_VOLUME_UNKNOWN
+        );
+    }
+
+    #[test]
+    fn first_session_bucket_baseline_by_segment_and_choice() {
+        let unknown = AUCTION_VOLUME_UNKNOWN;
+        for include in [false, true] {
+            for auction in [unknown, 0, 50_000, u64::MAX - 1] {
+                // Derivatives have no pre-open session: always the whole day.
+                for seg in [EXCHANGE_SEGMENT_NSE_FNO, EXCHANGE_SEGMENT_BSE_FNO] {
+                    assert_eq!(
+                        first_session_bucket_baseline(seg, include, auction),
+                        Some(0)
+                    );
+                }
+                for seg in [EXCHANGE_SEGMENT_NSE_EQ, EXCHANGE_SEGMENT_BSE_EQ] {
+                    let want = if include {
+                        Some(0)
+                    } else if auction == unknown {
+                        None
+                    } else {
+                        Some(auction)
+                    };
+                    assert_eq!(first_session_bucket_baseline(seg, include, auction), want);
+                }
+                for seg in [0_u8, 3, 5, 7, 6, 9, u8::MAX] {
+                    assert_eq!(first_session_bucket_baseline(seg, include, auction), None);
+                }
+            }
+        }
     }
 
     #[test]
@@ -8016,9 +8441,11 @@ mod tests {
         );
         assert!(sentinel.untraded_sentinel);
         assert!(!agg.index.contains_key(&(Feed::Dhan, FIRST_SID, 2)));
-        // So today's first trade seeds.
+        // So today's first trade seeds its 1-second bar. The 09:15 minute
+        // holds the whole first cumulative regardless (2026-10-09).
         let _ = push(&mut agg, &live(OPEN + 20, 13.0, 650, OPEN + 20));
-        assert_eq!(bar_volume(&agg, TfIndex::M1), 0);
+        assert_eq!(bar_volume(&agg, TfIndex::S1), 0);
+        assert_eq!(bar_volume(&agg, TfIndex::M1), 650);
     }
 
     #[test]
