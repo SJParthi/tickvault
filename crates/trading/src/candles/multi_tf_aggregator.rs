@@ -1263,7 +1263,11 @@ impl MultiTfAggregator {
         received_at_nanos: i64,
         cumulative: u64,
     ) {
-        if self.first_bar_includes_auction {
+        // A pre-open packet before the match carries a day cumulative of 0.
+        // That says "no match yet", not "the auction matched nothing": if the
+        // match packet is then lost, a recorded 0 would pour the auction into
+        // the 09:15 bars this choice leaves it out of. Unknown seeds instead.
+        if self.first_bar_includes_auction || cumulative == 0 {
             return;
         }
         let Some((idx, _)) = self.live_proof_slot(key, received_at_nanos) else {
@@ -8353,6 +8357,29 @@ mod tests {
             assert_eq!(got[TfIndex::S5.as_ordinal()], first);
             assert_eq!(got[TfIndex::S1.as_ordinal()], 0);
         }
+    }
+
+    /// Review 2026-10-09: a pre-open packet before the match carries a day
+    /// cumulative of 0. If the match packet is then lost, that 0 must read as
+    /// "auction unknown" (the first trade seeds), never as "the auction matched
+    /// nothing", which would pour the auction into the 09:15 bars this choice
+    /// leaves it out of.
+    #[test]
+    fn a_pre_match_zero_is_not_taken_as_a_known_auction() {
+        let eq = EXCHANGE_SEGMENT_NSE_EQ;
+        let key = (Feed::Dhan, FIRST_SID, eq);
+        let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+        agg.set_first_bar_includes_auction_for_test(false);
+        let _ = push(
+            &mut agg,
+            &live_seg(eq, CANDLE_OPEN + 120, 800.0, 0, CANDLE_OPEN + 125),
+        );
+        assert!(!agg.index.contains_key(&key), "a zero records nothing");
+        // The 09:08 match packet is lost; the first trade carries the auction.
+        let _ = push(&mut agg, &live_seg(eq, OPEN + 2, 801.0, 50_400, OPEN + 2));
+        let got = volumes_by_tf(&agg, eq);
+        assert_eq!(got[TfIndex::M1.as_ordinal()], 0, "seeds, never 50,400");
+        assert_eq!(got[TfIndex::S5.as_ordinal()], 0);
     }
 
     #[test]
