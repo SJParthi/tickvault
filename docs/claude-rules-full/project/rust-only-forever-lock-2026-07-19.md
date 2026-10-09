@@ -1097,3 +1097,9 @@ exception then ends.
 raising the row's ceiling; keeping the workflow after 2026-10-12 IST;
 widening its delete scope beyond Quote 29; adding a schedule or push trigger
 to it; any S3 delete or IAM change under cover of it.
+
+**ENDED 2026-10-09.** The job ran once that day after the close: a report-only
+pass at 16:14 IST, then the delete at 16:16 IST (GitHub runs 37919370600 and
+37919602693). The root volume went from 98% to 81% used. The workflow file and
+its budget row were deleted in the follow-up PR, so this exception authorizes
+nothing further; any new SSM shell needs its own dated section here.
