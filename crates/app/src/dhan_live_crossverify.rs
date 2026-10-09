@@ -49,8 +49,11 @@
 //!   so the operator can SEE what normal looks like;
 //! * keeps `missing_live` / `missing_rest` as their own categories, reported
 //!   but never conflated with real divergence;
-//! * excuses the last two session minutes, which may legitimately be unsealed
-//!   at 15:31 (`tail_unsealed`);
+//! * excuses only the DERIVED end-of-session window
+//!   ([`LATE_SEAL_WINDOW_MINUTES`]) and only under the `Excuse` policy, and an
+//!   excused minute holds the day at `partial`, never `clean`
+//!   (`late_excused`, §12.15.9);
+//! * never lets a failed vendor fetch hide a real divergence (§12.15.9);
 //! * never assumes the live side is correct.
 //!
 //! COLD PATH, once a day, default OFF. Writes ONLY
@@ -63,6 +66,10 @@ use tickvault_storage::dhan_live_crossverify_persistence::{
     DhanLiveXverifyCellFinding, DhanLiveXverifyCellKind, DhanLiveXverifyDailyRow,
     DhanLiveXverifyOutcome,
 };
+
+/// Whether a run could judge minutes missing from our side (§12.15.9). The
+/// wire labels live with the table, in the storage crate.
+pub use tickvault_storage::dhan_live_crossverify_persistence::DhanLiveXverifyMissingJudgeable as MissingJudgeable;
 
 // ---------------------------------------------------------------------------
 // Time constants — every one of these is in an EXPLICIT unit
@@ -140,12 +147,184 @@ const _: () = assert!(
     "the run must be stamped after the last minute it compares"
 );
 
-/// How many trailing session minutes are excused when absent on the LIVE side.
+/// How many trailing session minutes a read may find not yet sealed on the
+/// LIVE side: the end-of-session window the [`LateWindowPolicy::Excuse`]
+/// policy may excuse.
 ///
-/// At 15:31 the 15:29 bucket has only just closed and the 15:28 seal may still
-/// be in flight, so a live-side gap there is EXPECTED, not evidence of loss.
-/// Dhan's REST tape, being a post-hoc query, always has them.
-pub const TAIL_UNSEALED_MINUTES: i64 = 2;
+/// **DERIVED, never a literal (2026-10-06, plan ITEM 51c,
+/// `no-rest-except-live-feed-2026-06-27.md` §12.15.9).** This replaced the
+/// literal `TAIL_UNSEALED_MINUTES = 2`, written for the old 15:31 run. A quiet
+/// instrument's bucket seals only when the catch-up cutoff
+/// (`LiveIngest::catch_up_cutoff`: `min(watermark, wall)` minus
+/// `dhan_feed_stack::CATCHUP_LATENESS_MARGIN_SECS`) reaches the bucket's end.
+/// The watermark is the newest folded TRADE STAMP, so once frames stop at the
+/// close the cutoff stops moving: a read at 15:41 and a read at 17:00 see the
+/// same buckets sealed, and the run time does not enter. With the newest
+/// folded trade at or after 15:39:00 the cutoff is at or after 15:35:00, so
+/// only the 15:35 to 15:39 buckets can still be open; two literal minutes
+/// counted three of them as real loss.
+///
+/// The window is the margin plus [`LAST_FOLDED_TRADE_SLACK_SECS`], in whole
+/// minutes: (240 + 60) / 60 = 5 today. **Assumed, not checked:** it covers
+/// every unsealed bucket only when the feed's newest folded trade stamp is
+/// within that slack of the close. A feed whose stamps stop earlier (sockets
+/// down from 15:38:40, sparse closing stamps) leaves buckets before 15:35
+/// open, and a traded minute missing there reads as real loss until plan
+/// item 51d replaces this window with the published seal progress.
+/// *(Corrected in review 2026-10-06: the first text said the +60 was the
+/// minute between the close and the run, and asserted that at compile time.
+/// That dependency does not exist.)*
+pub const LATE_SEAL_WINDOW_MINUTES: i64 = (crate::dhan_feed_stack::CATCHUP_LATENESS_MARGIN_SECS
+    + LAST_FOLDED_TRADE_SLACK_SECS)
+    .div_ceil(60) as i64;
+
+/// How far before the close the feed's newest folded trade stamp may stop
+/// and [`LATE_SEAL_WINDOW_MINUTES`] still cover every bucket the catch-up
+/// seal has left open at the read (§12.15.9). **Assumed:** nothing measures
+/// or checks the closing stamps against it.
+const LAST_FOLDED_TRADE_SLACK_SECS: u32 = 60;
+
+const _: () = assert!(
+    LATE_SEAL_WINDOW_MINUTES * SECS_PER_MINUTE
+        >= crate::dhan_feed_stack::CATCHUP_LATENESS_MARGIN_SECS as i64
+            + LAST_FOLDED_TRADE_SLACK_SECS as i64,
+    "the late window must cover the catch-up margin plus the assumed last-trade slack"
+);
+const _: () = assert!(
+    LATE_SEAL_WINDOW_MINUTES > 0
+        && LATE_SEAL_WINDOW_MINUTES * SECS_PER_MINUTE
+            < SESSION_CLOSE_SECS_OF_DAY_IST - SESSION_OPEN_SECS_OF_DAY_IST,
+    "the late window must be a non-empty tail of the session, never all of it"
+);
+
+/// How a comparison treats a traded or index minute missing from our side
+/// inside the end-of-session window (§12.15.9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LateWindowPolicy {
+    /// The live side is known final: nothing is excused, and a minute missing
+    /// at 15:39 is real loss exactly like one missing at 10:00.
+    Strict,
+    /// The live side may not have sealed its last buckets yet. `None`
+    /// excuses the last [`LATE_SEAL_WINDOW_MINUTES`] session minutes;
+    /// `Some(t)` excuses every session bucket that ends after `t` (seconds of
+    /// the IST day). An excused minute is never real and holds the day at
+    /// `partial` at best.
+    Excuse {
+        sealed_through_secs_of_day: Option<i64>,
+    },
+}
+
+impl LateWindowPolicy {
+    /// The production policy until plan item 51d publishes the real seal
+    /// progress: excuse the derived window.
+    pub const DERIVED_WINDOW: Self = Self::Excuse {
+        sealed_through_secs_of_day: None,
+    };
+}
+
+/// Everything about a run, other than the bars themselves, that decides how
+/// its comparison is judged (§12.15.9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VerdictInputs {
+    /// The run budget ran out, or at least one vendor fetch failed. A target
+    /// with no vendor bars can add only `missing_rest`, so this never turns
+    /// missing-minute judging off and never hides a real finding; it only
+    /// keeps the day from reading `clean`.
+    pub rest_incomplete: bool,
+    /// Whether minutes missing from our side can be judged at all.
+    pub missing: MissingJudgeable,
+    /// Which end-of-session minutes are excused.
+    pub late: LateWindowPolicy,
+}
+
+/// The production mapping from what a run observed to how its comparison is
+/// judged. Pure, O(1).
+///
+/// Only the truncated live read turns judging off: it reads
+/// `ORDER BY ts ASC LIMIT`, so the cap cuts the END of the day and every
+/// minute after the cut would otherwise read as lost.
+///
+/// It is the one such input this run can detect, not the only one that can
+/// fake a missing live minute: until plan item 51d, a sealed bar not yet
+/// readable at the read (queued, spilled, or not yet applied by QuestDB's
+/// WAL) and a live row [`parse_live_dataset`] skips as malformed each read as
+/// a judged missing minute anywhere in the day, and the day reads `diverged`
+/// (§12.15.9 Honest limits).
+#[must_use]
+pub fn verdict_inputs_for_run(
+    budget_elapsed: bool,
+    rest_failures: usize,
+    live_truncated: bool,
+) -> VerdictInputs {
+    VerdictInputs {
+        rest_incomplete: budget_elapsed || rest_failures > 0,
+        missing: if live_truncated {
+            MissingJudgeable::LiveTruncated
+        } else {
+            MissingJudgeable::Judged
+        },
+        late: LateWindowPolicy::DERIVED_WINDOW,
+    }
+}
+
+/// The counts the day's outcome depends on, gathered by the comparison.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VerdictCounts {
+    pub minutes_compared: i64,
+    /// Rows existed on at least one side.
+    pub rows_seen: bool,
+    pub cells_diverged: i64,
+    /// Judged, unexcused minutes missing from our side that Dhan shows traded.
+    pub missing_live_traded: i64,
+    /// Judged, unexcused minutes missing from our side on an index.
+    pub missing_live_index: i64,
+    pub missing_rest: i64,
+    pub late_excused: i64,
+    pub missing_live_unjudged: i64,
+}
+
+/// The day's outcome (§12.15.9). Pure, total, O(1).
+///
+/// | Something compared | Real finding | Otherwise incomplete, unjudged, excused or a REST hole | Outcome |
+/// |---|---|---|---|
+/// | yes | yes | any | `diverged` |
+/// | yes | no | yes | `partial` |
+/// | yes | no | no | `clean` |
+/// | no | - | `rest_incomplete` or not judged | `degraded` |
+/// | no | - | otherwise, rows seen | `blind` |
+/// | no | - | otherwise | `no_data` |
+///
+/// A real finding is `cells_diverged > 0`, or a judged traded or index minute
+/// missing from our side. No input ever turns `diverged` into anything else:
+/// the fault this replaced checked a failed fetch BEFORE the real finding.
+#[must_use]
+pub fn decide_outcome(c: &VerdictCounts, inputs: VerdictInputs) -> DhanLiveXverifyOutcome {
+    let judged = inputs.missing.is_judged();
+    if c.minutes_compared > 0 {
+        let real = c.cells_diverged > 0
+            || (judged && (c.missing_live_traded > 0 || c.missing_live_index > 0));
+        if real {
+            DhanLiveXverifyOutcome::Diverged
+        } else if inputs.rest_incomplete
+            || !judged
+            || c.missing_rest > 0
+            || c.late_excused > 0
+            || c.missing_live_unjudged > 0
+        {
+            DhanLiveXverifyOutcome::Partial
+        } else {
+            DhanLiveXverifyOutcome::Clean
+        }
+    } else if inputs.rest_incomplete || !judged {
+        DhanLiveXverifyOutcome::Degraded
+    } else if c.rows_seen {
+        // Rows existed on at least one side yet nothing overlapped. THIS is
+        // the state the year-58502 window produced on every single run.
+        DhanLiveXverifyOutcome::Blind
+    } else {
+        DhanLiveXverifyOutcome::NoData
+    }
+}
 
 /// Minutes in the COMPARED session window, derived from this module's own two
 /// bounds so the row cap below can never disagree with the window the
@@ -178,13 +357,16 @@ pub const SESSION_MINUTES: usize =
 ///
 /// Stated as a coverage promise rather than left implicit in a row count: at
 /// or below this many instruments the live read is complete, and above it the
-/// run reports `partial`. Today's live universe is ~868 distinct instruments
+/// run judges no missing minute and holds a would-be `clean` at `partial` (a
+/// price difference still reads `diverged`, §12.15.9). Today's live universe is ~868 distinct instruments
 /// (~119 NSE indices + ~750 NTM constituents), so this carries better than 2×
 /// headroom.
 pub const LIVE_COVERED_INSTRUMENTS: usize = 2_000;
 
-/// Row cap for the live-side `/exec` read. Beyond it the run is stamped
-/// `partial` rather than silently comparing a truncated day.
+/// Row cap for the live-side `/exec` read. Beyond it the run judges no
+/// missing minute and holds a would-be `clean` at `partial` rather than
+/// silently comparing a truncated day; a price difference still reads
+/// `diverged` (§12.15.9).
 ///
 /// **Derived, not a round number (2026-08-25).** This was the literal
 /// `200_000`, which at today's ~868 instruments covers `200_000 / 868 ≈ 230`
@@ -199,7 +381,7 @@ pub const LIVE_COVERED_INSTRUMENTS: usize = 2_000;
 /// is 25,000, which would need `25_000 × 385 ≈ 9.6M` rows in one response —
 /// not a cap raise but a paginated or per-instrument read, i.e. a design
 /// change. Until then a universe past [`LIVE_COVERED_INSTRUMENTS`] verifies
-/// its morning and says `partial`. Stated here so the next widening does not
+/// its morning and says `partial` (or `diverged` on a price difference). Stated here so the next widening does not
 /// discover it from a puzzling verdict.
 pub const LIVE_ROW_LIMIT: usize = LIVE_COVERED_INSTRUMENTS * SESSION_MINUTES;
 
@@ -306,8 +488,9 @@ pub struct DhanLiveCrossverifyConfig {
     /// run — strictly worse than the partial verdict it replaced.
     #[serde(default = "default_live_read_timeout_secs")]
     pub live_read_timeout_secs: u64,
-    /// Whole-run wall-clock budget (seconds). On elapse the run is stamped
-    /// `partial` / `degraded` — never a fabricated clean verdict.
+    /// Whole-run wall-clock budget (seconds). On elapse a would-be `clean`
+    /// is held at `partial` (`degraded` when nothing was compared) — never a
+    /// fabricated clean verdict; a `diverged` verdict is unchanged (§12.15.9).
     #[serde(default = "default_run_budget_secs")]
     pub run_budget_secs: u64,
 }
@@ -431,22 +614,42 @@ pub fn secs_of_day(minute_ts_ist_nanos: i64, day_start_ist_nanos: i64) -> i64 {
         .div_euclid(NANOS_PER_SEC)
 }
 
-/// `true` when the bucket lies inside `[09:15, 15:30)` IST. Pure.
+/// `true` when the bucket lies inside `[09:15, 15:40)` IST (`[SESSION_OPEN,
+/// SESSION_CLOSE)`, the close derived from `TICK_PERSIST_END_SECS_OF_DAY_IST`).
+/// Pure.
 #[must_use]
 pub fn is_in_session(minute_ts_ist_nanos: i64, day_start_ist_nanos: i64) -> bool {
     let s = secs_of_day(minute_ts_ist_nanos, day_start_ist_nanos);
     (SESSION_OPEN_SECS_OF_DAY_IST..SESSION_CLOSE_SECS_OF_DAY_IST).contains(&s)
 }
 
-/// `true` when the bucket is one of the trailing [`TAIL_UNSEALED_MINUTES`]
-/// session minutes — the buckets a 15:31 run may legitimately find unsealed on
-/// the live side. Pure.
+/// `true` when the session bucket lies in the end-of-session window a read
+/// may find not yet sealed on the live side (§12.15.9). Pure, O(1).
+///
+/// * `sealed_through_secs_of_day = Some(t)`: every session bucket that ENDS
+///   after `t` (seconds of the IST day) — a bucket ending at or before `t`
+///   has had its chance to seal.
+/// * `None`: the last [`LATE_SEAL_WINDOW_MINUTES`] session buckets.
+///
+/// A bucket at or after the close is never in the window: it is not a
+/// session minute and is classified `out_of_session` before this is asked.
 #[must_use]
-pub fn is_tail_minute(minute_ts_ist_nanos: i64, day_start_ist_nanos: i64) -> bool {
+pub fn is_late_window_minute(
+    minute_ts_ist_nanos: i64,
+    day_start_ist_nanos: i64,
+    sealed_through_secs_of_day: Option<i64>,
+) -> bool {
     let s = secs_of_day(minute_ts_ist_nanos, day_start_ist_nanos);
-    let first_tail =
-        SESSION_CLOSE_SECS_OF_DAY_IST.saturating_sub(TAIL_UNSEALED_MINUTES * SECS_PER_MINUTE);
-    (first_tail..SESSION_CLOSE_SECS_OF_DAY_IST).contains(&s)
+    if s >= SESSION_CLOSE_SECS_OF_DAY_IST {
+        return false;
+    }
+    match sealed_through_secs_of_day {
+        Some(sealed_through) => s.saturating_add(SECS_PER_MINUTE) > sealed_through,
+        None => {
+            s >= SESSION_CLOSE_SECS_OF_DAY_IST
+                .saturating_sub(LATE_SEAL_WINDOW_MINUTES * SECS_PER_MINUTE)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -695,11 +898,12 @@ pub struct DayComparison {
     ///
     /// # What this split does NOT decide
     ///
-    /// It is a MEASUREMENT, not a verdict. The `outcome` logic is unchanged:
-    /// `missing_live` in total still counts as a real divergence, because
-    /// narrowing that to the traded half would be a behaviour change resting
-    /// on an assumption about vendor tape-filling that nothing here has
-    /// verified.
+    /// It is a MEASUREMENT, not a verdict. *(Corrected 2026-10-06, §12.15.9:
+    /// this said `missing_live` in total still counts as a real divergence.
+    /// Since 2026-09-29 only a judged, not-excused traded or index minute
+    /// decides the verdict (`decide_outcome`); zero-volume minutes stay
+    /// counted and persisted as `missing_live_zero_volume` and decide
+    /// nothing.)*
     ///
     /// **It says nothing at all for `IDX_I`.** An index has no volume by
     /// construction, so every index bar lands in the zero bucket regardless
@@ -712,8 +916,28 @@ pub struct DayComparison {
     /// not mean — in particular that it is uninformative for `IDX_I`.
     pub missing_live_zero_volume: i64,
     pub missing_rest: i64,
+    /// The old literal two-minute tail. **Written 0 since 2026-10-06
+    /// (§12.15.9)**; kept so the daily table's column keeps its meaning for
+    /// the rows written before. Excused minutes are [`Self::late_excused`].
     pub tail_unsealed: i64,
     pub out_of_session: i64,
+    /// Traded or index minutes missing from our side that fall in the
+    /// end-of-session window, whatever the policy and whether or not they
+    /// were judged. Under `Strict` the window is the derived one
+    /// ([`LATE_SEAL_WINDOW_MINUTES`]). A measurement: plan item 51d reads it
+    /// to tell a read that may have been early from a final one.
+    pub missing_live_late: i64,
+    /// Traded or index minutes missing from our side that the `Excuse` policy
+    /// excused (cell kind `late_excused`). Never real; any one holds the day
+    /// at `partial` at best. Never also counted in `missing_live`.
+    pub late_excused: i64,
+    /// Traded or index minutes missing from our side on a run that could not
+    /// judge them (cell kind `missing_live_unjudged`). Never real; any one
+    /// holds the day at `partial` at best. Never also counted in
+    /// `missing_live` or `late_excused`.
+    pub missing_live_unjudged: i64,
+    /// Whether missing minutes were judged on this run, and if not, why.
+    pub missing_judgeable: MissingJudgeable,
     /// Median divergence magnitude in paise — what NORMAL looks like.
     pub noise_p50_paise: i64,
     pub noise_p95_paise: i64,
@@ -782,9 +1006,11 @@ fn percentile(sorted: &[i64], p: f64) -> i64 {
 
 /// Compare one day of our LIVE capture against Dhan's official REST tape.
 ///
-/// Pure and total — no I/O, no panics. `degraded` marks that a leg failed or
-/// truncated upstream, which downgrades a would-be `Clean`/`Diverged` verdict
-/// to `Partial` (never up).
+/// Pure and total — no I/O, no panics. `inputs` says whether a REST leg was
+/// incomplete, whether missing minutes can be judged, and which end-of-session
+/// minutes are excused; [`decide_outcome`] turns the counts into the verdict.
+/// Since 2026-10-06 (§12.15.9) an incomplete leg can hold a would-be `Clean`
+/// at `Partial` but can never touch `Diverged`.
 ///
 /// Classification:
 ///
@@ -792,9 +1018,10 @@ fn percentile(sorted: &[i64], p: f64) -> i64 {
 /// |---|---|---|
 /// | both sides, field differs > tolerance | `diverged` | **yes** |
 /// | REST has it, live doesn't (mid-session) | `missing_live` | **yes** — the closest proxy we have for packet loss |
-/// | REST has it, live doesn't (last 2 min) | `tail_unsealed` | no — expected at 15:31 |
+/// | REST has it, live doesn't, traded or index, late window, `Excuse` | `late_excused` | no — may be unsealed at the read; holds the day at `partial` |
+/// | REST has it, live doesn't, traded or index, live read truncated | `missing_live_unjudged` | no — cannot be told from an unread minute; holds the day at `partial` |
 /// | live has it, REST doesn't | `missing_rest` | **no** — the REST tape is sparse by construction; reported as `Partial`, never `Clean`, never `Diverged` |
-/// | either side outside `[09:15, 15:30)` | `out_of_session` | no |
+/// | either side outside `[09:15, 15:40)` | `out_of_session` | no |
 #[must_use]
 /// Compares one day's live capture against the vendor's own tape.
 ///
@@ -824,7 +1051,7 @@ pub fn compare_day_in_scope(
     day_start_ist_nanos: i64,
     run_ts_ist_nanos: i64,
     tolerance_paise: i64,
-    degraded: bool,
+    inputs: VerdictInputs,
 ) -> DayComparison {
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -873,9 +1100,23 @@ pub fn compare_day_in_scope(
     let mut missing_live_traded: i64 = 0;
     let mut missing_live_zero_volume: i64 = 0;
     let mut missing_rest: i64 = 0;
-    let mut tail_unsealed: i64 = 0;
+    // Written 0 since 2026-10-06 (§12.15.9): see `DayComparison::tail_unsealed`.
+    let tail_unsealed: i64 = 0;
+    let mut missing_live_late: i64 = 0;
+    let mut late_excused: i64 = 0;
+    let mut missing_live_unjudged: i64 = 0;
     // Missing minutes on an index — always real (see the missing arm).
     let mut missing_live_index: i64 = 0;
+    let judged = inputs.missing.is_judged();
+    // Which window is "late", and whether a late minute is excused. Under
+    // `Strict` the derived window is still MEASURED (`missing_live_late`),
+    // never excused.
+    let (late_bound, excuse_late) = match inputs.late {
+        LateWindowPolicy::Strict => (None, false),
+        LateWindowPolicy::Excuse {
+            sealed_through_secs_of_day,
+        } => (sealed_through_secs_of_day, true),
+    };
     let session_open_minute = day_start_ist_nanos
         .saturating_add(SESSION_OPEN_SECS_OF_DAY_IST.saturating_mul(NANOS_PER_SEC));
 
@@ -951,12 +1192,34 @@ pub fn compare_day_in_scope(
                 }
             }
             (None, Some(r)) => {
-                // In Dhan's own tape but absent from our live capture. The
-                // trailing minutes get an amnesty — at 15:31 they may simply
-                // not have sealed yet.
-                let kind = if is_tail_minute(minute, day_start_ist_nanos) {
-                    tail_unsealed = tail_unsealed.saturating_add(1);
-                    DhanLiveXverifyCellKind::TailUnsealed
+                // In Dhan's own tape but absent from our live capture.
+                //
+                // A minute is a REAL candidate only when Dhan shows a trade
+                // or it is an index (an index has no volume and ticks every
+                // second). A zero-volume equity minute is never real, in or
+                // out of the window, and keeps its old classification below.
+                //
+                // A real candidate is then, in order (§12.15.9):
+                // - not judged (the live read was cut short) →
+                //   `missing_live_unjudged`: it cannot be told from a minute
+                //   the read never reached. Checked first, so an unjudged
+                //   minute is never also counted as excused;
+                // - in the end-of-session window under `Excuse` →
+                //   `late_excused`: it may not have sealed by the read;
+                // - otherwise → `missing_live`, real.
+                let is_index = segment == INDEX_SEGMENT;
+                let real_candidate = r.bar.volume > 0 || is_index;
+                let late = real_candidate
+                    && is_late_window_minute(minute, day_start_ist_nanos, late_bound);
+                if late {
+                    missing_live_late = missing_live_late.saturating_add(1);
+                }
+                let kind = if real_candidate && !judged {
+                    missing_live_unjudged = missing_live_unjudged.saturating_add(1);
+                    DhanLiveXverifyCellKind::MissingLiveUnjudged
+                } else if late && excuse_late {
+                    late_excused = late_excused.saturating_add(1);
+                    DhanLiveXverifyCellKind::LateExcused
                 } else {
                     missing_live = missing_live.saturating_add(1);
                     // Split the one number that could not be acted on. See
@@ -971,7 +1234,7 @@ pub fn compare_day_in_scope(
                     // An index carries no volume, so the traded/untraded
                     // split says nothing about it — and it ticks every
                     // second, so a minute it is missing IS lost data.
-                    if segment == INDEX_SEGMENT {
+                    if is_index {
                         missing_live_index = missing_live_index.saturating_add(1);
                     }
                     DhanLiveXverifyCellKind::MissingLive
@@ -1028,60 +1291,59 @@ pub fn compare_day_in_scope(
     // that compared nothing lands on Blind / NoData / Degraded — every one of
     // which `is_pass() == false`. This is the structural answer to the
     // predecessor's blind-since-birth failure.
-    let outcome = if minutes_compared > 0 {
-        // The asymmetry here is deliberate and was WRONG until 2026-08-25.
-        //
-        // `missing_live` (REST has the minute, we don't) is the closest proxy
-        // this system has for packet loss on our own feed. It stays a real
-        // divergence.
-        //
-        // `missing_rest` (we have the minute, the vendor's REST tape doesn't)
-        // is NOT evidence against the live feed. The REST tape is sparse by
-        // construction — it publishes a candle where trading happened — so an
-        // illiquid strike that we correctly recorded shows up here through no
-        // fault of ours. Counting it as divergence made a vendor-side hole
-        // read as a live-feed failure, and inflated the one signal this lane
-        // exists to produce.
-        //
-        // This module's own header has always said `missing_rest` is
-        // "reported but never conflated with real divergence". The
-        // classification table below it said the opposite, and the code
-        // followed the table. The header was right.
-        //
-        // It is NOT silenced, and it must never be: a bar we hold for a
-        // minute the exchange never traded could also mean we FABRICATED one
-        // — which is not hypothetical, since the aggregator was proven on
-        // 2026-08-24 to inflate candle volumes 9.2x. So a run whose only
-        // anomaly is `missing_rest` lands on `Partial`, which `is_pass()`
-        // refuses and `is_measured()` accepts: visible, never a pass, and
-        // never crying feed-loss either.
-        //
-        // 2026-09-29: a missing minute counts as real only when Dhan's own
-        // bar shows a trade, or the instrument is an index. Dhan prints a
-        // flat volume-0 bar for a minute nothing traded, and our fold
-        // correctly prints nothing — on 2026-09-28 that was 24,441 of the
-        // 25,534 "missing" option minutes, and it turned the whole day
-        // `diverged`. Those minutes stay counted and persisted
-        // (`missing_live_zero_volume`); they just no longer decide the verdict.
-        let real = cells_diverged > 0 || missing_live_traded > 0 || missing_live_index > 0;
-        if degraded {
-            DhanLiveXverifyOutcome::Partial
-        } else if real {
-            DhanLiveXverifyOutcome::Diverged
-        } else if missing_rest > 0 {
-            DhanLiveXverifyOutcome::Partial
-        } else {
-            DhanLiveXverifyOutcome::Clean
-        }
-    } else if degraded {
-        DhanLiveXverifyOutcome::Degraded
-    } else if rows_seen {
-        // Rows existed on at least one side yet nothing overlapped. THIS is
-        // the state the year-58502 window produced on every single run.
-        DhanLiveXverifyOutcome::Blind
-    } else {
-        DhanLiveXverifyOutcome::NoData
-    };
+    //
+    // The asymmetry here is deliberate and was WRONG until 2026-08-25.
+    //
+    // `missing_live` (REST has the minute, we don't) is the closest proxy
+    // this system has for packet loss on our own feed. It stays a real
+    // divergence.
+    //
+    // `missing_rest` (we have the minute, the vendor's REST tape doesn't)
+    // is NOT evidence against the live feed. The REST tape is sparse by
+    // construction — it publishes a candle where trading happened — so an
+    // illiquid strike that we correctly recorded shows up here through no
+    // fault of ours. Counting it as divergence made a vendor-side hole
+    // read as a live-feed failure, and inflated the one signal this lane
+    // exists to produce.
+    //
+    // This module's own header has always said `missing_rest` is
+    // "reported but never conflated with real divergence". The
+    // classification table below it said the opposite, and the code
+    // followed the table. The header was right.
+    //
+    // It is NOT silenced, and it must never be: a bar we hold for a
+    // minute the exchange never traded could also mean we FABRICATED one
+    // — which is not hypothetical, since the aggregator was proven on
+    // 2026-08-24 to inflate candle volumes 9.2x. So a run whose only
+    // anomaly is `missing_rest` lands on `Partial`, which `is_pass()`
+    // refuses and `is_measured()` accepts: visible, never a pass, and
+    // never crying feed-loss either.
+    //
+    // 2026-09-29: a missing minute counts as real only when Dhan's own
+    // bar shows a trade, or the instrument is an index. Dhan prints a
+    // flat volume-0 bar for a minute nothing traded, and our fold
+    // correctly prints nothing — on 2026-09-28 that was 24,441 of the
+    // 25,534 "missing" option minutes, and it turned the whole day
+    // `diverged`. Those minutes stay counted and persisted
+    // (`missing_live_zero_volume`); they just no longer decide the verdict.
+    //
+    // 2026-10-06 (§12.15.9): the verdict is `decide_outcome`. A failed
+    // fetch or a spent budget can no longer turn a real finding into
+    // `partial` (it was checked first until then), and an excused or
+    // unjudged minute holds the day at `partial`, never `clean`.
+    let outcome = decide_outcome(
+        &VerdictCounts {
+            minutes_compared,
+            rows_seen,
+            cells_diverged,
+            missing_live_traded,
+            missing_live_index,
+            missing_rest,
+            late_excused,
+            missing_live_unjudged,
+        },
+        inputs,
+    );
 
     DayComparison {
         outcome,
@@ -1095,6 +1357,10 @@ pub fn compare_day_in_scope(
         missing_rest,
         tail_unsealed,
         out_of_session,
+        missing_live_late,
+        late_excused,
+        missing_live_unjudged,
+        missing_judgeable: inputs.missing,
         noise_p50_paise,
         noise_p95_paise,
         noise_max_paise,
@@ -1106,6 +1372,34 @@ pub fn compare_day_in_scope(
     }
 }
 
+/// Which attempt wrote a set of audit rows (§12.15.9 review).
+///
+/// Every attempt of a day writes its daily row at the same deterministic `ts`
+/// and the daily DEDUP key includes `outcome`, so an incomplete attempt that is
+/// retried and a retry that reads differently (for example `diverged` while a
+/// sealed bar is still unapplied, then `partial` once it is readable) leave two
+/// rows. `at_ist_nanos` is read ONCE per attempt and written on its daily row
+/// and on every cell it writes, so a reader takes the daily row with the newest
+/// `attempt_at` and that attempt's cells by equality. Not in any DEDUP key.
+///
+/// The equality is exact only when no later attempt wrote cells without its
+/// daily row: cells are flushed before the daily row, so a later attempt that
+/// stops at its deadline after some batches restamps those findings (the cell
+/// DEDUP key has no `attempt_at`) and leaves no daily row to name them. The
+/// §12.15.6 option pass stamps its own cells and writes no daily row, so its
+/// cells never match a daily row's `attempt_at`. An attempt that loses a cell
+/// batch in a failed flush and still writes its daily row leaves the same gap:
+/// `run_complete` does not look at the persist.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AttemptStamp {
+    /// Wall clock when the attempt's persist began, IST nanoseconds.
+    pub at_ist_nanos: i64,
+    /// `run_is_complete` for that attempt: budget not spent, live read not
+    /// truncated, and at most `MAX_MARKER_REST_FAILURE_PERCENT` of the vendor
+    /// fetches failed.
+    pub run_complete: bool,
+}
+
 /// Build the daily audit row from a comparison. Pure.
 #[must_use]
 pub fn daily_row(
@@ -1113,6 +1407,7 @@ pub fn daily_row(
     day_start_ist_nanos: i64,
     run_ts_ist_nanos: i64,
     tolerance_paise: i64,
+    attempt: AttemptStamp,
 ) -> DhanLiveXverifyDailyRow {
     DhanLiveXverifyDailyRow {
         run_ts_ist_nanos,
@@ -1131,6 +1426,11 @@ pub fn daily_row(
         noise_max_paise: cmp.noise_max_paise,
         tolerance_paise,
         outcome: cmp.outcome,
+        late_excused: cmp.late_excused,
+        missing_live_unjudged: cmp.missing_live_unjudged,
+        missing_judgeable: cmp.missing_judgeable,
+        attempt_at_ist_nanos: attempt.at_ist_nanos,
+        run_complete: attempt.run_complete,
     }
 }
 
@@ -1163,7 +1463,7 @@ pub fn format_summary_line(cmp: &DayComparison) -> String {
             "🆘 Dhan live-vs-official check PROVED NOTHING today: {} minute(s) \
              of data existed but NONE lined up, so nothing was actually \
              compared. This is not a pass — the check itself needs attention.",
-            cmp.missing_live + cmp.missing_rest
+            cmp.missing_live + cmp.missing_rest + cmp.late_excused + cmp.missing_live_unjudged
         ),
         DhanLiveXverifyOutcome::NoData => "⚠️ Dhan live-vs-official check found no data on \
              either side today — nothing was compared, so nothing is proven."
@@ -1179,13 +1479,17 @@ pub fn format_summary_line(cmp: &DayComparison) -> String {
         DhanLiveXverifyOutcome::Partial | DhanLiveXverifyOutcome::Diverged => format!(
             "⚠️ Dhan live-vs-official check: {} minute(s) compared, {} price \
              difference(s), {} minute(s) we never received, {} minute(s) only \
-             we had. Typical difference ₹{:.2}, worst ₹{:.2}. Neither side is \
-             the official truth on its own — compare against previous days \
-             before acting.",
+             we had, {} minute(s) not yet judged. Typical difference ₹{:.2}, \
+             worst ₹{:.2}. Neither side is the official truth on its own — \
+             compare against previous days before acting.",
             cmp.minutes_compared,
             cmp.cells_diverged,
             cmp.missing_live,
             cmp.missing_rest,
+            // §12.15.9: excused late minutes and minutes a cut-short read
+            // could not judge; either holds the day at `partial`, so the
+            // line must name them or a partial day reads as all zeros.
+            cmp.late_excused.saturating_add(cmp.missing_live_unjudged),
             rupees(cmp.noise_p50_paise),
             rupees(cmp.noise_max_paise),
         ),
@@ -1525,7 +1829,9 @@ pub struct RunReport {
     /// alone said 815-of-865 without ever saying WHY.
     pub rest_failure_breakdown: RestFailureBreakdown,
     /// `true` when any leg failed, the live read truncated, or the run budget
-    /// elapsed — forces the verdict down to `partial` / `degraded`.
+    /// elapsed. It holds a would-be `clean` at `partial` (or `degraded` when
+    /// nothing was compared) and never changes a `diverged` verdict
+    /// (§12.15.9).
     pub degraded: bool,
     /// Rows skipped as malformed on either side (counted, never coerced).
     pub malformed_rows: usize,
@@ -1819,8 +2125,9 @@ pub fn fetched_at_ist_nanos_now() -> i64 {
 /// Bounded on every axis, and it never blocks anything else: each REST fetch
 /// and the live read carry their own `tokio::time::timeout`; the whole run
 /// stops issuing new fetches once `run_budget_secs` has elapsed (stamping
-/// `budget_elapsed`, which forces the verdict down). A failing leg degrades
-/// the verdict — it never fabricates a clean one.
+/// `budget_elapsed`). A spent budget or a failing leg holds a would-be clean
+/// verdict at `partial` — it never fabricates a clean one and never changes a
+/// `diverged` one (§12.15.9).
 ///
 /// This function is I/O only; every judgement lives in the pure
 /// [`compare_day`], which is what the tests exercise.
@@ -1949,6 +2256,12 @@ pub async fn run_cross_verification(
     }
 
     let degraded = truncated || budget_elapsed || rest_failures > 0;
+    // §12.15.9: a failed fetch or a spent budget only keeps the day from
+    // reading `clean`; a truncated live read alone turns missing-minute
+    // judging off. Neither can hide a real finding. Until 51d, a bar not yet
+    // readable or a row skipped as malformed (`live_malformed`) still reads as
+    // a judged missing minute (§12.15.9 Honest limits).
+    let inputs = verdict_inputs_for_run(budget_elapsed, rest_failures, truncated);
     let run_ts = deterministic_run_ts_nanos(day_start_ist_nanos);
     // The scope set: exactly what this run ASKED the vendor for. A live
     // instrument outside it was never requested, so calling its minutes
@@ -1966,7 +2279,7 @@ pub async fn run_cross_verification(
         day_start_ist_nanos,
         run_ts,
         cfg.tolerance_paise,
-        degraded,
+        inputs,
     );
 
     if rest_failures > 0 {
@@ -2035,8 +2348,19 @@ mod tests {
             day_start_ist_nanos,
             run_ts_ist_nanos,
             tolerance_paise,
-            degraded,
+            strict_inputs(degraded),
         )
+    }
+
+    /// The old single `degraded` flag, read as the 2026-10-06 inputs: an
+    /// incomplete REST leg, every missing minute judged, nothing excused
+    /// (`Strict`). Production judges with [`verdict_inputs_for_run`].
+    fn strict_inputs(rest_incomplete: bool) -> VerdictInputs {
+        VerdictInputs {
+            rest_incomplete,
+            missing: MissingJudgeable::Judged,
+            late: LateWindowPolicy::Strict,
+        }
     }
 
     fn bar(o: f64, h: f64, l: f64, c: f64) -> PaiseBar {
@@ -2054,6 +2378,10 @@ mod tests {
 
     const OPEN: i64 = SESSION_OPEN_SECS_OF_DAY_IST;
     const RUN_TS: i64 = 42;
+    const TEST_ATTEMPT: AttemptStamp = AttemptStamp {
+        at_ist_nanos: 7,
+        run_complete: true,
+    };
 
     // =======================================================================
     // THE #1474 REGRESSION LOCK — the bug that blinded the predecessor
@@ -2551,32 +2879,64 @@ mod tests {
         );
         assert!(!cmp.outcome.is_pass());
     }
-    /// The last two session minutes may legitimately be unsealed at 15:31 —
-    /// recorded, but never counted as loss.
+    /// 2026-10-06 (§12.15.9): the literal two-minute tail is gone. With no
+    /// published seal progress the `Excuse` policy excuses exactly the last
+    /// `LATE_SEAL_WINDOW_MINUTES` session buckets (15:35 to 15:39 today), as
+    /// `late_excused`, never as `missing_live` — and never as a pass.
     #[test]
-    fn is_tail_minute_excuses_trailing_two_minutes_not_counted_as_missing() {
-        let b = bar(100.0, 101.0, 99.0, 100.5);
+    fn is_late_window_minute_with_none_excuses_the_last_window() {
         let close = SESSION_CLOSE_SECS_OF_DAY_IST;
-        // 15:28 and 15:29 present only in Dhan's REST tape.
-        let rest = vec![side(13, close - 120, b), side(13, close - 60, b)];
-        let cmp = compare_day(&[], &rest, DAY_START_NANOS, RUN_TS, 0, false);
-        assert_eq!(cmp.tail_unsealed, 2);
+        let window = LATE_SEAL_WINDOW_MINUTES * 60;
+        let in_window: Vec<i64> = (SESSION_OPEN_SECS_OF_DAY_IST..close + 600)
+            .step_by(60)
+            .filter(|s| is_late_window_minute(minute(*s), DAY_START_NANOS, None))
+            .collect();
+        let expected: Vec<i64> = (close - window..close).step_by(60).collect();
+        assert_eq!(
+            in_window, expected,
+            "exactly the last window, nothing after the close"
+        );
+        assert_eq!(in_window.len(), 5, "15:35 to 15:39 today");
+
+        // Through the comparison: every traded minute of the window, present
+        // only in Dhan's tape, is excused.
+        let b = bar(100.0, 101.0, 99.0, 100.5);
+        let rest: Vec<SideBar> = expected.iter().map(|s| side(13, *s, b)).collect();
+        let cmp = compare_day_in_scope(
+            &[],
+            &rest,
+            &std::collections::BTreeSet::new(),
+            DAY_START_NANOS,
+            RUN_TS,
+            0,
+            excuse_inputs(None),
+        );
+        assert_eq!(cmp.late_excused, 5);
+        assert_eq!(cmp.missing_live_late, 5);
         assert_eq!(
             cmp.missing_live, 0,
-            "unsealed tail minutes must NOT be reported as lost packets"
+            "excused minutes are not reported as lost"
         );
+        assert_eq!(cmp.tail_unsealed, 0, "the old tail column is written 0");
         assert!(
             cmp.findings
                 .iter()
-                .all(|f| f.kind == DhanLiveXverifyCellKind::TailUnsealed)
+                .all(|f| f.kind == DhanLiveXverifyCellKind::LateExcused)
         );
-        // Nothing overlapped, so it is still vacuous — never a pass.
-        assert!(!cmp.outcome.is_pass());
+        assert!(!cmp.outcome.is_pass(), "nothing compared — never a pass");
 
-        // 15:27 is NOT excused — it is a real gap.
-        let rest = vec![side(13, close - 180, b)];
-        let cmp = compare_day(&[], &rest, DAY_START_NANOS, RUN_TS, 0, false);
-        assert_eq!(cmp.tail_unsealed, 0);
+        // 15:34 is NOT excused — it is real loss.
+        let rest = vec![side(13, close - window - 60, b)];
+        let cmp = compare_day_in_scope(
+            &[],
+            &rest,
+            &std::collections::BTreeSet::new(),
+            DAY_START_NANOS,
+            RUN_TS,
+            0,
+            excuse_inputs(None),
+        );
+        assert_eq!(cmp.late_excused, 0);
         assert_eq!(cmp.missing_live, 1);
     }
 
@@ -2620,23 +2980,40 @@ mod tests {
         );
     }
 
-    /// A tail minute is excused BEFORE the split, so it must reach neither half.
-    ///
-    /// Without this the amnesty would leak: an unsealed 15:29 bar would be
-    /// counted as a real gap by `missing_live_traded` while the total that
-    /// excused it stayed at zero — a split that contradicts its own parent.
+    /// An excused late minute is excused BEFORE the traded split, so it must
+    /// reach neither half — under `Excuse`, with or without a sealed-through
+    /// value. (Successor of the tail-amnesty test, 2026-10-06.)
     #[test]
-    fn compare_day_tail_amnesty_reaches_neither_half_of_the_split() {
+    fn the_late_window_reaches_neither_half_of_the_traded_split_under_excuse() {
         let traded = PaiseBar::from_rupees(100.0, 101.0, 99.0, 100.5, 250).expect("finite");
-        // 15:29 — inside the tail amnesty window.
         let rest = vec![side(13, SESSION_CLOSE_SECS_OF_DAY_IST - 60, traded)];
-
-        let cmp = compare_day(&[], &rest, DAY_START_NANOS, RUN_TS, 0, false);
-
-        assert_eq!(cmp.tail_unsealed, 1);
-        assert_eq!(cmp.missing_live, 0);
-        assert_eq!(cmp.missing_live_traded, 0);
-        assert_eq!(cmp.missing_live_zero_volume, 0);
+        for policy in [
+            LateWindowPolicy::Excuse {
+                sealed_through_secs_of_day: None,
+            },
+            LateWindowPolicy::Excuse {
+                sealed_through_secs_of_day: Some(SESSION_CLOSE_SECS_OF_DAY_IST - 300),
+            },
+        ] {
+            let cmp = compare_day_in_scope(
+                &[],
+                &rest,
+                &std::collections::BTreeSet::new(),
+                DAY_START_NANOS,
+                RUN_TS,
+                0,
+                VerdictInputs {
+                    rest_incomplete: false,
+                    missing: MissingJudgeable::Judged,
+                    late: policy,
+                },
+            );
+            assert_eq!(cmp.late_excused, 1, "{policy:?}");
+            assert_eq!(cmp.tail_unsealed, 0);
+            assert_eq!(cmp.missing_live, 0);
+            assert_eq!(cmp.missing_live_traded, 0);
+            assert_eq!(cmp.missing_live_zero_volume, 0);
+        }
     }
 
     #[test]
@@ -2644,7 +3021,7 @@ mod tests {
         let b = bar(100.0, 101.0, 99.0, 100.5);
         let live = vec![
             side(13, OPEN - 60, b),                     // 09:14 — pre-open
-            side(13, SESSION_CLOSE_SECS_OF_DAY_IST, b), // 15:30 — closed
+            side(13, SESSION_CLOSE_SECS_OF_DAY_IST, b), // 15:40 — closed
             side(13, OPEN, b),                          // in session
         ];
         let rest = vec![side(13, OPEN, b)];
@@ -2712,6 +3089,10 @@ mod tests {
         assert_eq!(cmp.outcome, DhanLiveXverifyOutcome::Blind);
     }
 
+    /// 2026-10-06 (§12.15.9): an incomplete REST leg holds a would-be `clean`
+    /// at `partial` and touches nothing else. Before, it was checked FIRST
+    /// and turned a real finding into `partial` too; that half is pinned by
+    /// `a_failed_fetch_no_longer_hides_a_real_divergence`.
     #[test]
     fn compare_day_degraded_downgrades_clean_to_partial_never_up() {
         let b = bar(100.0, 101.0, 99.0, 100.5);
@@ -2721,6 +3102,10 @@ mod tests {
         assert_eq!(cmp.outcome, DhanLiveXverifyOutcome::Partial);
         assert!(!cmp.outcome.is_pass(), "a degraded run is never a pass");
         assert!(cmp.outcome.is_measured(), "but it did compare something");
+        // ...and never UP: the same data with a real difference stays diverged.
+        let rest = vec![side(13, OPEN, bar(100.0, 101.5, 99.0, 100.5))];
+        let cmp = compare_day(&live, &rest, DAY_START_NANOS, RUN_TS, 0, true);
+        assert_eq!(cmp.outcome, DhanLiveXverifyOutcome::Diverged);
     }
 
     // =======================================================================
@@ -3133,8 +3518,22 @@ mod tests {
             0,
             false,
         );
-        let row = daily_row(&cmp, DAY_START_NANOS, RUN_TS, 0);
+        let attempt = AttemptStamp {
+            at_ist_nanos: RUN_TS + 13 * 60 * 1_000_000_000,
+            run_complete: true,
+        };
+        let row = daily_row(&cmp, DAY_START_NANOS, RUN_TS, 0, attempt);
         assert_eq!(row.trading_date_ist_nanos, DAY_START_NANOS);
+        // §12.15.9 review: the attempt stamp rides the row unchanged, and is
+        // distinct from the deterministic `ts` every attempt shares.
+        assert_eq!(row.attempt_at_ist_nanos, attempt.at_ist_nanos);
+        assert_ne!(row.attempt_at_ist_nanos, row.run_ts_ist_nanos);
+        assert!(row.run_complete);
+        let incomplete = AttemptStamp {
+            run_complete: false,
+            ..attempt
+        };
+        assert!(!daily_row(&cmp, DAY_START_NANOS, RUN_TS, 0, incomplete).run_complete);
         assert_eq!(row.run_ts_ist_nanos, RUN_TS);
         assert_eq!(row.minutes_compared, cmp.minutes_compared);
         assert_eq!(row.cells_diverged, cmp.cells_diverged);
@@ -3234,7 +3633,7 @@ mod tests {
         ));
         assert!(
             !is_in_session(minute(SESSION_CLOSE_SECS_OF_DAY_IST), DAY_START_NANOS),
-            "15:30 is excluded — the window is half-open"
+            "15:40 is excluded — the window is half-open"
         );
         assert!(!is_in_session(
             minute(SESSION_CLOSE_SECS_OF_DAY_IST + 3600),
@@ -3370,8 +3769,9 @@ mod tests {
         assert!(!sql.contains(&DAY_START_NANOS.to_string()));
     }
 
-    /// A degraded leg must DEGRADE the verdict, never fabricate a clean one —
-    /// mirrors what `run_cross_verification` passes into `compare_day`.
+    /// A degraded leg holds a would-be clean verdict down, never fabricates a
+    /// clean one, and never changes a diverged one (§12.15.9) — mirrors what
+    /// `run_cross_verification` passes into `compare_day`.
     #[test]
     fn test_run_report_degraded_flag_forces_the_verdict_down() {
         let b = bar(100.0, 101.0, 99.0, 100.5);
@@ -3891,7 +4291,7 @@ mod tests {
             DAY_START_NANOS,
             RUN_TS,
             0,
-            false,
+            strict_inputs(false),
         );
         assert_eq!(
             cmp.missing_rest, 0,
@@ -3920,7 +4320,7 @@ mod tests {
             DAY_START_NANOS,
             RUN_TS,
             0,
-            false,
+            strict_inputs(false),
         );
         assert_eq!(
             cmp.instruments, 1,
@@ -3942,7 +4342,7 @@ mod tests {
             DAY_START_NANOS,
             RUN_TS,
             0,
-            false,
+            strict_inputs(false),
         );
         assert_eq!(
             cmp.missing_rest, 1,
@@ -3963,7 +4363,7 @@ mod tests {
             DAY_START_NANOS,
             RUN_TS,
             0,
-            false,
+            strict_inputs(false),
         );
         assert_eq!(cmp.missing_rest, 1, "an empty scope filters nothing");
     }
@@ -3981,7 +4381,7 @@ mod tests {
             DAY_START_NANOS,
             RUN_TS,
             0,
-            false,
+            strict_inputs(false),
         );
         assert_eq!(
             cmp.instruments, 0,
@@ -3998,7 +4398,15 @@ mod tests {
             live.push(side(id, OPEN, bar(100.0, 101.0, 99.0, 100.5)));
         }
         let scope = scope_of(&[(0, "IDX_I"), (1, "IDX_I"), (2, "IDX_I")]);
-        let cmp = compare_day_in_scope(&live, &[], &scope, DAY_START_NANOS, RUN_TS, 0, false);
+        let cmp = compare_day_in_scope(
+            &live,
+            &[],
+            &scope,
+            DAY_START_NANOS,
+            RUN_TS,
+            0,
+            strict_inputs(false),
+        );
         assert_eq!(
             cmp.missing_rest, 3,
             "3 targeted instruments produce 3 findings — not 200. That ratio \
@@ -4100,5 +4508,723 @@ mod tests {
         let cmp = compare_day(&live, &rest, DAY_START_NANOS, RUN_TS, 0, false);
         assert_eq!(cmp.minutes_compared, 1, "prices are still compared");
         assert_eq!(cmp.volume_cells, 0, "09:15 volume is not scored");
+    }
+    // =======================================================================
+    // 2026-10-06 (plan ITEM 51c, §12.15.9): the verdict and the late window
+    // =======================================================================
+
+    fn excuse_inputs(sealed_through: Option<i64>) -> VerdictInputs {
+        VerdictInputs {
+            rest_incomplete: false,
+            missing: MissingJudgeable::Judged,
+            late: LateWindowPolicy::Excuse {
+                sealed_through_secs_of_day: sealed_through,
+            },
+        }
+    }
+
+    fn eq_bar(sid: i64, secs: i64, volume: i64) -> SideBar {
+        SideBar {
+            security_id: sid,
+            segment: "NSE_EQ".to_string(),
+            minute_ts_ist_nanos: minute(secs),
+            bar: bar_vol(100.0, 101.0, 99.0, 100.5, volume),
+        }
+    }
+
+    fn unscoped(live: &[SideBar], rest: &[SideBar], inputs: VerdictInputs) -> DayComparison {
+        compare_day_in_scope(
+            live,
+            rest,
+            &std::collections::BTreeSet::new(),
+            DAY_START_NANOS,
+            RUN_TS,
+            0,
+            inputs,
+        )
+    }
+
+    /// THE defect, Verified at `145276dad`: `if degraded { Partial } else if
+    /// real { Diverged }`. One failed vendor fetch out of ~868 recorded a day
+    /// with real price differences, or a real lost minute, as `partial`.
+    #[test]
+    fn a_failed_fetch_no_longer_hides_a_real_divergence() {
+        let live = vec![eq_bar(1, OPEN, 500)];
+        // A price difference on a compared minute.
+        let rest_diff = vec![SideBar {
+            bar: bar_vol(100.0, 101.5, 99.0, 100.5, 500),
+            ..eq_bar(1, OPEN, 500)
+        }];
+        // A traded minute missing from our side, mid-session.
+        let rest_lost = vec![eq_bar(1, OPEN, 500), eq_bar(1, OPEN + 600, 300)];
+        for rest in [&rest_diff, &rest_lost] {
+            let cmp = unscoped(&live, rest, verdict_inputs_for_run(false, 1, false));
+            assert_eq!(
+                cmp.outcome,
+                DhanLiveXverifyOutcome::Diverged,
+                "a failed fetch must not hide a real finding"
+            );
+            let cmp = unscoped(&live, rest, verdict_inputs_for_run(true, 0, false));
+            assert_eq!(
+                cmp.outcome,
+                DhanLiveXverifyOutcome::Diverged,
+                "a spent budget must not hide a real finding"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rest_incomplete_run_with_no_finding_is_partial_never_clean() {
+        let live = vec![eq_bar(1, OPEN, 500)];
+        let rest = vec![eq_bar(1, OPEN, 500)];
+        assert_eq!(
+            unscoped(&live, &rest, verdict_inputs_for_run(false, 0, false)).outcome,
+            DhanLiveXverifyOutcome::Clean
+        );
+        for (budget, failures) in [(true, 0), (false, 1), (true, 868)] {
+            let cmp = unscoped(
+                &live,
+                &rest,
+                verdict_inputs_for_run(budget, failures, false),
+            );
+            assert_eq!(cmp.outcome, DhanLiveXverifyOutcome::Partial);
+            assert!(!cmp.outcome.is_pass());
+        }
+    }
+
+    /// §12.15.9 Honest limit, pinned so the rule text cannot drift from the
+    /// code: the truncated read is NOT the only input that fakes a missing
+    /// live minute. A live row the read skips as malformed, and a sealed bar
+    /// absent from the read because it is not yet readable (queued, spilled
+    /// or not yet applied), are each a judged `missing_live` mid-session, and
+    /// the day reads `diverged` even when a vendor fetch failed. If 51d (or
+    /// anything else) stops judging these minutes, this test fails and the
+    /// rule's Honest limits must be amended with it.
+    #[test]
+    fn a_live_bar_unreadable_at_the_read_is_judged_missing_and_diverged_until_51d() {
+        let mid = OPEN + 600;
+        let body = format!(
+            r#"{{"dataset":[
+                [{ts_open},1,"NSE_EQ",100.0,101.0,99.0,100.5,500],
+                [{ts_mid},1,"NSE_EQ",null,101.0,99.0,100.5,300]
+            ]}}"#,
+            ts_open = minute(OPEN),
+            ts_mid = minute(mid)
+        );
+        let (malformed_live, truncated, malformed) = parse_live_dataset(&body, 100).expect("parse");
+        assert!(!truncated);
+        assert_eq!(malformed, 1, "the mid-session row is skipped as malformed");
+        // A bar not yet readable never reaches the read at all.
+        let unapplied_live = vec![eq_bar(1, OPEN, 500)];
+        let rest = vec![eq_bar(1, OPEN, 500), eq_bar(1, mid, 300)];
+
+        for live in [&malformed_live, &unapplied_live] {
+            for (budget, failures) in [(false, 0), (false, 1), (true, 0)] {
+                let inputs = verdict_inputs_for_run(budget, failures, truncated);
+                assert_eq!(inputs.missing, MissingJudgeable::Judged);
+                let cmp = unscoped(live, &rest, inputs);
+                assert_eq!(cmp.missing_live_traded, 1);
+                assert_eq!(cmp.missing_live_unjudged, 0);
+                assert_eq!(cmp.late_excused, 0, "mid-session, outside the window");
+                assert_eq!(
+                    cmp.outcome,
+                    DhanLiveXverifyOutcome::Diverged,
+                    "budget={budget} failures={failures}"
+                );
+            }
+        }
+    }
+
+    /// A read cut at its row cap drops the END of the day, so a missing
+    /// minute cannot be told from an unread one: no missing traded or index
+    /// minute is judged. A price difference on a minute present on both
+    /// sides still is.
+    #[test]
+    fn a_truncated_live_read_never_judges_missing_minutes_but_still_flags_price_divergence() {
+        let inputs = verdict_inputs_for_run(false, 0, true);
+        assert_eq!(inputs.missing, MissingJudgeable::LiveTruncated);
+        let live = vec![eq_bar(1, OPEN, 500)];
+        let rest = vec![
+            eq_bar(1, OPEN, 500),
+            eq_bar(1, OPEN + 600, 300), // traded, mid-session
+            eq_bar(1, OPEN + 660, 0),   // zero-volume equity
+            side(13, OPEN + 600, bar(1.0, 1.0, 1.0, 1.0)), // index
+            eq_bar(1, SESSION_CLOSE_SECS_OF_DAY_IST - 60, 300), // traded, late
+        ];
+        let cmp = unscoped(&live, &rest, inputs);
+        assert_eq!(
+            cmp.missing_live_unjudged, 3,
+            "traded, index and late traded"
+        );
+        assert_eq!(
+            cmp.late_excused, 0,
+            "an unjudged minute is never also excused"
+        );
+        assert_eq!(
+            cmp.missing_live_late, 1,
+            "the late window is still measured"
+        );
+        assert_eq!(cmp.missing_live, 1, "only the zero-volume minute");
+        assert_eq!(cmp.missing_live_zero_volume, 1);
+        assert_eq!(cmp.missing_live_traded, 0);
+        assert_eq!(cmp.missing_judgeable, MissingJudgeable::LiveTruncated);
+        assert_eq!(
+            cmp.findings
+                .iter()
+                .filter(|f| f.kind == DhanLiveXverifyCellKind::MissingLiveUnjudged)
+                .count(),
+            3
+        );
+        assert_eq!(cmp.outcome, DhanLiveXverifyOutcome::Partial);
+
+        // With a price difference on the compared minute: diverged.
+        let live = vec![SideBar {
+            bar: bar_vol(100.0, 102.0, 99.0, 100.5, 500),
+            ..eq_bar(1, OPEN, 500)
+        }];
+        let cmp = unscoped(&live, &rest, inputs);
+        assert_eq!(cmp.outcome, DhanLiveXverifyOutcome::Diverged);
+
+        // Truncated and nothing compared: degraded, as before.
+        let cmp = unscoped(&[], &rest, inputs);
+        assert_eq!(cmp.outcome, DhanLiveXverifyOutcome::Degraded);
+    }
+
+    #[test]
+    fn late_seal_window_minutes_is_derived_from_the_catch_up_margin() {
+        let margin = i64::from(crate::dhan_feed_stack::CATCHUP_LATENESS_MARGIN_SECS);
+        let slack = i64::from(LAST_FOLDED_TRADE_SLACK_SECS);
+        assert_eq!(slack, 60, "the assumed last-trade slack (§12.15.9)");
+        assert_eq!(LATE_SEAL_WINDOW_MINUTES, (margin + slack + 59) / 60);
+        assert_eq!(
+            LATE_SEAL_WINDOW_MINUTES, 5,
+            "240 s margin today: 15:35 to 15:39"
+        );
+        // The margin covers the measured delivery lag; the window covers the
+        // margin plus the slack. The run time is deliberately absent: the
+        // cutoff follows the watermark, not the read.
+        let lag = i64::from(crate::dhan_feed_stack::MEASURED_MAX_DELIVERY_LAG_SECS);
+        assert!(LATE_SEAL_WINDOW_MINUTES * 60 >= lag + slack);
+        // No literal tail count survives in the production half.
+        let src = include_str!("dhan_live_crossverify.rs");
+        let marker = concat!("#[cfg(", "test)]");
+        let production = src.split(marker).next().expect("production half");
+        let old_name = concat!("TAIL_", "UNSEALED_MINUTES");
+        let old_fn = concat!("fn is_", "tail_minute");
+        // Code lines only: the doc comments record the old name as history.
+        let code: Vec<&str> = production
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect();
+        assert!(
+            code.iter().all(|l| !l.contains(old_name)),
+            "the literal tail count must stay deleted"
+        );
+        assert!(code.iter().all(|l| !l.contains(old_fn)));
+        assert!(
+            code.iter()
+                .any(|l| l.contains("CATCHUP_LATENESS_MARGIN_SECS")),
+            "the window is derived from the catch-up margin"
+        );
+        assert!(
+            code.iter()
+                .any(|l| l.contains("+ LAST_FOLDED_TRADE_SLACK_SECS")),
+            "the window adds the named slack, never a bare literal"
+        );
+        assert!(
+            code.iter()
+                .all(|l| !l.contains("RUN_SECS_OF_DAY_IST - SESSION_CLOSE_SECS_OF_DAY_IST")),
+            "the run time must not enter the late window: the cutoff follows the watermark"
+        );
+    }
+
+    /// The window against the real seal rule (§12.15.9 review fix). The
+    /// catch-up cutoff after the close is the newest folded trade stamp `w`
+    /// minus the margin, whatever the read time; a bucket seals when its end
+    /// is at or before the cutoff (`AggregatorCell::would_catch_up_seal`).
+    /// The derived window covers every bucket still open exactly when `w` is
+    /// within `LAST_FOLDED_TRADE_SLACK_SECS` of the close, and not otherwise:
+    /// the 15:38:40 case leaves the 15:34 bucket open and outside the window.
+    #[test]
+    fn late_window_covers_every_unsealed_bucket_only_when_the_last_trade_is_within_the_slack() {
+        let close = SESSION_CLOSE_SECS_OF_DAY_IST;
+        let margin = i64::from(crate::dhan_feed_stack::CATCHUP_LATENESS_MARGIN_SECS);
+        let slack = i64::from(LAST_FOLDED_TRADE_SLACK_SECS);
+        for last_trade in (close - 900)..close {
+            let cutoff = last_trade - margin;
+            let open_buckets_covered = (SESSION_OPEN_SECS_OF_DAY_IST..close)
+                .step_by(60)
+                .filter(|b| b + 60 > cutoff)
+                .all(|b| is_late_window_minute(minute(b), DAY_START_NANOS, None));
+            assert_eq!(
+                open_buckets_covered,
+                last_trade >= close - slack,
+                "newest folded trade at {last_trade}"
+            );
+        }
+        // The finding's scenario, by name: the stamps stop at 15:38:40.
+        let cutoff = close - 80 - margin;
+        let b1534 = close - 360;
+        assert!(b1534 + 60 > cutoff, "the 15:34 bucket is still open");
+        assert!(!is_late_window_minute(minute(b1534), DAY_START_NANOS, None));
+    }
+
+    #[test]
+    fn is_late_window_minute_with_known_sealed_through_excuses_only_buckets_ending_after_it() {
+        let close = SESSION_CLOSE_SECS_OF_DAY_IST;
+        // Every sealed-through second over the last 10 minutes, and every
+        // session bucket.
+        for sealed_through in (close - 600)..=(close + 60) {
+            for s in (SESSION_OPEN_SECS_OF_DAY_IST..close + 300).step_by(60) {
+                let got = is_late_window_minute(minute(s), DAY_START_NANOS, Some(sealed_through));
+                let want = s < close && s + 60 > sealed_through;
+                assert_eq!(got, want, "bucket {s} sealed_through {sealed_through}");
+            }
+        }
+    }
+
+    #[test]
+    fn strict_policy_counts_a_missing_1539_traded_minute_as_real_diverged() {
+        let live = vec![eq_bar(1, OPEN, 500)];
+        let rest = vec![
+            eq_bar(1, OPEN, 500),
+            eq_bar(1, SESSION_CLOSE_SECS_OF_DAY_IST - 60, 300),
+        ];
+        let cmp = unscoped(&live, &rest, strict_inputs(false));
+        assert_eq!(cmp.missing_live_traded, 1);
+        assert_eq!(cmp.missing_live_late, 1, "measured under Strict too");
+        assert_eq!(cmp.late_excused, 0, "Strict excuses nothing");
+        assert_eq!(cmp.outcome, DhanLiveXverifyOutcome::Diverged);
+        // The same day under the derived Excuse: excused, partial.
+        let cmp = unscoped(&live, &rest, excuse_inputs(None));
+        assert_eq!(cmp.late_excused, 1);
+        assert_eq!(cmp.outcome, DhanLiveXverifyOutcome::Partial);
+    }
+
+    #[test]
+    fn missing_live_late_counts_traded_and_index_minutes_only() {
+        let late = SESSION_CLOSE_SECS_OF_DAY_IST - 120;
+        let live = vec![eq_bar(1, OPEN, 500)];
+        let rest = vec![
+            eq_bar(1, OPEN, 500),
+            eq_bar(1, late, 0),                             // zero-volume equity
+            eq_bar(2, late, 10),                            // traded equity
+            side(13, late, bar_vol(1.0, 1.0, 1.0, 1.0, 0)), // index
+        ];
+        for inputs in [strict_inputs(false), excuse_inputs(None)] {
+            let cmp = unscoped(&live, &rest, inputs);
+            assert_eq!(cmp.missing_live_late, 2, "{inputs:?}");
+            // The zero-volume equity minute is never real and never excused.
+            assert!(cmp.missing_live_zero_volume >= 1);
+        }
+        let cmp = unscoped(&live, &rest, excuse_inputs(None));
+        assert_eq!(cmp.late_excused, 2);
+        assert_eq!(cmp.missing_live, 1);
+        assert_eq!(cmp.missing_live_zero_volume, 1);
+        assert_eq!(cmp.outcome, DhanLiveXverifyOutcome::Partial);
+    }
+
+    #[test]
+    fn excuse_downgrades_clean_to_partial_only_when_late_excused_gt_zero_never_upgrades_degraded_or_diverged()
+     {
+        let late = SESSION_CLOSE_SECS_OF_DAY_IST - 60;
+        let live = vec![eq_bar(1, OPEN, 500)];
+        // Clean day, nothing late: Excuse leaves it clean.
+        let rest = vec![eq_bar(1, OPEN, 500)];
+        assert_eq!(
+            unscoped(&live, &rest, excuse_inputs(None)).outcome,
+            DhanLiveXverifyOutcome::Clean
+        );
+        // Clean day plus a late zero-volume equity minute: not real, not
+        // excused, still clean.
+        let rest = vec![eq_bar(1, OPEN, 500), eq_bar(1, late, 0)];
+        assert_eq!(
+            unscoped(&live, &rest, excuse_inputs(None)).outcome,
+            DhanLiveXverifyOutcome::Clean
+        );
+        // Clean day plus a late traded minute: excused, partial.
+        let rest = vec![eq_bar(1, OPEN, 500), eq_bar(1, late, 9)];
+        let cmp = unscoped(&live, &rest, excuse_inputs(None));
+        assert_eq!(cmp.late_excused, 1);
+        assert_eq!(cmp.outcome, DhanLiveXverifyOutcome::Partial);
+        // Never upgrades: an incomplete leg stays partial.
+        let mut inputs = excuse_inputs(None);
+        inputs.rest_incomplete = true;
+        assert_eq!(
+            unscoped(&live, &rest, inputs).outcome,
+            DhanLiveXverifyOutcome::Partial
+        );
+        // A real loss outside the window stays diverged.
+        let rest = vec![
+            eq_bar(1, OPEN, 500),
+            eq_bar(1, late, 9),
+            eq_bar(1, OPEN + 60, 9),
+        ];
+        assert_eq!(
+            unscoped(&live, &rest, excuse_inputs(None)).outcome,
+            DhanLiveXverifyOutcome::Diverged
+        );
+        // Degraded (nothing compared, incomplete) stays degraded.
+        let rest = vec![eq_bar(1, late, 9)];
+        assert_eq!(
+            unscoped(&[], &rest, inputs).outcome,
+            DhanLiveXverifyOutcome::Degraded
+        );
+    }
+
+    /// An independent oracle for `decide_outcome`, written as a severity rank
+    /// rather than an if-chain, so the two agree only if both are right.
+    fn oracle(c: &VerdictCounts, inputs: VerdictInputs) -> DhanLiveXverifyOutcome {
+        let judged = inputs.missing == MissingJudgeable::Judged;
+        if c.minutes_compared == 0 {
+            return match (inputs.rest_incomplete || !judged, c.rows_seen) {
+                (true, _) => DhanLiveXverifyOutcome::Degraded,
+                (false, true) => DhanLiveXverifyOutcome::Blind,
+                (false, false) => DhanLiveXverifyOutcome::NoData,
+            };
+        }
+        let lost = if judged {
+            c.missing_live_traded + c.missing_live_index
+        } else {
+            0
+        };
+        let severity_real = (c.cells_diverged + lost > 0) as u8;
+        let severity_incomplete = (u8::from(inputs.rest_incomplete)
+            + u8::from(!judged)
+            + u8::from(c.missing_rest > 0)
+            + u8::from(c.late_excused > 0)
+            + u8::from(c.missing_live_unjudged > 0)
+            > 0) as u8;
+        match (severity_real, severity_incomplete) {
+            (1, _) => DhanLiveXverifyOutcome::Diverged,
+            (0, 1) => DhanLiveXverifyOutcome::Partial,
+            _ => DhanLiveXverifyOutcome::Clean,
+        }
+    }
+
+    const ALL_POLICIES: [LateWindowPolicy; 3] = [
+        LateWindowPolicy::Strict,
+        LateWindowPolicy::Excuse {
+            sealed_through_secs_of_day: None,
+        },
+        LateWindowPolicy::Excuse {
+            sealed_through_secs_of_day: Some(SESSION_CLOSE_SECS_OF_DAY_IST - 180),
+        },
+    ];
+
+    /// Every combination of rest_incomplete × missing kind × late policy ×
+    /// every count (0 or more) through the pure verdict: it matches the
+    /// oracle, `diverged` is never downgraded, an excused or unjudged minute
+    /// never yields `clean`, and the vacuous outcomes are the old mapping.
+    #[test]
+    fn decide_outcome_matches_the_oracle_on_every_permutation() {
+        let mut checked = 0u32;
+        for rest_incomplete in [false, true] {
+            for missing in [MissingJudgeable::Judged, MissingJudgeable::LiveTruncated] {
+                for late in ALL_POLICIES {
+                    let inputs = VerdictInputs {
+                        rest_incomplete,
+                        missing,
+                        late,
+                    };
+                    for bits in 0u32..(1 << 8) {
+                        let b = |i: u32| i64::from((bits >> i) & 1);
+                        let c = VerdictCounts {
+                            minutes_compared: b(0),
+                            rows_seen: b(1) == 1,
+                            cells_diverged: b(2),
+                            missing_live_traded: b(3),
+                            missing_live_index: b(4),
+                            missing_rest: b(5),
+                            late_excused: b(6),
+                            missing_live_unjudged: b(7),
+                        };
+                        let got = decide_outcome(&c, inputs);
+                        assert_eq!(got, oracle(&c, inputs), "{c:?} {inputs:?}");
+                        if c.minutes_compared > 0 && c.cells_diverged > 0 {
+                            assert_eq!(got, DhanLiveXverifyOutcome::Diverged, "never downgraded");
+                        }
+                        if c.late_excused > 0
+                            || c.missing_live_unjudged > 0
+                            || rest_incomplete
+                            || missing != MissingJudgeable::Judged
+                        {
+                            assert_ne!(got, DhanLiveXverifyOutcome::Clean, "{c:?} {inputs:?}");
+                        }
+                        if c.minutes_compared == 0 {
+                            // The vacuous outcomes are exactly the old ones,
+                            // with the old `degraded` = an incomplete leg or
+                            // a truncated read.
+                            let old_degraded =
+                                rest_incomplete || missing == MissingJudgeable::LiveTruncated;
+                            let old = if old_degraded {
+                                DhanLiveXverifyOutcome::Degraded
+                            } else if c.rows_seen {
+                                DhanLiveXverifyOutcome::Blind
+                            } else {
+                                DhanLiveXverifyOutcome::NoData
+                            };
+                            assert_eq!(got, old);
+                        }
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 2 * 2 * 3 * 256);
+    }
+
+    /// The same permutations END TO END through the comparison: a day built
+    /// from optional pieces (a compared minute that may differ in price, a
+    /// REST hole, a mid-session lost traded minute, a lost index minute, a
+    /// late lost traded minute), under every input. Each finding lands in
+    /// exactly one category, and the outcome matches the oracle.
+    #[test]
+    fn compare_day_in_scope_every_piece_under_every_input() {
+        let late = SESSION_CLOSE_SECS_OF_DAY_IST - 60;
+        for pieces in 0u32..(1 << 6) {
+            let has = |i: u32| (pieces >> i) & 1 == 1;
+            let mut live = Vec::new();
+            let mut rest = Vec::new();
+            if has(0) {
+                live.push(eq_bar(1, OPEN, 500));
+                let diff = if has(1) { 101.5 } else { 101.0 };
+                rest.push(SideBar {
+                    bar: bar_vol(100.0, diff, 99.0, 100.5, 500),
+                    ..eq_bar(1, OPEN, 500)
+                });
+            }
+            if has(2) {
+                live.push(eq_bar(2, OPEN, 5)); // REST hole
+            }
+            if has(3) {
+                rest.push(eq_bar(3, OPEN + 600, 7)); // lost traded, mid-session
+            }
+            if has(4) {
+                rest.push(side(13, OPEN + 600, bar_vol(1.0, 1.0, 1.0, 1.0, 0))); // lost index
+            }
+            if has(5) {
+                rest.push(eq_bar(4, late, 7)); // lost traded, late
+            }
+            for rest_incomplete in [false, true] {
+                for missing in [MissingJudgeable::Judged, MissingJudgeable::LiveTruncated] {
+                    for policy in ALL_POLICIES {
+                        let inputs = VerdictInputs {
+                            rest_incomplete,
+                            missing,
+                            late: policy,
+                        };
+                        let cmp = unscoped(&live, &rest, inputs);
+                        let judged = missing == MissingJudgeable::Judged;
+                        let excuse = policy != LateWindowPolicy::Strict;
+                        let lost_mid = i64::from(has(3)) + i64::from(has(4));
+                        let lost_late = i64::from(has(5));
+                        let expect_unjudged = if judged { 0 } else { lost_mid + lost_late };
+                        let expect_excused = if judged && excuse { lost_late } else { 0 };
+                        let expect_missing_live = if judged {
+                            lost_mid + if excuse { 0 } else { lost_late }
+                        } else {
+                            0
+                        };
+                        assert_eq!(
+                            cmp.missing_live_unjudged, expect_unjudged,
+                            "{pieces:b} {inputs:?}"
+                        );
+                        assert_eq!(cmp.late_excused, expect_excused, "{pieces:b} {inputs:?}");
+                        assert_eq!(
+                            cmp.missing_live, expect_missing_live,
+                            "{pieces:b} {inputs:?}"
+                        );
+                        assert_eq!(cmp.missing_live_late, lost_late);
+                        assert_eq!(cmp.missing_rest, i64::from(has(2)));
+                        assert_eq!(
+                            cmp.missing_live_traded + cmp.missing_live_zero_volume,
+                            cmp.missing_live,
+                            "the split still sums"
+                        );
+                        assert_eq!(cmp.tail_unsealed, 0);
+                        let counts = VerdictCounts {
+                            minutes_compared: cmp.minutes_compared,
+                            rows_seen: !live.is_empty() || !rest.is_empty(),
+                            cells_diverged: cmp.cells_diverged,
+                            missing_live_traded: cmp.missing_live_traded,
+                            missing_live_index: i64::from(has(4) && judged),
+                            missing_rest: cmp.missing_rest,
+                            late_excused: cmp.late_excused,
+                            missing_live_unjudged: cmp.missing_live_unjudged,
+                        };
+                        assert_eq!(
+                            cmp.outcome,
+                            oracle(&counts, inputs),
+                            "{pieces:b} {inputs:?}"
+                        );
+                        if cmp.cells_diverged > 0 {
+                            assert_eq!(cmp.outcome, DhanLiveXverifyOutcome::Diverged);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A sealed-through value at every minute of the last 10 (and every
+    /// second between): a traded minute lost at each of the last 10 session
+    /// minutes is excused exactly when its bucket ends after the value, and
+    /// counted as real loss otherwise.
+    #[test]
+    fn a_sealed_through_value_at_every_minute_of_the_last_10() {
+        let close = SESSION_CLOSE_SECS_OF_DAY_IST;
+        let live = vec![eq_bar(1, OPEN, 500)];
+        let mut rest = vec![eq_bar(1, OPEN, 500)];
+        let last10: Vec<i64> = (close - 600..close).step_by(60).collect();
+        for s in &last10 {
+            rest.push(eq_bar(1, *s, 7));
+        }
+        for sealed_through in (close - 660)..=close {
+            let cmp = unscoped(&live, &rest, excuse_inputs(Some(sealed_through)));
+            let excused = last10.iter().filter(|s| **s + 60 > sealed_through).count() as i64;
+            assert_eq!(cmp.late_excused, excused, "sealed_through {sealed_through}");
+            assert_eq!(cmp.missing_live, 10 - excused);
+            let want = if excused < 10 {
+                DhanLiveXverifyOutcome::Diverged
+            } else {
+                DhanLiveXverifyOutcome::Partial
+            };
+            assert_eq!(cmp.outcome, want, "sealed_through {sealed_through}");
+            // Under Strict the same day is always diverged.
+            assert_eq!(
+                unscoped(&live, &rest, strict_inputs(false)).outcome,
+                DhanLiveXverifyOutcome::Diverged
+            );
+        }
+    }
+
+    #[test]
+    fn verdict_inputs_for_run_maps_every_observation() {
+        for budget in [false, true] {
+            for failures in [0usize, 1, 868] {
+                for truncated in [false, true] {
+                    let v = verdict_inputs_for_run(budget, failures, truncated);
+                    assert_eq!(v.rest_incomplete, budget || failures > 0);
+                    assert_eq!(
+                        v.missing,
+                        if truncated {
+                            MissingJudgeable::LiveTruncated
+                        } else {
+                            MissingJudgeable::Judged
+                        }
+                    );
+                    assert_eq!(v.late, LateWindowPolicy::DERIVED_WINDOW);
+                }
+            }
+        }
+        assert_eq!(
+            LateWindowPolicy::DERIVED_WINDOW,
+            LateWindowPolicy::Excuse {
+                sealed_through_secs_of_day: None
+            }
+        );
+        // run_cross_verification judges through it, not through the old flag.
+        let src = include_str!("dhan_live_crossverify.rs");
+        let production = src
+            .split(concat!("#[cfg(", "test)]"))
+            .next()
+            .expect("production half");
+        let body = production
+            .split("pub async fn run_cross_verification")
+            .nth(1)
+            .expect("run_cross_verification");
+        assert!(body.contains("verdict_inputs_for_run(budget_elapsed, rest_failures, truncated)"));
+    }
+
+    /// A day held at `partial` only by an excused late minute must not read
+    /// as all zeros: the summary line names the minutes not yet judged.
+    #[test]
+    fn summary_line_names_minutes_not_yet_judged() {
+        let live = vec![eq_bar(1, OPEN, 500)];
+        let rest = vec![
+            eq_bar(1, OPEN, 500),
+            eq_bar(1, SESSION_CLOSE_SECS_OF_DAY_IST - 60, 9),
+        ];
+        let cmp = unscoped(&live, &rest, excuse_inputs(None));
+        assert_eq!(cmp.outcome, DhanLiveXverifyOutcome::Partial);
+        let line = format_summary_line(&cmp);
+        assert!(line.contains("1 minute(s) not yet judged"), "{line}");
+        let cmp = unscoped(&live, &rest, verdict_inputs_for_run(false, 0, true));
+        assert!(format_summary_line(&cmp).contains("1 minute(s) not yet judged"));
+        let cmp = unscoped(&live, &rest, strict_inputs(false));
+        assert_eq!(cmp.outcome, DhanLiveXverifyOutcome::Diverged);
+        assert!(format_summary_line(&cmp).contains("0 minute(s) not yet judged"));
+    }
+
+    #[test]
+    fn daily_row_carries_the_late_and_unjudged_counts() {
+        let live = vec![eq_bar(1, OPEN, 500)];
+        let rest = vec![
+            eq_bar(1, OPEN, 500),
+            eq_bar(1, SESSION_CLOSE_SECS_OF_DAY_IST - 60, 9),
+        ];
+        let cmp = unscoped(&live, &rest, excuse_inputs(None));
+        let row = daily_row(&cmp, DAY_START_NANOS, RUN_TS, 0, TEST_ATTEMPT);
+        assert_eq!(row.late_excused, 1);
+        assert_eq!(row.missing_live_unjudged, 0);
+        assert_eq!(row.missing_judgeable, MissingJudgeable::Judged);
+        assert_eq!(row.tail_unsealed, 0);
+        let cmp = unscoped(&live, &rest, verdict_inputs_for_run(false, 0, true));
+        let row = daily_row(&cmp, DAY_START_NANOS, RUN_TS, 0, TEST_ATTEMPT);
+        assert_eq!(row.missing_live_unjudged, 1);
+        assert_eq!(row.missing_judgeable, MissingJudgeable::LiveTruncated);
+    }
+
+    proptest::proptest! {
+        /// Random days under random inputs: the verdict is never `clean`
+        /// when anything was incomplete, excused or unjudged, and a price
+        /// difference is always `diverged`.
+        #[test]
+        fn proptest_verdict_is_never_clean_when_anything_is_incomplete_excused_or_unjudged(
+            mins in proptest::collection::vec((0i64..385, 0i64..3, 0u8..4), 0..40),
+            rest_incomplete in proptest::bool::ANY,
+            truncated in proptest::bool::ANY,
+            policy_ix in 0usize..3,
+        ) {
+            let mut live = Vec::new();
+            let mut rest = Vec::new();
+            for (m, vol, shape) in &mins {
+                let secs = OPEN + m * 60;
+                let sid = 1 + (m % 3);
+                match shape {
+                    0 => { live.push(eq_bar(sid, secs, *vol)); rest.push(eq_bar(sid, secs, *vol)); }
+                    1 => rest.push(eq_bar(sid, secs, *vol)),
+                    2 => live.push(eq_bar(sid, secs, *vol)),
+                    _ => {
+                        live.push(eq_bar(sid, secs, *vol));
+                        rest.push(SideBar { bar: bar_vol(100.0, 103.0, 99.0, 100.5, *vol), ..eq_bar(sid, secs, *vol) });
+                    }
+                }
+            }
+            let inputs = VerdictInputs {
+                rest_incomplete,
+                missing: if truncated { MissingJudgeable::LiveTruncated } else { MissingJudgeable::Judged },
+                late: ALL_POLICIES[policy_ix],
+            };
+            let cmp = unscoped(&live, &rest, inputs);
+            if rest_incomplete || truncated || cmp.late_excused > 0 || cmp.missing_live_unjudged > 0 {
+                proptest::prop_assert_ne!(cmp.outcome, DhanLiveXverifyOutcome::Clean);
+            }
+            if cmp.cells_diverged > 0 {
+                proptest::prop_assert_eq!(cmp.outcome, DhanLiveXverifyOutcome::Diverged);
+            }
+            proptest::prop_assert_eq!(
+                cmp.missing_live_traded + cmp.missing_live_zero_volume,
+                cmp.missing_live
+            );
+            if truncated {
+                proptest::prop_assert_eq!(cmp.missing_live_traded, 0);
+                proptest::prop_assert_eq!(cmp.late_excused, 0);
+            }
+            if ALL_POLICIES[policy_ix] == LateWindowPolicy::Strict {
+                proptest::prop_assert_eq!(cmp.late_excused, 0);
+            }
+        }
     }
 }

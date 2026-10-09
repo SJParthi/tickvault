@@ -127,3 +127,76 @@ after the limit. That the database client gives up at its request timeout
 plus the bytes at its minimum throughput is read from its source; that the
 HTTP timeout covers the whole request is assumed. The marker write is one
 small file and is not bounded on a stalled disk.
+
+## §4. 2026-10-06 — the verdict and the late window: columns and cell kinds (plan ITEM 51c)
+
+Authority: `no-rest-except-live-feed-2026-06-27.md` §12.15.9. No new log
+source, alarm, filter or page: the existing `finished` line of
+`crates/app/src/dhan_live_crossverify_boot.rs` carries the new counts, and
+`xverify_diverged` stays price-only.
+
+| Column / field / kind | Where | Means | Operator action |
+|---|---|---|---|
+| `late_excused` (LONG), cell kind `late_excused` | `dhan_live_crossverify_daily`, `dhan_live_crossverify_cell_audit`, `finished` line | a traded or index minute missing from our side inside the end-of-session window (`LATE_SEAL_WINDOW_MINUTES`, 15:35 to 15:39 today) that may not have sealed by the read; never real, holds the day at `partial` | none for one day; if it is non-zero most days, check the seal catch-up (plan item 51d judges these minutes once the read waits for the seal) |
+| `missing_live_unjudged` (LONG), cell kind `missing_live_unjudged` | same | the live read hit its row cap, so a missing traded or index minute could not be told from an unread one; never real, holds the day at `partial` | check the `live_truncated` flag on the `finished` line; a cap hit means the day's live rows outgrew the read cap |
+| `missing_judgeable` (SYMBOL: `judged` / `live_truncated`) | `dhan_live_crossverify_daily`, `finished` line | whether missing minutes were judged on this run | `live_truncated`: as the row above |
+| `missing_live_late` | `finished` line only | traded or index minutes missing in the late window, whatever the policy; a measurement for plan item 51d | none |
+| `tail_unsealed` column and kind | both tables | the old literal two-minute tail; written 0 from 2026-10-06 and kept for older rows | none |
+| `attempt_at` (TIMESTAMP), `run_complete` (BOOLEAN) | `dhan_live_crossverify_daily` (both), `dhan_live_crossverify_cell_audit` (`attempt_at`) | `attempt_at`: when the attempt that wrote the row persisted it, one reading per attempt; `run_complete`: that attempt was not cut short by its budget or the live read cap, and at most 5% of its vendor fetches failed | pick the day's final row and its cells with them (below) |
+
+**Behaviour change:** a day with a price difference or a judged missing traded
+or index minute now reads `diverged` even when a vendor fetch failed or the
+budget ran out, and a day with a price difference reads `diverged` even when
+the live read was truncated (each read `partial`).
+
+**A day can have more than one daily row, and the same day's retry is the
+usual cause.** Every attempt writes its daily row at the same `ts`, and the
+daily DEDUP key includes `outcome`. An attempt that is not complete (budget
+spent, live read truncated, or more than 5% of vendor fetches failed)
+persists its rows and is retried; an attempt with 1 to 5% failed fetches is
+complete and, when every row persisted and the day was measured (something
+compared), writes the day marker and is not retried; if the retry reads differently
+(for example `diverged` at 15:41 because one sealed bar was still waiting in
+QuestDB's WAL, then `partial` at 15:54 once it was readable) both rows stay.
+Cells the first attempt wrote and the retry did not (that missing minute) stay
+too. Query by day, never by `outcome`, and take the newest attempt:
+
+```sql
+SELECT * FROM dhan_live_crossverify_daily
+WHERE trading_date_ist = '<day>T00:00:00.000000Z'
+ORDER BY attempt_at DESC LIMIT 1;
+
+SELECT * FROM dhan_live_crossverify_cell_audit
+WHERE trading_date_ist = '<day>T00:00:00.000000Z'
+  AND attempt_at = '<attempt_at from the row above>';
+```
+
+`run_complete = false` on that newest row means the day's last attempt did not
+finish either, and no day marker was written for it. A row with a null
+`attempt_at` was written before 2026-10-06; for such a day, read every row. The two queries are Assumed: they were not run against a live QuestDB when written.
+
+The cell query is exact only when no later attempt wrote cells without its
+daily row. Cells are flushed before the daily row, so a later attempt that
+stops at its deadline after some batches restamps the findings it rewrote
+(the cell DEDUP key has no `attempt_at`) and leaves no daily row naming that
+stamp; those findings then match neither row. An attempt that loses a cell
+batch in a failed flush and still writes its daily row comes back short the
+same way (`run_complete` says nothing about the persist). If the cell count looks short,
+read the day's cells without the `attempt_at` filter. Depth-held option
+findings (the §12.15.6 option pass) are stamped by that pass and have no daily
+row, so read them by day and segment:
+
+```sql
+SELECT * FROM dhan_live_crossverify_cell_audit
+WHERE trading_date_ist = '<day>T00:00:00.000000Z'
+  AND segment = 'NSE_FNO';
+```
+
+**A `diverged` day is not always packet loss (until plan item 51d).** A
+traded or index minute is also missing from our side when its sealed bar was
+not readable at the read (still queued for the seal writer, staged in a spill
+file not yet replayed, or not yet applied by QuestDB's WAL) or when the read
+skipped its row as malformed. Before treating a `diverged` day as lost ticks,
+check `malformed_rows` on the `finished` line, the WAL apply lag at the read
+and the spill directory for that day, then re-run the day once QuestDB has
+caught up.
