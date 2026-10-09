@@ -737,7 +737,7 @@ enabled = false
 unsubscribe_arm = false
 socket_close_arm = false
 
-# Depth table layout (plan item 49e step 3). `array_rows = true` writes one
+# Depth table layout (plan item 49e step 3). With array_rows on, the feed writes one
 # `market_depth_book` row per book side per packet (levels in arrays) instead
 # of one `market_depth` row per level: about 11-13.5x fewer bytes for QuestDB
 # to apply. Off until the operator turns it on (step 4). Frames received before

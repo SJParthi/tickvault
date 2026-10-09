@@ -189,7 +189,14 @@ fn create_table_columns(src: &str) -> BTreeMap<String, String> {
             .chain(body_start.find("PARTITION BY"))
             .min()
             .unwrap_or(body_start.len());
-        for (name, ty) in scan_pairs(&body_start[..end]) {
+        // An array column (`price DOUBLE[]`, `market_depth_book`, plan item
+        // 49e step 2) is written with `.column_arr`, which this guard does not
+        // type-check. Read it as its own type, never as a scalar `DOUBLE`:
+        // the tokenizer splits on `[`, and `quantity DOUBLE[]` in one table
+        // would otherwise overwrite `quantity LONG` from the level table
+        // declared in the same file.
+        let body = body_start[..end].replace("[]", "_ARRAY");
+        for (name, ty) in scan_pairs(&body) {
             out.insert(name, ty);
         }
         rest = &body_start[end.max(1)..];

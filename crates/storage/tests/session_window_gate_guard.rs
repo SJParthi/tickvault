@@ -297,16 +297,52 @@ fn depth_persistence_src() -> String {
     strip_rust_comments(&raw)
 }
 
-/// The body of `DepthWriter::append_row`, comments stripped.
+/// The body of `DepthWriter::append_row`, followed by the body of the shared
+/// window check it calls, `depth_arrival_window_refusal`.
+///
+/// 2026-10-09 (plan item 49e step 2): the window check moved into that shared
+/// function so `append_row` and `append_book_row` refuse the same rows. The
+/// two bodies are joined in that order, so "the gate runs before
+/// `append_row_inner`" is still read from `append_row` itself, and the clock
+/// the gate uses is read from the shared function. `append_row` is asserted
+/// to call it, so the join cannot pass on a check nobody calls.
 fn depth_append_body(src: &str) -> String {
     let start = src
         .find("pub fn append_row(&mut self, row: &DepthRow)")
         .expect("DepthWriter::append_row is gone from depth_persistence.rs");
     let rest = &src[start..];
     let end = rest
-        .find("\n    fn append_row_inner")
+        .find("\n    pub const fn layout")
+        .or_else(|| rest.find("\n    fn append_row_inner"))
         .unwrap_or(rest.len().min(6000));
-    rest[..end].to_string()
+    let append = &rest[..end];
+    assert!(
+        append.contains("depth_arrival_window_refusal(row.ts_nanos)"),
+        "`DepthWriter::append_row` no longer calls the shared window check"
+    );
+    let shared_start = src
+        .find("fn depth_arrival_window_refusal(")
+        .expect("depth_arrival_window_refusal is gone from depth_persistence.rs");
+    let shared = &src[shared_start..];
+    let shared_end = shared.find("\n}\n").unwrap_or(shared.len());
+    format!("{append}\n{}", &shared[..shared_end])
+}
+
+/// The array-row writer must refuse and count the same rows as the level
+/// writer (plan item 49e step 2).
+#[test]
+fn the_book_row_writer_uses_the_same_window_check() {
+    let src = depth_persistence_src();
+    let start = src
+        .find("pub fn append_book_row(")
+        .expect("DepthWriter::append_book_row is gone");
+    let body = &src[start..src.len().min(start + 600)];
+    assert!(
+        body.contains("depth_arrival_window_refusal(row.ts_nanos)")
+            && body.contains("self.out_of_window.note(reason)"),
+        "`append_book_row` must refuse and count out-of-window rows exactly as \
+         `append_row` does"
+    );
 }
 
 #[test]
