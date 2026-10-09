@@ -156,13 +156,17 @@ pub const PRE_OPEN_MATCH_DONE_SECS_OF_DAY_IST: u32 = 33_120;
 /// Whether an equity's FIRST session bar (the bucket of each timeframe that
 /// holds 09:15) counts the pre-open auction volume (2026-10-09, ADANIENT).
 ///
-/// `true` puts the auction volume in the 09:15 bar, which is how the broker's
-/// own chart is believed to show it (Assumed: not yet checked against a
-/// stored row). `false` counts only the trades from 09:15 on, and then the
-/// first bar takes the day's volume only when the auction volume is known
-/// (see [`first_session_bucket_baseline`]). The operator chooses; flipping
+/// `false` (the operator's pick, 2026-10-09: "opening alone only") counts only
+/// the trades from 09:15:00 on, so the first bar holds no auction volume, in
+/// line with the 2026-10-05 rule that candles start at 09:15. The first bar
+/// then takes the day's volume minus the auction volume, and only when the
+/// auction volume is known (see [`first_session_bucket_baseline`]); when it is
+/// not, the slot seeds as before. `true` would put the auction volume in the
+/// 09:15 bar, which is how the broker's own chart is believed to show it
+/// (Assumed: not checked against a stored row), so with `false` the 09:15 bar
+/// of an equity reads lower than that chart by the auction volume. Flipping
 /// this one value is the whole switch.
-pub const FIRST_BAR_INCLUDES_PRE_OPEN_AUCTION: bool = true;
+pub const FIRST_BAR_INCLUDES_PRE_OPEN_AUCTION: bool = false;
 
 /// `InstrumentSlot::pre_open_auction_volume` before any pre-open trade packet
 /// was received for the key today.
@@ -4465,9 +4469,16 @@ mod tests {
                 minutes.insert(st.bucket_start_ist_secs, st.volume);
             }
         });
-        // The 09:15 minute holds the day's first trade's whole cumulative
-        // (max-10, 2026-10-09 ADANIENT fix), then +5, +9 across the wrap, +2.
-        assert_eq!(minutes.get(&OPEN), Some(&(u64::from(max) - 10 + 16)));
+        // The 09:15 minute holds +5, +9 across the wrap, +2. With the auction
+        // in the first bar it also holds the first trade's whole cumulative
+        // (max-10, 2026-10-09 ADANIENT fix); without it (the default) no
+        // auction volume was received here, so the first trade seeds.
+        let first = if FIRST_BAR_INCLUDES_PRE_OPEN_AUCTION {
+            u64::from(max) - 10
+        } else {
+            0
+        };
+        assert_eq!(minutes.get(&OPEN), Some(&(first + 16)));
         assert_eq!(minutes.get(&(OPEN + 60)), Some(&7));
         assert_eq!(minutes.get(&(OPEN + 120)), Some(&8));
 
@@ -8101,7 +8112,8 @@ mod tests {
         // into every 09:15 bar. The 1-second bar seeds in both modes.
         //
         // 2026-10-09 (ADANIENT): with the opening bars INCLUDING the auction
-        // (the default, `FIRST_BAR_INCLUDES_PRE_OPEN_AUCTION`), the whole
+        // ("Match Dhan"; the default, `FIRST_BAR_INCLUDES_PRE_OPEN_AUCTION`, is
+        // `false`), the whole
         // 50,400 belongs to the bars holding 09:15, which is exactly what an
         // uninterrupted run writes there.
         for (include_auction, minute) in [(false, 0_u64), (true, 50_400)] {
@@ -8245,19 +8257,43 @@ mod tests {
         // fold saw only seeded the baseline, so its volume, and every trade
         // before it, reached no bar. BITE PROOF: without the first-bar
         // baseline every bar below reads 0.
-        for (seg, cum) in [(2_u8, 650_u32), (EXCHANGE_SEGMENT_NSE_EQ, 40_000)] {
+        //
+        // Cases: an option (no pre-open, the whole cumulative is today's
+        // trading); an equity with the auction in the first bar; and an
+        // equity under the operator's default (2026-10-09, "opening alone
+        // only"), where the 09:08 auction total (30,000) is left out and the
+        // first bar holds only the 10,000 traded from 09:15 on.
+        let eq = EXCHANGE_SEGMENT_NSE_EQ;
+        for (seg, include, auction, cum, want) in [
+            (
+                2_u8,
+                FIRST_BAR_INCLUDES_PRE_OPEN_AUCTION,
+                0_u32,
+                650_u32,
+                650_u64,
+            ),
+            (eq, true, 0, 40_000, 40_000),
+            (eq, false, 30_000, 40_000, 10_000),
+        ] {
             let mut agg = MultiTfAggregator::new(FeedStrategy::DEFAULT);
+            agg.set_first_bar_includes_auction_for_test(include);
+            if auction != 0 {
+                let _ = push(
+                    &mut agg,
+                    &live_seg(seg, CANDLE_OPEN + 480, 12.9, auction, CANDLE_OPEN + 485),
+                );
+            }
             let _ = push(&mut agg, &live_seg(seg, OPEN + 2, 13.0, cum, OPEN + 2));
             let got = volumes_by_tf(&agg, seg);
             assert_eq!(
                 got,
-                expected_first_trade_volumes(OPEN + 2, u64::from(cum)),
-                "segment {seg}"
+                expected_first_trade_volumes(OPEN + 2, want),
+                "segment {seg} include={include}"
             );
             let at = |tf: TfIndex| got[tf.as_ordinal()];
-            assert_eq!(at(TfIndex::M1), u64::from(cum), "the 09:15 minute");
-            assert_eq!(at(TfIndex::S5), u64::from(cum), "the 09:15:00 5 s bar");
-            assert_eq!(at(TfIndex::M60), u64::from(cum), "the 09:00 hour");
+            assert_eq!(at(TfIndex::M1), want, "the 09:15 minute");
+            assert_eq!(at(TfIndex::S5), want, "the 09:15:00 5 s bar");
+            assert_eq!(at(TfIndex::M60), want, "the 09:00 hour");
             // 09:15:02 opens a 1-second bucket of its own, after 09:15:00.
             assert_eq!(at(TfIndex::S1), 0, "a later 1-second bucket seeds");
             // The next trade counts only its own quantity.
@@ -8266,7 +8302,7 @@ mod tests {
                 &live_seg(seg, OPEN + 3, 13.05, cum + 50, OPEN + 3),
             );
             let after = volumes_by_tf(&agg, seg);
-            assert_eq!(after[TfIndex::M1.as_ordinal()], u64::from(cum) + 50);
+            assert_eq!(after[TfIndex::M1.as_ordinal()], want + 50);
             assert_eq!(after[TfIndex::S1.as_ordinal()], 50);
         }
     }

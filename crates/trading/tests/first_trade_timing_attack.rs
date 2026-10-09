@@ -18,8 +18,11 @@
 //! 2026-10-09 (ADANIENT): when the first folded packet seeds, the buckets
 //! that hold 09:15 still open on a zero baseline, so they also take the seed
 //! (`with_open_seed`): everything in that cumulative traded inside them. For
-//! equities this includes the pre-open auction under the default "Match Dhan"
-//! choice, so an equity's `truth` here places its auction at 09:15:00.
+//! equities this includes the pre-open auction under "Match Dhan", so an
+//! equity's `truth` here places its auction at 09:15:00. Under the default
+//! "Opening-only" (2026-10-09) an equity's 09:15 buckets take the cumulative
+//! minus the auction volume of a live pre-open trade packet, or seed when no
+//! such packet arrived (`eq_first`).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -28,8 +31,8 @@ use tickvault_common::tick_types::ParsedTick;
 use tickvault_trading::candles::TfIndex;
 use tickvault_trading::candles::aggregator_cell::FeedStrategy;
 use tickvault_trading::candles::multi_tf_aggregator::{
-    ConsumeStats, MultiTfAggregator, UNTRADED_PROOF_MAX_AGE_SECS, UNTRADED_PROOF_MAX_SKEW_SECS,
-    untraded_proof_holds,
+    ConsumeStats, FIRST_BAR_INCLUDES_PRE_OPEN_AUCTION, MultiTfAggregator,
+    UNTRADED_PROOF_MAX_AGE_SECS, UNTRADED_PROOF_MAX_SKEW_SECS, untraded_proof_holds,
 };
 
 /// An IST trading day's midnight, in IST epoch seconds (same as restart_differential).
@@ -59,6 +62,18 @@ fn tk(seg: u8, ltt: u32, price: f32, cum: u32, ltq: u16, receipt_ist: u32) -> Pa
         volume: cum,
         received_at_nanos: (i64::from(receipt_ist) - 19_800) * 1_000_000_000,
         ..ParsedTick::default()
+    }
+}
+
+/// The seed an equity's 09:15 buckets take: `with_auction` when the first
+/// bar counts the pre-open auction, else `without` (the operator's pick,
+/// 2026-10-09 "Opening-only": the cumulative minus the auction volume read
+/// from a live pre-open trade packet, or 0 when none arrived).
+const fn eq_first(with_auction: u64, without: u64) -> u64 {
+    if FIRST_BAR_INCLUDES_PRE_OPEN_AUCTION {
+        with_auction
+    } else {
+        without
     }
 }
 
@@ -502,7 +517,8 @@ fn s17_equity_stalled_proof_no_longer_pulls_the_auction() {
         &got,
         &[],
         OPEN + 2,
-        50_400,
+        // Opening-only: the proof is not an auction trade, so it seeds.
+        eq_first(50_400, 0),
         &[(OPEN, 50_000), (OPEN + 2, 400)],
     );
 }
@@ -522,7 +538,7 @@ fn s17b_equity_post_auction_proof_extends_to_open() {
         stale(EQ, DAY + 33_124),
         tk(EQ, OPEN + 2, 812.0, 400, 400, OPEN + 2),
     ]);
-    assert_seeded(&got, &[], OPEN + 2, 400, &t);
+    assert_seeded(&got, &[], OPEN + 2, eq_first(400, 0), &t);
 }
 
 // 18. Proofs out of order: only moves forward.
@@ -663,7 +679,9 @@ fn s25_equity_auction_trade_then_stale_snapshot() {
         &got,
         &[],
         OPEN + 2,
-        50_400,
+        // Opening-only: the 09:08 auction packet recorded 50,000, so the
+        // 09:15 buckets hold the true 400.
+        eq_first(50_400, 400),
         &[(OPEN, 50_000), (OPEN + 2, 400)],
     );
 }
@@ -712,7 +730,13 @@ fn s28_first_trade_larger_than_u16_seeds() {
         stale(EQ, DAY + 33_130),
         tk(EQ, OPEN + 2, 812.0, 70_000, 4_464, OPEN + 2), // 70,000 mod 65,536
     ]);
-    assert_seeded(&got, &[], OPEN + 2, 70_000, &[(OPEN + 2, 70_000)]);
+    assert_seeded(
+        &got,
+        &[],
+        OPEN + 2,
+        eq_first(70_000, 0),
+        &[(OPEN + 2, 70_000)],
+    );
 }
 
 // 29. Currency / commodity / other segments: never extended to 09:15.
@@ -901,7 +925,8 @@ mod randomized {
         /// first trade's own quantity, into the first trade's own bars.
         /// 2026-10-09: SEEDED for an F&O or equity key also gives the buckets
         /// holding 09:15 the seed (`with_open_seed`); currency and commodity
-        /// keep the plain seed.
+        /// keep the plain seed. Under "Opening-only" an equity keeps the plain
+        /// seed too, since no stream here carries an auction trade.
         #[test]
         fn zero_baseline_only_ever_adds_the_true_first_trade(
             t0_off in 0u32..20_000,
@@ -929,7 +954,11 @@ mod randomized {
                 bars_of(&out)
             };
             let seed = u64::from(first.volume);
-            let seeded_model = if matches!(seg, EQ | FNO | 4) {
+            // Opening-only: no stream here carries a pre-open auction trade, so
+            // an equity's 09:15 buckets seed like any later bucket.
+            let open_seed = seg == FNO
+                || (FIRST_BAR_INCLUDES_PRE_OPEN_AUCTION && matches!(seg, EQ | 4));
+            let seeded_model = if open_seed {
                 with_open_seed(model(seed), first.exchange_timestamp, seed)
             } else {
                 model(seed)
