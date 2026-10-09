@@ -245,7 +245,11 @@ impl OrderLegPnlWriter {
                 }
             }
             Err(err) => {
-                warn!(error = %err, "order_leg_pnl: ILP sender build failed — rows will be discarded at flush");
+                warn!(
+                    error = %err,
+                    "order_leg_pnl: ILP sender build failed — rows go to the disk spill at flush \
+                     and are replayed later; they are discarded only if the spill refuses them"
+                );
                 Self {
                     sender: None,
                     buffer: Buffer::new(ProtocolVersion::V1),

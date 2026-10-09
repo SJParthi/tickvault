@@ -648,6 +648,8 @@ impl DeferredDepth {
                 return; // already reported this episode
             }
             warn!(
+                code = tickvault_common::error_code::ErrorCode::WsSpill01WriterRespawn.code_str(),
+                source = "deferred_depth_persist_failed",
                 path = %path.display(),
                 error = %err,
                 "WAL deferred-depth marks could not be persisted — the RAM marks are kept; \

@@ -36,7 +36,8 @@
 //! - The 65h Fri 16:00 → Mon 09:00 IST weekend sleep/wake test
 //!   exists at `crates/core/tests/ws_sleep_resilience.rs:93,173`.
 //!   The literal "70h" wording was off by 5 hours; the real chaos
-//!   test is 65h.
+//!   test is 65h. (2026-10-09: it is a CALENDAR test, not a chaos
+//!   test; it holds no socket. See the last test in this file.)
 //! - The >65h long-holiday wake (e.g. Fri → Tue across a Mon holiday,
 //!   ~92h) is NOT yet pinned and is queued as Wave-6 item W6-2.
 //!
@@ -144,13 +145,13 @@ fn section8_keeps_seal_ring_claim_with_evidence_pointer() {
 }
 
 #[test]
-fn section8_keeps_65h_weekend_chaos_claim_with_evidence_pointer() {
+fn section8_keeps_65h_weekend_calendar_claim_with_evidence_pointer() {
     for (label, path) in [("preamble", PREAMBLE_PATH), ("matrix", MATRIX_PATH)] {
         let text = read(path);
         assert!(
             text.contains("65h Fri 16:00 IST"),
-            "{label} ({path}) must cite the 65h weekend sleep/wake \
-             chaos test by its actual duration (Fri 16:00 → Mon 09:00 \
+            "{label} ({path}) must cite the 65h weekend sleep-until-open \
+             calendar test by its actual duration (Fri 16:00 → Mon 09:00 \
              IST), not the legacy 70h claim."
         );
         assert!(
@@ -184,4 +185,35 @@ fn section8_still_rejects_literal_never_promises() {
         "wave-4-shared-preamble.md §8 must keep the REJECT IN REVIEW \
          clause for literal 'never' promises without envelope."
     );
+}
+
+/// Regression: 2026-10-09 (stress audit TG-3). The three honest-100%
+/// templates called `ws_sleep_resilience.rs` a "chaos-tested 65h ...
+/// sleep/wake". That file's own header says it pins only the calendar
+/// arithmetic in `secs_until_next_market_open`: no socket is opened, held
+/// or woken, and the production box is stopped overnight and at weekends.
+/// A template citing it as a chaos test claims a resilience it never
+/// measured, so the phrase is banned and the calendar wording is required.
+#[test]
+fn templates_call_the_weekend_test_calendar_maths_not_a_chaos_test() {
+    for (label, path) in [
+        ("preamble", PREAMBLE_PATH),
+        ("matrix", MATRIX_PATH),
+        ("charter", CHARTER_PATH),
+    ] {
+        let text = read(path);
+        for banned in ["chaos-tested 65h", "chaos sweep only exercises"] {
+            assert!(
+                !text.contains(banned),
+                "{label} ({path}) contains {banned:?}: ws_sleep_resilience.rs \
+                 is calendar arithmetic only and holds no socket. Say \
+                 \"calendar-tested\" instead."
+            );
+        }
+        assert!(
+            text.contains("calendar-tested 65h Fri 16:00 IST"),
+            "{label} ({path}) must describe the weekend test as \
+             \"calendar-tested 65h Fri 16:00 IST\"."
+        );
+    }
 }

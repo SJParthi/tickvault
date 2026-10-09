@@ -3002,3 +3002,41 @@ Status of the rest, so the next session does not re-audit:
   `.github/workflows/ci.yml`. Tests: a_take_racing_a_new_request_never_tears_loses_or_duplicates,
   a_pending_request_is_never_overwritten_by_a_later_one,
   a_racing_take_never_reads_a_torn_id_and_segment_pair.
+
+### Added 2026-10-09 (stress audit, findings OBS-1/TG-1 and TG-3)
+
+Guarantee matrix: see per-wave-guarantee-matrix.md (all 15 + 7 rows apply; rows that do not
+are written `N/A — reason` in the PR body).
+
+- [x] **OBS-1/TG-1 — The error-level guard can fail again.** `error_level_meta_guard.rs`
+  checked 28 fixed phrases that no longer appeared anywhere in the code, so it passed whatever
+  was logged. It now reads every `warn!` / `tracing::warn!` body (continuation lines and
+  continued strings included) in app, aws-lambdas, core and storage, flags a site whose text
+  pairs a durability word with a failure word, and requires `error!`, `// APPROVED:`, or a
+  `REVIEWED_WARN_SITES` entry with a reason; a stale entry also fails. 62 sites flagged on
+  main: the counters behind most of them already page through the `durability-sync-failing`
+  loss group, so `error!` would page twice (the noise lock forbids new pages). Fixed in the
+  same change: the applied-watermark persist warning repeated every second while the disk
+  refused writes (now once per episode, counter unchanged), it and the deferred-depth persist
+  warning carried no code (now WS-SPILL-01, which pages on ERROR only, so no new page), and the
+  order-leg P&L sender-build warning said rows were discarded when they go to the disk spill.
+  Files: `crates/storage/tests/error_level_meta_guard.rs`,
+  `crates/storage/src/wal_applied_watermark.rs`, `crates/storage/src/wal_deferred_depth.rs`,
+  `crates/storage/src/order_leg_pnl_persistence.rs`,
+  `.claude/rules/project/observability-architecture.md`, `docs/architecture/guarantees.md`.
+  Tests: write_failure_warns_are_errors_or_reviewed, reviewed_list_is_lowercase_and_reasoned,
+  bite_two_line_warn_on_a_failed_flush_is_flagged,
+  bite_continued_string_and_tracing_path_are_read,
+  bite_error_macro_and_benign_warn_are_not_flagged,
+  bite_approved_comment_and_test_module_are_honoured, bite_commented_out_warn_is_ignored,
+  test_regression_failing_persist_reports_once_and_rearms_on_success.
+- [x] **TG-3 — The "65-hour weekend sleep test" is described as what it is.** Three
+  honest-100% templates called `ws_sleep_resilience.rs` a chaos test; it is calendar
+  arithmetic and holds no socket (the box is stopped overnight and at weekends). The templates
+  now say "calendar-tested", and the wording guard bans the old phrase. Files:
+  `.claude/rules/project/per-wave-guarantee-matrix.md`,
+  `.claude/rules/project/wave-4-shared-preamble.md`,
+  `.claude/rules/project/zero-loss-guarantee-charter.md`,
+  `docs/claude-rules-full/project/operator-charter-forever.md`,
+  `crates/common/tests/wave4_section8_wording_guard.rs`. Test:
+  templates_call_the_weekend_test_calendar_maths_not_a_chaos_test.

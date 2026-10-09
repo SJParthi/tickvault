@@ -591,6 +591,10 @@ pub struct AppliedWatermark {
     /// none. So while suspect, acks do NOT move the watermark (they park in
     /// `suspect_max_*`), and on recovery the parked range is marked unapplied.
     sink_suspect: AtomicBool,
+    /// Set while persisting the snapshot keeps failing, so a failing disk is
+    /// reported once per episode and not once a second (2026-10-09). The
+    /// counter still counts every failure; `durability-sync-failing` pages on it.
+    persist_failing: AtomicBool,
     /// The watermarks as of the last CLEAN probe. When suspicion begins, the
     /// frames acked since then — the probe's detection window, one poll
     /// interval — are marked unapplied, because the table may have been
@@ -657,6 +661,7 @@ impl AppliedWatermark {
             persist_lock: Mutex::new(DurabilityLag::new()),
             dir_tag: AtomicU64::new(0),
             sink_suspect: AtomicBool::new(false),
+            persist_failing: AtomicBool::new(false),
             healthy_ticks: AtomicU64::new(0),
             healthy_depth: AtomicU64::new(0),
             suspect_max_ticks: AtomicU64::new(0),
@@ -1207,11 +1212,21 @@ impl AppliedWatermark {
         let written = write_fresh(tmp, &bytes).and_then(|()| std::fs::rename(tmp, path));
         if let Err(err) = written {
             metrics::counter!(APPLIED_PERSIST_FAILED_COUNTER).increment(1);
+            if self.persist_failing.swap(true, Ordering::AcqRel) {
+                return; // already reported this episode
+            }
             warn!(
+                code = tickvault_common::error_code::ErrorCode::WsSpill01WriterRespawn.code_str(),
+                source = "applied_watermark_persist_failed",
                 path = %path.display(),
                 error = %err,
                 "WAL applied-watermark could not be persisted — the RAM value is kept and \
                  the next boot replays MORE than it needs to, never less"
+            );
+        } else if self.persist_failing.swap(false, Ordering::AcqRel) {
+            tracing::info!(
+                path = %path.display(),
+                "WAL applied-watermark is persisting again"
             );
         }
     }
@@ -1334,6 +1349,31 @@ mod tests {
     fn applied_watermark_load_returns_none_for_an_absent_file() {
         let dir = scratch("absent");
         assert!(AppliedSnapshot::load(&dir).is_none());
+    }
+
+    // Regression: 2026-10-09 — a failing persist logged a warning every
+    // second for as long as the disk refused it. It now reports once per
+    // episode and re-arms when a persist succeeds.
+    #[test]
+    fn test_regression_failing_persist_reports_once_and_rearms_on_success() {
+        let dir = scratch("persist_latch").join("not_yet_created");
+        let wm = AppliedWatermark::new();
+        wm.bind(&dir);
+        assert!(!wm.persist_failing.load(Ordering::Acquire));
+        wm.persist_at(1);
+        assert!(
+            wm.persist_failing.load(Ordering::Acquire),
+            "a failed write opens the episode"
+        );
+        wm.persist_at(2);
+        assert!(wm.persist_failing.load(Ordering::Acquire), "still failing");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        wm.persist_at(3);
+        assert!(
+            !wm.persist_failing.load(Ordering::Acquire),
+            "a successful write closes the episode"
+        );
+        assert!(dir.join(APPLIED_WATERMARK_FILE).exists());
     }
 
     #[test]
