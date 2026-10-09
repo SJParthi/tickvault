@@ -67,8 +67,11 @@ jobs:
     timeout-minutes: 60
     # The one-off role trusts ONLY this environment's OIDC subject.
     environment: s3-old-data-delete-2026-10-09
-    # Only the reviewed workflow on main; the environment also allows only
-    # protected branches (set by the PR that added this file).
+    # Only the reviewed workflow on main. The environment itself carries no
+    # branch rule (GitHub creates it on first use) and the role's trust checks
+    # the environment, not the branch, so this line is what holds the run to
+    # main. A copy of this file on another branch could drop it; the IAM
+    # scope and the 2026-10-16 expiry still bound what such a run can delete.
     if: github.ref == 'refs/heads/main'
     steps:
       - name: Refuse outside the allowed window
