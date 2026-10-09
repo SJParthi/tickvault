@@ -3122,9 +3122,14 @@ RO-1) ship in their own PR.
   framed `.dspl` depth spill landing separately is covered); 0-byte files and `quarantine/`
   (never replayed) do not count; anything unclassifiable (unreadable folder or entry, symlink,
   unknown sub-folder) still counts as pending. Drained files are NOT deleted: the replay keeps
-  them on purpose so the age sweep can tell drained from abandoned.
+  them on purpose so the age sweep can tell drained from abandoned. Review fix (same day): the
+  replay never empties a folder's NEWEST file (the writer may still append to it) and records
+  the drained offset instead, so a non-empty newest file counts only while it is longer than
+  `tick_spill_replay::resume_offset_for`; after a restart (offset forgotten) it counts until
+  the next round re-drains it.
   Files: `crates/storage/src/partition_archive.rs`.
   Tests: test_regression_drained_spill_files_and_quarantine_are_not_pending,
+  test_regression_a_newest_file_drained_to_its_end_is_not_pending,
   a_non_empty_spill_file_of_any_extension_is_pending,
   a_missing_or_empty_spill_folder_is_not_pending, an_unknown_sub_folder_counts_as_pending,
   hour_window_defers_to_the_day_path_while_spill_data_is_pending (updated),

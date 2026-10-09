@@ -2945,11 +2945,17 @@ fn swept_tables() -> Vec<&'static str> {
 /// Does one spill folder still hold rows a replay could POST back with their
 /// ORIGINAL timestamps?
 ///
-/// Only a NON-EMPTY regular file at the top of the folder counts. The rules:
+/// Only a regular file at the top of the folder with bytes the replay has not
+/// yet drained counts. The rules:
 ///
 /// - A 0-byte file is a drained file. The replay empties a closed file once
 ///   QuestDB has accepted it and keeps it (so the age sweep can tell drained
 ///   from abandoned); the replay skips 0-byte files. It holds no rows.
+/// - The NEWEST file of a folder is never emptied, because the writer may
+///   still append to it; the replay remembers how far it drained it
+///   (`tick_spill_replay::resume_offset_for`). Such a file counts only while
+///   it is longer than that offset. The offset lives in memory, so after a
+///   restart the file counts until the next replay round drains it again.
 /// - The `quarantine/` sub-folder is never read by the replay: it holds files
 ///   QuestDB refused for good, kept and uploaded, never re-sent. It cannot
 ///   write into a partition, so it cannot race the hour archive.
@@ -2983,10 +2989,16 @@ fn spill_dir_has_pending_data(path: &Path) -> bool {
         };
         let file_type = meta.file_type();
         if file_type.is_file() {
-            if meta.len() > 0 {
+            // The replay never empties the NEWEST file of a folder (the writer
+            // may still append to it); it records how far it drained instead.
+            // Bytes past that offset are pending; a file drained to its end is
+            // not. A process restart forgets the offset (it reads 0), so the
+            // file counts as pending until the next replay round drains it.
+            let drained_to = crate::tick_spill_replay::resume_offset_for(&entry.path());
+            if meta.len() > drained_to {
                 return true;
             }
-            // A drained, emptied file: nothing left to replay.
+            // Emptied (0 bytes) or drained to its end: nothing left to replay.
             continue;
         }
         if file_type.is_dir() && entry.file_name() == crate::tick_spill_replay::QUARANTINE_DIR {
@@ -3454,6 +3466,44 @@ mod tests {
                 "{name} must count"
             );
         }
+    }
+
+    // Regression: 2026-10-09 (review of BND-1) — the replay never empties the
+    // NEWEST spill file (the writer may still append to it); it records the
+    // drained offset instead. Counting every non-empty file kept the hour
+    // window deferred after every spill episode, until a newer spill came.
+    #[test]
+    fn test_regression_a_newest_file_drained_to_its_end_is_not_pending() {
+        let dir = SpillScratch::new("newest-drained");
+        let newest = dir.path().join("ticks-dhan-2026100910.ilp");
+        std::fs::write(&newest, b"rows\nmore rows\n").expect("write");
+        assert!(
+            super::spill_dir_has_pending_data(dir.path()),
+            "an undrained newest file holds rows a replay will post"
+        );
+
+        let len = std::fs::metadata(&newest).expect("meta").len();
+        crate::tick_spill_replay::record_resume_offset(&newest, len);
+        assert!(
+            !super::spill_dir_has_pending_data(dir.path()),
+            "a newest file the replay drained to its end holds nothing to replay"
+        );
+
+        // The writer appends after the drain: those bytes are pending again.
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&newest)
+            .expect("open");
+        std::io::Write::write_all(&mut file, b"late rows\n").expect("append");
+        drop(file);
+        assert!(
+            super::spill_dir_has_pending_data(dir.path()),
+            "bytes appended past the drained offset are pending"
+        );
+
+        // A restart forgets the offset: the file counts until it is re-drained.
+        crate::tick_spill_replay::forget_resume_offset(&newest);
+        assert!(super::spill_dir_has_pending_data(dir.path()));
     }
 
     /// A missing folder holds nothing; an empty folder holds nothing.
