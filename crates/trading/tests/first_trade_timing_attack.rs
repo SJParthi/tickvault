@@ -14,6 +14,12 @@
 //!   about; a first trade it cannot prove is the day's first is "seeded",
 //!   i.e. missing, which under-reports and is the documented policy);
 //! - `truth`: what actually traded; NO bar may ever exceed it (`no_over`).
+//!
+//! 2026-10-09 (ADANIENT): when the first folded packet seeds, the buckets
+//! that hold 09:15 still open on a zero baseline, so they also take the seed
+//! (`with_open_seed`): everything in that cumulative traded inside them. For
+//! equities this includes the pre-open auction under the default "Match Dhan"
+//! choice, so an equity's `truth` here places its auction at 09:15:00.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -163,10 +169,53 @@ fn run(stream: &[ParsedTick]) -> BTreeMap<(usize, u32), u64> {
 /// Asserts the fold wrote exactly `counted` and never exceeded `truth`.
 #[track_caller]
 fn assert_bars(got: &BTreeMap<(usize, u32), u64>, counted: &[(u32, u64)], truth: &[(u32, u64)]) {
+    assert_expected(got, &bars_of(counted), truth);
+}
+
+/// Asserts the fold wrote exactly `want` and never exceeded `truth`.
+#[track_caller]
+fn assert_expected(
+    got: &BTreeMap<(usize, u32), u64>,
+    want: &BTreeMap<(usize, u32), u64>,
+    truth: &[(u32, u64)],
+) {
     let over = over_counts(&diff(got, &bars_of(truth)));
     assert!(over.is_empty(), "OVER-COUNT vs truth: {over:?}");
-    let d = diff(got, &bars_of(counted));
+    let d = diff(got, want);
     assert!(d.is_empty(), "differs from the expected bars: {d:?}");
+}
+
+/// `bars` plus `seed` in every checked bucket that holds both 09:15 and
+/// `first_ts` (2026-10-09): a seeding first packet at `first_ts` with day
+/// cumulative `seed` still fills the buckets that hold 09:15.
+fn with_open_seed(
+    mut bars: BTreeMap<(usize, u32), u64>,
+    first_ts: u32,
+    seed: u64,
+) -> BTreeMap<(usize, u32), u64> {
+    for (tf, n) in TFS {
+        if first_ts - first_ts % n == OPEN {
+            *bars.entry((tf.as_ordinal(), OPEN)).or_insert(0) += seed;
+        }
+    }
+    bars
+}
+
+/// The first folded packet at `first_ts` seeded with day cumulative `seed`;
+/// the rest wrote exactly `counted`.
+#[track_caller]
+fn assert_seeded(
+    got: &BTreeMap<(usize, u32), u64>,
+    counted: &[(u32, u64)],
+    first_ts: u32,
+    seed: u64,
+    truth: &[(u32, u64)],
+) {
+    assert_expected(
+        got,
+        &with_open_seed(bars_of(counted), first_ts, seed),
+        truth,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -190,14 +239,15 @@ fn s02_first_trade_61s_after_proof_seeds() {
     assert_bars(&got, &[], &[(p + 61, 650)]);
 }
 
-// 3. First trade minutes after a 09:00:30 connect snapshot -> seeds.
+// 3. First trade minutes after a 09:00:30 connect snapshot -> seeds; the
+//    09:15 five-minute bar still holds it (2026-10-09).
 #[test]
 fn s03_first_trade_minutes_after_open_seeds() {
     let got = run(&[
         stale(FNO, DAY + 32_430),
         tk(FNO, OPEN + 61, 13.0, 650, 650, OPEN + 61),
     ]);
-    assert_bars(&got, &[], &[(OPEN + 61, 650)]);
+    assert_seeded(&got, &[], OPEN + 61, 650, &[(OPEN + 61, 650)]);
 }
 
 // 4. Early: an F&O packet stamped 09:10, 30 s after a proof. Candles start
@@ -221,7 +271,8 @@ fn s05_duplicate_first_trade_is_not_double_counted() {
 }
 
 // 6. Out of order: A(:10, 100) and B(:40, +200); B arrives first. B's cum
-//    (300) != its LTQ (200) -> seeds; A is then stale. Both missing.
+//    (300) != its LTQ (200) -> seeds; A is then stale. Both missing from
+//    the short bars; the 09:15 minute and five minutes hold both (2026-10-09).
 #[test]
 fn s06_out_of_order_first_two_trades_same_minute() {
     let got = run(&[
@@ -229,7 +280,13 @@ fn s06_out_of_order_first_two_trades_same_minute() {
         tk(FNO, OPEN + 40, 13.2, 300, 200, OPEN + 41),
         tk(FNO, OPEN + 10, 13.0, 100, 100, OPEN + 42),
     ]);
-    assert_bars(&got, &[], &[(OPEN + 10, 100), (OPEN + 40, 200)]);
+    assert_seeded(
+        &got,
+        &[],
+        OPEN + 40,
+        300,
+        &[(OPEN + 10, 100), (OPEN + 40, 200)],
+    );
 }
 
 // 6b. Same trades, in order -> exact.
@@ -323,7 +380,7 @@ fn s09_proof_at_open_exact_boundaries() {
         stale(FNO, OPEN),
         tk(FNO, OPEN + 61, 13.0, 650, 650, OPEN + 61),
     ]);
-    assert_bars(&got, &[], &[(OPEN + 61, 650)]);
+    assert_seeded(&got, &[], OPEN + 61, 650, &[(OPEN + 61, 650)]);
     assert!(untraded_proof_holds(DAY + 32_400, OPEN + 60, FNO));
     assert!(!untraded_proof_holds(DAY + 32_400, OPEN + 61, FNO));
     assert_eq!(UNTRADED_PROOF_MAX_AGE_SECS, 60);
@@ -373,19 +430,19 @@ fn s13_future_receipt_proofs() {
         stale(FNO, OPEN + 10),
         tk(FNO, OPEN + 12, 13.0, 650, 650, OPEN + 12),
     ]);
-    assert_bars(&got, &[], &t);
+    assert_seeded(&got, &[], OPEN + 12, 650, &t);
     let got = run(&[
         stale(FNO, OPEN + 21_600),
         stale(FNO, OPEN + 10),
         tk(FNO, OPEN + 12, 13.0, 650, 650, OPEN + 12),
     ]);
-    assert_bars(&got, &[], &t);
+    assert_seeded(&got, &[], OPEN + 12, 650, &t);
     let mut far = stale(FNO, OPEN);
     far.received_at_nanos = 4_100_000_000_i64 * 1_000_000_000;
     let mut huge = stale(FNO, OPEN);
     huge.received_at_nanos = i64::MAX;
     let got = run(&[far, huge, tk(FNO, OPEN + 12, 13.0, 650, 650, OPEN + 12)]);
-    assert_bars(&got, &[], &t);
+    assert_seeded(&got, &[], OPEN + 12, 650, &t);
 }
 
 // 14. 540 refreshing proofs then a first trade 5 s after the last -> exact.
@@ -433,13 +490,21 @@ fn s16_cumulative_goes_down() {
 // 17. Former over-count: equity, stalled proof read 09:12:30 after the 09:08
 //     auction (50,000) whose packet Dhan skipped; first trade 09:15:02 carries
 //     cum 50,400 with LTQ 400 -> seeds (09:15 bars 0, not 50,400).
+//     2026-10-09: under "Match Dhan" the auction belongs to the 09:15 bars,
+//     so they read 50,400 and the truth places the auction at 09:15:00.
 #[test]
 fn s17_equity_stalled_proof_no_longer_pulls_the_auction() {
     let got = run(&[
         stale(EQ, DAY + 33_150),
         tk(EQ, OPEN + 2, 812.0, 50_400, 400, OPEN + 2),
     ]);
-    assert_bars(&got, &[], &[(DAY + 32_880, 50_000), (OPEN + 2, 400)]);
+    assert_seeded(
+        &got,
+        &[],
+        OPEN + 2,
+        50_400,
+        &[(OPEN, 50_000), (OPEN + 2, 400)],
+    );
 }
 
 // 17b. Equity proof after the auction, auction never traded, first trade at
@@ -452,12 +517,12 @@ fn s17b_equity_post_auction_proof_extends_to_open() {
     ]);
     let t = [(OPEN + 2, 400)];
     assert_bars(&got, &t, &t);
-    // 09:12:04 is too early to extend.
+    // 09:12:04 is too early to extend: seeds.
     let got = run(&[
         stale(EQ, DAY + 33_124),
         tk(EQ, OPEN + 2, 812.0, 400, 400, OPEN + 2),
     ]);
-    assert_bars(&got, &[], &t);
+    assert_seeded(&got, &[], OPEN + 2, 400, &t);
 }
 
 // 18. Proofs out of order: only moves forward.
@@ -586,6 +651,7 @@ fn s24_trade_packet_overtaken_by_stale_snapshot() {
 // 25. Equity auction traded before 09:15 (refused by the fold), then a stale
 // snapshot. The first continuous trade carries the auction in its cumulative
 // (50,400 against its own 400), so it seeds: missing, never 50,400.
+// 2026-10-09: under "Match Dhan" the 09:15 bars hold the auction (50,400).
 #[test]
 fn s25_equity_auction_trade_then_stale_snapshot() {
     let got = run(&[
@@ -593,7 +659,13 @@ fn s25_equity_auction_trade_then_stale_snapshot() {
         stale(EQ, OPEN - 1),
         tk(EQ, OPEN + 2, 812.0, 50_400, 400, OPEN + 2),
     ]);
-    assert_bars(&got, &[], &[(DAY + 32_880, 50_000), (OPEN + 2, 400)]);
+    assert_seeded(
+        &got,
+        &[],
+        OPEN + 2,
+        50_400,
+        &[(OPEN, 50_000), (OPEN + 2, 400)],
+    );
 }
 
 // 26. Former over-count: reconnect at 10:00 receives a prior-day copy for a
@@ -629,7 +701,7 @@ fn s27_two_fills_first_packet_seeds() {
         stale(FNO, OPEN - 5),
         tk(FNO, OPEN + 2, 13.0, 300, 200, OPEN + 2),
     ]);
-    assert_bars(&got, &[], &[(OPEN + 2, 300)]);
+    assert_seeded(&got, &[], OPEN + 2, 300, &[(OPEN + 2, 300)]);
 }
 
 // 28. LIMIT: a first trade above u16 (LTQ cannot represent it). Dhan's LTQ
@@ -640,7 +712,7 @@ fn s28_first_trade_larger_than_u16_seeds() {
         stale(EQ, DAY + 33_130),
         tk(EQ, OPEN + 2, 812.0, 70_000, 4_464, OPEN + 2), // 70,000 mod 65,536
     ]);
-    assert_bars(&got, &[], &[(OPEN + 2, 70_000)]);
+    assert_seeded(&got, &[], OPEN + 2, 70_000, &[(OPEN + 2, 70_000)]);
 }
 
 // 29. Currency / commodity / other segments: never extended to 09:15.
@@ -674,9 +746,11 @@ fn s30_true_first_packet_delayed_behind_later_trade() {
         tk(FNO, OPEN + 50, 13.2, 350, 50, OPEN + 50), // C (B lost)
         tk(FNO, OPEN + 10, 13.0, 100, 100, OPEN + 51), // A, late
     ]);
-    assert_bars(
+    assert_seeded(
         &got,
         &[],
+        OPEN + 50,
+        350,
         &[(OPEN + 10, 100), (OPEN + 30, 200), (OPEN + 50, 50)],
     );
 }
@@ -825,6 +899,9 @@ mod randomized {
         /// (baseline 0), and ZERO only when the first folded packet really is
         /// the day's first trade. So the zero baseline can only ever add the
         /// first trade's own quantity, into the first trade's own bars.
+        /// 2026-10-09: SEEDED for an F&O or equity key also gives the buckets
+        /// holding 09:15 the seed (`with_open_seed`); currency and commodity
+        /// keep the plain seed.
         #[test]
         fn zero_baseline_only_ever_adds_the_true_first_trade(
             t0_off in 0u32..20_000,
@@ -851,7 +928,13 @@ mod randomized {
                 }
                 bars_of(&out)
             };
-            let seeded = diff(&got, &model(u64::from(first.volume)));
+            let seed = u64::from(first.volume);
+            let seeded_model = if matches!(seg, EQ | FNO | 4) {
+                with_open_seed(model(seed), first.exchange_timestamp, seed)
+            } else {
+                model(seed)
+            };
+            let seeded = diff(&got, &seeded_model);
             let zero = diff(&got, &model(0));
             prop_assert!(seeded.is_empty() || zero.is_empty(),
                 "fold matches neither reference: seeded {:?} zero {:?}", seeded, zero);
