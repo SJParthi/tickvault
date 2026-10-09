@@ -4357,6 +4357,28 @@ mod first_bucket_ohlc_tests {
     use super::tests::{DAY, OPEN, tick_at};
     use super::*;
 
+    /// 2026-10-09: the multi-timeframe fold now calls this to find the bucket
+    /// that holds 09:15 on every timeframe, so pin it directly: exactly one
+    /// bucket per timeframe per day answers yes, and it is the one holding
+    /// 09:15, whatever the grid anchor puts its start at.
+    #[test]
+    fn test_is_days_first_session_bucket_is_exactly_the_bucket_holding_0915() {
+        assert_eq!(OPEN, DAY + 33_300);
+        for tf in TfIndex::ALL {
+            let holding = tf.bucket_start(OPEN);
+            assert!(is_days_first_session_bucket(tf, holding), "{tf:?}");
+            let after = tf.bucket_start(holding + tf.seconds_per_bucket());
+            assert!(!is_days_first_session_bucket(tf, after), "{tf:?} next");
+            if holding >= DAY + tf.seconds_per_bucket() {
+                let before = holding - tf.seconds_per_bucket();
+                assert!(!is_days_first_session_bucket(tf, before), "{tf:?} prev");
+            }
+            // The next day's 09:15 bucket answers yes too: the test is per day.
+            let next_day = tf.bucket_start(OPEN + 86_400);
+            assert!(is_days_first_session_bucket(tf, next_day), "{tf:?} day 2");
+        }
+    }
+
     /// Builds a tick carrying exchange-published session fields.
     fn tick_with_day(
         ts: u32,
