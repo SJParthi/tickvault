@@ -370,7 +370,7 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_partition_keys() {
+    fn test_classify_key_partition_keys() {
         use Verdict::*;
         let cases = [
             ("questdb-partitions/ticks/2026-10-08.csv.gz", Delete),
@@ -410,7 +410,7 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_dated_folder_keys() {
+    fn test_classify_key_dated_folder_keys() {
         use Verdict::*;
         let cases = [
             ("raw-frames/2026-10-08/ws-frames-1.wal.gz", Delete),
@@ -435,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn test_plan_counts_versions_markers_and_bytes() {
+    fn test_from_entries_counts_versions_markers_and_total_bytes() {
         let plan = DeletePlan::from_entries(vec![
             entry("questdb-partitions/ticks/2026-10-08.csv.gz", 100, false),
             entry("questdb-partitions/ticks/2026-10-08.csv.gz", 0, true),
