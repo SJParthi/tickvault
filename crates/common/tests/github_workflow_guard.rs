@@ -11,8 +11,10 @@
 //!   1. workflow file exists
 //!   2. triggers on push to main with `deploy/aws/terraform/**` path filter
 //!   3. has both terraform-plan and terraform-apply jobs
-//!   4. uses pinned `hashicorp/setup-terraform@v4` action
-//!   5. uses pinned `aws-actions/configure-aws-credentials@v4` action
+//!   4. uses pinned `hashicorp/setup-terraform` v4 action
+//!   5. uses pinned `aws-actions/configure-aws-credentials` v4 action
+//!      (2026-10-09: both are pinned to a 40-character commit SHA with the
+//!      tag as a trailing comment, not to the movable tag itself)
 //!   6. has the market-hours guard job
 //!   7. has `aws sns publish` for both success and failure notify paths
 //!   8. injects S3 backend bucket name via `-backend-config="bucket=tv-terraform-state-`
@@ -113,11 +115,11 @@ fn r3b_has_preflight_job_that_gates_downstream_on_bootstrap_secrets() {
 #[test]
 fn r4_uses_pinned_setup_terraform_action() {
     let body = read(WORKFLOW);
-    must_contain(
-        &body,
-        "hashicorp/setup-terraform@v4",
-        "setup-terraform pinned action",
-    );
+    // 2026-10-09 (stress audit RO-5/SEC-2): was `must_contain("…@v4")`. A tag
+    // can be moved by whoever controls the action's repository, and this job
+    // holds production credentials, so the pin is now a commit SHA with the
+    // tag kept as a comment.
+    assert_pinned_to_sha_with_tag(&body, "hashicorp/setup-terraform", "v4");
     must_contain(
         &body,
         "terraform_version: 1.9.8",
@@ -128,11 +130,30 @@ fn r4_uses_pinned_setup_terraform_action() {
 #[test]
 fn r5_uses_pinned_configure_aws_credentials_action() {
     let body = read(WORKFLOW);
-    must_contain(
-        &body,
-        "aws-actions/configure-aws-credentials@v4",
-        "configure-aws-credentials pinned action",
-    );
+    // 2026-10-09: SHA form, same reason as r4.
+    assert_pinned_to_sha_with_tag(&body, "aws-actions/configure-aws-credentials", "v4");
+}
+
+/// Every `uses: <action>@…` line in `body` names a 40-character commit SHA
+/// and carries `# <tag>` as its trailing comment; at least one such line
+/// exists.
+fn assert_pinned_to_sha_with_tag(body: &str, action: &str, tag: &str) {
+    let lines: Vec<&str> = body
+        .lines()
+        .filter(|l| uses_value(l).is_some_and(|v| v.starts_with(&format!("{action}@"))))
+        .collect();
+    assert!(!lines.is_empty(), "{action}: no `uses:` line found");
+    for line in lines {
+        let value = uses_value(line).unwrap_or_default();
+        assert!(
+            is_full_sha_ref(value),
+            "{action}: must be pinned to a 40-character commit SHA: {line:?}"
+        );
+        assert!(
+            line.contains(&format!("# {tag}")),
+            "{action}: the pin must carry `# {tag}` so a reader sees the version: {line:?}"
+        );
+    }
 }
 
 #[test]
@@ -754,4 +775,264 @@ fn careful_job_frees_runner_disk_and_drops_dependency_debug_info() {
         no_dep_debug, 2,
         "both careful cargo calls (build and test) must drop dependency debug info, else the test step relinks with full debug info"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Stress audit 2026-10-09: RO-5/SEC-2 (action pins), OPS-2 (reset-failed),
+// RO-1 (no market-data deletion in a workflow).
+// ---------------------------------------------------------------------------
+
+/// Every workflow file under `.github/workflows/`, as `(path, text)`.
+fn workflow_files() -> Vec<(String, String)> {
+    let dir = repo_root().join(".github/workflows");
+    let mut out: Vec<(String, String)> = fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("read_dir {} failed: {e}", dir.display()))
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "yml" || x == "yaml"))
+        .map(|p| {
+            let rel = format!(
+                ".github/workflows/{}",
+                p.file_name().unwrap_or_default().to_string_lossy()
+            );
+            let text = fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+            (rel, text)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// The value of a `uses:` key on this line (`- uses: x` or `uses: x`), with
+/// quotes and any trailing ` # comment` removed. `None` for every other line,
+/// comment lines included.
+fn uses_value(line: &str) -> Option<&str> {
+    let t = line.trim_start();
+    if t.starts_with('#') {
+        return None;
+    }
+    let t = t.strip_prefix("- ").map_or(t, str::trim_start);
+    let v = t.strip_prefix("uses:")?.trim();
+    let v = v.split(" #").next().unwrap_or(v).trim();
+    Some(v.trim_matches(|c| c == '"' || c == '\''))
+}
+
+/// `owner/repo[/path]@<40 lowercase hex>`.
+fn is_full_sha_ref(value: &str) -> bool {
+    let Some((name, git_ref)) = value.rsplit_once('@') else {
+        return false;
+    };
+    !name.is_empty()
+        && git_ref.len() == 40
+        && git_ref
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Remote actions still allowed on a tag or branch, as `action@ref`.
+///
+/// SHRINK-ONLY: entries may be removed, never added, and
+/// [`UNPINNED_ACTION_CEILING`] may only be lowered. Empty since 2026-10-09:
+/// every remote action resolved to a commit with `git ls-remote`.
+const UNPINNED_ACTION_ALLOWLIST: &[&str] = &[];
+
+/// Upper bound on [`UNPINNED_ACTION_ALLOWLIST`]. May only go down.
+const UNPINNED_ACTION_CEILING: usize = 0;
+
+/// The `uses:` lines across `files` that name a remote action by anything
+/// other than a full commit SHA (a `docker://` image needs an `@sha256:`
+/// digest), minus the allowlist. Local `./` actions are ours and exempt.
+fn unpinned_action_lines(files: &[(String, String)], allow: &[&str]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (path, text) in files {
+        for (i, line) in text.lines().enumerate() {
+            let Some(v) = uses_value(line) else {
+                continue;
+            };
+            if v.starts_with("./") || allow.contains(&v) {
+                continue;
+            }
+            let pinned = match v.strip_prefix("docker://") {
+                Some(image) => image.contains("@sha256:"),
+                None => is_full_sha_ref(v),
+            };
+            if !pinned {
+                out.push(format!("{path}:{}: {v}", i + 1));
+            }
+        }
+    }
+    out
+}
+
+// Regression: 2026-10-09 — actions holding production credentials (AWS keys,
+// the GitHub token) were pinned to movable tags, so whoever could move the
+// tag could run code with those credentials.
+#[test]
+fn test_regression_every_remote_action_is_pinned_to_a_commit_sha() {
+    assert!(
+        UNPINNED_ACTION_ALLOWLIST.len() <= UNPINNED_ACTION_CEILING,
+        "the unpinned-action allowlist may only shrink"
+    );
+    let files = workflow_files();
+    assert!(files.len() > 5, "found only {} workflows", files.len());
+    let used: usize = files
+        .iter()
+        .map(|(_, t)| t.lines().filter(|l| uses_value(l).is_some()).count())
+        .sum();
+    assert!(
+        used > 50,
+        "found only {used} `uses:` lines; the scan is broken"
+    );
+    let bad = unpinned_action_lines(&files, UNPINNED_ACTION_ALLOWLIST);
+    assert!(
+        bad.is_empty(),
+        "remote actions must be pinned to a 40-character commit SHA with the tag as \
+         a trailing comment (resolve it with `git ls-remote <repo> refs/tags/<tag>` \
+         and use the peeled `^{{}}` commit for an annotated tag):\n{}",
+        bad.join("\n")
+    );
+    for entry in UNPINNED_ACTION_ALLOWLIST {
+        assert!(
+            files
+                .iter()
+                .any(|(_, t)| t.lines().any(|l| uses_value(l) == Some(*entry))),
+            "allowlist entry {entry} is no longer used: remove it"
+        );
+    }
+}
+
+#[test]
+fn unpinned_action_scan_bites() {
+    let wf = |t: &str| vec![("w.yml".to_string(), t.to_string())];
+    let sha = "3d3c42e5aac5ba805825da76410c181273ba90b1";
+    assert_eq!(
+        unpinned_action_lines(&wf("      - uses: actions/checkout@v7\n"), &[]).len(),
+        1
+    );
+    assert_eq!(
+        unpinned_action_lines(&wf("        uses: \"a/b@main\"  # note\n"), &[]).len(),
+        1
+    );
+    assert_eq!(
+        unpinned_action_lines(&wf("        uses: a/b@3d3c42e5aac5\n"), &[]).len(),
+        1,
+        "a short SHA is not a pin"
+    );
+    assert_eq!(
+        unpinned_action_lines(&wf("        uses: docker://alpine:3\n"), &[]).len(),
+        1
+    );
+    assert!(
+        unpinned_action_lines(
+            &wf(&format!(
+                "      - uses: actions/checkout@{sha} # v7.0.1\n        uses: ./local\n      # uses: x/y@v1\n"
+            )),
+            &[]
+        )
+        .is_empty()
+    );
+    assert!(unpinned_action_lines(&wf("  uses: a/b@v1\n"), &["a/b@v1"]).is_empty());
+}
+
+// Regression: 2026-10-09 — the normal deploy swap restarted the app without
+// `systemctl reset-failed` first, so a unit that had crash-looped into its
+// start limit refused the restart and the FIX could not be deployed; the
+// rollback then reinstalled the crashing binary.
+#[test]
+fn test_regression_deploy_swap_resets_a_failed_unit_before_restarting() {
+    let wf = read(DEPLOY_AWS_WORKFLOW);
+    let lines: Vec<&str> = wf.lines().collect();
+    let restart = lines
+        .iter()
+        .position(|l| {
+            !l.trim_start().starts_with('#')
+                && l.contains("\"systemctl restart tickvault --no-block")
+        })
+        .expect("deploy-aws.yml must restart the app with --no-block");
+    let from = restart.saturating_sub(DEPLOY_RESET_FAILED_WINDOW_LINES);
+    let reset = lines[from..restart].iter().any(|l| {
+        !l.trim_start().starts_with('#') && l.contains("systemctl reset-failed tickvault")
+    });
+    assert!(
+        reset,
+        "deploy-aws.yml must run `systemctl reset-failed tickvault` in the {} SSM \
+         command(s) before `systemctl restart tickvault --no-block`",
+        DEPLOY_RESET_FAILED_WINDOW_LINES
+    );
+}
+
+/// How many lines before the restart the reset may sit (the marker element
+/// sits directly before it today).
+const DEPLOY_RESET_FAILED_WINDOW_LINES: usize = 2;
+
+/// Non-comment lines of `text` that delete raw capture, spill or dead-letter
+/// data with `rm`, or drop or truncate a market-data table (named, or through
+/// a shell variable).
+fn market_data_deletions(text: &str) -> Vec<String> {
+    const RAW_DIRS: &[&str] = &["ws_wal", "spill", "dlq"];
+    const TABLES: &[&str] = &["ticks", "market_depth", "candles", "top_volume"];
+    let mut out = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let t = line.trim_start();
+        if t.starts_with('#') {
+            continue;
+        }
+        let words: Vec<&str> = t.split_whitespace().collect();
+        let rm_with_flags = words
+            .windows(2)
+            .any(|w| w[0] == "rm" && w[1].starts_with('-'));
+        if rm_with_flags && RAW_DIRS.iter().any(|d| t.contains(d)) {
+            out.push(format!("{}: {t}", i + 1));
+            continue;
+        }
+        let upper = t.to_ascii_uppercase();
+        let drops = upper.contains("DROP TABLE") || upper.contains("TRUNCATE TABLE");
+        if drops && (TABLES.iter().any(|n| t.contains(n)) || t.contains('$')) {
+            out.push(format!("{}: {t}", i + 1));
+        }
+    }
+    out
+}
+
+// Regression: 2026-10-09 — emergency-fs-recover.yml ran `rm -rf` on ws_wal,
+// spill and dlq and dropped ticks, market_depth and every candles_<tf> with
+// no verified S3 copy. Quotes 21/22 are spent and Quote 28 (2026-09-29)
+// forbids deleting captured market data without a verified copy.
+#[test]
+fn test_regression_no_workflow_deletes_market_data_without_a_verified_copy() {
+    let mut bad = Vec::new();
+    for (path, text) in workflow_files() {
+        for hit in market_data_deletions(&text) {
+            bad.push(format!("{path}:{hit}"));
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "a workflow deletes captured market data. Quote 28 (2026-09-29) forbids it \
+         without a verified copy; a deletion needs a fresh dated operator quote in \
+         daily-universe-scope-expansion-2026-05-27.md first:\n{}",
+        bad.join("\n")
+    );
+}
+
+#[test]
+fn market_data_deletion_scan_bites() {
+    for line in [
+        "sudo rm -rf /opt/tickvault/data/spill /opt/tickvault/data/dlq",
+        "  sudo rm -rf /opt/tickvault/data/ws_wal",
+        "sudo rm -f /opt/tickvault/data/spill-hold/*.ilp",
+        r#"R=$(q "DROP TABLE IF EXISTS $t")"#,
+        r#"curl ... "query=DROP TABLE ticks""#,
+        r#"q "truncate table candles_1m""#,
+    ] {
+        assert_eq!(market_data_deletions(line).len(), 1, "{line}");
+    }
+    for line in [
+        "# sudo rm -rf /opt/tickvault/data/ws_wal (history)",
+        "rm -rf scripts/groww-sidecar",
+        "- NEVER run `git reset --hard`, `rm -rf`, `DROP TABLE`, or",
+        "sudo du -sBG /opt/tickvault/data/spill /opt/tickvault/data/ws_wal",
+    ] {
+        assert!(market_data_deletions(line).is_empty(), "{line}");
+    }
 }

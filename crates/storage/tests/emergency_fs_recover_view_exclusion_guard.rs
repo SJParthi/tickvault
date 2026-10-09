@@ -1,38 +1,27 @@
-//! The emergency filesystem-recovery workflow must never try to `DROP TABLE`
-//! a console VIEW — and must never SKIP a candle table that used to be a view.
+//! The emergency filesystem-recovery workflow drops NO table and NO view, and
+//! deletes none of the raw capture, spill or dead-letter data.
 //!
-//! `.github/workflows/emergency-fs-recover.yml` step 4 first drops the retired
-//! console views with `DROP VIEW IF EXISTS`, then builds its table-drop list
-//! (`TARGETS`) from `tables()` with an awk filter that takes every name
-//! starting `candles_`. One retired view also starts `candles_` —
-//! `candles_named` — so the filter carries an explicit `$0!="candles_named"`
-//! exclusion. If it is removed, a view that survived the `DROP VIEW` pass
-//! lands in `TARGETS`, `DROP TABLE` on a view is refused, and the step sets
-//! `failed=1` — a recovery run reported as FAILED for a reason that has
-//! nothing to do with the disk.
+//! ⚠ CHANGED 2026-10-09 (stress audit RO-1). Until that day
+//! `.github/workflows/emergency-fs-recover.yml` step 4 dropped the retired
+//! console views with `DROP VIEW IF EXISTS`, then built a table-drop list
+//! (`TARGETS`) from `tables()` with an awk filter and dropped `ticks`,
+//! `market_depth` and every `candles_<tf>`, and step 2 ran `rm -rf` on the
+//! WAL, spill and DLQ folders. This file pinned the shape of that drop list
+//! (that a `candles_*` VIEW was excluded from `TARGETS`, and that a view that
+//! became a table was not). Quotes 21/22 that authorized the wipe are spent,
+//! and Quote 28 (2026-09-29) forbids deleting captured market data without a
+//! verified copy, so the drops and deletions were removed. The guard now pins
+//! their ABSENCE. Retired console views need no workflow step: the app's boot
+//! sweep (`console_views`, `RETIRED_CONSOLE_VIEWS`) drops them.
 //!
-//! The OTHER direction arrived on 2026-09-22 (the operator's "no views"
-//! directive): `candles_10m` stopped being a view and became a real folded
-//! table. A leftover `$0!="candles_10m"` exclusion would then silently leave a
-//! real candle table out of the wipe — the recovery reports success while one
-//! table's rows survive. So names in `VIEW_NAMES_NOW_TABLES` must NOT be
-//! excluded.
-//!
-//! Every expectation is DERIVED from `console_views`, never hand-copied: a
-//! new retired `candles_*` view fails this test until the workflow excludes
-//! it, and a view that becomes a table fails it until the exclusion goes.
+//! The file keeps its name so its history stays in one place.
 
 use std::path::PathBuf;
 
 use tickvault_storage::console_views::{RETIRED_CONSOLE_VIEWS, VIEW_NAMES_NOW_TABLES};
 
-/// The prefix the awk filter uses to pick candle tables.
-const CANDLE_PREFIX: &str = "candles_";
-
-/// Prefixes of the tables the recovery step wipes. A retired view whose name
-/// starts with one of these read one of those tables, so it must be dropped
-/// as a VIEW before the table drops run.
-const WIPED_TABLE_PREFIXES: [&str; 3] = ["ticks", "candles_", "market_depth"];
+/// The raw-data folders under `/opt/tickvault/data` the recovery must keep.
+const KEPT_DATA_DIRS: [&str; 4] = ["ws_wal", "spill", "dlq", "spill-hold"];
 
 fn workflow_text() -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -40,177 +29,120 @@ fn workflow_text() -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
 }
 
-/// Returns the single `TARGETS=` line of the recovery script.
-fn targets_line(text: &str) -> &str {
-    let lines: Vec<&str> = text
-        .lines()
-        .filter(|l| l.trim_start().starts_with("TARGETS="))
+/// Non-comment lines of `text` (YAML and shell comments start with `#`).
+fn code_lines(text: &str) -> Vec<&str> {
+    text.lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect()
+}
+
+/// Lines that drop or truncate a table or a view, or build a drop list.
+fn drop_lines(text: &str) -> Vec<String> {
+    code_lines(text)
+        .into_iter()
+        .filter(|l| {
+            let u = l.to_ascii_uppercase();
+            u.contains("DROP TABLE")
+                || u.contains("DROP VIEW")
+                || u.contains("TRUNCATE TABLE")
+                || l.trim_start().starts_with("TARGETS=")
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// Lines that run `rm` with flags on one of [`KEPT_DATA_DIRS`].
+fn raw_data_rm_lines(text: &str) -> Vec<String> {
+    code_lines(text)
+        .into_iter()
+        .filter(|l| {
+            let words: Vec<&str> = l.split_whitespace().collect();
+            let rm = words
+                .windows(2)
+                .any(|w| w[0] == "rm" && w[1].starts_with('-'));
+            rm && KEPT_DATA_DIRS.iter().any(|d| l.contains(d))
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+// Regression: 2026-10-09 — the recovery dropped ticks, market_depth and every
+// candles_<tf> with no verified S3 copy.
+#[test]
+fn test_regression_the_recovery_script_drops_no_table() {
+    let text = workflow_text();
+    let hits: Vec<String> = drop_lines(&text)
+        .into_iter()
+        .filter(|l| !l.to_ascii_uppercase().contains("DROP VIEW"))
         .collect();
-    assert_eq!(
-        lines.len(),
-        1,
-        "expected exactly ONE `TARGETS=` line in the recovery script, found {}",
-        lines.len()
+    assert!(
+        hits.is_empty(),
+        "emergency-fs-recover.yml drops market-data tables again; Quote 28 forbids \
+         it without a verified copy: {hits:#?}"
     );
-    lines[0]
 }
 
-/// Returns the `for v in ...; do ... DROP VIEW` line.
-fn drop_view_line(text: &str) -> &str {
-    let lines: Vec<&str> = text
-        .lines()
-        .filter(|l| l.trim_start().starts_with("for v in ") && l.contains("DROP VIEW"))
-        .collect();
-    assert_eq!(
-        lines.len(),
-        1,
-        "expected exactly ONE `for v in ... DROP VIEW` loop, found {}",
-        lines.len()
-    );
-    lines[0]
-}
-
-fn is_now_a_table(name: &str) -> bool {
-    VIEW_NAMES_NOW_TABLES.contains(&name)
-}
-
-/// Retired `candles_*` views that are still views (never became a table).
-fn candle_views_still_views() -> Vec<&'static str> {
-    RETIRED_CONSOLE_VIEWS
-        .iter()
-        .copied()
-        .filter(|v| v.starts_with(CANDLE_PREFIX) && !is_now_a_table(v))
-        .collect()
-}
-
-/// Retired views that read a table this workflow wipes.
-fn views_over_wiped_tables() -> Vec<&'static str> {
-    RETIRED_CONSOLE_VIEWS
-        .iter()
-        .copied()
-        .filter(|v| WIPED_TABLE_PREFIXES.iter().any(|p| v.starts_with(p)))
-        .collect()
-}
-
-fn excludes(targets: &str, name: &str) -> bool {
-    targets.contains(&format!("$0!=\"{name}\""))
-}
-
-/// The views a `TARGETS` line fails to exclude, given the views it must.
-fn unexcluded<'a>(targets: &str, views: &[&'a str]) -> Vec<&'a str> {
-    views
-        .iter()
-        .copied()
-        .filter(|v| !excludes(targets, v))
-        .collect()
-}
-
-/// Names that are real tables now but are still (wrongly) excluded.
-fn wrongly_excluded<'a>(targets: &str, tables: &[&'a str]) -> Vec<&'a str> {
-    tables
-        .iter()
-        .copied()
-        .filter(|t| excludes(targets, t))
-        .collect()
-}
-
+/// No view is dropped by the workflow either: the app's boot sweep drops the
+/// retired console views, and a recovery that only extends the filesystem has
+/// no reason to touch the database schema.
 #[test]
-fn the_table_drop_list_excludes_every_candles_prefixed_view() {
+fn the_recovery_script_drops_no_view_and_the_boot_sweep_covers_them() {
     let text = workflow_text();
-    let targets = targets_line(&text);
-
-    // The inclusion rule this guard exists for must still be there — if the
-    // prefix match is gone the exclusion question changes shape, and this
-    // test must be re-derived rather than pass on a different filter.
+    let hits = drop_lines(&text);
     assert!(
-        targets.contains("index($0,\"candles_\")==1"),
-        "the TARGETS filter no longer selects tables by the `candles_` prefix; \
-         re-derive this guard. Line: {targets}"
+        hits.is_empty(),
+        "emergency-fs-recover.yml drops a view or builds a drop list: {hits:#?}"
     );
-
-    let views = candle_views_still_views();
-    assert!(
-        !views.is_empty(),
-        "anti-vacuity: at least one retired candles_* view must remain to test"
-    );
-    let missing = unexcluded(targets, &views);
-    assert!(
-        missing.is_empty(),
-        "emergency-fs-recover.yml would try to DROP TABLE these console VIEWS \
-         (they match the `candles_` prefix but are not excluded): {missing:?}. \
-         A refused drop sets failed=1 and fails the recovery run. Line: {targets}"
-    );
-}
-
-#[test]
-fn a_view_name_that_became_a_table_is_wiped_not_excluded() {
-    let text = workflow_text();
-    let targets = targets_line(&text);
-    let wrong = wrongly_excluded(targets, &VIEW_NAMES_NOW_TABLES);
-    assert!(
-        wrong.is_empty(),
-        "emergency-fs-recover.yml still EXCLUDES {wrong:?} from the table wipe, \
-         but these are real candle tables now (2026-09-22, no views). The \
-         recovery would report success while their rows survive. Line: {targets}"
-    );
-}
-
-#[test]
-fn every_view_over_a_wiped_table_is_dropped_as_a_view_first() {
-    let text = workflow_text();
-    let line = drop_view_line(&text);
-    let views = views_over_wiped_tables();
-    assert!(
-        !views.is_empty(),
-        "anti-vacuity: the derived view set must not be empty"
-    );
-    for view in views {
+    // The views the workflow used to drop are all still on the boot sweep's
+    // list (or are real tables now), so nothing is left behind.
+    for v in [
+        "ticks_named",
+        "candles_named",
+        "market_depth_named",
+        "candles_10m",
+    ] {
         assert!(
-            line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                .any(|w| w == view),
-            "`{view}` is not in the recovery step's DROP VIEW loop — a view left \
-             in place blocks dropping the table it reads. Line: {line}"
+            RETIRED_CONSOLE_VIEWS.contains(&v) || VIEW_NAMES_NOW_TABLES.contains(&v),
+            "`{v}` is neither swept at boot nor a table now"
         );
     }
+}
+
+// Regression: 2026-10-09 — the recovery ran `rm -rf` on the WAL, spill and
+// DLQ folders with no verified S3 copy.
+#[test]
+fn test_regression_the_recovery_script_keeps_the_wal_spill_and_dlq() {
+    let text = workflow_text();
+    let hits = raw_data_rm_lines(&text);
+    assert!(
+        hits.is_empty(),
+        "emergency-fs-recover.yml deletes raw capture, spill or dead-letter data: \
+         {hits:#?}"
+    );
+    assert!(
+        code_lines(&text).iter().any(|l| l.contains("growpart")),
+        "anti-vacuity: the recovery must still grow the partition"
+    );
 }
 
 /// Bite-proof of the detectors themselves.
 #[test]
 fn guard_self_test() {
-    let views = candle_views_still_views();
-    assert_eq!(views, vec!["candles_named"]);
+    let old = r#"
+          sudo rm -rf /opt/tickvault/data/spill /opt/tickvault/data/dlq /opt/tickvault/data/ws_wal
+          sudo rm -f /opt/tickvault/data/spill-hold/*.ilp
+          for v in ticks_named candles_named; do echo "$(q "DROP VIEW IF EXISTS $v")"; done
+          TARGETS=$(printf '%s\n' "$ALL" | sort)
+            R=$(q "DROP TABLE IF EXISTS $t")
+"#;
+    assert_eq!(raw_data_rm_lines(old).len(), 2);
+    assert_eq!(drop_lines(old).len(), 3);
 
-    let stripped = r#"TARGETS=$(printf '%s\n' "$ALL" | awk '$0=="ticks" || (index($0,"candles_")==1)' | sort)"#;
-    assert_eq!(
-        unexcluded(stripped, &views),
-        vec!["candles_named"],
-        "the detector must flag a candles_* view when no exclusion exists"
-    );
-    assert!(wrongly_excluded(stripped, &VIEW_NAMES_NOW_TABLES).is_empty());
-
-    let stale =
-        r#"TARGETS=$(awk '(index($0,"candles_")==1 && $0!="candles_10m" && $0!="candles_named")')"#;
-    assert!(unexcluded(stale, &views).is_empty());
-    assert_eq!(
-        wrongly_excluded(stale, &VIEW_NAMES_NOW_TABLES),
-        vec!["candles_10m"],
-        "the detector must flag the stale candles_10m exclusion"
-    );
-
-    let good = r#"TARGETS=$(awk '(index($0,"candles_")==1 && $0!="candles_named")')"#;
-    assert!(unexcluded(good, &views).is_empty());
-    assert!(wrongly_excluded(good, &VIEW_NAMES_NOW_TABLES).is_empty());
-
-    // The drop-loop set covers the four table-reading views and excludes the
-    // top_volume_rank_* views, which read no table this workflow wipes.
-    let over = views_over_wiped_tables();
-    for v in [
-        "ticks_named",
-        "candles_named",
-        "candles_10m",
-        "market_depth_named",
-    ] {
-        assert!(over.contains(&v), "{v} must be in the drop-loop set");
-    }
-    assert!(over.iter().all(|v| !v.starts_with("top_volume")));
+    let new = r#"
+          # sudo rm -rf /opt/tickvault/data/ws_wal (history, a comment)
+          sudo du -sBG /opt/tickvault/data/spill /opt/tickvault/data/ws_wal
+          sudo journalctl --vacuum-size=200M || true
+"#;
+    assert!(raw_data_rm_lines(new).is_empty());
+    assert!(drop_lines(new).is_empty());
 }

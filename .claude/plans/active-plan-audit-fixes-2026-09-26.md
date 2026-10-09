@@ -3076,6 +3076,40 @@ Crates touched: `storage`, `api` (commit A); `common` guard tests plus `.github/
   test_regression_a_miss_is_cached_and_the_repeat_does_not_query,
   test_get_quote_cached_404_expires_and_a_first_tick_is_seen (was
   test_get_quote_404_is_never_cached).
+- [x] **OPS-2 — the deploy swap clears a start-limited unit before restarting.** The normal
+  swap ran `systemctl restart tickvault --no-block` with no `reset-failed`, so a unit that had
+  crash-looped into its start limit refused the restart, the fix never ran, and the rollback
+  reinstalled the crashing binary. `systemctl reset-failed tickvault || true` now ends the
+  planned-restart marker element just before the restart (no new SSM element; the restart's
+  failure banners were shortened so the SSM shell bytes did not grow).
+  Files: `.github/workflows/deploy-aws.yml`, `crates/common/tests/github_workflow_guard.rs`.
+  Tests: test_regression_deploy_swap_resets_a_failed_unit_before_restarting.
+- [x] **RO-5/SEC-2 — every remote action is pinned to a commit SHA.** 55 `uses:` lines named
+  movable tags (`@v4`, `@v7`, ...), including the AWS-credential and terraform steps. Each is
+  now `owner/repo@<40-hex commit> # <tag>`, every SHA resolved with `git ls-remote` (the
+  peeled `^{}` commit for an annotated tag). The five existing `configure-aws-credentials`
+  pins named the v4 TAG OBJECT (`ff717079…`), not its commit (`7474bc46…`); they now name the
+  commit. `github_workflow_guard.rs` r4/r5 accept the SHA form; a new guard fails the build on
+  any remote `uses:` that is not a 40-hex SHA (a `docker://` image needs an `@sha256:` digest),
+  with a shrink-only allowlist that is empty.
+  Files: 18 files under `.github/workflows/`, `crates/common/tests/github_workflow_guard.rs`,
+  `crates/common/tests/assertion_free_test_ratchet.rs` (budget 154 -> 152: r4/r5 now assert).
+  Tests: test_regression_every_remote_action_is_pinned_to_a_commit_sha,
+  unpinned_action_scan_bites, r4_uses_pinned_setup_terraform_action,
+  r5_uses_pinned_configure_aws_credentials_action.
+- [x] **RO-1 — the emergency recovery no longer deletes or drops market data.** It ran
+  `rm -rf` on ws_wal, spill and dlq and dropped ticks, market_depth and every candles_<tf>
+  with no verified S3 copy. Quotes 21/22 are spent; Quote 28 (2026-09-29) forbids it. The
+  deletions, the view drops and the table drops are removed; the journal and package cache
+  are vacuumed instead, and the partition grow, docker/QuestDB restart and re-enable stay.
+  Files: `.github/workflows/emergency-fs-recover.yml`,
+  `crates/storage/tests/emergency_fs_recover_view_exclusion_guard.rs` (rewritten to pin the
+  absence), `crates/common/tests/github_workflow_guard.rs`,
+  `crates/common/tests/shell_budget_guard.rs` (its awk/jq row removed).
+  Tests: test_regression_no_workflow_deletes_market_data_without_a_verified_copy,
+  market_data_deletion_scan_bites, test_regression_the_recovery_script_drops_no_table,
+  test_regression_the_recovery_script_keeps_the_wal_spill_and_dlq,
+  the_recovery_script_drops_no_view_and_the_boot_sweep_covers_them, guard_self_test.
 
 ### Design
 
@@ -3087,6 +3121,11 @@ gains a WHERE time bound before `LATEST ON`; a miss stores an empty-string senti
 serialized quote is a JSON object and never empty) in the existing quote cache, and a cache hit
 on the sentinel answers 404.
 
+Commit B (workflows, guarded by `common` and `storage` tests): OPS-2 extends an existing SSM
+element instead of adding one, so the SSM shell budget does not grow. RO-5 replaces each tag
+with the commit `git ls-remote` reports for it today, so the version each job runs does not
+change. RO-1 deletes the destructive steps outright rather than gating them.
+
 ### Edge Cases
 
 BND-1: missing folder (not pending); empty folder (not pending); only 0-byte files plus a
@@ -3096,6 +3135,10 @@ and the replay empties it: bounded, one hour); unknown sub-folder or symlink (pe
 a file (pending). GAP-3: an id last ticked more than 7 days ago now reads 404; a first tick
 arriving inside a cached miss's second is seen up to 1 s late (same staleness as a cached 200);
 a segment-scoped miss never answers an unscoped request (composite key).
+OPS-2: `reset-failed` on a unit that is not failed is a no-op, and `|| true` covers a unit
+that is not loaded. RO-5: a commented-out `uses:` and a local `./` action are exempt; a short
+SHA is not a pin. RO-1: a root full of DATA is no longer freed by this workflow; grow the
+volume first (grow-ebs-volume.yml), then run it to extend the filesystem.
 
 ### Failure Modes
 
@@ -3104,21 +3147,29 @@ day path, never an unsafe hour drop; the pre-drop recount still guards every dro
 cache cap (2048) still bounds memory with garbage ids, every entry expires after 1 s, and the
 public limiter (5 requests a second) keeps the cap out of reach; a failed query is still
 probed for reachability and never cached.
+OPS-2/RO-5/RO-1 change no runtime code; the risk is a workflow that fails to resolve an action
+(a wrong SHA fails the job at once, loudly, never silently) or an emergency run that frees too
+little space (it reports df before and after and exits non-zero on every failed step).
 
 ### Test Plan
 
 `cargo test -p tickvault-storage` and `cargo test -p tickvault-api`; each regression test was
 run against the old logic (temporarily restored) and failed, then passed with the fix. Clippy
 `-D warnings` on both crates, `cargo fmt --check`, banned-pattern scanner, pub-fn test guard
-and plan gate.
+and plan gate. Commit B: `cargo test -p tickvault-common` and `-p tickvault-storage`; the
+new workflow guards were run against the pre-change workflows and failed (5 tests), then passed.
 
 ### Rollback
 
 Revert the commit. BND-1 reverts to "any entry defers" (safe, only slower archival); GAP-3
-reverts to the unbounded query and uncached misses. No schema, config or data change.
+reverts to the unbounded query and uncached misses. No schema, config or data change. Commit B
+reverts independently; reverting RO-1 would restore destructive steps that Quote 28 forbids, so
+it needs a fresh dated operator quote first.
 
 ### Observability
 
 BND-1: `tv_partition_archive_hour_window_deferred_total` should stop climbing on every run
 once the spill folders hold only drained files. GAP-3: `tv_api_cache_hits_total{endpoint=quote}`
-now also counts cached misses. No new metric, alarm or page (noise lock).
+now also counts cached misses. No new metric, alarm or page (noise lock). OPS-2 prints
+nothing new; a refused restart still dumps status and journal. RO-1 prints the sizes of the
+data folders it now keeps, so the operator sees what fills the disk.
