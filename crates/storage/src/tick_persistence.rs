@@ -2002,6 +2002,17 @@ impl OutOfWindowCounters {
     }
 
     pub(crate) fn note(&self, reason: &'static str) {
+        self.note_n(reason, 1);
+    }
+
+    /// [`Self::note`] for `n` rows refused together, as one array row
+    /// carrying `n` depth levels is: the counter moves by `n`, so it reads
+    /// the same unit whichever depth table is written; the log throttle
+    /// advances once. `n == 0` does nothing.
+    pub(crate) fn note_n(&self, reason: &'static str, n: u64) {
+        if n == 0 {
+            return;
+        }
         let mut idx = self.reasons.len() - 1;
         let mut i = 0;
         while i < self.reasons.len() {
@@ -2011,7 +2022,7 @@ impl OutOfWindowCounters {
             }
             i += 1;
         }
-        self.handles[idx].increment(1);
+        self.handles[idx].increment(n);
 
         if let Some(total) = self.throttle_tick(idx) {
             warn!(
@@ -6941,6 +6952,25 @@ mod tests {
         );
         assert_eq!(c.throttle_tick(0), Some(1));
         assert_eq!(c.throttle_tick(1), Some(1));
+    }
+
+    /// Plan item 49e review fix: one array row of 200 refused levels moves
+    /// the counter by 200 but advances the log throttle once; zero does
+    /// nothing at all.
+    #[test]
+    fn test_note_n_advances_the_throttle_once_and_zero_is_a_no_op() {
+        let c = OutOfWindowCounters::new(
+            Feed::Dhan,
+            TICK_OUT_OF_WINDOW_COUNTER,
+            TICK_OUT_OF_WINDOW_REASONS,
+        );
+        let reason = TICK_OUT_OF_WINDOW_REASONS[0];
+        c.note_n(reason, 0);
+        c.note_n(reason, 200);
+        // Exactly one advance so far, so the next tick is 2. Had zero
+        // advanced it the next would be 3; had 200 advanced it 200 times,
+        // 201. Neither is a power of two.
+        assert_eq!(c.throttle_tick(0), Some(2));
     }
 
     // -- Z7 / Z8a (2026-10-02): queued-rescue floors and synced spills ------

@@ -699,3 +699,119 @@ fn full_mode_frame_with_inline_depth_does_not_allocate_per_tick() {
         FRAMES * 4
     );
 }
+
+/// Plan item 49e step 3: the same production Full-packet shape with
+/// `[depth_storage] array_rows` ON, so each packet's five-level book becomes
+/// two `market_depth_book` rows (one bid, one ask) built in the `BookMode`
+/// scratch arrays, which are allocated once when the sink is built.
+///
+/// This covers `append_book_slots`, the append the depth-20 and depth-200
+/// socket drains share. Those drains have no DHAT gate of their own (they are
+/// private to the crate, as before this change); this gate is the measured
+/// half, and it is stated here rather than implied.
+#[test]
+fn full_mode_frame_with_inline_depth_book_rows_does_not_allocate_per_tick() {
+    let _serial = DHAT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    use tickvault_app::dhan_feed_stack::DepthIngest;
+    use tickvault_app::dhan_feed_stack::{counters, drain_main_feed_frame};
+    use tickvault_core::websocket::pool_budget::DhanEndpointType;
+    use tickvault_core::websocket::pool_supervisor::CapturedFrame;
+
+    fn full_packet(security_id: u32, ltp: f32, ltt: u32) -> Vec<u8> {
+        let mut buf = vec![0u8; tickvault_common::constants::FULL_QUOTE_PACKET_SIZE];
+        buf[0] = tickvault_common::constants::RESPONSE_CODE_FULL;
+        buf[1..3].copy_from_slice(
+            &(tickvault_common::constants::FULL_QUOTE_PACKET_SIZE as u16).to_le_bytes(),
+        );
+        buf[3] = 1; // NSE_EQ
+        buf[4..8].copy_from_slice(&security_id.to_le_bytes());
+        buf[tickvault_common::constants::QUOTE_OFFSET_LTP
+            ..tickvault_common::constants::QUOTE_OFFSET_LTP + 4]
+            .copy_from_slice(&ltp.to_le_bytes());
+        buf[tickvault_common::constants::QUOTE_OFFSET_LTT
+            ..tickvault_common::constants::QUOTE_OFFSET_LTT + 4]
+            .copy_from_slice(&ltt.to_le_bytes());
+        for level in 0..tickvault_common::constants::MARKET_DEPTH_LEVELS {
+            let base = tickvault_common::constants::FULL_OFFSET_DEPTH_START
+                + level * tickvault_common::constants::MARKET_DEPTH_LEVEL_SIZE;
+            let step = level as u32 + 1;
+            buf[base..base + 4].copy_from_slice(&(100u32 * step).to_le_bytes());
+            buf[base + 4..base + 8].copy_from_slice(&(200u32 * step).to_le_bytes());
+        }
+        buf
+    }
+
+    fn frame(seq: u64, n: u64) -> CapturedFrame {
+        let mut bytes = Vec::with_capacity(4 * tickvault_common::constants::FULL_QUOTE_PACKET_SIZE);
+        for i in 0..4u32 {
+            bytes.extend_from_slice(&full_packet(
+                5000 + i,
+                100.0 + (n % 97) as f32 * 0.05,
+                SESSION_EPOCH_SECS + (n % 600) as u32,
+            ));
+        }
+        CapturedFrame {
+            seq,
+            endpoint: DhanEndpointType::MainFeed,
+            connection_index: (n % 4) as u8,
+            received_at: std::time::Instant::now(),
+            received_at_nanos: tickvault_storage::ws_frame_spill::receipt_nanos_from(
+                std::time::Instant::now(),
+            ),
+            wal_backed: true,
+            bytes: bytes.into(),
+        }
+    }
+
+    // `since` = 1 ns: every frame here was received after it, so every packet
+    // takes the book path.
+    let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8)
+        .with_inline_depth(DepthIngest::for_test_book(1));
+    let c = counters();
+    for n in 0..4u64 {
+        let _ = drain_main_feed_frame(&mut ingest, &frame(n, n), SESSION_RECEIPT_NANOS, 1_000, c);
+    }
+
+    const FRAMES: u64 = 2_500; // x4 packets = 10,000 ticks, 20,000 book rows
+    let frames: Vec<CapturedFrame> = (0..FRAMES).map(|n| frame(1_000 + n, n)).collect();
+
+    let profiler = dhat::Profiler::builder().testing().build();
+    let mut folded = 0u64;
+    let mut depth_levels = 0u64;
+    for f in &frames {
+        let out = drain_main_feed_frame(&mut ingest, f, SESSION_RECEIPT_NANOS, 1_000, c);
+        folded += out.folded;
+        depth_levels += out.inline_depth_rows;
+    }
+    let stats = dhat::HeapStats::get();
+    drop(profiler);
+
+    assert_eq!(folded, FRAMES * 4, "every packet must fold");
+    // The book path counts LEVELS stored, the same unit as the level path, so
+    // ten per packet proves both book rows were appended for every packet.
+    assert_eq!(
+        depth_levels,
+        FRAMES * 4 * 10,
+        "the book sink must store all ten levels of every packet"
+    );
+    assert!(
+        ingest
+            .depth_sink()
+            .is_some_and(|d| !d.pending_book_bytes().is_empty()),
+        "the gate must measure the book path, not the level path"
+    );
+
+    // Ceiling. MEASURED 2026-10-09: 18 blocks over 10,000 ticks and 20,000
+    // book-row appends (the level-row gate above measures 19 for 100,000 level
+    // rows). Same 500 ceiling and reasoning as that gate: a per-tick
+    // allocation lands at 10,000+. A RATCHET at the measured rate, not a
+    // zero-allocation claim; the buffer's amortised doubling is the residue.
+    const MAX_BLOCKS_BOOK: u64 = 500;
+    assert!(
+        stats.total_blocks <= MAX_BLOCKS_BOOK,
+        "Full-mode frame drain with book rows allocated {} blocks over {} ticks \
+         (ceiling {MAX_BLOCKS_BOOK})",
+        stats.total_blocks,
+        FRAMES * 4
+    );
+}
