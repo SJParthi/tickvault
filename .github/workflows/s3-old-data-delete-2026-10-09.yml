@@ -1,0 +1,204 @@
+# s3-old-data-delete-2026-10-09.yml - ONE-OFF delete of the pre-2026-10-09
+# market-data copies in s3://tv-prod-cold (the S3 half of operator Quote 29).
+#
+# Authorization (recorded BEFORE this file was written):
+#   docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md
+#   "Quote 29e (2026-10-09, 21:52 IST) - ONE-TIME S3 DELETE PERMISSION".
+#   Parthi tapped "One-time permission" on the card "Allow a one-time S3 delete
+#   permission to remove the pre-9-Oct copies?".
+#
+# WHAT IT DOES: builds the Rust tool tv-s3-old-data-delete
+# (crates/app/src/bin/s3_old_data_delete.rs) and runs it under the one-off role
+# tv-prod-s3-old-data-delete-2026-10-09
+# (deploy/aws/terraform/s3-old-data-delete-2026-10-09.tf). The role can only
+# list 19 exact prefixes and delete object VERSIONS dated before 2026-10-09
+# under questdb-partitions/<17 market-data tables>/, raw-frames/ and
+# seal-spill/. It is explicitly denied today's keys, deploys/, sebi-preserve/
+# and every bucket setting.
+#
+# SAFETY:
+#   * mode=dry (default) lists and reports only.
+#   * mode=apply needs confirm=DELETE-S3-BEFORE-2026-10-09 AND a successful
+#     dry run of this workflow first; it deletes, lists again, and fails
+#     unless nothing in scope remains and every delete succeeded.
+#   * apply refuses 09:00-15:45 IST; both modes refuse after 2026-10-16 IST
+#     (Quote 29e is one-shot). The tool checks the same rules itself.
+#   * refuses while a deploy workflow is queued or running.
+#
+# REMOVED after the run, with the role and the tool, by the next PR.
+
+name: s3-old-data-delete-2026-10-09
+run-name: s3-old-data-delete (${{ inputs.mode }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'dry = report only; apply = delete'
+        required: true
+        default: dry
+        type: choice
+        options:
+          - dry
+          - apply
+      confirm:
+        description: 'For apply, type DELETE-S3-BEFORE-2026-10-09'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+  actions: read
+
+# Its own group: never cancels or queues behind a deploy run.
+concurrency:
+  group: s3-old-data-delete-2026-10-09
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-south-1
+
+jobs:
+  delete:
+    name: s3 delete (${{ inputs.mode }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # The one-off role trusts ONLY this environment's OIDC subject.
+    environment: s3-old-data-delete-2026-10-09
+    # Only the reviewed workflow on main. The environment itself carries no
+    # branch rule (GitHub creates it on first use) and the role's trust checks
+    # the environment, not the branch, so this line is what holds the run to
+    # main. A copy of this file on another branch could drop it; the IAM
+    # scope and the 2026-10-16 expiry still bound what such a run can delete.
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Refuse outside the allowed window
+        env:
+          MODE: ${{ inputs.mode }}
+          CONFIRM: ${{ inputs.confirm }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          case "$MODE" in
+            dry) ;;
+            apply)
+              if [ "$CONFIRM" != "DELETE-S3-BEFORE-2026-10-09" ]; then
+                echo "::error::mode=apply needs confirm=DELETE-S3-BEFORE-2026-10-09"
+                exit 1
+              fi ;;
+            *) echo "::error::mode must be dry or apply"; exit 1 ;;
+          esac
+          TODAY=$(TZ=Asia/Kolkata date +%F)
+          HM=$(TZ=Asia/Kolkata date +%H%M)
+          if [[ "$TODAY" > "2026-10-16" ]]; then
+            echo "::error::Quote 29e is one-shot; this job expired after 2026-10-16 IST"
+            exit 1
+          fi
+          if [ "$MODE" = "apply" ] && (( 10#$HM >= 900 && 10#$HM < 1545 )); then
+            echo "::error::apply never runs 09:00-15:45 IST"
+            exit 1
+          fi
+          BUSY=0
+          for wf in deploy-aws.yml deploy-aws-after-close.yml postmerge-catchup.yml; do
+            for st in queued in_progress waiting pending requested; do
+              N=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow "$wf" --status "$st" --limit 20 | wc -l)
+              if [ "$N" -gt 0 ]; then
+                echo "$wf has $N run(s) $st"
+                BUSY=1
+              fi
+            done
+          done
+          if [ "$BUSY" -ne 0 ]; then
+            echo "::error::a deploy is queued or running; dispatch again after it finishes"
+            exit 1
+          fi
+          if [ "$MODE" = "apply" ]; then
+            DRY_OK=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow s3-old-data-delete-2026-10-09.yml --commit "$GITHUB_SHA" --status success --limit 50 | grep -c "s3-old-data-delete (dry)" || true)
+            if [ "$DRY_OK" -lt 1 ]; then
+              echo "::error::run mode=dry successfully on this same commit before mode=apply"
+              exit 1
+            fi
+          fi
+          echo "window ok: $TODAY $HM IST, no deploy running, mode=$MODE"
+
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Install Rust toolchain 1.95.0
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # SHA-pinned
+        with:
+          toolchain: '1.95.0'
+
+      - name: Build the delete tool
+        run: |
+          set -euo pipefail
+          cargo build -p tickvault-app --bin tv-s3-old-data-delete
+
+      - name: Name the one-off role
+        id: role
+        env:
+          MAIN_ROLE: ${{ secrets.AWS_ROLE_ARN }}
+        run: |
+          set -euo pipefail
+          ACCOUNT=$(cut -d: -f5 <<<"$MAIN_ROLE")
+          if ! [[ "$ACCOUNT" =~ ^[0-9]{12}$ ]]; then
+            echo "::error::could not read the AWS account id from the AWS_ROLE_ARN secret"
+            exit 1
+          fi
+          echo "::add-mask::$ACCOUNT"
+          echo "arn=arn:aws:iam::${ACCOUNT}:role/tv-prod-s3-old-data-delete-2026-10-09" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials (OIDC, one-off role only)
+        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c # v4 tag commit, 2026-07-15
+        with:
+          role-to-assume: ${{ steps.role.outputs.arn }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: tv-s3-old-data-delete-${{ github.run_id }}
+
+      - name: Check again that no deploy started during the build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          BUSY=0
+          for wf in deploy-aws.yml deploy-aws-after-close.yml postmerge-catchup.yml; do
+            for st in queued in_progress waiting pending requested; do
+              N=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow "$wf" --status "$st" --limit 20 | wc -l)
+              if [ "$N" -gt 0 ]; then
+                echo "$wf has $N run(s) $st"
+                BUSY=1
+              fi
+            done
+          done
+          if [ "$BUSY" -ne 0 ]; then
+            echo "::error::a deploy started while the tool was building; dispatch again after it finishes"
+            exit 1
+          fi
+
+      - name: Run the delete tool
+        env:
+          MODE: ${{ inputs.mode }}
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          set -euo pipefail
+          STATUS=0
+          ./target/debug/tv-s3-old-data-delete --mode "$MODE" --confirm "$CONFIRM" --report s3-delete-report.txt || STATUS=$?
+          if [ -f s3-delete-report.txt ]; then
+            {
+              echo '```'
+              cat s3-delete-report.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$STATUS"
+
+      - name: Keep the report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: s3-delete-report-${{ inputs.mode }}-${{ github.run_id }}
+          path: s3-delete-report.txt
+          if-no-files-found: warn
+          retention-days: 90

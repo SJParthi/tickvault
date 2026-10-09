@@ -287,6 +287,9 @@ pub mod trading_pipeline;
 // boot instead. The WS-REINJECT-01 paging filter was retired in lockstep
 // (error-code-alarms.tf dated note); the `WsReinject01Aborted` variant is
 // retained pending the post-sibling-merge variant sweep.
+/// One-off (operator Quote 29e, 2026-10-09): the pure half of the
+/// `tv-s3-old-data-delete` tool. Removed with the tool after the run.
+pub mod s3_old_data_delete;
 /// Shared `ws_event_audit` channel + consumer helper — relocated from the
 /// main.rs binary in Phase C1 (2026-07-13) so the lib-side `dhan_rest_stack`
 /// (which owns the functional-dormant order-update WS per operator ruling
