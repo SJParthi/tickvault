@@ -1805,8 +1805,15 @@ impl DepthWriter {
         // half-written line instead of leaving it to fail every later row.
         self.buffer.set_marker().context("marker")?;
         if let Err(err) = self.write_book_line(row, levels) {
-            let _ = self.buffer.rewind_to_marker();
-            return Err(err);
+            // Cannot fail: the marker was set just above. If it ever did, the
+            // half line stays, the next flush fails on it, and that flush's
+            // rescue keeps every buffered row; nothing is discarded here.
+            return Err(match self.buffer.rewind_to_marker() {
+                Ok(()) => err,
+                Err(rewind_err) => err.context(format!(
+                    "depth book append: rewinding the half-written line also failed: {rewind_err}"
+                )),
+            });
         }
         self.buffer.clear_marker();
         // Counted in LEVELS, the unit the level layout counts, so every
