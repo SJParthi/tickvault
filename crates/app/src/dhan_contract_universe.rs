@@ -2010,22 +2010,162 @@ pub fn spot_labels_from(
     out
 }
 
-/// Publishes spot and index names at boot, before any contract attach, so the
-/// 09:00 pre-open index ticks carry a name. Uses the if-empty publish so it can
-/// never wipe a table the attach has already filled. Returns how many names it
-/// published (0 when the artifact is unreadable or the table was already set —
-/// both leave the column NULL until the attach, never wrong).
-pub fn publish_spot_contract_labels_at_boot(date_ist: &str) -> usize {
-    let Ok(symbols) = read_symbol_map(date_ist) else {
+/// Option names for EVERY option row of the day's contract file, keyed as the
+/// candle writer probes them (`(security_id as i64, segment string)`).
+///
+/// Uncapped, unlike [`crate::contract_underlying_map::labels_from_artifact`]:
+/// at boot nothing is selected yet, and a capped file-order walk names the
+/// first 25,000 of ~121,000 rows, which need not include the contracts the
+/// WAL replay rewrites. The name is the same [`contract_label`] the attach
+/// uses, so a row written at boot and one written after the attach carry the
+/// same string. Options only, same segment derivation and zero-id refusal as
+/// the attach. O(rows), once per boot; about 11 MB until the attach replaces
+/// the table (estimate: ~121,000 entries of key, pointer and a ~25-byte name).
+///
+/// [`contract_label`]: crate::contract_underlying_map::contract_label
+#[must_use]
+fn option_labels_from(
+    contracts: &[ContractRow],
+) -> tickvault_storage::candle_contract_labels::CandleContractLabels {
+    let mut out: tickvault_storage::candle_contract_labels::CandleContractLabels =
+        HashMap::with_capacity(contracts.len());
+    for row in contracts {
+        if !matches!(row.c.as_str(), "OPTIDX" | "OPTSTK") || row.i == 0 {
+            continue;
+        }
+        let Some(segment) = derivative_segment(&row.x) else {
+            continue;
+        };
+        let Ok(id) = i64::try_from(row.i) else {
+            continue;
+        };
+        let seg = tickvault_common::segment::segment_code_to_str(segment.binary_code());
+        out.insert(
+            (id, seg),
+            std::sync::Arc::from(
+                crate::contract_underlying_map::contract_label(&row.u, row.e, row.s, &row.l)
+                    .as_str(),
+            ),
+        );
+    }
+    out
+}
+
+/// How many days before the boot's own date the boot publish looks back for a
+/// symbol map. A boot after midnight (the 2026-10-10 02:01 IST redeploy
+/// replayed 9 Oct frames) or before the day's file is built still names the
+/// rows it rewrites from the newest earlier file; 7 covers a long weekend.
+const BOOT_LABEL_LOOKBACK_DAYS: u32 = 7;
+
+/// Set once the contract attach has published the day's names. After that a
+/// boot publish never replaces the table.
+static ATTACH_LABELS_PUBLISHED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `YYYYMMDD` of the files the last boot publish read; 0 before any.
+static BOOT_LABELS_DAY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Whether a boot publish of `new_len` names read from day `new_day` replaces
+/// the held table (`held_len` names, from boot day `held_day`).
+///
+/// Never after the attach. Otherwise a newer day wins, and on the same day
+/// only a larger table (a contract file that became readable between the two
+/// boot calls). An empty table never replaces anything. Pure, O(1).
+fn boot_publish_wins(
+    attach_published: bool,
+    held_day: u32,
+    held_len: usize,
+    new_day: u32,
+    new_len: usize,
+) -> bool {
+    !attach_published
+        && new_len > 0
+        && (held_len == 0 || new_day > held_day || (new_day == held_day && new_len > held_len))
+}
+
+/// The newest day at or before `date_ist`, at most `lookback_days` back, for
+/// which `read` returns a value: that day as `YYYY-MM-DD` and the value. None
+/// when no day in the window reads or `date_ist` does not parse. O(lookback).
+fn newest_readable_day<T>(
+    date_ist: &str,
+    lookback_days: u32,
+    mut read: impl FnMut(&str) -> Option<T>,
+) -> Option<(String, T)> {
+    let mut day = chrono::NaiveDate::parse_from_str(date_ist, "%Y-%m-%d").ok()?;
+    for _ in 0..=lookback_days {
+        let date = day.format("%Y-%m-%d").to_string();
+        if let Some(value) = read(&date) {
+            return Some((date, value));
+        }
+        day = day.pred_opt()?;
+    }
+    None
+}
+
+/// `YYYY-MM-DD` as `YYYYMMDD`; 0 when it does not parse.
+fn day_key(date_ist: &str) -> u32 {
+    chrono::NaiveDate::parse_from_str(date_ist, "%Y-%m-%d")
+        .ok()
+        .and_then(|d| d.format("%Y%m%d").to_string().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Publishes contract names at boot, before the seal writer's boot drain and
+/// before the lane's WAL replay: spot and index names from the symbol map,
+/// and (since 2026-10-10) every option name from the contract file, both from
+/// the newest day at or before `date_ist` (at most
+/// [`BOOT_LABEL_LOOKBACK_DAYS`] back) whose symbol map reads. Returns how many
+/// names it published (0 when no symbol map reads, or the held table wins —
+/// both leave the column as it is, never wrong).
+///
+/// Called twice per boot, both times before the lane starts, so the attach
+/// (which runs in the lane) can never interleave with it.
+///
+/// Regression (2026-10-09): this published spot and index names only. The
+/// evening redeploys replayed the day's frame log and drained the spilled
+/// seals before the contract attach published option names (862 names from
+/// 22:30 to 22:46 IST, then 25,862). Every option candle and tick written in
+/// that window carried no `contract`, and the DEDUP UPSERT replaced the
+/// stored row whole, so rows written in the session with their name lost it:
+/// `WHERE contract = 'ITC-27Oct2026-255-CE'` stopped finding them.
+///
+/// Honest limit: a boot that replays an earlier day's frames AFTER today's
+/// files exist names them from today's files; a derivative id the master
+/// reassigned overnight would carry today's name. The attach has the same
+/// limit.
+pub fn publish_contract_labels_at_boot(date_ist: &str) -> usize {
+    let Some((date, symbols)) = newest_readable_day(date_ist, BOOT_LABEL_LOOKBACK_DAYS, |d| {
+        read_symbol_map(d).ok()
+    }) else {
         return 0;
     };
-    let labels = spot_labels_from(&symbols);
-    let n = labels.len();
-    if tickvault_storage::candle_contract_labels::publish_candle_contract_labels_if_empty(labels) {
-        n
-    } else {
-        0
+    let mut labels = spot_labels_from(&symbols);
+    // Spot segments and option segments never share a key, so the order
+    // only matters for readability. A missing contract file publishes spot
+    // names only, as before.
+    if let Ok(contracts) = read_contract_artifact(&date) {
+        labels.extend(option_labels_from(&contracts));
     }
+    let n = labels.len();
+    let new_day = day_key(&date);
+    let held_len = tickvault_storage::candle_contract_labels::candle_contract_labels().len();
+    if !boot_publish_wins(
+        ATTACH_LABELS_PUBLISHED.load(std::sync::atomic::Ordering::Acquire),
+        BOOT_LABELS_DAY.load(std::sync::atomic::Ordering::Acquire),
+        held_len,
+        new_day,
+        n,
+    ) {
+        return 0;
+    }
+    tickvault_storage::candle_contract_labels::publish_candle_contract_labels(labels);
+    BOOT_LABELS_DAY.store(new_day, std::sync::atomic::Ordering::Release);
+    tracing::info!(
+        contract_names = n,
+        names_from = %date,
+        "contract names published at boot — rows the boot rewrites keep their name"
+    );
+    n
 }
 
 /// IST "now" as epoch nanoseconds — wall clock plus the fixed IST offset, the
@@ -2236,6 +2376,9 @@ pub async fn load_contract_universe(
         // published must be included again here or this publish would drop them.
         let mut candle_labels = spot_labels_from(&symbols);
         candle_labels.extend(candle_labels_from(&labels));
+        // Set BEFORE the publish: from here on a boot publish never replaces
+        // the attach's table (2026-10-10).
+        ATTACH_LABELS_PUBLISHED.store(true, std::sync::atomic::Ordering::Release);
         let published = tickvault_storage::candle_contract_labels::publish_candle_contract_labels(
             candle_labels,
         );
@@ -4299,10 +4442,151 @@ mod tests {
     }
 
     #[test]
-    fn publish_spot_contract_labels_at_boot_publishes_nothing_without_an_artifact() {
-        // No mapping artifact exists for this date, so nothing is read and
-        // nothing is published — the column stays NULL rather than wrong.
-        assert_eq!(publish_spot_contract_labels_at_boot("1999-01-01"), 0);
+    fn publish_contract_labels_at_boot_publishes_nothing_without_an_artifact() {
+        // No mapping artifact exists for this date or the week before it, so
+        // nothing is read and nothing is published — the column stays as it
+        // is rather than wrong.
+        assert_eq!(publish_contract_labels_at_boot("1999-01-01"), 0);
+    }
+
+    /// Regression (2026-10-10): the 02:01 IST boot replayed 9 Oct frames with
+    /// today's date, found no file for it and published no names at all. The
+    /// boot now takes the newest day that reads, within the lookback.
+    #[test]
+    fn test_regression_newest_readable_day_steps_back_to_the_last_built_day() {
+        let built = ["2026-10-09"];
+        let found = newest_readable_day("2026-10-10", BOOT_LABEL_LOOKBACK_DAYS, |d| {
+            built.contains(&d).then_some(d.len())
+        });
+        assert_eq!(found, Some(("2026-10-09".to_string(), 10)));
+    }
+
+    #[test]
+    fn newest_readable_day_prefers_the_day_itself() {
+        let found = newest_readable_day("2026-10-09", 7, |d| Some(d.to_string()));
+        assert_eq!(found.map(|(d, _)| d), Some("2026-10-09".to_string()));
+    }
+
+    #[test]
+    fn newest_readable_day_stops_at_the_lookback() {
+        let mut asked = 0_u32;
+        let found: Option<(String, ())> = newest_readable_day("2026-10-09", 7, |_| {
+            asked += 1;
+            None
+        });
+        assert!(found.is_none());
+        // The day itself plus seven earlier days, never more.
+        assert_eq!(asked, 8);
+        // Exactly at the edge: a file seven days back is still found.
+        let edge = newest_readable_day("2026-10-09", 7, |d| (d == "2026-10-02").then_some(()));
+        assert!(edge.is_some());
+        let past = newest_readable_day("2026-10-09", 7, |d| (d == "2026-10-01").then_some(()));
+        assert!(past.is_none());
+    }
+
+    #[test]
+    fn newest_readable_day_refuses_a_date_that_does_not_parse() {
+        let found = newest_readable_day("09-10-2026", 7, |d| Some(d.to_string()));
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn day_key_packs_the_date_and_refuses_garbage() {
+        assert_eq!(day_key("2026-10-09"), 20_261_009);
+        assert_eq!(day_key("not a date"), 0);
+        assert!(day_key("2026-10-10") > day_key("2026-10-09"));
+    }
+
+    /// The boot publish never replaces the attach's table, never publishes
+    /// an empty one, and otherwise lets the newer day (or, on the same day, the
+    /// larger table) win.
+    #[test]
+    fn test_boot_publish_wins_truth_table() {
+        // attach, held_day, held_len, new_day, new_len
+        assert!(boot_publish_wins(false, 0, 0, 20_261_009, 862));
+        assert!(!boot_publish_wins(false, 0, 0, 20_261_009, 0));
+        // After the attach: never, whatever the boot read.
+        assert!(!boot_publish_wins(true, 0, 0, 20_261_009, 25_862));
+        assert!(!boot_publish_wins(
+            true, 20_261_009, 862, 20_261_010, 30_000
+        ));
+        // Same day: only a larger table replaces (the contract file became
+        // readable between the two boot calls).
+        assert!(boot_publish_wins(
+            false, 20_261_009, 862, 20_261_009, 121_862
+        ));
+        assert!(!boot_publish_wins(
+            false, 20_261_009, 121_862, 20_261_009, 862
+        ));
+        assert!(!boot_publish_wins(false, 20_261_009, 862, 20_261_009, 862));
+        // A newer day replaces even a larger older table.
+        assert!(boot_publish_wins(
+            false, 20_261_009, 121_862, 20_261_010, 862
+        ));
+        // An older day never replaces a newer one.
+        assert!(!boot_publish_wins(
+            false, 20_261_010, 862, 20_261_009, 121_862
+        ));
+        // An empty held table is always filled.
+        assert!(boot_publish_wins(false, 20_261_010, 0, 20_261_009, 1));
+    }
+
+    /// Regression (2026-10-09): the evening boot's frame-log replay wrote
+    /// option candles before any option name was published, and each upsert
+    /// replaced a named row with a blank one. The boot table now names every
+    /// option of the day's contract file, with the attach's own label.
+    #[test]
+    fn test_regression_option_labels_from_names_every_option_like_the_attach() {
+        let itc = ContractRow {
+            i: 85_650,
+            x: "NSE".into(),
+            c: "OPTSTK".into(),
+            e: 20_261_027,
+            s: 25_500,
+            l: "CE".into(),
+            u: "ITC".into(),
+            z: 1_725,
+        };
+        let mut future = itc.clone();
+        future.i = 9;
+        future.c = "FUTSTK".into();
+        let mut bse = itc.clone();
+        bse.i = 10;
+        bse.x = "BSE".into();
+        let mut zero = itc.clone();
+        zero.i = 0;
+        let labels = option_labels_from(&[itc.clone(), future, bse, zero]);
+        assert_eq!(labels.len(), 1, "options on NSE only, never a zero id");
+        let name = labels.get(&(85_650, "NSE_FNO")).map(|s| &**s);
+        assert_eq!(name, Some("ITC-27Oct2026-255-CE"));
+        let attach = crate::contract_underlying_map::labels_from_artifact(&[itc]);
+        assert_eq!(
+            attach.get(&(85_650, ExchangeSegment::NseFno)).map(|s| &**s),
+            name,
+            "the boot name and the attach name must be the same string"
+        );
+    }
+
+    /// The attach's own table is capped at 25,000; the boot table is not,
+    /// because nothing is selected yet and a capped file-order walk could
+    /// leave a replayed contract unnamed.
+    #[test]
+    fn test_option_labels_from_is_not_capped() {
+        let rows: Vec<ContractRow> = (1..=30_000)
+            .map(|i| {
+                let mut row = crow(i);
+                row.s = i64::try_from(i).unwrap_or(0) * 100;
+                row
+            })
+            .collect();
+        let labels = option_labels_from(&rows);
+        assert_eq!(labels.len(), 30_000);
+        assert!(labels.contains_key(&(30_000, "NSE_FNO")));
+    }
+
+    #[test]
+    fn test_option_labels_from_an_empty_file_is_empty() {
+        assert!(option_labels_from(&[]).is_empty());
     }
 
     #[test]

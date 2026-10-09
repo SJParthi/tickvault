@@ -6626,3 +6626,34 @@ Approved 2026-10-06 by the owner: "Go ahead with whatever you want dude" and "Se
 52a review round 10 (2026-10-06): no change; the poll slack constant is gone, so nothing new is published.
 
 Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
+
+## ITEM 53 — DESIGN ADDENDUM (added 2026-10-10, operator: "Check whether other contracts have the same gaps. Zero tick loss is the rule, so fix and backfill automatically."): rebuilt rows lost their contract name
+
+- [x] Publish every option name (not only spot names) at boot, before the seal writer's boot drain and again before the lane's frame-log replay, from the newest day with a file within 7 days; the attach still owns the table once it publishes
+  - Files: crates/app/src/dhan_contract_universe.rs, crates/app/src/main.rs
+  - Tests: test_regression_option_labels_from_names_every_option_like_the_attach, test_option_labels_from_is_not_capped, test_option_labels_from_an_empty_file_is_empty, test_regression_newest_readable_day_steps_back_to_the_last_built_day, newest_readable_day_stops_at_the_lookback, test_boot_publish_wins_truth_table, day_key_packs_the_date_and_refuses_garbage, publish_contract_labels_at_boot_publishes_nothing_without_an_artifact
+- [ ] Restore the blanked names for 9 Oct on the live database (after close, with the box up; design follows the read-only count)
+
+## Design (Item 53)
+
+Cause (inferred from the box logs and the code, not yet confirmed by a database query): the 9 Oct evening redeploys replayed the day's frame log and drained the spilled seals while the name table held only the 862 spot names (the boot published spots only; options arrived with the attach about 17 minutes later). Each rewritten option row was written without `contract`, and the DEDUP UPSERT replaced the named row whole, so `WHERE contract = 'ITC-27Oct2026-255-CE'` stopped matching rows that are still there. Fix: `publish_contract_labels_at_boot` adds `option_labels_from` (every OPTIDX/OPTSTK row of the contract file, uncapped, the same label as the attach) and runs twice, first just before `spawn_seal_writer_loop` and again before `spawn_dhan_feed_stack`. `boot_publish_wins` decides a replace: never after the attach, never empty, newer day wins, same day only a larger table. O(rows) once per boot call, cold.
+
+## Edge Cases (Item 53)
+
+Boot after midnight (no file for today) uses the newest earlier day within 7; no file in the window publishes nothing (column stays as it is); a contract file that becomes readable between the two boot calls replaces the smaller table; the attach running later replaces the boot table as before. BSE options and zero ids are skipped, as in the attach.
+
+## Failure Modes (Item 53)
+
+A derivative id reassigned overnight would carry the newer day's name when an older day's frames are replayed after the newer file exists (the attach has the same limit). An unreadable contract file publishes spot names only, as before. A boot table never overwrites the attach's (the flag is set before the attach publishes; both boot calls run before the lane starts).
+
+## Test Plan (Item 53)
+
+`cargo test -p tickvault-app --lib -- dhan_contract_universe` (98 passed), `cargo clippy -p tickvault-app --no-deps -- -D warnings -W clippy::perf` clean.
+
+## Rollback (Item 53)
+
+Revert the PR: the boot publishes spot names only again. No stored row changes either way.
+
+## Observability (Item 53)
+
+Two `info!` lines at boot (count and the day the names came from); the existing `tv_candle_contract_labels_published` gauge reads the full count from the first boot call instead of 862.
