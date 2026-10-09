@@ -961,6 +961,57 @@ fn test_regression_deploy_swap_resets_a_failed_unit_before_restarting() {
     );
 }
 
+// Regression: 2026-10-09 — the same missing `reset-failed` sat on the two
+// other workflow paths that restart the app (the instance downsize and the
+// operator restart / IP-change buttons in aws-control). A crash-locked unit
+// refused each of those restarts too.
+#[test]
+fn test_regression_every_workflow_restart_resets_a_failed_unit_first() {
+    let mut missing = Vec::new();
+    let mut restarts = 0usize;
+    for (rel, text) in workflow_files() {
+        let lines: Vec<&str> = text.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            if line.trim_start().starts_with('#') {
+                continue;
+            }
+            // The app unit only: `tickvault-host-tuning` is a different unit.
+            let Some(at) = line
+                .match_indices("systemctl restart tickvault")
+                .find_map(|(at, m)| {
+                    let next = line[at + m.len()..].chars().next();
+                    (!next.is_some_and(|c| c == '-' || c.is_ascii_alphanumeric())).then_some(at)
+                })
+            else {
+                continue;
+            };
+            restarts += 1;
+            let same_line = line[..at].contains("systemctl reset-failed tickvault");
+            let from = i.saturating_sub(DEPLOY_RESET_FAILED_WINDOW_LINES);
+            let before = lines[from..i].iter().any(|l| {
+                !l.trim_start().starts_with('#') && l.contains("systemctl reset-failed tickvault")
+            });
+            if !same_line && !before {
+                missing.push(format!("{rel}:{}", i + 1));
+            }
+        }
+    }
+    assert!(
+        restarts >= WORKFLOW_APP_RESTART_FLOOR,
+        "expected at least {WORKFLOW_APP_RESTART_FLOOR} workflow app restarts, found {restarts}"
+    );
+    assert!(
+        missing.is_empty(),
+        "every workflow `systemctl restart tickvault` must follow \
+         `systemctl reset-failed tickvault` (same command or the {} before it): {missing:?}",
+        DEPLOY_RESET_FAILED_WINDOW_LINES
+    );
+}
+
+/// Workflow lines that restart the app today (deploy, downsize, two in
+/// aws-control). A floor, so a rename that hides them fails loudly.
+const WORKFLOW_APP_RESTART_FLOOR: usize = 4;
+
 /// How many lines before the restart the reset may sit (the marker element
 /// sits directly before it today).
 const DEPLOY_RESET_FAILED_WINDOW_LINES: usize = 2;
