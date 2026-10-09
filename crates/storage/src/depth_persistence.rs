@@ -1810,9 +1810,9 @@ impl DepthWriter {
             // rescue keeps every buffered row; nothing is discarded here.
             return Err(match self.buffer.rewind_to_marker() {
                 Ok(()) => err,
-                Err(rewind_err) => err.context(format!(
-                    "depth book append: rewinding the half-written line also failed: {rewind_err}"
-                )),
+                Err(rewind_err) => err
+                    .context(rewind_err)
+                    .context("depth book append: rewinding the half-written line also failed"),
             });
         }
         self.buffer.clear_marker();
