@@ -562,12 +562,21 @@ const CONSOLE_SHELL_SOURCES: &[(&str, usize, usize)] = &[
 ];
 
 /// Per workflow file: `(path, SSM command elements, bytes)` ceilings,
-/// measured 2026-10-04. A workflow absent here may send no SSM shell.
+/// measured 2026-10-04 (the one-off cleanup row 2026-10-09). A workflow
+/// absent here may send no SSM shell.
 const SSM_WORKFLOW_SHELL_BUDGET: &[(&str, usize, usize)] = &[
     (".github/workflows/aws-control.yml", 22, 1486),
     (".github/workflows/deploy-aws.yml", 95, 11980),
     (".github/workflows/downsize-instance.yml", 43, 3767),
     (".github/workflows/grow-ebs-volume.yml", 9, 353),
+    // ONE-OFF, rust-only lock §0.12 (2026-10-09): Parthi's pre-today data
+    // cleanup (Quote 29). The row and the workflow are deleted together
+    // after the run; the workflow refuses to run after 2026-10-12 IST.
+    (
+        ".github/workflows/old-data-cleanup-2026-10-09.yml",
+        33,
+        2952,
+    ),
 ];
 
 /// Per file: awk/jq word-occurrence ceilings, measured 2026-10-04. A file
