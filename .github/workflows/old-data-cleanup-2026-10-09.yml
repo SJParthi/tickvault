@@ -31,9 +31,13 @@
 #     applied.tvaw, deferred_depth.tvdd, .wal-owner.lock or the open segment.
 #
 # SAFETY: mode=dry (default) only reports. mode=apply also needs
-# confirm=DELETE-BEFORE-2026-10-09. Both the runner and the box refuse inside
-# 09:00-15:45 IST on weekdays and after 2026-10-12 IST (Quote 29 is one-shot),
-# and the runner refuses while any deploy workflow is queued or running.
+# confirm=DELETE-BEFORE-2026-10-09. Both the runner and the box run only on
+# weekdays 15:45-17:10 IST (after the close, before the 17:30 stop, never
+# during the 08:30 boot replay) and refuse after 2026-10-12 IST (Quote 29 is
+# one-shot). The runner refuses while any deploy workflow is queued or running
+# and shares the deploy concurrency group. A failed or erroring QuestDB query
+# fails the job; a table with nothing to drop is skipped. SSM stops the box
+# script after 1,500 s, inside the runner's 1,800 s wait.
 #
 # NOT DONE HERE: the S3 half of Quote 29. No automated identity may delete
 # object versions in tv-prod-cold, and widening IAM is forbidden.
@@ -62,8 +66,11 @@ permissions:
   contents: read
   actions: read
 
+# Same group as deploy-aws.yml, so this job and a deploy never run at once.
+# A deploy queued later waits; dispatch only when no deploy is pending, because
+# a newly queued run in a group cancels the PENDING run already in it.
 concurrency:
-  group: old-data-cleanup-2026-10-09
+  group: deploy-aws-prod
   cancel-in-progress: false
 
 env:
@@ -98,8 +105,8 @@ jobs:
             echo "::error::Quote 29 is one-shot; this job expired after 2026-10-12 IST"
             exit 1
           fi
-          if [ "$DOW" -le 5 ] && (( 10#$HM >= 900 && 10#$HM < 1545 )); then
-            echo "::error::inside market hours (09:00-15:45 IST); run after the close"
+          if [ "$DOW" -gt 5 ] || (( 10#$HM < 1545 || 10#$HM >= 1710 )); then
+            echo "::error::runs only on weekdays 15:45-17:10 IST (after the close, before the 17:30 stop)"
             exit 1
           fi
           BUSY=0
@@ -119,7 +126,7 @@ jobs:
           echo "window ok: $TODAY $HM IST, no deploy running, mode=$MODE"
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c # v4 tag commit, 2026-07-15
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -156,26 +163,27 @@ jobs:
           "echo \"Quote 29 one-off cleanup: mode=$MODE, box time $TODAY $HM IST, removes market data dated before $CUT_DATE\"",
           "case \"$MODE\" in dry|apply) ;; *) echo \"REFUSED: mode must be dry or apply\"; exit 1;; esac",
           "if [[ \"$TODAY\" > \"$LAST_DAY\" ]]; then echo \"REFUSED: Quote 29 is one-shot and this job expired after $LAST_DAY\"; exit 1; fi",
-          "if [ \"$DOW\" -le 5 ] && (( 10#$HM >= 900 && 10#$HM < 1545 )); then echo \"REFUSED: inside market hours 09:00-15:45 IST\"; exit 1; fi",
+          "if [ \"$DOW\" -gt 5 ] || (( 10#$HM < 1545 || 10#$HM >= 1710 )); then echo \"REFUSED: runs only on weekdays 15:45-17:10 IST (after the close, before the 17:30 stop)\"; exit 1; fi",
           "[ -d \"$D\" ] || { echo \"REFUSED: $D is missing\"; exit 1; }",
           "echo \"app before: $(systemctl is-active tickvault) (never stopped by this job)\"",
           "df -h /",
-          "q() { curl -sS -m 120 -G \"$QDB\" --data-urlencode \"query=$1\"; echo; }",
-          "old() { local act=$1; shift; find \"$@\" -type f ! -newermt \"$CUT_UTC\" ! -name boot-committed.summary ! -path \"$D/spill/audit/*\" \"$act\" 2>/dev/null; }",
-          "sweep() { local dir=$1; shift; [ -d \"$dir\" ] || { echo \"$dir: absent\"; return 0; }; local n b; n=$(old -print \"$dir\" \"$@\" | wc -l); b=$(old -print0 \"$dir\" \"$@\" | du -cb --files0-from=- 2>/dev/null | tail -1 | cut -f1); echo \"$dir: $n files, ${b:-0} bytes before $CUT_DATE\"; if [ \"$MODE\" = apply ] && [ \"$n\" -gt 0 ]; then old -delete \"$dir\" \"$@\" || FAIL=1; fi; }",
+          "q() { R=$(curl -sS -m 120 -G \"$QDB\" --data-urlencode \"query=$1\") || { echo \"QUERY FAILED: $1\"; FAIL=1; return 1; }; echo \"$R\"; case \"$R\" in *\\\"error\\\"*) echo \"QUERY ERROR: $1\"; FAIL=1; return 1;; esac; }",
+          "old() { find \"$1\" -ignore_readdir_race -maxdepth \"$2\" -type f -name \"$3\" ! -newermt \"$CUT_UTC\" ! -name boot-committed.summary ! -path \"$D/spill/audit/*\" \"$4\"; }",
+          "sweep() { local n b; [ -d \"$1\" ] || { echo \"$1: absent\"; return 0; }; n=$(old \"$1\" \"$2\" \"$3\" -print | wc -l); b=$(old \"$1\" \"$2\" \"$3\" -print0 | du -cb --files0-from=- 2>/dev/null | tail -1 | cut -f1); echo \"$1: $n files, ${b:-0} bytes before $CUT_DATE\"; if [ \"$MODE\" = apply ] && [ \"$n\" -gt 0 ]; then old \"$1\" \"$2\" \"$3\" -delete || { echo \"DELETE FAILED in $1\"; FAIL=1; }; fi; }",
           "echo \"=== frame log segments (open segment, applied.tvaw, deferred_depth.tvdd and .wal-owner.lock are never matched)\"",
-          "for s in \"\" /replaying /archive /uploaded; do sweep \"$D/ws_wal$s\" -maxdepth 1 -name \"ws-frames-*\"; done",
+          "for s in \"\" /replaying /archive /uploaded; do sweep \"$D/ws_wal$s\" 1 \"ws-frames-*\"; done",
           "echo \"=== spill, hold, dead-letter and temp files (spill/audit and boot-committed.summary are never matched)\"",
-          "for s in spill/ticks spill/depth spill/archive spill/refused spill/replaying spill-hold dlq tmp/partition-archive; do sweep \"$D/$s\"; done",
-          "sweep \"$D/spill\" -maxdepth 1 -name \"seals_v4-*\"",
-          "echo \"=== QuestDB apply state (a drop queued behind the depth backlog frees disk only when apply catches up)\"",
-          "q \"SELECT name, suspended, writerTxn, sequencerTxn FROM wal_tables() WHERE name IN (${SQ}ticks${SQ},${SQ}market_depth${SQ},${SQ}feed_aux_packets${SQ})\"",
-          "for t in ticks market_depth feed_aux_packets top_volume_1s top_volume_3s top_volume_5s top_volume_1m candles_1s candles_3s candles_5s candles_1m candles_3m candles_5m candles_10m candles_15m candles_30m candles_60m; do echo \"--- $t\"; q \"SELECT count() partitions, sum(diskSize) bytes FROM table_partitions(${SQ}$t${SQ}) WHERE maxTimestamp < ${SQ}$CUT_DATE${SQ}\"; if [ \"$MODE\" = apply ]; then q \"ALTER TABLE $t DROP PARTITION WHERE ts < ${SQ}$CUT_DATE${SQ}\"; fi; done",
+          "for s in spill/ticks spill/depth spill/archive spill/refused spill/replaying spill-hold dlq tmp/partition-archive; do sweep \"$D/$s\" 99 \"*\"; done",
+          "sweep \"$D/spill\" 1 \"seals_v4-*\"",
+          "echo \"=== QuestDB partitions dated before $CUT_DATE (a drop is queued behind the write backlog of that table)\"",
+          "for t in ticks market_depth feed_aux_packets top_volume_1s top_volume_3s top_volume_5s top_volume_1m candles_1s candles_3s candles_5s candles_1m candles_3m candles_5m candles_10m candles_15m candles_30m candles_60m; do echo \"--- $t\"; q \"SELECT count() partitions, sum(diskSize) bytes FROM table_partitions(${SQ}$t${SQ}) WHERE maxTimestamp < ${SQ}$CUT_DATE${SQ}\" || continue; P=${R#*\\\"dataset\\\":\\[\\[}; P=${P%%[!0-9]*}; if [ -z \"$P\" ]; then echo \"QUERY ERROR: no partition count for $t\"; FAIL=1; elif [ \"$MODE\" = apply ] && [ \"$P\" -gt 0 ]; then q \"ALTER TABLE $t DROP PARTITION WHERE ts < ${SQ}$CUT_DATE${SQ}\"; fi; done",
+          "echo \"=== tables whose writes are not yet applied (their drops free disk only when apply catches up)\"",
+          "q \"SELECT name, suspended, writerTxn, sequencerTxn FROM wal_tables() WHERE writerTxn < sequencerTxn\"",
           "sync",
           "echo \"app after: $(systemctl is-active tickvault)\"",
           "df -h /",
-          "if [ \"$FAIL\" -ne 0 ]; then echo \"FAILED: at least one delete did not complete\"; exit 1; fi",
-          "echo \"finished mode=$MODE\""]'
+          "if [ \"$FAIL\" -ne 0 ]; then echo \"FAILED: at least one delete or query did not complete\"; exit 1; fi",
+          "echo \"finished mode=$MODE\""],executionTimeout=["1500"]'
           PARAMS=$(printf '%s' "$PARAMS" | tr -d '\n')
           PARAMS=${PARAMS//__MODE__/$MODE}
           CMD=$(aws ssm send-command --instance-ids "$IID" \

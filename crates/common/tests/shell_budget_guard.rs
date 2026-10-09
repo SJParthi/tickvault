@@ -574,8 +574,8 @@ const SSM_WORKFLOW_SHELL_BUDGET: &[(&str, usize, usize)] = &[
     // after the run; the workflow refuses to run after 2026-10-12 IST.
     (
         ".github/workflows/old-data-cleanup-2026-10-09.yml",
-        33,
-        2952,
+        34,
+        3384,
     ),
 ];
 
@@ -1038,6 +1038,29 @@ fn ssm_workflow_shell_never_grows() {
          subcommand) and call that. Measured now:\n{}",
         problems.join("\n"),
         report.join("\n")
+    );
+}
+
+/// The one-off Quote 29 cleanup (rust-only lock §0.12) must not outlive its
+/// window. From 2026-10-14 IST the workflow and its budget row must both be
+/// gone, so a forgotten exception fails the build instead of lingering.
+#[test]
+fn one_off_cleanup_is_removed_after_its_window() {
+    const WF: &str = ".github/workflows/old-data-cleanup-2026-10-09.yml";
+    const REMOVE_BY_IST: &str = "2026-10-14";
+    let today_ist = (chrono::Utc::now() + chrono::Duration::minutes(330))
+        .format("%Y-%m-%d")
+        .to_string();
+    if today_ist.as_str() < REMOVE_BY_IST {
+        return;
+    }
+    let file_left = repo_root().join(WF).exists();
+    let row_left = SSM_WORKFLOW_SHELL_BUDGET.iter().any(|r| r.0 == WF);
+    assert!(
+        !file_left && !row_left,
+        "`{WF}` was a one-off (rust-only lock §0.12) and expired after 2026-10-12 IST. \
+         Delete the workflow and its SSM_WORKFLOW_SHELL_BUDGET row \
+         (file still present: {file_left}, row still present: {row_left})."
     );
 }
 

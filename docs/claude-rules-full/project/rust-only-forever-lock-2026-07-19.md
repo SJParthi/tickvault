@@ -1065,13 +1065,24 @@ other FFI crate; pinning any thread to core 0.
 
 **What is authorized:** one workflow,
 `.github/workflows/old-data-cleanup-2026-10-09.yml`, that sends one SSM
-`AWS-RunShellScript` payload of 33 elements / 2,952 bytes (budget row in
-`crates/common/tests/shell_budget_guard.rs`) to delete market data dated
-before 2026-10-09 IST, exactly the scope Quote 29 / 29c record in
-`daily-universe-scope-expansion-2026-05-27.md`. It is dispatch-only, reports
-before it deletes (`mode=dry`), needs a typed confirmation to delete, refuses
-inside 09:00–15:45 IST on weekdays, refuses while a deploy is queued or
-running, refuses after 2026-10-12 IST, and never stops the app.
+`AWS-RunShellScript` payload of 34 elements / 3,384 bytes (budget row in
+`crates/common/tests/shell_budget_guard.rs`). It covers the BOX half of
+Quote 29 only: it deletes frame-log, spill, hold, dead-letter and temp files
+last written before 2026-10-09 IST and queues `DROP PARTITION` for the 17
+market-data tables. It does nothing in S3 (no automated identity may delete
+object versions there, and widening IAM is forbidden). It is dispatch-only,
+reports before it deletes (`mode=dry`), needs a typed confirmation to delete,
+runs only on weekdays 15:45–17:10 IST (after the close and before the 17:30
+stop), shares the deploy concurrency group and refuses while a deploy is
+queued or running, refuses after 2026-10-12 IST, fails on any QuestDB error,
+and never stops the app. The app keeps running because Quote 29c records the
+run with the app left running; after the close the frame log no longer grows
+and nothing it deletes is open.
+
+**Correction recorded:** the 09:46 UTC card said the disk would fill
+"tomorrow". Today is Friday and the box does not run at weekends, so the
+estimate is Monday 2026-10-12 before noon (Assumed). Parthi was told at
+10:03 UTC. The choice on the card is unaffected.
 
 **Why not Rust:** the disk was 95.6% full at 14:46 IST and the box stops at
 17:30 IST; a `tickvault-host` subcommand needs a reviewed code change plus a
