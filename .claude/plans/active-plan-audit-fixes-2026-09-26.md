@@ -228,6 +228,18 @@ inline (PR2, PR8, PR14).
     instructions in `f32_to_f64_clean` (four to five calls per tick), not in the hash probe.
     Still open: Re-check 6 above and the PR10 rows folded in further down (buffer pre-sizes,
     label table, keepalive counters, delay timer, depth writer name checks).
+  - Progress 2026-10-09 (`common`, price widening): `f32_to_f64_clean` no longer formats every
+    price to text and parses it back. For 0 < |v| < 2^24 it finds the nearest integer m with
+    m / 10^k rounding back to v for k in 0..=9; m and 10^k are exact in f64, so the division
+    gives the same f64 the parse did. Everything else keeps the text path
+    (`f32_to_f64_clean_via_text`). Prototype: 129 -> 17 ns per call. An `#[ignore]`d test compares
+    both paths on all 2^32 f32 inputs: 0 differences, 382 s on 4 cores in release. File:
+    `crates/common/src/price_precision.rs`, `crates/common/tests/ignored_test_guard.rs` (allowlists
+    the exhaustive test). Tests:
+    test_f32_to_f64_clean_matches_text_path_for_every_f32 (ignored, exhaustive),
+    test_f32_to_f64_clean_matches_text_path_for_every_paise_price,
+    test_f32_to_f64_clean_matches_text_path_on_a_stride_of_all_f32,
+    test_f32_to_f64_clean_boundary_values_match_text_path.
 - [ ] **PR11 — disk ballast and token recovery without a restart.** (`storage`, `core`, `app`)
   - Disk headroom gauges and alarms already exist (disk_pressure_boot.rs:242, app-alarms.tf:312,
     :376). Missing: an ENOSPC ballast — a pre-allocated reserve file on the data volume, released

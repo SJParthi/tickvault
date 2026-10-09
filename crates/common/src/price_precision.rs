@@ -39,19 +39,79 @@ use std::io::Write;
 /// (ryu's f32 buffer is 16; +8 of slack for safety).
 const F32_DECIMAL_BUF_SIZE: usize = 24;
 
+/// Powers of ten tried by [`f32_to_f64_clean`]'s arithmetic path, in
+/// order: decimal places 0 through 9. Every entry is exact in `f64`.
+const DECIMAL_SCALES: [f64; 10] = [1.0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9];
+
+/// Magnitude bound of the arithmetic path: 2^24. Below it every integer
+/// is an `f32`, so the shortest decimal of a value never ends in an
+/// integer-part zero the arithmetic could miss; at or above it the
+/// shortest form can round the integer part (`123456792_f32` displays
+/// as `123456790`), and the text path handles it.
+const ARITHMETIC_PATH_MAX_MAGNITUDE: f32 = 16_777_216.0;
+
 /// Converts `f32` → `f64` without IEEE-754 widening artifacts.
 ///
-/// Zero allocation. O(1) — one ryu format + one parse.
+/// The result is the `f64` nearest to the shortest decimal that
+/// round-trips through `f32` (what `{v}` prints). Zero allocation.
+///
+/// # How
+///
+/// For `0 < |v| < 2^24` it searches decimal places 0..=9: at each scale
+/// `s` it takes the nearest integer `m` to `v·s` (then its other
+/// neighbour) and accepts the first `m / s` that rounds back to `v` as
+/// an `f32`. `m` and `s` are exact in `f64`, so the IEEE division gives
+/// the nearest `f64` to the decimal `m / s`, which is what parsing the
+/// printed text gives. Anything else (zero, non-finite, larger values,
+/// or no hit within nine places) takes the format-and-parse path.
+///
+/// Bit-identical to the format-and-parse path for all 2^32 inputs,
+/// checked by `test_f32_to_f64_clean_matches_text_path_for_every_f32`
+/// (`#[ignore]`d: about 8 minutes on 4 cores, release).
 ///
 /// # Performance
 ///
-/// Hot path safe — no heap allocation; ~50ns per call on the bench
-/// machine. Used in `tick_persistence::append_tick` (per-tick) and
-/// `aggregator_cell::fold_in_bucket` (per-tick) — both budgeted at
-/// <100ns end-to-end.
+/// O(1): at most 10 scales × 2 candidates, then the text path. Measured
+/// 2026-10-09 (release, x86 dev container, 1,000 price-like inputs):
+/// about 17 ns per call against 129 ns for format-and-parse. Used per
+/// tick in `tick_persistence::append_tick` and the candle fold.
 #[inline]
 #[must_use]
 pub fn f32_to_f64_clean(v: f32) -> f64 {
+    let magnitude = v.abs();
+    if magnitude > 0.0 && magnitude < ARITHMETIC_PATH_MAX_MAGNITUDE {
+        // APPROVED: f64::from(f32) is exact; only the scaled candidates
+        // below are returned, never this widened value.
+        let widened = f64::from(v);
+        for scale in DECIMAL_SCALES {
+            let scaled = widened * scale;
+            let nearest = scaled.round();
+            let candidate = nearest / scale;
+            #[allow(clippy::cast_possible_truncation)]
+            // APPROVED: narrowing is the round-trip test itself
+            if candidate as f32 == v {
+                return candidate;
+            }
+            let other = if scaled > nearest {
+                nearest + 1.0
+            } else {
+                nearest - 1.0
+            };
+            let candidate = other / scale;
+            #[allow(clippy::cast_possible_truncation)]
+            // APPROVED: narrowing is the round-trip test itself
+            if candidate as f32 == v {
+                return candidate;
+            }
+        }
+    }
+    f32_to_f64_clean_via_text(v)
+}
+
+/// The format-and-parse conversion: print the shortest round-trip
+/// decimal (`{v}`, ryu) and parse it as `f64`. The reference the
+/// arithmetic path in [`f32_to_f64_clean`] must match, and its fallback.
+fn f32_to_f64_clean_via_text(v: f32) -> f64 {
     if v == 0.0 || !v.is_finite() {
         // APPROVED: f64::from(f32) is correct for zero/inf/NaN — no
         // precision loss for these values, only for ordinary decimals.
@@ -208,6 +268,105 @@ mod tests {
         assert_eq!(f32_to_f64_clean(23_924.4_f32), 23924.40_f64);
         assert_eq!(f32_to_f64_clean(10.20_f32), 10.20_f64);
         assert_eq!(f32_to_f64_clean(21004.95_f32), 21004.95_f64);
+    }
+
+    /// Bit comparison that treats every NaN as equal to every NaN.
+    fn same_bits(left: f64, right: f64) -> bool {
+        left.to_bits() == right.to_bits() || (left.is_nan() && right.is_nan())
+    }
+
+    #[test]
+    fn test_f32_to_f64_clean_matches_text_path_for_every_paise_price() {
+        // Every price in paise from 0 to 2,00,000.00 rupees, both signs:
+        // the values the feed actually carries.
+        for paise in 0_u32..=20_000_000 {
+            #[allow(clippy::cast_precision_loss)]
+            // APPROVED: test input generation, paise < 2^25
+            let price = paise as f32 / 100.0;
+            for v in [price, -price] {
+                let (fast, text) = (f32_to_f64_clean(v), f32_to_f64_clean_via_text(v));
+                assert!(same_bits(fast, text), "{v}: {fast} != {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_f32_to_f64_clean_matches_text_path_on_a_stride_of_all_f32() {
+        // Every 4,099th bit pattern (about one million inputs) across
+        // the whole f32 range: subnormals, tiny and huge values, the
+        // 2^24 boundary, both signs, infinities and NaNs.
+        let mut bits: u64 = 0;
+        while bits <= u64::from(u32::MAX) {
+            #[allow(clippy::cast_possible_truncation)]
+            // APPROVED: loop bound keeps bits within u32
+            let v = f32::from_bits(bits as u32);
+            let (fast, text) = (f32_to_f64_clean(v), f32_to_f64_clean_via_text(v));
+            assert!(same_bits(fast, text), "{v:e}: {fast} != {text}");
+            bits += 4_099;
+        }
+    }
+
+    #[test]
+    fn test_f32_to_f64_clean_boundary_values_match_text_path() {
+        let boundaries = [
+            ARITHMETIC_PATH_MAX_MAGNITUDE,
+            f32::from_bits(ARITHMETIC_PATH_MAX_MAGNITUDE.to_bits() - 1),
+            f32::from_bits(ARITHMETIC_PATH_MAX_MAGNITUDE.to_bits() + 1),
+            123_456_792.0,
+            f32::MIN_POSITIVE,
+            f32::from_bits(1),
+            f32::MAX,
+            0.1,
+            0.3,
+            1e-9,
+            -0.0,
+        ];
+        for v in boundaries {
+            for v in [v, -v] {
+                let (fast, text) = (f32_to_f64_clean(v), f32_to_f64_clean_via_text(v));
+                assert!(same_bits(fast, text), "{v:e}: {fast} != {text}");
+            }
+        }
+    }
+
+    /// The full proof: all 2^32 inputs, split across the machine's
+    /// threads. Measured 2026-10-09: 0 differences, 382 s on 4
+    /// cores (release). Run with
+    /// `cargo test -p tickvault-common --release --lib -- --ignored every_f32`.
+    #[test]
+    #[ignore = "exhaustive: minutes in release, far longer in debug"]
+    fn test_f32_to_f64_clean_matches_text_path_for_every_f32() {
+        let threads = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+        let threads = u64::try_from(threads).unwrap_or(4);
+        let span = 1_u64 << 32;
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                std::thread::spawn(move || {
+                    let (low, high) = (span * t / threads, span * (t + 1) / threads);
+                    let mut first_difference = None;
+                    let mut differences = 0_u64;
+                    for bits in low..high {
+                        #[allow(clippy::cast_possible_truncation)]
+                        // APPROVED: bits < 2^32
+                        let v = f32::from_bits(bits as u32);
+                        let (fast, text) = (f32_to_f64_clean(v), f32_to_f64_clean_via_text(v));
+                        if !same_bits(fast, text) {
+                            differences += 1;
+                            first_difference.get_or_insert((v, fast, text));
+                        }
+                    }
+                    (differences, first_difference)
+                })
+            })
+            .collect();
+        let mut differences = 0;
+        let mut first = None;
+        for handle in handles {
+            let (count, example) = handle.join().expect("worker thread panicked");
+            differences += count;
+            first = first.or(example);
+        }
+        assert_eq!(differences, 0, "first difference: {first:?}");
     }
 
     #[test]
