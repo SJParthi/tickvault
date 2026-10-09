@@ -110,6 +110,11 @@ pub struct ApplicationConfig {
     /// dated operator quote in the scope lock, never a config edit alone.
     #[serde(default)]
     pub depth_unsubscribe_probe: DepthUnsubscribeProbeConfig,
+    /// `[depth_storage]` — where depth rows are written (plan item 49e
+    /// step 3). DEFAULT OFF: an absent section keeps one row per level in
+    /// `market_depth`. Turning it on is the operator step (step 4).
+    #[serde(default)]
+    pub depth_storage: DepthStorageConfig,
     /// `[groww_option_chain_1m]` — Groww per-minute option-chain REST leg
     /// `[tf_consistency]` — daily timeframe-consistency verifier (operator
     /// directive 2026-07-13: *"how will you guarantee that all our defined
@@ -982,6 +987,22 @@ pub struct DepthUnsubscribeProbeConfig {
     /// the request code was never the variable.
     #[serde(default)]
     pub socket_close_arm: bool,
+}
+
+/// `[depth_storage]` — the depth table layout (plan item 49e step 3).
+///
+/// `array_rows = false` (the default, and what an absent section means)
+/// writes one `market_depth` row per price level, as before. `true` writes
+/// one `market_depth_book` row per book side per packet, with the levels in
+/// three `DOUBLE[]` columns — about 11 to 13.5 times fewer bytes for QuestDB
+/// to apply (scratch-table test, 2026-10-06). Frames received before the
+/// first boot that had it on keep going to `market_depth`, so a replay never
+/// writes one packet into both tables.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+pub struct DepthStorageConfig {
+    /// Write depth as array rows into `market_depth_book`.
+    #[serde(default)]
+    pub array_rows: bool,
 }
 
 /// `[dhan_universe]` — daily Dhan master + NSE India indices download + join.
@@ -3065,6 +3086,27 @@ fn expired_live_gates(
 mod tests {
     use super::*;
 
+    // Plan item 49e step 3: array rows stay off unless the operator says so.
+    #[test]
+    fn test_depth_storage_config_array_rows_is_off_by_default_and_when_absent() {
+        assert!(!DepthStorageConfig::default().array_rows);
+        let empty: DepthStorageConfig = toml::from_str("").expect("empty section must parse");
+        assert!(!empty.array_rows);
+        let on: DepthStorageConfig = toml::from_str("array_rows = true").expect("must parse");
+        assert!(on.array_rows);
+    }
+
+    #[test]
+    fn test_depth_storage_config_ships_off_in_base_toml() {
+        let base = include_str!("../../../config/base.toml");
+        let section = base
+            .split_once("[depth_storage]")
+            .map(|(_, rest)| rest.split("\n[").next().unwrap_or(""))
+            .expect("base.toml must carry a [depth_storage] section");
+        assert!(section.contains("array_rows = false"), "{section}");
+        assert!(!section.contains("array_rows = true"), "{section}");
+    }
+
     // =======================================================================
     // S6-Step4: Sandbox-only enforcement tests
     // =======================================================================
@@ -3624,6 +3666,7 @@ mod tests {
             oms_reconcile: OmsReconcileConfig::default(),
             dhan_data_api: DhanDataApiConfig::default(),
             depth_unsubscribe_probe: DepthUnsubscribeProbeConfig::default(),
+            depth_storage: DepthStorageConfig::default(),
             tf_consistency: TfConsistencyConfig::default(),
             rest_candle_fold: RestCandleFoldConfig::default(),
             market_ram_store: MarketRamStoreConfig::default(),
