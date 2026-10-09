@@ -3002,6 +3002,23 @@ Status of the rest, so the next session does not re-audit:
   24 production files across api, app, core, storage and trading, plus
   `crates/common/tests/error_code_tag_guard.rs`. Tests: uncoded_error_sites_may_only_shrink,
   every_critical_code_with_an_emit_site_is_alarmed_or_allowlisted.
+- [x] **M3 (third pass) — the seven uncoded `error!` lines outside the frozen area carry a code.**
+  Six new Medium codes, none matched by any CloudWatch filter (no new page, no new alarm or
+  filter, no shrink-only exemption entry): WS-SPILL-03 (WAL init failure, boot halts; the halt
+  is still paged by the existing boot-heartbeat and liveness alarms), WS-SPILL-04 (unreadable WAL
+  segment skipped at replay; already paged by the existing durable-floor-breach counter alarm),
+  PROC-03 (panic hook, also on the synchronous errors.log line), API-SERVER-01 (API server exit),
+  TICK-GAP-01 (both tick-gap tracker lines, `source` instrument_gap / reconnect_backfill_window;
+  not RISK-GAP-03, which pages on every line) and PIPELINE-LAG-01 (trading pipeline broadcast
+  lag). The ratchet drops 10 -> 3; the three left are the frozen indicator/strategy lines. Files:
+  `crates/common/src/error_code.rs`, `crates/app/src/main.rs`, `crates/app/src/observability.rs`,
+  `crates/app/src/trading_pipeline.rs`, `crates/storage/src/ws_frame_spill.rs`,
+  `crates/trading/src/risk/tick_gap_tracker.rs`, `crates/common/tests/error_code_tag_guard.rs`,
+  `docs/error-runbooks/audit-m3-error-codes.md`, `docs/error-runbooks/ws-frame-spill-error-codes.md`,
+  `.claude/triage/error-rules.yaml`, `docs/audit-2026-10-04.md`. Tests:
+  uncoded_error_sites_may_only_shrink, test_audit_m3_codes_contract,
+  every_error_code_variant_has_a_triage_rule, every_error_code_variant_appears_in_a_rule_file,
+  test_append_panic_line_sync_panic_hook_writes_errors_log_synchronously.
 
 - [x] **H3 (core) — a loom test drives the real ghost-unsubscribe register.** The six
   per-slot registers move into `GhostRegister` (atomics from the new `crate::sync` shim:

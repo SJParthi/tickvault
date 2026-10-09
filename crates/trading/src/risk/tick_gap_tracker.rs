@@ -289,7 +289,11 @@ impl TickGapTracker {
             // branch below (gap_secs < WARN) once ticks resume normally.
             self.total_errors = self.total_errors.saturating_add(1);
             if !state.error_gap_alerted {
+                // TICK-GAP-01, not RISK-GAP-03: that code's filter pages on
+                // every line, and this fires once per silent instrument.
                 error!(
+                    code = tickvault_common::error_code::ErrorCode::TickGap01TrackerGap.code_str(),
+                    source = "instrument_gap",
                     security_id = security_id,
                     gap_secs = gap_secs,
                     last_ts = state.last_exchange_timestamp,
@@ -552,6 +556,8 @@ impl TickGapTracker {
         )
         .increment(active.len() as u64);
         tracing::error!(
+            code = tickvault_common::error_code::ErrorCode::TickGap01TrackerGap.code_str(),
+            source = "reconnect_backfill_window",
             connection_label = connection_label,
             recently_active_count = active.len(),
             window_secs = window_secs,

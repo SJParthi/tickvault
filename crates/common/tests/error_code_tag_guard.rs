@@ -334,7 +334,24 @@ fn scan_corpus_exists_and_is_substantial() {
 /// any crash would page at boot); the WAL init failure, the panic hook and the
 /// API server exit (no existing code fits; each needs its own code and
 /// runbook).
-const UNCODED_ERROR_BUDGET: usize = 10;
+///
+/// 10 -> 3 (2026-10-06, workspace audit M3, third pass). The seven above
+/// that sit outside the frozen area are CODED, with six new Medium codes
+/// that no CloudWatch filter matches (checked against every `pattern` in
+/// `deploy/aws/terraform/*.tf`: the filters match exact code strings, and
+/// none names these), so this step adds no page:
+/// `WS-SPILL-03` (WAL init failure; the halted boot is still paged by the
+/// existing boot-heartbeat and liveness alarms), `WS-SPILL-04` (unreadable
+/// WAL segment skipped at replay), `PROC-03` (the panic hook),
+/// `API-SERVER-01` (the API server exit), `TICK-GAP-01` (both tick-gap
+/// tracker lines, `source` = `instrument_gap` / `reconnect_backfill_window`)
+/// and `PIPELINE-LAG-01` (the trading pipeline's broadcast lag). Runbook:
+/// `docs/error-runbooks/audit-m3-error-codes.md`.
+///
+/// The three left are the frozen-area lines (`indicator/engine.rs` and two
+/// in `strategy/hot_reload.rs`); they change only with a fresh dated
+/// operator approval under `daily-universe-scope-expansion` §28.
+const UNCODED_ERROR_BUDGET: usize = 3;
 
 /// Per-crate uncoded-error budgets, for the crates the six-name list never
 /// reached.
