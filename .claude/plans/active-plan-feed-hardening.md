@@ -6560,3 +6560,32 @@ Approved 2026-10-06 by the owner: "Go ahead with whatever you want dude" and "Se
 52a review round 10 (2026-10-06): no change; the poll slack constant is gone, so nothing new is published.
 
 Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
+
+## ITEM 53 — ONE-TIME S3 DELETE OF THE PRE-9-OCT COPIES (Quote 29e, added 2026-10-09)
+
+Authority: Quote 29e in `docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md` (owner tapped "One-time permission", 2026-10-09 21:52 IST).
+
+- [x] 53a — one-off role, Rust delete tool and dispatch workflow (crates/app, tickvault-app).
+  - Files: deploy/aws/terraform/s3-old-data-delete-2026-10-09.tf, crates/app/src/s3_old_data_delete.rs, crates/app/src/bin/s3_old_data_delete.rs, crates/app/Cargo.toml, crates/app/src/lib.rs, .github/workflows/s3-old-data-delete-2026-10-09.yml
+  - Tests: test_classify_partition_keys, test_classify_dated_folder_keys, test_market_data_tables_match_the_iam_grant, test_run_refusal_rules, test_plan_counts_versions_markers_and_bytes, test_run_refuses_a_bad_mode_and_an_unconfirmed_apply
+- [ ] 53b — after the run: delete the role, workflow and tool; mark Quote 29e ENDED.
+  - Files: filled in by its PR
+  - Tests: filled in by its PR
+
+### Design (Item 53)
+The tool lists every version and delete marker under 19 exact prefixes (17 market-data tables under `questdb-partitions/`, plus `raw-frames/` and `seal-spill/`), classifies each key by the date it starts with, and deletes only versions dated before 2026-10-09 by version id, 1,000 per DeleteObjects call. The role can list only those prefixes and delete only versions (never `s3:DeleteObject`, so no delete marker), and is denied today's keys, `deploys/`, `sebi-preserve/` and bucket settings. Code and IAM grant are held in lockstep by a test that reads the terraform file.
+
+### Edge Cases (Item 53)
+A key from any year but 2026, a nested path, or an unparsable date is kept and listed. A null version id is deleted as "null". A truncated listing with no next marker fails the run.
+
+### Failure Modes (Item 53)
+A refused delete is listed per key and fails the job; the verify listing fails the job if anything in scope remains. A run past 2026-10-16, an apply between 09:00 and 15:45 IST, an apply without the confirm word or without a prior successful dry run, or a run during a deploy is refused before any AWS call.
+
+### Test Plan (Item 53)
+Unit tests for classification, plan totals, refusal rules, report cap and the tf/code lockstep; binary tests for flag parsing and refusals. The dry run on the real bucket is the end-to-end check before apply.
+
+### Rollback (Item 53)
+Nothing is deleted until apply. Deleted versions cannot be restored; that is the owner's stated intent. The role is removed by 53b.
+
+### Observability (Item 53)
+The job summary and an uploaded artifact carry the per-group report before and after the delete, including every kept-unparsed key (up to 50).
