@@ -1,0 +1,210 @@
+# old-data-cleanup-2026-10-09.yml — ONE-OFF removal of market data dated before
+# 2026-10-09 IST from the prod box. Runs on the box over SSM; the app keeps running.
+#
+# Authorization (recorded BEFORE this file was written):
+#   * Quote 29 / 29b / 29c / 29d in
+#     docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md
+#     (pre-today wipe, "Delete everything", "Server and S3", run with the app
+#     left running).
+#   * The rust-only lock exception §0.12 in
+#     docs/claude-rules-full/project/rust-only-forever-lock-2026-07-19.md
+#     (Parthi tapped "Workflow tonight", 2026-10-09 09:46 UTC, after saying
+#     "nope i wont run anythign dude evryhting needs to be automated dude okay?").
+#     Its shell is budgeted in crates/common/tests/shell_budget_guard.rs and the
+#     whole file is deleted after the run.
+#
+# WHY (measured 2026-10-09, CloudWatch disk_used_percent on tv-prod-app): the
+# root volume reached 95.6% at 14:46 IST and rises about 9% per trading day,
+# because the market_depth QuestDB table is ~200k writes behind and the archiver
+# moves nothing off the box while a table lags.
+#
+# WHAT IT DOES ON THE BOX (the commands are in the SSM payload below):
+#   * deletes frame-log segments (data/ws_wal and its replaying/, archive/,
+#     uploaded/ folders) last written before 2026-10-09 00:00 IST;
+#   * deletes spill, hold, dead-letter and temp files last written before then;
+#     data/spill/audit (SEBI order and P&L spills) and boot-committed.summary
+#     are never matched;
+#   * queues ALTER TABLE ... DROP PARTITION WHERE ts < '2026-10-09' on the 17
+#     market-data tables (ticks, market_depth, feed_aux_packets, top_volume_*,
+#     candles_*). SEBI, audit and lifecycle tables are not in the list.
+#   * never stops, restarts or disables tickvault; never touches today's data,
+#     applied.tvaw, deferred_depth.tvdd, .wal-owner.lock or the open segment.
+#
+# SAFETY: mode=dry (default) only reports. mode=apply also needs
+# confirm=DELETE-BEFORE-2026-10-09. Both the runner and the box run only on
+# weekdays 15:45-17:10 IST (after the close, before the 17:30 stop, never
+# during the 08:30 boot replay) and refuse after 2026-10-12 IST (Quote 29 is
+# one-shot). The runner refuses while any deploy workflow is queued or running
+# and shares the deploy concurrency group. A failed or erroring QuestDB query
+# fails the job; a table with nothing to drop is skipped. SSM stops the box
+# script after 1,500 s, inside the runner's 1,800 s wait.
+#
+# NOT DONE HERE: the S3 half of Quote 29. No automated identity may delete
+# object versions in tv-prod-cold, and widening IAM is forbidden.
+
+name: old-data-cleanup-2026-10-09
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'dry = report only; apply = delete'
+        required: true
+        default: dry
+        type: choice
+        options:
+          - dry
+          - apply
+      confirm:
+        description: 'For apply, type DELETE-BEFORE-2026-10-09'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+  actions: read
+
+# Same group as deploy-aws.yml, so this job and a deploy never run at once.
+# A deploy queued later waits; dispatch only when no deploy is pending, because
+# a newly queued run in a group cancels the PENDING run already in it.
+concurrency:
+  group: deploy-aws-prod
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-south-1
+
+jobs:
+  cleanup:
+    name: cleanup (${{ inputs.mode }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Refuse outside the allowed window
+        env:
+          MODE: ${{ inputs.mode }}
+          CONFIRM: ${{ inputs.confirm }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          case "$MODE" in
+            dry) ;;
+            apply)
+              if [ "$CONFIRM" != "DELETE-BEFORE-2026-10-09" ]; then
+                echo "::error::mode=apply needs confirm=DELETE-BEFORE-2026-10-09"
+                exit 1
+              fi ;;
+            *) echo "::error::mode must be dry or apply"; exit 1 ;;
+          esac
+          TODAY=$(TZ=Asia/Kolkata date +%F)
+          HM=$(TZ=Asia/Kolkata date +%H%M)
+          DOW=$(TZ=Asia/Kolkata date +%u)
+          if [[ "$TODAY" > "2026-10-12" ]]; then
+            echo "::error::Quote 29 is one-shot; this job expired after 2026-10-12 IST"
+            exit 1
+          fi
+          if [ "$DOW" -gt 5 ] || (( 10#$HM < 1545 || 10#$HM >= 1710 )); then
+            echo "::error::runs only on weekdays 15:45-17:10 IST (after the close, before the 17:30 stop)"
+            exit 1
+          fi
+          BUSY=0
+          for wf in deploy-aws.yml deploy-aws-after-close.yml postmerge-catchup.yml; do
+            for st in queued in_progress waiting pending requested; do
+              N=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow "$wf" --status "$st" --limit 20 | wc -l)
+              if [ "$N" -gt 0 ]; then
+                echo "$wf has $N run(s) $st"
+                BUSY=1
+              fi
+            done
+          done
+          if [ "$BUSY" -ne 0 ]; then
+            echo "::error::a deploy is queued or running; dispatch again after it finishes"
+            exit 1
+          fi
+          echo "window ok: $TODAY $HM IST, no deploy running, mode=$MODE"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c # v4 tag commit, 2026-07-15
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: tv-old-data-cleanup-${{ github.run_id }}
+
+      - name: Run the cleanup on the box
+        env:
+          MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          IIDS=$(aws ec2 describe-instances --region "$AWS_REGION" \
+                  --filters "Name=tag:Name,Values=tv-prod-app" "Name=instance-state-name,Values=running" \
+                  --query 'Reservations[].Instances[].InstanceId' --output text)
+          COUNT=$(printf '%s\n' $IIDS | grep -c . || true)
+          if [ "$COUNT" -ne 1 ]; then
+            echo "::error::expected exactly one running tv-prod-app instance, found $COUNT ($IIDS)"
+            exit 1
+          fi
+          IID=$IIDS
+          echo "instance: $IID"
+          PARAMS='commands=[
+          "set -u",
+          "MODE=__MODE__",
+          "D=/opt/tickvault/data",
+          "CUT_DATE=2026-10-09",
+          "CUT_UTC=\"2026-10-08 18:30:00 UTC\"",
+          "LAST_DAY=2026-10-12",
+          "SQ=$(printf \"\\047\")",
+          "QDB=http://127.0.0.1:9000/exec",
+          "FAIL=0",
+          "TODAY=$(TZ=Asia/Kolkata date +%F); HM=$(TZ=Asia/Kolkata date +%H%M); DOW=$(TZ=Asia/Kolkata date +%u)",
+          "echo \"Quote 29 one-off cleanup: mode=$MODE, box time $TODAY $HM IST, removes market data dated before $CUT_DATE\"",
+          "case \"$MODE\" in dry|apply) ;; *) echo \"REFUSED: mode must be dry or apply\"; exit 1;; esac",
+          "if [[ \"$TODAY\" > \"$LAST_DAY\" ]]; then echo \"REFUSED: Quote 29 is one-shot and this job expired after $LAST_DAY\"; exit 1; fi",
+          "if [ \"$DOW\" -gt 5 ] || (( 10#$HM < 1545 || 10#$HM >= 1710 )); then echo \"REFUSED: runs only on weekdays 15:45-17:10 IST (after the close, before the 17:30 stop)\"; exit 1; fi",
+          "[ -d \"$D\" ] || { echo \"REFUSED: $D is missing\"; exit 1; }",
+          "echo \"app before: $(systemctl is-active tickvault) (never stopped by this job)\"",
+          "df -h /",
+          "q() { R=$(curl -sS -m 120 -G \"$QDB\" --data-urlencode \"query=$1\") || { echo \"QUERY FAILED: $1\"; FAIL=1; return 1; }; echo \"$R\"; case \"$R\" in *\\\"error\\\"*) echo \"QUERY ERROR: $1\"; FAIL=1; return 1;; esac; }",
+          "old() { find \"$1\" -ignore_readdir_race -maxdepth \"$2\" -type f -name \"$3\" ! -newermt \"$CUT_UTC\" ! -name boot-committed.summary ! -path \"$D/spill/audit/*\" \"$4\"; }",
+          "sweep() { local n b; [ -d \"$1\" ] || { echo \"$1: absent\"; return 0; }; n=$(old \"$1\" \"$2\" \"$3\" -print | wc -l); b=$(old \"$1\" \"$2\" \"$3\" -print0 | du -cb --files0-from=- 2>/dev/null | tail -1 | cut -f1); echo \"$1: $n files, ${b:-0} bytes before $CUT_DATE\"; if [ \"$MODE\" = apply ] && [ \"$n\" -gt 0 ]; then old \"$1\" \"$2\" \"$3\" -delete || { echo \"DELETE FAILED in $1\"; FAIL=1; }; fi; }",
+          "echo \"=== frame log segments (open segment, applied.tvaw, deferred_depth.tvdd and .wal-owner.lock are never matched)\"",
+          "for s in \"\" /replaying /archive /uploaded; do sweep \"$D/ws_wal$s\" 1 \"ws-frames-*\"; done",
+          "echo \"=== spill, hold, dead-letter and temp files (spill/audit and boot-committed.summary are never matched)\"",
+          "for s in spill/ticks spill/depth spill/archive spill/refused spill/replaying spill-hold dlq tmp/partition-archive; do sweep \"$D/$s\" 99 \"*\"; done",
+          "sweep \"$D/spill\" 1 \"seals_v4-*\"",
+          "echo \"=== QuestDB partitions dated before $CUT_DATE (a drop is queued behind the write backlog of that table)\"",
+          "for t in ticks market_depth feed_aux_packets top_volume_1s top_volume_3s top_volume_5s top_volume_1m candles_1s candles_3s candles_5s candles_1m candles_3m candles_5m candles_10m candles_15m candles_30m candles_60m; do echo \"--- $t\"; q \"SELECT count() partitions, sum(diskSize) bytes FROM table_partitions(${SQ}$t${SQ}) WHERE maxTimestamp < ${SQ}$CUT_DATE${SQ}\" || continue; P=${R#*\\\"dataset\\\":\\[\\[}; P=${P%%[!0-9]*}; if [ -z \"$P\" ]; then echo \"QUERY ERROR: no partition count for $t\"; FAIL=1; elif [ \"$MODE\" = apply ] && [ \"$P\" -gt 0 ]; then q \"ALTER TABLE $t DROP PARTITION WHERE ts < ${SQ}$CUT_DATE${SQ}\"; fi; done",
+          "echo \"=== tables whose writes are not yet applied (their drops free disk only when apply catches up)\"",
+          "q \"SELECT name, suspended, writerTxn, sequencerTxn FROM wal_tables() WHERE writerTxn < sequencerTxn\"",
+          "sync",
+          "echo \"app after: $(systemctl is-active tickvault)\"",
+          "df -h /",
+          "if [ \"$FAIL\" -ne 0 ]; then echo \"FAILED: at least one delete or query did not complete\"; exit 1; fi",
+          "echo \"finished mode=$MODE\""],executionTimeout=["1500"]'
+          PARAMS=$(printf '%s' "$PARAMS" | tr -d '\n')
+          PARAMS=${PARAMS//__MODE__/$MODE}
+          CMD=$(aws ssm send-command --instance-ids "$IID" \
+            --document-name AWS-RunShellScript \
+            --comment "Quote 29 one-off cleanup ($MODE)" \
+            --parameters "$PARAMS" \
+            --query 'Command.CommandId' --output text)
+          echo "command: $CMD"
+          S=Pending
+          for i in $(seq 1 180); do
+            S=$(aws ssm get-command-invocation --command-id "$CMD" --instance-id "$IID" \
+                 --query 'Status' --output text 2>/dev/null || echo Pending)
+            case "$S" in Success|Failed|TimedOut|Cancelled) break ;; esac
+            sleep 10
+          done
+          aws ssm get-command-invocation --command-id "$CMD" --instance-id "$IID" \
+            --query 'StandardOutputContent' --output text
+          if [ "$S" != "Success" ]; then
+            echo "::error::cleanup did not succeed (SSM status: $S)"
+            aws ssm get-command-invocation --command-id "$CMD" --instance-id "$IID" \
+              --query 'StandardErrorContent' --output text || true
+            exit 1
+          fi
+          echo "cleanup finished, mode=$MODE"
