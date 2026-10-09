@@ -117,3 +117,10 @@ ignored = ["chrono-tz", "clap", "signal-hook"]
 [[bin]]
 name = "tv-guarantees"
 path = "src/bin/tv_guarantees.rs"
+
+# One-off (operator Quote 29e, 2026-10-09): deletes the pre-2026-10-09
+# market-data copies in s3://tv-prod-cold. Removed with its workflow and IAM
+# role after the run.
+[[bin]]
+name = "tv-s3-old-data-delete"
+path = "src/bin/s3_old_data_delete.rs"

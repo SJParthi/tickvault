@@ -19,6 +19,16 @@
 //! ([`SharedAppState::questdb_http_client`], pooled, built once) with a
 //! per-request timeout. Each cache miss used to build a new client, with its
 //! own connection pool and no connection reuse.
+//!
+//! # Bounded scan and cached misses (2026-10-09)
+//!
+//! The query only looks at the last [`QUOTE_LOOKBACK_DAYS`] days of `ticks`
+//! (`ts > dateadd('d', -N, now())`). Before, `LATEST ON` had no time bound, so
+//! an id with no ticks made QuestDB walk every partition of the table, and
+//! because a miss was never cached each repeat of that request walked them
+//! again. An instrument whose last tick is older than the window now reads as
+//! 404. A miss (QuestDB answered with no row) is now cached for the same TTL
+//! as a hit, inside the same bounded cache.
 
 use std::time::Duration;
 
@@ -34,6 +44,20 @@ use crate::state::SharedAppState;
 
 /// Timeout for QuestDB quote queries (cold path, not tick processing).
 const QUESTDB_QUOTE_TIMEOUT_SECS: u64 = 3;
+
+/// How many days back the latest-tick query looks (2026-10-09).
+///
+/// Seven days covers a weekend plus a run of exchange holidays, so the last
+/// trading day's tick is always inside it. `ticks.ts` is IST wall-clock time
+/// stored as if it were UTC, while QuestDB's `now()` is real UTC, so the
+/// window is really seven days plus 5 h 30 min: wider, never narrower.
+const QUOTE_LOOKBACK_DAYS: u32 = 7;
+
+/// What the quote cache stores for a MISS (QuestDB answered, no row).
+///
+/// The empty string, because a serialized [`QuoteResponse`] is a JSON object
+/// and is never empty, so the two can never be confused.
+const QUOTE_MISS_CACHED_BODY: &str = "";
 
 /// Query parameters of `GET /api/quote/{security_id}`.
 #[derive(Debug, Default, Deserialize)]
@@ -83,6 +107,15 @@ pub struct QuoteResponse {
 /// security_ids can never grow the map (only SIDs with real tick rows enter)
 /// and a negative entry can never mask a just-arrived first tick. The rate
 /// limiter in `crate::public_guard` runs BEFORE this handler (route_layer).
+///
+/// ⚠ CHANGED 2026-10-09: a 404 for "QuestDB answered with no row" IS now
+/// cached, for the same 1 s TTL and inside the same capped map, so a repeated
+/// miss no longer re-runs the query each time. The cost: a first tick that
+/// arrives inside that second is seen up to 1 s late, the same staleness a
+/// cached 200 already has. Garbage ids can now enter the map, but the map is
+/// still capped at `QUOTE_CACHE_MAX_ENTRIES` and entries expire after 1 s,
+/// and the public rate limiter (5 a second) keeps the cap out of reach.
+/// 400/409/503 and a 404 after a FAILED query are still never cached.
 pub async fn get_quote(
     State(state): State<SharedAppState>,
     Path(security_id): Path<u64>,
@@ -125,6 +158,9 @@ pub async fn get_quote(
 
     if let Some(body) = state.quote_cache().get(cache_key) {
         metrics::counter!("tv_api_cache_hits_total", "endpoint" => "quote").increment(1);
+        if body == QUOTE_MISS_CACHED_BODY {
+            return not_found();
+        }
         return cached_json_response(body, "hit");
     }
 
@@ -161,7 +197,13 @@ pub async fn get_quote(
                 .into_response()
         }
         // QuestDB answered with no row: it is reachable, there is no data.
-        Some(_) => not_found(),
+        // Cached like a hit (2026-10-09), so a repeat does not query again.
+        Some(_) => {
+            state
+                .quote_cache()
+                .put(cache_key, QUOTE_MISS_CACHED_BODY.to_string());
+            not_found()
+        }
         None => {
             // The query failed. Distinguish QuestDB unreachable from a query
             // QuestDB refused (for example a missing table).
@@ -208,6 +250,9 @@ const fn quote_timeout() -> Duration {
 /// one row PER SEGMENT the id has ticks in, which is what lets the handler
 /// see a collision instead of silently picking the fresher row. The segment
 /// text comes from [`segment_code_to_str`], never from the caller.
+///
+/// Bounded to the last [`QUOTE_LOOKBACK_DAYS`] days (2026-10-09) so a miss
+/// cannot scan every partition of `ticks`.
 #[must_use]
 fn build_latest_tick_sql(security_id: u64, segment_code: Option<u8>) -> String {
     // The columns that exist in the `ticks` table: `feed`, `segment` (SYMBOL
@@ -219,11 +264,13 @@ fn build_latest_tick_sql(security_id: u64, segment_code: Option<u8>) -> String {
     match segment_code {
         Some(code) => format!(
             "SELECT {COLUMNS} FROM ticks WHERE security_id = {security_id} \
-             AND segment = '{}' LATEST ON ts PARTITION BY security_id, segment",
+             AND segment = '{}' AND ts > dateadd('d', -{QUOTE_LOOKBACK_DAYS}, now()) \
+             LATEST ON ts PARTITION BY security_id, segment",
             segment_code_to_str(code)
         ),
         None => format!(
             "SELECT {COLUMNS} FROM ticks WHERE security_id = {security_id} \
+             AND ts > dateadd('d', -{QUOTE_LOOKBACK_DAYS}, now()) \
              LATEST ON ts PARTITION BY security_id, segment"
         ),
     }
@@ -370,7 +417,8 @@ mod tests {
     #[test]
     fn test_latest_tick_sql_without_a_segment_returns_one_row_per_segment() {
         let sql = build_latest_tick_sql(27, None);
-        assert!(sql.contains("WHERE security_id = 27 LATEST ON ts"), "{sql}");
+        assert!(sql.contains("WHERE security_id = 27 AND ts > "), "{sql}");
+        assert!(sql.contains(" LATEST ON ts"), "{sql}");
         assert!(
             sql.contains("PARTITION BY security_id, segment"),
             "without a segment the query must keep each segment's row apart: {sql}"
@@ -383,10 +431,35 @@ mod tests {
         let code = segment_str_to_code("NSE_EQ").expect("known segment");
         let sql = build_latest_tick_sql(27, Some(code));
         assert!(
-            sql.contains("WHERE security_id = 27 AND segment = 'NSE_EQ' LATEST ON ts"),
+            sql.contains("WHERE security_id = 27 AND segment = 'NSE_EQ' AND ts > "),
             "{sql}"
         );
+        assert!(sql.contains(" LATEST ON ts"), "{sql}");
         assert!(sql.contains("PARTITION BY security_id, segment"), "{sql}");
+    }
+
+    // Regression: 2026-10-09 — the latest-tick query had no time bound, so
+    // an id with no ticks scanned every partition of `ticks` on each request.
+    #[test]
+    fn test_regression_latest_tick_sql_is_bounded_to_the_lookback_window() {
+        let bound = format!("AND ts > dateadd('d', -{QUOTE_LOOKBACK_DAYS}, now())");
+        let code = segment_str_to_code("NSE_EQ").expect("known segment");
+        for sql in [
+            build_latest_tick_sql(27, None),
+            build_latest_tick_sql(27, Some(code)),
+        ] {
+            assert!(
+                sql.contains(&bound),
+                "the query must carry the time bound: {sql}"
+            );
+            let bound_at = sql.find(&bound).expect("bound present");
+            let latest_at = sql.find("LATEST ON").expect("LATEST ON present");
+            assert!(bound_at < latest_at, "the bound belongs in WHERE: {sql}");
+        }
+        assert!(
+            (3..=30).contains(&QUOTE_LOOKBACK_DAYS),
+            "the window must cover a long holiday weekend and stay short"
+        );
     }
 
     // ---- multi-row parsing ----
@@ -1001,11 +1074,11 @@ mod tests {
         );
     }
 
-    /// Error responses are NEVER cached: a 404 (no data yet) must not
-    /// poison the cache — the next request goes back to QuestDB and picks
-    /// up a just-arrived first tick as a fresh 200.
+    /// A cached 404 lives one TTL only (2026-10-09; before that a 404 was
+    /// never cached): after the TTL the next request goes back to QuestDB and
+    /// picks up a just-arrived first tick as a fresh 200.
     #[tokio::test]
-    async fn test_get_quote_404_is_never_cached() {
+    async fn test_get_quote_cached_404_expires_and_a_first_tick_is_seen() {
         let responses = vec![
             // call 1: empty dataset → 404 (QuestDB answered, no probe).
             r#"{"dataset":[]}"#,
@@ -1025,11 +1098,10 @@ mod tests {
             .await
             .into_response();
         assert_eq!(first.status(), StatusCode::NOT_FOUND);
-        assert!(
-            state.quote_cache().is_empty(),
-            "a 404 must never enter the cache"
-        );
+        assert_eq!(state.quote_cache().len(), 1, "the miss is cached");
 
+        // Past the 1 s TTL the cached miss is gone.
+        tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
         let second = get_quote(State(state), Path(777), no_segment())
             .await
             .into_response();
@@ -1038,6 +1110,40 @@ mod tests {
             StatusCode::OK,
             "the request after the first tick must be a fresh 200, not a cached 404"
         );
+    }
+
+    // Regression: 2026-10-09 — a miss was never cached, so each repeat of a
+    // request for an id with no ticks ran the query again.
+    #[tokio::test]
+    async fn test_regression_a_miss_is_cached_and_the_repeat_does_not_query() {
+        // One-shot mock: a second QuestDB query would find nothing listening
+        // and the handler would answer 503, not 404.
+        let base_url = start_mock_server(r#"{"dataset":[]}"#).await;
+        let state = mock_state(port_of(&base_url));
+        let first = get_quote(State(state.clone()), Path(4242), no_segment())
+            .await
+            .into_response();
+        assert_eq!(first.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            state
+                .quote_cache()
+                .get((4242, QUOTE_SEGMENT_UNSPECIFIED))
+                .as_deref(),
+            Some(QUOTE_MISS_CACHED_BODY),
+            "the miss must be cached"
+        );
+
+        let second = get_quote(State(state.clone()), Path(4242), no_segment())
+            .await
+            .into_response();
+        assert_eq!(
+            second.status(),
+            StatusCode::NOT_FOUND,
+            "the repeat must be answered from the cache, not by a new query"
+        );
+        // A cached miss for one key never answers another.
+        let nse_eq = segment_str_to_code("NSE_EQ").expect("known segment");
+        assert!(state.quote_cache().get((4242, nse_eq)).is_none());
     }
 
     /// The 400 invalid-SID guard runs before any cache/DB work and is
