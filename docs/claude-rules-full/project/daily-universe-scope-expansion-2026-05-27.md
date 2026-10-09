@@ -2714,3 +2714,21 @@ disk refills in about five trading days. That fix is separate work.
 - Runs inside 09:00–15:45 IST, or while `deploy-aws` is running.
 - Suspends versioning, adds an `expiration` or a `noncurrent_version_expiration`, or widens IAM to perform the delete.
 - Treats Quote 29 as standing permission: it is spent after this one run, and Quote 27 ("nothing is ever deleted") binds again from then on.
+
+##### Quote 29c (2026-10-09, 10:43 IST) — RUN NOW, APP KEEPS RUNNING (amends the market-window row above, preserve EXACTLY)
+
+> "why blockjed dude go ahead dude"
+
+**Quote 29d (2026-10-09, 11:01 IST, decision card tapped by the operator):** "Run now" on "Delete old box files now, during market hours, with the app kept running?"
+
+Asked why the delete was waiting for 15:45 IST. Measured at the time (CloudWatch `disk_used_percent`, 15-minute maxima): 87.8% at 09:28 IST, 90.97% at 10:28 IST, rising about 3% an hour, so the root disk would fill at roughly 13:30 IST, before the close. Waiting would have lost today's capture to a full disk.
+
+What 29c changes, and only this:
+
+- The box file deletes and the QuestDB `DROP PARTITION ... WHERE ts < '2026-10-09'` statements may run NOW, inside market hours, **with `tickvault.service` left running** (no stop, no restart). Only closed files named or dated before 2026-10-09 are removed; the open WAL segment and every file from today are kept.
+- The S3 delete may run now too. It must run AFTER the box file deletes, so the box has no old raw segment left to upload again into `raw-frames/<old date>/`.
+- Everything else in Quote 29 stands: the same scope, the same keep-list, one run, spent afterwards.
+
+Stated consequences: a drop on a table whose WAL apply is behind (`market_depth`, `ticks`) frees disk only once QuestDB applies up to it; the after-close deferred-depth pass will log WS-SPILL-02 once per old bucket whose segment is gone.
+
+REJECT under 29c: stopping or restarting `tickvault.service` inside 09:00–15:45 IST for this; deleting the open WAL segment, `applied.tvaw`, `deferred_depth.tvdd` or `.wal-owner.lock`; running the S3 delete before the box file deletes.
