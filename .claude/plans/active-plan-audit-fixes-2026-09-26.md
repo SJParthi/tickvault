@@ -3016,8 +3016,9 @@ Status of the rest, so the next session does not re-audit:
   `first_session_bucket_baseline` instead of the seed; every later bucket keeps the seed, so a
   lost packet can never pour volume into a later bar. Only on a live seed in a process that was
   listening before the open (no replay, no pending gap, not a mid-session boot). Derivatives:
-  baseline 0. Equities: baseline 0 when `FIRST_BAR_INCLUDES_PRE_OPEN_AUCTION` is `true` (the
-  default, "Match Dhan"), otherwise the auction volume read from a live pre-open trade packet
+  baseline 0. Equities: baseline 0 when `FIRST_BAR_INCLUDES_PRE_OPEN_AUCTION` is `true` ("Match
+  Dhan"); when it is `false` (the default, the owner's pick on 2026-10-09: "opening alone
+  only", i.e. count only trades from 09:15:00 on) the auction volume read from a live pre-open trade packet
   (`InstrumentSlot::pre_open_auction_volume`, same slot budget as the PR58 proof, cleared at the
   day reset), and the seed when none was received. Other segments: the seed. Cost: one mask test
   per timeframe per tick; O(`TF_COUNT`) once on a seeding tick; no allocation.
@@ -3032,13 +3033,14 @@ Status of the rest, so the next session does not re-audit:
   first_session_bucket_baseline_by_segment_and_choice (bite-checked: 10 tests fail without
   the fix). Seven older tests now pin the new 09:15 volumes, each in both choices where it
   matters.
-  - **Reverses, under the default, the PR58 review's "an equity auction is never poured into
-    the open bar".** `test_regression_an_equity_auction_is_never_poured_into_the_open_bar` keeps
-    that behaviour for the opening-only choice and pins 50,400 for the default.
-  - **Blocks merge:** the owner's pick on the "Match Dhan / Opening only" card, and, for Match
-    Dhan, a dated owner quote recorded in `websocket-connection-scope-lock.md` first, since its
-    2026-10-05 (SECOND) REJECT row forbids folding pre-open into 09:15 under that quote. Whether
-    Dhan's own 09:15 bar includes the auction is Assumed, not checked against a stored row.
+  - **The default keeps the PR58 review's "an equity auction is never poured into the open
+    bar".** `test_regression_an_equity_auction_is_never_poured_into_the_open_bar` pins it for
+    Opening-only and 50,400 for Match Dhan.
+  - **Owner's pick (2026-10-09, in the thread): "opening alone only dude".** The default is
+    `false`, which keeps the 2026-10-05 (SECOND) rule (no pre-open volume in the 09:15 bar),
+    so no rule-file change is needed. Consequence: if Dhan's own 09:15 bar includes the
+    auction (Assumed, not checked against a stored row), an equity's 09:15 bar reads lower
+    than Dhan's chart by the auction volume; every later bar is unaffected.
   - Honest limits: when the day's first packet arrives after a 1/3/5 s bucket that holds 09:15
     has passed, that volume is in no 1/3/5 s bar (the short bucket holding the first packet
     starts after 09:15 and seeds), so the 5 s bars of 09:15 can sum to less than the 1 m bar.
@@ -3049,7 +3051,8 @@ Status of the rest, so the next session does not re-audit:
     F&O baseline is 0 whatever the choice, so if futures (which have a pre-open since
     Dec 2023) ever re-enter the subscription, their auction lands in the 09:15 bars; today
     futures are not subscribed. Unknown: whether Dhan's equity cumulative includes the
-    08:45-09:00 block-deal window; under the default it would land in the 09:15 bar too.
+    08:45-09:00 block-deal window; under Match Dhan it would land in the 09:15 bar, and under
+    the default it sits inside the recorded pre-open total and stays out.
     The 09:15 bars' net direction stays unclassified, as the first bar's already was.
 
 ### Added 2026-10-09 (stress audit, findings OBS-1/TG-1 and TG-3)

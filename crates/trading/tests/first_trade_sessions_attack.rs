@@ -9,7 +9,11 @@
 //! 2026-10-09 (ADANIENT): the bucket of each timeframe that HOLDS 09:15
 //! takes the first trade's whole day cumulative, proof or no proof, since
 //! everything in it traded inside that bucket (auction volume included, the
-//! default "Match Dhan" choice). The proof rules above now decide only the
+//! "Match Dhan" choice). Under the operator's pick, "Opening-only"
+//! (`FIRST_BAR_INCLUDES_PRE_OPEN_AUCTION` = false), an equity's first bar
+//! takes the cumulative minus the auction volume read from a live pre-open
+//! trade packet, and seeds when no such packet arrived; the assertions read
+//! the constant. The proof rules above now decide only the
 //! buckets after it (a 1-second bar after 09:15:00, the 09:16 minute, ...),
 //! so several assertions below that read 0 for a 09:15 bar now read the
 //! cumulative.
@@ -20,7 +24,8 @@ use tickvault_common::feed::Feed;
 use tickvault_common::tick_types::ParsedTick;
 use tickvault_trading::candles::aggregator_cell::FeedStrategy;
 use tickvault_trading::candles::multi_tf_aggregator::{
-    AGGREGATOR_MAX_SLOTS, MultiTfAggregator, untraded_proof_holds,
+    AGGREGATOR_MAX_SLOTS, FIRST_BAR_INCLUDES_PRE_OPEN_AUCTION, MultiTfAggregator,
+    untraded_proof_holds,
 };
 use tickvault_trading::candles::tf_index::TfIndex;
 
@@ -101,6 +106,16 @@ impl Bars {
 
 fn agg() -> MultiTfAggregator {
     MultiTfAggregator::new(FeedStrategy::DEFAULT)
+}
+
+/// An equity's 09:15 bar: `with_auction` when the first bar counts the
+/// pre-open auction, else `without` (2026-10-09; see the module header).
+const fn eq_first(with_auction: u64, without: u64) -> u64 {
+    if FIRST_BAR_INCLUDES_PRE_OPEN_AUCTION {
+        with_auction
+    } else {
+        without
+    }
 }
 
 // ---------------------------------------------------------------- options
@@ -212,8 +227,9 @@ fn first_trade_above_u16_ltq_seeds() {
 /// own 100): it seeds, and 09:15 reads 0 (true 100), never 5,100. Same shape
 /// as row 5 below.
 ///
-/// 2026-10-09: under the default "Match Dhan" choice the 09:15 bars include
-/// the auction, so they read 5,100; the 1-second bar still seeds.
+/// 2026-10-09: under "Match Dhan" the 09:15 bars include the auction and
+/// read 5,100; under the default "Opening-only" the match packet recorded the
+/// auction (5,000), so they read the true 100. The 1-second bar still seeds.
 #[test]
 fn equity_pre_open_match_proof_age_decides() {
     for (sid, proof) in [(10, at(1, 9, 5, 0)), (11, at(1, 9, 7, 30))] {
@@ -227,8 +243,11 @@ fn equity_pre_open_match_proof_age_decides() {
             b.0.keys().all(|k| k.3 >= at(1, 9, 15, 0)),
             "no bar before 09:15"
         );
-        assert_eq!(b.vol(sid, EQ, TfIndex::M1, at(1, 9, 15, 2)), Some(5_100));
-        assert_eq!(b.vol(sid, EQ, TfIndex::M60, at(1, 9, 15, 2)), Some(5_100));
+        // Opening-only: the 09:07:50 match packet recorded 5,000, so the
+        // 09:15 bars hold the true 100.
+        let first = Some(eq_first(5_100, 100));
+        assert_eq!(b.vol(sid, EQ, TfIndex::M1, at(1, 9, 15, 2)), first);
+        assert_eq!(b.vol(sid, EQ, TfIndex::M60, at(1, 9, 15, 2)), first);
         assert_eq!(b.vol(sid, EQ, TfIndex::S1, at(1, 9, 15, 2)), Some(0));
     }
 
@@ -252,7 +271,12 @@ fn equity_proof_at_091204_vs_091205() {
         b.push(&mut a, &trade(12, EQ, at(1, 9, 15, 30), 300, 300));
         b.close(&mut a);
         assert_eq!(b.vol(12, EQ, TfIndex::S1, at(1, 9, 15, 30)), Some(expect));
-        assert_eq!(b.vol(12, EQ, TfIndex::M1, at(1, 9, 15, 30)), Some(300));
+        // Opening-only: no auction packet arrived, so the minute follows the
+        // proof like the 1-second bar.
+        assert_eq!(
+            b.vol(12, EQ, TfIndex::M1, at(1, 9, 15, 30)),
+            Some(eq_first(300, expect))
+        );
     }
 }
 
@@ -261,8 +285,9 @@ fn equity_proof_at_091204_vs_091205() {
 /// in its cumulative (5,100) against its own 100, so it seeds: 09:15 reads 0
 /// (true 100), never 5,100.
 ///
-/// 2026-10-09: under the default "Match Dhan" choice the 09:15 bars include
-/// the auction and read 5,100; the 1-second bar after 09:15:00 still seeds.
+/// 2026-10-09: under "Match Dhan" the 09:15 bars include the auction and read
+/// 5,100; under the default "Opening-only" the auction stays unknown and they
+/// seed (0). The 1-second bar after 09:15:00 still seeds.
 #[test]
 fn equity_if_post_match_packets_kept_prior_day_ltt_auction_is_not_poured_in() {
     let mut a = agg();
@@ -281,7 +306,12 @@ fn equity_if_post_match_packets_kept_prior_day_ltt_auction_is_not_poured_in() {
     );
     b.push(&mut a, &trade(13, EQ, at(1, 9, 15, 2), 5_100, 100));
     b.close(&mut a);
-    assert_eq!(b.vol(13, EQ, TfIndex::M1, at(1, 9, 15, 2)), Some(5_100));
+    // Opening-only: the 09:13 packet is a proof, not an auction trade, so
+    // the auction stays unknown and the minute seeds: 0 (true 100).
+    assert_eq!(
+        b.vol(13, EQ, TfIndex::M1, at(1, 9, 15, 2)),
+        Some(eq_first(5_100, 0))
+    );
     assert_eq!(b.vol(13, EQ, TfIndex::S1, at(1, 9, 15, 2)), Some(0));
 }
 
@@ -319,10 +349,14 @@ fn bse_segments_follow_their_nse_twins() {
     assert_eq!(b.vol(20, BSE_FNO, TfIndex::S1, at(1, 9, 15, 30)), Some(40));
     assert_eq!(b.vol(21, BSE_EQ, TfIndex::S1, at(1, 9, 15, 30)), Some(0));
     assert_eq!(b.vol(22, BSE_EQ, TfIndex::S1, at(1, 9, 15, 30)), Some(40));
-    for sid in [20, 21, 22] {
-        let seg = if sid == 20 { BSE_FNO } else { BSE_EQ };
-        assert_eq!(b.vol(sid, seg, TfIndex::M1, at(1, 9, 15, 30)), Some(40));
-    }
+    // Opening-only: no auction packet for the BSE equities, so their minute
+    // follows the proof (21 seeds, 22 holds).
+    assert_eq!(b.vol(20, BSE_FNO, TfIndex::M1, at(1, 9, 15, 30)), Some(40));
+    assert_eq!(
+        b.vol(21, BSE_EQ, TfIndex::M1, at(1, 9, 15, 30)),
+        Some(eq_first(40, 0))
+    );
+    assert_eq!(b.vol(22, BSE_EQ, TfIndex::M1, at(1, 9, 15, 30)), Some(40));
 }
 
 /// Row 8 (was latent). Currency/MCX/other segments are never extended to the
@@ -395,7 +429,12 @@ fn after_day_close_a_post_midnight_proof_is_extended_for_options_only() {
     assert_eq!(b.vol(32, EQ, TfIndex::S1, at(2, 9, 15, 20)), Some(0));
     // The 09:15 minute holds the cumulative either way (2026-10-09).
     assert_eq!(b.vol(31, FNO, TfIndex::M1, at(2, 9, 15, 20)), Some(25));
-    assert_eq!(b.vol(32, EQ, TfIndex::M1, at(2, 9, 15, 20)), Some(25));
+    // Opening-only: no auction packet, and the proof is not extended for an
+    // equity, so the minute seeds.
+    assert_eq!(
+        b.vol(32, EQ, TfIndex::M1, at(2, 9, 15, 20)),
+        Some(eq_first(25, 0))
+    );
 }
 
 #[test]
