@@ -72,8 +72,7 @@ use tickvault_storage::ws_frame_spill::{
 use tracing::{error, info, warn};
 
 use super::{
-    DEPTH_FLUSH_ROW_THRESHOLD, DepthIngest, DrainCounters, append_inline_depth, drain_depth_frame,
-    unknown_packet_skip,
+    DepthIngest, DrainCounters, append_inline_depth, drain_depth_frame, unknown_packet_skip,
 };
 
 /// 15:45 IST — the pass may start (five minutes after the 15:40 capture end).
@@ -580,8 +579,7 @@ pub fn run_after_close_pass(
                     _ => rewrite_dedicated_depth(sink, frame, c),
                 };
                 summary.rows_written = summary.rows_written.saturating_add(rows);
-                if sink.pending_rows() as u64 >= DEPTH_FLUSH_ROW_THRESHOLD && sink.flush().is_err()
-                {
+                if sink.flush_due() && sink.flush().is_err() {
                     failed = true;
                     break 'segments;
                 }
@@ -691,10 +689,16 @@ pub fn run_after_close_pass(
 /// sleeps until the next window. `cancel` stops it (set by the lane when its
 /// drain ends); it never waits on the lane's shutdown `Notify`, which wakes a
 /// single waiter and would be stolen from the drain.
+///
+/// `book_since` is the lane's array-row start instant (plan item 49e step 3),
+/// passed rather than re-read so the pass routes every frame exactly as the
+/// lane does: a frame received before it is rewritten into `market_depth`,
+/// one at or after it into `market_depth_book`.
 pub fn spawn_after_close_supervisor(
     questdb: tickvault_common::config::QuestDbConfig,
     wal_dir: std::path::PathBuf,
     cancel: std::sync::Arc<AtomicBool>,
+    book_since: Option<i64>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -721,7 +725,7 @@ pub fn spawn_after_close_supervisor(
             let spawned = std::thread::Builder::new()
                 .name("tv-deferred-depth".to_string())
                 .spawn(move || {
-                    let mut sink = DepthIngest::new(&questdb);
+                    let mut sink = DepthIngest::new(&questdb, book_since);
                     let summary = run_after_close_pass(
                         &mut sink,
                         tickvault_storage::wal_deferred_depth::deferred_depth(),
@@ -1115,7 +1119,7 @@ mod tests {
             ilp_port: 9009,
         };
         let cancel = std::sync::Arc::new(AtomicBool::new(true));
-        let handle = spawn_after_close_supervisor(questdb, std::env::temp_dir(), cancel);
+        let handle = spawn_after_close_supervisor(questdb, std::env::temp_dir(), cancel, None);
         tokio::time::timeout(Duration::from_secs(5), handle)
             .await
             .expect("a cancelled supervisor must exit promptly")

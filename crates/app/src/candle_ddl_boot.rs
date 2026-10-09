@@ -260,8 +260,12 @@ pub const LIVE_TABLE_DDL_BACKOFF_SECS: u64 = 5;
 pub async fn run_live_table_ddl_at_boot(questdb: &QuestDbConfig) -> bool {
     for attempt in 1..=LIVE_TABLE_DDL_ATTEMPTS {
         let ticks_ok = tickvault_storage::tick_persistence::ensure_ticks_table(questdb).await;
-        let depth_ok =
-            tickvault_storage::depth_persistence::ensure_market_depth_table(questdb).await;
+        // `market_depth_book` (plan item 49e step 3) is ensured with it on
+        // every boot, setting on or off: the array-row writer must never meet
+        // an auto-created table with no DEDUP key.
+        let depth_ok = tickvault_storage::depth_persistence::ensure_market_depth_table(questdb)
+            .await
+            && tickvault_storage::depth_persistence::ensure_market_depth_book_table(questdb).await;
         // The four direct `top_volume_<tf>` tables (2026-09-22; before that ONE
         // `top_volume` table viewed four ways). Their offload writer appends
         // from the first ranking sweep, so an un-ensured table would be
@@ -361,8 +365,10 @@ async fn ensure_tables_once(questdb: &QuestDbConfig, tables: DdlTables) -> bool 
         }
         DdlTables::Live => {
             let ticks_ok = tickvault_storage::tick_persistence::ensure_ticks_table(questdb).await;
-            let depth_ok =
-                tickvault_storage::depth_persistence::ensure_market_depth_table(questdb).await;
+            let depth_ok = tickvault_storage::depth_persistence::ensure_market_depth_table(questdb)
+                .await
+                && tickvault_storage::depth_persistence::ensure_market_depth_book_table(questdb)
+                    .await;
             let volume_ok =
                 tickvault_storage::top_volume_rank_persistence::ensure_top_volume_tables(questdb)
                     .await;

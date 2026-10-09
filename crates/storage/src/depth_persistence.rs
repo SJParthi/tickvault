@@ -589,7 +589,32 @@ fn spill_version_of(protocol: ProtocolVersion) -> u8 {
 #[must_use = "a false verdict means the depth_kind DEDUP key may be missing; retry it"]
 // TEST-EXEMPT: live-QuestDB DDL runner; the statement set is unit-tested via market_depth_ensure_statements() (kept on ONE line, directly above the fn — the guard reads only that line, so it must sit BELOW the attribute).
 pub async fn ensure_market_depth_table(questdb_config: &QuestDbConfig) -> bool {
-    // APPROVED: QuestDB base URL, once per ensure_market_depth_table at boot
+    run_depth_ddl(
+        questdb_config,
+        MARKET_DEPTH_TABLE,
+        &market_depth_ensure_statements(),
+    )
+    .await
+}
+
+/// Creates or self-heals `market_depth_book` (plan item 49e step 3). Run at
+/// every boot whether or not `[depth_storage] array_rows` is on: an empty
+/// table costs nothing, and the retention and archive sweeps name it.
+#[must_use = "a false verdict means the market_depth_book DEDUP key may be missing; retry it"]
+// TEST-EXEMPT: live-QuestDB DDL runner; the statement set is unit-tested via market_depth_book_ensure_statements() (test_market_depth_book_ensure_statements_never_drop_and_end_on_the_dedup_key).
+pub async fn ensure_market_depth_book_table(questdb_config: &QuestDbConfig) -> bool {
+    run_depth_ddl(
+        questdb_config,
+        MARKET_DEPTH_BOOK_TABLE,
+        &market_depth_book_ensure_statements(),
+    )
+    .await
+}
+
+/// Runs one depth table's ensure statements in order. `true` only when every
+/// statement was accepted.
+async fn run_depth_ddl(questdb_config: &QuestDbConfig, table: &str, statements: &[String]) -> bool {
+    // APPROVED: QuestDB base URL, once per depth table ensure at boot
     let base_url = format!(
         "http://{}:{}/exec",
         questdb_config.host, questdb_config.http_port
@@ -605,8 +630,9 @@ pub async fn ensure_market_depth_table(questdb_config: &QuestDbConfig) -> bool {
             error!(
                 code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
                 stage = "ensure_client_build",
+                table,
                 ?err,
-                "market_depth table not ensured — HTTP client build failed; the first \
+                "depth table not ensured — HTTP client build failed; the first \
                  ILP write may auto-create the table WITHOUT the depth_kind DEDUP key, \
                  which makes depth-20 and depth-200 overwrite each other's levels"
             );
@@ -614,7 +640,7 @@ pub async fn ensure_market_depth_table(questdb_config: &QuestDbConfig) -> bool {
         }
     };
     let mut every_statement_accepted = true;
-    for ddl in &market_depth_ensure_statements() {
+    for ddl in statements {
         match client
             .get(&base_url)
             .query(&[("query", ddl.as_str())])
@@ -630,10 +656,11 @@ pub async fn ensure_market_depth_table(questdb_config: &QuestDbConfig) -> bool {
                 error!(
                     code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
                     stage = "ensure_ddl",
+                    table,
                     %status,
                     ddl = ddl.as_str(),
                     body = %body.chars().take(200).collect::<String>(),
-                    "market_depth DDL returned non-2xx — the depth_kind DEDUP key may be \
+                    "depth table DDL returned non-2xx — the depth_kind DEDUP key may be \
                      missing, which makes the two depth pools overwrite each other"
                 );
                 every_statement_accepted = false;
@@ -644,9 +671,10 @@ pub async fn ensure_market_depth_table(questdb_config: &QuestDbConfig) -> bool {
                 error!(
                     code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
                     stage = "ensure_ddl",
+                    table,
                     ?err,
                     ddl = ddl.as_str(),
-                    "market_depth DDL request failed"
+                    "depth table DDL request failed"
                 );
                 every_statement_accepted = false;
             }
@@ -1632,6 +1660,13 @@ impl DepthWriter {
     // TEST-EXEMPT: observability accessor, asserted by the tests it enables.
     pub fn buffer_utf8(&self) -> String {
         String::from_utf8(self.buffer.as_bytes().to_vec()).unwrap_or_default()
+    }
+
+    /// The buffered bytes as written, for a binary ILP v2 (array-row) buffer
+    /// that `buffer_utf8` cannot show. Borrowed, no copy.
+    #[must_use]
+    pub fn buffer_bytes(&self) -> &[u8] {
+        self.buffer.as_bytes()
     }
 
     /// Marks the pending rows as having NO write-ahead-log record behind them
@@ -5619,6 +5654,32 @@ mod tests {
             None,
             "the in-window fixture is still in window"
         );
+    }
+
+    /// Plan item 49e step 3: with QuestDB unreachable the book-table ensure
+    /// reports false (every statement refused), so the boot DDL report shows
+    /// the depth tables as not ensured rather than a false OK.
+    #[tokio::test]
+    async fn test_ensure_market_depth_book_table_reports_false_when_questdb_is_unreachable() {
+        let cfg = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 1,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        assert!(!ensure_market_depth_book_table(&cfg).await);
+    }
+
+    #[test]
+    fn test_buffer_bytes_returns_the_binary_book_line_buffer_utf8_cannot_show() {
+        let mut w = DepthWriter::for_test_book(Feed::Dhan);
+        assert!(w.buffer_bytes().is_empty());
+        let (p, q, o) = book_levels(3);
+        w.append_book_row(&book_row(&p[..3], &q[..3], &o[..3], 7))
+            .expect("append");
+        let bytes = w.buffer_bytes();
+        assert!(bytes.starts_with(MARKET_DEPTH_BOOK_TABLE.as_bytes()));
+        assert_eq!(bytes.len(), w.pending_bytes());
     }
 
     #[test]

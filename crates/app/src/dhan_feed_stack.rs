@@ -124,8 +124,8 @@ use tickvault_core::websocket::pool_supervisor::{
     take_main_feed_reconnect_recovery_max_ms,
 };
 use tickvault_storage::depth_persistence::{
-    DEPTH_KIND_5, DEPTH_KIND_20, DEPTH_KIND_200, DEPTH_SIDE_ASK, DEPTH_SIDE_BID, DepthRow,
-    DepthWriter, depth_segment_label,
+    DEPTH_KIND_5, DEPTH_KIND_20, DEPTH_KIND_200, DEPTH_SIDE_ASK, DEPTH_SIDE_BID, DepthBookRow,
+    DepthRow, DepthWriter, MAX_DEPTH_BOOK_LEVELS, depth_segment_label,
 };
 use tickvault_storage::feed_aux_persistence::{AuxPacketKind, AuxPacketRow, aux_price};
 use tickvault_storage::tick_persistence::TickWriter;
@@ -2746,6 +2746,15 @@ impl LiveIngest {
             .map_or(0, DepthIngest::pending_rows)
     }
 
+    /// True when the depth buffer has reached its flush size (see
+    /// [`DepthIngest::flush_due`]); false with no depth wired. O(1).
+    #[must_use]
+    pub fn depth_flush_due(&self) -> bool {
+        self.inline_depth
+            .as_ref()
+            .is_some_and(DepthIngest::flush_due)
+    }
+
     /// Depth rows this lane has dropped, for the shutdown accounting line.
     #[must_use]
     pub fn depth_dropped_rows(&self) -> u64 {
@@ -3710,7 +3719,7 @@ impl LiveIngest {
     fn mark_frame_unbacked(&mut self) {
         self.writer.mark_pending_unbacked();
         if let Some(depth) = self.inline_depth.as_mut() {
-            depth.writer.mark_pending_unbacked();
+            depth.mark_all_pending_unbacked();
         }
     }
 
@@ -7928,9 +7937,12 @@ async fn run_frame_drain(
                 // Depth gets its OWN size trigger — see
                 // `DEPTH_FLUSH_ROW_THRESHOLD` for why reusing the tick one
                 // would have turned the drain into a synchronous HTTP loop.
-                if u64::try_from(ingest.depth_pending_rows()).unwrap_or(u64::MAX)
-                    >= DEPTH_FLUSH_ROW_THRESHOLD
-                {
+                //
+                // Plan item 49e step 3: `depth_flush_due` is the row threshold
+                // for a level writer and `DEPTH_BOOK_FLUSH_BYTES` for an
+                // array-row writer (one depth-200 row is ~4.8 KB, so 10,000
+                // rows would be ~48 MB, past the producer's queue-bytes bound).
+                if ingest.depth_flush_due() {
                     flush_depth(ingest.depth_sink());
                 }
                 if seen.is_multiple_of(DRAIN_REPORT_EVERY) {
@@ -9518,8 +9530,13 @@ pub struct DepthFrameOutcome {
 /// the depth-200 path from allocating 3.2 KB of levels per packet on a stream
 /// that can deliver several packets per frame.
 pub struct DepthIngest {
+    /// The writer the drain offloads: a level writer, or an array-row
+    /// (`market_depth_book`) writer when `book` is set.
     writer: DepthWriter,
     buf: DepthLevelBuffer,
+    /// Array-row mode (plan item 49e step 3), `None` while
+    /// `[depth_storage] array_rows` is off. Boxed once at construction.
+    book: Option<Box<BookMode>>,
     /// The dedicated depth ILP writer thread, when this ingest has been
     /// offloaded. `None` on a lane that never called `spawn_offload_writer`.
     writer_thread: Option<std::thread::JoinHandle<()>>,
@@ -9534,13 +9551,32 @@ pub struct DepthIngest {
 
 impl DepthIngest {
     /// Production constructor.
+    ///
+    /// `book_since` is the array-row start instant from
+    /// [`crate::depth_book_since::resolve_depth_book_since`]: `None` writes one
+    /// `market_depth` row per level (today's layout); `Some(since)` writes a
+    /// frame received at or after `since` as one `market_depth_book` row per
+    /// book side, and an older frame (a replay of an earlier process's
+    /// capture) through a second, synchronous level writer, so one packet
+    /// never lands in both tables.
     #[must_use]
     // TEST-EXEMPT: thin constructor; every behaviour is exercised through
-    // `drain_depth_frame` in the tests below via `for_test`.
-    pub fn new(questdb: &tickvault_common::config::QuestDbConfig) -> Self {
+    // `drain_depth_frame` in the tests below via `for_test` / `for_test_book`.
+    pub fn new(questdb: &tickvault_common::config::QuestDbConfig, book_since: Option<i64>) -> Self {
+        let (writer, book) = match book_since {
+            None => (DepthWriter::new(questdb, Feed::Dhan), None),
+            Some(since) => (
+                DepthWriter::new_book(questdb, Feed::Dhan),
+                Some(BookMode::boxed(
+                    since,
+                    DepthWriter::new(questdb, Feed::Dhan),
+                )),
+            ),
+        };
         Self {
-            writer: DepthWriter::new(questdb, Feed::Dhan),
+            writer,
             buf: DepthLevelBuffer::new(),
+            book,
             writer_thread: None,
             rescue_thread: None,
             writer_done: None,
@@ -9554,9 +9590,66 @@ impl DepthIngest {
         Self {
             writer: DepthWriter::for_test(Feed::Dhan),
             buf: DepthLevelBuffer::new(),
+            book: None,
             writer_thread: None,
             rescue_thread: None,
             writer_done: None,
+        }
+    }
+
+    /// Test constructor in array-row mode: frames received at or after
+    /// `since` go to a disconnected book writer, older ones to a disconnected
+    /// level writer.
+    #[must_use]
+    // TEST-EXEMPT: test-only helper used by the array-row drain tests below.
+    pub fn for_test_book(since: i64) -> Self {
+        Self {
+            writer: DepthWriter::for_test_book(Feed::Dhan),
+            buf: DepthLevelBuffer::new(),
+            book: Some(BookMode::boxed(since, DepthWriter::for_test(Feed::Dhan))),
+            writer_thread: None,
+            rescue_thread: None,
+            writer_done: None,
+        }
+    }
+
+    /// True when a frame received at `received_at_nanos` is written as array
+    /// rows. O(1).
+    #[must_use]
+    pub fn writes_book(&self, received_at_nanos: i64) -> bool {
+        self.book
+            .as_ref()
+            .is_some_and(|b| received_at_nanos >= b.since)
+    }
+
+    /// Marks the writer that will carry this frame's rows as holding rows
+    /// from a frame the WAL refused. O(1).
+    pub fn mark_pending_unbacked_for(&mut self, received_at_nanos: i64) {
+        level_sink(&mut self.book, &mut self.writer, received_at_nanos).mark_pending_unbacked();
+    }
+
+    /// Marks every writer of this ingest as holding rows from a frame the WAL
+    /// refused (the receipt time is not known at that call site). Over-marking
+    /// only keeps more rows on the inline spill. O(1).
+    pub fn mark_all_pending_unbacked(&mut self) {
+        self.writer.mark_pending_unbacked();
+        if let Some(b) = self.book.as_deref_mut() {
+            b.levels.mark_pending_unbacked();
+        }
+    }
+
+    /// True when the buffered depth should be flushed now: the array-row
+    /// writer by bytes ([`tickvault_storage::depth_persistence::DEPTH_BOOK_FLUSH_BYTES`],
+    /// so a batch stays inside the producer's queue-bytes bound), a level
+    /// writer by [`DEPTH_FLUSH_ROW_THRESHOLD`] rows. O(1).
+    #[must_use]
+    pub fn flush_due(&self) -> bool {
+        let rows_due = |w: &DepthWriter| {
+            u64::try_from(w.pending()).unwrap_or(u64::MAX) >= DEPTH_FLUSH_ROW_THRESHOLD
+        };
+        match &self.book {
+            Some(b) => self.writer.book_flush_due() || rows_due(&b.levels),
+            None => rows_due(&self.writer),
         }
     }
 
@@ -9822,7 +9915,9 @@ impl DepthIngest {
     #[must_use]
     // TEST-EXEMPT: observability accessor, asserted by the depth drain tests.
     pub fn pending_rows(&self) -> usize {
-        self.writer.pending()
+        self.writer
+            .pending()
+            .saturating_add(self.book.as_ref().map_or(0, |b| b.levels.pending()))
     }
 
     /// The ILP text this ingest has buffered — what a test must read to check
@@ -9833,23 +9928,135 @@ impl DepthIngest {
     // because this does.
     // TEST-EXEMPT: observability accessor, asserted by the tests it enables.
     pub fn pending_ilp(&self) -> String {
-        self.writer.buffer_utf8()
+        match &self.book {
+            None => self.writer.buffer_utf8(),
+            // The book buffer is binary ILP v2; the level text follows it.
+            Some(b) => format!("{}{}", self.writer.buffer_utf8(), b.levels.buffer_utf8()),
+        }
+    }
+
+    /// The array-row writer's buffered bytes (binary ILP v2), empty when array
+    /// rows are off.
+    #[must_use]
+    // TEST-EXEMPT: observability accessor, asserted by the array-row drain tests.
+    pub fn pending_book_bytes(&self) -> &[u8] {
+        if self.book.is_some() {
+            self.writer.buffer_bytes()
+        } else {
+            &[]
+        }
     }
 
     /// Rows discarded on failed flushes.
     #[must_use]
     // TEST-EXEMPT: observability accessor, asserted by the depth drain tests.
     pub fn dropped_rows(&self) -> u64 {
-        self.writer.dropped()
+        self.writer
+            .dropped()
+            .saturating_add(self.book.as_ref().map_or(0, |b| b.levels.dropped()))
     }
 
     /// Flushes the depth ILP buffer.
     ///
+    /// In array-row mode the level writer for older frames is flushed too,
+    /// only when it holds rows: it is synchronous (a network round trip), and
+    /// it holds rows only while a replay of an earlier process's frames runs
+    /// (the boot WAL catch-up, the after-close pass), never from live frames.
+    ///
     /// # Errors
     /// Propagates the writer's flush failure (which has already discarded and
-    /// logged the pending rows).
+    /// logged the pending rows). Both writers are flushed before an error is
+    /// returned.
     pub fn flush(&mut self) -> anyhow::Result<()> {
-        self.writer.flush()
+        let primary = self.writer.flush();
+        let older = match self.book.as_deref_mut() {
+            Some(b) if b.levels.pending() > 0 => b.levels.flush(),
+            _ => Ok(()),
+        };
+        primary.and(older)
+    }
+}
+
+/// Array-row state: the start instant, the level writer for older frames,
+/// and three reusable level arrays (allocated once, 4.8 KB).
+struct BookMode {
+    /// Frames received at or after this UTC instant go to `market_depth_book`.
+    since: i64,
+    /// Synchronous `market_depth` writer for frames received before `since`.
+    levels: DepthWriter,
+    price: [f64; MAX_DEPTH_BOOK_LEVELS],
+    quantity: [f64; MAX_DEPTH_BOOK_LEVELS],
+    orders: [f64; MAX_DEPTH_BOOK_LEVELS],
+}
+
+impl BookMode {
+    fn boxed(since: i64, levels: DepthWriter) -> Box<Self> {
+        Box::new(Self {
+            since,
+            levels,
+            price: [0.0; MAX_DEPTH_BOOK_LEVELS],
+            quantity: [0.0; MAX_DEPTH_BOOK_LEVELS],
+            orders: [0.0; MAX_DEPTH_BOOK_LEVELS],
+        })
+    }
+}
+
+impl BookMode {
+    /// A refused level keeps its slot, as NaN in all three arrays.
+    fn mark_refused(&mut self, slot: usize) {
+        self.price[slot] = f64::NAN;
+        self.quantity[slot] = f64::NAN;
+        self.orders[slot] = f64::NAN;
+    }
+}
+
+/// The identity columns of one array row.
+struct BookKey {
+    security_id: i64,
+    segment: &'static str,
+    depth_kind: &'static str,
+    side: &'static str,
+    capture_seq: i64,
+    ts_nanos: i64,
+}
+
+/// Appends the first `n` slots of `b`'s arrays as one `market_depth_book`
+/// row. `false` when the writer refused it (wrong layout, malformed, or out
+/// of window); the writer has then marked the frame unapplied. O(n), no
+/// allocation: the arrays are borrowed.
+fn append_book_slots(writer: &mut DepthWriter, b: &BookMode, n: usize, key: &BookKey) -> bool {
+    let row = DepthBookRow {
+        security_id: key.security_id,
+        segment: key.segment,
+        depth_kind: key.depth_kind,
+        side: key.side,
+        prices: &b.price[..n],
+        quantities: &b.quantity[..n],
+        orders: &b.orders[..n],
+        capture_seq: key.capture_seq,
+        ts_nanos: key.ts_nanos,
+    };
+    writer.append_book_row(&row).is_ok()
+}
+
+/// The per-level price check both layouts apply: finite, not negative, not
+/// above `MAX_PLAUSIBLE_LTP`. Zero passes (the absent-level sentinel).
+fn depth_level_price_is_plausible(price: f64) -> bool {
+    price.is_finite() && price >= 0.0 && price <= f64::from(MAX_PLAUSIBLE_LTP)
+}
+
+/// The writer that takes LEVEL rows for a frame received at
+/// `received_at_nanos`: the older-frame writer in array-row mode, else the
+/// primary. A free function over the two fields so the caller can keep the
+/// parse buffer borrowed. O(1).
+fn level_sink<'a>(
+    book: &'a mut Option<Box<BookMode>>,
+    primary: &'a mut DepthWriter,
+    received_at_nanos: i64,
+) -> &'a mut DepthWriter {
+    match book.as_deref_mut() {
+        Some(b) if received_at_nanos < b.since => &mut b.levels,
+        _ => primary,
     }
 }
 
@@ -9961,6 +10168,18 @@ fn append_inline_depth(
     // 23:59 IST into the PREVIOUS day — the day archival and retention key on.
     let ts_nanos =
         received_at_nanos.saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
+    if sink.writes_book(received_at_nanos) {
+        return append_inline_depth_book(
+            sink,
+            levels,
+            security_id,
+            segment,
+            capture_seq,
+            ts_nanos,
+            c,
+        );
+    }
+    let writer = level_sink(&mut sink.book, &mut sink.writer, received_at_nanos);
     let mut rows = 0_u64;
     for (idx, level) in levels.iter().enumerate() {
         let level_no = i64::try_from(idx).unwrap_or(i64::MAX).saturating_add(1);
@@ -10003,7 +10222,7 @@ fn append_inline_depth(
                 capture_seq,
                 ts_nanos,
             };
-            if sink.writer.append_row(&row).is_ok() {
+            if writer.append_row(&row).is_ok() {
                 rows = rows.saturating_add(1);
             } else {
                 // 2026-08-25: the dedicated drain has this else arm; the
@@ -10027,13 +10246,70 @@ fn append_inline_depth(
                 capture_seq,
                 ts_nanos,
             };
-            if sink.writer.append_row(&row).is_ok() {
+            if writer.append_row(&row).is_ok() {
                 rows = rows.saturating_add(1);
             } else {
                 c.depth_refused.increment(1);
             }
         } else {
             c.depth_refused.increment(1);
+        }
+    }
+    rows
+}
+
+/// The array-row form of [`append_inline_depth`] (plan item 49e step 3): the
+/// five-level book in a Full packet becomes TWO `market_depth_book` rows, one
+/// bid and one ask, five slots each. Prices go through `f32_to_f64_clean`
+/// exactly as the level path does; a refused level is NaN in its slot and
+/// counted refused. Returns the levels stored (the same unit the level path
+/// counts), at most ten.
+fn append_inline_depth_book(
+    sink: &mut DepthIngest,
+    levels: &[tickvault_common::tick_types::MarketDepthLevel; 5],
+    security_id: i64,
+    segment: &'static str,
+    capture_seq: i64,
+    ts_nanos: i64,
+    c: &DrainCounters,
+) -> u64 {
+    let Some(b) = sink.book.as_deref_mut() else {
+        // Unreachable: the caller checked `writes_book`. Counted all the same.
+        c.depth_refused.increment(1);
+        return 0;
+    };
+    let plausible = |p: f32| depth_level_price_is_plausible(f64::from(p));
+    let mut rows = 0_u64;
+    for side in [DEPTH_SIDE_BID, DEPTH_SIDE_ASK] {
+        let mut stored = 0_u64;
+        for (slot, level) in levels.iter().enumerate() {
+            let (price, quantity, orders) = if side == DEPTH_SIDE_BID {
+                (level.bid_price, level.bid_quantity, level.bid_orders)
+            } else {
+                (level.ask_price, level.ask_quantity, level.ask_orders)
+            };
+            if plausible(price) {
+                b.price[slot] = tickvault_common::price_precision::f32_to_f64_clean(price);
+                b.quantity[slot] = f64::from(quantity);
+                b.orders[slot] = f64::from(orders);
+                stored = stored.saturating_add(1);
+            } else {
+                b.mark_refused(slot);
+                c.depth_refused.increment(1);
+            }
+        }
+        let key = BookKey {
+            security_id,
+            segment,
+            depth_kind: DEPTH_KIND_5,
+            side,
+            capture_seq,
+            ts_nanos,
+        };
+        if append_book_slots(&mut sink.writer, b, levels.len(), &key) {
+            rows = rows.saturating_add(stored);
+        } else {
+            c.depth_refused.increment(stored);
         }
     }
     rows
@@ -10053,8 +10329,11 @@ fn drain_depth_frame(
     // are WAL-backed by definition and never take this arm.
     if !frame.wal_backed {
         c.frames_wal_unbacked.increment(1);
-        depth.writer.mark_pending_unbacked();
+        depth.mark_pending_unbacked_for(received_at_nanos);
     }
+    // Plan item 49e step 3: decided once per frame, so every packet of one
+    // frame lands in the same table.
+    let to_book = depth.writes_book(received_at_nanos);
     let depth_kind_label = match kind {
         DepthFeedKind::Twenty => DEPTH_KIND_20,
         DepthFeedKind::TwoHundred => DEPTH_KIND_200,
@@ -10258,6 +10537,58 @@ fn drain_depth_frame(
                 | crate::depth_subscription_view::DepthFrameClass::Unknown => {}
             }
         }
+        let ts_nanos =
+            received_at_nanos.saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
+        if to_book {
+            // ARRAY ROW (plan item 49e step 3): the whole side-packet is ONE
+            // `market_depth_book` row. A level the price check below refuses
+            // stays in its slot as NaN in all three arrays, so positions stay
+            // aligned and no level is skipped; it is counted refused exactly
+            // as the level path counts it. A packet with no levels writes
+            // nothing, as the level path writes nothing for it.
+            if levels.is_empty() {
+                continue;
+            }
+            if let Some(b) = depth.book.as_deref_mut() {
+                let n = levels.len().min(MAX_DEPTH_BOOK_LEVELS);
+                let mut stored = 0_u64;
+                for (slot, level) in levels.iter().take(n).enumerate() {
+                    if depth_level_price_is_plausible(level.price) {
+                        b.price[slot] = level.price;
+                        b.quantity[slot] = f64::from(level.quantity);
+                        b.orders[slot] = f64::from(level.orders);
+                        stored = stored.saturating_add(1);
+                    } else {
+                        b.mark_refused(slot);
+                        out.refused = out.refused.saturating_add(1);
+                        c.depth_refused.increment(1);
+                    }
+                }
+                // More levels than the array holds cannot come off the wire
+                // (depth-200 is the widest); counted, never silently cut.
+                let beyond = u64::try_from(levels.len() - n).unwrap_or(u64::MAX);
+                if beyond > 0 {
+                    out.refused = out.refused.saturating_add(beyond);
+                    c.depth_refused.increment(beyond);
+                }
+                let key = BookKey {
+                    security_id,
+                    segment,
+                    depth_kind: depth_kind_label,
+                    side: side_label,
+                    capture_seq,
+                    ts_nanos,
+                };
+                if append_book_slots(&mut depth.writer, b, n, &key) {
+                    out.rows = out.rows.saturating_add(stored);
+                } else {
+                    out.refused = out.refused.saturating_add(stored);
+                    c.depth_refused.increment(stored);
+                }
+            }
+            continue;
+        }
+        let sink = level_sink(&mut depth.book, &mut depth.writer, received_at_nanos);
         for (idx, level) in levels.iter().enumerate() {
             // Price sanity, per level — the depth twin of `tick_price_is_sane`.
             //
@@ -10283,10 +10614,7 @@ fn drain_depth_frame(
             // would count normal book shape as corruption and, worse, delete
             // the operator's own "show me everything" view of how deep a book
             // actually is. Negative is refused; a price cannot be below zero.
-            if !level.price.is_finite()
-                || level.price < 0.0
-                || level.price > f64::from(MAX_PLAUSIBLE_LTP)
-            {
+            if !depth_level_price_is_plausible(level.price) {
                 out.refused = out.refused.saturating_add(1);
                 c.depth_refused.increment(1);
                 continue;
@@ -10324,10 +10652,9 @@ fn drain_depth_frame(
                 // and 23:59 IST were partitioned into the PREVIOUS day —
                 // which is also the day the archival and retention paths key
                 // on.
-                ts_nanos: received_at_nanos
-                    .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS),
+                ts_nanos,
             };
-            if depth.writer.append_row(&row).is_ok() {
+            if sink.append_row(&row).is_ok() {
                 out.rows = out.rows.saturating_add(1);
             } else {
                 out.refused = out.refused.saturating_add(1);
@@ -11359,6 +11686,9 @@ pub struct DhanFeedStackParams {
     /// created, and config that reaches a decision through a global is config
     /// a test cannot set.
     pub depth_unsubscribe_probe: tickvault_common::config::DepthUnsubscribeProbeConfig,
+    /// `[depth_storage]` (plan item 49e step 3): whether depth is written as
+    /// array rows into `market_depth_book`. Off by default.
+    pub depth_storage: tickvault_common::config::DepthStorageConfig,
     /// `[dhan_universe] backup_top_n` (scope lock 2026-10-02): near-the-money
     /// contracts given a second copy on another main-feed socket. 0 = off.
     pub main_feed_backup_top_n: usize,
@@ -15789,10 +16119,10 @@ pub fn refold_wal_frames(
         // true. At that boot's volumes this is ~2,400 flushes across a replay
         // -- bounded work at boot, against a flush that currently cannot
         // succeed at all.
-        if ingest.pending_rows() >= FLUSH_ROW_THRESHOLD
-            || u64::try_from(ingest.depth_pending_rows()).unwrap_or(u64::MAX)
-                >= DEPTH_FLUSH_ROW_THRESHOLD
-        {
+        // Depth: `depth_flush_due` is the `DEPTH_FLUSH_ROW_THRESHOLD` row
+        // trigger for a level writer and the byte trigger for an array-row
+        // writer (plan item 49e step 3).
+        if ingest.pending_rows() >= FLUSH_ROW_THRESHOLD || ingest.depth_flush_due() {
             // `LiveIngest::flush` flushes the inline-depth sink first and
             // unconditionally (see its body), so one call drains both buffers.
             // A failure here is already loud and already rescues to the spill
@@ -16472,6 +16802,14 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // because depth retention is current-day (`depth_hot_days = 1`) and every
     // partition is verified into S3 before it leaves local disk. Widen that
     // window and this does not fit.
+    // Plan item 49e step 3: the array-row start instant, resolved once,
+    // before any socket dials, and shared with the after-close depth pass so
+    // both route every frame the same way. `None` while the setting is off.
+    // A clock past 2262 reads as "never", which keeps depth in `market_depth`.
+    let depth_book_since = crate::depth_book_since::resolve_depth_book_since(
+        params.depth_storage.array_rows,
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX),
+    );
     let mut ingest = LiveIngest::new(
         TickWriter::new(&params.questdb, Feed::Dhan),
         capacity.max(1),
@@ -16481,7 +16819,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // grows ~26x after boot when contracts attach. See
     // `with_detector_capacity` for the 1.2M refusals this fixes.
     .with_detector_capacity(AGGREGATOR_MAX_SLOTS)
-    .with_inline_depth(DepthIngest::new(&params.questdb));
+    .with_inline_depth(DepthIngest::new(&params.questdb, depth_book_since));
 
     // Taken immediately, so the attach tasks read the SAME store this drain
     // writes. Cloning the `Arc` here rather than constructing a second store
@@ -17651,6 +17989,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         params.questdb.clone(),
         crate::boot_helpers::ws_wal_dir(),
         Arc::clone(&deferred_depth_cancel),
+        depth_book_since,
     );
     let drain_outcome = drain.await;
     deferred_depth_cancel.store(true, std::sync::atomic::Ordering::Release);
@@ -20460,6 +20799,7 @@ mod tests {
         // socket, no behaviour change.
         let handle = spawn_dhan_feed_stack(DhanFeedStackParams {
             depth_unsubscribe_probe: Default::default(),
+            depth_storage: Default::default(),
             main_feed_backup_top_n: 0,
             dhan_enabled: false,
             instance_lock_held: Arc::new(AtomicBool::new(false)),
@@ -20839,6 +21179,242 @@ mod tests {
             depth.writer.pending_unbacked(),
             "the rows must be marked so the rescue path never drops them as WAL-backed"
         );
+    }
+
+    // ---- plan item 49e step 3: array rows --------------------------------
+
+    /// 12:30 IST-equivalent receipt used by the depth drain tests above.
+    const BOOK_RX: i64 = 1_779_355_000_000_000_000;
+
+    fn le_prices(prices: &[f64]) -> Vec<u8> {
+        prices.iter().flat_map(|p| p.to_le_bytes()).collect()
+    }
+
+    fn holds(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[test]
+    fn test_drain_depth_frame_writes_a_depth20_side_as_one_book_row() {
+        let mut depth = DepthIngest::for_test_book(BOOK_RX);
+        let frame = depth_frame(depth20_packet(13, 0, 41), DhanEndpointType::Depth20, 7);
+        let out = drain_depth_frame(
+            &mut depth,
+            &frame,
+            BOOK_RX,
+            DepthFeedKind::Twenty,
+            counters(),
+        );
+        assert_eq!(
+            out.rows, 20,
+            "rows still count LEVELS stored, the level path's unit"
+        );
+        assert_eq!(out.refused, 0);
+        assert_eq!(depth.pending_rows(), 1, "one side-packet is ONE array row");
+        let bytes = depth.pending_book_bytes();
+        assert!(
+            bytes.starts_with(b"market_depth_book"),
+            "{:?}",
+            &bytes[..20]
+        );
+        assert!(holds(bytes, b"depth_kind=d20"));
+        let expected: Vec<f64> = (0..20).map(|i| 100.0 + f64::from(i)).collect();
+        assert!(
+            holds(bytes, &le_prices(&expected)),
+            "all 20 prices, best first, contiguous in the price array"
+        );
+        assert!(
+            !String::from_utf8_lossy(bytes).contains("market_depth,"),
+            "nothing goes to the level table for a frame after the switch"
+        );
+    }
+
+    #[test]
+    fn test_a_refused_level_is_nan_in_its_slot_and_counted_refused() {
+        let mut depth = DepthIngest::for_test_book(BOOK_RX);
+        let mut packet = depth20_packet(13, 0, 41);
+        // Level 4 (slot 3) gets a negative price.
+        let base = 12 + 3 * 16;
+        packet[base..base + 8].copy_from_slice(&(-1.0_f64).to_le_bytes());
+        let frame = depth_frame(packet, DhanEndpointType::Depth20, 7);
+        let out = drain_depth_frame(
+            &mut depth,
+            &frame,
+            BOOK_RX,
+            DepthFeedKind::Twenty,
+            counters(),
+        );
+        assert_eq!(out.rows, 19);
+        assert_eq!(out.refused, 1);
+        assert_eq!(depth.pending_rows(), 1);
+        let mut expected: Vec<f64> = (0..20).map(|i| 100.0 + f64::from(i)).collect();
+        expected[3] = f64::NAN;
+        assert!(
+            holds(depth.pending_book_bytes(), &le_prices(&expected)),
+            "the refused level keeps its slot as NaN; later levels do not shift"
+        );
+    }
+
+    #[test]
+    fn test_a_depth200_book_row_carries_the_packet_row_count_and_an_empty_packet_writes_nothing() {
+        let mut depth = DepthIngest::for_test_book(BOOK_RX);
+        let frame = depth_frame(
+            depth200_packet(52_175, 2, 41, 200),
+            DhanEndpointType::Depth200,
+            9,
+        );
+        let out = drain_depth_frame(
+            &mut depth,
+            &frame,
+            BOOK_RX,
+            DepthFeedKind::TwoHundred,
+            counters(),
+        );
+        assert_eq!(out.rows, 200);
+        assert_eq!(depth.pending_rows(), 1);
+        let empty = depth_frame(
+            depth200_packet(52_175, 2, 41, 0),
+            DhanEndpointType::Depth200,
+            10,
+        );
+        let out = drain_depth_frame(
+            &mut depth,
+            &empty,
+            BOOK_RX,
+            DepthFeedKind::TwoHundred,
+            counters(),
+        );
+        assert_eq!((out.rows, out.refused), (0, 0));
+        assert_eq!(
+            depth.pending_rows(),
+            1,
+            "a zero-level packet writes no row, as before"
+        );
+    }
+
+    #[test]
+    fn test_a_frame_received_before_the_switch_goes_to_the_level_table() {
+        let mut depth = DepthIngest::for_test_book(BOOK_RX + 1);
+        assert!(!depth.writes_book(BOOK_RX));
+        assert!(depth.writes_book(BOOK_RX + 1));
+        let frame = depth_frame(depth20_packet(13, 0, 41), DhanEndpointType::Depth20, 7);
+        let out = drain_depth_frame(
+            &mut depth,
+            &frame,
+            BOOK_RX,
+            DepthFeedKind::Twenty,
+            counters(),
+        );
+        assert_eq!(out.rows, 20);
+        assert_eq!(
+            depth.pending_rows(),
+            20,
+            "twenty level rows on the older-frame writer"
+        );
+        assert!(
+            depth.pending_book_bytes().is_empty(),
+            "no array row for an older frame"
+        );
+        assert!(depth.pending_ilp().contains("market_depth,"));
+    }
+
+    #[test]
+    fn test_writes_book_is_false_with_array_rows_off() {
+        let depth = DepthIngest::for_test();
+        assert!(!depth.writes_book(i64::MAX));
+        assert!(depth.pending_book_bytes().is_empty());
+    }
+
+    #[test]
+    fn test_flush_due_is_bytes_for_book_rows_and_rows_for_level_rows() {
+        let mut book = DepthIngest::for_test_book(BOOK_RX);
+        let frame = depth_frame(
+            depth200_packet(52_175, 2, 41, 200),
+            DhanEndpointType::Depth200,
+            9,
+        );
+        // 2,000 depth-200 sides are 2,000 rows, far under the 10,000-row
+        // threshold, and ~9.6 MB, past the 8 MiB byte threshold.
+        let mut seq = 9_u64;
+        while !book.flush_due() {
+            let mut f = frame.clone();
+            seq += 1 << 20;
+            f.seq = seq;
+            drain_depth_frame(
+                &mut book,
+                &f,
+                BOOK_RX,
+                DepthFeedKind::TwoHundred,
+                counters(),
+            );
+            assert!(book.pending_rows() < 10_000, "must trip on bytes, not rows");
+        }
+        assert!(
+            book.pending_book_bytes().len()
+                >= tickvault_storage::depth_persistence::DEPTH_BOOK_FLUSH_BYTES
+        );
+
+        let mut levels = DepthIngest::for_test();
+        let frame = depth_frame(depth20_packet(13, 0, 41), DhanEndpointType::Depth20, 7);
+        for i in 0..499_u64 {
+            let mut f = frame.clone();
+            f.seq = 7 + (i << 20);
+            drain_depth_frame(&mut levels, &f, BOOK_RX, DepthFeedKind::Twenty, counters());
+        }
+        assert!(!levels.flush_due(), "9,980 level rows");
+        let mut f = frame.clone();
+        f.seq = 7 + (500 << 20);
+        drain_depth_frame(&mut levels, &f, BOOK_RX, DepthFeedKind::Twenty, counters());
+        assert!(levels.flush_due(), "10,000 level rows");
+    }
+
+    #[test]
+    fn test_mark_pending_unbacked_for_marks_the_writer_that_takes_the_frame() {
+        let mut depth = DepthIngest::for_test_book(BOOK_RX);
+        depth.mark_pending_unbacked_for(BOOK_RX - 1);
+        assert!(
+            depth
+                .book
+                .as_ref()
+                .is_some_and(|b| b.levels.pending_unbacked())
+        );
+        assert!(!depth.writer.pending_unbacked());
+        depth.mark_pending_unbacked_for(BOOK_RX);
+        assert!(depth.writer.pending_unbacked());
+    }
+
+    #[test]
+    fn test_mark_all_pending_unbacked_marks_both_writers() {
+        let mut all = DepthIngest::for_test_book(BOOK_RX);
+        all.mark_all_pending_unbacked();
+        assert!(all.writer.pending_unbacked());
+        assert!(
+            all.book
+                .as_ref()
+                .is_some_and(|b| b.levels.pending_unbacked())
+        );
+        // With array rows off there is only the one writer.
+        let mut one = DepthIngest::for_test();
+        one.mark_all_pending_unbacked();
+        assert!(one.writer.pending_unbacked());
+    }
+
+    #[test]
+    fn test_for_test_book_routes_from_its_instant_and_pending_book_bytes_starts_empty() {
+        let depth = DepthIngest::for_test_book(BOOK_RX);
+        assert!(depth.writes_book(BOOK_RX));
+        assert!(!depth.writes_book(BOOK_RX - 1));
+        assert!(depth.pending_book_bytes().is_empty(), "nothing written yet");
+        assert_eq!(depth.pending_rows(), 0);
+    }
+
+    #[test]
+    fn test_depth_flush_due_follows_the_inline_sink() {
+        let ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        assert!(!ingest.depth_flush_due(), "no depth sink, nothing to flush");
+        let ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8)
+            .with_inline_depth(DepthIngest::for_test_book(BOOK_RX));
+        assert!(!ingest.depth_flush_due(), "an empty book sink is not due");
     }
 
     /// The shed decision both depth paths take, over every input. Only a
@@ -25523,7 +26099,7 @@ mod wal_refold_tests {
         );
         assert!(
             body[..flush_at].contains("ingest.pending_rows() >= FLUSH_ROW_THRESHOLD")
-                && body[..flush_at].contains("DEPTH_FLUSH_ROW_THRESHOLD"),
+                && body[..flush_at].contains("ingest.depth_flush_due()"),
             "the flush must be gated on BOTH row thresholds the live drain \
              uses — a depth-only or tick-only gate leaves the other buffer \
              unbounded, and depth was the 22.3M-row half"
@@ -27253,6 +27829,79 @@ mod inline_depth_tests {
     }
 
     #[test]
+    fn test_append_inline_depth_book_writes_one_bid_and_one_ask_row_with_clean_prices() {
+        let mut sink = DepthIngest::for_test_book(RECEIPT_UTC_NANOS);
+        let tick = tickvault_common::tick_types::ParsedTick {
+            security_id: 13,
+            exchange_segment_code: 0,
+            ..Default::default()
+        };
+        let mut levels = [tickvault_common::tick_types::MarketDepthLevel {
+            bid_quantity: 10,
+            ask_quantity: 20,
+            bid_orders: 1,
+            ask_orders: 2,
+            bid_price: 10.2,
+            ask_price: 10.35,
+        }; 5];
+        // Slot 2's ask is refused.
+        levels[2].ask_price = -3.0;
+        let rows = append_inline_depth(
+            &mut sink,
+            &tick,
+            &levels,
+            RECEIPT_UTC_NANOS,
+            0,
+            0,
+            counters(),
+        );
+        assert_eq!(rows, 9, "ten levels, one refused");
+        assert_eq!(sink.pending_rows(), 2, "one bid row and one ask row");
+        let bytes = sink.pending_book_bytes();
+        let text = String::from_utf8_lossy(bytes);
+        assert!(text.contains("depth_kind=d5"));
+        assert!(text.contains("side=bid") && text.contains("side=ask"));
+        // f32_to_f64_clean: 10.2, never 10.199999809265137.
+        let bid: Vec<u8> = [10.2_f64; 5].iter().flat_map(|p| p.to_le_bytes()).collect();
+        assert!(bytes.windows(bid.len()).any(|w| w == bid.as_slice()));
+        let ask: Vec<u8> = [10.35, 10.35, f64::NAN, 10.35, 10.35]
+            .iter()
+            .flat_map(|p: &f64| p.to_le_bytes())
+            .collect();
+        assert!(bytes.windows(ask.len()).any(|w| w == ask.as_slice()));
+    }
+
+    #[test]
+    fn test_append_inline_depth_before_the_switch_writes_ten_level_rows() {
+        let mut sink = DepthIngest::for_test_book(RECEIPT_UTC_NANOS + 1);
+        let tick = tickvault_common::tick_types::ParsedTick {
+            security_id: 13,
+            exchange_segment_code: 0,
+            ..Default::default()
+        };
+        let levels = [tickvault_common::tick_types::MarketDepthLevel {
+            bid_quantity: 10,
+            ask_quantity: 20,
+            bid_orders: 1,
+            ask_orders: 2,
+            bid_price: 100.5,
+            ask_price: 100.75,
+        }; 5];
+        let rows = append_inline_depth(
+            &mut sink,
+            &tick,
+            &levels,
+            RECEIPT_UTC_NANOS,
+            0,
+            0,
+            counters(),
+        );
+        assert_eq!(rows, 10);
+        assert_eq!(sink.pending_rows(), 10);
+        assert!(sink.pending_book_bytes().is_empty());
+    }
+
+    #[test]
     fn append_inline_depth_writes_clean_decimals_not_widening_artifacts() {
         // The defect this pins, live for a day before it was caught: the
         // inline 5-level book carries Dhan's f32 prices, and this writer
@@ -27532,10 +28181,15 @@ mod inline_depth_tests {
              implausible-price arms + 2 failed-append arms = 7 minimum; found {counted}"
         );
         assert_eq!(
-            body.matches("if sink.writer.append_row(&row).is_ok() {")
-                .count(),
+            body.matches("if writer.append_row(&row).is_ok() {").count(),
             2,
             "both the bid and ask sides append exactly one row"
+        );
+        // The array-row twin (plan item 49e step 3) counts a failed book-row
+        // append as the levels it would have stored.
+        assert!(
+            body.contains("c.depth_refused.increment(stored);"),
+            "append_inline_depth_book drops a failed book row with no counter"
         );
         assert!(
             !body.contains(
