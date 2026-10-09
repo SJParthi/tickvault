@@ -198,10 +198,10 @@ jobs:
       plan_exitcode: ${{ steps.plan.outputs.exitcode }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v4
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4
         with:
           terraform_version: 1.9.8
           terraform_wrapper: false
@@ -221,7 +221,7 @@ jobs:
       # environment (Settings > Environments > prod), an owner setting.
       - name: Configure AWS credentials (OIDC if available, else access keys)
         if: github.event_name != 'pull_request'
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
         with:
           role-to-assume: ${{ secrets.AWS_TERRAFORM_ROLE_ARN }}
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -274,7 +274,7 @@ jobs:
       # cargo-lambda install is absorbed by the adjacent actions/cache step
       # (tag-pinned @v4, this workflow's house action-pinning style).
       - name: Cache cargo-lambda
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ~/.cargo/bin/cargo-lambda
           key: cargo-lambda-1.9.1-${{ runner.os }}-${{ runner.arch }}
@@ -445,7 +445,7 @@ jobs:
 
       - name: Upload plan artifact
         if: github.event_name != 'pull_request'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: terraform-plan-${{ github.sha }}
           path: ${{ env.TF_DIR }}/tfplan
@@ -508,16 +508,16 @@ jobs:
       elastic_ip: ${{ steps.outputs.outputs.elastic_ip }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v4
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4
         with:
           terraform_version: 1.9.8
           terraform_wrapper: false
 
       - name: Configure AWS credentials (OIDC if available, else access keys)
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
         with:
           role-to-assume: ${{ secrets.AWS_TERRAFORM_ROLE_ARN }}
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -532,7 +532,7 @@ jobs:
           echo "account_id=${ACCOUNT_ID}" >> $GITHUB_OUTPUT
 
       - name: Download plan artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: terraform-plan-${{ github.sha }}
           path: ${{ env.TF_DIR }}/
@@ -544,7 +544,7 @@ jobs:
       # (2026-07-18 hostile-review r1 F1 fix — full rationale on the plan
       # job's twin step; KEEP the two Cache/Build steps textually identical).
       - name: Cache cargo-lambda
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ~/.cargo/bin/cargo-lambda
           key: cargo-lambda-1.9.1-${{ runner.os }}-${{ runner.arch }}
@@ -873,7 +873,7 @@ jobs:
       )
     steps:
       - name: Configure AWS credentials (OIDC if available, else access keys)
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
         with:
           role-to-assume: ${{ secrets.AWS_TERRAFORM_ROLE_ARN }}
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
