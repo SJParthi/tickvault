@@ -6382,6 +6382,38 @@ Revert the PR. `.dspl` files left on disk are not read by the old binary, so dra
 
 `tv_depth_framed_spill_set_aside_total{reason=refused|corrupt|torn_tail}` counts set-aside events; replay outcomes add to the existing `SpillReplayOutcome` counters; every set-aside logs `TICK-SPILL-01` at error level with the file and byte range.
 
+## ITEM 49e-2 — Step 2: array-row writer for `market_depth_book` (2026-10-09)
+
+- [x] Array-row table DDL, pinned ILP v2 writer, byte-based flush check, v2-safe spill — Files: crates/storage/src/depth_persistence.rs — Tests: test_market_depth_book_create_ddl_holds_three_double_arrays, test_market_depth_book_ensure_statements_never_drop_and_end_on_the_dedup_key, test_new_book_builds_a_v2_book_writer_with_no_questdb, test_book_dedup_key_is_the_level_key_without_level, test_depth_layout_protocol_number_pins_v1_and_v2_in_the_conf, test_append_book_row_writes_a_200_level_side_as_one_row, test_a_refused_level_travels_as_nan_in_its_slot, test_an_empty_book_is_one_row_with_empty_arrays, test_unequal_or_oversized_arrays_are_refused_with_nothing_written, test_each_writer_refuses_the_other_layout, test_an_out_of_window_book_row_is_refused_like_a_level_row, test_book_flush_due_by_pending_bytes_never_for_a_level_writer, test_a_v2_batch_spills_as_one_whole_record_and_reads_back_byte_for_byte
+
+Why now: on 2026-10-09 QuestDB was about 204,000 depth transactions behind and the tick, candle and auxiliary tables were falling behind with it (CloudWatch, read-only). Array rows are the measured lever (49d: 11x to 13.5x fewer bytes written for depth-200 and depth-20). This step adds the writer only; nothing writes the new table until step 3, so production behaviour is unchanged.
+
+### Design
+
+New table `market_depth_book`: one row per book side per packet, `price` / `quantity` / `orders` as `DOUBLE[]`, `levels` LONG, same symbols, `contract`, `capture_seq` and `ts` as `market_depth`, `PARTITION BY HOUR WAL`. DEDUP key `ts, security_id, segment, depth_kind, side, capture_seq, feed` (the level key without `level`). `DepthWriter` gains a fixed `DepthLayout` (`Levels` or `Book`); `DepthWriter::new_book` builds a sender whose conf pins `protocol_version=2` (never negotiated). `append_book_row(&DepthBookRow)` borrows three caller-owned slices, refuses the same out-of-window rows as `append_row` (shared `depth_arrival_window_refusal`), and writes one ILP v2 line. Each writer refuses the other layout's rows. `book_flush_due` is true once the buffer holds `DEPTH_BOOK_FLUSH_BYTES` (8 MiB; four queued batches stay within 32 MiB). The spill path now passes the buffer's protocol to the framed spill (`spill_version_of`), so a v2 batch is one version-2 record rather than text cut at newlines. The DDL is not run at boot yet: step 3 runs it behind `[depth] array_rows = false`, together with the retention and archive registration of the new table.
+
+### Edge Cases
+
+Zero levels (empty book): one row with empty arrays, as the scratch test stored it. A refused level is `NaN` in its slot, positions aligned, never skipped. Unequal slice lengths or more than 200 levels: an error, nothing written, frame marked unapplied. A level row on a book writer (or the reverse): an error, nothing written. Out-of-window stamps: refused and counted under the existing reasons. A disconnected book writer still buffers in v2.
+
+### Failure Modes
+
+A wrong-layout or malformed row marks its frame unapplied, so a replay re-offers it (errs toward more replay). A v2 batch that fails to flush goes through the existing rescue, park and WAL-deferral tiers unchanged; only the spill record version differs. If QuestDB refused the arrays (it did not on 9.3.5 in the scratch test), step 3's flush would fail and the batch would spill as a version-2 record. Not reachable in production until step 3.
+
+### Test Plan
+
+`cargo test -p tickvault-storage --lib` (1,847 passed, 1 ignored, 2026-10-09). The 11 tests above. Bite: forcing version 1 inside `spill_failed_depth_ilp` fails `test_a_v2_batch_spills_as_one_whole_record_and_reads_back_byte_for_byte`. `cargo clippy -p tickvault-storage --no-deps -- -D warnings` clean. A DHAT gate for the book append lands with step 3, when the drain calls it per packet.
+
+### Rollback
+
+Revert the commit. No table is created, no config, data or infrastructure changes; the level writer's behaviour and spill format are unchanged (version 1 for its v1 buffers).
+
+### Observability
+
+No new metric, alarm or page in this step. A book writer reuses the existing depth counters (rows dropped, spilled, out-of-window refusals). Step 3 adds the table to the boot DDL report and to the retention and archive sets.
+
+Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
+
 ## ITEM 51 — Dhan 15:41 cross-verification hardening (2026-10-06)
 
 Approved by Parthiban 2026-10-06: "Go ahead with whatever you want dude" and "See do everything whatever is recommended dude okay?", answering the recommended cross-verification hardening list (five findings: the day marker, the read that runs too early, missing minutes that never page, a day with no run at all, and targets fixed at boot). Rule authority: `no-rest-except-live-feed-2026-06-27.md` §12.15.7 onward and the noise lock §2.5 notes, each dated and recorded before its code. Ten serial PRs, one sub-item each. Findings Verified by reading `origin/main` at `60bdfd97a`; cargo was not run for the findings.

@@ -403,6 +403,177 @@ pub fn market_depth_ensure_statements() -> Vec<String> {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Array-row table (plan item 49e step 2) — one row per book side per packet
+// ---------------------------------------------------------------------------
+
+/// The array-row successor of `market_depth`: one row per book SIDE per
+/// packet, the levels held in `DOUBLE[]` columns.
+///
+/// A NEW table, not a column change on `market_depth`: QuestDB cannot change a
+/// column's type in place, and the old table keeps its rows (never deleted;
+/// retention as today). Measured on a scratch QuestDB 9.3.5 on 2026-10-06
+/// (plan item 49d / 45i): 11x to 13.5x fewer bytes written by the database
+/// for depth-200 and depth-20, 2.8x for the inline five levels, every level
+/// read back exact. Not written by anything yet: the drain is switched to it
+/// in step 3, behind a default-off setting.
+pub const MARKET_DEPTH_BOOK_TABLE: &str = "market_depth_book";
+
+/// The `market_depth_book` DEDUP UPSERT key: [`DEDUP_KEY_MARKET_DEPTH`]
+/// without `level`, because a row now carries every level of one side.
+/// `segment` (I-P1-11) and `feed` stay in it.
+pub const DEDUP_KEY_MARKET_DEPTH_BOOK: &str =
+    "ts, security_id, segment, depth_kind, side, capture_seq, feed";
+
+/// Most levels one book row may carry: depth-200 sends 200 per side.
+pub const MAX_DEPTH_BOOK_LEVELS: usize = 200;
+
+/// Flush an array-row buffer once it holds this many bytes.
+///
+/// Counted in BYTES, not rows: a depth-200 side is about 4.8 KB as an array
+/// row, so the row threshold the level writer uses (10,000) would be about
+/// 48 MB, past [`MAX_DEPTH_PRODUCER_BUFFER_BYTES`] (attack finding, plan item
+/// 49d). At 8 MiB a full flush queue (`DEPTH_FLUSH_QUEUE_DEPTH` batches) holds
+/// at most 32 MiB, one [`MAX_DEPTH_PRODUCER_BUFFER_BYTES`].
+pub const DEPTH_BOOK_FLUSH_BYTES: usize = 8 * 1024 * 1024;
+
+/// The idempotent `CREATE TABLE` DDL for `market_depth_book`. Pure — no I/O.
+///
+/// Same column set as `market_depth` with `level` replaced by `levels` (the
+/// count of entries in each array), and `price` / `quantity` / `orders` as
+/// `DOUBLE[]`. Quantity and orders fit an `f64` exactly (they are `u32` on
+/// the wire). Same `PARTITION BY HOUR` as `market_depth`, for the same
+/// archive reason.
+#[must_use]
+pub fn market_depth_book_create_ddl() -> String {
+    // APPROVED: table DDL, built once at boot in market_depth_book_create_ddl
+    format!(
+        "CREATE TABLE IF NOT EXISTS {MARKET_DEPTH_BOOK_TABLE} (\
+            feed SYMBOL, \
+            contract SYMBOL, \
+            segment SYMBOL, \
+            depth_kind SYMBOL, \
+            side SYMBOL, \
+            security_id LONG, \
+            levels LONG, \
+            price DOUBLE[], \
+            quantity DOUBLE[], \
+            orders DOUBLE[], \
+            capture_seq LONG, \
+            ts TIMESTAMP\
+        ) TIMESTAMP(ts) PARTITION BY HOUR WAL"
+    )
+}
+
+/// Every `market_depth_book` column with its type, for the self-heal ALTERs.
+const MARKET_DEPTH_BOOK_COLUMNS: &[(&str, &str)] = &[
+    ("feed", "SYMBOL"),
+    ("contract", "SYMBOL"),
+    ("segment", "SYMBOL"),
+    ("depth_kind", "SYMBOL"),
+    ("side", "SYMBOL"),
+    ("security_id", "LONG"),
+    ("levels", "LONG"),
+    ("price", "DOUBLE[]"),
+    ("quantity", "DOUBLE[]"),
+    ("orders", "DOUBLE[]"),
+    ("capture_seq", "LONG"),
+];
+
+/// The ordered DDL statements for `market_depth_book`:
+/// CREATE → per-column `ADD COLUMN IF NOT EXISTS` → `DEDUP ENABLE`.
+/// Never a DROP. Pure, so the statement set is unit-testable without QuestDB.
+/// Run at boot from step 3, when the setting that writes the table exists.
+#[must_use]
+pub fn market_depth_book_ensure_statements() -> Vec<String> {
+    let mut out = vec![market_depth_book_create_ddl()]; // APPROVED: boot DDL statement list, never per row
+    for (col, ty) in MARKET_DEPTH_BOOK_COLUMNS {
+        // APPROVED: per-column ADD COLUMN, boot schema self-heal
+        out.push(format!(
+            "ALTER TABLE {MARKET_DEPTH_BOOK_TABLE} ADD COLUMN IF NOT EXISTS {col} {ty}"
+        ));
+    }
+    // APPROVED: DEDUP ENABLE statement, boot only
+    out.push(format!(
+        "ALTER TABLE {MARKET_DEPTH_BOOK_TABLE} DEDUP ENABLE UPSERT KEYS({DEDUP_KEY_MARKET_DEPTH_BOOK})"
+    ));
+    out
+}
+
+/// Which table a [`DepthWriter`] writes. One writer writes ONE table: a row
+/// written to `market_depth_book` without its three arrays would set them to
+/// NULL over a stored book (seen on the scratch table, plan item 49d), so a
+/// writer refuses rows of the other layout instead of mixing them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DepthLayout {
+    /// `market_depth`, one row per level, ILP v1. Every writer today.
+    Levels,
+    /// `market_depth_book`, one row per side, ILP v2 (arrays need v2).
+    Book,
+}
+
+impl DepthLayout {
+    /// The ILP protocol this layout's buffer and sender are pinned to.
+    /// Pinned, never negotiated: with no version set the client picks v3,
+    /// and a v2 buffer then fails at flush (attack finding, plan item 49d).
+    #[must_use]
+    pub const fn protocol(self) -> ProtocolVersion {
+        match self {
+            Self::Levels => ProtocolVersion::V1,
+            Self::Book => ProtocolVersion::V2,
+        }
+    }
+
+    /// The `protocol_version=` number written into the sender's conf string.
+    #[must_use]
+    pub const fn protocol_number(self) -> u8 {
+        match self {
+            Self::Levels => 1,
+            Self::Book => 2,
+        }
+    }
+}
+
+/// One side of one depth packet, prepared for an array-row append.
+///
+/// Borrows three caller-owned slices (a stack array on the drain), so
+/// building and appending it allocates nothing. The three slices are the
+/// same length, best price first; a level the caller refused is `NaN` in its
+/// slot, never skipped, so positions stay aligned and no level is dropped.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DepthBookRow<'a> {
+    /// Dhan SecurityId.
+    pub security_id: i64,
+    /// Exchange segment wire label.
+    pub segment: &'static str,
+    /// `d5`, `d20` or `d200`.
+    pub depth_kind: &'static str,
+    /// `bid` or `ask`.
+    pub side: &'static str,
+    /// Level prices, best first.
+    pub prices: &'a [f64],
+    /// Level quantities, same order.
+    pub quantities: &'a [f64],
+    /// Orders resting at each level, same order.
+    pub orders: &'a [f64],
+    /// Intra-second tiebreaker; see the module docs.
+    pub capture_seq: i64,
+    /// Designated timestamp — arrival time in IST, as `market_depth`.
+    pub ts_nanos: i64,
+}
+
+/// The framed-spill record version for a buffer's protocol.
+///
+/// A v2 buffer is binary and holds `\n` bytes inside its doubles and arrays,
+/// so it must be spilled as ONE record (version 2); cutting it at line
+/// boundaries as v1 text would split rows apart on replay.
+fn spill_version_of(protocol: ProtocolVersion) -> u8 {
+    match protocol {
+        ProtocolVersion::V1 => crate::depth_spill_frame::ILP_VERSION_1,
+        _ => crate::depth_spill_frame::ILP_VERSION_2,
+    }
+}
+
 /// Idempotently self-heals the `market_depth` schema. Best-effort: failures
 /// log and continue, they never block boot.
 ///
@@ -514,11 +685,13 @@ pub const ILP_REQUEST_TIMEOUT_SECS: u64 = 5;
 /// ILP-over-HTTP conf: per-flush server ACK with `retry_timeout=0` (the caller
 /// owns retry cadence) and a bounded `request_timeout` so a hung flush cannot
 /// wedge the drain.
-fn depth_ilp_http_conf(config: &QuestDbConfig) -> String {
+fn depth_ilp_http_conf(config: &QuestDbConfig, layout: DepthLayout) -> String {
     // APPROVED: ILP conf string, once per DepthWriter::new
     format!(
-        "http::addr={}:{};protocol_version=1;retry_timeout=0;request_timeout=5000;",
-        config.host, config.http_port
+        "http::addr={}:{};protocol_version={};retry_timeout=0;request_timeout=5000;",
+        config.host,
+        config.http_port,
+        layout.protocol_number()
     )
 }
 
@@ -771,6 +944,7 @@ fn depth_spill_dir_bytes(dir: &Path) -> u64 {
 fn spill_failed_depth_ilp(
     dir: &Path,
     payload: &[u8],
+    version: u8,
     feed: Feed,
     now_unix_secs: i64,
     cap_bytes: u64,
@@ -951,11 +1125,7 @@ fn spill_failed_depth_ilp(
         .create(true)
         .append(true)
         .open(&path)?;
-    crate::depth_spill_frame::append_framed_records(
-        &mut file,
-        payload,
-        crate::depth_spill_frame::ILP_VERSION_1,
-    )?;
+    crate::depth_spill_frame::append_framed_records(&mut file, payload, version)?;
     if let Some(sync) = sync {
         sync(&file)?;
     }
@@ -1020,6 +1190,9 @@ fn register_depth_drop_baseline(feed: Feed) {
 /// RESCUED to the depth spill tier first, and only genuinely dropped when that
 /// rescue itself fails. Either way it is loud.
 pub struct DepthWriter {
+    /// Which table this writer writes; see [`DepthLayout`]. Fixed for the
+    /// writer's life.
+    layout: DepthLayout,
     sender: Option<Sender>,
     buffer: Buffer,
     pending: usize,
@@ -1177,17 +1350,109 @@ pub const DEPTH_FLUSH_RETRY_FAST_FAILURE_WINDOW: std::time::Duration =
 pub(crate) fn flush_failure_is_retryable(err: &questdb::Error) -> bool {
     matches!(err.code(), questdb::ErrorCode::SocketError)
 }
+
+/// Why a depth row stamped `ts_nanos` is refused before it reaches the buffer,
+/// or `None` when it may be written. Shared by [`DepthWriter::append_row`] and
+/// [`DepthWriter::append_book_row`] so the two layouts refuse the same rows.
+fn depth_arrival_window_refusal(ts_nanos: i64) -> Option<&'static str> {
+    // The WAL sentinel first: a pre-TVW3 record carries no receipt,
+    // which becomes exactly `IST_UTC_OFFSET_NANOS` after stamping.
+    // It IS out of window, but "an old WAL format is being replayed"
+    // and "we are outside market hours" are different operational
+    // facts and must not share a label.
+    //
+    // ## Why depth REFUSES this and ticks ACCEPT the same situation
+    //
+    // `session_window::verdict` treats a `None` receipt on a TICK as
+    // "unknown, not a refusal" and writes the row. This arm refuses.
+    // That looks inconsistent and is not, because the missing value
+    // does not play the same role in the two tables:
+    //
+    //   * a tick carries TWO clocks. A pre-TVW3 tick still has its
+    //     EXCHANGE stamp, which is a real observation of when the
+    //     trade happened, so only the delivery time is unknown and
+    //     the row is worth keeping.
+    //   * depth carries ONE. `ts_nanos` IS the receipt, so a record
+    //     with no receipt has no usable timestamp at all -- the value
+    //     here is the bare IST offset, i.e. 1970-01-01 05:30.
+    //
+    // Writing it would not preserve an observation, it would FABRICATE
+    // one, and it would open a 1970 partition that retention and
+    // archival -- both keyed on the trading day -- can never reach.
+    // The refusal is counted under its own reason so an operator can
+    // tell "an old WAL format is being replayed" from "we are outside
+    // market hours"; the bytes stay on disk in the WAL segment.
+    if ts_nanos == tickvault_common::constants::IST_UTC_OFFSET_NANOS {
+        return Some(DEPTH_OUT_OF_WINDOW_REASONS[1]);
+    }
+    // Absolute epoch band BEFORE the time-of-day check: the window
+    // question is deliberately date-blind, so a corrupt far-future
+    // stamp whose seconds-of-day happen to land inside 09:00-15:40
+    // would read as perfectly in-window and open a partition that
+    // retention and archival can never reach.
+    let secs = ts_nanos.div_euclid(1_000_000_000);
+    let in_band = u32::try_from(secs).is_ok_and(|s| {
+        (tickvault_trading::candles::multi_tf_aggregator::MIN_PLAUSIBLE_EXCHANGE_TS_SECS
+            ..=tickvault_trading::candles::multi_tf_aggregator::MAX_PLAUSIBLE_EXCHANGE_TS_SECS)
+            // O(1) EXEMPT: RangeInclusive::contains on a const range is two integer compares, not a scan
+            .contains(&s)
+    });
+    if !in_band {
+        return Some(DEPTH_OUT_OF_WINDOW_REASONS[2]);
+    }
+    // ARRIVAL form, not the event form, and the difference is a real
+    // loss path rather than a naming preference.
+    //
+    // `ts_nanos` IS the instant this frame reached us -- the depth
+    // protocol carries no exchange timestamp at all, as the block above
+    // says. Judging it with `row_is_in_an_open_window` therefore asked
+    // "did the EVENT happen in session?" of a number that can only
+    // answer "when did the DELIVERY land?", and refused a snapshot of
+    // the 15:39 book that the vendor handed over at 15:40:05.
+    //
+    // That refusal was silent AND permanent: this arm returns `Ok(())`
+    // by design (so a pre-open frame is not re-offered forever), so it
+    // never marks the frame unapplied and no replay re-offers it. At
+    // the measured p99 Dhan lag of 46.37 s that discarded the tail of
+    // every session for the slowest 1% of depth frames; at the measured
+    // max of 198.69 s, the last ~3.3 minutes -- the closing-auction
+    // book, which is the part of the day this window exists to keep.
+    //
+    // `ARRIVAL_GRACE_TAIL_SECS` (240) clears that measured maximum. It
+    // graces the END only: a frame arriving at 08:58 is genuinely
+    // pre-open and is still refused, because delivery lag makes a row
+    // late, never early. An 18:00 restart is still refused by 2h20m.
+    if !tickvault_common::session_window::arrival_row_is_in_an_open_window(ts_nanos) {
+        return Some(DEPTH_OUT_OF_WINDOW_REASONS[0]);
+    }
+    None
+}
+
 impl DepthWriter {
     /// Production constructor — ILP-over-HTTP, lazy on connect failure.
     #[must_use]
     // TEST-EXEMPT: production ILP-connect constructor; the lazy-build contract and
     // every append/flush path are covered via for_test().
     pub fn new(config: &QuestDbConfig, feed: Feed) -> Self {
+        Self::with_layout(config, feed, DepthLayout::Levels)
+    }
+
+    /// Production constructor for the array-row table `market_depth_book`
+    /// (plan item 49e step 2): a sender pinned to ILP v2. Used by the drain
+    /// from step 3, behind a default-off setting.
+    #[must_use]
+    // TEST-EXEMPT: production ILP-connect constructor; the v2 pin is tested via depth_ilp_http_conf and every book append path via for_test_book().
+    pub fn new_book(config: &QuestDbConfig, feed: Feed) -> Self {
+        Self::with_layout(config, feed, DepthLayout::Book)
+    }
+
+    fn with_layout(config: &QuestDbConfig, feed: Feed, layout: DepthLayout) -> Self {
         register_depth_drop_baseline(feed);
-        match Sender::from_conf(depth_ilp_http_conf(config)) {
+        match Sender::from_conf(depth_ilp_http_conf(config, layout)) {
             Ok(s) => {
                 let b = s.new_buffer();
                 Self {
+                    layout,
                     sender: Some(s),
                     buffer: b,
                     pending: 0,
@@ -1219,7 +1484,8 @@ impl DepthWriter {
                 );
                 Self {
                     sender: None,
-                    buffer: Buffer::new(ProtocolVersion::V1),
+                    layout,
+                    buffer: Buffer::new(layout.protocol()),
                     pending: 0,
                     pending_min_seq: 0,
                     pending_max_seq: 0,
@@ -1256,6 +1522,7 @@ impl DepthWriter {
         register_depth_drop_baseline(feed);
         Self {
             sender: None,
+            layout: DepthLayout::Levels,
             buffer: Buffer::new(ProtocolVersion::V1),
             pending: 0,
             pending_min_seq: 0,
@@ -1275,6 +1542,18 @@ impl DepthWriter {
             flush_counters: DepthFlushCounters::new(feed),
             spare_buffers: None,
             contract_label: None,
+        }
+    }
+
+    /// Test constructor for an array-row writer: disconnected, its buffer
+    /// pinned to ILP v2 exactly as [`Self::new_book`] pins it.
+    #[must_use]
+    // TEST-EXEMPT: test-only helper used by the book append and spill tests below.
+    pub fn for_test_book(feed: Feed) -> Self {
+        Self {
+            layout: DepthLayout::Book,
+            buffer: Buffer::new(DepthLayout::Book.protocol()),
+            ..Self::for_test(feed)
         }
     }
 
@@ -1406,80 +1685,9 @@ impl DepthWriter {
         // exchange timestamp exists in the depth protocol, so `None` is the
         // honest second argument -- passing `Some(row.ts_nanos)` would check
         // one number twice and could never produce a distinct verdict.
-        {
-            // The WAL sentinel first: a pre-TVW3 record carries no receipt,
-            // which becomes exactly `IST_UTC_OFFSET_NANOS` after stamping.
-            // It IS out of window, but "an old WAL format is being replayed"
-            // and "we are outside market hours" are different operational
-            // facts and must not share a label.
-            //
-            // ## Why depth REFUSES this and ticks ACCEPT the same situation
-            //
-            // `session_window::verdict` treats a `None` receipt on a TICK as
-            // "unknown, not a refusal" and writes the row. This arm refuses.
-            // That looks inconsistent and is not, because the missing value
-            // does not play the same role in the two tables:
-            //
-            //   * a tick carries TWO clocks. A pre-TVW3 tick still has its
-            //     EXCHANGE stamp, which is a real observation of when the
-            //     trade happened, so only the delivery time is unknown and
-            //     the row is worth keeping.
-            //   * depth carries ONE. `ts_nanos` IS the receipt, so a record
-            //     with no receipt has no usable timestamp at all -- the value
-            //     here is the bare IST offset, i.e. 1970-01-01 05:30.
-            //
-            // Writing it would not preserve an observation, it would FABRICATE
-            // one, and it would open a 1970 partition that retention and
-            // archival -- both keyed on the trading day -- can never reach.
-            // The refusal is counted under its own reason so an operator can
-            // tell "an old WAL format is being replayed" from "we are outside
-            // market hours"; the bytes stay on disk in the WAL segment.
-            if row.ts_nanos == tickvault_common::constants::IST_UTC_OFFSET_NANOS {
-                self.out_of_window.note(DEPTH_OUT_OF_WINDOW_REASONS[1]);
-                return Ok(());
-            }
-            // Absolute epoch band BEFORE the time-of-day check: the window
-            // question is deliberately date-blind, so a corrupt far-future
-            // stamp whose seconds-of-day happen to land inside 09:00-15:40
-            // would read as perfectly in-window and open a partition that
-            // retention and archival can never reach.
-            let secs = row.ts_nanos.div_euclid(1_000_000_000);
-            let in_band = u32::try_from(secs).is_ok_and(|s| {
-                (tickvault_trading::candles::multi_tf_aggregator::MIN_PLAUSIBLE_EXCHANGE_TS_SECS
-                    ..=tickvault_trading::candles::multi_tf_aggregator::MAX_PLAUSIBLE_EXCHANGE_TS_SECS)
-                    // O(1) EXEMPT: RangeInclusive::contains on a const range is two integer compares, not a scan
-                    .contains(&s)
-            });
-            if !in_band {
-                self.out_of_window.note(DEPTH_OUT_OF_WINDOW_REASONS[2]);
-                return Ok(());
-            }
-            // ARRIVAL form, not the event form, and the difference is a real
-            // loss path rather than a naming preference.
-            //
-            // `row.ts_nanos` IS the instant this frame reached us -- the depth
-            // protocol carries no exchange timestamp at all, as the block above
-            // says. Judging it with `row_is_in_an_open_window` therefore asked
-            // "did the EVENT happen in session?" of a number that can only
-            // answer "when did the DELIVERY land?", and refused a snapshot of
-            // the 15:39 book that the vendor handed over at 15:40:05.
-            //
-            // That refusal was silent AND permanent: this arm returns `Ok(())`
-            // by design (so a pre-open frame is not re-offered forever), so it
-            // never marks the frame unapplied and no replay re-offers it. At
-            // the measured p99 Dhan lag of 46.37 s that discarded the tail of
-            // every session for the slowest 1% of depth frames; at the measured
-            // max of 198.69 s, the last ~3.3 minutes -- the closing-auction
-            // book, which is the part of the day this window exists to keep.
-            //
-            // `ARRIVAL_GRACE_TAIL_SECS` (240) clears that measured maximum. It
-            // graces the END only: a frame arriving at 08:58 is genuinely
-            // pre-open and is still refused, because delivery lag makes a row
-            // late, never early. An 18:00 restart is still refused by 2h20m.
-            if !tickvault_common::session_window::arrival_row_is_in_an_open_window(row.ts_nanos) {
-                self.out_of_window.note(DEPTH_OUT_OF_WINDOW_REASONS[0]);
-                return Ok(());
-            }
+        if let Some(reason) = depth_arrival_window_refusal(row.ts_nanos) {
+            self.out_of_window.note(reason);
+            return Ok(());
         }
         let outcome = self.append_row_inner(row);
         if outcome.is_err() {
@@ -1491,7 +1699,134 @@ impl DepthWriter {
         outcome
     }
 
+    /// Which table this writer writes.
+    #[must_use]
+    pub const fn layout(&self) -> DepthLayout {
+        self.layout
+    }
+
+    /// Bytes waiting in the buffer. An array-row writer flushes on this
+    /// ([`DEPTH_BOOK_FLUSH_BYTES`]), never on a row count.
+    #[must_use]
+    pub fn pending_bytes(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// True once an array-row buffer has reached [`DEPTH_BOOK_FLUSH_BYTES`].
+    /// Always false for a level writer, which keeps its row threshold.
+    #[must_use]
+    pub fn book_flush_due(&self) -> bool {
+        self.layout == DepthLayout::Book && self.buffer.len() >= DEPTH_BOOK_FLUSH_BYTES
+    }
+
+    /// Appends one side of one depth packet as ONE array row to
+    /// `market_depth_book` (plan item 49e step 2).
+    ///
+    /// O(levels) to copy the three arrays into the buffer (at most
+    /// [`MAX_DEPTH_BOOK_LEVELS`]), no allocation once the buffer has grown.
+    /// Refuses the same out-of-window rows as [`Self::append_row`], counted
+    /// the same way. Refused with an error, and its frame marked unapplied
+    /// so a replay offers it again: a level writer, three slices of unequal
+    /// length, or more than 200 levels. A level the caller refused travels as
+    /// `NaN` in its slot (it reads back null), so no level, side or packet is
+    /// dropped by the change of layout.
+    pub fn append_book_row(&mut self, row: &DepthBookRow<'_>) -> Result<()> {
+        if let Some(reason) = depth_arrival_window_refusal(row.ts_nanos) {
+            self.out_of_window.note(reason);
+            return Ok(());
+        }
+        let outcome = self.append_book_row_inner(row);
+        if outcome.is_err() {
+            crate::wal_applied_watermark::applied_watermark()
+                .note_unapplied(u64::try_from(row.capture_seq).unwrap_or(0));
+        }
+        outcome
+    }
+
+    fn append_book_row_inner(&mut self, row: &DepthBookRow<'_>) -> Result<()> {
+        if self.layout != DepthLayout::Book {
+            anyhow::bail!(
+                "append_book_row on a market_depth level writer: one writer writes one table"
+            );
+        }
+        let levels = row.prices.len();
+        if levels > MAX_DEPTH_BOOK_LEVELS
+            || row.quantities.len() != levels
+            || row.orders.len() != levels
+        {
+            anyhow::bail!(
+                "depth book row refused: {} prices, {} quantities, {} orders (at most {})",
+                levels,
+                row.quantities.len(),
+                row.orders.len(),
+                MAX_DEPTH_BOOK_LEVELS
+            );
+        }
+        let feed = self.feed.as_str();
+        // Same closed sets as the level writer, proven ILP-safe at compile
+        // time by the `const _` block; see `append_row_inner`.
+        debug_assert!(tickvault_common::sanitize::ilp_symbol_is_clean(row.segment));
+        debug_assert!(tickvault_common::sanitize::ilp_symbol_is_clean(
+            row.depth_kind
+        ));
+        debug_assert!(tickvault_common::sanitize::ilp_symbol_is_clean(row.side));
+        debug_assert!(tickvault_common::sanitize::ilp_symbol_is_clean(feed));
+        self.buffer
+            .table(MARKET_DEPTH_BOOK_TABLE)
+            .context("table")?
+            .symbol("segment", row.segment)
+            .context("segment")?
+            .symbol("depth_kind", row.depth_kind)
+            .context("depth_kind")?
+            .symbol("side", row.side)
+            .context("side")?
+            .symbol("feed", feed)
+            .context("feed")?;
+        // `contract`, resolved once per instrument run exactly as the level
+        // writer does; omitted (NULL) when the day's table does not know it.
+        let hit = matches!(
+            &self.contract_label,
+            Some((id, seg, _)) if *id == row.security_id && *seg == row.segment
+        );
+        if !hit {
+            let labels = crate::candle_contract_labels::candle_contract_labels();
+            let name = labels
+                .get(&(row.security_id, row.segment))
+                .map(std::sync::Arc::clone);
+            self.contract_label = Some((row.security_id, row.segment, name));
+        }
+        if let Some((_, _, Some(name))) = &self.contract_label {
+            self.buffer
+                .symbol(
+                    "contract",
+                    tickvault_common::sanitize::sanitize_ilp_symbol(name).as_ref(),
+                )
+                .context("contract")?;
+        }
+        self.buffer
+            .column_i64("security_id", row.security_id)
+            .context("security_id")?
+            .column_i64("levels", i64::try_from(levels).unwrap_or(i64::MAX))
+            .context("levels")?
+            .column_arr("price", &row.prices)
+            .context("price")?
+            .column_arr("quantity", &row.quantities)
+            .context("quantity")?
+            .column_arr("orders", &row.orders)
+            .context("orders")?
+            .column_i64("capture_seq", row.capture_seq)
+            .context("capture_seq")?
+            .at(TimestampNanos::new(row.ts_nanos))
+            .context("designated timestamp")?;
+        self.pending = self.pending.saturating_add(1);
+        self.note_pending_seq(row.capture_seq);
+        Ok(())
+    }
+
     fn append_row_inner(&mut self, row: &DepthRow) -> Result<()> {
+        if self.layout != DepthLayout::Levels {
+            anyhow::bail!("append_row on a market_depth_book writer: one writer writes one table");
+        }
         let feed = self.feed.as_str();
 
         // The `const _` proof below covers the closed SETS. It cannot cover a
@@ -1836,7 +2171,11 @@ impl DepthWriter {
 
         // Past the park's bound, a gone thread, or no rescue split at all:
         // the drain's inline spill, NOT synced (see `spill_on_drain`).
-        let landed = self.spill_on_drain(self.buffer.as_bytes(), rows);
+        let landed = self.spill_on_drain(
+            self.buffer.as_bytes(),
+            spill_version_of(self.buffer.protocol_version()),
+            rows,
+        );
         note_rescue_outcome_depth(landed, range, false);
         if landed {
             self.rescued = self.rescued.saturating_add(rows as u64);
@@ -2010,7 +2349,11 @@ impl DepthWriter {
     /// the rescue thread would: outcome, floor, completion count. Its rows
     /// were already counted as rescued and dropped when it was parked.
     fn spill_parked_on_drain(&self, batch: DepthRescueBatch) {
-        let landed = self.spill_on_drain(batch.buffer.as_bytes(), batch.rows);
+        let landed = self.spill_on_drain(
+            batch.buffer.as_bytes(),
+            spill_version_of(batch.buffer.protocol_version()),
+            batch.rows,
+        );
         note_rescue_outcome_depth(landed, (batch.min_seq, batch.max_seq), false);
         let wm = crate::wal_applied_watermark::applied_watermark();
         if let Some(floor) = batch.floor {
@@ -2024,11 +2367,12 @@ impl DepthWriter {
     ///
     /// A file write, so it runs through `off_worker` (the drain calls `flush`
     /// bare; see the tick writer's twin).
-    fn spill_on_drain(&self, payload: &[u8], rows: usize) -> bool {
+    fn spill_on_drain(&self, payload: &[u8], version: u8, rows: usize) -> bool {
         crate::off_worker::off_worker(|| {
             perform_depth_rescue(
                 &self.spill_dir,
                 payload,
+                version,
                 self.feed,
                 rows,
                 self.spill_min_free_headroom,
@@ -2488,6 +2832,7 @@ impl DepthRescueSink {
         let landed = perform_depth_rescue(
             &self.spill_dir,
             batch.buffer.as_bytes(),
+            spill_version_of(batch.buffer.protocol_version()),
             self.feed,
             batch.rows,
             self.spill_min_free_headroom,
@@ -2531,6 +2876,7 @@ fn note_rescue_outcome_depth(landed: bool, range: (u64, u64), in_order: bool) {
 fn perform_depth_rescue(
     spill_dir: &Path,
     payload: &[u8],
+    version: u8,
     feed: Feed,
     rows: usize,
     min_free_headroom_bytes: u64,
@@ -2543,6 +2889,7 @@ fn perform_depth_rescue(
     match spill_failed_depth_ilp(
         spill_dir,
         payload,
+        version,
         feed,
         now,
         depth_spill_max_bytes(),
@@ -2977,6 +3324,7 @@ impl DepthWriterSink {
         match spill_failed_depth_ilp(
             &self.spill_dir,
             batch.buffer.as_bytes(),
+            spill_version_of(batch.buffer.protocol_version()),
             self.feed,
             now,
             depth_spill_max_bytes(),
@@ -3914,6 +4262,7 @@ mod tests {
             spill_failed_depth_ilp(
                 &dir,
                 b"x\n",
+                crate::depth_spill_frame::ILP_VERSION_1,
                 Feed::Dhan,
                 0,
                 DEPTH_SPILL_MAX_BYTES,
@@ -3960,6 +4309,7 @@ mod tests {
         spill_failed_depth_ilp(
             &dir,
             b"under\n",
+            crate::depth_spill_frame::ILP_VERSION_1,
             Feed::Dhan,
             1_700_000_000,
             held + 1,
@@ -3998,6 +4348,7 @@ mod tests {
         let outcome = spill_failed_depth_ilp(
             &dir,
             b"over\n",
+            crate::depth_spill_frame::ILP_VERSION_1,
             Feed::Dhan,
             1_700_000_000,
             held,
@@ -5042,6 +5393,7 @@ mod tests {
             spill_failed_depth_ilp(
                 &dir,
                 b"x\n",
+                crate::depth_spill_frame::ILP_VERSION_1,
                 Feed::Dhan,
                 1_700_000_000,
                 u64::MAX,
@@ -5051,5 +5403,330 @@ mod tests {
             .is_err()
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Array-row table, plan item 49e step 2
+    // -----------------------------------------------------------------------
+
+    /// 12:30:00 IST, the same in-window instant `row()` uses.
+    const BOOK_TS_NANOS: i64 = 1_699_965_000_000_000_000;
+
+    fn book_levels(
+        n: usize,
+    ) -> (
+        [f64; MAX_DEPTH_BOOK_LEVELS],
+        [f64; MAX_DEPTH_BOOK_LEVELS],
+        [f64; MAX_DEPTH_BOOK_LEVELS],
+    ) {
+        let mut p = [0.0_f64; MAX_DEPTH_BOOK_LEVELS];
+        let mut q = [0.0_f64; MAX_DEPTH_BOOK_LEVELS];
+        let mut o = [0.0_f64; MAX_DEPTH_BOOK_LEVELS];
+        for i in 0..n {
+            p[i] = 24_500.25 - i as f64 * 0.05;
+            q[i] = (750 + i) as f64;
+            o[i] = (12 + i) as f64;
+        }
+        (p, q, o)
+    }
+
+    fn book_row<'a>(p: &'a [f64], q: &'a [f64], o: &'a [f64], seq: i64) -> DepthBookRow<'a> {
+        DepthBookRow {
+            security_id: 52_175,
+            segment: "NSE_FNO",
+            depth_kind: DEPTH_KIND_200,
+            side: DEPTH_SIDE_BID,
+            prices: p,
+            quantities: q,
+            orders: o,
+            capture_seq: seq,
+            ts_nanos: BOOK_TS_NANOS,
+        }
+    }
+
+    #[test]
+    fn test_market_depth_book_create_ddl_holds_three_double_arrays() {
+        let ddl = market_depth_book_create_ddl();
+        for col in [
+            "price DOUBLE[]",
+            "quantity DOUBLE[]",
+            "orders DOUBLE[]",
+            "levels LONG",
+        ] {
+            assert!(ddl.contains(col), "{col} missing from {ddl}");
+        }
+        assert!(
+            !ddl.contains("level LONG"),
+            "a book row carries no per-level column"
+        );
+        assert!(ddl.contains("PARTITION BY HOUR WAL"));
+        assert!(ddl.contains(MARKET_DEPTH_BOOK_TABLE));
+    }
+
+    #[test]
+    fn test_market_depth_book_ensure_statements_never_drop_and_end_on_the_dedup_key() {
+        let stmts = market_depth_book_ensure_statements();
+        assert_eq!(stmts.first(), Some(&market_depth_book_create_ddl()));
+        assert_eq!(stmts.len(), 1 + MARKET_DEPTH_BOOK_COLUMNS.len() + 1);
+        assert!(
+            stmts
+                .iter()
+                .all(|s| !s.to_ascii_uppercase().contains("DROP"))
+        );
+        assert_eq!(
+            stmts.last().map(String::as_str),
+            Some(
+                "ALTER TABLE market_depth_book DEDUP ENABLE UPSERT KEYS(ts, security_id, segment, depth_kind, side, capture_seq, feed)"
+            )
+        );
+    }
+
+    /// The book key is the level key with `level` removed and nothing else
+    /// changed: `segment` (I-P1-11), `depth_kind`, `capture_seq` and `feed`
+    /// all stay.
+    #[test]
+    fn test_book_dedup_key_is_the_level_key_without_level() {
+        let level_cols: Vec<&str> = DEDUP_KEY_MARKET_DEPTH
+            .split(", ")
+            .filter(|c| *c != "level")
+            .collect();
+        let book_cols: Vec<&str> = DEDUP_KEY_MARKET_DEPTH_BOOK.split(", ").collect();
+        assert_eq!(level_cols, book_cols);
+        for must in ["segment", "feed", "depth_kind", "capture_seq", "side"] {
+            assert!(
+                book_cols.contains(&must),
+                "{must} missing from the book key"
+            );
+        }
+    }
+
+    /// Pinned, never negotiated: arrays exist only in ILP v2, and an unpinned
+    /// client negotiates v3, which fails a v2 buffer at flush.
+    #[test]
+    fn test_depth_layout_protocol_number_pins_v1_and_v2_in_the_conf() {
+        let cfg = QuestDbConfig {
+            host: "tv-questdb".to_string(),
+            http_port: 9000,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        let levels = depth_ilp_http_conf(&cfg, DepthLayout::Levels);
+        let book = depth_ilp_http_conf(&cfg, DepthLayout::Book);
+        assert!(levels.contains("protocol_version=1;"), "{levels}");
+        assert!(book.contains("protocol_version=2;"), "{book}");
+        for conf in [&levels, &book] {
+            assert!(conf.contains("retry_timeout=0;"));
+            assert!(conf.contains("request_timeout=5000;"));
+        }
+        assert_eq!(DepthLayout::Book.protocol(), ProtocolVersion::V2);
+        assert_eq!(DepthLayout::Levels.protocol(), ProtocolVersion::V1);
+    }
+
+    #[test]
+    fn test_append_book_row_writes_a_200_level_side_as_one_row() {
+        let mut w = DepthWriter::for_test_book(Feed::Dhan);
+        assert_eq!(w.layout(), DepthLayout::Book);
+        let (p, q, o) = book_levels(200);
+        w.append_book_row(&book_row(&p, &q, &o, 7)).expect("append");
+        assert_eq!(w.pending(), 1, "one side of one packet is ONE row");
+        let bytes = w.buffer.as_bytes();
+        let text = String::from_utf8_lossy(bytes);
+        assert!(text.starts_with("market_depth_book,"), "{}", &text[..40]);
+        assert!(text.contains("levels=200i"));
+        assert!(text.contains("depth_kind=d200"));
+        assert!(text.contains("segment=NSE_FNO"));
+        assert!(text.contains("feed=dhan"));
+        // A level row for the same side would be ~200 lines; the book is one.
+        assert_eq!(bytes.last(), Some(&b'\n'));
+        assert!(
+            w.pending_bytes() > 200 * 8 * 3,
+            "three arrays of 200 doubles"
+        );
+    }
+
+    #[test]
+    fn test_a_refused_level_travels_as_nan_in_its_slot() {
+        let mut w = DepthWriter::for_test_book(Feed::Dhan);
+        let (mut p, q, o) = book_levels(20);
+        p[3] = f64::NAN;
+        w.append_book_row(&book_row(&p[..20], &q[..20], &o[..20], 9))
+            .expect("a NaN slot is kept, never skipped");
+        assert_eq!(w.pending(), 1);
+        assert!(String::from_utf8_lossy(w.buffer.as_bytes()).contains("levels=20i"));
+    }
+
+    #[test]
+    fn test_an_empty_book_is_one_row_with_empty_arrays() {
+        let mut w = DepthWriter::for_test_book(Feed::Dhan);
+        w.append_book_row(&book_row(&[], &[], &[], 11))
+            .expect("empty book");
+        assert_eq!(w.pending(), 1);
+        assert!(String::from_utf8_lossy(w.buffer.as_bytes()).contains("levels=0i"));
+    }
+
+    #[test]
+    fn test_unequal_or_oversized_arrays_are_refused_with_nothing_written() {
+        let mut w = DepthWriter::for_test_book(Feed::Dhan);
+        let (p, q, o) = book_levels(20);
+        assert!(
+            w.append_book_row(&book_row(&p[..20], &q[..19], &o[..20], 3))
+                .is_err()
+        );
+        assert!(
+            w.append_book_row(&book_row(&p[..20], &q[..20], &o[..21], 3))
+                .is_err()
+        );
+        let big = [1.0_f64; MAX_DEPTH_BOOK_LEVELS + 1];
+        assert!(w.append_book_row(&book_row(&big, &big, &big, 3)).is_err());
+        assert_eq!(w.pending(), 0);
+        assert!(
+            w.buffer.as_bytes().is_empty(),
+            "a refusal writes no partial line"
+        );
+    }
+
+    /// One writer writes one table: a level row on a book writer would leave
+    /// the arrays NULL over a stored book.
+    #[test]
+    fn test_each_writer_refuses_the_other_layout() {
+        let mut book = DepthWriter::for_test_book(Feed::Dhan);
+        assert!(book.append_row(&row()).is_err());
+        assert_eq!(book.pending(), 0);
+        let mut levels = DepthWriter::for_test(Feed::Dhan);
+        let (p, q, o) = book_levels(5);
+        assert!(
+            levels
+                .append_book_row(&book_row(&p[..5], &q[..5], &o[..5], 4))
+                .is_err()
+        );
+        assert_eq!(levels.pending(), 0);
+        assert!(levels.append_row(&row()).is_ok());
+    }
+
+    #[test]
+    fn test_an_out_of_window_book_row_is_refused_like_a_level_row() {
+        let mut w = DepthWriter::for_test_book(Feed::Dhan);
+        let (p, q, o) = book_levels(5);
+        let mut r = book_row(&p[..5], &q[..5], &o[..5], 5);
+        r.ts_nanos = tickvault_common::constants::IST_UTC_OFFSET_NANOS;
+        w.append_book_row(&r).expect("refused rows are Ok, counted");
+        // 22:13:20 IST, outside every session window.
+        r.ts_nanos = 1_700_000_000_000_000_000;
+        w.append_book_row(&r).expect("refused rows are Ok, counted");
+        assert_eq!(w.pending(), 0);
+        assert_eq!(
+            depth_arrival_window_refusal(BOOK_TS_NANOS),
+            None,
+            "the in-window fixture is still in window"
+        );
+    }
+
+    #[test]
+    fn test_book_flush_due_by_pending_bytes_never_for_a_level_writer() {
+        let mut w = DepthWriter::for_test_book(Feed::Dhan);
+        let (p, q, o) = book_levels(200);
+        let mut seq = 1_i64;
+        while !w.book_flush_due() {
+            w.append_book_row(&book_row(&p, &q, &o, seq))
+                .expect("append");
+            seq += 1;
+            assert!(seq < 10_000, "8 MiB must arrive within a few thousand rows");
+        }
+        assert!(w.pending_bytes() >= DEPTH_BOOK_FLUSH_BYTES);
+        assert!(
+            w.pending_bytes() < DEPTH_BOOK_FLUSH_BYTES + 16 * 1024,
+            "due on the row that crosses the bound, not later"
+        );
+        let mut levels = DepthWriter::for_test(Feed::Dhan);
+        for _ in 0..10 {
+            levels.append_row(&row()).expect("append");
+        }
+        assert!(!levels.book_flush_due());
+        // A full flush queue of book batches holds at most one producer
+        // buffer's worth of bytes.
+        assert!(
+            DEPTH_BOOK_FLUSH_BYTES * DEPTH_FLUSH_QUEUE_DEPTH <= MAX_DEPTH_PRODUCER_BUFFER_BYTES
+        );
+    }
+
+    /// A binary v2 batch must spill as ONE framed record: cut at line
+    /// boundaries as v1 text, a newline byte inside a double would split a
+    /// row apart on replay.
+    #[test]
+    fn test_a_v2_batch_spills_as_one_whole_record_and_reads_back_byte_for_byte() {
+        use std::io::Read as _;
+        let mut w = DepthWriter::for_test_book(Feed::Dhan);
+        let (p, q, o) = book_levels(200);
+        for seq in 1..=3 {
+            w.append_book_row(&book_row(&p, &q, &o, seq))
+                .expect("append");
+        }
+        let payload = w.buffer.as_bytes().to_vec();
+        let version = spill_version_of(w.buffer.protocol_version());
+        assert_eq!(version, crate::depth_spill_frame::ILP_VERSION_2);
+        assert_eq!(
+            spill_version_of(ProtocolVersion::V1),
+            crate::depth_spill_frame::ILP_VERSION_1
+        );
+        let dir = temp_depth_spill_dir();
+        let path = spill_failed_depth_ilp(
+            &dir,
+            &payload,
+            version,
+            Feed::Dhan,
+            1_699_965_000,
+            u64::MAX,
+            0,
+            None,
+        )
+        .expect("spill");
+        let file = std::fs::File::open(&path).expect("open");
+        let len = file.metadata().expect("meta").len();
+        let mut scratch = Vec::new();
+        match crate::depth_spill_frame::read_record_at(&file, 0, len, &mut scratch).expect("read") {
+            crate::depth_spill_frame::RecordAt::Whole { version, next } => {
+                assert_eq!(version, crate::depth_spill_frame::ILP_VERSION_2);
+                assert_eq!(next, len, "the whole batch is one record");
+            }
+            other => panic!("expected one whole record, got {other:?}"),
+        }
+        assert_eq!(scratch, payload, "replayed byte for byte");
+        let mut all = Vec::new();
+        std::fs::File::open(&path)
+            .expect("open")
+            .read_to_end(&mut all)
+            .expect("read");
+        assert_eq!(
+            all.len(),
+            crate::depth_spill_frame::FRAME_HEADER_BYTES + payload.len()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `new_book` builds a v2 writer whether or not QuestDB answers: the pinned
+    /// version means the client never calls `/settings` at construction.
+    #[test]
+    fn test_new_book_builds_a_v2_book_writer_with_no_questdb() {
+        let cfg = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 1,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        let mut w = DepthWriter::new_book(&cfg, Feed::Dhan);
+        assert_eq!(w.layout(), DepthLayout::Book);
+        assert_eq!(w.buffer.protocol_version(), ProtocolVersion::V2);
+        assert!(
+            w.sender.is_some(),
+            "a pinned v2 conf builds without a server"
+        );
+        let (p, q, o) = book_levels(5);
+        w.append_book_row(&book_row(&p[..5], &q[..5], &o[..5], 21))
+            .expect("append");
+        assert_eq!(w.pending(), 1);
+        assert_eq!(
+            DepthWriter::new(&cfg, Feed::Dhan).layout(),
+            DepthLayout::Levels
+        );
     }
 }
