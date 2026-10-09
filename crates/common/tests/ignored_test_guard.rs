@@ -49,6 +49,20 @@ fn repo_root() -> PathBuf {
 /// This list may SHRINK freely. Growing it is a deliberate edit, in the same
 /// change, with the reason visible to a reviewer.
 const ALLOWED_IGNORED: &[(&str, &str)] = &[
+    // Added 2026-10-09 with the arithmetic price widening (audit PR10): the
+    // exhaustive proof that the new `f32_to_f64_clean` returns the same f64 as
+    // the text path for all 2^32 f32 inputs. Measured: 0 differences, 382 s on
+    // 4 cores in release; in a debug CI build it would take hours. It is not
+    // the gate: the ordinary tests beside it (every paise price up to
+    // 2,00,000 rupees, a 1-in-4,099 stride over every bit pattern, and the
+    // boundary values) run in every suite. Re-run it whenever the arithmetic
+    // path changes:
+    //
+    //   cargo test -p tickvault-common --release --lib -- --ignored every_f32
+    (
+        "crates/common/src/price_precision.rs",
+        "test_f32_to_f64_clean_matches_text_path_for_every_f32",
+    ),
     // Added 2026-10-03 with sweep S1 (the drain flush no longer hands over
     // its worker): the same wall-clock shape as the harnesses below -- it
     // times `block_in_place` against a bare call and prints both, so a shared
