@@ -2655,3 +2655,62 @@ here first.
   spill, quarantine) without a verified copy, including at boot.
 - Runs a wipe or nuke of market data under cover of Quotes 21–26.
 - Presents the raw-archive cost as measured before a month has been billed.
+
+---
+
+#### Quote 29 (2026-10-09) — DELETE ALL PRE-TODAY MARKET DATA, BOX AND S3, PERMANENTLY (preserve EXACTLY, typos included)
+
+**Quote 29 (2026-10-09, 10:21 IST, after the morning's disk-full and database-behind alerts):**
+> "see why these many errors dude just remove the entire previous day data dude  permnanetly from s3 aws live box evryhwere dude so that onle and only have todays' data alone dude okay?"
+
+**Quote 29b (2026-10-09, decision cards in the project, tapped by the operator):**
+1. 10:22 IST, card "Delete all previous-day TickVault data permanently from S3 and the live box?" → **"Delete everything"**.
+2. 10:30 IST, card "Delete old TickVault data from the server only, or from S3 too?" → **"Server and S3"**. The card stated the cost of that option before the tap: *"Also wipes 108 GB of S3 backups permanently, every version; 1 to 8 Oct can never be recovered."* The recommended option ("Server only") was declined.
+
+Recorded HERE before anything is deleted, per the rule-file-first law and the
+Quote 27/28 retirement clause ("any deletion of captured market data … needs a
+fresh dated quote that names the data and states that it will be lost").
+
+##### What the diagnosis found first (measured 2026-10-09, read-only)
+
+| Fact | Evidence |
+|---|---|
+| Root disk 90.3% of 600 GB, 62 GB free; daily low rising ~9%/day (51% 6 Oct → 85% 9 Oct) | CloudWatch `disk_used_percent`, alarm `tv-prod-disk-used-high` |
+| `market_depth` WAL apply ~203,000 transactions behind, never 0 since 1 Oct | `tv_questdb_wal_apply_lag_max`; archiver log `writer_txn 480134 / sequencer_txn 675792` |
+| The archiver skips a table whose WAL is behind, so no `ticks` / `market_depth` partition after 1 Oct reached S3 | box log `STORAGE-GAP-04 … partition KEPT and the table skipped this run`; S3 listing |
+| S3 raw recordings are the only off-box copy of 1, 5, 6, 7 and 8 Oct | `s3://tv-prod-cold/raw-frames/2026-10-0{1,5,6,7,8}/` |
+
+**Deleting old data does not fix the cause.** Until the depth backlog is fixed the
+disk refills in about five trading days. That fix is separate work.
+
+##### What this authorizes (one run, after 15:30 IST, app stopped)
+
+| Surface | Disposition |
+|---|---|
+| QuestDB market-data tables (`ticks`, `market_depth`, `candles_<tf>`, `top_volume_<tf>`, `feed_aux_packets` and the other market-data classes) | Partitions dated before 2026-10-09 IST **DROPPED**. Today's partitions kept. |
+| On-box raw frame log, spill, spill-hold, DLQ | Files for days before 2026-10-09 **DELETED**. Today's kept. |
+| `s3://tv-prod-cold/questdb-partitions/`, `raw-frames/<date>` for every date before 2026-10-09, `seal-spill/` | **DELETED, every version** (versioning is on, so a plain delete would only hide them). |
+
+##### What this does NOT touch
+
+| Surface | Why |
+|---|---|
+| SEBI and audit tables (`instrument_lifecycle`, `instrument_lifecycle_audit`, `index_constituency`, `order_audit`, `partition_archive_audit` and the rest of the keep-list) | Never-delete (§5/§6/§25). No quote overrides it. |
+| `s3://tv-prod-cold/sebi-preserve/` and `/opt/tickvault/data/sebi-preserve/` | SEBI exports. |
+| `s3://tv-prod-cold/deploys/` and `bin/tickvault.backup` | Needed to deploy and roll back. |
+| `raw-frames/2026-10-09/` and every object written on or after 2026-10-09 | Today's data, which the operator keeps. |
+| Config, secrets, instrument cache, depth seed, terraform state | Not market data. |
+| Versioning, lifecycle, public-access block on `tv-prod-cold` | Quote 28 stands: no expiry, versioning stays ON. Old versions are deleted by version id, once, not by a lifecycle rule. |
+
+##### ⚠ What is lost (stated, not absorbed)
+
+- Every tick, depth row, candle and top_volume row from before 2026-10-09: on the box, in QuestDB and in S3. **1, 5, 6, 7 and 8 Oct cannot be rebuilt.**
+- `partition_archive_audit` rows will point at S3 keys that no longer exist. The key list is committed at `docs/audits/2026-10-09-s3-cold-deletion-manifest.txt`.
+
+##### What a PR or action that violates Quote 29 looks like (REJECT)
+
+- Deletes a SEBI or audit table row, `sebi-preserve/`, or `deploys/` under cover of this quote.
+- Deletes anything dated 2026-10-09 or later.
+- Runs inside 09:00–15:45 IST, or while `deploy-aws` is running.
+- Suspends versioning, adds an `expiration` or a `noncurrent_version_expiration`, or widens IAM to perform the delete.
+- Treats Quote 29 as standing permission: it is spent after this one run, and Quote 27 ("nothing is ever deleted") binds again from then on.
