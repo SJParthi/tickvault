@@ -17,9 +17,16 @@
 //! this process, and the next boot records a later one, so frames from this
 //! process replayed after that go to `market_depth` (both copies exist then,
 //! one per table; nothing is lost). (b) A wall clock stepped back across the
-//! first-on boot can send a few of an earlier process's frames to the new
-//! table. (c) After the setting is turned off and on again, frames from the
-//! first period that are replayed later go to `market_depth`.
+//! first-on boot can send a few of an earlier process's REPLAYED frames to
+//! the new table. A frame this process takes off a socket always goes to the
+//! new table, whatever the clock reads, and a stored instant later than the
+//! boot is re-recorded as the boot's own. (c) After the setting is turned
+//! off and on again, frames from the first period that are replayed later
+//! go to `market_depth`. (d) Turning the setting OFF removes the instant, so
+//! frames from the on-period replayed afterwards (the boot catch-up, the
+//! after-close pass) go to `market_depth` while their siblings sit in
+//! `market_depth_book`: nothing is lost, but one minute can then be split
+//! across the two tables.
 
 use std::io::{Read, Write};
 use std::path::Path;
@@ -64,11 +71,24 @@ fn resolve_in(path: &Path, array_rows: bool, now_utc_nanos: i64) -> Option<i64> 
         return None;
     }
     if let Some(since) = read_since(path) {
-        tracing::info!(
-            since,
-            "depth array rows on — frames received since then go to market_depth_book"
+        if since <= now_utc_nanos {
+            tracing::info!(
+                since,
+                "depth array rows on — frames received since then go to market_depth_book"
+            );
+            return Some(since);
+        }
+        // An instant later than this boot (a clock that ran ahead when it was
+        // saved, or a damaged file) would send every replayed frame up to it
+        // to market_depth. Re-recorded as this boot's instant, below; live
+        // frames go to market_depth_book whatever this says.
+        tracing::warn!(
+            path = %path.display(),
+            stored = since,
+            now = now_utc_nanos,
+            "depth array-row start instant is later than this boot's clock — it is \
+             re-recorded as this boot's instant"
         );
-        return Some(since);
     }
     if let Err(err) = write_since(path, now_utc_nanos) {
         tracing::warn!(
@@ -187,7 +207,27 @@ mod tests {
 
     #[test]
     fn test_resolve_depth_book_since_off_touches_nothing() {
-        // The production entry with the setting off never writes.
+        // The production entry with the setting off never writes. It works on
+        // the relative production path, so it runs only where no such file
+        // exists (it would remove one) and checks none appears.
+        let real = Path::new(DEPTH_BOOK_SINCE_PATH);
+        if real.exists() {
+            return;
+        }
         assert_eq!(resolve_depth_book_since(false, 1), None);
+        assert!(!real.exists(), "off must never create the file");
+    }
+
+    #[test]
+    fn test_a_stored_instant_later_than_this_boot_is_re_recorded_as_now() {
+        let path = temp_path("future");
+        assert_eq!(resolve_in(&path, true, 9_000), Some(9_000));
+        // A later boot whose clock reads EARLIER than the stored instant.
+        assert_eq!(resolve_in(&path, true, 4_000), Some(4_000));
+        assert_eq!(read_since(&path), Some(4_000), "re-recorded");
+        // An instant equal to the boot is kept.
+        assert_eq!(resolve_in(&path, true, 4_000), Some(4_000));
+        std::fs::write(&path, format!("{SINCE_PREFIX}{}\n", i64::MAX)).unwrap();
+        assert_eq!(resolve_in(&path, true, 5_000), Some(5_000));
     }
 }

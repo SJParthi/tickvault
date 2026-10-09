@@ -597,9 +597,11 @@ pub async fn ensure_market_depth_table(questdb_config: &QuestDbConfig) -> bool {
     .await
 }
 
-/// Creates or self-heals `market_depth_book` (plan item 49e step 3). Run at
-/// every boot whether or not `[depth_storage] array_rows` is on: an empty
-/// table costs nothing, and the retention and archive sweeps name it.
+/// Creates or self-heals `market_depth_book` (plan item 49e step 3). Run by
+/// the Dhan lane at its start, only with `[depth_storage] array_rows` on; the
+/// array-row writer is armed only when this returns `true`. With the setting
+/// off the table need not exist: the archive and retention sweeps read a
+/// missing table as nothing to do.
 #[must_use = "a false verdict means the market_depth_book DEDUP key may be missing; retry it"]
 // TEST-EXEMPT: live-QuestDB DDL runner; the statement set is unit-tested via market_depth_book_ensure_statements() (test_market_depth_book_ensure_statements_never_drop_and_end_on_the_dedup_key).
 pub async fn ensure_market_depth_book_table(questdb_config: &QuestDbConfig) -> bool {
@@ -1767,7 +1769,9 @@ impl DepthWriter {
     /// dropped by the change of layout.
     pub fn append_book_row(&mut self, row: &DepthBookRow<'_>) -> Result<()> {
         if let Some(reason) = depth_arrival_window_refusal(row.ts_nanos) {
-            self.out_of_window.note(reason);
+            // Counted per LEVEL, as the level layout counts one per row.
+            let levels = u64::try_from(row.prices.len()).unwrap_or(u64::MAX);
+            self.out_of_window.note_n(reason, levels.max(1));
             return Ok(());
         }
         let outcome = self.append_book_row_inner(row);
@@ -1797,6 +1801,26 @@ impl DepthWriter {
                 MAX_DEPTH_BOOK_LEVELS
             );
         }
+        // A marker before the line, so an error part-way through rewinds the
+        // half-written line instead of leaving it to fail every later row.
+        self.buffer.set_marker().context("marker")?;
+        if let Err(err) = self.write_book_line(row, levels) {
+            let _ = self.buffer.rewind_to_marker();
+            return Err(err);
+        }
+        self.buffer.clear_marker();
+        // Counted in LEVELS, the unit the level layout counts, so every
+        // flush, rescue and loss counter reads the same whichever table is
+        // written. A side with no levels still counts one, so a buffered row
+        // is never invisible to `pending`.
+        self.pending = self.pending.saturating_add(levels.max(1));
+        self.note_pending_seq(row.capture_seq);
+        Ok(())
+    }
+
+    /// Writes one array-row line into the buffer. Only
+    /// [`Self::append_book_row_inner`] calls it, inside a marker.
+    fn write_book_line(&mut self, row: &DepthBookRow<'_>, levels: usize) -> Result<()> {
         let feed = self.feed.as_str();
         // Same closed sets as the level writer, proven ILP-safe at compile
         // time by the `const _` block; see `append_row_inner`.
@@ -1853,8 +1877,6 @@ impl DepthWriter {
             .context("capture_seq")?
             .at(TimestampNanos::new(row.ts_nanos))
             .context("designated timestamp")?;
-        self.pending = self.pending.saturating_add(1);
-        self.note_pending_seq(row.capture_seq);
         Ok(())
     }
 
@@ -5563,7 +5585,13 @@ mod tests {
         assert_eq!(w.layout(), DepthLayout::Book);
         let (p, q, o) = book_levels(200);
         w.append_book_row(&book_row(&p, &q, &o, 7)).expect("append");
-        assert_eq!(w.pending(), 1, "one side of one packet is ONE row");
+        // ONE line in the buffer, counted as its 200 levels so every flush
+        // and loss counter reads the unit the level layout counts.
+        assert_eq!(
+            w.pending(),
+            200,
+            "pending counts the levels the row carries"
+        );
         let bytes = w.buffer.as_bytes();
         let text = String::from_utf8_lossy(bytes);
         assert!(text.starts_with("market_depth_book,"), "{}", &text[..40]);
@@ -5586,7 +5614,7 @@ mod tests {
         p[3] = f64::NAN;
         w.append_book_row(&book_row(&p[..20], &q[..20], &o[..20], 9))
             .expect("a NaN slot is kept, never skipped");
-        assert_eq!(w.pending(), 1);
+        assert_eq!(w.pending(), 20, "the NaN slot still counts as a level");
         assert!(String::from_utf8_lossy(w.buffer.as_bytes()).contains("levels=20i"));
     }
 
@@ -5595,7 +5623,7 @@ mod tests {
         let mut w = DepthWriter::for_test_book(Feed::Dhan);
         w.append_book_row(&book_row(&[], &[], &[], 11))
             .expect("empty book");
-        assert_eq!(w.pending(), 1);
+        assert_eq!(w.pending(), 1, "a side with no levels still counts one");
         assert!(String::from_utf8_lossy(w.buffer.as_bytes()).contains("levels=0i"));
     }
 
@@ -5784,7 +5812,7 @@ mod tests {
         let (p, q, o) = book_levels(5);
         w.append_book_row(&book_row(&p[..5], &q[..5], &o[..5], 21))
             .expect("append");
-        assert_eq!(w.pending(), 1);
+        assert_eq!(w.pending(), 5);
         assert_eq!(
             DepthWriter::new(&cfg, Feed::Dhan).layout(),
             DepthLayout::Levels

@@ -271,17 +271,31 @@ fn the_refusal_log_throttle_is_not_a_process_wide_static() {
     );
 
     // And `note` must route through it rather than growing a second, private
-    // throttle beside the first.
-    let note_at = src
+    // throttle beside the first. 2026-10-09 (plan item 49e step 3): `note` is
+    // `note_n(reason, 1)`, so `note_n` is the body that must route through it,
+    // and `note` is asserted to be nothing but that delegation.
+    let one_at = src
         .find("pub(crate) fn note(&self, reason: &'static str) {")
         .expect("OutOfWindowCounters::note is gone");
+    let one_end = src[one_at..]
+        .find("\n    }\n")
+        .map_or(src.len(), |o| one_at + o);
+    let one_body = &src[one_at..one_end];
+    assert!(
+        one_body.contains("self.note_n(reason, 1);") && !declares_a_static(one_body),
+        "note must be exactly `self.note_n(reason, 1)` -- a second body beside \
+         note_n can grow its own throttle."
+    );
+    let note_at = src
+        .find("pub(crate) fn note_n(&self, reason: &'static str, n: u64) {")
+        .expect("OutOfWindowCounters::note_n is gone");
     let note_end = src[note_at..]
         .find("\n    }\n")
         .map_or(src.len(), |o| note_at + o);
     let note_body = &src[note_at..note_end];
     assert!(
         note_body.contains("self.throttle_tick(idx)"),
-        "note no longer routes through throttle_tick, so the unit tests pin a \
+        "note_n no longer routes through throttle_tick, so the unit tests pin a \
          function production does not call."
     );
     assert!(
@@ -339,7 +353,7 @@ fn the_book_row_writer_uses_the_same_window_check() {
     let body = &src[start..src.len().min(start + 600)];
     assert!(
         body.contains("depth_arrival_window_refusal(row.ts_nanos)")
-            && body.contains("self.out_of_window.note(reason)"),
+            && body.contains("self.out_of_window.note_n(reason, levels.max(1))"),
         "`append_book_row` must refuse and count out-of-window rows exactly as \
          `append_row` does"
     );

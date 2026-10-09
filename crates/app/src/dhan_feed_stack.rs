@@ -9080,6 +9080,7 @@ pub fn drain_main_feed_frame(
                                 received_at_nanos,
                                 frame.seq,
                                 packets,
+                                frame.connection_index != u8::MAX,
                                 c,
                             ));
                     } else {
@@ -9613,19 +9614,28 @@ impl DepthIngest {
         }
     }
 
-    /// True when a frame received at `received_at_nanos` is written as array
-    /// rows. O(1).
+    /// True when a frame is written as array rows. O(1).
+    ///
+    /// `live` is true for a frame this process received from a socket (never
+    /// a replay): it always goes to the array rows when they are on, whatever
+    /// the wall clock read, so a backward clock step can never send this
+    /// process's own frames to the synchronous older-frame writer. A replayed
+    /// frame goes by its receipt time against the start instant.
     #[must_use]
-    pub fn writes_book(&self, received_at_nanos: i64) -> bool {
+    pub fn writes_book(&self, received_at_nanos: i64, live: bool) -> bool {
         self.book
             .as_ref()
-            .is_some_and(|b| received_at_nanos >= b.since)
+            .is_some_and(|b| live || received_at_nanos >= b.since)
     }
 
     /// Marks the writer that will carry this frame's rows as holding rows
     /// from a frame the WAL refused. O(1).
-    pub fn mark_pending_unbacked_for(&mut self, received_at_nanos: i64) {
-        level_sink(&mut self.book, &mut self.writer, received_at_nanos).mark_pending_unbacked();
+    pub fn mark_pending_unbacked_for(&mut self, received_at_nanos: i64, live: bool) {
+        if self.writes_book(received_at_nanos, live) {
+            self.writer.mark_pending_unbacked();
+        } else {
+            level_sink(&mut self.book, &mut self.writer).mark_pending_unbacked();
+        }
     }
 
     /// Marks every writer of this ingest as holding rows from a frame the WAL
@@ -10045,18 +10055,17 @@ fn depth_level_price_is_plausible(price: f64) -> bool {
     price.is_finite() && price >= 0.0 && price <= f64::from(MAX_PLAUSIBLE_LTP)
 }
 
-/// The writer that takes LEVEL rows for a frame received at
-/// `received_at_nanos`: the older-frame writer in array-row mode, else the
-/// primary. A free function over the two fields so the caller can keep the
-/// parse buffer borrowed. O(1).
+/// The writer that takes LEVEL rows for a frame [`DepthIngest::writes_book`]
+/// sent to level rows: the older-frame writer in array-row mode, else the
+/// primary. Call it only after `writes_book` said false. A free function over
+/// the two fields so the caller can keep the parse buffer borrowed. O(1).
 fn level_sink<'a>(
     book: &'a mut Option<Box<BookMode>>,
     primary: &'a mut DepthWriter,
-    received_at_nanos: i64,
 ) -> &'a mut DepthWriter {
     match book.as_deref_mut() {
-        Some(b) if received_at_nanos < b.since => &mut b.levels,
-        _ => primary,
+        Some(b) => &mut b.levels,
+        None => primary,
     }
 }
 
@@ -10122,6 +10131,10 @@ fn level_sink<'a>(
 /// the packet's depth and counts it. Never a fallback value: pinning every
 /// over-range packet onto one key would collapse them together, which is the
 /// same silent merge this exists to remove, reintroduced at the other end.
+///
+/// `live` is true only for a frame the live drain took off a socket in this
+/// process; a replayed frame (the boot catch-up, the after-close pass) passes
+/// false. See [`DepthIngest::writes_book`].
 fn append_inline_depth(
     sink: &mut DepthIngest,
     tick: &tickvault_common::tick_types::ParsedTick,
@@ -10129,6 +10142,7 @@ fn append_inline_depth(
     received_at_nanos: i64,
     frame_seq: u64,
     packet_index: u32,
+    live: bool,
     c: &DrainCounters,
 ) -> u64 {
     // Same posture as the dedicated depth drain: an unrecognised segment is
@@ -10168,7 +10182,7 @@ fn append_inline_depth(
     // 23:59 IST into the PREVIOUS day — the day archival and retention key on.
     let ts_nanos =
         received_at_nanos.saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
-    if sink.writes_book(received_at_nanos) {
+    if sink.writes_book(received_at_nanos, live) {
         return append_inline_depth_book(
             sink,
             levels,
@@ -10179,7 +10193,7 @@ fn append_inline_depth(
             c,
         );
     }
-    let writer = level_sink(&mut sink.book, &mut sink.writer, received_at_nanos);
+    let writer = level_sink(&mut sink.book, &mut sink.writer);
     let mut rows = 0_u64;
     for (idx, level) in levels.iter().enumerate() {
         let level_no = i64::try_from(idx).unwrap_or(i64::MAX).saturating_add(1);
@@ -10327,13 +10341,16 @@ fn drain_depth_frame(
     // the writer unbacked before any row lands, so a busy rescue never drops
     // its rows on the assumption a replay will restore them. Replayed frames
     // are WAL-backed by definition and never take this arm.
+    // A replayed frame carries `connection_index == u8::MAX`; every other
+    // frame came off a socket in this process.
+    let live = frame.connection_index != u8::MAX;
     if !frame.wal_backed {
         c.frames_wal_unbacked.increment(1);
-        depth.mark_pending_unbacked_for(received_at_nanos);
+        depth.mark_pending_unbacked_for(received_at_nanos, live);
     }
     // Plan item 49e step 3: decided once per frame, so every packet of one
     // frame lands in the same table.
-    let to_book = depth.writes_book(received_at_nanos);
+    let to_book = depth.writes_book(received_at_nanos, live);
     let depth_kind_label = match kind {
         DepthFeedKind::Twenty => DEPTH_KIND_20,
         DepthFeedKind::TwoHundred => DEPTH_KIND_200,
@@ -10588,7 +10605,7 @@ fn drain_depth_frame(
             }
             continue;
         }
-        let sink = level_sink(&mut depth.book, &mut depth.writer, received_at_nanos);
+        let sink = level_sink(&mut depth.book, &mut depth.writer);
         for (idx, level) in levels.iter().enumerate() {
             // Price sanity, per level — the depth twin of `tick_price_is_sane`.
             //
@@ -16310,6 +16327,7 @@ pub fn refold_wal_frames(
                             *wal_received_at_nanos,
                             *frame_seq,
                             packets,
+                            false,
                             counters(),
                         );
                         out.inline_depth_rows = out.inline_depth_rows.saturating_add(rows);
@@ -16806,10 +16824,30 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // before any socket dials, and shared with the after-close depth pass so
     // both route every frame the same way. `None` while the setting is off.
     // A clock past 2262 reads as "never", which keeps depth in `market_depth`.
-    let depth_book_since = crate::depth_book_since::resolve_depth_book_since(
-        params.depth_storage.array_rows,
-        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX),
-    );
+    //
+    // The array-row table is created here, only with the setting on, and the
+    // writer is armed only once QuestDB accepted every statement: a refused
+    // create would otherwise let the first ILP write auto-create the table
+    // with no DEDUP key and no hourly partition. On a refusal this process
+    // keeps writing `market_depth`, as with the setting off, and the start
+    // instant is left untouched for the next boot.
+    let depth_book_since = if params.depth_storage.array_rows
+        && !tickvault_storage::depth_persistence::ensure_market_depth_book_table(&params.questdb)
+            .await
+    {
+        error!(
+            code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+            table = tickvault_storage::depth_persistence::MARKET_DEPTH_BOOK_TABLE,
+            "depth array rows are on but market_depth_book could not be created — this \
+             process keeps writing depth to market_depth; nothing is lost"
+        );
+        None
+    } else {
+        crate::depth_book_since::resolve_depth_book_since(
+            params.depth_storage.array_rows,
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX),
+        )
+    };
     let mut ingest = LiveIngest::new(
         TickWriter::new(&params.questdb, Feed::Dhan),
         capacity.max(1),
@@ -21210,7 +21248,11 @@ mod tests {
             "rows still count LEVELS stored, the level path's unit"
         );
         assert_eq!(out.refused, 0);
-        assert_eq!(depth.pending_rows(), 1, "one side-packet is ONE array row");
+        assert_eq!(
+            depth.pending_rows(),
+            20,
+            "one array row, counted as the 20 levels it carries"
+        );
         let bytes = depth.pending_book_bytes();
         assert!(
             bytes.starts_with(b"market_depth_book"),
@@ -21246,7 +21288,11 @@ mod tests {
         );
         assert_eq!(out.rows, 19);
         assert_eq!(out.refused, 1);
-        assert_eq!(depth.pending_rows(), 1);
+        assert_eq!(
+            depth.pending_rows(),
+            20,
+            "the NaN slot still counts as a level"
+        );
         let mut expected: Vec<f64> = (0..20).map(|i| 100.0 + f64::from(i)).collect();
         expected[3] = f64::NAN;
         assert!(
@@ -21271,7 +21317,7 @@ mod tests {
             counters(),
         );
         assert_eq!(out.rows, 200);
-        assert_eq!(depth.pending_rows(), 1);
+        assert_eq!(depth.pending_rows(), 200);
         let empty = depth_frame(
             depth200_packet(52_175, 2, 41, 0),
             DhanEndpointType::Depth200,
@@ -21287,7 +21333,7 @@ mod tests {
         assert_eq!((out.rows, out.refused), (0, 0));
         assert_eq!(
             depth.pending_rows(),
-            1,
+            200,
             "a zero-level packet writes no row, as before"
         );
     }
@@ -21295,9 +21341,11 @@ mod tests {
     #[test]
     fn test_a_frame_received_before_the_switch_goes_to_the_level_table() {
         let mut depth = DepthIngest::for_test_book(BOOK_RX + 1);
-        assert!(!depth.writes_book(BOOK_RX));
-        assert!(depth.writes_book(BOOK_RX + 1));
-        let frame = depth_frame(depth20_packet(13, 0, 41), DhanEndpointType::Depth20, 7);
+        assert!(!depth.writes_book(BOOK_RX, false));
+        assert!(depth.writes_book(BOOK_RX + 1, false));
+        // A REPLAYED frame (the boot catch-up) goes by its receipt time.
+        let mut frame = depth_frame(depth20_packet(13, 0, 41), DhanEndpointType::Depth20, 7);
+        frame.connection_index = u8::MAX;
         let out = drain_depth_frame(
             &mut depth,
             &frame,
@@ -21318,10 +21366,38 @@ mod tests {
         assert!(depth.pending_ilp().contains("market_depth,"));
     }
 
+    /// Review fix (2026-10-09): a LIVE frame stamped before the start instant
+    /// (the wall clock stepped back) still goes to the array rows, never to
+    /// the synchronous older-frame writer whose flush runs on the drain.
+    #[test]
+    fn test_a_live_frame_stamped_before_the_switch_still_goes_to_the_book() {
+        let mut depth = DepthIngest::for_test_book(BOOK_RX + 1);
+        let frame = depth_frame(depth20_packet(13, 0, 41), DhanEndpointType::Depth20, 7);
+        assert_ne!(frame.connection_index, u8::MAX, "a live socket frame");
+        let out = drain_depth_frame(
+            &mut depth,
+            &frame,
+            BOOK_RX,
+            DepthFeedKind::Twenty,
+            counters(),
+        );
+        assert_eq!(out.rows, 20);
+        assert!(
+            !depth.pending_book_bytes().is_empty(),
+            "the live frame is one array row"
+        );
+        assert_eq!(
+            depth.book.as_ref().map(|b| b.levels.pending()),
+            Some(0),
+            "nothing on the older-frame writer"
+        );
+    }
+
     #[test]
     fn test_writes_book_is_false_with_array_rows_off() {
         let depth = DepthIngest::for_test();
-        assert!(!depth.writes_book(i64::MAX));
+        assert!(!depth.writes_book(i64::MAX, false));
+        assert!(!depth.writes_book(i64::MAX, true));
         assert!(depth.pending_book_bytes().is_empty());
     }
 
@@ -21336,6 +21412,7 @@ mod tests {
         // 2,000 depth-200 sides are 2,000 rows, far under the 10,000-row
         // threshold, and ~9.6 MB, past the 8 MiB byte threshold.
         let mut seq = 9_u64;
+        let mut sides = 0_u64;
         while !book.flush_due() {
             let mut f = frame.clone();
             seq += 1 << 20;
@@ -21347,7 +21424,8 @@ mod tests {
                 DepthFeedKind::TwoHundred,
                 counters(),
             );
-            assert!(book.pending_rows() < 10_000, "must trip on bytes, not rows");
+            sides += 1;
+            assert!(sides < 10_000, "must trip on bytes, not rows");
         }
         assert!(
             book.pending_book_bytes().len()
@@ -21371,7 +21449,7 @@ mod tests {
     #[test]
     fn test_mark_pending_unbacked_for_marks_the_writer_that_takes_the_frame() {
         let mut depth = DepthIngest::for_test_book(BOOK_RX);
-        depth.mark_pending_unbacked_for(BOOK_RX - 1);
+        depth.mark_pending_unbacked_for(BOOK_RX - 1, false);
         assert!(
             depth
                 .book
@@ -21379,8 +21457,19 @@ mod tests {
                 .is_some_and(|b| b.levels.pending_unbacked())
         );
         assert!(!depth.writer.pending_unbacked());
-        depth.mark_pending_unbacked_for(BOOK_RX);
+        depth.mark_pending_unbacked_for(BOOK_RX, false);
         assert!(depth.writer.pending_unbacked());
+        // A live frame stamped before the instant (a backward clock step)
+        // marks the array-row writer, the one that takes it.
+        let mut live = DepthIngest::for_test_book(BOOK_RX);
+        live.mark_pending_unbacked_for(BOOK_RX - 1, true);
+        assert!(live.writer.pending_unbacked());
+        assert!(
+            !live
+                .book
+                .as_ref()
+                .is_some_and(|b| b.levels.pending_unbacked())
+        );
     }
 
     #[test]
@@ -21402,8 +21491,12 @@ mod tests {
     #[test]
     fn test_for_test_book_routes_from_its_instant_and_pending_book_bytes_starts_empty() {
         let depth = DepthIngest::for_test_book(BOOK_RX);
-        assert!(depth.writes_book(BOOK_RX));
-        assert!(!depth.writes_book(BOOK_RX - 1));
+        assert!(depth.writes_book(BOOK_RX, false));
+        assert!(!depth.writes_book(BOOK_RX - 1, false));
+        assert!(
+            depth.writes_book(BOOK_RX - 1, true),
+            "a live frame always goes to the book"
+        );
         assert!(depth.pending_book_bytes().is_empty(), "nothing written yet");
         assert_eq!(depth.pending_rows(), 0);
     }
@@ -27823,6 +27916,7 @@ mod inline_depth_tests {
             RECEIPT_UTC_NANOS,
             0,
             0,
+            false,
             counters(),
         );
         assert_eq!(rows, 10, "5 levels x 2 sides");
@@ -27853,10 +27947,15 @@ mod inline_depth_tests {
             RECEIPT_UTC_NANOS,
             0,
             0,
+            false,
             counters(),
         );
         assert_eq!(rows, 9, "ten levels, one refused");
-        assert_eq!(sink.pending_rows(), 2, "one bid row and one ask row");
+        assert_eq!(
+            sink.pending_rows(),
+            10,
+            "one bid row and one ask row, counted as their ten levels"
+        );
         let bytes = sink.pending_book_bytes();
         let text = String::from_utf8_lossy(bytes);
         assert!(text.contains("depth_kind=d5"));
@@ -27894,6 +27993,7 @@ mod inline_depth_tests {
             RECEIPT_UTC_NANOS,
             0,
             0,
+            false,
             counters(),
         );
         assert_eq!(rows, 10);
@@ -27941,6 +28041,7 @@ mod inline_depth_tests {
             RECEIPT_UTC_NANOS,
             0,
             0,
+            false,
             counters(),
         );
         assert_eq!(rows, 10, "5 levels x 2 sides");
@@ -27979,7 +28080,7 @@ mod inline_depth_tests {
         };
         let zero = [tickvault_common::tick_types::MarketDepthLevel::default(); 5];
         assert_eq!(
-            append_inline_depth(&mut sink, &tick, &zero, 1, 0, 0, counters()),
+            append_inline_depth(&mut sink, &tick, &zero, 1, 0, 0, false, counters()),
             10,
             "zero-priced levels are the absent sentinel and MUST be written"
         );
@@ -27987,7 +28088,7 @@ mod inline_depth_tests {
         let mut neg = [tickvault_common::tick_types::MarketDepthLevel::default(); 5];
         neg[0].bid_price = -1.0;
         assert_eq!(
-            append_inline_depth(&mut sink, &tick, &neg, 1, 0, 0, counters()),
+            append_inline_depth(&mut sink, &tick, &neg, 1, 0, 0, false, counters()),
             9,
             "a negative price is impossible and must be refused"
         );
@@ -28028,6 +28129,7 @@ mod inline_depth_tests {
             RECEIPT_UTC_NANOS,
             frame_seq,
             0,
+            false,
             counters(),
         );
         let b = append_inline_depth(
@@ -28037,6 +28139,7 @@ mod inline_depth_tests {
             RECEIPT_UTC_NANOS,
             frame_seq,
             1,
+            false,
             counters(),
         );
         assert_eq!(a + b, 20, "both packets appended their ten rows");
@@ -28082,7 +28185,7 @@ mod inline_depth_tests {
         }; 5];
         let utc = RECEIPT_UTC_NANOS;
         assert_eq!(
-            append_inline_depth(&mut sink, &tick, &levels, utc, 0, 0, counters()),
+            append_inline_depth(&mut sink, &tick, &levels, utc, 0, 0, false, counters()),
             10
         );
         let expected = utc + tickvault_common::constants::IST_UTC_OFFSET_NANOS;
@@ -28116,7 +28219,7 @@ mod inline_depth_tests {
             ..Default::default()
         }; 5];
         assert_eq!(
-            append_inline_depth(&mut sink, &tick, &levels, 1, 0, 0, counters()),
+            append_inline_depth(&mut sink, &tick, &levels, 1, 0, 0, false, counters()),
             0,
             "an unknown segment must produce NO rows"
         );
@@ -28222,7 +28325,7 @@ mod inline_depth_tests {
             ..Default::default()
         }; 5];
         let sink = ingest.inline_depth.as_mut().expect("enabled above");
-        let rows = append_inline_depth(sink, &tick, &levels, 1, 0, 0, counters());
+        let rows = append_inline_depth(sink, &tick, &levels, 1, 0, 0, false, counters());
         assert_eq!(rows, 10, "depth rows were appended");
 
         // No ticks were folded, so pending_rows is 0 and the early return
@@ -28281,6 +28384,7 @@ mod inline_depth_tests {
             RECEIPT_UTC_NANOS,
             0,
             0,
+            false,
             counters(),
         );
         assert_eq!(appended, 10, "fixture must actually buffer depth rows");

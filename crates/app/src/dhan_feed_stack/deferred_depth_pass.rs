@@ -318,6 +318,7 @@ pub(crate) fn rewrite_inline_depth(
                 received_at_nanos,
                 frame_seq,
                 packets,
+                false,
                 c,
             ));
         }
@@ -875,13 +876,49 @@ mod tests {
             let Ok(ParsedFrame::TickWithDepth(tick, levels)) = dispatch_frame(&packet, rx) else {
                 panic!("fixture must parse as a Full packet");
             };
-            append_inline_depth(&mut live, &tick, &levels, rx, seq, idx, pass_counters());
+            append_inline_depth(
+                &mut live,
+                &tick,
+                &levels,
+                rx,
+                seq,
+                idx,
+                false,
+                pass_counters(),
+            );
         }
         assert_eq!(
             rewritten.pending_ilp(),
             live.pending_ilp(),
             "same rows, same capture_seq — a rewrite lands on the live rows"
         );
+    }
+
+    /// Plan item 49e step 3 (review fix 2026-10-09): with array rows on, the
+    /// after-close pass routes each written-back frame by its recorded
+    /// receipt, exactly as the live drain did: at or after the start instant
+    /// to `market_depth_book`, before it to `market_depth`.
+    #[test]
+    fn test_rewrite_inline_depth_routes_by_receipt_with_array_rows_on() {
+        let frame = full_packet(13);
+        let (seq, rx) = in_session();
+
+        let mut book = DepthIngest::for_test_book(rx);
+        let rows = rewrite_inline_depth(&mut book, &frame, seq, rx, pass_counters());
+        assert_eq!(rows, 10, "5 levels x 2 sides, counted in levels");
+        assert!(!book.pending_book_bytes().is_empty(), "array rows written");
+        assert_eq!(
+            book.book.as_ref().map(|b| b.levels.pending()),
+            Some(0),
+            "nothing on the older-frame writer"
+        );
+
+        let mut older = DepthIngest::for_test_book(rx + 1);
+        let rows = rewrite_inline_depth(&mut older, &frame, seq, rx, pass_counters());
+        assert_eq!(rows, 10);
+        assert!(older.pending_book_bytes().is_empty(), "no array row");
+        assert_eq!(older.pending_rows(), 10, "ten level rows");
+        assert!(older.pending_ilp().contains("market_depth,"));
     }
 
     /// A shed frame's depth is written back; a frame outside the bucket is
