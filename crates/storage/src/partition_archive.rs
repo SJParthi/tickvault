@@ -2466,26 +2466,18 @@ impl PartitionArchiver {
     /// Conservative by construction: any unreadable directory counts as PENDING,
     /// because "I could not check" must never read as "safe" -- the same posture
     /// the pre-drop recount already takes for a missing count.
+    ///
+    /// ⚠ CHANGED 2026-10-09: this used to count ANY entry. A drained spill file
+    /// is emptied to 0 bytes and kept, never deleted, so after the first spill
+    /// the hour-window archive was deferred for good. See
+    /// [`spill_dir_has_pending_data`] for the rule now used.
     fn spill_dirs_have_pending_data() -> bool {
         [
             crate::depth_persistence::DEPTH_SPILL_DIR,
             crate::tick_persistence::TICK_SPILL_DIR,
         ]
         .iter()
-        .any(|dir| {
-            let path = std::path::Path::new(dir);
-            if !path.exists() {
-                return false;
-            }
-            match std::fs::read_dir(path) {
-                // A non-empty spill dir means a replay may still be draining it.
-                // Sub-directories (the quarantine tree) count too: a quarantined
-                // file can be restored by an operator at any time.
-                Ok(rd) => rd.count() > 0,
-                // Unreadable -> assume pending. Fail toward the SAFE path.
-                Err(_) => true,
-            }
-        })
+        .any(|dir| spill_dir_has_pending_data(std::path::Path::new(dir)))
     }
 
     /// Lists a table's eligible (aged-out, inactive, well-formed-name)
@@ -2525,6 +2517,9 @@ impl PartitionArchiver {
         // degradation is bounded (archival is deferred, never skipped), and
         // it needs no coordination between two subsystems -- a directory
         // check is a fact both can see without a lock.
+        // (2026-10-09: "holds anything" now means a NON-EMPTY file the replay
+        // could still read; drained 0-byte files and `quarantine/` do not
+        // count. See `spill_dir_has_pending_data`.)
         //
         // UNDER DISK PRESSURE the deferral inverts (2026-09-01). The spill
         // dirs are non-empty BECAUSE the disk is full, so deferring makes the
@@ -2947,6 +2942,64 @@ fn swept_tables() -> Vec<&'static str> {
     tables
 }
 
+/// Does one spill folder still hold rows a replay could POST back with their
+/// ORIGINAL timestamps?
+///
+/// Only a NON-EMPTY regular file at the top of the folder counts. The rules:
+///
+/// - A 0-byte file is a drained file. The replay empties a closed file once
+///   QuestDB has accepted it and keeps it (so the age sweep can tell drained
+///   from abandoned); the replay skips 0-byte files. It holds no rows.
+/// - The `quarantine/` sub-folder is never read by the replay: it holds files
+///   QuestDB refused for good, kept and uploaded, never re-sent. It cannot
+///   write into a partition, so it cannot race the hour archive.
+/// - The rule does NOT look at the file extension. Any non-empty file counts,
+///   whatever it is called, so a new spill format (for example a framed depth
+///   file) is covered without touching this function.
+/// - Anything this function cannot classify (an unreadable folder or entry, a
+///   symlink, any sub-folder other than `quarantine/`) counts as PENDING.
+///   "I could not check" must never read as "safe".
+///
+/// A missing folder holds nothing and is not pending.
+///
+/// Cost: one `read_dir` plus one `lstat` per top-level entry, O(entries), on
+/// the archive task (off the worker), once per archive run. Stops at the first
+/// pending entry.
+fn spill_dir_has_pending_data(path: &Path) -> bool {
+    let entries = match std::fs::read_dir(path) {
+        Ok(rd) => rd,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return false,
+        // Unreadable -> assume pending. Fail toward the SAFE path.
+        Err(_) => return true,
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return true;
+        };
+        // `DirEntry::metadata` does not follow a symlink, so a link is seen
+        // as a link and counted as pending below.
+        let Ok(meta) = entry.metadata() else {
+            return true;
+        };
+        let file_type = meta.file_type();
+        if file_type.is_file() {
+            if meta.len() > 0 {
+                return true;
+            }
+            // A drained, emptied file: nothing left to replay.
+            continue;
+        }
+        if file_type.is_dir() && entry.file_name() == crate::tick_spill_replay::QUARANTINE_DIR {
+            // Set-aside data, never replayed.
+            continue;
+        }
+        // An unknown sub-folder, a symlink or a special file: cannot prove it
+        // holds nothing, so count it as pending.
+        return true;
+    }
+    false
+}
+
 /// Fair-shares the per-run partition budget across tables, oldest-first
 /// within each table.
 ///
@@ -3298,23 +3351,26 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("temp dir");
 
         assert!(
-            !dir_has_entries(&dir),
+            !super::spill_dir_has_pending_data(&dir),
             "an empty spill directory must not defer archival"
         );
 
         std::fs::write(dir.join("depth-spill-0001.ilp"), b"x").expect("write");
         assert!(
-            dir_has_entries(&dir),
+            super::spill_dir_has_pending_data(&dir),
             "a spill file a replay could still drain MUST defer the hour window"
         );
 
-        // A SUBDIRECTORY counts too: the quarantine tree holds files an
-        // operator can restore at any moment.
+        // ⚠ CHANGED 2026-10-09: the quarantine tree no longer counts. The
+        // replay never reads it (it holds files QuestDB refused for good), so
+        // it cannot write into a partition; counting it deferred the hour
+        // window for as long as a single set-aside file existed.
         std::fs::remove_file(dir.join("depth-spill-0001.ilp")).expect("rm");
         std::fs::create_dir_all(dir.join("quarantine")).expect("mkdir");
+        std::fs::write(dir.join("quarantine").join("refused.ilp"), b"x").expect("write");
         assert!(
-            dir_has_entries(&dir),
-            "a quarantine subdirectory is still pending data"
+            !super::spill_dir_has_pending_data(&dir),
+            "a quarantine subdirectory is never replayed, so it is not pending"
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -3333,22 +3389,90 @@ mod tests {
         ));
         std::fs::write(&f, b"not a directory").expect("write");
         assert!(
-            dir_has_entries(&f),
+            super::spill_dir_has_pending_data(&f),
             "cannot-check must never read as safe-to-drop"
         );
         std::fs::remove_file(&f).ok();
     }
 
-    /// Mirror of the production predicate for ONE directory, so these tests
-    /// exercise the real decision rather than a paraphrase of it.
-    fn dir_has_entries(path: &std::path::Path) -> bool {
-        if !path.exists() {
-            return false;
+    /// A fresh scratch folder for the spill-pending tests, removed on drop.
+    struct SpillScratch(std::path::PathBuf);
+    impl SpillScratch {
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "tv-archive-spill-pending-{tag}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("temp dir");
+            Self(path)
         }
-        match std::fs::read_dir(path) {
-            Ok(rd) => rd.count() > 0,
-            Err(_) => true,
+        fn path(&self) -> &std::path::Path {
+            &self.0
         }
+    }
+    impl Drop for SpillScratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    // Regression: 2026-10-09 — a drained spill file is emptied to 0 bytes and
+    // kept, and the old check counted ANY entry, so after the first spill the
+    // hour-window depth archive was deferred to the day path forever.
+    #[test]
+    fn test_regression_drained_spill_files_and_quarantine_are_not_pending() {
+        let dir = SpillScratch::new("drained");
+        std::fs::write(dir.path().join("ticks-dhan-2026100909.ilp"), b"").expect("write");
+        std::fs::write(dir.path().join("depth-dhan-2026100910.dspl"), b"").expect("write");
+        let quarantine = dir.path().join(crate::tick_spill_replay::QUARANTINE_DIR);
+        std::fs::create_dir_all(&quarantine).expect("quarantine");
+        std::fs::write(quarantine.join("refused.ilp"), b"refused rows\n").expect("write");
+        assert!(
+            !super::spill_dir_has_pending_data(dir.path()),
+            "only drained 0-byte files and quarantine/ are present: nothing can be replayed"
+        );
+    }
+
+    /// A non-empty file of ANY name still counts as pending, so a new spill
+    /// format is covered without an extension list.
+    #[test]
+    fn a_non_empty_spill_file_of_any_extension_is_pending() {
+        for (i, name) in [
+            "ticks-dhan-2026100909.ilp",
+            "depth-dhan-2026100910.dspl",
+            "unknown.bin",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let dir = SpillScratch::new(&format!("nonempty-{i}"));
+            std::fs::write(dir.path().join("drained.ilp"), b"").expect("write");
+            std::fs::write(dir.path().join(name), b"rows\n").expect("write");
+            assert!(
+                super::spill_dir_has_pending_data(dir.path()),
+                "{name} must count"
+            );
+        }
+    }
+
+    /// A missing folder holds nothing; an empty folder holds nothing.
+    #[test]
+    fn a_missing_or_empty_spill_folder_is_not_pending() {
+        let dir = SpillScratch::new("empty");
+        assert!(!super::spill_dir_has_pending_data(dir.path()));
+        assert!(!super::spill_dir_has_pending_data(
+            &dir.path().join("absent")
+        ));
+    }
+
+    /// Anything the check cannot classify counts as pending: an unknown
+    /// sub-folder may hold rows, and "could not check" never reads as safe.
+    #[test]
+    fn an_unknown_sub_folder_counts_as_pending() {
+        let dir = SpillScratch::new("unknown-sub");
+        std::fs::create_dir_all(dir.path().join("replaying")).expect("subdir");
+        assert!(super::spill_dir_has_pending_data(dir.path()));
     }
 
     // ---- Content-addressed sidecar archive keys (2026-08-25) -------------
