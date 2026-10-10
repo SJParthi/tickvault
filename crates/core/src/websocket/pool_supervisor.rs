@@ -83,8 +83,8 @@ use super::pool_budget::{
     ConnectionSlot, DhanEndpointType, MAX_TOTAL_DHAN_CONNECTIONS, PoolBudget, PoolBudgetRefusal,
 };
 use super::reconnect_ladder::{
-    FLAP_DAMPED_METRIC, FLAP_WINDOW_MS, FlapVerdict, ReconnectDecision, damped_reconnect_delay,
-    damped_reconnect_delay_with_jitter, reconnect_jitter_ms,
+    FLAP_DAMPED_METRIC, FLAP_WINDOW_MS, FlapVerdict, MIN_HEALTHY_SESSION_MS, ReconnectDecision,
+    damped_reconnect_delay, damped_reconnect_delay_with_jitter, reconnect_jitter_ms,
 };
 use super::types::{ConnectionId, ConnectionState, DisconnectCode};
 
@@ -92,7 +92,9 @@ use super::types::{ConnectionId, ConnectionState, DisconnectCode};
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Minimum delay before re-dialing after a token-staleness disconnect (807/809).
+/// Minimum delay before re-dialing after a token-staleness disconnect
+/// (807/809), and after a first 808 (scope lock 2026-10-06: an 808 refreshes
+/// the token once on the same delay rule).
 ///
 /// Deliberately far above the ladder's instant first rung. A stale token is not
 /// a transient TCP event: re-dialing immediately presents the SAME dead token
@@ -101,6 +103,85 @@ use super::types::{ConnectionId, ConnectionState, DisconnectCode};
 /// loop / mid-session watchdog room to publish a fresh token before we ask for
 /// one again.
 pub const TOKEN_STALE_REDIAL_FLOOR_MS: u64 = 5_000;
+
+/// 808 refresh-once (scope lock 2026-10-06): refreshes in one 808 episode
+/// that may fail OUTRIGHT (not deferred by the mint cooldown or the
+/// RESILIENCE-03 lock) before the slot parks. A wrong client id reported as
+/// 808 therefore costs at most this many extra dials. Raising it needs a
+/// dated quote in the scope lock first.
+pub const AUTH_REJECT_MAX_HARD_FAILURES: u8 = 3;
+
+/// 808 refresh-once: the longest an 808 episode may run WITHOUT a verified
+/// fresh token before the slot parks. The backstop for deferred refreshes,
+/// which do not count toward [`AUTH_REJECT_MAX_HARD_FAILURES`]: at least two
+/// mint cooldowns long (asserted below), so a deferral always gets one real
+/// mint attempt before the park.
+pub const AUTH_REJECT_EPISODE_MAX_MS: u64 = 300_000;
+
+/// 808 refresh-once: the window [`AUTH_REJECT_MAX_REFRESHES_PER_WINDOW`] is
+/// counted over, per slot.
+pub const AUTH_REJECT_WINDOW_MS: u64 = 300_000;
+
+/// 808 refresh-once: at most this many 808 refreshes per slot inside
+/// [`AUTH_REJECT_WINDOW_MS`]; the next 808 inside the window parks. Bounds an
+/// account that accepts each fresh token briefly and then rejects it again.
+pub const AUTH_REJECT_MAX_REFRESHES_PER_WINDOW: usize = 4;
+
+const _: () = assert!(
+    AUTH_REJECT_EPISODE_MAX_MS
+        >= 2 * tickvault_common::constants::DHAN_TOKEN_GENERATION_COOLDOWN_SECS * 1000,
+    "an 808 episode must outlast two mint cooldowns, or a deferred refresh parks the \
+     slot before a mint was ever allowed"
+);
+
+/// What the supervisor asks of the token refresh it is about to run (808
+/// refresh-once, scope lock 2026-10-06). `Copy`, no heap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenRefreshRequest {
+    /// The token generation this 808 episode already VERIFIED as fresh, if
+    /// any. A closure whose socket dialled with exactly this generation must
+    /// NOT renew (that would replace a token that was just issued); it
+    /// reports [`TokenRefreshOutcome::NotAttempted`] and the supervisor parks.
+    pub skip_if_presented: Option<u64>,
+}
+
+/// How a token refresh ended, as the refresh closure observed it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenRefreshOutcome {
+    /// The token generation moved past the one the socket presented:
+    /// `current` is the new generation. Only a closure that SAW the
+    /// generation move may report this.
+    Fresh { current: u64 },
+    /// The renewal was refused for now (mint cooldown or the RESILIENCE-03
+    /// lock); it does not count as a failure.
+    Deferred,
+    /// The renewal failed outright.
+    Failed,
+    /// No renewal was attempted (the presented generation was the verified
+    /// one, or there is no token manager).
+    NotAttempted,
+}
+
+/// What the refresh closure returns: the generation the socket presented on
+/// the dial that was rejected, and how the refresh ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenRefreshReport {
+    /// The token generation the rejected dial presented.
+    pub presented: u64,
+    /// How the refresh ended.
+    pub outcome: TokenRefreshOutcome,
+}
+
+/// One 808 episode on one slot. `Copy`, no heap. Started by the first 808,
+/// ended by a park, by a close other than 808 after frames, or by an 808 after
+/// [`MIN_HEALTHY_SESSION_MS`] of healthy delivery. Never touched on the frame
+/// path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AuthRejectEpisode {
+    started_at: Instant,
+    hard_failures: u8,
+    verified_generation: Option<u64>,
+}
 
 /// How often the shell wakes to ask the supervisor whether a socket has gone
 /// idle. One second gives a 27–28s detection window against the 27s threshold,
@@ -722,9 +803,13 @@ pub enum DisconnectClass {
     /// the situation strictly worse, which is why this is the one transport
     /// error that must stop rather than back off.
     PoolOverflow,
-    /// Entitlement or credential errors that never self-heal without operator
-    /// action (806 data-API not subscribed, 808 auth failed, 810 client id
-    /// invalid). Park; a human must fix the account or the config.
+    /// 808 — authentication failed. **Ambiguous:** an invalid or replaced
+    /// token produces it as well as an invalid client id. Refresh the token
+    /// ONCE and redial on the [`Self::TokenStale`] delay rule; park only on a
+    /// second rejection of the fresh token (or a cap) — see the
+    /// `AUTH_REJECT_*` constants and the scope lock's 2026-10-06 section
+    /// "808 REFRESHES THE TOKEN ONCE BEFORE IT PARKS".
+    AuthRejected,
     /// 804 — the VENDOR's per-connection instrument count was exceeded.
     ///
     /// Split out of [`Self::Fatal`] on 2026-09-10. It sat in the credential
@@ -745,6 +830,11 @@ pub enum DisconnectClass {
     /// Distinct from [`Self::Fatal`] rather than a widening of it: a
     /// credential error repeats verbatim on a fresh socket and this does not.
     SubscriptionRejected,
+    /// Entitlement or credential errors that never self-heal without operator
+    /// action (806 data-API not subscribed, 810 client id invalid). Park; a
+    /// human must fix the account or the config. 808 left this class on
+    /// 2026-10-06 ([`Self::AuthRejected`]): it parks here only after a
+    /// refreshed token was rejected too.
     Fatal,
 }
 
@@ -760,11 +850,13 @@ pub fn classify_disconnect(code: Option<DisconnectCode>) -> DisconnectClass {
         Some(DisconnectCode::AccessTokenExpired | DisconnectCode::AccessTokenInvalid) => {
             DisconnectClass::TokenStale
         }
-        Some(
-            DisconnectCode::DataApiSubscriptionRequired
-            | DisconnectCode::AuthenticationFailed
-            | DisconnectCode::ClientIdInvalid,
-        ) => DisconnectClass::Fatal,
+        // 808 is ambiguous (a bad token, or a bad client id): refresh once,
+        // park only when the refreshed token is rejected too (scope lock
+        // 2026-10-06). It sat in the Fatal arm below until then.
+        Some(DisconnectCode::AuthenticationFailed) => DisconnectClass::AuthRejected,
+        Some(DisconnectCode::DataApiSubscriptionRequired | DisconnectCode::ClientIdInvalid) => {
+            DisconnectClass::Fatal
+        }
         // 804 — the vendor's count for THIS connection is over its cap.
         //
         // Was in the Fatal arm above from 2026-08-14 to 2026-09-10. The note
@@ -3549,7 +3641,9 @@ pub fn dial_generation(connection_index: u8) -> u64 {
 pub enum ParkReason {
     /// 805 — re-dialing would kill a sibling. See [`DisconnectClass::PoolOverflow`].
     PoolOverflow,
-    /// An entitlement or credential error that needs operator action.
+    /// An entitlement or credential error that needs operator action: 806,
+    /// 810, or an 808 whose refreshed token was rejected too (or whose refresh
+    /// caps tripped; scope lock 2026-10-06).
     FatalDisconnect,
     /// 804 — the vendor's per-connection count was over its cap. The ONLY
     /// reason in this tree whose [`ParkReason::allows_one_respawn`] is `true`.
@@ -3603,11 +3697,15 @@ impl ParkReason {
     ///   fully-subscribed pool member that was working. The cost of being wrong
     ///   is another socket's shard, not one wasted dial.
     /// * [`Self::FatalDisconnect`] — the CREDENTIAL/ENTITLEMENT class. Every
-    ///   code that reaches it (806 data-API not subscribed, 808 auth failed,
-    ///   810 client id invalid) needs a human to fix the account or the config,
-    ///   so a re-dial re-presents the identical rejected credential and earns
-    ///   the identical rejection. **804 left this class on 2026-09-10** — see
-    ///   [`Self::SubscriptionRejected`] below.
+    ///   code that reaches it (806 data-API not subscribed, 810 client id
+    ///   invalid, or an 808 after a refreshed token was rejected too) needs a
+    ///   human to fix the account or the config, so a re-dial re-presents the
+    ///   identical rejected credential and earns the identical rejection.
+    ///   **804 left this class on 2026-09-10** — see
+    ///   [`Self::SubscriptionRejected`] below. A first 808 never reaches it
+    ///   since 2026-10-06: it refreshes the token once instead
+    ///   ([`DisconnectClass::AuthRejected`]), and its park comes only after
+    ///   that refresh, so the 804 respawn would only repeat it.
     /// * [`Self::Shutdown`] — we asked for it. Re-dialing during shutdown is
     ///   not recovery, it is refusing to stop.
     ///
@@ -3643,9 +3741,10 @@ impl ParkReason {
         match self {
             // Re-dialing kills a healthy sibling. Never.
             Self::PoolOverflow => false,
-            // Credential/entitlement (806/808/810). A fresh socket re-presents
-            // the identical rejected credential and earns the identical
-            // rejection. 804 LEFT this class on 2026-09-10 -- see below.
+            // Credential/entitlement (806/810, or 808 after a failed
+            // refresh). A fresh socket re-presents the identical rejected
+            // credential and earns the identical rejection. 804 LEFT this
+            // class on 2026-09-10 -- see below.
             Self::FatalDisconnect => false,
             // 804. The one `true` in this tree, and the docblock above
             // describes exactly this shape: neither overflow nor credential,
@@ -3708,11 +3807,15 @@ pub enum ReconnectReason {
     /// exactly what the damper should weigh, and no reason gains a flap
     /// exemption without its own dated quote.
     OverflowProbe,
+    /// Dhan closed the socket with 808 and the token is being refreshed once
+    /// before the redial (scope lock 2026-10-06). A fault, so it records a
+    /// flap.
+    AuthRejected,
 }
 
 impl ReconnectReason {
     /// Every reason, for pre-registration and the label-uniqueness pin.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::DialFailed,
         Self::SubscribeFailed,
         Self::Disconnected,
@@ -3720,6 +3823,7 @@ impl ReconnectReason {
         Self::IdleSilence,
         Self::ProbeClose,
         Self::OverflowProbe,
+        Self::AuthRejected,
     ];
 
     /// Stable lowercase tag for logs and metric labels.
@@ -3733,6 +3837,7 @@ impl ReconnectReason {
             Self::IdleSilence => "idle_silence",
             Self::ProbeClose => "probe_close",
             Self::OverflowProbe => "overflow_probe",
+            Self::AuthRejected => "auth_rejected",
         }
     }
 
@@ -3777,7 +3882,9 @@ pub enum SupervisorAction {
     SleepThenDial { delay_ms: u64 },
     /// As [`SupervisorAction::SleepThenDial`], but the caller MUST obtain a
     /// fresh access token before dialing — the previous socket died on a stale
-    /// one, so re-presenting it would simply be rejected again.
+    /// or rejected one (807/809, or a first 808), so re-presenting it would
+    /// simply be rejected again. After the refresh the caller reports it with
+    /// [`ConnectionSupervisor::note_token_refresh`], which may park instead.
     RefreshTokenThenDial { delay_ms: u64 },
     /// Send this connection's subscribe batches.
     Subscribe,
@@ -3905,6 +4012,16 @@ pub struct ConnectionSupervisor {
     /// ONLY to stamp the lifecycle audit row (`ws_event_audit.dhan_code`,
     /// `feed_gap_audit.dhan_code`); the supervisor never branches on it.
     last_disconnect_code: Option<u16>,
+    /// The open 808 episode, if any (scope lock 2026-10-06). `Copy`; written
+    /// only on the disconnect, backoff, park and refresh paths, never per
+    /// frame.
+    auth_reject: Option<AuthRejectEpisode>,
+    /// When this slot's recent 808 refreshes were scheduled, newest
+    /// overwriting oldest: a fixed ring, never a `Vec`. Bounds the refreshes
+    /// per [`AUTH_REJECT_WINDOW_MS`]. Survives episode ends on purpose.
+    auth_reject_refreshes: [Option<Instant>; AUTH_REJECT_MAX_REFRESHES_PER_WINDOW],
+    /// Next write position in [`Self::auth_reject_refreshes`].
+    auth_reject_cursor: u8,
 }
 
 impl ConnectionSupervisor {
@@ -3931,6 +4048,9 @@ impl ConnectionSupervisor {
             respawn_used: false,
             ever_delivered: false,
             last_disconnect_code: None,
+            auth_reject: None,
+            auth_reject_refreshes: [None; AUTH_REJECT_MAX_REFRESHES_PER_WINDOW],
+            auth_reject_cursor: 0,
         }
     }
 
@@ -4228,8 +4348,9 @@ impl ConnectionSupervisor {
                             endpoint = self.slot.endpoint.as_str(),
                             pool_index = self.slot.pool_index,
                             disconnect_code = code.map_or(0, |c| c.as_u16()),
-                            "Dhan closed this socket with a credential or entitlement error that \
-                             cannot self-heal — parking. Operator action required."
+                            "Dhan closed this socket with a credential or entitlement error \
+                             (806 or 810) that cannot self-heal — parking. Operator action \
+                             required."
                         );
                         self.park(ParkReason::FatalDisconnect, now)
                     }
@@ -4249,39 +4370,13 @@ impl ConnectionSupervisor {
                         self.park(ParkReason::SubscriptionRejected, now)
                     }
                     DisconnectClass::TokenStale => {
-                        // Floor the LADDER, then add this socket's stagger —
-                        // never the other way round (2026-08-11).
-                        //
-                        // This was `next_delay_ms().max(FLOOR)`, which reads
-                        // as "at least the floor" and is, but it also silently
-                        // discarded the jitter. The ladder's first three rungs
-                        // are 0/1000/2000 ms and the whole jitter range is
-                        // 0-375 ms, so every jittered value on those rungs is
-                        // below the 5,000 ms floor and `max` collapsed all of
-                        // them onto exactly 5,000.
-                        //
-                        // That is precisely the wrong behaviour for the event
-                        // this arm exists to handle: a token expiring kills
-                        // ALL sixteen sockets at once, so all sixteen slept an
-                        // identical 5,000 ms, woke in the same tick, and hit
-                        // the token endpoint together — a self-inflicted
-                        // thundering herd on the one code path guaranteed to
-                        // be entered by every connection simultaneously.
-                        //
-                        // Flooring the base first keeps the "wait at least
-                        // 5 s" intent and restores the fan-out on top of it.
-                        //
-                        // 2026-08-19: the base is now the DAMPED ladder value
-                        // rather than the raw rung, so a socket flapping on a
-                        // token that keeps going stale is slowed by the same
-                        // ceiling as any other flapper. The floor-then-jitter
-                        // ordering is unchanged.
-                        let damped = self.damped_decision_without_jitter(now);
-                        let base = damped.delay_ms.max(TOKEN_STALE_REDIAL_FLOOR_MS);
-                        let delay = base.saturating_add(self.jitter_ms());
-                        self.enter_backoff(ReconnectReason::TokenStale, damped.verdict, now);
+                        // Floor the LADDER, then add this socket's stagger:
+                        // see `token_floor_delay` (shared with a first 808).
+                        let (delay, verdict) = self.token_floor_delay(now);
+                        self.enter_backoff(ReconnectReason::TokenStale, verdict, now);
                         SupervisorAction::RefreshTokenThenDial { delay_ms: delay }
                     }
+                    DisconnectClass::AuthRejected => self.on_auth_rejected(now),
                     DisconnectClass::Transient => {
                         // THE CASCADE ARM. `connection.rs` reports a bare TCP
                         // reset as `Closed { code: None }`, which classifies
@@ -4484,6 +4579,172 @@ impl ConnectionSupervisor {
         reconnect_jitter_ms(self.slot.global_index)
     }
 
+    /// The delay for a redial that needs a fresh token first: 807/809
+    /// (`TokenStale`) and a first 808 (`AuthRejected`) share it, so both get
+    /// exactly the same floor and fan-out. Returns the delay and the damper
+    /// verdict for [`Self::enter_backoff`]. O(1), no allocation.
+    fn token_floor_delay(&self, now: Instant) -> (u64, FlapVerdict) {
+        // Floor the LADDER, then add this socket's stagger —
+        // never the other way round (2026-08-11).
+        //
+        // This was `next_delay_ms().max(FLOOR)`, which reads
+        // as "at least the floor" and is, but it also silently
+        // discarded the jitter. The ladder's first three rungs
+        // are 0/1000/2000 ms and the whole jitter range is
+        // 0-375 ms, so every jittered value on those rungs is
+        // below the 5,000 ms floor and `max` collapsed all of
+        // them onto exactly 5,000.
+        //
+        // That is precisely the wrong behaviour for the event
+        // this arm exists to handle: a token expiring kills
+        // ALL sixteen sockets at once, so all sixteen slept an
+        // identical 5,000 ms, woke in the same tick, and hit
+        // the token endpoint together — a self-inflicted
+        // thundering herd on the one code path guaranteed to
+        // be entered by every connection simultaneously.
+        //
+        // Flooring the base first keeps the "wait at least
+        // 5 s" intent and restores the fan-out on top of it.
+        //
+        // 2026-08-19: the base is now the DAMPED ladder value
+        // rather than the raw rung, so a socket flapping on a
+        // token that keeps going stale is slowed by the same
+        // ceiling as any other flapper. The floor-then-jitter
+        // ordering is unchanged.
+        let damped = self.damped_decision_without_jitter(now);
+        let base = damped.delay_ms.max(TOKEN_STALE_REDIAL_FLOOR_MS);
+        (base.saturating_add(self.jitter_ms()), damped.verdict)
+    }
+
+    /// 808 refresh-once (scope lock 2026-10-06): an 808 is a credential
+    /// rejection that a fresh token MAY cure. Refresh once and redial on the
+    /// same floored, jittered delay as 807; park only when the episode proves
+    /// the token is not the cause. O(1): a fixed four-slot ring, no heap.
+    fn on_auth_rejected(&mut self, now: Instant) -> SupervisorAction {
+        // (a) An 808 after a proven healthy session is a NEW episode: the
+        // previous token worked for a while, so its strikes do not carry over.
+        // Read before `enter_backoff`, which clears `healthy_since`.
+        if self.auth_reject.is_some() && self.healthy_duration_ms(now) >= MIN_HEALTHY_SESSION_MS {
+            self.auth_reject = None;
+        }
+        // (b) Start an episode on the first 808.
+        let episode = *self.auth_reject.get_or_insert(AuthRejectEpisode {
+            started_at: now,
+            hard_failures: 0,
+            verified_generation: None,
+        });
+        // (c) Refresh ceiling: the ring is full and its oldest entry is still
+        // inside the window, so this would be refresh number five.
+        let cursor = usize::from(self.auth_reject_cursor) % AUTH_REJECT_MAX_REFRESHES_PER_WINDOW;
+        let window = Duration::from_millis(AUTH_REJECT_WINDOW_MS);
+        if let Some(oldest) = self.auth_reject_refreshes[cursor]
+            && now.saturating_duration_since(oldest) < window
+        {
+            error!(
+                code = ErrorCode::WsGapDisconnectClassification.code_str(),
+                endpoint = self.slot.endpoint.as_str(),
+                pool_index = self.slot.pool_index,
+                disconnect_code = 808u16,
+                stage = "parked_refresh_ceiling",
+                refreshes_in_window = AUTH_REJECT_MAX_REFRESHES_PER_WINDOW,
+                "Dhan rejected this socket's login with 808 again after it already got a \
+                 fresh login several times in five minutes — parking. Operator action required."
+            );
+            return self.park(ParkReason::FatalDisconnect, now);
+        }
+        // (d) Refresh unavailable: too many outright failures, or the episode
+        // ran past its time bound without ever seeing a fresh token.
+        let age_ms = u64::try_from(
+            now.saturating_duration_since(episode.started_at)
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        if episode.hard_failures >= AUTH_REJECT_MAX_HARD_FAILURES
+            || (episode.verified_generation.is_none() && age_ms >= AUTH_REJECT_EPISODE_MAX_MS)
+        {
+            error!(
+                code = ErrorCode::WsGapDisconnectClassification.code_str(),
+                endpoint = self.slot.endpoint.as_str(),
+                pool_index = self.slot.pool_index,
+                disconnect_code = 808u16,
+                stage = "parked_refresh_unavailable",
+                hard_failures = episode.hard_failures,
+                episode_age_ms = age_ms,
+                "Dhan rejected this socket's login with 808 and a fresh login could not be \
+                 obtained — parking. Operator action required."
+            );
+            return self.park(ParkReason::FatalDisconnect, now);
+        }
+        // (e) Refresh once, then redial on the shared token floor.
+        self.auth_reject_refreshes[cursor] = Some(now);
+        self.auth_reject_cursor =
+            u8::try_from((cursor + 1) % AUTH_REJECT_MAX_REFRESHES_PER_WINDOW).unwrap_or(0);
+        let (delay, verdict) = self.token_floor_delay(now);
+        error!(
+            code = ErrorCode::WsGapDisconnectClassification.code_str(),
+            endpoint = self.slot.endpoint.as_str(),
+            pool_index = self.slot.pool_index,
+            disconnect_code = 808u16,
+            stage = "refresh_then_redial",
+            delay_ms = delay,
+            "Dhan rejected this socket's login with 808 — getting a fresh login once and \
+             redialling. If the fresh login is rejected too, this socket parks."
+        );
+        self.enter_backoff(ReconnectReason::AuthRejected, verdict, now);
+        SupervisorAction::RefreshTokenThenDial { delay_ms: delay }
+    }
+
+    /// What the shell must pass to the token refresh it runs for a
+    /// [`SupervisorAction::RefreshTokenThenDial`]. Only an 808 redial carries
+    /// the verified generation; a 807/809 redial never skips. O(1).
+    #[must_use]
+    pub fn token_refresh_request(&self) -> TokenRefreshRequest {
+        let skip_if_presented = if self.last_redial_reason == ReconnectReason::AuthRejected {
+            self.auth_reject
+                .and_then(|episode| episode.verified_generation)
+        } else {
+            None
+        };
+        TokenRefreshRequest { skip_if_presented }
+    }
+
+    /// Feed the outcome of the token refresh back BEFORE the dial. Returns a
+    /// park action when the refresh proves the 808 is not a stale token (the
+    /// rejected dial already presented the generation this episode verified);
+    /// otherwise `None` and the shell dials. Ignored outside an 808 redial, so
+    /// 807/809 behave exactly as before. O(1), no allocation.
+    pub fn note_token_refresh(
+        &mut self,
+        report: TokenRefreshReport,
+        now: Instant,
+    ) -> Option<SupervisorAction> {
+        if self.last_redial_reason != ReconnectReason::AuthRejected {
+            return None;
+        }
+        let episode = self.auth_reject.as_mut()?;
+        if episode.verified_generation == Some(report.presented) {
+            error!(
+                code = ErrorCode::WsGapDisconnectClassification.code_str(),
+                endpoint = self.slot.endpoint.as_str(),
+                pool_index = self.slot.pool_index,
+                disconnect_code = 808u16,
+                stage = "parked_fresh_token_rejected",
+                presented_generation = report.presented,
+                "Dhan rejected this socket's FRESH login with 808 too, so the login is not \
+                 the cause — parking. Operator action required."
+            );
+            return Some(self.park(ParkReason::FatalDisconnect, now));
+        }
+        match report.outcome {
+            TokenRefreshOutcome::Fresh { current } => episode.verified_generation = Some(current),
+            TokenRefreshOutcome::Deferred => {}
+            TokenRefreshOutcome::Failed | TokenRefreshOutcome::NotAttempted => {
+                episode.hard_failures = episode.hard_failures.saturating_add(1);
+            }
+        }
+        None
+    }
+
     /// Common tail for every retryable failure: compute the delay, count it,
     /// advance the ladder, drop into backoff.
     fn schedule_redial(&mut self, reason: ReconnectReason, now: Instant) -> SupervisorAction {
@@ -4511,6 +4772,12 @@ impl ConnectionSupervisor {
     }
 
     fn enter_backoff(&mut self, reason: ReconnectReason, verdict: FlapVerdict, now: Instant) {
+        // 808 refresh-once: a close other than 808 on a socket that delivered
+        // frames ends the episode (the fresh token worked). An 808 decides for
+        // itself in `on_auth_rejected`.
+        if self.proven_healthy && reason != ReconnectReason::AuthRejected {
+            self.auth_reject = None;
+        }
         // Recorded at the ONE site every redial passes through, so the audit
         // row cannot disagree with the counter beside it.
         self.last_redial_reason = reason;
@@ -4598,6 +4865,9 @@ impl ConnectionSupervisor {
     /// direction: a reader checking whether a respawn is observable would have
     /// concluded it is not, and gone to build a counter that already exists.
     fn park(&mut self, reason: ParkReason, now: Instant) -> SupervisorAction {
+        // Every park ends an 808 episode: a respawn or a probe release starts
+        // clean.
+        self.auth_reject = None;
         if respawn_budget_allows(reason.allows_one_respawn(), self.respawn_used) {
             // One-shot: consumed BEFORE the redial, so a second fatal on this
             // slot finds the budget spent and falls through to the park below.
@@ -8227,7 +8497,11 @@ pub enum ConnectionExit {
 /// itself and the one-second idle tick.
 ///
 /// `refresh_token` is invoked before re-dialing after a token-staleness
-/// disconnect; supply a no-op when the transport does not carry a token.
+/// disconnect (807/809) or an 808 (scope lock 2026-10-06). It receives the
+/// supervisor's [`TokenRefreshRequest`] and must return the generation the
+/// rejected dial presented plus how the refresh ended; the supervisor parks
+/// an 808 slot whose fresh token was rejected too. A transport that carries
+/// no token returns [`TokenRefreshOutcome::NotAttempted`].
 // Every decision this executes is unit-tested via `ConnectionSupervisor`, and
 // the loop itself is driven end-to-end against a fake transport by the
 // `test_run_connection_*` cases below — dial retry, subscribe failure, 805,
@@ -8242,8 +8516,8 @@ pub async fn run_connection<S, K, F, Fut>(
 where
     S: DhanFeedSocket,
     K: FrameSink + ?Sized,
-    F: FnMut() -> Fut + Send,
-    Fut: std::future::Future<Output = ()> + Send,
+    F: FnMut(TokenRefreshRequest) -> Fut + Send,
+    Fut: std::future::Future<Output = TokenRefreshReport> + Send,
 {
     run_connection_with_commands(socket, supervisor, guard, sink, refresh_token, None).await
 }
@@ -8399,8 +8673,8 @@ pub async fn run_connection_with_commands<S, K, F, Fut>(
 where
     S: DhanFeedSocket,
     K: FrameSink + ?Sized,
-    F: FnMut() -> Fut + Send,
-    Fut: std::future::Future<Output = ()> + Send,
+    F: FnMut(TokenRefreshRequest) -> Fut + Send,
+    Fut: std::future::Future<Output = TokenRefreshReport> + Send,
 {
     let endpoint = supervisor.slot().endpoint.as_str();
     let pool_index = supervisor.slot().pool_index;
@@ -8521,10 +8795,18 @@ where
                 );
                 sleep_unless_stopped(Duration::from_millis(delay_ms), &*sink).await;
                 // No credential round trip for a socket that is about to park.
+                // 808 refresh-once: the outcome is reported BEFORE the dial,
+                // so a fresh token that was already rejected parks here
+                // instead of dialling once more.
+                let mut parked = None;
                 if !sink.stop_requested() {
-                    refresh_token().await;
+                    let report = refresh_token(supervisor.token_refresh_request()).await;
+                    parked = supervisor.note_token_refresh(report, Instant::now());
                 }
-                action = supervisor.on_event(ConnEvent::BeginDial, Instant::now());
+                action = match parked {
+                    Some(park) => park,
+                    None => supervisor.on_event(ConnEvent::BeginDial, Instant::now()),
+                };
             }
 
             SupervisorAction::Dial => {
@@ -10906,7 +11188,6 @@ mod tests {
     fn test_classify_disconnect_credential_and_entitlement_errors_are_fatal() {
         for code in [
             DisconnectCode::DataApiSubscriptionRequired,
-            DisconnectCode::AuthenticationFailed,
             DisconnectCode::ClientIdInvalid,
         ] {
             assert_eq!(
@@ -11581,7 +11862,6 @@ mod tests {
     fn test_supervisor_fatal_disconnect_parks() {
         let now = t0();
         for code in [
-            DisconnectCode::AuthenticationFailed,
             DisconnectCode::ClientIdInvalid,
             DisconnectCode::DataApiSubscriptionRequired,
         ] {
@@ -11617,6 +11897,644 @@ mod tests {
                 assert!(delay_ms > reconnect_delay_ms(0));
             }
             other => panic!("expected RefreshTokenThenDial, got {other:?}"),
+        }
+    }
+
+    // --- 808 refresh-once (scope lock 2026-10-06) ---------------------
+
+    /// Dial and finish the dial, with no frame: the shape of an 808 that
+    /// arrives on the handshake.
+    fn dial_no_frames(s: &mut ConnectionSupervisor, now: Instant) {
+        assert_eq!(
+            s.on_event(ConnEvent::BeginDial, now),
+            SupervisorAction::Dial
+        );
+        let _ = s.on_event(ConnEvent::DialSucceeded, now);
+    }
+
+    fn close_808(s: &mut ConnectionSupervisor, now: Instant) -> SupervisorAction {
+        s.on_event(
+            ConnEvent::Disconnected {
+                code: Some(DisconnectCode::AuthenticationFailed),
+            },
+            now,
+        )
+    }
+
+    fn refresh_report(presented: u64, outcome: TokenRefreshOutcome) -> TokenRefreshReport {
+        TokenRefreshReport { presented, outcome }
+    }
+
+    fn assert_refresh(action: &SupervisorAction) {
+        assert!(
+            matches!(action, SupervisorAction::RefreshTokenThenDial { .. }),
+            "an 808 that may be cured by a fresh token must refresh then dial, got {action:?}"
+        );
+    }
+
+    fn assert_parked_fatal(s: &ConnectionSupervisor, action: &SupervisorAction) {
+        assert_eq!(
+            *action,
+            SupervisorAction::Park {
+                reason: ParkReason::FatalDisconnect
+            }
+        );
+        assert_eq!(s.phase(), ConnPhase::Parked);
+        assert_eq!(s.park_reason(), Some(ParkReason::FatalDisconnect));
+    }
+
+    /// One 808 episode that has verified generation `verified`: the first 808
+    /// refreshed and the refresh saw the token move to `verified`.
+    fn episode_with_verified(now: Instant, verified: u64) -> ConnectionSupervisor {
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+        dial_no_frames(&mut s, now);
+        assert_refresh(&close_808(&mut s, now));
+        assert_eq!(
+            s.note_token_refresh(
+                refresh_report(
+                    verified.saturating_sub(1),
+                    TokenRefreshOutcome::Fresh { current: verified }
+                ),
+                now
+            ),
+            None
+        );
+        s
+    }
+
+    #[test]
+    fn test_classify_disconnect_808_is_auth_rejected_and_806_810_stay_fatal() {
+        assert_eq!(
+            classify_disconnect(Some(DisconnectCode::AuthenticationFailed)),
+            DisconnectClass::AuthRejected
+        );
+        for code in [
+            DisconnectCode::DataApiSubscriptionRequired,
+            DisconnectCode::ClientIdInvalid,
+        ] {
+            assert_eq!(
+                classify_disconnect(Some(code)),
+                DisconnectClass::Fatal,
+                "{code:?}"
+            );
+        }
+        assert_eq!(ReconnectReason::AuthRejected.as_str(), "auth_rejected");
+        assert!(ReconnectReason::ALL.contains(&ReconnectReason::AuthRejected));
+    }
+
+    #[test]
+    fn test_first_808_refreshes_then_dials_with_the_token_floor() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+        dial_no_frames(&mut s, now);
+        // Slot 0 carries no stagger, so the delay is exactly the 807 floor.
+        assert_eq!(
+            close_808(&mut s, now),
+            SupervisorAction::RefreshTokenThenDial {
+                delay_ms: TOKEN_STALE_REDIAL_FLOOR_MS
+            }
+        );
+        assert_eq!(s.last_redial_reason(), ReconnectReason::AuthRejected);
+        assert_eq!(s.phase(), ConnPhase::Backoff);
+        assert_eq!(
+            s.token_refresh_request(),
+            TokenRefreshRequest {
+                skip_if_presented: None
+            },
+            "a first 808 has no verified generation to skip"
+        );
+        assert_eq!(
+            s.note_token_refresh(
+                refresh_report(0, TokenRefreshOutcome::Fresh { current: 1 }),
+                now
+            ),
+            None,
+            "a fresh token is dialled"
+        );
+        assert_eq!(
+            s.on_event(ConnEvent::BeginDial, now),
+            SupervisorAction::Dial
+        );
+    }
+
+    #[test]
+    fn test_second_808_presenting_the_verified_generation_parks() {
+        let now = t0();
+        let mut s = episode_with_verified(now, 1);
+        let later = now + Duration::from_secs(6);
+        dial_no_frames(&mut s, later);
+        assert_refresh(&close_808(&mut s, later));
+        assert_eq!(
+            s.token_refresh_request(),
+            TokenRefreshRequest {
+                skip_if_presented: Some(1)
+            }
+        );
+        let action = s
+            .note_token_refresh(refresh_report(1, TokenRefreshOutcome::NotAttempted), later)
+            .expect("the fresh token was rejected too: park");
+        assert_parked_fatal(&s, &action);
+        assert_eq!(
+            s.on_event(ConnEvent::BeginDial, later),
+            SupervisorAction::Continue,
+            "nothing dials after the park"
+        );
+    }
+
+    #[test]
+    fn test_808_with_a_new_generation_after_verification_is_a_new_strike() {
+        let now = t0();
+        let mut s = episode_with_verified(now, 1);
+        let later = now + Duration::from_secs(6);
+        dial_no_frames(&mut s, later);
+        assert_refresh(&close_808(&mut s, later));
+        // A sibling renewed meanwhile: this dial presented generation 2, not
+        // the verified 1, so the closure renewed and saw 3.
+        assert_eq!(
+            s.note_token_refresh(
+                refresh_report(2, TokenRefreshOutcome::Fresh { current: 3 }),
+                later
+            ),
+            None
+        );
+        let again = later + Duration::from_secs(6);
+        dial_no_frames(&mut s, again);
+        assert_refresh(&close_808(&mut s, again));
+        assert_eq!(
+            s.token_refresh_request(),
+            TokenRefreshRequest {
+                skip_if_presented: Some(3)
+            }
+        );
+        let action = s
+            .note_token_refresh(refresh_report(3, TokenRefreshOutcome::NotAttempted), again)
+            .expect("the newly verified token was rejected: park");
+        assert_parked_fatal(&s, &action);
+    }
+
+    #[test]
+    fn test_808_hard_failures_are_bounded() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+        let mut at = now;
+        for strike in 0..AUTH_REJECT_MAX_HARD_FAILURES {
+            dial_no_frames(&mut s, at);
+            assert_refresh(&close_808(&mut s, at));
+            assert_eq!(
+                s.note_token_refresh(refresh_report(0, TokenRefreshOutcome::Failed), at),
+                None,
+                "failure {strike} still dials"
+            );
+            at += Duration::from_secs(10);
+        }
+        dial_no_frames(&mut s, at);
+        let action = close_808(&mut s, at);
+        assert_parked_fatal(&s, &action);
+    }
+
+    #[test]
+    fn test_808_mint_cooldown_deferrals_do_not_count_but_the_episode_is_time_bounded() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+        // Four deferrals inside the episode bound: none counts as a failure,
+        // and three of them would already have parked a failing slot.
+        for secs in [0u64, 100, 200, 299] {
+            let at = now + Duration::from_secs(secs);
+            dial_no_frames(&mut s, at);
+            assert_refresh(&close_808(&mut s, at));
+            assert_eq!(
+                s.note_token_refresh(refresh_report(0, TokenRefreshOutcome::Deferred), at),
+                None
+            );
+        }
+        // Past the bound with no verified fresh token: park, even though no
+        // refresh failed outright and the ceiling window has moved on.
+        let at = now + Duration::from_millis(AUTH_REJECT_EPISODE_MAX_MS);
+        dial_no_frames(&mut s, at);
+        let action = close_808(&mut s, at);
+        assert_parked_fatal(&s, &action);
+    }
+
+    #[test]
+    fn test_stacked_data_then_808_does_not_clear_the_episode() {
+        let now = t0();
+        let mut s = episode_with_verified(now, 1);
+        let later = now + Duration::from_secs(6);
+        dial_no_frames(&mut s, later);
+        let _ = s.on_event(ConnEvent::SubscribeAcked, later);
+        // A frame stacked ahead of the 808 in the same read.
+        let _ = s.on_event(ConnEvent::FrameReceived, later);
+        assert_refresh(&close_808(&mut s, later));
+        assert_eq!(
+            s.token_refresh_request().skip_if_presented,
+            Some(1),
+            "a frame stacked ahead of the 808 is not a healthy session"
+        );
+        let action = s
+            .note_token_refresh(refresh_report(1, TokenRefreshOutcome::NotAttempted), later)
+            .expect("park");
+        assert_parked_fatal(&s, &action);
+    }
+
+    #[test]
+    fn test_808_after_a_proven_healthy_session_starts_a_new_episode() {
+        let now = t0();
+        let mut s = episode_with_verified(now, 1);
+        let later = now + Duration::from_secs(6);
+        dial_no_frames(&mut s, later);
+        let _ = s.on_event(ConnEvent::SubscribeAcked, later);
+        let _ = s.on_event(ConnEvent::FrameReceived, later);
+        let rejected_at = later + Duration::from_millis(MIN_HEALTHY_SESSION_MS + 1_000);
+        assert_refresh(&close_808(&mut s, rejected_at));
+        assert_eq!(
+            s.token_refresh_request().skip_if_presented,
+            None,
+            "the token worked for a healthy session: a new episode starts clean"
+        );
+        assert_eq!(
+            s.note_token_refresh(
+                refresh_report(1, TokenRefreshOutcome::Fresh { current: 2 }),
+                rejected_at
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_non_808_close_after_frames_clears_the_episode() {
+        let now = t0();
+        let mut s = episode_with_verified(now, 1);
+        let later = now + Duration::from_secs(6);
+        dial_no_frames(&mut s, later);
+        let _ = s.on_event(ConnEvent::SubscribeAcked, later);
+        let _ = s.on_event(ConnEvent::FrameReceived, later);
+        // The fresh token worked; a later plain reset ends the episode.
+        let _ = s.on_event(ConnEvent::Disconnected { code: None }, later);
+        assert!(s.auth_reject.is_none());
+        let again = later + Duration::from_secs(10);
+        dial_no_frames(&mut s, again);
+        assert_refresh(&close_808(&mut s, again));
+        assert_eq!(s.token_refresh_request().skip_if_presented, None);
+    }
+
+    #[test]
+    fn test_808_episode_is_cleared_by_an_805_park_and_probe_release() {
+        // Every park ends the episode, so a probe release (which redials a
+        // slot parked for 805) or a respawn starts clean. The park is called
+        // directly so the test does not touch the process-wide 805 state.
+        let now = t0();
+        let mut s = episode_with_verified(now, 1);
+        assert!(s.auth_reject.is_some());
+        let action = s.park(ParkReason::PoolOverflow, now);
+        assert_eq!(
+            action,
+            SupervisorAction::Park {
+                reason: ParkReason::PoolOverflow
+            }
+        );
+        assert!(s.auth_reject.is_none(), "an 805 park ends the 808 episode");
+
+        // The 804 respawn path also passes through `park`.
+        let mut r = episode_with_verified(now, 1);
+        let later = now + Duration::from_secs(6);
+        dial_no_frames(&mut r, later);
+        let _ = r.on_event(
+            ConnEvent::Disconnected {
+                code: Some(DisconnectCode::InstrumentsExceedLimit),
+            },
+            later,
+        );
+        assert!(
+            r.auth_reject.is_none(),
+            "a respawn starts without the episode"
+        );
+    }
+
+    #[test]
+    fn test_808_refresh_ceiling_per_window() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+        // Every refresh "works" (a new generation each time) and each new
+        // token is rejected again: only the ceiling stops it.
+        let mut generation = 10u64;
+        let mut at = now;
+        for _ in 0..AUTH_REJECT_MAX_REFRESHES_PER_WINDOW {
+            dial_no_frames(&mut s, at);
+            assert_refresh(&close_808(&mut s, at));
+            assert_eq!(
+                s.note_token_refresh(
+                    refresh_report(
+                        generation,
+                        TokenRefreshOutcome::Fresh {
+                            current: generation + 1
+                        }
+                    ),
+                    at
+                ),
+                None
+            );
+            generation += 2;
+            at += Duration::from_secs(10);
+        }
+        // A fifth 808 inside the window parks.
+        dial_no_frames(&mut s, at);
+        let action = close_808(&mut s, at);
+        assert_parked_fatal(&s, &action);
+
+        // A fifth refresh OUTSIDE the window is allowed.
+        let mut w = sup(DhanEndpointType::MainFeed, 0, now);
+        let mut generation = 10u64;
+        for secs in [0u64, 10, 20, 30] {
+            let at = now + Duration::from_secs(secs);
+            dial_no_frames(&mut w, at);
+            assert_refresh(&close_808(&mut w, at));
+            let _ = w.note_token_refresh(
+                refresh_report(
+                    generation,
+                    TokenRefreshOutcome::Fresh {
+                        current: generation + 1,
+                    },
+                ),
+                at,
+            );
+            generation += 2;
+        }
+        let at = now + Duration::from_millis(AUTH_REJECT_WINDOW_MS);
+        dial_no_frames(&mut w, at);
+        assert_refresh(&close_808(&mut w, at));
+    }
+
+    #[test]
+    fn test_807_and_809_ignore_note_token_refresh_and_never_park() {
+        let now = t0();
+        for code in [
+            DisconnectCode::AccessTokenExpired,
+            DisconnectCode::AccessTokenInvalid,
+        ] {
+            // Including inside an open 808 episode with a verified token.
+            let mut s = episode_with_verified(now, 1);
+            let mut at = now;
+            for _ in 0..12 {
+                at += Duration::from_secs(10);
+                dial_no_frames(&mut s, at);
+                assert_refresh(&s.on_event(ConnEvent::Disconnected { code: Some(code) }, at));
+                assert_eq!(
+                    s.token_refresh_request().skip_if_presented,
+                    None,
+                    "{code:?}"
+                );
+                for outcome in [
+                    TokenRefreshOutcome::Failed,
+                    TokenRefreshOutcome::NotAttempted,
+                ] {
+                    assert_eq!(s.note_token_refresh(refresh_report(1, outcome), at), None);
+                }
+            }
+            assert_ne!(s.phase(), ConnPhase::Parked, "{code:?} never parks");
+        }
+        // No episode at all: ignored too.
+        let mut fresh = sup(DhanEndpointType::MainFeed, 0, now);
+        assert_eq!(
+            fresh.note_token_refresh(refresh_report(0, TokenRefreshOutcome::Failed), now),
+            None
+        );
+    }
+
+    #[test]
+    fn test_token_refresh_request_carries_the_verified_generation_only_on_an_808_redial() {
+        let now = t0();
+        // No episode: nothing to skip.
+        let idle = sup(DhanEndpointType::MainFeed, 0, now);
+        assert_eq!(idle.token_refresh_request().skip_if_presented, None);
+        // An 808 redial with a verified generation carries it.
+        let mut s = episode_with_verified(now, 4);
+        let later = now + Duration::from_secs(6);
+        dial_no_frames(&mut s, later);
+        assert_refresh(&close_808(&mut s, later));
+        assert_eq!(s.token_refresh_request().skip_if_presented, Some(4));
+        // The same episode, but the redial is for 807: never skip.
+        let mut t = episode_with_verified(now, 4);
+        dial_no_frames(&mut t, later);
+        assert_refresh(&t.on_event(
+            ConnEvent::Disconnected {
+                code: Some(DisconnectCode::AccessTokenExpired),
+            },
+            later,
+        ));
+        assert_eq!(t.token_refresh_request().skip_if_presented, None);
+    }
+
+    #[test]
+    fn test_808_never_sets_rotation_halted_or_engages_the_overflow_episode() {
+        // Behaviour: every 808 park is a FatalDisconnect, never PoolOverflow
+        // (the reason the 805 recovery and the rotation breaker key on).
+        let now = t0();
+        let mut s = sup(DhanEndpointType::Depth200, 0, now);
+        for _ in 0..AUTH_REJECT_MAX_HARD_FAILURES {
+            dial_no_frames(&mut s, now);
+            assert_refresh(&close_808(&mut s, now));
+            let _ = s.note_token_refresh(refresh_report(0, TokenRefreshOutcome::Failed), now);
+        }
+        dial_no_frames(&mut s, now);
+        let action = close_808(&mut s, now);
+        assert_parked_fatal(&s, &action);
+        // Source: the 808 path never names the 805 machinery.
+        let src = include_str!("pool_supervisor.rs");
+        let prod = src.split(concat!("#[cfg(", "test)]")).next().unwrap_or(src);
+        for name in ["fn on_auth_rejected(", "pub fn note_token_refresh("] {
+            let at = prod.find(name).expect("808 fn");
+            let end = prod[at..].find("\n    }\n").expect("fn end");
+            let body = &prod[at..at + end];
+            for banned in [
+                "ROTATION_HALTED",
+                "OVERFLOW_ENGAGED",
+                "ParkReason::PoolOverflow",
+                "overflow_episode_",
+            ] {
+                assert!(!body.contains(banned), "{name} must not touch {banned}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_sixteen_sockets_rejected_808_together_fan_out_above_the_floor() {
+        let now = t0();
+        let mut delays = Vec::new();
+        for endpoint in DhanEndpointType::ALL {
+            for pool_index in 0..endpoint.max_connections() {
+                let mut s = sup(endpoint, pool_index, now);
+                dial_no_frames(&mut s, now);
+                match close_808(&mut s, now) {
+                    SupervisorAction::RefreshTokenThenDial { delay_ms } => delays.push(delay_ms),
+                    other => panic!("808 must refresh the token then dial, got {other:?}"),
+                }
+            }
+        }
+        assert_eq!(delays.len(), 16);
+        let unique: BTreeSet<u64> = delays.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            16,
+            "sixteen 808s must not wake together: {delays:?}"
+        );
+        assert!(delays.iter().all(|d| *d >= TOKEN_STALE_REDIAL_FLOOR_MS));
+        assert_eq!(
+            delays.iter().max().copied().unwrap_or(0),
+            TOKEN_STALE_REDIAL_FLOOR_MS + 15 * RECONNECT_JITTER_STEP_MS
+        );
+    }
+
+    #[test]
+    fn token_floor_delay_is_shared_by_807_and_808() {
+        let now = t0();
+        for endpoint in DhanEndpointType::ALL {
+            for pool_index in 0..endpoint.max_connections() {
+                let mut a = sup(endpoint, pool_index, now);
+                let mut b = sup(endpoint, pool_index, now);
+                dial_no_frames(&mut a, now);
+                dial_no_frames(&mut b, now);
+                let stale = a.on_event(
+                    ConnEvent::Disconnected {
+                        code: Some(DisconnectCode::AccessTokenExpired),
+                    },
+                    now,
+                );
+                assert_eq!(stale, close_808(&mut b, now), "{endpoint:?}/{pool_index}");
+            }
+        }
+        let src = include_str!("pool_supervisor.rs");
+        let prod = src.split(concat!("#[cfg(", "test)]")).next().unwrap_or(src);
+        let stale_arm = prod
+            .find("DisconnectClass::TokenStale => {")
+            .expect("807 arm");
+        assert!(prod[stale_arm..stale_arm + 400].contains("self.token_floor_delay(now)"));
+        let at = prod.find("fn on_auth_rejected(").expect("808 fn");
+        let end = prod[at..].find("\n    }\n").expect("fn end");
+        assert!(prod[at..at + end].contains("self.token_floor_delay(now)"));
+    }
+
+    #[test]
+    fn the_frame_path_does_not_touch_the_auth_reject_episode() {
+        let src = include_str!("pool_supervisor.rs");
+        let prod = src.split(concat!("#[cfg(", "test)]")).next().unwrap_or(src);
+        let at = prod
+            .find("ConnEvent::FrameReceived => {")
+            .expect("frame arm");
+        let end = prod[at..]
+            .find("ConnEvent::KeepAliveReceived =>")
+            .expect("next arm");
+        let arm = &prod[at..at + end];
+        assert!(
+            !arm.contains("auth_reject"),
+            "the per-frame arm must not read the 808 episode"
+        );
+        assert!(!arm.contains("on_auth_rejected"));
+    }
+
+    #[test]
+    fn refresh_arm_reports_the_outcome_before_begin_dial() {
+        let src = include_str!("pool_supervisor.rs");
+        let prod = src.split(concat!("#[cfg(", "test)]")).next().unwrap_or(src);
+        let at = prod
+            .find("SupervisorAction::RefreshTokenThenDial { delay_ms } => {")
+            .expect("shell refresh arm");
+        let end = prod[at..]
+            .find("SupervisorAction::Dial => {")
+            .expect("next arm");
+        let arm = &prod[at..at + end];
+        let refresh = arm
+            .find("refresh_token(supervisor.token_refresh_request()).await")
+            .expect("the request is passed to the refresh");
+        let note = arm
+            .find("supervisor.note_token_refresh(report, Instant::now())")
+            .expect("the outcome is reported");
+        let dial = arm.find("ConnEvent::BeginDial").expect("then the dial");
+        assert!(refresh < note && note < dial, "refresh, report, then dial");
+        assert!(
+            arm.contains("Some(park) => park,"),
+            "a park from the report wins over the dial"
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn prop_808_refreshes_are_bounded_and_nothing_dials_after_a_park(
+            steps in prop::collection::vec((0u64..120_000, 0u8..3, 0u8..3, 0u8..4, any::<bool>()), 1..80),
+        ) {
+            let start = t0();
+            let mut s = sup(DhanEndpointType::MainFeed, 0, start);
+            let mut at = start;
+            let mut generation = 0u64;
+            let mut refreshes: Vec<Instant> = Vec::new();
+            let mut parked = false;
+            for (gap_ms, frames, close, outcome, sibling_renewed) in steps {
+                at += Duration::from_millis(gap_ms);
+                let dial = s.on_event(ConnEvent::BeginDial, at);
+                if parked {
+                    prop_assert_ne!(dial, SupervisorAction::Dial, "dialled after a park");
+                    continue;
+                }
+                prop_assert_eq!(dial, SupervisorAction::Dial);
+                let _ = s.on_event(ConnEvent::DialSucceeded, at);
+                let _ = s.on_event(ConnEvent::SubscribeAcked, at);
+                let close_at = match frames {
+                    0 => at,
+                    1 => {
+                        let _ = s.on_event(ConnEvent::FrameReceived, at);
+                        at
+                    }
+                    _ => {
+                        let _ = s.on_event(ConnEvent::FrameReceived, at);
+                        at + Duration::from_millis(MIN_HEALTHY_SESSION_MS + 1)
+                    }
+                };
+                at = close_at;
+                let code = match close {
+                    0 => Some(DisconnectCode::AuthenticationFailed),
+                    1 => Some(DisconnectCode::AccessTokenExpired),
+                    _ => None,
+                };
+                let action = s.on_event(ConnEvent::Disconnected { code }, at);
+                if let SupervisorAction::Park { .. } = action {
+                    parked = true;
+                    continue;
+                }
+                if let SupervisorAction::RefreshTokenThenDial { .. } = action {
+                    if code == Some(DisconnectCode::AuthenticationFailed) {
+                        refreshes.push(at);
+                        let window = Duration::from_millis(AUTH_REJECT_WINDOW_MS);
+                        let in_window = refreshes
+                            .iter()
+                            .filter(|t| at.saturating_duration_since(**t) < window)
+                            .count();
+                        prop_assert!(in_window <= AUTH_REJECT_MAX_REFRESHES_PER_WINDOW);
+                    }
+                    if sibling_renewed {
+                        generation += 1;
+                    }
+                    let request = s.token_refresh_request();
+                    let report = if request.skip_if_presented == Some(generation) {
+                        refresh_report(generation, TokenRefreshOutcome::NotAttempted)
+                    } else {
+                        let presented = generation;
+                        let outcome = match outcome {
+                            0 => {
+                                generation += 1;
+                                TokenRefreshOutcome::Fresh { current: generation }
+                            }
+                            1 => TokenRefreshOutcome::Deferred,
+                            2 => TokenRefreshOutcome::Failed,
+                            _ => TokenRefreshOutcome::NotAttempted,
+                        };
+                        refresh_report(presented, outcome)
+                    };
+                    if let Some(park) = s.note_token_refresh(report, at) {
+                        let is_park = matches!(park, SupervisorAction::Park { .. });
+                        prop_assert!(is_park, "a refresh report only ever parks");
+                        parked = true;
+                    }
+                }
+            }
         }
     }
 
@@ -12357,9 +13275,11 @@ mod tests {
         // re-dial is actively harmful, not merely useless:
         //   PoolOverflow  — Dhan kills the OLDEST socket, so a re-dial costs a
         //                   healthy fully-subscribed sibling.
-        //   FatalDisconnect — 806/808/810 are credential/entitlement and repeat
+        //   FatalDisconnect — 806/810 are credential/entitlement and repeat
         //                   verbatim: a fresh socket re-presents the identical
         //                   rejected credential and earns the identical answer.
+        //                   (808 refreshes the token once before it parks:
+        //                   scope lock 2026-10-06.)
         //   Shutdown      — we asked to stop.
         //
         // The fourth is the one exception, and it is an exception for a reason
@@ -12445,7 +13365,9 @@ mod tests {
 
     #[test]
     fn test_credential_class_fatal_never_respawns_it_parks_on_the_first_fatal() {
-        // 806 / 808 / 810 are credential + entitlement: a re-dial re-presents
+        // 806 / 810 are credential + entitlement: a re-dial re-presents
+        // (808 refreshes the token once first and has its own tests; scope
+        // lock 2026-10-06)
         // the identical rejected credential and earns the identical rejection.
         //
         // 804 LEFT this list on 2026-09-10 and is covered by its own test
@@ -12456,7 +13378,6 @@ mod tests {
         let now = t0();
         for code in [
             DisconnectCode::DataApiSubscriptionRequired,
-            DisconnectCode::AuthenticationFailed,
             DisconnectCode::ClientIdInvalid,
         ] {
             let mut s = sup(DhanEndpointType::Depth20, 1, now);
@@ -12551,7 +13472,7 @@ mod tests {
         let now = t0();
         for reason_code in [
             Some(DisconnectCode::ExceededActiveConnections),
-            Some(DisconnectCode::AuthenticationFailed),
+            Some(DisconnectCode::ClientIdInvalid),
         ] {
             let mut s = sup(DhanEndpointType::MainFeed, 0, now);
             let _ = s.on_event(ConnEvent::BeginDial, now);
@@ -14075,7 +14996,7 @@ mod tests {
                             // Terminator: a fatal code parks the loop, so an
                             // exhausted script ends the test instead of hanging.
                             SocketEvent::Closed {
-                                code: Some(DisconnectCode::AuthenticationFailed),
+                                code: Some(DisconnectCode::ClientIdInvalid),
                             },
                         );
                         if matches!(event, SocketEvent::Frame(_)) {
@@ -14089,7 +15010,7 @@ mod tests {
                         event
                     }
                     Err(_) => SocketEvent::Closed {
-                        code: Some(DisconnectCode::AuthenticationFailed),
+                        code: Some(DisconnectCode::ClientIdInvalid),
                     },
                 }
             }
@@ -14113,6 +15034,18 @@ mod tests {
                     on_frame(frame);
                 }
             }
+        }
+    }
+
+    /// The refresh closure for a transport with no token: reports an outright
+    /// failure, so an 808 episode counts it as a hard failure.
+    fn no_refresh()
+    -> impl FnMut(TokenRefreshRequest) -> std::future::Ready<TokenRefreshReport> + Send {
+        |_request| {
+            std::future::ready(TokenRefreshReport {
+                presented: 0,
+                outcome: TokenRefreshOutcome::Failed,
+            })
         }
     }
 
@@ -14411,7 +15344,7 @@ mod tests {
             sup(DhanEndpointType::MainFeed, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
         )
         .await;
 
@@ -14470,7 +15403,7 @@ mod tests {
             sup(DhanEndpointType::Depth200, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -14516,7 +15449,7 @@ mod tests {
             sup(DhanEndpointType::Depth200, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -14575,7 +15508,7 @@ mod tests {
             sup(DhanEndpointType::MainFeed, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             None,
         ));
 
@@ -14655,7 +15588,7 @@ mod tests {
             sup(DhanEndpointType::Depth200, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -14713,7 +15646,7 @@ mod tests {
             sup(DhanEndpointType::Depth200, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -14787,7 +15720,7 @@ mod tests {
             sup(DhanEndpointType::Depth200, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -14836,7 +15769,7 @@ mod tests {
             sup(DhanEndpointType::Depth200, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -14878,7 +15811,7 @@ mod tests {
             sup(DhanEndpointType::Depth200, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -14919,7 +15852,7 @@ mod tests {
             sup(DhanEndpointType::Depth200, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -14981,7 +15914,7 @@ mod tests {
             sup(DhanEndpointType::Depth200, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -15087,7 +16020,7 @@ mod tests {
                             SocketEvent::KeepAlive
                         }
                         None => SocketEvent::Closed {
-                            code: Some(DisconnectCode::AuthenticationFailed),
+                            code: Some(DisconnectCode::ClientIdInvalid),
                         },
                     }
                 }
@@ -15125,7 +16058,7 @@ mod tests {
             sup(DhanEndpointType::Depth200, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -15187,7 +16120,7 @@ mod tests {
             sup(DhanEndpointType::MainFeed, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
         )
         .await;
 
@@ -15240,7 +16173,7 @@ mod tests {
             sup(DhanEndpointType::Depth200, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -15313,7 +16246,7 @@ mod tests {
             sup(DhanEndpointType::Depth200, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -15363,7 +16296,7 @@ mod tests {
                 sup(DhanEndpointType::Depth200, 0, t0()),
                 guard,
                 std::sync::Arc::new(RecordingSink::default()),
-                || async {},
+                no_refresh(),
                 Some(rx),
             )
             .await;
@@ -15454,7 +16387,7 @@ mod tests {
             sup(DhanEndpointType::Depth200, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -15507,7 +16440,7 @@ mod tests {
             sup(DhanEndpointType::Depth200, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -15555,7 +16488,7 @@ mod tests {
             sup(DhanEndpointType::MainFeed, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -15633,7 +16566,7 @@ mod tests {
             sup(DhanEndpointType::MainFeed, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -15700,7 +16633,7 @@ mod tests {
             sup(DhanEndpointType::MainFeed, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -15781,7 +16714,7 @@ mod tests {
             sup(DhanEndpointType::MainFeed, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -16000,7 +16933,7 @@ mod tests {
             sup(endpoint, 0, t0()),
             guard,
             sink,
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -16355,6 +17288,9 @@ mod tests {
                 "idle_silence",
                 "probe_close",
                 "overflow_probe",
+                // Scope lock 2026-10-06 (808 refresh-once): a fault
+                // recovery, never a subscription change.
+                "auth_rejected",
             ],
             "a new redial reason needs a dated quote in the scope lock first"
         );
@@ -16414,7 +17350,7 @@ mod tests {
             sup(DhanEndpointType::MainFeed, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -16500,7 +17436,7 @@ mod tests {
             sup(DhanEndpointType::MainFeed, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             None,
         )
         .await;
@@ -16529,7 +17465,7 @@ mod tests {
             sup(DhanEndpointType::MainFeed, 0, t0()),
             guard,
             sink,
-            || async {},
+            no_refresh(),
         )
         .await;
 
@@ -16565,7 +17501,7 @@ mod tests {
             sup(DhanEndpointType::MainFeed, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
         )
         .await;
 
@@ -16618,7 +17554,7 @@ mod tests {
             sup(DhanEndpointType::MainFeed, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
         )
         .await;
 
@@ -16647,10 +17583,14 @@ mod tests {
             sup(DhanEndpointType::MainFeed, 0, t0()),
             guard,
             sink,
-            move || {
+            move |_request: TokenRefreshRequest| {
                 let r = std::sync::Arc::clone(&r);
                 async move {
                     r.fetch_add(1, Ordering::SeqCst);
+                    TokenRefreshReport {
+                        presented: 0,
+                        outcome: TokenRefreshOutcome::Failed,
+                    }
                 }
             },
         )
@@ -16667,6 +17607,137 @@ mod tests {
             s.connects, 2,
             "one original dial plus one post-refresh dial"
         );
+    }
+
+    /// A refresh closure modelled on production: the dial presents the
+    /// current generation; a refresh skips when that generation is the one
+    /// the episode verified, and otherwise renews (generation + 1). Returns
+    /// the closure and the count of real renewals.
+    fn modelled_refresh() -> (
+        impl FnMut(TokenRefreshRequest) -> std::future::Ready<TokenRefreshReport> + Send,
+        std::sync::Arc<AtomicUsize>,
+    ) {
+        let renewals = std::sync::Arc::new(AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&renewals);
+        let mut generation = 0u64;
+        let closure = move |request: TokenRefreshRequest| {
+            let presented = generation;
+            let outcome = if request.skip_if_presented == Some(presented) {
+                TokenRefreshOutcome::NotAttempted
+            } else {
+                counted.fetch_add(1, Ordering::SeqCst);
+                generation += 1;
+                TokenRefreshOutcome::Fresh {
+                    current: generation,
+                }
+            };
+            std::future::ready(TokenRefreshReport { presented, outcome })
+        };
+        (closure, renewals)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_run_connection_808_refreshes_once_then_parks_when_the_fresh_token_is_rejected() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: VecDeque::from(vec![
+                SocketEvent::Closed {
+                    code: Some(DisconnectCode::AuthenticationFailed),
+                },
+                SocketEvent::Closed {
+                    code: Some(DisconnectCode::AuthenticationFailed),
+                },
+            ]),
+            ..FakeState::default()
+        }));
+        let (refresh, renewals) = modelled_refresh();
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::MainFeed, instruments(5))
+            .expect("inside cap");
+        let exit = run_connection(
+            fake(&st),
+            sup(DhanEndpointType::MainFeed, 0, t0()),
+            guard,
+            sink,
+            refresh,
+        )
+        .await;
+        assert_eq!(exit, ConnectionExit::Parked(ParkReason::FatalDisconnect));
+        assert_eq!(
+            renewals.load(Ordering::SeqCst),
+            1,
+            "one token refresh per episode"
+        );
+        let s = st.lock().expect("fake state");
+        assert_eq!(
+            s.connects, 2,
+            "the original dial plus one dial with the fresh token; the second 808 parks \
+             without a third dial"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_run_connection_808_then_healthy_redial_keeps_running() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: VecDeque::from(vec![
+                SocketEvent::Closed {
+                    code: Some(DisconnectCode::AuthenticationFailed),
+                },
+                SocketEvent::Frame(Bytes::from_static(b"aaaaaaaa")),
+                SocketEvent::Frame(Bytes::from_static(b"bbbbbbbb")),
+            ]),
+            ..FakeState::default()
+        }));
+        let (refresh, renewals) = modelled_refresh();
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::MainFeed, instruments(5))
+            .expect("inside cap");
+        let exit = run_connection(
+            fake(&st),
+            sup(DhanEndpointType::MainFeed, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            refresh,
+        )
+        .await;
+        // The script's terminator (810) ends the test; the 808 did not.
+        assert_eq!(exit, ConnectionExit::Parked(ParkReason::FatalDisconnect));
+        assert_eq!(renewals.load(Ordering::SeqCst), 1);
+        let s = st.lock().expect("fake state");
+        assert_eq!(s.connects, 2);
+        assert_eq!(s.frames_seen, 2, "the fresh token delivered frames");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_run_connection_stacked_808_frame_parks_on_the_second_fresh_rejection() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: VecDeque::from(vec![
+                SocketEvent::Closed {
+                    code: Some(DisconnectCode::AuthenticationFailed),
+                },
+                // One frame stacked ahead of the next 808 in the same read.
+                SocketEvent::Frame(Bytes::from_static(b"aaaaaaaa")),
+                SocketEvent::Closed {
+                    code: Some(DisconnectCode::AuthenticationFailed),
+                },
+            ]),
+            ..FakeState::default()
+        }));
+        let (refresh, renewals) = modelled_refresh();
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::MainFeed, instruments(5))
+            .expect("inside cap");
+        let exit = run_connection(
+            fake(&st),
+            sup(DhanEndpointType::MainFeed, 0, t0()),
+            guard,
+            sink,
+            refresh,
+        )
+        .await;
+        assert_eq!(exit, ConnectionExit::Parked(ParkReason::FatalDisconnect));
+        assert_eq!(renewals.load(Ordering::SeqCst), 1);
+        let s = st.lock().expect("fake state");
+        assert_eq!(s.connects, 2, "a stacked frame does not buy a third dial");
     }
 
     #[tokio::test(start_paused = true)]
@@ -16688,7 +17759,7 @@ mod tests {
             sup(DhanEndpointType::MainFeed, 0, t0()),
             guard,
             sink,
-            || async {},
+            no_refresh(),
         )
         .await;
 
@@ -16709,7 +17780,7 @@ mod tests {
         let mut s = sup(DhanEndpointType::MainFeed, 0, t0());
         let _ = s.on_event(ConnEvent::ShutdownRequested, t0());
 
-        let exit = run_connection(fake(&st), s, guard, sink, || async {}).await;
+        let exit = run_connection(fake(&st), s, guard, sink, no_refresh()).await;
         assert_eq!(exit, ConnectionExit::Parked(ParkReason::Shutdown));
         assert_eq!(
             st.lock().map(|g| g.connects).unwrap_or(usize::MAX),
@@ -17152,7 +18223,7 @@ mod tests {
             sup(DhanEndpointType::Depth20, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -17206,7 +18277,7 @@ mod tests {
             sup(DhanEndpointType::Depth200, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -17253,7 +18324,7 @@ mod tests {
             sup(DhanEndpointType::Depth200, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -17280,7 +18351,7 @@ mod tests {
     /// terminator parks it.
     ///
     /// This matters more than it looks: the default terminator is
-    /// `AuthenticationFailed`, which is FATAL and parks WITHOUT replaying.
+    /// `ClientIdInvalid` (810), which is FATAL and parks WITHOUT replaying.
     /// A "the replay carries nothing" test written against the default
     /// script passes because no replay ever happens — vacuously green
     /// against correct AND incorrect code. Hence the explicit transient
@@ -17328,7 +18399,7 @@ mod tests {
             sup(DhanEndpointType::Depth200, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -17380,7 +18451,7 @@ mod tests {
             sup(DhanEndpointType::Depth200, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -17432,7 +18503,7 @@ mod tests {
             sup(DhanEndpointType::Depth200, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -17513,7 +18584,7 @@ mod tests {
             sup(DhanEndpointType::Depth200, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -18070,7 +19141,7 @@ mod tests {
             sup(DhanEndpointType::Depth200, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -18495,7 +19566,7 @@ mod tests {
             sup(DhanEndpointType::MainFeed, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
         ));
         // Live and idle: both scripted frames drained, then the reader waits.
         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -18537,7 +19608,7 @@ mod tests {
             sup(DhanEndpointType::MainFeed, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
         ));
         // 0 + 1 s + 2 s + 5 s of ladder (plus jitter) puts t = 10 s inside
         // the 15 s step.
@@ -18576,7 +19647,7 @@ mod tests {
             sup(DhanEndpointType::MainFeed, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
         )
         .await;
         assert_eq!(exit, ConnectionExit::Parked(ParkReason::Shutdown));
@@ -18711,7 +19782,7 @@ mod tests {
         let mut fatal = live_main_feed(2, now);
         let _ = fatal.on_event(
             ConnEvent::Disconnected {
-                code: Some(DisconnectCode::AuthenticationFailed),
+                code: Some(DisconnectCode::ClientIdInvalid),
             },
             now,
         );
@@ -18755,7 +19826,7 @@ mod tests {
             let _ = fatal.on_event(ConnEvent::BeginDial, now);
             let _ = fatal.on_event(
                 ConnEvent::Disconnected {
-                    code: Some(DisconnectCode::AuthenticationFailed),
+                    code: Some(DisconnectCode::ClientIdInvalid),
                 },
                 now,
             );

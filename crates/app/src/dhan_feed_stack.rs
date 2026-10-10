@@ -15328,21 +15328,43 @@ fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize 
                 supervisor,
                 guard,
                 sink,
-                || async {
-                    // Post-807/809 re-dial: ask the token manager for a fresh JWT
-                    // before presenting a credential again. Failure is logged by
-                    // the manager and left to the reconnect ladder — re-dialing
-                    // with the stale token is the supervisor's own next step, on
-                    // the damped token-stale ladder (it does not park).
+                {
+                    let dialled_generation = &dialled_generation;
+                    move |request: tickvault_core::websocket::pool_supervisor::TokenRefreshRequest| async move {
+                    use tickvault_core::websocket::pool_supervisor::{
+                        TokenRefreshOutcome, TokenRefreshReport,
+                    };
+                    // Post-807/808/809 re-dial: ask the token manager for a
+                    // fresh JWT before presenting a credential again, and
+                    // report how it went (808 refresh-once, scope lock
+                    // 2026-10-06): the supervisor parks an 808 slot whose
+                    // fresh token was rejected too. A 807/809 refresh that
+                    // fails is left to the reconnect ladder as before.
                     //
                     // Audit PR22: renew only if the token THIS socket dialled
                     // with is still current. A sibling that got the same 807
                     // may have renewed it already; renewing again would expire
                     // the token that sibling just re-dialled with.
+                    //
+                    // A depth-account socket reads the same process-global
+                    // token manager here; the depth account's own minter is
+                    // separate, so for it this is a re-read only.
                     let dialled = dialled_generation.load(std::sync::atomic::Ordering::Relaxed);
-                    if let Some(manager) = global_token_manager()
-                        && let Err(err) = manager.force_renewal_unless_replaced(dialled).await
-                    {
+                    let report = |outcome| TokenRefreshReport {
+                        presented: dialled,
+                        outcome,
+                    };
+                    // The rejected dial already presented the token this 808
+                    // episode verified as fresh: renewing would only replace a
+                    // token that was just issued. The supervisor parks.
+                    if request.skip_if_presented == Some(dialled) {
+                        return report(TokenRefreshOutcome::NotAttempted);
+                    }
+                    let Some(manager) = global_token_manager() else {
+                        return report(TokenRefreshOutcome::Failed);
+                    };
+                    let result = manager.force_renewal_unless_replaced(dialled).await;
+                    if let Err(err) = &result {
                         // R3 (2026-10-01): an error, not a warning; the token
                         // manager pages once per dead token. Every socket
                         // repeats this on each ladder step while the token
@@ -15361,6 +15383,20 @@ fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize 
                                 "Dhan live feed could not refresh its token before re-dialing"
                             );
                         }
+                    }
+                    // Fresh only when the generation was SEEN to move past
+                    // the one this socket presented.
+                    let current = manager.renew_generation();
+                    let outcome = if current != dialled {
+                        TokenRefreshOutcome::Fresh { current }
+                    } else if result.as_ref().is_err_and(
+                        tickvault_core::auth::token_manager::is_deferred_renewal_failure,
+                    ) {
+                        TokenRefreshOutcome::Deferred
+                    } else {
+                        TokenRefreshOutcome::Failed
+                    };
+                    report(outcome)
                     }
                 },
                 topup_rx,
@@ -25590,6 +25626,30 @@ mod tests {
             !production.contains("manager.force_renewal().await"),
             "no feed socket may renew unconditionally after an 807"
         );
+        // 808 refresh-once (scope lock 2026-10-06): the closure reports what
+        // it saw. It skips when the rejected dial presented the verified
+        // generation, reports Fresh only when the generation moved, and
+        // reports a deferral (cooldown or lock refusal) as such.
+        for needle in [
+            "request.skip_if_presented == Some(dialled)",
+            "return report(TokenRefreshOutcome::NotAttempted);",
+            "let current = manager.renew_generation();",
+            "TokenRefreshOutcome::Fresh { current }",
+            "tickvault_core::auth::token_manager::is_deferred_renewal_failure",
+            "TokenRefreshOutcome::Deferred",
+        ] {
+            assert!(
+                production.contains(needle),
+                "the feed's refresh closure lost `{needle}`"
+            );
+        }
+        let skip = production
+            .find("request.skip_if_presented == Some(dialled)")
+            .expect("skip check");
+        let renew = production
+            .find("manager.force_renewal_unless_replaced(dialled)")
+            .expect("renewal");
+        assert!(skip < renew, "the skip is decided before any renewal");
         let helper = production
             .find("fn feed_token_recording_generation(")
             .expect("the recording token source must exist");

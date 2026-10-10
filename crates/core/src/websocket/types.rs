@@ -134,6 +134,11 @@ impl DisconnectCode {
     ///
     /// Reconnectable: 800 (transient server error), 807 (token expired — refresh first).
     /// NOT reconnectable: all others (config/credential/request errors — fix the root cause).
+    ///
+    /// NOT the live feed's policy: the supervised sockets classify a close with
+    /// `pool_supervisor::classify_disconnect`, where 809 refreshes the token
+    /// like 807 and, since 2026-10-06, a first 808 refreshes once before it
+    /// may park. This helper has no production caller.
     pub fn is_reconnectable(&self) -> bool {
         match self {
             Self::InternalServerError | Self::AccessTokenExpired => true,
@@ -152,6 +157,10 @@ impl DisconnectCode {
     }
 
     /// Whether this disconnect code requires a token refresh before reconnect.
+    ///
+    /// Not the live feed's policy: see `pool_supervisor::classify_disconnect`
+    /// (807 and 809 refresh; a first 808 refreshes once, scope lock
+    /// 2026-10-06). This helper has no production caller.
     pub fn requires_token_refresh(&self) -> bool {
         matches!(self, Self::AccessTokenExpired)
     }
