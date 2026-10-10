@@ -52,7 +52,8 @@
 //!     security_id LONG, segment SYMBOL, minute_ts_ist TIMESTAMP,
 //!     kind SYMBOL, field SYMBOL,
 //!     live_value DOUBLE, rest_value DOUBLE,
-//!     live_volume LONG, rest_volume LONG, diff_paise LONG
+//!     live_volume LONG, rest_volume LONG, diff_paise LONG,
+//!     attempt_at TIMESTAMP
 //! ) timestamp(ts) PARTITION BY DAY
 //! DEDUP UPSERT KEYS(ts, trading_date_ist, feed, security_id, segment,
 //!                   minute_ts_ist, kind, field)
@@ -64,7 +65,9 @@
 //!     missing_live_zero_volume LONG, missing_rest LONG,
 //!     tail_unsealed LONG, out_of_session LONG,
 //!     noise_p50_paise LONG, noise_p95_paise LONG, noise_max_paise LONG,
-//!     tolerance_paise LONG, outcome SYMBOL
+//!     tolerance_paise LONG, outcome SYMBOL,
+//!     late_excused LONG, missing_live_unjudged LONG, missing_judgeable SYMBOL,
+//!     attempt_at TIMESTAMP, run_complete BOOLEAN
 //! ) timestamp(ts) PARTITION BY DAY
 //! DEDUP UPSERT KEYS(ts, trading_date_ist, feed, outcome)
 //!
@@ -76,6 +79,19 @@
 //! ) timestamp(ts) PARTITION BY DAY
 //! DEDUP UPSERT KEYS(ts, security_id, segment, feed, source)
 //! ```
+//!
+//! ## 2026-10-06 (plan ITEM 51c, `no-rest-except-live-feed-2026-06-27.md` §12.15.9)
+//!
+//! The daily table gains `late_excused`, `missing_live_unjudged` and
+//! `missing_judgeable`, and the cell audit gains the kinds `late_excused` and
+//! `missing_live_unjudged`, all through the existing `ALTER ADD COLUMN IF NOT
+//! EXISTS` self-heal; DEDUP keys are unchanged. The `tail_unsealed` column and
+//! cell kind are KEPT for the rows written before this change and are written
+//! 0 from it: the literal two-minute tail they recorded is replaced by the
+//! derived late window, whose excused minutes are `late_excused`. The daily
+//! table also gains `attempt_at` and `run_complete`, and the cell audit
+//! `attempt_at` (one reading per attempt), through the same self-heal and
+//! outside every DEDUP key; they let a reader tell a day's attempts apart.
 
 use anyhow::{Context, Result};
 use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
@@ -182,8 +198,25 @@ pub enum DhanLiveXverifyCellKind {
     /// A live-side gap in the LAST TWO session minutes at run time — the seal
     /// may legitimately not have landed by 15:31. Recorded, NEVER counted as
     /// `missing_live` and never a divergence.
+    ///
+    /// **2026-10-06 (§12.15.9): no longer written.** Kept so the rows written
+    /// before that day still read; the derived late window writes
+    /// [`Self::LateExcused`] instead.
     TailUnsealed,
-    /// A row outside `[09:15, 15:30)` IST — recorded, not classified.
+    /// A traded or index minute missing from our side inside the derived
+    /// end-of-session window (`LATE_SEAL_WINDOW_MINUTES`, or every bucket
+    /// ending after the published seal progress), judged under the `Excuse`
+    /// policy, and only when it comes AFTER that instrument's own last live
+    /// minute (a later live bar means its tick closed the bucket): it may
+    /// simply not have sealed by the read. Recorded, never real, and it holds
+    /// the day at `partial` at best (§12.15.9).
+    LateExcused,
+    /// A traded or index minute missing from our side on a run whose live
+    /// read was cut short, so a missing minute cannot be told from an unread
+    /// one. Recorded, never real, and it holds the day at `partial` at best
+    /// (§12.15.9).
+    MissingLiveUnjudged,
+    /// A row outside `[09:15, 15:40)` IST — recorded, not classified.
     OutOfSession,
 }
 
@@ -196,18 +229,27 @@ impl DhanLiveXverifyCellKind {
             Self::MissingLive => "missing_live",
             Self::MissingRest => "missing_rest",
             Self::TailUnsealed => "tail_unsealed",
+            Self::LateExcused => "late_excused",
+            Self::MissingLiveUnjudged => "missing_live_unjudged",
             Self::OutOfSession => "out_of_session",
         }
     }
 
-    /// `true` for the kinds that constitute REAL divergence.
+    /// `true` for the kinds that CAN be real divergence.
     ///
-    /// `TailUnsealed` and `OutOfSession` are explicitly EXCLUDED — they are
-    /// reported categories, never evidence of a feed problem (the doctrine:
-    /// separate expected fluctuation from real divergence).
+    /// `Diverged` is always real. `MissingLive` is real only when the Dhan
+    /// minute traded (`rest_volume > 0`) or the instrument is an index
+    /// (`segment = 'IDX_I'`); a zero-volume non-index minute keeps the kind
+    /// and is never real, so a reader must check those two columns too
+    /// (§12.15.9). `MissingRest`, `TailUnsealed`, `LateExcused`,
+    /// `MissingLiveUnjudged` and `OutOfSession` are EXCLUDED — reported
+    /// categories, never evidence of a feed problem (the doctrine: separate
+    /// expected fluctuation from real divergence). *(Corrected 2026-10-10:
+    /// this returned `true` for `MissingRest`, which the verdict has never
+    /// counted: the vendor tape is sparse by construction.)*
     #[must_use]
     pub const fn is_real_divergence(self) -> bool {
-        matches!(self, Self::Diverged | Self::MissingLive | Self::MissingRest)
+        matches!(self, Self::Diverged | Self::MissingLive)
     }
 }
 
@@ -273,6 +315,45 @@ impl DhanLiveXverifyOutcome {
     #[must_use]
     pub const fn is_vacuous(self) -> bool {
         matches!(self, Self::Blind | Self::NoData | Self::Degraded)
+    }
+}
+
+/// Whether this run could judge minutes missing from our side (the
+/// `missing_judgeable` SYMBOL column). Stable wire labels, never reworded.
+///
+/// Added 2026-10-06 (plan ITEM 51c, §12.15.9). A failed vendor fetch cannot
+/// fake a missing LIVE minute (a target with no vendor bars adds only
+/// `missing_rest`), so it never turns judging off. A live read cut at its row
+/// cap can: it reads `ORDER BY ts ASC LIMIT`, so the cap drops the END of the
+/// day and every minute after the cut would read as lost. That is the one
+/// input that turns judging off today; plan item 51d adds the readiness
+/// reasons. Until then a `judged` day can still count a minute as missing
+/// whose sealed bar was not yet readable at the read (queued, spilled, or not
+/// yet applied by QuestDB's WAL) or whose live row was skipped as malformed;
+/// §12.15.9 records this under its Honest limits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DhanLiveXverifyMissingJudgeable {
+    /// Every missing traded or index minute outside the excused window is
+    /// judged as real loss.
+    Judged,
+    /// The live read hit its row cap; no missing minute is judged.
+    LiveTruncated,
+}
+
+impl DhanLiveXverifyMissingJudgeable {
+    /// Stable wire label. Never reworded.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Judged => "judged",
+            Self::LiveTruncated => "live_truncated",
+        }
+    }
+
+    /// `true` only for [`Self::Judged`].
+    #[must_use]
+    pub const fn is_judged(self) -> bool {
+        matches!(self, Self::Judged)
     }
 }
 
@@ -349,6 +430,33 @@ pub struct DhanLiveXverifyDailyRow {
     /// re-baselining history.
     pub tolerance_paise: i64,
     pub outcome: DhanLiveXverifyOutcome,
+    /// Traded or index minutes missing from our side inside the excused
+    /// end-of-session window (cell kind `late_excused`, §12.15.9). Never real;
+    /// any one holds the day at `partial` at best.
+    pub late_excused: i64,
+    /// Traded or index minutes missing from our side on a run that could not
+    /// judge them (cell kind `missing_live_unjudged`, §12.15.9). Never real;
+    /// any one holds the day at `partial` at best.
+    pub missing_live_unjudged: i64,
+    /// Whether missing minutes were judged on this run, and if not, why.
+    pub missing_judgeable: DhanLiveXverifyMissingJudgeable,
+    /// When the attempt that wrote this row persisted it (IST nanoseconds,
+    /// one reading per attempt). Every attempt of a day writes its daily row at
+    /// the same deterministic `ts`, and `outcome` is in the DEDUP key, so two
+    /// attempts that read differently leave two rows. The day's verdict is the
+    /// newest `diverged` row if any row reads `diverged` or any real spot cell
+    /// exists, otherwise the row with the newest `attempt_at` (§12.15.9,
+    /// 2026-10-10 review): a later attempt never hides an earlier `diverged`
+    /// one whose rows reached the database. Two attempts with the same
+    /// `outcome` share one row, which keeps the later stamp and counts. Not in
+    /// the DEDUP key.
+    pub attempt_at_ist_nanos: i64,
+    /// `true` when at most the marker's allowance of vendor fetches failed
+    /// (5%) and neither the run budget nor the live read cap cut the attempt
+    /// short (`run_is_complete`). An attempt that
+    /// is not complete is retried, so its row is never the last word unless no
+    /// later attempt ran.
+    pub run_complete: bool,
 }
 
 /// One minute of the vendor's own tape, exactly as fetched.
@@ -396,7 +504,8 @@ pub fn dhan_live_xverify_cell_audit_create_ddl() -> String {
             rest_value       DOUBLE, \
             live_volume      LONG, \
             rest_volume      LONG, \
-            diff_paise       LONG\
+            diff_paise       LONG, \
+            attempt_at       TIMESTAMP\
         ) timestamp(ts) PARTITION BY DAY \
         DEDUP UPSERT KEYS({DEDUP_KEY_DHAN_LIVE_XVERIFY_CELL_AUDIT});"
     )
@@ -423,7 +532,12 @@ pub fn dhan_live_xverify_daily_create_ddl() -> String {
             noise_p95_paise  LONG, \
             noise_max_paise  LONG, \
             tolerance_paise  LONG, \
-            outcome          SYMBOL\
+            outcome          SYMBOL, \
+            late_excused     LONG, \
+            missing_live_unjudged LONG, \
+            missing_judgeable SYMBOL, \
+            attempt_at       TIMESTAMP, \
+            run_complete     BOOLEAN\
         ) timestamp(ts) PARTITION BY DAY \
         DEDUP UPSERT KEYS({DEDUP_KEY_DHAN_LIVE_XVERIFY_DAILY});"
     )
@@ -488,6 +602,7 @@ const CELL_AUDIT_COLUMNS: &[(&str, &str)] = &[
     ("live_volume", "LONG"),
     ("rest_volume", "LONG"),
     ("diff_paise", "LONG"),
+    ("attempt_at", "TIMESTAMP"),
 ];
 
 /// Every daily-row column, for the idempotent `ALTER ADD COLUMN` self-heal.
@@ -508,6 +623,11 @@ const DAILY_COLUMNS: &[(&str, &str)] = &[
     ("noise_max_paise", "LONG"),
     ("tolerance_paise", "LONG"),
     ("outcome", "SYMBOL"),
+    ("late_excused", "LONG"),
+    ("missing_live_unjudged", "LONG"),
+    ("missing_judgeable", "SYMBOL"),
+    ("attempt_at", "TIMESTAMP"),
+    ("run_complete", "BOOLEAN"),
 ];
 
 /// The full ordered DDL statement list (CREATE → per-column `ALTER ADD COLUMN
@@ -739,9 +859,24 @@ impl DhanLiveXverifyAuditWriter {
     /// Appends one cell finding row. Symbols BEFORE columns (the ILP
     /// tags-before-fields rule).
     ///
+    /// `attempt_at_ist_nanos` is one reading per attempt (§12.15.9 review): a
+    /// finding an earlier attempt wrote and a later one did not keeps the
+    /// earlier stamp, and a later attempt that finds the same cell overwrites
+    /// it (the cell key has no attempt), so a cell's `attempt_at` is the LAST
+    /// attempt that wrote it. The stamps order the writes; they do not split
+    /// the findings by attempt, and the day's real findings are every
+    /// `diverged` cell of the day and every `missing_live` cell whose Dhan
+    /// minute traded (`rest_volume > 0`) or is an index (§12.15.9 reader
+    /// rule; a zero-volume non-index minute is never real).
+    /// The §12.15.6 option pass stamps its own cells and writes no daily row.
+    ///
     /// # Errors
     /// Propagates ILP buffer errors (table/column append failure).
-    pub fn append_cell(&mut self, f: &DhanLiveXverifyCellFinding) -> Result<()> {
+    pub fn append_cell(
+        &mut self,
+        f: &DhanLiveXverifyCellFinding,
+        attempt_at_ist_nanos: i64,
+    ) -> Result<()> {
         self.buffer
             .table(DHAN_LIVE_XVERIFY_CELL_AUDIT_TABLE)
             .context("table")?
@@ -772,6 +907,8 @@ impl DhanLiveXverifyAuditWriter {
             .context("rest_volume")?
             .column_i64("diff_paise", f.diff_paise)
             .context("diff_paise")?
+            .column_ts("attempt_at", TimestampNanos::new(attempt_at_ist_nanos))
+            .context("attempt_at")?
             .at(TimestampNanos::new(f.run_ts_ist_nanos))
             .context("designated timestamp")?;
         self.pending = self.pending.saturating_add(1);
@@ -837,6 +974,8 @@ impl DhanLiveXverifyAuditWriter {
             .context("feed")?
             .symbol("outcome", r.outcome.as_str())
             .context("outcome")?
+            .symbol("missing_judgeable", r.missing_judgeable.as_str())
+            .context("missing_judgeable")?
             .column_ts(
                 "trading_date_ist",
                 TimestampNanos::new(r.trading_date_ist_nanos),
@@ -868,6 +1007,14 @@ impl DhanLiveXverifyAuditWriter {
             .context("noise_max_paise")?
             .column_i64("tolerance_paise", r.tolerance_paise)
             .context("tolerance_paise")?
+            .column_i64("late_excused", r.late_excused)
+            .context("late_excused")?
+            .column_i64("missing_live_unjudged", r.missing_live_unjudged)
+            .context("missing_live_unjudged")?
+            .column_ts("attempt_at", TimestampNanos::new(r.attempt_at_ist_nanos))
+            .context("attempt_at")?
+            .column_bool("run_complete", r.run_complete)
+            .context("run_complete")?
             .at(TimestampNanos::new(r.run_ts_ist_nanos))
             .context("designated timestamp")?;
         self.pending = self.pending.saturating_add(1);
@@ -1072,6 +1219,11 @@ mod tests {
             noise_max_paise: 60,
             tolerance_paise: 0,
             outcome: DhanLiveXverifyOutcome::Diverged,
+            late_excused: 4,
+            missing_live_unjudged: 0,
+            missing_judgeable: DhanLiveXverifyMissingJudgeable::Judged,
+            attempt_at_ist_nanos: 3,
+            run_complete: false,
         }
     }
 
@@ -1151,7 +1303,7 @@ mod tests {
 
         assert!(DhanLiveXverifyCellKind::Diverged.is_real_divergence());
         assert!(DhanLiveXverifyCellKind::MissingLive.is_real_divergence());
-        assert!(DhanLiveXverifyCellKind::MissingRest.is_real_divergence());
+        assert!(!DhanLiveXverifyCellKind::MissingRest.is_real_divergence());
         // The doctrine: expected fluctuation is NOT divergence.
         assert!(
             !DhanLiveXverifyCellKind::TailUnsealed.is_real_divergence(),
@@ -1241,6 +1393,9 @@ mod tests {
             "noise_max_paise",
             "tolerance_paise",
             "outcome",
+            "late_excused",
+            "missing_live_unjudged",
+            "missing_judgeable",
         ] {
             assert!(ddl.contains(tok), "daily DDL missing `{tok}`: {ddl}");
         }
@@ -1361,7 +1516,7 @@ mod tests {
     #[test]
     fn append_cell_emits_symbols_before_columns_and_counts_pending() {
         let mut w = DhanLiveXverifyAuditWriter::for_test();
-        w.append_cell(&sample_cell()).expect("append");
+        w.append_cell(&sample_cell(), 7).expect("append");
         assert_eq!(w.pending(), 1);
         let line = w.buffer_utf8();
         assert!(line.contains(DHAN_LIVE_XVERIFY_CELL_AUDIT_TABLE));
@@ -1376,6 +1531,161 @@ mod tests {
         let tags = &line[..first_field];
         assert!(tags.contains("feed=dhan"), "symbols must precede columns");
         assert!(!tags.contains("live_value"), "columns must follow symbols");
+    }
+
+    /// 2026-10-06 (plan ITEM 51c, §12.15.9). The three new daily columns
+    /// reach an already-created table through the ALTER self-heal with the
+    /// type the CREATE declares, the ILP line carries them with the matching
+    /// wire type (a symbol for `missing_judgeable`, integers for the counts),
+    /// the two new cell kinds have stable labels, and no DEDUP key moved.
+    #[test]
+    fn late_excused_and_unjudged_columns_self_heal_and_dedup_keys_unchanged() {
+        let statements = dhan_live_xverify_ddl_statements();
+        let create = dhan_live_xverify_daily_create_ddl();
+        for (col, ty) in [
+            ("late_excused", "LONG"),
+            ("missing_live_unjudged", "LONG"),
+            ("missing_judgeable", "SYMBOL"),
+        ] {
+            let alter = format!(
+                "ALTER TABLE {DHAN_LIVE_XVERIFY_DAILY_TABLE} ADD COLUMN IF NOT EXISTS {col} {ty};"
+            );
+            assert!(statements.contains(&alter), "missing self-heal: {alter}");
+            assert!(
+                DAILY_COLUMNS.contains(&(col, ty)),
+                "{col} must be in the daily manifest as {ty}"
+            );
+            assert!(create.contains(col), "CREATE must declare {col}");
+        }
+        // DEDUP keys are unchanged by this change (and by any new column).
+        assert_eq!(
+            DEDUP_KEY_DHAN_LIVE_XVERIFY_DAILY,
+            "ts, trading_date_ist, feed, outcome"
+        );
+        assert_eq!(
+            DEDUP_KEY_DHAN_LIVE_XVERIFY_CELL_AUDIT,
+            "ts, trading_date_ist, feed, security_id, segment, minute_ts_ist, kind, field"
+        );
+        // The wire.
+        let mut row = sample_daily();
+        row.late_excused = 4;
+        row.missing_live_unjudged = 7;
+        row.missing_judgeable = DhanLiveXverifyMissingJudgeable::LiveTruncated;
+        let mut w = DhanLiveXverifyAuditWriter::for_test();
+        w.append_daily(&row).expect("append");
+        let line = w.buffer_utf8();
+        let first_field = line.find(' ').expect("space between tags and fields");
+        let (tags, fields) = line.split_at(first_field);
+        assert!(
+            tags.contains("missing_judgeable=live_truncated"),
+            "missing_judgeable is a SYMBOL, so it must ride with the tags: {line}"
+        );
+        assert!(fields.contains("late_excused=4i"), "{line}");
+        assert!(fields.contains("missing_live_unjudged=7i"), "{line}");
+        // tail_unsealed is still written (0 from this change on).
+        row.tail_unsealed = 0;
+        let mut w = DhanLiveXverifyAuditWriter::for_test();
+        w.append_daily(&row).expect("append");
+        assert!(w.buffer_utf8().contains("tail_unsealed=0i"));
+        // Stable labels.
+        assert_eq!(
+            DhanLiveXverifyCellKind::LateExcused.as_str(),
+            "late_excused"
+        );
+        assert_eq!(
+            DhanLiveXverifyCellKind::MissingLiveUnjudged.as_str(),
+            "missing_live_unjudged"
+        );
+        assert_eq!(DhanLiveXverifyMissingJudgeable::Judged.as_str(), "judged");
+        assert_eq!(
+            DhanLiveXverifyMissingJudgeable::LiveTruncated.as_str(),
+            "live_truncated"
+        );
+        assert!(DhanLiveXverifyMissingJudgeable::Judged.is_judged());
+        assert!(!DhanLiveXverifyMissingJudgeable::LiveTruncated.is_judged());
+    }
+
+    /// 2026-10-06 (§12.15.9 review). Every attempt of a day writes its daily
+    /// row at the same deterministic `ts` and `outcome` is in the DEDUP key,
+    /// so a retry that reads differently leaves a second row. `attempt_at`
+    /// (one reading per attempt, on the daily row AND every cell) and
+    /// `run_complete` (daily) let a reader order the writes; they do not split
+    /// the findings by attempt (a cell keeps the stamp of the last attempt
+    /// that wrote it; the day's reader rule is in §12.15.9). Both reach an old table through the ALTER self-heal with
+    /// the CREATE's type, ride the ILP line as fields with the matching wire
+    /// type, and stay OUT of every DEDUP key: in the key they would turn each
+    /// retry's rows into new rows instead of upserting the same finding.
+    #[test]
+    fn attempt_at_and_run_complete_self_heal_reach_the_wire_and_stay_out_of_dedup() {
+        let statements = dhan_live_xverify_ddl_statements();
+        let daily = dhan_live_xverify_daily_create_ddl();
+        let cell = dhan_live_xverify_cell_audit_create_ddl();
+        for (table, ddl, columns, col, ty) in [
+            (
+                DHAN_LIVE_XVERIFY_DAILY_TABLE,
+                &daily,
+                DAILY_COLUMNS,
+                "attempt_at",
+                "TIMESTAMP",
+            ),
+            (
+                DHAN_LIVE_XVERIFY_DAILY_TABLE,
+                &daily,
+                DAILY_COLUMNS,
+                "run_complete",
+                "BOOLEAN",
+            ),
+            (
+                DHAN_LIVE_XVERIFY_CELL_AUDIT_TABLE,
+                &cell,
+                CELL_AUDIT_COLUMNS,
+                "attempt_at",
+                "TIMESTAMP",
+            ),
+        ] {
+            let alter = format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {ty};");
+            assert!(statements.contains(&alter), "missing self-heal: {alter}");
+            assert!(columns.contains(&(col, ty)), "{table}.{col} must be {ty}");
+            assert!(
+                ddl.split_whitespace()
+                    .collect::<Vec<_>>()
+                    .windows(2)
+                    .any(|w| w[0] == col && w[1].trim_end_matches([',', ')']) == ty),
+                "{table} CREATE must declare {col} {ty}: {ddl}"
+            );
+        }
+        for key in [
+            DEDUP_KEY_DHAN_LIVE_XVERIFY_DAILY,
+            DEDUP_KEY_DHAN_LIVE_XVERIFY_CELL_AUDIT,
+        ] {
+            assert!(!key.contains("attempt_at"), "{key}");
+            assert!(!key.contains("run_complete"), "{key}");
+        }
+
+        // The wire: a TIMESTAMP field is `<micros>t`, a BOOLEAN is `t`/`f`,
+        // and both are fields, never tags.
+        let mut row = sample_daily();
+        row.attempt_at_ist_nanos = 1_759_751_460_123_456_000;
+        row.run_complete = true;
+        let mut w = DhanLiveXverifyAuditWriter::for_test();
+        w.append_daily(&row).expect("append");
+        let line = w.buffer_utf8();
+        let (tags, fields) = line.split_at(line.find(' ').expect("tags then fields"));
+        assert!(!tags.contains("attempt_at") && !tags.contains("run_complete"));
+        assert!(fields.contains("attempt_at=1759751460123456t"), "{line}");
+        assert!(fields.contains("run_complete=t"), "{line}");
+        row.run_complete = false;
+        let mut w = DhanLiveXverifyAuditWriter::for_test();
+        w.append_daily(&row).expect("append");
+        assert!(w.buffer_utf8().contains("run_complete=f"));
+
+        let mut w = DhanLiveXverifyAuditWriter::for_test();
+        w.append_cell(&sample_cell(), 1_759_751_460_123_456_000)
+            .expect("append");
+        let line = w.buffer_utf8();
+        let (tags, fields) = line.split_at(line.find(' ').expect("tags then fields"));
+        assert!(!tags.contains("attempt_at"));
+        assert!(fields.contains("attempt_at=1759751460123456t"), "{line}");
     }
 
     #[test]
@@ -1416,7 +1726,7 @@ mod tests {
         let mut w = DhanLiveXverifyAuditWriter::for_test();
         // Well under the threshold: nothing should be offered for flush.
         for _ in 0..50 {
-            w.append_cell(&sample_cell()).expect("append");
+            w.append_cell(&sample_cell(), 7).expect("append");
         }
         assert!(
             w.buffer_len() < DhanLiveXverifyAuditWriter::FLUSH_THRESHOLD_BYTES,
@@ -1433,7 +1743,7 @@ mod tests {
         // as the production caller is, so this cannot silently spin if the row
         // width changes.
         while w.buffer_len() < DhanLiveXverifyAuditWriter::FLUSH_THRESHOLD_BYTES {
-            w.append_cell(&sample_cell()).expect("append");
+            w.append_cell(&sample_cell(), 7).expect("append");
         }
         let rows_at_threshold = w.pending();
         assert!(
@@ -1480,7 +1790,7 @@ mod tests {
     #[test]
     fn flush_without_sender_errors_and_discards_the_poisoned_buffer() {
         let mut w = DhanLiveXverifyAuditWriter::for_test();
-        w.append_cell(&sample_cell()).expect("append");
+        w.append_cell(&sample_cell(), 7).expect("append");
         w.append_daily(&sample_daily()).expect("append");
         assert_eq!(w.pending(), 2);
         let err = w.flush().expect_err("disconnected writer must fail loudly");
@@ -1495,8 +1805,8 @@ mod tests {
     #[test]
     fn discard_pending_returns_the_dropped_count_and_clears() {
         let mut w = DhanLiveXverifyAuditWriter::for_test();
-        w.append_cell(&sample_cell()).expect("append");
-        w.append_cell(&sample_cell()).expect("append");
+        w.append_cell(&sample_cell(), 7).expect("append");
+        w.append_cell(&sample_cell(), 7).expect("append");
         assert_eq!(w.discard_pending(), 2);
         assert_eq!(w.pending(), 0);
         assert_eq!(w.discard_pending(), 0, "discarding twice is a no-op");
@@ -1507,7 +1817,7 @@ mod tests {
     #[test]
     fn abandon_pending_returns_the_dropped_count_clears_and_never_counts_as_discarded() {
         let mut w = DhanLiveXverifyAuditWriter::for_test();
-        w.append_cell(&sample_cell()).expect("append");
+        w.append_cell(&sample_cell(), 7).expect("append");
         w.append_daily(&sample_daily()).expect("append");
         assert_eq!(w.abandon_pending(), 2);
         assert_eq!(w.pending(), 0);
@@ -1625,14 +1935,16 @@ mod tests {
     /// narrowing it would hide real loss.
     #[test]
     fn test_is_real_divergence_separates_expected_fluctuation_from_real_faults() {
-        // Real: a price disagreement, or a minute one side never had.
+        // Real: a price disagreement, or a minute we never captured.
         assert!(DhanLiveXverifyCellKind::Diverged.is_real_divergence());
         assert!(
             DhanLiveXverifyCellKind::MissingLive.is_real_divergence(),
             "a minute Dhan's own tape has but we never captured is the closest \
              proxy we have for packet loss — it MUST count"
         );
-        assert!(DhanLiveXverifyCellKind::MissingRest.is_real_divergence());
+        // A minute only our side has is never a fault: the vendor tape is
+        // sparse by construction (the verdict reads it as `partial` at most).
+        assert!(!DhanLiveXverifyCellKind::MissingRest.is_real_divergence());
         // Expected: recorded for the operator, never counted as a fault.
         assert!(
             !DhanLiveXverifyCellKind::TailUnsealed.is_real_divergence(),
@@ -1640,17 +1952,23 @@ mod tests {
         );
         assert!(
             !DhanLiveXverifyCellKind::OutOfSession.is_real_divergence(),
-            "a row outside [09:15, 15:30) is recorded, never classified"
+            "a row outside [09:15, 15:40) is recorded, never classified"
         );
-        // Exactly three of the five kinds are real.
+        // Exactly two of the seven kinds can be real.
+        // 2026-10-06 (§12.15.9): an excused late minute and an unjudged
+        // minute are recorded, never real.
+        assert!(!DhanLiveXverifyCellKind::LateExcused.is_real_divergence());
+        assert!(!DhanLiveXverifyCellKind::MissingLiveUnjudged.is_real_divergence());
         let kinds = [
             DhanLiveXverifyCellKind::Diverged,
             DhanLiveXverifyCellKind::MissingLive,
             DhanLiveXverifyCellKind::MissingRest,
             DhanLiveXverifyCellKind::TailUnsealed,
+            DhanLiveXverifyCellKind::LateExcused,
+            DhanLiveXverifyCellKind::MissingLiveUnjudged,
             DhanLiveXverifyCellKind::OutOfSession,
         ];
-        assert_eq!(kinds.iter().filter(|k| k.is_real_divergence()).count(), 3);
+        assert_eq!(kinds.iter().filter(|k| k.is_real_divergence()).count(), 2);
     }
 
     // -----------------------------------------------------------------
