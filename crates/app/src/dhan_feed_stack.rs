@@ -4666,8 +4666,9 @@ impl LiveIngest {
     /// a healthy socket look silent. An untracked contract gives no evidence
     /// and leaves only the 900 s backstop.
     ///
-    /// Gated off outside the continuous session, during an overflow episode,
-    /// after an 805 halted rotation, and in `Off`. Each silent stretch is
+    /// Gated off outside 09:15–15:15 IST (the closing-auction minutes stay on
+    /// the 900 s backstop), during an overflow episode, after an 805 halted
+    /// rotation, and in `Off`. Each silent stretch is
     /// acted on once.
     ///
     /// Returns how many slots met the condition this scan.
@@ -4683,7 +4684,7 @@ impl LiveIngest {
     ) -> u32 {
         use tickvault_core::websocket::pool_supervisor as ps;
         let gate_open = FrameSilenceGate::ContinuousSessionIst
-            .is_open_at(tickvault_common::market_hours::now_ist_secs_of_day())
+            .confirmed_window_open_at(tickvault_common::market_hours::now_ist_secs_of_day())
             && !ps::overflow_episode_engaged()
             && !ps::rotation_halted();
         self.check_depth200_cross_feed_with(
@@ -4738,14 +4739,23 @@ impl LiveIngest {
             if *latch == baseline {
                 continue;
             }
-            *latch = baseline;
             let silent_secs = now_ms.saturating_sub(baseline) / 1_000;
             match fast_path {
                 FrameSilenceFastPath::Act => {
                     let outcome = match request(idx, now_ms) {
                         Ok(()) => "requested",
+                        // Transient: an earlier request for this slot is still
+                        // waiting or cooling down, and was logged when it was
+                        // made. Leave the latch open so this stretch is asked
+                        // again on a later scan once the slot can take it;
+                        // otherwise a socket deaf again inside the cooldown
+                        // would wait for the 900 s backstop.
+                        Err(DataSilenceRefusal::CoolingDown | DataSilenceRefusal::StillPending) => {
+                            continue;
+                        }
                         Err(refusal) => refusal.as_str(),
                     };
+                    *latch = baseline;
                     warn!(
                         code = ErrorCode::WsGapConnectionState.code_str(),
                         source = "depth200_cross_feed",
@@ -4759,6 +4769,7 @@ impl LiveIngest {
                     );
                 }
                 FrameSilenceFastPath::Shadow => {
+                    *latch = baseline;
                     metrics::counter!(
                         tickvault_core::websocket::pool_supervisor::FRAME_SILENCE_WOULD_REDIAL_METRIC,
                         "endpoint" => DhanEndpointType::Depth200.as_str(),
@@ -32468,11 +32479,43 @@ mod depth200_cross_feed_tests {
                 |idx| (idx == slot).then_some(BASE),
                 |_idx, _now| {
                     calls.set(calls.get() + 1);
-                    Err(DataSilenceRefusal::CoolingDown)
+                    Err(DataSilenceRefusal::Halted)
                 },
             );
         }
         assert_eq!(calls.get(), 1);
+    }
+
+    /// Review 2026-10-10 (MEDIUM): a cooldown or a still-pending request is
+    /// transient, so it must not latch the stretch. The same stretch is asked
+    /// again on the next scan, and acted on once the slot takes it.
+    #[test]
+    fn a_transient_refusal_leaves_the_stretch_open_until_a_request_lands() {
+        let mut ingest = ingest_with_trade_at(BASE + 30_000);
+        let slot = first_depth200_slot();
+        let calls = Cell::new(0_u32);
+        let answers = [
+            Err(DataSilenceRefusal::CoolingDown),
+            Err(DataSilenceRefusal::StillPending),
+            Ok(()),
+            Ok(()),
+        ];
+        for (step, now) in [90_000, 120_000, 150_000, 180_000].into_iter().enumerate() {
+            let _ = ingest.check_depth200_cross_feed_with(
+                u64::try_from(BASE + now).expect("positive"),
+                FrameSilenceFastPath::Act,
+                true,
+                |idx| (idx == slot).then_some((SID, SEG, BASE - 600_000)),
+                |idx| (idx == slot).then_some(BASE),
+                |_idx, _now| {
+                    calls.set(calls.get() + 1);
+                    answers[step]
+                },
+            );
+        }
+        // Asked at 90 s, 120 s and 150 s; latched on the 150 s success, so
+        // the 180 s scan of the same stretch asks nothing.
+        assert_eq!(calls.get(), 3);
     }
 
     #[test]

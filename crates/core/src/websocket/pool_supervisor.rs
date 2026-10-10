@@ -663,7 +663,7 @@ fn pack_depth200_held(instrument: SubscribeInstrument) -> Option<u64> {
 /// new id sees its start time. The SAME contract published again keeps its
 /// original `since`: a no-op swap every minute must not push the cross-feed
 /// baseline forward forever. `None` clears the slot (the socket is dialling,
-/// parked or emptied). O(1), no allocation.
+/// parked or emptied); only the id is cleared. O(1), no allocation.
 pub fn publish_depth200_held(
     connection_index: u8,
     held: Option<SubscribeInstrument>,
@@ -684,8 +684,12 @@ pub fn publish_depth200_held(
             id_slot.store(packed, std::sync::atomic::Ordering::Release);
         }
         None => {
+            // Only the id is cleared. Clearing `since` too could, on a weakly
+            // ordered CPU, become visible before the id store, and a reader
+            // would pair the old id with a zero start time (a baseline EARLIER
+            // than the truth). The stale `since` is overwritten before any
+            // new id is published.
             id_slot.store(0, std::sync::atomic::Ordering::Release);
-            since_slot.store(0, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }
@@ -707,7 +711,7 @@ pub fn depth200_held(connection_index: u8) -> Option<(u64, ExchangeSegment, i64)
     }
     let since = since_slot.load(std::sync::atomic::Ordering::Relaxed);
     let second = id_slot.load(std::sync::atomic::Ordering::Acquire);
-    if first != second {
+    if first != second || since <= 0 {
         return None;
     }
     let segment = ExchangeSegment::from_byte(u8::try_from(first & 0xFF).unwrap_or(u8::MAX))?;
@@ -4781,6 +4785,9 @@ impl ConnectionSupervisor {
 
     /// The confirmed threshold for this socket now: the kind's base doubled
     /// per strike (at most three doublings) and capped at the 300 s fallback.
+    /// Only the main feed and depth-20 have a sibling-confirmed path; a
+    /// depth-200 socket never reads this (its paths are the 900 s backstop
+    /// and the cross-feed check), so the 300 s it would return there is unused.
     #[must_use]
     pub fn confirmed_threshold_secs(&self) -> u64 {
         let base = confirmed_base_secs(self.slot.endpoint);
@@ -9522,6 +9529,11 @@ where
             SupervisorAction::SleepThenDial { delay_ms } => {
                 close_capturing(&mut socket, &*sink).await;
                 guard.mark_lost();
+                // Review 2026-10-10: the socket holds nothing during the
+                // backoff, so the depth-200 cross-feed check must not judge it
+                // (a request now would only be dropped as stale at the next
+                // dial and burn the slot's cooldown).
+                note_held_cleared(&mut supervisor);
                 // `mark_lost` is the honest edge: the subscription is gone and
                 // will have to be re-sent. Recorded BEFORE the sleep so the
                 // row's timestamp is the moment we lost the socket, not the
@@ -9539,6 +9551,11 @@ where
             SupervisorAction::RefreshTokenThenDial { delay_ms } => {
                 close_capturing(&mut socket, &*sink).await;
                 guard.mark_lost();
+                // Review 2026-10-10: the socket holds nothing during the
+                // backoff, so the depth-200 cross-feed check must not judge it
+                // (a request now would only be dropped as stale at the next
+                // dial and burn the slot's cooldown).
+                note_held_cleared(&mut supervisor);
                 sink.on_lifecycle_detail(
                     tickvault_common::ws_event_types::WsEventKind::Disconnected,
                     supervisor.last_redial_reason().as_str(),
@@ -24841,6 +24858,19 @@ mod frame_silence_evidence_tests {
             .find(".on_event(ConnEvent::SubscribeFailed, Instant::now())")
             .expect("emptied socket redials");
         assert!(cleared < failed);
+        // Both backoff arms clear the register before they sleep.
+        for arm in [
+            "SupervisorAction::SleepThenDial { delay_ms } => {",
+            "SupervisorAction::RefreshTokenThenDial { delay_ms } => {",
+        ] {
+            let start = prod.find(arm).expect("backoff arm");
+            let body = &prod[start..];
+            let cleared = body
+                .find("note_held_cleared(&mut supervisor);")
+                .expect("backoff clears the register");
+            let slept = body.find("sleep_unless_stopped(").expect("backoff sleeps");
+            assert!(cleared < slept, "{arm}");
+        }
         let set_fn = prod
             .find("fn note_held_set(")
             .expect("note_held_set exists");

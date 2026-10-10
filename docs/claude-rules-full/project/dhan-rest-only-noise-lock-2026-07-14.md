@@ -4730,7 +4730,8 @@ check. The fast paths ship in SHADOW mode (count only).
   evaluation 1.
 - `dhan-main-reconnect-slow` stays at 15,000 ms.
 - `tv_dhan_ws_frame_silence_redial_total`,
-  `tv_dhan_ws_frame_silence_would_redial_total` and
+  `tv_dhan_ws_frame_silence_would_redial_total`,
+  `tv_dhan_ws_data_silence_request_stale_total` and
   `tv_dhan_ws_conn_frame_gap_max_secs` are local `/metrics` only, seeded at 0,
   and in no EMF selector.
 
@@ -4752,5 +4753,5 @@ check. The fast paths ship in SHADOW mode (count only).
 **What a PR that violates §2.13 looks like (REJECT):**
 - Lowers `dhan-worst-socket-deaf` below 600 s, or edits either alarm's
   `alarm_description`, without a further dated row here.
-- Ships any of the three new series to CloudWatch (EMF selector, filter or
+- Ships any of the four new series to CloudWatch (EMF selector, filter or
   alarm) without a dated row here.

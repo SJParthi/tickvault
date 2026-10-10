@@ -9088,15 +9088,17 @@ Conditions on every fast path (all must hold):
   (depth-20) instruments;
 - main feed and depth-20: per-kind, pool-wide spacing of 15 s between fast
   redials (`CONFIRMED_REDIAL_SPACING_SECS`), taken by one compare-and-swap;
-- main feed and depth-20: per-socket ESCALATION. Each fast redial that does
-  not cure the socket doubles its threshold (60 → 120 → 240 → 300 on the main
-  feed), and the strikes reset only after 900 s with no silence redial, so a
+- main feed and depth-20: per-socket ESCALATION. Every silence redial of the
+  socket (fast or 300 s) adds a strike, and each strike doubles its next fast
+  threshold (60 → 120 → 240 → 300 on the main feed); the strikes reset only
+  after 900 s with no silence redial, so a
   deaf socket that bursts one snapshot after every dial cannot loop every
   ~61 s;
 - depth-200: the cross-feed request carries the socket's dial generation, so
   a request raised before a redial is dropped (counted `stale`); one request
   per socket per 300 s; a request taken after an 805 is refused with path
-  `data_silence` on `tv_dhan_ws_dial_refused_after_805_total`.
+  `data_silence` on `tv_depth_dial_refused_after_805_total`;
+- depth-200 cross-feed: inside the same 09:15:00–15:15:00 IST window.
 
 **Shadow first.** `[dhan_universe] frame_silence_fast_path` defaults to
 `shadow` (serde default and `config/base.toml`): the fast paths COUNT "would
@@ -9132,6 +9134,17 @@ timing exactly. The depth-200 900 s backstop is in code and active from merge.
   escalation bound that; they do not remove it.
 - Pools with 2 or fewer sockets of a kind never get sibling confirmation and
   stay at 300 s.
+- Shadow counts overstate what `act` would do: a would-redial takes no
+  spacing slot and adds no strike, so several sockets can count in the same
+  15 s and one socket can count again 60 s later where `act` would have
+  waited.
+- A depth-200 socket under an overflow probe was redialled at 300 s of
+  silence; it now waits 900 s, past the 740 s window bound, so a deaf probed
+  depth-200 socket can let its window pass (errs toward pass, recorded, not
+  changed).
+- A forward wall-clock step of 90 s or more between the read task's stamp
+  and the scan can make a healthy depth-200 socket look silent for one scan.
+  Rare; bounded by the 30 s trade lead and the 300 s cooldown.
 
 REJECT (2026-10-10):
 
