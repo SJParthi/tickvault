@@ -3229,3 +3229,80 @@ reverts to the unbounded query and uncached misses. No schema, config or data ch
 BND-1: `tv_partition_archive_hour_window_deferred_total` should stop climbing on every run
 once the spill folders hold only drained files. GAP-3: `tv_api_cache_hits_total{endpoint=quote}`
 now also counts cached misses. No new metric, alarm or page (noise lock).
+
+### Added 2026-10-09 (stress audit fix 3, findings OPS-2, RO-5 and RO-1: workflows)
+
+Guarantee matrix: see per-wave-guarantee-matrix.md (all 15 + 7 rows apply; rows that do not
+are written `N/A — reason` in the PR body).
+
+Crates touched: `common` and `storage` (guard tests only). No production Rust changes.
+
+- [x] **OPS-2 — every workflow restart of the app clears a start-limited unit first.** The
+  deploy swap ran `systemctl restart tickvault --no-block` with no `reset-failed`, so a unit
+  that had crash-looped into its start limit refused the restart, the fix never ran, and the
+  rollback reinstalled the crashing binary. The same gap sat on the instance downsize restart
+  and the two aws-control restarts (the operator restart button and the restart after an IP
+  change). `systemctl reset-failed tickvault || true` now runs before each of them, without
+  growing the SSM shell budget.
+  Files: `.github/workflows/deploy-aws.yml`, `.github/workflows/downsize-instance.yml`,
+  `.github/workflows/aws-control.yml`, `crates/common/tests/github_workflow_guard.rs`.
+  Tests: test_regression_deploy_swap_resets_a_failed_unit_before_restarting, plus the guard
+  over every workflow line that restarts the app unit.
+- [x] **RO-5/SEC-2 — every remote action is pinned to a commit SHA.** `uses:` lines named
+  movable tags (`@v4`, `@v7`, ...), including the AWS-credential and terraform steps. Each is
+  now `owner/repo@<40-hex commit> # <tag>`, every SHA resolved with `git ls-remote` (the
+  peeled `^{}` commit for an annotated tag). A new guard fails the build on any remote `uses:`
+  that is not a 40-hex SHA (a `docker://` image needs an `@sha256:` digest), with a
+  shrink-only allowlist that is empty.
+  Files: the workflows under `.github/workflows/`,
+  `crates/common/tests/github_workflow_guard.rs`,
+  `crates/common/tests/assertion_free_test_ratchet.rs`.
+  Tests: test_regression_every_remote_action_is_pinned_to_a_commit_sha,
+  unpinned_action_scan_bites, r4_uses_pinned_setup_terraform_action,
+  r5_uses_pinned_configure_aws_credentials_action.
+- [x] **RO-1 — the emergency recovery no longer deletes or drops market data.** It ran
+  `rm -rf` on ws_wal, spill and dlq and dropped ticks, market_depth and every candles_<tf>
+  with no verified S3 copy. Quotes 21/22 are spent; Quote 28 (2026-09-29) forbids it. The
+  deletions, the view drops and the table drops are removed; the journal and package cache
+  are vacuumed instead, and the partition grow, docker/QuestDB restart and re-enable stay.
+  Files: `.github/workflows/emergency-fs-recover.yml`,
+  `crates/storage/tests/emergency_fs_recover_view_exclusion_guard.rs`,
+  `crates/common/tests/github_workflow_guard.rs`, `crates/common/tests/shell_budget_guard.rs`.
+  Tests: test_regression_no_workflow_deletes_market_data_without_a_verified_copy,
+  market_data_deletion_scan_bites, test_regression_the_recovery_script_drops_no_table,
+  test_regression_the_recovery_script_keeps_the_wal_spill_and_dlq.
+
+#### Design
+
+OPS-2 extends existing SSM elements instead of adding any, so the SSM shell budget does not
+grow. RO-5 replaces each tag with the commit `git ls-remote` reports for it, so the version
+each job runs does not change. RO-1 deletes the destructive steps outright rather than gating
+them.
+
+#### Edge Cases
+
+OPS-2: `reset-failed` on a unit that is not failed is a no-op, and `|| true` covers a unit
+that is not loaded. RO-5: a commented-out `uses:` and a local `./` action are exempt; a short
+SHA is not a pin. RO-1: a root full of data is no longer freed by this workflow; grow the
+volume first (grow-ebs-volume.yml), then run it to extend the filesystem.
+
+#### Failure Modes
+
+OPS-2: if `reset-failed` itself fails, the restart runs exactly as before. RO-5: a wrong SHA
+fails the job at checkout of the action, loudly, before any step runs. RO-1: a full disk is
+no longer cleared by deleting data; the operator grows the volume instead.
+
+#### Test Plan
+
+`cargo test -p tickvault-common --test github_workflow_guard --test shell_budget_guard
+--test assertion_free_test_ratchet` and `cargo test -p tickvault-storage --test
+emergency_fs_recover_view_exclusion_guard`; each new scan has a bite test.
+
+#### Rollback
+
+Revert the commit. Workflows return to tag pins, no reset-failed, and the old recovery steps.
+No schema, config or data change.
+
+#### Observability
+
+No new metric, alarm or page (noise lock). The workflow logs show the reset-failed step.

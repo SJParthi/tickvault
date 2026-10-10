@@ -225,7 +225,7 @@ jobs:
 
       - name: Configure AWS credentials (bootstrap keys)
         if: github.event.inputs.credential_mode != 'oidc-role'
-        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c # v4 tag commit, 2026-07-15
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4 (commit; was the v4 tag object ff717079, 2026-10-09)
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -233,7 +233,7 @@ jobs:
 
       - name: Configure AWS credentials (OIDC role — has ZERO EC2 mutation grants today)
         if: github.event.inputs.credential_mode == 'oidc-role'
-        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c # v4 tag commit, 2026-07-15
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4 (commit; was the v4 tag object ff717079, 2026-10-09)
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION || 'ap-south-1' }}
@@ -710,11 +710,11 @@ jobs:
               "QDB_WANT_BYTES=$(awk -v g=$QDB_G \\"BEGIN{print g*1073741824}\\")",
               "if [ \\"$QDB_LIMIT_BYTES\\" != \\"$QDB_WANT_BYTES\\" ]; then echo FATAL: QuestDB container memory limit is $QDB_LIMIT_BYTES bytes but $QDB_WANT_BYTES = ${QDB_G}g was required. The .env upsert or compose recreate did NOT take effect; exit 1; fi",
               "echo MEMLIMIT_OK=$QDB_WANT_BYTES",
-              "systemctl daemon-reload",
+              "systemctl daemon-reload;systemctl reset-failed tickvault",
               "OLD_PID=$(systemctl show -p MainPID --value tickvault 2>/dev/null || echo 0)",
               "systemctl restart tickvault --no-block",
               "READY_OK=no; for i in $(seq 1 60); do NEW_PID=$(systemctl show -p MainPID --value tickvault 2>/dev/null || echo 0); if systemctl is-active --quiet tickvault && [ \"$NEW_PID\" != \"0\" ] && [ \"$NEW_PID\" != \"$OLD_PID\" ]; then READY_OK=yes; break; fi; sleep 5; done",
-              "if [ \"$READY_OK\" != yes ]; then echo FATAL: tickvault not active as a FRESH process within 300s - is-active alone can reflect the pre-restart PID so both is-active and a changed MainPID are required; journalctl -u tickvault.service -n 120 --no-pager --output=cat || true; exit 1; fi",
+              "if [ \"$READY_OK\" != yes ]; then echo FATAL: tickvault not a FRESH active process within 300s - needs is-active AND a changed MainPID; journalctl -u tickvault.service -n 120 --no-pager --output=cat || true; exit 1; fi",
               "echo APP-RESTARTED old_pid=$OLD_PID new_pid=$NEW_PID",
               "curl -fsS --max-time 5 http://127.0.0.1:3001/health || echo \"WARN: on-box health probe failed (API may be auth-gated or still warming)\"",
               "echo DOWNSIZE-BOX-OK"
