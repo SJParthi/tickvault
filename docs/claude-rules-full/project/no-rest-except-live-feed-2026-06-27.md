@@ -2451,7 +2451,8 @@ the alarms, their filters, or the hold ceiling.
   write the marker, since up to 5% of fetches may fail). Newest-wins then reports `partial` with no divergent
   cell: `rest_incomplete` hiding a price divergence at day level, the case
   this section forbids. A later attempt therefore never outranks an earlier
-  `diverged` one. The cost until 51d: a `diverged` caused by a sealed bar not
+  `diverged` one whose rows reached the database (see the Honest limits for an
+  attempt whose persist stopped before its first flush). The cost until 51d: a `diverged` caused by a sealed bar not
   yet readable at the first read stays the day's verdict even when the
   retry read it; the newer row shows what the retry saw.)* The stamps order
   the writes; they do not split the findings by attempt. Neither key carries
@@ -2493,9 +2494,16 @@ the alarms, their filters, or the hold ceiling.
   value the code stores: nothing in the process folds the cell audit into the
   daily row. A vacuous retry (`degraded`, `blind`, `no_data`) is the newest row
   and can shadow an earlier measured `partial` or `clean`; and a day whose live
-  side lost every minute reads `blind`, not `diverged`, though its traded
-  `missing_live` cells make the day `diverged` under the reader rule. Runbook
-  §4 says how to read both (round-4 review 2026-10-10).
+  side lost every minute reads `blind` or `degraded`, not `diverged`, though
+  its traded `missing_live` cells make the day `diverged` under the reader rule
+  (unless the read was truncated: those cells are `missing_live_unjudged`).
+  Runbook §4 says how to read both (round-4 review 2026-10-10).
+- The reader rule sees only rows that reached the database. An attempt whose
+  persist stopped before its first flush (the §12.15.8 deadline stop) leaves
+  no daily row and no cell; if it found a divergence and a later attempt could
+  not re-judge it, the day reads `partial`. Its only trace is the `finished`
+  line and the unpaged `xverify_persist_stopped_at_deadline` warning (round-5
+  review 2026-10-10).
 - `Excuse { sealed_through_secs_of_day: Some(t) }` takes `t` as given: a `t`
   before the session open would excuse every late-window candidate. Only
   `None` is built today; plan item 51d must bound `t` before it passes one.

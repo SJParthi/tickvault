@@ -444,9 +444,10 @@ pub struct DhanLiveXverifyDailyRow {
     /// one reading per attempt). Every attempt of a day writes its daily row at
     /// the same deterministic `ts`, and `outcome` is in the DEDUP key, so two
     /// attempts that read differently leave two rows. The day's verdict is the
-    /// newest `diverged` row if any row reads `diverged`, otherwise the row with
-    /// the newest `attempt_at` (§12.15.9, 2026-10-10 review): a later attempt
-    /// never hides an earlier `diverged` one. Two attempts with the same
+    /// newest `diverged` row if any row reads `diverged` or any real spot cell
+    /// exists, otherwise the row with the newest `attempt_at` (§12.15.9,
+    /// 2026-10-10 review): a later attempt never hides an earlier `diverged`
+    /// one whose rows reached the database. Two attempts with the same
     /// `outcome` share one row, which keeps the later stamp and counts. Not in
     /// the DEDUP key.
     pub attempt_at_ist_nanos: i64,

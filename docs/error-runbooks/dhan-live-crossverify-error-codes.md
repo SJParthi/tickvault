@@ -156,7 +156,8 @@ truncated) persists its rows and is retried; if the retry reads differently
 (for example `diverged` at 15:41 because one sealed bar was still waiting in
 QuestDB's WAL, then `partial` at 15:54 once it was readable) both rows stay.
 Cells the first attempt wrote and the retry did not (that missing minute) stay
-too. **A later attempt never outranks a `diverged` one** (§12.15.9, corrected
+too. **A later attempt never outranks a `diverged` one** whose rows reached
+the database (§12.15.9, corrected
 2026-10-10): a retry can read lower for a bad reason, because a target whose
 vendor fetch fails on the retry adds only `missing_rest` and its divergence is
 simply not judged again. The day reads `diverged` when ANY daily row of the
@@ -224,9 +225,19 @@ Query 2 picks the newest row whatever it reads, so a vacuous retry
 (`degraded`, `blind`, `no_data`) can shadow an earlier measured `partial` or
 `clean` row. Neither writes a marker for the vacuous attempt; read the earlier
 rows when query 2 returns a vacuous outcome. A day whose live side lost every
-minute reads `blind` (nothing lined up), not `diverged`, even when the vendor
-tape has traded minutes: its cells are real `missing_live` findings, so query 3
-makes the day `diverged`. The queries are Assumed: they were not run against a live QuestDB
+minute reads `blind` (nothing lined up) or `degraded` (a fetch also failed or
+the read was cut short), not `diverged`, even when the vendor tape has traded
+minutes: its cells are real `missing_live` findings, so query 3 makes the day
+`diverged`, unless the live read was truncated (its cells are then
+`missing_live_unjudged`, which query 3 does not count).
+
+The rule only sees rows that reached the database. An attempt whose persist
+stopped before its first flush (the §12.15.8 deadline stop) leaves no daily
+row and no cell, only the `finished` line and the
+`xverify_persist_stopped_at_deadline` warning. If that attempt found a
+divergence and a later attempt could not re-judge it (that target's fetch
+failed), the day reads `partial`. Search the app log for that warning on a
+day that reads `partial` (round-5 review 2026-10-10). The queries are Assumed: they were not run against a live QuestDB
 when written.
 
 **A `diverged` day is not always packet loss (until plan item 51d).** A
