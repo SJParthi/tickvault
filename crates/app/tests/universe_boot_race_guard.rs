@@ -143,6 +143,9 @@ fn every_wait_outcome_is_counted() {
         // own label it was indistinguishable from a rider that ran and failed,
         // and the three overnight boots that day looked like three failures.
         "producer_too_far",
+        // 2026-10-10: a non-trading day has no session to subscribe for, so
+        // the boot does not wait for the rider at all.
+        "non_trading_day",
     ] {
         assert!(
             src.contains(outcome),
