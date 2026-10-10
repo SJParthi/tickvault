@@ -109,9 +109,10 @@ const INDEX_SEGMENT: &str = "IDX_I";
 /// the CAS window the migration was made for, were structurally unverifiable by
 /// the one check the scope-lock calls the revived feed's only ground truth.
 ///
-/// It also mis-aimed the tail amnesty: `is_tail_minute` derives from this
-/// constant, so it excused 15:28-15:29 while the genuinely-unsealed tail had
-/// moved to 15:38-15:39. Deriving the value below fixes both at once.
+/// It also mis-aimed the tail amnesty: the old `is_tail_minute` derived from
+/// this constant, so it excused 15:28-15:29 while the genuinely-unsealed tail
+/// had moved to 15:38-15:39. Deriving the value below fixed both at once.
+/// (`is_tail_minute` was replaced by `is_late_window_minute` in §12.15.9.)
 ///
 /// Now DERIVED from the canonical constant rather than restated, so a future
 /// session-hours change cannot leave this file behind again. The const assert
@@ -610,7 +611,8 @@ pub fn secs_of_day(minute_ts_ist_nanos: i64, day_start_ist_nanos: i64) -> i64 {
         .div_euclid(NANOS_PER_SEC)
 }
 
-/// `true` when the bucket lies inside `[09:15, 15:30)` IST. Pure.
+/// `true` when the bucket lies inside `[09:15, 15:40)` IST (the session
+/// close is `SESSION_CLOSE_SECS_OF_DAY_IST`). Pure.
 #[must_use]
 pub fn is_in_session(minute_ts_ist_nanos: i64, day_start_ist_nanos: i64) -> bool {
     let s = secs_of_day(minute_ts_ist_nanos, day_start_ist_nanos);
@@ -892,11 +894,11 @@ pub struct DayComparison {
     ///
     /// # What this split does NOT decide
     ///
-    /// It is a MEASUREMENT, not a verdict. The `outcome` logic is unchanged:
-    /// `missing_live` in total still counts as a real divergence, because
-    /// narrowing that to the traded half would be a behaviour change resting
-    /// on an assumption about vendor tape-filling that nothing here has
-    /// verified.
+    /// It is a MEASUREMENT, not a verdict. *(Corrected 2026-10-10: this said
+    /// "`missing_live` in total still counts as a real divergence". The
+    /// outcome counts only a missing minute that traded or is an index; a
+    /// zero-volume non-index minute is reported here and never real, per
+    /// §12.15.9.)*
     ///
     /// **It says nothing at all for `IDX_I`.** An index has no volume by
     /// construction, so every index bar lands in the zero bucket regardless
@@ -915,8 +917,10 @@ pub struct DayComparison {
     pub tail_unsealed: i64,
     pub out_of_session: i64,
     /// Traded or index minutes missing from our side that fall in the
-    /// end-of-session window, whatever the policy and whether or not they
-    /// were judged. Under `Strict` the window is the derived one
+    /// end-of-session window AFTER the instrument's last live minute,
+    /// whatever the policy and whether or not they were judged. A minute
+    /// missing before a later live bar of the same instrument is never late:
+    /// that bar's tick closed the bucket (third review round 2026-10-10). Under `Strict` the window is the derived one
     /// ([`LATE_SEAL_WINDOW_MINUTES`]). A measurement: plan item 51d reads it
     /// to tell a read that may have been early from a final one.
     pub missing_live_late: i64,
@@ -1014,7 +1018,7 @@ fn percentile(sorted: &[i64], p: f64) -> i64 {
 /// | REST has it, live doesn't, traded or index, late window, `Excuse` | `late_excused` | no — may be unsealed at the read; holds the day at `partial` |
 /// | REST has it, live doesn't, traded or index, live read truncated | `missing_live_unjudged` | no — cannot be told from an unread minute; holds the day at `partial` |
 /// | live has it, REST doesn't | `missing_rest` | **no** — the REST tape is sparse by construction; reported as `Partial`, never `Clean`, never `Diverged` |
-/// | either side outside `[09:15, 15:30)` | `out_of_session` | no |
+/// | either side outside `[09:15, 15:40)` | `out_of_session` | no |
 #[must_use]
 /// Compares one day's live capture against the vendor's own tape.
 ///
@@ -1054,6 +1058,11 @@ pub fn compare_day_in_scope(
     type Key = (i64, String, i64);
 
     let mut live_map: BTreeMap<Key, &SideBar> = BTreeMap::new();
+    // Each instrument's latest in-session live minute. A bucket an instrument
+    // already traded past was closed by its own later tick, so a minute
+    // missing before it was never "not yet sealed" (§12.15.9, third review
+    // round 2026-10-10). O(log instruments) per live bar.
+    let mut last_live_minute: BTreeMap<(i64, String), i64> = BTreeMap::new();
     let mut rest_map: BTreeMap<Key, &SideBar> = BTreeMap::new();
     let mut instruments: BTreeSet<(i64, String)> = BTreeSet::new();
     let mut out_of_session: i64 = 0;
@@ -1071,6 +1080,10 @@ pub fn compare_day_in_scope(
             out_of_session = out_of_session.saturating_add(1);
             continue;
         }
+        let last = last_live_minute
+            .entry((b.security_id, b.segment.clone()))
+            .or_insert(b.minute_ts_ist_nanos);
+        *last = (*last).max(b.minute_ts_ist_nanos);
         live_map.insert((b.security_id, b.segment.clone(), b.minute_ts_ist_nanos), b);
     }
     for b in rest {
@@ -1202,7 +1215,13 @@ pub fn compare_day_in_scope(
                 // - otherwise → `missing_live`, real.
                 let is_index = segment == INDEX_SEGMENT;
                 let real_candidate = r.bar.volume > 0 || is_index;
+                // Late only after the instrument's own last live minute: a
+                // live bar later than this minute means its bucket rolled.
+                let after_last_live = last_live_minute
+                    .get(&(security_id, segment.clone()))
+                    .is_none_or(|last| minute > *last);
                 let late = real_candidate
+                    && after_last_live
                     && is_late_window_minute(minute, day_start_ist_nanos, late_bound);
                 if late {
                     missing_live_late = missing_live_late.saturating_add(1);
@@ -1376,11 +1395,16 @@ pub fn compare_day_in_scope(
 /// writes the same cell, or a same-`outcome` daily row, overwrites the stamp:
 /// a stamp is the LAST attempt that wrote the row, and the stamps order the
 /// writes without splitting the findings by attempt (the day's real findings
-/// are every `diverged` and `missing_live` cell of the day).
+/// are every spot `diverged` cell of the day and every spot `missing_live`
+/// cell whose Dhan minute traded or is an index; a zero-volume non-index
+/// minute is never real, and the §12.15.6 option pass's `NSE_FNO` cells are
+/// not part of the day's verdict).
 ///
 /// The reader rule (§12.15.9, corrected in the 2026-10-10 review): if ANY
 /// daily row of the day reads `diverged`, the day is `diverged` and the reader
-/// takes the newest such row; otherwise the newest row. A later attempt never
+/// takes the newest such row; it is also `diverged` when any real spot cell
+/// exists, because a persist can stop after flushing some cells and before
+/// its daily row (round 4); otherwise the newest row. A later attempt never
 /// hides an earlier `diverged` one, because a retry can read lower for a bad
 /// reason: a target whose vendor fetch fails on the retry adds only
 /// `missing_rest`, so the divergence that attempt 1 found on it is simply not
@@ -1460,7 +1484,10 @@ pub fn format_summary_line(cmp: &DayComparison) -> String {
             "🆘 Dhan live-vs-official check PROVED NOTHING today: {} minute(s) \
              of data existed but NONE lined up, so nothing was actually \
              compared. This is not a pass — the check itself needs attention.",
-            cmp.missing_live + cmp.missing_rest + cmp.late_excused + cmp.missing_live_unjudged
+            cmp.missing_live
+                .saturating_add(cmp.missing_rest)
+                .saturating_add(cmp.late_excused)
+                .saturating_add(cmp.missing_live_unjudged)
         ),
         DhanLiveXverifyOutcome::NoData => "⚠️ Dhan live-vs-official check found no data on \
              either side today — nothing was compared, so nothing is proven."
@@ -3573,7 +3600,21 @@ mod tests {
             !runbook.contains("AND attempt_at = '"),
             "the runbook must not pick a day's findings by stamp equality"
         );
-        assert!(runbook.contains("AND kind IN ('diverged', 'missing_live')"));
+        // Only real findings: a zero-volume non-index `missing_live` minute is
+        // never real (§12.15.9), so the query keeps traded and index minutes.
+        assert!(runbook.contains("AND (kind = 'diverged'"));
+        assert!(
+            runbook
+                .contains("OR (kind = 'missing_live' AND (rest_volume > 0 OR segment = 'IDX_I')))")
+        );
+        assert!(!runbook.contains("AND kind IN ('diverged', 'missing_live')"));
+        // Round 4: a persist can stop after flushing cells and before its
+        // daily row, so a real spot cell makes the day `diverged` too; the
+        // option pass's `NSE_FNO` cells have no daily row and stay out.
+        assert!(runbook.contains("OR query 3 finds any real spot finding"));
+        assert!(runbook.contains("AND segment <> 'NSE_FNO'"));
+        assert!(rule.contains("it is also `diverged` when any real spot cell of the"));
+        assert!(stub.contains("or any real spot finding in the cell audit"));
         assert!(rule.contains("they do not split the findings by attempt"));
         assert!(rule.contains("A later attempt therefore never outranks an earlier"));
         assert!(stub.contains("a later attempt never outranks it"));
@@ -4861,6 +4902,41 @@ mod tests {
         let cmp = unscoped(&live, &rest, excuse_inputs(None));
         assert_eq!(cmp.late_excused, 1);
         assert_eq!(cmp.outcome, DhanLiveXverifyOutcome::Partial);
+    }
+
+    /// Third review round 2026-10-10: a late-window minute missing BEFORE the
+    /// same instrument's later live bar is not "not yet sealed" (that bar's
+    /// tick closed the bucket), so `Excuse` never excuses it; only minutes
+    /// after the instrument's last live minute are late.
+    #[test]
+    fn a_late_gap_before_the_instruments_own_later_live_bar_is_never_excused() {
+        let m = |k: i64| SESSION_CLOSE_SECS_OF_DAY_IST - 60 * k;
+        let ib = || bar_vol(1.0, 1.0, 1.0, 1.0, 0);
+        // NIFTY: live 15:35, 15:37, 15:38, 15:39 — 15:36 is lost.
+        let mut live = vec![side(13, m(5), ib())];
+        live.extend((1..=3).map(|k| side(13, m(k), ib())));
+        // Equity 2: live up to 15:36 only — 15:37..15:39 may not have sealed.
+        live.push(eq_bar(2, m(5), 10));
+        live.push(eq_bar(2, m(4), 10));
+        let mut rest: Vec<SideBar> = (1..=5).map(|k| side(13, m(k), ib())).collect();
+        rest.extend((1..=5).map(|k| eq_bar(2, m(k), 10)));
+        let cmp = unscoped(&live, &rest, excuse_inputs(None));
+        assert_eq!(cmp.missing_live, 1, "the index gap at 15:36 is real");
+        assert_eq!(
+            cmp.late_excused, 3,
+            "only equity 2's three trailing minutes"
+        );
+        assert_eq!(cmp.missing_live_late, 3);
+        assert_eq!(cmp.outcome, DhanLiveXverifyOutcome::Diverged);
+        // Without the index gap the day is partial, never clean.
+        live.push(side(13, m(4), ib()));
+        let cmp = unscoped(&live, &rest, excuse_inputs(None));
+        assert_eq!(cmp.missing_live, 0);
+        assert_eq!(cmp.late_excused, 3);
+        assert_eq!(cmp.outcome, DhanLiveXverifyOutcome::Partial);
+        // An excuse bound earlier than the gap does not change the rule.
+        let cmp = unscoped(&live, &rest, excuse_inputs(Some(m(6))));
+        assert_eq!(cmp.late_excused, 3);
     }
 
     #[test]

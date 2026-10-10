@@ -206,15 +206,17 @@ pub enum DhanLiveXverifyCellKind {
     /// A traded or index minute missing from our side inside the derived
     /// end-of-session window (`LATE_SEAL_WINDOW_MINUTES`, or every bucket
     /// ending after the published seal progress), judged under the `Excuse`
-    /// policy: it may simply not have sealed by the read. Recorded, never
-    /// real, and it holds the day at `partial` at best (§12.15.9).
+    /// policy, and only when it comes AFTER that instrument's own last live
+    /// minute (a later live bar means its tick closed the bucket): it may
+    /// simply not have sealed by the read. Recorded, never real, and it holds
+    /// the day at `partial` at best (§12.15.9).
     LateExcused,
     /// A traded or index minute missing from our side on a run whose live
     /// read was cut short, so a missing minute cannot be told from an unread
     /// one. Recorded, never real, and it holds the day at `partial` at best
     /// (§12.15.9).
     MissingLiveUnjudged,
-    /// A row outside `[09:15, 15:30)` IST — recorded, not classified.
+    /// A row outside `[09:15, 15:40)` IST — recorded, not classified.
     OutOfSession,
 }
 
@@ -233,15 +235,21 @@ impl DhanLiveXverifyCellKind {
         }
     }
 
-    /// `true` for the kinds that constitute REAL divergence.
+    /// `true` for the kinds that CAN be real divergence.
     ///
-    /// `TailUnsealed`, `LateExcused`, `MissingLiveUnjudged` and `OutOfSession`
-    /// are explicitly EXCLUDED — they are
-    /// reported categories, never evidence of a feed problem (the doctrine:
-    /// separate expected fluctuation from real divergence).
+    /// `Diverged` is always real. `MissingLive` is real only when the Dhan
+    /// minute traded (`rest_volume > 0`) or the instrument is an index
+    /// (`segment = 'IDX_I'`); a zero-volume non-index minute keeps the kind
+    /// and is never real, so a reader must check those two columns too
+    /// (§12.15.9). `MissingRest`, `TailUnsealed`, `LateExcused`,
+    /// `MissingLiveUnjudged` and `OutOfSession` are EXCLUDED — reported
+    /// categories, never evidence of a feed problem (the doctrine: separate
+    /// expected fluctuation from real divergence). *(Corrected 2026-10-10:
+    /// this returned `true` for `MissingRest`, which the verdict has never
+    /// counted: the vendor tape is sparse by construction.)*
     #[must_use]
     pub const fn is_real_divergence(self) -> bool {
-        matches!(self, Self::Diverged | Self::MissingLive | Self::MissingRest)
+        matches!(self, Self::Diverged | Self::MissingLive)
     }
 }
 
@@ -436,9 +444,10 @@ pub struct DhanLiveXverifyDailyRow {
     /// one reading per attempt). Every attempt of a day writes its daily row at
     /// the same deterministic `ts`, and `outcome` is in the DEDUP key, so two
     /// attempts that read differently leave two rows. The day's verdict is the
-    /// newest `diverged` row if any row reads `diverged`, otherwise the row with
-    /// the newest `attempt_at` (§12.15.9, 2026-10-10 review): a later attempt
-    /// never hides an earlier `diverged` one. Two attempts with the same
+    /// newest `diverged` row if any row reads `diverged` or any real spot cell
+    /// exists, otherwise the row with the newest `attempt_at` (§12.15.9,
+    /// 2026-10-10 review): a later attempt never hides an earlier `diverged`
+    /// one whose rows reached the database. Two attempts with the same
     /// `outcome` share one row, which keeps the later stamp and counts. Not in
     /// the DEDUP key.
     pub attempt_at_ist_nanos: i64,
@@ -856,7 +865,9 @@ impl DhanLiveXverifyAuditWriter {
     /// it (the cell key has no attempt), so a cell's `attempt_at` is the LAST
     /// attempt that wrote it. The stamps order the writes; they do not split
     /// the findings by attempt, and the day's real findings are every
-    /// `diverged` and `missing_live` cell of the day (§12.15.9 reader rule).
+    /// `diverged` cell of the day and every `missing_live` cell whose Dhan
+    /// minute traded (`rest_volume > 0`) or is an index (§12.15.9 reader
+    /// rule; a zero-volume non-index minute is never real).
     /// The §12.15.6 option pass stamps its own cells and writes no daily row.
     ///
     /// # Errors
@@ -1292,7 +1303,7 @@ mod tests {
 
         assert!(DhanLiveXverifyCellKind::Diverged.is_real_divergence());
         assert!(DhanLiveXverifyCellKind::MissingLive.is_real_divergence());
-        assert!(DhanLiveXverifyCellKind::MissingRest.is_real_divergence());
+        assert!(!DhanLiveXverifyCellKind::MissingRest.is_real_divergence());
         // The doctrine: expected fluctuation is NOT divergence.
         assert!(
             !DhanLiveXverifyCellKind::TailUnsealed.is_real_divergence(),
@@ -1598,8 +1609,9 @@ mod tests {
     /// row at the same deterministic `ts` and `outcome` is in the DEDUP key,
     /// so a retry that reads differently leaves a second row. `attempt_at`
     /// (one reading per attempt, on the daily row AND every cell) and
-    /// `run_complete` (daily) let a reader pick the latest attempt and its
-    /// own findings. Both reach an old table through the ALTER self-heal with
+    /// `run_complete` (daily) let a reader order the writes; they do not split
+    /// the findings by attempt (a cell keeps the stamp of the last attempt
+    /// that wrote it; the day's reader rule is in §12.15.9). Both reach an old table through the ALTER self-heal with
     /// the CREATE's type, ride the ILP line as fields with the matching wire
     /// type, and stay OUT of every DEDUP key: in the key they would turn each
     /// retry's rows into new rows instead of upserting the same finding.
@@ -1923,14 +1935,16 @@ mod tests {
     /// narrowing it would hide real loss.
     #[test]
     fn test_is_real_divergence_separates_expected_fluctuation_from_real_faults() {
-        // Real: a price disagreement, or a minute one side never had.
+        // Real: a price disagreement, or a minute we never captured.
         assert!(DhanLiveXverifyCellKind::Diverged.is_real_divergence());
         assert!(
             DhanLiveXverifyCellKind::MissingLive.is_real_divergence(),
             "a minute Dhan's own tape has but we never captured is the closest \
              proxy we have for packet loss — it MUST count"
         );
-        assert!(DhanLiveXverifyCellKind::MissingRest.is_real_divergence());
+        // A minute only our side has is never a fault: the vendor tape is
+        // sparse by construction (the verdict reads it as `partial` at most).
+        assert!(!DhanLiveXverifyCellKind::MissingRest.is_real_divergence());
         // Expected: recorded for the operator, never counted as a fault.
         assert!(
             !DhanLiveXverifyCellKind::TailUnsealed.is_real_divergence(),
@@ -1938,9 +1952,9 @@ mod tests {
         );
         assert!(
             !DhanLiveXverifyCellKind::OutOfSession.is_real_divergence(),
-            "a row outside [09:15, 15:30) is recorded, never classified"
+            "a row outside [09:15, 15:40) is recorded, never classified"
         );
-        // Exactly three of the seven kinds are real.
+        // Exactly two of the seven kinds can be real.
         // 2026-10-06 (§12.15.9): an excused late minute and an unjudged
         // minute are recorded, never real.
         assert!(!DhanLiveXverifyCellKind::LateExcused.is_real_divergence());
@@ -1954,7 +1968,7 @@ mod tests {
             DhanLiveXverifyCellKind::MissingLiveUnjudged,
             DhanLiveXverifyCellKind::OutOfSession,
         ];
-        assert_eq!(kinds.iter().filter(|k| k.is_real_divergence()).count(), 3);
+        assert_eq!(kinds.iter().filter(|k| k.is_real_divergence()).count(), 2);
     }
 
     // -----------------------------------------------------------------
