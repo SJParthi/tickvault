@@ -6104,6 +6104,18 @@ No new metric, alarm or page. Book rows use the existing depth counters (rows st
 
 Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
 
+## ITEM 49e-4 — Step 4: array rows turned on in production (2026-10-10)
+
+- [x] `[depth_storage] array_rows = true` in `config/production.toml` (base.toml stays false) — Files: config/production.toml — Tests: test_depth_storage_config_ships_off_in_base_toml, test_resolve_records_the_first_instant_once_and_keeps_it
+
+Why: the operator's 2026-10-09 instruction for PR #2043, "ships OFF; after deploy, turn it on through automation before market open". #2043 merged at `5964162` with All Green and went live with the setting off in the deploy of `55831e2` (2026-10-10, 00:28 UTC). This config change deploys on merge (the deploy workflow watches `config/**`), so the first boot with it on is an off-market boot before Monday 12 Oct's open, which records the start instant. The scope-lock condition (a recorded QuestDB scratch-table test) is met by ITEM 49d / 45i (2026-10-06).
+
+Rollback: set `array_rows = false` and redeploy; the next boot removes the instant and writes `market_depth` only. Rows already in `market_depth_book` stay and age out on the depth window.
+
+Observability: the boot logs whether array rows are on and the instant in use. Check after the first boot: `SELECT count(*) FROM market_depth_book WHERE ts IN today()` grows during the session, and the depth apply lag on `tv_questdb_wal_apply_lag_max` falls against 2026-10-09.
+
+Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
+
 ## ITEM 51 — Dhan 15:41 cross-verification hardening (2026-10-06)
 
 Approved by Parthiban 2026-10-06: "Go ahead with whatever you want dude" and "See do everything whatever is recommended dude okay?", answering the recommended cross-verification hardening list (five findings: the day marker, the read that runs too early, missing minutes that never page, a day with no run at all, and targets fixed at boot). Rule authority: `no-rest-except-live-feed-2026-06-27.md` §12.15.7 onward and the noise lock §2.5 notes, each dated and recorded before its code. Ten serial PRs, one sub-item each. Findings Verified by reading `origin/main` at `60bdfd97a`; cargo was not run for the findings.

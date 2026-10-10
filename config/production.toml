@@ -83,3 +83,16 @@ sns_enabled = true
 # change: [rest_candle_fold] is OFF in base.toml — the two cannot both write
 # candles_<tf> under feed='dhan'.
 dhan_enabled = true
+
+[depth_storage]
+# 2026-10-10 — array_rows turned ON for production (plan item 49e step 4).
+# Operator, 2026-10-09: the array-row depth writer "ships OFF; after deploy,
+# turn it on through automation before market open". The writer (PR #2043)
+# went live with the setting off on 2026-10-10; this line turns it on, and
+# the next boot (before Monday 12 Oct's open) records the start instant in
+# data/state/depth_book_since. From then on depth goes to `market_depth_book`
+# (one row per book side, levels in arrays, about 11-13.5x fewer bytes);
+# frames received before that instant stay in `market_depth`. base.toml
+# keeps the default OFF. Rollback: set false and redeploy; the next boot
+# removes the instant and writes `market_depth` only.
+array_rows = true
