@@ -6655,3 +6655,29 @@ Nothing is deleted until apply. Deleted versions cannot be restored; that is the
 
 ### Observability (Item 53)
 The job summary and an uploaded artifact carry the per-group report before and after the delete, including every kept-unparsed key (up to 50).
+
+## ITEM 54 — Clean shutdown: no runtime drop at exit, and a lane that stops during WAL recovery (added 2026-10-10)
+
+Authority: the owner's 2026-10-10 ask to fix everything ("make everything to work and finish and fix and resolve everything"), relayed by the coordinator with the brief "fix the unclean shutdown, zero tick loss". Evidence from CloudWatch `/tickvault/prod/app`: 6 Oct 15:46:51 IST "PANIC: tickvault crashed" ("A Tokio 1.x context was found, but it is being shutdown", 20 ms after "tickvault stopped"); 9 Oct 22:41 and 10 Oct 02:17 IST "frame drain DIED (task cancelled)" about 85 s after "tickvault stopped".
+
+- [x] 54a — `main` leaks the runtime after `block_on` instead of dropping it; the lane checks for a stop before the boot refold, before each catch-up round and each lag-pause step, ends replay pacing on a stop, and closes its writers without spawning the drain or dialling when a stop arrived first (crates/app, tickvault-app).
+  - Files: crates/app/src/main.rs, crates/app/src/dhan_feed_stack.rs, crates/app/tests/shutdown_runtime_not_dropped_guard.rs
+  - Tests: main_leaks_the_runtime_after_block_on_and_never_drops_it, a_blocking_timer_fails_after_a_dropped_runtime_and_works_after_a_leaked_one, close_lane_before_dial_mirrors_the_drain_shutdown_tail, the_lane_never_spawns_the_drain_after_a_shutdown, the_boot_recovery_checks_for_a_shutdown_at_every_safe_boundary, close_lane_before_dial_hands_off_the_tail_and_joins_the_writer
+
+### Design (Item 54)
+Two causes, two fixes. (1) Dropping the tokio runtime at the end of `main` shuts the time and IO drivers down while blocking-pool threads may still wait on a timer through `Handle::block_on` (the tick spill replay round), which panics and, under `panic = "abort"`, dumps core; and it waits without bound for a worker stuck in synchronous work. `main` now leaks the runtime: every durable tier was already drained by the shutdown sequence, and work still running is crash-safe by design. (2) The lane read the stop only during its token wait and inside the drain, so a stop during the boot WAL refold or the catch-up drain ran both to the end and then spawned the drain into a dying runtime. The lane now reads `SOCKET_STOP` (requested first by `main`, never cleared, one atomic load) at safe boundaries only: it never interrupts a refold batch mid-way, because a half-folded batch would seal partial candles.
+
+### Edge Cases (Item 54)
+Stop before the boot refold: nothing is folded, staged segments stay in `replaying/` and the next boot re-offers them (same as the token-wait stop). Stop during a refold batch: the batch finishes unpaced; rows a full queue cannot take are rescued to the spill tier or marked unapplied in the WAL, exactly as an unpaced in-session replay does. Stop during a lag pause: noticed within one 5 s poll step. Stop after the catch-up but before the dial: the drain's own shutdown tail runs on a drain that saw no frames, then the lane returns; the lane-running flag was never set and the up-gauge never rose.
+
+### Failure Modes (Item 54)
+A refold batch or ack wait longer than `main`'s 30 s lane budget still logs the existing shutdown-timeout ERROR, and the process then exits with the lane mid-work: unconfirmed segments are re-read next boot (DEDUP makes the re-fold idempotent). Log lines written in the last moment before exit may not reach the log file, because the logging guards were already leaked for the process lifetime; this is unchanged from before.
+
+### Test Plan (Item 54)
+A real-runtime bite test shows a blocking thread's timer failing after a dropped runtime and working after a leaked one. Source guards pin the leak in `main`, the stop checks at each boundary, the no-spawn-after-stop return, and the shutdown tail order against `run_frame_drain`. A behavioural test runs `close_lane_before_dial` on a lane with an offloaded writer and a buffered tick.
+
+### Rollback (Item 54)
+Revert the PR. No config, schema, table or alarm changes.
+
+### Observability (Item 54)
+New info lines: "shutdown arrived before the WAL refold", "shutdown arrived before the sockets were dialled"; the catch-up summary line gains `stop_reason = "shutdown"` and a planned stop is not counted on `tv_wal_catchup_budget_exhausted_total`. No new metric or alarm. Per-item guarantee matrix: see the plan's shared matrix section.
