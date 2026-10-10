@@ -935,6 +935,15 @@ async fn async_main() -> Result<()> {
             config.questdb.clone(),
         ),
     );
+    // Contract name repair (2026-10-10, item 53): once a day after the close,
+    // put the `contract` name back on rows a boot rewrote without one (the
+    // 2026-10-09 evening redeploys). Process-global, every boot mode; it only
+    // touches days whose contract files are still on disk.
+    tokio::spawn(
+        tickvault_app::contract_name_repair_boot::run_contract_name_repair_loop(
+            config.questdb.clone(),
+        ),
+    );
     // PR-C2 (2026-07-13): the Dhan dormant activation watcher
     // (`dhan_activation.rs`) and the D2b runtime cold-start supervisor
     // (`run_dhan_lane_runtime_supervisor` + `dhan_lane_ctx_cell`) that were

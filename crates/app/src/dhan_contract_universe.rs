@@ -2168,6 +2168,27 @@ pub fn publish_contract_labels_at_boot(date_ist: &str) -> usize {
     n
 }
 
+/// Every contract name the writers would have given `date_ist`'s rows: spot
+/// and index names from that day's symbol map, plus every option name from
+/// that day's contract file, built exactly as the boot publish builds them.
+///
+/// Reads `date_ist`'s own files only, never an earlier day's: a repair must
+/// name a day's rows with that day's ids. `None` when the day's symbol map
+/// does not read (no file for a weekend, or kept past
+/// `ARTIFACT_RETENTION_DAYS`). A missing contract file names spots only.
+/// O(rows of both files), cold; used by the after-close name repair.
+#[must_use]
+pub fn contract_names_for_day(
+    date_ist: &str,
+) -> Option<tickvault_storage::candle_contract_labels::CandleContractLabels> {
+    let symbols = read_symbol_map(date_ist).ok()?;
+    let mut labels = spot_labels_from(&symbols);
+    if let Ok(contracts) = read_contract_artifact(date_ist) {
+        labels.extend(option_labels_from(&contracts));
+    }
+    Some(labels)
+}
+
 /// IST "now" as epoch nanoseconds — wall clock plus the fixed IST offset, the
 /// same convention the `ticks` designated timestamp is written in.
 fn ist_now_nanos() -> i64 {
@@ -4447,6 +4468,14 @@ mod tests {
         // nothing is read and nothing is published — the column stays as it
         // is rather than wrong.
         assert_eq!(publish_contract_labels_at_boot("1999-01-01"), 0);
+    }
+
+    #[test]
+    fn contract_names_for_day_is_none_without_that_days_symbol_map() {
+        // Never steps back to an earlier day: a repair names a day's rows
+        // with that day's ids or not at all.
+        assert!(contract_names_for_day("1999-01-01").is_none());
+        assert!(contract_names_for_day("not-a-date").is_none());
     }
 
     /// Regression (2026-10-10): the 02:01 IST boot replayed 9 Oct frames with
