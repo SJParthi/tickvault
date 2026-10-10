@@ -8483,7 +8483,7 @@ the depth-200 one-for-one `Swap`.
 | Main-feed late contract top-up, D3b widen | `Extend` in place | unchanged; runs on the shared in-place write engine |
 | Depth-20 index legs | `Extend` in place | unchanged; same engine |
 | Unsubscribe probe Arm B, main-feed overflow probe | deliberate close | kept: a diagnostic and 805 recovery, not a subscription change |
-| Dial fail, vendor close, 807, idle and silence watchdogs | redial | kept: genuine faults |
+| Dial fail, vendor close, 807, idle and silence watchdogs | redial | kept: genuine faults; cross-feed (drain-inferred) silence: kept as a fault redial, refused after 805 (added 2026-10-10, see "2026-10-10 — PER-KIND FRAME-SILENCE THRESHOLDS") |
 
 No deliberate redial remains for a subscription change (ratchet
 `no_deliberate_redial_remains_for_a_subscription_change`).
@@ -9036,3 +9036,126 @@ REJECT (review round 10):
   here and derives from it (740 - 120 - 20), so it cannot rise without the
   bound rising.
 - Moves a bound and the REJECT row that forbids moving it in the same change.
+
+### 2026-10-10 — PER-KIND FRAME-SILENCE THRESHOLDS (fault redials only)
+
+**Owner, verbatim, each with its own date:**
+
+- 2026-10-06: "Go ahead with whatever you want dude"
+- 2026-10-06: "See do everything whatever is recommended dude okay?"
+- 2026-10-10: "Why idle go ahead fully"
+
+*(Provenance: the two 2026-10-06 quotes approved the recommended fast-lane
+plan (ITEM 52 of `active-plan-feed-hardening.md`, whose 52g and 52h are this
+work). The 2026-10-10 quote reached the implementing session through the
+coordinator's workflow. Confirm all three against the owner thread before
+merge.)*
+
+Recorded HERE before the code, per the rule-file-first law.
+
+#### What was wrong (Verified in source on main 4ce1d7208)
+
+1. `FRAME_SILENCE_REDIAL_SECS` (300 s) was ONE threshold for every socket
+   kind; `ConnectionSupervisor::poll` never read the endpoint. A main-feed or
+   depth-20 socket that stopped delivering while its siblings kept streaming
+   stayed blind for five minutes.
+2. The same 300 s rule closed and redialled HEALTHY depth-200 sockets. Each
+   holds one contract, and the repository itself measured 56 minutes of benign
+   silence on one (which is why `worst_connection_tick_age_secs` excludes
+   depth-200). The constant's doc carried the false sentence "a depth socket
+   carries an at-the-money contract, so five minutes of silence there is a dead
+   subscription"; it is deleted.
+
+#### The rule
+
+Silence is judged on EVIDENCE, not on time alone. Every redial below is a
+genuine-fault redial (reason `IdleSilence`, unchanged), never a subscription
+change, so the 2026-10-01 law is untouched.
+
+| Socket | Fast path (needs evidence) | Fallback (time only) |
+|---|---|---|
+| Main feed | 60 s, confirmed by at least 2 OTHER main-feed sockets that delivered a frame in the last 10 s | 300 s, as before |
+| Depth-20 | 90 s, confirmed the same way by at least 2 other depth-20 sockets | 300 s, as before |
+| Depth-200 | cross-feed: 90 s with no depth frame while the main feed shows the held contract trading at least 30 s after that last frame | 900 s backstop (was 300 s) |
+
+Conditions on every fast path (all must hold):
+
+- inside 09:15:00–15:15:00 IST only (`CONFIRMED_SILENCE_CLOSE_SECS_OF_DAY_IST`
+  = the 15:15 closing-auction open); 15:15–15:40 stays on the fallback;
+- no overflow episode engaged (`overflow_episode_engaged()`) and no 805 this
+  process (`rotation_halted()`); `ROTATION_HALTED` is only ever READ;
+- main feed and depth-20: the socket holds at least 1,000 (main) / 20
+  (depth-20) instruments;
+- main feed and depth-20: per-kind, pool-wide spacing of 15 s between fast
+  redials (`CONFIRMED_REDIAL_SPACING_SECS`), taken by one compare-and-swap;
+- main feed and depth-20: per-socket ESCALATION. Every silence redial of the
+  socket (fast or 300 s) adds a strike, and each strike doubles its next fast
+  threshold (60 → 120 → 240 → 300 on the main feed); the strikes reset only
+  after 900 s with no silence redial, so a
+  deaf socket that bursts one snapshot after every dial cannot loop every
+  ~61 s;
+- depth-200: the cross-feed request carries the socket's dial generation, so
+  a request raised before a redial is dropped (counted `stale`); one request
+  per socket per 300 s; a request taken after an 805 is refused with path
+  `data_silence` on `tv_depth_dial_refused_after_805_total`;
+- depth-200 cross-feed: inside the same 09:15:00–15:15:00 IST window.
+
+**Shadow first.** `[dhan_universe] frame_silence_fast_path` defaults to
+`shadow` (serde default and `config/base.toml`): the fast paths COUNT "would
+redial" (`tv_dhan_ws_frame_silence_would_redial_total{endpoint,basis}`) and do
+nothing else. `act` is a later one-line config PR, after a shadow week shows
+the per-socket peak gap (`tv_dhan_ws_conn_frame_gap_max_secs`) and the
+would-redial count are safe. `off` restores the old main-feed and depth-20
+timing exactly. The depth-200 900 s backstop is in code and active from merge.
+
+#### What this AMENDS
+
+- The 2026-10-02 inventory row "idle and silence watchdogs | redial | kept"
+  now also lists "cross-feed (drain-inferred) silence: kept as a fault
+  redial, refused after 805".
+- Nothing else: socket counts, caps, `ROTATION_HALTED`, the 805 probe rules
+  and the in-place change mechanism are unchanged.
+
+#### ⚠ Honest envelope
+
+- **Assumed:** normal per-socket gaps on the main feed and depth-20 inside
+  09:15–15:15 are far below 60 / 90 s. No per-socket measurement exists yet;
+  shadow mode and the new gap gauge measure it before anything acts.
+- **Assumed:** Dhan sends a depth-200 frame on the book change a trade
+  causes. If it conflates or throttles, the cross-feed path could redial a
+  healthy socket; bounded by 90 s silence, a 30 s lead, the 300 s cooldown
+  and shadow mode first.
+- **Worse in one case:** a deaf depth-200 socket whose contract the main feed
+  does not track now waits 900 s instead of 300 s, and depth-200 is not on
+  the deaf gauge, so nothing pages for it.
+- Every redial is a genuine reconnect with no snapshot-on-subscribe, so a
+  false fast redial loses the prints inside its ~2 s blind window on up to
+  5,000 instruments. Shadow mode, the evidence rules, the spacing and the
+  escalation bound that; they do not remove it.
+- Pools with 2 or fewer sockets of a kind never get sibling confirmation and
+  stay at 300 s.
+- Shadow counts overstate what `act` would do: a would-redial takes no
+  spacing slot and adds no strike, so several sockets can count in the same
+  15 s and one socket can count again 60 s later where `act` would have
+  waited.
+- A depth-200 socket under an overflow probe was redialled at 300 s of
+  silence; it now waits 900 s, past the 740 s window bound, so a deaf probed
+  depth-200 socket can let its window pass (errs toward pass, recorded, not
+  changed).
+- A forward wall-clock step of 90 s or more between the read task's stamp
+  and the scan can make a healthy depth-200 socket look silent for one scan.
+  Rare; bounded by the 30 s trade lead and the 300 s cooldown.
+
+REJECT (2026-10-10):
+
+- A pure-time depth-200 silence threshold below 900 s.
+- Any fast path that fires without sibling or cross-feed evidence.
+- Cross-kind sibling evidence, or a single sibling as evidence.
+- Any fast path firing while an overflow episode is engaged or after an 805.
+- Removing the per-socket escalation or the per-kind spacing.
+- A confirmed threshold where threshold × `FLAP_REDIAL_CEILING` is not above
+  `FLAP_WINDOW_MS` / 1000.
+- A new `ReconnectReason` variant for silence without a fresh dated quote
+  here first.
+- Defaulting `frame_silence_fast_path` to `act` without a dated row here
+  recording the shadow-week measurement.

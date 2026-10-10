@@ -118,8 +118,9 @@ use tickvault_core::websocket::pool_budget::{
     ConnectionSlot, DhanEndpointType, MAX_TOTAL_DHAN_CONNECTIONS, connection_slot_label,
 };
 use tickvault_core::websocket::pool_supervisor::{
-    CapturedFrame, ConnectionSupervisor, ExtendOutcome, FrameSilenceGate, LiveSubscriptionCommand,
-    MAIN_RECONNECT_RECOVERY_MAX_MS_GAUGE, PoolSupervisor, RingByteBudget, SubscribeGuard,
+    CapturedFrame, ConnectionSupervisor, DataSilenceRefusal, ExtendOutcome, FrameSilenceFastPath,
+    FrameSilenceGate, LiveSubscriptionCommand, MAIN_RECONNECT_RECOVERY_MAX_MS_GAUGE,
+    PoolSupervisor, RingByteBudget, SiblingEvidence, SilenceBasis, SubscribeGuard,
     SubscribeGuardRefusal, SubscribeInstrument, WalRingSink, run_connection_with_commands,
     take_main_feed_reconnect_recovery_max_ms,
 };
@@ -1495,6 +1496,10 @@ pub struct LiveIngest {
     /// other caller unaffected.
     inline_depth: Option<DepthIngest>,
     detector: TickGapDetector,
+    /// Per slot, the depth-200 baseline the cross-feed check last acted on
+    /// (requested, refused or counted in shadow), so one silent stretch is
+    /// reported once. 0 = none. Indexed by global connection slot.
+    depth200_cross_feed_latched: [i64; MAX_TOTAL_DHAN_CONNECTIONS as usize],
     /// Edge latch for the dead-class detector: one bit per segment, set while
     /// that class is reported dead.
     ///
@@ -2810,6 +2815,7 @@ impl LiveIngest {
             // OFF unless explicitly enabled — see `with_inline_depth`.
             inline_depth: None,
             detector: TickGapDetector::with_capacity(capacity, DetectorConfig::default()),
+            depth200_cross_feed_latched: [0; MAX_TOTAL_DHAN_CONNECTIONS as usize],
             dead_class_latch: AtomicU8::new(0),
             dead_class_dead_scans: [const { AtomicU8::new(0) }; SEGMENT_CLASS_COUNT],
             // Created HERE rather than passed in, so one drain can never end
@@ -4642,6 +4648,141 @@ impl LiveIngest {
         (silent, never)
     }
 
+    /// Depth-200 cross-feed check (scope lock 2026-10-10, plan item 52h).
+    ///
+    /// A depth-200 socket carries one contract, so its silence alone proves
+    /// nothing: a quiet contract is a quiet book. What does prove a deaf
+    /// socket is the MAIN feed showing that contract TRADING while the depth
+    /// socket stays silent. For each depth-200 slot this asks: has the socket
+    /// been silent for at least [`DEPTH200_CROSS_FEED_SILENCE_MS`], and did
+    /// the main feed record a trade at least
+    /// [`DEPTH200_CROSS_FEED_TRADE_LEAD_MS`] after the socket's last frame?
+    /// If so it asks that socket's connection task to redial (`Act`), or
+    /// counts a would-redial (`Shadow`).
+    ///
+    /// The baseline is the later of the read task's last-frame stamp and the
+    /// moment the slot started holding its contract. The read task's stamp is
+    /// used, never the drain's, so a depth shed or a ring refusal cannot make
+    /// a healthy socket look silent. An untracked contract gives no evidence
+    /// and leaves only the 900 s backstop.
+    ///
+    /// Gated off outside 09:15–15:15 IST (the closing-auction minutes stay on
+    /// the 900 s backstop), during an overflow episode, after an 805 halted
+    /// rotation, and in `Off`. Each silent stretch is
+    /// acted on once.
+    ///
+    /// Returns how many slots met the condition this scan.
+    ///
+    /// # Complexity
+    /// O(slots) = O(26) probes of fixed registers plus one detector hash
+    /// probe per held depth-200 contract (at most 10), every
+    /// [`SILENCE_SCAN_INTERVAL`] on the drain's cold timer arm. No allocation.
+    pub fn check_depth200_cross_feed(
+        &mut self,
+        now_millis: u64,
+        fast_path: FrameSilenceFastPath,
+    ) -> u32 {
+        use tickvault_core::websocket::pool_supervisor as ps;
+        let gate_open = FrameSilenceGate::ContinuousSessionIst
+            .confirmed_window_open_at(tickvault_common::market_hours::now_ist_secs_of_day())
+            && !ps::overflow_episode_engaged()
+            && !ps::rotation_halted();
+        self.check_depth200_cross_feed_with(
+            now_millis,
+            fast_path,
+            gate_open,
+            ps::depth200_held,
+            ps::last_frame_wall_ms,
+            ps::request_data_silence_redial,
+        )
+    }
+
+    /// The injectable half of [`Self::check_depth200_cross_feed`]: the gate,
+    /// the two registers and the request are passed in, so a test drives it
+    /// without touching process-wide state. O(slots), no allocation.
+    fn check_depth200_cross_feed_with(
+        &mut self,
+        now_millis: u64,
+        fast_path: FrameSilenceFastPath,
+        gate_open: bool,
+        held: impl Fn(u8) -> Option<(u64, ExchangeSegment, i64)>,
+        last_frame: impl Fn(u8) -> Option<i64>,
+        mut request: impl FnMut(u8, i64) -> Result<(), DataSilenceRefusal>,
+    ) -> u32 {
+        if !gate_open || fast_path == FrameSilenceFastPath::Off {
+            return 0;
+        }
+        let now_ms = i64::try_from(now_millis).unwrap_or(i64::MAX);
+        let mut met = 0_u32;
+        for idx in 0..MAX_TOTAL_DHAN_CONNECTIONS {
+            if !matches!(
+                tickvault_core::websocket::pool_budget::slot_owner(idx),
+                Some((_, DhanEndpointType::Depth200))
+            ) {
+                continue;
+            }
+            let Some((security_id, segment, since)) = held(idx) else {
+                continue;
+            };
+            let baseline = last_frame(idx).unwrap_or(0).max(since);
+            let last_trade = self
+                .detector
+                .last_trade_millis((security_id, segment))
+                .and_then(|ms| i64::try_from(ms).ok());
+            if !depth200_cross_feed_silent(now_ms, baseline, last_trade) {
+                continue;
+            }
+            met = met.saturating_add(1);
+            let Some(latch) = self.depth200_cross_feed_latched.get_mut(usize::from(idx)) else {
+                continue;
+            };
+            if *latch == baseline {
+                continue;
+            }
+            let silent_secs = now_ms.saturating_sub(baseline) / 1_000;
+            match fast_path {
+                FrameSilenceFastPath::Act => {
+                    let outcome = match request(idx, now_ms) {
+                        Ok(()) => "requested",
+                        // Transient: an earlier request for this slot is still
+                        // waiting or cooling down, and was logged when it was
+                        // made. Leave the latch open so this stretch is asked
+                        // again on a later scan once the slot can take it;
+                        // otherwise a socket deaf again inside the cooldown
+                        // would wait for the 900 s backstop.
+                        Err(DataSilenceRefusal::CoolingDown | DataSilenceRefusal::StillPending) => {
+                            continue;
+                        }
+                        Err(refusal) => refusal.as_str(),
+                    };
+                    *latch = baseline;
+                    warn!(
+                        code = ErrorCode::WsGapConnectionState.code_str(),
+                        source = "depth200_cross_feed",
+                        connection = connection_slot_label(idx),
+                        security_id,
+                        segment = segment.as_str(),
+                        silent_secs,
+                        outcome,
+                        "Dhan depth-200 socket is silent while the main feed shows its \
+                         contract trading; asking the socket to redial"
+                    );
+                }
+                FrameSilenceFastPath::Shadow => {
+                    *latch = baseline;
+                    metrics::counter!(
+                        tickvault_core::websocket::pool_supervisor::FRAME_SILENCE_WOULD_REDIAL_METRIC,
+                        "endpoint" => DhanEndpointType::Depth200.as_str(),
+                        "basis" => SilenceBasis::CrossFeed.as_str()
+                    )
+                    .increment(1);
+                }
+                FrameSilenceFastPath::Off => {}
+            }
+        }
+        met
+    }
+
     /// [`Self::scan_silence`], but it also hands back the IDENTITIES of the
     /// quietest instruments.
     ///
@@ -5636,6 +5777,10 @@ fn seed_drain_loss_baselines() {
     ] {
         metrics::counter!(WS_LAG_EXCLUDED_COUNTER, "reason" => reason).increment(0);
     }
+    // Frame-silence redials and would-redials per endpoint and basis, and the
+    // stale cross-feed request counter (scope lock 2026-10-10). Local
+    // /metrics only; no alarm reads them.
+    tickvault_core::websocket::pool_supervisor::seed_frame_silence_counters();
 }
 
 /// Counter: daily cross-verification attempts, by outcome. Anything other than
@@ -7038,6 +7183,44 @@ pub const SILENCE_SCAN_INTERVAL_SECS: u64 = 30;
 /// [`SILENCE_SCAN_INTERVAL_SECS`] as a `Duration`.
 const SILENCE_SCAN_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(SILENCE_SCAN_INTERVAL_SECS);
+
+/// How long a depth-200 socket must be frame-silent before the main feed's
+/// view of its contract can count as evidence (scope lock 2026-10-10).
+pub const DEPTH200_CROSS_FEED_SILENCE_MS: u64 = 90_000;
+
+/// How far after the socket's last frame the main feed's last trade must
+/// fall: a trade that lands while the socket was still delivering, or just
+/// after, is not evidence of a deaf socket.
+pub const DEPTH200_CROSS_FEED_TRADE_LEAD_MS: u64 = 30_000;
+
+const _: () = {
+    // The lead must sit inside the silence window, or a trade could be
+    // required after "now".
+    assert!(DEPTH200_CROSS_FEED_TRADE_LEAD_MS < DEPTH200_CROSS_FEED_SILENCE_MS);
+    // The fast path must be faster than the time backstop it sits beside.
+    assert!(
+        DEPTH200_CROSS_FEED_SILENCE_MS
+            < tickvault_core::websocket::pool_supervisor::DEPTH200_SILENCE_BACKSTOP_SECS * 1_000
+    );
+};
+
+/// The cross-feed condition: silent for at least
+/// [`DEPTH200_CROSS_FEED_SILENCE_MS`] since `baseline`, and a main-feed trade
+/// at least [`DEPTH200_CROSS_FEED_TRADE_LEAD_MS`] after it. `None` (the
+/// contract never traded on the main feed, or is untracked) is no evidence.
+/// A zero baseline (no frame and no hold time) is also no evidence. Pure,
+/// O(1).
+#[must_use]
+const fn depth200_cross_feed_silent(now_ms: i64, baseline: i64, last_trade: Option<i64>) -> bool {
+    if baseline <= 0 {
+        return false;
+    }
+    let Some(trade) = last_trade else {
+        return false;
+    };
+    now_ms.saturating_sub(baseline) >= DEPTH200_CROSS_FEED_SILENCE_MS as i64
+        && trade >= baseline.saturating_add(DEPTH200_CROSS_FEED_TRADE_LEAD_MS as i64)
+}
 
 /// Consecutive silence scans that must agree before the lane pages.
 ///
@@ -8446,6 +8629,15 @@ async fn run_frame_drain(
                 // socket, how stale, how many frames — what the operator
                 // console's connection table reads. Local /metrics only.
                 publish_connection_deliveries(chrono::Utc::now().timestamp_millis());
+                // Frame-silence evidence (scope lock 2026-10-10): each slot's
+                // largest inter-frame gap inside 09:15-15:15, for the shadow
+                // week's measurement, and the depth-200 cross-feed check.
+                // Both cold: O(slots) every 30 s.
+                tickvault_core::websocket::pool_supervisor::publish_frame_gap_peaks();
+                let _ = ingest.check_depth200_cross_feed(
+                    now_millis,
+                    configured_frame_silence_fast_path(),
+                );
                 // Ring OCCUPANCY, the companion to the dwell gauge above.
                 //
                 // Published here rather than in `publish_fold_depth` because
@@ -11710,6 +11902,10 @@ pub struct DhanFeedStackParams {
     /// `[dhan_universe] backup_top_n` (scope lock 2026-10-02): near-the-money
     /// contracts given a second copy on another main-feed socket. 0 = off.
     pub main_feed_backup_top_n: usize,
+    /// `[dhan_universe] frame_silence_fast_path` (scope lock 2026-10-10):
+    /// whether the evidence-confirmed frame-silence redials count only
+    /// (`shadow`, the default), act, or are off.
+    pub frame_silence_fast_path: FrameSilenceFastPath,
     pub questdb: QuestDbConfig,
     /// The process-wide write-ahead log every captured frame lands in BEFORE
     /// it is visible to the fold. `None` refuses the lane: capture-at-receipt
@@ -15077,6 +15273,39 @@ type DialedDepthCommands = Vec<DialedDepthCommand>;
 /// also makes the two call sites — boot and the late attach — differ in exactly
 /// the one field that actually differs between them (`out_topups`), instead of
 /// in a positional argument nine places along.
+/// The configured frame-silence fast-path mode, as a byte: 0 = off, 1 =
+/// shadow, 2 = act. Written once when the lane starts, read once per dial.
+///
+/// A process-wide value rather than a [`DialContext`] field because the dial
+/// runs from four places (boot, contract attach, depth attach, widen), each
+/// with its own context struct, and every one of them must apply the same
+/// setting. O(1), no allocation.
+static FRAME_SILENCE_FAST_PATH: AtomicU8 = AtomicU8::new(FAST_PATH_SHADOW_BYTE);
+
+const FAST_PATH_OFF_BYTE: u8 = 0;
+const FAST_PATH_SHADOW_BYTE: u8 = 1;
+const FAST_PATH_ACT_BYTE: u8 = 2;
+
+/// Records the configured fast-path mode for every later dial. O(1).
+fn set_configured_frame_silence_fast_path(mode: FrameSilenceFastPath) {
+    let byte = match mode {
+        FrameSilenceFastPath::Off => FAST_PATH_OFF_BYTE,
+        FrameSilenceFastPath::Shadow => FAST_PATH_SHADOW_BYTE,
+        FrameSilenceFastPath::Act => FAST_PATH_ACT_BYTE,
+    };
+    FRAME_SILENCE_FAST_PATH.store(byte, Ordering::Relaxed);
+}
+
+/// The configured fast-path mode. An unknown byte reads as shadow, the
+/// default. O(1).
+fn configured_frame_silence_fast_path() -> FrameSilenceFastPath {
+    match FRAME_SILENCE_FAST_PATH.load(Ordering::Relaxed) {
+        FAST_PATH_OFF_BYTE => FrameSilenceFastPath::Off,
+        FAST_PATH_ACT_BYTE => FrameSilenceFastPath::Act,
+        _ => FrameSilenceFastPath::Shadow,
+    }
+}
+
 struct DialContext<'a> {
     pool: &'a mut PoolSupervisor,
     client_id: &'a str,
@@ -15186,6 +15415,13 @@ fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize 
             // watchdog would redial all sixteen sockets every five minutes
             // from 15:40 until the box stops at 17:30.
             taken.set_frame_silence_gate(FrameSilenceGate::ContinuousSessionIst);
+            // Frame-silence evidence (scope lock 2026-10-10): the fast paths
+            // read the process-wide activity register, and act, count or stay
+            // off as configured. Depth-200 and order-update ignore sibling
+            // evidence by construction; setting it on every slot keeps one
+            // shape for all of them.
+            taken.set_silence_evidence(SiblingEvidence::Pool);
+            taken.set_fast_path(configured_frame_silence_fast_path());
             taken
         }) else {
             warn!(
@@ -16655,6 +16891,8 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // Rule 11: the lane reads DOWN until it is provably carrying data, so a
     // half-wired stack is never presented as up.
     metrics::gauge!(FEED_STACK_UP_GAUGE).set(0.0);
+    // Before any dial and before the drain starts: both read it.
+    set_configured_frame_silence_fast_path(params.frame_silence_fast_path);
 
     let mut pool = PoolSupervisor::new();
     let plan = match build_feed_stack_plan(
@@ -20961,6 +21199,7 @@ mod tests {
             depth_unsubscribe_probe: Default::default(),
             depth_storage: Default::default(),
             main_feed_backup_top_n: 0,
+            frame_silence_fast_path: FrameSilenceFastPath::default(),
             dhan_enabled: false,
             instance_lock_held: Arc::new(AtomicBool::new(false)),
             // A disabled lane never reaches the re-fold, which is exactly why
@@ -32053,182 +32292,433 @@ mod socket_stop_tests {
 #[cfg(test)]
 mod feed_aux_tests;
 
-// 2026-10-10: a shutdown that lands during the lane's boot WAL recovery must
-// stop at a safe point and never spawn the frame drain or dial a socket.
+// Depth-200 cross-feed check and frame-silence wiring (scope lock 2026-10-10,
+// plan item 52h).
 #[cfg(test)]
-mod shutdown_before_dial_tests {
+mod depth200_cross_feed_tests {
     use super::*;
-    use tickvault_common::feed::Feed;
+    use std::cell::{Cell, RefCell};
+    use tickvault_core::pipeline::tick_gap_detector::TickObservation;
 
-    fn production() -> &'static str {
-        include_str!("dhan_feed_stack.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .expect("production half")
+    const SID: u64 = 52_175;
+    const SEG: ExchangeSegment = ExchangeSegment::NseFno;
+    /// A wall-ms baseline well past the epoch, so `baseline > 0` holds.
+    const BASE: i64 = 1_791_000_000_000;
+
+    fn depth200_slots() -> Vec<u8> {
+        (0..MAX_TOTAL_DHAN_CONNECTIONS)
+            .filter(|idx| {
+                matches!(
+                    tickvault_core::websocket::pool_budget::slot_owner(*idx),
+                    Some((_, DhanEndpointType::Depth200))
+                )
+            })
+            .collect()
     }
 
-    fn body_of<'a>(src: &'a str, signature: &str) -> &'a str {
-        let rest = src
-            .split_once(signature)
-            .unwrap_or_else(|| panic!("{signature} must exist"))
-            .1;
-        &rest[..rest.find("\n}\n").unwrap_or(rest.len())]
+    fn first_depth200_slot() -> u8 {
+        depth200_slots()[0]
     }
 
-    /// The calls of the drain's shutdown tail, in order. Each must appear in
-    /// both bodies, and in this order in both.
-    const SHUTDOWN_TAIL: [&str; 11] = [
-        "seal_complete_buckets_at_mid_session_exit()",
-        "seal_open_buckets_at_close()",
-        "flush_and_record(",
-        "flush_depth(ingest.depth_sink())",
-        "close_offload_queues()",
-        "shutdown_offload_writer(offload_deadline)",
-        "shutdown_rescue_writer(offload_deadline)",
-        "shutdown_depth_offload_writer(offload_deadline)",
-        "shutdown_top_volume_writer(offload_deadline)",
-        "applied_watermark().persist_now()",
-        "publish_fold_depth(",
-    ];
-
-    fn assert_tail_in_order(name: &str, body: &str) {
-        let mut at = 0usize;
-        for call in SHUTDOWN_TAIL {
-            let found = body[at..]
-                .find(call)
-                .unwrap_or_else(|| panic!("{name}: `{call}` missing or out of order"));
-            at += found + call.len();
-        }
-    }
-
-    /// The calls of the drain's shutdown ARM (the `shutdown.notified()`
-    /// branch), which run before the tail.
-    const SHUTDOWN_ARM: [&str; 3] = [
-        "ingest.catch_up_seal()",
-        "flush_and_record(",
-        "flush_depth(ingest.depth_sink())",
-    ];
-
-    /// Returns the offset just past the last call of `calls`, found in order.
-    fn assert_in_order(name: &str, body: &str, calls: &[&str]) -> usize {
-        let mut at = 0usize;
-        for call in calls {
-            let found = body[at..]
-                .find(call)
-                .unwrap_or_else(|| panic!("{name}: `{call}` missing or out of order"));
-            at += found + call.len();
-        }
-        at
-    }
-
-    #[test]
-    fn close_lane_before_dial_mirrors_the_drain_shutdown_tail() {
-        let prod = production();
-        let drain = body_of(prod, "async fn run_frame_drain(");
-        let arm = drain
-            .split_once("() = shutdown.notified() => {")
-            .expect("the drain's shutdown arm must exist")
-            .1;
-        let arm = &arm[..arm.find("break;").expect("the shutdown arm ends the loop")];
-        assert_in_order("run_frame_drain shutdown arm", arm, &SHUTDOWN_ARM);
-        let drain_tail = drain
-            .split_once("// Every sender was dropped, so no socket is left.")
-            .expect("the drain's shutdown tail anchor must exist")
-            .1;
-        assert_tail_in_order("run_frame_drain", drain_tail);
-        let close = body_of(prod, "fn close_lane_before_dial(");
-        let after_arm = assert_in_order("close_lane_before_dial", close, &SHUTDOWN_ARM);
-        assert_tail_in_order("close_lane_before_dial", &close[after_arm..]);
-    }
-
-    #[test]
-    fn the_lane_never_spawns_the_drain_after_a_shutdown() {
-        let prod = production();
-        let lane = body_of(prod, "async fn run_dhan_feed_stack(");
-        let finish = lane
-            .find("ingest.finish_wal_replay(replay_ended_on_gap);")
-            .expect("hand-over present");
-        let spawn = lane
-            .find("tokio::spawn(run_frame_drain(")
-            .expect("drain spawn present");
-        let between = &lane[finish..spawn];
-        let check = between
-            .find("if shutdown_requested() {")
-            .expect("a shutdown check must sit between the hand-over and the drain spawn");
-        let close = between
-            .find("close_lane_before_dial(&mut ingest, &params.feed_health);")
-            .expect("the shutdown arm must close the writers");
-        let ret = between[close..]
-            .find("return;")
-            .expect("the shutdown arm must return before the spawn");
-        assert!(check < close && close + ret < between.len());
-    }
-
-    #[test]
-    fn the_boot_recovery_checks_for_a_shutdown_at_every_safe_boundary() {
-        let prod = production();
-        let lane = body_of(prod, "async fn run_dhan_feed_stack(");
-        // Before the boot refold.
-        let refold = lane
-            .find("let outcome = refold_wal_frames(&mut ingest, boot_frames")
-            .expect("boot refold present");
-        assert!(
-            lane[..refold].contains("} else if shutdown_requested() {"),
-            "the boot refold must be skipped once a stop was requested"
-        );
-        // Before every catch-up round, inside the lag-pause loop.
-        let catch_up = lane
-            .split_once("while rounds < WAL_CATCHUP_MAX_ROUNDS")
-            .expect("catch-up loop present")
-            .1;
-        let pause = catch_up
-            .split_once("loop {")
-            .expect("lag-pause loop present")
-            .1;
-        let first_check = pause.find("if shutdown_requested() {").expect("stop check");
-        let first_sleep = pause.find("tokio::time::sleep(").expect("pause sleep");
-        assert!(
-            first_check < first_sleep,
-            "the stop must be checked before the lag pause sleeps"
-        );
-        assert!(catch_up.contains("if catchup_shutdown_stopped {\n                break;"));
-        // A stop is reported by name and never as an exhausted budget.
-        assert!(lane.contains("let exhausted = !catchup_shutdown_stopped"));
-        assert!(lane.contains("\"shutdown\""));
-        // And the pacing stops waiting on the writers.
-        let pace = body_of(prod, "fn replay_pace_after_flush(");
-        assert!(
-            pace.contains("if shutdown_requested() {\n                return false;"),
-            "a stop must end the replay pacing"
-        );
-    }
-
-    #[test]
-    fn close_lane_before_dial_hands_off_the_tail_and_joins_the_writer() {
-        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
-        let health = Arc::new(tickvault_common::feed_health::FeedHealthRegistry::new());
+    /// An ingest whose detector saw `SID` trade at `trade_at` (wall ms).
+    fn ingest_with_trade_at(trade_at: i64) -> LiveIngest {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        let at = |ms: i64| u64::try_from(ms).expect("positive");
+        // The first observation seeds the volume baseline; the second raises
+        // it, which is the trade.
+        let _ = ingest.detector.observe(TickObservation {
+            key: (SID, SEG),
+            ltt_epoch_secs: 1,
+            volume: 100,
+            open_interest: 0,
+            recv_monotonic_millis: at(BASE - 5_000),
+        });
+        let _ = ingest.detector.observe(TickObservation {
+            key: (SID, SEG),
+            ltt_epoch_secs: 2,
+            volume: 150,
+            open_interest: 0,
+            recv_monotonic_millis: at(trade_at),
+        });
         ingest
-            .spawn_offload_writer(Arc::clone(&health))
-            .expect("the writer thread must spawn");
-        let mut p = [0u8; 16];
-        p[0] = 2;
-        p[1] = 16;
-        p[4..8].copy_from_slice(&13u32.to_le_bytes());
-        p[8..12].copy_from_slice(&23_146.45_f32.to_le_bytes());
-        p[12..16].copy_from_slice(&1_779_355_000u32.to_le_bytes());
-        let parsed = dispatch_frame(&p, 1_779_355_000_000_000_000).expect("ticker parses");
-        let ParsedFrame::Tick(tick) = parsed else {
-            panic!("response code 2 must dispatch to a Tick");
-        };
-        ingest.ingest_tick(&tick, 42, 1_779_355_000_000);
-        assert_eq!(ingest.pending_rows(), 1);
+    }
 
-        close_lane_before_dial(&mut ingest, &health);
-
-        assert_eq!(ingest.pending_rows(), 0, "the tail row left the buffer");
-        assert!(
-            !ingest.writer_is_offloaded(),
-            "the writer queue is closed and the thread joined"
+    /// Runs one check for a single depth-200 slot holding `SID` since
+    /// `since`, whose read task last saw a frame at `last_frame`. Returns
+    /// (met, request calls).
+    fn run(
+        ingest: &mut LiveIngest,
+        now: i64,
+        mode: FrameSilenceFastPath,
+        gate_open: bool,
+        since: i64,
+        last_frame: Option<i64>,
+    ) -> (u32, Vec<u8>) {
+        let slot = first_depth200_slot();
+        let calls = RefCell::new(Vec::new());
+        let met = ingest.check_depth200_cross_feed_with(
+            u64::try_from(now).expect("positive"),
+            mode,
+            gate_open,
+            |idx| (idx == slot).then_some((SID, SEG, since)),
+            |idx| if idx == slot { last_frame } else { None },
+            |idx, _now| {
+                calls.borrow_mut().push(idx);
+                Ok(())
+            },
         );
+        (met, calls.into_inner())
+    }
+
+    #[test]
+    fn depth200_cross_feed_requests_when_trade_leads_by_30s_after_90s_silence() {
+        let mut ingest = ingest_with_trade_at(BASE + 30_000);
+        let (met, calls) = run(
+            &mut ingest,
+            BASE + 90_000,
+            FrameSilenceFastPath::Act,
+            true,
+            BASE - 600_000,
+            Some(BASE),
+        );
+        assert_eq!(met, 1);
+        assert_eq!(calls, vec![first_depth200_slot()]);
+        // The same silent stretch is acted on once.
+        let (met, calls) = run(
+            &mut ingest,
+            BASE + 120_000,
+            FrameSilenceFastPath::Act,
+            true,
+            BASE - 600_000,
+            Some(BASE),
+        );
+        assert_eq!(met, 1, "still silent");
+        assert!(calls.is_empty(), "latched for this baseline");
+    }
+
+    #[test]
+    fn no_request_when_the_trade_precedes_the_lead() {
+        let mut ingest = ingest_with_trade_at(BASE + 29_999);
+        let (met, calls) = run(
+            &mut ingest,
+            BASE + 200_000,
+            FrameSilenceFastPath::Act,
+            true,
+            BASE - 600_000,
+            Some(BASE),
+        );
+        assert_eq!((met, calls.len()), (0, 0));
+    }
+
+    #[test]
+    fn no_request_under_90s() {
+        let mut ingest = ingest_with_trade_at(BASE + 40_000);
+        let (met, calls) = run(
+            &mut ingest,
+            BASE + 89_999,
+            FrameSilenceFastPath::Act,
+            true,
+            BASE - 600_000,
+            Some(BASE),
+        );
+        assert_eq!((met, calls.len()), (0, 0));
+    }
+
+    #[test]
+    fn no_request_for_an_untracked_contract() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        let (met, calls) = run(
+            &mut ingest,
+            BASE + 600_000,
+            FrameSilenceFastPath::Act,
+            true,
+            BASE - 600_000,
+            Some(BASE),
+        );
+        assert_eq!((met, calls.len()), (0, 0));
+        // A tracked contract that never raised its volume is no evidence
+        // either.
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        let _ = ingest.detector.observe(TickObservation {
+            key: (SID, SEG),
+            ltt_epoch_secs: 1,
+            volume: 100,
+            open_interest: 0,
+            recv_monotonic_millis: u64::try_from(BASE + 50_000).expect("positive"),
+        });
+        let (met, _) = run(
+            &mut ingest,
+            BASE + 600_000,
+            FrameSilenceFastPath::Act,
+            true,
+            BASE - 600_000,
+            Some(BASE),
+        );
+        assert_eq!(met, 0);
+    }
+
+    #[test]
+    fn swap_resets_baseline_via_held_since() {
+        // The socket's last frame is old, but it started holding this
+        // contract 60 s later: the silence is measured from the swap.
+        let mut ingest = ingest_with_trade_at(BASE + 70_000);
+        let (met, calls) = run(
+            &mut ingest,
+            BASE + 100_000,
+            FrameSilenceFastPath::Act,
+            true,
+            BASE + 60_000,
+            Some(BASE),
+        );
+        assert_eq!((met, calls.len()), (0, 0), "40 s since the swap");
+        // With no frame at all, `since` alone is the baseline.
+        let mut ingest = ingest_with_trade_at(BASE + 100_000);
+        let (met, calls) = run(
+            &mut ingest,
+            BASE + 150_000,
+            FrameSilenceFastPath::Act,
+            true,
+            BASE + 60_000,
+            None,
+        );
+        assert_eq!((met, calls.len()), (1, 1));
+    }
+
+    #[test]
+    fn no_request_outside_the_gate_or_in_off() {
+        // `gate_open = false` models outside the session, an overflow
+        // episode, and a halted rotation alike.
+        for (mode, gate_open) in [
+            (FrameSilenceFastPath::Act, false),
+            (FrameSilenceFastPath::Shadow, false),
+            (FrameSilenceFastPath::Off, true),
+        ] {
+            let mut ingest = ingest_with_trade_at(BASE + 30_000);
+            let (met, calls) = run(
+                &mut ingest,
+                BASE + 600_000,
+                mode,
+                gate_open,
+                BASE - 600_000,
+                Some(BASE),
+            );
+            assert_eq!((met, calls.len()), (0, 0), "{mode:?} gate {gate_open}");
+        }
+    }
+
+    #[test]
+    fn shadow_counts_without_requesting() {
+        let mut ingest = ingest_with_trade_at(BASE + 30_000);
+        let (met, calls) = run(
+            &mut ingest,
+            BASE + 90_000,
+            FrameSilenceFastPath::Shadow,
+            true,
+            BASE - 600_000,
+            Some(BASE),
+        );
+        assert_eq!(met, 1);
+        assert!(calls.is_empty(), "shadow never asks a socket to redial");
+        assert_eq!(
+            ingest.depth200_cross_feed_latched[usize::from(first_depth200_slot())],
+            BASE,
+            "counted once per baseline"
+        );
+    }
+
+    #[test]
+    fn only_depth200_slots_checked() {
+        let mut ingest = ingest_with_trade_at(BASE + 30_000);
+        let asked = RefCell::new(Vec::new());
+        let held_probes = Cell::new(0_u32);
+        let met = ingest.check_depth200_cross_feed_with(
+            u64::try_from(BASE + 90_000).expect("positive"),
+            FrameSilenceFastPath::Act,
+            true,
+            |_idx| {
+                held_probes.set(held_probes.get() + 1);
+                Some((SID, SEG, BASE - 600_000))
+            },
+            |_idx| Some(BASE),
+            |idx, _now| {
+                asked.borrow_mut().push(idx);
+                Ok(())
+            },
+        );
+        let expected = depth200_slots();
+        assert!(!expected.is_empty());
+        assert_eq!(asked.into_inner(), expected);
+        assert_eq!(met as usize, expected.len());
+        assert_eq!(
+            held_probes.get() as usize,
+            expected.len(),
+            "main-feed, depth-20 and order-update slots are never probed"
+        );
+    }
+
+    /// Regression: during a depth shed the drain stops stamping depth
+    /// sockets, but the read task keeps publishing its frame stamps. The check
+    /// reads the read task's stamp, so a shed cannot fake silence.
+    #[test]
+    fn a_depth_shed_never_triggers_a_cross_feed_redial() {
+        let mut ingest = ingest_with_trade_at(BASE + 30_000);
+        for step in 0..10_i64 {
+            let now = BASE + 90_000 + step * 30_000;
+            // The read task saw a frame a second ago, every scan.
+            let (met, calls) = run(
+                &mut ingest,
+                now,
+                FrameSilenceFastPath::Act,
+                true,
+                BASE - 600_000,
+                Some(now - 1_000),
+            );
+            assert_eq!((met, calls.len()), (0, 0), "scan {step}");
+        }
+        // And the source reads the read-task register, not the drain's
+        // per-connection tick stamp.
+        let src = include_str!("dhan_feed_stack.rs");
+        let body = src
+            .split_once("fn check_depth200_cross_feed(")
+            .and_then(|(_, rest)| rest.split_once("fn check_depth200_cross_feed_with("))
+            .map(|(body, _)| body)
+            .expect("the wrapper exists");
+        assert!(body.contains("ps::last_frame_wall_ms"));
+        assert!(!body.contains("PER_CONN_LAST_TICK_MILLIS"));
+    }
+
+    #[test]
+    fn a_refused_request_is_reported_once_per_baseline() {
+        let mut ingest = ingest_with_trade_at(BASE + 30_000);
+        let slot = first_depth200_slot();
+        let calls = Cell::new(0_u32);
+        for now in [BASE + 90_000, BASE + 120_000] {
+            let _ = ingest.check_depth200_cross_feed_with(
+                u64::try_from(now).expect("positive"),
+                FrameSilenceFastPath::Act,
+                true,
+                |idx| (idx == slot).then_some((SID, SEG, BASE - 600_000)),
+                |idx| (idx == slot).then_some(BASE),
+                |_idx, _now| {
+                    calls.set(calls.get() + 1);
+                    Err(DataSilenceRefusal::Halted)
+                },
+            );
+        }
+        assert_eq!(calls.get(), 1);
+    }
+
+    /// Review 2026-10-10 (MEDIUM): a cooldown or a still-pending request is
+    /// transient, so it must not latch the stretch. The same stretch is asked
+    /// again on the next scan, and acted on once the slot takes it.
+    #[test]
+    fn a_transient_refusal_leaves_the_stretch_open_until_a_request_lands() {
+        let mut ingest = ingest_with_trade_at(BASE + 30_000);
+        let slot = first_depth200_slot();
+        let calls = Cell::new(0_u32);
+        let answers = [
+            Err(DataSilenceRefusal::CoolingDown),
+            Err(DataSilenceRefusal::StillPending),
+            Ok(()),
+            Ok(()),
+        ];
+        for (step, now) in [90_000, 120_000, 150_000, 180_000].into_iter().enumerate() {
+            let _ = ingest.check_depth200_cross_feed_with(
+                u64::try_from(BASE + now).expect("positive"),
+                FrameSilenceFastPath::Act,
+                true,
+                |idx| (idx == slot).then_some((SID, SEG, BASE - 600_000)),
+                |idx| (idx == slot).then_some(BASE),
+                |_idx, _now| {
+                    calls.set(calls.get() + 1);
+                    answers[step]
+                },
+            );
+        }
+        // Asked at 90 s, 120 s and 150 s; latched on the 150 s success, so
+        // the 180 s scan of the same stretch asks nothing.
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn depth200_cross_feed_silent_boundaries() {
+        let silent = DEPTH200_CROSS_FEED_SILENCE_MS as i64;
+        let lead = DEPTH200_CROSS_FEED_TRADE_LEAD_MS as i64;
+        assert!(depth200_cross_feed_silent(
+            BASE + silent,
+            BASE,
+            Some(BASE + lead)
+        ));
+        assert!(!depth200_cross_feed_silent(
+            BASE + silent - 1,
+            BASE,
+            Some(BASE + lead)
+        ));
+        assert!(!depth200_cross_feed_silent(
+            BASE + silent,
+            BASE,
+            Some(BASE + lead - 1)
+        ));
+        assert!(!depth200_cross_feed_silent(BASE + silent, BASE, None));
+        assert!(!depth200_cross_feed_silent(BASE + silent, 0, Some(BASE)));
+    }
+
+    #[test]
+    fn configured_fast_path_round_trips() {
+        let before = configured_frame_silence_fast_path();
+        for mode in [
+            FrameSilenceFastPath::Off,
+            FrameSilenceFastPath::Act,
+            FrameSilenceFastPath::Shadow,
+        ] {
+            set_configured_frame_silence_fast_path(mode);
+            assert_eq!(configured_frame_silence_fast_path(), mode);
+        }
+        set_configured_frame_silence_fast_path(before);
+    }
+
+    /// The dial sets sibling evidence and the configured fast path on every
+    /// main, depth-20 and depth-200 socket, beside the session gate; the lane
+    /// records the configured mode before any dial; the drain's 30 s arm runs
+    /// the cross-feed check and publishes the gap peaks.
+    #[test]
+    fn spawn_and_drain_wire_the_frame_silence_evidence() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let prod = src.split_once("#[cfg(test)]").map_or(src, |(p, _)| p);
+        let gate = prod
+            .find("taken.set_frame_silence_gate(FrameSilenceGate::ContinuousSessionIst);")
+            .expect("session gate applied at the dial");
+        let after = &prod[gate..];
+        let end = after.find("taken\n").expect("the supervisor is returned");
+        let block = &after[..end];
+        assert!(block.contains("taken.set_silence_evidence(SiblingEvidence::Pool);"));
+        assert!(block.contains("taken.set_fast_path(configured_frame_silence_fast_path());"));
+
+        let lane = prod
+            .split_once("async fn run_dhan_feed_stack(")
+            .map(|(_, rest)| rest)
+            .expect("lane body");
+        let set_at = lane
+            .find("set_configured_frame_silence_fast_path(params.frame_silence_fast_path);")
+            .expect("the lane records the configured mode");
+        let first_dial = lane
+            .find("dial_planned_connections(")
+            .expect("the lane dials");
+        assert!(set_at < first_dial, "recorded before the first dial");
+
+        let drain = prod
+            .split_once("async fn run_frame_drain(")
+            .map(|(_, rest)| rest)
+            .expect("drain body");
+        let arm = drain
+            .find("_ = silence_timer.tick() => {")
+            .expect("30 s arm");
+        let arm_body = &drain[arm + 1..];
+        // Up to the arm's closing brace (the select arms sit at 12 spaces).
+        let next_arm = arm_body.find("\n            }\n").expect("the arm closes");
+        let arm_body = &arm_body[..next_arm];
+        assert!(arm_body.contains("publish_frame_gap_peaks();"));
+        assert!(arm_body.contains("ingest.check_depth200_cross_feed("));
+        assert!(arm_body.contains("configured_frame_silence_fast_path()"));
     }
 }
