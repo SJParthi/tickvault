@@ -1014,8 +1014,8 @@ fn percentile(sorted: &[i64], p: f64) -> i64 {
 /// | Situation | Category | Counted as divergence? |
 /// |---|---|---|
 /// | both sides, field differs > tolerance | `diverged` | **yes** |
-/// | REST has it, live doesn't (mid-session) | `missing_live` | **yes** — the closest proxy we have for packet loss |
-/// | REST has it, live doesn't, traded or index, late window, `Excuse` | `late_excused` | no — may be unsealed at the read; holds the day at `partial` |
+/// | REST has it, live doesn't (outside the excused case below) | `missing_live` | **yes** — the closest proxy we have for packet loss |
+/// | REST has it, live doesn't, traded or index, late window, after that instrument's own last live minute, `Excuse` | `late_excused` | no — may be unsealed at the read; holds the day at `partial` |
 /// | REST has it, live doesn't, traded or index, live read truncated | `missing_live_unjudged` | no — cannot be told from an unread minute; holds the day at `partial` |
 /// | live has it, REST doesn't | `missing_rest` | **no** — the REST tape is sparse by construction; reported as `Partial`, never `Clean`, never `Diverged` |
 /// | either side outside `[09:15, 15:40)` | `out_of_session` | no |
