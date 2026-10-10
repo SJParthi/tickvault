@@ -2762,3 +2762,9 @@ REJECT under 29e:
 - Keeping the role, the workflow or the tool after the run, or reusing them for any other delete.
 - Suspending versioning, adding an `expiration` or `noncurrent_version_expiration`, or deleting by lifecycle rule.
 - Treating 29e as standing permission: it is spent after this one run, and Quote 27 ("nothing is ever deleted") binds again from then on.
+
+**ENDED 2026-10-10.** The run, on `main` at `c30116f3` (#2044 plus the account-id fix #2050):
+- Dry run (Actions run 38015817935, 07:43 IST): 1,304 versions, 0 delete markers, 109.10 GB in scope across the 19 prefixes (`raw-frames` 1,070 versions / 66.63 GB, `market_depth` 19 / 28.77 GB, `ticks` 75 / 5.46 GB, the ten candle tables 44 / 8.07 GB, the four `top_volume` tables 84 / 0.13 GB, `feed_aux_packets` 5 / 0.02 GB, `seal-spill` 7 / 0.00 GB); 214 versions dated 2026-10-09 or later kept; 0 unrecognised keys.
+- Owner's go, after Quote 29e: "See do everything now even merge and deploy now itself dude okay?" (2026-10-10 07:07 IST).
+- Apply (Actions run 38016206553, 07:44 IST): 1,304 deletes sent; the verify listing found 0 versions in scope; 214 later versions still kept.
+- The role, its policy, the workflow and the tool were deleted by the next PR (plan item 53b). Quote 27 binds again; 29e authorizes nothing further.
