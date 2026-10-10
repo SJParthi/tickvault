@@ -49,6 +49,19 @@ fn repo_root() -> PathBuf {
 /// This list may SHRINK freely. Growing it is a deliberate edit, in the same
 /// change, with the reason visible to a reviewer.
 const ALLOWED_IGNORED: &[(&str, &str)] = &[
+    // Added 2026-10-10 with the contract name repair (plan item 56): an
+    // end-to-end run against a real QuestDB (it creates and drops its own
+    // probe table), which CI does not have. It gates nothing; the SQL the
+    // repair sends is pinned by the ordinary tests in
+    // `crates/storage/src/contract_name_repair.rs`. Re-run it whenever that
+    // SQL changes:
+    //
+    //   TV_QUESTDB_EXEC_URL=http://127.0.0.1:9000/exec \
+    //     cargo test -p tickvault-storage --test contract_name_repair_live -- --ignored
+    (
+        "crates/storage/tests/contract_name_repair_live.rs",
+        "repair_names_blank_rows_in_place_and_leaves_everything_else",
+    ),
     // Added 2026-10-09 with the arithmetic price widening (audit PR10): the
     // exhaustive proof that the new `f32_to_f64_clean` returns the same f64 as
     // the text path for all 2^32 f32 inputs. Measured: 0 differences, 382 s on
