@@ -5964,7 +5964,7 @@ mod stub_integration_tests {
             (200, Vec::new(), body)
         }))
         .await;
-        let client = reqwest::Client::new();
+        let client = crate::http_client::build_probe_client(5).expect("probe client");
         let small = client
             .get(format!("{url}/small"))
             .send()
