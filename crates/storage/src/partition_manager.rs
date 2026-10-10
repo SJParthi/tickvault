@@ -140,10 +140,6 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // partition loses nothing that `ws_event_audit` and `feed_episode_audit`
     // do not still hold.
     "ws_connection_daily",
-    // (2026-10-10, item 53) the per-day name list the after-close name
-    // repair joins against. Not market data and not an audit record: an
-    // aged-out day only loses names already written back into the tables.
-    "contract_name_repair_map",
     // (2026-10-02) one row per live-feed reconnect gap, paired from the
     // `ws_event_audit` lifecycle rows by the app forwarder. Same SEBI-audit
     // class + DAY partitioning; `feed` is in the DEDUP key.
@@ -358,6 +354,17 @@ pub(crate) const RETENTION_EXEMPT_TABLES: &[&str] = &[
     // let the one-shot wipe run a SECOND time on the next out-of-session boot.
     "schema_reset_log",
 ];
+
+/// Scratch tables: their owner creates them fresh for every run and drops them after, so
+/// they never hold more than one run's rows and need no sweep. Not market
+/// data and not audit records, so they are neither swept, exempt, nor
+/// exported by the destructive operator actions.
+///
+/// - `contract_name_repair_map` (2026-10-10, plan item 54): the one-day name
+///   list the after-close contract name repair joins against
+///   (`contract_name_repair`), created fresh for each day and dropped after it.
+#[cfg(test)]
+const SCRATCH_TABLES: &[&str] = &["contract_name_repair_map"];
 
 /// Every table the retention system knows about, de-duplicated and sorted —
 /// the measurement set for `table_storage_probe`.
@@ -1271,6 +1278,22 @@ mod tests {
             names.len() > 10,
             "only {} managed tables — the retention lists look empty",
             names.len()
+        );
+    }
+
+    #[test]
+    fn test_scratch_tables_are_in_no_retention_list() {
+        // Regression (2026-10-10): the contract name map was first listed as
+        // a DAY-partitioned audit table, which made the operator console's
+        // volume reset treat it as a 5-year regulatory table to export.
+        for t in SCRATCH_TABLES {
+            assert!(!HOUR_PARTITIONED_TABLES.contains(t), "{t}");
+            assert!(!DAY_PARTITIONED_TABLES.contains(t), "{t}");
+            assert!(!RETENTION_EXEMPT_TABLES.contains(t), "{t}");
+            assert!(!all_managed_table_names().contains(t), "{t}");
+        }
+        assert!(
+            SCRATCH_TABLES.contains(&crate::contract_name_repair::CONTRACT_NAME_REPAIR_MAP_TABLE)
         );
     }
 }
