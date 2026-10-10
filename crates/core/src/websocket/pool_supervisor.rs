@@ -260,14 +260,22 @@ const _: () = {
 /// ladder, so a socket that stays deaf backs off and parks rather than
 /// spinning.
 ///
-/// Five minutes, not the 27 s idle threshold: every socket in the pool
-/// carries at least one instrument that trades continuously inside the
-/// session (the main feed carries the indices; a depth socket carries an
-/// at-the-money contract), so five minutes of silence there is a dead
-/// subscription, not a quiet market. It is deliberately HALF the 600 s
-/// alarm so the remediation runs before the operator is paged, and
-/// comfortably above the idle threshold (asserted below) so the two
-/// watchdogs can never race on the same socket.
+/// **Since 2026-10-10 (scope lock "PER-KIND FRAME-SILENCE THRESHOLDS") this
+/// is the UNCONFIRMED fallback for the main feed and depth-20**: the time
+/// after which a silent socket is redialled with no other evidence. With
+/// evidence (two other live sockets of the same kind) a main-feed socket is
+/// redialled at [`MAIN_FEED_CONFIRMED_SILENCE_REDIAL_SECS`] and a depth-20
+/// socket at [`DEPTH20_CONFIRMED_SILENCE_REDIAL_SECS`]; see
+/// [`silence_redial_basis`]. Depth-200 no longer uses this figure at all:
+/// a depth-200 socket carries ONE contract, and this repository measured
+/// 56 minutes of benign silence on one (the reason
+/// `worst_connection_tick_age_secs` excludes depth-200), so a pure-time
+/// redial there was tearing down healthy quiet sockets. Depth-200 waits for
+/// [`DEPTH200_SILENCE_BACKSTOP_SECS`] or for cross-feed evidence.
+///
+/// Five minutes is deliberately HALF the 600 s alarm so the remediation runs
+/// before the operator is paged, and comfortably above the idle threshold
+/// (asserted below) so the two watchdogs can never race on the same socket.
 ///
 /// The window is only counted INSIDE the continuous session when the
 /// supervisor is given [`FrameSilenceGate::ContinuousSessionIst`]; the
@@ -291,6 +299,674 @@ const _: () = {
          or the ping cadence itself could look like silence"
     );
 };
+
+// ---------------------------------------------------------------------------
+// Per-kind frame-silence evidence (scope lock 2026-10-10, "PER-KIND
+// FRAME-SILENCE THRESHOLDS (fault redials only)")
+// ---------------------------------------------------------------------------
+//
+// One 300 s rule for every socket kind left a deaf main-feed or depth-20 socket
+// blind for five minutes, and tore down HEALTHY quiet depth-200 sockets (one
+// contract each; 56 minutes of benign silence measured on one). The fix uses
+// evidence instead of time alone. Every redial below is still a genuine-fault
+// redial under `ReconnectReason::IdleSilence`; nothing here changes an
+// instrument or adds a reason.
+
+/// Main-feed silence after which a socket is redialled WITH sibling evidence
+/// (at least [`MIN_LIVE_SIBLINGS`] other main-feed sockets delivered in the
+/// last [`SIBLING_LIVE_EVIDENCE_SECS`]). Escalates per socket; see
+/// [`ConnectionSupervisor::confirmed_threshold_secs`].
+pub const MAIN_FEED_CONFIRMED_SILENCE_REDIAL_SECS: u64 = 60;
+
+/// Depth-20 silence after which a socket is redialled WITH sibling evidence.
+pub const DEPTH20_CONFIRMED_SILENCE_REDIAL_SECS: u64 = 90;
+
+/// Depth-200 pure-time backstop: a depth-200 socket carries one contract and
+/// can be legitimately silent for long stretches, so time alone redials it
+/// only after fifteen minutes. Faster recovery comes from cross-feed evidence
+/// (the main feed showing its contract trading), which arrives through
+/// [`request_data_silence_redial`].
+pub const DEPTH200_SILENCE_BACKSTOP_SECS: u64 = 900;
+
+/// How recent another socket's last frame must be to count as live evidence.
+pub const SIBLING_LIVE_EVIDENCE_SECS: u64 = 10;
+
+/// A sibling stamp further than this AHEAD of the reader's wall clock is not
+/// evidence: a clock step fails toward the 300 s fallback.
+pub const SIBLING_FUTURE_SKEW_MS: i64 = 5_000;
+
+/// Live same-kind siblings required to confirm a silence. Two, not one, so a
+/// stall of one exchange segment that leaves a single sibling live (that
+/// sibling carrying the other segment) cannot confirm by itself.
+pub const MIN_LIVE_SIBLINGS: u8 = 2;
+
+/// Instruments a main-feed socket must hold for its silence to be confirmed:
+/// a thinly-held socket can be quiet while its siblings are busy.
+pub const MAIN_FEED_CONFIRMED_MIN_HELD: u32 = 1_000;
+
+/// Instruments a depth-20 socket must hold for its silence to be confirmed.
+pub const DEPTH20_CONFIRMED_MIN_HELD: u32 = 20;
+
+/// Minimum spacing, pool-wide PER KIND, between two sibling-confirmed
+/// redials, so a vendor-side stall that silences several sockets of one kind
+/// redials them one at a time rather than all together.
+pub const CONFIRMED_REDIAL_SPACING_SECS: i64 = 15;
+
+/// A socket's silence strikes (the escalation of its confirmed threshold)
+/// reset only after this long with no silence redial.
+pub const SILENCE_STRIKE_RESET_SECS: u64 = 900;
+
+/// [`SILENCE_STRIKE_RESET_SECS`] as a `Duration`.
+// APPROVED: this line IS the named constant the no-hardcoded-Duration rule asks for; the scanner matches the declaration itself.
+pub const SILENCE_STRIKE_RESET: Duration = Duration::from_secs(SILENCE_STRIKE_RESET_SECS);
+
+/// The confirmed fast path runs only before 15:15 IST: the closing auction
+/// window (15:15–15:40) stays on the 300 s fallback, its quiet is unmeasured.
+pub const CONFIRMED_SILENCE_CLOSE_SECS_OF_DAY_IST: u32 =
+    tickvault_common::constants::CAS_WINDOW_OPEN_SECS_OF_DAY_IST;
+
+/// The largest left shift applied to a confirmed threshold (60 → 120 → 240,
+/// then capped at the 300 s fallback).
+const MAX_SILENCE_STRIKE_SHIFT: u8 = 3;
+
+/// How often a socket publishes its last-frame wall time for its siblings.
+// APPROVED: this line IS the named constant the no-hardcoded-Duration rule asks for; the scanner matches the declaration itself.
+const FRAME_ACTIVITY_PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Counter of frame-silence redials, labelled `endpoint` and `basis`
+/// ([`SilenceBasis::as_str`]). Local only: no EMF selector, no alarm.
+pub const FRAME_SILENCE_REDIAL_METRIC: &str = "tv_dhan_ws_frame_silence_redial_total";
+
+/// Counter of fast-path redials that WOULD have happened in shadow mode,
+/// labelled `endpoint` and `basis`, once per silence episode. Local only.
+pub const FRAME_SILENCE_WOULD_REDIAL_METRIC: &str = "tv_dhan_ws_frame_silence_would_redial_total";
+
+/// Gauge: the largest gap between two frames on a socket inside the confirmed
+/// window (09:15–15:15 IST), in seconds, reset when the window opens. Label
+/// `connection`. Local only. This is the measurement the shadow week reads.
+pub const FRAME_GAP_MAX_SECS_GAUGE: &str = "tv_dhan_ws_conn_frame_gap_max_secs";
+
+/// Counter of cross-feed redial requests dropped at take time because the
+/// socket had redialled since the request (the request named an earlier
+/// connection).
+pub const DATA_SILENCE_STALE_METRIC: &str = "tv_dhan_ws_data_silence_request_stale_total";
+
+/// Minimum time between two cross-feed redial requests for one slot.
+pub const DATA_SILENCE_REQUEST_COOLDOWN_SECS: i64 = 300;
+
+const _: () = {
+    let confirmed = [
+        MAIN_FEED_CONFIRMED_SILENCE_REDIAL_SECS,
+        DEPTH20_CONFIRMED_SILENCE_REDIAL_SECS,
+    ];
+    let mut i = 0;
+    while i < confirmed.len() {
+        let secs = confirmed[i];
+        assert!(
+            secs > IDLE_RECONNECT_TIMEOUT_SECS,
+            "a confirmed silence redial must fire after the idle watchdog would have"
+        );
+        assert!(
+            secs > CLIENT_KEEPALIVE_PING_INTERVAL.as_secs() * 2,
+            "a confirmed silence redial must never be faster than two keepalive rounds"
+        );
+        assert!(
+            secs < FRAME_SILENCE_REDIAL_SECS,
+            "a confirmed threshold must be faster than the unconfirmed fallback"
+        );
+        assert!(
+            secs * super::reconnect_ladder::FLAP_REDIAL_CEILING as u64 > FLAP_WINDOW_MS / 1000,
+            "confirmed redials alone must never reach the flap ceiling inside the flap window"
+        );
+        i += 1;
+    }
+    assert!(
+        FRAME_SILENCE_REDIAL_SECS < DEPTH200_SILENCE_BACKSTOP_SECS,
+        "the depth-200 backstop must be slower than the main-feed fallback"
+    );
+    assert!(
+        SIBLING_LIVE_EVIDENCE_SECS * 3 <= MAIN_FEED_CONFIRMED_SILENCE_REDIAL_SECS,
+        "sibling evidence must be much fresher than the silence it confirms"
+    );
+    assert!(
+        SILENCE_STRIKE_RESET_SECS > FRAME_SILENCE_REDIAL_SECS,
+        "strikes must outlive the fallback window or escalation could never bind"
+    );
+    assert!(
+        CONTINUOUS_SESSION_OPEN_SECS_OF_DAY_IST < CONFIRMED_SILENCE_CLOSE_SECS_OF_DAY_IST,
+        "the confirmed window must open after the continuous session does"
+    );
+    assert!(
+        CONFIRMED_SILENCE_CLOSE_SECS_OF_DAY_IST <= CONTINUOUS_SESSION_CLOSE_SECS_OF_DAY_IST,
+        "the confirmed window must close inside the continuous session"
+    );
+};
+
+/// What the evidence-based fast paths do: off, count only (the default), or
+/// act. Owned by the config crate, re-exported here.
+pub use tickvault_common::config::FrameSilenceFastPath;
+
+/// Why a frame-silence redial fired. Audit and counter label only; every
+/// basis schedules the same `ReconnectReason::IdleSilence` redial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SilenceBasis {
+    /// Time alone: 300 s on the main feed and depth-20.
+    Unconfirmed,
+    /// The confirmed threshold with two live same-kind siblings.
+    SiblingConfirmed,
+    /// Depth-200: the main feed showed this socket's contract trading while
+    /// the socket stayed silent.
+    CrossFeed,
+    /// Depth-200: time alone, after the 900 s backstop.
+    Backstop,
+}
+
+impl SilenceBasis {
+    /// Every basis, for seeding the counters at zero.
+    pub const ALL: [Self; 4] = [
+        Self::Unconfirmed,
+        Self::SiblingConfirmed,
+        Self::CrossFeed,
+        Self::Backstop,
+    ];
+
+    /// The counter and log label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unconfirmed => "unconfirmed",
+            Self::SiblingConfirmed => "sibling_confirmed",
+            Self::CrossFeed => "cross_feed",
+            Self::Backstop => "backstop",
+        }
+    }
+}
+
+/// Whether a supervisor reads the pool's activity register for sibling
+/// evidence. `Off` by default, so a supervisor built in a test never reads
+/// another test's sockets; the live lane opts in with `Pool`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SiblingEvidence {
+    /// No sibling evidence: only the time rules apply. The default.
+    #[default]
+    Off,
+    /// Read the process-wide activity register.
+    Pool,
+}
+
+/// The process-wide inputs the confirmed fast path reads, gathered only when
+/// a socket is already silent past its confirmed threshold.
+#[derive(Debug, Clone, Copy)]
+pub struct SilenceInputs<'a> {
+    /// Wall clock, milliseconds since the Unix epoch.
+    pub wall_ms: i64,
+    /// An overflow episode is engaged or rotation is halted by an 805.
+    pub overflow_or_halted: bool,
+    /// Every slot's last-frame wall time (0 = never).
+    pub stamps: [i64; GHOST_REDIAL_SLOTS],
+    /// The per-kind spacing register (`[main feed, depth-20]`).
+    pub spacing: &'a [std::sync::atomic::AtomicI64; CONFIRMED_SPACING_KINDS],
+}
+
+/// Kinds with a confirmed fast path: main feed and depth-20.
+pub const CONFIRMED_SPACING_KINDS: usize = 2;
+
+/// When each kind last took a sibling-confirmed redial, wall ms (0 = never).
+static LAST_CONFIRMED_REDIAL_WALL_MS: [std::sync::atomic::AtomicI64; CONFIRMED_SPACING_KINDS] =
+    [const { std::sync::atomic::AtomicI64::new(0) }; CONFIRMED_SPACING_KINDS];
+
+impl SilenceInputs<'static> {
+    /// Reads the live register: one wall-clock read, two atomic loads and a
+    /// copy of the 32-slot activity register. O(32), no allocation; called
+    /// only while a socket is silent past its confirmed threshold.
+    #[must_use]
+    pub fn live() -> Self {
+        Self {
+            wall_ms: wall_clock_ms(),
+            overflow_or_halted: overflow_episode_engaged() || rotation_halted(),
+            stamps: snapshot_frame_activity(),
+            spacing: &LAST_CONFIRMED_REDIAL_WALL_MS,
+        }
+    }
+}
+
+/// The spacing-register index for a kind with a confirmed fast path.
+const fn confirmed_kind_index(endpoint: DhanEndpointType) -> Option<usize> {
+    match endpoint {
+        DhanEndpointType::MainFeed => Some(0),
+        DhanEndpointType::Depth20 => Some(1),
+        DhanEndpointType::Depth200 | DhanEndpointType::OrderUpdate => None,
+    }
+}
+
+/// Instruments a socket of this kind must hold for its silence to be
+/// confirmed. `u32::MAX` for a kind with no confirmed path.
+#[must_use]
+pub const fn confirmed_min_held(endpoint: DhanEndpointType) -> u32 {
+    match endpoint {
+        DhanEndpointType::MainFeed => MAIN_FEED_CONFIRMED_MIN_HELD,
+        DhanEndpointType::Depth20 => DEPTH20_CONFIRMED_MIN_HELD,
+        DhanEndpointType::Depth200 | DhanEndpointType::OrderUpdate => u32::MAX,
+    }
+}
+
+/// The un-escalated confirmed threshold for a kind.
+const fn confirmed_base_secs(endpoint: DhanEndpointType) -> u64 {
+    match endpoint {
+        DhanEndpointType::MainFeed => MAIN_FEED_CONFIRMED_SILENCE_REDIAL_SECS,
+        DhanEndpointType::Depth20 => DEPTH20_CONFIRMED_SILENCE_REDIAL_SECS,
+        DhanEndpointType::Depth200 => DEPTH200_SILENCE_BACKSTOP_SECS,
+        DhanEndpointType::OrderUpdate => FRAME_SILENCE_REDIAL_SECS,
+    }
+}
+
+/// Decides whether a silent socket is redialled, and on what basis. Pure,
+/// O(1), no allocation.
+///
+/// * Depth-200: [`SilenceBasis::Backstop`] at
+///   [`DEPTH200_SILENCE_BACKSTOP_SECS`], never earlier by time (cross-feed
+///   evidence arrives through its own request).
+/// * Main feed and depth-20: [`SilenceBasis::Unconfirmed`] at
+///   [`FRAME_SILENCE_REDIAL_SECS`] whatever the evidence; earlier,
+///   [`SilenceBasis::SiblingConfirmed`] only when every condition holds.
+/// * Order update: never (an order-update socket is legitimately silent
+///   while no order moves).
+#[allow(clippy::too_many_arguments)]
+// APPROVED: a pure truth table over the eight inputs the scope lock names; a struct would only rename them.
+#[must_use]
+pub const fn silence_redial_basis(
+    endpoint: DhanEndpointType,
+    silent_secs: u64,
+    confirmed_threshold_secs: u64,
+    confirmed_window_open: bool,
+    overflow_or_halted: bool,
+    live_siblings: u8,
+    held: u32,
+    spacing_ok: bool,
+) -> Option<SilenceBasis> {
+    match endpoint {
+        DhanEndpointType::Depth200 => {
+            if silent_secs >= DEPTH200_SILENCE_BACKSTOP_SECS {
+                Some(SilenceBasis::Backstop)
+            } else {
+                None
+            }
+        }
+        DhanEndpointType::MainFeed | DhanEndpointType::Depth20 => {
+            if silent_secs >= FRAME_SILENCE_REDIAL_SECS {
+                Some(SilenceBasis::Unconfirmed)
+            } else if silent_secs >= confirmed_threshold_secs
+                && confirmed_window_open
+                && !overflow_or_halted
+                && live_siblings >= MIN_LIVE_SIBLINGS
+                && held >= confirmed_min_held(endpoint)
+                && spacing_ok
+            {
+                Some(SilenceBasis::SiblingConfirmed)
+            } else {
+                None
+            }
+        }
+        DhanEndpointType::OrderUpdate => None,
+    }
+}
+
+/// Counts the OTHER slots of the same kind whose last frame is at most
+/// [`SIBLING_LIVE_EVIDENCE_SECS`] old (and no more than
+/// [`SIBLING_FUTURE_SKEW_MS`] in the future). Pure over the injected stamps;
+/// the kind of each slot comes from the pool tiling
+/// ([`super::pool_budget::slot_owner`]), so a slot's kind can never drift from
+/// the budget that granted it. O(32), no allocation.
+#[must_use]
+pub fn live_siblings(
+    self_idx: u8,
+    endpoint: DhanEndpointType,
+    now_wall_ms: i64,
+    stamps: &[i64],
+) -> u8 {
+    let window_ms = i64::try_from(SIBLING_LIVE_EVIDENCE_SECS.saturating_mul(1_000)).unwrap_or(0);
+    let mut count: u8 = 0;
+    for (j, stamp) in stamps.iter().enumerate() {
+        let Ok(j) = u8::try_from(j) else {
+            break;
+        };
+        if j == self_idx || *stamp <= 0 {
+            continue;
+        }
+        let same_kind = matches!(
+            super::pool_budget::slot_owner(j),
+            Some((_, kind)) if kind == endpoint
+        );
+        if !same_kind {
+            continue;
+        }
+        let age = now_wall_ms.saturating_sub(*stamp);
+        if age >= -SIBLING_FUTURE_SKEW_MS && age <= window_ms {
+            count = count.saturating_add(1);
+        }
+    }
+    count
+}
+
+/// Cache-line padded slot of the activity register, so sixteen sockets
+/// publishing once a second never share a line.
+#[repr(align(64))]
+struct PaddedI64(std::sync::atomic::AtomicI64);
+
+/// Each slot's last-frame wall time in ms (0 = never), published by the
+/// socket's read task at most once a second. Read-task time, so a drain-side
+/// shed or a ring refusal cannot freeze it.
+static SLOT_LAST_FRAME_WALL_MS: [PaddedI64; GHOST_REDIAL_SLOTS] =
+    [const { PaddedI64(std::sync::atomic::AtomicI64::new(0)) }; GHOST_REDIAL_SLOTS];
+
+/// Each slot's largest inter-frame gap inside the confirmed window, in ms.
+static SLOT_FRAME_GAP_PEAK_MS: [std::sync::atomic::AtomicU64; GHOST_REDIAL_SLOTS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; GHOST_REDIAL_SLOTS];
+
+/// Wall clock in ms since the Unix epoch, read through the WAL's receipt
+/// anchor: the same UTC clock every captured frame is stamped with, so a
+/// slot's stamp, a depth-200 hold time and the drain's tick receipts all
+/// compare on one scale. The anchor maps a monotonic `Instant`, so this file
+/// still never reads the system clock itself (an NTP step moves the anchor
+/// only on its 30 s refresh, and only the fast path reads these stamps,
+/// never a timer). O(1), no allocation.
+fn wall_clock_ms() -> i64 {
+    tickvault_storage::ws_frame_spill::receipt_nanos_from(Instant::now()) / 1_000_000
+}
+
+/// A slot's last published frame wall time, `None` if it never delivered or
+/// the index is out of range. One relaxed load.
+#[must_use]
+pub fn last_frame_wall_ms(connection_index: u8) -> Option<i64> {
+    SLOT_LAST_FRAME_WALL_MS
+        .get(usize::from(connection_index))
+        .map(|s| s.0.load(std::sync::atomic::Ordering::Relaxed))
+        .filter(|v| *v > 0)
+}
+
+/// Copies the whole activity register. O(32), no allocation.
+#[must_use]
+pub fn snapshot_frame_activity() -> [i64; GHOST_REDIAL_SLOTS] {
+    let mut out = [0_i64; GHOST_REDIAL_SLOTS];
+    for (dst, src) in out.iter_mut().zip(SLOT_LAST_FRAME_WALL_MS.iter()) {
+        *dst = src.0.load(std::sync::atomic::Ordering::Relaxed);
+    }
+    out
+}
+
+/// A slot's largest inter-frame gap inside the confirmed window, in whole
+/// seconds. `None` for an out-of-range index.
+#[must_use]
+pub fn frame_gap_peak_secs(connection_index: u8) -> Option<u64> {
+    SLOT_FRAME_GAP_PEAK_MS
+        .get(usize::from(connection_index))
+        .map(|s| s.load(std::sync::atomic::Ordering::Relaxed) / 1_000)
+}
+
+/// Publishes [`FRAME_GAP_MAX_SECS_GAUGE`] for every authorized slot. Cold:
+/// O([`MAX_TOTAL_DHAN_CONNECTIONS`]) gauge sets, called from the drain's 30 s
+/// silence arm, never per frame.
+pub fn publish_frame_gap_peaks() {
+    for idx in 0..MAX_TOTAL_DHAN_CONNECTIONS {
+        if let Some(secs) = frame_gap_peak_secs(idx) {
+            #[allow(clippy::cast_precision_loss)]
+            // APPROVED: whole seconds of a gap, far below 2^52.
+            metrics::gauge!(
+                FRAME_GAP_MAX_SECS_GAUGE,
+                "connection" => super::pool_budget::connection_slot_label(idx)
+            )
+            .set(secs as f64);
+        }
+    }
+}
+
+/// Seeds the two frame-silence counters at zero for every endpoint and
+/// basis, so the first real event is a visible step rather than a new series.
+/// Cold, once per lane start.
+pub fn seed_frame_silence_counters() {
+    for endpoint in DhanEndpointType::ALL {
+        for basis in SilenceBasis::ALL {
+            metrics::counter!(
+                FRAME_SILENCE_REDIAL_METRIC,
+                "endpoint" => endpoint.as_str(),
+                "basis" => basis.as_str()
+            )
+            .increment(0);
+            metrics::counter!(
+                FRAME_SILENCE_WOULD_REDIAL_METRIC,
+                "endpoint" => endpoint.as_str(),
+                "basis" => basis.as_str()
+            )
+            .increment(0);
+        }
+    }
+    metrics::counter!(DATA_SILENCE_STALE_METRIC).increment(0);
+}
+
+// ---------------------------------------------------------------------------
+// Depth-200 cross-feed register (scope lock 2026-10-10)
+// ---------------------------------------------------------------------------
+
+/// The contract each depth-200 slot holds, packed `security_id << 8 |
+/// segment code` (0 = none). Composite on purpose (I-P1-11): one id in two
+/// segments is two contracts.
+static DEPTH200_HELD: [std::sync::atomic::AtomicU64; GHOST_REDIAL_SLOTS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; GHOST_REDIAL_SLOTS];
+
+/// When the slot started holding that contract, wall ms.
+static DEPTH200_HELD_SINCE_MS: [std::sync::atomic::AtomicI64; GHOST_REDIAL_SLOTS] =
+    [const { std::sync::atomic::AtomicI64::new(0) }; GHOST_REDIAL_SLOTS];
+
+/// Packs an instrument for [`DEPTH200_HELD`]; `None` for an id that cannot
+/// be shifted without losing bits.
+fn pack_depth200_held(instrument: SubscribeInstrument) -> Option<u64> {
+    if instrument.security_id > (u64::MAX >> 8) {
+        return None;
+    }
+    Some((instrument.security_id << 8) | u64::from(instrument.segment.binary_code()))
+}
+
+/// Records which contract a depth-200 slot now holds. A change of contract
+/// writes `since` first and the id second (Release), so a reader that sees the
+/// new id sees its start time. The SAME contract published again keeps its
+/// original `since`: a no-op swap every minute must not push the cross-feed
+/// baseline forward forever. `None` clears the slot (the socket is dialling,
+/// parked or emptied); only the id is cleared. O(1), no allocation.
+pub fn publish_depth200_held(
+    connection_index: u8,
+    held: Option<SubscribeInstrument>,
+    now_wall_ms: i64,
+) {
+    let idx = usize::from(connection_index);
+    let (Some(id_slot), Some(since_slot)) =
+        (DEPTH200_HELD.get(idx), DEPTH200_HELD_SINCE_MS.get(idx))
+    else {
+        return;
+    };
+    match held.and_then(pack_depth200_held) {
+        Some(packed) => {
+            if id_slot.load(std::sync::atomic::Ordering::Acquire) == packed {
+                return;
+            }
+            since_slot.store(now_wall_ms, std::sync::atomic::Ordering::Relaxed);
+            id_slot.store(packed, std::sync::atomic::Ordering::Release);
+        }
+        None => {
+            // Only the id is cleared. Clearing `since` too could, on a weakly
+            // ordered CPU, become visible before the id store, and a reader
+            // would pair the old id with a zero start time (a baseline EARLIER
+            // than the truth). The stale `since` is overwritten before any
+            // new id is published.
+            id_slot.store(0, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+/// The contract a depth-200 slot holds and since when:
+/// `(security_id, segment, since_wall_ms)`. Reads the id, the start time, then
+/// the id again, and answers `None` if the id moved in between, so an id is
+/// never paired with another contract's start time. A stale start time with
+/// the correct id can only push the baseline LATER, which delays a request and
+/// never fakes one. O(1).
+#[must_use]
+pub fn depth200_held(connection_index: u8) -> Option<(u64, ExchangeSegment, i64)> {
+    let idx = usize::from(connection_index);
+    let id_slot = DEPTH200_HELD.get(idx)?;
+    let since_slot = DEPTH200_HELD_SINCE_MS.get(idx)?;
+    let first = id_slot.load(std::sync::atomic::Ordering::Acquire);
+    if first == 0 {
+        return None;
+    }
+    let since = since_slot.load(std::sync::atomic::Ordering::Relaxed);
+    let second = id_slot.load(std::sync::atomic::Ordering::Acquire);
+    if first != second || since <= 0 {
+        return None;
+    }
+    let segment = ExchangeSegment::from_byte(u8::try_from(first & 0xFF).unwrap_or(u8::MAX))?;
+    Some((first >> 8, segment, since))
+}
+
+/// A pending cross-feed redial per slot: 0 = none, else the slot's dial
+/// generation at request time plus one, so a request made against one
+/// connection is never acted on by the next.
+static DATA_SILENCE_PENDING_GEN: [std::sync::atomic::AtomicU64; GHOST_REDIAL_SLOTS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; GHOST_REDIAL_SLOTS];
+
+/// When each slot's last cross-feed request was accepted, wall ms.
+static DATA_SILENCE_LAST_REQUEST_MS: [std::sync::atomic::AtomicI64; GHOST_REDIAL_SLOTS] =
+    [const { std::sync::atomic::AtomicI64::new(0) }; GHOST_REDIAL_SLOTS];
+
+/// Why a cross-feed redial request was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataSilenceRefusal {
+    /// The index is past the register.
+    OutOfRange,
+    /// The slot was asked less than [`DATA_SILENCE_REQUEST_COOLDOWN_SECS`] ago.
+    CoolingDown,
+    /// A request for this slot is still waiting to be taken.
+    StillPending,
+    /// An 805 halted rotation for this process: no voluntary redial.
+    Halted,
+}
+
+impl DataSilenceRefusal {
+    /// The log label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OutOfRange => "out_of_range",
+            Self::CoolingDown => "cooling_down",
+            Self::StillPending => "still_pending",
+            Self::Halted => "halted",
+        }
+    }
+}
+
+/// Asks a depth-200 slot's connection task to redial because the main feed
+/// shows its contract trading while the socket stays silent. Refused after an
+/// 805, while one is pending, and within the cooldown. O(1), no allocation.
+///
+/// # Errors
+/// A [`DataSilenceRefusal`] naming why nothing was recorded.
+// WIRING-EXEMPT: called as a function value, `ps::request_data_silence_redial`, by `LiveIngest::check_depth200_cross_feed` (dhan_feed_stack.rs)
+pub fn request_data_silence_redial(
+    connection_index: u8,
+    now_wall_ms: i64,
+) -> Result<(), DataSilenceRefusal> {
+    request_data_silence_redial_in(
+        &DATA_SILENCE_PENDING_GEN,
+        &DATA_SILENCE_LAST_REQUEST_MS,
+        connection_index,
+        now_wall_ms,
+        rotation_halted(),
+        dial_generation(connection_index),
+    )
+}
+
+/// The pure half of [`request_data_silence_redial`], over injected tables.
+fn request_data_silence_redial_in(
+    pending: &[std::sync::atomic::AtomicU64; GHOST_REDIAL_SLOTS],
+    last: &[std::sync::atomic::AtomicI64; GHOST_REDIAL_SLOTS],
+    connection_index: u8,
+    now_wall_ms: i64,
+    halted: bool,
+    generation: u64,
+) -> Result<(), DataSilenceRefusal> {
+    let idx = usize::from(connection_index);
+    let (Some(pending), Some(last)) = (pending.get(idx), last.get(idx)) else {
+        return Err(DataSilenceRefusal::OutOfRange);
+    };
+    if halted {
+        return Err(DataSilenceRefusal::Halted);
+    }
+    if pending.load(std::sync::atomic::Ordering::Acquire) != 0 {
+        return Err(DataSilenceRefusal::StillPending);
+    }
+    let previous = last.load(std::sync::atomic::Ordering::Relaxed);
+    if previous != 0
+        && now_wall_ms.saturating_sub(previous)
+            < DATA_SILENCE_REQUEST_COOLDOWN_SECS.saturating_mul(1_000)
+    {
+        return Err(DataSilenceRefusal::CoolingDown);
+    }
+    if pending
+        .compare_exchange(
+            0,
+            generation.saturating_add(1),
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return Err(DataSilenceRefusal::StillPending);
+    }
+    last.store(now_wall_ms, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// Takes a slot's pending cross-feed request. `true` only when one was
+/// pending AND it was made against the connection running now; a request
+/// made against an earlier connection is dropped and counted on
+/// [`DATA_SILENCE_STALE_METRIC`]. One swap, polled on the connection task's
+/// existing one-second tick.
+pub fn take_data_silence_redial(connection_index: u8) -> bool {
+    match take_data_silence_redial_in(
+        &DATA_SILENCE_PENDING_GEN,
+        connection_index,
+        dial_generation(connection_index),
+    ) {
+        DataSilenceTake::Take => true,
+        DataSilenceTake::Nothing => false,
+        DataSilenceTake::Stale => {
+            metrics::counter!(DATA_SILENCE_STALE_METRIC).increment(1);
+            false
+        }
+    }
+}
+
+/// What a take found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DataSilenceTake {
+    Nothing,
+    Take,
+    Stale,
+}
+
+/// The pure half of [`take_data_silence_redial`].
+fn take_data_silence_redial_in(
+    pending: &[std::sync::atomic::AtomicU64; GHOST_REDIAL_SLOTS],
+    connection_index: u8,
+    generation: u64,
+) -> DataSilenceTake {
+    let Some(slot) = pending.get(usize::from(connection_index)) else {
+        return DataSilenceTake::Nothing;
+    };
+    match slot.swap(0, std::sync::atomic::Ordering::AcqRel) {
+        0 => DataSilenceTake::Nothing,
+        stored if stored == generation.saturating_add(1) => DataSilenceTake::Take,
+        _ => DataSilenceTake::Stale,
+    }
+}
 
 /// When the frame watchdog ([`FRAME_SILENCE_REDIAL_SECS`]) is allowed to act.
 ///
@@ -344,6 +1020,22 @@ impl FrameSilenceGate {
             Self::ContinuousSessionIst => {
                 secs_of_day_ist >= CONTINUOUS_SESSION_OPEN_SECS_OF_DAY_IST
                     && secs_of_day_ist < CONTINUOUS_SESSION_CLOSE_SECS_OF_DAY_IST
+            }
+        }
+    }
+
+    /// Whether the sibling-confirmed fast path may act at `secs_of_day_ist`:
+    /// the continuous session up to [`CONFIRMED_SILENCE_CLOSE_SECS_OF_DAY_IST`]
+    /// (15:15). The closing-auction minutes stay on the time fallback.
+    /// `AlwaysOn` says yes and `Off` no, so tests model both without a clock.
+    #[must_use]
+    pub const fn confirmed_window_open_at(self, secs_of_day_ist: u32) -> bool {
+        match self {
+            Self::AlwaysOn => true,
+            Self::Off => false,
+            Self::ContinuousSessionIst => {
+                secs_of_day_ist >= CONTINUOUS_SESSION_OPEN_SECS_OF_DAY_IST
+                    && secs_of_day_ist < CONFIRMED_SILENCE_CLOSE_SECS_OF_DAY_IST
             }
         }
     }
@@ -1346,7 +2038,9 @@ pub fn rotation_halted() -> bool {
 /// contract change) and `ghost_unsubscribe` (a repeat unsubscribe). The name
 /// predates those two; the counter is kept so its existing readers keep
 /// working. (`ghost_redial` retired 2026-10-01: a ghost is answered by a
-/// repeat unsubscribe on the live socket, never a redial.)
+/// repeat unsubscribe on the live socket, never a redial.) Since 2026-10-10
+/// also `data_silence`: a depth-200 cross-feed silence redial taken after an
+/// 805.
 pub const DIAL_REFUSED_AFTER_805_METRIC: &str = "tv_depth_dial_refused_after_805_total";
 
 /// Records one voluntary redial refused by the 805 breaker: a counter and a
@@ -2815,6 +3509,15 @@ static OVERFLOW_EPISODES: std::sync::Mutex<OverflowEpisodes> =
 /// that keeps every quiet socket off the episode lock.
 static OVERFLOW_ENGAGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Whether an 805 overflow episode has engaged in this process. One Acquire
+/// load. Never cleared within a process (like [`rotation_halted`]), so every
+/// evidence-based fast redial stays off for the rest of the session once an
+/// 805 has been seen.
+#[must_use]
+pub fn overflow_episode_engaged() -> bool {
+    OVERFLOW_ENGAGED.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Scope lock 2026-10-06: when each slot (global index) last BEGAN a dial, in
 /// milliseconds since [`OVERFLOW_DIAL_EPOCH`] plus one (0 = never). Written
 /// with one Release store at every BeginDial, engaged or not, so a dial that
@@ -4050,6 +4753,34 @@ pub struct ConnectionSupervisor {
     auth_reject_refreshes: [Option<Instant>; AUTH_REJECT_MAX_REFRESHES_PER_WINDOW],
     /// Next write position in [`Self::auth_reject_refreshes`].
     auth_reject_cursor: u8,
+    /// Whether this supervisor reads the pool activity register for sibling
+    /// evidence. `Off` by default; the live lane opts in.
+    silence_evidence: SiblingEvidence,
+    /// What the evidence fast paths do (off, shadow count, act).
+    fast_path: FrameSilenceFastPath,
+    /// Instruments the current socket holds, for the confirmed-path floor.
+    held_instruments: u32,
+    /// Silence redials since the strikes last reset; escalates the
+    /// confirmed threshold.
+    silence_strikes: u8,
+    /// When this socket last took a silence redial.
+    last_silence_redial_at: Option<Instant>,
+    /// Basis of the most recent silence redial (audit and tests).
+    last_silence_basis: SilenceBasis,
+    /// Basis the NEXT `FrameSilenceElapsed` records; consumed by that arm.
+    next_silence_basis: SilenceBasis,
+    /// Shadow mode: whether this silence episode already counted a would-be
+    /// redial. Cleared by the next frame.
+    would_redial_latched: bool,
+    /// Shadow-mode would-be redials counted on this supervisor.
+    would_redials: u64,
+    /// When this socket next publishes its last-frame wall time.
+    next_activity_publish_at: Instant,
+    /// Whether the confirmed window was open at the last poll; a false to
+    /// true edge resets the gap peak.
+    gap_window_open: bool,
+    /// The largest frame gap seen inside the confirmed window, ms.
+    gap_peak_ms: u64,
 }
 
 impl ConnectionSupervisor {
@@ -4079,6 +4810,18 @@ impl ConnectionSupervisor {
             auth_reject: None,
             auth_reject_refreshes: [None; AUTH_REJECT_MAX_REFRESHES_PER_WINDOW],
             auth_reject_cursor: 0,
+            silence_evidence: SiblingEvidence::Off,
+            fast_path: FrameSilenceFastPath::Shadow,
+            held_instruments: 0,
+            silence_strikes: 0,
+            last_silence_redial_at: None,
+            last_silence_basis: SilenceBasis::Unconfirmed,
+            next_silence_basis: SilenceBasis::Unconfirmed,
+            would_redial_latched: false,
+            would_redials: 0,
+            next_activity_publish_at: now,
+            gap_window_open: false,
+            gap_peak_ms: 0,
         }
     }
 
@@ -4142,6 +4885,77 @@ impl ConnectionSupervisor {
         now.saturating_duration_since(self.last_frame_at)
     }
 
+    /// Whether this supervisor reads sibling evidence. The live lane sets
+    /// [`SiblingEvidence::Pool`]; tests leave it `Off` or inject evidence
+    /// through [`Self::poll_with`].
+    // TEST-EXEMPT: pinned by main_feed_confirmed_redial_at_60s_with_two_live_siblings_in_act_mode
+    pub fn set_silence_evidence(&mut self, evidence: SiblingEvidence) {
+        self.silence_evidence = evidence;
+    }
+
+    /// What the evidence fast paths do. The lane passes the config value.
+    // TEST-EXEMPT: pinned by shadow_mode_counts_once_per_episode_and_never_redials
+    pub fn set_fast_path(&mut self, fast_path: FrameSilenceFastPath) {
+        self.fast_path = fast_path;
+    }
+
+    /// Records how many instruments the current socket holds (the
+    /// confirmed-path floor reads it). Called at every held-set change.
+    // TEST-EXEMPT: pinned by below_the_instrument_floor_falls_back_to_300s
+    pub fn set_held_instruments(&mut self, held: u32) {
+        self.held_instruments = held;
+    }
+
+    /// Silence redials since the strikes last reset.
+    #[must_use]
+    pub const fn silence_strikes(&self) -> u8 {
+        self.silence_strikes
+    }
+
+    /// Basis of the most recent silence redial.
+    #[must_use]
+    pub const fn last_silence_basis(&self) -> SilenceBasis {
+        self.last_silence_basis
+    }
+
+    /// Would-be fast redials counted in shadow mode.
+    #[must_use]
+    pub const fn shadow_would_redials(&self) -> u64 {
+        self.would_redials
+    }
+
+    /// Sets the basis the next [`ConnEvent::FrameSilenceElapsed`] records.
+    /// Used by the connection task for a cross-feed request; the time paths
+    /// set it inside [`Self::poll_with`].
+    // TEST-EXEMPT: pinned by a_taken_data_silence_request_after_805_is_refused_with_path_data_silence and escalation_bounds_snapshot_then_deaf_loop
+    pub fn note_silence_basis(&mut self, basis: SilenceBasis) {
+        self.next_silence_basis = basis;
+    }
+
+    /// The confirmed threshold for this socket now: the kind's base doubled
+    /// per strike (at most three doublings) and capped at the 300 s fallback.
+    /// Only the main feed and depth-20 have a sibling-confirmed path; a
+    /// depth-200 socket never reads this (its paths are the 900 s backstop
+    /// and the cross-feed check), so the 300 s it would return there is unused.
+    #[must_use]
+    pub fn confirmed_threshold_secs(&self) -> u64 {
+        let base = confirmed_base_secs(self.slot.endpoint);
+        let shift = u32::from(self.silence_strikes.min(MAX_SILENCE_STRIKE_SHIFT));
+        base.checked_shl(shift)
+            .unwrap_or(u64::MAX)
+            .min(FRAME_SILENCE_REDIAL_SECS)
+    }
+
+    /// The threshold a basis fired at, for the audit log.
+    fn threshold_secs_for(&self, basis: SilenceBasis) -> u64 {
+        match basis {
+            SilenceBasis::Unconfirmed => FRAME_SILENCE_REDIAL_SECS,
+            SilenceBasis::SiblingConfirmed => self.confirmed_threshold_secs(),
+            SilenceBasis::Backstop => DEPTH200_SILENCE_BACKSTOP_SECS,
+            SilenceBasis::CrossFeed => 0,
+        }
+    }
+
     /// Phase projected onto the shared [`ConnectionState`] vocabulary, for
     /// `ws_event_audit` rows and the `/health` surface.
     #[must_use]
@@ -4199,6 +5013,8 @@ impl ConnectionSupervisor {
             ConnEvent::BeginDial => {
                 // A new dial clears the previous close's code (audit rows).
                 self.last_disconnect_code = None;
+                // A new connection is a new silence episode for shadow counting.
+                self.would_redial_latched = false;
                 self.phase = ConnPhase::Dialing;
                 self.proven_healthy = false;
                 self.healthy_since = None;
@@ -4274,8 +5090,41 @@ impl ConnectionSupervisor {
 
             ConnEvent::FrameReceived => {
                 self.watchdog.record_activity(now);
+                // Scope lock 2026-10-10: the largest gap between two frames
+                // inside the confirmed window, measured BEFORE the stamp is
+                // overwritten. One subtraction and a compare per frame; the
+                // shared store happens only when the peak grows.
+                if self.gap_window_open && self.proven_healthy {
+                    let gap_ms = u64::try_from(
+                        now.saturating_duration_since(self.last_frame_at)
+                            .as_millis(),
+                    )
+                    .unwrap_or(u64::MAX);
+                    if gap_ms > self.gap_peak_ms {
+                        self.gap_peak_ms = gap_ms;
+                        if let Some(peak) =
+                            SLOT_FRAME_GAP_PEAK_MS.get(usize::from(self.slot.global_index))
+                        {
+                            peak.fetch_max(gap_ms, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
                 self.last_frame_at = now;
                 self.frames = self.frames.saturating_add(1);
+                self.would_redial_latched = false;
+                // Publish this socket's liveness for its siblings, at most
+                // once a second: one wall-clock read and one relaxed store.
+                if now >= self.next_activity_publish_at {
+                    if let Some(slot) =
+                        SLOT_LAST_FRAME_WALL_MS.get(usize::from(self.slot.global_index))
+                    {
+                        slot.0
+                            .store(wall_clock_ms(), std::sync::atomic::Ordering::Relaxed);
+                    }
+                    self.next_activity_publish_at = now
+                        .checked_add(FRAME_ACTIVITY_PUBLISH_INTERVAL)
+                        .unwrap_or(now);
+                }
                 if !self.proven_healthy {
                     self.proven_healthy = true;
                     self.attempt = 0;
@@ -4439,12 +5288,28 @@ impl ConnectionSupervisor {
             }
 
             ConnEvent::FrameSilenceElapsed => {
+                // The basis is consumed whether or not this redial happens, so
+                // a stale basis can never label a later, different redial.
+                let basis =
+                    std::mem::replace(&mut self.next_silence_basis, SilenceBasis::Unconfirmed);
                 // Only a LIVE socket can be data-silent in a way that means
                 // anything: while dialing or subscribing no frame is expected,
                 // and backoff/parked are covered by `is_watchdog_eligible`.
                 if self.phase != ConnPhase::Live {
                     return SupervisorAction::Continue;
                 }
+                // Scope lock 2026-10-10: record the basis and escalate this
+                // socket's confirmed threshold (strikes reset after
+                // SILENCE_STRIKE_RESET with no silence redial).
+                self.last_silence_basis = basis;
+                self.silence_strikes = self.silence_strikes.saturating_add(1);
+                self.last_silence_redial_at = Some(now);
+                metrics::counter!(
+                    FRAME_SILENCE_REDIAL_METRIC,
+                    "endpoint" => self.slot.endpoint.as_str(),
+                    "basis" => basis.as_str()
+                )
+                .increment(1);
                 // Scope lock 2026-10-06: a DEPTH socket's frame silence
                 // neither fails nor restarts an overflow window (a quiet depth
                 // contract is legitimate), but the probed depth socket is down
@@ -4470,6 +5335,9 @@ impl ConnectionSupervisor {
                     endpoint = self.slot.endpoint.as_str(),
                     pool_index = self.slot.pool_index,
                     source = "frame_silence",
+                    basis = basis.as_str(),
+                    threshold_secs = self.threshold_secs_for(basis),
+                    strikes = self.silence_strikes,
                     silent_secs = self.frame_silent_for(now).as_secs(),
                     frames_on_this_connection = self.frames,
                     "socket answers pings but has delivered NO data frame for the frame-silence \
@@ -4515,23 +5383,155 @@ impl ConnectionSupervisor {
     /// The idle one wins when both would fire, so a dead transport is never
     /// attributed to data silence.
     pub fn poll(&mut self, now: Instant) -> SupervisorAction {
+        self.poll_with(now, SilenceInputs::live)
+    }
+
+    /// [`Self::poll`] with the process-wide silence inputs injected. `read` is
+    /// called ONLY when this socket is already silent past its confirmed
+    /// threshold and below the 300 s fallback, on a kind with a confirmed path,
+    /// with evidence and the fast path both on — so a healthy socket never
+    /// reads the register. Tests pass a closure over local data.
+    ///
+    /// Thresholds (scope lock 2026-10-10, "PER-KIND FRAME-SILENCE THRESHOLDS"):
+    /// main feed and depth-20 redial at 300 s on time alone, or earlier at
+    /// their escalating confirmed threshold with two live same-kind siblings;
+    /// depth-200 redials on time alone only at 900 s; order update never.
+    pub fn poll_with<'a>(
+        &mut self,
+        now: Instant,
+        read: impl FnOnce() -> SilenceInputs<'a>,
+    ) -> SupervisorAction {
         if !self.phase.is_watchdog_eligible() {
             return SupervisorAction::Continue;
         }
         if self.watchdog.is_expired(now) {
             return self.on_event(ConnEvent::IdleElapsed, now);
         }
-        if self.phase == ConnPhase::Live {
-            if !self.frame_silence_gate.is_open() {
-                // Outside the gate the silence clock is HELD, not paused: the
-                // window starts counting at the open, so a socket dialed at
-                // 09:00 is not torn down at 09:15 for the pre-open quiet.
-                self.last_frame_at = now;
-            } else if self.frame_silent_for(now) >= FRAME_SILENCE_REDIAL {
-                return self.on_event(ConnEvent::FrameSilenceElapsed, now);
+        // The ONE wall-clock read, and only for the IST gate.
+        let secs_of_day = match self.frame_silence_gate {
+            FrameSilenceGate::ContinuousSessionIst => {
+                tickvault_common::market_hours::now_ist_secs_of_day()
+            }
+            FrameSilenceGate::AlwaysOn | FrameSilenceGate::Off => 0,
+        };
+        let confirmed_open = self
+            .frame_silence_gate
+            .confirmed_window_open_at(secs_of_day);
+        if confirmed_open && !self.gap_window_open {
+            // The window just opened: a fresh day's gap peak.
+            self.gap_peak_ms = 0;
+            if let Some(peak) = SLOT_FRAME_GAP_PEAK_MS.get(usize::from(self.slot.global_index)) {
+                peak.store(0, std::sync::atomic::Ordering::Relaxed);
             }
         }
-        SupervisorAction::Continue
+        self.gap_window_open = confirmed_open;
+        if self.phase != ConnPhase::Live {
+            return SupervisorAction::Continue;
+        }
+        if let Some(at) = self.last_silence_redial_at
+            && now.saturating_duration_since(at) >= SILENCE_STRIKE_RESET
+        {
+            self.silence_strikes = 0;
+            self.last_silence_redial_at = None;
+        }
+        if !self.frame_silence_gate.is_open_at(secs_of_day) {
+            // Outside the gate the silence clock is HELD, not paused: the
+            // window starts counting at the open, so a socket dialed at
+            // 09:00 is not torn down at 09:15 for the pre-open quiet.
+            self.last_frame_at = now;
+            return SupervisorAction::Continue;
+        }
+        let endpoint = self.slot.endpoint;
+        let silent_secs = self.frame_silent_for(now).as_secs();
+        let confirmed_threshold = self.confirmed_threshold_secs();
+        let kind = confirmed_kind_index(endpoint);
+        let read_evidence = self.silence_evidence == SiblingEvidence::Pool
+            && self.fast_path != FrameSilenceFastPath::Off
+            && kind.is_some()
+            && silent_secs >= confirmed_threshold
+            && silent_secs < FRAME_SILENCE_REDIAL_SECS;
+        let mut overflow_or_halted = true;
+        let mut siblings: u8 = 0;
+        let mut spacing_ok = false;
+        let mut wall_ms: i64 = 0;
+        let mut spacing_slot: Option<&std::sync::atomic::AtomicI64> = None;
+        let mut spacing_last: i64 = 0;
+        if read_evidence {
+            let inputs = read();
+            let spacing: &'a [std::sync::atomic::AtomicI64; CONFIRMED_SPACING_KINDS] =
+                inputs.spacing;
+            overflow_or_halted = inputs.overflow_or_halted;
+            wall_ms = inputs.wall_ms;
+            siblings = live_siblings(self.slot.global_index, endpoint, wall_ms, &inputs.stamps);
+            if let Some(slot) = kind.and_then(|k| spacing.get(k)) {
+                spacing_last = slot.load(std::sync::atomic::Ordering::Acquire);
+                spacing_ok = spacing_last == 0
+                    || wall_ms.saturating_sub(spacing_last)
+                        >= CONFIRMED_REDIAL_SPACING_SECS.saturating_mul(1_000);
+                spacing_slot = Some(slot);
+            }
+        }
+        let Some(basis) = silence_redial_basis(
+            endpoint,
+            silent_secs,
+            confirmed_threshold,
+            confirmed_open,
+            overflow_or_halted,
+            siblings,
+            self.held_instruments,
+            spacing_ok,
+        ) else {
+            return SupervisorAction::Continue;
+        };
+        if basis == SilenceBasis::SiblingConfirmed {
+            match self.fast_path {
+                FrameSilenceFastPath::Off => return SupervisorAction::Continue,
+                FrameSilenceFastPath::Shadow => {
+                    if !self.would_redial_latched {
+                        self.would_redial_latched = true;
+                        self.would_redials = self.would_redials.saturating_add(1);
+                        metrics::counter!(
+                            FRAME_SILENCE_WOULD_REDIAL_METRIC,
+                            "endpoint" => endpoint.as_str(),
+                            "basis" => basis.as_str()
+                        )
+                        .increment(1);
+                        info!(
+                            endpoint = endpoint.as_str(),
+                            connection_index = self.slot.global_index,
+                            source = "frame_silence_shadow",
+                            silent_secs,
+                            threshold_secs = confirmed_threshold,
+                            live_siblings = siblings,
+                            held = self.held_instruments,
+                            "shadow mode: sibling-confirmed silence WOULD redial this socket now; \
+                             counted only, the 300 s fallback still governs"
+                        );
+                    }
+                    return SupervisorAction::Continue;
+                }
+                FrameSilenceFastPath::Act => {
+                    // One confirmed redial per kind per spacing, pool-wide: a
+                    // lost race means another socket of this kind just took it.
+                    let Some(slot) = spacing_slot else {
+                        return SupervisorAction::Continue;
+                    };
+                    if slot
+                        .compare_exchange(
+                            spacing_last,
+                            wall_ms,
+                            std::sync::atomic::Ordering::AcqRel,
+                            std::sync::atomic::Ordering::Acquire,
+                        )
+                        .is_err()
+                    {
+                        return SupervisorAction::Continue;
+                    }
+                }
+            }
+        }
+        self.next_silence_basis = basis;
+        self.on_event(ConnEvent::FrameSilenceElapsed, now)
     }
 
     /// How long the CURRENT socket has been delivering frames, in
@@ -5258,6 +6258,13 @@ impl SubscribeGuard {
     pub fn holds(&self, instrument: SubscribeInstrument) -> bool {
         // O(1) EXEMPT: n is 1 (depth-200) or <= 50 (depth-20), cold path, at most once per 180 s per socket.
         self.instruments.contains(&instrument)
+    }
+
+    /// The first instrument in the set, if any. On a depth-200 socket this is
+    /// the one contract it holds. O(1).
+    #[must_use]
+    pub fn first(&self) -> Option<SubscribeInstrument> {
+        self.instruments.first().copied()
     }
 
     /// Incarnation counter — bumped on every confirmed subscribe.
@@ -8443,6 +9450,7 @@ where
         let not_unsubscribed = plan.removed.get(removed_landed..).unwrap_or(&[]).to_vec();
         guard.put_back(&not_unsubscribed);
         publish_connection_instruments(&supervisor.slot(), guard.len());
+        note_held_set(supervisor, guard);
         count("stopped");
         error!(
             code = ErrorCode::WsGapSubscriptionBatching.code_str(),
@@ -8514,6 +9522,7 @@ where
         }
         let not_subscribed = guard.take_from(landed_until);
         publish_connection_instruments(&supervisor.slot(), guard.len());
+        note_held_set(supervisor, guard);
         count("stopped");
         error!(
             code = ErrorCode::WsGapSubscriptionBatching.code_str(),
@@ -8550,6 +9559,7 @@ where
         "in-place resubscribe applied on the live socket - unsubscribe then subscribe, no redial"
     );
     publish_connection_instruments(&supervisor.slot(), guard.len());
+    note_held_set(supervisor, guard);
     audit.emit("applied", sub.sent, removed_landed, guard.len());
     answer_resubscribe(ack, ResubscribeOutcome::Applied);
     SupervisorAction::Continue
@@ -8623,6 +9633,29 @@ where
 /// Saturates rather than wraps; a socket holds at most 5,000.
 fn guard_len_u32(guard: &SubscribeGuard) -> u32 {
     u32::try_from(guard.len()).unwrap_or(u32::MAX)
+}
+
+/// Scope lock 2026-10-10: tells the supervisor how many instruments the
+/// socket now holds (the confirmed-path floor) and, on depth-200, which
+/// contract it holds (the cross-feed register). Called beside every
+/// `publish_connection_instruments` that reports a held count. O(1).
+fn note_held_set(supervisor: &mut ConnectionSupervisor, guard: &SubscribeGuard) {
+    supervisor.set_held_instruments(guard_len_u32(guard));
+    if supervisor.slot().endpoint == DhanEndpointType::Depth200 {
+        publish_depth200_held(
+            supervisor.slot().global_index,
+            guard.first(),
+            wall_clock_ms(),
+        );
+    }
+}
+
+/// The socket holds nothing on the wire (dialing or parked). O(1).
+fn note_held_cleared(supervisor: &mut ConnectionSupervisor) {
+    supervisor.set_held_instruments(0);
+    if supervisor.slot().endpoint == DhanEndpointType::Depth200 {
+        publish_depth200_held(supervisor.slot().global_index, None, 0);
+    }
 }
 
 /// A market-data socket parked for 805 waits here for an overflow probe grant
@@ -8780,6 +9813,7 @@ where
                 close_capturing(&mut socket, &*sink).await;
                 // Parked for the session: the wire carries nothing from here.
                 publish_connection_instruments(&supervisor.slot(), 0);
+                note_held_cleared(&mut supervisor);
                 // A park is PERMANENT — nothing re-dials this socket, and its
                 // shard of the universe stops delivering for the rest of the
                 // session. Until 2026-08-20 that fact reached a log line and a
@@ -8845,6 +9879,11 @@ where
             SupervisorAction::SleepThenDial { delay_ms } => {
                 close_capturing(&mut socket, &*sink).await;
                 guard.mark_lost();
+                // Review 2026-10-10: the socket holds nothing during the
+                // backoff, so the depth-200 cross-feed check must not judge it
+                // (a request now would only be dropped as stale at the next
+                // dial and burn the slot's cooldown).
+                note_held_cleared(&mut supervisor);
                 // `mark_lost` is the honest edge: the subscription is gone and
                 // will have to be re-sent. Recorded BEFORE the sleep so the
                 // row's timestamp is the moment we lost the socket, not the
@@ -8862,6 +9901,11 @@ where
             SupervisorAction::RefreshTokenThenDial { delay_ms } => {
                 close_capturing(&mut socket, &*sink).await;
                 guard.mark_lost();
+                // Review 2026-10-10: the socket holds nothing during the
+                // backoff, so the depth-200 cross-feed check must not judge it
+                // (a request now would only be dropped as stale at the next
+                // dial and burn the slot's cooldown).
+                note_held_cleared(&mut supervisor);
                 sink.on_lifecycle_detail(
                     tickvault_common::ws_event_types::WsEventKind::Disconnected,
                     supervisor.last_redial_reason().as_str(),
@@ -8887,6 +9931,7 @@ where
             SupervisorAction::Dial => {
                 // Nothing is on the wire until this dial's subscribe is acked.
                 publish_connection_instruments(&supervisor.slot(), 0);
+                note_held_cleared(&mut supervisor);
                 // Z11d: a socket asked to stop never opens. Every dial path
                 // (first dial, every reconnect, the lock-refusal poll below)
                 // passes here, so this one check is what stops them all.
@@ -9017,6 +10062,7 @@ where
                 }
                 guard.mark_confirmed();
                 publish_connection_instruments(&supervisor.slot(), guard.len());
+                note_held_set(&mut supervisor, &guard);
                 // CONNECTED means subscribed-and-acked, not merely dialed.
                 // The 2026-08-12 blackout is why: twelve sockets dialed and
                 // every one died on the handshake, so a row written at dial
@@ -9558,6 +10604,7 @@ where
                                     .increment(added as u64);
                                 outcome = ExtendOutcome::Held;
                                 publish_connection_instruments(&supervisor.slot(), guard.len());
+                                note_held_set(supervisor, guard);
                             }
                         }
                         Err(_) => {
@@ -10081,6 +11128,7 @@ where
                                         },
                                         Some((swap_audit, guard_len_u32(guard))),
                                     );
+                                    note_held_cleared(supervisor);
                                     action = supervisor
                                         .on_event(ConnEvent::SubscribeFailed, Instant::now());
                                     // Leave the drain so the outer loop can act
@@ -10151,6 +11199,8 @@ where
                             metrics::counter!(SWAP_REFUSED_METRIC).increment(1);
                         }
                     }
+                    // Scope lock 2026-10-10: a swap may change the held contract.
+                    note_held_set(supervisor, guard);
                 }
                 Ok(LiveSubscriptionCommand::ProbeUnsubscribe {
                     drop_this,
@@ -10479,6 +11529,20 @@ where
                         refuse_voluntary_redial_after_805(supervisor.slot(), "probe_close");
                     } else {
                         action = supervisor.on_event(ConnEvent::ProbeCloseRequested, Instant::now());
+                    }
+                }
+                // Scope lock 2026-10-10: a cross-feed silence request (the
+                // main feed shows this depth-200 socket's contract trading
+                // while it stays silent). One atomic swap a second; refused
+                // after an 805 like every other voluntary redial.
+                if action == SupervisorAction::Continue
+                    && take_data_silence_redial(supervisor.slot().global_index)
+                {
+                    if rotation_halted() {
+                        refuse_voluntary_redial_after_805(supervisor.slot(), "data_silence");
+                    } else {
+                        supervisor.note_silence_basis(SilenceBasis::CrossFeed);
+                        action = supervisor.on_event(ConnEvent::FrameSilenceElapsed, Instant::now());
                     }
                 }
                 // D7 / 2026-10-02: the overflow probe, on the same tick. A quiet
@@ -13119,7 +14183,7 @@ mod tests {
     #[test]
     fn a_ponging_socket_that_delivers_no_frame_is_redialled_after_the_frame_silence_window() {
         let t = t0();
-        let mut s = sup(DhanEndpointType::Depth200, 0, t);
+        let mut s = sup(DhanEndpointType::MainFeed, 0, t);
         let _ = s.on_event(ConnEvent::BeginDial, t);
         let _ = s.on_event(ConnEvent::DialSucceeded, t);
         let _ = s.on_event(ConnEvent::SubscribeAcked, t);
@@ -19191,6 +20255,7 @@ mod tests {
     fn test_refuse_voluntary_redial_after_805_does_not_panic_and_names_the_path() {
         let slot = slot(DhanEndpointType::Depth20, 0);
         refuse_voluntary_redial_after_805(slot, "probe_close");
+        refuse_voluntary_redial_after_805(slot, "data_silence");
         assert_eq!(
             DIAL_REFUSED_AFTER_805_METRIC,
             "tv_depth_dial_refused_after_805_total"
@@ -24588,6 +25653,892 @@ mod subscription_audit_tests {
                 }
             }
             assert!(found, "the installed channel must receive the emit");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scope lock 2026-10-10 — per-kind frame-silence thresholds (fault redials
+// only). Every test injects its evidence through `poll_with` and local
+// spacing tables, so none of them reads or writes another test's sockets.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod frame_silence_evidence_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use std::cell::Cell;
+    use std::sync::atomic::AtomicI64;
+
+    const WALL0: i64 = 1_800_000_000_000;
+
+    fn t0() -> Instant {
+        Instant::now()
+    }
+
+    fn slot_at(endpoint: DhanEndpointType, global_index: u8) -> ConnectionSlot {
+        ConnectionSlot {
+            account: crate::websocket::pool_budget::DhanAccount::Primary,
+            endpoint,
+            pool_index: 0,
+            global_index,
+        }
+    }
+
+    /// A live supervisor on `global_index`, opted into evidence, with `held`
+    /// instruments and fast path `mode`.
+    fn live_sup(
+        endpoint: DhanEndpointType,
+        global_index: u8,
+        held: u32,
+        mode: FrameSilenceFastPath,
+        t: Instant,
+    ) -> ConnectionSupervisor {
+        let mut s = ConnectionSupervisor::new(slot_at(endpoint, global_index), t);
+        s.set_silence_evidence(SiblingEvidence::Pool);
+        s.set_fast_path(mode);
+        s.set_held_instruments(held);
+        let _ = s.on_event(ConnEvent::BeginDial, t);
+        let _ = s.on_event(ConnEvent::DialSucceeded, t);
+        let _ = s.on_event(ConnEvent::SubscribeAcked, t);
+        assert_eq!(s.phase(), ConnPhase::Live);
+        s
+    }
+
+    /// Stamps with the given slots live at `wall`.
+    fn stamps_live(slots: &[u8], wall: i64) -> [i64; GHOST_REDIAL_SLOTS] {
+        let mut out = [0_i64; GHOST_REDIAL_SLOTS];
+        for s in slots {
+            if let Some(v) = out.get_mut(usize::from(*s)) {
+                *v = wall;
+            }
+        }
+        out
+    }
+
+    /// Polls at `t + secs` after a pong (so the IDLE watchdog stays quiet),
+    /// with the given siblings live at that instant.
+    fn poll_at(
+        s: &mut ConnectionSupervisor,
+        t: Instant,
+        secs: u64,
+        siblings: &[u8],
+        overflow_or_halted: bool,
+        spacing: &[AtomicI64; CONFIRMED_SPACING_KINDS],
+    ) -> SupervisorAction {
+        let at = t + Duration::from_secs(secs);
+        let _ = s.on_event(ConnEvent::KeepAliveReceived, at);
+        let wall = WALL0 + i64::try_from(secs).unwrap_or(0) * 1_000;
+        s.poll_with(at, || SilenceInputs {
+            wall_ms: wall,
+            overflow_or_halted,
+            stamps: stamps_live(siblings, wall),
+            spacing,
+        })
+    }
+
+    fn fresh_spacing() -> [AtomicI64; CONFIRMED_SPACING_KINDS] {
+        [const { AtomicI64::new(0) }; CONFIRMED_SPACING_KINDS]
+    }
+
+    fn is_redial(a: SupervisorAction) -> bool {
+        matches!(a, SupervisorAction::SleepThenDial { .. })
+    }
+
+    #[test]
+    fn silence_redial_basis_truth_table() {
+        use DhanEndpointType::{Depth20, Depth200, MainFeed, OrderUpdate};
+        let all = |e, silent, held| silence_redial_basis(e, silent, 60, true, false, 2, held, true);
+        // Main feed: confirmed at its threshold with every condition.
+        assert_eq!(all(MainFeed, 59, 1_000), None);
+        assert_eq!(
+            all(MainFeed, 60, 1_000),
+            Some(SilenceBasis::SiblingConfirmed)
+        );
+        assert_eq!(
+            all(MainFeed, 299, 1_000),
+            Some(SilenceBasis::SiblingConfirmed)
+        );
+        assert_eq!(all(MainFeed, 300, 1_000), Some(SilenceBasis::Unconfirmed));
+        // Each condition alone blocks the confirmed path but never the fallback.
+        for (window, overflow, siblings, held, spacing) in [
+            (false, false, 2, 1_000, true),
+            (true, true, 2, 1_000, true),
+            (true, false, 1, 1_000, true),
+            (true, false, 2, 999, true),
+            (true, false, 2, 1_000, false),
+        ] {
+            assert_eq!(
+                silence_redial_basis(MainFeed, 120, 60, window, overflow, siblings, held, spacing),
+                None
+            );
+            assert_eq!(
+                silence_redial_basis(MainFeed, 300, 60, window, overflow, siblings, held, spacing),
+                Some(SilenceBasis::Unconfirmed)
+            );
+        }
+        // Depth-20: its own floor.
+        assert_eq!(
+            silence_redial_basis(Depth20, 90, 90, true, false, 2, 20, true),
+            Some(SilenceBasis::SiblingConfirmed)
+        );
+        assert_eq!(
+            silence_redial_basis(Depth20, 90, 90, true, false, 2, 19, true),
+            None
+        );
+        // Depth-200: time alone, only at the backstop.
+        assert_eq!(all(Depth200, 300, 1), None);
+        assert_eq!(all(Depth200, 899, 1), None);
+        assert_eq!(all(Depth200, 900, 1), Some(SilenceBasis::Backstop));
+        // Order update: never.
+        assert_eq!(all(OrderUpdate, 100_000, 1), None);
+        // Labels are distinct and stable.
+        let labels: Vec<&str> = SilenceBasis::ALL.iter().map(|b| b.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["unconfirmed", "sibling_confirmed", "cross_feed", "backstop"]
+        );
+    }
+
+    #[test]
+    fn live_siblings_counts_same_kind_other_slots_within_10s_only() {
+        let now = WALL0;
+        let mut stamps = [0_i64; GHOST_REDIAL_SLOTS];
+        // Main-feed slots 0..5. Self is 0.
+        stamps[0] = now; // self: never counted
+        stamps[1] = now - 10_000; // exactly 10 s old: counted
+        stamps[2] = now - 10_001; // just past: not counted
+        stamps[3] = now + 5_000; // 5 s ahead: counted (skew allowance)
+        stamps[4] = now + 5_001; // further ahead: not counted
+        stamps[5] = now; // depth-20 slot: other kind
+        stamps[10] = now; // depth-200 slot: other kind
+        assert_eq!(
+            live_siblings(0, DhanEndpointType::MainFeed, now, &stamps),
+            2
+        );
+        // Depth-20 seen from slot 6: slot 5 is live, the depth account's
+        // depth-20 slots (16..21) count as the same kind.
+        stamps[16] = now - 1;
+        assert_eq!(live_siblings(6, DhanEndpointType::Depth20, now, &stamps), 2);
+        // Never-delivered (0) and negative stamps never count.
+        let empty = [0_i64; GHOST_REDIAL_SLOTS];
+        assert_eq!(live_siblings(0, DhanEndpointType::MainFeed, now, &empty), 0);
+        // A short slice is handled.
+        assert_eq!(
+            live_siblings(0, DhanEndpointType::MainFeed, now, &[now, now]),
+            1
+        );
+    }
+
+    proptest! {
+        /// Random inter-frame gaps, every one below the kind's confirmed
+        /// threshold, with two siblings live and a poll every second inside
+        /// each gap: no fast-path mode ever produces a redial.
+        #[test]
+        fn proptest_gaps_below_the_confirmed_threshold_never_redial(
+            depth20 in any::<bool>(),
+            mode_pick in 0_u8..3,
+            gaps in proptest::collection::vec(1_u64..1_000, 1..40),
+        ) {
+            let endpoint = if depth20 {
+                DhanEndpointType::Depth20
+            } else {
+                DhanEndpointType::MainFeed
+            };
+            let mode = match mode_pick {
+                0 => FrameSilenceFastPath::Off,
+                1 => FrameSilenceFastPath::Shadow,
+                _ => FrameSilenceFastPath::Act,
+            };
+            let t = t0();
+            let spacing = fresh_spacing();
+            let mut s = live_sup(endpoint, 3, 5_000, mode, t);
+            let threshold = s.confirmed_threshold_secs();
+            prop_assert!(threshold >= MAIN_FEED_CONFIRMED_SILENCE_REDIAL_SECS);
+            let mut now_secs = 0_u64;
+            let _ = s.on_event(ConnEvent::FrameReceived, t);
+            for raw in gaps {
+                // Map onto [1, threshold - 1]: always below the threshold.
+                let gap = 1 + raw % (threshold - 1);
+                for step in 1..=gap {
+                    let action = poll_at(&mut s, t, now_secs + step, &[0, 1], false, &spacing);
+                    prop_assert!(
+                        !is_redial(action),
+                        "redial after {step} s of a {gap} s gap (threshold {threshold} s, {mode:?})"
+                    );
+                }
+                now_secs += gap;
+                let _ = s.on_event(
+                    ConnEvent::FrameReceived,
+                    t + Duration::from_secs(now_secs),
+                );
+            }
+            prop_assert_eq!(s.silence_strikes(), 0);
+        }
+    }
+
+    #[test]
+    fn main_feed_confirmed_redial_at_60s_with_two_live_siblings_in_act_mode() {
+        let t = t0();
+        let spacing = fresh_spacing();
+        let mut s = live_sup(
+            DhanEndpointType::MainFeed,
+            0,
+            5_000,
+            FrameSilenceFastPath::Act,
+            t,
+        );
+        assert_eq!(s.confirmed_threshold_secs(), 60);
+        assert_eq!(
+            poll_at(&mut s, t, 59, &[1, 2], false, &spacing),
+            SupervisorAction::Continue
+        );
+        assert!(is_redial(poll_at(&mut s, t, 60, &[1, 2], false, &spacing)));
+        assert_eq!(s.last_silence_basis(), SilenceBasis::SiblingConfirmed);
+        assert_eq!(s.last_redial_reason(), ReconnectReason::IdleSilence);
+        assert_eq!(s.silence_strikes(), 1);
+        assert_eq!(
+            spacing[0].load(std::sync::atomic::Ordering::Relaxed),
+            WALL0 + 60_000,
+            "the act path stamps the pool-wide spacing"
+        );
+        assert_eq!(spacing[1].load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn shadow_mode_counts_once_per_episode_and_never_redials() {
+        let t = t0();
+        let spacing = fresh_spacing();
+        let mut s = live_sup(
+            DhanEndpointType::MainFeed,
+            1,
+            5_000,
+            FrameSilenceFastPath::Shadow,
+            t,
+        );
+        for secs in [60, 61, 120, 299] {
+            assert_eq!(
+                poll_at(&mut s, t, secs, &[0, 2], false, &spacing),
+                SupervisorAction::Continue
+            );
+        }
+        assert_eq!(s.shadow_would_redials(), 1, "once per episode");
+        assert_eq!(
+            spacing[0].load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "shadow never stamps the spacing"
+        );
+        // A frame ends the episode; a new silence counts again.
+        let _ = s.on_event(ConnEvent::FrameReceived, t + Duration::from_secs(299));
+        assert_eq!(
+            poll_at(&mut s, t, 299 + 60, &[0, 2], false, &spacing),
+            SupervisorAction::Continue
+        );
+        assert_eq!(s.shadow_would_redials(), 2);
+        // The fallback still governs.
+        assert!(is_redial(poll_at(
+            &mut s,
+            t,
+            299 + 300,
+            &[0, 2],
+            false,
+            &spacing
+        )));
+        assert_eq!(s.last_silence_basis(), SilenceBasis::Unconfirmed);
+        // Off never even reads the evidence.
+        let reads = Cell::new(0_u32);
+        let mut off = live_sup(
+            DhanEndpointType::MainFeed,
+            2,
+            5_000,
+            FrameSilenceFastPath::Off,
+            t,
+        );
+        let at = t + Duration::from_secs(120);
+        let _ = off.on_event(ConnEvent::KeepAliveReceived, at);
+        let action = off.poll_with(at, || {
+            reads.set(reads.get() + 1);
+            SilenceInputs {
+                wall_ms: WALL0,
+                overflow_or_halted: false,
+                stamps: [WALL0; GHOST_REDIAL_SLOTS],
+                spacing: &spacing,
+            }
+        });
+        assert_eq!(action, SupervisorAction::Continue);
+        assert_eq!(reads.get(), 0);
+        assert_eq!(off.shadow_would_redials(), 0);
+    }
+
+    /// A socket that is deaf on every connection: confirmed redials escalate
+    /// 60 → 120 → 240 → 300 and then stay at the fallback, so confirmed
+    /// redials alone can never outpace the flap ceiling.
+    #[test]
+    fn escalation_bounds_snapshot_then_deaf_loop() {
+        let t = t0();
+        let mut s = live_sup(
+            DhanEndpointType::MainFeed,
+            3,
+            5_000,
+            FrameSilenceFastPath::Act,
+            t,
+        );
+        let mut elapsed: u64 = 0;
+        let mut gaps = Vec::new();
+        for _ in 0..6 {
+            let start = elapsed;
+            let spacing = fresh_spacing();
+            loop {
+                elapsed += 1;
+                if is_redial(poll_at(&mut s, t, elapsed, &[0, 1], false, &spacing)) {
+                    break;
+                }
+                assert!(elapsed - start <= 300, "never past the fallback");
+            }
+            gaps.push(elapsed - start);
+            // Redial and come back up, still deaf.
+            let at = t + Duration::from_secs(elapsed);
+            let _ = s.on_event(ConnEvent::BeginDial, at);
+            let _ = s.on_event(ConnEvent::DialSucceeded, at);
+            let _ = s.on_event(ConnEvent::SubscribeAcked, at);
+        }
+        assert_eq!(gaps, [60, 120, 240, 300, 300, 300]);
+        assert_eq!(s.silence_strikes(), 6);
+        // Strikes reset after SILENCE_STRIKE_RESET with no silence redial.
+        let mut quiet = elapsed;
+        while quiet < elapsed + SILENCE_STRIKE_RESET_SECS {
+            quiet += 30;
+            let _ = s.on_event(ConnEvent::FrameReceived, t + Duration::from_secs(quiet));
+            let _ = poll_at(&mut s, t, quiet, &[0, 1], false, &fresh_spacing());
+        }
+        assert_eq!(s.silence_strikes(), 0);
+        assert_eq!(s.confirmed_threshold_secs(), 60);
+    }
+
+    #[test]
+    fn confirmed_redial_spacing_is_pool_wide_per_kind() {
+        let t = t0();
+        let spacing = fresh_spacing();
+        let mut a = live_sup(
+            DhanEndpointType::MainFeed,
+            0,
+            5_000,
+            FrameSilenceFastPath::Act,
+            t,
+        );
+        let mut b = live_sup(
+            DhanEndpointType::MainFeed,
+            1,
+            5_000,
+            FrameSilenceFastPath::Act,
+            t,
+        );
+        let mut d = live_sup(
+            DhanEndpointType::Depth20,
+            5,
+            50,
+            FrameSilenceFastPath::Act,
+            t,
+        );
+        assert!(is_redial(poll_at(&mut a, t, 60, &[2, 3], false, &spacing)));
+        // The second main-feed socket waits out the spacing.
+        for secs in 60..75 {
+            assert_eq!(
+                poll_at(&mut b, t, secs, &[2, 3], false, &spacing),
+                SupervisorAction::Continue,
+                "+{secs}s"
+            );
+        }
+        assert!(is_redial(poll_at(&mut b, t, 75, &[2, 3], false, &spacing)));
+        // Depth-20 has its own spacing slot.
+        assert!(is_redial(poll_at(&mut d, t, 90, &[6, 7], false, &spacing)));
+    }
+
+    #[test]
+    fn below_the_instrument_floor_falls_back_to_300s() {
+        let t = t0();
+        let spacing = fresh_spacing();
+        let mut s = live_sup(
+            DhanEndpointType::MainFeed,
+            0,
+            MAIN_FEED_CONFIRMED_MIN_HELD - 1,
+            FrameSilenceFastPath::Act,
+            t,
+        );
+        for secs in [60, 120, 299] {
+            assert_eq!(
+                poll_at(&mut s, t, secs, &[1, 2, 3], false, &spacing),
+                SupervisorAction::Continue
+            );
+        }
+        assert!(is_redial(poll_at(
+            &mut s,
+            t,
+            300,
+            &[1, 2, 3],
+            false,
+            &spacing
+        )));
+        assert_eq!(s.last_silence_basis(), SilenceBasis::Unconfirmed);
+    }
+
+    #[test]
+    fn an_engaged_overflow_episode_or_a_halted_rotation_suppresses_every_fast_path() {
+        let t = t0();
+        let spacing = fresh_spacing();
+        let mut s = live_sup(
+            DhanEndpointType::Depth20,
+            5,
+            50,
+            FrameSilenceFastPath::Act,
+            t,
+        );
+        for secs in [90, 200, 299] {
+            assert_eq!(
+                poll_at(&mut s, t, secs, &[6, 7, 8], true, &spacing),
+                SupervisorAction::Continue
+            );
+        }
+        assert!(is_redial(poll_at(
+            &mut s,
+            t,
+            300,
+            &[6, 7, 8],
+            true,
+            &spacing
+        )));
+        assert_eq!(s.last_silence_basis(), SilenceBasis::Unconfirmed);
+        assert_eq!(spacing[1].load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn confirmed_window_open_at_boundaries() {
+        let gate = FrameSilenceGate::ContinuousSessionIst;
+        let open = CONTINUOUS_SESSION_OPEN_SECS_OF_DAY_IST;
+        let close = CONFIRMED_SILENCE_CLOSE_SECS_OF_DAY_IST;
+        assert_eq!(close, 15 * 3600 + 15 * 60, "15:15 IST");
+        assert!(!gate.confirmed_window_open_at(open - 1));
+        assert!(gate.confirmed_window_open_at(open));
+        assert!(gate.confirmed_window_open_at(close - 1));
+        assert!(!gate.confirmed_window_open_at(close));
+        // The closing auction is inside the session gate but outside the
+        // confirmed window: the 300 s fallback governs there.
+        assert!(gate.is_open_at(close));
+        assert!(FrameSilenceGate::AlwaysOn.confirmed_window_open_at(0));
+        assert!(!FrameSilenceGate::Off.confirmed_window_open_at(open));
+    }
+
+    #[test]
+    fn depth200_is_not_redialled_by_time_before_the_900s_backstop() {
+        let t = t0();
+        let spacing = fresh_spacing();
+        let reads = Cell::new(0_u32);
+        let mut s = live_sup(
+            DhanEndpointType::Depth200,
+            10,
+            1,
+            FrameSilenceFastPath::Act,
+            t,
+        );
+        let poll = |s: &mut ConnectionSupervisor, secs: u64| {
+            let at = t + Duration::from_secs(secs);
+            let _ = s.on_event(ConnEvent::KeepAliveReceived, at);
+            s.poll_with(at, || {
+                reads.set(reads.get() + 1);
+                SilenceInputs {
+                    wall_ms: WALL0,
+                    overflow_or_halted: false,
+                    stamps: [WALL0; GHOST_REDIAL_SLOTS],
+                    spacing: &spacing,
+                }
+            })
+        };
+        for secs in [60, 300, 600, 899] {
+            assert_eq!(poll(&mut s, secs), SupervisorAction::Continue, "+{secs}s");
+        }
+        assert!(is_redial(poll(&mut s, 900)));
+        assert_eq!(s.last_silence_basis(), SilenceBasis::Backstop);
+        assert_eq!(reads.get(), 0, "depth-200 never reads sibling evidence");
+
+        // The order-update socket is never redialled for frame silence.
+        let mut ou = live_sup(
+            DhanEndpointType::OrderUpdate,
+            15,
+            0,
+            FrameSilenceFastPath::Act,
+            t,
+        );
+        assert_eq!(poll(&mut ou, 3_600), SupervisorAction::Continue);
+        assert_eq!(ou.phase(), ConnPhase::Live);
+
+        // A cross-feed request redials a live depth-200 socket on its basis.
+        let mut x = live_sup(
+            DhanEndpointType::Depth200,
+            11,
+            1,
+            FrameSilenceFastPath::Act,
+            t,
+        );
+        x.note_silence_basis(SilenceBasis::CrossFeed);
+        assert!(is_redial(x.on_event(
+            ConnEvent::FrameSilenceElapsed,
+            t + Duration::from_secs(95)
+        )));
+        assert_eq!(x.last_silence_basis(), SilenceBasis::CrossFeed);
+        assert_eq!(x.silence_strikes(), 1);
+        // A basis noted while not live is consumed, never carried to a later
+        // redial.
+        let mut y = ConnectionSupervisor::new(slot_at(DhanEndpointType::Depth200, 12), t);
+        y.note_silence_basis(SilenceBasis::CrossFeed);
+        assert_eq!(
+            y.on_event(ConnEvent::FrameSilenceElapsed, t),
+            SupervisorAction::Continue
+        );
+        let _ = y.on_event(ConnEvent::BeginDial, t);
+        let _ = y.on_event(ConnEvent::DialSucceeded, t);
+        let _ = y.on_event(ConnEvent::SubscribeAcked, t);
+        assert!(is_redial(y.on_event(
+            ConnEvent::FrameSilenceElapsed,
+            t + Duration::from_secs(1)
+        )));
+        assert_eq!(y.last_silence_basis(), SilenceBasis::Unconfirmed);
+    }
+
+    #[test]
+    fn data_silence_request_is_dropped_when_the_dial_generation_moved() {
+        let pending = [const { std::sync::atomic::AtomicU64::new(0) }; GHOST_REDIAL_SLOTS];
+        let last = [const { AtomicI64::new(0) }; GHOST_REDIAL_SLOTS];
+        let cooldown_ms = DATA_SILENCE_REQUEST_COOLDOWN_SECS * 1_000;
+        assert_eq!(
+            request_data_silence_redial_in(&pending, &last, 3, WALL0, false, 7),
+            Ok(())
+        );
+        assert_eq!(
+            request_data_silence_redial_in(&pending, &last, 3, WALL0, false, 7),
+            Err(DataSilenceRefusal::StillPending)
+        );
+        assert_eq!(
+            take_data_silence_redial_in(&pending, 3, 7),
+            DataSilenceTake::Take
+        );
+        assert_eq!(
+            take_data_silence_redial_in(&pending, 3, 7),
+            DataSilenceTake::Nothing
+        );
+        assert_eq!(
+            request_data_silence_redial_in(&pending, &last, 3, WALL0 + cooldown_ms - 1, false, 7),
+            Err(DataSilenceRefusal::CoolingDown)
+        );
+        assert_eq!(
+            request_data_silence_redial_in(&pending, &last, 3, WALL0 + cooldown_ms, false, 7),
+            Ok(())
+        );
+        // The socket redialled since the request: the request names an
+        // earlier connection and is dropped.
+        assert_eq!(
+            take_data_silence_redial_in(&pending, 3, 8),
+            DataSilenceTake::Stale
+        );
+        assert_eq!(
+            take_data_silence_redial_in(&pending, 3, 8),
+            DataSilenceTake::Nothing
+        );
+        // After an 805 nothing is recorded.
+        assert_eq!(
+            request_data_silence_redial_in(&pending, &last, 4, WALL0, true, 1),
+            Err(DataSilenceRefusal::Halted)
+        );
+        assert_eq!(
+            take_data_silence_redial_in(&pending, 4, 1),
+            DataSilenceTake::Nothing
+        );
+        // Out of range never panics.
+        assert_eq!(
+            request_data_silence_redial_in(&pending, &last, 200, WALL0, false, 1),
+            Err(DataSilenceRefusal::OutOfRange)
+        );
+        assert_eq!(
+            take_data_silence_redial_in(&pending, 200, 1),
+            DataSilenceTake::Nothing
+        );
+        assert_eq!(DataSilenceRefusal::Halted.as_str(), "halted");
+    }
+
+    #[test]
+    fn a_taken_data_silence_request_after_805_is_refused_with_path_data_silence() {
+        let src = include_str!("pool_supervisor.rs");
+        let prod = src.split("#[cfg(test)]").next().expect("production half");
+        let take = prod
+            .find("&& take_data_silence_redial(supervisor.slot().global_index)")
+            .expect("the connection task takes cross-feed requests");
+        let rest = &prod[take..];
+        let halted = rest.find("if rotation_halted() {").expect("805 check");
+        let refused = rest
+            .find("refuse_voluntary_redial_after_805(supervisor.slot(), \"data_silence\")")
+            .expect("refused with its own path label");
+        let basis = rest
+            .find("supervisor.note_silence_basis(SilenceBasis::CrossFeed)")
+            .expect("labelled cross-feed");
+        let redial = rest
+            .find("supervisor.on_event(ConnEvent::FrameSilenceElapsed")
+            .expect("redials as a fault");
+        assert!(halted < refused && refused < basis && basis < redial);
+        // The request side refuses after an 805 too.
+        assert!(
+            prod.contains("        rotation_halted(),\n        dial_generation(connection_index),")
+        );
+    }
+
+    #[test]
+    fn depth200_held_round_trips_and_never_returns_a_torn_id() {
+        let idx = 31;
+        let a = SubscribeInstrument {
+            security_id: 72_271,
+            segment: ExchangeSegment::NseFno,
+        };
+        let b = SubscribeInstrument {
+            security_id: 72_272,
+            segment: ExchangeSegment::NseFno,
+        };
+        publish_depth200_held(idx, None, 0);
+        assert_eq!(depth200_held(idx), None);
+        publish_depth200_held(idx, Some(a), 1_000);
+        assert_eq!(
+            depth200_held(idx),
+            Some((72_271, ExchangeSegment::NseFno, 1_000))
+        );
+        // The same contract again keeps its original start.
+        publish_depth200_held(idx, Some(a), 5_000);
+        assert_eq!(
+            depth200_held(idx),
+            Some((72_271, ExchangeSegment::NseFno, 1_000))
+        );
+        publish_depth200_held(idx, Some(b), 6_000);
+        assert_eq!(
+            depth200_held(idx),
+            Some((72_272, ExchangeSegment::NseFno, 6_000))
+        );
+        // An id that cannot be packed clears the slot rather than lying.
+        publish_depth200_held(
+            idx,
+            Some(SubscribeInstrument {
+                security_id: u64::MAX,
+                segment: ExchangeSegment::NseFno,
+            }),
+            7_000,
+        );
+        assert_eq!(depth200_held(idx), None);
+        publish_depth200_held(idx, None, 0);
+        assert_eq!(depth200_held(idx), None);
+        // Out of range never panics.
+        publish_depth200_held(200, Some(a), 1);
+        assert_eq!(depth200_held(200), None);
+    }
+
+    #[test]
+    fn publish_depth200_held_is_called_at_every_held_set_change() {
+        let src = include_str!("pool_supervisor.rs");
+        let prod = src.split("#[cfg(test)]").next().expect("production half");
+        let lines: Vec<&str> = prod.lines().map(str::trim_start).collect();
+        let mut sized = 0;
+        let mut zeroed = 0;
+        for (i, line) in lines.iter().enumerate() {
+            let next = lines.get(i + 1).copied().unwrap_or("");
+            if line.starts_with("publish_connection_instruments(&supervisor.slot(), guard.len())") {
+                sized += 1;
+                assert!(next.starts_with("note_held_set("), "line {i}: {next}");
+            }
+            if line.starts_with("publish_connection_instruments(&supervisor.slot(), 0)") {
+                zeroed += 1;
+                assert!(next.starts_with("note_held_cleared("), "line {i}: {next}");
+            }
+        }
+        assert_eq!((sized, zeroed), (5, 2));
+        // The swap arm (which can change the depth-200 contract) and its
+        // emptied path are covered too.
+        assert!(prod.contains("                    note_held_set(supervisor, guard);\n                }\n                Ok(LiveSubscriptionCommand::ProbeUnsubscribe {"));
+        let emptied = prod
+            .find("metrics::counter!(SWAP_EMPTIED_SOCKET_METRIC).increment(1);")
+            .expect("emptied path");
+        let cleared = prod[emptied..]
+            .find("note_held_cleared(supervisor);")
+            .expect("emptied socket clears the register");
+        let failed = prod[emptied..]
+            .find(".on_event(ConnEvent::SubscribeFailed, Instant::now())")
+            .expect("emptied socket redials");
+        assert!(cleared < failed);
+        // Both backoff arms clear the register before they sleep.
+        for arm in [
+            "SupervisorAction::SleepThenDial { delay_ms } => {",
+            "SupervisorAction::RefreshTokenThenDial { delay_ms } => {",
+        ] {
+            let start = prod.find(arm).expect("backoff arm");
+            let body = &prod[start..];
+            let cleared = body
+                .find("note_held_cleared(&mut supervisor);")
+                .expect("backoff clears the register");
+            let slept = body.find("sleep_unless_stopped(").expect("backoff sleeps");
+            assert!(cleared < slept, "{arm}");
+        }
+        let set_fn = prod
+            .find("fn note_held_set(")
+            .expect("note_held_set exists");
+        let set_body = &prod[set_fn..];
+        let set_body = &set_body[..set_body.find("\n}\n").expect("end of note_held_set")];
+        let squashed: String = set_body.split_whitespace().collect();
+        assert!(
+            squashed.contains(
+                "publish_depth200_held(supervisor.slot().global_index,guard.first(),wall_clock_ms(),);"
+            ),
+            "note_held_set publishes the depth-200 contract: {set_body}"
+        );
+    }
+
+    #[test]
+    fn frame_activity_published_at_most_once_per_second() {
+        let idx = 30;
+        let t = t0();
+        let mut s = ConnectionSupervisor::new(slot_at(DhanEndpointType::MainFeed, idx), t);
+        let _ = s.on_event(ConnEvent::BeginDial, t);
+        let _ = s.on_event(ConnEvent::DialSucceeded, t);
+        let _ = s.on_event(ConnEvent::SubscribeAcked, t);
+        let _ = s.on_event(ConnEvent::FrameReceived, t);
+        let first = last_frame_wall_ms(idx).expect("published on the first frame");
+        assert!(first > 0);
+        // Overwrite with a sentinel: a frame inside the second must not
+        // republish.
+        SLOT_LAST_FRAME_WALL_MS[usize::from(idx)]
+            .0
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        let _ = s.on_event(ConnEvent::FrameReceived, t + Duration::from_millis(500));
+        let _ = s.on_event(ConnEvent::FrameReceived, t + Duration::from_millis(999));
+        assert_eq!(last_frame_wall_ms(idx), Some(1));
+        let _ = s.on_event(ConnEvent::FrameReceived, t + Duration::from_millis(1_000));
+        assert!(last_frame_wall_ms(idx).unwrap_or(0) >= first);
+        assert_eq!(last_frame_wall_ms(200), None);
+        assert_eq!(snapshot_frame_activity().len(), GHOST_REDIAL_SLOTS);
+    }
+
+    #[test]
+    fn frame_gap_peak_is_the_largest_gap_inside_the_window() {
+        let idx = 29;
+        let t = t0();
+        let mut s = ConnectionSupervisor::new(slot_at(DhanEndpointType::MainFeed, idx), t);
+        let _ = s.on_event(ConnEvent::BeginDial, t);
+        let _ = s.on_event(ConnEvent::DialSucceeded, t);
+        let _ = s.on_event(ConnEvent::SubscribeAcked, t);
+        // The first poll opens the window (AlwaysOn) and resets the peak.
+        assert_eq!(s.poll(t), SupervisorAction::Continue);
+        // The first frame's gap is the dial, not a gap between frames.
+        let _ = s.on_event(ConnEvent::FrameReceived, t + Duration::from_secs(20));
+        assert_eq!(frame_gap_peak_secs(idx), Some(0));
+        let _ = s.on_event(ConnEvent::FrameReceived, t + Duration::from_secs(25));
+        let _ = s.on_event(ConnEvent::FrameReceived, t + Duration::from_secs(32));
+        let _ = s.on_event(ConnEvent::FrameReceived, t + Duration::from_secs(33));
+        assert_eq!(frame_gap_peak_secs(idx), Some(7));
+        assert_eq!(frame_gap_peak_secs(200), None);
+        publish_frame_gap_peaks();
+        seed_frame_silence_counters();
+    }
+
+    /// Slot 27 is written by no other test in this module.
+    const REGISTER_TEST_SLOT: u8 = 27;
+
+    #[test]
+    fn test_last_frame_wall_ms_and_snapshot_frame_activity_read_the_register() {
+        let idx = usize::from(REGISTER_TEST_SLOT);
+        SLOT_LAST_FRAME_WALL_MS[idx]
+            .0
+            .store(WALL0, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(last_frame_wall_ms(REGISTER_TEST_SLOT), Some(WALL0));
+        assert_eq!(snapshot_frame_activity()[idx], WALL0);
+        // 0 means never delivered: no stamp.
+        SLOT_LAST_FRAME_WALL_MS[idx]
+            .0
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(last_frame_wall_ms(REGISTER_TEST_SLOT), None);
+        assert_eq!(snapshot_frame_activity()[idx], 0);
+        assert_eq!(last_frame_wall_ms(u8::MAX), None);
+    }
+
+    #[test]
+    fn test_frame_gap_peak_secs_rounds_down_and_publish_frame_gap_peaks_reads_it() {
+        let idx = usize::from(REGISTER_TEST_SLOT);
+        SLOT_FRAME_GAP_PEAK_MS[idx].store(7_999, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(frame_gap_peak_secs(REGISTER_TEST_SLOT), Some(7));
+        SLOT_FRAME_GAP_PEAK_MS[idx].store(999, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(frame_gap_peak_secs(REGISTER_TEST_SLOT), Some(0));
+        assert_eq!(frame_gap_peak_secs(u8::MAX), None);
+        // Publishing reads the register and never panics without a recorder.
+        publish_frame_gap_peaks();
+        SLOT_FRAME_GAP_PEAK_MS[idx].store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[test]
+    fn test_seed_frame_silence_counters_is_idempotent() {
+        // Seeding adds zero, so running it twice (two lane starts) is safe.
+        seed_frame_silence_counters();
+        seed_frame_silence_counters();
+        assert_eq!(
+            DATA_SILENCE_STALE_METRIC,
+            "tv_dhan_ws_data_silence_request_stale_total"
+        );
+    }
+
+    #[test]
+    fn test_overflow_episode_engaged_reads_the_never_cleared_flag() {
+        assert_eq!(
+            overflow_episode_engaged(),
+            OVERFLOW_ENGAGED.load(std::sync::atomic::Ordering::Acquire)
+        );
+    }
+
+    #[test]
+    fn test_confirmed_threshold_secs_doubles_per_strike_and_caps_at_300() {
+        let t = t0();
+        for (endpoint, expected) in [
+            (DhanEndpointType::MainFeed, [60, 120, 240, 300, 300]),
+            (DhanEndpointType::Depth20, [90, 180, 300, 300, 300]),
+            (DhanEndpointType::Depth200, [300, 300, 300, 300, 300]),
+        ] {
+            let mut s = ConnectionSupervisor::new(slot_at(endpoint, REGISTER_TEST_SLOT), t);
+            for (strikes, want) in expected.into_iter().enumerate() {
+                s.silence_strikes = u8::try_from(strikes).expect("small");
+                assert_eq!(s.confirmed_threshold_secs(), want, "{endpoint:?} {strikes}");
+            }
+            s.silence_strikes = u8::MAX;
+            assert_eq!(s.confirmed_threshold_secs(), FRAME_SILENCE_REDIAL_SECS);
+        }
+    }
+
+    proptest! {
+        /// Frames that never leave a gap as long as the shortest confirmed
+        /// threshold never earn a silence redial, whatever the evidence says.
+        #[test]
+        fn gaps_below_the_threshold_never_redial(
+            gaps in proptest::collection::vec(1_u64..60, 1..20),
+            endpoint_pick in 0_u8..2,
+        ) {
+            let endpoint = if endpoint_pick == 0 {
+                DhanEndpointType::MainFeed
+            } else {
+                DhanEndpointType::Depth20
+            };
+            let base = endpoint.jitter_base();
+            let t = t0();
+            let spacing = fresh_spacing();
+            let mut s = live_sup(endpoint, base, 5_000, FrameSilenceFastPath::Act, t);
+            let siblings = [base + 1, base + 2, base + 3];
+            let mut at: u64 = 0;
+            for gap in gaps {
+                for _ in 0..gap {
+                    at += 1;
+                    let action = poll_at(&mut s, t, at, &siblings, false, &spacing);
+                    prop_assert_eq!(action, SupervisorAction::Continue);
+                }
+                let _ = s.on_event(ConnEvent::FrameReceived, t + Duration::from_secs(at));
+            }
+            prop_assert_eq!(s.silence_strikes(), 0);
+            prop_assert_eq!(s.reconnects(), 0);
         }
     }
 }
