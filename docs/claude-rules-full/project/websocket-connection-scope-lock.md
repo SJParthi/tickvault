@@ -9074,7 +9074,9 @@ page) only when one of these holds:
 - (c) `AUTH_REJECT_EPISODE_MAX_MS` (300 s, at least twice the 125 s mint
   cooldown) passed without a fresh token, counted from the episode start or
   from the last refresh that produced a fresh token, whether or not an earlier
-  refresh verified a generation;
+  refresh verified a generation, and applied only when the redial that ended in
+  this 808 began with a refresh (after an outage of failed dials or other
+  closes, the slot refreshes once more first; review round 3);
 - (d) more than `AUTH_REJECT_MAX_REFRESHES_PER_WINDOW` (4) refreshes that each
   PRODUCED A FRESH TOKEN (a new generation) happened inside
   `AUTH_REJECT_WINDOW_MS` (300 s). A deferred or failed refresh is not counted

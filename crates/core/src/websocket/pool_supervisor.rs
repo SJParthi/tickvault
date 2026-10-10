@@ -111,11 +111,15 @@ pub const TOKEN_STALE_REDIAL_FLOOR_MS: u64 = 5_000;
 /// dated quote in the scope lock first.
 pub const AUTH_REJECT_MAX_HARD_FAILURES: u8 = 3;
 
-/// 808 refresh-once: the longest an 808 episode may run WITHOUT a verified
-/// fresh token before the slot parks. The backstop for deferred refreshes,
-/// which do not count toward [`AUTH_REJECT_MAX_HARD_FAILURES`]: at least two
-/// mint cooldowns long (asserted below), so a deferral always gets one real
-/// mint attempt before the park.
+/// 808 refresh-once, park rule (c): the longest an 808 episode may run
+/// without a fresh token, counted from the episode start or the last refresh
+/// that produced one, before the slot parks. Applied only when the cycle that
+/// ended in this 808 began with a refresh (no other redial since), so time
+/// spent in an outage never parks a slot that has not tried again. The
+/// backstop for deferred refreshes, which do not count toward
+/// [`AUTH_REJECT_MAX_HARD_FAILURES`]: at least two mint cooldowns long
+/// (asserted below), so a deferral always gets one real mint attempt before
+/// the park.
 pub const AUTH_REJECT_EPISODE_MAX_MS: u64 = 300_000;
 
 /// 808 refresh-once: the window [`AUTH_REJECT_MAX_REFRESHES_PER_WINDOW`] is
@@ -189,6 +193,15 @@ struct AuthRejectEpisode {
     /// an episode parks after [`AUTH_REJECT_EPISODE_MAX_MS`] without a fresh
     /// token whether or not an earlier refresh verified a generation.
     last_progress_at: Instant,
+    /// Whether the redial now ending began with a token refresh: set by
+    /// [`ConnectionSupervisor::note_token_refresh`] (any outcome), cleared by
+    /// every `enter_backoff`. A failed dial or any other close in between
+    /// clears it, so after an outage the next 808 refreshes once more before
+    /// the 300 s bound can park it. Not a time window on purpose: the redial
+    /// delay alone reaches `RECONNECT_DELAY_WITH_JITTER_MAX_MS` under the flap
+    /// ceiling, so any fixed window shorter than a full cycle would make the
+    /// bound unreachable.
+    refreshed_this_cycle: bool,
 }
 
 /// How often the shell wakes to ask the supervisor whether a socket has gone
@@ -4630,25 +4643,28 @@ impl ConnectionSupervisor {
     /// same floored, jittered delay as 807; park only when the episode proves
     /// the token is not the cause. O(1): a fixed four-slot ring, no heap.
     fn on_auth_rejected(&mut self, now: Instant) -> SupervisorAction {
-        // (a) An 808 after a proven healthy session is a NEW episode: the
+        // Step 1. An 808 after a proven healthy session is a NEW episode: the
         // previous token worked for a while, so its strikes do not carry over.
         // Read before `enter_backoff`, which clears `healthy_since`.
         if self.auth_reject.is_some() && self.healthy_duration_ms(now) >= MIN_HEALTHY_SESSION_MS {
             self.auth_reject = None;
         }
-        // (b) Start an episode on the first 808.
+        // Step 2. Start an episode on the first 808.
         let episode = *self.auth_reject.get_or_insert(AuthRejectEpisode {
             started_at: now,
             hard_failures: 0,
             verified_generation: None,
             last_progress_at: now,
+            refreshed_this_cycle: false,
         });
-        // (c) Refresh ceiling: the ring is full and its oldest entry is still
+        // Step 3, park rule (d) of the scope lock. (Rule (a), the rejected
+        // fresh token, is decided in `note_token_refresh`.) Refresh ceiling:
+        // the ring is full and its oldest entry is still
         // inside the window, so four refreshes already produced a fresh token
         // that was then rejected again. Only a refresh that produced a new
         // generation is charged to the ring (`note_token_refresh`), so a run
-        // of deferred refreshes never reaches this; the age bound in (d)
-        // parks those after 300 s without a fresh token.
+        // of deferred refreshes never reaches this; park rule (c) parks
+        // those after 300 s without a fresh token.
         let cursor = usize::from(self.auth_reject_cursor) % AUTH_REJECT_MAX_REFRESHES_PER_WINDOW;
         let window = Duration::from_millis(AUTH_REJECT_WINDOW_MS);
         if let Some(oldest) = self.auth_reject_refreshes[cursor]
@@ -4666,19 +4682,22 @@ impl ConnectionSupervisor {
             );
             return self.park(ParkReason::FatalDisconnect, now);
         }
-        // (d) Refresh unavailable: too many outright failures, or 300 s
-        // passed without a fresh token, counted from the episode start or the
-        // last refresh that produced one. Unconditional on
-        // `verified_generation`: after one fresh token, a sibling can move
-        // the token on so every later refresh is a new attempt that only
-        // defers; without this bound that slot would redial forever.
+        // Step 4, park rules (b) and (c). Refresh unavailable: too many
+        // outright failures (b), or 300 s passed without a fresh token (c),
+        // counted from the episode start or the last refresh that produced
+        // one. (c) is unconditional on `verified_generation`: after one fresh
+        // token, a sibling can move the token on so every later refresh is a
+        // new attempt that only defers; without (c) that slot would redial
+        // forever. (c) applies only when this cycle began with a refresh, so
+        // after an outage (failed dials, other closes) the slot refreshes
+        // once more first and parks on the next 808 if it still has none.
         let since_progress_ms = u64::try_from(
             now.saturating_duration_since(episode.last_progress_at)
                 .as_millis(),
         )
         .unwrap_or(u64::MAX);
         if episode.hard_failures >= AUTH_REJECT_MAX_HARD_FAILURES
-            || since_progress_ms >= AUTH_REJECT_EPISODE_MAX_MS
+            || (episode.refreshed_this_cycle && since_progress_ms >= AUTH_REJECT_EPISODE_MAX_MS)
         {
             error!(
                 code = ErrorCode::WsGapDisconnectClassification.code_str(),
@@ -4698,7 +4717,7 @@ impl ConnectionSupervisor {
             );
             return self.park(ParkReason::FatalDisconnect, now);
         }
-        // (e) Refresh once, then redial on the shared token floor. The ring
+        // Step 5. Refresh once, then redial on the shared token floor. The ring
         // is charged later, and only if the refresh produced a fresh token.
         let (delay, verdict) = self.token_floor_delay(now);
         error!(
@@ -4743,6 +4762,9 @@ impl ConnectionSupervisor {
             return None;
         }
         let episode = self.auth_reject.as_mut()?;
+        // Any outcome: this cycle began with a refresh, so park rule (c) may
+        // apply to the 808 that ends it.
+        episode.refreshed_this_cycle = true;
         if episode.verified_generation == Some(report.presented) {
             error!(
                 code = ErrorCode::WsGapDisconnectClassification.code_str(),
@@ -4760,9 +4782,9 @@ impl ConnectionSupervisor {
             TokenRefreshOutcome::Fresh { current } => {
                 episode.verified_generation = Some(current);
                 episode.last_progress_at = now;
-                // Charge the per-window ceiling (c) for a refresh that
-                // produced a new generation, and only for that one: a
-                // deferral or a failure is bounded by (d) instead.
+                // Charge the per-window ceiling, park rule (d), for a refresh
+                // that produced a new generation, and only for that one: a
+                // deferral or a failure is bounded by (b) and (c) instead.
                 let cursor =
                     usize::from(self.auth_reject_cursor) % AUTH_REJECT_MAX_REFRESHES_PER_WINDOW;
                 self.auth_reject_refreshes[cursor] = Some(now);
@@ -4809,6 +4831,11 @@ impl ConnectionSupervisor {
         // itself in `on_auth_rejected`.
         if self.proven_healthy && reason != ReconnectReason::AuthRejected {
             self.auth_reject = None;
+        }
+        // Every redial starts a cycle that has not refreshed yet; an 808
+        // redial sets it again in `note_token_refresh`, which runs after this.
+        if let Some(episode) = self.auth_reject.as_mut() {
+            episode.refreshed_this_cycle = false;
         }
         // Recorded at the ONE site every redial passes through, so the audit
         // row cannot disagree with the counter beside it.
@@ -10655,7 +10682,7 @@ mod tests {
 
     use super::super::reconnect_ladder::{
         FLAP_CEILING_REDIAL_FLOOR_MS, FLAP_REDIAL_CEILING, MIN_HEALTHY_SESSION_MS,
-        RECONNECT_DELAY_WITH_JITTER_MAX_MS, RECONNECT_JITTER_STEP_MS,
+        RECONNECT_DELAY_WITH_JITTER_MAX_MS, RECONNECT_JITTER_STEP_MS, RECONNECT_LADDER_CAP_MS,
         SHORT_SESSION_REDIAL_FLOOR_MS, reconnect_delay_ms,
     };
 
@@ -12173,8 +12200,8 @@ mod tests {
             at += step;
         }
         assert_eq!(refreshes, 60, "300 s of 808s, 5 s apart");
-        // At the bound: the park is (d) "refresh unavailable", not the
-        // ceiling — no deferred refresh was ever charged to the ring.
+        // At the bound: the park is rule (c), "refresh unavailable", not the
+        // ceiling (d): no deferred refresh was ever charged to the ring.
         assert!(s.auth_reject_refreshes.iter().all(Option::is_none));
         dial_no_frames(&mut s, at);
         let action = close_808(&mut s, at);
@@ -12242,6 +12269,78 @@ mod tests {
         dial_no_frames(&mut s, at);
         let action = close_808(&mut s, at);
         assert_parked_fatal(&s, &action);
+    }
+
+    /// Review round 3 (2026-10-06): an outage longer than 300 s (only failed
+    /// dials, no refresh) must not park the first 808 after it. That 808
+    /// refreshes once more; the next 808, with still no fresh token, parks.
+    #[test]
+    fn test_808_after_a_long_outage_refreshes_once_more_then_parks() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+        dial_no_frames(&mut s, now);
+        assert_refresh(&close_808(&mut s, now));
+        assert_eq!(
+            s.note_token_refresh(refresh_report(0, TokenRefreshOutcome::Deferred), now),
+            None
+        );
+        // 400 s of network outage: every dial fails, nothing refreshes.
+        let outage_end = now + Duration::from_secs(400);
+        let mut at = now + Duration::from_millis(TOKEN_STALE_REDIAL_FLOOR_MS);
+        while at < outage_end {
+            assert_eq!(s.on_event(ConnEvent::BeginDial, at), SupervisorAction::Dial);
+            let _ = s.on_event(ConnEvent::DialFailed, at);
+            at += Duration::from_millis(RECONNECT_LADDER_CAP_MS);
+        }
+        // The first 808 after the outage refreshes instead of parking.
+        dial_no_frames(&mut s, outage_end);
+        assert_refresh(&close_808(&mut s, outage_end));
+        assert_eq!(
+            s.note_token_refresh(refresh_report(0, TokenRefreshOutcome::Deferred), outage_end),
+            None
+        );
+        // One refresh cycle later, still no fresh token: park rule (c).
+        let next = outage_end + Duration::from_millis(TOKEN_STALE_REDIAL_FLOOR_MS);
+        dial_no_frames(&mut s, next);
+        let action = close_808(&mut s, next);
+        assert_parked_fatal(&s, &action);
+    }
+
+    /// Review round 3: at the delays the supervisor itself returns (the flap
+    /// ceiling raises them to 30 s), deferrals still park by rule (c), at
+    /// 300 s without a fresh token and within one redial delay after it.
+    #[test]
+    fn test_808_deferrals_at_the_returned_delays_park_within_one_cycle_of_300_s() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+        let bound = Duration::from_millis(AUTH_REJECT_EPISODE_MAX_MS);
+        let mut at = now;
+        loop {
+            dial_no_frames(&mut s, at);
+            match close_808(&mut s, at) {
+                SupervisorAction::RefreshTokenThenDial { delay_ms } => {
+                    assert!(delay_ms <= RECONNECT_DELAY_WITH_JITTER_MAX_MS);
+                    assert_eq!(
+                        s.note_token_refresh(refresh_report(0, TokenRefreshOutcome::Deferred), at),
+                        None
+                    );
+                    at += Duration::from_millis(delay_ms);
+                }
+                action => {
+                    assert_parked_fatal(&s, &action);
+                    break;
+                }
+            }
+            assert!(
+                at.saturating_duration_since(now)
+                    <= bound + Duration::from_millis(RECONNECT_DELAY_WITH_JITTER_MAX_MS),
+                "no park within one redial delay of the bound"
+            );
+        }
+        assert!(
+            at.saturating_duration_since(now) >= bound,
+            "parked before the bound"
+        );
     }
 
     /// Review fix (2026-10-06): one real failure followed by a reused one
@@ -12612,6 +12711,11 @@ mod tests {
             let mut generation = 0u64;
             let mut refreshes: Vec<Instant> = Vec::new();
             let mut parked = false;
+            // Test-side model of park rule (c): the last fresh token of the
+            // open episode, and whether the cycle now ending began with an
+            // 808 refresh.
+            let mut model_fresh: Option<Instant> = None;
+            let mut model_refreshed_this_cycle = false;
             for (gap_ms, frames, close, outcome, sibling_renewed) in steps {
                 at += Duration::from_millis(gap_ms);
                 let dial = s.on_event(ConnEvent::BeginDial, at);
@@ -12639,7 +12743,30 @@ mod tests {
                     1 => Some(DisconnectCode::AccessTokenExpired),
                     _ => None,
                 };
+                if s.auth_reject.is_none() {
+                    model_fresh = None;
+                }
+                let must_park = code == Some(DisconnectCode::AuthenticationFailed)
+                    && frames != 2
+                    && s.auth_reject.is_some()
+                    && model_refreshed_this_cycle
+                    && model_fresh.is_some_and(|fresh| {
+                        at.saturating_duration_since(fresh)
+                            >= Duration::from_millis(AUTH_REJECT_EPISODE_MAX_MS)
+                    });
                 let action = s.on_event(ConnEvent::Disconnected { code }, at);
+                model_refreshed_this_cycle = false;
+                if must_park {
+                    let is_park = matches!(action, SupervisorAction::Park { .. });
+                    prop_assert!(
+                        is_park,
+                        "an 808 300 s after the last fresh token, after a refresh, must park"
+                    );
+                }
+                if code == Some(DisconnectCode::AuthenticationFailed) && frames == 2 {
+                    // A healthy session before this 808 started a new episode.
+                    model_fresh = None;
+                }
                 if let SupervisorAction::Park { .. } = action {
                     parked = true;
                     continue;
@@ -12666,6 +12793,12 @@ mod tests {
                     };
                     let is_808 = code == Some(DisconnectCode::AuthenticationFailed);
                     let fresh = matches!(report.outcome, TokenRefreshOutcome::Fresh { .. });
+                    if is_808 {
+                        model_refreshed_this_cycle = true;
+                        if fresh {
+                            model_fresh = Some(at);
+                        }
+                    }
                     if let Some(park) = s.note_token_refresh(report, at) {
                         let is_park = matches!(park, SupervisorAction::Park { .. });
                         prop_assert!(is_park, "a refresh report only ever parks");
@@ -12683,6 +12816,74 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    proptest! {
+        /// Review round 3: park rule (c) always fires. Whatever mix of fresh
+        /// tokens, sibling renewals, deferrals and outages comes first, an
+        /// 808 that arrives 300 s or more after the last fresh token, in a
+        /// cycle that began with a refresh, parks; and a run that then only
+        /// defers parks within 300 s plus a few cycles.
+        #[test]
+        fn prop_808_parks_300_s_after_the_last_fresh_token_once_a_refresh_ran(
+            steps in prop::collection::vec((1_000u64..60_000, any::<bool>(), any::<bool>(), 0u8..4), 1..120),
+        ) {
+            let start = t0();
+            let mut s = sup(DhanEndpointType::MainFeed, 0, start);
+            let mut at = start;
+            let mut generation = 0u64;
+            // The episode starts at the first 808; until a fresh token, rule
+            // (c) counts from there.
+            let mut model_fresh: Option<Instant> = None;
+            let mut model_refreshed_this_cycle = false;
+            let mut parked = false;
+            let tail_step = (5_000u64, false, false, 1u8);
+            let tail = std::iter::repeat_n(tail_step, 90);
+            for (gap_ms, fresh, sibling_renewed, kind) in steps.into_iter().chain(tail) {
+                at += Duration::from_millis(gap_ms);
+                if kind == 0 {
+                    // An outage step: a failed dial, no refresh.
+                    prop_assert_eq!(s.on_event(ConnEvent::BeginDial, at), SupervisorAction::Dial);
+                    let _ = s.on_event(ConnEvent::DialFailed, at);
+                    model_refreshed_this_cycle = false;
+                    continue;
+                }
+                dial_no_frames(&mut s, at);
+                let progress = *model_fresh.get_or_insert(at);
+                let must_park = model_refreshed_this_cycle
+                    && at.saturating_duration_since(progress)
+                        >= Duration::from_millis(AUTH_REJECT_EPISODE_MAX_MS);
+                let action = close_808(&mut s, at);
+                model_refreshed_this_cycle = false;
+                if must_park {
+                    let is_park = matches!(action, SupervisorAction::Park { .. });
+                    prop_assert!(is_park, "300 s after the last fresh token, after a refresh: {:?}", action);
+                }
+                if matches!(action, SupervisorAction::Park { .. }) {
+                    parked = true;
+                    break;
+                }
+                if sibling_renewed {
+                    generation += 1;
+                }
+                let presented = generation;
+                let outcome = if fresh {
+                    generation += 1;
+                    TokenRefreshOutcome::Fresh { current: generation }
+                } else {
+                    TokenRefreshOutcome::Deferred
+                };
+                if s.note_token_refresh(refresh_report(presented, outcome), at).is_some() {
+                    parked = true;
+                    break;
+                }
+                model_refreshed_this_cycle = true;
+                if fresh {
+                    model_fresh = Some(at);
+                }
+            }
+            prop_assert!(parked, "a run that only defers must park");
         }
     }
 
