@@ -645,7 +645,39 @@ fn main() -> Result<()> {
         .build()
         .context("failed to build the tokio runtime")?;
 
-    runtime.block_on(async_main())
+    let outcome = runtime.block_on(async_main());
+    // RUNTIME-NOT-DROPPED-AT-EXIT (2026-10-10). The runtime is leaked, not
+    // dropped, and the process exits as soon as `main` returns.
+    //
+    // By the time `async_main` returns, the shutdown sequence has already
+    // drained every durable tier itself (lane seal and flush, seal writer,
+    // escalation thread, crash marker, WAL spill), except when the lane
+    // overran its shutdown budget mid-way through a WAL refold batch; that
+    // is logged as a shutdown timeout and its unconfirmed segments are
+    // re-read on the next boot. Dropping the runtime adds nothing to that
+    // and caused two measured failures:
+    //
+    // * 6 Oct 2026, 15:46:51 IST: the drop shut the time driver down while a
+    //   blocking-pool thread was still waiting on a timer through
+    //   `Handle::block_on` (the tick spill replay round runs that way). Tokio
+    //   panicked with "A Tokio 1.x context was found, but it is being
+    //   shutdown" 20 ms after "tickvault stopped", and `panic = "abort"`
+    //   turned it into a core dump.
+    // * 9 Oct 22:41 and 10 Oct 02:17 IST: the drop waited without bound for a
+    //   worker stuck in the lane's synchronous WAL refold, about 85 s after
+    //   "tickvault stopped", against systemd's 145 s stop timeout. When the
+    //   lane resumed it spawned the frame drain into the dying runtime, which
+    //   cancelled it at once ("frame drain DIED").
+    //
+    // Leaking keeps the drivers alive until the process ends, so no thread
+    // can see a runtime that is shutting down, and the exit no longer waits
+    // on work nobody needs. Anything still running at that point is
+    // crash-safe by design (the same work a SIGKILL would cut short): WAL
+    // segments are confirmed only after their rows landed, spill files are
+    // deleted only after their replay landed. Pinned by
+    // `crates/app/tests/shutdown_runtime_not_dropped_guard.rs`.
+    std::mem::forget(runtime);
+    outcome
 }
 
 async fn async_main() -> Result<()> {
@@ -935,7 +967,7 @@ async fn async_main() -> Result<()> {
             config.questdb.clone(),
         ),
     );
-    // Contract name repair (2026-10-10, item 54): once a day after the close,
+    // Contract name repair (2026-10-10, item 56): once a day after the close,
     // put the `contract` name back on rows a boot rewrote without one (the
     // 2026-10-09 evening redeploys). Process-global, every boot mode; it only
     // touches days whose contract files are still on disk.

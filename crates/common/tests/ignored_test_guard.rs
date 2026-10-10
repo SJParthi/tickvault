@@ -49,7 +49,7 @@ fn repo_root() -> PathBuf {
 /// This list may SHRINK freely. Growing it is a deliberate edit, in the same
 /// change, with the reason visible to a reviewer.
 const ALLOWED_IGNORED: &[(&str, &str)] = &[
-    // Added 2026-10-10 with the contract name repair (plan item 54): an
+    // Added 2026-10-10 with the contract name repair (plan item 56): an
     // end-to-end run against a real QuestDB (it creates and drops its own
     // probe table), which CI does not have. It gates nothing; the SQL the
     // repair sends is pinned by the ordinary tests in
