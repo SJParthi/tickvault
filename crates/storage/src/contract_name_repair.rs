@@ -891,7 +891,7 @@ mod tests {
     async fn test_repair_contract_names_for_day_sends_nothing_for_a_bad_day_or_no_names() {
         // Port 9 (discard) on a loopback: any request would fail and count a
         // failure, so a clean default tally proves nothing was sent.
-        let client = Client::new();
+        let client = crate::http_client::build_probe_client(5).expect("test client builds");
         let url = "http://127.0.0.1:9/exec";
         let names = [NameRow {
             security_id: 1,
@@ -909,7 +909,7 @@ mod tests {
     async fn test_an_unreachable_database_is_a_failure_not_a_skip() {
         // Regression (review 2026-10-10): an unanswered tables() check was
         // counted as skipped, so an outage ended the run "ok".
-        let client = Client::new();
+        let client = crate::http_client::build_probe_client(5).expect("test client builds");
         let names = [NameRow {
             security_id: 1,
             segment: "NSE_FNO",
