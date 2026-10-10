@@ -5949,6 +5949,38 @@ mod stub_integration_tests {
             "the OLDEST partition goes first (monotonic progress)"
         );
     }
+
+    /// `read_body_capped` (shared with the WAL watcher since plan item 51d)
+    /// returns a short body whole and stops at `ARCHIVE_MAX_EXEC_BODY_BYTES`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_read_body_capped_keeps_a_short_body_and_stops_at_the_cap() {
+        let cap = usize::try_from(ARCHIVE_MAX_EXEC_BODY_BYTES).unwrap_or(usize::MAX);
+        let (url, _log) = spawn_stub(Arc::new(move |req: &SeenRequest| {
+            let body = if req.target.starts_with("/big") {
+                vec![b'a'; cap + 4096]
+            } else {
+                b"{\"ok\":true}".to_vec()
+            };
+            (200, Vec::new(), body)
+        }))
+        .await;
+        let client = reqwest::Client::new();
+        let small = client
+            .get(format!("{url}/small"))
+            .send()
+            .await
+            .expect("small request");
+        assert_eq!(
+            read_body_capped(small).await.expect("small body"),
+            "{\"ok\":true}"
+        );
+        let big = client
+            .get(format!("{url}/big"))
+            .send()
+            .await
+            .expect("big request");
+        assert_eq!(read_body_capped(big).await.expect("big body").len(), cap);
+    }
 }
 
 #[cfg(test)]

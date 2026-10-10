@@ -5122,4 +5122,14 @@ mod pr41c_tests {
         assert_eq!(got.staged, 3, "{got:?}");
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    /// Plan item 51d: the production form reads the production spill folder;
+    /// a day no seal was ever written for counts zero there (a missing folder
+    /// counts zero too).
+    #[test]
+    fn test_staged_production_spill_records_for_day_reads_the_production_folder() {
+        let never = chrono::NaiveDate::from_ymd_opt(2001, 1, 1).unwrap_or_default();
+        let got = staged_production_spill_records_for_day(never).expect("listable");
+        assert_eq!(got.staged, 0, "{got:?}");
+    }
 }
