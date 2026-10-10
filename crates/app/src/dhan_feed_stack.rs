@@ -2755,6 +2755,16 @@ impl LiveIngest {
             .is_some_and(DepthIngest::flush_due)
     }
 
+    /// True when the depth buffer has reached the LATE-row flush size (see
+    /// [`DepthIngest::late_flush_due`]); false with no depth wired. The WAL
+    /// replay's trigger. O(1).
+    #[must_use]
+    pub fn depth_late_flush_due(&self) -> bool {
+        self.inline_depth
+            .as_ref()
+            .is_some_and(DepthIngest::late_flush_due)
+    }
+
     /// Depth rows this lane has dropped, for the shutdown accounting line.
     #[must_use]
     pub fn depth_dropped_rows(&self) -> u64 {
@@ -3505,10 +3515,19 @@ impl LiveIngest {
         self.writer_offloaded
     }
 
+    /// Flushes the depth sink, then the tick rows. Returns the tick rows it
+    /// covered.
     pub fn flush(&mut self) -> u64 {
+        self.flush_depth_sink();
+        self.flush_ticks()
+    }
+
+    /// Flushes the inline-depth sink only.
+    fn flush_depth_sink(&mut self) {
         // Flush the inline-depth sink FIRST, and unconditionally.
         //
-        // This sits above the `pending_rows == 0` early return deliberately.
+        // `flush` calls this before `flush_ticks` and its `pending_rows == 0`
+        // early return deliberately.
         // Depth rows and tick rows are appended on different conditions: a
         // Full-mode packet whose tick the aggregator refuses still contributed
         // depth rows, so `pending_rows` can be 0 while the depth buffer is not
@@ -3549,6 +3568,18 @@ impl LiveIngest {
                  Tick persistence is unaffected either way."
             );
         }
+    }
+
+    /// Flushes the tick rows only, leaving buffered depth rows for their own
+    /// trigger (plan item 55).
+    ///
+    /// The WAL replay uses this when only the tick buffer is due: a replayed
+    /// depth row lands in an hour partition that already holds rows, and
+    /// QuestDB rewrites that partition for every late commit whatever its
+    /// size (measured 2026-10-10: 460–620 MB per commit, from 1,000 rows to
+    /// 1,000,000). Flushing depth with every 1,000 tick rows multiplied those
+    /// commits. O(1) here; the flush itself is one hand-off or one request.
+    pub fn flush_ticks(&mut self) -> u64 {
         if self.pending_rows == 0 {
             return 0;
         }
@@ -9664,6 +9695,25 @@ impl DepthIngest {
         }
     }
 
+    /// The flush trigger for LATE rows (the WAL replay and the after-close
+    /// deferred pass, plan item 55): an array-row writer by
+    /// [`tickvault_storage::depth_persistence::DEPTH_BOOK_FLUSH_BYTES`] as
+    /// [`Self::flush_due`], a level writer by
+    /// [`tickvault_storage::depth_persistence::DEPTH_LATE_FLUSH_BYTES`]
+    /// instead of [`DEPTH_FLUSH_ROW_THRESHOLD`] rows, so each late commit
+    /// (which rewrites a whole hour partition) carries about nine times the
+    /// rows. Never used by the live drain, whose rows are in time order. O(1).
+    #[must_use]
+    pub fn late_flush_due(&self) -> bool {
+        let bytes_due = |w: &DepthWriter| {
+            w.pending_bytes() >= tickvault_storage::depth_persistence::DEPTH_LATE_FLUSH_BYTES
+        };
+        match &self.book {
+            Some(b) => self.writer.book_flush_due() || bytes_due(&b.levels),
+            None => bytes_due(&self.writer),
+        }
+    }
+
     /// Moves the depth ILP round trip onto a dedicated OS thread.
     ///
     /// # The coupling this removes — and why it mattered MORE here
@@ -15710,6 +15760,79 @@ fn note_wal_frames_deferred_by_shutdown(
     );
 }
 
+/// Whether `main` has started the shutdown (2026-10-10).
+///
+/// `main` requests `SOCKET_STOP` first, before it notifies this lane, and it
+/// is never cleared, so the lane reads it at its boot-time boundaries (before
+/// the boot refold, before each catch-up round, during a lag pause, between
+/// paced flushes, and before the dial) instead of finishing work the process
+/// is about to abandon. One atomic load.
+fn shutdown_requested() -> bool {
+    tickvault_core::websocket::pool_supervisor::SOCKET_STOP.is_requested()
+}
+
+/// Closes the lane when a shutdown arrived before the sockets were dialled
+/// (2026-10-10).
+///
+/// Measured 9 Oct 22:39 and 10 Oct 02:15 IST: a stop landed during the boot
+/// WAL refold, the lane finished it, dialled nothing useful and spawned the
+/// frame drain into a runtime that was already shutting down, so the drain
+/// was cancelled at once and logged "frame drain DIED". Nothing was lost,
+/// but every stop in that window read as a crash.
+///
+/// This runs the drain's own shutdown arm and tail on a drain that saw no
+/// frames, in the same order (pinned against `run_frame_drain` by
+/// `close_lane_before_dial_mirrors_the_drain_shutdown_tail`): the catch-up
+/// seal and a flush, as the drain's shutdown arm does, then seal what the
+/// exit time allows, flush, flush depth, close every writer queue, join the
+/// writers against one deadline, persist the applied watermark. The replay's
+/// held bars were already released by `finish_wal_replay`. Cold path, once.
+fn close_lane_before_dial(
+    ingest: &mut LiveIngest,
+    feed_health: &tickvault_common::feed_health::FeedHealthRegistry,
+) {
+    // The drain's shutdown arm.
+    let (arm_emitted, arm_dropped) = ingest.catch_up_seal();
+    flush_and_record(ingest, feed_health);
+    flush_depth(ingest.depth_sink());
+    if arm_dropped > 0 {
+        error!(
+            code = ErrorCode::WsGapConnectionState.code_str(),
+            emitted = arm_emitted,
+            dropped = arm_dropped,
+            "Dhan live feed: candles were DROPPED during the shutdown seal — the \
+             seal ring could not take them and they are lost with the process"
+        );
+    }
+    // The drain's tail.
+    let (close_emitted, close_dropped) = if is_mid_session_exit(now_ist_secs_of_day()) {
+        ingest.seal_complete_buckets_at_mid_session_exit()
+    } else {
+        ingest.seal_open_buckets_at_close()
+    };
+    let tail = flush_and_record(ingest, feed_health);
+    flush_depth(ingest.depth_sink());
+    ingest.close_offload_queues();
+    let offload_deadline = std::time::Instant::now() + OFFLOAD_SHUTDOWN_GRACE;
+    ingest.shutdown_offload_writer(offload_deadline);
+    ingest.shutdown_rescue_writer(offload_deadline);
+    ingest.shutdown_depth_offload_writer(offload_deadline);
+    ingest.shutdown_top_volume_writer(offload_deadline);
+    tickvault_storage::wal_applied_watermark::applied_watermark().persist_now();
+    publish_fold_depth(ingest);
+    info!(
+        final_flush_rows = tail,
+        close_seals_emitted = close_emitted,
+        close_seals_dropped = close_dropped,
+        seals_emitted = ingest.seals_emitted(),
+        seals_dropped = ingest.seals_dropped(),
+        "Dhan live feed: shutdown arrived before the sockets were dialled — the WAL \
+         recovery stopped at a safe point, its rows were flushed and every writer was \
+         closed; no socket was opened and no frame drain was started. Any write-ahead \
+         log segment not yet confirmed stays on disk and is re-read on the next boot."
+    );
+}
+
 /// Fold ONE replayed tick and classify the outcome.
 ///
 /// Extracted 2026-08-28 when the caller's `if let Ok(..)` became an exhaustive
@@ -15856,7 +15979,15 @@ pub fn pace_after_replay_flush(
 }
 
 /// [`pace_after_replay_flush`] on the real writers (audit R1).
-fn replay_pace_after_flush(ingest: &mut LiveIngest, pace_until: Option<Instant>) -> u32 {
+///
+/// `with_depth` says whether the flush it follows included the depth sink.
+/// After a ticks-only flush the depth rows are held on purpose (plan item
+/// 55), so they are neither re-flushed nor read as a full queue.
+fn replay_pace_after_flush(
+    ingest: &mut LiveIngest,
+    pace_until: Option<Instant>,
+    with_depth: bool,
+) -> u32 {
     if pace_until.is_none() {
         return 0;
     }
@@ -15864,11 +15995,21 @@ fn replay_pace_after_flush(ingest: &mut LiveIngest, pace_until: Option<Instant>)
     let ingest = std::cell::RefCell::new(ingest);
     let waits = pace_after_replay_flush(
         || {
-            blocking_flush(|| ingest.borrow_mut().flush());
+            if with_depth {
+                blocking_flush(|| ingest.borrow_mut().flush());
+            } else {
+                blocking_flush(|| ingest.borrow_mut().flush_ticks());
+            }
         },
         || {
+            // A shutdown ends the pacing (2026-10-10): the rest of the
+            // replay runs unpaced, so a full queue rescues its rows to the
+            // spill tier or back to the WAL instead of holding the stop.
+            if shutdown_requested() {
+                return false;
+            }
             let ingest = ingest.borrow();
-            ingest.pending_rows() > 0 || ingest.depth_pending_rows() > 0
+            ingest.pending_rows() > 0 || (with_depth && ingest.depth_pending_rows() > 0)
         },
         |step| {
             // A fresh snapshot each step: a rescue elsewhere should end this
@@ -16137,12 +16278,22 @@ pub fn refold_wal_frames(
         // true. At that boot's volumes this is ~2,400 flushes across a replay
         // -- bounded work at boot, against a flush that currently cannot
         // succeed at all.
-        // Depth: `depth_flush_due` is the `DEPTH_FLUSH_ROW_THRESHOLD` row
-        // trigger for a level writer and the byte trigger for an array-row
-        // writer (plan item 49e step 3).
-        if ingest.pending_rows() >= FLUSH_ROW_THRESHOLD || ingest.depth_flush_due() {
-            // `LiveIngest::flush` flushes the inline-depth sink first and
-            // unconditionally (see its body), so one call drains both buffers.
+        // Depth: `depth_late_flush_due` is the LATE-row trigger (plan item
+        // 55): the array-row byte trigger for an array-row writer (plan item
+        // 49e step 3) and `DEPTH_LATE_FLUSH_BYTES` for a level writer, not the
+        // live drain's `DEPTH_FLUSH_ROW_THRESHOLD`. A replayed depth row lands
+        // in an hour partition that already holds rows, and every such commit
+        // rewrites the partition whatever its size (measured 2026-10-10), so
+        // depth is flushed on its own trigger and never because the tick
+        // buffer filled: the tick trigger alone fired every 1,000 tick rows,
+        // several thousand depth rows apart.
+        let ticks_due = ingest.pending_rows() >= FLUSH_ROW_THRESHOLD;
+        let depth_due = ingest.depth_late_flush_due();
+        if ticks_due || depth_due {
+            // With depth due, `LiveIngest::flush` flushes the inline-depth
+            // sink first and unconditionally (see its body), so one call
+            // drains both buffers; with only the ticks due, `flush_ticks`
+            // leaves the depth rows to grow into a larger batch.
             // A failure here is already loud and already rescues to the spill
             // tier at its source; the loop carries on, exactly as the live
             // drain does.
@@ -16175,8 +16326,12 @@ pub fn refold_wal_frames(
             // met a full queue waits for the writers before the next batch, so
             // the replay never reaches the retention bound and never rescues
             // its own rows back to the WAL. See `pace_after_replay_flush`.
-            blocking_flush(|| ingest.flush());
-            let waits = replay_pace_after_flush(ingest, pace_until);
+            if depth_due {
+                blocking_flush(|| ingest.flush());
+            } else {
+                blocking_flush(|| ingest.flush_ticks());
+            }
+            let waits = replay_pace_after_flush(ingest, pace_until, depth_due);
             out.pace_waits = out.pace_waits.saturating_add(u64::from(waits));
         }
         // TVW4 (2026-09-02): route by the RECORDED endpoint BEFORE any header
@@ -17077,6 +17232,17 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                  not lost, the recovery is deferred."
             );
             report_unfolded_wal_frames(&params.wal_replay_live_feed, "seal_writer_missing");
+        } else if shutdown_requested() {
+            // A stop before the boot refold (2026-10-10): fold nothing. The
+            // staged segments are not confirmed, so they stay in the replay
+            // staging area and the next boot re-offers them — deferred, not
+            // lost, exactly as a stop during the authentication wait.
+            info!(
+                staged_frames = params.wal_replay_live_feed.len(),
+                "Dhan live feed: shutdown arrived before the WAL refold — the staged \
+                 write-ahead log frames are not folded now and are re-offered on the \
+                 next boot"
+            );
         } else {
             let unlanded_before =
                 tickvault_storage::wal_applied_watermark::applied_watermark().unlanded_total();
@@ -17261,6 +17427,11 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         // so up to a second of budget can remain, and the tail below would
         // then report "drained".
         let mut catchup_pause_clock_out = false;
+        // 2026-10-10: the drain stood down because the process is stopping.
+        // Checked before every round and on every lag-pause step, so a stop
+        // waits for at most the round already running, never the full
+        // budget. What it did not reach stays on disk for the next boot.
+        let mut catchup_shutdown_stopped = false;
         let lag_pause_counter = metrics::counter!(WAL_CATCHUP_LAG_PAUSE_COUNTER);
         lag_pause_counter.increment(0);
         // `true` only when the final pass found NOTHING left on disk — no
@@ -17312,6 +17483,10 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             // dark longer than the budget already allowed.
             let mut lag_paused_secs = 0_u64;
             loop {
+                if shutdown_requested() {
+                    catchup_shutdown_stopped = true;
+                    break;
+                }
                 let secs_left = catchup_deadline
                     .saturating_duration_since(tokio::time::Instant::now())
                     .as_secs();
@@ -17341,6 +17516,9 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                         lag_paused_secs = lag_paused_secs.saturating_add(step);
                     }
                 }
+            }
+            if catchup_shutdown_stopped {
+                break;
             }
             if catchup_lag_stopped {
                 warn!(
@@ -17640,7 +17818,12 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 );
             }
         }
-        if rounds > 0 || catchup_memory_stopped || catchup_lag_stopped || catchup_pause_clock_out {
+        if rounds > 0
+            || catchup_memory_stopped
+            || catchup_lag_stopped
+            || catchup_pause_clock_out
+            || catchup_shutdown_stopped
+        {
             // `catchup_memory_stopped` joins `exhausted` deliberately: all
             // three mean the SAME operational thing — the drain stood down
             // with work still on disk — and the counter exists to say that,
@@ -17648,12 +17831,18 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             // separates them for triage, at zero metric cost, which matters
             // because the budget has $2.75 of margin to the automatic
             // STOP_EC2_INSTANCES line and a new EMF name is ~$0.30/mo.
-            let exhausted = catchup_memory_stopped
-                || catchup_lag_stopped
-                || catchup_pause_clock_out
-                || tokio::time::Instant::now() >= catchup_deadline
-                || rounds >= WAL_CATCHUP_MAX_ROUNDS;
-            let stop_reason = if catchup_memory_stopped {
+            let exhausted = !catchup_shutdown_stopped
+                && (catchup_memory_stopped
+                    || catchup_lag_stopped
+                    || catchup_pause_clock_out
+                    || tokio::time::Instant::now() >= catchup_deadline
+                    || rounds >= WAL_CATCHUP_MAX_ROUNDS);
+            // A planned stop is named first and is NOT counted as an exhausted
+            // budget: the counter means "this box cannot drain its backlog",
+            // and a deploy landing mid-drain says nothing about that.
+            let stop_reason = if catchup_shutdown_stopped {
+                "shutdown"
+            } else if catchup_memory_stopped {
                 "memory"
             } else if catchup_lag_stopped {
                 "apply_lag"
@@ -17826,6 +18015,14 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // Plan ITEM 47: the WAL replay (boot + catch-up) is over; hand over to the
     // live feed before its first frame folds.
     ingest.finish_wal_replay(replay_ended_on_gap);
+    // SHUTDOWN BEFORE THE DIAL (2026-10-10). Never spawn the drain or dial a
+    // socket once the process is stopping: close the writers here and return.
+    // See `close_lane_before_dial` for the 9 and 10 Oct stops that spawned
+    // the drain into a runtime that was already shutting down.
+    if shutdown_requested() {
+        close_lane_before_dial(&mut ingest, &params.feed_health);
+        return;
+    }
     let drain = tokio::spawn(run_frame_drain(
         frame_rx,
         ingest,
@@ -21445,6 +21642,109 @@ mod tests {
         f.seq = 7 + (500 << 20);
         drain_depth_frame(&mut levels, &f, BOOK_RX, DepthFeedKind::Twenty, counters());
         assert!(levels.flush_due(), "10,000 level rows");
+    }
+
+    /// Plan item 55: a late level batch flushes on bytes, about nine times
+    /// the live drain's 10,000 rows; an array-row batch keeps its own byte
+    /// trigger.
+    #[test]
+    fn test_late_flush_due_is_late_bytes_for_level_rows_and_the_book_trigger_for_book_rows() {
+        use tickvault_storage::depth_persistence::DEPTH_LATE_FLUSH_BYTES;
+        let mut levels = DepthIngest::for_test();
+        let frame = depth_frame(depth20_packet(13, 0, 41), DhanEndpointType::Depth20, 7);
+        let mut frames = 0_u64;
+        while !levels.late_flush_due() {
+            let mut f = frame.clone();
+            f.seq = 7 + (frames << 20);
+            drain_depth_frame(&mut levels, &f, BOOK_RX, DepthFeedKind::Twenty, counters());
+            frames += 1;
+            if levels.pending_rows() < 10_000 {
+                assert!(!levels.late_flush_due());
+            }
+            assert!(frames < 100_000, "must trip on bytes");
+        }
+        assert!(
+            levels.flush_due(),
+            "the live row threshold tripped long before"
+        );
+        assert!(levels.writer.pending_bytes() >= DEPTH_LATE_FLUSH_BYTES);
+        assert!(
+            levels.pending_rows() >= 50_000,
+            "a late batch carries several times the live 10,000 rows, got {}",
+            levels.pending_rows()
+        );
+
+        let mut book = DepthIngest::for_test_book(BOOK_RX);
+        let frame = depth_frame(
+            depth200_packet(52_175, 2, 41, 200),
+            DhanEndpointType::Depth200,
+            9,
+        );
+        let mut seq = 9_u64;
+        while !book.flush_due() {
+            assert!(!book.late_flush_due(), "the book trigger is the same");
+            let mut f = frame.clone();
+            seq += 1 << 20;
+            f.seq = seq;
+            drain_depth_frame(
+                &mut book,
+                &f,
+                BOOK_RX,
+                DepthFeedKind::TwoHundred,
+                counters(),
+            );
+        }
+        assert!(book.late_flush_due());
+    }
+
+    /// Plan item 55: `flush_ticks` leaves the depth rows to batch, and
+    /// `depth_late_flush_due` follows the inline sink.
+    #[test]
+    fn test_flush_ticks_and_depth_late_flush_due_leave_depth_to_its_own_trigger() {
+        let ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        assert!(!ingest.depth_late_flush_due(), "no depth sink");
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8)
+            .with_inline_depth(DepthIngest::for_test());
+        assert!(!ingest.depth_late_flush_due(), "an empty sink is not due");
+        let frame = depth_frame(depth20_packet(13, 0, 41), DhanEndpointType::Depth20, 7);
+        let sink = ingest.depth_sink().expect("depth sink wired");
+        drain_depth_frame(sink, &frame, BOOK_RX, DepthFeedKind::Twenty, counters());
+        let held = ingest.depth_pending_rows();
+        assert!(held > 0, "depth rows buffered");
+        assert_eq!(ingest.flush_ticks(), 0, "no tick rows to flush");
+        assert_eq!(
+            ingest.depth_pending_rows(),
+            held,
+            "a tick-only flush must not touch the depth buffer"
+        );
+        assert!(
+            !ingest.depth_late_flush_due(),
+            "a few rows are not a late batch"
+        );
+    }
+
+    /// Plan item 55: the after-close pass writes late rows and must batch
+    /// them on the late trigger; the live drain keeps the row threshold.
+    #[test]
+    fn the_late_depth_paths_use_the_late_trigger_and_the_live_drain_does_not() {
+        let pass = include_str!("dhan_feed_stack/deferred_depth_pass.rs");
+        let pass_prod = pass.split("#[cfg(test)]").next().unwrap_or(pass);
+        assert!(pass_prod.contains("sink.late_flush_due() && sink.flush()"));
+        assert!(
+            !pass_prod.contains("sink.flush_due()"),
+            "the after-close pass writes late rows only"
+        );
+        let src = include_str!("dhan_feed_stack.rs");
+        let production = src.split("#[cfg(test)]").next().unwrap_or(src);
+        assert_eq!(
+            production.matches("ingest.depth_late_flush_due()").count(),
+            1,
+            "only the WAL replay uses the late trigger"
+        );
+        assert!(
+            production.contains("if ingest.depth_flush_due() {"),
+            "the live drain keeps the row threshold for in-order rows"
+        );
     }
 
     #[test]
@@ -26193,17 +26493,27 @@ mod wal_refold_tests {
         );
         assert!(
             body[..flush_at].contains("ingest.pending_rows() >= FLUSH_ROW_THRESHOLD")
-                && body[..flush_at].contains("ingest.depth_flush_due()"),
-            "the flush must be gated on BOTH row thresholds the live drain \
-             uses — a depth-only or tick-only gate leaves the other buffer \
-             unbounded, and depth was the 22.3M-row half"
+                && body[..flush_at].contains("ingest.depth_late_flush_due()"),
+            "the flush must be gated on BOTH size triggers — a depth-only or \
+             tick-only gate leaves the other buffer unbounded, and depth was \
+             the 22.3M-row half"
         );
+        // Plan item 55: depth on the LATE trigger, never the live row
+        // threshold, and a tick-only flush that leaves depth to batch.
+        assert!(
+            !body.contains("ingest.depth_flush_due()"),
+            "replayed depth rows are late rows: the replay must use \
+             `depth_late_flush_due`, not the live drain's row threshold"
+        );
+        let ticks_at = body
+            .find("blocking_flush(|| ingest.flush_ticks())")
+            .expect("a tick-only flush must leave the depth rows to batch");
 
         let match_at = body
             .find("match endpoint {")
             .expect("the endpoint match must exist");
         assert!(
-            flush_at < match_at,
+            flush_at < match_at && ticks_at < match_at,
             "the size trigger sits BELOW `match endpoint`, so the depth arm's \
              `continue` skips it — that is the exact shape of the defect this \
              test exists to stop, because depth is the half that builds the \
@@ -26360,7 +26670,8 @@ mod wal_refold_tests {
             "the boot pass and the catch-up rounds must both call the paced refold"
         );
         assert!(
-            production.contains("let waits = replay_pace_after_flush(ingest, pace_until);"),
+            production
+                .contains("let waits = replay_pace_after_flush(ingest, pace_until, depth_due);"),
             "the size-triggered replay flush must be the paced one"
         );
     }
@@ -31931,3 +32242,183 @@ mod socket_stop_tests {
 // its first `#[cfg(test)]` still see the whole production body.
 #[cfg(test)]
 mod feed_aux_tests;
+
+// 2026-10-10: a shutdown that lands during the lane's boot WAL recovery must
+// stop at a safe point and never spawn the frame drain or dial a socket.
+#[cfg(test)]
+mod shutdown_before_dial_tests {
+    use super::*;
+    use tickvault_common::feed::Feed;
+
+    fn production() -> &'static str {
+        include_str!("dhan_feed_stack.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production half")
+    }
+
+    fn body_of<'a>(src: &'a str, signature: &str) -> &'a str {
+        let rest = src
+            .split_once(signature)
+            .unwrap_or_else(|| panic!("{signature} must exist"))
+            .1;
+        &rest[..rest.find("\n}\n").unwrap_or(rest.len())]
+    }
+
+    /// The calls of the drain's shutdown tail, in order. Each must appear in
+    /// both bodies, and in this order in both.
+    const SHUTDOWN_TAIL: [&str; 11] = [
+        "seal_complete_buckets_at_mid_session_exit()",
+        "seal_open_buckets_at_close()",
+        "flush_and_record(",
+        "flush_depth(ingest.depth_sink())",
+        "close_offload_queues()",
+        "shutdown_offload_writer(offload_deadline)",
+        "shutdown_rescue_writer(offload_deadline)",
+        "shutdown_depth_offload_writer(offload_deadline)",
+        "shutdown_top_volume_writer(offload_deadline)",
+        "applied_watermark().persist_now()",
+        "publish_fold_depth(",
+    ];
+
+    fn assert_tail_in_order(name: &str, body: &str) {
+        let mut at = 0usize;
+        for call in SHUTDOWN_TAIL {
+            let found = body[at..]
+                .find(call)
+                .unwrap_or_else(|| panic!("{name}: `{call}` missing or out of order"));
+            at += found + call.len();
+        }
+    }
+
+    /// The calls of the drain's shutdown ARM (the `shutdown.notified()`
+    /// branch), which run before the tail.
+    const SHUTDOWN_ARM: [&str; 3] = [
+        "ingest.catch_up_seal()",
+        "flush_and_record(",
+        "flush_depth(ingest.depth_sink())",
+    ];
+
+    /// Returns the offset just past the last call of `calls`, found in order.
+    fn assert_in_order(name: &str, body: &str, calls: &[&str]) -> usize {
+        let mut at = 0usize;
+        for call in calls {
+            let found = body[at..]
+                .find(call)
+                .unwrap_or_else(|| panic!("{name}: `{call}` missing or out of order"));
+            at += found + call.len();
+        }
+        at
+    }
+
+    #[test]
+    fn close_lane_before_dial_mirrors_the_drain_shutdown_tail() {
+        let prod = production();
+        let drain = body_of(prod, "async fn run_frame_drain(");
+        let arm = drain
+            .split_once("() = shutdown.notified() => {")
+            .expect("the drain's shutdown arm must exist")
+            .1;
+        let arm = &arm[..arm.find("break;").expect("the shutdown arm ends the loop")];
+        assert_in_order("run_frame_drain shutdown arm", arm, &SHUTDOWN_ARM);
+        let drain_tail = drain
+            .split_once("// Every sender was dropped, so no socket is left.")
+            .expect("the drain's shutdown tail anchor must exist")
+            .1;
+        assert_tail_in_order("run_frame_drain", drain_tail);
+        let close = body_of(prod, "fn close_lane_before_dial(");
+        let after_arm = assert_in_order("close_lane_before_dial", close, &SHUTDOWN_ARM);
+        assert_tail_in_order("close_lane_before_dial", &close[after_arm..]);
+    }
+
+    #[test]
+    fn the_lane_never_spawns_the_drain_after_a_shutdown() {
+        let prod = production();
+        let lane = body_of(prod, "async fn run_dhan_feed_stack(");
+        let finish = lane
+            .find("ingest.finish_wal_replay(replay_ended_on_gap);")
+            .expect("hand-over present");
+        let spawn = lane
+            .find("tokio::spawn(run_frame_drain(")
+            .expect("drain spawn present");
+        let between = &lane[finish..spawn];
+        let check = between
+            .find("if shutdown_requested() {")
+            .expect("a shutdown check must sit between the hand-over and the drain spawn");
+        let close = between
+            .find("close_lane_before_dial(&mut ingest, &params.feed_health);")
+            .expect("the shutdown arm must close the writers");
+        let ret = between[close..]
+            .find("return;")
+            .expect("the shutdown arm must return before the spawn");
+        assert!(check < close && close + ret < between.len());
+    }
+
+    #[test]
+    fn the_boot_recovery_checks_for_a_shutdown_at_every_safe_boundary() {
+        let prod = production();
+        let lane = body_of(prod, "async fn run_dhan_feed_stack(");
+        // Before the boot refold.
+        let refold = lane
+            .find("let outcome = refold_wal_frames(&mut ingest, boot_frames")
+            .expect("boot refold present");
+        assert!(
+            lane[..refold].contains("} else if shutdown_requested() {"),
+            "the boot refold must be skipped once a stop was requested"
+        );
+        // Before every catch-up round, inside the lag-pause loop.
+        let catch_up = lane
+            .split_once("while rounds < WAL_CATCHUP_MAX_ROUNDS")
+            .expect("catch-up loop present")
+            .1;
+        let pause = catch_up
+            .split_once("loop {")
+            .expect("lag-pause loop present")
+            .1;
+        let first_check = pause.find("if shutdown_requested() {").expect("stop check");
+        let first_sleep = pause.find("tokio::time::sleep(").expect("pause sleep");
+        assert!(
+            first_check < first_sleep,
+            "the stop must be checked before the lag pause sleeps"
+        );
+        assert!(catch_up.contains("if catchup_shutdown_stopped {\n                break;"));
+        // A stop is reported by name and never as an exhausted budget.
+        assert!(lane.contains("let exhausted = !catchup_shutdown_stopped"));
+        assert!(lane.contains("\"shutdown\""));
+        // And the pacing stops waiting on the writers.
+        let pace = body_of(prod, "fn replay_pace_after_flush(");
+        assert!(
+            pace.contains("if shutdown_requested() {\n                return false;"),
+            "a stop must end the replay pacing"
+        );
+    }
+
+    #[test]
+    fn close_lane_before_dial_hands_off_the_tail_and_joins_the_writer() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
+        let health = Arc::new(tickvault_common::feed_health::FeedHealthRegistry::new());
+        ingest
+            .spawn_offload_writer(Arc::clone(&health))
+            .expect("the writer thread must spawn");
+        let mut p = [0u8; 16];
+        p[0] = 2;
+        p[1] = 16;
+        p[4..8].copy_from_slice(&13u32.to_le_bytes());
+        p[8..12].copy_from_slice(&23_146.45_f32.to_le_bytes());
+        p[12..16].copy_from_slice(&1_779_355_000u32.to_le_bytes());
+        let parsed = dispatch_frame(&p, 1_779_355_000_000_000_000).expect("ticker parses");
+        let ParsedFrame::Tick(tick) = parsed else {
+            panic!("response code 2 must dispatch to a Tick");
+        };
+        ingest.ingest_tick(&tick, 42, 1_779_355_000_000);
+        assert_eq!(ingest.pending_rows(), 1);
+
+        close_lane_before_dial(&mut ingest, &health);
+
+        assert_eq!(ingest.pending_rows(), 0, "the tail row left the buffer");
+        assert!(
+            !ingest.writer_is_offloaded(),
+            "the writer queue is closed and the thread joined"
+        );
+    }
+}

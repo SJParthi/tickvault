@@ -6697,3 +6697,98 @@ Nothing is deleted until apply. Deleted versions cannot be restored; that is the
 
 ### Observability (Item 53)
 The job summary and an uploaded artifact carry the per-group report before and after the delete, including every kept-unparsed key (up to 50).
+
+## ITEM 54 — Clean shutdown: no runtime drop at exit, and a lane that stops during WAL recovery (added 2026-10-10)
+
+Authority: the owner's 2026-10-10 ask to fix everything ("make everything to work and finish and fix and resolve everything"), relayed by the coordinator with the brief "fix the unclean shutdown, zero tick loss". Evidence from CloudWatch `/tickvault/prod/app`: 6 Oct 15:46:51 IST "PANIC: tickvault crashed" ("A Tokio 1.x context was found, but it is being shutdown", 20 ms after "tickvault stopped"); 9 Oct 22:41 and 10 Oct 02:17 IST "frame drain DIED (task cancelled)" about 85 s after "tickvault stopped".
+
+- [x] 54a — `main` leaks the runtime after `block_on` instead of dropping it; the lane checks for a stop before the boot refold, before each catch-up round and each lag-pause step, ends replay pacing on a stop, and closes its writers without spawning the drain or dialling when a stop arrived first (crates/app, tickvault-app).
+  - Files: crates/app/src/main.rs, crates/app/src/dhan_feed_stack.rs, crates/app/tests/shutdown_runtime_not_dropped_guard.rs
+  - Tests: main_leaks_the_runtime_after_block_on_and_never_drops_it, a_blocking_timer_fails_after_a_dropped_runtime_and_works_after_a_leaked_one, close_lane_before_dial_mirrors_the_drain_shutdown_tail, the_lane_never_spawns_the_drain_after_a_shutdown, the_boot_recovery_checks_for_a_shutdown_at_every_safe_boundary, close_lane_before_dial_hands_off_the_tail_and_joins_the_writer
+
+### Design (Item 54)
+Two causes, two fixes. (1) Dropping the tokio runtime at the end of `main` shuts the time and IO drivers down while blocking-pool threads may still wait on a timer through `Handle::block_on` (the tick spill replay round), which panics and, under `panic = "abort"`, dumps core; and it waits without bound for a worker stuck in synchronous work. `main` now leaks the runtime: every durable tier was already drained by the shutdown sequence, and work still running is crash-safe by design. (2) The lane read the stop only during its token wait and inside the drain, so a stop during the boot WAL refold or the catch-up drain ran both to the end and then spawned the drain into a dying runtime. The lane now reads `SOCKET_STOP` (requested first by `main`, never cleared, one atomic load) at safe boundaries only: it never interrupts a refold batch mid-way, because a half-folded batch would seal partial candles.
+
+### Edge Cases (Item 54)
+Stop before the boot refold: nothing is folded, staged segments stay in `replaying/` and the next boot re-offers them (same as the token-wait stop). Stop during a refold batch: the batch finishes unpaced; rows a full queue cannot take are rescued to the spill tier or marked unapplied in the WAL, exactly as an unpaced in-session replay does. Stop during a lag pause: noticed within one 5 s poll step. Stop after the catch-up but before the dial: the drain's own shutdown tail runs on a drain that saw no frames, then the lane returns; the lane-running flag was never set and the up-gauge never rose.
+
+### Failure Modes (Item 54)
+A refold batch or ack wait longer than `main`'s 30 s lane budget still logs the existing shutdown-timeout ERROR, and the process then exits with the lane mid-work: unconfirmed segments are re-read next boot (DEDUP makes the re-fold idempotent). Log lines written in the last moment before exit may not reach the log file, because the logging guards were already leaked for the process lifetime; this is unchanged from before. A stop between catch-up rounds ends the replay on a gap, so the candles still open at that point are withheld and counted on `tv_candle_refold_partial_suppressed_total` rather than written short (the raw ticks stay in `ticks` and the WAL); before this change the lane was cancelled there with no seal and nothing counted.
+
+### Test Plan (Item 54)
+A real-runtime bite test shows a blocking thread's timer failing after a dropped runtime and working after a leaked one. Source guards pin the leak in `main`, the stop checks at each boundary, the no-spawn-after-stop return, and the shutdown tail order against `run_frame_drain`. A behavioural test runs `close_lane_before_dial` on a lane with an offloaded writer and a buffered tick.
+
+### Rollback (Item 54)
+Revert the PR. No config, schema, table or alarm changes.
+
+### Observability (Item 54)
+New info lines: "shutdown arrived before the WAL refold", "shutdown arrived before the sockets were dialled"; the catch-up summary line gains `stop_reason = "shutdown"` and a planned stop is not counted on `tv_wal_catchup_budget_exhausted_total`. No new metric or alarm. Per-item guarantee matrix: see the plan's shared matrix section.
+
+## ITEM 56 — CONTRACT NAMES ON REBUILT ROWS (added 2026-10-10, operator: "Check whether other contracts have the same gaps. Zero tick loss is the rule, so fix and backfill automatically."): rebuilt rows lost their contract name
+
+- [x] Publish every option name (not only spot names) at boot, before the seal writer's boot drain and again before the lane's frame-log replay, from the newest day with a file within 7 days; the attach still owns the table once it publishes
+  - Files: crates/app/src/dhan_contract_universe.rs, crates/app/src/main.rs
+  - Tests: test_regression_option_labels_from_names_every_option_like_the_attach, test_option_labels_from_is_not_capped, test_option_labels_from_an_empty_file_is_empty, test_regression_newest_readable_day_steps_back_to_the_last_built_day, newest_readable_day_stops_at_the_lookback, test_boot_publish_wins_truth_table, day_key_packs_the_date_and_refuses_garbage, publish_contract_labels_at_boot_publishes_nothing_without_an_artifact
+- [x] Restore the blanked names automatically: once a day after the close (15:45 IST onward), for today and the 7 days before it whose contract files are still kept, re-insert every `dhan` row with a NULL `contract` whose `(security_id, segment)` that day's files name, with its name, through the table's own DEDUP key (QuestDB 9.3.5 refuses `UPDATE … FROM` on WAL tables). Candle tables, `ticks`, `feed_aux_packets`; not `market_depth`. A table without DEDUP, or with `contract` in its DEDUP key, is skipped. Each table is checked for a blank row first, so a clean day loads nothing; the day's names go into `contract_name_repair_map`, a scratch table with no WAL, created fresh for each day and dropped after it; a table is written only once QuestDB has applied every write to it and no new write arrived for 30 s. A run with a failure is retried, up to 3 runs a day. Covers 9 Oct from the first after-close run after the deploy.
+  - Files: crates/storage/src/contract_name_repair.rs, crates/storage/src/lib.rs, crates/storage/src/partition_manager.rs, crates/storage/tests/contract_name_repair_live.rs, crates/app/src/contract_name_repair_boot.rs, crates/app/src/dhan_contract_universe.rs, crates/app/src/lib.rs, crates/app/src/main.rs
+  - Tests: test_repair_insert_sql_copies_every_column_and_names_only_blank_dhan_rows, test_repair_insert_sql_refuses_a_table_missing_a_join_column, test_map_insert_sql_escapes_quotes, test_map_insert_sql_batch_stays_under_the_request_buffer, test_map_table_ddl_and_map_drop_sql_build_a_fresh_table_without_wal, test_repair_insert_sql_refuses_a_table_keyed_on_contract, test_table_is_quiet_needs_applied_and_two_equal_polls, test_an_unreachable_database_is_a_failure_not_a_skip, test_name_is_stored_verbatim_refuses_what_the_tick_writer_would_change, test_a_failed_run_is_retried_up_to_the_cap, test_scratch_tables_are_in_no_retention_list, test_count_and_repair_share_one_row_source, test_parsers_read_questdb_answers, test_is_valid_day_accepts_only_iso_dates, test_repair_is_due_only_after_the_close_and_once_a_day, test_repair_days_covers_the_incident_day_from_the_next_deploy, test_repair_tables_include_candles_ticks_and_aux_but_not_depth, contract_names_for_day_is_none_without_that_days_symbol_map, repair_names_blank_rows_in_place_and_leaves_everything_else (ignored; run against a local QuestDB 9.3.5 on 2026-10-10, passed)
+
+## Design (Item 56)
+
+Cause (inferred from the box logs and the code, not yet confirmed by a database query): the 9 Oct evening redeploys replayed the day's frame log and drained the spilled seals while the name table held only the 862 spot names (the boot published spots only; options arrived with the attach about 17 minutes later). Each rewritten option row was written without `contract`, and the DEDUP UPSERT replaced the named row whole, so `WHERE contract = 'ITC-27Oct2026-255-CE'` stopped matching rows that are still there. Fix: `publish_contract_labels_at_boot` adds `option_labels_from` (every OPTIDX/OPTSTK row of the contract file, uncapped, the same label as the attach) and runs twice, first just before `spawn_seal_writer_loop` and again before `spawn_dhan_feed_stack`. `boot_publish_wins` decides a replace: never after the attach, never empty, newer day wins, same day only a larger table. O(rows) once per boot call, cold.
+
+## Edge Cases (Item 56)
+
+Boot after midnight (no file for today) uses the newest earlier day within 7; no file in the window publishes nothing (column stays as it is); a contract file that becomes readable between the two boot calls replaces the smaller table; the attach running later replaces the boot table as before. BSE options and zero ids are skipped, as in the attach. Repair: a day whose files are gone (kept 7 days) is never tried; a day with a symbol map but no contract file names spots only; an id no file names stays NULL; rows of another feed are never touched; a second run finds nothing (the count is 0, no statement runs); a table still being written (WAL not applied, or a new commit between two polls 30 s apart) is not touched and the run is retried; a name the tick writer would store differently (a stripped character) is left out and counted.
+
+## Failure Modes (Item 56)
+
+A derivative id reassigned overnight would carry the newer day's name when an older day's frames are replayed after the newer file exists (the attach has the same limit). An unreadable contract file publishes spot names only, as before. A boot table never overwrites the attach's (the flag is set before the attach publishes; both boot calls run before the lane starts). Repair: a suspended name table, a refused statement or no answer within 600 s leaves the day for the next run and is counted (`tv_contract_name_repair_runs_total{outcome="partial"}`); a table without DEDUP or WAL, or missing one of the five join columns, is skipped and logged, never written (a re-insert there would duplicate rows). A day already copied to the cold bucket keeps blank names in that copy. A writer that starts while a repair statement runs (a boot replay, a spill drain) can have its newer copy replaced by the stored copy the statement read; the 30-minute boot grace and the quiet check narrow this to the length of one statement, it is not closed. If the disk-pressure archive drops a partition while a statement runs, the statement can leave only the repaired rows in it. An unanswered table check counts as a failure, never a skip.
+
+## Test Plan (Item 56)
+
+`cargo test -p tickvault-app --lib -- dhan_contract_universe` (98 passed), `cargo clippy -p tickvault-app --no-deps -- -D warnings -W clippy::perf` clean. Repair: the SQL builders and the schedule are unit-tested; `contract_name_repair_live` (ignored, needs QuestDB) builds a table with a blank row, a named row, an unnamed id, another feed and another day, runs the repair, and checks only the blank row changed, with every value kept, and that a second run is clean (passed on a local QuestDB 9.3.5, 2026-10-10).
+
+## Rollback (Item 56)
+
+Revert the PR: the boot publishes spot names only again and the after-close repair stops. Names the repair already wrote stay (they are the names the rows had before the redeploys); `contract_name_repair_map` is a scratch table and can be dropped.
+
+## Observability (Item 56)
+
+Two `info!` lines at boot (count and the day the names came from); the existing `tv_candle_contract_labels_published` gauge reads the full count from the first boot call instead of 862. Repair: one `info!` per day checked (names, rows restored, tables repaired, clean, skipped, failures) and one per run; counters `tv_contract_name_repair_rows_total` and `tv_contract_name_repair_runs_total{outcome}`, registered at 0 when the task starts. Statement failures are `warn!` (nothing is lost: the rows and their values stay; only the name is still missing). No page, alarm, EMF name or filter.
+
+## ITEM 55 — Late depth writes in fewer, larger commits (WAL apply backlog, 2026-10-10)
+
+Authority: Parthi, relayed 2026-10-10: "Bro make everything to work and finish and fix and resolve everything and merge and deploy everything now dude". The coordinator assigned the `market_depth` WAL apply backlog (about 235,000 transactions and rising) to this thread.
+
+Finding (Verified on a local QuestDB 9.3.5, a 6M-row hour partition with the `market_depth` columns, HOUR partitions, WAL and DEDUP key; paced commits as the after-close pass and the paced replay make them): every commit that adds rows to an hour partition that already holds rows rewrites roughly the whole partition — 464 MB for 1,000 rows, 495 MB for 10,000, 507 MB for 100,000, 0.62 GB for 1,000,000 — against about 1.7 MB for an in-order commit and 18 MB for 20 commits of exact duplicates. So a late batch costs the COUNT of its commits. The WAL replay flushed depth at 10,000 rows AND with every 1,000 tick rows (`LiveIngest::flush` always flushes the depth sink first), and the after-close pass at 10,000 rows.
+
+- [x] 55a — `DEPTH_LATE_FLUSH_BYTES` (16 MiB, half the producer ceiling) and `DepthIngest::late_flush_due`: a level writer flushes late rows by bytes (about 94,000 rows a commit), an array-row writer keeps its 8 MiB trigger.
+  - Files: crates/storage/src/depth_persistence.rs, crates/app/src/dhan_feed_stack.rs
+  - Tests: test_late_flush_due_is_late_bytes_for_level_rows_and_the_book_trigger_for_book_rows
+- [x] 55b — the WAL replay flushes depth on `depth_late_flush_due` only; a tick-only trigger calls the new `LiveIngest::flush_ticks`, and the pacer after it neither re-flushes nor waits on the held depth rows.
+  - Files: crates/app/src/dhan_feed_stack.rs
+  - Tests: test_flush_ticks_and_depth_late_flush_due_leave_depth_to_its_own_trigger, the_replay_loop_flushes_on_size_so_one_batch_cannot_build_a_four_gb_buffer, both_replay_passes_are_paced
+- [x] 55c — the after-close deferred pass flushes on `late_flush_due` (still once more at every bucket edge, so no batch spans two buckets).
+  - Files: crates/app/src/dhan_feed_stack/deferred_depth_pass.rs
+  - Tests: the_late_depth_paths_use_the_late_trigger_and_the_live_drain_does_not, after_close_pass_writes_depth_only_and_clears_after_a_healthy_settle
+
+### Design (Item 55)
+Only the batch size of LATE depth writes changes. The live drain keeps `DEPTH_FLUSH_ROW_THRESHOLD` (its rows are in time order and cheap). `late_flush_due` is O(1): one length read per writer. `flush_ticks` is the tick half of `LiveIngest::flush`, split out unchanged; `flush` is now `flush_depth_sink` then `flush_ticks`, same order and same behaviour. Both replay callers still flush everything at the end of each refold.
+
+### Edge Cases (Item 55)
+A replay with ticks and no depth flushes ticks every 1,000 rows as before. A replay with depth and no ticks flushes depth at 16 MiB. Array-row (book) mode: the book writer keeps 8 MiB; the synchronous older-frame level writer takes the 16 MiB trigger. An offload queue that is full hands a 16 MiB batch back; the producer still cuts at `MAX_DEPTH_PRODUCER_BUFFER_BYTES` (32 MiB) and the span bound, as before.
+
+### Failure Modes (Item 55)
+No row is skipped; only the size of each commit changes. A failed late batch goes to the depth spill tier (replay) or leaves its bucket marked (after-close pass), exactly as a 10,000-row batch did; the DEDUP key makes a rewrite idempotent. A 16 MiB request is bounded by the ILP timeout of 5 s plus the client's minimum throughput allowance; the replay runs before the drain starts and the after-close pass on its own thread, so neither blocks the live feed. Each remaining late commit still rewrites its partition: the change cuts the count, not the cost of one. Why QuestDB on the box does not merge queued commits (it does locally under a burst) is Unknown.
+
+### Test Plan (Item 55)
+`cargo test -p tickvault-app --lib` (late_flush_due, flush_ticks, the replay and deferred-pass tests); `cargo test -p tickvault-storage --lib depth_persistence` (the compile-time bounds). After deploy: the WAL transaction count added by a boot replay (`wal_tables()` `sequencerTxn` before and after) and `tv_questdb_wal_apply_lag_max`.
+
+### Rollback (Item 55)
+Revert the commit. No schema, data or config change.
+
+### Observability (Item 55)
+Existing: `tv_questdb_wal_apply_lag_max`, the depth flush and spill counters, `tv_wal_replay_pace_waits_total`. No new metric.
+
+Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
