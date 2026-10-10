@@ -357,6 +357,7 @@ Tests: `order_observability::tests::test_reconcile_verdict_*`.
 - Only 807 (AccessTokenExpired) requires token refresh
 - Naming per annexure: 808=AuthenticationFailed, 809=AccessTokenInvalid, 810=ClientIdInvalid
 - Test: integration `ws_disconnect_codes::*`
+- **Note (2026-10-06, scope lock "808 REFRESHES THE TOKEN ONCE BEFORE IT PARKS"):** the lines above describe the RAW code helpers `DisconnectCode::is_reconnectable()` / `requires_token_refresh()`, which have no production caller. Supervisor POLICY is `pool_supervisor::classify_disconnect`: 807 and 809 refresh the token and redial; 808 refreshes once and redials, and parks only when the refreshed token is rejected too (or a cap trips); 806 and 810 park; 805 parks for the overflow probe; 804 takes one respawn.
 
 ## WS-GAP-02: Subscription Batching
 - `build_subscription_messages()` must clamp batch_size to [1, 100]
@@ -428,6 +429,7 @@ emit). Ratchet:
 - Only `DisconnectCode::AccessTokenExpired` (807) triggers token refresh
 - All other codes do NOT trigger token refresh
 - Test: integration `ws_disconnect_codes::test_only_807_requires_refresh`
+- **Note (2026-10-06):** this mapping is the raw helper `requires_token_refresh()` (no production caller). The live socket supervisor (`classify_disconnect`) refreshes on 807 and 809, and on a first 808 (once; a second rejection of the refreshed token parks). See the WS-GAP-01 note.
 
 ---
 
