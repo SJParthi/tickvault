@@ -651,8 +651,11 @@ fn main() -> Result<()> {
     //
     // By the time `async_main` returns, the shutdown sequence has already
     // drained every durable tier itself (lane seal and flush, seal writer,
-    // escalation thread, crash marker, WAL spill). Dropping the runtime adds
-    // nothing to that and caused two measured failures:
+    // escalation thread, crash marker, WAL spill), except when the lane
+    // overran its shutdown budget mid-way through a WAL refold batch; that
+    // is logged as a shutdown timeout and its unconfirmed segments are
+    // re-read on the next boot. Dropping the runtime adds nothing to that
+    // and caused two measured failures:
     //
     // * 6 Oct 2026, 15:46:51 IST: the drop shut the time driver down while a
     //   blocking-pool thread was still waiting on a timer through

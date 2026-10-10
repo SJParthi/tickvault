@@ -53,10 +53,16 @@ fn main_leaks_the_runtime_after_block_on_and_never_drops_it() {
     }
 }
 
-/// Runs one blocking task that waits until the runtime is gone (or would
-/// be), then sleeps on a tokio timer through `Handle::block_on`, the shape of
-/// the tick spill replay round. Returns whether that timer worked.
+/// Runs one blocking task that, once the exit begins, keeps sleeping on a
+/// tokio timer through `Handle::block_on` (the shape of the tick spill
+/// replay round) until a sleep fails or `WATCH` passes. Returns whether
+/// every sleep worked.
+///
+/// The task does not guess when the drop has shut the drivers down: it
+/// retries until it sees the failure, so a slow runner only makes the loop
+/// longer, never the verdict different. `WATCH` bounds a broken test.
 fn blocking_timer_after_exit(leak: bool) -> bool {
+    const WATCH: Duration = Duration::from_secs(5);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .enable_all()
@@ -66,29 +72,37 @@ fn blocking_timer_after_exit(leak: bool) -> bool {
     let (go_tx, go_rx) = mpsc::channel::<()>();
     let (done_tx, done_rx) = mpsc::channel::<bool>();
     runtime.spawn_blocking(move || {
-        // Wait for the exit to begin, bounded so a broken test cannot hang.
-        let _ = go_rx.recv_timeout(Duration::from_secs(1));
-        let worked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            handle.block_on(tokio::time::sleep(Duration::from_millis(5)));
-        }))
-        .is_ok();
+        let _ = go_rx.recv_timeout(WATCH);
+        let deadline = std::time::Instant::now() + WATCH;
+        let mut worked = true;
+        while worked && std::time::Instant::now() < deadline {
+            worked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handle.block_on(tokio::time::sleep(Duration::from_millis(5)));
+            }))
+            .is_ok();
+            if leak {
+                // One clean sleep after the leak is the whole claim; a few
+                // more show it holds without running for the full watch.
+                std::thread::sleep(Duration::from_millis(20));
+                if deadline.saturating_duration_since(std::time::Instant::now())
+                    < WATCH - Duration::from_millis(200)
+                {
+                    break;
+                }
+            }
+        }
         let _ = done_tx.send(worked);
     });
+    let _ = go_tx.send(());
     if leak {
         std::mem::forget(runtime);
-        let _ = go_tx.send(());
     } else {
-        // The drop shuts the drivers down, then waits for the blocking pool;
-        // the task is released only once the drivers are already gone.
-        let release = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(200));
-            let _ = go_tx.send(());
-        });
+        // The drop shuts the drivers down, then waits for the blocking pool,
+        // so the task's retries see the shutdown before the drop returns.
         drop(runtime);
-        let _ = release.join();
     }
     done_rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(WATCH * 2)
         .expect("the blocking task reports")
 }
 

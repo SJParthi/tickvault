@@ -15730,9 +15730,10 @@ fn shutdown_requested() -> bool {
 /// was cancelled at once and logged "frame drain DIED". Nothing was lost,
 /// but every stop in that window read as a crash.
 ///
-/// This runs the drain's own shutdown tail on a drain that saw no frames, in
-/// the same order (pinned against `run_frame_drain` by
-/// `close_lane_before_dial_mirrors_the_drain_shutdown_tail`): seal what the
+/// This runs the drain's own shutdown arm and tail on a drain that saw no
+/// frames, in the same order (pinned against `run_frame_drain` by
+/// `close_lane_before_dial_mirrors_the_drain_shutdown_tail`): the catch-up
+/// seal and a flush, as the drain's shutdown arm does, then seal what the
 /// exit time allows, flush, flush depth, close every writer queue, join the
 /// writers against one deadline, persist the applied watermark. The replay's
 /// held bars were already released by `finish_wal_replay`. Cold path, once.
@@ -15740,6 +15741,20 @@ fn close_lane_before_dial(
     ingest: &mut LiveIngest,
     feed_health: &tickvault_common::feed_health::FeedHealthRegistry,
 ) {
+    // The drain's shutdown arm.
+    let (arm_emitted, arm_dropped) = ingest.catch_up_seal();
+    flush_and_record(ingest, feed_health);
+    flush_depth(ingest.depth_sink());
+    if arm_dropped > 0 {
+        error!(
+            code = ErrorCode::WsGapConnectionState.code_str(),
+            emitted = arm_emitted,
+            dropped = arm_dropped,
+            "Dhan live feed: candles were DROPPED during the shutdown seal — the \
+             seal ring could not take them and they are lost with the process"
+        );
+    }
+    // The drain's tail.
     let (close_emitted, close_dropped) = if is_mid_session_exit(now_ist_secs_of_day()) {
         ingest.seal_complete_buckets_at_mid_session_exit()
     } else {
@@ -32086,17 +32101,44 @@ mod shutdown_before_dial_tests {
         }
     }
 
+    /// The calls of the drain's shutdown ARM (the `shutdown.notified()`
+    /// branch), which run before the tail.
+    const SHUTDOWN_ARM: [&str; 3] = [
+        "ingest.catch_up_seal()",
+        "flush_and_record(",
+        "flush_depth(ingest.depth_sink())",
+    ];
+
+    /// Returns the offset just past the last call of `calls`, found in order.
+    fn assert_in_order(name: &str, body: &str, calls: &[&str]) -> usize {
+        let mut at = 0usize;
+        for call in calls {
+            let found = body[at..]
+                .find(call)
+                .unwrap_or_else(|| panic!("{name}: `{call}` missing or out of order"));
+            at += found + call.len();
+        }
+        at
+    }
+
     #[test]
     fn close_lane_before_dial_mirrors_the_drain_shutdown_tail() {
         let prod = production();
         let drain = body_of(prod, "async fn run_frame_drain(");
+        let arm = drain
+            .split_once("() = shutdown.notified() => {")
+            .expect("the drain's shutdown arm must exist")
+            .1;
+        let arm = &arm[..arm.find("break;").expect("the shutdown arm ends the loop")];
+        assert_in_order("run_frame_drain shutdown arm", arm, &SHUTDOWN_ARM);
         let drain_tail = drain
             .split_once("// Every sender was dropped, so no socket is left.")
             .expect("the drain's shutdown tail anchor must exist")
             .1;
         assert_tail_in_order("run_frame_drain", drain_tail);
         let close = body_of(prod, "fn close_lane_before_dial(");
-        assert_tail_in_order("close_lane_before_dial", close);
+        let after_arm = assert_in_order("close_lane_before_dial", close, &SHUTDOWN_ARM);
+        assert_tail_in_order("close_lane_before_dial", &close[after_arm..]);
     }
 
     #[test]
