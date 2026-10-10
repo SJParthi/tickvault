@@ -18,24 +18,42 @@
 //!
 //! QuestDB 9.3.5 refuses `UPDATE … FROM` on WAL tables ("UPDATE statements
 //! with join are not supported yet for WAL tables", checked against a local
-//! 9.3.5 on 2026-10-10). So, per day and per table:
+//! 9.3.5 on 2026-10-10). So, per day:
 //!
-//! 1. the day's names go into [`CONTRACT_NAME_REPAIR_MAP_TABLE`], one row per
-//!    `(security_id, segment)` (multi-row `INSERT … VALUES`, batched);
-//! 2. the repair waits until that table's WAL has applied those inserts;
-//! 3. one `INSERT INTO t (every column) SELECT …, m.contract, … FROM t JOIN
+//! 1. every table is checked first (DEDUP and WAL on, `contract` present and
+//!    not a DEDUP key column, at least one blank `dhan` row that day). A day
+//!    with no blank row anywhere loads nothing;
+//! 2. the day's names go into [`CONTRACT_NAME_REPAIR_MAP_TABLE`], a small
+//!    table without WAL, dropped and created fresh, so the rows are readable as soon as
+//!    the insert answers;
+//! 3. per table, the repair waits until QuestDB has applied every write to it
+//!    and no new write has arrived for [`TABLE_QUIET_POLL_SECS`]. A row still
+//!    waiting in the WAL is invisible to a SELECT, and re-inserting the stored
+//!    copy would put older values back over it;
+//! 4. one `INSERT INTO t (every column) SELECT …, m.contract, … FROM t JOIN
 //!    map …  WHERE contract IS NULL` re-inserts each blank row with its name.
 //!    Every other column is copied by the database itself, so no value passes
 //!    through this process, and the table's DEDUP key replaces the blank row
-//!    in place. A table without DEDUP is never touched: the same statement
-//!    would duplicate its rows.
+//!    in place.
 //!
 //! One statement per table per day keeps the out-of-order merge to one per
 //! partition. Only rows of feed `dhan` with a NULL name and an id the day's
-//! own files name are touched; an id no file names stays NULL, as the writer
-//! itself would leave it. `market_depth` is NOT repaired: its day partition
-//! holds about 1.5 billion rows, and rewriting the blank share of it is not
-//! worth the disk churn on a volume that was at 98% on 9 Oct.
+//! own files name are touched. The files name more contracts than the live
+//! name table holds (it stops at 25,000), so a row the live writer left blank
+//! past that cap is named too, with the same name. `market_depth` is NOT
+//! repaired: its day partition holds about 1.5 billion rows, and rewriting the
+//! blank share of it is not worth the disk churn on a volume that was at 98%
+//! on 9 Oct.
+//!
+//! ## Honest limits
+//!
+//! - A writer that starts while a repair statement runs (a boot replay, a
+//!   spill drain) can have its newer copy of a row replaced by the stored copy
+//!   the statement read. The quiet check makes this a window of one statement,
+//!   not a certainty; it is not closed.
+//! - The repair rewrites each touched partition (copy-on-write). If the
+//!   disk-pressure archive drops a partition while a statement runs, the
+//!   statement can leave only the repaired rows in it.
 //!
 //! Cold path: runs from the app's once-a-day after-close task, never on the
 //! frame drain.
@@ -45,19 +63,16 @@ use std::time::Duration;
 use reqwest::Client;
 use tracing::{info, warn};
 
-/// The per-day name table the repair joins against. Small: one row per named
-/// instrument per repaired day (about 26,000).
+/// The name table the repair joins against: one row per named instrument of
+/// the day being repaired (about 122,000), created fresh for each day and dropped after it.
+/// No WAL and no partitions, so an insert is readable as soon as it answers.
+/// Not market data and not an audit record.
 pub const CONTRACT_NAME_REPAIR_MAP_TABLE: &str = "contract_name_repair_map";
-
-/// DEDUP key of [`CONTRACT_NAME_REPAIR_MAP_TABLE`]: a re-run of the same day
-/// replaces each name in place instead of adding a second row, which would
-/// make the join emit every blank row twice.
-pub const DEDUP_KEY_CONTRACT_NAME_REPAIR_MAP: &str = "ts, security_id, segment, feed";
 
 /// The only feed whose rows are repaired; every live writer stamps it.
 pub const CONTRACT_NAME_REPAIR_FEED: &str = "dhan";
 
-/// Name rows per `INSERT … VALUES`. A row is about 70 characters, so 200 keep
+/// Name rows per `INSERT … VALUES`. A row is about 50 characters, so 200 keep
 /// the URL-encoded statement near 20 KB, well under QuestDB's default 64 KB
 /// request header buffer (`http.request.header.buffer.size`; `/exec` takes
 /// GET only, so the statement travels in the URL).
@@ -67,12 +82,13 @@ pub const CONTRACT_NAME_REPAIR_MAP_BATCH_ROWS: usize = 200;
 /// rows and the select runs inside the request.
 pub const CONTRACT_NAME_REPAIR_REQUEST_TIMEOUT_SECS: u64 = 600;
 
-/// How long the repair waits for the name table's WAL to apply its inserts
-/// before giving up on the day.
-pub const CONTRACT_NAME_REPAIR_APPLY_WAIT_SECS: u64 = 600;
+/// How long the repair waits for a table to be applied and quiet before it
+/// gives up on that table for this run.
+pub const CONTRACT_NAME_REPAIR_QUIET_WAIT_SECS: u64 = 600;
 
-/// Poll interval while waiting for the name table to apply.
-const APPLY_POLL_SECS: u64 = 5;
+/// Spacing of the WAL polls while waiting. A table is quiet when two polls
+/// this far apart read the same committed transaction and it is applied.
+pub const TABLE_QUIET_POLL_SECS: u64 = 30;
 
 /// One name to put back: the row identity and the name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,10 +110,16 @@ pub struct RepairDayTally {
     pub tables_repaired: u32,
     /// Tables with no blank row the day's names cover.
     pub tables_clean: u32,
-    /// Tables skipped: absent, no DEDUP, not WAL, or missing a needed column.
+    /// Tables skipped: absent, no DEDUP, not WAL, missing a needed column, or
+    /// `contract` is a DEDUP key column.
     pub tables_skipped: u32,
-    /// Statements QuestDB refused or that did not answer.
+    /// Statements QuestDB refused or that did not answer, or a table that was
+    /// never applied and quiet in time. A day with a failure is tried again.
     pub failures: u32,
+    /// Names left out because the live writers would store them differently
+    /// (a character [`tickvault_common::sanitize::sanitize_ilp_symbol`]
+    /// strips, or too long).
+    pub names_refused: u32,
 }
 
 /// `true` when `day` is exactly `YYYY-MM-DD` in ASCII digits. Every SQL string
@@ -119,6 +141,19 @@ pub fn is_plain_identifier(name: &str) -> bool {
     !name.is_empty() && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
 }
 
+/// `true` when every live writer stores `name` exactly as given. The tick and
+/// aux writers pass it through `sanitize_ilp_symbol`, the candle writer does
+/// not; a name that function would change is refused so the repair never
+/// writes a different spelling from the one the live path writes.
+#[must_use]
+pub fn name_is_stored_verbatim(name: &str) -> bool {
+    !name.is_empty()
+        && matches!(
+            tickvault_common::sanitize::sanitize_ilp_symbol(name),
+            std::borrow::Cow::Borrowed(_)
+        )
+}
+
 /// A SQL string literal: single quotes doubled.
 fn sql_string(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
@@ -133,21 +168,30 @@ fn sql_string(value: &str) -> String {
     out
 }
 
-/// CREATE statement for [`CONTRACT_NAME_REPAIR_MAP_TABLE`].
+/// CREATE statement for [`CONTRACT_NAME_REPAIR_MAP_TABLE`]. With no designated
+/// timestamp QuestDB makes it unpartitioned and without WAL (and refuses
+/// `BYPASS WAL` on it; both checked on 9.3.5, 2026-10-10). Run right after [`map_drop_sql`], so
+/// the table is built fresh for each day and a column change here can never
+/// meet an older copy of the table (no self-heal needed).
 #[must_use]
 pub fn map_table_ddl() -> String {
     format!(
-        "CREATE TABLE IF NOT EXISTS {CONTRACT_NAME_REPAIR_MAP_TABLE} (\
-         ts TIMESTAMP, feed SYMBOL, segment SYMBOL, security_id LONG, contract SYMBOL\
-         ) timestamp(ts) PARTITION BY DAY WAL \
-         DEDUP UPSERT KEYS({DEDUP_KEY_CONTRACT_NAME_REPAIR_MAP})"
+        "CREATE TABLE {CONTRACT_NAME_REPAIR_MAP_TABLE} (\
+         security_id LONG, segment SYMBOL, contract VARCHAR\
+         )"
     )
 }
 
-/// One multi-row insert of `rows` for `day` (caller has validated the day).
-/// `None` for an empty batch.
+/// Drops [`CONTRACT_NAME_REPAIR_MAP_TABLE`], the scratch table and nothing
+/// else; it holds only names copied from the day's contract files.
 #[must_use]
-pub fn map_insert_sql(day: &str, rows: &[NameRow<'_>]) -> Option<String> {
+pub fn map_drop_sql() -> String {
+    format!("DROP TABLE IF EXISTS {CONTRACT_NAME_REPAIR_MAP_TABLE}")
+}
+
+/// One multi-row insert of `rows`. `None` for an empty batch.
+#[must_use]
+pub fn map_insert_sql(rows: &[NameRow<'_>]) -> Option<String> {
     if rows.is_empty() {
         return None;
     }
@@ -157,22 +201,19 @@ pub fn map_insert_sql(day: &str, rows: &[NameRow<'_>]) -> Option<String> {
             sql.push_str(", ");
         }
         sql.push_str(&format!(
-            "('{day}T00:00:00.000000Z', '{CONTRACT_NAME_REPAIR_FEED}', {}, {}, {})",
-            sql_string(row.segment),
+            "({}, {}, {})",
             row.security_id,
+            sql_string(row.segment),
             sql_string(row.contract)
         ));
     }
     Some(sql)
 }
 
-/// The WAL progress of the name table: applied txn, committed txn, suspended.
+/// The WAL progress of `table`: applied txn, committed txn, suspended.
 #[must_use]
-pub fn map_wal_progress_sql() -> String {
-    format!(
-        "SELECT writerTxn, sequencerTxn, suspended FROM wal_tables() \
-         WHERE name = '{CONTRACT_NAME_REPAIR_MAP_TABLE}'"
-    )
+pub fn wal_progress_sql(table: &str) -> String {
+    format!("SELECT writerTxn, sequencerTxn, suspended FROM wal_tables() WHERE name = '{table}'")
 }
 
 /// Whether `table` exists with DEDUP and WAL on.
@@ -181,19 +222,28 @@ pub fn table_flags_sql(table: &str) -> String {
     format!("SELECT dedup, walEnabled FROM tables() WHERE table_name = '{table}'")
 }
 
-/// The column names of `table`, in table order.
+/// The column names of `table`, in table order, and whether each is a DEDUP
+/// key column.
 #[must_use]
 pub fn table_columns_sql(table: &str) -> String {
-    format!("SELECT \"column\" FROM table_columns('{table}')")
+    format!("SELECT \"column\", upsertKey FROM table_columns('{table}')")
+}
+
+/// How many `dhan` rows of `day` in `table` carry no name, with no join: the
+/// cheap check that decides whether the day needs the name table at all.
+#[must_use]
+pub fn blank_count_sql(table: &str, day: &str) -> String {
+    format!(
+        "SELECT count() FROM {table} WHERE ts IN '{day}' AND contract IS NULL \
+         AND feed = '{CONTRACT_NAME_REPAIR_FEED}'"
+    )
 }
 
 /// The `FROM … JOIN … WHERE …` both the count and the repair share: every
-/// `dhan` row of `day` with a NULL name whose id the day's names cover.
+/// `dhan` row of `day` with a NULL name whose id the name table covers.
 fn blank_named_rows_source(table: &str, day: &str) -> String {
     format!(
-        "FROM {table} c JOIN (SELECT security_id, segment, contract \
-         FROM {CONTRACT_NAME_REPAIR_MAP_TABLE} \
-         WHERE ts IN '{day}' AND feed = '{CONTRACT_NAME_REPAIR_FEED}') m \
+        "FROM {table} c JOIN {CONTRACT_NAME_REPAIR_MAP_TABLE} m \
          ON c.security_id = m.security_id AND c.segment = m.segment \
          WHERE c.ts IN '{day}' AND c.contract IS NULL AND c.feed = '{CONTRACT_NAME_REPAIR_FEED}'"
     )
@@ -205,27 +255,41 @@ pub fn blank_named_count_sql(table: &str, day: &str) -> String {
     format!("SELECT count() {}", blank_named_rows_source(table, day))
 }
 
+/// One column of a target table, from [`table_columns_sql`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableColumn {
+    /// The column name.
+    pub name: String,
+    /// Whether the column is part of the table's DEDUP key.
+    pub upsert_key: bool,
+}
+
 /// The repair statement: re-insert every blank row with its name, copying
 /// every other column as stored. `None` when a column the join needs is
-/// missing or a column name is not a plain identifier.
+/// missing, a column name is not a plain identifier, or `contract` is a DEDUP
+/// key column (re-inserting with a new name would then add a row, not
+/// replace one).
 #[must_use]
-pub fn repair_insert_sql(table: &str, day: &str, columns: &[String]) -> Option<String> {
+pub fn repair_insert_sql(table: &str, day: &str, columns: &[TableColumn]) -> Option<String> {
     for needed in ["ts", "feed", "segment", "security_id", "contract"] {
-        if !columns.iter().any(|c| c == needed) {
+        if !columns.iter().any(|c| c.name == needed) {
             return None;
         }
     }
-    if !columns.iter().all(|c| is_plain_identifier(c)) {
+    if columns.iter().any(|c| c.name == "contract" && c.upsert_key) {
         return None;
     }
-    let target: Vec<String> = columns.iter().map(|c| format!("\"{c}\"")).collect();
+    if !columns.iter().all(|c| is_plain_identifier(&c.name)) {
+        return None;
+    }
+    let target: Vec<String> = columns.iter().map(|c| format!("\"{}\"", c.name)).collect();
     let source: Vec<String> = columns
         .iter()
         .map(|c| {
-            if c == "contract" {
+            if c.name == "contract" {
                 "m.contract".to_string()
             } else {
-                format!("c.\"{c}\"")
+                format!("c.\"{}\"", c.name)
             }
         })
         .collect();
@@ -249,16 +313,31 @@ pub fn parse_single_long(body: &str) -> Option<i64> {
     dataset(body)?.first()?.as_array()?.first()?.as_i64()
 }
 
-/// `(dedup, walEnabled)` from [`table_flags_sql`]; `None` when the table does
-/// not exist or the answer does not parse.
-#[must_use]
-pub fn parse_table_flags(body: &str) -> Option<(bool, bool)> {
-    let rows = dataset(body)?;
-    let row = rows.first()?.as_array()?;
-    Some((row.first()?.as_bool()?, row.get(1)?.as_bool()?))
+/// What [`table_flags_sql`] said about a table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableFlags {
+    /// The answer listed no such table.
+    Absent,
+    /// The table exists; `(dedup, wal)`.
+    Present(bool, bool),
 }
 
-/// `(writerTxn, sequencerTxn, suspended)` from [`map_wal_progress_sql`].
+/// Reads a [`table_flags_sql`] answer. `None` when it does not parse, which
+/// the caller counts as a failure, never as an absent table.
+#[must_use]
+pub fn parse_table_flags(body: &str) -> Option<TableFlags> {
+    let rows = dataset(body)?;
+    let Some(first) = rows.first() else {
+        return Some(TableFlags::Absent);
+    };
+    let row = first.as_array()?;
+    Some(TableFlags::Present(
+        row.first()?.as_bool()?,
+        row.get(1)?.as_bool()?,
+    ))
+}
+
+/// `(writerTxn, sequencerTxn, suspended)` from [`wal_progress_sql`].
 #[must_use]
 pub fn parse_wal_progress(body: &str) -> Option<(i64, i64, bool)> {
     let rows = dataset(body)?;
@@ -270,14 +349,27 @@ pub fn parse_wal_progress(body: &str) -> Option<(i64, i64, bool)> {
     ))
 }
 
-/// Column names from [`table_columns_sql`]; `None` when empty or unparseable.
+/// Columns from [`table_columns_sql`]; `None` when empty or unparseable.
 #[must_use]
-pub fn parse_column_names(body: &str) -> Option<Vec<String>> {
-    let names: Option<Vec<String>> = dataset(body)?
+pub fn parse_columns(body: &str) -> Option<Vec<TableColumn>> {
+    let columns: Option<Vec<TableColumn>> = dataset(body)?
         .iter()
-        .map(|row| Some(row.as_array()?.first()?.as_str()?.to_string()))
+        .map(|row| {
+            let row = row.as_array()?;
+            Some(TableColumn {
+                name: row.first()?.as_str()?.to_string(),
+                upsert_key: row.get(1)?.as_bool()?,
+            })
+        })
         .collect();
-    names.filter(|n| !n.is_empty())
+    columns.filter(|c| !c.is_empty())
+}
+
+/// `true` once a table is applied and quiet: everything committed is applied
+/// and the committed transaction has not moved since the previous poll.
+#[must_use]
+pub fn table_is_quiet(applied: i64, committed: i64, previous_committed: Option<i64>) -> bool {
+    applied >= committed && previous_committed == Some(committed)
 }
 
 /// `true` when QuestDB answered with an `error` field.
@@ -310,68 +402,84 @@ async fn exec(client: &Client, exec_url: &str, sql: &str) -> Option<String> {
     }
 }
 
-/// Load `names` into the name table for `day` and wait until QuestDB has
-/// applied them. `false` when any step fails; the day is then left for the
-/// next run.
-async fn load_names(client: &Client, exec_url: &str, day: &str, names: &[NameRow<'_>]) -> bool {
+/// Empty the name table and load `names` into it. `false` when any step
+/// fails; the day is then left for the next run.
+async fn load_names(client: &Client, exec_url: &str, names: &[NameRow<'_>]) -> bool {
+    if exec(client, exec_url, &map_drop_sql()).await.is_none() {
+        return false;
+    }
     if exec(client, exec_url, &map_table_ddl()).await.is_none() {
         return false;
     }
     for batch in names.chunks(CONTRACT_NAME_REPAIR_MAP_BATCH_ROWS) {
-        let Some(sql) = map_insert_sql(day, batch) else {
+        let Some(sql) = map_insert_sql(batch) else {
             continue;
         };
         if exec(client, exec_url, &sql).await.is_none() {
             return false;
         }
     }
+    true
+}
+
+/// Wait until `table` is applied and quiet (see [`table_is_quiet`]). `false`
+/// when it is suspended or not quiet within
+/// [`CONTRACT_NAME_REPAIR_QUIET_WAIT_SECS`].
+async fn wait_until_quiet(client: &Client, exec_url: &str, table: &str) -> bool {
     let deadline =
-        tokio::time::Instant::now() + Duration::from_secs(CONTRACT_NAME_REPAIR_APPLY_WAIT_SECS);
-    let mut target: Option<i64> = None;
+        tokio::time::Instant::now() + Duration::from_secs(CONTRACT_NAME_REPAIR_QUIET_WAIT_SECS);
+    let mut previous: Option<i64> = None;
     loop {
-        let progress = exec(client, exec_url, &map_wal_progress_sql())
+        let progress = exec(client, exec_url, &wal_progress_sql(table))
             .await
             .and_then(|b| parse_wal_progress(&b));
-        if let Some((applied, committed, suspended)) = progress {
-            if suspended {
+        match progress {
+            Some((_, _, true)) => {
                 warn!(
-                    table = CONTRACT_NAME_REPAIR_MAP_TABLE,
-                    "contract name repair: name table WAL is suspended, day left for the next run"
+                    table,
+                    "contract name repair: table WAL is suspended, table left for the next run"
                 );
                 return false;
             }
-            // The committed txn read after the inserts includes them.
-            let goal = *target.get_or_insert(committed);
-            if applied >= goal {
-                return true;
+            Some((applied, committed, false)) => {
+                if table_is_quiet(applied, committed, previous) {
+                    return true;
+                }
+                previous = Some(committed);
             }
+            None => previous = None,
         }
         if tokio::time::Instant::now() >= deadline {
             warn!(
-                day,
-                wait_secs = CONTRACT_NAME_REPAIR_APPLY_WAIT_SECS,
-                "contract name repair: name table not applied in time, day left for the next run"
+                table,
+                wait_secs = CONTRACT_NAME_REPAIR_QUIET_WAIT_SECS,
+                "contract name repair: table still being written, left for the next run"
             );
             return false;
         }
-        tokio::time::sleep(Duration::from_secs(APPLY_POLL_SECS)).await;
+        tokio::time::sleep(Duration::from_secs(TABLE_QUIET_POLL_SECS)).await;
     }
 }
 
-/// Repair one table for one day. Adds to `tally`.
-async fn repair_table(
+/// Check one table for `day`. `Some(repair statement)` when it has blank rows
+/// to look at; `None` when it is clean, skipped or failed (already tallied).
+async fn survey_table(
     client: &Client,
     exec_url: &str,
     table: &str,
     day: &str,
     tally: &mut RepairDayTally,
-) {
-    let flags = exec(client, exec_url, &table_flags_sql(table))
+) -> Option<String> {
+    let Some(flags) = exec(client, exec_url, &table_flags_sql(table))
         .await
-        .and_then(|b| parse_table_flags(&b));
+        .and_then(|b| parse_table_flags(&b))
+    else {
+        tally.failures += 1;
+        return None;
+    };
     match flags {
-        Some((true, true)) => {}
-        Some((dedup, wal)) => {
+        TableFlags::Present(true, true) => {}
+        TableFlags::Present(dedup, wal) => {
             warn!(
                 table,
                 dedup,
@@ -379,40 +487,86 @@ async fn repair_table(
                 "contract name repair: table skipped, a re-insert without DEDUP would duplicate rows"
             );
             tally.tables_skipped += 1;
-            return;
+            return None;
         }
-        None => {
+        TableFlags::Absent => {
             tally.tables_skipped += 1;
-            return;
+            return None;
         }
     }
     let Some(columns) = exec(client, exec_url, &table_columns_sql(table))
         .await
-        .and_then(|b| parse_column_names(&b))
+        .and_then(|b| parse_columns(&b))
     else {
         tally.failures += 1;
-        return;
+        return None;
     };
     let Some(repair_sql) = repair_insert_sql(table, day, &columns) else {
+        warn!(
+            table,
+            "contract name repair: table skipped, a needed column is missing or `contract` is a DEDUP key"
+        );
         tally.tables_skipped += 1;
-        return;
+        return None;
     };
-    let Some(blank) = exec(client, exec_url, &blank_named_count_sql(table, day))
+    let Some(blank) = exec(client, exec_url, &blank_count_sql(table, day))
+        .await
+        .and_then(|b| parse_single_long(&b))
+    else {
+        tally.failures += 1;
+        return None;
+    };
+    if blank <= 0 {
+        tally.tables_clean += 1;
+        return None;
+    }
+    Some(repair_sql)
+}
+
+/// Repair one surveyed table for `day` against the loaded name table.
+async fn repair_table(
+    client: &Client,
+    exec_url: &str,
+    table: &str,
+    day: &str,
+    repair_sql: &str,
+    tally: &mut RepairDayTally,
+) {
+    // Count first: a table whose blank rows the names do not cover needs no
+    // quiet wait at all.
+    let count_sql = blank_named_count_sql(table, day);
+    let Some(named) = exec(client, exec_url, &count_sql)
         .await
         .and_then(|b| parse_single_long(&b))
     else {
         tally.failures += 1;
         return;
     };
-    if blank <= 0 {
+    if named <= 0 {
         tally.tables_clean += 1;
         return;
     }
-    if exec(client, exec_url, &repair_sql).await.is_none() {
+    if !wait_until_quiet(client, exec_url, table).await {
         tally.failures += 1;
         return;
     }
-    let rows = u64::try_from(blank).unwrap_or(0);
+    // Count again on the quiet table, so the tally matches what is written.
+    let Some(named) = exec(client, exec_url, &count_sql)
+        .await
+        .and_then(|b| parse_single_long(&b))
+    else {
+        tally.failures += 1;
+        return;
+    };
+    if named <= 0 {
+        tally.tables_clean += 1;
+        return;
+    }
+    if exec(client, exec_url, repair_sql).await.is_none() {
+        tally.failures += 1;
+        return;
+    }
+    let rows = u64::try_from(named).unwrap_or(0);
     tally.tables_repaired += 1;
     tally.rows_restored = tally.rows_restored.saturating_add(rows);
     metrics::counter!("tv_contract_name_repair_rows_total").increment(rows);
@@ -428,7 +582,8 @@ async fn repair_table(
 /// at least [`CONTRACT_NAME_REPAIR_REQUEST_TIMEOUT_SECS`]. Only `dhan` rows
 /// with a NULL `contract` whose `(security_id, segment)` is in `names` change.
 ///
-/// O(names / batch) inserts plus a few statements per table; cold path.
+/// O(tables) checks, then, only when a table has a blank row, O(names / batch)
+/// inserts plus a few statements per such table; cold path.
 pub async fn repair_contract_names_for_day(
     client: &Client,
     exec_url: &str,
@@ -440,17 +595,34 @@ pub async fn repair_contract_names_for_day(
     if !is_valid_day(day) || names.is_empty() {
         return tally;
     }
-    if !load_names(client, exec_url, day, names).await {
-        tally.failures += 1;
-        return tally;
-    }
+    let mut todo: Vec<(&str, String)> = Vec::new();
     for table in tables {
         if !is_plain_identifier(table) {
             tally.tables_skipped += 1;
             continue;
         }
-        repair_table(client, exec_url, table, day, &mut tally).await;
+        if let Some(sql) = survey_table(client, exec_url, table, day, &mut tally).await {
+            todo.push((table, sql));
+        }
     }
+    if todo.is_empty() {
+        return tally;
+    }
+    let kept: Vec<NameRow<'_>> = names
+        .iter()
+        .filter(|n| name_is_stored_verbatim(n.contract))
+        .copied()
+        .collect();
+    tally.names_refused = u32::try_from(names.len() - kept.len()).unwrap_or(u32::MAX);
+    if !load_names(client, exec_url, &kept).await {
+        tally.failures += 1;
+        return tally;
+    }
+    for (table, sql) in &todo {
+        repair_table(client, exec_url, table, day, sql, &mut tally).await;
+    }
+    // Best effort: the next day's load drops it first anyway.
+    let _ = exec(client, exec_url, &map_drop_sql()).await;
     tally
 }
 
@@ -458,8 +630,14 @@ pub async fn repair_contract_names_for_day(
 mod tests {
     use super::*;
 
-    fn cols(names: &[&str]) -> Vec<String> {
-        names.iter().map(|s| (*s).to_string()).collect()
+    fn cols(names: &[&str]) -> Vec<TableColumn> {
+        names
+            .iter()
+            .map(|s| TableColumn {
+                name: (*s).to_string(),
+                upsert_key: matches!(*s, "ts" | "feed" | "segment" | "security_id"),
+            })
+            .collect()
     }
 
     #[test]
@@ -480,7 +658,15 @@ mod tests {
     }
 
     #[test]
-    fn test_map_insert_sql_escapes_quotes_and_stamps_the_day() {
+    fn test_name_is_stored_verbatim_refuses_what_the_tick_writer_would_change() {
+        assert!(name_is_stored_verbatim("ITC-27Oct2026-255-CE"));
+        assert!(!name_is_stored_verbatim("A,B"));
+        assert!(!name_is_stored_verbatim("A=B"));
+        assert!(!name_is_stored_verbatim(""));
+    }
+
+    #[test]
+    fn test_map_insert_sql_escapes_quotes() {
         let rows = [
             NameRow {
                 security_id: 85650,
@@ -493,13 +679,11 @@ mod tests {
                 contract: "O'NEIL",
             },
         ];
-        let sql = map_insert_sql("2026-10-09", &rows).expect("non-empty");
+        let sql = map_insert_sql(&rows).expect("non-empty");
         assert!(sql.starts_with("INSERT INTO contract_name_repair_map VALUES "));
-        assert!(sql.contains(
-            "('2026-10-09T00:00:00.000000Z', 'dhan', 'NSE_FNO', 85650, 'ITC-27Oct2026-255-CE')"
-        ));
+        assert!(sql.contains("(85650, 'NSE_FNO', 'ITC-27Oct2026-255-CE')"));
         assert!(sql.contains("'O''NEIL'"));
-        assert!(map_insert_sql("2026-10-09", &[]).is_none());
+        assert!(map_insert_sql(&[]).is_none());
     }
 
     #[test]
@@ -511,7 +695,7 @@ mod tests {
                 contract: "BANKNIFTY-28Oct2026-123456-CE",
             })
             .collect();
-        let sql = map_insert_sql("2026-10-09", &rows).expect("non-empty");
+        let sql = map_insert_sql(&rows).expect("non-empty");
         // Worst-case URL encoding triples a byte; the buffer is 64 KiB.
         assert!(
             sql.len() * 3 < 64 * 1024,
@@ -521,12 +705,20 @@ mod tests {
     }
 
     #[test]
-    fn test_map_table_ddl_has_dedup_with_feed() {
+    fn test_map_table_ddl_and_map_drop_sql_build_a_fresh_table_without_wal() {
         let ddl = map_table_ddl();
-        assert!(ddl.contains("WAL"));
-        assert!(ddl.contains("DEDUP UPSERT KEYS(ts, security_id, segment, feed)"));
-        assert!(DEDUP_KEY_CONTRACT_NAME_REPAIR_MAP.contains("segment"));
-        assert!(DEDUP_KEY_CONTRACT_NAME_REPAIR_MAP.contains("feed"));
+        assert!(
+            !ddl.contains("timestamp("),
+            "a designated timestamp would make it WAL"
+        );
+        assert!(ddl.contains("contract VARCHAR"));
+        assert!(!ddl.contains("PARTITION BY"));
+        assert!(ddl.starts_with("CREATE TABLE contract_name_repair_map ("));
+        // The drop names the scratch table and nothing else.
+        assert_eq!(
+            map_drop_sql(),
+            "DROP TABLE IF EXISTS contract_name_repair_map"
+        );
     }
 
     #[test]
@@ -548,21 +740,18 @@ mod tests {
         assert!(sql.contains("c.contract IS NULL"));
         assert!(sql.contains("c.feed = 'dhan'"));
         assert!(sql.contains("c.ts IN '2026-10-09'"));
-        assert!(sql.contains("WHERE ts IN '2026-10-09' AND feed = 'dhan'"));
         assert!(sql.contains("ON c.security_id = m.security_id AND c.segment = m.segment"));
     }
 
     #[test]
     fn test_repair_insert_sql_refuses_a_table_missing_a_join_column() {
         for missing in ["ts", "feed", "segment", "security_id", "contract"] {
-            let columns: Vec<String> =
-                ["ts", "feed", "segment", "security_id", "contract", "close"]
-                    .iter()
-                    .filter(|c| **c != missing)
-                    .map(|c| (*c).to_string())
-                    .collect();
+            let names: Vec<&str> = ["ts", "feed", "segment", "security_id", "contract", "close"]
+                .into_iter()
+                .filter(|c| *c != missing)
+                .collect();
             assert!(
-                repair_insert_sql("t", "2026-10-09", &columns).is_none(),
+                repair_insert_sql("t", "2026-10-09", &cols(&names)).is_none(),
                 "{missing}"
             );
         }
@@ -578,6 +767,17 @@ mod tests {
     }
 
     #[test]
+    fn test_repair_insert_sql_refuses_a_table_keyed_on_contract() {
+        let mut columns = cols(&["ts", "feed", "segment", "security_id", "contract"]);
+        for c in &mut columns {
+            if c.name == "contract" {
+                c.upsert_key = true;
+            }
+        }
+        assert!(repair_insert_sql("t", "2026-10-09", &columns).is_none());
+    }
+
+    #[test]
     fn test_count_and_repair_share_one_row_source() {
         let count = blank_named_count_sql("ticks", "2026-10-09");
         let repair = repair_insert_sql(
@@ -590,6 +790,25 @@ mod tests {
         assert!(count.ends_with(&source));
         assert!(repair.ends_with(&source));
     }
+
+    #[test]
+    fn test_blank_count_sql_needs_no_join() {
+        let sql = blank_count_sql("candles_1m", "2026-10-09");
+        assert_eq!(
+            sql,
+            "SELECT count() FROM candles_1m WHERE ts IN '2026-10-09' AND contract IS NULL \
+             AND feed = 'dhan'"
+        );
+    }
+
+    #[test]
+    fn test_table_is_quiet_needs_applied_and_two_equal_polls() {
+        assert!(!table_is_quiet(10, 10, None));
+        assert!(table_is_quiet(10, 10, Some(10)));
+        assert!(!table_is_quiet(9, 10, Some(10)));
+        assert!(!table_is_quiet(11, 11, Some(10)));
+    }
+
     #[test]
     fn test_parse_single_long_reads_a_count() {
         let count = r#"{"query":"x","columns":[{"name":"count()","type":"LONG"}],"dataset":[[42]],"count":1}"#;
@@ -599,10 +818,17 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_table_flags_reads_dedup_and_wal() {
+    fn test_parse_table_flags_tells_absent_from_unreadable() {
         let flags = r#"{"columns":[],"dataset":[[true,false]],"count":1}"#;
-        assert_eq!(parse_table_flags(flags), Some((true, false)));
-        assert_eq!(parse_table_flags(r#"{"dataset":[],"count":0}"#), None);
+        assert_eq!(
+            parse_table_flags(flags),
+            Some(TableFlags::Present(true, false))
+        );
+        assert_eq!(
+            parse_table_flags(r#"{"dataset":[],"count":0}"#),
+            Some(TableFlags::Absent)
+        );
+        assert_eq!(parse_table_flags("not json"), None);
     }
 
     #[test]
@@ -613,13 +839,15 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_column_names_reads_names_in_order() {
-        let columns = r#"{"dataset":[["ts"],["feed"],["contract"]],"count":3}"#;
-        assert_eq!(
-            parse_column_names(columns),
-            Some(cols(&["ts", "feed", "contract"]))
-        );
-        assert_eq!(parse_column_names(r#"{"dataset":[],"count":0}"#), None);
+    fn test_parse_columns_reads_names_and_keys_in_order() {
+        let columns = r#"{"dataset":[["ts",true],["feed",true],["contract",false]],"count":3}"#;
+        let parsed = parse_columns(columns).expect("parses");
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].name, "ts");
+        assert!(parsed[0].upsert_key);
+        assert_eq!(parsed[2].name, "contract");
+        assert!(!parsed[2].upsert_key);
+        assert_eq!(parse_columns(r#"{"dataset":[],"count":0}"#), None);
     }
 
     #[test]
@@ -639,16 +867,16 @@ mod tests {
     }
 
     #[test]
-    fn test_table_columns_sql_names_the_table() {
+    fn test_table_columns_sql_reads_names_and_keys() {
         assert_eq!(
             table_columns_sql("ticks"),
-            "SELECT \"column\" FROM table_columns('ticks')"
+            "SELECT \"column\", upsertKey FROM table_columns('ticks')"
         );
     }
 
     #[test]
-    fn test_map_wal_progress_sql_reads_the_name_table() {
-        assert!(map_wal_progress_sql().contains("name = 'contract_name_repair_map'"));
+    fn test_wal_progress_sql_names_the_table() {
+        assert!(wal_progress_sql("candles_1m").contains("name = 'candles_1m'"));
     }
 
     #[test]
@@ -675,5 +903,27 @@ mod tests {
         assert_eq!(tally, RepairDayTally::default());
         let tally = repair_contract_names_for_day(&client, url, "2026-10-09", &[], &["t"]).await;
         assert_eq!(tally, RepairDayTally::default());
+    }
+
+    #[tokio::test]
+    async fn test_an_unreachable_database_is_a_failure_not_a_skip() {
+        // Regression (review 2026-10-10): an unanswered tables() check was
+        // counted as skipped, so an outage ended the run "ok".
+        let client = Client::new();
+        let names = [NameRow {
+            security_id: 1,
+            segment: "NSE_FNO",
+            contract: "X",
+        }];
+        let tally = repair_contract_names_for_day(
+            &client,
+            "http://127.0.0.1:9/exec",
+            "2026-10-09",
+            &names,
+            &["candles_1m"],
+        )
+        .await;
+        assert_eq!(tally.failures, 1);
+        assert_eq!(tally.tables_skipped, 0);
     }
 }
