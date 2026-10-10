@@ -284,6 +284,105 @@ pub fn parse_wal_tables_response(
     Ok((out, skipped))
 }
 
+/// The query [`fetch_wal_tables`] sends.
+const WAL_TABLES_PROBE_SQL: &str = "select * from wal_tables()";
+
+/// Reads `wal_tables()` once through `/exec` and returns every row, parsed by
+/// [`parse_wal_tables_response`].
+///
+/// Errors when the probe cannot produce a usable answer, INCLUDING a partial
+/// one: a row that failed to parse is a table whose suspension and apply
+/// state are unknown, and both callers must fail closed on that (the
+/// partition archive keeps the partition; the 1-minute cross-check's
+/// readiness wait reads `NotReported`). Moved here unchanged from
+/// `partition_archive` (plan item 51d) so the two share one implementation.
+///
+/// # Complexity
+/// One HTTP round trip, then O(tables) to parse. Cold.
+pub async fn fetch_wal_tables(
+    client: &reqwest::Client,
+    exec_url: &str,
+) -> anyhow::Result<Vec<WalTableRow>> {
+    use anyhow::Context as _;
+    let response = client
+        .get(exec_url)
+        .query(&[("query", WAL_TABLES_PROBE_SQL)])
+        .send()
+        .await
+        .context("wal_tables() probe request failed")?;
+    if !response.status().is_success() {
+        anyhow::bail!("wal_tables() probe returned {}", response.status());
+    }
+    let body = crate::partition_archive::read_body_capped(response).await?;
+    let value: Value =
+        serde_json::from_str(&body).context("wal_tables() probe body is not JSON")?;
+    let (rows, skipped) = parse_wal_tables_response(&value)
+        .map_err(|f| anyhow::anyhow!("wal_tables() probe parse failed: {}", f.as_str()))?;
+    // Fail CLOSED on a partial view. This set decides which tables the
+    // archiver must leave alone; a row that failed to parse is a table
+    // whose suspension state is UNKNOWN, and treating unknown as
+    // not-suspended would let the archiver detach partitions from a table
+    // that is silently not applying rows. Refusing the run is recoverable;
+    // archiving a suspended table is not.
+    if skipped > 0 {
+        anyhow::bail!(
+            "wal_tables() probe skipped {skipped} unparseable row(s) -- the \
+             suspended-table set is incomplete, refusing to archive on it"
+        );
+    }
+    Ok(rows)
+}
+
+/// Whether one table's WAL has applied every transaction up to a target, as
+/// [`wal_applied_through`] reads it (plan item 51d).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppliedThrough {
+    /// Not suspended, and `writerTxn` is at or past the target.
+    Reached,
+    /// Not suspended, and `writerTxn` is still below the target.
+    Behind {
+        /// The table's `writerTxn`.
+        writer_txn: i64,
+        /// The target it has not reached.
+        target_txn: i64,
+    },
+    /// The table's WAL apply is suspended.
+    Suspended,
+    /// The table is absent from the rows.
+    NotReported,
+    /// The table is present but `writerTxn` is missing.
+    TxnUnreadable,
+}
+
+/// Whether `table` has applied its WAL through `target_txn` (plan item 51d).
+///
+/// Applied THROUGH a target, not `writerTxn == sequencerTxn`: a reader takes
+/// the target from one snapshot's `sequencerTxn` and then waits for the
+/// writer to pass it, so new writes after the snapshot cannot keep it waiting
+/// forever. The archive's exact-equality gate (`wal_apply_verdict`) is
+/// unchanged. Pure.
+///
+/// # Complexity
+/// O(tables). O(1) EXEMPT: a linear scan of the `wal_tables()` rows, about 30
+/// in production, once per readiness poll (every 5 s at most), cold.
+#[must_use]
+pub fn wal_applied_through(rows: &[WalTableRow], table: &str, target_txn: i64) -> AppliedThrough {
+    let Some(row) = rows.iter().find(|r| r.name == table) else {
+        return AppliedThrough::NotReported;
+    };
+    if row.suspended {
+        return AppliedThrough::Suspended;
+    }
+    match row.writer_txn {
+        None => AppliedThrough::TxnUnreadable,
+        Some(writer_txn) if writer_txn >= target_txn => AppliedThrough::Reached,
+        Some(writer_txn) => AppliedThrough::Behind {
+            writer_txn,
+            target_txn,
+        },
+    }
+}
+
 /// What one observation of the current `wal_tables()` rows changed,
 /// relative to the tracker's latched episode set.
 #[derive(Debug, Clone, PartialEq)]
@@ -2396,5 +2495,61 @@ mod tests {
             "supervisor must keep running, not exit after spawning the watcher"
         );
         handle.abort();
+    }
+
+    /// Plan item 51d: applied THROUGH a target, not equal to the sequencer.
+    #[test]
+    fn test_wal_applied_through_reads_the_writer_against_a_target() {
+        let rows = vec![lag_row("candles_1m", 20, 12), row("ticks", true)];
+        assert_eq!(
+            wal_applied_through(&rows, "candles_1m", 12),
+            AppliedThrough::Reached
+        );
+        assert_eq!(
+            wal_applied_through(&rows, "candles_1m", 11),
+            AppliedThrough::Reached
+        );
+        assert_eq!(
+            wal_applied_through(&rows, "candles_1m", 13),
+            AppliedThrough::Behind {
+                writer_txn: 12,
+                target_txn: 13
+            }
+        );
+        assert_eq!(
+            wal_applied_through(&rows, "ticks", 0),
+            AppliedThrough::Suspended
+        );
+        assert_eq!(
+            wal_applied_through(&rows, "candles_5m", 0),
+            AppliedThrough::NotReported
+        );
+        let unreadable = vec![row("candles_1m", false)];
+        assert_eq!(
+            wal_applied_through(&unreadable, "candles_1m", 0),
+            AppliedThrough::TxnUnreadable
+        );
+        assert_eq!(
+            wal_applied_through(&[], "candles_1m", 0),
+            AppliedThrough::NotReported
+        );
+    }
+
+    /// Plan item 51d: the archiver and the readiness wait share one probe,
+    /// and it still fails closed on a row it could not parse.
+    #[test]
+    fn test_fetch_wal_tables_is_shared_and_fails_closed_on_a_skipped_row() {
+        let src = include_str!("wal_suspension_watcher.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        let body = prod
+            .split("pub async fn fetch_wal_tables(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap_or("");
+        assert!(body.contains("if skipped > 0 {"));
+        assert!(body.contains("anyhow::bail!("));
+        assert!(body.contains("read_body_capped(response)"));
+        let archive = include_str!("partition_archive.rs");
+        assert!(archive.contains("wal_suspension_watcher::fetch_wal_tables("));
     }
 }

@@ -2543,3 +2543,73 @@ the alarms, their filters, or the hold ceiling.
   replaces the window with the published seal progress.
 
 **What a PR that violates §12.15.9 looks like (REJECT):** a literal count of excused end-of-session minutes, or a late window not derived from the catch-up margin; letting `rest_incomplete` (a failed fetch or the budget) hide a judged missing minute or a price divergence; an excused or unjudged minute that leaves the day `clean`; any input that turns a `diverged` day into anything else, a later attempt included (a reader rule that lets a newer non-`diverged` row outrank a `diverged` one); excusing a minute under `Strict`; excusing a minute missing before a later live bar of the same instrument; changing `is_catastrophic_divergence` or any page under cover of this section; dropping the `tail_unsealed` column or kind; dropping `attempt_at` or `run_complete`, reading `attempt_at` more than once per attempt, or putting either in a DEDUP key; a new alarm, filter or page source for these findings without its own dated row in the noise lock.
+
+### §12.15.10 — 2026-10-06: the check reads our candles only once they are sealed and saved
+
+**The verbatim owner approvals (2026-10-06, typed directly in-session — preserve EXACTLY, typos included):**
+
+> "Go ahead with whatever you want dude"
+
+> "See do everything whatever is recommended dude okay?"
+
+Given in direct response to the recommended cross-verification hardening list
+(plan ITEM 51, `.claude/plans/active-plan-feed-hardening.md`). This section is
+sub-item **51d** and is recorded HERE before the code ships, per the
+rule-file-first law. It changes WHEN an attempt reads `candles_1m` and how it
+judges the end-of-session minutes. It does not change when the check fires,
+what it fetches from the vendor, the marker rule (§12.15.7), the time bounds
+(§12.15.8), the verdict rules (§12.15.9), the divergence page, the alarms,
+their filters, or the hold ceiling.
+
+**The gap (Verified by reading the code at `164f11aee`, recorded in §12.15.9's
+Honest limits).** The read ran at the fire time whatever the live side's
+state. A bar the fold had sealed but that was still queued for the seal
+writer, staged in a spill file after a QuestDB outage, or ACKed but not yet
+applied by QuestDB's WAL read as a judged `missing_live`, anywhere in the day,
+and the day read `diverged` for a minute that was never lost. The excused
+end-of-session window was the derived constant, not the day's real seal
+progress.
+
+| Aspect | Locked value |
+|---|---|
+| Live-final instant | `LIVE_FINAL_SECS_OF_DAY_IST` = close + `CATCHUP_LATENESS_MARGIN_SECS` + `CATCHUP_SEAL_INTERVAL_SECS` = **15:44:05** today. Compile-time asserted after the run instant, inside the token wait, and at or after the close plus `MEASURED_MAX_DELIVERY_LAG_SECS` |
+| Published seal progress | `dhan_feed_stack::CATCHUP_PROGRESS`, one `AtomicU64`: the floor cutoff of the last COMPLETED catch-up sweep (fold seconds) and the UTC second it completed. One Release store per completed sweep, never per tick |
+| Barrier 1: drained | the seal writer's last drain (`seal_writer_loop::last_seal_drained_unix_secs`) is STRICTLY after the reference sweep (the first sweep that reached the latest floor, never earlier than the live-final instant); then no seal spill file for today is staged (`seal_spill::staged_production_spill_records_for_day`). A parked replay file reads as its own reason (`seal_writer_task::parked_replay_files`); a folder that cannot be listed reads as pending (fail closed) |
+| Barrier 2: applied | after barrier 1, ONE snapshot of `candles_1m`'s `sequencerTxn` from `wal_tables()` (shared `wal_suspension_watcher::fetch_wal_tables`), then `writerTxn` at or past it. An error or timeout reads not applied. A new floor value re-arms both barriers |
+| Completeness | `Final`: a sweep completed at or after the live-final instant with a floor at or past the close. Decided at the deadline otherwise: `Frozen { t }` when the floor stayed below the close and unchanged since the first sweep after the live-final instant; `Moving { t }` when it moved; `Unknown` with no sweep of today after the live-final instant |
+| The wait | runs beside the token wait (`tokio::join!`) under the same bound (`TOKEN_WAIT_POLL_SECS × TOKEN_WAIT_MAX_POLLS` = 300 s, capped at the attempt deadline), so an attempt's longest duration is unchanged. Sleeps until the live-final instant, then samples every `READINESS_POLL_SECS` (5 s). A day that is no longer today reads final and applied |
+| Read plan (not the last attempt) | not applied or seals pending → retry with its reason, no vendor call, no persist, no marker, no page; `Final` → `Strict`; `Frozen { t }` → excuse after `t`; `Moving` → retry `live_not_final`; `Unknown` → `Strict`, and if a traded or index minute is missing in the late window, keep only the vendor tape and retry `live_not_final` (no daily row, no findings, no marker; a price divergence still pages) |
+| Read plan (the last attempt) | never retries. Not ready → read with missing-minute judging OFF (`missing_judgeable` = `not_ready_seals_pending` / `not_ready_seal_spill_parked` / `not_ready_not_applied`), prices still judged, and an uncoded-page `warn!` `xverify_unsettled_final`; `Final` → `Strict`; `Frozen` or `Moving { t }` → excuse after `t`; `Unknown` → judging off (`not_ready_completeness_unknown`) |
+| Excuse after `t` | `LateWindowPolicy::excuse_after(t)` clamps `t` into `[close − LATE_SEAL_WINDOW_MINUTES, close]`: a floor frozen before the derived window is an outage to judge, never a bucket waiting to seal. This bounds the `t` §12.15.9 left unbounded |
+| Option pass (§12.15.6) | reads with the spot attempt's last readiness: not ready → skipped (`tv_dhan_xverify_option_pass_total{outcome="skipped_not_ready"}`, `info!`); `Final` → `Strict`; `Frozen` or `Moving { t }` → excuse after `t`; `Unknown` → the derived window. Run alone, it waits itself, at most 300 s |
+| Retry reasons | `AttemptFailure` gains `live_not_final`, `live_not_applied`, `seals_pending`, `seal_spill_parked`, counted on `tv_dhan_xverify_retries_total{reason}` and logged as the uncoded-page `warn!` `xverify_attempt_not_ready`. A day whose last attempt still fails pages `xverify_failed` as before |
+| Persistence | the daily row's `missing_judgeable` gains the four `not_ready_*` values. No new column, no DEDUP change |
+| Page, alarms, marker, S3 | unchanged. No new alarm, filter, page source or EMF name |
+
+**Behaviour changes, recorded (Verified by reading the code; the size of each is Unknown until the daily table is queried).**
+- The first attempt reads no earlier than 15:44:05 IST, not 15:41.
+- A day whose bars were still queued, spilled or unapplied at 15:41 no longer
+  reads `diverged`: the attempt retries, or on the last attempt reads with
+  missing-minute judging off (`partial` at best).
+- A minute after the instrument's last live minute and after the day's real
+  seal floor is excused only up to that floor, so a day whose seal reached
+  the close judges 15:35 to 15:39 strictly.
+
+**⚠ Honest limits (Rule 11).**
+- A frozen floor below the close still excuses the minutes after it: the day
+  reads `partial`, never `clean`, and a real loss there is not judged.
+- The spill check counts every staged seal spill record for the day, not
+  only `candles_1m`'s, and the seal DLQ is not checked: a seal sent to the DLQ
+  is not in `candles_1m` and its minute still reads as a judged
+  `missing_live`.
+- The parked-file count is process-wide; one replay runs in production.
+- A live row the read skips as malformed still reads as a judged
+  `missing_live` (§12.15.9).
+- With no seal writer running (lane off), every attempt reads seals pending
+  and the last one reads with judging off.
+- `candles_1m`'s apply lag is not measured; a QuestDB that never applies
+  through the snapshot within 300 s makes every attempt retry until the last.
+- On the tape-only retry, the `measured` runs counter has already counted the
+  attempt.
+
+**What a PR that violates §12.15.10 looks like (REJECT):** reading `candles_1m` before the live-final instant; a drained check that accepts the same second as the reference sweep; skipping the spill, parked-file or WAL barrier, or failing open when one cannot be read; judging missing minutes on the last attempt while the live side is not ready; retrying on the last attempt; an excuse floor outside `[close − LATE_SEAL_WINDOW_MINUTES, close]`; writing a daily row, findings or the marker on the tape-only retry; letting the readiness wait lengthen an attempt past its deadline; publishing seal progress from the per-tick path; a new alarm, filter or page source for the readiness reasons without its own dated row in the noise lock.

@@ -1594,6 +1594,45 @@ pub struct MidSessionReplay {
     batch_offsets: Vec<u64>,
 }
 
+/// Spill files every live [`MidSessionReplay`] in this process holds parked
+/// (plan item 51d). One replay runs in production, so this is its count; the
+/// 1-minute cross-check reads it to tell a parked file from one still queued.
+/// O(1).
+static PARKED_REPLAY_FILES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Adds `delta` (+1 or -1) to [`PARKED_REPLAY_FILES`], never below zero. O(1).
+fn note_parked_replay_files(delta: isize) {
+    // The closure always returns Some, so the update cannot fail.
+    PARKED_REPLAY_FILES
+        .fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |n| Some(n.saturating_add_signed(delta)),
+        )
+        .ok();
+}
+
+/// How many spill files the mid-session replay holds parked after
+/// [`SEAL_REPLAY_STUCK_FAILURES`] failed flushes (plan item 51d). O(1).
+#[must_use]
+pub fn parked_replay_files() -> usize {
+    PARKED_REPLAY_FILES.load(std::sync::atomic::Ordering::Acquire)
+}
+
+impl Drop for MidSessionReplay {
+    /// A replay that goes away takes its parked files out of the count. O(1).
+    fn drop(&mut self) {
+        let parked = self.parked.len();
+        PARKED_REPLAY_FILES
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |n| Some(n.saturating_sub(parked)),
+            )
+            .ok();
+    }
+}
+
 impl MidSessionReplay {
     /// Feed one live drain outcome into the health gate.
     ///
@@ -1752,6 +1791,7 @@ impl MidSessionReplay {
             let cursor = match self.parked.iter().position(|p| p.cursor.path == path) {
                 Some(at) => {
                     let mut cursor = self.parked.swap_remove(at).cursor;
+                    note_parked_replay_files(-1);
                     cursor.failures_at_offset = 0;
                     info!(
                         ?path,
@@ -2096,6 +2136,7 @@ impl MidSessionReplay {
                 cursor,
                 retry_at: now_unix_secs.saturating_add(SEAL_REPLAY_PARK_SECS),
             });
+            note_parked_replay_files(1);
             self.last_scan = None;
             outcome.files_parked += 1;
         }
@@ -3729,13 +3770,14 @@ mod tests {
 
     #[test]
     fn observe_probe_rewinds_the_file_being_read_and_every_parked_file_on_suspicion() {
-        let mut replay = MidSessionReplay {
-            cursor: Some(ReplayCursor {
-                offset: 4 * SEAL_SPILL_RECORD_SIZE as u64,
-                ..ReplayCursor::new(PathBuf::from("a.bin"))
-            }),
-            ..MidSessionReplay::default()
-        };
+        // Field assignment, not struct update: `MidSessionReplay` has a
+        // `Drop` (plan item 51d), so its fields cannot be moved out of a
+        // default value.
+        let mut replay = MidSessionReplay::default();
+        replay.cursor = Some(ReplayCursor {
+            offset: 4 * SEAL_SPILL_RECORD_SIZE as u64,
+            ..ReplayCursor::new(PathBuf::from("a.bin"))
+        });
         replay.parked.push(ParkedFile {
             cursor: ReplayCursor {
                 offset: 9 * SEAL_SPILL_RECORD_SIZE as u64,
@@ -4841,5 +4883,44 @@ mod tests {
         assert_eq!(count_bin(&spill.join(SEAL_REFUSED_SUBDIR)), 1);
         assert_eq!(count_bin(&spill.join(SEAL_ARCHIVE_SUBDIR)), 0);
         cleanup(&spill, &dlq);
+    }
+
+    /// Plan item 51d: the parked-file count the readiness wait reads moves
+    /// with every park and unpark in production, and a dropped replay gives
+    /// its parked files back.
+    #[test]
+    fn test_parked_replay_files_counts_every_park_and_unpark() {
+        let src = include_str!("seal_writer_task.rs");
+        let prod = src.split("\nmod tests {").next().unwrap_or(src);
+        assert_eq!(prod.matches("self.parked.push(").count(), 1);
+        assert_eq!(prod.matches("note_parked_replay_files(1);").count(), 1);
+        let park = prod.find("self.parked.push(").expect("park");
+        let noted = prod.find("note_parked_replay_files(1);").expect("noted");
+        assert!(
+            park < noted && noted - park < 400,
+            "noted right after the park"
+        );
+        assert_eq!(prod.matches("self.parked.swap_remove(").count(), 1);
+        let unpark = prod.find("self.parked.swap_remove(").expect("unpark");
+        let unnoted = prod.find("note_parked_replay_files(-1);").expect("unnoted");
+        assert!(unpark < unnoted && unnoted - unpark < 200);
+        for removal in [
+            ".parked.remove(",
+            ".parked.retain(",
+            ".parked.clear(",
+            ".parked.pop(",
+        ] {
+            assert!(
+                !prod.contains(removal),
+                "{removal} must also move the count"
+            );
+        }
+        let drop = prod
+            .split("impl Drop for MidSessionReplay {")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap_or("");
+        assert!(drop.contains("self.parked.len()"));
+        assert!(drop.contains("saturating_sub(parked)"));
     }
 }

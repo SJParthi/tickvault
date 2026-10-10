@@ -88,7 +88,7 @@ use crate::shadow_candle_writer::ShadowCandleWriter;
 /// Production spill directory, derived through the public `SealSpillWriter`
 /// API so this module never duplicates the path literal (a drifted copy
 /// would silently recover from the wrong directory — i.e. recover nothing).
-fn production_spill_dir() -> std::path::PathBuf {
+pub(crate) fn production_spill_dir() -> std::path::PathBuf {
     SealSpillWriter::new()
         .spill_path(0)
         .parent()

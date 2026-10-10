@@ -148,6 +148,36 @@ const _: () = assert!(
     "the run must be stamped after the last minute it compares"
 );
 
+/// When the live side can first be final (§12.15.10, plan item 51d): the
+/// close, plus the catch-up lateness margin a quiet bucket waits for, plus one
+/// catch-up sweep interval. 15:44:05 IST today.
+///
+/// A quiet instrument's last session bucket seals only when the catch-up
+/// cutoff (`min(watermark, wall)` minus the margin) passes the close, and the
+/// sweep that seals it runs every interval. The readiness wait sleeps until
+/// this instant before it samples the published catch-up progress.
+pub const LIVE_FINAL_SECS_OF_DAY_IST: i64 = SESSION_CLOSE_SECS_OF_DAY_IST
+    + crate::dhan_feed_stack::CATCHUP_LATENESS_MARGIN_SECS as i64
+    + crate::dhan_feed_stack::CATCHUP_SEAL_INTERVAL_SECS as i64;
+
+const _: () = assert!(
+    LIVE_FINAL_SECS_OF_DAY_IST > RUN_SECS_OF_DAY_IST,
+    "the live side cannot be final before the run fires"
+);
+const _: () = assert!(
+    LIVE_FINAL_SECS_OF_DAY_IST
+        <= RUN_SECS_OF_DAY_IST
+            + crate::dhan_live_crossverify_boot::TOKEN_WAIT_POLL_SECS as i64
+                * crate::dhan_live_crossverify_boot::TOKEN_WAIT_MAX_POLLS as i64,
+    "the readiness wait must fit inside the token wait that starts at the run"
+);
+const _: () = assert!(
+    LIVE_FINAL_SECS_OF_DAY_IST
+        >= SESSION_CLOSE_SECS_OF_DAY_IST
+            + crate::dhan_feed_stack::MEASURED_MAX_DELIVERY_LAG_SECS as i64,
+    "the live side cannot be final before the slowest measured delivery lands"
+);
+
 /// How many trailing session minutes a read may find not yet sealed on the
 /// LIVE side: the end-of-session window the [`LateWindowPolicy::Excuse`]
 /// policy may excuse.
@@ -216,10 +246,60 @@ pub enum LateWindowPolicy {
 }
 
 impl LateWindowPolicy {
-    /// The production policy until plan item 51d publishes the real seal
-    /// progress: excuse the derived window.
+    /// Excuse the derived window. The production policy until plan item 51d;
+    /// since then used only when no seal progress is known and the policy
+    /// does not matter (tests, and the comparator's own defaults).
     pub const DERIVED_WINDOW: Self = Self::Excuse {
         sealed_through_secs_of_day: None,
+    };
+
+    /// The policy for a live side whose catch-up seal stopped below the
+    /// close at `sealed_through_secs_of_day` (§12.15.10, plan item 51d).
+    ///
+    /// Clamped to `[close - LATE_SEAL_WINDOW_MINUTES, close]`. Never earlier:
+    /// a seal frozen before the derived window means the feed's trade stamps
+    /// stopped before the close, which is an outage to judge, not a bucket
+    /// still waiting to seal, so the minutes before the window stay strict.
+    /// Never later than the close, which excuses nothing. Pure, O(1).
+    #[must_use]
+    pub const fn excuse_after(sealed_through_secs_of_day: i64) -> Self {
+        let earliest = SESSION_CLOSE_SECS_OF_DAY_IST - LATE_SEAL_WINDOW_MINUTES * SECS_PER_MINUTE;
+        let clamped = if sealed_through_secs_of_day < earliest {
+            earliest
+        } else if sealed_through_secs_of_day > SESSION_CLOSE_SECS_OF_DAY_IST {
+            SESSION_CLOSE_SECS_OF_DAY_IST
+        } else {
+            sealed_through_secs_of_day
+        };
+        Self::Excuse {
+            sealed_through_secs_of_day: Some(clamped),
+        }
+    }
+}
+
+/// How an attempt reads the live side, decided by the readiness wait before
+/// the read (§12.15.10, plan item 51d).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadPolicy {
+    /// Which end-of-session minutes are excused.
+    pub late: LateWindowPolicy,
+    /// `Some` only on the day's last attempt with the live side not known
+    /// final: missing minutes are then not judged at all.
+    pub not_ready:
+        Option<tickvault_storage::dhan_live_crossverify_persistence::DhanLiveXverifyNotReady>,
+}
+
+impl ReadPolicy {
+    /// The live side is known final: nothing excused, everything judged.
+    pub const STRICT: Self = Self {
+        late: LateWindowPolicy::Strict,
+        not_ready: None,
+    };
+
+    /// The derived window, everything judged (tests).
+    pub const DERIVED_WINDOW: Self = Self {
+        late: LateWindowPolicy::DERIVED_WINDOW,
+        not_ready: None,
     };
 }
 
@@ -245,26 +325,27 @@ pub struct VerdictInputs {
 /// `ORDER BY ts ASC LIMIT`, so the cap cuts the END of the day and every
 /// minute after the cut would otherwise read as lost.
 ///
-/// It is the one such input this run can detect, not the only one that can
-/// fake a missing live minute: until plan item 51d, a sealed bar not yet
-/// readable at the read (queued, spilled, or not yet applied by QuestDB's
-/// WAL) and a live row [`parse_live_dataset`] skips as malformed each read as
-/// a judged missing minute anywhere in the day, and the day reads `diverged`
-/// (§12.15.9 Honest limits).
+/// Since plan item 51d (§12.15.10) the readiness wait decides `read` before
+/// the read: the late window from the published seal progress, and, on the
+/// day's last attempt with the live side not known final, a `not_ready`
+/// reason that turns judging off and wins over a truncated read. A live row
+/// [`parse_live_dataset`] skips as malformed still reads as a judged missing
+/// minute (§12.15.9 Honest limits).
 #[must_use]
 pub fn verdict_inputs_for_run(
     budget_elapsed: bool,
     rest_failures: usize,
     live_truncated: bool,
+    read: ReadPolicy,
 ) -> VerdictInputs {
     VerdictInputs {
         rest_incomplete: budget_elapsed || rest_failures > 0,
-        missing: if live_truncated {
-            MissingJudgeable::LiveTruncated
-        } else {
-            MissingJudgeable::Judged
+        missing: match read.not_ready {
+            Some(reason) => MissingJudgeable::NotReady(reason),
+            None if live_truncated => MissingJudgeable::LiveTruncated,
+            None => MissingJudgeable::Judged,
         },
-        late: LateWindowPolicy::DERIVED_WINDOW,
+        late: read.late,
     }
 }
 
@@ -2156,6 +2237,7 @@ pub fn fetched_at_ist_nanos_now() -> i64 {
 /// # Errors
 /// Only when the LIVE read fails outright — in that case there is nothing to
 /// compare against and the caller stamps the day `degraded`.
+#[allow(clippy::too_many_arguments)] // APPROVED: cold once-a-day entry with two callers; a params struct would only relocate the arity.
 pub async fn run_cross_verification(
     client: &reqwest::Client,
     questdb_exec_url: &str,
@@ -2165,6 +2247,7 @@ pub async fn run_cross_verification(
     trading_date: chrono::NaiveDate,
     day_start_ist_nanos: i64,
     cfg: &DhanLiveCrossverifyConfig,
+    read: ReadPolicy,
 ) -> Result<RunReport, String> {
     let started = std::time::Instant::now();
     let budget = std::time::Duration::from_secs(cfg.run_budget_secs);
@@ -2279,10 +2362,11 @@ pub async fn run_cross_verification(
     let degraded = truncated || budget_elapsed || rest_failures > 0;
     // §12.15.9: a failed fetch or a spent budget only keeps the day from
     // reading `clean`; a truncated live read alone turns missing-minute
-    // judging off. Neither can hide a real finding. Until 51d, a bar not yet
-    // readable or a row skipped as malformed (`live_malformed`) still reads as
-    // a judged missing minute (§12.15.9 Honest limits).
-    let inputs = verdict_inputs_for_run(budget_elapsed, rest_failures, truncated);
+    // judging off. Neither can hide a real finding. `read` comes from the
+    // readiness wait (§12.15.10); a row skipped as malformed
+    // (`live_malformed`) still reads as a judged missing minute (§12.15.9
+    // Honest limits).
+    let inputs = verdict_inputs_for_run(budget_elapsed, rest_failures, truncated, read);
     let run_ts = deterministic_run_ts_nanos(day_start_ist_nanos);
     // The scope set: exactly what this run ASKED the vendor for. A live
     // instrument outside it was never requested, so calling its minutes
@@ -2381,6 +2465,86 @@ mod tests {
             rest_incomplete,
             missing: MissingJudgeable::Judged,
             late: LateWindowPolicy::Strict,
+        }
+    }
+
+    /// Every read policy the readiness wait can hand a run (§12.15.10).
+    fn read_policies() -> Vec<ReadPolicy> {
+        use tickvault_storage::dhan_live_crossverify_persistence::DhanLiveXverifyNotReady as N;
+        let mut out = vec![
+            ReadPolicy::STRICT,
+            ReadPolicy::DERIVED_WINDOW,
+            ReadPolicy {
+                late: LateWindowPolicy::excuse_after(SESSION_CLOSE_SECS_OF_DAY_IST - 241),
+                not_ready: None,
+            },
+        ];
+        for reason in [
+            N::SealsPending,
+            N::SealSpillParked,
+            N::NotApplied,
+            N::CompletenessUnknown,
+        ] {
+            out.push(ReadPolicy {
+                late: LateWindowPolicy::Strict,
+                not_ready: Some(reason),
+            });
+        }
+        out
+    }
+
+    /// 51d (§12.15.10): the readiness instant is derived, never a literal.
+    #[test]
+    fn live_final_secs_is_derived_from_close_margin_and_sweep_interval() {
+        assert_eq!(
+            LIVE_FINAL_SECS_OF_DAY_IST,
+            SESSION_CLOSE_SECS_OF_DAY_IST
+                + i64::from(crate::dhan_feed_stack::CATCHUP_LATENESS_MARGIN_SECS)
+                + crate::dhan_feed_stack::CATCHUP_SEAL_INTERVAL_SECS as i64
+        );
+        assert_eq!(
+            LIVE_FINAL_SECS_OF_DAY_IST,
+            15 * 3600 + 44 * 60 + 5,
+            "15:44:05 today"
+        );
+        assert!(
+            LIVE_FINAL_SECS_OF_DAY_IST
+                >= SESSION_CLOSE_SECS_OF_DAY_IST
+                    + i64::from(crate::dhan_feed_stack::MEASURED_MAX_DELIVERY_LAG_SECS)
+        );
+    }
+
+    /// 51d (§12.15.10): a frozen seal is clamped into the derived window, so
+    /// a seal stopped early never excuses a minute before 15:35, and a seal at
+    /// or past the close excuses nothing.
+    #[test]
+    fn excuse_after_clamps_the_sealed_through_into_the_late_window() {
+        let close = SESSION_CLOSE_SECS_OF_DAY_IST;
+        let earliest = close - LATE_SEAL_WINDOW_MINUTES * 60;
+        for st in (SESSION_OPEN_SECS_OF_DAY_IST - 60)..=(close + 120) {
+            let LateWindowPolicy::Excuse {
+                sealed_through_secs_of_day: Some(got),
+            } = LateWindowPolicy::excuse_after(st)
+            else {
+                panic!("excuse_after always excuses with a known bound");
+            };
+            assert_eq!(got, st.clamp(earliest, close), "sealed_through {st}");
+            // No bucket before the derived window is ever excused.
+            for s in (SESSION_OPEN_SECS_OF_DAY_IST..earliest).step_by(60) {
+                assert!(!is_late_window_minute(
+                    minute(s),
+                    DAY_START_NANOS,
+                    Some(got)
+                ));
+            }
+        }
+        // At or past the close, nothing is excused.
+        for s in (SESSION_OPEN_SECS_OF_DAY_IST..close).step_by(60) {
+            assert!(!is_late_window_minute(
+                minute(s),
+                DAY_START_NANOS,
+                Some(close)
+            ));
         }
     }
 
@@ -4640,13 +4804,21 @@ mod tests {
         // A traded minute missing from our side, mid-session.
         let rest_lost = vec![eq_bar(1, OPEN, 500), eq_bar(1, OPEN + 600, 300)];
         for rest in [&rest_diff, &rest_lost] {
-            let cmp = unscoped(&live, rest, verdict_inputs_for_run(false, 1, false));
+            let cmp = unscoped(
+                &live,
+                rest,
+                verdict_inputs_for_run(false, 1, false, ReadPolicy::DERIVED_WINDOW),
+            );
             assert_eq!(
                 cmp.outcome,
                 DhanLiveXverifyOutcome::Diverged,
                 "a failed fetch must not hide a real finding"
             );
-            let cmp = unscoped(&live, rest, verdict_inputs_for_run(true, 0, false));
+            let cmp = unscoped(
+                &live,
+                rest,
+                verdict_inputs_for_run(true, 0, false, ReadPolicy::DERIVED_WINDOW),
+            );
             assert_eq!(
                 cmp.outcome,
                 DhanLiveXverifyOutcome::Diverged,
@@ -4660,14 +4832,19 @@ mod tests {
         let live = vec![eq_bar(1, OPEN, 500)];
         let rest = vec![eq_bar(1, OPEN, 500)];
         assert_eq!(
-            unscoped(&live, &rest, verdict_inputs_for_run(false, 0, false)).outcome,
+            unscoped(
+                &live,
+                &rest,
+                verdict_inputs_for_run(false, 0, false, ReadPolicy::DERIVED_WINDOW)
+            )
+            .outcome,
             DhanLiveXverifyOutcome::Clean
         );
         for (budget, failures) in [(true, 0), (false, 1), (true, 868)] {
             let cmp = unscoped(
                 &live,
                 &rest,
-                verdict_inputs_for_run(budget, failures, false),
+                verdict_inputs_for_run(budget, failures, false, ReadPolicy::DERIVED_WINDOW),
             );
             assert_eq!(cmp.outcome, DhanLiveXverifyOutcome::Partial);
             assert!(!cmp.outcome.is_pass());
@@ -4702,7 +4879,8 @@ mod tests {
 
         for live in [&malformed_live, &unapplied_live] {
             for (budget, failures) in [(false, 0), (false, 1), (true, 0)] {
-                let inputs = verdict_inputs_for_run(budget, failures, truncated);
+                let inputs =
+                    verdict_inputs_for_run(budget, failures, truncated, ReadPolicy::DERIVED_WINDOW);
                 assert_eq!(inputs.missing, MissingJudgeable::Judged);
                 let cmp = unscoped(live, &rest, inputs);
                 assert_eq!(cmp.missing_live_traded, 1);
@@ -4723,7 +4901,7 @@ mod tests {
     /// sides still is.
     #[test]
     fn a_truncated_live_read_never_judges_missing_minutes_but_still_flags_price_divergence() {
-        let inputs = verdict_inputs_for_run(false, 0, true);
+        let inputs = verdict_inputs_for_run(false, 0, true, ReadPolicy::DERIVED_WINDOW);
         assert_eq!(inputs.missing, MissingJudgeable::LiveTruncated);
         let live = vec![eq_bar(1, OPEN, 500)];
         let rest = vec![
@@ -5242,17 +5420,19 @@ mod tests {
         for budget in [false, true] {
             for failures in [0usize, 1, 868] {
                 for truncated in [false, true] {
-                    let v = verdict_inputs_for_run(budget, failures, truncated);
-                    assert_eq!(v.rest_incomplete, budget || failures > 0);
-                    assert_eq!(
-                        v.missing,
-                        if truncated {
-                            MissingJudgeable::LiveTruncated
-                        } else {
-                            MissingJudgeable::Judged
-                        }
-                    );
-                    assert_eq!(v.late, LateWindowPolicy::DERIVED_WINDOW);
+                    for read in read_policies() {
+                        let v = verdict_inputs_for_run(budget, failures, truncated, read);
+                        assert_eq!(v.rest_incomplete, budget || failures > 0);
+                        // 51d: a readiness reason wins over a truncated read;
+                        // both turn judging off.
+                        let want = match read.not_ready {
+                            Some(reason) => MissingJudgeable::NotReady(reason),
+                            None if truncated => MissingJudgeable::LiveTruncated,
+                            None => MissingJudgeable::Judged,
+                        };
+                        assert_eq!(v.missing, want);
+                        assert_eq!(v.late, read.late, "the late policy passes through");
+                    }
                 }
             }
         }
@@ -5272,7 +5452,9 @@ mod tests {
             .split("pub async fn run_cross_verification")
             .nth(1)
             .expect("run_cross_verification");
-        assert!(body.contains("verdict_inputs_for_run(budget_elapsed, rest_failures, truncated)"));
+        assert!(
+            body.contains("verdict_inputs_for_run(budget_elapsed, rest_failures, truncated, read)")
+        );
     }
 
     /// A day held at `partial` only by an excused late minute must not read
@@ -5288,7 +5470,11 @@ mod tests {
         assert_eq!(cmp.outcome, DhanLiveXverifyOutcome::Partial);
         let line = format_summary_line(&cmp);
         assert!(line.contains("1 minute(s) not yet judged"), "{line}");
-        let cmp = unscoped(&live, &rest, verdict_inputs_for_run(false, 0, true));
+        let cmp = unscoped(
+            &live,
+            &rest,
+            verdict_inputs_for_run(false, 0, true, ReadPolicy::DERIVED_WINDOW),
+        );
         assert!(format_summary_line(&cmp).contains("1 minute(s) not yet judged"));
         let cmp = unscoped(&live, &rest, strict_inputs(false));
         assert_eq!(cmp.outcome, DhanLiveXverifyOutcome::Diverged);
@@ -5308,7 +5494,11 @@ mod tests {
         assert_eq!(row.missing_live_unjudged, 0);
         assert_eq!(row.missing_judgeable, MissingJudgeable::Judged);
         assert_eq!(row.tail_unsealed, 0);
-        let cmp = unscoped(&live, &rest, verdict_inputs_for_run(false, 0, true));
+        let cmp = unscoped(
+            &live,
+            &rest,
+            verdict_inputs_for_run(false, 0, true, ReadPolicy::DERIVED_WINDOW),
+        );
         let row = daily_row(&cmp, DAY_START_NANOS, RUN_TS, 0, TEST_ATTEMPT);
         assert_eq!(row.missing_live_unjudged, 1);
         assert_eq!(row.missing_judgeable, MissingJudgeable::LiveTruncated);

@@ -1743,6 +1743,9 @@ pub struct LiveIngest {
     /// Timer fires that found the previous catch-up sweep still running.
     catch_up_overruns: u64,
     catch_up_overrun_counter: metrics::Counter,
+    /// Where a completed catch-up sweep is published (plan item 51d):
+    /// [`CATCHUP_PROGRESS`] in production; a test points it at its own.
+    catch_up_progress: &'static CatchUpProgress,
     /// `true` while [`refold_wal_frames`] is re-folding a WAL backlog through
     /// this ingest. The ranking observer is SKIPPED for the duration.
     ///
@@ -2903,6 +2906,7 @@ impl LiveIngest {
             catch_up: None,
             catch_up_overruns: 0,
             catch_up_overrun_counter: metrics::counter!(CATCHUP_SEAL_OVERRUN_COUNTER),
+            catch_up_progress: &CATCHUP_PROGRESS,
             replaying_wal: false,
             top_volume: None,
         }
@@ -5204,6 +5208,7 @@ impl LiveIngest {
         }
         self.catch_up = Some(CatchUpSweep {
             cutoff,
+            floor_cutoff: cutoff,
             next_slot: 0,
             emitted: 0,
             dropped: 0,
@@ -5257,6 +5262,11 @@ impl LiveIngest {
         sweep.next_slot = next;
         if next >= self.aggregator.len() {
             self.catch_up = None;
+            // Plan item 51d: every slot has now been sealed through at least
+            // the floor. One clock read and one Release store per completed
+            // sweep (about every 5 s), never per tick, no allocation.
+            self.catch_up_progress
+                .publish(sweep.floor_cutoff, chrono::Utc::now().timestamp());
             return Some((sweep.emitted, sweep.dropped));
         }
         self.catch_up = Some(sweep);
@@ -6879,11 +6889,80 @@ pub const CATCHUP_SEAL_STEP_SLOTS: usize = 256;
 /// the slots it already visited are sealed by the next sweep.
 pub const CATCHUP_SEAL_OVERRUN_COUNTER: &str = "tv_candle_catch_up_overrun_total";
 
+/// The last COMPLETED catch-up seal sweep, for readers on other tasks (plan
+/// item 51d): the 1-minute cross-check waits on it before it reads
+/// `candles_1m`.
+///
+/// One `AtomicU64`: the high 32 bits are the sweep's floor cutoff (fold
+/// seconds, the IST wall clock as epoch seconds, the aggregator watermark's
+/// unit); the low 32 bits are the UTC unix second it finished (fits until
+/// 2106). `0` means no sweep has finished in this process. A completed sweep
+/// with floor `f` has sealed, in every slot, every bucket ending at or before
+/// `f`.
+#[derive(Debug, Default)]
+pub struct CatchUpProgress(std::sync::atomic::AtomicU64);
+
+impl CatchUpProgress {
+    /// An empty handle. O(1).
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(std::sync::atomic::AtomicU64::new(0))
+    }
+
+    /// Packs `(floor_cutoff, finished_unix_secs)`. A finish time outside
+    /// `u32` is clamped into it. Pure, O(1).
+    #[must_use]
+    pub const fn pack(floor_cutoff: u32, finished_unix_secs: i64) -> u64 {
+        let finished = if finished_unix_secs < 0 {
+            0
+        } else if finished_unix_secs > u32::MAX as i64 {
+            u32::MAX
+        } else {
+            finished_unix_secs as u32
+        };
+        ((floor_cutoff as u64) << 32) | finished as u64
+    }
+
+    /// The inverse of [`Self::pack`]; `None` for `0`. Pure, O(1).
+    #[must_use]
+    pub const fn unpack(packed: u64) -> Option<(u32, u32)> {
+        if packed == 0 {
+            None
+        } else {
+            Some(((packed >> 32) as u32, packed as u32))
+        }
+    }
+
+    /// Records a completed sweep. One Release store, O(1), no allocation.
+    pub fn publish(&self, floor_cutoff: u32, finished_unix_secs: i64) {
+        self.0.store(
+            Self::pack(floor_cutoff, finished_unix_secs),
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+
+    /// `(floor_cutoff, finished_unix_secs)` of the last completed sweep, or
+    /// `None`. One Acquire load, O(1).
+    #[must_use]
+    pub fn load(&self) -> Option<(u32, u32)> {
+        Self::unpack(self.0.load(std::sync::atomic::Ordering::Acquire))
+    }
+}
+
+/// The process's catch-up progress, written by the live ingest that owns the
+/// aggregator (plan item 51d).
+pub static CATCHUP_PROGRESS: CatchUpProgress = CatchUpProgress::new();
+
 /// A catch-up seal sweep part-way through the aggregator's slots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CatchUpSweep {
     /// Seal buckets whose exclusive end is at or before this second.
     cutoff: u32,
+    /// The cutoff this sweep STARTED with. An overrun raises `cutoff` for
+    /// the slots not yet visited, never this: the slots already visited were
+    /// judged against the older value, so only this one holds for every slot
+    /// once the sweep finishes (plan item 51d).
+    floor_cutoff: u32,
     /// The next aggregator slot to visit.
     next_slot: usize,
     /// Bars handed to the seal writer so far in this sweep.
@@ -24263,6 +24342,89 @@ mod tests {
             let _ = ingest.step_idle_work();
         }
         assert!(ingest.catch_up.is_none());
+    }
+
+    /// Plan item 51d: the packed progress round-trips, clamps the finish
+    /// time into `u32`, and reads `None` before any sweep finished.
+    #[test]
+    fn test_catch_up_progress_pack_round_trips_and_clamps() {
+        let p = CatchUpProgress::new();
+        assert_eq!(p.load(), None);
+        p.publish(1_728_056_400, 1_728_036_645);
+        assert_eq!(p.load(), Some((1_728_056_400, 1_728_036_645)));
+        p.publish(u32::MAX, i64::from(u32::MAX) + 5);
+        assert_eq!(p.load(), Some((u32::MAX, u32::MAX)));
+        p.publish(7, -3);
+        assert_eq!(p.load(), Some((7, 0)));
+        assert_eq!(
+            CatchUpProgress::unpack(CatchUpProgress::pack(1, 2)),
+            Some((1, 2))
+        );
+        assert_eq!(CatchUpProgress::unpack(0), None);
+    }
+
+    /// Plan item 51d: a sliced sweep publishes only when it has visited
+    /// every slot, with the cutoff it STARTED with: an overrun raises the
+    /// cutoff for the slots not yet visited, never the published floor.
+    #[test]
+    fn test_catch_up_progress_is_published_once_per_completed_sweep_with_its_floor() {
+        static PROGRESS: CatchUpProgress = CatchUpProgress::new();
+        let instruments = (CATCHUP_SEAL_STEP_SLOTS * 2 + 3) as u32;
+        let mut ingest = catch_up_book(instruments);
+        // Its own handle, so parallel tests do not race on the static.
+        ingest.catch_up_progress = &PROGRESS;
+        ingest.begin_catch_up_seal();
+        let started = ingest.catch_up.expect("the timer queued a sweep");
+        assert_eq!(started.floor_cutoff, started.cutoff);
+        let _ = ingest.step_idle_work();
+        assert!(ingest.catch_up.is_some(), "one step does not finish");
+        assert_eq!(PROGRESS.load(), None, "nothing is published mid-sweep");
+        // An overrun with a newer cutoff.
+        if let Some(sweep) = ingest.catch_up.as_mut() {
+            sweep.cutoff = sweep.cutoff.saturating_add(600);
+        }
+        let before = chrono::Utc::now().timestamp();
+        while ingest.idle_work_pending() {
+            let _ = ingest.step_idle_work();
+        }
+        let after = chrono::Utc::now().timestamp();
+        let (floor, done) = PROGRESS.load().expect("a finished sweep publishes");
+        assert_eq!(floor, started.cutoff, "the floor is the starting cutoff");
+        let done = i64::from(done);
+        assert!(before <= done && done <= after, "{before} {done} {after}");
+    }
+
+    /// Plan item 51d: the publish runs once per completed sweep, in the
+    /// step that ends it, and the overrun branch never touches the floor.
+    /// It is off the per-tick path.
+    #[test]
+    fn test_catch_up_progress_publish_is_off_the_per_tick_path() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let prod = src.split("#[cfg(test)]\nmod tests").next().unwrap_or("");
+        assert_eq!(
+            prod.matches("catch_up_progress\n                .publish(")
+                .count(),
+            1
+        );
+        let step = prod
+            .split("fn step_catch_up_seal(")
+            .nth(1)
+            .and_then(|s| s.split("\n    }\n").next())
+            .unwrap_or("");
+        let done = step.find("self.catch_up = None;").expect("sweep end");
+        let publish = step.find(".publish(sweep.floor_cutoff").expect("publish");
+        assert!(done < publish);
+        let begin = prod
+            .split("pub fn begin_catch_up_seal(")
+            .nth(1)
+            .and_then(|s| s.split("\n    }\n").next())
+            .unwrap_or("");
+        assert_eq!(
+            begin.matches("floor_cutoff").count(),
+            1,
+            "set only at the start"
+        );
+        assert!(begin.contains("floor_cutoff: cutoff,"));
     }
 
     /// The catch-up seal is wired into the drain loop and does not ride the

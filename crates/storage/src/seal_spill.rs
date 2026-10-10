@@ -2211,6 +2211,80 @@ pub(crate) fn is_spill_record_name(name: &str) -> bool {
     strip_copy_suffixes(name).ends_with(".bin")
 }
 
+/// Seal spill files still waiting to reach QuestDB for one IST day, as the
+/// 1-minute cross-check's readiness wait reads them (plan item 51d).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SpillStaged {
+    /// Record files for the day at the spill top level (written, not yet
+    /// staged) or in `replaying/` (staged, not yet confirmed and archived).
+    pub staged: usize,
+    /// Files the mid-session replay holds parked in this process, any day
+    /// (it keeps no per-day count).
+    pub parked: usize,
+}
+
+/// Counts the seal spill record files for `date` (IST) under `dir`: the top
+/// level and `replaying/`, never `archive/` or `refused/` (plan item 51d).
+/// The day comes from the file name (`seals_v4-YYYY-MM-DD.bin` and its
+/// renamed copies, [`is_spill_record_name`]). A missing folder is no files.
+///
+/// **Not specific to `candles_1m`:** a spill file holds sealed bars of every
+/// timeframe, so a staged 5-minute bar holds a 1-minute reader back too.
+///
+/// # Errors
+/// A folder that exists and cannot be listed.
+///
+/// # Complexity
+/// O(files in the two folders), cold: once per readiness check.
+pub fn staged_spill_records_for_day(
+    dir: &Path,
+    date: chrono::NaiveDate,
+) -> std::io::Result<SpillStaged> {
+    let want = format!(
+        "{}{}.bin",
+        crate::seal_writer_task::SEAL_FILE_PREFIX,
+        date.format("%Y-%m-%d")
+    );
+    let mut staged = 0_usize;
+    for folder in [
+        dir.to_path_buf(),
+        dir.join(crate::seal_writer_task::SEAL_REPLAYING_SUBDIR),
+    ] {
+        let entries = match std::fs::read_dir(&folder) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if is_spill_record_name(name)
+                && strip_copy_suffixes(name) == want
+                && entry.file_type().is_ok_and(|t| t.is_file())
+            {
+                staged = staged.saturating_add(1);
+            }
+        }
+    }
+    Ok(SpillStaged {
+        staged,
+        parked: crate::seal_writer_task::parked_replay_files(),
+    })
+}
+
+/// [`staged_spill_records_for_day`] over the production seal spill folder.
+///
+/// # Errors
+/// As [`staged_spill_records_for_day`].
+pub fn staged_production_spill_records_for_day(
+    date: chrono::NaiveDate,
+) -> std::io::Result<SpillStaged> {
+    staged_spill_records_for_day(&crate::seal_writer_runner::production_spill_dir(), date)
+}
+
 /// A spill record file, or a staged dead-letter copy (`seals_v4-*.ndjson`,
 /// legacy `seals-*.ndjson`, and their renamed copies), which `archive/` and
 /// `refused/` can hold: the boot drain and the replay move a staged file
@@ -2510,7 +2584,7 @@ mod tests {
         }
     }
 
-    fn temp_spill_dir(name: &str) -> PathBuf {
+    pub(super) fn temp_spill_dir(name: &str) -> PathBuf {
         let mut dir = std::env::temp_dir();
         dir.push(format!(
             "tickvault-seal-spill-test-{}-{}",
@@ -5008,6 +5082,43 @@ mod pr41c_tests {
             3 * SEAL_SPILL_RECORD_SIZE as u64
         );
         assert_eq!(writer.read_all(now).expect("read_all"), vec![a, b, c]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Plan item 51d: the readiness wait counts a day's record files at the
+    /// top level and in `replaying/`, renamed copies included, and nothing
+    /// else; a missing folder counts zero.
+    #[test]
+    fn test_staged_spill_records_for_day_counts_only_that_days_record_files() {
+        use crate::seal_writer_task::{SEAL_FILE_PREFIX, SEAL_REPLAYING_SUBDIR};
+        let dir = super::tests::temp_spill_dir("staged-for-day");
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 9).unwrap_or_default();
+        assert_eq!(
+            staged_spill_records_for_day(&dir.join("absent"), day).ok(),
+            Some(SpillStaged {
+                staged: 0,
+                parked: crate::seal_writer_task::parked_replay_files(),
+            })
+        );
+        let replaying = dir.join(SEAL_REPLAYING_SUBDIR);
+        std::fs::create_dir_all(&replaying).expect("replaying dir");
+        let name = |d: &str, suffix: &str| format!("{SEAL_FILE_PREFIX}{d}.bin{suffix}");
+        for (folder, file) in [
+            (&dir, name("2026-10-09", "")),
+            (&dir, name("2026-10-09", ".1")),
+            (&replaying, name("2026-10-09", "")),
+            (&dir, name("2026-10-08", "")),
+            (&replaying, name("2026-10-10", ".overflow")),
+            (&dir, format!("{SEAL_FILE_PREFIX}2026-10-09.tmp")),
+            (&dir, "boot-committed.summary".to_string()),
+        ] {
+            std::fs::write(folder.join(file), b"x").expect("write");
+        }
+        // A directory carrying a record name is not a file.
+        std::fs::create_dir_all(dir.join("archive").join(name("2026-10-09", ""))).expect("dir");
+        std::fs::create_dir_all(replaying.join(name("2026-10-09", ".2"))).expect("dir");
+        let got = staged_spill_records_for_day(&dir, day).expect("listable");
+        assert_eq!(got.staged, 3, "{got:?}");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

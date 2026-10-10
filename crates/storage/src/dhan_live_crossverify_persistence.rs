@@ -326,11 +326,11 @@ impl DhanLiveXverifyOutcome {
 /// `missing_rest`), so it never turns judging off. A live read cut at its row
 /// cap can: it reads `ORDER BY ts ASC LIMIT`, so the cap drops the END of the
 /// day and every minute after the cut would read as lost. That is the one
-/// input that turns judging off today; plan item 51d adds the readiness
-/// reasons. Until then a `judged` day can still count a minute as missing
-/// whose sealed bar was not yet readable at the read (queued, spilled, or not
-/// yet applied by QuestDB's WAL) or whose live row was skipped as malformed;
-/// §12.15.9 records this under its Honest limits.
+/// input this run detects at the read. Since plan item 51d (§12.15.10) the
+/// read waits until the live side is final; when the day's LAST attempt
+/// still finds it not final, judging is off with the reason
+/// (`not_ready_*`). A live row skipped as malformed still reads as a judged
+/// missing minute (§12.15.9 Honest limits).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DhanLiveXverifyMissingJudgeable {
     /// Every missing traded or index minute outside the excused window is
@@ -338,6 +338,27 @@ pub enum DhanLiveXverifyMissingJudgeable {
     Judged,
     /// The live read hit its row cap; no missing minute is judged.
     LiveTruncated,
+    /// The day's last attempt read the live side before it was known final
+    /// (plan item 51d, §12.15.10): no missing minute is judged; prices still
+    /// are.
+    NotReady(DhanLiveXverifyNotReady),
+}
+
+/// Why the live side was not known final at the read (plan item 51d,
+/// §12.15.10).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DhanLiveXverifyNotReady {
+    /// The seal writer had not drained after the last catch-up sweep, or a
+    /// seal spill file for today was still staged.
+    SealsPending,
+    /// A seal spill file the mid-session replay parked is still on disk.
+    SealSpillParked,
+    /// QuestDB had not applied `candles_1m` through the snapshot taken after
+    /// the drain, or `wal_tables()` could not be read.
+    NotApplied,
+    /// The catch-up progress could not say whether the last session buckets
+    /// were sealed.
+    CompletenessUnknown,
 }
 
 impl DhanLiveXverifyMissingJudgeable {
@@ -347,6 +368,14 @@ impl DhanLiveXverifyMissingJudgeable {
         match self {
             Self::Judged => "judged",
             Self::LiveTruncated => "live_truncated",
+            Self::NotReady(DhanLiveXverifyNotReady::SealsPending) => "not_ready_seals_pending",
+            Self::NotReady(DhanLiveXverifyNotReady::SealSpillParked) => {
+                "not_ready_seal_spill_parked"
+            }
+            Self::NotReady(DhanLiveXverifyNotReady::NotApplied) => "not_ready_not_applied",
+            Self::NotReady(DhanLiveXverifyNotReady::CompletenessUnknown) => {
+                "not_ready_completeness_unknown"
+            }
         }
     }
 
@@ -1603,6 +1632,26 @@ mod tests {
         );
         assert!(DhanLiveXverifyMissingJudgeable::Judged.is_judged());
         assert!(!DhanLiveXverifyMissingJudgeable::LiveTruncated.is_judged());
+        // 51d (§12.15.10): the readiness reasons, all unjudged.
+        for (reason, label) in [
+            (
+                DhanLiveXverifyNotReady::SealsPending,
+                "not_ready_seals_pending",
+            ),
+            (
+                DhanLiveXverifyNotReady::SealSpillParked,
+                "not_ready_seal_spill_parked",
+            ),
+            (DhanLiveXverifyNotReady::NotApplied, "not_ready_not_applied"),
+            (
+                DhanLiveXverifyNotReady::CompletenessUnknown,
+                "not_ready_completeness_unknown",
+            ),
+        ] {
+            let j = DhanLiveXverifyMissingJudgeable::NotReady(reason);
+            assert_eq!(j.as_str(), label);
+            assert!(!j.is_judged(), "{label} is never judged");
+        }
     }
 
     /// 2026-10-06 (§12.15.9 review). Every attempt of a day writes its daily

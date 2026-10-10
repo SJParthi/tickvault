@@ -31,7 +31,11 @@ use tickvault_common::trading_calendar::{TradingCalendar, ist_offset};
 use tickvault_common::types::ExchangeSegment;
 use tickvault_core::auth::token_manager::global_token_manager;
 use tickvault_core::websocket::pool_supervisor::SubscribeInstrument;
-use tickvault_storage::dhan_live_crossverify_persistence::DhanLiveXverifyAuditWriter;
+use tickvault_storage::dhan_live_crossverify_persistence::{
+    DhanLiveXverifyAuditWriter, DhanLiveXverifyNotReady,
+};
+use tickvault_storage::seal_spill::SpillStaged;
+use tickvault_storage::wal_suspension_watcher::{AppliedThrough, WalTableRow};
 use tracing::{error, info, warn};
 
 use crate::daily_task_marker::{
@@ -39,7 +43,8 @@ use crate::daily_task_marker::{
     try_write_daily_marker_keeping,
 };
 use crate::dhan_live_crossverify::{
-    AttemptStamp, DayComparison, DhanLiveCrossverifyConfig, RUN_SECS_OF_DAY_IST, RunReport,
+    AttemptStamp, DayComparison, DhanLiveCrossverifyConfig, LIVE_FINAL_SECS_OF_DAY_IST,
+    LateWindowPolicy, MissingJudgeable, RUN_SECS_OF_DAY_IST, ReadPolicy, RunReport,
     SESSION_CLOSE_SECS_OF_DAY_IST, XverifyTarget, daily_row, deterministic_run_ts_nanos,
     fetched_at_ist_nanos_now, run_cross_verification,
 };
@@ -425,6 +430,20 @@ pub enum AttemptFailure {
     /// 17:50 could not start either (§12.15.8). Pages `xverify_failed` unless
     /// today's paged marker shows a page already went out.
     SkippedNoTime,
+    /// The live side was not known final before the read: the catch-up floor
+    /// was still moving below the close, or a strict read of an unknown
+    /// completeness found late minutes missing (§12.15.10). Only the vendor
+    /// tape was kept.
+    LiveNotFinal,
+    /// QuestDB had not applied `candles_1m` through the snapshot taken after
+    /// the drain (§12.15.10). Nothing was read.
+    LiveNotApplied,
+    /// The seal writer had not drained after the last catch-up sweep, or a
+    /// seal spill file for today was staged (§12.15.10). Nothing was read.
+    SealsPending,
+    /// A seal spill file the mid-session replay parked is still on disk
+    /// (§12.15.10). Nothing was read.
+    SealSpillParked,
 }
 
 impl AttemptFailure {
@@ -440,6 +459,10 @@ impl AttemptFailure {
             Self::MarkerNotWritten => "marker_not_written",
             Self::AuditRowsLost => "audit_rows_lost",
             Self::SkippedNoTime => "skipped_no_time",
+            Self::LiveNotFinal => "live_not_final",
+            Self::LiveNotApplied => "live_not_applied",
+            Self::SealsPending => "seals_pending",
+            Self::SealSpillParked => "seal_spill_parked",
         }
     }
 }
@@ -670,6 +693,472 @@ fn current_jwt() -> Option<SecretString> {
         .filter(|state| state.is_valid())
         .map(|state| SecretString::from(state.access_token().expose_secret().to_string()))
 }
+
+// ── §12.15.10 (plan item 51d) — read only after the live side is final ──
+
+/// What the live side published about its catch-up seal: the floor cutoff of
+/// the last COMPLETED sweep (fold seconds, the IST wall clock read as epoch)
+/// and the UTC second it completed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SealProgress {
+    /// Every bucket ending at or before this second was sealed by the sweep.
+    pub floor_fold_secs: u32,
+    /// When that sweep completed, UTC unix seconds.
+    pub done_unix_secs: u32,
+}
+
+/// Whether the last session buckets are sealed (§12.15.10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Completeness {
+    /// A sweep completed at or after the live-final instant with a floor at
+    /// or past the close: every session bucket is sealed.
+    Final,
+    /// The floor stayed below the close, unchanged from the first sweep after
+    /// the live-final instant to the deadline: the feed's newest trade stamp
+    /// stopped, so the buckets after it cannot seal before the shutdown seal.
+    Frozen {
+        /// The floor, as seconds of the IST day.
+        sealed_through_secs_of_day: i64,
+    },
+    /// The floor was below the close and still moving at the deadline.
+    Moving {
+        /// The latest floor, as seconds of the IST day.
+        sealed_through_secs_of_day: i64,
+    },
+    /// No sweep of today completed at or after the live-final instant.
+    Unknown,
+}
+
+/// Whether the sealed bars are readable in QuestDB (§12.15.10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Durability {
+    /// The seal writer drained after the reference sweep, no spill file for
+    /// today is staged, and `candles_1m` applied its WAL through a snapshot
+    /// taken after both.
+    Applied,
+    /// One of the three barriers did not hold by the deadline.
+    NotReady(DhanLiveXverifyNotReady),
+}
+
+/// What the readiness wait found (§12.15.10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveReadiness {
+    pub durability: Durability,
+    pub completeness: Completeness,
+}
+
+impl LiveReadiness {
+    /// For a day that is no longer today: nothing more can be folded into
+    /// it, and the readiness wait reads only today's progress.
+    pub const PAST_DAY: Self = Self {
+        durability: Durability::Applied,
+        completeness: Completeness::Final,
+    };
+}
+
+/// How one attempt reads the live side, decided before the read (§12.15.10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadPlan {
+    /// Read and compare with `policy`. `check_late` is the not-last
+    /// `Unknown` case: if the strict comparison finds a traded or index
+    /// minute missing in the late window, keep only the vendor tape and
+    /// retry `LiveNotFinal`.
+    Read {
+        policy: ReadPolicy,
+        check_late: bool,
+    },
+    /// Do not read: retry later today for this reason. No vendor call, no
+    /// persist, no marker, no page.
+    Retry(AttemptFailure),
+}
+
+/// The retry reason for a durability barrier that did not hold. O(1).
+const fn retry_reason(reason: DhanLiveXverifyNotReady) -> AttemptFailure {
+    match reason {
+        DhanLiveXverifyNotReady::SealsPending => AttemptFailure::SealsPending,
+        DhanLiveXverifyNotReady::SealSpillParked => AttemptFailure::SealSpillParked,
+        DhanLiveXverifyNotReady::NotApplied => AttemptFailure::LiveNotApplied,
+        DhanLiveXverifyNotReady::CompletenessUnknown => AttemptFailure::LiveNotFinal,
+    }
+}
+
+/// The read plan for one attempt (§12.15.10). Pure, total, O(1).
+///
+/// | Durability | Completeness | Not the last attempt | The last attempt |
+/// |---|---|---|---|
+/// | not ready | any | retry (its reason) | read, missing minutes unjudged |
+/// | applied | `Final` | read `Strict` | read `Strict` |
+/// | applied | `Frozen` | read, excuse after the floor | the same |
+/// | applied | `Moving` | retry `live_not_final` | read, excuse after the latest floor |
+/// | applied | `Unknown` | read `Strict`, then the late check | read, missing minutes unjudged |
+///
+/// The last attempt never retries: `is_last` is decided once, before the
+/// attempt ([`attempt_is_last`]), and a not-ready read there judges prices
+/// only. An excuse holds the day at `partial`, never `clean`.
+#[must_use]
+pub fn decide_read(readiness: LiveReadiness, is_last: bool) -> ReadPlan {
+    let unjudged = |reason| ReadPlan::Read {
+        policy: ReadPolicy {
+            late: LateWindowPolicy::Strict,
+            not_ready: Some(reason),
+        },
+        check_late: false,
+    };
+    let read = |late| ReadPlan::Read {
+        policy: ReadPolicy {
+            late,
+            not_ready: None,
+        },
+        check_late: false,
+    };
+    match (readiness.durability, readiness.completeness) {
+        (Durability::NotReady(reason), _) => {
+            if is_last {
+                unjudged(reason)
+            } else {
+                ReadPlan::Retry(retry_reason(reason))
+            }
+        }
+        (Durability::Applied, Completeness::Final) => read(LateWindowPolicy::Strict),
+        (
+            Durability::Applied,
+            Completeness::Frozen {
+                sealed_through_secs_of_day,
+            },
+        ) => read(LateWindowPolicy::excuse_after(sealed_through_secs_of_day)),
+        (
+            Durability::Applied,
+            Completeness::Moving {
+                sealed_through_secs_of_day,
+            },
+        ) => {
+            if is_last {
+                read(LateWindowPolicy::excuse_after(sealed_through_secs_of_day))
+            } else {
+                ReadPlan::Retry(AttemptFailure::LiveNotFinal)
+            }
+        }
+        (Durability::Applied, Completeness::Unknown) => {
+            if is_last {
+                unjudged(DhanLiveXverifyNotReady::CompletenessUnknown)
+            } else {
+                ReadPlan::Read {
+                    policy: ReadPolicy::STRICT,
+                    check_late: true,
+                }
+            }
+        }
+    }
+}
+
+/// The first durability barrier as the readiness wait applies it
+/// (§12.15.10). Pure, O(1).
+///
+/// - `drained` must be STRICTLY after `reference_unix_secs` (`>= T + 1`): a
+///   drained sample in the same second as the sweep may predate the seals
+///   the sweep handed off.
+/// - then no spill file for today may be staged; a parked replay file reads
+///   as its own reason. A folder that cannot be listed reads as pending
+///   (fail closed).
+///
+/// `Ok` means: take or check the WAL snapshot.
+pub fn classify_durability(
+    drained_unix_secs: Option<i64>,
+    reference_unix_secs: i64,
+    spill: &std::io::Result<SpillStaged>,
+) -> Result<(), DhanLiveXverifyNotReady> {
+    match drained_unix_secs {
+        Some(drained) if drained > reference_unix_secs => {}
+        _ => return Err(DhanLiveXverifyNotReady::SealsPending),
+    }
+    match spill {
+        Ok(s) if s.staged == 0 => Ok(()),
+        Ok(s) if s.parked > 0 => Err(DhanLiveXverifyNotReady::SealSpillParked),
+        Ok(_) | Err(_) => Err(DhanLiveXverifyNotReady::SealsPending),
+    }
+}
+
+/// The QuestDB table the comparison reads.
+const LIVE_READ_TABLE: &str = "candles_1m";
+
+/// Seconds between readiness samples.
+pub const READINESS_POLL_SECS: u64 = 5;
+
+/// The day the readiness wait is for, as the clocks it compares read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReadinessDay {
+    /// IST midnight, as fold seconds.
+    day_start_fold_secs: i64,
+    /// The close, as fold seconds.
+    close_fold_secs: i64,
+    /// The live-final instant, as UTC unix seconds.
+    live_final_unix_secs: i64,
+}
+
+impl ReadinessDay {
+    fn new(day_start_ist_nanos: i64) -> Self {
+        let day_start_fold_secs = day_start_ist_nanos.div_euclid(1_000_000_000);
+        Self {
+            day_start_fold_secs,
+            close_fold_secs: day_start_fold_secs.saturating_add(SESSION_CLOSE_SECS_OF_DAY_IST),
+            live_final_unix_secs: day_start_fold_secs
+                .saturating_add(LIVE_FINAL_SECS_OF_DAY_IST)
+                .saturating_sub(tickvault_common::constants::IST_UTC_OFFSET_SECONDS_I64),
+        }
+    }
+}
+
+/// The completeness the samples support, or `None` while it is not yet
+/// decided (§12.15.10). `first` is the first sample whose sweep completed at
+/// or after the live-final instant; `latest` the newest. Pure, O(1).
+///
+/// `Final` is decided as soon as it holds. Everything else waits for the
+/// deadline: `Unknown` when there is no sample, the floor is not today's, or
+/// no sweep completed at or after the live-final instant; else `Frozen` when
+/// the floor did not change since `first`, else `Moving`.
+fn classify_completeness(
+    day: ReadinessDay,
+    first: Option<SealProgress>,
+    latest: Option<SealProgress>,
+    at_deadline: bool,
+) -> Option<Completeness> {
+    let Some(latest) = latest else {
+        return at_deadline.then_some(Completeness::Unknown);
+    };
+    let floor = i64::from(latest.floor_fold_secs);
+    let done = i64::from(latest.done_unix_secs);
+    let today = floor >= day.day_start_fold_secs
+        && floor < day.day_start_fold_secs.saturating_add(SECS_PER_DAY as i64);
+    if today && floor >= day.close_fold_secs && done >= day.live_final_unix_secs {
+        return Some(Completeness::Final);
+    }
+    if !at_deadline {
+        return None;
+    }
+    if !today || done < day.live_final_unix_secs {
+        return Some(Completeness::Unknown);
+    }
+    let sealed_through_secs_of_day = floor.saturating_sub(day.day_start_fold_secs);
+    Some(match first {
+        Some(f) if f.floor_fold_secs == latest.floor_fold_secs => Completeness::Frozen {
+            sealed_through_secs_of_day,
+        },
+        _ => Completeness::Moving {
+            sealed_through_secs_of_day,
+        },
+    })
+}
+
+/// Everything the readiness wait reads, injected so it is testable against a
+/// paused clock (§12.15.10).
+pub trait ReadinessSource {
+    /// The last completed catch-up sweep, if any.
+    fn seal_progress(&self) -> Option<SealProgress>;
+    /// [`tickvault_storage::seal_writer_loop::last_seal_drained_unix_secs`].
+    fn last_drained_unix_secs(&self) -> Option<i64>;
+    /// Seal spill files still staged for `date`.
+    fn staged_spill(&self, date: chrono::NaiveDate) -> std::io::Result<SpillStaged>;
+    /// One `wal_tables()` read.
+    fn wal_tables(&self) -> impl Future<Output = anyhow::Result<Vec<WalTableRow>>> + Send;
+    /// The wall clock, UTC unix seconds.
+    fn now_unix_secs(&self) -> i64;
+}
+
+/// The production [`ReadinessSource`].
+struct ProductionReadiness<'a> {
+    client: reqwest::Client,
+    exec_url: &'a str,
+}
+
+impl ReadinessSource for ProductionReadiness<'_> {
+    fn seal_progress(&self) -> Option<SealProgress> {
+        crate::dhan_feed_stack::CATCHUP_PROGRESS
+            .load()
+            .map(|(floor_fold_secs, done_unix_secs)| SealProgress {
+                floor_fold_secs,
+                done_unix_secs,
+            })
+    }
+
+    fn last_drained_unix_secs(&self) -> Option<i64> {
+        tickvault_storage::seal_writer_loop::last_seal_drained_unix_secs()
+    }
+
+    fn staged_spill(&self, date: chrono::NaiveDate) -> std::io::Result<SpillStaged> {
+        tickvault_storage::seal_spill::staged_production_spill_records_for_day(date)
+    }
+
+    fn wal_tables(&self) -> impl Future<Output = anyhow::Result<Vec<WalTableRow>>> + Send {
+        tickvault_storage::wal_suspension_watcher::fetch_wal_tables(&self.client, self.exec_url)
+    }
+
+    fn now_unix_secs(&self) -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+}
+
+/// The readiness wait's running state (§12.15.10).
+#[derive(Debug, Clone, Copy)]
+struct ReadinessTracker {
+    day: ReadinessDay,
+    first: Option<SealProgress>,
+    latest: Option<SealProgress>,
+    /// The first sample carrying the latest floor value: its sweep sealed
+    /// the newest bars, so the drain must come after it.
+    floor_since: Option<SealProgress>,
+    /// `candles_1m`'s `sequencerTxn`, snapshotted once per floor value after
+    /// the drain and spill barriers held.
+    snapshot_txn: Option<i64>,
+    /// The last durability verdict.
+    durability: Durability,
+}
+
+impl ReadinessTracker {
+    fn new(day: ReadinessDay) -> Self {
+        Self {
+            day,
+            first: None,
+            latest: None,
+            floor_since: None,
+            snapshot_txn: None,
+            durability: Durability::NotReady(DhanLiveXverifyNotReady::SealsPending),
+        }
+    }
+
+    /// Records one progress sample. A new floor value re-arms the durability
+    /// barriers: its sweep sealed bars the earlier drain did not cover.
+    fn observe(&mut self, sample: Option<SealProgress>) {
+        let Some(p) = sample else {
+            return;
+        };
+        if self.floor_since.map(|s| s.floor_fold_secs) != Some(p.floor_fold_secs) {
+            self.floor_since = Some(p);
+            self.snapshot_txn = None;
+            self.durability = Durability::NotReady(DhanLiveXverifyNotReady::SealsPending);
+        }
+        if self.first.is_none() && i64::from(p.done_unix_secs) >= self.day.live_final_unix_secs {
+            self.first = Some(p);
+        }
+        self.latest = Some(p);
+    }
+
+    /// The instant the drain must come after: the sweep that first reached
+    /// the latest floor, never earlier than the live-final instant.
+    fn reference_unix_secs(&self) -> i64 {
+        self.floor_since
+            .map_or(i64::MIN, |s| i64::from(s.done_unix_secs))
+            .max(self.day.live_final_unix_secs)
+    }
+}
+
+/// Waits until the live side is final or `deadline` passes, and reports what
+/// it found (§12.15.10). Runs beside the token wait under the same deadline,
+/// so an attempt's longest duration is unchanged.
+///
+/// Sleeps until the live-final instant (a no-op on a retry), then samples
+/// every [`READINESS_POLL_SECS`]: the published catch-up progress, then the
+/// three durability barriers in order (the seal writer drained after the
+/// reference sweep; no spill file for today staged; one `candles_1m`
+/// `sequencerTxn` snapshot, then `writerTxn` at or past it). Returns as soon
+/// as completeness is decided and durability holds; otherwise at the deadline
+/// with what it has. A `wal_tables()` error or timeout reads `NotApplied`.
+///
+/// O(tables + spill files) per sample, at most one sample per
+/// [`READINESS_POLL_SECS`], cold.
+async fn wait_live_final<R: ReadinessSource>(
+    src: &R,
+    today: chrono::NaiveDate,
+    day_start_ist_nanos: i64,
+    deadline: tokio::time::Instant,
+) -> LiveReadiness {
+    let day = ReadinessDay::new(day_start_ist_nanos);
+    let early = day.live_final_unix_secs.saturating_sub(src.now_unix_secs());
+    if early > 0 {
+        let wake = tokio::time::Instant::now() + Duration::from_secs(early.unsigned_abs());
+        tokio::time::sleep_until(wake.min(deadline)).await;
+    }
+    let mut t = ReadinessTracker::new(day);
+    loop {
+        t.observe(src.seal_progress());
+        if t.durability != Durability::Applied {
+            t.durability = match classify_durability(
+                src.last_drained_unix_secs(),
+                t.reference_unix_secs(),
+                &src.staged_spill(today),
+            ) {
+                Err(reason) => Durability::NotReady(reason),
+                Ok(()) => match tokio::time::timeout_at(deadline, src.wal_tables()).await {
+                    Ok(Ok(rows)) => {
+                        let target = match t.snapshot_txn {
+                            Some(txn) => Some(txn),
+                            None => rows
+                                .iter()
+                                .find(|r| r.name == LIVE_READ_TABLE)
+                                .and_then(|r| r.sequencer_txn),
+                        };
+                        t.snapshot_txn = target;
+                        match target.map(|txn| {
+                            tickvault_storage::wal_suspension_watcher::wal_applied_through(
+                                &rows,
+                                LIVE_READ_TABLE,
+                                txn,
+                            )
+                        }) {
+                            Some(AppliedThrough::Reached) => Durability::Applied,
+                            _ => Durability::NotReady(DhanLiveXverifyNotReady::NotApplied),
+                        }
+                    }
+                    Ok(Err(_)) | Err(_) => {
+                        Durability::NotReady(DhanLiveXverifyNotReady::NotApplied)
+                    }
+                },
+            };
+        }
+        let now = tokio::time::Instant::now();
+        let at_deadline = now >= deadline;
+        if let Some(completeness) = classify_completeness(day, t.first, t.latest, at_deadline)
+            && (t.durability == Durability::Applied || at_deadline)
+        {
+            return LiveReadiness {
+                durability: t.durability,
+                completeness,
+            };
+        }
+        if at_deadline {
+            // Unreachable: `classify_completeness` decides at the deadline.
+            return LiveReadiness {
+                durability: t.durability,
+                completeness: Completeness::Unknown,
+            };
+        }
+        tokio::time::sleep_until((now + Duration::from_secs(READINESS_POLL_SECS)).min(deadline))
+            .await;
+    }
+}
+
+/// The readiness for one attempt: the wait for today, or
+/// [`LiveReadiness::PAST_DAY`] when the day checked is no longer today.
+async fn attempt_readiness(
+    deps: &CrossverifyBootDeps,
+    today: chrono::NaiveDate,
+    day_start_ist_nanos: i64,
+    deadline: tokio::time::Instant,
+) -> LiveReadiness {
+    if today_ist().0 != today {
+        return LiveReadiness::PAST_DAY;
+    }
+    let src = ProductionReadiness {
+        client: reqwest::Client::builder()
+            .timeout(Duration::from_secs(READINESS_PROBE_TIMEOUT_SECS))
+            .build()
+            .unwrap_or_default(),
+        exec_url: &deps.questdb_exec_url,
+    };
+    wait_live_final(&src, today, day_start_ist_nanos, deadline).await
+}
+
+/// One `wal_tables()` probe's own timeout during the readiness wait.
+const READINESS_PROBE_TIMEOUT_SECS: u64 = 10;
 
 /// Spawns the daily cross-verification task for the subscribed universe.
 // TEST-EXEMPT: spawns a tokio task that waits for 15:41 IST and calls the vendor; its pure decisions (targets, schedule, catch-up, marker, divergence, same-day retry bound, attempt classification) are tested above and its emit contract by test_every_xverify_alarm_source_has_a_live_error_emit
@@ -991,6 +1480,11 @@ async fn run_day(
 ) {
     let divergence_paged = AtomicBool::new(false);
     let paged = &divergence_paged;
+    // §12.15.10: the readiness of the latest spot attempt, for the option
+    // pass. Locked only to store or take one `Copy` value, never across an
+    // `.await`.
+    let spot_readiness: std::sync::Mutex<Option<LiveReadiness>> = std::sync::Mutex::new(None);
+    let readiness_out = &spot_readiness;
     let result = drive_day(
         today,
         deps.config.run_budget_secs,
@@ -1019,7 +1513,16 @@ async fn run_day(
                     // once, no marker) is the fail-safe if it ever did not.
                     let deadline = plan.deadline.unwrap_or_else(tokio::time::Instant::now);
                     let day = (today, day_start_ist_nanos);
-                    run_once(deps, &cfg, targets, day, paged, deadline).await
+                    run_once(
+                        deps,
+                        &cfg,
+                        targets,
+                        day,
+                        paged,
+                        (deadline, plan.is_last),
+                        readiness_out,
+                    )
+                    .await
                 }
             }
         },
@@ -1038,9 +1541,11 @@ async fn run_day(
     // instant.
     let option_limit_secs = attempt_max_secs(XVERIFY_OPTION_PASS_BUDGET_SECS);
     let option_deadline = tokio::time::Instant::now() + Duration::from_secs(option_limit_secs);
+    // §12.15.10: the spot check's last readiness, so the pass reads with it.
+    let spot = spot_readiness.lock().ok().and_then(|slot| *slot);
     let option_pass = tokio::time::timeout_at(
         option_deadline,
-        run_option_pass(deps, today, day_start_ist_nanos, option_deadline),
+        run_option_pass(deps, today, day_start_ist_nanos, option_deadline, spot),
     )
     .await;
     if option_pass.is_err() {
@@ -1184,7 +1689,14 @@ fn report_final_failure(
         | AttemptFailure::RunFailed
         | AttemptFailure::NotPersisted
         | AttemptFailure::Incomplete
-        | AttemptFailure::AuditRowsLost => error!(
+        | AttemptFailure::AuditRowsLost
+        // §12.15.10: never the outcome of the day's LAST attempt
+        // (`decide_read` reads there), but an earlier attempt's readiness
+        // reason ends the day when the next attempt is skipped for time.
+        | AttemptFailure::LiveNotFinal
+        | AttemptFailure::LiveNotApplied
+        | AttemptFailure::SealsPending
+        | AttemptFailure::SealSpillParked => error!(
             code = ErrorCode::WsGapConnectionState.code_str(),
             source = "xverify_failed",
             %today,
@@ -1215,15 +1727,33 @@ fn report_final_failure(
 /// instant this attempt's timeout fires: the audit persist, which runs
 /// synchronously after the last `.await` and so cannot be cut by the timeout,
 /// stops itself there, and the marker is not written past it (§12.15.8).
+///
+/// §12.15.10 (plan item 51d): the token wait and the readiness wait run
+/// together under the token wait's own bound, so the attempt's longest
+/// duration is unchanged; `decide_read` then decides, before any vendor call,
+/// whether to read and how. `is_last` is the attempt plan's, decided once
+/// before the attempt. The readiness found is left in `readiness_out` for the
+/// option pass.
 async fn run_once(
     deps: &CrossverifyBootDeps,
     cfg: &DhanLiveCrossverifyConfig,
     targets: &[XverifyTarget],
     (today, day_start_ist_nanos): (chrono::NaiveDate, i64),
     divergence_paged: &AtomicBool,
-    deadline: tokio::time::Instant,
+    (deadline, is_last): (tokio::time::Instant, bool),
+    readiness_out: &std::sync::Mutex<Option<LiveReadiness>>,
 ) -> Result<(), AttemptFailure> {
-    let Some(jwt) = wait_for_jwt().await else {
+    let ready_deadline = (tokio::time::Instant::now()
+        + Duration::from_secs(TOKEN_WAIT_POLL_SECS * u64::from(TOKEN_WAIT_MAX_POLLS)))
+    .min(deadline);
+    let (jwt, readiness) = tokio::join!(
+        wait_for_jwt(),
+        attempt_readiness(deps, today, day_start_ist_nanos, ready_deadline)
+    );
+    if let Ok(mut slot) = readiness_out.lock() {
+        *slot = Some(readiness);
+    }
+    let Some(jwt) = jwt else {
         metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "no_token").increment(1);
         warn!(
             code = ErrorCode::WsGapConnectionState.code_str(),
@@ -1234,6 +1764,38 @@ async fn run_once(
         );
         return Err(AttemptFailure::NoToken);
     };
+    let (read, check_late) = match decide_read(readiness, is_last) {
+        // §12.15.10: before any vendor call. No persist, no marker, no page;
+        // `drive_day` counts the retry by its reason.
+        ReadPlan::Retry(reason) => {
+            warn!(
+                code = ErrorCode::WsGapConnectionState.code_str(),
+                source = "xverify_attempt_not_ready",
+                %today,
+                reason = reason.as_str(),
+                durability = ?readiness.durability,
+                completeness = ?readiness.completeness,
+                "Dhan 1-minute cross-verification waited for our last candles to be \
+                 sealed and saved, and they were not ready yet; nothing was compared, \
+                 and the check runs again later today"
+            );
+            return Err(reason);
+        }
+        ReadPlan::Read { policy, check_late } => (policy, check_late),
+    };
+    if let Some(reason) = read.not_ready {
+        warn!(
+            code = ErrorCode::WsGapConnectionState.code_str(),
+            source = "xverify_unsettled_final",
+            %today,
+            reason = MissingJudgeable::NotReady(reason).as_str(),
+            durability = ?readiness.durability,
+            completeness = ?readiness.completeness,
+            "Dhan 1-minute cross-verification: the day's last attempt found our last \
+             candles not yet sealed and saved; prices are still compared, but no minute \
+             missing from our side is judged today"
+        );
+    }
     let client = reqwest::Client::new();
     let result = run_cross_verification(
         &client,
@@ -1244,6 +1806,7 @@ async fn run_once(
         today,
         day_start_ist_nanos,
         cfg,
+        read,
     )
     .await;
     drop(jwt);
@@ -1302,26 +1865,39 @@ async fn run_once(
                     at_ist_nanos: fetched_at_ist_nanos_now(),
                     run_complete: complete,
                 },
+                scope: PersistScope::Full,
             };
+            // §12.15.10: a strict read of an unknown completeness that finds
+            // a late traded or index minute missing may have read too early.
+            // Keep only the vendor tape (its DEDUP key has no outcome, so a
+            // later attempt UPSERTs the same rows), page a price divergence
+            // as usual, and retry: no daily row, no findings, no marker.
+            if check_late && c.missing_live_late > 0 {
+                page_divergence_once(c, divergence_paged);
+                let tape_rows = PersistRows {
+                    scope: PersistScope::TapeOnly,
+                    ..rows
+                };
+                let kept = persist_report(&deps.questdb, &report, tape_rows, deadline);
+                warn!(
+                    code = ErrorCode::WsGapConnectionState.code_str(),
+                    source = "xverify_attempt_not_ready",
+                    %today,
+                    reason = AttemptFailure::LiveNotFinal.as_str(),
+                    missing_live_late = c.missing_live_late,
+                    tape_rows = report.rest_tape.len(),
+                    tape_rows_saved = kept.rows_flushed,
+                    "Dhan 1-minute cross-verification could not tell whether our last \
+                     candles were sealed, and minutes at the end of the session are missing \
+                     on our side; Dhan's record was saved, nothing was judged, and the check \
+                     runs again later today"
+                );
+                return Err(AttemptFailure::LiveNotFinal);
+            }
             let persisted = persist_report(&deps.questdb, &report, rows, deadline);
             let persist = persist_verdict(&persisted);
             let persisted_ok = persist.is_ok();
-            if is_catastrophic_divergence(c) && !divergence_paged.swap(true, Ordering::Relaxed) {
-                metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "diverged").increment(1);
-                error!(
-                    code = ErrorCode::WsGapConnectionState.code_str(),
-                    source = "xverify_diverged",
-                    instruments = c.instruments,
-                    minutes_compared = c.minutes_compared,
-                    price_fields_compared = c.minutes_compared.saturating_mul(4),
-                    cells_diverged = c.cells_diverged,
-                    noise_p95_paise = c.noise_p95_paise,
-                    noise_max_paise = c.noise_max_paise,
-                    "Dhan 1-minute cross-verification found MORE THAN HALF of the compared \
-                     price fields disagreeing with Dhan's own record. Treat today's candles \
-                     as untrustworthy until this is explained."
-                );
-            }
+            page_divergence_once(c, divergence_paged);
             let verdict =
                 classify_attempt(c.is_vacuous(), c.outcome.is_measured(), persist, complete);
             // The marker condition must stay exactly `should_write_marker`
@@ -1380,6 +1956,29 @@ async fn run_once(
             );
             Err(AttemptFailure::RunFailed)
         }
+    }
+}
+
+/// Pages a catastrophic price divergence once per day (§12.15.5). It is a
+/// finding about the data, not about the attempt, so it fires on the first
+/// attempt that measures it, the §12.15.10 tape-only retry included, and
+/// `paged` stops a later attempt from paging it again. O(1).
+fn page_divergence_once(c: &DayComparison, paged: &AtomicBool) {
+    if is_catastrophic_divergence(c) && !paged.swap(true, Ordering::Relaxed) {
+        metrics::counter!(XVERIFY_RUNS_COUNTER, "outcome" => "diverged").increment(1);
+        error!(
+            code = ErrorCode::WsGapConnectionState.code_str(),
+            source = "xverify_diverged",
+            instruments = c.instruments,
+            minutes_compared = c.minutes_compared,
+            price_fields_compared = c.minutes_compared.saturating_mul(4),
+            cells_diverged = c.cells_diverged,
+            noise_p95_paise = c.noise_p95_paise,
+            noise_max_paise = c.noise_max_paise,
+            "Dhan 1-minute cross-verification found MORE THAN HALF of the compared \
+             price fields disagreeing with Dhan's own record. Treat today's candles \
+             as untrustworthy until this is explained."
+        );
     }
 }
 
@@ -1473,6 +2072,17 @@ struct PersistRows {
     day_start_ist_nanos: i64,
     tolerance_paise: i64,
     attempt: AttemptStamp,
+    scope: PersistScope,
+}
+
+/// Which rows the spot persist writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PersistScope {
+    /// Findings, vendor tape and the daily row.
+    Full,
+    /// Only the vendor tape: a read retried as `live_not_final` (§12.15.10)
+    /// writes no daily row and no findings, so it can mark nothing.
+    TapeOnly,
 }
 
 /// Persists the run through the production writer, in batches of
@@ -1566,11 +2176,14 @@ fn persist_report_into(
             out.deadline_reached = true;
             out.final_flush_ok = false;
         };
-    let total = c
-        .findings
+    // §12.15.10: a tape-only persist writes neither findings nor the daily
+    // row.
+    let full = rows.scope == PersistScope::Full;
+    let findings: &[_] = if full { &c.findings } else { &[] };
+    let total = findings
         .len()
         .saturating_add(report.rest_tape.len())
-        .saturating_add(1);
+        .saturating_add(usize::from(full));
     let mut appended = 0_usize;
 
     // One clock reading per row, checked twice: before the append (so a
@@ -1578,11 +2191,11 @@ fn persist_report_into(
     // `flush_if_full` would actually send (51b review: checking only before
     // the append let a batch flush start one row larger than the one
     // checked).
-    for finding in &c.findings {
+    for finding in findings {
         let at = now();
         if !flush_fits(writer, at, deadline) {
             stop_at_deadline(writer, &mut out, total - appended);
-            return finish_persist(report, out, batch_errors, None);
+            return finish_persist(report, out, batch_errors, None, rows.scope);
         }
         if writer
             .append_cell(finding, rows.attempt.at_ist_nanos)
@@ -1593,7 +2206,7 @@ fn persist_report_into(
         appended += 1;
         if !flush_fits(writer, at, deadline) {
             stop_at_deadline(writer, &mut out, total - appended);
-            return finish_persist(report, out, batch_errors, None);
+            return finish_persist(report, out, batch_errors, None, rows.scope);
         }
         flush_if_full(writer, &mut out, &mut batch_errors);
     }
@@ -1601,7 +2214,7 @@ fn persist_report_into(
         let at = now();
         if !flush_fits(writer, at, deadline) {
             stop_at_deadline(writer, &mut out, total - appended);
-            return finish_persist(report, out, batch_errors, None);
+            return finish_persist(report, out, batch_errors, None, rows.scope);
         }
         if writer.append_rest_tape(row).is_err() {
             out.tape_append_errors = out.tape_append_errors.saturating_add(1);
@@ -1609,22 +2222,24 @@ fn persist_report_into(
         appended += 1;
         if !flush_fits(writer, at, deadline) {
             stop_at_deadline(writer, &mut out, total - appended);
-            return finish_persist(report, out, batch_errors, None);
+            return finish_persist(report, out, batch_errors, None, rows.scope);
         }
         flush_if_full(writer, &mut out, &mut batch_errors);
     }
-    let daily = daily_row(
-        c,
-        rows.day_start_ist_nanos,
-        deterministic_run_ts_nanos(rows.day_start_ist_nanos),
-        rows.tolerance_paise,
-        rows.attempt,
-    );
-    out.daily_appended = writer.append_daily(&daily).is_ok();
+    if full {
+        let daily = daily_row(
+            c,
+            rows.day_start_ist_nanos,
+            deterministic_run_ts_nanos(rows.day_start_ist_nanos),
+            rows.tolerance_paise,
+            rows.attempt,
+        );
+        out.daily_appended = writer.append_daily(&daily).is_ok();
+    }
     if !flush_fits(writer, now(), deadline) {
         out.daily_appended = false;
         stop_at_deadline(writer, &mut out, 0);
-        return finish_persist(report, out, batch_errors, None);
+        return finish_persist(report, out, batch_errors, None, rows.scope);
     }
 
     let before = writer.pending();
@@ -1644,7 +2259,7 @@ fn persist_report_into(
         // were counted as discarded above, so nothing is added here.
         let _already_empty = writer.discard_pending();
     }
-    finish_persist(report, out, batch_errors, final_err)
+    finish_persist(report, out, batch_errors, final_err, rows.scope)
 }
 
 /// Publishes the persist's counters and its one log line. Split out of
@@ -1655,6 +2270,7 @@ fn finish_persist(
     out: PersistOutcome,
     batch_errors: usize,
     final_err: Option<String>,
+    scope: PersistScope,
 ) -> PersistOutcome {
     let c = &report.comparison;
     metrics::counter!(XVERIFY_PERSIST_ROWS_COUNTER).increment(out.rows_flushed as u64);
@@ -1690,7 +2306,7 @@ fn finish_persist(
             if out.cell_append_errors > 0
                 || out.tape_append_errors > 0
                 || batch_errors > 0
-                || !out.daily_appended
+                || (!out.daily_appended && scope == PersistScope::Full)
             {
                 error!(
                     code = ErrorCode::WsGapConnectionState.code_str(),
@@ -1699,7 +2315,7 @@ fn finish_persist(
                     tape_errors = out.tape_append_errors,
                     batch_errors,
                     rows_discarded = out.rows_discarded,
-                    daily_failed = !out.daily_appended,
+                    daily_failed = !out.daily_appended && scope == PersistScope::Full,
                     findings = c.findings.len(),
                     tape_rows = report.rest_tape.len(),
                     "Dhan 1-minute cross-verification persisted with gaps — the audit \
@@ -1815,9 +2431,10 @@ pub const fn option_pass_fits(now_secs_of_day: u64) -> bool {
 /// start of each pass so a label reads as a real zero on `/metrics` rather
 /// than an absent series. `timed_out` is published by `run_day` when the
 /// pass's timeout elapses (§12.15.8).
-pub const XVERIFY_OPTION_PASS_OUTCOMES: [&str; 9] = [
+pub const XVERIFY_OPTION_PASS_OUTCOMES: [&str; 10] = [
     "timed_out",
     "skipped_late",
+    "skipped_not_ready",
     "no_targets",
     "no_token",
     "vacuous",
@@ -1846,6 +2463,33 @@ pub const fn option_pass_outcome(
     }
 }
 
+/// How the option pass reads the live side, from the spot attempt's
+/// readiness (§12.15.10), or `None` to skip it (`skipped_not_ready`): the pass
+/// is never the day's verdict and never retries, so it reads only once the
+/// sealed bars are saved. `Strict` when the live side was final; else the
+/// excuse after the floor the spot check saw, or the derived window when no
+/// floor was known. Pure, O(1).
+#[must_use]
+pub const fn option_pass_read(readiness: LiveReadiness) -> Option<ReadPolicy> {
+    match (readiness.durability, readiness.completeness) {
+        (Durability::NotReady(_), _) => None,
+        (Durability::Applied, Completeness::Final) => Some(ReadPolicy::STRICT),
+        (
+            Durability::Applied,
+            Completeness::Frozen {
+                sealed_through_secs_of_day,
+            }
+            | Completeness::Moving {
+                sealed_through_secs_of_day,
+            },
+        ) => Some(ReadPolicy {
+            late: LateWindowPolicy::excuse_after(sealed_through_secs_of_day),
+            not_ready: None,
+        }),
+        (Durability::Applied, Completeness::Unknown) => Some(ReadPolicy::DERIVED_WINDOW),
+    }
+}
+
 /// The after-close check of the day's depth-held option contracts.
 ///
 /// It never writes or blocks the day marker, never appends a daily row, and
@@ -1854,11 +2498,16 @@ pub const fn option_pass_outcome(
 /// `deadline` is the instant its timeout fires (§12.15.8); the audit persist,
 /// which runs synchronously and cannot be cut by that timeout, stops itself
 /// there (`persist_option_findings`).
+///
+/// §12.15.10: it reads with [`option_pass_read`] of the last spot attempt's
+/// readiness; with none (no spot attempt reached the wait), it runs its own
+/// wait beside the token wait, bounded like the spot attempt's.
 async fn run_option_pass(
     deps: &CrossverifyBootDeps,
     today: chrono::NaiveDate,
     day_start_ist_nanos: i64,
     deadline: tokio::time::Instant,
+    spot_readiness: Option<LiveReadiness>,
 ) {
     for label in XVERIFY_OPTION_PASS_OUTCOMES {
         metrics::counter!(XVERIFY_OPTION_PASS_COUNTER, "outcome" => label).increment(0);
@@ -1890,13 +2539,37 @@ async fn run_option_pass(
         );
         return;
     }
-    let Some(jwt) = wait_for_jwt().await else {
+    let (jwt, readiness) = match spot_readiness {
+        Some(readiness) => (wait_for_jwt().await, readiness),
+        None => {
+            let ready_deadline = (tokio::time::Instant::now()
+                + Duration::from_secs(TOKEN_WAIT_POLL_SECS * u64::from(TOKEN_WAIT_MAX_POLLS)))
+            .min(deadline);
+            tokio::join!(
+                wait_for_jwt(),
+                attempt_readiness(deps, today, day_start_ist_nanos, ready_deadline)
+            )
+        }
+    };
+    let Some(jwt) = jwt else {
         metrics::counter!(XVERIFY_OPTION_PASS_COUNTER, "outcome" => "no_token").increment(1);
         warn!(
             code = ErrorCode::WsGapConnectionState.code_str(),
             source = "xverify_options_no_token",
             %today,
             "Dhan option cross-check could not run: no Dhan token available"
+        );
+        return;
+    };
+    let Some(read) = option_pass_read(readiness) else {
+        metrics::counter!(XVERIFY_OPTION_PASS_COUNTER, "outcome" => "skipped_not_ready")
+            .increment(1);
+        info!(
+            %today,
+            durability = ?readiness.durability,
+            completeness = ?readiness.completeness,
+            "Dhan option cross-check skipped: our last candles were not saved in time to \
+             compare them today"
         );
         return;
     };
@@ -1914,6 +2587,7 @@ async fn run_option_pass(
         today,
         day_start_ist_nanos,
         &cfg,
+        read,
     )
     .await;
     drop(jwt);
@@ -2142,6 +2816,7 @@ mod tests {
                 at_ist_nanos: TEST_ATTEMPT_AT,
                 run_complete: true,
             },
+            scope: PersistScope::Full,
         }
     }
 
@@ -2296,8 +2971,8 @@ mod tests {
             .and_then(|s| s.split("\n}\n").next())
             .unwrap_or("");
         assert!(
-            body.contains("wait_for_jwt().await"),
-            "run_once must wait for the token"
+            body.contains("tokio::join!(\n        wait_for_jwt(),"),
+            "run_once must wait for the token (beside the readiness wait, §12.15.10)"
         );
         assert!(
             !body.contains("= current_jwt()"),
@@ -2981,9 +3656,14 @@ mod tests {
         assert!(arm.contains("code = ErrorCode::WsGapConnectionState.code_str()"));
         assert!(arm.contains("the day marker could not be saved to disk"));
         assert!(
-            body.contains("| AttemptFailure::AuditRowsLost => error!("),
+            body.contains("| AttemptFailure::AuditRowsLost\n"),
             "AuditRowsLost joins the existing xverify_failed arm"
         );
+        // §12.15.10: the readiness reasons join the same arm.
+        assert!(body.contains("| AttemptFailure::SealSpillParked => error!("));
+        for r in ["LiveNotFinal", "LiveNotApplied", "SealsPending"] {
+            assert!(body.contains(&format!("| AttemptFailure::{r}\n")), "{r}");
+        }
     }
 
     #[test]
@@ -4093,11 +4773,15 @@ mod tests {
         );
         assert!(drive.contains("deadline: Some(deadline)"));
         assert!(
-            run_day.contains("run_option_pass(deps, today, day_start_ist_nanos, option_deadline)")
+            run_day.contains(
+                "run_option_pass(deps, today, day_start_ist_nanos, option_deadline, spot)"
+            )
         );
         assert!(run_day.contains("source = \"xverify_options_timed_out\""));
-        // run_once is reached only through the driver.
-        assert_eq!(prod.matches("run_once(deps,").count(), 1);
+        // run_once is reached only through the driver: its definition and
+        // one call.
+        assert_eq!(prod.matches("run_once(").count(), 2);
+        assert_eq!(prod.matches("async fn run_once(").count(), 1);
         let run_once = fn_body(prod, "async fn run_once(");
         assert!(run_once.contains("persist_report(&deps.questdb, &report, rows, deadline)"));
         assert!(!run_day.contains("now_ist_secs_of_day()"));
@@ -4280,7 +4964,11 @@ mod tests {
                 "run_once must not page {alarmed} per attempt"
             );
         }
-        assert!(run_once.contains("!divergence_paged.swap(true, Ordering::Relaxed)"));
+        assert!(run_once.contains("page_divergence_once(c, divergence_paged)"));
+        assert!(
+            fn_body(prod, "fn page_divergence_once(")
+                .contains("!paged.swap(true, Ordering::Relaxed)")
+        );
         assert!(prod.contains("run_day(&deps, &targets, today, day_start_ist_nanos)"));
     }
 
@@ -4625,5 +5313,601 @@ mod tests {
         for label in ["vacuous", "measured", "partial"] {
             assert!(XVERIFY_OPTION_PASS_OUTCOMES.contains(&label));
         }
+    }
+
+    // ---- §12.15.10 live-final readiness (plan item 51d) ----
+
+    /// An IST midnight as fold seconds (the IST wall clock read as epoch).
+    const DAY0: i64 = 20_000 * 86_400;
+
+    fn day0() -> ReadinessDay {
+        ReadinessDay::new(DAY0 * 1_000_000_000)
+    }
+
+    /// A sweep whose floor is `floor_sod` seconds into DAY0 and that completed
+    /// `done_after_lf` seconds after the live-final instant.
+    fn progress(floor_sod: i64, done_after_lf: i64) -> SealProgress {
+        let d = day0();
+        SealProgress {
+            floor_fold_secs: u32::try_from(DAY0 + floor_sod).unwrap_or(0),
+            done_unix_secs: u32::try_from(d.live_final_unix_secs + done_after_lf).unwrap_or(0),
+        }
+    }
+
+    const CLOSE: i64 = SESSION_CLOSE_SECS_OF_DAY_IST;
+
+    #[test]
+    fn test_readiness_day_converts_the_fold_and_utc_clocks() {
+        let d = day0();
+        assert_eq!(d.day_start_fold_secs, DAY0);
+        assert_eq!(d.close_fold_secs, DAY0 + CLOSE);
+        assert_eq!(
+            d.live_final_unix_secs,
+            DAY0 + LIVE_FINAL_SECS_OF_DAY_IST - 19_800,
+            "fold seconds are IST read as epoch; completion is UTC"
+        );
+    }
+
+    #[test]
+    fn test_classify_completeness_table() {
+        let d = day0();
+        let at = |first, latest, deadline| classify_completeness(d, first, latest, deadline);
+        // No sample.
+        assert_eq!(at(None, None, false), None);
+        assert_eq!(at(None, None, true), Some(Completeness::Unknown));
+        // Final is decided early, and needs both the floor and the instant.
+        let fin = progress(CLOSE, 0);
+        assert_eq!(at(Some(fin), Some(fin), false), Some(Completeness::Final));
+        assert_eq!(
+            at(None, Some(progress(CLOSE + 30, 9)), false),
+            Some(Completeness::Final)
+        );
+        let early = progress(CLOSE, -1);
+        assert_eq!(at(None, Some(early), false), None);
+        assert_eq!(at(None, Some(early), true), Some(Completeness::Unknown));
+        // A floor below the close waits for the deadline.
+        let frozen = progress(CLOSE - 60, 1);
+        assert_eq!(at(Some(frozen), Some(frozen), false), None);
+        assert_eq!(
+            at(Some(frozen), Some(frozen), true),
+            Some(Completeness::Frozen {
+                sealed_through_secs_of_day: CLOSE - 60
+            })
+        );
+        let moved = progress(CLOSE - 30, 40);
+        assert_eq!(
+            at(Some(frozen), Some(moved), true),
+            Some(Completeness::Moving {
+                sealed_through_secs_of_day: CLOSE - 30
+            })
+        );
+        assert_eq!(
+            at(None, Some(moved), true),
+            Some(Completeness::Moving {
+                sealed_through_secs_of_day: CLOSE - 30
+            })
+        );
+        // A floor that is not today's never reads Final or Frozen.
+        for floor in [CLOSE - 86_400, 86_400 + 10, -1] {
+            let p = progress(floor, 5);
+            assert_eq!(at(Some(p), Some(p), false), None, "{floor}");
+            assert_eq!(
+                at(Some(p), Some(p), true),
+                Some(Completeness::Unknown),
+                "{floor}"
+            );
+        }
+    }
+
+    fn spill(staged: usize, parked: usize) -> std::io::Result<SpillStaged> {
+        Ok(SpillStaged { staged, parked })
+    }
+
+    #[test]
+    fn test_classify_durability_drain_must_be_strictly_after_the_reference() {
+        let t = 1_000;
+        let not_ready = |r| Err(r);
+        assert_eq!(
+            classify_durability(None, t, &spill(0, 0)),
+            not_ready(DhanLiveXverifyNotReady::SealsPending)
+        );
+        assert_eq!(
+            classify_durability(Some(t), t, &spill(0, 0)),
+            not_ready(DhanLiveXverifyNotReady::SealsPending),
+            "a drain in the same second may predate the sweep's hand-off"
+        );
+        assert_eq!(classify_durability(Some(t + 1), t, &spill(0, 0)), Ok(()));
+        assert_eq!(
+            classify_durability(Some(t + 1), t, &spill(2, 0)),
+            not_ready(DhanLiveXverifyNotReady::SealsPending)
+        );
+        assert_eq!(
+            classify_durability(Some(t + 1), t, &spill(1, 1)),
+            not_ready(DhanLiveXverifyNotReady::SealSpillParked)
+        );
+        // A parked file of another day does not hold today's read.
+        assert_eq!(classify_durability(Some(t + 1), t, &spill(0, 3)), Ok(()));
+        // A folder that cannot be listed fails closed.
+        let unreadable = Err(std::io::Error::other("unreadable"));
+        assert_eq!(
+            classify_durability(Some(t + 1), t, &unreadable),
+            not_ready(DhanLiveXverifyNotReady::SealsPending)
+        );
+        // The drain is checked first.
+        assert_eq!(
+            classify_durability(Some(t), t, &spill(1, 1)),
+            not_ready(DhanLiveXverifyNotReady::SealsPending)
+        );
+    }
+
+    const NOT_READY: [DhanLiveXverifyNotReady; 4] = [
+        DhanLiveXverifyNotReady::SealsPending,
+        DhanLiveXverifyNotReady::SealSpillParked,
+        DhanLiveXverifyNotReady::NotApplied,
+        DhanLiveXverifyNotReady::CompletenessUnknown,
+    ];
+
+    fn every_readiness() -> Vec<LiveReadiness> {
+        let mut durabilities = vec![Durability::Applied];
+        durabilities.extend(NOT_READY.map(Durability::NotReady));
+        let mut completeness = vec![Completeness::Final, Completeness::Unknown];
+        for st in [0, CLOSE - 600, CLOSE - 300, CLOSE - 1, CLOSE, CLOSE + 60] {
+            completeness.push(Completeness::Frozen {
+                sealed_through_secs_of_day: st,
+            });
+            completeness.push(Completeness::Moving {
+                sealed_through_secs_of_day: st,
+            });
+        }
+        durabilities
+            .iter()
+            .flat_map(|&durability| {
+                completeness.iter().map(move |&completeness| LiveReadiness {
+                    durability,
+                    completeness,
+                })
+            })
+            .collect()
+    }
+
+    /// §12.15.10: the read plan is total and matches its table for every
+    /// readiness, on the last attempt and before it.
+    #[test]
+    fn test_decide_read_is_total_and_matches_its_table() {
+        let mut seen = 0;
+        for r in every_readiness() {
+            for is_last in [false, true] {
+                seen += 1;
+                let plan = decide_read(r, is_last);
+                match plan {
+                    ReadPlan::Retry(reason) => {
+                        assert!(!is_last, "the last attempt never retries: {r:?}");
+                        let expected = match r.durability {
+                            Durability::NotReady(n) => retry_reason(n),
+                            Durability::Applied => AttemptFailure::LiveNotFinal,
+                        };
+                        assert_eq!(reason, expected, "{r:?}");
+                        if r.durability == Durability::Applied {
+                            assert!(matches!(r.completeness, Completeness::Moving { .. }));
+                        }
+                    }
+                    ReadPlan::Read { policy, check_late } => {
+                        if check_late {
+                            assert!(!is_last);
+                            assert_eq!(r.durability, Durability::Applied);
+                            assert_eq!(r.completeness, Completeness::Unknown);
+                            assert_eq!(policy, ReadPolicy::STRICT);
+                        }
+                        if let Some(reason) = policy.not_ready {
+                            assert!(is_last, "{r:?}");
+                            assert!(!check_late);
+                            assert_eq!(policy.late, LateWindowPolicy::Strict);
+                            let expected = match r.durability {
+                                Durability::NotReady(n) => n,
+                                Durability::Applied => DhanLiveXverifyNotReady::CompletenessUnknown,
+                            };
+                            assert_eq!(reason, expected);
+                        }
+                        match (r.durability, r.completeness) {
+                            (Durability::Applied, Completeness::Final) => {
+                                assert_eq!(policy, ReadPolicy::STRICT);
+                            }
+                            (
+                                Durability::Applied,
+                                Completeness::Frozen {
+                                    sealed_through_secs_of_day: st,
+                                }
+                                | Completeness::Moving {
+                                    sealed_through_secs_of_day: st,
+                                },
+                            ) => {
+                                assert_eq!(policy.late, LateWindowPolicy::excuse_after(st));
+                                assert_eq!(policy.not_ready, None);
+                            }
+                            (Durability::Applied, Completeness::Unknown) => {
+                                assert_eq!(check_late, !is_last);
+                            }
+                            (Durability::NotReady(_), _) => assert!(is_last),
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(seen, 5 * 14 * 2);
+    }
+
+    #[test]
+    fn test_every_attempt_failure_label_is_distinct() {
+        let all = [
+            AttemptFailure::NoToken,
+            AttemptFailure::RunFailed,
+            AttemptFailure::Vacuous,
+            AttemptFailure::NotPersisted,
+            AttemptFailure::Incomplete,
+            AttemptFailure::MarkerNotWritten,
+            AttemptFailure::AuditRowsLost,
+            AttemptFailure::SkippedNoTime,
+            AttemptFailure::LiveNotFinal,
+            AttemptFailure::LiveNotApplied,
+            AttemptFailure::SealsPending,
+            AttemptFailure::SealSpillParked,
+        ];
+        // Exhaustive: a new variant fails to compile here until it is listed.
+        for f in all {
+            match f {
+                AttemptFailure::NoToken
+                | AttemptFailure::RunFailed
+                | AttemptFailure::Vacuous
+                | AttemptFailure::NotPersisted
+                | AttemptFailure::Incomplete
+                | AttemptFailure::MarkerNotWritten
+                | AttemptFailure::AuditRowsLost
+                | AttemptFailure::SkippedNoTime
+                | AttemptFailure::LiveNotFinal
+                | AttemptFailure::LiveNotApplied
+                | AttemptFailure::SealsPending
+                | AttemptFailure::SealSpillParked => {}
+            }
+        }
+        let labels: std::collections::HashSet<_> = all.iter().map(|f| f.as_str()).collect();
+        assert_eq!(labels.len(), all.len());
+        // Each not-ready reason retries under its own label.
+        let retry: std::collections::HashSet<_> = NOT_READY
+            .iter()
+            .map(|&n| retry_reason(n).as_str())
+            .collect();
+        assert_eq!(retry.len(), NOT_READY.len());
+    }
+
+    #[test]
+    fn test_option_pass_read_table() {
+        for r in every_readiness() {
+            let read = option_pass_read(r);
+            match (r.durability, r.completeness) {
+                (Durability::NotReady(_), _) => assert_eq!(read, None),
+                (Durability::Applied, Completeness::Final) => {
+                    assert_eq!(read, Some(ReadPolicy::STRICT));
+                }
+                (
+                    Durability::Applied,
+                    Completeness::Frozen {
+                        sealed_through_secs_of_day: st,
+                    }
+                    | Completeness::Moving {
+                        sealed_through_secs_of_day: st,
+                    },
+                ) => assert_eq!(
+                    read,
+                    Some(ReadPolicy {
+                        late: LateWindowPolicy::excuse_after(st),
+                        not_ready: None,
+                    })
+                ),
+                (Durability::Applied, Completeness::Unknown) => {
+                    assert_eq!(read, Some(ReadPolicy::DERIVED_WINDOW));
+                }
+            }
+            // The pass never reads unjudged: it is never the day's verdict.
+            assert!(read.is_none_or(|p| p.not_ready.is_none()));
+        }
+    }
+
+    /// §12.15.10: the attempt waits for the token and the readiness together,
+    /// decides the read from the readiness, and returns a retry before any
+    /// vendor call.
+    #[test]
+    fn test_run_once_joins_both_waits_and_retries_before_the_read() {
+        let body = fn_body(prod_src(), "async fn run_once(");
+        let join = body.find("tokio::join!(").expect("joined waits");
+        let jwt = body.find("wait_for_jwt()").expect("token wait");
+        let ready = body.find("attempt_readiness(").expect("readiness wait");
+        let decide = body
+            .find("decide_read(readiness, is_last)")
+            .expect("decide");
+        let retry = body.find("ReadPlan::Retry(reason)").expect("retry arm");
+        let ret = body.find("return Err(reason);").expect("retry returns");
+        let read = body.find("run_cross_verification(").expect("the read");
+        assert!(join < jwt && jwt < ready && ready < decide, "{body}");
+        assert!(decide < retry && retry < ret && ret < read);
+        assert_eq!(body.matches("wait_for_jwt()").count(), 1);
+        // The read takes the policy the readiness decided.
+        assert!(body[read..].contains("        read,\n"));
+        // The readiness deadline is bounded by the token wait and the attempt.
+        assert!(body.contains(".min(deadline)"));
+    }
+
+    /// §12.15.10: the not-last unknown read that finds late minutes missing
+    /// keeps only the vendor tape and retries `live_not_final` before the
+    /// marker decision; it pages a price divergence as usual.
+    #[test]
+    fn test_run_once_late_check_keeps_only_the_tape_and_retries() {
+        let body = fn_body(prod_src(), "async fn run_once(");
+        let check = body
+            .find("if check_late && c.missing_live_late > 0 {")
+            .expect("late check");
+        let branch = &body[check..];
+        let end = branch
+            .find("return Err(AttemptFailure::LiveNotFinal);")
+            .expect("retry");
+        let branch = &branch[..end];
+        assert!(branch.contains("page_divergence_once(c, divergence_paged)"));
+        assert!(branch.contains("scope: PersistScope::TapeOnly"));
+        assert!(!branch.contains("record_day("));
+        assert!(!branch.contains("classify_attempt("));
+        let verdict = body.find("classify_attempt(").expect("marker decision");
+        assert!(check < verdict);
+        // The divergence page is the moved helper, called once on each path.
+        assert_eq!(body.matches("page_divergence_once(").count(), 2);
+        assert!(!body.contains("source = \"xverify_diverged\""));
+        assert!(
+            fn_body(prod_src(), "fn page_divergence_once(")
+                .contains("source = \"xverify_diverged\"")
+        );
+    }
+
+    /// §12.15.10: a tape-only persist writes the vendor tape and nothing
+    /// else: no findings and no daily row, so it can never mark the day.
+    #[test]
+    fn test_tape_only_persist_writes_no_findings_and_no_daily_row() {
+        let report = report_with(5, 3);
+        let mut writer = DhanLiveXverifyAuditWriter::for_test();
+        let t0 = tokio::time::Instant::now();
+        let far = t0 + Duration::from_secs(86_400);
+        let rows = PersistRows {
+            scope: PersistScope::TapeOnly,
+            ..test_rows()
+        };
+        let out = persist_report_into(&mut writer, &report, rows, 2, far, || t0);
+        assert!(!out.daily_appended);
+        assert_eq!(out.cell_append_errors, 0);
+        // No sender, so every flush discards: only the 3 tape rows were
+        // ever appended.
+        assert_eq!(out.rows_discarded, 3, "{out:?}");
+        assert_eq!(persist_verdict(&out), Err(AttemptFailure::NotPersisted));
+        // Past the deadline it counts only the tape rows as not written.
+        let mut writer = DhanLiveXverifyAuditWriter::for_test();
+        let out = persist_report_into(&mut writer, &report, rows, 2, t0, || t0);
+        assert_eq!(out.rows_not_written_at_deadline, 3, "{out:?}");
+    }
+
+    /// §12.15.10: the two new sources are warnings, and no alarm filter
+    /// matches them (noise lock §2.5: no new page).
+    #[test]
+    fn test_readiness_sources_are_warnings_with_no_alarm_filter() {
+        let prod = prod_src();
+        let tf = include_str!("../../../deploy/aws/terraform/error-code-alarms.tf");
+        for source in ["xverify_attempt_not_ready", "xverify_unsettled_final"] {
+            let emit = format!("source = \"{source}\"");
+            assert!(prod.contains(emit.as_str()), "{source} is not emitted");
+            for (at, _) in prod.match_indices(emit.as_str()) {
+                let head = &prod[..at];
+                let warn_at = head.rfind("warn!(").map_or(0, |i| i + 1);
+                let error_at = head.rfind("error!(").map_or(0, |i| i + 1);
+                assert!(warn_at > error_at, "{source} must be a warn!");
+            }
+            assert!(!tf.contains(source), "{source} must match no alarm filter");
+        }
+    }
+
+    /// §12.15.10: the option pass reads with the spot readiness, waits on its
+    /// own beside the token only when it has none, and skips (never reads
+    /// unjudged) when the sealed bars were not saved.
+    #[test]
+    fn test_run_option_pass_skips_when_not_ready_and_reads_with_the_policy() {
+        let body = fn_body(prod_src(), "async fn run_option_pass(");
+        assert!(body.contains("spot_readiness: Option<LiveReadiness>"));
+        assert!(body.contains("tokio::join!("));
+        let gate = body.find("option_pass_read(readiness)").expect("gate");
+        let skip = body.find("\"skipped_not_ready\"").expect("skip label");
+        let read = body.find("run_cross_verification(").expect("the read");
+        assert!(gate < skip && skip < read);
+        assert!(body[read..].contains("        read,\n"));
+        assert!(XVERIFY_OPTION_PASS_OUTCOMES.contains(&"skipped_not_ready"));
+        let run_day = fn_body(prod_src(), "async fn run_day(");
+        assert!(run_day.contains("spot_readiness.lock()"));
+    }
+
+    // ---- wait_live_final against a paused clock ----
+
+    struct FakeReadiness {
+        t0: tokio::time::Instant,
+        start_unix: i64,
+        progress: Box<dyn Fn(i64) -> Option<SealProgress>>,
+        drained: Box<dyn Fn(i64) -> Option<i64>>,
+        staged: usize,
+        wal: Option<Vec<WalTableRow>>,
+        wal_reads: std::cell::Cell<u32>,
+    }
+
+    impl FakeReadiness {
+        fn elapsed(&self) -> i64 {
+            i64::try_from((tokio::time::Instant::now() - self.t0).as_secs()).unwrap_or(i64::MAX)
+        }
+    }
+
+    impl ReadinessSource for FakeReadiness {
+        fn seal_progress(&self) -> Option<SealProgress> {
+            (self.progress)(self.elapsed())
+        }
+        fn last_drained_unix_secs(&self) -> Option<i64> {
+            (self.drained)(self.now_unix_secs())
+        }
+        fn staged_spill(&self, _date: chrono::NaiveDate) -> std::io::Result<SpillStaged> {
+            spill(self.staged, 0)
+        }
+        fn wal_tables(&self) -> impl Future<Output = anyhow::Result<Vec<WalTableRow>>> + Send {
+            self.wal_reads.set(self.wal_reads.get() + 1);
+            let rows = self.wal.clone();
+            async move { rows.ok_or_else(|| anyhow::anyhow!("questdb unreachable")) }
+        }
+        fn now_unix_secs(&self) -> i64 {
+            self.start_unix + self.elapsed()
+        }
+    }
+
+    fn wal_row(sequencer: i64, writer: i64) -> WalTableRow {
+        WalTableRow {
+            name: LIVE_READ_TABLE.to_string(),
+            suspended: false,
+            writer_txn: Some(writer),
+            sequencer_txn: Some(sequencer),
+            error_tag: None,
+            error_message: None,
+        }
+    }
+
+    fn fake(after_lf: i64) -> FakeReadiness {
+        FakeReadiness {
+            t0: tokio::time::Instant::now(),
+            start_unix: day0().live_final_unix_secs + after_lf,
+            progress: Box::new(|_| None),
+            drained: Box::new(|now| Some(now)),
+            staged: 0,
+            wal: Some(vec![wal_row(7, 7)]),
+            wal_reads: std::cell::Cell::new(0),
+        }
+    }
+
+    fn today0() -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(2024, 10, 4).unwrap_or_default()
+    }
+
+    async fn wait(src: &FakeReadiness, secs: u64) -> (LiveReadiness, u64) {
+        let deadline = src.t0 + Duration::from_secs(secs);
+        let r = wait_live_final(src, today0(), DAY0 * 1_000_000_000, deadline).await;
+        (r, (tokio::time::Instant::now() - src.t0).as_secs())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_wait_live_final_returns_at_once_when_final_and_applied() {
+        let mut src = fake(10);
+        src.progress = Box::new(|_| Some(progress(CLOSE, 5)));
+        let (r, took) = wait(&src, 300).await;
+        assert_eq!(took, 0);
+        assert_eq!(
+            r,
+            LiveReadiness {
+                durability: Durability::Applied,
+                completeness: Completeness::Final,
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_wait_live_final_is_bounded_by_its_deadline() {
+        let mut src = fake(10);
+        src.drained = Box::new(|_| None);
+        let (r, took) = wait(&src, 300).await;
+        assert_eq!(took, 300);
+        assert_eq!(
+            r,
+            LiveReadiness {
+                durability: Durability::NotReady(DhanLiveXverifyNotReady::SealsPending),
+                completeness: Completeness::Unknown,
+            }
+        );
+        assert_eq!(src.wal_reads.get(), 0, "no snapshot before the drain held");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_wait_live_final_sleeps_until_the_live_final_instant() {
+        let mut src = fake(-100);
+        src.progress = Box::new(|_| Some(progress(CLOSE, 0)));
+        let (r, took) = wait(&src, 300).await;
+        // It sleeps 100 s to the instant; the drain sampled there is in the
+        // same second as the reference, so the next sample, 5 s on, holds.
+        assert_eq!(took, 105);
+        assert_eq!(r.completeness, Completeness::Final);
+        assert_eq!(r.durability, Durability::Applied);
+        // A deadline before the instant ends the wait at the deadline.
+        let src = fake(-100);
+        let (r, took) = wait(&src, 40).await;
+        assert_eq!(took, 40);
+        assert_eq!(r.completeness, Completeness::Unknown);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_wait_live_final_frozen_floor_and_unapplied_wal_at_the_deadline() {
+        let mut src = fake(10);
+        src.progress = Box::new(|_| Some(progress(CLOSE - 60, 1)));
+        src.wal = Some(vec![wal_row(9, 8)]);
+        let (r, took) = wait(&src, 120).await;
+        assert_eq!(took, 120);
+        assert_eq!(
+            r,
+            LiveReadiness {
+                durability: Durability::NotReady(DhanLiveXverifyNotReady::NotApplied),
+                completeness: Completeness::Frozen {
+                    sealed_through_secs_of_day: CLOSE - 60
+                },
+            }
+        );
+        // An unreadable `wal_tables()` reads not applied too.
+        let mut src = fake(10);
+        src.progress = Box::new(|_| Some(progress(CLOSE, 0)));
+        src.wal = None;
+        let (r, _) = wait(&src, 60).await;
+        assert_eq!(
+            r.durability,
+            Durability::NotReady(DhanLiveXverifyNotReady::NotApplied)
+        );
+        assert_eq!(r.completeness, Completeness::Final);
+    }
+
+    /// A new floor re-arms the barriers: the drain must come after the sweep
+    /// that sealed the newest bars.
+    #[tokio::test(start_paused = true)]
+    async fn test_wait_live_final_rearms_when_the_floor_moves() {
+        let mut src = fake(10);
+        // Frozen below the close for 30 s, then a sweep at +40 s reaches it.
+        src.progress = Box::new(|elapsed| {
+            Some(if elapsed < 30 {
+                progress(CLOSE - 120, 1)
+            } else {
+                progress(CLOSE, 40)
+            })
+        });
+        // The drain lags the clock by 5 s.
+        src.drained = Box::new(|now| Some(now - 5));
+        let (r, took) = wait(&src, 300).await;
+        assert_eq!(r.completeness, Completeness::Final);
+        assert_eq!(r.durability, Durability::Applied);
+        // Reference = live_final + 40, so the drain (now - 5) passes it at
+        // elapsed > 35; the next 5 s sample after the floor moved is 40.
+        assert_eq!(took, 40, "returned before the drain covered the new sweep");
+    }
+
+    /// Spill files staged for today hold the read.
+    #[tokio::test(start_paused = true)]
+    async fn test_wait_live_final_waits_for_staged_spill_files() {
+        let mut src = fake(10);
+        src.progress = Box::new(|_| Some(progress(CLOSE, 0)));
+        src.staged = 1;
+        let (r, took) = wait(&src, 30).await;
+        assert_eq!(took, 30);
+        assert_eq!(
+            r.durability,
+            Durability::NotReady(DhanLiveXverifyNotReady::SealsPending)
+        );
     }
 }
