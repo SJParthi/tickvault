@@ -705,7 +705,7 @@ mod tests {
     }
 
     #[test]
-    fn test_map_table_has_no_wal_and_a_varchar_name() {
+    fn test_map_table_ddl_and_map_drop_sql_build_a_fresh_table_without_wal() {
         let ddl = map_table_ddl();
         assert!(
             !ddl.contains("timestamp("),
