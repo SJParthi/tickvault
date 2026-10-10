@@ -693,6 +693,7 @@ async fn run_trading_pipeline(
                         m_pipeline_lagged.increment(skipped);
                         if skipped >= TRADING_PIPELINE_LAG_ERROR_THRESHOLD {
                             error!(
+                                code = tickvault_common::error_code::ErrorCode::PipelineLag01TicksSkipped.code_str(),
                                 skipped,
                                 threshold = TRADING_PIPELINE_LAG_ERROR_THRESHOLD,
                                 "trading pipeline SEVERE lag — >1k ticks skipped \

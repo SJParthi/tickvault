@@ -535,6 +535,9 @@ pub fn append_panic_line_sync(path: &std::path::Path, location: &str, payload: &
         "target": "tickvault_app::panic",
         "fields": {
             "message": "PANIC: tickvault crashed",
+            // Audit M3 (2026-10-06): the same code the tracing line carries,
+            // so a crash is findable by code in this file too.
+            "code": tickvault_common::error_code::ErrorCode::Proc03Panicked.code_str(),
             "panic_location": location,
             "panic_payload": payload,
         },
@@ -880,6 +883,7 @@ mod tests {
         assert_eq!(line["level"], "ERROR");
         assert_eq!(line["fields"]["panic_location"], "src/x.rs:1:2");
         assert_eq!(line["fields"]["panic_payload"], "boom \"quoted\"");
+        assert_eq!(line["fields"]["code"], "PROC-03");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

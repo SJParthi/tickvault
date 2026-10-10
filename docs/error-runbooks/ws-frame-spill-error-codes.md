@@ -155,6 +155,20 @@ arm), `crates/common/src/error_code.rs::WsSpill02FrameDropped`.
 
 ---
 
+## §2a. WS-SPILL-03 and WS-SPILL-04 (added 2026-10-06, audit M3)
+
+Two more codes in this family, both Medium and neither alarmed. Their runbook is
+`docs/error-runbooks/audit-m3-error-codes.md`:
+
+- **WS-SPILL-03** — the WAL could not be opened at boot, so boot halts. The halt is
+  paged by the existing boot-heartbeat and liveness alarms.
+- **WS-SPILL-04** — a WAL segment could not be read at boot replay and was skipped.
+  The event already pages through `durable-floor-breach` on
+  `tv_wal_replay_corrupted_segments_total`; WS-SPILL-02 was not reused because it
+  would page the same event a second time.
+
+---
+
 ## §3. Trigger / auto-load
 
 This rule activates when editing:

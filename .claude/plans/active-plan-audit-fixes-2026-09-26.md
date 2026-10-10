@@ -3002,6 +3002,23 @@ Status of the rest, so the next session does not re-audit:
   24 production files across api, app, core, storage and trading, plus
   `crates/common/tests/error_code_tag_guard.rs`. Tests: uncoded_error_sites_may_only_shrink,
   every_critical_code_with_an_emit_site_is_alarmed_or_allowlisted.
+- [x] **M3 (third pass) — the seven uncoded `error!` lines outside the frozen area carry a code.**
+  Six new Medium codes, none matched by any CloudWatch filter (no new page, no new alarm or
+  filter, no shrink-only exemption entry): WS-SPILL-03 (WAL init failure, boot halts; the halt
+  is still paged by the existing boot-heartbeat and liveness alarms), WS-SPILL-04 (unreadable WAL
+  segment skipped at replay; already paged by the existing durable-floor-breach counter alarm),
+  PROC-03 (panic hook, also on the synchronous errors.log line), API-SERVER-01 (API server exit),
+  TICK-GAP-01 (both tick-gap tracker lines, `source` instrument_gap / reconnect_backfill_window;
+  not RISK-GAP-03, which pages on every line) and PIPELINE-LAG-01 (trading pipeline broadcast
+  lag). The ratchet drops 10 -> 3; the three left are the frozen indicator/strategy lines. Files:
+  `crates/common/src/error_code.rs`, `crates/app/src/main.rs`, `crates/app/src/observability.rs`,
+  `crates/app/src/trading_pipeline.rs`, `crates/storage/src/ws_frame_spill.rs`,
+  `crates/trading/src/risk/tick_gap_tracker.rs`, `crates/common/tests/error_code_tag_guard.rs`,
+  `docs/error-runbooks/audit-m3-error-codes.md`, `docs/error-runbooks/ws-frame-spill-error-codes.md`,
+  `.claude/triage/error-rules.yaml`, `docs/audit-2026-10-04.md`. Tests:
+  uncoded_error_sites_may_only_shrink, test_audit_m3_codes_contract,
+  every_error_code_variant_has_a_triage_rule, every_error_code_variant_appears_in_a_rule_file,
+  test_append_panic_line_sync_panic_hook_writes_errors_log_synchronously.
 
 - [x] **H3 (core) — a loom test drives the real ghost-unsubscribe register.** The six
   per-slot registers move into `GhostRegister` (atomics from the new `crate::sync` shim:
@@ -3014,6 +3031,24 @@ Status of the rest, so the next session does not re-audit:
   `.github/workflows/ci.yml`. Tests: a_take_racing_a_new_request_never_tears_loses_or_duplicates,
   a_pending_request_is_never_overwritten_by_a_later_one,
   a_racing_take_never_reads_a_torn_id_and_segment_pair.
+
+- [x] **H3 (core, rest) — the other core loom files drive real code.** Rebuilt 2026-10-09 on a
+  fresh branch from main (the handoff branch is read only). `loom_activity_watchdog` now drives
+  the real `ProgressProbe` and `note_activity` that `ActivityWatchdog::run` and the order-update
+  reader use (the counter is `crate::sync::AtomicU64`); `loom_ws_decoupling` drives the real
+  `RingByteBudget::try_reserve_detailed` and `release` (its two counters are
+  `crate::sync::AtomicUsize`; `new` and `with_slot_cap` stay `const` outside loom).
+  `loom_tick_dedup` is deleted: every model in it copied code that no longer exists. CI loom
+  lane: drift list and `--test` drop `loom_tick_dedup`, count 4 -> 3. Files:
+  `crates/core/src/sync.rs`, `crates/core/src/websocket/activity_watchdog.rs`,
+  `crates/core/src/websocket/order_update_connection.rs`,
+  `crates/core/src/websocket/pool_supervisor.rs`, `crates/core/tests/loom_activity_watchdog.rs`,
+  `crates/core/tests/loom_ws_decoupling.rs`, `.github/workflows/ci.yml`,
+  `.claude/rules/project/testing.md`. Tests:
+  two_readers_never_reserve_past_the_byte_cap_and_the_loser_returns_its_slot,
+  two_readers_never_reserve_past_the_slot_cap, a_reserve_racing_the_drain_release_leaves_exact_counters,
+  stress_readers_and_releases_never_breach_or_leak_the_budget. Honest limit: the tokio channel
+  and the WAL writer are not modelled (loom cannot run them).
 
 ### Added 2026-10-09 (ADANIENT 09:15 volume mismatch)
 

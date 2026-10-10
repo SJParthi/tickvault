@@ -2732,3 +2732,39 @@ What 29c changes, and only this:
 Stated consequences: a drop on a table whose WAL apply is behind (`market_depth`, `ticks`) frees disk only once QuestDB applies up to it; the after-close deferred-depth pass will log WS-SPILL-02 once per old bucket whose segment is gone.
 
 REJECT under 29c: stopping or restarting `tickvault.service` inside 09:00–15:45 IST for this; deleting the open WAL segment, `applied.tvaw`, `deferred_depth.tvdd` or `.wal-owner.lock`; running the S3 delete before the box file deletes.
+
+##### Quote 29e (2026-10-09, 21:52 IST) — ONE-TIME S3 DELETE PERMISSION (amends the "widens IAM" REJECT row above, preserve EXACTLY)
+
+The box half of Quote 29 ran at 16:16 IST (disk 98% to 81%). The S3 half did not run, because no automated identity can delete in `tv-prod-cold` and the REJECT list above forbids widening IAM to do it.
+
+**Operator, 21:46 IST, verbatim:**
+> "why blcoked?"
+
+**Quote 29e (decision card tapped by the operator at 21:52 IST):** "One-time permission" on "Allow a one-time S3 delete permission to remove the pre-9-Oct copies?". The card stated the consequence before the tap: *"I add delete rights for those three folders only, delete every version of the pre-9-Oct copies after close, then take the rights away."* Its context said: *"Audit, SEBI and deploy files are never touched. The deletion cannot be undone."* The alternative, "Keep S3 copies", was declined.
+
+What 29e changes, and only this:
+
+| Item | Locked value |
+|---|---|
+| Identity | One NEW IAM role, `tv-prod-s3-old-data-delete-2026-10-09`, trusted ONLY for the GitHub Actions environment `s3-old-data-delete-2026-10-09` of this repository. No existing role, user or bucket policy gains a permission. |
+| Permissions | `s3:ListBucketVersions` and `s3:ListBucket` on `tv-prod-cold` limited to the three prefixes below, plus `s3:DeleteObject` and `s3:DeleteObjectVersion` on object keys dated before 2026-10-09 under `questdb-partitions/<market-data table>/`, `raw-frames/<date>/` and `seal-spill/<date>/`. Nothing else. |
+| Scope | Exactly the Quote 29 S3 scope: `questdb-partitions/<table>/<partition dated before 2026-10-09>` for the 17 market-data tables only (`ticks`, `market_depth`, `feed_aux_packets`, `top_volume_{1s,3s,5s,1m}`, `candles_{1s,3s,5s,1m,3m,5m,10m,15m,30m,60m}`), `raw-frames/<date before 2026-10-09>/`, `seal-spill/<date before 2026-10-09>/`. Every version and every delete marker. A key that does not parse into that shape is KEPT and reported, never guessed at. |
+| Tool | A Rust tool (`tv-s3-old-data-delete`, app crate) run by a dispatch-only workflow, `dry` first (report only), then `apply`; after deleting it lists again and fails unless nothing in scope remains. |
+| When | Outside 09:00–15:45 IST, never while a deploy workflow is queued or running, and refused after 2026-10-16 IST. |
+| Afterwards | The first PR after the run deletes the role, its policy, the workflow and the tool, and marks this section ENDED with the run record. |
+
+Kept, as in Quote 29: SEBI and audit tables and every `questdb-partitions/` table not in the list above, `sebi-preserve/`, `deploys/`, everything dated 2026-10-09 or later, versioning, lifecycle and the public-access block.
+
+REJECT under 29e:
+- Granting any delete permission to an existing role, user or bucket policy, or a delete grant wider than the keys above (a bucket-wide `*`, `deploys/`, `sebi-preserve/`, a table outside the 17, a date on or after 2026-10-09).
+- Trusting the new role for anything but that one GitHub environment.
+- Running `apply` before a `dry` run of the same tool, inside 09:00–15:45 IST, while a deploy is queued or running, or after 2026-10-16 IST.
+- Keeping the role, the workflow or the tool after the run, or reusing them for any other delete.
+- Suspending versioning, adding an `expiration` or `noncurrent_version_expiration`, or deleting by lifecycle rule.
+- Treating 29e as standing permission: it is spent after this one run, and Quote 27 ("nothing is ever deleted") binds again from then on.
+
+**ENDED 2026-10-10.** The run, on `main` at `c30116f3` (#2044 plus the account-id fix #2050):
+- Dry run (Actions run 38015817935, 07:43 IST): 1,304 versions, 0 delete markers, 109.10 GB in scope across the 19 prefixes (`raw-frames` 1,070 versions / 66.63 GB, `market_depth` 19 / 28.77 GB, `ticks` 75 / 5.46 GB, the ten candle tables 44 / 8.07 GB, the four `top_volume` tables 84 / 0.13 GB, `feed_aux_packets` 5 / 0.02 GB, `seal-spill` 7 / 0.00 GB); 214 versions dated 2026-10-09 or later kept; 0 unrecognised keys.
+- Owner's go, after Quote 29e: "See do everything now even merge and deploy now itself dude okay?" (2026-10-10 07:07 IST).
+- Apply (Actions run 38016206553, 07:44 IST): 1,304 deletes sent; the verify listing found 0 versions in scope; 214 later versions still kept.
+- The role, its policy, the workflow and the tool were deleted by the next PR (plan item 53b). Quote 27 binds again; 29e authorizes nothing further.
