@@ -3464,6 +3464,7 @@ async fn async_main() -> Result<()> {
         &config.dhan_universe,
         &universe_date_ist,
         universe_collapse_expected,
+        trading_calendar.is_trading_day_today(),
     )
     .await;
     // Judged AGAIN after the wait (audit re-check 7). A boot between 07:10

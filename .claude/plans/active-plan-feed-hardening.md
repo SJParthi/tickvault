@@ -6460,6 +6460,36 @@ Observability: the boot logs whether array rows are on and the instant in use. C
 
 Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
 
+
+## ITEM 49e-5 — A non-trading-day boot does not wait for the instrument list (2026-10-10)
+
+- [x] `await_mapping_artifact` takes the trading-day verdict and returns at once on a non-trading day (outcome `non_trading_day`)
+  - Files: crates/app/src/dhan_live_universe.rs, crates/app/src/main.rs, crates/app/tests/universe_boot_race_guard.rs
+  - Tests: test_regression_await_mapping_artifact_does_not_wait_on_a_non_trading_day, every_wait_outcome_is_counted
+
+**Why (Verified, CloudWatch `/tickvault/prod/app` and deploy-aws run 38014245945):** the 07:24 IST deploy on Saturday 10 Oct
+logged "waiting for the daily rider before subscribing", sat in `activating (start)` for 12 minutes, missed the deploy's
+750 s readiness gate, and was reported FAILED (auto-stop and a page) for a healthy binary. The 06:09 IST deploy the same
+morning took the `producer_too_far` arm and was ready in under a minute. The wait only exists so a trading session does not
+start on 4 instruments; with no session today nothing reads the list.
+
+**Edge Cases:** a trading day is unchanged (the new arm needs `!trading_day`); an artifact already on disk still returns
+`already_present` first; a disabled rider still returns `rider_disabled` first.
+
+**Failure Modes:** a calendar that wrongly reads a trading day as a holiday would skip the wait on that day; the resolve
+then takes its existing, loudly logged fallback (newest earlier list), the same as a timed-out wait.
+
+**Rollback:** revert the PR; the wait returns to its earlier behaviour.
+
+**Observability:** `tv_dhan_live_universe_mapping_wait_total{outcome="non_trading_day"}` plus one `info!` line.
+
+**Not fixed (Limitation):** a deploy on a TRADING day between 07:10 and the rider's build hour still waits up to
+`MAPPING_WAIT_MAX_STALL_SECS` (3,600 s), longer than the deploy's 750 s gate; `the_deploy_readiness_gate_outlasts_the_boot_wait_budget`
+compares the gate with `MAPPING_WAIT_DEADLINE_SECS` (600 s), not that stall.
+
+Guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row) — boot path only, no hot-path,
+table, alarm or WebSocket change.
+
 ## ITEM 51 — Dhan 15:41 cross-verification hardening (2026-10-06)
 
 Approved by Parthiban 2026-10-06: "Go ahead with whatever you want dude" and "See do everything whatever is recommended dude okay?", answering the recommended cross-verification hardening list (five findings: the day marker, the read that runs too early, missing minutes that never page, a day with no run at all, and targets fixed at boot). Rule authority: `no-rest-except-live-feed-2026-06-27.md` §12.15.7 onward and the noise lock §2.5 notes, each dated and recorded before its code. Ten serial PRs, one sub-item each. Findings Verified by reading `origin/main` at `60bdfd97a`; cargo was not run for the findings.
