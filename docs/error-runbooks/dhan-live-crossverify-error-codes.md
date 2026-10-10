@@ -137,7 +137,7 @@ source, alarm, filter or page: the existing `finished` line of
 
 | Column / field / kind | Where | Means | Operator action |
 |---|---|---|---|
-| `late_excused` (LONG), cell kind `late_excused` | `dhan_live_crossverify_daily`, `dhan_live_crossverify_cell_audit`, `finished` line | a traded or index minute missing from our side inside the end-of-session window (`LATE_SEAL_WINDOW_MINUTES`, 15:35 to 15:39 today) that may not have sealed by the read; never real, holds the day at `partial` | none for one day; if it is non-zero most days, check the seal catch-up (plan item 51d judges these minutes once the read waits for the seal) |
+| `late_excused` (LONG), cell kind `late_excused` | `dhan_live_crossverify_daily`, `dhan_live_crossverify_cell_audit`, `finished` line | a traded or index minute missing from our side inside the end-of-session window (`LATE_SEAL_WINDOW_MINUTES`, 15:35 to 15:39 today), after that instrument's last live minute, that may not have sealed by the read (a gap before a later live bar of the same instrument is judged, never excused); never real, holds the day at `partial` | none for one day; if it is non-zero most days, check the seal catch-up (plan item 51d judges these minutes once the read waits for the seal) |
 | `missing_live_unjudged` (LONG), cell kind `missing_live_unjudged` | same | the live read hit its row cap, so a missing traded or index minute could not be told from an unread one; never real, holds the day at `partial` | check that `live_truncated = true` on the `finished` line (and `missing_judgeable = live_truncated` on the daily row); a cap hit means the day's live rows outgrew the read cap |
 | `missing_judgeable` (SYMBOL: `judged` / `live_truncated`) | `dhan_live_crossverify_daily`, `finished` line | whether missing minutes were judged on this run | `live_truncated`: as the row above |
 | `missing_live_late` | `finished` line only | traded or index minutes missing in the late window, whatever the policy; a measurement for plan item 51d | none |
@@ -176,9 +176,15 @@ ORDER BY attempt_at DESC LIMIT 1;
 -- 3. The day's findings, whatever attempt wrote them (newest write first).
 SELECT * FROM dhan_live_crossverify_cell_audit
 WHERE trading_date_ist = '<day>T00:00:00.000000Z'
-  AND kind IN ('diverged', 'missing_live')
+  AND (kind = 'diverged'
+       OR (kind = 'missing_live' AND (rest_volume > 0 OR segment = 'IDX_I')))
 ORDER BY attempt_at DESC;
 ```
+
+Query 3 leaves out a `missing_live` cell whose Dhan minute printed volume 0 on
+a non-index instrument: such a minute is never a real finding (§12.15.9). It is
+still written with kind `missing_live` and counted in the daily row's
+`missing_live_zero_volume`.
 
 When query 1 finds a `diverged` row and a newer row of the day reads
 `partial` or `clean`, read the newer row too: until plan item 51d, a sealed bar

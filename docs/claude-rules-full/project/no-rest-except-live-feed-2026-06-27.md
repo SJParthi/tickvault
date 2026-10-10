@@ -2413,7 +2413,7 @@ the alarms, their filters, or the hold ceiling.
 | Outcome, nothing compared | unchanged: `degraded` when `rest_incomplete` or not judged, else `blind` (rows seen) or `no_data` |
 | Why a failed fetch cannot hide anything | a target whose vendor fetch failed has no vendor bars, so it can add only `missing_rest`, never a false `missing_live`. The truncated live read is the one input this run can DETECT that fakes a missing live minute, so it alone turns missing-minute judging off. It is NOT the only input that can fake one: until plan item 51d, a sealed bar that is not yet readable when the read runs (still queued for the seal writer, staged in a spill file after a QuestDB outage, or ACKed but not yet applied by QuestDB's WAL), and a live row the read skips as malformed (counted on the `finished` line as `malformed_rows`), each read as a judged `missing_live`, anywhere in the day, and the day reads `diverged` (see the Honest limits) |
 | Late window | `LATE_SEAL_WINDOW_MINUTES = (CATCHUP_LATENESS_MARGIN_SECS + LAST_FOLDED_TRADE_SLACK_SECS) / 60`, rounded up: **5** today ((240 + 60) / 60, 15:35 to 15:39). `LAST_FOLDED_TRADE_SLACK_SECS` = 60 is how far before the close the feed's newest folded trade stamp may stop: the window covers every unsealed bucket only when that stamp is at or after 15:39:00. That is **Assumed**, not measured or checked. The read time does not enter: the cutoff follows the watermark, not the run. Compile-time asserted to cover the margin plus that slack. `TAIL_UNSEALED_MINUTES` is deleted |
-| `Excuse` | `Excuse { sealed_through: None }` excuses the last `LATE_SEAL_WINDOW_MINUTES` session minutes; `Excuse { sealed_through: Some(t) }` excuses every session bucket that ends after `t`. A traded or index minute missing there is counted in `late_excused` with cell kind `late_excused`, is not real, and holds the day at `partial` at best |
+| `Excuse` | `Excuse { sealed_through: None }` excuses the last `LATE_SEAL_WINDOW_MINUTES` session minutes; `Excuse { sealed_through: Some(t) }` excuses every session bucket that ends after `t`. Either way only a minute AFTER the instrument's own last live minute is late: a later live bar of the same instrument means its tick closed the bucket, so a gap before it is judged like any other (third review round 2026-10-10). A traded or index minute missing there is counted in `late_excused` with cell kind `late_excused`, is not real, and holds the day at `partial` at best |
 | `Strict` | no minute is excused. A traded or index minute missing anywhere, 15:38 and 15:39 included, is `missing_live` and real |
 | Not judged | a traded or index minute missing from our side is counted in `missing_live_unjudged` with cell kind `missing_live_unjudged`, is not real, and holds the day at `partial` at best. A not-judged minute is never also counted as excused |
 | A zero-volume minute | a non-index minute Dhan printed with volume 0 is never real, in or out of the window: it stays `missing_live` (`missing_live_zero_volume`), as since §46b |
@@ -2458,11 +2458,13 @@ the alarms, their filters, or the hold ceiling.
   attempt that wrote it, and a finding no later attempt re-found keeps its
   earlier stamp, which may match no surviving daily row (also the case for
   cells of an attempt whose persist stopped before its daily row). So the
-  day's real findings are every `diverged` and `missing_live` cell of the
-  day, whatever its stamp. The §12.15.6 option pass stamps its own cells and
-  writes no daily row. *(Corrected in the second review round 2026-10-10:
-  the first correction said "that row's findings are the cells with the same
-  `attempt_at`" and called unmatched stamps leftovers of a failed persist,
+  day's real findings are every `diverged` cell of the day and every
+  `missing_live` cell whose Dhan minute traded (`rest_volume > 0`) or is an
+  index, whatever its stamp (a zero-volume non-index minute stays
+  `missing_live` and is never real, per the row above). The §12.15.6 option
+  pass stamps its own cells and writes no daily row. *(Corrected in the
+  second review round 2026-10-10: the first correction said "that row's
+  findings are the cells with the same `attempt_at`" and called unmatched stamps leftovers of a failed persist,
   which drops a real divergence an earlier `diverged` attempt found and a
   later `diverged` attempt did not re-find.)*
   The marker and the S3 hold are unchanged: they follow the attempt that wrote
@@ -2511,4 +2513,4 @@ the alarms, their filters, or the hold ceiling.
   reads `diverged` for a minute that was only unsealed, not lost. Until 51d
   replaces the window with the published seal progress.
 
-**What a PR that violates §12.15.9 looks like (REJECT):** a literal count of excused end-of-session minutes, or a late window not derived from the catch-up margin; letting `rest_incomplete` (a failed fetch or the budget) hide a judged missing minute or a price divergence; an excused or unjudged minute that leaves the day `clean`; any input that turns a `diverged` day into anything else, a later attempt included (a reader rule that lets a newer non-`diverged` row outrank a `diverged` one); excusing a minute under `Strict`; changing `is_catastrophic_divergence` or any page under cover of this section; dropping the `tail_unsealed` column or kind; dropping `attempt_at` or `run_complete`, reading `attempt_at` more than once per attempt, or putting either in a DEDUP key; a new alarm, filter or page source for these findings without its own dated row in the noise lock.
+**What a PR that violates §12.15.9 looks like (REJECT):** a literal count of excused end-of-session minutes, or a late window not derived from the catch-up margin; letting `rest_incomplete` (a failed fetch or the budget) hide a judged missing minute or a price divergence; an excused or unjudged minute that leaves the day `clean`; any input that turns a `diverged` day into anything else, a later attempt included (a reader rule that lets a newer non-`diverged` row outrank a `diverged` one); excusing a minute under `Strict`; excusing a minute missing before a later live bar of the same instrument; changing `is_catastrophic_divergence` or any page under cover of this section; dropping the `tail_unsealed` column or kind; dropping `attempt_at` or `run_complete`, reading `attempt_at` more than once per attempt, or putting either in a DEDUP key; a new alarm, filter or page source for these findings without its own dated row in the noise lock.

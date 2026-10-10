@@ -856,7 +856,9 @@ impl DhanLiveXverifyAuditWriter {
     /// it (the cell key has no attempt), so a cell's `attempt_at` is the LAST
     /// attempt that wrote it. The stamps order the writes; they do not split
     /// the findings by attempt, and the day's real findings are every
-    /// `diverged` and `missing_live` cell of the day (§12.15.9 reader rule).
+    /// `diverged` cell of the day and every `missing_live` cell whose Dhan
+    /// minute traded (`rest_volume > 0`) or is an index (§12.15.9 reader
+    /// rule; a zero-volume non-index minute is never real).
     /// The §12.15.6 option pass stamps its own cells and writes no daily row.
     ///
     /// # Errors
