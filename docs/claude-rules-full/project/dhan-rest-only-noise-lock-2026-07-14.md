@@ -4707,51 +4707,37 @@ minutes, which is what §2.3's "one per episode" always said. Cost unchanged.
   strikes latch it for the day.
 - Removes the 30-minute cooldown or pages never-ticked contracts every scan.
 
-## §2.13 — 2026-10-10: per-kind frame-silence redials (no new page; how they meet the deaf and reconnect-slow pages)
+## §2.12 — 2026-10-06: an 808 refreshes the token once before it parks (no new page)
 
-Owner, verbatim, each with its own date:
+Owner, 2026-10-06: "Go ahead with whatever you want dude", and on the
+recommended-fixes list, "See do everything whatever is recommended dude okay?".
+Owner, 2026-10-10: "Why idle go ahead fully". *(Numbered §2.12 because §2.11
+was taken the same day by the `RISK-GAP-03` re-arm; the spec that ordered this
+section called it §2.11.)*
 
-- 2026-10-06: "Go ahead with whatever you want dude"
-- 2026-10-06: "See do everything whatever is recommended dude okay?"
-- 2026-10-10: "Why idle go ahead fully"
+The policy lives in the scope lock, section "2026-10-06 — 808 REFRESHES THE
+TOKEN ONCE BEFORE IT PARKS". What it changes for pages and alarms:
 
-(§2.12 is reserved by a parallel branch; this row takes the next free number.)
+- **(i)** `dhan-socket-parked` fires on an 808 only at the TERMINAL park (the
+  refreshed token was rejected too, or a cap tripped), no longer on the first
+  808. Its alarm definition, its `host`-only dimension and its lack of
+  `ok_actions` are unchanged; only its description text changes, and the same
+  for the every-socket-gone alarm's description (806/810, or an 808 that a
+  refreshed token did not cure).
+- **(ii)** The family-(3) `AuthenticationFailed` body sent from
+  `force_renewal_unless_replaced` changes from "(code 807)" to wording that
+  covers 807, 808 and 809 and still names Dhan. Same site, same once-per-token
+  latch.
+- **(iii)** A self-healing main-feed 808 inside 09:15–15:30 can still push
+  `tv_dhan_ws_main_reconnect_recovery_max_ms` past the threshold of the
+  existing `dhan-main-reconnect-slow` alarm, exactly as an 807 can today.
+- **(iv)** No new alarm, page, EMF name or metric filter. `reason="auth_rejected"`
+  rides the existing reconnect counter, and the new
+  `tv_token_renew_failure_reused_total` is a plain Prometheus counter that is
+  NOT EMF-selected.
 
-**What changed (full rule: `websocket-connection-scope-lock.md` "2026-10-10 —
-PER-KIND FRAME-SILENCE THRESHOLDS"):** a main-feed or depth-20 socket can be
-redialled after 60 / 90 s of silence when two same-kind siblings are live, and
-a depth-200 socket is redialled on a 900 s backstop (was 300 s) or a cross-feed
-check. The fast paths ship in SHADOW mode (count only).
-
-**Allowed set unchanged.** No new code, alarm, filter, EMF name, dimension or
-`ok_actions`:
-
-- `dhan-worst-socket-deaf` stays at 600 s, period 300 s, `Maximum`,
-  evaluation 1.
-- `dhan-main-reconnect-slow` stays at 15,000 ms.
-- `tv_dhan_ws_frame_silence_redial_total`,
-  `tv_dhan_ws_frame_silence_would_redial_total`,
-  `tv_dhan_ws_data_silence_request_stale_total` and
-  `tv_dhan_ws_conn_frame_gap_max_secs` are local `/metrics` only, seeded at 0,
-  and in no EMF selector.
-
-**Recorded interactions (no change made for them):**
-
-- Once the fast path is flipped to `act`, a fast redial feeds main-feed
-  reconnect-recovery samples earlier. A healthy socket gets a frame pushed on
-  subscribe, so its sample is about 2 s. A sample of 15 s or more means the
-  redial did not cure the socket, which is what the reconnect-slow page is
-  for.
-- Pre-existing, not fixed here: while the drain sheds all depth
-  (`ShedLevel::AllDepth`), the depth-20 last-tick stamps the deaf gauge reads
-  stop moving, so `dhan-worst-socket-deaf` can page on healthy depth-20
-  sockets. Fixing that changes a page and needs its own dated row.
-- A deaf depth-200 socket whose contract the main feed does not track now
-  waits 900 s, and depth-200 is not on the deaf gauge, so nothing pages for
-  it (the same as before for depth-200; only the redial is later).
-
-**What a PR that violates §2.13 looks like (REJECT):**
-- Lowers `dhan-worst-socket-deaf` below 600 s, or edits either alarm's
-  `alarm_description`, without a further dated row here.
-- Ships any of the four new series to CloudWatch (EMF selector, filter or
-  alarm) without a dated row here.
+**What a PR that violates §2.12 looks like (REJECT):**
+- Adds `ok_actions`, or any dimension beyond `host`, to `dhan-socket-parked`.
+- Adds a separate page for a first (self-healing) 808.
+- EMF-selects `tv_dhan_ws_reconnect_total{reason="auth_rejected"}` as its own
+  series or `tv_token_renew_failure_reused_total`.
