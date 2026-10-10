@@ -266,7 +266,7 @@ sealed bar is queued, staged in a spill file or not yet applied by QuestDB.
 | `source = "xverify_unsettled_final"` | WARN (log only) | the day's LAST attempt read with our candles not known final: prices were compared, missing minutes were not judged | read the day's `missing_judgeable` (below); the day is `partial` at best |
 | `missing_judgeable` = `not_ready_seals_pending` / `not_ready_seal_spill_parked` / `not_ready_not_applied` / `not_ready_completeness_unknown` | daily row, `finished` line | the last attempt's reason for not judging missing minutes | as the matching row above |
 | `tv_dhan_xverify_option_pass_total{outcome="skipped_not_ready"}` | `info!` | the option pass did not run because the spot check found our candles not saved | none |
-| `xverify_failed`, `reason` = one of the four above | ERROR (pages, last attempt only) | every attempt found our candles not ready and the last one could not read either | as the matching row above; S3 stays held |
+| `xverify_failed`, `reason` = one of the four above | ERROR (pages, last attempt only) | an earlier attempt retried with this reason and the next one was skipped for lack of time before 17:23 (the last attempt itself always reads) | as the matching row above; S3 stays held |
 
 ```sql
 -- QuestDB WAL apply state for the table the check reads.

@@ -989,17 +989,12 @@ impl ReadinessSource for ProductionReadiness<'_> {
         tickvault_storage::seal_writer_loop::last_seal_drained_unix_secs()
     }
 
-    fn staged_spill(
-        &self,
-        date: chrono::NaiveDate,
-    ) -> impl Future<Output = std::io::Result<SpillStaged>> + Send {
-        async move {
-            tokio::task::spawn_blocking(move || {
-                tickvault_storage::seal_spill::staged_production_spill_records_for_day(date)
-            })
-            .await
-            .unwrap_or_else(|join| Err(std::io::Error::other(join)))
-        }
+    async fn staged_spill(&self, date: chrono::NaiveDate) -> std::io::Result<SpillStaged> {
+        tokio::task::spawn_blocking(move || {
+            tickvault_storage::seal_spill::staged_production_spill_records_for_day(date)
+        })
+        .await
+        .unwrap_or_else(|join| Err(std::io::Error::other(join)))
     }
 
     fn wal_tables(&self) -> impl Future<Output = anyhow::Result<Vec<WalTableRow>>> + Send {
@@ -1015,37 +1010,60 @@ impl ReadinessSource for ProductionReadiness<'_> {
 #[derive(Debug, Clone, Copy)]
 struct ReadinessTracker {
     day: ReadinessDay,
+    /// The first sample whose sweep completed at or after the live-final
+    /// instant, kept across the day's attempts in this process.
     first: Option<SealProgress>,
     latest: Option<SealProgress>,
     /// The first sample carrying the latest floor value: its sweep sealed
-    /// the newest bars, so the drain must come after it.
+    /// the newest bars, so the drain must come after it. Once a floor at or
+    /// past the close is seen, it stays at that sample.
     floor_since: Option<SealProgress>,
-    /// `candles_1m`'s `sequencerTxn`, snapshotted once per floor value after
-    /// the drain and spill barriers held.
+    /// `candles_1m`'s `sequencerTxn`, snapshotted once after the drain and
+    /// spill barriers held, and dropped whenever either fails again.
     snapshot_txn: Option<i64>,
     /// The last durability verdict.
     durability: Durability,
+    /// The newest sample all three barriers held for: its bars are saved.
+    applied_at: Option<SealProgress>,
 }
 
 impl ReadinessTracker {
-    fn new(day: ReadinessDay) -> Self {
+    fn new(day: ReadinessDay, prior_first: Option<SealProgress>) -> Self {
         Self {
             day,
-            first: None,
+            first: prior_first,
             latest: None,
             floor_since: None,
             snapshot_txn: None,
             durability: Durability::NotReady(DhanLiveXverifyNotReady::SealsPending),
+            applied_at: None,
         }
     }
 
+    /// Whether `floor` is at or past today's close.
+    fn past_close(&self, floor: u32) -> bool {
+        let floor = i64::from(floor);
+        floor >= self.day.close_fold_secs
+            && floor
+                < self
+                    .day
+                    .day_start_fold_secs
+                    .saturating_add(SECS_PER_DAY as i64)
+    }
+
     /// Records one progress sample. A new floor value re-arms the durability
-    /// barriers: its sweep sealed bars the earlier drain did not cover.
+    /// barriers, since its sweep sealed bars the earlier drain did not cover;
+    /// a floor that moves on past the close does not, because every session
+    /// bucket was already sealed by the sweep that crossed it.
     fn observe(&mut self, sample: Option<SealProgress>) {
         let Some(p) = sample else {
             return;
         };
-        if self.floor_since.map(|s| s.floor_fold_secs) != Some(p.floor_fold_secs) {
+        let crossed = self
+            .floor_since
+            .is_some_and(|s| self.past_close(s.floor_fold_secs));
+        let moved = self.floor_since.map(|s| s.floor_fold_secs) != Some(p.floor_fold_secs);
+        if moved && !(crossed && self.past_close(p.floor_fold_secs)) {
             self.floor_since = Some(p);
             self.snapshot_txn = None;
             self.durability = Durability::NotReady(DhanLiveXverifyNotReady::SealsPending);
@@ -1063,6 +1081,12 @@ impl ReadinessTracker {
             .map_or(i64::MIN, |s| i64::from(s.done_unix_secs))
             .max(self.day.live_final_unix_secs)
     }
+
+    /// The sample whose bars are known saved: `floor_since` while the
+    /// barriers hold.
+    fn mark_applied(&mut self) {
+        self.applied_at = self.floor_since.or(self.latest);
+    }
 }
 
 /// Waits until the live side is final or `deadline` passes, and reports what
@@ -1077,6 +1101,12 @@ impl ReadinessTracker {
 /// as completeness is decided and durability holds; otherwise at the deadline
 /// with what it has. A `wal_tables()` error or timeout reads `NotApplied`.
 ///
+/// At the deadline, when the barriers do not hold for the newest floor but
+/// held for an earlier one, it reports that earlier floor as applied: its
+/// bars are saved, and the minutes after it are judged as not yet sealed.
+/// `prior_first` is the day's first sample after the live-final instant from
+/// an earlier attempt; the returned one is kept for the next.
+///
 /// O(tables + spill files) per sample, at most one sample per
 /// [`READINESS_POLL_SECS`], cold.
 async fn wait_live_final<R: ReadinessSource>(
@@ -1084,14 +1114,15 @@ async fn wait_live_final<R: ReadinessSource>(
     today: chrono::NaiveDate,
     day_start_ist_nanos: i64,
     deadline: tokio::time::Instant,
-) -> LiveReadiness {
+    prior_first: Option<SealProgress>,
+) -> (LiveReadiness, Option<SealProgress>) {
     let day = ReadinessDay::new(day_start_ist_nanos);
     let early = day.live_final_unix_secs.saturating_sub(src.now_unix_secs());
     if early > 0 {
         let wake = tokio::time::Instant::now() + Duration::from_secs(early.unsigned_abs());
         tokio::time::sleep_until(wake.min(deadline)).await;
     }
-    let mut t = ReadinessTracker::new(day);
+    let mut t = ReadinessTracker::new(day, prior_first);
     loop {
         t.observe(src.seal_progress());
         if t.durability != Durability::Applied {
@@ -1104,7 +1135,12 @@ async fn wait_live_final<R: ReadinessSource>(
                 t.reference_unix_secs(),
                 &spill,
             ) {
-                Err(reason) => Durability::NotReady(reason),
+                Err(reason) => {
+                    // A snapshot taken before this failure may predate seals
+                    // written since; take a fresh one once it clears.
+                    t.snapshot_txn = None;
+                    Durability::NotReady(reason)
+                }
                 Ok(()) => match tokio::time::timeout_at(deadline, src.wal_tables()).await {
                     Ok(Ok(rows)) => {
                         let target = match t.snapshot_txn {
@@ -1131,28 +1167,50 @@ async fn wait_live_final<R: ReadinessSource>(
                     }
                 },
             };
+            if t.durability == Durability::Applied {
+                t.mark_applied();
+            }
         }
         let now = tokio::time::Instant::now();
         let at_deadline = now >= deadline;
-        if let Some(completeness) = classify_completeness(day, t.first, t.latest, at_deadline)
-            && (t.durability == Durability::Applied || at_deadline)
+        let (durability, latest) = match (t.durability, t.applied_at) {
+            (Durability::NotReady(_), Some(saved)) if at_deadline => {
+                (Durability::Applied, Some(saved))
+            }
+            (d, _) => (d, t.latest),
+        };
+        if let Some(completeness) = classify_completeness(day, t.first, latest, at_deadline)
+            && (durability == Durability::Applied || at_deadline)
         {
-            return LiveReadiness {
-                durability: t.durability,
-                completeness,
-            };
+            return (
+                LiveReadiness {
+                    durability,
+                    completeness,
+                },
+                t.first,
+            );
         }
         if at_deadline {
             // Unreachable: `classify_completeness` decides at the deadline.
-            return LiveReadiness {
-                durability: t.durability,
-                completeness: Completeness::Unknown,
-            };
+            return (
+                LiveReadiness {
+                    durability,
+                    completeness: Completeness::Unknown,
+                },
+                t.first,
+            );
         }
         tokio::time::sleep_until((now + Duration::from_secs(READINESS_POLL_SECS)).min(deadline))
             .await;
     }
 }
+
+/// The day's first catch-up sample after the live-final instant, kept across
+/// the day's attempts in this process so `Frozen` means "unchanged since that
+/// sample", not "unchanged during this attempt" (§12.15.10). Keyed by the
+/// day's IST midnight in fold seconds. A restart starts it again.
+static FIRST_AFTER_LIVE_FINAL: std::sync::Mutex<Option<(i64, SealProgress)>> =
+    std::sync::Mutex::new(None);
 
 /// The readiness for one attempt: the wait for today, or
 /// [`LiveReadiness::PAST_DAY`] when the day checked is no longer today.
@@ -1165,16 +1223,33 @@ async fn attempt_readiness(
     if today_ist().0 != today {
         return LiveReadiness::PAST_DAY;
     }
-    // A build failure falls back to the default client; each probe is still
-    // bounded by `timeout_at(deadline, ..)` in the wait.
+    // `Client::default()` panics when the client cannot be built, and the
+    // process aborts on a panic, so a build failure reads not applied.
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(Duration::from_secs(READINESS_PROBE_TIMEOUT_SECS))
+        .build()
+    else {
+        return LiveReadiness {
+            durability: Durability::NotReady(DhanLiveXverifyNotReady::NotApplied),
+            completeness: Completeness::Unknown,
+        };
+    };
     let src = ProductionReadiness {
-        client: reqwest::Client::builder()
-            .timeout(Duration::from_secs(READINESS_PROBE_TIMEOUT_SECS))
-            .build()
-            .unwrap_or_default(),
+        client,
         exec_url: &deps.questdb_exec_url,
     };
-    wait_live_final(&src, today, day_start_ist_nanos, deadline).await
+    let day_key = day_start_ist_nanos.div_euclid(1_000_000_000);
+    let prior = FIRST_AFTER_LIVE_FINAL
+        .lock()
+        .ok()
+        .and_then(|slot| *slot)
+        .and_then(|(key, p)| (key == day_key).then_some(p));
+    let (readiness, first) =
+        wait_live_final(&src, today, day_start_ist_nanos, deadline, prior).await;
+    if let (Some(p), Ok(mut slot)) = (first, FIRST_AFTER_LIVE_FINAL.lock()) {
+        *slot = Some((day_key, p));
+    }
+    readiness
 }
 
 /// One `wal_tables()` probe's own timeout during the readiness wait.
@@ -5754,8 +5829,8 @@ mod tests {
         start_unix: i64,
         progress: Box<dyn Fn(i64) -> Option<SealProgress>>,
         drained: Box<dyn Fn(i64) -> Option<i64>>,
-        staged: usize,
-        wal: Option<Vec<WalTableRow>>,
+        staged: Box<dyn Fn(i64) -> usize>,
+        wal: Box<dyn Fn(i64) -> Option<Vec<WalTableRow>>>,
         wal_reads: std::cell::Cell<u32>,
     }
 
@@ -5776,12 +5851,12 @@ mod tests {
             &self,
             _date: chrono::NaiveDate,
         ) -> impl Future<Output = std::io::Result<SpillStaged>> + Send {
-            let staged = spill(self.staged, 0);
+            let staged = spill((self.staged)(self.elapsed()), 0);
             async move { staged }
         }
         fn wal_tables(&self) -> impl Future<Output = anyhow::Result<Vec<WalTableRow>>> + Send {
             self.wal_reads.set(self.wal_reads.get() + 1);
-            let rows = self.wal.clone();
+            let rows = (self.wal)(self.elapsed());
             async move { rows.ok_or_else(|| anyhow::anyhow!("questdb unreachable")) }
         }
         fn now_unix_secs(&self) -> i64 {
@@ -5806,8 +5881,8 @@ mod tests {
             start_unix: day0().live_final_unix_secs + after_lf,
             progress: Box::new(|_| None),
             drained: Box::new(|now| Some(now)),
-            staged: 0,
-            wal: Some(vec![wal_row(7, 7)]),
+            staged: Box::new(|_| 0),
+            wal: Box::new(|_| Some(vec![wal_row(7, 7)])),
             wal_reads: std::cell::Cell::new(0),
         }
     }
@@ -5818,7 +5893,7 @@ mod tests {
 
     async fn wait(src: &FakeReadiness, secs: u64) -> (LiveReadiness, u64) {
         let deadline = src.t0 + Duration::from_secs(secs);
-        let r = wait_live_final(src, today0(), DAY0 * 1_000_000_000, deadline).await;
+        let (r, _) = wait_live_final(src, today0(), DAY0 * 1_000_000_000, deadline, None).await;
         (r, (tokio::time::Instant::now() - src.t0).as_secs())
     }
 
@@ -5874,7 +5949,7 @@ mod tests {
     async fn test_wait_live_final_frozen_floor_and_unapplied_wal_at_the_deadline() {
         let mut src = fake(10);
         src.progress = Box::new(|_| Some(progress(CLOSE - 60, 1)));
-        src.wal = Some(vec![wal_row(9, 8)]);
+        src.wal = Box::new(|_| Some(vec![wal_row(9, 8)]));
         let (r, took) = wait(&src, 120).await;
         assert_eq!(took, 120);
         assert_eq!(
@@ -5889,7 +5964,7 @@ mod tests {
         // An unreadable `wal_tables()` reads not applied too.
         let mut src = fake(10);
         src.progress = Box::new(|_| Some(progress(CLOSE, 0)));
-        src.wal = None;
+        src.wal = Box::new(|_| None);
         let (r, _) = wait(&src, 60).await;
         assert_eq!(
             r.durability,
@@ -5926,7 +6001,7 @@ mod tests {
     async fn test_wait_live_final_waits_for_staged_spill_files() {
         let mut src = fake(10);
         src.progress = Box::new(|_| Some(progress(CLOSE, 0)));
-        src.staged = 1;
+        src.staged = Box::new(|_| 1);
         let (r, took) = wait(&src, 30).await;
         assert_eq!(took, 30);
         assert_eq!(
@@ -5943,12 +6018,109 @@ mod tests {
         let src = include_str!("dhan_live_crossverify_boot.rs");
         let prod = src.split("#[cfg(test)]\nmod tests").next().unwrap_or(src);
         assert!(prod.contains(
-            "tokio::task::spawn_blocking(move || {\n                tickvault_storage::seal_spill::staged_production_spill_records_for_day(date)"
+            "tokio::task::spawn_blocking(move || {\n            tickvault_storage::seal_spill::staged_production_spill_records_for_day(date)"
         ));
         assert!(
             prod.contains("tokio::time::timeout_at(deadline, src.staged_spill(today))"),
             "the listing is bounded by the deadline"
         );
         assert!(prod.contains("Err(std::io::ErrorKind::TimedOut.into())"));
+    }
+
+    /// 51d review: a floor that moved in the deadline sample re-arms the
+    /// barriers, and the probe at the deadline cannot finish; the wait then
+    /// reports the last floor whose bars it saw saved, as applied, so a last
+    /// attempt excuses after that floor instead of reading unjudged.
+    #[tokio::test(start_paused = true)]
+    async fn test_wait_live_final_reports_the_last_applied_floor_at_the_deadline() {
+        let mut src = fake(10);
+        // The floor steps 10 s every 50 s, below the close; the step at 300
+        // lands on the deadline sample.
+        src.progress =
+            Box::new(|elapsed| Some(progress(CLOSE - 240 + 10 * (elapsed / 50), elapsed)));
+        src.drained = Box::new(|now| Some(now - 15));
+        let (r, took) = wait(&src, 300).await;
+        assert_eq!(took, 300);
+        assert_eq!(
+            r,
+            LiveReadiness {
+                durability: Durability::Applied,
+                completeness: Completeness::Moving {
+                    sealed_through_secs_of_day: CLOSE - 190
+                },
+            }
+        );
+    }
+
+    /// 51d review: once a floor at or past the close is seen, later floors
+    /// (post-close trades keep the watermark moving) do not re-arm the
+    /// barriers; every session bucket was sealed by the sweep that crossed.
+    #[tokio::test(start_paused = true)]
+    async fn test_wait_live_final_does_not_rearm_past_the_close() {
+        let mut src = fake(10);
+        src.progress = Box::new(|elapsed| Some(progress(CLOSE + elapsed, elapsed)));
+        src.drained = Box::new(|now| Some(now - 15));
+        let (r, took) = wait(&src, 300).await;
+        assert_eq!(r.completeness, Completeness::Final);
+        assert_eq!(r.durability, Durability::Applied);
+        // The reference stays at the crossing sweep (live-final + 0), which
+        // the lagging drain passes at the third sample.
+        assert_eq!(took, 10);
+    }
+
+    /// 51d review: a barrier that fails after the WAL snapshot drops it, so
+    /// the next snapshot covers seals written since (a replayed spill file).
+    #[tokio::test(start_paused = true)]
+    async fn test_wait_live_final_takes_a_fresh_snapshot_after_a_barrier_fails() {
+        let mut src = fake(10);
+        src.progress = Box::new(|_| Some(progress(CLOSE - 60, 0)));
+        src.staged = Box::new(|elapsed| usize::from((20..30).contains(&elapsed)));
+        src.wal = Box::new(|elapsed| {
+            Some(vec![if elapsed < 20 {
+                wal_row(9, 8)
+            } else {
+                wal_row(12, 10)
+            }])
+        });
+        let (r, _) = wait(&src, 60).await;
+        // Against the old snapshot (9) writer 10 would read applied.
+        assert_eq!(
+            r.durability,
+            Durability::NotReady(DhanLiveXverifyNotReady::NotApplied)
+        );
+    }
+
+    /// 51d review: `Frozen` is judged from the day's first sample after the
+    /// live-final instant, carried over from an earlier attempt, not from
+    /// this attempt's own first sample.
+    #[tokio::test(start_paused = true)]
+    async fn test_wait_live_final_judges_frozen_against_the_days_first_sample() {
+        let mut src = fake(10);
+        src.progress = Box::new(|_| Some(progress(CLOSE - 60, 600)));
+        let earlier = progress(CLOSE - 120, 1);
+        let deadline = src.t0 + Duration::from_secs(60);
+        let (r, first) = wait_live_final(
+            &src,
+            today0(),
+            DAY0 * 1_000_000_000,
+            deadline,
+            Some(earlier),
+        )
+        .await;
+        assert_eq!(first, Some(earlier));
+        assert_eq!(
+            r.completeness,
+            Completeness::Moving {
+                sealed_through_secs_of_day: CLOSE - 60
+            }
+        );
+        // Without the earlier sample the same attempt reads it frozen.
+        let (r, _) = wait(&src, 60).await;
+        assert_eq!(
+            r.completeness,
+            Completeness::Frozen {
+                sealed_through_secs_of_day: CLOSE - 60
+            }
+        );
     }
 }

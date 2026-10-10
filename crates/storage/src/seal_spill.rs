@@ -5093,12 +5093,13 @@ mod pr41c_tests {
         use crate::seal_writer_task::{SEAL_FILE_PREFIX, SEAL_REPLAYING_SUBDIR};
         let dir = super::tests::temp_spill_dir("staged-for-day");
         let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 9).unwrap_or_default();
+        // `parked` is a process-wide count other tests move; only `staged`
+        // is this folder's.
         assert_eq!(
-            staged_spill_records_for_day(&dir.join("absent"), day).ok(),
-            Some(SpillStaged {
-                staged: 0,
-                parked: crate::seal_writer_task::parked_replay_files(),
-            })
+            staged_spill_records_for_day(&dir.join("absent"), day)
+                .ok()
+                .map(|s| s.staged),
+            Some(0)
         );
         let replaying = dir.join(SEAL_REPLAYING_SUBDIR);
         std::fs::create_dir_all(&replaying).expect("replaying dir");

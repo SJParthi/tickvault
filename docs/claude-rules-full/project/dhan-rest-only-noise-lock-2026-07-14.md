@@ -4210,8 +4210,9 @@ the code ships.
   whose every attempt found our candles not yet sealed and saved:
   `live_not_final`, `live_not_applied`, `seals_pending`, `seal_spill_parked`.
   It still pages once, after the last attempt, as every other `reason` does.
-  In practice the last attempt reads anyway (judging off), so these reach the
-  page only when that read itself fails.
+  The day's last attempt never ends with one of these (it reads, with
+  missing-minute judging off); one reaches the page only when an earlier
+  attempt retried with it and the next attempt was then skipped for time.
 - Two new log-sink-only coded `warn!` sources, neither filtered:
   `xverify_attempt_not_ready` (an attempt waited and retries) and
   `xverify_unsettled_final` (the last attempt read with missing-minute judging
