@@ -1045,6 +1045,62 @@ pub enum ErrorCode {
     /// consumer would make an existing alarm fire for a different component.
     /// Severity::Medium.
     LambdaMint01TokenMintFailed,
+    // -----------------------------------------------------------------------
+    // Audit M3 (2026-10-06): the last uncoded `error!` lines outside the
+    // frozen indicator/strategy area. Each had no fitting code, or its only
+    // fitting code pages (RISK-GAP-03, WS-SPILL-02 match on any line). Every
+    // one is Medium ON PURPOSE, the LAMBDA-* precedent: a High or Critical
+    // code makes `error_code_alarm_coverage_guard` demand a new CloudWatch
+    // alarm (a new page, which the Dhan noise lock forbids without a dated
+    // quote) or an entry on a shrink-only exemption list. No metric filter
+    // matches any of them, so coding them adds no page. Where the condition
+    // already pages, it is through an EXISTING alarm named in the runbook.
+    // Runbook: docs/error-runbooks/audit-m3-error-codes.md.
+    // -----------------------------------------------------------------------
+    /// WS-SPILL-03: the durable frame WAL could not be opened at boot, so
+    /// boot halts (`process::exit(1)`) rather than run without the zero-loss
+    /// floor. The halt itself is paged by the existing boot-heartbeat and
+    /// market-hours liveness alarms (the process never publishes
+    /// `tv_boot_completed`); this line names WHY. Severity::Medium.
+    WsSpill03WalInitFailed,
+    /// WS-SPILL-04: a WAL segment could not be read at boot replay and was
+    /// skipped. Replay does not delete it (it is staged with the other read
+    /// segments); its frames are not re-folded, and the next segment is
+    /// marked as following a gap. The event already pages through the
+    /// existing `durable-floor-breach` alarm on
+    /// `tv_wal_replay_corrupted_segments_total`; WS-SPILL-02 (a frame the
+    /// writer dropped) would have added a second page for the same event and
+    /// blurred what that code means.
+    /// Severity::Medium.
+    WsSpill04SegmentUnreadable,
+    /// PROC-03: the process panicked (the panic hook). Under the release
+    /// profile's `panic = "abort"` the process then dies and systemd
+    /// restarts it; the death is paged by the existing liveness alarms, and
+    /// this line carries the location, payload and the WAL abort-drain
+    /// result. (PROC-02 is reserved for the container restart loop.)
+    /// Severity::Medium.
+    Proc03Panicked,
+    /// API-SERVER-01: the HTTP API server (`axum::serve`) returned an error
+    /// and stopped serving. The trading lanes keep running; `/health`,
+    /// `/api/*` and the MCP read paths are unreachable until a restart.
+    /// Severity::Medium.
+    ApiServer01Exited,
+    /// TICK-GAP-01: the per-instrument tick-gap tracker saw an instrument go
+    /// silent past the error threshold (`source = "instrument_gap"`,
+    /// edge-latched per instrument), or opened a backfill window after a
+    /// WebSocket reconnect (`source = "reconnect_backfill_window"`). Not
+    /// RISK-GAP-03, whose filter pages on every line: a per-instrument page
+    /// for an illiquid option is noise. Dormant today (the tracker has no
+    /// production tick producer). Severity::Medium.
+    TickGap01TrackerGap,
+    /// PIPELINE-LAG-01: the trading pipeline's tick-broadcast receiver fell
+    /// behind and the broadcast skipped at least
+    /// `TRADING_PIPELINE_LAG_ERROR_THRESHOLD` ticks in one receive, so
+    /// signals for those ticks were not evaluated. The ticks themselves are
+    /// still captured (the WAL and the candle fold are separate consumers).
+    /// Dormant today (the trading pipeline has no production spawn site).
+    /// Severity::Medium.
+    PipelineLag01TicksSkipped,
 }
 
 impl ErrorCode {
@@ -1237,6 +1293,13 @@ impl ErrorCode {
             Self::LambdaPortal01ActionFailed => "LAMBDA-PORTAL-01",
             Self::LambdaProv01ShaUnknown => "LAMBDA-PROV-01",
             Self::LambdaMint01TokenMintFailed => "LAMBDA-MINT-01",
+            // Audit M3 (2026-10-06)
+            Self::WsSpill03WalInitFailed => "WS-SPILL-03",
+            Self::WsSpill04SegmentUnreadable => "WS-SPILL-04",
+            Self::Proc03Panicked => "PROC-03",
+            Self::ApiServer01Exited => "API-SERVER-01",
+            Self::TickGap01TrackerGap => "TICK-GAP-01",
+            Self::PipelineLag01TicksSkipped => "PIPELINE-LAG-01",
         }
     }
 
@@ -1490,6 +1553,15 @@ impl ErrorCode {
             | Self::LambdaPortal01ActionFailed
             | Self::LambdaProv01ShaUnknown
             | Self::LambdaMint01TokenMintFailed => Severity::Medium,
+            // Audit M3 (2026-10-06): Medium for the same forced reason as
+            // LAMBDA-* above — no new alarm, no shrink-only exemption entry.
+            // See the block comment at the variants.
+            Self::WsSpill03WalInitFailed
+            | Self::WsSpill04SegmentUnreadable
+            | Self::Proc03Panicked
+            | Self::ApiServer01Exited
+            | Self::TickGap01TrackerGap
+            | Self::PipelineLag01TicksSkipped => Severity::Medium,
             // Low: trading-day / Dhan other
             // PR #6a (2026-05-19): I-P1-01 (DailyScheduler) + I-P1-02 (DeltaFieldCoverage) retired
             Self::InstrumentP2TradingDayGuard
@@ -1685,6 +1757,13 @@ impl ErrorCode {
             | Self::LambdaMint01TokenMintFailed => {
                 "docs/error-runbooks/lambda-ops-error-codes.md"
             }
+            // Audit M3 (2026-10-06): the last uncoded error lines.
+            Self::WsSpill03WalInitFailed
+            | Self::WsSpill04SegmentUnreadable
+            | Self::Proc03Panicked
+            | Self::ApiServer01Exited
+            | Self::TickGap01TrackerGap
+            | Self::PipelineLag01TicksSkipped => "docs/error-runbooks/audit-m3-error-codes.md",
             Self::Scoreboard01AggregationDegraded => {
                 "docs/error-runbooks/dual-feed-scoreboard-error-codes.md"
             }
@@ -1955,6 +2034,13 @@ impl ErrorCode {
             Self::LambdaPortal01ActionFailed,
             Self::LambdaProv01ShaUnknown,
             Self::LambdaMint01TokenMintFailed,
+            // Audit M3 (2026-10-06)
+            Self::WsSpill03WalInitFailed,
+            Self::WsSpill04SegmentUnreadable,
+            Self::Proc03Panicked,
+            Self::ApiServer01Exited,
+            Self::TickGap01TrackerGap,
+            Self::PipelineLag01TicksSkipped,
         ]
     }
 }
@@ -2139,6 +2225,36 @@ mod tests {
     // variant cannot compile, and re-pointing it at a surviving code would
     // assert a different contract under the old name. SPOT1M-02 keeps its
     // own coverage via `test_all_codes_roundtrip`.
+
+    #[test]
+    fn test_audit_m3_codes_contract() {
+        // Audit M3 (2026-10-06): six codes for the last uncoded error lines.
+        // Every one is Medium (no new alarm, no shrink-only exemption entry)
+        // and shares one runbook; none reuses a code an alarm filter matches.
+        let expected = [
+            (ErrorCode::WsSpill03WalInitFailed, "WS-SPILL-03"),
+            (ErrorCode::WsSpill04SegmentUnreadable, "WS-SPILL-04"),
+            (ErrorCode::Proc03Panicked, "PROC-03"),
+            (ErrorCode::ApiServer01Exited, "API-SERVER-01"),
+            (ErrorCode::TickGap01TrackerGap, "TICK-GAP-01"),
+            (ErrorCode::PipelineLag01TicksSkipped, "PIPELINE-LAG-01"),
+        ];
+        for (code, s) in expected {
+            assert_eq!(code.code_str(), s);
+            assert_eq!(s.parse::<ErrorCode>(), Ok(code));
+            assert_eq!(code.severity(), Severity::Medium, "{s}");
+            assert!(code.is_auto_triage_safe(), "{s}");
+            assert_eq!(
+                code.runbook_path(),
+                "docs/error-runbooks/audit-m3-error-codes.md"
+            );
+            assert!(ErrorCode::all().contains(&code), "{s} missing from all()");
+            // The codes whose alarms page on any line must never be reused
+            // for these lines.
+            assert_ne!(s, "WS-SPILL-02");
+            assert_ne!(s, "RISK-GAP-03");
+        }
+    }
 
     #[test]
     fn test_tf_verify_codes_contract() {
@@ -2347,8 +2463,12 @@ mod tests {
                 // `error!` sites in crates/aws-lambdas, which no guard
                 // scanned until the crate list became filesystem discovery.
                 || s.starts_with("LAMBDA-")
-                // 2026-10-05 (audit M3): the HTTP API server task stopped.
-                || s.starts_with("API-SERVER-");
+                // Audit M3 (2026-10-06): the last uncoded error lines —
+                // the API server exit, the tick-gap tracker and the
+                // trading pipeline's broadcast lag.
+                || s.starts_with("API-SERVER-")
+                || s.starts_with("TICK-GAP-")
+                || s.starts_with("PIPELINE-LAG-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }

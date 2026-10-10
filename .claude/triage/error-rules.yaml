@@ -2309,3 +2309,83 @@ rules:
       auto-retry a mint: Dhan permits ONE active token per account, so a
       retry racing another minter invalidates whichever token currently
       works.
+
+  # Audit M3 (2026-10-06): the last uncoded error lines outside the frozen
+  # indicator/strategy area. All six are Medium and unalarmed; runbook
+  # docs/error-runbooks/audit-m3-error-codes.md.
+  - name: ws-spill-03-wal-init-failed-escalate
+    match:
+      code: WS-SPILL-03
+    action: escalate
+    runbook_path: docs/error-runbooks/audit-m3-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 300
+    justification: >-
+      WS-SPILL-03 = the frame WAL could not be opened at boot, so boot halts
+      and systemd restarts into the same fault. The cause is the volume (full,
+      read-only or a permission change). Escalate; never auto-fixed, and never
+      worked around by running without the WAL.
+
+  - name: ws-spill-04-wal-segment-unreadable-escalate
+    match:
+      code: WS-SPILL-04
+    action: escalate
+    runbook_path: docs/error-runbooks/audit-m3-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 300
+    justification: >-
+      WS-SPILL-04 = a WAL segment could not be read at boot replay and was
+      skipped; its frames are not re-folded and the next segment follows a
+      gap. Already paged by durable-floor-breach on the corrupted-segment
+      counter. Escalate so the window is recorded.
+
+  - name: proc-03-panicked-escalate
+    match:
+      code: PROC-03
+    action: escalate
+    runbook_path: docs/error-runbooks/audit-m3-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 60
+    justification: >-
+      PROC-03 = the process panicked; under panic=abort it dies and systemd
+      restarts it. Every panic is a defect at panic_location. Escalate; a
+      restart does not fix the cause.
+
+  - name: api-server-01-exited-escalate
+    match:
+      code: API-SERVER-01
+    action: escalate
+    runbook_path: docs/error-runbooks/audit-m3-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 3600
+    justification: >-
+      API-SERVER-01 = the HTTP API stopped serving. Trading lanes keep running;
+      /health and /api are unreachable until a restart, which is an operator
+      decision because it reconnects every socket.
+
+  - name: tick-gap-01-tracker-gap-escalate
+    match:
+      code: TICK-GAP-01
+    action: escalate
+    runbook_path: docs/error-runbooks/audit-m3-error-codes.md
+    confidence: 0.8
+    cooldown_secs: 600
+    justification: >-
+      TICK-GAP-01 = the per-instrument tick-gap tracker saw a silent
+      instrument (source=instrument_gap) or opened a reconnect backfill window
+      (source=reconnect_backfill_window). Dormant today. One illiquid
+      instrument is not a feed fault; compare with the live lane's silence
+      gauges before acting.
+
+  - name: pipeline-lag-01-ticks-skipped-escalate
+    match:
+      code: PIPELINE-LAG-01
+    action: escalate
+    runbook_path: docs/error-runbooks/audit-m3-error-codes.md
+    confidence: 0.9
+    cooldown_secs: 600
+    justification: >-
+      PIPELINE-LAG-01 = the trading pipeline's broadcast receiver skipped at
+      least the error threshold of ticks, so their signals were not
+      evaluated; the ticks themselves are captured elsewhere. Dormant today.
+      Look for a stall on the pipeline task.
