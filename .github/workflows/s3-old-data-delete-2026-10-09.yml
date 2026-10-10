@@ -136,15 +136,25 @@ jobs:
           set -euo pipefail
           cargo build -p tickvault-app --bin tv-s3-old-data-delete
 
+      # The account id comes from AWS_ROLE_ARN when it is set; this repo runs
+      # on the access keys instead (AWS_ROLE_ARN is unset, the first dry run
+      # failed here on 2026-10-10), so the keys answer one read-only
+      # get-caller-identity, the deploy-aws pattern. They live in this step's
+      # env only; every later step runs as the one-off role.
       - name: Name the one-off role
         id: role
         env:
           MAIN_ROLE: ${{ secrets.AWS_ROLE_ARN }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         run: |
           set -euo pipefail
           ACCOUNT=$(cut -d: -f5 <<<"$MAIN_ROLE")
+          if ! [[ "$ACCOUNT" =~ ^[0-9]{12}$ ]] && [ -n "$AWS_ACCESS_KEY_ID" ]; then
+            ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          fi
           if ! [[ "$ACCOUNT" =~ ^[0-9]{12}$ ]]; then
-            echo "::error::could not read the AWS account id from the AWS_ROLE_ARN secret"
+            echo "::error::could not read the AWS account id from AWS_ROLE_ARN or the access keys"
             exit 1
           fi
           echo "::add-mask::$ACCOUNT"
