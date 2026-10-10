@@ -581,6 +581,10 @@ struct InstrumentState {
     volume_delta_ewma: u64,
     /// Intervals contributed (not ticks — the first tick yields no interval).
     samples: u32,
+    /// `recv_monotonic_millis` of the last tick whose cumulative volume
+    /// ROSE (a trade), 0 = none seen. Read by the depth-200 cross-feed
+    /// silence check (scope lock 2026-10-10).
+    last_trade_millis: u64,
 }
 
 impl InstrumentState {
@@ -594,6 +598,7 @@ impl InstrumentState {
         interval_ewma_millis: 0,
         volume_delta_ewma: 0,
         samples: 0,
+        last_trade_millis: 0,
     };
 }
 
@@ -707,6 +712,11 @@ impl TickGapDetector {
             state.volume_delta_ewma = ewma_update(state.volume_delta_ewma, u64::from(delta));
         }
 
+        // A trade: the cumulative volume rose since the last tick. The first
+        // tick (no previous volume) is a snapshot, never evidence of a trade.
+        if matches!(state.last_volume, Some(previous) if obs.volume > previous) {
+            state.last_trade_millis = state.last_trade_millis.max(obs.recv_monotonic_millis);
+        }
         state.last_ltt = Some(obs.ltt_epoch_secs);
         state.last_volume = Some(obs.volume);
         state.last_oi = Some(obs.open_interest);
@@ -768,6 +778,19 @@ impl TickGapDetector {
         }
         self.next_slot = 0;
         self.refused_count = 0;
+    }
+
+    /// When `key` last traded (its cumulative volume rose), in the
+    /// observation's `recv_monotonic_millis` clock. `None` for an untracked
+    /// instrument or one not seen trading this session. One hash probe, never
+    /// assigns a slot. O(1) average.
+    #[must_use]
+    pub fn last_trade_millis(&self, key: InstrumentKey) -> Option<u64> {
+        let slot = *self.index.get(&key)?;
+        self.slots
+            .get(slot as usize)
+            .map(|state| state.last_trade_millis)
+            .filter(|millis| *millis > 0)
     }
 
     /// Number of instruments currently tracked. O(1).
@@ -848,6 +871,32 @@ mod tests {
             let t = u64::from(i) * cadence_millis;
             d.observe(obs(key, 1_000 + i, i * 100, 500, t));
         }
+    }
+
+    #[test]
+    fn last_trade_millis_moves_only_on_a_volume_increase() {
+        let mut d = detector();
+        assert_eq!(d.last_trade_millis(NIFTY), None, "untracked reads None");
+        // First observation seeds the volume baseline: not a trade.
+        d.observe(obs(NIFTY, 1_000, 100, 500, 1_000));
+        assert_eq!(d.last_trade_millis(NIFTY), None, "the seed is not a trade");
+        // Volume rises: a trade at 2_000.
+        d.observe(obs(NIFTY, 1_001, 150, 500, 2_000));
+        assert_eq!(d.last_trade_millis(NIFTY), Some(2_000));
+        // Same volume (a book or quote-only update): unchanged.
+        d.observe(obs(NIFTY, 1_002, 150, 600, 3_000));
+        assert_eq!(d.last_trade_millis(NIFTY), Some(2_000));
+        // A lower volume (counter restart or stale copy): unchanged.
+        d.observe(obs(NIFTY, 1_003, 10, 600, 4_000));
+        assert_eq!(d.last_trade_millis(NIFTY), Some(2_000));
+        // A later increase moves it forward.
+        d.observe(obs(NIFTY, 1_004, 200, 600, 5_000));
+        assert_eq!(d.last_trade_millis(NIFTY), Some(5_000));
+        // An older receipt instant never moves it backward.
+        d.observe(obs(NIFTY, 1_005, 300, 600, 4_500));
+        assert_eq!(d.last_trade_millis(NIFTY), Some(5_000));
+        // Another instrument is independent.
+        assert_eq!(d.last_trade_millis(BANKNIFTY), None);
     }
 
     /// MEASUREMENT (not a CI gate -- `#[ignore]`d, run on demand):
