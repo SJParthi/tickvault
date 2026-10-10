@@ -222,7 +222,7 @@ jobs:
       binary_artifact_name: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain (host = aarch64-unknown-linux-musl, static binary)
         # MUSL static target eliminates GLIBC version dependency entirely.
@@ -293,7 +293,7 @@ jobs:
           exit 1
 
       - name: Cache cargo registry + target
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -366,7 +366,7 @@ jobs:
 
       - name: Upload artifact (both binaries)
         id: upload
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: tickvault-binary
           path: dist/
@@ -378,7 +378,7 @@ jobs:
         # deploy job's credential step (same action + inputs) so it works both
         # pre- and post-OIDC-migration.
         if: failure()
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -500,10 +500,10 @@ jobs:
     environment: prod
     steps:
       - name: Checkout (for deploy scripts)
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Download built binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: tickvault-binary
           path: ./dist/
@@ -514,7 +514,7 @@ jobs:
         # operator has only AWS_ACCESS_KEY_ID/SECRET set — so this step MUST
         # accept either. Mirrors seed-staging-ssm.yml so deploy works the
         # moment the box exists, not only after the OIDC migration.
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -1028,6 +1028,14 @@ jobs:
       # READY behind the daily-universe infinite-retry CSV fetch — a >300s CDN blip
       # would false-fail this poll while the boot is legitimately still retrying;
       # if that mode returns, revisit this bound (or gate READY earlier app-side).
+      # RESET-FAILED BEFORE THE RESTART (2026-10-09, stress audit OPS-2). A unit
+      # that crash-looped into its start limit is refused by a plain restart
+      # ("start request repeated too quickly"), so a deploy carrying the FIX
+      # failed and the rollback then reinstalled the crashing binary. The
+      # rollback already clears it; the normal swap now does too, at the end of
+      # the planned-restart marker element (kept in that element so the restart
+      # element and the SSM shell budget do not grow; the restart's failure
+      # banners were shortened by at least as many bytes).
       # === OBSERVABILITY LAST (non-fatal + time-bounded) ===
       # SELF-HEAL: CloudWatch Agent install + config (mirrors user-data Step 2-3).
       # Without this the dashboards show No data and /tickvault/prod/app log group
@@ -1125,8 +1133,8 @@ jobs:
               "if [ \"$QDB_BEFORE\" != \"$QDB_AFTER\" ]; then echo \"questdb-mem: CORRECTED [$QDB_BEFORE] -> [$QDB_AFTER] — recreating questdb so the new cap takes effect\"; (cd /opt/tickvault/repo/deploy/docker && { docker compose up -d --force-recreate tv-questdb || { docker compose ps -aq 2>/dev/null | xargs -r docker rm -f >/dev/null 2>&1 || true; docker compose up -d; }; }) || echo \"questdb-mem: WARNING recreate failed — cap applies on next container start\"; else echo \"questdb-mem: already $QDB_AFTER\"; fi",
               "systemctl is-active tickvault-host-tuning >/dev/null 2>&1 && echo \"host-tuning: applied\" || echo \"host-tuning: WARNING not active - check journalctl -u tickvault-host-tuning\"",
               "cat /opt/tickvault/net-tuning.status 2>/dev/null || echo \"host-tuning: no net-tuning.status yet\"",
-              "if systemctl is-active --quiet tickvault; then date +%s > /opt/tickvault/data/planned-restart.marker && chown ec2-user:ec2-user /opt/tickvault/data/planned-restart.marker && echo PLANNED-RESTART-MARKER-WRITTEN || echo WARN: planned-restart marker not written - this restart will page as an unexpected stop; else echo planned-restart-marker: app not running, no stop to announce; fi",
-              "systemctl restart tickvault --no-block || (echo ===== systemctl restart dispatch failed ===== && systemctl status tickvault.service --no-pager -l || true; echo ===== journalctl -xeu last 100 ===== && journalctl -xeu tickvault.service -n 100 --no-pager || true; exit 1)",
+              "if systemctl is-active --quiet tickvault; then date +%s > /opt/tickvault/data/planned-restart.marker && chown ec2-user:ec2-user /opt/tickvault/data/planned-restart.marker && echo PLANNED-RESTART-MARKER-WRITTEN || echo WARN: planned-restart marker not written - this restart will page as an unexpected stop; else echo planned-restart-marker: app not running, no stop to announce; fi; systemctl reset-failed tickvault || true",
+              "systemctl restart tickvault --no-block || (echo == restart failed == && systemctl status tickvault.service --no-pager -l || true; echo == journal -xeu == && journalctl -xeu tickvault.service -n 100 --no-pager || true; exit 1)",
               "READY_OK=no; for i in $(seq 1 150); do if systemctl is-active --quiet tickvault; then READY_OK=yes; break; fi; sleep 5; done",
               "if [ \"$READY_OK\" != yes ]; then echo ===== tickvault not active within 750s - app likely never sent READY=1 - start job continues in background ===== && systemctl status tickvault.service --no-pager -l || true; echo ===== app stdout/stderr ONLY last 200 ===== && journalctl -u tickvault.service -n 200 --no-pager --output=cat || true; echo ===== journalctl -xeu last 100 ===== && journalctl -xeu tickvault.service -n 100 --no-pager || true; exit 1; fi",
               "echo TICKVAULT-UP",

@@ -90,6 +90,9 @@ pub mod boot_probe;
 // read once per sealed bar to fill `candles_<tf>.contract`.
 pub mod candle_contract_labels;
 pub mod console_views;
+// 2026-10-10 (item 53): puts the `contract` name back on rows a boot rewrote
+// blank on 9 Oct. Cold path, once a day after the close.
+pub mod contract_name_repair;
 // C2 (2026-07-03): HTTP-CLIENT-01 — panic-free reqwest client construction.
 // Shared OnceLock probe client for the repeating QuestDB readiness probes
 // (boot + every-5s pool watchdog + every-10s SLO scheduler); typed

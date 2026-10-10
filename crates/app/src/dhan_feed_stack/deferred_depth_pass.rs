@@ -580,7 +580,9 @@ pub fn run_after_close_pass(
                     _ => rewrite_dedicated_depth(sink, frame, c),
                 };
                 summary.rows_written = summary.rows_written.saturating_add(rows);
-                if sink.flush_due() && sink.flush().is_err() {
+                // The LATE-row trigger (plan item 55): every commit here
+                // rewrites a whole hour partition, so fewer, larger ones.
+                if sink.late_flush_due() && sink.flush().is_err() {
                     failed = true;
                     break 'segments;
                 }

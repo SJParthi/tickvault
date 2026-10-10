@@ -87,7 +87,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain 1.95.0
         uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
@@ -95,7 +95,7 @@ jobs:
           toolchain: '1.95.0'
 
       - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: ci-bench
           cache-on-failure: true
@@ -130,7 +130,7 @@ jobs:
       # impossible (run_id is unique), which is intentional — we always want
       # "latest previous same-hardware baseline".
       - name: Restore Criterion baseline (previous same-hardware main run)
-        uses: actions/cache/restore@v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: target/criterion
           key: criterion-baseline-${{ steps.hw.outputs.fingerprint }}-${{ github.run_id }}
@@ -190,14 +190,14 @@ jobs:
           always() && steps.bench.outcome == 'success' &&
           (steps.gate.outputs.gate_rc != '2' ||
            (github.event_name == 'workflow_dispatch' && inputs.reset_baseline == true))
-        uses: actions/cache/save@v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: target/criterion
           key: criterion-baseline-${{ steps.hw.outputs.fingerprint }}-${{ github.run_id }}
 
       - name: Upload bench + gate logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: bench-gate-logs
           path: |
