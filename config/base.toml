@@ -826,6 +826,16 @@ spot_universe_ntm_only = true
 # both. 0 turns it off.
 backup_top_n = 1000
 
+# Evidence-based frame-silence redials (scope lock 2026-10-10, "PER-KIND
+# FRAME-SILENCE THRESHOLDS (fault redials only)"; owner: "Why idle go ahead
+# fully"). A silent main-feed socket is redialled at 60 s and a depth-20 one at
+# 90 s ONLY when two other sockets of the same kind delivered in the last 10 s;
+# a depth-200 socket when the main feed shows its contract trading while it
+# stays silent. "shadow" counts those as would-redial and never acts, so the
+# gap figures are measured first; "act" redials; "off" is the old 300 s
+# behaviour. The depth-200 900 s backstop is in code, not here.
+frame_silence_fast_path = "shadow"
+
 # ===========================================================================
 # Daily timeframe-consistency verifier (operator directive 2026-07-13 —
 # "how will you guarantee that all our defined timeframes internally are

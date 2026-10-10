@@ -83,8 +83,8 @@ use super::pool_budget::{
     ConnectionSlot, DhanEndpointType, MAX_TOTAL_DHAN_CONNECTIONS, PoolBudget, PoolBudgetRefusal,
 };
 use super::reconnect_ladder::{
-    FLAP_DAMPED_METRIC, FLAP_WINDOW_MS, FlapVerdict, ReconnectDecision, damped_reconnect_delay,
-    damped_reconnect_delay_with_jitter, reconnect_jitter_ms,
+    FLAP_DAMPED_METRIC, FLAP_WINDOW_MS, FlapVerdict, MIN_HEALTHY_SESSION_MS, ReconnectDecision,
+    damped_reconnect_delay, damped_reconnect_delay_with_jitter, reconnect_jitter_ms,
 };
 use super::types::{ConnectionId, ConnectionState, DisconnectCode};
 
@@ -92,7 +92,9 @@ use super::types::{ConnectionId, ConnectionState, DisconnectCode};
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Minimum delay before re-dialing after a token-staleness disconnect (807/809).
+/// Minimum delay before re-dialing after a token-staleness disconnect
+/// (807/809), and after a first 808 (scope lock 2026-10-06: an 808 refreshes
+/// the token once on the same delay rule).
 ///
 /// Deliberately far above the ladder's instant first rung. A stale token is not
 /// a transient TCP event: re-dialing immediately presents the SAME dead token
@@ -101,6 +103,112 @@ use super::types::{ConnectionId, ConnectionState, DisconnectCode};
 /// loop / mid-session watchdog room to publish a fresh token before we ask for
 /// one again.
 pub const TOKEN_STALE_REDIAL_FLOOR_MS: u64 = 5_000;
+
+/// 808 refresh-once (scope lock 2026-10-06): refreshes in one 808 episode
+/// that may fail OUTRIGHT (not deferred by the mint cooldown or the
+/// RESILIENCE-03 lock) before the slot parks. A wrong client id reported as
+/// 808 therefore costs at most this many extra dials. Raising it needs a
+/// dated quote in the scope lock first.
+pub const AUTH_REJECT_MAX_HARD_FAILURES: u8 = 3;
+
+/// 808 refresh-once, park rule (c): the longest an 808 episode may run
+/// without a fresh token, counted from the episode start or the last refresh
+/// that produced one, before the slot parks, after at most one more refresh
+/// attempt past the bound: an 808 past it parks at once when its cycle began
+/// with a refresh, and otherwise (an outage came between) gets one grace
+/// refresh and parks on the next 808 past the bound. The
+/// backstop for deferred refreshes, which do not count toward
+/// [`AUTH_REJECT_MAX_HARD_FAILURES`]: at least two mint cooldowns long
+/// (asserted below), so a deferral always gets one real mint attempt before
+/// the park.
+pub const AUTH_REJECT_EPISODE_MAX_MS: u64 = 300_000;
+
+/// 808 refresh-once: the window [`AUTH_REJECT_MAX_REFRESHES_PER_WINDOW`] is
+/// counted over, per slot.
+pub const AUTH_REJECT_WINDOW_MS: u64 = 300_000;
+
+/// 808 refresh-once: at most this many 808 refreshes that PRODUCED A FRESH
+/// TOKEN per slot inside [`AUTH_REJECT_WINDOW_MS`]; the next 808 inside the
+/// window parks. Bounds an account that accepts each fresh token briefly and
+/// then rejects it again. Deferred or failed refreshes are not counted here;
+/// [`AUTH_REJECT_EPISODE_MAX_MS`] and [`AUTH_REJECT_MAX_HARD_FAILURES`] bound
+/// them.
+pub const AUTH_REJECT_MAX_REFRESHES_PER_WINDOW: usize = 4;
+
+const _: () = assert!(
+    AUTH_REJECT_EPISODE_MAX_MS
+        >= 2 * tickvault_common::constants::DHAN_TOKEN_GENERATION_COOLDOWN_SECS * 1000,
+    "an 808 episode must outlast two mint cooldowns, or a deferred refresh parks the \
+     slot before a mint was ever allowed"
+);
+
+/// What the supervisor asks of the token refresh it is about to run (808
+/// refresh-once, scope lock 2026-10-06). `Copy`, no heap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenRefreshRequest {
+    /// The token generation this 808 episode already VERIFIED as fresh, if
+    /// any. A closure whose socket dialled with exactly this generation must
+    /// NOT renew (that would replace a token that was just issued); it
+    /// reports [`TokenRefreshOutcome::NotAttempted`] and the supervisor parks.
+    pub skip_if_presented: Option<u64>,
+}
+
+/// How a token refresh ended, as the refresh closure observed it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenRefreshOutcome {
+    /// The token generation moved past the one the socket presented:
+    /// `current` is the new generation. Only a closure that SAW the
+    /// generation move may report this.
+    Fresh { current: u64 },
+    /// The renewal was refused for now (mint cooldown or the RESILIENCE-03
+    /// lock); it does not count as a failure.
+    Deferred,
+    /// The renewal failed outright.
+    Failed,
+    /// No renewal was attempted (the presented generation was the verified
+    /// one, or there is no token manager).
+    NotAttempted,
+}
+
+/// What the refresh closure returns: the generation the socket presented on
+/// the dial that was rejected, and how the refresh ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenRefreshReport {
+    /// The token generation the rejected dial presented.
+    pub presented: u64,
+    /// How the refresh ended.
+    pub outcome: TokenRefreshOutcome,
+}
+
+/// One 808 episode on one slot. `Copy`, no heap. Started by the first 808,
+/// ended by a park, by a close other than 808 after frames, or by an 808 after
+/// [`MIN_HEALTHY_SESSION_MS`] of healthy delivery. Never touched on the frame
+/// path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AuthRejectEpisode {
+    started_at: Instant,
+    hard_failures: u8,
+    verified_generation: Option<u64>,
+    /// The last instant this episode saw progress: its start, then each
+    /// refresh that produced a fresh token. The age bound runs from here, so
+    /// an episode parks after [`AUTH_REJECT_EPISODE_MAX_MS`] without a fresh
+    /// token whether or not an earlier refresh verified a generation.
+    last_progress_at: Instant,
+    /// Whether the redial now ending began with a token refresh: set by
+    /// [`ConnectionSupervisor::note_token_refresh`] (any outcome), cleared by
+    /// every `enter_backoff`. A failed dial or any other close in between
+    /// clears it, so after an outage the next 808 refreshes once more before
+    /// the 300 s bound can park it. Not a time window on purpose: the redial
+    /// delay alone reaches `RECONNECT_DELAY_WITH_JITTER_MAX_MS` under the flap
+    /// ceiling, so any fixed window shorter than a full cycle would make the
+    /// bound unreachable.
+    refreshed_this_cycle: bool,
+    /// Whether the one grace refresh past the 300 s bound, park rule (c),
+    /// has been spent. Cleared when a refresh produces a fresh token (the
+    /// bound restarts). Once set, the next 808 past the bound parks whatever
+    /// came between, so alternating 808s and failed dials cannot dodge (c).
+    grace_refresh_used: bool,
+}
 
 /// How often the shell wakes to ask the supervisor whether a socket has gone
 /// idle. One second gives a 27–28s detection window against the 27s threshold,
@@ -152,14 +260,22 @@ const _: () = {
 /// ladder, so a socket that stays deaf backs off and parks rather than
 /// spinning.
 ///
-/// Five minutes, not the 27 s idle threshold: every socket in the pool
-/// carries at least one instrument that trades continuously inside the
-/// session (the main feed carries the indices; a depth socket carries an
-/// at-the-money contract), so five minutes of silence there is a dead
-/// subscription, not a quiet market. It is deliberately HALF the 600 s
-/// alarm so the remediation runs before the operator is paged, and
-/// comfortably above the idle threshold (asserted below) so the two
-/// watchdogs can never race on the same socket.
+/// **Since 2026-10-10 (scope lock "PER-KIND FRAME-SILENCE THRESHOLDS") this
+/// is the UNCONFIRMED fallback for the main feed and depth-20**: the time
+/// after which a silent socket is redialled with no other evidence. With
+/// evidence (two other live sockets of the same kind) a main-feed socket is
+/// redialled at [`MAIN_FEED_CONFIRMED_SILENCE_REDIAL_SECS`] and a depth-20
+/// socket at [`DEPTH20_CONFIRMED_SILENCE_REDIAL_SECS`]; see
+/// [`silence_redial_basis`]. Depth-200 no longer uses this figure at all:
+/// a depth-200 socket carries ONE contract, and this repository measured
+/// 56 minutes of benign silence on one (the reason
+/// `worst_connection_tick_age_secs` excludes depth-200), so a pure-time
+/// redial there was tearing down healthy quiet sockets. Depth-200 waits for
+/// [`DEPTH200_SILENCE_BACKSTOP_SECS`] or for cross-feed evidence.
+///
+/// Five minutes is deliberately HALF the 600 s alarm so the remediation runs
+/// before the operator is paged, and comfortably above the idle threshold
+/// (asserted below) so the two watchdogs can never race on the same socket.
 ///
 /// The window is only counted INSIDE the continuous session when the
 /// supervisor is given [`FrameSilenceGate::ContinuousSessionIst`]; the
@@ -183,6 +299,674 @@ const _: () = {
          or the ping cadence itself could look like silence"
     );
 };
+
+// ---------------------------------------------------------------------------
+// Per-kind frame-silence evidence (scope lock 2026-10-10, "PER-KIND
+// FRAME-SILENCE THRESHOLDS (fault redials only)")
+// ---------------------------------------------------------------------------
+//
+// One 300 s rule for every socket kind left a deaf main-feed or depth-20 socket
+// blind for five minutes, and tore down HEALTHY quiet depth-200 sockets (one
+// contract each; 56 minutes of benign silence measured on one). The fix uses
+// evidence instead of time alone. Every redial below is still a genuine-fault
+// redial under `ReconnectReason::IdleSilence`; nothing here changes an
+// instrument or adds a reason.
+
+/// Main-feed silence after which a socket is redialled WITH sibling evidence
+/// (at least [`MIN_LIVE_SIBLINGS`] other main-feed sockets delivered in the
+/// last [`SIBLING_LIVE_EVIDENCE_SECS`]). Escalates per socket; see
+/// [`ConnectionSupervisor::confirmed_threshold_secs`].
+pub const MAIN_FEED_CONFIRMED_SILENCE_REDIAL_SECS: u64 = 60;
+
+/// Depth-20 silence after which a socket is redialled WITH sibling evidence.
+pub const DEPTH20_CONFIRMED_SILENCE_REDIAL_SECS: u64 = 90;
+
+/// Depth-200 pure-time backstop: a depth-200 socket carries one contract and
+/// can be legitimately silent for long stretches, so time alone redials it
+/// only after fifteen minutes. Faster recovery comes from cross-feed evidence
+/// (the main feed showing its contract trading), which arrives through
+/// [`request_data_silence_redial`].
+pub const DEPTH200_SILENCE_BACKSTOP_SECS: u64 = 900;
+
+/// How recent another socket's last frame must be to count as live evidence.
+pub const SIBLING_LIVE_EVIDENCE_SECS: u64 = 10;
+
+/// A sibling stamp further than this AHEAD of the reader's wall clock is not
+/// evidence: a clock step fails toward the 300 s fallback.
+pub const SIBLING_FUTURE_SKEW_MS: i64 = 5_000;
+
+/// Live same-kind siblings required to confirm a silence. Two, not one, so a
+/// stall of one exchange segment that leaves a single sibling live (that
+/// sibling carrying the other segment) cannot confirm by itself.
+pub const MIN_LIVE_SIBLINGS: u8 = 2;
+
+/// Instruments a main-feed socket must hold for its silence to be confirmed:
+/// a thinly-held socket can be quiet while its siblings are busy.
+pub const MAIN_FEED_CONFIRMED_MIN_HELD: u32 = 1_000;
+
+/// Instruments a depth-20 socket must hold for its silence to be confirmed.
+pub const DEPTH20_CONFIRMED_MIN_HELD: u32 = 20;
+
+/// Minimum spacing, pool-wide PER KIND, between two sibling-confirmed
+/// redials, so a vendor-side stall that silences several sockets of one kind
+/// redials them one at a time rather than all together.
+pub const CONFIRMED_REDIAL_SPACING_SECS: i64 = 15;
+
+/// A socket's silence strikes (the escalation of its confirmed threshold)
+/// reset only after this long with no silence redial.
+pub const SILENCE_STRIKE_RESET_SECS: u64 = 900;
+
+/// [`SILENCE_STRIKE_RESET_SECS`] as a `Duration`.
+// APPROVED: this line IS the named constant the no-hardcoded-Duration rule asks for; the scanner matches the declaration itself.
+pub const SILENCE_STRIKE_RESET: Duration = Duration::from_secs(SILENCE_STRIKE_RESET_SECS);
+
+/// The confirmed fast path runs only before 15:15 IST: the closing auction
+/// window (15:15–15:40) stays on the 300 s fallback, its quiet is unmeasured.
+pub const CONFIRMED_SILENCE_CLOSE_SECS_OF_DAY_IST: u32 =
+    tickvault_common::constants::CAS_WINDOW_OPEN_SECS_OF_DAY_IST;
+
+/// The largest left shift applied to a confirmed threshold (60 → 120 → 240,
+/// then capped at the 300 s fallback).
+const MAX_SILENCE_STRIKE_SHIFT: u8 = 3;
+
+/// How often a socket publishes its last-frame wall time for its siblings.
+// APPROVED: this line IS the named constant the no-hardcoded-Duration rule asks for; the scanner matches the declaration itself.
+const FRAME_ACTIVITY_PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Counter of frame-silence redials, labelled `endpoint` and `basis`
+/// ([`SilenceBasis::as_str`]). Local only: no EMF selector, no alarm.
+pub const FRAME_SILENCE_REDIAL_METRIC: &str = "tv_dhan_ws_frame_silence_redial_total";
+
+/// Counter of fast-path redials that WOULD have happened in shadow mode,
+/// labelled `endpoint` and `basis`, once per silence episode. Local only.
+pub const FRAME_SILENCE_WOULD_REDIAL_METRIC: &str = "tv_dhan_ws_frame_silence_would_redial_total";
+
+/// Gauge: the largest gap between two frames on a socket inside the confirmed
+/// window (09:15–15:15 IST), in seconds, reset when the window opens. Label
+/// `connection`. Local only. This is the measurement the shadow week reads.
+pub const FRAME_GAP_MAX_SECS_GAUGE: &str = "tv_dhan_ws_conn_frame_gap_max_secs";
+
+/// Counter of cross-feed redial requests dropped at take time because the
+/// socket had redialled since the request (the request named an earlier
+/// connection).
+pub const DATA_SILENCE_STALE_METRIC: &str = "tv_dhan_ws_data_silence_request_stale_total";
+
+/// Minimum time between two cross-feed redial requests for one slot.
+pub const DATA_SILENCE_REQUEST_COOLDOWN_SECS: i64 = 300;
+
+const _: () = {
+    let confirmed = [
+        MAIN_FEED_CONFIRMED_SILENCE_REDIAL_SECS,
+        DEPTH20_CONFIRMED_SILENCE_REDIAL_SECS,
+    ];
+    let mut i = 0;
+    while i < confirmed.len() {
+        let secs = confirmed[i];
+        assert!(
+            secs > IDLE_RECONNECT_TIMEOUT_SECS,
+            "a confirmed silence redial must fire after the idle watchdog would have"
+        );
+        assert!(
+            secs > CLIENT_KEEPALIVE_PING_INTERVAL.as_secs() * 2,
+            "a confirmed silence redial must never be faster than two keepalive rounds"
+        );
+        assert!(
+            secs < FRAME_SILENCE_REDIAL_SECS,
+            "a confirmed threshold must be faster than the unconfirmed fallback"
+        );
+        assert!(
+            secs * super::reconnect_ladder::FLAP_REDIAL_CEILING as u64 > FLAP_WINDOW_MS / 1000,
+            "confirmed redials alone must never reach the flap ceiling inside the flap window"
+        );
+        i += 1;
+    }
+    assert!(
+        FRAME_SILENCE_REDIAL_SECS < DEPTH200_SILENCE_BACKSTOP_SECS,
+        "the depth-200 backstop must be slower than the main-feed fallback"
+    );
+    assert!(
+        SIBLING_LIVE_EVIDENCE_SECS * 3 <= MAIN_FEED_CONFIRMED_SILENCE_REDIAL_SECS,
+        "sibling evidence must be much fresher than the silence it confirms"
+    );
+    assert!(
+        SILENCE_STRIKE_RESET_SECS > FRAME_SILENCE_REDIAL_SECS,
+        "strikes must outlive the fallback window or escalation could never bind"
+    );
+    assert!(
+        CONTINUOUS_SESSION_OPEN_SECS_OF_DAY_IST < CONFIRMED_SILENCE_CLOSE_SECS_OF_DAY_IST,
+        "the confirmed window must open after the continuous session does"
+    );
+    assert!(
+        CONFIRMED_SILENCE_CLOSE_SECS_OF_DAY_IST <= CONTINUOUS_SESSION_CLOSE_SECS_OF_DAY_IST,
+        "the confirmed window must close inside the continuous session"
+    );
+};
+
+/// What the evidence-based fast paths do: off, count only (the default), or
+/// act. Owned by the config crate, re-exported here.
+pub use tickvault_common::config::FrameSilenceFastPath;
+
+/// Why a frame-silence redial fired. Audit and counter label only; every
+/// basis schedules the same `ReconnectReason::IdleSilence` redial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SilenceBasis {
+    /// Time alone: 300 s on the main feed and depth-20.
+    Unconfirmed,
+    /// The confirmed threshold with two live same-kind siblings.
+    SiblingConfirmed,
+    /// Depth-200: the main feed showed this socket's contract trading while
+    /// the socket stayed silent.
+    CrossFeed,
+    /// Depth-200: time alone, after the 900 s backstop.
+    Backstop,
+}
+
+impl SilenceBasis {
+    /// Every basis, for seeding the counters at zero.
+    pub const ALL: [Self; 4] = [
+        Self::Unconfirmed,
+        Self::SiblingConfirmed,
+        Self::CrossFeed,
+        Self::Backstop,
+    ];
+
+    /// The counter and log label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unconfirmed => "unconfirmed",
+            Self::SiblingConfirmed => "sibling_confirmed",
+            Self::CrossFeed => "cross_feed",
+            Self::Backstop => "backstop",
+        }
+    }
+}
+
+/// Whether a supervisor reads the pool's activity register for sibling
+/// evidence. `Off` by default, so a supervisor built in a test never reads
+/// another test's sockets; the live lane opts in with `Pool`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SiblingEvidence {
+    /// No sibling evidence: only the time rules apply. The default.
+    #[default]
+    Off,
+    /// Read the process-wide activity register.
+    Pool,
+}
+
+/// The process-wide inputs the confirmed fast path reads, gathered only when
+/// a socket is already silent past its confirmed threshold.
+#[derive(Debug, Clone, Copy)]
+pub struct SilenceInputs<'a> {
+    /// Wall clock, milliseconds since the Unix epoch.
+    pub wall_ms: i64,
+    /// An overflow episode is engaged or rotation is halted by an 805.
+    pub overflow_or_halted: bool,
+    /// Every slot's last-frame wall time (0 = never).
+    pub stamps: [i64; GHOST_REDIAL_SLOTS],
+    /// The per-kind spacing register (`[main feed, depth-20]`).
+    pub spacing: &'a [std::sync::atomic::AtomicI64; CONFIRMED_SPACING_KINDS],
+}
+
+/// Kinds with a confirmed fast path: main feed and depth-20.
+pub const CONFIRMED_SPACING_KINDS: usize = 2;
+
+/// When each kind last took a sibling-confirmed redial, wall ms (0 = never).
+static LAST_CONFIRMED_REDIAL_WALL_MS: [std::sync::atomic::AtomicI64; CONFIRMED_SPACING_KINDS] =
+    [const { std::sync::atomic::AtomicI64::new(0) }; CONFIRMED_SPACING_KINDS];
+
+impl SilenceInputs<'static> {
+    /// Reads the live register: one wall-clock read, two atomic loads and a
+    /// copy of the 32-slot activity register. O(32), no allocation; called
+    /// only while a socket is silent past its confirmed threshold.
+    #[must_use]
+    pub fn live() -> Self {
+        Self {
+            wall_ms: wall_clock_ms(),
+            overflow_or_halted: overflow_episode_engaged() || rotation_halted(),
+            stamps: snapshot_frame_activity(),
+            spacing: &LAST_CONFIRMED_REDIAL_WALL_MS,
+        }
+    }
+}
+
+/// The spacing-register index for a kind with a confirmed fast path.
+const fn confirmed_kind_index(endpoint: DhanEndpointType) -> Option<usize> {
+    match endpoint {
+        DhanEndpointType::MainFeed => Some(0),
+        DhanEndpointType::Depth20 => Some(1),
+        DhanEndpointType::Depth200 | DhanEndpointType::OrderUpdate => None,
+    }
+}
+
+/// Instruments a socket of this kind must hold for its silence to be
+/// confirmed. `u32::MAX` for a kind with no confirmed path.
+#[must_use]
+pub const fn confirmed_min_held(endpoint: DhanEndpointType) -> u32 {
+    match endpoint {
+        DhanEndpointType::MainFeed => MAIN_FEED_CONFIRMED_MIN_HELD,
+        DhanEndpointType::Depth20 => DEPTH20_CONFIRMED_MIN_HELD,
+        DhanEndpointType::Depth200 | DhanEndpointType::OrderUpdate => u32::MAX,
+    }
+}
+
+/// The un-escalated confirmed threshold for a kind.
+const fn confirmed_base_secs(endpoint: DhanEndpointType) -> u64 {
+    match endpoint {
+        DhanEndpointType::MainFeed => MAIN_FEED_CONFIRMED_SILENCE_REDIAL_SECS,
+        DhanEndpointType::Depth20 => DEPTH20_CONFIRMED_SILENCE_REDIAL_SECS,
+        DhanEndpointType::Depth200 => DEPTH200_SILENCE_BACKSTOP_SECS,
+        DhanEndpointType::OrderUpdate => FRAME_SILENCE_REDIAL_SECS,
+    }
+}
+
+/// Decides whether a silent socket is redialled, and on what basis. Pure,
+/// O(1), no allocation.
+///
+/// * Depth-200: [`SilenceBasis::Backstop`] at
+///   [`DEPTH200_SILENCE_BACKSTOP_SECS`], never earlier by time (cross-feed
+///   evidence arrives through its own request).
+/// * Main feed and depth-20: [`SilenceBasis::Unconfirmed`] at
+///   [`FRAME_SILENCE_REDIAL_SECS`] whatever the evidence; earlier,
+///   [`SilenceBasis::SiblingConfirmed`] only when every condition holds.
+/// * Order update: never (an order-update socket is legitimately silent
+///   while no order moves).
+#[allow(clippy::too_many_arguments)]
+// APPROVED: a pure truth table over the eight inputs the scope lock names; a struct would only rename them.
+#[must_use]
+pub const fn silence_redial_basis(
+    endpoint: DhanEndpointType,
+    silent_secs: u64,
+    confirmed_threshold_secs: u64,
+    confirmed_window_open: bool,
+    overflow_or_halted: bool,
+    live_siblings: u8,
+    held: u32,
+    spacing_ok: bool,
+) -> Option<SilenceBasis> {
+    match endpoint {
+        DhanEndpointType::Depth200 => {
+            if silent_secs >= DEPTH200_SILENCE_BACKSTOP_SECS {
+                Some(SilenceBasis::Backstop)
+            } else {
+                None
+            }
+        }
+        DhanEndpointType::MainFeed | DhanEndpointType::Depth20 => {
+            if silent_secs >= FRAME_SILENCE_REDIAL_SECS {
+                Some(SilenceBasis::Unconfirmed)
+            } else if silent_secs >= confirmed_threshold_secs
+                && confirmed_window_open
+                && !overflow_or_halted
+                && live_siblings >= MIN_LIVE_SIBLINGS
+                && held >= confirmed_min_held(endpoint)
+                && spacing_ok
+            {
+                Some(SilenceBasis::SiblingConfirmed)
+            } else {
+                None
+            }
+        }
+        DhanEndpointType::OrderUpdate => None,
+    }
+}
+
+/// Counts the OTHER slots of the same kind whose last frame is at most
+/// [`SIBLING_LIVE_EVIDENCE_SECS`] old (and no more than
+/// [`SIBLING_FUTURE_SKEW_MS`] in the future). Pure over the injected stamps;
+/// the kind of each slot comes from the pool tiling
+/// ([`super::pool_budget::slot_owner`]), so a slot's kind can never drift from
+/// the budget that granted it. O(32), no allocation.
+#[must_use]
+pub fn live_siblings(
+    self_idx: u8,
+    endpoint: DhanEndpointType,
+    now_wall_ms: i64,
+    stamps: &[i64],
+) -> u8 {
+    let window_ms = i64::try_from(SIBLING_LIVE_EVIDENCE_SECS.saturating_mul(1_000)).unwrap_or(0);
+    let mut count: u8 = 0;
+    for (j, stamp) in stamps.iter().enumerate() {
+        let Ok(j) = u8::try_from(j) else {
+            break;
+        };
+        if j == self_idx || *stamp <= 0 {
+            continue;
+        }
+        let same_kind = matches!(
+            super::pool_budget::slot_owner(j),
+            Some((_, kind)) if kind == endpoint
+        );
+        if !same_kind {
+            continue;
+        }
+        let age = now_wall_ms.saturating_sub(*stamp);
+        if age >= -SIBLING_FUTURE_SKEW_MS && age <= window_ms {
+            count = count.saturating_add(1);
+        }
+    }
+    count
+}
+
+/// Cache-line padded slot of the activity register, so sixteen sockets
+/// publishing once a second never share a line.
+#[repr(align(64))]
+struct PaddedI64(std::sync::atomic::AtomicI64);
+
+/// Each slot's last-frame wall time in ms (0 = never), published by the
+/// socket's read task at most once a second. Read-task time, so a drain-side
+/// shed or a ring refusal cannot freeze it.
+static SLOT_LAST_FRAME_WALL_MS: [PaddedI64; GHOST_REDIAL_SLOTS] =
+    [const { PaddedI64(std::sync::atomic::AtomicI64::new(0)) }; GHOST_REDIAL_SLOTS];
+
+/// Each slot's largest inter-frame gap inside the confirmed window, in ms.
+static SLOT_FRAME_GAP_PEAK_MS: [std::sync::atomic::AtomicU64; GHOST_REDIAL_SLOTS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; GHOST_REDIAL_SLOTS];
+
+/// Wall clock in ms since the Unix epoch, read through the WAL's receipt
+/// anchor: the same UTC clock every captured frame is stamped with, so a
+/// slot's stamp, a depth-200 hold time and the drain's tick receipts all
+/// compare on one scale. The anchor maps a monotonic `Instant`, so this file
+/// still never reads the system clock itself (an NTP step moves the anchor
+/// only on its 30 s refresh, and only the fast path reads these stamps,
+/// never a timer). O(1), no allocation.
+fn wall_clock_ms() -> i64 {
+    tickvault_storage::ws_frame_spill::receipt_nanos_from(Instant::now()) / 1_000_000
+}
+
+/// A slot's last published frame wall time, `None` if it never delivered or
+/// the index is out of range. One relaxed load.
+#[must_use]
+pub fn last_frame_wall_ms(connection_index: u8) -> Option<i64> {
+    SLOT_LAST_FRAME_WALL_MS
+        .get(usize::from(connection_index))
+        .map(|s| s.0.load(std::sync::atomic::Ordering::Relaxed))
+        .filter(|v| *v > 0)
+}
+
+/// Copies the whole activity register. O(32), no allocation.
+#[must_use]
+pub fn snapshot_frame_activity() -> [i64; GHOST_REDIAL_SLOTS] {
+    let mut out = [0_i64; GHOST_REDIAL_SLOTS];
+    for (dst, src) in out.iter_mut().zip(SLOT_LAST_FRAME_WALL_MS.iter()) {
+        *dst = src.0.load(std::sync::atomic::Ordering::Relaxed);
+    }
+    out
+}
+
+/// A slot's largest inter-frame gap inside the confirmed window, in whole
+/// seconds. `None` for an out-of-range index.
+#[must_use]
+pub fn frame_gap_peak_secs(connection_index: u8) -> Option<u64> {
+    SLOT_FRAME_GAP_PEAK_MS
+        .get(usize::from(connection_index))
+        .map(|s| s.load(std::sync::atomic::Ordering::Relaxed) / 1_000)
+}
+
+/// Publishes [`FRAME_GAP_MAX_SECS_GAUGE`] for every authorized slot. Cold:
+/// O([`MAX_TOTAL_DHAN_CONNECTIONS`]) gauge sets, called from the drain's 30 s
+/// silence arm, never per frame.
+pub fn publish_frame_gap_peaks() {
+    for idx in 0..MAX_TOTAL_DHAN_CONNECTIONS {
+        if let Some(secs) = frame_gap_peak_secs(idx) {
+            #[allow(clippy::cast_precision_loss)]
+            // APPROVED: whole seconds of a gap, far below 2^52.
+            metrics::gauge!(
+                FRAME_GAP_MAX_SECS_GAUGE,
+                "connection" => super::pool_budget::connection_slot_label(idx)
+            )
+            .set(secs as f64);
+        }
+    }
+}
+
+/// Seeds the two frame-silence counters at zero for every endpoint and
+/// basis, so the first real event is a visible step rather than a new series.
+/// Cold, once per lane start.
+pub fn seed_frame_silence_counters() {
+    for endpoint in DhanEndpointType::ALL {
+        for basis in SilenceBasis::ALL {
+            metrics::counter!(
+                FRAME_SILENCE_REDIAL_METRIC,
+                "endpoint" => endpoint.as_str(),
+                "basis" => basis.as_str()
+            )
+            .increment(0);
+            metrics::counter!(
+                FRAME_SILENCE_WOULD_REDIAL_METRIC,
+                "endpoint" => endpoint.as_str(),
+                "basis" => basis.as_str()
+            )
+            .increment(0);
+        }
+    }
+    metrics::counter!(DATA_SILENCE_STALE_METRIC).increment(0);
+}
+
+// ---------------------------------------------------------------------------
+// Depth-200 cross-feed register (scope lock 2026-10-10)
+// ---------------------------------------------------------------------------
+
+/// The contract each depth-200 slot holds, packed `security_id << 8 |
+/// segment code` (0 = none). Composite on purpose (I-P1-11): one id in two
+/// segments is two contracts.
+static DEPTH200_HELD: [std::sync::atomic::AtomicU64; GHOST_REDIAL_SLOTS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; GHOST_REDIAL_SLOTS];
+
+/// When the slot started holding that contract, wall ms.
+static DEPTH200_HELD_SINCE_MS: [std::sync::atomic::AtomicI64; GHOST_REDIAL_SLOTS] =
+    [const { std::sync::atomic::AtomicI64::new(0) }; GHOST_REDIAL_SLOTS];
+
+/// Packs an instrument for [`DEPTH200_HELD`]; `None` for an id that cannot
+/// be shifted without losing bits.
+fn pack_depth200_held(instrument: SubscribeInstrument) -> Option<u64> {
+    if instrument.security_id > (u64::MAX >> 8) {
+        return None;
+    }
+    Some((instrument.security_id << 8) | u64::from(instrument.segment.binary_code()))
+}
+
+/// Records which contract a depth-200 slot now holds. A change of contract
+/// writes `since` first and the id second (Release), so a reader that sees the
+/// new id sees its start time. The SAME contract published again keeps its
+/// original `since`: a no-op swap every minute must not push the cross-feed
+/// baseline forward forever. `None` clears the slot (the socket is dialling,
+/// parked or emptied); only the id is cleared. O(1), no allocation.
+pub fn publish_depth200_held(
+    connection_index: u8,
+    held: Option<SubscribeInstrument>,
+    now_wall_ms: i64,
+) {
+    let idx = usize::from(connection_index);
+    let (Some(id_slot), Some(since_slot)) =
+        (DEPTH200_HELD.get(idx), DEPTH200_HELD_SINCE_MS.get(idx))
+    else {
+        return;
+    };
+    match held.and_then(pack_depth200_held) {
+        Some(packed) => {
+            if id_slot.load(std::sync::atomic::Ordering::Acquire) == packed {
+                return;
+            }
+            since_slot.store(now_wall_ms, std::sync::atomic::Ordering::Relaxed);
+            id_slot.store(packed, std::sync::atomic::Ordering::Release);
+        }
+        None => {
+            // Only the id is cleared. Clearing `since` too could, on a weakly
+            // ordered CPU, become visible before the id store, and a reader
+            // would pair the old id with a zero start time (a baseline EARLIER
+            // than the truth). The stale `since` is overwritten before any
+            // new id is published.
+            id_slot.store(0, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+/// The contract a depth-200 slot holds and since when:
+/// `(security_id, segment, since_wall_ms)`. Reads the id, the start time, then
+/// the id again, and answers `None` if the id moved in between, so an id is
+/// never paired with another contract's start time. A stale start time with
+/// the correct id can only push the baseline LATER, which delays a request and
+/// never fakes one. O(1).
+#[must_use]
+pub fn depth200_held(connection_index: u8) -> Option<(u64, ExchangeSegment, i64)> {
+    let idx = usize::from(connection_index);
+    let id_slot = DEPTH200_HELD.get(idx)?;
+    let since_slot = DEPTH200_HELD_SINCE_MS.get(idx)?;
+    let first = id_slot.load(std::sync::atomic::Ordering::Acquire);
+    if first == 0 {
+        return None;
+    }
+    let since = since_slot.load(std::sync::atomic::Ordering::Relaxed);
+    let second = id_slot.load(std::sync::atomic::Ordering::Acquire);
+    if first != second || since <= 0 {
+        return None;
+    }
+    let segment = ExchangeSegment::from_byte(u8::try_from(first & 0xFF).unwrap_or(u8::MAX))?;
+    Some((first >> 8, segment, since))
+}
+
+/// A pending cross-feed redial per slot: 0 = none, else the slot's dial
+/// generation at request time plus one, so a request made against one
+/// connection is never acted on by the next.
+static DATA_SILENCE_PENDING_GEN: [std::sync::atomic::AtomicU64; GHOST_REDIAL_SLOTS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; GHOST_REDIAL_SLOTS];
+
+/// When each slot's last cross-feed request was accepted, wall ms.
+static DATA_SILENCE_LAST_REQUEST_MS: [std::sync::atomic::AtomicI64; GHOST_REDIAL_SLOTS] =
+    [const { std::sync::atomic::AtomicI64::new(0) }; GHOST_REDIAL_SLOTS];
+
+/// Why a cross-feed redial request was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataSilenceRefusal {
+    /// The index is past the register.
+    OutOfRange,
+    /// The slot was asked less than [`DATA_SILENCE_REQUEST_COOLDOWN_SECS`] ago.
+    CoolingDown,
+    /// A request for this slot is still waiting to be taken.
+    StillPending,
+    /// An 805 halted rotation for this process: no voluntary redial.
+    Halted,
+}
+
+impl DataSilenceRefusal {
+    /// The log label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OutOfRange => "out_of_range",
+            Self::CoolingDown => "cooling_down",
+            Self::StillPending => "still_pending",
+            Self::Halted => "halted",
+        }
+    }
+}
+
+/// Asks a depth-200 slot's connection task to redial because the main feed
+/// shows its contract trading while the socket stays silent. Refused after an
+/// 805, while one is pending, and within the cooldown. O(1), no allocation.
+///
+/// # Errors
+/// A [`DataSilenceRefusal`] naming why nothing was recorded.
+// WIRING-EXEMPT: called as a function value, `ps::request_data_silence_redial`, by `LiveIngest::check_depth200_cross_feed` (dhan_feed_stack.rs)
+pub fn request_data_silence_redial(
+    connection_index: u8,
+    now_wall_ms: i64,
+) -> Result<(), DataSilenceRefusal> {
+    request_data_silence_redial_in(
+        &DATA_SILENCE_PENDING_GEN,
+        &DATA_SILENCE_LAST_REQUEST_MS,
+        connection_index,
+        now_wall_ms,
+        rotation_halted(),
+        dial_generation(connection_index),
+    )
+}
+
+/// The pure half of [`request_data_silence_redial`], over injected tables.
+fn request_data_silence_redial_in(
+    pending: &[std::sync::atomic::AtomicU64; GHOST_REDIAL_SLOTS],
+    last: &[std::sync::atomic::AtomicI64; GHOST_REDIAL_SLOTS],
+    connection_index: u8,
+    now_wall_ms: i64,
+    halted: bool,
+    generation: u64,
+) -> Result<(), DataSilenceRefusal> {
+    let idx = usize::from(connection_index);
+    let (Some(pending), Some(last)) = (pending.get(idx), last.get(idx)) else {
+        return Err(DataSilenceRefusal::OutOfRange);
+    };
+    if halted {
+        return Err(DataSilenceRefusal::Halted);
+    }
+    if pending.load(std::sync::atomic::Ordering::Acquire) != 0 {
+        return Err(DataSilenceRefusal::StillPending);
+    }
+    let previous = last.load(std::sync::atomic::Ordering::Relaxed);
+    if previous != 0
+        && now_wall_ms.saturating_sub(previous)
+            < DATA_SILENCE_REQUEST_COOLDOWN_SECS.saturating_mul(1_000)
+    {
+        return Err(DataSilenceRefusal::CoolingDown);
+    }
+    if pending
+        .compare_exchange(
+            0,
+            generation.saturating_add(1),
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return Err(DataSilenceRefusal::StillPending);
+    }
+    last.store(now_wall_ms, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// Takes a slot's pending cross-feed request. `true` only when one was
+/// pending AND it was made against the connection running now; a request
+/// made against an earlier connection is dropped and counted on
+/// [`DATA_SILENCE_STALE_METRIC`]. One swap, polled on the connection task's
+/// existing one-second tick.
+pub fn take_data_silence_redial(connection_index: u8) -> bool {
+    match take_data_silence_redial_in(
+        &DATA_SILENCE_PENDING_GEN,
+        connection_index,
+        dial_generation(connection_index),
+    ) {
+        DataSilenceTake::Take => true,
+        DataSilenceTake::Nothing => false,
+        DataSilenceTake::Stale => {
+            metrics::counter!(DATA_SILENCE_STALE_METRIC).increment(1);
+            false
+        }
+    }
+}
+
+/// What a take found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DataSilenceTake {
+    Nothing,
+    Take,
+    Stale,
+}
+
+/// The pure half of [`take_data_silence_redial`].
+fn take_data_silence_redial_in(
+    pending: &[std::sync::atomic::AtomicU64; GHOST_REDIAL_SLOTS],
+    connection_index: u8,
+    generation: u64,
+) -> DataSilenceTake {
+    let Some(slot) = pending.get(usize::from(connection_index)) else {
+        return DataSilenceTake::Nothing;
+    };
+    match slot.swap(0, std::sync::atomic::Ordering::AcqRel) {
+        0 => DataSilenceTake::Nothing,
+        stored if stored == generation.saturating_add(1) => DataSilenceTake::Take,
+        _ => DataSilenceTake::Stale,
+    }
+}
 
 /// When the frame watchdog ([`FRAME_SILENCE_REDIAL_SECS`]) is allowed to act.
 ///
@@ -236,6 +1020,22 @@ impl FrameSilenceGate {
             Self::ContinuousSessionIst => {
                 secs_of_day_ist >= CONTINUOUS_SESSION_OPEN_SECS_OF_DAY_IST
                     && secs_of_day_ist < CONTINUOUS_SESSION_CLOSE_SECS_OF_DAY_IST
+            }
+        }
+    }
+
+    /// Whether the sibling-confirmed fast path may act at `secs_of_day_ist`:
+    /// the continuous session up to [`CONFIRMED_SILENCE_CLOSE_SECS_OF_DAY_IST`]
+    /// (15:15). The closing-auction minutes stay on the time fallback.
+    /// `AlwaysOn` says yes and `Off` no, so tests model both without a clock.
+    #[must_use]
+    pub const fn confirmed_window_open_at(self, secs_of_day_ist: u32) -> bool {
+        match self {
+            Self::AlwaysOn => true,
+            Self::Off => false,
+            Self::ContinuousSessionIst => {
+                secs_of_day_ist >= CONTINUOUS_SESSION_OPEN_SECS_OF_DAY_IST
+                    && secs_of_day_ist < CONFIRMED_SILENCE_CLOSE_SECS_OF_DAY_IST
             }
         }
     }
@@ -722,9 +1522,13 @@ pub enum DisconnectClass {
     /// the situation strictly worse, which is why this is the one transport
     /// error that must stop rather than back off.
     PoolOverflow,
-    /// Entitlement or credential errors that never self-heal without operator
-    /// action (806 data-API not subscribed, 808 auth failed, 810 client id
-    /// invalid). Park; a human must fix the account or the config.
+    /// 808 — authentication failed. **Ambiguous:** an invalid or replaced
+    /// token produces it as well as an invalid client id. Refresh the token
+    /// ONCE and redial on the [`Self::TokenStale`] delay rule; park only on a
+    /// second rejection of the fresh token (or a cap) — see the
+    /// `AUTH_REJECT_*` constants and the scope lock's 2026-10-06 section
+    /// "808 REFRESHES THE TOKEN ONCE BEFORE IT PARKS".
+    AuthRejected,
     /// 804 — the VENDOR's per-connection instrument count was exceeded.
     ///
     /// Split out of [`Self::Fatal`] on 2026-09-10. It sat in the credential
@@ -745,6 +1549,11 @@ pub enum DisconnectClass {
     /// Distinct from [`Self::Fatal`] rather than a widening of it: a
     /// credential error repeats verbatim on a fresh socket and this does not.
     SubscriptionRejected,
+    /// Entitlement or credential errors that never self-heal without operator
+    /// action (806 data-API not subscribed, 810 client id invalid). Park; a
+    /// human must fix the account or the config. 808 left this class on
+    /// 2026-10-06 ([`Self::AuthRejected`]): it parks here only after a
+    /// refreshed token was rejected too.
     Fatal,
 }
 
@@ -760,11 +1569,13 @@ pub fn classify_disconnect(code: Option<DisconnectCode>) -> DisconnectClass {
         Some(DisconnectCode::AccessTokenExpired | DisconnectCode::AccessTokenInvalid) => {
             DisconnectClass::TokenStale
         }
-        Some(
-            DisconnectCode::DataApiSubscriptionRequired
-            | DisconnectCode::AuthenticationFailed
-            | DisconnectCode::ClientIdInvalid,
-        ) => DisconnectClass::Fatal,
+        // 808 is ambiguous (a bad token, or a bad client id): refresh once,
+        // park only when the refreshed token is rejected too (scope lock
+        // 2026-10-06). It sat in the Fatal arm below until then.
+        Some(DisconnectCode::AuthenticationFailed) => DisconnectClass::AuthRejected,
+        Some(DisconnectCode::DataApiSubscriptionRequired | DisconnectCode::ClientIdInvalid) => {
+            DisconnectClass::Fatal
+        }
         // 804 — the vendor's count for THIS connection is over its cap.
         //
         // Was in the Fatal arm above from 2026-08-14 to 2026-09-10. The note
@@ -1227,7 +2038,9 @@ pub fn rotation_halted() -> bool {
 /// contract change) and `ghost_unsubscribe` (a repeat unsubscribe). The name
 /// predates those two; the counter is kept so its existing readers keep
 /// working. (`ghost_redial` retired 2026-10-01: a ghost is answered by a
-/// repeat unsubscribe on the live socket, never a redial.)
+/// repeat unsubscribe on the live socket, never a redial.) Since 2026-10-10
+/// also `data_silence`: a depth-200 cross-feed silence redial taken after an
+/// 805.
 pub const DIAL_REFUSED_AFTER_805_METRIC: &str = "tv_depth_dial_refused_after_805_total";
 
 /// Records one voluntary redial refused by the 805 breaker: a counter and a
@@ -2696,6 +3509,15 @@ static OVERFLOW_EPISODES: std::sync::Mutex<OverflowEpisodes> =
 /// that keeps every quiet socket off the episode lock.
 static OVERFLOW_ENGAGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Whether an 805 overflow episode has engaged in this process. One Acquire
+/// load. Never cleared within a process (like [`rotation_halted`]), so every
+/// evidence-based fast redial stays off for the rest of the session once an
+/// 805 has been seen.
+#[must_use]
+pub fn overflow_episode_engaged() -> bool {
+    OVERFLOW_ENGAGED.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Scope lock 2026-10-06: when each slot (global index) last BEGAN a dial, in
 /// milliseconds since [`OVERFLOW_DIAL_EPOCH`] plus one (0 = never). Written
 /// with one Release store at every BeginDial, engaged or not, so a dial that
@@ -3549,7 +4371,9 @@ pub fn dial_generation(connection_index: u8) -> u64 {
 pub enum ParkReason {
     /// 805 — re-dialing would kill a sibling. See [`DisconnectClass::PoolOverflow`].
     PoolOverflow,
-    /// An entitlement or credential error that needs operator action.
+    /// An entitlement or credential error that needs operator action: 806,
+    /// 810, or an 808 whose refreshed token was rejected too (or whose refresh
+    /// caps tripped; scope lock 2026-10-06).
     FatalDisconnect,
     /// 804 — the vendor's per-connection count was over its cap. The ONLY
     /// reason in this tree whose [`ParkReason::allows_one_respawn`] is `true`.
@@ -3603,11 +4427,15 @@ impl ParkReason {
     ///   fully-subscribed pool member that was working. The cost of being wrong
     ///   is another socket's shard, not one wasted dial.
     /// * [`Self::FatalDisconnect`] — the CREDENTIAL/ENTITLEMENT class. Every
-    ///   code that reaches it (806 data-API not subscribed, 808 auth failed,
-    ///   810 client id invalid) needs a human to fix the account or the config,
-    ///   so a re-dial re-presents the identical rejected credential and earns
-    ///   the identical rejection. **804 left this class on 2026-09-10** — see
-    ///   [`Self::SubscriptionRejected`] below.
+    ///   code that reaches it (806 data-API not subscribed, 810 client id
+    ///   invalid, or an 808 after a refreshed token was rejected too) needs a
+    ///   human to fix the account or the config, so a re-dial re-presents the
+    ///   identical rejected credential and earns the identical rejection.
+    ///   **804 left this class on 2026-09-10** — see
+    ///   [`Self::SubscriptionRejected`] below. A first 808 never reaches it
+    ///   since 2026-10-06: it refreshes the token once instead
+    ///   ([`DisconnectClass::AuthRejected`]), and its park comes only after
+    ///   that refresh, so the 804 respawn would only repeat it.
     /// * [`Self::Shutdown`] — we asked for it. Re-dialing during shutdown is
     ///   not recovery, it is refusing to stop.
     ///
@@ -3643,9 +4471,10 @@ impl ParkReason {
         match self {
             // Re-dialing kills a healthy sibling. Never.
             Self::PoolOverflow => false,
-            // Credential/entitlement (806/808/810). A fresh socket re-presents
-            // the identical rejected credential and earns the identical
-            // rejection. 804 LEFT this class on 2026-09-10 -- see below.
+            // Credential/entitlement (806/810, or 808 after a failed
+            // refresh). A fresh socket re-presents the identical rejected
+            // credential and earns the identical rejection. 804 LEFT this
+            // class on 2026-09-10 -- see below.
             Self::FatalDisconnect => false,
             // 804. The one `true` in this tree, and the docblock above
             // describes exactly this shape: neither overflow nor credential,
@@ -3708,11 +4537,15 @@ pub enum ReconnectReason {
     /// exactly what the damper should weigh, and no reason gains a flap
     /// exemption without its own dated quote.
     OverflowProbe,
+    /// Dhan closed the socket with 808 and the token is being refreshed once
+    /// before the redial (scope lock 2026-10-06). A fault, so it records a
+    /// flap.
+    AuthRejected,
 }
 
 impl ReconnectReason {
     /// Every reason, for pre-registration and the label-uniqueness pin.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::DialFailed,
         Self::SubscribeFailed,
         Self::Disconnected,
@@ -3720,6 +4553,7 @@ impl ReconnectReason {
         Self::IdleSilence,
         Self::ProbeClose,
         Self::OverflowProbe,
+        Self::AuthRejected,
     ];
 
     /// Stable lowercase tag for logs and metric labels.
@@ -3733,6 +4567,7 @@ impl ReconnectReason {
             Self::IdleSilence => "idle_silence",
             Self::ProbeClose => "probe_close",
             Self::OverflowProbe => "overflow_probe",
+            Self::AuthRejected => "auth_rejected",
         }
     }
 
@@ -3777,7 +4612,9 @@ pub enum SupervisorAction {
     SleepThenDial { delay_ms: u64 },
     /// As [`SupervisorAction::SleepThenDial`], but the caller MUST obtain a
     /// fresh access token before dialing — the previous socket died on a stale
-    /// one, so re-presenting it would simply be rejected again.
+    /// or rejected one (807/809, or a first 808), so re-presenting it would
+    /// simply be rejected again. After the refresh the caller reports it with
+    /// [`ConnectionSupervisor::note_token_refresh`], which may park instead.
     RefreshTokenThenDial { delay_ms: u64 },
     /// Send this connection's subscribe batches.
     Subscribe,
@@ -3905,6 +4742,45 @@ pub struct ConnectionSupervisor {
     /// ONLY to stamp the lifecycle audit row (`ws_event_audit.dhan_code`,
     /// `feed_gap_audit.dhan_code`); the supervisor never branches on it.
     last_disconnect_code: Option<u16>,
+    /// The open 808 episode, if any (scope lock 2026-10-06). `Copy`; written
+    /// only on the disconnect, backoff, park and refresh paths, never per
+    /// frame.
+    auth_reject: Option<AuthRejectEpisode>,
+    /// When this slot's recent 808 refreshes produced a fresh token, newest
+    /// overwriting oldest: a fixed ring, never a `Vec`. Bounds those
+    /// refreshes per [`AUTH_REJECT_WINDOW_MS`]. Written only by
+    /// `note_token_refresh` on `Fresh`. Survives episode ends on purpose.
+    auth_reject_refreshes: [Option<Instant>; AUTH_REJECT_MAX_REFRESHES_PER_WINDOW],
+    /// Next write position in [`Self::auth_reject_refreshes`].
+    auth_reject_cursor: u8,
+    /// Whether this supervisor reads the pool activity register for sibling
+    /// evidence. `Off` by default; the live lane opts in.
+    silence_evidence: SiblingEvidence,
+    /// What the evidence fast paths do (off, shadow count, act).
+    fast_path: FrameSilenceFastPath,
+    /// Instruments the current socket holds, for the confirmed-path floor.
+    held_instruments: u32,
+    /// Silence redials since the strikes last reset; escalates the
+    /// confirmed threshold.
+    silence_strikes: u8,
+    /// When this socket last took a silence redial.
+    last_silence_redial_at: Option<Instant>,
+    /// Basis of the most recent silence redial (audit and tests).
+    last_silence_basis: SilenceBasis,
+    /// Basis the NEXT `FrameSilenceElapsed` records; consumed by that arm.
+    next_silence_basis: SilenceBasis,
+    /// Shadow mode: whether this silence episode already counted a would-be
+    /// redial. Cleared by the next frame.
+    would_redial_latched: bool,
+    /// Shadow-mode would-be redials counted on this supervisor.
+    would_redials: u64,
+    /// When this socket next publishes its last-frame wall time.
+    next_activity_publish_at: Instant,
+    /// Whether the confirmed window was open at the last poll; a false to
+    /// true edge resets the gap peak.
+    gap_window_open: bool,
+    /// The largest frame gap seen inside the confirmed window, ms.
+    gap_peak_ms: u64,
 }
 
 impl ConnectionSupervisor {
@@ -3931,6 +4807,21 @@ impl ConnectionSupervisor {
             respawn_used: false,
             ever_delivered: false,
             last_disconnect_code: None,
+            auth_reject: None,
+            auth_reject_refreshes: [None; AUTH_REJECT_MAX_REFRESHES_PER_WINDOW],
+            auth_reject_cursor: 0,
+            silence_evidence: SiblingEvidence::Off,
+            fast_path: FrameSilenceFastPath::Shadow,
+            held_instruments: 0,
+            silence_strikes: 0,
+            last_silence_redial_at: None,
+            last_silence_basis: SilenceBasis::Unconfirmed,
+            next_silence_basis: SilenceBasis::Unconfirmed,
+            would_redial_latched: false,
+            would_redials: 0,
+            next_activity_publish_at: now,
+            gap_window_open: false,
+            gap_peak_ms: 0,
         }
     }
 
@@ -3994,6 +4885,77 @@ impl ConnectionSupervisor {
         now.saturating_duration_since(self.last_frame_at)
     }
 
+    /// Whether this supervisor reads sibling evidence. The live lane sets
+    /// [`SiblingEvidence::Pool`]; tests leave it `Off` or inject evidence
+    /// through [`Self::poll_with`].
+    // TEST-EXEMPT: pinned by main_feed_confirmed_redial_at_60s_with_two_live_siblings_in_act_mode
+    pub fn set_silence_evidence(&mut self, evidence: SiblingEvidence) {
+        self.silence_evidence = evidence;
+    }
+
+    /// What the evidence fast paths do. The lane passes the config value.
+    // TEST-EXEMPT: pinned by shadow_mode_counts_once_per_episode_and_never_redials
+    pub fn set_fast_path(&mut self, fast_path: FrameSilenceFastPath) {
+        self.fast_path = fast_path;
+    }
+
+    /// Records how many instruments the current socket holds (the
+    /// confirmed-path floor reads it). Called at every held-set change.
+    // TEST-EXEMPT: pinned by below_the_instrument_floor_falls_back_to_300s
+    pub fn set_held_instruments(&mut self, held: u32) {
+        self.held_instruments = held;
+    }
+
+    /// Silence redials since the strikes last reset.
+    #[must_use]
+    pub const fn silence_strikes(&self) -> u8 {
+        self.silence_strikes
+    }
+
+    /// Basis of the most recent silence redial.
+    #[must_use]
+    pub const fn last_silence_basis(&self) -> SilenceBasis {
+        self.last_silence_basis
+    }
+
+    /// Would-be fast redials counted in shadow mode.
+    #[must_use]
+    pub const fn shadow_would_redials(&self) -> u64 {
+        self.would_redials
+    }
+
+    /// Sets the basis the next [`ConnEvent::FrameSilenceElapsed`] records.
+    /// Used by the connection task for a cross-feed request; the time paths
+    /// set it inside [`Self::poll_with`].
+    // TEST-EXEMPT: pinned by a_taken_data_silence_request_after_805_is_refused_with_path_data_silence and escalation_bounds_snapshot_then_deaf_loop
+    pub fn note_silence_basis(&mut self, basis: SilenceBasis) {
+        self.next_silence_basis = basis;
+    }
+
+    /// The confirmed threshold for this socket now: the kind's base doubled
+    /// per strike (at most three doublings) and capped at the 300 s fallback.
+    /// Only the main feed and depth-20 have a sibling-confirmed path; a
+    /// depth-200 socket never reads this (its paths are the 900 s backstop
+    /// and the cross-feed check), so the 300 s it would return there is unused.
+    #[must_use]
+    pub fn confirmed_threshold_secs(&self) -> u64 {
+        let base = confirmed_base_secs(self.slot.endpoint);
+        let shift = u32::from(self.silence_strikes.min(MAX_SILENCE_STRIKE_SHIFT));
+        base.checked_shl(shift)
+            .unwrap_or(u64::MAX)
+            .min(FRAME_SILENCE_REDIAL_SECS)
+    }
+
+    /// The threshold a basis fired at, for the audit log.
+    fn threshold_secs_for(&self, basis: SilenceBasis) -> u64 {
+        match basis {
+            SilenceBasis::Unconfirmed => FRAME_SILENCE_REDIAL_SECS,
+            SilenceBasis::SiblingConfirmed => self.confirmed_threshold_secs(),
+            SilenceBasis::Backstop => DEPTH200_SILENCE_BACKSTOP_SECS,
+            SilenceBasis::CrossFeed => 0,
+        }
+    }
+
     /// Phase projected onto the shared [`ConnectionState`] vocabulary, for
     /// `ws_event_audit` rows and the `/health` surface.
     #[must_use]
@@ -4051,6 +5013,8 @@ impl ConnectionSupervisor {
             ConnEvent::BeginDial => {
                 // A new dial clears the previous close's code (audit rows).
                 self.last_disconnect_code = None;
+                // A new connection is a new silence episode for shadow counting.
+                self.would_redial_latched = false;
                 self.phase = ConnPhase::Dialing;
                 self.proven_healthy = false;
                 self.healthy_since = None;
@@ -4126,8 +5090,41 @@ impl ConnectionSupervisor {
 
             ConnEvent::FrameReceived => {
                 self.watchdog.record_activity(now);
+                // Scope lock 2026-10-10: the largest gap between two frames
+                // inside the confirmed window, measured BEFORE the stamp is
+                // overwritten. One subtraction and a compare per frame; the
+                // shared store happens only when the peak grows.
+                if self.gap_window_open && self.proven_healthy {
+                    let gap_ms = u64::try_from(
+                        now.saturating_duration_since(self.last_frame_at)
+                            .as_millis(),
+                    )
+                    .unwrap_or(u64::MAX);
+                    if gap_ms > self.gap_peak_ms {
+                        self.gap_peak_ms = gap_ms;
+                        if let Some(peak) =
+                            SLOT_FRAME_GAP_PEAK_MS.get(usize::from(self.slot.global_index))
+                        {
+                            peak.fetch_max(gap_ms, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
                 self.last_frame_at = now;
                 self.frames = self.frames.saturating_add(1);
+                self.would_redial_latched = false;
+                // Publish this socket's liveness for its siblings, at most
+                // once a second: one wall-clock read and one relaxed store.
+                if now >= self.next_activity_publish_at {
+                    if let Some(slot) =
+                        SLOT_LAST_FRAME_WALL_MS.get(usize::from(self.slot.global_index))
+                    {
+                        slot.0
+                            .store(wall_clock_ms(), std::sync::atomic::Ordering::Relaxed);
+                    }
+                    self.next_activity_publish_at = now
+                        .checked_add(FRAME_ACTIVITY_PUBLISH_INTERVAL)
+                        .unwrap_or(now);
+                }
                 if !self.proven_healthy {
                     self.proven_healthy = true;
                     self.attempt = 0;
@@ -4228,8 +5225,9 @@ impl ConnectionSupervisor {
                             endpoint = self.slot.endpoint.as_str(),
                             pool_index = self.slot.pool_index,
                             disconnect_code = code.map_or(0, |c| c.as_u16()),
-                            "Dhan closed this socket with a credential or entitlement error that \
-                             cannot self-heal — parking. Operator action required."
+                            "Dhan closed this socket with a credential or entitlement error \
+                             (806 or 810) that cannot self-heal — parking. Operator action \
+                             required."
                         );
                         self.park(ParkReason::FatalDisconnect, now)
                     }
@@ -4249,39 +5247,13 @@ impl ConnectionSupervisor {
                         self.park(ParkReason::SubscriptionRejected, now)
                     }
                     DisconnectClass::TokenStale => {
-                        // Floor the LADDER, then add this socket's stagger —
-                        // never the other way round (2026-08-11).
-                        //
-                        // This was `next_delay_ms().max(FLOOR)`, which reads
-                        // as "at least the floor" and is, but it also silently
-                        // discarded the jitter. The ladder's first three rungs
-                        // are 0/1000/2000 ms and the whole jitter range is
-                        // 0-375 ms, so every jittered value on those rungs is
-                        // below the 5,000 ms floor and `max` collapsed all of
-                        // them onto exactly 5,000.
-                        //
-                        // That is precisely the wrong behaviour for the event
-                        // this arm exists to handle: a token expiring kills
-                        // ALL sixteen sockets at once, so all sixteen slept an
-                        // identical 5,000 ms, woke in the same tick, and hit
-                        // the token endpoint together — a self-inflicted
-                        // thundering herd on the one code path guaranteed to
-                        // be entered by every connection simultaneously.
-                        //
-                        // Flooring the base first keeps the "wait at least
-                        // 5 s" intent and restores the fan-out on top of it.
-                        //
-                        // 2026-08-19: the base is now the DAMPED ladder value
-                        // rather than the raw rung, so a socket flapping on a
-                        // token that keeps going stale is slowed by the same
-                        // ceiling as any other flapper. The floor-then-jitter
-                        // ordering is unchanged.
-                        let damped = self.damped_decision_without_jitter(now);
-                        let base = damped.delay_ms.max(TOKEN_STALE_REDIAL_FLOOR_MS);
-                        let delay = base.saturating_add(self.jitter_ms());
-                        self.enter_backoff(ReconnectReason::TokenStale, damped.verdict, now);
+                        // Floor the LADDER, then add this socket's stagger:
+                        // see `token_floor_delay` (shared with a first 808).
+                        let (delay, verdict) = self.token_floor_delay(now);
+                        self.enter_backoff(ReconnectReason::TokenStale, verdict, now);
                         SupervisorAction::RefreshTokenThenDial { delay_ms: delay }
                     }
+                    DisconnectClass::AuthRejected => self.on_auth_rejected(now),
                     DisconnectClass::Transient => {
                         // THE CASCADE ARM. `connection.rs` reports a bare TCP
                         // reset as `Closed { code: None }`, which classifies
@@ -4316,12 +5288,28 @@ impl ConnectionSupervisor {
             }
 
             ConnEvent::FrameSilenceElapsed => {
+                // The basis is consumed whether or not this redial happens, so
+                // a stale basis can never label a later, different redial.
+                let basis =
+                    std::mem::replace(&mut self.next_silence_basis, SilenceBasis::Unconfirmed);
                 // Only a LIVE socket can be data-silent in a way that means
                 // anything: while dialing or subscribing no frame is expected,
                 // and backoff/parked are covered by `is_watchdog_eligible`.
                 if self.phase != ConnPhase::Live {
                     return SupervisorAction::Continue;
                 }
+                // Scope lock 2026-10-10: record the basis and escalate this
+                // socket's confirmed threshold (strikes reset after
+                // SILENCE_STRIKE_RESET with no silence redial).
+                self.last_silence_basis = basis;
+                self.silence_strikes = self.silence_strikes.saturating_add(1);
+                self.last_silence_redial_at = Some(now);
+                metrics::counter!(
+                    FRAME_SILENCE_REDIAL_METRIC,
+                    "endpoint" => self.slot.endpoint.as_str(),
+                    "basis" => basis.as_str()
+                )
+                .increment(1);
                 // Scope lock 2026-10-06: a DEPTH socket's frame silence
                 // neither fails nor restarts an overflow window (a quiet depth
                 // contract is legitimate), but the probed depth socket is down
@@ -4347,6 +5335,9 @@ impl ConnectionSupervisor {
                     endpoint = self.slot.endpoint.as_str(),
                     pool_index = self.slot.pool_index,
                     source = "frame_silence",
+                    basis = basis.as_str(),
+                    threshold_secs = self.threshold_secs_for(basis),
+                    strikes = self.silence_strikes,
                     silent_secs = self.frame_silent_for(now).as_secs(),
                     frames_on_this_connection = self.frames,
                     "socket answers pings but has delivered NO data frame for the frame-silence \
@@ -4392,23 +5383,155 @@ impl ConnectionSupervisor {
     /// The idle one wins when both would fire, so a dead transport is never
     /// attributed to data silence.
     pub fn poll(&mut self, now: Instant) -> SupervisorAction {
+        self.poll_with(now, SilenceInputs::live)
+    }
+
+    /// [`Self::poll`] with the process-wide silence inputs injected. `read` is
+    /// called ONLY when this socket is already silent past its confirmed
+    /// threshold and below the 300 s fallback, on a kind with a confirmed path,
+    /// with evidence and the fast path both on — so a healthy socket never
+    /// reads the register. Tests pass a closure over local data.
+    ///
+    /// Thresholds (scope lock 2026-10-10, "PER-KIND FRAME-SILENCE THRESHOLDS"):
+    /// main feed and depth-20 redial at 300 s on time alone, or earlier at
+    /// their escalating confirmed threshold with two live same-kind siblings;
+    /// depth-200 redials on time alone only at 900 s; order update never.
+    pub fn poll_with<'a>(
+        &mut self,
+        now: Instant,
+        read: impl FnOnce() -> SilenceInputs<'a>,
+    ) -> SupervisorAction {
         if !self.phase.is_watchdog_eligible() {
             return SupervisorAction::Continue;
         }
         if self.watchdog.is_expired(now) {
             return self.on_event(ConnEvent::IdleElapsed, now);
         }
-        if self.phase == ConnPhase::Live {
-            if !self.frame_silence_gate.is_open() {
-                // Outside the gate the silence clock is HELD, not paused: the
-                // window starts counting at the open, so a socket dialed at
-                // 09:00 is not torn down at 09:15 for the pre-open quiet.
-                self.last_frame_at = now;
-            } else if self.frame_silent_for(now) >= FRAME_SILENCE_REDIAL {
-                return self.on_event(ConnEvent::FrameSilenceElapsed, now);
+        // The ONE wall-clock read, and only for the IST gate.
+        let secs_of_day = match self.frame_silence_gate {
+            FrameSilenceGate::ContinuousSessionIst => {
+                tickvault_common::market_hours::now_ist_secs_of_day()
+            }
+            FrameSilenceGate::AlwaysOn | FrameSilenceGate::Off => 0,
+        };
+        let confirmed_open = self
+            .frame_silence_gate
+            .confirmed_window_open_at(secs_of_day);
+        if confirmed_open && !self.gap_window_open {
+            // The window just opened: a fresh day's gap peak.
+            self.gap_peak_ms = 0;
+            if let Some(peak) = SLOT_FRAME_GAP_PEAK_MS.get(usize::from(self.slot.global_index)) {
+                peak.store(0, std::sync::atomic::Ordering::Relaxed);
             }
         }
-        SupervisorAction::Continue
+        self.gap_window_open = confirmed_open;
+        if self.phase != ConnPhase::Live {
+            return SupervisorAction::Continue;
+        }
+        if let Some(at) = self.last_silence_redial_at
+            && now.saturating_duration_since(at) >= SILENCE_STRIKE_RESET
+        {
+            self.silence_strikes = 0;
+            self.last_silence_redial_at = None;
+        }
+        if !self.frame_silence_gate.is_open_at(secs_of_day) {
+            // Outside the gate the silence clock is HELD, not paused: the
+            // window starts counting at the open, so a socket dialed at
+            // 09:00 is not torn down at 09:15 for the pre-open quiet.
+            self.last_frame_at = now;
+            return SupervisorAction::Continue;
+        }
+        let endpoint = self.slot.endpoint;
+        let silent_secs = self.frame_silent_for(now).as_secs();
+        let confirmed_threshold = self.confirmed_threshold_secs();
+        let kind = confirmed_kind_index(endpoint);
+        let read_evidence = self.silence_evidence == SiblingEvidence::Pool
+            && self.fast_path != FrameSilenceFastPath::Off
+            && kind.is_some()
+            && silent_secs >= confirmed_threshold
+            && silent_secs < FRAME_SILENCE_REDIAL_SECS;
+        let mut overflow_or_halted = true;
+        let mut siblings: u8 = 0;
+        let mut spacing_ok = false;
+        let mut wall_ms: i64 = 0;
+        let mut spacing_slot: Option<&std::sync::atomic::AtomicI64> = None;
+        let mut spacing_last: i64 = 0;
+        if read_evidence {
+            let inputs = read();
+            let spacing: &'a [std::sync::atomic::AtomicI64; CONFIRMED_SPACING_KINDS] =
+                inputs.spacing;
+            overflow_or_halted = inputs.overflow_or_halted;
+            wall_ms = inputs.wall_ms;
+            siblings = live_siblings(self.slot.global_index, endpoint, wall_ms, &inputs.stamps);
+            if let Some(slot) = kind.and_then(|k| spacing.get(k)) {
+                spacing_last = slot.load(std::sync::atomic::Ordering::Acquire);
+                spacing_ok = spacing_last == 0
+                    || wall_ms.saturating_sub(spacing_last)
+                        >= CONFIRMED_REDIAL_SPACING_SECS.saturating_mul(1_000);
+                spacing_slot = Some(slot);
+            }
+        }
+        let Some(basis) = silence_redial_basis(
+            endpoint,
+            silent_secs,
+            confirmed_threshold,
+            confirmed_open,
+            overflow_or_halted,
+            siblings,
+            self.held_instruments,
+            spacing_ok,
+        ) else {
+            return SupervisorAction::Continue;
+        };
+        if basis == SilenceBasis::SiblingConfirmed {
+            match self.fast_path {
+                FrameSilenceFastPath::Off => return SupervisorAction::Continue,
+                FrameSilenceFastPath::Shadow => {
+                    if !self.would_redial_latched {
+                        self.would_redial_latched = true;
+                        self.would_redials = self.would_redials.saturating_add(1);
+                        metrics::counter!(
+                            FRAME_SILENCE_WOULD_REDIAL_METRIC,
+                            "endpoint" => endpoint.as_str(),
+                            "basis" => basis.as_str()
+                        )
+                        .increment(1);
+                        info!(
+                            endpoint = endpoint.as_str(),
+                            connection_index = self.slot.global_index,
+                            source = "frame_silence_shadow",
+                            silent_secs,
+                            threshold_secs = confirmed_threshold,
+                            live_siblings = siblings,
+                            held = self.held_instruments,
+                            "shadow mode: sibling-confirmed silence WOULD redial this socket now; \
+                             counted only, the 300 s fallback still governs"
+                        );
+                    }
+                    return SupervisorAction::Continue;
+                }
+                FrameSilenceFastPath::Act => {
+                    // One confirmed redial per kind per spacing, pool-wide: a
+                    // lost race means another socket of this kind just took it.
+                    let Some(slot) = spacing_slot else {
+                        return SupervisorAction::Continue;
+                    };
+                    if slot
+                        .compare_exchange(
+                            spacing_last,
+                            wall_ms,
+                            std::sync::atomic::Ordering::AcqRel,
+                            std::sync::atomic::Ordering::Acquire,
+                        )
+                        .is_err()
+                    {
+                        return SupervisorAction::Continue;
+                    }
+                }
+            }
+        }
+        self.next_silence_basis = basis;
+        self.on_event(ConnEvent::FrameSilenceElapsed, now)
     }
 
     /// How long the CURRENT socket has been delivering frames, in
@@ -4484,6 +5607,214 @@ impl ConnectionSupervisor {
         reconnect_jitter_ms(self.slot.global_index)
     }
 
+    /// The delay for a redial that needs a fresh token first: 807/809
+    /// (`TokenStale`) and a first 808 (`AuthRejected`) share it, so both get
+    /// exactly the same floor and fan-out. Returns the delay and the damper
+    /// verdict for [`Self::enter_backoff`]. O(1), no allocation.
+    fn token_floor_delay(&self, now: Instant) -> (u64, FlapVerdict) {
+        // Floor the LADDER, then add this socket's stagger —
+        // never the other way round (2026-08-11).
+        //
+        // This was `next_delay_ms().max(FLOOR)`, which reads
+        // as "at least the floor" and is, but it also silently
+        // discarded the jitter. The ladder's first three rungs
+        // are 0/1000/2000 ms and the whole jitter range is
+        // 0-375 ms, so every jittered value on those rungs is
+        // below the 5,000 ms floor and `max` collapsed all of
+        // them onto exactly 5,000.
+        //
+        // That is precisely the wrong behaviour for the event
+        // this arm exists to handle: a token expiring kills
+        // ALL sixteen sockets at once, so all sixteen slept an
+        // identical 5,000 ms, woke in the same tick, and hit
+        // the token endpoint together — a self-inflicted
+        // thundering herd on the one code path guaranteed to
+        // be entered by every connection simultaneously.
+        //
+        // Flooring the base first keeps the "wait at least
+        // 5 s" intent and restores the fan-out on top of it.
+        //
+        // 2026-08-19: the base is now the DAMPED ladder value
+        // rather than the raw rung, so a socket flapping on a
+        // token that keeps going stale is slowed by the same
+        // ceiling as any other flapper. The floor-then-jitter
+        // ordering is unchanged.
+        let damped = self.damped_decision_without_jitter(now);
+        let base = damped.delay_ms.max(TOKEN_STALE_REDIAL_FLOOR_MS);
+        (base.saturating_add(self.jitter_ms()), damped.verdict)
+    }
+
+    /// 808 refresh-once (scope lock 2026-10-06): an 808 is a credential
+    /// rejection that a fresh token MAY cure. Refresh once and redial on the
+    /// same floored, jittered delay as 807; park only when the episode proves
+    /// the token is not the cause. O(1): a fixed four-slot ring, no heap.
+    fn on_auth_rejected(&mut self, now: Instant) -> SupervisorAction {
+        // Step 1. An 808 after a proven healthy session is a NEW episode: the
+        // previous token worked for a while, so its strikes do not carry over.
+        // Read before `enter_backoff`, which clears `healthy_since`.
+        if self.auth_reject.is_some() && self.healthy_duration_ms(now) >= MIN_HEALTHY_SESSION_MS {
+            self.auth_reject = None;
+        }
+        // Step 2. Start an episode on the first 808.
+        let episode = *self.auth_reject.get_or_insert(AuthRejectEpisode {
+            started_at: now,
+            hard_failures: 0,
+            verified_generation: None,
+            last_progress_at: now,
+            refreshed_this_cycle: false,
+            grace_refresh_used: false,
+        });
+        // Step 3, park rule (d) of the scope lock. (Rule (a), the rejected
+        // fresh token, is decided in `note_token_refresh`.) Refresh ceiling:
+        // the ring is full and its oldest entry is still
+        // inside the window, so four refreshes already produced a fresh token
+        // that was then rejected again. Only a refresh that produced a new
+        // generation is charged to the ring (`note_token_refresh`), so a run
+        // of deferred refreshes never reaches this; park rule (c) parks
+        // those after 300 s without a fresh token.
+        let cursor = usize::from(self.auth_reject_cursor) % AUTH_REJECT_MAX_REFRESHES_PER_WINDOW;
+        let window = Duration::from_millis(AUTH_REJECT_WINDOW_MS);
+        if let Some(oldest) = self.auth_reject_refreshes[cursor]
+            && now.saturating_duration_since(oldest) < window
+        {
+            error!(
+                code = ErrorCode::WsGapDisconnectClassification.code_str(),
+                endpoint = self.slot.endpoint.as_str(),
+                pool_index = self.slot.pool_index,
+                disconnect_code = 808u16,
+                stage = "parked_refresh_ceiling",
+                refreshes_in_window = AUTH_REJECT_MAX_REFRESHES_PER_WINDOW,
+                "Dhan rejected this socket's login with 808 again after it already got a \
+                 fresh login several times in five minutes — parking. Operator action required."
+            );
+            return self.park(ParkReason::FatalDisconnect, now);
+        }
+        // Step 4, park rules (b) and (c). Refresh unavailable: too many
+        // outright failures (b), or 300 s passed without a fresh token (c),
+        // counted from the episode start or the last refresh that produced
+        // one. (c) is unconditional on `verified_generation`: after one fresh
+        // token, a sibling can move the token on so every later refresh is a
+        // new attempt that only defers; without (c) that slot would redial
+        // forever. Past the bound the slot gets at most ONE more refresh:
+        // it parks at once if this cycle began with a refresh, and otherwise
+        // (an outage of failed dials or other closes came between) it takes
+        // a single grace refresh and parks on the next 808 past the bound,
+        // whatever happens in between. Without the grace limit, an 808
+        // alternating with a failed dial would never land on a refreshed
+        // cycle and the slot would never park.
+        let since_progress_ms = u64::try_from(
+            now.saturating_duration_since(episode.last_progress_at)
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        let past_bound = since_progress_ms >= AUTH_REJECT_EPISODE_MAX_MS;
+        if episode.hard_failures >= AUTH_REJECT_MAX_HARD_FAILURES
+            || (past_bound && (episode.refreshed_this_cycle || episode.grace_refresh_used))
+        {
+            error!(
+                code = ErrorCode::WsGapDisconnectClassification.code_str(),
+                endpoint = self.slot.endpoint.as_str(),
+                pool_index = self.slot.pool_index,
+                disconnect_code = 808u16,
+                stage = "parked_refresh_unavailable",
+                hard_failures = episode.hard_failures,
+                ms_since_fresh_token = since_progress_ms,
+                episode_age_ms = u64::try_from(
+                    now.saturating_duration_since(episode.started_at)
+                        .as_millis()
+                )
+                .unwrap_or(u64::MAX),
+                "Dhan rejected this socket's login with 808 and a fresh login could not be \
+                 obtained — parking. Operator action required."
+            );
+            return self.park(ParkReason::FatalDisconnect, now);
+        }
+        if past_bound && let Some(open) = self.auth_reject.as_mut() {
+            open.grace_refresh_used = true;
+        }
+        // Step 5. Refresh once, then redial on the shared token floor. The ring
+        // is charged later, and only if the refresh produced a fresh token.
+        let (delay, verdict) = self.token_floor_delay(now);
+        error!(
+            code = ErrorCode::WsGapDisconnectClassification.code_str(),
+            endpoint = self.slot.endpoint.as_str(),
+            pool_index = self.slot.pool_index,
+            disconnect_code = 808u16,
+            stage = "refresh_then_redial",
+            delay_ms = delay,
+            "Dhan rejected this socket's login with 808 — getting a fresh login once and \
+             redialling. If the fresh login is rejected too, this socket parks."
+        );
+        self.enter_backoff(ReconnectReason::AuthRejected, verdict, now);
+        SupervisorAction::RefreshTokenThenDial { delay_ms: delay }
+    }
+
+    /// What the shell must pass to the token refresh it runs for a
+    /// [`SupervisorAction::RefreshTokenThenDial`]. Only an 808 redial carries
+    /// the verified generation; a 807/809 redial never skips. O(1).
+    #[must_use]
+    pub fn token_refresh_request(&self) -> TokenRefreshRequest {
+        let skip_if_presented = if self.last_redial_reason == ReconnectReason::AuthRejected {
+            self.auth_reject
+                .and_then(|episode| episode.verified_generation)
+        } else {
+            None
+        };
+        TokenRefreshRequest { skip_if_presented }
+    }
+
+    /// Feed the outcome of the token refresh back BEFORE the dial. Returns a
+    /// park action when the refresh proves the 808 is not a stale token (the
+    /// rejected dial already presented the generation this episode verified);
+    /// otherwise `None` and the shell dials. Ignored outside an 808 redial, so
+    /// 807/809 behave exactly as before. O(1), no allocation.
+    pub fn note_token_refresh(
+        &mut self,
+        report: TokenRefreshReport,
+        now: Instant,
+    ) -> Option<SupervisorAction> {
+        if self.last_redial_reason != ReconnectReason::AuthRejected {
+            return None;
+        }
+        let episode = self.auth_reject.as_mut()?;
+        // Any outcome: this cycle began with a refresh, so park rule (c) may
+        // apply to the 808 that ends it.
+        episode.refreshed_this_cycle = true;
+        if episode.verified_generation == Some(report.presented) {
+            error!(
+                code = ErrorCode::WsGapDisconnectClassification.code_str(),
+                endpoint = self.slot.endpoint.as_str(),
+                pool_index = self.slot.pool_index,
+                disconnect_code = 808u16,
+                stage = "parked_fresh_token_rejected",
+                presented_generation = report.presented,
+                "Dhan rejected this socket's FRESH login with 808 too, so the login is not \
+                 the cause — parking. Operator action required."
+            );
+            return Some(self.park(ParkReason::FatalDisconnect, now));
+        }
+        match report.outcome {
+            TokenRefreshOutcome::Fresh { current } => {
+                episode.verified_generation = Some(current);
+                episode.last_progress_at = now;
+                episode.grace_refresh_used = false;
+                // Charge the per-window ceiling, park rule (d), for a refresh
+                // that produced a new generation, and only for that one: a
+                // deferral or a failure is bounded by (b) and (c) instead.
+                let cursor =
+                    usize::from(self.auth_reject_cursor) % AUTH_REJECT_MAX_REFRESHES_PER_WINDOW;
+                self.auth_reject_refreshes[cursor] = Some(now);
+                self.auth_reject_cursor =
+                    u8::try_from((cursor + 1) % AUTH_REJECT_MAX_REFRESHES_PER_WINDOW).unwrap_or(0);
+            }
+            TokenRefreshOutcome::Deferred => {}
+            TokenRefreshOutcome::Failed | TokenRefreshOutcome::NotAttempted => {
+                episode.hard_failures = episode.hard_failures.saturating_add(1);
+            }
+        }
+        None
+    }
+
     /// Common tail for every retryable failure: compute the delay, count it,
     /// advance the ladder, drop into backoff.
     fn schedule_redial(&mut self, reason: ReconnectReason, now: Instant) -> SupervisorAction {
@@ -4511,6 +5842,17 @@ impl ConnectionSupervisor {
     }
 
     fn enter_backoff(&mut self, reason: ReconnectReason, verdict: FlapVerdict, now: Instant) {
+        // 808 refresh-once: a close other than 808 on a socket that delivered
+        // frames ends the episode (the fresh token worked). An 808 decides for
+        // itself in `on_auth_rejected`.
+        if self.proven_healthy && reason != ReconnectReason::AuthRejected {
+            self.auth_reject = None;
+        }
+        // Every redial starts a cycle that has not refreshed yet; an 808
+        // redial sets it again in `note_token_refresh`, which runs after this.
+        if let Some(episode) = self.auth_reject.as_mut() {
+            episode.refreshed_this_cycle = false;
+        }
         // Recorded at the ONE site every redial passes through, so the audit
         // row cannot disagree with the counter beside it.
         self.last_redial_reason = reason;
@@ -4598,6 +5940,9 @@ impl ConnectionSupervisor {
     /// direction: a reader checking whether a respawn is observable would have
     /// concluded it is not, and gone to build a counter that already exists.
     fn park(&mut self, reason: ParkReason, now: Instant) -> SupervisorAction {
+        // Every park ends an 808 episode: a respawn or a probe release starts
+        // clean.
+        self.auth_reject = None;
         if respawn_budget_allows(reason.allows_one_respawn(), self.respawn_used) {
             // One-shot: consumed BEFORE the redial, so a second fatal on this
             // slot finds the budget spent and falls through to the park below.
@@ -4913,6 +6258,13 @@ impl SubscribeGuard {
     pub fn holds(&self, instrument: SubscribeInstrument) -> bool {
         // O(1) EXEMPT: n is 1 (depth-200) or <= 50 (depth-20), cold path, at most once per 180 s per socket.
         self.instruments.contains(&instrument)
+    }
+
+    /// The first instrument in the set, if any. On a depth-200 socket this is
+    /// the one contract it holds. O(1).
+    #[must_use]
+    pub fn first(&self) -> Option<SubscribeInstrument> {
+        self.instruments.first().copied()
     }
 
     /// Incarnation counter — bumped on every confirmed subscribe.
@@ -8098,6 +9450,7 @@ where
         let not_unsubscribed = plan.removed.get(removed_landed..).unwrap_or(&[]).to_vec();
         guard.put_back(&not_unsubscribed);
         publish_connection_instruments(&supervisor.slot(), guard.len());
+        note_held_set(supervisor, guard);
         count("stopped");
         error!(
             code = ErrorCode::WsGapSubscriptionBatching.code_str(),
@@ -8169,6 +9522,7 @@ where
         }
         let not_subscribed = guard.take_from(landed_until);
         publish_connection_instruments(&supervisor.slot(), guard.len());
+        note_held_set(supervisor, guard);
         count("stopped");
         error!(
             code = ErrorCode::WsGapSubscriptionBatching.code_str(),
@@ -8205,6 +9559,7 @@ where
         "in-place resubscribe applied on the live socket - unsubscribe then subscribe, no redial"
     );
     publish_connection_instruments(&supervisor.slot(), guard.len());
+    note_held_set(supervisor, guard);
     audit.emit("applied", sub.sent, removed_landed, guard.len());
     answer_resubscribe(ack, ResubscribeOutcome::Applied);
     SupervisorAction::Continue
@@ -8227,7 +9582,11 @@ pub enum ConnectionExit {
 /// itself and the one-second idle tick.
 ///
 /// `refresh_token` is invoked before re-dialing after a token-staleness
-/// disconnect; supply a no-op when the transport does not carry a token.
+/// disconnect (807/809) or an 808 (scope lock 2026-10-06). It receives the
+/// supervisor's [`TokenRefreshRequest`] and must return the generation the
+/// rejected dial presented plus how the refresh ended; the supervisor parks
+/// an 808 slot whose fresh token was rejected too. A transport that carries
+/// no token returns [`TokenRefreshOutcome::NotAttempted`].
 // Every decision this executes is unit-tested via `ConnectionSupervisor`, and
 // the loop itself is driven end-to-end against a fake transport by the
 // `test_run_connection_*` cases below — dial retry, subscribe failure, 805,
@@ -8242,8 +9601,8 @@ pub async fn run_connection<S, K, F, Fut>(
 where
     S: DhanFeedSocket,
     K: FrameSink + ?Sized,
-    F: FnMut() -> Fut + Send,
-    Fut: std::future::Future<Output = ()> + Send,
+    F: FnMut(TokenRefreshRequest) -> Fut + Send,
+    Fut: std::future::Future<Output = TokenRefreshReport> + Send,
 {
     run_connection_with_commands(socket, supervisor, guard, sink, refresh_token, None).await
 }
@@ -8274,6 +9633,29 @@ where
 /// Saturates rather than wraps; a socket holds at most 5,000.
 fn guard_len_u32(guard: &SubscribeGuard) -> u32 {
     u32::try_from(guard.len()).unwrap_or(u32::MAX)
+}
+
+/// Scope lock 2026-10-10: tells the supervisor how many instruments the
+/// socket now holds (the confirmed-path floor) and, on depth-200, which
+/// contract it holds (the cross-feed register). Called beside every
+/// `publish_connection_instruments` that reports a held count. O(1).
+fn note_held_set(supervisor: &mut ConnectionSupervisor, guard: &SubscribeGuard) {
+    supervisor.set_held_instruments(guard_len_u32(guard));
+    if supervisor.slot().endpoint == DhanEndpointType::Depth200 {
+        publish_depth200_held(
+            supervisor.slot().global_index,
+            guard.first(),
+            wall_clock_ms(),
+        );
+    }
+}
+
+/// The socket holds nothing on the wire (dialing or parked). O(1).
+fn note_held_cleared(supervisor: &mut ConnectionSupervisor) {
+    supervisor.set_held_instruments(0);
+    if supervisor.slot().endpoint == DhanEndpointType::Depth200 {
+        publish_depth200_held(supervisor.slot().global_index, None, 0);
+    }
 }
 
 /// A market-data socket parked for 805 waits here for an overflow probe grant
@@ -8399,8 +9781,8 @@ pub async fn run_connection_with_commands<S, K, F, Fut>(
 where
     S: DhanFeedSocket,
     K: FrameSink + ?Sized,
-    F: FnMut() -> Fut + Send,
-    Fut: std::future::Future<Output = ()> + Send,
+    F: FnMut(TokenRefreshRequest) -> Fut + Send,
+    Fut: std::future::Future<Output = TokenRefreshReport> + Send,
 {
     let endpoint = supervisor.slot().endpoint.as_str();
     let pool_index = supervisor.slot().pool_index;
@@ -8431,6 +9813,7 @@ where
                 close_capturing(&mut socket, &*sink).await;
                 // Parked for the session: the wire carries nothing from here.
                 publish_connection_instruments(&supervisor.slot(), 0);
+                note_held_cleared(&mut supervisor);
                 // A park is PERMANENT — nothing re-dials this socket, and its
                 // shard of the universe stops delivering for the rest of the
                 // session. Until 2026-08-20 that fact reached a log line and a
@@ -8496,6 +9879,11 @@ where
             SupervisorAction::SleepThenDial { delay_ms } => {
                 close_capturing(&mut socket, &*sink).await;
                 guard.mark_lost();
+                // Review 2026-10-10: the socket holds nothing during the
+                // backoff, so the depth-200 cross-feed check must not judge it
+                // (a request now would only be dropped as stale at the next
+                // dial and burn the slot's cooldown).
+                note_held_cleared(&mut supervisor);
                 // `mark_lost` is the honest edge: the subscription is gone and
                 // will have to be re-sent. Recorded BEFORE the sleep so the
                 // row's timestamp is the moment we lost the socket, not the
@@ -8513,6 +9901,11 @@ where
             SupervisorAction::RefreshTokenThenDial { delay_ms } => {
                 close_capturing(&mut socket, &*sink).await;
                 guard.mark_lost();
+                // Review 2026-10-10: the socket holds nothing during the
+                // backoff, so the depth-200 cross-feed check must not judge it
+                // (a request now would only be dropped as stale at the next
+                // dial and burn the slot's cooldown).
+                note_held_cleared(&mut supervisor);
                 sink.on_lifecycle_detail(
                     tickvault_common::ws_event_types::WsEventKind::Disconnected,
                     supervisor.last_redial_reason().as_str(),
@@ -8521,15 +9914,24 @@ where
                 );
                 sleep_unless_stopped(Duration::from_millis(delay_ms), &*sink).await;
                 // No credential round trip for a socket that is about to park.
+                // 808 refresh-once: the outcome is reported BEFORE the dial,
+                // so a fresh token that was already rejected parks here
+                // instead of dialling once more.
+                let mut parked = None;
                 if !sink.stop_requested() {
-                    refresh_token().await;
+                    let report = refresh_token(supervisor.token_refresh_request()).await;
+                    parked = supervisor.note_token_refresh(report, Instant::now());
                 }
-                action = supervisor.on_event(ConnEvent::BeginDial, Instant::now());
+                action = match parked {
+                    Some(park) => park,
+                    None => supervisor.on_event(ConnEvent::BeginDial, Instant::now()),
+                };
             }
 
             SupervisorAction::Dial => {
                 // Nothing is on the wire until this dial's subscribe is acked.
                 publish_connection_instruments(&supervisor.slot(), 0);
+                note_held_cleared(&mut supervisor);
                 // Z11d: a socket asked to stop never opens. Every dial path
                 // (first dial, every reconnect, the lock-refusal poll below)
                 // passes here, so this one check is what stops them all.
@@ -8660,6 +10062,7 @@ where
                 }
                 guard.mark_confirmed();
                 publish_connection_instruments(&supervisor.slot(), guard.len());
+                note_held_set(&mut supervisor, &guard);
                 // CONNECTED means subscribed-and-acked, not merely dialed.
                 // The 2026-08-12 blackout is why: twelve sockets dialed and
                 // every one died on the handshake, so a row written at dial
@@ -9201,6 +10604,7 @@ where
                                     .increment(added as u64);
                                 outcome = ExtendOutcome::Held;
                                 publish_connection_instruments(&supervisor.slot(), guard.len());
+                                note_held_set(supervisor, guard);
                             }
                         }
                         Err(_) => {
@@ -9724,6 +11128,7 @@ where
                                         },
                                         Some((swap_audit, guard_len_u32(guard))),
                                     );
+                                    note_held_cleared(supervisor);
                                     action = supervisor
                                         .on_event(ConnEvent::SubscribeFailed, Instant::now());
                                     // Leave the drain so the outer loop can act
@@ -9794,6 +11199,8 @@ where
                             metrics::counter!(SWAP_REFUSED_METRIC).increment(1);
                         }
                     }
+                    // Scope lock 2026-10-10: a swap may change the held contract.
+                    note_held_set(supervisor, guard);
                 }
                 Ok(LiveSubscriptionCommand::ProbeUnsubscribe {
                     drop_this,
@@ -10124,6 +11531,20 @@ where
                         action = supervisor.on_event(ConnEvent::ProbeCloseRequested, Instant::now());
                     }
                 }
+                // Scope lock 2026-10-10: a cross-feed silence request (the
+                // main feed shows this depth-200 socket's contract trading
+                // while it stays silent). One atomic swap a second; refused
+                // after an 805 like every other voluntary redial.
+                if action == SupervisorAction::Continue
+                    && take_data_silence_redial(supervisor.slot().global_index)
+                {
+                    if rotation_halted() {
+                        refuse_voluntary_redial_after_805(supervisor.slot(), "data_silence");
+                    } else {
+                        supervisor.note_silence_basis(SilenceBasis::CrossFeed);
+                        action = supervisor.on_event(ConnEvent::FrameSilenceElapsed, Instant::now());
+                    }
+                }
                 // D7 / 2026-10-02: the overflow probe, on the same tick. A quiet
                 // process pays one atomic load. A failed probe re-parks the
                 // probed socket here; every other socket only advances the
@@ -10341,7 +11762,7 @@ mod tests {
 
     use super::super::reconnect_ladder::{
         FLAP_CEILING_REDIAL_FLOOR_MS, FLAP_REDIAL_CEILING, MIN_HEALTHY_SESSION_MS,
-        RECONNECT_DELAY_WITH_JITTER_MAX_MS, RECONNECT_JITTER_STEP_MS,
+        RECONNECT_DELAY_WITH_JITTER_MAX_MS, RECONNECT_JITTER_STEP_MS, RECONNECT_LADDER_CAP_MS,
         SHORT_SESSION_REDIAL_FLOOR_MS, reconnect_delay_ms,
     };
 
@@ -10906,7 +12327,6 @@ mod tests {
     fn test_classify_disconnect_credential_and_entitlement_errors_are_fatal() {
         for code in [
             DisconnectCode::DataApiSubscriptionRequired,
-            DisconnectCode::AuthenticationFailed,
             DisconnectCode::ClientIdInvalid,
         ] {
             assert_eq!(
@@ -11581,7 +13001,6 @@ mod tests {
     fn test_supervisor_fatal_disconnect_parks() {
         let now = t0();
         for code in [
-            DisconnectCode::AuthenticationFailed,
             DisconnectCode::ClientIdInvalid,
             DisconnectCode::DataApiSubscriptionRequired,
         ] {
@@ -11617,6 +13036,1005 @@ mod tests {
                 assert!(delay_ms > reconnect_delay_ms(0));
             }
             other => panic!("expected RefreshTokenThenDial, got {other:?}"),
+        }
+    }
+
+    // --- 808 refresh-once (scope lock 2026-10-06) ---------------------
+
+    /// Dial and finish the dial, with no frame: the shape of an 808 that
+    /// arrives on the handshake.
+    fn dial_no_frames(s: &mut ConnectionSupervisor, now: Instant) {
+        assert_eq!(
+            s.on_event(ConnEvent::BeginDial, now),
+            SupervisorAction::Dial
+        );
+        let _ = s.on_event(ConnEvent::DialSucceeded, now);
+    }
+
+    fn close_808(s: &mut ConnectionSupervisor, now: Instant) -> SupervisorAction {
+        s.on_event(
+            ConnEvent::Disconnected {
+                code: Some(DisconnectCode::AuthenticationFailed),
+            },
+            now,
+        )
+    }
+
+    fn refresh_report(presented: u64, outcome: TokenRefreshOutcome) -> TokenRefreshReport {
+        TokenRefreshReport { presented, outcome }
+    }
+
+    fn assert_refresh(action: &SupervisorAction) {
+        assert!(
+            matches!(action, SupervisorAction::RefreshTokenThenDial { .. }),
+            "an 808 that may be cured by a fresh token must refresh then dial, got {action:?}"
+        );
+    }
+
+    fn assert_parked_fatal(s: &ConnectionSupervisor, action: &SupervisorAction) {
+        assert_eq!(
+            *action,
+            SupervisorAction::Park {
+                reason: ParkReason::FatalDisconnect
+            }
+        );
+        assert_eq!(s.phase(), ConnPhase::Parked);
+        assert_eq!(s.park_reason(), Some(ParkReason::FatalDisconnect));
+    }
+
+    /// One 808 episode that has verified generation `verified`: the first 808
+    /// refreshed and the refresh saw the token move to `verified`.
+    fn episode_with_verified(now: Instant, verified: u64) -> ConnectionSupervisor {
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+        dial_no_frames(&mut s, now);
+        assert_refresh(&close_808(&mut s, now));
+        assert_eq!(
+            s.note_token_refresh(
+                refresh_report(
+                    verified.saturating_sub(1),
+                    TokenRefreshOutcome::Fresh { current: verified }
+                ),
+                now
+            ),
+            None
+        );
+        s
+    }
+
+    #[test]
+    fn test_classify_disconnect_808_is_auth_rejected_and_806_810_stay_fatal() {
+        assert_eq!(
+            classify_disconnect(Some(DisconnectCode::AuthenticationFailed)),
+            DisconnectClass::AuthRejected
+        );
+        for code in [
+            DisconnectCode::DataApiSubscriptionRequired,
+            DisconnectCode::ClientIdInvalid,
+        ] {
+            assert_eq!(
+                classify_disconnect(Some(code)),
+                DisconnectClass::Fatal,
+                "{code:?}"
+            );
+        }
+        assert_eq!(ReconnectReason::AuthRejected.as_str(), "auth_rejected");
+        assert!(ReconnectReason::ALL.contains(&ReconnectReason::AuthRejected));
+    }
+
+    #[test]
+    fn test_first_808_refreshes_then_dials_with_the_token_floor() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+        dial_no_frames(&mut s, now);
+        // Slot 0 carries no stagger, so the delay is exactly the 807 floor.
+        assert_eq!(
+            close_808(&mut s, now),
+            SupervisorAction::RefreshTokenThenDial {
+                delay_ms: TOKEN_STALE_REDIAL_FLOOR_MS
+            }
+        );
+        assert_eq!(s.last_redial_reason(), ReconnectReason::AuthRejected);
+        assert_eq!(s.phase(), ConnPhase::Backoff);
+        assert_eq!(
+            s.token_refresh_request(),
+            TokenRefreshRequest {
+                skip_if_presented: None
+            },
+            "a first 808 has no verified generation to skip"
+        );
+        assert_eq!(
+            s.note_token_refresh(
+                refresh_report(0, TokenRefreshOutcome::Fresh { current: 1 }),
+                now
+            ),
+            None,
+            "a fresh token is dialled"
+        );
+        assert_eq!(
+            s.on_event(ConnEvent::BeginDial, now),
+            SupervisorAction::Dial
+        );
+    }
+
+    #[test]
+    fn test_second_808_presenting_the_verified_generation_parks() {
+        let now = t0();
+        let mut s = episode_with_verified(now, 1);
+        let later = now + Duration::from_secs(6);
+        dial_no_frames(&mut s, later);
+        assert_refresh(&close_808(&mut s, later));
+        assert_eq!(
+            s.token_refresh_request(),
+            TokenRefreshRequest {
+                skip_if_presented: Some(1)
+            }
+        );
+        let action = s
+            .note_token_refresh(refresh_report(1, TokenRefreshOutcome::NotAttempted), later)
+            .expect("the fresh token was rejected too: park");
+        assert_parked_fatal(&s, &action);
+        assert_eq!(
+            s.on_event(ConnEvent::BeginDial, later),
+            SupervisorAction::Continue,
+            "nothing dials after the park"
+        );
+    }
+
+    #[test]
+    fn test_808_with_a_new_generation_after_verification_is_a_new_strike() {
+        let now = t0();
+        let mut s = episode_with_verified(now, 1);
+        let later = now + Duration::from_secs(6);
+        dial_no_frames(&mut s, later);
+        assert_refresh(&close_808(&mut s, later));
+        // A sibling renewed meanwhile: this dial presented generation 2, not
+        // the verified 1, so the closure renewed and saw 3.
+        assert_eq!(
+            s.note_token_refresh(
+                refresh_report(2, TokenRefreshOutcome::Fresh { current: 3 }),
+                later
+            ),
+            None
+        );
+        let again = later + Duration::from_secs(6);
+        dial_no_frames(&mut s, again);
+        assert_refresh(&close_808(&mut s, again));
+        assert_eq!(
+            s.token_refresh_request(),
+            TokenRefreshRequest {
+                skip_if_presented: Some(3)
+            }
+        );
+        let action = s
+            .note_token_refresh(refresh_report(3, TokenRefreshOutcome::NotAttempted), again)
+            .expect("the newly verified token was rejected: park");
+        assert_parked_fatal(&s, &action);
+    }
+
+    #[test]
+    fn test_808_hard_failures_are_bounded() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+        let mut at = now;
+        for strike in 0..AUTH_REJECT_MAX_HARD_FAILURES {
+            dial_no_frames(&mut s, at);
+            assert_refresh(&close_808(&mut s, at));
+            assert_eq!(
+                s.note_token_refresh(refresh_report(0, TokenRefreshOutcome::Failed), at),
+                None,
+                "failure {strike} still dials"
+            );
+            at += Duration::from_secs(10);
+        }
+        dial_no_frames(&mut s, at);
+        let action = close_808(&mut s, at);
+        assert_parked_fatal(&s, &action);
+    }
+
+    #[test]
+    fn test_808_mint_cooldown_deferrals_do_not_count_but_the_episode_is_time_bounded() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+        // Four deferrals inside the episode bound: none counts as a failure,
+        // and three of them would already have parked a failing slot.
+        for secs in [0u64, 100, 200, 299] {
+            let at = now + Duration::from_secs(secs);
+            dial_no_frames(&mut s, at);
+            assert_refresh(&close_808(&mut s, at));
+            assert_eq!(
+                s.note_token_refresh(refresh_report(0, TokenRefreshOutcome::Deferred), at),
+                None
+            );
+        }
+        // Past the bound with no verified fresh token: park, even though no
+        // refresh failed outright and the ceiling window has moved on.
+        let at = now + Duration::from_millis(AUTH_REJECT_EPISODE_MAX_MS);
+        dial_no_frames(&mut s, at);
+        let action = close_808(&mut s, at);
+        assert_parked_fatal(&s, &action);
+    }
+
+    /// Review fix (2026-10-06): at REAL redial cadence (808s 5 s apart,
+    /// the token floor) a run of deferred refreshes must not trip the
+    /// per-window ceiling; only the episode age parks it, at 300 s.
+    #[test]
+    fn test_808_deferrals_at_real_cadence_park_only_at_the_episode_bound() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+        let step = Duration::from_millis(TOKEN_STALE_REDIAL_FLOOR_MS);
+        let mut at = now;
+        let mut refreshes = 0u32;
+        while at.saturating_duration_since(now) < Duration::from_millis(AUTH_REJECT_EPISODE_MAX_MS)
+        {
+            dial_no_frames(&mut s, at);
+            let action = close_808(&mut s, at);
+            assert!(
+                matches!(action, SupervisorAction::RefreshTokenThenDial { .. }),
+                "deferred refresh {refreshes} parked before the episode bound: {action:?}"
+            );
+            assert_eq!(
+                s.note_token_refresh(refresh_report(0, TokenRefreshOutcome::Deferred), at),
+                None
+            );
+            refreshes += 1;
+            at += step;
+        }
+        assert_eq!(refreshes, 60, "300 s of 808s, 5 s apart");
+        // At the bound: the park is rule (c), "refresh unavailable", not the
+        // ceiling (d): no deferred refresh was ever charged to the ring.
+        assert!(s.auth_reject_refreshes.iter().all(Option::is_none));
+        dial_no_frames(&mut s, at);
+        let action = close_808(&mut s, at);
+        assert_parked_fatal(&s, &action);
+    }
+
+    /// Review fix round 2 (2026-10-06): after one fresh token, a sibling
+    /// moves the token on, so every later 808 presents a generation the
+    /// episode never verified and its refresh only defers (a persistent
+    /// RESILIENCE-03 refusal). The slot must still park 300 s after that
+    /// fresh token, and not before. The fresh token lands 100 s into the
+    /// episode, so this also proves the bound runs from the last fresh
+    /// token, not from the episode start.
+    #[test]
+    fn test_808_deferrals_after_one_fresh_token_park_300_s_after_it() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+        let step = Duration::from_millis(TOKEN_STALE_REDIAL_FLOOR_MS);
+        let bound = Duration::from_millis(AUTH_REJECT_EPISODE_MAX_MS);
+        let fresh_at = now + Duration::from_secs(100);
+        let mut at = now;
+        // Deferrals until the fresh token, presenting generation 0.
+        while at < fresh_at {
+            dial_no_frames(&mut s, at);
+            assert_refresh(&close_808(&mut s, at));
+            assert_eq!(
+                s.note_token_refresh(refresh_report(0, TokenRefreshOutcome::Deferred), at),
+                None
+            );
+            at += step;
+        }
+        // One refresh produces generation 1.
+        dial_no_frames(&mut s, fresh_at);
+        assert_refresh(&close_808(&mut s, fresh_at));
+        assert_eq!(
+            s.note_token_refresh(
+                refresh_report(0, TokenRefreshOutcome::Fresh { current: 1 }),
+                fresh_at
+            ),
+            None
+        );
+        // A sibling installed generation 2; every refresh from here defers.
+        at = fresh_at + step;
+        let mut deferrals = 0u32;
+        while at.saturating_duration_since(fresh_at) < bound {
+            dial_no_frames(&mut s, at);
+            let action = close_808(&mut s, at);
+            assert!(
+                matches!(action, SupervisorAction::RefreshTokenThenDial { .. }),
+                "deferral {deferrals} parked before 300 s after the fresh token: {action:?}"
+            );
+            assert_eq!(
+                s.note_token_refresh(refresh_report(2, TokenRefreshOutcome::Deferred), at),
+                None
+            );
+            deferrals += 1;
+            at += step;
+        }
+        assert_eq!(deferrals, 59, "300 s after the fresh token, 5 s apart");
+        assert!(
+            at.saturating_duration_since(now) > bound,
+            "the episode itself is older than the bound, so the start alone did not park it"
+        );
+        assert_eq!(s.auth_reject.map(|e| e.hard_failures), Some(0));
+        dial_no_frames(&mut s, at);
+        let action = close_808(&mut s, at);
+        assert_parked_fatal(&s, &action);
+    }
+
+    /// Review round 3 (2026-10-06): an outage longer than 300 s (only failed
+    /// dials, no refresh) must not park the first 808 after it. That 808
+    /// refreshes once more; the next 808, with still no fresh token, parks.
+    #[test]
+    fn test_808_after_a_long_outage_refreshes_once_more_then_parks() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+        dial_no_frames(&mut s, now);
+        assert_refresh(&close_808(&mut s, now));
+        assert_eq!(
+            s.note_token_refresh(refresh_report(0, TokenRefreshOutcome::Deferred), now),
+            None
+        );
+        // 400 s of network outage: every dial fails, nothing refreshes.
+        let outage_end = now + Duration::from_secs(400);
+        let mut at = now + Duration::from_millis(TOKEN_STALE_REDIAL_FLOOR_MS);
+        while at < outage_end {
+            assert_eq!(s.on_event(ConnEvent::BeginDial, at), SupervisorAction::Dial);
+            let _ = s.on_event(ConnEvent::DialFailed, at);
+            at += Duration::from_millis(RECONNECT_LADDER_CAP_MS);
+        }
+        // The first 808 after the outage refreshes instead of parking.
+        dial_no_frames(&mut s, outage_end);
+        assert_refresh(&close_808(&mut s, outage_end));
+        assert_eq!(
+            s.note_token_refresh(refresh_report(0, TokenRefreshOutcome::Deferred), outage_end),
+            None
+        );
+        // One refresh cycle later, still no fresh token: park rule (c).
+        let next = outage_end + Duration::from_millis(TOKEN_STALE_REDIAL_FLOOR_MS);
+        dial_no_frames(&mut s, next);
+        let action = close_808(&mut s, next);
+        assert_parked_fatal(&s, &action);
+    }
+
+    /// Review round 3: at the delays the supervisor itself returns (the flap
+    /// ceiling raises them to 30 s), deferrals still park by rule (c), at
+    /// 300 s without a fresh token and within one redial delay after it.
+    #[test]
+    fn test_808_deferrals_at_the_returned_delays_park_within_one_cycle_of_300_s() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+        let bound = Duration::from_millis(AUTH_REJECT_EPISODE_MAX_MS);
+        let mut at = now;
+        loop {
+            dial_no_frames(&mut s, at);
+            match close_808(&mut s, at) {
+                SupervisorAction::RefreshTokenThenDial { delay_ms } => {
+                    assert!(delay_ms <= RECONNECT_DELAY_WITH_JITTER_MAX_MS);
+                    assert_eq!(
+                        s.note_token_refresh(refresh_report(0, TokenRefreshOutcome::Deferred), at),
+                        None
+                    );
+                    at += Duration::from_millis(delay_ms);
+                }
+                action => {
+                    assert_parked_fatal(&s, &action);
+                    break;
+                }
+            }
+            assert!(
+                at.saturating_duration_since(now)
+                    <= bound + Duration::from_millis(RECONNECT_DELAY_WITH_JITTER_MAX_MS),
+                "no park within one redial delay of the bound"
+            );
+        }
+        assert!(
+            at.saturating_duration_since(now) >= bound,
+            "parked before the bound"
+        );
+    }
+
+    /// Review round 4 (2026-10-06): 808s alternating with failed dials never
+    /// land on a cycle that began with a refresh. Past the 300 s bound the
+    /// slot still gets only one grace refresh, so it parks no later than the
+    /// second 808 past the bound.
+    #[test]
+    fn test_808_alternating_with_failed_dials_parks_by_the_second_808_past_300_s() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+        let bound = Duration::from_millis(AUTH_REJECT_EPISODE_MAX_MS);
+        let step = Duration::from_millis(TOKEN_STALE_REDIAL_FLOOR_MS);
+        let mut at = now;
+        let mut past_bound_808s = 0u32;
+        loop {
+            dial_no_frames(&mut s, at);
+            let past = at.saturating_duration_since(now) >= bound;
+            if past {
+                past_bound_808s += 1;
+            }
+            match close_808(&mut s, at) {
+                SupervisorAction::RefreshTokenThenDial { .. } => {
+                    assert_eq!(
+                        s.note_token_refresh(refresh_report(0, TokenRefreshOutcome::Deferred), at),
+                        None
+                    );
+                }
+                action => {
+                    assert_parked_fatal(&s, &action);
+                    break;
+                }
+            }
+            assert!(
+                past_bound_808s < 2,
+                "the second 808 past 300 s did not park"
+            );
+            // The refreshed dial fails; the next 808 comes on a later dial.
+            at += step;
+            assert_eq!(s.on_event(ConnEvent::BeginDial, at), SupervisorAction::Dial);
+            let _ = s.on_event(ConnEvent::DialFailed, at);
+            at += step;
+        }
+        assert!(past_bound_808s >= 1, "parked before the 300 s bound");
+        assert!(past_bound_808s <= 2);
+    }
+
+    /// Review fix (2026-10-06): one real failure followed by a reused one
+    /// (reported as Deferred by the closure) is ONE hard strike.
+    #[test]
+    fn test_808_reused_failure_is_not_a_second_hard_strike() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+        dial_no_frames(&mut s, now);
+        assert_refresh(&close_808(&mut s, now));
+        let _ = s.note_token_refresh(refresh_report(0, TokenRefreshOutcome::Failed), now);
+        let later = now + Duration::from_millis(TOKEN_STALE_REDIAL_FLOOR_MS);
+        dial_no_frames(&mut s, later);
+        assert_refresh(&close_808(&mut s, later));
+        let _ = s.note_token_refresh(refresh_report(0, TokenRefreshOutcome::Deferred), later);
+        assert_eq!(s.auth_reject.map(|e| e.hard_failures), Some(1));
+    }
+
+    #[test]
+    fn test_stacked_data_then_808_does_not_clear_the_episode() {
+        let now = t0();
+        let mut s = episode_with_verified(now, 1);
+        let later = now + Duration::from_secs(6);
+        dial_no_frames(&mut s, later);
+        let _ = s.on_event(ConnEvent::SubscribeAcked, later);
+        // A frame stacked ahead of the 808 in the same read.
+        let _ = s.on_event(ConnEvent::FrameReceived, later);
+        assert_refresh(&close_808(&mut s, later));
+        assert_eq!(
+            s.token_refresh_request().skip_if_presented,
+            Some(1),
+            "a frame stacked ahead of the 808 is not a healthy session"
+        );
+        let action = s
+            .note_token_refresh(refresh_report(1, TokenRefreshOutcome::NotAttempted), later)
+            .expect("park");
+        assert_parked_fatal(&s, &action);
+    }
+
+    #[test]
+    fn test_808_after_a_proven_healthy_session_starts_a_new_episode() {
+        let now = t0();
+        let mut s = episode_with_verified(now, 1);
+        let later = now + Duration::from_secs(6);
+        dial_no_frames(&mut s, later);
+        let _ = s.on_event(ConnEvent::SubscribeAcked, later);
+        let _ = s.on_event(ConnEvent::FrameReceived, later);
+        let rejected_at = later + Duration::from_millis(MIN_HEALTHY_SESSION_MS + 1_000);
+        assert_refresh(&close_808(&mut s, rejected_at));
+        assert_eq!(
+            s.token_refresh_request().skip_if_presented,
+            None,
+            "the token worked for a healthy session: a new episode starts clean"
+        );
+        assert_eq!(
+            s.note_token_refresh(
+                refresh_report(1, TokenRefreshOutcome::Fresh { current: 2 }),
+                rejected_at
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_non_808_close_after_frames_clears_the_episode() {
+        let now = t0();
+        let mut s = episode_with_verified(now, 1);
+        let later = now + Duration::from_secs(6);
+        dial_no_frames(&mut s, later);
+        let _ = s.on_event(ConnEvent::SubscribeAcked, later);
+        let _ = s.on_event(ConnEvent::FrameReceived, later);
+        // The fresh token worked; a later plain reset ends the episode.
+        let _ = s.on_event(ConnEvent::Disconnected { code: None }, later);
+        assert!(s.auth_reject.is_none());
+        let again = later + Duration::from_secs(10);
+        dial_no_frames(&mut s, again);
+        assert_refresh(&close_808(&mut s, again));
+        assert_eq!(s.token_refresh_request().skip_if_presented, None);
+    }
+
+    #[test]
+    fn test_808_episode_is_cleared_by_an_805_park_and_probe_release() {
+        // Every park ends the episode, so a probe release (which redials a
+        // slot parked for 805) or a respawn starts clean. The park is called
+        // directly so the test does not touch the process-wide 805 state.
+        let now = t0();
+        let mut s = episode_with_verified(now, 1);
+        assert!(s.auth_reject.is_some());
+        let action = s.park(ParkReason::PoolOverflow, now);
+        assert_eq!(
+            action,
+            SupervisorAction::Park {
+                reason: ParkReason::PoolOverflow
+            }
+        );
+        assert!(s.auth_reject.is_none(), "an 805 park ends the 808 episode");
+
+        // The 804 respawn path also passes through `park`.
+        let mut r = episode_with_verified(now, 1);
+        let later = now + Duration::from_secs(6);
+        dial_no_frames(&mut r, later);
+        let _ = r.on_event(
+            ConnEvent::Disconnected {
+                code: Some(DisconnectCode::InstrumentsExceedLimit),
+            },
+            later,
+        );
+        assert!(
+            r.auth_reject.is_none(),
+            "a respawn starts without the episode"
+        );
+    }
+
+    #[test]
+    fn test_808_refresh_ceiling_per_window() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+        // Every refresh "works" (a new generation each time) and each new
+        // token is rejected again: only the ceiling stops it.
+        let mut generation = 10u64;
+        let mut at = now;
+        for _ in 0..AUTH_REJECT_MAX_REFRESHES_PER_WINDOW {
+            dial_no_frames(&mut s, at);
+            assert_refresh(&close_808(&mut s, at));
+            assert_eq!(
+                s.note_token_refresh(
+                    refresh_report(
+                        generation,
+                        TokenRefreshOutcome::Fresh {
+                            current: generation + 1
+                        }
+                    ),
+                    at
+                ),
+                None
+            );
+            generation += 2;
+            at += Duration::from_secs(10);
+        }
+        // A fifth 808 inside the window parks.
+        dial_no_frames(&mut s, at);
+        let action = close_808(&mut s, at);
+        assert_parked_fatal(&s, &action);
+
+        // A fifth refresh OUTSIDE the window is allowed.
+        let mut w = sup(DhanEndpointType::MainFeed, 0, now);
+        let mut generation = 10u64;
+        for secs in [0u64, 10, 20, 30] {
+            let at = now + Duration::from_secs(secs);
+            dial_no_frames(&mut w, at);
+            assert_refresh(&close_808(&mut w, at));
+            let _ = w.note_token_refresh(
+                refresh_report(
+                    generation,
+                    TokenRefreshOutcome::Fresh {
+                        current: generation + 1,
+                    },
+                ),
+                at,
+            );
+            generation += 2;
+        }
+        let at = now + Duration::from_millis(AUTH_REJECT_WINDOW_MS);
+        dial_no_frames(&mut w, at);
+        assert_refresh(&close_808(&mut w, at));
+    }
+
+    #[test]
+    fn test_807_and_809_ignore_note_token_refresh_and_never_park() {
+        let now = t0();
+        for code in [
+            DisconnectCode::AccessTokenExpired,
+            DisconnectCode::AccessTokenInvalid,
+        ] {
+            // Including inside an open 808 episode with a verified token.
+            let mut s = episode_with_verified(now, 1);
+            let mut at = now;
+            for _ in 0..12 {
+                at += Duration::from_secs(10);
+                dial_no_frames(&mut s, at);
+                assert_refresh(&s.on_event(ConnEvent::Disconnected { code: Some(code) }, at));
+                assert_eq!(
+                    s.token_refresh_request().skip_if_presented,
+                    None,
+                    "{code:?}"
+                );
+                for outcome in [
+                    TokenRefreshOutcome::Failed,
+                    TokenRefreshOutcome::NotAttempted,
+                ] {
+                    assert_eq!(s.note_token_refresh(refresh_report(1, outcome), at), None);
+                }
+            }
+            assert_ne!(s.phase(), ConnPhase::Parked, "{code:?} never parks");
+        }
+        // No episode at all: ignored too.
+        let mut fresh = sup(DhanEndpointType::MainFeed, 0, now);
+        assert_eq!(
+            fresh.note_token_refresh(refresh_report(0, TokenRefreshOutcome::Failed), now),
+            None
+        );
+    }
+
+    #[test]
+    fn test_token_refresh_request_carries_the_verified_generation_only_on_an_808_redial() {
+        let now = t0();
+        // No episode: nothing to skip.
+        let idle = sup(DhanEndpointType::MainFeed, 0, now);
+        assert_eq!(idle.token_refresh_request().skip_if_presented, None);
+        // An 808 redial with a verified generation carries it.
+        let mut s = episode_with_verified(now, 4);
+        let later = now + Duration::from_secs(6);
+        dial_no_frames(&mut s, later);
+        assert_refresh(&close_808(&mut s, later));
+        assert_eq!(s.token_refresh_request().skip_if_presented, Some(4));
+        // The same episode, but the redial is for 807: never skip.
+        let mut t = episode_with_verified(now, 4);
+        dial_no_frames(&mut t, later);
+        assert_refresh(&t.on_event(
+            ConnEvent::Disconnected {
+                code: Some(DisconnectCode::AccessTokenExpired),
+            },
+            later,
+        ));
+        assert_eq!(t.token_refresh_request().skip_if_presented, None);
+    }
+
+    #[test]
+    fn test_808_never_sets_rotation_halted_or_engages_the_overflow_episode() {
+        // Behaviour: every 808 park is a FatalDisconnect, never PoolOverflow
+        // (the reason the 805 recovery and the rotation breaker key on).
+        let now = t0();
+        let mut s = sup(DhanEndpointType::Depth200, 0, now);
+        for _ in 0..AUTH_REJECT_MAX_HARD_FAILURES {
+            dial_no_frames(&mut s, now);
+            assert_refresh(&close_808(&mut s, now));
+            let _ = s.note_token_refresh(refresh_report(0, TokenRefreshOutcome::Failed), now);
+        }
+        dial_no_frames(&mut s, now);
+        let action = close_808(&mut s, now);
+        assert_parked_fatal(&s, &action);
+        // Source: the 808 path never names the 805 machinery.
+        let src = include_str!("pool_supervisor.rs");
+        let prod = src.split(concat!("#[cfg(", "test)]")).next().unwrap_or(src);
+        for name in ["fn on_auth_rejected(", "pub fn note_token_refresh("] {
+            let at = prod.find(name).expect("808 fn");
+            let end = prod[at..].find("\n    }\n").expect("fn end");
+            let body = &prod[at..at + end];
+            for banned in [
+                "ROTATION_HALTED",
+                "OVERFLOW_ENGAGED",
+                "ParkReason::PoolOverflow",
+                "overflow_episode_",
+            ] {
+                assert!(!body.contains(banned), "{name} must not touch {banned}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_sixteen_sockets_rejected_808_together_fan_out_above_the_floor() {
+        let now = t0();
+        let mut delays = Vec::new();
+        for endpoint in DhanEndpointType::ALL {
+            for pool_index in 0..endpoint.max_connections() {
+                let mut s = sup(endpoint, pool_index, now);
+                dial_no_frames(&mut s, now);
+                match close_808(&mut s, now) {
+                    SupervisorAction::RefreshTokenThenDial { delay_ms } => delays.push(delay_ms),
+                    other => panic!("808 must refresh the token then dial, got {other:?}"),
+                }
+            }
+        }
+        assert_eq!(delays.len(), 16);
+        let unique: BTreeSet<u64> = delays.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            16,
+            "sixteen 808s must not wake together: {delays:?}"
+        );
+        assert!(delays.iter().all(|d| *d >= TOKEN_STALE_REDIAL_FLOOR_MS));
+        assert_eq!(
+            delays.iter().max().copied().unwrap_or(0),
+            TOKEN_STALE_REDIAL_FLOOR_MS + 15 * RECONNECT_JITTER_STEP_MS
+        );
+    }
+
+    #[test]
+    fn token_floor_delay_is_shared_by_807_and_808() {
+        let now = t0();
+        for endpoint in DhanEndpointType::ALL {
+            for pool_index in 0..endpoint.max_connections() {
+                let mut a = sup(endpoint, pool_index, now);
+                let mut b = sup(endpoint, pool_index, now);
+                dial_no_frames(&mut a, now);
+                dial_no_frames(&mut b, now);
+                let stale = a.on_event(
+                    ConnEvent::Disconnected {
+                        code: Some(DisconnectCode::AccessTokenExpired),
+                    },
+                    now,
+                );
+                assert_eq!(stale, close_808(&mut b, now), "{endpoint:?}/{pool_index}");
+            }
+        }
+        let src = include_str!("pool_supervisor.rs");
+        let prod = src.split(concat!("#[cfg(", "test)]")).next().unwrap_or(src);
+        let stale_arm = prod
+            .find("DisconnectClass::TokenStale => {")
+            .expect("807 arm");
+        assert!(prod[stale_arm..stale_arm + 400].contains("self.token_floor_delay(now)"));
+        let at = prod.find("fn on_auth_rejected(").expect("808 fn");
+        let end = prod[at..].find("\n    }\n").expect("fn end");
+        assert!(prod[at..at + end].contains("self.token_floor_delay(now)"));
+    }
+
+    #[test]
+    fn the_frame_path_does_not_touch_the_auth_reject_episode() {
+        let src = include_str!("pool_supervisor.rs");
+        let prod = src.split(concat!("#[cfg(", "test)]")).next().unwrap_or(src);
+        let at = prod
+            .find("ConnEvent::FrameReceived => {")
+            .expect("frame arm");
+        let end = prod[at..]
+            .find("ConnEvent::KeepAliveReceived =>")
+            .expect("next arm");
+        let arm = &prod[at..at + end];
+        assert!(
+            !arm.contains("auth_reject"),
+            "the per-frame arm must not read the 808 episode"
+        );
+        assert!(!arm.contains("on_auth_rejected"));
+    }
+
+    #[test]
+    fn refresh_arm_reports_the_outcome_before_begin_dial() {
+        let src = include_str!("pool_supervisor.rs");
+        let prod = src.split(concat!("#[cfg(", "test)]")).next().unwrap_or(src);
+        let at = prod
+            .find("SupervisorAction::RefreshTokenThenDial { delay_ms } => {")
+            .expect("shell refresh arm");
+        let end = prod[at..]
+            .find("SupervisorAction::Dial => {")
+            .expect("next arm");
+        let arm = &prod[at..at + end];
+        let refresh = arm
+            .find("refresh_token(supervisor.token_refresh_request()).await")
+            .expect("the request is passed to the refresh");
+        let note = arm
+            .find("supervisor.note_token_refresh(report, Instant::now())")
+            .expect("the outcome is reported");
+        let dial = arm.find("ConnEvent::BeginDial").expect("then the dial");
+        assert!(refresh < note && note < dial, "refresh, report, then dial");
+        assert!(
+            arm.contains("Some(park) => park,"),
+            "a park from the report wins over the dial"
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn prop_808_refreshes_are_bounded_and_nothing_dials_after_a_park(
+            steps in prop::collection::vec((0u64..120_000, 0u8..3, 0u8..3, 0u8..4, any::<bool>()), 1..80),
+        ) {
+            let start = t0();
+            let mut s = sup(DhanEndpointType::MainFeed, 0, start);
+            let mut at = start;
+            let mut generation = 0u64;
+            let mut refreshes: Vec<Instant> = Vec::new();
+            let mut parked = false;
+            // Test-side model of park rule (c): the last fresh token of the
+            // open episode, and whether the cycle now ending began with an
+            // 808 refresh.
+            let mut model_fresh: Option<Instant> = None;
+            let mut model_refreshed_this_cycle = false;
+            for (gap_ms, frames, close, outcome, sibling_renewed) in steps {
+                at += Duration::from_millis(gap_ms);
+                let dial = s.on_event(ConnEvent::BeginDial, at);
+                if parked {
+                    prop_assert_ne!(dial, SupervisorAction::Dial, "dialled after a park");
+                    continue;
+                }
+                prop_assert_eq!(dial, SupervisorAction::Dial);
+                let _ = s.on_event(ConnEvent::DialSucceeded, at);
+                let _ = s.on_event(ConnEvent::SubscribeAcked, at);
+                let close_at = match frames {
+                    0 => at,
+                    1 => {
+                        let _ = s.on_event(ConnEvent::FrameReceived, at);
+                        at
+                    }
+                    _ => {
+                        let _ = s.on_event(ConnEvent::FrameReceived, at);
+                        at + Duration::from_millis(MIN_HEALTHY_SESSION_MS + 1)
+                    }
+                };
+                at = close_at;
+                let code = match close {
+                    0 => Some(DisconnectCode::AuthenticationFailed),
+                    1 => Some(DisconnectCode::AccessTokenExpired),
+                    _ => None,
+                };
+                if s.auth_reject.is_none() {
+                    model_fresh = None;
+                }
+                let must_park = code == Some(DisconnectCode::AuthenticationFailed)
+                    && frames != 2
+                    && s.auth_reject.is_some()
+                    && model_refreshed_this_cycle
+                    && model_fresh.is_some_and(|fresh| {
+                        at.saturating_duration_since(fresh)
+                            >= Duration::from_millis(AUTH_REJECT_EPISODE_MAX_MS)
+                    });
+                let action = s.on_event(ConnEvent::Disconnected { code }, at);
+                model_refreshed_this_cycle = false;
+                if must_park {
+                    let is_park = matches!(action, SupervisorAction::Park { .. });
+                    prop_assert!(
+                        is_park,
+                        "an 808 300 s after the last fresh token, after a refresh, must park"
+                    );
+                }
+                if code == Some(DisconnectCode::AuthenticationFailed) && frames == 2 {
+                    // A healthy session before this 808 started a new episode.
+                    model_fresh = None;
+                }
+                if let SupervisorAction::Park { .. } = action {
+                    parked = true;
+                    continue;
+                }
+                if let SupervisorAction::RefreshTokenThenDial { .. } = action {
+                    if sibling_renewed {
+                        generation += 1;
+                    }
+                    let request = s.token_refresh_request();
+                    let report = if request.skip_if_presented == Some(generation) {
+                        refresh_report(generation, TokenRefreshOutcome::NotAttempted)
+                    } else {
+                        let presented = generation;
+                        let outcome = match outcome {
+                            0 => {
+                                generation += 1;
+                                TokenRefreshOutcome::Fresh { current: generation }
+                            }
+                            1 => TokenRefreshOutcome::Deferred,
+                            2 => TokenRefreshOutcome::Failed,
+                            _ => TokenRefreshOutcome::NotAttempted,
+                        };
+                        refresh_report(presented, outcome)
+                    };
+                    let is_808 = code == Some(DisconnectCode::AuthenticationFailed);
+                    let fresh = matches!(report.outcome, TokenRefreshOutcome::Fresh { .. });
+                    if is_808 {
+                        model_refreshed_this_cycle = true;
+                        if fresh {
+                            model_fresh = Some(at);
+                        }
+                    }
+                    if let Some(park) = s.note_token_refresh(report, at) {
+                        let is_park = matches!(park, SupervisorAction::Park { .. });
+                        prop_assert!(is_park, "a refresh report only ever parks");
+                        parked = true;
+                    } else if is_808 && fresh {
+                        // Only an 808 refresh that produced a fresh token is
+                        // bounded per window.
+                        refreshes.push(at);
+                        let window = Duration::from_millis(AUTH_REJECT_WINDOW_MS);
+                        let in_window = refreshes
+                            .iter()
+                            .filter(|t| at.saturating_duration_since(**t) < window)
+                            .count();
+                        prop_assert!(in_window <= AUTH_REJECT_MAX_REFRESHES_PER_WINDOW);
+                    }
+                }
+            }
+        }
+    }
+
+    proptest! {
+        /// Review rounds 3 and 4: park rule (c) always fires. Whatever mix of
+        /// fresh tokens, sibling renewals, deferrals, failed dials, bare
+        /// resets and 807s comes first, an 808 that arrives 300 s or more
+        /// after the last fresh token parks when its cycle began with a
+        /// refresh or the one grace refresh past the bound is spent; and a run
+        /// that then only defers, even alternating 808s with failed dials,
+        /// parks.
+        #[test]
+        fn prop_808_parks_300_s_after_the_last_fresh_token_once_a_refresh_ran(
+            steps in prop::collection::vec((1_000u64..60_000, any::<bool>(), any::<bool>(), 0u8..6), 1..120),
+        ) {
+            let start = t0();
+            let mut s = sup(DhanEndpointType::MainFeed, 0, start);
+            let mut at = start;
+            let mut generation = 0u64;
+            // The episode starts at the first 808; until a fresh token, rule
+            // (c) counts from there.
+            let mut model_fresh: Option<Instant> = None;
+            let mut model_refreshed_this_cycle = false;
+            let mut model_grace_used = false;
+            let mut parked = false;
+            // The tail alternates a failed dial with a deferred 808: the
+            // pattern that must not dodge rule (c).
+            let tail = [(5_000u64, false, false, 0u8), (5_000u64, false, false, 3u8)]
+                .into_iter()
+                .cycle()
+                .take(200);
+            for (gap_ms, fresh, sibling_renewed, kind) in steps.into_iter().chain(tail) {
+                at += Duration::from_millis(gap_ms);
+                if kind == 0 {
+                    // A failed dial, no refresh.
+                    prop_assert_eq!(s.on_event(ConnEvent::BeginDial, at), SupervisorAction::Dial);
+                    let _ = s.on_event(ConnEvent::DialFailed, at);
+                    model_refreshed_this_cycle = false;
+                    continue;
+                }
+                dial_no_frames(&mut s, at);
+                if kind == 1 || kind == 2 {
+                    // A bare reset with no frames, or an 807 (its refresh
+                    // report is ignored outside an 808 redial).
+                    let code = (kind == 2).then_some(DisconnectCode::AccessTokenExpired);
+                    let action = s.on_event(ConnEvent::Disconnected { code }, at);
+                    let parked_here = matches!(action, SupervisorAction::Park { .. });
+                    prop_assert!(!parked_here, "a reset or an 807 never parks");
+                    if kind == 2 {
+                        prop_assert_eq!(
+                            s.note_token_refresh(refresh_report(generation, TokenRefreshOutcome::Deferred), at),
+                            None
+                        );
+                    }
+                    model_refreshed_this_cycle = false;
+                    continue;
+                }
+                let progress = *model_fresh.get_or_insert(at);
+                let past_bound = at.saturating_duration_since(progress)
+                    >= Duration::from_millis(AUTH_REJECT_EPISODE_MAX_MS);
+                let must_park = past_bound && (model_refreshed_this_cycle || model_grace_used);
+                let action = close_808(&mut s, at);
+                model_refreshed_this_cycle = false;
+                if must_park {
+                    let is_park = matches!(action, SupervisorAction::Park { .. });
+                    prop_assert!(is_park, "300 s after the last fresh token, refresh spent: {:?}", action);
+                }
+                if matches!(action, SupervisorAction::Park { .. }) {
+                    parked = true;
+                    break;
+                }
+                if past_bound {
+                    model_grace_used = true;
+                }
+                if sibling_renewed {
+                    generation += 1;
+                }
+                let presented = generation;
+                let outcome = if fresh {
+                    generation += 1;
+                    TokenRefreshOutcome::Fresh { current: generation }
+                } else {
+                    TokenRefreshOutcome::Deferred
+                };
+                if s.note_token_refresh(refresh_report(presented, outcome), at).is_some() {
+                    parked = true;
+                    break;
+                }
+                model_refreshed_this_cycle = true;
+                if fresh {
+                    model_fresh = Some(at);
+                    model_grace_used = false;
+                }
+            }
+            prop_assert!(parked, "a run that only defers must park");
         }
     }
 
@@ -11765,7 +14183,7 @@ mod tests {
     #[test]
     fn a_ponging_socket_that_delivers_no_frame_is_redialled_after_the_frame_silence_window() {
         let t = t0();
-        let mut s = sup(DhanEndpointType::Depth200, 0, t);
+        let mut s = sup(DhanEndpointType::MainFeed, 0, t);
         let _ = s.on_event(ConnEvent::BeginDial, t);
         let _ = s.on_event(ConnEvent::DialSucceeded, t);
         let _ = s.on_event(ConnEvent::SubscribeAcked, t);
@@ -12357,9 +14775,11 @@ mod tests {
         // re-dial is actively harmful, not merely useless:
         //   PoolOverflow  — Dhan kills the OLDEST socket, so a re-dial costs a
         //                   healthy fully-subscribed sibling.
-        //   FatalDisconnect — 806/808/810 are credential/entitlement and repeat
+        //   FatalDisconnect — 806/810 are credential/entitlement and repeat
         //                   verbatim: a fresh socket re-presents the identical
         //                   rejected credential and earns the identical answer.
+        //                   (808 refreshes the token once before it parks:
+        //                   scope lock 2026-10-06.)
         //   Shutdown      — we asked to stop.
         //
         // The fourth is the one exception, and it is an exception for a reason
@@ -12445,7 +14865,9 @@ mod tests {
 
     #[test]
     fn test_credential_class_fatal_never_respawns_it_parks_on_the_first_fatal() {
-        // 806 / 808 / 810 are credential + entitlement: a re-dial re-presents
+        // 806 / 810 are credential + entitlement: a re-dial re-presents
+        // (808 refreshes the token once first and has its own tests; scope
+        // lock 2026-10-06)
         // the identical rejected credential and earns the identical rejection.
         //
         // 804 LEFT this list on 2026-09-10 and is covered by its own test
@@ -12456,7 +14878,6 @@ mod tests {
         let now = t0();
         for code in [
             DisconnectCode::DataApiSubscriptionRequired,
-            DisconnectCode::AuthenticationFailed,
             DisconnectCode::ClientIdInvalid,
         ] {
             let mut s = sup(DhanEndpointType::Depth20, 1, now);
@@ -12551,7 +14972,7 @@ mod tests {
         let now = t0();
         for reason_code in [
             Some(DisconnectCode::ExceededActiveConnections),
-            Some(DisconnectCode::AuthenticationFailed),
+            Some(DisconnectCode::ClientIdInvalid),
         ] {
             let mut s = sup(DhanEndpointType::MainFeed, 0, now);
             let _ = s.on_event(ConnEvent::BeginDial, now);
@@ -14075,7 +16496,7 @@ mod tests {
                             // Terminator: a fatal code parks the loop, so an
                             // exhausted script ends the test instead of hanging.
                             SocketEvent::Closed {
-                                code: Some(DisconnectCode::AuthenticationFailed),
+                                code: Some(DisconnectCode::ClientIdInvalid),
                             },
                         );
                         if matches!(event, SocketEvent::Frame(_)) {
@@ -14089,7 +16510,7 @@ mod tests {
                         event
                     }
                     Err(_) => SocketEvent::Closed {
-                        code: Some(DisconnectCode::AuthenticationFailed),
+                        code: Some(DisconnectCode::ClientIdInvalid),
                     },
                 }
             }
@@ -14113,6 +16534,18 @@ mod tests {
                     on_frame(frame);
                 }
             }
+        }
+    }
+
+    /// The refresh closure for a transport with no token: reports an outright
+    /// failure, so an 808 episode counts it as a hard failure.
+    fn no_refresh()
+    -> impl FnMut(TokenRefreshRequest) -> std::future::Ready<TokenRefreshReport> + Send {
+        |_request| {
+            std::future::ready(TokenRefreshReport {
+                presented: 0,
+                outcome: TokenRefreshOutcome::Failed,
+            })
         }
     }
 
@@ -14411,7 +16844,7 @@ mod tests {
             sup(DhanEndpointType::MainFeed, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
         )
         .await;
 
@@ -14470,7 +16903,7 @@ mod tests {
             sup(DhanEndpointType::Depth200, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -14516,7 +16949,7 @@ mod tests {
             sup(DhanEndpointType::Depth200, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -14575,7 +17008,7 @@ mod tests {
             sup(DhanEndpointType::MainFeed, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             None,
         ));
 
@@ -14655,7 +17088,7 @@ mod tests {
             sup(DhanEndpointType::Depth200, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -14713,7 +17146,7 @@ mod tests {
             sup(DhanEndpointType::Depth200, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -14787,7 +17220,7 @@ mod tests {
             sup(DhanEndpointType::Depth200, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -14836,7 +17269,7 @@ mod tests {
             sup(DhanEndpointType::Depth200, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -14878,7 +17311,7 @@ mod tests {
             sup(DhanEndpointType::Depth200, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -14919,7 +17352,7 @@ mod tests {
             sup(DhanEndpointType::Depth200, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -14981,7 +17414,7 @@ mod tests {
             sup(DhanEndpointType::Depth200, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -15087,7 +17520,7 @@ mod tests {
                             SocketEvent::KeepAlive
                         }
                         None => SocketEvent::Closed {
-                            code: Some(DisconnectCode::AuthenticationFailed),
+                            code: Some(DisconnectCode::ClientIdInvalid),
                         },
                     }
                 }
@@ -15125,7 +17558,7 @@ mod tests {
             sup(DhanEndpointType::Depth200, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -15187,7 +17620,7 @@ mod tests {
             sup(DhanEndpointType::MainFeed, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
         )
         .await;
 
@@ -15240,7 +17673,7 @@ mod tests {
             sup(DhanEndpointType::Depth200, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -15313,7 +17746,7 @@ mod tests {
             sup(DhanEndpointType::Depth200, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -15363,7 +17796,7 @@ mod tests {
                 sup(DhanEndpointType::Depth200, 0, t0()),
                 guard,
                 std::sync::Arc::new(RecordingSink::default()),
-                || async {},
+                no_refresh(),
                 Some(rx),
             )
             .await;
@@ -15454,7 +17887,7 @@ mod tests {
             sup(DhanEndpointType::Depth200, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -15507,7 +17940,7 @@ mod tests {
             sup(DhanEndpointType::Depth200, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -15555,7 +17988,7 @@ mod tests {
             sup(DhanEndpointType::MainFeed, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -15633,7 +18066,7 @@ mod tests {
             sup(DhanEndpointType::MainFeed, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -15700,7 +18133,7 @@ mod tests {
             sup(DhanEndpointType::MainFeed, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -15781,7 +18214,7 @@ mod tests {
             sup(DhanEndpointType::MainFeed, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -16000,7 +18433,7 @@ mod tests {
             sup(endpoint, 0, t0()),
             guard,
             sink,
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -16355,6 +18788,9 @@ mod tests {
                 "idle_silence",
                 "probe_close",
                 "overflow_probe",
+                // Scope lock 2026-10-06 (808 refresh-once): a fault
+                // recovery, never a subscription change.
+                "auth_rejected",
             ],
             "a new redial reason needs a dated quote in the scope lock first"
         );
@@ -16414,7 +18850,7 @@ mod tests {
             sup(DhanEndpointType::MainFeed, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -16500,7 +18936,7 @@ mod tests {
             sup(DhanEndpointType::MainFeed, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             None,
         )
         .await;
@@ -16529,7 +18965,7 @@ mod tests {
             sup(DhanEndpointType::MainFeed, 0, t0()),
             guard,
             sink,
-            || async {},
+            no_refresh(),
         )
         .await;
 
@@ -16565,7 +19001,7 @@ mod tests {
             sup(DhanEndpointType::MainFeed, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
         )
         .await;
 
@@ -16618,7 +19054,7 @@ mod tests {
             sup(DhanEndpointType::MainFeed, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
         )
         .await;
 
@@ -16647,10 +19083,14 @@ mod tests {
             sup(DhanEndpointType::MainFeed, 0, t0()),
             guard,
             sink,
-            move || {
+            move |_request: TokenRefreshRequest| {
                 let r = std::sync::Arc::clone(&r);
                 async move {
                     r.fetch_add(1, Ordering::SeqCst);
+                    TokenRefreshReport {
+                        presented: 0,
+                        outcome: TokenRefreshOutcome::Failed,
+                    }
                 }
             },
         )
@@ -16667,6 +19107,137 @@ mod tests {
             s.connects, 2,
             "one original dial plus one post-refresh dial"
         );
+    }
+
+    /// A refresh closure modelled on production: the dial presents the
+    /// current generation; a refresh skips when that generation is the one
+    /// the episode verified, and otherwise renews (generation + 1). Returns
+    /// the closure and the count of real renewals.
+    fn modelled_refresh() -> (
+        impl FnMut(TokenRefreshRequest) -> std::future::Ready<TokenRefreshReport> + Send,
+        std::sync::Arc<AtomicUsize>,
+    ) {
+        let renewals = std::sync::Arc::new(AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&renewals);
+        let mut generation = 0u64;
+        let closure = move |request: TokenRefreshRequest| {
+            let presented = generation;
+            let outcome = if request.skip_if_presented == Some(presented) {
+                TokenRefreshOutcome::NotAttempted
+            } else {
+                counted.fetch_add(1, Ordering::SeqCst);
+                generation += 1;
+                TokenRefreshOutcome::Fresh {
+                    current: generation,
+                }
+            };
+            std::future::ready(TokenRefreshReport { presented, outcome })
+        };
+        (closure, renewals)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_run_connection_808_refreshes_once_then_parks_when_the_fresh_token_is_rejected() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: VecDeque::from(vec![
+                SocketEvent::Closed {
+                    code: Some(DisconnectCode::AuthenticationFailed),
+                },
+                SocketEvent::Closed {
+                    code: Some(DisconnectCode::AuthenticationFailed),
+                },
+            ]),
+            ..FakeState::default()
+        }));
+        let (refresh, renewals) = modelled_refresh();
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::MainFeed, instruments(5))
+            .expect("inside cap");
+        let exit = run_connection(
+            fake(&st),
+            sup(DhanEndpointType::MainFeed, 0, t0()),
+            guard,
+            sink,
+            refresh,
+        )
+        .await;
+        assert_eq!(exit, ConnectionExit::Parked(ParkReason::FatalDisconnect));
+        assert_eq!(
+            renewals.load(Ordering::SeqCst),
+            1,
+            "one token refresh per episode"
+        );
+        let s = st.lock().expect("fake state");
+        assert_eq!(
+            s.connects, 2,
+            "the original dial plus one dial with the fresh token; the second 808 parks \
+             without a third dial"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_run_connection_808_then_healthy_redial_keeps_running() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: VecDeque::from(vec![
+                SocketEvent::Closed {
+                    code: Some(DisconnectCode::AuthenticationFailed),
+                },
+                SocketEvent::Frame(Bytes::from_static(b"aaaaaaaa")),
+                SocketEvent::Frame(Bytes::from_static(b"bbbbbbbb")),
+            ]),
+            ..FakeState::default()
+        }));
+        let (refresh, renewals) = modelled_refresh();
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::MainFeed, instruments(5))
+            .expect("inside cap");
+        let exit = run_connection(
+            fake(&st),
+            sup(DhanEndpointType::MainFeed, 0, t0()),
+            guard,
+            std::sync::Arc::clone(&sink),
+            refresh,
+        )
+        .await;
+        // The script's terminator (810) ends the test; the 808 did not.
+        assert_eq!(exit, ConnectionExit::Parked(ParkReason::FatalDisconnect));
+        assert_eq!(renewals.load(Ordering::SeqCst), 1);
+        let s = st.lock().expect("fake state");
+        assert_eq!(s.connects, 2);
+        assert_eq!(s.frames_seen, 2, "the fresh token delivered frames");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_run_connection_stacked_808_frame_parks_on_the_second_fresh_rejection() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            recv_events: VecDeque::from(vec![
+                SocketEvent::Closed {
+                    code: Some(DisconnectCode::AuthenticationFailed),
+                },
+                // One frame stacked ahead of the next 808 in the same read.
+                SocketEvent::Frame(Bytes::from_static(b"aaaaaaaa")),
+                SocketEvent::Closed {
+                    code: Some(DisconnectCode::AuthenticationFailed),
+                },
+            ]),
+            ..FakeState::default()
+        }));
+        let (refresh, renewals) = modelled_refresh();
+        let sink = std::sync::Arc::new(RecordingSink::default());
+        let guard = SubscribeGuard::try_new(DhanEndpointType::MainFeed, instruments(5))
+            .expect("inside cap");
+        let exit = run_connection(
+            fake(&st),
+            sup(DhanEndpointType::MainFeed, 0, t0()),
+            guard,
+            sink,
+            refresh,
+        )
+        .await;
+        assert_eq!(exit, ConnectionExit::Parked(ParkReason::FatalDisconnect));
+        assert_eq!(renewals.load(Ordering::SeqCst), 1);
+        let s = st.lock().expect("fake state");
+        assert_eq!(s.connects, 2, "a stacked frame does not buy a third dial");
     }
 
     #[tokio::test(start_paused = true)]
@@ -16688,7 +19259,7 @@ mod tests {
             sup(DhanEndpointType::MainFeed, 0, t0()),
             guard,
             sink,
-            || async {},
+            no_refresh(),
         )
         .await;
 
@@ -16709,7 +19280,7 @@ mod tests {
         let mut s = sup(DhanEndpointType::MainFeed, 0, t0());
         let _ = s.on_event(ConnEvent::ShutdownRequested, t0());
 
-        let exit = run_connection(fake(&st), s, guard, sink, || async {}).await;
+        let exit = run_connection(fake(&st), s, guard, sink, no_refresh()).await;
         assert_eq!(exit, ConnectionExit::Parked(ParkReason::Shutdown));
         assert_eq!(
             st.lock().map(|g| g.connects).unwrap_or(usize::MAX),
@@ -17152,7 +19723,7 @@ mod tests {
             sup(DhanEndpointType::Depth20, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -17206,7 +19777,7 @@ mod tests {
             sup(DhanEndpointType::Depth200, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -17253,7 +19824,7 @@ mod tests {
             sup(DhanEndpointType::Depth200, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -17280,7 +19851,7 @@ mod tests {
     /// terminator parks it.
     ///
     /// This matters more than it looks: the default terminator is
-    /// `AuthenticationFailed`, which is FATAL and parks WITHOUT replaying.
+    /// `ClientIdInvalid` (810), which is FATAL and parks WITHOUT replaying.
     /// A "the replay carries nothing" test written against the default
     /// script passes because no replay ever happens — vacuously green
     /// against correct AND incorrect code. Hence the explicit transient
@@ -17328,7 +19899,7 @@ mod tests {
             sup(DhanEndpointType::Depth200, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -17380,7 +19951,7 @@ mod tests {
             sup(DhanEndpointType::Depth200, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -17432,7 +20003,7 @@ mod tests {
             sup(DhanEndpointType::Depth200, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -17513,7 +20084,7 @@ mod tests {
             sup(DhanEndpointType::Depth200, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -17684,6 +20255,7 @@ mod tests {
     fn test_refuse_voluntary_redial_after_805_does_not_panic_and_names_the_path() {
         let slot = slot(DhanEndpointType::Depth20, 0);
         refuse_voluntary_redial_after_805(slot, "probe_close");
+        refuse_voluntary_redial_after_805(slot, "data_silence");
         assert_eq!(
             DIAL_REFUSED_AFTER_805_METRIC,
             "tv_depth_dial_refused_after_805_total"
@@ -18070,7 +20642,7 @@ mod tests {
             sup(DhanEndpointType::Depth200, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
             Some(rx),
         )
         .await;
@@ -18495,7 +21067,7 @@ mod tests {
             sup(DhanEndpointType::MainFeed, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
         ));
         // Live and idle: both scripted frames drained, then the reader waits.
         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -18537,7 +21109,7 @@ mod tests {
             sup(DhanEndpointType::MainFeed, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
         ));
         // 0 + 1 s + 2 s + 5 s of ladder (plus jitter) puts t = 10 s inside
         // the 15 s step.
@@ -18576,7 +21148,7 @@ mod tests {
             sup(DhanEndpointType::MainFeed, 0, t0()),
             guard,
             std::sync::Arc::clone(&sink),
-            || async {},
+            no_refresh(),
         )
         .await;
         assert_eq!(exit, ConnectionExit::Parked(ParkReason::Shutdown));
@@ -18711,7 +21283,7 @@ mod tests {
         let mut fatal = live_main_feed(2, now);
         let _ = fatal.on_event(
             ConnEvent::Disconnected {
-                code: Some(DisconnectCode::AuthenticationFailed),
+                code: Some(DisconnectCode::ClientIdInvalid),
             },
             now,
         );
@@ -18755,7 +21327,7 @@ mod tests {
             let _ = fatal.on_event(ConnEvent::BeginDial, now);
             let _ = fatal.on_event(
                 ConnEvent::Disconnected {
-                    code: Some(DisconnectCode::AuthenticationFailed),
+                    code: Some(DisconnectCode::ClientIdInvalid),
                 },
                 now,
             );
@@ -23081,6 +25653,892 @@ mod subscription_audit_tests {
                 }
             }
             assert!(found, "the installed channel must receive the emit");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scope lock 2026-10-10 — per-kind frame-silence thresholds (fault redials
+// only). Every test injects its evidence through `poll_with` and local
+// spacing tables, so none of them reads or writes another test's sockets.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod frame_silence_evidence_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use std::cell::Cell;
+    use std::sync::atomic::AtomicI64;
+
+    const WALL0: i64 = 1_800_000_000_000;
+
+    fn t0() -> Instant {
+        Instant::now()
+    }
+
+    fn slot_at(endpoint: DhanEndpointType, global_index: u8) -> ConnectionSlot {
+        ConnectionSlot {
+            account: crate::websocket::pool_budget::DhanAccount::Primary,
+            endpoint,
+            pool_index: 0,
+            global_index,
+        }
+    }
+
+    /// A live supervisor on `global_index`, opted into evidence, with `held`
+    /// instruments and fast path `mode`.
+    fn live_sup(
+        endpoint: DhanEndpointType,
+        global_index: u8,
+        held: u32,
+        mode: FrameSilenceFastPath,
+        t: Instant,
+    ) -> ConnectionSupervisor {
+        let mut s = ConnectionSupervisor::new(slot_at(endpoint, global_index), t);
+        s.set_silence_evidence(SiblingEvidence::Pool);
+        s.set_fast_path(mode);
+        s.set_held_instruments(held);
+        let _ = s.on_event(ConnEvent::BeginDial, t);
+        let _ = s.on_event(ConnEvent::DialSucceeded, t);
+        let _ = s.on_event(ConnEvent::SubscribeAcked, t);
+        assert_eq!(s.phase(), ConnPhase::Live);
+        s
+    }
+
+    /// Stamps with the given slots live at `wall`.
+    fn stamps_live(slots: &[u8], wall: i64) -> [i64; GHOST_REDIAL_SLOTS] {
+        let mut out = [0_i64; GHOST_REDIAL_SLOTS];
+        for s in slots {
+            if let Some(v) = out.get_mut(usize::from(*s)) {
+                *v = wall;
+            }
+        }
+        out
+    }
+
+    /// Polls at `t + secs` after a pong (so the IDLE watchdog stays quiet),
+    /// with the given siblings live at that instant.
+    fn poll_at(
+        s: &mut ConnectionSupervisor,
+        t: Instant,
+        secs: u64,
+        siblings: &[u8],
+        overflow_or_halted: bool,
+        spacing: &[AtomicI64; CONFIRMED_SPACING_KINDS],
+    ) -> SupervisorAction {
+        let at = t + Duration::from_secs(secs);
+        let _ = s.on_event(ConnEvent::KeepAliveReceived, at);
+        let wall = WALL0 + i64::try_from(secs).unwrap_or(0) * 1_000;
+        s.poll_with(at, || SilenceInputs {
+            wall_ms: wall,
+            overflow_or_halted,
+            stamps: stamps_live(siblings, wall),
+            spacing,
+        })
+    }
+
+    fn fresh_spacing() -> [AtomicI64; CONFIRMED_SPACING_KINDS] {
+        [const { AtomicI64::new(0) }; CONFIRMED_SPACING_KINDS]
+    }
+
+    fn is_redial(a: SupervisorAction) -> bool {
+        matches!(a, SupervisorAction::SleepThenDial { .. })
+    }
+
+    #[test]
+    fn silence_redial_basis_truth_table() {
+        use DhanEndpointType::{Depth20, Depth200, MainFeed, OrderUpdate};
+        let all = |e, silent, held| silence_redial_basis(e, silent, 60, true, false, 2, held, true);
+        // Main feed: confirmed at its threshold with every condition.
+        assert_eq!(all(MainFeed, 59, 1_000), None);
+        assert_eq!(
+            all(MainFeed, 60, 1_000),
+            Some(SilenceBasis::SiblingConfirmed)
+        );
+        assert_eq!(
+            all(MainFeed, 299, 1_000),
+            Some(SilenceBasis::SiblingConfirmed)
+        );
+        assert_eq!(all(MainFeed, 300, 1_000), Some(SilenceBasis::Unconfirmed));
+        // Each condition alone blocks the confirmed path but never the fallback.
+        for (window, overflow, siblings, held, spacing) in [
+            (false, false, 2, 1_000, true),
+            (true, true, 2, 1_000, true),
+            (true, false, 1, 1_000, true),
+            (true, false, 2, 999, true),
+            (true, false, 2, 1_000, false),
+        ] {
+            assert_eq!(
+                silence_redial_basis(MainFeed, 120, 60, window, overflow, siblings, held, spacing),
+                None
+            );
+            assert_eq!(
+                silence_redial_basis(MainFeed, 300, 60, window, overflow, siblings, held, spacing),
+                Some(SilenceBasis::Unconfirmed)
+            );
+        }
+        // Depth-20: its own floor.
+        assert_eq!(
+            silence_redial_basis(Depth20, 90, 90, true, false, 2, 20, true),
+            Some(SilenceBasis::SiblingConfirmed)
+        );
+        assert_eq!(
+            silence_redial_basis(Depth20, 90, 90, true, false, 2, 19, true),
+            None
+        );
+        // Depth-200: time alone, only at the backstop.
+        assert_eq!(all(Depth200, 300, 1), None);
+        assert_eq!(all(Depth200, 899, 1), None);
+        assert_eq!(all(Depth200, 900, 1), Some(SilenceBasis::Backstop));
+        // Order update: never.
+        assert_eq!(all(OrderUpdate, 100_000, 1), None);
+        // Labels are distinct and stable.
+        let labels: Vec<&str> = SilenceBasis::ALL.iter().map(|b| b.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["unconfirmed", "sibling_confirmed", "cross_feed", "backstop"]
+        );
+    }
+
+    #[test]
+    fn live_siblings_counts_same_kind_other_slots_within_10s_only() {
+        let now = WALL0;
+        let mut stamps = [0_i64; GHOST_REDIAL_SLOTS];
+        // Main-feed slots 0..5. Self is 0.
+        stamps[0] = now; // self: never counted
+        stamps[1] = now - 10_000; // exactly 10 s old: counted
+        stamps[2] = now - 10_001; // just past: not counted
+        stamps[3] = now + 5_000; // 5 s ahead: counted (skew allowance)
+        stamps[4] = now + 5_001; // further ahead: not counted
+        stamps[5] = now; // depth-20 slot: other kind
+        stamps[10] = now; // depth-200 slot: other kind
+        assert_eq!(
+            live_siblings(0, DhanEndpointType::MainFeed, now, &stamps),
+            2
+        );
+        // Depth-20 seen from slot 6: slot 5 is live, the depth account's
+        // depth-20 slots (16..21) count as the same kind.
+        stamps[16] = now - 1;
+        assert_eq!(live_siblings(6, DhanEndpointType::Depth20, now, &stamps), 2);
+        // Never-delivered (0) and negative stamps never count.
+        let empty = [0_i64; GHOST_REDIAL_SLOTS];
+        assert_eq!(live_siblings(0, DhanEndpointType::MainFeed, now, &empty), 0);
+        // A short slice is handled.
+        assert_eq!(
+            live_siblings(0, DhanEndpointType::MainFeed, now, &[now, now]),
+            1
+        );
+    }
+
+    proptest! {
+        /// Random inter-frame gaps, every one below the kind's confirmed
+        /// threshold, with two siblings live and a poll every second inside
+        /// each gap: no fast-path mode ever produces a redial.
+        #[test]
+        fn proptest_gaps_below_the_confirmed_threshold_never_redial(
+            depth20 in any::<bool>(),
+            mode_pick in 0_u8..3,
+            gaps in proptest::collection::vec(1_u64..1_000, 1..40),
+        ) {
+            let endpoint = if depth20 {
+                DhanEndpointType::Depth20
+            } else {
+                DhanEndpointType::MainFeed
+            };
+            let mode = match mode_pick {
+                0 => FrameSilenceFastPath::Off,
+                1 => FrameSilenceFastPath::Shadow,
+                _ => FrameSilenceFastPath::Act,
+            };
+            let t = t0();
+            let spacing = fresh_spacing();
+            let mut s = live_sup(endpoint, 3, 5_000, mode, t);
+            let threshold = s.confirmed_threshold_secs();
+            prop_assert!(threshold >= MAIN_FEED_CONFIRMED_SILENCE_REDIAL_SECS);
+            let mut now_secs = 0_u64;
+            let _ = s.on_event(ConnEvent::FrameReceived, t);
+            for raw in gaps {
+                // Map onto [1, threshold - 1]: always below the threshold.
+                let gap = 1 + raw % (threshold - 1);
+                for step in 1..=gap {
+                    let action = poll_at(&mut s, t, now_secs + step, &[0, 1], false, &spacing);
+                    prop_assert!(
+                        !is_redial(action),
+                        "redial after {step} s of a {gap} s gap (threshold {threshold} s, {mode:?})"
+                    );
+                }
+                now_secs += gap;
+                let _ = s.on_event(
+                    ConnEvent::FrameReceived,
+                    t + Duration::from_secs(now_secs),
+                );
+            }
+            prop_assert_eq!(s.silence_strikes(), 0);
+        }
+    }
+
+    #[test]
+    fn main_feed_confirmed_redial_at_60s_with_two_live_siblings_in_act_mode() {
+        let t = t0();
+        let spacing = fresh_spacing();
+        let mut s = live_sup(
+            DhanEndpointType::MainFeed,
+            0,
+            5_000,
+            FrameSilenceFastPath::Act,
+            t,
+        );
+        assert_eq!(s.confirmed_threshold_secs(), 60);
+        assert_eq!(
+            poll_at(&mut s, t, 59, &[1, 2], false, &spacing),
+            SupervisorAction::Continue
+        );
+        assert!(is_redial(poll_at(&mut s, t, 60, &[1, 2], false, &spacing)));
+        assert_eq!(s.last_silence_basis(), SilenceBasis::SiblingConfirmed);
+        assert_eq!(s.last_redial_reason(), ReconnectReason::IdleSilence);
+        assert_eq!(s.silence_strikes(), 1);
+        assert_eq!(
+            spacing[0].load(std::sync::atomic::Ordering::Relaxed),
+            WALL0 + 60_000,
+            "the act path stamps the pool-wide spacing"
+        );
+        assert_eq!(spacing[1].load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn shadow_mode_counts_once_per_episode_and_never_redials() {
+        let t = t0();
+        let spacing = fresh_spacing();
+        let mut s = live_sup(
+            DhanEndpointType::MainFeed,
+            1,
+            5_000,
+            FrameSilenceFastPath::Shadow,
+            t,
+        );
+        for secs in [60, 61, 120, 299] {
+            assert_eq!(
+                poll_at(&mut s, t, secs, &[0, 2], false, &spacing),
+                SupervisorAction::Continue
+            );
+        }
+        assert_eq!(s.shadow_would_redials(), 1, "once per episode");
+        assert_eq!(
+            spacing[0].load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "shadow never stamps the spacing"
+        );
+        // A frame ends the episode; a new silence counts again.
+        let _ = s.on_event(ConnEvent::FrameReceived, t + Duration::from_secs(299));
+        assert_eq!(
+            poll_at(&mut s, t, 299 + 60, &[0, 2], false, &spacing),
+            SupervisorAction::Continue
+        );
+        assert_eq!(s.shadow_would_redials(), 2);
+        // The fallback still governs.
+        assert!(is_redial(poll_at(
+            &mut s,
+            t,
+            299 + 300,
+            &[0, 2],
+            false,
+            &spacing
+        )));
+        assert_eq!(s.last_silence_basis(), SilenceBasis::Unconfirmed);
+        // Off never even reads the evidence.
+        let reads = Cell::new(0_u32);
+        let mut off = live_sup(
+            DhanEndpointType::MainFeed,
+            2,
+            5_000,
+            FrameSilenceFastPath::Off,
+            t,
+        );
+        let at = t + Duration::from_secs(120);
+        let _ = off.on_event(ConnEvent::KeepAliveReceived, at);
+        let action = off.poll_with(at, || {
+            reads.set(reads.get() + 1);
+            SilenceInputs {
+                wall_ms: WALL0,
+                overflow_or_halted: false,
+                stamps: [WALL0; GHOST_REDIAL_SLOTS],
+                spacing: &spacing,
+            }
+        });
+        assert_eq!(action, SupervisorAction::Continue);
+        assert_eq!(reads.get(), 0);
+        assert_eq!(off.shadow_would_redials(), 0);
+    }
+
+    /// A socket that is deaf on every connection: confirmed redials escalate
+    /// 60 → 120 → 240 → 300 and then stay at the fallback, so confirmed
+    /// redials alone can never outpace the flap ceiling.
+    #[test]
+    fn escalation_bounds_snapshot_then_deaf_loop() {
+        let t = t0();
+        let mut s = live_sup(
+            DhanEndpointType::MainFeed,
+            3,
+            5_000,
+            FrameSilenceFastPath::Act,
+            t,
+        );
+        let mut elapsed: u64 = 0;
+        let mut gaps = Vec::new();
+        for _ in 0..6 {
+            let start = elapsed;
+            let spacing = fresh_spacing();
+            loop {
+                elapsed += 1;
+                if is_redial(poll_at(&mut s, t, elapsed, &[0, 1], false, &spacing)) {
+                    break;
+                }
+                assert!(elapsed - start <= 300, "never past the fallback");
+            }
+            gaps.push(elapsed - start);
+            // Redial and come back up, still deaf.
+            let at = t + Duration::from_secs(elapsed);
+            let _ = s.on_event(ConnEvent::BeginDial, at);
+            let _ = s.on_event(ConnEvent::DialSucceeded, at);
+            let _ = s.on_event(ConnEvent::SubscribeAcked, at);
+        }
+        assert_eq!(gaps, [60, 120, 240, 300, 300, 300]);
+        assert_eq!(s.silence_strikes(), 6);
+        // Strikes reset after SILENCE_STRIKE_RESET with no silence redial.
+        let mut quiet = elapsed;
+        while quiet < elapsed + SILENCE_STRIKE_RESET_SECS {
+            quiet += 30;
+            let _ = s.on_event(ConnEvent::FrameReceived, t + Duration::from_secs(quiet));
+            let _ = poll_at(&mut s, t, quiet, &[0, 1], false, &fresh_spacing());
+        }
+        assert_eq!(s.silence_strikes(), 0);
+        assert_eq!(s.confirmed_threshold_secs(), 60);
+    }
+
+    #[test]
+    fn confirmed_redial_spacing_is_pool_wide_per_kind() {
+        let t = t0();
+        let spacing = fresh_spacing();
+        let mut a = live_sup(
+            DhanEndpointType::MainFeed,
+            0,
+            5_000,
+            FrameSilenceFastPath::Act,
+            t,
+        );
+        let mut b = live_sup(
+            DhanEndpointType::MainFeed,
+            1,
+            5_000,
+            FrameSilenceFastPath::Act,
+            t,
+        );
+        let mut d = live_sup(
+            DhanEndpointType::Depth20,
+            5,
+            50,
+            FrameSilenceFastPath::Act,
+            t,
+        );
+        assert!(is_redial(poll_at(&mut a, t, 60, &[2, 3], false, &spacing)));
+        // The second main-feed socket waits out the spacing.
+        for secs in 60..75 {
+            assert_eq!(
+                poll_at(&mut b, t, secs, &[2, 3], false, &spacing),
+                SupervisorAction::Continue,
+                "+{secs}s"
+            );
+        }
+        assert!(is_redial(poll_at(&mut b, t, 75, &[2, 3], false, &spacing)));
+        // Depth-20 has its own spacing slot.
+        assert!(is_redial(poll_at(&mut d, t, 90, &[6, 7], false, &spacing)));
+    }
+
+    #[test]
+    fn below_the_instrument_floor_falls_back_to_300s() {
+        let t = t0();
+        let spacing = fresh_spacing();
+        let mut s = live_sup(
+            DhanEndpointType::MainFeed,
+            0,
+            MAIN_FEED_CONFIRMED_MIN_HELD - 1,
+            FrameSilenceFastPath::Act,
+            t,
+        );
+        for secs in [60, 120, 299] {
+            assert_eq!(
+                poll_at(&mut s, t, secs, &[1, 2, 3], false, &spacing),
+                SupervisorAction::Continue
+            );
+        }
+        assert!(is_redial(poll_at(
+            &mut s,
+            t,
+            300,
+            &[1, 2, 3],
+            false,
+            &spacing
+        )));
+        assert_eq!(s.last_silence_basis(), SilenceBasis::Unconfirmed);
+    }
+
+    #[test]
+    fn an_engaged_overflow_episode_or_a_halted_rotation_suppresses_every_fast_path() {
+        let t = t0();
+        let spacing = fresh_spacing();
+        let mut s = live_sup(
+            DhanEndpointType::Depth20,
+            5,
+            50,
+            FrameSilenceFastPath::Act,
+            t,
+        );
+        for secs in [90, 200, 299] {
+            assert_eq!(
+                poll_at(&mut s, t, secs, &[6, 7, 8], true, &spacing),
+                SupervisorAction::Continue
+            );
+        }
+        assert!(is_redial(poll_at(
+            &mut s,
+            t,
+            300,
+            &[6, 7, 8],
+            true,
+            &spacing
+        )));
+        assert_eq!(s.last_silence_basis(), SilenceBasis::Unconfirmed);
+        assert_eq!(spacing[1].load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn confirmed_window_open_at_boundaries() {
+        let gate = FrameSilenceGate::ContinuousSessionIst;
+        let open = CONTINUOUS_SESSION_OPEN_SECS_OF_DAY_IST;
+        let close = CONFIRMED_SILENCE_CLOSE_SECS_OF_DAY_IST;
+        assert_eq!(close, 15 * 3600 + 15 * 60, "15:15 IST");
+        assert!(!gate.confirmed_window_open_at(open - 1));
+        assert!(gate.confirmed_window_open_at(open));
+        assert!(gate.confirmed_window_open_at(close - 1));
+        assert!(!gate.confirmed_window_open_at(close));
+        // The closing auction is inside the session gate but outside the
+        // confirmed window: the 300 s fallback governs there.
+        assert!(gate.is_open_at(close));
+        assert!(FrameSilenceGate::AlwaysOn.confirmed_window_open_at(0));
+        assert!(!FrameSilenceGate::Off.confirmed_window_open_at(open));
+    }
+
+    #[test]
+    fn depth200_is_not_redialled_by_time_before_the_900s_backstop() {
+        let t = t0();
+        let spacing = fresh_spacing();
+        let reads = Cell::new(0_u32);
+        let mut s = live_sup(
+            DhanEndpointType::Depth200,
+            10,
+            1,
+            FrameSilenceFastPath::Act,
+            t,
+        );
+        let poll = |s: &mut ConnectionSupervisor, secs: u64| {
+            let at = t + Duration::from_secs(secs);
+            let _ = s.on_event(ConnEvent::KeepAliveReceived, at);
+            s.poll_with(at, || {
+                reads.set(reads.get() + 1);
+                SilenceInputs {
+                    wall_ms: WALL0,
+                    overflow_or_halted: false,
+                    stamps: [WALL0; GHOST_REDIAL_SLOTS],
+                    spacing: &spacing,
+                }
+            })
+        };
+        for secs in [60, 300, 600, 899] {
+            assert_eq!(poll(&mut s, secs), SupervisorAction::Continue, "+{secs}s");
+        }
+        assert!(is_redial(poll(&mut s, 900)));
+        assert_eq!(s.last_silence_basis(), SilenceBasis::Backstop);
+        assert_eq!(reads.get(), 0, "depth-200 never reads sibling evidence");
+
+        // The order-update socket is never redialled for frame silence.
+        let mut ou = live_sup(
+            DhanEndpointType::OrderUpdate,
+            15,
+            0,
+            FrameSilenceFastPath::Act,
+            t,
+        );
+        assert_eq!(poll(&mut ou, 3_600), SupervisorAction::Continue);
+        assert_eq!(ou.phase(), ConnPhase::Live);
+
+        // A cross-feed request redials a live depth-200 socket on its basis.
+        let mut x = live_sup(
+            DhanEndpointType::Depth200,
+            11,
+            1,
+            FrameSilenceFastPath::Act,
+            t,
+        );
+        x.note_silence_basis(SilenceBasis::CrossFeed);
+        assert!(is_redial(x.on_event(
+            ConnEvent::FrameSilenceElapsed,
+            t + Duration::from_secs(95)
+        )));
+        assert_eq!(x.last_silence_basis(), SilenceBasis::CrossFeed);
+        assert_eq!(x.silence_strikes(), 1);
+        // A basis noted while not live is consumed, never carried to a later
+        // redial.
+        let mut y = ConnectionSupervisor::new(slot_at(DhanEndpointType::Depth200, 12), t);
+        y.note_silence_basis(SilenceBasis::CrossFeed);
+        assert_eq!(
+            y.on_event(ConnEvent::FrameSilenceElapsed, t),
+            SupervisorAction::Continue
+        );
+        let _ = y.on_event(ConnEvent::BeginDial, t);
+        let _ = y.on_event(ConnEvent::DialSucceeded, t);
+        let _ = y.on_event(ConnEvent::SubscribeAcked, t);
+        assert!(is_redial(y.on_event(
+            ConnEvent::FrameSilenceElapsed,
+            t + Duration::from_secs(1)
+        )));
+        assert_eq!(y.last_silence_basis(), SilenceBasis::Unconfirmed);
+    }
+
+    #[test]
+    fn data_silence_request_is_dropped_when_the_dial_generation_moved() {
+        let pending = [const { std::sync::atomic::AtomicU64::new(0) }; GHOST_REDIAL_SLOTS];
+        let last = [const { AtomicI64::new(0) }; GHOST_REDIAL_SLOTS];
+        let cooldown_ms = DATA_SILENCE_REQUEST_COOLDOWN_SECS * 1_000;
+        assert_eq!(
+            request_data_silence_redial_in(&pending, &last, 3, WALL0, false, 7),
+            Ok(())
+        );
+        assert_eq!(
+            request_data_silence_redial_in(&pending, &last, 3, WALL0, false, 7),
+            Err(DataSilenceRefusal::StillPending)
+        );
+        assert_eq!(
+            take_data_silence_redial_in(&pending, 3, 7),
+            DataSilenceTake::Take
+        );
+        assert_eq!(
+            take_data_silence_redial_in(&pending, 3, 7),
+            DataSilenceTake::Nothing
+        );
+        assert_eq!(
+            request_data_silence_redial_in(&pending, &last, 3, WALL0 + cooldown_ms - 1, false, 7),
+            Err(DataSilenceRefusal::CoolingDown)
+        );
+        assert_eq!(
+            request_data_silence_redial_in(&pending, &last, 3, WALL0 + cooldown_ms, false, 7),
+            Ok(())
+        );
+        // The socket redialled since the request: the request names an
+        // earlier connection and is dropped.
+        assert_eq!(
+            take_data_silence_redial_in(&pending, 3, 8),
+            DataSilenceTake::Stale
+        );
+        assert_eq!(
+            take_data_silence_redial_in(&pending, 3, 8),
+            DataSilenceTake::Nothing
+        );
+        // After an 805 nothing is recorded.
+        assert_eq!(
+            request_data_silence_redial_in(&pending, &last, 4, WALL0, true, 1),
+            Err(DataSilenceRefusal::Halted)
+        );
+        assert_eq!(
+            take_data_silence_redial_in(&pending, 4, 1),
+            DataSilenceTake::Nothing
+        );
+        // Out of range never panics.
+        assert_eq!(
+            request_data_silence_redial_in(&pending, &last, 200, WALL0, false, 1),
+            Err(DataSilenceRefusal::OutOfRange)
+        );
+        assert_eq!(
+            take_data_silence_redial_in(&pending, 200, 1),
+            DataSilenceTake::Nothing
+        );
+        assert_eq!(DataSilenceRefusal::Halted.as_str(), "halted");
+    }
+
+    #[test]
+    fn a_taken_data_silence_request_after_805_is_refused_with_path_data_silence() {
+        let src = include_str!("pool_supervisor.rs");
+        let prod = src.split("#[cfg(test)]").next().expect("production half");
+        let take = prod
+            .find("&& take_data_silence_redial(supervisor.slot().global_index)")
+            .expect("the connection task takes cross-feed requests");
+        let rest = &prod[take..];
+        let halted = rest.find("if rotation_halted() {").expect("805 check");
+        let refused = rest
+            .find("refuse_voluntary_redial_after_805(supervisor.slot(), \"data_silence\")")
+            .expect("refused with its own path label");
+        let basis = rest
+            .find("supervisor.note_silence_basis(SilenceBasis::CrossFeed)")
+            .expect("labelled cross-feed");
+        let redial = rest
+            .find("supervisor.on_event(ConnEvent::FrameSilenceElapsed")
+            .expect("redials as a fault");
+        assert!(halted < refused && refused < basis && basis < redial);
+        // The request side refuses after an 805 too.
+        assert!(
+            prod.contains("        rotation_halted(),\n        dial_generation(connection_index),")
+        );
+    }
+
+    #[test]
+    fn depth200_held_round_trips_and_never_returns_a_torn_id() {
+        let idx = 31;
+        let a = SubscribeInstrument {
+            security_id: 72_271,
+            segment: ExchangeSegment::NseFno,
+        };
+        let b = SubscribeInstrument {
+            security_id: 72_272,
+            segment: ExchangeSegment::NseFno,
+        };
+        publish_depth200_held(idx, None, 0);
+        assert_eq!(depth200_held(idx), None);
+        publish_depth200_held(idx, Some(a), 1_000);
+        assert_eq!(
+            depth200_held(idx),
+            Some((72_271, ExchangeSegment::NseFno, 1_000))
+        );
+        // The same contract again keeps its original start.
+        publish_depth200_held(idx, Some(a), 5_000);
+        assert_eq!(
+            depth200_held(idx),
+            Some((72_271, ExchangeSegment::NseFno, 1_000))
+        );
+        publish_depth200_held(idx, Some(b), 6_000);
+        assert_eq!(
+            depth200_held(idx),
+            Some((72_272, ExchangeSegment::NseFno, 6_000))
+        );
+        // An id that cannot be packed clears the slot rather than lying.
+        publish_depth200_held(
+            idx,
+            Some(SubscribeInstrument {
+                security_id: u64::MAX,
+                segment: ExchangeSegment::NseFno,
+            }),
+            7_000,
+        );
+        assert_eq!(depth200_held(idx), None);
+        publish_depth200_held(idx, None, 0);
+        assert_eq!(depth200_held(idx), None);
+        // Out of range never panics.
+        publish_depth200_held(200, Some(a), 1);
+        assert_eq!(depth200_held(200), None);
+    }
+
+    #[test]
+    fn publish_depth200_held_is_called_at_every_held_set_change() {
+        let src = include_str!("pool_supervisor.rs");
+        let prod = src.split("#[cfg(test)]").next().expect("production half");
+        let lines: Vec<&str> = prod.lines().map(str::trim_start).collect();
+        let mut sized = 0;
+        let mut zeroed = 0;
+        for (i, line) in lines.iter().enumerate() {
+            let next = lines.get(i + 1).copied().unwrap_or("");
+            if line.starts_with("publish_connection_instruments(&supervisor.slot(), guard.len())") {
+                sized += 1;
+                assert!(next.starts_with("note_held_set("), "line {i}: {next}");
+            }
+            if line.starts_with("publish_connection_instruments(&supervisor.slot(), 0)") {
+                zeroed += 1;
+                assert!(next.starts_with("note_held_cleared("), "line {i}: {next}");
+            }
+        }
+        assert_eq!((sized, zeroed), (5, 2));
+        // The swap arm (which can change the depth-200 contract) and its
+        // emptied path are covered too.
+        assert!(prod.contains("                    note_held_set(supervisor, guard);\n                }\n                Ok(LiveSubscriptionCommand::ProbeUnsubscribe {"));
+        let emptied = prod
+            .find("metrics::counter!(SWAP_EMPTIED_SOCKET_METRIC).increment(1);")
+            .expect("emptied path");
+        let cleared = prod[emptied..]
+            .find("note_held_cleared(supervisor);")
+            .expect("emptied socket clears the register");
+        let failed = prod[emptied..]
+            .find(".on_event(ConnEvent::SubscribeFailed, Instant::now())")
+            .expect("emptied socket redials");
+        assert!(cleared < failed);
+        // Both backoff arms clear the register before they sleep.
+        for arm in [
+            "SupervisorAction::SleepThenDial { delay_ms } => {",
+            "SupervisorAction::RefreshTokenThenDial { delay_ms } => {",
+        ] {
+            let start = prod.find(arm).expect("backoff arm");
+            let body = &prod[start..];
+            let cleared = body
+                .find("note_held_cleared(&mut supervisor);")
+                .expect("backoff clears the register");
+            let slept = body.find("sleep_unless_stopped(").expect("backoff sleeps");
+            assert!(cleared < slept, "{arm}");
+        }
+        let set_fn = prod
+            .find("fn note_held_set(")
+            .expect("note_held_set exists");
+        let set_body = &prod[set_fn..];
+        let set_body = &set_body[..set_body.find("\n}\n").expect("end of note_held_set")];
+        let squashed: String = set_body.split_whitespace().collect();
+        assert!(
+            squashed.contains(
+                "publish_depth200_held(supervisor.slot().global_index,guard.first(),wall_clock_ms(),);"
+            ),
+            "note_held_set publishes the depth-200 contract: {set_body}"
+        );
+    }
+
+    #[test]
+    fn frame_activity_published_at_most_once_per_second() {
+        let idx = 30;
+        let t = t0();
+        let mut s = ConnectionSupervisor::new(slot_at(DhanEndpointType::MainFeed, idx), t);
+        let _ = s.on_event(ConnEvent::BeginDial, t);
+        let _ = s.on_event(ConnEvent::DialSucceeded, t);
+        let _ = s.on_event(ConnEvent::SubscribeAcked, t);
+        let _ = s.on_event(ConnEvent::FrameReceived, t);
+        let first = last_frame_wall_ms(idx).expect("published on the first frame");
+        assert!(first > 0);
+        // Overwrite with a sentinel: a frame inside the second must not
+        // republish.
+        SLOT_LAST_FRAME_WALL_MS[usize::from(idx)]
+            .0
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        let _ = s.on_event(ConnEvent::FrameReceived, t + Duration::from_millis(500));
+        let _ = s.on_event(ConnEvent::FrameReceived, t + Duration::from_millis(999));
+        assert_eq!(last_frame_wall_ms(idx), Some(1));
+        let _ = s.on_event(ConnEvent::FrameReceived, t + Duration::from_millis(1_000));
+        assert!(last_frame_wall_ms(idx).unwrap_or(0) >= first);
+        assert_eq!(last_frame_wall_ms(200), None);
+        assert_eq!(snapshot_frame_activity().len(), GHOST_REDIAL_SLOTS);
+    }
+
+    #[test]
+    fn frame_gap_peak_is_the_largest_gap_inside_the_window() {
+        let idx = 29;
+        let t = t0();
+        let mut s = ConnectionSupervisor::new(slot_at(DhanEndpointType::MainFeed, idx), t);
+        let _ = s.on_event(ConnEvent::BeginDial, t);
+        let _ = s.on_event(ConnEvent::DialSucceeded, t);
+        let _ = s.on_event(ConnEvent::SubscribeAcked, t);
+        // The first poll opens the window (AlwaysOn) and resets the peak.
+        assert_eq!(s.poll(t), SupervisorAction::Continue);
+        // The first frame's gap is the dial, not a gap between frames.
+        let _ = s.on_event(ConnEvent::FrameReceived, t + Duration::from_secs(20));
+        assert_eq!(frame_gap_peak_secs(idx), Some(0));
+        let _ = s.on_event(ConnEvent::FrameReceived, t + Duration::from_secs(25));
+        let _ = s.on_event(ConnEvent::FrameReceived, t + Duration::from_secs(32));
+        let _ = s.on_event(ConnEvent::FrameReceived, t + Duration::from_secs(33));
+        assert_eq!(frame_gap_peak_secs(idx), Some(7));
+        assert_eq!(frame_gap_peak_secs(200), None);
+        publish_frame_gap_peaks();
+        seed_frame_silence_counters();
+    }
+
+    /// Slot 27 is written by no other test in this module.
+    const REGISTER_TEST_SLOT: u8 = 27;
+
+    #[test]
+    fn test_last_frame_wall_ms_and_snapshot_frame_activity_read_the_register() {
+        let idx = usize::from(REGISTER_TEST_SLOT);
+        SLOT_LAST_FRAME_WALL_MS[idx]
+            .0
+            .store(WALL0, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(last_frame_wall_ms(REGISTER_TEST_SLOT), Some(WALL0));
+        assert_eq!(snapshot_frame_activity()[idx], WALL0);
+        // 0 means never delivered: no stamp.
+        SLOT_LAST_FRAME_WALL_MS[idx]
+            .0
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(last_frame_wall_ms(REGISTER_TEST_SLOT), None);
+        assert_eq!(snapshot_frame_activity()[idx], 0);
+        assert_eq!(last_frame_wall_ms(u8::MAX), None);
+    }
+
+    #[test]
+    fn test_frame_gap_peak_secs_rounds_down_and_publish_frame_gap_peaks_reads_it() {
+        let idx = usize::from(REGISTER_TEST_SLOT);
+        SLOT_FRAME_GAP_PEAK_MS[idx].store(7_999, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(frame_gap_peak_secs(REGISTER_TEST_SLOT), Some(7));
+        SLOT_FRAME_GAP_PEAK_MS[idx].store(999, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(frame_gap_peak_secs(REGISTER_TEST_SLOT), Some(0));
+        assert_eq!(frame_gap_peak_secs(u8::MAX), None);
+        // Publishing reads the register and never panics without a recorder.
+        publish_frame_gap_peaks();
+        SLOT_FRAME_GAP_PEAK_MS[idx].store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[test]
+    fn test_seed_frame_silence_counters_is_idempotent() {
+        // Seeding adds zero, so running it twice (two lane starts) is safe.
+        seed_frame_silence_counters();
+        seed_frame_silence_counters();
+        assert_eq!(
+            DATA_SILENCE_STALE_METRIC,
+            "tv_dhan_ws_data_silence_request_stale_total"
+        );
+    }
+
+    #[test]
+    fn test_overflow_episode_engaged_reads_the_never_cleared_flag() {
+        assert_eq!(
+            overflow_episode_engaged(),
+            OVERFLOW_ENGAGED.load(std::sync::atomic::Ordering::Acquire)
+        );
+    }
+
+    #[test]
+    fn test_confirmed_threshold_secs_doubles_per_strike_and_caps_at_300() {
+        let t = t0();
+        for (endpoint, expected) in [
+            (DhanEndpointType::MainFeed, [60, 120, 240, 300, 300]),
+            (DhanEndpointType::Depth20, [90, 180, 300, 300, 300]),
+            (DhanEndpointType::Depth200, [300, 300, 300, 300, 300]),
+        ] {
+            let mut s = ConnectionSupervisor::new(slot_at(endpoint, REGISTER_TEST_SLOT), t);
+            for (strikes, want) in expected.into_iter().enumerate() {
+                s.silence_strikes = u8::try_from(strikes).expect("small");
+                assert_eq!(s.confirmed_threshold_secs(), want, "{endpoint:?} {strikes}");
+            }
+            s.silence_strikes = u8::MAX;
+            assert_eq!(s.confirmed_threshold_secs(), FRAME_SILENCE_REDIAL_SECS);
+        }
+    }
+
+    proptest! {
+        /// Frames that never leave a gap as long as the shortest confirmed
+        /// threshold never earn a silence redial, whatever the evidence says.
+        #[test]
+        fn gaps_below_the_threshold_never_redial(
+            gaps in proptest::collection::vec(1_u64..60, 1..20),
+            endpoint_pick in 0_u8..2,
+        ) {
+            let endpoint = if endpoint_pick == 0 {
+                DhanEndpointType::MainFeed
+            } else {
+                DhanEndpointType::Depth20
+            };
+            let base = endpoint.jitter_base();
+            let t = t0();
+            let spacing = fresh_spacing();
+            let mut s = live_sup(endpoint, base, 5_000, FrameSilenceFastPath::Act, t);
+            let siblings = [base + 1, base + 2, base + 3];
+            let mut at: u64 = 0;
+            for gap in gaps {
+                for _ in 0..gap {
+                    at += 1;
+                    let action = poll_at(&mut s, t, at, &siblings, false, &spacing);
+                    prop_assert_eq!(action, SupervisorAction::Continue);
+                }
+                let _ = s.on_event(ConnEvent::FrameReceived, t + Duration::from_secs(at));
+            }
+            prop_assert_eq!(s.silence_strikes(), 0);
+            prop_assert_eq!(s.reconnects(), 0);
         }
     }
 }

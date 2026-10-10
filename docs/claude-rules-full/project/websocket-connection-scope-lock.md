@@ -8483,7 +8483,7 @@ the depth-200 one-for-one `Swap`.
 | Main-feed late contract top-up, D3b widen | `Extend` in place | unchanged; runs on the shared in-place write engine |
 | Depth-20 index legs | `Extend` in place | unchanged; same engine |
 | Unsubscribe probe Arm B, main-feed overflow probe | deliberate close | kept: a diagnostic and 805 recovery, not a subscription change |
-| Dial fail, vendor close, 807, idle and silence watchdogs | redial | kept: genuine faults |
+| Dial fail, vendor close, 807, idle and silence watchdogs | redial | kept: genuine faults; cross-feed (drain-inferred) silence: kept as a fault redial, refused after 805 (added 2026-10-10, see "2026-10-10 — PER-KIND FRAME-SILENCE THRESHOLDS") |
 
 No deliberate redial remains for a subscription change (ratchet
 `no_deliberate_redial_remains_for_a_subscription_change`).
@@ -9036,3 +9036,233 @@ REJECT (review round 10):
   here and derives from it (740 - 120 - 20), so it cannot rise without the
   bound rising.
 - Moves a bound and the REJECT row that forbids moving it in the same change.
+
+### 2026-10-06 — 808 REFRESHES THE TOKEN ONCE BEFORE IT PARKS
+
+**Owner (2026-10-06, verbatim):** "Go ahead with whatever you want dude" and
+"See do everything whatever is recommended dude okay?" — the approval for the
+recommended fast-lane plan, whose ITEM 52d/52e is this change (spec fl-808).
+**Owner (2026-10-10, verbatim):** "Why idle go ahead fully".
+
+*(Provenance: the 2026-10-06 quotes reached the implementing session through
+the coordinator's workflow, as for the OVERFLOW PROBE ATTRIBUTION section
+above; the 2026-10-10 line was relayed the same way. Confirm against the owner
+thread before merge.)*
+
+Recorded HERE before the code, per the rule-file-first law.
+
+**What was wrong (Verified in source, main 4525ffe86).** `classify_disconnect`
+put Dhan disconnect code 808 ("authentication failed") in the same Fatal arm as
+806 (data API not subscribed) and 810 (client id invalid). One 808 therefore
+parked the socket for the whole session (`ParkReason::FatalDisconnect`, no 804
+respawn). But 808 is ambiguous: an invalid or replaced token produces it as well
+as a wrong client id, and a token problem is exactly what 807 and 809 already
+recover from by refreshing the token and redialling. The order side already
+treats 808 as "refresh the token and retry once".
+
+**The contract.** A first 808 on a socket triggers ONE shared token refresh and
+a redial with the token floor and jitter (`TOKEN_STALE_REDIAL_FLOOR_MS` on the
+damped ladder plus the socket's stagger: the same delay rule as 807 and 809),
+counted as `reason="auth_rejected"` on the existing reconnect counter. The slot
+parks for the session (`FatalDisconnect`, no 804 respawn, the existing park
+page) only when one of these holds:
+
+- (a) the dial that got the 808 presented the token generation that an earlier
+  refresh in the same episode produced (the fresh token was rejected too);
+- (b) `AUTH_REJECT_MAX_HARD_FAILURES` (3) refreshes in the episode failed
+  outright;
+- (c) `AUTH_REJECT_EPISODE_MAX_MS` (300 s, at least twice the 125 s mint
+  cooldown) passed without a fresh token, counted from the episode start or
+  from the last refresh that produced a fresh token, whether or not an earlier
+  refresh verified a generation, after at most one more refresh attempt past
+  the bound: an 808 past it parks at once when the redial that ended in it
+  began with a refresh, and otherwise (an outage of failed dials or other
+  closes came between) gets one grace refresh and parks on the next 808 past
+  the bound, whatever happens in between (review rounds 3 and 4);
+- (d) more than `AUTH_REJECT_MAX_REFRESHES_PER_WINDOW` (4) refreshes that each
+  PRODUCED A FRESH TOKEN (a new generation) happened inside
+  `AUTH_REJECT_WINDOW_MS` (300 s). A deferred or failed refresh is not counted
+  here. The window is per SLOT and spans episodes: it is not cleared when an
+  episode ends or the slot parks, so a slot that got four fresh tokens inside
+  300 s, each accepted and delivering for a while before the next 808, parks
+  on the fifth 808 without refreshing again (review round 5).
+
+A refresh refused only because of the mint cooldown or the RESILIENCE-03 lock is
+DEFERRED: it counts toward neither (b) nor (d), so at the real redial cadence
+(an 808 about every 5 s) a run of deferrals parks through (c): 300 s without a
+fresh token. That holds after a fresh token too: if a sibling then moves the
+token on, every later 808 presents a generation the episode never verified, so
+(a) cannot fire, and each refresh may only defer; (c) still parks the slot 300 s
+after its last fresh token.
+A renewal result reused from another socket's renewal of the same token in the
+last 10 s (failed or deferred) is also reported as DEFERRED, because it carries
+no new evidence: one real failure is one strike, however many sockets read it.
+*(Corrected 2026-10-06, review round 1: the first code charged every refresh
+to (d) before its outcome was known, so deferrals 5 s apart parked after about
+20 s and (c) could never be reached; and a reused failure counted as a second
+outright failure. Review round 2: (c) first applied only while no generation
+was verified, so after one fresh token a slot whose later refreshes all
+deferred redialled without bound; it now runs from the last fresh token.)* An episode ends when the
+credential has proven itself: a close other than 808 after the socket delivered
+frames, or an 808 arriving after at least `MIN_HEALTHY_SESSION_MS` of healthy
+delivery; any park ends it too. Nothing on the per-frame path changes.
+
+806 and 810 stay fatal on the first strike. 805 and `ROTATION_HALTED` are
+unchanged (an 808 never sets or clears it). An 808 on the probed socket of an
+805 window is a coded close like 807 (watch restart, a second one fails the
+window), where before it parked at once; the park after a rejected fresh token
+still fails the window. Refresh is per account: a primary-account socket
+renews through the primary token manager (`force_renewal_unless_replaced`, the
+single-flight gate), and a failed or deferred renewal result is shared across
+sockets for 10 s (as a deferral, its reason stored redacted), so while the mint
+cooldown holds the pool sends one RenewToken per 10 s, not one per socket.
+
+**Depth account.** An 808 on a depth-account socket may only RE-READ
+`/tickvault/<env>/dhan-depth/access-token`. It never calls RenewToken or
+generateAccessToken, and never calls `global_token_manager()` (minter rule
+§10.4 and §10.9: one issuer per account). No depth-account socket is dialled
+today (Verified), so there is no code for it yet. The production refresh
+closure renews the PRIMARY account and carries a note that it MUST NOT be used
+for a depth-account socket, which needs its own re-read-only closure.
+
+**Out of scope, stated.** A rejection at the HTTP upgrade arrives as a failed
+dial (`DialFailed`), which does not refresh; this change does not alter it.
+
+**Authorised:** the reconnect reason label `auth_rejected`
+(`ReconnectReason::AuthRejected`, appended to `ReconnectReason::ALL`).
+
+**REJECT:**
+- Retrying an 808 without a token refresh first.
+- Redialling an 808 below `TOKEN_STALE_REDIAL_FLOOR_MS`.
+- Raising any `AUTH_REJECT_*` cap without a fresh dated quote here first.
+- Making 806 or 810 refreshable.
+- Spending the 804 respawn budget on 808.
+- Setting or clearing `ROTATION_HALTED` on 808.
+- An 808 on one account refreshing another account's token.
+- A depth-account 808 calling RenewToken or a mint, or `global_token_manager()`.
+- A production refresh closure that reports `Fresh` without the token generation
+  having moved.
+- Clearing the episode on the frame path.
+
+### 2026-10-10 — PER-KIND FRAME-SILENCE THRESHOLDS (fault redials only)
+
+**Owner, verbatim, each with its own date:**
+
+- 2026-10-06: "Go ahead with whatever you want dude"
+- 2026-10-06: "See do everything whatever is recommended dude okay?"
+- 2026-10-10: "Why idle go ahead fully"
+
+*(Provenance: the two 2026-10-06 quotes approved the recommended fast-lane
+plan (ITEM 52 of `active-plan-feed-hardening.md`, whose 52g and 52h are this
+work). The 2026-10-10 quote reached the implementing session through the
+coordinator's workflow. Confirm all three against the owner thread before
+merge.)*
+
+Recorded HERE before the code, per the rule-file-first law.
+
+#### What was wrong (Verified in source on main 4ce1d7208)
+
+1. `FRAME_SILENCE_REDIAL_SECS` (300 s) was ONE threshold for every socket
+   kind; `ConnectionSupervisor::poll` never read the endpoint. A main-feed or
+   depth-20 socket that stopped delivering while its siblings kept streaming
+   stayed blind for five minutes.
+2. The same 300 s rule closed and redialled HEALTHY depth-200 sockets. Each
+   holds one contract, and the repository itself measured 56 minutes of benign
+   silence on one (which is why `worst_connection_tick_age_secs` excludes
+   depth-200). The constant's doc carried the false sentence "a depth socket
+   carries an at-the-money contract, so five minutes of silence there is a dead
+   subscription"; it is deleted.
+
+#### The rule
+
+Silence is judged on EVIDENCE, not on time alone. Every redial below is a
+genuine-fault redial (reason `IdleSilence`, unchanged), never a subscription
+change, so the 2026-10-01 law is untouched.
+
+| Socket | Fast path (needs evidence) | Fallback (time only) |
+|---|---|---|
+| Main feed | 60 s, confirmed by at least 2 OTHER main-feed sockets that delivered a frame in the last 10 s | 300 s, as before |
+| Depth-20 | 90 s, confirmed the same way by at least 2 other depth-20 sockets | 300 s, as before |
+| Depth-200 | cross-feed: 90 s with no depth frame while the main feed shows the held contract trading at least 30 s after that last frame | 900 s backstop (was 300 s) |
+
+Conditions on every fast path (all must hold):
+
+- inside 09:15:00–15:15:00 IST only (`CONFIRMED_SILENCE_CLOSE_SECS_OF_DAY_IST`
+  = the 15:15 closing-auction open); 15:15–15:40 stays on the fallback;
+- no overflow episode engaged (`overflow_episode_engaged()`) and no 805 this
+  process (`rotation_halted()`); `ROTATION_HALTED` is only ever READ;
+- main feed and depth-20: the socket holds at least 1,000 (main) / 20
+  (depth-20) instruments;
+- main feed and depth-20: per-kind, pool-wide spacing of 15 s between fast
+  redials (`CONFIRMED_REDIAL_SPACING_SECS`), taken by one compare-and-swap;
+- main feed and depth-20: per-socket ESCALATION. Every silence redial of the
+  socket (fast or 300 s) adds a strike, and each strike doubles its next fast
+  threshold (60 → 120 → 240 → 300 on the main feed); the strikes reset only
+  after 900 s with no silence redial, so a
+  deaf socket that bursts one snapshot after every dial cannot loop every
+  ~61 s;
+- depth-200: the cross-feed request carries the socket's dial generation, so
+  a request raised before a redial is dropped (counted `stale`); one request
+  per socket per 300 s; a request taken after an 805 is refused with path
+  `data_silence` on `tv_depth_dial_refused_after_805_total`;
+- depth-200 cross-feed: inside the same 09:15:00–15:15:00 IST window.
+
+**Shadow first.** `[dhan_universe] frame_silence_fast_path` defaults to
+`shadow` (serde default and `config/base.toml`): the fast paths COUNT "would
+redial" (`tv_dhan_ws_frame_silence_would_redial_total{endpoint,basis}`) and do
+nothing else. `act` is a later one-line config PR, after a shadow week shows
+the per-socket peak gap (`tv_dhan_ws_conn_frame_gap_max_secs`) and the
+would-redial count are safe. `off` restores the old main-feed and depth-20
+timing exactly. The depth-200 900 s backstop is in code and active from merge.
+
+#### What this AMENDS
+
+- The 2026-10-02 inventory row "idle and silence watchdogs | redial | kept"
+  now also lists "cross-feed (drain-inferred) silence: kept as a fault
+  redial, refused after 805".
+- Nothing else: socket counts, caps, `ROTATION_HALTED`, the 805 probe rules
+  and the in-place change mechanism are unchanged.
+
+#### ⚠ Honest envelope
+
+- **Assumed:** normal per-socket gaps on the main feed and depth-20 inside
+  09:15–15:15 are far below 60 / 90 s. No per-socket measurement exists yet;
+  shadow mode and the new gap gauge measure it before anything acts.
+- **Assumed:** Dhan sends a depth-200 frame on the book change a trade
+  causes. If it conflates or throttles, the cross-feed path could redial a
+  healthy socket; bounded by 90 s silence, a 30 s lead, the 300 s cooldown
+  and shadow mode first.
+- **Worse in one case:** a deaf depth-200 socket whose contract the main feed
+  does not track now waits 900 s instead of 300 s, and depth-200 is not on
+  the deaf gauge, so nothing pages for it.
+- Every redial is a genuine reconnect with no snapshot-on-subscribe, so a
+  false fast redial loses the prints inside its ~2 s blind window on up to
+  5,000 instruments. Shadow mode, the evidence rules, the spacing and the
+  escalation bound that; they do not remove it.
+- Pools with 2 or fewer sockets of a kind never get sibling confirmation and
+  stay at 300 s.
+- Shadow counts overstate what `act` would do: a would-redial takes no
+  spacing slot and adds no strike, so several sockets can count in the same
+  15 s and one socket can count again 60 s later where `act` would have
+  waited.
+- A depth-200 socket under an overflow probe was redialled at 300 s of
+  silence; it now waits 900 s, past the 740 s window bound, so a deaf probed
+  depth-200 socket can let its window pass (errs toward pass, recorded, not
+  changed).
+- A forward wall-clock step of 90 s or more between the read task's stamp
+  and the scan can make a healthy depth-200 socket look silent for one scan.
+  Rare; bounded by the 30 s trade lead and the 300 s cooldown.
+
+REJECT (2026-10-10):
+
+- A pure-time depth-200 silence threshold below 900 s.
+- Any fast path that fires without sibling or cross-feed evidence.
+- Cross-kind sibling evidence, or a single sibling as evidence.
+- Any fast path firing while an overflow episode is engaged or after an 805.
+- Removing the per-socket escalation or the per-kind spacing.
+- A confirmed threshold where threshold × `FLAP_REDIAL_CEILING` is not above
+  `FLAP_WINDOW_MS` / 1000.
+- A new `ReconnectReason` variant for silence without a fresh dated quote
+  here first.
+- Defaulting `frame_silence_fast_path` to `act` without a dated row here
+  recording the shadow-week measurement.

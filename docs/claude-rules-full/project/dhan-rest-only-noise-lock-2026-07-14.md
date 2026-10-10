@@ -4553,7 +4553,7 @@ counters become five pages.
 | `tv-<env>-cold-backup-failing` | `tv_raw_frame_upload_failed_total`, `tv_cold_file_upload_failed_total`, `tv_raw_upload_marker_write_failed_total` | ≥ 1 in 2 of 3 consecutive 900 s periods | "Copies of captured market data are not reaching cloud storage — the files are kept on the server, but the disk will fill" |
 | `tv-<env>-disk-kept-not-backed-up` | `tv_wal_prune_refused_not_uploaded_total`, `tv_seal_spill_prune_refused_not_uploaded_total`, `tv_quarantine_prune_refused_not_uploaded_total` | ≥ 1 in one 900 s period | "Old market data files are due to be cleared but have no cloud copy, so they are kept — the disk will fill" |
 | `tv-<env>-order-update-dropped` | `tv_order_update_broadcast_drops_total` | ≥ 1 in one 300 s period | "🔷 DHAN: an order update from the broker reached nothing in the app — that update is missing" |
-| `tv-<env>-log-lines-dropped` | `tv_log_lines_dropped_total` | ≥ 1 in one 300 s period | "Log lines were dropped because the log writer fell behind — part of the record is missing" |
+| `tv-<env>-log-lines-dropped` | `tv_log_lines_dropped_total` *(⚠ narrowed by §2.9-i, 2026-10-10: the page is to read `tv_log_lines_dropped_shipped_total`, a metrics-log filter over `tv_log_lines_dropped_total` with `sink` = `app_log` or `errors_jsonl`, the two log files shipped to CloudWatch. Stage 1 adds only the filter; until stage 2 switches the alarm after a measured match, the alarm still reads the raw sum written in this cell.)* | ≥ 1 in one 300 s period | "Log lines were dropped because the log writer fell behind — part of the record is missing" |
 | `tv-<env>-feed-thread-wrote-to-disk` | `tv_tick_rescue_inline_fallback_total`, `tv_depth_rescue_inline_fallback_total` | ≥ 1 in one 300 s period | "🔷 DHAN: the live price thread had to save to disk itself because the save helper was full or gone — prices may have been skipped while it waited" |
 
 All five: `treat_missing_data = notBreaching` (the box is stopped outside the
@@ -4595,6 +4595,114 @@ note projected October at about that line before this change.
   would page).
 - Drops the boot-time zero registration of any of the ten counters.
 - Adds a sixth counter to any group without a dated row here first.
+
+## §2.9-i — 2026-10-10: the log-lines-dropped page reads only the two log files shipped to CloudWatch
+
+**This is a NARROWING, not a new page.** One existing alarm,
+`tv-<env>-log-lines-dropped` (§2.9), keeps its name, threshold (≥ 1), period
+(300 s, one period), `treat_missing_data = notBreaching`, empty `ok_actions`,
+`host`-only dimension and Telegram line. Only its INPUT shrinks: from the sum
+of `tv_log_lines_dropped_total` over every sink to the two sinks whose files
+CloudWatch receives. It never adds a page. Reverting is one field
+(`metric_name`).
+
+**The owner's words.** Owner, 2026-10-06: "Go ahead with whatever you want
+dude", and on the recommended-fixes list, "See do everything whatever is
+recommended dude okay?". Owner, 2026-10-10: "Why idle go ahead fully". These
+are general go-aheads and do not name this change; §2.10 records that a
+general go-ahead did not by itself carry a new page. They are accepted here
+ONLY because this row narrows an existing page and adds none, which is the
+shape §2.11 accepted the same 2026-10-06 words for. A reviewer may still ask
+for a decision card.
+
+**What was wrong (Verified from code and config, 2026-10-10).**
+`tv_log_lines_dropped_total` is published per sink by
+`publish_log_drop_counters` (`crates/app/src/observability.rs`) under the label
+each writer registered with: `app_log` and `errors_jsonl` (`main.rs`, next to
+`init_app_log_appender` and `init_errors_jsonl_appender`), `errors_log`
+(`init_lossy_non_blocking`), `candles` and `live_ticks` (the category
+appenders), and `stdout` only when `log_to_stdout` is on (it is `false` in
+`config/base.toml` and nothing in `config/` or `deploy/` overrides it). The
+CloudWatch agent's `collect_list` (`deploy/aws/cloudwatch-agent.json`) ships
+exactly two files: `data/logs/machine/errors.jsonl.2*` and
+`data/logs/machine/app.2*`; the category files sit in subdirectories the
+`app.2*` glob does not reach. The alarm read the EMF host-sum over every sink,
+so a drop in a file no one reads in CloudWatch (the TRACE-level category files
+above all) paged the same as a drop that hid a coded ERROR from its log
+filter, which is the one case the page exists for. errors.log is also lossy by
+design: it is reset to empty at its size cap (`cap_errors_log_size`,
+`ERRORS_LOG_MAX_BYTES`).
+
+**What changes, in three serial stages (each merged and verified first):**
+
+1. **Stage 1 (this row's first change): the filter only.** One log metric
+   filter on `/tickvault/<env>/metrics`,
+   `tv-<env>-log-lines-dropped-shipped`, pattern
+   `{ $.tv_log_lines_dropped_total = * && ($.sink = "app_log" || $.sink = "errors_jsonl") }`,
+   writes the DERIVED metric `tv_log_lines_dropped_shipped_total` (value
+   `$.tv_log_lines_dropped_total`, `host` dimension, no `default_value`). A
+   distinct derived name, as in `seal-drop-alarm.tf`, so a later EMF selection
+   of the raw name can never be counted twice. No alarm changes.
+2. **Gate before stage 2 (measured, not assumed).** With AWS credentials:
+   Logs Insights on `/tickvault/prod/metrics`,
+   `filter ispresent(tv_log_lines_dropped_total) | stats count(*) by sink`,
+   must show rows for `app_log` and `errors_jsonl`; and SampleCount of
+   `tv_log_lines_dropped_shipped_total` over a window while the box runs must
+   be > 0 (the boot-zero seeds publish a 0 every scrape, so a nonzero count
+   proves the slice matches). If the first query shows no `sink` field, stop:
+   the fallback is a second counter in Rust, with its own plan.
+3. **Stage 2: the alarm switches** `metric_name` to
+   `tv_log_lines_dropped_shipped_total` and nothing else (applied outside
+   09:00–15:40 IST). **Stage 3 (optional):** the raw name leaves the EMF
+   selector, only after stage 2 is applied.
+
+**Drops on box-local files still surface.** Every new drop logs one `warn!`
+naming the sink into the shipped app log (unless `app_log` itself is the sink
+dropping, which still pages), and the raw per-sink series stays in
+`/tickvault/<env>/metrics` for Logs Insights.
+
+**Guards (stage 1).** `crates/app/tests/log_drop_alarm_shipped_sinks_guard.rs`
+pins the slice equal to the files the agent ships, keeps the unshipped sinks
+out, ties each sliced label to the writer that registers it, pins the filter
+shape, and requires both labels seeded at 0 at boot.
+`crates/app/tests/alarmed_counters_are_seeded_guard.rs` carries the derived
+name in `DERIVED_SLICE_FILTER_METRICS` and checks its source is seeded for
+each sliced label.
+
+**Honest cost (AWS list price):** stage 1 adds one filter-derived custom
+metric, **+$0.30/month**; filters are free. Stage 3 removes one EMF name
+(−$0.30), so the net is **$0** after stage 3, and +$0.30 stays if stage 3 is
+skipped. Metric filters on `/tickvault/<env>/metrics` go from 60 to 61
+(55 loss-group plus five single filters; the AWS limit is 100 per log group).
+Recorded in `aws-budget.md` "COST NOTE 2026-10-10".
+
+**NOT claimed:**
+- That the CloudWatch agent writes the Prometheus label as a top-level `sink`
+  field in the metrics log. No house slice (seal-drop `$.kind`, loss-group
+  `$.reason`) has been live-verified on that point. If it does not, the filter
+  never matches and, once stage 2 lands, a `notBreaching` alarm would stay
+  green forever. That is why stage 2 waits on the measured gate above.
+- That counters reach the metrics log as per-scrape deltas (the §2.10
+  residual). If they were cumulative, the page would repeat each period after
+  the first real drop until restart: loud, not silent.
+
+**Residual, not a regression:** drops before the agent's first scrape at boot
+(the most log-heavy minute) become the dropped baseline sample and never page;
+that was already true of the raw sum.
+
+**What a PR that violates §2.9-i looks like (REJECT):**
+- Widens the slice to a sink whose file is not shipped to CloudWatch, without
+  a dated row here first.
+- Points the alarm back at the raw all-sink sum `tv_log_lines_dropped_total`.
+- Adds a `sink` dimension, or splits the page into per-sink alarms.
+- Adds `ok_actions`.
+- Drops the boot-zero seed for `app_log` or `errors_jsonl`.
+- Filters the drop `warn!` line instead of the scrape (that line rides the same
+  lossy sinks it reports on).
+- Seeds the derived name `tv_log_lines_dropped_shipped_total` in Rust.
+- Removes the raw name from the EMF selector before the alarm reads the
+  derived metric and a match has been measured.
+- Switches the alarm in the same change that adds the filter.
 
 ## §2.10 — 2026-10-05: six LOSS-GROUP pages over counters that were counted and reached no one (audit H1, N3)
 
@@ -4725,3 +4833,87 @@ minutes, which is what §2.3's "one per episode" always said. Cost unchanged.
 - Counts never-ticked contracts toward re-arming the page again, so far
   strikes latch it for the day.
 - Removes the 30-minute cooldown or pages never-ticked contracts every scan.
+
+## §2.12 — 2026-10-06: an 808 refreshes the token once before it parks (no new page)
+
+Owner, 2026-10-06: "Go ahead with whatever you want dude", and on the
+recommended-fixes list, "See do everything whatever is recommended dude okay?".
+Owner, 2026-10-10: "Why idle go ahead fully". *(Numbered §2.12 because §2.11
+was taken the same day by the `RISK-GAP-03` re-arm; the spec that ordered this
+section called it §2.11.)*
+
+The policy lives in the scope lock, section "2026-10-06 — 808 REFRESHES THE
+TOKEN ONCE BEFORE IT PARKS". What it changes for pages and alarms:
+
+- **(i)** `dhan-socket-parked` fires on an 808 only at the TERMINAL park (the
+  refreshed token was rejected too, or a cap tripped), no longer on the first
+  808. Its alarm definition, its `host`-only dimension and its lack of
+  `ok_actions` are unchanged; only its description text changes, and the same
+  for the every-socket-gone alarm's description (806/810, or an 808 that a
+  refreshed token did not cure).
+- **(ii)** The family-(3) `AuthenticationFailed` body sent from
+  `force_renewal_unless_replaced` changes from "(code 807)" to wording that
+  covers 807, 808 and 809 and still names Dhan. Same site, same once-per-token
+  latch.
+- **(iii)** A self-healing main-feed 808 inside 09:15–15:30 can still push
+  `tv_dhan_ws_main_reconnect_recovery_max_ms` past the threshold of the
+  existing `dhan-main-reconnect-slow` alarm, exactly as an 807 can today.
+- **(iv)** No new alarm, page, EMF name or metric filter. `reason="auth_rejected"`
+  rides the existing reconnect counter, and the new
+  `tv_token_renew_failure_reused_total` is a plain Prometheus counter that is
+  NOT EMF-selected.
+
+**What a PR that violates §2.12 looks like (REJECT):**
+- Adds `ok_actions`, or any dimension beyond `host`, to `dhan-socket-parked`.
+- Adds a separate page for a first (self-healing) 808.
+- EMF-selects `tv_dhan_ws_reconnect_total{reason="auth_rejected"}` as its own
+  series or `tv_token_renew_failure_reused_total`.
+
+## §2.13 — 2026-10-10: per-kind frame-silence redials (no new page; how they meet the deaf and reconnect-slow pages)
+
+Owner, verbatim, each with its own date:
+
+- 2026-10-06: "Go ahead with whatever you want dude"
+- 2026-10-06: "See do everything whatever is recommended dude okay?"
+- 2026-10-10: "Why idle go ahead fully"
+
+(§2.12 is reserved by a parallel branch; this row takes the next free number.)
+
+**What changed (full rule: `websocket-connection-scope-lock.md` "2026-10-10 —
+PER-KIND FRAME-SILENCE THRESHOLDS"):** a main-feed or depth-20 socket can be
+redialled after 60 / 90 s of silence when two same-kind siblings are live, and
+a depth-200 socket is redialled on a 900 s backstop (was 300 s) or a cross-feed
+check. The fast paths ship in SHADOW mode (count only).
+
+**Allowed set unchanged.** No new code, alarm, filter, EMF name, dimension or
+`ok_actions`:
+
+- `dhan-worst-socket-deaf` stays at 600 s, period 300 s, `Maximum`,
+  evaluation 1.
+- `dhan-main-reconnect-slow` stays at 15,000 ms.
+- `tv_dhan_ws_frame_silence_redial_total`,
+  `tv_dhan_ws_frame_silence_would_redial_total`,
+  `tv_dhan_ws_data_silence_request_stale_total` and
+  `tv_dhan_ws_conn_frame_gap_max_secs` are local `/metrics` only, seeded at 0,
+  and in no EMF selector.
+
+**Recorded interactions (no change made for them):**
+
+- Once the fast path is flipped to `act`, a fast redial feeds main-feed
+  reconnect-recovery samples earlier. A healthy socket gets a frame pushed on
+  subscribe, so its sample is about 2 s. A sample of 15 s or more means the
+  redial did not cure the socket, which is what the reconnect-slow page is
+  for.
+- Pre-existing, not fixed here: while the drain sheds all depth
+  (`ShedLevel::AllDepth`), the depth-20 last-tick stamps the deaf gauge reads
+  stop moving, so `dhan-worst-socket-deaf` can page on healthy depth-20
+  sockets. Fixing that changes a page and needs its own dated row.
+- A deaf depth-200 socket whose contract the main feed does not track now
+  waits 900 s, and depth-200 is not on the deaf gauge, so nothing pages for
+  it (the same as before for depth-200; only the redial is later).
+
+**What a PR that violates §2.13 looks like (REJECT):**
+- Lowers `dhan-worst-socket-deaf` below 600 s, or edits either alarm's
+  `alarm_description`, without a further dated row here.
+- Ships any of the four new series to CloudWatch (EMF selector, filter or
+  alarm) without a dated row here.
