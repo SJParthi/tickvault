@@ -2755,6 +2755,16 @@ impl LiveIngest {
             .is_some_and(DepthIngest::flush_due)
     }
 
+    /// True when the depth buffer has reached the LATE-row flush size (see
+    /// [`DepthIngest::late_flush_due`]); false with no depth wired. The WAL
+    /// replay's trigger. O(1).
+    #[must_use]
+    pub fn depth_late_flush_due(&self) -> bool {
+        self.inline_depth
+            .as_ref()
+            .is_some_and(DepthIngest::late_flush_due)
+    }
+
     /// Depth rows this lane has dropped, for the shutdown accounting line.
     #[must_use]
     pub fn depth_dropped_rows(&self) -> u64 {
@@ -3505,10 +3515,19 @@ impl LiveIngest {
         self.writer_offloaded
     }
 
+    /// Flushes the depth sink, then the tick rows. Returns the tick rows it
+    /// covered.
     pub fn flush(&mut self) -> u64 {
+        self.flush_depth_sink();
+        self.flush_ticks()
+    }
+
+    /// Flushes the inline-depth sink only.
+    fn flush_depth_sink(&mut self) {
         // Flush the inline-depth sink FIRST, and unconditionally.
         //
-        // This sits above the `pending_rows == 0` early return deliberately.
+        // `flush` calls this before `flush_ticks` and its `pending_rows == 0`
+        // early return deliberately.
         // Depth rows and tick rows are appended on different conditions: a
         // Full-mode packet whose tick the aggregator refuses still contributed
         // depth rows, so `pending_rows` can be 0 while the depth buffer is not
@@ -3549,6 +3568,18 @@ impl LiveIngest {
                  Tick persistence is unaffected either way."
             );
         }
+    }
+
+    /// Flushes the tick rows only, leaving buffered depth rows for their own
+    /// trigger (plan item 55).
+    ///
+    /// The WAL replay uses this when only the tick buffer is due: a replayed
+    /// depth row lands in an hour partition that already holds rows, and
+    /// QuestDB rewrites that partition for every late commit whatever its
+    /// size (measured 2026-10-10: 460–620 MB per commit, from 1,000 rows to
+    /// 1,000,000). Flushing depth with every 1,000 tick rows multiplied those
+    /// commits. O(1) here; the flush itself is one hand-off or one request.
+    pub fn flush_ticks(&mut self) -> u64 {
         if self.pending_rows == 0 {
             return 0;
         }
@@ -9660,6 +9691,25 @@ impl DepthIngest {
         match &self.book {
             Some(b) => self.writer.book_flush_due() || rows_due(&b.levels),
             None => rows_due(&self.writer),
+        }
+    }
+
+    /// The flush trigger for LATE rows (the WAL replay and the after-close
+    /// deferred pass, plan item 55): an array-row writer by
+    /// [`tickvault_storage::depth_persistence::DEPTH_BOOK_FLUSH_BYTES`] as
+    /// [`Self::flush_due`], a level writer by
+    /// [`tickvault_storage::depth_persistence::DEPTH_LATE_FLUSH_BYTES`]
+    /// instead of [`DEPTH_FLUSH_ROW_THRESHOLD`] rows, so each late commit
+    /// (which rewrites a whole hour partition) carries about nine times the
+    /// rows. Never used by the live drain, whose rows are in time order. O(1).
+    #[must_use]
+    pub fn late_flush_due(&self) -> bool {
+        let bytes_due = |w: &DepthWriter| {
+            w.pending_bytes() >= tickvault_storage::depth_persistence::DEPTH_LATE_FLUSH_BYTES
+        };
+        match &self.book {
+            Some(b) => self.writer.book_flush_due() || bytes_due(&b.levels),
+            None => bytes_due(&self.writer),
         }
     }
 
@@ -15855,7 +15905,15 @@ pub fn pace_after_replay_flush(
 }
 
 /// [`pace_after_replay_flush`] on the real writers (audit R1).
-fn replay_pace_after_flush(ingest: &mut LiveIngest, pace_until: Option<Instant>) -> u32 {
+///
+/// `with_depth` says whether the flush it follows included the depth sink.
+/// After a ticks-only flush the depth rows are held on purpose (plan item
+/// 55), so they are neither re-flushed nor read as a full queue.
+fn replay_pace_after_flush(
+    ingest: &mut LiveIngest,
+    pace_until: Option<Instant>,
+    with_depth: bool,
+) -> u32 {
     if pace_until.is_none() {
         return 0;
     }
@@ -15863,11 +15921,15 @@ fn replay_pace_after_flush(ingest: &mut LiveIngest, pace_until: Option<Instant>)
     let ingest = std::cell::RefCell::new(ingest);
     let waits = pace_after_replay_flush(
         || {
-            blocking_flush(|| ingest.borrow_mut().flush());
+            if with_depth {
+                blocking_flush(|| ingest.borrow_mut().flush());
+            } else {
+                blocking_flush(|| ingest.borrow_mut().flush_ticks());
+            }
         },
         || {
             let ingest = ingest.borrow();
-            ingest.pending_rows() > 0 || ingest.depth_pending_rows() > 0
+            ingest.pending_rows() > 0 || (with_depth && ingest.depth_pending_rows() > 0)
         },
         |step| {
             // A fresh snapshot each step: a rescue elsewhere should end this
@@ -16136,12 +16198,22 @@ pub fn refold_wal_frames(
         // true. At that boot's volumes this is ~2,400 flushes across a replay
         // -- bounded work at boot, against a flush that currently cannot
         // succeed at all.
-        // Depth: `depth_flush_due` is the `DEPTH_FLUSH_ROW_THRESHOLD` row
-        // trigger for a level writer and the byte trigger for an array-row
-        // writer (plan item 49e step 3).
-        if ingest.pending_rows() >= FLUSH_ROW_THRESHOLD || ingest.depth_flush_due() {
-            // `LiveIngest::flush` flushes the inline-depth sink first and
-            // unconditionally (see its body), so one call drains both buffers.
+        // Depth: `depth_late_flush_due` is the LATE-row trigger (plan item
+        // 55): the array-row byte trigger for an array-row writer (plan item
+        // 49e step 3) and `DEPTH_LATE_FLUSH_BYTES` for a level writer, not the
+        // live drain's `DEPTH_FLUSH_ROW_THRESHOLD`. A replayed depth row lands
+        // in an hour partition that already holds rows, and every such commit
+        // rewrites the partition whatever its size (measured 2026-10-10), so
+        // depth is flushed on its own trigger and never because the tick
+        // buffer filled: the tick trigger alone fired every 1,000 tick rows,
+        // several thousand depth rows apart.
+        let ticks_due = ingest.pending_rows() >= FLUSH_ROW_THRESHOLD;
+        let depth_due = ingest.depth_late_flush_due();
+        if ticks_due || depth_due {
+            // With depth due, `LiveIngest::flush` flushes the inline-depth
+            // sink first and unconditionally (see its body), so one call
+            // drains both buffers; with only the ticks due, `flush_ticks`
+            // leaves the depth rows to grow into a larger batch.
             // A failure here is already loud and already rescues to the spill
             // tier at its source; the loop carries on, exactly as the live
             // drain does.
@@ -16174,8 +16246,12 @@ pub fn refold_wal_frames(
             // met a full queue waits for the writers before the next batch, so
             // the replay never reaches the retention bound and never rescues
             // its own rows back to the WAL. See `pace_after_replay_flush`.
-            blocking_flush(|| ingest.flush());
-            let waits = replay_pace_after_flush(ingest, pace_until);
+            if depth_due {
+                blocking_flush(|| ingest.flush());
+            } else {
+                blocking_flush(|| ingest.flush_ticks());
+            }
+            let waits = replay_pace_after_flush(ingest, pace_until, depth_due);
             out.pace_waits = out.pace_waits.saturating_add(u64::from(waits));
         }
         // TVW4 (2026-09-02): route by the RECORDED endpoint BEFORE any header
@@ -21446,6 +21522,109 @@ mod tests {
         assert!(levels.flush_due(), "10,000 level rows");
     }
 
+    /// Plan item 55: a late level batch flushes on bytes, about nine times
+    /// the live drain's 10,000 rows; an array-row batch keeps its own byte
+    /// trigger.
+    #[test]
+    fn test_late_flush_due_is_late_bytes_for_level_rows_and_the_book_trigger_for_book_rows() {
+        use tickvault_storage::depth_persistence::DEPTH_LATE_FLUSH_BYTES;
+        let mut levels = DepthIngest::for_test();
+        let frame = depth_frame(depth20_packet(13, 0, 41), DhanEndpointType::Depth20, 7);
+        let mut frames = 0_u64;
+        while !levels.late_flush_due() {
+            let mut f = frame.clone();
+            f.seq = 7 + (frames << 20);
+            drain_depth_frame(&mut levels, &f, BOOK_RX, DepthFeedKind::Twenty, counters());
+            frames += 1;
+            if levels.pending_rows() < 10_000 {
+                assert!(!levels.late_flush_due());
+            }
+            assert!(frames < 100_000, "must trip on bytes");
+        }
+        assert!(
+            levels.flush_due(),
+            "the live row threshold tripped long before"
+        );
+        assert!(levels.writer.pending_bytes() >= DEPTH_LATE_FLUSH_BYTES);
+        assert!(
+            levels.pending_rows() >= 50_000,
+            "a late batch carries several times the live 10,000 rows, got {}",
+            levels.pending_rows()
+        );
+
+        let mut book = DepthIngest::for_test_book(BOOK_RX);
+        let frame = depth_frame(
+            depth200_packet(52_175, 2, 41, 200),
+            DhanEndpointType::Depth200,
+            9,
+        );
+        let mut seq = 9_u64;
+        while !book.flush_due() {
+            assert!(!book.late_flush_due(), "the book trigger is the same");
+            let mut f = frame.clone();
+            seq += 1 << 20;
+            f.seq = seq;
+            drain_depth_frame(
+                &mut book,
+                &f,
+                BOOK_RX,
+                DepthFeedKind::TwoHundred,
+                counters(),
+            );
+        }
+        assert!(book.late_flush_due());
+    }
+
+    /// Plan item 55: `flush_ticks` leaves the depth rows to batch, and
+    /// `depth_late_flush_due` follows the inline sink.
+    #[test]
+    fn test_flush_ticks_and_depth_late_flush_due_leave_depth_to_its_own_trigger() {
+        let ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        assert!(!ingest.depth_late_flush_due(), "no depth sink");
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8)
+            .with_inline_depth(DepthIngest::for_test());
+        assert!(!ingest.depth_late_flush_due(), "an empty sink is not due");
+        let frame = depth_frame(depth20_packet(13, 0, 41), DhanEndpointType::Depth20, 7);
+        let sink = ingest.depth_sink().expect("depth sink wired");
+        drain_depth_frame(sink, &frame, BOOK_RX, DepthFeedKind::Twenty, counters());
+        let held = ingest.depth_pending_rows();
+        assert!(held > 0, "depth rows buffered");
+        assert_eq!(ingest.flush_ticks(), 0, "no tick rows to flush");
+        assert_eq!(
+            ingest.depth_pending_rows(),
+            held,
+            "a tick-only flush must not touch the depth buffer"
+        );
+        assert!(
+            !ingest.depth_late_flush_due(),
+            "a few rows are not a late batch"
+        );
+    }
+
+    /// Plan item 55: the after-close pass writes late rows and must batch
+    /// them on the late trigger; the live drain keeps the row threshold.
+    #[test]
+    fn the_late_depth_paths_use_the_late_trigger_and_the_live_drain_does_not() {
+        let pass = include_str!("dhan_feed_stack/deferred_depth_pass.rs");
+        let pass_prod = pass.split("#[cfg(test)]").next().unwrap_or(pass);
+        assert!(pass_prod.contains("sink.late_flush_due() && sink.flush()"));
+        assert!(
+            !pass_prod.contains("sink.flush_due()"),
+            "the after-close pass writes late rows only"
+        );
+        let src = include_str!("dhan_feed_stack.rs");
+        let production = src.split("#[cfg(test)]").next().unwrap_or(src);
+        assert_eq!(
+            production.matches("ingest.depth_late_flush_due()").count(),
+            1,
+            "only the WAL replay uses the late trigger"
+        );
+        assert!(
+            production.contains("if ingest.depth_flush_due() {"),
+            "the live drain keeps the row threshold for in-order rows"
+        );
+    }
+
     #[test]
     fn test_mark_pending_unbacked_for_marks_the_writer_that_takes_the_frame() {
         let mut depth = DepthIngest::for_test_book(BOOK_RX);
@@ -26192,17 +26371,27 @@ mod wal_refold_tests {
         );
         assert!(
             body[..flush_at].contains("ingest.pending_rows() >= FLUSH_ROW_THRESHOLD")
-                && body[..flush_at].contains("ingest.depth_flush_due()"),
-            "the flush must be gated on BOTH row thresholds the live drain \
-             uses — a depth-only or tick-only gate leaves the other buffer \
-             unbounded, and depth was the 22.3M-row half"
+                && body[..flush_at].contains("ingest.depth_late_flush_due()"),
+            "the flush must be gated on BOTH size triggers — a depth-only or \
+             tick-only gate leaves the other buffer unbounded, and depth was \
+             the 22.3M-row half"
         );
+        // Plan item 55: depth on the LATE trigger, never the live row
+        // threshold, and a tick-only flush that leaves depth to batch.
+        assert!(
+            !body.contains("ingest.depth_flush_due()"),
+            "replayed depth rows are late rows: the replay must use \
+             `depth_late_flush_due`, not the live drain's row threshold"
+        );
+        let ticks_at = body
+            .find("blocking_flush(|| ingest.flush_ticks())")
+            .expect("a tick-only flush must leave the depth rows to batch");
 
         let match_at = body
             .find("match endpoint {")
             .expect("the endpoint match must exist");
         assert!(
-            flush_at < match_at,
+            flush_at < match_at && ticks_at < match_at,
             "the size trigger sits BELOW `match endpoint`, so the depth arm's \
              `continue` skips it — that is the exact shape of the defect this \
              test exists to stop, because depth is the half that builds the \
@@ -26359,7 +26548,8 @@ mod wal_refold_tests {
             "the boot pass and the catch-up rounds must both call the paced refold"
         );
         assert!(
-            production.contains("let waits = replay_pace_after_flush(ingest, pace_until);"),
+            production
+                .contains("let waits = replay_pace_after_flush(ingest, pace_until, depth_due);"),
             "the size-triggered replay flush must be the paced one"
         );
     }

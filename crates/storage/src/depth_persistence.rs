@@ -437,6 +437,34 @@ pub const MAX_DEPTH_BOOK_LEVELS: usize = 200;
 /// at most 32 MiB, one [`MAX_DEPTH_PRODUCER_BUFFER_BYTES`].
 pub const DEPTH_BOOK_FLUSH_BYTES: usize = 8 * 1024 * 1024;
 
+/// Flush a LEVEL-row buffer that is being filled with LATE rows (the WAL
+/// replay and the after-close deferred pass) once it holds this many bytes,
+/// instead of at the live drain's 10,000 rows (plan item 55).
+///
+/// A late row lands in an hour partition that already holds rows, and QuestDB
+/// rewrites that partition for every commit that adds rows to it, whatever the
+/// commit's size: measured on QuestDB 9.3.5 (2026-10-10, a 6M-row hour, paced
+/// commits) at 464 MB written per 1,000-row commit, 495 MB per 10,000-row
+/// commit and 507 MB per 100,000-row commit, against about 1.7 MB for an
+/// in-order commit. So a late batch's cost is the COUNT of commits, and at
+/// about 179 bytes a row this is about 94,000 rows per commit, about 9 times
+/// fewer commits than 10,000 rows.
+///
+/// Half of [`MAX_DEPTH_PRODUCER_BUFFER_BYTES`], so a batch the full offload
+/// queue hands back still has room for the next span before the byte cut, and
+/// [`DEPTH_FLUSH_QUEUE_DEPTH`] batches stay inside the asserted in-flight
+/// bound. The live drain keeps its row threshold: its rows are in time order.
+pub const DEPTH_LATE_FLUSH_BYTES: usize = 16 * 1024 * 1024;
+
+const _: () = assert!(
+    DEPTH_LATE_FLUSH_BYTES * 2 <= MAX_DEPTH_PRODUCER_BUFFER_BYTES,
+    "a late depth batch must leave the producer room for one more span before its byte cut"
+);
+const _: () = assert!(
+    DEPTH_LATE_FLUSH_BYTES >= DEPTH_BOOK_FLUSH_BYTES,
+    "the late batch exists to be LARGER than the ordinary one"
+);
+
 /// The idempotent `CREATE TABLE` DDL for `market_depth_book`. Pure — no I/O.
 ///
 /// Same column set as `market_depth` with `level` replaced by `levels` (the

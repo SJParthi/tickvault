@@ -6730,3 +6730,39 @@ Revert the PR: the boot publishes spot names only again and the after-close repa
 ## Observability (Item 54)
 
 Two `info!` lines at boot (count and the day the names came from); the existing `tv_candle_contract_labels_published` gauge reads the full count from the first boot call instead of 862. Repair: one `info!` per day checked (names, rows restored, tables repaired, clean, skipped, failures) and one per run; counters `tv_contract_name_repair_rows_total` and `tv_contract_name_repair_runs_total{outcome}`, registered at 0 when the task starts. Statement failures are `warn!` (nothing is lost: the rows and their values stay; only the name is still missing). No page, alarm, EMF name or filter.
+
+## ITEM 55 — Late depth writes in fewer, larger commits (WAL apply backlog, 2026-10-10)
+
+Authority: Parthi, relayed 2026-10-10: "Bro make everything to work and finish and fix and resolve everything and merge and deploy everything now dude". The coordinator assigned the `market_depth` WAL apply backlog (about 235,000 transactions and rising) to this thread.
+
+Finding (Verified on a local QuestDB 9.3.5, a 6M-row hour partition with the `market_depth` columns, HOUR partitions, WAL and DEDUP key; paced commits as the after-close pass and the paced replay make them): every commit that adds rows to an hour partition that already holds rows rewrites roughly the whole partition — 464 MB for 1,000 rows, 495 MB for 10,000, 507 MB for 100,000, 0.62 GB for 1,000,000 — against about 1.7 MB for an in-order commit and 18 MB for 20 commits of exact duplicates. So a late batch costs the COUNT of its commits. The WAL replay flushed depth at 10,000 rows AND with every 1,000 tick rows (`LiveIngest::flush` always flushes the depth sink first), and the after-close pass at 10,000 rows.
+
+- [x] 55a — `DEPTH_LATE_FLUSH_BYTES` (16 MiB, half the producer ceiling) and `DepthIngest::late_flush_due`: a level writer flushes late rows by bytes (about 94,000 rows a commit), an array-row writer keeps its 8 MiB trigger.
+  - Files: crates/storage/src/depth_persistence.rs, crates/app/src/dhan_feed_stack.rs
+  - Tests: test_late_flush_due_is_late_bytes_for_level_rows_and_the_book_trigger_for_book_rows
+- [x] 55b — the WAL replay flushes depth on `depth_late_flush_due` only; a tick-only trigger calls the new `LiveIngest::flush_ticks`, and the pacer after it neither re-flushes nor waits on the held depth rows.
+  - Files: crates/app/src/dhan_feed_stack.rs
+  - Tests: test_flush_ticks_and_depth_late_flush_due_leave_depth_to_its_own_trigger, the_replay_loop_flushes_on_size_so_one_batch_cannot_build_a_four_gb_buffer, both_replay_passes_are_paced
+- [x] 55c — the after-close deferred pass flushes on `late_flush_due` (still once more at every bucket edge, so no batch spans two buckets).
+  - Files: crates/app/src/dhan_feed_stack/deferred_depth_pass.rs
+  - Tests: the_late_depth_paths_use_the_late_trigger_and_the_live_drain_does_not, after_close_pass_writes_depth_only_and_clears_after_a_healthy_settle
+
+### Design (Item 55)
+Only the batch size of LATE depth writes changes. The live drain keeps `DEPTH_FLUSH_ROW_THRESHOLD` (its rows are in time order and cheap). `late_flush_due` is O(1): one length read per writer. `flush_ticks` is the tick half of `LiveIngest::flush`, split out unchanged; `flush` is now `flush_depth_sink` then `flush_ticks`, same order and same behaviour. Both replay callers still flush everything at the end of each refold.
+
+### Edge Cases (Item 55)
+A replay with ticks and no depth flushes ticks every 1,000 rows as before. A replay with depth and no ticks flushes depth at 16 MiB. Array-row (book) mode: the book writer keeps 8 MiB; the synchronous older-frame level writer takes the 16 MiB trigger. An offload queue that is full hands a 16 MiB batch back; the producer still cuts at `MAX_DEPTH_PRODUCER_BUFFER_BYTES` (32 MiB) and the span bound, as before.
+
+### Failure Modes (Item 55)
+No row is skipped; only the size of each commit changes. A failed late batch goes to the depth spill tier (replay) or leaves its bucket marked (after-close pass), exactly as a 10,000-row batch did; the DEDUP key makes a rewrite idempotent. A 16 MiB request is bounded by the ILP timeout of 5 s plus the client's minimum throughput allowance; the replay runs before the drain starts and the after-close pass on its own thread, so neither blocks the live feed. Each remaining late commit still rewrites its partition: the change cuts the count, not the cost of one. Why QuestDB on the box does not merge queued commits (it does locally under a burst) is Unknown.
+
+### Test Plan (Item 55)
+`cargo test -p tickvault-app --lib` (late_flush_due, flush_ticks, the replay and deferred-pass tests); `cargo test -p tickvault-storage --lib depth_persistence` (the compile-time bounds). After deploy: the WAL transaction count added by a boot replay (`wal_tables()` `sequencerTxn` before and after) and `tv_questdb_wal_apply_lag_max`.
+
+### Rollback (Item 55)
+Revert the commit. No schema, data or config change.
+
+### Observability (Item 55)
+Existing: `tv_questdb_wal_apply_lag_max`, the depth flush and spill counters, `tv_wal_replay_pace_waits_total`. No new metric.
+
+Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
