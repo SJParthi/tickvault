@@ -15346,9 +15346,13 @@ fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize 
                     // may have renewed it already; renewing again would expire
                     // the token that sibling just re-dialled with.
                     //
-                    // A depth-account socket reads the same process-global
-                    // token manager here; the depth account's own minter is
-                    // separate, so for it this is a re-read only.
+                    // This closure renews or mints the PRIMARY account's
+                    // token (`global_token_manager()`). It MUST NOT be used
+                    // for a depth-account socket: that would renew the wrong
+                    // account. A depth-account socket needs its own closure
+                    // that only re-reads /tickvault/<env>/dhan-depth/access-token
+                    // (scope lock 2026-10-06, 808 section; that account has
+                    // its own minter).
                     let dialled = dialled_generation.load(std::sync::atomic::Ordering::Relaxed);
                     let report = |outcome| TokenRefreshReport {
                         presented: dialled,

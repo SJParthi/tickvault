@@ -9073,11 +9073,21 @@ page) only when one of these holds:
   outright;
 - (c) the episode is older than `AUTH_REJECT_EPISODE_MAX_MS` (300 s, at least
   twice the 125 s mint cooldown) without a verified fresh token;
-- (d) more than `AUTH_REJECT_MAX_REFRESHES_PER_WINDOW` (4) refreshes happened
-  inside `AUTH_REJECT_WINDOW_MS` (300 s).
+- (d) more than `AUTH_REJECT_MAX_REFRESHES_PER_WINDOW` (4) refreshes that each
+  PRODUCED A FRESH TOKEN (a new generation) happened inside
+  `AUTH_REJECT_WINDOW_MS` (300 s). A deferred or failed refresh is not counted
+  here.
 
 A refresh refused only because of the mint cooldown or the RESILIENCE-03 lock is
-DEFERRED and does not count toward (b); (c) bounds it. An episode ends when the
+DEFERRED: it counts toward neither (b) nor (d), so at the real redial cadence
+(an 808 about every 5 s) a run of deferrals parks only through (c), at 300 s.
+A renewal result reused from another socket's renewal of the same token in the
+last 10 s (failed or deferred) is also reported as DEFERRED, because it carries
+no new evidence: one real failure is one strike, however many sockets read it.
+*(Corrected 2026-10-06, review round 1: the first code charged every refresh
+to (d) before its outcome was known, so deferrals 5 s apart parked after about
+20 s and (c) could never be reached; and a reused failure counted as a second
+outright failure.)* An episode ends when the
 credential has proven itself: a close other than 808 after the socket delivered
 frames, or an 808 arriving after at least `MIN_HEALTHY_SESSION_MS` of healthy
 delivery; any park ends it too. Nothing on the per-frame path changes.
@@ -9088,14 +9098,17 @@ unchanged (an 808 never sets or clears it). An 808 on the probed socket of an
 window), where before it parked at once; the park after a rejected fresh token
 still fails the window. Refresh is per account: a primary-account socket
 renews through the primary token manager (`force_renewal_unless_replaced`, the
-single-flight gate), and a failed renewal is shared across sockets for 10 s.
+single-flight gate), and a failed or deferred renewal result is shared across
+sockets for 10 s (as a deferral, its reason stored redacted), so while the mint
+cooldown holds the pool sends one RenewToken per 10 s, not one per socket.
 
 **Depth account.** An 808 on a depth-account socket may only RE-READ
 `/tickvault/<env>/dhan-depth/access-token`. It never calls RenewToken or
 generateAccessToken, and never calls `global_token_manager()` (minter rule
 §10.4 and §10.9: one issuer per account). No depth-account socket is dialled
-today (Verified), so there is no code for it yet; the production closure
-carries a doc note saying so.
+today (Verified), so there is no code for it yet. The production refresh
+closure renews the PRIMARY account and carries a note that it MUST NOT be used
+for a depth-account socket, which needs its own re-read-only closure.
 
 **Out of scope, stated.** A rejection at the HTTP upgrade arrives as a failed
 dial (`DialFailed`), which does not refresh; this change does not alter it.

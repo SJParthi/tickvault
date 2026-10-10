@@ -147,27 +147,42 @@ fn stale_credential_failure_pages(err: &ApplicationError, dialled: u64, current:
     current == dialled && !is_deferred_renewal_failure(err)
 }
 
+/// 808 refresh-once (scope lock 2026-10-06): reason PREFIX of a renewal
+/// result answered from [`RENEW_FAILURE_REUSE_MS`]'s record instead of a
+/// request. It carries no new evidence about the token, so
+/// [`is_deferred_renewal_failure`] counts it as a deferral: one real failure
+/// is one strike, however many sockets read it back. The original reason
+/// follows the prefix.
+pub(crate) const RENEW_FAILURE_REUSED_REASON_PREFIX: &str =
+    "renew-reused: a renewal for this token ended moments ago";
+
 /// 808 refresh-once (scope lock 2026-10-06). Pure, O(1). True iff a renewal
-/// failure is a DEFERRAL, not a real failure: the mint-cooldown skip or the
-/// RESILIENCE-03 lock refusal. Prefix-anchored on our own literals, never a
-/// scan of a server body (SEC-R2-2). The feed's refresh closure uses it to
-/// report a deferral, which does not count toward the 808 park.
+/// failure is a DEFERRAL, not a real failure: the mint-cooldown skip, the
+/// RESILIENCE-03 lock refusal, or a result reused from a renewal that just
+/// ended. Prefix-anchored on our own literals, never a scan of a server body
+/// (SEC-R2-2). The feed's refresh closure uses it to report a deferral, which
+/// does not count toward the 808 park.
 #[must_use]
 pub fn is_deferred_renewal_failure(err: &ApplicationError) -> bool {
     match err {
         ApplicationError::AuthenticationFailed { reason } => {
             reason.starts_with(MINT_COOLDOWN_REFUSAL_REASON_PREFIX)
                 || reason.starts_with(RESILIENCE03_MINT_REFUSAL_REASON_PREFIX)
+                || reason.starts_with(RENEW_FAILURE_REUSED_REASON_PREFIX)
         }
         _ => false,
     }
 }
 
-/// 808 refresh-once (scope lock 2026-10-06): how long an outright
-/// stale-credential renewal failure is reused for later callers that saw the
-/// same token generation. Ten seconds covers a sixteen-socket burst (5 s
-/// floor plus at most 375 ms jitter, then the queue on the gate) and is far
-/// below the 125 s mint cooldown, so a real retry is never held back by it.
+/// 808 refresh-once (scope lock 2026-10-06): how long a failed
+/// stale-credential renewal (outright, or deferred by the mint cooldown or
+/// the RESILIENCE-03 lock) is reused for later callers that saw the same
+/// token generation. Ten seconds covers a sixteen-socket burst (5 s floor
+/// plus at most 375 ms jitter, then the queue on the gate). A caller inside
+/// the window gets the recorded result back as a DEFERRAL and sends nothing;
+/// the first caller after it sends a real request. So a retry IS held back
+/// for up to ten seconds, which is far below the 125 s mint cooldown and
+/// the 300 s 808 episode bound that covers deferrals.
 pub const RENEW_FAILURE_REUSE_MS: u64 = 10_000;
 
 /// R3 (2026-10-01). True exactly once per token `generation`. O(1),
@@ -298,12 +313,12 @@ pub struct TokenManager {
     /// failure paged (0 = never). One page per dead token, not one per socket:
     /// sixteen sockets told 807 on the same token share one generation.
     stale_credential_paged_generation: std::sync::atomic::AtomicU64,
-    /// 808 refresh-once (scope lock 2026-10-06): the last OUTRIGHT failure
-    /// of a stale-credential renewal — `(seen generation, when, reason)`.
-    /// Sixteen sockets rejected together queue on [`Self::renew_gate`]; once
-    /// the first one's renewal fails, the rest reuse that failure for
-    /// [`RENEW_FAILURE_REUSE_MS`] instead of each sending their own renewal
-    /// and login. Only [`Self::force_renewal_unless_replaced`] reads or
+    /// 808 refresh-once (scope lock 2026-10-06): the last failed
+    /// stale-credential renewal, outright or deferred — `(seen generation,
+    /// when, redacted reason)`. Sixteen sockets rejected together queue on
+    /// [`Self::renew_gate`]; once the first one's renewal fails, the rest
+    /// reuse that result for [`RENEW_FAILURE_REUSE_MS`] (as a deferral)
+    /// instead of each sending their own renewal and login. Only [`Self::force_renewal_unless_replaced`] reads or
     /// writes it. Cold path: one lock per post-disconnect refresh.
     recent_stale_failure: std::sync::Mutex<Option<(u64, std::time::Instant, String)>>,
 }
@@ -1374,11 +1389,12 @@ impl TokenManager {
     /// credential belongs to; if the token has moved on since, nothing is
     /// renewed and the caller simply presents the newer token.
     ///
-    /// `reuse_recent_failure` (808 refresh-once, 2026-10-06): when true, an
-    /// outright failure for this same generation less than
-    /// [`RENEW_FAILURE_REUSE_MS`] old is returned again without a request,
-    /// and a fresh outright failure is recorded for the next caller. Only the
-    /// stale-credential path passes true.
+    /// `reuse_recent_failure` (808 refresh-once, 2026-10-06): when true, a
+    /// failure (outright or deferred) for this same generation less than
+    /// [`RENEW_FAILURE_REUSE_MS`] old is returned again, prefixed with
+    /// [`RENEW_FAILURE_REUSED_REASON_PREFIX`] so it reads as a deferral,
+    /// without a request; a new failure is recorded (redacted) for the next
+    /// caller. Only the stale-credential path passes true.
     async fn renew_with_fallback_since(
         &self,
         seen_generation: u64,
@@ -1406,18 +1422,22 @@ impl TokenManager {
             tracing::debug!(
                 seen_generation,
                 "token renewal skipped — a renewal for this same token failed moments ago, \
-                 so its failure is reused instead of sending another request"
+                 so its result is reused (as a deferral) instead of sending another request"
             );
-            return Err(ApplicationError::AuthenticationFailed { reason });
+            return Err(ApplicationError::AuthenticationFailed {
+                reason: format!("{RENEW_FAILURE_REUSED_REASON_PREFIX} — {reason}"),
+            });
         }
         let result = self.renew_or_mint().await;
-        if reuse_recent_failure
-            && let Err(err) = &result
-            && !is_deferred_renewal_failure(err)
-        {
+        if reuse_recent_failure && let Err(err) = &result {
+            // Stored redacted and bounded: the reason is logged again by
+            // every socket that reuses it. The redaction keeps our own
+            // prefixes (no URL, no token in them) at the front.
             let reason = match err {
-                ApplicationError::AuthenticationFailed { reason } => reason.clone(),
-                other => other.to_string(),
+                ApplicationError::AuthenticationFailed { reason } => {
+                    capture_rest_error_body(reason)
+                }
+                other => capture_rest_error_body(&other.to_string()),
             };
             *self
                 .recent_stale_failure
@@ -1428,7 +1448,7 @@ impl TokenManager {
         result
     }
 
-    /// The reason of an outright stale-credential renewal failure for
+    /// The reason of a failed stale-credential renewal for
     /// `seen_generation` recorded less than [`RENEW_FAILURE_REUSE_MS`] ago.
     /// O(1): one lock, one compare, one clone of a short string on a hit.
     fn recent_failure_for(&self, seen_generation: u64) -> Option<String> {
@@ -2372,6 +2392,9 @@ mod tests {
         assert!(is_deferred_renewal_failure(&auth(format!(
             "{RESILIENCE03_MINT_REFUSAL_REASON_PREFIX} — refused"
         ))));
+        assert!(is_deferred_renewal_failure(&auth(format!(
+            "{RENEW_FAILURE_REUSED_REASON_PREFIX} — generateAccessToken HTTP 500"
+        ))));
         assert!(!is_deferred_renewal_failure(&auth(
             "generateAccessToken HTTP 500".to_string()
         )));
@@ -2428,7 +2451,11 @@ mod tests {
                 matches!(reused, ApplicationError::AuthenticationFailed { .. }),
                 "{reused:?}"
             );
-            assert!(!is_deferred_renewal_failure(&reused));
+            assert!(
+                is_deferred_renewal_failure(&reused),
+                "a reused result is no new evidence: it must read as a deferral, or one \
+                 real failure counts as many strikes"
+            );
         }
         assert_eq!(
             hits.load(std::sync::atomic::Ordering::SeqCst),
@@ -2458,6 +2485,51 @@ mod tests {
             manager
                 .recent_failure_for(dialled.wrapping_add(7))
                 .is_none()
+        );
+        server.abort();
+    }
+
+    /// 808 refresh-once (2026-10-06, review fix): a renewal DEFERRED by the
+    /// mint cooldown is shared too, so while the cooldown holds sixteen
+    /// sockets send one RenewToken per window, not one each. The reused
+    /// answer stays a deferral.
+    #[tokio::test]
+    async fn test_stale_renewal_deferral_is_reused_within_the_window() {
+        let (url, hits, server) = start_counting_mock_server(r#"{"unexpected":true}"#).await;
+        let initial = DhanAuthResponseData {
+            access_token: "old-jwt".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86400,
+        };
+        let manager = make_mock_manager(&url, &url, Some(TokenState::from_response(&initial)));
+        // A mint attempt just happened: the fallback login is held back.
+        *manager
+            .last_mint_attempt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::time::Instant::now());
+        let dialled = manager.renew_generation();
+
+        let first = manager
+            .force_renewal_unless_replaced(dialled)
+            .await
+            .expect_err("the renewal fails and the login is deferred");
+        assert!(is_deferred_renewal_failure(&first), "{first:?}");
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one RenewToken, no login"
+        );
+        for _ in 0..15 {
+            let reused = manager
+                .force_renewal_unless_replaced(dialled)
+                .await
+                .expect_err("the deferral is reused");
+            assert!(is_deferred_renewal_failure(&reused), "{reused:?}");
+        }
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the other fifteen sockets must not each send a RenewToken"
         );
         server.abort();
     }

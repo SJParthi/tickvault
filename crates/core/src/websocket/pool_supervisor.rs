@@ -122,9 +122,12 @@ pub const AUTH_REJECT_EPISODE_MAX_MS: u64 = 300_000;
 /// counted over, per slot.
 pub const AUTH_REJECT_WINDOW_MS: u64 = 300_000;
 
-/// 808 refresh-once: at most this many 808 refreshes per slot inside
-/// [`AUTH_REJECT_WINDOW_MS`]; the next 808 inside the window parks. Bounds an
-/// account that accepts each fresh token briefly and then rejects it again.
+/// 808 refresh-once: at most this many 808 refreshes that PRODUCED A FRESH
+/// TOKEN per slot inside [`AUTH_REJECT_WINDOW_MS`]; the next 808 inside the
+/// window parks. Bounds an account that accepts each fresh token briefly and
+/// then rejects it again. Deferred or failed refreshes are not counted here;
+/// [`AUTH_REJECT_EPISODE_MAX_MS`] and [`AUTH_REJECT_MAX_HARD_FAILURES`] bound
+/// them.
 pub const AUTH_REJECT_MAX_REFRESHES_PER_WINDOW: usize = 4;
 
 const _: () = assert!(
@@ -4016,9 +4019,10 @@ pub struct ConnectionSupervisor {
     /// only on the disconnect, backoff, park and refresh paths, never per
     /// frame.
     auth_reject: Option<AuthRejectEpisode>,
-    /// When this slot's recent 808 refreshes were scheduled, newest
-    /// overwriting oldest: a fixed ring, never a `Vec`. Bounds the refreshes
-    /// per [`AUTH_REJECT_WINDOW_MS`]. Survives episode ends on purpose.
+    /// When this slot's recent 808 refreshes produced a fresh token, newest
+    /// overwriting oldest: a fixed ring, never a `Vec`. Bounds those
+    /// refreshes per [`AUTH_REJECT_WINDOW_MS`]. Written only by
+    /// `note_token_refresh` on `Fresh`. Survives episode ends on purpose.
     auth_reject_refreshes: [Option<Instant>; AUTH_REJECT_MAX_REFRESHES_PER_WINDOW],
     /// Next write position in [`Self::auth_reject_refreshes`].
     auth_reject_cursor: u8,
@@ -4634,7 +4638,10 @@ impl ConnectionSupervisor {
             verified_generation: None,
         });
         // (c) Refresh ceiling: the ring is full and its oldest entry is still
-        // inside the window, so this would be refresh number five.
+        // inside the window, so four refreshes already produced a fresh token
+        // that was then rejected again. Only a refresh that produced a new
+        // generation is charged to the ring (`note_token_refresh`), so a run
+        // of deferred refreshes never reaches this; (d) bounds those.
         let cursor = usize::from(self.auth_reject_cursor) % AUTH_REJECT_MAX_REFRESHES_PER_WINDOW;
         let window = Duration::from_millis(AUTH_REJECT_WINDOW_MS);
         if let Some(oldest) = self.auth_reject_refreshes[cursor]
@@ -4675,10 +4682,8 @@ impl ConnectionSupervisor {
             );
             return self.park(ParkReason::FatalDisconnect, now);
         }
-        // (e) Refresh once, then redial on the shared token floor.
-        self.auth_reject_refreshes[cursor] = Some(now);
-        self.auth_reject_cursor =
-            u8::try_from((cursor + 1) % AUTH_REJECT_MAX_REFRESHES_PER_WINDOW).unwrap_or(0);
+        // (e) Refresh once, then redial on the shared token floor. The ring
+        // is charged later, and only if the refresh produced a fresh token.
         let (delay, verdict) = self.token_floor_delay(now);
         error!(
             code = ErrorCode::WsGapDisconnectClassification.code_str(),
@@ -4736,7 +4741,17 @@ impl ConnectionSupervisor {
             return Some(self.park(ParkReason::FatalDisconnect, now));
         }
         match report.outcome {
-            TokenRefreshOutcome::Fresh { current } => episode.verified_generation = Some(current),
+            TokenRefreshOutcome::Fresh { current } => {
+                episode.verified_generation = Some(current);
+                // Charge the per-window ceiling (c) for a refresh that
+                // produced a new generation, and only for that one: a
+                // deferral or a failure is bounded by (d) instead.
+                let cursor =
+                    usize::from(self.auth_reject_cursor) % AUTH_REJECT_MAX_REFRESHES_PER_WINDOW;
+                self.auth_reject_refreshes[cursor] = Some(now);
+                self.auth_reject_cursor =
+                    u8::try_from((cursor + 1) % AUTH_REJECT_MAX_REFRESHES_PER_WINDOW).unwrap_or(0);
+            }
             TokenRefreshOutcome::Deferred => {}
             TokenRefreshOutcome::Failed | TokenRefreshOutcome::NotAttempted => {
                 episode.hard_failures = episode.hard_failures.saturating_add(1);
@@ -12115,6 +12130,56 @@ mod tests {
         assert_parked_fatal(&s, &action);
     }
 
+    /// Review fix (2026-10-06): at REAL redial cadence (808s 5 s apart,
+    /// the token floor) a run of deferred refreshes must not trip the
+    /// per-window ceiling; only the episode age parks it, at 300 s.
+    #[test]
+    fn test_808_deferrals_at_real_cadence_park_only_at_the_episode_bound() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+        let step = Duration::from_millis(TOKEN_STALE_REDIAL_FLOOR_MS);
+        let mut at = now;
+        let mut refreshes = 0u32;
+        while at.saturating_duration_since(now) < Duration::from_millis(AUTH_REJECT_EPISODE_MAX_MS)
+        {
+            dial_no_frames(&mut s, at);
+            let action = close_808(&mut s, at);
+            assert!(
+                matches!(action, SupervisorAction::RefreshTokenThenDial { .. }),
+                "deferred refresh {refreshes} parked before the episode bound: {action:?}"
+            );
+            assert_eq!(
+                s.note_token_refresh(refresh_report(0, TokenRefreshOutcome::Deferred), at),
+                None
+            );
+            refreshes += 1;
+            at += step;
+        }
+        assert_eq!(refreshes, 60, "300 s of 808s, 5 s apart");
+        // At the bound: the park is (d) "refresh unavailable", not the
+        // ceiling — no deferred refresh was ever charged to the ring.
+        assert!(s.auth_reject_refreshes.iter().all(Option::is_none));
+        dial_no_frames(&mut s, at);
+        let action = close_808(&mut s, at);
+        assert_parked_fatal(&s, &action);
+    }
+
+    /// Review fix (2026-10-06): one real failure followed by a reused one
+    /// (reported as Deferred by the closure) is ONE hard strike.
+    #[test]
+    fn test_808_reused_failure_is_not_a_second_hard_strike() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+        dial_no_frames(&mut s, now);
+        assert_refresh(&close_808(&mut s, now));
+        let _ = s.note_token_refresh(refresh_report(0, TokenRefreshOutcome::Failed), now);
+        let later = now + Duration::from_millis(TOKEN_STALE_REDIAL_FLOOR_MS);
+        dial_no_frames(&mut s, later);
+        assert_refresh(&close_808(&mut s, later));
+        let _ = s.note_token_refresh(refresh_report(0, TokenRefreshOutcome::Deferred), later);
+        assert_eq!(s.auth_reject.map(|e| e.hard_failures), Some(1));
+    }
+
     #[test]
     fn test_stacked_data_then_808_does_not_clear_the_episode() {
         let now = t0();
@@ -12500,15 +12565,6 @@ mod tests {
                     continue;
                 }
                 if let SupervisorAction::RefreshTokenThenDial { .. } = action {
-                    if code == Some(DisconnectCode::AuthenticationFailed) {
-                        refreshes.push(at);
-                        let window = Duration::from_millis(AUTH_REJECT_WINDOW_MS);
-                        let in_window = refreshes
-                            .iter()
-                            .filter(|t| at.saturating_duration_since(**t) < window)
-                            .count();
-                        prop_assert!(in_window <= AUTH_REJECT_MAX_REFRESHES_PER_WINDOW);
-                    }
                     if sibling_renewed {
                         generation += 1;
                     }
@@ -12528,10 +12584,22 @@ mod tests {
                         };
                         refresh_report(presented, outcome)
                     };
+                    let is_808 = code == Some(DisconnectCode::AuthenticationFailed);
+                    let fresh = matches!(report.outcome, TokenRefreshOutcome::Fresh { .. });
                     if let Some(park) = s.note_token_refresh(report, at) {
                         let is_park = matches!(park, SupervisorAction::Park { .. });
                         prop_assert!(is_park, "a refresh report only ever parks");
                         parked = true;
+                    } else if is_808 && fresh {
+                        // Only an 808 refresh that produced a fresh token is
+                        // bounded per window.
+                        refreshes.push(at);
+                        let window = Duration::from_millis(AUTH_REJECT_WINDOW_MS);
+                        let in_window = refreshes
+                            .iter()
+                            .filter(|t| at.saturating_duration_since(**t) < window)
+                            .count();
+                        prop_assert!(in_window <= AUTH_REJECT_MAX_REFRESHES_PER_WINDOW);
                     }
                 }
             }
