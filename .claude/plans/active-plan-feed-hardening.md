@@ -6322,16 +6322,41 @@ Boot after midnight (no file for today) uses the newest earlier day within 7; no
 ### Test Plan (Item 53)
 Unit tests for classification, plan totals, refusal rules, report cap and the tf/code lockstep; binary tests for flag parsing and refusals. The dry run on the real bucket is the end-to-end check before apply.
 
+### Rollback (Item 53)
+Nothing is deleted until apply. Deleted versions cannot be restored; that is the owner's stated intent. The role is removed by 53b.
+
+### Observability (Item 53)
+The job summary and an uploaded artifact carry the per-group report before and after the delete, including every kept-unparsed key (up to 50).
+
+## ITEM 54 — CONTRACT NAMES ON REBUILT ROWS (added 2026-10-10, operator: "Check whether other contracts have the same gaps. Zero tick loss is the rule, so fix and backfill automatically."): rebuilt rows lost their contract name
+
+- [x] Publish every option name (not only spot names) at boot, before the seal writer's boot drain and again before the lane's frame-log replay, from the newest day with a file within 7 days; the attach still owns the table once it publishes
+  - Files: crates/app/src/dhan_contract_universe.rs, crates/app/src/main.rs
+  - Tests: test_regression_option_labels_from_names_every_option_like_the_attach, test_option_labels_from_is_not_capped, test_option_labels_from_an_empty_file_is_empty, test_regression_newest_readable_day_steps_back_to_the_last_built_day, newest_readable_day_stops_at_the_lookback, test_boot_publish_wins_truth_table, day_key_packs_the_date_and_refuses_garbage, publish_contract_labels_at_boot_publishes_nothing_without_an_artifact
+- [x] Restore the blanked names automatically: once a day after the close (15:45 IST onward), for today and the 7 days before it whose contract files are still kept, re-insert every `dhan` row with a NULL `contract` whose `(security_id, segment)` that day's files name, with its name, through the table's own DEDUP key (QuestDB 9.3.5 refuses `UPDATE … FROM` on WAL tables). Candle tables, `ticks`, `feed_aux_packets`; not `market_depth`. A table without DEDUP is skipped. Covers 9 Oct from the run after the Monday 12 Oct deploy.
+  - Files: crates/storage/src/contract_name_repair.rs, crates/storage/src/lib.rs, crates/storage/src/partition_manager.rs, crates/storage/tests/contract_name_repair_live.rs, crates/app/src/contract_name_repair_boot.rs, crates/app/src/dhan_contract_universe.rs, crates/app/src/lib.rs, crates/app/src/main.rs
+  - Tests: test_repair_insert_sql_copies_every_column_and_names_only_blank_dhan_rows, test_repair_insert_sql_refuses_a_table_missing_a_join_column, test_map_insert_sql_escapes_quotes_and_stamps_the_day, test_map_insert_sql_batch_stays_under_the_request_buffer, test_map_table_ddl_has_dedup_with_feed, test_count_and_repair_share_one_row_source, test_parsers_read_questdb_answers, test_is_valid_day_accepts_only_iso_dates, test_repair_is_due_only_after_the_close_and_once_a_day, test_repair_days_covers_the_incident_day_from_the_next_deploy, test_repair_tables_include_candles_ticks_and_aux_but_not_depth, contract_names_for_day_is_none_without_that_days_symbol_map, repair_names_blank_rows_in_place_and_leaves_everything_else (ignored; run against a local QuestDB 9.3.5 on 2026-10-10, passed)
+
+## Design (Item 54)
+
+Cause (inferred from the box logs and the code, not yet confirmed by a database query): the 9 Oct evening redeploys replayed the day's frame log and drained the spilled seals while the name table held only the 862 spot names (the boot published spots only; options arrived with the attach about 17 minutes later). Each rewritten option row was written without `contract`, and the DEDUP UPSERT replaced the named row whole, so `WHERE contract = 'ITC-27Oct2026-255-CE'` stopped matching rows that are still there. Fix: `publish_contract_labels_at_boot` adds `option_labels_from` (every OPTIDX/OPTSTK row of the contract file, uncapped, the same label as the attach) and runs twice, first just before `spawn_seal_writer_loop` and again before `spawn_dhan_feed_stack`. `boot_publish_wins` decides a replace: never after the attach, never empty, newer day wins, same day only a larger table. O(rows) once per boot call, cold.
+
+## Edge Cases (Item 54)
+
+Boot after midnight (no file for today) uses the newest earlier day within 7; no file in the window publishes nothing (column stays as it is); a contract file that becomes readable between the two boot calls replaces the smaller table; the attach running later replaces the boot table as before. BSE options and zero ids are skipped, as in the attach. Repair: a day whose files are gone (kept 7 days) is never tried; a day with a symbol map but no contract file names spots only; an id no file names stays NULL; rows of another feed are never touched; a second run finds nothing (the count is 0, no statement runs); a row still unapplied in the WAL is picked up by the next day's run if its files are still kept.
+
+## Failure Modes (Item 54)
+
 A derivative id reassigned overnight would carry the newer day's name when an older day's frames are replayed after the newer file exists (the attach has the same limit). An unreadable contract file publishes spot names only, as before. A boot table never overwrites the attach's (the flag is set before the attach publishes; both boot calls run before the lane starts). Repair: a suspended name table, a refused statement or no answer within 600 s leaves the day for the next run and is counted (`tv_contract_name_repair_runs_total{outcome="partial"}`); a table without DEDUP or WAL, or missing one of the five join columns, is skipped and logged, never written (a re-insert there would duplicate rows). A day already copied to the cold bucket keeps blank names in that copy. A boot still replaying its frame log can rewrite a row the repair just read; both carry the same values and a name.
 
-## Test Plan (Item 53)
+## Test Plan (Item 54)
 
 `cargo test -p tickvault-app --lib -- dhan_contract_universe` (98 passed), `cargo clippy -p tickvault-app --no-deps -- -D warnings -W clippy::perf` clean. Repair: the SQL builders and the schedule are unit-tested; `contract_name_repair_live` (ignored, needs QuestDB) builds a table with a blank row, a named row, an unnamed id, another feed and another day, runs the repair, and checks only the blank row changed, with every value kept, and that a second run is clean (passed on a local QuestDB 9.3.5, 2026-10-10).
 
-## Rollback (Item 53)
+## Rollback (Item 54)
 
 Revert the PR: the boot publishes spot names only again and the after-close repair stops. Names the repair already wrote stay (they are the names the rows had before the redeploys); `contract_name_repair_map` can be dropped.
 
-## Observability (Item 53)
+## Observability (Item 54)
 
 Two `info!` lines at boot (count and the day the names came from); the existing `tv_candle_contract_labels_published` gauge reads the full count from the first boot call instead of 862. Repair: one `info!` per day checked (names, rows restored, tables repaired, clean, skipped, failures) and one per run; counters `tv_contract_name_repair_rows_total` and `tv_contract_name_repair_runs_total{outcome}`. Statement failures are `warn!` (nothing is lost: the rows and their values stay; only the name is still missing). No page, alarm, EMF name or filter.
