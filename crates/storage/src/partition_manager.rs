@@ -140,6 +140,10 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // partition loses nothing that `ws_event_audit` and `feed_episode_audit`
     // do not still hold.
     "ws_connection_daily",
+    // (2026-10-10, item 53) the per-day name list the after-close name
+    // repair joins against. Not market data and not an audit record: an
+    // aged-out day only loses names already written back into the tables.
+    "contract_name_repair_map",
     // (2026-10-02) one row per live-feed reconnect gap, paired from the
     // `ws_event_audit` lifecycle rows by the app forwarder. Same SEBI-audit
     // class + DAY partitioning; `feed` is in the DEDUP key.
