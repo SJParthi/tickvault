@@ -39,9 +39,9 @@ use crate::daily_task_marker::{
     try_write_daily_marker_keeping,
 };
 use crate::dhan_live_crossverify::{
-    DayComparison, DhanLiveCrossverifyConfig, RUN_SECS_OF_DAY_IST, RunReport,
+    AttemptStamp, DayComparison, DhanLiveCrossverifyConfig, RUN_SECS_OF_DAY_IST, RunReport,
     SESSION_CLOSE_SECS_OF_DAY_IST, XverifyTarget, daily_row, deterministic_run_ts_nanos,
-    run_cross_verification,
+    fetched_at_ist_nanos_now, run_cross_verification,
 };
 use crate::shutdown_class::{
     SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST, SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST,
@@ -1265,7 +1265,10 @@ async fn run_once(
                 missing_live = c.missing_live,
                 missing_live_traded = c.missing_live_traded,
                 missing_rest = c.missing_rest,
-                tail_unsealed = c.tail_unsealed,
+                late_excused = c.late_excused,
+                missing_live_late = c.missing_live_late,
+                missing_live_unjudged = c.missing_live_unjudged,
+                missing_judgeable = c.missing_judgeable.as_str(),
                 out_of_session = c.out_of_session,
                 noise_p50_paise = c.noise_p50_paise,
                 noise_p95_paise = c.noise_p95_paise,
@@ -1282,13 +1285,24 @@ async fn run_once(
                 vacuous = c.is_vacuous(),
                 "Dhan 1-minute cross-verification finished"
             );
-            let persisted = persist_report(
-                &deps.questdb,
-                &report,
-                day_start_ist_nanos,
-                cfg.tolerance_paise,
-                deadline,
+            let complete = run_is_complete(
+                report.budget_elapsed,
+                report.live_truncated,
+                report.rest_failures,
+                targets.len(),
             );
+            // §12.15.9 review: one wall-clock reading per attempt, written on
+            // its daily row and every cell, so the day's latest attempt and
+            // its own findings can be told apart from an earlier attempt's.
+            let rows = PersistRows {
+                day_start_ist_nanos,
+                tolerance_paise: cfg.tolerance_paise,
+                attempt: AttemptStamp {
+                    at_ist_nanos: fetched_at_ist_nanos_now(),
+                    run_complete: complete,
+                },
+            };
+            let persisted = persist_report(&deps.questdb, &report, rows, deadline);
             let persist = persist_verdict(&persisted);
             let persisted_ok = persist.is_ok();
             if is_catastrophic_divergence(c) && !divergence_paged.swap(true, Ordering::Relaxed) {
@@ -1307,12 +1321,6 @@ async fn run_once(
                      as untrustworthy until this is explained."
                 );
             }
-            let complete = run_is_complete(
-                report.budget_elapsed,
-                report.live_truncated,
-                report.rest_failures,
-                targets.len(),
-            );
             let verdict =
                 classify_attempt(c.is_vacuous(), c.outcome.is_measured(), persist, complete);
             // The marker condition must stay exactly `should_write_marker`
@@ -1457,21 +1465,28 @@ fn flush_fits(
         .is_some_and(|end| end <= deadline)
 }
 
+/// What the spot persist stamps on its rows: the day, the applied tolerance,
+/// and the attempt that wrote them (§12.15.9 review).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PersistRows {
+    day_start_ist_nanos: i64,
+    tolerance_paise: i64,
+    attempt: AttemptStamp,
+}
+
 /// Persists the run through the production writer, in batches of
 /// [`PERSIST_BATCH_ROWS`], stopping at `deadline`. See [`persist_report_into`].
 fn persist_report(
     questdb: &QuestDbConfig,
     report: &RunReport,
-    day_start_ist_nanos: i64,
-    tolerance_paise: i64,
+    rows: PersistRows,
     deadline: tokio::time::Instant,
 ) -> PersistOutcome {
     let mut writer = DhanLiveXverifyAuditWriter::new(questdb);
     persist_report_into(
         &mut writer,
         report,
-        day_start_ist_nanos,
-        tolerance_paise,
+        rows,
         PERSIST_BATCH_ROWS,
         deadline,
         tokio::time::Instant::now,
@@ -1502,8 +1517,7 @@ fn persist_report(
 fn persist_report_into(
     writer: &mut DhanLiveXverifyAuditWriter,
     report: &RunReport,
-    day_start_ist_nanos: i64,
-    tolerance_paise: i64,
+    rows: PersistRows,
     batch_rows: usize,
     deadline: tokio::time::Instant,
     mut now: impl FnMut() -> tokio::time::Instant,
@@ -1569,7 +1583,10 @@ fn persist_report_into(
             stop_at_deadline(writer, &mut out, total - appended);
             return finish_persist(report, out, batch_errors, None);
         }
-        if writer.append_cell(finding).is_err() {
+        if writer
+            .append_cell(finding, rows.attempt.at_ist_nanos)
+            .is_err()
+        {
             out.cell_append_errors = out.cell_append_errors.saturating_add(1);
         }
         appended += 1;
@@ -1597,9 +1614,10 @@ fn persist_report_into(
     }
     let daily = daily_row(
         c,
-        day_start_ist_nanos,
-        deterministic_run_ts_nanos(day_start_ist_nanos),
-        tolerance_paise,
+        rows.day_start_ist_nanos,
+        deterministic_run_ts_nanos(rows.day_start_ist_nanos),
+        rows.tolerance_paise,
+        rows.attempt,
     );
     out.daily_appended = writer.append_daily(&daily).is_ok();
     if !flush_fits(writer, now(), deadline) {
@@ -1972,8 +1990,15 @@ fn persist_option_findings(
     deadline: tokio::time::Instant,
 ) -> bool {
     let mut writer = DhanLiveXverifyAuditWriter::new(questdb);
-    persist_option_findings_into(&mut writer, report, deadline, tokio::time::Instant::now)
-        == OptionPersist::Flushed
+    // One reading for the pass (§12.15.9 review), as the spot persist does.
+    let attempt_at_ist_nanos = fetched_at_ist_nanos_now();
+    persist_option_findings_into(
+        &mut writer,
+        report,
+        attempt_at_ist_nanos,
+        deadline,
+        tokio::time::Instant::now,
+    ) == OptionPersist::Flushed
 }
 
 /// What the option persist did (§12.15.8).
@@ -1992,6 +2017,7 @@ enum OptionPersist {
 fn persist_option_findings_into(
     writer: &mut DhanLiveXverifyAuditWriter,
     report: &RunReport,
+    attempt_at_ist_nanos: i64,
     deadline: tokio::time::Instant,
     mut now: impl FnMut() -> tokio::time::Instant,
 ) -> OptionPersist {
@@ -2019,7 +2045,7 @@ fn persist_option_findings_into(
             stopped = true;
             break;
         }
-        if writer.append_cell(finding).is_err() {
+        if writer.append_cell(finding, attempt_at_ist_nanos).is_err() {
             row_errors = row_errors.saturating_add(1);
         }
         appended += 1;
@@ -2103,6 +2129,64 @@ fn persist_option_findings_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The attempt stamp the persist tests write (§12.15.9 review).
+    const TEST_ATTEMPT_AT: i64 = 9;
+
+    fn test_rows() -> PersistRows {
+        PersistRows {
+            day_start_ist_nanos: 0,
+            tolerance_paise: 5,
+            attempt: AttemptStamp {
+                at_ist_nanos: TEST_ATTEMPT_AT,
+                run_complete: true,
+            },
+        }
+    }
+
+    /// §12.15.9 review: every attempt writes its daily row at the same
+    /// deterministic `ts` and `outcome` is in the DEDUP key, so an incomplete
+    /// attempt (say `diverged`, a sealed bar still unapplied) and its complete
+    /// retry (`partial`) leave two rows. Each attempt reads the clock ONCE,
+    /// before its persist, and stamps that reading on its daily row and on
+    /// every cell; `run_complete` on the row is the same `run_is_complete`
+    /// value the marker decision uses. The option pass stamps its cells too.
+    #[test]
+    fn test_every_persisted_row_carries_one_attempt_stamp_and_the_run_complete_flag() {
+        let prod = prod_src();
+        let run_once = fn_body(prod, "async fn run_once(");
+        assert_eq!(
+            run_once.matches("fetched_at_ist_nanos_now()").count(),
+            1,
+            "one clock reading per attempt"
+        );
+        assert_eq!(
+            run_once.matches("run_is_complete(").count(),
+            1,
+            "the stamped flag and the marker decision must be one value"
+        );
+        let stamp = run_once
+            .find("run_complete: complete")
+            .expect("stamped flag");
+        let persist = run_once.find("persist_report(").expect("persist call");
+        let verdict = run_once.find("classify_attempt(").expect("marker decision");
+        assert!(
+            stamp < persist && persist < verdict,
+            "stamp, persist, then decide"
+        );
+        assert!(run_once[verdict..].contains("persist, complete)"));
+
+        let into = fn_body(prod, "fn persist_report_into(");
+        assert!(into.contains("append_cell(finding, rows.attempt.at_ist_nanos)"));
+        assert!(
+            into.contains("rows.attempt,"),
+            "the daily row takes the same stamp"
+        );
+        let options = fn_body(prod, "fn persist_option_findings(");
+        assert_eq!(options.matches("fetched_at_ist_nanos_now()").count(), 1);
+        let options_into = fn_body(prod, "fn persist_option_findings_into(");
+        assert!(options_into.contains("append_cell(finding, attempt_at_ist_nanos)"));
+    }
     use tickvault_storage::dhan_live_crossverify_persistence::DhanLiveXverifyOutcome;
 
     fn instrument(security_id: u64, segment: ExchangeSegment) -> SubscribeInstrument {
@@ -2125,6 +2209,10 @@ mod tests {
             missing_rest: 0,
             tail_unsealed: 0,
             out_of_session: 0,
+            missing_live_late: 0,
+            late_excused: 0,
+            missing_live_unjudged: 0,
+            missing_judgeable: crate::dhan_live_crossverify::MissingJudgeable::Judged,
             noise_p50_paise: 0,
             noise_p95_paise: 0,
             noise_max_paise: 0,
@@ -2583,7 +2671,7 @@ mod tests {
         let mut writer = DhanLiveXverifyAuditWriter::for_test();
         let t0 = tokio::time::Instant::now();
         let far = t0 + Duration::from_secs(86_400);
-        let out = persist_report_into(&mut writer, &report, 0, 5, 2, far, || t0);
+        let out = persist_report_into(&mut writer, &report, test_rows(), 2, far, || t0);
         assert!(!out.deadline_reached);
         assert_eq!(out.rows_not_written_at_deadline, 0);
         assert!(out.daily_appended);
@@ -2620,7 +2708,7 @@ mod tests {
         let report = report_with(5, 3);
         let mut writer = DhanLiveXverifyAuditWriter::for_test();
         let t0 = tokio::time::Instant::now();
-        let out = persist_report_into(&mut writer, &report, 0, 5, 2, t0, || t0);
+        let out = persist_report_into(&mut writer, &report, test_rows(), 2, t0, || t0);
         assert!(out.deadline_reached);
         assert!(!out.final_flush_ok);
         assert!(!out.daily_appended);
@@ -2652,7 +2740,7 @@ mod tests {
             at
         };
         let deadline = t0 + Duration::from_secs(7);
-        let out = persist_report_into(&mut writer, &report, 0, 5, 2, deadline, clock);
+        let out = persist_report_into(&mut writer, &report, test_rows(), 2, deadline, clock);
         assert_eq!(reads.get(), 3, "one reading per row until the stop");
         assert!(out.deadline_reached);
         // Rows 0 and 1 went in a failed batch flush (no sender), row 2 was
@@ -2679,7 +2767,7 @@ mod tests {
         let mut probe = DhanLiveXverifyAuditWriter::for_test();
         let mut stop_row = None;
         for (i, f) in report.comparison.findings.iter().enumerate() {
-            assert!(probe.append_cell(f).is_ok());
+            assert!(probe.append_cell(f, 0).is_ok());
             if probe.flush_worst_case() > room {
                 stop_row = Some(i + 1);
                 break;
@@ -2689,7 +2777,7 @@ mod tests {
         assert!(stop_row > 1 && stop_row < 4_000, "{stop_row}");
         let mut writer = DhanLiveXverifyAuditWriter::for_test();
         let t0 = tokio::time::Instant::now();
-        let out = persist_report_into(&mut writer, &report, 0, 5, 10_000, t0 + room, || t0);
+        let out = persist_report_into(&mut writer, &report, test_rows(), 10_000, t0 + room, || t0);
         assert!(out.deadline_reached, "{out:?}");
         assert_eq!(out.rows_abandoned_at_deadline, stop_row, "{out:?}");
         assert_eq!(out.rows_not_written_at_deadline, 4_001 - stop_row);
@@ -2698,7 +2786,7 @@ mod tests {
         // The same for the option persist.
         let mut writer = DhanLiveXverifyAuditWriter::for_test();
         assert_eq!(
-            persist_option_findings_into(&mut writer, &report, t0 + room, || t0),
+            persist_option_findings_into(&mut writer, &report, TEST_ATTEMPT_AT, t0 + room, || t0),
             OptionPersist::StoppedAtDeadline
         );
         assert_eq!(writer.pending(), 0);
@@ -2757,7 +2845,7 @@ mod tests {
                 t0 + Duration::from_millis(at_ms)
             };
             let deadline = t0 + Duration::from_millis(deadline_ms);
-            let out = persist_report_into(&mut writer, &report, 0, 5, batch, deadline, clock);
+            let out = persist_report_into(&mut writer, &report, test_rows(), batch, deadline, clock);
             proptest::prop_assert_eq!(
                 out.rows_flushed
                     + out.rows_discarded
@@ -2796,21 +2884,21 @@ mod tests {
         let mut w = DhanLiveXverifyAuditWriter::for_test();
         let empty = report_with(0, 0);
         assert_eq!(
-            persist_option_findings_into(&mut w, &empty, far, || t0),
+            persist_option_findings_into(&mut w, &empty, TEST_ATTEMPT_AT, far, || t0),
             OptionPersist::Flushed
         );
         assert_eq!(
-            persist_option_findings_into(&mut w, &empty, t0, || t0),
+            persist_option_findings_into(&mut w, &empty, TEST_ATTEMPT_AT, t0, || t0),
             OptionPersist::Flushed
         );
         let rows = report_with(4, 2);
         assert_eq!(
-            persist_option_findings_into(&mut w, &rows, t0, || t0),
+            persist_option_findings_into(&mut w, &rows, TEST_ATTEMPT_AT, t0, || t0),
             OptionPersist::StoppedAtDeadline
         );
         assert_eq!(w.pending(), 0);
         assert_eq!(
-            persist_option_findings_into(&mut w, &rows, far, || t0),
+            persist_option_findings_into(&mut w, &rows, TEST_ATTEMPT_AT, far, || t0),
             OptionPersist::Failed
         );
         assert_eq!(w.pending(), 0);
@@ -4010,7 +4098,7 @@ mod tests {
         // run_once is reached only through the driver.
         assert_eq!(prod.matches("run_once(deps,").count(), 1);
         let run_once = fn_body(prod, "async fn run_once(");
-        assert!(run_once.contains("cfg.tolerance_paise,\n                deadline,"));
+        assert!(run_once.contains("persist_report(&deps.questdb, &report, rows, deadline)"));
         assert!(!run_day.contains("now_ist_secs_of_day()"));
     }
 

@@ -127,3 +127,82 @@ after the limit. That the database client gives up at its request timeout
 plus the bytes at its minimum throughput is read from its source; that the
 HTTP timeout covers the whole request is assumed. The marker write is one
 small file and is not bounded on a stalled disk.
+
+## §4. 2026-10-06 — the verdict and the late window: columns and cell kinds (plan ITEM 51c)
+
+Authority: `no-rest-except-live-feed-2026-06-27.md` §12.15.9. No new log
+source, alarm, filter or page: the existing `finished` line of
+`crates/app/src/dhan_live_crossverify_boot.rs` carries the new counts, and
+`xverify_diverged` stays price-only.
+
+| Column / field / kind | Where | Means | Operator action |
+|---|---|---|---|
+| `late_excused` (LONG), cell kind `late_excused` | `dhan_live_crossverify_daily`, `dhan_live_crossverify_cell_audit`, `finished` line | a traded or index minute missing from our side inside the end-of-session window (`LATE_SEAL_WINDOW_MINUTES`, 15:35 to 15:39 today) that may not have sealed by the read; never real, holds the day at `partial` | none for one day; if it is non-zero most days, check the seal catch-up (plan item 51d judges these minutes once the read waits for the seal) |
+| `missing_live_unjudged` (LONG), cell kind `missing_live_unjudged` | same | the live read hit its row cap, so a missing traded or index minute could not be told from an unread one; never real, holds the day at `partial` | check that `live_truncated = true` on the `finished` line (and `missing_judgeable = live_truncated` on the daily row); a cap hit means the day's live rows outgrew the read cap |
+| `missing_judgeable` (SYMBOL: `judged` / `live_truncated`) | `dhan_live_crossverify_daily`, `finished` line | whether missing minutes were judged on this run | `live_truncated`: as the row above |
+| `missing_live_late` | `finished` line only | traded or index minutes missing in the late window, whatever the policy; a measurement for plan item 51d | none |
+| `tail_unsealed` column and kind | both tables | the old literal two-minute tail; written 0 from 2026-10-06 and kept for older rows | none |
+| `attempt_at` (TIMESTAMP), `run_complete` (BOOLEAN) | `dhan_live_crossverify_daily` (both), `dhan_live_crossverify_cell_audit` (`attempt_at`) | `attempt_at`: when the attempt that wrote the row persisted it, one reading per attempt; `run_complete`: at most 5% of that attempt's vendor fetches failed, the budget was not spent and the live read was not truncated | pick the day's final row and its cells with them (below) |
+
+**Behaviour change:** a day with a price difference or a judged missing traded
+or index minute now reads `diverged` even when a vendor fetch failed or the
+budget ran out (it read `partial`).
+
+**A day can have more than one daily row, and the same day's retry is the
+usual cause.** Every attempt writes its daily row at the same `ts`, and the
+daily DEDUP key includes `outcome`. An attempt that is not complete (more than
+5% of its vendor fetches failed, the budget ran out, or the live read was
+truncated) persists its rows and is retried; if the retry reads differently
+(for example `diverged` at 15:41 because one sealed bar was still waiting in
+QuestDB's WAL, then `partial` at 15:54 once it was readable) both rows stay.
+Cells the first attempt wrote and the retry did not (that missing minute) stay
+too. **A later attempt never outranks a `diverged` one** (§12.15.9, corrected
+2026-10-10): a retry can read lower for a bad reason, because a target whose
+vendor fetch fails on the retry adds only `missing_rest` and its divergence is
+simply not judged again. So first look for a `diverged` row, and only if there
+is none take the newest row:
+
+```sql
+-- 1. The day's verdict when any attempt read diverged (newest such attempt).
+SELECT * FROM dhan_live_crossverify_daily
+WHERE trading_date_ist = '<day>T00:00:00.000000Z' AND outcome = 'diverged'
+ORDER BY attempt_at DESC LIMIT 1;
+
+-- 2. Only when query 1 returns nothing: the newest attempt.
+SELECT * FROM dhan_live_crossverify_daily
+WHERE trading_date_ist = '<day>T00:00:00.000000Z'
+ORDER BY attempt_at DESC LIMIT 1;
+
+-- 3. The day's findings, whatever attempt wrote them (newest write first).
+SELECT * FROM dhan_live_crossverify_cell_audit
+WHERE trading_date_ist = '<day>T00:00:00.000000Z'
+  AND kind IN ('diverged', 'missing_live')
+ORDER BY attempt_at DESC;
+```
+
+When query 1 finds a `diverged` row and a newer row of the day reads
+`partial` or `clean`, read the newer row too: until plan item 51d, a sealed bar
+not yet readable at the first read makes a `diverged` that the retry no longer
+sees, and its missing cells name the minutes involved. A divergence in prices
+(`cells_diverged > 0`) does not come from an unreadable bar.
+
+`run_complete = false` on the chosen row means that attempt failed more than
+5% of its vendor fetches or was cut short, and no day marker was written for
+it. A row with a null `attempt_at` was written before 2026-10-06; for such a
+day, read every row. Do not pick a day's findings by matching `attempt_at`:
+neither key carries the attempt, so an attempt that finds a cell again
+overwrites it with its own stamp, two attempts with the same `outcome` share
+one daily row with the later stamp and counts, and a finding no later attempt
+re-found keeps an earlier stamp that may match no surviving daily row. A cell's
+`attempt_at` is the last attempt that wrote it. The option pass writes cells
+with its own `attempt_at` and no daily row. The queries are Assumed: they were not run against a live QuestDB
+when written.
+
+**A `diverged` day is not always packet loss (until plan item 51d).** A
+traded or index minute is also missing from our side when its sealed bar was
+not readable at the read (still queued for the seal writer, staged in a spill
+file not yet replayed, or not yet applied by QuestDB's WAL) or when the read
+skipped its row as malformed. Before treating a `diverged` day as lost ticks,
+check `malformed_rows` on the `finished` line, the WAL apply lag at the read
+and the spill directory for that day, then re-run the day once QuestDB has
+caught up.
