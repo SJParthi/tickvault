@@ -109,9 +109,10 @@ const INDEX_SEGMENT: &str = "IDX_I";
 /// the CAS window the migration was made for, were structurally unverifiable by
 /// the one check the scope-lock calls the revived feed's only ground truth.
 ///
-/// It also mis-aimed the tail amnesty: `is_tail_minute` derives from this
-/// constant, so it excused 15:28-15:29 while the genuinely-unsealed tail had
-/// moved to 15:38-15:39. Deriving the value below fixes both at once.
+/// It also mis-aimed the tail amnesty: the old `is_tail_minute` derived from
+/// this constant, so it excused 15:28-15:29 while the genuinely-unsealed tail
+/// had moved to 15:38-15:39. Deriving the value below fixed both at once.
+/// (`is_tail_minute` was replaced by `is_late_window_minute` in §12.15.9.)
 ///
 /// Now DERIVED from the canonical constant rather than restated, so a future
 /// session-hours change cannot leave this file behind again. The const assert
@@ -610,7 +611,8 @@ pub fn secs_of_day(minute_ts_ist_nanos: i64, day_start_ist_nanos: i64) -> i64 {
         .div_euclid(NANOS_PER_SEC)
 }
 
-/// `true` when the bucket lies inside `[09:15, 15:30)` IST. Pure.
+/// `true` when the bucket lies inside `[09:15, 15:40)` IST (the session
+/// close is `SESSION_CLOSE_SECS_OF_DAY_IST`). Pure.
 #[must_use]
 pub fn is_in_session(minute_ts_ist_nanos: i64, day_start_ist_nanos: i64) -> bool {
     let s = secs_of_day(minute_ts_ist_nanos, day_start_ist_nanos);
@@ -892,11 +894,11 @@ pub struct DayComparison {
     ///
     /// # What this split does NOT decide
     ///
-    /// It is a MEASUREMENT, not a verdict. The `outcome` logic is unchanged:
-    /// `missing_live` in total still counts as a real divergence, because
-    /// narrowing that to the traded half would be a behaviour change resting
-    /// on an assumption about vendor tape-filling that nothing here has
-    /// verified.
+    /// It is a MEASUREMENT, not a verdict. *(Corrected 2026-10-10: this said
+    /// "`missing_live` in total still counts as a real divergence". The
+    /// outcome counts only a missing minute that traded or is an index; a
+    /// zero-volume non-index minute is reported here and never real, per
+    /// §12.15.9.)*
     ///
     /// **It says nothing at all for `IDX_I`.** An index has no volume by
     /// construction, so every index bar lands in the zero bucket regardless
@@ -1016,7 +1018,7 @@ fn percentile(sorted: &[i64], p: f64) -> i64 {
 /// | REST has it, live doesn't, traded or index, late window, `Excuse` | `late_excused` | no — may be unsealed at the read; holds the day at `partial` |
 /// | REST has it, live doesn't, traded or index, live read truncated | `missing_live_unjudged` | no — cannot be told from an unread minute; holds the day at `partial` |
 /// | live has it, REST doesn't | `missing_rest` | **no** — the REST tape is sparse by construction; reported as `Partial`, never `Clean`, never `Diverged` |
-/// | either side outside `[09:15, 15:30)` | `out_of_session` | no |
+/// | either side outside `[09:15, 15:40)` | `out_of_session` | no |
 #[must_use]
 /// Compares one day's live capture against the vendor's own tape.
 ///
@@ -1393,13 +1395,16 @@ pub fn compare_day_in_scope(
 /// writes the same cell, or a same-`outcome` daily row, overwrites the stamp:
 /// a stamp is the LAST attempt that wrote the row, and the stamps order the
 /// writes without splitting the findings by attempt (the day's real findings
-/// are every `diverged` cell of the day and every `missing_live` cell whose
-/// Dhan minute traded or is an index; a zero-volume non-index minute is never
-/// real).
+/// are every spot `diverged` cell of the day and every spot `missing_live`
+/// cell whose Dhan minute traded or is an index; a zero-volume non-index
+/// minute is never real, and the §12.15.6 option pass's `NSE_FNO` cells are
+/// not part of the day's verdict).
 ///
 /// The reader rule (§12.15.9, corrected in the 2026-10-10 review): if ANY
 /// daily row of the day reads `diverged`, the day is `diverged` and the reader
-/// takes the newest such row; otherwise the newest row. A later attempt never
+/// takes the newest such row; it is also `diverged` when any real spot cell
+/// exists, because a persist can stop after flushing some cells and before
+/// its daily row (round 4); otherwise the newest row. A later attempt never
 /// hides an earlier `diverged` one, because a retry can read lower for a bad
 /// reason: a target whose vendor fetch fails on the retry adds only
 /// `missing_rest`, so the divergence that attempt 1 found on it is simply not
@@ -1479,7 +1484,10 @@ pub fn format_summary_line(cmp: &DayComparison) -> String {
             "🆘 Dhan live-vs-official check PROVED NOTHING today: {} minute(s) \
              of data existed but NONE lined up, so nothing was actually \
              compared. This is not a pass — the check itself needs attention.",
-            cmp.missing_live + cmp.missing_rest + cmp.late_excused + cmp.missing_live_unjudged
+            cmp.missing_live
+                .saturating_add(cmp.missing_rest)
+                .saturating_add(cmp.late_excused)
+                .saturating_add(cmp.missing_live_unjudged)
         ),
         DhanLiveXverifyOutcome::NoData => "⚠️ Dhan live-vs-official check found no data on \
              either side today — nothing was compared, so nothing is proven."
@@ -3600,6 +3608,13 @@ mod tests {
                 .contains("OR (kind = 'missing_live' AND (rest_volume > 0 OR segment = 'IDX_I')))")
         );
         assert!(!runbook.contains("AND kind IN ('diverged', 'missing_live')"));
+        // Round 4: a persist can stop after flushing cells and before its
+        // daily row, so a real spot cell makes the day `diverged` too; the
+        // option pass's `NSE_FNO` cells have no daily row and stay out.
+        assert!(runbook.contains("OR query 3 finds any real spot finding"));
+        assert!(runbook.contains("AND segment <> 'NSE_FNO'"));
+        assert!(rule.contains("it is also `diverged` when any real spot cell of the"));
+        assert!(stub.contains("or any real spot finding in the cell audit"));
         assert!(rule.contains("they do not split the findings by attempt"));
         assert!(rule.contains("A later attempt therefore never outranks an earlier"));
         assert!(stub.contains("a later attempt never outranks it"));

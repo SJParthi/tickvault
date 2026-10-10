@@ -1292,8 +1292,9 @@ async fn run_once(
                 targets.len(),
             );
             // §12.15.9 review: one wall-clock reading per attempt, written on
-            // its daily row and every cell, so the day's latest attempt and
-            // its own findings can be told apart from an earlier attempt's.
+            // its daily row and every cell, so a reader can order the writes.
+            // The stamps do not split the findings by attempt: a cell keeps
+            // the stamp of the LAST attempt that wrote it.
             let rows = PersistRows {
                 day_start_ist_nanos,
                 tolerance_paise: cfg.tolerance_paise,

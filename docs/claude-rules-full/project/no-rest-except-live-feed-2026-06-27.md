@@ -2413,11 +2413,11 @@ the alarms, their filters, or the hold ceiling.
 | Outcome, nothing compared | unchanged: `degraded` when `rest_incomplete` or not judged, else `blind` (rows seen) or `no_data` |
 | Why a failed fetch cannot hide anything | a target whose vendor fetch failed has no vendor bars, so it can add only `missing_rest`, never a false `missing_live`. The truncated live read is the one input this run can DETECT that fakes a missing live minute, so it alone turns missing-minute judging off. It is NOT the only input that can fake one: until plan item 51d, a sealed bar that is not yet readable when the read runs (still queued for the seal writer, staged in a spill file after a QuestDB outage, or ACKed but not yet applied by QuestDB's WAL), and a live row the read skips as malformed (counted on the `finished` line as `malformed_rows`), each read as a judged `missing_live`, anywhere in the day, and the day reads `diverged` (see the Honest limits) |
 | Late window | `LATE_SEAL_WINDOW_MINUTES = (CATCHUP_LATENESS_MARGIN_SECS + LAST_FOLDED_TRADE_SLACK_SECS) / 60`, rounded up: **5** today ((240 + 60) / 60, 15:35 to 15:39). `LAST_FOLDED_TRADE_SLACK_SECS` = 60 is how far before the close the feed's newest folded trade stamp may stop: the window covers every unsealed bucket only when that stamp is at or after 15:39:00. That is **Assumed**, not measured or checked. The read time does not enter: the cutoff follows the watermark, not the run. Compile-time asserted to cover the margin plus that slack. `TAIL_UNSEALED_MINUTES` is deleted |
-| `Excuse` | `Excuse { sealed_through: None }` excuses the last `LATE_SEAL_WINDOW_MINUTES` session minutes; `Excuse { sealed_through: Some(t) }` excuses every session bucket that ends after `t`. Either way only a minute AFTER the instrument's own last live minute is late: a later live bar of the same instrument means its tick closed the bucket, so a gap before it is judged like any other (third review round 2026-10-10). A traded or index minute missing there is counted in `late_excused` with cell kind `late_excused`, is not real, and holds the day at `partial` at best |
+| `Excuse` | `Excuse { sealed_through_secs_of_day: None }` excuses the last `LATE_SEAL_WINDOW_MINUTES` session minutes; `Excuse { sealed_through_secs_of_day: Some(t) }` excuses every session bucket that ends after `t`. Either way only a minute AFTER the instrument's own last live minute is late: a later live bar of the same instrument means its tick closed the bucket, so a gap before it is judged like any other (third review round 2026-10-10). A traded or index minute missing there is counted in `late_excused` with cell kind `late_excused`, is not real, and holds the day at `partial` at best |
 | `Strict` | no minute is excused. A traded or index minute missing anywhere, 15:38 and 15:39 included, is `missing_live` and real |
 | Not judged | a traded or index minute missing from our side is counted in `missing_live_unjudged` with cell kind `missing_live_unjudged`, is not real, and holds the day at `partial` at best. A not-judged minute is never also counted as excused |
 | A zero-volume minute | a non-index minute Dhan printed with volume 0 is never real, in or out of the window: it stays `missing_live` (`missing_live_zero_volume`), as since §46b |
-| Production today | the spot check and the §12.15.6 option pass both judge with `Excuse { sealed_through: None }` and `rest_incomplete`/`missing` from the run. Plan item 51d replaces `None` with the published seal progress and uses `Strict` when the live side is known final |
+| Production today | the spot check and the §12.15.6 option pass both judge with `Excuse { sealed_through_secs_of_day: None }` and `rest_incomplete`/`missing` from the run. Plan item 51d replaces `None` with the published seal progress and uses `Strict` when the live side is known final |
 | Persistence | the daily table gains `late_excused LONG`, `missing_live_unjudged LONG`, `missing_judgeable SYMBOL` (`judged` / `live_truncated`) through `ALTER ADD COLUMN IF NOT EXISTS`; the cell audit gains kinds `late_excused` and `missing_live_unjudged`. DEDUP keys unchanged. The `tail_unsealed` column and cell kind are KEPT for history and written 0 from this change. *(Review, same day:)* the daily table also gains `attempt_at TIMESTAMP` and `run_complete BOOLEAN`, and the cell audit `attempt_at TIMESTAMP`, through the same self-heal; `attempt_at` is ONE wall-clock reading per attempt (IST), written on that attempt's daily row and on every cell it writes (the §12.15.6 option pass stamps its own cells the same way); `run_complete` is the attempt's `run_is_complete`, the value the marker decision uses. Neither is in a DEDUP key |
 | Page, alarms, marker, S3 | unchanged. `xverify_diverged` stays price-only (`is_catastrophic_divergence` untouched). `partial` and `diverged` are both measured, so the marker and the §12.15.2 hold behave exactly as before. No new alarm, filter, page source or EMF name |
 
@@ -2437,8 +2437,11 @@ the alarms, their filters, or the hold ceiling.
   same way: a finding an earlier attempt wrote and the retry did not (the bar
   became readable) stays in the cell audit. The day's verdict: if ANY daily
   row of the day reads `diverged`, the day is `diverged` and its row is the
-  newest `diverged` one; otherwise it is the row with the newest
-  `attempt_at`. `run_complete` says whether that attempt was complete (at
+  newest `diverged` one; it is also `diverged` when any real spot cell of the
+  day exists (below), because an attempt's persist can stop after flushing
+  some cells and before its daily row (the §12.15.8 deadline stop or a failed
+  batch flush: round-4 review 2026-10-10); otherwise it is the row with the
+  newest `attempt_at`. `run_complete` says whether that attempt was complete (at
   most 5% of its vendor fetches failed, budget not spent, live read not
   truncated). *(Corrected in review 2026-10-10: this said "the daily row with
   the newest `attempt_at`", which let a retry hide a divergence. Attempt 1
@@ -2462,7 +2465,9 @@ the alarms, their filters, or the hold ceiling.
   `missing_live` cell whose Dhan minute traded (`rest_volume > 0`) or is an
   index, whatever its stamp (a zero-volume non-index minute stays
   `missing_live` and is never real, per the row above). The §12.15.6 option
-  pass stamps its own cells and writes no daily row. *(Corrected in the
+  pass stamps its own cells (segment `NSE_FNO`) and writes no daily row, so
+  its cells are not part of the day's verdict; the spot targets are `IDX_I`,
+  `NSE_EQ` and `BSE_EQ`. *(Corrected in the
   second review round 2026-10-10: the first correction said "that row's
   findings are the cells with the same `attempt_at`" and called unmatched stamps leftovers of a failed persist,
   which drops a real divergence an earlier `diverged` attempt found and a
@@ -2470,16 +2475,30 @@ the alarms, their filters, or the hold ceiling.
   The marker and the S3 hold are unchanged: they follow the attempt that wrote
   the marker, which is always the last one that ran that day.
 - Some days move from `clean` to `partial`: a day whose only gap was a traded
-  or index minute at 15:38 or 15:39 read `clean`; it now reads `partial` with
-  `late_excused > 0`.
+  or index minute at 15:38 or 15:39, after that instrument's last live
+  minute, read `clean`; it now reads `partial` with `late_excused > 0`.
+- Some days move from `clean` to `diverged`: a traded or index minute missing
+  at 15:38 while the same instrument has a live 15:39 bar was excused as
+  `tail_unsealed`; it is now judged `missing_live`, because the later bar's
+  tick closed the 15:38 bucket (round-4 review 2026-10-10).
 - Some days move from `diverged` to `partial`: a traded or index minute
-  missing at 15:35 to 15:37, which may only have been unsealed, is now
-  excused rather than counted as loss.
+  missing at 15:35 to 15:37, after that instrument's last live minute, which
+  may only have been unsealed, is now excused rather than counted as loss.
 - A missing zero-volume non-index minute at 15:38 or 15:39 moves from
   `tail_unsealed` to `missing_live_zero_volume`; it was never real and still
   is not.
 
 **⚠ Honest limits (Rule 11).**
+- The day's verdict (the reader rule above) is a rule for a READER, not a
+  value the code stores: nothing in the process folds the cell audit into the
+  daily row. A vacuous retry (`degraded`, `blind`, `no_data`) is the newest row
+  and can shadow an earlier measured `partial` or `clean`; and a day whose live
+  side lost every minute reads `blind`, not `diverged`, though its traded
+  `missing_live` cells make the day `diverged` under the reader rule. Runbook
+  §4 says how to read both (round-4 review 2026-10-10).
+- `Excuse { sealed_through_secs_of_day: Some(t) }` takes `t` as given: a `t`
+  before the session open would excuse every late-window candidate. Only
+  `None` is built today; plan item 51d must bound `t` before it passes one.
 - Until 51d, a REAL loss of a traded or index minute at 15:35 to 15:39 is
   never judged: the day reads `partial`, never `diverged`, for it. Price
   differences in those minutes (present on both sides) are still judged.
