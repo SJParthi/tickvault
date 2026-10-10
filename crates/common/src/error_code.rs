@@ -146,6 +146,11 @@ pub enum ErrorCode {
     /// Token expiry validation failed (expired or invalid state).
     AuthGapTokenExpiry,
     /// Only disconnect-code 807 should trigger token refresh; other code did.
+    ///
+    /// 2026-10-06 (scope lock, 808 refresh-once): on the live feed the
+    /// token-refresh codes are 807 and 809, plus a FIRST 808, which refreshes
+    /// once before it may park (`pool_supervisor::classify_disconnect`). The
+    /// code string is unchanged.
     AuthGapDisconnectTokenMap,
 
     // -----------------------------------------------------------------------

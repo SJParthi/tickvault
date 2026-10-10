@@ -4707,6 +4707,41 @@ minutes, which is what §2.3's "one per episode" always said. Cost unchanged.
   strikes latch it for the day.
 - Removes the 30-minute cooldown or pages never-ticked contracts every scan.
 
+## §2.12 — 2026-10-06: an 808 refreshes the token once before it parks (no new page)
+
+Owner, 2026-10-06: "Go ahead with whatever you want dude", and on the
+recommended-fixes list, "See do everything whatever is recommended dude okay?".
+Owner, 2026-10-10: "Why idle go ahead fully". *(Numbered §2.12 because §2.11
+was taken the same day by the `RISK-GAP-03` re-arm; the spec that ordered this
+section called it §2.11.)*
+
+The policy lives in the scope lock, section "2026-10-06 — 808 REFRESHES THE
+TOKEN ONCE BEFORE IT PARKS". What it changes for pages and alarms:
+
+- **(i)** `dhan-socket-parked` fires on an 808 only at the TERMINAL park (the
+  refreshed token was rejected too, or a cap tripped), no longer on the first
+  808. Its alarm definition, its `host`-only dimension and its lack of
+  `ok_actions` are unchanged; only its description text changes, and the same
+  for the every-socket-gone alarm's description (806/810, or an 808 that a
+  refreshed token did not cure).
+- **(ii)** The family-(3) `AuthenticationFailed` body sent from
+  `force_renewal_unless_replaced` changes from "(code 807)" to wording that
+  covers 807, 808 and 809 and still names Dhan. Same site, same once-per-token
+  latch.
+- **(iii)** A self-healing main-feed 808 inside 09:15–15:30 can still push
+  `tv_dhan_ws_main_reconnect_recovery_max_ms` past the threshold of the
+  existing `dhan-main-reconnect-slow` alarm, exactly as an 807 can today.
+- **(iv)** No new alarm, page, EMF name or metric filter. `reason="auth_rejected"`
+  rides the existing reconnect counter, and the new
+  `tv_token_renew_failure_reused_total` is a plain Prometheus counter that is
+  NOT EMF-selected.
+
+**What a PR that violates §2.12 looks like (REJECT):**
+- Adds `ok_actions`, or any dimension beyond `host`, to `dhan-socket-parked`.
+- Adds a separate page for a first (self-healing) 808.
+- EMF-selects `tv_dhan_ws_reconnect_total{reason="auth_rejected"}` as its own
+  series or `tv_token_renew_failure_reused_total`.
+
 ## §2.13 — 2026-10-10: per-kind frame-silence redials (no new page; how they meet the deaf and reconnect-slow pages)
 
 Owner, verbatim, each with its own date:

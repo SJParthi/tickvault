@@ -9037,6 +9037,113 @@ REJECT (review round 10):
   bound rising.
 - Moves a bound and the REJECT row that forbids moving it in the same change.
 
+### 2026-10-06 — 808 REFRESHES THE TOKEN ONCE BEFORE IT PARKS
+
+**Owner (2026-10-06, verbatim):** "Go ahead with whatever you want dude" and
+"See do everything whatever is recommended dude okay?" — the approval for the
+recommended fast-lane plan, whose ITEM 52d/52e is this change (spec fl-808).
+**Owner (2026-10-10, verbatim):** "Why idle go ahead fully".
+
+*(Provenance: the 2026-10-06 quotes reached the implementing session through
+the coordinator's workflow, as for the OVERFLOW PROBE ATTRIBUTION section
+above; the 2026-10-10 line was relayed the same way. Confirm against the owner
+thread before merge.)*
+
+Recorded HERE before the code, per the rule-file-first law.
+
+**What was wrong (Verified in source, main 4525ffe86).** `classify_disconnect`
+put Dhan disconnect code 808 ("authentication failed") in the same Fatal arm as
+806 (data API not subscribed) and 810 (client id invalid). One 808 therefore
+parked the socket for the whole session (`ParkReason::FatalDisconnect`, no 804
+respawn). But 808 is ambiguous: an invalid or replaced token produces it as well
+as a wrong client id, and a token problem is exactly what 807 and 809 already
+recover from by refreshing the token and redialling. The order side already
+treats 808 as "refresh the token and retry once".
+
+**The contract.** A first 808 on a socket triggers ONE shared token refresh and
+a redial with the token floor and jitter (`TOKEN_STALE_REDIAL_FLOOR_MS` on the
+damped ladder plus the socket's stagger: the same delay rule as 807 and 809),
+counted as `reason="auth_rejected"` on the existing reconnect counter. The slot
+parks for the session (`FatalDisconnect`, no 804 respawn, the existing park
+page) only when one of these holds:
+
+- (a) the dial that got the 808 presented the token generation that an earlier
+  refresh in the same episode produced (the fresh token was rejected too);
+- (b) `AUTH_REJECT_MAX_HARD_FAILURES` (3) refreshes in the episode failed
+  outright;
+- (c) `AUTH_REJECT_EPISODE_MAX_MS` (300 s, at least twice the 125 s mint
+  cooldown) passed without a fresh token, counted from the episode start or
+  from the last refresh that produced a fresh token, whether or not an earlier
+  refresh verified a generation, after at most one more refresh attempt past
+  the bound: an 808 past it parks at once when the redial that ended in it
+  began with a refresh, and otherwise (an outage of failed dials or other
+  closes came between) gets one grace refresh and parks on the next 808 past
+  the bound, whatever happens in between (review rounds 3 and 4);
+- (d) more than `AUTH_REJECT_MAX_REFRESHES_PER_WINDOW` (4) refreshes that each
+  PRODUCED A FRESH TOKEN (a new generation) happened inside
+  `AUTH_REJECT_WINDOW_MS` (300 s). A deferred or failed refresh is not counted
+  here. The window is per SLOT and spans episodes: it is not cleared when an
+  episode ends or the slot parks, so a slot that got four fresh tokens inside
+  300 s, each accepted and delivering for a while before the next 808, parks
+  on the fifth 808 without refreshing again (review round 5).
+
+A refresh refused only because of the mint cooldown or the RESILIENCE-03 lock is
+DEFERRED: it counts toward neither (b) nor (d), so at the real redial cadence
+(an 808 about every 5 s) a run of deferrals parks through (c): 300 s without a
+fresh token. That holds after a fresh token too: if a sibling then moves the
+token on, every later 808 presents a generation the episode never verified, so
+(a) cannot fire, and each refresh may only defer; (c) still parks the slot 300 s
+after its last fresh token.
+A renewal result reused from another socket's renewal of the same token in the
+last 10 s (failed or deferred) is also reported as DEFERRED, because it carries
+no new evidence: one real failure is one strike, however many sockets read it.
+*(Corrected 2026-10-06, review round 1: the first code charged every refresh
+to (d) before its outcome was known, so deferrals 5 s apart parked after about
+20 s and (c) could never be reached; and a reused failure counted as a second
+outright failure. Review round 2: (c) first applied only while no generation
+was verified, so after one fresh token a slot whose later refreshes all
+deferred redialled without bound; it now runs from the last fresh token.)* An episode ends when the
+credential has proven itself: a close other than 808 after the socket delivered
+frames, or an 808 arriving after at least `MIN_HEALTHY_SESSION_MS` of healthy
+delivery; any park ends it too. Nothing on the per-frame path changes.
+
+806 and 810 stay fatal on the first strike. 805 and `ROTATION_HALTED` are
+unchanged (an 808 never sets or clears it). An 808 on the probed socket of an
+805 window is a coded close like 807 (watch restart, a second one fails the
+window), where before it parked at once; the park after a rejected fresh token
+still fails the window. Refresh is per account: a primary-account socket
+renews through the primary token manager (`force_renewal_unless_replaced`, the
+single-flight gate), and a failed or deferred renewal result is shared across
+sockets for 10 s (as a deferral, its reason stored redacted), so while the mint
+cooldown holds the pool sends one RenewToken per 10 s, not one per socket.
+
+**Depth account.** An 808 on a depth-account socket may only RE-READ
+`/tickvault/<env>/dhan-depth/access-token`. It never calls RenewToken or
+generateAccessToken, and never calls `global_token_manager()` (minter rule
+§10.4 and §10.9: one issuer per account). No depth-account socket is dialled
+today (Verified), so there is no code for it yet. The production refresh
+closure renews the PRIMARY account and carries a note that it MUST NOT be used
+for a depth-account socket, which needs its own re-read-only closure.
+
+**Out of scope, stated.** A rejection at the HTTP upgrade arrives as a failed
+dial (`DialFailed`), which does not refresh; this change does not alter it.
+
+**Authorised:** the reconnect reason label `auth_rejected`
+(`ReconnectReason::AuthRejected`, appended to `ReconnectReason::ALL`).
+
+**REJECT:**
+- Retrying an 808 without a token refresh first.
+- Redialling an 808 below `TOKEN_STALE_REDIAL_FLOOR_MS`.
+- Raising any `AUTH_REJECT_*` cap without a fresh dated quote here first.
+- Making 806 or 810 refreshable.
+- Spending the 804 respawn budget on 808.
+- Setting or clearing `ROTATION_HALTED` on 808.
+- An 808 on one account refreshing another account's token.
+- A depth-account 808 calling RenewToken or a mint, or `global_token_manager()`.
+- A production refresh closure that reports `Fresh` without the token generation
+  having moved.
+- Clearing the episode on the frame path.
+
 ### 2026-10-10 — PER-KIND FRAME-SILENCE THRESHOLDS (fault redials only)
 
 **Owner, verbatim, each with its own date:**
