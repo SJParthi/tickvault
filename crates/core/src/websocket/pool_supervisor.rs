@@ -760,6 +760,7 @@ impl DataSilenceRefusal {
 ///
 /// # Errors
 /// A [`DataSilenceRefusal`] naming why nothing was recorded.
+// WIRING-EXEMPT: called as a function value, `ps::request_data_silence_redial`, by `LiveIngest::check_depth200_cross_feed` (dhan_feed_stack.rs)
 pub fn request_data_silence_redial(
     connection_index: u8,
     now_wall_ms: i64,
@@ -24930,6 +24931,76 @@ mod frame_silence_evidence_tests {
         assert_eq!(frame_gap_peak_secs(200), None);
         publish_frame_gap_peaks();
         seed_frame_silence_counters();
+    }
+
+    /// Slot 27 is written by no other test in this module.
+    const REGISTER_TEST_SLOT: u8 = 27;
+
+    #[test]
+    fn test_last_frame_wall_ms_and_snapshot_frame_activity_read_the_register() {
+        let idx = usize::from(REGISTER_TEST_SLOT);
+        SLOT_LAST_FRAME_WALL_MS[idx]
+            .0
+            .store(WALL0, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(last_frame_wall_ms(REGISTER_TEST_SLOT), Some(WALL0));
+        assert_eq!(snapshot_frame_activity()[idx], WALL0);
+        // 0 means never delivered: no stamp.
+        SLOT_LAST_FRAME_WALL_MS[idx]
+            .0
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(last_frame_wall_ms(REGISTER_TEST_SLOT), None);
+        assert_eq!(snapshot_frame_activity()[idx], 0);
+        assert_eq!(last_frame_wall_ms(u8::MAX), None);
+    }
+
+    #[test]
+    fn test_frame_gap_peak_secs_rounds_down_and_publish_frame_gap_peaks_reads_it() {
+        let idx = usize::from(REGISTER_TEST_SLOT);
+        SLOT_FRAME_GAP_PEAK_MS[idx].store(7_999, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(frame_gap_peak_secs(REGISTER_TEST_SLOT), Some(7));
+        SLOT_FRAME_GAP_PEAK_MS[idx].store(999, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(frame_gap_peak_secs(REGISTER_TEST_SLOT), Some(0));
+        assert_eq!(frame_gap_peak_secs(u8::MAX), None);
+        // Publishing reads the register and never panics without a recorder.
+        publish_frame_gap_peaks();
+        SLOT_FRAME_GAP_PEAK_MS[idx].store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[test]
+    fn test_seed_frame_silence_counters_is_idempotent() {
+        // Seeding adds zero, so running it twice (two lane starts) is safe.
+        seed_frame_silence_counters();
+        seed_frame_silence_counters();
+        assert_eq!(
+            DATA_SILENCE_STALE_METRIC,
+            "tv_dhan_ws_data_silence_request_stale_total"
+        );
+    }
+
+    #[test]
+    fn test_overflow_episode_engaged_reads_the_never_cleared_flag() {
+        assert_eq!(
+            overflow_episode_engaged(),
+            OVERFLOW_ENGAGED.load(std::sync::atomic::Ordering::Acquire)
+        );
+    }
+
+    #[test]
+    fn test_confirmed_threshold_secs_doubles_per_strike_and_caps_at_300() {
+        let t = t0();
+        for (endpoint, expected) in [
+            (DhanEndpointType::MainFeed, [60, 120, 240, 300, 300]),
+            (DhanEndpointType::Depth20, [90, 180, 300, 300, 300]),
+            (DhanEndpointType::Depth200, [300, 300, 300, 300, 300]),
+        ] {
+            let mut s = ConnectionSupervisor::new(slot_at(endpoint, REGISTER_TEST_SLOT), t);
+            for (strikes, want) in expected.into_iter().enumerate() {
+                s.silence_strikes = u8::try_from(strikes).expect("small");
+                assert_eq!(s.confirmed_threshold_secs(), want, "{endpoint:?} {strikes}");
+            }
+            s.silence_strikes = u8::MAX;
+            assert_eq!(s.confirmed_threshold_secs(), FRAME_SILENCE_REDIAL_SECS);
+        }
     }
 
     proptest! {
