@@ -184,6 +184,11 @@ struct AuthRejectEpisode {
     started_at: Instant,
     hard_failures: u8,
     verified_generation: Option<u64>,
+    /// The last instant this episode saw progress: its start, then each
+    /// refresh that produced a fresh token. The age bound runs from here, so
+    /// an episode parks after [`AUTH_REJECT_EPISODE_MAX_MS`] without a fresh
+    /// token whether or not an earlier refresh verified a generation.
+    last_progress_at: Instant,
 }
 
 /// How often the shell wakes to ask the supervisor whether a socket has gone
@@ -4636,12 +4641,14 @@ impl ConnectionSupervisor {
             started_at: now,
             hard_failures: 0,
             verified_generation: None,
+            last_progress_at: now,
         });
         // (c) Refresh ceiling: the ring is full and its oldest entry is still
         // inside the window, so four refreshes already produced a fresh token
         // that was then rejected again. Only a refresh that produced a new
         // generation is charged to the ring (`note_token_refresh`), so a run
-        // of deferred refreshes never reaches this; (d) bounds those.
+        // of deferred refreshes never reaches this; the age bound in (d)
+        // parks those after 300 s without a fresh token.
         let cursor = usize::from(self.auth_reject_cursor) % AUTH_REJECT_MAX_REFRESHES_PER_WINDOW;
         let window = Duration::from_millis(AUTH_REJECT_WINDOW_MS);
         if let Some(oldest) = self.auth_reject_refreshes[cursor]
@@ -4659,15 +4666,19 @@ impl ConnectionSupervisor {
             );
             return self.park(ParkReason::FatalDisconnect, now);
         }
-        // (d) Refresh unavailable: too many outright failures, or the episode
-        // ran past its time bound without ever seeing a fresh token.
-        let age_ms = u64::try_from(
-            now.saturating_duration_since(episode.started_at)
+        // (d) Refresh unavailable: too many outright failures, or 300 s
+        // passed without a fresh token, counted from the episode start or the
+        // last refresh that produced one. Unconditional on
+        // `verified_generation`: after one fresh token, a sibling can move
+        // the token on so every later refresh is a new attempt that only
+        // defers; without this bound that slot would redial forever.
+        let since_progress_ms = u64::try_from(
+            now.saturating_duration_since(episode.last_progress_at)
                 .as_millis(),
         )
         .unwrap_or(u64::MAX);
         if episode.hard_failures >= AUTH_REJECT_MAX_HARD_FAILURES
-            || (episode.verified_generation.is_none() && age_ms >= AUTH_REJECT_EPISODE_MAX_MS)
+            || since_progress_ms >= AUTH_REJECT_EPISODE_MAX_MS
         {
             error!(
                 code = ErrorCode::WsGapDisconnectClassification.code_str(),
@@ -4676,7 +4687,12 @@ impl ConnectionSupervisor {
                 disconnect_code = 808u16,
                 stage = "parked_refresh_unavailable",
                 hard_failures = episode.hard_failures,
-                episode_age_ms = age_ms,
+                ms_since_fresh_token = since_progress_ms,
+                episode_age_ms = u64::try_from(
+                    now.saturating_duration_since(episode.started_at)
+                        .as_millis()
+                )
+                .unwrap_or(u64::MAX),
                 "Dhan rejected this socket's login with 808 and a fresh login could not be \
                  obtained — parking. Operator action required."
             );
@@ -4743,6 +4759,7 @@ impl ConnectionSupervisor {
         match report.outcome {
             TokenRefreshOutcome::Fresh { current } => {
                 episode.verified_generation = Some(current);
+                episode.last_progress_at = now;
                 // Charge the per-window ceiling (c) for a refresh that
                 // produced a new generation, and only for that one: a
                 // deferral or a failure is bounded by (d) instead.
@@ -12159,6 +12176,69 @@ mod tests {
         // At the bound: the park is (d) "refresh unavailable", not the
         // ceiling — no deferred refresh was ever charged to the ring.
         assert!(s.auth_reject_refreshes.iter().all(Option::is_none));
+        dial_no_frames(&mut s, at);
+        let action = close_808(&mut s, at);
+        assert_parked_fatal(&s, &action);
+    }
+
+    /// Review fix round 2 (2026-10-06): after one fresh token, a sibling
+    /// moves the token on, so every later 808 presents a generation the
+    /// episode never verified and its refresh only defers (a persistent
+    /// RESILIENCE-03 refusal). The slot must still park 300 s after that
+    /// fresh token, and not before. The fresh token lands 100 s into the
+    /// episode, so this also proves the bound runs from the last fresh
+    /// token, not from the episode start.
+    #[test]
+    fn test_808_deferrals_after_one_fresh_token_park_300_s_after_it() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+        let step = Duration::from_millis(TOKEN_STALE_REDIAL_FLOOR_MS);
+        let bound = Duration::from_millis(AUTH_REJECT_EPISODE_MAX_MS);
+        let fresh_at = now + Duration::from_secs(100);
+        let mut at = now;
+        // Deferrals until the fresh token, presenting generation 0.
+        while at < fresh_at {
+            dial_no_frames(&mut s, at);
+            assert_refresh(&close_808(&mut s, at));
+            assert_eq!(
+                s.note_token_refresh(refresh_report(0, TokenRefreshOutcome::Deferred), at),
+                None
+            );
+            at += step;
+        }
+        // One refresh produces generation 1.
+        dial_no_frames(&mut s, fresh_at);
+        assert_refresh(&close_808(&mut s, fresh_at));
+        assert_eq!(
+            s.note_token_refresh(
+                refresh_report(0, TokenRefreshOutcome::Fresh { current: 1 }),
+                fresh_at
+            ),
+            None
+        );
+        // A sibling installed generation 2; every refresh from here defers.
+        at = fresh_at + step;
+        let mut deferrals = 0u32;
+        while at.saturating_duration_since(fresh_at) < bound {
+            dial_no_frames(&mut s, at);
+            let action = close_808(&mut s, at);
+            assert!(
+                matches!(action, SupervisorAction::RefreshTokenThenDial { .. }),
+                "deferral {deferrals} parked before 300 s after the fresh token: {action:?}"
+            );
+            assert_eq!(
+                s.note_token_refresh(refresh_report(2, TokenRefreshOutcome::Deferred), at),
+                None
+            );
+            deferrals += 1;
+            at += step;
+        }
+        assert_eq!(deferrals, 59, "300 s after the fresh token, 5 s apart");
+        assert!(
+            at.saturating_duration_since(now) > bound,
+            "the episode itself is older than the bound, so the start alone did not park it"
+        );
+        assert_eq!(s.auth_reject.map(|e| e.hard_failures), Some(0));
         dial_no_frames(&mut s, at);
         let action = close_808(&mut s, at);
         assert_parked_fatal(&s, &action);

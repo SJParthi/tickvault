@@ -9071,8 +9071,10 @@ page) only when one of these holds:
   refresh in the same episode produced (the fresh token was rejected too);
 - (b) `AUTH_REJECT_MAX_HARD_FAILURES` (3) refreshes in the episode failed
   outright;
-- (c) the episode is older than `AUTH_REJECT_EPISODE_MAX_MS` (300 s, at least
-  twice the 125 s mint cooldown) without a verified fresh token;
+- (c) `AUTH_REJECT_EPISODE_MAX_MS` (300 s, at least twice the 125 s mint
+  cooldown) passed without a fresh token, counted from the episode start or
+  from the last refresh that produced a fresh token, whether or not an earlier
+  refresh verified a generation;
 - (d) more than `AUTH_REJECT_MAX_REFRESHES_PER_WINDOW` (4) refreshes that each
   PRODUCED A FRESH TOKEN (a new generation) happened inside
   `AUTH_REJECT_WINDOW_MS` (300 s). A deferred or failed refresh is not counted
@@ -9080,14 +9082,20 @@ page) only when one of these holds:
 
 A refresh refused only because of the mint cooldown or the RESILIENCE-03 lock is
 DEFERRED: it counts toward neither (b) nor (d), so at the real redial cadence
-(an 808 about every 5 s) a run of deferrals parks only through (c), at 300 s.
+(an 808 about every 5 s) a run of deferrals parks through (c): 300 s without a
+fresh token. That holds after a fresh token too: if a sibling then moves the
+token on, every later 808 presents a generation the episode never verified, so
+(a) cannot fire, and each refresh may only defer; (c) still parks the slot 300 s
+after its last fresh token.
 A renewal result reused from another socket's renewal of the same token in the
 last 10 s (failed or deferred) is also reported as DEFERRED, because it carries
 no new evidence: one real failure is one strike, however many sockets read it.
 *(Corrected 2026-10-06, review round 1: the first code charged every refresh
 to (d) before its outcome was known, so deferrals 5 s apart parked after about
 20 s and (c) could never be reached; and a reused failure counted as a second
-outright failure.)* An episode ends when the
+outright failure. Review round 2: (c) first applied only while no generation
+was verified, so after one fresh token a slot whose later refreshes all
+deferred redialled without bound; it now runs from the last fresh token.)* An episode ends when the
 credential has proven itself: a close other than 808 after the socket delivered
 frames, or an 808 arriving after at least `MIN_HEALTHY_SESSION_MS` of healthy
 delivery; any park ends it too. Nothing on the per-frame path changes.
