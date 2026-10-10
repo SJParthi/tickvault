@@ -3002,6 +3002,23 @@ Status of the rest, so the next session does not re-audit:
   24 production files across api, app, core, storage and trading, plus
   `crates/common/tests/error_code_tag_guard.rs`. Tests: uncoded_error_sites_may_only_shrink,
   every_critical_code_with_an_emit_site_is_alarmed_or_allowlisted.
+- [x] **M3 (third pass) — the seven uncoded `error!` lines outside the frozen area carry a code.**
+  Six new Medium codes, none matched by any CloudWatch filter (no new page, no new alarm or
+  filter, no shrink-only exemption entry): WS-SPILL-03 (WAL init failure, boot halts; the halt
+  is still paged by the existing boot-heartbeat and liveness alarms), WS-SPILL-04 (unreadable WAL
+  segment skipped at replay; already paged by the existing durable-floor-breach counter alarm),
+  PROC-03 (panic hook, also on the synchronous errors.log line), API-SERVER-01 (API server exit),
+  TICK-GAP-01 (both tick-gap tracker lines, `source` instrument_gap / reconnect_backfill_window;
+  not RISK-GAP-03, which pages on every line) and PIPELINE-LAG-01 (trading pipeline broadcast
+  lag). The ratchet drops 10 -> 3; the three left are the frozen indicator/strategy lines. Files:
+  `crates/common/src/error_code.rs`, `crates/app/src/main.rs`, `crates/app/src/observability.rs`,
+  `crates/app/src/trading_pipeline.rs`, `crates/storage/src/ws_frame_spill.rs`,
+  `crates/trading/src/risk/tick_gap_tracker.rs`, `crates/common/tests/error_code_tag_guard.rs`,
+  `docs/error-runbooks/audit-m3-error-codes.md`, `docs/error-runbooks/ws-frame-spill-error-codes.md`,
+  `.claude/triage/error-rules.yaml`, `docs/audit-2026-10-04.md`. Tests:
+  uncoded_error_sites_may_only_shrink, test_audit_m3_codes_contract,
+  every_error_code_variant_has_a_triage_rule, every_error_code_variant_appears_in_a_rule_file,
+  test_append_panic_line_sync_panic_hook_writes_errors_log_synchronously.
 
 - [x] **H3 (core) — a loom test drives the real ghost-unsubscribe register.** The six
   per-slot registers move into `GhostRegister` (atomics from the new `crate::sync` shim:
@@ -3014,6 +3031,24 @@ Status of the rest, so the next session does not re-audit:
   `.github/workflows/ci.yml`. Tests: a_take_racing_a_new_request_never_tears_loses_or_duplicates,
   a_pending_request_is_never_overwritten_by_a_later_one,
   a_racing_take_never_reads_a_torn_id_and_segment_pair.
+
+- [x] **H3 (core, rest) — the other core loom files drive real code.** Rebuilt 2026-10-09 on a
+  fresh branch from main (the handoff branch is read only). `loom_activity_watchdog` now drives
+  the real `ProgressProbe` and `note_activity` that `ActivityWatchdog::run` and the order-update
+  reader use (the counter is `crate::sync::AtomicU64`); `loom_ws_decoupling` drives the real
+  `RingByteBudget::try_reserve_detailed` and `release` (its two counters are
+  `crate::sync::AtomicUsize`; `new` and `with_slot_cap` stay `const` outside loom).
+  `loom_tick_dedup` is deleted: every model in it copied code that no longer exists. CI loom
+  lane: drift list and `--test` drop `loom_tick_dedup`, count 4 -> 3. Files:
+  `crates/core/src/sync.rs`, `crates/core/src/websocket/activity_watchdog.rs`,
+  `crates/core/src/websocket/order_update_connection.rs`,
+  `crates/core/src/websocket/pool_supervisor.rs`, `crates/core/tests/loom_activity_watchdog.rs`,
+  `crates/core/tests/loom_ws_decoupling.rs`, `.github/workflows/ci.yml`,
+  `.claude/rules/project/testing.md`. Tests:
+  two_readers_never_reserve_past_the_byte_cap_and_the_loser_returns_its_slot,
+  two_readers_never_reserve_past_the_slot_cap, a_reserve_racing_the_drain_release_leaves_exact_counters,
+  stress_readers_and_releases_never_breach_or_leak_the_budget. Honest limit: the tokio channel
+  and the WAL writer are not modelled (loom cannot run them).
 
 ### Added 2026-10-09 (ADANIENT 09:15 volume mismatch)
 
@@ -3104,3 +3139,93 @@ are written `N/A — reason` in the PR body).
   `docs/claude-rules-full/project/operator-charter-forever.md`,
   `crates/common/tests/wave4_section8_wording_guard.rs`. Test:
   templates_call_the_weekend_test_calendar_maths_not_a_chaos_test.
+
+### Added 2026-10-09 (stress audit fix 2, findings BND-1 and GAP-3: archive and quote)
+
+Guarantee matrix: see per-wave-guarantee-matrix.md (all 15 + 7 rows apply; rows that do not
+are written `N/A — reason` in the PR body).
+
+Crates touched: `storage`, `api`. The workflow findings found in the same pass (OPS-2, RO-5,
+RO-1) ship in their own PR.
+
+- [x] **BND-1 — drained spill files no longer defer the hour-window depth archive forever.**
+  `spill_dirs_have_pending_data` counted ANY entry in the tick and depth spill folders. A
+  drained spill file is emptied to 0 bytes and kept (the replay skips it), so after the first
+  spill the archive fell back to the day path for good
+  (`tv_partition_archive_hour_window_deferred_total`). A folder now counts as pending only
+  when it holds a NON-EMPTY regular file at its top level, whatever its extension (so the
+  framed `.dspl` depth spill landing separately is covered); 0-byte files and `quarantine/`
+  (never replayed) do not count; anything unclassifiable (unreadable folder or entry, symlink,
+  unknown sub-folder) still counts as pending. Drained files are NOT deleted: the replay keeps
+  them on purpose so the age sweep can tell drained from abandoned. Review fix (same day): the
+  replay never empties a folder's NEWEST file (the writer may still append to it) and records
+  the drained offset instead, so a non-empty newest file counts only while it is longer than
+  `tick_spill_replay::resume_offset_for`; after a restart (offset forgotten) it counts until
+  the next round re-drains it.
+  Files: `crates/storage/src/partition_archive.rs`.
+  Tests: test_regression_drained_spill_files_and_quarantine_are_not_pending,
+  test_regression_a_newest_file_drained_to_its_end_is_not_pending,
+  a_non_empty_spill_file_of_any_extension_is_pending,
+  a_missing_or_empty_spill_folder_is_not_pending, an_unknown_sub_folder_counts_as_pending,
+  hour_window_defers_to_the_day_path_while_spill_data_is_pending (updated),
+  an_unreadable_spill_directory_defers_rather_than_permits (now calls the real function; the
+  test-only mirror of the old rule is removed).
+- [x] **GAP-3 — the public quote endpoint no longer runs an unbounded scan on a miss.**
+  `/api/quote/{security_id}` ran `LATEST ON ts` over all of `ticks` with no time bound, and a
+  miss was never cached. The query now carries `ts > dateadd('d', -QUOTE_LOOKBACK_DAYS, now())`
+  (7 days; `ts` is IST wall-clock stored as UTC and `now()` is UTC, so the window is 7 days
+  plus 5 h 30 min, wider never narrower), and a clean miss (QuestDB answered, no row) is cached
+  for the same 1 s TTL inside the same capped `BoundedTtlCache`. The 409 multi-segment answer,
+  400s, 503 and a 404 after a FAILED query are still never cached.
+  Files: `crates/api/src/handlers/quote.rs`, `crates/api/src/response_cache.rs`, `CLAUDE.md`
+  (dated note on the `BoundedTtlCache::put` row).
+  Tests: test_regression_latest_tick_sql_is_bounded_to_the_lookback_window,
+  test_regression_a_miss_is_cached_and_the_repeat_does_not_query,
+  test_get_quote_cached_404_expires_and_a_first_tick_is_seen (was
+  test_get_quote_404_is_never_cached).
+
+#### Design
+
+BND-1: one free function `spill_dir_has_pending_data(path)` in `storage`'s
+`partition_archive.rs`, one `read_dir` and one `lstat` per top-level entry, called for both
+spill folders from the existing off-worker check. The rule keys on byte length, not on the
+extension list, so a new spill format needs no change here. GAP-3: the `api` crate's quote SQL
+gains a WHERE time bound before `LATEST ON`; a miss stores an empty-string sentinel (a
+serialized quote is a JSON object and never empty) in the existing quote cache, and a cache hit
+on the sentinel answers 404.
+
+#### Edge Cases
+
+BND-1: missing folder (not pending); empty folder (not pending); only 0-byte files plus a
+non-empty `quarantine/` (not pending); a non-empty file of any extension (pending); the live
+hour file fully drained but not yet emptied (still non-empty, so pending until the hour rolls
+and the replay empties it: bounded, one hour); unknown sub-folder or symlink (pending); path is
+a file (pending). GAP-3: an id last ticked more than 7 days ago now reads 404; a first tick
+arriving inside a cached miss's second is seen up to 1 s late (same staleness as a cached 200);
+a segment-scoped miss never answers an unscoped request (composite key).
+
+#### Failure Modes
+
+BND-1: an unreadable folder or entry fails toward "pending", so the archive takes the proven
+day path, never an unsafe hour drop; the pre-drop recount still guards every drop. GAP-3: the
+cache cap (2048) still bounds memory with garbage ids, every entry expires after 1 s, and the
+public limiter (5 requests a second) keeps the cap out of reach; a failed query is still
+probed for reachability and never cached.
+
+#### Test Plan
+
+`cargo test -p tickvault-storage` and `cargo test -p tickvault-api`; each regression test was
+run against the old logic (temporarily restored) and failed, then passed with the fix. Clippy
+`-D warnings` on both crates, `cargo fmt --check`, banned-pattern scanner, pub-fn test guard
+and plan gate.
+
+#### Rollback
+
+Revert the commit. BND-1 reverts to "any entry defers" (safe, only slower archival); GAP-3
+reverts to the unbounded query and uncached misses. No schema, config or data change.
+
+#### Observability
+
+BND-1: `tv_partition_archive_hour_window_deferred_total` should stop climbing on every run
+once the spill folders hold only drained files. GAP-3: `tv_api_cache_hits_total{endpoint=quote}`
+now also counts cached misses. No new metric, alarm or page (noise lock).

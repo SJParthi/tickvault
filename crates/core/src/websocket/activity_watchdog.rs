@@ -28,8 +28,13 @@
 //!   the task on disconnect and respawns before the next `run_read_loop`.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
+
+// `crate::sync` (audit H3): the std `AtomicU64` in a normal build, loom's
+// under the crate's `loom` feature, so `tests/loom_activity_watchdog.rs`
+// drives the real `note_activity` / `ProgressProbe` through every interleaving.
+use crate::sync::AtomicU64;
 
 use tickvault_common::market_hours::is_within_trading_session_ist;
 use tokio::sync::Notify;
@@ -156,6 +161,60 @@ pub const WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS: u64 = 14400;
 /// instruments for depth-20).
 pub const WATCHDOG_THRESHOLD_DEPTH_DEFERRED_SECS: u64 = 14400;
 
+/// Records one inbound frame on a connection's activity counter.
+///
+/// The read loop's only write to the counter, once per `Some(Ok(_))` frame:
+/// one relaxed `fetch_add`, O(1), no allocation. Relaxed is enough because
+/// the watchdog asks only "did the counter move", never what else the reader
+/// wrote; coherence on one atomic already forbids it from seeing the counter
+/// go backwards. Driven under loom by `tests/loom_activity_watchdog.rs`.
+#[inline]
+pub fn note_activity(counter: &AtomicU64) {
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The watchdog's per-poll progress decision, kept apart from its timer so
+/// the loom lane can drive the exact code [`ActivityWatchdog::run`] runs.
+///
+/// Holds the last counter value the watchdog saw. [`Self::advanced`] reads the
+/// counter once and catches up to it in one step, however many frames
+/// arrived since the last poll, so a later poll never reports progress for
+/// frames an earlier poll already counted. Copy, two words, O(1), no
+/// allocation. Hidden from docs: public only for the loom test.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub struct ProgressProbe {
+    last_seen: u64,
+}
+
+impl ProgressProbe {
+    /// A probe that has seen the counter's current value.
+    #[must_use]
+    pub fn start(counter: &AtomicU64) -> Self {
+        Self {
+            last_seen: counter.load(Ordering::Relaxed),
+        }
+    }
+
+    /// `true` when the counter moved since the previous poll (or since
+    /// [`Self::start`]), in which case the probe now holds the new value.
+    #[must_use]
+    pub fn advanced(&mut self, counter: &AtomicU64) -> bool {
+        let current = counter.load(Ordering::Relaxed);
+        if current == self.last_seen {
+            return false;
+        }
+        self.last_seen = current;
+        true
+    }
+
+    /// The last counter value this probe saw.
+    #[must_use]
+    pub const fn last_seen(&self) -> u64 {
+        self.last_seen
+    }
+}
+
 /// Per-connection activity watchdog.
 ///
 /// Construct with [`ActivityWatchdog::new`], share the [`Arc<AtomicU64>`]
@@ -204,7 +263,7 @@ impl ActivityWatchdog {
     // TEST-EXEMPT: covered by watchdog_does_not_fire_when_counter_advances, watchdog_fires_on_sustained_silence_past_threshold, watchdog_resets_on_late_activity — hook name-matcher doesn't pick up behaviour-named tests
     pub async fn run(self) {
         let poll = Duration::from_secs(WATCHDOG_POLL_INTERVAL_SECS);
-        let mut last_counter = self.counter.load(Ordering::Relaxed);
+        let mut probe = ProgressProbe::start(&self.counter);
         let mut last_advance = Instant::now();
         let mut ticker = tokio::time::interval(poll);
         // Skip missed ticks so long stalls (e.g. during a stop-the-world
@@ -217,9 +276,7 @@ impl ActivityWatchdog {
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            let current = self.counter.load(Ordering::Relaxed);
-            if current != last_counter {
-                last_counter = current;
+            if probe.advanced(&self.counter) {
                 last_advance = Instant::now();
                 continue;
             }
@@ -416,6 +473,48 @@ mod tests {
         );
         let handle = tokio::spawn(watchdog.run());
         (handle, counter, notify)
+    }
+
+    #[test]
+    fn test_note_activity_bumps_the_counter_by_exactly_one() {
+        let counter = AtomicU64::new(41);
+        note_activity(&counter);
+        assert_eq!(counter.load(Ordering::Relaxed), 42);
+    }
+
+    #[test]
+    fn test_progress_probe_start_holds_the_current_value() {
+        let counter = AtomicU64::new(7);
+        let probe = ProgressProbe::start(&counter);
+        assert_eq!(probe.last_seen(), 7);
+    }
+
+    /// Several frames between two polls count as ONE advance, and the next
+    /// poll with no new frame reports none: the probe catches up in one step.
+    #[test]
+    fn test_progress_probe_advanced_catches_up_in_one_step() {
+        let counter = AtomicU64::new(0);
+        let mut probe = ProgressProbe::start(&counter);
+        assert!(!probe.advanced(&counter), "no frame, no progress");
+        note_activity(&counter);
+        note_activity(&counter);
+        note_activity(&counter);
+        assert!(probe.advanced(&counter));
+        assert_eq!(probe.last_seen(), 3);
+        assert!(
+            !probe.advanced(&counter),
+            "frames already counted must not read as progress again"
+        );
+    }
+
+    /// The counter wraps at `u64::MAX`; a wrapped value is still a change.
+    #[test]
+    fn test_progress_probe_last_seen_follows_a_wrapping_counter() {
+        let counter = AtomicU64::new(u64::MAX);
+        let mut probe = ProgressProbe::start(&counter);
+        note_activity(&counter);
+        assert!(probe.advanced(&counter));
+        assert_eq!(probe.last_seen(), 0);
     }
 
     #[tokio::test(start_paused = true)]

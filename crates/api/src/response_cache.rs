@@ -6,6 +6,11 @@
 //! - [`BoundedTtlCache`] — `/api/quote/{security_id}` (per-(SID, segment) JSON body,
 //!   1s TTL, hard entry cap; callers cache ONLY 200 bodies so
 //!   attacker-chosen garbage security_ids can never grow the map).
+//!   ⚠ CHANGED 2026-10-09: the quote handler now also caches a MISS (404,
+//!   QuestDB answered with no row) for the same TTL, so garbage ids CAN
+//!   enter the map. It stays capped at [`QUOTE_CACHE_MAX_ENTRIES`], every
+//!   entry expires after 1 s, and the public rate limiter (5 requests a
+//!   second) keeps the cap out of reach.
 //!
 //! std `Mutex` with `PoisonError::into_inner` recovery — a mutex is correct
 //! on this cold path, and there is zero `unwrap`/`expect` in prod code.
