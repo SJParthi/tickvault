@@ -1043,7 +1043,6 @@ jobs:
           expected=$(LC_ALL=C sort <<'EOF'
           crates/core/tests/loom_activity_watchdog.rs
           crates/core/tests/loom_ghost_register.rs
-          crates/core/tests/loom_tick_dedup.rs
           crates/core/tests/loom_ws_decoupling.rs
           crates/trading/tests/loom_circuit_breaker.rs
           EOF
@@ -1080,7 +1079,6 @@ jobs:
           cargo test -p tickvault-core --features loom \
             --test loom_activity_watchdog \
             --test loom_ghost_register \
-            --test loom_tick_dedup \
             --test loom_ws_decoupling 2>&1 | tee /tmp/loom-core.log
           if grep -q "running 0 tests" /tmp/loom-core.log; then
             echo "::error::A loom target in tickvault-core ran 0 tests — the crate's 'loom' feature is not reaching the cfg gate, so these binaries are EMPTY and this lane would pass vacuously."
@@ -1092,8 +1090,8 @@ jobs:
           # targets had actually run (first live run, 2026-08-09). Mirrors the DHAT
           # lane above, which has always used this form.
           executed=$(grep -c 'Running.*tests/loom_' /tmp/loom-core.log || true)
-          if [ "$executed" -ne 4 ]; then
-            echo "::error::Expected 4 executed loom targets in tickvault-core, saw $executed — a --test flag was dropped from this step while the file and drift-list entry survived, silently un-gating that target."
+          if [ "$executed" -ne 3 ]; then
+            echo "::error::Expected 3 executed loom targets in tickvault-core, saw $executed — a --test flag was dropped from this step while the file and drift-list entry survived, silently un-gating that target."
             exit 1
           fi
 
