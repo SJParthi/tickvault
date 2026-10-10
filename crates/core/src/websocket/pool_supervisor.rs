@@ -6562,12 +6562,20 @@ pub enum RingReserve {
     SlotsFull,
 }
 
+/// The per-class byte and frame budget of the shared frame ring (see the
+/// notes above [`RingReserve`]).
+///
+/// Its two counters come from `crate::sync` (audit H3): the std atomics in a
+/// normal build, loom's under the crate's `loom` feature, so
+/// `crates/core/tests/loom_ws_decoupling.rs` drives these exact
+/// `try_reserve_detailed` / `release` methods through every interleaving of
+/// several socket readers and the drain.
 #[derive(Debug)]
 pub struct RingByteBudget {
-    resident: std::sync::atomic::AtomicUsize,
+    resident: crate::sync::AtomicUsize,
     cap: usize,
     /// Frames currently reserved by this class. See `slot_cap`.
-    slots: std::sync::atomic::AtomicUsize,
+    slots: crate::sync::AtomicUsize,
     /// Per-class ceiling on the NUMBER of frames resident in the shared ring.
     ///
     /// ADDED 2026-08-29, and it closes a real hole rather than adding belt to
@@ -6592,14 +6600,18 @@ pub struct RingByteBudget {
 
 impl RingByteBudget {
     /// A budget capped at `cap` resident bytes.
+    #[cfg(not(feature = "loom"))]
     #[must_use]
     pub const fn new(cap: usize) -> Self {
-        Self {
-            resident: std::sync::atomic::AtomicUsize::new(0),
-            cap,
-            slots: std::sync::atomic::AtomicUsize::new(0),
-            slot_cap: usize::MAX,
-        }
+        Self::with_slot_cap(cap, usize::MAX)
+    }
+
+    /// A budget capped at `cap` resident bytes (loom build: loom atomics have
+    /// no `const` constructor).
+    #[cfg(feature = "loom")]
+    #[must_use]
+    pub fn new(cap: usize) -> Self {
+        Self::with_slot_cap(cap, usize::MAX)
     }
 
     /// A budget capped at `cap` resident bytes AND `slot_cap` resident frames.
@@ -6609,12 +6621,26 @@ impl RingByteBudget {
     /// makes the shared-pool refusal unreachable: if every admitted frame
     /// held a per-class slot and the class caps add up to the channel size,
     /// the channel can never be full when a reservation succeeded.
+    #[cfg(not(feature = "loom"))]
     #[must_use]
     pub const fn with_slot_cap(cap: usize, slot_cap: usize) -> Self {
         Self {
-            resident: std::sync::atomic::AtomicUsize::new(0),
+            resident: crate::sync::AtomicUsize::new(0),
             cap,
-            slots: std::sync::atomic::AtomicUsize::new(0),
+            slots: crate::sync::AtomicUsize::new(0),
+            slot_cap,
+        }
+    }
+
+    /// [`Self::with_slot_cap`] for the loom build (loom atomics have no
+    /// `const` constructor).
+    #[cfg(feature = "loom")]
+    #[must_use]
+    pub fn with_slot_cap(cap: usize, slot_cap: usize) -> Self {
+        Self {
+            resident: crate::sync::AtomicUsize::new(0),
+            cap,
+            slots: crate::sync::AtomicUsize::new(0),
             slot_cap,
         }
     }

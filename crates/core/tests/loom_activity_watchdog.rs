@@ -1,30 +1,34 @@
-//! T1.3 — Loom concurrency model for the activity watchdog + read loop race.
+//! Loom model of the REAL activity-watchdog progress check (audit H3,
+//! rewritten 2026-10-06).
 //!
-//! Production invariant this test protects:
+//! Until 2026-10-06 this file modelled a hand-written copy: an `AtomicBool`
+//! standing in for `tokio::sync::Notify` and a compare-and-swap "fire at most
+//! once" guard that the production watchdog never had (it fires by calling
+//! `notify_one` and returning, so it cannot fire twice). A change to the real
+//! code could not fail it. Those three models are deleted.
 //!
-//!   > In every possible interleaving of the WS reader thread and the
-//!   > activity watchdog task, one of the following holds:
-//!   >   (a) The reader bumps the counter forward before the watchdog
-//!   >       observes a stall → watchdog does NOT fire.
-//!   >   (b) The reader stalls completely → watchdog fires EXACTLY once
-//!   >       via `notify_one()`, and the read loop returns `WatchdogFired`
-//!   >       exactly once.
-//!   > No interleaving produces: double-fire, lost-notify, or a reader
-//!   > that continues running after `notify_one()` has been observed.
+//! What crosses threads in production is one counter: the order-update read
+//! loop bumps it per frame (`note_activity`) and the watchdog task reads it
+//! once per poll (`ProgressProbe::advanced`, the exact call inside
+//! `ActivityWatchdog::run`). Under the crate's `loom` feature that counter is
+//! loom's `AtomicU64` (`crate::sync`), so this file drives those two real
+//! functions through every interleaving loom explores.
 //!
-//! This is a tighter companion to `loom_ws_decoupling.rs`. That file
-//! proves the WAL path never blocks the reader; this file proves the
-//! shutdown path (watchdog → Notify → read loop exit) is race-free.
+//! Not modelled, stated plainly: the tokio timer and `Notify` (loom cannot run
+//! a tokio runtime). The fire path is covered by the paused-clock unit tests in
+//! `activity_watchdog.rs` (`watchdog_fires_on_sustained_silence_past_threshold`
+//! and its two siblings).
 //!
-//! The loom model collapses the production code to its atomic shape:
+//! What it proves, in every interleaving:
 //!
-//!   - `counter: AtomicU64` — the reader bumps, the watchdog reads.
-//!   - `notified: AtomicBool` — a hand-rolled "did the watchdog fire"
-//!     flag. Production uses `tokio::sync::Notify`, which loom cannot
-//!     model directly. An AtomicBool with Acquire/Release semantics is
-//!     semantically equivalent for the notify-once-check-once pattern.
-//!   - `reader_exits: AtomicBool` — set by the reader when it observes
-//!     `notified == true` and decides to stop.
+//! - a poll never reports progress that was not made: the advances a probe
+//!   reports are at most the frames recorded;
+//! - once the reader has stopped (joined), one poll catches up to EVERY frame,
+//!   and the poll after it reports no progress: frames counted once are never
+//!   counted again (a probe that re-reported them would hold off the watchdog
+//!   on a dead socket);
+//! - both outcomes of the race are explored: a concurrent poll sometimes sees
+//!   the frames and sometimes does not (anti-vacuity, see the loom note).
 //!
 //! Run with:
 //!   cargo test -p tickvault-core --features loom --test loom_activity_watchdog
@@ -38,209 +42,141 @@
 
 #[cfg(feature = "loom")]
 mod loom_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use loom::sync::Arc;
-    use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use loom::sync::atomic::AtomicU64;
     use loom::thread;
+    use tickvault_core::websocket::activity_watchdog::{ProgressProbe, note_activity};
 
-    /// Minimal shape of the (reader, watchdog) pair. The reader is a
-    /// single loop iteration; the watchdog is a single observation.
-    struct WatchdogState {
-        counter: AtomicU64,
-        notified: AtomicBool,
-        reader_exits: AtomicBool,
-    }
+    /// Frames the reader records in each model.
+    const FRAMES: u64 = 2;
 
-    impl WatchdogState {
-        fn new() -> Arc<Self> {
-            Arc::new(Self {
-                counter: AtomicU64::new(0),
-                notified: AtomicBool::new(false),
-                reader_exits: AtomicBool::new(false),
-            })
-        }
-    }
-
-    /// **Invariant 1** — reader that bumps ONCE before the watchdog
-    /// observation must NOT cause a fire. Equivalent to the healthy-ops
-    /// case (live feed actively flowing).
+    /// The reader records frames on its own thread while the watchdog polls.
+    ///
+    /// The polls run on the MAIN thread, the shape `loom_ghost_register.rs`
+    /// measured as necessary there: with its take on a spawned thread loom
+    /// explored a single execution (Assumed cause: loom 0.7 tracks only the
+    /// last access to each atomic). Measured 2026-10-06 for THIS model: the
+    /// mirror shape (polls spawned, frames on main) also explored both
+    /// outcomes, in 195 executions, so the limitation does not bite here; the
+    /// shape is kept for consistency, and the anti-vacuity asserts below fail
+    /// if a loom change ever collapses this model to one outcome.
     #[test]
-    fn watchdog_does_not_fire_when_reader_advances_counter_first() {
-        loom::model(|| {
-            let state = WatchdogState::new();
-            let last_seen = 0u64;
+    fn a_poll_never_reports_progress_it_did_not_see_and_never_counts_a_frame_twice() {
+        static POLL_SAW_PROGRESS: AtomicUsize = AtomicUsize::new(0);
+        static POLL_SAW_NONE: AtomicUsize = AtomicUsize::new(0);
 
-            // Reader: bump counter once, then check if notified.
-            let s_reader = Arc::clone(&state);
+        loom::model(|| {
+            let counter = Arc::new(AtomicU64::new(0));
+            let mut probe = ProgressProbe::start(&counter);
+
+            let reader_counter = Arc::clone(&counter);
             let reader = thread::spawn(move || {
-                // Simulate one frame through the read loop.
-                s_reader.counter.fetch_add(1, Ordering::Relaxed);
-                // Before "await"-ing the next frame, check the notify flag.
-                if s_reader.notified.load(Ordering::Acquire) {
-                    s_reader.reader_exits.store(true, Ordering::Release);
+                for _ in 0..FRAMES {
+                    note_activity(&reader_counter);
                 }
             });
 
-            // Watchdog: one observation — if counter has advanced, do
-            // NOT fire. This is the "fast path" of the production
-            // watchdog loop (every 5s).
-            let s_watchdog = Arc::clone(&state);
-            let watchdog = thread::spawn(move || {
-                let current = s_watchdog.counter.load(Ordering::Relaxed);
-                if current == last_seen {
-                    // Only fires if counter stayed put.
-                    s_watchdog.notified.store(true, Ordering::Release);
+            // The watchdog polls three times while the reader records two
+            // frames, so "advances <= frames" is not true by construction.
+            let mut advances = 0_u64;
+            for _ in 0..3 {
+                if probe.advanced(&counter) {
+                    advances += 1;
+                    POLL_SAW_PROGRESS.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    POLL_SAW_NONE.fetch_add(1, Ordering::Relaxed);
                 }
-            });
-
-            reader.join().expect("reader join");
-            watchdog.join().expect("watchdog join");
-
-            // Either the reader won the race and the counter advanced
-            // BEFORE the watchdog observed it — no fire.
-            // Or the watchdog observed last_seen==0==current BEFORE the
-            // reader bumped — then it fired, but the reader has already
-            // exited cleanly.
-            //
-            // The invariant: if the watchdog fires, the reader MUST
-            // have exited cleanly. Never deadlock, never miss the
-            // notify.
-            let fired = state.notified.load(Ordering::Acquire);
-            let exited = state.reader_exits.load(Ordering::Acquire);
-            if fired {
-                // Either the reader observed the fire and exited, or the
-                // reader had already finished its one-shot iteration and
-                // never checked — both are fine for a one-shot model.
-                let _ = exited; // purely documentary
+                // Coherence on one atomic: a later poll never sees less.
+                assert!(probe.last_seen() <= FRAMES);
             }
-        });
-    }
-
-    /// **Invariant 2** — the watchdog fires EXACTLY ONCE in any
-    /// interleaving. The production watchdog task calls `notify_one()`
-    /// and returns; a second fire is a bug. Loom's state-space
-    /// exhaustion verifies this across every schedule.
-    #[test]
-    fn watchdog_fires_at_most_once_across_interleavings() {
-        loom::model(|| {
-            let state = WatchdogState::new();
-            let fire_count = Arc::new(AtomicU64::new(0));
-
-            // Watchdog observation #1: reads counter, if stale, "fires".
-            let s1 = Arc::clone(&state);
-            let fc1 = Arc::clone(&fire_count);
-            let w1 = thread::spawn(move || {
-                let c = s1.counter.load(Ordering::Relaxed);
-                if c == 0 {
-                    // CAS guard — only the first firer wins.
-                    if s1
-                        .notified
-                        .compare_exchange(false, true, Ordering::Release, Ordering::Relaxed)
-                        .is_ok()
-                    {
-                        fc1.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            });
-
-            // Watchdog observation #2: same logic, racing against #1.
-            // In production this cannot happen (one watchdog per
-            // connection), but the CAS guard must hold regardless.
-            let s2 = Arc::clone(&state);
-            let fc2 = Arc::clone(&fire_count);
-            let w2 = thread::spawn(move || {
-                let c = s2.counter.load(Ordering::Relaxed);
-                if c == 0
-                    && s2
-                        .notified
-                        .compare_exchange(false, true, Ordering::Release, Ordering::Relaxed)
-                        .is_ok()
-                {
-                    fc2.fetch_add(1, Ordering::Relaxed);
-                }
-            });
-
-            w1.join().expect("w1 join");
-            w2.join().expect("w2 join");
-
-            // INVARIANT: at most one CAS fire regardless of interleaving.
-            let fires = fire_count.load(Ordering::Relaxed);
             assert!(
-                fires <= 1,
-                "watchdog fired {fires} times — CAS guard broken in interleaving"
+                advances <= FRAMES,
+                "{advances} advances for {FRAMES} frames"
             );
+
+            reader.join().expect("reader thread");
+
+            // The join orders every bump before this poll: it must catch up
+            // to all of them in one step...
+            let before = probe.last_seen();
+            let caught_up = probe.advanced(&counter);
+            assert_eq!(probe.last_seen(), FRAMES, "probe missed a frame");
+            // ...reporting progress exactly when the racing polls had not
+            // already reached the final value...
+            assert_eq!(caught_up, before != FRAMES);
+            // ...and with no new frame, no poll may report progress again.
+            assert!(
+                !probe.advanced(&counter),
+                "a frame already counted read as progress a second time"
+            );
+            assert!(!probe.advanced(&counter));
         });
+
+        // ANTI-VACUITY: loom must have explored both outcomes of a racing poll.
+        assert!(
+            POLL_SAW_PROGRESS.load(Ordering::Relaxed) > 0,
+            "no execution let a racing poll see a frame"
+        );
+        assert!(
+            POLL_SAW_NONE.load(Ordering::Relaxed) > 0,
+            "no execution let a racing poll miss the frames"
+        );
     }
 
-    /// **Invariant 3** — when the watchdog fires, the reader observes
-    /// the notify on its NEXT check. No lost notifications: the
-    /// Release/Acquire pair guarantees the reader sees the store.
+    /// No frame, no progress: a silent reader never moves the probe, in any
+    /// interleaving of the probe's start and its polls.
     #[test]
-    fn reader_observes_watchdog_notify_after_release_store() {
+    fn a_silent_connection_never_reads_as_progress() {
         loom::model(|| {
-            let state = WatchdogState::new();
-
-            // Watchdog stores the fire flag first.
-            let s_watchdog = Arc::clone(&state);
+            let counter = Arc::new(AtomicU64::new(0));
+            let poll_counter = Arc::clone(&counter);
             let watchdog = thread::spawn(move || {
-                s_watchdog.notified.store(true, Ordering::Release);
+                let mut probe = ProgressProbe::start(&poll_counter);
+                (probe.advanced(&poll_counter), probe.advanced(&poll_counter))
             });
-
-            // Reader reads after (scheduler may interleave arbitrarily).
-            let s_reader = Arc::clone(&state);
-            let reader = thread::spawn(move || s_reader.notified.load(Ordering::Acquire));
-
-            watchdog.join().expect("watchdog join");
-            let observed = reader.join().expect("reader join");
-
-            // The reader observes either `false` (it ran first) or
-            // `true` (watchdog finished before reader load). The
-            // Release/Acquire pair means there is NO third possibility
-            // — no torn read, no visibility delay.
-            assert!(observed || !observed, "atomic bool is always valid");
-
-            // Final state: the watchdog's store is visible if we read
-            // it again after the joins.
-            let final_flag = state.notified.load(Ordering::Acquire);
-            assert!(
-                final_flag,
-                "after watchdog join, notify flag MUST be observed as true"
-            );
+            let (first, second) = watchdog.join().expect("watchdog thread");
+            assert!(!first && !second, "progress reported on a silent socket");
         });
     }
 }
 
-// Standard (non-loom) sanity tests so the file participates in every
-// CI run, not just the weekly loom-feature one.
+// Standard (non-loom) stress test on the same real functions, so the file
+// runs in the ordinary suite too.
 #[cfg(not(feature = "loom"))]
 mod std_tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::AtomicU64;
     use std::thread;
 
+    use tickvault_core::websocket::activity_watchdog::{ProgressProbe, note_activity};
+
+    /// A reader records 100,000 frames while the watchdog polls in a loop.
+    /// The probe never runs ahead of the frames, and after the reader stops
+    /// one poll catches up to the exact total and the next reports nothing.
     #[test]
-    fn stress_watchdog_cas_fires_at_most_once_across_many_racers() {
-        let notified = Arc::new(AtomicBool::new(false));
-        let fire_count = Arc::new(AtomicU64::new(0));
-        let mut handles = Vec::new();
-        for _ in 0..32 {
-            let notified = Arc::clone(&notified);
-            let fire_count = Arc::clone(&fire_count);
-            handles.push(thread::spawn(move || {
-                if notified
-                    .compare_exchange(false, true, Ordering::Release, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    fire_count.fetch_add(1, Ordering::Relaxed);
-                }
-            }));
+    fn stress_probe_tracks_a_busy_reader_exactly() {
+        const FRAMES: u64 = 100_000;
+        let counter = Arc::new(AtomicU64::new(0));
+        let reader_counter = Arc::clone(&counter);
+        let reader = thread::spawn(move || {
+            for _ in 0..FRAMES {
+                note_activity(&reader_counter);
+            }
+        });
+        let mut probe = ProgressProbe::start(&counter);
+        let mut previous = probe.last_seen();
+        while !reader.is_finished() {
+            if probe.advanced(&counter) {
+                assert!(probe.last_seen() > previous, "the probe went backwards");
+                previous = probe.last_seen();
+            }
+            assert!(probe.last_seen() <= FRAMES);
         }
-        for h in handles {
-            h.join().expect("join");
-        }
-        assert_eq!(
-            fire_count.load(Ordering::Relaxed),
-            1,
-            "exactly one racer must win the CAS fire"
-        );
+        reader.join().expect("reader thread");
+        let _ = probe.advanced(&counter);
+        assert_eq!(probe.last_seen(), FRAMES);
+        assert!(!probe.advanced(&counter));
     }
 }
