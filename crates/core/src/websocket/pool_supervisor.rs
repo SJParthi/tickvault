@@ -113,9 +113,10 @@ pub const AUTH_REJECT_MAX_HARD_FAILURES: u8 = 3;
 
 /// 808 refresh-once, park rule (c): the longest an 808 episode may run
 /// without a fresh token, counted from the episode start or the last refresh
-/// that produced one, before the slot parks. Applied only when the cycle that
-/// ended in this 808 began with a refresh (no other redial since), so time
-/// spent in an outage never parks a slot that has not tried again. The
+/// that produced one, before the slot parks, after at most one more refresh
+/// attempt past the bound: an 808 past it parks at once when its cycle began
+/// with a refresh, and otherwise (an outage came between) gets one grace
+/// refresh and parks on the next 808 past the bound. The
 /// backstop for deferred refreshes, which do not count toward
 /// [`AUTH_REJECT_MAX_HARD_FAILURES`]: at least two mint cooldowns long
 /// (asserted below), so a deferral always gets one real mint attempt before
@@ -202,6 +203,11 @@ struct AuthRejectEpisode {
     /// ceiling, so any fixed window shorter than a full cycle would make the
     /// bound unreachable.
     refreshed_this_cycle: bool,
+    /// Whether the one grace refresh past the 300 s bound, park rule (c),
+    /// has been spent. Cleared when a refresh produces a fresh token (the
+    /// bound restarts). Once set, the next 808 past the bound parks whatever
+    /// came between, so alternating 808s and failed dials cannot dodge (c).
+    grace_refresh_used: bool,
 }
 
 /// How often the shell wakes to ask the supervisor whether a socket has gone
@@ -4656,6 +4662,7 @@ impl ConnectionSupervisor {
             verified_generation: None,
             last_progress_at: now,
             refreshed_this_cycle: false,
+            grace_refresh_used: false,
         });
         // Step 3, park rule (d) of the scope lock. (Rule (a), the rejected
         // fresh token, is decided in `note_token_refresh`.) Refresh ceiling:
@@ -4688,16 +4695,21 @@ impl ConnectionSupervisor {
         // one. (c) is unconditional on `verified_generation`: after one fresh
         // token, a sibling can move the token on so every later refresh is a
         // new attempt that only defers; without (c) that slot would redial
-        // forever. (c) applies only when this cycle began with a refresh, so
-        // after an outage (failed dials, other closes) the slot refreshes
-        // once more first and parks on the next 808 if it still has none.
+        // forever. Past the bound the slot gets at most ONE more refresh:
+        // it parks at once if this cycle began with a refresh, and otherwise
+        // (an outage of failed dials or other closes came between) it takes
+        // a single grace refresh and parks on the next 808 past the bound,
+        // whatever happens in between. Without the grace limit, an 808
+        // alternating with a failed dial would never land on a refreshed
+        // cycle and the slot would never park.
         let since_progress_ms = u64::try_from(
             now.saturating_duration_since(episode.last_progress_at)
                 .as_millis(),
         )
         .unwrap_or(u64::MAX);
+        let past_bound = since_progress_ms >= AUTH_REJECT_EPISODE_MAX_MS;
         if episode.hard_failures >= AUTH_REJECT_MAX_HARD_FAILURES
-            || (episode.refreshed_this_cycle && since_progress_ms >= AUTH_REJECT_EPISODE_MAX_MS)
+            || (past_bound && (episode.refreshed_this_cycle || episode.grace_refresh_used))
         {
             error!(
                 code = ErrorCode::WsGapDisconnectClassification.code_str(),
@@ -4716,6 +4728,9 @@ impl ConnectionSupervisor {
                  obtained — parking. Operator action required."
             );
             return self.park(ParkReason::FatalDisconnect, now);
+        }
+        if past_bound && let Some(open) = self.auth_reject.as_mut() {
+            open.grace_refresh_used = true;
         }
         // Step 5. Refresh once, then redial on the shared token floor. The ring
         // is charged later, and only if the refresh produced a fresh token.
@@ -4782,6 +4797,7 @@ impl ConnectionSupervisor {
             TokenRefreshOutcome::Fresh { current } => {
                 episode.verified_generation = Some(current);
                 episode.last_progress_at = now;
+                episode.grace_refresh_used = false;
                 // Charge the per-window ceiling, park rule (d), for a refresh
                 // that produced a new generation, and only for that one: a
                 // deferral or a failure is bounded by (b) and (c) instead.
@@ -12343,6 +12359,50 @@ mod tests {
         );
     }
 
+    /// Review round 4 (2026-10-06): 808s alternating with failed dials never
+    /// land on a cycle that began with a refresh. Past the 300 s bound the
+    /// slot still gets only one grace refresh, so it parks no later than the
+    /// second 808 past the bound.
+    #[test]
+    fn test_808_alternating_with_failed_dials_parks_by_the_second_808_past_300_s() {
+        let now = t0();
+        let mut s = sup(DhanEndpointType::MainFeed, 0, now);
+        let bound = Duration::from_millis(AUTH_REJECT_EPISODE_MAX_MS);
+        let step = Duration::from_millis(TOKEN_STALE_REDIAL_FLOOR_MS);
+        let mut at = now;
+        let mut past_bound_808s = 0u32;
+        loop {
+            dial_no_frames(&mut s, at);
+            let past = at.saturating_duration_since(now) >= bound;
+            if past {
+                past_bound_808s += 1;
+            }
+            match close_808(&mut s, at) {
+                SupervisorAction::RefreshTokenThenDial { .. } => {
+                    assert_eq!(
+                        s.note_token_refresh(refresh_report(0, TokenRefreshOutcome::Deferred), at),
+                        None
+                    );
+                }
+                action => {
+                    assert_parked_fatal(&s, &action);
+                    break;
+                }
+            }
+            assert!(
+                past_bound_808s < 2,
+                "the second 808 past 300 s did not park"
+            );
+            // The refreshed dial fails; the next 808 comes on a later dial.
+            at += step;
+            assert_eq!(s.on_event(ConnEvent::BeginDial, at), SupervisorAction::Dial);
+            let _ = s.on_event(ConnEvent::DialFailed, at);
+            at += step;
+        }
+        assert!(past_bound_808s >= 1, "parked before the 300 s bound");
+        assert!(past_bound_808s <= 2);
+    }
+
     /// Review fix (2026-10-06): one real failure followed by a reused one
     /// (reported as Deferred by the closure) is ONE hard strike.
     #[test]
@@ -12820,14 +12880,16 @@ mod tests {
     }
 
     proptest! {
-        /// Review round 3: park rule (c) always fires. Whatever mix of fresh
-        /// tokens, sibling renewals, deferrals and outages comes first, an
-        /// 808 that arrives 300 s or more after the last fresh token, in a
-        /// cycle that began with a refresh, parks; and a run that then only
-        /// defers parks within 300 s plus a few cycles.
+        /// Review rounds 3 and 4: park rule (c) always fires. Whatever mix of
+        /// fresh tokens, sibling renewals, deferrals, failed dials, bare
+        /// resets and 807s comes first, an 808 that arrives 300 s or more
+        /// after the last fresh token parks when its cycle began with a
+        /// refresh or the one grace refresh past the bound is spent; and a run
+        /// that then only defers, even alternating 808s with failed dials,
+        /// parks.
         #[test]
         fn prop_808_parks_300_s_after_the_last_fresh_token_once_a_refresh_ran(
-            steps in prop::collection::vec((1_000u64..60_000, any::<bool>(), any::<bool>(), 0u8..4), 1..120),
+            steps in prop::collection::vec((1_000u64..60_000, any::<bool>(), any::<bool>(), 0u8..6), 1..120),
         ) {
             let start = t0();
             let mut s = sup(DhanEndpointType::MainFeed, 0, start);
@@ -12837,32 +12899,56 @@ mod tests {
             // (c) counts from there.
             let mut model_fresh: Option<Instant> = None;
             let mut model_refreshed_this_cycle = false;
+            let mut model_grace_used = false;
             let mut parked = false;
-            let tail_step = (5_000u64, false, false, 1u8);
-            let tail = std::iter::repeat_n(tail_step, 90);
+            // The tail alternates a failed dial with a deferred 808: the
+            // pattern that must not dodge rule (c).
+            let tail = [(5_000u64, false, false, 0u8), (5_000u64, false, false, 3u8)]
+                .into_iter()
+                .cycle()
+                .take(200);
             for (gap_ms, fresh, sibling_renewed, kind) in steps.into_iter().chain(tail) {
                 at += Duration::from_millis(gap_ms);
                 if kind == 0 {
-                    // An outage step: a failed dial, no refresh.
+                    // A failed dial, no refresh.
                     prop_assert_eq!(s.on_event(ConnEvent::BeginDial, at), SupervisorAction::Dial);
                     let _ = s.on_event(ConnEvent::DialFailed, at);
                     model_refreshed_this_cycle = false;
                     continue;
                 }
                 dial_no_frames(&mut s, at);
+                if kind == 1 || kind == 2 {
+                    // A bare reset with no frames, or an 807 (its refresh
+                    // report is ignored outside an 808 redial).
+                    let code = (kind == 2).then_some(DisconnectCode::AccessTokenExpired);
+                    let action = s.on_event(ConnEvent::Disconnected { code }, at);
+                    let parked_here = matches!(action, SupervisorAction::Park { .. });
+                    prop_assert!(!parked_here, "a reset or an 807 never parks");
+                    if kind == 2 {
+                        prop_assert_eq!(
+                            s.note_token_refresh(refresh_report(generation, TokenRefreshOutcome::Deferred), at),
+                            None
+                        );
+                    }
+                    model_refreshed_this_cycle = false;
+                    continue;
+                }
                 let progress = *model_fresh.get_or_insert(at);
-                let must_park = model_refreshed_this_cycle
-                    && at.saturating_duration_since(progress)
-                        >= Duration::from_millis(AUTH_REJECT_EPISODE_MAX_MS);
+                let past_bound = at.saturating_duration_since(progress)
+                    >= Duration::from_millis(AUTH_REJECT_EPISODE_MAX_MS);
+                let must_park = past_bound && (model_refreshed_this_cycle || model_grace_used);
                 let action = close_808(&mut s, at);
                 model_refreshed_this_cycle = false;
                 if must_park {
                     let is_park = matches!(action, SupervisorAction::Park { .. });
-                    prop_assert!(is_park, "300 s after the last fresh token, after a refresh: {:?}", action);
+                    prop_assert!(is_park, "300 s after the last fresh token, refresh spent: {:?}", action);
                 }
                 if matches!(action, SupervisorAction::Park { .. }) {
                     parked = true;
                     break;
+                }
+                if past_bound {
+                    model_grace_used = true;
                 }
                 if sibling_renewed {
                     generation += 1;
@@ -12881,6 +12967,7 @@ mod tests {
                 model_refreshed_this_cycle = true;
                 if fresh {
                     model_fresh = Some(at);
+                    model_grace_used = false;
                 }
             }
             prop_assert!(parked, "a run that only defers must park");
