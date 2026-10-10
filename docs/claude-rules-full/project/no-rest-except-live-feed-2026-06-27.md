@@ -2507,8 +2507,10 @@ the alarms, their filters, or the hold ceiling.
 - `Excuse { sealed_through_secs_of_day: Some(t) }` takes `t` as given: a `t`
   before the session open would excuse every late-window candidate. Only
   `None` is built today; plan item 51d must bound `t` before it passes one.
-- Until 51d, a REAL loss of a traded or index minute at 15:35 to 15:39 is
-  never judged: the day reads `partial`, never `diverged`, for it. Price
+- Until 51d, a REAL loss of a traded or index minute at 15:35 to 15:39,
+  after that instrument's own last live minute, is never judged: the day
+  reads `partial`, never `diverged`, for it (a gap before a later live bar of
+  the same instrument is judged, round 3). Price
   differences in those minutes (present on both sides) are still judged.
 - Until 51d, a sealed bar that is not yet readable when the read runs
   (queued for the seal writer, staged in a spill file not yet replayed, or
