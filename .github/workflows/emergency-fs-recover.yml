@@ -6,6 +6,24 @@
 # .claude/rules/project/daily-universe-scope-expansion-2026-05-27.md BEFORE
 # this file was written.
 #
+# ⚠ CHANGED 2026-10-09 (stress audit RO-1) — THIS WORKFLOW NO LONGER DELETES
+# OR DROPS ANY MARKET DATA. Quotes 21 and 22 are SPENT (they authorized one
+# deletion, on 2026-09-05). Quote 28 (2026-09-29, "yes approve all steps",
+# approving the zero-loss plan after Quote 27: "nothign shdou lneevr ever be
+# missed or removed or deleted") forbids deleting a raw WAL segment with no
+# verified S3 copy and dropping ticks, depth, candles, spill or quarantine
+# data without a verified copy. Until 2026-10-09 this file still ran
+# `rm -rf` on ws_wal, spill and dlq and dropped ticks, market_depth and every
+# candles_<tf>, none of it checked against an S3 copy. Those steps are
+# REMOVED. What is left is non-destructive: stop the app, vacuum the system
+# journal and the package cache, grow the partition and filesystem to the
+# volume's size, bring docker and QuestDB back, re-enable the app. If the
+# root is full of DATA, grow the volume first (grow-ebs-volume.yml) and then
+# run this to extend the filesystem; deleting captured data needs a fresh
+# dated operator quote naming the data, recorded in the rule file first.
+# Pinned by crates/common/tests/github_workflow_guard.rs
+# (no_workflow_deletes_market_data_without_a_verified_copy).
+#
 # WHY THIS EXISTS (measured, not assumed)
 # ------------------------------------------------------------------------
 # grow-ebs-volume.yml grew vol-0c6ab6e593e39d8c8 500 -> 600 GB at 21:39 UTC on
@@ -40,20 +58,17 @@
 #
 # WHAT IT DOES ON THE BOX (in order; every step fails loudly)
 #   1. stop + disable tickvault (so the app cannot refill the disk mid-recovery)
-#   2. delete the WAL/spill/DLQ backlog under /opt/tickvault/data (Quote 21 —
-#      the backlog every restart replays)
+#   2. vacuum the system journal and the package cache (no market data)
 #   3. growpart + xfs_growfs so the grown volume is actually usable
-#   4. restart containerd + docker, bring QuestDB up, drop the market-data
-#      tables (ticks, market_depth, every candles_<tf>) and the three console
-#      views over QuestDB's HTTP port — the app's boot DDL recreates them
-#      empty. SEBI/audit/REST tables are NEVER touched.
+#   4. restart containerd + docker and bring QuestDB up (nothing is dropped)
 #   5. re-enable tickvault (NOT started — the operator-side verification starts
 #      it over SSM once the agent registers), restart the SSM agent, print df.
 #
 # It never stops the instance and never touches the volume, the budget, or
-# any table outside the Quote 21 list. Dispatch requires typing the exact
-# instance id, and every input flows through env: (never template-interpolated
-# into run:).
+# any table. (Before 2026-10-09 step 2 deleted the WAL/spill/DLQ backlog and
+# step 4 dropped the market-data tables; see the note at the top.)
+# Dispatch requires typing the exact instance id, and every input flows
+# through env: (never template-interpolated into run:).
 
 name: emergency-fs-recover
 
@@ -64,7 +79,7 @@ on:
         description: 'Type the EXACT prod instance id (i-...) to confirm.'
         required: true
       force_market_hours:
-        description: 'Type "yes" to run INSIDE 09:00-15:45 IST Mon-Fri. Default refuses: this stops the app and drops the market-data tables mid-session.'
+        description: 'Type "yes" to run INSIDE 09:00-15:45 IST Mon-Fri. Default refuses: this stops the app mid-session.'
         required: false
         default: 'no'
       force_disk_check:
@@ -96,9 +111,10 @@ jobs:
             exit 1
           fi
 
-      # Operator sweep row 28 (2026-09-08): this workflow stops the app, deletes
-      # the WAL/spill backlog and DROPS ticks/market_depth/candles_*. Dispatched
-      # inside the session by mistake it ends the trading day. deploy-aws.yml has
+      # Operator sweep row 28 (2026-09-08): this workflow stops the app.
+      # Dispatched inside the session by mistake it ends the trading day.
+      # (Until 2026-10-09 it also deleted the WAL/spill backlog and dropped the
+      # market-data tables; both are removed, see the note at the top.) deploy-aws.yml has
       # refused the same window since 2026-07-04; this mirrors that guard exactly
       # (09:00-15:45 IST = 03:30-10:15 UTC, Mon-Fri) behind an explicit override.
       - name: Refuse to run inside the trading session unless forced
@@ -109,15 +125,15 @@ jobs:
           HHMM=$(date -u +%H%M); DOW=$(date -u +%u)
           if [ "$DOW" -le 5 ] && [ "$HHMM" -ge 0330 ] && [ "$HHMM" -lt 1015 ]; then
             if [ "$FORCE" = "yes" ]; then
-              echo "::warning::running INSIDE 09:00-15:45 IST on operator override — the app will stop and today's market-data tables will be dropped"
+              echo "::warning::running INSIDE 09:00-15:45 IST on operator override — the app will stop"
             else
-              echo "::error::BLOCK: it is $(TZ='Asia/Kolkata' date +'%H:%M IST') on a weekday — this recovery stops the app and drops today's tables. Re-run with force_market_hours=yes only if the box is already dead."
+              echo "::error::BLOCK: it is $(TZ='Asia/Kolkata' date +'%H:%M IST') on a weekday — this recovery stops the app. Re-run with force_market_hours=yes only if the box is already dead."
               exit 1
             fi
           fi
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c # v4 tag commit, 2026-07-15
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4 (commit; was the v4 tag object ff717079, 2026-10-09)
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -185,25 +201,27 @@ jobs:
           set -u
           echo "=== 0. before ==="; df -B1G / | tail -1
           # Precondition (2026-09-08): this script is for a FULL root. On a box
-          # whose disk is fine it would still delete the backlog and drop every
-          # market-data table, so it refuses unless the disk is actually full
-          # or the operator forced it. Exit 3 is the "refused" code the caller
-          # treats as terminal (never retried as an sshd-not-ready failure).
+          # whose disk is fine it would still stop and disable the app, so it
+          # refuses unless the disk is actually full or the operator forced it.
+          # Exit 3 is the "refused" code the caller treats as terminal (never
+          # retried as an sshd-not-ready failure).
           USED_PCT=$(df --output=pcent / | tail -1 | tr -dc '0-9')
           if [ "${USED_PCT:-0}" -lt 95 ] && [ "__FORCE_DISK__" != "yes" ]; then
-            echo "REFUSED: root is ${USED_PCT:-?}% used, not full — this recovery deletes the WAL/spill backlog and DROPS the market-data tables. Re-run with force_disk_check=yes if you really mean it."
+            echo "REFUSED: root is ${USED_PCT:-?}% used, not full — this recovery stops and disables the app. Re-run with force_disk_check=yes if you really mean it."
             exit 3
           fi
           echo "=== 1. stop + disable the app ==="
           sudo systemctl stop tickvault || true
           sudo systemctl disable tickvault || true
           echo "UNIT=$(systemctl is-active tickvault) ENABLED=$(systemctl is-enabled tickvault)"
-          echo "=== 2. delete the WAL/spill/DLQ backlog (Quote 21) ==="
+          echo "=== 2. free space WITHOUT touching market data (Quote 28) ==="
+          # Sizes are printed so the operator can see what fills the disk; the
+          # WAL, spill and DLQ are KEPT (no verified S3 copy is checked here).
           sudo du -sBG /opt/tickvault/data/spill /opt/tickvault/data/dlq /opt/tickvault/data/ws_wal /opt/tickvault/data/spill-hold 2>/dev/null || true
-          sudo rm -rf /opt/tickvault/data/spill /opt/tickvault/data/dlq /opt/tickvault/data/ws_wal
-          sudo rm -f /opt/tickvault/data/spill-hold/*.ilp
+          sudo journalctl --vacuum-size=200M || true
+          sudo dnf clean all >/dev/null 2>&1 || true
           sync
-          echo "AFTER-RM"; df -B1G / | tail -1
+          echo "AFTER-VACUUM"; df -B1G / | tail -1
           echo "=== 3. grow the filesystem ==="
           ROOT=$(findmnt -no SOURCE /); DISK=$(lsblk -no PKNAME "$ROOT")
           # Only the TRAILING digits are the partition number: /dev/nvme0n1p1 -> "1".
@@ -216,7 +234,7 @@ jobs:
           FSTYPE=$(findmnt -no FSTYPE /)
           if [ "$FSTYPE" = xfs ]; then sudo xfs_growfs -d / ; else sudo resize2fs "$ROOT"; fi
           echo "AFTER-GROW"; df -B1G / | tail -1
-          echo "=== 4. containerd + docker + QuestDB up, then drop the market-data tables + retired console views (Quote 21) ==="
+          echo "=== 4. containerd + docker + QuestDB up (no table is dropped) ==="
           # After a disk-full boot dockerd could not dial containerd (first live run);
           # restarting containerd and clearing docker's failed state fixed it.
           sudo systemctl restart containerd || true
@@ -227,24 +245,7 @@ jobs:
           sudo docker start tv-questdb >/dev/null 2>&1 || true
           up=0
           for i in $(seq 1 90); do curl -fsS 'http://127.0.0.1:9000/exec?query=SELECT%201' >/dev/null 2>&1 && { up=1; break; }; sleep 2; done
-          if [ "$up" != 1 ]; then echo "FAILED: QuestDB never answered on :9000 — refusing to report an empty drop as success"; sudo docker ps -a; exit 1; fi
-          q() { curl -fsS --max-time 600 -G --data-urlencode "query=$1" http://127.0.0.1:9000/exec 2>&1; }
-          ALL=$(curl -fsS --max-time 30 -G --data-urlencode 'query=SELECT table_name FROM tables()' http://127.0.0.1:9000/exp | tail -n +2 | tr -d '"\r' | sed '/^$/d')
-          echo "TABLES-BEFORE: $(echo "$ALL" | paste -sd' ' -)"
-          for v in ticks_named candles_named candles_10m market_depth_named; do echo "VIEW $v: $(q "DROP VIEW IF EXISTS $v" | head -c 100)"; done
-          TARGETS=$(printf '%s\n' "$ALL" | awk '$0=="ticks" || $0=="market_depth" || (index($0,"candles_")==1 && $0!="candles_named")' | sort)
-          echo "WIPE-TARGETS $(echo "$TARGETS" | wc -w): $(echo "$TARGETS" | paste -sd' ' -)"
-          failed=0
-          for t in $TARGETS; do
-            R=$(q "DROP TABLE IF EXISTS $t")
-            if echo "$R" | grep -q '"ddl":"OK"'; then echo "DROPPED $t"; else
-              echo "DROP-FAILED $t: $(echo "$R" | head -c 160)"; q "ALTER TABLE $t RESUME WAL" >/dev/null 2>&1 || true
-              R2=$(q "DROP TABLE IF EXISTS $t"); echo "RETRY $t: $(echo "$R2" | head -c 120)"
-              echo "$R2" | grep -q '"ddl":"OK"' || failed=1; fi
-          done
-          echo "TABLES-AFTER: $(curl -fsS -G --data-urlencode 'query=SELECT table_name FROM tables()' http://127.0.0.1:9000/exp | tail -n +2 | tr -d '"\r' | paste -sd' ' -)"
-          sync; sleep 45; echo "AFTER-DROP"; df -B1G / | tail -1
-          [ "$failed" = 0 ] || { echo "FAILED: at least one drop did not succeed"; exit 1; }
+          if [ "$up" != 1 ]; then echo "FAILED: QuestDB never answered on :9000"; sudo docker ps -a; exit 1; fi
           echo "=== 5. re-enable the app (not started) + wake the SSM agent ==="
           sudo systemctl enable tickvault || true
           sudo systemctl restart amazon-ssm-agent || true
