@@ -9082,7 +9082,10 @@ page) only when one of these holds:
 - (d) more than `AUTH_REJECT_MAX_REFRESHES_PER_WINDOW` (4) refreshes that each
   PRODUCED A FRESH TOKEN (a new generation) happened inside
   `AUTH_REJECT_WINDOW_MS` (300 s). A deferred or failed refresh is not counted
-  here.
+  here. The window is per SLOT and spans episodes: it is not cleared when an
+  episode ends or the slot parks, so a slot that got four fresh tokens inside
+  300 s, each accepted and delivering for a while before the next 808, parks
+  on the fifth 808 without refreshing again (review round 5).
 
 A refresh refused only because of the mint cooldown or the RESILIENCE-03 lock is
 DEFERRED: it counts toward neither (b) nor (d), so at the real redial cadence
