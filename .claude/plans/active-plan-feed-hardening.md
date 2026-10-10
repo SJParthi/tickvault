@@ -6644,11 +6644,11 @@ Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.
 Authority: Quote 29e in `docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md` (owner tapped "One-time permission", 2026-10-09 21:52 IST).
 
 - [x] 53a — one-off role, Rust delete tool and dispatch workflow (crates/app, tickvault-app).
-  - Files: deploy/aws/terraform/s3-old-data-delete-2026-10-09.tf, crates/app/src/s3_old_data_delete.rs, crates/app/src/bin/s3_old_data_delete.rs, crates/app/Cargo.toml, crates/app/src/lib.rs, .github/workflows/s3-old-data-delete-2026-10-09.yml
-  - Tests: test_classify_partition_keys, test_classify_dated_folder_keys, test_market_data_tables_match_the_iam_grant, test_run_refusal_rules, test_plan_counts_versions_markers_and_bytes, test_run_refuses_a_bad_mode_and_an_unconfirmed_apply
-- [ ] 53b — after the run: delete the role, workflow and tool; mark Quote 29e ENDED.
-  - Files: filled in by its PR
-  - Tests: filled in by its PR
+  - Files: crates/app/Cargo.toml, crates/app/src/lib.rs (the role file, the workflow, the tool and its tests were deleted by 53b after the run)
+  - Tests: (deleted with the tool by 53b; the run record is the ENDED note under Quote 29e)
+- [x] 53b — after the run: delete the role, workflow and tool; mark Quote 29e ENDED. Apply run 2026-10-10: 1,304 versions (109.10 GB) deleted, 0 left in scope, 214 later versions kept.
+  - Files: crates/app/Cargo.toml, crates/app/src/lib.rs, docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md, .claude/rules/project/daily-universe-scope-expansion-2026-05-27.md
+  - Tests: (removal only; terraform plan in CI shows the role destroyed)
 
 ### Design (Item 53)
 The tool lists every version and delete marker under 19 exact prefixes (17 market-data tables under `questdb-partitions/`, plus `raw-frames/` and `seal-spill/`), classifies each key by the date it starts with, and deletes only versions dated before 2026-10-09 by version id, 1,000 per DeleteObjects call. The role can list only those prefixes and delete only versions (never `s3:DeleteObject`, so no delete marker), and is denied today's keys, `deploys/`, `sebi-preserve/` and bucket settings. Code and IAM grant are held in lockstep by a test that reads the terraform file.
