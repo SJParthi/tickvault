@@ -762,6 +762,7 @@ jobs:
           crates/app/tests/dhat_ws_lag_recorder.rs
           crates/core/tests/dhat_allocation.rs
           crates/core/tests/dhat_depth_packet_zero_alloc.rs
+          crates/core/tests/dhat_frame_silence_activity.rs
           crates/core/tests/dhat_instrument_registry.rs
           crates/core/tests/dhat_moneyness.rs
           crates/core/tests/dhat_telegram_dispatcher.rs
@@ -824,6 +825,7 @@ jobs:
           cargo test -p tickvault-core --features dhat \
             --test dhat_allocation \
             --test dhat_depth_packet_zero_alloc \
+            --test dhat_frame_silence_activity \
             --test dhat_instrument_registry \
             --test dhat_moneyness \
             --test dhat_telegram_dispatcher \
