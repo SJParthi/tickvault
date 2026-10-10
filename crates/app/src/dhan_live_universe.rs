@@ -1549,7 +1549,8 @@ pub fn mapping_wait_end_ist_secs(now_ist_secs: u32, rider_target_ist_secs: u32) 
 /// Counter: how each boot's wait for the mapping artifact ended.
 ///
 /// `outcome` is one of `not_requested`, `rider_disabled`, `already_present`,
-/// `became_ready`, `timed_out`, `pre_open_cutoff`.
+/// `non_trading_day`, `producer_too_far`, `became_ready`, `timed_out`,
+/// `pre_open_cutoff`.
 ///
 /// # NOT shipped to CloudWatch — deliberately, and this is a real limitation
 ///
@@ -1728,6 +1729,7 @@ pub async fn await_mapping_artifact(
     cfg: &tickvault_common::config::DhanUniverseConfig,
     date_ist: &str,
     collapse_expected: bool,
+    trading_day: bool,
 ) {
     // Nothing to wait for: the lane is not master-sourced this boot.
     if !cfg.live_subscription_from_master {
@@ -1769,6 +1771,22 @@ pub async fn await_mapping_artifact(
              so nothing will ever write today's mapping. Not waiting — the lane will subscribe \
              the newest earlier list on disk, or the 4 index SIDs if there is none. Enable the rider or turn master sourcing off; the two flags \
              disagree."
+        );
+        return;
+    }
+
+    // No session today, so no socket opens and nothing reads the list before
+    // the next trading day's boot. Waiting would only hold the boot: a boot
+    // between 07:10 and the rider's build hour waits up to an hour, and on
+    // 2026-10-10 (a Saturday) a 07:24 IST deploy timed out on that wait and
+    // reported FAILED for a healthy binary.
+    if !trading_day {
+        metrics::counter!(MAPPING_WAIT_COUNTER, "outcome" => "non_trading_day").increment(1);
+        tracing::info!(
+            path = %path.display(),
+            "live universe: not waiting for today's mapping — today is not a trading day, so \
+             no session will read it. This boot subscribes the newest earlier list (or the \
+             index universe if none is on disk)."
         );
         return;
     }
@@ -3137,7 +3155,7 @@ mod tests {
             ..Default::default()
         };
         let t0 = std::time::Instant::now();
-        await_mapping_artifact(&cfg, "2099-01-06", false).await;
+        await_mapping_artifact(&cfg, "2099-01-06", false, true).await;
         assert!(
             t0.elapsed() < std::time::Duration::from_millis(200),
             "master sourcing off means nothing to wait for; waited {:?}",
@@ -3157,10 +3175,32 @@ mod tests {
             ..Default::default()
         };
         let t0 = std::time::Instant::now();
-        await_mapping_artifact(&cfg, "2099-01-07", false).await;
+        await_mapping_artifact(&cfg, "2099-01-07", false, true).await;
         assert!(
             t0.elapsed() < std::time::Duration::from_millis(200),
             "a disabled rider must fail fast, not stall boot; waited {:?}",
+            t0.elapsed()
+        );
+    }
+
+    // Regression: 2026-10-10 — a Saturday 07:24 IST deploy waited for the
+    // rider's 08:00 build, never became ready inside the deploy's 750 s gate,
+    // and reported FAILED for a healthy binary.
+    #[tokio::test]
+    async fn test_regression_await_mapping_artifact_does_not_wait_on_a_non_trading_day() {
+        // Master sourcing on and the rider enabled: the only thing that stops
+        // the wait is the day. The clock is real, so at any hour inside the
+        // wait window this would otherwise sleep until the rider's build.
+        let cfg = tickvault_common::config::DhanUniverseConfig {
+            live_subscription_from_master: true,
+            enabled: true,
+            ..Default::default()
+        };
+        let t0 = std::time::Instant::now();
+        await_mapping_artifact(&cfg, "2099-01-10", true, false).await;
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(200),
+            "a non-trading day has no session to subscribe for; waited {:?}",
             t0.elapsed()
         );
     }

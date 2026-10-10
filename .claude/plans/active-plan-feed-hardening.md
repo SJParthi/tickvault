@@ -6448,6 +6448,48 @@ No new metric, alarm or page. Book rows use the existing depth counters (rows st
 
 Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
 
+## ITEM 49e-4 — Step 4: array rows turned on in production (2026-10-10)
+
+- [x] `[depth_storage] array_rows = true` in `config/production.toml` (base.toml stays false) — Files: config/production.toml — Tests: test_depth_storage_config_ships_off_in_base_toml, test_resolve_records_the_first_instant_once_and_keeps_it
+
+Why: the operator's 2026-10-09 instruction for PR #2043, "ships OFF; after deploy, turn it on through automation before market open". #2043 merged at `5964162` with All Green and went live with the setting off in the deploy of `55831e2` (2026-10-10, 00:28 UTC). This config change deploys on merge (the deploy workflow watches `config/**`), so the first boot with it on is an off-market boot before Monday 12 Oct's open, which records the start instant. The scope-lock condition (a recorded QuestDB scratch-table test) is met by ITEM 49d / 45i (2026-10-06).
+
+Rollback: set `array_rows = false` and redeploy; the next boot removes the instant and writes `market_depth` only. Rows already in `market_depth_book` stay and age out on the depth window.
+
+Observability: the boot logs whether array rows are on and the instant in use. Check after the first boot: `SELECT count(*) FROM market_depth_book WHERE ts IN today()` grows during the session, and the depth apply lag on `tv_questdb_wal_apply_lag_max` falls against 2026-10-09.
+
+Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
+
+
+## ITEM 49e-5 — A non-trading-day boot does not wait for the instrument list (2026-10-10)
+
+- [x] `await_mapping_artifact` takes the trading-day verdict and returns at once on a non-trading day (outcome `non_trading_day`)
+  - Files: crates/app/src/dhan_live_universe.rs, crates/app/src/main.rs, crates/app/tests/universe_boot_race_guard.rs
+  - Tests: test_regression_await_mapping_artifact_does_not_wait_on_a_non_trading_day, every_wait_outcome_is_counted
+
+**Why (Verified, CloudWatch `/tickvault/prod/app` and deploy-aws run 38014245945):** the 07:24 IST deploy on Saturday 10 Oct
+logged "waiting for the daily rider before subscribing", sat in `activating (start)` for 12 minutes, missed the deploy's
+750 s readiness gate, and was reported FAILED (auto-stop and a page) for a healthy binary. The 06:09 IST deploy the same
+morning took the `producer_too_far` arm and was ready in under a minute. The wait only exists so a trading session does not
+start on 4 instruments; with no session today nothing reads the list.
+
+**Edge Cases:** a trading day is unchanged (the new arm needs `!trading_day`); an artifact already on disk still returns
+`already_present` first; a disabled rider still returns `rider_disabled` first.
+
+**Failure Modes:** a calendar that wrongly reads a trading day as a holiday would skip the wait on that day; the resolve
+then takes its existing, loudly logged fallback (newest earlier list), the same as a timed-out wait.
+
+**Rollback:** revert the PR; the wait returns to its earlier behaviour.
+
+**Observability:** `tv_dhan_live_universe_mapping_wait_total{outcome="non_trading_day"}` plus one `info!` line.
+
+**Not fixed (Limitation):** a deploy on a TRADING day between 07:10 and the rider's build hour still waits up to
+`MAPPING_WAIT_MAX_STALL_SECS` (3,600 s), longer than the deploy's 750 s gate; `the_deploy_readiness_gate_outlasts_the_boot_wait_budget`
+compares the gate with `MAPPING_WAIT_DEADLINE_SECS` (600 s), not that stall.
+
+Guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row) — boot path only, no hot-path,
+table, alarm or WebSocket change.
+
 ## ITEM 51 — Dhan 15:41 cross-verification hardening (2026-10-06)
 
 Approved by Parthiban 2026-10-06: "Go ahead with whatever you want dude" and "See do everything whatever is recommended dude okay?", answering the recommended cross-verification hardening list (five findings: the day marker, the read that runs too early, missing minutes that never page, a day with no run at all, and targets fixed at boot). Rule authority: `no-rest-except-live-feed-2026-06-27.md` §12.15.7 onward and the noise lock §2.5 notes, each dated and recorded before its code. Ten serial PRs, one sub-item each. Findings Verified by reading `origin/main` at `60bdfd97a`; cargo was not run for the findings.
@@ -6632,11 +6674,11 @@ Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.
 Authority: Quote 29e in `docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md` (owner tapped "One-time permission", 2026-10-09 21:52 IST).
 
 - [x] 53a — one-off role, Rust delete tool and dispatch workflow (crates/app, tickvault-app).
-  - Files: deploy/aws/terraform/s3-old-data-delete-2026-10-09.tf, crates/app/src/s3_old_data_delete.rs, crates/app/src/bin/s3_old_data_delete.rs, crates/app/Cargo.toml, crates/app/src/lib.rs, .github/workflows/s3-old-data-delete-2026-10-09.yml
-  - Tests: test_classify_partition_keys, test_classify_dated_folder_keys, test_market_data_tables_match_the_iam_grant, test_run_refusal_rules, test_plan_counts_versions_markers_and_bytes, test_run_refuses_a_bad_mode_and_an_unconfirmed_apply
-- [ ] 53b — after the run: delete the role, workflow and tool; mark Quote 29e ENDED.
-  - Files: filled in by its PR
-  - Tests: filled in by its PR
+  - Files: crates/app/Cargo.toml, crates/app/src/lib.rs (the role file, the workflow, the tool and its tests were deleted by 53b after the run)
+  - Tests: (deleted with the tool by 53b; the run record is the ENDED note under Quote 29e)
+- [x] 53b — after the run: delete the role, workflow and tool; mark Quote 29e ENDED. Apply run 2026-10-10: 1,304 versions (109.10 GB) deleted, 0 left in scope, 214 later versions kept.
+  - Files: crates/app/Cargo.toml, crates/app/src/lib.rs, docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md, .claude/rules/project/daily-universe-scope-expansion-2026-05-27.md
+  - Tests: (removal only; terraform plan in CI shows the role destroyed)
 
 ### Design (Item 53)
 The tool lists every version and delete marker under 19 exact prefixes (17 market-data tables under `questdb-partitions/`, plus `raw-frames/` and `seal-spill/`), classifies each key by the date it starts with, and deletes only versions dated before 2026-10-09 by version id, 1,000 per DeleteObjects call. The role can list only those prefixes and delete only versions (never `s3:DeleteObject`, so no delete marker), and is denied today's keys, `deploys/`, `sebi-preserve/` and bucket settings. Code and IAM grant are held in lockstep by a test that reads the terraform file.
