@@ -7006,7 +7006,8 @@ pub struct IdleStep {
 /// buckets behind. Widening that needs `last_sealed` to remember more than
 /// one bucket per (slot, timeframe), which is a memory and design change with
 /// its own measurement. Recorded rather than implied fixed.
-const CATCHUP_LATENESS_MARGIN_SECS: u32 = MEASURED_MAX_DELIVERY_LAG_SECS.div_ceil(60) * 60;
+pub(crate) const CATCHUP_LATENESS_MARGIN_SECS: u32 =
+    MEASURED_MAX_DELIVERY_LAG_SECS.div_ceil(60) * 60;
 
 /// The measured worst-case Dhan delivery lag, exchange stamp to our receipt.
 ///
@@ -7024,7 +7025,7 @@ const CATCHUP_LATENESS_MARGIN_SECS: u32 = MEASURED_MAX_DELIVERY_LAG_SECS.div_cei
 /// across 16 sockets, and nothing here claims the distribution is unchanged at
 /// that scale. `tv_dhan_ws_lag_ms` is the live read-out — if a session
 /// measures a worse max, this constant is what moves.
-const MEASURED_MAX_DELIVERY_LAG_SECS: u32 = 199;
+pub(crate) const MEASURED_MAX_DELIVERY_LAG_SECS: u32 = 199;
 
 /// How often the lane asks the gap detector what it has recorded.
 ///
