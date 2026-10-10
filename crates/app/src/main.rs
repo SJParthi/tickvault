@@ -967,7 +967,7 @@ async fn async_main() -> Result<()> {
             config.questdb.clone(),
         ),
     );
-    // Contract name repair (2026-10-10, item 54): once a day after the close,
+    // Contract name repair (2026-10-10, item 56): once a day after the close,
     // put the `contract` name back on rows a boot rewrote without one (the
     // 2026-10-09 evening redeploys). Process-global, every boot mode; it only
     // touches days whose contract files are still on disk.

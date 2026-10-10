@@ -360,7 +360,7 @@ pub(crate) const RETENTION_EXEMPT_TABLES: &[&str] = &[
 /// data and not audit records, so they are neither swept, exempt, nor
 /// exported by the destructive operator actions.
 ///
-/// - `contract_name_repair_map` (2026-10-10, plan item 54): the one-day name
+/// - `contract_name_repair_map` (2026-10-10, plan item 56): the one-day name
 ///   list the after-close contract name repair joins against
 ///   (`contract_name_repair`), created fresh for each day and dropped after it.
 #[cfg(test)]

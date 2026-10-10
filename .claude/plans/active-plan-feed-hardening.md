@@ -6387,15 +6387,37 @@ A real-runtime bite test shows a blocking thread's timer failing after a dropped
 ### Rollback (Item 54)
 Revert the PR. No config, schema, table or alarm changes.
 
-## Test Plan (Item 54)
+### Observability (Item 54)
+New info lines: "shutdown arrived before the WAL refold", "shutdown arrived before the sockets were dialled"; the catch-up summary line gains `stop_reason = "shutdown"` and a planned stop is not counted on `tv_wal_catchup_budget_exhausted_total`. No new metric or alarm. Per-item guarantee matrix: see the plan's shared matrix section.
+
+## ITEM 56 — CONTRACT NAMES ON REBUILT ROWS (added 2026-10-10, operator: "Check whether other contracts have the same gaps. Zero tick loss is the rule, so fix and backfill automatically."): rebuilt rows lost their contract name
+
+Authority: the owner's 2026-10-10 ask to fix everything ("make everything to work and finish and fix and resolve everything"), relayed by the coordinator with the brief "fix the unclean shutdown, zero tick loss". Evidence from CloudWatch `/tickvault/prod/app`: 6 Oct 15:46:51 IST "PANIC: tickvault crashed" ("A Tokio 1.x context was found, but it is being shutdown", 20 ms after "tickvault stopped"); 9 Oct 22:41 and 10 Oct 02:17 IST "frame drain DIED (task cancelled)" about 85 s after "tickvault stopped".
+
+## Design (Item 56)
+
+### Design (Item 54)
+Two causes, two fixes. (1) Dropping the tokio runtime at the end of `main` shuts the time and IO drivers down while blocking-pool threads may still wait on a timer through `Handle::block_on` (the tick spill replay round), which panics and, under `panic = "abort"`, dumps core; and it waits without bound for a worker stuck in synchronous work. `main` now leaks the runtime: every durable tier was already drained by the shutdown sequence, and work still running is crash-safe by design. (2) The lane read the stop only during its token wait and inside the drain, so a stop during the boot WAL refold or the catch-up drain ran both to the end and then spawned the drain into a dying runtime. The lane now reads `SOCKET_STOP` (requested first by `main`, never cleared, one atomic load) at safe boundaries only: it never interrupts a refold batch mid-way, because a half-folded batch would seal partial candles.
+
+## Edge Cases (Item 56)
+
+### Failure Modes (Item 54)
+A refold batch or ack wait longer than `main`'s 30 s lane budget still logs the existing shutdown-timeout ERROR, and the process then exits with the lane mid-work: unconfirmed segments are re-read next boot (DEDUP makes the re-fold idempotent). Log lines written in the last moment before exit may not reach the log file, because the logging guards were already leaked for the process lifetime; this is unchanged from before. A stop between catch-up rounds ends the replay on a gap, so the candles still open at that point are withheld and counted on `tv_candle_refold_partial_suppressed_total` rather than written short (the raw ticks stay in `ticks` and the WAL); before this change the lane was cancelled there with no seal and nothing counted.
+
+## Failure Modes (Item 56)
+
+### Rollback (Item 54)
+Revert the PR. No config, schema, table or alarm changes.
+
+## Test Plan (Item 56)
 
 `cargo test -p tickvault-app --lib -- dhan_contract_universe` (98 passed), `cargo clippy -p tickvault-app --no-deps -- -D warnings -W clippy::perf` clean. Repair: the SQL builders and the schedule are unit-tested; `contract_name_repair_live` (ignored, needs QuestDB) builds a table with a blank row, a named row, an unnamed id, another feed and another day, runs the repair, and checks only the blank row changed, with every value kept, and that a second run is clean (passed on a local QuestDB 9.3.5, 2026-10-10).
 
-## Rollback (Item 54)
+## Rollback (Item 56)
 
 Revert the PR: the boot publishes spot names only again and the after-close repair stops. Names the repair already wrote stay (they are the names the rows had before the redeploys); `contract_name_repair_map` is a scratch table and can be dropped.
 
-## Observability (Item 54)
+## Observability (Item 56)
 
 Two `info!` lines at boot (count and the day the names came from); the existing `tv_candle_contract_labels_published` gauge reads the full count from the first boot call instead of 862. Repair: one `info!` per day checked (names, rows restored, tables repaired, clean, skipped, failures) and one per run; counters `tv_contract_name_repair_rows_total` and `tv_contract_name_repair_runs_total{outcome}`, registered at 0 when the task starts. Statement failures are `warn!` (nothing is lost: the rows and their values stay; only the name is still missing). No page, alarm, EMF name or filter.
 
