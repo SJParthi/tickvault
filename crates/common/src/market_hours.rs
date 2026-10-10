@@ -7,7 +7,7 @@
 //!
 //! # Authority
 //! The market-hours window is derived from `TICK_PERSIST_START_SECS_OF_DAY_IST`
-//! (09:00 IST) and `TICK_PERSIST_END_SECS_OF_DAY_IST` (15:30 IST). Do NOT
+//! (09:00 IST) and `TICK_PERSIST_END_SECS_OF_DAY_IST` (15:40 IST). Do NOT
 //! hardcode different bounds elsewhere — they must come from this helper so
 //! a single edit (e.g. if NSE extends market hours) propagates everywhere.
 //!
@@ -57,7 +57,7 @@ pub fn set_market_calendar_for_session(calendar: Arc<TradingCalendar>) -> bool {
 /// The trading-day-aware "is the market open RIGHT NOW?" answer used by the
 /// `/feeds` live-feed health verdict.
 ///
-/// Returns `true` ONLY when the IST wall-clock is inside `[09:00, 15:30)` AND
+/// Returns `true` ONLY when the IST wall-clock is inside `[09:00, 15:40)` AND
 /// today is an actual NSE trading day:
 /// - If a calendar was installed via [`set_market_calendar_for_session`], today
 ///   must be a trading day per [`TradingCalendar::is_trading_day_today`] (covers
@@ -177,25 +177,32 @@ fn in_market_hours_at(sec_of_day: u32) -> bool {
 
 /// `true` when a Unix timestamp falls on a Saturday or Sunday in IST.
 ///
-/// Day 0 of the Unix epoch (1970-01-01) was a Thursday, which is index 3 when
-/// Monday is 0 (chrono's `TryFrom<u8>` numbering), so the IST weekday index is
-/// `(ist_day + 3) mod 7`. `rem_euclid` keeps it in `0..7`, so the `try_from`
-/// can never fail; if it somehow did, the day would read as a weekday.
+/// Day 0 of the Unix epoch (1970-01-01) was a Thursday, so the IST weekday of
+/// a timestamp is `WEEKDAYS_FROM_EPOCH[ist_day mod 7]`, with the table starting
+/// on Thursday. The table is spelled out rather than relying on chrono's
+/// integer numbering of `Weekday`, which chrono documents as not to be relied
+/// on. `rem_euclid` keeps the index in `0..7`, so the lookup always hits; if it
+/// somehow missed, the day would read as a weekday.
 #[must_use]
 #[inline]
 fn is_ist_weekend_at(utc_secs: i64) -> bool {
-    /// Monday-based weekday index of 1970-01-01 (a Thursday).
-    const EPOCH_WEEKDAY_FROM_MONDAY: i64 = 3;
+    /// Weekdays in order from the Unix epoch's day (a Thursday).
+    const WEEKDAYS_FROM_EPOCH: [chrono::Weekday; 7] = [
+        chrono::Weekday::Thu,
+        chrono::Weekday::Fri,
+        chrono::Weekday::Sat,
+        chrono::Weekday::Sun,
+        chrono::Weekday::Mon,
+        chrono::Weekday::Tue,
+        chrono::Weekday::Wed,
+    ];
     const DAYS_PER_WEEK: i64 = 7;
     let ist_day = utc_secs
         .saturating_add(i64::from(IST_UTC_OFFSET_SECONDS))
         .div_euclid(i64::from(SECONDS_PER_DAY));
-    let weekday_from_monday = ist_day
-        .saturating_add(EPOCH_WEEKDAY_FROM_MONDAY)
-        .rem_euclid(DAYS_PER_WEEK);
-    let weekday = u8::try_from(weekday_from_monday)
+    let weekday = usize::try_from(ist_day.rem_euclid(DAYS_PER_WEEK))
         .ok()
-        .and_then(|index| chrono::Weekday::try_from(index).ok());
+        .and_then(|index| WEEKDAYS_FROM_EPOCH.get(index));
     matches!(weekday, Some(chrono::Weekday::Sat | chrono::Weekday::Sun))
 }
 
@@ -416,6 +423,9 @@ mod tests {
     /// market-hours gate tests in `connection` and `order_update_connection`.
     #[test]
     fn returns_bool_without_panic() {
+        // Hold the override lock at false so the real-clock path runs on
+        // every run (another test forcing it true would skip those lines).
+        let _force_guard = ForceHours::set(false);
         let _ = is_within_market_hours_ist();
     }
 
@@ -439,6 +449,9 @@ mod tests {
     /// Smoke test: helper returns a bool without panic.
     #[test]
     fn trading_session_returns_bool_without_panic() {
+        // Hold the override lock at false so the real-clock path runs on
+        // every run (another test forcing it true would skip those lines).
+        let _force_guard = ForceHours::set(false);
         let _ = is_within_trading_session_ist();
     }
 
@@ -454,12 +467,20 @@ mod tests {
     /// gate — if it's currently outside market hours, it's also outside the
     /// trading session, regardless of weekday.
     #[test]
+    ///
+    /// Checked on the pure helpers over every minute of a full week rather
+    /// than on the wall clock, so it asserts the same thing whatever time CI
+    /// runs (2026-10-10: the old `if !in_hours { assert }` body only ran
+    /// outside market hours, which moved the crate's line coverage).
     fn trading_session_implies_market_hours() {
-        let _force_guard = ForceHours::set(false);
-        if !is_within_market_hours_ist() {
+        let week_start = ist_instant(2026, 10, 5, 0, 0, 0); // a Monday
+        let minutes_per_week = 7 * 24 * 60;
+        for minute in 0..minutes_per_week {
+            let utc_secs = week_start + minute * 60;
+            let in_hours = in_market_hours_at(ist_secs_of_day_at(utc_secs));
             assert!(
-                !is_within_trading_session_ist(),
-                "trading session must be false when market hours is false"
+                !in_trading_session_at(utc_secs) || in_hours,
+                "trading session must be false when market hours is false (minute {minute})"
             );
         }
     }
@@ -531,6 +552,9 @@ mod tests {
     /// `is_trading_session_now()` returns a bool without panic (real clock).
     #[test]
     fn trading_session_now_returns_bool_without_panic() {
+        // Hold the override lock at false so the real-clock path runs on
+        // every run (another test forcing it true would skip those lines).
+        let _force_guard = ForceHours::set(false);
         let _ = is_trading_session_now();
     }
 
@@ -542,13 +566,14 @@ mod tests {
     #[test]
     fn trading_session_now_falls_back_to_weekday_gate_when_no_calendar() {
         let _force_guard = ForceHours::set(false);
-        if SESSION_CALENDAR.get().is_none() {
-            assert_eq!(
-                is_trading_session_now(),
-                is_within_trading_session_ist(),
-                "no calendar → must mirror the weekday-only gate"
-            );
-        }
+        // Written without an `if` so every line runs whichever test installs
+        // the calendar first (test order would otherwise move coverage).
+        let no_calendar = SESSION_CALENDAR.get().is_none();
+        let mirrors = is_trading_session_now() == is_within_trading_session_ist();
+        assert!(
+            !no_calendar || mirrors,
+            "no calendar → must mirror the weekday-only gate"
+        );
     }
 
     /// Install the session calendar ONCE (this test owns the `OnceLock` per
@@ -622,6 +647,9 @@ mod tests {
     /// market opens.
     #[test]
     fn secs_until_next_open_bounded_below_one_day() {
+        // Hold the override lock at false so the real-clock path runs on
+        // every run (another test forcing it true would skip those lines).
+        let _force_guard = ForceHours::set(false);
         let secs = secs_until_next_market_open_ist();
         assert!(
             secs < u64::from(SECONDS_PER_DAY),
@@ -635,18 +663,21 @@ mod tests {
     /// a no-op and re-introduce the flap.
     #[test]
     fn secs_until_next_open_positive_when_off_hours() {
-        // Force off-hours by clearing the override (default state).
-        let _force_guard = ForceHours::set(false);
-        if !is_within_market_hours_ist() {
+        // Fixed off-hours instants, so the assertion runs whatever time CI
+        // starts (2026-10-10: it used to sit inside `if !in_hours`, which
+        // left these lines uncovered on a run during market hours). The
+        // in-hours direction is `secs_until_next_open_returns_zero_during_market_hours`.
+        for sec_of_day in [
+            0,
+            TICK_PERSIST_START_SECS_OF_DAY_IST - 1,
+            TICK_PERSIST_END_SECS_OF_DAY_IST,
+            SECONDS_PER_DAY - 1,
+        ] {
             assert!(
-                secs_until_next_market_open_ist() > 0,
-                "off-hours must return > 0 secs"
+                secs_until_market_open_from(sec_of_day) > 0,
+                "off-hours must return > 0 secs (sec_of_day {sec_of_day})"
             );
         }
-        // If the real wall-clock happens to be inside [09:00, 15:30) IST
-        // while CI runs this test, we can't deterministically assert > 0
-        // — but `secs_until_next_open_returns_zero_during_market_hours`
-        // covers that direction.
     }
 
     /// Phase 2 ratchet: `now_ist_secs_of_day` returns a value in
@@ -654,6 +685,9 @@ mod tests {
     /// in CI but the bound is invariant.
     #[test]
     fn test_now_ist_secs_of_day_is_bounded() {
+        // Hold the override lock at false so the real-clock path runs on
+        // every run (another test forcing it true would skip those lines).
+        let _force_guard = ForceHours::set(false);
         let s = now_ist_secs_of_day();
         assert!(s < 86400, "secs-of-day must be < 86400, got {s}");
     }
@@ -675,6 +709,9 @@ mod tests {
     /// MUST NOT exceed 24h.
     #[test]
     fn test_secs_until_next_ist_midnight_is_bounded() {
+        // Hold the override lock at false so the real-clock path runs on
+        // every run (another test forcing it true would skip those lines).
+        let _force_guard = ForceHours::set(false);
         let s = secs_until_next_ist_midnight();
         assert!(s > 0, "secs_until_next_ist_midnight must be positive");
         assert!(
