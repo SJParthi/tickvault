@@ -6305,11 +6305,11 @@ Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.
   - Tests: test_repair_insert_sql_copies_every_column_and_names_only_blank_dhan_rows, test_repair_insert_sql_refuses_a_table_missing_a_join_column, test_map_insert_sql_escapes_quotes_and_stamps_the_day, test_map_insert_sql_batch_stays_under_the_request_buffer, test_map_table_ddl_has_dedup_with_feed, test_count_and_repair_share_one_row_source, test_parsers_read_questdb_answers, test_is_valid_day_accepts_only_iso_dates, test_repair_is_due_only_after_the_close_and_once_a_day, test_repair_days_covers_the_incident_day_from_the_next_deploy, test_repair_tables_include_candles_ticks_and_aux_but_not_depth, contract_names_for_day_is_none_without_that_days_symbol_map, repair_names_blank_rows_in_place_and_leaves_everything_else (ignored; run against a local QuestDB 9.3.5 on 2026-10-10, passed)
 
 - [x] 53a — one-off role, Rust delete tool and dispatch workflow (crates/app, tickvault-app).
-  - Files: deploy/aws/terraform/s3-old-data-delete-2026-10-09.tf, crates/app/src/s3_old_data_delete.rs, crates/app/src/bin/s3_old_data_delete.rs, crates/app/Cargo.toml, crates/app/src/lib.rs, .github/workflows/s3-old-data-delete-2026-10-09.yml
-  - Tests: test_classify_partition_keys, test_classify_dated_folder_keys, test_market_data_tables_match_the_iam_grant, test_run_refusal_rules, test_plan_counts_versions_markers_and_bytes, test_run_refuses_a_bad_mode_and_an_unconfirmed_apply
-- [ ] 53b — after the run: delete the role, workflow and tool; mark Quote 29e ENDED.
-  - Files: filled in by its PR
-  - Tests: filled in by its PR
+  - Files: crates/app/Cargo.toml, crates/app/src/lib.rs (the role file, the workflow, the tool and its tests were deleted by 53b after the run)
+  - Tests: (deleted with the tool by 53b; the run record is the ENDED note under Quote 29e)
+- [x] 53b — after the run: delete the role, workflow and tool; mark Quote 29e ENDED. Apply run 2026-10-10: 1,304 versions (109.10 GB) deleted, 0 left in scope, 214 later versions kept.
+  - Files: crates/app/Cargo.toml, crates/app/src/lib.rs, docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md, .claude/rules/project/daily-universe-scope-expansion-2026-05-27.md
+  - Tests: (removal only; terraform plan in CI shows the role destroyed)
 
 ### Design (Item 53)
 The tool lists every version and delete marker under 19 exact prefixes (17 market-data tables under `questdb-partitions/`, plus `raw-frames/` and `seal-spill/`), classifies each key by the date it starts with, and deletes only versions dated before 2026-10-09 by version id, 1,000 per DeleteObjects call. The role can list only those prefixes and delete only versions (never `s3:DeleteObject`, so no delete marker), and is denied today's keys, `deploys/`, `sebi-preserve/` and bucket settings. Code and IAM grant are held in lockstep by a test that reads the terraform file.
