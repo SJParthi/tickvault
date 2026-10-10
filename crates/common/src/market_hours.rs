@@ -7,7 +7,7 @@
 //!
 //! # Authority
 //! The market-hours window is derived from `TICK_PERSIST_START_SECS_OF_DAY_IST`
-//! (09:00 IST) and `TICK_PERSIST_END_SECS_OF_DAY_IST` (15:30 IST). Do NOT
+//! (09:00 IST) and `TICK_PERSIST_END_SECS_OF_DAY_IST` (15:40 IST). Do NOT
 //! hardcode different bounds elsewhere — they must come from this helper so
 //! a single edit (e.g. if NSE extends market hours) propagates everywhere.
 //!
@@ -57,7 +57,7 @@ pub fn set_market_calendar_for_session(calendar: Arc<TradingCalendar>) -> bool {
 /// The trading-day-aware "is the market open RIGHT NOW?" answer used by the
 /// `/feeds` live-feed health verdict.
 ///
-/// Returns `true` ONLY when the IST wall-clock is inside `[09:00, 15:30)` AND
+/// Returns `true` ONLY when the IST wall-clock is inside `[09:00, 15:40)` AND
 /// today is an actual NSE trading day:
 /// - If a calendar was installed via [`set_market_calendar_for_session`], today
 ///   must be a trading day per [`TradingCalendar::is_trading_day_today`] (covers
@@ -141,6 +141,107 @@ pub fn set_test_force_in_market_hours(value: bool) {
     TEST_FORCE_IN_MARKET_HOURS.store(value, std::sync::atomic::Ordering::Relaxed);
 }
 
+// ----- Pure seconds-of-day helpers (2026-10-10) ------------------------------
+//
+// Every wall-clock function below reads the clock ONCE and hands the reading to
+// one of these pure helpers. Before this split, each branch of the arithmetic
+// (inside vs outside 09:00-15:40 IST, before vs after 09:00, weekday vs
+// weekend) ran only when CI happened to run at that time of day, so the
+// crate's line coverage depended on the hour: a run during market hours left
+// the off-hours lines of `secs_until_next_market_open_ist` uncovered and fell
+// to ~99.38% against the 99.4 floor. The helpers take the time as an argument,
+// so the tests pin every branch with fixed inputs and coverage no longer moves
+// with the clock. Each is O(1): integer arithmetic only, no allocation.
+
+/// IST seconds-of-day in `[0, 86_400)` for a Unix timestamp (seconds, UTC).
+///
+/// Saturates instead of overflowing near `i64::MAX`, and `rem_euclid` keeps a
+/// pre-1970 timestamp in range, so every `i64` input is defined.
+#[allow(clippy::cast_possible_truncation)] // APPROVED: rem_euclid against SECONDS_PER_DAY (=86400) fits u32
+#[allow(clippy::cast_sign_loss)] // APPROVED: rem_euclid with a positive divisor is never negative
+#[must_use]
+#[inline]
+fn ist_secs_of_day_at(utc_secs: i64) -> u32 {
+    utc_secs
+        .saturating_add(i64::from(IST_UTC_OFFSET_SECONDS))
+        .rem_euclid(i64::from(SECONDS_PER_DAY)) as u32
+}
+
+/// `true` when an IST seconds-of-day falls in
+/// `[TICK_PERSIST_START, TICK_PERSIST_END)`.
+#[must_use]
+#[inline]
+fn in_market_hours_at(sec_of_day: u32) -> bool {
+    (TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST).contains(&sec_of_day)
+}
+
+/// `true` when a Unix timestamp falls on a Saturday or Sunday in IST.
+///
+/// Day 0 of the Unix epoch (1970-01-01) was a Thursday, so the IST weekday of
+/// a timestamp is `WEEKDAYS_FROM_EPOCH[ist_day mod 7]`, with the table starting
+/// on Thursday. The table is spelled out rather than relying on chrono's
+/// integer numbering of `Weekday`, which chrono documents as not to be relied
+/// on. `rem_euclid` keeps the index in `0..7`, so the lookup always hits; if it
+/// somehow missed, the day would read as a weekday.
+#[must_use]
+#[inline]
+fn is_ist_weekend_at(utc_secs: i64) -> bool {
+    /// Weekdays in order from the Unix epoch's day (a Thursday).
+    const WEEKDAYS_FROM_EPOCH: [chrono::Weekday; 7] = [
+        chrono::Weekday::Thu,
+        chrono::Weekday::Fri,
+        chrono::Weekday::Sat,
+        chrono::Weekday::Sun,
+        chrono::Weekday::Mon,
+        chrono::Weekday::Tue,
+        chrono::Weekday::Wed,
+    ];
+    const DAYS_PER_WEEK: i64 = 7;
+    let ist_day = utc_secs
+        .saturating_add(i64::from(IST_UTC_OFFSET_SECONDS))
+        .div_euclid(i64::from(SECONDS_PER_DAY));
+    let weekday = usize::try_from(ist_day.rem_euclid(DAYS_PER_WEEK))
+        .ok()
+        .and_then(|index| WEEKDAYS_FROM_EPOCH.get(index));
+    matches!(weekday, Some(chrono::Weekday::Sat | chrono::Weekday::Sun))
+}
+
+/// `true` when a Unix timestamp is inside market hours on an IST weekday.
+#[must_use]
+#[inline]
+fn in_trading_session_at(utc_secs: i64) -> bool {
+    in_market_hours_at(ist_secs_of_day_at(utc_secs)) && !is_ist_weekend_at(utc_secs)
+}
+
+/// Seconds from an IST seconds-of-day to the next IST midnight, in
+/// `(0, 86_400]`. An input past the end of the day saturates to 0 rather than
+/// wrapping (no caller passes one: every caller reads `ist_secs_of_day_at`).
+#[must_use]
+#[inline]
+fn secs_until_ist_midnight_from(sec_of_day: u32) -> u64 {
+    u64::from(SECONDS_PER_DAY.saturating_sub(sec_of_day))
+}
+
+/// Seconds from an IST seconds-of-day to the next market open (09:00 IST);
+/// `0` inside market hours. Before 09:00 that is today's open; at or after the
+/// close it is tomorrow's.
+#[must_use]
+#[inline]
+fn secs_until_market_open_from(sec_of_day: u32) -> u64 {
+    if in_market_hours_at(sec_of_day) {
+        return 0;
+    }
+    let open = TICK_PERSIST_START_SECS_OF_DAY_IST;
+    let until = if sec_of_day < open {
+        open - sec_of_day
+    } else {
+        SECONDS_PER_DAY
+            .saturating_sub(sec_of_day)
+            .saturating_add(open)
+    };
+    u64::from(until)
+}
+
 /// Returns `true` when the current IST wall-clock falls within
 /// `[TICK_PERSIST_START, TICK_PERSIST_END)` — the same window Dhan uses to
 /// stream market data.
@@ -150,14 +251,12 @@ pub fn set_test_force_in_market_hours(value: bool) {
 /// `chrono::Utc::now()` syscall, one `rem_euclid`, one range check.
 /// Called on cold paths only — disconnect events, watchdog fires,
 /// rebalancer ticks. Zero per-tick impact.
-#[allow(clippy::cast_possible_truncation)] // APPROVED: secs-of-day fits u32 by construction
 #[inline]
 pub fn is_within_market_hours_ist() -> bool {
     if TEST_FORCE_IN_MARKET_HOURS.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
-    let sec_of_day = now_ist_secs_of_day();
-    (TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST).contains(&sec_of_day)
+    in_market_hours_at(now_ist_secs_of_day())
 }
 
 /// Returns `true` ONLY when the IST wall-clock is in
@@ -182,30 +281,23 @@ pub fn is_within_market_hours_ist() -> bool {
 /// incrementally.
 ///
 /// # Complexity
-/// O(1): one relaxed atomic load + one [`is_within_market_hours_ist`]
-/// call + one [`chrono::Utc::now`] + integer math. Cold path —
-/// called once per watchdog/SLO scheduler tick (≥10s cadence).
+/// O(1): one relaxed atomic load + one [`chrono::Utc::now`] + integer
+/// math. The time of day and the weekday come from the SAME clock
+/// reading (until 2026-10-10 they were two readings, which could
+/// straddle midnight). Cold path — called once per watchdog/SLO
+/// scheduler tick (≥10s cadence).
 ///
 /// # Test override
 /// Honours `TEST_FORCE_IN_MARKET_HOURS` for parity with
 /// [`is_within_market_hours_ist`] — when set, returns `true`
 /// regardless of weekday or wall-clock.
 #[inline]
-// TEST-EXEMPT: covered by 5 tests in this file's `tests` module (`trading_session_returns_bool_without_panic`, `trading_session_force_override_returns_true_when_set`, `trading_session_implies_market_hours`, `weekend_weekdays_match_sat_and_sun`, `trading_session_helper_contains_weekend_gate`).
+// TEST-EXEMPT: covered by the tests in this file's `tests` module (`trading_session_returns_bool_without_panic`, `trading_session_force_override_returns_true_when_set`, `trading_session_implies_market_hours`, `in_trading_session_at_*`, `is_ist_weekend_at_*`, `trading_session_helper_contains_weekend_gate`).
 pub fn is_within_trading_session_ist() -> bool {
     if TEST_FORCE_IN_MARKET_HOURS.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
-    if !is_within_market_hours_ist() {
-        return false;
-    }
-    let now_utc = chrono::Utc::now();
-    let now_ist = now_utc + chrono::TimeDelta::seconds(i64::from(IST_UTC_OFFSET_SECONDS));
-    use chrono::Datelike;
-    !matches!(
-        now_ist.weekday(),
-        chrono::Weekday::Sat | chrono::Weekday::Sun
-    )
+    in_trading_session_at(chrono::Utc::now().timestamp())
 }
 
 /// Returns the number of seconds until the next IST midnight
@@ -219,14 +311,12 @@ pub fn is_within_trading_session_ist() -> bool {
 /// # Test override
 /// When `TEST_FORCE_IN_MARKET_HOURS` is set, returns 1 — a tiny
 /// deterministic value so tests don't sleep for hours.
-#[allow(clippy::cast_possible_truncation)] // APPROVED: rem_euclid against SECONDS_PER_DAY (=86400) fits u32, then u32 → u64 widening
 #[inline]
 pub fn secs_until_next_ist_midnight() -> u64 {
     if TEST_FORCE_IN_MARKET_HOURS.load(std::sync::atomic::Ordering::Relaxed) {
         return 1;
     }
-    let sec_of_day = u64::from(now_ist_secs_of_day());
-    u64::from(SECONDS_PER_DAY) - sec_of_day
+    secs_until_ist_midnight_from(now_ist_secs_of_day())
 }
 
 /// Returns the current IST seconds-of-day in `[0, 86400)` from
@@ -245,17 +335,13 @@ pub fn secs_until_next_ist_midnight() -> u64 {
 /// When `TEST_FORCE_IN_MARKET_HOURS` is set, returns 09:30 IST
 /// (33000) — a deterministic in-market sec-of-day so tests get
 /// repeatable phase classification regardless of wall clock.
-#[allow(clippy::cast_possible_truncation)] // APPROVED: rem_euclid against SECONDS_PER_DAY (=86400) fits u32
 #[inline]
 pub fn now_ist_secs_of_day() -> u32 {
     if TEST_FORCE_IN_MARKET_HOURS.load(std::sync::atomic::Ordering::Relaxed) {
         // Deterministic 09:30 IST for tests — within OPEN phase.
         return 9 * 3600 + 30 * 60;
     }
-    let now_utc_secs = chrono::Utc::now().timestamp();
-    now_utc_secs
-        .saturating_add(i64::from(IST_UTC_OFFSET_SECONDS))
-        .rem_euclid(i64::from(SECONDS_PER_DAY)) as u32
+    ist_secs_of_day_at(chrono::Utc::now().timestamp())
 }
 
 /// Returns the number of seconds until the next `TICK_PERSIST_START_SECS_OF_DAY_IST`
@@ -265,37 +351,21 @@ pub fn now_ist_secs_of_day() -> u32 {
 /// open rather than flap against Dhan's pre-market idle-socket resets.
 ///
 /// # Complexity
-/// O(1): same path as `is_within_market_hours_ist` plus arithmetic.
+/// O(1): one clock read plus arithmetic (until 2026-10-10 it read the clock
+/// twice, once for the in-hours check and once for the arithmetic).
 ///
 /// # Upper bound
-/// At most 24 hours minus the `[09:00, 15:30)` window, i.e. 17h30m = 63,000 s.
+/// At most 24 hours minus the `[09:00, 15:40)` window, i.e. 17h20m = 62,400 s.
 ///
 /// # Test override
 /// When `TEST_FORCE_IN_MARKET_HOURS` is set, returns `0` — same semantics as
-/// "currently in market hours".
-#[allow(clippy::cast_possible_truncation)] // APPROVED: secs-of-day and diff fit u32 by construction
+/// "currently in market hours" (the override pins `now_ist_secs_of_day` to
+/// 09:30 IST, which is inside the window).
 #[inline]
-// TEST-EXEMPT: covered by secs_until_next_open_returns_zero_during_market_hours, secs_until_next_open_bounded_below_one_day, secs_until_next_open_positive_when_off_hours below
+// TEST-EXEMPT: covered by secs_until_next_open_returns_zero_during_market_hours, secs_until_next_open_bounded_below_one_day, secs_until_next_open_positive_when_off_hours and the fixed-input secs_until_market_open_from_* tests below
 pub fn secs_until_next_market_open_ist() -> u64 {
-    if is_within_market_hours_ist() {
-        return 0;
-    }
-    let now_utc_secs = chrono::Utc::now().timestamp();
-    let sec_of_day = now_utc_secs
-        .saturating_add(i64::from(IST_UTC_OFFSET_SECONDS))
-        .rem_euclid(i64::from(SECONDS_PER_DAY)) as u32;
-    let open = TICK_PERSIST_START_SECS_OF_DAY_IST;
-    let day = SECONDS_PER_DAY;
-    // If sec_of_day < open → today, later. If sec_of_day >= open (we're past
-    // 09:00 but not within hours, i.e. >= 15:30) → next day's open.
-    let until = if sec_of_day < open {
-        open - sec_of_day
-    } else {
-        day - sec_of_day + open
-    };
-    u64::from(until)
+    secs_until_market_open_from(now_ist_secs_of_day())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,6 +423,9 @@ mod tests {
     /// market-hours gate tests in `connection` and `order_update_connection`.
     #[test]
     fn returns_bool_without_panic() {
+        // Hold the override lock at false so the real-clock path runs on
+        // every run (another test forcing it true would skip those lines).
+        let _force_guard = ForceHours::set(false);
         let _ = is_within_market_hours_ist();
     }
 
@@ -376,6 +449,9 @@ mod tests {
     /// Smoke test: helper returns a bool without panic.
     #[test]
     fn trading_session_returns_bool_without_panic() {
+        // Hold the override lock at false so the real-clock path runs on
+        // every run (another test forcing it true would skip those lines).
+        let _force_guard = ForceHours::set(false);
         let _ = is_within_trading_session_ist();
     }
 
@@ -391,12 +467,20 @@ mod tests {
     /// gate — if it's currently outside market hours, it's also outside the
     /// trading session, regardless of weekday.
     #[test]
+    ///
+    /// Checked on the pure helpers over every minute of a full week rather
+    /// than on the wall clock, so it asserts the same thing whatever time CI
+    /// runs (2026-10-10: the old `if !in_hours { assert }` body only ran
+    /// outside market hours, which moved the crate's line coverage).
     fn trading_session_implies_market_hours() {
-        let _force_guard = ForceHours::set(false);
-        if !is_within_market_hours_ist() {
+        let week_start = ist_instant(2026, 10, 5, 0, 0, 0); // a Monday
+        let minutes_per_week = 7 * 24 * 60;
+        for minute in 0..minutes_per_week {
+            let utc_secs = week_start + minute * 60;
+            let in_hours = in_market_hours_at(ist_secs_of_day_at(utc_secs));
             assert!(
-                !is_within_trading_session_ist(),
-                "trading session must be false when market hours is false"
+                !in_trading_session_at(utc_secs) || in_hours,
+                "trading session must be false when market hours is false (minute {minute})"
             );
         }
     }
@@ -468,6 +552,9 @@ mod tests {
     /// `is_trading_session_now()` returns a bool without panic (real clock).
     #[test]
     fn trading_session_now_returns_bool_without_panic() {
+        // Hold the override lock at false so the real-clock path runs on
+        // every run (another test forcing it true would skip those lines).
+        let _force_guard = ForceHours::set(false);
         let _ = is_trading_session_now();
     }
 
@@ -479,13 +566,14 @@ mod tests {
     #[test]
     fn trading_session_now_falls_back_to_weekday_gate_when_no_calendar() {
         let _force_guard = ForceHours::set(false);
-        if SESSION_CALENDAR.get().is_none() {
-            assert_eq!(
-                is_trading_session_now(),
-                is_within_trading_session_ist(),
-                "no calendar → must mirror the weekday-only gate"
-            );
-        }
+        // Written without an `if` so every line runs whichever test installs
+        // the calendar first (test order would otherwise move coverage).
+        let no_calendar = SESSION_CALENDAR.get().is_none();
+        let mirrors = is_trading_session_now() == is_within_trading_session_ist();
+        assert!(
+            !no_calendar || mirrors,
+            "no calendar → must mirror the weekday-only gate"
+        );
     }
 
     /// Install the session calendar ONCE (this test owns the `OnceLock` per
@@ -559,6 +647,9 @@ mod tests {
     /// market opens.
     #[test]
     fn secs_until_next_open_bounded_below_one_day() {
+        // Hold the override lock at false so the real-clock path runs on
+        // every run (another test forcing it true would skip those lines).
+        let _force_guard = ForceHours::set(false);
         let secs = secs_until_next_market_open_ist();
         assert!(
             secs < u64::from(SECONDS_PER_DAY),
@@ -572,18 +663,21 @@ mod tests {
     /// a no-op and re-introduce the flap.
     #[test]
     fn secs_until_next_open_positive_when_off_hours() {
-        // Force off-hours by clearing the override (default state).
-        let _force_guard = ForceHours::set(false);
-        if !is_within_market_hours_ist() {
+        // Fixed off-hours instants, so the assertion runs whatever time CI
+        // starts (2026-10-10: it used to sit inside `if !in_hours`, which
+        // left these lines uncovered on a run during market hours). The
+        // in-hours direction is `secs_until_next_open_returns_zero_during_market_hours`.
+        for sec_of_day in [
+            0,
+            TICK_PERSIST_START_SECS_OF_DAY_IST - 1,
+            TICK_PERSIST_END_SECS_OF_DAY_IST,
+            SECONDS_PER_DAY - 1,
+        ] {
             assert!(
-                secs_until_next_market_open_ist() > 0,
-                "off-hours must return > 0 secs"
+                secs_until_market_open_from(sec_of_day) > 0,
+                "off-hours must return > 0 secs (sec_of_day {sec_of_day})"
             );
         }
-        // If the real wall-clock happens to be inside [09:00, 15:30) IST
-        // while CI runs this test, we can't deterministically assert > 0
-        // — but `secs_until_next_open_returns_zero_during_market_hours`
-        // covers that direction.
     }
 
     /// Phase 2 ratchet: `now_ist_secs_of_day` returns a value in
@@ -591,6 +685,9 @@ mod tests {
     /// in CI but the bound is invariant.
     #[test]
     fn test_now_ist_secs_of_day_is_bounded() {
+        // Hold the override lock at false so the real-clock path runs on
+        // every run (another test forcing it true would skip those lines).
+        let _force_guard = ForceHours::set(false);
         let s = now_ist_secs_of_day();
         assert!(s < 86400, "secs-of-day must be < 86400, got {s}");
     }
@@ -612,6 +709,9 @@ mod tests {
     /// MUST NOT exceed 24h.
     #[test]
     fn test_secs_until_next_ist_midnight_is_bounded() {
+        // Hold the override lock at false so the real-clock path runs on
+        // every run (another test forcing it true would skip those lines).
+        let _force_guard = ForceHours::set(false);
         let s = secs_until_next_ist_midnight();
         assert!(s > 0, "secs_until_next_ist_midnight must be positive");
         assert!(
@@ -627,5 +727,198 @@ mod tests {
         let _force_guard = ForceHours::set(true);
         let s = secs_until_next_ist_midnight();
         assert_eq!(s, 1, "test override must return 1s");
+    }
+
+    // ----- Pure seconds-of-day helpers (2026-10-10) --------------------------
+    // Fixed inputs, so every branch is covered whatever time CI runs. Before
+    // these, the crate's coverage moved with the hour of the run.
+
+    /// Unix seconds (UTC) for an IST wall-clock instant.
+    fn ist_instant(year: i32, month: u32, day: u32, hour: u32, minute: u32, second: u32) -> i64 {
+        chrono::NaiveDate::from_ymd_opt(year, month, day)
+            .unwrap()
+            .and_hms_opt(hour, minute, second)
+            .unwrap()
+            .and_utc()
+            .timestamp()
+            - i64::from(IST_UTC_OFFSET_SECONDS)
+    }
+
+    /// Reference IST weekday from chrono, for the equivalence checks.
+    fn chrono_ist_weekday(utc_secs: i64) -> chrono::Weekday {
+        use chrono::Datelike;
+        (chrono::DateTime::from_timestamp(utc_secs, 0).unwrap()
+            + chrono::TimeDelta::seconds(i64::from(IST_UTC_OFFSET_SECONDS)))
+        .weekday()
+    }
+
+    #[test]
+    fn ist_secs_of_day_at_fixed_instants() {
+        // The Unix epoch is 05:30:00 IST.
+        assert_eq!(ist_secs_of_day_at(0), 5 * 3600 + 30 * 60);
+        // One second before the epoch stays in range (rem_euclid, not %).
+        assert_eq!(ist_secs_of_day_at(-1), 5 * 3600 + 30 * 60 - 1);
+        assert_eq!(
+            ist_secs_of_day_at(ist_instant(2026, 10, 9, 9, 0, 0)),
+            32_400
+        );
+        assert_eq!(
+            ist_secs_of_day_at(ist_instant(2026, 10, 9, 15, 40, 0)),
+            56_400
+        );
+        assert_eq!(ist_secs_of_day_at(ist_instant(2026, 10, 9, 0, 0, 0)), 0);
+        assert_eq!(
+            ist_secs_of_day_at(ist_instant(2026, 10, 9, 23, 59, 59)),
+            86_399
+        );
+    }
+
+    #[test]
+    fn ist_secs_of_day_at_extreme_inputs_stay_in_range() {
+        for utc_secs in [
+            i64::MIN,
+            i64::MIN + 1,
+            -86_400,
+            86_400,
+            i64::MAX - 1,
+            i64::MAX,
+        ] {
+            assert!(
+                ist_secs_of_day_at(utc_secs) < SECONDS_PER_DAY,
+                "out of range for {utc_secs}"
+            );
+        }
+    }
+
+    #[test]
+    fn in_market_hours_at_window_edges() {
+        assert!(!in_market_hours_at(0));
+        assert!(!in_market_hours_at(TICK_PERSIST_START_SECS_OF_DAY_IST - 1));
+        assert!(in_market_hours_at(TICK_PERSIST_START_SECS_OF_DAY_IST));
+        assert!(in_market_hours_at(TICK_PERSIST_END_SECS_OF_DAY_IST - 1));
+        assert!(!in_market_hours_at(TICK_PERSIST_END_SECS_OF_DAY_IST));
+        assert!(!in_market_hours_at(SECONDS_PER_DAY - 1));
+    }
+
+    #[test]
+    fn is_ist_weekend_at_fixed_days() {
+        // 2026-10-09 Friday, 10 Saturday, 11 Sunday, 12 Monday.
+        assert!(!is_ist_weekend_at(ist_instant(2026, 10, 9, 12, 0, 0)));
+        assert!(is_ist_weekend_at(ist_instant(2026, 10, 10, 12, 0, 0)));
+        assert!(is_ist_weekend_at(ist_instant(2026, 10, 11, 12, 0, 0)));
+        assert!(!is_ist_weekend_at(ist_instant(2026, 10, 12, 12, 0, 0)));
+        // The weekday turns over at IST midnight, not UTC midnight: Friday
+        // 18:30 UTC is already Saturday 00:00 IST.
+        assert!(!is_ist_weekend_at(ist_instant(2026, 10, 9, 23, 59, 59)));
+        assert!(is_ist_weekend_at(ist_instant(2026, 10, 10, 0, 0, 0)));
+        assert!(is_ist_weekend_at(ist_instant(2026, 10, 11, 23, 59, 59)));
+        assert!(!is_ist_weekend_at(ist_instant(2026, 10, 12, 0, 0, 0)));
+        // 1970-01-01 was a Thursday; 1969-12-28 a Sunday (pre-epoch input).
+        assert!(!is_ist_weekend_at(0));
+        assert!(is_ist_weekend_at(ist_instant(1969, 12, 28, 12, 0, 0)));
+    }
+
+    #[test]
+    fn is_ist_weekend_at_extreme_inputs_do_not_panic() {
+        for utc_secs in [i64::MIN, i64::MIN + 1, i64::MAX - 1, i64::MAX] {
+            let _ = is_ist_weekend_at(utc_secs);
+        }
+    }
+
+    #[test]
+    fn in_trading_session_at_fixed_instants() {
+        // Friday inside the window.
+        assert!(in_trading_session_at(ist_instant(2026, 10, 9, 9, 0, 0)));
+        assert!(in_trading_session_at(ist_instant(2026, 10, 9, 15, 39, 59)));
+        // Friday outside the window.
+        assert!(!in_trading_session_at(ist_instant(2026, 10, 9, 8, 59, 59)));
+        assert!(!in_trading_session_at(ist_instant(2026, 10, 9, 15, 40, 0)));
+        // Saturday and Sunday inside the clock window stay closed.
+        assert!(!in_trading_session_at(ist_instant(2026, 10, 10, 11, 0, 0)));
+        assert!(!in_trading_session_at(ist_instant(2026, 10, 11, 11, 0, 0)));
+        // Monday reopens.
+        assert!(in_trading_session_at(ist_instant(2026, 10, 12, 11, 0, 0)));
+    }
+
+    #[test]
+    fn secs_until_ist_midnight_from_fixed_values() {
+        assert_eq!(secs_until_ist_midnight_from(0), 86_400);
+        assert_eq!(secs_until_ist_midnight_from(1), 86_399);
+        assert_eq!(secs_until_ist_midnight_from(33_000), 53_400);
+        assert_eq!(secs_until_ist_midnight_from(86_399), 1);
+        // Out-of-range input saturates instead of wrapping.
+        assert_eq!(secs_until_ist_midnight_from(90_000), 0);
+    }
+
+    #[test]
+    fn secs_until_market_open_from_fixed_values() {
+        let open = u64::from(TICK_PERSIST_START_SECS_OF_DAY_IST);
+        let close = TICK_PERSIST_END_SECS_OF_DAY_IST;
+        let day = u64::from(SECONDS_PER_DAY);
+        // Before the open: today's 09:00.
+        assert_eq!(secs_until_market_open_from(0), open);
+        assert_eq!(
+            secs_until_market_open_from(TICK_PERSIST_START_SECS_OF_DAY_IST - 1),
+            1
+        );
+        // Inside the window: zero.
+        assert_eq!(
+            secs_until_market_open_from(TICK_PERSIST_START_SECS_OF_DAY_IST),
+            0
+        );
+        assert_eq!(secs_until_market_open_from(close - 1), 0);
+        // At or after the close: tomorrow's 09:00. The longest wait is from
+        // the close itself: 86,400 - 56,400 + 32,400 = 62,400 s.
+        assert_eq!(
+            secs_until_market_open_from(close),
+            day - u64::from(close) + open
+        );
+        assert_eq!(secs_until_market_open_from(close), 62_400);
+        assert_eq!(secs_until_market_open_from(SECONDS_PER_DAY - 1), open + 1);
+    }
+
+    proptest::proptest! {
+        /// The integer weekday matches chrono's for any instant between
+        /// roughly 1653 and 2286 AD.
+        #[test]
+        fn is_ist_weekend_at_matches_chrono(utc_secs in -10_000_000_000_i64..10_000_000_000_i64) {
+            let weekend = matches!(
+                chrono_ist_weekday(utc_secs),
+                chrono::Weekday::Sat | chrono::Weekday::Sun
+            );
+            proptest::prop_assert_eq!(is_ist_weekend_at(utc_secs), weekend);
+        }
+
+        /// Seconds-of-day matches chrono's IST wall clock.
+        #[test]
+        fn ist_secs_of_day_at_matches_chrono(utc_secs in -10_000_000_000_i64..10_000_000_000_i64) {
+            use chrono::Timelike;
+            let ist = chrono::DateTime::from_timestamp(utc_secs, 0).unwrap()
+                + chrono::TimeDelta::seconds(i64::from(IST_UTC_OFFSET_SECONDS));
+            proptest::prop_assert_eq!(ist_secs_of_day_at(utc_secs), ist.num_seconds_from_midnight());
+        }
+
+        /// Waiting the returned seconds lands exactly on 09:00 IST, and the
+        /// wait never reaches a full day.
+        #[test]
+        fn secs_until_market_open_from_lands_on_the_open(sec_of_day in 0_u32..SECONDS_PER_DAY) {
+            let wait = secs_until_market_open_from(sec_of_day);
+            proptest::prop_assert!(wait < u64::from(SECONDS_PER_DAY));
+            if in_market_hours_at(sec_of_day) {
+                proptest::prop_assert_eq!(wait, 0);
+            } else {
+                proptest::prop_assert!(wait > 0);
+                let landing = (u64::from(sec_of_day) + wait) % u64::from(SECONDS_PER_DAY);
+                proptest::prop_assert_eq!(landing, u64::from(TICK_PERSIST_START_SECS_OF_DAY_IST));
+            }
+        }
+
+        /// Waiting the returned seconds lands exactly on IST midnight.
+        #[test]
+        fn secs_until_ist_midnight_from_lands_on_midnight(sec_of_day in 0_u32..SECONDS_PER_DAY) {
+            let wait = secs_until_ist_midnight_from(sec_of_day);
+            proptest::prop_assert!(wait > 0 && wait <= u64::from(SECONDS_PER_DAY));
+            proptest::prop_assert_eq!((u64::from(sec_of_day) + wait) % u64::from(SECONDS_PER_DAY), 0);
+        }
     }
 }
