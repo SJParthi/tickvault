@@ -967,6 +967,15 @@ async fn async_main() -> Result<()> {
             config.questdb.clone(),
         ),
     );
+    // Contract name repair (2026-10-10, item 56): once a day after the close,
+    // put the `contract` name back on rows a boot rewrote without one (the
+    // 2026-10-09 evening redeploys). Process-global, every boot mode; it only
+    // touches days whose contract files are still on disk.
+    tokio::spawn(
+        tickvault_app::contract_name_repair_boot::run_contract_name_repair_loop(
+            config.questdb.clone(),
+        ),
+    );
     // PR-C2 (2026-07-13): the Dhan dormant activation watcher
     // (`dhan_activation.rs`) and the D2b runtime cold-start supervisor
     // (`run_dhan_lane_runtime_supervisor` + `dhan_lane_ctx_cell`) that were
@@ -3512,16 +3521,18 @@ async fn async_main() -> Result<()> {
             config.dhan_universe.target_secs_of_day_ist,
         );
 
-    // Spot and index names for `ticks.contract` / `candles_<tf>.contract`
-    // BEFORE the lane dials, so the 09:00 pre-open index ticks carry one. The
-    // contract attach later replaces the table with spots + options; this
-    // publish only fills an EMPTY table, so it can never wipe option names.
-    let spot_names = tickvault_app::dhan_contract_universe::publish_spot_contract_labels_at_boot(
-        &universe_date_ist,
-    );
+    // Contract names for `ticks.contract` / `candles_<tf>.contract` BEFORE the
+    // lane dials and before its frame-log replay, so the 09:00 pre-open ticks
+    // and every row the replay rewrites carry one. Second boot call: the first
+    // ran before the seal writer started; this one runs after the wait above,
+    // so a contract file built in the meantime replaces a smaller table. The
+    // attach later replaces the table and, from then on, the boot publish
+    // never does (2026-10-09 regression, see the function).
+    let contract_names =
+        tickvault_app::dhan_contract_universe::publish_contract_labels_at_boot(&universe_date_ist);
     info!(
-        spot_contract_names = spot_names,
-        "spot and index contract names published at boot"
+        contract_names,
+        "contract names checked before the lane starts (0 = held table kept)"
     );
 
     // Give the lane the `/health` websocket reporter BEFORE it dials, so the
@@ -4617,6 +4628,20 @@ async fn build_shared_infra(
         &config.questdb,
     )
     .await;
+
+    // --- Contract names BEFORE the seal writer's boot drain ---
+    // The drain rewrites spilled candles at once; a row written without its
+    // `contract` replaces a named row whole (DEDUP UPSERT). On 2026-10-09 the
+    // evening boots blanked every option name this way. Today's date, or the
+    // newest earlier day with a file (a boot after midnight).
+    let early_contract_names =
+        tickvault_app::dhan_contract_universe::publish_contract_labels_at_boot(
+            &tickvault_app::dhan_universe::today_ist_date(),
+        );
+    info!(
+        contract_names = early_contract_names,
+        "contract names published before the seal writer starts"
+    );
 
     // --- Seal-writer (installs the process-wide global_seal_sender) ---
     spawn_seal_writer_loop(&config.questdb);
