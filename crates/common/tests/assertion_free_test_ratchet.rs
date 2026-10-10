@@ -102,7 +102,11 @@ use tickvault_common::source_scan::strip_rust_comments;
 /// 159 -> 154 on 2026-10-02: measured on the zero-loss fixes PR, which
 /// deleted the per-minute depth steering report and its tests, and the
 /// per-request quote client and its tests. Nothing was rewritten to reach it.
-const ASSERTION_FREE_BUDGET: usize = 154;
+/// 154 -> 152 on 2026-10-09: measured on the stress-audit workflow fixes.
+/// `github_workflow_guard.rs` r4 and r5 checked their action pins through a
+/// helper the classifier does not read as an assertion; they now call
+/// `assert_pinned_to_sha_with_tag`, so both left the count.
+const ASSERTION_FREE_BUDGET: usize = 152;
 
 /// Substrings whose presence means the body asserts something.
 const ASSERTION_MARKERS: [&str; 12] = [

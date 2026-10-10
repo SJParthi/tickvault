@@ -572,6 +572,8 @@ const SSM_WORKFLOW_SHELL_BUDGET: &[(&str, usize, usize)] = &[
 
 /// Per file: awk/jq word-occurrence ceilings, measured 2026-10-04. A file
 /// absent here may use neither.
+/// 2026-10-09: the `emergency-fs-recover.yml` row (1) is removed; its one
+/// `awk` built the market-data drop list, which went with stress-audit RO-1.
 const AWK_JQ_BUDGET: &[(&str, usize)] = &[
     (".claude/hooks/auto-save-remote.sh", 1),
     (".claude/hooks/banned-pattern-scanner.sh", 1),
@@ -612,7 +614,6 @@ const AWK_JQ_BUDGET: &[(&str, usize)] = &[
     (".github/workflows/deploy-aws-after-close.yml", 2),
     (".github/workflows/deploy-aws.yml", 4),
     (".github/workflows/downsize-instance.yml", 4),
-    (".github/workflows/emergency-fs-recover.yml", 1),
     (".github/workflows/fuzz.yml", 4),
     (".github/workflows/local-branch-sync.yml", 1),
     (".github/workflows/mutation.yml", 1),
