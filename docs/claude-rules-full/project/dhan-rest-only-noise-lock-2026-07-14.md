@@ -4199,6 +4199,25 @@ attempt and Page rows). Recorded BEFORE the code.
 - New log-sink-only coded `warn!` sources: `xverify_already_paged_today`,
   `xverify_paged_marker_write_failed`.
 
+**2026-10-06 note (51d) — four retry reasons and two warning sources for the
+readiness wait, no new page.** Same owner approvals as the notes above (plan
+ITEM 51d; `no-rest-except-live-feed-2026-06-27.md` §12.15.10). Recorded BEFORE
+the code ships.
+
+- **NO** new alarm, metric filter, EMF name, dimension or `ok_actions`. No
+  terraform change.
+- `xverify_failed` keeps its meaning and gains four `reason` values for a day
+  whose every attempt found our candles not yet sealed and saved:
+  `live_not_final`, `live_not_applied`, `seals_pending`, `seal_spill_parked`.
+  It still pages once, after the last attempt, as every other `reason` does.
+  The day's last attempt never ends with one of these (it reads, with
+  missing-minute judging off); one reaches the page only when an earlier
+  attempt retried with it and the next attempt was then skipped for time.
+- Two new log-sink-only coded `warn!` sources, neither filtered:
+  `xverify_attempt_not_ready` (an attempt waited and retries) and
+  `xverify_unsettled_final` (the last attempt read with missing-minute judging
+  off). The option pass logs its skip at `info!`.
+
 ---
 
 ## §2.6 — 2026-09-25: three live-lane pages for DELAY, not only for loss — feed delay, main-feed reconnect time, blank new depth contracts

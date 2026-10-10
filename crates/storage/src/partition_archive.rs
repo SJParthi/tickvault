@@ -117,7 +117,7 @@ use crate::s3_cold::{
     S3Cold, S3ObjectMeta, Sha256Writer, base64_encode, hex_encode, resolve_archive_bucket,
     runtime_environment,
 };
-use crate::wal_suspension_watcher::{WalTableRow, parse_wal_tables_response};
+use crate::wal_suspension_watcher::WalTableRow;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -218,10 +218,6 @@ const ARCHIVE_EXPORT_TIMEOUT_SECS: u64 = 600;
 /// (a few hundred KB on the first catch-up sweep); 4 MiB bounds a hostile /
 /// misrouted response without ever truncating a real one.
 const ARCHIVE_MAX_EXEC_BODY_BYTES: u64 = 4 * 1024 * 1024;
-
-/// The WAL-suspension probe (F3) — same query the WAL-SUSPEND-01 watcher
-/// issues; parsed by the SAME `parse_wal_tables_response`.
-const WAL_TABLES_PROBE_SQL: &str = "select * from wal_tables()";
 
 /// Forensic audit table — one row per archive attempt outcome.
 pub const PARTITION_ARCHIVE_AUDIT_TABLE: &str = "partition_archive_audit";
@@ -2343,34 +2339,10 @@ impl PartitionArchiver {
     /// then skips the ENTIRE run, and the per-partition gate skips the table
     /// (fail-closed: no export or drop without proof the WAL is applied).
     async fn fetch_wal_tables(&self) -> Result<Vec<WalTableRow>> {
-        let response = self
-            .ddl_client
-            .get(&self.exec_url)
-            .query(&[("query", WAL_TABLES_PROBE_SQL)])
-            .send()
-            .await
-            .context("wal_tables() probe request failed")?;
-        if !response.status().is_success() {
-            anyhow::bail!("wal_tables() probe returned {}", response.status());
-        }
-        let body = read_body_capped(response).await?;
-        let value: serde_json::Value =
-            serde_json::from_str(&body).context("wal_tables() probe body is not JSON")?;
-        let (rows, skipped) = parse_wal_tables_response(&value)
-            .map_err(|f| anyhow::anyhow!("wal_tables() probe parse failed: {}", f.as_str()))?;
-        // Fail CLOSED on a partial view. This set decides which tables the
-        // archiver must leave alone; a row that failed to parse is a table
-        // whose suspension state is UNKNOWN, and treating unknown as
-        // not-suspended would let the archiver detach partitions from a table
-        // that is silently not applying rows. Refusing the run is recoverable;
-        // archiving a suspended table is not.
-        if skipped > 0 {
-            anyhow::bail!(
-                "wal_tables() probe skipped {skipped} unparseable row(s) -- the \
-                 suspended-table set is incomplete, refusing to archive on it"
-            );
-        }
-        Ok(rows)
+        // Plan item 51d: one implementation, shared with the cross-check's
+        // readiness wait. Same query, same capped body read, same fail-closed
+        // rule on a skipped row.
+        crate::wal_suspension_watcher::fetch_wal_tables(&self.ddl_client, &self.exec_url).await
     }
 
     /// Per-partition WAL-applied gate (2026-10-02). Probes `wal_tables()`
@@ -3139,7 +3111,7 @@ fn audit_row_from_proof(
 /// a hostile / misrouted `/exec` response can never balloon memory. Bytes
 /// past [`ARCHIVE_MAX_EXEC_BODY_BYTES`] are dropped: truncation only
 /// affects diagnostics, or fails JSON parsing CLOSED (keep, never drop).
-async fn read_body_capped(mut response: reqwest::Response) -> Result<String> {
+pub(crate) async fn read_body_capped(mut response: reqwest::Response) -> Result<String> {
     let mut out: Vec<u8> = Vec::new(); // O(1) EXEMPT: cold-path bounded body read
     while let Some(chunk) = response.chunk().await.context("body read failed")? {
         let remaining = usize::try_from(ARCHIVE_MAX_EXEC_BODY_BYTES)
@@ -5976,6 +5948,38 @@ mod stub_integration_tests {
                 .contains_key("tv-test-cold/questdb-partitions/ticks/2026-04-01T09.csv.gz"),
             "the OLDEST partition goes first (monotonic progress)"
         );
+    }
+
+    /// `read_body_capped` (shared with the WAL watcher since plan item 51d)
+    /// returns a short body whole and stops at `ARCHIVE_MAX_EXEC_BODY_BYTES`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_read_body_capped_keeps_a_short_body_and_stops_at_the_cap() {
+        let cap = usize::try_from(ARCHIVE_MAX_EXEC_BODY_BYTES).unwrap_or(usize::MAX);
+        let (url, _log) = spawn_stub(Arc::new(move |req: &SeenRequest| {
+            let body = if req.target.starts_with("/big") {
+                vec![b'a'; cap + 4096]
+            } else {
+                b"{\"ok\":true}".to_vec()
+            };
+            (200, Vec::new(), body)
+        }))
+        .await;
+        let client = reqwest::Client::new();
+        let small = client
+            .get(format!("{url}/small"))
+            .send()
+            .await
+            .expect("small request");
+        assert_eq!(
+            read_body_capped(small).await.expect("small body"),
+            "{\"ok\":true}"
+        );
+        let big = client
+            .get(format!("{url}/big"))
+            .send()
+            .await
+            .expect("big request");
+        assert_eq!(read_body_capped(big).await.expect("big body").len(), cap);
     }
 }
 
