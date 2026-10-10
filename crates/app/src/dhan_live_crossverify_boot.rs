@@ -956,8 +956,13 @@ pub trait ReadinessSource {
     fn seal_progress(&self) -> Option<SealProgress>;
     /// [`tickvault_storage::seal_writer_loop::last_seal_drained_unix_secs`].
     fn last_drained_unix_secs(&self) -> Option<i64>;
-    /// Seal spill files still staged for `date`.
-    fn staged_spill(&self, date: chrono::NaiveDate) -> std::io::Result<SpillStaged>;
+    /// Seal spill files still staged for `date`. Lists a folder, so the
+    /// production source runs it on the blocking pool, off the runtime's
+    /// workers.
+    fn staged_spill(
+        &self,
+        date: chrono::NaiveDate,
+    ) -> impl Future<Output = std::io::Result<SpillStaged>> + Send;
     /// One `wal_tables()` read.
     fn wal_tables(&self) -> impl Future<Output = anyhow::Result<Vec<WalTableRow>>> + Send;
     /// The wall clock, UTC unix seconds.
@@ -984,8 +989,17 @@ impl ReadinessSource for ProductionReadiness<'_> {
         tickvault_storage::seal_writer_loop::last_seal_drained_unix_secs()
     }
 
-    fn staged_spill(&self, date: chrono::NaiveDate) -> std::io::Result<SpillStaged> {
-        tickvault_storage::seal_spill::staged_production_spill_records_for_day(date)
+    fn staged_spill(
+        &self,
+        date: chrono::NaiveDate,
+    ) -> impl Future<Output = std::io::Result<SpillStaged>> + Send {
+        async move {
+            tokio::task::spawn_blocking(move || {
+                tickvault_storage::seal_spill::staged_production_spill_records_for_day(date)
+            })
+            .await
+            .unwrap_or_else(|join| Err(std::io::Error::other(join)))
+        }
     }
 
     fn wal_tables(&self) -> impl Future<Output = anyhow::Result<Vec<WalTableRow>>> + Send {
@@ -1081,10 +1095,14 @@ async fn wait_live_final<R: ReadinessSource>(
     loop {
         t.observe(src.seal_progress());
         if t.durability != Durability::Applied {
+            // A listing that does not finish by the deadline reads pending.
+            let spill = tokio::time::timeout_at(deadline, src.staged_spill(today))
+                .await
+                .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()));
             t.durability = match classify_durability(
                 src.last_drained_unix_secs(),
                 t.reference_unix_secs(),
-                &src.staged_spill(today),
+                &spill,
             ) {
                 Err(reason) => Durability::NotReady(reason),
                 Ok(()) => match tokio::time::timeout_at(deadline, src.wal_tables()).await {
@@ -1147,6 +1165,8 @@ async fn attempt_readiness(
     if today_ist().0 != today {
         return LiveReadiness::PAST_DAY;
     }
+    // A build failure falls back to the default client; each probe is still
+    // bounded by `timeout_at(deadline, ..)` in the wait.
     let src = ProductionReadiness {
         client: reqwest::Client::builder()
             .timeout(Duration::from_secs(READINESS_PROBE_TIMEOUT_SECS))
@@ -5752,8 +5772,12 @@ mod tests {
         fn last_drained_unix_secs(&self) -> Option<i64> {
             (self.drained)(self.now_unix_secs())
         }
-        fn staged_spill(&self, _date: chrono::NaiveDate) -> std::io::Result<SpillStaged> {
-            spill(self.staged, 0)
+        fn staged_spill(
+            &self,
+            _date: chrono::NaiveDate,
+        ) -> impl Future<Output = std::io::Result<SpillStaged>> + Send {
+            let staged = spill(self.staged, 0);
+            async move { staged }
         }
         fn wal_tables(&self) -> impl Future<Output = anyhow::Result<Vec<WalTableRow>>> + Send {
             self.wal_reads.set(self.wal_reads.get() + 1);
@@ -5909,5 +5933,22 @@ mod tests {
             r.durability,
             Durability::NotReady(DhanLiveXverifyNotReady::SealsPending)
         );
+    }
+
+    /// 51d review: the spill listing is blocking file I/O, so production runs
+    /// it on the blocking pool, and the wait bounds it by the deadline
+    /// (a listing that does not finish reads pending).
+    #[test]
+    fn test_production_spill_listing_runs_off_the_workers_under_the_deadline() {
+        let src = include_str!("dhan_live_crossverify_boot.rs");
+        let prod = src.split("#[cfg(test)]\nmod tests").next().unwrap_or(src);
+        assert!(prod.contains(
+            "tokio::task::spawn_blocking(move || {\n                tickvault_storage::seal_spill::staged_production_spill_records_for_day(date)"
+        ));
+        assert!(
+            prod.contains("tokio::time::timeout_at(deadline, src.staged_spill(today))"),
+            "the listing is bounded by the deadline"
+        );
+        assert!(prod.contains("Err(std::io::ErrorKind::TimedOut.into())"));
     }
 }
