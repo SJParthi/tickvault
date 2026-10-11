@@ -2918,6 +2918,92 @@ write, then candle warm-up (PR31b-2 (a), already listed above). Each fix ships a
   `crates/storage/tests/dhat_seal_queue_backlog.rs`. Test:
   dhat_seal_queue_backlog_never_allocates_where_the_tokio_queue_did.
 
+### Deep audit 2026-10-11 (DA-1 .. DA-11)
+
+Approved by Parthiban (operator), 2026-10-11 09:45 UTC: "Fix and resolve everything dude okay?",
+answering the deep-audit page (https://claude.ai/artifact/9T6uHr91zzN6qo26Mu1fZv); DA-11 is the
+owner's tap "Logs and alarms" (10:26 UTC) on the AWS-cost card. Only findings NOT already queued
+by the "Fix known defects and ship" thread (`/mnt/project-files/tickvault-triage/2026-10-11-open-items.md`)
+are here. Rules kept: no new Telegram page, alarm, filter or EMF name without a dated noise-lock
+row; nothing in `indicator/`, `strategy/`, the exit-order layer or OMS `dry_run`; no extra
+allocation on the tick path; every new pub fn has a test and a call site. Every item was fixed,
+then hostile-reviewed twice, then reworked on the review findings. Owner decisions are listed
+separately and are NOT done.
+
+- [x] **DA-1 — Instance-lock renewal failures are counted, bounded and escalated** (SUP-9).
+  Files: `crates/core/src/instance_lock.rs`, `crates/app/src/feed_scoreboard_boot.rs`,
+  `.claude/triage/error-rules.yaml`, `docs/error-runbooks/dual-instance-lock-2026-07-04.md`.
+  Tests: `instance_lock::tests::test_heartbeat_tick_logs_renew_lapsed_once_at_the_ttl`,
+  `feed_scoreboard_boot::tests::test_ssm_reachability_resilience_01_is_not_dual_instance_evidence`,
+  `feed_scoreboard_boot::tests::test_resilience_01_non_peer_stages_match_their_emitters`.
+  Owner decision, not done: CONC-3, LOCK-1, LOCK-2 (clear the held flag or close sockets on a
+  stale lock; take over a same-machine lock).
+- [x] **DA-2 — A hung S3 call fails the cold-upload file within a budget** (SUP-5).
+  Files: `crates/storage/src/raw_frame_upload.rs`, `crates/app/src/main.rs`, `CLAUDE.md`.
+  Tests: `raw_frame_upload::tests::test_the_default_call_budget_is_the_production_budget`,
+  `raw_frame_upload::tests::test_publish_pass_end_accepts_any_clock`.
+  Owner decision, not done: SUP-1, SUP-2, SUP-3. Won't fix: SUP-4. Other thread: SUP-6, SUP-11.
+- [x] **DA-3 — Shutdown never loses a signal or a queued seal, and reports a lock release that
+  did not delete** (CONC-1, CONC-2, CONC-4, CONC-5). `TimeoutStopSec` 145 → 165.
+  Files: `crates/app/src/main.rs`, `crates/app/src/dhan_rest_stack.rs`,
+  `crates/storage/src/seal_writer_loop.rs`, `crates/storage/src/seal_writer_runner.rs`,
+  `crates/core/src/instance_lock.rs`, `crates/core/src/auth/token_manager.rs`,
+  `deploy/systemd/tickvault.service`.
+  Tests: `seal_writer_loop::tests::test_final_drain_takes_a_seal_sent_after_an_idle_cycle`,
+  `instance_lock::tests::test_instance_lock_heartbeat_shutdown_reports_a_release_that_did_not_delete`,
+  `dhan_rest_stack::tests::release_registered_counts_only_a_real_delete_as_released`,
+  `shutdown_budget_fits_systemd_guard`, `shutdown_sequence_guard`. Other thread: CONC-6.
+- [x] **DA-4 — SEBI audit and QuestDB writes are confirmed and counted** (QDB-2, OBS-2, DB-8,
+  OBS-8, QDB-10). Files: `crates/storage/src/{order_audit_persistence,instrument_lifecycle_persistence,index_constituency_persistence,questdb_health,tick_persistence,depth_persistence,wal_applied_watermark}.rs`,
+  `crates/app/src/{dhan_lifecycle,dhan_universe,order_observability}.rs`,
+  `docs/error-runbooks/wave-2-error-codes.md`.
+  Tests: `dhan_lifecycle::tests::test_write_audit_then_lifecycle_writes_audit_before_any_lifecycle_row`,
+  `dhan_lifecycle::tests::test_write_audit_then_lifecycle_holds_back_a_row_whose_audit_failed`,
+  `dhan_lifecycle::tests::test_write_audit_then_lifecycle_stops_after_consecutive_failures`.
+  Owner decision, not done: DB-2. Other thread: QDB-9.
+- [x] **DA-5 — The cause of a crash reaches the shipped log; panic hook installed early;
+  `unsafe_code` denied** (OBS-1, CR-3, CR-5). Files: `crates/app/src/{main,observability,lib}.rs`,
+  `crates/common/src/error_code.rs`, every crate `lib.rs`, `docs/error-runbooks/audit-m3-error-codes.md`.
+  Tests: `observability::tests::test_append_panic_line_sync_writes_one_whole_line`,
+  `observability::tests::test_append_panic_jsonl_line_sync_writes_flat_schema`,
+  `shutdown_budget_fits_systemd_guard::the_panic_hook_is_installed_before_any_boot_work`,
+  `unsafe_code_lint_guard`.
+- [x] **DA-6 — Bad input is counted and logged, never shrinks the day** (INP-1, INP-7, INP-12,
+  INP-13, INP-14, INP-16). Files: `crates/app/src/{boot_helpers,dhan_feed_stack,dhan_intraday_parse,dhan_live_crossverify,dhan_live_crossverify_boot}.rs`,
+  `crates/core/src/notification/service.rs`, `crates/trading/src/oms/{engine,reconciliation}.rs`.
+  Tests: `dhan_live_crossverify::tests::fetch_rest_side_all_rows_skipped_is_a_failure_that_keeps_its_faults`,
+  `dhan_live_crossverify::tests::run_report_counts_an_all_skipped_target_as_a_failure_with_its_rows`,
+  `safety_layer`. Won't fix: INP-9.
+- [x] **DA-7 — API token floor and a narrow SSH CIDR** (SEC-9, SEC-12). Files:
+  `crates/api/src/middleware.rs`, `crates/app/src/{api_token_rotation,main}.rs`,
+  `deploy/aws/terraform/variables.tf`, `.claude/rules/project/gap-enforcement.md`.
+  Tests: `middleware::tests::test_bearer_token_boot_verdict_all_outcomes`,
+  `middleware::tests::test_main_rs_refuses_weak_bearer_token_in_live_mode`,
+  `aws_infra_wiring::operator_cidr_validation_refuses_world_open_and_broad_prefixes`.
+  Other thread: SEC-4.
+- [x] **DA-8 — Missing proof tests** (HOT-1, PROOF-2, TEST-1, CLOCK-3). Files:
+  `crates/app/src/infra.rs`, `crates/core/src/websocket/pool_supervisor.rs`.
+  Tests: `crates/app/tests/dhat_wal_ring_sink_accept.rs`, `crates/core/tests/ws_fake_dhan_server_end_to_end.rs`,
+  `crates/storage/tests/chaos_wal_real_sigkill.rs`,
+  `infra::tests::test_regression_clock3_parse_chronyc_tracking_refuses_an_unsynchronised_daemon`.
+- [x] **DA-9 — The weekly mutation job** (PROOF-3): already fixed on main (#2022 `--in-place`,
+  #2028 shards); first proof is the 2026-10-12 03:00 UTC run. No change. PROOF-3b (storage and
+  app in scope) deferred until one green 3-crate run.
+- [x] **DA-10 — The docs tell the truth** (TRU-1, TRU-5, TRU-6, TRU-7, TRU-12, TRU-14, TRU-18).
+  Files: `docs/architecture/{guarantees,what-we-guarantee-plain-english}.md`, `CLAUDE.md`,
+  `.claude/rules/project/{per-wave-guarantee-matrix,testing,wave-4-shared-preamble,z-plus-defense-doctrine,zero-loss-guarantee-charter}.md`,
+  `deploy/aws/terraform/{main,variables}.tf` (comments only).
+  Tests: `guarantees_doc_citations_guard`, `wave4_section8_wording_guard`,
+  `coverage_claim_honesty_guard`, `main_rs_boot_header_guard`.
+  Other thread: TRU-4, TRU-10, TRU-11, TRU-15, TRU-16, TRU-17, PROOF-15.
+- [x] **DA-11 — App and Lambda logs exported to S3; 14 more counters fold into the six
+  loss-group pages, no new page** (OBS-6, owner tap "Logs and alarms"). Files:
+  `deploy/aws/terraform/{log-export,loss-group-alarms}.tf`, `crates/app/src/main.rs`,
+  `docs/claude-rules-full/project/dhan-rest-only-noise-lock-2026-07-14.md` §2.10-a and its stub,
+  `.claude/rules/project/aws-budget.md`. Tests: `log_export_wiring_guard`,
+  `alarmed_counters_are_seeded_guard`, `aws_deploy_safety_guard`, `loss_counter_visibility_guard`.
+  Not proven: Firehose delivery to S3 (never applied; terraform not installed here).
+
 ## Edge Cases
 
 - PR1: log burst larger than the non-blocking buffer → lines dropped and counted, never blocking.
