@@ -1153,7 +1153,7 @@ mod tests {
         ] {
             let at = src.find(start).expect("panic writer exists");
             let body = &src[at..];
-            let end = body.find("\n}\n").expect("function end");
+            let end = body.find("\n\x7d\n").expect("function end");
             assert!(
                 !body[..end].contains(concat!("writeln", "!(")),
                 "{start} must write the whole line with one write_all"

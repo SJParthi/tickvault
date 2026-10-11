@@ -4317,7 +4317,7 @@ mod tests {
             .nth(1)
             .expect("run_cross_verification must exist");
         // Bound the scan to the function, not the rest of the file.
-        let end = body.find("\n}\n").unwrap_or(body.len());
+        let end = body.find("\n\x7d\n").unwrap_or(body.len());
         let body = &body[..end];
         assert!(
             body.contains("rest_failure_breakdown.record("),
@@ -5928,7 +5928,7 @@ mod tests {
         let start = src
             .find("pub async fn fetch_rest_side_for_target(")
             .expect("fn present");
-        let body = src[start..].split("\n}\n").next().expect("fn body");
+        let body = src[start..].split("\n\x7d\n").next().expect("fn body");
         assert!(body.contains("accumulate_capped("));
         assert!(body.contains("XVERIFY_REST_MAX_BODY_BYTES"));
         assert!(
