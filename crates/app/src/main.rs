@@ -1,28 +1,51 @@
 //! Binary entry point for the tickvault application.
 //!
 //! Orchestrates the complete boot sequence:
-//! Config → Observability → Logging → Notification → IP Verify → Auth → Persist → Universe → WebSocket → Pipeline → OrderUpdate → HTTP → Shutdown
+//! ~~Config → Observability → Logging → Notification → IP Verify → Auth → Persist → Universe → WebSocket → Pipeline → OrderUpdate → HTTP → Shutdown~~
 //!
 //! # Boot Sequence (optimized for fast restart)
 //!
-//! Steps 4+5 and QuestDB DDL queries run in parallel. Token cache skips
-//! the Dhan HTTP auth call on crash recovery (~500ms-2s saved).
+//! ~~Steps 4+5 and QuestDB DDL queries run in parallel. Token cache skips~~
+//! ~~the Dhan HTTP auth call on crash recovery (~500ms-2s saved).~~
 //!
-//! 1. Load and validate configuration
-//! 2. Initialize observability (Prometheus metrics + OpenTelemetry tracing)
-//! 3. Initialize structured logging with OpenTelemetry layer
-//! 4. (parallel) Notification service + Docker infra check
-//! 5. Verify public IP against SSM static IP (BLOCKS BOOT on mismatch)
-//! 6. Authenticate (token cache → SSM → TOTP → JWT)
-//! 7. (parallel) QuestDB table setup (5 DDL queries concurrent)
-//! 8. Build F&O universe + subscription plan
-//! 9. Build WebSocket connection pool
-//! 10. Spawn tick processing pipeline
-//! 11. Spawn background historical candle fetch (cold path)
-//! 12. Spawn order update WebSocket
-//! 13. Start API server
-//! 14. Spawn token renewal task
-//! 15. Await shutdown signal
+//! ~~1. Load and validate configuration~~
+//! ~~2. Initialize observability (Prometheus metrics + OpenTelemetry tracing)~~
+//! ~~3. Initialize structured logging with OpenTelemetry layer~~
+//! ~~4. (parallel) Notification service + Docker infra check~~
+//! ~~5. Verify public IP against SSM static IP (BLOCKS BOOT on mismatch)~~
+//! ~~6. Authenticate (token cache → SSM → TOTP → JWT)~~
+//! ~~7. (parallel) QuestDB table setup (5 DDL queries concurrent)~~
+//! ~~8. Build F&O universe + subscription plan~~
+//! ~~9. Build WebSocket connection pool~~
+//! ~~10. Spawn tick processing pipeline~~
+//! ~~11. Spawn background historical candle fetch (cold path)~~
+//! ~~12. Spawn order update WebSocket~~
+//! ~~13. Start API server~~
+//! ~~14. Spawn token renewal task~~
+//! ~~15. Await shutdown signal~~
+//!
+//! **⚠ CORRECTED 2026-10-11** — the list above is the 2026-05 boot and is
+//! stale: there is no IP check, no F&O universe or subscription plan, no
+//! tick pipeline task, no historical candle fetch and no separate
+//! token-renewal step here. The boot today, in source order:
+//!
+//! 1. holiday-gate short-circuit (Step -1, Step 0.5)
+//! 2. CryptoProvider (Step 0) and the panic hook (Step 0.9)
+//! 3. configuration (Step 1)
+//! 4. observability, including the WAL replay read (Step 2)
+//! 5. logging (Step 3)
+//! 6. per-feed dispatcher (Step C)
+//! 7. systemd watchdog pinger
+//! 8. shared infrastructure (QuestDB, notifier)
+//! 9. process and disk monitors
+//! 10. WAL replay settlement
+//! 11. Dhan REST stack (auth, and the order-update socket when enabled)
+//! 12. Dhan live-feed stack
+//! 13. systemd ready
+//! 14. run loop (API server), then shutdown
+//!
+//! Read the `Step` banners in this file, not this list: this list is prose
+//! and goes stale the same way the one above did.
 
 // APPROVED: clippy 1.95 tightened these doc-formatting lints; this binary
 // crate root predates them. Allow rather than churn doc comments for a

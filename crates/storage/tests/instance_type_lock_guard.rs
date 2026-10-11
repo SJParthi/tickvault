@@ -462,3 +462,36 @@ fn instance_lock_schedule_pinned_to_0830_1730_ist_window() {
          moves to the new window in the same PR as the terraform."
     );
 }
+
+/// Regression: 2026-10-11 (audit TRU-14). The instance lock itself was
+/// correct (the validation pins r8g.xlarge), but `main.tf` still said that
+/// validation "documents the desired t4g.medium", and the `instance_type`
+/// description sized RAM on a 13-frame, 128-byte cell that has been gone
+/// since `TF_COUNT` fell to 10. Text that names a retired box as the desired
+/// one is the next session's false premise.
+#[test]
+fn terraform_text_names_no_retired_instance_as_desired() {
+    let root = repo_root();
+    let main_tf = read(&root.join("deploy/aws/terraform/main.tf"));
+    assert!(
+        !main_tf.contains("documents the desired t4g.medium"),
+        "main.tf says the instance_type validation documents t4g.medium as the \
+         desired type; it pins r8g.xlarge (Quote 13)"
+    );
+    let vars = read(&root.join("deploy/aws/terraform/variables.tf"));
+    let start = vars
+        .find(r#"variable "instance_type""#)
+        .expect("variables.tf defines instance_type");
+    let block = &vars[start..];
+    let block = &block[..block.find("\n}\n").map_or(block.len(), |i| i + 3)];
+    assert!(
+        block.contains(r#"var.instance_type == "r8g.xlarge""#),
+        "the instance_type block must still pin r8g.xlarge"
+    );
+    assert!(
+        !block.contains("13 TF x 128 B"),
+        "the instance_type description still sizes RAM on the retired \
+         13-frame, 128-byte cell; re-derive it from TF_COUNT, LiveCandleState \
+         and SEAL_BUFFER_CAPACITY"
+    );
+}

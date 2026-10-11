@@ -217,3 +217,53 @@ fn templates_call_the_weekend_test_calendar_maths_not_a_chaos_test() {
         );
     }
 }
+
+/// Remove every `~~…~~` span on a line. Struck text is corrected history,
+/// not a live claim.
+fn without_struck(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(open) = rest.find("~~") {
+        let after_open = &rest[open + 2..];
+        match after_open.find("~~") {
+            Some(close) => {
+                out.push_str(&rest[..open]);
+                rest = &after_open[close + 2..];
+            }
+            None => break,
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Regression: 2026-10-11 (audit TRU-5). The 7-row resilience matrix, which
+/// every plan item copies, named three mechanisms that no longer exist: a
+/// "ring 2M" (the frame ring is bounded by `FRAME_RING_CAPACITY` and
+/// `FRAME_RING_MAX_BYTES`), "core_affinity Core 0" (the crate was removed
+/// 2026-08-10; the read workers pin to core 1 through libc) and an "SPSC
+/// bounded" ring (it is one bounded channel with many producers). A table
+/// row may carry those words only inside a `~~strike~~`.
+#[test]
+fn resilience_matrix_rows_carry_no_retired_mechanisms() {
+    assert_eq!(without_struck("a ~~b~~ c ~~d~~"), "a  c ");
+    assert_eq!(without_struck("a ~~b"), "a ~~b");
+    for (label, path) in [("matrix", MATRIX_PATH), ("charter", CHARTER_PATH)] {
+        let text = read(path);
+        let rows: Vec<&str> = text.lines().filter(|l| l.starts_with('|')).collect();
+        assert!(
+            rows.len() >= 10,
+            "{label} ({path}) has too few table rows to check"
+        );
+        for row in rows {
+            let live = without_struck(row);
+            for banned in ["ring 2M", "core_affinity Core 0", "SPSC bounded"] {
+                assert!(
+                    !live.contains(banned),
+                    "{label} ({path}) table row still claims {banned:?} unstruck:\n{row}\n\
+                     Strike it and add a dated correction naming what exists."
+                );
+            }
+        }
+    }
+}

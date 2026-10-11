@@ -46,11 +46,11 @@ checklist or in a dedicated "Per-Item Guarantee Matrix" subsection:
 
 | Demand | Honest envelope | Per-item proof |
 |---|---|---|
-| Zero ticks lost | Bounded zero loss inside chaos envelope: ring 2M → spill NDJSON → DLQ | item must not introduce new tick-drop path |
+| Zero ticks lost | Bounded zero loss inside chaos envelope: ~~ring 2M~~ → spill NDJSON → DLQ. **⚠ CORRECTED 2026-10-11:** there is no 2M ring. The live frame ring is one bounded channel with many producers, capped by `FRAME_RING_CAPACITY` (frames) and `FRAME_RING_MAX_BYTES` (bytes) in `dhan_feed_stack.rs` (read the constants); the frame is written to the WAL at receipt, before the ring, so a full ring is a lag signal. Loss paths that remain are counted and paged (spill channel full, spill writer dead, spill byte cap, WAL loss after a shed, rows dropped at the database writer). | item must not introduce new tick-drop path |
 | WS never disconnects | DETECT ≤5s, reconnect with `SubscribeRxGuard`, sleep-until-open post-close | item must not break SubscribeRxGuard or pool watchdog |
-| Never slow/locked/hanged | DHAT ≤4 alloc blocks/8KB across 10K calls; Criterion p99 ≤100ns; tick-gap >30s Telegram; core_affinity Core 0 | item must not add hot-path allocation |
+| Never slow/locked/hanged | DHAT ≤4 alloc blocks/8KB across 10K calls; Criterion p99 ≤100ns; tick-gap >30s Telegram; ~~core_affinity Core 0~~ **⚠ CORRECTED 2026-10-11:** the `core_affinity` crate is gone (removed 2026-08-10). The socket read workers are pinned to one core (core 1 by default, never core 0) by `reader_runtime`, through `libc`; nothing has measured that the pin helps. | item must not add hot-path allocation |
 | QuestDB never fails | ABSORB via 3-tier rescue→spill→DLQ + schema self-heal | item must not break self-heal |
-| O(1) latency | `from_le_bytes` + `papaya` + `Arc<HashMap>` + SPSC bounded; bench-gate ≤5% regression | item adds Criterion bench if hot path |
+| O(1) latency | `from_le_bytes` + ~~`papaya` + `Arc<HashMap>` + SPSC bounded~~; bench-gate ≤5% regression. **⚠ CORRECTED 2026-10-11:** hot-path lookups are a plain `HashMap` on the composite key (the aggregator rejects papaya on purpose); papaya is used only where other tasks read concurrently. The frame ring is a bounded channel with many producers (one per socket read task), not single-producer. A depth packet is O(levels), a tick packet O(1). | item adds Criterion bench if hot path |
 | Uniqueness + dedup | Composite `(security_id, exchange_segment)` per I-P1-11 + DEDUP UPSERT KEYS + meta-guard | item DEDUP key includes segment |
 | Real-time proof | 7-layer telemetry + SLO-01/SLO-02 @ 10s + market-open self-test @ 09:16:30 IST | item ratchet pins all 7 layers |
 

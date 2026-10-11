@@ -50,12 +50,12 @@ But we CAN mechanically guarantee:
 
 | Claim | Proof file | Test name |
 |---|---|---|
-| CloudWatch alarm fires when `tv_ticks_dropped_total > 0` (the FINAL irrecoverable tick-loss breach — added #989) *(RETIRED 2026-07-18, stage-4 dead-producer sweep: the alarm + its metric's emit sites are deleted — the tick ring/spill/DLQ chain died with the stage-2 dead-WS sweep 2026-07-17; the seal-side pagers in seal-drop-alarm.tf remain the loss monitors.)* | `deploy/aws/terraform/app-alarms.tf` (`tv-${env}-ticks-dropped`) | `crates/common/tests/cloudwatch_app_alarms_wiring.rs::test_app_alarms_count_is_seven` |
+| CloudWatch alarm fires when `tv_ticks_dropped_total > 0` (the FINAL irrecoverable tick-loss breach — added #989) ~~*(RETIRED 2026-07-18, stage-4 dead-producer sweep: the alarm + its metric's emit sites are deleted — the tick ring/spill/DLQ chain died with the stage-2 dead-WS sweep 2026-07-17; the seal-side pagers in seal-drop-alarm.tf remain the loss monitors.)*~~ **⚠ CORRECTED 2026-10-11:** NOT retired. `crates/storage/src/tick_persistence.rs` returned with the Dhan live feed (2026-08-26) and emits this counter (rows dropped at the database writer); the alarm is `tv-${env}-ticks-dropped` in `deploy/aws/terraform/live-lane-alarms.tf`. | ~~`deploy/aws/terraform/app-alarms.tf`~~ `deploy/aws/terraform/live-lane-alarms.tf` (`tv-${env}-ticks-dropped`) | `crates/common/tests/cloudwatch_app_alarms_wiring.rs::test_app_alarms_count_is_seven` |
 | Alarm fires when disk spill is dropping (`tv_spill_dropped_total`) *(RETIRED 2026-07-18, stage-4 dead-producer sweep: the alarm + its metric's emit sites are deleted — the tick ring/spill/DLQ chain died with the stage-2 dead-WS sweep 2026-07-17; the seal-side pagers in seal-drop-alarm.tf remain the loss monitors.)* | same tf (`tv-${env}-spill-dropped`) | same guard (every alarm metric has a Rust emit-site) |
 | Alarm fires when DLQ catches ticks (`tv_dlq_ticks_total`) *(RETIRED 2026-07-18, stage-4 dead-producer sweep: the alarm + its metric's emit sites are deleted — the tick ring/spill/DLQ chain died with the stage-2 dead-WS sweep 2026-07-17; the seal-side pagers in seal-drop-alarm.tf remain the loss monitors.)* | same tf (`tv-${env}-dlq-ticks`) | same guard |
 | Every alarm metric is published by the CW agent (EMF filter) | `deploy/aws/terraform/user-data.sh.tftpl` | `cloudwatch_app_alarms_wiring.rs::test_every_alarm_metric_is_in_emf_filter_list` |
 | Every alarm metric has a real Rust emit-site (no dead alarms) | crates/ (`counter!`/`gauge!`) | `cloudwatch_app_alarms_wiring.rs::test_every_alarm_metric_has_a_rust_emit_site` |
-| `ticks_dropped_total` counter emission *(RETIRED 2026-07-18, stage-4 sweep: `tick_persistence.rs` was deleted in the stage-2 dead-WS sweep — zero emit sites remain; `zero_tick_loss_alert_guard.rs` deleted with it)* | — | — |
+| `ticks_dropped_total` counter emission ~~*(RETIRED 2026-07-18, stage-4 sweep: `tick_persistence.rs` was deleted in the stage-2 dead-WS sweep — zero emit sites remain; `zero_tick_loss_alert_guard.rs` deleted with it)*~~ **⚠ CORRECTED 2026-10-11:** NOT retired. The file is back (2026-08-26) and emits `tv_ticks_dropped_total` with a `feed` label, registered at 0 at writer construction; the live emit site is `crates/storage/src/tick_persistence.rs`. (`zero_tick_loss_alert_guard.rs` is still deleted.) | `crates/storage/src/tick_persistence.rs` | — |
 | `SEAL_BUFFER_CAPACITY = AGGREGATOR_MAX_SLOTS x TF_COUNT` = 25,000 x 10 = **250,000** at TF_COUNT=10 (was 600,000 at TF_COUNT=24 until the 2026-09-19 nine-frame collapse, 225,000 at TF_COUNT=9 until `M10` became a native frame on 2026-09-22, and this row said 225,000 until audit PR40a — read the constant, not this number) (absorbs the IST-midnight seal burst) — **CORRECTED 2026-08-29**, this said a literal 200,000, which is 3x too small and is the exact restate-the-number-instead-of-the-constant error CLAUDE.md warns about by name | `crates/trading/src/candles/seal_ring.rs` | `seal_ring.rs::test_seal_buffer_capacity_absorbs_the_whole_midnight_burst` |
 | QuestDB outage drops zero ticks (disconnected writer) | `crates/storage/tests/zero_tick_loss_sla_guard.rs` | `test_zero_tick_loss_spill_survives_crash_and_replay_recovers_all_frames` — **RE-POINTED 2026-08-29.** The cited `chaos_questdb_full_session.rs` was DELETED; this doc kept citing it as live proof. |
 | Disk-full → DLQ NDJSON catches every tick | `crates/storage/tests/chaos_seal_disk_full_dlq_capture.rs` | `test_seal_spill_dead_dlq_captures_every_overflow_zero_drop` — **RE-POINTED 2026-08-29** (was the deleted `chaos_disk_full.rs`). Covers the SEAL tier; an equivalent tick-tier chaos test does NOT exist. |
@@ -68,8 +68,8 @@ But we CAN mechanically guarantee:
 | Claim | Proof file | Test name |
 |---|---|---|
 | Tick parse ≤ 10 ns (p99) | `quality/benchmark-budgets.toml` + Criterion benches | bench gate via `scripts/bench-gate.sh` |
-| Pipeline routing ≤ 100 ns per tick (gate now divides batch median by element count — honest per-tick, fixed #992; measured 2026-06-02: 4.7 ns/tick) | same + `quality/benchmark-budgets.toml` `[elements]` | `crates/common/tests/bench_budget_elements_guard.rs` |
-| papaya registry lookup ≤ 50 ns (measured 2026-06-02: 10.6 ns, hit≈miss → true O(1)) | same | bench gate |
+| ~~Pipeline routing~~ Packet decode + dispatch ≤ 100 ns per tick (gate now divides batch median by element count — honest per-tick, fixed #992; measured 2026-06-02: 4.7 ns/tick) **⚠ CORRECTED 2026-10-11:** this budget times packet decode and dispatch only (`pipeline.rs` loops `dispatch_frame`). The live path per packet (WAL append, candle fold, row append) has no bench; decode is O(1) per tick packet and O(levels) per depth packet. | same + `quality/benchmark-budgets.toml` `[elements]` | `crates/common/tests/bench_budget_elements_guard.rs` |
+| ~~papaya~~ registry lookup ≤ 50 ns (measured 2026-06-02: 10.6 ns, hit≈miss → true O(1)) **⚠ CORRECTED 2026-10-11:** the registry is a plain `HashMap` on the composite key, not papaya; the O(1) claim stands. | same | bench gate |
 | OMS state transition ≤ 100 ns | same | same |
 | Zero heap alloc per tick | `crates/core/tests/dhat_allocation.rs` | DHAT harness, fails CI on non-zero alloc |
 | 5% benchmark regression = build fail | `quality/benchmark-budgets.toml` | bench-gate CI stage |
@@ -95,7 +95,7 @@ But we CAN mechanically guarantee:
 
 | Claim | Proof file | Test name / gate |
 |---|---|---|
-| Ratcheted per-crate LINE-coverage floors (app 72.6 · core 91.6 · storage 90.1 · trading 96.9 · api 98.6 · common 99.4 · default 63.0; floors only move up, 100% is the target — LINE coverage only, no branch gate) | `quality/crate-coverage-thresholds.toml` | `scripts/coverage-gate.sh`, post-merge only (not a PR blocker) |
+| Ratcheted per-crate LINE-coverage floors (app 72.6 · core 91.6 · storage 90.1 · trading 96.9 · api 98.6 · common 99.4 · default 63.0; floors only move up, 100% is the target — LINE coverage only, no branch gate) | `quality/crate-coverage-thresholds.toml` | `scripts/coverage-gate.sh`, ~~post-merge only (not a PR blocker)~~ **⚠ CORRECTED 2026-10-11:** runs on every PR and is in the All Green fan-in (ci.yml `all-green` needs `coverage-and-perf`), so a floor breach blocks merge |
 | Mutation score: zero survivors | `.github/workflows/mutation.yml` | lines 103-113 fail if any `SURVIVED` |
 | Fuzz targets run weekly, zero crashes | `.github/workflows/fuzz.yml` | nightly schedule |
 | `cargo fmt --check` clean | CI | pre-commit + PR gate |
@@ -165,7 +165,7 @@ no shell, no curl, no grep:
 | `cargo audit` | YES | every push |
 | `cargo deny` | YES | every push |
 | 30-check validate-automation | YES | every push |
-| Ratcheted per-crate LINE-coverage floors (72.6–99.4, target 100%; no branch gate) | YES | post-merge only (not a PR blocker) |
+| Ratcheted per-crate LINE-coverage floors (72.6–99.4, target 100%; no branch gate) | YES | ~~post-merge only (not a PR blocker)~~ **⚠ CORRECTED 2026-10-11:** every PR, inside All Green (`all-green` needs `coverage-and-perf`) |
 | Mutation zero-survivors | YES | weekly |
 | Fuzz 0 crashes | YES | weekly |
 
@@ -175,8 +175,8 @@ Physics / economics limits. These claims are **replaced by SLAs**:
 
 | Impossible claim | SLA replacement | Alert |
 |---|---|---|
-| "WebSocket never disconnects" | Reconnect p99 < 500ms, zero tick loss via ring + spill | `HighWebSocketReconnectRate` |
-| "QuestDB never fails" | Back-pressure + disk spill + auto-resume < 30s | `QuestDbDown` |
+| "WebSocket never disconnects" | ~~Reconnect p99 < 500ms, zero tick loss via ring + spill~~ **⚠ CORRECTED 2026-10-11:** no reconnect p99 is measured or alarmed. The page fires when the worst re-dial-to-first-data time of a main-feed socket in a 5-minute window reaches 15 s (normal is about 2 s), in session only; depth sockets are excluded. | ~~HighWebSocketReconnectRate~~ `tv-<env>-dhan-main-reconnect-slow` |
+| "QuestDB never fails" | Back-pressure + disk spill + auto-resume < 30s **⚠ CORRECTED 2026-10-11:** the alert named here did not exist; the QuestDB pages are the three alarms in the next column. | ~~QuestDbDown~~ `tv-<env>-questdb-wal-suspended`, `tv-<env>-spill-dir-free-low`, `tv-<env>-questdb-wal-probe-failed` |
 | "No future bugs" | 0 known bugs at HEAD + every seen pattern = CI block | every guard above |
 | "100% of all possible scenarios" | Every enumerated scenario + fuzz + mutation | weekly fuzz / mutation CI |
 | "Auto-resolve every incident" | Known-signature → auto-fix; novel → escalate with context | triage hook + YAML rules |

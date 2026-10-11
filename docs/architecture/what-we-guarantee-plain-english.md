@@ -31,11 +31,33 @@
 |---|---|
 | Every price update is written to disk **first**, before anything else can drop it. | Even if everything downstream jams or crashes, the update is already safe on disk and replays when we restart. **Zero lost.** |
 | If the database goes down, updates pile into a safety net (memory → disk → backup file). | Tested: database down → **0 lost**. Disk full → a backup text file catches them → **0 lost**. Power-kill mid-write → replays on restart → **0 lost**. |
-| The only way to truly lose one | Memory full **and** disk full **and** backup file unwritable — all at the same instant. That's physics, not a bug. **And the moment it happens, your phone rings** (a dedicated alarm) — it is never silent. |
+| The only way to truly lose one | ~~Memory full **and** disk full **and** backup file unwritable — all at the same instant. That's physics, not a bug.~~ *(corrected below)* **And the moment it happens, your phone rings** (a dedicated alarm) — it is never silent. |
+
+> **⚠ CORRECTED 2026-10-11** — the last row above was too strong. A price
+> update can be lost without everything failing at once. Any ONE of these is
+> enough:
+>
+> 1. the save queue is full for a moment;
+> 2. the disk-saving helper has stopped;
+> 3. the backup files have reached their size limit;
+> 4. the main log write failed after the update had been set aside to save
+>    later;
+> 5. the database writer gave up on rows after a failed write.
+>
+> Each of these is counted, and each one rings your phone. One kind of loss we
+> cannot see at all: if our reader falls behind, the broker skips ahead to its
+> newest prices and sends no sequence number, so the updates it skipped never
+> reach us and nothing can count them.
 
 > **Picture it:** a fruit on a conveyor belt. Before it can fall off, a net is
-> already under it. Then a second net. Then a third. Only if all three nets
-> tear at once does a fruit drop — and a siren goes off instantly.
+> already under it. Then a second net. Then a third. ~~Only if all three nets
+> tear at once does a fruit drop — and a siren goes off instantly.~~
+>
+> **⚠ CORRECTED 2026-10-11:** a fruit can also drop when just ONE net is full
+> or broken for a moment — the nets do not all have to tear together. Every
+> such drop still sets off the siren. And if the truck bringing the fruit
+> skips some on the road, those never reach the belt, so no net and no siren
+> can know about them.
 
 ---
 
@@ -45,7 +67,7 @@
 |---|---|
 | Looking up any instrument takes the **same tiny time** whether we track 4 or 4 million — it never slows down as we grow. | Measured: ~10 billionths of a second. Same speed for a found item and a missing item — proof it doesn't slow down with size. |
 | Reading a price packet | ~15 billionths of a second, fixed — never changes with input. |
-| Processing one tick end-to-end inside the shop | ~5 billionths of a second per tick. |
+| ~~Processing one tick end-to-end inside the shop~~ Reading a packet's label and sending it the right way | ~5 billionths of a second per tick. **⚠ CORRECTED 2026-10-11:** this row said "end-to-end". ~5 billionths is only the time to decode a packet's header and route it. It does not include writing the update to the log, building candles or queueing the database row. That whole path has not been measured. |
 | The honest edge | The *network* trip to the exchange is ~thousandths of a second — that's the speed of the internet, which no software can beat. Inside our shop, everything is blink-fast. |
 
 > **"O(1)" in human words:** the time to do the job does **not** grow when the
@@ -106,8 +128,8 @@
 
 | What people wish for | What we actually promise (and prove) |
 |---|---|
-| "Never lose a tick, ever" | Zero loss in every real failure — slow db, db down, crash, restart, disk full. The one physical edge (memory **and** disk **and** backup all full at once) is **alarmed, never silent.** |
-| "Infinitely fast" | Blink-fast inside the shop (billionths of a second, measured). The network trip to the exchange is the internet's speed — nobody beats that. |
+| "Never lose a tick, ever" | ~~Zero loss in every real failure — slow db, db down, crash, restart, disk full. The one physical edge (memory **and** disk **and** backup all full at once) is **alarmed, never silent.**~~ **⚠ CORRECTED 2026-10-11:** zero loss in the failures we test (slow database, database down, crash, restart). An update CAN be lost when any one save step is full or stopped for a moment (see section 1); each such loss is counted and **rings your phone, never silent**. Updates the broker skips when our reader falls behind never reach us and cannot be counted. |
+| "Infinitely fast" | Blink-fast inside the shop (billionths of a second, measured — for reading and routing a packet; the full path to the database is not yet measured, see section 2). The network trip to the exchange is the internet's speed — nobody beats that. |
 | "Never breaks" | We can't stop a third party or the internet from hiccuping. But we **detect it in seconds, recover automatically, and ring your phone.** |
 | "Trust me, it's safe" | No "trust me." Every promise on this page has a real automated test behind it (see the engineer's version). If a test goes missing, the build fails. |
 

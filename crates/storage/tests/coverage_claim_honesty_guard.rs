@@ -377,3 +377,53 @@ fn every_documented_coverage_floor_matches_the_enforced_floor() {
         wrong.join("\n  ")
     );
 }
+
+/// Regression: 2026-10-11 (audit TRU-6). `guarantees.md` said the coverage
+/// floors run "post-merge only (not a PR blocker)" while ci.yml's `all-green`
+/// job — the one required merge gate — needs `coverage-and-perf`. While that
+/// is so, the document may not call coverage post-merge-only outside a
+/// `~~strike~~`.
+#[test]
+fn guarantees_doc_matches_coverage_gate_timing() {
+    let ci = read(".github/workflows/ci.yml");
+    let start = ci
+        .find("\n  all-green:")
+        .expect("ci.yml defines the all-green job");
+    let job = &ci[start + 1..];
+    let needs_start = job.find("needs:").expect("all-green has a needs list");
+    let needs: Vec<&str> = job[needs_start..]
+        .lines()
+        .skip(1)
+        .take_while(|l| l.trim_start().starts_with("- "))
+        .map(|l| l.trim_start().trim_start_matches("- ").trim())
+        .collect();
+    assert!(
+        needs.len() >= 5,
+        "parsed too few all-green needs: {needs:?}"
+    );
+    if !needs.contains(&"coverage-and-perf") {
+        // Coverage left the merge gate; the post-merge wording would be true.
+        return;
+    }
+
+    let doc = read("docs/architecture/guarantees.md");
+    let mut live = String::with_capacity(doc.len());
+    let mut rest = doc.as_str();
+    while let Some(open) = rest.find("~~") {
+        let after = &rest[open + 2..];
+        match after.find("~~") {
+            Some(close) => {
+                live.push_str(&rest[..open]);
+                rest = &after[close + 2..];
+            }
+            None => break,
+        }
+    }
+    live.push_str(rest);
+    assert!(
+        !live.contains("post-merge only (not a PR blocker)"),
+        "guarantees.md says the coverage gate is post-merge only, but ci.yml \
+         all-green needs coverage-and-perf, so a floor breach blocks merge. \
+         Strike the claim and add a dated correction."
+    );
+}
