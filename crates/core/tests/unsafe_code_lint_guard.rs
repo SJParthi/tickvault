@@ -11,6 +11,16 @@
 //!
 //! These two tests stop the lint being removed quietly, and stop a second
 //! opt-out being added without this file changing with it.
+//!
+//! **Corrected 2026-10-11 (review of CR-5).** The opt-out scan first matched
+//! only the text `allow(unsafe_code` / `expect(unsafe_code`, so a list with
+//! another lint first (`#[allow(dead_code, unsafe_code)]`, or the same inside
+//! `cfg_attr`) or a `warn(unsafe_code)` downgrade slipped past it. It now
+//! flags any `allow`, `expect` or `warn` list that names the `unsafe_code`
+//! token, across lines, and `unsafe_code_opt_out_detector_bites` proves it.
+//! **Not covered by the deny:** `build.rs` files (only `crates/common/build.rs`
+//! today) are build-script crate roots and do not carry the deny line; the
+//! opt-out scan still reads them, so an opt-out added there fails this test.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -102,17 +112,17 @@ fn allow_unsafe_code_appears_only_on_the_affinity_module() {
             continue;
         }
         let body = fs::read_to_string(&file).unwrap_or_default();
-        let lines: Vec<&str> = body.lines().collect();
-        for (i, line) in lines.iter().enumerate() {
-            let code = line.split("//").next().unwrap_or("");
-            if code.contains("allow(unsafe_code") || code.contains("expect(unsafe_code") {
-                let next = lines
-                    .iter()
-                    .skip(i + 1)
-                    .map(|l| l.trim())
-                    .find(|l| !l.is_empty())
-                    .unwrap_or("");
-                sites.push((rel.display().to_string(), next.to_string()));
+        record_opt_outs(&rel.display().to_string(), &body, &mut sites);
+    }
+    // build.rs files are crate roots of their own build scripts, which the
+    // root lint does not cover (see the module header); an opt-out there is
+    // still recorded, so one cannot be added without this test changing.
+    if let Ok(crates) = fs::read_dir(root.join("crates")) {
+        for entry in crates.flatten() {
+            let build = entry.path().join("build.rs");
+            if let Ok(body) = fs::read_to_string(&build) {
+                let rel = build.strip_prefix(&root).unwrap_or(&build).to_path_buf();
+                record_opt_outs(&rel.display().to_string(), &body, &mut sites);
             }
         }
     }
@@ -125,4 +135,106 @@ fn allow_unsafe_code_appears_only_on_the_affinity_module() {
         "the only production opt-out from deny(unsafe_code) is the affinity module; \
          a new one needs its own SAFETY notes and this test updated in the same change"
     );
+}
+
+/// Records `(file, first non-empty line after the attribute)` for every
+/// `unsafe_code` opt-out in `body`, read with `//` comments stripped.
+fn record_opt_outs(rel: &str, body: &str, sites: &mut Vec<(String, String)>) {
+    let stripped: Vec<&str> = body
+        .lines()
+        .map(|l| l.split("//").next().unwrap_or(""))
+        .collect();
+    let code = stripped.join("\n");
+    for at in unsafe_code_opt_outs(&code) {
+        // The attribute ends at the next `]`; the item it applies to is the
+        // first non-empty line after that.
+        let close = code[at..].find(']').map_or(code.len(), |r| at + r);
+        let close_line = code[..close].matches('\n').count();
+        let next = stripped
+            .iter()
+            .skip(close_line + 1)
+            .map(|l| l.trim())
+            .find(|l| !l.is_empty())
+            .unwrap_or("");
+        sites.push((rel.to_string(), next.to_string()));
+    }
+}
+
+/// Does `code` (comment-stripped source) hold an attribute that turns the
+/// `unsafe_code` lint down? True for `allow`, `expect` and `warn` lists that
+/// name the token anywhere in the list (`#[allow(dead_code, unsafe_code)]`,
+/// `#![cfg_attr(x, allow(clippy::y, unsafe_code))]`), false for `deny` and
+/// `forbid`. Returns the byte offset of each opt-out's `unsafe_code` token.
+fn unsafe_code_opt_outs(code: &str) -> Vec<usize> {
+    const TOKEN: &str = "unsafe_code";
+    let bytes = code.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = code[from..].find(TOKEN) {
+        let at = from + rel;
+        from = at + TOKEN.len();
+        let before_ok = at == 0 || !is_ident(bytes[at - 1]);
+        let after_ok = from >= bytes.len() || !is_ident(bytes[from]);
+        if !before_ok || !after_ok {
+            continue;
+        }
+        // Walk back to the open paren of the list this token sits in, then
+        // read the lint level named just before it.
+        let mut depth = 0usize;
+        let mut level: Option<&str> = None;
+        let mut i = at;
+        while i > 0 {
+            i -= 1;
+            match bytes[i] {
+                b')' => depth += 1,
+                b'(' if depth > 0 => depth -= 1,
+                b'(' => {
+                    let mut s = i;
+                    while s > 0 && is_ident(bytes[s - 1]) {
+                        s -= 1;
+                    }
+                    level = Some(&code[s..i]);
+                    break;
+                }
+                b'[' | b';' | b'{' | b'}' => break,
+                _ => {}
+            }
+        }
+        if matches!(level, Some("allow" | "expect" | "warn")) {
+            out.push(at);
+        }
+    }
+    out
+}
+
+#[test]
+fn unsafe_code_opt_out_detector_bites() {
+    for opt_out in [
+        "#[allow(unsafe_code)]",
+        "#[allow(dead_code, unsafe_code)]",
+        "#![allow(clippy::x, unsafe_code)]",
+        "#[expect(unsafe_code, reason = \"x\")]",
+        "#[warn(unsafe_code)]",
+        "#![cfg_attr(feature = \"x\", allow(clippy::foo, unsafe_code))]",
+        "#[allow(\n    dead_code,\n    unsafe_code\n)]",
+    ] {
+        assert_eq!(
+            unsafe_code_opt_outs(opt_out).len(),
+            1,
+            "must be flagged as an opt-out: {opt_out}"
+        );
+    }
+    for fine in [
+        "#![cfg_attr(not(test), deny(unsafe_code))]",
+        "#![forbid(unsafe_code)]",
+        "#[deny(dead_code, unsafe_code)]",
+        "let not_unsafe_code_here = 1;",
+        "fn unsafe_code_opt_outs(code: &str) {}",
+    ] {
+        assert!(
+            unsafe_code_opt_outs(fine).is_empty(),
+            "must not be flagged: {fine}"
+        );
+    }
 }

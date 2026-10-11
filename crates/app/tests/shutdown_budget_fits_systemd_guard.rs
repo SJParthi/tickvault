@@ -251,6 +251,42 @@ fn the_panic_hook_drains_the_wal_before_it_aborts() {
         jsonl_line < drain,
         "the shipped errors.jsonl panic line must be written before the WAL drain waits"
     );
+    // Review of OBS-1 (2026-10-11): the call must target ERRORS_JSONL_DIR, the
+    // directory the CloudWatch agent tails. Any other directory keeps the
+    // order above green while the crash line never reaches the shipped stream.
+    let jsonl_call = &hook[jsonl_line..];
+    let jsonl_call = &jsonl_call[..jsonl_call
+        .find(");")
+        .expect("the errors.jsonl panic call ends with );")];
+    assert!(
+        jsonl_call.contains("ERRORS_JSONL_DIR"),
+        "the errors.jsonl panic line must be written into observability::ERRORS_JSONL_DIR, \
+         the directory the CloudWatch agent ships: {jsonl_call}"
+    );
+    let agent = read("deploy/aws/cloudwatch-agent.json");
+    assert!(
+        agent.contains("\"/opt/tickvault/data/logs/machine/errors.jsonl.2*\""),
+        "the CloudWatch agent must tail data/logs/machine/errors.jsonl.2*, the directory \
+         ERRORS_JSONL_DIR names (pinned to data/logs/machine in observability.rs)"
+    );
+    // Review of OBS-1 (2026-10-11): in the abort build the tracing line that
+    // carries `wal_drain` dies with the process, so the drain outcome gets its
+    // own synchronous line, after the drain and before the default hook.
+    let drain_line = hook
+        .find("append_panic_wal_drain_jsonl_line_sync(")
+        .expect("the hook writes the WAL drain outcome synchronously");
+    assert!(
+        drain < drain_line,
+        "the WAL drain outcome line must be written after the drain returns"
+    );
+    let drain_call = &hook[drain_line..];
+    let drain_call = &drain_call[..drain_call
+        .find(");")
+        .expect("the drain outcome call ends with );")];
+    assert!(
+        drain_call.contains("ERRORS_JSONL_DIR"),
+        "the WAL drain outcome line must go to the shipped errors.jsonl directory: {drain_call}"
+    );
     assert!(
         hook.contains("WAL_ABORT_DRAIN_BUDGET"),
         "the hook's WAL drain must be bounded by WAL_ABORT_DRAIN_BUDGET"
@@ -278,7 +314,9 @@ fn the_panic_hook_drains_the_wal_before_it_aborts() {
 /// spawned task, the first OS thread and the WAL writer — and after the
 /// one-shot CLI short-circuits, which never run the app. Until this date it
 /// sat after ~40 spawns and the WAL thread, so an early panic left only the
-/// default stderr message.
+/// default stderr message. (2026-10-11, review of G5-crash: the config load
+/// is now `boot_helpers::layered_config_figment`, since G6-input INP-14; the
+/// anchor below follows it.)
 #[test]
 fn the_panic_hook_is_installed_before_any_boot_work() {
     let main_rs = strip_comments(&read("crates/app/src/main.rs"));
@@ -300,7 +338,7 @@ fn the_panic_hook_is_installed_before_any_boot_work() {
         "tokio::spawn(",
         "WsFrameSpill::new_with_guard(",
         "std::thread::Builder::new(",
-        "Toml::file(CONFIG_BASE_PATH)",
+        "layered_config_figment(",
     ] {
         let at = body
             .find(later)

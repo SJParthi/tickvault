@@ -575,9 +575,21 @@ pub fn errors_jsonl_hour_path(
 /// this date no shipped log row carried a crash's location or message. This
 /// writes the same flattened shape the errors.jsonl layer emits
 /// (`flatten_event(true)`: `code`, `message` at the top level), with a UTC
-/// RFC 3339 `timestamp`. The CloudWatch agent is its own process and ships
-/// the line after the abort. No metric filter, alarm or page reads it: the
-/// process death is paged by the existing liveness alarms.
+/// RFC 3339 `timestamp`. That matches the rest of the file: the errors.jsonl
+/// layer sets no timer, so tracing-subscriber's default writes UTC with a
+/// `Z` suffix, which is what the agent's `"timezone": "UTC"` expects (pinned
+/// by `test_errors_jsonl_layer_keeps_the_default_utc_timer`). The CloudWatch
+/// agent is its own process and ships the line after the abort.
+///
+/// No alarm pages on it. The generic flat-schema error filter
+/// (`log-schema-flat-errors`) counts it, which can only hold
+/// `errcode-stream-silent` off, never trip it. A single panic is NOT paged:
+/// systemd restarts the unit within seconds (`Restart=always`,
+/// `RestartSec=3`), and `market-hours-liveness-missing` needs five missing
+/// 60 s periods inside 09:20-15:35 IST. Only a restart loop (past
+/// `StartLimitBurst` the unit stays failed) or an outage of five minutes or
+/// more in that window pages. A PROC-03 page is an open owner decision under
+/// the noise lock (corrected 2026-10-11, review of OBS-1).
 ///
 /// Runs only inside the panic hook, once per process death: one directory
 /// create, one open, one `write_all`. Best-effort like
@@ -595,6 +607,30 @@ pub fn append_panic_jsonl_line_sync(dir: &std::path::Path, location: &str, paylo
         "message": "PANIC: tickvault crashed",
         "panic_location": location,
         "panic_payload": payload,
+    });
+    append_whole_line_best_effort(&errors_jsonl_hour_path(dir, now), &line);
+}
+
+/// Appends the WAL drain outcome of a panic SYNCHRONOUSLY to the current
+/// hourly `errors.jsonl` file in `dir`, as a second PROC-03 line (review of
+/// audit OBS-1, 2026-10-11).
+///
+/// **Why:** the first panic line is written before the WAL drain, so it
+/// cannot say how the drain ended, and the coded tracing line that carries
+/// `wal_drain` dies with the process under `panic = "abort"`. The panic hook
+/// calls this after `drain_registered_for_abort` returns and before the
+/// default hook aborts, so the shipped stream says whether the WAL queue was
+/// emptied. Runs only in abort builds, once per process death: one open and
+/// one `write_all`. Best-effort like [`append_panic_jsonl_line_sync`].
+pub fn append_panic_wal_drain_jsonl_line_sync(dir: &std::path::Path, wal_drain: &str) {
+    let now = chrono::Utc::now();
+    let line = serde_json::json!({
+        "timestamp": now.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string(),
+        "level": "ERROR",
+        "target": "tickvault_app::panic",
+        "code": tickvault_common::error_code::ErrorCode::Proc03Panicked.code_str(),
+        "message": "PANIC: WAL drain before abort",
+        "wal_drain": wal_drain,
     });
     append_whole_line_best_effort(&errors_jsonl_hour_path(dir, now), &line);
 }
@@ -999,6 +1035,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir.parent().unwrap_or(&dir));
     }
 
+    // Review of OBS-1 (2026-10-11): in the abort build the only record of the
+    // WAL drain outcome is this second synchronous line.
+    #[test]
+    fn test_append_panic_wal_drain_jsonl_line_sync_writes_the_drain_outcome() {
+        let dir = panic_test_dir("panic-drain").join("machine");
+        let before = chrono::Utc::now();
+        append_panic_wal_drain_jsonl_line_sync(&dir, "Drained { records: 3 }");
+        let after = chrono::Utc::now();
+        let body = [
+            errors_jsonl_hour_path(&dir, before),
+            errors_jsonl_hour_path(&dir, after),
+        ]
+        .iter()
+        .find_map(|p| std::fs::read_to_string(p).ok())
+        .expect("the drain line is in the current hourly errors.jsonl file");
+        assert_eq!(body.matches('\n').count(), 1, "exactly one whole line");
+        let line: serde_json::Value =
+            serde_json::from_str(body.trim_end()).expect("one valid JSON line");
+        assert_eq!(line["code"], "PROC-03");
+        assert_eq!(line["level"], "ERROR");
+        assert_eq!(line["message"], "PANIC: WAL drain before abort");
+        assert_eq!(line["wal_drain"], "Drained { records: 3 }");
+        let ts = line["timestamp"].as_str().expect("timestamp");
+        assert!(
+            ts.ends_with('Z'),
+            "UTC like the layer's default timer: {ts}"
+        );
+        let parsed = crate::feed_scoreboard_boot::parse_errors_jsonl_line(&body)
+            .expect("the shipped-stream reader parses the drain line");
+        assert_eq!(parsed.code, "PROC-03");
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap_or(&dir));
+    }
+
+    // Review of OBS-1 (2026-10-11): the panic lines build their timestamp by
+    // hand in UTC with a `Z`. That only matches the rest of errors.jsonl, and
+    // the agent's `"timezone": "UTC"`, while the layer keeps the default
+    // timer. An IST timer there would split the file into two clocks.
+    #[test]
+    fn test_errors_jsonl_layer_keeps_the_default_utc_timer() {
+        let main = include_str!("main.rs");
+        let at = main
+            .find("init_errors_jsonl_appender(observability::ERRORS_JSONL_DIR)")
+            .expect("main.rs builds the errors.jsonl layer");
+        let block = &main[at..];
+        let end = block
+            .find("Some(Box::new(layer))")
+            .expect("the errors.jsonl layer block ends with Some(Box::new(layer))");
+        assert!(
+            !block[..end].contains(".with_timer("),
+            "the errors.jsonl layer must keep the default UTC timer; the panic \
+             lines in observability.rs write UTC `Z` timestamps to match it"
+        );
+    }
+
     // Pins `errors_jsonl_hour_path` against tracing-appender's own naming,
     // so a dependency change that renames the files fails here, not in prod.
     #[test]
@@ -1068,6 +1158,39 @@ mod tests {
                 !body[..end].contains(concat!("writeln", "!(")),
                 "{start} must write the whole line with one write_all"
             );
+        }
+
+        // Review of OBS-1 (2026-10-11): any piecewise formatted write brings
+        // the interleave back, not only `writeln!`. Every public panic writer
+        // goes through the one helper, and the helper writes one buffer.
+        let writers = [
+            "pub fn append_panic_line_sync(",
+            "pub fn append_panic_jsonl_line_sync(",
+            "pub fn append_panic_wal_drain_jsonl_line_sync(",
+        ];
+        let helper = "fn append_whole_line_best_effort(";
+        for start in writers.iter().chain(std::iter::once(&helper)) {
+            let at = src.find(start).expect("panic writer exists");
+            let body = &src[at..];
+            let end = body.find("\n\x7d\n").expect("function end");
+            let body = &body[..end];
+            for banned in [concat!("write", "!("), concat!("write", "_fmt(")] {
+                assert!(
+                    !body.contains(banned),
+                    "{start} must not use {banned}; write the whole line with one write_all"
+                );
+            }
+            if *start == helper {
+                assert!(
+                    body.contains("write_all(text.as_bytes())"),
+                    "the helper must write the serialized line with one write_all"
+                );
+            } else {
+                assert!(
+                    body.contains("append_whole_line_best_effort("),
+                    "{start} must write through append_whole_line_best_effort"
+                );
+            }
         }
     }
 

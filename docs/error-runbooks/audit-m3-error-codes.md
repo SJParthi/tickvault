@@ -29,7 +29,7 @@ EXISTING alarm, named in each section.
 |---|---|---|
 | WS-SPILL-03 | `crates/app/src/main.rs`, STAGE-C WAL init | No new page. The halted boot is paged by the existing boot-heartbeat and market-hours liveness alarms. |
 | WS-SPILL-04 | `crates/storage/src/ws_frame_spill.rs`, boot replay | No new page. The event already pages through the existing `durable-floor-breach` alarm (counter `tv_wal_replay_corrupted_segments_total`). |
-| PROC-03 | `crates/app/src/main.rs`, panic hook | No new page. The process death is paged by the existing liveness alarms. |
+| PROC-03 | `crates/app/src/main.rs`, panic hook | No new page. The process death is paged by the existing liveness alarms. *(⚠ Corrected 2026-10-11: only a restart loop or an outage of 5+ minutes between 09:20 and 15:35 IST pages; a single panic that systemd restarts is not paged. See the PROC-03 section.)* |
 | API-SERVER-01 | `crates/app/src/main.rs`, API server task | No. |
 | TICK-GAP-01 | `crates/trading/src/risk/tick_gap_tracker.rs` (two lines) | No. Dormant today. |
 | PIPELINE-LAG-01 | `crates/app/src/trading_pipeline.rs` | No. Dormant today. |
@@ -103,10 +103,45 @@ lines; a panic in `main()` before `async_main` starts (reader-runtime setup) is
 still covered only by the default stderr message. In test and debug builds
 (unwinding) the tracing line can also arrive, giving two rows for one panic.
 
+**⚠ CORRECTED AGAIN 2026-10-11 (review of OBS-1)** — four statements above were
+wrong or too strong:
+
+- **"The process death is paged by the existing liveness alarms" is false for an
+  ordinary single panic.** systemd restarts the unit within seconds
+  (`Restart=always`, `RestartSec=3`), and `tv-<env>-market-hours-liveness-missing`
+  needs five missing 60 s periods, only between 09:20 and 15:35 IST. So a panic
+  that restarts and boots in under about five minutes, or any panic outside that
+  window, pages nobody. Only a restart loop (past `StartLimitBurst` = 5 in an hour
+  the unit stays failed) or an outage of five minutes or more inside the window
+  pages. The table row above and the "What pages" line carry the same error. A
+  PROC-03 page is an **open owner decision** under the Dhan noise lock; no alarm
+  is added here.
+- **"No metric filter or alarm reads it" is false.** The existing generic filter
+  `tv-<env>-log-schema-flat-errors` (`{ $.level = "ERROR" && $.code = * }`)
+  counts the flat PROC-03 line into `tv_log_errors_flat_total`. That can only hold
+  `errcode-stream-silent` off, never trip it, so no alarm pages on it.
+- **"A panic anywhere in boot" was too strong.** Before the hook are also the TLS
+  provider install at Step 0 and the `holiday-gate` and `ensure-questdb`
+  one-shots; a panic there leaves only the default stderr message, like the
+  reader-runtime setup in `main()`.
+- **Step 2 below pointed at a field no surviving record carried** in the release
+  build: the line with `wal_drain` was the non-blocking tracing line, lost with
+  the abort. The hook now writes a second synchronous `errors.jsonl` line after
+  the drain returns and before the abort, `"message": "PANIC: WAL drain before
+  abort"`, with `wal_drain` at the top level. It is written only in abort builds
+  (unwinding builds do not drain).
+
+The `timestamp` on both panic lines is UTC with a `Z`, the same as every other
+line in `errors.jsonl` (that layer keeps tracing-subscriber's default UTC timer;
+only `app.log`, `errors.log` and the category files use IST), which matches the
+agent's `"timezone": "UTC"`.
+
 **Do:**
 1. Read `panic_location` and `panic_payload`: they name the source line and message.
    In CloudWatch, search the `errors-jsonl` stream for `PROC-03`.
 2. Read `wal_drain`: it says whether the WAL queue was emptied before the abort.
+   *(2026-10-11: in CloudWatch it is on the second PROC-03 line, message
+   `PANIC: WAL drain before abort`; see the correction above.)*
 3. Treat every panic as a defect: open a fix for the named location. A panic that
    repeats on every boot is a restart loop.
 

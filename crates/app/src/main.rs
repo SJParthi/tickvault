@@ -772,14 +772,21 @@ async fn async_main() -> Result<()> {
     // -----------------------------------------------------------------------
     // Installed HERE, before the config load (which can panic) and before the
     // first spawned task, the WAL writer thread and every other boot step, so
-    // a panic anywhere in boot leaves the synchronous PROC-03 lines and gets
-    // the bounded WAL drain. Until this date it sat after ~40 spawns and the
-    // WAL thread, so an early panic left only the default stderr message.
+    // a panic in boot from here on leaves the synchronous PROC-03 lines and
+    // gets the bounded WAL drain. Until this date it sat after ~40 spawns and
+    // the WAL thread, so an early panic left only the default stderr message.
     // After the one-shot CLI short-circuits above, which never run the app.
+    // NOT covered (default stderr message only): the TLS provider install at
+    // Step 0, the holiday-gate and ensure-questdb one-shots, and main()'s
+    // reader-runtime setup before async_main starts.
     // It needs nothing initialized: with no subscriber yet the tracing line
     // is a no-op, the drain reports no spill registered, and the file writers
-    // create `data/logs/machine` themselves. The paging comes from the
-    // liveness alarms, not from this line.
+    // create `data/logs/machine` themselves. No alarm pages on these lines. A
+    // single panic that systemd restarts within about five minutes is not
+    // paged at all; only a restart loop (past StartLimitBurst the unit stays
+    // failed) or an outage of five minutes or more between 09:20 and 15:35
+    // IST trips market-hours-liveness-missing. A PROC-03 page is an open
+    // owner decision under the noise lock.
     let default_panic_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
         let location = panic_info.location().map_or_else(
@@ -826,6 +833,16 @@ async fn async_main() -> Result<()> {
         } else {
             None
         };
+        // Review of OBS-1 (2026-10-11): the two synchronous lines above run
+        // before the drain and the tracing line below dies with the abort, so
+        // without this no surviving record says how the drain ended. One more
+        // synchronous line, after the drain and before the default hook.
+        if let Some(outcome) = &wal_drain {
+            tickvault_app::observability::append_panic_wal_drain_jsonl_line_sync(
+                std::path::Path::new(tickvault_app::observability::ERRORS_JSONL_DIR),
+                &format!("{outcome:?}"),
+            );
+        }
         tracing::error!(
             code = tickvault_common::error_code::ErrorCode::Proc03Panicked.code_str(),
             panic_location = %location,
