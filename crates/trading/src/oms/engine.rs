@@ -1286,6 +1286,15 @@ impl OrderManagementSystem {
                 // so no page) and the order is flagged for reconciliation, the
                 // same shape as the invalid-transition arm below. Cold: only
                 // an unknown status allocates, for the bounded log copy.
+                //
+                // ⚠ CORRECTED 2026-10-11 (review of INP-7): "flagged for
+                // reconciliation" claims more than the code does. Nothing in
+                // production reads `needs_reconciliation`: `reconcile()`
+                // returns at once in dry-run (the only mode today), and in
+                // live mode it skips a REST row whose status is also unknown,
+                // so the flag would never clear. The counter and the coded
+                // `error!` are what make the event visible; the flag is a
+                // marker with no reader yet.
                 counter!(UNKNOWN_ORDER_STATUS_COUNTER).increment(1);
                 let shown_status: String = update
                     .status
@@ -1297,7 +1306,8 @@ impl OrderManagementSystem {
                     source = "unknown_status",
                     order_id = %order_id,
                     status = %shown_status,
-                    "unknown order status in WebSocket update — order flagged for reconciliation"
+                    "unknown order status in WebSocket update — update skipped and counted; \
+                     order marked needs_reconciliation, which nothing acts on today"
                 );
                 if let Some(order) = self.orders.get_mut(&order_id) {
                     order.needs_reconciliation = true;
@@ -5649,7 +5659,9 @@ mod tests {
     #[test]
     fn handle_update_unknown_status_flags_needs_reconciliation() {
         // Audit INP-7 (2026-10-11): an unknown status is no longer a silent
-        // skip — the order is flagged so the next reconcile looks at it.
+        // skip — it is counted and logged, and the order is marked
+        // `needs_reconciliation`. (Review 2026-10-11: no production code
+        // reads that flag yet, so the mark alone corrects nothing.)
         let mut oms = make_oms_with_order("1", OrderStatus::Confirmed);
         assert!(!oms.order("1").unwrap().needs_reconciliation);
         let update = make_order_update("1", "WEIRD");

@@ -1139,6 +1139,11 @@ pub const INGEST_SEQ_REFUSED_COUNTER: &str = "tv_dhan_feed_ingest_seq_refused_to
 /// makes the event visible. Local Prometheus only: deliberately NOT in the
 /// CloudWatch EMF selector and NOT a label on the EMF-selected
 /// `tv_dhan_feed_ingest_refused_total`, so it adds no alarm and no page.
+///
+/// **⚠ CORRECTED 2026-10-11 (review of INP-1):** "live ticks" above is too
+/// narrow. The count runs in `ingest_tick_at`, which the WAL replay and the
+/// shed-frame refold also reach, so it counts live AND replayed ticks. The
+/// log line carries `origin` (`live` or `replay`); the counter has no label.
 const TICK_UNKNOWN_SEGMENT_COUNTER: &str = "tv_dhan_feed_tick_unknown_segment_total";
 
 /// Counter: live ticks folded end-to-end (gap detector → aggregator → writer).
@@ -3902,11 +3907,15 @@ impl LiveIngest {
                 error!(
                     code = ErrorCode::StorageGapTickDedupSegment.code_str(),
                     source = "tick_unknown_segment",
+                    // A boot WAL replay or shed-frame refold also lands here
+                    // (review of INP-1): say which, so a restart is not read
+                    // as a fresh live-feed fault. One bool load, unknown arm only.
+                    origin = if self.replaying_wal { "replay" } else { "live" },
                     security_id = tick.security_id,
                     segment_code = tick.exchange_segment_code,
                     frame_seq,
                     count = self.unknown_segment_ticks,
-                    "live tick carries a segment code the decoder does not know; the row \
+                    "tick carries a segment code the decoder does not know; the row \
                      is KEPT (zero-loss rule) under segment UNKNOWN and the raw code stays \
                      in the WAL frame by capture_seq"
                 );
@@ -25039,13 +25048,22 @@ mod tests {
     #[test]
     fn observe_for_ranking_no_longer_claims_the_decoder_counts_unknown_segments() {
         let src = include_str!("dhan_feed_stack.rs");
-        let banned = ["already counted and logged", " by the decoder"].concat();
+        // Review of INP-1 (2026-10-11): the old ban joined words that sat on
+        // two lines of the original comment, so it could never fail. This
+        // fragment sat on ONE line of the parent commit's comment.
+        let banned = ["is already counted", " and logged by the"].concat();
         assert!(
             !src.contains(&banned),
             "the false claim that the decoder counts unknown segments must stay gone"
         );
         let start = src.find("pub fn ingest_tick_at(").expect("fn present");
-        let body = &src[start..start + 9_000];
+        // Bounded to the method (it ends at a 4-space-indented brace), with
+        // no byte-offset slice that a multi-byte character could split.
+        let fn_end = ["\n    ", "\x7d\n"].concat();
+        let body = src
+            .get(start..)
+            .and_then(|rest| rest.split(fn_end.as_str()).next())
+            .expect("fn body");
         assert!(
             body.contains("counters().tick_unknown_segment.increment(1)"),
             "ingest_tick_at must count an unknown segment byte"

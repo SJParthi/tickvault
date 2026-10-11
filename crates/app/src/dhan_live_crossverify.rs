@@ -1851,6 +1851,11 @@ impl XverifyFetchFailureKind {
 pub struct XverifyFetchFailure {
     pub kind: XverifyFetchFailureKind,
     pub msg: String,
+    /// Vendor cell faults the failed fetch saw before it failed. ADDED
+    /// 2026-10-11 (review of audit INP-12): a body whose every row was
+    /// skipped for a bad cell is a failure, and its skipped-row count used to
+    /// be thrown away with it. All zero for every other failure.
+    pub faults: VendorCellFaults,
 }
 
 impl XverifyFetchFailure {
@@ -1858,6 +1863,7 @@ impl XverifyFetchFailure {
         Self {
             kind,
             msg: msg.into(),
+            faults: VendorCellFaults::default(),
         }
     }
 }
@@ -1942,12 +1948,23 @@ pub struct RunReport {
     /// was filled from the live side only, so "either side" was false; it now
     /// adds the vendor candles refused for a non-finite price. The verdict
     /// does not read this field.
+    ///
+    /// **⚠ CORRECTED 2026-10-11 (review of INP-12):** the vendor term cannot
+    /// fire from today's input. JSON cannot carry NaN or infinity, serde_json
+    /// refuses an overflowing number, and the parser already skips a
+    /// non-finite candle (counted in [`Self::rest_rows_skipped`]). The term is
+    /// defensive; the value is the live side's count in practice.
     pub malformed_rows: usize,
     /// Vendor rows the parser skipped for a bad price or timestamp cell.
-    /// ADDED 2026-10-11 (audit INP-12). Report and log only.
+    /// ADDED 2026-10-11 (audit INP-12). Report and log only: these counts are
+    /// NOT in the daily audit row, so the stored verdict still cannot tell a
+    /// vendor cell fault from our own divergence (that half of INP-12 stays
+    /// open). Since the review of INP-12 it includes the rows of a target
+    /// whose every row was skipped, which also counts in `rest_failures`.
     pub rest_rows_skipped: usize,
     /// Vendor volume cells read as 0 because they did not parse. ADDED
-    /// 2026-10-11 (audit INP-12). Report and log only.
+    /// 2026-10-11 (audit INP-12). Report and log only, not in the daily
+    /// audit row.
     pub rest_volumes_coerced: usize,
     /// `true` when the run budget elapsed before every target was fetched.
     pub budget_elapsed: bool,
@@ -2138,25 +2155,49 @@ pub async fn fetch_rest_side_for_target(
         .map_err(|_| XverifyFetchFailure::new(K::Timeout, "rest body timed out"))?
         .map_err(|e| XverifyFetchFailure::new(K::Transport, format!("rest body: {e}")))?
         .ok_or_else(|| XverifyFetchFailure::new(K::Other, REST_BODY_OVER_CAP_MSG))?;
-    let text = String::from_utf8(body)
-        .map_err(|_| XverifyFetchFailure::new(K::Other, "rest body not utf-8"))?;
+    // Review of INP-13 (2026-10-11): decode the way the old uncapped text
+    // read did — a leading UTF-8 byte-order mark is dropped and an invalid byte is
+    // replaced, not fatal — so the capped read changes only the size bound.
+    // A replaced byte inside a number cell makes that row skipped, and the
+    // skip is counted below. Borrowed (no copy) when the body is valid.
+    let text = decode_vendor_body(&body);
     let (candles, cell_faults) = crate::dhan_intraday_parse::parse_intraday_1m_candles(&text);
     let (bars, malformed) =
         rest_candles_to_side_bars(&candles, target.security_id, &target.segment);
+    let faults = VendorCellFaults {
+        skipped_rows: cell_faults.skipped_rows,
+        coerced_volumes: cell_faults.coerced_volumes,
+        non_finite_rows: malformed,
+    };
     if bars.is_empty() && malformed == 0 {
-        return Err(XverifyFetchFailure::new(
-            K::NoCandles,
-            "rest returned no candles",
-        ));
+        // Review of INP-12 (2026-10-11): a body whose every row was skipped
+        // for a bad cell is still a failure (it counts in `rest_failures`),
+        // but it carries its counts and says so, instead of reading as an
+        // empty answer.
+        let mut failure = if faults.skipped_rows > 0 {
+            XverifyFetchFailure::new(
+                K::NoCandles,
+                format!("{REST_ROWS_ALL_SKIPPED_MSG}: {}", faults.skipped_rows),
+            )
+        } else {
+            XverifyFetchFailure::new(K::NoCandles, "rest returned no candles")
+        };
+        failure.faults = faults;
+        return Err(failure);
     }
-    Ok((
-        bars,
-        VendorCellFaults {
-            skipped_rows: cell_faults.skipped_rows,
-            coerced_volumes: cell_faults.coerced_volumes,
-            non_finite_rows: malformed,
-        },
-    ))
+    Ok((bars, faults))
+}
+
+/// Failure message prefix for a vendor body whose every row was skipped for a
+/// bad cell. ADDED 2026-10-11 (review of audit INP-12).
+const REST_ROWS_ALL_SKIPPED_MSG: &str = "rest rows all skipped";
+
+/// Decodes a vendor body as text: drops a leading UTF-8 byte-order mark and
+/// replaces invalid bytes. ADDED 2026-10-11 (review of audit INP-13). O(body),
+/// no copy when the body is valid UTF-8.
+fn decode_vendor_body(body: &[u8]) -> std::borrow::Cow<'_, str> {
+    let bytes = body.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(body);
+    String::from_utf8_lossy(bytes)
 }
 
 /// Ceiling on one vendor intraday body, in bytes. ADDED 2026-10-11 (audit
@@ -2432,6 +2473,9 @@ pub async fn run_cross_verification(
                 // `XverifyFetchFailureKind` for what that cost.
                 rest_failures = rest_failures.saturating_add(1);
                 rest_failure_breakdown.record(failure.kind);
+                // A target that lost every row to bad cells still reports
+                // them (review of audit INP-12); zero for other failures.
+                vendor_faults.absorb(failure.faults);
                 if failure_samples.len() < FAILURE_SAMPLE_MAX {
                     failure_samples.push(format!(
                         "{}/{} {}: {}",
@@ -5724,8 +5768,92 @@ mod tests {
         );
     }
 
+    /// Two rows, both with a null open: every row is skipped.
+    const INP_ALL_SKIPPED_BODY: &str = r#"{"open":[null,null],"high":[1.0,2.0],"low":[1.0,2.0],"close":[1.0,2.0],"volume":[1,2],"timestamp":[1786334400,1786334460]}"#;
+
     #[tokio::test]
-    async fn run_report_malformed_rows_includes_the_vendor_side() {
+    async fn fetch_rest_side_all_rows_skipped_is_a_failure_that_keeps_its_faults() {
+        let port = spawn_fixed_body_http(INP_ALL_SKIPPED_BODY.as_bytes().to_vec(), true).await;
+        let url = format!("http://127.0.0.1:{port}/v2/charts/intraday");
+        let failure = fetch_rest_side_for_target(
+            &reqwest::Client::new(),
+            &url,
+            "test-token",
+            &inp_target(),
+            inp_date(),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect_err("a body with no usable row is still a failure");
+        assert_eq!(failure.kind, XverifyFetchFailureKind::NoCandles);
+        assert!(
+            failure.msg.starts_with(REST_ROWS_ALL_SKIPPED_MSG),
+            "value drift must not read as an empty answer: {}",
+            failure.msg
+        );
+        assert_eq!(failure.faults.skipped_rows, 2);
+    }
+
+    #[tokio::test]
+    async fn run_report_counts_an_all_skipped_target_as_a_failure_with_its_rows() {
+        let rest_port = spawn_fixed_body_http(INP_ALL_SKIPPED_BODY.as_bytes().to_vec(), true).await;
+        let live_port = spawn_fixed_body_http(br#"{"dataset":[]}"#.to_vec(), true).await;
+        let report = run_cross_verification(
+            &reqwest::Client::new(),
+            &format!("http://127.0.0.1:{live_port}/exec"),
+            &format!("http://127.0.0.1:{rest_port}/v2/charts/intraday"),
+            "test-token",
+            &[inp_target()],
+            inp_date(),
+            DAY_START_NANOS,
+            &DhanLiveCrossverifyConfig::default(),
+            ReadPolicy::STRICT,
+        )
+        .await
+        .expect("run completes");
+        assert_eq!(report.rest_failures, 1, "still a failure");
+        assert!(report.degraded, "a failure degrades the run");
+        assert_eq!(
+            report.rest_rows_skipped, 2,
+            "the skipped rows of a failed target reach the report"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_rest_side_accepts_a_body_with_a_utf8_byte_order_mark() {
+        let mut body = b"\xEF\xBB\xBF".to_vec();
+        body.extend_from_slice(INP_FAULTY_BODY.as_bytes());
+        let port = spawn_fixed_body_http(body, true).await;
+        let url = format!("http://127.0.0.1:{port}/v2/charts/intraday");
+        let (bars, _) = fetch_rest_side_for_target(
+            &reqwest::Client::new(),
+            &url,
+            "test-token",
+            &inp_target(),
+            inp_date(),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("a BOM-prefixed body parses as before");
+        assert_eq!(bars.len(), 2);
+    }
+
+    #[test]
+    fn decode_vendor_body_strips_a_bom_and_replaces_invalid_bytes() {
+        assert_eq!(decode_vendor_body(b"\xEF\xBB\xBF{}"), "{}");
+        assert_eq!(decode_vendor_body(b"{}"), "{}");
+        assert!(matches!(
+            decode_vendor_body(b"{}"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert_eq!(decode_vendor_body(b"{\xFF}"), "{\u{FFFD}}");
+    }
+
+    /// Renamed 2026-10-11 (review of INP-12): it was named for
+    /// `malformed_rows`, which it never asserted; it checks the vendor cell
+    /// fault counts.
+    #[tokio::test]
+    async fn run_report_carries_vendor_cell_faults() {
         let rest_port = spawn_fixed_body_http(INP_FAULTY_BODY.as_bytes().to_vec(), true).await;
         let live_port = spawn_fixed_body_http(br#"{"dataset":[]}"#.to_vec(), true).await;
         let report = run_cross_verification(

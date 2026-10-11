@@ -105,12 +105,23 @@ pub fn config_env_path(env: &str) -> Option<String> {
 /// not the gate. Both now call this. Boot-only, O(1); nothing is read until
 /// the caller extracts.
 pub fn layered_config_figment(config_env: &str) -> figment::Figment {
+    layered_config_figment_at(
+        CONFIG_BASE_PATH,
+        config_env_path(config_env).as_deref(),
+        CONFIG_LOCAL_PATH,
+    )
+}
+
+/// [`layered_config_figment`] over explicit paths, so the merge order can be
+/// tested on fixture files instead of the developer's own `config/local.toml`
+/// (review of INP-14, 2026-10-11). A missing file merges as empty.
+fn layered_config_figment_at(base: &str, env: Option<&str>, local: &str) -> figment::Figment {
     use figment::providers::{Format, Toml};
-    let mut layered = figment::Figment::new().merge(Toml::file(CONFIG_BASE_PATH));
-    if let Some(env_path) = config_env_path(config_env) {
+    let mut layered = figment::Figment::new().merge(Toml::file(base));
+    if let Some(env_path) = env {
         layered = layered.merge(Toml::file(env_path));
     }
-    layered.merge(Toml::file(CONFIG_LOCAL_PATH))
+    layered.merge(Toml::file(local))
 }
 
 // ---------------------------------------------------------------------------
@@ -1291,16 +1302,67 @@ mod tests {
     /// `config/base.toml` sets `notification.sns_enabled = false` and
     /// `config/production.toml` sets it `true`; a merge that skips the env
     /// file reads `false` for prod.
+    ///
+    /// **⚠ CORRECTED 2026-10-11 (review of INP-14):** the first version read
+    /// the developer's gitignored `config/local.toml` too, so a local file
+    /// setting `notification.sns_enabled` flipped the result by machine. It
+    /// now reads the two tracked files with a local path that does not exist.
     #[test]
     fn test_layered_config_figment_merges_the_env_file_between_base_and_local() {
-        let prod: bool = layered_config_figment("prod")
+        let empty_dir = scratch_dir("no-local");
+        let no_local_path = empty_dir.join("local.toml");
+        let no_local = no_local_path.to_str().expect("utf-8 temp path");
+        let prod_env = config_env_path("prod");
+        let prod: bool = layered_config_figment_at(CONFIG_BASE_PATH, prod_env.as_deref(), no_local)
             .extract_inner("notification.sns_enabled")
             .expect("prod layered config must carry notification.sns_enabled");
-        let dev: bool = layered_config_figment("dev")
+        let dev_env = config_env_path("dev");
+        let dev: bool = layered_config_figment_at(CONFIG_BASE_PATH, dev_env.as_deref(), no_local)
             .extract_inner("notification.sns_enabled")
             .expect("dev layered config must carry notification.sns_enabled");
         assert!(prod, "prod must read config/production.toml over base");
         assert!(!dev, "dev must not read config/production.toml");
+        let _ = std::fs::remove_dir_all(&empty_dir);
+    }
+
+    /// Review of INP-14 (2026-10-11): base, then env, then local, last write
+    /// wins — checked on fixture files only.
+    #[test]
+    fn test_layered_config_figment_at_orders_base_env_local_on_fixtures() {
+        let dir = scratch_dir("order");
+        let write = |name: &str, body: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, body).expect("write fixture");
+            path.to_str().expect("utf-8 temp path").to_string()
+        };
+        let base = write("base.toml", "[t]\na = 1\nb = 1\nc = 1\n");
+        let env = write("env.toml", "[t]\nb = 2\nc = 2\n");
+        let local = write("local.toml", "[t]\nc = 3\n");
+        let read = |figment: figment::Figment, key: &str| -> i64 {
+            figment.extract_inner(key).expect("fixture key")
+        };
+        let with_env = || layered_config_figment_at(&base, Some(&env), &local);
+        assert_eq!(read(with_env(), "t.a"), 1, "base value survives");
+        assert_eq!(read(with_env(), "t.b"), 2, "env overrides base");
+        assert_eq!(read(with_env(), "t.c"), 3, "local overrides env");
+        let without_env = || layered_config_figment_at(&base, None, &local);
+        assert_eq!(read(without_env(), "t.b"), 1, "no env file: base value");
+        assert_eq!(read(without_env(), "t.c"), 3, "local still wins");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fresh, empty temp folder for one test.
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "tv-layered-cfg-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
     }
 
     /// Audit INP-14 (2026-10-11): the `--check-trading-day` gate and the boot
