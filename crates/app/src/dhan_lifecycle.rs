@@ -577,6 +577,9 @@ pub async fn write_dhan_lifecycle(
     today_ist_nanos: i64,
     source_sha256: &str,
 ) -> anyhow::Result<LifecycleTally> {
+    // Seed the audit failure counter at 0 so its first failure is a step from
+    // a known baseline, never a series that appears from nothing.
+    metrics::counter!("tv_instrument_lifecycle_audit_failed_total").increment(0);
     let known = fetch_known_instruments(questdb).await;
     let (rows, tally) =
         build_lifecycle_rows(master, &known, today_ymd, today_ist_nanos, source_sha256);
@@ -605,8 +608,12 @@ pub async fn write_dhan_lifecycle(
             Ok(()) => audit_written += chunk.len(),
             Err(err) => {
                 audit_failed += chunk.len();
+                metrics::counter!("tv_instrument_lifecycle_audit_failed_total").increment(1);
+                // Audit OBS-2 (2026-10-11): a failed SEBI audit write is a storage
+                // audit-write failure (STORAGE-GAP-03), not a socket state (WS-GAP-03).
                 tracing::error!(
-                    code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                    code = tickvault_common::error_code::ErrorCode::StorageGap03AuditWriteFailed
+                        .code_str(),
                     source = "lifecycle_audit_persist_failed",
                     ?err,
                     rows = chunk.len(),
@@ -705,6 +712,45 @@ async fn fetch_known_instruments(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The text of `src` from the `source = "<source>"` field back to the
+    /// `error!` macro that holds it, plus everything up to the arm's end.
+    fn arm_around<'a>(src: &'a str, source_field: &str) -> &'a str {
+        let at = src
+            .find(source_field)
+            .unwrap_or_else(|| panic!("{source_field} must exist"));
+        let start = src[..at]
+            .rfind("Err(")
+            .expect("an Err arm holds the source");
+        let end = at + src[at..].find("\n        }\n").expect("the arm ends");
+        &src[start..end]
+    }
+
+    // Audit OBS-2 (2026-10-11): a failed SEBI lifecycle AUDIT write was coded
+    // WS-GAP-03 (a socket state), so a STORAGE-GAP-03 triage never found it,
+    // and only the success counter existed.
+    #[test]
+    fn test_lifecycle_audit_failure_is_coded_storage_gap_03() {
+        let src = include_str!("dhan_lifecycle.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("non-test half");
+        let arm = arm_around(prod, "source = \"lifecycle_audit_persist_failed\"");
+        assert!(
+            arm.contains("ErrorCode::StorageGap03AuditWriteFailed"),
+            "{arm}"
+        );
+        assert!(!arm.contains("WsGapConnectionState"), "{arm}");
+        assert!(
+            arm.contains("counter!(\"tv_instrument_lifecycle_audit_failed_total\").increment(1)"),
+            "{arm}"
+        );
+        assert!(
+            prod.contains("counter!(\"tv_instrument_lifecycle_audit_failed_total\").increment(0)"),
+            "the failure counter is seeded at 0 before the first write"
+        );
+    }
 
     const TODAY: u32 = 2026_08_19;
     const TODAY_NANOS: i64 = 1_755_561_600_000_000_000;

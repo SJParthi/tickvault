@@ -110,9 +110,11 @@ const RECONCILE_QUERY_TIMEOUT_SECS: u64 = 10;
 pub enum OrderSideMsg {
     /// From `OmsAlertBridge` (rejected / circuit transitions / rate-limit).
     Alert(OmsAlert),
-    /// From `RiskAlertBridge` — NO `order_audit` row (not an order
-    /// lifecycle event); the Critical Telegram + the coded RISK-GAP-01
-    /// `error!` in the risk engine are its record.
+    /// From `RiskAlertBridge`. **⚠ CORRECTED 2026-10-11 (audit OBS-8):** it
+    /// now writes ONE `order_audit` row (`event = risk_halt`) besides the
+    /// Critical Telegram and the coded RISK-GAP-01 `error!` in the risk
+    /// engine; until then it wrote none, so the SEBI order trail had no
+    /// record of the halt.
     RiskHalt {
         /// The trading-crate breach slug (mapped to plain English by
         /// [`plain_risk_reason`] before it reaches the phone).
@@ -172,7 +174,8 @@ impl OrderSideMsg {
     /// producer, `appended` at the consumer).
     #[must_use]
     pub fn produces_order_audit_row(&self) -> bool {
-        !matches!(self, Self::RiskHalt { .. } | Self::PnlEod { .. })
+        // Audit OBS-8 (2026-10-11): a RiskHalt now writes one row too.
+        !matches!(self, Self::PnlEod { .. })
     }
 }
 
@@ -616,6 +619,20 @@ fn persist_order_row(
     stats.appended.fetch_add(1, Ordering::Relaxed);
 }
 
+/// The `order_audit` row for a risk halt (audit OBS-8, 2026-10-11): a system
+/// event like the circuit-breaker rows — no order id (written as `"n/a"`),
+/// no instrument — with the plain reason and the engine's breach name in
+/// `detail`. O(1), once per halt (the engine latches a halt once a day).
+fn risk_halt_row(reason: &str, dry_run: bool, feed: &'static str) -> OrderAuditRow {
+    OrderAuditRow {
+        event: OrderAuditEvent::RiskHalt,
+        order_status: "halted",
+        outcome: "halted",
+        detail: format!("{} (risk_breach={reason})", plain_risk_reason(reason)),
+        ..base_row(dry_run, feed)
+    }
+}
+
 fn base_row(dry_run: bool, feed: &'static str) -> OrderAuditRow {
     let ts = now_ist_nanos();
     OrderAuditRow {
@@ -750,10 +767,16 @@ pub(crate) async fn run_order_side_consumer(
             }
             OrderSideMsg::RiskHalt { reason } => {
                 // Critical — NEVER gated, no pacing (trading's !halted
-                // latch = once/day), NO order_audit row by design.
+                // latch = once/day). The page goes FIRST so the row write
+                // never delays it.
                 wiring.notifier.notify(NotificationEvent::RiskHalt {
                     reason: plain_risk_reason(reason).to_string(),
                 });
+                // Audit OBS-8 (2026-10-11): one order_audit row per halt, so
+                // the SEBI order trail records when and why trading stopped.
+                // Same path as every other row (append, flush, disk spill).
+                let row = risk_halt_row(reason, wiring.dry_run, wiring.feed);
+                persist_order_row(&mut order_writer, &stats, &row);
             }
             OrderSideMsg::Placed {
                 order_id,
@@ -1131,11 +1154,11 @@ mod tests {
         );
     }
 
-    /// Ledger membership: RiskHalt + PnlEod produce NO order_audit row;
-    /// everything else does.
+    /// Ledger membership: only PnlEod produces NO order_audit row; everything
+    /// else does (RiskHalt since 2026-10-11, audit OBS-8).
     #[test]
     fn test_order_side_msg_row_producing_membership() {
-        assert!(!OrderSideMsg::RiskHalt { reason: "x" }.produces_order_audit_row());
+        assert!(OrderSideMsg::RiskHalt { reason: "x" }.produces_order_audit_row());
         assert!(
             !OrderSideMsg::PnlEod {
                 realized: 0.0,
@@ -1184,14 +1207,15 @@ mod tests {
             2,
             "closed drop counted"
         );
-        // RiskHalt is NOT ledger-counted (no row expected) even on drop.
+        // RiskHalt IS ledger-counted since 2026-10-11 (audit OBS-8: it writes
+        // a row), so a dropped halt is a counted drop like any other.
         let risk = RiskAlertBridge {
             tx: bridge.tx.clone(),
             stats: Arc::clone(&stats),
         };
         risk.fire_risk_halt("ManualHalt");
-        assert_eq!(stats.received.load(Ordering::Relaxed), 3);
-        assert_eq!(stats.dropped.load(Ordering::Relaxed), 2);
+        assert_eq!(stats.received.load(Ordering::Relaxed), 4);
+        assert_eq!(stats.dropped.load(Ordering::Relaxed), 3);
     }
 
     /// IST midnight derivation is stable across the day and floors to the
@@ -1331,6 +1355,13 @@ mod tests {
     /// relative directory (`data/spill/audit/...`, gitignored), so repeated
     /// runs do not accumulate files or creep toward the disk-tier cap. Only
     /// files carrying this process id in their name are touched.
+    /// Serialises the tests that write to the shared audit spill folder: one
+    /// test's `ProcessSpillCleanup` removes every file named with this
+    /// process id, so a second test spilling at the same moment could lose
+    /// its file between the temp write and the rename (seen 2026-10-11 once
+    /// the risk-halt row started spilling too).
+    static SPILL_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     struct ProcessSpillCleanup;
 
     impl Drop for ProcessSpillCleanup {
@@ -1395,6 +1426,7 @@ mod tests {
             try_send_order_side(&tx, &stats, msg);
         }
         drop(tx);
+        let _serial = SPILL_TESTS.lock().await;
         let _cleanup = ProcessSpillCleanup;
         run_order_side_consumer(rx, test_wiring(true, vec![]), Arc::clone(&stats)).await;
         assert_eq!(stats.received.load(Ordering::Relaxed), 8);
@@ -1443,6 +1475,7 @@ mod tests {
             },
         );
         drop(tx);
+        let _serial = SPILL_TESTS.lock().await;
         let _cleanup = ProcessSpillCleanup;
         run_order_side_consumer(rx, wiring, Arc::clone(&stats)).await;
         // PnlEod is not row-producing; the skip branch leaves the ledger
@@ -1478,6 +1511,7 @@ mod tests {
             },
         );
         drop(tx);
+        let _serial = SPILL_TESTS.lock().await;
         let _cleanup = ProcessSpillCleanup;
         run_order_side_consumer(rx, wiring, Arc::clone(&stats)).await;
         // No row-producing message went through the channel; the ledger
@@ -1510,6 +1544,7 @@ mod tests {
             },
         );
         drop(tx);
+        let _serial = SPILL_TESTS.lock().await;
         let _cleanup = ProcessSpillCleanup;
         run_order_side_consumer(rx, test_wiring(false, vec![]), Arc::clone(&stats)).await;
         assert_eq!(stats.received.load(Ordering::Relaxed), 1);
@@ -1520,10 +1555,11 @@ mod tests {
         );
     }
 
-    /// RiskHalt routes to the (disabled) notifier WITHOUT an order_audit
-    /// row and WITHOUT touching the reconcile ledger.
+    /// Audit OBS-8 (2026-10-11): a RiskHalt routes to the (disabled)
+    /// notifier AND writes exactly one order_audit row, so the reconcile
+    /// ledger stays balanced (received == appended).
     #[tokio::test]
-    async fn test_consumer_risk_halt_notifies_without_row() {
+    async fn test_risk_halt_writes_one_order_audit_row_with_reason() {
         let (tx, rx) = mpsc::channel::<OrderSideMsg>(4);
         let stats = Arc::new(OrderSideDayStats::default());
         try_send_order_side(
@@ -1534,14 +1570,38 @@ mod tests {
             },
         );
         drop(tx);
+        let _serial = SPILL_TESTS.lock().await;
         let _cleanup = ProcessSpillCleanup;
         run_order_side_consumer(rx, test_wiring(true, vec![]), Arc::clone(&stats)).await;
         assert_eq!(
             stats.received.load(Ordering::Relaxed),
-            0,
-            "RiskHalt is not row-producing"
+            1,
+            "RiskHalt is row-producing"
         );
-        assert_eq!(stats.appended.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            stats.appended.load(Ordering::Relaxed),
+            1,
+            "unreachable QuestDB — the halt row goes to the disk tier (audit PR42b)"
+        );
         assert_eq!(stats.dropped.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_risk_halt_produces_order_audit_row() {
+        let row = risk_halt_row("MaxDailyLossExceeded", true, "dhan");
+        assert_eq!(row.event, OrderAuditEvent::RiskHalt);
+        assert_eq!(row.event.as_str(), "risk_halt");
+        // Empty ids are written as the "n/a" sentinel by the writer.
+        assert!(row.order_id.is_empty());
+        assert!(row.correlation_id.is_empty());
+        assert_eq!(row.security_id, -1);
+        assert_eq!(row.mode, "paper");
+        assert_eq!(row.feed, "dhan");
+        assert_eq!(row.outcome, "halted");
+        assert_eq!(
+            row.detail,
+            "daily loss limit hit (risk_breach=MaxDailyLossExceeded)"
+        );
+        assert_eq!(risk_halt_row("ManualHalt", false, "dhan").mode, "live");
     }
 }

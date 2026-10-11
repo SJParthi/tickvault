@@ -1202,3 +1202,31 @@ fn test_deploy_watchdog_handler_only_dispatches_when_positively_stale() {
         "watchdog must dispatch the idempotent + market-hours-guarded auto-deploy workflow"
     );
 }
+
+// QDB-10 (2026-10-11): the QuestDB-disconnected alarm text must not name the
+// retired "100K rescue ring" or promise that nothing is lost.
+#[test]
+fn test_questdb_disconnected_alarm_text_has_no_retired_rescue_ring() {
+    let content =
+        std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/app-alarms.tf"))
+            .expect("app-alarms.tf must be readable"); // APPROVED: test
+    let start = content
+        .find("resource \"aws_cloudwatch_metric_alarm\" \"questdb_disconnected\"")
+        .expect("questdb_disconnected alarm must exist"); // APPROVED: test
+    let block = &content[start..];
+    let end = block.find("\n}\n").expect("alarm block must close"); // APPROVED: test
+    let block = &block[..end];
+    let description = block
+        .lines()
+        .find(|line| line.trim_start().starts_with("alarm_description"))
+        .expect("alarm must carry a description"); // APPROVED: test
+    assert!(
+        !description.contains(concat!("100K rescue ", "ring")),
+        "the description names a retired rescue ring: {description}"
+    );
+    assert!(
+        !description.to_lowercase().contains("no data"),
+        "the description must not promise no loss: {description}"
+    );
+    assert!(description.contains("finite reserve"));
+}

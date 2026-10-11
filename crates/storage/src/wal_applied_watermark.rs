@@ -636,6 +636,32 @@ pub fn applied_watermark() -> &'static AppliedWatermark {
     &APPLIED
 }
 
+/// `fate` of a tick or depth batch whose spill rescue FAILED, when the batch
+/// carries a capture-sequence range the WAL accepted: the range is marked
+/// unapplied, so the next boot's WAL replay re-inserts it.
+pub(crate) const RESCUE_FATE_DEFERRED_TO_WAL_REPLAY: &str = "deferred_to_wal_replay";
+
+/// `fate` of a failed spill rescue whose rows no WAL record backs (no capture
+/// sequence, or a frame the WAL refused): they are gone.
+pub(crate) const RESCUE_FATE_LOST: &str = "lost";
+
+/// What happens to rows whose spill rescue failed (audit DB-8, 2026-10-11).
+///
+/// Until this date every failed-rescue log line said the rows "are
+/// permanently lost and nothing re-inserts them". That is false for a batch
+/// with a WAL-backed sequence range: `note_rescue_outcome_*` marks the range
+/// unapplied and the next boot's replay re-inserts it. It is true only for
+/// rows with no sequence (`min_seq == 0`) or rows the WAL refused
+/// (`unbacked`). Shared by the tick and depth writers so the two cannot
+/// drift. O(1), no allocation.
+pub(crate) const fn rescue_failure_fate(min_seq: u64, unbacked: bool) -> &'static str {
+    if min_seq != 0 && !unbacked {
+        RESCUE_FATE_DEFERRED_TO_WAL_REPLAY
+    } else {
+        RESCUE_FATE_LOST
+    }
+}
+
 impl AppliedWatermark {
     /// A fresh, unbound instance for tests that must not share the global.
     #[cfg(test)]

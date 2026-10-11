@@ -2987,7 +2987,8 @@ impl TickWriter {
     /// the disk on the drain (thread gone). Completes it exactly as the rescue
     /// thread would: outcome, floor, completion count.
     fn spill_parked_on_drain(&self, batch: RescueBatch) {
-        let landed = self.spill_on_drain(batch.buffer.as_bytes(), batch.rows);
+        let fate = crate::wal_applied_watermark::rescue_failure_fate(batch.min_seq, batch.unbacked);
+        let landed = self.spill_on_drain(batch.buffer.as_bytes(), batch.rows, fate);
         note_rescue_outcome_ticks(landed, (batch.min_seq, batch.max_seq), false);
         let wm = crate::wal_applied_watermark::applied_watermark();
         if let Some(floor) = batch.floor {
@@ -3001,7 +3002,7 @@ impl TickWriter {
     /// It is a file write (and possibly a `df` probe), so it runs through
     /// `off_worker`: the drain calls `flush` bare, and this is one of the two
     /// places a flush can block.
-    fn spill_on_drain(&self, payload: &[u8], rows: usize) -> bool {
+    fn spill_on_drain(&self, payload: &[u8], rows: usize, fate: &'static str) -> bool {
         crate::off_worker::off_worker(|| {
             perform_tick_rescue(
                 &self.spill_dir,
@@ -3009,6 +3010,7 @@ impl TickWriter {
                 self.feed,
                 rows,
                 SPILL_UNSYNCED_ON_DRAIN,
+                fate,
             )
         })
     }
@@ -3030,6 +3032,8 @@ impl TickWriter {
             rows,
             min_seq,
             max_seq,
+            // Copied, not taken: the flag stays set for the rows still pending.
+            unbacked: self.pending_unbacked,
         };
         let Some(tx) = self.offload.as_ref() else {
             // Unreachable — `flush` checks. Treated as the gone arm rather
@@ -3193,6 +3197,7 @@ impl TickWriter {
                 rows: dropped,
                 min_seq: range.0,
                 max_seq: range.1,
+                unbacked,
                 floor,
             };
             match tx.try_send(batch) {
@@ -3283,7 +3288,8 @@ impl TickWriter {
 
         // Past the park's bound, a gone thread, or no rescue split at all:
         // the drain's inline spill, NOT synced (see `spill_on_drain`).
-        let landed = self.spill_on_drain(self.buffer.as_bytes(), dropped);
+        let fate = crate::wal_applied_watermark::rescue_failure_fate(range.0, unbacked);
+        let landed = self.spill_on_drain(self.buffer.as_bytes(), dropped, fate);
         note_rescue_outcome_ticks(landed, range, false);
         self.buffer.clear();
         self.pending = 0;
@@ -3326,6 +3332,7 @@ fn perform_tick_rescue(
     feed: Feed,
     dropped: usize,
     sync: Option<SpillSyncFn>,
+    fate: &'static str,
 ) -> bool {
     let payload_len = payload.len();
     let now = std::time::SystemTime::now()
@@ -3381,11 +3388,13 @@ fn perform_tick_rescue(
                 code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
                 feed = feed.as_str(),
                 dropped,
+                fate,
                 spill_error = %err,
-                "tick flush failed AND the spill rescue also failed — these ticks \
-                 are permanently lost and nothing re-inserts them. The raw frames \
-                 remain in the write-ahead log ONLY if it accepted them -- a non-zero \
-                 tv_dhan_ws_wal_dropped_total means the disk refused them there too."
+                "tick flush failed AND the spill rescue also failed — these ticks are in \
+                 neither QuestDB nor the spill. fate=deferred_to_wal_replay means their \
+                 capture-sequence range is marked unapplied and the next boot's WAL \
+                 replay re-inserts them; fate=lost means no write-ahead-log record \
+                 backs them and they are gone."
             );
             false
         }
@@ -3470,6 +3479,9 @@ pub struct RescueBatch {
     /// Lowest / highest `capture_seq` in this payload (`0` = unknown).
     min_seq: u64,
     max_seq: u64,
+    /// `true` when some row has no WAL record behind it (DB-8: decides the
+    /// `fate` a failed rescue reports).
+    unbacked: bool,
     /// This batch's hold on the persisted watermark (Z7); released by the
     /// rescue thread once the write is synced or has failed and been marked.
     /// An abandoned batch (shutdown) never releases it, so the final persist
@@ -3511,6 +3523,7 @@ impl TickRescueSink {
             self.feed,
             batch.rows,
             self.spill_sync,
+            crate::wal_applied_watermark::rescue_failure_fate(batch.min_seq, batch.unbacked),
         );
         note_rescue_outcome_ticks(landed, (batch.min_seq, batch.max_seq), false);
         let wm = crate::wal_applied_watermark::applied_watermark();
@@ -3617,6 +3630,9 @@ pub struct FlushBatch {
     /// Lowest / highest `capture_seq` in this batch (`0` = unknown).
     min_seq: u64,
     max_seq: u64,
+    /// `true` when some row has no WAL record behind it (DB-8: decides the
+    /// `fate` a failed rescue reports).
+    unbacked: bool,
 }
 
 impl FlushBatch {
@@ -3935,11 +3951,18 @@ impl TickWriterSink {
                     feed = self.feed.as_str(),
                     dropped = rows,
                     reason = why,
+                    fate = crate::wal_applied_watermark::rescue_failure_fate(
+                        batch.min_seq,
+                        batch.unbacked,
+                    ),
+                    min_seq = batch.min_seq,
+                    max_seq = batch.max_seq,
                     spill_error = %err,
                     "offloaded tick flush failed AND the spill rescue also failed — these \
-                     ticks are permanently lost and nothing re-inserts them. The raw frames \
-                     remain in the write-ahead log ONLY if it accepted them -- a non-zero \
-                 tv_dhan_ws_wal_dropped_total means the disk refused them there too."
+                     ticks are in neither QuestDB nor the spill. fate=deferred_to_wal_replay \
+                     means their capture-sequence range is marked unapplied and the next \
+                     boot's WAL replay re-inserts them; fate=lost means no write-ahead-log \
+                     record backs them and they are gone."
                 );
             }
         }
@@ -3954,6 +3977,76 @@ impl TickWriterSink {
 
 #[cfg(test)]
 mod tests {
+    // ---- Audit DB-8 (2026-10-11): a failed rescue names its real fate ----
+
+    #[test]
+    fn test_rescue_failure_fate_backed_range_is_deferred() {
+        assert_eq!(
+            crate::wal_applied_watermark::rescue_failure_fate(5, false),
+            "deferred_to_wal_replay"
+        );
+    }
+
+    #[test]
+    fn test_rescue_failure_fate_unsequenced_or_unbacked_is_lost() {
+        assert_eq!(
+            crate::wal_applied_watermark::rescue_failure_fate(0, false),
+            "lost"
+        );
+        assert_eq!(
+            crate::wal_applied_watermark::rescue_failure_fate(5, true),
+            "lost"
+        );
+        assert_eq!(
+            crate::wal_applied_watermark::rescue_failure_fate(0, true),
+            "lost"
+        );
+    }
+
+    /// Every failed-rescue line used to say the rows "are permanently lost and
+    /// nothing re-inserts them", which is false for a WAL-backed range.
+    #[test]
+    fn test_rescue_failure_log_no_longer_claims_nothing_re_inserts() {
+        let source = include_str!("tick_persistence.rs");
+        let prod = source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("non-test half");
+        assert!(!prod.contains(concat!("nothing re-", "inserts them")));
+        assert!(!prod.contains(concat!("permanently ", "lost and nothing")));
+        assert!(
+            prod.contains(
+                "                    fate = crate::wal_applied_watermark::rescue_failure_fate(\n"
+            ),
+            "the writer-thread arm reports the fate"
+        );
+        assert!(
+            prod.contains("                fate,\n                spill_error = %err,"),
+            "the shared rescue arm reports the fate"
+        );
+    }
+
+    #[test]
+    fn test_rescue_batch_carries_unbacked() {
+        let dir = scratch_dir("db8-unbacked");
+        let mut w = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (sink, rx) = w.split_rescue_offload();
+        // A freshly minted sequence has no WAL record behind it.
+        w.append_tick(&sample_tick()).expect("append");
+        assert_eq!(w.discard_pending(), 1);
+        let batch = rx.try_recv().expect("queued");
+        assert!(batch.unbacked, "a minted row is unbacked");
+        sink.rescue(&batch);
+        // A replayed sequence is WAL-backed.
+        w.append_tick_with_seq(&sample_tick(), 5).expect("append");
+        assert_eq!(w.discard_pending(), 1);
+        let batch = rx.try_recv().expect("queued");
+        assert!(!batch.unbacked, "a WAL-sequenced row is backed");
+        assert_eq!(batch.min_seq, 5);
+        sink.rescue(&batch);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 2026-09-26 audit fix PR1: the ILP append-failure arm is per TICK, so
     /// its ERROR line must sit behind the power-of-two throttle while the
     /// alarmed drop counter stays per tick.
@@ -5636,6 +5729,7 @@ mod tests {
             rows: 0,
             min_seq: 0,
             max_seq: 0,
+            unbacked: false,
         }
     }
 

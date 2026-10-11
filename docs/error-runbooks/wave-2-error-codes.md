@@ -282,6 +282,26 @@ ring + spill backoff exhausted. Coalesces AUDIT-01..06.
 **Triage:** see specific AUDIT-NN code emitted alongside.
 **Source:** `crates/storage/src/{phase2,depth_rebalance,ws_reconnect,boot,selftest,order}_audit_persistence.rs`
 
+### 2026-10-11 note — SEBI lifecycle and constituency writes (audit OBS-2)
+
+Three failed writes to the SEBI never-delete tables were coded WS-GAP-03 (a
+socket state code) until 2026-10-11, so a search for STORAGE-GAP-03 missed
+them. They now carry STORAGE-GAP-03 with these `source` values:
+
+| `source` | Table | Counter (local `/metrics` only) |
+|---|---|---|
+| `lifecycle_persist_failed` | `instrument_lifecycle` | `tv_instrument_lifecycle_persist_failed_total` |
+| `lifecycle_audit_persist_failed` | `instrument_lifecycle_audit` | `tv_instrument_lifecycle_audit_failed_total` |
+| `rider_constituency_persist_failed` | `index_constituency` | `tv_index_constituency_persist_failed_total` |
+
+Each runs once a day. Nothing is deleted; the next day's write is
+DEDUP-idempotent and re-writes what did not land. **What to do:** check
+QuestDB health, then read the `err` field on the line. Since the same date
+(audit QDB-2) these writers use acknowledged HTTP ILP, so a line QuestDB
+refused fails here instead of being reported as written. The three counters
+are not in any loss-group alarm; adding them is an owner decision that needs
+a dated row in the noise lock first. No page, no new alarm.
+
 ### 2026-09-22 note — the one-shot fresh-start reset emits this code
 
 `crates/storage/src/fresh_start_reset.rs` logs STORAGE-GAP-03 with
