@@ -344,7 +344,7 @@ jobs:
       - name: Install cargo-audit + cargo-deny (prebuilt, pinned)
         id: install-audit-tools
         continue-on-error: true
-        uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419 # v2.82.7 SHA-pinned
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.82.7 SHA-pinned
         with:
           tool: cargo-audit@0.22.2,cargo-deny@0.19.9
 
