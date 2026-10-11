@@ -140,6 +140,65 @@ pub fn index_legs(candidates: &[DepthCandidate], each_side: usize) -> Vec<Subscr
     out
 }
 
+/// The index legs the operator's widest window asks for: NIFTY and BANKNIFTY
+/// at-the-money ±[`DEPTH20_INDEX_MAX_EACH_SIDE`], call and put (36).
+///
+/// The shortfall is counted against this, never against the window the budget
+/// happened to leave room for, so a budget with no room at all reads as 36
+/// legs missing instead of "complete".
+pub const DEPTH20_INDEX_LEGS_WANTED: usize = index_legs_cost(DEPTH20_INDEX_MAX_EACH_SIDE);
+
+/// Gauge: index legs of the widest window not in today's depth-20 set, set
+/// once when the index legs settle. 0 on a normal day.
+pub const DEPTH20_INDEX_LEGS_MISSING_GAUGE: &str = "tv_depth20_index_legs_missing";
+
+/// Gauge: F&O spots left out of today's depth-20 set by the 250-slot cap, set
+/// once when the index legs settle. 0 on a normal day.
+pub const DEPTH20_SPOTS_CUT_GAUGE: &str = "tv_depth20_spots_cut";
+
+/// What today's depth-20 set leaves out (plan item PR43).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Depth20Shortfall {
+    /// F&O spots the 250-slot cap left out.
+    pub spots_cut: usize,
+    /// Index legs in the set.
+    pub index_legs_placed: usize,
+    /// Index legs of the widest window not in the set.
+    pub index_legs_missing: usize,
+}
+
+impl Depth20Shortfall {
+    /// Whether anything the operator asked for is not in the set.
+    #[must_use]
+    pub const fn is_short(&self) -> bool {
+        self.spots_cut > 0 || self.index_legs_missing > 0
+    }
+}
+
+/// Counts what a set built by [`build_static_depth20`] left out.
+///
+/// `spot_count` is the deduplicated spot list, `set_len` the built set's
+/// length. Spots are placed first, so the set holds `min(spot_count, budget)`
+/// spots and the rest are index legs. O(1).
+#[must_use]
+pub const fn depth20_shortfall(
+    spot_count: usize,
+    set_len: usize,
+    budget: usize,
+) -> Depth20Shortfall {
+    let spots_placed = if spot_count < budget {
+        spot_count
+    } else {
+        budget
+    };
+    let index_legs_placed = set_len.saturating_sub(spots_placed);
+    Depth20Shortfall {
+        spots_cut: spot_count.saturating_sub(budget),
+        index_legs_placed,
+        index_legs_missing: DEPTH20_INDEX_LEGS_WANTED.saturating_sub(index_legs_placed),
+    }
+}
+
 /// Spots first, then index legs, deduplicated and capped at `budget`.
 ///
 /// Spots come first because they are known at 09:00. The index legs arrive at
@@ -284,6 +343,86 @@ mod tests {
     fn test_no_window_when_even_atm_does_not_fit() {
         assert_eq!(index_strikes_each_side(247, 250, 4), None);
         assert_eq!(index_strikes_each_side(300, 250, 4), None);
+    }
+
+    #[test]
+    fn test_index_legs_wanted_is_the_full_plus_minus_four_window() {
+        assert_eq!(DEPTH20_INDEX_LEGS_WANTED, 36);
+    }
+
+    #[test]
+    fn test_shortfall_is_zero_on_a_normal_day() {
+        // 208 spots + ±4 (36) = 244 instruments, nothing left out.
+        let s = depth20_shortfall(208, 244, DEPTH20_STATIC_BUDGET);
+        assert_eq!(
+            s,
+            Depth20Shortfall {
+                spots_cut: 0,
+                index_legs_placed: 36,
+                index_legs_missing: 0,
+            }
+        );
+        assert!(!s.is_short());
+    }
+
+    #[test]
+    fn test_shortfall_counts_the_legs_a_shrunk_window_leaves_out() {
+        // 216 spots leave room for ±3 (28): 8 legs of the widest window missing.
+        let s = depth20_shortfall(216, 216 + 28, DEPTH20_STATIC_BUDGET);
+        assert_eq!(s.index_legs_missing, 8);
+        assert_eq!(s.spots_cut, 0);
+        assert!(s.is_short());
+    }
+
+    #[test]
+    fn test_no_room_reads_as_every_leg_missing_not_complete() {
+        // 247 spots: not even ATM fits. Before PR43 the wanted cost stayed 0
+        // and the settle log said "complete".
+        let k = index_strikes_each_side(247, DEPTH20_STATIC_BUDGET, DEPTH20_INDEX_MAX_EACH_SIDE);
+        assert_eq!(k, None);
+        let s = depth20_shortfall(247, 247, DEPTH20_STATIC_BUDGET);
+        assert_eq!(s.index_legs_missing, 36);
+        assert_eq!(s.index_legs_placed, 0);
+        assert!(s.is_short());
+    }
+
+    #[test]
+    fn test_shortfall_counts_spots_cut_at_the_cap() {
+        let spots: Vec<SubscribeInstrument> = (1..=260).map(eq).collect();
+        let set = build_static_depth20(&spots, &[], DEPTH20_STATIC_BUDGET);
+        let s = depth20_shortfall(spots.len(), set.len(), DEPTH20_STATIC_BUDGET);
+        assert_eq!(s.spots_cut, 10);
+        assert_eq!(s.index_legs_missing, 36);
+    }
+
+    #[test]
+    fn test_shortfall_matches_the_built_set_for_every_spot_count() {
+        // Exhaustive over the realistic range: whatever the budget picks, the
+        // shortfall equals the window it could not place.
+        for spot_count in 0..=300usize {
+            let spots: Vec<SubscribeInstrument> = (1..=spot_count as u64).map(eq).collect();
+            let k = index_strikes_each_side(
+                spot_count,
+                DEPTH20_STATIC_BUDGET,
+                DEPTH20_INDEX_MAX_EACH_SIDE,
+            );
+            let legs: Vec<SubscribeInstrument> = (0..k.map_or(0, index_legs_cost))
+                .map(|i| fno(100_000 + i as u64))
+                .collect();
+            let set = build_static_depth20(&spots, &legs, DEPTH20_STATIC_BUDGET);
+            let s = depth20_shortfall(spot_count, set.len(), DEPTH20_STATIC_BUDGET);
+            assert_eq!(s.index_legs_placed, legs.len(), "spots {spot_count}");
+            assert_eq!(
+                s.index_legs_missing,
+                DEPTH20_INDEX_LEGS_WANTED - legs.len(),
+                "spots {spot_count}"
+            );
+            assert_eq!(
+                s.spots_cut,
+                spot_count.saturating_sub(DEPTH20_STATIC_BUDGET),
+                "spots {spot_count}"
+            );
+        }
     }
 
     #[test]

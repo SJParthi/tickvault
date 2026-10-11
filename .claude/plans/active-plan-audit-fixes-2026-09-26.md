@@ -1583,7 +1583,16 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
     copy of the paper OMS order map, and fetching the broker order book is REST outside the
     allowed classes (`no-rest-except-live-feed-2026-06-27.md`). Options: share a read handle on
     the OMS order map, or accept counted loss. Not started.
-- [ ] **PR43 — no NIFTY or BANKNIFTY depth-20 option leg is dropped silently.** (`app`)
+- [x] **PR43 — no NIFTY or BANKNIFTY depth-20 option leg is dropped silently.** (`app`)
+  - DONE 2026-10-11: `depth20_static::depth20_shortfall` counts spots cut at the 250 cap and
+    index legs missing from the ±4 window (36, `DEPTH20_INDEX_LEGS_WANTED`), even when the
+    budget leaves no room. At settle the attach sets `tv_depth20_index_legs_missing` and
+    `tv_depth20_spots_cut` and, when either is non-zero, logs a coded WS-GAP-02 `error!`
+    (`source = "depth20_static_set_short"`) naming both counts; "complete" is logged only when
+    nothing is missing. Log-sink only (no new alarm: a page needs a noise-lock row). Placement
+    is unchanged pending the owner decision below. Tests: `depth20_static::tests::test_shortfall_*`,
+    `test_no_room_reads_as_every_leg_missing_not_complete` (bite-checked),
+    `the_index_settle_states_and_counts_what_the_static_set_leaves_out`.
   - Past 246 spot instruments every index option leg leaves depth-20 while the settle log says
     complete; shrinking starts at 215 spots, and today is about 208
     (depth20_static.rs:108-119, :218-226; dhan_feed_stack.rs:12242-12255). This is close to the
