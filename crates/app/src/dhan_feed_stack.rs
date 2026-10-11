@@ -11394,14 +11394,20 @@ impl WsLagSlot {
 /// `/metrics` for whoever is triaging, which is the moment attribution is
 /// actually wanted — and by then a human is already looking.
 ///
-/// # Never-ticked slots are EXCLUDED, deliberately
+/// # Never-ticked slots age from their subscribe, never from zero
 ///
-/// A slot that has never ticked reads `0` and is skipped rather than treated
-/// as infinitely stale. Two reasons: an unused slot would peg this gauge at
-/// "broken" forever, and a legitimately quiet subscription (a depth-200 socket
-/// on one illiquid contract) is not a fault. The never-ticked case has its own
-/// signal already — `tv_dhan_feed_instruments_never_ticked` plus RISK-GAP-03 —
-/// so it is covered, not dropped.
+/// A slot that has never ticked reads `0`. An UNUSED slot (never subscribed)
+/// is skipped, so it cannot peg this gauge at "broken" forever. A slot that
+/// subscribed and never delivered ages from its subscribe ack, or from 09:15
+/// IST if it subscribed earlier (PR54, [`slot_delivery_age_secs`]). Depth-200
+/// slots stay excluded either way: one quiet contract is not a socket fault.
+///
+/// ⚠ CORRECTED 2026-10-11 (PR54): this said the never-ticked case was covered
+/// by `tv_dhan_feed_instruments_never_ticked` plus RISK-GAP-03. False for a
+/// depth socket: that detector is keyed by INSTRUMENT and fed by ticks, so a
+/// spot the main feed also carries reads alive however dead its depth-20
+/// socket is. A morning-dial depth socket that never sent a frame paged
+/// nothing.
 static PER_CONN_LAST_TICK_MILLIS: [std::sync::atomic::AtomicI64;
     MAX_TOTAL_DHAN_CONNECTIONS as usize] =
     [const { std::sync::atomic::AtomicI64::new(0) }; MAX_TOTAL_DHAN_CONNECTIONS as usize];
@@ -11426,16 +11432,72 @@ pub fn record_connection_tick(connection_index: u8, recv_millis: i64) {
     }
 }
 
-/// Age in seconds of the STALEST connection that has ever ticked.
+/// Age in seconds of the STALEST connection that has ticked, or that
+/// subscribed and never delivered (PR54, from its subscribe or 09:15 IST).
 ///
-/// `None` when no connection has ticked yet — which is a real state (pre-open,
-/// or a lane that has just started) and must NOT render as zero. Zero would
-/// mean "every socket ticked this instant", the most reassuring reading
-/// available, at the moment we know least.
+/// `None` when no connection has ticked yet and none is overdue from its
+/// subscribe — which is a real state (pre-open, or a lane that has just
+/// started) and must NOT render as zero. Zero would mean "every socket ticked
+/// this instant", the most reassuring reading available, at the moment we know
+/// least.
 ///
-/// Pure, so the boundary cases are testable without a clock.
+/// Reads two global registers; the pure form is
+/// [`worst_connection_tick_age_secs_with`] over [`slot_delivery_age_secs`].
 #[must_use]
 pub fn worst_connection_tick_age_secs(now_millis: i64) -> Option<u64> {
+    worst_connection_tick_age_secs_with(
+        now_millis,
+        tickvault_core::websocket::pool_supervisor::subscribed_wall_ms,
+    )
+}
+
+/// 09:15:00 IST of the IST day holding `now_millis`, as UTC epoch ms. Pure,
+/// O(1).
+#[must_use]
+pub const fn session_open_utc_millis(now_millis: i64) -> i64 {
+    const DAY_MS: i64 = 86_400_000;
+    const IST_OFFSET_MS: i64 = tickvault_common::constants::IST_UTC_OFFSET_SECONDS_I64 * 1_000;
+    const OPEN_MS_OF_DAY: i64 = tickvault_common::constants::MARKET_OPEN_IST_NANOS / 1_000_000;
+    let ist_ms = now_millis.saturating_add(IST_OFFSET_MS);
+    let day_start_ist = ist_ms - ist_ms.rem_euclid(DAY_MS);
+    day_start_ist + OPEN_MS_OF_DAY - IST_OFFSET_MS
+}
+
+/// One slot's delivery age for the deaf-socket gauge (plan item PR54). Pure,
+/// O(1).
+///
+/// A slot that delivered ages from its last frame. One that never delivered
+/// but subscribed ages from its subscribe ack, or from 09:15 IST of the same
+/// day if it subscribed earlier, so a socket dialled at 08:30 that has sent
+/// no frame by 09:25 reads 600 s. Before that anchor it reads `None`. A slot
+/// that never subscribed reads `None`: an unused slot is not a fault.
+#[must_use]
+pub fn slot_delivery_age_secs(
+    now_millis: i64,
+    last_tick_millis: i64,
+    subscribed_millis: Option<i64>,
+) -> Option<u64> {
+    let since = if last_tick_millis != 0 {
+        last_tick_millis
+    } else {
+        let anchor = subscribed_millis?.max(session_open_utc_millis(now_millis));
+        if now_millis < anchor {
+            return None;
+        }
+        anchor
+    };
+    // saturating: a clock stepped backwards must read as 0 age, never wrap
+    // into a gigantic one at the moment the log is hardest to read.
+    Some(u64::try_from(now_millis.saturating_sub(since).max(0) / 1_000).unwrap_or(u64::MAX))
+}
+
+/// [`worst_connection_tick_age_secs`] with the subscribe register passed in,
+/// so the never-delivered case is testable. O(slots).
+#[must_use]
+pub fn worst_connection_tick_age_secs_with(
+    now_millis: i64,
+    subscribed_at: impl Fn(u8) -> Option<i64>,
+) -> Option<u64> {
     // Depth-200 slots are EXCLUDED, and that exclusion is the whole point.
     //
     // 2026-09-02: this alarm flipped ALARM/OK seven times between 08:44 and
@@ -11463,12 +11525,12 @@ pub fn worst_connection_tick_age_secs(now_millis: i64) -> Option<u64> {
             continue; // one contract per socket — see above
         }
         let last = slot.load(Ordering::Relaxed);
-        if last == 0 {
-            continue; // never ticked — see the type's docs
-        }
-        // saturating: a clock stepped backwards must read as 0 age, never wrap
-        // into a gigantic one at the moment the log is hardest to read.
-        let age = u64::try_from(now_millis.saturating_sub(last).max(0) / 1_000).unwrap_or(u64::MAX);
+        // Never ticked: aged from its subscribe, or skipped if it never
+        // subscribed (see the type's docs).
+        let subscribed = u8::try_from(index).ok().and_then(&subscribed_at);
+        let Some(age) = slot_delivery_age_secs(now_millis, last, subscribed) else {
+            continue;
+        };
         worst = Some(worst.map_or(age, |w| w.max(age)));
     }
     worst
@@ -31928,7 +31990,8 @@ mod depth20_layout_wiring_tests {
 mod deaf_socket_gauge_scope_tests {
     use super::{
         DhanEndpointType, PER_CONN_LAST_TICK_MILLIS, record_connection_tick,
-        worst_connection_tick_age_secs,
+        session_open_utc_millis, slot_delivery_age_secs, worst_connection_tick_age_secs,
+        worst_connection_tick_age_secs_with,
     };
     use std::sync::atomic::Ordering;
 
@@ -32035,6 +32098,87 @@ mod deaf_socket_gauge_scope_tests {
             worst, 1_800,
             "depth-account depth-20 silence stays diagnostic"
         );
+    }
+
+    /// 2026-10-12 (a Monday) 10:00:00 IST and 09:15:00 IST, as UTC epoch ms.
+    const TEN_AM_IST_MS: i64 = 1_791_779_400_000;
+    const OPEN_IST_MS: i64 = 1_791_776_700_000;
+
+    #[test]
+    fn test_session_open_utc_millis_is_0915_ist_of_the_same_ist_day() {
+        assert_eq!(session_open_utc_millis(TEN_AM_IST_MS), OPEN_IST_MS);
+        assert_eq!(session_open_utc_millis(OPEN_IST_MS), OPEN_IST_MS);
+        // 23:59 IST the same day still maps to that day's open.
+        let late = OPEN_IST_MS + (14 * 3_600 + 44 * 60) * 1_000;
+        assert_eq!(session_open_utc_millis(late), OPEN_IST_MS);
+        // 00:01 IST the next day maps to the next open.
+        let next = OPEN_IST_MS + (14 * 3_600 + 46 * 60) * 1_000;
+        assert_eq!(session_open_utc_millis(next), OPEN_IST_MS + 86_400_000);
+    }
+
+    #[test]
+    fn test_slot_delivery_age_secs_never_delivering_socket_ages_from_subscribe_or_open() {
+        // Delivered: the last frame wins, as before.
+        assert_eq!(
+            slot_delivery_age_secs(TEN_AM_IST_MS, TEN_AM_IST_MS - 7_000, Some(1)),
+            Some(7)
+        );
+        // Never subscribed: an unused slot is not a fault.
+        assert_eq!(slot_delivery_age_secs(TEN_AM_IST_MS, 0, None), None);
+        // Dialled at 08:30, nothing by 10:00: aged from 09:15, not 08:30.
+        let dialled_0830 = OPEN_IST_MS - 45 * 60 * 1_000;
+        assert_eq!(
+            slot_delivery_age_secs(TEN_AM_IST_MS, 0, Some(dialled_0830)),
+            Some(45 * 60)
+        );
+        // Before 09:15 the pre-open silence is not a fault.
+        assert_eq!(
+            slot_delivery_age_secs(OPEN_IST_MS - 60_000, 0, Some(dialled_0830)),
+            None
+        );
+        // Subscribed mid-session: aged from the subscribe.
+        assert_eq!(
+            slot_delivery_age_secs(TEN_AM_IST_MS, 0, Some(TEN_AM_IST_MS - 600_000)),
+            Some(600)
+        );
+        // A clock stepped back reads 0, never a wrapped huge age.
+        assert_eq!(
+            slot_delivery_age_secs(TEN_AM_IST_MS, TEN_AM_IST_MS + 5_000, None),
+            Some(0)
+        );
+    }
+
+    /// PR54, pinned: a depth-20 socket that subscribed at the morning dial and
+    /// never sent a frame drives the deaf-socket gauge. Before PR54 it was
+    /// skipped as "never ticked" and paged nothing.
+    #[test]
+    fn test_worst_connection_tick_age_secs_with_a_never_delivering_depth20_socket_pages() {
+        let _guard = lock_slots();
+        let now = TEN_AM_IST_MS;
+        let dead_d20 = DhanEndpointType::Depth20.jitter_base() + 1;
+        let quiet_d200 = DhanEndpointType::Depth200.jitter_base() + 1;
+        seed_all_fresh(now);
+        PER_CONN_LAST_TICK_MILLIS[usize::from(dead_d20)].store(0, Ordering::Relaxed);
+        PER_CONN_LAST_TICK_MILLIS[usize::from(quiet_d200)].store(0, Ordering::Relaxed);
+        let dialled_0900 = OPEN_IST_MS - 15 * 60 * 1_000;
+        let subscribed =
+            |slot: u8| (slot == dead_d20 || slot == quiet_d200).then_some(dialled_0900);
+        assert_eq!(
+            worst_connection_tick_age_secs_with(now, subscribed),
+            Some(45 * 60),
+            "the never-delivering depth-20 socket is 45 minutes deaf at 10:00"
+        );
+        // Without its subscribe stamp it is an unused slot, skipped as before.
+        assert_eq!(
+            worst_connection_tick_age_secs_with(now, |_| None),
+            Some(0),
+            "an unused slot never drives the gauge"
+        );
+        // A depth-200 slot stays excluded even when it never delivered.
+        let only_d200 = |slot: u8| (slot == quiet_d200).then_some(dialled_0900);
+        PER_CONN_LAST_TICK_MILLIS[usize::from(dead_d20)].store(now, Ordering::Relaxed);
+        assert_eq!(worst_connection_tick_age_secs_with(now, only_d200), Some(0));
+        seed_all_fresh(now);
     }
 }
 

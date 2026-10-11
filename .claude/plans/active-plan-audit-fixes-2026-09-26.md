@@ -1902,7 +1902,17 @@ the PR4c follow-ups, PR52. PR30b stays on or after 2026-10-01.
     literal candle-table DROP in either sweep body; bite-proven by re-adding the literal),
     `drop_status_counts_as_answered_only_when_questdb_answered`. Non-candle KEEP tables stay
     pinned by the existing `retired_drop_list_never_names_a_live_table`.
-- [ ] **PR54 — a depth socket that never sends a first frame pages.** (`app`, `core`)
+- [x] **PR54 — a depth socket that never sends a first frame pages.** (`app`, `core`)
+  - DONE 2026-10-11: the supervisor stamps each slot at its subscribe ack
+    (`pool_supervisor::subscribed_wall_ms`, one relaxed store per dial). The deaf-socket gauge
+    (`worst_connection_tick_age_secs`, alarm `dhan-worst-socket-deaf`, 600 s, gated 09:20-15:35)
+    now ages a main-feed or depth-20 socket that subscribed and never delivered from its
+    subscribe or from 09:15 IST, whichever is later (`slot_delivery_age_secs`, O(1) per slot);
+    an unused slot and every depth-200 slot stay excluded. No new alarm or metric. Both false
+    RISK-GAP-03 comments are corrected (that scan is keyed by instrument and cannot see a depth
+    socket). Tests: `test_slot_delivery_age_secs_*`, `test_session_open_utc_millis_*`,
+    `test_worst_connection_tick_age_secs_with_a_never_delivering_depth20_socket_pages`
+    (bite-checked), `test_subscribed_wall_ms_is_stamped_at_the_subscribe_ack`.
   - From re-check 7: a morning-dial depth socket that never delivers a frame pages nothing, and
     the comment that says RISK-GAP-03 covers it is false for depth. PR44/PR45 do not cover it.
   - Fix: a per-socket first-frame deadline (O(1) per socket) that pages through an existing
