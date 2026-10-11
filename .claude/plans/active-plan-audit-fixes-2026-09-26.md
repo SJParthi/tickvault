@@ -605,11 +605,18 @@ folded into them below), then PR18, PR19 and the decisions.
     the same rate cap applies.
   - D6: four more shell scripts (deploy/aws/user-data.sh.tftpl, host-tuning/apply-host-tuning.sh,
     sysctl/verify-net-tuning.sh, tickvault-host-tuning.service:119-147, operator_control.rs:1913).
-- [ ] **PR18 — order-side lookups are O(1) and segment-keyed.** (`trading`, `app`)
+- [x] **PR18 — order-side lookups are O(1) and segment-keyed.** (`trading`, `app`)
   - Unrealised P&L for the daily-loss check walks every position (risk/engine.rs:834): keep a
     running total updated on each fill and mark.
   - Paper-fill lookups use the security id alone (order_runtime.rs:915-929, risk/engine.rs:778):
     composite `(security_id, segment)` key. Paper mode only; `dry_run` is not touched.
+  - Done 2026-10-11: the risk engine keeps a running unrealized total (`refresh_unrealized`,
+    `unrealized_by_key`), so the daily-loss check is O(1); the local reconcile keeps its sets
+    between heartbeats (`ReconcileScratch`, row 213). The composite paper-fill key landed with
+    M7 (2026-10-04). Files: risk/engine.rs, order_runtime.rs. Tests:
+    running_unrealized_total_equals_the_walk_after_every_step,
+    running_unrealized_total_follows_fills_marks_closes_and_reset,
+    test_local_reconcile_reuses_its_working_sets_between_runs.
 - [ ] **PR19 — small cleanups.** (`app`, `core`, `api`, `tickvault-logs-mcp`, CI, deploy)
   - Per-minute depth steering reloads data it never uses (depth_rebalance.rs:1888, :1895,
     :2044-2051): drop the reload.
@@ -3093,7 +3100,7 @@ Status of the rest, so the next session does not re-audit:
 
 | State | Items |
 |---|---|
-| Partly done (remaining work named in each item) | PR5, PR8 (shutdown/boot `blocking_flush`, seal-writer cycle, order observability flushes still `block_in_place`), D2 (waits on PR12), D3 (D3a/b/c-1 done; D3c-2/3 open), D5 (waits on PR11), D6 (D6e onward), PR16 (`df` fork with no timeout, drain still on the shared runtime, boot seal drain bare), PR18, PR19, D7 (808 policy open), D9 (D9b-3 open), PR24, PR28b (owner lock mode), PR31c, PR32 (hour-boundary late append in tick spill replay; unapplied-table overflow uncounted; archive blind to capture-log deferrals), PR33, PR36 (SSH done), PR39, PR42 (42a/42b done; 42c owner; order/position update event writers have no spill tier), PR55 (manual and tag deploys gated; input-in-shell and branch checks open), PR56 (alarm open), PR40b-f (all parts done 2026-10-04; awaiting merge) |
+| Partly done (remaining work named in each item) | PR5, PR8 (shutdown/boot `blocking_flush`, seal-writer cycle, order observability flushes still `block_in_place`), D2 (waits on PR12), D3 (D3a/b/c-1 done; D3c-2/3 open), D5 (waits on PR11), D6 (D6e onward), PR16 (`df` fork with no timeout, drain still on the shared runtime, boot seal drain bare), PR19, D7 (808 policy open), D9 (D9b-3 open), PR24, PR28b (owner lock mode), PR31c, PR32 (hour-boundary late append in tick spill replay; unapplied-table overflow uncounted; archive blind to capture-log deferrals), PR33, PR36 (SSH done), PR39, PR42 (42a/42b done; 42c owner; order/position update event writers have no spill tier), PR55 (manual and tag deploys gated; input-in-shell and branch checks open), PR56 (alarm open), PR40b-f (all parts done 2026-10-04; awaiting merge) |
 | Open, nothing built | PR6, PR7, PR9, PR10, PR11, PR12, PR13, PR14, D1, D4, D8, PR23, PR25, PR26, PR27, PR34, PR35, PR37, PR38, PR43, PR44, PR45, PR46, PR47, PR49, PR50, PR51, PR52, PR54, PR57, PR59, PR40c-f, PR40d-f |
 | Waiting on the owner | OWNER-202, PR42c, PR28b lock mode, D11/R3-13 (no `wip/d11` branch exists any more; the box curfew still blocks Sundays; the session is 2026-11-08) |
 | Dormant | PR48 (console wipes switched off by `CONSOLE_DATA_WIPES_AUTHORIZED = false`) |
