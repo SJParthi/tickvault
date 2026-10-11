@@ -1018,6 +1018,7 @@ impl SealSpillWriter {
     /// `write(2)` calls the two append paths have made, counted at the call
     /// (audit PR40c-f).
     #[cfg(test)]
+    // TEST-EXEMPT: test-only probe, read by the batch and escalation-burst tests
     pub(crate) fn disk_writes_for_test(&self) -> u64 {
         self.probes.disk_writes.load(Ordering::SeqCst)
     }
