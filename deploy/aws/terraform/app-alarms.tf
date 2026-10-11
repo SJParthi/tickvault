@@ -111,9 +111,9 @@ locals {
 # 4. QuestDB disconnected — persistence backed up to retry buffers + spill
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "questdb_disconnected" {
-  alarm_name          = "tv-${var.environment}-questdb-disconnected"
   # ⚠ CORRECTED 2026-10-11 (audit QDB-10): the description named a "100K
   # rescue ring" that no longer exists. Text only; the alarm is unchanged.
+  alarm_name          = "tv-${var.environment}-questdb-disconnected"
   alarm_description   = "QuestDB has been disconnected for > 30 seconds. Rows are held in writer retry buffers and disk spill (finite reserve). See BOOT-01/BOOT-02 runbook."
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 1
