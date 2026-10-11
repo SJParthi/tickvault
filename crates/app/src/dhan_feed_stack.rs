@@ -10651,7 +10651,19 @@ fn append_inline_depth_book(
     rows
 }
 
-fn drain_depth_frame(
+/// Decode one captured depth frame and append every level it carries.
+///
+/// # Why this is `pub` (audit PROOF-10, 2026-10-11)
+///
+/// Depth is about 24 times the tick volume, and this is the app-side seam
+/// that joins the depth parser to the depth writer. The parser and the
+/// writer each had a DHAT gate; this function had none, which is the gap the
+/// tick lane had before 2026-08-14. Exposing it lets
+/// `dhat_depth_drain.rs` measure the whole frame walk. Per packet it is
+/// O(levels) (20 or 200), never O(1); the gate proves zero allocation per
+/// packet, not O(1).
+// TEST-EXEMPT: driven directly by dhat_depth_drain.rs and by the 28 drain tests in this file's tests module
+pub fn drain_depth_frame(
     depth: &mut DepthIngest,
     frame: &CapturedFrame,
     received_at_nanos: i64,
@@ -21649,7 +21661,7 @@ mod tests {
     fn the_depth_walk_carries_the_same_packet_cap_as_the_main_feed_walk() {
         let src = include_str!("dhan_feed_stack.rs");
         let from = src
-            .find("\nfn drain_depth_frame")
+            .find("\npub fn drain_depth_frame")
             .expect("drain_depth_frame must exist");
         // `from + 1` so the search does not immediately re-find the `\nfn`
         // that `from` itself points at — which would slice an empty body and
@@ -29029,7 +29041,7 @@ mod inline_depth_tests {
             .expect("append_inline_depth must exist"); // APPROVED: test
         let body = &src[start..];
         let end = body
-            .find("\nfn drain_depth_frame")
+            .find("\npub fn drain_depth_frame")
             .expect("the function must be followed by drain_depth_frame"); // APPROVED: test
         let body = &body[..end];
 
