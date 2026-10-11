@@ -1338,6 +1338,12 @@ async fn run_order_runtime(
                         } else {
                             warn!(skipped, "order runtime receiver lagged — events skipped");
                         }
+                        // PR14 (2026-10-11): check the book now rather than at
+                        // the next heartbeat (up to `reconcile_interval_secs`
+                        // later). The order-fold leg flags a skipped fill of a
+                        // tracked order; the reconcile is not gated on market
+                        // hours here, since a lag is itself the signal.
+                        run_reconcile_cycle(&mut oms, &risk, &book).await;
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         // Structurally unreachable (the supervisor holds a
@@ -2677,6 +2683,66 @@ mod tests {
             report.order_fold_divergences, 1,
             "the order-fold leg MUST flag the lost fill for a tracked order"
         );
+    }
+
+    /// PR14: the order-update channel holds about 7 minutes of events at the
+    /// 10-a-second order limit, and the REST stack sizes the channel from
+    /// the constant rather than a literal.
+    #[test]
+    fn order_update_broadcast_capacity_is_4096() {
+        assert_eq!(
+            tickvault_common::constants::ORDER_UPDATE_BROADCAST_CAPACITY,
+            4_096
+        );
+        let stack =
+            tickvault_common::source_scan::production_region(include_str!("dhan_rest_stack.rs"))
+                .expect("dhan_rest_stack.rs keeps its test module"); // APPROVED: test
+        assert!(
+            stack.contains("tickvault_common::constants::ORDER_UPDATE_BROADCAST_CAPACITY"),
+            "the order-runtime channel must be sized by ORDER_UPDATE_BROADCAST_CAPACITY"
+        );
+        assert!(
+            !stack.contains("OrderUpdate>(256)"),
+            "the 256-slot literal is back on the order-runtime channel"
+        );
+    }
+
+    /// PR14: a lagged receiver runs the reconcile at once, inside the
+    /// `Lagged` arm, before the `Closed` arm.
+    #[test]
+    fn lag_triggers_reconcile() {
+        let src =
+            tickvault_common::source_scan::production_region(include_str!("order_runtime.rs"))
+                .expect("order_runtime.rs keeps its test module"); // APPROVED: test
+        let lagged = src
+            .find("Err(broadcast::error::RecvError::Lagged(skipped)) => {")
+            .expect("the Lagged arm exists"); // APPROVED: test
+        let closed = src[lagged..]
+            .find("Err(broadcast::error::RecvError::Closed) => {")
+            .map(|i| lagged + i)
+            .expect("the Closed arm follows the Lagged arm"); // APPROVED: test
+        assert!(
+            src[lagged..closed].contains("run_reconcile_cycle(&mut oms, &risk, &book).await;"),
+            "the Lagged arm no longer runs the reconcile; a skipped fill would wait \
+             for the next heartbeat"
+        );
+    }
+
+    /// The reconcile the `Lagged` arm runs flags a fill the risk book never
+    /// received, in paper mode.
+    #[tokio::test]
+    async fn lag_reconcile_flags_a_skipped_fill() {
+        let mut oms = make_oms();
+        let risk = make_risk();
+        let book = BookState::new();
+        let order_id = place_paper(&mut oms, 13, TransactionType::Buy).await;
+        let order = oms.order(&order_id).cloned().expect("tracked"); // APPROVED: test
+        let synthetic = synthesize_paper_fill(&order, 100.0, 0).expect("fill"); // APPROVED: test
+        let _skipped = oms.handle_order_update(&synthetic);
+        let before = local_reconcile(&oms, &risk, &book.mirror);
+        assert_eq!(before.order_fold_divergences, 1);
+        // Must not panic, and runs the paper (local) arm.
+        run_reconcile_cycle(&mut oms, &risk, &book).await;
     }
 
     /// Property-style sweep: random signed fill sequences keep the mirror

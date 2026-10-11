@@ -1960,6 +1960,12 @@ async fn async_main() -> Result<()> {
     metrics::counter!("tv_telegram_dropped_total", "reason" => "noop_mode").increment(0);
     metrics::counter!("tv_telegram_dropped_total", "reason" => "coalesced_sample_capped")
         .increment(0);
+    // PR47 (2026-10-11): a lost SMS copy of a High/Critical page is counted
+    // (both `service.rs::send_sns_sms` failure arms). Prometheus only;
+    // seeded so the series reads 0 rather than absent before the first
+    // failure.
+    metrics::counter!("tv_sns_sms_failed_total", "reason" => "attribute_build").increment(0);
+    metrics::counter!("tv_sns_sms_failed_total", "reason" => "publish_failed").increment(0);
     // Host kernel-limit verification (2026-08-10). Must run AFTER the recorder
     // is installed — gauges written before install resolve to a no-op recorder
     // and would be silently discarded, same rationale as the registrations
@@ -5386,15 +5392,29 @@ async fn run_process_runloop(
             // here would give the sweep two drivers that could drift; there is now
             // exactly one.
 
-            // Post-market: detach old QuestDB partitions (Phase B).
-            // Runs daily after pipeline stops — keeps hot data bounded to retention_days.
-            // KEPT even with the archive leg enabled: the daily archive loop drops
-            // aged partitions first, so this legacy cycle finds nothing new — but its
-            // `total_detached=…` log lines keep firing so the CloudWatch evidence
-            // trail (the 15:30 IST "partition" filter) continues uninterrupted.
+            // Post-market: detach old QuestDB partitions (Phase B) — ONLY when the
+            // archive leg is OFF.
+            //
+            // Fixed 2026-10-11 (audit RET-1). This block used to run whatever
+            // `archive_enabled` said, on the claim that "the daily archive loop
+            // drops aged partitions first". The timing says otherwise: this arm
+            // runs ~2 s after the 15:30 close, while the archive window opens at
+            // 15:30:02 and its first pass lands minutes later. Both select on the
+            // same rolling `retention_days` cutoff for the Standard class (the
+            // audit tables), so the partition that crossed the line today was
+            // DETACHED here first — renamed inside the EBS volume, gone from
+            // `table_partitions()`, never exported, never freed — and the archive
+            // pass could not see it. With the archive leg on, it is the only drop
+            // path: it exports, verifies the S3 copy, then drops.
             {
                 let retention_days = config.partition_retention.retention_days;
-                if retention_days > 0 {
+                if config.partition_retention.archive_enabled {
+                    info!(
+                        retention_days,
+                        "post-market partition detach skipped — the archive leg owns \
+                         retention (archive, verify, then drop)"
+                    );
+                } else if retention_days > 0 {
                     match tickvault_storage::partition_manager::PartitionManager::new(
                         &config.questdb,
                         retention_days,

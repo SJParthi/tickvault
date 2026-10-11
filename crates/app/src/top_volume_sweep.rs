@@ -127,6 +127,27 @@ pub const fn window_close_reference_secs(watermark_secs: u32, wall_secs: u32) ->
     }
 }
 
+/// Counts the episodes in which the candle clock ran AHEAD of the wall clock
+/// and [`window_close_reference_secs`] capped it there: a future-dated tick,
+/// or the exchange's clock ahead of ours. Each window close is then judged by
+/// our wall clock, so contracts whose bars have not closed by the exchange's
+/// clock can still be trading when their board is ranked. One count per
+/// episode, not per frame.
+pub const TOP_VOLUME_WATERMARK_CAPPED_COUNTER: &str = "tv_top_volume_watermark_capped_total";
+
+/// Seconds by which the candle clock, less [`WINDOW_CLOSE_LATENESS_SECS`],
+/// runs past the wall clock: the amount [`window_close_reference_secs`] caps
+/// away. Zero while the candle clock is at or behind the wall.
+///
+/// # Complexity
+/// O(1): two saturating subtractions.
+#[must_use]
+pub const fn watermark_lead_over_wall_secs(watermark_secs: u32, wall_secs: u32) -> u32 {
+    watermark_secs
+        .saturating_sub(WINDOW_CLOSE_LATENESS_SECS)
+        .saturating_sub(wall_secs)
+}
+
 /// Closed windows of one cadence the clock still catches up on, oldest
 /// first. Older ones are skipped and counted: by the time the clock is that
 /// far behind, a contract that trades every window may have sealed over the
@@ -987,6 +1008,33 @@ mod tests {
             u32::MAX - WINDOW_CLOSE_LATENESS_SECS,
             "no overflow at the top of the range"
         );
+    }
+
+    #[test]
+    fn test_watermark_lead_over_wall_secs_is_exactly_what_the_close_clock_caps_away() {
+        // Behind or at the wall (after the lateness margin): no lead.
+        assert_eq!(watermark_lead_over_wall_secs(1_000, 1_001), 0);
+        assert_eq!(watermark_lead_over_wall_secs(1_002, 1_001), 0);
+        assert_eq!(watermark_lead_over_wall_secs(0, 1_000), 0);
+        assert_eq!(watermark_lead_over_wall_secs(0, 0), 0);
+        // Ahead: the seconds the cap removes.
+        assert_eq!(watermark_lead_over_wall_secs(1_003, 1_001), 1);
+        assert_eq!(watermark_lead_over_wall_secs(9_999, 1_000), 8_998);
+        assert_eq!(
+            watermark_lead_over_wall_secs(u32::MAX, 0),
+            u32::MAX - WINDOW_CLOSE_LATENESS_SECS,
+            "no overflow at the top of the range"
+        );
+        // A lead is reported exactly when the reference sits at the wall
+        // because of the cap, never otherwise.
+        for (watermark, wall) in [(1_000, 1_001), (1_002, 1_001), (1_003, 1_001), (9_999, 10)] {
+            let uncapped = watermark - WINDOW_CLOSE_LATENESS_SECS;
+            assert_eq!(
+                watermark_lead_over_wall_secs(watermark, wall) > 0,
+                uncapped > wall,
+                "watermark {watermark} wall {wall}"
+            );
+        }
     }
 
     #[test]

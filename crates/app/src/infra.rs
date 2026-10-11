@@ -146,11 +146,13 @@ const DASHBOARD_SERVICES: &[(&str, &str, &str, u16)] = &[
 /// Outcome of the boot-time `docker compose up -d` retry loop, once the
 /// required service (QuestDB) has been probed.
 ///
-/// Root cause this guards against: `run_docker_compose_up` runs
-/// `--force-recreate`, which is NOT idempotent — it tears down + recreates
+/// Root cause this guarded against: `run_docker_compose_up` ran
+/// `--force-recreate`, which is NOT idempotent — it tore down + recreated
 /// every container on every boot. On a same-day crash-recovery boot (QuestDB
-/// already up + busy) the recreate can fail all `COMPOSE_UP_MAX_RETRIES`
-/// attempts even though the service the app actually needs is healthy. The
+/// already up + busy) the recreate could fail all `COMPOSE_UP_MAX_RETRIES`
+/// attempts even though the service the app actually needs is healthy.
+/// (2026-10-11, audit QDB-1: the boot now runs plain `up -d`; the
+/// classification stays, since compose can still fail while QuestDB is up.) The
 /// old code fired a Telegram CRITICAL unconditionally on that path — a
 /// false-CRITICAL that erodes operator trust in the pager. This enum routes
 /// the failure by whether the required service is ACTUALLY reachable.
@@ -160,7 +162,7 @@ pub enum ComposeOutcome {
     Succeeded,
     /// compose-up exhausted its retries, but the required service (QuestDB)
     /// is reachable — the app can run. Log Low (`warn!`), no CRITICAL page.
-    /// This is the `--force-recreate`-churn-while-service-up false-CRITICAL.
+    /// This was the recreate-churn-while-service-up false-CRITICAL.
     DegradedServiceUp,
     /// compose-up exhausted its retries AND the required service is NOT
     /// reachable — a real outage. Keep the CRITICAL page.
@@ -413,9 +415,9 @@ pub async fn ensure_infra_running(questdb_config: &QuestDbConfig) {
             }
         }
     }
-    // false-CRITICAL fix (2026-07-01): compose-up may fail all retries purely
-    // because `--force-recreate` churns containers that are ALREADY up (e.g. a
-    // same-day crash-recovery boot with QuestDB already serving). Only page
+    // false-CRITICAL fix (2026-07-01): compose-up may fail all retries while
+    // the containers are ALREADY up (e.g. a same-day crash-recovery boot with
+    // QuestDB already serving). Only page
     // CRITICAL when the required service (QuestDB) is ACTUALLY unreachable —
     // otherwise the app can run and the CRITICAL was a false alarm.
     let questdb_reachable =
@@ -1232,11 +1234,11 @@ const TEST_SPAWN_NOOP_PROGRAM: &str = "/usr/bin/true";
 /// **`cfg(test)`: a no-op.** Two functions in this module spawn a process with
 /// real, destructive side effects, and this module's unit tests call both:
 ///
-/// * [`run_docker_compose_up`] builds an argv ending in `--force-recreate`,
-///   which the `ComposeOutcome` header above records verbatim as "NOT
-///   idempotent — it tears down + recreates every container". Six tests reach
-///   it. On a developer machine with the stack up, `cargo test -p
-///   tickvault-app` would therefore destroy their running QuestDB.
+/// * [`run_docker_compose_up`] runs `docker compose up -d`, which starts or
+///   recreates containers. Until 2026-10-11 it also passed `--force-recreate`,
+///   which tore down every container. Six tests reach it. On a developer
+///   machine with the stack up, `cargo test -p tickvault-app` would change
+///   their running containers.
 /// * [`open_in_browser`] runs `open`/`xdg-open`. Five tests reach it through
 ///   `open_all_dashboards`, and `DASHBOARD_SERVICES` includes QuestDB on 9000
 ///   — so with a local stack up, `cargo test` opens browser windows.
@@ -1364,12 +1366,17 @@ async fn resolve_compose_cli() -> Option<ComposeCli> {
         .map(ComposeCli::PluginPath)
 }
 
-/// Runs `<compose front-end> -f <file> up -d --force-recreate` with the given
-/// environment variables, via the resolved [`ComposeCli`].
+/// Runs `<compose front-end> -f <file> up -d` with the given environment
+/// variables, via the resolved [`ComposeCli`].
 ///
-/// `--force-recreate` ensures containers with updated configs (healthchecks,
-/// dashboard JSON, Alloy config) are recreated automatically. Docker only
-/// recreates containers whose config hash actually changed — no-op for unchanged.
+/// Plain `up -d` starts anything missing or stopped and recreates only a
+/// container whose config hash changed; a running, unchanged QuestDB is left
+/// alone. Until 2026-10-11 (audit QDB-1) this passed `--force-recreate`, and
+/// the comment here claimed Docker only recreated changed containers. That
+/// flag does the opposite: it recreates EVERY container, so each app restart
+/// (a crash-recovery boot mid-session included) stopped QuestDB under any
+/// open ILP connection and lost the in-flight rows. The deploy workflow keeps
+/// its own `--force-recreate tv-questdb`, scoped to a changed memory cap.
 /// The argument vector comes from the pure [`compose_cli_args`] builder so the
 /// R1 (2026-06-30) subcommand-before-`-f` ordering stays unit-ratcheted.
 async fn run_docker_compose_up(cli: ComposeCli, env_vars: &[(&str, String)]) -> Result<()> {
@@ -1378,7 +1385,7 @@ async fn run_docker_compose_up(cli: ComposeCli, env_vars: &[(&str, String)]) -> 
         // Resolved, not the bare constant: on the deployed box the constant
         // points at a file that does not exist. See `resolve_compose_path`.
         resolve_compose_path().unwrap_or(DOCKER_COMPOSE_PATH),
-        &["up", "-d", "--force-recreate"],
+        &["up", "-d"],
         env_vars,
     )
     .await
@@ -2637,7 +2644,7 @@ mod tests {
         let args = compose_cli_args(
             ComposeCli::DockerComposeV2,
             "deploy/docker/docker-compose.yml",
-            &["up", "-d", "--force-recreate"],
+            &["up", "-d"],
         );
         assert_eq!(
             args[0], "compose",
@@ -2652,7 +2659,7 @@ mod tests {
         assert_eq!(args[2], "deploy/docker/docker-compose.yml");
         assert_eq!(args[3], "up");
         assert_eq!(args[4], "-d");
-        assert_eq!(args[5], "--force-recreate");
+        assert_eq!(args.len(), 5, "boot compose-up is plain `up -d` (QDB-1)");
         // `compose` must appear BEFORE `-f` in the full vector.
         let compose_pos = args.iter().position(|a| *a == "compose").unwrap();
         let f_pos = args.iter().position(|a| *a == "-f").unwrap();

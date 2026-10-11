@@ -134,6 +134,24 @@ fn main_rs_wires_archive_before_detach_and_keeps_detach() {
          that expresses it now."
     );
 
+    // Regression (2026-10-11, audit RET-1): spawn order is NOT run order. The
+    // archive window opens at 15:30:02 and its first pass lands minutes later,
+    // while the post-market detach runs ~2 s after the close on the same
+    // Standard-class cutoff. So the detach must not run at all while the
+    // archive leg is on, or it renames the day's newly aged audit partition
+    // before the archiver can export it.
+    let detach_block_start = main_rs[..detach_idx]
+        .rfind("let retention_days = config.partition_retention.retention_days;")
+        .expect("the detach block must read config.partition_retention.retention_days");
+    let gate = main_rs[detach_block_start..detach_idx]
+        .find("if config.partition_retention.archive_enabled {");
+    assert!(
+        gate.is_some(),
+        "the legacy detach must be skipped when archive_enabled is true — \
+         otherwise it detaches today's newly aged partition before the archive \
+         pass can export it (audit RET-1)"
+    );
+
     // SINGLE DRIVER. Two copies of the sweep — one inline here, one in the
     // scheduler — could drift apart, and the more dangerous direction is the
     // quiet one: the inline copy runs only on a clean non-SIGTERM shutdown,

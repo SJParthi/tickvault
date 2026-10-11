@@ -257,7 +257,11 @@ inline (PR2, PR8, PR14).
 - [ ] **PR13 — no JavaScript left in CI.** (`.github/workflows/`)
   - 14 `actions/github-script` steps: safety.yml (12) and dep-freshness-nightly.yml (2). Port each
     to the `gh` CLI with identical inputs/outputs, the way fuzz.yml / chaos-nightly.yml already were.
-- [ ] **PR14 — order-update receiver cannot silently skip.** (`app`, `core`)
+- [x] **PR14 — order-update receiver cannot silently skip.** (`app`, `core`)
+  - Done 2026-10-11: `ORDER_UPDATE_BROADCAST_CAPACITY` = 4,096 wired at `dhan_rest_stack.rs`;
+    the `Lagged` arm runs `run_reconcile_cycle` at once. Tests (order_runtime.rs):
+    `order_update_broadcast_capacity_is_4096`, `lag_triggers_reconcile`,
+    `lag_reconcile_flags_a_skipped_fill`.
   - Correction: `Lagged` is already counted and logged (order_runtime.rs:1346), but events are
     still lost. Raise the broadcast capacity from 256 to 4,096 (order events are rate-limited to
     ≤ 10/s, so lag then needs a multi-minute runtime stall, which D1 removes) and make a lag
@@ -531,7 +535,18 @@ folded into them below), then PR18, PR19 and the decisions.
     the board error-file endpoint's listing and sort on every poll (row 176, debug.rs:345-376); the
     drain can free the old contract-name table in place (dhan_feed_stack.rs:2443-2446), so drop it
     off the drain.
-- [ ] **PR17 — spill files survive a host crash and a torn line.** (`storage`, `core`)
+- [x] **PR17 — spill files survive a host crash and a torn line.** (`storage`, `core`)
+  *(Closed 2026-10-11 against the code. The "deferred" label: since 2026-10-02 a frame the WAL
+  refused reaches the ring marked `wal_backed == false`
+  (`test_wal_ring_sink_marks_a_wal_refused_frame_unbacked`), its rows are marked unbacked, and a
+  busy rescue thread no longer hands them "to the WAL" under the `rescue_deferred_to_wal` source:
+  they keep the inline spill (`mark_pending_unbacked_keeps_rows_in_the_inline_spill`,
+  `mark_pending_unbacked_keeps_depth_rows_in_the_inline_spill`). The tick and depth spill files
+  are synced on the writer and rescue threads before a batch counts as rescued (Z8a,
+  `sync_spill_data`). The drain's inline spill stays UNSYNCED, kept as a recorded limitation
+  (`SPILL_UNSYNCED_ON_DRAIN`): it runs only past the H4 park bounds (8 batches, 128 MiB per
+  sink), and syncing there would put a device wait on the frame drain; it relies on the same
+  kernel writeback the 60 s watermark durability lag already assumes.)*
   - Spill, dead-letter and replay-marker files are never flushed to disk before the marker moves
     (ws_frame_spill.rs:566; tick_persistence.rs:1344-1349, :2837, :3383): `sync_data` before the
     marker advances, off the drain.
@@ -631,12 +646,20 @@ folded into them below), then PR18, PR19 and the decisions.
     separate resume permit. The one-socket test dial must watch every socket for an 805 over a
     window, since Dhan accepts a new socket and closes the oldest (pool_supervisor.rs:1818-1829;
     dhan_feed_stack.rs:12102, :12865-12887).
-- [ ] **D8 — index ids from the instrument file replace the fixed four.** (`app`) When the master
+- [x] **D8 — index ids from the instrument file replace the fixed four.** (`app`) When the master
   yields any index rows they REPLACE the four seeds (dhan_live_universe.rs:269-277). That swap is
   deliberate and evidence-backed (seed ids measured receiving zero packets, comment above it), so
   it stays. The gap is that an index the fixed list names (for example India VIX) can vanish
   silently if the master's index rows omit it. Default chosen: keep the swap, and when a fixed
   index has no master counterpart by symbol, keep that seed and raise one coded error naming it.
+  **DONE 2026-10-11:** the artifact symbol is parsed; a seed is dropped when a master index row
+  matches it by id or by symbol (spaces and case ignored); otherwise it is kept and one coded
+  WS-GAP-03 `error!` (`source = "index_seed_missing_from_master"`, log-sink only) names it. SENSEX
+  is BSE and is dropped quietly: the spot path is NSE-only by the 2026-08-22 "skip BSE" lock, so
+  the triage note "include BSE index rows" was not taken. Matching by symbol is Assumed to fit the
+  master's SYMBOL_NAME for NIFTY, BANKNIFTY and INDIA VIX (not checked against a live file).
+  Tests: `test_regression_d8_india_vix_missing_from_the_master_is_kept_and_reported` (bite-checked),
+  `test_d8_*`, `test_seed_names_for_*`, property `master_indices_replace_the_seeds_rather_than_joining_them`.
 - [ ] **D9 — a second Dhan account for the depth sockets only.** (`core`, `app`, `aws-lambdas`,
   terraform) Owner, 2026-09-26 13:05 UTC: "i will get my friends accoutn as the seocnd accoputn
   oen and only to haev this extra depth 20 and dpeth 200 websockets alone"; 13:09 UTC: "yes dhan
@@ -1579,7 +1602,16 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
     copy of the paper OMS order map, and fetching the broker order book is REST outside the
     allowed classes (`no-rest-except-live-feed-2026-06-27.md`). Options: share a read handle on
     the OMS order map, or accept counted loss. Not started.
-- [ ] **PR43 — no NIFTY or BANKNIFTY depth-20 option leg is dropped silently.** (`app`)
+- [x] **PR43 — no NIFTY or BANKNIFTY depth-20 option leg is dropped silently.** (`app`)
+  - DONE 2026-10-11: `depth20_static::depth20_shortfall` counts spots cut at the 250 cap and
+    index legs missing from the ±4 window (36, `DEPTH20_INDEX_LEGS_WANTED`), even when the
+    budget leaves no room. At settle the attach sets `tv_depth20_index_legs_missing` and
+    `tv_depth20_spots_cut` and, when either is non-zero, logs a coded WS-GAP-02 `error!`
+    (`source = "depth20_static_set_short"`) naming both counts; "complete" is logged only when
+    nothing is missing. Log-sink only (no new alarm: a page needs a noise-lock row). Placement
+    is unchanged pending the owner decision below. Tests: `depth20_static::tests::test_shortfall_*`,
+    `test_no_room_reads_as_every_leg_missing_not_complete` (bite-checked),
+    `the_index_settle_states_and_counts_what_the_static_set_leaves_out`.
   - Past 246 spot instruments every index option leg leaves depth-20 while the settle log says
     complete; shrinking starts at 215 spots, and today is about 208
     (depth20_static.rs:108-119, :218-226; dhan_feed_stack.rs:12242-12255). This is close to the
@@ -1612,10 +1644,11 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
   - The budget-action role may stop any instance (budget.tf:374-380): scope it to the box.
   - Database ports and a default login fallback (docker-compose.yml:221-224; deploy-aws.yml:1006):
     bind to the host and fail the deploy on a missing password.
-- [ ] **PR47 — an urgent Telegram page is never lost uncounted.** (`core`)
+- [x] **PR47 — an urgent Telegram page is never lost uncounted.** (`core`)
   - A Critical page can be lost in a burst, uncounted, while the SMS copy still goes out
     (core/src/notification/service.rs:462, :489-494, :2109-2131, :2316-2345): honour the
     retry-after reply, count the final failure, and count SMS failures too.
+  - (Done 2026-10-11: 429 replies wait Telegram's `retry_after`, capped at 30 s, on the send, episode and edit ladders; the chunked page path counts `tv_telegram_dropped_total{reason="send_failed"}` once per lost page; SMS failures count on `tv_sns_sms_failed_total{reason}` with a coded TELEGRAM-01 error; row 166 recorded, not capped: `tv_telegram_send_tasks_inflight` gauge. Tests: `test_regression_send_retry_waits_for_telegram_retry_after`, `test_regression_chunked_page_loss_counts_one_drop_per_page`, `test_regression_sns_sms_failure_is_counted_per_reason`.)
 - [ ] **PR48 — console destructive actions finish before the open and never report a false
   complete.** (`aws-lambdas`) The open holes of ticked PR28a.
   - A reset or nuke started 08:30-08:59 runs into the open
@@ -1888,7 +1921,17 @@ the PR4c follow-ups, PR52. PR30b stays on or after 2026-10-01.
     literal candle-table DROP in either sweep body; bite-proven by re-adding the literal),
     `drop_status_counts_as_answered_only_when_questdb_answered`. Non-candle KEEP tables stay
     pinned by the existing `retired_drop_list_never_names_a_live_table`.
-- [ ] **PR54 — a depth socket that never sends a first frame pages.** (`app`, `core`)
+- [x] **PR54 — a depth socket that never sends a first frame pages.** (`app`, `core`)
+  - DONE 2026-10-11: the supervisor stamps each slot at its subscribe ack
+    (`pool_supervisor::subscribed_wall_ms`, one relaxed store per dial). The deaf-socket gauge
+    (`worst_connection_tick_age_secs`, alarm `dhan-worst-socket-deaf`, 600 s, gated 09:20-15:35)
+    now ages a main-feed or depth-20 socket that subscribed and never delivered from its
+    subscribe or from 09:15 IST, whichever is later (`slot_delivery_age_secs`, O(1) per slot);
+    an unused slot and every depth-200 slot stay excluded. No new alarm or metric. Both false
+    RISK-GAP-03 comments are corrected (that scan is keyed by instrument and cannot see a depth
+    socket). Tests: `test_slot_delivery_age_secs_*`, `test_session_open_utc_millis_*`,
+    `test_worst_connection_tick_age_secs_with_a_never_delivering_depth20_socket_pages`
+    (bite-checked), `test_subscribed_wall_ms_is_stamped_at_the_subscribe_ack`.
   - From re-check 7: a morning-dial depth socket that never delivers a frame pages nothing, and
     the comment that says RISK-GAP-03 covers it is false for depth. PR44/PR45 do not cover it.
   - Fix: a per-socket first-frame deadline (O(1) per socket) that pages through an existing
@@ -2045,9 +2088,15 @@ New items:
   - Row 111: a wait under 1 s never pages (seal_writer_runner.rs:279, :672-693). Page on the
     summed inline wait per window, or alarm the shipped inline-fallback count. This item also
     owns row 110 (the throttle is keyed on the fold's time instead of the wall clock).
-- [ ] **PR40c-f — finish the batching and append-pause proofs.** (`storage`)
+- [x] **PR40c-f — finish the batching and append-pause proofs.** (`storage`)
   - Row 266 (c6#235): count writes at the disk call, and test an append racing the rename
     (seal_spill.rs:878-918, :962-968).
+  - Done 2026-10-11: a test-only count at both `write_all` calls (`SpillTestProbes`, compiled
+    out of production). `test_append_seals_writes_a_batch_with_one_call_and_reads_back_in_order`
+    and `the_escalation_thread_batches_a_burst_and_writes_every_record_in_order` assert on it;
+    `test_an_append_blocked_by_the_pause_lands_in_a_fresh_file_after_the_rename` waits until a
+    second thread is at the append lock, renames, and fails with `state.open = None` removed
+    (bite-checked).
 - [x] **PR40b-f — the spill prune never deletes unreplayed or refused candles.** (`storage`,
   `app`)
   - This item owns the PR40b corrections above: rows 187 (c6#168; `.overflow` as well as
@@ -2110,6 +2159,11 @@ Rows folded into existing items (the fix is named here so the item carries it):
 - PR24: row 121 (cap the spot store's held time at the wall clock); row 101 (c6#101, count
   contracts pushed off the 1 s board by broker clock skew, and tie the close to the measured
   skew; the board half goes with the PR4c follow-ups).
+  *(2026-10-11: row 101 counter half DONE: `tv_top_volume_watermark_capped_total`, one count and
+  one coded `warn!` per episode of the candle clock running ahead of the wall
+  (`dhan_feed_stack.rs::note_top_volume_watermark_cap`, test
+  `test_note_top_volume_watermark_cap_counts_each_episode_once`). Tying the close to the measured
+  skew stays open, as do the WAL watermark cap and the archive applied-gate above.)*
 - PR32: row 169 (c6#150, split a refused batch so only the bad row is quarantined); row 176
   (c6#157, order spill files by sequence, not by name).
 - PR31c: rows 172 (c6#153, top-volume boards get the spill tier during a DB outage), 193 (count
@@ -2953,7 +3007,7 @@ Status of the rest, so the next session does not re-audit:
 
 | State | Items |
 |---|---|
-| Partly done (remaining work named in each item) | PR5, PR8 (shutdown/boot `blocking_flush`, seal-writer cycle, order observability flushes still `block_in_place`), D2 (waits on PR12), D3 (D3a/b/c-1 done; D3c-2/3 open), D5 (waits on PR11), D6 (D6e onward), PR16 (`df` fork with no timeout, drain still on the shared runtime, boot seal drain bare), PR17 (seal DLQ, torn-line and seal-spill sync done 2026-10-04; tick spill marker sync and the "deferred" label open), PR18, PR19, D7 (808 policy open), D9 (D9b-3 open), PR24, PR28b (owner lock mode), PR31c, PR32 (hour-boundary late append in tick spill replay; unapplied-table overflow uncounted; archive blind to capture-log deferrals), PR33, PR36 (SSH done), PR39, PR42 (42a/42b done; 42c owner; order/position update event writers have no spill tier), PR55 (manual and tag deploys gated; input-in-shell and branch checks open), PR56 (alarm open), PR40b-f (all parts done 2026-10-04; awaiting merge) |
+| Partly done (remaining work named in each item) | PR5, PR8 (shutdown/boot `blocking_flush`, seal-writer cycle, order observability flushes still `block_in_place`), D2 (waits on PR12), D3 (D3a/b/c-1 done; D3c-2/3 open), D5 (waits on PR11), D6 (D6e onward), PR16 (`df` fork with no timeout, drain still on the shared runtime, boot seal drain bare), PR18, PR19, D7 (808 policy open), D9 (D9b-3 open), PR24, PR28b (owner lock mode), PR31c, PR32 (hour-boundary late append in tick spill replay; unapplied-table overflow uncounted; archive blind to capture-log deferrals), PR33, PR36 (SSH done), PR39, PR42 (42a/42b done; 42c owner; order/position update event writers have no spill tier), PR55 (manual and tag deploys gated; input-in-shell and branch checks open), PR56 (alarm open), PR40b-f (all parts done 2026-10-04; awaiting merge) |
 | Open, nothing built | PR6, PR7, PR9, PR10, PR11, PR12, PR13, PR14, D1, D4, D8, PR23, PR25, PR26, PR27, PR34, PR35, PR37, PR38, PR43, PR44, PR45, PR46, PR47, PR49, PR50, PR51, PR52, PR54, PR57, PR59, PR40c-f, PR40d-f |
 | Waiting on the owner | OWNER-202, PR42c, PR28b lock mode, D11/R3-13 (no `wip/d11` branch exists any more; the box curfew still blocks Sundays; the session is 2026-11-08) |
 | Dormant | PR48 (console wipes switched off by `CONSOLE_DATA_WIPES_AUTHORIZED = false`) |

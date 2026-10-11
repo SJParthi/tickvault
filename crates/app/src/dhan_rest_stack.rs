@@ -1197,11 +1197,15 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
     // is byte-identical to the post-#1532 noise-lock shape.
     // -----------------------------------------------------------------------
     if config.order_runtime.enabled {
-        // Stack-local broadcast channel (capacity mirrors the legacy 256).
+        // Stack-local broadcast channel, sized by
+        // `ORDER_UPDATE_BROADCAST_CAPACITY` (4,096 since 2026-10-11, audit
+        // PR14; it was a literal 256, about 25 s of order events).
         // The construction receiver IS the runtime's first receiver — there
         // is no earlier producer to order against (no socket, no drain).
         let (order_update_sender, first_order_update_rx) =
-            tokio::sync::broadcast::channel::<tickvault_common::order_types::OrderUpdate>(256);
+            tokio::sync::broadcast::channel::<tickvault_common::order_types::OrderUpdate>(
+                tickvault_common::constants::ORDER_UPDATE_BROADCAST_CAPACITY,
+            );
         // The auth seam: never notified today (no socket) — the runtime's
         // one-shot reconcile-on-auth arm idles by construction; kept so the
         // gated live re-arm wires the socket's auth signal into the SAME

@@ -1016,6 +1016,10 @@ pub struct DayComparison {
     pub missing_live_unjudged: i64,
     /// Whether missing minutes were judged on this run, and if not, why.
     pub missing_judgeable: MissingJudgeable,
+    /// SHADOW (§12.15.11, plan 51h): whether a missing-minutes page would
+    /// have fired for this run. Persisted on the daily row; read by no page.
+    /// See [`would_page_on_missing_minutes`] for the rule.
+    pub missing_minutes_would_page: bool,
     /// Median divergence magnitude in paise — what NORMAL looks like.
     pub noise_p50_paise: i64,
     pub noise_p95_paise: i64,
@@ -1194,6 +1198,12 @@ pub fn compare_day_in_scope(
     let mut missing_live_unjudged: i64 = 0;
     // Missing minutes on an index — always real (see the missing arm).
     let mut missing_live_index: i64 = 0;
+    // §12.15.11 shadow: the current run of consecutive real missing index
+    // minutes on which Dhan's bar moved, as (security_id, last minute, length),
+    // and the longest such run of the day. Keys iterate per instrument in
+    // minute order, so a run is broken by any minute that is not the next one.
+    let mut index_run: Option<(i64, i64, i64)> = None;
+    let mut longest_moving_index_run: i64 = 0;
     let judged = inputs.missing.is_judged();
     // Which window is "late", and whether a late minute is excused. Under
     // `Strict` the derived window is still MEASURED (`missing_live_late`),
@@ -1329,6 +1339,27 @@ pub fn compare_day_in_scope(
                     // second, so a minute it is missing IS lost data.
                     if is_index {
                         missing_live_index = missing_live_index.saturating_add(1);
+                        // A flat bar (high == low) does not extend a run: the
+                        // shadow pages only on an index that kept moving while
+                        // we held nothing for it.
+                        index_run = if r.bar.high_paise != r.bar.low_paise {
+                            let len = match index_run {
+                                Some((sid, last, len))
+                                    if sid == security_id
+                                        && minute
+                                            == last.saturating_add(
+                                                NANOS_PER_SEC.saturating_mul(60),
+                                            ) =>
+                                {
+                                    len.saturating_add(1)
+                                }
+                                _ => 1,
+                            };
+                            longest_moving_index_run = longest_moving_index_run.max(len);
+                            Some((security_id, minute, len))
+                        } else {
+                            None
+                        };
                     }
                     DhanLiveXverifyCellKind::MissingLive
                 };
@@ -1454,6 +1485,11 @@ pub fn compare_day_in_scope(
         late_excused,
         missing_live_unjudged,
         missing_judgeable: inputs.missing,
+        missing_minutes_would_page: would_page_on_missing_minutes(
+            judged,
+            missing_live_traded,
+            longest_moving_index_run,
+        ),
         noise_p50_paise,
         noise_p95_paise,
         noise_max_paise,
@@ -1463,6 +1499,33 @@ pub fn compare_day_in_scope(
         volume_capture_p05_pct,
         volume_capture_min_pct,
     }
+}
+
+/// The shortest run of consecutive missing index minutes, each on a Dhan bar
+/// that moved (high ≠ low), that the missing-minutes shadow counts as a page
+/// (§12.15.11). One lone missing index minute does not page: an index prints
+/// every second, but a single absent bucket at a quiet moment is the shape a
+/// late-sealed bar takes, and the page (51j) is meant to fire on lost data.
+pub const WOULD_PAGE_MIN_INDEX_RUN_MINUTES: i64 = 2;
+
+/// The missing-minutes page rule, run in SHADOW (§12.15.11, plan 51h): what a
+/// page would have said, persisted on the daily row and read by no page.
+///
+/// `true` only when missing minutes were judged on this run AND either a
+/// non-index minute that Dhan shows traded is missing from our side
+/// (`missing_live_traded`), or an index missed at least
+/// [`WOULD_PAGE_MIN_INDEX_RUN_MINUTES`] consecutive minutes on which it moved.
+/// Excused late minutes and unjudged minutes are never counted: they are not
+/// in `missing_live_traded` and never extend an index run. A run that could
+/// not judge missing minutes is always `false`. Pure, O(1).
+#[must_use]
+pub const fn would_page_on_missing_minutes(
+    judged: bool,
+    missing_live_traded: i64,
+    longest_moving_index_run: i64,
+) -> bool {
+    judged
+        && (missing_live_traded > 0 || longest_moving_index_run >= WOULD_PAGE_MIN_INDEX_RUN_MINUTES)
 }
 
 /// Which attempt wrote a set of audit rows (§12.15.9 review).
@@ -1533,6 +1596,7 @@ pub fn daily_row(
         missing_judgeable: cmp.missing_judgeable,
         attempt_at_ist_nanos: attempt.at_ist_nanos,
         run_complete: attempt.run_complete,
+        missing_minutes_would_page: cmp.missing_minutes_would_page,
     }
 }
 
@@ -5079,6 +5143,179 @@ mod tests {
         // Truncated and nothing compared: degraded, as before.
         let cmp = unscoped(&[], &rest, inputs);
         assert_eq!(cmp.outcome, DhanLiveXverifyOutcome::Degraded);
+    }
+
+    /// §12.15.11 (plan 51h): the would-page rule, every input class.
+    #[test]
+    fn would_page_on_missing_minutes_table() {
+        assert_eq!(WOULD_PAGE_MIN_INDEX_RUN_MINUTES, 2);
+        for judged in [false, true] {
+            for traded in [0, 1, 7] {
+                for run in [0, 1, 2, 3] {
+                    let expected = judged && (traded > 0 || run >= 2);
+                    assert_eq!(
+                        would_page_on_missing_minutes(judged, traded, run),
+                        expected,
+                        "judged={judged} traded={traded} run={run}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The bars that would page on a judged run: a traded equity minute and
+    /// two consecutive moving index minutes, all missing from our side, all
+    /// mid-session.
+    fn would_page_rest() -> Vec<SideBar> {
+        vec![
+            eq_bar(1, OPEN, 500),
+            eq_bar(1, OPEN + 600, 300),
+            side(13, OPEN + 600, bar_vol(1.0, 2.0, 1.0, 1.5, 0)),
+            side(13, OPEN + 660, bar_vol(1.0, 2.0, 1.0, 1.5, 0)),
+        ]
+    }
+
+    /// §12.15.11 (plan 51h): an unsettled run never judges a missing minute,
+    /// so its shadow is `false` whatever is missing: the truncated read and
+    /// every not-ready reason of the day's last attempt.
+    #[test]
+    fn missing_minutes_would_page_is_false_on_an_unjudged_or_not_ready_run() {
+        use tickvault_storage::dhan_live_crossverify_persistence::DhanLiveXverifyNotReady as N;
+        let live = vec![eq_bar(1, OPEN, 500)];
+        let rest = would_page_rest();
+        let judged = unscoped(
+            &live,
+            &rest,
+            verdict_inputs_for_run(false, 0, false, ReadPolicy::STRICT),
+        );
+        assert!(judged.missing_minutes_would_page, "the control must page");
+
+        let mut unsettled = vec![verdict_inputs_for_run(false, 0, true, ReadPolicy::STRICT)];
+        for reason in [
+            N::SealsPending,
+            N::SealSpillParked,
+            N::NotApplied,
+            N::CompletenessUnknown,
+        ] {
+            let read = ReadPolicy {
+                not_ready: Some(reason),
+                ..ReadPolicy::STRICT
+            };
+            unsettled.push(verdict_inputs_for_run(false, 0, false, read));
+        }
+        for inputs in unsettled {
+            assert!(!inputs.missing.is_judged(), "{inputs:?}");
+            let cmp = unscoped(&live, &rest, inputs);
+            assert_eq!(cmp.missing_live_traded, 0, "never judged: {inputs:?}");
+            assert_eq!(cmp.missing_live_unjudged, 3, "{inputs:?}");
+            assert!(!cmp.missing_minutes_would_page, "{inputs:?}");
+            let row = daily_row(&cmp, DAY_START_NANOS, RUN_TS, 0, TEST_ATTEMPT);
+            assert!(!row.missing_minutes_would_page, "{inputs:?}");
+        }
+    }
+
+    /// §12.15.11 (plan 51h): on a judged run the shadow pages on a missing
+    /// traded minute or a run of at least two consecutive moving index
+    /// minutes, and on nothing else.
+    #[test]
+    fn missing_minutes_would_page_follows_traded_minutes_and_moving_index_runs() {
+        let strict = verdict_inputs_for_run(false, 0, false, ReadPolicy::STRICT);
+        let live = vec![
+            eq_bar(1, OPEN, 500),
+            side(13, OPEN, bar_vol(1.0, 2.0, 1.0, 1.5, 0)),
+        ];
+        let moving = bar_vol(1.0, 2.0, 1.0, 1.5, 0);
+        let flat = bar_vol(1.0, 1.0, 1.0, 1.0, 0);
+        let base = || vec![eq_bar(1, OPEN, 500), side(13, OPEN, moving)];
+        let page = |extra: Vec<SideBar>| {
+            let mut rest = base();
+            rest.extend(extra);
+            unscoped(&live, &rest, strict).missing_minutes_would_page
+        };
+
+        assert!(!page(vec![]), "nothing missing");
+        assert!(page(vec![eq_bar(1, OPEN + 600, 300)]), "a traded minute");
+        assert!(
+            !page(vec![eq_bar(1, OPEN + 600, 0)]),
+            "a zero-volume equity minute is never real"
+        );
+        assert!(
+            !page(vec![side(13, OPEN + 600, moving)]),
+            "one lone moving index minute"
+        );
+        assert!(
+            page(vec![
+                side(13, OPEN + 600, moving),
+                side(13, OPEN + 660, moving)
+            ]),
+            "two consecutive moving index minutes"
+        );
+        assert!(
+            !page(vec![
+                side(13, OPEN + 600, moving),
+                side(13, OPEN + 720, moving)
+            ]),
+            "two moving minutes with a gap between them"
+        );
+        assert!(
+            !page(vec![
+                side(13, OPEN + 600, moving),
+                side(13, OPEN + 660, flat)
+            ]),
+            "a flat minute does not extend a run"
+        );
+        assert!(
+            !page(vec![side(13, OPEN + 600, flat), side(13, OPEN + 660, flat)]),
+            "two flat minutes"
+        );
+        assert!(
+            page(vec![
+                side(13, OPEN + 600, moving),
+                side(13, OPEN + 660, flat),
+                side(13, OPEN + 720, moving),
+                side(13, OPEN + 780, moving),
+            ]),
+            "a run restarts after a flat minute"
+        );
+        // Two indices, each missing one minute at adjacent times: not a run.
+        assert!(!page(vec![
+            side(13, SESSION_CLOSE_SECS_OF_DAY_IST - 3_600, moving),
+            side(25, SESSION_CLOSE_SECS_OF_DAY_IST - 3_540, moving),
+        ]));
+        // A minute present on our side between two missing ones breaks the run.
+        let mut rest = base();
+        rest.extend([
+            side(13, OPEN + 600, moving),
+            side(13, OPEN + 660, moving),
+            side(13, OPEN + 720, moving),
+        ]);
+        let mut live_mid = live.clone();
+        live_mid.push(side(13, OPEN + 660, moving));
+        assert!(!unscoped(&live_mid, &rest, strict).missing_minutes_would_page);
+
+        // Excused late minutes never page: a traded minute and a moving index
+        // run in the derived window, after each instrument's last live bar.
+        let excuse = verdict_inputs_for_run(false, 0, false, ReadPolicy::DERIVED_WINDOW);
+        let close = SESSION_CLOSE_SECS_OF_DAY_IST;
+        let mut rest = base();
+        rest.extend([
+            eq_bar(1, close - 60, 300),
+            side(13, close - 120, moving),
+            side(13, close - 60, moving),
+        ]);
+        let cmp = unscoped(&live, &rest, excuse);
+        assert_eq!(cmp.late_excused, 3);
+        assert!(!cmp.missing_minutes_would_page);
+        // The same minutes judged strictly do page.
+        assert!(unscoped(&live, &rest, strict).missing_minutes_would_page);
+
+        // The daily row carries the shadow as computed.
+        let cmp = unscoped(&live, &would_page_rest(), strict);
+        let row = daily_row(&cmp, DAY_START_NANOS, RUN_TS, 0, TEST_ATTEMPT);
+        assert!(row.missing_minutes_would_page);
+        // The shadow changes no verdict: the same day reads `diverged`
+        // whether or not the shadow would page.
+        assert_eq!(cmp.outcome, DhanLiveXverifyOutcome::Diverged);
     }
 
     #[test]

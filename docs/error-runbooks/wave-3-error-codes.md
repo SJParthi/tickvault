@@ -34,6 +34,19 @@ Sources of drops, in order of likelihood:
    Counter label: `reason="send_failed"`.
 3. **Disabled mode** — service initialized in NoOp mode (SSM credentials
    unavailable at boot). Counter label: `reason="noop_mode"`.
+4. **SMS copy lost** (`source = "sns_sms_failed"`, added 2026-10-11, PR47)
+   — the SNS SMS copy of a High/Critical page was not sent. Counted on
+   `tv_sns_sms_failed_total{reason="publish_failed"|"attribute_build"}`,
+   NOT on `tv_telegram_dropped_total`, so it never trips the Telegram drop
+   alarm. Prometheus only, no page. Triage: SNS spend limit, the SMS
+   sandbox, and the phone number in SSM.
+
+**Since 2026-10-11 (PR47):** a 429 from Telegram is retried after the
+`retry_after` Telegram names (capped at 30 s), not after 100 ms, and the
+chunked send path used by every non-episode High/Critical page counts a
+lost page on `reason="send_failed"` (it used to log without counting).
+Running alert-send tasks are on the `tv_telegram_send_tasks_inflight`
+gauge; there is no cap, because a cap would drop or delay a Critical page.
 
 **Severity:** Medium. Drops are visible quality degradation but do not
 breach the zero-tick-loss or order-management envelopes. The

@@ -1759,6 +1759,13 @@ pub struct LiveIngest {
     /// backlog the biased select starves those timers, and the reading is then
     /// the latest frame's arrival, still our own clock.
     top_volume_wall_secs: u32,
+    /// `true` while the candle clock runs ahead of the wall clock and the
+    /// close clock caps it (plan row 101, PR24): the counter and the warn
+    /// fire once on the rising edge, and this clears when the lead is gone.
+    top_volume_watermark_capped: bool,
+    /// Episodes counted so far; the counter below carries the same number.
+    top_volume_watermark_capped_episodes: u64,
+    top_volume_watermark_capped_counter: metrics::Counter,
     /// The catch-up seal sweep in progress, if any (audit PR4b, 2026-09-26).
     /// The 5 s timer arm only sets this; the drain's idle arm advances it
     /// [`CATCHUP_SEAL_STEP_SLOTS`] slots at a time.
@@ -2211,9 +2218,48 @@ impl LiveIngest {
 
     /// Checks every cadence against the stored clocks. O(1).
     fn close_top_volume_windows(&mut self) {
+        self.note_top_volume_watermark_cap();
         for cadence in tickvault_storage::top_volume_rank_persistence::SnapshotCadence::ALL {
             self.close_top_volume_window(cadence);
         }
+    }
+
+    /// Counts an episode of the candle clock running ahead of the wall clock
+    /// (plan row 101, PR24). While it does, the close clock caps the candle
+    /// clock at the wall, so every window closes by OUR clock and a contract
+    /// still trading by the exchange's clock can be left off its board. One
+    /// count and one coded `warn!` on the rising edge; nothing per frame
+    /// after that, and the latch clears once the lead is gone.
+    ///
+    /// # Complexity
+    /// O(1), no allocation: two subtractions, one compare, one bool.
+    fn note_top_volume_watermark_cap(&mut self) {
+        if self.top_volume_wall_secs == 0 {
+            return;
+        }
+        let lead_secs = crate::top_volume_sweep::watermark_lead_over_wall_secs(
+            self.aggregator.watermark_secs(),
+            self.top_volume_wall_secs,
+        );
+        if lead_secs == 0 {
+            self.top_volume_watermark_capped = false;
+            return;
+        }
+        if self.top_volume_watermark_capped {
+            return;
+        }
+        self.top_volume_watermark_capped = true;
+        self.top_volume_watermark_capped_episodes =
+            self.top_volume_watermark_capped_episodes.saturating_add(1);
+        self.top_volume_watermark_capped_counter.increment(1);
+        warn!(
+            code = ErrorCode::WsGapConnectionState.code_str(),
+            source = "top_volume_watermark_ahead_of_wall",
+            lead_secs,
+            "Dhan feed: the candle clock is {lead_secs} s ahead of this box's clock; \
+             top-volume windows now close by this box's clock, so a contract still \
+             trading by the exchange's clock can be left off a board"
+        );
     }
 
     /// Stores a wall-clock reading, whole IST seconds, for the close clock.
@@ -2928,6 +2974,11 @@ impl LiveIngest {
             ),
             top_volume_close_clock: crate::top_volume_sweep::WindowCloseClock::new(),
             top_volume_wall_secs: 0,
+            top_volume_watermark_capped: false,
+            top_volume_watermark_capped_episodes: 0,
+            top_volume_watermark_capped_counter: metrics::counter!(
+                crate::top_volume_sweep::TOP_VOLUME_WATERMARK_CAPPED_COUNTER
+            ),
             catch_up: None,
             catch_up_overruns: 0,
             catch_up_overrun_counter: metrics::counter!(CATCHUP_SEAL_OVERRUN_COUNTER),
@@ -11453,14 +11504,20 @@ impl WsLagSlot {
 /// `/metrics` for whoever is triaging, which is the moment attribution is
 /// actually wanted — and by then a human is already looking.
 ///
-/// # Never-ticked slots are EXCLUDED, deliberately
+/// # Never-ticked slots age from their subscribe, never from zero
 ///
-/// A slot that has never ticked reads `0` and is skipped rather than treated
-/// as infinitely stale. Two reasons: an unused slot would peg this gauge at
-/// "broken" forever, and a legitimately quiet subscription (a depth-200 socket
-/// on one illiquid contract) is not a fault. The never-ticked case has its own
-/// signal already — `tv_dhan_feed_instruments_never_ticked` plus RISK-GAP-03 —
-/// so it is covered, not dropped.
+/// A slot that has never ticked reads `0`. An UNUSED slot (never subscribed)
+/// is skipped, so it cannot peg this gauge at "broken" forever. A slot that
+/// subscribed and never delivered ages from its subscribe ack, or from 09:15
+/// IST if it subscribed earlier (PR54, [`slot_delivery_age_secs`]). Depth-200
+/// slots stay excluded either way: one quiet contract is not a socket fault.
+///
+/// ⚠ CORRECTED 2026-10-11 (PR54): this said the never-ticked case was covered
+/// by `tv_dhan_feed_instruments_never_ticked` plus RISK-GAP-03. False for a
+/// depth socket: that detector is keyed by INSTRUMENT and fed by ticks, so a
+/// spot the main feed also carries reads alive however dead its depth-20
+/// socket is. A morning-dial depth socket that never sent a frame paged
+/// nothing.
 static PER_CONN_LAST_TICK_MILLIS: [std::sync::atomic::AtomicI64;
     MAX_TOTAL_DHAN_CONNECTIONS as usize] =
     [const { std::sync::atomic::AtomicI64::new(0) }; MAX_TOTAL_DHAN_CONNECTIONS as usize];
@@ -11485,16 +11542,72 @@ pub fn record_connection_tick(connection_index: u8, recv_millis: i64) {
     }
 }
 
-/// Age in seconds of the STALEST connection that has ever ticked.
+/// Age in seconds of the STALEST connection that has ticked, or that
+/// subscribed and never delivered (PR54, from its subscribe or 09:15 IST).
 ///
-/// `None` when no connection has ticked yet — which is a real state (pre-open,
-/// or a lane that has just started) and must NOT render as zero. Zero would
-/// mean "every socket ticked this instant", the most reassuring reading
-/// available, at the moment we know least.
+/// `None` when no connection has ticked yet and none is overdue from its
+/// subscribe — which is a real state (pre-open, or a lane that has just
+/// started) and must NOT render as zero. Zero would mean "every socket ticked
+/// this instant", the most reassuring reading available, at the moment we know
+/// least.
 ///
-/// Pure, so the boundary cases are testable without a clock.
+/// Reads two global registers; the pure form is
+/// [`worst_connection_tick_age_secs_with`] over [`slot_delivery_age_secs`].
 #[must_use]
 pub fn worst_connection_tick_age_secs(now_millis: i64) -> Option<u64> {
+    worst_connection_tick_age_secs_with(
+        now_millis,
+        tickvault_core::websocket::pool_supervisor::subscribed_wall_ms,
+    )
+}
+
+/// 09:15:00 IST of the IST day holding `now_millis`, as UTC epoch ms. Pure,
+/// O(1).
+#[must_use]
+pub const fn session_open_utc_millis(now_millis: i64) -> i64 {
+    const DAY_MS: i64 = 86_400_000;
+    const IST_OFFSET_MS: i64 = tickvault_common::constants::IST_UTC_OFFSET_SECONDS_I64 * 1_000;
+    const OPEN_MS_OF_DAY: i64 = tickvault_common::constants::MARKET_OPEN_IST_NANOS / 1_000_000;
+    let ist_ms = now_millis.saturating_add(IST_OFFSET_MS);
+    let day_start_ist = ist_ms - ist_ms.rem_euclid(DAY_MS);
+    day_start_ist + OPEN_MS_OF_DAY - IST_OFFSET_MS
+}
+
+/// One slot's delivery age for the deaf-socket gauge (plan item PR54). Pure,
+/// O(1).
+///
+/// A slot that delivered ages from its last frame. One that never delivered
+/// but subscribed ages from its subscribe ack, or from 09:15 IST of the same
+/// day if it subscribed earlier, so a socket dialled at 08:30 that has sent
+/// no frame by 09:25 reads 600 s. Before that anchor it reads `None`. A slot
+/// that never subscribed reads `None`: an unused slot is not a fault.
+#[must_use]
+pub fn slot_delivery_age_secs(
+    now_millis: i64,
+    last_tick_millis: i64,
+    subscribed_millis: Option<i64>,
+) -> Option<u64> {
+    let since = if last_tick_millis != 0 {
+        last_tick_millis
+    } else {
+        let anchor = subscribed_millis?.max(session_open_utc_millis(now_millis));
+        if now_millis < anchor {
+            return None;
+        }
+        anchor
+    };
+    // saturating: a clock stepped backwards must read as 0 age, never wrap
+    // into a gigantic one at the moment the log is hardest to read.
+    Some(u64::try_from(now_millis.saturating_sub(since).max(0) / 1_000).unwrap_or(u64::MAX))
+}
+
+/// [`worst_connection_tick_age_secs`] with the subscribe register passed in,
+/// so the never-delivered case is testable. O(slots).
+#[must_use]
+pub fn worst_connection_tick_age_secs_with(
+    now_millis: i64,
+    subscribed_at: impl Fn(u8) -> Option<i64>,
+) -> Option<u64> {
     // Depth-200 slots are EXCLUDED, and that exclusion is the whole point.
     //
     // 2026-09-02: this alarm flipped ALARM/OK seven times between 08:44 and
@@ -11522,12 +11635,12 @@ pub fn worst_connection_tick_age_secs(now_millis: i64) -> Option<u64> {
             continue; // one contract per socket — see above
         }
         let last = slot.load(Ordering::Relaxed);
-        if last == 0 {
-            continue; // never ticked — see the type's docs
-        }
-        // saturating: a clock stepped backwards must read as 0 age, never wrap
-        // into a gigantic one at the moment the log is hardest to read.
-        let age = u64::try_from(now_millis.saturating_sub(last).max(0) / 1_000).unwrap_or(u64::MAX);
+        // Never ticked: aged from its subscribe, or skipped if it never
+        // subscribed (see the type's docs).
+        let subscribed = u8::try_from(index).ok().and_then(&subscribed_at);
+        let Some(age) = slot_delivery_age_secs(now_millis, last, subscribed) else {
+            continue;
+        };
         worst = Some(worst.map_or(age, |w| w.max(age)));
     }
     worst
@@ -13983,6 +14096,9 @@ async fn attach_depth_when_available(
         let mut depth20_index_legs: Vec<SubscribeInstrument> = Vec::new();
         let mut depth20_index_full_cost = 0usize;
         let mut depth20_index_due = false;
+        // What the set built this attempt leaves out (plan item PR43): spots
+        // cut at the 250-slot cap and index legs of the widest window not in it.
+        let mut depth20_shortfall = crate::depth20_static::Depth20Shortfall::default();
         if !depth_done {
             // ONE load for both halves. Two loads a few seconds apart can
             // disagree, and a disagreement here fills the movers sockets from
@@ -14044,10 +14160,17 @@ async fn attach_depth_when_available(
                 &depth20_index_legs,
                 crate::depth20_static::DEPTH20_STATIC_BUDGET,
             );
+            depth20_shortfall = crate::depth20_static::depth20_shortfall(
+                spots.len(),
+                selection.depth_20.len(),
+                crate::depth20_static::DEPTH20_STATIC_BUDGET,
+            );
             info!(
                 spots = spots.len(),
                 index_legs = depth20_index_legs.len(),
                 index_legs_wanted = depth20_index_full_cost,
+                index_legs_missing = depth20_shortfall.index_legs_missing,
+                spots_cut = depth20_shortfall.spots_cut,
                 index_strikes_each_side = ?each_side,
                 index_due,
                 depth_20 = selection.depth_20.len(),
@@ -14711,14 +14834,31 @@ async fn attach_depth_when_available(
                     )
                 {
                     depth_20_index_added = true;
-                    if depth20_index_legs.len() < depth20_index_full_cost {
-                        warn!(
-                            legs = depth20_index_legs.len(),
-                            full_cost = depth20_index_full_cost,
+                    // PR43: the settle log states what the day set leaves out,
+                    // counted against the operator's widest window (±4, 36
+                    // legs) and the F&O spot list, never against what the
+                    // budget happened to leave room for. Set once a session.
+                    metrics::gauge!(crate::depth20_static::DEPTH20_INDEX_LEGS_MISSING_GAUGE)
+                        .set(depth20_shortfall.index_legs_missing as f64);
+                    metrics::gauge!(crate::depth20_static::DEPTH20_SPOTS_CUT_GAUGE)
+                        .set(depth20_shortfall.spots_cut as f64);
+                    if depth20_shortfall.is_short() {
+                        error!(
+                            code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                            source = "depth20_static_set_short",
+                            index_legs_placed = depth20_shortfall.index_legs_placed,
+                            index_legs_wanted = crate::depth20_static::DEPTH20_INDEX_LEGS_WANTED,
+                            index_legs_missing = depth20_shortfall.index_legs_missing,
+                            index_legs_offered = depth20_index_legs.len(),
+                            index_window_cost = depth20_index_full_cost,
+                            spots_cut = depth20_shortfall.spots_cut,
                             attempts,
-                            "depth-20: settling the index legs with a SHORT at-the-money window \
-                             — the full window never became available by 09:20. The day set \
-                             stays static with what was offered."
+                            "depth-20: today's static set is SHORT — {} NIFTY/BANKNIFTY \
+                             option legs and {} F&O spots have no depth-20 slot for the whole \
+                             day (250-slot cap, or the at-the-money window was not available \
+                             by 09:20). Placement is unchanged; the set stays static.",
+                            depth20_shortfall.index_legs_missing,
+                            depth20_shortfall.spots_cut,
                         );
                     } else {
                         info!(
@@ -31483,6 +31623,45 @@ mod depth_rebalance_wiring_tests {
         assert!(closes >= 1, "the windows up to the wall did close");
     }
 
+    /// Plan row 101 (PR24): a candle clock ahead of the wall is capped at the
+    /// wall, and that is counted once per episode, not once per frame.
+    #[test]
+    fn test_note_top_volume_watermark_cap_counts_each_episode_once() {
+        use crate::top_volume_sweep::WINDOW_CLOSE_LATENESS_SECS;
+        let _serial = lock_published_views();
+        let s0 = FIXTURE_TRADE_SECS;
+        let nanos = |secs: u32| i64::from(secs) * 1_000_000_000;
+        let mut ingest = ranking_ingest(true);
+
+        // No wall reading yet: nothing is judged, even with a skewed tick.
+        trade_fixture_contract(&mut ingest, s0 + 2, 5_100, 2);
+        ingest.poll_top_volume_window_closes_by_candles(-1);
+        assert_eq!(ingest.top_volume_watermark_capped_episodes, 0);
+
+        // The candle clock less the lateness margin sits exactly at the wall:
+        // not ahead, no episode.
+        ingest.poll_top_volume_window_closes_by_candles(nanos(s0 + 2 - WINDOW_CLOSE_LATENESS_SECS));
+        assert!(!ingest.top_volume_watermark_capped);
+        assert_eq!(ingest.top_volume_watermark_capped_episodes, 0);
+
+        // A future-dated print: one episode, however many frames follow.
+        trade_fixture_contract(&mut ingest, s0 + 500, 5_200, 3);
+        for _ in 0..10 {
+            ingest.poll_top_volume_window_closes_by_candles(nanos(s0 + 3));
+            let _ = run_queued_sweeps(&mut ingest);
+        }
+        assert!(ingest.top_volume_watermark_capped);
+        assert_eq!(ingest.top_volume_watermark_capped_episodes, 1);
+
+        // The wall catches up: the latch clears, and a fresh lead is a new
+        // episode.
+        ingest.poll_top_volume_window_closes_by_candles(nanos(s0 + 500));
+        assert!(!ingest.top_volume_watermark_capped);
+        trade_fixture_contract(&mut ingest, s0 + 900, 5_300, 4);
+        ingest.poll_top_volume_window_closes_by_candles(nanos(s0 + 501));
+        assert_eq!(ingest.top_volume_watermark_capped_episodes, 2);
+    }
+
     /// Review of audit PR4c-2: a contract that trades every second seals its
     /// window's bar over in the fold before the board can reach it. The
     /// board still ranks it, at the window's own candle volume, from the
@@ -31941,6 +32120,38 @@ mod depth20_layout_wiring_tests {
     }
 
     #[test]
+    fn the_index_settle_states_and_counts_what_the_static_set_leaves_out() {
+        // PR43: a budget with no room for index legs used to settle with a
+        // wanted cost of 0 and log "complete" while both indices were absent
+        // all day. The settle now counts against the widest window and pages
+        // a coded error when anything is missing.
+        let p = production();
+        assert!(
+            p.contains("depth20_shortfall = crate::depth20_static::depth20_shortfall("),
+            "the attach must compute what the static set leaves out"
+        );
+        assert!(
+            p.contains("source = \"depth20_static_set_short\""),
+            "a short static set must raise the coded error"
+        );
+        assert!(
+            p.contains("metrics::gauge!(crate::depth20_static::DEPTH20_INDEX_LEGS_MISSING_GAUGE)")
+                && p.contains("metrics::gauge!(crate::depth20_static::DEPTH20_SPOTS_CUT_GAUGE)"),
+            "the settle must publish both shortfall gauges"
+        );
+        let settle = p
+            .find("if depth20_shortfall.is_short()")
+            .expect("the settle branches on the shortfall"); // APPROVED: test
+        let complete = p
+            .find("the static day set is complete (spots + index legs)")
+            .expect("the complete log line exists"); // APPROVED: test
+        assert!(
+            settle < complete,
+            "\"complete\" must be logged only on the not-short branch"
+        );
+    }
+
+    #[test]
     fn depth_is_not_done_until_the_index_legs_are_settled() {
         // The spots dial at 09:00; the index legs only exist from 09:12. If
         // `depth_done` ignored them, the attach loop would stop before 09:12
@@ -32009,7 +32220,8 @@ mod depth20_layout_wiring_tests {
 mod deaf_socket_gauge_scope_tests {
     use super::{
         DhanEndpointType, PER_CONN_LAST_TICK_MILLIS, record_connection_tick,
-        worst_connection_tick_age_secs,
+        session_open_utc_millis, slot_delivery_age_secs, worst_connection_tick_age_secs,
+        worst_connection_tick_age_secs_with,
     };
     use std::sync::atomic::Ordering;
 
@@ -32116,6 +32328,87 @@ mod deaf_socket_gauge_scope_tests {
             worst, 1_800,
             "depth-account depth-20 silence stays diagnostic"
         );
+    }
+
+    /// 2026-10-12 (a Monday) 10:00:00 IST and 09:15:00 IST, as UTC epoch ms.
+    const TEN_AM_IST_MS: i64 = 1_791_779_400_000;
+    const OPEN_IST_MS: i64 = 1_791_776_700_000;
+
+    #[test]
+    fn test_session_open_utc_millis_is_0915_ist_of_the_same_ist_day() {
+        assert_eq!(session_open_utc_millis(TEN_AM_IST_MS), OPEN_IST_MS);
+        assert_eq!(session_open_utc_millis(OPEN_IST_MS), OPEN_IST_MS);
+        // 23:59 IST the same day still maps to that day's open.
+        let late = OPEN_IST_MS + (14 * 3_600 + 44 * 60) * 1_000;
+        assert_eq!(session_open_utc_millis(late), OPEN_IST_MS);
+        // 00:01 IST the next day maps to the next open.
+        let next = OPEN_IST_MS + (14 * 3_600 + 46 * 60) * 1_000;
+        assert_eq!(session_open_utc_millis(next), OPEN_IST_MS + 86_400_000);
+    }
+
+    #[test]
+    fn test_slot_delivery_age_secs_never_delivering_socket_ages_from_subscribe_or_open() {
+        // Delivered: the last frame wins, as before.
+        assert_eq!(
+            slot_delivery_age_secs(TEN_AM_IST_MS, TEN_AM_IST_MS - 7_000, Some(1)),
+            Some(7)
+        );
+        // Never subscribed: an unused slot is not a fault.
+        assert_eq!(slot_delivery_age_secs(TEN_AM_IST_MS, 0, None), None);
+        // Dialled at 08:30, nothing by 10:00: aged from 09:15, not 08:30.
+        let dialled_0830 = OPEN_IST_MS - 45 * 60 * 1_000;
+        assert_eq!(
+            slot_delivery_age_secs(TEN_AM_IST_MS, 0, Some(dialled_0830)),
+            Some(45 * 60)
+        );
+        // Before 09:15 the pre-open silence is not a fault.
+        assert_eq!(
+            slot_delivery_age_secs(OPEN_IST_MS - 60_000, 0, Some(dialled_0830)),
+            None
+        );
+        // Subscribed mid-session: aged from the subscribe.
+        assert_eq!(
+            slot_delivery_age_secs(TEN_AM_IST_MS, 0, Some(TEN_AM_IST_MS - 600_000)),
+            Some(600)
+        );
+        // A clock stepped back reads 0, never a wrapped huge age.
+        assert_eq!(
+            slot_delivery_age_secs(TEN_AM_IST_MS, TEN_AM_IST_MS + 5_000, None),
+            Some(0)
+        );
+    }
+
+    /// PR54, pinned: a depth-20 socket that subscribed at the morning dial and
+    /// never sent a frame drives the deaf-socket gauge. Before PR54 it was
+    /// skipped as "never ticked" and paged nothing.
+    #[test]
+    fn test_worst_connection_tick_age_secs_with_a_never_delivering_depth20_socket_pages() {
+        let _guard = lock_slots();
+        let now = TEN_AM_IST_MS;
+        let dead_d20 = DhanEndpointType::Depth20.jitter_base() + 1;
+        let quiet_d200 = DhanEndpointType::Depth200.jitter_base() + 1;
+        seed_all_fresh(now);
+        PER_CONN_LAST_TICK_MILLIS[usize::from(dead_d20)].store(0, Ordering::Relaxed);
+        PER_CONN_LAST_TICK_MILLIS[usize::from(quiet_d200)].store(0, Ordering::Relaxed);
+        let dialled_0900 = OPEN_IST_MS - 15 * 60 * 1_000;
+        let subscribed =
+            |slot: u8| (slot == dead_d20 || slot == quiet_d200).then_some(dialled_0900);
+        assert_eq!(
+            worst_connection_tick_age_secs_with(now, subscribed),
+            Some(45 * 60),
+            "the never-delivering depth-20 socket is 45 minutes deaf at 10:00"
+        );
+        // Without its subscribe stamp it is an unused slot, skipped as before.
+        assert_eq!(
+            worst_connection_tick_age_secs_with(now, |_| None),
+            Some(0),
+            "an unused slot never drives the gauge"
+        );
+        // A depth-200 slot stays excluded even when it never delivered.
+        let only_d200 = |slot: u8| (slot == quiet_d200).then_some(dialled_0900);
+        PER_CONN_LAST_TICK_MILLIS[usize::from(dead_d20)].store(now, Ordering::Relaxed);
+        assert_eq!(worst_connection_tick_age_secs_with(now, only_d200), Some(0));
+        seed_all_fresh(now);
     }
 }
 
