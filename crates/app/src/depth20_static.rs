@@ -301,6 +301,7 @@ mod tests {
         MasterEntry {
             security_id: id,
             exchange_segment_code: seg.binary_code(),
+            symbol: String::new(),
         }
     }
 

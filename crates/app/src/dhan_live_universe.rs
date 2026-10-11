@@ -101,6 +101,11 @@ pub struct LiveUniverseSelection {
     /// authorized envelope. Non-zero only with
     /// [`UniverseSource::TruncatedToCapacity`].
     pub refused_over_capacity: usize,
+    /// Hardcoded NSE index seeds kept because the master's index rows held
+    /// no counterpart for them, by id or by symbol (audit D8). Empty when the
+    /// master supplied no index rows at all (the seeds then stand whole and
+    /// that is the fallback, not a gap) or when every NSE seed was matched.
+    pub seeds_missing_from_master: Vec<SecurityId>,
 }
 
 /// One resolved constituent, as the daily rider wrote it.
@@ -110,6 +115,40 @@ pub struct MasterEntry {
     pub security_id: u64,
     /// Segment as the artifact's wire byte — decoded, never cast.
     pub exchange_segment_code: u8,
+    /// The row's `symbol`, uppercased and trimmed, or empty when absent.
+    /// Read only to match an index row to a hardcoded seed by name (D8).
+    pub symbol: String,
+}
+
+/// Hardcoded index seeds the master's index rows never carry, because the
+/// spot path is NSE-only by the operator's 2026-08-22 "skip BSE" lock
+/// (`dhan_universe::nse_index_mappings` filters `exch_id == "NSE"`). Such a
+/// seed is dropped by the swap on purpose, so its absence is not a gap and
+/// raises nothing. SENSEX is the BSE index among `SPOT_1M_REST_INDICES`.
+pub const BSE_INDEX_SEED_NAMES: [&str; 1] = ["SENSEX"];
+
+/// Normalise an index name for the seed match: uppercase, spaces dropped,
+/// so `India VIX`, `INDIA VIX` and `INDIAVIX` compare equal. Cold path.
+fn index_name_key(name: &str) -> String {
+    name.chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(char::to_uppercase)
+        .collect()
+}
+
+/// The name of a hardcoded index seed, from `SPOT_1M_REST_INDICES`.
+fn seed_name(security_id: SecurityId) -> Option<&'static str> {
+    tickvault_common::constants::SPOT_1M_REST_INDICES
+        .iter()
+        .find(|(id, _)| *id == security_id)
+        .map(|(_, name)| *name)
+}
+
+/// The names of the given seed ids, for the D8 log line. Unknown ids read
+/// as `"?"` rather than vanish.
+#[must_use]
+pub fn seed_names_for(ids: &[SecurityId]) -> Vec<&'static str> {
+    ids.iter().map(|id| seed_name(*id).unwrap_or("?")).collect()
 }
 
 /// Parse the daily mapping artifact.
@@ -144,9 +183,15 @@ pub fn parse_mapping_artifact(body: &str) -> Result<Vec<MasterEntry>, String> {
         let Ok(exchange_segment_code) = u8::try_from(seg) else {
             continue;
         };
+        let symbol = row
+            .get("symbol")
+            .and_then(serde_json::Value::as_str)
+            .map(|s| s.trim().to_uppercase())
+            .unwrap_or_default();
         out.push(MasterEntry {
             security_id,
             exchange_segment_code,
+            symbol,
         });
     }
     Ok(out)
@@ -183,6 +228,7 @@ pub fn select_live_universe(
             refused_unknown_segment: 0,
             deduped: 0,
             refused_over_capacity: 0,
+            seeds_missing_from_master: Vec::new(),
         };
     };
 
@@ -286,6 +332,8 @@ pub fn select_live_universe(
     let mut master_index_ids: Vec<SecurityId> = Vec::new();
     let mut master_index_seen: std::collections::HashSet<SecurityId> =
         std::collections::HashSet::new();
+    let mut master_index_names: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     for entry in master {
         if entry.security_id == 0 {
             continue;
@@ -297,9 +345,35 @@ pub fn select_live_universe(
         if master_index_seen.insert(id) {
             master_index_ids.push(id);
         }
+        if !entry.symbol.is_empty() {
+            master_index_names.insert(index_name_key(&entry.symbol));
+        }
     }
+    let mut seeds_missing_from_master: Vec<SecurityId> = Vec::new();
     if !master_index_ids.is_empty() {
+        // Audit D8: the swap stays, but a fixed NSE index the master's index
+        // rows do not carry (by id or by symbol) must not vanish silently. It
+        // is kept and named, so the caller raises one coded error. A BSE seed
+        // is absent by the "skip BSE" lock and is dropped quietly.
+        let kept_seeds: Vec<SubscribeInstrument> = index_universe
+            .iter()
+            .filter(|seed| seed.segment == ExchangeSegment::IdxI)
+            .filter(|seed| {
+                let name = seed_name(seed.security_id);
+                if name.is_some_and(|n| BSE_INDEX_SEED_NAMES.contains(&n)) {
+                    return false;
+                }
+                let by_id = master_index_seen.contains(&seed.security_id);
+                let by_name = name.is_some_and(|n| master_index_names.contains(&index_name_key(n)));
+                !by_id && !by_name
+            })
+            .copied()
+            .collect();
         instruments.retain(|i| i.segment != ExchangeSegment::IdxI);
+        for seed in kept_seeds {
+            seeds_missing_from_master.push(seed.security_id);
+            instruments.push(seed);
+        }
         for security_id in master_index_ids {
             instruments.push(SubscribeInstrument {
                 security_id,
@@ -333,6 +407,7 @@ pub fn select_live_universe(
             refused_unknown_segment,
             deduped,
             refused_over_capacity,
+            seeds_missing_from_master,
         };
     }
 
@@ -352,6 +427,7 @@ pub fn select_live_universe(
         refused_unknown_segment,
         deduped,
         refused_over_capacity: 0,
+        seeds_missing_from_master,
     }
 }
 
@@ -1365,7 +1441,32 @@ pub fn resolve_live_universe(
             );
         }
     }
+    report_seeds_missing_from_master(&selection, &artifact_date);
     selection.instruments
+}
+
+/// Audit D8: one coded error naming every hardcoded NSE index the master's
+/// index rows left out, so it is kept by its fixed id instead of vanishing.
+/// Log-sink only: its `source` matches no CloudWatch filter. Silent when
+/// nothing is missing. Cold path, once per boot resolve.
+fn report_seeds_missing_from_master(
+    selection: &LiveUniverseSelection,
+    artifact_date: &impl std::fmt::Display,
+) {
+    if selection.seeds_missing_from_master.is_empty() {
+        return;
+    }
+    let names = seed_names_for(&selection.seeds_missing_from_master);
+    tracing::error!(
+        code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+        missing = ?names,
+        ids = ?selection.seeds_missing_from_master,
+        artifact_date = %artifact_date,
+        source = "index_seed_missing_from_master",
+        "live universe: today's master lists other indices but not these fixed ones, so \
+         each is kept on its fixed id. That id may not be accepted by the feed; check \
+         whether the instrument file renamed or dropped the index"
+    );
 }
 
 // ===========================================================================
@@ -2185,21 +2286,28 @@ mod tests {
             MasterEntry {
                 security_id: 99,
                 exchange_segment_code: ExchangeSegment::IdxI as u8,
+                symbol: String::new(),
             },
             MasterEntry {
                 security_id: 99,
                 exchange_segment_code: ExchangeSegment::IdxI as u8,
+                symbol: String::new(),
             },
         ];
         let got = select_live_universe(&seeds, Some(&master), 50);
+        // Audit D8: NIFTY and BANKNIFTY are not in the master's index rows,
+        // so they are kept (and reported); 99 still appears exactly once.
         assert_eq!(
             got.instruments,
-            vec![SubscribeInstrument {
-                security_id: 99,
-                segment: ExchangeSegment::IdxI,
-            }],
+            [13_u64, 25, 99]
+                .map(|security_id| SubscribeInstrument {
+                    security_id,
+                    segment: ExchangeSegment::IdxI,
+                })
+                .to_vec(),
             "the duplicate index row reached the subscription"
         );
+        assert_eq!(got.seeds_missing_from_master, vec![13, 25]);
     }
 
     /// A master whose index ids all coincide with the seeds STILL drops the
@@ -2214,24 +2322,136 @@ mod tests {
     /// The trigger is now the master's index SET, which is the question the
     /// surrounding comment always claimed to be asking. Found by the same
     /// property test as the duplicate above, in the same counterexample.
+    ///
+    /// Since audit D8 a seed is dropped only when the master carries it by id
+    /// OR by symbol; here 13 matches by id and BANKNIFTY and INDIA VIX by
+    /// symbol under new ids, and SENSEX is BSE, so every seed id goes.
     #[test]
     fn a_master_naming_only_a_seed_index_still_drops_the_other_seeds() {
         let seeds = [13_u64, 25, 51, 21].map(|security_id| SubscribeInstrument {
             security_id,
             segment: ExchangeSegment::IdxI,
         });
-        let master = [MasterEntry {
-            security_id: 13,
-            exchange_segment_code: ExchangeSegment::IdxI as u8,
-        }];
+        let master = [
+            index_row(13, ""),
+            index_row(777, "BANKNIFTY"),
+            index_row(888, "India VIX"),
+        ];
         let got = select_live_universe(&seeds, Some(&master), 50);
         assert_eq!(
             got.instruments,
-            vec![SubscribeInstrument {
-                security_id: 13,
-                segment: ExchangeSegment::IdxI,
-            }],
-            "seeds the master did not name survived"
+            [13_u64, 777, 888]
+                .map(|security_id| SubscribeInstrument {
+                    security_id,
+                    segment: ExchangeSegment::IdxI,
+                })
+                .to_vec(),
+            "seeds the master named survived"
+        );
+        assert!(got.seeds_missing_from_master.is_empty());
+    }
+
+    fn index_row(security_id: u64, symbol: &str) -> MasterEntry {
+        MasterEntry {
+            security_id,
+            exchange_segment_code: ExchangeSegment::IdxI.binary_code(),
+            symbol: symbol.trim().to_uppercase(),
+        }
+    }
+
+    fn the_four_seeds() -> Vec<SubscribeInstrument> {
+        crate::dhan_feed_stack::hardcoded_index_universe()
+    }
+
+    // Regression: 2026-10-11 (audit D8) — a fixed index the master's index
+    // rows leave out vanished silently with the swap.
+    #[test]
+    fn test_regression_d8_india_vix_missing_from_the_master_is_kept_and_reported() {
+        let master = [
+            index_row(13, "NIFTY"),
+            index_row(25, "BANKNIFTY"),
+            index_row(442, "NIFTY IT"),
+            entry(2885, 1),
+        ];
+        let got = select_live_universe(&the_four_seeds(), Some(&master), 50);
+        let ids: Vec<u64> = got.instruments.iter().map(|i| i.security_id).collect();
+        assert!(ids.contains(&21), "INDIA VIX vanished: {ids:?}");
+        assert!(
+            !ids.contains(&51),
+            "SENSEX is BSE and must not be kept: {ids:?}"
+        );
+        assert_eq!(got.seeds_missing_from_master, vec![21]);
+        assert_eq!(
+            seed_names_for(&got.seeds_missing_from_master),
+            vec!["INDIA VIX"]
+        );
+        assert_eq!(got.source, UniverseSource::MasterSourced);
+    }
+
+    #[test]
+    fn test_d8_a_seed_matched_by_symbol_under_a_new_id_is_replaced() {
+        let master = [
+            index_row(13, "NIFTY"),
+            index_row(25, "BANKNIFTY"),
+            index_row(9_021, " india  vix "),
+        ];
+        let got = select_live_universe(&the_four_seeds(), Some(&master), 50);
+        let ids: Vec<u64> = got.instruments.iter().map(|i| i.security_id).collect();
+        assert_eq!(ids, vec![13, 25, 9_021]);
+        assert!(got.seeds_missing_from_master.is_empty());
+    }
+
+    #[test]
+    fn test_d8_sensex_is_dropped_quietly_every_other_seed_named_by_id() {
+        let master = [index_row(13, ""), index_row(25, ""), index_row(21, "")];
+        let got = select_live_universe(&the_four_seeds(), Some(&master), 50);
+        let ids: Vec<u64> = got.instruments.iter().map(|i| i.security_id).collect();
+        assert_eq!(ids, vec![13, 25, 21]);
+        assert!(got.seeds_missing_from_master.is_empty());
+        assert_eq!(BSE_INDEX_SEED_NAMES, ["SENSEX"]);
+        assert!(
+            tickvault_common::constants::SPOT_1M_REST_INDICES
+                .iter()
+                .any(|(id, name)| *id == 51 && *name == "SENSEX"),
+            "the BSE seed name must match the fixed list"
+        );
+    }
+
+    #[test]
+    fn test_d8_a_master_with_no_index_rows_keeps_the_seeds_and_reports_nothing() {
+        let master = [entry(2885, 1)];
+        let got = select_live_universe(&the_four_seeds(), Some(&master), 50);
+        let ids: Vec<u64> = got.instruments.iter().map(|i| i.security_id).collect();
+        assert_eq!(ids, vec![13, 25, 51, 21, 2885]);
+        assert!(got.seeds_missing_from_master.is_empty());
+    }
+
+    #[test]
+    fn test_seed_names_for_names_known_ids_and_marks_unknown_ones() {
+        assert_eq!(
+            seed_names_for(&[13, 21, 4_242]),
+            vec!["NIFTY", "INDIA VIX", "?"]
+        );
+        assert!(seed_names_for(&[]).is_empty());
+    }
+
+    #[test]
+    fn test_d8_the_boot_resolve_reports_missing_seeds_with_a_coded_error() {
+        let src = include_str!("dhan_live_universe.rs");
+        let body = src
+            .split(concat!("fn report_seeds_missing", "_from_master("))
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap_or_default();
+        assert!(body.contains("ErrorCode::WsGapConnectionState.code_str()"));
+        assert!(body.contains("source = \"index_seed_missing_from_master\""));
+        assert!(body.contains("tracing::error!"));
+        assert!(
+            src.contains(concat!(
+                "report_seeds_missing_from_master(&selection, ",
+                "&artifact_date);"
+            )),
+            "the boot resolve must call the D8 report"
         );
     }
 
@@ -2465,6 +2685,7 @@ mod tests {
         MasterEntry {
             security_id,
             exchange_segment_code: code,
+            symbol: String::new(),
         }
     }
 
@@ -2491,14 +2712,17 @@ mod tests {
             MasterEntry {
                 security_id: 900,
                 exchange_segment_code: 0,
+                symbol: "NIFTY".to_owned(),
             },
             MasterEntry {
                 security_id: 901,
                 exchange_segment_code: 0,
+                symbol: String::new(),
             },
             MasterEntry {
                 security_id: 500,
                 exchange_segment_code: 1,
+                symbol: String::new(),
             },
         ];
         let out = select_live_universe(&seeds, Some(&master), 25_000);
@@ -2530,6 +2754,7 @@ mod tests {
         let master = vec![MasterEntry {
             security_id: 500,
             exchange_segment_code: 1,
+            symbol: String::new(),
         }];
         let out = select_live_universe(&seeds, Some(&master), 25_000);
         let idx: Vec<u64> = out
@@ -2555,6 +2780,7 @@ mod tests {
         let master = vec![MasterEntry {
             security_id: 13,
             exchange_segment_code: 0,
+            symbol: String::new(),
         }];
         let out = select_live_universe(&seeds, Some(&master), 25_000);
         let idx: Vec<u64> = out
@@ -2637,6 +2863,7 @@ mod tests {
                 master.push(MasterEntry {
                     security_id: 100_000 + stock,
                     exchange_segment_code: 1, // NSE_EQ
+                    symbol: String::new(),
                 });
             }
         }
@@ -2644,6 +2871,7 @@ mod tests {
             master.push(MasterEntry {
                 security_id: 1_000 + idx,
                 exchange_segment_code: 0, // IDX_I
+                symbol: String::new(),
             });
         }
         assert_eq!(master.len(), 4_565, "the artifact row count under audit");
@@ -2689,8 +2917,10 @@ mod tests {
     #[test]
     fn over_the_envelope_fills_the_capacity_by_priority_indices_first() {
         let mut master: Vec<MasterEntry> = (1..=10).map(|i| entry(1000 + i, 1)).collect();
-        // The master's index row comes LAST in the file; priority puts it first.
-        master.push(entry(1999, 0));
+        // The master's index rows come LAST in the file; priority puts them
+        // first. They name both seeds by symbol, so neither seed is kept (D8).
+        master.push(index_row(1999, "NIFTY"));
+        master.push(index_row(1998, "BANKNIFTY"));
         let sel = select_live_universe(&idx(), Some(&master), 5);
         assert_eq!(sel.source, UniverseSource::TruncatedToCapacity);
         assert_eq!(
@@ -2704,21 +2934,21 @@ mod tests {
             "must never fall back to the index set"
         );
         assert_eq!(
-            sel.instruments[0],
-            SubscribeInstrument {
-                security_id: 1999,
+            sel.instruments[..2],
+            [1998_u64, 1999].map(|security_id| SubscribeInstrument {
+                security_id,
                 segment: ExchangeSegment::IdxI,
-            },
+            }),
             "indices come first"
         );
-        let stocks: Vec<SecurityId> = sel.instruments[1..].iter().map(|i| i.security_id).collect();
+        let stocks: Vec<SecurityId> = sel.instruments[2..].iter().map(|i| i.security_id).collect();
         assert_eq!(
             stocks,
-            vec![1001, 1002, 1003, 1004],
+            vec![1001, 1002, 1003],
             "then by composite key, whatever the row order"
         );
-        // 10 stocks + 1 master index (the seeds are replaced) = 11; 5 fit.
-        assert_eq!(sel.refused_over_capacity, 6);
+        // 10 stocks + 2 master indices (the seeds are replaced) = 12; 5 fit.
+        assert_eq!(sel.refused_over_capacity, 7);
     }
 
     /// Exactly at the envelope is a normal widened session, not a truncation.
@@ -2876,7 +3106,11 @@ mod tests {
              "security_id":2885,"exchange_segment":1}]}"#;
         assert_eq!(
             parse_mapping_artifact(body),
-            Ok(vec![entry(2885, 1)]),
+            Ok(vec![MasterEntry {
+                security_id: 2885,
+                exchange_segment_code: 1,
+                symbol: "RELIANCE".to_owned(),
+            }]),
             "must decode the exact field names the rider writes"
         );
     }
@@ -2955,6 +3189,7 @@ mod tests {
             Some(vec![MasterEntry {
                 security_id: 11536,
                 exchange_segment_code: 1,
+                symbol: String::new(),
             }]),
             "the F&O artifact and the mapping artifact share one shape and one parser"
         );

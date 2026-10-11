@@ -635,12 +635,20 @@ folded into them below), then PR18, PR19 and the decisions.
     separate resume permit. The one-socket test dial must watch every socket for an 805 over a
     window, since Dhan accepts a new socket and closes the oldest (pool_supervisor.rs:1818-1829;
     dhan_feed_stack.rs:12102, :12865-12887).
-- [ ] **D8 — index ids from the instrument file replace the fixed four.** (`app`) When the master
+- [x] **D8 — index ids from the instrument file replace the fixed four.** (`app`) When the master
   yields any index rows they REPLACE the four seeds (dhan_live_universe.rs:269-277). That swap is
   deliberate and evidence-backed (seed ids measured receiving zero packets, comment above it), so
   it stays. The gap is that an index the fixed list names (for example India VIX) can vanish
   silently if the master's index rows omit it. Default chosen: keep the swap, and when a fixed
   index has no master counterpart by symbol, keep that seed and raise one coded error naming it.
+  **DONE 2026-10-11:** the artifact symbol is parsed; a seed is dropped when a master index row
+  matches it by id or by symbol (spaces and case ignored); otherwise it is kept and one coded
+  WS-GAP-03 `error!` (`source = "index_seed_missing_from_master"`, log-sink only) names it. SENSEX
+  is BSE and is dropped quietly: the spot path is NSE-only by the 2026-08-22 "skip BSE" lock, so
+  the triage note "include BSE index rows" was not taken. Matching by symbol is Assumed to fit the
+  master's SYMBOL_NAME for NIFTY, BANKNIFTY and INDIA VIX (not checked against a live file).
+  Tests: `test_regression_d8_india_vix_missing_from_the_master_is_kept_and_reported` (bite-checked),
+  `test_d8_*`, `test_seed_names_for_*`, property `master_indices_replace_the_seeds_rather_than_joining_them`.
 - [ ] **D9 — a second Dhan account for the depth sockets only.** (`core`, `app`, `aws-lambdas`,
   terraform) Owner, 2026-09-26 13:05 UTC: "i will get my friends accoutn as the seocnd accoputn
   oen and only to haev this extra depth 20 and dpeth 200 websockets alone"; 13:09 UTC: "yes dhan
