@@ -755,6 +755,7 @@ jobs:
           set -euo pipefail
           actual=$(ls crates/*/tests/dhat_*.rs | LC_ALL=C sort)
           expected=$(LC_ALL=C sort <<'EOF'
+          crates/app/tests/dhat_depth_drain.rs
           crates/app/tests/dhat_live_ingest_seam.rs
           crates/app/tests/dhat_mark_forward.rs
           crates/app/tests/dhat_top_volume_sweep.rs
@@ -973,6 +974,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo test -p tickvault-app \
+            --test dhat_depth_drain \
             --test dhat_live_ingest_seam \
             --test dhat_mark_forward \
             --test dhat_top_volume_sweep \
@@ -993,13 +995,15 @@ jobs:
           # the run step, so the count is the only thing that notices. Bumping
           # it is the fix; loosening it to >= would delete the guard.
           #
+          # 6 since audit PROOF-10 (2026-10-11): dhat_depth_drain gates the
+          # app-side depth frame drain (drain_depth_frame).
           # 5 since audit M6 (2026-10-05): dhat_ws_lag_recorder runs the lag tap
           # with the production recorder installed.
           # 4 since audit PR4 (2026-09-26): dhat_top_volume_sweep gates the
           # sliced top-volume sweep that moved off the drain's timer arms.
           ran=$(grep -c 'Running.*tests/dhat_' /tmp/dhat-app.log || true)
-          if [ "$ran" -ne 5 ]; then
-            echo "::error::app DHAT step executed $ran targets, expected 5 — a --test flag was dropped from this step."
+          if [ "$ran" -ne 6 ]; then
+            echo "::error::app DHAT step executed $ran targets, expected 6 — a --test flag was dropped from this step."
             exit 1
           fi
 
