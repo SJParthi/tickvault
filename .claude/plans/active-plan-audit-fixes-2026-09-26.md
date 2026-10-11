@@ -2045,9 +2045,15 @@ New items:
   - Row 111: a wait under 1 s never pages (seal_writer_runner.rs:279, :672-693). Page on the
     summed inline wait per window, or alarm the shipped inline-fallback count. This item also
     owns row 110 (the throttle is keyed on the fold's time instead of the wall clock).
-- [ ] **PR40c-f — finish the batching and append-pause proofs.** (`storage`)
+- [x] **PR40c-f — finish the batching and append-pause proofs.** (`storage`)
   - Row 266 (c6#235): count writes at the disk call, and test an append racing the rename
     (seal_spill.rs:878-918, :962-968).
+  - Done 2026-10-11: a test-only count at both `write_all` calls (`SpillTestProbes`, compiled
+    out of production). `test_append_seals_writes_a_batch_with_one_call_and_reads_back_in_order`
+    and `the_escalation_thread_batches_a_burst_and_writes_every_record_in_order` assert on it;
+    `test_an_append_blocked_by_the_pause_lands_in_a_fresh_file_after_the_rename` waits until a
+    second thread is at the append lock, renames, and fails with `state.open = None` removed
+    (bite-checked).
 - [x] **PR40b-f — the spill prune never deletes unreplayed or refused candles.** (`storage`,
   `app`)
   - This item owns the PR40b corrections above: rows 187 (c6#168; `.overflow` as well as
