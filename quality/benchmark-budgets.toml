@@ -91,6 +91,22 @@ obi_compute              = 1000         # <1μs = 1000ns — matches obi_compute
 # Companion zero-alloc evidence: crates/app/tests/dhat_mark_forward.rs.
 order_gate_mark_forward  = 100          # <100ns — hot-path-grade mark gate
 
+# Live-lane frame drains (audit PROOF-9, 2026-10-11). crates/app/benches/feed_drain.rs.
+# Before this, nothing measured either drain, though both run once per frame on
+# the frame-drain task. Per-ELEMENT budgets ([elements] below divides the frame
+# median): per TICK for the main feed, per LEVEL for depth (depth is O(levels)
+# by nature, never O(1)). Measured 2026-10-11, release, 4-core x86 dev
+# container, nothing else running: main feed 4.96 us per 4-quote frame
+# (~1,240 ns/tick: decode, lag record, 10-timeframe fold, one ILP row);
+# depth-20 53.8 us per 80-level frame (~672 ns/level); depth-200 137.5 us per
+# 200-level packet (~687 ns/level). Per level the cost is the ILP row
+# serialisation (one row per level), which is why depth is the dominant drain
+# cost at ~24x the tick volume. Budgets are ~2x the measured figure; CI
+# multiplies them again for shared runners. NOT measured on the prod host.
+# Companion zero-alloc evidence: dhat_live_ingest_seam.rs, dhat_depth_drain.rs.
+feed_drain_main_feed     = 2500         # <2.5us per tick — matches feed_drain/main_feed_frame_4_quotes
+feed_drain_depth         = 1500         # <1.5us per level — matches feed_drain/depth20_frame_4x20 and feed_drain/depth200_packet
+
 # Common crate
 is_trading_day           = 50           # <50ns  — matches calendar/is_trading_day
 config_toml_load         = 10000000     # <10ms = 10,000,000ns — matches config/toml_load
@@ -111,3 +127,6 @@ config_toml_load         = 10000000     # <10ms = 10,000,000ns — matches confi
 [elements]
 pipeline_batch_100_mixed  = 100   # 100 mixed packets per iter
 pipeline_burst_100_ticker = 100   # 100 ticker packets per iter
+feed_drain_main_feed_frame_4_quotes = 4    # 4 Quote packets per frame (audit PROOF-9)
+feed_drain_depth20_frame_4x20       = 80   # 4 packets x 20 levels per frame
+feed_drain_depth200_packet          = 200  # 200 levels per packet
