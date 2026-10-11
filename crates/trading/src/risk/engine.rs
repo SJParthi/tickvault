@@ -127,6 +127,20 @@ pub struct RiskEngine {
     /// `positions`, flat rows included (the reconcile's union needs them), so
     /// it is bounded transitively by `MAX_TRACKED_POSITIONS`.
     by_sid: HashMap<u64, i64>,
+    /// The unrealized P&L each open, marked position contributes to
+    /// [`Self::unrealized_total`] right now (audit PR18, 2026-10-11).
+    ///
+    /// Holds a key only while its contribution is a finite, non-zero number,
+    /// so its key set is a subset of `non_flat` and is bounded by it.
+    /// Rewritten by [`Self::refresh_unrealized`] at the only two places an
+    /// input to `PositionInfo::unrealized_at` changes: a fill (the row) and a
+    /// mark (the price). `reset_daily` clears it.
+    unrealized_by_key: HashMap<PositionKey, f64>,
+    /// Running sum of `unrealized_by_key`, so the daily-loss check reads the
+    /// unrealized P&L in O(1) instead of walking every open position on every
+    /// order (audit PR18). See [`Self::total_unrealized_pnl`] for the
+    /// rounding bound.
+    unrealized_total: f64,
     /// Sum of all realized P&L from closed trades today.
     total_realized_pnl: f64,
     /// Whether trading is halted due to a risk breach.
@@ -214,6 +228,8 @@ impl RiskEngine {
             market_prices: HashMap::with_capacity(POSITIONS_INITIAL_CAPACITY),
             non_flat: HashSet::with_capacity(POSITIONS_INITIAL_CAPACITY),
             by_sid: HashMap::with_capacity(POSITIONS_INITIAL_CAPACITY),
+            unrealized_by_key: HashMap::with_capacity(POSITIONS_INITIAL_CAPACITY),
+            unrealized_total: 0.0,
             marks_rejected: 0,
             mark_capacity_reported: false,
             total_realized_pnl: 0.0,
@@ -530,6 +546,49 @@ impl RiskEngine {
         // would leave that sid invisible to the reconcile's union.
         let entry = self.by_sid.entry(security_id).or_insert(0);
         *entry = entry.saturating_add(i64::from(new_lots) - i64::from(old_lots));
+        // The fill changed this row's lots, entry price and lot size, so its
+        // unrealized contribution is recomputed here, after every early
+        // return above (same reason as the two indexes).
+        self.refresh_unrealized(key);
+    }
+
+    /// Recomputes one position's unrealized P&L contribution and moves the
+    /// running total by the difference (audit PR18).
+    ///
+    /// The contribution follows the rules the old full walk applied: zero for
+    /// a flat row, for a row with no mark yet (conservative, RISK-GAP-02), and
+    /// for a non-finite product (an absurd but finite price can overflow).
+    /// When no position contributes any more the total is set to exactly 0.0,
+    /// so rounding left by earlier adds and subtracts does not outlive the
+    /// last open position.
+    ///
+    /// # Performance
+    /// O(1): two hash probes on `positions` and `market_prices`, one insert or
+    /// remove on `unrealized_by_key`. No allocation once the map holds the key
+    /// (it is pre-sized at construction).
+    fn refresh_unrealized(&mut self, key: PositionKey) {
+        let contribution = match (self.positions.get(&key), self.market_prices.get(&key)) {
+            (Some(pos), Some(&mark)) if pos.net_lots != 0 => {
+                let unrealized = pos.unrealized_at(mark);
+                if unrealized.is_finite() {
+                    unrealized
+                } else {
+                    0.0
+                }
+            }
+            _ => 0.0,
+        };
+        let previous = if contribution == 0.0 {
+            self.unrealized_by_key.remove(&key)
+        } else {
+            self.unrealized_by_key.insert(key, contribution)
+        }
+        .unwrap_or(0.0);
+        if self.unrealized_by_key.is_empty() {
+            self.unrealized_total = 0.0;
+        } else {
+            self.unrealized_total += contribution - previous;
+        }
     }
 
     /// Updates the mark-to-market price for an instrument (for unrealized P&L).
@@ -629,6 +688,10 @@ impl RiskEngine {
             return;
         }
         self.market_prices.insert(key, current_price);
+        // A new mark moves this leg's unrealized P&L; a mark for an
+        // instrument with no open position contributes nothing and leaves the
+        // total alone.
+        self.refresh_unrealized(key);
     }
 
     /// Mark-to-market daily-loss evaluation OUTSIDE the order path
@@ -719,6 +782,8 @@ impl RiskEngine {
         self.non_flat.clear();
         self.by_sid.clear();
         self.market_prices.clear();
+        self.unrealized_by_key.clear();
+        self.unrealized_total = 0.0;
         self.total_realized_pnl = 0.0;
         self.halted = false;
         self.halt_reason = None;
@@ -831,44 +896,26 @@ impl RiskEngine {
     /// `check_order` runs on EVERY order, so that growth sat on the order
     /// decision path. The doc line here used to say "cold path"; it was not
     /// one, and a comment asserting otherwise is how it stayed unexamined.
+    ///
+    /// **⚠ CHANGED 2026-10-11 (audit PR18) — O(1).** The sum is now kept
+    /// running: each fill and each mark recomputes only its own position's
+    /// contribution (`refresh_unrealized`), so this is one load. The walk
+    /// survives as `unrealized_by_walk` in the test module, and a
+    /// randomized test checks the two agree after every fill and mark.
+    ///
+    /// **Rounding, stated rather than hidden:** a running sum of floats can
+    /// differ from a fresh sum in the last bits. Each add or subtract rounds
+    /// by at most half an ulp of the running total (about 1e-10 rupees at a
+    /// ₹1 crore book), and the total is reset to exactly 0.0 whenever no
+    /// position contributes, so the error cannot carry past a flat book or a
+    /// daily reset. That is far below the paise the daily-loss threshold is
+    /// compared in.
+    ///
+    /// # Performance
+    /// O(1), no allocation.
     pub fn total_unrealized_pnl(&self) -> f64 {
-        let mut total = 0.0_f64;
-        for key in &self.non_flat {
-            // The index can only contain keys the map has, and only while they
-            // are non-flat — both invariants are maintained at the single
-            // mutation site. A miss here would mean the index drifted, so it
-            // is skipped rather than defaulted: a fabricated zero would feed
-            // the daily-loss halt a number no position produced.
-            let Some(pos) = self.positions.get(key) else {
-                continue;
-            };
-            if pos.net_lots == 0 {
-                continue;
-            }
-            // Composite-key lookup (I-P1-11): each leg is priced with ITS OWN
-            // segment's mark. Keyed on the bare id, a same-id/different-segment
-            // instrument supplied the mark here and fabricated the unrealized
-            // P&L that the daily-loss auto-halt reads.
-            if let Some(&market_price) = self.market_prices.get(key) {
-                // Delegates to the ONE per-leg formula
-                // (`PositionInfo::unrealized_at`, order-leg-pnl Item 1) —
-                // preserves the 2026-07-14 lot-size fix (multiply by the
-                // contract lot size; lot_size 0 treated as 1 for pre-fix
-                // Default rows and equities).
-                let unrealized = pos.unrealized_at(market_price);
-                // Defensive finiteness guard: with the lot_size multiplier an
-                // ABSURD (finite-but-huge, ~1e307) price could overflow the
-                // product to ±inf and poison the total. Conservative-skip,
-                // same policy as the missing-market-price arm above —
-                // unreachable with real NSE prices (stress-test pinned).
-                if unrealized.is_finite() {
-                    total += unrealized;
-                }
-            }
-            // Conservative: skip securities without a market price
-        }
-        metrics::gauge!("tv_unrealized_pnl").set(total);
-        total
+        metrics::gauge!("tv_unrealized_pnl").set(self.unrealized_total);
+        self.unrealized_total
     }
 
     /// Returns the position info for a specific instrument.
@@ -1048,6 +1095,47 @@ mod tests {
         RiskEngine::new(2.0, 100, 1_000_000.0)
     }
 
+    /// The full walk the running total replaced, kept so the tests can check
+    /// the two agree. O(open).
+    fn unrealized_by_walk(engine: &RiskEngine) -> f64 {
+        let mut total = 0.0_f64;
+        for key in &engine.non_flat {
+            // The index can only contain keys the map has, and only while they
+            // are non-flat — both invariants are maintained at the single
+            // mutation site. A miss here would mean the index drifted, so it
+            // is skipped rather than defaulted: a fabricated zero would feed
+            // the daily-loss halt a number no position produced.
+            let Some(pos) = engine.positions.get(key) else {
+                continue;
+            };
+            if pos.net_lots == 0 {
+                continue;
+            }
+            // Composite-key lookup (I-P1-11): each leg is priced with ITS OWN
+            // segment's mark. Keyed on the bare id, a same-id/different-segment
+            // instrument supplied the mark here and fabricated the unrealized
+            // P&L that the daily-loss auto-halt reads.
+            if let Some(&market_price) = engine.market_prices.get(key) {
+                // Delegates to the ONE per-leg formula
+                // (`PositionInfo::unrealized_at`, order-leg-pnl Item 1) —
+                // preserves the 2026-07-14 lot-size fix (multiply by the
+                // contract lot size; lot_size 0 treated as 1 for pre-fix
+                // Default rows and equities).
+                let unrealized = pos.unrealized_at(market_price);
+                // Defensive finiteness guard: with the lot_size multiplier an
+                // ABSURD (finite-but-huge, ~1e307) price could overflow the
+                // product to ±inf and poison the total. Conservative-skip,
+                // same policy as the missing-market-price arm above —
+                // unreachable with real NSE prices (stress-test pinned).
+                if unrealized.is_finite() {
+                    total += unrealized;
+                }
+            }
+            // Conservative: skip securities without a market price
+        }
+        total
+    }
+
     #[test]
     fn new_engine_starts_clean() {
         let engine = make_engine();
@@ -1177,17 +1265,28 @@ mod tests {
             .nth(1)
             .and_then(|s| s.split("\n    ///").next())
             .expect("total_unrealized_pnl must exist");
+        // Audit PR18 (2026-10-11): the reader went from O(open) to O(1). It
+        // must return the running total and iterate nothing at all; the
+        // walk lives only in the test module (`unrealized_by_walk`).
         assert!(
-            unrealized.contains("for key in &self.non_flat"),
-            "total_unrealized_pnl must iterate the non_flat INDEX. It sits on \
-             the order decision path via check_order -> daily_loss_state, so \
-             iterating `positions` makes every order slower as the day's closed \
-             round trips accumulate. Found:\n{unrealized}"
+            unrealized.contains("self.unrealized_total"),
+            "total_unrealized_pnl must return the running total kept by \
+             refresh_unrealized. It sits on the order decision path via \
+             check_order -> daily_loss_state. Found:\n{unrealized}"
         );
         assert!(
-            !unrealized.contains("&self.positions {")
-                && !unrealized.contains("self.positions.iter"),
-            "total_unrealized_pnl must not walk the whole map:\n{unrealized}"
+            !unrealized.contains("for ")
+                && !unrealized.contains(".iter")
+                && !unrealized.contains(".values"),
+            "total_unrealized_pnl must not walk any map:\n{unrealized}"
+        );
+        let refresh_calls = production.matches("self.refresh_unrealized(key)").count();
+        assert_eq!(
+            refresh_calls, 2,
+            "the running total is moved at exactly the two places an input to \
+             unrealized_at changes: record_fill_in_segment (the row) and \
+             update_market_price_in_segment (the mark). A third mutation site \
+             of positions or market_prices must call it too."
         );
 
         let count = production
@@ -1225,6 +1324,91 @@ mod tests {
         // And the number itself is unchanged by the optimisation: 4 lots,
         // lot_size 1, 50 -> 60.
         assert!((engine.total_unrealized_pnl() - 40.0).abs() < 1e-9);
+    }
+
+    fn assert_running_total_matches_walk(engine: &RiskEngine, context: &str) {
+        let running = engine.total_unrealized_pnl();
+        let walked = unrealized_by_walk(engine);
+        assert!(
+            (running - walked).abs() <= 1e-6 * walked.abs().max(1.0),
+            "{context}: running unrealized total {running} drifted from the walk {walked}"
+        );
+        assert!(
+            engine
+                .unrealized_by_key
+                .keys()
+                .all(|key| engine.non_flat.contains(key)),
+            "{context}: a contribution is held for a key that is not open"
+        );
+    }
+
+    #[test]
+    fn running_unrealized_total_follows_fills_marks_closes_and_reset() {
+        let mut engine = make_engine();
+        let nse = ExchangeSegment::NseFno;
+        let idx = ExchangeSegment::IdxI;
+        // No mark yet: conservative zero.
+        engine.record_fill_in_segment(7, nse, 2, 100.0, 25);
+        assert_eq!(engine.total_unrealized_pnl(), 0.0);
+        // Mark arrives: (110 - 100) * 2 * 25 = 500.
+        engine.update_market_price_in_segment(7, nse, 110.0);
+        assert!((engine.total_unrealized_pnl() - 500.0).abs() < 1e-9);
+        // Same id, other segment, short 1 lot at 50 marked 40: +10.
+        engine.record_fill_in_segment(7, idx, -1, 50.0, 1);
+        engine.update_market_price_in_segment(7, idx, 40.0);
+        assert!((engine.total_unrealized_pnl() - 510.0).abs() < 1e-9);
+        // A mark for an instrument we do not hold changes nothing.
+        engine.update_market_price_in_segment(8, nse, 999.0);
+        assert!((engine.total_unrealized_pnl() - 510.0).abs() < 1e-9);
+        // A refused mark keeps the last good one.
+        engine.update_market_price_in_segment(7, nse, f64::NAN);
+        assert!((engine.total_unrealized_pnl() - 510.0).abs() < 1e-9);
+        // Closing the NSE_FNO leg removes its contribution.
+        engine.record_fill_in_segment(7, nse, -2, 110.0, 25);
+        assert!((engine.total_unrealized_pnl() - 10.0).abs() < 1e-9);
+        // Closing the last leg leaves exactly zero, not rounding residue.
+        engine.record_fill_in_segment(7, idx, 1, 40.0, 1);
+        assert_eq!(engine.total_unrealized_pnl(), 0.0);
+        assert!(engine.unrealized_by_key.is_empty());
+        // An absurd but finite mark overflows the product: skipped, as the
+        // walk skipped it.
+        engine.record_fill_in_segment(9, nse, 1, 100.0, 1_000_000);
+        engine.update_market_price_in_segment(9, nse, 1e307);
+        assert_eq!(engine.total_unrealized_pnl(), 0.0);
+        assert_running_total_matches_walk(&engine, "after an overflowing mark");
+        // Reset clears the total and the per-key contributions.
+        engine.update_market_price_in_segment(9, nse, 101.0);
+        assert!(engine.total_unrealized_pnl() > 0.0);
+        engine.reset_daily();
+        assert_eq!(engine.total_unrealized_pnl(), 0.0);
+        assert!(engine.unrealized_by_key.is_empty());
+    }
+
+    proptest::proptest! {
+        /// The running total equals the full walk after every fill, mark and
+        /// reset in a random sequence over a few ids in two segments, so the
+        /// O(1) read is the same number the O(open) walk gave the halt.
+        #[test]
+        fn running_unrealized_total_equals_the_walk_after_every_step(
+            ops in proptest::collection::vec(
+                (0_u8..10, 0_u64..4, proptest::bool::ANY, -5_i32..=5, 1_u32..500_000, 1_u32..100),
+                1..200,
+            )
+        ) {
+            let mut engine = make_engine();
+            for (step, (kind, sid, in_index, lots, price_paise, lot_size)) in
+                ops.into_iter().enumerate()
+            {
+                let segment = if in_index { ExchangeSegment::IdxI } else { ExchangeSegment::NseFno };
+                let price = f64::from(price_paise) / 100.0;
+                match kind {
+                    0..=4 => engine.record_fill_in_segment(sid, segment, lots, price, lot_size),
+                    5..=8 => engine.update_market_price_in_segment(sid, segment, price),
+                    _ => engine.reset_daily(),
+                }
+                assert_running_total_matches_walk(&engine, &format!("step {step}"));
+            }
+        }
     }
 
     #[test]
