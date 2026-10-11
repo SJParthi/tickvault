@@ -1741,6 +1741,13 @@ pub struct LiveIngest {
     /// backlog the biased select starves those timers, and the reading is then
     /// the latest frame's arrival, still our own clock.
     top_volume_wall_secs: u32,
+    /// `true` while the candle clock runs ahead of the wall clock and the
+    /// close clock caps it (plan row 101, PR24): the counter and the warn
+    /// fire once on the rising edge, and this clears when the lead is gone.
+    top_volume_watermark_capped: bool,
+    /// Episodes counted so far; the counter below carries the same number.
+    top_volume_watermark_capped_episodes: u64,
+    top_volume_watermark_capped_counter: metrics::Counter,
     /// The catch-up seal sweep in progress, if any (audit PR4b, 2026-09-26).
     /// The 5 s timer arm only sets this; the drain's idle arm advances it
     /// [`CATCHUP_SEAL_STEP_SLOTS`] slots at a time.
@@ -2193,9 +2200,48 @@ impl LiveIngest {
 
     /// Checks every cadence against the stored clocks. O(1).
     fn close_top_volume_windows(&mut self) {
+        self.note_top_volume_watermark_cap();
         for cadence in tickvault_storage::top_volume_rank_persistence::SnapshotCadence::ALL {
             self.close_top_volume_window(cadence);
         }
+    }
+
+    /// Counts an episode of the candle clock running ahead of the wall clock
+    /// (plan row 101, PR24). While it does, the close clock caps the candle
+    /// clock at the wall, so every window closes by OUR clock and a contract
+    /// still trading by the exchange's clock can be left off its board. One
+    /// count and one coded `warn!` on the rising edge; nothing per frame
+    /// after that, and the latch clears once the lead is gone.
+    ///
+    /// # Complexity
+    /// O(1), no allocation: two subtractions, one compare, one bool.
+    fn note_top_volume_watermark_cap(&mut self) {
+        if self.top_volume_wall_secs == 0 {
+            return;
+        }
+        let lead_secs = crate::top_volume_sweep::watermark_lead_over_wall_secs(
+            self.aggregator.watermark_secs(),
+            self.top_volume_wall_secs,
+        );
+        if lead_secs == 0 {
+            self.top_volume_watermark_capped = false;
+            return;
+        }
+        if self.top_volume_watermark_capped {
+            return;
+        }
+        self.top_volume_watermark_capped = true;
+        self.top_volume_watermark_capped_episodes =
+            self.top_volume_watermark_capped_episodes.saturating_add(1);
+        self.top_volume_watermark_capped_counter.increment(1);
+        warn!(
+            code = ErrorCode::WsGapConnectionState.code_str(),
+            source = "top_volume_watermark_ahead_of_wall",
+            lead_secs,
+            "Dhan feed: the candle clock is {lead_secs} s ahead of this box's clock; \
+             top-volume windows now close by this box's clock, so a contract still \
+             trading by the exchange's clock can be left off a board"
+        );
     }
 
     /// Stores a wall-clock reading, whole IST seconds, for the close clock.
@@ -2909,6 +2955,11 @@ impl LiveIngest {
             ),
             top_volume_close_clock: crate::top_volume_sweep::WindowCloseClock::new(),
             top_volume_wall_secs: 0,
+            top_volume_watermark_capped: false,
+            top_volume_watermark_capped_episodes: 0,
+            top_volume_watermark_capped_counter: metrics::counter!(
+                crate::top_volume_sweep::TOP_VOLUME_WATERMARK_CAPPED_COUNTER
+            ),
             catch_up: None,
             catch_up_overruns: 0,
             catch_up_overrun_counter: metrics::counter!(CATCHUP_SEAL_OVERRUN_COUNTER),
@@ -31341,6 +31392,45 @@ mod depth_rebalance_wiring_tests {
             assert!(closes < 64, "the clock must catch up");
         }
         assert!(closes >= 1, "the windows up to the wall did close");
+    }
+
+    /// Plan row 101 (PR24): a candle clock ahead of the wall is capped at the
+    /// wall, and that is counted once per episode, not once per frame.
+    #[test]
+    fn test_note_top_volume_watermark_cap_counts_each_episode_once() {
+        use crate::top_volume_sweep::WINDOW_CLOSE_LATENESS_SECS;
+        let _serial = lock_published_views();
+        let s0 = FIXTURE_TRADE_SECS;
+        let nanos = |secs: u32| i64::from(secs) * 1_000_000_000;
+        let mut ingest = ranking_ingest(true);
+
+        // No wall reading yet: nothing is judged, even with a skewed tick.
+        trade_fixture_contract(&mut ingest, s0 + 2, 5_100, 2);
+        ingest.poll_top_volume_window_closes_by_candles(-1);
+        assert_eq!(ingest.top_volume_watermark_capped_episodes, 0);
+
+        // The candle clock less the lateness margin sits exactly at the wall:
+        // not ahead, no episode.
+        ingest.poll_top_volume_window_closes_by_candles(nanos(s0 + 2 - WINDOW_CLOSE_LATENESS_SECS));
+        assert!(!ingest.top_volume_watermark_capped);
+        assert_eq!(ingest.top_volume_watermark_capped_episodes, 0);
+
+        // A future-dated print: one episode, however many frames follow.
+        trade_fixture_contract(&mut ingest, s0 + 500, 5_200, 3);
+        for _ in 0..10 {
+            ingest.poll_top_volume_window_closes_by_candles(nanos(s0 + 3));
+            let _ = run_queued_sweeps(&mut ingest);
+        }
+        assert!(ingest.top_volume_watermark_capped);
+        assert_eq!(ingest.top_volume_watermark_capped_episodes, 1);
+
+        // The wall catches up: the latch clears, and a fresh lead is a new
+        // episode.
+        ingest.poll_top_volume_window_closes_by_candles(nanos(s0 + 500));
+        assert!(!ingest.top_volume_watermark_capped);
+        trade_fixture_contract(&mut ingest, s0 + 900, 5_300, 4);
+        ingest.poll_top_volume_window_closes_by_candles(nanos(s0 + 501));
+        assert_eq!(ingest.top_volume_watermark_capped_episodes, 2);
     }
 
     /// Review of audit PR4c-2: a contract that trades every second seals its
