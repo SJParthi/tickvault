@@ -4753,6 +4753,34 @@ pub struct ConnectionSupervisor {
     auth_reject_refreshes: [Option<Instant>; AUTH_REJECT_MAX_REFRESHES_PER_WINDOW],
     /// Next write position in [`Self::auth_reject_refreshes`].
     auth_reject_cursor: u8,
+    /// Whether this supervisor reads the pool activity register for sibling
+    /// evidence. `Off` by default; the live lane opts in.
+    silence_evidence: SiblingEvidence,
+    /// What the evidence fast paths do (off, shadow count, act).
+    fast_path: FrameSilenceFastPath,
+    /// Instruments the current socket holds, for the confirmed-path floor.
+    held_instruments: u32,
+    /// Silence redials since the strikes last reset; escalates the
+    /// confirmed threshold.
+    silence_strikes: u8,
+    /// When this socket last took a silence redial.
+    last_silence_redial_at: Option<Instant>,
+    /// Basis of the most recent silence redial (audit and tests).
+    last_silence_basis: SilenceBasis,
+    /// Basis the NEXT `FrameSilenceElapsed` records; consumed by that arm.
+    next_silence_basis: SilenceBasis,
+    /// Shadow mode: whether this silence episode already counted a would-be
+    /// redial. Cleared by the next frame.
+    would_redial_latched: bool,
+    /// Shadow-mode would-be redials counted on this supervisor.
+    would_redials: u64,
+    /// When this socket next publishes its last-frame wall time.
+    next_activity_publish_at: Instant,
+    /// Whether the confirmed window was open at the last poll; a false to
+    /// true edge resets the gap peak.
+    gap_window_open: bool,
+    /// The largest frame gap seen inside the confirmed window, ms.
+    gap_peak_ms: u64,
 }
 
 impl ConnectionSupervisor {
@@ -4782,6 +4810,18 @@ impl ConnectionSupervisor {
             auth_reject: None,
             auth_reject_refreshes: [None; AUTH_REJECT_MAX_REFRESHES_PER_WINDOW],
             auth_reject_cursor: 0,
+            silence_evidence: SiblingEvidence::Off,
+            fast_path: FrameSilenceFastPath::Shadow,
+            held_instruments: 0,
+            silence_strikes: 0,
+            last_silence_redial_at: None,
+            last_silence_basis: SilenceBasis::Unconfirmed,
+            next_silence_basis: SilenceBasis::Unconfirmed,
+            would_redial_latched: false,
+            would_redials: 0,
+            next_activity_publish_at: now,
+            gap_window_open: false,
+            gap_peak_ms: 0,
         }
     }
 

@@ -116,7 +116,7 @@ const SHELL_OPS_FILES: &[(&str, usize)] = &[
     ("scripts/aws-one-shot-bootstrap.sh", 323),
     ("scripts/aws-seed-ssm-parameters.sh", 250),
     ("scripts/aws-upgrade-instance.sh", 542),
-    ("scripts/bench-gate.selftest.sh", 212),
+    ("scripts/bench-gate.selftest.sh", 208),
     ("scripts/bench-gate.sh", 440),
     ("scripts/bootstrap.sh", 323),
     ("scripts/claude-session-bootstrap.sh", 199),
