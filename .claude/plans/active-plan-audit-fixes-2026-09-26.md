@@ -2148,6 +2148,11 @@ Rows folded into existing items (the fix is named here so the item carries it):
 - PR24: row 121 (cap the spot store's held time at the wall clock); row 101 (c6#101, count
   contracts pushed off the 1 s board by broker clock skew, and tie the close to the measured
   skew; the board half goes with the PR4c follow-ups).
+  *(2026-10-11: row 101 counter half DONE: `tv_top_volume_watermark_capped_total`, one count and
+  one coded `warn!` per episode of the candle clock running ahead of the wall
+  (`dhan_feed_stack.rs::note_top_volume_watermark_cap`, test
+  `test_note_top_volume_watermark_cap_counts_each_episode_once`). Tying the close to the measured
+  skew stays open, as do the WAL watermark cap and the archive applied-gate above.)*
 - PR32: row 169 (c6#150, split a refused batch so only the bad row is quarantined); row 176
   (c6#157, order spill files by sequence, not by name).
 - PR31c: rows 172 (c6#153, top-volume boards get the spill tier during a DB outage), 193 (count
