@@ -2268,7 +2268,7 @@ impl DepthWriter {
             self.buffer.as_bytes(),
             spill_version_of(self.buffer.protocol_version()),
             rows,
-            crate::wal_applied_watermark::rescue_failure_fate(range.0, unbacked),
+            crate::wal_applied_watermark::rescue_failure_fate(range.0, range.1, unbacked),
         );
         note_rescue_outcome_depth(landed, range, false);
         if landed {
@@ -2447,7 +2447,11 @@ impl DepthWriter {
             batch.buffer.as_bytes(),
             spill_version_of(batch.buffer.protocol_version()),
             batch.rows,
-            crate::wal_applied_watermark::rescue_failure_fate(batch.min_seq, batch.unbacked),
+            crate::wal_applied_watermark::rescue_failure_fate(
+                batch.min_seq,
+                batch.max_seq,
+                batch.unbacked,
+            ),
         );
         note_rescue_outcome_depth(landed, (batch.min_seq, batch.max_seq), false);
         let wm = crate::wal_applied_watermark::applied_watermark();
@@ -2516,7 +2520,8 @@ impl DepthWriter {
             rows,
             min_seq,
             max_seq,
-            // Copied, not taken: the flag stays set for the rows still pending.
+            // Copied, not taken: on a full queue the rows come back and the
+            // flag stays with them; the Sent arm below clears it.
             unbacked: self.pending_unbacked,
         };
         let Some(tx) = self.offload.as_ref() else {
@@ -2531,6 +2536,9 @@ impl DepthWriter {
             Ok(()) => {
                 self.pending = 0;
                 self.retained_spans = 0;
+                // The batch carries the mark now; nothing pending is unbacked
+                // (review of G4-audit, 2026-10-11).
+                self.pending_unbacked = false;
                 crate::wal_applied_watermark::applied_watermark().note_depth_handed_off();
                 self.flush_counters.offloaded.increment(1);
                 // Only NOW, after the send succeeded: on the Full arm below the
@@ -2717,6 +2725,9 @@ impl DepthWriter {
         match outcome {
             Ok(()) => {
                 self.pending = 0;
+                // Every pending row landed, so the unbacked mark goes with them
+                // (review of G4-audit, 2026-10-11) — see the tick writer's twin.
+                self.pending_unbacked = false;
                 // The synchronous arm acks the watermark itself — see the tick
                 // writer's twin for why.
                 let (_, max_seq) = self.take_pending_range();
@@ -2938,7 +2949,11 @@ impl DepthRescueSink {
             batch.rows,
             self.spill_min_free_headroom,
             self.spill_sync,
-            crate::wal_applied_watermark::rescue_failure_fate(batch.min_seq, batch.unbacked),
+            crate::wal_applied_watermark::rescue_failure_fate(
+                batch.min_seq,
+                batch.max_seq,
+                batch.unbacked,
+            ),
         );
         note_rescue_outcome_depth(landed, (batch.min_seq, batch.max_seq), false);
         let wm = crate::wal_applied_watermark::applied_watermark();
@@ -3045,8 +3060,12 @@ fn perform_depth_rescue(
                 spill_error = %err,
                 "market_depth flush failed AND the depth spill rescue also failed — \
                  these levels are in neither QuestDB nor the spill. \
-                 fate=deferred_to_wal_replay means their capture-sequence range is \
-                 marked unapplied and the next boot's WAL replay re-inserts them; \
+                 fate=deferred_to_wal_replay means the WAL writer had already flushed \
+                 their frames to the kernel, so the next boot's replay re-inserts them \
+                 unless the host crashes before the device sync; \
+                 fate=deferred_if_wal_flushes means they are re-inserted only if the WAL \
+                 writer flushes those frames (a rise in \
+                 tv_ws_frame_spill_unflushed_lost_total means some were not); \
                  fate=lost means no write-ahead-log record backs them and they are gone."
             );
             false
@@ -3473,6 +3492,7 @@ impl DepthWriterSink {
                     reason = why,
                     fate = crate::wal_applied_watermark::rescue_failure_fate(
                         batch.min_seq,
+                        batch.max_seq,
                         batch.unbacked,
                     ),
                     min_seq = batch.min_seq,
@@ -3482,8 +3502,12 @@ impl DepthWriterSink {
                     spill_error = %err,
                     "offloaded market_depth flush failed AND the depth spill rescue also \
                      failed — these levels are in neither QuestDB nor the spill. \
-                     fate=deferred_to_wal_replay means their capture-sequence range is \
-                     marked unapplied and the next boot's WAL replay re-inserts them; \
+                     fate=deferred_to_wal_replay means the WAL writer had already flushed \
+                     their frames to the kernel, so the next boot's replay re-inserts \
+                     them unless the host crashes before the device sync; \
+                     fate=deferred_if_wal_flushes means they are re-inserted only if the \
+                     WAL writer flushes those frames (a rise in \
+                     tv_ws_frame_spill_unflushed_lost_total means some were not); \
                      fate=lost means no write-ahead-log record backs them and they are gone."
                 );
             }
@@ -4943,6 +4967,28 @@ mod tests {
         assert_eq!(w.pending(), 0, "the rows left the producer");
         let batch = rx.try_recv().expect("the batch must be on the queue");
         assert_eq!(batch.rows(), 1, "and it must carry the row count");
+    }
+
+    #[test]
+    fn a_sent_depth_batch_takes_the_unbacked_mark_with_it() {
+        // Review of G4-audit (2026-10-11): the mark was copied into the batch
+        // and never cleared, so after ONE unbacked frame every later batch
+        // read as unbacked and its rescue failure was reported as lost.
+        let (mut w, _sink, rx) = DepthWriter::for_test(Feed::Dhan).split_for_offload();
+        w.append_row(&row()).expect("append");
+        w.mark_pending_unbacked();
+        w.flush().expect("hand-off");
+        let first = rx.try_recv().expect("first batch");
+        assert!(first.unbacked, "the marked batch carries the mark");
+        assert!(!w.pending_unbacked(), "the Sent arm clears the mark");
+
+        w.append_row(&row()).expect("append");
+        w.flush().expect("hand-off");
+        let second = rx.try_recv().expect("second batch");
+        assert!(
+            !second.unbacked,
+            "a later, fully sequenced batch must read as backed"
+        );
     }
 
     #[test]

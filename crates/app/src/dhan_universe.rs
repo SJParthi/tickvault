@@ -1092,8 +1092,6 @@ async fn build_once(date: &str, questdb: &QuestDbConfig) -> anyhow::Result<JoinO
     // Everything here is unchanged except WHEN it runs.
     let today_ymd = crate::dhan_feed_stack::ymd_from_ist_date(date);
     let today_nanos = ist_midnight_nanos(date);
-    // Seeded at 0 so the first failure is a step from a known baseline.
-    metrics::counter!("tv_instrument_lifecycle_persist_failed_total").increment(0);
     match crate::dhan_lifecycle::write_dhan_lifecycle(questdb, &master, today_ymd, today_nanos, "")
         .await
     {
@@ -1111,11 +1109,13 @@ async fn build_once(date: &str, questdb: &QuestDbConfig) -> anyhow::Result<JoinO
                 code = tickvault_common::error_code::ErrorCode::StorageGap03AuditWriteFailed
                     .code_str(),
                 source = "lifecycle_persist_failed",
-                %err,
+                ?err,
                 date,
-                "instrument lifecycle could NOT be written — nothing was deleted (the table is \
-                 append-and-upsert only), but today's expiry marks are missing, so a query \
-                 asking which instruments were tradeable today will read yesterday's answer."
+                "instrument lifecycle write did not fully land — nothing was deleted (the table \
+                 is append-and-upsert only). Rows that did not land keep yesterday's state, so \
+                 a query asking which instruments were tradeable today reads yesterday's answer \
+                 for them; rows held back because their audit transition was not written are \
+                 recorded by the next run. The error carries the counts."
             );
         }
     }
@@ -1157,6 +1157,12 @@ async fn build_once(date: &str, questdb: &QuestDbConfig) -> anyhow::Result<JoinO
 /// persistent failure means the SEBI point-in-time history is developing a
 /// hole, which is worth waking someone for — just not worth discarding good
 /// work over.
+///
+/// **⚠ CORRECTED 2026-10-11 (review of QDB-2).** "The row lands then" is
+/// false: each row is stamped with its own trading date, so tomorrow's write
+/// lands tomorrow's row and today's stays missing. What narrows the hole is
+/// the writer's 10 s retry on a transport failure or a 5xx answer
+/// (`sebi_master_ilp_http_conf`); a failure past that is a missing day.
 async fn persist_constituents(questdb: &QuestDbConfig, date: &str, outcome: &JoinOutcome) {
     if outcome.resolved.is_empty() {
         // Unreachable while the tolerance gate stands (an empty join reports
@@ -1166,8 +1172,6 @@ async fn persist_constituents(questdb: &QuestDbConfig, date: &str, outcome: &Joi
         warn!("no resolved constituents to persist — skipping (this should be unreachable)");
         return;
     }
-    // Seeded at 0 so the first failure is a step from a known baseline.
-    metrics::counter!("tv_index_constituency_persist_failed_total").increment(0);
 
     tickvault_storage::index_constituency_persistence::ensure_index_constituency_table(questdb)
         .await;
@@ -1844,9 +1848,16 @@ mod tests {
                 arm.contains(&format!("counter!(\"{counter}\").increment(1)")),
                 "{arm}"
             );
+            // Seeded at boot after the recorder install (review of OBS-2,
+            // 2026-10-11): a seed milliseconds before the write that may fail
+            // is a series no scrape ever sees at 0.
             assert!(
-                prod.contains(&format!("counter!(\"{counter}\").increment(0)")),
-                "{counter} must be seeded at 0"
+                include_str!("main.rs").contains(&format!("counter!(\"{counter}\").increment(0)")),
+                "{counter} must be seeded at 0 at boot"
+            );
+            assert!(
+                !prod.contains(&format!("counter!(\"{counter}\").increment(0)")),
+                "{counter} must not be seeded right before its write"
             );
         }
     }

@@ -903,6 +903,47 @@ mod tests {
                 );
             }
         });
+        // Review of QDB-2 (2026-10-11): the ILP TCP port is a live listener
+        // that reads and discards. With `ilp_port: 1` a writer gone back to
+        // TCP failed to connect and passed this test for the wrong reason;
+        // against this drain it would flush Ok, so only the HTTP 400 can
+        // make the result Err.
+        let drain = std::net::TcpListener::bind("127.0.0.1:0").expect("bind drain");
+        let drain_port = drain.local_addr().expect("drain addr").port();
+        std::thread::spawn(move || {
+            for stream in drain.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 65_536];
+                    while matches!(stream.read(&mut buf), Ok(n) if n > 0) {}
+                });
+            }
+        });
+        let cfg = QuestDbConfig {
+            host: "127.0.0.1".to_owned(),
+            http_port: port,
+            pg_port: 1,
+            ilp_port: drain_port,
+        };
+        let res = append_index_constituency_rows(&cfg, &[sample_row()]).await;
+        assert!(res.is_err(), "a refused constituency chunk must be Err");
+    }
+
+    /// The acknowledged case: an HTTP 204 must return Ok, so the refused
+    /// case above is the server's answer and not a broken writer.
+    #[tokio::test]
+    async fn test_append_index_constituency_rows_acknowledged_chunk_is_ok() {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 65_536];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
+            }
+        });
         let cfg = QuestDbConfig {
             host: "127.0.0.1".to_owned(),
             http_port: port,
@@ -910,7 +951,10 @@ mod tests {
             ilp_port: 1,
         };
         let res = append_index_constituency_rows(&cfg, &[sample_row()]).await;
-        assert!(res.is_err(), "a refused constituency chunk must be Err");
+        assert!(
+            res.is_ok(),
+            "an acknowledged constituency chunk must be Ok: {res:?}"
+        );
     }
 
     #[test]

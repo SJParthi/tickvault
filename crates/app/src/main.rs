@@ -1763,6 +1763,13 @@ async fn async_main() -> Result<()> {
     metrics::counter!("tv_seal_unwritten_mark_errors_total").increment(0);
     metrics::counter!("tv_wal_deferred_depth_persist_failed_total").increment(0);
     metrics::counter!("tv_wal_applied_watermark_persist_failed_total").increment(0);
+    // SEBI lifecycle / constituency write failures (audit OBS-2, 2026-10-11).
+    // Seeded here, after the recorder install, so a scrape records 0 before
+    // the once-a-day write that may fail. Local /metrics only: no alarm reads
+    // them yet (that needs a dated loss-group row).
+    metrics::counter!("tv_instrument_lifecycle_persist_failed_total").increment(0);
+    metrics::counter!("tv_instrument_lifecycle_audit_failed_total").increment(0);
+    metrics::counter!("tv_index_constituency_persist_failed_total").increment(0);
     for reason in ["too_large", "unparseable_order"] {
         metrics::counter!("tv_order_update_frames_dropped_total", "reason" => reason).increment(0);
     }

@@ -2756,6 +2756,11 @@ impl TickWriter {
         match flushed {
             Some(Ok(())) => {
                 self.pending = 0;
+                // Every pending row landed, so the unbacked mark goes with them
+                // (review of G4-audit, 2026-10-11). Left set, it read every
+                // LATER batch as unbacked and reported its rescue failure as
+                // lost although the WAL backs it.
+                self.pending_unbacked = false;
                 // The synchronous arm (offload not wired, or its spawn failed)
                 // acks the watermark itself; otherwise a lane on this path
                 // would never skip a replayed frame.
@@ -2987,7 +2992,11 @@ impl TickWriter {
     /// the disk on the drain (thread gone). Completes it exactly as the rescue
     /// thread would: outcome, floor, completion count.
     fn spill_parked_on_drain(&self, batch: RescueBatch) {
-        let fate = crate::wal_applied_watermark::rescue_failure_fate(batch.min_seq, batch.unbacked);
+        let fate = crate::wal_applied_watermark::rescue_failure_fate(
+            batch.min_seq,
+            batch.max_seq,
+            batch.unbacked,
+        );
         let landed = self.spill_on_drain(batch.buffer.as_bytes(), batch.rows, fate);
         note_rescue_outcome_ticks(landed, (batch.min_seq, batch.max_seq), false);
         let wm = crate::wal_applied_watermark::applied_watermark();
@@ -3032,7 +3041,8 @@ impl TickWriter {
             rows,
             min_seq,
             max_seq,
-            // Copied, not taken: the flag stays set for the rows still pending.
+            // Copied, not taken: on a full queue the rows come back and the
+            // flag stays with them; the Sent arm below clears it.
             unbacked: self.pending_unbacked,
         };
         let Some(tx) = self.offload.as_ref() else {
@@ -3047,6 +3057,9 @@ impl TickWriter {
             Ok(()) => {
                 self.pending = 0;
                 self.retained_spans = 0;
+                // The batch carries the mark now; nothing pending is unbacked
+                // (review of G4-audit, 2026-10-11).
+                self.pending_unbacked = false;
                 crate::wal_applied_watermark::applied_watermark().note_ticks_handed_off();
                 self.flush_counters.offloaded.increment(1);
                 // Only NOW take a recycled spare: taking it before the send
@@ -3288,7 +3301,7 @@ impl TickWriter {
 
         // Past the park's bound, a gone thread, or no rescue split at all:
         // the drain's inline spill, NOT synced (see `spill_on_drain`).
-        let fate = crate::wal_applied_watermark::rescue_failure_fate(range.0, unbacked);
+        let fate = crate::wal_applied_watermark::rescue_failure_fate(range.0, range.1, unbacked);
         let landed = self.spill_on_drain(self.buffer.as_bytes(), dropped, fate);
         note_rescue_outcome_ticks(landed, range, false);
         self.buffer.clear();
@@ -3391,10 +3404,13 @@ fn perform_tick_rescue(
                 fate,
                 spill_error = %err,
                 "tick flush failed AND the spill rescue also failed — these ticks are in \
-                 neither QuestDB nor the spill. fate=deferred_to_wal_replay means their \
-                 capture-sequence range is marked unapplied and the next boot's WAL \
-                 replay re-inserts them; fate=lost means no write-ahead-log record \
-                 backs them and they are gone."
+                 neither QuestDB nor the spill. fate=deferred_to_wal_replay means the WAL \
+                 writer had already flushed their frames to the kernel, so the next \
+                 boot's replay re-inserts them unless the host crashes before the device \
+                 sync; fate=deferred_if_wal_flushes means they are re-inserted only if \
+                 the WAL writer flushes those frames (a rise in \
+                 tv_ws_frame_spill_unflushed_lost_total means some were not); fate=lost \
+                 means no write-ahead-log record backs them and they are gone."
             );
             false
         }
@@ -3523,7 +3539,11 @@ impl TickRescueSink {
             self.feed,
             batch.rows,
             self.spill_sync,
-            crate::wal_applied_watermark::rescue_failure_fate(batch.min_seq, batch.unbacked),
+            crate::wal_applied_watermark::rescue_failure_fate(
+                batch.min_seq,
+                batch.max_seq,
+                batch.unbacked,
+            ),
         );
         note_rescue_outcome_ticks(landed, (batch.min_seq, batch.max_seq), false);
         let wm = crate::wal_applied_watermark::applied_watermark();
@@ -3953,6 +3973,7 @@ impl TickWriterSink {
                     reason = why,
                     fate = crate::wal_applied_watermark::rescue_failure_fate(
                         batch.min_seq,
+                        batch.max_seq,
                         batch.unbacked,
                     ),
                     min_seq = batch.min_seq,
@@ -3960,9 +3981,12 @@ impl TickWriterSink {
                     spill_error = %err,
                     "offloaded tick flush failed AND the spill rescue also failed — these \
                      ticks are in neither QuestDB nor the spill. fate=deferred_to_wal_replay \
-                     means their capture-sequence range is marked unapplied and the next \
-                     boot's WAL replay re-inserts them; fate=lost means no write-ahead-log \
-                     record backs them and they are gone."
+                     means the WAL writer had already flushed their frames to the kernel, \
+                     so the next boot's replay re-inserts them unless the host crashes \
+                     before the device sync; fate=deferred_if_wal_flushes means they are \
+                     re-inserted only if the WAL writer flushes those frames (a rise in \
+                     tv_ws_frame_spill_unflushed_lost_total means some were not); \
+                     fate=lost means no write-ahead-log record backs them and they are gone."
                 );
             }
         }
@@ -3979,26 +4003,54 @@ impl TickWriterSink {
 mod tests {
     // ---- Audit DB-8 (2026-10-11): a failed rescue names its real fate ----
 
+    /// A row's sequence: frame base `b`, packet index `i`.
+    fn row_seq(b: u64, i: u64) -> u64 {
+        (b << crate::ws_frame_spill::PACKET_INDEX_BITS) | i
+    }
+
     #[test]
-    fn test_rescue_failure_fate_backed_range_is_deferred() {
+    fn test_rescue_failure_fate_flushed_backed_range_is_deferred() {
+        use crate::wal_applied_watermark::rescue_failure_fate_at;
+        // The WAL flushed through frame 10; the batch ends at frame 10,
+        // packet 3 (same frame, later packet).
         assert_eq!(
-            crate::wal_applied_watermark::rescue_failure_fate(5, false),
+            rescue_failure_fate_at(row_seq(5, 0), row_seq(10, 3), false, row_seq(10, 0)),
             "deferred_to_wal_replay"
+        );
+    }
+
+    /// Review of DB-8 (2026-10-11): a backed range the WAL writer has not
+    /// flushed yet is not promised back; the WAL can still lose it.
+    #[test]
+    fn test_rescue_failure_fate_unflushed_backed_range_is_conditional() {
+        use crate::wal_applied_watermark::rescue_failure_fate_at;
+        assert_eq!(
+            rescue_failure_fate_at(row_seq(5, 0), row_seq(11, 0), false, row_seq(10, 0)),
+            "deferred_if_wal_flushes"
+        );
+        assert_eq!(
+            rescue_failure_fate_at(row_seq(5, 0), row_seq(6, 0), false, 0),
+            "deferred_if_wal_flushes",
+            "nothing flushed yet"
+        );
+        // The production wrapper reads the live mark and agrees with the pure
+        // form for a range far above anything flushed in this process.
+        assert_eq!(
+            crate::wal_applied_watermark::rescue_failure_fate(1, u64::MAX, false),
+            "deferred_if_wal_flushes"
         );
     }
 
     #[test]
     fn test_rescue_failure_fate_unsequenced_or_unbacked_is_lost() {
+        use crate::wal_applied_watermark::rescue_failure_fate_at;
+        for flushed in [0, u64::MAX] {
+            assert_eq!(rescue_failure_fate_at(0, 0, false, flushed), "lost");
+            assert_eq!(rescue_failure_fate_at(5, 5, true, flushed), "lost");
+            assert_eq!(rescue_failure_fate_at(0, 5, true, flushed), "lost");
+        }
         assert_eq!(
-            crate::wal_applied_watermark::rescue_failure_fate(0, false),
-            "lost"
-        );
-        assert_eq!(
-            crate::wal_applied_watermark::rescue_failure_fate(5, true),
-            "lost"
-        );
-        assert_eq!(
-            crate::wal_applied_watermark::rescue_failure_fate(0, true),
+            crate::wal_applied_watermark::rescue_failure_fate(0, 0, false),
             "lost"
         );
     }
@@ -5604,6 +5656,34 @@ mod tests {
         );
         let batch = rx.try_recv().expect("the batch must be on the queue");
         assert_eq!(batch.rows(), 2, "the batch carries the row count verbatim");
+    }
+
+    #[test]
+    fn a_sent_batch_takes_the_unbacked_mark_with_it() {
+        // Review of G4-audit (2026-10-11): the mark was copied into the batch
+        // and never cleared, so after ONE unbacked frame every later batch
+        // read as unbacked and its rescue failure was reported as lost.
+        let mut w = TickWriter::for_test(Feed::Dhan);
+        w.append_tick_with_seq(&sample_tick(), 1).expect("append");
+        let (mut producer, _sink, rx) = w.split_for_offload();
+        producer.mark_pending_unbacked();
+        producer.flush().expect("offloaded flush");
+        let first = rx.try_recv().expect("first batch");
+        assert!(first.unbacked, "the marked batch carries the mark");
+        assert!(
+            !producer.pending_unbacked(),
+            "the Sent arm clears the producer's mark"
+        );
+
+        producer
+            .append_tick_with_seq(&sample_tick(), 2)
+            .expect("append");
+        producer.flush().expect("offloaded flush");
+        let second = rx.try_recv().expect("second batch");
+        assert!(
+            !second.unbacked,
+            "a later, fully sequenced batch must read as backed"
+        );
     }
 
     #[test]

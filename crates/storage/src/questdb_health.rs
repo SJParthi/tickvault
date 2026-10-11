@@ -118,7 +118,11 @@ impl QuestDbHealthPoller {
     }
 
     /// Has the current down-cycle already fired its halt alert?
-    pub const fn halt_alert_fired(&self) -> bool {
+    ///
+    /// Test-only (2026-10-11, review of the halt latch): nothing in
+    /// production reads it; the latch is observed through the verdicts.
+    #[cfg(test)]
+    pub(crate) const fn halt_alert_fired(&self) -> bool {
         self.halt_alert_fired
     }
 

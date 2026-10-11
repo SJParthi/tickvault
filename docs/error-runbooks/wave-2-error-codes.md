@@ -302,6 +302,28 @@ refused fails here instead of being reported as written. The three counters
 are not in any loss-group alarm; adding them is an owner decision that needs
 a dated row in the noise lock first. No page, no new alarm.
 
+**⚠ CORRECTED 2026-10-11 (review of QDB-2, same day).** "The next day's
+write is DEDUP-idempotent and re-writes what did not land" was true of
+`instrument_lifecycle` only:
+
+- `instrument_lifecycle_audit` rows are derived by comparing today's rows
+  with what the table held before. When the lifecycle rows were written
+  first and the audit rows after, a failed audit chunk was lost for good: the
+  next run read the new state and found nothing to record. The writer is now
+  audit-first: a lifecycle row whose audit row did not land is held back, so
+  the table keeps yesterday's state for it and the next run (a restart the
+  same day, or the next day) records the same transition again, stamped with
+  that run's date. A refused lifecycle chunk no longer stops the chunks after
+  it; the pass stops only after 2 failed chunks in a row (a database that is
+  down). `lifecycle_persist_failed` now carries the counts: audit rows not
+  written, lifecycle rows held back, lifecycle rows not written.
+- `index_constituency` is a per-date point-in-time row. Tomorrow's run writes
+  tomorrow's date; today's row stays missing. Nothing re-writes it.
+
+All three writers now retry a transport failure or a 5xx answer for 10 s
+before giving up on a chunk (they shipped with no retry). A 4xx refusal (a
+bad row) is never retried. The counters are seeded at 0 at boot.
+
 ### 2026-09-22 note — the one-shot fresh-start reset emits this code
 
 `crates/storage/src/fresh_start_reset.rs` logs STORAGE-GAP-03 with

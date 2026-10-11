@@ -637,15 +637,25 @@ pub fn applied_watermark() -> &'static AppliedWatermark {
 }
 
 /// `fate` of a tick or depth batch whose spill rescue FAILED, when the batch
-/// carries a capture-sequence range the WAL accepted: the range is marked
-/// unapplied, so the next boot's WAL replay re-inserts it.
+/// carries a capture-sequence range the WAL accepted AND the WAL writer had
+/// already flushed every frame of that range to the kernel: the range is
+/// marked unapplied, so the next boot's WAL replay re-inserts it, unless the
+/// host crashes before the WAL's device sync.
 pub(crate) const RESCUE_FATE_DEFERRED_TO_WAL_REPLAY: &str = "deferred_to_wal_replay";
+
+/// `fate` of a failed spill rescue whose range the WAL accepted but had not
+/// yet flushed when the rescue failed. The range is marked unapplied; the
+/// next boot's replay re-inserts it only if the WAL writer then flushed those
+/// frames. A rise in `tv_ws_frame_spill_unflushed_lost_total` in the same
+/// window means some were not, and those rows are gone.
+pub(crate) const RESCUE_FATE_DEFERRED_IF_WAL_FLUSHES: &str = "deferred_if_wal_flushes";
 
 /// `fate` of a failed spill rescue whose rows no WAL record backs (no capture
 /// sequence, or a frame the WAL refused): they are gone.
 pub(crate) const RESCUE_FATE_LOST: &str = "lost";
 
-/// What happens to rows whose spill rescue failed (audit DB-8, 2026-10-11).
+/// What happens to rows whose spill rescue failed (audit DB-8, 2026-10-11),
+/// judged against the WAL writer's flushed high-water mark now.
 ///
 /// Until this date every failed-rescue log line said the rows "are
 /// permanently lost and nothing re-inserts them". That is false for a batch
@@ -653,12 +663,43 @@ pub(crate) const RESCUE_FATE_LOST: &str = "lost";
 /// unapplied and the next boot's replay re-inserts it. It is true only for
 /// rows with no sequence (`min_seq == 0`) or rows the WAL refused
 /// (`unbacked`). Shared by the tick and depth writers so the two cannot
-/// drift. O(1), no allocation.
-pub(crate) const fn rescue_failure_fate(min_seq: u64, unbacked: bool) -> &'static str {
-    if min_seq != 0 && !unbacked {
+/// drift. O(1), no allocation: one relaxed atomic load.
+///
+/// **⚠ CORRECTED 2026-10-11 (review of DB-8, same day).** The first version
+/// returned `deferred_to_wal_replay` for every backed range and the log line
+/// said outright that the replay "re-inserts them". "Backed" only means the
+/// WAL took the frame into its queue; its writer can still lose it (a failed
+/// buffered write or flush, counted on
+/// `tv_ws_frame_spill_unflushed_lost_total`), and a spill rescue usually
+/// fails because the disk the WAL shares is full or failing. So a range the
+/// WAL has not flushed yet now reads `deferred_if_wal_flushes`.
+pub(crate) fn rescue_failure_fate(min_seq: u64, max_seq: u64, unbacked: bool) -> &'static str {
+    rescue_failure_fate_at(
+        min_seq,
+        max_seq,
+        unbacked,
+        crate::wal_frame_fate::flushed_high_seq(),
+    )
+}
+
+/// [`rescue_failure_fate`] against a given WAL flushed high-water mark.
+/// Pure; compares frame bases (the sequence with its packet index dropped),
+/// because the WAL records one sequence per frame and a row's sequence adds
+/// its packet index to it.
+pub(crate) const fn rescue_failure_fate_at(
+    min_seq: u64,
+    max_seq: u64,
+    unbacked: bool,
+    wal_flushed_high_seq: u64,
+) -> &'static str {
+    if min_seq == 0 || unbacked {
+        RESCUE_FATE_LOST
+    } else if (max_seq >> crate::ws_frame_spill::PACKET_INDEX_BITS)
+        <= (wal_flushed_high_seq >> crate::ws_frame_spill::PACKET_INDEX_BITS)
+    {
         RESCUE_FATE_DEFERRED_TO_WAL_REPLAY
     } else {
-        RESCUE_FATE_LOST
+        RESCUE_FATE_DEFERRED_IF_WAL_FLUSHES
     }
 }
 
