@@ -5549,11 +5549,16 @@ async fn run_process_runloop(
     // still seal, and those seals go to the durable spill) and by any seal
     // writer outcome other than a clean, residue-free drain. Read at 5b-2c.
     let mut seal_tail_complete = true;
+    // CONC-4 review (2026-10-11): whether the lane is known to have stopped.
+    // A lane that failed or overran its budget may still be running, so the
+    // dual-instance lock is kept at 5b-4. True when no lane ran.
+    let mut lane_stopped_cleanly = true;
     if let Some(handle) = dhan_feed_stack_monitor {
         match tokio::time::timeout(DHAN_LANE_SHUTDOWN_FLUSH_BUDGET, handle).await {
             Ok(Ok(())) => info!("Dhan live feed: sealed and flushed cleanly on shutdown"),
             Ok(Err(err)) => {
                 seal_tail_complete = false;
+                lane_stopped_cleanly = false;
                 error!(
                     code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
                     %err,
@@ -5565,6 +5570,7 @@ async fn run_process_runloop(
             // for a month after the budget was raised to 30 (2026-08-28).
             Err(_) => {
                 seal_tail_complete = false;
+                lane_stopped_cleanly = false;
                 error!(
                     code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
                     budget_secs = DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS,
@@ -5671,6 +5677,9 @@ async fn run_process_runloop(
         }
         if handle.is_finished() {
             if handle.join().is_err() {
+                // CONC-2 review (2026-10-11): what it held is gone, so the
+                // tail is not complete whatever the pending count reads.
+                seal_tail_complete = false;
                 error!(
                     code = tickvault_common::error_code::ErrorCode::AggregatorDrop01.code_str(),
                     "seal escalation thread PANICKED during its final drain — whatever it still held is gone"
@@ -5680,6 +5689,10 @@ async fn run_process_runloop(
             }
         } else {
             // Abandoned, not joined — joining now would wait without bound.
+            // Not a complete tail whatever the pending count reads: a
+            // Relaxed read can be 0 while one item is mid-write (CONC-2
+            // review, 2026-10-11).
+            seal_tail_complete = false;
             // Reported rather than swallowed: whatever is still queued dies
             // with the process, and a loss nobody counts is the false-OK this
             // whole shutdown path was rebuilt to stop producing.
@@ -5784,14 +5797,23 @@ async fn run_process_runloop(
     }
     // 5b-4. Release the dual-instance lock (audit CONC-4, 2026-10-11).
     //
-    // AFTER the WAL floor: no socket, drain or WAL writer is left, so nothing
-    // here can still need the lock, and the release flips the held flag off
-    // first, which refuses any late mint (RESILIENCE-03). BEFORE the notifier
-    // flush, so a slow Telegram cannot eat the budget. Until this date the
-    // heartbeat was never told to stop and every clean stop left the lock in
-    // SSM for the 90s TTL, so a restart in market hours opened no socket for
-    // that long. Bounded: past the budget the TTL clears it as before.
+    // AFTER the WAL floor, and only when every socket closed at 5a and the
+    // lane stopped cleanly inside its budget at 5b (CONC-4 review,
+    // 2026-10-11): only then can nothing here still dial Dhan. Otherwise
+    // the lock is kept, the heartbeat renews it until exit, and the 90s TTL
+    // clears it after the process has gone, so a waiting peer never dials
+    // while this process still can. The release flips the held flag off
+    // first, which refuses any late mint (RESILIENCE-03, logged at info as a
+    // stopping process, not paged as a peer). BEFORE the notifier flush, so
+    // a slow Telegram cannot eat the budget. Until this date the heartbeat
+    // was never told to stop and every clean stop left the lock in SSM for
+    // the 90s TTL, so a restart in market hours opened no socket for that
+    // long. Bounded: past the budget the TTL clears it as before.
     let _ = tickvault_app::dhan_rest_stack::release_instance_lock_at_shutdown(
+        tickvault_app::dhan_rest_stack::ShutdownLockGate {
+            sockets_left_open,
+            lane_stopped_cleanly,
+        },
         INSTANCE_LOCK_RELEASE_BUDGET,
     )
     .await;
@@ -5832,8 +5854,10 @@ async fn run_process_runloop(
 /// once.
 #[cfg(unix)]
 struct ShutdownSignals {
-    terminate: tokio::signal::unix::Signal,
-    interrupt: tokio::signal::unix::Signal,
+    /// `None` only when creating the SIGTERM stream failed.
+    terminate: Option<tokio::signal::unix::Signal>,
+    /// `None` only when creating the SIGINT stream failed.
+    interrupt: Option<tokio::signal::unix::Signal>,
 }
 
 /// See [`ShutdownSignals`]. `None` until the first wait, so a SIGTERM during
@@ -5842,12 +5866,28 @@ struct ShutdownSignals {
 static SHUTDOWN_SIGNALS: tokio::sync::Mutex<Option<ShutdownSignals>> =
     tokio::sync::Mutex::const_new(None);
 
+/// One stream's next signal; never resolves when the stream does not exist.
+#[cfg(unix)]
+async fn next_signal(stream: &mut Option<tokio::signal::unix::Signal>) {
+    match stream {
+        Some(stream) => {
+            let _ = stream.recv().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
 /// Waits for either SIGINT (Ctrl+C) or SIGTERM and returns the signal name.
 ///
 /// SIGTERM support enables graceful shutdown from Docker (`docker stop`).
 /// The streams persist across calls (see [`ShutdownSignals`]), so a signal
 /// delivered between two waits is returned by the next one. Cancel-safe:
 /// dropping the future drops only the lock guard, never the streams.
+///
+/// If one stream cannot be created, the other is still kept and waited on
+/// (CONC-5 review, 2026-10-11): before, a failed SIGINT stream also dropped a
+/// SIGTERM stream that had been created, leaving tokio's SIGTERM handler
+/// installed with no receiver, so SIGTERM did nothing at all.
 async fn wait_for_shutdown_signal() -> &'static str {
     #[cfg(unix)]
     {
@@ -5856,19 +5896,36 @@ async fn wait_for_shutdown_signal() -> &'static str {
         if slot.is_none() {
             // First use only: the same moment the streams were created
             // before, so boot-time SIGTERM behaviour is unchanged.
-            match (
-                signal(SignalKind::terminate()),
-                signal(SignalKind::interrupt()),
-            ) {
+            let terminate = signal(SignalKind::terminate());
+            let interrupt = signal(SignalKind::interrupt());
+            match (terminate, interrupt) {
                 (Ok(terminate), Ok(interrupt)) => {
                     *slot = Some(ShutdownSignals {
-                        terminate,
-                        interrupt,
+                        terminate: Some(terminate),
+                        interrupt: Some(interrupt),
                     });
                 }
-                (Err(err), _) | (_, Err(err)) => {
+                (Ok(terminate), Err(err)) => {
+                    warn!(?err, "SIGINT handler failed — waiting on SIGTERM only");
+                    *slot = Some(ShutdownSignals {
+                        terminate: Some(terminate),
+                        interrupt: None,
+                    });
+                }
+                (Err(err), Ok(interrupt)) => {
+                    warn!(?err, "SIGTERM handler failed — waiting on SIGINT only");
+                    *slot = Some(ShutdownSignals {
+                        terminate: None,
+                        interrupt: Some(interrupt),
+                    });
+                }
+                (Err(term_err), Err(int_err)) => {
                     drop(slot);
-                    warn!(?err, "SIGTERM handler failed — falling back to SIGINT only");
+                    warn!(
+                        ?term_err,
+                        ?int_err,
+                        "SIGTERM and SIGINT handlers failed — falling back to ctrl_c"
+                    );
                     let _ = tokio::signal::ctrl_c().await;
                     return "ctrl_c";
                 }
@@ -5878,10 +5935,10 @@ async fn wait_for_shutdown_signal() -> &'static str {
             return "ctrl_c";
         };
         tokio::select! {
-            _ = signals.interrupt.recv() => {
+            () = next_signal(&mut signals.interrupt) => {
                 "ctrl_c"
             }
-            _ = signals.terminate.recv() => {
+            () = next_signal(&mut signals.terminate) => {
                 info!("SIGTERM received — initiating graceful shutdown");
                 "sigterm"
             }
@@ -5904,29 +5961,45 @@ mod tests {
     use super::*;
 
     /// Audit CONC-5 (2026-10-11): the shutdown-signal streams are created on
-    /// the first wait and outlive it, so a signal delivered between two waits
-    /// reaches the second. Before the fix each wait built and dropped its own
-    /// streams and no slot existed.
+    /// the first wait and outlive it, so a SIGTERM delivered while no wait is
+    /// running is returned by the next wait. Before the fix each wait built
+    /// and dropped its own streams, so a signal between two waits reached no
+    /// stream and the second wait never returned (bite: per-call streams fail
+    /// the last assertion).
+    ///
+    /// Sends a real SIGTERM to this test process with the system `kill`. The
+    /// handler stays installed for the rest of the test binary, so a later
+    /// SIGTERM or Ctrl+C to the binary is caught rather than killing it; under
+    /// nextest each test runs in its own process. This is the only test in
+    /// the binary that touches the signal streams, so they are bound to one
+    /// runtime.
     #[cfg(unix)]
     #[tokio::test]
-    async fn shutdown_signal_slot_is_reused_across_calls() {
-        let wait = std::time::Duration::from_millis(1);
+    async fn a_sigterm_between_two_waits_is_returned_by_the_next_wait() {
+        let short = std::time::Duration::from_millis(5);
         assert!(
-            tokio::time::timeout(wait, wait_for_shutdown_signal())
+            tokio::time::timeout(short, wait_for_shutdown_signal())
                 .await
                 .is_err(),
-            "no signal was sent"
+            "no signal was sent yet"
         );
         assert!(
             SHUTDOWN_SIGNALS.lock().await.is_some(),
             "the streams outlive the wait that created them"
         );
-        assert!(
-            tokio::time::timeout(wait, wait_for_shutdown_signal())
-                .await
-                .is_err()
-        );
-        assert!(SHUTDOWN_SIGNALS.lock().await.is_some());
+        // No wait is running now: the signal lands between two waits.
+        let status = std::process::Command::new("kill")
+            .args(["-TERM", &std::process::id().to_string()])
+            .status()
+            .expect("run kill");
+        assert!(status.success(), "kill delivered SIGTERM");
+        let got = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            wait_for_shutdown_signal(),
+        )
+        .await
+        .expect("the buffered SIGTERM is returned by the next wait");
+        assert_eq!(got, "sigterm");
     }
 
     #[test]

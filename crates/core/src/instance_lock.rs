@@ -876,10 +876,25 @@ async fn write_and_verify(
 /// have expired naturally — that's not an alertable condition.
 // TEST-EXEMPT: end-to-end behaviour requires a real AWS SSM endpoint.
 pub async fn release_instance_lock(ssm: &SsmClient, env: &str, host_id: &str) -> Result<()> {
-    release_lock_at_path(ssm, &compute_instance_lock_path(env), host_id).await
+    release_lock_at_path(ssm, &compute_instance_lock_path(env), host_id)
+        .await
+        .map(|_| ())
 }
 
-async fn release_lock_at_path(ssm: &SsmClient, path: &str, host_id: &str) -> Result<()> {
+/// What an ownership-checked release found (CONC-4 review, 2026-10-11).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReleaseFound {
+    /// Our parameter was deleted.
+    Deleted,
+    /// No parameter was there.
+    AlreadyGone,
+    /// Another process holds the lock; left intact.
+    HeldByOther,
+    /// The value could not be read as a lock; left intact, so it stays in SSM.
+    Unparseable,
+}
+
+async fn release_lock_at_path(ssm: &SsmClient, path: &str, host_id: &str) -> Result<ReleaseFound> {
     let raw = get_parameter(ssm, path).await.with_context(|| {
         format!("GetParameter failed for instance lock path={path} during release")
     })?;
@@ -889,7 +904,7 @@ async fn release_lock_at_path(ssm: &SsmClient, path: &str, host_id: &str) -> Res
             path = %path,
             "instance lock already gone at release time"
         );
-        return Ok(());
+        return Ok(ReleaseFound::AlreadyGone);
     };
     let existing = match LockValue::from_json(&raw_value) {
         Ok(v) => v,
@@ -900,7 +915,7 @@ async fn release_lock_at_path(ssm: &SsmClient, path: &str, host_id: &str) -> Res
                 error = %err,
                 "instance-lock SSM value is not valid JSON at release time; leaving it alone"
             );
-            return Ok(());
+            return Ok(ReleaseFound::Unparseable);
         }
     };
     if existing.host_id != host_id {
@@ -912,7 +927,7 @@ async fn release_lock_at_path(ssm: &SsmClient, path: &str, host_id: &str) -> Res
             "instance lock held by another process at release time \
              (heartbeat likely raced TTL expiry); leaving foreign lock intact"
         );
-        return Ok(());
+        return Ok(ReleaseFound::HeldByOther);
     }
     ssm.delete_parameter()
         .name(path)
@@ -924,7 +939,7 @@ async fn release_lock_at_path(ssm: &SsmClient, path: &str, host_id: &str) -> Res
         path = %path,
         "instance lock released cleanly"
     );
-    Ok(())
+    Ok(ReleaseFound::Deleted)
 }
 
 /// Overwrites the instance lock UNCONDITIONALLY — the operator escape
@@ -1196,6 +1211,40 @@ where
     HeartbeatStep::Continue
 }
 
+/// How the heartbeat task ended (CONC-4 review, 2026-10-11). Until this date
+/// the task returned `()`, so the shutdown release counted "the task ended"
+/// as "the lock was released", including a failed `DeleteParameter`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeartbeatExit {
+    /// Shutdown: our SSM parameter was deleted.
+    Released,
+    /// Shutdown: there was nothing of ours to delete (already gone, or held
+    /// by another process).
+    NothingToRelease,
+    /// Shutdown: the release failed (SSM error, or a value that is not a
+    /// lock), so the parameter may still be in SSM until the TTL clears it.
+    ReleaseFailed,
+    /// No shutdown: a renewal saw another holder and the task exited.
+    LostOwnership,
+}
+
+/// Set by the heartbeat's shutdown arm just before it clears the held flag
+/// (CONC-4 review, 2026-10-11). Process-wide: one heartbeat per process.
+static RELEASED_AT_SHUTDOWN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// True once the heartbeat has given the lock up because this process is
+/// stopping, not because a peer took it. The RESILIENCE-03 mint tripwire
+/// reads it so a renewal that lands during the last seconds of a clean stop
+/// refuses the mint without paging "another instance holds the lock".
+///
+/// # Complexity
+/// O(1): one atomic load.
+#[must_use]
+pub fn lock_released_at_shutdown() -> bool {
+    RELEASED_AT_SHUTDOWN.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Spawns the instance-lock heartbeat task.
 ///
 /// The returned `JoinHandle` is held by the boot code so a clean shutdown
@@ -1247,7 +1296,7 @@ pub fn spawn_instance_lock_heartbeat(
     host_id: String,
     shutdown: Arc<Notify>,
     held_flag: Arc<std::sync::atomic::AtomicBool>,
-) -> JoinHandle<()> {
+) -> JoinHandle<HeartbeatExit> {
     let interval = Duration::from_secs(INSTANCE_LOCK_HEARTBEAT_INTERVAL_SECS);
     tokio::spawn(async move {
         info!(
@@ -1280,18 +1329,31 @@ pub fn spawn_instance_lock_heartbeat(
                     );
                     // We are about to give the lock up — refuse any
                     // further mint from this process (fail-closed;
-                    // RESILIENCE-03 tripwire).
+                    // RESILIENCE-03 tripwire). The shutdown latch goes
+                    // first, so a mint refused from here on reads as a
+                    // stopping process, not a peer (CONC-4 review).
+                    RELEASED_AT_SHUTDOWN.store(true, std::sync::atomic::Ordering::Release);
                     held_flag.store(false, std::sync::atomic::Ordering::Release);
-                    if let Err(err) = release_instance_lock(&ssm, &env, &host_id).await {
-                        warn!(
-                            target: "tickvault::instance_lock",
-                            error = %err,
-                            "instance-lock release on shutdown failed (slot will be \
-                             considered stale within {}s by the next booting instance)",
-                            INSTANCE_LOCK_TTL_SECS
-                        );
-                    }
-                    return;
+                    let path = compute_instance_lock_path(&env);
+                    return match release_lock_at_path(&ssm, &path, &host_id).await {
+                        Ok(ReleaseFound::Deleted) => HeartbeatExit::Released,
+                        Ok(ReleaseFound::AlreadyGone | ReleaseFound::HeldByOther) => {
+                            HeartbeatExit::NothingToRelease
+                        }
+                        Ok(ReleaseFound::Unparseable) => HeartbeatExit::ReleaseFailed,
+                        Err(err) => {
+                            warn!(
+                                target: "tickvault::instance_lock",
+                                code = ErrorCode::Resilience01DualInstanceDetected.code_str(),
+                                stage = "release_at_shutdown_failed",
+                                error = %err,
+                                "instance-lock release on shutdown failed (slot will be \
+                                 considered stale within {}s by the next booting instance)",
+                                INSTANCE_LOCK_TTL_SECS
+                            );
+                            HeartbeatExit::ReleaseFailed
+                        }
+                    };
                 }
                 _ = ticker.tick() => {
                     // A successful renewal is silent (SELFTEST-01 gives the
@@ -1306,7 +1368,7 @@ pub fn spawn_instance_lock_heartbeat(
                     )
                     .await;
                     if step == HeartbeatStep::Exit {
-                        return;
+                        return HeartbeatExit::LostOwnership;
                     }
                 }
             }
@@ -3108,13 +3170,76 @@ mod tests {
             Arc::clone(&held),
         );
         shutdown.notify_one();
-        tokio::time::timeout(Duration::from_secs(30), handle)
+        let exit = tokio::time::timeout(Duration::from_secs(30), handle)
             .await
             .expect("heartbeat must exit promptly on shutdown")
             .expect("heartbeat task must not panic");
+        assert_eq!(exit, HeartbeatExit::Released, "our parameter was deleted");
         assert!(
             !held.load(Ordering::Acquire),
             "held_flag must flip false on shutdown"
+        );
+        assert!(lock_released_at_shutdown());
+    }
+
+    /// CONC-4 review (2026-10-11): the heartbeat reports what its shutdown
+    /// release found, so the caller never counts a release that did not
+    /// happen as `released`.
+    #[tokio::test]
+    async fn test_instance_lock_heartbeat_shutdown_reports_a_release_that_did_not_delete() {
+        for (response, expected) in [
+            (
+                get_parameter_response("not a lock value"),
+                HeartbeatExit::ReleaseFailed,
+            ),
+            (
+                get_parameter_absent_response(),
+                HeartbeatExit::NothingToRelease,
+            ),
+        ] {
+            let (url, _stub) = start_ssm_stub(vec![response]).await;
+            let shutdown = Arc::new(Notify::new());
+            let held = Arc::new(AtomicBool::new(true));
+            let handle = spawn_instance_lock_heartbeat(
+                Arc::new(stub_ssm_client(&url)),
+                "testenv".to_string(),
+                "host-a".to_string(),
+                Arc::clone(&shutdown),
+                Arc::clone(&held),
+            );
+            shutdown.notify_one();
+            let exit = tokio::time::timeout(Duration::from_secs(30), handle)
+                .await
+                .expect("heartbeat must exit promptly on shutdown")
+                .expect("heartbeat task must not panic");
+            assert_eq!(exit, expected);
+            assert!(!held.load(Ordering::Acquire));
+        }
+    }
+
+    /// CONC-4 review (2026-10-11): the shutdown latch is set by the
+    /// heartbeat's shutdown arm only; a lost lock does not set it. Process
+    /// wide, so this checks only the direction a parallel test cannot undo.
+    #[test]
+    fn test_lock_released_at_shutdown_is_set_only_by_the_shutdown_arm() {
+        let src = include_str!("instance_lock.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+        assert_eq!(
+            prod.matches("RELEASED_AT_SHUTDOWN.store(true").count(),
+            1,
+            "exactly one store, in the shutdown arm"
+        );
+        let arm = prod
+            .find("() = shutdown.notified() =>")
+            .expect("shutdown arm");
+        let store = prod.find("RELEASED_AT_SHUTDOWN.store(true").expect("store");
+        let held = prod[arm..]
+            .find("held_flag.store(false")
+            .map(|i| i + arm)
+            .expect("held flag cleared in the arm");
+        assert!(
+            arm < store && store < held,
+            "latch set before the held flag"
         );
     }
 
@@ -3148,10 +3273,11 @@ mod tests {
             Arc::clone(&shutdown),
             Arc::clone(&held),
         );
-        tokio::time::timeout(Duration::from_secs(3600), handle)
+        let exit = tokio::time::timeout(Duration::from_secs(3600), handle)
             .await
             .expect("heartbeat must exit after losing ownership")
             .expect("heartbeat task must not panic");
+        assert_eq!(exit, HeartbeatExit::LostOwnership);
         assert!(
             !held.load(Ordering::Acquire),
             "held_flag must flip false when ownership is lost"

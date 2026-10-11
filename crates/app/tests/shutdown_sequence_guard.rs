@@ -137,8 +137,21 @@ fn shutdown_signal_streams_are_created_once_not_per_wait() {
         "exactly one SIGTERM stream creation, on first use"
     );
     assert!(
-        body.contains(".terminate.recv()") && body.contains(".interrupt.recv()"),
+        body.contains("next_signal(&mut signals.terminate)")
+            && body.contains("next_signal(&mut signals.interrupt)"),
         "the wait polls the persistent streams"
+    );
+    assert!(
+        code.contains("Some(stream) => {\n            let _ = stream.recv().await;"),
+        "next_signal awaits the stored stream"
+    );
+    // CONC-5 review (2026-10-11): one stream failing must not drop the other.
+    // A dropped SIGTERM stream leaves tokio's handler installed with no
+    // receiver, so SIGTERM would do nothing at all.
+    assert!(
+        body.contains("(Ok(terminate), Err(err)) => {")
+            && body.contains("(Err(err), Ok(interrupt)) => {"),
+        "a failure of one stream keeps the other"
     );
 }
 
@@ -214,5 +227,69 @@ fn shutdown_releases_the_instance_lock_after_the_wal_and_before_the_notifier() {
     assert!(
         prod.contains("INSTANCE_LOCK_HEARTBEAT"),
         "the heartbeat is registered for the shutdown release"
+    );
+}
+
+/// CONC-4 review (2026-10-11): the lock is released only when every socket
+/// closed and the lane stopped cleanly. Otherwise this process could still
+/// dial Dhan after a waiting peer took the lock.
+#[test]
+fn shutdown_releases_the_lock_only_when_nothing_can_still_dial() {
+    let code = main_rs_code();
+    let release = code
+        .find("release_instance_lock_at_shutdown(")
+        .expect("shutdown releases the dual-instance lock");
+    let call = &code[release..];
+    let call = &call[..call.find(".await").expect("the release is awaited")];
+    assert!(
+        call.contains("ShutdownLockGate {")
+            && call.contains("sockets_left_open")
+            && call.contains("lane_stopped_cleanly"),
+        "the release is gated on the socket stop and the lane stop"
+    );
+    let lane = code
+        .find("let mut lane_stopped_cleanly = true;")
+        .expect("the lane outcome is recorded");
+    let lane_match = &code[lane..release];
+    assert_eq!(
+        lane_match.matches("lane_stopped_cleanly = false;").count(),
+        2,
+        "a failed lane and a lane past its budget both keep the lock"
+    );
+}
+
+/// CONC-2 review (2026-10-11): a panicked or abandoned escalation thread
+/// clears `seal_tail_complete`, whatever its pending count reads.
+#[test]
+fn every_non_clean_escalation_arm_clears_the_tail_complete_flag() {
+    let code = main_rs_code();
+    let start = code
+        .find("let escalation_handle = SEAL_ESCALATION_THREAD")
+        .expect("the escalation step");
+    let end = start
+        + code[start..]
+            .find("finish_unwritten_mark_at_shutdown(")
+            .expect("the crash marker follows");
+    let step = &code[start..end];
+    let panicked = step
+        .find("if handle.join().is_err() {")
+        .expect("the panic arm");
+    let abandoned = step
+        .find("seals_escalation_abandoned = seals_abandoned;")
+        .expect("the abandoned arm");
+    let first_clear = step[panicked..]
+        .find("seal_tail_complete = false;")
+        .map(|i| panicked + i)
+        .expect("the panic arm clears the flag");
+    assert!(
+        first_clear
+            < step
+                .find("info!(\"seal escalation: queue drained")
+                .unwrap_or(usize::MAX),
+        "the clear is inside the panic arm"
+    );
+    assert!(
+        step[..abandoned].rfind("seal_tail_complete = false;") > Some(first_clear),
+        "the abandoned arm clears the flag too"
     );
 }

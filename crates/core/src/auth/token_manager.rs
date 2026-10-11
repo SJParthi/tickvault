@@ -1124,6 +1124,27 @@ impl TokenManager {
         // effects. `RenewToken` (try_renew_token) is deliberately NOT
         // gated — renewing our own still-active token harms no peer.
         if mint_refused_by_instance_lock(self.instance_lock_held.as_deref()) {
+            // CONC-4 review (2026-10-11): a clean stop now releases the lock
+            // and clears the held flag a few seconds before exit. A renewal
+            // landing in that window is refused the same way, but no peer
+            // holds the lock, so it is logged at info and does not page
+            // "another tickvault instance holds the dual-instance lock".
+            if crate::instance_lock::lock_released_at_shutdown() {
+                info!(
+                    code =
+                        tickvault_common::error_code::ErrorCode::Resilience03MintRefusedLockNotHeld
+                            .code_str(),
+                    stage = "shutting_down",
+                    "RESILIENCE-03: refusing generateAccessToken — this process is stopping \
+                     and has released the dual-instance lock"
+                );
+                return Err(ApplicationError::AuthenticationFailed {
+                    reason: format!(
+                        "{RESILIENCE03_MINT_REFUSAL_REASON_PREFIX} — generateAccessToken mint \
+                         refused (fail-closed)"
+                    ),
+                });
+            }
             error!(
                 code = tickvault_common::error_code::ErrorCode::Resilience03MintRefusedLockNotHeld
                     .code_str(),
@@ -2253,6 +2274,34 @@ mod tests {
             1,
             "only write_current_token_cache writes the cache"
         );
+    }
+
+    /// CONC-4 review (2026-10-11): a refusal after this process released
+    /// its own lock at shutdown returns before the page, and the page is
+    /// still sent for every other refusal.
+    #[test]
+    fn test_mint_refusal_after_own_shutdown_release_does_not_page() {
+        let src = include_str!("token_manager.rs");
+        let production = src
+            .split("// Tests\n// ----")
+            .next()
+            .expect("production part");
+        let tripwire = production
+            .find("if mint_refused_by_instance_lock(")
+            .expect("tripwire");
+        let latch = production[tripwire..]
+            .find("crate::instance_lock::lock_released_at_shutdown()")
+            .expect("shutdown latch checked inside the tripwire");
+        let page = production[tripwire..]
+            .find("NotificationEvent::AuthenticationFailed")
+            .expect("page still sent for a peer-held lock");
+        assert!(
+            latch < page,
+            "the shutdown latch is checked before the page"
+        );
+        let between = &production[tripwire + latch..tripwire + page];
+        assert!(between.contains("stage = \"shutting_down\""));
+        assert!(between.contains("return Err(ApplicationError::AuthenticationFailed"));
     }
 
     /// Adoption must PROVE the token works before skipping the mint.

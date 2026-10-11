@@ -482,6 +482,12 @@ pub struct UnwrittenSealRecord {
     /// before it was written, spilled or counted lost. `None` when no sample
     /// of that process saw the queues empty, or the marker is `v1` and held
     /// seals. The boot warm-up re-sends the candles sealed after it.
+    ///
+    /// **⚠ CORRECTED 2026-10-11 (CONC-2 review) — nothing re-sends.** No
+    /// production code reads this field: [`previous_unwritten`] has no caller
+    /// outside the tests, and [`report_previous_unwritten`] returns 0 for a
+    /// clean marker without reading it. It is recorded for a reader, not
+    /// acted on.
     pub drained_at_unix_secs: Option<i64>,
 }
 
@@ -796,6 +802,16 @@ fn record_mark_write_failure(path: &std::path::Path, err: &std::io::Error, log: 
 /// lane still sealing, which stopped the next boot re-sending candles sealed
 /// after the last real drain.
 ///
+/// **⚠ CORRECTED 2026-10-11 (CONC-2 review) — the last sentence above
+/// describes a reader that does not exist.** The record this writes is clean,
+/// and the next boot's [`report_previous_unwritten`] returns 0 for a clean
+/// record without reading `unwritten` or `drained_at`; nothing re-sends any
+/// candle. So `tail_complete` and `seals_reported_lost` change only what the
+/// file says, for a person reading it; the losses themselves are paged by
+/// main at shutdown. Also a limit of the record: when the seal writer overran
+/// its budget, what that detached writer still held is not in
+/// `seals_reported_lost`, so `unwritten` reads lower than the loss.
+///
 /// # Complexity
 /// O(finished markers), one in production, plus one small write and a rename.
 pub fn finish_unwritten_mark_at_shutdown(
@@ -1015,9 +1031,34 @@ pub const FINAL_DRAIN_BUDGET_SECS: u64 = 45;
 /// the runner is dropped a later send sees the channel disconnected and goes
 /// to the durable spill through the overflow sink.
 ///
+/// **⚠ CORRECTED 2026-10-11 (CONC-2 review) — "goes to the durable spill" is
+/// not always true.** The overflow sink hands the seal to the escalation
+/// queue and counts it as rescued once that hand-off succeeds. A lane that
+/// overran its shutdown budget is not stopped; if main has already given up
+/// on the escalation thread (step 5b-2b), a seal that lane queues after that
+/// dies at exit while counted as rescued. The shutdown records that tail as
+/// incomplete, but the rescue counter overstates what was kept.
+///
+/// The drain also stops on an idle cycle only when the channel is empty
+/// (CONC-2 review, 2026-10-11). Before, an idle cycle stopped it even with a
+/// seal that had just arrived in the channel, which was then counted as
+/// residue although one more cycle would have taken it.
+///
 /// # Complexity
 /// O(seals held), bounded by the budget. No allocation.
 fn final_drain(runner: &mut SealWriterRunner, progress: &mut SealWriterProgress) -> CycleOutcome {
+    final_drain_with(runner, progress, |_, _| {})
+}
+
+/// [`final_drain`] with a hook run after each cycle, before the stop checks.
+/// Production passes a no-op; a test uses it to send a seal between two
+/// cycles, the timing a lane still sealing produces (audit CONC-2 review,
+/// 2026-10-11).
+fn final_drain_with(
+    runner: &mut SealWriterRunner,
+    progress: &mut SealWriterProgress,
+    mut after_cycle: impl FnMut(&SealWriterRunner, u64),
+) -> CycleOutcome {
     let deadline = Instant::now() + Duration::from_secs(FINAL_DRAIN_BUDGET_SECS);
     let mut total = CycleOutcome::default();
     let mut cycles: u64 = 0;
@@ -1028,6 +1069,7 @@ fn final_drain(runner: &mut SealWriterRunner, progress: &mut SealWriterProgress)
         record_cycle_observability(&outcome, dropped);
         total.accumulate(&outcome);
         cycles = cycles.saturating_add(1);
+        after_cycle(runner, cycles);
 
         // Audit CONC-2 (2026-10-11): the channel too, not only the ring. A
         // seal sent while this cycle flushed landed in the channel after its
@@ -1036,9 +1078,13 @@ fn final_drain(runner: &mut SealWriterRunner, progress: &mut SealWriterProgress)
         if final_drain_residue(runner) == 0 {
             break;
         }
-        if outcome.is_idle() {
-            // The ring is non-empty and yet nothing moved — every tier is
-            // refusing. More cycles cannot change that.
+        // An idle cycle stops the drain only when the channel is empty too
+        // (CONC-2 review, 2026-10-11). Then the ring is non-empty and nothing
+        // moved: every tier is refusing, and more cycles cannot change that.
+        // A seal in the channel is different: the next cycle's step 1 always
+        // takes it (`try_recv` until empty), so that cycle cannot be idle and
+        // the loop cannot spin; the deadline still bounds it.
+        if outcome.is_idle() && runner.queued_seals() == 0 {
             break;
         }
         if Instant::now() >= deadline {
@@ -2340,6 +2386,35 @@ mod tests {
             "the reported residue is the ring plus the channel at exit"
         );
         assert_eq!(runner.queued_seals(), 0, "nothing is left in the channel");
+        cleanup(&spill, &dlq);
+    }
+
+    /// CONC-2 review (2026-10-11): a seal that reaches the channel after an
+    /// idle cycle (a lane still sealing) is taken by the next cycle, not left
+    /// as residue. Bite: with the old `if outcome.is_idle() { break; }` the
+    /// first, idle cycle stops the drain and `final_residue` reads 1.
+    #[tokio::test]
+    async fn test_final_drain_takes_a_seal_sent_after_an_idle_cycle() {
+        let (spill, dlq) = temp_pair("final-drain-late-seal");
+        let mut runner = SealWriterRunner::for_test(spill.clone(), dlq.clone(), 16, 16, 4);
+        let tx = runner.sender();
+        let mut progress = SealWriterProgress::default();
+        let mut sent = false;
+        let outcome = final_drain_with(&mut runner, &mut progress, |runner, cycle| {
+            if cycle == 1 && !sent {
+                assert_eq!(final_drain_residue(runner), 0, "the first cycle was idle");
+                tx.try_send(mk_seal(13, 0, TfIndex::M1, 1_716_000_000, 100.0))
+                    .expect("queued");
+                sent = true;
+            }
+        });
+        assert!(sent, "the hook ran after the first cycle");
+        assert_eq!(
+            outcome.submitted_from_mpsc, 1,
+            "the late seal was taken by a later cycle"
+        );
+        assert_eq!(outcome.final_residue, 0, "nothing is left in memory");
+        assert_eq!(final_drain_residue(&runner), 0);
         cleanup(&spill, &dlq);
     }
 
