@@ -188,6 +188,27 @@ flag were ever set again.
   sockets it already had until Dhan evicts them; an evicted socket is then
   not re-dialled.
 
+**⚠ CHANGED 2026-10-11 (audit SUP-9) — renewal failures are counted and
+escalated.** The "WARN-and-retry path" in the Renewal row above was a bare
+`warn!` with no code and no count, and the renewal had no timeout of its own,
+so a hung SSM call logged nothing at all. Now each renewal runs under a 20 s
+local timeout (`INSTANCE_LOCK_RENEW_TIMEOUT_SECS`, below the 30 s heartbeat);
+an error or a timeout is counted on `tv_instance_lock_renew_failed_total{reason
+= "error" | "timeout"}` and the gauge `tv_instance_lock_renew_consecutive_failures`
+(local Prometheus only, no CloudWatch name) and logged as a coded RESILIENCE-01
+`warn!` (`stage = "renew_failed"`). The second failure in a row
+(`INSTANCE_LOCK_RENEW_FAILURES_BEFORE_ERROR`; 2 × 30 s + 20 s = 80 s, before the
+90 s TTL) logs ONE RESILIENCE-01 `error!` with `stage = "renew_failing"` per
+failure episode (log sink only, no page: RESILIENCE-01 has no
+`error_code_alerts` entry). The next success logs `stage = "renew_recovered"`
+at INFO and re-arms it. **The self-fence is still not taken:** a failing
+renewal leaves the lock-held flag set, so dialling and minting continue, as
+the "Renewal does not settle" limit above records.
+
+**Operator action on `renew_failing`:** the box cannot reach SSM. If it
+persists past 90 s, a booting peer could take the lock over; check that no
+second process is starting, and check the box's network path to SSM.
+
 ## §4. What a PR that violates this lock looks like (REJECT)
 
 - Re-introduces a trading-mode (`is_live()`) or any other gate that can skip the
