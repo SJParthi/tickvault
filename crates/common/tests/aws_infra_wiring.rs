@@ -1230,3 +1230,51 @@ fn test_questdb_disconnected_alarm_text_has_no_retired_rescue_ring() {
     );
     assert!(description.contains("finite reserve"));
 }
+
+/// Audit SEC-12 (2026-10-11): the `operator_cidr` validation must refuse a
+/// world-open or broad CIDR. Before, any valid CIDR passed, so setting the
+/// `TF_VAR_OPERATOR_CIDR` secret to 0.0.0.0/0 reopened port 22 to the
+/// internet with no refusal (the state audit PR36c removed).
+#[test]
+fn operator_cidr_validation_refuses_world_open_and_broad_prefixes() {
+    let content =
+        std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/variables.tf"))
+            .expect("variables.tf must be readable"); // APPROVED: test
+    let header = "variable \"operator_cidr\" {";
+    let start = content
+        .find(header)
+        .expect("variables.tf must declare variable \"operator_cidr\""); // APPROVED: test
+    let rest = &content[start..];
+    let end = rest.find("\n}\n").map_or(rest.len(), |i| i + 3);
+    let block: String = rest[..end]
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let condition = block
+        .lines()
+        .find(|line| line.trim_start().starts_with("condition"))
+        .expect("the operator_cidr variable must carry a validation condition"); // APPROVED: test
+    assert!(
+        condition.contains(">= (") && condition.contains("? 64 : 24"),
+        "the operator_cidr validation must enforce a prefix floor (IPv4 /24, \
+         IPv6 /64); a bare can(cidrhost(...)) accepts 0.0.0.0/0. Found:\n{condition}"
+    );
+    assert!(
+        condition.contains("try("),
+        "the prefix check must sit inside try() so a value with no \"/\" reads \
+         false instead of erroring. Found:\n{condition}"
+    );
+    assert!(
+        condition.contains("var.operator_cidr == \"\""),
+        "an empty operator_cidr (no SSH ingress) must stay valid"
+    );
+    let message = block
+        .lines()
+        .find(|line| line.trim_start().starts_with("error_message"))
+        .expect("the operator_cidr validation must carry an error_message"); // APPROVED: test
+    assert!(
+        message.contains("0.0.0.0/0") && message.contains("refused"),
+        "the error_message must say 0.0.0.0/0 is refused. Found:\n{message}"
+    );
+}

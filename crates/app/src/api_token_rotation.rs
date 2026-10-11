@@ -166,8 +166,9 @@ async fn run_api_token_reload_loop(config: ApiAuthConfig) {
                             // MEDIUM #2) can self-diagnose from this line.
                             warn!(
                                 "GAP-SEC-01: SSM returned a shape-invalid API bearer \
-                                 token (empty, longer than 512 chars, or containing \
-                                 whitespace/control chars) — swap rejected; auth \
+                                 token (empty, shorter than 32 or longer than 512 \
+                                 chars, or containing whitespace/control chars) — \
+                                 swap rejected; auth \
                                  continues on the previously loaded token (fix \
                                  /tickvault/<env>/api/bearer-token)"
                             );

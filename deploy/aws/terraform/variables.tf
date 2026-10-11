@@ -140,14 +140,22 @@ variable "key_name" {
 #   aws ssm start-session --target <instance-id>
 # To allow SSH from one address, set the repository secret
 # TF_VAR_OPERATOR_CIDR to e.g. 203.0.113.42/32 and re-run terraform-apply.
+#
+# **⚠ 2026-10-11 (audit SEC-12):** the validation now refuses world-open and
+# broad CIDRs. Before, any valid CIDR passed, so setting the secret to
+# 0.0.0.0/0 reopened port 22 to the internet with no refusal. IPv4 must be
+# /24 or longer, IPv6 /64 or longer. The check sits inside try() because HCL
+# `&&` is not relied on to short-circuit: a value with no "/" reads false
+# instead of erroring. If the secret currently holds a broad CIDR, the next
+# terraform-apply plan fails here until it is narrowed or unset.
 variable "operator_cidr" {
   description = "CIDR that may SSH into the instance, e.g. 203.0.113.42/32. Empty = no SSH ingress (use SSM Session Manager)."
   type        = string
   default     = ""
 
   validation {
-    condition     = var.operator_cidr == "" || can(cidrhost(var.operator_cidr, 0))
-    error_message = "operator_cidr must be empty (no SSH) or a CIDR such as 203.0.113.42/32."
+    condition     = var.operator_cidr == "" || try(can(cidrhost(var.operator_cidr, 0)) && tonumber(split("/", var.operator_cidr)[1]) >= (length(regexall(":", var.operator_cidr)) > 0 ? 64 : 24), false)
+    error_message = "operator_cidr must be empty (no SSH; use SSM Session Manager) or a narrow CIDR: IPv4 /24 or longer (e.g. 203.0.113.42/32), IPv6 /64 or longer. 0.0.0.0/0, ::/0 and any broader prefix are refused."
   }
 }
 

@@ -4924,6 +4924,33 @@ async fn build_shared_infra(
             );
         }
     }
+    // Audit SEC-9 (2026-10-11): boot applies the SAME shape gate as rotation
+    // (at least 32 and at most 512 characters, no whitespace or control
+    // characters). Before, boot checked only emptiness, so a 3-character
+    // token guarded a publicly funnelled port. Live mode refuses to boot;
+    // paper mode keeps auth ENABLED on the loaded token and says so. Never
+    // logs the value or its length.
+    let bearer_token_is_weak = !bearer_token_is_empty && {
+        use secrecy::ExposeSecret as _;
+        !tickvault_api::middleware::is_acceptable_bearer_token(api_bearer_token.expose_secret())
+    };
+    if bearer_token_is_weak {
+        if config.strategy.dry_run {
+            error!(
+                code = tickvault_common::error_code::ErrorCode::GapSecApiAuth.code_str(),
+                "the API bearer token in SSM is weak (shorter than 32 characters, longer than 512, \
+                 or containing whitespace/control characters) — bearer auth stays ENABLED on it \
+                 this paper-mode session; rotate /tickvault/<env>/api/bearer-token to a random \
+                 value of 32 or more characters"
+            );
+        } else {
+            anyhow::bail!(
+                "GAP-SEC-01: the API bearer token in SSM is shorter than 32 characters, longer than \
+                 512, or contains whitespace/control characters — refusing to boot LIVE on a weak \
+                 token for a publicly funnelled port"
+            );
+        }
+    }
     let api_auth_config = tickvault_api::middleware::ApiAuthConfig::from_token(api_bearer_token);
     // W2#7 (2026-07-10): supervised SSM re-read loop (slow-boot mirror of
     // the fast-arm spawn above) — token rotation without restart; fail-open
