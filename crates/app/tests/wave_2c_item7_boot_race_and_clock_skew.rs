@@ -168,23 +168,24 @@ fn test_boot_03_error_code_round_trips() {
 }
 
 /// Item 7.3 — `enforce_clock_skew_at_boot` returns Unavailable
-/// (not ThresholdExceeded) when both probe paths fail before producing
-/// a sample. We can't drive a real `chronyc` from a unit test, so we
-/// use the QuestDB-fallback path with an unreachable QuestDB to assert
-/// the `Unavailable` branch surfaces the WARN-not-HALT path.
+/// (not ThresholdExceeded) when chronyc produces no sample. We cannot
+/// drive a real `chronyc` from a unit test; in a container without it the
+/// probe fails and the `Unavailable` branch surfaces the WARN-not-HALT path.
+/// **⚠ CORRECTED 2026-10-11 (audit CLOCK-3):** this used to run the
+/// QuestDB `now()` fallback against an unreachable QuestDB. That fallback is
+/// removed (QuestDB shares this host's clock, so it measured nothing), and
+/// the functions no longer take a QuestDB config.
 #[tokio::test]
 async fn test_enforce_clock_skew_at_boot_unavailable_does_not_halt() {
-    let cfg = unreachable_questdb_config();
     // chrony may or may not be installed in the test container — both
-    // outcomes are acceptable. What matters: when both probes fail we
-    // get Unavailable (NOT ThresholdExceeded). Boot proceeds with WARN.
+    // outcomes are acceptable. What matters: when the probe fails we get
+    // Unavailable (NOT ThresholdExceeded). Boot proceeds with WARN.
     let result =
-        tickvault_app::infra::enforce_clock_skew_at_boot(&cfg, CLOCK_SKEW_HALT_THRESHOLD_SECS)
-            .await;
+        tickvault_app::infra::enforce_clock_skew_at_boot(CLOCK_SKEW_HALT_THRESHOLD_SECS).await;
     if let Err(ClockSkewError::ThresholdExceeded { .. }) = result {
         panic!(
             "ThresholdExceeded must require a successful skew sample; \
-             unreachable QuestDB must yield Unavailable or Ok (chronyc)"
+             a failed chronyc probe must yield Unavailable"
         );
     }
 }
@@ -195,20 +196,19 @@ async fn test_enforce_clock_skew_at_boot_unavailable_does_not_halt() {
 /// Named to satisfy the pub-fn-test-guard regex `test.*probe_clock_skew`.
 #[tokio::test]
 async fn test_probe_clock_skew_smoke_against_unreachable_questdb() {
-    let cfg = unreachable_questdb_config();
-    let result = tickvault_app::infra::probe_clock_skew(&cfg).await;
+    let result = tickvault_app::infra::probe_clock_skew().await;
     match result {
         Ok(sample) => {
             // chrony was reachable on the host — the sample is real.
             assert!(
-                sample.source == "chronyc" || sample.source == "questdb_now",
-                "sample.source must be one of chronyc / questdb_now, got {}",
+                sample.source == "chronyc",
+                "sample.source must be chronyc (the QuestDB fallback is removed, 2026-10-11), got {}",
                 sample.source
             );
             assert!(sample.skew_secs.is_finite());
         }
         Err(ClockSkewError::Unavailable { .. }) => {
-            // chronyc + unreachable QuestDB → Unavailable. Boot
+            // chronyc failed → Unavailable. Boot
             // proceeds with WARN per design.
         }
         Err(ClockSkewError::ThresholdExceeded { .. }) => {
@@ -227,15 +227,14 @@ async fn test_probe_clock_skew_smoke_against_unreachable_questdb() {
 /// worth pinning is not "it probes" but "it is still probing after a
 /// probe fails".
 ///
-/// Drives it against an unreachable QuestDB on a 10ms interval, waits
+/// Drives it on a 10ms interval (chronyc is absent in CI, so every probe fails), waits
 /// several intervals, and asserts the task has neither finished nor
 /// panicked. Named to satisfy the pub-fn-test-guard regex
 /// `test.*spawn_clock_skew_poller`.
 #[tokio::test]
 async fn test_spawn_clock_skew_poller_survives_a_failing_probe() {
-    let cfg = unreachable_questdb_config();
     let handle =
-        tickvault_app::infra::spawn_clock_skew_poller(cfg, std::time::Duration::from_millis(10));
+        tickvault_app::infra::spawn_clock_skew_poller(std::time::Duration::from_millis(10));
 
     // First tick is consumed immediately by the poller (deliberate: the
     // boot gate has just sampled), so this covers several real probes.

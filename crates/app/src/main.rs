@@ -4521,15 +4521,15 @@ async fn build_shared_infra(
     let health_status: SharedHealthStatus = std::sync::Arc::new(SystemHealthStatus::new());
 
     // BOOT-03 (Wave-2-C Item 7.3): clock-skew boot gate. Wall-clock drift
-    // vs a trusted source (chronyc PRIMARY, QuestDB now() FALLBACK) that
-    // exceeds CLOCK_SKEW_HALT_THRESHOLD_SECS can silently split/merge trading
-    // days in QuestDB DEDUP keys — so HALT boot. Runs on every boot path
-    // before the seal-writer starts. QuestDB is up by here (ensure_infra_running
-    // above). A probe that CANNOT run (no chrony + QuestDB unreachable) degrades
-    // and PROCEEDS — a dev box without chrony must still boot (per
-    // test_enforce_clock_skew_at_boot_unavailable_does_not_halt).
+    // vs chronyc that exceeds CLOCK_SKEW_HALT_THRESHOLD_SECS can silently
+    // split/merge trading days in QuestDB DEDUP keys — so HALT boot. Runs on
+    // every boot path before the seal-writer starts. A probe that CANNOT run
+    // (no chrony) degrades and PROCEEDS — a dev box without chrony must still
+    // boot (per test_enforce_clock_skew_at_boot_unavailable_does_not_halt).
+    // ⚠ CORRECTED 2026-10-11 (audit CLOCK-3): the QuestDB now() FALLBACK is
+    // gone. QuestDB runs on this host and shares its clock, so it read ~0 and
+    // passed this gate exactly when chronyd had stopped.
     match infra::enforce_clock_skew_at_boot(
-        &config.questdb,
         tickvault_common::constants::CLOCK_SKEW_HALT_THRESHOLD_SECS,
     )
     .await
@@ -4547,12 +4547,9 @@ async fn build_shared_infra(
             // pre-market number. Re-sample every 30s so the alarm and the
             // dashboard panel track LIVE drift. See
             // infra::spawn_clock_skew_poller for the full reasoning.
-            infra::spawn_clock_skew_poller(
-                config.questdb.clone(),
-                std::time::Duration::from_secs(
-                    tickvault_common::constants::CLOCK_SKEW_POLL_INTERVAL_SECS,
-                ),
-            );
+            infra::spawn_clock_skew_poller(std::time::Duration::from_secs(
+                tickvault_common::constants::CLOCK_SKEW_POLL_INTERVAL_SECS,
+            ));
         }
         Err(infra::ClockSkewError::ThresholdExceeded {
             skew_secs,
@@ -4576,12 +4573,21 @@ async fn build_shared_infra(
             ));
         }
         Err(unavailable) => {
-            // Both probes failed (no chrony + QuestDB now() unreachable) —
-            // degrade, do NOT halt. Dev boxes without chrony still boot.
+            // chronyc failed (no chrony, or chronyd stopped) — degrade, do NOT
+            // halt. Dev boxes without chrony still boot. The skew is UNKNOWN,
+            // not a number (audit CLOCK-3, 2026-10-11).
             warn!(
+                code = tickvault_common::error_code::ErrorCode::Boot03ClockSkewExceeded.code_str(),
                 error = %unavailable,
-                "BOOT-03: clock-skew probe unavailable — proceeding without the gate"
+                "BOOT-03: clock-skew probe unavailable — proceeding without the gate; \
+                 the skew is unknown until chronyc answers"
             );
+            // Still start the poller, so a chronyd that comes back is
+            // measured. Its own power-of-two BOOT-03 warn covers a probe that
+            // keeps failing.
+            infra::spawn_clock_skew_poller(std::time::Duration::from_secs(
+                tickvault_common::constants::CLOCK_SKEW_POLL_INTERVAL_SECS,
+            ));
         }
     }
 

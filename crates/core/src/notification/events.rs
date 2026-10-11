@@ -981,6 +981,9 @@ pub enum NotificationEvent {
         /// `CLOCK_SKEW_HALT_THRESHOLD_SECS` from common::constants).
         threshold_secs: f64,
         /// Probe source that observed the skew (e.g., "chronyc", "questdb_now").
+        /// **⚠ CORRECTED 2026-10-11 (audit CLOCK-3):** always `"chronyc"` now.
+        /// The `"questdb_now"` fallback was removed: QuestDB runs on the same
+        /// host and shares its clock, so it could not measure skew.
         source: String,
     },
 

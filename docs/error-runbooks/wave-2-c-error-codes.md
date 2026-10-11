@@ -24,6 +24,18 @@ QuestDB `SELECT now()` over PG-wire) and observed a skew of magnitude
 ≥ `CLOCK_SKEW_HALT_THRESHOLD_SECS` (= 2.0s, pinned in
 `crates/common/src/constants.rs`). The app HALTS. Severity::Critical.
 
+**⚠ CORRECTED 2026-10-11 (audit CLOCK-3):** there is no FALLBACK any more.
+QuestDB runs on this host and shares its kernel clock, so `SELECT now()`
+read about 0 skew whatever the real drift was, and a stopped chronyd
+passed this gate and fed `tv_clock_skew_seconds{source="questdb_now"}` to
+the `clock-skew-high` alarm. Now, when `chronyc` cannot answer, the probe
+returns Unavailable, boot proceeds with a BOOT-03 `warn!` (not an
+`error!`, so it does not page), no skew number is written, and the local
+gauge `tv_clock_skew_probe_available` reads 0. Honest limit: while chronyc
+is unavailable the CloudWatch gauge keeps its last chronyc value, and the
+alarm treats missing data as not breaching. Step 2 of the triage below is
+kept as history; a container shares the host clock, so it never helps.
+
 **Why this is a HALT, not a warn:**
 IST timestamp math + DEDUP UPSERT keys depend on accurate wall-clock.
 A ±2s skew can cross IST midnight, the 09:00:00 market-open gate, or
