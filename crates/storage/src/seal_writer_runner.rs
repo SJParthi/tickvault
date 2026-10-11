@@ -960,6 +960,12 @@ pub struct CycleOutcome {
     /// Drain-side outcome from `drain_once` (ring → ILP buffer →
     /// flush, with rescue cascade on flush failure).
     pub drain: DrainOutcome,
+    /// Seals still held in memory when the shutdown drain stopped: the ring
+    /// plus the writer channel (audit CONC-2, 2026-10-11). Set only by the
+    /// shutdown drain; a normal cycle leaves it 0 and
+    /// [`Self::accumulate`] does not touch it. Main counts it as lost when
+    /// it marks the crash marker at shutdown.
+    pub final_residue: usize,
 }
 
 impl CycleOutcome {
@@ -1162,6 +1168,20 @@ impl SealWriterRunner {
     #[must_use]
     pub fn ring_len(&self) -> usize {
         self.pipeline.ring_len()
+    }
+
+    /// Seals waiting in the writer channel that no cycle has taken yet
+    /// (audit CONC-2, 2026-10-11). The shutdown drain reads it beside
+    /// [`Self::ring_len`]: a seal sent while a cycle flushes lands here after
+    /// that cycle's `try_recv` already saw the channel empty, so an empty
+    /// ring alone does not mean nothing is left.
+    ///
+    /// # Complexity
+    /// O(1): `crossbeam_channel::Receiver::len` on a bounded channel reads
+    /// two indices. No allocation.
+    #[must_use]
+    pub fn queued_seals(&self) -> usize {
+        self.receiver.len()
     }
 
     /// Sealed candles this process holds in memory and has not yet written
@@ -1565,6 +1585,40 @@ mod tests {
             ..CycleOutcome::default()
         };
         assert!(!o.is_idle());
+    }
+
+    /// Audit CONC-2: `queued_seals` reads the writer channel, not the ring.
+    #[test]
+    fn test_queued_seals_reads_the_channel_not_the_ring() {
+        let (spill, dlq) = temp_pair("queued-seals");
+        let mut runner = SealWriterRunner::for_test(spill.clone(), dlq.clone(), 16, 16, 0);
+        let tx = runner.sender();
+        for i in 0..3u32 {
+            tx.try_send(mk_seal(13, 0, TfIndex::M1, 1_716_000_000 + i * 60, 100.0))
+                .expect("queued");
+        }
+        assert_eq!(runner.queued_seals(), 3);
+        assert_eq!(runner.ring_len(), 0);
+        // A cycle with no drain budget moves the channel into the ring.
+        let _ = runner.run_one_cycle(1_716_000_000);
+        assert_eq!(runner.queued_seals(), 0);
+        assert_eq!(runner.ring_len(), 3);
+        cleanup(&spill, &dlq);
+    }
+
+    /// Audit CONC-2: `final_residue` is a shutdown-only figure; folding cycles
+    /// together never changes it.
+    #[test]
+    fn test_cycle_outcome_accumulate_leaves_final_residue_alone() {
+        let mut total = CycleOutcome::default();
+        let other = CycleOutcome {
+            submitted_from_mpsc: 2,
+            final_residue: 9,
+            ..CycleOutcome::default()
+        };
+        total.accumulate(&other);
+        assert_eq!(total.submitted_from_mpsc, 2);
+        assert_eq!(total.final_residue, 0);
     }
 
     #[test]

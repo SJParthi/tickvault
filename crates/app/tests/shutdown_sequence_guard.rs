@@ -81,3 +81,138 @@ fn wait_for_shutdown_signal_covers_sigterm_and_ctrl_c() {
         "wait_for_shutdown_signal must accept SIGTERM (unix prod)"
     );
 }
+
+/// Production source of main.rs with `//` comment lines removed, so a comment
+/// naming a call can never satisfy a pin.
+fn main_rs_code() -> String {
+    main_rs()
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The body of `async fn wait_for_shutdown_signal()`, up to the next item.
+fn wait_fn_body(code: &str) -> String {
+    let start = code
+        .find("async fn wait_for_shutdown_signal()")
+        .expect("main.rs defines wait_for_shutdown_signal");
+    let rest = &code[start..];
+    let end = rest[1..]
+        .find("\n#[cfg(test)]")
+        .or_else(|| rest[1..].find("\nfn "))
+        .map_or(rest.len(), |e| e + 1);
+    rest[..end].to_string()
+}
+
+/// Regression: 2026-10-11 (audit CONC-5) — each wait built fresh signal
+/// streams and dropped them on return. A tokio stream subscribes at the
+/// current version, so a SIGTERM delivered between two waits reached no one,
+/// and systemd SIGKILLed the process after TimeoutStopSec. The streams are
+/// now created once, in the first wait, and kept in a static slot.
+#[test]
+fn shutdown_signal_streams_are_created_once_not_per_wait() {
+    let code = main_rs_code();
+    assert!(
+        code.contains("static SHUTDOWN_SIGNALS:"),
+        "the shutdown-signal streams must live in a static slot that outlives a wait"
+    );
+    let body = wait_fn_body(&code);
+    let lock = body
+        .find("SHUTDOWN_SIGNALS.lock()")
+        .expect("the wait reads the persistent slot");
+    let first_use = body
+        .find("if slot.is_none()")
+        .expect("the streams are created only when the slot is empty");
+    let create = body
+        .find("signal(SignalKind::terminate())")
+        .expect("the wait still listens for SIGTERM");
+    assert!(
+        lock < first_use && first_use < create,
+        "SIGTERM's stream must be created inside the first-use branch, after the slot is read"
+    );
+    assert_eq!(
+        body.matches("signal(SignalKind::terminate())").count(),
+        1,
+        "exactly one SIGTERM stream creation, on first use"
+    );
+    assert!(
+        body.contains(".terminate.recv()") && body.contains(".interrupt.recv()"),
+        "the wait polls the persistent streams"
+    );
+}
+
+/// Regression: 2026-10-11 (audit CONC-5) — the post-market drain sleep and
+/// partition detach ran with no shutdown signal being listened for. They now
+/// race the signal wait, which wins.
+#[test]
+fn post_market_housekeeping_is_preemptible_by_the_shutdown_signal() {
+    let code = main_rs_code();
+    let detach = code
+        .find("detach_old_partitions()")
+        .expect("the post-market detach still runs");
+    let housekeeping = code
+        .find("let post_market_housekeeping = async {")
+        .expect("the post-market housekeeping is one future");
+    assert!(
+        housekeeping < detach,
+        "the detach runs inside the housekeeping future"
+    );
+    let select_at = code[detach..]
+        .find("tokio::select!")
+        .map(|i| detach + i)
+        .expect("the housekeeping future is raced against the signal");
+    let select = &code[select_at..];
+    let select = &select[..select.find("};").expect("select! ends")];
+    assert!(select.contains("biased;"), "the signal arm is polled first");
+    let signal = select
+        .find("wait_for_shutdown_signal()")
+        .expect("one arm waits for the shutdown signal");
+    let work = select
+        .find("post_market_housekeeping")
+        .expect("the other arm runs the housekeeping");
+    assert!(
+        signal < work,
+        "the signal arm comes first in the biased select"
+    );
+}
+
+/// Audit CONC-4 (2026-10-11): a clean stop releases the dual-instance lock
+/// after the WAL floor (nothing can still need it) and before the notifier
+/// flush (a slow Telegram cannot eat its budget).
+#[test]
+fn shutdown_releases_the_instance_lock_after_the_wal_and_before_the_notifier() {
+    let code = main_rs_code();
+    let wal = code
+        .find("spill.shutdown(")
+        .expect("shutdown drains the WAL writer");
+    let release = code
+        .find("release_instance_lock_at_shutdown(")
+        .expect("shutdown releases the dual-instance lock");
+    let notifier = code
+        .find("notifier.shutdown_flush()")
+        .expect("shutdown flushes the notifier");
+    assert!(wal < release, "the lock is released after the WAL floor");
+    assert!(
+        release < notifier,
+        "the lock is released before the notifier flush"
+    );
+    assert!(
+        code[release..notifier].contains("INSTANCE_LOCK_RELEASE_BUDGET"),
+        "the release is bounded by INSTANCE_LOCK_RELEASE_BUDGET"
+    );
+
+    let stack = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/dhan_rest_stack.rs"),
+    )
+    .expect("dhan_rest_stack.rs must be readable");
+    let prod = stack.split("#[cfg(test)]").next().unwrap_or(&stack);
+    assert!(
+        !prod.contains("let _heartbeat_handle"),
+        "the heartbeat handle must be kept, not discarded"
+    );
+    assert!(
+        prod.contains("INSTANCE_LOCK_HEARTBEAT"),
+        "the heartbeat is registered for the shutdown release"
+    );
+}

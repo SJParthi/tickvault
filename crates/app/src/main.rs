@@ -4046,6 +4046,17 @@ static SEAL_UNWRITTEN_MARK_DIR: std::sync::OnceLock<std::path::PathBuf> =
 /// disk cannot hold the shutdown before the WAL floor drains.
 const SEAL_UNWRITTEN_MARK_FINISH_BUDGET_SECS: u64 = 2;
 
+/// Budget for releasing the dual-instance lock at shutdown (audit CONC-4,
+/// 2026-10-11): one SSM read and one delete, normally well under a second.
+/// Bounded so an unreachable SSM cannot hold the stop; the 90s TTL clears
+/// the lock if the release does not finish. Counted in the sequential sum
+/// `shutdown_budget_fits_systemd_guard.rs` checks.
+const INSTANCE_LOCK_RELEASE_BUDGET_SECS: u64 = 3;
+
+/// [`INSTANCE_LOCK_RELEASE_BUDGET_SECS`] as a `Duration`.
+const INSTANCE_LOCK_RELEASE_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(INSTANCE_LOCK_RELEASE_BUDGET_SECS);
+
 /// [`SEAL_UNWRITTEN_MARK_FINISH_BUDGET_SECS`] as a `Duration`.
 const SEAL_UNWRITTEN_MARK_FINISH_BUDGET: std::time::Duration =
     std::time::Duration::from_secs(SEAL_UNWRITTEN_MARK_FINISH_BUDGET_SECS);
@@ -5038,7 +5049,8 @@ const DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS: u64 = 30;
 /// Sized from the close path, not guessed: a socket sees the stop within one
 /// 1 s idle poll, then spends at most two 2 s `CLOSE_HANDSHAKE_WAIT`s (the
 /// Close write and the drain of the peer's reply). 5 s covers that and keeps
-/// the guard's 20 s margin at `TimeoutStopSec=145`.
+/// the guard's 20 s margin at `TimeoutStopSec=145`. (⚠ 2026-10-11, audit
+/// CONC-1: that sum missed two waits; the timeout is 165 now.)
 const DHAN_SOCKET_STOP_BUDGET_SECS: u64 = 5;
 
 /// [`DHAN_SOCKET_STOP_BUDGET_SECS`] as a `Duration`.
@@ -5195,62 +5207,86 @@ async fn run_process_runloop(
             );
         }
 
-        // Drain buffer: let in-flight ticks (last 15:29 candle) settle in the
-        // Groww bridge / seal writer before post-market housekeeping. (PR-C2,
-        // 2026-07-13: the Dhan lane abort block that followed this sleep is
-        // deleted with the lane — the Groww lane self-manages via its own
-        // dormancy gates; the order-update WS stays alive until app shutdown.)
-        let drain = std::time::Duration::from_secs(
-            tickvault_common::constants::MARKET_CLOSE_DRAIN_BUFFER_SECS,
-        );
-        tokio::time::sleep(drain).await;
+        // Audit CONC-5 (2026-10-11): the drain sleep and the partition detach
+        // below are pre-emptible by a shutdown signal. Until this date a
+        // SIGTERM that landed here (a deploy or stop just after 15:30) reached
+        // no live signal stream, was lost, and systemd SIGKILLed the process
+        // after TimeoutStopSec. The detach is idempotent and runs again the
+        // next day, so abandoning it loses nothing.
+        let post_market_housekeeping = async {
+            // Drain buffer: let in-flight ticks (last 15:29 candle) settle in the
+            // Groww bridge / seal writer before post-market housekeeping. (PR-C2,
+            // 2026-07-13: the Dhan lane abort block that followed this sleep is
+            // deleted with the lane — the Groww lane self-manages via its own
+            // dormancy gates; the order-update WS stays alive until app shutdown.)
+            let drain = std::time::Duration::from_secs(
+                tickvault_common::constants::MARKET_CLOSE_DRAIN_BUFFER_SECS,
+            );
+            tokio::time::sleep(drain).await;
 
-        // The daily archive sweep used to run HERE, inline. It now runs from
-        // `daily_archive_boot::spawn_supervised_daily_archive_loop`, spawned at
-        // boot, because this arm is unreachable on any run that started after
-        // 15:30 IST and is skipped entirely when shutdown arrives by SIGTERM —
-        // which is how the 17:30 box stop always arrives. Keeping a second copy
-        // here would give the sweep two drivers that could drift; there is now
-        // exactly one.
+            // The daily archive sweep used to run HERE, inline. It now runs from
+            // `daily_archive_boot::spawn_supervised_daily_archive_loop`, spawned at
+            // boot, because this arm is unreachable on any run that started after
+            // 15:30 IST and is skipped entirely when shutdown arrives by SIGTERM —
+            // which is how the 17:30 box stop always arrives. Keeping a second copy
+            // here would give the sweep two drivers that could drift; there is now
+            // exactly one.
 
-        // Post-market: detach old QuestDB partitions (Phase B).
-        // Runs daily after pipeline stops — keeps hot data bounded to retention_days.
-        // KEPT even with the archive leg enabled: the daily archive loop drops
-        // aged partitions first, so this legacy cycle finds nothing new — but its
-        // `total_detached=…` log lines keep firing so the CloudWatch evidence
-        // trail (the 15:30 IST "partition" filter) continues uninterrupted.
-        {
-            let retention_days = config.partition_retention.retention_days;
-            if retention_days > 0 {
-                match tickvault_storage::partition_manager::PartitionManager::new(
-                    &config.questdb,
-                    retention_days,
-                ) {
-                    Ok(pm) => match pm.detach_old_partitions().await {
-                        Ok(count) => {
-                            info!(
-                                detached = count,
-                                retention_days, "post-market partition detach complete"
-                            );
-                        }
+            // Post-market: detach old QuestDB partitions (Phase B).
+            // Runs daily after pipeline stops — keeps hot data bounded to retention_days.
+            // KEPT even with the archive leg enabled: the daily archive loop drops
+            // aged partitions first, so this legacy cycle finds nothing new — but its
+            // `total_detached=…` log lines keep firing so the CloudWatch evidence
+            // trail (the 15:30 IST "partition" filter) continues uninterrupted.
+            {
+                let retention_days = config.partition_retention.retention_days;
+                if retention_days > 0 {
+                    match tickvault_storage::partition_manager::PartitionManager::new(
+                        &config.questdb,
+                        retention_days,
+                    ) {
+                        Ok(pm) => match pm.detach_old_partitions().await {
+                            Ok(count) => {
+                                info!(
+                                    detached = count,
+                                    retention_days, "post-market partition detach complete"
+                                );
+                            }
+                            Err(err) => {
+                                warn!(?err, "post-market partition detach failed (non-critical)");
+                            }
+                        },
                         Err(err) => {
-                            warn!(?err, "post-market partition detach failed (non-critical)");
+                            warn!(?err, "partition manager creation failed (non-critical)");
                         }
-                    },
-                    Err(err) => {
-                        warn!(?err, "partition manager creation failed (non-critical)");
                     }
                 }
             }
-        }
 
-        info!("post-market: housekeeping complete — scheduled tasks continue");
+            info!("post-market: housekeeping complete — scheduled tasks continue");
+        };
+        let signal_during_housekeeping = tokio::select! {
+            biased;
+            reason = wait_for_shutdown_signal() => Some(reason),
+            () = post_market_housekeeping => None,
+        };
+        if let Some(reason) = signal_during_housekeeping {
+            info!(
+                reason,
+                "shutdown signal during post-market housekeeping — skipping the rest"
+            );
+        }
 
         // Phase 2: App runs 24/7. Only Ctrl+C / SIGTERM stops it.
         // No auto-shutdown — the daily reset signal at 16:00 IST handles
         // candle aggregator reset, indicator flush, etc. without stopping the app.
-        info!("post-market tasks running — app stays alive (Ctrl+C to stop)");
-        let reason = wait_for_shutdown_signal().await;
+        let reason = match signal_during_housekeeping {
+            Some(reason) => reason,
+            None => {
+                info!("post-market tasks running — app stays alive (Ctrl+C to stop)");
+                wait_for_shutdown_signal().await
+            }
+        };
         info!(
             reason,
             "shutdown signal received — stopping remaining services"
@@ -5362,24 +5398,35 @@ async fn run_process_runloop(
     // ERROR rather than exiting quietly — a flush that did not finish is not
     // the same as one that did, and the operator must be able to tell.
     dhan_feed_shutdown.notify_one();
+    // Audit CONC-2 (2026-10-11): whether this shutdown saw the whole sealed-
+    // candle tail written. Cleared by a lane that overran its budget (it may
+    // still seal, and those seals go to the durable spill) and by any seal
+    // writer outcome other than a clean, residue-free drain. Read at 5b-2c.
+    let mut seal_tail_complete = true;
     if let Some(handle) = dhan_feed_stack_monitor {
         match tokio::time::timeout(DHAN_LANE_SHUTDOWN_FLUSH_BUDGET, handle).await {
             Ok(Ok(())) => info!("Dhan live feed: sealed and flushed cleanly on shutdown"),
-            Ok(Err(err)) => error!(
-                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
-                %err,
-                "Dhan live feed: the lane task failed while shutting down — the day's tail may \
-                 not have been persisted"
-            ),
+            Ok(Err(err)) => {
+                seal_tail_complete = false;
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                    %err,
+                    "Dhan live feed: the lane task failed while shutting down — the day's tail may \
+                     not have been persisted"
+                );
+            }
             // The budget is read from the constant — this line said "within 20s"
             // for a month after the budget was raised to 30 (2026-08-28).
-            Err(_) => error!(
-                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
-                budget_secs = DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS,
-                "Dhan live feed: the shutdown seal+flush did NOT finish within \
-                 {DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS}s — exiting anyway so systemd does not \
-                 SIGKILL us, but the day's tail may be incomplete"
-            ),
+            Err(_) => {
+                seal_tail_complete = false;
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                    budget_secs = DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS,
+                    "Dhan live feed: the shutdown seal+flush did NOT finish within \
+                     {DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS}s — exiting anyway so systemd does not \
+                     SIGKILL us, but the day's tail may be incomplete"
+                );
+            }
         }
     }
 
@@ -5398,10 +5445,17 @@ async fn run_process_runloop(
     if let Some(cancel) = SEAL_WRITER_CANCEL.get() {
         let _ = cancel.send(true);
     }
+    // Seals the writer's final drain left in memory (audit CONC-2), counted
+    // as lost in the crash marker at 5b-2c.
+    let mut seal_final_residue = 0_usize;
     let seal_handle = SEAL_WRITER_HANDLE.lock().ok().and_then(|mut s| s.take());
     if let Some(handle) = seal_handle {
         match tokio::time::timeout(SEAL_WRITER_SHUTDOWN_BUDGET, handle).await {
             Ok(Ok(outcome)) => {
+                seal_final_residue = outcome.final_residue;
+                if outcome.final_residue > 0 || outcome.mpsc_submit_dropped > 0 {
+                    seal_tail_complete = false;
+                }
                 if outcome.mpsc_submit_dropped > 0 {
                     error!(
                         code = tickvault_common::error_code::ErrorCode::AggregatorDrop01.code_str(),
@@ -5420,19 +5474,24 @@ async fn run_process_runloop(
                     "seal writer: final drain complete on shutdown"
                 );
             }
-            Ok(Err(err)) => error!(
-                code = tickvault_common::error_code::ErrorCode::AggregatorDrop01
-                    .code_str(),
-                %err,
-                "seal writer: the task failed during its final drain — the day's tail may not \
-                 have been persisted"
-            ),
-            Err(_) => error!(
-                code = tickvault_common::error_code::ErrorCode::AggregatorDrop01.code_str(),
-                budget_secs = SEAL_WRITER_SHUTDOWN_BUDGET.as_secs(),
-                "seal writer: the final drain did NOT finish within budget — exiting anyway so \
-                 systemd does not SIGKILL us, but the day's tail is incomplete"
-            ),
+            Ok(Err(err)) => {
+                seal_tail_complete = false;
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::AggregatorDrop01.code_str(),
+                    %err,
+                    "seal writer: the task failed during its final drain — the day's tail may \
+                     not have been persisted"
+                );
+            }
+            Err(_) => {
+                seal_tail_complete = false;
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::AggregatorDrop01.code_str(),
+                    budget_secs = SEAL_WRITER_SHUTDOWN_BUDGET.as_secs(),
+                    "seal writer: the final drain did NOT finish within budget — exiting anyway \
+                     so systemd does not SIGKILL us, but the day's tail is incomplete"
+                );
+            }
         }
     }
 
@@ -5520,9 +5579,13 @@ async fn run_process_runloop(
         let dir = dir.clone();
         let now = chrono::Utc::now().timestamp();
         let finish = tokio::task::spawn_blocking(move || {
+            // The writer's residue is lost as surely as the abandoned
+            // escalation queue, and an incomplete tail names the last real
+            // drain instant rather than `now` (audit CONC-2, 2026-10-11).
             tickvault_storage::seal_writer_loop::finish_unwritten_mark_at_shutdown(
                 &dir,
-                seals_escalation_abandoned,
+                seals_escalation_abandoned.saturating_add(seal_final_residue),
+                seal_tail_complete,
                 now,
             )
         });
@@ -5573,6 +5636,20 @@ async fn run_process_runloop(
             );
         }
     }
+    // 5b-4. Release the dual-instance lock (audit CONC-4, 2026-10-11).
+    //
+    // AFTER the WAL floor: no socket, drain or WAL writer is left, so nothing
+    // here can still need the lock, and the release flips the held flag off
+    // first, which refuses any late mint (RESILIENCE-03). BEFORE the notifier
+    // flush, so a slow Telegram cannot eat the budget. Until this date the
+    // heartbeat was never told to stop and every clean stop left the lock in
+    // SSM for the 90s TTL, so a restart in market hours opened no socket for
+    // that long. Bounded: past the budget the TTL clears it as before.
+    let _ = tickvault_app::dhan_rest_stack::release_instance_lock_at_shutdown(
+        INSTANCE_LOCK_RELEASE_BUDGET,
+    )
+    .await;
+
     // 5c. Telegram UX overhaul (2026-07-07): flush pending coalesced
     // summaries + write the final episode snapshot (bounded 10s inside
     // shutdown_flush — a black-holed Telegram can never hang exit).
@@ -5594,29 +5671,71 @@ async fn run_process_runloop(
 // Helper: Wait for shutdown signal (SIGINT or SIGTERM)
 // ---------------------------------------------------------------------------
 
+/// The SIGTERM and SIGINT streams, created on the first wait and kept for the
+/// process (audit CONC-5, 2026-10-11).
+///
+/// A tokio signal stream sees only signals delivered while it exists: a new
+/// stream subscribes at the current version, so a signal that arrived while
+/// no stream was alive is recorded and broadcast to no one. Until this date
+/// each wait built fresh streams and dropped them on return, so a SIGTERM in
+/// the gap between the two waits (the post-market drain sleep and the
+/// partition detach) was lost: tokio's handler stayed installed, the default
+/// kill did not run either, and systemd SIGKILLed the process after
+/// `TimeoutStopSec` with the live lane still unflushed. A stream kept here
+/// buffers a signal delivered between waits, and the next wait returns at
+/// once.
+#[cfg(unix)]
+struct ShutdownSignals {
+    terminate: tokio::signal::unix::Signal,
+    interrupt: tokio::signal::unix::Signal,
+}
+
+/// See [`ShutdownSignals`]. `None` until the first wait, so a SIGTERM during
+/// boot keeps its default effect exactly as before.
+#[cfg(unix)]
+static SHUTDOWN_SIGNALS: tokio::sync::Mutex<Option<ShutdownSignals>> =
+    tokio::sync::Mutex::const_new(None);
+
 /// Waits for either SIGINT (Ctrl+C) or SIGTERM and returns the signal name.
 ///
 /// SIGTERM support enables graceful shutdown from Docker (`docker stop`).
+/// The streams persist across calls (see [`ShutdownSignals`]), so a signal
+/// delivered between two waits is returned by the next one. Cancel-safe:
+/// dropping the future drops only the lock guard, never the streams.
 async fn wait_for_shutdown_signal() -> &'static str {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
-        let mut sigterm = match signal(SignalKind::terminate()) {
-            Ok(s) => s,
-            Err(err) => {
-                warn!(?err, "SIGTERM handler failed — falling back to SIGINT only");
-                let _ = tokio::signal::ctrl_c().await;
-                return "ctrl_c";
+        let mut slot = SHUTDOWN_SIGNALS.lock().await;
+        if slot.is_none() {
+            // First use only: the same moment the streams were created
+            // before, so boot-time SIGTERM behaviour is unchanged.
+            match (
+                signal(SignalKind::terminate()),
+                signal(SignalKind::interrupt()),
+            ) {
+                (Ok(terminate), Ok(interrupt)) => {
+                    *slot = Some(ShutdownSignals {
+                        terminate,
+                        interrupt,
+                    });
+                }
+                (Err(err), _) | (_, Err(err)) => {
+                    drop(slot);
+                    warn!(?err, "SIGTERM handler failed — falling back to SIGINT only");
+                    let _ = tokio::signal::ctrl_c().await;
+                    return "ctrl_c";
+                }
             }
+        }
+        let Some(signals) = slot.as_mut() else {
+            return "ctrl_c";
         };
         tokio::select! {
-            result = tokio::signal::ctrl_c() => {
-                if let Err(err) = result {
-                    warn!(?err, "failed to listen for SIGINT");
-                }
+            _ = signals.interrupt.recv() => {
                 "ctrl_c"
             }
-            _ = sigterm.recv() => {
+            _ = signals.terminate.recv() => {
                 info!("SIGTERM received — initiating graceful shutdown");
                 "sigterm"
             }
@@ -5637,6 +5756,32 @@ async fn wait_for_shutdown_signal() -> &'static str {
 #[allow(clippy::assertions_on_constants)]
 mod tests {
     use super::*;
+
+    /// Audit CONC-5 (2026-10-11): the shutdown-signal streams are created on
+    /// the first wait and outlive it, so a signal delivered between two waits
+    /// reaches the second. Before the fix each wait built and dropped its own
+    /// streams and no slot existed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_signal_slot_is_reused_across_calls() {
+        let wait = std::time::Duration::from_millis(1);
+        assert!(
+            tokio::time::timeout(wait, wait_for_shutdown_signal())
+                .await
+                .is_err(),
+            "no signal was sent"
+        );
+        assert!(
+            SHUTDOWN_SIGNALS.lock().await.is_some(),
+            "the streams outlive the wait that created them"
+        );
+        assert!(
+            tokio::time::timeout(wait, wait_for_shutdown_signal())
+                .await
+                .is_err()
+        );
+        assert!(SHUTDOWN_SIGNALS.lock().await.is_some());
+    }
 
     #[test]
     fn reader_pin_report_covers_every_plan_and_never_reports_a_failed_pin_as_pinned() {

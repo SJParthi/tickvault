@@ -90,6 +90,16 @@
 //! against TRANSIENT failures comes from the internal retry-forever loops
 //! (every failure arm is a typed-error `match`, no unwrap/expect).
 //!
+//! **⚠ CHANGED 2026-10-11 (audit CONC-4) — a clean stop now releases the
+//! lock.** The heartbeat's shutdown `Notify` and `JoinHandle` are kept in a
+//! static, and main calls [`release_instance_lock_at_shutdown`] after the
+//! WAL floor has drained and before the notifier flush, bounded at
+//! `INSTANCE_LOCK_RELEASE_BUDGET_SECS`. The heartbeat flips the held flag
+//! off (so the RESILIENCE-03 tripwire refuses any late mint) and deletes the
+//! parameter only if this process still owns it. A crash, a SIGKILL or a
+//! release past the budget still relies on the 90s TTL, and the text below
+//! describes that case. Kept as written:
+//!
 //! **Graceful-shutdown honest envelope:** the SSM lock heartbeat here has no
 //! shutdown-notify chain (the lane's Item 19f bridge is lane-scoped), so a
 //! process stop leaves the lock parameter in SSM until the 90s TTL clears
@@ -152,6 +162,107 @@ const DHAN_REST_STACK_TOKEN_RETRY_FLOOR_SECS: u64 = 130;
 /// twice (N stacks = N heartbeats + N renewal loops + N spot/chain
 /// families). First caller wins; later calls log INFO and return `None`.
 static DHAN_REST_STACK_SPAWNED: AtomicBool = AtomicBool::new(false);
+
+/// The lock heartbeat's shutdown signal and task, kept so a clean stop can
+/// release the dual-instance lock instead of leaving it for the 90s TTL
+/// (audit CONC-4, 2026-10-11). Set once, when the stack acquires the lock;
+/// taken once, at shutdown.
+type HeartbeatSlot =
+    std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, tokio::task::JoinHandle<()>)>>;
+
+/// See [`HeartbeatSlot`].
+static INSTANCE_LOCK_HEARTBEAT: HeartbeatSlot = std::sync::Mutex::new(None);
+
+/// What [`release_instance_lock_at_shutdown`] found (audit CONC-4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LockReleaseAtShutdown {
+    /// No heartbeat is running: the lock was never acquired in this process,
+    /// or the heartbeat had already exited (lost ownership).
+    NotHeld,
+    /// The heartbeat ran its release and exited inside the budget.
+    Released,
+    /// The heartbeat did not finish inside the budget; the 90s TTL clears
+    /// the lock instead.
+    TimedOut,
+}
+
+impl LockReleaseAtShutdown {
+    /// Label for `tv_instance_lock_release_at_shutdown_total{outcome}`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotHeld => "not_held",
+            Self::Released => "released",
+            Self::TimedOut => "timed_out",
+        }
+    }
+}
+
+/// Release the dual-instance lock on a clean stop (audit CONC-4, 2026-10-11).
+///
+/// Signals the lock heartbeat, which flips the held flag off and deletes the
+/// SSM parameter if this process still owns it, then waits for it at most
+/// `budget`. Until this date nothing signalled the heartbeat, so every clean
+/// stop (deploy, restart, the 17:30 stop) left the lock in SSM for the 90s
+/// TTL plus the takeover settle, and a restart inside market hours opened no
+/// Dhan socket for that window.
+///
+/// Call once, after every Dhan socket and the WAL writer have stopped: the
+/// released flag refuses any later mint. Cold path; a local counter only, no
+/// page and no alarm.
+pub async fn release_instance_lock_at_shutdown(budget: Duration) -> LockReleaseAtShutdown {
+    let outcome = release_registered(&INSTANCE_LOCK_HEARTBEAT, budget).await;
+    metrics::counter!(
+        "tv_instance_lock_release_at_shutdown_total",
+        "outcome" => outcome.as_str()
+    )
+    .increment(1);
+    match outcome {
+        LockReleaseAtShutdown::Released => {
+            info!("Dhan REST-only stack: dual-instance lock released on shutdown");
+        }
+        LockReleaseAtShutdown::NotHeld => {
+            debug!("Dhan REST-only stack: no dual-instance lock to release on shutdown");
+        }
+        LockReleaseAtShutdown::TimedOut => {
+            // Same level as the heartbeat's own failed release: the TTL
+            // still clears the lock, so this is degraded, not lost.
+            warn!(
+                code = ErrorCode::Resilience01DualInstanceDetected.code_str(),
+                stage = "release_at_shutdown_timed_out",
+                budget_secs = budget.as_secs(),
+                "Dhan REST-only stack: the dual-instance lock release did not finish within \
+                 budget — the next boot waits for the 90s TTL instead"
+            );
+        }
+    }
+    outcome
+}
+
+/// The body of [`release_instance_lock_at_shutdown`], over an explicit slot so
+/// tests can drive it. The slot's lock is held only for the take, never across
+/// an `.await`.
+///
+/// # Complexity
+/// O(1) plus one bounded wait.
+async fn release_registered(slot: &HeartbeatSlot, budget: Duration) -> LockReleaseAtShutdown {
+    let taken = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    let Some((shutdown, handle)) = taken else {
+        return LockReleaseAtShutdown::NotHeld;
+    };
+    if handle.is_finished() {
+        // Exited on lost ownership: there is nothing of ours to release.
+        return LockReleaseAtShutdown::NotHeld;
+    }
+    shutdown.notify_one();
+    match tokio::time::timeout(budget, handle).await {
+        Ok(_) => LockReleaseAtShutdown::Released,
+        Err(_) => LockReleaseAtShutdown::TimedOut,
+    }
+}
 
 /// Process-global once-guard for the Dhan-REST SCHEDULED TASK FAMILY
 /// (spot_1m_rest + option_chain_1m; the REST canary left the family
@@ -567,18 +678,22 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
         }
     }
 
-    // Lock held — spawn the heartbeat. The shutdown Notify is deliberately
-    // never notified (this stack lives for the process lifetime; see the
-    // module-docs graceful-shutdown honest envelope: the 90s TTL clears the
-    // lock for the next boot).
+    // Lock held — spawn the heartbeat. Its shutdown Notify and handle are
+    // kept so a clean stop releases the lock (audit CONC-4, 2026-10-11; this
+    // said "deliberately never notified" until then, which left every clean
+    // stop's lock in SSM for the 90s TTL).
     let heartbeat_shutdown = Arc::new(tokio::sync::Notify::new());
-    let _heartbeat_handle = instance_lock::spawn_instance_lock_heartbeat(
+    let heartbeat_handle = instance_lock::spawn_instance_lock_heartbeat(
         Arc::clone(&ssm_client),
         env.clone(),
         host_id.clone(),
-        heartbeat_shutdown,
+        Arc::clone(&heartbeat_shutdown),
         Arc::clone(&instance_lock_held),
     );
+    *INSTANCE_LOCK_HEARTBEAT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some((heartbeat_shutdown, heartbeat_handle));
 
     // -----------------------------------------------------------------------
     // Phase 2: TokenManager (SSM creds → TOTP → JWT), the SAME wiring the
@@ -1210,6 +1325,86 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// Audit CONC-4: the shutdown release signals the heartbeat and waits for
+    /// it to finish.
+    #[tokio::test]
+    async fn release_registered_notifies_the_heartbeat_and_waits_for_it() {
+        let slot: super::HeartbeatSlot = std::sync::Mutex::new(None);
+        let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task = {
+            let notify = std::sync::Arc::clone(&notify);
+            let released = std::sync::Arc::clone(&released);
+            tokio::spawn(async move {
+                notify.notified().await;
+                released.store(true, std::sync::atomic::Ordering::Release);
+            })
+        };
+        *slot.lock().expect("slot") = Some((notify, task));
+        let outcome = super::release_registered(&slot, std::time::Duration::from_secs(3)).await;
+        assert_eq!(outcome, super::LockReleaseAtShutdown::Released);
+        assert!(released.load(std::sync::atomic::Ordering::Acquire));
+        assert!(slot.lock().expect("slot").is_none(), "taken exactly once");
+    }
+
+    /// Audit CONC-4: a heartbeat that ignores the signal costs the budget,
+    /// never more.
+    #[tokio::test(start_paused = true)]
+    async fn release_registered_gives_up_at_the_budget() {
+        let slot: super::HeartbeatSlot = std::sync::Mutex::new(None);
+        let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+        let task = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        *slot.lock().expect("slot") = Some((notify, task));
+        let started = tokio::time::Instant::now();
+        let outcome = super::release_registered(&slot, std::time::Duration::from_secs(3)).await;
+        assert_eq!(outcome, super::LockReleaseAtShutdown::TimedOut);
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(3));
+    }
+
+    /// Audit CONC-4: nothing registered (lock never acquired) does not wait.
+    #[tokio::test(start_paused = true)]
+    async fn release_registered_on_an_empty_slot_is_not_held() {
+        let slot: super::HeartbeatSlot = std::sync::Mutex::new(None);
+        let started = tokio::time::Instant::now();
+        let outcome = super::release_registered(&slot, std::time::Duration::from_secs(3)).await;
+        assert_eq!(outcome, super::LockReleaseAtShutdown::NotHeld);
+        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+    }
+
+    /// Audit CONC-4: a heartbeat that already exited (lost ownership) has
+    /// nothing of ours to release.
+    #[tokio::test]
+    async fn release_registered_after_the_heartbeat_exited_is_not_held() {
+        let slot: super::HeartbeatSlot = std::sync::Mutex::new(None);
+        let task = tokio::spawn(async {});
+        while !task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        *slot.lock().expect("slot") = Some((std::sync::Arc::new(tokio::sync::Notify::new()), task));
+        let outcome = super::release_registered(&slot, std::time::Duration::from_secs(3)).await;
+        assert_eq!(outcome, super::LockReleaseAtShutdown::NotHeld);
+    }
+
+    #[test]
+    fn test_lock_release_at_shutdown_labels() {
+        use super::LockReleaseAtShutdown as L;
+        assert_eq!(L::NotHeld.as_str(), "not_held");
+        assert_eq!(L::Released.as_str(), "released");
+        assert_eq!(L::TimedOut.as_str(), "timed_out");
+    }
+
+    /// Audit CONC-4: the stack keeps the heartbeat's handle instead of
+    /// discarding it, so the shutdown can release the lock.
+    #[test]
+    fn the_heartbeat_handle_is_kept_for_the_shutdown_release() {
+        let src = include_str!("dhan_rest_stack.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+        assert!(!prod.contains("let _heartbeat_handle"));
+        assert!(prod.contains("Some((heartbeat_shutdown, heartbeat_handle))"));
+    }
+
     use super::*;
 
     /// `dhan_rest_stack_backoff_secs` — the documented 10→20→40→80→160→300
