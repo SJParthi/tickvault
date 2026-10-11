@@ -51,6 +51,29 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
+      # 2026-10-11: the 2026-10-10 run had 3.25 GB free when the storage
+      # suite ran. The seal escalation spill refuses below its 4 GiB
+      # free-disk floor by design, so its tests failed and a shared rescue
+      # floor table left behind failed a tick_persistence test. The same
+      # suite passes locally with disk (2,207 passed, 0 failed). Same recipe
+      # as the ci.yml coverage job and the safety.yml jobs.
+      - name: Free runner disk space (seal spill 4 GiB free-disk floor)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "=== df -h BEFORE cleanup ==="
+          df -h /
+          sudo rm -rf /usr/share/dotnet \
+                      /usr/local/lib/android \
+                      /opt/ghc \
+                      /usr/local/share/boost \
+                      /opt/hostedtoolcache/CodeQL || true
+          if command -v docker >/dev/null 2>&1; then
+            sudo docker system prune -af >/dev/null 2>&1 || true
+          fi
+          echo "=== df -h AFTER cleanup ==="
+          df -h /
+
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -129,6 +152,12 @@ jobs:
         run: |
           set -euo pipefail
           printf '%s\n' "$ISSUE_BODY" > /tmp/nightly-issue-body.md
+          # 2026-10-11: the labels did not exist, so the issue step failed
+          # and no issue was ever opened. `--force` creates or updates them.
+          gh label create nightly-regression --force --color B60205 \
+            --description "Nightly full-workspace test failure"
+          gh label create auto-triage --force --color FBCA04 \
+            --description "Opened by a workflow for triage"
           gh issue create \
             --title "nightly regression: full-workspace test failed @ ${COMMIT_SHA:0:7}" \
             --body-file /tmp/nightly-issue-body.md \

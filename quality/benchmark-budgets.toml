@@ -12,6 +12,11 @@
 # Maximum allowed regression percentage from baseline
 max_regression_pct = 5.0
 
+# A relative regression whose confident size (median x CI lower bound / (1 + lb))
+# is under this many ns is reported as NOISE, not a regression (2026-10-11:
+# 3-7ns benches failed on 0.3-0.5ns of runner noise). Absolute budgets still gate.
+min_regression_delta_ns = 1.0
+
 [budgets]
 # Core crate — hot path
 # Key must be a substring of (or contain) the criterion bench_function name
