@@ -148,14 +148,22 @@ variable "key_name" {
 # `&&` is not relied on to short-circuit: a value with no "/" reads false
 # instead of erroring. If the secret currently holds a broad CIDR, the next
 # terraform-apply plan fails here until it is narrowed or unset.
+#
+# **⚠ CORRECTED 2026-10-11 (review of SEC-12):** the line above said IPv6
+# /64 or longer was accepted. Its only consumer, the SSH ingress in main.tf,
+# puts the value in `cidr_blocks`, which takes IPv4 only, so an IPv6 value
+# (and the IPv4-mapped `::ffff:0.0.0.0/96`) passed this check and then
+# failed at AWS apply. The check is now IPv4 only: any value containing ":"
+# is refused here, at plan time. IPv6 SSH would need an `ipv6_cidr_blocks`
+# branch in main.tf first.
 variable "operator_cidr" {
   description = "CIDR that may SSH into the instance, e.g. 203.0.113.42/32. Empty = no SSH ingress (use SSM Session Manager)."
   type        = string
   default     = ""
 
   validation {
-    condition     = var.operator_cidr == "" || try(can(cidrhost(var.operator_cidr, 0)) && tonumber(split("/", var.operator_cidr)[1]) >= (length(regexall(":", var.operator_cidr)) > 0 ? 64 : 24), false)
-    error_message = "operator_cidr must be empty (no SSH; use SSM Session Manager) or a narrow CIDR: IPv4 /24 or longer (e.g. 203.0.113.42/32), IPv6 /64 or longer. 0.0.0.0/0, ::/0 and any broader prefix are refused."
+    condition     = var.operator_cidr == "" || try(can(cidrhost(var.operator_cidr, 0)) && length(regexall(":", var.operator_cidr)) == 0 && tonumber(split("/", var.operator_cidr)[1]) >= 24, false)
+    error_message = "operator_cidr must be empty (no SSH; use SSM Session Manager) or a narrow IPv4 CIDR, /24 or longer (e.g. 203.0.113.42/32). 0.0.0.0/0 and any broader prefix are refused, and IPv6 is refused because the SSH rule takes IPv4 only."
   }
 }
 

@@ -159,16 +159,22 @@ async fn run_api_token_reload_loop(config: ApiAuthConfig) {
                         // outcome.
                         if !warned_rejected_episode {
                             warned_rejected_episode = true;
-                            // Names ALL rejection causes so an operator whose
-                            // token boots fine but never rotates (>512 chars
-                            // or embedded whitespace — the boot-vs-rotation
-                            // shape asymmetry, 2026-07-10 hostile review
-                            // MEDIUM #2) can self-diagnose from this line.
+                            // Names ALL rejection causes so an operator can
+                            // self-diagnose from this line.
+                            // **⚠ CORRECTED 2026-10-11 (review of audit
+                            // SEC-9):** the "boots fine but never rotates"
+                            // asymmetry (2026-07-10 hostile review MEDIUM #2)
+                            // is gone: boot and rotation share one shape
+                            // gate. And a value EQUAL to the loaded token is
+                            // now `Unchanged`, never this arm, so a weak token
+                            // paper mode booted on no longer lands here every
+                            // cycle; this arm means SSM holds a DIFFERENT,
+                            // invalid value.
                             warn!(
-                                "GAP-SEC-01: SSM returned a shape-invalid API bearer \
-                                 token (empty, shorter than 32 or longer than 512 \
-                                 chars, or containing whitespace/control chars) — \
-                                 swap rejected; auth \
+                                "GAP-SEC-01: SSM holds a new API bearer token that \
+                                 fails the shape gate (empty, shorter than 32 or \
+                                 longer than 512 characters, not all visible ASCII, \
+                                 or one repeated character) — swap rejected; auth \
                                  continues on the previously loaded token (fix \
                                  /tickvault/<env>/api/bearer-token)"
                             );

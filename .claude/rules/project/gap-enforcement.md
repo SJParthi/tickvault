@@ -207,6 +207,36 @@ for FINNIFTY + MIDCPNIFTY starting at 15:45 IST, post-market close.
 - Empty/missing/wrong token = 401 Unauthorized
 - Test: all `api_auth::tests::*`
 
+> **⚠ CORRECTED 2026-10-11 — the token does not come from `TV_API_TOKEN`.** It is
+> read only from SSM `/tickvault/<env>/api/bearer-token`; there is no env-var
+> fallback (pinned by `test_main_rs_uses_ssm_only_no_env_fallback`). The line
+> above is kept as history.
+
+### 2026-10-11 Update — weak bearer token (audit SEC-9)
+
+- **The floor.** Boot and rotation share one shape gate
+  (`middleware::is_acceptable_bearer_token`): 32 to 512 characters, every one
+  visible ASCII (`!` to `~`, so bytes equal characters), and not one character
+  repeated. A value outside visible ASCII could never be sent in the header,
+  so it would have locked every client out.
+- **At boot** (`middleware::bearer_token_boot_verdict`, unit-tested in all five
+  outcomes): an empty or weak token REFUSES to boot in live mode. In paper mode
+  (the deployed setting) an empty token disables auth and a weak token keeps
+  auth ON with that weak token; each logs one coded GAP-SEC-01 `error!`, which
+  is log-sink-only (no page).
+- **What the boot error means:** the publicly funnelled API port is guarded
+  only by the weak token until SSM holds a better one. Fix:
+  `aws ssm put-parameter --name /tickvault/<env>/api/bearer-token --type SecureString --overwrite`
+  with a random value of 32 or more visible ASCII characters. The reload loop
+  swaps it in within 5 minutes, no restart.
+- **The reload loop.** A re-read equal to the loaded token is `unchanged`, even
+  when that token is weak, so a weak boot token does not count `rejected` every
+  cycle. `rejected` (and its one edge-latched `warn!`) means SSM holds a
+  DIFFERENT value that fails the gate; auth stays on the loaded token.
+- **Honest limit:** paper mode still boots on a weak token. Refusing it there
+  too waits on the owner confirming the stored value passes the gate, so the
+  morning boot cannot be stopped by it.
+
 ### 2026-07-10 Update — 401-burst counter + CloudWatch pager (wave-2 #2)
 
 Every bearer-auth rejection (all 3 arms of `require_bearer_auth` — invalid

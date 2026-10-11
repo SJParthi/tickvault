@@ -140,14 +140,29 @@ pub enum TokenReloadOutcome {
 }
 
 /// Pure shape gate for a re-read token: at least [`BEARER_TOKEN_MIN_LEN`]
-/// bytes, at most [`RELOAD_TOKEN_MAX_LEN`], no whitespace or control
-/// characters. An empty, short or placeholder SSM value can therefore never
-/// replace the live token (which would flip comparisons toward
-/// accept-empty semantics or a guessable secret).
+/// bytes, at most [`RELOAD_TOKEN_MAX_LEN`], every byte visible ASCII
+/// (`!` to `~`: no whitespace, no control characters, no non-ASCII), and not
+/// one character repeated. An empty, short or placeholder SSM value can
+/// therefore never replace the live token (which would flip comparisons
+/// toward accept-empty semantics or a guessable secret).
+///
+/// **⚠ CORRECTED 2026-10-11 (review of audit SEC-9):** the gate accepted
+/// any non-whitespace, non-control character, so a 33-byte value of eleven
+/// three-byte characters passed a floor every message calls "32
+/// characters", and could never be presented: `require_bearer_auth` reads
+/// the header with `HeaderValue::to_str`, which fails on anything outside
+/// visible ASCII, so a rotation to such a value locked out every client
+/// while the loop reported `Rotated`. Visible ASCII only also makes bytes
+/// equal characters. A value of one repeated character (`"x"` × 32) is
+/// refused as a placeholder.
 fn is_valid_reload_token(token: &str) -> bool {
-    token.len() >= BEARER_TOKEN_MIN_LEN
-        && token.len() <= RELOAD_TOKEN_MAX_LEN
-        && token.chars().all(|c| !c.is_whitespace() && !c.is_control())
+    let bytes = token.as_bytes();
+    bytes.len() >= BEARER_TOKEN_MIN_LEN
+        && bytes.len() <= RELOAD_TOKEN_MAX_LEN
+        && bytes.iter().all(u8::is_ascii_graphic)
+        && bytes
+            .first()
+            .is_some_and(|first| bytes.iter().any(|b| b != first))
 }
 
 /// The one shape gate for the API bearer token, shared by the boot check in
@@ -156,6 +171,43 @@ fn is_valid_reload_token(token: &str) -> bool {
 /// O(token length), cold path only (boot, and the ~5 minute re-read).
 pub fn is_acceptable_bearer_token(token: &str) -> bool {
     is_valid_reload_token(token)
+}
+
+/// What boot does with the API bearer token read from SSM, given the mode
+/// (review of audit SEC-9, 2026-10-11). A pure decision so every branch is
+/// unit-tested; `main.rs` matches on it and acts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BearerTokenBootVerdict {
+    /// Shape-valid token: auth enabled on it.
+    Accept,
+    /// Paper mode, empty token: bearer auth is DISABLED (documented dev
+    /// passthrough), logged as a coded error.
+    PaperEmptyAuthDisabled,
+    /// Paper mode, non-empty token that fails the shape gate: auth stays
+    /// ENABLED on that weak token, logged as a coded error.
+    PaperWeakAuthEnabled,
+    /// Live mode, empty token: refuse to boot.
+    RefuseLiveEmpty,
+    /// Live mode, non-empty token that fails the shape gate: refuse to boot.
+    RefuseLiveWeak,
+}
+
+/// Classifies the boot token. `dry_run` is `config.strategy.dry_run`.
+/// O(token length), once at boot.
+///
+/// **Honest limit:** paper mode (`dry_run = true`, the deployed setting)
+/// still boots on a weak token, and the public port is then guarded by that
+/// weak token until SSM is fixed; only live mode refuses. Refusing in paper
+/// mode too waits on the owner confirming the stored value passes the gate,
+/// so the morning boot cannot be stopped by it.
+pub fn bearer_token_boot_verdict(token: &str, dry_run: bool) -> BearerTokenBootVerdict {
+    match (token.is_empty(), is_acceptable_bearer_token(token), dry_run) {
+        (true, _, true) => BearerTokenBootVerdict::PaperEmptyAuthDisabled,
+        (true, _, false) => BearerTokenBootVerdict::RefuseLiveEmpty,
+        (false, true, _) => BearerTokenBootVerdict::Accept,
+        (false, false, true) => BearerTokenBootVerdict::PaperWeakAuthEnabled,
+        (false, false, false) => BearerTokenBootVerdict::RefuseLiveWeak,
+    }
 }
 
 /// Pure floor decision for the 401-triggered out-of-band re-read.
@@ -264,16 +316,25 @@ impl ApiAuthConfig {
     ///
     /// Cold path only (periodic ~5 min cadence / ≥60s-floored OOB) — never
     /// on the request path.
+    ///
+    /// **⚠ CHANGED 2026-10-11 (review of audit SEC-9):** the equality check
+    /// now runs BEFORE the shape gate. Paper mode can boot on a weak token
+    /// (see [`bearer_token_boot_verdict`]); every re-read then returned that
+    /// same value, which was counted `rejected` every cycle and logged as a
+    /// swap rejected "on the previously loaded token" although it IS the
+    /// loaded token. An equal value is now `Unchanged` (boot already logged
+    /// the weak token once); only a differing value meets the shape gate.
+    /// A weak value can still never be swapped IN.
     pub fn rotate_bearer_token(&self, new_token: SecretString) -> TokenReloadOutcome {
-        if !is_valid_reload_token(new_token.expose_secret()) {
-            return TokenReloadOutcome::RejectedInvalid;
-        }
         let current = self.bearer_token.load();
         if constant_time_token_eq(
             new_token.expose_secret().as_bytes(),
             current.expose_secret().as_bytes(),
         ) {
             return TokenReloadOutcome::Unchanged;
+        }
+        if !is_valid_reload_token(new_token.expose_secret()) {
+            return TokenReloadOutcome::RejectedInvalid;
         }
         self.bearer_token.store(Arc::new(new_token));
         TokenReloadOutcome::Rotated
@@ -1952,7 +2013,7 @@ mod tests {
             !is_valid_reload_token(&oversized),
             "oversized must be rejected"
         );
-        let at_cap = "x".repeat(RELOAD_TOKEN_MAX_LEN);
+        let at_cap = format!("y{}", "x".repeat(RELOAD_TOKEN_MAX_LEN - 1));
         assert!(is_valid_reload_token(&at_cap), "exactly at cap is valid");
     }
 
@@ -1965,12 +2026,12 @@ mod tests {
 
     #[test]
     fn test_is_valid_reload_token_rejects_below_min_len() {
-        let below = "x".repeat(BEARER_TOKEN_MIN_LEN - 1);
+        let below = format!("y{}", "x".repeat(BEARER_TOKEN_MIN_LEN - 2));
         assert!(
             !is_valid_reload_token(&below),
             "a token one byte under the floor must be rejected"
         );
-        let at_floor = "x".repeat(BEARER_TOKEN_MIN_LEN);
+        let at_floor = format!("y{}", "x".repeat(BEARER_TOKEN_MIN_LEN - 1));
         assert!(
             is_valid_reload_token(&at_floor),
             "a token exactly at the floor is valid"
@@ -2012,33 +2073,146 @@ mod tests {
         }
     }
 
-    /// Audit SEC-9 (2026-10-11): boot must apply the same shape gate as
-    /// rotation and refuse a weak token in LIVE mode. Source scan, same
-    /// style as `test_main_rs_uses_ssm_only_no_env_fallback`.
+    /// Review of audit SEC-9 (2026-10-11): the gate is visible ASCII only.
+    /// A multi-byte token that reaches 32 BYTES but is not visible ASCII is
+    /// refused, because `HeaderValue::to_str` could never present it.
+    #[test]
+    fn test_is_valid_reload_token_refuses_non_ascii_and_repeated_char() {
+        let multibyte = "\u{20ac}".repeat(11);
+        assert_eq!(multibyte.len(), 33, "eleven three-byte characters");
+        assert!(
+            !is_valid_reload_token(&multibyte),
+            "a non-ASCII token must be refused even past the byte floor"
+        );
+        let mixed = format!("{}\u{e9}", "a1".repeat(16));
+        assert!(
+            !is_valid_reload_token(&mixed),
+            "one non-ASCII character anywhere must be refused"
+        );
+        assert!(
+            !is_valid_reload_token(&"x".repeat(BEARER_TOKEN_MIN_LEN)),
+            "one repeated character is a placeholder, refused"
+        );
+        assert!(
+            !is_valid_reload_token(&format!("{}\u{7f}", "ab".repeat(16))),
+            "DEL (0x7f) is not visible ASCII"
+        );
+        assert!(is_valid_reload_token(NEW_TOKEN_32));
+    }
+
+    /// Every boot outcome of `bearer_token_boot_verdict`, both modes.
+    #[test]
+    fn test_bearer_token_boot_verdict_all_outcomes() {
+        let uuid = "3f2b8c1e-9a4d-4e6f-b7c2-1d0e5a9f8b34";
+        assert_eq!(
+            bearer_token_boot_verdict(uuid, true),
+            BearerTokenBootVerdict::Accept
+        );
+        assert_eq!(
+            bearer_token_boot_verdict(uuid, false),
+            BearerTokenBootVerdict::Accept
+        );
+        assert_eq!(
+            bearer_token_boot_verdict("", true),
+            BearerTokenBootVerdict::PaperEmptyAuthDisabled
+        );
+        assert_eq!(
+            bearer_token_boot_verdict("", false),
+            BearerTokenBootVerdict::RefuseLiveEmpty
+        );
+        assert_eq!(
+            bearer_token_boot_verdict("abc", true),
+            BearerTokenBootVerdict::PaperWeakAuthEnabled
+        );
+        assert_eq!(
+            bearer_token_boot_verdict("abc", false),
+            BearerTokenBootVerdict::RefuseLiveWeak
+        );
+        let repeated = "x".repeat(BEARER_TOKEN_MIN_LEN);
+        assert_eq!(
+            bearer_token_boot_verdict(&repeated, false),
+            BearerTokenBootVerdict::RefuseLiveWeak
+        );
+    }
+
+    /// Boot must decide through `bearer_token_boot_verdict` before building
+    /// the auth config, and refuse (bail) on exactly the two live verdicts.
+    /// Source scan: the main.rs branches are not executable from a test;
+    /// the decision itself is unit-tested above.
     #[test]
     fn test_main_rs_refuses_weak_bearer_token_in_live_mode() {
+        // The closing brace of a match arm, spelled as an escape so the
+        // pre-commit scanner's brace counter stays balanced in this module.
+        const ARM_CLOSE: char = '\u{7d}';
         let main_rs = std::fs::read_to_string("../app/src/main.rs")
             .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
             .expect("main.rs must be readable from middleware test working dir");
         let gate = main_rs
-            .find("is_acceptable_bearer_token(")
-            .expect("main.rs must check the bearer token with is_acceptable_bearer_token(");
+            .find("middleware::bearer_token_boot_verdict(")
+            .expect("main.rs must classify the bearer token with bearer_token_boot_verdict(");
         let from_token = main_rs
             .find("ApiAuthConfig::from_token(api_bearer_token)")
             .expect("main.rs must build the auth config from the SSM token");
         assert!(
             gate < from_token,
-            "the shape gate must run before ApiAuthConfig::from_token"
+            "the boot verdict must run before ApiAuthConfig::from_token"
         );
         let window = &main_rs[gate..from_token];
+        let call_end = window.find(')').unwrap_or(0);
         assert!(
-            window.contains("anyhow::bail!("),
-            "a weak token must refuse to boot in LIVE mode"
+            window[..window[call_end + 1..]
+                .find(')')
+                .map_or(0, |e| call_end + 1 + e)]
+                .contains("config.strategy.dry_run"),
+            "the verdict must be computed from config.strategy.dry_run"
         );
-        assert!(
-            window.contains("ErrorCode::GapSecApiAuth.code_str()"),
-            "a weak token in paper mode must log a coded GAP-SEC-01 error"
+        for refuse in [
+            "BearerTokenBootVerdict::RefuseLiveEmpty",
+            "BearerTokenBootVerdict::RefuseLiveWeak",
+        ] {
+            let at = window
+                .find(refuse)
+                .unwrap_or_else(|| panic!("main.rs must handle {refuse}"));
+            let arm_end = window[at..]
+                .find(ARM_CLOSE)
+                .map_or(window.len(), |e| at + e);
+            assert!(
+                window[at..arm_end].contains("anyhow::bail!("),
+                "{refuse} must refuse to boot with anyhow::bail!"
+            );
+        }
+        for paper in [
+            "BearerTokenBootVerdict::PaperEmptyAuthDisabled",
+            "BearerTokenBootVerdict::PaperWeakAuthEnabled",
+        ] {
+            let at = window
+                .find(paper)
+                .unwrap_or_else(|| panic!("main.rs must handle {paper}"));
+            let arm_end = window[at..]
+                .find(ARM_CLOSE)
+                .map_or(window.len(), |e| at + e);
+            let arm = &window[at..arm_end];
+            assert!(
+                arm.contains("ErrorCode::GapSecApiAuth.code_str()") && !arm.contains("bail!"),
+                "{paper} must log a coded GAP-SEC-01 error and keep booting"
+            );
+        }
+    }
+
+    /// Review of audit SEC-9 (2026-10-11): a weak token paper mode booted on
+    /// must read `Unchanged` on every re-read, not `RejectedInvalid`.
+    #[test]
+    fn test_rotate_bearer_token_same_weak_value_is_unchanged() {
+        let config = ApiAuthConfig::new("short".to_string());
+        let outcome = config.rotate_bearer_token(SecretString::from("short".to_string()));
+        assert_eq!(outcome, TokenReloadOutcome::Unchanged);
+        let outcome = config.rotate_bearer_token(SecretString::from("other".to_string()));
+        assert_eq!(
+            outcome,
+            TokenReloadOutcome::RejectedInvalid,
+            "a DIFFERENT weak value is still refused"
         );
+        assert_eq!(config.token_value_for_test(), "short");
     }
 
     #[test]

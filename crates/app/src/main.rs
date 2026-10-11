@@ -5061,49 +5061,54 @@ async fn build_shared_infra(
     // because port 3001 is publicly funnelled; an empty token on a live box
     // is an open switch on the internet, so live mode refuses to boot on it.
     // Paper mode keeps the documented dev passthrough, said out loud.
-    let bearer_token_is_empty = {
+    //
+    // Audit SEC-9 (2026-10-11): boot applies the SAME shape gate as rotation
+    // (32 to 512 visible ASCII characters, not one repeated character).
+    // Before, boot checked only emptiness, so a 3-character token guarded a
+    // publicly funnelled port. Live mode refuses to boot; paper mode keeps
+    // auth ENABLED on the loaded token and says so. Never logs the value or
+    // its length. **⚠ CHANGED 2026-10-11 (review of SEC-9):** the decision
+    // is the pure, unit-tested `bearer_token_boot_verdict`; this site only
+    // acts on it. Honest limit: production runs paper mode, so a weak token
+    // there still boots and guards the public port until SSM is fixed.
+    let bearer_boot_verdict = {
         use secrecy::ExposeSecret as _;
-        api_bearer_token.expose_secret().is_empty()
+        tickvault_api::middleware::bearer_token_boot_verdict(
+            api_bearer_token.expose_secret(),
+            config.strategy.dry_run,
+        )
     };
-    if bearer_token_is_empty {
-        if config.strategy.dry_run {
+    match bearer_boot_verdict {
+        tickvault_api::middleware::BearerTokenBootVerdict::Accept => {}
+        tickvault_api::middleware::BearerTokenBootVerdict::PaperEmptyAuthDisabled => {
             error!(
-                code = "GAP-SEC-01",
+                code = tickvault_common::error_code::ErrorCode::GapSecApiAuth.code_str(),
                 "the API bearer token in SSM is EMPTY — bearer auth is DISABLED for this paper-mode \
                  session and every /api route including the feed toggle is open; store a token via \
                  `aws ssm put-parameter --name /tickvault/<env>/api/bearer-token --type SecureString`"
             );
-        } else {
+        }
+        tickvault_api::middleware::BearerTokenBootVerdict::PaperWeakAuthEnabled => {
+            error!(
+                code = tickvault_common::error_code::ErrorCode::GapSecApiAuth.code_str(),
+                "the API bearer token in SSM is WEAK (shorter than 32 or longer than 512 \
+                 characters, not all visible ASCII, or one repeated character) — this paper-mode \
+                 session boots anyway and the publicly funnelled API port is guarded ONLY by that \
+                 weak token until it is replaced; rotate /tickvault/<env>/api/bearer-token to a \
+                 random value of 32 or more visible ASCII characters (live within 5 minutes)"
+            );
+        }
+        tickvault_api::middleware::BearerTokenBootVerdict::RefuseLiveEmpty => {
             anyhow::bail!(
                 "GAP-SEC-01: the API bearer token in SSM is EMPTY and this is LIVE mode — refusing to \
                  boot with bearer auth disabled on a publicly funnelled port"
             );
         }
-    }
-    // Audit SEC-9 (2026-10-11): boot applies the SAME shape gate as rotation
-    // (at least 32 and at most 512 characters, no whitespace or control
-    // characters). Before, boot checked only emptiness, so a 3-character
-    // token guarded a publicly funnelled port. Live mode refuses to boot;
-    // paper mode keeps auth ENABLED on the loaded token and says so. Never
-    // logs the value or its length.
-    let bearer_token_is_weak = !bearer_token_is_empty && {
-        use secrecy::ExposeSecret as _;
-        !tickvault_api::middleware::is_acceptable_bearer_token(api_bearer_token.expose_secret())
-    };
-    if bearer_token_is_weak {
-        if config.strategy.dry_run {
-            error!(
-                code = tickvault_common::error_code::ErrorCode::GapSecApiAuth.code_str(),
-                "the API bearer token in SSM is weak (shorter than 32 characters, longer than 512, \
-                 or containing whitespace/control characters) — bearer auth stays ENABLED on it \
-                 this paper-mode session; rotate /tickvault/<env>/api/bearer-token to a random \
-                 value of 32 or more characters"
-            );
-        } else {
+        tickvault_api::middleware::BearerTokenBootVerdict::RefuseLiveWeak => {
             anyhow::bail!(
-                "GAP-SEC-01: the API bearer token in SSM is shorter than 32 characters, longer than \
-                 512, or contains whitespace/control characters — refusing to boot LIVE on a weak \
-                 token for a publicly funnelled port"
+                "GAP-SEC-01: the API bearer token in SSM is shorter than 32 or longer than 512 \
+                 characters, not all visible ASCII, or one repeated character — refusing to boot \
+                 LIVE on a weak token for a publicly funnelled port"
             );
         }
     }

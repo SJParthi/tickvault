@@ -1256,9 +1256,18 @@ fn operator_cidr_validation_refuses_world_open_and_broad_prefixes() {
         .find(|line| line.trim_start().starts_with("condition"))
         .expect("the operator_cidr variable must carry a validation condition"); // APPROVED: test
     assert!(
-        condition.contains(">= (") && condition.contains("? 64 : 24"),
-        "the operator_cidr validation must enforce a prefix floor (IPv4 /24, \
-         IPv6 /64); a bare can(cidrhost(...)) accepts 0.0.0.0/0. Found:\n{condition}"
+        condition.contains(") >= 24"),
+        "the operator_cidr validation must enforce an IPv4 prefix floor of /24; \
+         a bare can(cidrhost(...)) accepts 0.0.0.0/0. Found:\n{condition}"
+    );
+    // Review of SEC-12 (2026-10-11): the SSH ingress puts the value in
+    // `cidr_blocks`, which takes IPv4 only, so IPv6 must be refused at plan
+    // time instead of failing at AWS apply.
+    assert!(
+        condition.contains("length(regexall(\":\", var.operator_cidr)) == 0")
+            && !condition.contains("? 64"),
+        "the operator_cidr validation must refuse IPv6 (any \":\"), because the \
+         SSH ingress cidr_blocks is IPv4 only. Found:\n{condition}"
     );
     assert!(
         condition.contains("try("),
@@ -1276,5 +1285,16 @@ fn operator_cidr_validation_refuses_world_open_and_broad_prefixes() {
     assert!(
         message.contains("0.0.0.0/0") && message.contains("refused"),
         "the error_message must say 0.0.0.0/0 is refused. Found:\n{message}"
+    );
+    assert!(
+        message.contains("IPv6 is refused") && !message.contains("/64"),
+        "the error_message must not advertise IPv6 as accepted. Found:\n{message}"
+    );
+    let main_tf = std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/main.tf"))
+        .expect("main.tf must be readable"); // APPROVED: test
+    assert!(
+        !main_tf.contains("ipv6_cidr_blocks = [ingress.value]"),
+        "if main.tf gains an IPv6 SSH branch, relax the IPv6 refusal in \
+         variables.tf in the same change"
     );
 }
