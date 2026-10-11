@@ -55,6 +55,18 @@ expect() {
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
+# The 30 real benches shared by cases A, B and G (medians observed on main).
+SPECS30="registry/get_hit:14 registry/get_miss:14 oms/state_transition:38
+  calendar/is_trading_day:9 config/toml_load:40324 obi_compute_20_levels:371
+  obi_compute_empty_book:14 obi_compute_with_wall:369 dispatch_frame/ticker:16
+  dispatch_frame/quote:16 token_handle_load:6 token_handle_load_none:6
+  token_handle_clone_arc:5 moneyness_classify:2 moneyness_snapshot_read:7
+  pipeline/burst_100_ticker:641 pipeline/batch_100_mixed:771
+  ws_reader_frame_handle_ns:153 order_gate_mark_forward_disarmed:4
+  order_gate_mark_forward_armed_full:4 order_gate_mark_forward_armed_accept:31
+  calendar/is_trading_day_holiday:10 calendar/is_trading_day_weekend:1
+  extra_a:10 extra_b:10 extra_c:10 extra_d:10 extra_e:10 extra_f:10 extra_g:10"
+
 # --- Case A: the REAL 2026-08-07 shape -------------------------------------
 # 31 benches, all regressing +24%..+30% (spread 6 pts), every absolute value
 # far inside budget. This exact shape produced the live false RED.
@@ -62,18 +74,7 @@ trap 'rm -rf "$TMP"' EXIT
 # entry; medians are the real observed ns values.
 A="$TMP/a"
 i=0
-for spec in \
-  "registry/get_hit:14" "registry/get_miss:14" "oms/state_transition:38" \
-  "calendar/is_trading_day:9" "config/toml_load:40324" "obi_compute_20_levels:371" \
-  "obi_compute_empty_book:14" "obi_compute_with_wall:369" "dispatch_frame/ticker:16" \
-  "dispatch_frame/quote:16" "token_handle_load:6" "token_handle_load_none:6" \
-  "token_handle_clone_arc:5" "moneyness_classify:2" "moneyness_snapshot_read:7" \
-  "pipeline/burst_100_ticker:641" "pipeline/batch_100_mixed:771" \
-  "ws_reader_frame_handle_ns:153" "order_gate_mark_forward_disarmed:4" \
-  "order_gate_mark_forward_armed_full:4" "order_gate_mark_forward_armed_accept:31" \
-  "calendar/is_trading_day_holiday:10" "calendar/is_trading_day_weekend:1" \
-  "extra_a:10" "extra_b:10" "extra_c:10" "extra_d:10" "extra_e:10" \
-  "extra_f:10" "extra_g:10" "extra_h:10" ; do
+for spec in $SPECS30 extra_h:10 ; do
   name="${spec%%:*}"; median="${spec##*:}"
   # point 0.240..0.300, lower bound just under it — all confidently regressed
   frac="0.$((240 + i * 2))"
@@ -87,18 +88,7 @@ expect "31/31 uniform +24..30% drift, all budgets OK -> PASS (was false RED)" 0 
 # Same 31 benches, but only 3 regress. Share 3/31 = 10% < 70% -> NOT drift.
 B="$TMP/b"
 i=0
-for spec in \
-  "registry/get_hit:14" "registry/get_miss:14" "oms/state_transition:38" \
-  "calendar/is_trading_day:9" "config/toml_load:40324" "obi_compute_20_levels:371" \
-  "obi_compute_empty_book:14" "obi_compute_with_wall:369" "dispatch_frame/ticker:16" \
-  "dispatch_frame/quote:16" "token_handle_load:6" "token_handle_load_none:6" \
-  "token_handle_clone_arc:5" "moneyness_classify:2" "moneyness_snapshot_read:7" \
-  "pipeline/burst_100_ticker:641" "pipeline/batch_100_mixed:771" \
-  "ws_reader_frame_handle_ns:153" "order_gate_mark_forward_disarmed:4" \
-  "order_gate_mark_forward_armed_full:4" "order_gate_mark_forward_armed_accept:31" \
-  "calendar/is_trading_day_holiday:10" "calendar/is_trading_day_weekend:1" \
-  "extra_a:10" "extra_b:10" "extra_c:10" "extra_d:10" "extra_e:10" \
-  "extra_f:10" "extra_g:10" "extra_h:10" ; do
+for spec in $SPECS30 extra_h:10 ; do
   name="${spec%%:*}"; median="${spec##*:}"
   if [ "$i" -lt 3 ]; then frac="0.300"; lower="0.290"; else frac="0.001"; lower="-0.010"; fi
   mk_bench "$B" "$name" "$median" "$frac" "$lower"
@@ -162,20 +152,7 @@ expect "no regressions, budgets OK -> PASS" 0 "$F"
 # IQR the tails are ignored and the shape is correctly suppressed.
 # This case FAILS (exit 2) against the pre-IQR gate and PASSES against it.
 G="$TMP/g"
-i=0
-for spec in \
-  "ws_reader_dispatch_ticker:27" \
-  "registry/get_hit:14" "registry/get_miss:14" "oms/state_transition:38" \
-  "calendar/is_trading_day:9" "config/toml_load:40324" "obi_compute_20_levels:371" \
-  "obi_compute_empty_book:14" "obi_compute_with_wall:369" "dispatch_frame/ticker:16" \
-  "dispatch_frame/quote:16" "token_handle_load:6" "token_handle_load_none:6" \
-  "token_handle_clone_arc:5" "moneyness_classify:2" "moneyness_snapshot_read:7" \
-  "pipeline/burst_100_ticker:641" "pipeline/batch_100_mixed:771" \
-  "ws_reader_frame_handle_ns:153" "order_gate_mark_forward_disarmed:4" \
-  "order_gate_mark_forward_armed_full:4" "order_gate_mark_forward_armed_accept:31" \
-  "calendar/is_trading_day_holiday:10" "calendar/is_trading_day_weekend:1" \
-  "extra_a:10" "extra_b:10" "extra_c:10" "extra_d:10" "extra_e:10" \
-  "extra_f:10" "extra_g:10" ; do
+for spec in ws_reader_dispatch_ticker:27 $SPECS30 ; do
   name="${spec%%:*}"; median="${spec##*:}"
   if [ "$i" -eq 0 ]; then
     # the lone outlier: +111.6%, exactly as observed live
@@ -207,6 +184,25 @@ expect "benches present, zero budget matches -> FAIL-CLOSED" 3 "$H"
 I_DIR="$TMP/i"
 mkdir -p "$I_DIR"
 expect "empty criterion dir -> FAIL-CLOSED" 3 "$I_DIR"
+
+# --- Case J: regression noise floor (2026-10-11) ----------------------------
+# Live: oms_invalid_transition ~3ns, +18.1% with CI lower bound +10.6%, i.e.
+# 0.3ns, failed the gate on runner noise. Under the 1ns floor it is NOISE.
+J="$TMP/j"
+mk_bench "$J" "oms/state_transition" 3 "0.181" "0.106"
+mk_bench "$J" "registry/get_hit" 10 "0.001" "-0.020"
+expect "3ns bench, lower bound +10.6% = 0.3ns under the floor -> PASS (NOISE)" 0 "$J"
+
+# --- Case K: the floor never hides a regression of real size ----------------
+# The same +10.6% on a 38ns bench is 3.6ns -> FAILS. A change with no new/
+# median has an unknown size, so it is never NOISE -> FAILS.
+K="$TMP/k"
+mk_bench "$K" "oms/state_transition" 38 "0.181" "0.106"
+expect "38ns bench, lower bound +10.6% = 3.6ns over the floor -> still FAILS" 2 "$K"
+L="$TMP/l"
+mk_bench "$L" "registry/get_hit" 10 "0.001" "-0.020"
+mk_bench "$L" "moneyness_classify" 2 "0.181" "0.106"; rm -rf "$L/moneyness_classify/new"
+expect "regression with no median (size unknown) -> never NOISE, still FAILS" 2 "$L"
 
 printf '  bench-gate self-test: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

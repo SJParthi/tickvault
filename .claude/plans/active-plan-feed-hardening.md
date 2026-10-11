@@ -310,7 +310,7 @@ This plan converts hope into bounded, tested, alarmed guarantees. It does NOT pr
     `day_boundary_rearms_the_first_bucket_treatment`
   - Full design: ITEM 10 addendum below (C1–C8)
 
-- [ ] **Item RESUB — unsubscribe and subscribe, not disconnect and reconnect (operator 2026-10-01: "now isntead of disconenct reocnenct follow the unsubscribe and siubscribe apporach ddue okay? see i neve rver want to have nay ticks loss zerot icks loss and zerod ata msisign dude okay?")**
+- [x] **Item RESUB — unsubscribe and subscribe, not disconnect and reconnect (operator 2026-10-01: "now isntead of disconenct reocnenct follow the unsubscribe and siubscribe apporach ddue okay? see i neve rver want to have nay ticks loss zerot icks loss and zerod ata msisign dude okay?")**
   - Depth-200 ranked rotation sends `LiveSubscriptionCommand::Swap` (code 25 then code 23 on
     the live socket) instead of `RotateByRedial`; `RotateByRedial`,
     `ConnEvent::RotationRequested` and `ReconnectReason::RankedRotation` are removed.
@@ -5987,9 +5987,9 @@ One PR at a time, in this order (each item is its own PR unless noted):
 - [ ] 45d2 — **Uploader frozen.** Split out of 45d on 2026-10-01 because it adds an EMF name and an alarm, which the noise lock governs. Ship `tv_log_lines_dropped_total` to CloudWatch; alarm when `errors.jsonl` file growth on the box is non-zero while the stream ingests nothing (uploader frozen). Tests: terraform guard for the new alarm.
 - [ ] 45e — **Raw frames to S3 before any delete.** A cold-path uploader compresses each sealed WAL segment (gzip, as `partition_archive.rs` already does), uploads to `s3://tv-prod-cold/raw-frames/<date>/<segment>.wal.gz` with a no-overwrite put and SHA-256, verifies size, and writes a local `.uploaded` marker; both prune passes require the marker. Runs after close and on disk pressure, never on the drain. IAM: `s3:PutObject` on that prefix only. Tests: marker gating in both prune passes; upload verify refuses a size mismatch.
 - [x] 45f — **S3 keeps everything.** (Implemented 2026-10-01: `deploy/aws/terraform/main.tf` `aws_s3_bucket_versioning.tv_cold` Enabled, expiration removed, noncurrent versions tiered not expired, `raw-frames-deep-archive` rule; guards `test_terraform_tv_cold_lifecycle_never_expires_and_tiers_down` and `test_terraform_tv_cold_versioning_is_enabled` in `crates/common/tests/aws_infra_wiring.rs`, both bite-proven by re-adding a `noncurrent_version_expiration` and `Suspended`.) `deploy/aws/terraform/main.tf`: remove `expiration { days = 1825 }`; add Deep Archive transition for `raw-frames/` after 30 days; enable `aws_s3_bucket_versioning`. Guard test pins no `expiration` and versioning `Enabled`.
-- [ ] 45g — **No delete without a copy (spill, quarantine, boot drops).** Seal spill age prune, tick quarantine prune, fresh-start reset and retired-table sweeps export to S3 (verified) before deleting, or refuse. Tests per path.
-- [ ] 45h — **Persist what is received but never saved.** OI packets, market-status packets, `oi_day_high`/`oi_day_low`, out-of-window ticks and prior-day connect snapshots are written (new columns / a `feed`-tagged table, `feed` in the DEDUP key), outside the candle fold. Tests: one per packet class; DEDUP meta-guard.
-- [ ] 45i — **Depth array rows** (separate designed project): scratch-table test on QuestDB 9.3.5 first (DOUBLE[] + DEDUP), then a binary-safe spill format, then the switch. Not started until the test result is recorded here.
+- [x] 45g — **No delete without a copy (spill, quarantine, boot drops).** Seal spill age prune, tick quarantine prune, fresh-start reset and retired-table sweeps export to S3 (verified) before deleting, or refuse. Tests per path. *(Ticked 2026-10-11: landed in PR #2004; fresh_start_reset.rs renames tables with rows aside, retired sweeps drop only proven-empty tables.)*
+- [x] 45h — **Persist what is received but never saved.** OI packets, market-status packets, `oi_day_high`/`oi_day_low`, out-of-window ticks and prior-day connect snapshots are written (new columns / a `feed`-tagged table, `feed` in the DEDUP key), outside the candle fold. Tests: one per packet class; DEDUP meta-guard. *(Ticked 2026-10-11: landed in PR #2004 as feed_aux_persistence.rs, recorded as R3-6.)*
+- [x] 45i — **Depth array rows** (separate designed project): scratch-table test on QuestDB 9.3.5 first (DOUBLE[] + DEDUP), then a binary-safe spill format, then the switch. Not started until the test result is recorded here. *(Ticked 2026-10-11: scratch-table result recorded 2026-10-06 below; shipped as 49e in PR #2037 and PR #2043.)*
 
 ### Design
 
@@ -6212,7 +6212,7 @@ Approved by Parthiban 2026-10-05 ("go woith your recomemndation dude", answering
 - [x] 49c — **Depth spill replay held 08:00–15:40 IST.** The depth directory's drain skips its round inside that window (counted on `tv_depth_spill_replay_held_total`) and drains after the close; the tick directory is unchanged and the quarantine trim still runs. A deferral, never a drop: the spill keeps accepting past its soft cap while the volume has room, and the raw frames are in the WAL.
   - Files: crates/storage/src/tick_spill_replay.rs
   - Tests: test_depth_replay_held_at_covers_08_00_to_the_close_only, test_depth_replay_held_at_is_applied_to_the_depth_directory_only
-- [ ] 49d — **One `market_depth` row per packet with level arrays.** Not started: the scope lock allows array rows only after a QuestDB scratch-table test, and this session has no QuestDB to run one against.
+- [x] 49d — **One `market_depth` row per packet with level arrays.** Not started: the scope lock allows array rows only after a QuestDB scratch-table test, and this session has no QuestDB to run one against. *(Ticked 2026-10-11: superseded by that test result and shipped as 49e, PR #2037 and PR #2043.)*
 
 ### Design
 49a and 49b change only what is measured or shown. 49c is a time-of-day gate on the depth drain loop, O(1) per 300 s round.

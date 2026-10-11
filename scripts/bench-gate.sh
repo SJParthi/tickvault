@@ -74,6 +74,13 @@
 #   changed. Case C of the self-test (8 benches genuinely fanned +6%..+80%,
 #   IQR 24 pts) still FAILS, so the discriminating power is preserved, and the
 #   full min..max range is still PRINTED for the operator.
+#
+# Regression noise floor (2026-10-11): sub-10ns benches failed the relative arm
+# on noise (oms_invalid_transition ~3ns, CI lower bound +10.6% = 0.3ns). A
+# regression whose confident size, median x lb/(1+lb), is under the TOML
+# min_regression_delta_ns is printed as NOISE and left out (absent key = 0 =
+# off). Absolute budgets still gate. Honest limit: a real sub-floor slowdown
+# on a tiny bench passes the relative arm.
 # =============================================================================
 
 set -euo pipefail
@@ -137,18 +144,10 @@ if [ -z "$ESTIMATE_FILES" ]; then
 fi
 
 
-# =============================================================================
-# Rust-only purge Phase 2a-2 (2026-07-18): the inline interpreter walker below
-# was replaced by jq (per-file JSON extraction) + awk (TOML parse, budget
-# matching, float comparisons, verdicts). Numeric semantics preserved:
-# every comparison and every printed number is computed on IEEE-754 doubles
-# exactly as the evaluator was (json floats, per-element division, budget x
-# multiplier, pct x 100, printf %.0f / %+.1f / %g are the same C-double
-# operations in both). Per-line output content and exit codes are
-# unchanged; LINE ORDER is now deterministic (sorted paths, all absolute-
-# budget lines before regression lines) where the legacy walker's order was
-# filesystem-dependent.
-# =============================================================================
+# Rust-only purge Phase 2a-2 (2026-07-18): jq extracts per-file JSON and awk
+# does the TOML parse, budget matching and verdicts, on IEEE-754 doubles
+# exactly as the retired evaluator did. Line order is deterministic: absolute
+# lines first, then regression lines.
 
 RECORDS_FILE="$(mktemp)"
 trap 'rm -f "$RECORDS_FILE"' EXIT
@@ -245,14 +244,14 @@ BEGIN {
 # ---- stripped, [elements] ints, max_regression_pct anywhere) ----
 FILENAME == budgets_file {
   line = trim($0)
-  if (line ~ /^max_regression_pct/) {
+  if (line ~ /^(max_regression_pct|min_regression_delta_ns)/) {
     eq = index(line, "=")
-    if (eq == 0) { print "ERROR: malformed max_regression_pct line in " budgets_file > "/dev/stderr"; died = 1; exit 1 }
-    max_regression_raw = trim(substr(line, eq + 1))
-    if (max_regression_raw !~ /^[0-9]+(\.[0-9]+)?$/) {
-      print "ERROR: max_regression_pct is not a plain decimal: " max_regression_raw > "/dev/stderr"; died = 1; exit 1
+    if (eq == 0) { print "ERROR: malformed knob line in " budgets_file ": " line > "/dev/stderr"; died = 1; exit 1 }
+    raw = trim(substr(line, eq + 1))
+    if (raw !~ /^[0-9]+(\.[0-9]+)?$/) {
+      print "ERROR: knob is not a plain decimal: " line > "/dev/stderr"; died = 1; exit 1
     }
-    max_regression = max_regression_raw + 0
+    if (line ~ /^max/) { max_regression_raw = raw; max_regression = raw + 0 } else min_delta_ns = raw + 0
     next
   }
   if (line == "[budgets]")  { in_budgets = 1; in_elements = 0; next }
@@ -293,6 +292,7 @@ $1 == "N" {
   gsub(/\//, "_", bench)
   bench = tolower(bench)
   median_ns = $3 + 0
+  med[bench] = median_ns          # for the regression noise floor
 
   # Per-element normalization: budgets are PER-ELEMENT; batch benches divide
   # the batch median by their [elements] count (default 1). First TOML-order
@@ -342,21 +342,21 @@ $1 == "C" {
   bench = tolower(bench)
   point_pct = ($3 + 0) * 100
   lb = $4
-  cmp_total++
-  if (lb != "NA") {
-    lower_pct = (lb + 0) * 100
-    if (lower_pct > max_regression) {
-      reg_n++
-      reg_bench[reg_n] = bench; reg_point[reg_n] = point_pct
-      reg_lower[reg_n] = lower_pct; reg_kind[reg_n] = "ci"
-    }
-  } else {
+  if (lb == "NA")
     printf "  NOTE: %s: change/estimates.json has no confidence_interval — falling back to point estimate\n", bench
-    if (point_pct > max_regression) {
-      reg_n++
-      reg_bench[reg_n] = bench; reg_point[reg_n] = point_pct
-      reg_lower[reg_n] = point_pct; reg_kind[reg_n] = "point"
-    }
+  frac = (lb != "NA") ? lb + 0 : $3 + 0
+  # Noise floor: the confident slowdown in ns, from the new median. -1 when
+  # unknown (no matching new/ median), so an unknown size is never NOISE.
+  delta_ns = ((bench in med) && frac > -1) ? med[bench] * frac / (1 + frac) : -1
+  if (frac * 100 > max_regression && delta_ns >= 0 && delta_ns < min_delta_ns) {
+    printf "  NOISE: %s: %+.1f%% is %.2fns, under the %gns floor (absolute budget still gates)\n", bench, point_pct, delta_ns, min_delta_ns
+    next
+  }
+  cmp_total++
+  if (frac * 100 > max_regression) {
+    reg_n++
+    reg_bench[reg_n] = bench; reg_point[reg_n] = point_pct
+    reg_lower[reg_n] = frac * 100; reg_kind[reg_n] = (lb != "NA") ? "ci" : "point"
   }
   next
 }

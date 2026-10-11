@@ -778,6 +778,37 @@ fn careful_job_frees_runner_disk_and_drops_dependency_debug_info() {
 }
 
 // ---------------------------------------------------------------------------
+// Nightly full-workspace run (2026-10-11). The 2026-10-10 run had 3.25 GB
+// free, below the seal spill's 4 GiB free-disk floor, so storage tests failed;
+// then `gh issue create` failed because its labels did not exist, so the
+// failure opened no issue.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn nightly_frees_disk_before_checkout_and_creates_its_issue_labels() {
+    let wf = read(".github/workflows/full-test-nightly.yml");
+    let free = wf
+        .find("Free runner disk space")
+        .expect("nightly frees the preinstalled toolchains");
+    let checkout = wf.find("- name: Checkout").expect("checkout step present");
+    assert!(
+        free < checkout,
+        "disk is freed before the checkout and build"
+    );
+    assert!(
+        wf.contains("sudo rm -rf /usr/share/dotnet"),
+        "the cleanup actually removes something"
+    );
+    for label in ["nightly-regression", "auto-triage"] {
+        let create = wf
+            .find(&format!("gh label create {label} --force"))
+            .unwrap_or_else(|| panic!("label {label} is created before use"));
+        let issue = wf.find("gh issue create").expect("issue step present");
+        assert!(create < issue, "label {label} exists before the issue");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Stress audit 2026-10-09: RO-5/SEC-2 (action pins), OPS-2 (reset-failed),
 // RO-1 (no market-data deletion in a workflow).
 // ---------------------------------------------------------------------------

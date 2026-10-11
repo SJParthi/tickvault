@@ -37,7 +37,7 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Budget keys, by section. `max_regression_pct` is a knob, not a bench key.
+/// Budget keys, by section. `max_regression_pct` and `min_regression_delta_ns` are knobs, not bench keys.
 fn budget_keys() -> (Vec<String>, Vec<String>) {
     let body = std::fs::read_to_string(repo_root().join("quality/benchmark-budgets.toml"))
         .expect("quality/benchmark-budgets.toml must exist");
@@ -179,7 +179,7 @@ fn every_latency_budget_reaches_at_least_one_benchmark() {
 #[test]
 fn claude_md_states_the_real_budget_key_count() {
     let (budgets, elements) = budget_keys();
-    let total = budgets.len() + elements.len() + 1; // + max_regression_pct
+    let total = budgets.len() + elements.len() + 2; // + the two knobs
     let claude = std::fs::read_to_string(repo_root().join("CLAUDE.md")).expect("CLAUDE.md");
     let line = claude
         .lines()
@@ -189,7 +189,7 @@ fn claude_md_states_the_real_budget_key_count() {
         line.contains(&format!("{total} keys")),
         "CLAUDE.md describes benchmark-budgets.toml as having a different \
          number of keys than it has ({total}: {} budgets + {} elements + \
-         max_regression_pct).\nLine: {line}",
+         max_regression_pct + min_regression_delta_ns).\nLine: {line}",
         budgets.len(),
         elements.len()
     );
