@@ -198,6 +198,37 @@ resource "aws_cloudwatch_metric_alarm" "order_update_dropped" {
 # is full, and publishes the cumulative drop count every 10 s. A dropped
 # ERROR line is a coded page that never reached the log filter, which is why
 # this is a page and not a chart.
+#
+# 4a. THE SHIPPED-SINK SLICE (2026-10-10, noise lock §2.9-i, stage 1 of 3).
+# Only two log files reach CloudWatch (cloudwatch-agent.json collect_list:
+# machine/app.2* and machine/errors.jsonl.2*), so only a drop on THOSE sinks
+# can hide a coded ERROR from its log filter. This filter slices the raw
+# per-sink series in the metrics log down to sink = app_log or errors_jsonl
+# and writes a DISTINCT derived name, on the seal-drop-alarm.tf naming rule:
+# the raw name is still EMF-selected, so reusing it would count twice.
+# Stage 1 adds the filter ONLY; the alarm below is unchanged and still reads
+# the raw all-sink sum. It switches (stage 2) only after a measured match:
+# SampleCount of the derived metric > 0 while the box runs, since both sliced
+# labels are seeded at 0 at boot and publish a zero every scrape.
+# Lockstep: crates/app/tests/log_drop_alarm_shipped_sinks_guard.rs.
+resource "aws_cloudwatch_log_metric_filter" "log_lines_dropped_shipped" {
+  name = "tv-${var.environment}-log-lines-dropped-shipped"
+  # Agent-created group, referenced by name (metrics-log-metric-filters.tf
+  # precedent; adopted into terraform by log-retention.tf).
+  log_group_name = "/tickvault/${var.environment}/metrics"
+  pattern        = "{ $.tv_log_lines_dropped_total = * && ($.sink = \"app_log\" || $.sink = \"errors_jsonl\") }"
+  metric_transformation {
+    name      = "tv_log_lines_dropped_shipped_total" # DERIVED sink-slice name, never the raw one
+    namespace = local.app_namespace
+    value     = "$.tv_log_lines_dropped_total"
+    dimensions = {
+      host = "$.host"
+    }
+    # No default_value: that knob emits datapoints for NON-matching events,
+    # and AWS refuses it together with dimensions.
+  }
+}
+
 resource "aws_cloudwatch_metric_alarm" "log_lines_dropped" {
   alarm_name          = "tv-${var.environment}-log-lines-dropped"
   alarm_description   = "LOG LINES WERE DROPPED. A log writer fell behind and its 128,000-line buffer filled, so lines were discarded - including, possibly, coded ERROR lines whose own alarms then never fired. DO: (1) treat the window as a blind spot: other alarms may have missed events in it. (2) look for the burst that caused it - the app logs one line per sink per 10 s while drops continue, naming the sink. (3) check disk write latency and df -h /data; a slow or full log volume is the usual cause."

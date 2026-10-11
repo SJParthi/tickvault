@@ -94,6 +94,11 @@ const REVIEWED_WARN_SITES: &[(&str, &str, &str)] = &[
     ),
     (
         "crates/app/src/dhan_live_crossverify_boot.rs",
+        "could not tell whether our last candles were sealed",
+        "not a write failure: the live side was not yet readable, nothing was judged, the vendor tape rows upsert on the retry; section 12.15.10 keeps readiness reasons warn-only with no page",
+    ),
+    (
+        "crates/app/src/dhan_live_crossverify_boot.rs",
         "stopped saving its audit rows",
         "a deliberate stop at the 17:23 deadline (section 12.15.8); real row losses are counted by the writer and paged on audit_rows",
     ),

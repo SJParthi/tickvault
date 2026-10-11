@@ -1135,6 +1135,46 @@ pub struct DhanUniverseConfig {
     /// `min(this, room on the backup socket)`.
     #[serde(default = "default_main_feed_backup_top_n")]
     pub backup_top_n: usize,
+
+    /// Whether the evidence-based frame-silence fast paths act, only count,
+    /// or are off (scope lock 2026-10-10, "PER-KIND FRAME-SILENCE
+    /// THRESHOLDS"). Default `Shadow`: the main-feed (60 s) and depth-20
+    /// (90 s) sibling-confirmed redials and the depth-200 cross-feed redial
+    /// are COUNTED as "would redial" and never act, so their gap figures are
+    /// measured before anything acts on them. `Off` is exactly the old 300 s
+    /// behaviour for the main feed and depth-20. The depth-200 900 s backstop
+    /// is in code and does not depend on this field.
+    #[serde(default)]
+    pub frame_silence_fast_path: FrameSilenceFastPath,
+}
+
+/// What the evidence-based frame-silence fast paths do (scope lock
+/// 2026-10-10). Lives here rather than in the WebSocket crate because the
+/// config crate cannot depend on it; the WebSocket crate re-exports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FrameSilenceFastPath {
+    /// No fast path: main feed and depth-20 redial only after 300 s of
+    /// silence, and nothing is counted.
+    Off,
+    /// The fast paths are evaluated and COUNTED as "would redial", once per
+    /// silence episode, and never act. The default.
+    #[default]
+    Shadow,
+    /// The fast paths redial.
+    Act,
+}
+
+impl FrameSilenceFastPath {
+    /// The config spelling, for logs.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Shadow => "shadow",
+            Self::Act => "act",
+        }
+    }
 }
 
 const fn default_main_feed_backup_top_n() -> usize {
@@ -1159,6 +1199,7 @@ impl Default for DhanUniverseConfig {
             spot_universe_fno_underlyings_only: false,
             spot_universe_ntm_only: false,
             backup_top_n: default_main_feed_backup_top_n(),
+            frame_silence_fast_path: FrameSilenceFastPath::Shadow,
         }
     }
 }
@@ -4757,6 +4798,69 @@ mod tests {
             .extract()
             .expect("0 parses");
         assert_eq!(off.dhan_universe.backup_top_n, 0);
+    }
+
+    #[test]
+    fn test_frame_silence_fast_path_defaults_to_shadow_and_parses_every_spelling() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            dhan_universe: DhanUniverseConfig,
+        }
+        // Absent: the scope lock 2026-10-10 default, shadow (count, never act).
+        let absent: Wrapper = Figment::new()
+            .merge(Toml::string("[dhan_universe]\nenabled = true\n"))
+            .extract()
+            .expect("absent frame_silence_fast_path must default");
+        assert_eq!(
+            absent.dhan_universe.frame_silence_fast_path,
+            FrameSilenceFastPath::Shadow
+        );
+        assert_eq!(
+            DhanUniverseConfig::default().frame_silence_fast_path,
+            FrameSilenceFastPath::Shadow
+        );
+        assert_eq!(
+            FrameSilenceFastPath::default(),
+            FrameSilenceFastPath::Shadow
+        );
+        for (spelling, want) in [
+            ("off", FrameSilenceFastPath::Off),
+            ("shadow", FrameSilenceFastPath::Shadow),
+            ("act", FrameSilenceFastPath::Act),
+        ] {
+            let parsed: Wrapper = Figment::new()
+                .merge(Toml::string(&format!(
+                    "[dhan_universe]\nframe_silence_fast_path = \"{spelling}\"\n"
+                )))
+                .extract()
+                .expect("a documented spelling parses");
+            assert_eq!(parsed.dhan_universe.frame_silence_fast_path, want);
+            assert_eq!(want.as_str(), spelling);
+        }
+        // A typo fails the boot rather than silently picking a mode.
+        let typo: Result<Wrapper, _> = Figment::new()
+            .merge(Toml::string(
+                "[dhan_universe]\nframe_silence_fast_path = \"acts\"\n",
+            ))
+            .extract();
+        assert!(typo.is_err(), "an unknown mode must be refused");
+    }
+
+    #[test]
+    fn test_base_toml_ships_frame_silence_fast_path_shadow() {
+        let base = include_str!("../../../config/base.toml");
+        let section = base
+            .split("\n[dhan_universe]")
+            .nth(1)
+            .expect("base.toml carries [dhan_universe]");
+        let section = section.split("\n[").next().unwrap_or(section);
+        assert!(
+            section.contains("frame_silence_fast_path = \"shadow\""),
+            "base.toml must ship the frame-silence fast paths in shadow mode"
+        );
     }
 
     #[test]

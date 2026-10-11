@@ -39,6 +39,8 @@
 //! - Gauges are excluded: a gauge is published verbatim, with no delta and no
 //!   dropped first sample, so it has no equivalent hazard.
 
+mod log_drop_support;
+
 use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {
@@ -235,6 +237,24 @@ const DERIVED_LOSS_GROUP_METRICS: &[&str] = &[
 /// The number of source counters the loss groups read. Moves only with a dated
 /// row in noise lock §2.10.
 const LOSS_GROUP_FILTER_COUNT: usize = 55;
+
+/// Derived metrics that are a LABEL SLICE of one source counter, written by a
+/// log metric filter over the metrics log (noise lock §2.9-i, 2026-10-10):
+/// `(derived, source, label, sliced values)`.
+///
+/// Not `KNOWN_NO_PRODUCER`: there IS a producer, the source counter. Not
+/// `DERIVED_LOSS_GROUP_METRICS`: that list sums WHOLE counters, so seeding the
+/// counter name is enough there. A slice reads only some label values, and the
+/// agent drops the first sample of each labelled series, so every sliced value
+/// must itself be seeded at 0, which a name-only check cannot see.
+/// `every_derived_slice_filter_source_is_registered_for_each_sliced_label`
+/// checks exactly that.
+const DERIVED_SLICE_FILTER_METRICS: &[(&str, &str, &str, &[&str])] = &[(
+    "tv_log_lines_dropped_shipped_total",
+    "tv_log_lines_dropped_total",
+    "sink",
+    &["app_log", "errors_jsonl"],
+)];
 
 /// Maps `const NAME: &str = "tv_...";` to its literal, workspace-wide, so a
 /// registration written through a named constant (the house style for a metric
@@ -504,6 +524,7 @@ fn every_alarmed_counter_is_registered_at_boot() {
             || KNOWN_NO_PRODUCER.contains(&name.as_str())
             || SEEDED_VIA_HANDLE.iter().any(|(n, _)| n == name)
             || DERIVED_LOSS_GROUP_METRICS.contains(&name.as_str())
+            || DERIVED_SLICE_FILTER_METRICS.iter().any(|(d, ..)| d == name)
         {
             continue;
         }
@@ -825,5 +846,84 @@ fn the_loss_group_alarms_read_the_metrics_the_filters_write() {
     assert_eq!(
         written, derived,
         "the groups the filters write and the metrics the alarms read disagree"
+    );
+}
+
+/// The sliced values of `source` that `main_src` does NOT seed at 0.
+fn unseeded_slice_values(
+    main_src: &str,
+    source: &str,
+    label: &str,
+    values: &[&str],
+) -> Vec<String> {
+    let stripped = strip_rust_comments(main_src);
+    let seeded = log_drop_support::seeded_label_values(&stripped, source, label);
+    values
+        .iter()
+        .filter(|v| !seeded.contains(**v))
+        .map(|v| (*v).to_owned())
+        .collect()
+}
+
+/// A label-slice filter is only as good as the seeding of each value it
+/// slices: an unseeded value's first real increment is the sample the agent
+/// drops, so a single-episode failure on that sink would never page.
+#[test]
+fn every_derived_slice_filter_source_is_registered_for_each_sliced_label() {
+    let registered = zero_registered_names();
+    let main_src = read("crates/app/src/main.rs");
+    let tf_dir = repo_root().join("deploy/aws/terraform");
+    let tf_all: String = std::fs::read_dir(&tf_dir)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", tf_dir.display()))
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("tf"))
+        .filter_map(|p| std::fs::read_to_string(p).ok())
+        .collect();
+    for (derived, source, label, values) in DERIVED_SLICE_FILTER_METRICS {
+        assert!(
+            registered.contains(*source),
+            "{derived} slices {source}, but {source} is never registered at 0 at boot"
+        );
+        let missing = unseeded_slice_values(&main_src, source, label, values);
+        assert!(
+            missing.is_empty(),
+            "{derived} slices {source} on {label} = {values:?}, but main.rs does not seed \
+             {missing:?} at 0; the first drop on that sink would be the agent's dropped sample"
+        );
+        // Some filter writes the derived name, so the exemption above can never
+        // hide an alarm that reads a metric nothing produces.
+        let written = tf_all
+            .split("metric_transformation {")
+            .skip(1)
+            .any(|block| {
+                let body = block.split('}').next().unwrap_or_default();
+                body.lines().any(|l| {
+                    let compact: String = l.chars().filter(|c| !c.is_whitespace()).collect();
+                    compact.starts_with(&format!("name=\"{derived}\""))
+                })
+            });
+        assert!(
+            written,
+            "no metric_transformation in terraform writes {derived}"
+        );
+    }
+}
+
+#[test]
+fn bite_an_unseeded_slice_value_is_caught() {
+    let main_src = read("crates/app/src/main.rs");
+    let (_, source, label, values) = DERIVED_SLICE_FILTER_METRICS[0];
+    assert!(unseeded_slice_values(&main_src, source, label, values).is_empty());
+    let narrowed = main_src.replacen(
+        r#"for sink in ["app_log", "errors_jsonl"] {"#,
+        r#"for sink in ["app_log"] {"#,
+        1,
+    );
+    assert_ne!(narrowed, main_src, "bite setup: the seed loop moved");
+    assert_eq!(
+        unseeded_slice_values(&narrowed, source, label, values),
+        vec!["errors_jsonl".to_owned()],
+        "dropping a sliced value from the boot seed must be caught"
     );
 }

@@ -547,6 +547,22 @@ impl UnwrittenSealRecord {
 static LAST_DRAINED_UNIX_SECS: std::sync::atomic::AtomicI64 =
     std::sync::atomic::AtomicI64::new(i64::MIN);
 
+/// The latest wall-clock second (UTC unix) at which the seal writer, after a
+/// cycle, held no seal in its channel, ring or escalation queue, or `None`
+/// before the first such sample in this process (plan item 51d).
+///
+/// Sampled after every 100 ms writer cycle. A seal handed to the writer
+/// before an empty sample was then ACKed by QuestDB or written to the spill
+/// (a failed flush keeps its seals in the ring, so it cannot read empty);
+/// the spill half is checked separately by
+/// [`crate::seal_spill::staged_production_spill_records_for_day`]. An ACK is
+/// not an apply: a reader still waits for the WAL. O(1), one Acquire load.
+#[must_use]
+pub fn last_seal_drained_unix_secs() -> Option<i64> {
+    let last = LAST_DRAINED_UNIX_SECS.load(std::sync::atomic::Ordering::Acquire);
+    (last != i64::MIN).then_some(last)
+}
+
 /// What the previous process's marker said, read by `main` before the seal
 /// writer starts and kept for the candle warm-up (audit PR31b-2). The writer
 /// loop overwrites the file with its own samples, so this is the only copy.
@@ -662,7 +678,9 @@ impl UnwrittenSealMark {
     fn note_drained(&mut self, unwritten: usize, now_unix_secs: i64) {
         if unwritten == 0 {
             self.drained_at_unix_secs = Some(now_unix_secs);
-            LAST_DRAINED_UNIX_SECS.store(now_unix_secs, std::sync::atomic::Ordering::Relaxed);
+            // Release (plan item 51d): a reader that sees this second also
+            // sees everything the writer did before it found itself empty.
+            LAST_DRAINED_UNIX_SECS.store(now_unix_secs, std::sync::atomic::Ordering::Release);
         }
     }
 
@@ -770,7 +788,7 @@ pub fn finish_unwritten_mark_at_shutdown(
     let drained_at_unix_secs = if seals_reported_lost == 0 {
         Some(now_unix_secs)
     } else {
-        let last = LAST_DRAINED_UNIX_SECS.load(std::sync::atomic::Ordering::Relaxed);
+        let last = LAST_DRAINED_UNIX_SECS.load(std::sync::atomic::Ordering::Acquire);
         (last != i64::MIN).then_some(last)
     };
     let record = UnwrittenSealRecord {
@@ -2388,5 +2406,30 @@ mod pr31b1_tests {
         assert!(read(&spill).clean);
         drop(sink);
         cleanup(&spill);
+    }
+
+    /// Plan item 51d: the drained second is published with Release and read
+    /// with Acquire, and reads `None` until the writer first drained.
+    #[test]
+    fn test_last_seal_drained_unix_secs_is_released_and_none_until_drained() {
+        let src = include_str!("seal_writer_loop.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        assert!(prod.contains(
+            "LAST_DRAINED_UNIX_SECS.store(now_unix_secs, std::sync::atomic::Ordering::Release)"
+        ));
+        assert!(!prod.contains(
+            "LAST_DRAINED_UNIX_SECS.store(now_unix_secs, std::sync::atomic::Ordering::Relaxed)"
+        ));
+        let getter = prod
+            .split("pub fn last_seal_drained_unix_secs(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .unwrap_or("");
+        assert!(getter.contains("Ordering::Acquire"));
+        assert!(getter.contains("(last != i64::MIN).then_some(last)"));
+        assert!(
+            prod.contains("AtomicI64 =\n    std::sync::atomic::AtomicI64::new(i64::MIN);")
+                || prod.contains("AtomicI64::new(i64::MIN)")
+        );
     }
 }

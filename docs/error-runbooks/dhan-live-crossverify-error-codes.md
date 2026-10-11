@@ -248,3 +248,42 @@ skipped its row as malformed. Before treating a `diverged` day as lost ticks,
 check `malformed_rows` on the `finished` line, the WAL apply lag at the read
 and the spill directory for that day, then re-run the day once QuestDB has
 caught up.
+
+## §5. 2026-10-06 — the read waits until our candles are sealed and saved (plan ITEM 51d)
+
+Authority: `no-rest-except-live-feed-2026-06-27.md` §12.15.10. No new alarm,
+filter, page or EMF name. Since 51d the paragraph above ("A `diverged` day is
+not always packet loss") applies only to a live row skipped as malformed and
+to a seal sent to the dead-letter queue: an attempt no longer reads while a
+sealed bar is queued, staged in a spill file or not yet applied by QuestDB.
+
+| Source / reason / value | Level | Means | Operator action |
+|---|---|---|---|
+| `source = "xverify_attempt_not_ready"`, `reason = "seals_pending"` | WARN (log only) | the seal writer had not drained after the last catch-up sweep, or a seal spill file for today was still staged; nothing was compared and the check runs again later today | none for one attempt; if every attempt says it, list the spill folder (below) and check the seal writer is running |
+| same, `reason = "seal_spill_parked"` | WARN (log only) | the mid-session replay parked a spill file after repeated failed flushes | check QuestDB is accepting writes, then the spill folder; the parked file replays once QuestDB answers |
+| same, `reason = "live_not_applied"` | WARN (log only) | QuestDB had not applied `candles_1m` through the snapshot taken after the drain, or `wal_tables()` could not be read | run the `wal_tables()` query (below); a `writerTxn` well behind `sequencerTxn` is apply lag |
+| same, `reason = "live_not_final"` | WARN (log only) | the catch-up floor was still moving below the close, or a strict read with no seal progress found end-of-session minutes missing (only Dhan's record was saved) | none for one attempt; on every attempt, check that the feed's frames reached the close |
+| `source = "xverify_unsettled_final"` | WARN (log only) | the day's LAST attempt read with our candles not known final: prices were compared, missing minutes were not judged | read the day's `missing_judgeable` (below); the day is `partial` at best |
+| `missing_judgeable` = `not_ready_seals_pending` / `not_ready_seal_spill_parked` / `not_ready_not_applied` / `not_ready_completeness_unknown` | daily row, `finished` line | the last attempt's reason for not judging missing minutes | as the matching row above |
+| `tv_dhan_xverify_option_pass_total{outcome="skipped_not_ready"}` | `info!` | the option pass did not run because the spot check found our candles not saved | none |
+| `xverify_failed`, `reason` = one of the four above | ERROR (pages, last attempt only) | an earlier attempt retried with this reason and the next one was skipped for lack of time before 17:23 (the last attempt itself always reads) | as the matching row above; S3 stays held |
+
+```sql
+-- QuestDB WAL apply state for the table the check reads.
+SELECT name, suspended, writerTxn, sequencerTxn
+FROM wal_tables()
+WHERE name = 'candles_1m';
+```
+
+```bash
+# Seal spill files still waiting for today (top level and replaying/).
+ls -l /opt/tickvault/data/spill /opt/tickvault/data/spill/replaying | grep "seals_v4-$(TZ=Asia/Kolkata date +%F)"
+```
+
+**Honest limits.** A seal floor frozen below the close excuses the minutes
+after it (the day reads `partial`). The spill check counts every staged seal
+file of the day, not only 1-minute bars. A seal sent to the dead-letter queue
+is not checked and still reads as a judged missing minute. The `measured`
+runs counter counts an attempt that kept only Dhan's record and retried. The
+SQL and the `ls` line are Assumed: they were not run against the live box when
+written.

@@ -1636,3 +1636,31 @@ $2.40 is about ₹205 at ~₹85/$ (Assumed rate).
 
 **§2.3n's lever rule is NOT met.** No lever is taken. The operator chose the
 spend knowing the price.
+
+## COST NOTE 2026-10-10 — log-drop page narrowed to the shipped sinks (+$0.30/mo, net $0 after stage 3)
+
+**Authorization:** `dhan-rest-only-noise-lock-2026-07-14.md` §2.9-i, recorded
+before the terraform, per the rule-file-first law. It narrows the existing
+`tv-<env>-log-lines-dropped` page (§2.9) to the two log files shipped to
+CloudWatch; it adds no page.
+
+| Item | Cost |
+|---|---:|
+| 1 filter-derived metric `tv_log_lines_dropped_shipped_total` (`host` dimension) | $0.30 |
+| 1 log metric filter on `/tickvault/<env>/metrics` | $0.00 |
+| Alarms added | 0 |
+| **Stage 1 total** | **+$0.30/mo (upper bound)** |
+| Stage 3: `tv_log_lines_dropped_total` leaves the EMF selector | −$0.30 |
+| **Net after stage 3** | **$0** |
+
+If stage 3 is skipped, the +$0.30 stays. Derived metrics bill only for hours
+with datapoints; both sliced labels are seeded at 0 at boot, so the box's
+running hours set the real figure. Metric filters on the metrics log group go
+from 60 to 61 of the 100 AWS allows per log group.
+
+**Budget position: NOT read live.** The session that wrote this had no AWS
+read. The standing ceiling is $150 (Quote 23); +$0.30 is 0.2% of it, and the
+net after stage 3 is zero.
+
+**§2.3n's lever rule is NOT met.** No lever is taken; the change is net zero
+once complete.
