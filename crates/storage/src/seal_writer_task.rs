@@ -511,7 +511,13 @@ fn stage_pending_files(dir: &Path) -> Vec<PathBuf> {
                 // A same-named leftover is already staged (prior crashed
                 // boot). Keep BOTH: park the live one under a free name
                 // rather than clobbering un-recovered records.
-                let target = free_path(&replaying, name);
+                let Some(target) = free_path(&replaying, name) else {
+                    warn!(
+                        ?path,
+                        "no free staging name for seal file — retried next boot"
+                    );
+                    continue;
+                };
                 if let Err(err) = std::fs::rename(&path, &target) {
                     warn!(?path, ?err, "cannot stage seal file — retried next boot");
                 }
@@ -584,21 +590,57 @@ fn staged_kind(path: &Path) -> Option<StagedKind> {
     }
 }
 
-/// Returns `dir/name`, appending `.1`, `.2`, … until the path is free.
-/// Bounded so a pathological directory cannot spin forever.
-fn free_path(dir: &Path, name: &std::ffi::OsStr) -> PathBuf {
+/// Numbered copies `free_path` probes (`name.1` .. `name.9999`) before it
+/// falls back to time-tagged overflow names.
+const FREE_PATH_NUMBERED_COPIES: u32 = 10_000;
+
+/// Time-tagged overflow names `free_path` probes before it gives up.
+const FREE_PATH_OVERFLOW_ATTEMPTS: u64 = 64;
+
+/// Returns a path in `dir` for `name` that does not exist yet: `dir/name`,
+/// then `.1`, `.2`, … `.9999`, then `.overflow.<unix nanos>`. `None` when
+/// every probe is taken; the caller then leaves the file where it is.
+///
+/// Never returns an existing path. `std::fs::rename` replaces its target, so
+/// until 2026-10-11 the fixed `.overflow` fallback made every rename past the
+/// 10,000th copy overwrite the previous one and lose its seals silently (seen
+/// as `staging_the_live_file_while_appends_race_loses_no_seal` failing under
+/// coverage). The overflow tag is digits, so `strip_copy_suffixes` still reads
+/// the copy as a spill record file.
+///
+/// The probe and the rename are not atomic; one task renames into each of
+/// `replaying/` and `archive/`, so nothing else takes the name in between.
+///
+/// # Complexity
+/// O(copies already present), at most 10,000 + 64 `stat` calls. Cold: once
+/// per staged or archived file.
+fn free_path(dir: &Path, name: &std::ffi::OsStr) -> Option<PathBuf> {
     let base = dir.join(name);
     if !base.exists() {
-        return base;
+        return Some(base);
     }
     let stem = name.to_string_lossy().into_owned();
-    for suffix in 1..10_000u32 {
+    // O(1) EXEMPT: bounded probe of a cold directory, once per staged file
+    for suffix in 1..FREE_PATH_NUMBERED_COPIES {
         let candidate = dir.join(format!("{stem}.{suffix}"));
         if !candidate.exists() {
-            return candidate;
+            return Some(candidate);
         }
     }
-    dir.join(format!("{stem}.overflow"))
+    let first_tag = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
+        });
+    // O(1) EXEMPT: bounded probe of a cold directory, once per staged file
+    (0..FREE_PATH_OVERFLOW_ATTEMPTS)
+        .map(|offset| {
+            dir.join(format!(
+                "{stem}.overflow.{}",
+                first_tag.wrapping_add(offset)
+            ))
+        })
+        .find(|candidate| !candidate.exists())
 }
 
 /// Decodes every fixed-size record in a staged spill file.
@@ -724,7 +766,15 @@ fn archive_staged(path: &Path, refused: bool) -> std::io::Result<()> {
     let Some(name) = path.file_name() else {
         return Ok(());
     };
-    std::fs::rename(path, free_path(&archive, name))
+    let Some(target) = free_path(&archive, name) else {
+        // Left in `replaying/`: the caller keeps it staged and retries, so
+        // its seals are never lost to an overwrite.
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("no free archive name for {path:?}"),
+        ));
+    };
+    std::fs::rename(path, target)
 }
 
 /// The narrow slice of [`ShadowCandleWriter`] the recovery drain needs.
@@ -2264,7 +2314,11 @@ fn stage_live_spill_files(spill: &crate::seal_spill::SealSpillWriter, spill_dir:
                 every_rename_ok = false;
                 continue;
             };
-            let target = free_path(&replaying, name);
+            let Some(target) = free_path(&replaying, name) else {
+                every_rename_ok = false;
+                warn!(?path, "seal replay: no free staging name for a spill file");
+                continue;
+            };
             match std::fs::rename(path, &target) {
                 Ok(()) => moved += 1,
                 Err(err) => {
@@ -4017,6 +4071,33 @@ mod tests {
         );
         assert_eq!(out.seals_reingested, 4);
         cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn test_regression_free_path_never_returns_an_existing_path_past_the_numbered_copies() {
+        // 2026-10-11: past `.9999` free_path returned a fixed `.overflow`, and
+        // `rename` replaced it, so every later staged or archived copy
+        // overwrote the one before and lost its seals.
+        let (dir, dlq) = temp_pair("free-path-overflow");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let name = std::ffi::OsStr::new("seals_v5-2026-10-11.bin");
+        std::fs::write(dir.join(name), b"x").expect("base");
+        for suffix in 1..FREE_PATH_NUMBERED_COPIES {
+            std::fs::write(dir.join(format!("seals_v5-2026-10-11.bin.{suffix}")), b"x")
+                .expect("copy");
+        }
+        // The fixed name the old fallback returned.
+        std::fs::write(dir.join("seals_v5-2026-10-11.bin.overflow"), b"x").expect("old");
+
+        let first = free_path(&dir, name).expect("a free overflow name");
+        assert!(!first.exists(), "never an existing path: {first:?}");
+        assert_eq!(staged_kind(&first), Some(StagedKind::Spill));
+        std::fs::write(&first, b"x").expect("take it");
+
+        let second = free_path(&dir, name).expect("another free overflow name");
+        assert!(!second.exists(), "never an existing path: {second:?}");
+        assert_ne!(first, second);
+        cleanup(&dir, &dlq);
     }
 
     #[test]
