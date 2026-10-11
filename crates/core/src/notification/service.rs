@@ -385,7 +385,9 @@ impl NotificationService {
                         .is_some_and(|key| key.family != EpisodeFamily::Boot || self.boot_bubble)
                 {
                     let svc = Arc::clone(self);
+                    let inflight = InflightAlertTask::start();
                     tokio::spawn(async move {
+                        let _inflight = inflight;
                         svc.dispatch_episode_event(event).await;
                     });
                     return;
@@ -459,43 +461,10 @@ impl NotificationService {
                     let base_url = telegram_api_base_url.clone();
                     let chunks = split_message_for_telegram(&message);
 
+                    let inflight = InflightAlertTask::start();
                     tokio::spawn(async move {
-                        let total = chunks.len();
-                        let mut failed_parts: Vec<usize> = Vec::new();
-                        for (idx, chunk) in chunks.iter().enumerate() {
-                            let part_num = idx.saturating_add(1);
-                            let body = if total > 1 {
-                                format!("(Part {part_num}/{total})\n{chunk}")
-                            } else {
-                                chunk.clone()
-                            };
-                            let ok = send_telegram_chunk_with_retry(
-                                &client, &base_url, &token, &chat_id, &body,
-                            )
-                            .await;
-                            if !ok {
-                                failed_parts.push(part_num);
-                            }
-                        }
-                        // Q3 (2026-04-23): if ANY chunk failed after all
-                        // retries, emit a single ERROR log so the operator
-                        // knows the report is incomplete. Loki routes
-                        // ERROR-level tracing events to Telegram via
-                        // alertmanager, so this serves as the
-                        // "delivery-failed, investigate" signal even
-                        // though the Telegram transport itself is the
-                        // thing that failed (the alertmanager path is
-                        // independent — different chat channel / retry).
-                        if !failed_parts.is_empty() {
-                            error!(
-                                code = tickvault_common::error_code::ErrorCode::Telegram01Dropped.code_str(),
-                                source = "chunked_send_partial",
-                                total_chunks = total,
-                                failed_chunks = failed_parts.len(),
-                                failed_part_numbers = ?failed_parts,
-                                "notification: Telegram chunked-send had mid-batch failures after retries — user-visible report is incomplete"
-                            );
-                        }
+                        let _inflight = inflight;
+                        send_chunked_page(&client, &base_url, &token, &chat_id, &chunks).await;
                     });
                 }
 
@@ -507,7 +476,9 @@ impl NotificationService {
                     let client = sns.clone();
                     let phone = phone.clone();
 
+                    let inflight = InflightAlertTask::start();
                     tokio::spawn(async move {
+                        let _inflight = inflight;
                         send_sns_sms(&client, &phone, &sms_text).await;
                     });
                 }
@@ -1969,6 +1940,38 @@ pub(crate) const TELEGRAM_SEND_BACKOFF_INITIAL_MS: u64 = 100;
 /// indefinitely.
 pub(crate) const TELEGRAM_SEND_BACKOFF_CAP_SECS: u64 = 2;
 
+/// Upper bound on a wait Telegram asks for in a 429 reply
+/// (`parameters.retry_after`). PR47 (2026-10-11): the ladder above used to
+/// ignore that field, so a burst that hit the flood limit retried after
+/// 100 ms and 200 ms, inside the window Telegram had just named, and the
+/// page was dropped. The ladder now waits what Telegram asks, up to this
+/// cap. Every send runs on its own spawned task, so the wait holds back
+/// only that page, never the caller. Worst case per chunk:
+/// `(TELEGRAM_SEND_MAX_ATTEMPTS − 1) × 30 s` = 60 s.
+pub(crate) const TELEGRAM_RETRY_AFTER_CAP_SECS: u64 = 30;
+
+/// Reads `parameters.retry_after` (whole seconds) from a Telegram error
+/// body. Any other shape, including an unparseable body, is `None`.
+#[must_use]
+pub(crate) fn parse_retry_after_secs(body: &str) -> Option<u64> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .get("parameters")?
+        .get("retry_after")?
+        .as_u64()
+}
+
+/// The wait before the next attempt: the ladder's backoff, or Telegram's
+/// requested `retry_after` (capped at [`TELEGRAM_RETRY_AFTER_CAP_SECS`])
+/// when that is longer. Never shorter than the ladder's backoff.
+#[must_use]
+pub(crate) fn telegram_retry_wait(backoff: Duration, retry_after_secs: Option<u64>) -> Duration {
+    match retry_after_secs {
+        Some(secs) => Duration::from_secs(secs.min(TELEGRAM_RETRY_AFTER_CAP_SECS)).max(backoff),
+        None => backoff,
+    }
+}
+
 /// Outcome of a single Telegram `sendMessage` request. Drives whether
 /// the caller retries the same chunk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1976,7 +1979,9 @@ pub(crate) enum TelegramSendOutcome {
     /// HTTP 2xx — Telegram accepted the message.
     Success,
     /// Network error, 5xx, or 429 rate-limit — worth retrying.
-    Transient,
+    /// `retry_after_secs` is the wait Telegram asked for in a 429 body
+    /// (`parameters.retry_after`); `None` for every other transient case.
+    Transient { retry_after_secs: Option<u64> },
     /// 4xx other than 429 — retrying won't help (bad bot token, wrong
     /// chat_id, malformed HTML). Log ERROR once and move on.
     Permanent,
@@ -1989,7 +1994,9 @@ fn classify_telegram_status(status: reqwest::StatusCode) -> TelegramSendOutcome 
     if status.is_success() {
         TelegramSendOutcome::Success
     } else if status.as_u16() == 429 || status.is_server_error() {
-        TelegramSendOutcome::Transient
+        TelegramSendOutcome::Transient {
+            retry_after_secs: None,
+        }
     } else {
         TelegramSendOutcome::Permanent
     }
@@ -2061,14 +2068,15 @@ async fn send_telegram_message(
     match client.post(&url).json(&body).send().await {
         Ok(response) => {
             let status = response.status();
-            let outcome = classify_telegram_status(status);
+            let outcome = with_retry_after(classify_telegram_status(status), response).await;
             match outcome {
                 TelegramSendOutcome::Success => {
                     tracing::debug!("notification: Telegram message sent");
                 }
-                TelegramSendOutcome::Transient => {
+                TelegramSendOutcome::Transient { retry_after_secs } => {
                     warn!(
                         status = %status,
+                        retry_after_secs = ?retry_after_secs,
                         "notification: Telegram sendMessage transient failure — will retry"
                     );
                 }
@@ -2094,9 +2102,28 @@ async fn send_telegram_message(
             warn_transient_send_throttled(&safe_msg);
             // Network errors are always transient — DNS, TLS handshake,
             // TCP reset all self-heal on retry.
-            TelegramSendOutcome::Transient
+            TelegramSendOutcome::Transient {
+                retry_after_secs: None,
+            }
         }
     }
+}
+
+/// For a 429, reads the response body and fills in Telegram's requested
+/// `retry_after`. Every other outcome is returned unchanged and the body is
+/// left unread. Cold path: one body read per rate-limited attempt.
+async fn with_retry_after(
+    outcome: TelegramSendOutcome,
+    response: reqwest::Response,
+) -> TelegramSendOutcome {
+    if response.status().as_u16() != 429 {
+        return outcome;
+    }
+    let retry_after_secs = match response.text().await {
+        Ok(body) => parse_retry_after_secs(&body),
+        Err(_) => None,
+    };
+    TelegramSendOutcome::Transient { retry_after_secs }
 }
 
 /// Sends a single Telegram chunk with per-chunk retry. Retries transient
@@ -2121,9 +2148,9 @@ pub(crate) async fn send_telegram_chunk_with_retry(
         match send_telegram_message(client, base_url, bot_token, chat_id, text).await {
             TelegramSendOutcome::Success => return true,
             TelegramSendOutcome::Permanent => return false,
-            TelegramSendOutcome::Transient => {
+            TelegramSendOutcome::Transient { retry_after_secs } => {
                 if attempt < TELEGRAM_SEND_MAX_ATTEMPTS {
-                    tokio::time::sleep(delay).await;
+                    tokio::time::sleep(telegram_retry_wait(delay, retry_after_secs)).await;
                     delay = delay.saturating_mul(2).min(cap);
                 }
             }
@@ -2168,13 +2195,12 @@ async fn send_telegram_message_capture(
         Ok(response) => {
             let status = response.status();
             let outcome = classify_telegram_status(status);
-            let message_id = if matches!(outcome, TelegramSendOutcome::Success) {
-                match response.text().await {
-                    Ok(text) => parse_send_message_id(&text),
-                    Err(_) => None,
-                }
-            } else {
-                None
+            if !matches!(outcome, TelegramSendOutcome::Success) {
+                return (with_retry_after(outcome, response).await, None);
+            }
+            let message_id = match response.text().await {
+                Ok(text) => parse_send_message_id(&text),
+                Err(_) => None,
             };
             (outcome, message_id)
         }
@@ -2184,7 +2210,12 @@ async fn send_telegram_message_capture(
                 .to_string()
                 .replace(bot_token.expose_secret(), "[REDACTED]");
             warn_transient_send_throttled(&safe_msg);
-            (TelegramSendOutcome::Transient, None)
+            (
+                TelegramSendOutcome::Transient {
+                    retry_after_secs: None,
+                },
+                None,
+            )
         }
     }
 }
@@ -2205,9 +2236,9 @@ pub(crate) async fn send_telegram_chunk_with_retry_returning_id(
         match send_telegram_message_capture(client, base_url, bot_token, chat_id, text).await {
             (TelegramSendOutcome::Success, message_id) => return (true, message_id),
             (TelegramSendOutcome::Permanent, _) => return (false, None),
-            (TelegramSendOutcome::Transient, _) => {
+            (TelegramSendOutcome::Transient { retry_after_secs }, _) => {
                 if attempt < TELEGRAM_SEND_MAX_ATTEMPTS {
-                    tokio::time::sleep(delay).await;
+                    tokio::time::sleep(telegram_retry_wait(delay, retry_after_secs)).await;
                     delay = delay.saturating_mul(2).min(cap);
                 }
             }
@@ -2276,10 +2307,14 @@ pub(crate) async fn edit_telegram_message_with_retry(
     let cap = Duration::from_secs(TELEGRAM_SEND_BACKOFF_CAP_SECS);
     let mut last = EditOutcome::Transient;
     for attempt in 1..=TELEGRAM_SEND_MAX_ATTEMPTS {
+        let mut retry_after_secs = None;
         last = match client.post(&url).json(&body).send().await {
             Ok(response) => {
                 let status = response.status().as_u16();
                 let response_body = response.text().await.unwrap_or_default();
+                if status == 429 {
+                    retry_after_secs = parse_retry_after_secs(&response_body);
+                }
                 classify_edit_body(status, &response_body)
             }
             Err(err) => {
@@ -2293,7 +2328,7 @@ pub(crate) async fn edit_telegram_message_with_retry(
         match last {
             EditOutcome::Transient => {
                 if attempt < TELEGRAM_SEND_MAX_ATTEMPTS {
-                    tokio::time::sleep(delay).await;
+                    tokio::time::sleep(telegram_retry_wait(delay, retry_after_secs)).await;
                     delay = delay.saturating_mul(2).min(cap);
                 }
             }
@@ -2303,6 +2338,99 @@ pub(crate) async fn edit_telegram_message_with_retry(
     last
 }
 
+/// Sends one page as ordered chunks, each on the retry ladder, and returns
+/// how many chunks were lost. Any lost chunk counts ONE
+/// `tv_telegram_dropped_total{reason="send_failed"}` (the page is what was
+/// lost) and logs one coded TELEGRAM-01 `error!`.
+///
+/// Q3 (2026-04-23): if ANY chunk failed after all retries, the operator is
+/// told the report is incomplete. PR47 (2026-10-11): this was the one
+/// terminal send failure that logged TELEGRAM-01 but never counted, so a
+/// lost Critical page was invisible to the tv-telegram-drops alarm.
+///
+/// # Performance
+///
+/// Cold path only. Called from a spawned task.
+async fn send_chunked_page(
+    client: &reqwest::Client,
+    base_url: &str,
+    bot_token: &SecretString,
+    chat_id: &str,
+    chunks: &[String],
+) -> usize {
+    let total = chunks.len();
+    let mut failed_parts: Vec<usize> = Vec::new();
+    for (idx, chunk) in chunks.iter().enumerate() {
+        let part_num = idx.saturating_add(1);
+        let body = if total > 1 {
+            format!("(Part {part_num}/{total})\n{chunk}")
+        } else {
+            chunk.clone()
+        };
+        if !send_telegram_chunk_with_retry(client, base_url, bot_token, chat_id, &body).await {
+            failed_parts.push(part_num);
+        }
+    }
+    if !failed_parts.is_empty() {
+        metrics::counter!(
+            "tv_telegram_dropped_total",
+            "reason" => "send_failed",
+        )
+        .increment(1);
+        error!(
+            code = tickvault_common::error_code::ErrorCode::Telegram01Dropped.code_str(),
+            source = "chunked_send_partial",
+            total_chunks = total,
+            failed_chunks = failed_parts.len(),
+            failed_part_numbers = ?failed_parts,
+            "notification: Telegram chunked-send had mid-batch failures after retries — user-visible report is incomplete"
+        );
+    }
+    failed_parts.len()
+}
+
+// ---------------------------------------------------------------------------
+// Alert-send task count (PR47, row 166)
+// ---------------------------------------------------------------------------
+
+/// Alert-send tasks currently running (Telegram bypass sends, SMS copies,
+/// episode dispatches). Published on `tv_telegram_send_tasks_inflight`.
+static ALERT_SEND_TASKS_INFLIGHT: AtomicU64 = AtomicU64::new(0);
+
+/// Counts one spawned alert-send task while it lives.
+///
+/// The bound is recorded, not capped (PR47, row 166): `notify` spawns one
+/// task per High/Critical page and per episode event, because a cap would
+/// have to drop or delay a Critical page, which is the loss this item
+/// closes. What bounds the count is the producers: every High/Critical
+/// event is edge-triggered or once per episode, Medium/Low fold into the
+/// coalescer, and a task lives at most `TELEGRAM_SEND_MAX_ATTEMPTS` sends
+/// plus `(TELEGRAM_SEND_MAX_ATTEMPTS − 1) × TELEGRAM_RETRY_AFTER_CAP_SECS`
+/// of waiting per chunk. This gauge is the measurement of that bound.
+pub(crate) struct InflightAlertTask;
+
+impl InflightAlertTask {
+    /// Counts a task in. Call before `tokio::spawn` and move the value in.
+    pub(crate) fn start() -> Self {
+        let now = ALERT_SEND_TASKS_INFLIGHT
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        publish_inflight_alert_tasks(now);
+        Self
+    }
+}
+
+impl Drop for InflightAlertTask {
+    fn drop(&mut self) {
+        let before = ALERT_SEND_TASKS_INFLIGHT.fetch_sub(1, Ordering::Relaxed);
+        publish_inflight_alert_tasks(before.saturating_sub(1));
+    }
+}
+
+fn publish_inflight_alert_tasks(count: u64) {
+    metrics::gauge!("tv_telegram_send_tasks_inflight").set(count as f64);
+}
+
 // ---------------------------------------------------------------------------
 // Internal SNS Send
 // ---------------------------------------------------------------------------
@@ -2310,7 +2438,12 @@ pub(crate) async fn edit_telegram_message_with_retry(
 /// Sends an SMS via AWS SNS direct publish to a phone number.
 ///
 /// Uses `Transactional` SMS type for highest delivery priority (not promotional).
-/// Logs `warn` on failure — never panics, never blocks caller.
+/// Never panics, never blocks the caller. A failure is counted on
+/// `tv_sns_sms_failed_total{reason}` and logged as a coded TELEGRAM-01
+/// `error!` (PR47, 2026-10-11): before, it was a bare `warn!` with no
+/// counter, so a lost SMS copy of a Critical page left no trace an
+/// operator could query. Prometheus only, no CloudWatch alarm (a page for
+/// it would need a dated row in the noise lock).
 ///
 /// # Performance
 ///
@@ -2323,7 +2456,7 @@ async fn send_sns_sms(client: &aws_sdk_sns::Client, phone_number: &str, message:
     {
         Ok(v) => v,
         Err(err) => {
-            warn!(error = %err, "notification: SNS MessageAttributeValue build failed");
+            record_sns_sms_failure(SNS_SMS_FAILED_ATTRIBUTE_BUILD, &err.to_string());
             return;
         }
     };
@@ -2343,9 +2476,28 @@ async fn send_sns_sms(client: &aws_sdk_sns::Client, phone_number: &str, message:
             );
         }
         Err(err) => {
-            warn!(error = %err, "notification: SNS SMS send failed");
+            record_sns_sms_failure(SNS_SMS_FAILED_PUBLISH, &err.to_string());
         }
     }
+}
+
+/// `reason` label: the SMS attribute could not be built (no request sent).
+pub(crate) const SNS_SMS_FAILED_ATTRIBUTE_BUILD: &str = "attribute_build";
+/// `reason` label: SNS refused or failed the publish call.
+pub(crate) const SNS_SMS_FAILED_PUBLISH: &str = "publish_failed";
+
+/// Counts and logs one lost SMS copy of a High/Critical page. The phone
+/// number is never logged.
+fn record_sns_sms_failure(reason: &'static str, error_text: &str) {
+    metrics::counter!("tv_sns_sms_failed_total", "reason" => reason).increment(1);
+    error!(
+        target: "notification",
+        code = tickvault_common::error_code::ErrorCode::Telegram01Dropped.code_str(),
+        source = "sns_sms_failed",
+        reason,
+        error = %error_text,
+        "TELEGRAM-01: SNS SMS copy of a High/Critical page was not sent"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2398,6 +2550,13 @@ fn mask_phone(phone: &str) -> String {
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: test code
 mod tests {
     use super::*;
+
+    /// Current number of running alert-send tasks. Kept inside the test
+    /// module: a top-level `#[cfg(test)]` item ends the loss-counter
+    /// guard's scan of this file early, hiding every counter below it.
+    fn inflight_alert_tasks() -> u64 {
+        ALERT_SEND_TASKS_INFLIGHT.load(Ordering::Relaxed)
+    }
 
     /// A `metrics::Recorder` that records counter increments in memory, so a
     /// test can assert on a counter the production code emits.
@@ -3041,7 +3200,9 @@ mod tests {
         // Rate-limited — must retry, not give up.
         assert_eq!(
             classify_telegram_status(reqwest::StatusCode::TOO_MANY_REQUESTS),
-            TelegramSendOutcome::Transient
+            TelegramSendOutcome::Transient {
+                retry_after_secs: None
+            }
         );
     }
 
@@ -3052,7 +3213,9 @@ mod tests {
             let status = reqwest::StatusCode::from_u16(code).unwrap();
             assert_eq!(
                 classify_telegram_status(status),
-                TelegramSendOutcome::Transient,
+                TelegramSendOutcome::Transient {
+                    retry_after_secs: None
+                },
                 "HTTP {code} must classify as transient"
             );
         }
@@ -4610,6 +4773,316 @@ mod tests {
         let outcome =
             edit_telegram_message_with_retry(&client, &base_url, &token, "123", 42, "text").await;
         assert_eq!(outcome, EditOutcome::Fallback);
+    }
+
+    // -----------------------------------------------------------------------
+    // PR47 (2026-10-11): an urgent page is never lost uncounted.
+    // -----------------------------------------------------------------------
+
+    /// Answers the first `limited` requests (send or edit) with a 429 that
+    /// carries `parameters.retry_after = retry_after_secs`, then 200 with
+    /// `message_id` 777. Returns the base URL and a request counter.
+    async fn start_rate_limited_then_ok_server(
+        limited: usize,
+        retry_after_secs: u64,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::AtomicUsize;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://127.0.0.1:{}", addr.port());
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let hits_task = std::sync::Arc::clone(&hits);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let seen = hits_task.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let _ = stream.read(&mut buf).await;
+                    let (status_line, body) = if seen < limited {
+                        (
+                            "HTTP/1.1 429 Too Many Requests",
+                            format!(
+                                r#"{{"ok":false,"error_code":429,"description":"Too Many Requests: retry after {retry_after_secs}","parameters":{{"retry_after":{retry_after_secs}}}}}"#
+                            ),
+                        )
+                    } else {
+                        (
+                            "HTTP/1.1 200 OK",
+                            r#"{"ok":true,"result":{"message_id":777}}"#.to_string(),
+                        )
+                    };
+                    let response = format!(
+                        "{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        status_line,
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        (base_url, hits)
+    }
+
+    fn short_timeout_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_parse_retry_after_secs_reads_the_parameters_field() {
+        assert_eq!(
+            parse_retry_after_secs(
+                r#"{"ok":false,"error_code":429,"parameters":{"retry_after":17}}"#
+            ),
+            Some(17)
+        );
+        assert_eq!(
+            parse_retry_after_secs(r#"{"ok":false,"description":"Too Many Requests"}"#),
+            None,
+            "a 429 with no parameters falls back to the ladder"
+        );
+        assert_eq!(parse_retry_after_secs("not json"), None);
+        assert_eq!(parse_retry_after_secs(""), None);
+        assert_eq!(
+            parse_retry_after_secs(r#"{"parameters":{"retry_after":-3}}"#),
+            None,
+            "a negative wait is not a wait"
+        );
+        assert_eq!(
+            parse_retry_after_secs(r#"{"parameters":{"retry_after":"5"}}"#),
+            None,
+            "a string is not the documented integer"
+        );
+    }
+
+    #[test]
+    fn test_telegram_retry_wait_honours_and_caps_retry_after() {
+        let backoff = Duration::from_millis(TELEGRAM_SEND_BACKOFF_INITIAL_MS);
+        assert_eq!(telegram_retry_wait(backoff, None), backoff);
+        assert_eq!(
+            telegram_retry_wait(backoff, Some(5)),
+            Duration::from_secs(5),
+            "Telegram's longer wait wins"
+        );
+        assert_eq!(
+            telegram_retry_wait(backoff, Some(0)),
+            backoff,
+            "never shorter than the ladder"
+        );
+        assert_eq!(
+            telegram_retry_wait(backoff, Some(u64::MAX)),
+            Duration::from_secs(TELEGRAM_RETRY_AFTER_CAP_SECS),
+            "a huge wait is capped"
+        );
+        assert_eq!(
+            telegram_retry_wait(Duration::from_secs(90), Some(1)),
+            Duration::from_secs(90),
+            "a longer ladder step is kept"
+        );
+    }
+
+    const _: () = assert!(
+        TELEGRAM_RETRY_AFTER_CAP_SECS >= 1 && TELEGRAM_RETRY_AFTER_CAP_SECS <= 60,
+        "the retry-after cap must honour Telegram's usual flood window and stay bounded"
+    );
+
+    // Regression: 2026-10-11 — a 429 retried after 100 ms, inside the
+    // window Telegram named, and the page was lost.
+    #[tokio::test]
+    async fn test_regression_send_retry_waits_for_telegram_retry_after() {
+        let (base_url, hits) = start_rate_limited_then_ok_server(1, 1).await;
+        let token = SecretString::from("test-bot-token".to_string());
+        let started = std::time::Instant::now();
+        let ok =
+            send_telegram_chunk_with_retry(&short_timeout_client(), &base_url, &token, "1", "x")
+                .await;
+        assert!(ok, "the retry after the requested wait is delivered");
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "the retry waited Telegram's retry_after, not the 100 ms ladder step: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_regression_episode_send_retry_waits_for_telegram_retry_after() {
+        let (base_url, hits) = start_rate_limited_then_ok_server(1, 1).await;
+        let token = SecretString::from("test-bot-token".to_string());
+        let started = std::time::Instant::now();
+        let (ok, id) = send_telegram_chunk_with_retry_returning_id(
+            &short_timeout_client(),
+            &base_url,
+            &token,
+            "1",
+            "x",
+        )
+        .await;
+        assert!(ok);
+        assert_eq!(id, Some(777));
+        assert!(started.elapsed() >= Duration::from_secs(1));
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_regression_edit_retry_waits_for_telegram_retry_after() {
+        let (base_url, hits) = start_rate_limited_then_ok_server(1, 1).await;
+        let token = SecretString::from("test-bot-token".to_string());
+        let started = std::time::Instant::now();
+        let outcome = edit_telegram_message_with_retry(
+            &short_timeout_client(),
+            &base_url,
+            &token,
+            "1",
+            42,
+            "x",
+        )
+        .await;
+        assert_eq!(outcome, EditOutcome::Applied);
+        assert!(started.elapsed() >= Duration::from_secs(1));
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_rate_limited_on_every_attempt_gives_up_after_the_budget() {
+        let (base_url, hits) = start_rate_limited_then_ok_server(usize::MAX, 1).await;
+        let token = SecretString::from("test-bot-token".to_string());
+        let ok =
+            send_telegram_chunk_with_retry(&short_timeout_client(), &base_url, &token, "1", "x")
+                .await;
+        assert!(!ok);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            TELEGRAM_SEND_MAX_ATTEMPTS as usize,
+            "no attempt beyond the budget"
+        );
+    }
+
+    // Regression: 2026-10-11 — the chunked bypass path (every Critical and
+    // High page outside the episode lane) logged TELEGRAM-01 on a lost page
+    // but never counted it, so the tv-telegram-drops alarm could not see it.
+    #[test]
+    fn test_regression_chunked_page_loss_counts_one_drop_per_page() {
+        let recorder = CapturingRecorder::default();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(50))
+            .build()
+            .unwrap();
+        let token = SecretString::from("fake".to_string());
+        let chunks = vec!["one".to_string(), "two".to_string()];
+        let lost = metrics::with_local_recorder(&recorder, || {
+            rt.block_on(send_chunked_page(
+                &client,
+                "http://127.0.0.1:1",
+                &token,
+                "1",
+                &chunks,
+            ))
+        });
+        assert_eq!(lost, 2, "both chunks were unreachable");
+        assert_eq!(
+            recorder.count_labelled("tv_telegram_dropped_total", "reason", "send_failed"),
+            1,
+            "one lost page counts once, whatever its chunk count"
+        );
+    }
+
+    #[test]
+    fn test_chunked_page_delivered_counts_no_drop() {
+        let recorder = CapturingRecorder::default();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let token = SecretString::from("test-bot-token".to_string());
+        let chunks = vec!["one".to_string()];
+        let lost = metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let (base_url, _hits) = start_rate_limited_then_ok_server(0, 0).await;
+                send_chunked_page(&short_timeout_client(), &base_url, &token, "1", &chunks).await
+            })
+        });
+        assert_eq!(lost, 0);
+        assert_eq!(recorder.count("tv_telegram_dropped_total"), 0);
+    }
+
+    // Regression: 2026-10-11 — a failed SMS copy of a Critical page was a
+    // bare warn! with no counter.
+    #[test]
+    fn test_regression_sns_sms_failure_is_counted_per_reason() {
+        let recorder = CapturingRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            record_sns_sms_failure(SNS_SMS_FAILED_PUBLISH, "throttled");
+            record_sns_sms_failure(SNS_SMS_FAILED_PUBLISH, "throttled");
+            record_sns_sms_failure(SNS_SMS_FAILED_ATTRIBUTE_BUILD, "bad attribute");
+        });
+        assert_eq!(
+            recorder.count_labelled("tv_sns_sms_failed_total", "reason", "publish_failed"),
+            2
+        );
+        assert_eq!(
+            recorder.count_labelled("tv_sns_sms_failed_total", "reason", "attribute_build"),
+            1
+        );
+        assert_eq!(
+            recorder.count("tv_telegram_dropped_total"),
+            0,
+            "an SMS loss must not trip the Telegram drop alarm"
+        );
+    }
+
+    #[test]
+    fn test_sns_sms_failure_source_is_coded_and_never_logs_the_phone() {
+        let src = include_str!("service.rs");
+        let start = src.find("fn record_sns_sms_failure").unwrap();
+        let body = &src[start..start + 900];
+        assert!(body.contains("ErrorCode::Telegram01Dropped"));
+        assert!(body.contains("error!("));
+        assert!(!body.contains("phone"), "the phone number is never logged");
+        let sms = src.find("async fn send_sns_sms").unwrap();
+        let sms_body = &src[sms..src[sms..].find("\n}\n").unwrap() + sms];
+        assert!(
+            !sms_body.contains(concat!("warn", "!(")),
+            "SMS loss is an error, not a warning"
+        );
+        assert_eq!(sms_body.matches("record_sns_sms_failure(").count(), 2);
+    }
+
+    #[test]
+    fn test_inflight_alert_tasks_counts_while_alive() {
+        let first = InflightAlertTask::start();
+        let second = InflightAlertTask::start();
+        assert!(inflight_alert_tasks() >= 2, "both tasks are counted");
+        drop(first);
+        drop(second);
+    }
+
+    #[test]
+    fn test_every_notify_spawn_is_counted_in_flight() {
+        let src = include_str!("service.rs");
+        let start = src.find("pub fn notify(self: &Arc<Self>").unwrap();
+        let end = start + src[start..].find("pub fn is_active(&self)").unwrap();
+        let notify = &src[start..end];
+        assert_eq!(
+            notify.matches("tokio::spawn(").count(),
+            notify.matches("InflightAlertTask::start()").count(),
+            "every task notify spawns is counted on tv_telegram_send_tasks_inflight"
+        );
+        assert_eq!(notify.matches("tokio::spawn(").count(), 3);
     }
 
     #[tokio::test]
