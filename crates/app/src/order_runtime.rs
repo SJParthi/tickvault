@@ -655,6 +655,30 @@ struct LocalReconcileReport {
     order_fold_divergences: usize,
 }
 
+/// The working sets [`local_reconcile`] fills on each run, kept between runs
+/// so a heartbeat clears them instead of allocating them again (audit PR18,
+/// plan row 213).
+///
+/// Cleared, never shrunk: after the first runs they hold the capacity the
+/// largest book needed and a later run allocates nothing until the book grows
+/// past it. Bounded by the book itself (`BookState::MAX_TRACKED_SIDS`
+/// instruments, `MAX_TRACKED_ORDERS` orders), and emptied with the book at
+/// the daily reset.
+#[derive(Debug, Default)]
+struct ReconcileScratch {
+    /// The union of instrument keys one leg compares over.
+    keys: HashSet<(u64, ExchangeSegment)>,
+    /// Leg 2: per-instrument signed fold of order `traded_qty` lots.
+    folded: HashMap<(u64, ExchangeSegment), i64>,
+}
+
+impl ReconcileScratch {
+    fn clear(&mut self) {
+        self.keys.clear();
+        self.folded.clear();
+    }
+}
+
 /// Compares (leg 1) the runtime's FillEvent-folded net-lots mirror against
 /// the risk engine's positions over the UNION of both key sets, and
 /// (leg 2, C7) the per-instrument signed fold of every tracked order's
@@ -675,17 +699,22 @@ struct LocalReconcileReport {
 ///
 /// # Performance
 /// O(mirror + positions + orders), cold: runs on the reconcile heartbeat.
+/// Its working sets live in `scratch` and are cleared, not rebuilt, so a run
+/// allocates only while the book is larger than on any earlier run.
 fn local_reconcile(
     oms: &OrderManagementSystem,
     risk: &RiskEngine,
     mirror: &HashMap<(u64, ExchangeSegment), i64>,
+    scratch: &mut ReconcileScratch,
 ) -> LocalReconcileReport {
     let mut report = LocalReconcileReport::default();
+    scratch.clear();
+    let ReconcileScratch { keys, folded } = scratch;
     // Leg 1: mirror vs risk over the UNION of keys (C7 — a risk-side
     // position absent from the mirror is a divergence too).
-    let mut keys: HashSet<(u64, ExchangeSegment)> = mirror.keys().copied().collect();
+    keys.extend(mirror.keys().copied());
     keys.extend(risk.position_keys());
-    for &(sid, segment) in &keys {
+    for &(sid, segment) in keys.iter() {
         report.sids_checked += 1;
         let mirror_lots = mirror.get(&(sid, segment)).copied().unwrap_or(0);
         if i64::from(risk.net_lots_for_in_segment(sid, segment)) != mirror_lots {
@@ -694,7 +723,6 @@ fn local_reconcile(
     }
     // Leg 2: per-instrument signed order fold (floor of cumulatives — the
     // same math the engine's fill delta uses) vs risk net lots.
-    let mut folded: HashMap<(u64, ExchangeSegment), i64> = HashMap::with_capacity(mirror.len());
     for order in oms.all_orders().values() {
         let lot = i64::from(order.lot_size.max(1));
         let lots = order.traded_qty.max(0) / lot;
@@ -706,9 +734,11 @@ fn local_reconcile(
             .entry((order.security_id, order.exchange_segment))
             .or_insert(0) += signed;
     }
-    let mut fold_keys: HashSet<(u64, ExchangeSegment)> = folded.keys().copied().collect();
-    fold_keys.extend(risk.position_keys());
-    for &(sid, segment) in &fold_keys {
+    // The same set is reused for leg 2's union of keys.
+    keys.clear();
+    keys.extend(folded.keys().copied());
+    keys.extend(risk.position_keys());
+    for &(sid, segment) in keys.iter() {
         let fold_lots = folded.get(&(sid, segment)).copied().unwrap_or(0);
         if i64::from(risk.net_lots_for_in_segment(sid, segment)) != fold_lots {
             report.order_fold_divergences += 1;
@@ -820,6 +850,8 @@ struct BookState {
     /// event; per-mark reads are one HashMap lookup, zero alloc on the
     /// no-pending path.
     pending_paper: HashMap<(u64, ExchangeSegment), Vec<String>>,
+    /// The local reconcile's working sets, kept between heartbeats (PR18).
+    reconcile_scratch: ReconcileScratch,
 }
 
 impl BookState {
@@ -898,6 +930,7 @@ impl BookState {
             tripwire: HashMap::with_capacity(64),
             tripwire_reported: HashSet::with_capacity(8),
             pending_paper: HashMap::with_capacity(8),
+            reconcile_scratch: ReconcileScratch::default(),
         }
     }
 
@@ -906,6 +939,7 @@ impl BookState {
         self.tripwire.clear();
         self.tripwire_reported.clear();
         self.pending_paper.clear();
+        self.reconcile_scratch.clear();
     }
 
     /// Rebuilds the sid → pending-PAPER-order index from the OMS book.
@@ -1343,7 +1377,7 @@ async fn run_order_runtime(
                         // later). The order-fold leg flags a skipped fill of a
                         // tracked order; the reconcile is not gated on market
                         // hours here, since a lag is itself the signal.
-                        run_reconcile_cycle(&mut oms, &risk, &book).await;
+                        run_reconcile_cycle(&mut oms, &risk, &mut book).await;
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         // Structurally unreachable (the supervisor holds a
@@ -1428,7 +1462,7 @@ async fn run_order_runtime(
             // ---- Arm 3: one-shot reconcile on first WS auth ----
             _ = ctx.auth_notify.notified() => {
                 info!("order runtime: order-update WS authenticated — running reconcile cycle");
-                run_reconcile_cycle(&mut oms, &risk, &book).await;
+                run_reconcile_cycle(&mut oms, &risk, &mut book).await;
             }
 
             // ---- Arm 4: 1s housekeeping (timers ride one cold tick) ----
@@ -1445,7 +1479,7 @@ async fn run_order_runtime(
                     if reconcile_window_ok(secs_of_day)
                         && ctx.calendar.is_trading_day_today()
                     {
-                        run_reconcile_cycle(&mut oms, &risk, &book).await;
+                        run_reconcile_cycle(&mut oms, &risk, &mut book).await;
                         // Rides the SAME market-hours + trading-day gate as
                         // the reconcile (audit Rule 3): a drop outside the
                         // session is not an operator signal, and reporting
@@ -1767,10 +1801,14 @@ fn report_marks_dropped(marks_dropped: &AtomicU64, last_reported: &mut u64) {
     );
 }
 
-async fn run_reconcile_cycle(oms: &mut OrderManagementSystem, risk: &RiskEngine, book: &BookState) {
+async fn run_reconcile_cycle(
+    oms: &mut OrderManagementSystem,
+    risk: &RiskEngine,
+    book: &mut BookState,
+) {
     if oms.is_dry_run() {
         metrics::counter!("tv_oms_reconcile_runs_total", "mode" => "paper_noop").increment(1);
-        let report = local_reconcile(oms, risk, &book.mirror);
+        let report = local_reconcile(oms, risk, &book.mirror, &mut book.reconcile_scratch);
         if report.divergences > 0 || report.order_fold_divergences > 0 {
             error!(
                 code = ErrorCode::OmsGapReconciliation.code_str(),
@@ -2605,14 +2643,68 @@ mod tests {
             .flatten()
             .expect("fill event"); // APPROVED: test
         assert!(apply_fill(&mut risk, &mut book, &fill, None));
-        let ok = local_reconcile(&oms, &risk, &book.mirror);
+        let ok = local_reconcile(&oms, &risk, &book.mirror, &mut ReconcileScratch::default());
         assert_eq!(ok.sids_checked, 1);
         assert_eq!(ok.divergences, 0, "mirror==net_lots after a clean fill");
         assert_eq!(ok.order_fold_divergences, 0, "order fold matches too");
         // Poison the mirror → the mirror leg must flag it.
         book.mirror.insert((13, ExchangeSegment::IdxI), 99);
-        let bad = local_reconcile(&oms, &risk, &book.mirror);
+        let bad = local_reconcile(&oms, &risk, &book.mirror, &mut ReconcileScratch::default());
         assert_eq!(bad.divergences, 1, "a poisoned mirror must be flagged");
+    }
+
+    /// Audit PR18 (plan row 213): the reconcile's working sets are kept
+    /// between runs. A reused scratch gives the same verdict as a fresh one,
+    /// carries nothing over from the previous run, and keeps its capacity,
+    /// so a later run over a book no larger allocates nothing.
+    #[tokio::test]
+    async fn test_local_reconcile_reuses_its_working_sets_between_runs() {
+        let mut oms = make_oms();
+        let mut risk = make_risk();
+        let mut book = BookState::new();
+        for sid in [13_u64, 25, 51] {
+            let order_id = place_paper(&mut oms, sid, TransactionType::Buy).await;
+            let order = oms.order(&order_id).cloned().expect("tracked"); // APPROVED: test
+            let synthetic = synthesize_paper_fill(&order, 100.0, 0).expect("fill"); // APPROVED: test
+            let fill = oms
+                .handle_order_update(&synthetic)
+                .ok()
+                .flatten()
+                .expect("fill event"); // APPROVED: test
+            assert!(apply_fill(&mut risk, &mut book, &fill, None));
+        }
+        let mut scratch = ReconcileScratch::default();
+        let first = local_reconcile(&oms, &risk, &book.mirror, &mut scratch);
+        let keys_capacity = scratch.keys.capacity();
+        let folded_capacity = scratch.folded.capacity();
+        assert_eq!(first.sids_checked, 3);
+        assert_eq!(first.divergences + first.order_fold_divergences, 0);
+
+        // A divergence in one run must not leak into the next.
+        book.mirror.insert((13, ExchangeSegment::IdxI), 99);
+        let poisoned = local_reconcile(&oms, &risk, &book.mirror, &mut scratch);
+        assert_eq!(poisoned.divergences, 1);
+        book.mirror.insert((13, ExchangeSegment::IdxI), 1);
+        let again = local_reconcile(&oms, &risk, &book.mirror, &mut scratch);
+        assert_eq!(
+            again, first,
+            "a reused scratch gives the fresh-scratch verdict"
+        );
+        assert_eq!(
+            again,
+            local_reconcile(&oms, &risk, &book.mirror, &mut ReconcileScratch::default())
+        );
+        assert_eq!(scratch.keys.capacity(), keys_capacity, "kept, not regrown");
+        assert_eq!(
+            scratch.folded.capacity(),
+            folded_capacity,
+            "kept, not regrown"
+        );
+
+        // The daily reset empties the book and its scratch.
+        book.clear();
+        assert!(book.reconcile_scratch.keys.is_empty());
+        assert!(book.reconcile_scratch.folded.is_empty());
     }
 
     /// Audit M7 (2026-10-04): a fill booked to the WRONG segment of the same
@@ -2644,7 +2736,7 @@ mod tests {
             1,
             "the fill is booked where its segment says"
         );
-        let report = local_reconcile(&oms, &risk, &book.mirror);
+        let report = local_reconcile(&oms, &risk, &book.mirror, &mut ReconcileScratch::default());
         assert_eq!(
             report.divergences, 0,
             "mirror and risk move together, so leg 1 agrees"
@@ -2674,7 +2766,7 @@ mod tests {
             .ok()
             .flatten()
             .expect("fill event produced then dropped"); // APPROVED: test
-        let report = local_reconcile(&oms, &risk, &book.mirror);
+        let report = local_reconcile(&oms, &risk, &book.mirror, &mut ReconcileScratch::default());
         assert_eq!(
             report.divergences, 0,
             "mirror leg CANNOT see a lost fill (both sides 0)"
@@ -2722,7 +2814,7 @@ mod tests {
             .map(|i| lagged + i)
             .expect("the Closed arm follows the Lagged arm"); // APPROVED: test
         assert!(
-            src[lagged..closed].contains("run_reconcile_cycle(&mut oms, &risk, &book).await;"),
+            src[lagged..closed].contains("run_reconcile_cycle(&mut oms, &risk, &mut book).await;"),
             "the Lagged arm no longer runs the reconcile; a skipped fill would wait \
              for the next heartbeat"
         );
@@ -2734,15 +2826,15 @@ mod tests {
     async fn lag_reconcile_flags_a_skipped_fill() {
         let mut oms = make_oms();
         let risk = make_risk();
-        let book = BookState::new();
+        let mut book = BookState::new();
         let order_id = place_paper(&mut oms, 13, TransactionType::Buy).await;
         let order = oms.order(&order_id).cloned().expect("tracked"); // APPROVED: test
         let synthetic = synthesize_paper_fill(&order, 100.0, 0).expect("fill"); // APPROVED: test
         let _skipped = oms.handle_order_update(&synthetic);
-        let before = local_reconcile(&oms, &risk, &book.mirror);
+        let before = local_reconcile(&oms, &risk, &book.mirror, &mut ReconcileScratch::default());
         assert_eq!(before.order_fold_divergences, 1);
         // Must not panic, and runs the paper (local) arm.
-        run_reconcile_cycle(&mut oms, &risk, &book).await;
+        run_reconcile_cycle(&mut oms, &risk, &mut book).await;
     }
 
     /// Property-style sweep: random signed fill sequences keep the mirror
@@ -2774,7 +2866,12 @@ mod tests {
         // Leg 1 only: this synthetic walk applies fills WITHOUT tracked
         // orders, so the order-fold leg legitimately diverges (empty book
         // vs positions) — it is asserted by its own dedicated test above.
-        let report = local_reconcile(&make_oms(), &risk, &book.mirror);
+        let report = local_reconcile(
+            &make_oms(),
+            &risk,
+            &book.mirror,
+            &mut ReconcileScratch::default(),
+        );
         assert_eq!(
             report.divergences, 0,
             "after any fill sequence the mirror must equal risk net_lots"
@@ -3812,7 +3909,12 @@ mod tests {
              and reported as a permanent divergence"
         );
 
-        let report = local_reconcile(&make_oms(), &risk, &book.mirror);
+        let report = local_reconcile(
+            &make_oms(),
+            &risk,
+            &book.mirror,
+            &mut ReconcileScratch::default(),
+        );
         assert_eq!(
             report.divergences, 0,
             "a consistent book past the tripwire ceiling must report ZERO \
