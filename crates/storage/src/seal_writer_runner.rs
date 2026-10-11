@@ -2391,6 +2391,14 @@ mod tests {
             },
             "a queued burst must be written SEAL_ESCALATION_BATCH records per write"
         );
+        // Audit PR40c-f: `spill_writes` is counted by this thread per call it
+        // makes; the spill counts at the disk call itself, so a spill that
+        // wrote each record separately would show `total` here.
+        assert_eq!(
+            overflow.spill.disk_writes_for_test(),
+            5,
+            "each batch must reach the disk in exactly one write"
+        );
         // PR17: the last batch (7 records) empties the queue, so it is always
         // synced; a full batch is synced only once a second has passed, which
         // depends on the disk, so only the bounds are pinned.

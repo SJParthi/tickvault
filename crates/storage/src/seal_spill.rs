@@ -949,6 +949,20 @@ pub struct SealSpillWriter {
     /// The spill directory itself was created: its parent's entry too.
     parent_unsynced: AtomicBool,
     superseded: SupersededCounters,
+    /// Test-only counts taken at the disk call and at the append lock
+    /// (audit PR40c-f). Compiled out of production builds.
+    #[cfg(test)]
+    probes: SpillTestProbes,
+}
+
+/// Test-only counts for audit PR40c-f: `write(2)` calls made by the two
+/// append paths, counted AT the call rather than by the caller, and attempts
+/// to take the append lock, so a test can see another thread waiting on it.
+#[cfg(test)]
+#[derive(Default)]
+struct SpillTestProbes {
+    disk_writes: AtomicU64,
+    lock_attempts: AtomicU64,
 }
 
 /// Name of the spill-write failure counter. Both label values are
@@ -989,6 +1003,8 @@ impl SealSpillWriter {
             dir_unsynced: AtomicBool::new(false),
             parent_unsynced: AtomicBool::new(false),
             superseded: SupersededCounters::resolve(),
+            #[cfg(test)]
+            probes: SpillTestProbes::default(),
         }
     }
 
@@ -1011,11 +1027,21 @@ impl SealSpillWriter {
         Self::in_dir(dir)
     }
 
+    /// `write(2)` calls the two append paths have made, counted at the call
+    /// (audit PR40c-f).
+    #[cfg(test)]
+    // TEST-EXEMPT: test-only probe, read by the batch and escalation-burst tests
+    pub(crate) fn disk_writes_for_test(&self) -> u64 {
+        self.probes.disk_writes.load(Ordering::SeqCst)
+    }
+
     /// Locks the append state, treating a poisoned mutex as the value it
     /// holds. A panic in another thread while holding this lock cannot
     /// leave the spill writer permanently dead — the worst case is a stale
     /// handle, which the day check and the write-error path both correct.
     fn lock_state(&self) -> std::sync::MutexGuard<'_, SpillState> {
+        #[cfg(test)]
+        self.probes.lock_attempts.fetch_add(1, Ordering::SeqCst);
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1227,6 +1253,8 @@ impl SealSpillWriter {
         // what `chaos_seal_sigkill_spill_replay.rs` recovers. Introducing a
         // cross-seal user-space buffer WOULD regress that; see the
         // module-level note on why it is deliberately not done.
+        #[cfg(test)]
+        self.probes.disk_writes.fetch_add(1, Ordering::SeqCst);
         if let Err(err) = current.file.write_all(&bytes) {
             // Audit PR41c: a failed write may have left part of this record
             // behind. Cut the file back to its last whole record BEFORE
@@ -1522,6 +1550,8 @@ impl SealSpillWriter {
                 return Err(err).with_context(|| format!("failed to stat spill file {path:?}"));
             }
         };
+        #[cfg(test)]
+        self.probes.disk_writes.fetch_add(1, Ordering::SeqCst);
         if let Err(err) = current.file.write_all(scratch) {
             // Cut the torn tail before dropping the handle. Best effort: a
             // failure here is reported in the error chain, not swallowed.
@@ -3456,10 +3486,18 @@ mod tests {
         writer
             .append_seals(seals.iter(), &mut scratch, now)
             .expect("batch append");
-        // An empty batch is a no-op, not an error.
+        // Audit PR40c-f: counted at the disk call, so a batch written record
+        // by record would show 50 here.
+        assert_eq!(
+            writer.disk_writes_for_test(),
+            1,
+            "a batch of 50 seals must reach the disk in one write"
+        );
+        // An empty batch is a no-op, not an error, and touches no disk.
         writer
             .append_seals(std::iter::empty(), &mut scratch, now)
             .expect("empty batch");
+        assert_eq!(writer.disk_writes_for_test(), 1);
         let back = writer.read_all(now).expect("read back");
         assert_eq!(back, seals);
         let _ = std::fs::remove_dir_all(&dir);
@@ -3548,6 +3586,61 @@ mod tests {
             1,
             "the next append must open a fresh day file"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_an_append_blocked_by_the_pause_lands_in_a_fresh_file_after_the_rename() {
+        // Audit PR40c-f: the race the pause exists for. A second thread's
+        // append reaches the append lock while the pause holds it and renames
+        // the live file; when the pause ends, that append must land in a new
+        // live file, never in the moved one. No timing: the pause waits until
+        // the other thread has asked for the lock, which it cannot get.
+        let dir = temp_spill_dir("appends-paused-race");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        let now = 1_700_000_000_i64;
+        writer
+            .append_seal(&mk_seal(13, 0, 1, 1, 1.0), now)
+            .expect("first append");
+        let moved = dir.join("moved.bin");
+        let live = writer.spill_path(now);
+        std::thread::scope(|scope| {
+            let writer = &writer;
+            writer.with_appends_paused(|| {
+                let asked_before = writer.probes.lock_attempts.load(Ordering::SeqCst);
+                let blocked = scope.spawn(move || {
+                    writer
+                        .append_seal(&mk_seal(13, 0, 1, 2, 2.0), now)
+                        .expect("append blocked by the pause");
+                });
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while writer.probes.lock_attempts.load(Ordering::SeqCst) == asked_before {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the second append never reached the append lock"
+                    );
+                    std::thread::yield_now();
+                }
+                assert!(
+                    !blocked.is_finished(),
+                    "the append must wait for the pause to end"
+                );
+                std::fs::rename(&live, &moved).expect("rename");
+                ((), true)
+            });
+        });
+        assert_eq!(
+            std::fs::metadata(&moved).expect("moved").len(),
+            SEAL_SPILL_RECORD_SIZE as u64,
+            "the blocked append must not land in the moved file"
+        );
+        let fresh = writer.read_all(now).expect("read");
+        assert_eq!(
+            fresh.len(),
+            1,
+            "the blocked append must land in a fresh live file"
+        );
+        assert_eq!(fresh[0].bucket_start_ist_secs, 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
