@@ -7,7 +7,8 @@
 //! spawn — and its unit tests call those functions directly. Until 2026-09-05
 //! that meant `cargo test -p tickvault-app` could:
 //!
-//! * run `docker compose up -d --force-recreate`, which that module's own
+//! * run `docker compose up -d --force-recreate` (the boot argv until
+//!   2026-10-11, audit QDB-1), which that module's own
 //!   `ComposeOutcome` header records verbatim as "NOT idempotent — it tears
 //!   down + recreates every container". Six tests reached it, so a developer
 //!   with the stack up lost their running QuestDB to a test run.
@@ -237,20 +238,24 @@ fn only_one_bare_compose_spawn_exists_and_the_destructive_argv_is_seam_routed() 
          out of `cargo test`."
     );
 
-    // Count PRODUCTION text only. `--force-recreate` also appears twice inside
-    // `mod tests`, in the `compose_cli_args` arg-builder assertions -- those
-    // build a `Vec<&str>` and spawn nothing, so counting them would make this
-    // assertion fail on a correct tree, which is the fastest way to get a
-    // guard deleted.
+    // Count PRODUCTION argv literals only. Since 2026-10-11 (audit QDB-1) the
+    // boot runs plain `up -d`: a recreate of every container on each app start
+    // stopped QuestDB under open ILP connections and lost in-flight rows. The
+    // docs above the compose call still NAME the old flag (to say why it is
+    // gone), so the scan counts the quoted argv form `"--force-recreate"`, not
+    // the bare text. `mod tests` builds argv vectors that spawn nothing, so
+    // it is excluded.
     let prod = src
         .split_once("\nmod tests {")
         .map_or(src.as_str(), |(before, _)| before);
-    let recreate = prod.matches("--force-recreate").count();
+    let recreate = prod.matches("\"--force-recreate\"").count();
     assert_eq!(
-        recreate, 1,
-        "expected exactly ONE `--force-recreate` argv in the PRODUCTION half \
-         of {INFRA_SRC}, found {recreate}. That flag is what tears down every \
-         container; a second occurrence is a second destructive path this \
-         guard has not been taught about."
+        recreate, 0,
+        "found {recreate} `\"--force-recreate\"` argv literal(s) in the \
+         PRODUCTION half of {INFRA_SRC}. The boot compose is plain `up -d` \
+         (audit QDB-1, 2026-10-11): recreating every container on each app \
+         start stopped QuestDB under open ILP connections and lost in-flight \
+         rows. The deploy workflow keeps its own scoped `--force-recreate \
+         tv-questdb` for a changed memory cap; the app boot must not."
     );
 }
