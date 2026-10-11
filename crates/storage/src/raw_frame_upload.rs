@@ -208,10 +208,16 @@ impl S3InFlight {
 
 /// Stamps the end of one pass of `set` on [`LAST_PASS_END_GAUGE`]. O(1).
 fn publish_pass_end(set: &'static str, now: SystemTime) {
+    metrics::gauge!(LAST_PASS_END_GAUGE, "set" => set).set(pass_end_gauge_secs(now));
+}
+
+/// Whole unix seconds of `now` for the pass-end gauge; a clock before the
+/// epoch reads as 0 rather than failing.
+fn pass_end_gauge_secs(now: SystemTime) -> f64 {
     // APPROVED: cast — unix seconds, far below f64 precision loss.
     #[allow(clippy::cast_precision_loss)] // APPROVED: unix seconds
     let secs = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()) as f64;
-    metrics::gauge!(LAST_PASS_END_GAUGE, "set" => set).set(secs);
+    secs
 }
 
 /// Pre-size of the gzip buffer: 128 MiB segments compress to roughly half.
@@ -2225,8 +2231,16 @@ mod tests {
 
     #[test]
     fn test_publish_pass_end_accepts_any_clock() {
-        // No recorder installed: proves the call is total, including a clock
-        // before the epoch, which reads as 0 rather than panicking.
+        // A clock before the epoch reads as 0; a normal clock reads its whole
+        // unix seconds. No recorder installed: the publish itself is total.
+        assert_eq!(
+            pass_end_gauge_secs(UNIX_EPOCH - Duration::from_secs(1)),
+            0.0
+        );
+        assert_eq!(
+            pass_end_gauge_secs(UNIX_EPOCH + Duration::from_millis(1_700_000_000_900)),
+            1_700_000_000.0
+        );
         publish_pass_end(WAL_SET_LABEL, SystemTime::now());
         publish_pass_end(WAL_SET_LABEL, UNIX_EPOCH - Duration::from_secs(1));
     }
