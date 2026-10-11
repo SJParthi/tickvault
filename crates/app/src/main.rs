@@ -2546,18 +2546,31 @@ async fn async_main() -> Result<()> {
                 // trims (plan item 45e-1, operator Quotes 27 + 28). Same
                 // schedule and batch as the WAL pass; today's spill day file
                 // is the one the live writer may hold open, so it is skipped.
-                let today_spill_file =
-                    tickvault_storage::seal_spill::live_spill_file_name(now_utc_secs());
-                let others = raw_upload::run_spill_and_quarantine_passes(
-                    &store,
-                    std::path::Path::new("data/spill"),
-                    std::path::Path::new(tickvault_storage::tick_persistence::TICK_SPILL_DIR),
-                    std::path::Path::new(tickvault_storage::depth_persistence::DEPTH_SPILL_DIR),
-                    &today_spill_file,
-                    max_segments,
-                    &should_continue,
-                )
-                .await;
+                // Review of audit SUP-5 (2026-10-11): when the WAL pass ended on
+                // three S3 time-outs in a row the store is hung, so this loop
+                // skips the three file passes rather than spend their time-outs
+                // too; the WAL pass's failures already count and page, and the
+                // file sets are tried again on the next loop.
+                let others = if summary.store_unreachable {
+                    tracing::debug!(
+                        "cold bucket timed out on the WAL pass; spill and quarantine \
+                         passes skipped this loop"
+                    );
+                    raw_upload::UploadPassSummary::default()
+                } else {
+                    let today_spill_file =
+                        tickvault_storage::seal_spill::live_spill_file_name(now_utc_secs());
+                    raw_upload::run_spill_and_quarantine_passes(
+                        &store,
+                        std::path::Path::new("data/spill"),
+                        std::path::Path::new(tickvault_storage::tick_persistence::TICK_SPILL_DIR),
+                        std::path::Path::new(tickvault_storage::depth_persistence::DEPTH_SPILL_DIR),
+                        &today_spill_file,
+                        max_segments,
+                        &should_continue,
+                    )
+                    .await
+                };
                 if summary.marked() > 0 || others.marked() > 0 {
                     tickvault_app::reclaim_signal::request_reclaim();
                 }
