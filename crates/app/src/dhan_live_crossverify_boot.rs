@@ -2984,6 +2984,7 @@ mod tests {
             late_excused: 0,
             missing_live_unjudged: 0,
             missing_judgeable: crate::dhan_live_crossverify::MissingJudgeable::Judged,
+            missing_minutes_would_page: false,
             noise_p50_paise: 0,
             noise_p95_paise: 0,
             noise_max_paise: 0,

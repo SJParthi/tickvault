@@ -67,7 +67,8 @@
 //!     noise_p50_paise LONG, noise_p95_paise LONG, noise_max_paise LONG,
 //!     tolerance_paise LONG, outcome SYMBOL,
 //!     late_excused LONG, missing_live_unjudged LONG, missing_judgeable SYMBOL,
-//!     attempt_at TIMESTAMP, run_complete BOOLEAN
+//!     attempt_at TIMESTAMP, run_complete BOOLEAN,
+//!     missing_minutes_would_page BOOLEAN
 //! ) timestamp(ts) PARTITION BY DAY
 //! DEDUP UPSERT KEYS(ts, trading_date_ist, feed, outcome)
 //!
@@ -92,6 +93,14 @@
 //! table also gains `attempt_at` and `run_complete`, and the cell audit
 //! `attempt_at` (one reading per attempt), through the same self-heal and
 //! outside every DEDUP key; they let a reader tell a day's attempts apart.
+//!
+//! ## 2026-10-11 (plan ITEM 51h, `no-rest-except-live-feed-2026-06-27.md` §12.15.11)
+//!
+//! The daily table gains `missing_minutes_would_page` (BOOLEAN), through the
+//! same `ALTER ADD COLUMN IF NOT EXISTS` self-heal and outside the DEDUP key.
+//! It is a SHADOW: what a missing-minutes page would have said for that
+//! attempt. Nothing reads it to page; it is the measured baseline the page
+//! (51j) needs first.
 
 use anyhow::{Context, Result};
 use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
@@ -486,6 +495,10 @@ pub struct DhanLiveXverifyDailyRow {
     /// is not complete is retried, so its row is never the last word unless no
     /// later attempt ran.
     pub run_complete: bool,
+    /// SHADOW (§12.15.11): `true` when a missing-minutes page would have
+    /// fired for this attempt. Always `false` on a run that could not judge
+    /// missing minutes. Read by no page; outside the DEDUP key.
+    pub missing_minutes_would_page: bool,
 }
 
 /// One minute of the vendor's own tape, exactly as fetched.
@@ -566,7 +579,8 @@ pub fn dhan_live_xverify_daily_create_ddl() -> String {
             missing_live_unjudged LONG, \
             missing_judgeable SYMBOL, \
             attempt_at       TIMESTAMP, \
-            run_complete     BOOLEAN\
+            run_complete     BOOLEAN, \
+            missing_minutes_would_page BOOLEAN\
         ) timestamp(ts) PARTITION BY DAY \
         DEDUP UPSERT KEYS({DEDUP_KEY_DHAN_LIVE_XVERIFY_DAILY});"
     )
@@ -657,6 +671,7 @@ const DAILY_COLUMNS: &[(&str, &str)] = &[
     ("missing_judgeable", "SYMBOL"),
     ("attempt_at", "TIMESTAMP"),
     ("run_complete", "BOOLEAN"),
+    ("missing_minutes_would_page", "BOOLEAN"),
 ];
 
 /// The full ordered DDL statement list (CREATE → per-column `ALTER ADD COLUMN
@@ -1044,6 +1059,8 @@ impl DhanLiveXverifyAuditWriter {
             .context("attempt_at")?
             .column_bool("run_complete", r.run_complete)
             .context("run_complete")?
+            .column_bool("missing_minutes_would_page", r.missing_minutes_would_page)
+            .context("missing_minutes_would_page")?
             .at(TimestampNanos::new(r.run_ts_ist_nanos))
             .context("designated timestamp")?;
         self.pending = self.pending.saturating_add(1);
@@ -1253,6 +1270,7 @@ mod tests {
             missing_judgeable: DhanLiveXverifyMissingJudgeable::Judged,
             attempt_at_ist_nanos: 3,
             run_complete: false,
+            missing_minutes_would_page: false,
         }
     }
 
@@ -1735,6 +1753,44 @@ mod tests {
         let (tags, fields) = line.split_at(line.find(' ').expect("tags then fields"));
         assert!(!tags.contains("attempt_at"));
         assert!(fields.contains("attempt_at=1759751460123456t"), "{line}");
+    }
+
+    /// 2026-10-11 (§12.15.11, plan 51h). The would-page shadow reaches an old
+    /// daily table through the ALTER self-heal as a BOOLEAN, rides the ILP
+    /// line as a field (`t`/`f`), and stays out of the DEDUP key: in the key
+    /// it would split one attempt's verdict into two rows.
+    #[test]
+    fn missing_minutes_would_page_self_heals_reaches_the_wire_and_stays_out_of_dedup() {
+        let col = "missing_minutes_would_page";
+        let alter = format!(
+            "ALTER TABLE {DHAN_LIVE_XVERIFY_DAILY_TABLE} ADD COLUMN IF NOT EXISTS {col} BOOLEAN;"
+        );
+        assert!(
+            dhan_live_xverify_ddl_statements().contains(&alter),
+            "missing self-heal: {alter}"
+        );
+        assert!(DAILY_COLUMNS.contains(&(col, "BOOLEAN")));
+        assert!(
+            dhan_live_xverify_daily_create_ddl()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .windows(2)
+                .any(|w| w[0] == col && w[1].trim_end_matches([',', ')', '\\']) == "BOOLEAN"),
+            "the CREATE must declare {col} BOOLEAN"
+        );
+        assert!(!DEDUP_KEY_DHAN_LIVE_XVERIFY_DAILY.contains(col));
+        assert!(!dhan_live_xverify_cell_audit_create_ddl().contains(col));
+
+        for (value, wire) in [(true, "t"), (false, "f")] {
+            let mut row = sample_daily();
+            row.missing_minutes_would_page = value;
+            let mut w = DhanLiveXverifyAuditWriter::for_test();
+            w.append_daily(&row).expect("append");
+            let line = w.buffer_utf8();
+            let (tags, fields) = line.split_at(line.find(' ').expect("tags then fields"));
+            assert!(!tags.contains(col), "{line}");
+            assert!(fields.contains(&format!("{col}={wire}")), "{line}");
+        }
     }
 
     #[test]

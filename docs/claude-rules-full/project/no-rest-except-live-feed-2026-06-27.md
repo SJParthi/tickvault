@@ -2616,3 +2616,50 @@ progress.
   sample.
 
 **What a PR that violates §12.15.10 looks like (REJECT):** reading `candles_1m` before the live-final instant; a drained check that accepts the same second as the reference sweep; skipping the spill, parked-file or WAL barrier, or failing open when one cannot be read; judging missing minutes on the last attempt while the live side is not ready; retrying on the last attempt; an excuse floor outside `[close − LATE_SEAL_WINDOW_MINUTES, close]`; writing a daily row, findings or the marker on the tape-only retry; letting the readiness wait lengthen an attempt past its deadline; publishing seal progress from the per-tick path; a new alarm, filter or page source for the readiness reasons without its own dated row in the noise lock.
+
+### §12.15.11 — 2026-10-11: what a missing-minutes page would have said, stored in shadow
+
+**The verbatim owner approvals (preserve EXACTLY, typos included):**
+
+> "Go ahead with whatever you want dude" (2026-10-06)
+
+> "See do everything whatever is recommended dude okay?" (2026-10-06)
+
+> "dude meanwhiel check teh rbanches and fix and rezoleve evrythign previously which we have drafetyd as defects issues gaps criticialiteis findigs as well along with emrgign and pr mergign and deployign as well now dude oaky?" (2026-10-11)
+
+The 2026-10-06 approvals cover plan ITEM 51 (`.claude/plans/active-plan-feed-hardening.md`);
+this section is sub-item **51h** and is recorded HERE before the code ships, per
+the rule-file-first law. It adds one stored column and changes nothing else:
+not the verdict, not the marker, not any page, alarm, filter or EMF name.
+
+**The gap.** 51j (the missing-minutes page) needs a measured baseline of how
+often such a page would fire before it can be wired. Nothing recorded that.
+51d already made an unsettled run judge no missing minute (§12.15.10), and
+51c already stores unjudged minutes as their own cell kind
+(`missing_live_unjudged`); the would-page record was the missing half.
+
+| Aspect | Locked value |
+|---|---|
+| Column | `dhan_live_crossverify_daily.missing_minutes_would_page BOOLEAN`, through the existing `ALTER ADD COLUMN IF NOT EXISTS` self-heal, OUTSIDE the DEDUP key. Never on the cell audit |
+| The rule (`would_page_on_missing_minutes`) | `true` only when missing minutes were judged on the run AND either (a) a minute Dhan shows traded is missing from our side (`missing_live_traded > 0`), or (b) an index missed at least `WOULD_PAGE_MIN_INDEX_RUN_MINUTES` (2) CONSECUTIVE minutes on each of which Dhan's bar moved (high ≠ low). A flat minute, a minute present on our side, or a minute of another instrument ends a run |
+| Never counted | excused late minutes (`late_excused`), unjudged minutes (`missing_live_unjudged`), zero-volume non-index minutes, `missing_rest`, price divergence |
+| Unsettled run | a truncated live read or any `not_ready_*` reason (§12.15.10) writes `false` |
+| Cost | O(1) per missing minute inside the existing comparison walk; one more BOOLEAN field per daily row |
+| Page, alarms, marker, verdict | unchanged. Nothing reads the column to page |
+
+**Measuring query** (run after a few sessions, before 51j):
+`SELECT trading_date_ist, outcome, missing_judgeable, missing_minutes_would_page, attempt_at FROM dhan_live_crossverify_daily WHERE trading_date_ist > dateadd('d', -30, now()) ORDER BY trading_date_ist, attempt_at`.
+
+**⚠ Honest limits (Rule 11).**
+- The "moving" test reads Dhan's own bar range only; an index that printed
+  one value for a whole minute while we held nothing is not counted (Assumed
+  rare; a run of moving minutes on either side of it still counts).
+- The rule is the proposed page rule, not a measured one: the two-minute
+  index run is chosen so one late-sealed bucket does not page, and is
+  re-judged against the measured baseline in 51j.
+- A live row the read skips as malformed still reads as a judged missing
+  minute (§12.15.9), so it can set the shadow too.
+- The column is per attempt: a day with several attempts has several rows;
+  read it with the §12.15.9 reader rule.
+
+**What a PR that violates §12.15.11 looks like (REJECT):** putting the column in a DEDUP key; paging, alarming or filtering on it without 51j's own dated noise-lock section; counting an excused or unjudged minute; writing `true` on a run that could not judge missing minutes; letting the shadow change the verdict or the marker.
