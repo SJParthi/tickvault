@@ -736,9 +736,27 @@ fn lock_finished_marks() -> std::sync::MutexGuard<'static, Vec<std::path::PathBu
 }
 
 /// Write `record` to `path` through a temporary file and a rename.
+///
+/// The temporary file is created with `create_new` after any leftover is
+/// removed, so a symlink planted at the temporary name is never followed: the
+/// remove drops the link itself, and if one reappears before the open, the
+/// open fails instead of writing through it (2026-10-11; `fs::write` followed
+/// it). The rename replaces a link at `path` rather than its target.
 fn write_mark_file(path: &std::path::Path, record: &UnwrittenSealRecord) -> std::io::Result<()> {
+    use std::io::Write as _;
     let tmp = path.with_extension("mark.tmp");
-    std::fs::write(&tmp, record.to_line().as_bytes()).and_then(|()| std::fs::rename(&tmp, path))
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)?;
+    file.write_all(record.to_line().as_bytes())?;
+    drop(file);
+    std::fs::rename(&tmp, path)
 }
 
 /// A failed marker write: counted every time, and when `log` is set reported
@@ -1917,6 +1935,33 @@ mod tests {
         ] {
             assert_eq!(UnwrittenSealRecord::parse(bad), None, "must refuse {bad:?}");
         }
+    }
+
+    // Regression: 2026-10-11 — the marker's temporary file was written with
+    // `fs::write`, which follows a symlink planted at that name.
+    #[cfg(unix)]
+    #[test]
+    fn test_regression_write_mark_file_never_writes_through_a_planted_symlink() {
+        let dir = temp_dir_for("symlink");
+        let victim = dir.join("victim.txt");
+        std::fs::write(&victim, b"keep me").expect("victim");
+        let path = dir.join(SEAL_UNWRITTEN_MARK_FILE);
+        std::os::unix::fs::symlink(&victim, path.with_extension("mark.tmp")).expect("plant");
+        let record = UnwrittenSealRecord {
+            unwritten: 3,
+            clean: false,
+            sampled_at_unix_secs: 1_790_000_000,
+            drained_at_unix_secs: None,
+        };
+        write_mark_file(&path, &record).expect("write");
+        assert_eq!(std::fs::read(&victim).expect("victim"), b"keep me");
+        let PreviousUnwritten::Read(stored) = UnwrittenSealMark::in_dir(&dir).read_previous()
+        else {
+            panic!("marker must be readable");
+        };
+        assert_eq!(stored, record);
+        assert!(!path.with_extension("mark.tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
