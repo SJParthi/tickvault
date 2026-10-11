@@ -15,6 +15,14 @@
 //! UPSERT on the shadow-candle key collapses any double-replay into one row,
 //! so idempotent recovery + DEDUP = zero duplicate.
 //!
+//! **⚠ CORRECTED 2026-10-11 (audit TEST-1).** Two claims above are wrong.
+//! (a) `chaos_sigkill_replay.rs` does not exist; there was no tick-path
+//! SIGKILL test. (b) Nothing here is killed: the writer is dropped in-process,
+//! so no write is ever cut off mid-record. The real process kill of the seal
+//! spill (re-executed test binary, `SIGKILL` mid-burst, exact-prefix check) is
+//! `chaos_wal_real_sigkill.rs`. This file proves readback and idempotent
+//! re-reading, not crash safety.
+//!
 //! This is pure on-disk durability + readback — deterministic, cross-platform,
 //! no subprocess, no `unsafe`.
 

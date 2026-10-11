@@ -26,6 +26,14 @@
 //!      segment.
 //!
 //! This is P7 scenarios 5 and 11 from the plan:
+//! **⚠ CORRECTED 2026-10-11 (audit TEST-1) — nothing here is killed.** Step 3
+//! drops the spill, which joins the writer thread and flushes the segment: a
+//! CLEAN shutdown, not a SIGKILL. It cannot leave a torn tail, which is the
+//! case the recovery code exists for. The real process kill (re-executed test
+//! binary, `SIGKILL` mid-burst, exact-prefix check) is
+//! `chaos_wal_real_sigkill.rs`. This file still proves replay of every
+//! frame type; it does not prove crash safety.
+//!
 //!   - Scenario 5: "SIGKILL the process mid-ingestion — WAL survives,
 //!     restart replays, QuestDB has all frames"
 //!   - Scenario 11: "Corrupted WAL record (truncated or bad CRC) —
