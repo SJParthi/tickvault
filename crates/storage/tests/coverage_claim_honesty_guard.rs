@@ -2,7 +2,9 @@
 //!
 //! The executable truth is `quality/crate-coverage-thresholds.toml` — ratcheted
 //! per-crate LINE-coverage floors (app 72.6 … common 99.4; floors only move up,
-//! 100% is the target), enforced post-merge by `scripts/coverage-gate.sh`. The
+//! 100% is the target), enforced by `scripts/coverage-gate.sh` on every PR inside
+//! All Green and again after merge (corrected 2026-10-11: this said
+//! "post-merge"; `all-green` needs `coverage-and-perf`). The
 //! B7 directive replaced every FALSE "100% coverage enforced" documentation
 //! claim with that honest wording, aligned `make coverage` to the SAME per-crate
 //! gate as CI, and gave the QuestDB-backed Groww e2e a CI lane that can never
@@ -425,5 +427,80 @@ fn guarantees_doc_matches_coverage_gate_timing() {
         "guarantees.md says the coverage gate is post-merge only, but ci.yml \
          all-green needs coverage-and-perf, so a floor breach blocks merge. \
          Strike the claim and add a dated correction."
+    );
+}
+
+/// Regression: 2026-10-11 (review of G10-docs). The TRU-6 fix above struck the
+/// post-merge-only claim in `guarantees.md`, but five rule files and the compliance audit
+/// still said the coverage floors are "enforced post-merge" while ci.yml's
+/// `all-green` needs `coverage-and-perf`. While that is so, none of them may
+/// say it outside a `~~strike~~`.
+#[test]
+fn rule_files_match_coverage_gate_timing() {
+    let ci = read(".github/workflows/ci.yml");
+    let start = ci
+        .find("\n  all-green:")
+        .expect("ci.yml defines the all-green job");
+    let job = &ci[start + 1..];
+    let needs_start = job.find("needs:").expect("all-green has a needs list");
+    let needs: Vec<&str> = job[needs_start..]
+        .lines()
+        .skip(1)
+        .take_while(|l| l.trim_start().starts_with("- "))
+        .map(|l| l.trim_start().trim_start_matches("- ").trim())
+        .collect();
+    assert!(
+        needs.len() >= 5,
+        "parsed too few all-green needs: {needs:?}"
+    );
+    if !needs.contains(&"coverage-and-perf") {
+        // Coverage left the merge gate; the post-merge wording would be true.
+        return;
+    }
+
+    const FILES: [&str; 6] = [
+        ".claude/rules/project/testing.md",
+        ".claude/rules/project/per-wave-guarantee-matrix.md",
+        ".claude/rules/project/zero-loss-guarantee-charter.md",
+        ".claude/rules/project/wave-4-shared-preamble.md",
+        ".claude/rules/project/z-plus-defense-doctrine.md",
+        "docs/architecture/100-percent-compliance-audit.md",
+    ];
+    const BANNED: [&str; 6] = [
+        "Enforced post-merge",
+        "enforced post-merge by",
+        "post-merge llvm-cov",
+        "`scripts/coverage-gate.sh` post-merge",
+        "`scripts/coverage-gate.sh` | post-merge",
+        "`scripts/coverage-gate.sh` runs post-merge",
+    ];
+    let mut wrong = Vec::new();
+    for file in FILES {
+        let doc = read(file);
+        let mut live = String::with_capacity(doc.len());
+        let mut rest = doc.as_str();
+        while let Some(open) = rest.find("~~") {
+            let after = &rest[open + 2..];
+            match after.find("~~") {
+                Some(close) => {
+                    live.push_str(&rest[..open]);
+                    rest = &after[close + 2..];
+                }
+                None => break,
+            }
+        }
+        live.push_str(rest);
+        for phrase in BANNED {
+            if live.contains(phrase) {
+                wrong.push(format!("{file}: \"{phrase}\""));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "these rule files say the coverage gate runs post-merge, but ci.yml \
+         all-green needs coverage-and-perf, so a floor breach blocks merge. \
+         Strike each claim and add a dated correction:\n  {}",
+        wrong.join("\n  ")
     );
 }

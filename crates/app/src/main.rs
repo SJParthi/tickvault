@@ -29,9 +29,15 @@
 //! tick pipeline task, no historical candle fetch and no separate
 //! token-renewal step here. The boot today, in source order:
 //!
-//! 1. holiday-gate short-circuit (Step -1, Step 0.5)
-//! 2. CryptoProvider (Step 0) and the panic hook (Step 0.9)
-//! 3. configuration (Step 1)
+//! ~~1. holiday-gate short-circuit (Step -1, Step 0.5)~~
+//! ~~2. CryptoProvider (Step 0) and the panic hook (Step 0.9)~~
+//! ~~3. configuration (Step 1)~~
+//!
+//! **⚠ CORRECTED 2026-10-11 (later the same day):** items 1 and 2 above
+//! were not in source order. The source runs: holiday-gate CLI
+//! short-circuit (Step -1), CryptoProvider (Step 0), the holiday-gate and
+//! ensure-questdb one-shots (Step 0.5), the panic hook (Step 0.9), then
+//! configuration (Step 1). Items 4 onward are unchanged.
 //! 4. observability, including the WAL replay read (Step 2)
 //! 5. logging (Step 3)
 //! 6. per-feed dispatcher (Step C)
