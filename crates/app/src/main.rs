@@ -1776,6 +1776,81 @@ async fn async_main() -> Result<()> {
     metrics::counter!("tv_oom_monitor_probe_failed_total").increment(0);
     metrics::counter!("tv_ws_activity_watchdog_panicked_total", "label" => "order-update")
         .increment(0);
+    // The fourteen counters that joined the same six pages on 2026-10-11
+    // (noise lock §2.10-a). Same reason, every label value each emit site uses.
+    for reason in tickvault_app::top_volume_snapshot::SnapshotRefusal::ALL {
+        metrics::counter!(
+            tickvault_app::dhan_feed_stack::TOP_VOLUME_SNAPSHOT_REFUSAL_COUNTER,
+            "reason" => reason.as_str()
+        )
+        .increment(0);
+    }
+    for endpoint in tickvault_core::websocket::pool_budget::DhanEndpointType::ALL {
+        let endpoint = endpoint.as_str();
+        for reason in ["oversize", "transport"] {
+            metrics::counter!(
+                tickvault_core::websocket::connection::FRAME_REFUSED_METRIC,
+                "endpoint" => endpoint,
+                "reason" => reason
+            )
+            .increment(0);
+        }
+        // Only the primary account opens through the budget in production.
+        for reason in ["endpoint_at_capacity", "total_at_capacity"] {
+            metrics::counter!(
+                tickvault_core::websocket::pool_budget::POOL_BUDGET_REFUSED_METRIC,
+                "account" => "primary",
+                "endpoint" => endpoint,
+                "reason" => reason
+            )
+            .increment(0);
+        }
+    }
+    metrics::counter!(
+        tickvault_core::websocket::pool_supervisor::INSTANCE_LOCK_DIAL_REFUSED_METRIC
+    )
+    .increment(0);
+    for reason in ["sync", "slot_overflow"] {
+        metrics::counter!(
+            tickvault_storage::seal_dlq::SEAL_DLQ_SYNC_FAILED_COUNTER,
+            "reason" => reason
+        )
+        .increment(0);
+    }
+    for tier in ["minute", "hour", "day"] {
+        metrics::counter!("tv_oms_order_budget_refused_total", "tier" => tier).increment(0);
+    }
+    metrics::counter!("tv_oms_dh904_exhausted_total").increment(0);
+    for source in ["code", "wire_string"] {
+        metrics::counter!("tv_oms_unknown_order_segment_refused_total", "source" => source)
+            .increment(0);
+    }
+    metrics::counter!("tv_oms_stop_all_refusals_total").increment(0);
+    for reason in ["nan", "infinite", "non_positive"] {
+        metrics::counter!(
+            tickvault_trading::risk::engine::MARK_REJECTED_COUNTER,
+            "reason" => reason
+        )
+        .increment(0);
+    }
+    metrics::counter!("tv_day_ohlc_tracker_refused_total").increment(0);
+    metrics::counter!("tv_tick_gap_tracker_refused_total").increment(0);
+    for reason in ["clean_exit", "panic", "cancelled", "unknown"] {
+        metrics::counter!("tv_day_ohlc_reset_failures_total", "reason" => reason).increment(0);
+    }
+    for site in [
+        "boot_probe",
+        "lifecycle_audit_ensure",
+        "lifecycle_ensure",
+        "oms_wiring",
+        "retired_views_drop",
+        "shadow_drop_legacy",
+        "shadow_drop_retired_candles",
+        "shadow_ensure_tables",
+        "wal_suspension_probe",
+    ] {
+        metrics::counter!("tv_http_client_build_failed_total", "site" => site).increment(0);
+    }
     // The seal-spill write-error counter (2026-08-28). Emitted only when the
     // producer-side durable tier's own append fails, which is the moment the
     // no-drop policy is leaning hardest on it — and, like the twenty above, it
