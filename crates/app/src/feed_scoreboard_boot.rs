@@ -1397,6 +1397,10 @@ pub fn parse_prom_counter_sum(body: &str, name: &str) -> Option<u64> {
 pub struct JsonlCodeEvent {
     pub code: String,
     pub reason: Option<String>,
+    /// The `stage` field, when the line carries one (2026-10-11). Read so a
+    /// RESILIENCE-01 line that only reports SSM reachability is not taken
+    /// as dual-instance evidence (see [`RESILIENCE_01_NON_PEER_STAGES`]).
+    pub stage: Option<String>,
     pub ts_ist_nanos: i64,
 }
 
@@ -1435,15 +1439,37 @@ pub fn parse_errors_jsonl_line(line: &str) -> Option<JsonlCodeEvent> {
         .get("reason")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
+    let stage = v
+        .get("stage")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
     let ts = v.get("timestamp")?.as_str()?;
     let parsed = chrono::DateTime::parse_from_rfc3339(ts).ok()?;
     let utc_nanos = parsed.timestamp_nanos_opt()?;
     Some(JsonlCodeEvent {
         code,
         reason,
+        stage,
         ts_ist_nanos: utc_nanos.saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS),
     })
 }
+
+/// RESILIENCE-01 `stage` values that report SSM reachability, not a peer
+/// (2026-10-11, review of SUP-9). The code is reused for these lines; none
+/// of them means a second instance was seen, so none sets
+/// `resilience_same_day` (which would blame the day's 805s on us as
+/// `dual_instance`). Emitters: `ssm_transport` and
+/// `release_at_shutdown_timed_out` in `dhan_rest_stack.rs`;
+/// `renew_failed`, `renew_failing` and `renew_lapsed` in
+/// `tickvault_core::instance_lock`. A RESILIENCE-01 line with any other
+/// stage, or none, still counts.
+const RESILIENCE_01_NON_PEER_STAGES: [&str; 5] = [
+    "ssm_transport",
+    "release_at_shutdown_timed_out",
+    "renew_failed",
+    "renew_failing",
+    "renew_lapsed",
+];
 
 /// Fold parsed events into day-scoped [`CorrelationEvidence`]. Pure.
 #[must_use]
@@ -1462,6 +1488,11 @@ pub fn collect_correlation_evidence(
             continue;
         }
         match ev.code.as_str() {
+            "RESILIENCE-01"
+                if ev
+                    .stage
+                    .as_deref()
+                    .is_some_and(|stage| RESILIENCE_01_NON_PEER_STAGES.contains(&stage)) => {}
             "RESILIENCE-01" | "RESILIENCE-03" => out.resilience_same_day = true,
             "WS-GAP-09" => match ev.reason.as_deref() {
                 Some("bare_dhan_reset") => out.ws_gap9_bare_ts_nanos.push(ev.ts_ist_nanos),
@@ -3792,28 +3823,100 @@ mod tests {
         assert_eq!(parse_errors_jsonl_line("not json"), None);
     }
 
+    /// Regression (2026-10-11, review of SUP-9): a RESILIENCE-01 line that
+    /// only reports SSM reachability must not set `resilience_same_day`,
+    /// which would blame every 805 of the day on us as `dual_instance`.
+    #[test]
+    fn test_ssm_reachability_resilience_01_is_not_dual_instance_evidence() {
+        let line = r#"{"timestamp":"2026-07-10T05:05:00Z","code":"RESILIENCE-01","stage":"renew_failing","message":"x"}"#;
+        let ev = parse_errors_jsonl_line(line).expect("parses");
+        assert_eq!(ev.stage.as_deref(), Some("renew_failing"));
+        // 2026-07-10T05:05Z + 5:30 = IST day 20_644.
+        let corr = collect_correlation_evidence(&[ev], 20_644, true);
+        assert!(
+            !corr.resilience_same_day,
+            "renew_failing is SSM reachability, not a peer"
+        );
+        for stage in RESILIENCE_01_NON_PEER_STAGES {
+            let ev = JsonlCodeEvent {
+                code: "RESILIENCE-01".to_string(),
+                reason: None,
+                stage: Some(stage.to_string()),
+                ts_ist_nanos: day_ts(40_000),
+            };
+            let corr = collect_correlation_evidence(&[ev], DAY, true);
+            assert!(!corr.resilience_same_day, "{stage} is not peer evidence");
+        }
+        // A peer stage, no stage, and RESILIENCE-03 with a listed stage all
+        // still count.
+        for (code, stage) in [
+            ("RESILIENCE-01", Some("already_held")),
+            ("RESILIENCE-01", Some("renew_contention")),
+            ("RESILIENCE-01", None),
+            ("RESILIENCE-03", Some("renew_failing")),
+        ] {
+            let ev = JsonlCodeEvent {
+                code: code.to_string(),
+                reason: None,
+                stage: stage.map(str::to_string),
+                ts_ist_nanos: day_ts(40_000),
+            };
+            let corr = collect_correlation_evidence(&[ev], DAY, true);
+            assert!(corr.resilience_same_day, "{code} {stage:?} is evidence");
+        }
+    }
+
+    /// Every listed non-peer stage is still emitted with that exact string
+    /// next to a RESILIENCE-01 code, so the list cannot drift from the
+    /// emitters silently.
+    #[test]
+    fn test_resilience_01_non_peer_stages_match_their_emitters() {
+        let rest_stack = include_str!("dhan_rest_stack.rs");
+        let instance_lock = include_str!("../../core/src/instance_lock.rs");
+        for stage in RESILIENCE_01_NON_PEER_STAGES {
+            let needle = format!("stage = \"{stage}\"");
+            let source = if rest_stack.contains(&needle) {
+                rest_stack
+            } else {
+                instance_lock
+            };
+            // Any occurrence (the first may be in a doc comment) must sit
+            // just after a RESILIENCE-01 code field.
+            let emitted = source.match_indices(&needle).any(|(at, _)| {
+                source[..at]
+                    .rfind("Resilience01DualInstanceDetected")
+                    .is_some_and(|code_at| at - code_at < 400)
+            });
+            assert!(emitted, "stage {stage} is no longer a RESILIENCE-01 line");
+        }
+    }
+
     #[test]
     fn test_collect_correlation_evidence_and_has_overlap_windows() {
         let events = vec![
             JsonlCodeEvent {
                 code: "WS-GAP-09".to_string(),
                 reason: Some("bare_dhan_reset".to_string()),
+                stage: None,
                 ts_ist_nanos: day_ts(40_000),
             },
             JsonlCodeEvent {
                 code: "RESILIENCE-01".to_string(),
                 reason: None,
+                stage: None,
                 ts_ist_nanos: day_ts(41_000),
             },
             JsonlCodeEvent {
                 code: "PROC-01".to_string(),
                 reason: None,
+                stage: None,
                 ts_ist_nanos: day_ts(42_000),
             },
             // Wrong day — excluded.
             JsonlCodeEvent {
                 code: "RESOURCE-01".to_string(),
                 reason: None,
+                stage: None,
                 ts_ist_nanos: day_ts(90_000),
             },
         ];
@@ -4752,6 +4855,7 @@ mod tests {
             let ev = JsonlCodeEvent {
                 code: code.to_string(),
                 reason: Some("bare_dhan_reset".to_string()),
+                stage: None,
                 ts_ist_nanos: day_ts(40_000),
             };
             let out = collect_correlation_evidence(&[ev], DAY, true);

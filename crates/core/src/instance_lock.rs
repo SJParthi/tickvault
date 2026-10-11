@@ -54,6 +54,11 @@
 //!   * Heartbeat: every 30s the owner re-issues `PutParameter` with a
 //!     refreshed `last_heartbeat_unix`. Two missed renewals still leave
 //!     30s of headroom before another instance considers the slot stale.
+//!     **⚠ CORRECTED 2026-10-11 (review of SUP-9):** not with the 20 s
+//!     renewal timeout. The second failure can end at +80 s (10 s of
+//!     headroom), and the third renewal starts at the +90 s tick, the TTL
+//!     boundary itself, so it races a peer's staleness check. See
+//!     `spawn_instance_lock_heartbeat`.
 //!   * Release: `GetParameter` + ownership check + `DeleteParameter`.
 //!     A foreign holder is left alone (logged at WARN, not ERROR).
 
@@ -64,7 +69,7 @@ use anyhow::{Context as _, Result, anyhow};
 use aws_sdk_ssm::Client as SsmClient;
 use aws_sdk_ssm::types::ParameterType;
 use serde::{Deserialize, Serialize};
-use tickvault_common::error_code::ErrorCode;
+use tickvault_common::error_code::{ErrorCode, Severity};
 use tickvault_common::sanitize::sanitize_ilp_symbol;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -77,6 +82,11 @@ pub const INSTANCE_LOCK_TTL_SECS: u64 = 90;
 
 /// Heartbeat interval — 1/3 of the TTL. Two missed renewals still leave
 /// 30 seconds of headroom before the lock is considered stale.
+///
+/// **⚠ CORRECTED 2026-10-11 (review of SUP-9):** true only when a failure
+/// is instant. With [`INSTANCE_LOCK_RENEW_TIMEOUT_SECS`] (20 s), two
+/// timed-out renewals end at +80 s, 10 s before the TTL, and the third
+/// renewal starts at +90 s, the TTL boundary itself.
 pub const INSTANCE_LOCK_HEARTBEAT_INTERVAL_SECS: u64 = 30;
 
 /// Tolerated skew, in seconds, between the ACQUIRER's wall clock and the
@@ -973,13 +983,43 @@ pub async fn force_takeover_instance_lock(ssm: &SsmClient, env: &str, host_id: &
 
 /// Consecutive-failure count for the heartbeat's renewals (2026-10-11,
 /// audit SUP-9). O(1), no allocation.
+///
+/// Also keeps the START instant of the last successful renewal (2026-10-11,
+/// review of SUP-9): the count alone understates how long the lock has gone
+/// without a renewal when ticks run late, so the lapse past the TTL is judged
+/// on time. `None` means no success is known yet, and no lapse is judged.
 #[derive(Debug, Default)]
 struct RenewFailureTracker {
     consecutive: u32,
     escalated: bool,
+    last_success: Option<tokio::time::Instant>,
+    lapsed: bool,
 }
 
 impl RenewFailureTracker {
+    /// A tracker whose last successful write is `acquired_at` (the lock was
+    /// just acquired when the heartbeat starts).
+    fn starting_at(acquired_at: tokio::time::Instant) -> Self {
+        Self {
+            last_success: Some(acquired_at),
+            ..Self::default()
+        }
+    }
+
+    /// Returns the seconds since the last successful renewal exactly once
+    /// per failure episode: the first time they reach
+    /// [`INSTANCE_LOCK_TTL_SECS`], when a booting peer can judge the lock
+    /// stale. Measured from the START of that renewal, which is no later
+    /// than the heartbeat it stored, so it errs early. A success re-arms it.
+    fn lapse_edge(&mut self, now: tokio::time::Instant) -> Option<u64> {
+        let last = self.last_success?;
+        let elapsed_secs = now.saturating_duration_since(last).as_secs();
+        if self.lapsed || elapsed_secs < INSTANCE_LOCK_TTL_SECS {
+            return None;
+        }
+        self.lapsed = true;
+        Some(elapsed_secs)
+    }
     /// Records one failed renewal. Returns `true` exactly once per failure
     /// episode: when the count first reaches
     /// [`INSTANCE_LOCK_RENEW_FAILURES_BEFORE_ERROR`].
@@ -992,12 +1032,14 @@ impl RenewFailureTracker {
         false
     }
 
-    /// Records one successful renewal. Returns the failure count it ends,
-    /// if any, and re-arms the escalation.
-    fn on_success(&mut self) -> Option<u32> {
+    /// Records one successful renewal that started at `started`. Returns the
+    /// failure count it ends, if any, and re-arms both latches.
+    fn on_success(&mut self, started: tokio::time::Instant) -> Option<u32> {
         let ended = (self.consecutive > 0).then_some(self.consecutive);
         self.consecutive = 0;
         self.escalated = false;
+        self.lapsed = false;
+        self.last_success = Some(started);
         ended
     }
 }
@@ -1022,9 +1064,20 @@ enum HeartbeatStep {
 ///   `error!` (`stage = "renew_failing"`), the others a coded `warn!`.
 ///   `held_flag` is NOT touched: the self-fence is an operator trade-off
 ///   (dual-instance-lock runbook §3.6), not taken here.
+/// - Once the time since the last successful renewal STARTED reaches
+///   [`INSTANCE_LOCK_TTL_SECS`] (a booting peer may now take the lock), one
+///   more RESILIENCE-01 `error!` (`stage = "renew_lapsed"`), once per
+///   failure episode.
 ///
-/// A renewal cancelled by the timeout can at worst leave our own value
-/// stored, which the next renewal re-reads and verifies. Cold path, once
+/// Both `error!` lines reuse the RESILIENCE-01 code for an SSM reachability
+/// problem, NOT a dual-instance detection: the lock is still held and no
+/// peer has been seen. Their `severity` field is therefore `high`, not the
+/// code's `critical`, and the feed scoreboard does not count these stages
+/// as dual-instance evidence (`feed_scoreboard_boot`).
+///
+/// A renewal cancelled by the timeout may still land its put on the server.
+/// If a peer took the lock in the meantime, our next read-back sees a
+/// foreign holder (`Ok(false)`) and the heartbeat exits. Cold path, once
 /// per 30 s, O(1).
 async fn heartbeat_tick<Fut>(
     renew: Fut,
@@ -1036,11 +1089,12 @@ async fn heartbeat_tick<Fut>(
 where
     Fut: Future<Output = Result<bool>>,
 {
+    let started = tokio::time::Instant::now();
     let outcome =
         tokio::time::timeout(Duration::from_secs(INSTANCE_LOCK_RENEW_TIMEOUT_SECS), renew).await;
     let (reason, err) = match outcome {
         Ok(Ok(true)) => {
-            if let Some(failed_attempts) = tracker.on_success() {
+            if let Some(failed_attempts) = tracker.on_success(started) {
                 info!(
                     target: "tickvault::instance_lock",
                     stage = "renew_recovered",
@@ -1082,13 +1136,18 @@ where
     let escalate = tracker.on_failure();
     let consecutive = tracker.consecutive;
     metrics::gauge!("tv_instance_lock_renew_consecutive_failures").set(f64::from(consecutive));
+    // `{:#}` prints the whole anyhow chain, so the SDK cause (DNS, connect,
+    // AccessDenied, throttling) reaches the log, not only the outer context.
+    // Cold path, once per 30 s: the allocation is fine.
+    let error_chain = format!("{err:#}");
     if escalate {
+        // RESILIENCE-01 is reused for SSM reachability; this is NOT a
+        // dual-instance detection, so the severity is `high`, not the
+        // code's `critical` (see `heartbeat_tick` docs).
         error!(
             target: "tickvault::instance_lock",
             code = ErrorCode::Resilience01DualInstanceDetected.code_str(),
-            severity = ErrorCode::Resilience01DualInstanceDetected
-                .severity()
-                .as_str(),
+            severity = Severity::High.as_str(),
             stage = "renew_failing",
             env = %env,
             host_id = %host_id,
@@ -1096,10 +1155,11 @@ where
             consecutive,
             interval_secs = INSTANCE_LOCK_HEARTBEAT_INTERVAL_SECS,
             ttl_secs = INSTANCE_LOCK_TTL_SECS,
-            error = %err,
-            "instance-lock renewal has failed {consecutive} times in a row; a peer may \
-             see the lock stale after {INSTANCE_LOCK_TTL_SECS}s; this process still \
-             holds its flag (no self-fence, runbook section 3.6)"
+            error = %error_chain,
+            "instance-lock renewal has failed {consecutive} times in a row (SSM \
+             reachability, not a peer); a peer may see the lock stale after \
+             {INSTANCE_LOCK_TTL_SECS}s; this process still holds its flag (no \
+             self-fence, runbook section 3.6)"
         );
     } else {
         warn!(
@@ -1110,8 +1170,27 @@ where
             host_id = %host_id,
             reason,
             consecutive,
-            error = %err,
+            error = %error_chain,
             "instance-lock renewal failed; will retry on next heartbeat tick"
+        );
+    }
+    if let Some(secs_since_renewal) = tracker.lapse_edge(tokio::time::Instant::now()) {
+        error!(
+            target: "tickvault::instance_lock",
+            code = ErrorCode::Resilience01DualInstanceDetected.code_str(),
+            severity = Severity::High.as_str(),
+            stage = "renew_lapsed",
+            env = %env,
+            host_id = %host_id,
+            reason,
+            consecutive,
+            secs_since_renewal,
+            ttl_secs = INSTANCE_LOCK_TTL_SECS,
+            error = %error_chain,
+            "instance-lock renewal has not succeeded for {secs_since_renewal}s, at or \
+             past the {INSTANCE_LOCK_TTL_SECS}s TTL: a booting peer may now take the \
+             lock over; this process still holds its flag (no self-fence, runbook \
+             section 3.6)"
         );
     }
     HeartbeatStep::Continue
@@ -1148,11 +1227,20 @@ where
 /// 30 s heartbeat against a 90 s TTL, two consecutive failures still leave
 /// 30 s of headroom before another instance considers the slot stale. See
 /// `heartbeat_tick`.
-// TEST-EXEMPT: real SSM endpoint required for the GetParameter /
-// PutParameter round trip; the renew_instance_lock /
-// release_instance_lock functions the task delegates to are themselves
-// TEST-EXEMPT for the same reason. The cancellation + exit path is small
-// enough to verify by inspection.
+///
+/// **⚠ CORRECTED 2026-10-11 (review of SUP-9) — the "30 s of headroom"
+/// sentence above is wrong in the reassuring direction.** With the 20 s
+/// renewal timeout, the second failure can end at +80 s (30 + 20 + 30),
+/// which leaves 10 s, not 30 s. The third renewal starts at the +90 s tick,
+/// which is the TTL boundary itself (a peer judges age > 90 s stale), so it
+/// races a peer's staleness check rather than landing with room to spare.
+/// The const assert on [`INSTANCE_LOCK_RENEW_FAILURES_BEFORE_ERROR`] only
+/// guarantees the `renew_failing` line lands before the TTL; the
+/// `renew_lapsed` line marks the moment the TTL is reached.
+///
+/// Covered by `test_instance_lock_heartbeat_shutdown_releases_and_exits` and
+/// `test_instance_lock_heartbeat_pages_and_exits_on_lost_ownership` (both
+/// against a loopback SSM stub), and by the `heartbeat_tick` tests.
 pub fn spawn_instance_lock_heartbeat(
     ssm: Arc<SsmClient>,
     env: String,
@@ -1174,7 +1262,10 @@ pub fn spawn_instance_lock_heartbeat(
         // First tick fires immediately — skip it so we don't redundantly
         // re-write the parameter that try_acquire just put.
         ticker.tick().await;
-        let mut tracker = RenewFailureTracker::default();
+        // Seeded with the spawn instant: the lock was acquired just before
+        // the heartbeat is spawned. If boot spawned it later, the first
+        // `renew_lapsed` is judged late by that gap.
+        let mut tracker = RenewFailureTracker::starting_at(tokio::time::Instant::now());
         // First-sample baseline: both series exist at 0 before any failure.
         metrics::gauge!("tv_instance_lock_renew_consecutive_failures").set(0.0);
         metrics::counter!("tv_instance_lock_renew_failed_total", "reason" => "error").increment(0);
@@ -1419,12 +1510,16 @@ mod tests {
     #[test]
     fn test_renew_failure_tracker_success_resets_and_rearms() {
         let mut tracker = RenewFailureTracker::default();
-        assert_eq!(tracker.on_success(), None, "no failure run to end");
+        assert_eq!(
+            tracker.on_success(tokio::time::Instant::now()),
+            None,
+            "no failure run to end"
+        );
         for _ in 0..INSTANCE_LOCK_RENEW_FAILURES_BEFORE_ERROR {
             tracker.on_failure();
         }
         assert_eq!(
-            tracker.on_success(),
+            tracker.on_success(tokio::time::Instant::now()),
             Some(INSTANCE_LOCK_RENEW_FAILURES_BEFORE_ERROR)
         );
         assert_eq!(tracker.consecutive, 0);
@@ -1441,6 +1536,7 @@ mod tests {
         let mut tracker = RenewFailureTracker {
             consecutive: u32::MAX,
             escalated: true,
+            ..RenewFailureTracker::default()
         };
         assert!(!tracker.on_failure());
         assert_eq!(tracker.consecutive, u32::MAX);
@@ -1473,14 +1569,20 @@ mod tests {
         let mut tracker = RenewFailureTracker::default();
         let held = AtomicBool::new(true);
         let started = tokio::time::Instant::now();
-        let step = heartbeat_tick(
-            std::future::pending::<Result<bool>>(),
-            &mut tracker,
-            &held,
-            "test",
-            "host-a",
+        // Outer bound: if the timeout wrapper inside heartbeat_tick were
+        // removed, this fails fast instead of hanging the test job.
+        let step = tokio::time::timeout(
+            Duration::from_secs(INSTANCE_LOCK_RENEW_TIMEOUT_SECS * 2),
+            heartbeat_tick(
+                std::future::pending::<Result<bool>>(),
+                &mut tracker,
+                &held,
+                "test",
+                "host-a",
+            ),
         )
-        .await;
+        .await
+        .expect("heartbeat_tick must bound a hung renewal by its own timeout");
         assert_eq!(step, HeartbeatStep::Continue);
         assert_eq!(
             tracker.consecutive, 1,
@@ -1533,6 +1635,146 @@ mod tests {
             !held.load(Ordering::Acquire),
             "lock loss arms the mint tripwire"
         );
+    }
+
+    /// A `Write` sink the heartbeat log-capture tests log into.
+    #[derive(Clone, Default)]
+    struct HeartbeatLogSink(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for HeartbeatLogSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl HeartbeatLogSink {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(
+                &self
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )
+            .into_owned()
+        }
+
+        /// Installs a thread-local subscriber writing into this sink. The
+        /// current-thread test runtime polls `heartbeat_tick` on this thread.
+        fn install(&self) -> tracing::subscriber::DefaultGuard {
+            let writer = self.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::TRACE)
+                .finish();
+            tracing::subscriber::set_default(subscriber)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_tick_threshold_failure_logs_error_others_warn() {
+        let sink = HeartbeatLogSink::default();
+        let _guard = sink.install();
+        let mut tracker = RenewFailureTracker::default();
+        let held = AtomicBool::new(true);
+        let attempts = INSTANCE_LOCK_RENEW_FAILURES_BEFORE_ERROR + 2;
+        for _ in 0..attempts {
+            heartbeat_tick(
+                async { Err(anyhow!("dns lookup failed").context("GetParameter failed")) },
+                &mut tracker,
+                &held,
+                "test",
+                "host-a",
+            )
+            .await;
+        }
+        let out = sink.text();
+        let failing: Vec<&str> = out
+            .lines()
+            .filter(|l| l.contains("renew_failing"))
+            .collect();
+        assert_eq!(failing.len(), 1, "one escalation per episode:\n{out}");
+        assert!(failing[0].contains("ERROR"), "{}", failing[0]);
+        assert!(failing[0].contains("RESILIENCE-01"), "{}", failing[0]);
+        assert!(
+            failing[0].contains("severity=\"high\""),
+            "an SSM blip is not a critical dual-instance detection: {}",
+            failing[0]
+        );
+        assert!(
+            failing[0].contains("dns lookup failed"),
+            "the whole error chain reaches the log, not only the outer context: {}",
+            failing[0]
+        );
+        let failed: Vec<&str> = out.lines().filter(|l| l.contains("renew_failed")).collect();
+        assert_eq!(
+            failed.len() as u32,
+            attempts - 1,
+            "every other failure is a warning:\n{out}"
+        );
+        for line in &failed {
+            assert!(line.contains("WARN"), "{line}");
+        }
+        assert!(
+            !out.contains("renew_lapsed"),
+            "no lapse without a known last success:\n{out}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_heartbeat_tick_logs_renew_lapsed_once_at_the_ttl() {
+        let sink = HeartbeatLogSink::default();
+        let _guard = sink.install();
+        let mut tracker = RenewFailureTracker::starting_at(tokio::time::Instant::now());
+        let held = AtomicBool::new(true);
+        let ticks_to_ttl = INSTANCE_LOCK_TTL_SECS / INSTANCE_LOCK_HEARTBEAT_INTERVAL_SECS;
+        for tick in 1..=ticks_to_ttl + 1 {
+            tokio::time::advance(Duration::from_secs(INSTANCE_LOCK_HEARTBEAT_INTERVAL_SECS)).await;
+            heartbeat_tick(
+                async { Err(anyhow!("ssm unreachable")) },
+                &mut tracker,
+                &held,
+                "test",
+                "host-a",
+            )
+            .await;
+            assert_eq!(
+                tracker.lapsed,
+                tick >= ticks_to_ttl,
+                "lapse latches at the tick that reaches the TTL (tick {tick})"
+            );
+        }
+        let out = sink.text();
+        let lapsed: Vec<&str> = out.lines().filter(|l| l.contains("renew_lapsed")).collect();
+        assert_eq!(lapsed.len(), 1, "edge-latched once per episode:\n{out}");
+        assert!(lapsed[0].contains("ERROR"), "{}", lapsed[0]);
+        assert!(lapsed[0].contains("severity=\"high\""), "{}", lapsed[0]);
+        assert!(held.load(Ordering::Acquire), "no self-fence on a lapse");
+
+        // A success re-arms the lapse latch from that renewal's start.
+        heartbeat_tick(async { Ok(true) }, &mut tracker, &held, "test", "host-a").await;
+        assert!(!tracker.lapsed);
+        assert_eq!(tracker.lapse_edge(tokio::time::Instant::now()), None);
+        tokio::time::advance(Duration::from_secs(INSTANCE_LOCK_TTL_SECS)).await;
+        assert_eq!(
+            tracker.lapse_edge(tokio::time::Instant::now()),
+            Some(INSTANCE_LOCK_TTL_SECS)
+        );
+    }
+
+    #[test]
+    fn test_renew_failure_tracker_lapse_needs_a_known_success() {
+        let mut tracker = RenewFailureTracker::default();
+        let far_later =
+            tokio::time::Instant::now() + Duration::from_secs(10 * INSTANCE_LOCK_TTL_SECS);
+        assert_eq!(tracker.lapse_edge(far_later), None);
     }
 
     // -----------------------------------------------------------------------
