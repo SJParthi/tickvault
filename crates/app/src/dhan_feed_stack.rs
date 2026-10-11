@@ -13924,6 +13924,9 @@ async fn attach_depth_when_available(
         let mut depth20_index_legs: Vec<SubscribeInstrument> = Vec::new();
         let mut depth20_index_full_cost = 0usize;
         let mut depth20_index_due = false;
+        // What the set built this attempt leaves out (plan item PR43): spots
+        // cut at the 250-slot cap and index legs of the widest window not in it.
+        let mut depth20_shortfall = crate::depth20_static::Depth20Shortfall::default();
         if !depth_done {
             // ONE load for both halves. Two loads a few seconds apart can
             // disagree, and a disagreement here fills the movers sockets from
@@ -13985,10 +13988,17 @@ async fn attach_depth_when_available(
                 &depth20_index_legs,
                 crate::depth20_static::DEPTH20_STATIC_BUDGET,
             );
+            depth20_shortfall = crate::depth20_static::depth20_shortfall(
+                spots.len(),
+                selection.depth_20.len(),
+                crate::depth20_static::DEPTH20_STATIC_BUDGET,
+            );
             info!(
                 spots = spots.len(),
                 index_legs = depth20_index_legs.len(),
                 index_legs_wanted = depth20_index_full_cost,
+                index_legs_missing = depth20_shortfall.index_legs_missing,
+                spots_cut = depth20_shortfall.spots_cut,
                 index_strikes_each_side = ?each_side,
                 index_due,
                 depth_20 = selection.depth_20.len(),
@@ -14652,14 +14662,31 @@ async fn attach_depth_when_available(
                     )
                 {
                     depth_20_index_added = true;
-                    if depth20_index_legs.len() < depth20_index_full_cost {
-                        warn!(
-                            legs = depth20_index_legs.len(),
-                            full_cost = depth20_index_full_cost,
+                    // PR43: the settle log states what the day set leaves out,
+                    // counted against the operator's widest window (±4, 36
+                    // legs) and the F&O spot list, never against what the
+                    // budget happened to leave room for. Set once a session.
+                    metrics::gauge!(crate::depth20_static::DEPTH20_INDEX_LEGS_MISSING_GAUGE)
+                        .set(depth20_shortfall.index_legs_missing as f64);
+                    metrics::gauge!(crate::depth20_static::DEPTH20_SPOTS_CUT_GAUGE)
+                        .set(depth20_shortfall.spots_cut as f64);
+                    if depth20_shortfall.is_short() {
+                        error!(
+                            code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                            source = "depth20_static_set_short",
+                            index_legs_placed = depth20_shortfall.index_legs_placed,
+                            index_legs_wanted = crate::depth20_static::DEPTH20_INDEX_LEGS_WANTED,
+                            index_legs_missing = depth20_shortfall.index_legs_missing,
+                            index_legs_offered = depth20_index_legs.len(),
+                            index_window_cost = depth20_index_full_cost,
+                            spots_cut = depth20_shortfall.spots_cut,
                             attempts,
-                            "depth-20: settling the index legs with a SHORT at-the-money window \
-                             — the full window never became available by 09:20. The day set \
-                             stays static with what was offered."
+                            "depth-20: today's static set is SHORT — {} NIFTY/BANKNIFTY \
+                             option legs and {} F&O spots have no depth-20 slot for the whole \
+                             day (250-slot cap, or the at-the-money window was not available \
+                             by 09:20). Placement is unchanged; the set stays static.",
+                            depth20_shortfall.index_legs_missing,
+                            depth20_shortfall.spots_cut,
                         );
                     } else {
                         info!(
@@ -31797,6 +31824,38 @@ mod depth20_layout_wiring_tests {
         assert!(
             !p.contains("crate::depth20_layout::build_depth20_layout("),
             "the steered mover layout must not be the depth-20 dial source"
+        );
+    }
+
+    #[test]
+    fn the_index_settle_states_and_counts_what_the_static_set_leaves_out() {
+        // PR43: a budget with no room for index legs used to settle with a
+        // wanted cost of 0 and log "complete" while both indices were absent
+        // all day. The settle now counts against the widest window and pages
+        // a coded error when anything is missing.
+        let p = production();
+        assert!(
+            p.contains("depth20_shortfall = crate::depth20_static::depth20_shortfall("),
+            "the attach must compute what the static set leaves out"
+        );
+        assert!(
+            p.contains("source = \"depth20_static_set_short\""),
+            "a short static set must raise the coded error"
+        );
+        assert!(
+            p.contains("metrics::gauge!(crate::depth20_static::DEPTH20_INDEX_LEGS_MISSING_GAUGE)")
+                && p.contains("metrics::gauge!(crate::depth20_static::DEPTH20_SPOTS_CUT_GAUGE)"),
+            "the settle must publish both shortfall gauges"
+        );
+        let settle = p
+            .find("if depth20_shortfall.is_short()")
+            .expect("the settle branches on the shortfall"); // APPROVED: test
+        let complete = p
+            .find("the static day set is complete (spots + index legs)")
+            .expect("the complete log line exists"); // APPROVED: test
+        assert!(
+            settle < complete,
+            "\"complete\" must be logged only on the not-short branch"
         );
     }
 
