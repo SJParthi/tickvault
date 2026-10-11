@@ -2294,8 +2294,11 @@ pub const SELF_TRADE_COOLDOWN_SECS: u64 = 60;
 pub const TICK_BROADCAST_CAPACITY: usize = 262_144;
 
 /// Broadcast channel capacity for order update consumers (OMS, risk engine).
-/// 256 order updates × ~512 bytes each = ~128KB. At ~10 orders/sec = ~25 seconds.
-pub const ORDER_UPDATE_BROADCAST_CAPACITY: usize = 256;
+/// 4,096 order updates × ~512 bytes each = ~2 MiB. Order events are limited
+/// to 10 a second, so the receiver must stall for about 7 minutes before it
+/// lags. It was 256 (~25 s) until 2026-10-11 (audit PR14): a lagged receiver
+/// skips events and a skipped fill never reaches the risk book.
+pub const ORDER_UPDATE_BROADCAST_CAPACITY: usize = 4_096;
 
 // 2026-06-28: the 9 OPTION_CHAIN_* constants were REMOVED with the entire
 // option_chain REST subsystem (operator directive 2026-06-28). They were

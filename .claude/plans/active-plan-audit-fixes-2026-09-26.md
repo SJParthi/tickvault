@@ -257,7 +257,11 @@ inline (PR2, PR8, PR14).
 - [ ] **PR13 — no JavaScript left in CI.** (`.github/workflows/`)
   - 14 `actions/github-script` steps: safety.yml (12) and dep-freshness-nightly.yml (2). Port each
     to the `gh` CLI with identical inputs/outputs, the way fuzz.yml / chaos-nightly.yml already were.
-- [ ] **PR14 — order-update receiver cannot silently skip.** (`app`, `core`)
+- [x] **PR14 — order-update receiver cannot silently skip.** (`app`, `core`)
+  - Done 2026-10-11: `ORDER_UPDATE_BROADCAST_CAPACITY` = 4,096 wired at `dhan_rest_stack.rs`;
+    the `Lagged` arm runs `run_reconcile_cycle` at once. Tests (order_runtime.rs):
+    `order_update_broadcast_capacity_is_4096`, `lag_triggers_reconcile`,
+    `lag_reconcile_flags_a_skipped_fill`.
   - Correction: `Lagged` is already counted and logged (order_runtime.rs:1346), but events are
     still lost. Raise the broadcast capacity from 256 to 4,096 (order events are rate-limited to
     ≤ 10/s, so lag then needs a multi-minute runtime stall, which D1 removes) and make a lag
