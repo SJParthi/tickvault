@@ -33,6 +33,18 @@
 //!   up. Replacing the ring with a pre-allocated array channel (as audit N2 did
 //!   for the seal queue) is a separate, larger change.
 //!
+//! **⚠ CORRECTED 2026-10-11 (review of HOT-1).** Two things above were wrong
+//! or missing. (1) "Blocks are reused once the drain catches up" is false: in
+//! tokio 1.53.2 `reclaim_block` re-links a drained block after the tail at
+//! most 3 times and frees it otherwise, so only about 3 spare blocks survive
+//! and every new backlog allocates again. The **re-backlog** phase below
+//! measures that: after a full drain, a second backlog of the same size
+//! allocates about one block per 32 frames again. (2) The three SHED arms of
+//! `accept` (byte budget full, slot budget full, ring `try_send` full) were
+//! not measured. The **shed** phase runs each against its own sink and holds
+//! it to the house 8 blocks / 1 KiB budget. Still NOT measured here: the
+//! read buffering inside `tokio-tungstenite`, upstream of `accept`.
+//!
 //! CI ENFORCEMENT: un-gated, house pattern; the Coverage lane skips it by the
 //! `dhat_` name prefix. One profiler per process, so both arms share one test.
 //!
@@ -62,6 +74,15 @@ const STEADY_BUDGET_BLOCKS: u64 = 8;
 const STEADY_FRAMES: usize = 10_000;
 const WARMUP_FRAMES: usize = 4_096;
 const BACKLOG_FRAMES: usize = 4_096;
+/// Frames sent into EACH shed arm per measured attempt.
+const SHED_FRAMES: usize = 4_096;
+/// Attempts `measure_with_phantom_retry` may make, so every attempt gets
+/// fresh frames.
+const MEASURE_ATTEMPTS: usize = 3;
+/// Spare blocks a drained tokio `mpsc` keeps (`reclaim_block` tries 3 times),
+/// plus slack: a re-backlog must allocate at least this many fewer blocks
+/// than one per 32 frames to count as "blocks were reused".
+const REBACKLOG_REUSE_SLACK_BLOCKS: u64 = 8;
 /// tokio 1.53 `sync::mpsc` block size (`BLOCK_CAP`).
 const TOKIO_MPSC_BLOCK_CAP: usize = 32;
 /// One block per 32 queued frames, plus a little slack for the tail block
@@ -137,7 +158,51 @@ fn dhat_wal_ring_sink_accept_steady_state_allocates_nothing_and_backlog_grows_on
         0,
     );
 
-    let total = WARMUP_FRAMES + STEADY_FRAMES * 3 + BACKLOG_FRAMES;
+    // Three shed sinks on the same WAL, each with its own channel and budget,
+    // built before the profiler so their counter handles resolve off-clock.
+    // Each forces one refusal arm of `accept`:
+    //   bytes: an 8-byte budget refuses every 16-byte frame (BytesFull);
+    //   slots: a 0-slot budget refuses every frame (SlotsFull);
+    //   send:  a capacity-1 channel, filled once, refuses at `try_send`.
+    let (bytes_tx, _bytes_rx) = tokio::sync::mpsc::channel::<CapturedFrame>(FRAME_RING_CAPACITY);
+    let bytes_budget = Arc::new(RingByteBudget::with_slot_cap(8, usize::MAX));
+    let bytes_sink = WalRingSink::new(
+        Arc::clone(&spill),
+        bytes_tx,
+        Arc::clone(&bytes_budget),
+        WsType::LiveFeed,
+        DhanEndpointType::MainFeed,
+        1,
+    );
+    let (slots_tx, _slots_rx) = tokio::sync::mpsc::channel::<CapturedFrame>(FRAME_RING_CAPACITY);
+    let slots_budget = Arc::new(RingByteBudget::with_slot_cap(FRAME_RING_MAX_BYTES, 0));
+    let slots_sink = WalRingSink::new(
+        Arc::clone(&spill),
+        slots_tx,
+        Arc::clone(&slots_budget),
+        WsType::LiveFeed,
+        DhanEndpointType::MainFeed,
+        2,
+    );
+    let (send_tx, _send_rx) = tokio::sync::mpsc::channel::<CapturedFrame>(1);
+    let send_budget = Arc::new(RingByteBudget::with_slot_cap(
+        FRAME_RING_MAX_BYTES,
+        FRAME_RING_CAPACITY,
+    ));
+    let send_sink = WalRingSink::new(
+        Arc::clone(&spill),
+        send_tx,
+        Arc::clone(&send_budget),
+        WsType::LiveFeed,
+        DhanEndpointType::MainFeed,
+        3,
+    );
+
+    let total = WARMUP_FRAMES
+        + STEADY_FRAMES * MEASURE_ATTEMPTS
+        + BACKLOG_FRAMES * 2
+        + 4
+        + SHED_FRAMES * 3 * MEASURE_ATTEMPTS;
     let frames: Vec<Bytes> = (0..total as u32).map(shared_ticker).collect();
     let mut next = 0usize;
     let mut persisted_target = 0u64;
@@ -152,8 +217,27 @@ fn dhat_wal_ring_sink_accept_steady_state_allocates_nothing_and_backlog_grows_on
         assert_eq!(got.bytes.len(), len);
         budget.release(len);
     }
-    next += WARMUP_FRAMES;
-    persisted_target += WARMUP_FRAMES as u64;
+    // One shed per arm off-clock, and the one frame that fills the capacity-1
+    // channel: warms the frame-fate table, the applied watermark and each
+    // sink's counters.
+    assert_eq!(
+        bytes_sink.accept(frames[next + WARMUP_FRAMES].clone()),
+        FrameSinkOutcome::RingFull
+    );
+    assert_eq!(
+        slots_sink.accept(frames[next + WARMUP_FRAMES + 1].clone()),
+        FrameSinkOutcome::RingFull
+    );
+    assert_eq!(
+        send_sink.accept(frames[next + WARMUP_FRAMES + 2].clone()),
+        FrameSinkOutcome::Captured
+    );
+    assert_eq!(
+        send_sink.accept(frames[next + WARMUP_FRAMES + 3].clone()),
+        FrameSinkOutcome::RingFull
+    );
+    next += WARMUP_FRAMES + 4;
+    persisted_target += WARMUP_FRAMES as u64 + 4;
     wait_persisted(&spill, persisted_target);
 
     let _profiler = dhat::Profiler::builder().testing().build();
@@ -221,6 +305,84 @@ fn dhat_wal_ring_sink_accept_steady_state_allocates_nothing_and_backlog_grows_on
     assert_eq!(budget.resident(), 0, "every reservation released");
     persisted_target += BACKLOG_FRAMES as u64;
     wait_persisted(&spill, persisted_target);
+    next += BACKLOG_FRAMES;
+
+    // ---- Arm B2: re-backlog after a full drain. If tokio kept the drained
+    // blocks this would allocate (almost) nothing; it keeps about 3, so a
+    // second backlog of the same size allocates about as many blocks again.
+    let rebacklog = &frames[next..next + BACKLOG_FRAMES];
+    let before = dhat::HeapStats::get();
+    for frame in rebacklog {
+        assert_eq!(sink.accept(frame.clone()), FrameSinkOutcome::Captured);
+    }
+    let after = dhat::HeapStats::get();
+    let r_blocks = after.total_blocks.saturating_sub(before.total_blocks);
+    let r_bytes = after.total_bytes.saturating_sub(before.total_bytes);
+    eprintln!(
+        "dhat_wal_ring_sink_accept: re-backlog of {BACKLOG_FRAMES} frames after a full drain \
+         allocated {r_bytes} B / {r_blocks} blocks (the drained blocks were freed, not kept)"
+    );
+    let per_32 = BACKLOG_FRAMES.div_ceil(TOKIO_MPSC_BLOCK_CAP) as u64;
+    assert!(
+        r_blocks <= BACKLOG_BUDGET_BLOCKS,
+        "a re-backlog of {BACKLOG_FRAMES} frames allocated {r_blocks} blocks (budget \
+         {BACKLOG_BUDGET_BLOCKS})"
+    );
+    assert!(
+        r_blocks + REBACKLOG_REUSE_SLACK_BLOCKS >= per_32,
+        "a re-backlog allocated only {r_blocks} blocks against {per_32} needed: tokio now keeps \
+         drained ring blocks, so the 'blocks are freed, every backlog allocates again' notes in \
+         pool_supervisor.rs and this file are stale and must be corrected"
+    );
+    for frame in rebacklog {
+        let got = ring_rx.try_recv().expect("re-backlog frame in ring");
+        assert_eq!(got.bytes, *frame, "ring must hand frames back in order");
+        budget.release(frame.len());
+    }
+    assert_eq!(budget.resident(), 0, "every reservation released");
+    persisted_target += BACKLOG_FRAMES as u64;
+    wait_persisted(&spill, persisted_target);
+    next += BACKLOG_FRAMES;
+
+    // ---- Arm C: the three shed arms. Each frame is still written to the WAL
+    // (an Arc bump) and marked unapplied and shed; nothing may allocate.
+    for (name, shed_sink) in [
+        ("bytes_full", &bytes_sink),
+        ("slots_full", &slots_sink),
+        ("try_send_full", &send_sink),
+    ] {
+        let (c_bytes, c_blocks) = dhat_support::measure_with_phantom_retry(
+            STEADY_BUDGET_BYTES,
+            STEADY_BUDGET_BLOCKS,
+            || {},
+            || {
+                for frame in &frames[next..next + SHED_FRAMES] {
+                    let outcome = shed_sink.accept(frame.clone());
+                    assert_eq!(outcome, FrameSinkOutcome::RingFull);
+                }
+                next += SHED_FRAMES;
+                persisted_target += SHED_FRAMES as u64;
+                wait_persisted(&spill, persisted_target);
+            },
+        );
+        eprintln!(
+            "dhat_wal_ring_sink_accept: shed arm {name}: {c_bytes} B / {c_blocks} blocks over \
+             {SHED_FRAMES} refused frames"
+        );
+        assert!(
+            c_bytes <= STEADY_BUDGET_BYTES && c_blocks <= STEADY_BUDGET_BLOCKS,
+            "the {name} shed arm of WalRingSink::accept allocated {c_bytes} B / {c_blocks} \
+             blocks over {SHED_FRAMES} frames (budget {STEADY_BUDGET_BYTES} B / \
+             {STEADY_BUDGET_BLOCKS} blocks)"
+        );
+    }
+    assert_eq!(bytes_budget.resident(), 0, "BytesFull hands its slot back");
+    assert_eq!(slots_budget.resident(), 0, "SlotsFull reserves nothing");
+    assert_eq!(
+        send_budget.resident(),
+        16,
+        "a refused try_send releases its reservation; only the filling frame is held"
+    );
 
     assert_eq!(spill.shutdown(Duration::from_secs(10)), 0);
     let _ = std::fs::remove_dir_all(&dir);

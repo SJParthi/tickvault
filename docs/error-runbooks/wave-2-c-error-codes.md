@@ -36,6 +36,26 @@ is unavailable the CloudWatch gauge keeps its last chronyc value, and the
 alarm treats missing data as not breaching. Step 2 of the triage below is
 kept as history; a container shares the host clock, so it never helps.
 
+**⚠ CORRECTED 2026-10-11 (review of CLOCK-3) — plain words, and one more
+case.**
+- **The CloudWatch clock alarm stays GREEN while the skew is unknown.** If
+  chrony is missing, stopped or not synchronised, nothing pages you. The
+  only signals are the BOOT-03 warning line in the log (field
+  `reason="probe_unavailable"`, at boot and then at 1, 2, 4, 8 … failed
+  re-samples) and the local gauge `tv_clock_skew_probe_available` = 0,
+  which is not shipped to CloudWatch. Paging on an unknown skew would need
+  an owner decision (a new shipped metric and alarm under the noise lock,
+  with a cost note); until then, this is an accepted limit.
+- **A running chronyd that never synchronised now counts as unavailable.**
+  It prints `Last offset : +0.000000000`, which used to read as exactly 0
+  skew. The probe now refuses a sample when `chronyc tracking` shows
+  `Leap status : Not synchronised` or a `Reference ID` of `00000000` /
+  `0.0.0.0`.
+- **Check on the box:** `chronyc tracking` — `Leap status` should read
+  `Normal` and `Reference ID` should name a source (on AWS,
+  `169.254.169.123`). If not, `sudo systemctl restart chronyd`, wait a
+  minute, check again.
+
 **Why this is a HALT, not a warn:**
 IST timestamp math + DEDUP UPSERT keys depend on accurate wall-clock.
 A ±2s skew can cross IST midnight, the 09:00:00 market-open gate, or

@@ -35,6 +35,33 @@
 //! * The child test functions run as ordinary tests too; without the
 //!   environment variable they return at once and do nothing.
 //! * Unix only: `Child::kill` is `SIGKILL` there.
+//!
+//! **⚠ CORRECTED 2026-10-11 (review of TEST-1).** Three statements above were
+//! too strong, and two gaps were closed:
+//!
+//! * "A torn record at the tail is skipped": a process kill cannot actually
+//!   tear a record in either floor. The seal spill writes each 128-byte record
+//!   with one `write(2)`; the frame WAL writes a whole batch (at most 257
+//!   records of 46 bytes, under its 256 KiB buffer) with one `write(2)` when it
+//!   flushes the batch, and the kernel finishes a regular-file write before it
+//!   delivers the kill. So the kill rounds prove "an exact, in-order prefix,
+//!   including everything confirmed on disk before the kill"; they do not
+//!   reach the torn-record path. That path is now proven directly by
+//!   `wal_replay_drops_a_record_cut_at_every_byte_of_the_tail`, which cuts a
+//!   real segment at every byte offset inside its last record. Records still
+//!   queued in the child's RAM when it dies are lost and are not counted.
+//! * The frame-WAL child used to sleep 100 ms after the writer counted the
+//!   prefix and assume it had reached the file. It now waits until
+//!   `wal_frame_fate::flushed_high_seq` (raised only after the buffer is
+//!   handed to the kernel) covers the last prefix record.
+//! * "The child test functions run as ordinary tests too": they now carry
+//!   `#[ignore]`, so a plain `cargo test` lists them as ignored instead of
+//!   reporting a vacuous pass; the parent runs them with `--ignored`.
+//! * The parent reads with `replay_all`, not the production
+//!   `replay_all_fenced`. Both reach the same reader
+//!   (`replay_all_with_report_guarded`); the fenced form only adds the
+//!   per-boot frame cap and the disk floor in front of it, and on a dev box
+//!   under that floor it would refuse to read at all.
 
 #![cfg(unix)]
 
@@ -45,7 +72,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tickvault_common::feed::Feed;
 use tickvault_storage::seal_spill::{SealSpillWriter, SerializedSeal};
-use tickvault_storage::ws_frame_spill::{AppendOutcome, WsFrameSpill, WsType, replay_all};
+use tickvault_storage::wal_frame_fate;
+use tickvault_storage::ws_frame_spill::{
+    AppendOutcome, WsFrameSpill, WsType, next_frame_seq, replay_all,
+};
 use tickvault_trading::candles::{BufferedSeal, LiveCandleState, TfIndex};
 
 /// Set only on the re-executed child; names the directory it writes into.
@@ -119,7 +149,13 @@ fn write_ready(dir: &Path) {
 fn run_and_kill(child: &str, dir: &Path, delay_ms: u64) {
     let exe = std::env::current_exe().expect("current test binary"); // APPROVED: test
     let mut proc = Command::new(exe)
-        .args(["--exact", child, "--nocapture", "--test-threads=1"])
+        .args([
+            "--exact",
+            child,
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
         .env(CHILD_DIR_ENV, dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -154,6 +190,7 @@ fn run_and_kill(child: &str, dir: &Path, delay_ms: u64) {
 /// Child half of the frame-WAL test. Does nothing unless re-executed by
 /// [`chaos_real_sigkill_ws_frame_wal_replays_an_exact_prefix`].
 #[test]
+#[ignore = "child half of chaos_wal_real_sigkill; run only by re-exec from its parent test"]
 fn chaos_kill_child_ws_frame_wal_writer() {
     let Some(dir) = std::env::var_os(CHILD_DIR_ENV) else {
         return;
@@ -162,34 +199,40 @@ fn chaos_kill_child_ws_frame_wal_writer() {
     let spill = WsFrameSpill::new(&dir).expect("WsFrameSpill::new"); // APPROVED: test
     let started = Instant::now();
     let mut marker: u32 = 0;
-    let append = |marker: u32| {
-        // A full channel refuses the frame; retry it so the written sequence
-        // has no holes (the parent checks for an exact prefix).
-        while spill.append(WsType::LiveFeed, live_feed_frame(marker)) == AppendOutcome::Dropped {
+    // Each frame gets its sequence ONCE; a refused append (full channel) is
+    // retried with the SAME sequence, so the written sequence has no holes
+    // (the parent checks for an exact prefix). Returns the sequence used.
+    let append = |marker: u32| -> u64 {
+        let seq = next_frame_seq();
+        while spill.append_with_seq(WsType::LiveFeed, live_feed_frame(marker), seq)
+            == AppendOutcome::Dropped
+        {
             std::thread::yield_now();
         }
+        seq
     };
+    let mut last_prefix_seq = 0u64;
     while marker < KNOWN_PREFIX {
-        append(marker);
+        last_prefix_seq = append(marker);
         marker += 1;
     }
-    // Wait until the writer thread has taken and written every prefix frame;
-    // it flushes each batch right after writing it, so a short pause after
-    // that puts the whole prefix in the file.
-    while spill.queued_records() != 0 || spill.persisted_count() < u64::from(KNOWN_PREFIX) {
+    // Wait until the writer has handed every prefix record to the kernel.
+    // `flushed_high_seq` is raised only after the buffer holding a record was
+    // flushed, so once it covers the last prefix sequence the whole prefix is
+    // in the file (page cache), which is what a process kill leaves intact.
+    while wal_frame_fate::flushed_high_seq() < last_prefix_seq {
         assert!(
             started.elapsed() < Duration::from_secs(CHILD_SAFETY_SECS),
-            "prefix never persisted"
+            "prefix never flushed"
         );
         std::thread::sleep(Duration::from_millis(1));
     }
-    std::thread::sleep(Duration::from_millis(100));
     write_ready(&dir);
     // Burst until killed.
     while marker < CHILD_SAFETY_RECORDS
         && started.elapsed() < Duration::from_secs(CHILD_SAFETY_SECS)
     {
-        append(marker);
+        let _seq = append(marker);
         marker += 1;
     }
     std::process::exit(CHILD_CAP_EXIT);
@@ -237,6 +280,7 @@ fn chaos_real_sigkill_ws_frame_wal_replays_an_exact_prefix() {
 /// Child half of the seal-spill test. Does nothing unless re-executed by
 /// [`chaos_real_sigkill_seal_spill_replays_an_exact_prefix`].
 #[test]
+#[ignore = "child half of chaos_wal_real_sigkill; run only by re-exec from its parent test"]
 fn chaos_kill_child_seal_spill_writer() {
     let Some(dir) = std::env::var_os(CHILD_DIR_ENV) else {
         return;
@@ -302,4 +346,84 @@ fn chaos_real_sigkill_seal_spill_replays_an_exact_prefix() {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+// ------------------------------------------------------- torn tail, directly
+
+/// A process kill cannot tear a WAL record (see the header), so the kill
+/// rounds above never reach the torn-tail path. This drives it directly: a
+/// real segment written by `WsFrameSpill` is cut at EVERY byte offset inside
+/// its last record, and the reader must return exactly the whole records
+/// before it, in order, byte for byte.
+#[test]
+fn wal_replay_drops_a_record_cut_at_every_byte_of_the_tail() {
+    const RECORDS: u32 = 64;
+    let src = temp_dir("torn-src");
+    {
+        let spill = WsFrameSpill::new(&src).expect("WsFrameSpill::new"); // APPROVED: test
+        for marker in 0..RECORDS {
+            let seq = next_frame_seq();
+            while spill.append_with_seq(WsType::LiveFeed, live_feed_frame(marker), seq)
+                == AppendOutcome::Dropped
+            {
+                std::thread::yield_now();
+            }
+        }
+        assert_eq!(
+            spill.shutdown(Duration::from_secs(10)),
+            0,
+            "every record reached the segment"
+        );
+    }
+    let mut segments: Vec<PathBuf> = std::fs::read_dir(&src)
+        .expect("read WAL dir") // APPROVED: test
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "wal"))
+        .collect();
+    segments.sort();
+    assert_eq!(segments.len(), 1, "one segment expected: {segments:?}");
+    let segment = &segments[0];
+    let name = segment.file_name().expect("segment name").to_owned(); // APPROVED: test
+    let bytes = std::fs::read(segment).expect("read segment"); // APPROVED: test
+    assert_eq!(
+        bytes.len() % RECORDS as usize,
+        0,
+        "{} bytes is not {RECORDS} equal records",
+        bytes.len()
+    );
+    let record_len = bytes.len() / RECORDS as usize;
+    assert!(
+        record_len > 16,
+        "a record carries a header: {record_len} bytes"
+    );
+
+    let whole = bytes.len() - record_len;
+    for keep in whole..bytes.len() {
+        let dir = temp_dir("torn-cut");
+        std::fs::write(dir.join(&name), &bytes[..keep]).expect("write cut segment"); // APPROVED: test
+        let recovered = replay_all(&dir).expect("replay_all on a torn tail"); // APPROVED: test
+        assert_eq!(
+            recovered.len(),
+            RECORDS as usize - 1,
+            "cut at {} of {record_len} bytes into the last record: wrong frame count",
+            keep - whole
+        );
+        for (i, frame) in recovered.iter().enumerate() {
+            let expected = live_feed_frame(u32::try_from(i).expect("index fits u32")); // APPROVED: test
+            assert_eq!(
+                frame.frame,
+                expected,
+                "cut at {} bytes into the last record: frame {i} is not the frame written there",
+                keep - whole
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    eprintln!(
+        "chaos_real_sigkill (frame WAL): {record_len} cuts inside the last {record_len}-byte \
+         record each returned the {} whole records before it",
+        RECORDS - 1
+    );
+    let _ = std::fs::remove_dir_all(&src);
 }

@@ -194,8 +194,12 @@ async fn test_enforce_clock_skew_at_boot_unavailable_does_not_halt() {
 /// once at boot. Smoke test: returns either Ok(sample) or
 /// `Unavailable` against an unreachable QuestDB. Never panics.
 /// Named to satisfy the pub-fn-test-guard regex `test.*probe_clock_skew`.
+///
+/// ⚠ CORRECTED 2026-10-11 (audit CLOCK-3): QuestDB plays no part any more;
+/// the probe reads `chronyc` only. Renamed from
+/// `test_probe_clock_skew_smoke_against_unreachable_questdb`.
 #[tokio::test]
-async fn test_probe_clock_skew_smoke_against_unreachable_questdb() {
+async fn test_probe_clock_skew_smoke_chronyc_only() {
     let result = tickvault_app::infra::probe_clock_skew().await;
     match result {
         Ok(sample) => {

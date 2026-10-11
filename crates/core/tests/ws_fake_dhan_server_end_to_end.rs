@@ -128,6 +128,10 @@ struct SeenConnection {
     path: String,
     query: String,
     subscribes: Vec<serde_json::Value>,
+    /// Every text message the client sent AFTER the subscribe covered the
+    /// held set (2026-10-11 review): an extra subscribe, a repeat or any
+    /// other JSON would otherwise be drained and ignored.
+    late_texts: Vec<String>,
 }
 
 /// Accepts one upgrade, records the request target, reads subscribe messages
@@ -158,6 +162,7 @@ async fn serve_one(listener: &TcpListener, frames: Vec<Vec<u8>>) -> SeenConnecti
         path,
         query,
         subscribes: Vec::new(),
+        late_texts: Vec::new(),
     };
     let want = held_instruments().len();
     let mut covered = 0usize;
@@ -182,7 +187,12 @@ async fn serve_one(listener: &TcpListener, frames: Vec<Vec<u8>>) -> SeenConnecti
             .expect("send frame"); // APPROVED: test
     }
     // Hold the socket open; the client closes it after the disconnect packet.
-    while let Some(Ok(_)) = ws.next().await {}
+    // Record any text it sends meanwhile; the test asserts there is none.
+    while let Some(Ok(message)) = ws.next().await {
+        if let Message::Text(text) = message {
+            seen.late_texts.push(text.as_str().to_string());
+        }
+    }
     seen
 }
 
@@ -199,6 +209,11 @@ fn temp_wal_dir() -> std::path::PathBuf {
 
 /// Checks one connection's subscribe messages against the held set.
 fn assert_subscribes(conn: usize, seen: &SeenConnection) {
+    assert!(
+        seen.late_texts.is_empty(),
+        "conn {conn}: the client sent text after its subscribe covered the held set: {:?}",
+        seen.late_texts
+    );
     let mut derivatives = 0usize;
     let mut indices = 0usize;
     for message in &seen.subscribes {

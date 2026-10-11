@@ -81,6 +81,17 @@
 //! 10,000 frames in steady state, and 127 blocks for a 4,096-frame backlog.
 //! Removing the backlog allocation needs a pre-allocated array channel for the
 //! ring (as audit N2 did for the seal queue); that is a separate change.
+//!
+//! **⚠ CORRECTED 2026-10-11 (review of HOT-1) — the blocks are NOT reused.**
+//! The note above said the backlog blocks are "reused once the drain catches
+//! up". In tokio 1.53.2 the receiver hands each drained block back with
+//! `reclaim_block`, which tries to re-link it after the tail at most 3 times
+//! and FREES it otherwise; `reclaim_blocks` also yields once per block. So
+//! only about 3 spare blocks survive a drain, and EVERY backlog episode
+//! allocates again: about one block per 32 queued frames, up to 2,048 blocks,
+//! and the drain pays one free per block. Per frame this is O(1) on average;
+//! it is not zero allocation. Measured by the re-backlog phase of
+//! `dhat_wal_ring_sink_accept.rs`.
 
 use std::time::{Duration, Instant};
 

@@ -4708,11 +4708,13 @@ async fn build_shared_infra(
             ));
         }
         Err(unavailable) => {
-            // chronyc failed (no chrony, or chronyd stopped) — degrade, do NOT
+            // chronyc failed (no chrony, chronyd stopped, or chronyd not
+            // synchronised to any source) — degrade, do NOT
             // halt. Dev boxes without chrony still boot. The skew is UNKNOWN,
             // not a number (audit CLOCK-3, 2026-10-11).
             warn!(
                 code = tickvault_common::error_code::ErrorCode::Boot03ClockSkewExceeded.code_str(),
+                reason = "probe_unavailable",
                 error = %unavailable,
                 "BOOT-03: clock-skew probe unavailable — proceeding without the gate; \
                  the skew is unknown until chronyc answers"

@@ -546,18 +546,13 @@ impl std::fmt::Display for ClockSkewError {
 
 impl std::error::Error for ClockSkewError {}
 
-/// Reads `chronyc tracking` and parses the `Last offset` line.
+/// Reads `chronyc tracking` and parses it with [`parse_chronyc_tracking`].
 ///
 /// Security review: `Command::new` + `args(&[...])` with a STATIC slice.
 /// No string interpolation, no shell, no env passthrough — argv cannot
 /// be influenced by external input. The `chronyc` binary itself comes
 /// from the host (Docker bind-mount) and is trusted. On hosts without
 /// chrony installed, this returns `Err` and the caller falls through.
-///
-/// `Last offset` line format:
-/// ```text
-/// Last offset     : -0.000007441 seconds
-/// ```
 fn probe_via_chronyc() -> Result<ClockSkewSample, String> {
     // STATIC argv — argv is a `&[&str; 1]` literal. Security-reviewed:
     // never mix in user input, never `format!`, never `env` passthrough.
@@ -573,28 +568,67 @@ fn probe_via_chronyc() -> Result<ClockSkewSample, String> {
         ));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_chronyc_tracking(&stdout)
+}
+
+/// Parses `chronyc tracking` output into a skew sample.
+///
+/// `Last offset` line format:
+/// ```text
+/// Last offset     : -0.000007441 seconds
+/// ```
+///
+/// **⚠ CORRECTED 2026-10-11 (audit CLOCK-3, follow-up).** This used to read
+/// `Last offset` alone. A chronyd that is running but has never synchronised
+/// (no reachable NTP source) still prints `Last offset : +0.000000000
+/// seconds`, so a free-running clock read as exactly 0 skew and passed the
+/// boot gate and the alarm. The sample is now refused when the output shows
+/// the daemon is not synchronised: `Leap status : Not synchronised`, or a
+/// `Reference ID` of `00000000` / `0.0.0.0` (no source selected). A refused
+/// sample is `Err`, so the caller reports skew as unknown rather than 0.
+fn parse_chronyc_tracking(stdout: &str) -> Result<ClockSkewSample, String> {
+    let mut offset: Option<f64> = None;
     for line in stdout.lines() {
         // Tolerate locale variants — match prefix only.
         let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("Last offset") {
-            // After the colon, the value is `<sign?>0.NNNNN seconds`.
-            let after_colon = rest.split(':').nth(1).ok_or_else(|| {
-                format!("chronyc tracking 'Last offset' line malformed: {trimmed}")
-            })?;
-            let value = after_colon
+        let Some((key, after_colon)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        let value_text = after_colon.trim();
+        if key.eq_ignore_ascii_case("Leap status")
+            && value_text.to_ascii_lowercase().contains("not synchronised")
+        {
+            return Err(format!(
+                "chronyc tracking reports the clock is not synchronised: {trimmed}"
+            ));
+        }
+        if key.eq_ignore_ascii_case("Reference ID") {
+            let reference = value_text.split_whitespace().next().unwrap_or("");
+            if reference.is_empty() || reference == "00000000" || reference == "0.0.0.0" {
+                return Err(format!(
+                    "chronyc tracking has no selected time source: {trimmed}"
+                ));
+            }
+        }
+        if key == "Last offset" {
+            let value = value_text
                 .split_whitespace()
                 .next()
                 .ok_or_else(|| format!("chronyc tracking value missing: {trimmed}"))?;
             let skew_secs: f64 = value
                 .parse()
                 .map_err(|e| format!("chronyc tracking value not f64 ('{value}'): {e}"))?;
-            return Ok(ClockSkewSample {
-                skew_secs,
-                source: "chronyc",
-            });
+            offset = Some(skew_secs);
         }
     }
-    Err("chronyc tracking did not contain a 'Last offset' line".to_string())
+    match offset {
+        Some(skew_secs) => Ok(ClockSkewSample {
+            skew_secs,
+            source: "chronyc",
+        }),
+        None => Err("chronyc tracking did not contain a 'Last offset' line".to_string()),
+    }
 }
 
 /// Text placed in `ClockSkewError::Unavailable { fallback }` when `chronyc`
@@ -731,6 +765,7 @@ async fn run_clock_skew_loop(interval: Duration) {
                     warn!(
                         code = tickvault_common::error_code::ErrorCode::Boot03ClockSkewExceeded
                             .code_str(),
+                        reason = "probe_unavailable",
                         consecutive_failures = failures,
                         error = %err,
                         "clock-skew re-sample FAILED — tv_clock_skew_seconds is now \
@@ -3078,5 +3113,93 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A synchronised `chronyc tracking` output (Amazon Time Sync shape).
+    const CHRONYC_SYNCED: &str = "Reference ID    : A9FEA97B (169.254.169.123)\n\
+Stratum         : 4\n\
+Ref time (UTC)  : Sun Oct 11 03:00:00 2026\n\
+System time     : 0.000001234 seconds fast of NTP time\n\
+Last offset     : -0.000007441 seconds\n\
+RMS offset      : 0.000012000 seconds\n\
+Frequency       : 12.345 ppm slow\n\
+Leap status     : Normal\n";
+
+    /// A running chronyd that has never synchronised: `Last offset` reads 0.
+    const CHRONYC_UNSYNCED: &str = "Reference ID    : 00000000 ()\n\
+Stratum         : 0\n\
+Ref time (UTC)  : Thu Jan 01 00:00:00 1970\n\
+System time     : 0.000000000 seconds slow of NTP time\n\
+Last offset     : +0.000000000 seconds\n\
+RMS offset      : 0.000000000 seconds\n\
+Frequency       : 0.000 ppm slow\n\
+Leap status     : Not synchronised\n";
+
+    #[test]
+    fn test_parse_chronyc_tracking_reads_last_offset_when_synchronised() {
+        let sample = parse_chronyc_tracking(CHRONYC_SYNCED).expect("synced sample"); // APPROVED: test
+        assert_eq!(sample.source, "chronyc");
+        assert!((sample.skew_secs - (-0.000_007_441)).abs() < 1e-12);
+    }
+
+    // Regression: 2026-10-11 — an unsynchronised chronyd printed
+    // `Last offset : +0.000000000` and read as exactly 0 skew (audit CLOCK-3).
+    #[test]
+    fn test_regression_clock3_parse_chronyc_tracking_refuses_an_unsynchronised_daemon() {
+        let err = parse_chronyc_tracking(CHRONYC_UNSYNCED)
+            .expect_err("unsynchronised chronyd must not yield a 0 skew"); // APPROVED: test
+        assert!(
+            err.contains("no selected time source") || err.contains("not synchronised"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_chronyc_tracking_refuses_leap_status_not_synchronised_alone() {
+        // A non-zero reference id, but the leap status says unsynchronised.
+        let text = CHRONYC_SYNCED.replace(
+            "Leap status     : Normal",
+            "Leap status     : Not synchronised",
+        );
+        let err = parse_chronyc_tracking(&text).expect_err("must refuse"); // APPROVED: test
+        assert!(err.contains("not synchronised"), "{err}");
+    }
+
+    #[test]
+    fn test_parse_chronyc_tracking_refuses_a_zero_dotted_reference_id() {
+        let text = CHRONYC_SYNCED.replace("A9FEA97B (169.254.169.123)", "0.0.0.0 ()");
+        let err = parse_chronyc_tracking(&text).expect_err("must refuse"); // APPROVED: test
+        assert!(err.contains("no selected time source"), "{err}");
+    }
+
+    #[test]
+    fn test_parse_chronyc_tracking_errors_without_last_offset_or_on_garbage() {
+        let missing = CHRONYC_SYNCED.replace("Last offset     : -0.000007441 seconds\n", "");
+        assert!(parse_chronyc_tracking(&missing).is_err());
+        let garbage = CHRONYC_SYNCED.replace("-0.000007441", "abc");
+        assert!(parse_chronyc_tracking(&garbage).is_err());
+        assert!(parse_chronyc_tracking("").is_err());
+    }
+
+    /// Source scan on `main.rs`: the BOOT-03 `Err(unavailable)` arm must still
+    /// start the poller, so a chronyd that comes back later is measured
+    /// (audit CLOCK-3 follow-up, 2026-10-11).
+    #[test]
+    fn test_boot03_unavailable_arm_starts_the_clock_skew_poller() {
+        let main = include_str!("main.rs");
+        let start = main
+            .find("Err(unavailable) => {")
+            .expect("main.rs BOOT-03 unavailable arm"); // APPROVED: test
+        let arm = &main[start..];
+        let end = arm.find("\n        }\n    }\n").expect("arm end"); // APPROVED: test
+        let arm = &arm[..end];
+        assert!(
+            arm.contains("infra::spawn_clock_skew_poller("),
+            "the BOOT-03 unavailable arm no longer starts the clock-skew poller"
+        );
+        assert!(
+            arm.contains("reason = \"probe_unavailable\""),
+            "the BOOT-03 unavailable warn lost its reason field"
+        );
     }
 }

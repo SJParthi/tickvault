@@ -884,6 +884,12 @@ rules:
       `chronyc -a makestep` and restart. Never auto-action — clock
       drift is symptomatic of NTP / hardware / hypervisor issues
       that need human triage.
+      ⚠ CORRECTED 2026-10-11 (audit CLOCK-3): the trusted source is
+      chronyc ONLY since 2026-10-11; the QuestDB now() fallback named
+      above was removed because QuestDB shares this host's clock. A
+      BOOT-03 warn with reason="probe_unavailable" means skew is UNKNOWN
+      (no chrony, chronyd stopped, or chronyd not synchronised), not a
+      halt; the boot proceeds.
 
   - name: audit-02-depth-rebalance-write-failed-escalate
     match:
