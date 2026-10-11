@@ -663,6 +663,28 @@ static SLOT_LAST_FRAME_WALL_MS: [PaddedI64; GHOST_REDIAL_SLOTS] =
 static SLOT_FRAME_GAP_PEAK_MS: [std::sync::atomic::AtomicU64; GHOST_REDIAL_SLOTS] =
     [const { std::sync::atomic::AtomicU64::new(0) }; GHOST_REDIAL_SLOTS];
 
+/// Each slot's last subscribe-acknowledged wall time in ms (0 = never), on
+/// the same clock as [`SLOT_LAST_FRAME_WALL_MS`] (plan item PR54).
+///
+/// Stamped once per dial, at `SubscribeAcked` (one relaxed store, never per
+/// frame). The app reads it to age a socket that subscribed but has never
+/// delivered a frame, so a depth-20 socket dark from its first dial reaches
+/// the deaf-socket gauge instead of being skipped as "never ticked". Not
+/// cleared on a close, matching the last-frame stamp: a socket that parks
+/// keeps ageing either way.
+static SLOT_SUBSCRIBED_WALL_MS: [std::sync::atomic::AtomicI64; GHOST_REDIAL_SLOTS] =
+    [const { std::sync::atomic::AtomicI64::new(0) }; GHOST_REDIAL_SLOTS];
+
+/// A slot's last subscribe-ack wall time in ms, `None` if it never subscribed
+/// or the index is out of range. One relaxed load.
+#[must_use]
+pub fn subscribed_wall_ms(connection_index: u8) -> Option<i64> {
+    SLOT_SUBSCRIBED_WALL_MS
+        .get(usize::from(connection_index))
+        .map(|s| s.load(std::sync::atomic::Ordering::Relaxed))
+        .filter(|v| *v > 0)
+}
+
 /// Wall clock in ms since the Unix epoch, read through the WAL's receipt
 /// anchor: the same UTC clock every captured frame is stamped with, so a
 /// slot's stamp, a depth-200 hold time and the drain's tick receipts all
@@ -5082,6 +5104,13 @@ impl ConnectionSupervisor {
             ConnEvent::SubscribeAcked => {
                 self.phase = ConnPhase::Live;
                 self.watchdog.record_activity(now);
+                // PR54: when this socket last subscribed, so a socket that never
+                // delivers a frame still ages on the deaf-socket gauge.
+                if let Some(stamp) =
+                    SLOT_SUBSCRIBED_WALL_MS.get(usize::from(self.slot.global_index))
+                {
+                    stamp.store(wall_clock_ms(), std::sync::atomic::Ordering::Relaxed);
+                }
                 // The frame clock starts at the ack, not at the dial: a slow
                 // paced subscribe must not eat into the silence window.
                 self.last_frame_at = now;
@@ -5182,9 +5211,15 @@ impl ConnectionSupervisor {
             // `proven_healthy`: those mean "this connection delivered market
             // data", and a socket that only pings has delivered none. Letting
             // a keep-alive claim health would hide a silently-failed subscribe
-            // behind a heartbeat. That condition has its own detector — the
-            // 30s silence scan (RISK-GAP-03), which is market-hours gated so
-            // the legitimately silent pre-open never pages.
+            // behind a heartbeat. That condition has its own detectors: the
+            // app's deaf-socket gauge, which ages a socket from its last frame
+            // or, if it never delivered, from its subscribe ack (PR54; main
+            // feed and depth-20, alarm gated to market hours), and the 30 s
+            // silence scan (RISK-GAP-03). That scan is keyed by INSTRUMENT, so a
+            // contract the main feed also carries reads alive however dead its
+            // depth socket is: it does not cover a depth socket. A depth-200
+            // socket holds one contract whose silence is not a socket fault;
+            // its 900 s backstop and cross-feed check cover it.
             ConnEvent::KeepAliveReceived => {
                 self.watchdog.record_activity(now);
                 SupervisorAction::Continue
@@ -26416,6 +26451,22 @@ mod frame_silence_evidence_tests {
         assert!(last_frame_wall_ms(idx).unwrap_or(0) >= first);
         assert_eq!(last_frame_wall_ms(200), None);
         assert_eq!(snapshot_frame_activity().len(), GHOST_REDIAL_SLOTS);
+    }
+
+    #[test]
+    fn test_subscribed_wall_ms_is_stamped_at_the_subscribe_ack() {
+        // PR54: the deaf-socket gauge ages a never-delivering socket from its
+        // subscribe. The stamp is taken at the ack, before any frame.
+        let idx = 28;
+        let t = t0();
+        let mut s = ConnectionSupervisor::new(slot_at(DhanEndpointType::Depth20, idx), t);
+        let _ = s.on_event(ConnEvent::BeginDial, t);
+        let _ = s.on_event(ConnEvent::DialSucceeded, t);
+        let before = wall_clock_ms();
+        let _ = s.on_event(ConnEvent::SubscribeAcked, t);
+        let stamp = subscribed_wall_ms(idx).expect("stamped at the subscribe ack");
+        assert!(stamp >= before, "the stamp is the ack's wall time");
+        assert_eq!(subscribed_wall_ms(200), None, "out of range reads None");
     }
 
     #[test]
