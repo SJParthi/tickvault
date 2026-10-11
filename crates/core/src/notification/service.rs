@@ -120,6 +120,13 @@ pub struct NotificationService {
     boot_dispatch_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
+/// Whether the `TICKVAULT_ALLOW_NOOP_NOTIFIER` value turns the strict-mode
+/// override on. Only exactly `1` does (audit INP-16, 2026-10-11): `0`,
+/// `false` or an empty value no longer count as "set".
+fn noop_override_value_allows(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
 impl NotificationService {
     /// Internal helper — every constructor funnels through here so the
     /// field defaults live in one place. Adding a new field to the struct
@@ -301,6 +308,10 @@ impl NotificationService {
     /// Escape hatch: set `TICKVAULT_ALLOW_NOOP_NOTIFIER=1` to allow no-op
     /// mode (used by tests and dev runs without SSM access).
     ///
+    /// ⚠ CORRECTED 2026-10-11 (audit INP-16): the value must be exactly `1`.
+    /// Until this date any value was accepted, so `=0` or `=false` turned the
+    /// override ON. Any other value is ignored with a `warn!`.
+    ///
     /// # Errors
     ///
     /// Returns `Err(String)` with a human-readable reason if any of the
@@ -327,12 +338,19 @@ impl NotificationService {
         if service.is_active() {
             return Ok(service);
         }
-        if std::env::var("TICKVAULT_ALLOW_NOOP_NOTIFIER").is_ok() {
+        let override_value = std::env::var("TICKVAULT_ALLOW_NOOP_NOTIFIER").ok();
+        if noop_override_value_allows(override_value.as_deref()) {
             warn!(
                 "notification: strict mode overridden by TICKVAULT_ALLOW_NOOP_NOTIFIER — \
                  running in no-op mode (dev/test only)"
             );
             return Ok(service);
+        }
+        if override_value.is_some() {
+            warn!(
+                "notification: TICKVAULT_ALLOW_NOOP_NOTIFIER is set but not to 1 — \
+                 ignored, strict mode refuses the no-op notifier"
+            );
         }
         Err("NotificationService fell back to no-op mode. \
              SSM is unreachable or Telegram credentials are missing. \
@@ -2733,6 +2751,35 @@ mod tests {
             refuse_again.is_err(),
             "Phase 3: cleanup must restore the refuse path"
         );
+
+        // Phase 4 (audit INP-16, 2026-10-11): `=0` must NOT turn the
+        // override on. Until that date any value did.
+        // SAFETY: setting an env var is safe.
+        unsafe {
+            std::env::set_var("TICKVAULT_ALLOW_NOOP_NOTIFIER", "0");
+        }
+        let zero_result = NotificationService::enforce_strict(NotificationService::disabled());
+        // SAFETY: clean up so other tests don't inherit the value.
+        unsafe {
+            std::env::remove_var("TICKVAULT_ALLOW_NOOP_NOTIFIER");
+        }
+        assert!(
+            zero_result.is_err(),
+            "Phase 4: TICKVAULT_ALLOW_NOOP_NOTIFIER=0 must not override strict mode"
+        );
+    }
+
+    /// Audit INP-16 (2026-10-11): only exactly `1` turns the override on.
+    #[test]
+    fn test_noop_override_requires_exactly_one() {
+        assert!(noop_override_value_allows(Some("1")));
+        for value in ["0", "false", "", " 1", "1 ", "true", "yes", "01", "11"] {
+            assert!(
+                !noop_override_value_allows(Some(value)),
+                "value {value:?} must not turn the override on"
+            );
+        }
+        assert!(!noop_override_value_allows(None));
     }
 
     #[test]

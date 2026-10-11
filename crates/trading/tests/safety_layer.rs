@@ -1139,11 +1139,14 @@ mod proptest_oms_state_machine {
         fn random_strings_parse_to_none(
             s in "[a-z]{1,20}",
         ) {
-            // All valid Dhan statuses are UPPERCASE or specific mixed case
-            // Lowercase random strings should never match
-            prop_assert!(
-                parse_order_status(&s).is_none(),
-                "Random lowercase string '{}' must parse to None",
+            // Matching ignores ASCII case since 2026-10-11 (audit INP-7), so a
+            // lowercase string parses exactly when its uppercase form does;
+            // every other lowercase string must parse to None.
+            let upper = s.to_ascii_uppercase();
+            prop_assert_eq!(
+                parse_order_status(&s),
+                parse_order_status(&upper),
+                "lowercase '{}' must parse exactly like its uppercase form",
                 s,
             );
         }

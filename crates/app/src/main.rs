@@ -38,7 +38,7 @@
 
 // Modules are declared in lib.rs for coverage instrumentation.
 use tickvault_app::boot_helpers::{
-    CONFIG_BASE_PATH, CONFIG_LOCAL_PATH, IstTimer, check_clock_drift, compute_market_close_sleep,
+    CONFIG_BASE_PATH, IstTimer, check_clock_drift, compute_market_close_sleep,
     create_error_log_writer, format_bind_addr, should_emit_post_market_alert,
 };
 use tickvault_app::{host_limits, infra, observability, subsystem_memory};
@@ -46,8 +46,6 @@ use tickvault_app::{host_limits, infra, observability, subsystem_memory};
 use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
-use figment::Figment;
-use figment::providers::{Format, Toml};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -113,6 +111,10 @@ fn trading_day_gate_exit_code(is_trading_day: bool) -> i32 {
 /// treats as "let the app start" — so the gate can NEVER stop the box on a real
 /// trading day because of a transient load failure. Single source of truth: the
 /// SAME `config/base.toml` NSE holiday list the app itself uses (no duplication).
+/// **⚠ CORRECTED 2026-10-11 (audit INP-14):** "the same list" was true only
+/// while no `config/<env>.toml` set one: the gate merged base and local, the
+/// boot merged base, `config/<env>.toml` and local. Both now read
+/// `boot_helpers::layered_config_figment`, the same layered config.
 fn run_trading_day_gate() -> ! {
     std::process::exit(trading_day_gate_code());
 }
@@ -123,10 +125,13 @@ const TRADING_DAY_GATE_LOAD_ERROR_EXIT: i32 = 70;
 /// The `--check-trading-day` verdict as an exit code, without exiting, so the
 /// in-process holiday gate asks the very same question.
 fn trading_day_gate_code() -> i32 {
-    let config: ApplicationConfig = match Figment::new()
-        .merge(Toml::file(CONFIG_BASE_PATH))
-        .merge(Toml::file(CONFIG_LOCAL_PATH))
-        .extract()
+    // AUDIT INP-14 (2026-10-11): the same layered merge as the boot (base,
+    // then config/<env>.toml, then local). Until this date the gate skipped
+    // the env file.
+    let config: ApplicationConfig = match tickvault_app::boot_helpers::layered_config_figment(
+        &tickvault_app::boot_helpers::resolve_config_env(),
+    )
+    .extract()
     {
         Ok(c) => c,
         // FAIL-OPEN on load error (exit 70 → gate lets the app start).
@@ -816,15 +821,14 @@ async fn async_main() -> Result<()> {
     // ENVIRONMENT, the SAME variable secret_manager uses for the SSM prefix, so
     // config + secrets always agree. For dev/local there is no override file,
     // so this is byte-identical to the previous base + local behaviour.
+    // Since 2026-10-11 (audit INP-14) the merge lives in
+    // `boot_helpers::layered_config_figment`, shared with the
+    // `--check-trading-day` gate so the two can never read different files.
     let config_env = tickvault_app::boot_helpers::resolve_config_env();
-    let mut config_figment = Figment::new().merge(Toml::file(CONFIG_BASE_PATH));
-    if let Some(env_path) = tickvault_app::boot_helpers::config_env_path(&config_env) {
-        config_figment = config_figment.merge(Toml::file(env_path));
-    }
-    let mut config: ApplicationConfig = config_figment
-        .merge(Toml::file(CONFIG_LOCAL_PATH))
-        .extract()
-        .context("failed to load configuration from config/base.toml")?;
+    let mut config: ApplicationConfig =
+        tickvault_app::boot_helpers::layered_config_figment(&config_env)
+            .extract()
+            .context("failed to load configuration from config/base.toml")?;
 
     config
         .validate()

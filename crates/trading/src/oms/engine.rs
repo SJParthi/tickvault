@@ -36,7 +36,10 @@ use super::idempotency::CorrelationTracker;
 use super::order_readiness::{OrderReadinessState, ReadinessRefusal, evaluate_order_readiness};
 use super::rate_limiter::{OrderBudget, OrderRateLimiter};
 use super::reconciliation::reconcile_orders;
-use super::state_machine::{is_valid_transition, parse_order_status};
+use super::state_machine::{
+    UNKNOWN_ORDER_STATUS_COUNTER, UNKNOWN_STATUS_LOG_MAX_CHARS, is_valid_transition,
+    parse_order_status,
+};
 use super::types::{
     DhanForeverOrderRequest, DhanModifyOrderRequest, DhanModifySuperOrderRequest,
     DhanPlaceOrderRequest, DhanPlaceSuperOrderRequest, DhanSuperOrderResponse,
@@ -1276,11 +1279,29 @@ impl OrderManagementSystem {
         let new_status = match parse_order_status(&update.status) {
             Some(status) => status,
             None => {
-                warn!(
+                // AUDIT INP-7 (2026-10-11): this was an uncoded `warn!` with
+                // no counter and no flag, so a fill under a status spelling we
+                // did not know stayed invisible until the next reconcile. Now
+                // it is counted, logged with OMS-GAP-01 (no CloudWatch filter,
+                // so no page) and the order is flagged for reconciliation, the
+                // same shape as the invalid-transition arm below. Cold: only
+                // an unknown status allocates, for the bounded log copy.
+                counter!(UNKNOWN_ORDER_STATUS_COUNTER).increment(1);
+                let shown_status: String = update
+                    .status
+                    .chars()
+                    .take(UNKNOWN_STATUS_LOG_MAX_CHARS)
+                    .collect();
+                error!(
+                    code = ErrorCode::OmsGapStateMachine.code_str(),
+                    source = "unknown_status",
                     order_id = %order_id,
-                    status = %update.status,
-                    "unknown order status in WebSocket update"
+                    status = %shown_status,
+                    "unknown order status in WebSocket update — order flagged for reconciliation"
                 );
+                if let Some(order) = self.orders.get_mut(&order_id) {
+                    order.needs_reconciliation = true;
+                }
                 return Ok(None);
             }
         };
@@ -5623,6 +5644,38 @@ mod tests {
         );
         // Original status should be unchanged
         assert_eq!(oms.order("1").unwrap().status, OrderStatus::Pending);
+    }
+
+    #[test]
+    fn handle_update_unknown_status_flags_needs_reconciliation() {
+        // Audit INP-7 (2026-10-11): an unknown status is no longer a silent
+        // skip — the order is flagged so the next reconcile looks at it.
+        let mut oms = make_oms_with_order("1", OrderStatus::Confirmed);
+        assert!(!oms.order("1").unwrap().needs_reconciliation);
+        let update = make_order_update("1", "WEIRD");
+        let result = oms.handle_order_update(&update);
+        assert!(matches!(result, Ok(None)));
+        let order = oms.order("1").unwrap();
+        assert_eq!(order.status, OrderStatus::Confirmed, "status unchanged");
+        assert!(
+            order.needs_reconciliation,
+            "an unknown status must flag the order for reconciliation"
+        );
+    }
+
+    #[test]
+    fn handle_order_update_accepts_mixed_case_traded_and_emits_the_fill() {
+        // Audit INP-7 (2026-10-11): the vendor spells statuses in mixed case
+        // ("Cancelled" in its own example); "Traded" must fill, not vanish.
+        let mut oms = make_oms_with_order("1", OrderStatus::Pending);
+        let mut update = make_order_update("1", "Traded");
+        update.traded_qty = 50;
+        update.avg_traded_price = 250.0;
+        let result = oms.handle_order_update(&update).expect("valid transition");
+        assert!(result.is_some(), "a mixed-case TRADED must emit a fill");
+        let order = oms.order("1").unwrap();
+        assert_eq!(order.status, OrderStatus::Traded);
+        assert!(!order.needs_reconciliation);
     }
 
     // -----------------------------------------------------------------------

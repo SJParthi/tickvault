@@ -95,6 +95,24 @@ pub fn config_env_path(env: &str) -> Option<String> {
     Some(format!("config/{file_stem}.toml"))
 }
 
+/// The layered configuration the app boots from: `config/base.toml`, then
+/// `config/<env>.toml` ([`config_env_path`]), then `config/local.toml`, last
+/// write wins.
+///
+/// ADDED 2026-10-11 (audit INP-14). The boot and the `--check-trading-day`
+/// gate each built their own merge, and the gate's skipped the env file, so
+/// a holiday list in `config/production.toml` would have reached the app and
+/// not the gate. Both now call this. Boot-only, O(1); nothing is read until
+/// the caller extracts.
+pub fn layered_config_figment(config_env: &str) -> figment::Figment {
+    use figment::providers::{Format, Toml};
+    let mut layered = figment::Figment::new().merge(Toml::file(CONFIG_BASE_PATH));
+    if let Some(env_path) = config_env_path(config_env) {
+        layered = layered.merge(Toml::file(env_path));
+    }
+    layered.merge(Toml::file(CONFIG_LOCAL_PATH))
+}
+
 // ---------------------------------------------------------------------------
 // IST timestamp formatter for tracing-subscriber
 // ---------------------------------------------------------------------------
@@ -1266,6 +1284,48 @@ mod tests {
         assert!(
             should_emit_post_market_alert(&cal, monday),
             "regular trading day must fire the Post-Market alert"
+        );
+    }
+
+    /// Audit INP-14 (2026-10-11): the env file sits between base and local.
+    /// `config/base.toml` sets `notification.sns_enabled = false` and
+    /// `config/production.toml` sets it `true`; a merge that skips the env
+    /// file reads `false` for prod.
+    #[test]
+    fn test_layered_config_figment_merges_the_env_file_between_base_and_local() {
+        let prod: bool = layered_config_figment("prod")
+            .extract_inner("notification.sns_enabled")
+            .expect("prod layered config must carry notification.sns_enabled");
+        let dev: bool = layered_config_figment("dev")
+            .extract_inner("notification.sns_enabled")
+            .expect("dev layered config must carry notification.sns_enabled");
+        assert!(prod, "prod must read config/production.toml over base");
+        assert!(!dev, "dev must not read config/production.toml");
+    }
+
+    /// Audit INP-14 (2026-10-11): the `--check-trading-day` gate and the boot
+    /// read the SAME layered config, so a holiday list in the env file
+    /// reaches both. Source scan of `main.rs`.
+    #[test]
+    fn test_trading_day_gate_reads_the_same_layered_config_as_the_boot() {
+        let src = include_str!("main.rs");
+        let gate_start = src
+            .find("fn trading_day_gate_code")
+            .expect("main.rs must define trading_day_gate_code");
+        let gate_body = &src[gate_start..];
+        let gate_end = gate_body.find("\n}\n").unwrap_or(gate_body.len());
+        let gate_body = &gate_body[..gate_end];
+        assert!(
+            gate_body.contains("layered_config_figment"),
+            "the trading-day gate must build its config with layered_config_figment"
+        );
+        assert!(
+            !gate_body.contains("Figment::new()"),
+            "the trading-day gate must not build a merge of its own"
+        );
+        assert!(
+            src.matches("layered_config_figment(").count() >= 2,
+            "the boot and the gate must both call layered_config_figment"
         );
     }
 }

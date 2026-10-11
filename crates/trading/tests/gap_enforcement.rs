@@ -330,8 +330,11 @@ mod oms_state_machine {
     fn parse_unknown_returns_none() {
         assert_eq!(parse_order_status("UNKNOWN"), None);
         assert_eq!(parse_order_status(""), None);
-        assert_eq!(parse_order_status("traded"), None); // case-sensitive
-        assert_eq!(parse_order_status("pending"), None);
+        // "traded" / "pending" were asserted None here (case-sensitive) until
+        // 2026-10-11; audit INP-7 made matching ignore ASCII case, because the
+        // vendor spells statuses in mixed case ("Cancelled").
+        assert_eq!(parse_order_status("traded"), Some(OrderStatus::Traded));
+        assert_eq!(parse_order_status("Pending"), Some(OrderStatus::Pending));
         assert_eq!(parse_order_status("FILLED"), None);
         assert_eq!(parse_order_status(" TRADED"), None); // leading whitespace
     }
