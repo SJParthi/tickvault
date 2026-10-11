@@ -309,6 +309,25 @@ jobs:
         with:
           tool: cargo-nextest
 
+      - name: Start QuestDB for the real round-trip tests (storage only)
+        # Audit PROOF-1 (2026-10-11): crates/storage/tests/questdb_real_roundtrip.rs
+        # writes through the real writers into a real QuestDB and reads the
+        # rows back. Steps on this matrix lane, not a new job, so the
+        # all-green needs list is untouched. Same image digest as
+        # deploy/docker/docker-compose.yml (a multi-arch manifest list, so it
+        # pulls natively on the amd64 runner).
+        if: matrix.crate == 'storage'
+        run: |
+          set -euo pipefail
+          docker run -d --name tv-qdb-it -p 9000:9000 \
+            questdb/questdb:9.3.5@sha256:22ad030544f45a396c743124c928ce33de11666c104f63f69ce4e66e07e7b968
+          for _ in $(seq 1 60); do
+            curl -fsS "http://127.0.0.1:9000/exec?query=SELECT%201" >/dev/null 2>&1 && exit 0
+            sleep 1
+          done
+          docker logs tv-qdb-it
+          exit 1
+
       - name: cargo nextest run -p tickvault-${{ matrix.crate }} (lib + integration, profile=ci)
         # Full per-crate suite — unit (lib) AND integration (tests/) targets.
         # `#[ignore]`d tests (QuestDB/Docker/timing-dependent) are skipped by
@@ -316,7 +335,34 @@ jobs:
         # Profile `ci` (.config/nextest.toml) caps per-test wall-clock
         # at 90 s so runaway tests fail fast. Flaky tests get 1 retry
         # before being marked FAIL.
+        # On the storage lane the two TV_QDB_REAL_* values point the real
+        # round-trip tests at the container above and make a missing or
+        # unreachable QuestDB a failure, not a skip. Empty elsewhere.
+        env:
+          TV_QDB_REAL_HTTP: ${{ matrix.crate == 'storage' && '127.0.0.1:9000' || '' }}
+          TV_QDB_REAL_REQUIRED: ${{ matrix.crate == 'storage' && '1' || '' }}
         run: cargo nextest run -p tickvault-${{ matrix.crate }} ${{ matrix.features }} --no-fail-fast --profile ci
+
+      - name: Restart QuestDB and check the rows survived (storage only)
+        # Second phase of rows_survive_a_questdb_restart: the first phase ran
+        # in the suite above and wrote its rows; after the restart this phase
+        # re-runs the boot DDL on the populated tables and reads them back.
+        if: matrix.crate == 'storage'
+        env:
+          TV_QDB_REAL_HTTP: 127.0.0.1:9000
+          TV_QDB_REAL_REQUIRED: '1'
+          TV_QDB_RESTART_PHASE: after
+        run: |
+          set -euo pipefail
+          docker restart tv-qdb-it
+          ready=0
+          for _ in $(seq 1 60); do
+            if curl -fsS "http://127.0.0.1:9000/exec?query=SELECT%201" >/dev/null 2>&1; then ready=1; break; fi
+            sleep 1
+          done
+          if [ "$ready" != 1 ]; then docker logs tv-qdb-it; exit 1; fi
+          cargo nextest run -p tickvault-storage --test questdb_real_roundtrip --profile ci \
+            -E 'test(rows_survive_a_questdb_restart)'
 
   # -------------------------------------------------------------------------
   # Security & Audit — delegated to security-audit.yml workflow.
