@@ -44,6 +44,11 @@
 //! session). The read, gzip and hashing run in `spawn_blocking` — never on
 //! the frame drain or the WAL writer thread. Cold path throughout.
 //!
+//! Each file's S3 calls run under one time budget (60 s plus one second per
+//! MiB of gzip, audit SUP-5, 2026-10-11). Past it the file is a counted
+//! failure with no marker, retried on the next pass, so a hung connection
+//! can no longer stall the pass and hide its failures.
+//!
 //! # Honest limits
 //!
 //! - This step does NOT break a deadlock where the stuck segments are
@@ -121,6 +126,30 @@ pub const RAW_UPLOAD_MIN_QUIET_SECS: u64 = 60;
 /// unreachable, and hammering it per segment helps nobody.
 const MAX_CONSECUTIVE_FAILURES: usize = 3;
 
+/// Fixed part of the time one file's S3 calls (HeadObject, PutObject,
+/// HeadObject, and the sidecar pair when the key is taken) may take.
+///
+/// 2026-10-11 (audit SUP-5): the client is built with the SDK defaults, which
+/// bound the connect but not a read, so a PUT on a half-open connection could
+/// wait forever. The pass never returned, no failure was counted, and the
+/// cold-backup page never fired. Past this budget the file is an ordinary
+/// failed upload: counted, no marker, retried on the next pass. Cancelling a
+/// PUT is safe because it is a conditional create: if it did land, the next
+/// pass's HeadObject finds it identical and reuses it.
+const S3_CALL_TIMEOUT_BASE_SECS: u64 = 60;
+
+/// Slowest transfer rate the budget allows for the gzip body: 1 MiB/s, so a
+/// 64 MiB gzip (a full 128 MiB segment) gets about 124 s in all.
+const S3_CALL_MIN_BYTES_PER_SEC: u64 = 1_048_576;
+
+/// The time one file's S3 calls may take: the fixed part plus the body at
+/// the slowest allowed rate. O(1), saturating, never panics.
+fn s3_call_budget(gzip_len: u64) -> Duration {
+    Duration::from_secs(
+        S3_CALL_TIMEOUT_BASE_SECS.saturating_add(gzip_len / S3_CALL_MIN_BYTES_PER_SEC),
+    )
+}
+
 /// Pre-size of the gzip buffer: 128 MiB segments compress to roughly half.
 const GZIP_PRESIZE_BYTES: usize = 64 * 1024 * 1024;
 
@@ -159,6 +188,13 @@ pub trait ColdObjectStore: Send + Sync {
         sha256_b64: &str,
         metadata: &[(&'static str, String)],
     ) -> impl Future<Output = Result<()>> + Send;
+
+    /// The time the S3 calls for one file of `gzip_len` bytes may take before
+    /// the file counts as failed (audit SUP-5). The default is the production
+    /// budget; only the test store shortens it.
+    fn call_budget(&self, gzip_len: u64) -> Duration {
+        s3_call_budget(gzip_len)
+    }
 }
 
 impl ColdObjectStore for S3Cold {
@@ -753,54 +789,23 @@ async fn upload_file_with<S: ColdObjectStore>(
     let gzip_len = prepared.gzip.len() as u64;
     let canonical = key.to_string();
 
-    let head = match store.head_object(&canonical).await {
-        Ok(h) => h,
-        Err(err) => {
+    // Audit SUP-5: every S3 call for this file runs under one budget, so a
+    // hung connection ends as a counted failure instead of a pass that never
+    // returns. The marker write below stays outside it.
+    let budget = store.call_budget(gzip_len);
+    let outcome = match tokio::time::timeout(
+        budget,
+        store_and_verify(store, canonical, gzip_len, &prepared),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(_elapsed) => {
             return SegmentOutcome::Failed {
-                reason: format!("HeadObject {canonical}: {err:#}"),
+                reason: format!(
+                    "{key}: S3 calls did not finish within {budget:?}; retried on the next pass"
+                ),
             };
-        }
-    };
-    let outcome = match classify_existing(head.as_ref(), gzip_len, &prepared.gzip_sha256_b64) {
-        ExistingObject::Identical => SegmentOutcome::Reused { key: canonical },
-        ExistingObject::Absent => match put_and_verify(store, &canonical, &prepared).await {
-            Ok(()) => SegmentOutcome::Uploaded { key: canonical },
-            Err(err) => {
-                return SegmentOutcome::Failed {
-                    reason: format!("{canonical}: {err:#}"),
-                };
-            }
-        },
-        ExistingObject::Different => {
-            // Never overwrite: the bytes go to a content-addressed key.
-            let side = sidecar_key(&canonical, &prepared.gzip_sha256_hex);
-            let side_head = match store.head_object(&side).await {
-                Ok(h) => h,
-                Err(err) => {
-                    return SegmentOutcome::Failed {
-                        reason: format!("HeadObject {side}: {err:#}"),
-                    };
-                }
-            };
-            match classify_existing(side_head.as_ref(), gzip_len, &prepared.gzip_sha256_b64) {
-                ExistingObject::Identical => SegmentOutcome::Reused { key: side },
-                ExistingObject::Absent => match put_and_verify(store, &side, &prepared).await {
-                    Ok(()) => SegmentOutcome::UploadedSidecar { key: side },
-                    Err(err) => {
-                        return SegmentOutcome::Failed {
-                            reason: format!("{side}: {err:#}"),
-                        };
-                    }
-                },
-                ExistingObject::Different => {
-                    return SegmentOutcome::Failed {
-                        reason: format!(
-                            "{canonical} and its content-addressed sidecar {side} both hold \
-                             other bytes; neither overwritten"
-                        ),
-                    };
-                }
-            }
         }
     };
     let key = match &outcome {
@@ -850,6 +855,61 @@ async fn upload_file_with<S: ColdObjectStore>(
         Err(err) => SegmentOutcome::Failed {
             reason: format!("marker task failed: {err}"),
         },
+    }
+}
+
+/// The S3 half of [`upload_file_with`]: HeadObject on the canonical key,
+/// then reuse, PUT and verify, or the content-addressed sidecar. Every
+/// failure is a `Failed` outcome. Runs under the caller's time budget.
+async fn store_and_verify<S: ColdObjectStore>(
+    store: &S,
+    canonical: String,
+    gzip_len: u64,
+    prepared: &PreparedSegment,
+) -> SegmentOutcome {
+    let head = match store.head_object(&canonical).await {
+        Ok(h) => h,
+        Err(err) => {
+            return SegmentOutcome::Failed {
+                reason: format!("HeadObject {canonical}: {err:#}"),
+            };
+        }
+    };
+    match classify_existing(head.as_ref(), gzip_len, &prepared.gzip_sha256_b64) {
+        ExistingObject::Identical => SegmentOutcome::Reused { key: canonical },
+        ExistingObject::Absent => match put_and_verify(store, &canonical, prepared).await {
+            Ok(()) => SegmentOutcome::Uploaded { key: canonical },
+            Err(err) => SegmentOutcome::Failed {
+                reason: format!("{canonical}: {err:#}"),
+            },
+        },
+        ExistingObject::Different => {
+            // Never overwrite: the bytes go to a content-addressed key.
+            let side = sidecar_key(&canonical, &prepared.gzip_sha256_hex);
+            let side_head = match store.head_object(&side).await {
+                Ok(h) => h,
+                Err(err) => {
+                    return SegmentOutcome::Failed {
+                        reason: format!("HeadObject {side}: {err:#}"),
+                    };
+                }
+            };
+            match classify_existing(side_head.as_ref(), gzip_len, &prepared.gzip_sha256_b64) {
+                ExistingObject::Identical => SegmentOutcome::Reused { key: side },
+                ExistingObject::Absent => match put_and_verify(store, &side, prepared).await {
+                    Ok(()) => SegmentOutcome::UploadedSidecar { key: side },
+                    Err(err) => SegmentOutcome::Failed {
+                        reason: format!("{side}: {err:#}"),
+                    },
+                },
+                ExistingObject::Different => SegmentOutcome::Failed {
+                    reason: format!(
+                        "{canonical} and its content-addressed sidecar {side} both hold \
+                         other bytes; neither overwritten"
+                    ),
+                },
+            }
+        }
     }
 }
 
@@ -1448,6 +1508,10 @@ mod tests {
         puts: Mutex<Vec<String>>,
         head_len_skew: u64,
         fail_heads: bool,
+        /// Audit SUP-5: PutObject never returns, like a half-open connection.
+        hang_puts: bool,
+        /// A shorter budget than production, so a hung call ends quickly.
+        call_budget: Option<Duration>,
     }
 
     impl FakeStore {
@@ -1486,6 +1550,9 @@ mod tests {
             sha256_b64: &str,
             _metadata: &[(&'static str, String)],
         ) -> Result<()> {
+            if self.hang_puts {
+                std::future::pending::<()>().await;
+            }
             let mut objects = self.objects.lock().expect("lock"); // APPROVED: test-only
             if objects.contains_key(key) {
                 anyhow::bail!("412 precondition failed");
@@ -1499,6 +1566,10 @@ mod tests {
             );
             self.puts.lock().expect("lock").push(key.to_string()); // APPROVED: test-only
             Ok(())
+        }
+
+        fn call_budget(&self, gzip_len: u64) -> Duration {
+            self.call_budget.unwrap_or_else(|| s3_call_budget(gzip_len))
         }
     }
 
@@ -1800,6 +1871,82 @@ mod tests {
         assert_eq!(s.failed, MAX_CONSECUTIVE_FAILURES);
         assert_eq!(s.backlog_after, 5);
         assert!(!markers_dir(&dir).exists());
+    }
+
+    /// Audit SUP-5: the budget has a 60 s floor, adds one second per MiB of
+    /// gzip, never shrinks as the file grows and never overflows.
+    #[test]
+    fn test_s3_call_budget_scales_with_size_and_has_a_floor() {
+        assert_eq!(s3_call_budget(0), Duration::from_secs(60));
+        assert_eq!(s3_call_budget(1_048_575), Duration::from_secs(60));
+        assert_eq!(s3_call_budget(64 * 1_048_576), Duration::from_secs(124));
+        assert_eq!(s3_call_budget(128 * 1_048_576), Duration::from_secs(188));
+        let mut last = Duration::ZERO;
+        for len in [0, 1, 1 << 20, 1 << 26, 1 << 27, 1 << 40, u64::MAX] {
+            let b = s3_call_budget(len);
+            assert!(b >= last, "budget shrank at {len}");
+            last = b;
+        }
+        // The trait default is the production budget.
+        let store = FakeStore::default();
+        assert_eq!(store.call_budget(1 << 26), s3_call_budget(1 << 26));
+    }
+
+    /// A store whose PutObject never returns, with a short budget.
+    fn hanging_store() -> FakeStore {
+        FakeStore {
+            hang_puts: true,
+            call_budget: Some(Duration::from_millis(200)),
+            ..FakeStore::default()
+        }
+    }
+
+    /// Longest a test waits for a pass that must end on its own. Before the
+    /// SUP-5 fix the pass never ended, so this outer bound is what fails.
+    const PASS_MUST_END_WITHIN: Duration = Duration::from_secs(30);
+
+    /// Audit SUP-5 regression: a PUT that never returns (a half-open
+    /// connection) used to hang the pass forever, so no failure was counted
+    /// and the cold-backup page could never fire. Now the file fails after
+    /// its budget, with no marker, and the pass ends.
+    #[tokio::test]
+    async fn test_regression_a_hung_put_fails_the_segment_within_the_budget_and_writes_no_marker() {
+        let dir = temp_wal_dir("hungput");
+        plant(&dir, SEG, b"frames nobody can upload");
+        let store = hanging_store();
+        let pass = run_pass_with(
+            &store,
+            &dir,
+            usize::MAX,
+            &always,
+            &never_open,
+            SystemTime::now(),
+        );
+        let s = tokio::time::timeout(PASS_MUST_END_WITHIN, pass)
+            .await
+            .expect("the pass must end when S3 hangs"); // APPROVED: test-only
+        assert_eq!((s.marked(), s.failed, s.backlog_after), (0, 1, 1));
+        assert_eq!(store.put_count(), 0);
+        assert!(!markers_dir(&dir).join(SEG).exists());
+    }
+
+    /// Audit SUP-5 regression, spill and quarantine sets: the same hung PUT
+    /// through `run_file_pass`, which shares the upload step.
+    #[tokio::test]
+    async fn test_regression_a_hung_put_fails_the_cold_file_pass_too() {
+        let dir = temp_wal_dir("hungfile");
+        let file = plant(&dir, DAY_FILE, b"seal records");
+        let store = hanging_store();
+        let set = ColdFileSet::seal_spill(&dir);
+        let never = |_: &Path| false;
+        let pass = run_file_pass_with(&store, &set, usize::MAX, &always, &never, SystemTime::now());
+        let s = tokio::time::timeout(PASS_MUST_END_WITHIN, pass)
+            .await
+            .expect("the file pass must end when S3 hangs"); // APPROVED: test-only
+        assert_eq!((s.marked(), s.failed, s.backlog_after), (0, 1, 1));
+        let meta = std::fs::metadata(&file).expect("stat"); // APPROVED: test-only
+        assert!(!CopyGate::Required.allows_delete(&file, &meta));
+        assert!(!dir.join(UPLOADED_SUBDIR).join(DAY_FILE).exists());
     }
 
     #[test]
