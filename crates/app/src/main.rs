@@ -1758,6 +1758,12 @@ async fn async_main() -> Result<()> {
     metrics::counter!("tv_telegram_dropped_total", "reason" => "noop_mode").increment(0);
     metrics::counter!("tv_telegram_dropped_total", "reason" => "coalesced_sample_capped")
         .increment(0);
+    // PR47 (2026-10-11): a lost SMS copy of a High/Critical page is counted
+    // (both `service.rs::send_sns_sms` failure arms). Prometheus only;
+    // seeded so the series reads 0 rather than absent before the first
+    // failure.
+    metrics::counter!("tv_sns_sms_failed_total", "reason" => "attribute_build").increment(0);
+    metrics::counter!("tv_sns_sms_failed_total", "reason" => "publish_failed").increment(0);
     // Host kernel-limit verification (2026-08-10). Must run AFTER the recorder
     // is installed — gauges written before install resolve to a no-op recorder
     // and would be silently discarded, same rationale as the registrations

@@ -1612,10 +1612,11 @@ shown. The order after PR29b was set by re-check 6 (2026-09-27). One PR open at 
   - The budget-action role may stop any instance (budget.tf:374-380): scope it to the box.
   - Database ports and a default login fallback (docker-compose.yml:221-224; deploy-aws.yml:1006):
     bind to the host and fail the deploy on a missing password.
-- [ ] **PR47 — an urgent Telegram page is never lost uncounted.** (`core`)
+- [x] **PR47 — an urgent Telegram page is never lost uncounted.** (`core`)
   - A Critical page can be lost in a burst, uncounted, while the SMS copy still goes out
     (core/src/notification/service.rs:462, :489-494, :2109-2131, :2316-2345): honour the
     retry-after reply, count the final failure, and count SMS failures too.
+  - (Done 2026-10-11: 429 replies wait Telegram's `retry_after`, capped at 30 s, on the send, episode and edit ladders; the chunked page path counts `tv_telegram_dropped_total{reason="send_failed"}` once per lost page; SMS failures count on `tv_sns_sms_failed_total{reason}` with a coded TELEGRAM-01 error; row 166 recorded, not capped: `tv_telegram_send_tasks_inflight` gauge. Tests: `test_regression_send_retry_waits_for_telegram_retry_after`, `test_regression_chunked_page_loss_counts_one_drop_per_page`, `test_regression_sns_sms_failure_is_counted_per_reason`.)
 - [ ] **PR48 — console destructive actions finish before the open and never report a false
   complete.** (`aws-lambdas`) The open holes of ticked PR28a.
   - A reset or nuke started 08:30-08:59 runs into the open
