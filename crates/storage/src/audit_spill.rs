@@ -378,12 +378,21 @@ pub fn rows_in_spill_file_name(path: &Path) -> Option<u64> {
     stem.rsplit('-').next()?.parse().ok()
 }
 
+/// Mode of an audit spill file: owner read/write only. These rows are order
+/// and P&L history kept for SEBI; the process default umask left them
+/// readable by every local user (2026-10-11).
+const AUDIT_SPILL_FILE_MODE: u32 = 0o600;
+
 fn write_and_sync(path: &Path, payload: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(AUDIT_SPILL_FILE_MODE);
+    }
+    let mut file = opts.open(path)?;
     file.write_all(payload)?;
     file.sync_all()
 }
@@ -849,6 +858,19 @@ mod tests {
         // No tmp file is left behind.
         assert_eq!(list_spill_files(tmp.path()), vec![path]);
         assert_eq!(std::fs::read_dir(tmp.path()).expect("dir").count(), 1);
+    }
+
+    // Regression: 2026-10-11 — audit spill files took the process umask, so
+    // order and P&L rows kept for SEBI were readable by every local user.
+    #[cfg(unix)]
+    #[test]
+    fn test_regression_audit_spill_file_is_owner_read_write_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = TestDir::new();
+        let spill = AuditSpill::in_dir(AuditSpillTable::OrderLegPnl, tmp.path().to_path_buf());
+        let path = spill.spill(ROWS, 2).expect("spill");
+        let mode = std::fs::metadata(&path).expect("meta").permissions().mode() & 0o777;
+        assert_eq!(mode, AUDIT_SPILL_FILE_MODE, "got {mode:o}");
     }
 
     #[test]
