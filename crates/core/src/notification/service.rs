@@ -2427,13 +2427,6 @@ impl Drop for InflightAlertTask {
     }
 }
 
-/// Current number of running alert-send tasks.
-#[cfg(test)]
-#[must_use]
-pub(crate) fn inflight_alert_tasks() -> u64 {
-    ALERT_SEND_TASKS_INFLIGHT.load(Ordering::Relaxed)
-}
-
 fn publish_inflight_alert_tasks(count: u64) {
     metrics::gauge!("tv_telegram_send_tasks_inflight").set(count as f64);
 }
@@ -2557,6 +2550,13 @@ fn mask_phone(phone: &str) -> String {
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: test code
 mod tests {
     use super::*;
+
+    /// Current number of running alert-send tasks. Kept inside the test
+    /// module: a top-level `#[cfg(test)]` item ends the loss-counter
+    /// guard's scan of this file early, hiding every counter below it.
+    fn inflight_alert_tasks() -> u64 {
+        ALERT_SEND_TASKS_INFLIGHT.load(Ordering::Relaxed)
+    }
 
     /// A `metrics::Recorder` that records counter increments in memory, so a
     /// test can assert on a counter the production code emits.
