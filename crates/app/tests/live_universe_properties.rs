@@ -65,6 +65,7 @@ fn entry() -> impl Strategy<Value = MasterEntry> {
         .prop_map(|(security_id, exchange_segment_code)| MasterEntry {
             security_id,
             exchange_segment_code,
+            symbol: String::new(),
         })
 }
 
@@ -154,11 +155,21 @@ proptest! {
             return Ok(());
         }
         for inst in got.instruments.iter().filter(|i| i.segment == ExchangeSegment::IdxI) {
+            // Audit D8: a seed the master's index rows do not carry is kept
+            // and reported, never silently. Every other surviving index must
+            // be one the master listed.
             prop_assert!(
-                master_index_ids.contains(&inst.security_id),
-                "seed {} survived a master that supplied indices",
+                master_index_ids.contains(&inst.security_id)
+                    || got.seeds_missing_from_master.contains(&inst.security_id),
+                "seed {} survived a master that supplied indices, unreported",
                 inst.security_id
             );
+        }
+        // A kept seed is never one the master listed, and the BSE seed
+        // (SENSEX, 51) is never kept: the spot path is NSE-only by lock.
+        for id in &got.seeds_missing_from_master {
+            prop_assert!(!master_index_ids.contains(id), "seed {id} was listed yet kept");
+            prop_assert!(*id != 51, "the BSE seed SENSEX was kept");
         }
     }
 
