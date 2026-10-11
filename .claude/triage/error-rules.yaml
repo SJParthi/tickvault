@@ -1226,8 +1226,8 @@ rules:
       connection budget. Operator inspects live_instance_lock table
       and stops one of the instances immediately. EXCEPTION (2026-10-11):
       lines with stage renew_failed, renew_failing, renew_lapsed,
-      ssm_transport or release_at_shutdown_timed_out reuse this code for
-      SSM reachability, not a peer; check the box's network path to SSM
+      ssm_transport or release_at_shutdown_incomplete, _skipped or _failed
+      reuse this code for SSM reachability or a shutdown release, not a peer; check the box's network path to SSM
       instead of stopping an instance (dual-instance-lock runbook 3.6).
 
   - name: resilience-03-mint-refused-lock-not-held-escalate

@@ -1458,17 +1458,19 @@ pub fn parse_errors_jsonl_line(line: &str) -> Option<JsonlCodeEvent> {
 /// (2026-10-11, review of SUP-9). The code is reused for these lines; none
 /// of them means a second instance was seen, so none sets
 /// `resilience_same_day` (which would blame the day's 805s on us as
-/// `dual_instance`). Emitters: `ssm_transport` and
-/// `release_at_shutdown_timed_out` in `dhan_rest_stack.rs`;
-/// `renew_failed`, `renew_failing` and `renew_lapsed` in
-/// `tickvault_core::instance_lock`. A RESILIENCE-01 line with any other
-/// stage, or none, still counts.
-const RESILIENCE_01_NON_PEER_STAGES: [&str; 5] = [
+/// `dual_instance`). Emitters: `ssm_transport`,
+/// `release_at_shutdown_incomplete` and `release_at_shutdown_skipped` in
+/// `dhan_rest_stack.rs`; `renew_failed`, `renew_failing`, `renew_lapsed` and
+/// `release_at_shutdown_failed` in `tickvault_core::instance_lock`. A
+/// RESILIENCE-01 line with any other stage, or none, still counts.
+const RESILIENCE_01_NON_PEER_STAGES: [&str; 7] = [
     "ssm_transport",
-    "release_at_shutdown_timed_out",
+    "release_at_shutdown_incomplete",
+    "release_at_shutdown_skipped",
     "renew_failed",
     "renew_failing",
     "renew_lapsed",
+    "release_at_shutdown_failed",
 ];
 
 /// Fold parsed events into day-scoped [`CorrelationEvidence`]. Pure.

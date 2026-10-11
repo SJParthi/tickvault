@@ -221,8 +221,10 @@ did not say.**
   Before this, any RESILIENCE-01 line in a day's `errors.jsonl` made the blame
   classifier call every 805 of that day `dual_instance` (ours) instead of
   `rate_limit_805` (the broker), so two plain SSM timeouts mis-blamed the whole
-  day. Lines with `stage` = `ssm_transport`, `release_at_shutdown_timed_out`,
-  `renew_failed`, `renew_failing` or `renew_lapsed` are now skipped there;
+  day. Lines with `stage` = `ssm_transport`, `renew_failed`, `renew_failing`,
+  `renew_lapsed`, `release_at_shutdown_incomplete`,
+  `release_at_shutdown_skipped` or `release_at_shutdown_failed` are now
+  skipped there;
   every other RESILIENCE-01 line still counts.
 - **The 90 s moment now has its own line.** Once the time since the last
   successful renewal started reaches the 90 s TTL, one more RESILIENCE-01
