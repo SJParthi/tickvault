@@ -1,4 +1,5 @@
 // Compile-time lint enforcement — defense-in-depth with CLI clippy flags
+#![cfg_attr(not(test), deny(unsafe_code))]
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 #![cfg_attr(not(test), deny(clippy::expect_used))]
 #![deny(clippy::print_stdout)]

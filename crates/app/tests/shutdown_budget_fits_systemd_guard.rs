@@ -211,6 +211,16 @@ fn the_panic_hook_drains_the_wal_before_it_aborts() {
         sync_line < drain,
         "the synchronous panic line must be written before the WAL drain waits"
     );
+    // Audit OBS-1 (2026-10-11): errors.log is not shipped to CloudWatch, the
+    // hourly errors.jsonl file is. The hook writes the crash there too, and
+    // before the WAL drain, which waits up to its budget.
+    let jsonl_line = hook
+        .find("append_panic_jsonl_line_sync(")
+        .expect("the hook writes the panic line into the shipped errors.jsonl stream");
+    assert!(
+        jsonl_line < drain,
+        "the shipped errors.jsonl panic line must be written before the WAL drain waits"
+    );
     assert!(
         hook.contains("WAL_ABORT_DRAIN_BUDGET"),
         "the hook's WAL drain must be bounded by WAL_ABORT_DRAIN_BUDGET"
@@ -231,6 +241,45 @@ fn the_panic_hook_drains_the_wal_before_it_aborts() {
         skip < wait,
         "the writer-thread skip must come before any wait"
     );
+}
+
+/// Audit CR-3 (2026-10-11): the panic hook is installed before any boot work
+/// that can panic or that a panic must cover — the config load, the first
+/// spawned task, the first OS thread and the WAL writer — and after the
+/// one-shot CLI short-circuits, which never run the app. Until this date it
+/// sat after ~40 spawns and the WAL thread, so an early panic left only the
+/// default stderr message.
+#[test]
+fn the_panic_hook_is_installed_before_any_boot_work() {
+    let main_rs = strip_comments(&read("crates/app/src/main.rs"));
+    let start = main_rs
+        .find("async fn async_main(")
+        .expect("main.rs has async_main");
+    let body = &main_rs[start..];
+    let hook = body
+        .find("std::panic::set_hook(")
+        .expect("async_main installs the panic hook");
+    let cli = body
+        .find("ensure_questdb::is_invocation(")
+        .expect("async_main short-circuits the ensure-questdb CLI");
+    assert!(
+        cli < hook,
+        "the hook must come after the one-shot CLI short-circuits"
+    );
+    for later in [
+        "tokio::spawn(",
+        "WsFrameSpill::new_with_guard(",
+        "std::thread::Builder::new(",
+        "Toml::file(CONFIG_BASE_PATH)",
+    ] {
+        let at = body
+            .find(later)
+            .unwrap_or_else(|| panic!("async_main no longer contains {later}"));
+        assert!(
+            hook < at,
+            "the panic hook must be installed before the first {later} in async_main"
+        );
+    }
 }
 
 /// Z11d (2026-10-02): the sockets must be CLOSED before the lane drain is

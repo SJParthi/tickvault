@@ -87,8 +87,25 @@ abort. systemd restarts it.
 **What pages:** not this line. The process death is paged by the existing liveness
 alarms. (PROC-02 is reserved for a container restart loop and is not used here.)
 
+**⚠ CORRECTED 2026-10-11 (audit OBS-1, CR-3)** — the synchronous line above went
+only to `errors.log`, which the CloudWatch agent does not ship, and the coded
+tracing line rides the non-blocking errors.jsonl worker, which dies with the
+process under `panic = "abort"`. So in production no CloudWatch row carried the
+panic. The hook now also writes the same crash, synchronously and before the WAL
+drain, to the current hourly `data/logs/machine/errors.jsonl.<UTC hour>` file, so
+it reaches CloudWatch Logs (`/tickvault/<env>/app`, stream `errors-jsonl`). That
+line is flattened like the rest of the file: `code`, `message`, `panic_location`
+and `panic_payload` at the top level, with a UTC `timestamp`, and carries no
+`wal_drain` field (the drain runs after it). Still **no page**: no metric filter or
+alarm reads it. The hook is also installed earlier, right after the one-shot CLI
+commands and before the config load, so a panic anywhere in boot leaves these
+lines; a panic in `main()` before `async_main` starts (reader-runtime setup) is
+still covered only by the default stderr message. In test and debug builds
+(unwinding) the tracing line can also arrive, giving two rows for one panic.
+
 **Do:**
 1. Read `panic_location` and `panic_payload`: they name the source line and message.
+   In CloudWatch, search the `errors-jsonl` stream for `PROC-03`.
 2. Read `wal_drain`: it says whether the WAL queue was emptied before the abort.
 3. Treat every panic as a defect: open a fix for the named location. A panic that
    repeats on every boot is a restart loop.

@@ -27,6 +27,7 @@
 // APPROVED: clippy 1.95 tightened these doc-formatting lints; this binary
 // crate root predates them. Allow rather than churn doc comments for a
 // cosmetic markdown-rendering nicety with zero runtime/behavior impact.
+#![cfg_attr(not(test), deny(unsafe_code))]
 #![allow(clippy::doc_lazy_continuation)]
 #![allow(clippy::doc_overindented_list_items)]
 // Match the lib.rs restriction-lint blanket for the binary crate root:
@@ -737,6 +738,75 @@ async fn async_main() -> Result<()> {
         let code = tickvault_app::ensure_questdb::run().await;
         std::process::exit(code);
     }
+
+    // -----------------------------------------------------------------------
+    // Step 0.9: Panic hook (audit CR-3, 2026-10-11)
+    // -----------------------------------------------------------------------
+    // Installed HERE, before the config load (which can panic) and before the
+    // first spawned task, the WAL writer thread and every other boot step, so
+    // a panic anywhere in boot leaves the synchronous PROC-03 lines and gets
+    // the bounded WAL drain. Until this date it sat after ~40 spawns and the
+    // WAL thread, so an early panic left only the default stderr message.
+    // After the one-shot CLI short-circuits above, which never run the app.
+    // It needs nothing initialized: with no subscriber yet the tracing line
+    // is a no-op, the drain reports no spill registered, and the file writers
+    // create `data/logs/machine` themselves. The paging comes from the
+    // liveness alarms, not from this line.
+    let default_panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let location = panic_info.location().map_or_else(
+            || "unknown".to_string(),
+            |loc| format!("{}:{}:{}", loc.file(), loc.line(), loc.column()),
+        );
+        let payload = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown panic payload".to_string()
+        };
+        // Synchronous FIRST: every tracing sink is non-blocking, and under
+        // `panic = "abort"` the process dies before their worker threads
+        // flush. This line is the one record that must not ride a queue.
+        tickvault_app::observability::append_panic_line_sync(
+            std::path::Path::new(tickvault_app::boot_helpers::ERROR_LOG_FILE_PATH),
+            &location,
+            &payload,
+        );
+        // Audit OBS-1 (2026-10-11): errors.log is not shipped to CloudWatch;
+        // the hourly errors.jsonl file is. Write the same crash there too,
+        // synchronously, before the WAL drain can make it wait.
+        tickvault_app::observability::append_panic_jsonl_line_sync(
+            std::path::Path::new(tickvault_app::observability::ERRORS_JSONL_DIR),
+            &location,
+            &payload,
+        );
+        // Z11b (2026-10-02): under `panic = "abort"` (the release profile) the
+        // process dies the moment this hook returns, and every record still
+        // in the WAL spill channel dies with it — each one already reported to
+        // its socket as `Spilled`, and never resent by Dhan. Give the writer a
+        // bounded moment to empty the channel into the page cache, which
+        // survives the abort. Skipped (inside the call) when the writer itself
+        // panicked, and not run at all under unwinding, where the panic may be
+        // caught and the process lives on.
+        let wal_drain = if cfg!(panic = "abort") {
+            Some(
+                tickvault_storage::ws_frame_spill::drain_registered_for_abort(
+                    tickvault_storage::ws_frame_spill::WAL_ABORT_DRAIN_BUDGET,
+                ),
+            )
+        } else {
+            None
+        };
+        tracing::error!(
+            code = tickvault_common::error_code::ErrorCode::Proc03Panicked.code_str(),
+            panic_location = %location,
+            panic_payload = %payload,
+            wal_drain = ?wal_drain,
+            "PANIC: tickvault crashed"
+        );
+        default_panic_hook(panic_info);
+    }));
 
     // -----------------------------------------------------------------------
     // Step 1: Load and validate configuration
@@ -2396,55 +2466,6 @@ async fn async_main() -> Result<()> {
             .await;
         }
     });
-
-    // Install panic hook: log at ERROR level (triggers Telegram via Loki → Grafana alerting).
-    let default_panic_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |panic_info| {
-        let location = panic_info.location().map_or_else(
-            || "unknown".to_string(),
-            |loc| format!("{}:{}:{}", loc.file(), loc.line(), loc.column()),
-        );
-        let payload = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
-            (*s).to_string()
-        } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
-            s.clone()
-        } else {
-            "unknown panic payload".to_string()
-        };
-        // Synchronous FIRST: every tracing sink is non-blocking, and under
-        // `panic = "abort"` the process dies before their worker threads
-        // flush. This line is the one record that must not ride a queue.
-        tickvault_app::observability::append_panic_line_sync(
-            std::path::Path::new(tickvault_app::boot_helpers::ERROR_LOG_FILE_PATH),
-            &location,
-            &payload,
-        );
-        // Z11b (2026-10-02): under `panic = "abort"` (the release profile) the
-        // process dies the moment this hook returns, and every record still
-        // in the WAL spill channel dies with it — each one already reported to
-        // its socket as `Spilled`, and never resent by Dhan. Give the writer a
-        // bounded moment to empty the channel into the page cache, which
-        // survives the abort. Skipped (inside the call) when the writer itself
-        // panicked, and not run at all under unwinding, where the panic may be
-        // caught and the process lives on.
-        let wal_drain = if cfg!(panic = "abort") {
-            Some(
-                tickvault_storage::ws_frame_spill::drain_registered_for_abort(
-                    tickvault_storage::ws_frame_spill::WAL_ABORT_DRAIN_BUDGET,
-                ),
-            )
-        } else {
-            None
-        };
-        tracing::error!(
-            code = tickvault_common::error_code::ErrorCode::Proc03Panicked.code_str(),
-            panic_location = %location,
-            panic_payload = %payload,
-            wal_drain = ?wal_drain,
-            "PANIC: tickvault crashed"
-        );
-        default_panic_hook(panic_info);
-    }));
 
     // Dropped-line publisher for every lossy log sink (2026-09-26 audit fix
     // PR1). A slow timer on its own task — never the tick path.
