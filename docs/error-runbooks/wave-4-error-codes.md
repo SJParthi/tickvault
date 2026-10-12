@@ -408,8 +408,10 @@ gauge. **Triage:** `df -h data/spill/`; restore the QuestDB drain
 (a `warn!`, log only, no page).** The watcher keeps its last hour of
 free-space readings and projects how long the disk lasts at the rate it filled
 over that hour (`tv_disk_hours_left_at_fill_rate` on local `/metrics`; -1 means
-"not filling" or "under 10 minutes of readings"). The line fires once when the
-projection drops under 24 hours and re-arms only above 30 hours. **Triage:**
+"not filling" or "under 10 minutes of readings"). The line fires once when, at that rate, the disk
+is full before capture ends at 15:40 IST (a longer projection is a normal
+session and never logs); it re-arms once the projection is 2 hours longer than
+the capture time left, or at the IST day change. **Triage:**
 check that the cold backup (raw frame upload) is keeping up, because frame logs
 are kept until a verified copy exists; then free disk or grow the volume. The
 probe itself is now one `statvfs` call, not the `df` tool, so a probe failure

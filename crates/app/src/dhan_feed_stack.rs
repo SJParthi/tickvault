@@ -5862,7 +5862,7 @@ fn seed_drain_loss_baselines() {
     // first sample of a series it has never seen, so an unseeded counter
     // publishes NOTHING on the one day it matters.
     metrics::counter!(OFFLOAD_SHUTDOWN_INCOMPLETE_COUNTER, "writer" => "top_volume").increment(0);
-    // Rescues written WITHOUT a free-space answer, because the `df` probe
+    // Rescues written WITHOUT a free-space answer, because the free-space probe
     // failed. Both tiers, both label values — a partially-seeded family is a
     // partial blind spot wearing the appearance of a covered one, and the
     // agent computes its delta per LABEL SET.

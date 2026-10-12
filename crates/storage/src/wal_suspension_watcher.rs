@@ -63,7 +63,7 @@
 //! [`crate::wal_auto_resume`] issues the statement only when the disk that
 //! caused the suspension has measurably recovered (a quarter of the volume
 //! free, well clear of where the disk-pressure loop stops reclaiming), and it
-//! refuses on a tight disk, refuses when `df` cannot be read at all, and stops
+//! refuses on a tight disk, refuses when free space cannot be read at all, and stops
 //! after three attempts per episode — at which point the WAL-SUSPEND-01 page
 //! stands and this paragraph's original advice applies again. The caution was
 //! right; what it lacked was a condition.

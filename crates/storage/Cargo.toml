@@ -52,6 +52,10 @@ sha2 = { workspace = true }
 # Already a pinned workspace dependency (tickvault-core uses it for the reader
 # affinity), so `Cargo.lock` gains no new package.
 libc = { workspace = true }
+# Deep audit DA-12 (HOT-10): the faster hasher for the per-row contract-label
+# table. Already a pinned workspace dependency (app, core and trading use it),
+# so `Cargo.lock` gains no new package.
+ahash = { workspace = true }
 
 [features]
 # PR-C3 (2026-07-14): the `daily_universe_fetcher` feature (Sub-PR #10b-ε

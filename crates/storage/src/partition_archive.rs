@@ -1679,7 +1679,7 @@ impl PartitionArchiver {
         // exists for, since a full volume is also where `create_dir_all` is
         // most likely to have failed.
         let temp_dir = std::path::Path::new(ARCHIVE_TEMP_DIR);
-        // Sweep S5: the mkdir and the `df` child process below run off the
+        // Sweep S5: the mkdir and the `statvfs` probe below run off the
         // shared tokio worker; this pass can run mid-session under disk pressure.
         let probe_path =
             if crate::off_worker::off_worker(|| std::fs::create_dir_all(temp_dir)).is_ok() {

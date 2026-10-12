@@ -49,10 +49,13 @@ use arc_swap::{ArcSwap, Guard};
 pub type CandleContractKey = (i64, &'static str);
 
 /// The published name table.
-pub type CandleContractLabels = HashMap<CandleContractKey, Arc<str>>;
+/// `ahash` rather than the default SipHash (deep audit DA-12, HOT-10): the
+/// key is an instrument id the vendor assigns, not attacker-chosen input, and
+/// the table is probed once per written tick, depth and candle row.
+pub type CandleContractLabels = HashMap<CandleContractKey, Arc<str>, ahash::RandomState>;
 
 static LABELS: LazyLock<ArcSwap<CandleContractLabels>> =
-    LazyLock::new(|| ArcSwap::from_pointee(HashMap::new()));
+    LazyLock::new(|| ArcSwap::from_pointee(CandleContractLabels::default()));
 
 /// Replaces the whole table atomically and returns how many names it holds.
 ///
@@ -115,7 +118,7 @@ mod tests {
     #[test]
     fn test_publish_candle_contract_labels_finds_a_label_under_its_own_segment_only() {
         let _g = lock();
-        let mut m = HashMap::new();
+        let mut m = CandleContractLabels::default();
         m.insert(
             (9_100_001, "NSE_FNO"),
             Arc::<str>::from("NIFTY-25Sep2026-24500-CE"),
@@ -133,8 +136,8 @@ mod tests {
     #[test]
     fn test_publish_candle_contract_labels_if_empty_never_overwrites_a_published_table() {
         let _g = lock();
-        publish_candle_contract_labels(HashMap::new());
-        let mut boot = HashMap::new();
+        publish_candle_contract_labels(CandleContractLabels::default());
+        let mut boot = CandleContractLabels::default();
         boot.insert((13, "IDX_I"), Arc::<str>::from("NIFTY"));
         assert!(publish_candle_contract_labels_if_empty(boot));
         assert_eq!(
@@ -143,13 +146,13 @@ mod tests {
         );
 
         // The attach replaces the whole table with spots + options.
-        let mut attach = HashMap::new();
+        let mut attach = CandleContractLabels::default();
         attach.insert((13, "IDX_I"), Arc::<str>::from("NIFTY"));
         attach.insert((9_100_201, "NSE_FNO"), Arc::<str>::from("NIFTY-CE"));
         publish_candle_contract_labels(attach);
 
         // A late boot publish must NOT wipe the option name.
-        let mut late = HashMap::new();
+        let mut late = CandleContractLabels::default();
         late.insert((25, "IDX_I"), Arc::<str>::from("BANKNIFTY"));
         assert!(!publish_candle_contract_labels_if_empty(late));
         let t = candle_contract_labels();
@@ -163,10 +166,10 @@ mod tests {
     #[test]
     fn test_candle_contract_labels_republish_replaces_rather_than_merges() {
         let _g = lock();
-        let mut first = HashMap::new();
+        let mut first = CandleContractLabels::default();
         first.insert((9_100_101, "NSE_FNO"), Arc::<str>::from("OLD-EXPIRED-CE"));
         publish_candle_contract_labels(first);
-        let mut second = HashMap::new();
+        let mut second = CandleContractLabels::default();
         second.insert((9_100_102, "NSE_FNO"), Arc::<str>::from("NEW-CE"));
         assert_eq!(publish_candle_contract_labels(second), 1);
         let t = candle_contract_labels();

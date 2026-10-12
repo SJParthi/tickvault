@@ -6187,7 +6187,7 @@ pub const WAL_PINNED_DISK_FLOOR_FREE_FRACTION: f64 = 0.05;
 /// Whether the volume holding `wal_dir` has less free space than
 /// [`WAL_PINNED_DISK_FLOOR_FREE_FRACTION`]. A failed probe reads as NOT below
 /// the floor: an unmeasured disk never justifies deleting the only copy.
-/// Cold prune path: one `df`.
+/// Cold prune path: one `statvfs` call.
 #[must_use]
 pub fn wal_disk_below_floor(wal_dir: &Path) -> bool {
     match crate::disk_health_watcher::probe_disk_free_bytes(wal_dir) {
@@ -6373,7 +6373,7 @@ pub fn ws_wal_active_max_bytes<P: AsRef<Path>>(wal_dir: P) -> u64 {
     if let Some(v) = RESOLVED.get() {
         return *v;
     }
-    // Probe the deepest EXISTING ancestor: `df` on a path that does not exist
+    // Probe the deepest EXISTING ancestor: `statvfs` on a path that does not exist
     // yet fails, and the WAL directory is created lazily.
     let mut probe: &Path = wal_dir.as_ref();
     while !probe.exists() {

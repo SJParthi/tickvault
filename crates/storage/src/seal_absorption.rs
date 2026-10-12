@@ -108,7 +108,7 @@ const _: () = assert!(
 
 /// Minimum gap between free-space probes, in seconds.
 ///
-/// `spill_free_bytes` forks `df`. `escalate_evicted` is reachable from the
+/// `spill_free_bytes` makes a `statvfs` call (a forked `df` until 2026-10-12). `escalate_evicted` is reachable from the
 /// FRAME-DRAIN task and a ring-overflow episode calls it in a tight burst,
 /// so an unthrottled probe would spawn a process per seal on the one task
 /// that must never block. THAT is why this tier had no floor, and a floor
@@ -291,14 +291,14 @@ impl SealAbsorptionPipeline {
 
     /// Is there room on the volume to escalate at all?
     ///
-    /// THROTTLED: `spill_free_bytes` forks `df`, and this is reachable from
+    /// THROTTLED: `spill_free_bytes` makes a `statvfs` call (a forked `df` until 2026-10-12), and this is reachable from
     /// the frame drain, so the answer is cached for
     /// [`SEAL_DISK_PROBE_INTERVAL_SECS`]. A burst of a thousand escalations
     /// inside one second costs ONE probe, not a thousand processes.
     ///
     /// FAILS OPEN when the probe cannot answer, matching the TICK tier and
     /// deliberately unlike depth: a seal that is refused here is a CANDLE
-    /// that exists nowhere else, so one broken `df` must never be able to
+    /// that exists nowhere else, so one failed free-space probe must never be able to
     /// start discarding candles. Depth can afford the opposite default
     /// because a depth row is a record, not a decision input.
     fn has_room_to_escalate(&self, payload_len: u64, now_unix_secs: i64) -> bool {
@@ -309,7 +309,7 @@ impl SealAbsorptionPipeline {
             // sees the new time and the old value re-uses a verdict at most
             // one interval stale, which is the same guarantee a single
             // caller gets. The inverse order could let every racing caller
-            // decide it is due and fork `df` in lockstep.
+            // decide it is due and probe in lockstep.
             self.last_probe_secs.store(now_unix_secs, Ordering::Relaxed);
             let probed = spill_free_bytes(self.spill.spill_dir());
             self.last_free_bytes
@@ -1006,7 +1006,7 @@ mod tests {
     fn has_room_to_escalate_fails_open_when_the_probe_cannot_answer() {
         // A directory that does not exist: `spill_free_bytes` returns None.
         // Blind must ALLOW here — unlike depth — because a refused seal is a
-        // candle that exists nowhere else, and one broken `df` must never be
+        // candle that exists nowhere else, and one failed free-space probe must never be
         // able to start discarding candles.
         let mut missing = std::env::temp_dir();
         missing.push(format!(
@@ -1044,7 +1044,7 @@ mod tests {
 
     #[test]
     fn the_free_space_probe_is_throttled_so_a_burst_costs_one_probe() {
-        // `spill_free_bytes` forks `df`, and this path is reachable from the
+        // `spill_free_bytes` makes a `statvfs` call (a forked `df` until 2026-10-12), and this path is reachable from the
         // frame drain. An unthrottled probe would spawn a process per seal
         // during exactly the burst it exists to survive.
         let (spill, dlq) = temp_pair("floor-throttle");

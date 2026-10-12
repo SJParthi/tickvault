@@ -1962,7 +1962,11 @@ fn parse_spot_rows(body: &str, floor: Option<i64>) -> Result<SpotPriceRows, Stri
 fn candle_labels_from(
     labels: &HashMap<crate::contract_underlying_map::ContractKey, std::sync::Arc<str>>,
 ) -> tickvault_storage::candle_contract_labels::CandleContractLabels {
-    let mut out = HashMap::with_capacity(labels.len());
+    let mut out =
+        tickvault_storage::candle_contract_labels::CandleContractLabels::with_capacity_and_hasher(
+            labels.len(),
+            ahash::RandomState::default(),
+        );
     for ((id, segment), name) in labels {
         let Ok(id) = i64::try_from(*id) else {
             continue;
@@ -1987,7 +1991,10 @@ pub fn spot_labels_from(
     symbols: &HashMap<String, (u64, u8)>,
 ) -> tickvault_storage::candle_contract_labels::CandleContractLabels {
     let mut out: tickvault_storage::candle_contract_labels::CandleContractLabels =
-        HashMap::with_capacity(symbols.len());
+        tickvault_storage::candle_contract_labels::CandleContractLabels::with_capacity_and_hasher(
+            symbols.len(),
+            ahash::RandomState::default(),
+        );
     for (name, (id, code)) in symbols {
         if !matches!(*code, 0 | 1 | 4) {
             continue;
@@ -2028,7 +2035,10 @@ fn option_labels_from(
     contracts: &[ContractRow],
 ) -> tickvault_storage::candle_contract_labels::CandleContractLabels {
     let mut out: tickvault_storage::candle_contract_labels::CandleContractLabels =
-        HashMap::with_capacity(contracts.len());
+        tickvault_storage::candle_contract_labels::CandleContractLabels::with_capacity_and_hasher(
+            contracts.len(),
+            ahash::RandomState::default(),
+        );
     for row in contracts {
         if !matches!(row.c.as_str(), "OPTIDX" | "OPTSTK") || row.i == 0 {
             continue;

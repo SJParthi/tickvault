@@ -269,14 +269,18 @@ pub fn probe_disk_free_inodes(path: &std::path::Path) -> Option<(u64, u64)> {
 // Published as `tv_disk_hours_left_at_fill_rate` on local `/metrics` only (no
 // EMF name, no alarm, no page: budget rule), and one edge-triggered coded
 // `warn!` (`RESOURCE-03`, log-sink-only, `source = "disk_hours_left_low"`)
-// when the projection drops under a day. The ring is a fixed array written
+// when, at that rate, the disk is full before the session ends at
+// `TICK_PERSIST_END_SECS_OF_DAY_IST` (15:40 IST), after which nothing more is
+// captured and the evening archive frees space. A projection longer than the
+// rest of the session is the normal shape of a trading day (the volume is
+// sized for one session), so it never logs. The ring is a fixed array written
 // once a minute: O(1) per probe, no allocation after the watcher starts.
 //
 // Honest limits: the rate is the slope between the oldest and newest reading
 // of the window, so a cleanup or volume growth inside the hour reads "not
-// filling" until it leaves the window; and the projection does not know
-// whether the upload is failing. A second, upload-aware signal is a separate
-// item.
+// filling" until it leaves the window; the opening burst can over-project
+// for the first hour; and the projection does not know whether the upload is
+// failing. A second, upload-aware signal is a separate item.
 
 /// Readings kept for the fill-rate projection: one hour at the 60 s cadence.
 const DISK_FILL_RATE_WINDOW_SAMPLES: usize = 60;
@@ -285,12 +289,11 @@ const DISK_FILL_RATE_WINDOW_SAMPLES: usize = 60;
 /// few noisy readings right after start never produce a figure.
 const DISK_FILL_RATE_MIN_SPAN_SECS: u64 = 600;
 
-/// The coded warning fires once when the projection drops under this.
-const DISK_HOURS_LEFT_WARN_HOURS: f64 = 24.0;
-
-/// The warning re-arms only once the projection is back above this (or the
-/// disk stopped filling), so a projection hovering near a day logs once.
-const DISK_HOURS_LEFT_REARM_HOURS: f64 = 30.0;
+/// The warning re-arms only once the projection is this many hours longer
+/// than the rest of the session, so a projection hovering near the close logs
+/// once. A projection that disappears (the disk stopped filling) keeps the
+/// latch; the latch clears at the IST day change.
+const DISK_HOURS_LEFT_REARM_MARGIN_HOURS: f64 = 2.0;
 
 /// Gauge value when there is no projection (not filling, or too few readings).
 const DISK_HOURS_LEFT_NONE_GAUGE: f64 = -1.0;
@@ -369,15 +372,39 @@ fn hours_left(window: &DiskFillWindow) -> Option<f64> {
     Some(newest.free_bytes as f64 / bytes_per_sec / 3_600.0)
 }
 
+/// Hours from `unix_secs` until the capture window ends today
+/// (`TICK_PERSIST_END_SECS_OF_DAY_IST`, IST), 0 once it has passed. Pure and
+/// O(1).
+fn hours_until_session_end(unix_secs: u64) -> f64 {
+    let ist_secs_of_day = (unix_secs
+        + u64::from(tickvault_common::constants::IST_UTC_OFFSET_SECONDS.unsigned_abs()))
+        % u64::from(tickvault_common::constants::SECONDS_PER_DAY);
+    let end = u64::from(tickvault_common::constants::TICK_PERSIST_END_SECS_OF_DAY_IST);
+    end.saturating_sub(ist_secs_of_day) as f64 / 3_600.0
+}
+
+/// The IST calendar day number of `unix_secs` (days since 1970-01-01 IST).
+/// Pure and O(1).
+fn ist_day_number(unix_secs: u64) -> u64 {
+    (unix_secs + u64::from(tickvault_common::constants::IST_UTC_OFFSET_SECONDS.unsigned_abs()))
+        / u64::from(tickvault_common::constants::SECONDS_PER_DAY)
+}
+
 /// The edge-triggered decision for the hours-left warning: `(fire, latched)`.
-/// Fires once when the projection first drops under
-/// [`DISK_HOURS_LEFT_WARN_HOURS`]; re-arms only when it is back above
-/// [`DISK_HOURS_LEFT_REARM_HOURS`] or there is no projection. Pure and O(1).
-fn hours_left_warn_edge(hours: Option<f64>, latched: bool) -> (bool, bool) {
+/// Fires once when the projection is shorter than `session_hours_left` (the
+/// disk fills before the capture window ends). Re-arms only once the
+/// projection is [`DISK_HOURS_LEFT_REARM_MARGIN_HOURS`] longer than that; no
+/// projection keeps the latch as it is. Pure and O(1).
+fn hours_left_warn_edge(
+    hours: Option<f64>,
+    session_hours_left: f64,
+    latched: bool,
+) -> (bool, bool) {
     match hours {
-        Some(h) if h < DISK_HOURS_LEFT_WARN_HOURS => (!latched, true),
-        Some(h) if h < DISK_HOURS_LEFT_REARM_HOURS => (false, latched),
-        _ => (false, false),
+        Some(h) if h < session_hours_left => (!latched, true),
+        Some(h) if h < session_hours_left + DISK_HOURS_LEFT_REARM_MARGIN_HOURS => (false, latched),
+        Some(_) => (false, false),
+        None => (false, latched),
     }
 }
 
@@ -401,6 +428,7 @@ pub fn spawn_spill_disk_health_watcher(spill_dir: PathBuf) -> tokio::task::JoinH
         let started = std::time::Instant::now();
         let mut fill_window = DiskFillWindow::new();
         let mut hours_left_latched = false;
+        let mut hours_left_day = 0_u64;
 
         info!(
             path = %spill_dir.display(),
@@ -462,7 +490,17 @@ pub fn spawn_spill_disk_health_watcher(spill_dir: PathBuf) -> tokio::task::JoinH
                     });
                     let projected = hours_left(&fill_window);
                     m_hours_left.set(projected.unwrap_or(DISK_HOURS_LEFT_NONE_GAUGE));
-                    let (fire, latched) = hours_left_warn_edge(projected, hours_left_latched);
+                    let now_unix = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs());
+                    let today = ist_day_number(now_unix);
+                    if today != hours_left_day {
+                        hours_left_day = today;
+                        hours_left_latched = false;
+                    }
+                    let session_hours_left = hours_until_session_end(now_unix);
+                    let (fire, latched) =
+                        hours_left_warn_edge(projected, session_hours_left, hours_left_latched);
                     hours_left_latched = latched;
                     if fire {
                         warn!(
@@ -472,8 +510,9 @@ pub fn spawn_spill_disk_health_watcher(spill_dir: PathBuf) -> tokio::task::JoinH
                             hours_left = projected.unwrap_or(DISK_HOURS_LEFT_NONE_GAUGE),
                             free_bytes,
                             total_bytes,
-                            "disk fills in under a day at the rate it filled over the last hour \
-                             — check that the cold backup is keeping up"
+                            session_hours_left,
+                            "disk fills before the capture window ends at the rate it filled \
+                             over the last hour — check that the cold backup is keeping up"
                         );
                     }
                     // Derived per-probe, never cached: the volume can grow
@@ -738,15 +777,55 @@ mod tests {
     /// re-arms only above 30 h or when there is no projection.
     #[test]
     fn hours_left_warn_is_edge_triggered_with_hysteresis() {
-        assert_eq!(hours_left_warn_edge(None, false), (false, false));
-        assert_eq!(hours_left_warn_edge(Some(48.0), false), (false, false));
-        assert_eq!(hours_left_warn_edge(Some(23.0), false), (true, true));
-        assert_eq!(hours_left_warn_edge(Some(5.0), true), (false, true));
-        assert_eq!(hours_left_warn_edge(Some(26.0), true), (false, true));
-        assert_eq!(hours_left_warn_edge(Some(26.0), false), (false, false));
-        assert_eq!(hours_left_warn_edge(Some(31.0), true), (false, false));
-        assert_eq!(hours_left_warn_edge(None, true), (false, false));
-        assert_eq!(hours_left_warn_edge(Some(0.0), false), (true, true));
+        // Six session hours left (09:40 IST).
+        assert_eq!(hours_left_warn_edge(None, 6.0, false), (false, false));
+        assert_eq!(hours_left_warn_edge(Some(48.0), 6.0, false), (false, false));
+        assert_eq!(hours_left_warn_edge(Some(5.0), 6.0, false), (true, true));
+        assert_eq!(hours_left_warn_edge(Some(1.0), 6.0, true), (false, true));
+        assert_eq!(hours_left_warn_edge(Some(7.0), 6.0, true), (false, true));
+        assert_eq!(hours_left_warn_edge(Some(7.0), 6.0, false), (false, false));
+        assert_eq!(hours_left_warn_edge(Some(8.5), 6.0, true), (false, false));
+        // No projection (the disk stopped filling) keeps the latch either way.
+        assert_eq!(hours_left_warn_edge(None, 6.0, true), (false, true));
+        assert_eq!(hours_left_warn_edge(Some(0.0), 6.0, false), (true, true));
+        // After the close only a disk full within the margin keeps it latched.
+        assert_eq!(hours_left_warn_edge(Some(0.5), 0.0, true), (false, true));
+        assert_eq!(hours_left_warn_edge(Some(3.0), 0.0, true), (false, false));
+    }
+
+    #[test]
+    fn hours_left_warn_stays_quiet_on_a_normal_session_fill() {
+        // The volume is sized for one session: a 6.5-hour projection at 09:30
+        // IST (6h10m of capture left) is a normal day and must not log, while
+        // the same rate one hour later with less disk left (5h projected,
+        // 5h10m of capture left) must.
+        assert_eq!(
+            hours_left_warn_edge(Some(6.5), 6.0 + 10.0 / 60.0, false),
+            (false, false)
+        );
+        assert_eq!(
+            hours_left_warn_edge(Some(5.0), 5.0 + 10.0 / 60.0, false),
+            (true, true)
+        );
+    }
+
+    #[test]
+    fn hours_until_session_end_tracks_the_ist_clock() {
+        // 2026-10-12 04:10 UTC = 09:40 IST, six hours before 15:40.
+        let at_0940_ist = 1_791_778_200_u64;
+        assert!((hours_until_session_end(at_0940_ist) - 6.0).abs() < 1e-9);
+        // 15:40 IST and later read 0.
+        assert_eq!(hours_until_session_end(at_0940_ist + 6 * 3_600), 0.0);
+        assert_eq!(hours_until_session_end(at_0940_ist + 8 * 3_600), 0.0);
+        // The IST day changes at 18:30 UTC, not at UTC midnight.
+        assert_eq!(
+            ist_day_number(at_0940_ist),
+            ist_day_number(at_0940_ist + 14 * 3_600 - 1)
+        );
+        assert_eq!(
+            ist_day_number(at_0940_ist) + 1,
+            ist_day_number(at_0940_ist + 14 * 3_600 + 1_200)
+        );
     }
 
     /// The byte arithmetic is a multiply of two kernel fields; a fabricated

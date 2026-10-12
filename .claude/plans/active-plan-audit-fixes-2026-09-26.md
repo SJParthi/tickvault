@@ -3025,8 +3025,8 @@ CloudWatch alarm, metric filter or EMF name without a dated noise-lock row (coun
 OMS `dry_run`; no new dependency; no extra allocation on the tick path; every new pub fn has a test
 and a call site; shell may only shrink. One PR per item, serial.
 
-- [ ] **DA-12 — Free space is one `statvfs` call, never a `df` fork; tick append hardening**
-  (RUST-5, DB-4, NT-1, tail HOT-3, DISK-9, DB-3, HOT-10, HOT-12, S3-1 partial). `storage`.
+- [x] **DA-12 — Free space is one `statvfs` call, never a `df` fork; tick append hardening**
+  (RUST-5, DB-4, NT-1, tail HOT-3, DISK-9, DB-3, HOT-10, HOT-12, S3-1 partial). `storage`. Done: `disk_health_watcher::statvfs_probe`, `hours_left_warn_edge` (warns only when the disk fills before capture ends); `tick_persistence::{append_within_marker, SpillHeldBytesCache, tick_ilp_column}`; `candle_contract_labels::CandleContractLabels` on `ahash`; `wal_applied_watermark::RESCUE_FLOOR_SLOTS` = 16.
 - [ ] **DA-13 — Frame log, spill replay and archive close their counted-loss holes** (CR-2,
   CLOCK-2, CRASH-2, QDB-3, QDB-6, RET-2, RET-3, RET-4, RET-5, RET-6, RET-7, OBS-11). `storage`, `app`.
 - [ ] **DA-14 — The candle disk floor keeps what can be kept and says why** (DISK-1, DISK-2,

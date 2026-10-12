@@ -1183,7 +1183,7 @@ pub const fn classify_spill_ceiling(
 /// arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlindWritePolicy {
-    /// Write anyway, counted. Correct for TICKS: one broken `df` must not
+    /// Write anyway, counted. Correct for TICKS: one failed free-space probe must not
     /// disable the tier that carries decision-critical rows.
     FailOpen,
     /// Refuse. Correct for DEPTH: it is record-only, carries ~24x the tick row
@@ -1443,7 +1443,14 @@ fn spill_failed_ilp(
     // there is demonstrably room, and discarding market data we have somewhere
     // to put is indefensible.
     let ceiling = tick_spill_max_bytes();
-    let held = spill_dir_bytes(dir);
+    // The drain's inline fallback (no sync) reuses a fresh listing; the writer
+    // and rescue threads list every time (deep audit DA-12, NT-1).
+    let on_drain = sync.is_none();
+    let held = if on_drain {
+        TICK_DRAIN_SPILL_HELD.held(dir, std::time::Instant::now(), spill_dir_bytes)
+    } else {
+        spill_dir_bytes(dir)
+    };
     // The probe is deliberately INSIDE this branch, not an argument to the
     // call below.
     //
@@ -1484,7 +1491,7 @@ fn spill_failed_ilp(
                 // COUNT THE BLINDNESS (2026-09-01, adversarial review).
                 //
                 // Until now only the FLOOR arms touched this counter, so a
-                // broken `df` refusing every rescue AT THE CEILING left the
+                // failed free-space probe refusing every rescue AT THE CEILING left the
                 // tier permanently refusing with `tv_spill_free_probe_blind_total`
                 // sitting at its seeded 0. The operator would watch
                 // `tv_ticks_dropped_total` climb with nothing naming the
@@ -1535,7 +1542,7 @@ fn spill_failed_ilp(
     //             Unknown => do not grow. It bites only in an already
     //             abnormal state, so refusing costs little.
     //   floor   — "is there room for THIS one write?" Unknown => refusing
-    //             means a single broken `df` disables the entire rescue tier
+    //             means a single failed free-space probe disables the entire rescue tier
     //             for the process lifetime, turning every failed flush back
     //             into the permanent loss this tier exists to prevent.
     //
@@ -1543,7 +1550,7 @@ fn spill_failed_ilp(
     // was SILENT: the tier could write blind, indefinitely, with nothing
     // saying so. It is now counted.
     // FAIL OPEN when the probe fails, and that is deliberate for THIS tier:
-    // one broken `df` must not disable the rescue path that carries
+    // one failed free-space probe must not disable the rescue path that carries
     // decision-critical rows. The depth twin fails CLOSED for the mirror-image
     // reason — see `classify_spill_floor` for why the asymmetry is now a typed
     // policy rather than two hand-written `else` arms that silently diverged.
@@ -1587,6 +1594,9 @@ fn spill_failed_ilp(
     file.flush()?;
     if let Some(sync) = sync {
         sync(&file)?;
+    }
+    if on_drain {
+        TICK_DRAIN_SPILL_HELD.note_written(dir, payload.len() as u64);
     }
     Ok(path)
     // O(1) EXEMPT: end
@@ -1635,6 +1645,139 @@ fn spill_dir_bytes(dir: &Path) -> u64 {
         &dir.join(crate::tick_spill_replay::QUARANTINE_DIR),
     ))
     // O(1) EXEMPT: end
+}
+
+/// How long the drain may reuse a spill-folder byte total before listing the
+/// folder again (deep audit DA-12, NT-1).
+pub(crate) const SPILL_HELD_BYTES_CACHE_MAX_AGE_SECS: u64 = 5;
+
+/// [`SPILL_HELD_BYTES_CACHE_MAX_AGE_SECS`] as a `Duration`.
+pub(crate) const SPILL_HELD_BYTES_CACHE_MAX_AGE: std::time::Duration =
+    std::time::Duration::from_secs(SPILL_HELD_BYTES_CACHE_MAX_AGE_SECS);
+
+/// The spill folder's byte total, remembered for the drain's inline fallback
+/// (deep audit DA-12, NT-1, 2026-10-12).
+///
+/// The size ceiling needs the bytes the folder holds, and measuring that is a
+/// listing of every spill file. The writer and rescue threads still list on
+/// every write; the drain, which must not wait on a slow folder, lists at most
+/// once per [`SPILL_HELD_BYTES_CACHE_MAX_AGE`] per folder and in between uses
+/// the last total plus the bytes it has written since. Under the cap the drain
+/// pays one uncontended lock and one path hash per spill: O(path length), no
+/// allocation.
+///
+/// Honest limit: files the replay or the archive removed inside the window are
+/// still counted until the next listing, so the total can read HIGH for up to
+/// five seconds. High only moves the write into the over-ceiling branch, which
+/// then asks the free-space probe; it never lets the folder grow past a limit
+/// it would otherwise refuse.
+pub(crate) struct SpillHeldBytesCache {
+    /// `(folder tag, bytes, when listed)` of the last listing.
+    last: std::sync::Mutex<Option<(u64, u64, std::time::Instant)>>,
+}
+
+impl SpillHeldBytesCache {
+    pub(crate) const fn new() -> Self {
+        Self {
+            last: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn folder_tag(dir: &Path) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        dir.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// The folder's bytes: the remembered total while it is fresh and for the
+    /// same folder, otherwise `scan(dir)`, which is then remembered.
+    pub(crate) fn held(
+        &self,
+        dir: &Path,
+        now: std::time::Instant,
+        scan: impl FnOnce(&Path) -> u64,
+    ) -> u64 {
+        let tag = Self::folder_tag(dir);
+        let mut last = self
+            .last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((held_tag, bytes, at)) = *last
+            && held_tag == tag
+            && now
+                .checked_duration_since(at)
+                .is_some_and(|age| age < SPILL_HELD_BYTES_CACHE_MAX_AGE)
+        {
+            return bytes;
+        }
+        let bytes = scan(dir);
+        *last = Some((tag, bytes, now));
+        bytes
+    }
+
+    /// Adds `written` bytes to the remembered total when it is for `dir`.
+    pub(crate) fn note_written(&self, dir: &Path, written: u64) {
+        let tag = Self::folder_tag(dir);
+        let mut last = self
+            .last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((held_tag, bytes, _)) = last.as_mut()
+            && *held_tag == tag
+        {
+            *bytes = bytes.saturating_add(written);
+        }
+    }
+}
+
+/// The tick drain's spill-folder byte total (see [`SpillHeldBytesCache`]).
+static TICK_DRAIN_SPILL_HELD: SpillHeldBytesCache = SpillHeldBytesCache::new();
+
+#[cfg(test)]
+mod spill_held_bytes_cache_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn test_drain_spill_reuses_a_fresh_listing_and_adds_bytes_written() {
+        let cache = SpillHeldBytesCache::new();
+        let dir = Path::new("/spill/ticks");
+        let scans = Cell::new(0_u32);
+        let scan = |_: &Path| {
+            scans.set(scans.get() + 1);
+            1_000
+        };
+        let t0 = Instant::now();
+        assert_eq!(cache.held(dir, t0, scan), 1_000);
+        cache.note_written(dir, 250);
+        // Fresh and the same folder: no second listing, the write is counted.
+        assert_eq!(cache.held(dir, t0 + Duration::from_secs(1), scan), 1_250);
+        assert_eq!(scans.get(), 1);
+        // Stale: lists again and forgets the running total.
+        assert_eq!(
+            cache.held(dir, t0 + SPILL_HELD_BYTES_CACHE_MAX_AGE, scan),
+            1_000
+        );
+        assert_eq!(scans.get(), 2);
+    }
+
+    #[test]
+    fn test_drain_spill_cache_never_serves_another_folder() {
+        let cache = SpillHeldBytesCache::new();
+        let t0 = Instant::now();
+        assert_eq!(cache.held(Path::new("/a"), t0, |_| 10), 10);
+        // A write to another folder does not move this folder's total.
+        cache.note_written(Path::new("/b"), 99);
+        assert_eq!(cache.held(Path::new("/b"), t0, |_| 20), 20);
+        assert_eq!(cache.held(Path::new("/a"), t0, |_| 30), 30);
+        // A clock that reads earlier than the listing never reuses it.
+        let earlier = t0.checked_sub(Duration::from_secs(1)).unwrap_or(t0);
+        if earlier < t0 {
+            assert_eq!(cache.held(Path::new("/a"), earlier, |_| 40), 40);
+        }
+    }
 }
 
 /// The share of the tick spill ceiling that quarantined files may occupy.
@@ -3361,7 +3504,7 @@ impl TickWriter {
         // 2026-09-26 audit fix PR3 — the drain never writes the spill file.
         //
         // Until this date a full rescue queue (or a gone rescue thread) fell
-        // back to `perform_tick_rescue` INLINE: a `df` fork plus up to 32 MiB
+        // back to `perform_tick_rescue` INLINE: a `statvfs` probe plus up to 32 MiB
         // of file write on the frame-drain task, at exactly the moment the
         // disk was slowest. Every row carrying a capture sequence is already
         // in the capture-at-receipt WAL, so the rescue is handed to the WAL
@@ -4634,7 +4777,7 @@ mod tests {
     /// cannot manufacture a nearly-full disk, so before the decision was
     /// separated out, the arm that protects the database was untestable and
     /// Every arm of the per-write floor, including the two the live box can
-    /// only reach with a broken `df`.
+    /// only reach with a failed free-space probe.
     #[test]
     fn classify_spill_floor_covers_every_arm() {
         use BlindWritePolicy::{FailClosed, FailOpen};
@@ -5658,7 +5801,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let row = sample_row();
-        let mut m = crate::candle_contract_labels::CandleContractLabels::new();
+        let mut m = crate::candle_contract_labels::CandleContractLabels::default();
         m.insert(
             (row.security_id, row.segment),
             std::sync::Arc::<str>::from("NIFTY-25Sep2026-24500-CE"),
@@ -5684,7 +5827,7 @@ mod tests {
         );
 
         crate::candle_contract_labels::publish_candle_contract_labels(
-            crate::candle_contract_labels::CandleContractLabels::new(),
+            crate::candle_contract_labels::CandleContractLabels::default(),
         );
         let mut w = TickWriter::for_test(Feed::Dhan);
         w.append_row(&row).expect("append");
