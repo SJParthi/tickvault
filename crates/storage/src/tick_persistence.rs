@@ -1734,52 +1734,6 @@ impl SpillHeldBytesCache {
 /// The tick drain's spill-folder byte total (see [`SpillHeldBytesCache`]).
 static TICK_DRAIN_SPILL_HELD: SpillHeldBytesCache = SpillHeldBytesCache::new();
 
-#[cfg(test)]
-mod spill_held_bytes_cache_tests {
-    use super::*;
-    use std::cell::Cell;
-    use std::time::{Duration, Instant};
-
-    #[test]
-    fn test_drain_spill_reuses_a_fresh_listing_and_adds_bytes_written() {
-        let cache = SpillHeldBytesCache::new();
-        let dir = Path::new("/spill/ticks");
-        let scans = Cell::new(0_u32);
-        let scan = |_: &Path| {
-            scans.set(scans.get() + 1);
-            1_000
-        };
-        let t0 = Instant::now();
-        assert_eq!(cache.held(dir, t0, scan), 1_000);
-        cache.note_written(dir, 250);
-        // Fresh and the same folder: no second listing, the write is counted.
-        assert_eq!(cache.held(dir, t0 + Duration::from_secs(1), scan), 1_250);
-        assert_eq!(scans.get(), 1);
-        // Stale: lists again and forgets the running total.
-        assert_eq!(
-            cache.held(dir, t0 + SPILL_HELD_BYTES_CACHE_MAX_AGE, scan),
-            1_000
-        );
-        assert_eq!(scans.get(), 2);
-    }
-
-    #[test]
-    fn test_drain_spill_cache_never_serves_another_folder() {
-        let cache = SpillHeldBytesCache::new();
-        let t0 = Instant::now();
-        assert_eq!(cache.held(Path::new("/a"), t0, |_| 10), 10);
-        // A write to another folder does not move this folder's total.
-        cache.note_written(Path::new("/b"), 99);
-        assert_eq!(cache.held(Path::new("/b"), t0, |_| 20), 20);
-        assert_eq!(cache.held(Path::new("/a"), t0, |_| 30), 30);
-        // A clock that reads earlier than the listing never reuses it.
-        let earlier = t0.checked_sub(Duration::from_secs(1)).unwrap_or(t0);
-        if earlier < t0 {
-            assert_eq!(cache.held(Path::new("/a"), earlier, |_| 40), 40);
-        }
-    }
-}
-
 /// The share of the tick spill ceiling that quarantined files may occupy.
 ///
 /// # Why quarantine needs a bound at all
@@ -7696,5 +7650,51 @@ mod tests {
         let file = std::fs::File::create(dir.join("f")).expect("file");
         sync_spill_data(&file).expect("fdatasync on a regular file");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod spill_held_bytes_cache_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn test_drain_spill_reuses_a_fresh_listing_and_adds_bytes_written() {
+        let cache = SpillHeldBytesCache::new();
+        let dir = Path::new("/spill/ticks");
+        let scans = Cell::new(0_u32);
+        let scan = |_: &Path| {
+            scans.set(scans.get() + 1);
+            1_000
+        };
+        let t0 = Instant::now();
+        assert_eq!(cache.held(dir, t0, scan), 1_000);
+        cache.note_written(dir, 250);
+        // Fresh and the same folder: no second listing, the write is counted.
+        assert_eq!(cache.held(dir, t0 + Duration::from_secs(1), scan), 1_250);
+        assert_eq!(scans.get(), 1);
+        // Stale: lists again and forgets the running total.
+        assert_eq!(
+            cache.held(dir, t0 + SPILL_HELD_BYTES_CACHE_MAX_AGE, scan),
+            1_000
+        );
+        assert_eq!(scans.get(), 2);
+    }
+
+    #[test]
+    fn test_drain_spill_cache_never_serves_another_folder() {
+        let cache = SpillHeldBytesCache::new();
+        let t0 = Instant::now();
+        assert_eq!(cache.held(Path::new("/a"), t0, |_| 10), 10);
+        // A write to another folder does not move this folder's total.
+        cache.note_written(Path::new("/b"), 99);
+        assert_eq!(cache.held(Path::new("/b"), t0, |_| 20), 20);
+        assert_eq!(cache.held(Path::new("/a"), t0, |_| 30), 30);
+        // A clock that reads earlier than the listing never reuses it.
+        let earlier = t0.checked_sub(Duration::from_secs(1)).unwrap_or(t0);
+        if earlier < t0 {
+            assert_eq!(cache.held(Path::new("/a"), earlier, |_| 40), 40);
+        }
     }
 }
