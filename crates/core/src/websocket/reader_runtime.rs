@@ -269,7 +269,8 @@ fn pin_this_reader_thread(core: usize) {
 /// The two affinity syscalls, and nothing else that needs `unsafe`.
 ///
 /// The crate root denies `unsafe_code` outside tests (audit CR-5,
-/// 2026-10-11); this module is the one production opt-out. Every block in
+/// 2026-10-11); this module is one of the two production opt-outs (the other is the
+/// `statvfs` probe in tickvault-storage, 2026-10-12). Every block in
 /// it is bounds-checked and carries a SAFETY note.
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)] // APPROVED: the two affinity syscalls; every block bounds-checked, see SAFETY

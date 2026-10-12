@@ -323,6 +323,179 @@ pub fn count_nonfinite_tick_floats(row: &TickRow) -> u64 {
         + optional.iter().flatten().filter(|v| !v.is_finite()).count() as u64
 }
 
+/// A `ticks` column name, handed to the ILP buffer without re-validation.
+///
+/// Deep audit DA-12 (2026-10-12): every name passed here is a string literal
+/// written in this file, so `questdb-rs` re-checking its characters on every
+/// row of the busiest write repeated work fixed when the literal was typed.
+/// The check moved: a debug assertion runs the library's own validator on
+/// every call in tests and debug builds (the full-row tests write every
+/// column), and release builds skip it. O(1), no allocation.
+#[inline]
+fn tick_ilp_column(name: &'static str) -> questdb::ingress::ColumnName<'static> {
+    debug_assert!(
+        questdb::ingress::ColumnName::new(name).is_ok(),
+        "ticks column name {name:?} is not a valid ILP column name"
+    );
+    questdb::ingress::ColumnName::new_unchecked(name)
+}
+
+/// Every feed label is ILP-safe, proven at COMPILE TIME (the depth writer's
+/// pattern), so `write_tick_line` passes `feed` through without
+/// `sanitize_ilp_symbol`. Adding a label with a comma, an equals sign, a
+/// control byte or a non-ASCII character is a build failure here.
+const _: () = {
+    let feeds = Feed::ALL;
+    let mut i = 0;
+    while i < feeds.len() {
+        assert!(tickvault_common::sanitize::ilp_symbol_is_clean(
+            feeds[i].as_str()
+        ));
+        i += 1;
+    }
+};
+
+/// Runs `write` inside an ILP marker: on `Err` the buffer is rewound to
+/// exactly what it held before, so a half-written line can never poison it.
+///
+/// If the marker cannot be set (the buffer is already mid-line, which this
+/// function exists to make impossible) the error is returned and nothing is
+/// written. If the rewind itself fails (it cannot: the marker was just set)
+/// both errors are returned; the half line then fails the next flush, whose
+/// rescue keeps every buffered row. O(1) around `write`, no allocation.
+fn append_within_marker(
+    buffer: &mut Buffer,
+    write: impl FnOnce(&mut Buffer) -> Result<()>,
+) -> Result<()> {
+    buffer.set_marker().context("marker")?;
+    if let Err(err) = write(buffer) {
+        return Err(match buffer.rewind_to_marker() {
+            Ok(()) => err,
+            Err(rewind_err) => err
+                .context(rewind_err)
+                .context("tick append: rewinding the half-written line also failed"),
+        });
+    }
+    buffer.clear_marker();
+    Ok(())
+}
+
+/// Writes one `ticks` line. Only [`TickWriter::append_row`] calls it, inside
+/// a marker.
+fn write_tick_line(buffer: &mut Buffer, feed: &'static str, row: &TickRow) -> Result<()> {
+    debug_assert!(tickvault_common::sanitize::ilp_symbol_is_clean(feed));
+    buffer
+        .table(questdb::ingress::TableName::new_unchecked(TICKS_TABLE))
+        .context("table")?
+        .symbol(
+            tick_ilp_column("segment"),
+            sanitize_ilp_symbol(row.segment).as_ref(),
+        )
+        .context("segment")?
+        .symbol(tick_ilp_column("feed"), feed)
+        .context("feed")?;
+    // `contract` — the option's NAME (`NIFTY-25Sep2026-24500-CE`), from the
+    // SAME table the candle writer reads (operator 2026-09-22: "put either
+    // contract or symbol name right in each and every table"). One ArcSwap
+    // load + one hash probe per row, zero allocation: the name is borrowed
+    // out of the published snapshot and `sanitize_ilp_symbol` returns it
+    // borrowed unless it needs escaping (the name is master-derived, so it
+    // keeps the sanitiser). Written only when the table knows this exact
+    // `(security_id, segment)`; otherwise OMITTED, so the cell reads NULL —
+    // never a guessed name. It must sit among the symbols: ILP rejects a
+    // symbol after the first column.
+    let labels = crate::candle_contract_labels::candle_contract_labels();
+    if let Some(name) = labels.get(&(row.security_id, row.segment)) {
+        buffer
+            .symbol(
+                tick_ilp_column("contract"),
+                sanitize_ilp_symbol(name).as_ref(),
+            )
+            .context("contract")?;
+    }
+    buffer
+        .column_i64(tick_ilp_column("security_id"), row.security_id)
+        .context("security_id")?
+        .column_f64(tick_ilp_column("ltp"), row.ltp)
+        .context("ltp")?;
+
+    // Per-feed OPTIONAL columns — omitted (NULL) when None.
+    if let Some(v) = row.open {
+        buffer
+            .column_f64(tick_ilp_column("open"), v)
+            .context("open")?;
+    }
+    if let Some(v) = row.high {
+        buffer
+            .column_f64(tick_ilp_column("high"), v)
+            .context("high")?;
+    }
+    if let Some(v) = row.low {
+        buffer
+            .column_f64(tick_ilp_column("low"), v)
+            .context("low")?;
+    }
+    if let Some(v) = row.close {
+        buffer
+            .column_f64(tick_ilp_column("close"), v)
+            .context("close")?;
+    }
+    buffer
+        .column_i64(tick_ilp_column("volume"), row.volume)
+        .context("volume")?;
+    if let Some(v) = row.oi {
+        buffer.column_i64(tick_ilp_column("oi"), v).context("oi")?;
+    }
+    if let Some(v) = row.oi_day_high {
+        buffer
+            .column_i64(tick_ilp_column("oi_day_high"), v)
+            .context("oi_day_high")?;
+    }
+    if let Some(v) = row.oi_day_low {
+        buffer
+            .column_i64(tick_ilp_column("oi_day_low"), v)
+            .context("oi_day_low")?;
+    }
+    if let Some(v) = row.avg_price {
+        buffer
+            .column_f64(tick_ilp_column("avg_price"), v)
+            .context("avg_price")?;
+    }
+    if let Some(v) = row.last_trade_qty {
+        buffer
+            .column_i64(tick_ilp_column("last_trade_qty"), v)
+            .context("last_trade_qty")?;
+    }
+    if let Some(v) = row.total_buy_qty {
+        buffer
+            .column_i64(tick_ilp_column("total_buy_qty"), v)
+            .context("total_buy_qty")?;
+    }
+    if let Some(v) = row.total_sell_qty {
+        buffer
+            .column_i64(tick_ilp_column("total_sell_qty"), v)
+            .context("total_sell_qty")?;
+    }
+    if let Some(v) = row.received_at_ist_nanos {
+        buffer
+            .column_ts(tick_ilp_column("received_at"), TimestampNanos::new(v))
+            .context("received_at")?;
+    }
+    if let Some(v) = row.payload_hash {
+        buffer
+            .column_i64(tick_ilp_column("payload_hash"), v)
+            .context("payload_hash")?;
+    }
+
+    // capture_seq is the LAST column before the designated timestamp.
+    buffer
+        .column_i64(tick_ilp_column("capture_seq"), row.capture_seq)
+        .context("capture_seq")?
+        .at(TimestampNanos::new(row.ts_ist_nanos))
+        .context("designated timestamp")?;
+    Ok(())
+}
+
 /// One `ticks` row, ready for ILP append. Feed-agnostic and `Copy`.
 ///
 /// Per-feed OPTIONAL columns are `Option<T>`: `None` OMITS the ILP token so
@@ -1134,15 +1307,15 @@ pub const TICK_SPILL_VOLUME_FRACTION: u64 = 32;
 /// warning, never silently.
 ///
 /// # Complexity
-/// O(1) after the first call. The first call spawns one `df`, on the cold
-/// flush-failure path only.
+/// O(1) after the first call. The first call makes one `statvfs` call, on the
+/// cold flush-failure path only.
 #[must_use]
 pub fn tick_spill_max_bytes() -> u64 {
     static RESOLVED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *RESOLVED.get_or_init(|| {
         let probe_at = std::path::Path::new(TICK_SPILL_DIR);
-        // Probe the deepest EXISTING ancestor: `df` on a path that does not
-        // exist yet fails, and the spill dir is created lazily.
+        // Probe the deepest EXISTING ancestor: `statvfs` on a path that does
+        // not exist yet fails, and the spill dir is created lazily.
         let mut probe: &std::path::Path = probe_at;
         while !probe.exists() {
             match probe.parent() {
@@ -1345,8 +1518,9 @@ fn spill_failed_ilp(
     // `SPILL_MIN_FREE_HEADROOM_BYTES` behind. This is deliberately NOT
     // memoised, unlike the ceiling: free space is a moving quantity, and a
     // cached value would be answering a question about a disk that no longer
-    // exists. One `df` per rescue is free — a rescue only happens when a flush
-    // already failed.
+    // exists. One probe per rescue is free — a rescue only happens when a
+    // flush already failed, and since 2026-10-12 (deep audit DA-12) the probe
+    // is one `statvfs` syscall, no longer a forked `df` process.
     //
     // A refusal here is still an honest counted drop, not a silent one: the
     // caller's `Err` arm logs HOT-PATH-02 naming this reason.
@@ -2472,13 +2646,26 @@ impl TickWriter {
     /// gate's own tests live and where a reviewer is looking for it.
     ///
     /// ILP requires every SYMBOL before any field column, so `segment` and
-    /// `feed` are written first. Both are routed through `sanitize_ilp_symbol`
-    /// (defence in depth against line-protocol injection) even though both come
-    /// from closed `&'static str` sets today. `None` columns are OMITTED so the
-    /// cell is NULL rather than `0`.
+    /// `feed` are written first. `segment` is routed through
+    /// `sanitize_ilp_symbol` (defence in depth against line-protocol
+    /// injection: [`TickRow::segment`] is a `pub` field, and the hostile-value
+    /// test drives it with arbitrary text). `feed` is NOT: it comes from the
+    /// closed [`Feed`] set, which the `const _` block beside
+    /// [`tick_ilp_column`] proves ILP-safe at compile time (deep audit DA-12,
+    /// 2026-10-12, the depth writer's pattern). `None` columns are OMITTED so
+    /// the cell is NULL rather than `0`.
+    ///
+    /// # Atomic per row (deep audit DA-12, 2026-10-12)
+    ///
+    /// A marker is set before the line and the buffer is rewound to it when
+    /// any step fails, so a half-written row can no longer poison the buffer
+    /// and fail every later tick until a flush cleared it (the depth writer
+    /// has done this since its array rows). `set_marker`, `rewind_to_marker`
+    /// and `clear_marker` are O(1) and allocate nothing.
     ///
     /// # Errors
-    /// Propagates ILP buffer errors (table/column append failure).
+    /// Propagates ILP buffer errors (table/column append failure). The buffer
+    /// then holds exactly what it held before the call.
     pub(crate) fn append_row(&mut self, row: &TickRow) -> Result<()> {
         // Tripwire (2026-09-26 audit fix PR2), the tick twin of the candle
         // writer's. QuestDB stores a non-finite ILP float as NULL with no
@@ -2489,101 +2676,9 @@ impl TickWriter {
             metrics::counter!(TICK_NONFINITE_COLUMNS_COUNTER).increment(nonfinite);
         }
         let feed = self.feed.as_str();
-        self.buffer
-            .table(TICKS_TABLE)
-            .context("table")?
-            .symbol("segment", sanitize_ilp_symbol(row.segment).as_ref())
-            .context("segment")?
-            .symbol("feed", sanitize_ilp_symbol(feed).as_ref())
-            .context("feed")?;
-        // `contract` — the option's NAME (`NIFTY-25Sep2026-24500-CE`), from the
-        // SAME table the candle writer reads (operator 2026-09-22: "put either
-        // contract or symbol name right in each and every table"). One ArcSwap
-        // load + one hash probe per row, zero allocation: the name is borrowed
-        // out of the published snapshot and `sanitize_ilp_symbol` returns it
-        // borrowed unless it needs escaping. Written only when the table knows
-        // this exact `(security_id, segment)`; otherwise OMITTED, so the cell
-        // reads NULL — never a guessed name. It must sit among the symbols:
-        // ILP rejects a symbol after the first column.
-        let labels = crate::candle_contract_labels::candle_contract_labels();
-        if let Some(name) = labels.get(&(row.security_id, row.segment)) {
-            self.buffer
-                .symbol("contract", sanitize_ilp_symbol(name).as_ref())
-                .context("contract")?;
-        }
-        self.buffer
-            .column_i64("security_id", row.security_id)
-            .context("security_id")?
-            .column_f64("ltp", row.ltp)
-            .context("ltp")?;
-
-        // Per-feed OPTIONAL columns — omitted (NULL) when None.
-        if let Some(v) = row.open {
-            self.buffer.column_f64("open", v).context("open")?;
-        }
-        if let Some(v) = row.high {
-            self.buffer.column_f64("high", v).context("high")?;
-        }
-        if let Some(v) = row.low {
-            self.buffer.column_f64("low", v).context("low")?;
-        }
-        if let Some(v) = row.close {
-            self.buffer.column_f64("close", v).context("close")?;
-        }
-        self.buffer
-            .column_i64("volume", row.volume)
-            .context("volume")?;
-        if let Some(v) = row.oi {
-            self.buffer.column_i64("oi", v).context("oi")?;
-        }
-        if let Some(v) = row.oi_day_high {
-            self.buffer
-                .column_i64("oi_day_high", v)
-                .context("oi_day_high")?;
-        }
-        if let Some(v) = row.oi_day_low {
-            self.buffer
-                .column_i64("oi_day_low", v)
-                .context("oi_day_low")?;
-        }
-        if let Some(v) = row.avg_price {
-            self.buffer
-                .column_f64("avg_price", v)
-                .context("avg_price")?;
-        }
-        if let Some(v) = row.last_trade_qty {
-            self.buffer
-                .column_i64("last_trade_qty", v)
-                .context("last_trade_qty")?;
-        }
-        if let Some(v) = row.total_buy_qty {
-            self.buffer
-                .column_i64("total_buy_qty", v)
-                .context("total_buy_qty")?;
-        }
-        if let Some(v) = row.total_sell_qty {
-            self.buffer
-                .column_i64("total_sell_qty", v)
-                .context("total_sell_qty")?;
-        }
-        if let Some(v) = row.received_at_ist_nanos {
-            self.buffer
-                .column_ts("received_at", TimestampNanos::new(v))
-                .context("received_at")?;
-        }
-        if let Some(v) = row.payload_hash {
-            self.buffer
-                .column_i64("payload_hash", v)
-                .context("payload_hash")?;
-        }
-
-        // capture_seq is the LAST column before the designated timestamp.
-        self.buffer
-            .column_i64("capture_seq", row.capture_seq)
-            .context("capture_seq")?
-            .at(TimestampNanos::new(row.ts_ist_nanos))
-            .context("designated timestamp")?;
-
+        append_within_marker(&mut self.buffer, |buffer| {
+            write_tick_line(buffer, feed, row)
+        })?;
         self.pending = self.pending.saturating_add(1);
         self.last_capture_seq = self.last_capture_seq.max(row.capture_seq);
         self.note_pending_seq(row.capture_seq);
@@ -2606,7 +2701,10 @@ impl TickWriter {
     /// append failure is: the frame is marked unapplied so the next replay
     /// re-offers it, and `tv_ticks_dropped_total` is incremented.
     pub fn append_aux(&mut self, row: &AuxPacketRow) -> Result<()> {
-        match append_aux_row(&mut self.buffer, self.feed.as_str(), row) {
+        let feed = self.feed.as_str();
+        // Inside a marker, as `append_row` is (deep audit DA-12, 2026-10-12):
+        // a failed aux row leaves the buffer exactly as it found it.
+        match append_within_marker(&mut self.buffer, |buffer| append_aux_row(buffer, feed, row)) {
             Ok(()) => {
                 self.pending = self.pending.saturating_add(1);
                 self.aux_rows_appended = self.aux_rows_appended.saturating_add(1);
@@ -3008,7 +3106,7 @@ impl TickWriter {
 
     /// The drain's only spill write, NOT synced (see `SPILL_UNSYNCED_ON_DRAIN`).
     ///
-    /// It is a file write (and possibly a `df` probe), so it runs through
+    /// It is a file write (and a `statvfs` free-space probe), so it runs through
     /// `off_worker`: the drain calls `flush` bare, and this is one of the two
     /// places a flush can block.
     fn spill_on_drain(&self, payload: &[u8], rows: usize, fate: &'static str) -> bool {
@@ -3149,12 +3247,12 @@ impl TickWriter {
     /// stalling on.
     ///
     /// CORRECTED 2026-09-01 (adversarial review): this said "a live `statvfs`".
-    /// There is no `statvfs` anywhere in this workspace — the probe is
-    /// [`crate::disk_health_watcher::probe_disk_free_bytes`], which **forks and
-    /// execs `df`**. That is materially worse than the doc implied on exactly
-    /// this path, since a fork is far more expensive than a syscall and this
-    /// arm runs on the frame-drain task. The cost argument the paragraph makes
-    /// is therefore stronger than it was written to be, not weaker.
+    /// There was no `statvfs` anywhere in this workspace then — the probe,
+    /// [`crate::disk_health_watcher::probe_disk_free_bytes`], forked and
+    /// exec'd `df`, far more expensive than a syscall on a path that runs on
+    /// the frame-drain task. **CHANGED 2026-10-12 (deep audit DA-12):** the
+    /// probe is now one `statvfs` call, so the fork is gone from this arm; the
+    /// directory walk and the file write described above remain.
     ///
     /// And it fires at the worst possible instant BY CONSTRUCTION. The cut
     /// that calls it only trips after the hand-off queue has been full for
@@ -3444,6 +3542,16 @@ pub const RESCUE_QUEUE_DEPTH: usize = 2;
 /// either bound the drain writes inline exactly as before, counted on
 /// `tv_tick_rescue_inline_fallback_total`.
 pub const PARKED_RESCUE_MAX_BATCHES: usize = 8;
+// Deep audit DA-12 (2026-10-12): every WAL-backed batch queued, parked or
+// being written holds a rescue floor, so the floor table must cover them all
+// or the overflow is counted on `tv_wal_rescue_floor_full_total` in normal
+// operation (safe — the range replays — but not what the sizing claimed).
+const _: () = assert!(
+    // `<` rather than `+ 1 <=`: the one extra slot is the batch in flight.
+    RESCUE_QUEUE_DEPTH + PARKED_RESCUE_MAX_BATCHES
+        < crate::wal_applied_watermark::RESCUE_FLOOR_SLOTS,
+    "tick rescue queue + park + in-flight must fit the rescue floor table"
+);
 
 /// Byte bound on the park: four producer buffers at their cut-over size.
 /// 128 MiB per sink, held only while the disk is slower than the drain.
@@ -4214,6 +4322,157 @@ mod tests {
         assert_eq!(w.pending(), 1);
     }
 
+    /// DA-12 (2026-10-12): a tick row that fails part-way (here at the
+    /// designated timestamp, the LAST step, so every column was already
+    /// written) is rewound, and the next tick appends cleanly. Before the
+    /// marker the half line stayed in the buffer and every later tick failed
+    /// at `table()` until a flush cleared it.
+    #[test]
+    fn test_append_row_failure_rewinds_so_the_next_tick_appends() {
+        let mut w = TickWriter::for_test(Feed::Dhan);
+        let mut bad = sample_row();
+        bad.ts_ist_nanos = -1; // ILP refuses a negative designated timestamp
+        assert!(
+            w.append_row(&bad).is_err(),
+            "a negative timestamp is refused"
+        );
+        assert_eq!(w.pending(), 0, "a refused row is not pending");
+        assert!(w.buffer_utf8().is_empty(), "the half line was rewound");
+
+        w.append_row(&sample_row())
+            .expect("the next tick must append");
+        w.append_row(&sample_row()).expect("and the one after");
+        assert_eq!(w.pending(), 2);
+        let text = w.buffer_utf8();
+        assert_eq!(
+            text.lines().count(),
+            2,
+            "exactly the two good rows: {text:?}"
+        );
+        assert!(text.lines().all(|l| l.starts_with("ticks,")));
+    }
+
+    /// DA-12: the same for a `feed_aux_packets` row sharing the buffer — a
+    /// failed aux row leaves earlier tick rows intact and later rows work.
+    #[test]
+    fn test_append_aux_failure_rewinds_the_partial_row() {
+        let mut w = TickWriter::for_test(Feed::Dhan);
+        w.append_row(&sample_row()).expect("tick");
+        let mut bad = AuxPacketRow::from_header(
+            AuxPacketKind::MarketStatus,
+            13,
+            0,
+            1_779_951_600_111_000_000,
+            1_779_951_600_111_000_000,
+        )
+        .expect("row");
+        bad.ts_ist_nanos = -5;
+        assert!(
+            w.append_aux(&bad).is_err(),
+            "a negative timestamp is refused"
+        );
+        let good = AuxPacketRow::from_header(
+            AuxPacketKind::MarketStatus,
+            13,
+            0,
+            1_779_951_600_111_000_000,
+            1_779_951_600_111_000_000,
+        )
+        .expect("row");
+        w.append_aux(&good).expect("the next aux row must append");
+        w.append_row(&sample_row()).expect("and a tick after it");
+        let text = w.buffer_utf8();
+        assert_eq!(text.lines().count(), 3, "tick, aux, tick: {text:?}");
+        assert_eq!(w.aux_rows_appended(), 1);
+        assert_eq!(w.pending(), 3);
+    }
+
+    /// DA-12: the pre-validated names and the unsanitised `feed` produce the
+    /// SAME bytes as the old checked path, column for column, on a row with
+    /// every optional column present. The reference below is the pre-DA-12
+    /// encoding written with plain `&str` names (validated by the library on
+    /// every call) and `sanitize_ilp_symbol` on both symbols.
+    #[test]
+    fn test_append_row_bytes_unchanged_after_prevalidated_names() {
+        let mut row = sample_row();
+        row.open = Some(101.25);
+        row.high = Some(102.5);
+        row.low = Some(99.75);
+        row.close = Some(100.0);
+        row.oi = Some(12_345);
+        row.oi_day_high = Some(13_000);
+        row.oi_day_low = Some(12_000);
+        row.avg_price = Some(100.55);
+        row.last_trade_qty = Some(75);
+        row.total_buy_qty = Some(1_000);
+        row.total_sell_qty = Some(2_000);
+        row.received_at_ist_nanos = Some(1_779_951_600_222_000_000);
+        row.payload_hash = Some(-7);
+        let mut w = TickWriter::for_test(Feed::Dhan);
+        w.append_row(&row).expect("append");
+
+        let mut b = Buffer::new(ProtocolVersion::V1);
+        b.table(TICKS_TABLE)
+            .and_then(|b| b.symbol("segment", sanitize_ilp_symbol(row.segment).as_ref()))
+            .and_then(|b| b.symbol("feed", sanitize_ilp_symbol("dhan").as_ref()))
+            .expect("reference symbols");
+        let labels = crate::candle_contract_labels::candle_contract_labels();
+        if let Some(name) = labels.get(&(row.security_id, row.segment)) {
+            b.symbol("contract", sanitize_ilp_symbol(name).as_ref())
+                .expect("reference contract");
+        }
+        b.column_i64("security_id", row.security_id)
+            .and_then(|b| b.column_f64("ltp", row.ltp))
+            .and_then(|b| b.column_f64("open", 101.25))
+            .and_then(|b| b.column_f64("high", 102.5))
+            .and_then(|b| b.column_f64("low", 99.75))
+            .and_then(|b| b.column_f64("close", 100.0))
+            .and_then(|b| b.column_i64("volume", row.volume))
+            .and_then(|b| b.column_i64("oi", 12_345))
+            .and_then(|b| b.column_i64("oi_day_high", 13_000))
+            .and_then(|b| b.column_i64("oi_day_low", 12_000))
+            .and_then(|b| b.column_f64("avg_price", 100.55))
+            .and_then(|b| b.column_i64("last_trade_qty", 75))
+            .and_then(|b| b.column_i64("total_buy_qty", 1_000))
+            .and_then(|b| b.column_i64("total_sell_qty", 2_000))
+            .and_then(|b| {
+                b.column_ts(
+                    "received_at",
+                    TimestampNanos::new(1_779_951_600_222_000_000),
+                )
+            })
+            .and_then(|b| b.column_i64("payload_hash", -7))
+            .and_then(|b| b.column_i64("capture_seq", row.capture_seq))
+            .and_then(|b| b.at(TimestampNanos::new(row.ts_ist_nanos)))
+            .expect("reference row");
+        assert_eq!(
+            w.buffer_utf8(),
+            String::from_utf8(b.as_bytes().to_vec()).expect("utf8"),
+            "the pre-validated encoding must be byte-identical to the checked one"
+        );
+    }
+
+    /// DA-12: every feed label is already ILP-clean, which is what lets
+    /// `write_tick_line` skip the sanitiser for it (the compile-time block
+    /// proves the same; this pins the runtime view of it).
+    #[test]
+    fn test_closed_symbol_sets_need_no_sanitising() {
+        for feed in Feed::ALL {
+            assert_eq!(sanitize_ilp_symbol(feed.as_str()).as_ref(), feed.as_str());
+            assert!(tickvault_common::sanitize::ilp_symbol_is_clean(
+                feed.as_str()
+            ));
+        }
+        for code in 0..=u8::MAX {
+            let seg = segment_code_to_str(code);
+            assert_eq!(
+                sanitize_ilp_symbol(seg).as_ref(),
+                seg,
+                "segment code {code}"
+            );
+        }
+    }
+
     /// `append_aux` counts the row as pending (so the size trigger and flush
     /// see it) and widens the WAL sequence range like a tick.
     #[test]
@@ -4754,16 +5013,19 @@ mod tests {
         let start = src
             .find("pub(crate) fn append_row(&mut self, row: &TickRow)")
             .expect("append_row must exist");
-        // Unbounded on purpose: the first `.column_f64(` after the signature
-        // is inside `append_row`, which writes `ltp` before any other float.
+        // Since DA-12 (2026-10-12) the columns are written by
+        // `write_tick_line`, called from `append_row` inside a marker; the
+        // count must run before that call.
         let body = &src[start..];
         let tripwire = body
             .find("count_nonfinite_tick_floats(row)")
             .expect("append_row must count non-finite floats");
-        let first_column = body.find(".column_f64(").expect("append_row writes floats");
+        let first_write = body
+            .find("write_tick_line(buffer, feed, row)")
+            .expect("append_row writes the line through write_tick_line");
         assert!(
-            tripwire < first_column,
-            "the count runs before the first float column"
+            tripwire < first_write,
+            "the count runs before the line is written"
         );
     }
 
@@ -5993,7 +6255,8 @@ mod tests {
     /// This is the defect the split exists to remove: `discard_pending` used to
     /// do `create_dir_all`, a `read_dir` + per-entry `metadata()` walk of the
     /// spill directory AND its quarantine subdirectory, a live free-space probe
-    /// (which forks `df` on its first call), and up to 32 MiB of file write —
+    /// (a forked `df` until 2026-10-12, one `statvfs` call since), and up to
+    /// 32 MiB of file write —
     /// all on the frame-drain task, and all at the one moment the disk is
     /// already wedged, because the cut that calls it only trips when the flush
     /// queue has been full for several consecutive flushes.

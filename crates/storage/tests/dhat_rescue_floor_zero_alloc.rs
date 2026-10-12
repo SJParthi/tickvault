@@ -12,10 +12,18 @@
 //! The full-table fallback (a counter and a range mark) is a cold arm and is
 //! deliberately outside the measured window: every batch in the window
 //! releases its floor before the next one holds.
+//!
+//! **Added 2026-10-12 (deep audit DA-12):** the free-space probe the same
+//! rescue arm runs (`disk_health_watcher::probe_disk_free_bytes`) is one
+//! `statvfs` call now, no longer a forked `df` process. Its one allocation is
+//! the NUL-terminated copy of the path the kernel needs; the second window
+//! below pins it at exactly one block per call (a fork plus a parsed `df`
+//! output allocated far more).
 
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
+use tickvault_storage::disk_health_watcher::{DiskHealthOutcome, probe_disk_free_bytes};
 use tickvault_storage::wal_applied_watermark::{
     AppliedSink, DURABILITY_SAMPLE_SLOTS, DurabilityLag, applied_watermark,
 };
@@ -76,4 +84,32 @@ fn dhat_rescue_floor_and_durability_lag_are_zero_allocation() {
     // Non-vacuity: the floors really were taken, and the ring really wrapped.
     assert!(held > 0, "the floors were held");
     assert!(10_000 > 2 * DURABILITY_SAMPLE_SLOTS, "the ring wrapped");
+
+    // Second window: the statvfs free-space probe, one block per call.
+    const PROBES: u64 = 1_000;
+    let dir = std::env::temp_dir();
+    let path_bytes = dir.as_os_str().len() as u64 + 1;
+    let mut answered = 0u64;
+    let (bytes, blocks) = dhat_support::measure_with_phantom_retry(
+        PROBES * path_bytes,
+        PROBES,
+        || {},
+        || {
+            answered = 0;
+            for _ in 0..PROBES {
+                if matches!(probe_disk_free_bytes(&dir), DiskHealthOutcome::Ok { .. }) {
+                    answered += 1;
+                }
+            }
+        },
+    );
+    assert!(
+        blocks <= PROBES && bytes <= PROBES * path_bytes,
+        "the free-space probe allocated {bytes} bytes / {blocks} blocks over {PROBES} calls; \
+         it must be one statvfs call with one path copy, never a child process"
+    );
+    assert_eq!(
+        answered, PROBES,
+        "statvfs answered every probe on the temp dir"
+    );
 }

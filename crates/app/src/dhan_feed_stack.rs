@@ -3290,7 +3290,8 @@ impl LiveIngest {
         // What it takes off the drain is not small. The inline rescue did
         // `create_dir_all`, a `read_dir` + per-entry `metadata()` walk of the
         // spill directory AND its quarantine subdirectory, a live free-space
-        // probe (which forks `df` on its first call), and then up to 32 MiB of
+        // probe (a forked `df` until 2026-10-12, one `statvfs` call since), and
+        // then up to 32 MiB of
         // file write — all on the frame-drain task, and all on the same volume
         // QuestDB is stalling on.
         //

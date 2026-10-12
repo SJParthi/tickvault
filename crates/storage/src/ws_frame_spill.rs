@@ -9656,6 +9656,60 @@ mod tests {
         }
     }
 
+    /// Deep audit DA-12 (HOT-12, 2026-10-12): the single-thread tests above
+    /// cannot see a lost compare-and-swap race. Every socket read task calls
+    /// `next_frame_seq`, so it is checked here with 16 threads at once: no
+    /// value is handed out twice, every value leaves the packet-index bits
+    /// free, and each thread sees its own values strictly increase. Other
+    /// tests running in parallel may also take values from the same global
+    /// counter; that only adds contention and cannot make a value repeat.
+    #[test]
+    fn test_next_frame_seq_unique_and_low_bits_free_under_contention() {
+        const THREADS: usize = 16;
+        const PER_THREAD: usize = 10_000;
+        let handles: Vec<std::thread::JoinHandle<Vec<u64>>> = (0..THREADS)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    let mut taken = Vec::with_capacity(PER_THREAD);
+                    for _ in 0..PER_THREAD {
+                        taken.push(next_frame_seq());
+                    }
+                    taken
+                })
+            })
+            .collect();
+        let mut all = Vec::with_capacity(THREADS * PER_THREAD);
+        for handle in handles {
+            let taken = handle.join().expect("sequence thread panicked");
+            assert_eq!(taken.len(), PER_THREAD);
+            for pair in taken.windows(2) {
+                assert!(
+                    pair[1] > pair[0],
+                    "a thread's own frame_seq must strictly increase: {} !> {}",
+                    pair[1],
+                    pair[0]
+                );
+            }
+            for &seq in &taken {
+                assert_eq!(
+                    seq & MAX_PACKET_INDEX,
+                    0,
+                    "frame_seq {seq} has a non-zero packet-index slot under contention"
+                );
+            }
+            all.extend_from_slice(&taken);
+        }
+        all.sort_unstable();
+        let before = all.len();
+        all.dedup();
+        assert_eq!(
+            all.len(),
+            before,
+            "{} frame_seq values were handed out twice under contention",
+            before - all.len()
+        );
+    }
+
     #[test]
     fn test_packet_capture_seq_is_distinct_per_packet_and_never_reaches_the_next_frame() {
         let a = next_frame_seq();

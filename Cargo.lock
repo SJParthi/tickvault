@@ -4290,6 +4290,7 @@ dependencies = [
  "crossbeam-channel",
  "dhat",
  "flate2",
+ "libc",
  "metrics",
  "proptest",
  "questdb-rs",

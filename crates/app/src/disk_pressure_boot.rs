@@ -265,8 +265,8 @@ async fn run_disk_pressure_loop(
         // away. Widening that type to serve a second consumer would couple two
         // decisions that must be able to disagree.
         let mut free_bytes_seen: Option<u64> = None;
-        // `df` is a child process: run it on the blocking pool so a wedged
-        // disk (the case this loop exists for) cannot hold a runtime worker.
+        // `statvfs` can block on a wedged disk (the case this loop exists
+        // for): run it on the blocking pool so it cannot hold a runtime worker.
         let probe_dir = data_dir.clone();
         let outcome = tokio::task::spawn_blocking(move || probe_disk_free_bytes(&probe_dir))
             .await

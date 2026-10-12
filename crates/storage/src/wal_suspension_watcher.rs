@@ -1306,7 +1306,7 @@ const RESUME_DISK_PROBE_PATH: &str = "data";
 /// Every refusal is logged with its reason, because "nothing happened" and
 /// "we decided not to" are different states and only one of them means the
 /// operator should look.
-// TEST-EXEMPT: async I/O composition (a `df` probe plus one /exec per resume); every decision it makes — the disk classification, the attempt budget, the give-up point and the SQL — is a pure function tested in `wal_auto_resume`.
+// TEST-EXEMPT: async I/O composition (a `statvfs` disk probe plus one /exec per resume); every decision it makes — the disk classification, the attempt budget, the give-up point and the SQL — is a pure function tested in `wal_auto_resume`.
 async fn attempt_auto_resume(
     questdb: &QuestDbConfig,
     rows: &[WalTableRow],
@@ -1319,9 +1319,9 @@ async fn attempt_auto_resume(
         return;
     }
 
-    // Measured ONCE per poll, not per table: `df` is a subprocess, and the
-    // answer cannot differ between two tables on the same volume.
-    // On the blocking pool: a `df` fork can hang on the very volume whose
+    // Measured ONCE per poll, not per table: the answer cannot differ between
+    // two tables on the same volume.
+    // On the blocking pool: a `statvfs` call can hang on the very volume whose
     // fullness suspended the table (O(1) sweep, 2026-10-03).
     let probe = tokio::task::spawn_blocking(|| {
         crate::disk_health_watcher::probe_disk_free_bytes(std::path::Path::new(

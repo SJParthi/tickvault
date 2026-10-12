@@ -3,10 +3,12 @@
 //!
 //! Every crate root (each `lib.rs`, `main.rs` and `bin/*.rs` under
 //! `crates/*/src`) carries `#![cfg_attr(not(test), deny(unsafe_code))]`, so
-//! production code that writes `unsafe` fails to build. The one production
-//! opt-out is the `affinity` module in `crates/core/src/websocket/reader_runtime.rs`
+//! production code that writes `unsafe` fails to build. The production
+//! opt-outs are the `affinity` module in `crates/core/src/websocket/reader_runtime.rs`
 //! (the two CPU-affinity syscalls, each block bounds-checked with a SAFETY
-//! note). Test code (Rust 2024 `env::set_var` in `#[cfg(test)]` modules) is
+//! note) and, since 2026-10-12 (deep audit DA-12), the `statvfs_probe` module
+//! in `crates/storage/src/disk_health_watcher.rs` (one `statvfs` call that
+//! replaced a forked `df` process on the rescue free-space probe). Test code (Rust 2024 `env::set_var` in `#[cfg(test)]` modules) is
 //! outside the lint by the `cfg_attr(not(test), ...)` form.
 //!
 //! These two tests stop the lint being removed quietly, and stop a second
@@ -99,7 +101,7 @@ fn every_crate_root_denies_unsafe_code() {
 }
 
 #[test]
-fn allow_unsafe_code_appears_only_on_the_affinity_module() {
+fn allow_unsafe_code_appears_only_on_the_listed_modules() {
     let root = workspace_root();
     let mut files = Vec::new();
     rust_files(&root.join("crates"), &mut files);
@@ -126,14 +128,22 @@ fn allow_unsafe_code_appears_only_on_the_affinity_module() {
             }
         }
     }
+    sites.sort();
     assert_eq!(
         sites,
-        vec![(
-            "crates/core/src/websocket/reader_runtime.rs".to_string(),
-            "mod affinity {".to_string()
-        )],
-        "the only production opt-out from deny(unsafe_code) is the affinity module; \
-         a new one needs its own SAFETY notes and this test updated in the same change"
+        vec![
+            (
+                "crates/core/src/websocket/reader_runtime.rs".to_string(),
+                "mod affinity {".to_string()
+            ),
+            (
+                "crates/storage/src/disk_health_watcher.rs".to_string(),
+                "mod statvfs_probe {".to_string()
+            ),
+        ],
+        "the only production opt-outs from deny(unsafe_code) are the affinity and \
+         statvfs_probe modules; a new one needs its own SAFETY notes and this test \
+         updated in the same change"
     );
 }
 

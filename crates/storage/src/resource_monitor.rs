@@ -421,7 +421,7 @@ pub struct ResourceMonitorPaths {
     /// ceiling when no cgroup limit exists. Without this the check silently
     /// does nothing on a bare systemd host; see [`resolve_memory_ceiling`].
     pub proc_meminfo: PathBuf,
-    /// spill directory (free-percent probe reuses the disk-health `df` probe).
+    /// spill directory (free-percent probe reuses the disk-health `statvfs` probe).
     pub spill_dir: PathBuf,
 }
 
@@ -488,8 +488,8 @@ pub fn spawn_resource_monitor(paths: ResourceMonitorPaths) -> tokio::task::JoinH
             ticker.tick().await;
 
             // Every read below is blocking: `/proc` and cgroup files, an
-            // O(open fds) directory listing, and a `df` fork that can hang on
-            // a stalled volume. They all run in one blocking-pool task and the
+            // O(open fds) directory listing, and a `statvfs` call that can hang
+            // on a stalled volume. They all run in one blocking-pool task and the
             // async side only classifies (O(1) sweep, 2026-10-03).
             let probe_paths = paths.clone();
             let Ok(readings) = tokio::task::spawn_blocking(move || ProbeReadings {

@@ -879,14 +879,14 @@ pub const DEPTH_SPILL_VOLUME_FRACTION: u64 = 32;
 /// silently — same discipline as the tick tier.
 ///
 /// # Complexity
-/// O(1) after the first call (`OnceLock`). The first call spawns one `df`, on
-/// the cold flush-failure path only.
+/// O(1) after the first call (`OnceLock`). The first call makes one `statvfs`
+/// call, on the cold flush-failure path only.
 #[must_use]
 pub fn depth_spill_max_bytes() -> u64 {
     static RESOLVED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *RESOLVED.get_or_init(|| {
-        // Probe the deepest EXISTING ancestor: `df` on a path that does not
-        // exist yet fails, and the spill dir is created lazily.
+        // Probe the deepest EXISTING ancestor: `statvfs` on a path that does
+        // not exist yet fails, and the spill dir is created lazily.
         let mut probe: &std::path::Path = std::path::Path::new(DEPTH_SPILL_DIR);
         while !probe.exists() {
             match probe.parent() {
@@ -2128,8 +2128,8 @@ impl DepthWriter {
     /// timer arm, and the shutdown tail all reach it.
     ///
     /// Inline it did `create_dir_all`, a `read_dir` + per-entry `metadata()`
-    /// walk of the depth spill directory, a live free-space probe that FORKS
-    /// `df` on its first call, and then up to
+    /// walk of the depth spill directory, a live free-space probe (a forked
+    /// `df` until 2026-10-12, one `statvfs` call since), and then up to
     /// [`MAX_DEPTH_PRODUCER_BUFFER_BYTES`] — 32 MiB — of file write. All on the
     /// frame-drain task, and all on the volume QuestDB is stalling on.
     ///
@@ -2871,6 +2871,14 @@ pub const DEPTH_RESCUE_QUEUE_DEPTH: usize = 2;
 /// write would have kept it, and past the bound the drain writes inline as
 /// before, counted on `tv_depth_rescue_inline_fallback_total`.
 pub const DEPTH_PARKED_RESCUE_MAX_BATCHES: usize = 8;
+// Deep audit DA-12 (2026-10-12): the depth twin of the tick assert — every
+// WAL-backed batch queued, parked or being written holds a rescue floor.
+const _: () = assert!(
+    // `<` rather than `+ 1 <=`: the one extra slot is the batch in flight.
+    DEPTH_RESCUE_QUEUE_DEPTH + DEPTH_PARKED_RESCUE_MAX_BATCHES
+        < crate::wal_applied_watermark::RESCUE_FLOOR_SLOTS,
+    "depth rescue queue + park + in-flight must fit the rescue floor table"
+);
 
 /// Byte bound on the depth park: four producer buffers at their cut-over size.
 pub const DEPTH_PARKED_RESCUE_MAX_BYTES: usize = 4 * MAX_DEPTH_PRODUCER_BUFFER_BYTES;

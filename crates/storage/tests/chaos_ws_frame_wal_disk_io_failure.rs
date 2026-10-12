@@ -41,7 +41,9 @@
 //!
 //! The literal-disk-full subprocess approach IS achievable but requires
 //! adding `libc` to `crates/storage/Cargo.toml` — which is a
-//! Parthiban-approval dependency change, tracked separately.
+//! Parthiban-approval dependency change, tracked separately. *(2026-10-12:
+//! `libc` is now a dependency of `tickvault-storage` for the `statvfs`
+//! free-space probe, deep audit DA-12; this test still does not use it.)*
 
 #![cfg(test)]
 
