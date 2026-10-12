@@ -4279,6 +4279,7 @@ dependencies = [
 name = "tickvault-storage"
 version = "0.1.0"
 dependencies = [
+ "ahash",
  "anyhow",
  "arc-swap",
  "aws-config",
@@ -4290,6 +4291,7 @@ dependencies = [
  "crossbeam-channel",
  "dhat",
  "flate2",
+ "libc",
  "metrics",
  "proptest",
  "questdb-rs",

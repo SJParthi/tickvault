@@ -6187,7 +6187,7 @@ pub const WAL_PINNED_DISK_FLOOR_FREE_FRACTION: f64 = 0.05;
 /// Whether the volume holding `wal_dir` has less free space than
 /// [`WAL_PINNED_DISK_FLOOR_FREE_FRACTION`]. A failed probe reads as NOT below
 /// the floor: an unmeasured disk never justifies deleting the only copy.
-/// Cold prune path: one `df`.
+/// Cold prune path: one `statvfs` call.
 #[must_use]
 pub fn wal_disk_below_floor(wal_dir: &Path) -> bool {
     match crate::disk_health_watcher::probe_disk_free_bytes(wal_dir) {
@@ -6373,7 +6373,7 @@ pub fn ws_wal_active_max_bytes<P: AsRef<Path>>(wal_dir: P) -> u64 {
     if let Some(v) = RESOLVED.get() {
         return *v;
     }
-    // Probe the deepest EXISTING ancestor: `df` on a path that does not exist
+    // Probe the deepest EXISTING ancestor: `statvfs` on a path that does not exist
     // yet fails, and the WAL directory is created lazily.
     let mut probe: &Path = wal_dir.as_ref();
     while !probe.exists() {
@@ -9654,6 +9654,60 @@ mod tests {
                 "frame_seq {seq} has a non-zero packet-index slot"
             );
         }
+    }
+
+    /// Deep audit DA-12 (HOT-12, 2026-10-12): the single-thread tests above
+    /// cannot see a lost compare-and-swap race. Every socket read task calls
+    /// `next_frame_seq`, so it is checked here with 16 threads at once: no
+    /// value is handed out twice, every value leaves the packet-index bits
+    /// free, and each thread sees its own values strictly increase. Other
+    /// tests running in parallel may also take values from the same global
+    /// counter; that only adds contention and cannot make a value repeat.
+    #[test]
+    fn test_next_frame_seq_unique_and_low_bits_free_under_contention() {
+        const THREADS: usize = 16;
+        const PER_THREAD: usize = 10_000;
+        let handles: Vec<std::thread::JoinHandle<Vec<u64>>> = (0..THREADS)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    let mut taken = Vec::with_capacity(PER_THREAD);
+                    for _ in 0..PER_THREAD {
+                        taken.push(next_frame_seq());
+                    }
+                    taken
+                })
+            })
+            .collect();
+        let mut all = Vec::with_capacity(THREADS * PER_THREAD);
+        for handle in handles {
+            let taken = handle.join().expect("sequence thread panicked");
+            assert_eq!(taken.len(), PER_THREAD);
+            for pair in taken.windows(2) {
+                assert!(
+                    pair[1] > pair[0],
+                    "a thread's own frame_seq must strictly increase: {} !> {}",
+                    pair[1],
+                    pair[0]
+                );
+            }
+            for &seq in &taken {
+                assert_eq!(
+                    seq & MAX_PACKET_INDEX,
+                    0,
+                    "frame_seq {seq} has a non-zero packet-index slot under contention"
+                );
+            }
+            all.extend_from_slice(&taken);
+        }
+        all.sort_unstable();
+        let before = all.len();
+        all.dedup();
+        assert_eq!(
+            all.len(),
+            before,
+            "{} frame_seq values were handed out twice under contention",
+            before - all.len()
+        );
     }
 
     #[test]

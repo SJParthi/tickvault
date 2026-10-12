@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 /// `(file under the workspace root, wrapped call that must be present)`.
 const WRAPPED: &[(&str, &str)] = &[
-    // Every 60 s: `df` is a child process and can hang on a wedged disk.
+    // Every 60 s: `statvfs` can hang on a wedged disk.
     (
         "crates/app/src/disk_pressure_boot.rs",
         "tokio::task::spawn_blocking(move || probe_disk_free_bytes(&probe_dir))",

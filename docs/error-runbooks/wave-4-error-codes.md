@@ -404,6 +404,19 @@ spill dir is caught before the zero-loss chain is at risk. Reuses the
 gauge. **Triage:** `df -h data/spill/`; restore the QuestDB drain
 (cross-check DISK-WATCHER-01 / BOOT-01/02) or free disk.
 
+**Added 2026-10-12 (deep audit DA-12, S3-1) — `source = "disk_hours_left_low"`
+(a `warn!`, log only, no page).** The watcher keeps its last hour of
+free-space readings and projects how long the disk lasts at the rate it filled
+over that hour (`tv_disk_hours_left_at_fill_rate` on local `/metrics`; -1 means
+"not filling" or "under 10 minutes of readings"). The line fires once when, at that rate, the disk
+is full before capture ends at 15:40 IST (a longer projection is a normal
+session and never logs); it re-arms once the projection is 2 hours longer than
+the capture time left, or at the IST day change. **Triage:**
+check that the cold backup (raw frame upload) is keeping up, because frame logs
+are kept until a verified copy exists; then free disk or grow the volume. The
+probe itself is now one `statvfs` call, not the `df` tool, so a probe failure
+reads `reason = "statvfs_failed"`.
+
 ## OPER-01 — Dhan client-id changed in config (Wave-4-E3)
 
 **Reserved.** Severity::Critical. Defensive guard. Boot-time check

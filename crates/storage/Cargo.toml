@@ -45,6 +45,17 @@ flate2 = { workspace = true }
 # Review round 2 (2026-07-13): SHA-256 content identity for the S3
 # reuse/conflict decision (workspace-pinned; the app crate already uses it).
 sha2 = { workspace = true }
+# Deep audit DA-12 (2026-10-12): one `statvfs(2)` call replaces the forked
+# `df` process in `disk_health_watcher::probe_disk_free_bytes`, which the tick
+# and depth rescue paths (the frame drain's inline fallback included) call.
+# Unavoidable for that fix: the standard library has no free-space call.
+# Already a pinned workspace dependency (tickvault-core uses it for the reader
+# affinity), so `Cargo.lock` gains no new package.
+libc = { workspace = true }
+# Deep audit DA-12 (HOT-10): the faster hasher for the per-row contract-label
+# table. Already a pinned workspace dependency (app, core and trading use it),
+# so `Cargo.lock` gains no new package.
+ahash = { workspace = true }
 
 [features]
 # PR-C3 (2026-07-14): the `daily_universe_fetcher` feature (Sub-PR #10b-ε
