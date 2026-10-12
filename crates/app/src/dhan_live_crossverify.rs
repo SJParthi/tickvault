@@ -1915,6 +1915,11 @@ impl XverifyFetchFailureKind {
 pub struct XverifyFetchFailure {
     pub kind: XverifyFetchFailureKind,
     pub msg: String,
+    /// Vendor cell faults the failed fetch saw before it failed. ADDED
+    /// 2026-10-11 (review of audit INP-12): a body whose every row was
+    /// skipped for a bad cell is a failure, and its skipped-row count used to
+    /// be thrown away with it. All zero for every other failure.
+    pub faults: VendorCellFaults,
 }
 
 impl XverifyFetchFailure {
@@ -1922,6 +1927,7 @@ impl XverifyFetchFailure {
         Self {
             kind,
             msg: msg.into(),
+            faults: VendorCellFaults::default(),
         }
     }
 }
@@ -2001,7 +2007,29 @@ pub struct RunReport {
     /// elapsed — forces the verdict down to `partial` / `degraded`.
     pub degraded: bool,
     /// Rows skipped as malformed on either side (counted, never coerced).
+    ///
+    /// **⚠ CORRECTED 2026-10-11 (audit INP-12):** until this date the field
+    /// was filled from the live side only, so "either side" was false; it now
+    /// adds the vendor candles refused for a non-finite price. The verdict
+    /// does not read this field.
+    ///
+    /// **⚠ CORRECTED 2026-10-11 (review of INP-12):** the vendor term cannot
+    /// fire from today's input. JSON cannot carry NaN or infinity, serde_json
+    /// refuses an overflowing number, and the parser already skips a
+    /// non-finite candle (counted in [`Self::rest_rows_skipped`]). The term is
+    /// defensive; the value is the live side's count in practice.
     pub malformed_rows: usize,
+    /// Vendor rows the parser skipped for a bad price or timestamp cell.
+    /// ADDED 2026-10-11 (audit INP-12). Report and log only: these counts are
+    /// NOT in the daily audit row, so the stored verdict still cannot tell a
+    /// vendor cell fault from our own divergence (that half of INP-12 stays
+    /// open). Since the review of INP-12 it includes the rows of a target
+    /// whose every row was skipped, which also counts in `rest_failures`.
+    pub rest_rows_skipped: usize,
+    /// Vendor volume cells read as 0 because they did not parse. ADDED
+    /// 2026-10-11 (audit INP-12). Report and log only, not in the daily
+    /// audit row.
+    pub rest_volumes_coerced: usize,
     /// `true` when the run budget elapsed before every target was fetched.
     pub budget_elapsed: bool,
     /// `true` when the live read came back at [`LIVE_ROW_LIMIT`] + 1 rows, so
@@ -2125,7 +2153,7 @@ pub async fn fetch_rest_side_for_target(
     target: &XverifyTarget,
     trading_date: chrono::NaiveDate,
     timeout: std::time::Duration,
-) -> Result<Vec<SideBar>, XverifyFetchFailure> {
+) -> Result<(Vec<SideBar>, VendorCellFaults), XverifyFetchFailure> {
     use XverifyFetchFailureKind as K;
     let next_day = trading_date
         .succ_opt()
@@ -2162,20 +2190,113 @@ pub async fn fetch_rest_side_for_target(
             format!("rest fetch http {status}"),
         ));
     }
-    let text = tokio::time::timeout(timeout, resp.text())
+    // AUDIT INP-13 (2026-10-11): the body was read in one uncapped call, which
+    // buffers whatever the server sends, bounded only by the timeout. It is
+    // now read through the capped streaming helper and refused WHOLE past
+    // `XVERIFY_REST_MAX_BODY_BYTES` (never parsed truncated).
+    if resp
+        .content_length()
+        .is_some_and(|n| n > XVERIFY_REST_MAX_BODY_BYTES as u64)
+    {
+        return Err(XverifyFetchFailure::new(K::Other, REST_BODY_OVER_CAP_MSG));
+    }
+    let mut resp = resp;
+    let read_capped = async {
+        let mut body: Vec<u8> = Vec::new();
+        while let Some(chunk) = resp.chunk().await? {
+            if !crate::rest_candle_fold::accumulate_capped(
+                &mut body,
+                &chunk,
+                XVERIFY_REST_MAX_BODY_BYTES,
+            ) {
+                return Ok::<Option<Vec<u8>>, reqwest::Error>(None);
+            }
+        }
+        Ok(Some(body))
+    };
+    let body = tokio::time::timeout(timeout, read_capped)
         .await
         .map_err(|_| XverifyFetchFailure::new(K::Timeout, "rest body timed out"))?
-        .map_err(|e| XverifyFetchFailure::new(K::Transport, format!("rest body: {e}")))?;
-    let candles = crate::dhan_intraday_parse::parse_intraday_1m_candles(&text);
+        .map_err(|e| XverifyFetchFailure::new(K::Transport, format!("rest body: {e}")))?
+        .ok_or_else(|| XverifyFetchFailure::new(K::Other, REST_BODY_OVER_CAP_MSG))?;
+    // Review of INP-13 (2026-10-11): decode the way the old uncapped text
+    // read did — a leading UTF-8 byte-order mark is dropped and an invalid byte is
+    // replaced, not fatal — so the capped read changes only the size bound.
+    // A replaced byte inside a number cell makes that row skipped, and the
+    // skip is counted below. Borrowed (no copy) when the body is valid.
+    let text = decode_vendor_body(&body);
+    let (candles, cell_faults) = crate::dhan_intraday_parse::parse_intraday_1m_candles(&text);
     let (bars, malformed) =
         rest_candles_to_side_bars(&candles, target.security_id, &target.segment);
+    let faults = VendorCellFaults {
+        skipped_rows: cell_faults.skipped_rows,
+        coerced_volumes: cell_faults.coerced_volumes,
+        non_finite_rows: malformed,
+    };
     if bars.is_empty() && malformed == 0 {
-        return Err(XverifyFetchFailure::new(
-            K::NoCandles,
-            "rest returned no candles",
-        ));
+        // Review of INP-12 (2026-10-11): a body whose every row was skipped
+        // for a bad cell is still a failure (it counts in `rest_failures`),
+        // but it carries its counts and says so, instead of reading as an
+        // empty answer.
+        let mut failure = if faults.skipped_rows > 0 {
+            XverifyFetchFailure::new(
+                K::NoCandles,
+                format!("{REST_ROWS_ALL_SKIPPED_MSG}: {}", faults.skipped_rows),
+            )
+        } else {
+            XverifyFetchFailure::new(K::NoCandles, "rest returned no candles")
+        };
+        failure.faults = faults;
+        return Err(failure);
     }
-    Ok(bars)
+    Ok((bars, faults))
+}
+
+/// Failure message prefix for a vendor body whose every row was skipped for a
+/// bad cell. ADDED 2026-10-11 (review of audit INP-12).
+const REST_ROWS_ALL_SKIPPED_MSG: &str = "rest rows all skipped";
+
+/// Decodes a vendor body as text: drops a leading UTF-8 byte-order mark and
+/// replaces invalid bytes. ADDED 2026-10-11 (review of audit INP-13). O(body),
+/// no copy when the body is valid UTF-8.
+fn decode_vendor_body(body: &[u8]) -> std::borrow::Cow<'_, str> {
+    let bytes = body.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(body);
+    String::from_utf8_lossy(bytes)
+}
+
+/// Ceiling on one vendor intraday body, in bytes. ADDED 2026-10-11 (audit
+/// INP-13).
+///
+/// A full trading day of 1-minute candles is about 375 rows of six numbers,
+/// roughly 20 to 30 KB of JSON, so 4 MiB is more than a hundred times that.
+/// A larger body is refused whole (`Other`, [`REST_BODY_OVER_CAP_MSG`]),
+/// never parsed truncated. Memory: at most this much per fetch, one fetch in
+/// flight.
+pub const XVERIFY_REST_MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+
+/// Failure message for a vendor body over [`XVERIFY_REST_MAX_BODY_BYTES`].
+const REST_BODY_OVER_CAP_MSG: &str = "rest body over cap";
+
+/// Vendor-side cell faults one fetch absorbed without failing. ADDED
+/// 2026-10-11 (audit INP-12); summed across the run into [`RunReport`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VendorCellFaults {
+    /// Rows the parser skipped for a bad price or timestamp cell.
+    pub skipped_rows: usize,
+    /// Volume cells the parser read as 0 because they did not parse.
+    pub coerced_volumes: usize,
+    /// Parsed candles refused for a non-finite price
+    /// ([`rest_candles_to_side_bars`]).
+    pub non_finite_rows: usize,
+}
+
+impl VendorCellFaults {
+    /// Adds `other` into `self`, saturating. Pure, O(1).
+    fn absorb(&mut self, other: Self) {
+        self.skipped_rows = self.skipped_rows.saturating_add(other.skipped_rows);
+        self.coerced_volumes = self.coerced_volumes.saturating_add(other.coerced_volumes);
+        self.non_finite_rows = self.non_finite_rows.saturating_add(other.non_finite_rows);
+    }
 }
 
 /// [`fetch_rest_side_for_target`], paced against the shared Dhan Data-API
@@ -2204,7 +2325,7 @@ async fn fetch_rest_side_paced(
     trading_date: chrono::NaiveDate,
     timeout: std::time::Duration,
     pacer: &mut RestPacer,
-) -> Result<Vec<SideBar>, XverifyFetchFailure> {
+) -> Result<(Vec<SideBar>, VendorCellFaults), XverifyFetchFailure> {
     pacer.wait().await;
     let out =
         fetch_rest_side_for_target(client, intraday_url, jwt, target, trading_date, timeout).await;
@@ -2344,6 +2465,8 @@ pub async fn run_cross_verification(
     let mut failure_samples: Vec<String> = Vec::with_capacity(FAILURE_SAMPLE_MAX);
     let mut budget_elapsed = false;
     let target_count = targets.len();
+    // Vendor-side cell faults, summed over the run (audit INP-12).
+    let mut vendor_faults = VendorCellFaults::default();
 
     // ---- the sweep starts somewhere different every day ---------------
     //
@@ -2389,7 +2512,8 @@ pub async fn run_cross_verification(
         )
         .await
         {
-            Ok(mut bars) => {
+            Ok((mut bars, faults)) => {
+                vendor_faults.absorb(faults);
                 let fetched_at_nanos = fetched_at_ist_nanos_now();
                 rest_tape.extend(bars.iter().map(|b| {
                     tickvault_storage::dhan_live_crossverify_persistence::DhanRestTapeRow {
@@ -2413,6 +2537,9 @@ pub async fn run_cross_verification(
                 // `XverifyFetchFailureKind` for what that cost.
                 rest_failures = rest_failures.saturating_add(1);
                 rest_failure_breakdown.record(failure.kind);
+                // A target that lost every row to bad cells still reports
+                // them (review of audit INP-12); zero for other failures.
+                vendor_faults.absorb(failure.faults);
                 if failure_samples.len() < FAILURE_SAMPLE_MAX {
                     failure_samples.push(format!(
                         "{}/{} {}: {}",
@@ -2469,7 +2596,9 @@ pub async fn run_cross_verification(
         rest_failure_breakdown,
         live_truncated: truncated,
         degraded,
-        malformed_rows: live_malformed,
+        malformed_rows: live_malformed.saturating_add(vendor_faults.non_finite_rows),
+        rest_rows_skipped: vendor_faults.skipped_rows,
+        rest_volumes_coerced: vendor_faults.coerced_volumes,
         budget_elapsed,
         rest_tape,
     })
@@ -4106,6 +4235,8 @@ mod tests {
             rest_failure_breakdown: RestFailureBreakdown::default(),
             degraded: true,
             malformed_rows: 0,
+            rest_rows_skipped: 0,
+            rest_volumes_coerced: 0,
             budget_elapsed: true,
             live_truncated: false,
             rest_tape: Vec::new(),
@@ -4250,7 +4381,7 @@ mod tests {
             .nth(1)
             .expect("run_cross_verification must exist");
         // Bound the scan to the function, not the rest of the file.
-        let end = body.find("\n}\n").unwrap_or(body.len());
+        let end = body.find("\n\x7d\n").unwrap_or(body.len());
         let body = &body[..end];
         assert!(
             body.contains("rest_failure_breakdown.record("),
@@ -5790,6 +5921,281 @@ mod tests {
             if ALL_POLICIES[policy_ix] == LateWindowPolicy::Strict {
                 proptest::prop_assert_eq!(cmp.late_excused, 0);
             }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Audit INP-12 / INP-13 (2026-10-11): vendor cell faults reach the
+    // report, and the vendor body is read through a byte cap.
+    // -----------------------------------------------------------------
+
+    /// A loopback HTTP server that answers every request with `body`. With
+    /// `content_length` false it sends no length and closes, so the client
+    /// streams to EOF (the path the byte cap guards when no length is sent).
+    async fn spawn_fixed_body_http(body: Vec<u8>, content_length: bool) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let body = std::sync::Arc::new(body);
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    let body = std::sync::Arc::clone(&body);
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut buf = [0u8; 16_384];
+                        let _ = stream.read(&mut buf).await;
+                        let head = if content_length {
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            )
+                        } else {
+                            "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_string()
+                        };
+                        let _ = stream.write_all(head.as_bytes()).await;
+                        let _ = stream.write_all(&body).await;
+                        let _ = stream.shutdown().await;
+                    });
+                }
+            }
+        });
+        port
+    }
+
+    fn inp_target() -> XverifyTarget {
+        XverifyTarget {
+            security_id: 13,
+            segment: "IDX_I".to_string(),
+            instrument: "INDEX".to_string(),
+        }
+    }
+
+    fn inp_date() -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(2026, 8, 10).expect("date")
+    }
+
+    /// One good row, one row with a null open (skipped), one string volume
+    /// (coerced to 0).
+    const INP_FAULTY_BODY: &str = r#"{"open":[1.0,null,3.0],"high":[1.0,2.0,3.0],"low":[1.0,2.0,3.0],"close":[1.0,2.0,3.0],"volume":[1,2,"x"],"timestamp":[1786334400,1786334460,1786334520]}"#;
+
+    #[tokio::test]
+    async fn fetch_rest_side_carries_the_vendor_cell_faults() {
+        let port = spawn_fixed_body_http(INP_FAULTY_BODY.as_bytes().to_vec(), true).await;
+        let url = format!("http://127.0.0.1:{port}/v2/charts/intraday");
+        let (bars, faults) = fetch_rest_side_for_target(
+            &reqwest::Client::new(),
+            &url,
+            "test-token",
+            &inp_target(),
+            inp_date(),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("a body with good rows is a success");
+        assert_eq!(bars.len(), 2);
+        assert_eq!(
+            faults,
+            VendorCellFaults {
+                skipped_rows: 1,
+                coerced_volumes: 1,
+                non_finite_rows: 0
+            }
+        );
+    }
+
+    /// Two rows, both with a null open: every row is skipped.
+    const INP_ALL_SKIPPED_BODY: &str = r#"{"open":[null,null],"high":[1.0,2.0],"low":[1.0,2.0],"close":[1.0,2.0],"volume":[1,2],"timestamp":[1786334400,1786334460]}"#;
+
+    #[tokio::test]
+    async fn fetch_rest_side_all_rows_skipped_is_a_failure_that_keeps_its_faults() {
+        let port = spawn_fixed_body_http(INP_ALL_SKIPPED_BODY.as_bytes().to_vec(), true).await;
+        let url = format!("http://127.0.0.1:{port}/v2/charts/intraday");
+        let failure = fetch_rest_side_for_target(
+            &reqwest::Client::new(),
+            &url,
+            "test-token",
+            &inp_target(),
+            inp_date(),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect_err("a body with no usable row is still a failure");
+        assert_eq!(failure.kind, XverifyFetchFailureKind::NoCandles);
+        assert!(
+            failure.msg.starts_with(REST_ROWS_ALL_SKIPPED_MSG),
+            "value drift must not read as an empty answer: {}",
+            failure.msg
+        );
+        assert_eq!(failure.faults.skipped_rows, 2);
+    }
+
+    #[tokio::test]
+    async fn run_report_counts_an_all_skipped_target_as_a_failure_with_its_rows() {
+        let rest_port = spawn_fixed_body_http(INP_ALL_SKIPPED_BODY.as_bytes().to_vec(), true).await;
+        let live_port = spawn_fixed_body_http(br#"{"dataset":[]}"#.to_vec(), true).await;
+        let report = run_cross_verification(
+            &reqwest::Client::new(),
+            &format!("http://127.0.0.1:{live_port}/exec"),
+            &format!("http://127.0.0.1:{rest_port}/v2/charts/intraday"),
+            "test-token",
+            &[inp_target()],
+            inp_date(),
+            DAY_START_NANOS,
+            &DhanLiveCrossverifyConfig::default(),
+            ReadPolicy::STRICT,
+        )
+        .await
+        .expect("run completes");
+        assert_eq!(report.rest_failures, 1, "still a failure");
+        assert!(report.degraded, "a failure degrades the run");
+        assert_eq!(
+            report.rest_rows_skipped, 2,
+            "the skipped rows of a failed target reach the report"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_rest_side_accepts_a_body_with_a_utf8_byte_order_mark() {
+        let mut body = b"\xEF\xBB\xBF".to_vec();
+        body.extend_from_slice(INP_FAULTY_BODY.as_bytes());
+        let port = spawn_fixed_body_http(body, true).await;
+        let url = format!("http://127.0.0.1:{port}/v2/charts/intraday");
+        let (bars, _) = fetch_rest_side_for_target(
+            &reqwest::Client::new(),
+            &url,
+            "test-token",
+            &inp_target(),
+            inp_date(),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("a BOM-prefixed body parses as before");
+        assert_eq!(bars.len(), 2);
+    }
+
+    #[test]
+    fn decode_vendor_body_strips_a_bom_and_replaces_invalid_bytes() {
+        assert_eq!(decode_vendor_body(b"\xEF\xBB\xBF{}"), "{}");
+        assert_eq!(decode_vendor_body(b"{}"), "{}");
+        assert!(matches!(
+            decode_vendor_body(b"{}"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert_eq!(decode_vendor_body(b"{\xFF}"), "{\u{FFFD}}");
+    }
+
+    /// Renamed 2026-10-11 (review of INP-12): it was named for
+    /// `malformed_rows`, which it never asserted; it checks the vendor cell
+    /// fault counts.
+    #[tokio::test]
+    async fn run_report_carries_vendor_cell_faults() {
+        let rest_port = spawn_fixed_body_http(INP_FAULTY_BODY.as_bytes().to_vec(), true).await;
+        let live_port = spawn_fixed_body_http(br#"{"dataset":[]}"#.to_vec(), true).await;
+        let report = run_cross_verification(
+            &reqwest::Client::new(),
+            &format!("http://127.0.0.1:{live_port}/exec"),
+            &format!("http://127.0.0.1:{rest_port}/v2/charts/intraday"),
+            "test-token",
+            &[inp_target()],
+            inp_date(),
+            DAY_START_NANOS,
+            &DhanLiveCrossverifyConfig::default(),
+            ReadPolicy::STRICT,
+        )
+        .await
+        .expect("run completes");
+        assert_eq!(report.rest_failures, 0);
+        assert_eq!(
+            report.rest_rows_skipped, 1,
+            "vendor skipped rows reach the report"
+        );
+        assert_eq!(
+            report.rest_volumes_coerced, 1,
+            "vendor coerced volumes reach the report"
+        );
+    }
+
+    #[test]
+    fn vendor_cell_faults_absorb_sums_every_field() {
+        let mut total = VendorCellFaults::default();
+        total.absorb(VendorCellFaults {
+            skipped_rows: 1,
+            coerced_volumes: 2,
+            non_finite_rows: 3,
+        });
+        total.absorb(VendorCellFaults {
+            skipped_rows: 10,
+            coerced_volumes: 20,
+            non_finite_rows: usize::MAX,
+        });
+        assert_eq!(
+            total,
+            VendorCellFaults {
+                skipped_rows: 11,
+                coerced_volumes: 22,
+                non_finite_rows: usize::MAX
+            }
+        );
+    }
+
+    #[test]
+    fn xverify_rest_body_cap_is_well_above_a_full_day_body() {
+        // A full session of 1-minute bars, serialised the way the vendor does.
+        let n = 375usize;
+        let prices: Vec<f64> = (0..n).map(|i| 24_500.25 + i as f64).collect();
+        let volumes: Vec<i64> = (0..n).map(|i| 1_234_567 + i as i64).collect();
+        let stamps: Vec<i64> = (0..n).map(|i| 1_786_334_400 + 60 * i as i64).collect();
+        let body = serde_json::json!({
+            "open": prices, "high": prices, "low": prices, "close": prices,
+            "volume": volumes, "timestamp": stamps,
+        })
+        .to_string();
+        assert!(
+            body.len() < XVERIFY_REST_MAX_BODY_BYTES / 50,
+            "a full day ({} bytes) must sit far under the cap",
+            body.len()
+        );
+    }
+
+    #[test]
+    fn fetch_rest_side_reads_the_body_through_the_capped_reader() {
+        let src = include_str!("dhan_live_crossverify.rs");
+        let start = src
+            .find("pub async fn fetch_rest_side_for_target(")
+            .expect("fn present");
+        let body = src[start..].split("\n\x7d\n").next().expect("fn body");
+        assert!(body.contains("accumulate_capped("));
+        assert!(body.contains("XVERIFY_REST_MAX_BODY_BYTES"));
+        assert!(
+            !body.contains(&["resp", ".text()"].concat()),
+            "the vendor body must never be read uncapped"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_rest_side_refuses_an_oversize_body() {
+        for content_length in [true, false] {
+            let port =
+                spawn_fixed_body_http(vec![b' '; XVERIFY_REST_MAX_BODY_BYTES + 1], content_length)
+                    .await;
+            let url = format!("http://127.0.0.1:{port}/v2/charts/intraday");
+            let err = fetch_rest_side_for_target(
+                &reqwest::Client::new(),
+                &url,
+                "test-token",
+                &inp_target(),
+                inp_date(),
+                std::time::Duration::from_secs(10),
+            )
+            .await
+            .expect_err("an oversize body must be refused");
+            assert_eq!(err.kind, XverifyFetchFailureKind::Other);
+            assert_eq!(
+                err.msg, REST_BODY_OVER_CAP_MSG,
+                "content_length={content_length}"
+            );
         }
     }
 }

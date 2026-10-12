@@ -66,6 +66,7 @@
 
 **Symptom:** Telegram CRITICAL "BOOT-03 — clock skew exceeded"; app exited.
 **Cause:** Host wall-clock drift ≥ 2s vs `chronyc tracking` source OR QuestDB `now()`.
+**⚠ CORRECTED 2026-10-11 (audit CLOCK-3):** the source is `chronyc tracking` only. The QuestDB `now()` fallback was removed because QuestDB runs on this host and shares its clock, so it always read about 0. When chronyc cannot answer, boot proceeds with a BOOT-03 `warn!` (skew unknown) and the local gauge `tv_clock_skew_probe_available` reads 0.
 **Fix:**
   1. `chronyc tracking` — inspect "Last offset".
   2. `chronyc -a 'burst 4/4' && chronyc -a makestep` — force step adjustment.

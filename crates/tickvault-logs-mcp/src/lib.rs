@@ -107,6 +107,7 @@
 //!     the skip-continue semantics. The parity transcript uses
 //!     valid-UTF-8 files only, so the byte-parity gate is unaffected.
 
+#![cfg_attr(not(test), deny(unsafe_code))]
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 #![cfg_attr(not(test), deny(clippy::expect_used))]
 #![deny(clippy::print_stdout)]

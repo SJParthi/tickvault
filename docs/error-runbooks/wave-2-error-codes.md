@@ -282,6 +282,48 @@ ring + spill backoff exhausted. Coalesces AUDIT-01..06.
 **Triage:** see specific AUDIT-NN code emitted alongside.
 **Source:** `crates/storage/src/{phase2,depth_rebalance,ws_reconnect,boot,selftest,order}_audit_persistence.rs`
 
+### 2026-10-11 note — SEBI lifecycle and constituency writes (audit OBS-2)
+
+Three failed writes to the SEBI never-delete tables were coded WS-GAP-03 (a
+socket state code) until 2026-10-11, so a search for STORAGE-GAP-03 missed
+them. They now carry STORAGE-GAP-03 with these `source` values:
+
+| `source` | Table | Counter (local `/metrics` only) |
+|---|---|---|
+| `lifecycle_persist_failed` | `instrument_lifecycle` | `tv_instrument_lifecycle_persist_failed_total` |
+| `lifecycle_audit_persist_failed` | `instrument_lifecycle_audit` | `tv_instrument_lifecycle_audit_failed_total` |
+| `rider_constituency_persist_failed` | `index_constituency` | `tv_index_constituency_persist_failed_total` |
+
+Each runs once a day. Nothing is deleted; the next day's write is
+DEDUP-idempotent and re-writes what did not land. **What to do:** check
+QuestDB health, then read the `err` field on the line. Since the same date
+(audit QDB-2) these writers use acknowledged HTTP ILP, so a line QuestDB
+refused fails here instead of being reported as written. The three counters
+are not in any loss-group alarm; adding them is an owner decision that needs
+a dated row in the noise lock first. No page, no new alarm.
+
+**⚠ CORRECTED 2026-10-11 (review of QDB-2, same day).** "The next day's
+write is DEDUP-idempotent and re-writes what did not land" was true of
+`instrument_lifecycle` only:
+
+- `instrument_lifecycle_audit` rows are derived by comparing today's rows
+  with what the table held before. When the lifecycle rows were written
+  first and the audit rows after, a failed audit chunk was lost for good: the
+  next run read the new state and found nothing to record. The writer is now
+  audit-first: a lifecycle row whose audit row did not land is held back, so
+  the table keeps yesterday's state for it and the next run (a restart the
+  same day, or the next day) records the same transition again, stamped with
+  that run's date. A refused lifecycle chunk no longer stops the chunks after
+  it; the pass stops only after 2 failed chunks in a row (a database that is
+  down). `lifecycle_persist_failed` now carries the counts: audit rows not
+  written, lifecycle rows held back, lifecycle rows not written.
+- `index_constituency` is a per-date point-in-time row. Tomorrow's run writes
+  tomorrow's date; today's row stays missing. Nothing re-writes it.
+
+All three writers now retry a transport failure or a 5xx answer for 10 s
+before giving up on a chunk (they shipped with no retry). A 4xx refusal (a
+bad row) is never retried. The counters are seeded at 0 at boot.
+
 ### 2026-09-22 note — the one-shot fresh-start reset emits this code
 
 `crates/storage/src/fresh_start_reset.rs` logs STORAGE-GAP-03 with

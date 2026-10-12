@@ -188,6 +188,56 @@ flag were ever set again.
   sockets it already had until Dhan evicts them; an evicted socket is then
   not re-dialled.
 
+**⚠ CHANGED 2026-10-11 (audit SUP-9) — renewal failures are counted and
+escalated.** The "WARN-and-retry path" in the Renewal row above was a bare
+`warn!` with no code and no count, and the renewal had no timeout of its own,
+so a hung SSM call logged nothing at all. Now each renewal runs under a 20 s
+local timeout (`INSTANCE_LOCK_RENEW_TIMEOUT_SECS`, below the 30 s heartbeat);
+an error or a timeout is counted on `tv_instance_lock_renew_failed_total{reason
+= "error" | "timeout"}` and the gauge `tv_instance_lock_renew_consecutive_failures`
+(local Prometheus only, no CloudWatch name) and logged as a coded RESILIENCE-01
+`warn!` (`stage = "renew_failed"`). The second failure in a row
+(`INSTANCE_LOCK_RENEW_FAILURES_BEFORE_ERROR`; 2 × 30 s + 20 s = 80 s, before the
+90 s TTL) logs ONE RESILIENCE-01 `error!` with `stage = "renew_failing"` per
+failure episode (log sink only, no page: RESILIENCE-01 has no
+`error_code_alerts` entry). The next success logs `stage = "renew_recovered"`
+at INFO and re-arms it. **The self-fence is still not taken:** a failing
+renewal leaves the lock-held flag set, so dialling and minting continue, as
+the "Renewal does not settle" limit above records.
+
+**Operator action on `renew_failing`:** the box cannot reach SSM. If it
+persists past 90 s, a booting peer could take the lock over; check that no
+second process is starting, and check the box's network path to SSM.
+
+**⚠ CORRECTED 2026-10-11 (review of SUP-9) — four things the block above
+did not say.**
+- **These lines are not a dual-instance detection.** They reuse the
+  RESILIENCE-01 code for SSM reachability: the lock is still held and no peer
+  has been seen. Do NOT stop an instance on a `renew_failing` line alone (the
+  generic RESILIENCE-01 triage text says to; it is written for a real
+  detection). Their `severity` field now reads `high`, not the code's
+  `critical`.
+- **The feed scoreboard no longer counts them as dual-instance evidence.**
+  Before this, any RESILIENCE-01 line in a day's `errors.jsonl` made the blame
+  classifier call every 805 of that day `dual_instance` (ours) instead of
+  `rate_limit_805` (the broker), so two plain SSM timeouts mis-blamed the whole
+  day. Lines with `stage` = `ssm_transport`, `renew_failed`, `renew_failing`,
+  `renew_lapsed`, `release_at_shutdown_incomplete`,
+  `release_at_shutdown_skipped` or `release_at_shutdown_failed` are now
+  skipped there;
+  every other RESILIENCE-01 line still counts.
+- **The 90 s moment now has its own line.** Once the time since the last
+  successful renewal started reaches the 90 s TTL, one more RESILIENCE-01
+  `error!` with `stage = "renew_lapsed"` is logged per failure episode (log
+  sink only, no page). It is judged on time, not on the failure count, so late
+  heartbeat ticks cannot hide it. From that line on, a booting peer may take
+  the lock over.
+- **The headroom was smaller than stated.** Two timed-out renewals end at
+  +80 s, 10 s before the TTL, and the third starts at +90 s, the TTL boundary
+  itself; "two missed renewals leave 30 s" holds only for instant failures.
+  The log line now carries the whole error chain (the SDK cause, not only the
+  outer context).
+
 ## §4. What a PR that violates this lock looks like (REJECT)
 
 - Re-introduces a trading-mode (`is_live()`) or any other gate that can skip the

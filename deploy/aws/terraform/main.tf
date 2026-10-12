@@ -1,3 +1,7 @@
+# ⚠ CORRECTED 2026-10-11: the header below is history. The live instance lock
+# is r8g.xlarge (4 vCPU / 32 GiB), multi-AZ, per daily-universe-scope-expansion
+# §7 Quote 13 (2026-08-08); var.instance_type's validation pins it. The
+# t4g.medium envelope and bills below describe a superseded box.
 # DLT AWS stack — t4g.medium budget envelope (INTERIM ~₹1,289/mo incl GST:
 # 270 hrs, live 30 GB EBS [verified 2026-07-19 via describe-volumes — the
 # 2026-07-13 approved grow to 50 never physically applied; the ~₹1,471 figure
@@ -430,8 +434,11 @@ resource "aws_instance" "tv_app" {
   #                    out-of-band by scripts/aws-upgrade-instance.sh or the
   #                    guarded downsize-instance.yml workflow at a controlled
   #                    off-market time. Terraform must not fight that or revert
-  #                    it. The var.instance_type validation still documents the
-  #                    desired t4g.medium for any fresh provision.
+  #                    it. The var.instance_type validation pins r8g.xlarge
+  #                    for any fresh provision.
+  #                    ⚠ CORRECTED 2026-10-11: this said the validation
+  #                    documented t4g.medium as the desired type. It pins
+  #                    r8g.xlarge (Quote 13, 2026-08-08); t4g.medium is history.
   #   - user_data:     bootstrap-only (see note above); deploys are over SSM.
   #   - root_block_device size/iops/throughput: scripts/aws-upgrade-instance.sh
   #                    bumps these ONLINE (aws ec2 modify-volume, no stop, no data

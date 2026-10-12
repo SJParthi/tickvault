@@ -21,6 +21,18 @@
 //! With H1, the ENTIRE read-loop tail (counter + WAL hand-off + dispatch)
 //! is zero-allocation — no per-frame malloc remains on the hottest path.
 //!
+//! **⚠ CORRECTED 2026-10-11 (review of audit HOT-1).** The sentence above
+//! over-claims. This file measures a STAND-IN: a counter bump, a `Bytes`
+//! clone and `dispatch_frame`. It never calls the real per-frame path,
+//! `WalRingSink::accept` (WAL append, byte budget, ring `try_send`), and it
+//! does not cover `tokio-tungstenite`'s own read buffering. The real path is
+//! measured by `crates/app/tests/dhat_wal_ring_sink_accept.rs`, which shows it
+//! allocates nothing while the drain keeps up or while it sheds, and DOES
+//! allocate while the frame ring holds a backlog (about one 32-slot channel
+//! block per 32 queued frames, again on every backlog). So "the entire
+//! read-loop tail is zero-allocation" is not true under a backlog, and the
+//! `tokio-tungstenite` part is unmeasured.
+//!
 //! DHAT allows only one profiler per process, so all hot-path
 //! assertions are consolidated into a single test.
 

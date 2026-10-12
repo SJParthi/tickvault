@@ -1066,8 +1066,10 @@ pub enum ErrorCode {
     WsSpill04SegmentUnreadable,
     /// PROC-03: the process panicked (the panic hook). Under the release
     /// profile's `panic = "abort"` the process then dies and systemd
-    /// restarts it; the death is paged by the existing liveness alarms, and
-    /// this line carries the location, payload and the WAL abort-drain
+    /// restarts it. No alarm pages on a single panic that restarts within
+    /// about five minutes; only a restart loop or a 5+ minute outage between
+    /// 09:20 and 15:35 IST trips the liveness alarm (corrected 2026-10-11).
+    /// This line carries the location, payload and the WAL abort-drain
     /// result. (PROC-02 is reserved for the container restart loop.)
     /// Severity::Medium.
     Proc03Panicked,

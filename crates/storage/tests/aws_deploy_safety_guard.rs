@@ -63,6 +63,8 @@ fn code_only(s: &str) -> String {
 
 const MAIN_TF: &str = "deploy/aws/terraform/main.tf";
 const VARIABLES_TF: &str = "deploy/aws/terraform/variables.tf";
+/// The app and Lambda log export to S3 (2026-10-11, DA-11; noise lock §2.10-a).
+const LOG_EXPORT_TF: &str = "deploy/aws/terraform/log-export.tf";
 
 /// The running box must NEVER be stop-protected — the daily auto-stop cron and
 /// the upgrade script both need ec2:StopInstances. (`disable_api_stop = true`
@@ -362,6 +364,7 @@ fn _assert_exists(rel: &str) {
 fn deploy_terraform_files_exist() {
     _assert_exists(MAIN_TF);
     _assert_exists(VARIABLES_TF);
+    _assert_exists(LOG_EXPORT_TF);
 }
 
 const UPGRADE_SCRIPT: &str = "scripts/aws-upgrade-instance.sh";

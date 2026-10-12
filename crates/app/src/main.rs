@@ -1,32 +1,62 @@
 //! Binary entry point for the tickvault application.
 //!
 //! Orchestrates the complete boot sequence:
-//! Config → Observability → Logging → Notification → IP Verify → Auth → Persist → Universe → WebSocket → Pipeline → OrderUpdate → HTTP → Shutdown
+//! ~~Config → Observability → Logging → Notification → IP Verify → Auth → Persist → Universe → WebSocket → Pipeline → OrderUpdate → HTTP → Shutdown~~
 //!
 //! # Boot Sequence (optimized for fast restart)
 //!
-//! Steps 4+5 and QuestDB DDL queries run in parallel. Token cache skips
-//! the Dhan HTTP auth call on crash recovery (~500ms-2s saved).
+//! ~~Steps 4+5 and QuestDB DDL queries run in parallel. Token cache skips~~
+//! ~~the Dhan HTTP auth call on crash recovery (~500ms-2s saved).~~
 //!
-//! 1. Load and validate configuration
-//! 2. Initialize observability (Prometheus metrics + OpenTelemetry tracing)
-//! 3. Initialize structured logging with OpenTelemetry layer
-//! 4. (parallel) Notification service + Docker infra check
-//! 5. Verify public IP against SSM static IP (BLOCKS BOOT on mismatch)
-//! 6. Authenticate (token cache → SSM → TOTP → JWT)
-//! 7. (parallel) QuestDB table setup (5 DDL queries concurrent)
-//! 8. Build F&O universe + subscription plan
-//! 9. Build WebSocket connection pool
-//! 10. Spawn tick processing pipeline
-//! 11. Spawn background historical candle fetch (cold path)
-//! 12. Spawn order update WebSocket
-//! 13. Start API server
-//! 14. Spawn token renewal task
-//! 15. Await shutdown signal
+//! ~~1. Load and validate configuration~~
+//! ~~2. Initialize observability (Prometheus metrics + OpenTelemetry tracing)~~
+//! ~~3. Initialize structured logging with OpenTelemetry layer~~
+//! ~~4. (parallel) Notification service + Docker infra check~~
+//! ~~5. Verify public IP against SSM static IP (BLOCKS BOOT on mismatch)~~
+//! ~~6. Authenticate (token cache → SSM → TOTP → JWT)~~
+//! ~~7. (parallel) QuestDB table setup (5 DDL queries concurrent)~~
+//! ~~8. Build F&O universe + subscription plan~~
+//! ~~9. Build WebSocket connection pool~~
+//! ~~10. Spawn tick processing pipeline~~
+//! ~~11. Spawn background historical candle fetch (cold path)~~
+//! ~~12. Spawn order update WebSocket~~
+//! ~~13. Start API server~~
+//! ~~14. Spawn token renewal task~~
+//! ~~15. Await shutdown signal~~
+//!
+//! **⚠ CORRECTED 2026-10-11** — the list above is the 2026-05 boot and is
+//! stale: there is no IP check, no F&O universe or subscription plan, no
+//! tick pipeline task, no historical candle fetch and no separate
+//! token-renewal step here. The boot today, in source order:
+//!
+//! ~~1. holiday-gate short-circuit (Step -1, Step 0.5)~~
+//! ~~2. CryptoProvider (Step 0) and the panic hook (Step 0.9)~~
+//! ~~3. configuration (Step 1)~~
+//!
+//! **⚠ CORRECTED 2026-10-11 (later the same day):** items 1 and 2 above
+//! were not in source order. The source runs: holiday-gate CLI
+//! short-circuit (Step -1), CryptoProvider (Step 0), the holiday-gate and
+//! ensure-questdb one-shots (Step 0.5), the panic hook (Step 0.9), then
+//! configuration (Step 1). Items 4 onward are unchanged.
+//! 4. observability, including the WAL replay read (Step 2)
+//! 5. logging (Step 3)
+//! 6. per-feed dispatcher (Step C)
+//! 7. systemd watchdog pinger
+//! 8. shared infrastructure (QuestDB, notifier)
+//! 9. process and disk monitors
+//! 10. WAL replay settlement
+//! 11. Dhan REST stack (auth, and the order-update socket when enabled)
+//! 12. Dhan live-feed stack
+//! 13. systemd ready
+//! 14. run loop (API server), then shutdown
+//!
+//! Read the `Step` banners in this file, not this list: this list is prose
+//! and goes stale the same way the one above did.
 
 // APPROVED: clippy 1.95 tightened these doc-formatting lints; this binary
 // crate root predates them. Allow rather than churn doc comments for a
 // cosmetic markdown-rendering nicety with zero runtime/behavior impact.
+#![cfg_attr(not(test), deny(unsafe_code))]
 #![allow(clippy::doc_lazy_continuation)]
 #![allow(clippy::doc_overindented_list_items)]
 // Match the lib.rs restriction-lint blanket for the binary crate root:
@@ -37,7 +67,7 @@
 
 // Modules are declared in lib.rs for coverage instrumentation.
 use tickvault_app::boot_helpers::{
-    CONFIG_BASE_PATH, CONFIG_LOCAL_PATH, IstTimer, check_clock_drift, compute_market_close_sleep,
+    CONFIG_BASE_PATH, IstTimer, check_clock_drift, compute_market_close_sleep,
     create_error_log_writer, format_bind_addr, should_emit_post_market_alert,
 };
 use tickvault_app::{host_limits, infra, observability, subsystem_memory};
@@ -45,8 +75,6 @@ use tickvault_app::{host_limits, infra, observability, subsystem_memory};
 use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
-use figment::Figment;
-use figment::providers::{Format, Toml};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -112,6 +140,10 @@ fn trading_day_gate_exit_code(is_trading_day: bool) -> i32 {
 /// treats as "let the app start" — so the gate can NEVER stop the box on a real
 /// trading day because of a transient load failure. Single source of truth: the
 /// SAME `config/base.toml` NSE holiday list the app itself uses (no duplication).
+/// **⚠ CORRECTED 2026-10-11 (audit INP-14):** "the same list" was true only
+/// while no `config/<env>.toml` set one: the gate merged base and local, the
+/// boot merged base, `config/<env>.toml` and local. Both now read
+/// `boot_helpers::layered_config_figment`, the same layered config.
 fn run_trading_day_gate() -> ! {
     std::process::exit(trading_day_gate_code());
 }
@@ -122,10 +154,13 @@ const TRADING_DAY_GATE_LOAD_ERROR_EXIT: i32 = 70;
 /// The `--check-trading-day` verdict as an exit code, without exiting, so the
 /// in-process holiday gate asks the very same question.
 fn trading_day_gate_code() -> i32 {
-    let config: ApplicationConfig = match Figment::new()
-        .merge(Toml::file(CONFIG_BASE_PATH))
-        .merge(Toml::file(CONFIG_LOCAL_PATH))
-        .extract()
+    // AUDIT INP-14 (2026-10-11): the same layered merge as the boot (base,
+    // then config/<env>.toml, then local). Until this date the gate skipped
+    // the env file.
+    let config: ApplicationConfig = match tickvault_app::boot_helpers::layered_config_figment(
+        &tickvault_app::boot_helpers::resolve_config_env(),
+    )
+    .extract()
     {
         Ok(c) => c,
         // FAIL-OPEN on load error (exit 70 → gate lets the app start).
@@ -739,6 +774,92 @@ async fn async_main() -> Result<()> {
     }
 
     // -----------------------------------------------------------------------
+    // Step 0.9: Panic hook (audit CR-3, 2026-10-11)
+    // -----------------------------------------------------------------------
+    // Installed HERE, before the config load (which can panic) and before the
+    // first spawned task, the WAL writer thread and every other boot step, so
+    // a panic in boot from here on leaves the synchronous PROC-03 lines and
+    // gets the bounded WAL drain. Until this date it sat after ~40 spawns and
+    // the WAL thread, so an early panic left only the default stderr message.
+    // After the one-shot CLI short-circuits above, which never run the app.
+    // NOT covered (default stderr message only): the TLS provider install at
+    // Step 0, the holiday-gate and ensure-questdb one-shots, and main()'s
+    // reader-runtime setup before async_main starts.
+    // It needs nothing initialized: with no subscriber yet the tracing line
+    // is a no-op, the drain reports no spill registered, and the file writers
+    // create `data/logs/machine` themselves. No alarm pages on these lines. A
+    // single panic that systemd restarts within about five minutes is not
+    // paged at all; only a restart loop (past StartLimitBurst the unit stays
+    // failed) or an outage of five minutes or more between 09:20 and 15:35
+    // IST trips market-hours-liveness-missing. A PROC-03 page is an open
+    // owner decision under the noise lock.
+    let default_panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let location = panic_info.location().map_or_else(
+            || "unknown".to_string(),
+            |loc| format!("{}:{}:{}", loc.file(), loc.line(), loc.column()),
+        );
+        let payload = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown panic payload".to_string()
+        };
+        // Synchronous FIRST: every tracing sink is non-blocking, and under
+        // `panic = "abort"` the process dies before their worker threads
+        // flush. This line is the one record that must not ride a queue.
+        tickvault_app::observability::append_panic_line_sync(
+            std::path::Path::new(tickvault_app::boot_helpers::ERROR_LOG_FILE_PATH),
+            &location,
+            &payload,
+        );
+        // Audit OBS-1 (2026-10-11): errors.log is not shipped to CloudWatch;
+        // the hourly errors.jsonl file is. Write the same crash there too,
+        // synchronously, before the WAL drain can make it wait.
+        tickvault_app::observability::append_panic_jsonl_line_sync(
+            std::path::Path::new(tickvault_app::observability::ERRORS_JSONL_DIR),
+            &location,
+            &payload,
+        );
+        // Z11b (2026-10-02): under `panic = "abort"` (the release profile) the
+        // process dies the moment this hook returns, and every record still
+        // in the WAL spill channel dies with it — each one already reported to
+        // its socket as `Spilled`, and never resent by Dhan. Give the writer a
+        // bounded moment to empty the channel into the page cache, which
+        // survives the abort. Skipped (inside the call) when the writer itself
+        // panicked, and not run at all under unwinding, where the panic may be
+        // caught and the process lives on.
+        let wal_drain = if cfg!(panic = "abort") {
+            Some(
+                tickvault_storage::ws_frame_spill::drain_registered_for_abort(
+                    tickvault_storage::ws_frame_spill::WAL_ABORT_DRAIN_BUDGET,
+                ),
+            )
+        } else {
+            None
+        };
+        // Review of OBS-1 (2026-10-11): the two synchronous lines above run
+        // before the drain and the tracing line below dies with the abort, so
+        // without this no surviving record says how the drain ended. One more
+        // synchronous line, after the drain and before the default hook.
+        if let Some(outcome) = &wal_drain {
+            tickvault_app::observability::append_panic_wal_drain_jsonl_line_sync(
+                std::path::Path::new(tickvault_app::observability::ERRORS_JSONL_DIR),
+                &format!("{outcome:?}"),
+            );
+        }
+        tracing::error!(
+            code = tickvault_common::error_code::ErrorCode::Proc03Panicked.code_str(),
+            panic_location = %location,
+            panic_payload = %payload,
+            wal_drain = ?wal_drain,
+            "PANIC: tickvault crashed"
+        );
+        default_panic_hook(panic_info);
+    }));
+
+    // -----------------------------------------------------------------------
     // Step 1: Load and validate configuration
     // -----------------------------------------------------------------------
     // Merge order (last-write-wins): base.toml → config/<env>.toml → local.toml.
@@ -746,15 +867,14 @@ async fn async_main() -> Result<()> {
     // ENVIRONMENT, the SAME variable secret_manager uses for the SSM prefix, so
     // config + secrets always agree. For dev/local there is no override file,
     // so this is byte-identical to the previous base + local behaviour.
+    // Since 2026-10-11 (audit INP-14) the merge lives in
+    // `boot_helpers::layered_config_figment`, shared with the
+    // `--check-trading-day` gate so the two can never read different files.
     let config_env = tickvault_app::boot_helpers::resolve_config_env();
-    let mut config_figment = Figment::new().merge(Toml::file(CONFIG_BASE_PATH));
-    if let Some(env_path) = tickvault_app::boot_helpers::config_env_path(&config_env) {
-        config_figment = config_figment.merge(Toml::file(env_path));
-    }
-    let mut config: ApplicationConfig = config_figment
-        .merge(Toml::file(CONFIG_LOCAL_PATH))
-        .extract()
-        .context("failed to load configuration from config/base.toml")?;
+    let mut config: ApplicationConfig =
+        tickvault_app::boot_helpers::layered_config_figment(&config_env)
+            .extract()
+            .context("failed to load configuration from config/base.toml")?;
 
     config
         .validate()
@@ -1666,6 +1786,13 @@ async fn async_main() -> Result<()> {
     metrics::counter!("tv_seal_unwritten_mark_errors_total").increment(0);
     metrics::counter!("tv_wal_deferred_depth_persist_failed_total").increment(0);
     metrics::counter!("tv_wal_applied_watermark_persist_failed_total").increment(0);
+    // SEBI lifecycle / constituency write failures (audit OBS-2, 2026-10-11).
+    // Seeded here, after the recorder install, so a scrape records 0 before
+    // the once-a-day write that may fail. Local /metrics only: no alarm reads
+    // them yet (that needs a dated loss-group row).
+    metrics::counter!("tv_instrument_lifecycle_persist_failed_total").increment(0);
+    metrics::counter!("tv_instrument_lifecycle_audit_failed_total").increment(0);
+    metrics::counter!("tv_index_constituency_persist_failed_total").increment(0);
     for reason in ["too_large", "unparseable_order"] {
         metrics::counter!("tv_order_update_frames_dropped_total", "reason" => reason).increment(0);
     }
@@ -1702,6 +1829,81 @@ async fn async_main() -> Result<()> {
     metrics::counter!("tv_oom_monitor_probe_failed_total").increment(0);
     metrics::counter!("tv_ws_activity_watchdog_panicked_total", "label" => "order-update")
         .increment(0);
+    // The fourteen counters that joined the same six pages on 2026-10-11
+    // (noise lock §2.10-a). Same reason, every label value each emit site uses.
+    for reason in tickvault_app::top_volume_snapshot::SnapshotRefusal::ALL {
+        metrics::counter!(
+            tickvault_app::dhan_feed_stack::TOP_VOLUME_SNAPSHOT_REFUSAL_COUNTER,
+            "reason" => reason.as_str()
+        )
+        .increment(0);
+    }
+    for endpoint in tickvault_core::websocket::pool_budget::DhanEndpointType::ALL {
+        let endpoint = endpoint.as_str();
+        for reason in ["oversize", "transport"] {
+            metrics::counter!(
+                tickvault_core::websocket::connection::FRAME_REFUSED_METRIC,
+                "endpoint" => endpoint,
+                "reason" => reason
+            )
+            .increment(0);
+        }
+        // Only the primary account opens through the budget in production.
+        for reason in ["endpoint_at_capacity", "total_at_capacity"] {
+            metrics::counter!(
+                tickvault_core::websocket::pool_budget::POOL_BUDGET_REFUSED_METRIC,
+                "account" => "primary",
+                "endpoint" => endpoint,
+                "reason" => reason
+            )
+            .increment(0);
+        }
+    }
+    metrics::counter!(
+        tickvault_core::websocket::pool_supervisor::INSTANCE_LOCK_DIAL_REFUSED_METRIC
+    )
+    .increment(0);
+    for reason in ["sync", "slot_overflow"] {
+        metrics::counter!(
+            tickvault_storage::seal_dlq::SEAL_DLQ_SYNC_FAILED_COUNTER,
+            "reason" => reason
+        )
+        .increment(0);
+    }
+    for tier in ["minute", "hour", "day"] {
+        metrics::counter!("tv_oms_order_budget_refused_total", "tier" => tier).increment(0);
+    }
+    metrics::counter!("tv_oms_dh904_exhausted_total").increment(0);
+    for source in ["code", "wire_string"] {
+        metrics::counter!("tv_oms_unknown_order_segment_refused_total", "source" => source)
+            .increment(0);
+    }
+    metrics::counter!("tv_oms_stop_all_refusals_total").increment(0);
+    for reason in ["nan", "infinite", "non_positive"] {
+        metrics::counter!(
+            tickvault_trading::risk::engine::MARK_REJECTED_COUNTER,
+            "reason" => reason
+        )
+        .increment(0);
+    }
+    metrics::counter!("tv_day_ohlc_tracker_refused_total").increment(0);
+    metrics::counter!("tv_tick_gap_tracker_refused_total").increment(0);
+    for reason in ["clean_exit", "panic", "cancelled", "unknown"] {
+        metrics::counter!("tv_day_ohlc_reset_failures_total", "reason" => reason).increment(0);
+    }
+    for site in [
+        "boot_probe",
+        "lifecycle_audit_ensure",
+        "lifecycle_ensure",
+        "oms_wiring",
+        "retired_views_drop",
+        "shadow_drop_legacy",
+        "shadow_drop_retired_candles",
+        "shadow_ensure_tables",
+        "wal_suspension_probe",
+    ] {
+        metrics::counter!("tv_http_client_build_failed_total", "site" => site).increment(0);
+    }
     // The seal-spill write-error counter (2026-08-28). Emitted only when the
     // producer-side durable tier's own append fails, which is the moment the
     // no-drop policy is leaning hardest on it — and, like the twenty above, it
@@ -2380,18 +2582,31 @@ async fn async_main() -> Result<()> {
                 // trims (plan item 45e-1, operator Quotes 27 + 28). Same
                 // schedule and batch as the WAL pass; today's spill day file
                 // is the one the live writer may hold open, so it is skipped.
-                let today_spill_file =
-                    tickvault_storage::seal_spill::live_spill_file_name(now_utc_secs());
-                let others = raw_upload::run_spill_and_quarantine_passes(
-                    &store,
-                    std::path::Path::new("data/spill"),
-                    std::path::Path::new(tickvault_storage::tick_persistence::TICK_SPILL_DIR),
-                    std::path::Path::new(tickvault_storage::depth_persistence::DEPTH_SPILL_DIR),
-                    &today_spill_file,
-                    max_segments,
-                    &should_continue,
-                )
-                .await;
+                // Review of audit SUP-5 (2026-10-11): when the WAL pass ended on
+                // three S3 time-outs in a row the store is hung, so this loop
+                // skips the three file passes rather than spend their time-outs
+                // too; the WAL pass's failures already count and page, and the
+                // file sets are tried again on the next loop.
+                let others = if summary.store_unreachable {
+                    tracing::debug!(
+                        "cold bucket timed out on the WAL pass; spill and quarantine \
+                         passes skipped this loop"
+                    );
+                    raw_upload::UploadPassSummary::default()
+                } else {
+                    let today_spill_file =
+                        tickvault_storage::seal_spill::live_spill_file_name(now_utc_secs());
+                    raw_upload::run_spill_and_quarantine_passes(
+                        &store,
+                        std::path::Path::new("data/spill"),
+                        std::path::Path::new(tickvault_storage::tick_persistence::TICK_SPILL_DIR),
+                        std::path::Path::new(tickvault_storage::depth_persistence::DEPTH_SPILL_DIR),
+                        &today_spill_file,
+                        max_segments,
+                        &should_continue,
+                    )
+                    .await
+                };
                 if summary.marked() > 0 || others.marked() > 0 {
                     tickvault_app::reclaim_signal::request_reclaim();
                 }
@@ -2402,55 +2617,6 @@ async fn async_main() -> Result<()> {
             .await;
         }
     });
-
-    // Install panic hook: log at ERROR level (triggers Telegram via Loki → Grafana alerting).
-    let default_panic_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |panic_info| {
-        let location = panic_info.location().map_or_else(
-            || "unknown".to_string(),
-            |loc| format!("{}:{}:{}", loc.file(), loc.line(), loc.column()),
-        );
-        let payload = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
-            (*s).to_string()
-        } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
-            s.clone()
-        } else {
-            "unknown panic payload".to_string()
-        };
-        // Synchronous FIRST: every tracing sink is non-blocking, and under
-        // `panic = "abort"` the process dies before their worker threads
-        // flush. This line is the one record that must not ride a queue.
-        tickvault_app::observability::append_panic_line_sync(
-            std::path::Path::new(tickvault_app::boot_helpers::ERROR_LOG_FILE_PATH),
-            &location,
-            &payload,
-        );
-        // Z11b (2026-10-02): under `panic = "abort"` (the release profile) the
-        // process dies the moment this hook returns, and every record still
-        // in the WAL spill channel dies with it — each one already reported to
-        // its socket as `Spilled`, and never resent by Dhan. Give the writer a
-        // bounded moment to empty the channel into the page cache, which
-        // survives the abort. Skipped (inside the call) when the writer itself
-        // panicked, and not run at all under unwinding, where the panic may be
-        // caught and the process lives on.
-        let wal_drain = if cfg!(panic = "abort") {
-            Some(
-                tickvault_storage::ws_frame_spill::drain_registered_for_abort(
-                    tickvault_storage::ws_frame_spill::WAL_ABORT_DRAIN_BUDGET,
-                ),
-            )
-        } else {
-            None
-        };
-        tracing::error!(
-            code = tickvault_common::error_code::ErrorCode::Proc03Panicked.code_str(),
-            panic_location = %location,
-            panic_payload = %payload,
-            wal_drain = ?wal_drain,
-            "PANIC: tickvault crashed"
-        );
-        default_panic_hook(panic_info);
-    }));
 
     // Dropped-line publisher for every lossy log sink (2026-09-26 audit fix
     // PR1). A slow timer on its own task — never the tick path.
@@ -4027,6 +4193,17 @@ static SEAL_UNWRITTEN_MARK_DIR: std::sync::OnceLock<std::path::PathBuf> =
 /// disk cannot hold the shutdown before the WAL floor drains.
 const SEAL_UNWRITTEN_MARK_FINISH_BUDGET_SECS: u64 = 2;
 
+/// Budget for releasing the dual-instance lock at shutdown (audit CONC-4,
+/// 2026-10-11): one SSM read and one delete, normally well under a second.
+/// Bounded so an unreachable SSM cannot hold the stop; the 90s TTL clears
+/// the lock if the release does not finish. Counted in the sequential sum
+/// `shutdown_budget_fits_systemd_guard.rs` checks.
+const INSTANCE_LOCK_RELEASE_BUDGET_SECS: u64 = 3;
+
+/// [`INSTANCE_LOCK_RELEASE_BUDGET_SECS`] as a `Duration`.
+const INSTANCE_LOCK_RELEASE_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(INSTANCE_LOCK_RELEASE_BUDGET_SECS);
+
 /// [`SEAL_UNWRITTEN_MARK_FINISH_BUDGET_SECS`] as a `Duration`.
 const SEAL_UNWRITTEN_MARK_FINISH_BUDGET: std::time::Duration =
     std::time::Duration::from_secs(SEAL_UNWRITTEN_MARK_FINISH_BUDGET_SECS);
@@ -4491,15 +4668,15 @@ async fn build_shared_infra(
     let health_status: SharedHealthStatus = std::sync::Arc::new(SystemHealthStatus::new());
 
     // BOOT-03 (Wave-2-C Item 7.3): clock-skew boot gate. Wall-clock drift
-    // vs a trusted source (chronyc PRIMARY, QuestDB now() FALLBACK) that
-    // exceeds CLOCK_SKEW_HALT_THRESHOLD_SECS can silently split/merge trading
-    // days in QuestDB DEDUP keys — so HALT boot. Runs on every boot path
-    // before the seal-writer starts. QuestDB is up by here (ensure_infra_running
-    // above). A probe that CANNOT run (no chrony + QuestDB unreachable) degrades
-    // and PROCEEDS — a dev box without chrony must still boot (per
-    // test_enforce_clock_skew_at_boot_unavailable_does_not_halt).
+    // vs chronyc that exceeds CLOCK_SKEW_HALT_THRESHOLD_SECS can silently
+    // split/merge trading days in QuestDB DEDUP keys — so HALT boot. Runs on
+    // every boot path before the seal-writer starts. A probe that CANNOT run
+    // (no chrony) degrades and PROCEEDS — a dev box without chrony must still
+    // boot (per test_enforce_clock_skew_at_boot_unavailable_does_not_halt).
+    // ⚠ CORRECTED 2026-10-11 (audit CLOCK-3): the QuestDB now() FALLBACK is
+    // gone. QuestDB runs on this host and shares its clock, so it read ~0 and
+    // passed this gate exactly when chronyd had stopped.
     match infra::enforce_clock_skew_at_boot(
-        &config.questdb,
         tickvault_common::constants::CLOCK_SKEW_HALT_THRESHOLD_SECS,
     )
     .await
@@ -4517,12 +4694,9 @@ async fn build_shared_infra(
             // pre-market number. Re-sample every 30s so the alarm and the
             // dashboard panel track LIVE drift. See
             // infra::spawn_clock_skew_poller for the full reasoning.
-            infra::spawn_clock_skew_poller(
-                config.questdb.clone(),
-                std::time::Duration::from_secs(
-                    tickvault_common::constants::CLOCK_SKEW_POLL_INTERVAL_SECS,
-                ),
-            );
+            infra::spawn_clock_skew_poller(std::time::Duration::from_secs(
+                tickvault_common::constants::CLOCK_SKEW_POLL_INTERVAL_SECS,
+            ));
         }
         Err(infra::ClockSkewError::ThresholdExceeded {
             skew_secs,
@@ -4546,12 +4720,23 @@ async fn build_shared_infra(
             ));
         }
         Err(unavailable) => {
-            // Both probes failed (no chrony + QuestDB now() unreachable) —
-            // degrade, do NOT halt. Dev boxes without chrony still boot.
+            // chronyc failed (no chrony, chronyd stopped, or chronyd not
+            // synchronised to any source) — degrade, do NOT
+            // halt. Dev boxes without chrony still boot. The skew is UNKNOWN,
+            // not a number (audit CLOCK-3, 2026-10-11).
             warn!(
+                code = tickvault_common::error_code::ErrorCode::Boot03ClockSkewExceeded.code_str(),
+                reason = "probe_unavailable",
                 error = %unavailable,
-                "BOOT-03: clock-skew probe unavailable — proceeding without the gate"
+                "BOOT-03: clock-skew probe unavailable — proceeding without the gate; \
+                 the skew is unknown until chronyc answers"
             );
+            // Still start the poller, so a chronyd that comes back is
+            // measured. Its own power-of-two BOOT-03 warn covers a probe that
+            // keeps failing.
+            infra::spawn_clock_skew_poller(std::time::Duration::from_secs(
+                tickvault_common::constants::CLOCK_SKEW_POLL_INTERVAL_SECS,
+            ));
         }
     }
 
@@ -4890,22 +5075,54 @@ async fn build_shared_infra(
     // because port 3001 is publicly funnelled; an empty token on a live box
     // is an open switch on the internet, so live mode refuses to boot on it.
     // Paper mode keeps the documented dev passthrough, said out loud.
-    let bearer_token_is_empty = {
+    //
+    // Audit SEC-9 (2026-10-11): boot applies the SAME shape gate as rotation
+    // (32 to 512 visible ASCII characters, not one repeated character).
+    // Before, boot checked only emptiness, so a 3-character token guarded a
+    // publicly funnelled port. Live mode refuses to boot; paper mode keeps
+    // auth ENABLED on the loaded token and says so. Never logs the value or
+    // its length. **⚠ CHANGED 2026-10-11 (review of SEC-9):** the decision
+    // is the pure, unit-tested `bearer_token_boot_verdict`; this site only
+    // acts on it. Honest limit: production runs paper mode, so a weak token
+    // there still boots and guards the public port until SSM is fixed.
+    let bearer_boot_verdict = {
         use secrecy::ExposeSecret as _;
-        api_bearer_token.expose_secret().is_empty()
+        tickvault_api::middleware::bearer_token_boot_verdict(
+            api_bearer_token.expose_secret(),
+            config.strategy.dry_run,
+        )
     };
-    if bearer_token_is_empty {
-        if config.strategy.dry_run {
+    match bearer_boot_verdict {
+        tickvault_api::middleware::BearerTokenBootVerdict::Accept => {}
+        tickvault_api::middleware::BearerTokenBootVerdict::PaperEmptyAuthDisabled => {
             error!(
-                code = "GAP-SEC-01",
+                code = tickvault_common::error_code::ErrorCode::GapSecApiAuth.code_str(),
                 "the API bearer token in SSM is EMPTY — bearer auth is DISABLED for this paper-mode \
                  session and every /api route including the feed toggle is open; store a token via \
                  `aws ssm put-parameter --name /tickvault/<env>/api/bearer-token --type SecureString`"
             );
-        } else {
+        }
+        tickvault_api::middleware::BearerTokenBootVerdict::PaperWeakAuthEnabled => {
+            error!(
+                code = tickvault_common::error_code::ErrorCode::GapSecApiAuth.code_str(),
+                "the API bearer token in SSM is WEAK (shorter than 32 or longer than 512 \
+                 characters, not all visible ASCII, or one repeated character) — this paper-mode \
+                 session boots anyway and the publicly funnelled API port is guarded ONLY by that \
+                 weak token until it is replaced; rotate /tickvault/<env>/api/bearer-token to a \
+                 random value of 32 or more visible ASCII characters (live within 5 minutes)"
+            );
+        }
+        tickvault_api::middleware::BearerTokenBootVerdict::RefuseLiveEmpty => {
             anyhow::bail!(
                 "GAP-SEC-01: the API bearer token in SSM is EMPTY and this is LIVE mode — refusing to \
                  boot with bearer auth disabled on a publicly funnelled port"
+            );
+        }
+        tickvault_api::middleware::BearerTokenBootVerdict::RefuseLiveWeak => {
+            anyhow::bail!(
+                "GAP-SEC-01: the API bearer token in SSM is shorter than 32 or longer than 512 \
+                 characters, not all visible ASCII, or one repeated character — refusing to boot \
+                 LIVE on a weak token for a publicly funnelled port"
             );
         }
     }
@@ -4992,7 +5209,8 @@ const DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS: u64 = 30;
 /// Sized from the close path, not guessed: a socket sees the stop within one
 /// 1 s idle poll, then spends at most two 2 s `CLOSE_HANDSHAKE_WAIT`s (the
 /// Close write and the drain of the peer's reply). 5 s covers that and keeps
-/// the guard's 20 s margin at `TimeoutStopSec=145`.
+/// the guard's 20 s margin at `TimeoutStopSec=145`. (⚠ 2026-10-11, audit
+/// CONC-1: that sum missed two waits; the timeout is 165 now.)
 const DHAN_SOCKET_STOP_BUDGET_SECS: u64 = 5;
 
 /// [`DHAN_SOCKET_STOP_BUDGET_SECS`] as a `Duration`.
@@ -5149,76 +5367,100 @@ async fn run_process_runloop(
             );
         }
 
-        // Drain buffer: let in-flight ticks (last 15:29 candle) settle in the
-        // Groww bridge / seal writer before post-market housekeeping. (PR-C2,
-        // 2026-07-13: the Dhan lane abort block that followed this sleep is
-        // deleted with the lane — the Groww lane self-manages via its own
-        // dormancy gates; the order-update WS stays alive until app shutdown.)
-        let drain = std::time::Duration::from_secs(
-            tickvault_common::constants::MARKET_CLOSE_DRAIN_BUFFER_SECS,
-        );
-        tokio::time::sleep(drain).await;
+        // Audit CONC-5 (2026-10-11): the drain sleep and the partition detach
+        // below are pre-emptible by a shutdown signal. Until this date a
+        // SIGTERM that landed here (a deploy or stop just after 15:30) reached
+        // no live signal stream, was lost, and systemd SIGKILLed the process
+        // after TimeoutStopSec. The detach is idempotent and runs again the
+        // next day, so abandoning it loses nothing.
+        let post_market_housekeeping = async {
+            // Drain buffer: let in-flight ticks (last 15:29 candle) settle in the
+            // Groww bridge / seal writer before post-market housekeeping. (PR-C2,
+            // 2026-07-13: the Dhan lane abort block that followed this sleep is
+            // deleted with the lane — the Groww lane self-manages via its own
+            // dormancy gates; the order-update WS stays alive until app shutdown.)
+            let drain = std::time::Duration::from_secs(
+                tickvault_common::constants::MARKET_CLOSE_DRAIN_BUFFER_SECS,
+            );
+            tokio::time::sleep(drain).await;
 
-        // The daily archive sweep used to run HERE, inline. It now runs from
-        // `daily_archive_boot::spawn_supervised_daily_archive_loop`, spawned at
-        // boot, because this arm is unreachable on any run that started after
-        // 15:30 IST and is skipped entirely when shutdown arrives by SIGTERM —
-        // which is how the 17:30 box stop always arrives. Keeping a second copy
-        // here would give the sweep two drivers that could drift; there is now
-        // exactly one.
+            // The daily archive sweep used to run HERE, inline. It now runs from
+            // `daily_archive_boot::spawn_supervised_daily_archive_loop`, spawned at
+            // boot, because this arm is unreachable on any run that started after
+            // 15:30 IST and is skipped entirely when shutdown arrives by SIGTERM —
+            // which is how the 17:30 box stop always arrives. Keeping a second copy
+            // here would give the sweep two drivers that could drift; there is now
+            // exactly one.
 
-        // Post-market: detach old QuestDB partitions (Phase B) — ONLY when the
-        // archive leg is OFF.
-        //
-        // Fixed 2026-10-11 (audit RET-1). This block used to run whatever
-        // `archive_enabled` said, on the claim that "the daily archive loop
-        // drops aged partitions first". The timing says otherwise: this arm
-        // runs ~2 s after the 15:30 close, while the archive window opens at
-        // 15:30:02 and its first pass lands minutes later. Both select on the
-        // same rolling `retention_days` cutoff for the Standard class (the
-        // audit tables), so the partition that crossed the line today was
-        // DETACHED here first — renamed inside the EBS volume, gone from
-        // `table_partitions()`, never exported, never freed — and the archive
-        // pass could not see it. With the archive leg on, it is the only drop
-        // path: it exports, verifies the S3 copy, then drops.
-        {
-            let retention_days = config.partition_retention.retention_days;
-            if config.partition_retention.archive_enabled {
-                info!(
-                    retention_days,
-                    "post-market partition detach skipped — the archive leg owns \
-                     retention (archive, verify, then drop)"
-                );
-            } else if retention_days > 0 {
-                match tickvault_storage::partition_manager::PartitionManager::new(
-                    &config.questdb,
-                    retention_days,
-                ) {
-                    Ok(pm) => match pm.detach_old_partitions().await {
-                        Ok(count) => {
-                            info!(
-                                detached = count,
-                                retention_days, "post-market partition detach complete"
-                            );
-                        }
+            // Post-market: detach old QuestDB partitions (Phase B) — ONLY when the
+            // archive leg is OFF.
+            //
+            // Fixed 2026-10-11 (audit RET-1). This block used to run whatever
+            // `archive_enabled` said, on the claim that "the daily archive loop
+            // drops aged partitions first". The timing says otherwise: this arm
+            // runs ~2 s after the 15:30 close, while the archive window opens at
+            // 15:30:02 and its first pass lands minutes later. Both select on the
+            // same rolling `retention_days` cutoff for the Standard class (the
+            // audit tables), so the partition that crossed the line today was
+            // DETACHED here first — renamed inside the EBS volume, gone from
+            // `table_partitions()`, never exported, never freed — and the archive
+            // pass could not see it. With the archive leg on, it is the only drop
+            // path: it exports, verifies the S3 copy, then drops.
+            {
+                let retention_days = config.partition_retention.retention_days;
+                if config.partition_retention.archive_enabled {
+                    info!(
+                        retention_days,
+                        "post-market partition detach skipped — the archive leg owns \
+                         retention (archive, verify, then drop)"
+                    );
+                } else if retention_days > 0 {
+                    match tickvault_storage::partition_manager::PartitionManager::new(
+                        &config.questdb,
+                        retention_days,
+                    ) {
+                        Ok(pm) => match pm.detach_old_partitions().await {
+                            Ok(count) => {
+                                info!(
+                                    detached = count,
+                                    retention_days, "post-market partition detach complete"
+                                );
+                            }
+                            Err(err) => {
+                                warn!(?err, "post-market partition detach failed (non-critical)");
+                            }
+                        },
                         Err(err) => {
-                            warn!(?err, "post-market partition detach failed (non-critical)");
+                            warn!(?err, "partition manager creation failed (non-critical)");
                         }
-                    },
-                    Err(err) => {
-                        warn!(?err, "partition manager creation failed (non-critical)");
                     }
                 }
             }
-        }
 
-        info!("post-market: housekeeping complete — scheduled tasks continue");
+            info!("post-market: housekeeping complete — scheduled tasks continue");
+        };
+        let signal_during_housekeeping = tokio::select! {
+            biased;
+            reason = wait_for_shutdown_signal() => Some(reason),
+            () = post_market_housekeeping => None,
+        };
+        if let Some(reason) = signal_during_housekeeping {
+            info!(
+                reason,
+                "shutdown signal during post-market housekeeping — skipping the rest"
+            );
+        }
 
         // Phase 2: App runs 24/7. Only Ctrl+C / SIGTERM stops it.
         // No auto-shutdown — the daily reset signal at 16:00 IST handles
         // candle aggregator reset, indicator flush, etc. without stopping the app.
-        info!("post-market tasks running — app stays alive (Ctrl+C to stop)");
-        let reason = wait_for_shutdown_signal().await;
+        let reason = match signal_during_housekeeping {
+            Some(reason) => reason,
+            None => {
+                info!("post-market tasks running — app stays alive (Ctrl+C to stop)");
+                wait_for_shutdown_signal().await
+            }
+        };
         info!(
             reason,
             "shutdown signal received — stopping remaining services"
@@ -5330,24 +5572,41 @@ async fn run_process_runloop(
     // ERROR rather than exiting quietly — a flush that did not finish is not
     // the same as one that did, and the operator must be able to tell.
     dhan_feed_shutdown.notify_one();
+    // Audit CONC-2 (2026-10-11): whether this shutdown saw the whole sealed-
+    // candle tail written. Cleared by a lane that overran its budget (it may
+    // still seal, and those seals go to the durable spill) and by any seal
+    // writer outcome other than a clean, residue-free drain. Read at 5b-2c.
+    let mut seal_tail_complete = true;
+    // CONC-4 review (2026-10-11): whether the lane is known to have stopped.
+    // A lane that failed or overran its budget may still be running, so the
+    // dual-instance lock is kept at 5b-4. True when no lane ran.
+    let mut lane_stopped_cleanly = true;
     if let Some(handle) = dhan_feed_stack_monitor {
         match tokio::time::timeout(DHAN_LANE_SHUTDOWN_FLUSH_BUDGET, handle).await {
             Ok(Ok(())) => info!("Dhan live feed: sealed and flushed cleanly on shutdown"),
-            Ok(Err(err)) => error!(
-                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
-                %err,
-                "Dhan live feed: the lane task failed while shutting down — the day's tail may \
-                 not have been persisted"
-            ),
+            Ok(Err(err)) => {
+                seal_tail_complete = false;
+                lane_stopped_cleanly = false;
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                    %err,
+                    "Dhan live feed: the lane task failed while shutting down — the day's tail may \
+                     not have been persisted"
+                );
+            }
             // The budget is read from the constant — this line said "within 20s"
             // for a month after the budget was raised to 30 (2026-08-28).
-            Err(_) => error!(
-                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
-                budget_secs = DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS,
-                "Dhan live feed: the shutdown seal+flush did NOT finish within \
-                 {DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS}s — exiting anyway so systemd does not \
-                 SIGKILL us, but the day's tail may be incomplete"
-            ),
+            Err(_) => {
+                seal_tail_complete = false;
+                lane_stopped_cleanly = false;
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                    budget_secs = DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS,
+                    "Dhan live feed: the shutdown seal+flush did NOT finish within \
+                     {DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS}s — exiting anyway so systemd does not \
+                     SIGKILL us, but the day's tail may be incomplete"
+                );
+            }
         }
     }
 
@@ -5366,10 +5625,17 @@ async fn run_process_runloop(
     if let Some(cancel) = SEAL_WRITER_CANCEL.get() {
         let _ = cancel.send(true);
     }
+    // Seals the writer's final drain left in memory (audit CONC-2), counted
+    // as lost in the crash marker at 5b-2c.
+    let mut seal_final_residue = 0_usize;
     let seal_handle = SEAL_WRITER_HANDLE.lock().ok().and_then(|mut s| s.take());
     if let Some(handle) = seal_handle {
         match tokio::time::timeout(SEAL_WRITER_SHUTDOWN_BUDGET, handle).await {
             Ok(Ok(outcome)) => {
+                seal_final_residue = outcome.final_residue;
+                if outcome.final_residue > 0 || outcome.mpsc_submit_dropped > 0 {
+                    seal_tail_complete = false;
+                }
                 if outcome.mpsc_submit_dropped > 0 {
                     error!(
                         code = tickvault_common::error_code::ErrorCode::AggregatorDrop01.code_str(),
@@ -5388,19 +5654,24 @@ async fn run_process_runloop(
                     "seal writer: final drain complete on shutdown"
                 );
             }
-            Ok(Err(err)) => error!(
-                code = tickvault_common::error_code::ErrorCode::AggregatorDrop01
-                    .code_str(),
-                %err,
-                "seal writer: the task failed during its final drain — the day's tail may not \
-                 have been persisted"
-            ),
-            Err(_) => error!(
-                code = tickvault_common::error_code::ErrorCode::AggregatorDrop01.code_str(),
-                budget_secs = SEAL_WRITER_SHUTDOWN_BUDGET.as_secs(),
-                "seal writer: the final drain did NOT finish within budget — exiting anyway so \
-                 systemd does not SIGKILL us, but the day's tail is incomplete"
-            ),
+            Ok(Err(err)) => {
+                seal_tail_complete = false;
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::AggregatorDrop01.code_str(),
+                    %err,
+                    "seal writer: the task failed during its final drain — the day's tail may \
+                     not have been persisted"
+                );
+            }
+            Err(_) => {
+                seal_tail_complete = false;
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::AggregatorDrop01.code_str(),
+                    budget_secs = SEAL_WRITER_SHUTDOWN_BUDGET.as_secs(),
+                    "seal writer: the final drain did NOT finish within budget — exiting anyway \
+                     so systemd does not SIGKILL us, but the day's tail is incomplete"
+                );
+            }
         }
     }
 
@@ -5434,6 +5705,9 @@ async fn run_process_runloop(
         }
         if handle.is_finished() {
             if handle.join().is_err() {
+                // CONC-2 review (2026-10-11): what it held is gone, so the
+                // tail is not complete whatever the pending count reads.
+                seal_tail_complete = false;
                 error!(
                     code = tickvault_common::error_code::ErrorCode::AggregatorDrop01.code_str(),
                     "seal escalation thread PANICKED during its final drain — whatever it still held is gone"
@@ -5443,6 +5717,10 @@ async fn run_process_runloop(
             }
         } else {
             // Abandoned, not joined — joining now would wait without bound.
+            // Not a complete tail whatever the pending count reads: a
+            // Relaxed read can be 0 while one item is mid-write (CONC-2
+            // review, 2026-10-11).
+            seal_tail_complete = false;
             // Reported rather than swallowed: whatever is still queued dies
             // with the process, and a loss nobody counts is the false-OK this
             // whole shutdown path was rebuilt to stop producing.
@@ -5488,9 +5766,13 @@ async fn run_process_runloop(
         let dir = dir.clone();
         let now = chrono::Utc::now().timestamp();
         let finish = tokio::task::spawn_blocking(move || {
+            // The writer's residue is lost as surely as the abandoned
+            // escalation queue, and an incomplete tail names the last real
+            // drain instant rather than `now` (audit CONC-2, 2026-10-11).
             tickvault_storage::seal_writer_loop::finish_unwritten_mark_at_shutdown(
                 &dir,
-                seals_escalation_abandoned,
+                seals_escalation_abandoned.saturating_add(seal_final_residue),
+                seal_tail_complete,
                 now,
             )
         });
@@ -5541,6 +5823,29 @@ async fn run_process_runloop(
             );
         }
     }
+    // 5b-4. Release the dual-instance lock (audit CONC-4, 2026-10-11).
+    //
+    // AFTER the WAL floor, and only when every socket closed at 5a and the
+    // lane stopped cleanly inside its budget at 5b (CONC-4 review,
+    // 2026-10-11): only then can nothing here still dial Dhan. Otherwise
+    // the lock is kept, the heartbeat renews it until exit, and the 90s TTL
+    // clears it after the process has gone, so a waiting peer never dials
+    // while this process still can. The release flips the held flag off
+    // first, which refuses any late mint (RESILIENCE-03, logged at info as a
+    // stopping process, not paged as a peer). BEFORE the notifier flush, so
+    // a slow Telegram cannot eat the budget. Until this date the heartbeat
+    // was never told to stop and every clean stop left the lock in SSM for
+    // the 90s TTL, so a restart in market hours opened no socket for that
+    // long. Bounded: past the budget the TTL clears it as before.
+    let _ = tickvault_app::dhan_rest_stack::release_instance_lock_at_shutdown(
+        tickvault_app::dhan_rest_stack::ShutdownLockGate {
+            sockets_left_open,
+            lane_stopped_cleanly,
+        },
+        INSTANCE_LOCK_RELEASE_BUDGET,
+    )
+    .await;
+
     // 5c. Telegram UX overhaul (2026-07-07): flush pending coalesced
     // summaries + write the final episode snapshot (bounded 10s inside
     // shutdown_flush — a black-holed Telegram can never hang exit).
@@ -5562,29 +5867,106 @@ async fn run_process_runloop(
 // Helper: Wait for shutdown signal (SIGINT or SIGTERM)
 // ---------------------------------------------------------------------------
 
+/// The SIGTERM and SIGINT streams, created on the first wait and kept for the
+/// process (audit CONC-5, 2026-10-11).
+///
+/// A tokio signal stream sees only signals delivered while it exists: a new
+/// stream subscribes at the current version, so a signal that arrived while
+/// no stream was alive is recorded and broadcast to no one. Until this date
+/// each wait built fresh streams and dropped them on return, so a SIGTERM in
+/// the gap between the two waits (the post-market drain sleep and the
+/// partition detach) was lost: tokio's handler stayed installed, the default
+/// kill did not run either, and systemd SIGKILLed the process after
+/// `TimeoutStopSec` with the live lane still unflushed. A stream kept here
+/// buffers a signal delivered between waits, and the next wait returns at
+/// once.
+#[cfg(unix)]
+struct ShutdownSignals {
+    /// `None` only when creating the SIGTERM stream failed.
+    terminate: Option<tokio::signal::unix::Signal>,
+    /// `None` only when creating the SIGINT stream failed.
+    interrupt: Option<tokio::signal::unix::Signal>,
+}
+
+/// See [`ShutdownSignals`]. `None` until the first wait, so a SIGTERM during
+/// boot keeps its default effect exactly as before.
+#[cfg(unix)]
+static SHUTDOWN_SIGNALS: tokio::sync::Mutex<Option<ShutdownSignals>> =
+    tokio::sync::Mutex::const_new(None);
+
+/// One stream's next signal; never resolves when the stream does not exist.
+#[cfg(unix)]
+async fn next_signal(stream: &mut Option<tokio::signal::unix::Signal>) {
+    match stream {
+        Some(stream) => {
+            let _ = stream.recv().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
 /// Waits for either SIGINT (Ctrl+C) or SIGTERM and returns the signal name.
 ///
 /// SIGTERM support enables graceful shutdown from Docker (`docker stop`).
+/// The streams persist across calls (see [`ShutdownSignals`]), so a signal
+/// delivered between two waits is returned by the next one. Cancel-safe:
+/// dropping the future drops only the lock guard, never the streams.
+///
+/// If one stream cannot be created, the other is still kept and waited on
+/// (CONC-5 review, 2026-10-11): before, a failed SIGINT stream also dropped a
+/// SIGTERM stream that had been created, leaving tokio's SIGTERM handler
+/// installed with no receiver, so SIGTERM did nothing at all.
 async fn wait_for_shutdown_signal() -> &'static str {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
-        let mut sigterm = match signal(SignalKind::terminate()) {
-            Ok(s) => s,
-            Err(err) => {
-                warn!(?err, "SIGTERM handler failed — falling back to SIGINT only");
-                let _ = tokio::signal::ctrl_c().await;
-                return "ctrl_c";
+        let mut slot = SHUTDOWN_SIGNALS.lock().await;
+        if slot.is_none() {
+            // First use only: the same moment the streams were created
+            // before, so boot-time SIGTERM behaviour is unchanged.
+            let terminate = signal(SignalKind::terminate());
+            let interrupt = signal(SignalKind::interrupt());
+            match (terminate, interrupt) {
+                (Ok(terminate), Ok(interrupt)) => {
+                    *slot = Some(ShutdownSignals {
+                        terminate: Some(terminate),
+                        interrupt: Some(interrupt),
+                    });
+                }
+                (Ok(terminate), Err(err)) => {
+                    warn!(?err, "SIGINT handler failed — waiting on SIGTERM only");
+                    *slot = Some(ShutdownSignals {
+                        terminate: Some(terminate),
+                        interrupt: None,
+                    });
+                }
+                (Err(err), Ok(interrupt)) => {
+                    warn!(?err, "SIGTERM handler failed — waiting on SIGINT only");
+                    *slot = Some(ShutdownSignals {
+                        terminate: None,
+                        interrupt: Some(interrupt),
+                    });
+                }
+                (Err(term_err), Err(int_err)) => {
+                    drop(slot);
+                    warn!(
+                        ?term_err,
+                        ?int_err,
+                        "SIGTERM and SIGINT handlers failed — falling back to ctrl_c"
+                    );
+                    let _ = tokio::signal::ctrl_c().await;
+                    return "ctrl_c";
+                }
             }
+        }
+        let Some(signals) = slot.as_mut() else {
+            return "ctrl_c";
         };
         tokio::select! {
-            result = tokio::signal::ctrl_c() => {
-                if let Err(err) = result {
-                    warn!(?err, "failed to listen for SIGINT");
-                }
+            () = next_signal(&mut signals.interrupt) => {
                 "ctrl_c"
             }
-            _ = sigterm.recv() => {
+            () = next_signal(&mut signals.terminate) => {
                 info!("SIGTERM received — initiating graceful shutdown");
                 "sigterm"
             }
@@ -5605,6 +5987,48 @@ async fn wait_for_shutdown_signal() -> &'static str {
 #[allow(clippy::assertions_on_constants)]
 mod tests {
     use super::*;
+
+    /// Audit CONC-5 (2026-10-11): the shutdown-signal streams are created on
+    /// the first wait and outlive it, so a SIGTERM delivered while no wait is
+    /// running is returned by the next wait. Before the fix each wait built
+    /// and dropped its own streams, so a signal between two waits reached no
+    /// stream and the second wait never returned (bite: per-call streams fail
+    /// the last assertion).
+    ///
+    /// Sends a real SIGTERM to this test process with the system `kill`. The
+    /// handler stays installed for the rest of the test binary, so a later
+    /// SIGTERM or Ctrl+C to the binary is caught rather than killing it; under
+    /// nextest each test runs in its own process. This is the only test in
+    /// the binary that touches the signal streams, so they are bound to one
+    /// runtime.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_sigterm_between_two_waits_is_returned_by_the_next_wait() {
+        let short = std::time::Duration::from_millis(5);
+        assert!(
+            tokio::time::timeout(short, wait_for_shutdown_signal())
+                .await
+                .is_err(),
+            "no signal was sent yet"
+        );
+        assert!(
+            SHUTDOWN_SIGNALS.lock().await.is_some(),
+            "the streams outlive the wait that created them"
+        );
+        // No wait is running now: the signal lands between two waits.
+        let status = std::process::Command::new("kill")
+            .args(["-TERM", &std::process::id().to_string()])
+            .status()
+            .expect("run kill");
+        assert!(status.success(), "kill delivered SIGTERM");
+        let got = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            wait_for_shutdown_signal(),
+        )
+        .await
+        .expect("the buffered SIGTERM is returned by the next wait");
+        assert_eq!(got, "sigterm");
+    }
 
     #[test]
     fn reader_pin_report_covers_every_plan_and_never_reports_a_failed_pin_as_pinned() {

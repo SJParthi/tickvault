@@ -482,6 +482,12 @@ pub struct UnwrittenSealRecord {
     /// before it was written, spilled or counted lost. `None` when no sample
     /// of that process saw the queues empty, or the marker is `v1` and held
     /// seals. The boot warm-up re-sends the candles sealed after it.
+    ///
+    /// **⚠ CORRECTED 2026-10-11 (CONC-2 review) — nothing re-sends.** No
+    /// production code reads this field: [`previous_unwritten`] has no caller
+    /// outside the tests, and [`report_previous_unwritten`] returns 0 for a
+    /// clean marker without reading it. It is recorded for a reader, not
+    /// acted on.
     pub drained_at_unix_secs: Option<i64>,
 }
 
@@ -788,11 +794,30 @@ fn record_mark_write_failure(path: &std::path::Path, err: &std::io::Error, log: 
 /// `true` when the clean record was written; a failure is counted and logged,
 /// and the marker then keeps the last count, which the next boot reports.
 ///
+/// `tail_complete` (audit CONC-2, 2026-10-11) says main saw the whole tail
+/// written: the lane stopped inside its budget and the seal writer returned
+/// with no residue and no dropped seal. Only then is `now` named as the
+/// drained instant. Until this date `now` was named whenever nothing was
+/// reported lost, including after a seal writer that overran its budget or a
+/// lane still sealing, which stopped the next boot re-sending candles sealed
+/// after the last real drain.
+///
+/// **⚠ CORRECTED 2026-10-11 (CONC-2 review) — the last sentence above
+/// describes a reader that does not exist.** The record this writes is clean,
+/// and the next boot's [`report_previous_unwritten`] returns 0 for a clean
+/// record without reading `unwritten` or `drained_at`; nothing re-sends any
+/// candle. So `tail_complete` and `seals_reported_lost` change only what the
+/// file says, for a person reading it; the losses themselves are paged by
+/// main at shutdown. Also a limit of the record: when the seal writer overran
+/// its budget, what that detached writer still held is not in
+/// `seals_reported_lost`, so `unwritten` reads lower than the loss.
+///
 /// # Complexity
 /// O(finished markers), one in production, plus one small write and a rename.
 pub fn finish_unwritten_mark_at_shutdown(
     dir: &std::path::Path,
     seals_reported_lost: usize,
+    tail_complete: bool,
     now_unix_secs: i64,
 ) -> bool {
     let path = dir.join(SEAL_UNWRITTEN_MARK_FILE);
@@ -800,10 +825,11 @@ pub fn finish_unwritten_mark_at_shutdown(
     if !finished.iter().any(|done| done == &path) {
         finished.push(path.clone());
     }
-    // Nothing reported lost: every seal is written now. Otherwise the latest
-    // instant this process saw the writer empty, so the next boot re-sends
-    // the candles sealed after it (audit PR31b-2).
-    let drained_at_unix_secs = if seals_reported_lost == 0 {
+    // Nothing reported lost and the tail seen through: every seal is written
+    // now. Otherwise the latest instant this process saw the writer empty, so
+    // the next boot re-sends the candles sealed after it (audit PR31b-2,
+    // CONC-2).
+    let drained_at_unix_secs = if seals_reported_lost == 0 && tail_complete {
         Some(now_unix_secs)
     } else {
         let last = LAST_DRAINED_UNIX_SECS.load(std::sync::atomic::Ordering::Acquire);
@@ -988,14 +1014,51 @@ pub const FINAL_DRAIN_BUDGET_SECS: u64 = 45;
 ///
 /// # Termination
 ///
-/// Three independent exits, so this can never spin: the ring empties, the
-/// budget expires, or a cycle makes no progress at all (which is what a
-/// permanently-stuck tier looks like — continuing would burn the budget to
-/// achieve nothing).
+/// Three independent exits, so this can never spin: the ring AND the writer
+/// channel empty, the budget expires, or a cycle makes no progress at all
+/// (which is what a permanently-stuck tier looks like — continuing would burn
+/// the budget to achieve nothing).
+///
+/// # Residue (audit CONC-2, 2026-10-11)
+///
+/// Until this date the loop stopped on an empty ring and counted only the
+/// ring as residue. A seal that reached the channel while the last cycle
+/// flushed was left there, dropped with the runner, and reported as 0. The
+/// residue is now ring plus channel, returned in
+/// [`CycleOutcome::final_residue`] so main counts it as lost in the crash
+/// marker. **Honest limit:** a seal sent between the residue read and the
+/// runner drop (one marker write, microseconds) is still not counted; once
+/// the runner is dropped a later send sees the channel disconnected and goes
+/// to the durable spill through the overflow sink.
+///
+/// **⚠ CORRECTED 2026-10-11 (CONC-2 review) — "goes to the durable spill" is
+/// not always true.** The overflow sink hands the seal to the escalation
+/// queue and counts it as rescued once that hand-off succeeds. A lane that
+/// overran its shutdown budget is not stopped; if main has already given up
+/// on the escalation thread (step 5b-2b), a seal that lane queues after that
+/// dies at exit while counted as rescued. The shutdown records that tail as
+/// incomplete, but the rescue counter overstates what was kept.
+///
+/// The drain also stops on an idle cycle only when the channel is empty
+/// (CONC-2 review, 2026-10-11). Before, an idle cycle stopped it even with a
+/// seal that had just arrived in the channel, which was then counted as
+/// residue although one more cycle would have taken it.
 ///
 /// # Complexity
-/// O(seals in the ring), bounded by the budget. No allocation.
+/// O(seals held), bounded by the budget. No allocation.
 fn final_drain(runner: &mut SealWriterRunner, progress: &mut SealWriterProgress) -> CycleOutcome {
+    final_drain_with(runner, progress, |_, _| {})
+}
+
+/// [`final_drain`] with a hook run after each cycle, before the stop checks.
+/// Production passes a no-op; a test uses it to send a seal between two
+/// cycles, the timing a lane still sealing produces (audit CONC-2 review,
+/// 2026-10-11).
+fn final_drain_with(
+    runner: &mut SealWriterRunner,
+    progress: &mut SealWriterProgress,
+    mut after_cycle: impl FnMut(&SealWriterRunner, u64),
+) -> CycleOutcome {
     let deadline = Instant::now() + Duration::from_secs(FINAL_DRAIN_BUDGET_SECS);
     let mut total = CycleOutcome::default();
     let mut cycles: u64 = 0;
@@ -1006,13 +1069,22 @@ fn final_drain(runner: &mut SealWriterRunner, progress: &mut SealWriterProgress)
         record_cycle_observability(&outcome, dropped);
         total.accumulate(&outcome);
         cycles = cycles.saturating_add(1);
+        after_cycle(runner, cycles);
 
-        if runner.ring_len() == 0 {
+        // Audit CONC-2 (2026-10-11): the channel too, not only the ring. A
+        // seal sent while this cycle flushed landed in the channel after its
+        // `try_recv` saw it empty; stopping on an empty ring left it there to
+        // die with the runner, uncounted.
+        if final_drain_residue(runner) == 0 {
             break;
         }
-        if outcome.is_idle() {
-            // The ring is non-empty and yet nothing moved — every tier is
-            // refusing. More cycles cannot change that.
+        // An idle cycle stops the drain only when the channel is empty too
+        // (CONC-2 review, 2026-10-11). Then the ring is non-empty and nothing
+        // moved: every tier is refusing, and more cycles cannot change that.
+        // A seal in the channel is different: the next cycle's step 1 always
+        // takes it (`try_recv` until empty), so that cycle cannot be idle and
+        // the loop cannot spin; the deadline still bounds it.
+        if outcome.is_idle() && runner.queued_seals() == 0 {
             break;
         }
         if Instant::now() >= deadline {
@@ -1022,13 +1094,17 @@ fn final_drain(runner: &mut SealWriterRunner, progress: &mut SealWriterProgress)
 
     emit_progress_report(&progress.take(), runner.ring_len());
 
-    let residue = runner.ring_len();
+    // The ring and the channel (audit CONC-2): both die with the runner.
+    let residue = final_drain_residue(runner);
+    total.final_residue = residue;
     if residue > 0 {
         // NOT an `info!` "complete" line. These seals are in RAM, the process
         // is exiting, and no tier accepted them — they are gone.
         error!(
             code = ErrorCode::AggregatorDrop01.code_str(),
-            ring_len = residue,
+            residue,
+            ring_len = runner.ring_len(),
+            queued_seals = runner.queued_seals(),
             cycles,
             submitted_from_mpsc = total.submitted_from_mpsc,
             "seal writer final drain ENDED WITH SEALS STILL IN MEMORY — \
@@ -1047,6 +1123,16 @@ fn final_drain(runner: &mut SealWriterRunner, progress: &mut SealWriterProgress)
     }
 
     total
+}
+
+/// Seals the shutdown drain still holds in memory: the ring plus the writer
+/// channel (audit CONC-2, 2026-10-11). The drain stops only when this reads
+/// 0, and reports it as residue when it stops for any other reason.
+///
+/// # Complexity
+/// O(1): two length reads. No allocation.
+fn final_drain_residue(runner: &SealWriterRunner) -> usize {
+    runner.ring_len().saturating_add(runner.queued_seals())
 }
 
 /// [`run_cycle`] plus one mid-session replay step, for the loop's tick. The
@@ -2170,7 +2256,7 @@ mod tests {
     #[test]
     fn the_shutdown_finish_is_drained_now_when_nothing_was_lost() {
         let dir = temp_dir_for("finish_drained");
-        assert!(finish_unwritten_mark_at_shutdown(&dir, 0, 2_000));
+        assert!(finish_unwritten_mark_at_shutdown(&dir, 0, true, 2_000));
         match UnwrittenSealMark::in_dir(&dir).read_previous() {
             PreviousUnwritten::Read(r) => {
                 assert!(r.clean);
@@ -2252,6 +2338,126 @@ mod tests {
             "the escalation queue's count is shared with the runner"
         );
         cleanup(&spill, &dlq);
+    }
+
+    /// Regression: 2026-10-11 (audit CONC-2) — the shutdown drain stopped on
+    /// an empty ring while seals sat in the writer channel, and counted only
+    /// the ring as residue, so those seals died with the runner reported as 0.
+    #[test]
+    fn test_regression_final_drain_residue_counts_the_channel_not_only_the_ring() {
+        let (spill, dlq) = temp_pair("residue-channel");
+        let runner = SealWriterRunner::for_test(spill.clone(), dlq.clone(), 16, 16, 4);
+        let tx = runner.sender();
+        for i in 0..3u32 {
+            tx.try_send(mk_seal(13, 0, TfIndex::M1, 1_716_000_000 + i * 60, 100.0))
+                .expect("queued");
+        }
+        // The shape a seal sent during the last cycle's flush leaves behind:
+        // the ring is empty and the channel is not.
+        assert_eq!(runner.ring_len(), 0);
+        assert_eq!(
+            final_drain_residue(&runner),
+            3,
+            "an empty ring is not a finished drain while the channel holds seals"
+        );
+        cleanup(&spill, &dlq);
+    }
+
+    /// Audit CONC-2: the shutdown drain takes what the channel holds and
+    /// reports no residue once both are empty.
+    #[tokio::test]
+    async fn test_final_drain_does_not_stop_while_the_channel_holds_seals() {
+        let (spill, dlq) = temp_pair("final-drain-channel");
+        let mut runner = SealWriterRunner::for_test(spill.clone(), dlq.clone(), 16, 16, 1);
+        let tx = runner.sender();
+        for i in 0..5u32 {
+            tx.try_send(mk_seal(13, 0, TfIndex::M1, 1_716_000_000 + i * 60, 100.0))
+                .expect("queued");
+        }
+        let mut progress = SealWriterProgress::default();
+        let outcome = final_drain(&mut runner, &mut progress);
+        assert_eq!(
+            outcome.submitted_from_mpsc, 5,
+            "every queued seal was taken"
+        );
+        assert_eq!(
+            outcome.final_residue,
+            final_drain_residue(&runner),
+            "the reported residue is the ring plus the channel at exit"
+        );
+        assert_eq!(runner.queued_seals(), 0, "nothing is left in the channel");
+        cleanup(&spill, &dlq);
+    }
+
+    /// CONC-2 review (2026-10-11): a seal that reaches the channel after an
+    /// idle cycle (a lane still sealing) is taken by the next cycle, not left
+    /// as residue. Bite: with the old `if outcome.is_idle() { break; }` the
+    /// first, idle cycle stops the drain and `final_residue` reads 1.
+    #[tokio::test]
+    async fn test_final_drain_takes_a_seal_sent_after_an_idle_cycle() {
+        let (spill, dlq) = temp_pair("final-drain-late-seal");
+        let mut runner = SealWriterRunner::for_test(spill.clone(), dlq.clone(), 16, 16, 4);
+        let tx = runner.sender();
+        let mut progress = SealWriterProgress::default();
+        let mut sent = false;
+        let outcome = final_drain_with(&mut runner, &mut progress, |runner, cycle| {
+            if cycle == 1 && !sent {
+                assert_eq!(final_drain_residue(runner), 0, "the first cycle was idle");
+                tx.try_send(mk_seal(13, 0, TfIndex::M1, 1_716_000_000, 100.0))
+                    .expect("queued");
+                sent = true;
+            }
+        });
+        assert!(sent, "the hook ran after the first cycle");
+        assert_eq!(
+            outcome.submitted_from_mpsc, 1,
+            "the late seal was taken by a later cycle"
+        );
+        assert_eq!(outcome.final_residue, 0, "nothing is left in memory");
+        assert_eq!(final_drain_residue(&runner), 0);
+        cleanup(&spill, &dlq);
+    }
+
+    /// Audit CONC-2: a shutdown that did not see the whole tail written keeps
+    /// the last instant the writer was really empty, so the next boot re-sends
+    /// the candles sealed after it.
+    #[test]
+    fn test_finish_with_an_incomplete_tail_keeps_the_last_drained_instant() {
+        let dir = temp_dir_for("finish_incomplete_tail");
+        // A unique instant no other test stores: LAST_DRAINED is process-wide.
+        const NOW: i64 = 7_777_777_001;
+        LAST_DRAINED_UNIX_SECS.store(1_000, std::sync::atomic::Ordering::Release);
+        assert!(finish_unwritten_mark_at_shutdown(&dir, 0, false, NOW));
+        match UnwrittenSealMark::in_dir(&dir).read_previous() {
+            PreviousUnwritten::Read(r) => {
+                assert!(r.clean);
+                assert_ne!(
+                    r.drained_at_unix_secs,
+                    Some(NOW),
+                    "an incomplete tail must not name the shutdown instant as drained"
+                );
+                assert!(r.drained_at_unix_secs.is_some());
+            }
+            other => panic!("expected a marker, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Audit CONC-2: the final drain's residue reaches the marker as lost.
+    #[test]
+    fn test_finish_with_residue_counts_it_as_lost() {
+        let dir = temp_dir_for("finish_residue");
+        const NOW: i64 = 7_777_777_002;
+        LAST_DRAINED_UNIX_SECS.store(1_000, std::sync::atomic::Ordering::Release);
+        assert!(finish_unwritten_mark_at_shutdown(&dir, 4, true, NOW));
+        match UnwrittenSealMark::in_dir(&dir).read_previous() {
+            PreviousUnwritten::Read(r) => {
+                assert_eq!(r.unwritten, 4);
+                assert_ne!(r.drained_at_unix_secs, Some(NOW));
+            }
+            other => panic!("expected a marker, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -2381,7 +2587,7 @@ mod pr31b1_tests {
         let (spill, _dlq) = temp_pair("finish");
         let mut writer_mark = UnwrittenSealMark::in_dir(&spill);
         assert!(writer_mark.record_now(250_000, 1_000));
-        assert!(finish_unwritten_mark_at_shutdown(&spill, 7, 1_010));
+        assert!(finish_unwritten_mark_at_shutdown(&spill, 7, true, 1_010));
         let record = read(&spill);
         assert!(record.clean);
         assert_eq!(record.unwritten, 7, "the count main already paged");
@@ -2396,7 +2602,7 @@ mod pr31b1_tests {
             "the next boot reports nothing"
         );
         // A second finish is harmless.
-        assert!(finish_unwritten_mark_at_shutdown(&spill, 7, 1_050));
+        assert!(finish_unwritten_mark_at_shutdown(&spill, 7, true, 1_050));
         cleanup(&spill);
     }
 
@@ -2404,7 +2610,7 @@ mod pr31b1_tests {
     fn finishing_one_marker_leaves_another_directory_writable() {
         let (finished, _dlq) = temp_pair("finish-one");
         let (other, _dlq2) = temp_pair("finish-other");
-        assert!(finish_unwritten_mark_at_shutdown(&finished, 0, 1_000));
+        assert!(finish_unwritten_mark_at_shutdown(&finished, 0, true, 1_000));
         let mut mark = UnwrittenSealMark::in_dir(&other);
         assert!(mark.record_now(4, 1_000));
         assert_eq!(read(&other).unwritten, 4);
@@ -2417,7 +2623,7 @@ mod pr31b1_tests {
         let mut dir = std::env::temp_dir();
         dir.push(format!("tickvault-pr31b1-missing-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(!finish_unwritten_mark_at_shutdown(&dir, 0, 1_000));
+        assert!(!finish_unwritten_mark_at_shutdown(&dir, 0, true, 1_000));
     }
 
     #[tokio::test]
@@ -2447,7 +2653,12 @@ mod pr31b1_tests {
         );
         assert_eq!(record.unwritten, 250);
         // Main then finishes the shutdown once the escalation step is over.
-        assert!(finish_unwritten_mark_at_shutdown(&spill, 0, utc_now_secs()));
+        assert!(finish_unwritten_mark_at_shutdown(
+            &spill,
+            0,
+            true,
+            utc_now_secs()
+        ));
         assert!(read(&spill).clean);
         drop(sink);
         cleanup(&spill);

@@ -9,6 +9,11 @@
 //! does NOT write an `order_audit` row (it is not an order lifecycle event —
 //! the coded `error!` + the Critical Telegram are its record).
 //!
+//! **⚠ CORRECTED 2026-10-11 (audit OBS-8) — a RiskHalt now DOES write one
+//! `order_audit` row** (`event = risk_halt`, `order_id = "n/a"`, the plain
+//! reason in `detail`), like the circuit-breaker system rows. A halt stops
+//! every later order, so the SEBI order trail needs to say when and why.
+//!
 //! BEST-EFFORT ONLY: a forensics write failure must NEVER affect the order
 //! path — the app-crate consumer logs (coded AUDIT-06, staged) + counts and
 //! continues; orders (paper today) are never blocked by this table.
@@ -97,6 +102,11 @@ pub enum OrderAuditEvent {
     CircuitClosed,
     /// The SEBI rate limiter denied an order.
     RateLimited,
+    /// The risk engine HALTED trading for the day (daily-loss or other breach).
+    /// Added 2026-10-11 (audit OBS-8): a halt paged Telegram but left no row,
+    /// so the SEBI order trail had no record of when or why trading stopped.
+    /// A system event like `CircuitOpen`: `order_id` is `"n/a"`.
+    RiskHalt,
 }
 
 impl OrderAuditEvent {
@@ -112,6 +122,7 @@ impl OrderAuditEvent {
             Self::CircuitOpen => "circuit_open",
             Self::CircuitClosed => "circuit_closed",
             Self::RateLimited => "rate_limited",
+            Self::RiskHalt => "risk_halt",
         }
     }
 }
@@ -605,6 +616,12 @@ mod tests {
         }
     }
 
+    /// Audit OBS-8 (2026-10-11): a risk halt has its own stable wire string.
+    #[test]
+    fn test_order_audit_event_risk_halt_wire_string_is_stable() {
+        assert_eq!(OrderAuditEvent::RiskHalt.as_str(), "risk_halt");
+    }
+
     #[test]
     fn test_order_audit_create_ddl_contains_expected_columns() {
         let ddl = order_audit_create_ddl();
@@ -680,6 +697,7 @@ mod tests {
             (OrderAuditEvent::CircuitOpen, "circuit_open"),
             (OrderAuditEvent::CircuitClosed, "circuit_closed"),
             (OrderAuditEvent::RateLimited, "rate_limited"),
+            (OrderAuditEvent::RiskHalt, "risk_halt"),
         ];
         for (variant, wire) in all {
             assert_eq!(variant.as_str(), wire);

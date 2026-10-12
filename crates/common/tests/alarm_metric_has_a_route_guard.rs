@@ -215,11 +215,12 @@ fn emf_selected(root: &Path) -> BTreeSet<String> {
 /// into one name per `group = "..."` value assigned in the same file.
 ///
 /// ADDED 2026-10-05 with `loss-group-alarms.tf` (noise lock §2.10): its 55
-/// filters write six derived metrics through one interpolated name, and this
-/// guard read the raw template, so the six alarms looked unroutable. Only the
-/// `${each.value.<key>}` form is expanded; a name with any other
-/// interpolation is left as written, so it still fails rather than passing on
-/// a guess. A template with no matching values expands to nothing.
+/// filters (69 since §2.10-a, 2026-10-11) write six derived metrics through
+/// one interpolated name, and this guard read the raw template, so the six
+/// alarms looked unroutable. Only the `${each.value.<key>}` form is expanded;
+/// a name with any other interpolation is left as written, so it still fails
+/// rather than passing on a guess. A template with no matching values expands
+/// to nothing.
 fn expand_for_each(names: BTreeSet<String>, file: &str) -> BTreeSet<String> {
     const OPEN: &str = "${each.value.";
     let cleaned = strip_comments(file);

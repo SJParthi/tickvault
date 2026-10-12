@@ -4,6 +4,7 @@
 //! so that `cargo llvm-cov` can instrument them through the lib target.
 //! The binary entry point (`main.rs`) re-exports these via `use crate::`.
 
+#![cfg_attr(not(test), deny(unsafe_code))]
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 #![cfg_attr(not(test), deny(clippy::expect_used))]
 #![deny(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)]

@@ -83,25 +83,52 @@ pub fn is_valid_transition(from: OrderStatus, to: OrderStatus) -> bool {
 
 /// Parses a Dhan status string (from WebSocket or REST) into an `OrderStatus`.
 ///
-/// Dhan sends uppercase status strings. Returns `None` for unknown values.
+/// Matching ignores ASCII case. Returns `None` for unknown values.
+///
+/// (Until 2026-10-11 this said "Dhan sends uppercase status strings" and
+/// matched exact case, accepting mixed case for `Cancelled` alone.)
+/// **⚠ CORRECTED 2026-10-11 (audit INP-7):** the vendor's own order-update
+/// example spells the status `"Cancelled"`, so mixed case is real and a
+/// `"Traded"` spelling would have been read as unknown, losing a fill until
+/// the next reconcile. Every spelling is now matched case-insensitively.
 ///
 /// # Performance
-/// O(1) — match on string slices.
+/// O(k) with k = 12 fixed spellings (`ORDER_STATUS_SPELLINGS`): a length
+/// compare first, then an ASCII case-folding compare. Constant-bounded and
+/// allocation-free; on the order path, never the tick path.
 pub fn parse_order_status(status_str: &str) -> Option<OrderStatus> {
-    match status_str {
-        "TRANSIT" => Some(OrderStatus::Transit),
-        "PENDING" => Some(OrderStatus::Pending),
-        "CONFIRMED" => Some(OrderStatus::Confirmed),
-        "PART_TRADED" | "PARTIALLY_FILLED" => Some(OrderStatus::PartTraded),
-        "TRADED" => Some(OrderStatus::Traded),
-        "CANCELLED" | "Cancelled" => Some(OrderStatus::Cancelled),
-        "REJECTED" => Some(OrderStatus::Rejected),
-        "EXPIRED" => Some(OrderStatus::Expired),
-        "CLOSED" => Some(OrderStatus::Closed),
-        "TRIGGERED" | "CONFIRM" => Some(OrderStatus::Triggered),
-        _ => None,
-    }
+    ORDER_STATUS_SPELLINGS
+        .iter()
+        .find(|(spelling, _)| spelling.eq_ignore_ascii_case(status_str))
+        .map(|&(_, status)| status)
 }
+
+/// Counter: order status strings `parse_order_status` did not recognise, on
+/// the order-update path and the REST reconcile path. ADDED 2026-10-11 (audit
+/// INP-7). Local Prometheus only: not EMF-selected, no alarm, no page.
+pub(crate) const UNKNOWN_ORDER_STATUS_COUNTER: &str = "tv_oms_unknown_order_status_total";
+
+/// How many characters of an unrecognised vendor status string a log line
+/// carries. Bounds vendor text in the log; a real status is at most 16.
+pub(crate) const UNKNOWN_STATUS_LOG_MAX_CHARS: usize = 32;
+
+/// Every Dhan status spelling `parse_order_status` accepts, compared without
+/// ASCII case. `PARTIALLY_FILLED` and `CONFIRM` (Forever Order, waiting for
+/// trigger) are aliases.
+const ORDER_STATUS_SPELLINGS: [(&str, OrderStatus); 12] = [
+    ("TRANSIT", OrderStatus::Transit),
+    ("PENDING", OrderStatus::Pending),
+    ("CONFIRMED", OrderStatus::Confirmed),
+    ("PART_TRADED", OrderStatus::PartTraded),
+    ("PARTIALLY_FILLED", OrderStatus::PartTraded),
+    ("TRADED", OrderStatus::Traded),
+    ("CANCELLED", OrderStatus::Cancelled),
+    ("REJECTED", OrderStatus::Rejected),
+    ("EXPIRED", OrderStatus::Expired),
+    ("CLOSED", OrderStatus::Closed),
+    ("TRIGGERED", OrderStatus::Triggered),
+    ("CONFIRM", OrderStatus::Triggered),
+];
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -467,7 +494,37 @@ mod tests {
     fn parse_unknown_status_returns_none() {
         assert_eq!(parse_order_status("UNKNOWN"), None);
         assert_eq!(parse_order_status(""), None);
-        assert_eq!(parse_order_status("traded"), None);
+        assert_eq!(parse_order_status(" TRADED"), None);
+        assert_eq!(parse_order_status("TRADED "), None);
+        assert_eq!(parse_order_status("CONFIRME"), None);
+        // "traded" was asserted None here until 2026-10-11 (audit INP-7);
+        // matching is case-insensitive now, see the test below.
+    }
+
+    #[test]
+    fn parse_order_status_is_case_insensitive() {
+        // Audit INP-7 (2026-10-11): the vendor example spells "Cancelled", so
+        // mixed case is real; a "Traded" fill must never read as unknown.
+        assert_eq!(parse_order_status("Traded"), Some(OrderStatus::Traded));
+        assert_eq!(parse_order_status("traded"), Some(OrderStatus::Traded));
+        assert_eq!(
+            parse_order_status("Part_Traded"),
+            Some(OrderStatus::PartTraded)
+        );
+        assert_eq!(
+            parse_order_status("partially_filled"),
+            Some(OrderStatus::PartTraded)
+        );
+        assert_eq!(parse_order_status("pending"), Some(OrderStatus::Pending));
+        assert_eq!(parse_order_status("Confirm"), Some(OrderStatus::Triggered));
+        assert_eq!(
+            parse_order_status("Confirmed"),
+            Some(OrderStatus::Confirmed)
+        );
+        assert_eq!(
+            parse_order_status("cancelled"),
+            Some(OrderStatus::Cancelled)
+        );
     }
 
     // --- Debug format tests ---

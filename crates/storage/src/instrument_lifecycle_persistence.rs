@@ -70,6 +70,13 @@
 //! "connection closed before message completed" boot halts). ILP has no URL
 //! limit. The single-row helpers + DDL stay on `/exec` (small, no URL issue).
 //!
+//! **⚠ CORRECTED 2026-10-11 (audit QDB-2) — the bulk writers now use ILP over
+//! HTTP, not TCP port 9009.** TCP ILP gets no reply from the server: a line
+//! QuestDB refused closed the socket while `flush()` still returned `Ok`, so a
+//! SEBI never-delete row could be logged as written and never stored. HTTP ILP
+//! waits for the answer on every flush (see `sebi_master_ilp_http_conf`). The
+//! "ILP, not `/exec`" reasoning above is unchanged.
+//!
 //! ## ⚠ DDL follow-up — historical note (SUPERSEDED above)
 //!
 //! Because `instrument_lifecycle`'s designated `ts` is pinned to epoch 0,
@@ -102,6 +109,48 @@ use tickvault_common::sanitize::{sanitize_audit_string, sanitize_ilp_string, san
 /// `/exec` HTTP timeout for both DDL and INSERT. Matches the value used
 /// by the other `*_persistence` modules in the storage crate.
 const QUESTDB_EXEC_TIMEOUT_SECS: u64 = 10;
+
+/// Per-request timeout (ms) for the SEBI never-delete ILP writers
+/// (`instrument_lifecycle`, `instrument_lifecycle_audit`,
+/// `index_constituency`). Generous because a chunk can be up to the app's
+/// `LIFECYCLE_WRITE_CHUNK` rows in ONE request; the client adds its own
+/// per-byte allowance on top (`request_min_throughput`).
+pub(crate) const SEBI_MASTER_ILP_REQUEST_TIMEOUT_MS: u64 = 60_000;
+
+/// ILP config string for the SEBI never-delete writers — HTTP, never TCP.
+///
+/// **2026-10-11 (audit QDB-2).** These writers used the TCP ILP pipe. TCP ILP
+/// gets no reply: a line QuestDB rejects makes the server drop the socket
+/// while `flush()` still returns `Ok`, so the caller logged success for SEBI
+/// rows that were never stored. HTTP ILP waits for the server's answer on
+/// every flush, so a refused chunk now returns `Err` and the caller's
+/// existing failure arm fires.
+///
+/// **⚠ CORRECTED 2026-10-11 (review of QDB-2, same day).** This shipped with
+/// `retry_timeout=0` and the reason "the caller already treats a failed chunk
+/// as 'next idempotent run re-writes it'". That reason is false for two of
+/// the three tables: `instrument_lifecycle_audit` rows are derived from the
+/// difference against the previous state, which a landed lifecycle row
+/// erases, and `index_constituency` is a per-date point-in-time row that
+/// tomorrow's run does not write. So a brief QuestDB hiccup became a
+/// permanent hole. These writers run once a day on `spawn_blocking`, never on
+/// the frame drain, so they now retry for
+/// [`SEBI_MASTER_ILP_RETRY_TIMEOUT_MS`]. The client retries only transport
+/// failures and 5xx answers; a 4xx refusal (a bad row) is never retried.
+pub(crate) fn sebi_master_ilp_http_conf(cfg: &QuestDbConfig) -> String {
+    format!(
+        "http::addr={}:{};protocol_version=1;retry_timeout={};request_timeout={};",
+        cfg.host,
+        cfg.http_port,
+        SEBI_MASTER_ILP_RETRY_TIMEOUT_MS,
+        SEBI_MASTER_ILP_REQUEST_TIMEOUT_MS
+    )
+}
+
+/// How long (ms) the SEBI never-delete ILP writers retry a transport failure
+/// or a 5xx answer before giving up on a chunk. Cold path (once a day, on
+/// `spawn_blocking`), so a few seconds of retry costs nothing that waits.
+pub(crate) const SEBI_MASTER_ILP_RETRY_TIMEOUT_MS: u64 = 10_000;
 
 /// Broker-source label stamped on EVERY row this module writes today
 /// (operator override 2026-06-28 — `feed` is now part of the DEDUP key on
@@ -717,8 +766,10 @@ fn build_lifecycle_ilp_row(
     Ok(())
 }
 
-/// Bulk-ingest many `instrument_lifecycle` rows via QuestDB **ILP** (port
-/// 9009) — the real ingestion pipe, NOT the `/exec` SQL/URL door.
+/// Bulk-ingest many `instrument_lifecycle` rows via QuestDB **ILP over HTTP**
+/// (acknowledged per flush; TCP port 9009 until 2026-10-11, see
+/// [`sebi_master_ilp_http_conf`]) — the real ingestion pipe, NOT the `/exec`
+/// SQL/URL door.
 ///
 /// The whole [`Buffer`] is built on the async task (CPU-only, borrows `rows`),
 /// then the blocking ILP connect + flush runs on a `spawn_blocking` thread so
@@ -737,7 +788,7 @@ pub async fn append_instrument_lifecycle_rows(
     if rows.is_empty() {
         return Ok(());
     }
-    let conf = questdb_config.build_ilp_conf_string();
+    let conf = sebi_master_ilp_http_conf(questdb_config);
     let mut buffer = Buffer::new(ProtocolVersion::V1);
     for row in rows {
         build_lifecycle_ilp_row(&mut buffer, row)
@@ -1046,14 +1097,24 @@ fn build_lifecycle_audit_ilp_row(
     Ok(())
 }
 
-/// Bulk-append many `instrument_lifecycle_audit` rows via QuestDB **ILP**
-/// (port 9009). Append-only forensic chain — written BEFORE the lifecycle
+/// Bulk-append many `instrument_lifecycle_audit` rows via QuestDB **ILP over
+/// HTTP** (acknowledged per flush; TCP port 9009 until 2026-10-11, see
+/// [`sebi_master_ilp_http_conf`]). Append-only forensic chain — written BEFORE the lifecycle
 /// batch so the §24 audit-first invariant holds. Idempotent via DEDUP UPSERT
 /// KEYS. Buffer built on the async task; blocking flush on `spawn_blocking`.
 ///
+/// **⚠ CORRECTED 2026-10-11 (review of QDB-2).** "Written BEFORE the
+/// lifecycle batch" was false when written: the Dhan caller wrote the
+/// lifecycle rows first and the audit rows after, so a failed audit chunk
+/// lost its transitions for good (a re-run read the new state and derived
+/// nothing). The caller (`dhan_lifecycle::write_audit_then_lifecycle`) now
+/// writes the audit rows first and holds back any lifecycle row whose audit
+/// row did not land, which is what makes the sentence above true.
+///
 /// # Errors
-/// Returns `Err` on ILP connect/flush failure → caller counts it → next
-/// idempotent boot re-runs (Z+ L6).
+/// Returns `Err` on ILP connect/flush failure → caller counts it and holds
+/// back the matching lifecycle rows → the next run re-derives the same
+/// transitions (Z+ L6).
 // TEST-EXEMPT: network I/O — pure builder `build_lifecycle_audit_ilp_row` is unit-tested + boot integration exercises the flush.
 pub async fn append_instrument_lifecycle_audit_rows(
     questdb_config: &QuestDbConfig,
@@ -1062,7 +1123,7 @@ pub async fn append_instrument_lifecycle_audit_rows(
     if rows.is_empty() {
         return Ok(());
     }
-    let conf = questdb_config.build_ilp_conf_string();
+    let conf = sebi_master_ilp_http_conf(questdb_config);
     let mut buffer = Buffer::new(ProtocolVersion::V1);
     for row in rows {
         build_lifecycle_audit_ilp_row(&mut buffer, row)
@@ -1810,22 +1871,60 @@ mod tests {
         port
     }
 
+    const P2C_ILP_204: &str = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n";
+    const P2C_ILP_400: &str =
+        "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+    /// A loopback HTTP ILP endpoint that answers every request with
+    /// `response` (2026-10-11, audit QDB-2: the SEBI writers moved from the
+    /// unacknowledged TCP pipe to HTTP ILP).
+    fn p2c_spawn_ilp_http(response: &'static str) -> u16 {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 65_536];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        port
+    }
+
+    /// A loopback TCP listener that accepts and reads to the end, discarding
+    /// the bytes: what a TCP ILP sender would see as a successful flush.
     fn p2c_spawn_tcp_drain() -> u16 {
         use std::io::Read as _;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 65536];
-                loop {
-                    match stream.read(&mut buf) {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) => {}
-                    }
-                }
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 65_536];
+                    while matches!(stream.read(&mut buf), Ok(n) if n > 0) {}
+                });
             }
         });
         port
+    }
+
+    /// The drain is a real target: a TCP ILP sender flushes to it Ok, so a
+    /// test that uses it as the ILP port bites if a writer goes back to TCP.
+    #[test]
+    fn test_p2c_tcp_drain_accepts_a_tcp_ilp_flush() {
+        let port = p2c_spawn_tcp_drain();
+        let conf = format!("tcp::addr=127.0.0.1:{port};protocol_version=1;");
+        let mut sender = Sender::from_conf(&conf).expect("connect to the drain");
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        buffer
+            .table("t")
+            .and_then(|b| b.column_i64("x", 1))
+            .and_then(|b| b.at_now())
+            .expect("build one row");
+        assert!(sender.flush(&mut buffer).is_ok(), "TCP ILP reports Ok here");
     }
 
     fn p2c_cfg(http_port: u16, ilp_port: u16) -> QuestDbConfig {
@@ -1910,10 +2009,21 @@ mod tests {
         let res = append_instrument_lifecycle_rows(&p2c_cfg(1, 1), &[]).await;
         assert!(res.is_ok(), "empty slice must be Ok without I/O");
 
+        let ok_port = p2c_spawn_ilp_http(P2C_ILP_204);
+        let row = sample_index_row();
+        let res = append_instrument_lifecycle_rows(&p2c_cfg(ok_port, 1), &[row]).await;
+        assert!(res.is_ok(), "acknowledged ILP flush must be Ok: {res:?}");
+
+        // A chunk QuestDB REFUSES must surface as Err (audit QDB-2: over TCP
+        // the same refusal returned Ok and the caller logged success).
+        let bad_port = p2c_spawn_ilp_http(P2C_ILP_400);
+        // The ILP TCP port is a live listener that reads and discards, so a
+        // writer that went back to TCP would flush Ok and fail this test;
+        // only the HTTP answer can make it Err (review of QDB-2).
         let drain_port = p2c_spawn_tcp_drain();
         let row = sample_index_row();
-        let res = append_instrument_lifecycle_rows(&p2c_cfg(1, drain_port), &[row]).await;
-        assert!(res.is_ok(), "ILP flush to drain server must be Ok: {res:?}");
+        let res = append_instrument_lifecycle_rows(&p2c_cfg(bad_port, drain_port), &[row]).await;
+        assert!(res.is_err(), "a refused lifecycle chunk must be Err");
 
         // Port 1 — connect refused → Err, no panic.
         let row = sample_index_row();
@@ -1926,14 +2036,58 @@ mod tests {
         let res = append_instrument_lifecycle_audit_rows(&p2c_cfg(1, 1), &[]).await;
         assert!(res.is_ok(), "empty slice must be Ok without I/O");
 
+        let ok_port = p2c_spawn_ilp_http(P2C_ILP_204);
+        let row = sample_audit_row();
+        let res = append_instrument_lifecycle_audit_rows(&p2c_cfg(ok_port, 1), &[row]).await;
+        assert!(res.is_ok(), "acknowledged ILP flush must be Ok: {res:?}");
+
+        let bad_port = p2c_spawn_ilp_http(P2C_ILP_400);
+        // The ILP TCP port is a live listener that reads and discards, so a
+        // writer that went back to TCP would flush Ok and fail this test;
+        // only the HTTP answer can make it Err (review of QDB-2).
         let drain_port = p2c_spawn_tcp_drain();
         let row = sample_audit_row();
-        let res = append_instrument_lifecycle_audit_rows(&p2c_cfg(1, drain_port), &[row]).await;
-        assert!(res.is_ok(), "ILP flush to drain server must be Ok: {res:?}");
+        let res =
+            append_instrument_lifecycle_audit_rows(&p2c_cfg(bad_port, drain_port), &[row]).await;
+        assert!(res.is_err(), "a refused lifecycle audit chunk must be Err");
 
         let row = sample_audit_row();
         let res = append_instrument_lifecycle_audit_rows(&p2c_cfg(1, 1), &[row]).await;
         assert!(res.is_err(), "ILP connect failure must surface an error");
+    }
+
+    #[test]
+    fn test_sebi_master_ilp_conf_is_http_with_request_timeout() {
+        let conf = sebi_master_ilp_http_conf(&p2c_cfg(9000, 9009));
+        assert!(conf.starts_with("http::addr=127.0.0.1:9000;"), "{conf}");
+        assert!(conf.contains("protocol_version=1;"), "{conf}");
+        assert!(conf.contains("retry_timeout=10000;"), "{conf}");
+        assert_eq!(SEBI_MASTER_ILP_RETRY_TIMEOUT_MS, 10_000);
+        assert!(conf.contains("request_timeout=60000;"), "{conf}");
+        assert_eq!(SEBI_MASTER_ILP_REQUEST_TIMEOUT_MS, 60_000);
+        assert!(!conf.contains("tcp::addr"), "{conf}");
+        assert!(
+            !conf.contains("9009"),
+            "the ILP TCP port must not be used: {conf}"
+        );
+    }
+
+    /// Audit QDB-2: the non-test half must never build a TCP ILP sender again.
+    #[test]
+    fn test_lifecycle_writers_never_build_tcp_conf() {
+        let source = include_str!("instrument_lifecycle_persistence.rs");
+        let prod = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("source has a non-test half");
+        assert!(!prod.contains(concat!("build_ilp_", "conf_string")));
+        assert!(!prod.contains(concat!("tcp", "::addr")));
+        assert_eq!(
+            prod.matches("let conf = sebi_master_ilp_http_conf(questdb_config);")
+                .count(),
+            2,
+            "both bulk writers (lifecycle + audit) must use the HTTP ILP conf"
+        );
     }
 
     #[test]
