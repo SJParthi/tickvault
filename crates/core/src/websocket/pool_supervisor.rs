@@ -66,6 +66,32 @@
 //! performs one `Instant::now()` (a ~20ns vDSO read) to feed the watchdog:
 //! 0.03% of the 66.7µs per-packet budget on the busiest socket. Both costs are
 //! recorded rather than rounded away.
+//!
+//! **⚠ CORRECTED 2026-10-11 (audit HOT-1) — true only while the drain keeps
+//! up.** "Performs no heap allocation" was never measured, and it is false
+//! under a backlog. The frame ring is a tokio bounded `mpsc`, which stores
+//! queued items in 32-slot blocks and allocates a new block each time the tail
+//! fills. So while the ring holds a backlog, `accept` allocates one block per
+//! 32 queued frames on the socket reader task: at most
+//! `FRAME_RING_CAPACITY / 32` = 2,048 blocks per backlog, reused once the
+//! drain catches up. With the drain keeping up it allocates nothing.
+//! Both facts are now MEASURED, with the production metrics recorder
+//! installed and the WAL writer thread inside the window, by
+//! `crates/app/tests/dhat_wal_ring_sink_accept.rs`: 0 B / 0 blocks over
+//! 10,000 frames in steady state, and 127 blocks for a 4,096-frame backlog.
+//! Removing the backlog allocation needs a pre-allocated array channel for the
+//! ring (as audit N2 did for the seal queue); that is a separate change.
+//!
+//! **⚠ CORRECTED 2026-10-11 (review of HOT-1) — the blocks are NOT reused.**
+//! The note above said the backlog blocks are "reused once the drain catches
+//! up". In tokio 1.53.2 the receiver hands each drained block back with
+//! `reclaim_block`, which tries to re-link it after the tail at most 3 times
+//! and FREES it otherwise; `reclaim_blocks` also yields once per block. So
+//! only about 3 spare blocks survive a drain, and EVERY backlog episode
+//! allocates again: about one block per 32 queued frames, up to 2,048 blocks,
+//! and the drain pays one free per block. Per frame this is O(1) on average;
+//! it is not zero allocation. Measured by the re-backlog phase of
+//! `dhat_wal_ring_sink_accept.rs`.
 
 use std::time::{Duration, Instant};
 

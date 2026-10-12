@@ -197,3 +197,282 @@ fn the_guard_is_not_vacuous() {
         "the resolver matched a name that cannot exist"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 2026-10-11 (audit TRU-1, TRU-6, TRU-7, TRU-18): the documents must not keep
+// a claim the code disproves. Each check below reads the text with every
+// `~~struck~~` span removed, because the house style corrects a stale claim
+// by striking it and adding a dated note, never by deleting history. A claim
+// left UNSTRUCK is a claim the document still makes.
+// ---------------------------------------------------------------------------
+
+/// Remove every `~~…~~` span (they may cross a line break). An unpaired
+/// trailing `~~` is kept as text, so an open strike cannot hide the rest of
+/// the document.
+fn without_struck(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    while let Some(open) = rest.find("~~") {
+        let after_open = &rest[open + 2..];
+        match after_open.find("~~") {
+            Some(close) => {
+                out.push_str(&rest[..open]);
+                rest = &after_open[close + 2..];
+            }
+            None => break,
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn plain_english_doc() -> String {
+    let p = repo_root().join("docs/architecture/what-we-guarantee-plain-english.md");
+    std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
+}
+
+/// Every `.rs` file under `crates/*/src`, with its basename.
+fn production_sources(root: &Path) -> Vec<PathBuf> {
+    crate_sources(root)
+        .into_iter()
+        .filter(|p| {
+            p.strip_prefix(root.join("crates"))
+                .ok()
+                .and_then(|rel| rel.components().nth(1))
+                .is_some_and(|c| c.as_os_str() == "src")
+        })
+        .collect()
+}
+
+#[test]
+fn without_struck_self_test() {
+    assert_eq!(without_struck("a ~~b~~ c"), "a  c");
+    assert_eq!(without_struck("a ~~b\n> c~~ d"), "a  d");
+    assert_eq!(
+        without_struck("a ~~b"),
+        "a ~~b",
+        "an open strike hides nothing"
+    );
+    assert_eq!(without_struck("~~x~~~~y~~z"), "z");
+}
+
+/// Regression: 2026-10-11 (audit TRU-1). The operator-facing page said a
+/// price update could be lost only if memory, disk and the backup file all
+/// failed "at the same instant", and that one tick is processed
+/// "end-to-end" in ~5 billionths of a second. The code has five separate,
+/// counted loss paths that each need only one step to fail, and the ~5 ns
+/// bench times packet decode (header and body) and routing only, not the
+/// path to the database.
+///
+/// Review of G10-docs (2026-10-11, later): the first correction struck only
+/// the "all at once" wording and left the same claim standing in other
+/// words ("Zero lost", "Disk full → a backup text file catches them → 0
+/// lost", "Power-kill mid-write → 0 lost", "Not one tick lost"). A full
+/// disk refuses new frames, and a power cut loses up to about a second plus
+/// the syncer's time (`ws_frame_spill.rs` header), so each of those is
+/// banned unstruck too.
+#[test]
+fn plain_english_doc_makes_no_all_at_once_loss_claim() {
+    let live = without_struck(&plain_english_doc());
+    for banned in [
+        "all at the same instant",
+        "all full at once",
+        "tear at once does a fruit drop",
+        "end-to-end inside the shop",
+        "**Zero lost.**",
+        "Disk full → a backup text file catches them → **0 lost**",
+        "Power-kill mid-write",
+        "already safe on disk",
+        "Not one tick lost",
+        "Not one order is ever lost",
+        "Not a single tick is ever lost",
+        "decode a packet's header and route it",
+    ] {
+        assert!(
+            !live.contains(banned),
+            "what-we-guarantee-plain-english.md still says {banned:?} unstruck. \
+             A tick can be lost when ONE save step is full or stopped, a full \
+             disk refuses new frames, a power cut loses up to about a second, \
+             and the ~5 ns figure is whole-packet decode + routing only. \
+             Strike the claim and add a dated correction."
+        );
+    }
+    // Not vacuous: the corrected page still makes the honest claims.
+    assert!(live.contains("CORRECTED 2026-10-11"));
+    assert!(live.contains("rings your phone"));
+    // The loss list must not read as complete, and must name the one loss
+    // with no recovery (the WAL and the memory queue both refused).
+    assert!(
+        live.contains("not a complete list"),
+        "the plain-English loss list must say it is not a complete list"
+    );
+    assert!(
+        live.contains("the disk log AND the memory queue both refused it"),
+        "the plain-English loss list must name the WAL-and-ring refusal, the \
+         one loss with no way back"
+    );
+}
+
+/// Regression: 2026-10-11 (audit TRU-6). `guarantees.md` called the
+/// tick-drop alarm and `tick_persistence.rs` RETIRED while both were live.
+/// A row may say RETIRED only about things that are gone: no metric it names
+/// may still be emitted from production source, and no `.rs` file it names
+/// may still exist under `crates/*/src`.
+#[test]
+fn retired_rows_name_nothing_still_live() {
+    let root = repo_root();
+    let sources = production_sources(&root);
+    assert!(
+        sources.len() > 100,
+        "expected many production sources, found {} — the walker is broken",
+        sources.len()
+    );
+    let haystack: String = sources
+        .iter()
+        .filter_map(|p| std::fs::read_to_string(p).ok())
+        .collect();
+    let basenames: BTreeSet<String> = sources
+        .iter()
+        .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .collect();
+
+    let live = without_struck(&doc());
+    let mut retired_rows = 0usize;
+    let mut offenders = Vec::new();
+    for line in live.lines().filter(|l| l.contains("RETIRED")) {
+        retired_rows += 1;
+        for chunk in line.split('`').skip(1).step_by(2) {
+            if chunk.starts_with("tv_") {
+                let name: String = chunk
+                    .chars()
+                    .take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_')
+                    .collect();
+                if haystack.contains(&format!("\"{name}\"")) {
+                    offenders.push(format!("metric `{name}` is still emitted"));
+                }
+            }
+            if chunk.ends_with(".rs") {
+                let base = chunk.rsplit('/').next().unwrap_or(chunk);
+                if basenames.contains(base) {
+                    offenders.push(format!("file `{base}` still exists under crates/*/src"));
+                }
+            }
+        }
+    }
+    assert!(
+        retired_rows >= 3,
+        "expected several RETIRED rows to check, found {retired_rows}"
+    );
+    assert!(
+        offenders.is_empty(),
+        "guarantees.md marks rows RETIRED that name live code:\n  {}\n\n\
+         Strike the RETIRED note and add a dated correction naming the live \
+         emit site and alarm.",
+        offenders.join("\n  ")
+    );
+}
+
+/// Regression: 2026-10-11 (audit TRU-7). Tier 10 named the alerts
+/// `HighWebSocketReconnectRate` and `QuestDbDown`, which exist in no
+/// terraform, Rust or workflow file. Every backticked alert in the Tier 10
+/// table must be a real CloudWatch alarm, `tv-<env>-X`, whose
+/// `tv-${var.environment}-X` appears in some `deploy/aws/terraform/*.tf`.
+#[test]
+fn tier10_alerts_name_real_alarms() {
+    let root = repo_root();
+    let tf: String = std::fs::read_dir(root.join("deploy/aws/terraform"))
+        .expect("read deploy/aws/terraform")
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "tf"))
+        .filter_map(|p| std::fs::read_to_string(p).ok())
+        .collect();
+
+    let live = without_struck(&doc());
+    let start = live
+        .find("## Tier 10")
+        .expect("guarantees.md has a Tier 10 section");
+    let section = &live[start..];
+    let end = section[3..].find("\n## ").map_or(section.len(), |i| i + 3);
+    let section = &section[..end];
+
+    let mut checked = 0usize;
+    let mut bad = Vec::new();
+    for row in section.lines().filter(|l| l.starts_with('|')) {
+        let cells: Vec<&str> = row
+            .split('|')
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .collect();
+        let Some(alert) = cells.last() else { continue };
+        for token in alert.split('`').skip(1).step_by(2) {
+            checked += 1;
+            match token.strip_prefix("tv-<env>-") {
+                Some(suffix) if tf.contains(&format!("tv-${{var.environment}}-{suffix}\"")) => {}
+                Some(_) => bad.push(format!("`{token}` has no matching terraform alarm")),
+                None => bad.push(format!("`{token}` is not a `tv-<env>-…` alarm name")),
+            }
+        }
+    }
+    assert!(
+        checked >= 2,
+        "expected Tier 10 to name real alarms, found {checked}"
+    );
+    // Review of G10-docs (2026-10-11): the corrected QuestDB row named three
+    // alarms and left out the one that pages when QuestDB is down. While
+    // terraform defines it, the QuestDB row must name it.
+    if tf.contains("tv-${var.environment}-questdb-disconnected\"") {
+        let qdb_row = section
+            .lines()
+            .find(|l| l.starts_with("| \"QuestDB never fails\""))
+            .expect("Tier 10 has the QuestDB never fails row");
+        let alert = qdb_row
+            .split('|')
+            .map(str::trim)
+            .rfind(|c| !c.is_empty())
+            .unwrap_or("");
+        assert!(
+            alert.contains("`tv-<env>-questdb-disconnected`"),
+            "the Tier 10 QuestDB row must name `tv-<env>-questdb-disconnected`, \
+             the alarm that pages when QuestDB is unreachable: {qdb_row}"
+        );
+    }
+    assert!(
+        bad.is_empty(),
+        "guarantees.md Tier 10 names alerts that do not exist:\n  {}",
+        bad.join("\n  ")
+    );
+}
+
+/// Regression: 2026-10-11 (audit TRU-18). The `pipeline` budget row read
+/// "Pipeline routing ≤ 100 ns per tick", but the bench behind it loops
+/// `dispatch_frame` (whole-packet decode, header and body, plus dispatch) and
+/// touches none of the drain.
+/// While that stays true the row must say it times decode.
+#[test]
+fn pipeline_budget_row_says_decode_only() {
+    let root = repo_root();
+    let bench_path = root.join("crates/core/benches/pipeline.rs");
+    let bench = std::fs::read_to_string(&bench_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", bench_path.display()));
+    let drain_symbols = ["drain_main_feed_frame", "consume_tick", "append_tick"];
+    if !bench.contains("dispatch_frame") || drain_symbols.iter().any(|s| bench.contains(s)) {
+        // The bench now measures more than decode; this check no longer
+        // applies, and the row may describe the wider path.
+        return;
+    }
+    let live = without_struck(&doc());
+    let row = live
+        .lines()
+        .find(|l| l.starts_with('|') && l.contains("100 ns per tick"))
+        .expect("guarantees.md Tier 3 carries the 100 ns per tick budget row");
+    let claim = row.trim_start_matches('|').trim_start();
+    assert!(
+        !claim.starts_with("Pipeline routing"),
+        "the 100 ns budget row still calls itself pipeline routing: {row}"
+    );
+    assert!(
+        claim.contains("decode"),
+        "the 100 ns budget row must say it times packet decode: {row}"
+    );
+}

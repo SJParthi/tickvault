@@ -54,6 +54,10 @@ const MATRIX_PATH: &str = "../../.claude/rules/project/per-wave-guarantee-matrix
 // seal-ring envelope in the same sweep — pin them here so they cannot
 // silently regress to the retired tick-ring wording.
 const CHARTER_PATH: &str = "../../docs/claude-rules-full/project/operator-charter-forever.md";
+// 2026-10-11 (review of G10-docs): the compliance audit's 7-row table carried
+// the same retired "papaya + SPSC bounded" hot-path claim the matrix was
+// corrected for, and nothing scanned it.
+const COMPLIANCE_AUDIT_PATH: &str = "../../docs/architecture/100-percent-compliance-audit.md";
 
 fn read(rel: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel);
@@ -216,4 +220,88 @@ fn templates_call_the_weekend_test_calendar_maths_not_a_chaos_test() {
              \"calendar-tested 65h Fri 16:00 IST\"."
         );
     }
+}
+
+/// Remove every `~~…~~` span on a line. Struck text is corrected history,
+/// not a live claim.
+fn without_struck(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(open) = rest.find("~~") {
+        let after_open = &rest[open + 2..];
+        match after_open.find("~~") {
+            Some(close) => {
+                out.push_str(&rest[..open]);
+                rest = &after_open[close + 2..];
+            }
+            None => break,
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Regression: 2026-10-11 (audit TRU-5). The 7-row resilience matrix, which
+/// every plan item copies, named three mechanisms that no longer exist: a
+/// "ring 2M" (the frame ring is bounded by `FRAME_RING_CAPACITY` and
+/// `FRAME_RING_MAX_BYTES`), "core_affinity Core 0" (the crate was removed
+/// 2026-08-10; the read workers pin to core 1 through libc) and an "SPSC
+/// bounded" ring (it is one bounded channel with many producers). A table
+/// row may carry those words only inside a `~~strike~~`.
+#[test]
+fn resilience_matrix_rows_carry_no_retired_mechanisms() {
+    assert_eq!(without_struck("a ~~b~~ c ~~d~~"), "a  c ");
+    assert_eq!(without_struck("a ~~b"), "a ~~b");
+    for (label, path) in [
+        ("matrix", MATRIX_PATH),
+        ("charter", CHARTER_PATH),
+        ("compliance audit", COMPLIANCE_AUDIT_PATH),
+    ] {
+        let text = read(path);
+        let rows: Vec<&str> = text.lines().filter(|l| l.starts_with('|')).collect();
+        assert!(
+            rows.len() >= 10,
+            "{label} ({path}) has too few table rows to check"
+        );
+        for row in rows {
+            let live = without_struck(row);
+            for banned in ["ring 2M", "core_affinity Core 0", "SPSC bounded"] {
+                assert!(
+                    !live.contains(banned),
+                    "{label} ({path}) table row still claims {banned:?} unstruck:\n{row}\n\
+                     Strike it and add a dated correction naming what exists."
+                );
+            }
+        }
+    }
+}
+
+/// Regression: 2026-10-11 (review of G10-docs). The matrix's "Zero ticks
+/// lost" row still gave the tick envelope as "→ spill NDJSON → DLQ" (the
+/// tick tier has no DLQ; only the candle seal tier does) and listed five loss
+/// paths in a way that read as complete, leaving out the one with no
+/// recovery: WAL and ring both refused. The row may not claim a tick DLQ
+/// outside a `~~strike~~`, and its loss list must say it is not exhaustive
+/// and name the WAL-and-ring case.
+#[test]
+fn zero_ticks_lost_row_claims_no_tick_dlq_and_no_complete_loss_list() {
+    let text = read(MATRIX_PATH);
+    let row = text
+        .lines()
+        .find(|l| l.starts_with("| Zero ticks lost"))
+        .expect("the matrix has a Zero ticks lost row");
+    let live = without_struck(row);
+    assert!(
+        !live.contains("spill NDJSON → DLQ"),
+        "the Zero ticks lost row still gives the tick envelope a DLQ unstruck:\n{row}"
+    );
+    assert!(
+        live.contains("not an exhaustive list"),
+        "the Zero ticks lost row must say its loss list is not exhaustive:\n{row}"
+    );
+    assert!(
+        live.contains("WAL and ring both refused"),
+        "the Zero ticks lost row must name the one loss with no recovery \
+         (WAL and ring both refused):\n{row}"
+    );
 }

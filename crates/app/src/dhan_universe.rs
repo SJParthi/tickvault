@@ -1101,14 +1101,23 @@ async fn build_once(date: &str, questdb: &QuestDbConfig) -> anyhow::Result<JoinO
             expired_by_absence = tally.expired_by_absence,
             "instrument lifecycle recorded"
         ),
-        Err(err) => error!(
-            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
-            %err,
-            date,
-            "instrument lifecycle could NOT be written — nothing was deleted (the table is \
-             append-and-upsert only), but today's expiry marks are missing, so a query \
-             asking which instruments were tradeable today will read yesterday's answer."
-        ),
+        Err(err) => {
+            metrics::counter!("tv_instrument_lifecycle_persist_failed_total").increment(1);
+            // Audit OBS-2 (2026-10-11): a failed SEBI lifecycle write is a
+            // storage audit-write failure (STORAGE-GAP-03), not a socket state.
+            error!(
+                code = tickvault_common::error_code::ErrorCode::StorageGap03AuditWriteFailed
+                    .code_str(),
+                source = "lifecycle_persist_failed",
+                ?err,
+                date,
+                "instrument lifecycle write did not fully land — nothing was deleted (the table \
+                 is append-and-upsert only). Rows that did not land keep yesterday's state, so \
+                 a query asking which instruments were tradeable today reads yesterday's answer \
+                 for them; rows held back because their audit transition was not written are \
+                 recorded by the next run. The error carries the counts."
+            );
+        }
     }
     persist_constituents(questdb, date, &outcome).await;
 
@@ -1148,6 +1157,12 @@ async fn build_once(date: &str, questdb: &QuestDbConfig) -> anyhow::Result<JoinO
 /// persistent failure means the SEBI point-in-time history is developing a
 /// hole, which is worth waking someone for — just not worth discarding good
 /// work over.
+///
+/// **⚠ CORRECTED 2026-10-11 (review of QDB-2).** "The row lands then" is
+/// false: each row is stamped with its own trading date, so tomorrow's write
+/// lands tomorrow's row and today's stays missing. What narrows the hole is
+/// the writer's 10 s retry on a transport failure or a 5xx answer
+/// (`sebi_master_ilp_http_conf`); a failure past that is a missing day.
 async fn persist_constituents(questdb: &QuestDbConfig, date: &str, outcome: &JoinOutcome) {
     if outcome.resolved.is_empty() {
         // Unreachable while the tolerance gate stands (an empty join reports
@@ -1232,18 +1247,23 @@ async fn persist_constituents(questdb: &QuestDbConfig, date: &str, outcome: &Joi
             )
             .await;
         }
-        Err(err) => error!(
-            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
-            source = "rider_constituency_persist_failed",
-            rows = rows.len(),
-            date,
-            error = %err,
-            "index_constituency persist FAILED — the mapping file is still correct on disk and \
-             tomorrow's write is DEDUP-idempotent, but today's point-in-time row is missing. \
-             The rebalance-expiry pass is deliberately SKIPPED: a failed write is \
-             indistinguishable from every constituent being dropped, so running it here \
-             would expire the live universe"
-        ),
+        Err(err) => {
+            metrics::counter!("tv_index_constituency_persist_failed_total").increment(1);
+            // Audit OBS-2 (2026-10-11): STORAGE-GAP-03, not WS-GAP-03.
+            error!(
+                code = tickvault_common::error_code::ErrorCode::StorageGap03AuditWriteFailed
+                    .code_str(),
+                source = "rider_constituency_persist_failed",
+                rows = rows.len(),
+                date,
+                error = %err,
+                "index_constituency persist FAILED — the mapping file is still correct on disk and \
+                 tomorrow's write is DEDUP-idempotent, but today's point-in-time row is missing. \
+                 The rebalance-expiry pass is deliberately SKIPPED: a failed write is \
+                 indistinguishable from every constituent being dropped, so running it here \
+                 would expire the live universe"
+            );
+        }
     }
 }
 
@@ -1795,6 +1815,52 @@ mod constituent_bound_tests {
 
 #[cfg(test)]
 mod tests {
+
+    // Audit OBS-2 (2026-10-11): failed writes to the SEBI lifecycle and
+    // constituency tables were coded WS-GAP-03 (a socket state), the lifecycle
+    // arm carried no `source`, and neither had a failure counter.
+    #[test]
+    fn test_lifecycle_and_constituency_persist_failures_are_coded_storage_gap_03() {
+        let src = include_str!("dhan_universe.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("non-test half");
+        for (source, counter) in [
+            (
+                "source = \"lifecycle_persist_failed\"",
+                "tv_instrument_lifecycle_persist_failed_total",
+            ),
+            (
+                "source = \"rider_constituency_persist_failed\"",
+                "tv_index_constituency_persist_failed_total",
+            ),
+        ] {
+            let at = prod
+                .find(source)
+                .unwrap_or_else(|| panic!("{source} must exist"));
+            let start = prod[..at].rfind("Err(err) => {").expect("an Err arm");
+            let end = at + prod[at..].find("\n        }\n").expect("the arm ends");
+            let arm = &prod[start..end];
+            assert!(arm.contains("StorageGap03AuditWriteFailed"), "{arm}");
+            assert!(!arm.contains("WsGapConnectionState"), "{arm}");
+            assert!(
+                arm.contains(&format!("counter!(\"{counter}\").increment(1)")),
+                "{arm}"
+            );
+            // Seeded at boot after the recorder install (review of OBS-2,
+            // 2026-10-11): a seed milliseconds before the write that may fail
+            // is a series no scrape ever sees at 0.
+            assert!(
+                include_str!("main.rs").contains(&format!("counter!(\"{counter}\").increment(0)")),
+                "{counter} must be seeded at 0 at boot"
+            );
+            assert!(
+                !prod.contains(&format!("counter!(\"{counter}\").increment(0)")),
+                "{counter} must not be seeded right before its write"
+            );
+        }
+    }
 
     // ---- F&O stock underlying derivation (operator 2026-08-21) ----
 

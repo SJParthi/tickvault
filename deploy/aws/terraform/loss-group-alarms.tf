@@ -11,14 +11,19 @@
 # what the operator DOES (the §2.9 / loss-and-retention-alarms.tf precedent):
 # fifty-five counters, six pages.
 #
+# 2026-10-11 (§2.10-a, the owner tapped "Logs and alarms"): fourteen more
+# counters joined the same six pages, no new page. Sixty-nine counters now.
+# The ones left out, and why, are listed in §2.10-a.
+#
 # ROUTE (seal-drop-alarm.tf house pattern): no EMF name is added. Every 60 s
 # scrape already ships each series as a plain JSON event, with $.host and each
 # Prometheus label as a same-named field, into /tickvault/<env>/metrics. One
 # log metric filter per counter extracts the per-scrape delta into ONE derived
 # metric per group. Each group's metric has a DISTINCT tv_loss_* name, never a
 # raw counter name, so a later EMF selection of a raw counter cannot be
-# double-counted under these alarms. Filters are free; the group holds about
-# 60 of its 100.
+# double-counted under these alarms. Filters are free; the group holds 75 of
+# the 100 AWS allows per log group since 2026-10-11 (§2.10-a keeps it at or
+# under 95).
 #
 # SLICES. A label clause narrows a counter to its loss values where some of
 # its values are normal (each exclusion and its reason is in §2.10).
@@ -57,6 +62,11 @@ locals {
     "candle-int-heal-refused"     = { group = "market_data_refused", counter = "tv_candle_int_self_heal_refused_total", slice = "" }
     "top-volume-rows-discarded"   = { group = "market_data_refused", counter = "tv_top_volume_rank_rows_discarded_total", slice = "" }
     "top-volume-append-failed"    = { group = "market_data_refused", counter = "tv_top_volume_rank_append_failed_total", slice = "" }
+    # 2026-10-11 (§2.10-a). Every reason but label_unavailable drops the row;
+    # label_unavailable keeps it with a blank display name.
+    "top-volume-snapshot-refused" = { group = "market_data_refused", counter = "tv_top_volume_snapshot_refused_total", slice = " && $.reason != \"label_unavailable\"" }
+    # Oversize only: transport is every ordinary socket reset.
+    "ws-frame-refused-oversize" = { group = "market_data_refused", counter = "tv_dhan_ws_frame_refused_total", slice = " && $.reason = \"oversize\"" }
 
     # ---- 2. subscription coverage lost -------------------------------------
     # spawn_skipped only: gave_up_outstanding_sockets can happen on a flat open.
@@ -69,6 +79,10 @@ locals {
     "rebalance-swaps-refused" = { group = "subscription_gap", counter = "tv_depth_rebalance_swaps_refused_total", slice = " && ($.reason = \"no_socket\" || $.reason = \"channel_full\" || $.reason = \"channel_closed\")" }
     # empty_selection only: partial_selection is normal at a 09:00 attach.
     "depth-universe-failed" = { group = "subscription_gap", counter = "tv_dhan_depth_universe_failed_total", slice = " && $.reason = \"empty_selection\"" }
+    # 2026-10-11 (§2.10-a): a planned socket refused by the connection
+    # budget, and a redial refused because this process lost the lock.
+    "pool-budget-refused"        = { group = "subscription_gap", counter = "tv_dhan_pool_budget_refused_total", slice = "" }
+    "instance-lock-dial-refused" = { group = "subscription_gap", counter = "tv_instance_lock_dial_refused_total", slice = "" }
 
     # ---- 3. audit rows lost (N3: socket-audit write failures) --------------
     "ws-audit-write-errors"       = { group = "audit_rows", counter = "tv_ws_event_audit_write_errors_total", slice = "" }
@@ -93,6 +107,8 @@ locals {
     "seal-unwritten-mark-errors"       = { group = "durability_sync", counter = "tv_seal_unwritten_mark_errors_total", slice = "" }
     "deferred-depth-persist-failed"    = { group = "durability_sync", counter = "tv_wal_deferred_depth_persist_failed_total", slice = "" }
     "applied-watermark-persist-failed" = { group = "durability_sync", counter = "tv_wal_applied_watermark_persist_failed_total", slice = "" }
+    # 2026-10-11 (§2.10-a): the candle dead-letter file sync.
+    "seal-dlq-sync-failed" = { group = "durability_sync", counter = "tv_seal_dlq_sync_failed_total", slice = "" }
 
     # ---- 5. order path dropped (paper mode today) --------------------------
     "order-update-frames-dropped" = { group = "order_path", counter = "tv_order_update_frames_dropped_total", slice = "" }
@@ -107,6 +123,13 @@ locals {
     "order-runtime-sid-refused"   = { group = "order_path", counter = "tv_order_runtime_sid_refused_total", slice = "" }
     "oms-aliases-refused"         = { group = "order_path", counter = "tv_oms_order_aliases_refused_total", slice = "" }
     "oms-correlations-refused"    = { group = "order_path", counter = "tv_oms_correlations_refused_total", slice = "" }
+    # 2026-10-11 (§2.10-a): orders refused (budget tier, DH-904 retries
+    # spent, unknown segment, the 805 stop-all latch) and marks refused.
+    "oms-order-budget-refused"  = { group = "order_path", counter = "tv_oms_order_budget_refused_total", slice = "" }
+    "oms-dh904-exhausted"       = { group = "order_path", counter = "tv_oms_dh904_exhausted_total", slice = "" }
+    "oms-unknown-order-segment" = { group = "order_path", counter = "tv_oms_unknown_order_segment_refused_total", slice = "" }
+    "oms-stop-all-refusals"     = { group = "order_path", counter = "tv_oms_stop_all_refusals_total", slice = "" }
+    "risk-mark-rejected"        = { group = "order_path", counter = "tv_risk_mark_rejected_total", slice = "" }
 
     # ---- 6. a safety bound reached, or a monitor blind ---------------------
     "spot-price-store-refused" = { group = "bound_or_blind", counter = "tv_spot_price_store_refused_total", slice = "" }
@@ -120,6 +143,13 @@ locals {
     "resource-monitor-probe-failed" = { group = "bound_or_blind", counter = "tv_resource_monitor_probe_failed_total", slice = "" }
     "oom-monitor-probe-failed"      = { group = "bound_or_blind", counter = "tv_oom_monitor_probe_failed_total", slice = "" }
     "ws-activity-watchdog-panicked" = { group = "bound_or_blind", counter = "tv_ws_activity_watchdog_panicked_total", slice = "" }
+    # 2026-10-11 (§2.10-a): two per-instrument trackers at their cap, the
+    # day high/low reset task dying, and an HTTP client that could not be
+    # built (that probe or write is skipped).
+    "day-ohlc-tracker-refused" = { group = "bound_or_blind", counter = "tv_day_ohlc_tracker_refused_total", slice = "" }
+    "tick-gap-tracker-refused" = { group = "bound_or_blind", counter = "tv_tick_gap_tracker_refused_total", slice = "" }
+    "day-ohlc-reset-failures"  = { group = "bound_or_blind", counter = "tv_day_ohlc_reset_failures_total", slice = "" }
+    "http-client-build-failed" = { group = "bound_or_blind", counter = "tv_http_client_build_failed_total", slice = "" }
   }
 }
 
@@ -150,7 +180,7 @@ resource "aws_cloudwatch_log_metric_filter" "loss_group" {
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "market_data_refused" {
   alarm_name          = "tv-${var.environment}-market-data-refused"
-  alarm_description   = "RECEIVED MARKET DATA WAS REFUSED, SET ASIDE OR DISCARDED. Sums seven counters: frames drained from a stale socket at reconnect, open-interest/market-status rows refused, depth spill rows refused because the free-space probe was blind, spill replay lines QuestDB refused (kept in quarantine), candles refused on a table still on the old id type, and top-volume rows that failed to append or were discarded. DO: (1) grep /tickvault/<env>/app for STORAGE-GAP-01, STORAGE-GAP-03 and TICK-SPILL-01 lines; they name the table and the cause. (2) check QuestDB health and df -h /data. (3) re-ingest data/spill/quarantine/*.rejected-lines once the cause is fixed. Authority: dhan-rest-only-noise-lock-2026-07-14.md section 2.10."
+  alarm_description   = "RECEIVED MARKET DATA WAS REFUSED, SET ASIDE OR DISCARDED. Sums nine counters: frames drained from a stale socket at reconnect, open-interest/market-status rows refused, depth spill rows refused because the free-space probe was blind, spill replay lines QuestDB refused (kept in quarantine), candles refused on a table still on the old id type, top-volume rows that failed to append, were discarded or were dropped by the snapshot, and socket frames refused as larger than the size cap. DO: (1) grep /tickvault/<env>/app for STORAGE-GAP-01, STORAGE-GAP-03 and TICK-SPILL-01 lines; they name the table and the cause. (2) check QuestDB health and df -h /data. (3) re-ingest data/spill/quarantine/*.rejected-lines once the cause is fixed. Authority: dhan-rest-only-noise-lock-2026-07-14.md section 2.10."
   comparison_operator = "GreaterThanOrEqualToThreshold"
   threshold           = 1
   evaluation_periods  = 1
@@ -170,7 +200,7 @@ resource "aws_cloudwatch_metric_alarm" "market_data_refused" {
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "subscription_coverage_lost" {
   alarm_name          = "tv-${var.environment}-subscription-coverage-lost"
-  alarm_description   = "SOME PLANNED CONTRACTS ARE GETTING NO DATA. Sums seven counters: planned sockets the dial never spawned, subscribe dispatches that stopped part-way, top-up subscribes that failed, depth swaps that failed or timed out, decided depth swaps that never reached a socket, and a depth selection that came back empty. DO: (1) grep /tickvault/<env>/app for WS-GAP-02 and WS-GAP-03 lines; they name the socket, endpoint and how many instruments are uncovered. (2) if a socket is short and no 805 was reported, restart the lane in a quiet window. Authority: dhan-rest-only-noise-lock-2026-07-14.md section 2.10."
+  alarm_description   = "SOME PLANNED CONTRACTS ARE GETTING NO DATA. Sums nine counters: planned sockets the dial never spawned, subscribe dispatches that stopped part-way, top-up subscribes that failed, depth swaps that failed or timed out, decided depth swaps that never reached a socket, a depth selection that came back empty, a socket the connection budget refused, and a redial refused because this server lost its single-instance lock. DO: (1) grep /tickvault/<env>/app for WS-GAP-02 and WS-GAP-03 lines; they name the socket, endpoint and how many instruments are uncovered. (2) if a socket is short and no 805 was reported, restart the lane in a quiet window. Authority: dhan-rest-only-noise-lock-2026-07-14.md section 2.10."
   comparison_operator = "GreaterThanOrEqualToThreshold"
   threshold           = 1
   evaluation_periods  = 1
@@ -212,7 +242,7 @@ resource "aws_cloudwatch_metric_alarm" "audit_rows_lost" {
 # the page; a device that keeps failing is.
 resource "aws_cloudwatch_metric_alarm" "durability_sync_failing" {
   alarm_name          = "tv-${var.environment}-durability-sync-failing"
-  alarm_description   = "THE SERVER COULD NOT CONFIRM SAVED DATA TO DISK. Sums five counters: frame log syncs that failed, candle spill file syncs that failed, crash-marker writes that failed, and the deferred-depth marks and applied-watermark files that could not be saved. A power cut now could lose the newest data. DO: (1) check the disk: dmesg for I/O errors, df -h /data, the EBS volume status. (2) grep /tickvault/<env>/app for WS-SPILL-01 and AGGREGATOR-SEAL-01 lines. Authority: dhan-rest-only-noise-lock-2026-07-14.md section 2.10."
+  alarm_description   = "THE SERVER COULD NOT CONFIRM SAVED DATA TO DISK. Sums six counters: frame log syncs that failed, candle spill and dead-letter file syncs that failed, crash-marker writes that failed, and the deferred-depth marks and applied-watermark files that could not be saved. A power cut now could lose the newest data. DO: (1) check the disk: dmesg for I/O errors, df -h /data, the EBS volume status. (2) grep /tickvault/<env>/app for WS-SPILL-01 and AGGREGATOR-SEAL-01 lines. Authority: dhan-rest-only-noise-lock-2026-07-14.md section 2.10."
   comparison_operator = "GreaterThanOrEqualToThreshold"
   threshold           = 1
   evaluation_periods  = 3
@@ -232,7 +262,7 @@ resource "aws_cloudwatch_metric_alarm" "durability_sync_failing" {
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "order_path_dropped" {
   alarm_name          = "tv-${var.environment}-order-path-dropped"
-  alarm_description   = "AN ORDER UPDATE, FILL OR PRICE FOR THE ORDER SYSTEM WAS DROPPED OR REFUSED. Sums twelve counters: order-update frames dropped or decoded hollow, order updates skipped by a lagging receiver, prices dropped or their producer lost, fills refused (unknown segment, bad price, risk engine), and orders, aliases, correlations or instruments refused at a size limit. DO: (1) reconcile the named orders against the Dhan order book. (2) grep /tickvault/<env>/app for ORDER-EVT-02, OMS-GAP and RISK-GAP lines. Paper mode today. Authority: dhan-rest-only-noise-lock-2026-07-14.md section 2.10."
+  alarm_description   = "AN ORDER UPDATE, FILL OR PRICE FOR THE ORDER SYSTEM WAS DROPPED OR REFUSED. Sums seventeen counters: order-update frames dropped or decoded hollow, order updates skipped by a lagging receiver, prices dropped, refused as invalid or their producer lost, fills refused (unknown segment, bad price, risk engine), orders, aliases, correlations or instruments refused at a size limit, and orders refused by the order budget, after DH-904 retries ran out, for an unknown segment or during the 805 stop-all pause. DO: (1) reconcile the named orders against the Dhan order book. (2) grep /tickvault/<env>/app for ORDER-EVT-02, OMS-GAP and RISK-GAP lines. Paper mode today. Authority: dhan-rest-only-noise-lock-2026-07-14.md section 2.10."
   comparison_operator = "GreaterThanOrEqualToThreshold"
   threshold           = 1
   evaluation_periods  = 1
@@ -252,7 +282,7 @@ resource "aws_cloudwatch_metric_alarm" "order_path_dropped" {
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "safety_bound_or_monitor_blind" {
   alarm_name          = "tv-${var.environment}-safety-bound-or-monitor-blind"
-  alarm_description   = "A FIXED-SIZE TABLE IS FULL OR A HEALTH CHECK IS BLIND. Sums ten counters: spot-price, previous-close and volume-ranking entries refused at their caps (or a ranking window lost), depth-view tracking refused at its cap, the WAL lag tracker full, the spill-disk, memory and OOM probes failing, and the order-update activity watchdog panicking. DO: read the log line naming the table or probe in /tickvault/<env>/app. A cap hit means the universe outgrew it; a failing probe means that monitor is not watching. Authority: dhan-rest-only-noise-lock-2026-07-14.md section 2.10."
+  alarm_description   = "A FIXED-SIZE TABLE IS FULL OR A HEALTH CHECK IS BLIND. Sums fourteen counters: spot-price, previous-close, volume-ranking, day high/low and tick-gap entries refused at their caps (or a ranking window lost), depth-view tracking refused at its cap, the WAL lag tracker full, the spill-disk, memory and OOM probes failing, the order-update activity watchdog panicking, the day high/low reset task dying, and an HTTP client that could not be built. DO: read the log line naming the table or probe in /tickvault/<env>/app. A cap hit means the universe outgrew it; a failing probe means that monitor is not watching. Authority: dhan-rest-only-noise-lock-2026-07-14.md section 2.10."
   comparison_operator = "GreaterThanOrEqualToThreshold"
   threshold           = 1
   evaluation_periods  = 1

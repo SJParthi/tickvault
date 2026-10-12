@@ -32,6 +32,7 @@
 //!   1 — fatal error collecting data (shouldn't happen — all
 //!        probes are fail-safe)
 
+#![cfg_attr(not(test), deny(unsafe_code))]
 #![allow(clippy::unwrap_used)] // APPROVED: diagnostic CLI
 #![allow(clippy::expect_used)] // APPROVED: diagnostic CLI
 

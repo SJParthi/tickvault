@@ -437,6 +437,13 @@ const SPAWN_ALLOWLIST: &[(&str, &str)] = &[
         "compose health checks (infra.rs) + container tests",
     ),
     ("df", "disk-health watcher"),
+    (
+        "kill",
+        "test only (audit G3, 2026-10-11): main.rs sends SIGTERM to the test's \
+         own process to prove a signal landing between two shutdown waits is \
+         returned by the next wait. A POSIX process utility, not a language \
+         runtime; nothing in production spawns it.",
+    ),
     ("open", "operator convenience — opens a URL on the dev box"),
     (
         "chronyc",
@@ -581,6 +588,8 @@ fn spawn_allowlist_is_documented_and_has_no_language_runtime() {
         "sh",
         "docker",
         "df",
+        // 2026-10-11 (audit G3): test-only SIGTERM to the test's own process.
+        "kill",
         "open",
         "chronyc",
         "systemctl",

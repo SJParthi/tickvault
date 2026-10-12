@@ -18,6 +18,15 @@
 //!     14-byte disconnect packet: response_code at byte 2 of the
 //!     12-byte depth header, reason code at bytes 12-13 LE.
 //!
+//! **⚠ CORRECTED 2026-10-11 (audit PROOF-2).** The read-loop names above are
+//! stale: `connection.rs::run_read_loop` and `depth_connection.rs` no longer
+//! exist (the socket is `DhanFeedSocketImpl`, and a disconnect becomes
+//! `SocketEvent::Closed` in its `recv`), and the "Unit tests inside
+//! `connection.rs`" below no longer cover a `run_read_loop`. This file still
+//! checks the byte decoder. The production socket against a real server
+//! (807 refresh, 805 park, stacked disconnect) is proved by
+//! `ws_fake_dhan_server_end_to_end.rs`.
+//!
 //! This file exercises the OBSERVABLE contract via the byte-layout
 //! helpers — it constructs exact on-wire disconnect packets and
 //! feeds them through the classifier to verify the same decoder

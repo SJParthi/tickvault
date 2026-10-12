@@ -122,7 +122,7 @@ The `.mcp.json` `tickvault-logs` entry is loaded automatically — same MCP tool
 > **Still NOT done:** the measurement this note asks for. Nothing has shown the pin helps
 > on the r8g.xlarge; the cell above stays withdrawn until that number exists.
 | QuestDB never fails | ABSORB via 3-tier rescue→spill→DLQ + schema self-heal via `ALTER ADD COLUMN IF NOT EXISTS` | item must not break self-heal |
-| O(1) latency | `from_le_bytes` + `papaya` + `Arc<HashMap>` + SPSC bounded; bench-gate ≤5% regression on hot path | item adds Criterion bench if hot path |
+| O(1) latency | `from_le_bytes` + ~~`papaya` + `Arc<HashMap>` + SPSC bounded~~; bench-gate ≤5% regression on hot path. **⚠ CORRECTED 2026-10-11:** hot-path lookups are a plain `HashMap` on the composite key (the aggregator rejects papaya on purpose); papaya is used only where other tasks read concurrently. The frame ring is a bounded channel with many producers (one per socket read task), capped by `FRAME_RING_CAPACITY` and `FRAME_RING_MAX_BYTES`, not single-producer. A depth packet is O(levels), a tick packet O(1). | item adds Criterion bench if hot path |
 | Uniqueness + dedup | Composite `(security_id, exchange_segment)` per I-P1-11 + DEDUP UPSERT KEYS on every storage table | item DEDUP key includes segment |
 | Real-time proof | 7-layer telemetry + SLO score every 10s + market-open self-test at 09:16:30 IST | item ratchet pins all 7 layers |
 

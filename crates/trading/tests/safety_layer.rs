@@ -1139,13 +1139,72 @@ mod proptest_oms_state_machine {
         fn random_strings_parse_to_none(
             s in "[a-z]{1,20}",
         ) {
-            // All valid Dhan statuses are UPPERCASE or specific mixed case
-            // Lowercase random strings should never match
-            prop_assert!(
-                parse_order_status(&s).is_none(),
-                "Random lowercase string '{}' must parse to None",
+            // Matching ignores ASCII case since 2026-10-11 (audit INP-7), so a
+            // lowercase string parses exactly when it is one of the known
+            // spellings; every other lowercase string must parse to None.
+            // Checked against an independent list (review G6, 2026-10-11): a
+            // parser that accepted everything also parses `s` like its
+            // uppercase form, so equality alone proves nothing.
+            prop_assert_eq!(
+                parse_order_status(&s).is_some(),
+                is_known_status_spelling(&s),
+                "'{}' must parse exactly when it is a known spelling",
+                s,
+            );
+            let upper = s.to_ascii_uppercase();
+            prop_assert_eq!(parse_order_status(&s), parse_order_status(&upper));
+        }
+
+        /// INVARIANT: mixed-case strings with underscores parse exactly when
+        /// they are a known spelling, ignoring ASCII case (review G6).
+        #[test]
+        fn mixed_case_strings_parse_only_when_known(
+            s in "[A-Za-z_]{1,20}",
+        ) {
+            prop_assert_eq!(
+                parse_order_status(&s).is_some(),
+                is_known_status_spelling(&s),
+                "'{}' must parse exactly when it is a known spelling",
                 s,
             );
         }
+
+        /// INVARIANT: every known spelling, in any ASCII case, parses.
+        #[test]
+        fn known_spellings_parse_in_any_case(
+            idx in 0usize..KNOWN_STATUS_SPELLINGS.len(),
+            mask in proptest::collection::vec(any::<bool>(), 16),
+        ) {
+            let known = KNOWN_STATUS_SPELLINGS[idx];
+            let mixed: String = known
+                .chars()
+                .zip(mask.iter().cycle())
+                .map(|(c, lower)| if *lower { c.to_ascii_lowercase() } else { c })
+                .collect();
+            prop_assert!(parse_order_status(&mixed).is_some(), "'{}' must parse", mixed);
+        }
+    }
+
+    /// Independent oracle: the 12 Dhan status spellings, written out here
+    /// rather than read from the parser's own table.
+    const KNOWN_STATUS_SPELLINGS: [&str; 12] = [
+        "TRANSIT",
+        "PENDING",
+        "CONFIRMED",
+        "PART_TRADED",
+        "PARTIALLY_FILLED",
+        "TRADED",
+        "CANCELLED",
+        "REJECTED",
+        "EXPIRED",
+        "CLOSED",
+        "TRIGGERED",
+        "CONFIRM",
+    ];
+
+    fn is_known_status_spelling(s: &str) -> bool {
+        KNOWN_STATUS_SPELLINGS
+            .iter()
+            .any(|k| k.eq_ignore_ascii_case(s))
     }
 }

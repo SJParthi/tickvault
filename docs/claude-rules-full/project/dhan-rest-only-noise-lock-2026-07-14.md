@@ -4804,6 +4804,111 @@ the standing ceiling is $150 per Quote 23.
 - Drops the boot-time zero registration of any counter in a group.
 - Adds a counter to a group, or widens a slice, without a dated row here.
 
+## §2.10-a — 2026-10-11: more counters join the six loss-group pages (no new page)
+
+**The owner's answer, as recorded by the platform:** 2026-10-11 10:26 UTC, the
+owner tapped **"Logs and alarms"** on the card *"Prepare which AWS cost changes
+from the audit as code?"*. The option text read: *"I write the S3 log export
+and fold the uncovered counters into the existing loss pages; no standby."*
+This dated row is the §3 record, written in the same change as the terraform
+(`deploy/aws/terraform/loss-group-alarms.tf`, `deploy/aws/terraform/log-export.tf`).
+
+**What changed in the pages.** Fourteen more counters feed the six §2.10
+pages. No new alarm, no new derived metric, no new dimension, no `ok_actions`,
+no EMF name. Each counter gets one log metric filter on
+`/tickvault/<env>/metrics`, into its group's existing `tv_loss_*` metric. The
+pages now sum 69 counters (55 before). Filters on that log group go from 61 to
+75 of the 100 AWS allows per log group.
+
+| Page | Counters added |
+|---|---|
+| `tv-<env>-market-data-refused` | `tv_top_volume_snapshot_refused_total` (every `reason` except `label_unavailable`, which keeps the row with a blank display name), `tv_dhan_ws_frame_refused_total` (`reason = "oversize"` only; `transport` is every ordinary socket reset) |
+| `tv-<env>-subscription-coverage-lost` | `tv_dhan_pool_budget_refused_total`, `tv_instance_lock_dial_refused_total` |
+| `tv-<env>-durability-sync-failing` | `tv_seal_dlq_sync_failed_total` |
+| `tv-<env>-order-path-dropped` | `tv_oms_order_budget_refused_total`, `tv_oms_dh904_exhausted_total`, `tv_oms_unknown_order_segment_refused_total`, `tv_oms_stop_all_refusals_total`, `tv_risk_mark_rejected_total` |
+| `tv-<env>-safety-bound-or-monitor-blind` | `tv_day_ohlc_tracker_refused_total`, `tv_tick_gap_tracker_refused_total`, `tv_day_ohlc_reset_failures_total`, `tv_http_client_build_failed_total` |
+
+Each added counter is registered at 0 at boot for every label value its emit
+sites use, in `crates/app/src/main.rs` beside the §2.10 seeds. Ratchet:
+`crates/app/tests/alarmed_counters_are_seeded_guard.rs`
+(`LOSS_GROUP_FILTER_COUNT` = 69).
+
+**Left out, with the reason:**
+- `tv_dhan_ws_topup_budget_exhausted_total`: a top-up that stops at its wire
+  budget is routine; the cut contracts are re-offered at the next top-up
+  (`error-code-alarms.tf` records it as ordinary and non-paging).
+- `tv_dhan_ws_topup_refused_total`: refused contracts are un-marked and
+  offered to a socket with room on the next attempt, and the backup subscribe
+  is refused at its cap by design.
+- `tv_instance_lock_renew_failed_total`: one failed renewal is retried every
+  30 s and escalates only on consecutive failures; a lost lock shows up as
+  `tv_instance_lock_dial_refused_total`, which is folded.
+- `tv_instance_lock_clock_skew_refused_total`: the refusal returns "already
+  held", and the existing `DualInstanceDetected` Telegram line already pages
+  that after the patience window.
+- `tv_disk_pressure_probe_failed_total`: one failed poll is retried; a probe
+  blind for the full window already pages through `STORAGE-GAP-05`
+  (`source = "pressure_probe_failing"`).
+- `tv_stall_detector_starved_total`: it increments on every boot with the live
+  lane on (its input is always empty), so it would page every morning.
+- `tv_oms_reconcile_corrections_skipped_total`: a terminal local order that
+  ignores a later broker status is the state machine working; not known to be
+  zero on a normal day.
+- `tv_oms_orphan_fill_updates_total`: an order placed outside tickvault on the
+  same account produces it; not known to be zero on a normal day.
+- `tv_errors_summary_refresh_failed_total`: a local helper file, retried each
+  minute; its read can race the hourly log rotation. Not a loss.
+- `tv_tf_verify_query_failures_total`: `budget_exceeded` adds the count of
+  unchecked instruments and can fire on a large universe; not known to be zero
+  on a normal day.
+- Already paged by another alarm (not folded, never double-paged):
+  `tv_wal_shed_frames_lost_total`, `tv_ws_frame_spill_unflushed_lost_total`,
+  `tv_wal_replay_truncated_segments_total`, `tv_wal_replay_abandoned_bytes_total`,
+  `tv_wal_lost_fate_unknown_total`, `tv_wal_prune_refused_unapplied_total`,
+  `tv_wal_replay_ack_wait_timeouts_total`, `tv_feed_gap_audit_dropped_total`,
+  `tv_depth_dial_refused_after_805_total`, `tv_seal_escalation_inline_stall_total`.
+- Forbidden here: `tv_dhan_live_xverify_audit_rows_abandoned_total`
+  (no-REST lock §12.15.8: a deliberate stop at the deadline never counts as a
+  loss) and `tv_exit_commands_dropped_total` (the exit-order lockout keeps that
+  layer log-sink-only).
+- Excluded by §2.10 already: `tv_risk_mark_capacity_refused_total`,
+  `tv_orphan_position_watchdog_fetch_failures_total`.
+- Not checked in this change, so not folded: the remaining counters of the
+  2026-10-04 audit inventory (normal or not a loss, dead or frozen, or not yet
+  verified). Each needs its own check and a dated row here.
+
+**The S3 log export is a data copy, not a page.** The same tap covers
+`deploy/aws/terraform/log-export.tf`: CloudWatch Logs subscription filters send
+every event of `/tickvault/<env>/app` and the 12 terraform-managed Lambda log
+groups through two Kinesis Firehose streams into `s3://tv-<env>-cold/logs/app/`
+and `logs/lambda/`. It adds no alarm, no metric and no Telegram line. The
+metrics log group is not exported. Nothing is deleted: the Firehose role has no
+Delete, lifecycle or versioning action, and `logs/` falls under the bucket's
+existing never-expire tiering rule. Ratchet:
+`crates/common/tests/log_export_wiring_guard.rs`.
+
+**Honest cost:** the pages cost **$0**: filters are free, and no metric, alarm
+or EMF name is added. The export is priced in `aws-budget.md` "COST NOTE
+2026-10-11" (Assumed, not read live).
+
+**NOT claimed:**
+- That no added counter moves on a healthy day. No CloudWatch baseline was
+  read for any of the fourteen.
+- That the live account has room for the subscription filters (AWS allows two
+  per log group; none was read).
+- That Firehose delivery is watched. A delivery failure goes to its error log
+  and `logs-errors/` and pages no one; a page needs its own dated row.
+
+**What a PR that violates §2.10-a looks like (REJECT):**
+- Changes any §2.10 rule (every §2.10 REJECT row stands unchanged).
+- Folds a counter that another alarm already pages.
+- Folds `tv_dhan_live_xverify_audit_rows_abandoned_total` or
+  `tv_exit_commands_dropped_total`.
+- Takes the metric filters on `/tickvault/<env>/metrics` past 95.
+- Adds a page, an alarm or `ok_actions` for the S3 log export, or gives the
+  Firehose role a Delete, lifecycle or versioning action, without a dated row
+  here.
+
 ## §2.11 — 2026-10-06: `RISK-GAP-03` re-arms after each silence episode (no new page)
 
 Owner, 2026-10-06: "Go ahead with whatever you want dude", and on the

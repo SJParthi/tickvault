@@ -160,6 +160,9 @@ RestartSec=3
 #
 # It stays well under TimeoutStopSec=145 + the deploy watchdog's own window, so
 # nothing downstream re-times against it.
+# (⚠ CORRECTED 2026-10-11, audit CONC-1: TimeoutStopSec is 165 now, see the
+# shutdown rationale below. systemd stops the watchdog once the unit is
+# stopping, so the two do not interact.)
 WatchdogSec=150
 
 # Environment
@@ -448,10 +451,33 @@ PrivateTmp=true
 # the 20s floor the guard requires (the 25s margin noted above narrows to it).
 # Any further budget growth must raise this timeout.
 #
+# **⚠ CORRECTED 2026-10-11 (audit CONC-1) — the worst case was 137s, not
+# 125s.** The table above left out two bounded waits that were already on the
+# same sequential path, and the guard summed only the five it listed:
+#
+#   SEAL_UNWRITTEN_MARK_FINISH_BUDGET_SECS = 2    (crash marker, after the
+#                                                  escalation queue; main.rs)
+#   SHUTDOWN_FLUSH_TIMEOUT_SECS            = 10   (Telegram flush, after the
+#                                                  WAL drain; in
+#                                                  crates/core/src/notification/service.rs)
+#
+# So 145 left 8s, not the 20s floor. The same change adds an eighth wait,
+# INSTANCE_LOCK_RELEASE_BUDGET_SECS = 3 (main.rs, after the WAL drain and
+# before the Telegram flush): a clean stop now releases the dual-instance lock
+# instead of leaving it for its 90s TTL, so a restart in market hours opens
+# its sockets at once (audit CONC-4). The worst case is therefore
+#
+#   5 + 30 + 75 + 5 + 2 + 10 + 3 + 10       = 140s
+#
+# and the timeout moves to 165 = 140 + the 25s margin this file prefers. No
+# drain budget is shrunk. OpenTelemetry adds nothing while tracing is off in
+# config/base.toml. The longest `systemctl stop` or `restart` can now take up
+# to 165s; the 17:30 stop still ends long before the 17:45 stop-verify.
+#
 # Pinned by crates/app/tests/shutdown_budget_fits_systemd_guard.rs — the
 # relationship, not the number: raising any app budget past this timeout
 # now fails the build.
-TimeoutStopSec=145
+TimeoutStopSec=165
 KillMode=mixed
 KillSignal=SIGTERM
 

@@ -242,6 +242,7 @@ pub(crate) fn pass_counters() -> &'static DrainCounters {
             write_failed: noop(),
             ingest_ticks: noop(),
             ingest_seq_refused: noop(),
+            tick_unknown_segment: noop(),
             refused_price: noop(),
             refused_timestamp: noop(),
             refused_slot: noop(),

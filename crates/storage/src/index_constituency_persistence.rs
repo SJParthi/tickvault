@@ -57,9 +57,11 @@
 //!   previous day-floored `trading_date_ist` caused.
 //! * Idempotent `CREATE TABLE IF NOT EXISTS` + `ALTER ADD COLUMN IF NOT EXISTS`
 //!   (schema self-heal — `observability-architecture.md`).
-//! * ILP bulk ingest (port 9009) — the per-index mapping is large (~46 indices ×
-//!   constituents, heavily overlapping → thousands of rows), so the `/exec` URL
-//!   door would overflow; ILP is the real pipe.
+//! * ILP bulk ingest (over HTTP since 2026-10-11, acknowledged per flush; TCP
+//!   port 9009 before, which reported success for rows QuestDB refused) — the
+//!   per-index mapping is large (~46 indices × constituents, heavily
+//!   overlapping → thousands of rows), so the `/exec` URL door would overflow;
+//!   ILP is the real pipe.
 //!
 //! **Feature-gated** under `daily_universe_fetcher` per rule §21.
 
@@ -691,7 +693,9 @@ fn build_index_constituency_ilp_row(
     Ok(())
 }
 
-/// Bulk-ingest many `index_constituency` rows via QuestDB **ILP** (port 9009).
+/// Bulk-ingest many `index_constituency` rows via QuestDB **ILP over HTTP**
+/// (acknowledged per flush; TCP port 9009 until 2026-10-11, see
+/// `instrument_lifecycle_persistence::sebi_master_ilp_http_conf`).
 ///
 /// The whole [`Buffer`] is built on the async task (CPU-only, borrows `rows`),
 /// then the blocking ILP connect + flush runs on `spawn_blocking`. Idempotent
@@ -708,7 +712,7 @@ pub async fn append_index_constituency_rows(
     if rows.is_empty() {
         return Ok(());
     }
-    let conf = questdb_config.build_ilp_conf_string();
+    let conf = crate::instrument_lifecycle_persistence::sebi_master_ilp_http_conf(questdb_config);
     let mut buffer = Buffer::new(ProtocolVersion::V1);
     for row in rows {
         build_index_constituency_ilp_row(&mut buffer, row)
@@ -862,6 +866,95 @@ mod tests {
     #[test]
     fn test_table_name_constant_is_stable() {
         assert_eq!(QUESTDB_TABLE_INDEX_CONSTITUENCY, "index_constituency");
+    }
+
+    /// Audit QDB-2 (2026-10-11): the constituency bulk writer must use the
+    /// acknowledged HTTP ILP conf, never the TCP pipe that reported success
+    /// for rows QuestDB refused.
+    #[test]
+    fn test_constituency_writer_uses_http_ilp_conf() {
+        let source = include_str!("index_constituency_persistence.rs");
+        let prod = source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("source has a non-test half");
+        assert!(
+            prod.contains(
+                "let conf = crate::instrument_lifecycle_persistence::sebi_master_ilp_http_conf(questdb_config);"
+            ),
+            "append_index_constituency_rows must build its sender from the HTTP ILP conf"
+        );
+        assert!(!prod.contains(concat!("build_ilp_", "conf_string")));
+        assert!(!prod.contains(concat!("tcp", "::addr")));
+    }
+
+    #[tokio::test]
+    async fn test_append_index_constituency_rows_refused_chunk_is_err() {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 65_536];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        // Review of QDB-2 (2026-10-11): the ILP TCP port is a live listener
+        // that reads and discards. With `ilp_port: 1` a writer gone back to
+        // TCP failed to connect and passed this test for the wrong reason;
+        // against this drain it would flush Ok, so only the HTTP 400 can
+        // make the result Err.
+        let drain = std::net::TcpListener::bind("127.0.0.1:0").expect("bind drain");
+        let drain_port = drain.local_addr().expect("drain addr").port();
+        std::thread::spawn(move || {
+            for stream in drain.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 65_536];
+                    while matches!(stream.read(&mut buf), Ok(n) if n > 0) {}
+                });
+            }
+        });
+        let cfg = QuestDbConfig {
+            host: "127.0.0.1".to_owned(),
+            http_port: port,
+            pg_port: 1,
+            ilp_port: drain_port,
+        };
+        let res = append_index_constituency_rows(&cfg, &[sample_row()]).await;
+        assert!(res.is_err(), "a refused constituency chunk must be Err");
+    }
+
+    /// The acknowledged case: an HTTP 204 must return Ok, so the refused
+    /// case above is the server's answer and not a broken writer.
+    #[tokio::test]
+    async fn test_append_index_constituency_rows_acknowledged_chunk_is_ok() {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 65_536];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
+            }
+        });
+        let cfg = QuestDbConfig {
+            host: "127.0.0.1".to_owned(),
+            http_port: port,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        let res = append_index_constituency_rows(&cfg, &[sample_row()]).await;
+        assert!(
+            res.is_ok(),
+            "an acknowledged constituency chunk must be Ok: {res:?}"
+        );
     }
 
     #[test]

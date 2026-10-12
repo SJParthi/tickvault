@@ -2176,6 +2176,7 @@ impl DepthWriter {
                 rows,
                 min_seq: range.0,
                 max_seq: range.1,
+                unbacked,
                 floor,
             };
             match tx.try_send(batch) {
@@ -2267,6 +2268,7 @@ impl DepthWriter {
             self.buffer.as_bytes(),
             spill_version_of(self.buffer.protocol_version()),
             rows,
+            crate::wal_applied_watermark::rescue_failure_fate(range.0, range.1, unbacked),
         );
         note_rescue_outcome_depth(landed, range, false);
         if landed {
@@ -2445,6 +2447,11 @@ impl DepthWriter {
             batch.buffer.as_bytes(),
             spill_version_of(batch.buffer.protocol_version()),
             batch.rows,
+            crate::wal_applied_watermark::rescue_failure_fate(
+                batch.min_seq,
+                batch.max_seq,
+                batch.unbacked,
+            ),
         );
         note_rescue_outcome_depth(landed, (batch.min_seq, batch.max_seq), false);
         let wm = crate::wal_applied_watermark::applied_watermark();
@@ -2459,7 +2466,7 @@ impl DepthWriter {
     ///
     /// A file write, so it runs through `off_worker` (the drain calls `flush`
     /// bare; see the tick writer's twin).
-    fn spill_on_drain(&self, payload: &[u8], version: u8, rows: usize) -> bool {
+    fn spill_on_drain(&self, payload: &[u8], version: u8, rows: usize, fate: &'static str) -> bool {
         crate::off_worker::off_worker(|| {
             perform_depth_rescue(
                 &self.spill_dir,
@@ -2469,6 +2476,7 @@ impl DepthWriter {
                 rows,
                 self.spill_min_free_headroom,
                 crate::tick_persistence::SPILL_UNSYNCED_ON_DRAIN,
+                fate,
             )
         })
     }
@@ -2512,6 +2520,9 @@ impl DepthWriter {
             rows,
             min_seq,
             max_seq,
+            // Copied, not taken: on a full queue the rows come back and the
+            // flag stays with them; the Sent arm below clears it.
+            unbacked: self.pending_unbacked,
         };
         let Some(tx) = self.offload.as_ref() else {
             // Unreachable — `flush` checks. Treated as the gone arm rather than
@@ -2525,6 +2536,9 @@ impl DepthWriter {
             Ok(()) => {
                 self.pending = 0;
                 self.retained_spans = 0;
+                // The batch carries the mark now; nothing pending is unbacked
+                // (review of G4-audit, 2026-10-11).
+                self.pending_unbacked = false;
                 crate::wal_applied_watermark::applied_watermark().note_depth_handed_off();
                 self.flush_counters.offloaded.increment(1);
                 // Only NOW, after the send succeeded: on the Full arm below the
@@ -2711,6 +2725,9 @@ impl DepthWriter {
         match outcome {
             Ok(()) => {
                 self.pending = 0;
+                // Every pending row landed, so the unbacked mark goes with them
+                // (review of G4-audit, 2026-10-11) — see the tick writer's twin.
+                self.pending_unbacked = false;
                 // The synchronous arm acks the watermark itself — see the tick
                 // writer's twin for why.
                 let (_, max_seq) = self.take_pending_range();
@@ -2890,6 +2907,9 @@ pub struct DepthRescueBatch {
     /// Lowest / highest `capture_seq` in this payload (`0` = unknown).
     min_seq: u64,
     max_seq: u64,
+    /// `true` when some row has no WAL record behind it (DB-8: decides the
+    /// `fate` a failed rescue reports).
+    unbacked: bool,
     /// This batch's hold on the persisted watermark (Z7); released by the
     /// rescue thread once the write is synced or has failed and been marked.
     /// An abandoned batch (shutdown) never releases it, so the final persist
@@ -2929,6 +2949,11 @@ impl DepthRescueSink {
             batch.rows,
             self.spill_min_free_headroom,
             self.spill_sync,
+            crate::wal_applied_watermark::rescue_failure_fate(
+                batch.min_seq,
+                batch.max_seq,
+                batch.unbacked,
+            ),
         );
         note_rescue_outcome_depth(landed, (batch.min_seq, batch.max_seq), false);
         let wm = crate::wal_applied_watermark::applied_watermark();
@@ -2973,6 +2998,7 @@ fn perform_depth_rescue(
     rows: usize,
     min_free_headroom_bytes: u64,
     sync: Option<crate::tick_persistence::SpillSyncFn>,
+    fate: &'static str,
 ) -> bool {
     let payload_len = payload.len();
     let now = std::time::SystemTime::now()
@@ -3028,13 +3054,19 @@ fn perform_depth_rescue(
                 code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
                 feed = feed.as_str(),
                 dropped = rows,
+                fate,
                 cap_bytes = depth_spill_max_bytes(),
                 spill_dir = %spill_dir.display(),
                 spill_error = %err,
                 "market_depth flush failed AND the depth spill rescue also failed — \
-                 these levels are permanently lost and nothing re-inserts them. The \
-                 raw frames remain in the write-ahead log ONLY if it accepted them -- a non-zero \
-                 tv_dhan_ws_wal_dropped_total means the disk refused them there too."
+                 these levels are in neither QuestDB nor the spill. \
+                 fate=deferred_to_wal_replay means the WAL writer had already flushed \
+                 their frames to the kernel, so the next boot's replay re-inserts them \
+                 unless the host crashes before the device sync; \
+                 fate=deferred_if_wal_flushes means they are re-inserted only if the WAL \
+                 writer flushes those frames (a rise in \
+                 tv_ws_frame_spill_unflushed_lost_total means some were not); \
+                 fate=lost means no write-ahead-log record backs them and they are gone."
             );
             false
         }
@@ -3118,6 +3150,9 @@ pub struct DepthFlushBatch {
     /// Lowest / highest `capture_seq` in this batch (`0` = unknown).
     min_seq: u64,
     max_seq: u64,
+    /// `true` when some row has no WAL record behind it (DB-8: decides the
+    /// `fate` a failed rescue reports).
+    unbacked: bool,
 }
 
 impl DepthFlushBatch {
@@ -3455,13 +3490,25 @@ impl DepthWriterSink {
                     feed = self.feed.as_str(),
                     dropped = rows,
                     reason = why,
+                    fate = crate::wal_applied_watermark::rescue_failure_fate(
+                        batch.min_seq,
+                        batch.max_seq,
+                        batch.unbacked,
+                    ),
+                    min_seq = batch.min_seq,
+                    max_seq = batch.max_seq,
                     cap_bytes = depth_spill_max_bytes(),
                     spill_dir = %self.spill_dir.display(),
                     spill_error = %err,
                     "offloaded market_depth flush failed AND the depth spill rescue also \
-                     failed — these levels are permanently lost and nothing re-inserts \
-                     them. The raw frames remain in the write-ahead log ONLY if it accepted them -- a non-zero \
-                 tv_dhan_ws_wal_dropped_total means the disk refused them there too."
+                     failed — these levels are in neither QuestDB nor the spill. \
+                     fate=deferred_to_wal_replay means the WAL writer had already flushed \
+                     their frames to the kernel, so the next boot's replay re-inserts \
+                     them unless the host crashes before the device sync; \
+                     fate=deferred_if_wal_flushes means they are re-inserted only if the \
+                     WAL writer flushes those frames (a rise in \
+                     tv_ws_frame_spill_unflushed_lost_total means some were not); \
+                     fate=lost means no write-ahead-log record backs them and they are gone."
                 );
             }
         }
@@ -3471,6 +3518,51 @@ impl DepthWriterSink {
 }
 #[cfg(test)]
 mod tests {
+    // ---- Audit DB-8 (2026-10-11): a failed depth rescue names its fate ----
+
+    #[test]
+    fn test_depth_rescue_failure_log_carries_fate_and_no_blanket_lost_claim() {
+        let source = include_str!("depth_persistence.rs");
+        let prod = source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("non-test half");
+        assert!(!prod.contains(concat!("nothing re-", "inserts")));
+        assert!(!prod.contains(concat!("permanently ", "lost and nothing")));
+        assert!(
+            prod.contains(
+                "                    fate = crate::wal_applied_watermark::rescue_failure_fate(\n"
+            ),
+            "the writer-thread arm reports the fate"
+        );
+        assert!(
+            prod.contains(
+                "                fate,\n                cap_bytes = depth_spill_max_bytes(),"
+            ),
+            "the shared depth rescue arm reports the fate"
+        );
+    }
+
+    #[test]
+    fn test_depth_rescue_batch_carries_unbacked() {
+        let dir = spill_tmp("db8-depth-unbacked");
+        let mut w = DepthWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (sink, rx) = w.split_rescue_offload();
+        w.append_row(&row()).expect("append");
+        assert_eq!(w.discard_pending(), 1);
+        let batch = rx.try_recv().expect("queued");
+        assert!(!batch.unbacked, "a WAL-sequenced depth row is backed");
+        assert_ne!(batch.min_seq, 0);
+        sink.rescue(&batch);
+
+        w.mark_pending_unbacked();
+        w.append_row(&row()).expect("append");
+        assert_eq!(w.discard_pending(), 1);
+        let batch = rx.try_recv().expect("queued");
+        assert!(batch.unbacked, "a frame the WAL refused is unbacked");
+        sink.rescue(&batch);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The retry window must be far above an interrupted syscall and far below
     /// The named timeout and the conf literal must never drift apart.
@@ -4732,6 +4824,7 @@ mod tests {
             rows: 0,
             min_seq: 0,
             max_seq: 0,
+            unbacked: false,
         }
     }
 
@@ -4874,6 +4967,28 @@ mod tests {
         assert_eq!(w.pending(), 0, "the rows left the producer");
         let batch = rx.try_recv().expect("the batch must be on the queue");
         assert_eq!(batch.rows(), 1, "and it must carry the row count");
+    }
+
+    #[test]
+    fn a_sent_depth_batch_takes_the_unbacked_mark_with_it() {
+        // Review of G4-audit (2026-10-11): the mark was copied into the batch
+        // and never cleared, so after ONE unbacked frame every later batch
+        // read as unbacked and its rescue failure was reported as lost.
+        let (mut w, _sink, rx) = DepthWriter::for_test(Feed::Dhan).split_for_offload();
+        w.append_row(&row()).expect("append");
+        w.mark_pending_unbacked();
+        w.flush().expect("hand-off");
+        let first = rx.try_recv().expect("first batch");
+        assert!(first.unbacked, "the marked batch carries the mark");
+        assert!(!w.pending_unbacked(), "the Sent arm clears the mark");
+
+        w.append_row(&row()).expect("append");
+        w.flush().expect("hand-off");
+        let second = rx.try_recv().expect("second batch");
+        assert!(
+            !second.unbacked,
+            "a later, fully sequenced batch must read as backed"
+        );
     }
 
     #[test]
@@ -5028,6 +5143,7 @@ mod tests {
             rows: 0,
             min_seq: 0,
             max_seq: 0,
+            unbacked: false,
         };
         assert_eq!(sink.write(&mut empty), 0);
         assert!(
