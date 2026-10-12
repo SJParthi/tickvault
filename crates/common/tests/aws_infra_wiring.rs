@@ -1202,3 +1202,99 @@ fn test_deploy_watchdog_handler_only_dispatches_when_positively_stale() {
         "watchdog must dispatch the idempotent + market-hours-guarded auto-deploy workflow"
     );
 }
+
+// QDB-10 (2026-10-11): the QuestDB-disconnected alarm text must not name the
+// retired "100K rescue ring" or promise that nothing is lost.
+#[test]
+fn test_questdb_disconnected_alarm_text_has_no_retired_rescue_ring() {
+    let content =
+        std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/app-alarms.tf"))
+            .expect("app-alarms.tf must be readable"); // APPROVED: test
+    let start = content
+        .find("resource \"aws_cloudwatch_metric_alarm\" \"questdb_disconnected\"")
+        .expect("questdb_disconnected alarm must exist"); // APPROVED: test
+    let block = &content[start..];
+    let end = block.find("\n}\n").expect("alarm block must close"); // APPROVED: test
+    let block = &block[..end];
+    let description = block
+        .lines()
+        .find(|line| line.trim_start().starts_with("alarm_description"))
+        .expect("alarm must carry a description"); // APPROVED: test
+    assert!(
+        !description.contains(concat!("100K rescue ", "ring")),
+        "the description names a retired rescue ring: {description}"
+    );
+    assert!(
+        !description.to_lowercase().contains("no data"),
+        "the description must not promise no loss: {description}"
+    );
+    assert!(description.contains("finite reserve"));
+}
+
+/// Audit SEC-12 (2026-10-11): the `operator_cidr` validation must refuse a
+/// world-open or broad CIDR. Before, any valid CIDR passed, so setting the
+/// `TF_VAR_OPERATOR_CIDR` secret to 0.0.0.0/0 reopened port 22 to the
+/// internet with no refusal (the state audit PR36c removed).
+#[test]
+fn operator_cidr_validation_refuses_world_open_and_broad_prefixes() {
+    let content =
+        std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/variables.tf"))
+            .expect("variables.tf must be readable"); // APPROVED: test
+    let header = "variable \"operator_cidr\" {";
+    let start = content
+        .find(header)
+        .expect("variables.tf must declare variable \"operator_cidr\""); // APPROVED: test
+    let rest = &content[start..];
+    let end = rest.find("\n}\n").map_or(rest.len(), |i| i + 3);
+    let block: String = rest[..end]
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let condition = block
+        .lines()
+        .find(|line| line.trim_start().starts_with("condition"))
+        .expect("the operator_cidr variable must carry a validation condition"); // APPROVED: test
+    assert!(
+        condition.contains(") >= 24"),
+        "the operator_cidr validation must enforce an IPv4 prefix floor of /24; \
+         a bare can(cidrhost(...)) accepts 0.0.0.0/0. Found:\n{condition}"
+    );
+    // Review of SEC-12 (2026-10-11): the SSH ingress puts the value in
+    // `cidr_blocks`, which takes IPv4 only, so IPv6 must be refused at plan
+    // time instead of failing at AWS apply.
+    assert!(
+        condition.contains("length(regexall(\":\", var.operator_cidr)) == 0")
+            && !condition.contains("? 64"),
+        "the operator_cidr validation must refuse IPv6 (any \":\"), because the \
+         SSH ingress cidr_blocks is IPv4 only. Found:\n{condition}"
+    );
+    assert!(
+        condition.contains("try("),
+        "the prefix check must sit inside try() so a value with no \"/\" reads \
+         false instead of erroring. Found:\n{condition}"
+    );
+    assert!(
+        condition.contains("var.operator_cidr == \"\""),
+        "an empty operator_cidr (no SSH ingress) must stay valid"
+    );
+    let message = block
+        .lines()
+        .find(|line| line.trim_start().starts_with("error_message"))
+        .expect("the operator_cidr validation must carry an error_message"); // APPROVED: test
+    assert!(
+        message.contains("0.0.0.0/0") && message.contains("refused"),
+        "the error_message must say 0.0.0.0/0 is refused. Found:\n{message}"
+    );
+    assert!(
+        message.contains("IPv6 is refused") && !message.contains("/64"),
+        "the error_message must not advertise IPv6 as accepted. Found:\n{message}"
+    );
+    let main_tf = std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/main.tf"))
+        .expect("main.tf must be readable"); // APPROVED: test
+    assert!(
+        !main_tf.contains("ipv6_cidr_blocks = [ingress.value]"),
+        "if main.tf gains an IPv6 SSH branch, relax the IPv6 refusal in \
+         variables.tf in the same change"
+    );
+}

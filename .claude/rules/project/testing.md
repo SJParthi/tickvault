@@ -36,7 +36,10 @@ fn test_<module>_<function>_<scenario>_<expected_outcome>()
   (storage 91.2 → 90.1 on 2026-07-17: truthful re-baseline after the stage-2
   dead-WS sweep deleted ~12K LoC of heavily-tested dead tick-chain code —
   measured 90.26% on PR #1631; dated record in the TOML + the lockdown test.)
-- Enforced post-merge by `scripts/coverage-gate.sh` (CI job `coverage-and-perf`);
+- ~~Enforced post-merge by `scripts/coverage-gate.sh` (CI job `coverage-and-perf`);~~
+  **⚠ CORRECTED 2026-10-11:** enforced on every PR by `scripts/coverage-gate.sh`
+  (CI job `coverage-and-perf`, which is in the `all-green` needs list, so a floor
+  breach blocks merge), and again on the merge commit;
   `make coverage` runs the SAME per-crate gate locally.
 
 ## Required Test Types (22 Categories — Mechanical Enforcement, SCOPED)

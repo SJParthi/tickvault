@@ -45,7 +45,7 @@ hallucination and is REJECTED in review.
 
 | Operator "absolute" | Honest, enforced envelope | Evidence required |
 |---|---|---|
-| Zero tick loss | Bounded zero loss inside the chaos envelope: ring → spill NDJSON → DLQ; beyond it, DLQ catches every payload as recoverable text | `seal_ring.rs` (SEAL_BUFFER_CAPACITY ratchet) + seal-chain chaos tests *(zero_tick_loss_alert_guard.rs retired 2026-07-18 with the dead tick chain)* |
+| Zero tick loss | Bounded zero loss inside the chaos envelope: ~~ring → spill NDJSON → DLQ; beyond it, DLQ catches every payload as recoverable text~~ **⚠ CORRECTED 2026-10-11:** ticks: WAL → ring → QuestDB, with the rescue spill and the inline fallback; the tick tier has no DLQ (only candles do: seal ring → spill → DLQ). Every tick loss we can see is counted and paged; a power cut (up to ~1 s plus the syncer time) and records still queued for the WAL at a kill are not counted | `seal_ring.rs` (SEAL_BUFFER_CAPACITY ratchet) + seal-chain chaos tests *(zero_tick_loss_alert_guard.rs retired 2026-07-18 with the dead tick chain)* |
 | WS never disconnects | DETECT ≤5s, reconnect with `SubscribeRxGuard`, sleep-until-open post-close; SEBI 24h JWT forces ≥1 reconnect/day by law | pool watchdog + `ws_sleep_resilience` tests (calendar arithmetic only; no socket is held across a sleep) |
 | Never slow / hanged | Hot path: DHAT ≤ budget alloc, Criterion p99 ≤ budget; tick-gap >30s → Telegram | DHAT tests + Criterion + bench-gate |
 | QuestDB never fails | ABSORB via 3-tier rescue→spill→DLQ + schema self-heal; alert if disconnected >30s | chaos_questdb tests |
@@ -65,7 +65,7 @@ allowed where genuinely inapplicable.
 
 | Dimension | Proof artefact (real, no hallucination) |
 |---|---|
-| Code coverage | `quality/crate-coverage-thresholds.toml` (ratcheted per-crate floors (72.6–99.4, target 100%), floors only move up), `scripts/coverage-gate.sh` post-merge |
+| Code coverage | `quality/crate-coverage-thresholds.toml` (ratcheted per-crate floors (72.6–99.4, target 100%), floors only move up), `scripts/coverage-gate.sh` ~~post-merge~~ **⚠ CORRECTED 2026-10-11:** on every PR inside All Green, and again after merge |
 | Audit coverage | `<event>_audit` QuestDB table with DEDUP UPSERT KEYS |
 | Testing coverage | the 22 test categories in `testing.md`, scoped to changed crate(s) |
 | Security coverage | banned-pattern + secret-scan + `Secret<T>` + security-reviewer agent |

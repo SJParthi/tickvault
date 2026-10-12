@@ -1132,6 +1132,20 @@ fn plan_pool(
 /// onto the `i64` `capture_seq` column. Fail-closed, never a silent stamp.
 pub const INGEST_SEQ_REFUSED_COUNTER: &str = "tv_dhan_feed_ingest_seq_refused_total";
 
+/// Counter: live ticks whose header segment byte names no `ExchangeSegment`
+/// (6, 9..=255). ADDED 2026-10-11 (audit INP-1). The row is KEPT under the
+/// zero-loss rule (2026-09-29 section of the WebSocket scope lock: no new drop
+/// for received market data) and written as segment `UNKNOWN`; this counter
+/// makes the event visible. Local Prometheus only: deliberately NOT in the
+/// CloudWatch EMF selector and NOT a label on the EMF-selected
+/// `tv_dhan_feed_ingest_refused_total`, so it adds no alarm and no page.
+///
+/// **⚠ CORRECTED 2026-10-11 (review of INP-1):** "live ticks" above is too
+/// narrow. The count runs in `ingest_tick_at`, which the WAL replay and the
+/// shed-frame refold also reach, so it counts live AND replayed ticks. The
+/// log line carries `origin` (`live` or `replay`); the counter has no label.
+const TICK_UNKNOWN_SEGMENT_COUNTER: &str = "tv_dhan_feed_tick_unknown_segment_total";
+
 /// Counter: live ticks folded end-to-end (gap detector → aggregator → writer).
 pub const INGEST_TICKS_COUNTER: &str = "tv_dhan_feed_ingest_ticks_total";
 
@@ -1538,6 +1552,10 @@ pub struct LiveIngest {
     aggregator: MultiTfAggregator,
     writer: TickWriter,
     seq_refused: u64,
+    /// Live ticks whose segment byte names no `ExchangeSegment`, cumulative.
+    /// Kept (written as `UNKNOWN`), counted, and logged on a power-of-two
+    /// throttle. ADDED 2026-10-11 (audit INP-1).
+    unknown_segment_ticks: u64,
     /// Ticks the AGGREGATOR refused, cumulative, by reason.
     ///
     /// These exist because the refusal arm below cannot log. It sits on the
@@ -2894,6 +2912,7 @@ impl LiveIngest {
             },
             writer,
             seq_refused: 0,
+            unknown_segment_ticks: 0,
             refused_price: 0,
             refused_timestamp: 0,
             refused_slot: 0,
@@ -3921,6 +3940,39 @@ impl LiveIngest {
             return IngestOutcome::SeqUnrepresentable;
         };
 
+        // AUDIT INP-1 (2026-10-11): an unknown segment byte (6, 9..=255) used
+        // to be folded and written as `UNKNOWN` with no count and no log; the
+        // decoder reads the byte without checking it. The tick is KEPT, not
+        // refused: the 2026-09-29 zero-loss section of the WebSocket scope
+        // lock forbids a new drop for received market data, and the `ticks`
+        // DEDUP key carries `capture_seq`, so two unknown codes never collapse
+        // there; the raw code stays in the WAL frame under this capture_seq.
+        // O(1): one byte match, no allocation unless the throttled log fires.
+        // Residual, recorded not fixed: `candles_*` still label the bar
+        // `UNKNOWN`, so two unknown codes with one security_id and bucket
+        // would share a candle DEDUP key.
+        if ExchangeSegment::from_byte(tick.exchange_segment_code).is_none() {
+            self.unknown_segment_ticks = self.unknown_segment_ticks.saturating_add(1);
+            counters().tick_unknown_segment.increment(1);
+            if self.unknown_segment_ticks.is_power_of_two() {
+                error!(
+                    code = ErrorCode::StorageGapTickDedupSegment.code_str(),
+                    source = "tick_unknown_segment",
+                    // A boot WAL replay or shed-frame refold also lands here
+                    // (review of INP-1): say which, so a restart is not read
+                    // as a fresh live-feed fault. One bool load, unknown arm only.
+                    origin = if self.replaying_wal { "replay" } else { "live" },
+                    security_id = tick.security_id,
+                    segment_code = tick.exchange_segment_code,
+                    frame_seq,
+                    count = self.unknown_segment_ticks,
+                    "tick carries a segment code the decoder does not know; the row \
+                     is KEPT (zero-loss rule) under segment UNKNOWN and the raw code stays \
+                     in the WAL frame by capture_seq"
+                );
+            }
+        }
+
         // The gap detector observes BEFORE the fold, and deliberately so.
         //
         // (Until 2026-08-25 this comment said "see the type docs on order".
@@ -4529,8 +4581,12 @@ impl LiveIngest {
         let Some(segment) =
             tickvault_common::types::ExchangeSegment::from_byte(tick.exchange_segment_code)
         else {
-            // An unknown segment byte is already counted and logged by the
-            // decoder; re-reporting it here would double-count one packet.
+            // An unknown segment byte is not ranked. (Until 2026-10-11 this
+            // comment said the decoder counts and logs it.)
+            // ⚠ CORRECTED 2026-10-11 (audit INP-1): the decoder does NOT count
+            // it. `ingest_tick_at` counts it on
+            // `tv_dhan_feed_tick_unknown_segment_total` and logs it, so this
+            // arm stays silent to avoid counting one packet twice.
             return;
         };
         let Some(owner) = crate::contract_underlying_map::global_contract_underlying_map()
@@ -5607,6 +5663,8 @@ pub struct DrainCounters {
     write_failed: metrics::Counter,
     ingest_ticks: metrics::Counter,
     ingest_seq_refused: metrics::Counter,
+    /// See `TICK_UNKNOWN_SEGMENT_COUNTER` (audit INP-1, 2026-10-11).
+    tick_unknown_segment: metrics::Counter,
     refused_price: metrics::Counter,
     refused_timestamp: metrics::Counter,
     refused_slot: metrics::Counter,
@@ -5714,6 +5772,7 @@ pub fn counters() -> &'static DrainCounters {
         write_failed: metrics::counter!(DRAIN_FRAMES_COUNTER, "outcome" => "write_failed"),
         ingest_ticks: metrics::counter!(INGEST_TICKS_COUNTER),
         ingest_seq_refused: metrics::counter!(INGEST_SEQ_REFUSED_COUNTER),
+        tick_unknown_segment: metrics::counter!(TICK_UNKNOWN_SEGMENT_COUNTER),
         refused_price: metrics::counter!(INGEST_REFUSED_COUNTER, "reason" => "price"),
         refused_timestamp: metrics::counter!(INGEST_REFUSED_COUNTER, "reason" => "timestamp"),
         refused_slot: metrics::counter!(INGEST_REFUSED_COUNTER, "reason" => "slot_exhausted"),
@@ -25079,6 +25138,87 @@ mod tests {
             ingest.pending_rows(),
             0,
             "a refused tick must not reach the writer buffer"
+        );
+    }
+
+    /// Builds a decoded ticker with the header segment byte under test control.
+    fn tick_with_segment_byte(segment: u8) -> ParsedTick {
+        let mut packet = ticker_packet(13, 100.0, 1_779_355_000);
+        packet[3] = segment;
+        let ParsedFrame::Tick(tick) =
+            dispatch_frame(&packet, 1_779_355_000_000_000_000).expect("parse")
+        else {
+            panic!("expected a tick for segment byte {segment}");
+        };
+        tick
+    }
+
+    #[test]
+    fn an_unknown_segment_tick_is_counted_and_its_row_is_still_written() {
+        // Audit INP-1 (2026-10-11): an unknown segment byte is KEPT (zero-loss
+        // rule) and COUNTED, never silently written as UNKNOWN.
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        let tick = tick_with_segment_byte(6);
+        ingest.ingest_tick(&tick, 7, 1_779_355_000_000);
+        assert_eq!(
+            ingest.unknown_segment_ticks, 1,
+            "the unknown segment is counted"
+        );
+        assert_eq!(
+            ingest.pending_rows(),
+            1,
+            "the row is still written (zero-loss rule): a counted UNKNOWN, never a drop"
+        );
+    }
+
+    #[test]
+    fn an_unknown_segment_on_every_byte_outside_the_enum_is_counted() {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        let mut expected = 0u64;
+        for (n, byte) in (0u8..=255).enumerate() {
+            let known = ExchangeSegment::from_byte(byte).is_some();
+            let before = ingest.unknown_segment_ticks;
+            let tick = tick_with_segment_byte(byte);
+            ingest.ingest_tick(&tick, 100 + n as u64, 1_779_355_000_000);
+            if known {
+                assert_eq!(
+                    ingest.unknown_segment_ticks, before,
+                    "known segment byte {byte} must not be counted"
+                );
+            } else {
+                expected += 1;
+                assert_eq!(
+                    ingest.unknown_segment_ticks, expected,
+                    "unknown segment byte {byte} must be counted"
+                );
+            }
+        }
+        // 6 and 9..=255 are the bytes outside the enum.
+        assert_eq!(expected, 1 + (9..=255u16).count() as u64);
+    }
+
+    #[test]
+    fn observe_for_ranking_no_longer_claims_the_decoder_counts_unknown_segments() {
+        let src = include_str!("dhan_feed_stack.rs");
+        // Review of INP-1 (2026-10-11): the old ban joined words that sat on
+        // two lines of the original comment, so it could never fail. This
+        // fragment sat on ONE line of the parent commit's comment.
+        let banned = ["is already counted", " and logged by the"].concat();
+        assert!(
+            !src.contains(&banned),
+            "the false claim that the decoder counts unknown segments must stay gone"
+        );
+        let start = src.find("pub fn ingest_tick_at(").expect("fn present");
+        // Bounded to the method (it ends at a 4-space-indented brace), with
+        // no byte-offset slice that a multi-byte character could split.
+        let fn_end = ["\n    ", "\x7d\n"].concat();
+        let body = src
+            .get(start..)
+            .and_then(|rest| rest.split(fn_end.as_str()).next())
+            .expect("fn body");
+        assert!(
+            body.contains("counters().tick_unknown_segment.increment(1)"),
+            "ingest_tick_at must count an unknown segment byte"
         );
     }
 

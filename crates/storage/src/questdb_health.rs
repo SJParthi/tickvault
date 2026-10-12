@@ -25,7 +25,10 @@
 //!
 //! - 0-30s disconnected → `Degrading` (gauge only, no alert)
 //! - 30s disconnected → `Degraded` CRITICAL alert (once per outage)
-//! - 300s disconnected → `Halt` recommended (operator decision)
+//! - 300s disconnected → `Halt` recommended (operator decision), once per outage
+//!   (**⚠ CORRECTED 2026-10-11, audit QDB-10:** it was returned on every
+//!   2 s poll past 300 s, and the `Degraded` / `Halt` messages said "No data
+//!   is lost", which the finite retry buffers and spill do not guarantee)
 //!
 //! These mirror the WebSocket pool watchdog thresholds for consistency.
 
@@ -69,6 +72,14 @@ pub enum QuestDbHealthVerdict {
 pub struct QuestDbHealthPoller {
     state: QuestDbHealthState,
     degraded_alert_fired: bool,
+    /// Has the current down-cycle already fired its `Halt` verdict?
+    ///
+    /// **⚠ CORRECTED 2026-10-11 (audit QDB-10):** before this latch `Halt`
+    /// was returned on EVERY tick past `QUESTDB_HALT_SECS`, and the caller
+    /// polls every 2 seconds, so a long outage wrote one coded `error!` every
+    /// 2 seconds. `Halt` now fires once per outage, like `Degraded`; later
+    /// ticks return `Degrading` (the gauges keep updating).
+    halt_alert_fired: bool,
     reconnects_total: u64,
     disconnect_events_total: u64,
 }
@@ -80,6 +91,7 @@ impl QuestDbHealthPoller {
         Self {
             state: QuestDbHealthState::Healthy,
             degraded_alert_fired: false,
+            halt_alert_fired: false,
             reconnects_total: 0,
             disconnect_events_total: 0,
         }
@@ -105,6 +117,15 @@ impl QuestDbHealthPoller {
         self.degraded_alert_fired
     }
 
+    /// Has the current down-cycle already fired its halt alert?
+    ///
+    /// Test-only (2026-10-11, review of the halt latch): nothing in
+    /// production reads it; the latch is observed through the verdicts.
+    #[cfg(test)]
+    pub(crate) const fn halt_alert_fired(&self) -> bool {
+        self.halt_alert_fired
+    }
+
     /// Feeds a connection snapshot (`true` = connected, `false` = not) plus
     /// the current time into the poller and returns a verdict.
     ///
@@ -119,6 +140,7 @@ impl QuestDbHealthPoller {
             (QuestDbHealthState::Healthy, false) => {
                 self.state = QuestDbHealthState::Disconnected { since: now };
                 self.degraded_alert_fired = false;
+                self.halt_alert_fired = false;
                 self.disconnect_events_total = self.disconnect_events_total.saturating_add(1);
                 QuestDbHealthVerdict::Degrading {
                     down_for: Duration::ZERO,
@@ -129,6 +151,7 @@ impl QuestDbHealthPoller {
                 let was_down_for = now.saturating_duration_since(since);
                 self.state = QuestDbHealthState::Healthy;
                 self.degraded_alert_fired = false;
+                self.halt_alert_fired = false;
                 self.reconnects_total = self.reconnects_total.saturating_add(1);
                 QuestDbHealthVerdict::Recovered { was_down_for }
             }
@@ -136,7 +159,13 @@ impl QuestDbHealthPoller {
             (QuestDbHealthState::Disconnected { since }, false) => {
                 let down_for = now.saturating_duration_since(since);
                 if down_for >= Duration::from_secs(QUESTDB_HALT_SECS) {
-                    QuestDbHealthVerdict::Halt { down_for }
+                    // QDB-10: once per outage, not once per 2 s poll.
+                    if !self.halt_alert_fired {
+                        self.halt_alert_fired = true;
+                        QuestDbHealthVerdict::Halt { down_for }
+                    } else {
+                        QuestDbHealthVerdict::Degrading { down_for }
+                    }
                 } else if down_for >= Duration::from_secs(QUESTDB_DEGRADED_ALERT_SECS) {
                     if !self.degraded_alert_fired {
                         self.degraded_alert_fired = true;
@@ -190,8 +219,8 @@ pub fn emit_metrics_for_verdict(verdict: QuestDbHealthVerdict, poller: &QuestDbH
                 source = "questdb_down_30s",
                 down_for_secs = down_for.as_secs(),
                 disconnect_events_total = poller.disconnect_events_total(),
-                "S3-1 CRITICAL: QuestDB has been disconnected for >30s — tick ring buffer \
-                 + spill path are absorbing all writes. No data is lost, but operator \
+                "S3-1 CRITICAL: QuestDB has been disconnected for >30s. Rows are held in \
+                 the writers' retry buffers and disk spill, which are finite. Operator \
                  attention is required. Check Docker logs for tv-questdb."
             );
         }
@@ -202,8 +231,9 @@ pub fn emit_metrics_for_verdict(verdict: QuestDbHealthVerdict, poller: &QuestDbH
                 code = tickvault_common::error_code::ErrorCode::Boot01QuestDbSlow.code_str(),
                 source = "questdb_down_300s",
                 down_for_secs = down_for.as_secs(),
-                "S3-1 FATAL: QuestDB has been disconnected for >300s. Ring buffer and \
-                 spill file are approaching capacity. Restart QuestDB or the app now."
+                "S3-1 FATAL: QuestDB has been disconnected for >300s. The writers' retry \
+                 buffers and disk spill are finite and filling. Restart QuestDB now. \
+                 Logged once per outage."
             );
         }
     }
@@ -374,5 +404,61 @@ mod tests {
 
         p.tick(true, start + Duration::from_secs(40));
         assert!(!p.degraded_alert_fired());
+    }
+
+    // QDB-10 (2026-10-11): `Halt` fires once per outage, not every 2 s poll.
+    #[test]
+    fn test_poller_halt_fires_once_per_outage() {
+        let mut p = QuestDbHealthPoller::new();
+        let start = Instant::now();
+        p.tick(false, start);
+        p.tick(false, start + Duration::from_secs(30));
+        let v = p.tick(false, start + Duration::from_secs(300));
+        assert!(matches!(v, QuestDbHealthVerdict::Halt { .. }));
+        assert!(p.halt_alert_fired());
+        // The production caller polls every 2 s: an hour of polls must not
+        // fire Halt again.
+        let mut halts = 0_u32;
+        for i in 1..=1_800_u64 {
+            let t = start + Duration::from_secs(300 + i * 2);
+            if matches!(p.tick(false, t), QuestDbHealthVerdict::Halt { .. }) {
+                halts += 1;
+            }
+        }
+        assert_eq!(halts, 0, "Halt must fire once per outage");
+    }
+
+    #[test]
+    fn test_poller_halt_rearms_after_recovery() {
+        let mut p = QuestDbHealthPoller::new();
+        let start = Instant::now();
+        p.tick(false, start);
+        assert!(matches!(
+            p.tick(false, start + Duration::from_secs(300)),
+            QuestDbHealthVerdict::Halt { .. }
+        ));
+        p.tick(true, start + Duration::from_secs(310));
+        assert!(!p.halt_alert_fired());
+        let t2 = start + Duration::from_secs(320);
+        p.tick(false, t2);
+        assert!(!p.halt_alert_fired());
+        assert!(matches!(
+            p.tick(false, t2 + Duration::from_secs(300)),
+            QuestDbHealthVerdict::Halt { .. }
+        ));
+    }
+
+    #[test]
+    fn test_health_messages_do_not_claim_no_data_lost() {
+        let src = include_str!("questdb_health.rs");
+        let prod = src.split("\n#[cfg(test)]\n").next().unwrap_or_default();
+        let banned = concat!("No data ", "is lost");
+        assert!(
+            !prod.contains(banned),
+            "the QuestDB health messages must not promise that no data is lost"
+        );
+        let retired = concat!("tick ring ", "buffer");
+        assert!(!prod.contains(retired));
+        assert!(prod.contains("Logged once per outage."));
     }
 }

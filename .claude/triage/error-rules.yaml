@@ -920,6 +920,12 @@ rules:
       `chronyc -a makestep` and restart. Never auto-action — clock
       drift is symptomatic of NTP / hardware / hypervisor issues
       that need human triage.
+      ⚠ CORRECTED 2026-10-11 (audit CLOCK-3): the trusted source is
+      chronyc ONLY since 2026-10-11; the QuestDB now() fallback named
+      above was removed because QuestDB shares this host's clock. A
+      BOOT-03 warn with reason="probe_unavailable" means skew is UNKNOWN
+      (no chrony, chronyd stopped, or chronyd not synchronised), not a
+      halt; the boot proceeds.
 
   - name: audit-02-depth-rebalance-write-failed-escalate
     match:
@@ -1254,7 +1260,11 @@ rules:
       tickvault instances running against the same Dhan client_id will
       fight over static-IP enforcement and fragment the WebSocket
       connection budget. Operator inspects live_instance_lock table
-      and stops one of the instances immediately.
+      and stops one of the instances immediately. EXCEPTION (2026-10-11):
+      lines with stage renew_failed, renew_failing, renew_lapsed,
+      ssm_transport or release_at_shutdown_incomplete, _skipped or _failed
+      reuse this code for SSM reachability or a shutdown release, not a peer; check the box's network path to SSM
+      instead of stopping an instance (dual-instance-lock runbook 3.6).
 
   - name: resilience-03-mint-refused-lock-not-held-escalate
     match:

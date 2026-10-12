@@ -34,7 +34,7 @@
 //! find the drop-outs. Cold path: once per trading day, on the daily rider,
 //! never on the tick path.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use tickvault_core::instrument::master_csv::{InstrumentClass, MasterRow, OptionLeg};
 use tickvault_storage::instrument_lifecycle_persistence::{
@@ -556,6 +556,134 @@ pub fn build_lifecycle_audit_rows<'a>(
     out
 }
 
+/// A write pass stops sending after this many chunks in a row failed, and
+/// counts the rest as not written.
+///
+/// One refused chunk (a bad row) is followed by chunks that land, so the
+/// count resets and every chunk is still tried. A database that is down
+/// fails every chunk, and with the client's retry budget each attempt costs
+/// seconds; two in a row is the signal to stop rather than spend that on all
+/// ~15 lifecycle chunks.
+const LIFECYCLE_STOP_AFTER_CONSECUTIVE_FAILED_CHUNKS: usize = 2;
+
+/// What [`write_audit_then_lifecycle`] wrote and what it did not.
+#[derive(Debug, Default)]
+struct LifecycleWriteReport {
+    /// Audit rows the database acknowledged.
+    audit_written: usize,
+    /// Audit rows refused, or not sent after consecutive failures.
+    audit_failed: usize,
+    /// Lifecycle rows the database acknowledged.
+    lifecycle_written: usize,
+    /// Lifecycle rows not sent because their audit row did not land.
+    lifecycle_held_back: usize,
+    /// Lifecycle rows refused, or not sent after consecutive failures.
+    lifecycle_failed: usize,
+    /// The first chunk error, kept for the caller's report.
+    first_error: Option<anyhow::Error>,
+}
+
+/// Writes the audit rows, then the lifecycle rows, in chunks.
+///
+/// Audit first, and a lifecycle row whose audit row did not land is held
+/// back: the audit rows are derived from the difference between `rows` and
+/// what the table held before, so a lifecycle row that lands without its
+/// audit row erases the difference that would let a re-run record it.
+/// Every chunk is tried (a refused chunk does not stop the rest) until
+/// [`LIFECYCLE_STOP_AFTER_CONSECUTIVE_FAILED_CHUNKS`] fail in a row.
+///
+/// O(rows + audit rows) plus, only when an audit chunk failed, one hash set
+/// of the affected keys and one filtered copy of `rows`. Each chunk is handed
+/// to the writer as an owned copy (one `Vec` per chunk), which keeps the
+/// writer's future free of a borrowed argument so the rider task stays
+/// `Send`. Cold path, once a day.
+async fn write_audit_then_lifecycle<'a, A, FA, L, FL>(
+    rows: &[InstrumentLifecycleRow<'a>],
+    audit_rows: &[InstrumentLifecycleAuditRow<'a>],
+    chunk_rows: usize,
+    mut write_audit: A,
+    mut write_lifecycle: L,
+) -> LifecycleWriteReport
+where
+    A: FnMut(Vec<InstrumentLifecycleAuditRow<'a>>) -> FA,
+    FA: std::future::Future<Output = anyhow::Result<()>>,
+    L: FnMut(Vec<InstrumentLifecycleRow<'a>>) -> FL,
+    FL: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let chunk_rows = chunk_rows.max(1);
+    let mut report = LifecycleWriteReport::default();
+    // Composite key per I-P1-11; built only when an audit chunk fails.
+    let mut held: HashSet<(i64, &'a str)> = HashSet::new();
+
+    let mut consecutive = 0_usize;
+    for chunk in audit_rows.chunks(chunk_rows) {
+        if consecutive >= LIFECYCLE_STOP_AFTER_CONSECUTIVE_FAILED_CHUNKS {
+            report.audit_failed += chunk.len();
+            held.extend(chunk.iter().map(|a| (a.security_id, a.exchange_segment)));
+            continue;
+        }
+        match write_audit(chunk.to_vec()).await {
+            Ok(()) => {
+                report.audit_written += chunk.len();
+                consecutive = 0;
+            }
+            Err(err) => {
+                consecutive += 1;
+                report.audit_failed += chunk.len();
+                held.extend(chunk.iter().map(|a| (a.security_id, a.exchange_segment)));
+                metrics::counter!("tv_instrument_lifecycle_audit_failed_total").increment(1);
+                // Audit OBS-2 (2026-10-11): a failed SEBI audit write is a storage
+                // audit-write failure (STORAGE-GAP-03), not a socket state (WS-GAP-03).
+                tracing::error!(
+                    code = tickvault_common::error_code::ErrorCode::StorageGap03AuditWriteFailed
+                        .code_str(),
+                    source = "lifecycle_audit_persist_failed",
+                    ?err,
+                    rows = chunk.len(),
+                    "instrument lifecycle AUDIT rows could not be written — the 5-year \
+                     point-in-time chain is missing these transitions for now. Their \
+                     lifecycle rows are held back, so the table keeps yesterday's state \
+                     for them and the next run records the same transitions again."
+                );
+                report.first_error.get_or_insert(err);
+            }
+        }
+    }
+
+    let kept: Vec<InstrumentLifecycleRow<'a>>;
+    let to_write: &[InstrumentLifecycleRow<'a>] = if held.is_empty() {
+        rows
+    } else {
+        kept = rows
+            .iter()
+            .filter(|r| !held.contains(&(r.security_id, r.exchange_segment)))
+            .cloned()
+            .collect();
+        report.lifecycle_held_back = rows.len() - kept.len();
+        &kept
+    };
+
+    consecutive = 0;
+    for chunk in to_write.chunks(chunk_rows) {
+        if consecutive >= LIFECYCLE_STOP_AFTER_CONSECUTIVE_FAILED_CHUNKS {
+            report.lifecycle_failed += chunk.len();
+            continue;
+        }
+        match write_lifecycle(chunk.to_vec()).await {
+            Ok(()) => {
+                report.lifecycle_written += chunk.len();
+                consecutive = 0;
+            }
+            Err(err) => {
+                consecutive += 1;
+                report.lifecycle_failed += chunk.len();
+                report.first_error.get_or_insert(err);
+            }
+        }
+    }
+    report
+}
+
 /// Writes the day's Dhan lifecycle rows.
 ///
 /// Never deletes and never truncates: every row is an upsert on the pinned
@@ -566,10 +694,22 @@ pub fn build_lifecycle_audit_rows<'a>(
 ///
 /// # Errors
 ///
-/// Propagates the first chunk failure. A partial write is safe by
-/// construction — every row is independently idempotent, so the next day's
-/// run re-sends whatever did not land.
-// TEST-EXEMPT: async I/O composition (one /exec read + chunked ILP writes); the pure parts — build_lifecycle_rows, parse_known_instruments, lifecycle_state_for, absence_state_for, lifecycle_segment_for, expiry_ymd_to_ist_nanos — are each tested below.
+/// `Err` when any audit or lifecycle row did not land; the message carries
+/// the counts and the first chunk's error.
+///
+/// **⚠ CORRECTED 2026-10-11 (review of audit QDB-2).** This said "Propagates
+/// the first chunk failure ... the next day's run re-sends whatever did not
+/// land". Both halves were wrong once HTTP ILP made a refused chunk visible.
+/// The `?` stopped at the first refused lifecycle chunk, so the later chunks
+/// AND the whole audit pass were skipped. And the audit rows are derived by
+/// comparing today's rows with what the table held before the write, so a
+/// transition whose lifecycle row landed and whose audit row did not was
+/// never re-derived: a re-run read the new state as "known" and found
+/// nothing to record. The write is now audit-first (see
+/// [`write_audit_then_lifecycle`]): a lifecycle row whose audit row did not
+/// land is held back, so the next run still sees yesterday's state and
+/// records the same transition again.
+// TEST-EXEMPT: async I/O composition (one /exec read + chunked ILP writes); the write ordering is tested through write_audit_then_lifecycle, and the pure parts — build_lifecycle_rows, parse_known_instruments, lifecycle_state_for, absence_state_for, lifecycle_segment_for, expiry_ymd_to_ist_nanos — are each tested below.
 pub async fn write_dhan_lifecycle(
     questdb: &tickvault_common::config::QuestDbConfig,
     master: &[MasterRow],
@@ -577,20 +717,25 @@ pub async fn write_dhan_lifecycle(
     today_ist_nanos: i64,
     source_sha256: &str,
 ) -> anyhow::Result<LifecycleTally> {
+    // The audit failure counter is seeded at boot (main.rs), after the
+    // metrics recorder is installed, so a scrape sees 0 before any failure.
     let known = fetch_known_instruments(questdb).await;
     let (rows, tally) =
         build_lifecycle_rows(master, &known, today_ymd, today_ist_nanos, source_sha256);
 
-    for chunk in rows.chunks(LIFECYCLE_WRITE_CHUNK) {
-        append_instrument_lifecycle_rows(questdb, chunk).await?;
-    }
-
-    // --- The SEBI 5-year audit chain ---
+    // --- The SEBI 5-year audit chain, written FIRST ---
     //
-    // Written AFTER the data rows and never allowed to fail the write: the
-    // lifecycle table is what the system reads, the audit table is what a
-    // regulator reads, and losing today's history is strictly better than
-    // losing today's state. Both are still reported.
+    // **⚠ CHANGED 2026-10-11 (review of audit QDB-2).** Until this date the
+    // audit rows were written AFTER the lifecycle rows "and never allowed to
+    // fail the write". That ordering lost history for good: the audit rows
+    // are derived from the difference between today's rows and what the
+    // table held before, so once a lifecycle row landed, a failed audit row
+    // for it could never be derived again. Audit-first keeps the difference
+    // alive: a lifecycle row whose audit row did not land is held back, the
+    // table keeps yesterday's state for it, and the next run records the
+    // transition. Rows with no transition today are never held back, so
+    // one refused audit row costs one instrument's state update, not the
+    // day's.
     //
     // The DDL is ensured here rather than at boot because this is the only
     // writer: ILP would otherwise auto-create the table without its DEDUP
@@ -598,32 +743,34 @@ pub async fn write_dhan_lifecycle(
     // the same day instead of upserting onto the first.
     ensure_instrument_lifecycle_audit_table(questdb).await;
     let audit_rows = build_lifecycle_audit_rows(&rows, &known, today_ist_nanos, source_sha256);
-    let mut audit_written = 0_usize;
-    let mut audit_failed = 0_usize;
-    for chunk in audit_rows.chunks(LIFECYCLE_WRITE_CHUNK) {
-        match append_instrument_lifecycle_audit_rows(questdb, chunk).await {
-            Ok(()) => audit_written += chunk.len(),
-            Err(err) => {
-                audit_failed += chunk.len();
-                tracing::error!(
-                    code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
-                    source = "lifecycle_audit_persist_failed",
-                    ?err,
-                    rows = chunk.len(),
-                    "instrument lifecycle AUDIT rows could not be written — the 5-year \
-                     point-in-time chain is incomplete for today. The lifecycle table \
-                     itself is unaffected; what is missing is the record of what changed."
-                );
-            }
-        }
-    }
-    metrics::counter!("tv_instrument_lifecycle_audit_rows_total").increment(audit_written as u64);
+    let report = write_audit_then_lifecycle(
+        &rows,
+        &audit_rows,
+        LIFECYCLE_WRITE_CHUNK,
+        move |chunk| async move { append_instrument_lifecycle_audit_rows(questdb, &chunk).await },
+        move |chunk| async move { append_instrument_lifecycle_rows(questdb, &chunk).await },
+    )
+    .await;
+    metrics::counter!("tv_instrument_lifecycle_audit_rows_total")
+        .increment(report.audit_written as u64);
 
     tracing::info!(
-        audit_rows_written = audit_written,
-        audit_rows_failed = audit_failed,
-        "instrument lifecycle audit transitions recorded"
+        audit_rows_written = report.audit_written,
+        audit_rows_failed = report.audit_failed,
+        lifecycle_rows_written = report.lifecycle_written,
+        lifecycle_rows_held_back = report.lifecycle_held_back,
+        lifecycle_rows_failed = report.lifecycle_failed,
+        "instrument lifecycle audit transitions and state recorded"
     );
+
+    if let Some(err) = report.first_error {
+        return Err(err.context(format!(
+            "instrument lifecycle write incomplete: {} audit row(s) not written, {} \
+             lifecycle row(s) held back so the next run records their transitions again, \
+             {} lifecycle row(s) not written",
+            report.audit_failed, report.lifecycle_held_back, report.lifecycle_failed
+        )));
+    }
 
     tracing::info!(
         active = tally.active,
@@ -705,6 +852,197 @@ async fn fetch_known_instruments(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The text of `src` from the `source = "<source>"` field back to the
+    /// `error!` macro that holds it, plus everything up to the arm's end.
+    fn arm_around<'a>(src: &'a str, source_field: &str) -> &'a str {
+        let at = src
+            .find(source_field)
+            .unwrap_or_else(|| panic!("{source_field} must exist"));
+        let start = src[..at]
+            .rfind("Err(")
+            .expect("an Err arm holds the source");
+        let end = at + src[at..].find("\n        }\n").expect("the arm ends");
+        &src[start..end]
+    }
+
+    // Audit OBS-2 (2026-10-11): a failed SEBI lifecycle AUDIT write was coded
+    // WS-GAP-03 (a socket state), so a STORAGE-GAP-03 triage never found it,
+    // and only the success counter existed.
+    #[test]
+    fn test_lifecycle_audit_failure_is_coded_storage_gap_03() {
+        let src = include_str!("dhan_lifecycle.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("non-test half");
+        let arm = arm_around(prod, "source = \"lifecycle_audit_persist_failed\"");
+        assert!(
+            arm.contains("ErrorCode::StorageGap03AuditWriteFailed"),
+            "{arm}"
+        );
+        assert!(!arm.contains("WsGapConnectionState"), "{arm}");
+        assert!(
+            arm.contains("counter!(\"tv_instrument_lifecycle_audit_failed_total\").increment(1)"),
+            "{arm}"
+        );
+        // Seeded at boot after the recorder install, not milliseconds before
+        // the write that may fail (review of OBS-2, 2026-10-11).
+        assert!(
+            include_str!("main.rs")
+                .contains("counter!(\"tv_instrument_lifecycle_audit_failed_total\").increment(0)"),
+            "the failure counter is seeded at 0 at boot"
+        );
+        assert!(
+            !prod.contains("counter!(\"tv_instrument_lifecycle_audit_failed_total\").increment(0)"),
+            "no seed right before the write: a scrape could never record that 0"
+        );
+    }
+
+    // ---- Review of audit QDB-2 (2026-10-11): audit-first, every chunk tried ----
+
+    /// Three never-seen instruments: three lifecycle rows and three
+    /// `appeared` audit rows.
+    fn three_master_rows() -> Vec<MasterRow> {
+        vec![
+            row(1, InstrumentClass::Equity, "NSE", 0, OptionLeg::None),
+            row(2, InstrumentClass::Equity, "NSE", 0, OptionLeg::None),
+            row(3, InstrumentClass::Equity, "NSE", 0, OptionLeg::None),
+        ]
+    }
+
+    #[tokio::test]
+    async fn test_write_audit_then_lifecycle_writes_audit_before_any_lifecycle_row() {
+        let master = three_master_rows();
+        let (rows, _) = build_lifecycle_rows(&master, &[], TODAY, TODAY_NANOS, "sha");
+        let audit = build_lifecycle_audit_rows(&rows, &[], TODAY_NANOS, "sha");
+        assert_eq!(audit.len(), 3);
+        let order = std::cell::RefCell::new(Vec::new());
+        let report = write_audit_then_lifecycle(
+            &rows,
+            &audit,
+            1,
+            |_c: Vec<_>| {
+                order.borrow_mut().push("audit");
+                std::future::ready(Ok(()))
+            },
+            |_c: Vec<_>| {
+                order.borrow_mut().push("lifecycle");
+                std::future::ready(Ok(()))
+            },
+        )
+        .await;
+        assert_eq!(
+            order.into_inner(),
+            vec![
+                "audit",
+                "audit",
+                "audit",
+                "lifecycle",
+                "lifecycle",
+                "lifecycle"
+            ]
+        );
+        assert_eq!(report.audit_written, 3);
+        assert_eq!(report.lifecycle_written, 3);
+        assert_eq!(report.lifecycle_held_back, 0);
+        assert!(report.first_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_write_audit_then_lifecycle_sends_later_chunks_after_a_refused_one() {
+        let master = three_master_rows();
+        let (rows, _) = build_lifecycle_rows(&master, &[], TODAY, TODAY_NANOS, "sha");
+        let audit = build_lifecycle_audit_rows(&rows, &[], TODAY_NANOS, "sha");
+        let sent = std::cell::RefCell::new(Vec::new());
+        let report = write_audit_then_lifecycle(
+            &rows,
+            &audit,
+            1,
+            |_c: Vec<_>| std::future::ready(Ok(())),
+            |c: Vec<InstrumentLifecycleRow<'_>>| {
+                let id = c[0].security_id;
+                sent.borrow_mut().push(id);
+                std::future::ready(if id == 1 {
+                    Err(anyhow::anyhow!("refused"))
+                } else {
+                    Ok(())
+                })
+            },
+        )
+        .await;
+        assert_eq!(
+            sent.into_inner(),
+            vec![1, 2, 3],
+            "a refused chunk must not stop the chunks after it"
+        );
+        assert_eq!(report.lifecycle_failed, 1);
+        assert_eq!(report.lifecycle_written, 2);
+        assert_eq!(report.audit_written, 3);
+        assert!(report.first_error.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_write_audit_then_lifecycle_holds_back_a_row_whose_audit_failed() {
+        let master = three_master_rows();
+        let (rows, _) = build_lifecycle_rows(&master, &[], TODAY, TODAY_NANOS, "sha");
+        let audit = build_lifecycle_audit_rows(&rows, &[], TODAY_NANOS, "sha");
+        let written = std::cell::RefCell::new(Vec::new());
+        let report = write_audit_then_lifecycle(
+            &rows,
+            &audit,
+            1,
+            |c: Vec<InstrumentLifecycleAuditRow<'_>>| {
+                std::future::ready(if c[0].security_id == 2 {
+                    Err(anyhow::anyhow!("audit refused"))
+                } else {
+                    Ok(())
+                })
+            },
+            |c: Vec<InstrumentLifecycleRow<'_>>| {
+                written.borrow_mut().extend(c.iter().map(|r| r.security_id));
+                std::future::ready(Ok(()))
+            },
+        )
+        .await;
+        assert_eq!(
+            written.into_inner(),
+            vec![1, 3],
+            "the row whose transition was not recorded keeps yesterday's state"
+        );
+        assert_eq!(report.audit_failed, 1);
+        assert_eq!(report.lifecycle_held_back, 1);
+        assert_eq!(report.lifecycle_written, 2);
+        assert!(report.first_error.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_write_audit_then_lifecycle_stops_after_consecutive_failures() {
+        let master: Vec<MasterRow> = (1..=5)
+            .map(|id| row(id, InstrumentClass::Equity, "NSE", 0, OptionLeg::None))
+            .collect();
+        let (rows, _) = build_lifecycle_rows(&master, &[], TODAY, TODAY_NANOS, "sha");
+        let audit = build_lifecycle_audit_rows(&rows, &[], TODAY_NANOS, "sha");
+        let calls = std::cell::Cell::new(0_usize);
+        let report = write_audit_then_lifecycle(
+            &rows,
+            &audit,
+            1,
+            |_c: Vec<_>| std::future::ready(Ok(())),
+            |_c: Vec<_>| {
+                calls.set(calls.get() + 1);
+                std::future::ready(Err(anyhow::anyhow!("database down")))
+            },
+        )
+        .await;
+        assert_eq!(
+            calls.get(),
+            LIFECYCLE_STOP_AFTER_CONSECUTIVE_FAILED_CHUNKS,
+            "a database that fails every chunk is not asked again and again"
+        );
+        assert_eq!(report.lifecycle_failed, 5, "unsent rows are counted");
+        assert_eq!(report.lifecycle_written, 0);
+    }
 
     const TODAY: u32 = 2026_08_19;
     const TODAY_NANOS: i64 = 1_755_561_600_000_000_000;

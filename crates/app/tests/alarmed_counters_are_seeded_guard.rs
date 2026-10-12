@@ -235,8 +235,8 @@ const DERIVED_LOSS_GROUP_METRICS: &[&str] = &[
 ];
 
 /// The number of source counters the loss groups read. Moves only with a dated
-/// row in noise lock §2.10.
-const LOSS_GROUP_FILTER_COUNT: usize = 55;
+/// row in noise lock §2.10 (§2.10-a, 2026-10-11: 55 to 69).
+const LOSS_GROUP_FILTER_COUNT: usize = 69;
 
 /// Derived metrics that are a LABEL SLICE of one source counter, written by a
 /// log metric filter over the metrics log (noise lock §2.9-i, 2026-10-10):
@@ -773,8 +773,8 @@ fn loss_group_filter_counters() -> Vec<String> {
     out
 }
 
-/// The loss-group pages (2026-10-05, noise lock §2.10) read 55 source counters
-/// through log metric filters. Each source is exposed to the same dropped
+/// The loss-group pages (2026-10-05, noise lock §2.10) read 69 source counters
+/// (55 until the 2026-10-11 §2.10-a row) through log metric filters. Each source is exposed to the same dropped
 /// first sample as any alarmed counter, so each must be registered at 0 at
 /// boot, either in `main.rs` or beside its owner, or named in
 /// `SEEDED_VIA_HANDLE` with its seeding site.

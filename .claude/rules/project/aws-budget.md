@@ -1664,3 +1664,42 @@ net after stage 3 is zero.
 
 **§2.3n's lever rule is NOT met.** No lever is taken; the change is net zero
 once complete.
+
+## COST NOTE 2026-10-11 — S3 log export and 14 more loss-page counters (Assumed, at most about $5/mo)
+
+**Authorization:** the owner tapped "Logs and alarms" on the card "Prepare
+which AWS cost changes from the audit as code?", option "I write the S3 log
+export and fold the uncovered counters into the existing loss pages; no
+standby." (2026-10-11 10:26 UTC). Recorded in
+`dhan-rest-only-noise-lock-2026-07-14.md` §2.10-a before the terraform, per
+the rule-file-first law. The export is a data copy, not a page.
+
+| Item | Cost |
+|---|---:|
+| 14 more log metric filters on `/tickvault/<env>/metrics` (61 to 75 of 100) | $0.00 |
+| Derived metrics, alarms and EMF names added | 0 |
+| 2 Firehose streams, app and Lambda logs to `s3://tv-<env>-cold/logs/` | at most about $4.70 (Assumed) |
+| S3 Standard storage for the copied logs, growing each month | about $0.40 more each month (Assumed) |
+| 1 log group for Firehose delivery errors (14-day retention) | about $0 (written only on a failure) |
+| **Total** | **at most about $5/mo in the first month (Assumed)** |
+
+**How the Firehose figure is bounded (Assumed, not measured).** Firehose bills
+per GB it receives, each record rounded up to 5 KB, at about $0.029/GB
+(us-east-1 list price; the Mumbai price was not read). The account-wide
+`logs-ingestion-runaway` alarm pages above 5 GiB a day, so the copied volume
+stays under about 161 GB a month unless that alarm is already firing. 161 GB
+at $0.029 is about $4.70. The real volume is far lower, because the metrics
+scrape group (the biggest) is not exported and the records arrive gzipped.
+No normal-day volume was read.
+
+**How the S3 figure is bounded (Assumed).** The copies stay gzipped, assumed
+about a tenth of the ingested bytes, so at most about 16 GB a month at about
+$0.025/GB-month. Nothing is deleted (Quote 27), so this line grows by about
+that much each month until a lifecycle transition is approved.
+
+**Budget position: NOT read live.** The session that wrote this had no AWS
+read. The standing ceiling is $150 (Quote 23); the upper bound above is about
+3% of it.
+
+**§2.3n's lever rule is NOT met.** No lever is taken. The owner chose the
+change knowing it adds an S3 copy.

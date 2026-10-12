@@ -805,6 +805,7 @@ jobs:
           crates/app/tests/dhat_live_ingest_seam.rs
           crates/app/tests/dhat_mark_forward.rs
           crates/app/tests/dhat_top_volume_sweep.rs
+          crates/app/tests/dhat_wal_ring_sink_accept.rs
           crates/app/tests/dhat_ws_lag.rs
           crates/app/tests/dhat_ws_lag_recorder.rs
           crates/core/tests/dhat_allocation.rs
@@ -1024,6 +1025,7 @@ jobs:
             --test dhat_live_ingest_seam \
             --test dhat_mark_forward \
             --test dhat_top_volume_sweep \
+            --test dhat_wal_ring_sink_accept \
             --test dhat_ws_lag \
             --test dhat_ws_lag_recorder \
             2>&1 | tee /tmp/dhat-app.log
@@ -1041,15 +1043,19 @@ jobs:
           # the run step, so the count is the only thing that notices. Bumping
           # it is the fix; loosening it to >= would delete the guard.
           #
+          # 7 since the PROOF-10 / HOT-1 merge (2026-10-12): both sides added a
+          # target, the same both-sides case the 2026-08-15 note above records.
           # 6 since audit PROOF-10 (2026-10-11): dhat_depth_drain gates the
           # app-side depth frame drain (drain_depth_frame).
+          # 6 since audit HOT-1 (2026-10-11): dhat_wal_ring_sink_accept runs the
+          # real WAL ring sink on the socket read path.
           # 5 since audit M6 (2026-10-05): dhat_ws_lag_recorder runs the lag tap
           # with the production recorder installed.
           # 4 since audit PR4 (2026-09-26): dhat_top_volume_sweep gates the
           # sliced top-volume sweep that moved off the drain's timer arms.
           ran=$(grep -c 'Running.*tests/dhat_' /tmp/dhat-app.log || true)
-          if [ "$ran" -ne 6 ]; then
-            echo "::error::app DHAT step executed $ran targets, expected 6 — a --test flag was dropped from this step."
+          if [ "$ran" -ne 7 ]; then
+            echo "::error::app DHAT step executed $ran targets, expected 7 — a --test flag was dropped from this step."
             exit 1
           fi
 

@@ -47,6 +47,7 @@
 //! cargo run -p tickvault-app --bin tv-guarantees     # or: make guarantees
 //! ```
 
+#![cfg_attr(not(test), deny(unsafe_code))]
 #![allow(clippy::unwrap_used)] // APPROVED: diagnostic CLI, same posture as tv_doctor
 #![allow(clippy::expect_used)] // APPROVED: diagnostic CLI, same posture as tv_doctor
 

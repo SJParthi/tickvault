@@ -36,6 +36,7 @@
 //! Typically 200-500ms. The deploy workflow allows up to 30 seconds
 //! (--duration flag) before considering the test hung.
 
+#![cfg_attr(not(test), deny(unsafe_code))]
 #![allow(clippy::unwrap_used)] // APPROVED: test-only binary
 #![allow(clippy::expect_used)] // APPROVED: test-only binary
 

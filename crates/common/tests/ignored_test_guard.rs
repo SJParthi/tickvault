@@ -49,6 +49,21 @@ fn repo_root() -> PathBuf {
 /// This list may SHRINK freely. Growing it is a deliberate edit, in the same
 /// change, with the reason visible to a reviewer.
 const ALLOWED_IGNORED: &[(&str, &str)] = &[
+    // Added 2026-10-11 with the real-SIGKILL chaos test (audit TEST-1): these
+    // two are the CHILD halves of `chaos_wal_real_sigkill.rs`. Each parent
+    // test re-runs its own test binary with `--ignored --exact <child>`,
+    // SIGKILLs it mid-write, and then checks what survived on disk. The
+    // parents are ordinary tests and run in every suite, so the children
+    // always run through them; run on their own they would just write until
+    // killed, which proves nothing.
+    (
+        "crates/storage/tests/chaos_wal_real_sigkill.rs",
+        "chaos_kill_child_ws_frame_wal_writer",
+    ),
+    (
+        "crates/storage/tests/chaos_wal_real_sigkill.rs",
+        "chaos_kill_child_seal_spill_writer",
+    ),
     // Added 2026-10-10 with the contract name repair (plan item 56): an
     // end-to-end run against a real QuestDB (it creates and drops its own
     // probe table), which CI does not have. It gates nothing; the SQL the

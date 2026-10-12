@@ -1833,25 +1833,6 @@ pub struct QuestDbConfig {
     pub ilp_port: u16,
 }
 
-impl QuestDbConfig {
-    /// Builds the ILP connection string with retry and timeout settings.
-    ///
-    /// All 15+ ILP writers in the storage crate SHOULD use this method
-    /// instead of raw `format!("tcp::addr=...")` to get consistent:
-    /// - Retry timeout: 30s (recovers from transient QuestDB restarts)
-    /// - Init buffer size: 64KB (matches WAL segment tuning)
-    /// - Request timeout: 60s (generous for large batch flushes)
-    ///
-    /// Builds the ILP TCP connection string.
-    ///
-    /// NOTE: `retry_timeout`, `init_buf_size`, `request_timeout` are HTTP-only
-    /// parameters in questdb-rs 6.1.0. TCP mode only supports `addr`.
-    /// Connection resilience is handled by our writers (ring buffer + reconnect).
-    pub fn build_ilp_conf_string(&self) -> String {
-        format!("tcp::addr={}:{};", self.host, self.ilp_port)
-    }
-}
-
 /// Partition retention configuration (separate from QuestDbConfig to avoid breaking existing code).
 ///
 /// 2026-07-13 (disk-pressure remediation): grew the archive→verify→drop knobs.
@@ -4590,35 +4571,6 @@ mod tests {
         assert!(!config.strategy.mode.is_live());
         assert!(!config.strategy.mode.is_sandbox());
         assert!(!config.strategy.mode.is_http_active());
-    }
-
-    #[test]
-    fn test_build_ilp_conf_string_tcp_only() {
-        let config = QuestDbConfig {
-            host: "tv-questdb".to_string(),
-            http_port: 9000,
-            pg_port: 8812,
-            ilp_port: 9009,
-        };
-        let conf = config.build_ilp_conf_string();
-        assert_eq!(conf, "tcp::addr=tv-questdb:9009;");
-        // TCP mode does NOT support retry_timeout, init_buf_size, request_timeout
-        // (those are HTTP-only in questdb-rs 6.1.0)
-        assert!(!conf.contains("retry_timeout"));
-        assert!(!conf.contains("init_buf_size"));
-        assert!(!conf.contains("request_timeout"));
-    }
-
-    #[test]
-    fn test_build_ilp_conf_string_custom_port() {
-        let config = QuestDbConfig {
-            host: "10.0.1.5".to_string(),
-            http_port: 9000,
-            pg_port: 8812,
-            ilp_port: 19009,
-        };
-        let conf = config.build_ilp_conf_string();
-        assert!(conf.contains("tcp::addr=10.0.1.5:19009;"));
     }
 
     #[test]

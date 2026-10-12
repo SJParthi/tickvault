@@ -13,7 +13,9 @@ use tracing::{error, info, warn};
 
 use tickvault_common::order_types::OrderStatus;
 
-use super::state_machine::parse_order_status;
+use super::state_machine::{
+    UNKNOWN_ORDER_STATUS_COUNTER, UNKNOWN_STATUS_LOG_MAX_CHARS, parse_order_status,
+};
 use super::types::{DhanOrderResponse, ManagedOrder, ReconciliationReport};
 
 /// A single correction to apply from reconciliation.
@@ -76,9 +78,22 @@ pub fn reconcile_orders(
         let dhan_status = match parse_order_status(&dhan_order.order_status) {
             Some(status) => status,
             None => {
+                // AUDIT INP-7 (2026-10-11): coded and counted. Still a skip:
+                // the reconcile has no order of its own to flag here. Coded
+                // OMS-GAP-02 because the rule for this skip lives under the
+                // reconciliation gap; that code has no CloudWatch filter.
+                metrics::counter!(UNKNOWN_ORDER_STATUS_COUNTER).increment(1);
+                let shown_status: String = dhan_order
+                    .order_status
+                    .chars()
+                    .take(UNKNOWN_STATUS_LOG_MAX_CHARS)
+                    .collect();
                 warn!(
+                    code = tickvault_common::error_code::ErrorCode::OmsGapReconciliation
+                        .code_str(),
+                    source = "unknown_status_rest",
                     order_id = %dhan_order.order_id,
-                    status = %dhan_order.order_status,
+                    status = %shown_status,
                     "unknown order status from Dhan REST API — skipping"
                 );
                 continue;
