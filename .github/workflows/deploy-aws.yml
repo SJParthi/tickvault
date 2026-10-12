@@ -230,7 +230,7 @@ jobs:
         # A glibc-dynamic binary built on the runner refuses to load on the box
         # with `version GLIBC_2.38/2.39 not found`. Static musl binary = zero
         # runtime libc dependency = runs on any Linux forever. Z+ L4 PREVENT.
-        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # SHA-pinned (was @master, supply-chain hardening 2026-04-25)
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # SHA-pinned (was @master, supply-chain hardening 2026-04-25)
         with:
           toolchain: 1.95.0
           targets: aarch64-unknown-linux-musl
@@ -503,7 +503,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Download built binary
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: tickvault-binary
           path: ./dist/
