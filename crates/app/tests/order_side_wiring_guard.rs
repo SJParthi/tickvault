@@ -141,3 +141,27 @@ fn test_risk_halt_error_is_coded_risk_gap_01() {
          migration; the Telegram page is the sink's Critical RiskHalt event"
     );
 }
+
+/// Deep audit DYN-4 (2026-10-12): the trading pipeline module doc read as a
+/// live tick consumer with a live strategy hot reload, while
+/// `spawn_trading_pipeline` has no production caller. The doc now says
+/// DORMANT. This fails if a caller appears in `main.rs` while the doc still
+/// says DORMANT, or if the DORMANT note is removed while there is no caller.
+#[test]
+fn trading_pipeline_doc_says_dormant_while_spawn_has_no_caller() {
+    let main_src = read_repo_file("src/main.rs");
+    let prod = compact(&strip_line_comments(production_region(&main_src)));
+    let spawn_sites = prod.matches("spawn_trading_pipeline").count();
+    let module = read_repo_file("src/trading_pipeline.rs");
+    let doc_says_dormant = module
+        .lines()
+        .take_while(|l| l.starts_with("//!") || l.trim().is_empty())
+        .any(|l| l.contains("# DORMANT"));
+    assert_eq!(
+        doc_says_dormant,
+        spawn_sites == 0,
+        "trading_pipeline.rs module doc DORMANT note ({doc_says_dormant}) disagrees with \
+         the {spawn_sites} production spawn site(s) in main.rs. Update the doc in the PR \
+         that wires (or unwires) the pipeline."
+    );
+}

@@ -73,10 +73,10 @@ The `.mcp.json` `tickvault-logs` entry is loaded automatically — same MCP tool
 | 100% audit coverage | `<event>_audit` table with DEDUP UPSERT KEYS | `mcp__tickvault-logs__questdb_sql` |
 | 100% testing coverage | 22 test categories per `testing.md` (unit/integration/property/loom/dhat/fuzz/mutation/sanitizer/coverage/etc.) | `cargo test --workspace` green |
 | 100% code checks | banned-pattern + pub-fn-test + pub-fn-wiring + plan-verify + secret-scan + 8 pre-commit gates | pre-push mandatory |
-| 100% code performance | DHAT zero-alloc + Criterion p99 budgets + bench-gate ≤5% regression | `cargo bench` + `scripts/bench-gate.sh` |
+| 100% code performance | DHAT zero-alloc + Criterion p99 (CORRECTED 2026-10-12, TRU-2: bench-gate reads Criterion's MEDIAN against the budget, after merge and nightly only; no percentile is measured) budgets + bench-gate ≤5% regression | `cargo bench` + `scripts/bench-gate.sh` |
 | 100% monitoring | 7-layer telemetry (Prom counter + gauge + tracing span + Loki log + Telegram event + Grafana panel + audit table) | `mcp__tickvault-logs__run_doctor` |
 | 100% logging | tracing macros mandatory; ERROR → Telegram via Loki/Alertmanager | hourly `errors.jsonl` rotation |
-| 100% alerting | `alerts.yml` Prom rule + `resilience_sla_alert_guard.rs` ratchet | `mcp__tickvault-logs__run_doctor` (CloudWatch alarms) |
+| 100% alerting | `alerts.yml` Prom rule + `resilience_sla_alert_guard.rs` ratchet | `mcp__tickvault-logs__run_doctor` (CloudWatch alarms) **⚠ CORRECTED 2026-10-12 (deep audit TRU-8): `resilience_sla_alert_guard.rs` does not exist in the tree; NOT ENFORCED.** |
 | 100% security | banned-pattern + secret-scan + `Secret<T>` enforcement + security-reviewer agent | `cargo audit` post-deploy |
 | 100% security hardening | static IP enforcement + secret scan + `unused_must_use` lint | post-deploy IP verify |
 | 100% bug fixing | adversarial 3-agent review (proven 4-bug catch rate per 30-commit PR) | pre-PR + post-impl agent pass |
@@ -91,7 +91,7 @@ The `.mcp.json` `tickvault-logs` entry is loaded automatically — same MCP tool
 |---|---|---|
 | Zero data loss | Bounded zero loss inside chaos envelope: the derived seal-ring capacity `AGGREGATOR_MAX_SLOTS × TF_COUNT` (`SEAL_BUFFER_CAPACITY`, ratcheted by `seal_ring.rs`) → NDJSON spill → DLQ *(2026-07-18: the tick rescue ring + its capacity constant were deleted with the dead tick writer — the seal chain is the live absorption tier)* | item must not introduce new seal-drop path |
 | WS never disconnects | SEBI 24h JWT forces ≥1 reconnect/day BY LAW. DETECT ≤5s, reconnect with `SubscribeRxGuard`, sleep-until-open post-close. | item must not break `SubscribeRxGuard` or pool watchdog |
-| Never slow/locked/hanged | DHAT ≤4 alloc blocks/8KB across 10K calls; Criterion p99 ≤100ns enqueue; tick-gap >30s coalesced Telegram; ~~core_affinity Core 0~~ **(CORRECTED 2026-08-10 — see note below)** | item must not add hot-path allocation |
+| Never slow/locked/hanged | DHAT ≤4 alloc blocks/8KB across 10K calls; Criterion p99 (CORRECTED 2026-10-12, TRU-2: bench-gate reads Criterion's MEDIAN against the budget, after merge and nightly only; no percentile is measured) ≤100ns enqueue; tick-gap >30s coalesced Telegram; ~~core_affinity Core 0~~ **(CORRECTED 2026-08-10 — see note below)** | item must not add hot-path allocation |
 
 > **⚠ CORRECTION 2026-08-10 — the "core_affinity Core 0" cell above was FALSE and is
 > withdrawn.** A workspace audit found `core_affinity` declared in both the root
@@ -249,7 +249,7 @@ For every plan item / new feature / Telegram message / docs:
 
 ### Mechanical ratchet (to be wired)
 
-- New hook `.claude/hooks/serial-pr-guard.sh` runs at session start; refuses code commits if an open PR authored by this branch exists on the operator's repo without merge.
+- New hook `.claude/hooks/serial-pr-guard.sh` runs at session start; refuses code commits if an open PR authored by this branch exists on the operator's repo without merge. **⚠ CORRECTED 2026-10-12 (deep audit TRU-8): NOT BUILT; no such hook exists.**
 - Tag-guard meta-test `crates/storage/tests/serial_pr_protocol_guard.rs` greps for the canonical phrases in this section so the rule cannot be silently deleted.
 
 ---
@@ -321,8 +321,8 @@ For every plan item / new feature / Telegram message / docs:
 | `error_code_tag_guard.rs` | `cargo test` | every error code mentioned in a log has `code =` field |
 | `error_code_rule_file_crossref.rs` | `cargo test` | every ErrorCode variant has rule-file mention |
 | `dedup_segment_meta_guard.rs` | `cargo test` | every DEDUP key includes segment |
-| `operator_health_dashboard_guard.rs` | `cargo test` | every counter has a Grafana panel |
-| `resilience_sla_alert_guard.rs` | `cargo test` | every counter has an alert rule |
+| `operator_health_dashboard_guard.rs` | `cargo test` | every counter has a Grafana panel **⚠ CORRECTED 2026-10-12 (deep audit TRU-8): `operator_health_dashboard_guard.rs` does not exist in the tree; NOT ENFORCED.** |
+| `resilience_sla_alert_guard.rs` | `cargo test` | every counter has an alert rule **⚠ CORRECTED 2026-10-12 (deep audit TRU-8): `resilience_sla_alert_guard.rs` does not exist in the tree; NOT ENFORCED.** |
 | `error_level_meta_guard.rs` | `cargo test` | flush/persist failures use `error!` not `warn!` |
 | `scripts/bench-gate.sh` | post-merge | 5% regression budget on hot-path benches |
 | `scripts/coverage-gate.sh` | post-merge | ratcheted per-crate floors (72.6–99.4, target 100%) per crate |

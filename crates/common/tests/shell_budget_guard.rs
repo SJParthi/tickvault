@@ -35,10 +35,17 @@
 //!   `bash <file>` is not detected by name or content. Every such file in
 //!   the tree today has a shebang; a new one would also need a caller, and
 //!   callers in systemd units are checked by (4).
-//! - Shell inside other files is NOT budgeted here yet: workflow `run:`
+//! - ~~Shell inside other files is NOT budgeted here yet: workflow `run:`
 //!   steps, the Makefile, SSM command strings inside Rust (`operator_control`
 //!   and friends), and `Command::new("sh")` spawns. Those are later D6 steps,
-//!   recorded in `.claude/plans/active-plan-audit-fixes-2026-09-26.md`.
+//!   recorded in `.claude/plans/active-plan-audit-fixes-2026-09-26.md`.~~
+//!   CORRECTED 2026-10-12 (deep audit RUST-6 / RUST-7): every one of those is
+//!   budgeted now. The console's SSM shell and the workflow SSM payloads
+//!   (`console_embedded_shell_never_grows`, `ssm_workflow_shell_never_grows`,
+//!   2026-10-04), workflow `run:` steps (`workflow_run_lines_never_grow`) and
+//!   Makefile recipes (`makefile_recipe_lines_never_grow`) below, and Rust
+//!   that starts a shell (`rust_shell_spawns_are_allowlisted` in
+//!   `rust_only_guard.rs`, one dev-only row: the MCP doctor).
 //! - Line ceilings count lines, not logic. A script can be rewritten at the
 //!   same length; the ceiling only stops it from growing.
 
@@ -140,7 +147,6 @@ const SHELL_OPS_FILES: &[(&str, usize)] = &[
     ("scripts/questdb-init.sh", 190),
     ("scripts/questdb-tunnel.sh", 304),
     ("scripts/register-dhan-ip.sh", 316),
-    ("scripts/setup-cloudwatch-alarms.sh", 227),
     ("scripts/setup-observability.sh", 375),
     ("scripts/setup-secrets.sh", 118),
     ("scripts/sync-to-integration.sh", 255),
@@ -153,7 +159,6 @@ const SHELL_OPS_FILES: &[(&str, usize)] = &[
     ("scripts/tv-tunnel/install-mac.sh", 168),
     ("scripts/validate-automation.sh", 178),
     ("scripts/validate-deploy-ssm-quoting.sh", 81),
-    ("scripts/verify-option-chain-minute-snapshot.sh", 193),
     ("scripts/verify-stack.sh", 125),
 ];
 
@@ -645,7 +650,6 @@ const AWK_JQ_BUDGET: &[(&str, usize)] = &[
     ("scripts/tv-tunnel/install-aws.sh", 1),
     ("scripts/tv-tunnel/install-mac.sh", 1),
     ("scripts/validate-deploy-ssm-quoting.sh", 2),
-    ("scripts/verify-option-chain-minute-snapshot.sh", 10),
 ];
 
 /// Lines of the All Green jq program in `ci.yml` (between `jq -rn '` and the
@@ -1212,6 +1216,208 @@ fn embedded_shell_and_awk_jq_self_test() {
     assert!(is_production_rust("crates/app/src/main.rs"));
     assert!(is_production_rust("crates/app/build.rs"));
     assert!(!is_production_rust("crates/app/tests/x.rs"));
+}
+
+// ============================ WORKFLOW `run:` SHELL (RUST-7) ============================
+//
+// 2026-10-12, deep audit RUST-7. Inline `run:` shell in `.github/workflows/`
+// was the largest body of shell in the repo (about 4,200 lines on the audit
+// date) and had no ceiling at all, while several of those workflows act on
+// production (deploy, terraform apply, downsize, EBS growth). The Makefile
+// recipes (about 300 lines) had none either.
+//
+// `workflow_run_lines_never_grow`: per workflow file, the count of non-blank,
+// non-comment lines inside `run:` steps (a one-line `run: cmd` counts 1, a
+// `run: |` / `run: >` block counts its body) is held at or below its ceiling.
+// A workflow absent from the table may carry NO `run:` shell; a row whose
+// file is gone or now measures zero must be removed. A ceiling may be lowered
+// freely and must never be raised: new logic goes into a Rust bin the step
+// calls.
+//
+// `makefile_recipe_lines_never_grow`: the same for Makefile recipe lines
+// (tab-led, non-blank, not a `#` comment).
+//
+// HONEST LIMIT: lines, not logic, as with the ops-script ceilings above. A
+// flow-style `run: "a; b; c"` counts as one line.
+
+/// Per workflow: ceiling on non-blank, non-comment `run:` shell lines,
+/// measured 2026-10-12 after the RUST-8 port and the SEC-7 / PROOF-5 edits.
+const WORKFLOW_RUN_LINE_BUDGET: &[(&str, usize)] = &[
+    (".github/workflows/auto-merge.yml", 25),
+    (".github/workflows/aws-autopilot.yml", 7),
+    (".github/workflows/aws-control.yml", 264),
+    (".github/workflows/bench.yml", 19),
+    (".github/workflows/chaos-nightly.yml", 64),
+    (".github/workflows/ci.yml", 293),
+    (".github/workflows/claude-integration.yml", 17),
+    (".github/workflows/claude-mobile-command.yml", 2),
+    (".github/workflows/claude-triage-loop.yml", 6),
+    (".github/workflows/dep-freshness-nightly.yml", 82),
+    (".github/workflows/deploy-aws-after-close.yml", 58),
+    (".github/workflows/deploy-aws.yml", 643),
+    (".github/workflows/downsize-instance.yml", 425),
+    (".github/workflows/emergency-fs-recover.yml", 126),
+    (".github/workflows/full-test-nightly.yml", 83),
+    (".github/workflows/fuzz.yml", 107),
+    (".github/workflows/grow-ebs-volume.yml", 157),
+    (".github/workflows/local-branch-sync.yml", 34),
+    (".github/workflows/mutation.yml", 79),
+    (".github/workflows/postmerge-catchup.yml", 75),
+    (".github/workflows/safety.yml", 410),
+    (".github/workflows/secret-scan.yml", 29),
+    (".github/workflows/security-audit.yml", 2),
+    (".github/workflows/terraform-apply.yml", 287),
+    (".github/workflows/wipe-log-streams.yml", 115),
+];
+
+/// Makefile recipe-line ceiling, measured 2026-10-12.
+const MAKEFILE_RECIPE_LINE_CEILING: usize = 301;
+
+/// Indentation (in columns) of a line.
+fn indent_of(line: &str) -> usize {
+    line.len() - line.trim_start().len()
+}
+
+/// Non-blank, non-comment shell lines inside `run:` steps of one workflow.
+fn count_workflow_run_lines(text: &str) -> usize {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut total = 0_usize;
+    let mut i = 0_usize;
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed = line.trim_start();
+        let after_dash = trimmed.strip_prefix("- ").unwrap_or(trimmed);
+        let Some(value) = after_dash.strip_prefix("run:") else {
+            i += 1;
+            continue;
+        };
+        if trimmed.starts_with('#') {
+            i += 1;
+            continue;
+        }
+        // Column of the `run` key: the block body must be indented past it.
+        let key_col = indent_of(line) + (trimmed.len() - after_dash.len());
+        let value = value.trim();
+        let is_block = value.starts_with('|') || value.starts_with('>');
+        if !is_block {
+            if !value.is_empty() && !value.starts_with('#') {
+                total += 1;
+            }
+            i += 1;
+            continue;
+        }
+        i += 1;
+        while i < lines.len() {
+            let body = lines[i];
+            if body.trim().is_empty() {
+                i += 1;
+                continue;
+            }
+            if indent_of(body) <= key_col {
+                break;
+            }
+            if !body.trim_start().starts_with('#') {
+                total += 1;
+            }
+            i += 1;
+        }
+    }
+    total
+}
+
+/// Non-blank, non-comment Makefile recipe lines (tab-led).
+fn count_makefile_recipe_lines(text: &str) -> usize {
+    text.lines()
+        .filter_map(|l| l.strip_prefix('\t'))
+        .filter(|l| {
+            let t = l.trim();
+            !t.is_empty() && !t.starts_with('#')
+        })
+        .count()
+}
+
+#[test]
+fn workflow_run_lines_never_grow() {
+    let names: Vec<&str> = WORKFLOW_RUN_LINE_BUDGET.iter().map(|r| r.0).collect();
+    assert_sorted_unique(&names, "WORKFLOW_RUN_LINE_BUDGET");
+    let mut measured: Vec<(String, usize)> = Vec::new();
+    for wf in all_files().into_iter().filter(|p| {
+        p.starts_with(".github/workflows/") && (p.ends_with(".yml") || p.ends_with(".yaml"))
+    }) {
+        let n = count_workflow_run_lines(&read_text(&wf).unwrap_or_default());
+        if n > 0 {
+            measured.push((wf, n));
+        }
+    }
+    let total: usize = measured.iter().map(|r| r.1).sum();
+    assert!(
+        measured.len() > 10 && total > 1_000,
+        "only {} workflows / {total} run lines measured; the counter is broken",
+        measured.len()
+    );
+    let report: Vec<String> = measured
+        .iter()
+        .map(|(p, n)| format!("    (\"{p}\", {n}),"))
+        .collect();
+    let over = over_budget(&measured, WORKFLOW_RUN_LINE_BUDGET);
+    let stale = stale_budget_rows(&measured, WORKFLOW_RUN_LINE_BUDGET);
+    assert!(
+        over.is_empty() && stale.is_empty(),
+        "workflow `run:` shell budget broken. Over ceiling (path, lines, ceiling): \
+         {over:?}. Stale rows (file gone or no run shell left): {stale:?}. Put new \
+         logic in a Rust bin and call it from the step; lower a ceiling freely, \
+         never raise one. Measured now:\n{}",
+        report.join("\n")
+    );
+}
+
+#[test]
+fn makefile_recipe_lines_never_grow() {
+    let text = read_text("Makefile").expect("Makefile present");
+    let n = count_makefile_recipe_lines(&text);
+    assert!(
+        n > 50,
+        "only {n} Makefile recipe lines; the counter is broken"
+    );
+    assert!(
+        n <= MAKEFILE_RECIPE_LINE_CEILING,
+        "Makefile recipe lines grew: {n} > ceiling {MAKEFILE_RECIPE_LINE_CEILING}. \
+         Put the logic in Rust (a `tv_*` bin) and call it; lower the ceiling freely."
+    );
+}
+
+#[test]
+fn workflow_run_line_counter_bites() {
+    let wf = concat!(
+        "jobs:\n",
+        "  a:\n",
+        "    steps:\n",
+        "      - run: echo one\n",
+        "      - name: block\n",
+        "        run: |\n",
+        "          set -euo pipefail\n",
+        "\n",
+        "          # a comment\n",
+        "          echo two\n",
+        "            echo nested\n",
+        "      - name: folded\n",
+        "        run: >-\n",
+        "          echo three\n",
+        "        env:\n",
+        "          X: y\n",
+        "      - name: not a run\n",
+        "        with:\n",
+        "          script: |\n",
+        "            run: not counted\n",
+        "      # - run: commented out\n",
+    );
+    // echo one (1) + block body 3 non-comment lines + folded 1 = 5, plus the
+    // `run: not counted` line, a one-line `run:` key inside a `script:` block
+    // that does count 1 (the counter errs toward counting more) = 6.
+    assert_eq!(count_workflow_run_lines(wf), 6);
+    assert_eq!(count_workflow_run_lines("on: push\n"), 0);
+    let mk = "all:\n\techo a\n\t# c\n\n\techo b\nvar = 1\n";
+    assert_eq!(count_makefile_recipe_lines(mk), 2);
 }
 
 // ======================= NEXTEST FLAKY RESULT (2026-10-04) =======================

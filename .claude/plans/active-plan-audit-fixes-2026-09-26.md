@@ -3042,9 +3042,9 @@ and a call site; shell may only shrink. One PR per item, serial.
 - [ ] **DA-18 — Config, host sizing and boot checks** (INP-3, DYN-1, DYN-2, DYN-5, MEM-1, SUP-7,
   QDB-5, QDB-8, tail HOT-11, OBS-5, OBS-10, OBS-14, SCALE-5, CAL-1 partial, RUST-1 first slice).
   `common`, `app`, `core`, `storage`, `deploy/`, `.github/workflows/`.
-- [ ] **DA-19 — Guards, CI and docs that tell the truth** (RUST-6, RUST-7, RUST-8, RUST-9,
+- [x] **DA-19 — Guards, CI and docs that tell the truth** (RUST-6, RUST-7, RUST-8, RUST-9,
   RUST-10, CR-4, CR-7, CR-9, TRU-2, TRU-8, SCALE-6, PROOF-5, PROOF-6, PROOF-12, PROOF-13, INC-1
-  ratchet, SEC-7, HOT-6, HOT-18, DYN-4, CR-1, SUP-10, OBS-7 ratchet, OBS-15, QDB-7, QDB-11).
+  ratchet, SEC-7, HOT-6, HOT-18, DYN-4, CR-1, SUP-10, OBS-7 ratchet, OBS-15, QDB-7, QDB-11). Done: `shell_budget_guard::{workflow_run_lines_never_grow, makefile_recipe_lines_never_grow}`, `rust_only_guard::rust_shell_spawns_are_allowlisted`, `GITHUB_SCRIPT_BUDGET` empty; new guards `source_scan_budget_guard`, `bench_claim_wording_guard`, `error_code_paging_decision_guard`, `rule_cited_guard_exists_guard`, `source_size_ratchet_guard`, `questdb_commit_mode_doc_guard`; `coverage_file_floors` (report-only, not run in CI yet); `naive_date_from_archived_i32` returns `Option`.
 - [ ] **DA-20 — Missing benches, chaos and fuzz** (HOT-5, HOT-7, HOT-15, SCALE-2, TEST-2, WS-1,
   PROOF-7, PROOF-14, PROOF-16, INP-8, QDB-4).
 - [ ] **DA-21 — Structural hot-path work** (HOT-3 drain on its own thread, HOT-2 and tail HOT-10

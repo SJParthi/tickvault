@@ -370,10 +370,21 @@ impl ActivityWatchdog {
 /// the caller exactly as before. Panics in the watchdog no longer leave
 /// the read loop stuck.
 ///
+/// **CORRECTED 2026-10-12 (deep audit CR-4):** the two paragraphs above hold
+/// only in dev and test builds. The release profile sets `panic = "abort"`
+/// (root `Cargo.toml`), so a watchdog panic in release ends the whole process:
+/// `catch_unwind` never returns and the notify-on-panic arm never runs. What
+/// recovers release is the panic hook in `main.rs` (one synchronous log line
+/// and a bounded drain) followed by the systemd restart and the WAL replay.
+/// The same correction was made for the frame-log writer (Z11b,
+/// `ws_frame_spill.rs`).
+///
 /// # Testing
 /// Covered by `test_spawn_with_panic_notify_fires_notify_on_panic` —
 /// spawns a future that panics immediately, awaits `notify.notified()`
 /// with a 500ms timeout, and asserts the notify fires.
+/// That test proves the unwinding build only; it cannot run under
+/// `panic = "abort"`.
 /// Builds a heartbeat gauge handle for a single WebSocket connection.
 ///
 /// # Why this helper exists (ZL-P0-1)
@@ -421,6 +432,8 @@ pub fn spawn_with_panic_notify(watchdog: ActivityWatchdog) -> tokio::task::JoinH
     let label = watchdog.label.clone();
     tokio::spawn(async move {
         use futures_util::FutureExt as _;
+        // Reachable only under unwinding (dev/test). Release aborts on panic
+        // (`panic = "abort"`), so there the process ends instead (CR-4).
         let result = std::panic::AssertUnwindSafe(watchdog.run())
             .catch_unwind()
             .await;

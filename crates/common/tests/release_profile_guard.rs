@@ -202,3 +202,24 @@ fn guard_self_test() {
          would satisfy the assertions: {block}"
     );
 }
+
+/// Deep audit SUP-10 (2026-10-12): under `panic = "abort"` a task panic ends
+/// the process, so every catch_unwind / JoinError respawn arm runs only in
+/// test and dev builds. That consequence must stay written next to the
+/// setting, where a reader changing the profile will see it.
+#[test]
+fn release_profile_panic_abort_is_documented() {
+    let toml = read("Cargo.toml");
+    let start = toml
+        .find("\n[profile.release]")
+        .expect("Cargo.toml has no [profile.release] section");
+    let body = &toml[start + 1..];
+    let end = body[1..].find("\n[").map_or(body.len(), |i| i + 1);
+    let section = &body[..end];
+    for needle in ["SUP-10", "RestartSec", "catch_unwind", "panic = \"abort\""] {
+        assert!(
+            section.contains(needle),
+            "[profile.release] must keep `{needle}` in the panic=abort note"
+        );
+    }
+}

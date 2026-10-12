@@ -285,6 +285,12 @@ overflow-checks = true    # Integer overflow = panic (not silent wrap) — criti
 lto = "thin"              # Link-time optimization — smaller binary, dead code elimination
 codegen-units = 1         # Single codegen unit — better optimization at cost of compile time
 strip = "symbols"         # Strip debug symbols from release binary
+# SUP-10 (2026-10-12, deep audit): abort means ANY panic in ANY task ends the
+# whole process. systemd restarts it after RestartSec=3 and WAL replay
+# recovers the frames. So every catch_unwind or JoinError-is-panic respawn arm
+# in the code runs only in test and dev builds, never in production; the
+# clippy unwrap/expect denies are the real defence. See the panic hook in
+# crates/app/src/main.rs.
 panic = "abort"           # No stack unwinding in production — smaller, faster, no catch_unwind
 
 # Benchmarks only (`cargo bench`; the shipped binary is built with

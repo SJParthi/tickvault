@@ -793,6 +793,11 @@ async fn async_main() -> Result<()> {
     // failed) or an outage of five minutes or more between 09:20 and 15:35
     // IST trips market-hours-liveness-missing. A PROC-03 page is an open
     // owner decision under the noise lock.
+    // Release builds use panic = "abort" (deep audit SUP-10): this hook is the
+    // LAST code a panicking process runs. No task survives a panic in
+    // production, so a catch_unwind or JoinError respawn arm elsewhere runs only
+    // in test and dev builds; recovery is the systemd restart (RestartSec=3)
+    // plus WAL replay, and the clippy unwrap/expect denies are the defence.
     let default_panic_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
         let location = panic_info.location().map_or_else(
@@ -2075,6 +2080,16 @@ async fn async_main() -> Result<()> {
                 let file_filter_directive =
                     tickvault_app::boot_helpers::build_app_log_filter_directive(log_filter);
                 let file_filter = tracing_subscriber::EnvFilter::new(file_filter_directive);
+                // TWO SHIPPED SCHEMAS ON PURPOSE (2026-10-12, deep audit
+                // OBS-15). This app log is NESTED (`fields.code`,
+                // `fields.*`) with IST timestamps; errors.jsonl below is FLAT
+                // (`code` at the top level) with UTC timestamps. Both reach
+                // the same CloudWatch log group, so a query must name the
+                // shape it reads. Do NOT flatten this layer: the terraform
+                // divergence control `log_schema_nested_errors` and the
+                // `preopen-ready-secs` filter read the nested shape
+                // (`$.fields.code`, `$.fields.ready_at_ist_secs`). Pinned by
+                // `observability_chain_e2e::app_log_layer_stays_nested_for_the_schema_divergence_control`.
                 let file_fmt = tracing_subscriber::fmt::layer()
                     .with_target(true)
                     .with_thread_ids(true)
@@ -2148,6 +2163,8 @@ async fn async_main() -> Result<()> {
                     // summary_writer + Claude can pattern-match them without
                     // walking a nested object. The e2e test
                     // `observability_chain_e2e` regresses on this flag.
+                    // No `with_timer`: these timestamps are UTC, where the
+                    // nested app log above uses IST (deep audit OBS-15).
                     .flatten_event(true)
                     .with_current_span(true)
                     .with_span_list(false)

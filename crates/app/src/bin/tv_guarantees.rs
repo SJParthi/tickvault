@@ -48,8 +48,10 @@
 //! ```
 
 #![cfg_attr(not(test), deny(unsafe_code))]
-#![allow(clippy::unwrap_used)] // APPROVED: diagnostic CLI, same posture as tv_doctor
-#![allow(clippy::expect_used)] // APPROVED: diagnostic CLI, same posture as tv_doctor
+// 2026-10-12 (deep audit CR-7): deny, not allow. No production unwrap/expect
+// exists here; a future one now fails clippy instead of aborting (exit 134).
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
+#![cfg_attr(not(test), deny(clippy::expect_used))]
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};

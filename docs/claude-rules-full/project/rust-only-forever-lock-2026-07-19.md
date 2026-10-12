@@ -942,6 +942,17 @@ all is a scope question, not an executor's: the operator's directive is about
 the workspace codebase, and QuestDB is a database he chose, not code we wrote.
 Recorded so the next session decides deliberately rather than rediscovering it.
 
+**2026-10-12 — an OPEN scope question, recorded, not ruled (deep audit RUST-10).**
+Not every process on the box is code we write: QuestDB (Java and C++, a
+pinned container image), Loki and Alloy (Go, optional `logs` profile),
+Docker, the SSM and CloudWatch agents, and chrony are third-party services,
+and the app talks to every one of them from Rust. Whether this rule covers
+them is the scope question the paragraph above reserves for the operator,
+and no dated quote answers it yet. Until one does, this file claims only
+that the code we write and ship is Rust; it does NOT claim that every
+process on the box is, and it does NOT exempt any third-party runtime. The
+image-identity allowlist above stays not taken.
+
 ### What a PR that violates §0.9 looks like (REJECT)
 
 - Reverts the Lambda scan to `read_dir`, or any non-recursive enumeration.
@@ -993,6 +1004,10 @@ Workflow `run:` steps, the Makefile, SSM command strings built inside Rust
 (the operator console), and `Command::new("sh")` spawns. The plan item records
 them; this section is amended when each lands.
 
+> **⚠ CORRECTED 2026-10-12:** all four are now budgeted (the console SSM
+> shell and the awk/jq programs on 2026-10-04, workflow `run:` steps, the
+> Makefile and shell spawns on 2026-10-12); see the two dated sections below.
+
 ### 2026-10-04 — the embedded shell and the awk/jq programs are budgeted (audit M5, L8)
 
 Two places ran root shell on the production server without being a shell
@@ -1014,6 +1029,30 @@ frozen, not yet ported to Rust; awk/jq are counted by word, so a name built
 from a variable is not seen; Rust literals are read only up to the first
 `#[cfg(test)]` line. Workflow `run:` steps, the Makefile's shell and
 `Command::new("sh")` spawns are still not budgeted.
+*(⚠ CORRECTED 2026-10-12: all three are budgeted now; see the next section.)*
+
+### 2026-10-12 — the rest is budgeted; inline JavaScript in CI is at zero (deep audit RUST-6, RUST-7, RUST-8, RUST-9)
+
+| Test | What it pins |
+|---|---|
+| `workflow_run_lines_never_grow` (`shell_budget_guard.rs`) | per workflow, non-blank non-comment lines inside `run:` steps; a workflow with no row may carry none |
+| `makefile_recipe_lines_never_grow` (`shell_budget_guard.rs`) | Makefile recipe lines (tab-led, non-comment) |
+| `rust_shell_spawns_are_allowlisted` (`rust_only_guard.rs`) | spawn literals naming a shell in `crates/*/src` and `build.rs`; one dev-only row, the MCP server's `bash scripts/doctor.sh` plus one `sh -c` in its own test module |
+| `github_script_usage_only_shrinks` (`rust_only_guard.rs`) | `GITHUB_SCRIPT_BUDGET` is now EMPTY: the last 14 `actions/github-script` steps (12 in `safety.yml`, 2 in `dep-freshness-nightly.yml`) became `gh issue` run steps with the same titles, labels and dedup rule |
+
+Two orphan scripts were deleted with their rows:
+`scripts/verify-option-chain-minute-snapshot.sh` (and its Makefile target; the
+option-chain REST leg it checked was deleted 2026-09-16) and
+`scripts/setup-cloudwatch-alarms.sh` (it created two alarms by hand that
+terraform owns, one of them with `ok_actions`, which the noise lock forbids).
+Kept on purpose: the operator-run measuring tools
+`measure-ram-residency-cost.sh` and `count-current-expiry-universe.sh` (the
+websocket scope lock names the second as the way to replace an assumed
+figure), `diagnose-write-amplification.sh` (named by the live feed-hardening
+plan), and the two `auto-fix-*-rollback.sh` scripts that `scripts/triage/rollback.sh`
+reaches by name. **Honest limits:** lines, not logic; a flow-style
+`run: "a; b"` counts as one line; a shell named through a variable in Rust is
+not seen (the non-literal spawn budget pins how many such sites exist).
 
 ### What a PR that violates §0.10 looks like (REJECT)
 
@@ -1024,6 +1063,11 @@ from a variable is not seen; Rust literals are read only up to the first
   ceiling.
 - Weakens the shell detection (name, template suffix, or shebang) or drops the
   untracked-file listing.
+- (2026-10-12) Raises a `WORKFLOW_RUN_LINE_BUDGET` row, the Makefile recipe
+  ceiling or a `RUST_SHELL_SPAWN_BUDGET` row, adds a workflow with `run:` shell
+  and no row, or re-adds any `actions/github-script` step, without a fresh
+  dated operator quote recorded in this file first (the same escape the
+  ceiling row above has).
 
 ## §0.11. 2026-10-02 — `libc` becomes a DIRECT dependency (owner-approved)
 

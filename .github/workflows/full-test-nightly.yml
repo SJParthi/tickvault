@@ -163,3 +163,92 @@ jobs:
             --body-file /tmp/nightly-issue-body.md \
             --label nightly-regression \
             --label auto-triage
+
+  # PROOF-5 (2026-10-12, deep audit): every other test job runs on x86_64
+  # glibc, while production is an aarch64 musl static binary. Until now no
+  # test, DHAT count or loom model had ever run on aarch64 or under musl.
+  # This NIGHTLY job (not a PR job, so the All Green needs list is untouched)
+  # runs the core, storage, trading and app suites built for
+  # aarch64-unknown-linux-musl, then the loom models on native aarch64.
+  #
+  # HONEST LIMITS: the runner is a GitHub ARM host, not the r8g Graviton4
+  # box, so it proves atomics ordering, musl allocator behaviour and DHAT
+  # counts on aarch64 + musl, not production latency. The core DHAT targets
+  # gated behind `--features dhat` are not built here (the plain suites run
+  # the storage, trading and app DHAT targets). apt uses one mirror with
+  # retries; a mirror outage fails the night and opens the issue below.
+  # GitHub Actions minutes, not AWS spend.
+  test-aarch64-musl:
+    name: Test (aarch64-musl)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    steps:
+      - name: Free runner disk space (seal spill 4 GiB free-disk floor)
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain (aarch64 musl target)
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # SHA-pinned
+        with:
+          toolchain: '1.95.0'
+          targets: aarch64-unknown-linux-musl
+
+      - name: Install musl build deps
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true update
+          sudo apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true \
+            install -y --no-install-recommends cmake build-essential pkg-config musl-tools musl-dev
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: full-test-nightly-aarch64-musl
+
+      - name: cargo test (aarch64-unknown-linux-musl)
+        id: musl_test
+        shell: bash
+        env:
+          CC_aarch64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: |
+          set -euo pipefail
+          cargo test --target aarch64-unknown-linux-musl --no-fail-fast \
+            -p tickvault-core -p tickvault-storage -p tickvault-trading -p tickvault-app \
+            2>&1 | tee /tmp/musl-test.log
+
+      - name: Loom models (native aarch64)
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p tickvault-core --features loom --test loom_activity_watchdog \
+            --test loom_ghost_register --test loom_ws_decoupling
+          cargo test -p tickvault-trading --features loom --test loom_circuit_breaker
+
+      - name: Open regression issue on failure
+        if: failure()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT_SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh label create nightly-regression --force --color B60205 \
+            --description "Nightly full-workspace test failure"
+          # Keep one open issue: skip when an aarch64-musl regression issue is
+          # already open (the sibling job above has no such check).
+          gh issue list --state open --label nightly-regression --search 'in:title "nightly regression: aarch64-musl"' | grep -q . && exit 0
+          gh issue create \
+            --title "nightly regression: aarch64-musl tests failed @ ${COMMIT_SHA:0:7}" \
+            --body "The nightly aarch64-musl test job failed. Run: ${RUN_URL}" \
+            --label nightly-regression

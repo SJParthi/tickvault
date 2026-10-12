@@ -7,6 +7,11 @@
 > + `make wave-guarantee-check` (CI gate). Items without the matrix fail
 > the build at PR-merge.
 > **Trigger:** Always loaded for any session editing a plan file.
+> **⚠ CORRECTED 2026-10-12 (deep audit):** nothing in `.github/` or in
+> `pre-pr-gate.sh` runs the matrix check, so it is NOT a CI gate and does not
+> fail a PR. It runs only when someone runs `make wave-guarantee-check` or
+> the hook by hand. The table under "Mechanical enforcement" is wrong in the
+> same way.
 
 ## Why this rule exists
 
@@ -30,10 +35,10 @@ checklist or in a dedicated "Per-Item Guarantee Matrix" subsection:
 | 100% audit coverage | `<event>_audit` table per typed event with DEDUP UPSERT KEYS | `mcp__tickvault-logs__questdb_sql` | item adds/extends audit table |
 | 100% testing coverage | 22 test categories per `testing.md` (unit/integration/property/loom/dhat/fuzz/mutation/sanitizer/coverage/etc.) | `cargo test --workspace` green | item declares which 22 it covers |
 | 100% code checks | banned-pattern + pub-fn-test + pub-fn-wiring + plan-verify + secret-scan + 8 pre-commit gates | pre-push mandatory | all gates green |
-| 100% code performance | DHAT zero-alloc + Criterion p99 budgets + bench-gate ≤5% regression | `cargo bench` + `scripts/bench-gate.sh` | DHAT test if hot path |
+| 100% code performance | DHAT zero-alloc + Criterion p99 (CORRECTED 2026-10-12, TRU-2: bench-gate reads Criterion's MEDIAN against the budget, after merge and nightly only; no percentile is measured) budgets + bench-gate ≤5% regression | `cargo bench` + `scripts/bench-gate.sh` | DHAT test if hot path |
 | 100% monitoring | 7-layer telemetry (Prom counter + gauge + tracing span + Loki log + Telegram event + Grafana panel + audit table) | `mcp__tickvault-logs__run_doctor` | 9-box completes 7 layers |
 | 100% logging | tracing macros mandatory (no println!/dbg!); ERROR → Telegram | hourly errors.jsonl rotation | every error path uses `error!` with `code` |
-| 100% alerting | `alerts.yml` Prom rule + `resilience_sla_alert_guard.rs` ratchet | `mcp__tickvault-logs__run_doctor` (CloudWatch alarms) | item adds alert for new failure |
+| 100% alerting | `alerts.yml` Prom rule + `resilience_sla_alert_guard.rs` ratchet | `mcp__tickvault-logs__run_doctor` (CloudWatch alarms) | item adds alert for new failure **⚠ CORRECTED 2026-10-12 (deep audit TRU-8): `resilience_sla_alert_guard.rs` does not exist in the tree; NOT ENFORCED.** |
 | 100% security | banned-pattern + secret-scan + `Secret<T>` + security-reviewer agent | `cargo audit` post-deploy | item runs security-reviewer |
 | 100% security hardening | static IP enforcement + pre-commit secret scan + `unused_must_use` lint | post-deploy IP verify | item declares attack-surface delta |
 | 100% bugs fixing | adversarial 3-agent review (proven 4-bug catch rate) | pre-PR + post-impl agent pass | item runs all 3 agents |
@@ -48,7 +53,7 @@ checklist or in a dedicated "Per-Item Guarantee Matrix" subsection:
 |---|---|---|
 | Zero ticks lost | Bounded zero loss inside chaos envelope: ~~ring 2M~~ ~~→ spill NDJSON → DLQ~~. **⚠ CORRECTED 2026-10-11:** there is no 2M ring. The live frame ring is one bounded channel with many producers, capped by `FRAME_RING_CAPACITY` (frames) and `FRAME_RING_MAX_BYTES` (bytes) in `dhan_feed_stack.rs` (read the constants); the frame is ~~written to the WAL at receipt~~ queued to the WAL writer at receipt, before the ring, so a full ring is a lag signal. ~~Loss paths that remain are counted and paged (spill channel full, spill writer dead, spill byte cap, WAL loss after a shed, rows dropped at the database writer).~~ **⚠ CORRECTED 2026-10-11 (later the same day):** ticks: WAL → ring → QuestDB, with the rescue spill and the inline fallback; the tick tier has NO DLQ (only candles have one: seal ring → spill → DLQ). Loss paths read from source 2026-10-11 include (not an exhaustive list): WAL and ring both refused (no recovery; paged), spill channel full, spill writer dead, spill byte cap, WAL loss after a shed, rescue rows abandoned at shutdown, offload writer shutdown incomplete, re-injected frames dropped, oversize frames refused; each is counted and paged. Rows dropped at the database writer are usually rescued to the spill or replayed from the WAL, so that page is not a loss on its own. Two losses are not counted: up to ~1 s plus the syncer's time on a power cut, and records still queued for the WAL when the process is killed. | item must not introduce new tick-drop path |
 | WS never disconnects | DETECT ≤5s, reconnect with `SubscribeRxGuard`, sleep-until-open post-close | item must not break SubscribeRxGuard or pool watchdog |
-| Never slow/locked/hanged | DHAT ≤4 alloc blocks/8KB across 10K calls; Criterion p99 ≤100ns; tick-gap >30s Telegram; ~~core_affinity Core 0~~ **⚠ CORRECTED 2026-10-11:** the `core_affinity` crate is gone (removed 2026-08-10). The socket read workers are pinned to one core (core 1 by default, never core 0) by `reader_runtime`, through `libc`; nothing has measured that the pin helps. | item must not add hot-path allocation |
+| Never slow/locked/hanged | DHAT ≤4 alloc blocks/8KB across 10K calls; Criterion p99 (CORRECTED 2026-10-12, TRU-2: bench-gate reads Criterion's MEDIAN against the budget, after merge and nightly only; no percentile is measured) ≤100ns; tick-gap >30s Telegram; ~~core_affinity Core 0~~ **⚠ CORRECTED 2026-10-11:** the `core_affinity` crate is gone (removed 2026-08-10). The socket read workers are pinned to one core (core 1 by default, never core 0) by `reader_runtime`, through `libc`; nothing has measured that the pin helps. | item must not add hot-path allocation |
 | QuestDB never fails | ABSORB via 3-tier rescue→spill→DLQ + schema self-heal | item must not break self-heal |
 | O(1) latency | `from_le_bytes` + ~~`papaya` + `Arc<HashMap>` + SPSC bounded~~; bench-gate ≤5% regression. **⚠ CORRECTED 2026-10-11:** hot-path lookups are a plain `HashMap` on the composite key (the aggregator rejects papaya on purpose); papaya is used only where other tasks read concurrently. The frame ring is a bounded channel with many producers (one per socket read task), not single-producer. A depth packet is O(levels), a tick packet O(1). | item adds Criterion bench if hot path |
 | Uniqueness + dedup | Composite `(security_id, exchange_segment)` per I-P1-11 + DEDUP UPSERT KEYS + meta-guard | item DEDUP key includes segment |
@@ -84,6 +89,10 @@ without the envelope qualifier = REJECT IN REVIEW.
 | `make wave-guarantee-check` | `Makefile` target | invokes the hook explicitly; CI gate |
 | Pre-PR gate | `.claude/hooks/pre-pr-gate.sh` | calls the matrix check before any PR opens |
 | `plan-verify.sh` | existing hook | extended to also check matrix presence |
+
+> **⚠ CORRECTED 2026-10-12:** of the rows above, only the Makefile target
+> calls the hook. `pre-pr-gate.sh` does not call it and no CI job runs it, so
+> "CI gate" and "fails the build at PR-merge" are not true today.
 
 ## Per-session automation (operator demand: every Claude session does everything automatically)
 

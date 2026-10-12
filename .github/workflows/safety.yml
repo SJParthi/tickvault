@@ -50,6 +50,12 @@ env:
   # a newer nightly to compile the sanitizer builds.
   NIGHTLY_VERSION: nightly-2026-05-19
 
+# Issue steps (2026-10-12, deep audit RUST-8): the twelve open / dedupe /
+# auto-close issue steps were ported off actions/github-script (inline
+# JavaScript) to the `gh` CLI, the same shape as fuzz.yml. Titles, labels
+# and the dedup rule (exact title over the 100 newest open `safety` issues)
+# are unchanged, so issues opened before the port still match. Step outputs
+# reach the script through `env:`, never spliced into it.
 jobs:
   # ---- cargo-careful: Extra debug checks ----
   #
@@ -126,32 +132,30 @@ jobs:
 
       - name: Auto-close cargo-careful build-failure issue on green build
         if: steps.build.outcome == 'success'
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v7
-        with:
-          script: |
-            const title = '⚠️ Safety Net: cargo-careful build failure (nightly compatibility)';
-            const { data: existing } = await github.rest.issues.listForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              state: 'open',
-              labels: 'safety',
-              per_page: 100,
-            });
-            const match = existing.find(i => i.title === title);
-            if (!match) { return; }
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: match.number,
-              body: `Auto-closed: cargo-careful builds clean on \`${process.env.NIGHTLY_VERSION || 'current pin'}\`.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
-            });
-            await github.rest.issues.update({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: match.number,
-              state: 'closed',
-              state_reason: 'completed',
-            });
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          WHAT: "cargo-careful builds clean"
+          TITLES: |-
+            ⚠️ Safety Net: cargo-careful build failure (nightly compatibility)
+        run: |
+          set -euo pipefail
+          open=$(gh issue list --state open --label safety --limit 100 \
+            --json number,title --template '{{range .}}{{.number}}{{"\t"}}{{.title}}{{"\n"}}{{end}}')
+          find_open() {
+            while IFS=$'\t' read -r n t; do
+              if [ "$t" = "$1" ]; then echo "$n"; break; fi
+            done < <(printf '%s\n' "$open")
+          }
+          while IFS= read -r title; do
+            num=$(find_open "$title")
+            if [ -z "$num" ]; then continue; fi
+            printf 'Auto-closed: %s on `%s`.\n\nSee: %s\n' \
+              "$WHAT" "${NIGHTLY_VERSION:-current pin}" "$RUN_URL" > /tmp/safety-close.md
+            gh issue comment "$num" --body-file /tmp/safety-close.md
+            gh issue close "$num" --reason completed
+          done <<< "$TITLES"
 
       - name: Run careful tests
         id: test
@@ -180,94 +184,90 @@ jobs:
 
       - name: Auto-close cargo-careful runtime issue on green run
         if: steps.test.outcome == 'success'
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v7
-        with:
-          script: |
-            const title = '🔴 Safety Net: cargo-careful found issues';
-            const { data: existing } = await github.rest.issues.listForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              state: 'open',
-              labels: 'safety',
-              per_page: 100,
-            });
-            const match = existing.find(i => i.title === title);
-            if (!match) { return; }
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: match.number,
-              body: `Auto-closed: cargo-careful green on \`${process.env.NIGHTLY_VERSION || 'current pin'}\`.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
-            });
-            await github.rest.issues.update({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: match.number,
-              state: 'closed',
-              state_reason: 'completed',
-            });
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          WHAT: "cargo-careful green"
+          TITLES: |-
+            🔴 Safety Net: cargo-careful found issues
+        run: |
+          set -euo pipefail
+          open=$(gh issue list --state open --label safety --limit 100 \
+            --json number,title --template '{{range .}}{{.number}}{{"\t"}}{{.title}}{{"\n"}}{{end}}')
+          find_open() {
+            while IFS=$'\t' read -r n t; do
+              if [ "$t" = "$1" ]; then echo "$n"; break; fi
+            done < <(printf '%s\n' "$open")
+          }
+          while IFS= read -r title; do
+            num=$(find_open "$title")
+            if [ -z "$num" ]; then continue; fi
+            printf 'Auto-closed: %s on `%s`.\n\nSee: %s\n' \
+              "$WHAT" "${NIGHTLY_VERSION:-current pin}" "$RUN_URL" > /tmp/safety-close.md
+            gh issue comment "$num" --body-file /tmp/safety-close.md
+            gh issue close "$num" --reason completed
+          done <<< "$TITLES"
 
       - name: Create issue on test failure (deduplicated)
         if: failure() && steps.test.outputs.test_failed == 'true'
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v7
-        with:
-          script: |
-            const title = '🔴 Safety Net: cargo-careful found issues';
-            const { data: existing } = await github.rest.issues.listForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              state: 'open',
-              labels: 'safety',
-              per_page: 100,
-            });
-            const duplicate = existing.find(i => i.title === title);
-            if (duplicate) {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: duplicate.number,
-                body: `Still reproducing as of ${new Date().toISOString()}.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
-              });
-              return;
-            }
-            await github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title,
-              body: `Weekly safety scan detected potential undefined behavior.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nThis requires investigation.`,
-              labels: ['bug', 'safety', 'critical'],
-            });
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TITLE: "🔴 Safety Net: cargo-careful found issues"
+        run: |
+          set -euo pipefail
+          open=$(gh issue list --state open --label safety --limit 100 \
+            --json number,title --template '{{range .}}{{.number}}{{"\t"}}{{.title}}{{"\n"}}{{end}}')
+          find_open() {
+            while IFS=$'\t' read -r n t; do
+              if [ "$t" = "$1" ]; then echo "$n"; break; fi
+            done < <(printf '%s\n' "$open")
+          }
+          num=$(find_open "$TITLE")
+          if [ -n "$num" ]; then
+            printf 'Still reproducing as of %s.\n\nSee: %s\n' \
+              "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$RUN_URL" > /tmp/safety-comment.md
+            gh issue comment "$num" --body-file /tmp/safety-comment.md
+            exit 0
+          fi
+          printf 'Weekly safety scan detected potential undefined behavior.\n\nSee: %s\n\nThis requires investigation.\n' \
+            "$RUN_URL" > /tmp/safety-body.md
+          gh issue create --title "$TITLE" --body-file /tmp/safety-body.md \
+            --label bug --label safety --label critical
 
       - name: Create issue on build failure (deduplicated)
         if: failure() && steps.build.outputs.build_failed == 'true'
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v7
-        with:
-          script: |
-            const title = '⚠️ Safety Net: cargo-careful build failure (nightly compatibility)';
-            const { data: existing } = await github.rest.issues.listForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              state: 'open',
-              labels: 'safety',
-              per_page: 100,
-            });
-            const duplicate = existing.find(i => i.title === title);
-            if (duplicate) {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: duplicate.number,
-                body: `Still failing as of ${new Date().toISOString()}.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
-              });
-              return;
-            }
-            await github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title,
-              body: `cargo-careful tests failed to **build** (not a test finding).\nTwo known causes: a nightly toolchain incompatibility (a compiler error in the log), or runner disk exhaustion ('No space left on device', or a linker 'Bus error'; see #1836).\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nTo fix: for a compiler error, update \`NIGHTLY_VERSION\` in \`.github/workflows/safety.yml\`; for disk exhaustion, free runner space the way the sanitizer jobs do.`,
-              labels: ['bug', 'safety'],
-            });
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TITLE: "⚠️ Safety Net: cargo-careful build failure (nightly compatibility)"
+        run: |
+          set -euo pipefail
+          open=$(gh issue list --state open --label safety --limit 100 \
+            --json number,title --template '{{range .}}{{.number}}{{"\t"}}{{.title}}{{"\n"}}{{end}}')
+          find_open() {
+            while IFS=$'\t' read -r n t; do
+              if [ "$t" = "$1" ]; then echo "$n"; break; fi
+            done < <(printf '%s\n' "$open")
+          }
+          num=$(find_open "$TITLE")
+          if [ -n "$num" ]; then
+            printf 'Still failing as of %s.\n\nSee: %s\n' \
+              "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$RUN_URL" > /tmp/safety-comment.md
+            gh issue comment "$num" --body-file /tmp/safety-comment.md
+            exit 0
+          fi
+          {
+            printf '%s\n' 'cargo-careful tests failed to **build** (not a test finding).' \
+              "Two known causes: a nightly toolchain incompatibility (a compiler error in the log), or runner disk exhaustion ('No space left on device', or a linker 'Bus error'; see #1836)."
+            printf '\nSee: %s\n\n' "$RUN_URL"
+            printf '%s\n' 'To fix: for a compiler error, update `NIGHTLY_VERSION` in `.github/workflows/safety.yml`; for disk exhaustion, free runner space the way the sanitizer jobs do.'
+          } > /tmp/safety-body.md
+          gh issue create --title "$TITLE" --body-file /tmp/safety-body.md \
+            --label bug --label safety
 
   # ---- AddressSanitizer: Memory safety ----
   #
@@ -362,32 +362,30 @@ jobs:
 
       - name: Auto-close ASan build-failure issue on green build
         if: steps.build.outcome == 'success'
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v7
-        with:
-          script: |
-            const title = '⚠️ Safety Net: ASan build failure (nightly compatibility)';
-            const { data: existing } = await github.rest.issues.listForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              state: 'open',
-              labels: 'safety',
-              per_page: 100,
-            });
-            const match = existing.find(i => i.title === title);
-            if (!match) { return; }
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: match.number,
-              body: `Auto-closed: ASan builds clean on \`${process.env.NIGHTLY_VERSION || 'current pin'}\`.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
-            });
-            await github.rest.issues.update({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: match.number,
-              state: 'closed',
-              state_reason: 'completed',
-            });
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          WHAT: "ASan builds clean"
+          TITLES: |-
+            ⚠️ Safety Net: ASan build failure (nightly compatibility)
+        run: |
+          set -euo pipefail
+          open=$(gh issue list --state open --label safety --limit 100 \
+            --json number,title --template '{{range .}}{{.number}}{{"\t"}}{{.title}}{{"\n"}}{{end}}')
+          find_open() {
+            while IFS=$'\t' read -r n t; do
+              if [ "$t" = "$1" ]; then echo "$n"; break; fi
+            done < <(printf '%s\n' "$open")
+          }
+          while IFS= read -r title; do
+            num=$(find_open "$title")
+            if [ -z "$num" ]; then continue; fi
+            printf 'Auto-closed: %s on `%s`.\n\nSee: %s\n' \
+              "$WHAT" "${NIGHTLY_VERSION:-current pin}" "$RUN_URL" > /tmp/safety-close.md
+            gh issue comment "$num" --body-file /tmp/safety-close.md
+            gh issue close "$num" --reason completed
+          done <<< "$TITLES"
 
       - name: Run tests with AddressSanitizer
         id: test
@@ -469,113 +467,105 @@ jobs:
 
       - name: Auto-close ASan runtime issue on green run
         if: steps.test.outcome == 'success'
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v7
-        with:
-          script: |
-            // Close BOTH the real-finding title and the honest
-            // no-report-lane-failure title on a green run.
-            const titles = [
-              '🔴 Safety Net: AddressSanitizer found memory issues',
-              'safety: ASan lane failed (no sanitizer report — test/build failure)',
-            ];
-            const { data: existing } = await github.rest.issues.listForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              state: 'open',
-              labels: 'safety',
-              per_page: 100,
-            });
-            for (const title of titles) {
-              const match = existing.find(i => i.title === title);
-              if (!match) { continue; }
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: match.number,
-                body: `Auto-closed: ASan green on \`${process.env.NIGHTLY_VERSION || 'current pin'}\`.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
-              });
-              await github.rest.issues.update({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: match.number,
-                state: 'closed',
-                state_reason: 'completed',
-              });
-            }
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          WHAT: "ASan green"
+          TITLES: |-
+            🔴 Safety Net: AddressSanitizer found memory issues
+            safety: ASan lane failed (no sanitizer report — test/build failure)
+        run: |
+          set -euo pipefail
+          open=$(gh issue list --state open --label safety --limit 100 \
+            --json number,title --template '{{range .}}{{.number}}{{"\t"}}{{.title}}{{"\n"}}{{end}}')
+          find_open() {
+            while IFS=$'\t' read -r n t; do
+              if [ "$t" = "$1" ]; then echo "$n"; break; fi
+            done < <(printf '%s\n' "$open")
+          }
+          while IFS= read -r title; do
+            num=$(find_open "$title")
+            if [ -z "$num" ]; then continue; fi
+            printf 'Auto-closed: %s on `%s`.\n\nSee: %s\n' \
+              "$WHAT" "${NIGHTLY_VERSION:-current pin}" "$RUN_URL" > /tmp/safety-close.md
+            gh issue comment "$num" --body-file /tmp/safety-close.md
+            gh issue close "$num" --reason completed
+          done <<< "$TITLES"
 
       - name: Create issue on test failure (deduplicated)
         if: failure() && steps.test.outputs.test_failed == 'true'
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v7
-        with:
-          script: |
-            // Honest filing (#1495): only claim "found memory issues" when
-            // the captured log carries a real `ERROR: AddressSanitizer`
-            // banner; a plain test failure under the sanitizer build gets
-            // an honest title instead.
-            const hasReport = '${{ steps.test.outputs.sanitizer_report }}' === 'true';
-            const failedCrates = '${{ steps.test.outputs.failed_crates }}' || 'unknown';
-            const title = hasReport
-              ? '🔴 Safety Net: AddressSanitizer found memory issues'
-              : 'safety: ASan lane failed (no sanitizer report — test/build failure)';
-            const detail = hasReport
-              ? 'Weekly safety scan detected memory safety issues (use-after-free, buffer overflow, etc.).\n\nThis requires immediate investigation.'
-              : 'The ASan job failed, but the captured test log contains NO `ERROR: AddressSanitizer` banner — this is a plain test (or harness) failure under the sanitizer build, NOT a memory-safety finding. Fix the failing test; the sanitizer itself reported nothing.';
-            const labels = hasReport ? ['bug', 'safety', 'critical'] : ['bug', 'safety'];
-            const { data: existing } = await github.rest.issues.listForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              state: 'open',
-              labels: 'safety',
-              per_page: 100,
-            });
-            const duplicate = existing.find(i => i.title === title);
-            if (duplicate) {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: duplicate.number,
-                body: `Still reproducing as of ${new Date().toISOString()} (failed crates: ${failedCrates}).\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
-              });
-              return;
-            }
-            await github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title,
-              body: `${detail}\n\nFailed crates: ${failedCrates}\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
-              labels,
-            });
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # Step outputs travel through env, never spliced into the script.
+          SANITIZER_REPORT: ${{ steps.test.outputs.sanitizer_report }}
+          FAILED_CRATES: ${{ steps.test.outputs.failed_crates }}
+        run: |
+          set -euo pipefail
+          # Honest filing (#1495): only claim a memory-safety finding when the
+          # captured log carries a real `ERROR: AddressSanitizer` banner;
+          # a plain test failure under the sanitizer build gets an honest
+          # title instead.
+          crates="${FAILED_CRATES:-unknown}"
+          if [ "${SANITIZER_REPORT:-}" = "true" ]; then
+            TITLE='🔴 Safety Net: AddressSanitizer found memory issues'
+            detail='Weekly safety scan detected memory safety issues (use-after-free, buffer overflow, etc.).\n\nThis requires immediate investigation.'
+            labels=(--label bug --label safety --label critical)
+          else
+            TITLE='safety: ASan lane failed (no sanitizer report — test/build failure)'
+            detail='The ASan job failed, but the captured test log contains NO `ERROR: AddressSanitizer` banner — this is a plain test (or harness) failure under the sanitizer build, NOT a memory-safety finding. Fix the failing test; the sanitizer itself reported nothing.'
+            labels=(--label bug --label safety)
+          fi
+          open=$(gh issue list --state open --label safety --limit 100 \
+            --json number,title --template '{{range .}}{{.number}}{{"\t"}}{{.title}}{{"\n"}}{{end}}')
+          find_open() {
+            while IFS=$'\t' read -r n t; do
+              if [ "$t" = "$1" ]; then echo "$n"; break; fi
+            done < <(printf '%s\n' "$open")
+          }
+          num=$(find_open "$TITLE")
+          if [ -n "$num" ]; then
+            printf 'Still reproducing as of %s (failed crates: %s).\n\nSee: %s\n' \
+              "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$crates" "$RUN_URL" > /tmp/safety-comment.md
+            gh issue comment "$num" --body-file /tmp/safety-comment.md
+            exit 0
+          fi
+          printf '%b\n\nFailed crates: %s\n\nSee: %s\n' "$detail" "$crates" "$RUN_URL" > /tmp/safety-body.md
+          gh issue create --title "$TITLE" --body-file /tmp/safety-body.md "${labels[@]}"
 
       - name: Create issue on build failure (deduplicated)
         if: failure() && steps.build.outputs.build_failed == 'true'
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v7
-        with:
-          script: |
-            const title = '⚠️ Safety Net: ASan build failure (nightly compatibility)';
-            const { data: existing } = await github.rest.issues.listForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              state: 'open',
-              labels: 'safety',
-              per_page: 100,
-            });
-            const duplicate = existing.find(i => i.title === title);
-            if (duplicate) {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: duplicate.number,
-                body: `Still failing as of ${new Date().toISOString()}.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
-              });
-              return;
-            }
-            await github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title,
-              body: `AddressSanitizer tests failed to **build** (not a runtime finding).\nTwo known causes: a nightly toolchain incompatibility (a compiler error in the log), or runner disk exhaustion ('No space left on device', or a linker 'Bus error'; see #1836).\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nTo fix: for a compiler error, update \`NIGHTLY_VERSION\` in \`.github/workflows/safety.yml\`; for disk exhaustion, check the \"Report runner disk\" step and shrink the build or free more space.`,
-              labels: ['bug', 'safety'],
-            });
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TITLE: "⚠️ Safety Net: ASan build failure (nightly compatibility)"
+        run: |
+          set -euo pipefail
+          open=$(gh issue list --state open --label safety --limit 100 \
+            --json number,title --template '{{range .}}{{.number}}{{"\t"}}{{.title}}{{"\n"}}{{end}}')
+          find_open() {
+            while IFS=$'\t' read -r n t; do
+              if [ "$t" = "$1" ]; then echo "$n"; break; fi
+            done < <(printf '%s\n' "$open")
+          }
+          num=$(find_open "$TITLE")
+          if [ -n "$num" ]; then
+            printf 'Still failing as of %s.\n\nSee: %s\n' \
+              "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$RUN_URL" > /tmp/safety-comment.md
+            gh issue comment "$num" --body-file /tmp/safety-comment.md
+            exit 0
+          fi
+          {
+            printf '%s\n' 'AddressSanitizer tests failed to **build** (not a runtime finding).' \
+              "Two known causes: a nightly toolchain incompatibility (a compiler error in the log), or runner disk exhaustion ('No space left on device', or a linker 'Bus error'; see #1836)."
+            printf '\nSee: %s\n\n' "$RUN_URL"
+            printf '%s\n' 'To fix: for a compiler error, update `NIGHTLY_VERSION` in `.github/workflows/safety.yml`; for disk exhaustion, check the "Report runner disk" step and shrink the build or free more space.'
+          } > /tmp/safety-body.md
+          gh issue create --title "$TITLE" --body-file /tmp/safety-body.md \
+            --label bug --label safety
 
   # ---- ThreadSanitizer: Data races ----
   # Runner disk: same three mitigations as the ASan job, for the same reason
@@ -645,32 +635,30 @@ jobs:
 
       - name: Auto-close TSan build-failure issue on green build
         if: steps.build.outcome == 'success'
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v7
-        with:
-          script: |
-            const title = '⚠️ Safety Net: TSan build failure (nightly compatibility)';
-            const { data: existing } = await github.rest.issues.listForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              state: 'open',
-              labels: 'safety',
-              per_page: 100,
-            });
-            const match = existing.find(i => i.title === title);
-            if (!match) { return; }
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: match.number,
-              body: `Auto-closed: TSan builds clean on \`${process.env.NIGHTLY_VERSION || 'current pin'}\`.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
-            });
-            await github.rest.issues.update({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: match.number,
-              state: 'closed',
-              state_reason: 'completed',
-            });
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          WHAT: "TSan builds clean"
+          TITLES: |-
+            ⚠️ Safety Net: TSan build failure (nightly compatibility)
+        run: |
+          set -euo pipefail
+          open=$(gh issue list --state open --label safety --limit 100 \
+            --json number,title --template '{{range .}}{{.number}}{{"\t"}}{{.title}}{{"\n"}}{{end}}')
+          find_open() {
+            while IFS=$'\t' read -r n t; do
+              if [ "$t" = "$1" ]; then echo "$n"; break; fi
+            done < <(printf '%s\n' "$open")
+          }
+          while IFS= read -r title; do
+            num=$(find_open "$title")
+            if [ -z "$num" ]; then continue; fi
+            printf 'Auto-closed: %s on `%s`.\n\nSee: %s\n' \
+              "$WHAT" "${NIGHTLY_VERSION:-current pin}" "$RUN_URL" > /tmp/safety-close.md
+            gh issue comment "$num" --body-file /tmp/safety-close.md
+            gh issue close "$num" --reason completed
+          done <<< "$TITLES"
 
       - name: Run tests with ThreadSanitizer
         id: test
@@ -768,110 +756,102 @@ jobs:
 
       - name: Auto-close TSan runtime issue on green run
         if: steps.test.outcome == 'success'
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v7
-        with:
-          script: |
-            // Close BOTH the real-finding title and the honest
-            // no-report-lane-failure title on a green run.
-            const titles = [
-              '🔴 Safety Net: ThreadSanitizer found data races',
-              'safety: TSan lane failed (no sanitizer report — test/build failure)',
-            ];
-            const { data: existing } = await github.rest.issues.listForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              state: 'open',
-              labels: 'safety',
-              per_page: 100,
-            });
-            for (const title of titles) {
-              const match = existing.find(i => i.title === title);
-              if (!match) { continue; }
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: match.number,
-                body: `Auto-closed: TSan green on \`${process.env.NIGHTLY_VERSION || 'current pin'}\`.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
-              });
-              await github.rest.issues.update({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: match.number,
-                state: 'closed',
-                state_reason: 'completed',
-              });
-            }
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          WHAT: "TSan green"
+          TITLES: |-
+            🔴 Safety Net: ThreadSanitizer found data races
+            safety: TSan lane failed (no sanitizer report — test/build failure)
+        run: |
+          set -euo pipefail
+          open=$(gh issue list --state open --label safety --limit 100 \
+            --json number,title --template '{{range .}}{{.number}}{{"\t"}}{{.title}}{{"\n"}}{{end}}')
+          find_open() {
+            while IFS=$'\t' read -r n t; do
+              if [ "$t" = "$1" ]; then echo "$n"; break; fi
+            done < <(printf '%s\n' "$open")
+          }
+          while IFS= read -r title; do
+            num=$(find_open "$title")
+            if [ -z "$num" ]; then continue; fi
+            printf 'Auto-closed: %s on `%s`.\n\nSee: %s\n' \
+              "$WHAT" "${NIGHTLY_VERSION:-current pin}" "$RUN_URL" > /tmp/safety-close.md
+            gh issue comment "$num" --body-file /tmp/safety-close.md
+            gh issue close "$num" --reason completed
+          done <<< "$TITLES"
 
       - name: Create issue on test failure (deduplicated)
         if: failure() && steps.test.outputs.test_failed == 'true'
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v7
-        with:
-          script: |
-            // Honest filing (#1495): only claim "found data races" when the
-            // captured log carries a real `WARNING: ThreadSanitizer` banner;
-            // a plain test failure under the sanitizer build gets an honest
-            // title instead.
-            const hasReport = '${{ steps.test.outputs.sanitizer_report }}' === 'true';
-            const failedCrates = '${{ steps.test.outputs.failed_crates }}' || 'unknown';
-            const title = hasReport
-              ? '🔴 Safety Net: ThreadSanitizer found data races'
-              : 'safety: TSan lane failed (no sanitizer report — test/build failure)';
-            const detail = hasReport
-              ? 'Weekly safety scan detected data race conditions.\n\nThis requires investigation — data races in trading systems can cause incorrect fills.'
-              : 'The TSan job failed, but the captured test log contains NO `WARNING: ThreadSanitizer` banner — this is a plain test (or harness) failure under the sanitizer build, NOT a data-race finding. Fix the failing test; the sanitizer itself reported nothing.';
-            const labels = hasReport ? ['bug', 'safety', 'critical'] : ['bug', 'safety'];
-            const { data: existing } = await github.rest.issues.listForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              state: 'open',
-              labels: 'safety',
-              per_page: 100,
-            });
-            const duplicate = existing.find(i => i.title === title);
-            if (duplicate) {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: duplicate.number,
-                body: `Still reproducing as of ${new Date().toISOString()} (failed crates: ${failedCrates}).\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
-              });
-              return;
-            }
-            await github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title,
-              body: `${detail}\n\nFailed crates: ${failedCrates}\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
-              labels,
-            });
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # Step outputs travel through env, never spliced into the script.
+          SANITIZER_REPORT: ${{ steps.test.outputs.sanitizer_report }}
+          FAILED_CRATES: ${{ steps.test.outputs.failed_crates }}
+        run: |
+          set -euo pipefail
+          # Honest filing (#1495): only claim a data-race finding when the
+          # captured log carries a real `WARNING: ThreadSanitizer` banner;
+          # a plain test failure under the sanitizer build gets an honest
+          # title instead.
+          crates="${FAILED_CRATES:-unknown}"
+          if [ "${SANITIZER_REPORT:-}" = "true" ]; then
+            TITLE='🔴 Safety Net: ThreadSanitizer found data races'
+            detail='Weekly safety scan detected data race conditions.\n\nThis requires investigation — data races in trading systems can cause incorrect fills.'
+            labels=(--label bug --label safety --label critical)
+          else
+            TITLE='safety: TSan lane failed (no sanitizer report — test/build failure)'
+            detail='The TSan job failed, but the captured test log contains NO `WARNING: ThreadSanitizer` banner — this is a plain test (or harness) failure under the sanitizer build, NOT a data-race finding. Fix the failing test; the sanitizer itself reported nothing.'
+            labels=(--label bug --label safety)
+          fi
+          open=$(gh issue list --state open --label safety --limit 100 \
+            --json number,title --template '{{range .}}{{.number}}{{"\t"}}{{.title}}{{"\n"}}{{end}}')
+          find_open() {
+            while IFS=$'\t' read -r n t; do
+              if [ "$t" = "$1" ]; then echo "$n"; break; fi
+            done < <(printf '%s\n' "$open")
+          }
+          num=$(find_open "$TITLE")
+          if [ -n "$num" ]; then
+            printf 'Still reproducing as of %s (failed crates: %s).\n\nSee: %s\n' \
+              "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$crates" "$RUN_URL" > /tmp/safety-comment.md
+            gh issue comment "$num" --body-file /tmp/safety-comment.md
+            exit 0
+          fi
+          printf '%b\n\nFailed crates: %s\n\nSee: %s\n' "$detail" "$crates" "$RUN_URL" > /tmp/safety-body.md
+          gh issue create --title "$TITLE" --body-file /tmp/safety-body.md "${labels[@]}"
 
       - name: Create issue on build failure (deduplicated)
         if: failure() && steps.build.outputs.build_failed == 'true'
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v7
-        with:
-          script: |
-            const title = '⚠️ Safety Net: TSan build failure (nightly compatibility)';
-            const { data: existing } = await github.rest.issues.listForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              state: 'open',
-              labels: 'safety',
-              per_page: 100,
-            });
-            const duplicate = existing.find(i => i.title === title);
-            if (duplicate) {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: duplicate.number,
-                body: `Still failing as of ${new Date().toISOString()}.\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
-              });
-              return;
-            }
-            await github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title,
-              body: `ThreadSanitizer tests failed to **build** (not a runtime finding).\nTwo known causes: a nightly toolchain incompatibility (a compiler error in the log), or runner disk exhaustion ('No space left on device', or a linker 'Bus error'; see #1836).\n\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nTo fix: for a compiler error, update \`NIGHTLY_VERSION\` in \`.github/workflows/safety.yml\`; for disk exhaustion, check the \"Report runner disk\" step and shrink the build or free more space.`,
-              labels: ['bug', 'safety'],
-            });
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TITLE: "⚠️ Safety Net: TSan build failure (nightly compatibility)"
+        run: |
+          set -euo pipefail
+          open=$(gh issue list --state open --label safety --limit 100 \
+            --json number,title --template '{{range .}}{{.number}}{{"\t"}}{{.title}}{{"\n"}}{{end}}')
+          find_open() {
+            while IFS=$'\t' read -r n t; do
+              if [ "$t" = "$1" ]; then echo "$n"; break; fi
+            done < <(printf '%s\n' "$open")
+          }
+          num=$(find_open "$TITLE")
+          if [ -n "$num" ]; then
+            printf 'Still failing as of %s.\n\nSee: %s\n' \
+              "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$RUN_URL" > /tmp/safety-comment.md
+            gh issue comment "$num" --body-file /tmp/safety-comment.md
+            exit 0
+          fi
+          {
+            printf '%s\n' 'ThreadSanitizer tests failed to **build** (not a runtime finding).' \
+              "Two known causes: a nightly toolchain incompatibility (a compiler error in the log), or runner disk exhaustion ('No space left on device', or a linker 'Bus error'; see #1836)."
+            printf '\nSee: %s\n\n' "$RUN_URL"
+            printf '%s\n' 'To fix: for a compiler error, update `NIGHTLY_VERSION` in `.github/workflows/safety.yml`; for disk exhaustion, check the "Report runner disk" step and shrink the build or free more space.'
+          } > /tmp/safety-body.md
+          gh issue create --title "$TITLE" --body-file /tmp/safety-body.md \
+            --label bug --label safety

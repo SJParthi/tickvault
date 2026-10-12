@@ -124,3 +124,24 @@ aws-lambdas = 81.1
 # measurement lands.
 # 2026-07-20: 80.0 -> 87.3 (this IS the ratchet promised above - first CI measurement 87.64 on both runs; PR #1694).
 tickvault-logs-mcp = 87.3
+
+# ----------------------------------------------------------------------
+# Per-FILE floors (2026-10-12, deep audit PROOF-12). Read by the Rust bin
+# `coverage_file_floors` (crates/common/src/bin/coverage_file_floors.rs);
+# scripts/coverage-gate.sh skips this table. Keys are repo-relative paths,
+# quoted; values are line coverage floors with at most two decimals,
+# compared exactly (a file at its floor passes). A listed file below its
+# floor, or missing from the report, makes the bin exit 1.
+#
+# NOT YET RUN IN CI: the Coverage & Perf job would have to build common a
+# second time, uninstrumented, in a job with a history of running out of
+# runner disk (see the note in ci.yml). Until a cheap way to run it there
+# is chosen, run it by hand on the uploaded coverage-report artifact.
+#
+# EMPTY ON PURPOSE: no CI coverage report was available when the table was
+# added. Seed each floor from the bin's "Largest 15 files" report
+# (measured, rounded down to one decimal, minus 0.3), first for
+# crates/app/src/main.rs, crates/app/src/dhan_feed_stack.rs and
+# crates/app/src/dhan_live_crossverify.rs. Floors may only move up.
+# ----------------------------------------------------------------------
+[files]

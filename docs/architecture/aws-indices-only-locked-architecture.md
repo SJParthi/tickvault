@@ -399,7 +399,7 @@ The operator demanded these are NEVER compromised. Checking at 4-SID scope:
 > - Zero data loss bounded by the 200,000-seal ring (`SEAL_BUFFER_CAPACITY`) → NDJSON spill → DLQ _(2026-07-18: the 100K tick rescue ring was deleted with the dead tick writer, stage-4 sweep — the seal chain is the live absorption tier)_.
 > - WebSocket detect-and-reconnect ≤5s; sleep-until-open post-close; SubscribeRxGuard preserves subscriptions across reconnects.
 > - QuestDB outage absorbed up to ring capacity; CloudWatch alarm fires within 30s of disconnect; operator paged via SMS+Telegram+Email simultaneously.
-> - Hot path O(1) per yata indicator update; bench-gated ≤100ns p99.
+> - Hot path O(1) per yata indicator update; bench-gated ≤100ns p99 (CORRECTED 2026-10-12, TRU-2: bench-gate reads Criterion's MEDIAN against the budget, after merge and nightly only; no percentile is measured).
 > - Composite (security_id, exchange_segment) uniqueness preserved (degenerate at 4 IDX_I SIDs but invariant holds).
 > - CloudWatch detection latency ≤60s for all 12 worst-case scenarios in `aws-daily-lifecycle.md` §3.
 > - AWS ap-south-1 99.99% regional SLA = ~4.3 minutes/month expected downtime envelope.
@@ -796,7 +796,7 @@ Per operator-charter §F honest envelope:
 When the BRUTEX work lands, add these tests:
 
 1. `crates/trading/tests/strategy_load_ratchet.rs` — measures total RAM with 20 mock strategies; fails build if > 5 MB
-2. `crates/trading/benches/strategy_eval_p99.rs` — Criterion bench; per-eval p99 ≤ 100 µs; fails build at >5% regression
+2. `crates/trading/benches/strategy_eval_p99.rs` — Criterion bench; per-eval p99 (CORRECTED 2026-10-12, TRU-2: bench-gate reads Criterion's MEDIAN against the budget, after merge and nightly only; no percentile is measured) ≤ 100 µs; fails build at >5% regression
 3. `crates/storage/tests/cpu_credit_budget_alarm_guard.rs` — pins the `tv-cpu-credit-low` CloudWatch alarm name + threshold (=50)
 
 ---
