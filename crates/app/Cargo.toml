@@ -107,6 +107,10 @@ default = []
 name = "order_gate"
 harness = false
 
+[[bench]]
+name = "feed_drain"
+harness = false
+
 [package.metadata.cargo-machete]
 ignored = ["chrono-tz", "clap", "signal-hook"]
 
