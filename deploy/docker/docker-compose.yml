@@ -1,24 +1,24 @@
 # =============================================================================
 # tickvault — Docker Compose
 # =============================================================================
-# Same file on Mac dev and AWS prod (t4g.medium ARM Graviton2, 2 vCPUs / 4 GiB,
-# operator-lock 2026-07-15 Quote 8 in daily-universe-scope-expansion-2026-05-27.md §7).
+# Same file on Mac dev and AWS prod. Prod host: r8g.xlarge (ARM Graviton4,
+# 4 vCPUs / 32 GiB), multi-AZ, per operator Quote 13 (2026-08-08) in
+# daily-universe-scope-expansion-2026-05-27.md §7.
 #
-# Post-CloudWatch-only migration (#O1/#O2/#O3/#O4), Groww-only ~770-SID universe.
-#   Compose default QDB_MEM_LIMIT=12g — the r8g.xlarge 32 GiB host (operator
-#   Quote 13, 2026-08-08), per §7 Rule 2: QuestDB 8–16 GB + resident ticks
-#   2.3–7.2 GB + app 2–4 GB + OS/FS-cache 2–4 GB = ~14–31 GB of 32 GiB.
+# QuestDB memory (rewritten 2026-10-12, deep audit QDB-11):
+#   Compose default QDB_MEM_LIMIT=12g. On the box, EVERY deploy derives the
+#   value (deploy-aws.yml, the questdb-mem step): 40% of the host MemTotal,
+#   clamped to 1..12g, written into the on-box deploy/docker/.env, and
+#   tv-questdb is recreated when it changed. So the 32 GiB box runs 12g and
+#   a smaller host gets a smaller cap with no manual step. The audit measured
+#   a QuestDB working set of about 4.17 GiB, so disk throughput, not memory,
+#   is the bound.
 #   History: 4g on r8g.large (2026-07-01 → 2026-07-15), then 1g on the
-#   t4g.medium downsize (2026-07-15 → 2026-08-10).
+#   t4g.medium downsize (2026-07-15 → 2026-08-10, Quote 8), then 12g.
 #
-#   ⚠ THE REPO CHANGE ALONE DOES NOT RETUNE THE BOX. The on-box
-#   deploy/docker/.env OVERRIDES this default, and it was written to 1g by
-#   the downsize workflow's SSM step. Until
-#   `scripts/aws-upgrade-instance.sh --qdb-mem 12g --apply-ssm` runs against
-#   the live instance, prod QuestDB stays at 1g regardless of this file.
-#   Note also that `.github/workflows/downsize-instance.yml` still hard-
-#   asserts 1073741824 and will FAIL against a 12g box — that workflow is a
-#   t4g.medium-era tool and must not be dispatched at the current lock.
+#   ⚠ `.github/workflows/downsize-instance.yml` still hard-asserts
+#   1073741824 and will FAIL against a 12g box. It is a t4g.medium-era tool
+#   and must not be dispatched at the current lock.
 #
 # REMOVED (CloudWatch-only migration):
 #   - Grafana       -> CloudWatch Dashboards (#O1)
@@ -229,6 +229,19 @@ services:
       QDB_LOG_W_STDOUT_LEVEL: ERROR
       QDB_TELEMETRY_ENABLED: "false"
       QDB_METRICS_ENABLED: "TRUE"
+      # --- Commit mode (2026-10-12, deep audit QDB-7) ---
+      # cairo.commit.mode is LEFT at QuestDB's default, nosync, ON PURPOSE: an
+      # ILP 2xx means the rows reached the page cache, not the disk. sync was
+      # MEASURED on 2026-10-02 and rejected (a 1,000-row tick flush went from
+      # p50 3.3 ms to 21-26 ms, a 10,000-row depth flush from 14 ms to
+      # 37-42 ms). Durability across a host crash comes from the app instead:
+      # the persisted applied watermark trails acks by
+      # WATERMARK_DURABILITY_LAG_SECS (60 s, wal_applied_watermark.rs), so the
+      # WAL replays anything the kernel had not yet written back. The lag and
+      # row-cap settings below shape WAL apply only, not ack durability. Not
+      # pinned here as an env var: adding one would recreate tv-questdb on the
+      # next deploy for no behaviour change.
+      #
       # --- WAL / writer tuning ---
       #
       # Every value below was VERIFIED against the running container on

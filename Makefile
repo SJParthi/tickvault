@@ -14,7 +14,7 @@
         audit coverage bench geiger typos quality doc bootstrap scoped-check full-qa parity-soak \
         lambda-test \
         dispatch dispatch-readonly dispatch-status dispatch-logs dispatch-check dispatch-audit \
-        cross-verify-show cross-verify-now prev-day-show \
+        cross-verify-show cross-verify-now prev-day-show wave-guarantee-check \
 
 # ---- Configuration ----
 APP_NAME       := tickvault
@@ -524,8 +524,8 @@ dispatch-check: ## Common preset — ask Claude to run the full health check
 dispatch-audit: ## Common preset — ask Claude to run the 100% audit
 	@$(MAKE) dispatch MSG="run scripts/100pct-audit.sh and post PASS/GAP counts + any GAPs as the step summary"
 
-verify-option-chain-minute-snapshot: ## 7-query verification of the option-chain minute-snapshot pipeline (PR #5 of 5)
-	@bash scripts/verify-option-chain-minute-snapshot.sh
+wave-guarantee-check: ## 15-row + 7-row guarantee matrix check over every active plan (per-wave-guarantee-matrix.md)
+	@bash .claude/hooks/per-item-guarantee-check.sh
 
 # ---- Post-market 1-minute cross-verification (operator visibility) ----
 cross-verify-show: ## Show the latest post-market cross-verify CSV (where a human looks)

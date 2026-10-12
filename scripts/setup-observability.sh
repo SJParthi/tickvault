@@ -363,7 +363,7 @@ if curl -sf --max-time 1 "http://169.254.169.254/latest/meta-data/" >/dev/null 2
         echo ""
         echo -e "${YELLOW}═══════════════════════════════════════════════════════════════${NC}"
         echo -e "${YELLOW}  ACTION NEEDED: External health alarms not configured.${NC}"
-        echo -e "${YELLOW}  Run: ./scripts/setup-cloudwatch-alarms.sh --env ${SSM_ENV}${NC}"
+        echo -e "${YELLOW}  Apply terraform (deploy/aws/terraform/alarms.tf)${NC}"
         echo -e "${YELLOW}  Covers: EC2 instance death + Docker daemon crash → SMS${NC}"
         echo -e "${YELLOW}═══════════════════════════════════════════════════════════════${NC}"
         echo ""

@@ -41,9 +41,11 @@ on:
   workflow_dispatch:
     inputs:
       confirm_market_hours:
-        description: 'Deploying during market hours? Type "yes" to override the guard.'
+        description: 'Deploying during market hours? Choose "yes" to override the guard.'
         required: false
         default: 'no'
+        type: choice
+        options: ['no', 'yes']
   push:
     branches: [main]
     paths:
@@ -420,6 +422,10 @@ jobs:
     steps:
       - name: Check current IST time against market window
         id: window
+        # SEC-7 (2026-10-12): a dispatch input reaches the script through env,
+        # never as an inline expression the runner pastes into the script.
+        env:
+          CONFIRM_MARKET_HOURS: ${{ github.event.inputs.confirm_market_hours }}
         run: |
           # No-deploy band 09:00-15:45 IST = 03:30-10:15 UTC (operator lock
           # 2026-06-03: "only between 9 am till 3.45 pm it should not happen").
@@ -433,7 +439,7 @@ jobs:
 
           # No-deploy window in UTC: 0330 (09:00 IST) to 1015 (15:45 IST)
           if [ "$UTC_DOW" -le 5 ] && [ "$UTC_TIME_NUM" -ge 330 ] && [ "$UTC_TIME_NUM" -lt 1015 ]; then
-            if [ "${{ github.event.inputs.confirm_market_hours }}" = "yes" ]; then
+            if [ "${CONFIRM_MARKET_HOURS:-no}" = "yes" ]; then
               echo "WARNING: deploying during market hours with explicit override"
             elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
               # An explicit human/dispatcher action asked for an in-window
@@ -861,9 +867,11 @@ jobs:
         # intentional defer, not a failure) while keeping the run non-success
         # so the cron re-fires. The manual override path stays open via
         # workflow_dispatch confirm_market_hours=yes (same as the start guard).
+        env:
+          CONFIRM_MARKET_HOURS: ${{ github.event.inputs.confirm_market_hours }}
         run: |
           set -uo pipefail
-          if [ "${{ github.event.inputs.confirm_market_hours }}" = "yes" ]; then
+          if [ "${CONFIRM_MARKET_HOURS:-no}" = "yes" ]; then
             echo "operator override (confirm_market_hours=yes) — proceeding with swap during market hours"
             exit 0
           fi

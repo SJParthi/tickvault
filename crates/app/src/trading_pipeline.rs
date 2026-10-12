@@ -4,6 +4,14 @@
 //! a separate tokio task, consuming ticks from a broadcast channel (cold path,
 //! does NOT pollute the hot tick processor).
 //!
+//! # DORMANT (2026-10-12, deep audit DYN-4)
+//! `spawn_trading_pipeline` has NO production caller: every call is in a
+//! test (pinned by `order_side_wiring_guard.rs`, recorded in
+//! `order_observability.rs`). So nothing in a running process consumes ticks
+//! here, and `StrategyHotReloader` is reached only from tests: no strategy is
+//! evaluated or reloaded live today. The text below describes the pipeline as
+//! it will run once it is wired again.
+//!
 //! # Safety: Paper Trading Only
 //! The OMS operates in `dry_run = true` mode by default. No real HTTP calls
 //! are ever made to Dhan. All orders are simulated with PAPER-xxx IDs.

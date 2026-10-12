@@ -316,13 +316,13 @@ impl From<&ArchivedIndexCategory> for IndexCategory {
 
 /// Reconstruct a `NaiveDate` from an archived rkyv `i32_le` (days from CE).
 ///
-/// # Safety contract
-/// The caller must ensure the `i32_le` value was produced by [`NaiveDateAsI32`]
-/// serialization of a valid `NaiveDate`.
-#[allow(clippy::expect_used)] // APPROVED: archived value validated at cache write time
-pub fn naive_date_from_archived_i32(days: &rkyv::rend::i32_le) -> NaiveDate {
+/// Returns `None` for a day count chrono cannot represent (a corrupt or
+/// foreign archive). Before 2026-10-12 (deep audit CR-9) this was an
+/// `expect`, which under the release profile's `panic = "abort"` would end
+/// the process on one bad cached date; the only caller stores the result in
+/// an `Option<NaiveDate>` field, so `None` is the honest value.
+pub fn naive_date_from_archived_i32(days: &rkyv::rend::i32_le) -> Option<NaiveDate> {
     NaiveDate::from_num_days_from_ce_opt((*days).into())
-        .expect("valid days-from-CE in validated rkyv archive") // APPROVED: archived value validated at cache write time
 }
 
 /// A subscribed index — one of the 31 documented indices.
@@ -1834,7 +1834,16 @@ mod tests {
         let date = chrono::NaiveDate::from_ymd_opt(2026, 3, 20).unwrap();
         let days = rkyv::rend::i32_le::from_native(date.num_days_from_ce());
         let result = naive_date_from_archived_i32(&days);
-        assert_eq!(result, date);
+        assert_eq!(result, Some(date));
+    }
+
+    #[test]
+    fn test_naive_date_from_archived_i32_out_of_range_returns_none() {
+        // CR-9: a day count chrono cannot represent is `None`, never a panic.
+        for raw in [i32::MAX, i32::MIN] {
+            let days = rkyv::rend::i32_le::from_native(raw);
+            assert_eq!(naive_date_from_archived_i32(&days), None, "raw {raw}");
+        }
     }
 
     // =====================================================================
@@ -3007,7 +3016,7 @@ mod tests {
         for date in dates {
             let days = rkyv::rend::i32_le::from_native(date.num_days_from_ce());
             let result = naive_date_from_archived_i32(&days);
-            assert_eq!(result, date);
+            assert_eq!(result, Some(date));
         }
     }
 

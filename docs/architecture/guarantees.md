@@ -67,12 +67,12 @@ But we CAN mechanically guarantee:
 
 | Claim | Proof file | Test name |
 |---|---|---|
-| Tick parse ≤ 10 ns (p99) | `quality/benchmark-budgets.toml` + Criterion benches | bench gate via `scripts/bench-gate.sh` |
+| Tick parse ≤ 10 ns (p99) (CORRECTED 2026-10-12, TRU-2: bench-gate reads Criterion's MEDIAN against the budget, after merge and nightly only; no percentile is measured) | `quality/benchmark-budgets.toml` + Criterion benches | bench gate via `scripts/bench-gate.sh` |
 | ~~Pipeline routing~~ Packet decode + dispatch ≤ 100 ns per tick (gate now divides batch median by element count — honest per-tick, fixed #992; measured 2026-06-02: 4.7 ns/tick) **⚠ CORRECTED 2026-10-11:** this budget times packet decode and dispatch only (`pipeline.rs` loops `dispatch_frame`). The live path per packet (WAL append, candle fold, row append) has no bench; decode is O(1) per tick packet and O(levels) per depth packet. | same + `quality/benchmark-budgets.toml` `[elements]` | `crates/common/tests/bench_budget_elements_guard.rs` |
 | ~~papaya~~ registry lookup ≤ 50 ns (measured 2026-06-02: 10.6 ns, hit≈miss → true O(1)) **⚠ CORRECTED 2026-10-11:** the registry is a plain `HashMap` on the composite key, not papaya; the O(1) claim stands. | same | bench gate |
 | OMS state transition ≤ 100 ns | same | same |
 | Zero heap alloc per tick | `crates/core/tests/dhat_allocation.rs` | DHAT harness, fails CI on non-zero alloc |
-| 5% benchmark regression = build fail | `quality/benchmark-budgets.toml` | bench-gate CI stage |
+| 5% benchmark regression = build fail (CORRECTED 2026-10-12, TRU-2: it fails the post-merge / nightly bench run, never a PR; bench.yml has no pull_request trigger) | `quality/benchmark-budgets.toml` | bench-gate CI stage |
 | No `.unwrap()` / `.expect()` in prod | every `crates/*/src/lib.rs` | `#![cfg_attr(not(test), deny(clippy::unwrap_used))]` |
 | No dropped `Result` in prod | every `crates/*/src/lib.rs` | `#![cfg_attr(not(test), deny(unused_must_use))]` |
 | No `.clone()` on hot path | `.claude/hooks/banned-pattern-scanner.sh` category 2 | pre-commit hook |

@@ -1118,3 +1118,113 @@ fn market_data_deletion_scan_bites() {
         assert!(market_data_deletions(line).is_empty(), "{line}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Deep audit SEC-7 (2026-10-12): no dispatch input pasted into a run script.
+// ---------------------------------------------------------------------------
+
+/// `(line number, text)` of every line that belongs to a `run:` script in a
+/// workflow: the value of a one-line `run: x`, or every line of a `run: |` /
+/// `run: >` block scalar (lines indented deeper than the key, blanks kept).
+fn run_script_lines(text: &str) -> Vec<(usize, &str)> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        let indent = line.len() - line.trim_start().len();
+        let t = line.trim_start();
+        let t = t.strip_prefix("- ").map_or(t, str::trim_start);
+        if let Some(value) = t.strip_prefix("run:") {
+            let v = value.trim();
+            if v.starts_with('|') || v.starts_with('>') {
+                let mut j = i + 1;
+                while j < lines.len() {
+                    let l = lines[j];
+                    let li = l.len() - l.trim_start().len();
+                    if !l.trim().is_empty() && li <= indent {
+                        break;
+                    }
+                    out.push((j + 1, l));
+                    j += 1;
+                }
+                i = j;
+                continue;
+            }
+            out.push((i + 1, line));
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Lines across `files` where a run script pastes a dispatch input inline.
+fn inputs_interpolated_into_run(files: &[(String, String)]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (path, text) in files {
+        for (n, line) in run_script_lines(text) {
+            let squeezed: String = line.split_whitespace().collect();
+            if squeezed.contains("${{github.event.inputs.") || squeezed.contains("${{inputs.") {
+                out.push(format!("{path}:{n}: {}", line.trim()));
+            }
+        }
+    }
+    out
+}
+
+// Regression: 2026-10-12 (deep audit SEC-7) — `confirm_market_hours`, a free
+// string, was written as `"${{ github.event.inputs.confirm_market_hours }}"`
+// inside three run scripts. GitHub pastes the value into the script before
+// bash parses it, so a value such as `yes"; curl ...; "` ran on a runner
+// holding deploy credentials. Inputs reach a script through `env:` only.
+#[test]
+fn r_no_dispatch_input_interpolated_into_run_script() {
+    let files = workflow_files();
+    assert!(files.len() > 20, "only {} workflows found", files.len());
+    let scanned: usize = files.iter().map(|(_, t)| run_script_lines(t).len()).sum();
+    assert!(
+        scanned > 1_000,
+        "only {scanned} run lines found; the scan is broken"
+    );
+    let hits = inputs_interpolated_into_run(&files);
+    assert!(
+        hits.is_empty(),
+        "a run script pastes a dispatch input inline (expression injection): {hits:?}. \
+         Pass it through the step's `env:` and read the variable instead."
+    );
+}
+
+#[test]
+fn r_dispatch_input_scan_bites() {
+    let bad = (
+        "x.yml".to_string(),
+        [
+            "jobs:",
+            "  a:",
+            "    steps:",
+            "      - name: s",
+            "        env:",
+            "          OK: ${{ github.event.inputs.confirm }}",
+            "        with:",
+            "          prompt: ${{ inputs.instruction }}",
+            "        run: |",
+            "          echo start",
+            "",
+            "          if [ \"${{ github.event.inputs.confirm_market_hours }}\" = \"yes\" ]; then",
+            "            exit 0",
+            "          fi",
+            "      - run: echo ${{ inputs.x }}",
+            "      - name: after",
+            "        if: github.event.inputs.action == 'status'",
+        ]
+        .join("\n"),
+    );
+    let hits = inputs_interpolated_into_run(&[bad]);
+    assert_eq!(
+        hits.len(),
+        2,
+        "expected the block-scalar and one-line hits: {hits:?}"
+    );
+    assert!(hits[0].starts_with("x.yml:12:"), "{hits:?}");
+    assert!(hits[1].starts_with("x.yml:15:"), "{hits:?}");
+}

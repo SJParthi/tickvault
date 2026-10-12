@@ -617,7 +617,7 @@ pub fn make_derivative_instrument_from_archived(
         display_label: contract.display_name.as_str().to_owned(),
         underlying_symbol: contract.underlying_symbol.as_str().to_owned(),
         instrument_kind: Some(DhanInstrumentKind::from(&contract.instrument_kind)),
-        expiry_date: Some(naive_date_from_archived_i32(&contract.expiry_date)),
+        expiry_date: naive_date_from_archived_i32(&contract.expiry_date),
         strike_price: if strike > 0.0 { Some(strike) } else { None },
         option_type: contract.option_type.as_ref().map(OptionType::from),
         feed_mode,

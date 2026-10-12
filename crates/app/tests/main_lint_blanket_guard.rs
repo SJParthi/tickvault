@@ -119,8 +119,8 @@ fn crate_roots() -> Vec<String> {
 ///
 /// `deny` is the default posture. `allow` with an `// APPROVED:` reason is
 /// legitimate for a diagnostic CLI whose whole job is to fall over loudly
-/// on a broken workspace — `tv_doctor`, `tv_guarantees` and `smoke_test`
-/// all carry one, and that is a decision on the record.
+/// on a broken workspace. (`tv_doctor`, `tv_guarantees` and `smoke_test`
+/// carried one until 2026-10-12; all three now `deny`.)
 ///
 /// What fails is SILENCE. A root that says nothing has not chosen the
 /// permissive posture; it has failed to choose at all, and the compiler
@@ -159,8 +159,11 @@ fn every_crate_root_decides_about_silent_panics() {
 /// service binary may not.
 #[test]
 fn production_crate_roots_keep_the_deny_blanket() {
-    // Every root that is NOT a hand-run diagnostic tool.
-    let exempt = ["tv_doctor.rs", "tv_guarantees.rs", "smoke_test.rs"];
+    // 2026-10-12 (deep audit CR-7): the three diagnostic bins (`tv_doctor.rs`,
+    // `tv_guarantees.rs`, `smoke_test.rs`) now carry the deny blanket too, so
+    // nothing is exempt. `smoke_test` runs in every deploy, where an unwrap
+    // would abort with exit 134 instead of a clear exit 1.
+    let exempt: [&str; 0] = [];
     let mut weakened = Vec::new();
 
     for rel in crate_roots() {

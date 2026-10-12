@@ -17,6 +17,14 @@
 #   route: error! -> errors.jsonl -> CloudWatch Logs -> filter -> tv_errcode_*
 #   metric -> alarm (<=5 min) -> SNS tv-alerts -> Telegram webhook Lambda.
 #
+# CODES WITH NO ALARM (2026-10-12, deep audit OBS-7): most error codes have
+#   no filter here ON PURPOSE (the Dhan noise lock keeps the page set small).
+#   That is now a recorded decision: crates/common/tests/
+#   error_code_paging_decision_guard.rs fails the build when a code is
+#   neither referenced by terraform nor listed as log-only. The non-paging
+#   way to see the log-only codes is the logs MCP tool list_novel_signatures.
+#   A digest page for them needs a dated noise-lock row first.
+#
 # HONEST ALARM COUNT: this file takes the REAL total from 33 -> 41 alarms
 # (45 with the reconnect-storm + feed-stall-restarts [pager retired
 # 2026-07-15 with the Groww live feed] + readiness-lambda-errors
@@ -1135,6 +1143,9 @@ resource "aws_cloudwatch_metric_alarm" "hot_path_02" {
 #
 #   data/logs/machine/errors.jsonl.2*  ->  {"level":"ERROR","code":"X",...}
 #   data/logs/machine/app.2*           ->  {"level":"ERROR","fields":{"code":"X"}}
+#
+# TIMESTAMPS DIFFER TOO (2026-10-12, deep audit OBS-15): errors.jsonl stamps
+# UTC, the app log stamps IST. A Logs Insights query over both must convert.
 #
 # So 25 of the 27 filters on this log group depend on ONE file reaching
 # CloudWatch (MEASURED live 2026-09-02, not counted from source: one is a bare

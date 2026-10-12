@@ -541,6 +541,15 @@ jobs:
       - name: Enforce per-crate coverage thresholds
         run: bash scripts/coverage-gate.sh target/llvm-cov/coverage.json
 
+      # PROOF-12 (2026-10-12): per-FILE floors live in the [files] table and
+      # are checked by the Rust bin `coverage_file_floors`. It is NOT run in
+      # this job: llvm-cov builds into its own target dir, so `cargo run`
+      # here would build common's whole dependency tree a second time,
+      # uninstrumented, in the job that has run out of runner disk before
+      # (#1442, #1455). The table is empty, so nothing is gated yet. Run it
+      # by hand on the uploaded report:
+      #   cargo run -p tickvault-common --bin coverage_file_floors -- coverage.json quality/crate-coverage-thresholds.toml
+
       - name: Upload coverage report
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
