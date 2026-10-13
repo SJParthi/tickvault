@@ -2048,6 +2048,19 @@ pub struct SpillPruneOutcome {
     pub records_unreplayed_with_copy: u64,
 }
 
+impl SpillPruneOutcome {
+    /// Top-level and `replaying/` files deleted that held no record at all:
+    /// `deleted` minus the files deleted while holding records, with or
+    /// without a cold copy (DA-13a). The only count the sweep may report as
+    /// "empty". O(1).
+    #[must_use]
+    pub const fn deleted_empty(&self) -> usize {
+        self.deleted
+            .saturating_sub(self.deleted_non_empty)
+            .saturating_sub(self.deleted_unreplayed_with_copy)
+    }
+}
+
 /// Counter: sealed candles in unreplayed spill files the retention sweep
 /// deleted WITH a verified cold copy (DA-13a). They are in the cold bucket and
 /// in no table. Local `/metrics` only (no EMF name, no alarm); the sweep also
@@ -2602,10 +2615,7 @@ pub fn prune_spill_files(
              and are NOT in candles_* until that copy is replayed"
         );
     }
-    let empty_deleted = outcome
-        .deleted
-        .saturating_sub(outcome.deleted_non_empty)
-        .saturating_sub(outcome.deleted_unreplayed_with_copy);
+    let empty_deleted = outcome.deleted_empty();
     if empty_deleted > 0 {
         info!(
             deleted = empty_deleted,
@@ -4615,9 +4625,80 @@ mod tests {
         assert!(!marker.exists(), "the deleted file's marker goes with it");
     }
 
+    /// Counts one counter name, every label set summed, through a recorder
+    /// scoped with `metrics::with_local_recorder` (never a global install, so
+    /// parallel tests cannot steal each other's counts).
+    #[derive(Clone)]
+    struct OneCounterRecorder {
+        name: &'static str,
+        total: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    struct OneCounter {
+        total: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl metrics::CounterFn for OneCounter {
+        fn increment(&self, value: u64) {
+            self.total
+                .fetch_add(value, std::sync::atomic::Ordering::Relaxed);
+        }
+        fn absolute(&self, _: u64) {}
+    }
+
+    impl metrics::Recorder for OneCounterRecorder {
+        fn describe_counter(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_gauge(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_histogram(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn register_counter(
+            &self,
+            key: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            if key.name() == self.name {
+                metrics::Counter::from_arc(std::sync::Arc::new(OneCounter {
+                    total: std::sync::Arc::clone(&self.total),
+                }))
+            } else {
+                metrics::Counter::noop()
+            }
+        }
+        fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            metrics::Gauge::noop()
+        }
+        fn register_histogram(
+            &self,
+            _: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
     // Regression: 2026-10-13 — DA-13a. A never-replayed spill file deleted
     // with a cold copy was counted only in `deleted` and logged as "removed
     // aged empty spill files". Only a truly empty file may count as empty.
+    // DA-13a review: drives the production wrapper (the sweep, the empty
+    // count it logs and the counter it increments), not a copy of its
+    // arithmetic.
     #[test]
     fn test_regression_da13a_prune_counts_unreplayed_with_copy_apart_from_empty_files() {
         let dir = spill_tmp("gate-copy-split");
@@ -4630,21 +4711,49 @@ mod tests {
         );
         crate::raw_frame_upload::write_file_marker_for_test(&empty);
         crate::raw_frame_upload::write_file_marker_for_test(&full);
-        let out = prune_spill_files_at(
-            &dir,
-            3_600,
-            std::time::SystemTime::now(),
-            CopyGate::Required,
-        );
+        // The production sweep holds unreplayed files until the boot drain
+        // has read the folder; this one has.
+        note_boot_drain_ran(&dir);
+        let recorder = OneCounterRecorder {
+            name: SEAL_SPILL_UNREPLAYED_DELETED_WITH_COPY_COUNTER,
+            total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        let out = metrics::with_local_recorder(&recorder, || prune_spill_files(&dir, 3_600, true));
+        assert!(!empty.exists() && !full.exists(), "both aged files deleted");
         assert_eq!(out.deleted, 2);
+        assert_eq!(out.held_before_boot_drain, 0);
         assert_eq!(out.deleted_unreplayed_with_copy, 1, "only the full file");
         assert_eq!(out.records_unreplayed_with_copy, 3);
         assert_eq!((out.deleted_non_empty, out.records_lost), (0, 0));
-        let empty_deleted = out
-            .deleted
-            .saturating_sub(out.deleted_non_empty)
-            .saturating_sub(out.deleted_unreplayed_with_copy);
-        assert_eq!(empty_deleted, 1, "the empty file is the only empty one");
+        assert_eq!(
+            out.deleted_empty(),
+            1,
+            "the empty file is the only one reported as empty"
+        );
+        assert_eq!(
+            recorder.total.load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "the sweep counts the three records that left the box unreplayed"
+        );
+    }
+
+    #[test]
+    fn test_spill_prune_outcome_deleted_empty_excludes_files_that_held_records() {
+        let out = SpillPruneOutcome {
+            deleted: 5,
+            deleted_non_empty: 1,
+            deleted_unreplayed_with_copy: 2,
+            ..SpillPruneOutcome::default()
+        };
+        assert_eq!(out.deleted_empty(), 2);
+        // Saturates rather than wrapping on an inconsistent outcome.
+        let odd = SpillPruneOutcome {
+            deleted: 1,
+            deleted_non_empty: 1,
+            deleted_unreplayed_with_copy: 1,
+            ..SpillPruneOutcome::default()
+        };
+        assert_eq!(odd.deleted_empty(), 0);
     }
 
     #[test]
