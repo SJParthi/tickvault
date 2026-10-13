@@ -105,9 +105,9 @@ variable "ebs_gp3_size_gb" {
 # safe" is the one mistake here that cannot be undone without another recreate.
 
 variable "ebs_gp3_iops" {
-  description = "Root gp3 EBS provisioned IOPS. RAISED 3000 -> 6000 on 2026-08-19 per operator Quote 17 (daily-universe-scope-expansion-2026-05-27.md §0), alongside throughput 125 -> 500. Range 3000-16000. WHAT TERRAFORM DOES WITH THIS: nothing, to a running box — root_block_device[0].iops sits in the instance's lifecycle.ignore_changes (main.tf), so `terraform apply` never touches the live volume. This variable documents FRESH-PROVISION intent only; the LIVE change is an out-of-band `aws ec2 modify-volume --volume-id <id> --iops 6000 --throughput 500` (or scripts/aws-upgrade-instance.sh), online with no stop, and until that runs the live volume keeps its current settings. Same shape as the Quote 16 size raise. COST: gp3 charges $0.005 per provisioned IOPS above the free 3000 baseline, so (6000-3000) x $0.005 = $15.00/mo."
+  description = "Root gp3 EBS provisioned IOPS. LOWERED 6000 -> 3000 (the free gp3 baseline) on 2026-10-13 per operator Quote 30 (daily-universe-scope-expansion-2026-05-27.md §0): measured 13 Oct, about 1,000 IOPS average after 10:00 IST and a 3,658 peak for a few start-up minutes; saves $15.00/mo so AWS stays at or under ₹15,000 a month. Throughput is NOT changed. History: RAISED 3000 -> 6000 on 2026-08-19 per operator Quote 17 (daily-universe-scope-expansion-2026-05-27.md §0), alongside throughput 125 -> 500. Range 3000-16000. WHAT TERRAFORM DOES WITH THIS: nothing, to a running box — root_block_device[0].iops sits in the instance's lifecycle.ignore_changes (main.tf), so `terraform apply` never touches the live volume. This variable documents FRESH-PROVISION intent only; the LIVE change is an out-of-band `aws ec2 modify-volume --volume-id <id> --iops 6000 --throughput 500` (or scripts/aws-upgrade-instance.sh), online with no stop, and until that runs the live volume keeps its current settings. Same shape as the Quote 16 size raise. COST: gp3 charges $0.005 per provisioned IOPS above the free 3000 baseline, so (6000-3000) x $0.005 = $15.00/mo."
   type        = number
-  default     = 6000
+  default     = 3000
 
   validation {
     condition     = var.ebs_gp3_iops >= 3000 && var.ebs_gp3_iops <= 16000

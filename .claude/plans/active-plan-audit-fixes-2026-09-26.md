@@ -3139,6 +3139,17 @@ and a call site; shell may only shrink. One PR per item, serial.
   `tv_wal_deferred_depth_pass_total{outcome="disk_floor"}`. Honest limit: one evening clears an
   estimated ~30% of a fully shed day (Assumed, not measured); the marks carry the rest to later
   evenings.
+- [x] **DA-23 — AWS at or under ₹15,000 a month** (owner Quote 30, 2026-10-13, two decision
+  cards, recorded in the daily-universe rule file first). `aws-lambdas`, terraform,
+  `.github/workflows/`. Kill line $150 → $170 in all four lockstep sites and
+  `hard_stop_guard::STANDING_BUDGET_KILL_USD`; the native 90% `stop_at_90` budget action removed
+  (one stop at 100%); `ebs_gp3_iops` default and the `grow-ebs-volume.yml` default 6000 → 3000.
+  Measured: Oct 1–12 $71.80, projection ~$173–175, old 90% stop ($135) ~23 Oct; IOPS ~1,000 avg
+  after 10:00 IST, peak 3,658; throughput unchanged. Tests:
+  `budget_ceiling_lockstep_guard::{native_stop_is_one_action_at_100_percent,
+  standing_cap_is_170_and_the_allowance_is_one_month, ceiling_brackets_the_recorded_bill_high_estimate}`,
+  `hard_stop_guard::tests::test_regression_quote30_october_at_165_does_not_stop`. The live IOPS
+  change runs through `grow-ebs-volume.yml` after merge, outside 09:00–15:45 IST.
 - [ ] **DA-15 — The frame drain's timers cannot starve; small drain fixes** (HOT-11, tail HOT-4,
   tail HOT-9, CR-8, HOT-16, SCALE-7, INP-2, HOT-17, tail HOT-6, SCALE-3 limit, HOT-9 limit row,
   NT-2, NT-3, NT-4). `app`, `core`, `trading`, `common`.
