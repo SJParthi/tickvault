@@ -349,11 +349,19 @@ fn record_boot_drain_observability(outcome: &BootDrainOutcome) {
         metrics::counter!("tv_seal_writer_drain_total", "kind" => "boot_summary_not_persisted")
             .increment(outcome.summary_not_persisted as u64);
     }
-    // DA-13a: files the drain left staged because the database was suspect
-    // (their seals are already in `boot_pending`).
+    // DA-13a: FILES the drain left staged because the database was suspect.
+    // The seals of a file read before the hold are in `boot_pending`; a file
+    // held unread adds no seals anywhere (its count is unknown unread).
     if outcome.files_held_sink_suspect > 0 {
         metrics::counter!("tv_seal_writer_drain_total", "kind" => "boot_held_sink_suspect")
             .increment(outcome.files_held_sink_suspect as u64);
+    }
+    // DA-13a review: SEALS acked by the database and waiting, in files still
+    // staged, for the WAL-suspension watcher to confirm them. Not landed yet,
+    // so never in `boot_reingested`; local `/metrics` only, no alarm.
+    if outcome.seals_awaiting_confirm > 0 {
+        metrics::counter!("tv_seal_writer_drain_total", "kind" => "boot_awaiting_confirm")
+            .increment(outcome.seals_awaiting_confirm as u64);
     }
     // Row 296: page the seals given up on for good, once, when their file
     // leaves `replaying/`. A file staged for another try is pending
@@ -1281,6 +1289,8 @@ pub async fn run_seal_writer_loop(
             summary_refused = boot.summary_refused,
             summary_not_persisted = boot.summary_not_persisted,
             files_held_sink_suspect = boot.files_held_sink_suspect,
+            files_awaiting_confirm = boot.files_awaiting_confirm,
+            seals_awaiting_confirm = boot.seals_awaiting_confirm,
             "seal writer boot recovery drain finished"
         );
     }
@@ -1902,6 +1912,8 @@ mod tests {
             summary_refused: 1,
             summary_not_persisted: 2,
             files_held_sink_suspect: 1,
+            files_awaiting_confirm: 1,
+            seals_awaiting_confirm: 8,
             seals_unrecovered: 5,
             files_refused: 1,
         });
