@@ -188,7 +188,13 @@ security_id=1234i,level=7i,price=24273.15,quantity=50i,orders=3i,capture_seq=99i
     // already in the high-water mark and cannot be credited to the replay.
     let before = peak_rss_bytes();
 
-    let outcome = tickvault_storage::tick_spill_replay::replay_spill_dir(&dir, &url, &client).await;
+    let outcome = tickvault_storage::tick_spill_replay::replay_spill_dir(
+        &dir,
+        &url,
+        &client,
+        &tickvault_storage::tick_spill_replay::SpillSinkView::current(),
+    )
+    .await;
 
     let after = peak_rss_bytes();
     let growth = after.saturating_sub(before);

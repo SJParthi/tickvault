@@ -58,10 +58,12 @@ use tickvault_common::error_code::ErrorCode;
 use tracing::{error, info, warn};
 
 use crate::tick_spill_replay::{
-    LineIsolation, QUARANTINE_DIR, REPLAY_LINES_REJECTED_COUNTER, REPLAY_MAX_CHUNK_BYTES,
-    SpillReplayOutcome, describe_send_error, forget_resume_offset, ilp_chunk_ranges,
-    is_permanent_refusal, isolate_refused_lines, record_resume_offset, resume_offset_for,
-    set_aside_rejected_lines,
+    EmptyOutcome, LineIsolation, QUARANTINE_DIR, REPLAY_LINES_REJECTED_COUNTER,
+    REPLAY_MAX_CHUNK_BYTES, SpillReplayOutcome, SpillSinkView, describe_send_error,
+    empty_drained_closed_file, forget_resume_offset, ilp_chunk_ranges, is_permanent_refusal,
+    isolate_refused_lines, note_spill_ack, note_spill_file_unreadable, record_resume_offset,
+    resend_through_for, resume_offset_for, rewind_after_suspicion, set_aside_rejected_lines,
+    spill_file_may_still_be_appended,
 };
 
 /// File extension of the framed depth spill. Deliberately not `ilp`, so the
@@ -357,12 +359,20 @@ enum Walk {
 ///
 /// Same contract as `tick_spill_replay::replay_spill_dir`: oldest file first;
 /// the first transient failure stops the round, keeping the offset of the last
-/// record dealt with; the live (last) file and a file that grew while it was
-/// read are never truncated, their drained offset is remembered instead; a
-/// closed file is truncated (not deleted) once every record is dealt with.
-/// Replaying a record twice is harmless: the `market_depth` dedup key carries
-/// `depth_kind` and `capture_seq`, so a row upserts onto itself.
-pub async fn replay_framed_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillReplayOutcome {
+/// record dealt with; a file the writer may still append to (the last one, or
+/// any whose hour has not passed or that was written in the last
+/// `SPILL_LIVE_FILE_QUIET_SECS`) and a file that grew while it was read are
+/// never truncated, their drained offset is remembered instead; a closed file
+/// is truncated (not deleted) once every record is dealt with AND QuestDB's
+/// acknowledgements are confirmed (audit DA-13b). Replaying a record twice is
+/// harmless: the `market_depth` dedup key carries `depth_kind` and
+/// `capture_seq`, so a row upserts onto itself.
+pub async fn replay_framed_spill_dir(
+    dir: &Path,
+    url: &str,
+    client: &Client,
+    view: &SpillSinkView,
+) -> SpillReplayOutcome {
     let mut outcome = SpillReplayOutcome::default();
     for reason in ["refused", "corrupt", "torn_tail"] {
         metrics::counter!(FRAMED_SET_ASIDE_COUNTER, "reason" => reason).increment(0);
@@ -371,39 +381,58 @@ pub async fn replay_framed_spill_dir(dir: &Path, url: &str, client: &Client) -> 
     let last_index = files.len().saturating_sub(1);
     let mut scratch: Vec<u8> = Vec::new();
     for (file_index, path) in files.into_iter().enumerate() {
-        let writer_may_still_append = file_index == last_index;
-        let file_len = match std::fs::metadata(&path) {
-            Ok(meta) => meta.len(),
+        let meta = match std::fs::metadata(&path) {
+            Ok(meta) => meta,
             Err(err) => {
-                warn!(
-                    path = %path.display(),
-                    %err,
-                    "framed depth spill replay could not read a spill file — leaving it for \
-                     the next round"
-                );
+                note_spill_file_unreadable(&path, "spill_stat_failed", &err);
                 outcome.files_failed = outcome.files_failed.saturating_add(1);
                 return outcome;
             }
         };
+        let file_len = meta.len();
         if file_len == 0 {
             forget_resume_offset(&path);
             outcome.files_skipped_empty = outcome.files_skipped_empty.saturating_add(1);
             continue;
         }
+        let writer_may_still_append =
+            spill_file_may_still_be_appended(&path, &meta, file_index == last_index, view, "depth");
+        rewind_after_suspicion(&path, view, "depth");
         let resume_from = resume_offset_for(&path).min(file_len);
+        // Below this offset a rewound re-send does not set a damaged stretch
+        // or a torn tail aside again (judged on the bytes on disk); a record
+        // QuestDB refuses is still set aside (2026-10-13 (DA-13b review)).
+        let resend_through = resend_through_for(&path);
         if resume_from == file_len {
+            // Fully drained: empty it once its hour has closed and its acks
+            // are confirmed (audit DA-13b; before, a file drained while live
+            // was never emptied).
+            if !writer_may_still_append {
+                match empty_drained_closed_file(&path, view, "depth") {
+                    EmptyOutcome::Emptied => {
+                        info!(
+                            path = %path.display(),
+                            "emptied a drained framed depth spill file whose acknowledgements \
+                             are confirmed"
+                        );
+                    }
+                    EmptyOutcome::Deferred => {
+                        outcome.files_awaiting_confirm =
+                            outcome.files_awaiting_confirm.saturating_add(1);
+                    }
+                    EmptyOutcome::Failed => {
+                        outcome.files_failed = outcome.files_failed.saturating_add(1);
+                        return outcome;
+                    }
+                }
+            }
             outcome.files_skipped_empty = outcome.files_skipped_empty.saturating_add(1);
             continue;
         }
         let file = match File::open(&path) {
             Ok(f) => f,
             Err(err) => {
-                warn!(
-                    path = %path.display(),
-                    %err,
-                    "framed depth spill replay could not open a spill file — leaving it for \
-                     the next round"
-                );
+                note_spill_file_unreadable(&path, "spill_open_failed", &err);
                 outcome.files_failed = outcome.files_failed.saturating_add(1);
                 return outcome;
             }
@@ -416,6 +445,7 @@ pub async fn replay_framed_spill_dir(dir: &Path, url: &str, client: &Client) -> 
             &file,
             file_len,
             writer_may_still_append,
+            resend_through,
             client,
             url,
             &mut offset,
@@ -424,6 +454,14 @@ pub async fn replay_framed_spill_dir(dir: &Path, url: &str, client: &Client) -> 
             &mut scratch,
         )
         .await;
+        // Stamp on ANY progress, not only `sent_bytes`: a refused record whose
+        // lines were isolated had its good halves acknowledged by QuestDB
+        // without adding to `sent_bytes`, and those acks need confirming
+        // before the file is emptied too. Stamping a set-aside-only round as
+        // well costs at most one more confirm cycle before the empty-out.
+        if sent_bytes > 0 || offset > resume_from {
+            note_spill_ack(&path, view, resume_from, offset);
+        }
         if offset > resume_from {
             record_resume_offset(&path, offset);
         }
@@ -435,8 +473,14 @@ pub async fn replay_framed_spill_dir(dir: &Path, url: &str, client: &Client) -> 
                 metrics::counter!("tv_tick_spill_replay_failed_total").increment(1);
                 return outcome;
             }
+            // A file is counted as replayed only when rows reached QuestDB
+            // this round (`sent_bytes`, which includes the good lines of an
+            // isolated record), never for a round that only set bytes aside
+            // (2026-10-13 (DA-13b review)).
             Walk::WaitForWriter => {
-                outcome.files_replayed = outcome.files_replayed.saturating_add(1);
+                if sent_bytes > 0 {
+                    outcome.files_replayed = outcome.files_replayed.saturating_add(1);
+                }
                 continue;
             }
             Walk::Done => {}
@@ -444,37 +488,39 @@ pub async fn replay_framed_spill_dir(dir: &Path, url: &str, client: &Client) -> 
         // Grown while read: the next round resumes at `offset`.
         match std::fs::metadata(&path).map(|m| m.len()) {
             Ok(len_now) if len_now > file_len => {
-                outcome.files_replayed = outcome.files_replayed.saturating_add(1);
+                if sent_bytes > 0 {
+                    outcome.files_replayed = outcome.files_replayed.saturating_add(1);
+                }
                 continue;
             }
             Ok(_) => {}
             Err(err) => {
-                warn!(
-                    path = %path.display(),
-                    %err,
-                    "could not re-check a drained framed depth spill file's size — NOT \
-                     truncating it; the next round resumes at the drained offset"
-                );
+                // NOT truncating it; the next round resumes at the drained
+                // offset.
+                note_spill_file_unreadable(&path, "spill_recheck_failed", &err);
                 outcome.files_failed = outcome.files_failed.saturating_add(1);
                 return outcome;
             }
         }
-        if writer_may_still_append {
+        if sent_bytes > 0 {
             outcome.files_replayed = outcome.files_replayed.saturating_add(1);
+        }
+        if writer_may_still_append {
+            if sent_bytes == 0 {
+                continue;
+            }
             info!(
                 path = %path.display(),
                 bytes = sent_bytes,
                 resume_from = offset,
-                "recovered spilled depth rows into the database. This is the hour the writer \
-                 may still append to, so the file is left intact and the next round resumes \
-                 at the drained offset"
+                "recovered spilled depth rows into the database. The writer may still append \
+                 to this file, so it is left intact and the next round resumes at the drained \
+                 offset"
             );
             continue;
         }
-        forget_resume_offset(&path);
-        match File::create(&path) {
-            Ok(_) => {
-                outcome.files_replayed = outcome.files_replayed.saturating_add(1);
+        match empty_drained_closed_file(&path, view, "depth") {
+            EmptyOutcome::Emptied if sent_bytes > 0 => {
                 info!(
                     path = %path.display(),
                     bytes = sent_bytes,
@@ -482,25 +528,32 @@ pub async fn replay_framed_spill_dir(dir: &Path, url: &str, client: &Client) -> 
                      spill file"
                 );
             }
-            Err(err) => {
-                error!(
-                    code = ErrorCode::TickSpill01FileQuarantined.code_str(),
-                    source = "accepted_not_emptied",
+            EmptyOutcome::Emptied => {
+                info!(
                     path = %path.display(),
-                    %err,
-                    "spilled depth rows were accepted by the database but the spill file \
-                     could not be emptied — the rows are saved; the file will be sent again \
-                     next round and the duplicate rows collapse onto themselves"
+                    "emptied a drained framed depth spill file. Nothing was sent this round: \
+                     its last bytes were set aside in quarantine"
                 );
+            }
+            EmptyOutcome::Deferred => {
+                outcome.files_awaiting_confirm = outcome.files_awaiting_confirm.saturating_add(1);
+                if sent_bytes > 0 {
+                    info!(
+                        path = %path.display(),
+                        bytes = sent_bytes,
+                        "recovered spilled depth rows into the database; the drained file is \
+                         kept until QuestDB's acknowledgement is confirmed, then emptied"
+                    );
+                }
+            }
+            EmptyOutcome::Failed => {
                 outcome.files_failed = outcome.files_failed.saturating_add(1);
-                metrics::counter!("tv_tick_spill_replay_failed_total").increment(1);
                 return outcome;
             }
         }
     }
     outcome
 }
-
 /// Walks one file from `*offset`, POSTing each whole record.
 #[allow(clippy::too_many_arguments)] // APPROVED: private helper of one caller; the state is the caller's
 async fn walk_file(
@@ -509,6 +562,7 @@ async fn walk_file(
     file: &File,
     file_len: u64,
     live: bool,
+    resend_through: u64,
     client: &Client,
     url: &str,
     offset: &mut u64,
@@ -550,9 +604,24 @@ async fn walk_file(
                     None if live => return Walk::WaitForWriter,
                     None => (file_len, "torn_tail"),
                 };
+                if *offset < resend_through {
+                    // A rewound re-send (audit DA-13b review): these bytes
+                    // were set aside and counted on the first pass. Safe to
+                    // skip, unlike a refusal: whether bytes form a record
+                    // depends only on the bytes on disk, which a rewind does
+                    // not change.
+                    *offset = to;
+                    continue;
+                }
                 match set_aside_region(dir, path, file, *offset, to) {
                     Ok(bytes) => {
                         metrics::counter!(FRAMED_SET_ASIDE_COUNTER, "reason" => reason)
+                            .increment(1);
+                        // Also on the paged rejected-lines counter, like any
+                        // row kept out of the database (2026-10-13 (DA-13b
+                        // review)): before, a torn tail or a damaged stretch
+                        // moved only the local framed counter.
+                        metrics::counter!(REPLAY_LINES_REJECTED_COUNTER, "dir" => "depth")
                             .increment(1);
                         error!(
                             code = ErrorCode::TickSpill01FileQuarantined.code_str(),
@@ -595,9 +664,11 @@ async fn walk_file(
                     version,
                     &body,
                     accepted_in_file,
+                    *offset < resend_through,
                     client,
                     url,
                     outcome,
+                    sent_bytes,
                 )
                 .await
                 {
@@ -643,6 +714,16 @@ async fn walk_file(
 /// Deals with a record QuestDB permanently refused. `Some(true)`: set aside
 /// (in part or whole) and the walk moves on; `Some(false)`: the quarantine
 /// write failed; `None`: QuestDB stopped answering during line isolation.
+///
+/// `repeat` (the record lies below the file's `resend_through`, a re-send
+/// after a rewind) no longer skips anything (2026-10-13 (DA-13b review)): the
+/// rewind exists because the first pass's 2xx may have come from a suspended
+/// table, so a record refused now may never have been kept. It is set aside
+/// and counted again, and `repeat` only labels the log line. Honest limit: a
+/// record refused on both passes is kept twice and counted twice on the
+/// paged counter (errs loud, never drops a row). The good lines an isolation
+/// re-POSTed are added to `sent_bytes`, so a round whose only rows landed
+/// that way still reads as a recovery.
 #[allow(clippy::too_many_arguments)] // APPROVED: private helper of one caller
 async fn set_aside_refused(
     dir: &Path,
@@ -650,15 +731,20 @@ async fn set_aside_refused(
     version: u8,
     body: &bytes::Bytes,
     others_accepted: bool,
+    repeat: bool,
     client: &Client,
     url: &str,
     outcome: &mut SpillReplayOutcome,
+    sent_bytes: &mut u64,
 ) -> Option<bool> {
     if version == ILP_VERSION_1 {
         match isolate_refused_lines(client, url, body, others_accepted).await {
             LineIsolation::Isolated(rejected) => {
                 return Some(match set_aside_rejected_lines(dir, path, body, &rejected) {
                     Ok(bytes) => {
+                        let rejected_bytes: u64 = rejected.iter().map(|r| r.len() as u64).sum();
+                        *sent_bytes = sent_bytes
+                            .saturating_add((body.len() as u64).saturating_sub(rejected_bytes));
                         let lines = rejected.len() as u64;
                         metrics::counter!(REPLAY_LINES_REJECTED_COUNTER, "dir" => "depth")
                             .increment(lines);
@@ -668,9 +754,12 @@ async fn set_aside_refused(
                             path = %path.display(),
                             lines,
                             bytes,
+                            resent = repeat,
                             "QuestDB refused single depth rows in a framed spill record. They \
                              are kept in quarantine as <file>.rejected-lines and are NOT in the \
-                             database; every other row of the record was accepted."
+                             database; every other row of the record was accepted. \
+                             resent=true: sent again after a QuestDB suspicion episode, so a \
+                             row may be kept twice."
                         );
                         true
                     }
@@ -697,9 +786,11 @@ async fn set_aside_refused(
                     path = %path.display(),
                     bytes = body.len(),
                     version,
+                    resent = repeat,
                     "QuestDB permanently refused a whole framed depth spill record. It is kept, \
                      framed, in quarantine as <file>.rejected-records and is NOT in the database; \
-                     the replay carries on with the next record."
+                     the replay carries on with the next record. resent=true: sent again after a \
+                     QuestDB suspicion episode, so the record may be kept twice."
                 );
                 true
             }
@@ -932,7 +1023,8 @@ mod tests {
         write_records(&closed, &[(b"market_depth,a=1 b=1i 1\n", 1), (v2, 2)]);
         write_records(&live, &[(b"market_depth,a=2 b=2i 2\n", 1)]);
         let (url, bodies, server) = spawn_recording_server().await;
-        let out = replay_framed_spill_dir(&dir, &url, &client()).await;
+        let view = crate::tick_spill_replay::tests::test_spill_view();
+        let out = replay_framed_spill_dir(&dir, &url, &client(), &view).await;
         server.abort();
         let bodies = bodies.lock().expect("lock").clone();
         assert_eq!(
@@ -947,21 +1039,33 @@ mod tests {
         assert_eq!(out.files_replayed, 2);
         assert_eq!(out.files_failed, 0);
         assert_eq!(
-            std::fs::metadata(&closed).expect("m").len(),
-            0,
-            "closed file emptied"
+            out.files_awaiting_confirm, 1,
+            "audit DA-13b: the closed file waits for its acks to be confirmed"
         );
+        assert!(std::fs::metadata(&closed).expect("m").len() > 0);
         assert!(
             std::fs::metadata(&live).expect("m").len() > 0,
             "the live file is never truncated"
         );
-        // A second round re-sends nothing from the live file.
+        // A second round, acks confirmed, re-sends nothing and empties the
+        // closed file.
         let (url, bodies, server) = spawn_recording_server().await;
-        let _ = replay_framed_spill_dir(&dir, &url, &client()).await;
+        let _ = replay_framed_spill_dir(
+            &dir,
+            &url,
+            &client(),
+            &crate::tick_spill_replay::tests::confirmed_spill_view(&view),
+        )
+        .await;
         server.abort();
         assert!(
             bodies.lock().expect("lock").is_empty(),
             "the drained offset is remembered"
+        );
+        assert_eq!(
+            std::fs::metadata(&closed).expect("m").len(),
+            0,
+            "closed file emptied"
         );
         forget_resume_offset(&live);
         let _ = std::fs::remove_dir_all(&dir);
@@ -982,7 +1086,13 @@ mod tests {
         f.write_all(b"market_depth,a=2").expect("w");
         drop(f);
         let (url, bodies, server) = spawn_recording_server().await;
-        let out = replay_framed_spill_dir(&dir, &url, &client()).await;
+        let out = replay_framed_spill_dir(
+            &dir,
+            &url,
+            &client(),
+            &crate::tick_spill_replay::tests::test_spill_view(),
+        )
+        .await;
         assert_eq!(
             bodies.lock().expect("lock").len(),
             1,
@@ -1000,7 +1110,13 @@ mod tests {
             .expect("open");
         f.write_all(b" b=2i 2\n").expect("w");
         drop(f);
-        let _ = replay_framed_spill_dir(&dir, &url, &client()).await;
+        let _ = replay_framed_spill_dir(
+            &dir,
+            &url,
+            &client(),
+            &crate::tick_spill_replay::tests::test_spill_view(),
+        )
+        .await;
         server.abort();
         let bodies = bodies.lock().expect("lock").clone();
         assert_eq!(bodies.len(), 2);
@@ -1028,7 +1144,13 @@ mod tests {
             &[(b"market_depth,a=4 b=4i 4\n", 1)],
         );
         let (url, bodies, server) = spawn_recording_server().await;
-        let out = replay_framed_spill_dir(&dir, &url, &client()).await;
+        let out = replay_framed_spill_dir(
+            &dir,
+            &url,
+            &client(),
+            &crate::tick_spill_replay::tests::test_spill_view(),
+        )
+        .await;
         server.abort();
         let bodies = bodies.lock().expect("lock").clone();
         assert_eq!(
@@ -1072,8 +1194,8 @@ mod tests {
             &[(b"market_depth,a=3 b=3i 3\n", 1)],
         );
         let (url, _bodies, server) = spawn_recording_server().await;
-        let out = replay_framed_spill_dir(&dir, &url, &client()).await;
-        server.abort();
+        let view = crate::tick_spill_replay::tests::test_spill_view();
+        let out = replay_framed_spill_dir(&dir, &url, &client(), &view).await;
         assert_eq!(out.files_failed, 0);
         let kept = std::fs::read(
             dir.join(QUARANTINE_DIR)
@@ -1081,6 +1203,14 @@ mod tests {
         )
         .expect("kept");
         assert_eq!(kept.len(), FRAME_HEADER_BYTES + b"market_depth".len());
+        let _ = replay_framed_spill_dir(
+            &dir,
+            &url,
+            &client(),
+            &crate::tick_spill_replay::tests::confirmed_spill_view(&view),
+        )
+        .await;
+        server.abort();
         assert_eq!(std::fs::metadata(&closed).expect("m").len(), 0);
         forget_resume_offset(&dir.join("depth-dhan-2.dspl"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1105,7 +1235,13 @@ mod tests {
             &[(b"market_depth,a=3 b=3i 3\n", 1)],
         );
         let (url, bodies, server) = spawn_recording_server().await;
-        let out = replay_framed_spill_dir(&dir, &url, &client()).await;
+        let out = replay_framed_spill_dir(
+            &dir,
+            &url,
+            &client(),
+            &crate::tick_spill_replay::tests::test_spill_view(),
+        )
+        .await;
         server.abort();
         assert_eq!(out.files_failed, 1, "the 503 stops the round");
         let bodies = bodies.lock().expect("lock").clone();
@@ -1146,7 +1282,13 @@ mod tests {
             &[(b"market_depth,a=3 b=3i 3\n", 1)],
         );
         let (url, _bodies, server) = spawn_recording_server().await;
-        let out = replay_framed_spill_dir(&dir, &url, &client()).await;
+        let out = replay_framed_spill_dir(
+            &dir,
+            &url,
+            &client(),
+            &crate::tick_spill_replay::tests::test_spill_view(),
+        )
+        .await;
         server.abort();
         assert_eq!(out.files_failed, 0);
         assert_eq!(out.lines_set_aside, 1);
@@ -1156,6 +1298,15 @@ mod tests {
         )))
         .expect("kept");
         assert_eq!(kept, b"market_depth,poison\n");
+        // Audit DA-13b: the good lines were acknowledged during isolation,
+        // so the drained file waits for those acks to be confirmed. Bite:
+        // stamp only on `sent_bytes > 0` and the file is emptied here.
+        assert_eq!(out.files_awaiting_confirm, 1);
+        assert!(
+            std::fs::metadata(&closed).expect("m").len() > 0,
+            "acks won by line isolation are confirmed before the file is emptied"
+        );
+        forget_resume_offset(&closed);
         forget_resume_offset(&dir.join("depth-dhan-2.dspl"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1247,5 +1398,173 @@ mod tests {
         );
         forget_resume_offset(&path);
         assert_eq!(resume_offset_for(&path), 0);
+    }
+
+    /// Audit DA-13b review (depth twin), corrected 2026-10-13 (DA-13b review,
+    /// round 2): a rewound re-send of a framed file keeps a line QuestDB
+    /// refuses AGAIN, because the first pass's verdict may have come from a
+    /// suspended table. A duplicate quarantine line is harmless; a dropped
+    /// row is not.
+    ///
+    /// Bite: put back the `Isolated(_) if repeat` skip in `set_aside_refused`
+    /// and round 2 keeps nothing.
+    #[tokio::test]
+    async fn test_regression_da13b_a_rewound_depth_file_keeps_a_refused_line_again() {
+        let dir = temp_dir("da13b-depth-rewind");
+        let closed = dir.join("depth-dhan-1.dspl");
+        write_records(
+            &closed,
+            &[(
+                b"market_depth,a=1 b=1i 1\nmarket_depth,poison\nmarket_depth,a=2 b=2i 2\n",
+                1,
+            )],
+        );
+        write_records(
+            &dir.join("depth-dhan-2.dspl"),
+            &[(b"market_depth,a=3 b=3i 3\n", 1)],
+        );
+        let (url, _bodies, server) = spawn_recording_server().await;
+        let view = crate::tick_spill_replay::tests::test_spill_view();
+        let first = replay_framed_spill_dir(&dir, &url, &client(), &view).await;
+        assert_eq!(first.lines_set_aside, 1);
+        // An episode begins before the acks are confirmed: the file is sent
+        // again from where those acks began.
+        let mut after_episode = crate::tick_spill_replay::tests::confirmed_spill_view(&view);
+        after_episode.suspect_episodes += 1;
+        let second = replay_framed_spill_dir(&dir, &url, &client(), &after_episode).await;
+        server.abort();
+        assert!(second.bytes_replayed > 0, "the file is sent again");
+        assert_eq!(
+            second.lines_set_aside, 1,
+            "the re-sent refusal is kept again"
+        );
+        let kept = std::fs::read(dir.join(QUARANTINE_DIR).join(format!(
+            "depth-dhan-1.dspl{}",
+            crate::tick_spill_replay::REJECTED_LINES_SUFFIX
+        )))
+        .expect("kept");
+        assert_eq!(kept, b"market_depth,poison\nmarket_depth,poison\n");
+        forget_resume_offset(&closed);
+        forget_resume_offset(&dir.join("depth-dhan-2.dspl"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- DA-13b review, round 2 (2026-10-13): C1, C6, C7 on the depth twin ---
+
+    fn rejected_of(dir: &Path, name: &str, suffix: &str) -> Vec<u8> {
+        std::fs::read(dir.join(QUARANTINE_DIR).join(format!("{name}{suffix}"))).unwrap_or_default()
+    }
+
+    /// C1 (depth): every record got a 2xx on the first pass (from a
+    /// suspended table); after the episode QuestDB refuses one line of a v1
+    /// record and a whole v2 record. Both are the only copies of their rows
+    /// and must be kept in quarantine, although they lie below
+    /// `resend_through`.
+    ///
+    /// Bite: put back either `repeat` skip in `set_aside_refused` and round 2
+    /// keeps nothing for that record.
+    #[tokio::test]
+    async fn test_regression_da13b_depth_repeat_refusal_is_set_aside() {
+        let dir = temp_dir("da13b-c1-depth");
+        let closed = dir.join("depth-dhan-1.dspl");
+        let flip_line: &[u8] = b"market_depth,flip=1 b=2i 2\n";
+        let mut v1 = b"market_depth,a=1 b=1i 1\n".to_vec();
+        v1.extend_from_slice(flip_line);
+        let v2_flip: &[u8] = b"bin flip \n\x00";
+        write_records(&closed, &[(&v1, 1), (v2_flip, 2)]);
+        write_records(
+            &dir.join("depth-dhan-2.dspl"),
+            &[(b"market_depth,a=3 b=3i 3\n", 1)],
+        );
+        let refuse = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (url, server) =
+            crate::tick_spill_replay::tests::spawn_flip_server(Arc::clone(&refuse)).await;
+        let view = crate::tick_spill_replay::tests::test_spill_view();
+        let first = replay_framed_spill_dir(&dir, &url, &client(), &view).await;
+        assert_eq!(first.lines_set_aside, 0);
+        assert_eq!(first.files_quarantined, 0);
+
+        refuse.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut after_episode = crate::tick_spill_replay::tests::confirmed_spill_view(&view);
+        after_episode.suspect_episodes += 1;
+        let second = replay_framed_spill_dir(&dir, &url, &client(), &after_episode).await;
+        server.abort();
+        assert_eq!(second.lines_set_aside, 1, "the refused v1 line is kept");
+        assert_eq!(
+            rejected_of(
+                &dir,
+                "depth-dhan-1.dspl",
+                crate::tick_spill_replay::REJECTED_LINES_SUFFIX
+            ),
+            flip_line
+        );
+        let kept_record = rejected_of(&dir, "depth-dhan-1.dspl", REJECTED_RECORDS_SUFFIX);
+        assert_eq!(
+            kept_record.len(),
+            FRAME_HEADER_BYTES + v2_flip.len(),
+            "the refused v2 record is kept whole"
+        );
+        forget_resume_offset(&closed);
+        forget_resume_offset(&dir.join("depth-dhan-2.dspl"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A closed framed file holding only a torn record: nothing in it can
+    /// ever reach QuestDB.
+    fn write_torn_only(path: &Path) {
+        let header = encode_header(1, b"market_depth,a=2 b=2i 2\n").expect("h"); // APPROVED: test
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("open"); // APPROVED: test
+        f.write_all(&header).expect("w"); // APPROVED: test
+        f.write_all(b"market_depth").expect("w"); // APPROVED: test
+    }
+
+    /// C6 (depth): a round that only set a torn record aside sent nothing,
+    /// so it is not counted (or logged) as a recovery.
+    ///
+    /// Bite: count `files_replayed` without `sent_bytes > 0` and it reads 1.
+    #[tokio::test]
+    async fn test_regression_da13b_depth_set_aside_only_round_is_not_a_recovery() {
+        let dir = temp_dir("da13b-c6-depth");
+        let closed = dir.join("depth-dhan-1.dspl");
+        write_torn_only(&closed);
+        std::fs::write(dir.join("depth-dhan-2.dspl"), b"").expect("w"); // APPROVED: test
+        // Nothing is POSTed: an address nobody listens on.
+        let view = crate::tick_spill_replay::tests::test_spill_view();
+        let out = replay_framed_spill_dir(&dir, "http://127.0.0.1:9/write", &client(), &view).await;
+        assert_eq!(out.files_failed, 0);
+        assert_eq!(out.bytes_replayed, 0);
+        assert_eq!(out.files_replayed, 0, "nothing reached the database");
+        forget_resume_offset(&closed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// C7 (depth): a torn record set aside moves the PAGED rejected-lines
+    /// counter, like any other row kept out of the database.
+    ///
+    /// Bite: drop the `REPLAY_LINES_REJECTED_COUNTER` increment beside the
+    /// `torn_tail` set-aside and the count reads 0.
+    #[test]
+    fn test_regression_da13b_depth_torn_tail_is_paged() {
+        let dir = temp_dir("da13b-c7-depth");
+        let closed = dir.join("depth-dhan-1.dspl");
+        write_torn_only(&closed);
+        std::fs::write(dir.join("depth-dhan-2.dspl"), b"").expect("w"); // APPROVED: test
+        let rt = crate::tick_spill_replay::tests::counter_test_runtime();
+        let rec =
+            crate::tick_spill_replay::tests::OneCounterRecorder::new(REPLAY_LINES_REJECTED_COUNTER);
+        let view = crate::tick_spill_replay::tests::test_spill_view();
+        let client = client();
+        let (out, paged) = rec.count_during(
+            &rt,
+            replay_framed_spill_dir(&dir, "http://127.0.0.1:9/write", &client, &view),
+        );
+        assert_eq!(out.files_failed, 0);
+        assert_eq!(paged, 1, "the torn record is on the paged counter");
+        forget_resume_offset(&closed);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
