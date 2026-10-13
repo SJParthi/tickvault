@@ -1790,6 +1790,14 @@ async fn async_main() -> Result<()> {
     metrics::counter!("tv_seal_spill_sync_failed_total").increment(0);
     metrics::counter!("tv_seal_unwritten_mark_errors_total").increment(0);
     metrics::counter!("tv_wal_deferred_depth_persist_failed_total").increment(0);
+    // DA-13d: pinned WAL segments deleted below the disk floor. Local /metrics only.
+    for copy_in_s3 in ["true", "false"] {
+        metrics::counter!(
+            tickvault_storage::ws_frame_spill::WAL_DEFERRED_DEPTH_LOST_COUNTER,
+            "copy_in_s3" => copy_in_s3
+        )
+        .increment(0);
+    }
     metrics::counter!("tv_wal_applied_watermark_persist_failed_total").increment(0);
     // SEBI lifecycle / constituency write failures (audit OBS-2, 2026-10-11).
     // Seeded here, after the recorder install, so a scrape records 0 before

@@ -211,6 +211,13 @@ pub const fn pass_verdict(summary: &ArchiveRunSummary, max_partitions_per_run: u
         // it caught up.
         return PassVerdict::Incomplete("wal_not_applied");
     }
+    if summary.held_deferred_depth > 0 {
+        // DA-13d: depth partitions were held while the after-close pass
+        // wrote shed rows back into them. A later attempt, once the pass is
+        // done, archives them with those rows in; latching now would leave
+        // them for the next day.
+        return PassVerdict::Incomplete("deferred_depth_pass");
+    }
     if summary.tables_list_failed > 0 {
         return PassVerdict::Incomplete("table_list_failed");
     }
@@ -1097,6 +1104,22 @@ mod pass_ran_tests {
             pass_verdict(&lagging, 200),
             PassVerdict::Incomplete("wal_not_applied")
         );
+    }
+
+    // Regression: 2026-10-13 (DA-13d) — depth partitions held while the
+    // after-close pass writes them must keep the day open, or they wait a day.
+    #[test]
+    fn test_regression_da13d_held_depth_partitions_keep_the_day_open() {
+        let held = ArchiveRunSummary {
+            pass_ran: true,
+            held_deferred_depth: 1,
+            ..ArchiveRunSummary::default()
+        };
+        assert_eq!(
+            pass_verdict(&held, 200),
+            PassVerdict::Incomplete("deferred_depth_pass")
+        );
+        assert!(!PassOutcome::Ran(pass_verdict(&held, 200)).latches_the_day());
     }
 
     /// Every incomplete reason must be its own counter label, or the operator

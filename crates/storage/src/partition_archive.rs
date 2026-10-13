@@ -175,7 +175,6 @@ static DEPTH_REWRITE_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_ne
 /// Call it ONLY from a plain OS thread (the pass's own `tv-deferred-depth`
 /// thread): it blocks, and inside an async context it would panic. Cold path,
 /// once per pass.
-#[must_use]
 pub fn hold_depth_partitions_for_rewrite() -> tokio::sync::MutexGuard<'static, ()> {
     DEPTH_REWRITE_GATE.blocking_lock()
 }
