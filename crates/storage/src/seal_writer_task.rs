@@ -421,9 +421,16 @@ pub struct BootDrainOutcome {
     pub seals_reingested: usize,
     /// Files confirmed and moved to `archive/`.
     pub files_archived: usize,
-    /// Files still in `replaying/` (flush failed or never attempted).
+    /// Files still in `replaying/` because they were not flushed, not
+    /// landed, or not read at all (flush failed, never attempted, held
+    /// unread on a suspect sink, unreadable, or archive rename failed).
+    /// Files flushed and waiting for the QuestDB watcher's confirmation are
+    /// NOT here: see `files_awaiting_confirm`.
     pub files_left_pending: usize,
-    /// Seals still on disk and NOT in QuestDB. The honest loss-risk number.
+    /// Seals still on disk and NOT in QuestDB, for the files this drain READ.
+    /// A file held unread (the sink was suspect before it was opened) adds
+    /// nothing here: its seal count is unknown without reading it, so it is
+    /// counted only in `files_left_pending` and `files_held_sink_suspect`.
     pub seals_left_pending: usize,
     /// Records that could not be decoded (corrupt tail / legacy format /
     /// unknown timeframe ordinal). Their bytes survive in `archive/`.
@@ -460,6 +467,27 @@ pub struct BootDrainOutcome {
     /// reached, or the write failed) although files stay staged. A later boot
     /// may write an older copy of such a bar.
     pub summary_not_persisted: usize,
+    /// DA-13a: files left staged because the WAL-suspension watcher reported
+    /// the database suspect (a table suspended, lagging, or the probe blind).
+    /// A suspended table answers an ILP write with 2xx and applies nothing, so
+    /// those flushes prove nothing. Also counted in `files_left_pending`. A
+    /// file READ before the hold has its seals in `seals_left_pending`; a file
+    /// held UNREAD adds no seals anywhere (its count is unknown). Never in
+    /// `seals_reingested`.
+    pub files_held_sink_suspect: usize,
+    /// DA-13a review: files every flush of which was acked while a QuestDB
+    /// watcher is expected or running. They stay in `replaying/` and are
+    /// handed to the mid-session replay, which archives each only after
+    /// [`SEAL_REPLAY_ARCHIVE_CONFIRM_PROBES`] clean probes have reported behind
+    /// its last flush with no suspicion since. NOT in `files_archived` or
+    /// `files_left_pending`.
+    pub files_awaiting_confirm: usize,
+    /// Seals of `files_awaiting_confirm` the database acked. Acked, NOT yet
+    /// confirmed applied, so NOT in `seals_reingested`. If the database turns
+    /// suspect before the confirmation, the spill files among them are read
+    /// again by the mid-session replay and the dead-letter ones by the next
+    /// boot (DEDUP keys collapse the repeats).
+    pub seals_awaiting_confirm: usize,
 }
 
 impl BootDrainOutcome {
@@ -660,10 +688,30 @@ fn read_staged_spill(path: &Path) -> Option<(Vec<SerializedSeal>, usize)> {
     let mut undecodable = 0usize;
     let mut checksum_refused = 0usize;
     let mut buf = [0u8; SEAL_SPILL_RECORD_SIZE];
-    // The loop ends on the first read error, which is either a clean EOF or a
-    // truncated trailing record (a torn write at the moment of the crash).
-    // Either way nothing further in the file is readable.
-    while reader.read_exact(&mut buf).is_ok() {
+    // The loop ends at `UnexpectedEof`: a clean end of file, or a truncated
+    // trailing record (a torn write at the moment of the crash). Nothing
+    // further in the file is readable then.
+    //
+    // ⚠ CORRECTED 2026-10-13 (audit DA-13a). This loop was
+    // `while read_exact(..).is_ok()`, so ANY read error (EIO on a bad block,
+    // ESTALE) ended it like a clean end of file. The caller then re-ingested
+    // the prefix and archived the file as fully recovered, and every record
+    // after the error was in no table and on no counter. Any other error now
+    // returns `None`: the caller keeps the file staged and logs it coded, the
+    // same way `read_step` (the mid-session reader of the same files) does.
+    loop {
+        match reader.read_exact(&mut buf) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(err) => {
+                warn!(
+                    ?path,
+                    ?err,
+                    "seal recovery: read error in a staged spill file"
+                );
+                return None;
+            }
+        }
         // Format-version gate — the SAME `!=` test as `SealSpillWriter::read_all`.
         //
         // ⚠ CORRECTED 2026-09-22. This gate refused only `buf[7] == 0`, the
@@ -723,9 +771,25 @@ fn read_staged_dlq(path: &Path) -> Option<(Vec<SerializedSeal>, usize)> {
     let mut out = Vec::new();
     let mut undecodable = 0usize;
     for line in BufReader::new(file).lines() {
-        let Ok(line) = line else {
-            undecodable += 1;
-            continue;
+        // Bad UTF-8 (`InvalidData`) consumes the line's bytes, so counting it
+        // undecodable and moving on is right. Any other error does not
+        // advance the reader: `lines()` returns it again forever, which spun
+        // the boot drain before its first cycle (audit DA-13a). The file is
+        // left staged instead.
+        let line = match line {
+            Ok(line) => line,
+            Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
+                undecodable += 1;
+                continue;
+            }
+            Err(err) => {
+                warn!(
+                    ?path,
+                    ?err,
+                    "seal recovery: read error in a staged dlq file"
+                );
+                return None;
+            }
         };
         if line.trim().is_empty() {
             continue;
@@ -970,13 +1034,47 @@ fn remove_boot_summary(spill_dir: &Path) {
 /// Stops at the first flush failure (QuestDB is down; the remaining files
 /// stay staged for the next boot) and reports exactly how many seals are
 /// still on disk rather than in the database.
+///
+/// With no runner to take them, a file flushed while a QuestDB watcher is
+/// expected (DA-13a review) stays in `replaying/` until the next boot reads
+/// it again. The production writer goes through
+/// [`drain_recovered_seals_for_replay`], which hands such files to its
+/// mid-session replay to archive once the watcher confirms them.
 pub fn drain_recovered_seals<S: SealSink>(
     writer: &mut S,
     spill_dir: &Path,
     dlq_dir: &Path,
     max_batch: usize,
 ) -> BootDrainOutcome {
-    let outcome = drain_recovered_seals_once(writer, spill_dir, dlq_dir, max_batch);
+    let mut replay = MidSessionReplay::default();
+    drain_recovered_seals_for_replay(writer, spill_dir, dlq_dir, max_batch, &mut replay)
+}
+
+/// [`drain_recovered_seals`] for the seal writer runner (DA-13a review): a
+/// file every flush of which was acked while a QuestDB watcher is expected or
+/// running is not archived here. It stays in `replaying/` and joins `replay`'s
+/// awaiting list, so it is archived only once the watcher has reported
+/// [`SEAL_REPLAY_ARCHIVE_CONFIRM_PROBES`] clean probes behind its last flush,
+/// exactly as a file the mid-session replay finished. With no watcher expected
+/// (tests, a process that never spawns one) the file is archived at once.
+///
+/// Cold path, once per boot. Allowed to allocate.
+pub fn drain_recovered_seals_for_replay<S: SealSink>(
+    writer: &mut S,
+    spill_dir: &Path,
+    dlq_dir: &Path,
+    max_batch: usize,
+    replay: &mut MidSessionReplay,
+) -> BootDrainOutcome {
+    let outcome = drain_recovered_seals_once(
+        writer,
+        spill_dir,
+        dlq_dir,
+        max_batch,
+        &boot_drain_probe,
+        replay,
+        chrono::Utc::now().timestamp(),
+    );
     // PR40b-f: the retention sweep may now delete aged unreplayed files here.
     // Whatever the drain found, it has read the folder; a file it left
     // staged stays inside the age window or is reported when it ages out.
@@ -984,12 +1082,79 @@ pub fn drain_recovered_seals<S: SealSink>(
     outcome
 }
 
-/// One boot drain; see [`drain_recovered_seals`].
+/// What the boot drain reads of the QuestDB WAL-suspension watcher (DA-13a):
+/// the process-wide view, three atomic loads.
+///
+/// In this crate's own unit tests it reads "no watcher": one of them starts a
+/// real watcher against a closed port, whose failed probe sets the
+/// process-wide flag at a moment no other test controls. The gate itself is
+/// tested through [`drain_recovered_seals_once`] with an injected probe.
+fn boot_drain_probe() -> ReplayProbe {
+    #[cfg(not(test))]
+    {
+        ReplayProbe::current()
+    }
+    #[cfg(test)]
+    {
+        ReplayProbe::default()
+    }
+}
+
+/// Reads the watcher once for the boot drain and feeds the reading to the
+/// replay that will archive the files this drain hands it (DA-13a review).
+/// A reading that turns suspect clears that replay's awaiting list
+/// ([`MidSessionReplay::observe_probe`]), so the files already handed over
+/// are counted back as held and pending here. O(1) plus, on that transition,
+/// O(files handed over).
+fn read_boot_probe(
+    probe: &dyn Fn() -> ReplayProbe,
+    replay: &mut MidSessionReplay,
+    now_unix_secs: i64,
+    outcome: &mut BootDrainOutcome,
+) -> ReplayProbe {
+    let reading = probe();
+    replay.observe_probe(reading, now_unix_secs);
+    if reading.suspect && outcome.files_awaiting_confirm > 0 {
+        outcome.files_left_pending += outcome.files_awaiting_confirm;
+        outcome.files_held_sink_suspect += outcome.files_awaiting_confirm;
+        outcome.seals_left_pending += outcome.seals_awaiting_confirm;
+        outcome.files_awaiting_confirm = 0;
+        outcome.seals_awaiting_confirm = 0;
+    }
+    reading
+}
+
+/// One boot drain; see [`drain_recovered_seals_for_replay`].
+///
+/// `probe` is read before each file, after each of its flushes, and once more
+/// after its last (DA-13a). While it reads suspect the drain stops and leaves
+/// the file staged: a WAL-suspended table answers 2xx and applies nothing, so
+/// an archive then would move the only copy out of reach on the strength of an
+/// ack that proves nothing. A suspicion seen after a file was handed over
+/// takes it back (see [`read_boot_probe`]).
+///
+/// A file whose flushes were all acked is archived at once only when no
+/// watcher is expected or running ([`ReplayProbe::is_running`] false). The
+/// boot drain runs before the watcher's first verdict, so in production the
+/// watcher is EXPECTED (`main.rs` marks it before the seal writer starts) and
+/// the file goes to `replay`'s awaiting list instead. Past
+/// [`SEAL_REPLAY_HELD_LIMIT`] it simply stays staged: the mid-session replay
+/// reads a spill file again, and the next boot any file; the DEDUP keys
+/// collapse the repeats.
+///
+/// Honest limits: the awaiting list lives in memory, so a crash before the
+/// confirmation leaves the file in `replaying/` (re-read next boot, with the
+/// summary of committed copies still on disk). The mid-session replay reads
+/// only spill files, so a dead-letter file taken back by a suspicion waits in
+/// `replaying/` for the next boot: kept, not lost.
 fn drain_recovered_seals_once<S: SealSink>(
     writer: &mut S,
     spill_dir: &Path,
     dlq_dir: &Path,
     max_batch: usize,
+    probe: &dyn Fn() -> ReplayProbe,
+    replay: &mut MidSessionReplay,
+    now_unix_secs: i64,
 ) -> BootDrainOutcome {
     let mut outcome = BootDrainOutcome::default();
     let batch = max_batch.max(1);
@@ -1023,11 +1188,26 @@ fn drain_recovered_seals_once<S: SealSink>(
     // summary of what it committed; seed from it before reading any file.
     seed_from_boot_summary(spill_dir, &mut written, &mut outcome);
     let mut halted = false;
+    // DA-13a: set once the database reads suspect; every later file stays
+    // staged and is counted as held for that reason.
+    let mut held_suspect = false;
     for path in &staged {
-        if halted {
-            // QuestDB is down — count the untouched remainder honestly
-            // instead of burning a bounded flush timeout per file.
+        if !halted
+            && !held_suspect
+            && read_boot_probe(probe, replay, now_unix_secs, &mut outcome).suspect
+        {
+            // The database is suspect, so a flush would be acked without
+            // being applied. Leave this and every later file staged.
+            held_suspect = true;
+        }
+        if halted || held_suspect {
+            // QuestDB is down or suspect — count the untouched remainder
+            // honestly instead of burning a bounded flush timeout per file.
+            // Unread, so its seal count is unknown: files only, no seals.
             outcome.files_left_pending += 1;
+            if held_suspect {
+                outcome.files_held_sink_suspect += 1;
+            }
             continue;
         }
         // A file we could not READ is never a file we may ARCHIVE.
@@ -1078,6 +1258,11 @@ fn drain_recovered_seals_once<S: SealSink>(
 
         let mut committed = 0usize;
         let mut file_ok = true;
+        // DA-13a review: the watcher turned suspect after one of this file's
+        // flushes; the rest of the file is not sent.
+        let mut suspect_mid_file = false;
+        // The reading taken after this file's latest flush, if it had one.
+        let mut last_read: Option<ReplayProbe> = None;
         // Seals of this file the writer refused. Until 2026-09-27 the refusal
         // was logged and skipped, the file was archived as if every seal had
         // landed, and the boot printed "every recovered seal re-ingested".
@@ -1147,6 +1332,15 @@ fn drain_recovered_seals_once<S: SealSink>(
                 Ok(()) => {
                     committed += appended;
                     written.commit_pending();
+                    // Read after every flush, so a suspicion episode (at
+                    // least one watcher poll long) cannot start and end
+                    // unseen inside a long file.
+                    let reading = read_boot_probe(probe, replay, now_unix_secs, &mut outcome);
+                    last_read = Some(reading);
+                    if reading.suspect {
+                        suspect_mid_file = true;
+                        break;
+                    }
                 }
                 Err(flush_err) => {
                     error!(
@@ -1166,7 +1360,29 @@ fn drain_recovered_seals_once<S: SealSink>(
             }
         }
 
-        outcome.seals_reingested += committed;
+        // DA-13a: every flush of this file was acked, but an ack from a
+        // suspect sink proves nothing. Re-read the flag after the last flush;
+        // if it is set, the file stays staged and its seals count as pending,
+        // not re-ingested. The re-send on the next read is collapsed by the
+        // DEDUP keys.
+        let after = if file_ok && !suspect_mid_file {
+            // Taken after the last flush already, unless the file had none.
+            match last_read {
+                Some(reading) => reading,
+                None => read_boot_probe(probe, replay, now_unix_secs, &mut outcome),
+            }
+        } else {
+            ReplayProbe::default()
+        };
+        if file_ok && (suspect_mid_file || after.suspect) {
+            outcome.files_left_pending += 1;
+            outcome.files_held_sink_suspect += 1;
+            outcome.seals_left_pending += records.len();
+            outcome.seals_append_failed += append_failed;
+            held_suspect = true;
+            continue;
+        }
+
         outcome.seals_append_failed += append_failed;
 
         if file_ok && append_failed > 0 && !staged_file_is_past_refusal_retry(path) {
@@ -1174,9 +1390,38 @@ fn drain_recovered_seals_once<S: SealSink>(
             // are still worth trying: no `halted`. Re-reading this file on the
             // next boot re-sends the seals that did land, and the DEDUP key
             // collapses them.
+            outcome.seals_reingested += committed;
             outcome.files_left_pending += 1;
             outcome.seals_left_pending += append_failed;
+        } else if file_ok && after.is_running() {
+            // DA-13a review: a watcher is expected or running, so the acks
+            // are not proof until it confirms them. The file stays staged and
+            // waits in the replay's list; its seals given up on (if any) are
+            // reported when the replay moves it to `refused/`, once.
+            if append_failed > 0 {
+                error!(
+                    code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                    ?path,
+                    append_failed,
+                    retry_secs = SEAL_REFUSED_FILE_RETRY_SECS,
+                    "seal recovery: seals in this file were refused on every boot for the \
+                     whole retry window — NOT re-ingested; the file goes to refused/ once \
+                     QuestDB confirms the rest"
+                );
+            }
+            let unrecovered = file_undecodable.saturating_add(append_failed);
+            if replay.adopt_boot_flushed(path.clone(), unrecovered, after.clean_probes) {
+                outcome.files_awaiting_confirm += 1;
+                outcome.seals_awaiting_confirm += committed;
+            } else {
+                // The replay's list is full: the file stays staged and is
+                // read again (the mid-session replay for a spill file, the
+                // next boot for any). Nothing is lost by reading it twice.
+                outcome.files_left_pending += 1;
+                outcome.seals_left_pending += committed;
+            }
         } else if file_ok {
+            outcome.seals_reingested += committed;
             if append_failed > 0 {
                 // Bounded retry: a file older than the retry window has been
                 // refused on every boot since, so the refusal is in the data,
@@ -1211,6 +1456,7 @@ fn drain_recovered_seals_once<S: SealSink>(
                 }
             }
         } else {
+            outcome.seals_reingested += committed;
             outcome.files_left_pending += 1;
             outcome.seals_left_pending += records.len().saturating_sub(committed);
             halted = true;
@@ -1220,7 +1466,10 @@ fn drain_recovered_seals_once<S: SealSink>(
     // S1: a drain that leaves files staged hands what it (and every earlier
     // stopped drain) committed to the next boot; one that leaves none removes
     // the summary, since no staged copy is left to compare.
-    if outcome.files_left_pending > 0 {
+    // DA-13a review: a file waiting for the watcher's confirmation is still
+    // on disk too, and a later boot may read it again, so it keeps the
+    // summary as a staged file does.
+    if outcome.files_left_pending > 0 || outcome.files_awaiting_confirm > 0 {
         persist_boot_summary(spill_dir, &written, &mut outcome);
     } else {
         remove_boot_summary(spill_dir);
@@ -1230,9 +1479,12 @@ fn drain_recovered_seals_once<S: SealSink>(
         error!(
             code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
             files_pending = outcome.files_left_pending,
+            files_held_sink_suspect = outcome.files_held_sink_suspect,
+            files_awaiting_confirm = outcome.files_awaiting_confirm,
             seals_pending = outcome.seals_left_pending,
             seals_append_failed = outcome.seals_append_failed,
             seals_reingested = outcome.seals_reingested,
+            seals_awaiting_confirm = outcome.seals_awaiting_confirm,
             "seal recovery INCOMPLETE — sealed candles are on DISK and NOT in QuestDB"
         );
     } else if outcome.seals_append_failed > 0 {
@@ -1243,6 +1495,16 @@ fn drain_recovered_seals_once<S: SealSink>(
             files_archived = outcome.files_archived,
             "seal recovery finished with refused seals NOT re-ingested — their \
              bytes are kept for good in refused/"
+        );
+    } else if outcome.files_awaiting_confirm > 0 {
+        info!(
+            files_archived = outcome.files_archived,
+            seals_reingested = outcome.seals_reingested,
+            files_awaiting_confirm = outcome.files_awaiting_confirm,
+            seals_awaiting_confirm = outcome.seals_awaiting_confirm,
+            "seal recovery flushed every recovered seal — the files stay in replaying/ \
+             until the QuestDB WAL-suspension watcher confirms them (two clean probes), \
+             then they are archived"
         );
     } else {
         info!(
@@ -1432,26 +1694,35 @@ const SEAL_REPLAY_ARCHIVE_CONFIRM_PROBES: u64 = 2;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ReplayProbe {
     /// Clean probes reported so far this process. `0` with `suspect == false`
-    /// means no watcher has reported, and the replay behaves as before PR41b.
+    /// and `expected == false` means no watcher runs in this process, and the
+    /// replay behaves as before PR41b.
     pub clean_probes: u64,
     /// `true` while a table is suspended, lagging, or the probe is blind.
     pub suspect: bool,
+    /// DA-13a review: this process will run the watcher
+    /// ([`crate::wal_applied_watermark::AppliedWatermark::mark_probe_expected`]),
+    /// although it may not have reported yet. Before its first verdict
+    /// `clean_probes == 0 && !suspect` reads exactly like "no watcher", and the
+    /// replay used to archive on a bare 2xx in that window.
+    pub expected: bool,
 }
 
 impl ReplayProbe {
-    /// The process-global watcher's current view. Two atomic loads.
+    /// The process-global watcher's current view. Three atomic loads.
     #[must_use]
     pub fn current() -> Self {
         let wm = crate::wal_applied_watermark::applied_watermark();
         Self {
             clean_probes: wm.clean_probe_count(),
             suspect: wm.is_sink_suspect(),
+            expected: wm.is_probe_expected(),
         }
     }
 
-    /// `true` once any probe has reported, clean or not.
+    /// `true` once a watcher is expected or any probe has reported, clean or
+    /// not: a finished file then waits for two clean probes behind it.
     const fn is_running(self) -> bool {
-        self.clean_probes > 0 || self.suspect
+        self.expected || self.clean_probes > 0 || self.suspect
     }
 }
 
@@ -1602,6 +1873,10 @@ struct AwaitingArchive {
     path: PathBuf,
     /// The file holds a seal the replay skipped: it goes to `refused/`.
     refused: bool,
+    /// Seals given up on that are still to be reported, once, when the file
+    /// leaves `replaying/` (row 296). Non-zero only for a file the boot drain
+    /// handed over (DA-13a review); the replay reports its own as it reads.
+    unrecovered: usize,
     /// Clean probes reported when its last record was flushed.
     clean_probes_at_finish: u64,
 }
@@ -1757,6 +2032,33 @@ impl MidSessionReplay {
         rewound
     }
 
+    /// DA-13a review: take a file the boot drain flushed while a QuestDB
+    /// watcher is expected or running. It waits in the awaiting list exactly
+    /// like a file this replay finished: archived (to `refused/` when
+    /// `unrecovered > 0`, reporting those seals then) once
+    /// [`SEAL_REPLAY_ARCHIVE_CONFIRM_PROBES`] clean probes have reported past
+    /// `clean_probes_at_finish` with no suspicion, and dropped from the list
+    /// (left staged) if the database turns suspect first. Returns `false`,
+    /// taking nothing, when the list already holds [`SEAL_REPLAY_HELD_LIMIT`]
+    /// files. O(1).
+    fn adopt_boot_flushed(
+        &mut self,
+        path: PathBuf,
+        unrecovered: usize,
+        clean_probes_at_finish: u64,
+    ) -> bool {
+        if self.awaiting_archive.len() >= SEAL_REPLAY_HELD_LIMIT {
+            return false;
+        }
+        self.awaiting_archive.push(AwaitingArchive {
+            path,
+            refused: unrecovered > 0,
+            unrecovered,
+            clean_probes_at_finish,
+        });
+        true
+    }
+
     /// Close the gate and remember when, for the probe path to reopen it.
     fn note_failure(&mut self, now_unix_secs: i64) {
         self.healthy_since = None;
@@ -1888,6 +2190,7 @@ impl MidSessionReplay {
             match archive_staged(&entry.path, entry.refused) {
                 Ok(()) => {
                     outcome.files_archived += 1;
+                    outcome.records_skipped += entry.unrecovered;
                     info!(
                         path = ?entry.path,
                         refused = entry.refused,
@@ -2061,6 +2364,7 @@ impl MidSessionReplay {
             self.awaiting_archive.push(AwaitingArchive {
                 path,
                 refused,
+                unrecovered: 0,
                 clean_probes_at_finish: self.probe.clean_probes,
             });
             self.cursor = None;
@@ -3647,6 +3951,7 @@ mod tests {
         // what the global reports; read both and compare.
         assert_eq!(probe.clean_probes, wm.clean_probe_count());
         assert_eq!(probe.suspect, wm.is_sink_suspect());
+        assert_eq!(probe.expected, wm.is_probe_expected());
         assert!(
             !ReplayProbe::default().is_running(),
             "no probe seen reads as no watcher"
@@ -3667,6 +3972,7 @@ mod tests {
         let probe = ReplayProbe {
             clean_probes: 1,
             suspect: false,
+            ..ReplayProbe::default()
         };
         assert_eq!(replay.observe_probe(probe, t0 + 20), 0);
         assert!(
@@ -3693,6 +3999,7 @@ mod tests {
             ReplayProbe {
                 clean_probes: 3,
                 suspect: true,
+                ..ReplayProbe::default()
             },
             t0 + SEAL_REPLAY_HEALTHY_SECS,
         );
@@ -3713,6 +4020,7 @@ mod tests {
         let mut probe = ReplayProbe {
             clean_probes: 1,
             suspect: false,
+            ..ReplayProbe::default()
         };
         replay.observe_probe(probe, t0);
         let mut sink = ReplaySink::default();
@@ -3757,6 +4065,7 @@ mod tests {
             ReplayProbe {
                 clean_probes: 1,
                 suspect: false,
+                ..ReplayProbe::default()
             },
             t0,
         );
@@ -3781,6 +4090,7 @@ mod tests {
             ReplayProbe {
                 clean_probes: 1,
                 suspect: true,
+                ..ReplayProbe::default()
             },
             now,
         );
@@ -3797,6 +4107,7 @@ mod tests {
             ReplayProbe {
                 clean_probes: 2,
                 suspect: false,
+                ..ReplayProbe::default()
             },
             now + 700,
         );
@@ -3842,6 +4153,7 @@ mod tests {
         let suspect = ReplayProbe {
             clean_probes: 0,
             suspect: true,
+            ..ReplayProbe::default()
         };
         assert_eq!(replay.observe_probe(suspect, 10), 2);
         assert_eq!(replay.cursor.as_ref().map(|c| c.offset), Some(0));
@@ -5003,5 +5315,488 @@ mod tests {
             .unwrap_or("");
         assert!(drop.contains("self.parked.len()"));
         assert!(drop.contains("saturating_sub(parked)"));
+    }
+
+    // -----------------------------------------------------------------------
+    // DA-13a — the boot drain never archives on an ack it cannot trust, and
+    // never reads an I/O error as the end of a file
+    // -----------------------------------------------------------------------
+
+    // Regression: 2026-10-13 — DA-13a. The boot drain archived a staged file
+    // on any 2xx flush, including one from a WAL-suspended table that applies
+    // nothing; the mid-session replay already waited for clean probes.
+    #[test]
+    fn test_regression_da13a_boot_drain_holds_every_file_while_the_sink_is_suspect() {
+        let (spill, dlq) = temp_pair("da13a-suspect-start");
+        let writer = crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(spill.clone());
+        let t0 = jan1_noon_utc();
+        spill_range(&writer, 0, 3, t0);
+        spill_range(&writer, 10, 2, t0 + 86_400);
+
+        let mut sink = ReplaySink::default();
+        let out = drain_recovered_seals_once(
+            &mut sink,
+            &spill,
+            &dlq,
+            64,
+            &suspect_probe,
+            &mut MidSessionReplay::default(),
+            t0,
+        );
+        assert_eq!(out.files_archived, 0, "nothing archived on a suspect sink");
+        assert_eq!(out.files_left_pending, 2);
+        assert_eq!(out.files_held_sink_suspect, 2);
+        assert_eq!(out.seals_reingested, 0);
+        // DA-13a review: both files were held UNREAD, so their seal count is
+        // unknown and none is claimed as pending.
+        assert_eq!(out.seals_left_pending, 0);
+        assert_eq!(sink.flushes, 0, "no flush into a suspect sink");
+        assert_eq!(count_bin(&spill.join(SEAL_REPLAYING_SUBDIR)), 2);
+
+        // Once the sink is clean the next drain re-ingests and archives both.
+        let out = drain_recovered_seals_once(
+            &mut sink,
+            &spill,
+            &dlq,
+            64,
+            &ReplayProbe::default,
+            &mut MidSessionReplay::default(),
+            t0,
+        );
+        assert_eq!(out.files_archived, 2);
+        assert_eq!(out.files_held_sink_suspect, 0);
+        assert_eq!(out.seals_reingested, 5);
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn test_regression_da13a_boot_drain_keeps_a_file_staged_when_the_sink_turns_suspect_after_its_flush()
+     {
+        let (spill, dlq) = temp_pair("da13a-suspect-after");
+        let writer = crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(spill.clone());
+        let t0 = jan1_noon_utc();
+        spill_range(&writer, 0, 3, t0);
+        spill_range(&writer, 10, 2, t0 + 86_400);
+
+        // Clean before the first file's flush, suspect when it is checked
+        // again before the archive.
+        let reads = std::cell::Cell::new(0u32);
+        let suspect = || {
+            reads.set(reads.get() + 1);
+            ReplayProbe {
+                suspect: reads.get() > 1,
+                ..ReplayProbe::default()
+            }
+        };
+        let mut sink = ReplaySink::default();
+        let out = drain_recovered_seals_once(
+            &mut sink,
+            &spill,
+            &dlq,
+            64,
+            &suspect,
+            &mut MidSessionReplay::default(),
+            t0,
+        );
+        assert_eq!(sink.committed, vec![0, 1, 2], "the first file was flushed");
+        assert_eq!(
+            out.files_archived, 0,
+            "but not archived: the ack proves nothing"
+        );
+        assert_eq!(
+            out.seals_reingested, 0,
+            "acked seals are not counted as landed"
+        );
+        assert_eq!(out.seals_left_pending, 3);
+        assert_eq!(out.files_left_pending, 2);
+        assert_eq!(out.files_held_sink_suspect, 2);
+        assert_eq!(count_bin(&spill.join(SEAL_REPLAYING_SUBDIR)), 2);
+        cleanup(&spill, &dlq);
+    }
+
+    // Regression: 2026-10-13 — DA-13a. Any read error ended the staged spill
+    // walk like a clean end of file, so the prefix was re-ingested and the
+    // file archived as fully recovered.
+    #[test]
+    fn test_regression_da13a_read_staged_spill_returns_none_on_a_read_error() {
+        let (spill, dlq) = temp_pair("da13a-read-err");
+        // A directory opens on Linux and every read fails with EISDIR: a read
+        // error that is not `UnexpectedEof`.
+        let dir_path = spill.join("seals_v5-20260101.bin");
+        std::fs::create_dir_all(&dir_path).expect("mkdir");
+        assert!(read_staged_spill(&dir_path).is_none());
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn test_regression_da13a_read_staged_spill_still_stops_at_a_torn_tail() {
+        let (spill, dlq) = temp_pair("da13a-torn");
+        std::fs::create_dir_all(&spill).expect("mkdir");
+        let path = spill.join("seals_v5-20260101.bin");
+        let seal = SerializedSeal::from(&mk_seal(13, 0, TfIndex::M1, 7, 101.5));
+        let mut bytes = seal.to_bytes().to_vec();
+        bytes.extend_from_slice(&[0u8; SEAL_SPILL_RECORD_SIZE / 2]);
+        std::fs::write(&path, &bytes).expect("write");
+        let (records, undecodable) = read_staged_spill(&path).expect("torn tail is readable");
+        assert_eq!(records.len(), 1);
+        assert_eq!(undecodable, 0);
+        cleanup(&spill, &dlq);
+    }
+
+    // Regression: 2026-10-13 — DA-13a. A read error that does not advance the
+    // reader made `lines()` return it forever, so the boot drain spun before
+    // its first cycle. Run on a thread so a regression fails instead of hanging.
+    #[test]
+    fn test_regression_da13a_read_staged_dlq_returns_none_on_a_read_error_instead_of_spinning() {
+        let (spill, dlq) = temp_pair("da13a-dlq-err");
+        let dir_path = dlq.join("seals-dlq-20260101.ndjson");
+        std::fs::create_dir_all(&dir_path).expect("mkdir");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe = dir_path.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_staged_dlq(&probe).is_none());
+        });
+        let returned_none = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("read_staged_dlq must return, not spin on a read error");
+        assert!(returned_none);
+        cleanup(&spill, &dlq);
+    }
+
+    // -----------------------------------------------------------------------
+    // DA-13a review — the boot drain runs before the watcher's first verdict,
+    // so it archives only after the watcher confirms
+    // -----------------------------------------------------------------------
+
+    fn suspect_probe() -> ReplayProbe {
+        ReplayProbe {
+            suspect: true,
+            ..ReplayProbe::default()
+        }
+    }
+
+    /// The production state at boot: the watcher is expected (marked before
+    /// the seal writer starts) and has not reported yet.
+    fn expected_probe() -> ReplayProbe {
+        ReplayProbe {
+            expected: true,
+            ..ReplayProbe::default()
+        }
+    }
+
+    fn clean(clean_probes: u64) -> ReplayProbe {
+        ReplayProbe {
+            clean_probes,
+            expected: true,
+            ..ReplayProbe::default()
+        }
+    }
+
+    /// Two spill files (3 + 2 seals) and one dead-letter file (1 seal).
+    fn da13a_review_fixture(name: &str) -> (PathBuf, PathBuf, i64) {
+        let (spill, dlq) = temp_pair(name);
+        let writer = crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(spill.clone());
+        let t0 = jan1_noon_utc();
+        spill_range(&writer, 0, 3, t0);
+        spill_range(&writer, 10, 2, t0 + 86_400);
+        z6_dead_letter(&dlq, &mk_seal(13, 0, TfIndex::M1, 50, 101.5), t0);
+        (spill, dlq, t0)
+    }
+
+    fn archive_now(replay: &mut MidSessionReplay, probe: ReplayProbe, now: i64) -> ReplayOutcome {
+        let mut outcome = ReplayOutcome::default();
+        outcome.files_rewound = replay.observe_probe(probe, now);
+        replay.archive_confirmed(&mut outcome);
+        outcome
+    }
+
+    // Regression: 2026-10-13 — DA-13a review. In production the boot drain
+    // runs before the WAL-suspension watcher's first verdict, when
+    // `clean_probes == 0 && !suspect`: the suspect gate never fired and every
+    // flushed file was archived on a 2xx a suspended table may have sent.
+    #[test]
+    fn test_regression_da13a_boot_drain_archives_nothing_before_the_expected_watcher_reports() {
+        let (spill, dlq, t0) = da13a_review_fixture("da13a-rv-expected");
+        let mut sink = ReplaySink::default();
+        let mut replay = MidSessionReplay::default();
+        let out = drain_recovered_seals_once(
+            &mut sink,
+            &spill,
+            &dlq,
+            64,
+            &expected_probe,
+            &mut replay,
+            t0,
+        );
+        assert_eq!(sink.committed.len(), 6, "every seal was flushed");
+        assert_eq!(out.files_archived, 0, "but nothing archived on a bare 2xx");
+        assert_eq!(out.files_awaiting_confirm, 3);
+        assert_eq!(out.seals_awaiting_confirm, 6);
+        assert_eq!(out.seals_reingested, 0, "acked is not confirmed");
+        assert_eq!((out.files_left_pending, out.seals_left_pending), (0, 0));
+        assert_eq!(replay.awaiting_archive.len(), 3);
+        assert_eq!(count_bin(&spill.join(SEAL_REPLAYING_SUBDIR)), 2);
+        assert_eq!(count_bin(&dlq.join(SEAL_REPLAYING_SUBDIR)), 1);
+        assert!(
+            spill.join(SEAL_BOOT_SUMMARY_FILE).exists(),
+            "files still on disk keep the summary of committed copies"
+        );
+
+        // The watcher is expected but never reports: nothing is archived.
+        for at in 0..5 {
+            let o = archive_now(&mut replay, expected_probe(), t0 + at);
+            assert_eq!(o.files_archived, 0);
+        }
+        // One clean probe may have started before the flush: not enough.
+        assert_eq!(
+            archive_now(&mut replay, clean(1), t0 + 60).files_archived,
+            0
+        );
+        // The second confirms every file, the dead-letter one included.
+        assert_eq!(
+            archive_now(&mut replay, clean(2), t0 + 120).files_archived,
+            3
+        );
+        assert_eq!(count_bin(&spill.join(SEAL_REPLAYING_SUBDIR)), 0);
+        assert_eq!(count_bin(&dlq.join(SEAL_REPLAYING_SUBDIR)), 0);
+        assert_eq!(count_bin(&spill.join(SEAL_ARCHIVE_SUBDIR)), 2);
+        assert_eq!(count_bin(&dlq.join(SEAL_ARCHIVE_SUBDIR)), 1);
+        // Archived exactly once.
+        assert_eq!(
+            archive_now(&mut replay, clean(9), t0 + 600).files_archived,
+            0
+        );
+        assert!(replay.awaiting_archive.is_empty());
+        assert_eq!(sink.committed.len(), 6, "nothing written twice");
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn test_regression_da13a_boot_drain_files_are_taken_back_when_suspicion_comes_before_confirmation()
+     {
+        let (spill, dlq, t0) = da13a_review_fixture("da13a-rv-late-suspect");
+        let mut sink = ReplaySink::default();
+        let mut replay = MidSessionReplay::default();
+        let out = drain_recovered_seals_once(
+            &mut sink,
+            &spill,
+            &dlq,
+            64,
+            &expected_probe,
+            &mut replay,
+            t0,
+        );
+        assert_eq!(out.files_awaiting_confirm, 3);
+        assert_eq!(
+            archive_now(&mut replay, clean(1), t0 + 60).files_archived,
+            0
+        );
+        // Suspect before the second clean probe: every file is taken back.
+        let suspect = ReplayProbe {
+            clean_probes: 1,
+            suspect: true,
+            expected: true,
+        };
+        let o = archive_now(&mut replay, suspect, t0 + 120);
+        assert_eq!((o.files_archived, o.files_rewound), (0, 3));
+        assert!(replay.awaiting_archive.is_empty());
+        // Clean again: nothing archived without a re-read.
+        assert_eq!(
+            archive_now(&mut replay, clean(5), t0 + 600).files_archived,
+            0
+        );
+        assert_eq!(count_bin(&spill.join(SEAL_ARCHIVE_SUBDIR)), 0);
+        assert_eq!(count_bin(&dlq.join(SEAL_ARCHIVE_SUBDIR)), 0);
+        // The spill files are read again by the mid-session replay; the
+        // dead-letter file stays staged for the next boot (kept, not lost).
+        assert_eq!(count_bin(&spill.join(SEAL_REPLAYING_SUBDIR)), 2);
+        assert_eq!(count_bin(&dlq.join(SEAL_REPLAYING_SUBDIR)), 1);
+        let next = replay
+            .next_staged_file(&spill, t0 + 600)
+            .expect("a spill file to re-read");
+        assert_eq!(staged_kind(&next), Some(StagedKind::Spill));
+        assert!(replay.next_staged_file(&dlq, t0 + 600).is_none());
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn test_regression_da13a_boot_drain_takes_back_handed_over_files_when_it_sees_suspicion() {
+        let (spill, dlq, t0) = da13a_review_fixture("da13a-rv-drain-suspect");
+        // Clean (expected) through the first file, suspect from the second.
+        let reads = std::cell::Cell::new(0u32);
+        let probe = || {
+            reads.set(reads.get() + 1);
+            ReplayProbe {
+                suspect: reads.get() > 2,
+                expected: true,
+                ..ReplayProbe::default()
+            }
+        };
+        let mut sink = ReplaySink::default();
+        let mut replay = MidSessionReplay::default();
+        let out = drain_recovered_seals_once(&mut sink, &spill, &dlq, 64, &probe, &mut replay, t0);
+        assert_eq!(
+            sink.committed,
+            vec![0, 1, 2],
+            "only the first file was sent"
+        );
+        assert_eq!(
+            (out.files_awaiting_confirm, out.seals_awaiting_confirm),
+            (0, 0)
+        );
+        assert!(
+            replay.awaiting_archive.is_empty(),
+            "the handed-over file is taken back"
+        );
+        assert_eq!(out.files_archived, 0);
+        assert_eq!(out.files_left_pending, 3);
+        assert_eq!(out.files_held_sink_suspect, 3);
+        assert_eq!(out.seals_left_pending, 3, "only the file that was read");
+        assert_eq!(out.seals_reingested, 0);
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn test_regression_da13a_boot_drain_leaves_a_file_staged_past_the_held_limit() {
+        let (spill, dlq) = temp_pair("da13a-rv-held-limit");
+        let writer = crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(spill.clone());
+        let t0 = jan1_noon_utc();
+        spill_range(&writer, 0, 4, t0);
+        let mut replay = MidSessionReplay::default();
+        for i in 0..SEAL_REPLAY_HELD_LIMIT {
+            assert!(replay.adopt_boot_flushed(PathBuf::from(format!("x{i}.bin")), 0, 0));
+        }
+        assert!(!replay.adopt_boot_flushed(PathBuf::from("full.bin"), 0, 0));
+        let mut sink = ReplaySink::default();
+        let out = drain_recovered_seals_once(
+            &mut sink,
+            &spill,
+            &dlq,
+            64,
+            &expected_probe,
+            &mut replay,
+            t0,
+        );
+        assert_eq!(out.files_archived, 0);
+        assert_eq!(out.files_awaiting_confirm, 0);
+        assert_eq!((out.files_left_pending, out.seals_left_pending), (1, 4));
+        assert_eq!(replay.awaiting_archive.len(), SEAL_REPLAY_HELD_LIMIT);
+        assert_eq!(
+            count_bin(&spill.join(SEAL_REPLAYING_SUBDIR)),
+            1,
+            "kept staged"
+        );
+        assert!(spill.join(SEAL_BOOT_SUMMARY_FILE).exists());
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn test_regression_da13a_a_crash_before_confirmation_leaves_every_file_for_the_next_boot() {
+        let (spill, dlq, t0) = da13a_review_fixture("da13a-rv-crash");
+        let mut sink = ReplaySink::default();
+        let mut replay = MidSessionReplay::default();
+        let out = drain_recovered_seals_once(
+            &mut sink,
+            &spill,
+            &dlq,
+            64,
+            &expected_probe,
+            &mut replay,
+            t0,
+        );
+        assert_eq!(out.files_awaiting_confirm, 3);
+        // The process dies: the awaiting list is gone with it.
+        drop(replay);
+        assert_eq!(count_bin(&spill.join(SEAL_REPLAYING_SUBDIR)), 2);
+        assert_eq!(count_bin(&dlq.join(SEAL_REPLAYING_SUBDIR)), 1);
+        assert!(spill.join(SEAL_BOOT_SUMMARY_FILE).exists());
+        // The next boot (no watcher here) reads every file again and archives.
+        let mut next = ReplaySink::default();
+        let out = drain_recovered_seals_once(
+            &mut next,
+            &spill,
+            &dlq,
+            64,
+            &ReplayProbe::default,
+            &mut MidSessionReplay::default(),
+            t0 + 86_400,
+        );
+        assert_eq!(out.files_archived, 3);
+        assert_eq!(out.seals_reingested, 6);
+        assert_eq!(
+            next.committed.len(),
+            6,
+            "every seal re-sent; DEDUP collapses them"
+        );
+        assert!(!spill.join(SEAL_BOOT_SUMMARY_FILE).exists());
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn test_regression_da13a_boot_drain_with_no_watcher_archives_at_once() {
+        let (spill, dlq, t0) = da13a_review_fixture("da13a-rv-no-watcher");
+        let mut sink = ReplaySink::default();
+        let mut replay = MidSessionReplay::default();
+        let out = drain_recovered_seals_once(
+            &mut sink,
+            &spill,
+            &dlq,
+            64,
+            &ReplayProbe::default,
+            &mut replay,
+            t0,
+        );
+        assert_eq!(out.files_archived, 3);
+        assert_eq!(out.seals_reingested, 6);
+        assert_eq!(out.files_awaiting_confirm, 0);
+        assert!(replay.awaiting_archive.is_empty());
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn test_regression_da13a_a_handed_over_refused_file_reports_its_unrecovered_seals_once_when_moved()
+     {
+        let mut replay = MidSessionReplay::default();
+        let (spill, dlq) = temp_pair("da13a-rv-refused");
+        let replaying = spill.join(SEAL_REPLAYING_SUBDIR);
+        std::fs::create_dir_all(&replaying).expect("mkdir");
+        let path = replaying.join(format!("{SEAL_FILE_PREFIX}2026-01-01.bin"));
+        std::fs::write(&path, b"").expect("write");
+        assert!(replay.adopt_boot_flushed(path, 2, 0));
+        let t0 = jan1_noon_utc();
+        assert_eq!(archive_now(&mut replay, clean(1), t0).records_skipped, 0);
+        let moved = archive_now(&mut replay, clean(2), t0 + 60);
+        assert_eq!((moved.files_archived, moved.records_skipped), (1, 2));
+        assert_eq!(count_bin(&spill.join(SEAL_REFUSED_SUBDIR)), 1);
+        assert_eq!(
+            archive_now(&mut replay, clean(3), t0 + 120).records_skipped,
+            0
+        );
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn test_regression_da13a_runner_boot_drain_hands_files_to_its_own_replay() {
+        let src = include_str!("seal_writer_runner.rs");
+        let prod = src.split("\nmod tests {").next().unwrap_or(src);
+        let body = prod
+            .split("pub fn boot_drain(&mut self)")
+            .nth(1)
+            .and_then(|s| s.split("\n    }\n").next())
+            .unwrap_or("");
+        assert!(body.contains("drain_recovered_seals_for_replay("));
+        assert!(body.contains("&mut self.replay"));
+        let main = include_str!("../../app/src/main.rs");
+        let mark = main
+            .find("applied_watermark().mark_probe_expected()")
+            .expect("main.rs marks the watcher expected");
+        let seal = main
+            .find("\n    spawn_seal_writer_loop(&config.questdb);")
+            .expect("main.rs spawns the seal writer");
+        assert!(
+            mark < seal,
+            "marked before the seal writer's boot drain can run"
+        );
+        assert!(main.contains("spawn_supervised_wal_suspension_watcher("));
     }
 }
