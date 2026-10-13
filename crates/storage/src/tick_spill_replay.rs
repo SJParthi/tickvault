@@ -511,6 +511,21 @@ pub const SPILL_REPLAY_NONLAST_LIVE_COUNTER: &str = "tv_spill_replay_nonlast_kep
 /// Reasons a drained closed file is kept for a later round.
 const EMPTY_DEFER_REASONS: [&str; 3] = ["sink_suspect", "awaiting_clean_probes", "durability_lag"];
 
+/// Counter: torn last lines of a closed spill file set aside, never POSTed
+/// (audit DA-13b review). Local `/metrics` only.
+pub const SPILL_REPLAY_TORN_TAIL_COUNTER: &str = "tv_spill_replay_torn_tail_set_aside_total";
+
+/// Where the latest suspicion episode began, as the watermark recorded it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EpisodeStart {
+    /// The episode's number (`suspect_episodes` once it had begun).
+    pub episode: u64,
+    /// Clean probes that had run when it began.
+    pub clean_probes: u64,
+    /// Wall clock when it began, Unix seconds.
+    pub unix_secs: u64,
+}
+
 /// What the replay knows about the database and the clock for one round.
 ///
 /// Taken once per round by the caller ([`SpillSinkView::current`]) so a round
@@ -524,6 +539,8 @@ pub struct SpillSinkView {
     pub clean_probes: u64,
     /// Suspicion episodes begun this process.
     pub suspect_episodes: u64,
+    /// Where the latest of those episodes began, when known.
+    pub episode_start: Option<EpisodeStart>,
     /// Wall clock, Unix seconds.
     pub now_unix_secs: u64,
     /// Read from the process (`current`), so an ack stamps the probe count
@@ -535,14 +552,34 @@ pub struct SpillSinkView {
 
 impl SpillSinkView {
     /// The view right now, from the process-wide applied watermark and the
-    /// wall clock. O(1): three atomic loads and one clock read.
+    /// wall clock. O(1): a few atomic loads and one clock read.
+    ///
+    /// The episode count is read BEFORE and AFTER the suspect flag (audit
+    /// DA-13b review). The watcher sets the flag and then bumps the count, so
+    /// a read that saw "not suspect" while an episode began reads two
+    /// different counts, and the view is then marked suspect (the round is
+    /// held). Without that, a view could read "not suspect" with the new
+    /// count, and acks sent into the suspended table would be stamped with
+    /// the episode they belong to and never rewound.
     #[must_use]
     pub fn current() -> Self {
         let wm = crate::wal_applied_watermark::applied_watermark();
+        let episodes_before = wm.suspect_episode_count();
+        let suspect = wm.is_sink_suspect();
+        let clean_probes = wm.clean_probe_count();
+        let episode_start = wm
+            .last_episode_start()
+            .map(|(episode, clean_probes, unix_secs)| EpisodeStart {
+                episode,
+                clean_probes,
+                unix_secs,
+            });
+        let episodes_after = wm.suspect_episode_count();
         Self {
-            suspect: wm.is_sink_suspect(),
-            clean_probes: wm.clean_probe_count(),
-            suspect_episodes: wm.suspect_episode_count(),
+            suspect: suspect || episodes_before != episodes_after,
+            clean_probes,
+            suspect_episodes: episodes_before,
+            episode_start,
             now_unix_secs: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -552,9 +589,15 @@ impl SpillSinkView {
     }
 }
 
-/// The acks that drained a spill file and are not yet confirmed.
+/// Acks of a spill file that are not yet confirmed: the byte range they
+/// covered and when they landed.
 #[derive(Debug, Clone, Copy)]
-struct AckStamp {
+struct PendingAcks {
+    /// Resume offset where the first unconfirmed ack's bytes began. A rewind
+    /// returns here, never further: everything before it is confirmed.
+    from: u64,
+    /// Resume offset reached by the last unconfirmed ack.
+    through: u64,
     /// Suspicion episodes when the FIRST unconfirmed ack landed: an episode
     /// after it may have lied about any of them.
     first_episode: u64,
@@ -563,21 +606,41 @@ struct AckStamp {
     last_ack_probes: u64,
 }
 
-impl AckStamp {
+impl PendingAcks {
+    /// `Ok` once these acks are confirmed: the sink is not suspect, at least
+    /// [`SPILL_EMPTY_CONFIRM_PROBES`] clean probes ran after the last one and
+    /// the durability lag passed, all before any suspicion episode began. An
+    /// episode that began and ended between two rounds no longer voids acks
+    /// it cannot have touched: the watermark records where the latest one
+    /// began, and acks confirmed by then are settled. Only when more than one
+    /// episode began since, or the start record is unreadable, does doubt
+    /// remain, and doubt re-sends.
     fn confirmed_at(&self, view: &SpillSinkView) -> Result<(), &'static str> {
-        if view.suspect || view.suspect_episodes != self.first_episode {
-            Err(EMPTY_DEFER_REASONS[0])
-        } else if view.clean_probes
-            < self
-                .last_ack_probes
-                .saturating_add(SPILL_EMPTY_CONFIRM_PROBES)
-        {
+        if view.suspect {
+            return Err(EMPTY_DEFER_REASONS[0]);
+        }
+        let lag = crate::wal_applied_watermark::WATERMARK_DURABILITY_LAG_SECS;
+        let needed_probes = self
+            .last_ack_probes
+            .saturating_add(SPILL_EMPTY_CONFIRM_PROBES);
+        let needed_secs = self.last_ack_secs.saturating_add(lag);
+        if view.suspect_episodes != self.first_episode {
+            let settled_before_episode = view.suspect_episodes
+                == self.first_episode.saturating_add(1)
+                && view.episode_start.is_some_and(|start| {
+                    start.episode == view.suspect_episodes
+                        && start.clean_probes >= needed_probes
+                        && start.unix_secs >= needed_secs
+                });
+            return if settled_before_episode {
+                Ok(())
+            } else {
+                Err(EMPTY_DEFER_REASONS[0])
+            };
+        }
+        if view.clean_probes < needed_probes {
             Err(EMPTY_DEFER_REASONS[1])
-        } else if view.now_unix_secs
-            < self
-                .last_ack_secs
-                .saturating_add(crate::wal_applied_watermark::WATERMARK_DURABILITY_LAG_SECS)
-        {
+        } else if view.now_unix_secs < needed_secs {
             Err(EMPTY_DEFER_REASONS[2])
         } else {
             Ok(())
@@ -585,27 +648,40 @@ impl AckStamp {
     }
 }
 
-/// Unconfirmed acks per spill file. One entry per file with drained bytes not
-/// yet emptied; removed with its resume offset, so it is bounded by the files
-/// in the spill directories.
+/// Per-file ack bookkeeping beside the resume offset.
+#[derive(Debug, Clone, Copy, Default)]
+struct FileAckState {
+    /// The acks not yet confirmed, if any.
+    pending: Option<PendingAcks>,
+    /// Bytes below this offset have been dealt with once already (POSTed, set
+    /// aside or refused). After a rewind they are POSTed again, but a line set
+    /// aside or refused there is not set aside or counted a second time.
+    resend_through: u64,
+}
+
+/// Ack state per spill file. One entry per file with drained bytes not yet
+/// emptied; removed with its resume offset, so it is bounded by the files in
+/// the spill directories.
 static ACK_STAMPS: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, AckStamp>>,
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, FileAckState>>,
 > = std::sync::OnceLock::new();
 
-fn ack_stamps() -> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, AckStamp>>
-{
+fn ack_stamps()
+-> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, FileAckState>> {
     ACK_STAMPS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// Records that QuestDB acknowledged bytes of `path` at `view`. When the
-/// earlier acks are already confirmed they are settled and the episode
-/// baseline restarts here; otherwise the first unconfirmed ack's episode is
-/// kept. The episode baseline is the ROUND's (an episode that began during
-/// the round may have lied about this ack, so it must still rewind it), while
-/// the clock and probe count are re-read at the ack for a live view (probes
-/// that ran during a long round, before the ack, must not count towards its
-/// confirmation). Cold replay path, one lock and one probe.
-pub(crate) fn note_spill_ack(path: &Path, view: &SpillSinkView) {
+/// Records that QuestDB acknowledged the bytes of `path` between resume
+/// offsets `from` and `through` at `view`. Joins the file's pending range (the
+/// first unconfirmed ack keeps its start and episode) or opens one. The
+/// episode baseline is the ROUND's (an episode that began during the round
+/// may have lied about this ack, so it must still rewind it), while the clock
+/// and probe count are re-read at the ack for a live view (probes that ran
+/// during a long round, before the ack, must not count towards its
+/// confirmation). A confirmed range is settled by `rewind_after_suspicion`,
+/// which every round runs before it sends anything. Cold replay path, one
+/// lock and one probe.
+pub(crate) fn note_spill_ack(path: &Path, view: &SpillSinkView, from: u64, through: u64) {
     let (ack_secs, ack_probes) = if view.live {
         let now = SpillSinkView::current();
         (
@@ -616,59 +692,164 @@ pub(crate) fn note_spill_ack(path: &Path, view: &SpillSinkView) {
         (view.now_unix_secs, view.clean_probes)
     };
     if let Ok(mut m) = ack_stamps().lock() {
-        let first_episode = match m.get(path) {
-            Some(prev) if prev.confirmed_at(view).is_err() => prev.first_episode,
-            _ => view.suspect_episodes,
-        };
-        m.insert(
-            path.to_path_buf(),
-            AckStamp {
-                first_episode,
+        let state = m.entry(path.to_path_buf()).or_default();
+        state.pending = Some(match state.pending {
+            Some(prev) => PendingAcks {
+                through: prev.through.max(through),
+                last_ack_secs: ack_secs,
+                last_ack_probes: ack_probes,
+                ..prev
+            },
+            None => PendingAcks {
+                from,
+                through,
+                first_episode: view.suspect_episodes,
                 last_ack_secs: ack_secs,
                 last_ack_probes: ack_probes,
             },
-        );
+        });
     }
 }
 
-/// If a suspicion episode began after the first unconfirmed ack of `path`,
-/// forgets its resume offset and stamp so this round POSTs the file again
-/// from the start, and returns `true`. The episode may have acknowledged rows
-/// it never applied; the DEDUP keys collapse the ones that did land. A stamp
-/// this round finds already confirmed is settled (dropped) instead, so an
-/// episode that begins later does not rewind acks it cannot have lied about.
+/// Settles `path`'s pending acks once they are confirmed. If instead a
+/// suspicion episode began after the first of them and they were not
+/// confirmed before it, rewinds the resume offset to where those acks began
+/// (never further: the confirmed prefix is not re-sent) and returns `true`.
+/// The episode may have acknowledged rows it never applied; the DEDUP keys
+/// collapse the ones that did land. Everything below the old offset is marked
+/// as dealt with, so the re-send sets nothing aside and counts no refusal a
+/// second time.
 pub(crate) fn rewind_after_suspicion(
     path: &Path,
     view: &SpillSinkView,
     dir_label: &'static str,
 ) -> bool {
-    let rewind = ack_stamps()
+    let drained_to = resume_offset_for(path);
+    let rewind_to = ack_stamps()
         .lock()
-        .map(|mut m| match m.get(path) {
-            // Confirmed before any episode began: those acks are settled, so
-            // a LATER episode cannot have lied about them. Dropping the stamp
-            // here keeps one later episode from re-sending the whole live
-            // hour file (possibly gigabytes) into a database that was just
-            // under stress.
-            Some(s) if s.confirmed_at(view).is_ok() => {
-                m.remove(path);
-                false
+        .map(|mut m| {
+            let state = m.get_mut(path)?;
+            let pending = state.pending?;
+            if pending.confirmed_at(view).is_ok() {
+                state.pending = None;
+                return None;
             }
-            Some(s) => s.first_episode != view.suspect_episodes,
-            None => false,
+            if pending.first_episode == view.suspect_episodes {
+                return None;
+            }
+            state.pending = None;
+            state.resend_through = state.resend_through.max(drained_to);
+            Some(pending.from)
         })
-        .unwrap_or(false);
-    if rewind {
-        forget_resume_offset(path);
-        metrics::counter!(SPILL_REPLAY_REWOUND_COUNTER, "dir" => dir_label).increment(1);
-        warn!(
-            path = %path.display(),
-            "a QuestDB suspicion episode began after this spill file was acknowledged — \
-             the acknowledgement may not have been applied, so the file is sent again \
-             from the start; rows that did land collapse onto themselves"
-        );
+        .unwrap_or(None);
+    let Some(rewind_to) = rewind_to else {
+        return false;
+    };
+    rewind_resume_offset(path, rewind_to);
+    metrics::counter!(SPILL_REPLAY_REWOUND_COUNTER, "dir" => dir_label).increment(1);
+    warn!(
+        code = ErrorCode::TickSpill01FileQuarantined.code_str(),
+        source = "spill_rewound_after_suspicion",
+        path = %path.display(),
+        rewound_from = drained_to,
+        rewound_to = rewind_to,
+        "a QuestDB suspicion episode began before this spill file's latest \
+         acknowledgements were confirmed, so they may not have been applied: the \
+         bytes they covered are sent again (rows that did land collapse onto \
+         themselves; nothing is set aside twice)"
+    );
+    true
+}
+
+/// Moves `path`'s resume offset BACK to `offset` (a rewind). The only caller
+/// that may lower it; `record_resume_offset` stays monotone.
+fn rewind_resume_offset(path: &Path, offset: u64) {
+    if let Ok(mut m) = resume_offsets().lock() {
+        m.insert(path.to_path_buf(), offset);
     }
-    rewind
+}
+
+/// Bytes of `path` below this offset were dealt with once already; a re-send
+/// after a rewind sets nothing aside and counts no refusal there.
+pub(crate) fn resend_through_for(path: &Path) -> u64 {
+    ack_stamps()
+        .lock()
+        .map(|m| m.get(path).map_or(0, |s| s.resend_through))
+        .unwrap_or(0)
+}
+
+/// Where `path`'s CONFIRMED rows end, given that it was resumed at
+/// `resume_from` this round: the start of its unconfirmed acks when it has
+/// any, else `resume_from`. Read before a quarantine, which forgets both.
+fn confirmed_through_for(path: &Path, view: &SpillSinkView, resume_from: u64) -> u64 {
+    ack_stamps()
+        .lock()
+        .map(|m| {
+            m.get(path)
+                .and_then(|s| s.pending)
+                .filter(|p| p.confirmed_at(view).is_err())
+                .map_or(resume_from, |p| p.from.min(resume_from))
+        })
+        .unwrap_or(0)
+}
+
+/// What a whole-file quarantine reports about how much of the file reached
+/// the database (audit DA-13b review).
+struct QuarantineReport {
+    /// Rows before this offset are confirmed in the database.
+    confirmed_through: u64,
+    /// Rows before this offset were acknowledged (confirmed or not).
+    acked_through: u64,
+    /// The file's length when it was moved, not at the start of the round.
+    len_now: u64,
+}
+
+impl QuarantineReport {
+    /// Bytes NOT confirmed in the database.
+    fn unreplayed_bytes(&self) -> u64 {
+        self.len_now.saturating_sub(self.confirmed_through)
+    }
+}
+
+/// Builds the report for a file about to be quarantined: the confirmed and
+/// acknowledged boundaries, and the length re-read now, because a live file
+/// grows while it is read. Must run before the move, which forgets the
+/// resume offset and the acks. Cold path: one lock and one `stat`.
+fn quarantine_report(
+    path: &Path,
+    view: &SpillSinkView,
+    resume_from: u64,
+    accepted_this_round: u64,
+    file_len_at_start: u64,
+) -> QuarantineReport {
+    let acked_through = resume_from.saturating_add(accepted_this_round);
+    let len_now = std::fs::metadata(path)
+        .map_or(file_len_at_start, |m| m.len())
+        .max(file_len_at_start)
+        .max(acked_through);
+    QuarantineReport {
+        confirmed_through: confirmed_through_for(path, view, resume_from),
+        acked_through,
+        len_now,
+    }
+}
+
+/// Whether `path` holds acks QuestDB has not yet confirmed (audit DA-13b
+/// review). The hour-granular partition archive counts such a file as
+/// pending, because a rewind may still send its rows again into an hour the
+/// archive would otherwise export and drop. One lock and one probe.
+#[must_use]
+pub(crate) fn has_unconfirmed_ack(path: &Path) -> bool {
+    let view = SpillSinkView::current();
+    ack_stamps()
+        .lock()
+        .map(|m| {
+            m.get(path)
+                .and_then(|s| s.pending)
+                .is_some_and(|p| p.confirmed_at(&view).is_err())
+        })
+        // A poisoned lock cannot vouch for anything: count it as pending.
+        .unwrap_or(true)
 }
 
 /// Whether a fully drained, closed spill file may be emptied now: `Ok` when it
@@ -681,12 +862,14 @@ pub(crate) fn drained_file_empty_verdict(
         return Err(EMPTY_DEFER_REASONS[0]);
     }
     match ack_stamps().lock() {
-        Ok(m) => m.get(path).map_or(Ok(()), |s| s.confirmed_at(view)),
+        Ok(m) => m
+            .get(path)
+            .and_then(|s| s.pending)
+            .map_or(Ok(()), |p| p.confirmed_at(view)),
         // A poisoned lock cannot vouch for anything: keep the file.
         Err(_) => Err(EMPTY_DEFER_REASONS[1]),
     }
 }
-
 /// The hour a spill file's name carries (`<tier>-<feed>-<hour>.<ext>`).
 #[must_use]
 pub(crate) fn spill_file_hour(path: &Path) -> Option<u64> {
@@ -716,6 +899,24 @@ pub(crate) fn spill_file_may_still_be_appended(
     if is_last {
         return true;
     }
+    let live = !spill_file_closed_and_quiet(path, meta, view);
+    if live {
+        metrics::counter!(SPILL_REPLAY_NONLAST_LIVE_COUNTER, "dir" => dir_label).increment(1);
+    }
+    live
+}
+
+/// Whether the hour in `path`'s name has passed AND it has been quiet (by
+/// mtime) for [`SPILL_LIVE_FILE_QUIET_SECS`]. The writer names files from the
+/// current hour, so such a file receives no more appends; a name that does
+/// not parse or an unreadable mtime reads as not closed. Also used for the
+/// LAST file's final line: a line with no newline in a closed, quiet file is
+/// torn for good, not still being written (audit DA-13b review).
+pub(crate) fn spill_file_closed_and_quiet(
+    path: &Path,
+    meta: &std::fs::Metadata,
+    view: &SpillSinkView,
+) -> bool {
     let hour_closed =
         spill_file_hour(path).is_some_and(|hour| hour < view.now_unix_secs / SPILL_FILE_HOUR_SECS);
     let quiet = meta
@@ -725,11 +926,7 @@ pub(crate) fn spill_file_may_still_be_appended(
         .is_some_and(|m| {
             m.as_secs().saturating_add(SPILL_LIVE_FILE_QUIET_SECS) <= view.now_unix_secs
         });
-    let live = !(hour_closed && quiet);
-    if live {
-        metrics::counter!(SPILL_REPLAY_NONLAST_LIVE_COUNTER, "dir" => dir_label).increment(1);
-    }
-    live
+    hour_closed && quiet
 }
 
 /// What became of a closed, fully drained file this round.
@@ -1204,13 +1401,20 @@ pub async fn replay_spill_dir(
         // counted as a live non-last file.
         let writer_may_still_append =
             spill_file_may_still_be_appended(&path, &meta, file_index == last_index, view, label);
-        // A suspicion episode since this file's first unconfirmed ack: those
-        // acks may be lies, so start the file again (audit DA-13b).
+        // A final line with no newline in a file whose hour has passed and
+        // that has been quiet is torn for good (a crash or a full disk cut
+        // the append), even when the file is still the last one.
+        let tail_torn_for_good = spill_file_closed_and_quiet(&path, &meta, view);
+        // A suspicion episode before this file's latest acks were confirmed:
+        // they may be lies, so send their bytes again (audit DA-13b).
         rewind_after_suspicion(&path, view, label);
         // Start where the last round finished, not at 0. See RESUME_OFFSETS:
         // this is what makes a growing file converge WITHOUT moving bytes or
         // truncating a file the writer still holds open.
         let resume_from = resume_offset_for(&path).min(file_len);
+        // Below this offset a rewound re-send sets nothing aside and counts
+        // no refusal again: those were dealt with on the first pass.
+        let resend_through = resend_through_for(&path);
         if resume_from == file_len {
             // Fully drained. A file drained while it was live is emptied here
             // once its hour has closed and its acks are confirmed; before
@@ -1307,35 +1511,85 @@ pub async fn replay_spill_dir(
             if filled == 0 {
                 break;
             }
+            // File offset of `buf[0]`: every byte before it has been dealt
+            // with this round.
+            let window_at = resume_from.saturating_add(accepted);
             // Cut at the LAST newline in the window. Everything before it is
             // whole lines; everything after is carried to the next fill.
-            let cut = match buf[..filled].iter().rposition(|b| *b == b'\n') {
+            let mut cut = match buf[..filled].iter().rposition(|b| *b == b'\n') {
                 // +1 keeps the newline with the line it terminates, matching
                 // `ilp_chunk_ranges`.
                 Some(nl) => nl.saturating_add(1),
-                // No newline in the FINAL read of a file the writer may still
-                // append to, or one that grew past the size read at the start
-                // of this round: that is a line still being written, not a
-                // torn one (audit DA-13b). POSTing it would commit the half
-                // row (a prefix cut before its timestamp is valid ILP, which
-                // QuestDB stamps with its own time) and the next round would
-                // resume mid-line and set the other half aside. Leave it
-                // unconsumed; the resume offset stays on the last newline and
-                // a later round reads the whole line.
+                // No newline in the FINAL read of a file that grew past the
+                // size read at the start of this round, or of one the writer
+                // may still append to and that is not yet closed and quiet:
+                // that is a line still being written, not a torn one (audit
+                // DA-13b). POSTing it would commit the half row (a prefix cut
+                // before its timestamp is valid ILP, which QuestDB stamps with
+                // its own time) and the next round would resume mid-line and
+                // set the other half aside. Leave it unconsumed; the resume
+                // offset stays on the last newline and a later round reads
+                // the whole line.
                 None if eof
-                    && (writer_may_still_append
-                        || resume_from
-                            .saturating_add(accepted)
-                            .saturating_add(filled as u64)
-                            > file_len) =>
+                    && (window_at.saturating_add(filled as u64) > file_len
+                        || (writer_may_still_append && !tail_torn_for_good)) =>
                 {
                     break 'file;
                 }
                 // No newline in the FINAL read of a closed, quiet file: a tail
-                // torn by a crash mid-append. POST it whole and let QuestDB
-                // judge it — which is byte-for-byte what this function did
-                // before streaming.
-                None if eof => filled,
+                // torn for good by a crash or a full disk mid-append. It is
+                // NEVER POSTed (audit DA-13b review): a fragment cut before
+                // its timestamp is valid ILP, which QuestDB would stamp with
+                // its own time, a fabricated row. It is set aside whole in
+                // `<file>.rejected-lines`, counted, and the file moves past
+                // it. A failed rescue left those frames unapplied, so the WAL
+                // still holds the true rows.
+                None if eof => {
+                    let len = filled as u64;
+                    if window_at >= resend_through {
+                        match set_aside_rejected_lines(
+                            dir,
+                            &path,
+                            &buf[..filled],
+                            std::slice::from_ref(&(0..filled)),
+                        ) {
+                            Ok(_) => {
+                                metrics::counter!(
+                                    SPILL_REPLAY_TORN_TAIL_COUNTER,
+                                    "dir" => label
+                                )
+                                .increment(1);
+                                outcome.lines_set_aside = outcome.lines_set_aside.saturating_add(1);
+                                error!(
+                                    code = ErrorCode::TickSpill01FileQuarantined.code_str(),
+                                    source = "spill_torn_tail",
+                                    path = %path.display(),
+                                    offset = window_at,
+                                    bytes = len,
+                                    "the last line of a closed spill file is cut short (a crash \
+                                     or a full disk during the append). It is NOT sent, because \
+                                     QuestDB would store a cut row at its own time; it is kept \
+                                     in quarantine as <file>.rejected-lines and is not in the \
+                                     database from this file. The rescue that wrote it failed, \
+                                     so the WAL still holds the rows."
+                                );
+                            }
+                            Err(err) => {
+                                warn!(
+                                    path = %path.display(),
+                                    %err,
+                                    "the torn last line of a spill file could NOT be written to \
+                                     quarantine — the file is kept intact and retried next round"
+                                );
+                                failed = true;
+                                break 'file;
+                            }
+                        }
+                    }
+                    accepted = accepted.saturating_add(len);
+                    refused_bytes = refused_bytes.saturating_add(len);
+                    break 'file;
+                }
                 // No newline in a FULL buffer with more file behind it. At
                 // 32 MiB that is not a long line, it is a torn file.
                 //
@@ -1368,8 +1622,20 @@ pub async fn replay_spill_dir(
                     break 'file;
                 }
             };
+            // A rewound re-send: end this window exactly at `resend_through`
+            // (a line boundary, it was a resume offset) so no chunk straddles
+            // it, and every chunk is wholly a repeat or wholly new.
+            if window_at < resend_through {
+                let to_mark = usize::try_from(resend_through - window_at).unwrap_or(usize::MAX);
+                if to_mark < cut && buf.get(to_mark.wrapping_sub(1)) == Some(&b'\n') {
+                    cut = to_mark;
+                }
+            }
             let carried = filled.saturating_sub(cut);
             for range in ilp_chunk_ranges(&buf[..cut], REPLAY_MAX_CHUNK_BYTES) {
+                // A chunk below `resend_through` was dealt with on an earlier
+                // pass: its set-asides and refusals are already counted.
+                let repeat = window_at.saturating_add(range.start as u64) < resend_through;
                 let raw = &buf[range];
                 // `len` counts the bytes CONSUMED from the file, not the bytes
                 // sent: it drives the resume offset, so a refused line must
@@ -1385,7 +1651,7 @@ pub async fn replay_spill_dir(
                 let (chunk, refused_lines) = retain_lines_in_open_window(raw, is_arrival_clock);
                 refused_bytes =
                     refused_bytes.saturating_add(len.saturating_sub(chunk.len() as u64));
-                if refused_lines > 0 {
+                if refused_lines > 0 && !repeat {
                     metrics::counter!(
                         "tv_spill_replay_rows_out_of_window_refused_total",
                         "dir" => dir_label(dir)
@@ -1443,6 +1709,16 @@ pub async fn replay_spill_dir(
                                 LineIsolation::Isolated(rejected) => {
                                     let rejected_bytes: u64 =
                                         rejected.iter().map(|r| r.len() as u64).sum();
+                                    if repeat {
+                                        // Re-sent after a rewind: these lines
+                                        // were set aside and counted on the
+                                        // first pass (audit DA-13b review).
+                                        refused_bytes =
+                                            refused_bytes.saturating_add(rejected_bytes);
+                                        accepted = accepted.saturating_add(len);
+                                        acked = true;
+                                        continue;
+                                    }
                                     match set_aside_rejected_lines(dir, &path, &sent, &rejected) {
                                         Ok(_) => {
                                             let lines = rejected.len() as u64;
@@ -1508,13 +1784,18 @@ pub async fn replay_spill_dir(
                             // this one — which is exactly what stranded 1,662,318
                             // intact ticks on 2026-08-25. Set it aside and keep
                             // going.
-                            // Audit DA-13b (C11): the chunks before this
-                            // one, in this round and in earlier rounds, were
-                            // accepted. Say so, and count them as replayed,
-                            // rather than report the whole file as not in
-                            // the database. Taken before the move, which
-                            // forgets the resume offset.
-                            let accepted_through = resume_from.saturating_add(accepted);
+                            // Audit DA-13b (C11, and its review): the chunks
+                            // before this one were acknowledged, but only the
+                            // rows before `confirmed_through` are CONFIRMED in
+                            // the database; acks after it (this round's, and
+                            // any not yet past two clean probes and the
+                            // durability lag) can come from a suspended table
+                            // that never applies them. Read before the move,
+                            // which forgets the offset and the acks, and with
+                            // the length as it is NOW (a live file grows
+                            // while it is read).
+                            let report =
+                                quarantine_report(&path, view, resume_from, accepted, file_len);
                             let landed_this_round = accepted.saturating_sub(refused_bytes);
                             match quarantine_spill_file(dir, &path) {
                                 Ok(moved) => {
@@ -1529,16 +1810,20 @@ pub async fn replay_spill_dir(
                                         code = ErrorCode::TickSpill01FileQuarantined.code_str(),
                                         path = %moved.display(),
                                         status,
-                                        bytes = file_len,
-                                        accepted_through,
-                                        unreplayed_bytes = file_len.saturating_sub(accepted_through),
+                                        bytes = report.len_now,
+                                        confirmed_through = report.confirmed_through,
+                                        acked_through = report.acked_through,
+                                        unreplayed_bytes = report.unreplayed_bytes(),
                                         "tick spill file PERMANENTLY refused by QuestDB and moved to \
-                                         quarantine so the rest of the backlog can drain. The rows \
-                                         before byte accepted_through ARE in the database (and some \
-                                         of the refused chunk may be too); the rest is on disk and \
-                                         is NOT. Most of the file is usually salvageable — filter \
-                                         to well-formed lines and re-POST, which is safe to repeat \
-                                         because the ticks dedup key carries capture_seq."
+                                         quarantine so the rest of the backlog can drain. Rows before \
+                                         byte confirmed_through are confirmed in the database. Rows \
+                                         from confirmed_through to acked_through were acknowledged \
+                                         but not yet confirmed (a suspended table acknowledges \
+                                         without applying), so treat them as NOT in the database, \
+                                         like the rest of the file. Most of the file is usually \
+                                         salvageable — filter to well-formed lines and re-POST from \
+                                         confirmed_through, which is safe to repeat because the \
+                                         ticks dedup key carries capture_seq."
                                     );
                                     // Deliberately NOT `failed = true`: this file
                                     // is dealt with, and the whole point is that
@@ -1599,22 +1884,37 @@ pub async fn replay_spill_dir(
             // it: quarantine preserves every byte for salvage and lets the
             // backlog behind it drain, while a split row can be silently
             // accepted with a server-assigned timestamp.
+            // Same accounting as the whole-file refusal above (audit DA-13b
+            // review): read before the move, which forgets the offset and
+            // the acks.
+            let report = quarantine_report(&path, view, resume_from, accepted, file_len);
+            let landed_this_round = accepted.saturating_sub(refused_bytes);
             match quarantine_spill_file(dir, &path) {
                 Ok(moved) => {
                     metrics::counter!(REPLAY_QUARANTINED_COUNTER).increment(1);
                     outcome.files_quarantined = outcome.files_quarantined.saturating_add(1);
+                    outcome.bytes_replayed =
+                        outcome.bytes_replayed.saturating_add(landed_this_round);
+                    metrics::counter!("tv_tick_spill_replayed_bytes_total")
+                        .increment(landed_this_round);
                     error!(
                         code = ErrorCode::TickSpill01FileQuarantined.code_str(),
                         path = %moved.display(),
-                        bytes = file_len,
+                        bytes = report.len_now,
+                        confirmed_through = report.confirmed_through,
+                        acked_through = report.acked_through,
+                        unreplayed_bytes = report.unreplayed_bytes(),
                         window = REPLAY_STREAM_BUFFER_BYTES,
                         "tick spill file contains a line longer than the entire read window, \
                          which no writer here produces — the file is corrupt. Moved to \
                          quarantine with every byte intact rather than POSTing a partial row, \
-                         which QuestDB can accept with its own timestamp. Rows already accepted \
-                         from this file ARE in the database; the remainder is on disk and is \
-                         NOT. Salvage by filtering to well-formed lines and re-POSTing, which \
-                         is safe to repeat because the ticks dedup key carries capture_seq."
+                         which QuestDB can accept with its own timestamp. Rows before byte \
+                         confirmed_through are confirmed in the database; rows from \
+                         confirmed_through to acked_through were acknowledged but not yet \
+                         confirmed, so treat them, and the rest of the file, as NOT in the \
+                         database. Salvage by filtering to well-formed lines and re-POSTing \
+                         from confirmed_through, which is safe to repeat because the ticks \
+                         dedup key carries capture_seq."
                     );
                     continue;
                 }
@@ -1644,7 +1944,12 @@ pub async fn replay_spill_dir(
         // until they are confirmed, and so a suspicion episode after them
         // rewinds it.
         if acked {
-            note_spill_ack(&path, view);
+            note_spill_ack(
+                &path,
+                view,
+                resume_from,
+                resume_from.saturating_add(accepted),
+            );
         }
         // Where this round stopped, always on a line boundary: every chunk is
         // cut at a newline, and a half-written last line of a live file is
@@ -1742,7 +2047,9 @@ pub async fn replay_spill_dir(
                      BYTE-FOR-BYTE INTACT and the next round resumes at the drained offset. \
                      Nothing is moved, nothing is truncated, nothing is re-sent."
                 );
-                outcome.files_replayed = outcome.files_replayed.saturating_add(1);
+                if accepted > 0 {
+                    outcome.files_replayed = outcome.files_replayed.saturating_add(1);
+                }
                 continue;
             }
             Ok(_) => {}
@@ -1777,13 +2084,19 @@ pub async fn replay_spill_dir(
         // Rows accepted this round are counted when they are accepted; the
         // empty-out of a closed file is a separate, later decision.
         record_resume_offset(&path, drained_to);
-        outcome.files_replayed = outcome.files_replayed.saturating_add(1);
         outcome.bytes_replayed = outcome
             .bytes_replayed
             .saturating_add(accepted.saturating_sub(refused_bytes));
         metrics::counter!("tv_tick_spill_replayed_bytes_total")
             .increment(accepted.saturating_sub(refused_bytes));
         if writer_may_still_append || drained_to < file_len {
+            // Nothing dealt with this round (only a line still being written
+            // was found): no progress, so no "recovered" line and no count
+            // (audit DA-13b review: it read as a recovery every 300 s).
+            if accepted == 0 {
+                continue;
+            }
+            outcome.files_replayed = outcome.files_replayed.saturating_add(1);
             info!(
                 path = %path.display(),
                 bytes = accepted,
@@ -1800,6 +2113,7 @@ pub async fn replay_spill_dir(
         // acks that drained it are confirmed (audit DA-13b). Until then it is
         // kept, and a later round empties it from the fully-drained branch
         // at the top of the loop.
+        outcome.files_replayed = outcome.files_replayed.saturating_add(1);
         match empty_drained_closed_file(&path, view, label) {
             EmptyOutcome::Emptied => {
                 info!(
@@ -1863,6 +2177,7 @@ pub fn register_replay_baseline() {
             .increment(0);
         metrics::counter!(SPILL_REPLAY_REWOUND_COUNTER, "dir" => dir).increment(0);
         metrics::counter!(SPILL_REPLAY_NONLAST_LIVE_COUNTER, "dir" => dir).increment(0);
+        metrics::counter!(SPILL_REPLAY_TORN_TAIL_COUNTER, "dir" => dir).increment(0);
         for reason in EMPTY_DEFER_REASONS {
             metrics::counter!(SPILL_REPLAY_EMPTY_DEFERRED_COUNTER, "dir" => dir, "reason" => reason)
                 .increment(0);
@@ -2122,6 +2437,7 @@ pub(crate) mod tests {
         view.clean_probes = 0;
         view.suspect_episodes = 0;
         view.live = false;
+        view.episode_start = None;
         view.now_unix_secs = view.now_unix_secs.saturating_add(2 * SPILL_FILE_HOUR_SECS);
         view
     }
@@ -3944,25 +4260,57 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A confirmed ack settles: the episode baseline restarts at the next
-    /// ack, so an episode BEFORE it does not rewind bytes acked after it.
+    /// Review finding (MED): an ack confirmed BEFORE a suspicion episode that
+    /// began and ended between two rounds is settled by the episode's
+    /// recorded start, not rewound; an ack the episode could have touched
+    /// still is.
+    ///
+    /// Bite: drop the `settled_before_episode` arm of `confirmed_at` and the
+    /// first rewind returns true.
     #[test]
-    fn test_regression_da13b_a_confirmed_ack_resets_the_episode_baseline() {
-        let path = temp_dir("da13b-baseline").join("ticks-dhan-1.ilp");
+    fn test_regression_da13b_an_ack_confirmed_before_an_episode_began_is_settled() {
+        let path = temp_dir("da13b-episode-start").join("ticks-dhan-1.ilp");
         let view = test_spill_view();
-        note_spill_ack(&path, &view);
-        let mut later = confirmed_spill_view(&view);
-        later.suspect_episodes += 1;
-        // Unconfirmed at `later` (an episode began): the first ack's episode
-        // is kept, so the file rewinds.
-        note_spill_ack(&path, &later);
-        assert!(rewind_after_suspicion(&path, &later, "ticks"));
-        // Re-acked at `later` from scratch, then confirmed: a further ack
-        // starts a new baseline and nothing rewinds.
-        note_spill_ack(&path, &later);
-        let settled = confirmed_spill_view(&later);
-        note_spill_ack(&path, &settled);
-        assert!(!rewind_after_suspicion(&path, &settled, "ticks"));
+        note_spill_ack(&path, &view, 0, 42);
+        record_resume_offset(&path, 42);
+        let lag = crate::wal_applied_watermark::WATERMARK_DURABILITY_LAG_SECS;
+        let mut after_episode = view;
+        after_episode.suspect_episodes = view.suspect_episodes + 1;
+        after_episode.clean_probes = view.clean_probes + 5;
+        after_episode.now_unix_secs = view.now_unix_secs + 300;
+        // The episode began after two clean probes and the lag had passed.
+        after_episode.episode_start = Some(EpisodeStart {
+            episode: after_episode.suspect_episodes,
+            clean_probes: view.clean_probes + SPILL_EMPTY_CONFIRM_PROBES,
+            unix_secs: view.now_unix_secs + lag,
+        });
+        assert!(
+            !rewind_after_suspicion(&path, &after_episode, "ticks"),
+            "confirmed before the episode began: settled, never re-sent"
+        );
+        assert_eq!(resume_offset_for(&path), 42);
+        assert_eq!(drained_file_empty_verdict(&path, &after_episode), Ok(()));
+
+        // The same, but the episode began after only one clean probe: the
+        // ack may be a lie, so its bytes are sent again.
+        note_spill_ack(&path, &view, 42, 84);
+        record_resume_offset(&path, 84);
+        let mut early = after_episode;
+        early.episode_start = Some(EpisodeStart {
+            episode: early.suspect_episodes,
+            clean_probes: view.clean_probes + 1,
+            unix_secs: view.now_unix_secs + lag,
+        });
+        // Two episodes since the ack, or no start record: doubt re-sends.
+        let mut two_episodes = after_episode;
+        two_episodes.suspect_episodes += 1;
+        assert!(drained_file_empty_verdict(&path, &two_episodes).is_err());
+        assert!(rewind_after_suspicion(&path, &early, "ticks"));
+        assert_eq!(
+            resume_offset_for(&path),
+            42,
+            "rewound to where the unconfirmed acks began, not to 0"
+        );
         forget_resume_offset(&path);
     }
 
@@ -3978,7 +4326,7 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
         let mut round_start = test_spill_view();
         round_start.live = true;
         round_start.now_unix_secs = 0;
-        note_spill_ack(&path, &round_start);
+        note_spill_ack(&path, &round_start, 0, 1);
         let mut later = round_start;
         later.live = false;
         later.clean_probes = u64::MAX / 2;
@@ -4001,7 +4349,7 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
     fn test_regression_da13b_a_stamp_confirmed_before_an_episode_is_never_rewound() {
         let path = temp_dir("da13b-settle").join("ticks-dhan-1.ilp");
         let view = test_spill_view();
-        note_spill_ack(&path, &view);
+        note_spill_ack(&path, &view, 0, 42);
         record_resume_offset(&path, 42);
         let confirmed = confirmed_spill_view(&view);
         assert!(!rewind_after_suspicion(&path, &confirmed, "ticks"));
@@ -4134,7 +4482,10 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
         std::fs::write(&live, &body).expect("write"); // APPROVED: test
         let (url, server) = spawn_selective_server().await;
         let client = crate::http_client::build_probe_client(5).expect("client"); // APPROVED: test
-        let view = test_spill_view();
+        // The clock at the real time: the file was written just now, so its
+        // half-written last line is still being written, not torn for good.
+        let mut view = test_spill_view();
+        view.now_unix_secs = SpillSinkView::current().now_unix_secs;
         let whole = 2 * GOOD_LINE.len() as u64;
 
         let first = replay_spill_dir(&dir, &url, &client, &view).await;
@@ -4283,5 +4634,211 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
             "the accepted first chunk is in the database and is counted"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Audit DA-13b review (2026-10-13): the rewind and the accounting ---
+
+    fn rejected_lines_of(dir: &Path, name: &str) -> Vec<u8> {
+        std::fs::read(
+            dir.join(QUARANTINE_DIR)
+                .join(format!("{name}{REJECTED_LINES_SUFFIX}")),
+        )
+        .unwrap_or_default()
+    }
+
+    /// Review finding (HIGH): a rewind after a suspicion episode re-sends
+    /// only the bytes whose acks were still unconfirmed, never the confirmed
+    /// prefix, and never sets aside or counts a refused line a second time.
+    ///
+    /// Bite: rewind to 0 (or drop the `repeat` skip) and round 4 re-sends the
+    /// prefix (bytes) or sets the second poison line aside again (lines).
+    #[tokio::test]
+    async fn test_regression_da13b_a_rewind_resends_only_the_unconfirmed_range_once() {
+        let dir = temp_dir("da13b-rewind-range");
+        let live = dir.join("ticks-dhan-1.ilp");
+        let poison_a: &[u8] = b"ticks,poison=a 1\n";
+        let poison_b: &[u8] = b"ticks,poison=b 2\n";
+        let mut part_a = GOOD_LINE.to_vec();
+        part_a.extend_from_slice(poison_a);
+        let mut part_b = GOOD_LINE.to_vec();
+        part_b.extend_from_slice(poison_b);
+        part_b.extend_from_slice(GOOD_LINE);
+        std::fs::write(&live, &part_a).expect("write"); // APPROVED: test
+        let (url, server) = spawn_full_body_server(false).await;
+        let client = crate::http_client::build_probe_client(5).expect("client"); // APPROVED: test
+
+        // Round 1 drains part A (one line set aside); round 2 confirms it.
+        let view = test_spill_view();
+        let r1 = replay_spill_dir(&dir, &url, &client, &view).await;
+        assert_eq!(r1.lines_set_aside, 1);
+        let confirmed = confirmed_spill_view(&view);
+        let _ = replay_spill_dir(&dir, &url, &client, &confirmed).await;
+
+        // The writer appends part B; round 3 drains it (one more set aside).
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&live)
+            .expect("open"); // APPROVED: test
+        std::io::Write::write_all(&mut f, &part_b).expect("append"); // APPROVED: test
+        drop(f);
+        let r3 = replay_spill_dir(&dir, &url, &client, &confirmed).await;
+        assert_eq!(r3.lines_set_aside, 1);
+
+        // An episode begins before part B's acks are confirmed.
+        let mut after_episode = confirmed_spill_view(&confirmed);
+        after_episode.suspect_episodes += 1;
+        let r4 = replay_spill_dir(&dir, &url, &client, &after_episode).await;
+        server.abort();
+        assert_eq!(
+            r4.bytes_replayed,
+            2 * GOOD_LINE.len() as u64,
+            "only part B's good lines are sent again, not part A"
+        );
+        assert_eq!(r4.lines_set_aside, 0, "nothing is set aside twice");
+        let mut expected = poison_a.to_vec();
+        expected.extend_from_slice(poison_b);
+        assert_eq!(
+            rejected_lines_of(&dir, "ticks-dhan-1.ilp"),
+            expected,
+            "each refused line is kept exactly once"
+        );
+        forget_resume_offset(&live);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review finding (MED): the torn last line of a CLOSED file is never
+    /// POSTed, even when QuestDB would accept it (a line cut before its
+    /// timestamp is valid ILP and would be stored at the server's time). It
+    /// is set aside and counted.
+    ///
+    /// Bite: POST the tail (`None if eof => filled`) and `bytes_replayed`
+    /// includes it while nothing is set aside.
+    #[tokio::test]
+    async fn test_regression_da13b_a_torn_tail_of_a_closed_file_is_never_posted() {
+        let dir = temp_dir("da13b-torn-closed");
+        let closed = dir.join("ticks-dhan-1.ilp");
+        let torn: &[u8] = b"ticks,segment=NSE_EQ,feed=dhan security_id=3i";
+        let mut body = GOOD_LINE.to_vec();
+        body.extend_from_slice(torn);
+        std::fs::write(&closed, &body).expect("write"); // APPROVED: test
+        std::fs::write(dir.join("ticks-dhan-2.ilp"), GOOD_LINE).expect("write"); // APPROVED: test
+        let (url, server) = spawn_selective_server().await;
+        let client = crate::http_client::build_probe_client(5).expect("client"); // APPROVED: test
+        let out = replay_spill_dir(&dir, &url, &client, &test_spill_view()).await;
+        server.abort();
+        assert_eq!(
+            out.bytes_replayed,
+            2 * GOOD_LINE.len() as u64,
+            "the torn fragment is not sent"
+        );
+        assert_eq!(out.lines_set_aside, 1);
+        let mut kept = torn.to_vec();
+        kept.push(b'\n');
+        assert_eq!(rejected_lines_of(&dir, "ticks-dhan-1.ilp"), kept);
+        assert_eq!(resume_offset_for(&closed), body.len() as u64);
+        forget_resume_offset(&closed);
+        forget_resume_offset(&dir.join("ticks-dhan-2.ilp"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review finding (LOW): a live file whose only new bytes are a line
+    /// still being written made no progress, so it is not counted as
+    /// replayed (it read as a recovery every 300 s).
+    ///
+    /// Bite: count `files_replayed` when `accepted == 0`.
+    #[tokio::test]
+    async fn test_regression_da13b_a_live_file_with_only_a_partial_line_is_not_counted() {
+        let dir = temp_dir("da13b-partial-count");
+        let live = dir.join("ticks-dhan-1.ilp");
+        let mut body = GOOD_LINE.to_vec();
+        body.extend_from_slice(b"ticks,segment=NSE_EQ,feed=dhan secu");
+        std::fs::write(&live, &body).expect("write"); // APPROVED: test
+        let (url, server) = spawn_selective_server().await;
+        let client = crate::http_client::build_probe_client(5).expect("client"); // APPROVED: test
+        // The clock at the real time: the file was written just now, so its
+        // partial last line is still being written.
+        let mut view = test_spill_view();
+        view.now_unix_secs = SpillSinkView::current().now_unix_secs;
+        let first = replay_spill_dir(&dir, &url, &client, &view).await;
+        assert_eq!(first.files_replayed, 1);
+        let second = replay_spill_dir(&dir, &url, &client, &view).await;
+        server.abort();
+        assert_eq!(second.files_replayed, 0, "no progress, no count");
+        assert_eq!(second.bytes_replayed, 0);
+        forget_resume_offset(&live);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review findings (MED): a quarantine reports how much is CONFIRMED in
+    /// the database (not merely acknowledged), and the length as it is when
+    /// the file is moved (a live file grows while it is read).
+    ///
+    /// Bite: report `resume_from` as confirmed, or the round-start length.
+    #[test]
+    fn test_regression_da13b_a_quarantine_reports_confirmed_rows_and_the_current_length() {
+        let dir = temp_dir("da13b-report");
+        let path = dir.join("ticks-dhan-1.ilp");
+        std::fs::write(&path, vec![b'x'; 300]).expect("write"); // APPROVED: test
+        let view = test_spill_view();
+        // Bytes 100..200 were acknowledged last round and are not confirmed.
+        note_spill_ack(&path, &view, 100, 200);
+        let report = quarantine_report(&path, &view, 200, 50, 250);
+        assert_eq!(report.confirmed_through, 100);
+        assert_eq!(report.acked_through, 250);
+        assert_eq!(report.len_now, 300, "re-read now, not the 250 at the start");
+        assert_eq!(report.unreplayed_bytes(), 200);
+        // Once confirmed, everything before the round's start is confirmed.
+        let confirmed = confirmed_spill_view(&view);
+        let report = quarantine_report(&path, &confirmed, 200, 50, 250);
+        assert_eq!(report.confirmed_through, 200);
+        forget_resume_offset(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review finding (LOW): the over-long-line quarantine counts the chunks
+    /// already accepted, like the whole-file refusal.
+    ///
+    /// Bite: drop the `landed_this_round` increment in that branch.
+    #[tokio::test]
+    async fn test_regression_da13b_an_over_long_line_quarantine_counts_accepted_chunks() {
+        let dir = temp_dir("da13b-over-long");
+        let path = dir.join("ticks-dhan-1.ilp");
+        let mut body = GOOD_LINE.to_vec();
+        body.extend_from_slice(GOOD_LINE);
+        body.resize(body.len() + REPLAY_STREAM_BUFFER_BYTES + 1024, b'x');
+        std::fs::write(&path, &body).expect("write"); // APPROVED: test
+        drop(body);
+        let (url, server) = spawn_selective_server().await;
+        let client = crate::http_client::build_probe_client(5).expect("client"); // APPROVED: test
+        let out = replay_spill_dir(&dir, &url, &client, &test_spill_view()).await;
+        server.abort();
+        assert_eq!(out.files_quarantined, 1);
+        assert_eq!(out.bytes_replayed, 2 * GOOD_LINE.len() as u64);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review finding (LOW): the view reads the episode count before AND
+    /// after the suspect flag, and reads "suspect" when they differ, so an
+    /// episode beginning mid-read can never yield "not suspect" with the new
+    /// count. Source scan: the race is nanoseconds wide.
+    ///
+    /// Bite: read the count after the flag only.
+    #[test]
+    fn test_regression_da13b_the_view_reads_the_episode_count_around_the_suspect_flag() {
+        let src = include_str!("tick_spill_replay.rs");
+        let body = src
+            .split("pub fn current() -> Self {")
+            .nth(1)
+            .expect("current()");
+        let body = &body[..body.find("\n    }\n").unwrap_or(body.len())];
+        let before = body
+            .find("let episodes_before = wm.suspect_episode_count();")
+            .expect("count read first");
+        let flag = body.find("wm.is_sink_suspect()").expect("flag read");
+        let after = body
+            .find("let episodes_after = wm.suspect_episode_count();")
+            .expect("count read again");
+        assert!(before < flag && flag < after);
+        assert!(body.contains("suspect || episodes_before != episodes_after"));
     }
 }

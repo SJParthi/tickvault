@@ -2976,6 +2976,13 @@ fn spill_dir_has_pending_data(path: &Path) -> bool {
             if meta.len() > drained_to {
                 return true;
             }
+            // Drained, but its latest acks are not yet confirmed (audit DA-13b
+            // review): a QuestDB suspicion episode can still rewind it and
+            // send those rows again, into an hour this archive would export
+            // and drop. Pending until confirmed.
+            if meta.len() > 0 && crate::tick_spill_replay::has_unconfirmed_ack(&entry.path()) {
+                return true;
+            }
             // Emptied (0 bytes) or drained to its end: nothing left to replay.
             continue;
         }
@@ -3444,6 +3451,37 @@ mod tests {
                 "{name} must count"
             );
         }
+    }
+
+    /// Audit DA-13b review: a file drained to its end whose latest acks are
+    /// not yet confirmed can still be rewound and sent again by a QuestDB
+    /// suspicion episode, into an hour this archive would drop. Pending.
+    ///
+    /// Bite: drop the `has_unconfirmed_ack` check and the first assert fails.
+    #[test]
+    fn test_regression_da13b_a_drained_file_with_unconfirmed_acks_is_pending() {
+        let dir = SpillScratch::new("unconfirmed-ack");
+        let path = dir.path().join("depth-dhan-2026100910.dspl");
+        std::fs::write(&path, b"rows\n").expect("write");
+        let len = std::fs::metadata(&path).expect("meta").len();
+        crate::tick_spill_replay::record_resume_offset(&path, len);
+        let mut view = crate::tick_spill_replay::SpillSinkView::current();
+        view.live = false;
+        view.suspect = false;
+        // Far ahead of any real probe count, so it can never be confirmed.
+        view.clean_probes = u64::MAX / 2;
+        crate::tick_spill_replay::note_spill_ack(&path, &view, 0, len);
+        assert!(
+            super::spill_dir_has_pending_data(dir.path()),
+            "unconfirmed acks: a rewind may still send these rows again"
+        );
+        crate::tick_spill_replay::forget_resume_offset(&path);
+        crate::tick_spill_replay::record_resume_offset(&path, len);
+        assert!(
+            !super::spill_dir_has_pending_data(dir.path()),
+            "no acks pending: drained to its end holds nothing"
+        );
+        crate::tick_spill_replay::forget_resume_offset(&path);
     }
 
     // Regression: 2026-10-09 (review of BND-1) — the replay never empties the

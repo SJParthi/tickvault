@@ -62,7 +62,7 @@ use crate::tick_spill_replay::{
     REPLAY_MAX_CHUNK_BYTES, SpillReplayOutcome, SpillSinkView, describe_send_error,
     empty_drained_closed_file, forget_resume_offset, ilp_chunk_ranges, is_permanent_refusal,
     isolate_refused_lines, note_spill_ack, note_spill_file_unreadable, record_resume_offset,
-    resume_offset_for, rewind_after_suspicion, set_aside_rejected_lines,
+    resend_through_for, resume_offset_for, rewind_after_suspicion, set_aside_rejected_lines,
     spill_file_may_still_be_appended,
 };
 
@@ -399,6 +399,8 @@ pub async fn replay_framed_spill_dir(
             spill_file_may_still_be_appended(&path, &meta, file_index == last_index, view, "depth");
         rewind_after_suspicion(&path, view, "depth");
         let resume_from = resume_offset_for(&path).min(file_len);
+        // Below this offset a rewound re-send sets nothing aside again.
+        let resend_through = resend_through_for(&path);
         if resume_from == file_len {
             // Fully drained: empty it once its hour has closed and its acks
             // are confirmed (audit DA-13b; before, a file drained while live
@@ -441,6 +443,7 @@ pub async fn replay_framed_spill_dir(
             &file,
             file_len,
             writer_may_still_append,
+            resend_through,
             client,
             url,
             &mut offset,
@@ -455,7 +458,7 @@ pub async fn replay_framed_spill_dir(
         // before the file is emptied too. Stamping a set-aside-only round as
         // well costs at most one more confirm cycle before the empty-out.
         if sent_bytes > 0 || offset > resume_from {
-            note_spill_ack(&path, view);
+            note_spill_ack(&path, view, resume_from, offset);
         }
         if offset > resume_from {
             record_resume_offset(&path, offset);
@@ -469,7 +472,9 @@ pub async fn replay_framed_spill_dir(
                 return outcome;
             }
             Walk::WaitForWriter => {
-                outcome.files_replayed = outcome.files_replayed.saturating_add(1);
+                if offset > resume_from {
+                    outcome.files_replayed = outcome.files_replayed.saturating_add(1);
+                }
                 continue;
             }
             Walk::Done => {}
@@ -535,6 +540,7 @@ async fn walk_file(
     file: &File,
     file_len: u64,
     live: bool,
+    resend_through: u64,
     client: &Client,
     url: &str,
     offset: &mut u64,
@@ -576,6 +582,12 @@ async fn walk_file(
                     None if live => return Walk::WaitForWriter,
                     None => (file_len, "torn_tail"),
                 };
+                if *offset < resend_through {
+                    // A rewound re-send (audit DA-13b review): these bytes
+                    // were set aside and counted on the first pass.
+                    *offset = to;
+                    continue;
+                }
                 match set_aside_region(dir, path, file, *offset, to) {
                     Ok(bytes) => {
                         metrics::counter!(FRAMED_SET_ASIDE_COUNTER, "reason" => reason)
@@ -621,6 +633,7 @@ async fn walk_file(
                     version,
                     &body,
                     accepted_in_file,
+                    *offset < resend_through,
                     client,
                     url,
                     outcome,
@@ -676,12 +689,17 @@ async fn set_aside_refused(
     version: u8,
     body: &bytes::Bytes,
     others_accepted: bool,
+    repeat: bool,
     client: &Client,
     url: &str,
     outcome: &mut SpillReplayOutcome,
 ) -> Option<bool> {
     if version == ILP_VERSION_1 {
         match isolate_refused_lines(client, url, body, others_accepted).await {
+            // A rewound re-send (audit DA-13b review): isolation just re-POSTed
+            // the good lines; the refused ones were set aside and counted on
+            // the first pass.
+            LineIsolation::Isolated(_) if repeat => return Some(true),
             LineIsolation::Isolated(rejected) => {
                 return Some(match set_aside_rejected_lines(dir, path, body, &rejected) {
                     Ok(bytes) => {
@@ -706,6 +724,10 @@ async fn set_aside_refused(
             LineIsolation::Transient => return None,
             LineIsolation::WholeFile => {}
         }
+    }
+    if repeat {
+        // Set aside whole and counted on the first pass.
+        return Some(true);
     }
     let Ok(header) = encode_header(version, body) else {
         return Some(false);
@@ -1333,5 +1355,48 @@ mod tests {
         );
         forget_resume_offset(&path);
         assert_eq!(resume_offset_for(&path), 0);
+    }
+
+    /// Audit DA-13b review (HIGH, depth twin): a rewound re-send of a framed
+    /// file sets no refused line aside, and counts none, a second time.
+    ///
+    /// Bite: drop the `repeat` arm of `set_aside_refused` and round 2 sets
+    /// the line aside again.
+    #[tokio::test]
+    async fn test_regression_da13b_a_rewound_depth_file_sets_nothing_aside_twice() {
+        let dir = temp_dir("da13b-depth-rewind");
+        let closed = dir.join("depth-dhan-1.dspl");
+        write_records(
+            &closed,
+            &[(
+                b"market_depth,a=1 b=1i 1\nmarket_depth,poison\nmarket_depth,a=2 b=2i 2\n",
+                1,
+            )],
+        );
+        write_records(
+            &dir.join("depth-dhan-2.dspl"),
+            &[(b"market_depth,a=3 b=3i 3\n", 1)],
+        );
+        let (url, _bodies, server) = spawn_recording_server().await;
+        let view = crate::tick_spill_replay::tests::test_spill_view();
+        let first = replay_framed_spill_dir(&dir, &url, &client(), &view).await;
+        assert_eq!(first.lines_set_aside, 1);
+        // An episode begins before the acks are confirmed: the file is sent
+        // again from where those acks began.
+        let mut after_episode = crate::tick_spill_replay::tests::confirmed_spill_view(&view);
+        after_episode.suspect_episodes += 1;
+        let second = replay_framed_spill_dir(&dir, &url, &client(), &after_episode).await;
+        server.abort();
+        assert!(second.bytes_replayed > 0, "the file is sent again");
+        assert_eq!(second.lines_set_aside, 0, "nothing is set aside twice");
+        let kept = std::fs::read(dir.join(QUARANTINE_DIR).join(format!(
+            "depth-dhan-1.dspl{}",
+            crate::tick_spill_replay::REJECTED_LINES_SUFFIX
+        )))
+        .expect("kept");
+        assert_eq!(kept, b"market_depth,poison\n");
+        forget_resume_offset(&closed);
+        forget_resume_offset(&dir.join("depth-dhan-2.dspl"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
