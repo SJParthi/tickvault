@@ -105,7 +105,9 @@ pub const SPILL_FILE_EXTENSION: &str = "ilp";
 /// What one replay round did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SpillReplayOutcome {
-    /// Files fully accepted by QuestDB and truncated.
+    /// Files whose rows QuestDB accepted this round. A closed file is emptied
+    /// only once those acknowledgements are confirmed (audit DA-13b), so it
+    /// may still hold its bytes; see `files_awaiting_confirm`.
     pub files_replayed: usize,
     /// Files whose replay failed; left intact for the next round.
     pub files_failed: usize,
@@ -118,6 +120,10 @@ pub struct SpillReplayOutcome {
     /// Single lines QuestDB refused inside an otherwise accepted chunk, kept
     /// in `quarantine/<file>.rejected-lines` (PR17).
     pub lines_set_aside: u64,
+    /// Closed files fully drained but kept, because their acknowledgements
+    /// are not yet confirmed (audit DA-13b: suspect sink, fewer than two
+    /// clean probes since, or inside the durability lag).
+    pub files_awaiting_confirm: usize,
 }
 
 impl SpillReplayOutcome {
@@ -134,6 +140,9 @@ impl SpillReplayOutcome {
             .saturating_add(other.files_quarantined);
         self.bytes_replayed = self.bytes_replayed.saturating_add(other.bytes_replayed);
         self.lines_set_aside = self.lines_set_aside.saturating_add(other.lines_set_aside);
+        self.files_awaiting_confirm = self
+            .files_awaiting_confirm
+            .saturating_add(other.files_awaiting_confirm);
     }
 }
 
@@ -436,11 +445,329 @@ pub(crate) fn record_resume_offset(path: &Path, offset: u64) {
 }
 
 /// Forget a file we will never read again, so the map cannot grow without
-/// bound as hours roll over.
+/// bound as hours roll over. Also forgets its ack stamp (audit DA-13b): the
+/// two describe the same drained bytes and must go together, or a new file of
+/// the same name would inherit a stamp for bytes it never held.
 pub(crate) fn forget_resume_offset(path: &Path) {
     if let Ok(mut m) = resume_offsets().lock() {
         m.remove(path);
     }
+    if let Ok(mut m) = ack_stamps().lock() {
+        m.remove(path);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Audit DA-13b (2026-10-13): when a drained spill file may be emptied.
+//
+// Three defects shared one cause: the replay emptied a file on the strength of
+// facts it never checked.
+//
+// 1. "QuestDB said 2xx, so the rows are in the database." Not while a table is
+//    WAL-suspended: it acknowledges and never applies (the 2026-08-25 disk-full
+//    shape), and the rescued rows' WAL frames already read as applied, so the
+//    spill file is their only local copy. Nor within seconds of the ack: with
+//    `cairo.commit.mode=nosync` the rows sit in the page cache, which is why the
+//    persisted watermark lags acks by `WATERMARK_DURABILITY_LAG_SECS`.
+// 2. "Only the last file by name can still be written to." The writer names
+//    files from the wall clock, so a clock step back across an hour (or a step
+//    forward that left a future-named file behind) makes it append to a file
+//    that is not last.
+// 3. "A file drained while it was live will be emptied when its hour closes."
+//    It never was: the fully-drained skip ran before the empty-out.
+//
+// So a closed, fully drained file is emptied only when every ack that drained
+// it has stood for the durability lag, at least two clean QuestDB probes ran
+// after the last of them (the seal mid-session replay's rule), no suspicion
+// episode began since the first of them, and the sink is not suspect now. An
+// episode since the first ack rewinds the file so it is POSTed again; the
+// DEDUP keys collapse the rows that did land. Every direction keeps the file.
+// ---------------------------------------------------------------------------
+
+/// Clean QuestDB probes that must run after a spill file's last ack before the
+/// file may be emptied. Same value and reason as the seal mid-session replay's
+/// `SEAL_REPLAY_ARCHIVE_CONFIRM_PROBES`: one probe can race the ack; the second
+/// ran wholly after it.
+pub const SPILL_EMPTY_CONFIRM_PROBES: u64 = 2;
+
+/// Seconds a non-last spill file must have been quiet (by mtime) before the
+/// replay treats it as closed. Covers a rescue still writing into the previous
+/// hour's file just after the rollover, and an mtime ahead of the clock after a
+/// backward step reads as live until the clock passes it.
+pub const SPILL_LIVE_FILE_QUIET_SECS: u64 = 120;
+
+/// Seconds in one spill-file hour (the writers name files `now / 3_600`).
+const SPILL_FILE_HOUR_SECS: u64 = 3_600;
+
+/// Counter: replay rounds held because the database is suspect.
+pub const SPILL_REPLAY_HELD_COUNTER: &str = "tv_spill_replay_held_total";
+/// Counter: drained closed files kept because their acks are not confirmed.
+pub const SPILL_REPLAY_EMPTY_DEFERRED_COUNTER: &str = "tv_spill_replay_empty_deferred_total";
+/// Counter: files rewound to be POSTed again after a suspicion episode.
+pub const SPILL_REPLAY_REWOUND_COUNTER: &str = "tv_spill_replay_rewound_total";
+/// Counter: non-last files treated as live (clock step, recent write).
+pub const SPILL_REPLAY_NONLAST_LIVE_COUNTER: &str = "tv_spill_replay_nonlast_kept_live_total";
+
+/// Reasons a drained closed file is kept for a later round.
+const EMPTY_DEFER_REASONS: [&str; 3] = ["sink_suspect", "awaiting_clean_probes", "durability_lag"];
+
+/// What the replay knows about the database and the clock for one round.
+///
+/// Taken once per round by the caller ([`SpillSinkView::current`]) so a round
+/// judges every file against the same instant, and so tests can drive time and
+/// probes without touching the process-wide watermark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpillSinkView {
+    /// A QuestDB table is suspended, its apply lag grows, or the probe is blind.
+    pub suspect: bool,
+    /// Clean probes reported this process.
+    pub clean_probes: u64,
+    /// Suspicion episodes begun this process.
+    pub suspect_episodes: u64,
+    /// Wall clock, Unix seconds.
+    pub now_unix_secs: u64,
+}
+
+impl SpillSinkView {
+    /// The view right now, from the process-wide applied watermark and the
+    /// wall clock. O(1): three atomic loads and one clock read.
+    #[must_use]
+    pub fn current() -> Self {
+        let wm = crate::wal_applied_watermark::applied_watermark();
+        Self {
+            suspect: wm.is_sink_suspect(),
+            clean_probes: wm.clean_probe_count(),
+            suspect_episodes: wm.suspect_episode_count(),
+            now_unix_secs: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        }
+    }
+}
+
+/// The acks that drained a spill file and are not yet confirmed.
+#[derive(Debug, Clone, Copy)]
+struct AckStamp {
+    /// Suspicion episodes when the FIRST unconfirmed ack landed: an episode
+    /// after it may have lied about any of them.
+    first_episode: u64,
+    /// When the LAST ack landed, and how many clean probes had run by then.
+    last_ack_secs: u64,
+    last_ack_probes: u64,
+}
+
+impl AckStamp {
+    fn confirmed_at(&self, view: &SpillSinkView) -> Result<(), &'static str> {
+        if view.suspect || view.suspect_episodes != self.first_episode {
+            Err(EMPTY_DEFER_REASONS[0])
+        } else if view.clean_probes
+            < self
+                .last_ack_probes
+                .saturating_add(SPILL_EMPTY_CONFIRM_PROBES)
+        {
+            Err(EMPTY_DEFER_REASONS[1])
+        } else if view.now_unix_secs
+            < self
+                .last_ack_secs
+                .saturating_add(crate::wal_applied_watermark::WATERMARK_DURABILITY_LAG_SECS)
+        {
+            Err(EMPTY_DEFER_REASONS[2])
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Unconfirmed acks per spill file. One entry per file with drained bytes not
+/// yet emptied; removed with its resume offset, so it is bounded by the files
+/// in the spill directories.
+static ACK_STAMPS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, AckStamp>>,
+> = std::sync::OnceLock::new();
+
+fn ack_stamps() -> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, AckStamp>>
+{
+    ACK_STAMPS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Records that QuestDB acknowledged bytes of `path` at `view`. When the
+/// earlier acks are already confirmed they are settled and the episode
+/// baseline restarts here; otherwise the first unconfirmed ack's episode is
+/// kept. Cold replay path, one lock and one probe.
+pub(crate) fn note_spill_ack(path: &Path, view: &SpillSinkView) {
+    if let Ok(mut m) = ack_stamps().lock() {
+        let first_episode = match m.get(path) {
+            Some(prev) if prev.confirmed_at(view).is_err() => prev.first_episode,
+            _ => view.suspect_episodes,
+        };
+        m.insert(
+            path.to_path_buf(),
+            AckStamp {
+                first_episode,
+                last_ack_secs: view.now_unix_secs,
+                last_ack_probes: view.clean_probes,
+            },
+        );
+    }
+}
+
+/// If a suspicion episode began after the first unconfirmed ack of `path`,
+/// forgets its resume offset and stamp so this round POSTs the file again
+/// from the start, and returns `true`. The episode may have acknowledged rows
+/// it never applied; the DEDUP keys collapse the ones that did land.
+pub(crate) fn rewind_after_suspicion(
+    path: &Path,
+    view: &SpillSinkView,
+    dir_label: &'static str,
+) -> bool {
+    let rewind = ack_stamps()
+        .lock()
+        .map(|m| {
+            m.get(path)
+                .is_some_and(|s| s.first_episode != view.suspect_episodes)
+        })
+        .unwrap_or(false);
+    if rewind {
+        forget_resume_offset(path);
+        metrics::counter!(SPILL_REPLAY_REWOUND_COUNTER, "dir" => dir_label).increment(1);
+        warn!(
+            path = %path.display(),
+            "a QuestDB suspicion episode began after this spill file was acknowledged — \
+             the acknowledgement may not have been applied, so the file is sent again \
+             from the start; rows that did land collapse onto themselves"
+        );
+    }
+    rewind
+}
+
+/// Whether a fully drained, closed spill file may be emptied now: `Ok` when it
+/// has no unconfirmed acks or they are all confirmed, else the reason to wait.
+pub(crate) fn drained_file_empty_verdict(
+    path: &Path,
+    view: &SpillSinkView,
+) -> Result<(), &'static str> {
+    if view.suspect {
+        return Err(EMPTY_DEFER_REASONS[0]);
+    }
+    match ack_stamps().lock() {
+        Ok(m) => m.get(path).map_or(Ok(()), |s| s.confirmed_at(view)),
+        // A poisoned lock cannot vouch for anything: keep the file.
+        Err(_) => Err(EMPTY_DEFER_REASONS[1]),
+    }
+}
+
+/// The hour a spill file's name carries (`<tier>-<feed>-<hour>.<ext>`).
+#[must_use]
+pub(crate) fn spill_file_hour(path: &Path) -> Option<u64> {
+    path.file_stem()?
+        .to_str()?
+        .rsplit('-')
+        .next()?
+        .parse::<u64>()
+        .ok()
+}
+
+/// Whether the spill writer may still append to `path` (audit DA-13b).
+///
+/// The last file by name always may. Any other file is treated as closed only
+/// when the hour in its name is before the current wall-clock hour AND its
+/// mtime is at least [`SPILL_LIVE_FILE_QUIET_SECS`] in the past. A name that
+/// does not parse or an mtime that cannot be read reads as live: doubt keeps
+/// the data. A non-last file kept live is counted, so a clock step shows.
+/// Cold replay path: one compare and one `SystemTime` subtraction.
+pub(crate) fn spill_file_may_still_be_appended(
+    path: &Path,
+    meta: &std::fs::Metadata,
+    is_last: bool,
+    view: &SpillSinkView,
+    dir_label: &'static str,
+) -> bool {
+    if is_last {
+        return true;
+    }
+    let hour_closed =
+        spill_file_hour(path).is_some_and(|hour| hour < view.now_unix_secs / SPILL_FILE_HOUR_SECS);
+    let quiet = meta
+        .modified()
+        .ok()
+        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+        .is_some_and(|m| {
+            m.as_secs().saturating_add(SPILL_LIVE_FILE_QUIET_SECS) <= view.now_unix_secs
+        });
+    let live = !(hour_closed && quiet);
+    if live {
+        metrics::counter!(SPILL_REPLAY_NONLAST_LIVE_COUNTER, "dir" => dir_label).increment(1);
+    }
+    live
+}
+
+/// What became of a closed, fully drained file this round.
+pub(crate) enum EmptyOutcome {
+    /// Truncated to zero bytes.
+    Emptied,
+    /// Kept for a later round; the reason was counted.
+    Deferred,
+    /// The truncate failed (coded error logged, failure counted).
+    Failed,
+}
+
+/// Empties a closed, fully drained spill file once its acks are confirmed
+/// (see the section comment above), or keeps it and counts why. Truncates
+/// rather than deletes so the retention sweep can still tell a drained file
+/// from an abandoned one. Cold replay path.
+pub(crate) fn empty_drained_closed_file(
+    path: &Path,
+    view: &SpillSinkView,
+    dir_label: &'static str,
+) -> EmptyOutcome {
+    if let Err(reason) = drained_file_empty_verdict(path, view) {
+        metrics::counter!(
+            SPILL_REPLAY_EMPTY_DEFERRED_COUNTER,
+            "dir" => dir_label,
+            "reason" => reason
+        )
+        .increment(1);
+        return EmptyOutcome::Deferred;
+    }
+    match std::fs::File::create(path) {
+        Ok(_) => {
+            forget_resume_offset(path);
+            EmptyOutcome::Emptied
+        }
+        Err(err) => {
+            // The rows ARE in QuestDB; only the bookkeeping failed. The offset
+            // stays, so the next round does not re-send; it retries the empty.
+            error!(
+                code = ErrorCode::TickSpill01FileQuarantined.code_str(),
+                source = "accepted_not_emptied",
+                path = %path.display(),
+                %err,
+                "spilled rows were accepted by the database but the spill file could not \
+                 be emptied — the rows are saved; the empty-out is retried next round"
+            );
+            metrics::counter!("tv_tick_spill_replay_failed_total").increment(1);
+            EmptyOutcome::Failed
+        }
+    }
+}
+
+/// Counts and logs a spill file the replay could not stat, open, seek or
+/// re-check (audit DA-13b, C10). Before, these returned with an uncoded
+/// `warn!` and no counter, so a file that stays unreadable blocked every file
+/// behind it, every round, invisibly. Cold replay path.
+pub(crate) fn note_spill_file_unreadable(path: &Path, source: &'static str, err: &std::io::Error) {
+    metrics::counter!("tv_tick_spill_replay_failed_total").increment(1);
+    error!(
+        code = ErrorCode::TickSpill01FileQuarantined.code_str(),
+        source,
+        path = %path.display(),
+        %err,
+        "the spill replay could not read a spill file. Nothing is quarantined and \
+         nothing is lost: the file is left as it is and retried next round, but the \
+         files behind it wait until it can be read. Check the file's owner, mode and \
+         the disk."
+    );
 }
 
 /// A `&'static str` label for the spill directory being replayed.
@@ -782,7 +1109,15 @@ fn nanos_are_a_plausible_epoch(nanos: i64) -> bool {
     })
 }
 
-pub async fn replay_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillReplayOutcome {
+/// Replays every text spill file in `dir` into QuestDB, judging liveness and
+/// the empty-out against `view` (audit DA-13b; see the section comment above
+/// [`SpillSinkView`]).
+pub async fn replay_spill_dir(
+    dir: &Path,
+    url: &str,
+    client: &Client,
+    view: &SpillSinkView,
+) -> SpillReplayOutcome {
     let mut outcome = SpillReplayOutcome::default();
     // FIRST-SAMPLE BASELINE. The CloudWatch agent computes a counter as the
     // delta between consecutive samples and DROPS the first sample of a series
@@ -807,28 +1142,29 @@ pub async fn replay_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillRe
     // size independent of how large any spill file has grown.
     let mut buf = vec![0_u8; REPLAY_STREAM_BUFFER_BYTES];
     // The writer appends to the file for the CURRENT hour, and `list_spill_files`
-    // sorts by name (hour), so the LAST entry is the only one that can still be
-    // written to. Everything before it has been closed by the hour rollover.
-    // That distinction is what makes the truncate below provably safe: a closed
-    // file has no appender, so emptying it cannot destroy anything.
+    // sorts by name (hour). The LAST entry is always treated as live; since
+    // audit DA-13b an earlier entry is closed only when its hour has passed AND
+    // it has been quiet for `SPILL_LIVE_FILE_QUIET_SECS`, because the writer
+    // names files from the wall clock and a clock step makes it append to a
+    // file that is not last. A closed file has no appender, so emptying it
+    // cannot destroy anything.
+    let label = dir_label(dir);
     let files = list_spill_files(dir);
     let last_index = files.len().saturating_sub(1);
     for (file_index, path) in files.into_iter().enumerate() {
-        let writer_may_still_append = file_index == last_index;
         // Size from METADATA, never from a materialised read. This is the
         // 2026-09-03 fix: `std::fs::read` here held a 21 GB file in RAM.
-        let file_len = match std::fs::metadata(&path) {
-            Ok(meta) => meta.len(),
+        let meta = match std::fs::metadata(&path) {
+            Ok(meta) => meta,
             Err(err) => {
-                warn!(
-                    path = %path.display(),
-                    %err,
-                    "tick spill replay could not read a spill file — leaving it for the next round"
-                );
+                note_spill_file_unreadable(&path, "spill_stat_failed", &err);
                 outcome.files_failed = outcome.files_failed.saturating_add(1);
                 return outcome;
             }
         };
+        let file_len = meta.len();
+        let writer_may_still_append =
+            spill_file_may_still_be_appended(&path, &meta, file_index == last_index, view, label);
         if file_len == 0 {
             forget_resume_offset(&path);
             // Already drained. Leave it alone: truncating it again would
@@ -836,22 +1172,43 @@ pub async fn replay_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillRe
             outcome.files_skipped_empty = outcome.files_skipped_empty.saturating_add(1);
             continue;
         }
+        // A suspicion episode since this file's first unconfirmed ack: those
+        // acks may be lies, so start the file again (audit DA-13b).
+        rewind_after_suspicion(&path, view, label);
         // Start where the last round finished, not at 0. See RESUME_OFFSETS:
         // this is what makes a growing file converge WITHOUT moving bytes or
         // truncating a file the writer still holds open.
         let resume_from = resume_offset_for(&path).min(file_len);
         if resume_from == file_len {
+            // Fully drained. A file drained while it was live is emptied here
+            // once its hour has closed and its acks are confirmed; before
+            // audit DA-13b this skip ran first and such a file was never
+            // emptied for the life of the process.
+            if !writer_may_still_append {
+                match empty_drained_closed_file(&path, view, label) {
+                    EmptyOutcome::Emptied => {
+                        info!(
+                            path = %path.display(),
+                            "emptied a drained spill file whose acknowledgements are confirmed"
+                        );
+                    }
+                    EmptyOutcome::Deferred => {
+                        outcome.files_awaiting_confirm =
+                            outcome.files_awaiting_confirm.saturating_add(1);
+                    }
+                    EmptyOutcome::Failed => {
+                        outcome.files_failed = outcome.files_failed.saturating_add(1);
+                        return outcome;
+                    }
+                }
+            }
             outcome.files_skipped_empty = outcome.files_skipped_empty.saturating_add(1);
             continue;
         }
         let mut handle = match std::fs::File::open(&path) {
             Ok(f) => f,
             Err(err) => {
-                warn!(
-                    path = %path.display(),
-                    %err,
-                    "tick spill replay could not read a spill file — leaving it for the next round"
-                );
+                note_spill_file_unreadable(&path, "spill_open_failed", &err);
                 outcome.files_failed = outcome.files_failed.saturating_add(1);
                 return outcome;
             }
@@ -860,13 +1217,8 @@ pub async fn replay_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillRe
         if resume_from > 0 {
             use std::io::Seek as _;
             if let Err(err) = handle.seek(std::io::SeekFrom::Start(resume_from)) {
-                warn!(
-                    path = %path.display(),
-                    %err,
-                    resume_from,
-                    "tick spill replay could not seek to the resume offset — leaving this file \
-                     for the next round rather than re-sending from the start"
-                );
+                // Left for the next round rather than re-sent from the start.
+                note_spill_file_unreadable(&path, "spill_seek_failed", &err);
                 outcome.files_failed = outcome.files_failed.saturating_add(1);
                 continue;
             }
@@ -884,6 +1236,10 @@ pub async fn replay_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillRe
         let mut failed = false;
         let mut quarantined = false;
         let mut over_long_line = false;
+        // At least one chunk of this file got a 2xx this round (audit
+        // DA-13b): the ack is stamped so the empty-out can wait for it to be
+        // confirmed.
+        let mut acked = false;
         // STREAMING WINDOW STATE.
         //
         // `carry` is the partial line at the FRONT of the buffer, kept from
@@ -925,9 +1281,28 @@ pub async fn replay_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillRe
                 // +1 keeps the newline with the line it terminates, matching
                 // `ilp_chunk_ranges`.
                 Some(nl) => nl.saturating_add(1),
-                // No newline in the FINAL read: a tail torn by a crash
-                // mid-append. POST it whole and let QuestDB judge it — which
-                // is byte-for-byte what this function did before streaming.
+                // No newline in the FINAL read of a file the writer may still
+                // append to, or one that grew past the size read at the start
+                // of this round: that is a line still being written, not a
+                // torn one (audit DA-13b). POSTing it would commit the half
+                // row (a prefix cut before its timestamp is valid ILP, which
+                // QuestDB stamps with its own time) and the next round would
+                // resume mid-line and set the other half aside. Leave it
+                // unconsumed; the resume offset stays on the last newline and
+                // a later round reads the whole line.
+                None if eof
+                    && (writer_may_still_append
+                        || resume_from
+                            .saturating_add(accepted)
+                            .saturating_add(filled as u64)
+                            > file_len) =>
+                {
+                    break 'file;
+                }
+                // No newline in the FINAL read of a closed, quiet file: a tail
+                // torn by a crash mid-append. POST it whole and let QuestDB
+                // judge it — which is byte-for-byte what this function did
+                // before streaming.
                 None if eof => filled,
                 // No newline in a FULL buffer with more file behind it. At
                 // 32 MiB that is not a long line, it is a torn file.
@@ -1015,6 +1390,7 @@ pub async fn replay_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillRe
                 match client.post(url).body(chunk).send().await {
                     Ok(resp) if resp.status().is_success() => {
                         accepted = accepted.saturating_add(len);
+                        acked = true;
                     }
                     Ok(resp) => {
                         let status = resp.status().as_u16();
@@ -1062,6 +1438,7 @@ pub async fn replay_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillRe
                                             refused_bytes =
                                                 refused_bytes.saturating_add(rejected_bytes);
                                             accepted = accepted.saturating_add(len);
+                                            acked = true;
                                             continue;
                                         }
                                         Err(err) => {
@@ -1099,22 +1476,37 @@ pub async fn replay_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillRe
                             // this one — which is exactly what stranded 1,662,318
                             // intact ticks on 2026-08-25. Set it aside and keep
                             // going.
+                            // Audit DA-13b (C11): the chunks before this
+                            // one, in this round and in earlier rounds, were
+                            // accepted. Say so, and count them as replayed,
+                            // rather than report the whole file as not in
+                            // the database. Taken before the move, which
+                            // forgets the resume offset.
+                            let accepted_through = resume_from.saturating_add(accepted);
+                            let landed_this_round = accepted.saturating_sub(refused_bytes);
                             match quarantine_spill_file(dir, &path) {
                                 Ok(moved) => {
                                     metrics::counter!(REPLAY_QUARANTINED_COUNTER).increment(1);
                                     outcome.files_quarantined =
                                         outcome.files_quarantined.saturating_add(1);
+                                    outcome.bytes_replayed =
+                                        outcome.bytes_replayed.saturating_add(landed_this_round);
+                                    metrics::counter!("tv_tick_spill_replayed_bytes_total")
+                                        .increment(landed_this_round);
                                     error!(
                                         code = ErrorCode::TickSpill01FileQuarantined.code_str(),
                                         path = %moved.display(),
                                         status,
                                         bytes = file_len,
+                                        accepted_through,
+                                        unreplayed_bytes = file_len.saturating_sub(accepted_through),
                                         "tick spill file PERMANENTLY refused by QuestDB and moved to \
                                          quarantine so the rest of the backlog can drain. The rows \
-                                         are still on disk and are NOT in the database. Most of the \
-                                         file is usually salvageable — filter to well-formed lines \
-                                         and re-POST, which is safe to repeat because the ticks \
-                                         dedup key carries capture_seq."
+                                         before byte accepted_through ARE in the database (and some \
+                                         of the refused chunk may be too); the rest is on disk and \
+                                         is NOT. Most of the file is usually salvageable — filter \
+                                         to well-formed lines and re-POST, which is safe to repeat \
+                                         because the ticks dedup key carries capture_seq."
                                     );
                                     // Deliberately NOT `failed = true`: this file
                                     // is dealt with, and the whole point is that
@@ -1216,6 +1608,19 @@ pub async fn replay_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillRe
             continue;
         }
 
+        // Audit DA-13b: stamp the acks of this file so its empty-out waits
+        // until they are confirmed, and so a suspicion episode after them
+        // rewinds it.
+        if acked {
+            note_spill_ack(&path, view);
+        }
+        // Where this round stopped, always on a line boundary: every chunk is
+        // cut at a newline, and a half-written last line of a live file is
+        // left unconsumed. Before audit DA-13b the grown and live branches
+        // recorded the `file_len` snapshot instead, which can fall mid-line
+        // while the writer is appending, so the next round started inside a
+        // row.
+        let drained_to = resume_from.saturating_add(accepted);
         if failed {
             // Keep what this round finished. `accepted` counts only chunks
             // that were fully handled (POSTed and accepted, refused as out of
@@ -1229,7 +1634,7 @@ pub async fn replay_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillRe
             // themselves); the duplicate quarantine lines and the repeated
             // bisection work were not.
             if accepted > 0 {
-                record_resume_offset(&path, resume_from.saturating_add(accepted));
+                record_resume_offset(&path, drained_to);
                 outcome.bytes_replayed = outcome
                     .bytes_replayed
                     .saturating_add(accepted.saturating_sub(refused_bytes));
@@ -1294,12 +1699,12 @@ pub async fn replay_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillRe
                 // replaced — it froze the tail length before copying, so bytes
                 // appended DURING the copy were erased by `set_len`. See
                 // RESUME_OFFSETS for why that cannot be repaired in place.
-                record_resume_offset(&path, file_len);
+                record_resume_offset(&path, drained_to);
                 info!(
                     path = %path.display(),
                     len_before = file_len,
                     len_now,
-                    resume_from = file_len,
+                    resume_from = drained_to,
                     bytes = accepted,
                     "spilled rows were accepted; the file GREW while draining, so it is left \
                      BYTE-FOR-BYTE INTACT and the next round resumes at the drained offset. \
@@ -1310,14 +1715,13 @@ pub async fn replay_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillRe
             }
             Ok(_) => {}
             Err(err) => {
-                warn!(
-                    path = %path.display(),
-                    %err,
-                    bytes = accepted,
-                    "could not re-check a drained spill file's size — NOT truncating, so no \
-                     appended bytes can be destroyed. The rows already accepted are in the \
-                     database; the next round re-POSTs them idempotently."
-                );
+                // NOT truncating, so no appended bytes can be destroyed. The
+                // rows already accepted keep their offset; the next round
+                // resumes after them.
+                if accepted > 0 {
+                    record_resume_offset(&path, drained_to);
+                }
+                note_spill_file_unreadable(&path, "spill_recheck_failed", &err);
                 outcome.files_failed = outcome.files_failed.saturating_add(1);
                 return outcome;
             }
@@ -1338,38 +1742,34 @@ pub async fn replay_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillRe
         // the grown-file branch uses, with the same guarantee: nothing is
         // touched, so nothing can be lost, and the next round resumes rather
         // than re-sending.
-        if writer_may_still_append {
-            record_resume_offset(&path, file_len);
-            outcome.files_replayed = outcome.files_replayed.saturating_add(1);
-            outcome.bytes_replayed = outcome
-                .bytes_replayed
-                .saturating_add(accepted.saturating_sub(refused_bytes));
-            metrics::counter!("tv_tick_spill_replayed_bytes_total")
-                .increment(accepted.saturating_sub(refused_bytes));
+        // Rows accepted this round are counted when they are accepted; the
+        // empty-out of a closed file is a separate, later decision.
+        record_resume_offset(&path, drained_to);
+        outcome.files_replayed = outcome.files_replayed.saturating_add(1);
+        outcome.bytes_replayed = outcome
+            .bytes_replayed
+            .saturating_add(accepted.saturating_sub(refused_bytes));
+        metrics::counter!("tv_tick_spill_replayed_bytes_total")
+            .increment(accepted.saturating_sub(refused_bytes));
+        if writer_may_still_append || drained_to < file_len {
             info!(
                 path = %path.display(),
                 bytes = accepted,
-                resume_from = file_len,
-                "recovered spilled ticks into the database. This is the hour the writer is \
-                 still appending to, so the file is left BYTE-FOR-BYTE INTACT and the next \
-                 round resumes at the drained offset — emptying it here could destroy a \
-                 concurrent append."
+                resume_from = drained_to,
+                "recovered spilled ticks into the database. The writer may still append to \
+                 this file (or its last line is still being written), so it is left \
+                 BYTE-FOR-BYTE INTACT and the next round resumes at the drained offset — \
+                 emptying it here could destroy a concurrent append."
             );
             continue;
         }
 
-        // A closed file: no writer holds it, so truncating is safe. Truncate
-        // rather than delete so the retention sweep can still tell a drained
-        // file from an abandoned one.
-        forget_resume_offset(&path);
-        match std::fs::File::create(&path) {
-            Ok(_) => {
-                outcome.files_replayed = outcome.files_replayed.saturating_add(1);
-                outcome.bytes_replayed = outcome
-                    .bytes_replayed
-                    .saturating_add(accepted.saturating_sub(refused_bytes));
-                metrics::counter!("tv_tick_spill_replayed_bytes_total")
-                    .increment(accepted.saturating_sub(refused_bytes));
+        // A closed file: no writer holds it, so truncating is safe once the
+        // acks that drained it are confirmed (audit DA-13b). Until then it is
+        // kept, and a later round empties it from the fully-drained branch
+        // at the top of the loop.
+        match empty_drained_closed_file(&path, view, label) {
+            EmptyOutcome::Emptied => {
                 info!(
                     path = %path.display(),
                     bytes = accepted,
@@ -1377,22 +1777,18 @@ pub async fn replay_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillRe
                      otherwise have lost are now queryable"
                 );
             }
-            Err(err) => {
-                // The rows ARE in QuestDB; only the bookkeeping failed. Say so
-                // precisely, because the next round will re-POST them and a
-                // reader who assumed loss would be doubly wrong.
-                error!(
-                    code = ErrorCode::TickSpill01FileQuarantined.code_str(),
-                    source = "accepted_not_emptied",
+            EmptyOutcome::Deferred => {
+                outcome.files_awaiting_confirm = outcome.files_awaiting_confirm.saturating_add(1);
+                info!(
                     path = %path.display(),
-                    %err,
                     bytes = accepted,
-                    "spilled ticks were accepted by the database but the spill file could not \
-                     be emptied — the rows are saved; the file will be sent again next round \
-                     and the duplicate rows collapse onto themselves"
+                    "recovered spilled ticks into the database; the drained file is kept until \
+                     QuestDB's acknowledgement is confirmed (two clean probes and the \
+                     durability lag), then emptied"
                 );
+            }
+            EmptyOutcome::Failed => {
                 outcome.files_failed = outcome.files_failed.saturating_add(1);
-                metrics::counter!("tv_tick_spill_replay_failed_total").increment(1);
                 return outcome;
             }
         }
@@ -1429,6 +1825,17 @@ pub fn describe_send_error(err: &reqwest::Error) -> &'static str {
 pub fn register_replay_baseline() {
     metrics::counter!("tv_tick_spill_replayed_bytes_total").increment(0);
     metrics::counter!("tv_tick_spill_replay_failed_total").increment(0);
+    // Audit DA-13b: the empty-out gate's local counters, every label pair.
+    for dir in ["ticks", "depth"] {
+        metrics::counter!(SPILL_REPLAY_HELD_COUNTER, "dir" => dir, "reason" => "sink_suspect")
+            .increment(0);
+        metrics::counter!(SPILL_REPLAY_REWOUND_COUNTER, "dir" => dir).increment(0);
+        metrics::counter!(SPILL_REPLAY_NONLAST_LIVE_COUNTER, "dir" => dir).increment(0);
+        for reason in EMPTY_DEFER_REASONS {
+            metrics::counter!(SPILL_REPLAY_EMPTY_DEFERRED_COUNTER, "dir" => dir, "reason" => reason)
+                .increment(0);
+        }
+    }
 }
 
 /// Seconds between replay rounds.
@@ -1472,6 +1879,8 @@ async fn run_replay_loop(dir: PathBuf, url: String, require_upload: bool) {
     if holds_in_session {
         metrics::counter!("tv_depth_spill_replay_held_total").increment(0);
     }
+    // One coded `warn!` per suspicion episode, not one per held round.
+    let mut suspect_logged = false;
     // DRAIN FIRST, THEN SLEEP (2026-08-25). This loop slept 300s before its
     // first round, and that ordering cost 1,695,983 ticks on the live box this
     // morning — permanently, in a single event.
@@ -1523,12 +1932,44 @@ async fn run_replay_loop(dir: PathBuf, url: String, require_upload: bool) {
         if held {
             metrics::counter!("tv_depth_spill_replay_held_total").increment(1);
         }
+        // Audit DA-13b: while a QuestDB table is suspended (or its apply lag
+        // grows, or the probe is blind), a 2xx is not proof the rows were
+        // applied, so nothing is POSTed and nothing is emptied. Logged once
+        // per episode, counted every held round.
+        let view = SpillSinkView::current();
+        if view.suspect {
+            metrics::counter!(
+                SPILL_REPLAY_HELD_COUNTER,
+                "dir" => dir_label(&dir),
+                "reason" => "sink_suspect"
+            )
+            .increment(1);
+            if !suspect_logged {
+                suspect_logged = true;
+                warn!(
+                    code = ErrorCode::TickSpill01FileQuarantined.code_str(),
+                    source = "spill_replay_held_sink_suspect",
+                    dir = %dir.display(),
+                    "spill replay is holding: QuestDB reports a suspended table, a growing \
+                     apply lag, or cannot be probed, so an acknowledgement would not prove the \
+                     rows were applied. The spill files are kept as they are and the replay \
+                     resumes once a probe is clean."
+                );
+            }
+        } else {
+            suspect_logged = false;
+        }
+        let held_suspect = view.suspect;
         let round = tokio::task::spawn_blocking(move || {
-            let outcome = if held {
+            let outcome = if held || held_suspect {
                 SpillReplayOutcome::default()
             } else {
-                let mut outcome =
-                    runtime.block_on(replay_spill_dir(&round_dir, &round_url, &round_client));
+                let mut outcome = runtime.block_on(replay_spill_dir(
+                    &round_dir,
+                    &round_url,
+                    &round_client,
+                    &view,
+                ));
                 // The depth directory also holds length-framed `.dspl` files
                 // (plan item 49e, 2026-10-09). Older `.ilp` files drain first;
                 // a failed text round leaves the framed files for the next
@@ -1539,6 +1980,7 @@ async fn run_replay_loop(dir: PathBuf, url: String, require_upload: bool) {
                             &round_dir,
                             &round_url,
                             &round_client,
+                            &view,
                         ),
                     ));
                 }
@@ -1975,10 +2417,16 @@ mod tests {
         let src = include_str!("tick_spill_replay.rs");
         let test_marker = concat!("#[cfg(", "test)]");
         let production = src.split(test_marker).next().unwrap_or(src);
-        let create_at = production
-            .find("std::fs::File::create(&path)")
+        let body = &production[production
+            .find("pub async fn replay_spill_dir(")
+            .expect("replay_spill_dir must exist")..];
+        // The empty-out after a drain is the LAST call in the function; the
+        // earlier one empties a file drained in an earlier round, which has
+        // not grown since (its resume offset still equals its length).
+        let create_at = body
+            .rfind("empty_drained_closed_file(&path")
             .expect("the truncate site must still exist");
-        let guard_at = production
+        let guard_at = body
             .find("Ok(len_now) if len_now > file_len")
             .expect("the growth check must exist");
         assert!(
@@ -2121,7 +2569,13 @@ mod tests {
         let before = std::fs::metadata(&path).expect("meta").modified().ok();
 
         let client = crate::http_client::build_probe_client(1).expect("client");
-        let outcome = replay_spill_dir(&dir, "http://127.0.0.1:1/write", &client).await;
+        let outcome = replay_spill_dir(
+            &dir,
+            "http://127.0.0.1:1/write",
+            &client,
+            &test_spill_view(),
+        )
+        .await;
 
         assert_eq!(outcome.files_skipped_empty, 1);
         assert_eq!(outcome.files_replayed, 0);
@@ -2142,7 +2596,13 @@ mod tests {
         std::fs::write(&path, b"ticks value=1i 1\n").expect("write");
 
         let client = crate::http_client::build_probe_client(1).expect("client");
-        let outcome = replay_spill_dir(&dir, "http://127.0.0.1:1/write", &client).await;
+        let outcome = replay_spill_dir(
+            &dir,
+            "http://127.0.0.1:1/write",
+            &client,
+            &test_spill_view(),
+        )
+        .await;
 
         assert_eq!(outcome.files_failed, 1);
         assert_eq!(outcome.files_replayed, 0);
@@ -2159,7 +2619,13 @@ mod tests {
         let missing = std::env::temp_dir().join("tv-spill-replay-absent-4c1e");
         let _ = std::fs::remove_dir_all(&missing);
         let client = crate::http_client::build_probe_client(1).expect("client");
-        let outcome = replay_spill_dir(&missing, "http://127.0.0.1:1/write", &client).await;
+        let outcome = replay_spill_dir(
+            &missing,
+            "http://127.0.0.1:1/write",
+            &client,
+            &test_spill_view(),
+        )
+        .await;
         assert_eq!(outcome, SpillReplayOutcome::default());
     }
 
@@ -2609,12 +3075,25 @@ mod tests {
             2,
         );
         let client = crate::http_client::build_probe_client(5).expect("client");
-        let outcome = replay_spill_dir(&dir, &url, &client).await;
+        let view = test_spill_view();
+        let outcome = replay_spill_dir(&dir, &url, &client, &view).await;
         let _ = server.join();
 
         assert_eq!(outcome.files_replayed, 2);
         assert_eq!(outcome.files_failed, 0);
         assert_eq!(outcome.bytes_replayed, (payload.len() as u64) * 2);
+        // Audit DA-13b: the closed file is kept until the acks are confirmed.
+        assert_eq!(outcome.files_awaiting_confirm, 1);
+        assert_eq!(
+            std::fs::metadata(&closed).expect("meta").len(),
+            payload.len() as u64,
+            "a closed file is emptied only after its acks are confirmed"
+        );
+        // A later round, two clean probes and the durability lag on: emptied,
+        // with nothing POSTed (the server above served its two requests).
+        let later = replay_spill_dir(&dir, &url, &client, &confirmed_spill_view(&view)).await;
+        assert_eq!(later.files_failed, 0);
+        assert_eq!(later.bytes_replayed, 0, "nothing is re-sent");
 
         assert_eq!(
             std::fs::metadata(&closed).expect("meta").len(),
@@ -2659,7 +3138,7 @@ mod tests {
             1,
         );
         let client = crate::http_client::build_probe_client(5).expect("client");
-        let outcome = replay_spill_dir(&dir, &url, &client).await;
+        let outcome = replay_spill_dir(&dir, &url, &client, &test_spill_view()).await;
         let _ = server.join();
 
         assert_eq!(outcome.files_quarantined, 1);
@@ -2696,7 +3175,7 @@ mod tests {
             1,
         );
         let client = crate::http_client::build_probe_client(5).expect("client");
-        let outcome = replay_spill_dir(&dir, &url, &client).await;
+        let outcome = replay_spill_dir(&dir, &url, &client, &test_spill_view()).await;
         let served = server.join().expect("server thread");
 
         // The response must have been DELIVERED, not merely absent.
@@ -2730,7 +3209,7 @@ mod tests {
             3,
         );
         let client = crate::http_client::build_probe_client(5).expect("client");
-        let outcome = replay_spill_dir(&dir, &url, &client).await;
+        let outcome = replay_spill_dir(&dir, &url, &client, &test_spill_view()).await;
         let _ = server.join();
 
         assert_eq!(outcome.files_replayed, 3);
@@ -2966,7 +3445,7 @@ mod tests {
 
         let (url, server) = spawn_selective_server().await;
         let client = crate::http_client::build_probe_client(5).expect("client"); // APPROVED: test
-        let out = replay_spill_dir(&dir, &url, &client).await;
+        let out = replay_spill_dir(&dir, &url, &client, &test_spill_view()).await;
         server.abort();
 
         assert_eq!(
@@ -3021,7 +3500,7 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
 
         let (url, server) = spawn_selective_server().await;
         let client = crate::http_client::build_probe_client(5).expect("client"); // APPROVED: test
-        let out = replay_spill_dir(&dir, &url, &client).await;
+        let out = replay_spill_dir(&dir, &url, &client, &test_spill_view()).await;
         server.abort();
 
         assert_eq!(
@@ -3059,10 +3538,18 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
             b"ticks,segment=NSE_EQ,feed=dhan security_id=1i 1\nticks,poison-torn",
         )
         .expect("write"); // APPROVED: test
+        // A later hour's file, so `-1` is closed: only a CLOSED file's last
+        // line without a newline is a crash-torn tail (audit DA-13b). On the
+        // live file it is a line still being written and is left alone.
+        std::fs::write(
+            dir.join("ticks-dhan-2.ilp"),
+            b"ticks,segment=NSE_EQ,feed=dhan security_id=2i 2\n",
+        )
+        .expect("write"); // APPROVED: test
 
         let (url, server) = spawn_selective_server().await;
         let client = crate::http_client::build_probe_client(5).expect("client"); // APPROVED: test
-        let out = replay_spill_dir(&dir, &url, &client).await;
+        let out = replay_spill_dir(&dir, &url, &client, &test_spill_view()).await;
         server.abort();
 
         assert_eq!(out.files_quarantined, 0);
@@ -3167,7 +3654,7 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
         let client = crate::http_client::build_probe_client(30).expect("client"); // APPROVED: test
 
         let (url, server) = spawn_full_body_server(true).await;
-        let first = replay_spill_dir(&dir, &url, &client).await;
+        let first = replay_spill_dir(&dir, &url, &client, &test_spill_view()).await;
         server.abort();
         assert_eq!(first.lines_set_aside, 1, "round 1 sets the torn line aside");
         assert_eq!(first.files_failed, 1, "and stops at the 503");
@@ -3177,7 +3664,7 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
         );
 
         let (url, server) = spawn_full_body_server(false).await;
-        let second = replay_spill_dir(&dir, &url, &client).await;
+        let second = replay_spill_dir(&dir, &url, &client, &test_spill_view()).await;
         server.abort();
         assert_eq!(second.files_failed, 0);
         assert_eq!(
@@ -3227,7 +3714,7 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
 
         let (url, server) = spawn_selective_server().await;
         let client = crate::http_client::build_probe_client(5).expect("client"); // APPROVED: test
-        let out = replay_spill_dir(&dir, &url, &client).await;
+        let out = replay_spill_dir(&dir, &url, &client, &test_spill_view()).await;
         server.abort();
 
         assert_eq!(out.files_quarantined, 1);
@@ -3299,4 +3786,423 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
             "the replay call site compares against this label"
         );
     }
+
+    // --- Audit DA-13b (2026-10-13): when a drained spill file may be emptied ---
+
+    const GOOD_LINE: &[u8] = b"ticks,segment=NSE_EQ,feed=dhan security_id=1i 1\n";
+
+    /// C4 / C15 / split 0: a 2xx is not proof of durable application. A
+    /// drained closed file is emptied only once two clean probes ran after
+    /// its last ack, the durability lag passed, and the sink is not suspect.
+    ///
+    /// Bite: make `drained_file_empty_verdict` return `Ok(())` and the file
+    /// is emptied in the first round.
+    #[tokio::test]
+    async fn test_regression_da13b_a_drained_closed_file_waits_for_confirmed_acks() {
+        let dir = temp_dir("da13b-confirm");
+        let closed = dir.join("ticks-dhan-1.ilp");
+        let live = dir.join("ticks-dhan-2.ilp");
+        std::fs::write(&closed, GOOD_LINE).expect("write"); // APPROVED: test
+        std::fs::write(&live, GOOD_LINE).expect("write"); // APPROVED: test
+        let (url, server) = spawn_selective_server().await;
+        let client = crate::http_client::build_probe_client(5).expect("client"); // APPROVED: test
+        let len = GOOD_LINE.len() as u64;
+        let size = |p: &Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+
+        let view = test_spill_view();
+        let first = replay_spill_dir(&dir, &url, &client, &view).await;
+        assert_eq!(first.bytes_replayed, 2 * len);
+        assert_eq!(first.files_awaiting_confirm, 1);
+        assert_eq!(
+            size(&closed),
+            len,
+            "not emptied on the round that POSTed it"
+        );
+
+        // One clean probe only.
+        let mut one_probe = confirmed_spill_view(&view);
+        one_probe.clean_probes = view.clean_probes + 1;
+        let _ = replay_spill_dir(&dir, &url, &client, &one_probe).await;
+        assert_eq!(size(&closed), len, "one clean probe can race the ack");
+
+        // Two probes, inside the durability lag.
+        let mut early = confirmed_spill_view(&view);
+        early.now_unix_secs = view.now_unix_secs + 1;
+        let _ = replay_spill_dir(&dir, &url, &client, &early).await;
+        assert_eq!(size(&closed), len, "inside the durability lag");
+
+        // Everything else confirmed, but the sink is suspect now.
+        let mut suspect = confirmed_spill_view(&view);
+        suspect.suspect = true;
+        let _ = replay_spill_dir(&dir, &url, &client, &suspect).await;
+        assert_eq!(size(&closed), len, "a suspect sink empties nothing");
+
+        let done = replay_spill_dir(&dir, &url, &client, &confirmed_spill_view(&view)).await;
+        server.abort();
+        assert_eq!(done.bytes_replayed, 0, "nothing re-sent");
+        assert_eq!(size(&closed), 0, "emptied once the acks are confirmed");
+        assert_eq!(size(&live), len, "the live file is never emptied");
+        forget_resume_offset(&live);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// C4 / split 0: a suspicion episode that began after the ack (even one
+    /// that ended between two rounds) means the ack may have been a lie, so
+    /// the file is POSTed again rather than emptied.
+    ///
+    /// Bite: make `rewind_after_suspicion` never rewind and round 2 empties
+    /// the file with nothing re-sent.
+    #[tokio::test]
+    async fn test_regression_da13b_a_suspicion_episode_after_the_ack_rewinds_the_file() {
+        let dir = temp_dir("da13b-rewind");
+        let closed = dir.join("ticks-dhan-1.ilp");
+        std::fs::write(&closed, GOOD_LINE).expect("write"); // APPROVED: test
+        std::fs::write(dir.join("ticks-dhan-2.ilp"), b"").expect("write"); // APPROVED: test
+        let (url, server) = spawn_selective_server().await;
+        let client = crate::http_client::build_probe_client(5).expect("client"); // APPROVED: test
+        let len = GOOD_LINE.len() as u64;
+
+        let view = test_spill_view();
+        let first = replay_spill_dir(&dir, &url, &client, &view).await;
+        assert_eq!(first.bytes_replayed, len);
+
+        // Probes and lag satisfied, but an episode began (and ended) since.
+        let mut after_episode = confirmed_spill_view(&view);
+        after_episode.suspect_episodes = view.suspect_episodes + 1;
+        let second = replay_spill_dir(&dir, &url, &client, &after_episode).await;
+        assert_eq!(second.bytes_replayed, len, "the file is POSTed again");
+        assert_eq!(
+            std::fs::metadata(&closed).expect("m").len(),
+            len,
+            "and kept until the new acks are confirmed"
+        );
+
+        let third =
+            replay_spill_dir(&dir, &url, &client, &confirmed_spill_view(&after_episode)).await;
+        server.abort();
+        assert_eq!(third.bytes_replayed, 0);
+        assert_eq!(std::fs::metadata(&closed).expect("m").len(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A confirmed ack settles: the episode baseline restarts at the next
+    /// ack, so an episode BEFORE it does not rewind bytes acked after it.
+    #[test]
+    fn test_regression_da13b_a_confirmed_ack_resets_the_episode_baseline() {
+        let path = temp_dir("da13b-baseline").join("ticks-dhan-1.ilp");
+        let view = test_spill_view();
+        note_spill_ack(&path, &view);
+        let mut later = confirmed_spill_view(&view);
+        later.suspect_episodes += 1;
+        // Unconfirmed at `later` (an episode began): the first ack's episode
+        // is kept, so the file rewinds.
+        note_spill_ack(&path, &later);
+        assert!(rewind_after_suspicion(&path, &later, "ticks"));
+        // Re-acked at `later` from scratch, then confirmed: a further ack
+        // starts a new baseline and nothing rewinds.
+        note_spill_ack(&path, &later);
+        let settled = confirmed_spill_view(&later);
+        note_spill_ack(&path, &settled);
+        assert!(!rewind_after_suspicion(&path, &settled, "ticks"));
+        forget_resume_offset(&path);
+    }
+
+    /// C4: the replay loop holds the whole round while the sink is suspect.
+    /// Source scan, because the loop's sleep makes a live run impractical.
+    #[test]
+    fn test_regression_da13b_the_replay_loop_holds_while_the_sink_is_suspect() {
+        let src = include_str!("tick_spill_replay.rs");
+        let body = src
+            .split("async fn run_replay_loop")
+            .nth(1)
+            .expect("run_replay_loop must exist");
+        let view_at = body
+            .find("SpillSinkView::current()")
+            .expect("the loop takes a view each round");
+        let hold_at = body
+            .find("if held || held_suspect")
+            .expect("the round is held while the sink is suspect");
+        let call_at = body
+            .find("replay_spill_dir(")
+            .expect("the loop still replays");
+        assert!(view_at < hold_at && hold_at < call_at);
+        let mut suspect = test_spill_view();
+        suspect.suspect = true;
+        assert_eq!(
+            drained_file_empty_verdict(Path::new("no-such-spill-file"), &suspect),
+            Err("sink_suspect")
+        );
+    }
+
+    /// C2 / C16 / split 1: a file that is not last is still live when the hour
+    /// in its name has not passed, when it was written recently, when its
+    /// name does not parse, or when its hour is in the future.
+    ///
+    /// Bite: make `spill_file_may_still_be_appended` return `is_last` and
+    /// every non-last "live" assertion below fails.
+    #[test]
+    fn test_regression_da13b_a_non_last_file_of_the_current_hour_or_recently_written_is_live() {
+        let dir = temp_dir("da13b-live");
+        let now = test_spill_view();
+        let real_now = SpillSinkView::current();
+        let hour_now = now.now_unix_secs / SPILL_FILE_HOUR_SECS;
+        let check = |name: String, view: &SpillSinkView| {
+            let p = dir.join(name);
+            std::fs::write(&p, GOOD_LINE).expect("write"); // APPROVED: test
+            let meta = std::fs::metadata(&p).expect("meta"); // APPROVED: test
+            spill_file_may_still_be_appended(&p, &meta, false, view, "ticks")
+        };
+        assert!(
+            !check("ticks-dhan-1.ilp".into(), &now),
+            "an old hour, quiet for two hours: closed"
+        );
+        assert!(
+            check("ticks-dhan-2.ilp".into(), &real_now),
+            "written just now: live, whatever its name says"
+        );
+        assert!(
+            check(format!("ticks-dhan-{hour_now}.ilp"), &now),
+            "the current hour (a clock stepped back across the hour): live"
+        );
+        assert!(
+            check(format!("ticks-dhan-{}.ilp", hour_now + 5), &now),
+            "a future hour (a clock that stepped forward): live"
+        );
+        assert!(
+            check("ticks-dhan-x.ilp".into(), &now),
+            "a name that does not parse: live"
+        );
+        let last = dir.join("ticks-dhan-3.ilp");
+        std::fs::write(&last, GOOD_LINE).expect("write"); // APPROVED: test
+        let meta = std::fs::metadata(&last).expect("meta"); // APPROVED: test
+        assert!(spill_file_may_still_be_appended(
+            &last, &meta, true, &now, "ticks"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// C2 / C16, end to end: the writer still appends to the current hour's
+    /// file while a future-named file sorts last. It is never emptied.
+    #[tokio::test]
+    async fn test_regression_da13b_the_current_hour_file_is_never_emptied_when_not_last() {
+        let dir = temp_dir("da13b-step");
+        let view = test_spill_view();
+        let hour_now = view.now_unix_secs / SPILL_FILE_HOUR_SECS;
+        let current = dir.join(format!("ticks-dhan-{hour_now}.ilp"));
+        let future = dir.join(format!("ticks-dhan-{}.ilp", hour_now + 3));
+        std::fs::write(&current, GOOD_LINE).expect("write"); // APPROVED: test
+        std::fs::write(&future, GOOD_LINE).expect("write"); // APPROVED: test
+        let (url, server) = spawn_selective_server().await;
+        let client = crate::http_client::build_probe_client(5).expect("client"); // APPROVED: test
+        let _ = replay_spill_dir(&dir, &url, &client, &view).await;
+        let _ = replay_spill_dir(&dir, &url, &client, &confirmed_spill_view(&view)).await;
+        server.abort();
+        assert_eq!(
+            std::fs::metadata(&current).expect("m").len(),
+            GOOD_LINE.len() as u64,
+            "a file the writer may still append to is never emptied"
+        );
+        forget_resume_offset(&current);
+        forget_resume_offset(&future);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// C3 / C12: the last line of the live file without a newline is a line
+    /// still being written. It is not POSTed, and the resume offset stays on
+    /// the last newline, so the next round sends the whole line once.
+    ///
+    /// Bite: drop the live-file arm of the `None if eof` match and round 1
+    /// POSTs the half line and resumes at the snapshot length.
+    #[tokio::test]
+    async fn test_regression_da13b_a_half_written_last_line_of_the_live_file_is_not_posted() {
+        let dir = temp_dir("da13b-half");
+        let live = dir.join("ticks-dhan-1.ilp");
+        let half: &[u8] = b"ticks,segment=NSE_EQ,feed=dhan secu";
+        let rest: &[u8] = b"rity_id=3i 3\n";
+        let mut body = GOOD_LINE.to_vec();
+        body.extend_from_slice(GOOD_LINE);
+        body.extend_from_slice(half);
+        std::fs::write(&live, &body).expect("write"); // APPROVED: test
+        let (url, server) = spawn_selective_server().await;
+        let client = crate::http_client::build_probe_client(5).expect("client"); // APPROVED: test
+        let view = test_spill_view();
+        let whole = 2 * GOOD_LINE.len() as u64;
+
+        let first = replay_spill_dir(&dir, &url, &client, &view).await;
+        assert_eq!(first.bytes_replayed, whole, "only whole lines are sent");
+        assert_eq!(first.lines_set_aside, 0);
+        assert_eq!(
+            resume_offset_for(&live),
+            whole,
+            "resume on the last newline"
+        );
+
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&live)
+            .expect("open"); // APPROVED: test
+        std::io::Write::write_all(&mut f, rest).expect("append"); // APPROVED: test
+        drop(f);
+        let second = replay_spill_dir(&dir, &url, &client, &view).await;
+        server.abort();
+        assert_eq!(
+            second.bytes_replayed,
+            (half.len() + rest.len()) as u64,
+            "the completed line is sent whole, once"
+        );
+        assert_eq!(second.lines_set_aside, 0);
+        forget_resume_offset(&live);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// C6: a file drained while it was the live one is emptied once its hour
+    /// has closed. Before, the fully-drained skip ran first and it never was.
+    ///
+    /// Bite: move the `resume_from == file_len` skip back above the empty-out.
+    #[tokio::test]
+    async fn test_regression_da13b_a_file_drained_while_live_is_emptied_after_its_hour_closes() {
+        let dir = temp_dir("da13b-c6");
+        let first_file = dir.join("ticks-dhan-1.ilp");
+        std::fs::write(&first_file, GOOD_LINE).expect("write"); // APPROVED: test
+        let (url, server) = spawn_selective_server().await;
+        let client = crate::http_client::build_probe_client(5).expect("client"); // APPROVED: test
+        let view = test_spill_view();
+        let _ = replay_spill_dir(&dir, &url, &client, &view).await;
+        assert_eq!(resume_offset_for(&first_file), GOOD_LINE.len() as u64);
+        // The hour rolls over: a new file is now the last.
+        let next = dir.join("ticks-dhan-2.ilp");
+        std::fs::write(&next, GOOD_LINE).expect("write"); // APPROVED: test
+        let _ = replay_spill_dir(&dir, &url, &client, &confirmed_spill_view(&view)).await;
+        server.abort();
+        assert_eq!(
+            std::fs::metadata(&first_file).expect("m").len(),
+            0,
+            "a fully drained closed file must be emptied, not held for the life of the process"
+        );
+        forget_resume_offset(&next);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// C10: a spill file the replay cannot stat, open, seek or re-check is
+    /// counted on the replay-failed counter with a coded error. Source scan:
+    /// running as root, a test cannot make an existing file unreadable.
+    ///
+    /// Bite: remove any one `note_spill_file_unreadable` call.
+    #[test]
+    fn test_regression_da13b_every_unreadable_branch_is_counted() {
+        let tick = include_str!("tick_spill_replay.rs");
+        let tick_fn = tick
+            .split("pub async fn replay_spill_dir(")
+            .nth(1)
+            .expect("replay_spill_dir");
+        let tick_fn = &tick_fn[..tick_fn.find("\n\u{7d}\n").unwrap_or(tick_fn.len())];
+        for source in [
+            "spill_stat_failed",
+            "spill_open_failed",
+            "spill_seek_failed",
+            "spill_recheck_failed",
+        ] {
+            assert!(
+                tick_fn.contains(&format!("note_spill_file_unreadable(&path, \"{source}\"")),
+                "replay_spill_dir must count and log `{source}`"
+            );
+        }
+        let depth = include_str!("depth_spill_frame.rs");
+        let depth_fn = depth
+            .split("pub async fn replay_framed_spill_dir(")
+            .nth(1)
+            .expect("replay_framed_spill_dir");
+        let depth_fn = &depth_fn[..depth_fn.find("\n\u{7d}\n").unwrap_or(depth_fn.len())];
+        for source in [
+            "spill_stat_failed",
+            "spill_open_failed",
+            "spill_recheck_failed",
+        ] {
+            assert!(
+                depth_fn.contains(&format!("note_spill_file_unreadable(&path, \"{source}\"")),
+                "replay_framed_spill_dir must count and log `{source}`"
+            );
+        }
+        let helper = tick
+            .split("pub(crate) fn note_spill_file_unreadable")
+            .nth(1)
+            .expect("helper");
+        let helper = &helper[..helper.find("\n\u{7d}\n").unwrap_or(helper.len())];
+        assert!(helper.contains("tv_tick_spill_replay_failed_total"));
+        assert!(helper.contains("error!("));
+        assert!(helper.contains("code = ErrorCode::"));
+    }
+
+    /// C11: when a later chunk is refused whole and the file is quarantined,
+    /// the chunks QuestDB already accepted this round are counted as
+    /// replayed, not reported as missing.
+    ///
+    /// Bite: drop the `landed_this_round` increment and `bytes_replayed`
+    /// reads 0.
+    #[tokio::test]
+    async fn test_regression_da13b_a_whole_file_quarantine_counts_the_chunks_already_accepted() {
+        let dir = temp_dir("da13b-c11");
+        let path = dir.join("ticks-dhan-1.ilp");
+        // Whole good lines up to just under one chunk, then a poison line long
+        // enough to cross the chunk edge, so the first chunk is all good and
+        // the second is all poison (refused whole).
+        let mut body: Vec<u8> = Vec::with_capacity(REPLAY_MAX_CHUNK_BYTES + 1024);
+        let mut sid: u64 = 0;
+        loop {
+            sid += 1;
+            let line = format!("ticks,segment=NSE_EQ,feed=dhan security_id={sid}i 1\n");
+            if body.len() + line.len() > REPLAY_MAX_CHUNK_BYTES - 64 {
+                break;
+            }
+            body.extend_from_slice(line.as_bytes());
+        }
+        let good = body.len() as u64;
+        body.extend_from_slice(format!("poison {}\n", "p".repeat(256)).as_bytes());
+        // More refused lines than isolation may set aside, so the chunk is
+        // refused WHOLE although the first chunk was accepted.
+        for n in 0..=REPLAY_MAX_REJECTED_LINES_PER_CHUNK {
+            body.extend_from_slice(format!("poison {n}\n").as_bytes());
+        }
+        std::fs::write(&path, &body).expect("write"); // APPROVED: test
+        let (url, server) = spawn_full_body_server(false).await;
+        let client = crate::http_client::build_probe_client(30).expect("client"); // APPROVED: test
+        let out = replay_spill_dir(&dir, &url, &client, &test_spill_view()).await;
+        server.abort();
+        assert_eq!(out.files_quarantined, 1);
+        assert_eq!(
+            out.bytes_replayed, good,
+            "the accepted first chunk is in the database and is counted"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// Test helpers shared with `depth_spill_frame`'s tests. Kept below the test
+// module so source scans that read the production part (everything above the
+// first `#[cfg(test)]`) still see the whole replay.
+/// Test view: a clean sink with no probes yet and the clock two hours ahead,
+/// so a fixture written just now with a small hour in its name reads as
+/// closed and quiet (unless it is the last file).
+#[cfg(test)]
+pub(crate) fn test_spill_view() -> SpillSinkView {
+    let mut view = SpillSinkView::current();
+    view.suspect = false;
+    view.clean_probes = 0;
+    view.suspect_episodes = 0;
+    view.now_unix_secs = view.now_unix_secs.saturating_add(2 * SPILL_FILE_HOUR_SECS);
+    view
+}
+
+/// Test view: `view` after two clean probes and the durability lag, so the
+/// acks it stamped are confirmed.
+#[cfg(test)]
+pub(crate) fn confirmed_spill_view(view: &SpillSinkView) -> SpillSinkView {
+    let mut later = *view;
+    later.clean_probes = later
+        .clean_probes
+        .saturating_add(SPILL_EMPTY_CONFIRM_PROBES);
+    later.now_unix_secs = later
+        .now_unix_secs
+        .saturating_add(crate::wal_applied_watermark::WATERMARK_DURABILITY_LAG_SECS);
+    later
 }

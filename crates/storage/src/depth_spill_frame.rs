@@ -58,10 +58,12 @@ use tickvault_common::error_code::ErrorCode;
 use tracing::{error, info, warn};
 
 use crate::tick_spill_replay::{
-    LineIsolation, QUARANTINE_DIR, REPLAY_LINES_REJECTED_COUNTER, REPLAY_MAX_CHUNK_BYTES,
-    SpillReplayOutcome, describe_send_error, forget_resume_offset, ilp_chunk_ranges,
-    is_permanent_refusal, isolate_refused_lines, record_resume_offset, resume_offset_for,
-    set_aside_rejected_lines,
+    EmptyOutcome, LineIsolation, QUARANTINE_DIR, REPLAY_LINES_REJECTED_COUNTER,
+    REPLAY_MAX_CHUNK_BYTES, SpillReplayOutcome, SpillSinkView, describe_send_error,
+    empty_drained_closed_file, forget_resume_offset, ilp_chunk_ranges, is_permanent_refusal,
+    isolate_refused_lines, note_spill_ack, note_spill_file_unreadable, record_resume_offset,
+    resume_offset_for, rewind_after_suspicion, set_aside_rejected_lines,
+    spill_file_may_still_be_appended,
 };
 
 /// File extension of the framed depth spill. Deliberately not `ilp`, so the
@@ -357,12 +359,20 @@ enum Walk {
 ///
 /// Same contract as `tick_spill_replay::replay_spill_dir`: oldest file first;
 /// the first transient failure stops the round, keeping the offset of the last
-/// record dealt with; the live (last) file and a file that grew while it was
-/// read are never truncated, their drained offset is remembered instead; a
-/// closed file is truncated (not deleted) once every record is dealt with.
-/// Replaying a record twice is harmless: the `market_depth` dedup key carries
-/// `depth_kind` and `capture_seq`, so a row upserts onto itself.
-pub async fn replay_framed_spill_dir(dir: &Path, url: &str, client: &Client) -> SpillReplayOutcome {
+/// record dealt with; a file the writer may still append to (the last one, or
+/// any whose hour has not passed or that was written in the last
+/// `SPILL_LIVE_FILE_QUIET_SECS`) and a file that grew while it was read are
+/// never truncated, their drained offset is remembered instead; a closed file
+/// is truncated (not deleted) once every record is dealt with AND QuestDB's
+/// acknowledgements are confirmed (audit DA-13b). Replaying a record twice is
+/// harmless: the `market_depth` dedup key carries `depth_kind` and
+/// `capture_seq`, so a row upserts onto itself.
+pub async fn replay_framed_spill_dir(
+    dir: &Path,
+    url: &str,
+    client: &Client,
+    view: &SpillSinkView,
+) -> SpillReplayOutcome {
     let mut outcome = SpillReplayOutcome::default();
     for reason in ["refused", "corrupt", "torn_tail"] {
         metrics::counter!(FRAMED_SET_ASIDE_COUNTER, "reason" => reason).increment(0);
@@ -371,39 +381,54 @@ pub async fn replay_framed_spill_dir(dir: &Path, url: &str, client: &Client) -> 
     let last_index = files.len().saturating_sub(1);
     let mut scratch: Vec<u8> = Vec::new();
     for (file_index, path) in files.into_iter().enumerate() {
-        let writer_may_still_append = file_index == last_index;
-        let file_len = match std::fs::metadata(&path) {
-            Ok(meta) => meta.len(),
+        let meta = match std::fs::metadata(&path) {
+            Ok(meta) => meta,
             Err(err) => {
-                warn!(
-                    path = %path.display(),
-                    %err,
-                    "framed depth spill replay could not read a spill file — leaving it for \
-                     the next round"
-                );
+                note_spill_file_unreadable(&path, "spill_stat_failed", &err);
                 outcome.files_failed = outcome.files_failed.saturating_add(1);
                 return outcome;
             }
         };
+        let file_len = meta.len();
+        let writer_may_still_append =
+            spill_file_may_still_be_appended(&path, &meta, file_index == last_index, view, "depth");
         if file_len == 0 {
             forget_resume_offset(&path);
             outcome.files_skipped_empty = outcome.files_skipped_empty.saturating_add(1);
             continue;
         }
+        rewind_after_suspicion(&path, view, "depth");
         let resume_from = resume_offset_for(&path).min(file_len);
         if resume_from == file_len {
+            // Fully drained: empty it once its hour has closed and its acks
+            // are confirmed (audit DA-13b; before, a file drained while live
+            // was never emptied).
+            if !writer_may_still_append {
+                match empty_drained_closed_file(&path, view, "depth") {
+                    EmptyOutcome::Emptied => {
+                        info!(
+                            path = %path.display(),
+                            "emptied a drained framed depth spill file whose acknowledgements \
+                             are confirmed"
+                        );
+                    }
+                    EmptyOutcome::Deferred => {
+                        outcome.files_awaiting_confirm =
+                            outcome.files_awaiting_confirm.saturating_add(1);
+                    }
+                    EmptyOutcome::Failed => {
+                        outcome.files_failed = outcome.files_failed.saturating_add(1);
+                        return outcome;
+                    }
+                }
+            }
             outcome.files_skipped_empty = outcome.files_skipped_empty.saturating_add(1);
             continue;
         }
         let file = match File::open(&path) {
             Ok(f) => f,
             Err(err) => {
-                warn!(
-                    path = %path.display(),
-                    %err,
-                    "framed depth spill replay could not open a spill file — leaving it for \
-                     the next round"
-                );
+                note_spill_file_unreadable(&path, "spill_open_failed", &err);
                 outcome.files_failed = outcome.files_failed.saturating_add(1);
                 return outcome;
             }
@@ -424,6 +449,9 @@ pub async fn replay_framed_spill_dir(dir: &Path, url: &str, client: &Client) -> 
             &mut scratch,
         )
         .await;
+        if sent_bytes > 0 {
+            note_spill_ack(&path, view);
+        }
         if offset > resume_from {
             record_resume_offset(&path, offset);
         }
@@ -449,32 +477,27 @@ pub async fn replay_framed_spill_dir(dir: &Path, url: &str, client: &Client) -> 
             }
             Ok(_) => {}
             Err(err) => {
-                warn!(
-                    path = %path.display(),
-                    %err,
-                    "could not re-check a drained framed depth spill file's size — NOT \
-                     truncating it; the next round resumes at the drained offset"
-                );
+                // NOT truncating it; the next round resumes at the drained
+                // offset.
+                note_spill_file_unreadable(&path, "spill_recheck_failed", &err);
                 outcome.files_failed = outcome.files_failed.saturating_add(1);
                 return outcome;
             }
         }
+        outcome.files_replayed = outcome.files_replayed.saturating_add(1);
         if writer_may_still_append {
-            outcome.files_replayed = outcome.files_replayed.saturating_add(1);
             info!(
                 path = %path.display(),
                 bytes = sent_bytes,
                 resume_from = offset,
-                "recovered spilled depth rows into the database. This is the hour the writer \
-                 may still append to, so the file is left intact and the next round resumes \
-                 at the drained offset"
+                "recovered spilled depth rows into the database. The writer may still append \
+                 to this file, so it is left intact and the next round resumes at the drained \
+                 offset"
             );
             continue;
         }
-        forget_resume_offset(&path);
-        match File::create(&path) {
-            Ok(_) => {
-                outcome.files_replayed = outcome.files_replayed.saturating_add(1);
+        match empty_drained_closed_file(&path, view, "depth") {
+            EmptyOutcome::Emptied => {
                 info!(
                     path = %path.display(),
                     bytes = sent_bytes,
@@ -482,25 +505,23 @@ pub async fn replay_framed_spill_dir(dir: &Path, url: &str, client: &Client) -> 
                      spill file"
                 );
             }
-            Err(err) => {
-                error!(
-                    code = ErrorCode::TickSpill01FileQuarantined.code_str(),
-                    source = "accepted_not_emptied",
+            EmptyOutcome::Deferred => {
+                outcome.files_awaiting_confirm = outcome.files_awaiting_confirm.saturating_add(1);
+                info!(
                     path = %path.display(),
-                    %err,
-                    "spilled depth rows were accepted by the database but the spill file \
-                     could not be emptied — the rows are saved; the file will be sent again \
-                     next round and the duplicate rows collapse onto themselves"
+                    bytes = sent_bytes,
+                    "recovered spilled depth rows into the database; the drained file is kept \
+                     until QuestDB's acknowledgement is confirmed, then emptied"
                 );
+            }
+            EmptyOutcome::Failed => {
                 outcome.files_failed = outcome.files_failed.saturating_add(1);
-                metrics::counter!("tv_tick_spill_replay_failed_total").increment(1);
                 return outcome;
             }
         }
     }
     outcome
 }
-
 /// Walks one file from `*offset`, POSTing each whole record.
 #[allow(clippy::too_many_arguments)] // APPROVED: private helper of one caller; the state is the caller's
 async fn walk_file(
@@ -932,7 +953,8 @@ mod tests {
         write_records(&closed, &[(b"market_depth,a=1 b=1i 1\n", 1), (v2, 2)]);
         write_records(&live, &[(b"market_depth,a=2 b=2i 2\n", 1)]);
         let (url, bodies, server) = spawn_recording_server().await;
-        let out = replay_framed_spill_dir(&dir, &url, &client()).await;
+        let view = crate::tick_spill_replay::test_spill_view();
+        let out = replay_framed_spill_dir(&dir, &url, &client(), &view).await;
         server.abort();
         let bodies = bodies.lock().expect("lock").clone();
         assert_eq!(
@@ -947,21 +969,33 @@ mod tests {
         assert_eq!(out.files_replayed, 2);
         assert_eq!(out.files_failed, 0);
         assert_eq!(
-            std::fs::metadata(&closed).expect("m").len(),
-            0,
-            "closed file emptied"
+            out.files_awaiting_confirm, 1,
+            "audit DA-13b: the closed file waits for its acks to be confirmed"
         );
+        assert!(std::fs::metadata(&closed).expect("m").len() > 0);
         assert!(
             std::fs::metadata(&live).expect("m").len() > 0,
             "the live file is never truncated"
         );
-        // A second round re-sends nothing from the live file.
+        // A second round, acks confirmed, re-sends nothing and empties the
+        // closed file.
         let (url, bodies, server) = spawn_recording_server().await;
-        let _ = replay_framed_spill_dir(&dir, &url, &client()).await;
+        let _ = replay_framed_spill_dir(
+            &dir,
+            &url,
+            &client(),
+            &crate::tick_spill_replay::confirmed_spill_view(&view),
+        )
+        .await;
         server.abort();
         assert!(
             bodies.lock().expect("lock").is_empty(),
             "the drained offset is remembered"
+        );
+        assert_eq!(
+            std::fs::metadata(&closed).expect("m").len(),
+            0,
+            "closed file emptied"
         );
         forget_resume_offset(&live);
         let _ = std::fs::remove_dir_all(&dir);
@@ -982,7 +1016,13 @@ mod tests {
         f.write_all(b"market_depth,a=2").expect("w");
         drop(f);
         let (url, bodies, server) = spawn_recording_server().await;
-        let out = replay_framed_spill_dir(&dir, &url, &client()).await;
+        let out = replay_framed_spill_dir(
+            &dir,
+            &url,
+            &client(),
+            &crate::tick_spill_replay::test_spill_view(),
+        )
+        .await;
         assert_eq!(
             bodies.lock().expect("lock").len(),
             1,
@@ -1000,7 +1040,13 @@ mod tests {
             .expect("open");
         f.write_all(b" b=2i 2\n").expect("w");
         drop(f);
-        let _ = replay_framed_spill_dir(&dir, &url, &client()).await;
+        let _ = replay_framed_spill_dir(
+            &dir,
+            &url,
+            &client(),
+            &crate::tick_spill_replay::test_spill_view(),
+        )
+        .await;
         server.abort();
         let bodies = bodies.lock().expect("lock").clone();
         assert_eq!(bodies.len(), 2);
@@ -1028,7 +1074,13 @@ mod tests {
             &[(b"market_depth,a=4 b=4i 4\n", 1)],
         );
         let (url, bodies, server) = spawn_recording_server().await;
-        let out = replay_framed_spill_dir(&dir, &url, &client()).await;
+        let out = replay_framed_spill_dir(
+            &dir,
+            &url,
+            &client(),
+            &crate::tick_spill_replay::test_spill_view(),
+        )
+        .await;
         server.abort();
         let bodies = bodies.lock().expect("lock").clone();
         assert_eq!(
@@ -1072,8 +1124,8 @@ mod tests {
             &[(b"market_depth,a=3 b=3i 3\n", 1)],
         );
         let (url, _bodies, server) = spawn_recording_server().await;
-        let out = replay_framed_spill_dir(&dir, &url, &client()).await;
-        server.abort();
+        let view = crate::tick_spill_replay::test_spill_view();
+        let out = replay_framed_spill_dir(&dir, &url, &client(), &view).await;
         assert_eq!(out.files_failed, 0);
         let kept = std::fs::read(
             dir.join(QUARANTINE_DIR)
@@ -1081,6 +1133,14 @@ mod tests {
         )
         .expect("kept");
         assert_eq!(kept.len(), FRAME_HEADER_BYTES + b"market_depth".len());
+        let _ = replay_framed_spill_dir(
+            &dir,
+            &url,
+            &client(),
+            &crate::tick_spill_replay::confirmed_spill_view(&view),
+        )
+        .await;
+        server.abort();
         assert_eq!(std::fs::metadata(&closed).expect("m").len(), 0);
         forget_resume_offset(&dir.join("depth-dhan-2.dspl"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1105,7 +1165,13 @@ mod tests {
             &[(b"market_depth,a=3 b=3i 3\n", 1)],
         );
         let (url, bodies, server) = spawn_recording_server().await;
-        let out = replay_framed_spill_dir(&dir, &url, &client()).await;
+        let out = replay_framed_spill_dir(
+            &dir,
+            &url,
+            &client(),
+            &crate::tick_spill_replay::test_spill_view(),
+        )
+        .await;
         server.abort();
         assert_eq!(out.files_failed, 1, "the 503 stops the round");
         let bodies = bodies.lock().expect("lock").clone();
@@ -1146,7 +1212,13 @@ mod tests {
             &[(b"market_depth,a=3 b=3i 3\n", 1)],
         );
         let (url, _bodies, server) = spawn_recording_server().await;
-        let out = replay_framed_spill_dir(&dir, &url, &client()).await;
+        let out = replay_framed_spill_dir(
+            &dir,
+            &url,
+            &client(),
+            &crate::tick_spill_replay::test_spill_view(),
+        )
+        .await;
         server.abort();
         assert_eq!(out.files_failed, 0);
         assert_eq!(out.lines_set_aside, 1);

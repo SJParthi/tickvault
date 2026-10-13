@@ -1615,6 +1615,10 @@ async fn async_main() -> Result<()> {
     metrics::counter!("tv_dhan_feed_seals_rescued_total").increment(0);
     metrics::counter!("tv_aggregator_slot_exhausted_total").increment(0);
     metrics::counter!("tv_tick_spill_replay_quarantined_total").increment(0);
+    // Audit DA-13b: the spill replay's empty-out gate counters (held while
+    // QuestDB is suspect, empty-out deferred, rewound, non-last file kept
+    // live), every label pair, dense from boot like their siblings above.
+    tickvault_storage::tick_spill_replay::register_replay_baseline();
     metrics::counter!("tv_wal_catchup_budget_exhausted_total").increment(0);
 
     // The two inputs to `aggregator-refusal-rate-high` (2026-09-03).
