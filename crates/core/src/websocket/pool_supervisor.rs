@@ -10428,6 +10428,64 @@ where
     (outcome, wait.socket_decision)
 }
 
+/// Re-sends code 25 then 23 for ONE depth-200 contract silent since its swap
+/// (scope lock 2026-10-13), on the live socket, never a redial (25 first: a bare
+/// repeated 23 is a duplicate, answered with 804). Refused after an 805 or when
+/// the guard no longer holds it; a landed 25 with a failed 23 takes the swap's
+/// `SubscribeFailed` redial. Once per swap; each write bounded by
+/// [`SWAP_WIRE_BUDGET`]; `guard.holds` scans one instrument.
+async fn resubscribe_silent_swap<S, K>(
+    socket: &mut S,
+    supervisor: &mut ConnectionSupervisor,
+    sink: &K,
+    throttle: &mut DrainThrottle,
+    guard: &SubscribeGuard,
+    silent: SubscribeInstrument,
+) -> SupervisorAction
+where
+    S: DhanFeedSocket,
+    K: FrameSink + ?Sized,
+{
+    use super::silent_swap::{count_outcome, resend_gate, warn_resend};
+    let (index, pool) = (supervisor.slot().global_index, supervisor.slot().pool_index);
+    let gate = resend_gate(rotation_halted(), guard.holds(silent));
+    if let Some(refused) = gate.refusal_label() {
+        count_outcome(refused);
+        warn_resend(index, pool, silent, refused);
+        return SupervisorAction::Continue;
+    }
+    let deadline = || Some(tokio::time::Instant::now() + SWAP_WIRE_BUDGET);
+    let ticket = socket.send_unsubscribe(&[silent]);
+    let unsub = await_write(socket, supervisor, sink, throttle, ticket, deadline()).await;
+    let mut outcome = "wire_failed";
+    let mut may_be_empty = unsub.outcome.is_err();
+    if let Some(decided) = unsub.socket_decision {
+        count_outcome(outcome);
+        warn_resend(index, pool, silent, outcome);
+        return decided;
+    }
+    if matches!(unsub.outcome, Ok(Ok(()))) {
+        let ticket = socket.send_subscribe(&[silent]);
+        let sub = await_write(socket, supervisor, sink, throttle, ticket, deadline()).await;
+        if let Some(decided) = sub.socket_decision {
+            count_outcome(outcome);
+            warn_resend(index, pool, silent, outcome);
+            return decided;
+        }
+        may_be_empty = !matches!(sub.outcome, Ok(Ok(())));
+        if !may_be_empty {
+            outcome = "sent";
+        }
+    }
+    count_outcome(outcome);
+    warn_resend(index, pool, silent, outcome);
+    if may_be_empty {
+        note_held_cleared(supervisor);
+        return supervisor.on_event(ConnEvent::SubscribeFailed, Instant::now());
+    }
+    SupervisorAction::Continue
+}
+
 /// The drain loop. Returns as soon as the supervisor asks for anything other
 /// than [`SupervisorAction::Continue`].
 ///
@@ -10503,6 +10561,11 @@ where
     // the top of the loop. Steady state is `None`, so the per-frame cost is
     // one discriminant check.
     let mut pending_ghost_unsubscribe: Option<SubscribeInstrument> = None;
+
+    // Silent depth-200 swap watch (scope lock 2026-10-13); depth-200 only.
+    let watch_silent_swaps = supervisor.slot().endpoint == DhanEndpointType::Depth200;
+    let mut silent_watch = super::silent_swap::SilentSwapWatch::new(supervisor.slot().global_index);
+    let mut pending_silent_resubscribe: Option<SubscribeInstrument> = None;
 
     // When we last sent a client keepalive ping on this socket.
     //
@@ -10803,6 +10866,7 @@ where
                             // item 44f: the reader keeps polling while the write
                             // is in flight, so the socket can close under it.
                             let mut socket_decision: Option<SupervisorAction> = None;
+                            let mut silent_armed = false;
                             if let Some(drop_this) = swap.unsubscribe {
                                 let ticket = socket.send_unsubscribe(&[drop_this]);
                                 let wait = await_write(
@@ -10944,6 +11008,11 @@ where
                                 .record(unsub_started.elapsed().as_secs_f64() * 1000.0);
                             }
                             if !wire_failed && let Some(add_this) = swap.subscribe {
+                                // Armed before the write (2026-10-13).
+                                silent_armed = watch_silent_swaps;
+                                if silent_armed {
+                                    silent_watch.arm(add_this, Instant::now());
+                                }
                                 let sub_started = tokio::time::Instant::now();
                                 let ticket = socket.send_subscribe(&[add_this]);
                                 let wait = await_write(
@@ -10973,6 +11042,9 @@ where
                                         wire_timed_out = true;
                                     }
                                 }
+                            }
+                            if wire_failed && silent_armed {
+                                silent_watch.cancel();
                             }
                             if wire_failed {
                                 // FORCE A REDIAL when the swap left the socket
@@ -11499,6 +11571,16 @@ where
             }
         }
 
+        // SILENT DEPTH-200 SWAP (scope lock 2026-10-13): once per swap, in
+        // place, never while a ping is on the wire.
+        if action == SupervisorAction::Continue
+            && pending_ping.is_none()
+            && let Some(silent) = pending_silent_resubscribe.take()
+        {
+            action =
+                resubscribe_silent_swap(socket, supervisor, sink, throttle, guard, silent).await;
+        }
+
         // A top-up now READS the socket between its batches, so a `Closed`
         // (or any other decision) can land inside the command block. Leave
         // with it here, before the select: a parked supervisor answers every
@@ -11579,6 +11661,13 @@ where
                 {
                     pending_ghost_unsubscribe =
                         take_ghost_unsubscribe(supervisor.slot().global_index);
+                }
+                // 2026-10-13: O(1); the contract at most once per swap.
+                if watch_silent_swaps
+                    && action == SupervisorAction::Continue
+                    && pending_silent_resubscribe.is_none()
+                {
+                    pending_silent_resubscribe = silent_watch.poll(Instant::now());
                 }
                 // The probe-close register, read on the same tick. A ghost
                 // stashed above is still sent first at the top of the loop if
@@ -20234,6 +20323,111 @@ mod tests {
             st.lock().expect("fake state").wire_calls.is_empty(),
             "a held contract must never be unsubscribed"
         );
+    }
+
+    /// 2026-10-13: resubscribed in place, unsubscribe first, never a redial.
+    #[tokio::test(start_paused = true)]
+    async fn test_regression_silent_swap_resend_writes_25_then_23_and_never_redials() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            idle_when_exhausted: true,
+            ..FakeState::default()
+        }));
+        let (mut sock, sink) = (fake(&st), RecordingSink::default());
+        let mut supervisor = sup(DhanEndpointType::Depth200, 0, t0());
+        let mut throttle = DrainThrottle::default();
+        let guard = SubscribeGuard::try_new(DhanEndpointType::Depth200, vec![si(9)]).expect("one");
+        // ROTATION_HALTED is process-wide and never cleared; another test may
+        // have tripped it, and then the 805 refusal is what must be seen.
+        let halted_before = rotation_halted();
+        let action = resubscribe_silent_swap(
+            &mut sock,
+            &mut supervisor,
+            &sink,
+            &mut throttle,
+            &guard,
+            si(9),
+        )
+        .await;
+        assert_eq!(action, SupervisorAction::Continue);
+        let s = st.lock().expect("fake state");
+        if halted_before {
+            assert!(s.wire_calls.is_empty(), "after an 805 nothing is sent");
+        } else if !rotation_halted() {
+            assert_eq!(s.wire_calls, vec!["unsubscribe", "subscribe"]);
+        }
+        assert_eq!((s.connects, s.closes), (0, 0), "never a redial");
+    }
+
+    /// A contract the guard no longer holds is never resubscribed (2026-10-13).
+    #[tokio::test(start_paused = true)]
+    async fn test_regression_silent_swap_resend_refused_when_the_guard_moved_on() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState::default()));
+        let (mut sock, sink) = (fake(&st), RecordingSink::default());
+        let mut supervisor = sup(DhanEndpointType::Depth200, 0, t0());
+        let mut throttle = DrainThrottle::default();
+        let guard = SubscribeGuard::try_new(DhanEndpointType::Depth200, vec![si(2)]).expect("one");
+        let action = resubscribe_silent_swap(
+            &mut sock,
+            &mut supervisor,
+            &sink,
+            &mut throttle,
+            &guard,
+            si(9),
+        )
+        .await;
+        assert_eq!(action, SupervisorAction::Continue);
+        assert!(st.lock().expect("fake state").wire_calls.is_empty());
+    }
+
+    /// A landed 25 then a failed 23 may leave nothing held: redial like a swap.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_swap_resend_whose_subscribe_fails_redials_like_a_failed_swap() {
+        let st = std::sync::Arc::new(Mutex::new(FakeState {
+            subscribe_results: VecDeque::from([false]),
+            ..FakeState::default()
+        }));
+        let (mut sock, sink) = (fake(&st), RecordingSink::default());
+        let mut supervisor = sup(DhanEndpointType::Depth200, 0, t0());
+        let mut throttle = DrainThrottle::default();
+        let guard = SubscribeGuard::try_new(DhanEndpointType::Depth200, vec![si(9)]).expect("one");
+        let action = resubscribe_silent_swap(
+            &mut sock,
+            &mut supervisor,
+            &sink,
+            &mut throttle,
+            &guard,
+            si(9),
+        )
+        .await;
+        assert_ne!(
+            action,
+            SupervisorAction::Continue,
+            "an emptied socket redials"
+        );
+    }
+
+    /// The wiring: armed on a depth-200 swap before its subscribe, asked on
+    /// the idle tick, sent at the top of the loop, and the 805 gate is read
+    /// before any write.
+    #[test]
+    fn test_regression_silent_swap_is_wired_into_the_drain() {
+        let src = include_str!("pool_supervisor.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or_default();
+        let arm = prod
+            .find("silent_watch.arm(add_this")
+            .expect("armed on the swap");
+        let sub = prod[arm..].find("socket.send_subscribe(&[add_this])");
+        assert!(sub.is_some(), "armed BEFORE the subscribe write");
+        assert!(prod.contains("pending_silent_resubscribe = silent_watch.poll("));
+        assert!(prod.contains("resubscribe_silent_swap(socket, supervisor, sink, throttle, guard"));
+        let body = &prod[prod.find("async fn resubscribe_silent_swap").expect("fn")..];
+        let gate = body.find("resend_gate(rotation_halted(), guard.holds(silent))");
+        let write = body.find("socket.send_unsubscribe(&[silent])");
+        assert!(
+            gate.is_some() && gate < write,
+            "805 + guard gate before any write"
+        );
+        assert!(!body[..body.find("\n}\n").unwrap_or(body.len())].contains(".close("));
     }
 
     /// A burst arriving while the resend is on the wire is read, not left in

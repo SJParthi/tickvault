@@ -3773,6 +3773,15 @@ async fn async_main() -> Result<()> {
         tokio::spawn(tickvault_app::dhan_live_universe::run_degraded_universe_heartbeat(reason));
     }
 
+    // Scope lock 2026-10-13: the silent depth-200 swap wait, validated at boot
+    // (10..=600 s); installed before any depth socket can swap.
+    let silent_swap_secs = tickvault_core::websocket::silent_swap::set_resubscribe_after_secs(
+        config.dhan_universe.depth200_silent_swap_resubscribe_secs,
+    );
+    info!(
+        silent_swap_secs,
+        "depth-200 silent swap resubscribe wait installed"
+    );
     let dhan_feed_stack_monitor = tickvault_app::dhan_feed_stack::spawn_dhan_feed_stack(
         tickvault_app::dhan_feed_stack::DhanFeedStackParams {
             shutdown: std::sync::Arc::clone(&dhan_feed_shutdown),

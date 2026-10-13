@@ -57,6 +57,22 @@
 //! is being ignored — proven live for code 25 on 2026-09-10 and for code 24 on
 //! 2026-09-11 — the arrival half of a swap is the only half left to check.
 //!
+//! # ⚠ It cannot see a silent depth-200 swap (2026-10-13)
+//!
+//! Two depth-200 sockets swapped and then delivered nothing for 900 s on
+//! 2026-10-13 while `silent_window` stayed at 0. Two reasons, both read from
+//! the code below and both deliberate trades for the LATENCY measurement:
+//! `send_swap` refuses the stamp (`unmeasurable`) for any contract a depth
+//! socket held or dropped in the last `DROPPED_RETENTION_SECS` (600 s), which
+//! on a socket rotating among a few near-the-money strikes is most of them;
+//! and the next swap on the same socket `forget`s the previous stamp, so a
+//! socket swapping every minute never keeps one to the 120 s window. Which of
+//! the two applied on that day is not known (these series are local only).
+//! The silence question is answered per SOCKET by
+//! `tickvault_core::websocket::silent_swap`, which resubscribes the contract
+//! in place at 90 s; this tracker is unchanged and still measures latency
+//! only. Do not read a zero `silent_window` as "no depth-200 swap went dark".
+//!
 //! # Complexity
 //!
 //! * [`DepthFirstPacketTracker::observe_at`] — the hot path, once per depth
@@ -906,6 +922,17 @@ mod tests {
             ),
             Some(NANOS_PER_MILLI),
             "its own pool still resolves it"
+        );
+    }
+
+    /// Scope lock 2026-10-13: the per-socket depth-200 first-packet samples
+    /// land on THIS histogram (label `basis = "depth200_socket"`), so the
+    /// two names must never drift apart.
+    #[test]
+    fn the_silent_swap_latency_samples_share_this_histogram_name() {
+        assert_eq!(
+            tickvault_core::websocket::silent_swap::FIRST_PACKET_LATENCY_METRIC,
+            FIRST_PACKET_LATENCY_MS
         );
     }
 

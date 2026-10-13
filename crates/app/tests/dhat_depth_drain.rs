@@ -209,3 +209,52 @@ fn depth200_drain_does_not_allocate_per_packet() {
          is {MAX_BLOCKS} blocks. Find the allocation, do NOT raise the ceiling."
     );
 }
+
+/// Scope lock 2026-10-13: the silent-swap watch's per-packet arm, measured
+/// with a swap AWAITED on the frames' socket (the expensive case: a compare
+/// on every packet), then cleared by the awaited contract's own packet.
+#[test]
+fn depth200_drain_with_an_awaited_silent_swap_does_not_allocate() {
+    use tickvault_core::websocket::pool_supervisor::SubscribeInstrument;
+    use tickvault_core::websocket::silent_swap::SilentSwapWatch;
+    let _serial = DHAT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    const FRAMES: u64 = 1_000;
+    // Awaited: contract 70_002 on the frames' socket (connection_index 5);
+    // the frames carry 70_001, so the watch stays armed for every packet.
+    let mut watch = SilentSwapWatch::new(5);
+    let t0 = std::time::Instant::now();
+    watch.arm(
+        SubscribeInstrument {
+            security_id: 70_002,
+            segment: tickvault_common::types::ExchangeSegment::NseFno,
+        },
+        t0,
+    );
+    let warm: Vec<CapturedFrame> = (0..4).map(|n| depth200_frame(n, n)).collect();
+    let mut frames: Vec<CapturedFrame> =
+        (0..FRAMES).map(|n| depth200_frame(1_000 + n, n)).collect();
+    frames.push(frame(
+        depth_packet(70_002, DEEP_DEPTH_FEED_CODE_BID, 200, true, 0),
+        DhanEndpointType::Depth200,
+        9_999,
+    ));
+    let (blocks, bytes, rows) = measure(&warm, &frames, DepthFeedKind::TwoHundred);
+    assert_eq!(
+        rows,
+        (FRAMES + 1) * 200,
+        "frames were refused; measured nothing"
+    );
+    // Non-vacuity: the awaited contract's packet reached the watch and ended
+    // it, so nothing is due even long after 90 s.
+    assert_eq!(
+        watch.poll(t0 + std::time::Duration::from_secs(10_000)),
+        None,
+        "the drain never told the silent-swap watch the contract arrived"
+    );
+    assert!(!watch.is_armed());
+    assert!(
+        blocks <= MAX_BLOCKS,
+        "PER-PACKET ALLOCATION with a silent swap awaited: {blocks} blocks \
+         ({bytes} bytes) over {FRAMES} packets; budget {MAX_BLOCKS}."
+    );
+}

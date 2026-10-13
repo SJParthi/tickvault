@@ -9317,8 +9317,9 @@ are; the silence question is answered per SOCKET by the new watch below.
   The frame drain clears it on the first depth-200 packet for exactly that
   contract on exactly that socket: one relaxed load per depth-200 packet, no
   allocation.
-- If nothing for that contract arrives within 90 s
-  (`SILENT_SWAP_RESUBSCRIBE_SECS`), the connection task, on its existing
+- If nothing for that contract arrives within the configured wait
+  (`[dhan_universe] depth200_silent_swap_resubscribe_secs`, default 90), the
+  connection task, on its existing
   one-second idle tick, re-sends the subscription for that ONE contract on the
   live socket: code 25 then code 23 for the same contract (the 2026-10-01
   unsubscribe-first order). The 25 is sent first because a bare repeated 23
@@ -9337,6 +9338,19 @@ are; the silence question is answered per SOCKET by the new watch below.
   `refused_halted_805`, `refused_not_held`, `wire_failed`, `recovered`),
   registered at 0 at boot, local `/metrics` only; one coded `warn!` per
   resend decision, never per packet.
+- **90 s is the STARTING value, not a measured one.** The wait is a config
+  value, validated at boot to 10..=600 s (the ceiling stays well under the
+  900 s backstop). The owner may lower it once the measured first-packet p99
+  supports it, and lowering it is a config change plus a restart, never a
+  code change. To measure it, the drain records every depth-200 swap's time
+  from subscribe to the new contract's first packet ON ITS SOCKET into the
+  existing local histogram `tv_depth_first_packet_latency_ms`, labelled
+  `basis = "depth200_socket"` (O(1), one sample per swap, on the one packet
+  that clears the watch). Local `/metrics` only; the name is not
+  EMF-selected. Contracts that never arrive are not in it, so read its p99
+  together with the `sent` count.
+- Every per-packet and per-tick step is O(1) and allocation-free; waiting is
+  not work: the 90 s is a timestamp compared once a second.
 
 #### Honest limits
 
