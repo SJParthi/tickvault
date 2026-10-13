@@ -3237,7 +3237,7 @@ impl TopVolumeRankWriter {
 // session-window filter; a file older than its table's hot window less a day
 // is set aside in `quarantine/` (owner decision Q4(b)), which is uploaded to
 // the cold bucket before any trim. `[top_volume] spill_enabled = false`
-// discards instead of spilling and does not start the replay.
+// discards instead of spilling; the replay still runs for files on disk.
 
 /// Folder a top_volume batch that cannot reach QuestDB is appended to:
 /// `data/spill/top_volume`, a sibling of

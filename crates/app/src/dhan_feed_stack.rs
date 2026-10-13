@@ -17635,7 +17635,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // breaker keeps a dead QuestDB to one timeout per cooldown. The drain side
     // is unchanged. Spilled files are kept on disk until the replay lands
     // (plan item 5, a later change). ⚠ 2026-10-13 PR-C: it has; main.rs
-    // spawns it (it posts after 15:40 IST) unless `spill_enabled = false`.
+    // always spawns it (it posts after 15:40 IST); the switch stops spilling.
     //
     // A spawn failure leaves `top_volume` unset. That is the honest degrade:
     // no snapshot rows rather than a synchronous ILP flush on the frame drain,

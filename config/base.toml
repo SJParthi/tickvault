@@ -755,7 +755,7 @@ array_rows = false
 # cannot reach QuestDB to data/spill/top_volume and replay it after 15:40 IST
 # (plan `.claude/plans/active-plan-top-volume-spill.md`, owner approval
 # 2026-10-13). Set false to roll back: such batches are then discarded and
-# counted, as before, and the replay for the folder is not started.
+# counted, as before. The replay still runs for files already on disk.
 [top_volume]
 spill_enabled = true
 

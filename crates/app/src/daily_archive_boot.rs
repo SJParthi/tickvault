@@ -243,6 +243,13 @@ pub const fn pass_verdict(summary: &ArchiveRunSummary, max_partitions_per_run: u
         // still past retention at the next day's sweep and go then.
         return PassVerdict::Incomplete("deferred_depth_pass");
     }
+    if summary.held_top_volume_spill > 0 {
+        // Top_volume spill plan item 6 (2026-10-13): a top_volume hour a
+        // pending spill file can still replay into was held. The day stays
+        // open (never latched with it unarchived) and is NOT refunded: the
+        // replay posts after 15:40, so a later attempt finds it drained.
+        return PassVerdict::Incomplete("top_volume_spill_pending");
+    }
     PassVerdict::Complete
 }
 
@@ -264,7 +271,7 @@ pub fn refunds_attempt(outcome: PassOutcome) -> bool {
 
 /// Every `tv_daily_archive_attempts_total{outcome}` value, seeded at 0 when
 /// the loop starts so a first event never lands on a missing series.
-pub const SEEDED_ATTEMPT_OUTCOMES: [&str; 11] = [
+pub const SEEDED_ATTEMPT_OUTCOMES: [&str; 12] = [
     "complete",
     "contended",
     "did_not_run",
@@ -274,6 +281,7 @@ pub const SEEDED_ATTEMPT_OUTCOMES: [&str; 11] = [
     "partition_failed",
     "budget_exhausted",
     "deferred_depth_pass",
+    "top_volume_spill_pending",
     "skipped",
     "failed",
 ];
@@ -1160,6 +1168,29 @@ mod pass_ran_tests {
             PassVerdict::Incomplete("deferred_depth_pass")
         );
         assert!(!PassOutcome::Ran(pass_verdict(&held, 200)).latches_the_day());
+    }
+
+    // Regression: 2026-10-13 (top_volume spill PR-C review, HIGH) — held
+    // top_volume partitions were skipped with no counter, so the pass read
+    // Complete and latched the day with them unarchived.
+    #[test]
+    fn test_regression_held_top_volume_partitions_keep_the_day_open() {
+        let held = ArchiveRunSummary {
+            pass_ran: true,
+            held_top_volume_spill: 2,
+            ..ArchiveRunSummary::default()
+        };
+        assert_eq!(
+            pass_verdict(&held, 200),
+            PassVerdict::Incomplete("top_volume_spill_pending")
+        );
+        let outcome = PassOutcome::Ran(pass_verdict(&held, 200));
+        assert!(!outcome.latches_the_day());
+        assert!(
+            !refunds_attempt(outcome),
+            "a held top_volume hour spends its attempt"
+        );
+        assert!(SEEDED_ATTEMPT_OUTCOMES.contains(&"top_volume_spill_pending"));
     }
 
     // Regression: 2026-10-13 (DA-13d review) — the after-close depth pass

@@ -4834,7 +4834,7 @@ wall-clock minute under its own note.
 > older than its table's hot window less a day is set aside in `quarantine/`
 > (uploaded to `top-volume-quarantine/` before any trim). Rows are counted as
 > discarded only when the spill itself is refused. `[top_volume]
-> spill_enabled = false` restores the drop. The REJECT row above STANDS: the
+> spill_enabled = false` restores the drop (the replay still drains files on disk). The REJECT row above STANDS: the
 > persistence bound is kept; only the drop became a spill. Plan:
 > `.claude/plans/active-plan-top-volume-spill.md`.
 

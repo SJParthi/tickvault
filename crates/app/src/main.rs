@@ -3048,14 +3048,15 @@ async fn async_main() -> Result<()> {
     // The third drain, for the top_volume board spill (2026-10-13, plan item 5):
     // held until the tables are keyed, then after 15:40 IST; no window filter;
     // a file older than the hot window less a day is set aside, never replayed.
-    let _top_volume_spill_drain_supervisor = config.top_volume.spill_enabled.then(|| {
+    // ALWAYS started: `[top_volume] spill_enabled = false` stops only new spills,
+    // so files already on disk are still replayed and aged (PR-C review).
+    let _top_volume_spill_drain_supervisor =
         tickvault_storage::tick_spill_replay::spawn_supervised_top_volume_spill_replay(
             &config.questdb.host,
             config.questdb.http_port,
             require_raw_upload,
             &config.partition_retention,
-        )
-    });
+        );
 
     // Feed-hardening Item 5 (2026-08-19): the watcher above MEASURES a filling
     // volume and does nothing about it. This loop is the remediation arm.

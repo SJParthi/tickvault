@@ -1016,8 +1016,8 @@ pub struct DepthStorageConfig {
 /// `spill_enabled` defaults to TRUE, also when the section or the key is
 /// absent: a board batch that cannot reach QuestDB is saved to
 /// `data/spill/top_volume` and replayed after the close. `false` is the
-/// rollback: such batches are discarded and counted, as before 2026-10-13,
-/// and the replay for the folder is not started.
+/// rollback: such batches are discarded and counted, as before 2026-10-13.
+/// The replay still runs, so files already on disk are posted and aged.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 pub struct TopVolumeConfig {
     /// Save board batches that do not land to disk and replay them.

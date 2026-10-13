@@ -460,15 +460,44 @@ pub const TOP_VOLUME_REPLAY_AGE_SLACK_DAYS: u32 = 1;
 /// `hot − 1` days keeps it at least 5.5 h ahead of that, so a replay never
 /// writes into an hour whose cold copy was already taken. The file is kept in
 /// `quarantine/` (uploaded cold before any trim), never deleted. Pure. O(1).
+///
+/// ⚠ CHANGED 2026-10-13 (PR-C review, MEDIUM): when the disk-pressure archive
+/// is enabled, the window is the SMALLER of the normal and the pressure
+/// window. A pressure pass cuts market data to `pressure_hot_days` (2 by
+/// default) and archives top_volume hours by then, so with the normal window
+/// alone a file 2 to 14 days old was neither set aside nor protected and the
+/// 15:40 replay wrote into hours already dropped. A pressure pass can run at
+/// any time and its drops outlive the episode and a restart, so the smaller
+/// window applies whenever pressure archival can run, not only during an
+/// episode. Cost: with the shipped config (15-day window, pressure on, 2
+/// days) a file more than ONE day old is set aside rather than replayed;
+/// replay runs every evening, so only a spill QuestDB could not take for a
+/// whole day reaches that, and it is kept and copied cold, never deleted.
 #[must_use]
 pub fn top_volume_replay_max_age_secs(
     cfg: &tickvault_common::config::PartitionRetentionConfig,
 ) -> u64 {
-    let hot = crate::top_volume_rank_persistence::SnapshotCadence::ALL
-        .iter()
-        .map(|c| crate::partition_archive::hot_window_days(c.table_name(), cfg))
-        .min()
-        .unwrap_or(crate::partition_archive::MIN_HOT_DAYS);
+    let shortest = |c: &tickvault_common::config::PartitionRetentionConfig| {
+        crate::top_volume_rank_persistence::SnapshotCadence::ALL
+            .iter()
+            .map(|t| crate::partition_archive::hot_window_days(t.table_name(), c))
+            .min()
+            .unwrap_or(crate::partition_archive::MIN_HOT_DAYS)
+    };
+    let mut hot = shortest(cfg);
+    if cfg.pressure_archive_enabled {
+        // The same `min(configured, pressure)` the pressure leg applies
+        // (`disk_pressure_boot::pressure_config`) to the market-data class
+        // `top_volume_<tf>` belongs to.
+        let pressure_days = crate::disk_pressure::pressure_hot_days(cfg);
+        let pressure = tickvault_common::config::PartitionRetentionConfig {
+            market_data_hot_days: cfg.market_data_hot_days.min(pressure_days),
+            depth_hot_days: cfg.depth_hot_days.min(pressure_days),
+            intraday_hot_days: cfg.intraday_hot_days.min(pressure_days),
+            ..cfg.clone()
+        };
+        hot = hot.min(shortest(&pressure));
+    }
     let days = hot.saturating_sub(TOP_VOLUME_REPLAY_AGE_SLACK_DAYS).max(1);
     u64::from(days).saturating_mul(86_400)
 }
@@ -2796,8 +2825,9 @@ pub fn spawn_supervised_tick_spill_replay(
 /// [`top_volume_replay_max_age_secs`] set aside rather than replayed.
 ///
 /// Trims the folder's quarantine once first, against its own ceiling, as the
-/// boot does for ticks (plan item 7). Spawned by the app only when
-/// `[top_volume] spill_enabled` is true.
+/// boot does for ticks (plan item 7). Spawned by the app on every boot, also
+/// with `[top_volume] spill_enabled = false`, so files already on disk are
+/// replayed and aged and never hold the archive forever (PR-C review).
 // TEST-EXEMPT: spawns the supervised loop; the policy it passes is asserted by test_top_volume_replay_holds_until_tables_are_keyed and test_top_volume_spawn_sets_the_age_limit_from_the_archive_window, and the boot call site by the app's top_volume spill wiring test.
 pub fn spawn_supervised_top_volume_spill_replay(
     host: &str,
@@ -6116,6 +6146,7 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
     fn test_top_volume_spawn_sets_the_age_limit_from_the_archive_window() {
         let mut cfg = tickvault_common::config::PartitionRetentionConfig::default();
         cfg.market_data_hot_days = 35;
+        cfg.pressure_archive_enabled = false;
         let hot = crate::partition_archive::hot_window_days(
             crate::top_volume_rank_persistence::SnapshotCadence::OneSecond.table_name(),
             &cfg,
@@ -6134,6 +6165,37 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
         );
         assert_eq!(policy.max_file_age_secs, Some(86_400));
         assert_eq!(policy.window, ReplayWindow::None);
+    }
+
+    /// Regression (2026-10-13 PR-C review, MEDIUM): a pressure pass cuts
+    /// market data to the pressure window, so the age limit follows the
+    /// smaller window whenever pressure archival is on; otherwise a file 2 to
+    /// 14 days old was replayed into hours the pressure leg had dropped.
+    #[test]
+    fn test_regression_top_volume_age_limit_follows_the_pressure_window() {
+        let mut cfg = tickvault_common::config::PartitionRetentionConfig::default();
+        cfg.market_data_hot_days = 15;
+        cfg.pressure_hot_days = 2;
+        cfg.pressure_archive_enabled = false;
+        assert_eq!(top_volume_replay_max_age_secs(&cfg), 14 * 86_400);
+        cfg.pressure_archive_enabled = true;
+        assert_eq!(
+            top_volume_replay_max_age_secs(&cfg),
+            86_400,
+            "pressure archives top_volume at 2 days, so files older than 1 day are set aside"
+        );
+        cfg.pressure_hot_days = 5;
+        assert_eq!(top_volume_replay_max_age_secs(&cfg), 4 * 86_400);
+        cfg.pressure_hot_days = 0;
+        assert_eq!(
+            top_volume_replay_max_age_secs(&cfg),
+            86_400,
+            "the pressure window is floored at 2 days, so never below one day"
+        );
+        // Pressure only ever shortens: a pressure window above the normal one
+        // changes nothing.
+        cfg.pressure_hot_days = 40;
+        assert_eq!(top_volume_replay_max_age_secs(&cfg), 14 * 86_400);
     }
 
     #[test]
