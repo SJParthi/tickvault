@@ -283,13 +283,22 @@ enum LastLine {
 /// hundred bytes), so a longer unterminated tail is torn by definition.
 const DLQ_LAST_LINE_PROBE_BYTES: usize = 4_096;
 
-/// Classifies how `file` (of length `len`) ends. Reads at most
-/// [`DLQ_LAST_LINE_PROBE_BYTES`] from the end into a stack buffer: one seek
-/// and one bounded read, no allocation unless the last line must be parsed.
+/// Classifies how `file` (of length `len`) ends. Reads the last byte first
+/// (one seek, one 1-byte read): a file ending in a newline, the steady
+/// state, costs nothing more. Only an unterminated file reads up to
+/// [`DLQ_LAST_LINE_PROBE_BYTES`] more from the end into a stack buffer (one
+/// more seek and bounded read), with no allocation unless the last line must
+/// be parsed.
 /// The append position is unaffected: the file is opened in append mode, so
 /// every write still lands at the end.
 fn read_unterminated_last_line(file: &mut std::fs::File, len: u64) -> std::io::Result<LastLine> {
     if len == 0 {
+        return Ok(LastLine::Terminated);
+    }
+    file.seek(SeekFrom::Start(len - 1))?;
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last)?;
+    if last[0] == b'\n' {
         return Ok(LastLine::Terminated);
     }
     let probe = len.min(DLQ_LAST_LINE_PROBE_BYTES as u64);
@@ -297,9 +306,6 @@ fn read_unterminated_last_line(file: &mut std::fs::File, len: u64) -> std::io::R
     let mut buf = [0u8; DLQ_LAST_LINE_PROBE_BYTES];
     let tail = &mut buf[..probe as usize];
     file.read_exact(tail)?;
-    if tail.last() == Some(&b'\n') {
-        return Ok(LastLine::Terminated);
-    }
     let Some(newline) = tail.iter().rposition(|byte| *byte == b'\n') else {
         // No newline in the probe: either the whole file is one unterminated
         // line no longer than the probe, or the line is longer than any
@@ -546,8 +552,9 @@ impl SealDlqWriter {
             unsynced.parent |= created_dir;
         }
         // Deep audit DA-14 (CRASH-1 partial): a file that does not end in a
-        // newline ends in a line a process died writing (no appender of this
-        // process can be mid-write: they all hold `append_lock`). Appending
+        // newline ends in a line a process died writing, or one a failed write
+        // of this process could not cut back (no appender of this process can
+        // be mid-write: they all hold `append_lock`). Appending
         // straight after it glued the NEXT record onto that fragment, so the
         // replay refused both as one line and lost a record this call had
         // reported written. The line is closed with a newline first. It is
@@ -565,7 +572,8 @@ impl SealDlqWriter {
                     code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
                     source = "seal_dlq_torn_line",
                     ?path,
-                    "seal DLQ: the file ended in a partial line (a process died mid-write); \
+                    "seal DLQ: the file ended in a partial line (a process died mid-write, or a \
+                     failed write here could not be cut back); \
                      it is closed with a newline so the next record is not glued to it. The \
                      partial line is one candle the replay will refuse and count"
                 );

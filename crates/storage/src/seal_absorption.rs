@@ -313,7 +313,9 @@ impl SealAbsorptionPipeline {
 
     /// Producer entry point. Infallible by design — every absorption
     /// failure escalates one tier deeper. Worst case returns
-    /// [`SubmitOutcome::Dropped`] carrying the lost seal.
+    /// [`SubmitOutcome::Dropped`] carrying the lost seal, or
+    /// [`SubmitOutcome::DroppedBelowFloor`] when free space is below the seal
+    /// floor and nothing was written (deep audit DA-14).
     ///
     /// `now_unix_secs` is the UTC unix timestamp used to derive the
     /// IST-date filename for the spill / DLQ files (per locked
@@ -340,7 +342,9 @@ impl SealAbsorptionPipeline {
     ///
     /// Returns the same [`SubmitOutcome`] enum as [`Self::submit`] —
     /// `Buffered` is impossible (we skip the ring), so the caller
-    /// will only ever observe `Spilled` / `DlqWritten` / `Dropped`.
+    /// will only ever observe `Spilled` / `DlqWritten` / `Dropped` /
+    /// `DroppedBelowFloor` (deep audit DA-14: refused at the seal disk floor,
+    /// nothing written).
     pub fn rescue_in_flight(&self, seal: BufferedSeal, now_unix_secs: i64) -> SubmitOutcome {
         self.escalate_evicted(seal, now_unix_secs)
     }
@@ -770,12 +774,24 @@ mod tests {
         let spilled = SubmitOutcome::Spilled;
         let dlq = SubmitOutcome::DlqWritten;
         let dropped = SubmitOutcome::Dropped(s);
+        // Deep audit DA-14: the floor refusal is its own outcome, never equal
+        // to a tier failure, so the page can say which one happened.
+        let below_floor = SubmitOutcome::DroppedBelowFloor(mk_buffered_seal(
+            13,
+            0,
+            TfIndex::M1,
+            1_716_023_700,
+            100.0,
+        ));
         assert_ne!(buffered, spilled);
         assert_ne!(buffered, dlq);
         assert_ne!(buffered, dropped);
         assert_ne!(spilled, dlq);
         assert_ne!(spilled, dropped);
         assert_ne!(dlq, dropped);
+        for other in [&buffered, &spilled, &dlq, &dropped] {
+            assert_ne!(&below_floor, other);
+        }
     }
 
     #[test]
