@@ -809,6 +809,12 @@ struct SpillState {
     /// before any sync closes the older one unsynced, which is the same
     /// exposure the open file has until its own first sync.
     rotated: Option<File>,
+    /// A handle dropped after a failed write, not yet synced (deep audit DA-14
+    /// review). It still holds the bytes written since the last sync: every
+    /// earlier append on it, and the whole records a failed batch kept.
+    /// Parked here (no syscall) instead of dropped, and synced and closed
+    /// off the lock by [`SealSpillWriter::sync_open_file`], like `rotated`.
+    failed_unsynced: Option<File>,
     /// The fullest copy of each bar on disk and in the database. See
     /// [`crate::seal_spill_ledger`].
     ledger: SpillLedger,
@@ -927,6 +933,10 @@ pub struct SealSpillWriter {
     /// affordable.
     err_no_handle: metrics::Counter,
     err_write: metrics::Counter,
+    /// Pre-resolved handle for a torn record found when a day file is opened
+    /// (deep audit DA-14): the open runs under the append lock and can be
+    /// reached from the frame drain's inline fallback, like the two above.
+    torn_tail_cut: metrics::Counter,
     /// Pre-resolved handle for a failed `sync_data` (PR17). Only the
     /// escalation thread syncs, but the handle is resolved once like the two
     /// above rather than per failure.
@@ -963,6 +973,39 @@ pub struct SealSpillWriter {
 struct SpillTestProbes {
     disk_writes: AtomicU64,
     lock_attempts: AtomicU64,
+    /// Deep audit DA-14: when armed, the batch write lands only this many
+    /// bytes and then fails as a full disk does (a short write, then
+    /// ENOSPC), so the keep-what-fit path can be driven without filling a
+    /// real volume.
+    fail_write_armed: AtomicBool,
+    fail_write_after_bytes: AtomicU64,
+}
+
+/// A batch spill write that failed (deep audit DA-14), and how much of the
+/// batch is kept anyway.
+///
+/// `kept` is the number of LEADING seals of the batch the caller passed that
+/// need no further write: on disk whole, or superseded by a fuller copy the
+/// spill already holds. The caller dead-letters the seals after them only.
+#[derive(Debug)]
+pub struct BatchSpillFailure {
+    /// Leading input seals that are durable or superseded.
+    pub kept: usize,
+    /// What failed.
+    pub error: anyhow::Error,
+}
+
+impl BatchSpillFailure {
+    /// A failure before any byte of the batch was written.
+    fn nothing_kept(error: anyhow::Error) -> Self {
+        Self { kept: 0, error }
+    }
+}
+
+impl std::fmt::Display for BatchSpillFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#} ({} leading seals kept)", self.error, self.kept)
+    }
 }
 
 /// Name of the spill-write failure counter. Both label values are
@@ -986,6 +1029,7 @@ impl SealSpillWriter {
             state: Mutex::new(SpillState {
                 open: None,
                 rotated: None,
+                failed_unsynced: None,
                 ledger: SpillLedger::with_capacity(SEAL_SPILL_LEDGER_CAPACITY),
                 mirror_scratch: Vec::new(),
                 mirror_seals: Vec::new(),
@@ -997,6 +1041,7 @@ impl SealSpillWriter {
             escalation_finished: AtomicU64::new(0),
             err_no_handle: metrics::counter!(SPILL_WRITE_ERRORS_COUNTER, "stage" => "no_handle"),
             err_write: metrics::counter!(SPILL_WRITE_ERRORS_COUNTER, "stage" => "write"),
+            torn_tail_cut: metrics::counter!("tv_seal_spill_torn_tail_cut_total"),
             err_sync: metrics::counter!(SEAL_SPILL_SYNC_FAILED_COUNTER),
             sync_failing: AtomicBool::new(false),
             data_unsynced: AtomicBool::new(false),
@@ -1066,9 +1111,10 @@ impl SealSpillWriter {
     /// A failure is counted on `tv_seal_spill_sync_failed_total` and logged
     /// once per failing episode.
     pub(crate) fn sync_open_file(&self) -> bool {
-        let (rotated, handle, dir, parent) = {
+        let (rotated, failed, handle, dir, parent) = {
             let mut state = self.lock_state();
             let rotated = state.rotated.take();
+            let failed = state.failed_unsynced.take();
             // The flags are set under this lock (by `current_file` and the
             // `open_append_handle` it calls), so taking them here pairs each
             // with the handle it was set for. A file with no append since the
@@ -1080,14 +1126,16 @@ impl SealSpillWriter {
             };
             let dir = self.dir_unsynced.swap(false, Ordering::Relaxed);
             let parent = self.parent_unsynced.swap(false, Ordering::Relaxed);
-            (rotated, handle, dir, parent)
+            (rotated, failed, handle, dir, parent)
         };
-        if rotated.is_none() && handle.is_none() && !dir && !parent {
+        if rotated.is_none() && failed.is_none() && handle.is_none() && !dir && !parent {
             return true;
         }
         // The previous day's file first: its last seals are the oldest
         // unsynced ones. It is dropped (closed) here, off the lock.
         let rotated_outcome = rotated.map_or(Ok(()), |file| file.sync_data());
+        // A handle a failed write left behind (deep audit DA-14 review).
+        let failed_outcome = failed.map_or(Ok(()), |file| file.sync_data());
         let open_outcome = handle
             .map_or(Ok(()), |file| file.and_then(|file| file.sync_data()))
             .inspect_err(|_| {
@@ -1109,6 +1157,7 @@ impl SealSpillWriter {
             _ => Ok(()),
         };
         let outcome = rotated_outcome
+            .and(failed_outcome)
             .and(open_outcome)
             .and(dir_outcome)
             .and(parent_outcome);
@@ -1139,9 +1188,42 @@ impl SealSpillWriter {
     pub(crate) fn has_unsynced_writes(&self) -> bool {
         let state = self.lock_state();
         state.rotated.is_some()
+            || state.failed_unsynced.is_some()
             || self.data_unsynced.load(Ordering::Relaxed)
             || self.dir_unsynced.load(Ordering::Relaxed)
             || self.parent_unsynced.load(Ordering::Relaxed)
+    }
+
+    /// Drops the append handle after a failed write WITHOUT losing its sync
+    /// (deep audit DA-14 review). The handle still holds every byte written
+    /// on it since the last sync, including the whole records a failed batch
+    /// kept; dropping it left `sync_open_file` with no handle, so it cleared
+    /// the flag and synced nothing. It is parked in `failed_unsynced` and
+    /// synced off the lock by the next `sync_open_file`. No syscall unless a
+    /// handle is already parked, then one `fstat` per handle to see whether
+    /// they share a file (a sync of either covers both); a parked handle of a
+    /// DIFFERENT file (one set aside since) is kept, and this one is closed
+    /// unsynced and counted as a failed sync, with the episode's coded line.
+    fn park_failed_handle(&self, open: &mut Option<OpenSpillFile>, failed: &mut Option<File>) {
+        let Some(previous) = open.take() else {
+            return;
+        };
+        let Some(parked) = failed.as_ref() else {
+            *failed = Some(previous.file);
+            return;
+        };
+        if same_file(parked, &previous.file) {
+            return;
+        }
+        self.err_sync.increment(1);
+        if !self.sync_failing.swap(true, Ordering::Relaxed) {
+            error!(
+                code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                spill_dir = ?self.spill_dir,
+                "seal spill: two failed writes on different files before a sync; the newer \
+                 file's seals reported written may be lost on a power cut"
+            );
+        }
     }
 
     /// Opens (creating as needed) the append handle for `path`.
@@ -1224,6 +1306,7 @@ impl SealSpillWriter {
         let SpillState {
             open,
             rotated,
+            failed_unsynced,
             ledger,
             epoch,
             ..
@@ -1266,13 +1349,16 @@ impl SealSpillWriter {
             // mirrors `ws_frame_spill::persist_record_resilient`. The error
             // still propagates, so the absorption pipeline escalates THIS
             // seal to the tier-3 DLQ exactly as before.
-            *open = None;
+            self.park_failed_handle(open, failed_unsynced);
             self.err_write.increment(1);
             let path = self.spill_path(now_unix_secs);
             return match cut {
                 Ok(_) => Err(err).with_context(|| format!("failed to write seal to {path:?}")),
                 Err(cut_err) => {
                     let aside = set_aside_torn_file(&path);
+                    // The rename changed the directory: its entry must be synced too
+                    // (deep audit DA-14 review).
+                    self.dir_unsynced.store(true, Ordering::Relaxed);
                     Err(err).with_context(|| {
                         format!(
                             "failed to write seal to {path:?}, cutting the torn tail back ALSO \
@@ -1313,16 +1399,29 @@ impl SealSpillWriter {
             // reader would refuse them all. Checked once per open.
             match cut_back_to_whole_records(&file) {
                 Ok(0) => {}
-                Ok(cut) => warn!(
-                    ?path,
-                    cut_bytes = cut,
-                    "seal spill: cut a torn partial record off the end of the day file before \
-                     appending"
-                ),
+                Ok(cut) => {
+                    // Deep audit DA-14 (CRASH-1 partial): a tear found at OPEN
+                    // was left by a process that died mid-write (a failed write
+                    // in this process cuts its own tail). That record is one
+                    // seal the crash took; the crash marker counts the seals it
+                    // held, and this is the evidence on disk. Counted and
+                    // coded; it was an uncoded `warn!` with no counter.
+                    self.torn_tail_cut.increment(1);
+                    error!(
+                        code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                        source = "seal_spill_torn_tail",
+                        ?path,
+                        cut_bytes = cut,
+                        "seal spill: the day file ended in a partial record (a process died \
+                         mid-write); the partial record is cut off before appending, so one \
+                         candle being written at the crash is not on disk"
+                    );
+                }
                 Err(err) => {
                     drop(file);
                     match set_aside_torn_file(&path) {
                         Ok(aside) => {
+                            self.dir_unsynced.store(true, Ordering::Relaxed);
                             warn!(
                                 ?path,
                                 ?err,
@@ -1463,15 +1562,22 @@ impl SealSpillWriter {
     /// `scratch` is the caller's reusable byte buffer, so a steady stream of
     /// batches allocates nothing after the first one of the largest size.
     ///
-    /// # Failure is all-or-nothing, as far as the filesystem allows
+    /// # A failed write keeps the whole records that landed (deep audit DA-14)
     ///
-    /// A failed `write_all` may have written part of the batch. The file is
-    /// then cut back to the length it had before the write, so the caller can
-    /// escalate every seal of the batch one by one without writing any of
-    /// them twice and, more importantly, without leaving a torn record that
-    /// would shift every later record off its 128-byte boundary. Readers stop
-    /// only at a SHORT read, so a torn record in the middle of a file would
-    /// make every record after it unreadable, not just itself.
+    /// A failed `write_all` may have written part of the batch: a full disk
+    /// takes what fits and then refuses the rest. The file is cut back to its
+    /// last WHOLE record, never past it, so no torn record is left to shift
+    /// every later record off its 128-byte boundary (readers stop only at a
+    /// SHORT read, so a torn record in the middle of a file would make every
+    /// record after it unreadable). The error reports how many leading seals
+    /// of the batch are kept ([`BatchSpillFailure::kept`]), and the caller
+    /// dead-letters only the rest.
+    ///
+    /// Before DA-14 the file was cut back to the length it had before the
+    /// write, discarding the records that HAD fitted, and every seal of the
+    /// batch went to the DLQ, which lives on the same full volume and writes
+    /// a larger record: on a nearly full disk, a batch of 1,024 seals of
+    /// which 900 fitted lost all 1,024.
     ///
     /// If the cut ALSO fails, the file is renamed aside (`<name>.<n>`, a name
     /// both drains still read) with the handle already closed, so the tear is
@@ -1490,7 +1596,7 @@ impl SealSpillWriter {
         seals: I,
         scratch: &mut Vec<u8>,
         now_unix_secs: i64,
-    ) -> Result<()>
+    ) -> std::result::Result<(), BatchSpillFailure>
     where
         I: IntoIterator<Item = &'a SerializedSeal>,
         I::IntoIter: Clone,
@@ -1500,6 +1606,7 @@ impl SealSpillWriter {
         let SpillState {
             open,
             rotated,
+            failed_unsynced,
             ledger,
             epoch,
             ..
@@ -1519,7 +1626,9 @@ impl SealSpillWriter {
         if scratch.is_empty() {
             return Ok(());
         }
-        let current = self.current_file(open, rotated, now_unix_secs)?;
+        let current = self
+            .current_file(open, rotated, now_unix_secs)
+            .map_err(BatchSpillFailure::nothing_kept)?;
         let before = match current.file.metadata() {
             // Audit PR41c: the batch starts on a record boundary. The day
             // file was cut back when it was opened and every failed write
@@ -1529,40 +1638,62 @@ impl SealSpillWriter {
                 match cut_back_to_whole_records(&current.file) {
                     Ok(cut) => meta.len().saturating_sub(cut),
                     Err(err) => {
-                        *open = None;
+                        self.park_failed_handle(open, failed_unsynced);
                         self.err_write.increment(1);
                         let path = self.spill_path(now_unix_secs);
                         let aside = set_aside_torn_file(&path);
-                        return Err(err).with_context(|| {
-                            format!(
+                        // The rename changed the directory: its entry must be synced too
+                        // (deep audit DA-14 review).
+                        self.dir_unsynced.store(true, Ordering::Relaxed);
+                        return Err(BatchSpillFailure::nothing_kept(
+                            anyhow::Error::from(err).context(format!(
                                 "seal spill file {path:?} ends mid-record and cannot be cut \
                                  back; set aside ({aside:?}) before the batch"
-                            )
-                        });
+                            )),
+                        ));
                     }
                 }
             }
             Ok(meta) => meta.len(),
             Err(err) => {
-                *open = None;
+                self.park_failed_handle(open, failed_unsynced);
                 self.err_write.increment(1);
                 let path = self.spill_path(now_unix_secs);
-                return Err(err).with_context(|| format!("failed to stat spill file {path:?}"));
+                return Err(BatchSpillFailure::nothing_kept(
+                    anyhow::Error::from(err).context(format!("failed to stat spill file {path:?}")),
+                ));
             }
         };
         #[cfg(test)]
         self.probes.disk_writes.fetch_add(1, Ordering::SeqCst);
-        if let Err(err) = current.file.write_all(scratch) {
+        if let Err(err) = self.write_batch_bytes(&mut current.file, scratch) {
+            // Deep audit DA-14: keep the whole records that landed. A full
+            // disk takes what fits and refuses the rest, so the file is cut
+            // back to its last WHOLE record, not to `before`. One `fstat`;
+            // when it fails the landed length is unknown and nothing is kept,
+            // as before.
+            let landed_whole = match current.file.metadata() {
+                Ok(meta) => {
+                    let landed = meta.len().saturating_sub(before).min(scratch.len() as u64);
+                    landed - landed % SEAL_SPILL_RECORD_SIZE as u64
+                }
+                Err(_) => 0,
+            };
             // Cut the torn tail before dropping the handle. Best effort: a
             // failure here is reported in the error chain, not swallowed.
-            let cut = current.file.set_len(before);
-            *open = None;
+            let cut = current.file.set_len(before.saturating_add(landed_whole));
+            self.park_failed_handle(open, failed_unsynced);
             self.err_write.increment(1);
             let path = self.spill_path(now_unix_secs);
-            return match cut {
-                Ok(()) => Err(err).with_context(|| {
-                    format!("failed to write a seal batch to {path:?} (torn tail cut back)")
-                }),
+            // Either way the whole records that landed are readable: after a
+            // clean cut they are the file's tail; after a failed cut the file
+            // is set aside and the tear, which follows them, reads as its end.
+            let records_kept = (landed_whole / SEAL_SPILL_RECORD_SIZE as u64) as usize;
+            let error = match cut {
+                Ok(()) => anyhow::Error::from(err).context(format!(
+                    "failed to write a seal batch to {path:?} ({records_kept} whole records \
+                     kept, torn tail cut back)"
+                )),
                 Err(cut_err) => {
                     // The torn tail stays, and every record appended after it
                     // would sit off its 128-byte boundary: readers would
@@ -1571,16 +1702,37 @@ impl SealSpillWriter {
                     // drains still read, so the records before the tear are
                     // recovered, the tear ends that file, and the next append
                     // starts a clean one. The handle is already closed (held
-                    // lock, `*open = None` above), so nothing follows the move.
+                    // lock, the handle parked above), so nothing follows the move.
                     let aside = set_aside_torn_file(&path);
-                    Err(err).with_context(|| {
-                        format!(
-                            "failed to write a seal batch to {path:?}, cutting the torn tail \
-                             back ALSO failed ({cut_err}); file set aside: {aside:?}"
-                        )
-                    })
+                    // The rename changed the directory: its entry must be synced too
+                    // (deep audit DA-14 review).
+                    self.dir_unsynced.store(true, Ordering::Relaxed);
+                    anyhow::Error::from(err).context(format!(
+                        "failed to write a seal batch to {path:?}, cutting the torn tail \
+                         back ALSO failed ({cut_err}); file set aside: {aside:?}"
+                    ))
                 }
             };
+            // Map the records kept back to the leading INPUT seals: a seal the
+            // ledger left out (superseded) needs no write and counts as kept
+            // until the first included seal that did not land. The ledger is
+            // read only, so this walk sees the verdicts the filter above saw.
+            let mut included_left = records_kept;
+            let mut kept = 0usize;
+            for seal in seals.clone() {
+                if ledger.verdict(seal) != SpillVerdict::OlderNotWritten {
+                    if included_left == 0 {
+                        break;
+                    }
+                    included_left -= 1;
+                }
+                kept += 1;
+            }
+            for seal in seals.take(kept) {
+                let verdict = ledger.verdict(seal);
+                self.note_spilled(ledger, seal, verdict, *epoch);
+            }
+            return Err(BatchSpillFailure { kept, error });
         }
         // Every copy left out above is less full than the one the ledger
         // holds, so recording it changes nothing.
@@ -1589,6 +1741,36 @@ impl SealSpillWriter {
             self.note_spilled(ledger, seal, verdict, *epoch);
         }
         Ok(())
+    }
+
+    /// The batch path's one `write(2)`. In tests an armed probe lands only
+    /// part of the bytes and then fails the way a full disk does.
+    fn write_batch_bytes(&self, file: &mut File, bytes: &[u8]) -> std::io::Result<()> {
+        #[cfg(test)]
+        if self.probes.fail_write_armed.load(Ordering::SeqCst) {
+            let cap = self.probes.fail_write_after_bytes.load(Ordering::SeqCst);
+            let landed = usize::try_from(cap).unwrap_or(usize::MAX).min(bytes.len());
+            file.write_all(&bytes[..landed])?;
+            if landed < bytes.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::StorageFull,
+                    "test: the disk took only part of the batch",
+                ));
+            }
+            return Ok(());
+        }
+        file.write_all(bytes)
+    }
+
+    /// Test hook: make the next batch writes land only `bytes` bytes and then
+    /// fail as a full disk does (deep audit DA-14).
+    #[cfg(test)]
+    // TEST-EXEMPT: test-only hook, used by the DA-14 partial-batch regression tests in seal_spill and seal_writer_runner
+    pub(crate) fn fail_batch_writes_after_for_test(&self, bytes: u64) {
+        self.probes
+            .fail_write_after_bytes
+            .store(bytes, Ordering::SeqCst);
+        self.probes.fail_write_armed.store(true, Ordering::SeqCst);
     }
 
     /// Audit PR41a, Z6: record what the live writer committed, and append to
@@ -1624,6 +1806,7 @@ impl SealSpillWriter {
         let SpillState {
             open,
             rotated,
+            failed_unsynced,
             ledger,
             mirror_scratch,
             mirror_seals,
@@ -1660,7 +1843,7 @@ impl SealSpillWriter {
         if let Err(err) = written {
             // The handle may be broken; the next append reopens it, and the
             // open cuts a torn tail back to a whole record (audit PR41c).
-            *open = None;
+            self.park_failed_handle(open, failed_unsynced);
             self.err_write.increment(1);
             self.superseded
                 .mirror_failed
@@ -1920,6 +2103,25 @@ fn cut_back_to_whole_records(file: &File) -> std::io::Result<u64> {
         file.set_len(len - torn)?;
     }
     Ok(torn)
+}
+
+/// Whether two handles are the same file (deep audit DA-14 review): one
+/// `fstat` each. Unknown (an `fstat` failed, or not Unix) reads as different,
+/// which only costs a counted sync failure, never a silent one.
+fn same_file(a: &File, b: &File) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (a.metadata(), b.metadata()) {
+            (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (a, b);
+        false
+    }
 }
 
 /// Move a spill file whose tail is torn to `<name>.<n>` in the same
@@ -3526,6 +3728,91 @@ mod tests {
     }
 
     #[test]
+    fn test_fail_batch_writes_after_for_test_arms_the_probe() {
+        let dir = temp_spill_dir("da14-fail-hook");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        writer.fail_batch_writes_after_for_test(0);
+        let mut scratch = Vec::new();
+        let seal = mk_seal(13, 0, 1, 34_200, 100.0);
+        let failure = writer
+            .append_seals(std::iter::once(&seal), &mut scratch, 1_700_000_000)
+            .expect_err("armed: nothing lands");
+        assert_eq!(failure.kept, 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Deep audit DA-14: a batch that only partly fits keeps the whole
+    /// records that landed, cuts the torn one, and reports how many leading
+    /// seals are kept. Before, the file was cut back to its length before the
+    /// write and every seal of the batch, including those on disk, went to
+    /// the DLQ on the same full volume.
+    #[test]
+    fn test_regression_da14_a_partly_written_batch_keeps_the_records_that_fit() {
+        let dir = temp_spill_dir("da14-batch-keep");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        let now = 1_700_000_000_i64;
+        let seals: Vec<SerializedSeal> = (0..4u32)
+            .map(|i| mk_seal(13, 0, 1, 34_200 + i, 100.0 + f64::from(i)))
+            .collect();
+        let mut scratch = Vec::new();
+        // Two and a half records land, then the disk refuses.
+        writer.fail_batch_writes_after_for_test(SEAL_SPILL_RECORD_SIZE as u64 * 2 + 64);
+        let failure = writer
+            .append_seals(seals.iter(), &mut scratch, now)
+            .expect_err("the disk refused part of the batch");
+        assert_eq!(
+            failure.kept, 2,
+            "the two whole records that landed are kept"
+        );
+        let on_disk = writer.read_all(now).expect("read");
+        assert_eq!(on_disk, seals[..2].to_vec(), "kept, whole, in order");
+        let len = std::fs::metadata(writer.spill_path(now))
+            .expect("stat")
+            .len();
+        assert_eq!(
+            len,
+            SEAL_SPILL_RECORD_SIZE as u64 * 2,
+            "the torn third record is cut off"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Deep audit DA-14 review: the records a failed batch kept must still be
+    /// synced. Before, the failed handle was dropped, so `sync_open_file`
+    /// found no handle, cleared the flag and synced nothing.
+    #[test]
+    fn test_regression_da14_records_kept_by_a_failed_batch_are_synced() {
+        let dir = temp_spill_dir("da14-kept-synced");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        let now = 1_700_000_000_i64;
+        let seals: Vec<SerializedSeal> = (0..4u32)
+            .map(|i| mk_seal(13, 0, 1, 34_200 + i, 100.0 + f64::from(i)))
+            .collect();
+        let mut scratch = Vec::new();
+        writer.fail_batch_writes_after_for_test(SEAL_SPILL_RECORD_SIZE as u64 * 2 + 64);
+        let failure = writer
+            .append_seals(seals.iter(), &mut scratch, now)
+            .expect_err("the disk refused part of the batch");
+        assert_eq!(failure.kept, 2);
+        {
+            let state = writer.lock_state();
+            assert!(state.open.is_none(), "the failed handle is not reused");
+            assert!(
+                state.failed_unsynced.is_some(),
+                "the failed handle is parked for the sync, not dropped"
+            );
+        }
+        assert!(writer.has_unsynced_writes());
+        assert!(writer.sync_open_file(), "the parked handle syncs");
+        assert!(
+            writer.lock_state().failed_unsynced.is_none(),
+            "the sync closes the parked handle"
+        );
+        assert!(!writer.has_unsynced_writes());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn test_append_seals_writes_a_batch_with_one_call_and_reads_back_in_order() {
         let dir = temp_spill_dir("append-seals-batch");
         let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
@@ -4747,6 +5034,40 @@ mod tests {
             3,
             "the sweep counts the three records that left the box unreplayed"
         );
+    }
+
+    /// Deep audit DA-14 (CRASH-1 partial): a partial record found when the
+    /// day file is opened (a process died mid-write) is cut off AND counted,
+    /// so the crash's lost candle leaves a number, not only a log line.
+    #[test]
+    fn test_regression_da14_torn_tail_found_at_open_is_counted() {
+        let dir = temp_spill_dir("da14-torn-at-open");
+        let recorder = OneCounterRecorder {
+            name: "tv_seal_spill_torn_tail_cut_total",
+            total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        // Built under the recorder: the writer resolves its counter handles
+        // once, at construction.
+        let writer = metrics::with_local_recorder(&recorder, || {
+            SealSpillWriter::with_spill_dir_for_test(dir.clone())
+        });
+        let now = 1_700_000_000_i64;
+        let first = mk_seal(13, 0, 1, 34_200, 100.0);
+        let mut bytes = first.to_bytes().to_vec();
+        bytes.extend_from_slice(&[0xAB; 40]); // the crash's partial record
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(writer.spill_path(now), &bytes).expect("seed torn file");
+        let second = mk_seal(25, 0, 1, 34_260, 200.0);
+        writer
+            .append_seal(&second, now)
+            .expect("append after the cut");
+        assert_eq!(
+            recorder.total.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the tear found at open must be counted"
+        );
+        assert_eq!(writer.read_all(now).expect("read"), vec![first, second]);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

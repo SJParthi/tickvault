@@ -95,6 +95,7 @@ fn test_seal_spill_dead_dlq_captures_every_overflow_zero_drop() {
             SubmitOutcome::Spilled => spilled += 1,
             SubmitOutcome::DlqWritten => dlq += 1,
             SubmitOutcome::Dropped(_) => dropped += 1,
+            SubmitOutcome::DroppedBelowFloor(_) => dropped += 1,
         }
     }
 

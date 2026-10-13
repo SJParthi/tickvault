@@ -1032,8 +1032,8 @@ const _: () = assert!(
 );
 
 /// Pre-register every `tier` label value of `tv_spill_free_probe_blind_total`
-/// at 0 (`tick`, `depth`, and since 2026-10-13 `top_volume`, the tier
-/// `SpillTier::TopVolume` counts under).
+/// at 0: `tick`, `depth`, `seal` (since deep audit DA-14) and `top_volume`
+/// (since 2026-10-13, the tier `SpillTier::TopVolume` counts under).
 ///
 /// That counter records rescues written WITHOUT a free-space answer, because
 /// the `df` probe failed. A per-write floor must NOT fail closed — one broken
@@ -1053,6 +1053,8 @@ const _: () = assert!(
 pub fn seed_spill_free_probe_blind_counters() {
     metrics::counter!("tv_spill_free_probe_blind_total", "tier" => "tick").increment(0);
     metrics::counter!("tv_spill_free_probe_blind_total", "tier" => "depth").increment(0);
+    // Deep audit DA-14: the seal escalation floor's blind writes.
+    metrics::counter!("tv_spill_free_probe_blind_total", "tier" => "seal").increment(0);
     metrics::counter!("tv_spill_free_probe_blind_total", "tier" => "top_volume").increment(0);
 }
 
@@ -7571,7 +7573,7 @@ mod tests {
             ))
             .map(|(_, rest)| rest.split_once("\n}").map_or(rest, |(b, _)| b))
             .unwrap_or_default();
-        for tier in ["\"tick\"", "\"depth\"", "\"top_volume\""] {
+        for tier in ["\"tick\"", "\"depth\"", "\"seal\"", "\"top_volume\""] {
             assert!(
                 body.contains(tier),
                 "the seeding function does not register the {tier} tier — the \
@@ -7581,8 +7583,8 @@ mod tests {
         }
         assert_eq!(
             body.matches("increment(0)").count(),
-            3,
-            "expected exactly three seeded label sets (tick, depth, top_volume)"
+            4,
+            "expected exactly four seeded label sets (tick, depth, seal, top_volume)"
         );
     }
 
