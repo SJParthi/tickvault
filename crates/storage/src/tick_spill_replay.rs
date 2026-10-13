@@ -361,17 +361,223 @@ pub fn is_depth_spill_dir(dir: &Path) -> bool {
     dir_label(dir) == dir_label(Path::new(crate::depth_persistence::DEPTH_SPILL_DIR))
 }
 
+/// Which session window replay applies to a spill directory's lines.
+///
+/// Added 2026-10-13 (top_volume spill plan item 5) to replace the ad-hoc
+/// per-directory check at the filter site. Each answer matches the WRITER
+/// that spilled the rows, so replay refuses exactly what the writer would.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayWindow {
+    /// Exchange-clocked rows (ticks, and any unknown folder): the strict gate.
+    Exchange,
+    /// Arrival-clocked rows (depth): the gate with its arrival grace tail.
+    Arrival,
+    /// No filter (top_volume): its writer has no session gate, and the
+    /// exchange gate would delete, for example, a Muhurat-evening board
+    /// replayed the next day (`muhurat::current()` is per process).
+    None,
+}
+
+/// When a spill directory's replay waits instead of posting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayHold {
+    /// Never held (ticks): the rescue tier must drain as soon as it can.
+    Never,
+    /// Held 08:00–15:40 IST ([`depth_replay_held_at`]); depth.
+    InSession,
+    /// Held until the `top_volume_<tf>` tables carry their DEDUP key in this
+    /// process (an ILP row could otherwise auto-create a keyless table), and
+    /// then 08:00–15:40 IST like depth (owner decision Q1, 2026-10-13).
+    KeyedThenInSession,
+}
+
+/// How one spill directory is replayed: chosen from the directory by
+/// [`replay_policy_for_dir`]. Ticks and depth map to exactly the behaviour
+/// they had before this type existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplayPolicy {
+    /// The `dir` label on the replay counters.
+    pub label: &'static str,
+    /// Session window applied to every line.
+    pub window: ReplayWindow,
+    /// When the round is held.
+    pub hold: ReplayHold,
+    /// Whether the round also drains length-framed depth files (`.dspl`).
+    pub framed_depth: bool,
+    /// A pending file whose hour is older than this many seconds is moved to
+    /// `quarantine/` instead of replayed (top_volume, owner decision Q4(b)).
+    /// `None` replays every file whatever its age.
+    pub max_file_age_secs: Option<u64>,
+}
+
+/// The replay policy of `dir`. O(1): one label lookup.
+#[must_use]
+pub fn replay_policy_for_dir(dir: &Path) -> ReplayPolicy {
+    let label = dir_label(dir);
+    let (window, hold, framed_depth) = match label {
+        "depth" => (ReplayWindow::Arrival, ReplayHold::InSession, true),
+        "top_volume" => (ReplayWindow::None, ReplayHold::KeyedThenInSession, false),
+        _ => (ReplayWindow::Exchange, ReplayHold::Never, false),
+    };
+    ReplayPolicy {
+        label,
+        window,
+        hold,
+        framed_depth,
+        max_file_age_secs: None,
+    }
+}
+
+/// Whether a round of `hold` waits at `secs_of_day_ist` given whether the
+/// top_volume tables are keyed. Pure. O(1).
+#[must_use]
+pub fn replay_held(hold: ReplayHold, secs_of_day_ist: u32, top_volume_keyed: bool) -> bool {
+    match hold {
+        ReplayHold::Never => false,
+        ReplayHold::InSession => depth_replay_held_at(secs_of_day_ist),
+        ReplayHold::KeyedThenInSession => {
+            !top_volume_keyed || depth_replay_held_at(secs_of_day_ist)
+        }
+    }
+}
+
+/// Days of slack between a top_volume spill file's age limit and the hot
+/// window after which its table's partitions can be archived and dropped.
+pub const TOP_VOLUME_REPLAY_AGE_SLACK_DAYS: u32 = 1;
+
+/// The age past which a top_volume spill file is set aside instead of
+/// replayed (owner decision Q4(b), 2026-10-13): the shortest hot window the
+/// archive applies to any `top_volume_<tf>` table (the same
+/// `hot_window_days` the archive calls, so the two cannot disagree) less
+/// [`TOP_VOLUME_REPLAY_AGE_SLACK_DAYS`], never below one day.
+///
+/// # Why
+///
+/// The archive drops a `top_volume_<tf>` day partition once its oldest row is
+/// older than the hot window. Rows are stamped in IST (5.5 h ahead of the
+/// wall clock in UTC), so a day partition holding a row written at `t` can be
+/// eligible from `t + (hot − 1) days + 5.5 h`. Setting a file aside at
+/// `hot − 1` days keeps it at least 5.5 h ahead of that, so a replay never
+/// writes into an hour whose cold copy was already taken. The file is kept in
+/// `quarantine/` (uploaded cold before any trim), never deleted. Pure. O(1).
+///
+/// ⚠ CHANGED 2026-10-13 (PR-C review, MEDIUM): when the disk-pressure archive
+/// is enabled, the window is the SMALLER of the normal and the pressure
+/// window. A pressure pass cuts market data to `pressure_hot_days` (2 by
+/// default) and archives top_volume hours by then, so with the normal window
+/// alone a file 2 to 14 days old was neither set aside nor protected and the
+/// 15:40 replay wrote into hours already dropped. A pressure pass can run at
+/// any time and its drops outlive the episode and a restart, so the smaller
+/// window applies whenever pressure archival can run, not only during an
+/// episode. Cost: with the shipped config (15-day window, pressure on, 2
+/// days) a file more than ONE day old is set aside rather than replayed;
+/// replay runs every evening, so only a spill QuestDB could not take for a
+/// whole day reaches that, and it is kept and copied cold, never deleted.
+#[must_use]
+pub fn top_volume_replay_max_age_secs(
+    cfg: &tickvault_common::config::PartitionRetentionConfig,
+) -> u64 {
+    let shortest = |c: &tickvault_common::config::PartitionRetentionConfig| {
+        crate::top_volume_rank_persistence::SnapshotCadence::ALL
+            .iter()
+            .map(|t| crate::partition_archive::hot_window_days(t.table_name(), c))
+            .min()
+            .unwrap_or(crate::partition_archive::MIN_HOT_DAYS)
+    };
+    let mut hot = shortest(cfg);
+    if cfg.pressure_archive_enabled {
+        // The same `min(configured, pressure)` the pressure leg applies
+        // (`disk_pressure_boot::pressure_config`) to the market-data class
+        // `top_volume_<tf>` belongs to.
+        let pressure_days = crate::disk_pressure::pressure_hot_days(cfg);
+        let pressure = tickvault_common::config::PartitionRetentionConfig {
+            market_data_hot_days: cfg.market_data_hot_days.min(pressure_days),
+            depth_hot_days: cfg.depth_hot_days.min(pressure_days),
+            intraday_hot_days: cfg.intraday_hot_days.min(pressure_days),
+            ..cfg.clone()
+        };
+        hot = hot.min(shortest(&pressure));
+    }
+    let days = hot.saturating_sub(TOP_VOLUME_REPLAY_AGE_SLACK_DAYS).max(1);
+    u64::from(days).saturating_mul(86_400)
+}
+
+/// Whether a spill file of hour `file_hour` is past `max_age_secs` at
+/// `now_unix_secs`: its hour STARTED more than `max_age_secs` ago. Pure. O(1).
+#[must_use]
+pub fn spill_file_older_than(file_hour: u64, max_age_secs: u64, now_unix_secs: u64) -> bool {
+    file_hour
+        .saturating_mul(SPILL_FILE_HOUR_SECS)
+        .saturating_add(max_age_secs)
+        < now_unix_secs
+}
+
+/// Moves every PENDING spill file of `dir` older than `max_age_secs` to
+/// `quarantine/` (top_volume, owner decision Q4(b)). A file that is drained,
+/// empty, unnamed by hour, or still being written (not closed and quiet) is
+/// left alone. Each move is counted on `tv_spill_replay_aged_set_aside_total`
+/// and logged once. Returns the files moved.
+///
+/// # Complexity
+/// O(files in `dir`): one listing and one `stat` per file, on the replay
+/// task's blocking round only.
+pub fn set_aside_aged_spill_files(dir: &Path, max_age_secs: u64, view: &SpillSinkView) -> u64 {
+    let label = dir_label(dir);
+    let mut moved: u64 = 0;
+    for path in list_spill_files(dir) {
+        let Some(hour) = spill_file_hour(&path) else {
+            continue;
+        };
+        if !spill_file_older_than(hour, max_age_secs, view.now_unix_secs) {
+            continue;
+        }
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if !spill_file_pending(&path, meta.len())
+            || !spill_file_closed_and_quiet(&path, &meta, view)
+        {
+            continue;
+        }
+        match quarantine_spill_file(dir, &path) {
+            Ok(target) => {
+                moved = moved.saturating_add(1);
+                metrics::counter!("tv_spill_replay_aged_set_aside_total", "dir" => label)
+                    .increment(1);
+                warn!(
+                    code = ErrorCode::TickSpill01FileQuarantined.code_str(),
+                    source = "spill_replay_aged_set_aside",
+                    dir = label,
+                    from = %path.display(),
+                    to = %target.display(),
+                    max_age_secs,
+                    "spill file is older than its table's hot window allows, so it was SET \
+                     ASIDE in quarantine instead of replayed: its hour may already be \
+                     archived and dropped, and a replay would recreate that hour with only \
+                     these rows. Kept on disk and copied to the cold bucket before any trim; \
+                     re-ingest by hand only after checking the cold archive of that hour."
+                );
+            }
+            Err(err) => note_spill_file_unreadable(&path, "spill_aged_set_aside_failed", &err),
+        }
+    }
+    moved
+}
+
 /// The spill ceiling of the directory `dir`: the depth ceiling for the depth
 /// spill directory, the tick ceiling otherwise. The quarantine trim takes its
 /// budget from the directory it trims (until 2026-10-02 the depth quarantine
 /// was trimmed against the tick ceiling). O(1) after each ceiling's first
 /// resolution.
+///
+/// ⚠ CHANGED 2026-10-13 (top_volume spill plan item 5): the top_volume
+/// folder takes its own hard ceiling.
 #[must_use]
 pub fn spill_max_bytes_for_dir(dir: &Path) -> u64 {
-    if is_depth_spill_dir(dir) {
-        crate::depth_persistence::depth_spill_max_bytes()
-    } else {
-        crate::tick_persistence::tick_spill_max_bytes()
+    match dir_label(dir) {
+        "depth" => crate::depth_persistence::depth_spill_max_bytes(),
+        "top_volume" => crate::top_volume_rank_persistence::top_volume_spill_max_bytes(),
+        _ => crate::tick_persistence::tick_spill_max_bytes(),
     }
 }
 
@@ -1112,6 +1318,9 @@ fn dir_label(dir: &Path) -> &'static str {
         "ticks"
     } else if p.ends_with("depth") {
         "depth"
+    } else if p.ends_with("top_volume") {
+        // 2026-10-13 (top_volume spill plan item 5): read "other" until then.
+        "top_volume"
     } else {
         "other"
     }
@@ -1165,6 +1374,17 @@ fn retain_lines_in_open_window(chunk: &[u8], is_arrival_clock: bool) -> (Vec<u8>
         }
     }
     (kept, dropped)
+}
+
+/// [`retain_lines_in_open_window`] on the clock `window` names, or no filter
+/// at all for [`ReplayWindow::None`] (top_volume, 2026-10-13). O(bytes).
+fn retain_lines_for_window(chunk: &[u8], window: ReplayWindow) -> (Vec<u8>, u64) {
+    match window {
+        ReplayWindow::Exchange => retain_lines_in_open_window(chunk, false),
+        ReplayWindow::Arrival => retain_lines_in_open_window(chunk, true),
+        // One copy, as the filter's own `kept` buffer is.
+        ReplayWindow::None => (chunk.to_vec(), 0),
+    }
 }
 
 /// True only when the line carries a parseable ILP timestamp that is BOTH a
@@ -1771,9 +1991,10 @@ pub async fn replay_spill_dir(
                 // `line_is_positively_out_of_window`); every other spill dir is
                 // exchange-clocked. Deciding it HERE, from the dir being drained,
                 // is what keeps replay in agreement with the writer that spilled it.
-                let is_arrival_clock = dir_label(dir)
-                    == dir_label(Path::new(crate::depth_persistence::DEPTH_SPILL_DIR));
-                let (chunk, refused_lines) = retain_lines_in_open_window(raw, is_arrival_clock);
+                // ⚠ CHANGED 2026-10-13 (top_volume spill plan item 5): chosen by
+                // `replay_policy_for_dir`; the top_volume folder gets no filter.
+                let (chunk, refused_lines) =
+                    retain_lines_for_window(raw, replay_policy_for_dir(dir).window);
                 refused_bytes =
                     refused_bytes.saturating_add(len.saturating_sub(chunk.len() as u64));
                 // Counted on a re-send too (2026-10-13 (DA-13b review)): a
@@ -2370,7 +2591,7 @@ pub const REPLAY_REQUEST_TIMEOUT_SECS: u64 = 60;
 ///
 /// Returns only if the HTTP client cannot be built, which the supervisor
 /// treats as a respawn-worthy exit.
-async fn run_replay_loop(dir: PathBuf, url: String, require_upload: bool) {
+async fn run_replay_loop(dir: PathBuf, url: String, require_upload: bool, policy: ReplayPolicy) {
     let client = match crate::http_client::build_probe_client(REPLAY_REQUEST_TIMEOUT_SECS) {
         Ok(client) => client,
         Err(err) => {
@@ -2384,9 +2605,20 @@ async fn run_replay_loop(dir: PathBuf, url: String, require_upload: bool) {
         }
     };
     register_replay_baseline();
-    let holds_in_session = is_depth_spill_dir(&dir);
+    // ⚠ CHANGED 2026-10-13 (top_volume spill plan item 5): the hold comes
+    // from the directory's `ReplayPolicy`. Depth is held in session exactly as
+    // before; the top_volume folder is also held until its tables are keyed.
+    let holds_in_session = policy.hold == ReplayHold::InSession;
     if holds_in_session {
         metrics::counter!("tv_depth_spill_replay_held_total").increment(0);
+    }
+    if policy.hold == ReplayHold::KeyedThenInSession {
+        metrics::counter!(SPILL_REPLAY_HELD_COUNTER, "dir" => policy.label, "reason" => "unkeyed")
+            .increment(0);
+        metrics::counter!(SPILL_REPLAY_HELD_COUNTER, "dir" => policy.label, "reason" => "in_session")
+            .increment(0);
+        metrics::counter!("tv_spill_replay_aged_set_aside_total", "dir" => policy.label)
+            .increment(0);
     }
     // One coded `warn!` per suspicion episode, not one per held round.
     let mut suspect_logged = false;
@@ -2436,10 +2668,20 @@ async fn run_replay_loop(dir: PathBuf, url: String, require_upload: bool) {
         let runtime = tokio::runtime::Handle::current();
         // The depth directory waits for the close (see `depth_replay_held_at`).
         // The quarantine trim below still runs every round.
-        let held = holds_in_session
-            && depth_replay_held_at(tickvault_common::market_hours::now_ist_secs_of_day());
-        if held {
+        let keyed = crate::top_volume_rank_persistence::TOP_VOLUME_TABLES_KEYED
+            .load(std::sync::atomic::Ordering::Acquire);
+        let held = replay_held(
+            policy.hold,
+            tickvault_common::market_hours::now_ist_secs_of_day(),
+            keyed,
+        );
+        if held && holds_in_session {
             metrics::counter!("tv_depth_spill_replay_held_total").increment(1);
+        }
+        if held && policy.hold == ReplayHold::KeyedThenInSession {
+            let reason = if keyed { "in_session" } else { "unkeyed" };
+            metrics::counter!(SPILL_REPLAY_HELD_COUNTER, "dir" => policy.label, "reason" => reason)
+                .increment(1);
         }
         // Audit DA-13b: while a QuestDB table is suspended (or its apply lag
         // grows, or the probe is blind), a 2xx is not proof the rows were
@@ -2469,7 +2711,15 @@ async fn run_replay_loop(dir: PathBuf, url: String, require_upload: bool) {
             suspect_logged = false;
         }
         let held_suspect = view.suspect;
+        let max_file_age_secs = policy.max_file_age_secs;
+        let framed_depth = policy.framed_depth;
         let round = tokio::task::spawn_blocking(move || {
+            // Owner decision Q4(b) (top_volume, 2026-10-13): a file too old
+            // for its table's hot window is set aside BEFORE any replay, on
+            // every round, held or not.
+            if let Some(max_age) = max_file_age_secs {
+                let _set_aside = set_aside_aged_spill_files(&round_dir, max_age, &view);
+            }
             let outcome = if held || held_suspect {
                 SpillReplayOutcome::default()
             } else {
@@ -2483,7 +2733,7 @@ async fn run_replay_loop(dir: PathBuf, url: String, require_upload: bool) {
                 // (plan item 49e, 2026-10-09). Older `.ilp` files drain first;
                 // a failed text round leaves the framed files for the next
                 // round, as any failure stops the round.
-                if holds_in_session && outcome.files_failed == 0 {
+                if framed_depth && outcome.files_failed == 0 {
                     outcome.absorb(runtime.block_on(
                         crate::depth_spill_frame::replay_framed_spill_dir(
                             &round_dir,
@@ -2563,10 +2813,71 @@ pub fn spawn_supervised_tick_spill_replay(
     http_port: u16,
     require_upload: bool,
 ) -> tokio::task::JoinHandle<()> {
-    let url = write_url(host, http_port);
+    let policy = replay_policy_for_dir(&dir);
+    spawn_supervised_spill_replay(dir, write_url(host, http_port), require_upload, policy)
+}
+
+/// The third supervised replay, for the top_volume spill folder
+/// ([`crate::top_volume_rank_persistence::TOP_VOLUME_SPILL_DIR`]; top_volume
+/// spill plan item 5, 2026-10-13). Same loop as ticks and depth with the
+/// top_volume [`ReplayPolicy`]: no window filter, held until the tables are
+/// keyed and then 08:00–15:40 IST, and a file older than
+/// [`top_volume_replay_max_age_secs`] set aside rather than replayed.
+///
+/// Trims the folder's quarantine once first, against its own ceiling, as the
+/// boot does for ticks (plan item 7). Spawned by the app on every boot, also
+/// with `[top_volume] spill_enabled = false`, so files already on disk are
+/// replayed and aged and never hold the archive forever (PR-C review).
+// TEST-EXEMPT: spawns the supervised loop; the policy it passes is asserted by test_top_volume_replay_holds_until_tables_are_keyed and test_top_volume_spawn_sets_the_age_limit_from_the_archive_window, and the boot call site by the app's top_volume spill wiring test.
+pub fn spawn_supervised_top_volume_spill_replay(
+    host: &str,
+    http_port: u16,
+    require_upload: bool,
+    retention: &tickvault_common::config::PartitionRetentionConfig,
+) -> tokio::task::JoinHandle<()> {
+    let dir = PathBuf::from(crate::top_volume_rank_persistence::TOP_VOLUME_SPILL_DIR);
+    let pruned = crate::tick_persistence::prune_quarantine(
+        &dir,
+        spill_max_bytes_for_dir(&dir),
+        require_upload,
+    );
+    if pruned > 0 {
+        warn!(
+            files = pruned,
+            "trimmed the top_volume quarantine directory to its share of its spill ceiling \
+             — see the preceding coded lines for each file"
+        );
+    }
+    let policy = top_volume_replay_policy(&dir, retention);
+    spawn_supervised_spill_replay(dir, write_url(host, http_port), require_upload, policy)
+}
+
+/// The top_volume folder's policy with its age limit set from `retention`.
+#[must_use]
+pub fn top_volume_replay_policy(
+    dir: &Path,
+    retention: &tickvault_common::config::PartitionRetentionConfig,
+) -> ReplayPolicy {
+    ReplayPolicy {
+        max_file_age_secs: Some(top_volume_replay_max_age_secs(retention)),
+        ..replay_policy_for_dir(dir)
+    }
+}
+
+fn spawn_supervised_spill_replay(
+    dir: PathBuf,
+    url: String,
+    require_upload: bool,
+    policy: ReplayPolicy,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            let handle = tokio::spawn(run_replay_loop(dir.clone(), url.clone(), require_upload));
+            let handle = tokio::spawn(run_replay_loop(
+                dir.clone(),
+                url.clone(),
+                require_upload,
+                policy,
+            ));
             let join_result = handle.await;
             let reason = if join_result.is_ok() {
                 "returned"
@@ -3265,7 +3576,7 @@ pub(crate) mod tests {
         // Structural: the supervisor must respawn and must say so with a code.
         let src = include_str!("tick_spill_replay.rs");
         let body = src
-            .split("pub fn spawn_supervised_tick_spill_replay")
+            .split("\nfn spawn_supervised_spill_replay(")
             .nth(1)
             .expect("the supervised spawn must exist");
         // The closing brace is written as an escape, not a literal: a bare one
@@ -3315,13 +3626,19 @@ pub(crate) mod tests {
             .nth(1)
             .expect("the replay loop must exist");
         let body = &body[..body.find("\n\u{7d}\n").unwrap_or(body.len())];
-        assert!(
-            body.contains("let holds_in_session = is_depth_spill_dir(&dir);"),
+        // 2026-10-13 (top_volume spill plan item 5): the hold is the policy's.
+        assert_eq!(
+            replay_policy_for_dir(Path::new(crate::depth_persistence::DEPTH_SPILL_DIR)).hold,
+            ReplayHold::InSession
+        );
+        assert_eq!(
+            replay_policy_for_dir(Path::new(crate::tick_persistence::TICK_SPILL_DIR)).hold,
+            ReplayHold::Never,
             "the hold must be scoped to the depth directory, never the tick one"
         );
         assert!(
-            body.contains("holds_in_session\n            && depth_replay_held_at("),
-            "a held round must consult the IST window"
+            body.contains("let held = replay_held(\n            policy.hold,"),
+            "a held round must consult the policy and the IST window"
         );
         assert!(
             body.contains("tv_depth_spill_replay_held_total"),
@@ -3807,6 +4124,42 @@ pub(crate) mod tests {
         );
         handle.abort();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The third drain (top_volume spill plan item 5) is supervised the same
+    /// way. Its folder is the production relative path, which does not exist
+    /// under the test's working directory, so every round finds nothing.
+    #[tokio::test]
+    async fn test_spawn_supervised_top_volume_spill_replay_starts_and_stays_running() {
+        let retention = tickvault_common::config::PartitionRetentionConfig::default();
+        let handle = spawn_supervised_top_volume_spill_replay("127.0.0.1", 1, true, &retention);
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!handle.is_finished(), "the supervisor must keep running");
+        handle.abort();
+    }
+
+    /// Names the three policy builders the replay uses, end to end.
+    #[test]
+    fn test_replay_policy_for_dir_top_volume_replay_policy_and_top_volume_replay_max_age_secs_agree()
+     {
+        let dir = Path::new(crate::top_volume_rank_persistence::TOP_VOLUME_SPILL_DIR);
+        let retention = tickvault_common::config::PartitionRetentionConfig::default();
+        let base = replay_policy_for_dir(dir);
+        let full = top_volume_replay_policy(dir, &retention);
+        assert_eq!(base.max_file_age_secs, None);
+        assert_eq!(
+            full.max_file_age_secs,
+            Some(top_volume_replay_max_age_secs(&retention))
+        );
+        assert_eq!(
+            ReplayPolicy {
+                max_file_age_secs: None,
+                ..full
+            },
+            base
+        );
+        assert!(top_volume_replay_max_age_secs(&retention) >= 86_400);
     }
 
     /// The permanent-vs-transient split IS the fix. A 5xx must still stop the
@@ -5680,5 +6033,317 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
             note_spill_file_unreadable(Path::new("/x/ticks-dhan-1.ilp"), "stat", &err);
         });
         assert_eq!(rec.total.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    // ---- top_volume spill plan item 5 (2026-10-13): the replay policy ------
+
+    #[test]
+    fn test_replay_policy_for_ticks_and_depth_is_unchanged() {
+        let ticks = replay_policy_for_dir(Path::new(crate::tick_persistence::TICK_SPILL_DIR));
+        assert_eq!(ticks.label, "ticks");
+        assert_eq!(ticks.window, ReplayWindow::Exchange);
+        assert_eq!(ticks.hold, ReplayHold::Never);
+        assert!(!ticks.framed_depth);
+        assert_eq!(ticks.max_file_age_secs, None);
+        let depth = replay_policy_for_dir(Path::new(crate::depth_persistence::DEPTH_SPILL_DIR));
+        assert_eq!(depth.label, "depth");
+        assert_eq!(depth.window, ReplayWindow::Arrival);
+        assert_eq!(depth.hold, ReplayHold::InSession);
+        assert!(
+            depth.framed_depth,
+            "only depth drains the framed .dspl files"
+        );
+        assert_eq!(depth.max_file_age_secs, None);
+        // An unknown folder keeps the old default: exchange clock, no hold.
+        let other = replay_policy_for_dir(Path::new("/tmp/whatever"));
+        assert_eq!(other.label, "other");
+        assert_eq!(other.window, ReplayWindow::Exchange);
+        assert_eq!(other.hold, ReplayHold::Never);
+        // The ceilings: top_volume has its own; the others are unchanged.
+        assert_eq!(
+            spill_max_bytes_for_dir(Path::new(
+                crate::top_volume_rank_persistence::TOP_VOLUME_SPILL_DIR
+            )),
+            crate::top_volume_rank_persistence::top_volume_spill_max_bytes()
+        );
+    }
+
+    #[test]
+    fn test_top_volume_replay_holds_until_tables_are_keyed() {
+        let tv = replay_policy_for_dir(Path::new(
+            crate::top_volume_rank_persistence::TOP_VOLUME_SPILL_DIR,
+        ));
+        assert_eq!(tv.label, "top_volume", "it read `other` before 2026-10-13");
+        assert_eq!(tv.window, ReplayWindow::None);
+        assert_eq!(tv.hold, ReplayHold::KeyedThenInSession);
+        assert!(!tv.framed_depth, "no pass over framed depth files");
+        // Truth table of the hold.
+        let noon = 12 * 3600;
+        let evening = 17 * 3600;
+        assert!(
+            replay_held(tv.hold, evening, false),
+            "unkeyed: held after the close"
+        );
+        assert!(replay_held(tv.hold, noon, false));
+        assert!(
+            replay_held(tv.hold, noon, true),
+            "keyed: held in session (Q1)"
+        );
+        assert!(
+            !replay_held(tv.hold, evening, true),
+            "keyed, after 15:40: drains"
+        );
+        assert!(
+            !replay_held(ReplayHold::Never, noon, false),
+            "ticks are never held"
+        );
+        assert!(replay_held(ReplayHold::InSession, noon, false));
+        assert!(!replay_held(ReplayHold::InSession, evening, false));
+    }
+
+    #[test]
+    fn test_top_volume_replay_hold_window_matches_depth() {
+        for secs in [
+            0,
+            8 * 3600 - 1,
+            8 * 3600,
+            12 * 3600,
+            56_400 - 1,
+            56_400,
+            86_399,
+        ] {
+            assert_eq!(
+                replay_held(ReplayHold::KeyedThenInSession, secs, true),
+                replay_held(ReplayHold::InSession, secs, true),
+                "keyed top_volume holds exactly when depth holds, at {secs}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_top_volume_replay_applies_no_window_filter() {
+        // A 22:00 IST stamp is outside every exchange window: ticks drop it,
+        // top_volume keeps it (Muhurat boards, E5).
+        let mut chunk = tick_line(12 * 3600);
+        chunk.push_str(&tick_line(22 * 3600));
+        let (kept, dropped) = retain_lines_for_window(chunk.as_bytes(), ReplayWindow::None);
+        assert_eq!(dropped, 0);
+        assert_eq!(kept, chunk.as_bytes());
+        let (_, dropped_ticks) = retain_lines_for_window(chunk.as_bytes(), ReplayWindow::Exchange);
+        assert_eq!(dropped_ticks, 1);
+        let src = include_str!("tick_spill_replay.rs");
+        let body = src
+            .split("pub async fn replay_spill_dir(")
+            .nth(1)
+            .expect("replay_spill_dir");
+        assert!(
+            body.contains("retain_lines_for_window(raw, replay_policy_for_dir(dir).window)"),
+            "the filter must follow the directory's policy"
+        );
+    }
+
+    #[test]
+    fn test_top_volume_spawn_sets_the_age_limit_from_the_archive_window() {
+        let mut cfg = tickvault_common::config::PartitionRetentionConfig::default();
+        cfg.market_data_hot_days = 35;
+        cfg.pressure_archive_enabled = false;
+        let hot = crate::partition_archive::hot_window_days(
+            crate::top_volume_rank_persistence::SnapshotCadence::OneSecond.table_name(),
+            &cfg,
+        );
+        assert_eq!(
+            hot, 35,
+            "top_volume tables archive on the market-data window"
+        );
+        assert_eq!(top_volume_replay_max_age_secs(&cfg), 34 * 86_400);
+        cfg.market_data_hot_days = 0;
+        // Floored at the archive's 2 days, less one: never below a day.
+        assert_eq!(top_volume_replay_max_age_secs(&cfg), 86_400);
+        let policy = top_volume_replay_policy(
+            Path::new(crate::top_volume_rank_persistence::TOP_VOLUME_SPILL_DIR),
+            &cfg,
+        );
+        assert_eq!(policy.max_file_age_secs, Some(86_400));
+        assert_eq!(policy.window, ReplayWindow::None);
+    }
+
+    /// Regression (2026-10-13 PR-C review, MEDIUM): a pressure pass cuts
+    /// market data to the pressure window, so the age limit follows the
+    /// smaller window whenever pressure archival is on; otherwise a file 2 to
+    /// 14 days old was replayed into hours the pressure leg had dropped.
+    #[test]
+    fn test_regression_top_volume_age_limit_follows_the_pressure_window() {
+        let mut cfg = tickvault_common::config::PartitionRetentionConfig::default();
+        cfg.market_data_hot_days = 15;
+        cfg.pressure_hot_days = 2;
+        cfg.pressure_archive_enabled = false;
+        assert_eq!(top_volume_replay_max_age_secs(&cfg), 14 * 86_400);
+        cfg.pressure_archive_enabled = true;
+        assert_eq!(
+            top_volume_replay_max_age_secs(&cfg),
+            86_400,
+            "pressure archives top_volume at 2 days, so files older than 1 day are set aside"
+        );
+        cfg.pressure_hot_days = 5;
+        assert_eq!(top_volume_replay_max_age_secs(&cfg), 4 * 86_400);
+        cfg.pressure_hot_days = 0;
+        assert_eq!(
+            top_volume_replay_max_age_secs(&cfg),
+            86_400,
+            "the pressure window is floored at 2 days, so never below one day"
+        );
+        // Pressure only ever shortens: a pressure window above the normal one
+        // changes nothing.
+        cfg.pressure_hot_days = 40;
+        assert_eq!(top_volume_replay_max_age_secs(&cfg), 14 * 86_400);
+    }
+
+    #[test]
+    fn test_spill_file_older_than_is_measured_from_the_hour_start() {
+        let day = 86_400;
+        let hour = 1_000_u64;
+        let start = hour * SPILL_FILE_HOUR_SECS;
+        assert!(
+            !spill_file_older_than(hour, day, start + day),
+            "exactly at the limit: kept"
+        );
+        assert!(spill_file_older_than(hour, day, start + day + 1));
+        assert!(
+            !spill_file_older_than(hour, day, start),
+            "a current file is never old"
+        );
+        assert!(
+            !spill_file_older_than(u64::MAX, day, u64::MAX),
+            "saturates, no panic"
+        );
+    }
+
+    #[test]
+    fn test_set_aside_aged_spill_files_moves_only_old_pending_closed_files() {
+        let dir = temp_dir("q4b-aged").join("top_volume");
+        std::fs::create_dir_all(&dir).expect("mkdir"); // APPROVED: test
+        let now = SpillSinkView::current().now_unix_secs;
+        let this_hour = now / SPILL_FILE_HOUR_SECS;
+        let old = dir.join(format!("top_volume-dhan-{}.ilp", this_hour - 48));
+        let old_empty = dir.join(format!("top_volume-dhan-{}.ilp", this_hour - 47));
+        let fresh = dir.join(format!("top_volume-dhan-{this_hour}.ilp"));
+        std::fs::write(&old, GOOD_LINE).expect("write"); // APPROVED: test
+        std::fs::write(&old_empty, b"").expect("write"); // APPROVED: test
+        std::fs::write(&fresh, GOOD_LINE).expect("write"); // APPROVED: test
+        let mut view = test_spill_view();
+        view.now_unix_secs = now + 600;
+        // Written just now: not yet quiet, so even the old-named file stays.
+        let mut early = view;
+        early.now_unix_secs = now;
+        assert_eq!(set_aside_aged_spill_files(&dir, 86_400, &early), 0);
+        assert_eq!(set_aside_aged_spill_files(&dir, 86_400, &view), 1);
+        assert!(!old.exists(), "the old pending file is set aside");
+        assert!(
+            dir.join(QUARANTINE_DIR)
+                .join(old.file_name().expect("name"))
+                .exists()
+        );
+        assert!(old_empty.exists(), "an empty file has nothing to replay");
+        assert!(
+            fresh.exists(),
+            "a file inside the age limit is replayed, not moved"
+        );
+        let _ = std::fs::remove_dir_all(dir.parent().expect("parent"));
+    }
+
+    /// Answers 204 to every POST and records each body.
+    async fn spawn_recording_server() -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind"); // APPROVED: test
+        let addr = listener.local_addr().expect("addr"); // APPROVED: test
+        let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::clone(&bodies);
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut req: Vec<u8> = Vec::new();
+                let mut buf = vec![0_u8; 65536];
+                let mut body_start = None;
+                let mut content_len = 0_usize;
+                loop {
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    req.extend_from_slice(&buf[..n]);
+                    if body_start.is_none()
+                        && let Some(i) = req.windows(4).position(|w| w == b"\r\n\r\n")
+                    {
+                        body_start = Some(i + 4);
+                        let head = String::from_utf8_lossy(&req[..i]).to_ascii_lowercase();
+                        content_len = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse().ok())
+                            .unwrap_or(0);
+                    }
+                    if let Some(start) = body_start
+                        && req.len() >= start + content_len
+                    {
+                        break;
+                    }
+                }
+                let start = body_start.unwrap_or(req.len()).min(req.len());
+                seen.lock().expect("lock").push(req[start..].to_vec()); // APPROVED: test
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (format!("http://{addr}/write"), bodies, handle)
+    }
+
+    #[tokio::test]
+    async fn test_replayed_top_volume_rows_upsert_onto_themselves() {
+        // E1: a re-POST of the same file sends identical bodies, so the
+        // DEDUP key `(ts, tf, family, feed, security_id, segment)` upserts
+        // the second write onto the first. And E5: a 22:00 IST board line is
+        // posted, never filtered.
+        let dir = temp_dir("tv-replay-upsert").join("top_volume");
+        std::fs::create_dir_all(&dir).expect("mkdir"); // APPROVED: test
+        let path = dir.join("top_volume-dhan-1.ilp");
+        let mut body = String::new();
+        for secs in [9 * 3600 + 30, 22 * 3600] {
+            body.push_str(&format!(
+                "top_volume_1s,tf=1s,family=stock_option,feed=dhan,segment=NSE_FNO \
+                 security_id=7i,total_lots_traded=3i {}\n",
+                ist_at(secs)
+            ));
+        }
+        std::fs::write(&path, body.as_bytes()).expect("write"); // APPROVED: test
+        let (url, bodies, server) = spawn_recording_server().await;
+        let client = crate::http_client::build_probe_client(5).expect("client"); // APPROVED: test
+        let view = test_spill_view();
+        let first = replay_spill_dir(&dir, &url, &client, &view).await;
+        assert_eq!(first.files_failed, 0);
+        forget_resume_offset(&path);
+        let second = replay_spill_dir(&dir, &url, &client, &view).await;
+        assert_eq!(second.files_failed, 0);
+        let posted = bodies.lock().expect("lock").clone(); // APPROVED: test
+        assert_eq!(posted.len(), 2, "one POST per round");
+        assert_eq!(posted[0], posted[1], "the re-send is byte-identical");
+        assert_eq!(
+            posted[0],
+            body.as_bytes(),
+            "nothing filtered, nothing reordered"
+        );
+        server.abort();
+        let _ = std::fs::remove_dir_all(dir.parent().expect("parent"));
     }
 }
