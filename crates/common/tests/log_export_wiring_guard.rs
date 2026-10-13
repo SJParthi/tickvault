@@ -244,8 +244,11 @@ fn the_subscription_role_can_only_put_records_into_the_two_streams() {
     }
     let trust = resource_block(&src, "aws_iam_role", "logs_to_firehose");
     for needed in [
+        "StringLike",
         "\"aws:SourceArn\"",
-        "log-group:${aws_cloudwatch_log_group.tv_app.name}*\"",
+        "StringEquals = { \"aws:SourceAccount\" = data.aws_caller_identity.current.account_id }",
+        "log-group:${aws_cloudwatch_log_group.tv_app.name}\"",
+        "log-group:${aws_cloudwatch_log_group.tv_app.name}:*\"",
         "log-group:/aws/lambda/tv-${var.environment}-*\"",
     ] {
         assert!(
@@ -271,8 +274,22 @@ fn test_regression_trust_policy_stays_under_the_role_size_limit() {
     );
     let arns = trust.matches("arn:aws:logs:").count();
     assert_eq!(
-        arns, 2,
-        "the trust condition must hold exactly the two prefix patterns:\n{trust}"
+        arns, 3,
+        "the trust condition must hold exactly the app group (two forms) and the \
+         Lambda prefix:\n{trust}"
+    );
+    // Region and account are always pinned: a wildcard there would let a
+    // log group in any region or account use the role.
+    let pinned = trust
+        .matches("arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:")
+        .count();
+    assert_eq!(
+        pinned, arns,
+        "every source ARN must pin region and account:\n{trust}"
+    );
+    assert!(
+        !trust.contains("app*\""),
+        "the app log group must be named exactly, not as a prefix:\n{trust}"
     );
 }
 
