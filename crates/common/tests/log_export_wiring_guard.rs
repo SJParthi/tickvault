@@ -243,10 +243,121 @@ fn the_subscription_role_can_only_put_records_into_the_two_streams() {
         );
     }
     let trust = resource_block(&src, "aws_iam_role", "logs_to_firehose");
+    for needed in [
+        "\"aws:SourceArn\"",
+        "log-group:${aws_cloudwatch_log_group.tv_app.name}*\"",
+        "log-group:/aws/lambda/tv-${var.environment}-*\"",
+    ] {
+        assert!(
+            trust.contains(needed),
+            "the subscription role must trust only the app log group and this \
+             environment's Lambda log groups ({needed:?} missing):\n{trust}"
+        );
+    }
+}
+
+// Regression: 2026-10-12 — every terraform apply failed creating
+// tv-prod-logs-to-firehose: "Cannot exceed quota for ACLSizePerRole: 2048".
+// The trust policy listed two ARNs for each of the 13 exported log groups.
+// The condition must stay a fixed, short list of prefix patterns.
+#[test]
+fn test_regression_trust_policy_stays_under_the_role_size_limit() {
+    let src = read(LOG_EXPORT_TF);
+    let trust = resource_block(&src, "aws_iam_role", "logs_to_firehose");
     assert!(
-        trust.contains("\"aws:SourceArn\"") && trust.contains("local.log_export_source_groups"),
-        "the subscription role must trust only the exported log groups:\n{trust}"
+        !trust.contains("for group in") && !trust.contains("flatten("),
+        "the trust condition must not expand one ARN per log group: AWS caps a \
+         role's trust policy at 2,048 characters:\n{trust}"
     );
+    let arns = trust.matches("arn:aws:logs:").count();
+    assert_eq!(
+        arns, 2,
+        "the trust condition must hold exactly the two prefix patterns:\n{trust}"
+    );
+}
+
+/// The resource names in `local.lambda_log_export_groups`.
+fn exported_lambda_group_resources(export_src: &str) -> Vec<String> {
+    let code = strip_comments(export_src);
+    let start = code
+        .find("lambda_log_export_groups = {")
+        .unwrap_or_else(|| panic!("{LOG_EXPORT_TF} must declare lambda_log_export_groups")); // APPROVED: test
+    let body = &code[start..];
+    let body = &body[..body.find("\n  }").unwrap_or(body.len())];
+    body.lines()
+        .filter_map(|l| l.split("aws_cloudwatch_log_group.").nth(1))
+        .filter_map(|rest| rest.split(".name").next())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The literal `name = "..."` of `resource "aws_cloudwatch_log_group" "<res>"`.
+fn log_group_literal_name(res: &str) -> Option<String> {
+    let dir = workspace_root().join(TF_DIR);
+    let header = format!("resource \"aws_cloudwatch_log_group\" \"{res}\"");
+    for entry in fs::read_dir(&dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("tf") {
+            continue;
+        }
+        let src = strip_comments(&fs::read_to_string(&path).unwrap_or_default());
+        let Some(at) = src.find(&header) else {
+            continue;
+        };
+        return src[at..]
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("name"))
+            .and_then(|rest| rest.trim_start().strip_prefix('='))
+            .and_then(|rest| rest.trim().strip_prefix('"'))
+            .and_then(|rest| rest.split('"').next())
+            .map(str::to_owned);
+    }
+    None
+}
+
+/// Whether a Lambda log group's terraform name falls under the trust
+/// condition's `/aws/lambda/tv-${var.environment}-*` pattern. Two groups in
+/// budget-guards.tf spell the environment as the literal `prod`, which is the
+/// same name in the only environment deployed.
+fn matches_lambda_trust_prefix(name: &str) -> bool {
+    name.starts_with("/aws/lambda/tv-${var.environment}-")
+        || name.starts_with("/aws/lambda/tv-prod-")
+}
+
+#[test]
+fn every_exported_lambda_group_matches_the_trust_prefix() {
+    let resources = exported_lambda_group_resources(&read(LOG_EXPORT_TF));
+    assert!(
+        resources.len() >= 12,
+        "found only {} exported Lambda groups; the parser has probably stopped \
+         matching: {resources:?}",
+        resources.len()
+    );
+    for res in &resources {
+        let name = log_group_literal_name(res)
+            .unwrap_or_else(|| panic!("no literal name for aws_cloudwatch_log_group.{res}")); // APPROVED: test
+        assert!(
+            matches_lambda_trust_prefix(&name),
+            "aws_cloudwatch_log_group.{res} is named {name:?}, outside the \
+             subscription role's trust pattern /aws/lambda/tv-<env>-*: its \
+             subscription filter could not assume the role and its logs would \
+             never reach S3"
+        );
+    }
+}
+
+#[test]
+fn bite_a_lambda_group_outside_the_prefix_is_caught() {
+    assert!(matches_lambda_trust_prefix(
+        "/aws/lambda/tv-${var.environment}-start-watchdog"
+    ));
+    assert!(matches_lambda_trust_prefix(
+        "/aws/lambda/tv-prod-hard-stop-guard"
+    ));
+    assert!(!matches_lambda_trust_prefix("/aws/lambda/start-watchdog"));
+    assert!(!matches_lambda_trust_prefix(
+        "/tickvault/${var.environment}/app"
+    ));
 }
 
 #[test]
