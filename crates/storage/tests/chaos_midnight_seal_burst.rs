@@ -99,6 +99,7 @@ impl Tally {
             SubmitOutcome::Spilled => self.spilled += 1,
             SubmitOutcome::DlqWritten => self.dlq += 1,
             SubmitOutcome::Dropped(_) => self.dropped += 1,
+            SubmitOutcome::DroppedBelowFloor(_) => self.dropped += 1,
         }
     }
 
