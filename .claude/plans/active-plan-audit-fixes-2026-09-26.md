@@ -3031,6 +3031,17 @@ and a call site; shell may only shrink. One PR per item, serial.
   CLOCK-2, CRASH-2, QDB-3, QDB-6, RET-2, RET-3, RET-4, RET-5, RET-6, RET-7, OBS-11). `storage`, `app`.
 - [ ] **DA-14 — The candle disk floor keeps what can be kept and says why** (DISK-1, DISK-2,
   DISK-3, DISK-5, DISK-6, DISK-7, DISK-8, HOT-8, CRASH-1 partial, tail HOT-2 limit row). `storage`.
+- [x] **DA-22 — The after-close depth pass runs while the disk shed is on** (found live
+  2026-10-13). `app`. On 2026-10-12 the disk shed turned on at 09:52 IST (used 80%) and stayed on
+  all evening; 51.4M main-feed depth packets were deferred and the after-close pass, which paused
+  whenever the shed was on, wrote 0 rows (`stop=Deadline`), so the pinned WAL segments kept
+  filling the disk the pass would have freed. `after_close_step` and `live_signals` no longer read
+  `INGEST_SHED` (after 15:40 the shed controls nothing live; the pass still pauses on apply-lag
+  growth and a suspect sink); the pass stops at `AFTER_CLOSE_DISK_FLOOR_FREE_FRACTION` (8%, above
+  the 5% pinned-delete floor) with `PassStop::DiskFloor`, a WS-SPILL-01 `warn!` (log-only) and
+  `tv_wal_deferred_depth_pass_total{outcome="disk_floor"}`. Honest limit: one evening clears an
+  estimated ~30% of a fully shed day (Assumed, not measured); the marks carry the rest to later
+  evenings.
 - [ ] **DA-15 — The frame drain's timers cannot starve; small drain fixes** (HOT-11, tail HOT-4,
   tail HOT-9, CR-8, HOT-16, SCALE-7, INP-2, HOT-17, tail HOT-6, SCALE-3 limit, HOT-9 limit row,
   NT-2, NT-3, NT-4). `app`, `core`, `trading`, `common`.
