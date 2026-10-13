@@ -268,17 +268,56 @@ pub const SEAL_DLQ_SYNC_FAILED_COUNTER: &str = "tv_seal_dlq_sync_failed_total";
 /// and counts. Local `/metrics` only, registered at 0 at boot.
 pub const SEAL_DLQ_TORN_LINE_CLOSED_COUNTER: &str = "tv_seal_dlq_torn_line_closed_total";
 
-/// Whether `file` ends with a newline. One seek and a 1-byte read; an empty
-/// file counts as ending cleanly. The append position is unaffected: the file
-/// is opened in append mode, so every write still lands at the end.
-fn ends_with_newline(file: &mut std::fs::File) -> std::io::Result<bool> {
-    if file.seek(SeekFrom::End(0))? == 0 {
-        return Ok(true);
+/// How a DLQ file ends (deep audit DA-14).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LastLine {
+    /// Empty, or ends with a newline.
+    Terminated,
+    /// Ends in a complete record that lacks only its newline.
+    CompleteUnterminated,
+    /// Ends in a partial line: one candle the replay will refuse.
+    Torn,
+}
+
+/// The longest last line read back: far above any real record (a few
+/// hundred bytes), so a longer unterminated tail is torn by definition.
+const DLQ_LAST_LINE_PROBE_BYTES: usize = 4_096;
+
+/// Classifies how `file` (of length `len`) ends. Reads at most
+/// [`DLQ_LAST_LINE_PROBE_BYTES`] from the end into a stack buffer: one seek
+/// and one bounded read, no allocation unless the last line must be parsed.
+/// The append position is unaffected: the file is opened in append mode, so
+/// every write still lands at the end.
+fn read_unterminated_last_line(file: &mut std::fs::File, len: u64) -> std::io::Result<LastLine> {
+    if len == 0 {
+        return Ok(LastLine::Terminated);
     }
-    file.seek(SeekFrom::End(-1))?;
-    let mut last = [0u8; 1];
-    file.read_exact(&mut last)?;
-    Ok(last[0] == b'\n')
+    let probe = len.min(DLQ_LAST_LINE_PROBE_BYTES as u64);
+    file.seek(SeekFrom::Start(len - probe))?;
+    let mut buf = [0u8; DLQ_LAST_LINE_PROBE_BYTES];
+    let tail = &mut buf[..probe as usize];
+    file.read_exact(tail)?;
+    if tail.last() == Some(&b'\n') {
+        return Ok(LastLine::Terminated);
+    }
+    let Some(newline) = tail.iter().rposition(|byte| *byte == b'\n') else {
+        // No newline in the probe: either the whole file is one unterminated
+        // line no longer than the probe, or the line is longer than any
+        // record and therefore torn.
+        if len > probe {
+            return Ok(LastLine::Torn);
+        }
+        return Ok(classify_last_line(tail));
+    };
+    Ok(classify_last_line(&tail[newline + 1..]))
+}
+
+/// A complete record parses; anything else is a torn line.
+fn classify_last_line(line: &[u8]) -> LastLine {
+    match serde_json::from_slice::<SealDlqRecord>(line) {
+        Ok(_) => LastLine::CompleteUnterminated,
+        Err(_) => LastLine::Torn,
+    }
 }
 
 /// Append-only NDJSON DLQ writer. One instance lives in the writer
@@ -295,6 +334,23 @@ pub struct SealDlqWriter {
     /// Edge latch for the sync-failure `error!`: one line per failing
     /// episode, cleared by the next clean sync.
     sync_failing: AtomicBool,
+    /// Serialises a whole append (deep audit DA-14 review): the stat, the
+    /// last-line check, the close of a torn line, the write and the cut-back
+    /// of a failed write. Every `Arc` handle (the seal writer, the escalation
+    /// thread, the frame drain's inline fallback) shares this one writer, so
+    /// one lock covers every appender in the process. Without it, one
+    /// appender's cut-back to the length IT saw could delete a record another
+    /// had just written and reported. Never held across a sync; the DLQ is
+    /// the last tier of a failure path, so it is uncontended in the steady
+    /// state (nothing is written to it at all).
+    append_lock: Mutex<()>,
+    /// Test-only one-shot failure: the next line write lands this many bytes,
+    /// waits, then fails as a full disk does (deep audit DA-14 review).
+    #[cfg(test)]
+    fail_next_write_after: Mutex<Option<usize>>,
+    /// Test-only: set once the armed write has landed its partial bytes.
+    #[cfg(test)]
+    failing_write_started: AtomicBool,
 }
 
 /// What [`SealDlqWriter::sync_written`] still has to sync. Two day slots
@@ -345,6 +401,11 @@ impl SealDlqWriter {
             dlq_dir: dir,
             unsynced: Mutex::new(DlqUnsynced::default()),
             sync_failing: AtomicBool::new(false),
+            append_lock: Mutex::new(()),
+            #[cfg(test)]
+            fail_next_write_after: Mutex::new(None),
+            #[cfg(test)]
+            failing_write_started: AtomicBool::new(false),
         }
     }
 
@@ -452,11 +513,16 @@ impl SealDlqWriter {
     /// `error!(code = ErrorCode::AggregatorDrop01.code_str())` per
     /// the AGGREGATOR-DROP-01 runbook.
     pub fn append_record(&self, record: &SealDlqRecord, now_unix_secs: i64) -> Result<()> {
+        // Serialised end to end (deep audit DA-14 review): see `append_lock`.
+        let _append = self
+            .append_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let created_dir = !self.dlq_dir.is_dir();
         std::fs::create_dir_all(&self.dlq_dir)
             .with_context(|| format!("failed to create dlq dir {:?}", self.dlq_dir))?;
         let path = self.dlq_path(now_unix_secs);
-        // Read access too (deep audit DA-14): the last byte is checked below.
+        // Read access too (deep audit DA-14): the last line is checked below.
         // `append` still puts every write at the end, whatever the position.
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -480,34 +546,48 @@ impl SealDlqWriter {
             unsynced.parent |= created_dir;
         }
         // Deep audit DA-14 (CRASH-1 partial): a file that does not end in a
-        // newline ends in a line a process died writing. Appending straight
-        // after it glued the NEXT record onto that fragment, so the replay
-        // refused both as one undecodable line and lost a record this call had
-        // reported written. The fragment is closed with a newline first: it
-        // stays a refused line on its own, and the record below stays whole.
-        // One seek and one 1-byte read per append; the DLQ is the last tier
-        // of a failure path, never the steady state.
-        if before > 0 && !ends_with_newline(&mut file)? {
+        // newline ends in a line a process died writing (no appender of this
+        // process can be mid-write: they all hold `append_lock`). Appending
+        // straight after it glued the NEXT record onto that fragment, so the
+        // replay refused both as one line and lost a record this call had
+        // reported written. The line is closed with a newline first. It is
+        // counted as a refused candle only when it does not parse: a complete
+        // record that only lacks its newline is closed and replays.
+        let mut base = before;
+        let last_line = read_unterminated_last_line(&mut file, before)?;
+        if last_line != LastLine::Terminated {
             file.write_all(b"\n")
                 .with_context(|| format!("failed to close a torn dlq line in {path:?}"))?;
-            metrics::counter!(SEAL_DLQ_TORN_LINE_CLOSED_COUNTER).increment(1);
-            error!(
-                code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
-                source = "seal_dlq_torn_line",
-                ?path,
-                "seal DLQ: the file ended in a partial line (a process died mid-write); \
-                 it is closed with a newline so the next record is not glued to it. The \
-                 partial line is one candle the replay will refuse and count"
-            );
+            base = before.saturating_add(1);
+            if last_line == LastLine::Torn {
+                metrics::counter!(SEAL_DLQ_TORN_LINE_CLOSED_COUNTER).increment(1);
+                error!(
+                    code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                    source = "seal_dlq_torn_line",
+                    ?path,
+                    "seal DLQ: the file ended in a partial line (a process died mid-write); \
+                     it is closed with a newline so the next record is not glued to it. The \
+                     partial line is one candle the replay will refuse and count"
+                );
+            } else {
+                info!(
+                    source = "seal_dlq_torn_line",
+                    ?path,
+                    "seal DLQ: the last record was complete but lacked its newline; closed \
+                     so the next record is not glued to it (it replays normally)"
+                );
+            }
         }
         let mut line = serde_json::to_string(record)
             .with_context(|| "failed to serialise SealDlqRecord to JSON")?;
         line.push('\n');
-        // One write of the whole line. On failure the file is cut back to its
-        // length before this call (deep audit DA-14), so a line the disk took
-        // only part of is not left behind for the next record to glue onto.
-        if let Err(err) = file.write_all(line.as_bytes()) {
-            let cut = file.set_len(before);
+        // One write of the whole line. On failure the file is cut back to
+        // `base`, its length before this record (after the newline that
+        // closed a torn line, which is never removed again, so a fragment is
+        // closed and counted once). Under `append_lock`, so the cut cannot
+        // reach another appender's record.
+        if let Err(err) = self.write_line(&mut file, line.as_bytes()) {
+            let cut = file.set_len(base);
             return match cut {
                 Ok(()) => Err(err)
                     .with_context(|| format!("failed to write dlq line to {path:?} (cut back)")),
@@ -520,6 +600,41 @@ impl SealDlqWriter {
             };
         }
         Ok(())
+    }
+
+    /// The one `write(2)` of a DLQ line. In tests an armed one-shot lands only
+    /// part of the line, waits so concurrent appenders get every chance to
+    /// run, then fails as a full disk does.
+    fn write_line(&self, file: &mut std::fs::File, bytes: &[u8]) -> std::io::Result<()> {
+        // Taken in its own statement, so the hook's mutex is released before
+        // the sleep: held across it, the hook itself would serialise the
+        // appenders and hide a missing `append_lock`.
+        #[cfg(test)]
+        let armed = self
+            .fail_next_write_after
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        #[cfg(test)]
+        if let Some(landed) = armed {
+            file.write_all(&bytes[..landed.min(bytes.len())])?;
+            self.failing_write_started.store(true, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                "test: the disk took only part of the line",
+            ));
+        }
+        file.write_all(bytes)
+    }
+
+    /// Test hook: the next line write lands `bytes` bytes and then fails.
+    #[cfg(test)]
+    pub(crate) fn fail_next_write_after_for_test(&self, bytes: usize) {
+        *self
+            .fail_next_write_after
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(bytes);
     }
 
     /// Drains the daily DLQ file by reading every line into the
@@ -1373,5 +1488,223 @@ mod tests {
 
         assert_eq!(dlq_bytes_at(&dir), 1000, "only .ndjson records count");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- deep audit DA-14 review: the DLQ append is serialised ----------
+
+    /// Counts one counter name through a recorder scoped with
+    /// `metrics::with_local_recorder` (never a global install).
+    struct TornLineRecorder {
+        total: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    struct TornLineCounter {
+        total: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl metrics::CounterFn for TornLineCounter {
+        fn increment(&self, value: u64) {
+            self.total
+                .fetch_add(value, std::sync::atomic::Ordering::Relaxed);
+        }
+        fn absolute(&self, _: u64) {}
+    }
+
+    impl metrics::Recorder for TornLineRecorder {
+        fn describe_counter(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_gauge(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_histogram(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn register_counter(
+            &self,
+            key: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            if key.name() == SEAL_DLQ_TORN_LINE_CLOSED_COUNTER {
+                metrics::Counter::from_arc(std::sync::Arc::new(TornLineCounter {
+                    total: std::sync::Arc::clone(&self.total),
+                }))
+            } else {
+                metrics::Counter::noop()
+            }
+        }
+        fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            metrics::Gauge::noop()
+        }
+        fn register_histogram(
+            &self,
+            _: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
+    fn da14_now() -> i64 {
+        chrono::Utc
+            .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
+            .single()
+            .expect("valid")
+            .timestamp()
+    }
+
+    #[test]
+    fn test_fail_next_write_after_for_test_fails_exactly_one_write() {
+        let dir = temp_dlq_dir("da14-one-shot");
+        let writer = SealDlqWriter::with_dlq_dir_for_test(dir.clone());
+        let now = da14_now();
+        let record = SealDlqRecord::from(&mk_serialized_seal(13, 0, 0, 1_716_000_900, 1.0));
+        writer.fail_next_write_after_for_test(5);
+        assert!(writer.append_record(&record, now).is_err());
+        writer.append_record(&record, now).expect("one shot only");
+        assert_eq!(writer.read_all(now).expect("read"), vec![record]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// One appender's failed write cuts back only its own partial line:
+    /// records other threads append meanwhile, and were told were written,
+    /// all survive. Without the append lock the cut-back to the length the
+    /// failing appender saw deleted them.
+    #[test]
+    fn test_regression_da14_failed_dlq_write_never_cuts_another_appenders_record() {
+        let dir = temp_dlq_dir("da14-concurrent-cut");
+        let writer = std::sync::Arc::new(SealDlqWriter::with_dlq_dir_for_test(dir.clone()));
+        let now = da14_now();
+        writer
+            .append_record(
+                &SealDlqRecord::from(&mk_serialized_seal(1, 0, 0, 1_716_000_900, 1.0)),
+                now,
+            )
+            .expect("first record");
+        writer.fail_next_write_after_for_test(20);
+        let failing = {
+            let writer = std::sync::Arc::clone(&writer);
+            std::thread::spawn(move || {
+                writer.append_record(
+                    &SealDlqRecord::from(&mk_serialized_seal(2, 0, 0, 1_716_000_900, 2.0)),
+                    now,
+                )
+            })
+        };
+        // Start the others only once the failing append holds its partial
+        // line, so the one-shot cannot be taken by another thread.
+        let started = std::time::Instant::now();
+        while !writer
+            .failing_write_started
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            assert!(started.elapsed() < std::time::Duration::from_secs(10));
+            std::thread::yield_now();
+        }
+        let mut appenders = Vec::new();
+        for thread in 0..3u64 {
+            let writer = std::sync::Arc::clone(&writer);
+            appenders.push(std::thread::spawn(move || {
+                let mut written = 0usize;
+                for i in 0..40u64 {
+                    let sid = 100 + thread * 1_000 + i;
+                    let record =
+                        SealDlqRecord::from(&mk_serialized_seal(sid, 0, 0, 1_716_000_900, 3.0));
+                    if writer.append_record(&record, now).is_ok() {
+                        written += 1;
+                    }
+                }
+                written
+            }));
+        }
+        assert!(
+            failing.join().expect("join").is_err(),
+            "the armed write fails"
+        );
+        let written: usize = appenders.into_iter().map(|h| h.join().expect("join")).sum();
+        assert_eq!(written, 120, "every other append succeeded");
+        let drained = writer.read_all(now).expect("read");
+        assert_eq!(
+            drained.len(),
+            1 + written,
+            "every record reported written must replay; the failed one must not"
+        );
+        assert!(drained.iter().all(|record| record.security_id != 2));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A torn line is closed and counted ONCE: a failed append after the
+    /// close cuts back to just past the closing newline, so the next append
+    /// finds the line closed and does not count it again.
+    #[test]
+    fn test_regression_da14_torn_line_is_counted_once_across_a_failed_append() {
+        let dir = temp_dlq_dir("da14-count-once");
+        let recorder = TornLineRecorder {
+            total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        let writer = SealDlqWriter::with_dlq_dir_for_test(dir.clone());
+        let now = da14_now();
+        let r1 = SealDlqRecord::from(&mk_serialized_seal(13, 0, 0, 1_716_000_900, 100.0));
+        let r2 = SealDlqRecord::from(&mk_serialized_seal(25, 0, 4, 1_716_001_500, 200.0));
+        let r3 = SealDlqRecord::from(&mk_serialized_seal(51, 0, 4, 1_716_001_500, 300.0));
+        writer.append_record(&r1, now).expect("append r1");
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(writer.dlq_path(now))
+                .expect("open append");
+            f.write_all(b"{\"security_id\":51,\"exch").expect("torn");
+        }
+        metrics::with_local_recorder(&recorder, || {
+            writer.fail_next_write_after_for_test(10);
+            assert!(writer.append_record(&r2, now).is_err(), "armed write fails");
+            writer.append_record(&r3, now).expect("append r3");
+        });
+        assert_eq!(
+            recorder.total.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "one torn fragment, counted once"
+        );
+        assert_eq!(writer.read_all(now).expect("read"), vec![r1, r3]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A last record that is complete but lacks its newline is closed and
+    /// replays; it is not counted as a refused candle.
+    #[test]
+    fn test_regression_da14_complete_unterminated_record_is_closed_not_counted() {
+        let dir = temp_dlq_dir("da14-complete-unterminated");
+        let recorder = TornLineRecorder {
+            total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        let writer = SealDlqWriter::with_dlq_dir_for_test(dir.clone());
+        let now = da14_now();
+        let r1 = SealDlqRecord::from(&mk_serialized_seal(13, 0, 0, 1_716_000_900, 100.0));
+        let r2 = SealDlqRecord::from(&mk_serialized_seal(25, 0, 4, 1_716_001_500, 200.0));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let line = serde_json::to_string(&r1).expect("json");
+        std::fs::write(writer.dlq_path(now), line.as_bytes()).expect("seed");
+        metrics::with_local_recorder(&recorder, || {
+            writer.append_record(&r2, now).expect("append r2");
+        });
+        assert_eq!(
+            recorder.total.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a complete record is not a refused candle"
+        );
+        assert_eq!(writer.read_all(now).expect("read"), vec![r1, r2]);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

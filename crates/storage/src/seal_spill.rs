@@ -797,6 +797,12 @@ struct SpillState {
     /// before any sync closes the older one unsynced, which is the same
     /// exposure the open file has until its own first sync.
     rotated: Option<File>,
+    /// A handle dropped after a failed write, not yet synced (deep audit DA-14
+    /// review). It still holds the bytes written since the last sync: every
+    /// earlier append on it, and the whole records a failed batch kept.
+    /// Parked here (no syscall) instead of dropped, and synced and closed
+    /// off the lock by [`SealSpillWriter::sync_open_file`], like `rotated`.
+    failed_unsynced: Option<File>,
     /// The fullest copy of each bar on disk and in the database. See
     /// [`crate::seal_spill_ledger`].
     ledger: SpillLedger,
@@ -1011,6 +1017,7 @@ impl SealSpillWriter {
             state: Mutex::new(SpillState {
                 open: None,
                 rotated: None,
+                failed_unsynced: None,
                 ledger: SpillLedger::with_capacity(SEAL_SPILL_LEDGER_CAPACITY),
                 mirror_scratch: Vec::new(),
                 mirror_seals: Vec::new(),
@@ -1092,9 +1099,10 @@ impl SealSpillWriter {
     /// A failure is counted on `tv_seal_spill_sync_failed_total` and logged
     /// once per failing episode.
     pub(crate) fn sync_open_file(&self) -> bool {
-        let (rotated, handle, dir, parent) = {
+        let (rotated, failed, handle, dir, parent) = {
             let mut state = self.lock_state();
             let rotated = state.rotated.take();
+            let failed = state.failed_unsynced.take();
             // The flags are set under this lock (by `current_file` and the
             // `open_append_handle` it calls), so taking them here pairs each
             // with the handle it was set for. A file with no append since the
@@ -1106,14 +1114,16 @@ impl SealSpillWriter {
             };
             let dir = self.dir_unsynced.swap(false, Ordering::Relaxed);
             let parent = self.parent_unsynced.swap(false, Ordering::Relaxed);
-            (rotated, handle, dir, parent)
+            (rotated, failed, handle, dir, parent)
         };
-        if rotated.is_none() && handle.is_none() && !dir && !parent {
+        if rotated.is_none() && failed.is_none() && handle.is_none() && !dir && !parent {
             return true;
         }
         // The previous day's file first: its last seals are the oldest
         // unsynced ones. It is dropped (closed) here, off the lock.
         let rotated_outcome = rotated.map_or(Ok(()), |file| file.sync_data());
+        // A handle a failed write left behind (deep audit DA-14 review).
+        let failed_outcome = failed.map_or(Ok(()), |file| file.sync_data());
         let open_outcome = handle
             .map_or(Ok(()), |file| file.and_then(|file| file.sync_data()))
             .inspect_err(|_| {
@@ -1135,6 +1145,7 @@ impl SealSpillWriter {
             _ => Ok(()),
         };
         let outcome = rotated_outcome
+            .and(failed_outcome)
             .and(open_outcome)
             .and(dir_outcome)
             .and(parent_outcome);
@@ -1165,9 +1176,42 @@ impl SealSpillWriter {
     pub(crate) fn has_unsynced_writes(&self) -> bool {
         let state = self.lock_state();
         state.rotated.is_some()
+            || state.failed_unsynced.is_some()
             || self.data_unsynced.load(Ordering::Relaxed)
             || self.dir_unsynced.load(Ordering::Relaxed)
             || self.parent_unsynced.load(Ordering::Relaxed)
+    }
+
+    /// Drops the append handle after a failed write WITHOUT losing its sync
+    /// (deep audit DA-14 review). The handle still holds every byte written
+    /// on it since the last sync, including the whole records a failed batch
+    /// kept; dropping it left `sync_open_file` with no handle, so it cleared
+    /// the flag and synced nothing. It is parked in `failed_unsynced` and
+    /// synced off the lock by the next `sync_open_file`. No syscall unless a
+    /// handle is already parked, then one `fstat` per handle to see whether
+    /// they share a file (a sync of either covers both); a parked handle of a
+    /// DIFFERENT file (one set aside since) is kept, and this one is closed
+    /// unsynced and counted as a failed sync, with the episode's coded line.
+    fn park_failed_handle(&self, open: &mut Option<OpenSpillFile>, failed: &mut Option<File>) {
+        let Some(previous) = open.take() else {
+            return;
+        };
+        let Some(parked) = failed.as_ref() else {
+            *failed = Some(previous.file);
+            return;
+        };
+        if same_file(parked, &previous.file) {
+            return;
+        }
+        self.err_sync.increment(1);
+        if !self.sync_failing.swap(true, Ordering::Relaxed) {
+            error!(
+                code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                spill_dir = ?self.spill_dir,
+                "seal spill: two failed writes on different files before a sync; the newer \
+                 file's seals reported written may be lost on a power cut"
+            );
+        }
     }
 
     /// Opens (creating as needed) the append handle for `path`.
@@ -1250,6 +1294,7 @@ impl SealSpillWriter {
         let SpillState {
             open,
             rotated,
+            failed_unsynced,
             ledger,
             epoch,
             ..
@@ -1292,13 +1337,16 @@ impl SealSpillWriter {
             // mirrors `ws_frame_spill::persist_record_resilient`. The error
             // still propagates, so the absorption pipeline escalates THIS
             // seal to the tier-3 DLQ exactly as before.
-            *open = None;
+            self.park_failed_handle(open, failed_unsynced);
             self.err_write.increment(1);
             let path = self.spill_path(now_unix_secs);
             return match cut {
                 Ok(_) => Err(err).with_context(|| format!("failed to write seal to {path:?}")),
                 Err(cut_err) => {
                     let aside = set_aside_torn_file(&path);
+                    // The rename changed the directory: its entry must be synced too
+                    // (deep audit DA-14 review).
+                    self.dir_unsynced.store(true, Ordering::Relaxed);
                     Err(err).with_context(|| {
                         format!(
                             "failed to write seal to {path:?}, cutting the torn tail back ALSO \
@@ -1361,6 +1409,7 @@ impl SealSpillWriter {
                     drop(file);
                     match set_aside_torn_file(&path) {
                         Ok(aside) => {
+                            self.dir_unsynced.store(true, Ordering::Relaxed);
                             warn!(
                                 ?path,
                                 ?err,
@@ -1545,6 +1594,7 @@ impl SealSpillWriter {
         let SpillState {
             open,
             rotated,
+            failed_unsynced,
             ledger,
             epoch,
             ..
@@ -1576,10 +1626,13 @@ impl SealSpillWriter {
                 match cut_back_to_whole_records(&current.file) {
                     Ok(cut) => meta.len().saturating_sub(cut),
                     Err(err) => {
-                        *open = None;
+                        self.park_failed_handle(open, failed_unsynced);
                         self.err_write.increment(1);
                         let path = self.spill_path(now_unix_secs);
                         let aside = set_aside_torn_file(&path);
+                        // The rename changed the directory: its entry must be synced too
+                        // (deep audit DA-14 review).
+                        self.dir_unsynced.store(true, Ordering::Relaxed);
                         return Err(BatchSpillFailure::nothing_kept(
                             anyhow::Error::from(err).context(format!(
                                 "seal spill file {path:?} ends mid-record and cannot be cut \
@@ -1591,7 +1644,7 @@ impl SealSpillWriter {
             }
             Ok(meta) => meta.len(),
             Err(err) => {
-                *open = None;
+                self.park_failed_handle(open, failed_unsynced);
                 self.err_write.increment(1);
                 let path = self.spill_path(now_unix_secs);
                 return Err(BatchSpillFailure::nothing_kept(
@@ -1617,7 +1670,7 @@ impl SealSpillWriter {
             // Cut the torn tail before dropping the handle. Best effort: a
             // failure here is reported in the error chain, not swallowed.
             let cut = current.file.set_len(before.saturating_add(landed_whole));
-            *open = None;
+            self.park_failed_handle(open, failed_unsynced);
             self.err_write.increment(1);
             let path = self.spill_path(now_unix_secs);
             // Either way the whole records that landed are readable: after a
@@ -1637,8 +1690,11 @@ impl SealSpillWriter {
                     // drains still read, so the records before the tear are
                     // recovered, the tear ends that file, and the next append
                     // starts a clean one. The handle is already closed (held
-                    // lock, `*open = None` above), so nothing follows the move.
+                    // lock, the handle parked above), so nothing follows the move.
                     let aside = set_aside_torn_file(&path);
+                    // The rename changed the directory: its entry must be synced too
+                    // (deep audit DA-14 review).
+                    self.dir_unsynced.store(true, Ordering::Relaxed);
                     anyhow::Error::from(err).context(format!(
                         "failed to write a seal batch to {path:?}, cutting the torn tail \
                          back ALSO failed ({cut_err}); file set aside: {aside:?}"
@@ -1738,6 +1794,7 @@ impl SealSpillWriter {
         let SpillState {
             open,
             rotated,
+            failed_unsynced,
             ledger,
             mirror_scratch,
             mirror_seals,
@@ -1774,7 +1831,7 @@ impl SealSpillWriter {
         if let Err(err) = written {
             // The handle may be broken; the next append reopens it, and the
             // open cuts a torn tail back to a whole record (audit PR41c).
-            *open = None;
+            self.park_failed_handle(open, failed_unsynced);
             self.err_write.increment(1);
             self.superseded
                 .mirror_failed
@@ -2034,6 +2091,25 @@ fn cut_back_to_whole_records(file: &File) -> std::io::Result<u64> {
         file.set_len(len - torn)?;
     }
     Ok(torn)
+}
+
+/// Whether two handles are the same file (deep audit DA-14 review): one
+/// `fstat` each. Unknown (an `fstat` failed, or not Unix) reads as different,
+/// which only costs a counted sync failure, never a silent one.
+fn same_file(a: &File, b: &File) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (a.metadata(), b.metadata()) {
+            (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (a, b);
+        false
+    }
 }
 
 /// Move a spill file whose tail is torn to `<name>.<n>` in the same
@@ -3686,6 +3762,41 @@ mod tests {
             SEAL_SPILL_RECORD_SIZE as u64 * 2,
             "the torn third record is cut off"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Deep audit DA-14 review: the records a failed batch kept must still be
+    /// synced. Before, the failed handle was dropped, so `sync_open_file`
+    /// found no handle, cleared the flag and synced nothing.
+    #[test]
+    fn test_regression_da14_records_kept_by_a_failed_batch_are_synced() {
+        let dir = temp_spill_dir("da14-kept-synced");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        let now = 1_700_000_000_i64;
+        let seals: Vec<SerializedSeal> = (0..4u32)
+            .map(|i| mk_seal(13, 0, 1, 34_200 + i, 100.0 + f64::from(i)))
+            .collect();
+        let mut scratch = Vec::new();
+        writer.fail_batch_writes_after_for_test(SEAL_SPILL_RECORD_SIZE as u64 * 2 + 64);
+        let failure = writer
+            .append_seals(seals.iter(), &mut scratch, now)
+            .expect_err("the disk refused part of the batch");
+        assert_eq!(failure.kept, 2);
+        {
+            let state = writer.lock_state();
+            assert!(state.open.is_none(), "the failed handle is not reused");
+            assert!(
+                state.failed_unsynced.is_some(),
+                "the failed handle is parked for the sync, not dropped"
+            );
+        }
+        assert!(writer.has_unsynced_writes());
+        assert!(writer.sync_open_file(), "the parked handle syncs");
+        assert!(
+            writer.lock_state().failed_unsynced.is_none(),
+            "the sync closes the parked handle"
+        );
+        assert!(!writer.has_unsynced_writes());
         let _ = std::fs::remove_dir_all(dir);
     }
 

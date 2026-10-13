@@ -5684,9 +5684,17 @@ async fn run_process_runloop(
                     error!(
                         code = tickvault_common::error_code::ErrorCode::AggregatorDrop01.code_str(),
                         dropped = outcome.mpsc_submit_dropped,
+                        // Deep audit DA-14 review: why. A floor refusal wrote
+                        // nothing; the rest failed both disk writes.
+                        dropped_below_floor = outcome.mpsc_submit_dropped_below_floor,
+                        dropped_tiers_failed = outcome
+                            .mpsc_submit_dropped
+                            .saturating_sub(outcome.mpsc_submit_dropped_below_floor),
                         submitted = outcome.submitted_from_mpsc,
-                        "seal writer: seals were DROPPED on the final drain — all three \
-                         absorption tiers failed; these candles are gone"
+                        "seal writer: seals were DROPPED on the final drain: \
+                         dropped_below_floor were refused because free disk space is below the \
+                         seal floor (nothing was written), dropped_tiers_failed were lost after \
+                         the spill and the DLQ both failed; these candles are gone"
                     );
                 }
                 info!(
