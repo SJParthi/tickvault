@@ -219,11 +219,64 @@ pub const fn pass_verdict(summary: &ArchiveRunSummary, max_partitions_per_run: u
     }
     // `>=` and not `>`: hitting the cap exactly means the worklist was
     // truncated at it, which is the same "there is more" as exceeding it.
-    if max_partitions_per_run > 0 && summary.partitions_considered >= max_partitions_per_run {
+    // DA-13d re-review: held depth partitions take worklist slots but no
+    // work, so they do not count toward the budget. Otherwise a backlog of
+    // 200 or more read as budget_exhausted, was not refunded, and the hold
+    // still used up the day's attempts.
+    if max_partitions_per_run > 0
+        && summary
+            .partitions_considered
+            .saturating_sub(summary.held_deferred_depth)
+            >= max_partitions_per_run
+    {
         return PassVerdict::Incomplete("budget_exhausted");
+    }
+    if summary.held_deferred_depth > 0 {
+        // DA-13d: depth partitions were held while the after-close pass
+        // wrote shed rows back into them. Checked LAST, so it is the verdict
+        // only when nothing else went wrong: the caller refunds the attempt on
+        // this reason ([`refunds_attempt`]) and polls again, and a real
+        // failure in the same pass must still spend one. The pass holds the
+        // gate until at most ~17:16:05 IST (its 17:15 stop plus the settle),
+        // so the first poll after that archives the depth partitions with the
+        // rewritten rows in. If the 17:30 box stop comes first, they are
+        // still past retention at the next day's sweep and go then.
+        return PassVerdict::Incomplete("deferred_depth_pass");
     }
     PassVerdict::Complete
 }
+
+/// Whether an attempt with this outcome is given back rather than spent.
+///
+/// Only the two "another job is doing this right now" verdicts: `contended`
+/// (the disk-pressure leg holds the archive lock) and `deferred_depth_pass`
+/// (DA-13d: the after-close depth pass holds the depth partitions while it
+/// writes rows back into them, ~15:45 to at most ~17:16 IST). Spending an
+/// attempt on either would exhaust the day's six attempts by ~16:10 and page
+/// STORAGE-GAP-04 on a box that is working. Pure, O(1).
+#[must_use]
+pub fn refunds_attempt(outcome: PassOutcome) -> bool {
+    matches!(
+        outcome,
+        PassOutcome::Ran(PassVerdict::Incomplete("contended" | "deferred_depth_pass"))
+    )
+}
+
+/// Every `tv_daily_archive_attempts_total{outcome}` value, seeded at 0 when
+/// the loop starts so a first event never lands on a missing series.
+pub const SEEDED_ATTEMPT_OUTCOMES: [&str; 11] = [
+    "complete",
+    "contended",
+    "did_not_run",
+    "wal_suspended",
+    "wal_not_applied",
+    "table_list_failed",
+    "partition_failed",
+    "budget_exhausted",
+    "deferred_depth_pass",
+    "skipped",
+    "failed",
+];
 
 /// Per-day attempt bookkeeping.
 ///
@@ -468,14 +521,7 @@ async fn run_daily_archive_loop(
     // Pre-register both series at zero so the CloudWatch agent's counter-delta
     // baseline is the harmless zero rather than the first real event. The
     // repo has been bitten by an absent series reading as a healthy one.
-    for outcome in [
-        "complete",
-        "table_list_failed",
-        "partition_failed",
-        "budget_exhausted",
-        "skipped",
-        "failed",
-    ] {
+    for outcome in SEEDED_ATTEMPT_OUTCOMES {
         metrics::counter!("tv_daily_archive_attempts_total", "outcome" => outcome).increment(0);
     }
     let completed_gauge = metrics::gauge!("tv_daily_archive_completed_today");
@@ -551,15 +597,16 @@ async fn run_daily_archive_loop(
         // this work — so charging the day's six attempts for it would exhaust
         // the budget on someone else's success and then abandon the daily
         // sweep once the lock freed. Found by adversarial review 2026-09-01.
-        if matches!(
-            outcome,
-            PassOutcome::Ran(PassVerdict::Incomplete("contended"))
-        ) {
+        // DA-13d: a pass that held depth partitions for the after-close depth
+        // pass is refunded the same way (see `refunds_attempt`).
+        if refunds_attempt(outcome) {
             ledger.refund(today);
             debug!(
                 attempt,
-                "daily archive tick stood aside — the disk-pressure leg holds the \
-                 archive lock and is doing this work; attempt refunded, not spent"
+                outcome = outcome.as_str(),
+                "daily archive tick stood aside — another job (the disk-pressure leg, \
+                 or the after-close depth pass) holds what this pass needs; attempt \
+                 refunded, not spent, and the next tick retries"
             );
             continue;
         }
@@ -1097,6 +1144,171 @@ mod pass_ran_tests {
             pass_verdict(&lagging, 200),
             PassVerdict::Incomplete("wal_not_applied")
         );
+    }
+
+    // Regression: 2026-10-13 (DA-13d) — depth partitions held while the
+    // after-close pass writes them must keep the day open, or they wait a day.
+    #[test]
+    fn test_regression_da13d_held_depth_partitions_keep_the_day_open() {
+        let held = ArchiveRunSummary {
+            pass_ran: true,
+            held_deferred_depth: 1,
+            ..ArchiveRunSummary::default()
+        };
+        assert_eq!(
+            pass_verdict(&held, 200),
+            PassVerdict::Incomplete("deferred_depth_pass")
+        );
+        assert!(!PassOutcome::Ran(pass_verdict(&held, 200)).latches_the_day());
+    }
+
+    // Regression: 2026-10-13 (DA-13d review) — the after-close depth pass
+    // holds the depth partitions from ~15:45 to ~17:16 IST. Every daily tick
+    // in that stretch spent an attempt, the six ran out by ~16:10, and
+    // STORAGE-GAP-04 paged on a working box. A hold must be refunded, and a
+    // real failure in the same pass must still spend its attempt.
+    #[test]
+    fn test_regression_da13d_refunds_attempt_only_for_a_held_depth_pass() {
+        let held = ArchiveRunSummary {
+            pass_ran: true,
+            held_deferred_depth: 3,
+            ..ArchiveRunSummary::default()
+        };
+        let mut ledger = AttemptLedger::default();
+        // Twenty ticks: 15:45 to 17:25 at the five-minute poll.
+        for _ in 0..20 {
+            assert_eq!(
+                archive_tick(60_000, 55_802, false, ledger.attempts_on(9), 6),
+                ArchiveTick::Run,
+                "a held depth pass must never exhaust the day's attempts"
+            );
+            ledger.record(9);
+            let outcome = PassOutcome::Ran(pass_verdict(&held, 200));
+            if refunds_attempt(outcome) {
+                ledger.refund(9);
+            }
+        }
+        assert_eq!(ledger.attempts_on(9), 0);
+
+        // A partition failure in the same pass is the verdict, and it spends.
+        let held_and_failed = ArchiveRunSummary { failed: 1, ..held };
+        let verdict = pass_verdict(&held_and_failed, 200);
+        assert_eq!(verdict, PassVerdict::Incomplete("partition_failed"));
+        assert!(!refunds_attempt(PassOutcome::Ran(verdict)));
+        assert!(refunds_attempt(PassOutcome::Ran(PassVerdict::Incomplete(
+            "contended"
+        ))));
+        assert!(!refunds_attempt(PassOutcome::Ran(PassVerdict::Complete)));
+        assert!(!refunds_attempt(PassOutcome::Failed));
+    }
+
+    // Regression: 2026-10-13 (DA-13d re-review) — held depth partitions took
+    // slots in the per-run budget, so a backlog of 200 read as
+    // budget_exhausted, was not refunded, and the attempts still ran out.
+    #[test]
+    fn test_regression_da13d_held_partitions_do_not_spend_the_budget() {
+        let full_of_held = ArchiveRunSummary {
+            pass_ran: true,
+            partitions_considered: 200,
+            held_deferred_depth: 200,
+            ..ArchiveRunSummary::default()
+        };
+        let verdict = pass_verdict(&full_of_held, 200);
+        assert_eq!(verdict, PassVerdict::Incomplete("deferred_depth_pass"));
+        assert!(refunds_attempt(PassOutcome::Ran(verdict)));
+
+        let truly_full = ArchiveRunSummary {
+            held_deferred_depth: 0,
+            ..full_of_held
+        };
+        let verdict = pass_verdict(&truly_full, 200);
+        assert_eq!(verdict, PassVerdict::Incomplete("budget_exhausted"));
+        assert!(!refunds_attempt(PassOutcome::Ran(verdict)));
+
+        // 200 real partitions besides the held ones: still budget-bound.
+        let over = ArchiveRunSummary {
+            partitions_considered: 210,
+            held_deferred_depth: 10,
+            ..full_of_held
+        };
+        assert_eq!(
+            pass_verdict(&over, 200),
+            PassVerdict::Incomplete("budget_exhausted")
+        );
+    }
+
+    // Regression: 2026-10-13 (DA-13d review) — the archiver's hold counter
+    // was not seeded at 0. The boot seed (`count_depth_partitions_held(0)`
+    // in main.rs) must put the exact series a hold increments on /metrics.
+    #[test]
+    fn test_regression_da13d_depth_hold_counter_seeds_at_zero() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            tickvault_storage::partition_archive::count_depth_partitions_held(0);
+        });
+        let rendered = handle.render();
+        let line = rendered
+            .lines()
+            .find(|l| {
+                l.starts_with("tv_partition_archive_skipped_total{")
+                    && l.contains("reason=\"deferred_depth_pass\"")
+            })
+            .unwrap_or_else(|| panic!("hold series not seeded; got:\n{rendered}"));
+        assert!(line.ends_with(" 0"), "seeded at 0, got {line}");
+    }
+
+    // Regression: 2026-10-13 (DA-13d review) — the new outcome label was not
+    // seeded at 0. Every reason `pass_verdict` can return, and every other
+    // outcome, must be in the seeded set.
+    #[test]
+    fn test_regression_da13d_every_attempt_outcome_is_seeded() {
+        let ran = ArchiveRunSummary {
+            pass_ran: true,
+            ..ArchiveRunSummary::default()
+        };
+        let summaries = [
+            ArchiveRunSummary {
+                contended: true,
+                ..ArchiveRunSummary::default()
+            },
+            ArchiveRunSummary::default(),
+            ArchiveRunSummary {
+                tables_wal_suspended: 1,
+                ..ran
+            },
+            ArchiveRunSummary {
+                tables_wal_not_applied: 1,
+                ..ran
+            },
+            ArchiveRunSummary {
+                tables_list_failed: 1,
+                ..ran
+            },
+            ArchiveRunSummary { failed: 1, ..ran },
+            ArchiveRunSummary {
+                partitions_considered: 200,
+                ..ran
+            },
+            ArchiveRunSummary {
+                held_deferred_depth: 1,
+                ..ran
+            },
+            ran,
+        ];
+        let mut outcomes: Vec<PassOutcome> = summaries
+            .iter()
+            .map(|s| PassOutcome::Ran(pass_verdict(s, 200)))
+            .collect();
+        outcomes.push(PassOutcome::Skipped);
+        outcomes.push(PassOutcome::Failed);
+        for outcome in outcomes {
+            assert!(
+                SEEDED_ATTEMPT_OUTCOMES.contains(&outcome.as_str()),
+                "outcome {} is not seeded at 0",
+                outcome.as_str()
+            );
+        }
     }
 
     /// Every incomplete reason must be its own counter label, or the operator

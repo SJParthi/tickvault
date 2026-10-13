@@ -6804,3 +6804,32 @@ Revert the commit. No schema, data or config change.
 Existing: `tv_questdb_wal_apply_lag_max`, the depth flush and spill counters, `tv_wal_replay_pace_waits_total`. No new metric.
 
 Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
+
+## ITEM 56 — silent depth-200 swap is resubscribed in place (added 2026-10-13, operator chose "Resubscribe at 90s (Recommended)" and then "yes everythignis entirley approved permission grnated dude")
+
+- [x] 56a — rule section first: the dated 2026-10-13 section in `docs/claude-rules-full/project/websocket-connection-scope-lock.md` and its summary bullet.
+  - Files: docs/claude-rules-full/project/websocket-connection-scope-lock.md, .claude/rules/project/websocket-connection-scope-lock.md
+  - Tests: tick_gap_reset_wiring_guard, instance_type_lock_guard
+- [x] 56b — per-socket silent-swap watch: one atomic word per slot armed before the subscribe write, cleared by the drain on the first depth-200 packet of the awaited contract (O(1), no allocation), handed back once by the 1 s idle tick after `depth200_silent_swap_resubscribe_secs` (default 90, 10..=600); the connection sends RequestCode 25 then 23 on the live socket. Refused after an 805 or when the guard no longer holds the contract.
+  - Files: crates/core/src/websocket/silent_swap.rs, crates/core/src/websocket/pool_supervisor.rs, crates/common/src/config.rs, crates/app/src/main.rs, crates/app/src/dhan_feed_stack.rs, crates/app/src/depth_first_packet.rs
+  - Tests: dhat_depth_drain, silent_swap tests (resend at the wait, no resend after a packet, one resend per swap, composite key, second swap cancels the first, 805 refusal, guard no longer holds), config bounds test
+
+### Design (Item 56)
+Dhan sometimes sends nothing for a contract swapped in by 25 then 23. Instead of waiting for the 900 s backstop redial, the socket that made the swap waits 90 s for the contract's first packet and, if none came, sends 25 then 23 again for that one contract on the same socket. 25 goes first because a duplicate 23 is answered with 804. Every depth-200 swap's subscribe-to-first-packet time is recorded under `tv_depth_first_packet_latency_ms{basis="depth200_socket"}`.
+
+### Edge Cases (Item 56)
+A second swap inside the wait replaces the watch (the 900 s backstop still covers a socket that swaps every minute). An 805 in the episode refuses the resend. A contract the guard no longer holds is never resent. A packet left in the ring from an earlier hold of the same contract can clear the watch (no resend; the backstop covers it).
+
+### Failure Modes (Item 56)
+If the 25 lands and the 23 fails, the socket takes the swap's existing `SubscribeFailed` redial. If Dhan ignores the 25, the 23 may draw one 804, at most once per swap. A wire failure is counted (`wire_failed`). Nothing here can open a socket or exceed the 1-instrument cap.
+
+### Test Plan (Item 56)
+`cargo test -p tickvault-core --lib`, `-p tickvault-app --lib`, `-p tickvault-common --lib`, `dhat_depth_drain`, the wiring and seeding guards. Live: 14 Oct 12:00 and 15:50 IST checks read the latency p99 next to the swap count and `tv_depth200_silent_swap_resubscribe_total`.
+
+### Rollback (Item 56)
+Set `depth200_silent_swap_resubscribe_secs = 600` (longest wait) or revert the commit. No schema or data change.
+
+### Observability (Item 56)
+`tv_depth200_silent_swap_resubscribe_total{outcome=sent|refused_halted_805|refused_not_held|wire_failed|recovered}`, seeded at 0, local `/metrics` only; one coded `warn!` (WS-GAP-02) per resend decision; the latency histogram above. No alarm, filter, EMF name or page.
+
+Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.

@@ -1485,6 +1485,8 @@ pub async fn run_depth_rebalance(
     // counter whose first increment is the event it reports cannot be the
     // sample an exporter drops -- the 2026-08-28 seeding defect, not repeated.
     crate::depth_first_packet::pre_register_first_packet_counters();
+    // The silent depth-200 swap resubscribe outcomes (scope lock 2026-10-13).
+    tickvault_core::websocket::silent_swap::pre_register_silent_swap_counters();
     crate::depth200_ranked_steer::pre_register_ranked_counters();
     crate::depth20_ranked_steer::pre_register_depth20_ranked_counters();
     crate::depth_seed::pre_register_seed_counters();
