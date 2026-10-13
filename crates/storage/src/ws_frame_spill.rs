@@ -6452,8 +6452,8 @@ pub struct SegmentSpan {
     pub is_open: bool,
 }
 
-/// Every `*.wal` segment in the active directory, `replaying/` and
-/// `archive/`, in capture order (file-name order is capture order), with its
+/// Every `*.wal` segment in the active directory, `replaying/`, `settling/`,
+/// `settling/unreadable/` and `archive/`, in capture order (file-name order is capture order), with its
 /// sequence range. The open segment IS listed — flagged — because it still
 /// bounds its predecessor's range. Cold path: one verified header read per
 /// segment.
@@ -6470,6 +6470,10 @@ pub fn deferred_segment_spans(wal_dir: &Path) -> std::io::Result<Vec<SegmentSpan
         wal_dir.to_path_buf(),
         wal_dir.join(REPLAYING_SUBDIR),
         wal_dir.join(crate::wal_replay_settle::SETTLING_SUBDIR),
+        // DA-13c review: leftovers set apart as unreadable stay protected.
+        wal_dir
+            .join(crate::wal_replay_settle::SETTLING_SUBDIR)
+            .join(crate::wal_replay_settle::SETTLING_UNREADABLE_SUBDIR),
         wal_dir.join(ARCHIVE_SUBDIR),
     ] {
         let entries = match std::fs::read_dir(&dir) {

@@ -100,11 +100,21 @@ pub struct SettleBatchStart {
 }
 
 impl SettleBatchStart {
-    /// The batch-start reading of `wm`. One atomic load.
+    /// The batch-start reading of `wm`. Two atomic loads.
+    ///
+    /// An episode ALREADY OPEN at the start (the sink is suspect now) counts
+    /// as one that began after it: the batch is written into a sink that may
+    /// ack without applying, so it must hold even if the episode clears
+    /// before the settle. The count is read BEFORE the flag: the watermark
+    /// sets the flag before it bumps the count, so an episode OPENING between
+    /// the two loads only makes this reading lower, which holds more. One
+    /// CLOSING between them was over before the batch wrote a row.
     #[must_use]
     pub fn of(wm: &AppliedWatermark) -> Self {
+        let count = wm.suspect_episode_count();
+        let open = wm.is_sink_suspect();
         Self {
-            episodes: wm.suspect_episode_count(),
+            episodes: count.saturating_sub(u64::from(open)),
         }
     }
 }
@@ -151,6 +161,11 @@ pub const WAL_REPLAY_SETTLE_HELD_COUNTER: &str = "tv_wal_replay_settle_held_segm
 pub const WAL_REPLAY_SETTLE_RECOVERED_COUNTER: &str =
     "tv_wal_replay_settle_recovered_segments_total";
 
+/// Bytes held in `settling/unreadable/` (DA-13c review): leftovers no boot
+/// could read, kept and never pruned. Set at the once-per-process check;
+/// local `/metrics` only, no alarm.
+pub const WAL_REPLAY_SETTLE_UNREADABLE_BYTES_GAUGE: &str = "tv_wal_replay_settle_unreadable_bytes";
+
 /// The existing counter `confirm_replayed` used; a segment now counts as
 /// confirmed when it reaches `archive/`.
 const CONFIRMED_COUNTER: &str = "tv_wal_replay_confirmed_segments_total";
@@ -184,6 +199,10 @@ pub struct SettleState {
     mark: Option<SettleMark>,
     held: bool,
     settled_any: bool,
+    /// `settling/unreadable/` was tried this process (DA-13c review): once
+    /// per process, so a replay pass that runs before the first settle does
+    /// not re-read, re-warn and re-count it.
+    unreadable_checked: bool,
 }
 
 impl Default for SettleState {
@@ -201,6 +220,7 @@ impl SettleState {
             mark: None,
             held: false,
             settled_any: false,
+            unreadable_checked: false,
         }
     }
 
@@ -310,10 +330,14 @@ impl SettleState {
         }
         let settling_dir = wal_dir.join(SETTLING_SUBDIR);
         let mut leftovers = wal_segments_in(&settling_dir);
-        // Segments an earlier boot could not read are tried again here.
-        leftovers.extend(wal_segments_in(
-            &settling_dir.join(SETTLING_UNREADABLE_SUBDIR),
-        ));
+        // Segments an earlier boot could not read are tried again, once per
+        // process.
+        if !self.unreadable_checked {
+            self.unreadable_checked = true;
+            leftovers.extend(wal_segments_in(
+                &settling_dir.join(SETTLING_UNREADABLE_SUBDIR),
+            ));
+        }
         if leftovers.is_empty() {
             return 0;
         }
@@ -354,6 +378,8 @@ impl SettleState {
                 "replay_settle_unreadable",
             );
             metrics::counter!(WAL_REPLAY_SETTLE_HELD_COUNTER).increment(set_apart);
+            metrics::gauge!(WAL_REPLAY_SETTLE_UNREADABLE_BYTES_GAUGE)
+                .set(segment_bytes(&settling_dir.join(SETTLING_UNREADABLE_SUBDIR)) as f64);
             if set_apart < unreadable.len() as u64 {
                 // One stayed in settling/: the next settle must not archive it.
                 self.hold(
@@ -413,6 +439,18 @@ impl SettleState {
         self.held = true;
         metrics::counter!(WAL_REPLAY_SETTLE_HELD_COUNTER).increment(segments);
     }
+}
+
+/// Total size of the entries directly in `dir` (a directory entry counts its
+/// own metadata size). Cold: once per process.
+fn segment_bytes(dir: &Path) -> u64 {
+    // O(1) EXEMPT: once per process, bounded by the set-apart segments
+    std::fs::read_dir(dir).map_or(0, |entries| {
+        entries
+            .filter_map(|e| e.ok()?.metadata().ok())
+            .map(|m| m.len())
+            .fold(0u64, u64::saturating_add)
+    })
 }
 
 /// Renames each file into `dst_dir` (created if missing). A failed rename
@@ -796,6 +834,63 @@ mod tests {
         wm.note_questdb_probe(true);
         assert_eq!(st.promote(&wm, lagged(t0)), SettleVerdict::Held);
         assert_eq!(names(&dir.join(ARCHIVE_SUBDIR)), 0);
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// DA-13c re-review: a batch that STARTS while the sink is already
+    /// suspect is written into a sink that may ack without applying; it holds
+    /// even when auto-resume clears the episode before the settle.
+    #[test]
+    fn test_regression_da13c_an_episode_open_at_batch_start_holds_the_batch() {
+        let dir = tmp("open");
+        plant(
+            &dir.join(REPLAYING_SUBDIR),
+            "ws-frames-00000000000000000012.wal",
+        );
+        let wm = AppliedWatermark::new_for_tests();
+        wm.note_questdb_probe(false);
+        assert!(wm.is_sink_suspect());
+        let start = SettleBatchStart::of(&wm);
+        wm.note_questdb_probe(true); // auto-resume, during the refold
+        let mut st = SettleState::new();
+        let t0 = Instant::now();
+        st.settle(&dir, &wm, t0, start);
+        wm.note_questdb_probe(true);
+        wm.note_questdb_probe(true);
+        assert_eq!(st.promote(&wm, lagged(t0)), SettleVerdict::Held);
+        assert_eq!(names(&dir.join(ARCHIVE_SUBDIR)), 0);
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// DA-13c re-review: `settling/unreadable/` is tried once per process, not
+    /// on every replay pass before the first settle; it stays listed for the
+    /// after-close depth pass and is uploaded to the cold bucket.
+    #[test]
+    fn test_regression_da13c_unreadable_leftovers_are_tried_once_per_process() {
+        let dir = tmp("once");
+        let apart = dir.join(SETTLING_SUBDIR).join(SETTLING_UNREADABLE_SUBDIR);
+        let name = format!("ws-frames-{:020}.wal", seq(0));
+        std::fs::create_dir_all(apart.join(&name)).expect("mkdir"); // APPROVED: test-only
+        let wm = AppliedWatermark::new_for_tests();
+        let mut st = SettleState::new();
+        assert_eq!(st.recover(&dir, &wm), 0, "unreadable: set apart");
+        // It becomes readable later in the SAME process: not tried again.
+        std::fs::remove_dir(apart.join(&name)).expect("rmdir"); // APPROVED: test-only
+        segment(&apart, 0, 3);
+        assert_eq!(
+            st.recover(&dir, &wm),
+            0,
+            "a second pass does not re-read it"
+        );
+        assert!(apart.join(&name).is_file());
+        let spans = crate::ws_frame_spill::deferred_segment_spans(&dir).expect("spans");
+        assert!(
+            spans.iter().any(|s| s.path == apart.join(&name)),
+            "the after-close depth pass still sees the set-apart segment"
+        );
+        // The next process (a fresh state) tries it again and recovers it.
+        let mut next = SettleState::new();
+        assert_eq!(next.recover(&dir, &wm), 1);
         drop(std::fs::remove_dir_all(&dir));
     }
 

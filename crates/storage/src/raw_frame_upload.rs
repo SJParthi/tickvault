@@ -1116,6 +1116,11 @@ fn wal_scan_dirs(wal_dir: &Path) -> Vec<ScanDir> {
         wal_dir.to_path_buf(),
         wal_dir.join("replaying"),
         wal_dir.join(crate::wal_replay_settle::SETTLING_SUBDIR),
+        // DA-13c review: a leftover set apart as unreadable is never pruned,
+        // so it at least gets a cold copy once it can be read.
+        wal_dir
+            .join(crate::wal_replay_settle::SETTLING_SUBDIR)
+            .join(crate::wal_replay_settle::SETTLING_UNREADABLE_SUBDIR),
         wal_dir.join("archive"),
     ]
     .into_iter()
@@ -2010,11 +2015,17 @@ mod tests {
         let settling = dir.join(crate::wal_replay_settle::SETTLING_SUBDIR);
         std::fs::create_dir_all(&settling).expect("mkdir"); // APPROVED: test-only
         plant(&settling, "ws-frames-01790000000000000004.wal", b"s");
+        // DA-13c re-review: a leftover set apart as unreadable (never pruned)
+        // still gets its cold copy once it can be read.
+        let apart = settling.join(crate::wal_replay_settle::SETTLING_UNREADABLE_SUBDIR);
+        std::fs::create_dir_all(&apart).expect("mkdir"); // APPROVED: test-only
+        plant(&apart, "ws-frames-01790000000000000005.wal", b"u");
         let store = FakeStore::default();
         let s = run_pass_with(&store, &dir, 8, &always, &never_open, SystemTime::now()).await;
-        assert_eq!((s.uploaded, s.backlog_after), (1, 0));
+        assert_eq!((s.uploaded, s.backlog_after), (2, 0));
         let puts = store.puts.lock().expect("lock").clone(); // APPROVED: test-only
         assert!(puts[0].ends_with("04.wal.gz"));
+        assert!(puts[1].ends_with("05.wal.gz"));
     }
 
     #[tokio::test]

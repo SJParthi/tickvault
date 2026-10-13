@@ -1680,6 +1680,10 @@ async fn async_main() -> Result<()> {
         .increment(0);
     metrics::counter!(tickvault_storage::wal_replay_settle::WAL_REPLAY_SETTLE_RECOVERED_COUNTER)
         .increment(0);
+    // A gauge the boot replay may already have set: `increment(0.0)` registers
+    // it without overwriting that value.
+    metrics::gauge!(tickvault_storage::wal_replay_settle::WAL_REPLAY_SETTLE_UNREADABLE_BYTES_GAUGE)
+        .increment(0.0);
     metrics::counter!("tv_seal_writer_drain_dropped_total").increment(0);
     metrics::counter!("tv_ws_frame_spill_write_errors_total", "stage" => "write_record")
         .increment(0);
