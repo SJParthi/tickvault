@@ -32,16 +32,17 @@ pub const GST_MULT: f64 = 1.18;
 /// and the guard both read
 /// `hard_stop_guard::effective_budget_kill_usd(BUDGET_USD, year, month)`,
 /// which clamps every month except 2026-09 to
-/// `hard_stop_guard::STANDING_BUDGET_KILL_USD` ($150).
+/// `hard_stop_guard::STANDING_BUDGET_KILL_USD` ($170 since operator Quote 30, 2026-10-13).
 ///
 /// History: $55 → $25 (2026-07-19) → $35 (2026-07-31) → $100 (2026-08-08)
 /// → $130 (2026-08-19) → $150 (2026-08-25, Quote 19) → $225 September only
 /// → $150 (2026-10-01, audit PR30b: the scheduled revert; the month clamp now
-/// changes nothing for any month, and stays as the backstop).
+/// changes nothing for any month, and stays as the backstop) → $170
+/// (2026-10-13, operator Quote 30: AWS at or under ₹15,000 a month).
 /// KEEP IN SYNC with budget.tf limit_amount + budget-guards.tf
 /// BUDGET_KILL_USD + hard_stop_guard::DEFAULT_BUDGET_KILL_USD —
 /// `budget_ceiling_lockstep_guard.rs` fails the build if they drift.
-pub const BUDGET_USD: f64 = 150.0;
+pub const BUDGET_USD: f64 = 170.0;
 
 /// SNS subject — legacy parity: `'[BUDGET] daily AWS cost'`.
 pub const DIGEST_SUBJECT: &str = "[BUDGET] daily AWS cost";
@@ -168,7 +169,7 @@ pub fn render_digest(
         format!("_Yesterday_:   ₹{:.0}   (${:.2})", inr(yday_usd), yday_usd),
         format!("_This month_:  ₹{:.0}   (${:.2})", inr(mtd_usd), mtd_usd),
         // Derived from the EFFECTIVE ceiling (BUDGET_USD clamped to the
-        // standing $150 outside the one-month September 2026 allowance).
+        // standing line ($170 since Quote 30) outside the one-month September 2026 allowance).
         format!("_Of ${ceiling:.0} stop-budget_: {pct:.0}%"),
         format!(
             "_Forecast EOM_: ₹{:.0}   (${:.2})",
@@ -363,17 +364,17 @@ mod tests {
 
     #[test]
     fn test_digest_names_the_standing_line_in_every_month_since_the_revert() {
-        // Audit PR30b (2026-10-01): the configured ceiling is $150 again, so
-        // even a September-2026 date (the old one-month allowance) reads $150.
+        // Operator Quote 30 (2026-10-13): the configured ceiling is $170, so
+        // even a September-2026 date (the old one-month allowance) reads $170.
         let sept = NaiveDate::from_ymd_opt(2026, 9, 23).unwrap();
-        let (msg, pct) = render_digest(sept, 5.0, 75.0, &[]);
-        assert!(msg.contains("_Of $150 stop-budget_: 50%"), "{msg}");
+        let (msg, pct) = render_digest(sept, 5.0, 85.0, &[]);
+        assert!(msg.contains("_Of $170 stop-budget_: 50%"), "{msg}");
         assert!((pct - 50.0).abs() < 1e-9);
 
-        // October: the same spend is 100% of the standing $150 line — red.
+        // October: $170 of spend is 100% of the standing $170 line — red.
         let oct = NaiveDate::from_ymd_opt(2026, 10, 5).unwrap();
-        let (msg, pct) = render_digest(oct, 5.0, 150.0, &[]);
-        assert!(msg.contains("_Of $150 stop-budget_: 100%"), "{msg}");
+        let (msg, pct) = render_digest(oct, 5.0, 170.0, &[]);
+        assert!(msg.contains("_Of $170 stop-budget_: 100%"), "{msg}");
         assert!(msg.starts_with("🔴"), "{msg}");
         assert!((pct - 100.0).abs() < 1e-9);
     }

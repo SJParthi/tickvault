@@ -2768,3 +2768,53 @@ REJECT under 29e:
 - Owner's go, after Quote 29e: "See do everything now even merge and deploy now itself dude okay?" (2026-10-10 07:07 IST).
 - Apply (Actions run 38016206553, 07:44 IST): 1,304 deletes sent; the verify listing found 0 versions in scope; 214 later versions still kept.
 - The role, its policy, the workflow and the tool were deleted by the next PR (plan item 53b). Quote 27 binds again; 29e authorizes nothing further.
+
+#### Quote 30 (2026-10-13) — AWS STAYS AT OR UNDER ₹15,000 A MONTH: ONE STOP AT $170, UNUSED DISK OPERATIONS CUT (preserve EXACTLY, typos included)
+
+**Quote 30 (2026-10-13, in session):**
+> "bro stil lwe hsodul not go ahead mpore than 15k inr dude okay?"
+> "per month dude okay?"
+> "bro nto for claude dude im talkign about aws per month shdou leb inr 15 dude okay?"
+
+**Quote 30b (2026-10-13 ~19:20 IST, decision card tapped by the owner):** "Stop at ₹15,000 + trim (Recommended)".
+
+**Quote 30c (2026-10-13 ~22:05 IST, decision card tapped by the owner, after a correction):** "Stop at ₹15k + cut unused disk (Recommended)". The card said, before the tap: *"Correction to my last card: AWS also stops the server automatically at 90% of the limit. Today that is $135 (about ₹11,900), which October will hit around 23 Oct, so the server would go off for the last 6 trading days. The disk check also found that the server uses about 1,000 of the 6,000 disk operations a second we pay for (peak 3,658, for a few minutes at start-up)."* and the option read *"One automatic stop, at exactly $170 (≈₹15,000) instead of the early 90% stop. Lower the disk's paid operations from 6,000 to the free 3,000 (saves about ₹1,300 a month), and remove alarms that watch nothing. October should land around ₹14,500, so the server keeps running. Disk speed (MB per second) is not touched."* Followed by: "go ahead with the fixes and reosltions dude okay?"
+
+**Measured 2026-10-13 (read-only Cost Explorer and CloudWatch, Verified):**
+
+| Fact | Reading |
+|---|---|
+| October 1–12 cost | $71.80 (weekdays $4.93–6.40, weekends $3.64–4.53, 1 Oct $15.96) |
+| 1–13 Oct by usage type | EBS volume $25.88, r8g.xlarge $15.66, EBS throughput $7.71, EBS IOPS $7.70, tax $10.95, CloudWatch alarms $5.17, metrics $2.00, dashboards $1.37, idle public IPv4 $1.22 |
+| October projection at the old config | about $173–175 (Assumed: remaining 14 weekdays × ~$5.8 + 5 weekend days × ~$4.0; the tax line may be trued up at month end) |
+| Old native stop (90% of $150) | $135, crossed around 23 Oct |
+| Disk IOPS, 13 Oct, 1-minute | 08:30–10:05 IST up to 3,658 (avg ~2,900); 10:05–17:30 IST max 1,456, avg ~1,000 |
+| Disk throughput, 13 Oct | 500 MiB/s (the volume cap) 08:30–10:05 IST; 149 MiB/s flat maximum for the rest of the day |
+| Instance EBS burst balance (`EBSByteBalance%`) | 69% at 08:30, 4% at 09:30, **0% from ~10:00 IST to the stop** |
+| CloudWatch alarms | 127 alarms, ~148 billed metrics, about $13.8/mo; only ~$0.40/mo watch nothing (two Groww token-minter alarms built outside this repo, `order-fill-lag-high`, the staged depth-minter alarm) |
+
+**What this authorizes:**
+
+| Item | Change |
+|---|---|
+| Kill line | All four lockstep sites $150 → **$170** (≈₹15,000 at an Assumed ~₹88/USD); `STANDING_BUDGET_KILL_USD` 150 → 170 |
+| Native early stop | The 90% `STOP_EC2_INSTANCES` budget action is removed; one native stop remains, at 100% of $170 |
+| Disk IOPS | 6,000 → **3,000** (the free gp3 baseline): `variables.tf` default and the live volume through `grow-ebs-volume.yml` (size and throughput unchanged), outside 09:00–15:45 IST, after the rule and code PR merges |
+| Alarm trim | None in this change: the measured removable set is ~$0.40/mo, and two of the four are not built by this repo |
+
+**NOT authorized:** any throughput change (the volume sat at its 500 MiB/s cap for 95 minutes on 13 Oct); any instance-type change; any EBS size change; raising the kill line above $170.
+
+**Finding recorded, not acted on:** from about 10:00 IST the instance had spent its EBS burst balance and the disk was held at about 149 MiB/s for the whole session, which is the instance's own baseline and well below the volume's 500 MiB/s. This is a likely cause of the database falling behind during market hours (Assumed until the database plan measures it). Paying for volume throughput above that baseline only helps while the burst lasts.
+
+**Honest limits:**
+- The ₹ figure moves with the exchange rate; the kill line is in USD.
+- Stopping the box does not stop the bill: the 600 GB volume, its throughput, the alarms and the IP keep billing (about $3.5/day). With the box stopped all month the bill is still roughly $135. A month that trips the $170 stop therefore ends above $170 by about $3.5 for each day left.
+- Budget actual figures lag by up to a day, so the stop can fire a day late.
+- With one native stop, a runaway is caught at 100%, not 90%; the hourly guard Lambda still stops the box at `>= $170` as before.
+
+##### What a PR or action that violates Quote 30 looks like (REJECT)
+- Raises any lockstep site, `STANDING_BUDGET_KILL_USD` or the native stop above $170 without a fresh dated quote.
+- Re-adds a native stop below 100% of the limit without a fresh dated quote.
+- Changes disk throughput, the instance type or the EBS size under cover of this quote.
+- Raises IOPS above 3,000 again without a fresh dated quote.
+- Claims the ₹15,000 is a hard cap: it is a stop line, and fixed costs continue after the stop.
