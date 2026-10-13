@@ -564,7 +564,9 @@ fn every_offload_writer_is_joined_and_labelled_at_shutdown() {
 /// what was fixed — the lesson the sibling guard above records.
 #[test]
 fn the_top_volume_join_is_bounded_by_the_shared_deadline() {
-    let lane = production_region(&read_src("src/dhan_feed_stack.rs"));
+    // Moved out of `dhan_feed_stack.rs` on 2026-10-13 (top_volume spill PR-B)
+    // to keep that file under its size pin; the same function, the same rule.
+    let lane = production_region(&read_src("src/dhan_feed_stack/top_volume_threads.rs"));
 
     const FN: &str = "pub fn shutdown_top_volume_writer(&mut self, deadline: std::time::Instant) {";
     const POLL: &str = "while !handle.is_finished() && std::time::Instant::now() < deadline {";
