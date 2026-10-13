@@ -11757,6 +11757,8 @@ where
         SocketEvent::Frame(frame) => {
             // Two operations. That is the whole loop body.
             let accept_started = Instant::now();
+            // Before the sink: a shed or ring-refused frame counts (2026-10-13).
+            super::silent_swap::note_depth200_frame(supervisor.slot(), &frame, accept_started);
             let outcome = sink.accept(frame);
             let accepted = Instant::now();
             // Live proof the reader never waits (2026-10-02): the accept's

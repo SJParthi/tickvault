@@ -9314,9 +9314,15 @@ are; the silence question is answered per SOCKET by the new watch below.
 - Depth-200 only. After a successful `Swap` (not a no-op), the connection task
   arms a per-socket watch for the NEW contract, keyed on the composite
   `(security_id, segment)` and on the socket's slot (one `AtomicU64` per slot).
-  The frame drain clears it on the first depth-200 packet for exactly that
-  contract on exactly that socket: one relaxed load per depth-200 packet, no
-  allocation.
+  The socket READ task clears it, before the frame is handed to the WAL and
+  the ring, when the first packet of a frame is a bid or ask packet for
+  exactly that contract (12-byte depth header, fixed offsets): one acquire
+  load per frame while nothing is awaited, no allocation, no metric. Read
+  BEFORE the sink because a frame the drain sheds or the ring refuses (WAL
+  only) never reaches the drain's parser; a drain-side check would read a
+  flowing contract as silent during a shed and send a false resend (review
+  finding, same day; the cross-feed check reads the read task's stamp for
+  the same reason).
 - If nothing for that contract arrives within the configured wait
   (`[dhan_universe] depth200_silent_swap_resubscribe_secs`, default 90), the
   connection task, on its existing
@@ -9342,11 +9348,13 @@ are; the silence question is answered per SOCKET by the new watch below.
   value, validated at boot to 10..=600 s (the ceiling stays well under the
   900 s backstop). The owner may lower it once the measured first-packet p99
   supports it, and lowering it is a config change plus a restart, never a
-  code change. To measure it, the drain records every depth-200 swap's time
+  code change. To measure it, every depth-200 swap's time
   from subscribe to the new contract's first packet ON ITS SOCKET into the
   existing local histogram `tv_depth_first_packet_latency_ms`, labelled
-  `basis = "depth200_socket"` (O(1), one sample per swap, on the one packet
-  that clears the watch). Local `/metrics` only; the name is not
+  `basis = "depth200_socket"` (one sample per swap, recorded by the
+  connection task's 1 s poll after the read task clears the watch; the
+  production recorder can allocate a bucket block about once every 64
+  samples, as for `depth_first_packet`, never per frame). Local `/metrics` only; the name is not
   EMF-selected. Contracts that never arrive are not in it, so read its p99
   together with the `sent` count.
 - Every per-packet and per-tick step is O(1) and allocation-free; waiting is
@@ -9365,11 +9373,12 @@ are; the silence question is answered per SOCKET by the new watch below.
   sends no acknowledgement, so it is not measured.
 - If Dhan ignored the 25 (the ghost behaviour), the 23 that follows is a
   duplicate and may draw an 804; once per swap at most.
-- The drain reads packets after ring dwell, so a packet received just before
-  90 s and drained just after can let a needless resend through; it costs the
-  contract a few seconds, never a socket.
-- A packet for the new contract still in the ring from an EARLIER hold of the
-  same contract on the same socket can clear the watch falsely.
+- Only the first packet of a frame is read: a frame stacking a ghost of the
+  old contract ahead of the new one does not clear the watch; the next frame
+  of a flowing contract does.
+- The poll has no market-hours gate of its own. Swaps are only planned in
+  session, so nothing is armed outside it; a swap in the last 90 s of the
+  session can still be resent just after the close.
 - Not verified against a live Dhan socket.
 
 REJECT (2026-10-13):

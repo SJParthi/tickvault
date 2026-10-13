@@ -26,33 +26,46 @@
 //!    [`SilentSwapWatch`] for the NEW contract. That stores one packed word,
 //!    the composite `(security_id, segment)` key, in this socket's slot of
 //!    [`SilentSwapRegister`].
-//! 2. The frame drain calls [`note_depth200_packet`] for every depth-200
-//!    packet it decodes. The first packet for exactly that contract on exactly
-//!    that socket clears the slot.
+//! 2. The socket READ task calls [`note_depth200_frame`] for every frame it
+//!    reads, BEFORE the frame is handed to the WAL and the ring. On a
+//!    depth-200 socket it reads the 12-byte depth header of the frame's first
+//!    packet; a bid or ask packet for exactly the awaited contract clears the
+//!    slot. It runs before the sink on purpose: a frame the drain later SHEDS
+//!    or the ring REFUSES (it goes only to the WAL) never reaches the drain's
+//!    parser, so a drain-side check would read a flowing contract as silent
+//!    during a shed and send a false resend (found by review, 2026-10-13; the
+//!    cross-feed silence check reads the read task's stamp for the same reason).
 //! 3. On its existing one-second idle tick the connection task asks
 //!    [`SilentSwapWatch::poll`]. If the slot is still armed
 //!    `[dhan_universe] depth200_silent_swap_resubscribe_secs` (90 s to start)
 //!    after the swap, it gets the contract
 //!    back once, and sends code 25 then code 23 for it on the live socket
 //!    (never a redial). Still silent after that, nothing new happens: the
-//!    900 s frame-silence backstop is the fallback.
+//!    900 s frame-silence backstop is the fallback. When the slot clears, the
+//!    same poll records the subscribe-to-first-packet time.
 //!
 //! # Complexity
 //!
-//! * [`note_depth200_packet`]: the frame drain, once per depth-200 PACKET.
-//!   One bounds-checked array index and one relaxed load; when the slot is
-//!   armed, one compare and at most one compare-and-swap. O(1), no
-//!   allocation, no lock.
+//! * [`note_depth200_frame`]: the socket read task, once per FRAME. One
+//!   endpoint compare (every other socket kind returns there), one
+//!   bounds-checked index and one acquire load while nothing is awaited; while
+//!   a swap is awaited, a fixed-offset header read, one compare and at most
+//!   one compare-and-swap, plus one clock-anchor load on the one frame that
+//!   clears it. O(1), no allocation, no lock, no metric.
 //! * [`SilentSwapWatch::arm`] / [`SilentSwapWatch::poll`]: the connection
-//!   task, once per swap and once per idle tick. O(1), no allocation.
+//!   task, once per swap and once per idle tick. O(1). The poll records one
+//!   histogram sample per cleared swap; the production recorder can allocate
+//!   a bucket block about once every 64 samples (the same as
+//!   `depth_first_packet`), never per frame.
 //!
 //! # Honest limits
 //!
-//! * A packet for the new contract still sitting in the ring from an EARLIER
-//!   hold of the same contract on the same socket can clear the slot falsely.
-//! * The drain reads packets after ring dwell, so a packet received just
-//!   before 90 s and drained just after can let a needless resend through.
-//!   It costs the contract a few seconds, never the socket.
+//! * Only the first packet of a frame is read. A frame that stacks a ghost of
+//!   the old contract ahead of the new one does not clear the slot; the next
+//!   frame of a flowing contract does.
+//! * The poll has no market-hours gate of its own. Swaps are only planned in
+//!   session, so outside it nothing is armed; a swap in the last 90 s of the
+//!   session can still be resent just after the close.
 //! * A second swap within 90 s replaces the watch, so a socket that swaps every
 //!   minute onto contracts Dhan never starts is never resent; the backstop
 //!   still covers it.
@@ -66,9 +79,12 @@ use tickvault_common::config::{
     DEPTH200_SILENT_SWAP_RESUBSCRIBE_DEFAULT_SECS, DEPTH200_SILENT_SWAP_RESUBSCRIBE_MAX_SECS,
     DEPTH200_SILENT_SWAP_RESUBSCRIBE_MIN_SECS,
 };
+use tickvault_common::constants::{DEEP_DEPTH_FEED_CODE_ASK, DEEP_DEPTH_FEED_CODE_BID};
 use tickvault_common::error_code::ErrorCode;
 
+use super::pool_budget::{ConnectionSlot, DhanEndpointType};
 use super::pool_supervisor::{GHOST_REDIAL_SLOTS, SubscribeInstrument};
+use crate::parser::depth::parse_depth_header;
 
 /// How long a freshly swapped-in depth-200 contract may stay silent on its
 /// socket before the subscription is sent again, in seconds. Set once at boot
@@ -138,18 +154,21 @@ pub const fn pack(security_id: u64, segment_code: u8) -> Option<u64> {
     Some(ARMED_BIT | (security_id << 8) | segment_code as u64)
 }
 
-/// One awaited contract per connection slot, and when it was armed.
+/// One awaited contract per connection slot, when it was armed, and the
+/// measured first-packet time once it arrived.
 ///
 /// Each slot has ONE writer that arms it (the slot's connection task) and one
-/// that clears it (the frame drain, by compare-and-swap from the exact armed
-/// word). The arm instant is stored before the word with Release, and read
-/// after an Acquire load of the word, so the drain pairs a word with its own
-/// arm instant (a re-arm of the SAME contract in between can only move it
-/// later).
+/// that clears it (the socket read task, by compare-and-swap from the exact
+/// armed word). The arm instant is stored before the word with Release, and
+/// read after an Acquire load of the word, so the reader pairs a word with its
+/// own arm instant (a re-arm of the SAME contract in between can only move it
+/// later). The measured time is handed back to the connection task's poll
+/// through `elapsed_nanos` (-1 = none), so no metric is touched per frame.
 #[doc(hidden)]
 pub struct SilentSwapRegister {
     awaiting: [AtomicU64; GHOST_REDIAL_SLOTS],
     armed_at_nanos: [AtomicI64; GHOST_REDIAL_SLOTS],
+    elapsed_nanos: [AtomicI64; GHOST_REDIAL_SLOTS],
 }
 
 impl SilentSwapRegister {
@@ -159,20 +178,35 @@ impl SilentSwapRegister {
         Self {
             awaiting: [const { AtomicU64::new(0) }; GHOST_REDIAL_SLOTS],
             armed_at_nanos: [const { AtomicI64::new(0) }; GHOST_REDIAL_SLOTS],
+            elapsed_nanos: [const { AtomicI64::new(-1) }; GHOST_REDIAL_SLOTS],
         }
     }
 
     /// Clears the slot if a packet carries exactly the awaited contract, and
     /// returns the nanoseconds from the arm to `received_at_nanos` on the one
     /// packet that clears it (`None` on every other packet, and for a receipt
-    /// stamped before the arm, which still clears the slot). O(1), no
-    /// allocation; see [`note_depth200_packet`].
+    /// stamped before the arm, which still clears the slot). The time is also
+    /// kept for the connection task's poll. O(1), no allocation.
     pub fn note_packet(
         &self,
         connection_index: u8,
         security_id: u64,
         segment_code: u8,
         received_at_nanos: i64,
+    ) -> Option<i64> {
+        self.note_packet_with(connection_index, security_id, segment_code, || {
+            received_at_nanos
+        })
+    }
+
+    /// [`Self::note_packet`] with the receipt time read only on the one packet
+    /// that clears the slot.
+    fn note_packet_with(
+        &self,
+        connection_index: u8,
+        security_id: u64,
+        segment_code: u8,
+        received_at_nanos: impl FnOnce() -> i64,
     ) -> Option<i64> {
         let idx = usize::from(connection_index);
         let slot = self.awaiting.get(idx)?;
@@ -189,13 +223,56 @@ impl SilentSwapRegister {
         // packet wins the claim.
         slot.compare_exchange(armed, 0, Ordering::Relaxed, Ordering::Relaxed)
             .ok()?;
-        let elapsed = received_at_nanos.checked_sub(armed_at)?;
-        (elapsed >= 0 && armed_at > 0).then_some(elapsed)
+        let elapsed = received_at_nanos()
+            .checked_sub(armed_at)
+            .filter(|e| *e >= 0 && armed_at > 0);
+        if let Some(cell) = self.elapsed_nanos.get(idx) {
+            cell.store(elapsed.unwrap_or(-1), Ordering::Relaxed);
+        }
+        elapsed
+    }
+
+    /// The read task's half for one raw frame: on a depth-200 slot, read the
+    /// 12-byte header of the frame's first packet (fixed offsets) and clear
+    /// the slot if it is a bid or ask packet for the awaited contract. O(1).
+    pub fn note_frame(&self, connection_index: u8, frame: &[u8], received: Instant) {
+        let Some(slot) = self.awaiting.get(usize::from(connection_index)) else {
+            return;
+        };
+        if slot.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let Ok(header) = parse_depth_header(frame) else {
+            return;
+        };
+        if header.response_code != DEEP_DEPTH_FEED_CODE_BID
+            && header.response_code != DEEP_DEPTH_FEED_CODE_ASK
+        {
+            return;
+        }
+        let _ = self.note_packet_with(
+            connection_index,
+            header.security_id,
+            header.exchange_segment_code,
+            || tickvault_storage::ws_frame_spill::receipt_nanos_from(received),
+        );
+    }
+
+    /// Takes the first-packet time the read task left for this slot.
+    fn take_elapsed(&self, connection_index: u8) -> Option<i64> {
+        let cell = self.elapsed_nanos.get(usize::from(connection_index))?;
+        let v = cell.swap(-1, Ordering::Relaxed);
+        (v >= 0).then_some(v)
     }
 
     fn store(&self, connection_index: u8, word: u64, armed_at_nanos: i64) {
         let idx = usize::from(connection_index);
-        if let (Some(slot), Some(at)) = (self.awaiting.get(idx), self.armed_at_nanos.get(idx)) {
+        if let (Some(slot), Some(at), Some(el)) = (
+            self.awaiting.get(idx),
+            self.armed_at_nanos.get(idx),
+            self.elapsed_nanos.get(idx),
+        ) {
+            el.store(-1, Ordering::Relaxed);
             at.store(armed_at_nanos, Ordering::Relaxed);
             slot.store(word, Ordering::Release);
         }
@@ -220,30 +297,26 @@ static REGISTER: SilentSwapRegister = SilentSwapRegister::new();
 /// Nanoseconds in a millisecond, as the float the histogram takes.
 const NANOS_PER_MILLI_F64: f64 = 1_000_000.0;
 
-/// The frame drain's half: called once per decoded depth-200 packet from a
-/// live socket. The first packet for the awaited contract on that socket
-/// clears its slot and records its first-packet latency.
+/// The socket read task's half: called for EVERY frame read on every socket,
+/// before the frame is handed to the sink, so a frame the drain later sheds
+/// or the ring refuses still counts. Returns at once for anything but a
+/// depth-200 slot.
 ///
-/// O(1), no allocation, no lock: one bounds-checked index and one acquire
-/// load while nothing is awaited (almost every packet), plus one compare, one
-/// load and at most one compare-and-swap while a swap is awaited. The
-/// histogram sample is taken only on the ONE packet that clears a swap
-/// (a few a minute), never per packet; its label is a literal.
-pub fn note_depth200_packet(
-    connection_index: u8,
-    security_id: u64,
-    segment_code: u8,
-    received_at_nanos: i64,
-) {
-    if let Some(elapsed) = REGISTER.note_packet(
-        connection_index,
-        security_id,
-        segment_code,
-        received_at_nanos,
-    ) {
-        metrics::histogram!(FIRST_PACKET_LATENCY_METRIC, "basis" => "depth200_socket")
-            .record(elapsed as f64 / NANOS_PER_MILLI_F64);
+/// O(1), no allocation, no lock, no metric: one endpoint compare; on a
+/// depth-200 slot one bounds-checked index and one acquire load while nothing
+/// is awaited (almost every frame), plus a fixed-offset header read, one
+/// compare and at most one compare-and-swap while a swap is awaited.
+pub fn note_depth200_frame(slot: ConnectionSlot, frame: &[u8], received: Instant) {
+    if slot.endpoint == DhanEndpointType::Depth200 {
+        REGISTER.note_frame(slot.global_index, frame, received);
     }
+}
+
+/// Records one cleared swap's first-packet time. Called from the connection
+/// task's poll, once per cleared swap, never per frame.
+fn record_first_packet(elapsed_nanos: i64) {
+    metrics::histogram!(FIRST_PACKET_LATENCY_METRIC, "basis" => "depth200_socket")
+        .record(elapsed_nanos as f64 / NANOS_PER_MILLI_F64);
 }
 
 /// Registers every outcome of [`SILENT_SWAP_RESUBSCRIBE_METRIC`] at zero.
@@ -335,7 +408,7 @@ impl SilentSwapWatch {
     /// Starts watching `instrument`, swapped onto this socket at `now`.
     /// Replaces any earlier watch: a second swap before the resend cancels
     /// the first. Called BEFORE the subscribe is written, so a packet the
-    /// drain sees during the write already counts. O(1).
+    /// read task sees during the write already counts. O(1).
     pub fn arm(&mut self, instrument: SubscribeInstrument, now: Instant) {
         let armed_at = tickvault_storage::ws_frame_spill::receipt_nanos_from(Instant::now());
         self.arm_in(&REGISTER, instrument, now, armed_at, resubscribe_after());
@@ -396,7 +469,10 @@ impl SilentSwapWatch {
     ) -> Option<SubscribeInstrument> {
         let armed = self.armed.as_mut()?;
         if !register.holds(self.connection_index, armed.word) {
-            // The drain saw the contract: it is streaming.
+            // The read task saw the contract: it is streaming.
+            if let Some(elapsed) = register.take_elapsed(self.connection_index) {
+                record_first_packet(elapsed);
+            }
             if armed.resent {
                 count_outcome("recovered");
                 info!(
@@ -716,16 +792,43 @@ mod tests {
         }
     }
 
+    /// One depth packet as it arrives on the wire: the 12-byte header (length,
+    /// feed code, segment, security id, row count) and no levels.
+    fn depth_frame(security_id: u32, segment: ExchangeSegment, feed_code: u8) -> Vec<u8> {
+        let mut p = vec![0_u8; 12];
+        p[0..2].copy_from_slice(&12_u16.to_le_bytes());
+        p[2] = feed_code;
+        p[3] = segment.binary_code();
+        p[4..8].copy_from_slice(&security_id.to_le_bytes());
+        p
+    }
+
+    fn depth200_slot(global_index: u8) -> ConnectionSlot {
+        ConnectionSlot {
+            account: super::super::pool_budget::DhanAccount::Primary,
+            endpoint: DhanEndpointType::Depth200,
+            pool_index: 0,
+            global_index,
+        }
+    }
+
     #[test]
-    fn test_note_depth200_packet_and_the_production_watch_poll_in_is_armed() {
+    fn test_note_depth200_frame_and_the_production_watch_poll_in_is_armed() {
         // The process register, on slot 31 (unused by the other tests).
         let mut w = SilentSwapWatch::new(31);
         assert!(!w.is_armed());
         w.arm(inst(1, ExchangeSegment::NseFno), Instant::now());
         assert!(w.is_armed());
-        note_depth200_packet(31, 1, ExchangeSegment::NseFno.binary_code(), 0);
+        // Another socket kind with the same index never touches the watch.
+        let mut main = depth200_slot(31);
+        main.endpoint = DhanEndpointType::MainFeed;
+        let frame = depth_frame(1, ExchangeSegment::NseFno, DEEP_DEPTH_FEED_CODE_BID);
+        note_depth200_frame(main, &frame, Instant::now());
         assert!(w.poll(Instant::now()).is_none());
-        assert!(!w.is_armed(), "the drain's packet ended the watch");
+        assert!(w.is_armed());
+        note_depth200_frame(depth200_slot(31), &frame, Instant::now());
+        assert!(w.poll(Instant::now()).is_none());
+        assert!(!w.is_armed(), "the read task's frame ended the watch");
         w.arm(inst(2, ExchangeSegment::NseFno), Instant::now());
         w.cancel();
         assert!(!w.is_armed());
@@ -733,5 +836,65 @@ mod tests {
         let reg = SilentSwapRegister::new();
         let mut idle = SilentSwapWatch::new_in(&reg, 30);
         assert_eq!(idle.poll_in(&reg, Instant::now()), None);
+    }
+
+    /// Review HIGH, 2026-10-13: a frame the drain SHEDS, or the ring refuses
+    /// (WAL only), is never parsed by the drain, so a drain-side check read a
+    /// flowing contract as silent and sent a false 25/23 after 90 s of shed.
+    /// The read task clears the watch before the sink, whatever the sink then
+    /// does with the frame (the cross-feed check's
+    /// `a_depth_shed_never_triggers_a_cross_feed_redial`, mirrored).
+    #[test]
+    fn test_regression_silent_swap_a_depth_shed_never_triggers_a_false_resend() {
+        let reg = SilentSwapRegister::new();
+        let mut watch = SilentSwapWatch::new_in(&reg, SLOT);
+        let t0 = Instant::now();
+        let new = inst(70_002, ExchangeSegment::NseFno);
+        watch.arm_in(&reg, new, t0, ARM_NANOS, AFTER);
+        // A whole shed: the drain parses nothing, the read task sees frames.
+        for code in [DEEP_DEPTH_FEED_CODE_BID, DEEP_DEPTH_FEED_CODE_ASK] {
+            let frame = depth_frame(70_002, ExchangeSegment::NseFno, code);
+            reg.note_frame(SLOT, &frame, t0);
+        }
+        for secs in [90, 200, 900] {
+            assert_eq!(watch.poll_in(&reg, at(t0, secs)), None, "no false resend");
+        }
+        // The read side runs before the sink in the socket read arm, on every
+        // frame, whatever the sink's outcome.
+        let src = include_str!("pool_supervisor.rs");
+        let prod = src
+            .split(concat!("#[cfg(", "test)]"))
+            .next()
+            .unwrap_or_default();
+        let arm = prod
+            .split("SocketEvent::Frame(frame) => {")
+            .nth(1)
+            .expect("the read arm");
+        let note = arm
+            .find("note_depth200_frame(")
+            .expect("the read side is wired");
+        let accept = arm.find("sink.accept(frame)").expect("the sink call");
+        assert!(note < accept, "the watch is fed before the sink");
+    }
+
+    #[test]
+    fn test_note_frame_reads_only_bid_or_ask_headers_of_the_awaited_contract() {
+        let reg = SilentSwapRegister::new();
+        let mut watch = SilentSwapWatch::new_in(&reg, SLOT);
+        let t0 = Instant::now();
+        let new = inst(70_002, ExchangeSegment::NseFno);
+        watch.arm_in(&reg, new, t0, ARM_NANOS, AFTER);
+        // A disconnect packet, a short frame, another segment, another id and
+        // another slot all leave the watch armed.
+        let disconnect = depth_frame(70_002, ExchangeSegment::NseFno, 50);
+        reg.note_frame(SLOT, &disconnect, t0);
+        reg.note_frame(SLOT, &[0_u8; 11], t0);
+        let bse = depth_frame(70_002, ExchangeSegment::BseFno, DEEP_DEPTH_FEED_CODE_BID);
+        reg.note_frame(SLOT, &bse, t0);
+        let other = depth_frame(70_003, ExchangeSegment::NseFno, DEEP_DEPTH_FEED_CODE_BID);
+        reg.note_frame(SLOT, &other, t0);
+        let ok = depth_frame(70_002, ExchangeSegment::NseFno, DEEP_DEPTH_FEED_CODE_ASK);
+        reg.note_frame(SLOT + 1, &ok, t0);
+        assert_eq!(watch.poll_in(&reg, at(t0, 90)), Some(new));
     }
 }

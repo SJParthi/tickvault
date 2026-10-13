@@ -10957,17 +10957,6 @@ pub fn drain_depth_frame(
                 kind,
                 received_at_nanos,
             );
-            // Scope lock 2026-10-13: the first packet for a just-swapped
-            // depth-200 contract on THIS socket ends its silent-swap watch.
-            // O(1), no allocation: one relaxed load when nothing is awaited.
-            if kind == DepthFeedKind::TwoHundred {
-                tickvault_core::websocket::silent_swap::note_depth200_packet(
-                    frame.connection_index,
-                    header.security_id,
-                    header.exchange_segment_code,
-                    received_at_nanos,
-                );
-            }
         }
         if frame.connection_index != u8::MAX {
             match crate::depth_subscription_view::global_depth_subscription_view().classify_raw(

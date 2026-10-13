@@ -210,17 +210,26 @@ fn depth200_drain_does_not_allocate_per_packet() {
     );
 }
 
-/// Scope lock 2026-10-13: the silent-swap watch's per-packet arm, measured
-/// with a swap AWAITED on the frames' socket (the expensive case: a compare
-/// on every packet), then cleared by the awaited contract's own packet.
+/// Scope lock 2026-10-13: the silent-swap watch is fed by the socket READ
+/// task (`note_depth200_frame`, before the sink), for every frame, including
+/// one the drain would later shed or the ring refuse. Measured with a swap
+/// AWAITED on the frames' socket (the expensive case: a header read and a
+/// compare on every frame), then cleared by the awaited contract's own frame.
 #[test]
-fn depth200_drain_with_an_awaited_silent_swap_does_not_allocate() {
+fn depth200_read_side_silent_swap_watch_does_not_allocate() {
+    use tickvault_core::websocket::pool_budget::{ConnectionSlot, DhanAccount};
     use tickvault_core::websocket::pool_supervisor::SubscribeInstrument;
-    use tickvault_core::websocket::silent_swap::SilentSwapWatch;
+    use tickvault_core::websocket::silent_swap::{SilentSwapWatch, note_depth200_frame};
     let _serial = DHAT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     const FRAMES: u64 = 1_000;
-    // Awaited: contract 70_002 on the frames' socket (connection_index 5);
-    // the frames carry 70_001, so the watch stays armed for every packet.
+    let slot = ConnectionSlot {
+        account: DhanAccount::Primary,
+        endpoint: DhanEndpointType::Depth200,
+        pool_index: 0,
+        global_index: 5,
+    };
+    // Awaited: contract 70_002; the frames carry 70_001, so the watch stays
+    // armed for every frame until the last one.
     let mut watch = SilentSwapWatch::new(5);
     let t0 = std::time::Instant::now();
     watch.arm(
@@ -230,7 +239,6 @@ fn depth200_drain_with_an_awaited_silent_swap_does_not_allocate() {
         },
         t0,
     );
-    let warm: Vec<CapturedFrame> = (0..4).map(|n| depth200_frame(n, n)).collect();
     let mut frames: Vec<CapturedFrame> =
         (0..FRAMES).map(|n| depth200_frame(1_000 + n, n)).collect();
     frames.push(frame(
@@ -238,23 +246,28 @@ fn depth200_drain_with_an_awaited_silent_swap_does_not_allocate() {
         DhanEndpointType::Depth200,
         9_999,
     ));
-    let (blocks, bytes, rows) = measure(&warm, &frames, DepthFeedKind::TwoHundred);
-    assert_eq!(
-        rows,
-        (FRAMES + 1) * 200,
-        "frames were refused; measured nothing"
-    );
-    // Non-vacuity: the awaited contract's packet reached the watch and ended
+    // Warm-up outside the window: one non-matching frame.
+    note_depth200_frame(slot, &frames[0].bytes, t0);
+    let profiler = dhat::Profiler::builder().testing().build();
+    for f in &frames {
+        note_depth200_frame(slot, &f.bytes, f.received_at);
+    }
+    let stats = dhat::HeapStats::get();
+    drop(profiler);
+    // Non-vacuity: the awaited contract's frame reached the watch and ended
     // it, so nothing is due even long after 90 s.
     assert_eq!(
         watch.poll(t0 + std::time::Duration::from_secs(10_000)),
         None,
-        "the drain never told the silent-swap watch the contract arrived"
+        "the read side never told the silent-swap watch the contract arrived"
     );
     assert!(!watch.is_armed());
-    assert!(
-        blocks <= MAX_BLOCKS,
-        "PER-PACKET ALLOCATION with a silent swap awaited: {blocks} blocks \
-         ({bytes} bytes) over {FRAMES} packets; budget {MAX_BLOCKS}."
+    assert_eq!(
+        stats.total_blocks,
+        0,
+        "the read-side silent-swap watch allocated {} blocks ({} bytes) over {} frames",
+        stats.total_blocks,
+        stats.total_bytes,
+        FRAMES + 1
     );
 }
