@@ -1667,6 +1667,9 @@ async fn async_main() -> Result<()> {
     // seeded for the refusal counter anyway — there are only two, and a reader
     // comparing this block against the emit sites should find them all.
     metrics::counter!("tv_wal_replay_unknown_magic_total").increment(0);
+    // DA-13c: local `/metrics` only (no EMF name, no alarm).
+    metrics::counter!(tickvault_app::dhan_feed_stack::WAL_REFOLD_ABANDONED_BYTES_COUNTER)
+        .increment(0);
     metrics::counter!("tv_seal_writer_drain_dropped_total").increment(0);
     metrics::counter!("tv_ws_frame_spill_write_errors_total", "stage" => "write_record")
         .increment(0);

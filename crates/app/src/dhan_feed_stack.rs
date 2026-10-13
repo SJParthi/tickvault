@@ -6633,6 +6633,9 @@ pub const DRAIN_FRAMES_COUNTER: &str = "tv_dhan_feed_drain_frames_total";
 /// CloudWatch. Stated rather than assumed: shipping it is a cost decision
 /// (~$0.30/mo) that belongs with the alarm that would read it.
 pub const DRAIN_ABANDONED_BYTES_COUNTER: &str = "tv_dhan_feed_abandoned_bytes_total";
+/// The replay twin of [`DRAIN_ABANDONED_BYTES_COUNTER`] (DA-13c): bytes of
+/// REPLAYED WAL frames the refold abandoned. Local `/metrics` only.
+pub const WAL_REFOLD_ABANDONED_BYTES_COUNTER: &str = "tv_dhan_wal_refold_abandoned_bytes_total";
 
 /// Counter: unknown-code packets the drain SKIPPED on their own length stamp
 /// instead of abandoning the rest of the frame (item 44b, 2026-09-22). Local
@@ -16043,6 +16046,14 @@ pub struct WalRefoldOutcome {
     pub backup_dropped: u64,
     /// Frames whose bytes could not be parsed at all.
     pub unparseable: u64,
+    /// Bytes of replayed frames the walk ABANDONED at an unreadable packet
+    /// boundary (DA-13c): the live drain's give-up accounting, which the
+    /// replay lacked. Bytes, not packets: undecodable bytes have no knowable
+    /// packet count. Not re-read: a later replay stops at the same place.
+    pub abandoned_bytes: u64,
+    /// Unknown-code packets stepped over on a trustworthy length stamp (item
+    /// 44b, as the live drain does), keeping the packets behind them.
+    pub unknown_skipped: u64,
     /// Packets the decoder REFUSED (2026-08-28).
     ///
     /// Distinct from `unparseable`, which counts a frame whose PACKET
@@ -16975,14 +16986,31 @@ pub fn refold_wal_frames(
         let mut packets = 0u32;
         while offset < bytes.len() {
             let Some(len) = main_feed_packet_len(&bytes[offset..]) else {
+                // DA-13c: the same recovery the live drain makes (item 44b) —
+                // an unknown code whose own length stamp lands on a clean
+                // header is stepped over, so the packets behind it are kept
+                // instead of being thrown away by the replay alone.
+                if let Some(next) = unknown_packet_skip(bytes, offset) {
+                    out.unknown_skipped = out.unknown_skipped.saturating_add(1);
+                    offset = next;
+                    packets = packets.saturating_add(1);
+                    continue;
+                }
                 // Stop at the first unrecognised boundary rather than
-                // resynchronising on a guess, which would fabricate ticks.
+                // resynchronising on a guess, which would fabricate ticks —
+                // and count how much of the frame that throws away (DA-13c).
                 out.unparseable = out.unparseable.saturating_add(1);
+                out.abandoned_bytes = out
+                    .abandoned_bytes
+                    .saturating_add(bytes.len().saturating_sub(offset) as u64);
                 break;
             };
             let end = offset.saturating_add(len);
             if end > bytes.len() {
                 out.unparseable = out.unparseable.saturating_add(1);
+                out.abandoned_bytes = out
+                    .abandoned_bytes
+                    .saturating_add(bytes.len().saturating_sub(offset) as u64);
                 break;
             }
             // Was `if let Ok(ParsedFrame::Tick(tick) | ParsedFrame::TickWithDepth(tick, _))`,
@@ -17109,6 +17137,36 @@ pub fn refold_wal_frames(
         .increment(out.non_tick);
     metrics::counter!("tv_dhan_wal_refolded_total", "outcome" => "backup_dropped")
         .increment(out.backup_dropped);
+    // DA-13c: the frame give-ups. Frames and skipped packets are label values
+    // on the SAME series (no new metric name); the abandoned BYTES go on their
+    // own local counter, off the live `DRAIN_ABANDONED_BYTES_COUNTER` and out
+    // of the summed series, so bytes never add to a frame count.
+    metrics::counter!("tv_dhan_wal_refolded_total", "outcome" => "unparseable")
+        .increment(out.unparseable);
+    metrics::counter!("tv_dhan_wal_refolded_total", "outcome" => "unknown_skipped")
+        .increment(out.unknown_skipped);
+    metrics::counter!(WAL_REFOLD_ABANDONED_BYTES_COUNTER).increment(out.abandoned_bytes);
+    if out.unparseable > 0 {
+        // WS-SPILL-04 (an unreadable part of a WAL segment), which is
+        // log-sink-only: no new page. ONE line per refold, never per frame.
+        // The segment is still archived, honestly: a later replay would walk
+        // the same bytes and stop at the same boundary, so holding it back
+        // recovers nothing and re-reads it on every boot.
+        error!(
+            code = ErrorCode::WsSpill04SegmentUnreadable.code_str(),
+            source = "replay_unparseable",
+            unparseable = out.unparseable,
+            abandoned_bytes = out.abandoned_bytes,
+            unknown_skipped = out.unknown_skipped,
+            refolded = out.refolded,
+            frames = frames.len(),
+            "WAL replay: {} frame(s) stopped at a packet boundary that could not be read, \
+             and the {} byte(s) after it in those frames were NOT folded or written. The \
+             segment is archived either way; the raw frames remain in the WAL archive.",
+            out.unparseable,
+            out.abandoned_bytes
+        );
+    }
     // Item 45h: the rows this replay re-offered to `feed_aux_packets` (non-tick
     // packets, connect snapshots, out-of-window ticks). A label value on the
     // existing series, so no new metric name.
@@ -27854,6 +27912,84 @@ mod wal_refold_tests {
         let out = refold_wal_frames(&mut ingest(), &frames, &[], None);
         assert_eq!(out.refolded, 0);
         assert!(out.unparseable >= 1, "a truncated packet must be counted");
+    }
+
+    /// DA-13c: the bytes a replayed frame throws away at an unreadable
+    /// boundary are COUNTED (the live drain's give-up accounting), not only
+    /// the frame. A good ticker ahead of the bad boundary is still folded.
+    #[test]
+    fn test_regression_da13c_refold_counts_the_bytes_it_abandons() {
+        let now_utc_secs = chrono::Utc::now().timestamp();
+        let now_ist = u32::try_from(
+            now_utc_secs + i64::from(tickvault_common::constants::IST_UTC_OFFSET_SECONDS),
+        )
+        .expect("fits u32 until 2106");
+        let mut buf = replay_ticker(13, now_ist).to_vec();
+        // An unknown code whose stamp (65,535) runs past the frame: no skip.
+        buf.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        let frames = vec![(
+            1u64,
+            now_utc_secs * 1_000_000_000,
+            WalEndpoint::MainFeed,
+            bytes::Bytes::from(buf),
+        )];
+        let out = refold_wal_frames(&mut ingest(), &frames, &[], None);
+        assert_eq!(out.unparseable, 1, "the frame gave up once");
+        assert_eq!(
+            out.abandoned_bytes, 5,
+            "every byte after the bad boundary is counted, not just the frame"
+        );
+        assert_eq!(out.unknown_skipped, 0);
+        assert_eq!(
+            out.refolded + out.refused_wrong_day + out.lost,
+            1,
+            "the ticker ahead of the boundary was still walked"
+        );
+
+        // A packet that runs past the frame's end is the same give-up.
+        let truncated = vec![(
+            2u64,
+            WAL_RECEIPT_UNKNOWN_NANOS,
+            WalEndpoint::MainFeed,
+            bytes::Bytes::from_static(&[2, 0, 0, 0]),
+        )];
+        let out = refold_wal_frames(&mut ingest(), &truncated, &[], None);
+        assert_eq!(out.unparseable, 1);
+        assert_eq!(out.abandoned_bytes, 4);
+    }
+
+    /// DA-13c: an unknown packet whose own length stamp lands on a clean
+    /// header is stepped over, as the live drain does since item 44b, so the
+    /// replay keeps the ticks stacked behind it instead of abandoning them.
+    #[test]
+    fn test_regression_da13c_refold_steps_over_an_unknown_packet_like_the_live_drain() {
+        let now_utc_secs = chrono::Utc::now().timestamp();
+        let now_ist = u32::try_from(
+            now_utc_secs + i64::from(tickvault_common::constants::IST_UTC_OFFSET_SECONDS),
+        )
+        .expect("fits u32 until 2106");
+        let mut buf = vec![0_u8; 16];
+        buf[0] = 0xFE; // not a main-feed response code
+        buf[1..3].copy_from_slice(&16_u16.to_le_bytes()); // its own length
+        buf.extend_from_slice(&replay_ticker(13, now_ist));
+        let frames = vec![(
+            1u64,
+            now_utc_secs * 1_000_000_000,
+            WalEndpoint::MainFeed,
+            bytes::Bytes::from(buf),
+        )];
+        let out = refold_wal_frames(&mut ingest(), &frames, &[], None);
+        assert_eq!(
+            out.unknown_skipped, 1,
+            "the unknown packet was stepped over"
+        );
+        assert_eq!(out.unparseable, 0, "and the frame did not give up");
+        assert_eq!(out.abandoned_bytes, 0);
+        assert_eq!(
+            out.refolded + out.refused_wrong_day + out.lost,
+            1,
+            "the ticker behind it was walked, as the live drain walks it"
+        );
     }
 
     #[test]
