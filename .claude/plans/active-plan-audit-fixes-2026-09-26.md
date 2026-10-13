@@ -3055,6 +3055,22 @@ and a call site; shell may only shrink. One PR per item, serial.
     posted and resumed mid-line; a 2xx from a suspended table truncates the only local copy; the
     live file is chosen by name order (a clock step); a drained live file is never emptied after
     its hour; stuck rounds are not counted; a whole-file quarantine misreports bytes.
+    **Review round 2 (2026-10-13, hostile review + refuters, 7 confirmed, 5 rejected):**
+    - C1: a re-send after a rewind no longer skips a refusal. A line or record QuestDB refuses
+      on the re-send is set aside and counted again (`set_aside_refused`, the tick isolated arm),
+      and out-of-window lines on a re-send are counted. Honest limit: a row refused on both
+      passes is kept twice and counted twice (errs loud).
+    - C2: a non-last spill file is closed only once its hour ended at least 120 s ago
+      (`spill_file_closed_and_quiet`), not only when its mtime is quiet. Limit: a rescue stalled
+      over 120 s between its clock read and its write is not covered.
+    - C3: the rewind lowers the offset before it clears the acks (two lock holds, never
+      nested); the archive reads offset, acks, offset (`spill_file_pending`).
+    - C4: confirmation is sticky (`FileAckState::settle_if_confirmed`, used by the empty-out
+      verdict, the archive check and the quarantine report).
+    - C5: a failed size re-check counts the bytes QuestDB accepted.
+    - C6: a round that only set bytes aside is not a recovery (`landed`, depth `sent_bytes`).
+    - C7: a torn tail (tick and depth, and a damaged depth stretch) is on the paged
+      `tv_tick_spill_replay_lines_rejected_total`.
   - [ ] **DA-13c — WAL refold and confirm.** A bad packet boundary abandons the rest of a frame
     with no counter or log; segments are archived the instant their rows are acked, ignoring the
     60 s durability lag and a suspect flag that lags one probe.

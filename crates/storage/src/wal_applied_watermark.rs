@@ -619,6 +619,26 @@ pub struct AppliedWatermark {
     /// traffic and to archive a file only after a whole clean probe ran
     /// behind its last write.
     clean_probes: AtomicU64,
+    /// Suspicion episodes this process (audit DA-13b, DA-13c). Monotone;
+    /// bumped once per transition into suspicion. The tick and depth spill
+    /// replays stamp it with each ack and refuse to empty a spill file whose
+    /// acks an episode may have lied about, even when the episode began and
+    /// ended between two of their rounds; the WAL replay settle step records
+    /// it at an ack and refuses to archive the acked segments if it has moved
+    /// since.
+    suspect_episodes: AtomicU64,
+    /// Where the LATEST suspicion episode began (audit DA-13b review): its
+    /// number (0 while being rewritten), the clean-probe count and the wall
+    /// clock at its start. A spill replay round that runs after an episode
+    /// began and ended between two of its rounds uses it to tell acks that
+    /// were already confirmed BEFORE the episode (settled, never re-sent)
+    /// from acks the episode may have lied about. A seqlock with one writer
+    /// (the WAL-suspension watcher): the tag is cleared, the fields written,
+    /// then the tag set, and a reader that sees two different tags around
+    /// its reads discards them.
+    episode_start_tag: AtomicU64,
+    episode_start_probes: AtomicU64,
+    episode_start_secs: AtomicU64,
     /// DA-13a review: set once, before the seal writer starts, by a process
     /// that WILL run the WAL-suspension watcher. Until the watcher's first
     /// verdict (an HTTP round trip after it spawns) `clean_probes` is 0 and
@@ -751,6 +771,10 @@ impl AppliedWatermark {
             suspect_max_ticks: AtomicU64::new(0),
             suspect_max_depth: AtomicU64::new(0),
             clean_probes: AtomicU64::new(0),
+            suspect_episodes: AtomicU64::new(0),
+            episode_start_tag: AtomicU64::new(0),
+            episode_start_probes: AtomicU64::new(0),
+            episode_start_secs: AtomicU64::new(0),
             probe_expected: AtomicBool::new(false),
             unlanded: AtomicU64::new(0),
             rescue_floors_ticks: [const { AtomicU64::new(0) }; RESCUE_FLOOR_SLOTS],
@@ -860,6 +884,20 @@ impl AppliedWatermark {
             self.healthy_depth
                 .store(self.hwm_depth.load(Ordering::Acquire), Ordering::Release);
         } else if !self.sink_suspect.swap(true, Ordering::AcqRel) {
+            // Record where this episode begins BEFORE its number is published
+            // (audit DA-13b review): a reader that sees the new number can then
+            // also see its start, and a reader mid-rewrite sees the tag change.
+            let episode = self
+                .suspect_episodes
+                .load(Ordering::Acquire)
+                .saturating_add(1);
+            self.episode_start_tag.store(0, Ordering::SeqCst);
+            self.episode_start_probes
+                .store(self.clean_probes.load(Ordering::Acquire), Ordering::SeqCst);
+            self.episode_start_secs
+                .store(wall_nanos() / 1_000_000_000, Ordering::SeqCst);
+            self.episode_start_tag.store(episode, Ordering::SeqCst);
+            self.suspect_episodes.fetch_add(1, Ordering::AcqRel);
             let hwm_ticks = self.hwm_ticks.load(Ordering::Acquire);
             let hwm_depth = self.hwm_depth.load(Ordering::Acquire);
             self.note_unapplied_range(
@@ -879,6 +917,29 @@ impl AppliedWatermark {
     #[must_use]
     pub fn clean_probe_count(&self) -> u64 {
         self.clean_probes.load(Ordering::Acquire)
+    }
+
+    /// How many suspicion episodes have begun this process (audit DA-13b,
+    /// DA-13c). A change between two reads means the sink was suspect at some
+    /// point in between, even if it has recovered since: an ack stamped with
+    /// one value and read back with another may have been acknowledged by a
+    /// table that never applied it.
+    #[must_use]
+    pub fn suspect_episode_count(&self) -> u64 {
+        self.suspect_episodes.load(Ordering::Acquire)
+    }
+
+    /// Where the latest suspicion episode began, as `(episode, clean probes
+    /// at its start, wall-clock seconds at its start)`, or `None` before the
+    /// first episode or when the record was being rewritten during the read
+    /// (audit DA-13b review). O(1): four atomic loads, no lock.
+    #[must_use]
+    pub fn last_episode_start(&self) -> Option<(u64, u64, u64)> {
+        let tag_before = self.episode_start_tag.load(Ordering::SeqCst);
+        let probes = self.episode_start_probes.load(Ordering::SeqCst);
+        let secs = self.episode_start_secs.load(Ordering::SeqCst);
+        let tag_after = self.episode_start_tag.load(Ordering::SeqCst);
+        (tag_before != 0 && tag_before == tag_after).then_some((tag_before, probes, secs))
     }
 
     /// DA-13a review: this process will run the QuestDB WAL-suspension
@@ -2084,6 +2145,51 @@ mod tests {
         wm.note_questdb_probe(true);
         wm.mark_probe_expected();
         assert!(wm.is_probe_expected(), "never cleared");
+    }
+
+    #[test]
+    fn suspect_episode_count_counts_each_entry_into_suspicion_once() {
+        let wm = AppliedWatermark::new_for_tests();
+        assert_eq!(wm.suspect_episode_count(), 0);
+        wm.note_questdb_probe(true);
+        assert_eq!(wm.suspect_episode_count(), 0, "a clean probe is no episode");
+        wm.note_questdb_probe(false);
+        wm.note_questdb_probe(false);
+        assert_eq!(wm.suspect_episode_count(), 1, "one episode, however long");
+        wm.note_questdb_probe(true);
+        assert_eq!(
+            wm.suspect_episode_count(),
+            1,
+            "recovery keeps the count, so a reader can still see the episode"
+        );
+        wm.note_questdb_probe(false);
+        assert_eq!(wm.suspect_episode_count(), 2);
+    }
+
+    /// Audit DA-13b review: the latest episode's start records its number and
+    /// the clean-probe count at that moment, so the spill replay can tell
+    /// acks confirmed before it from acks it may have lied about.
+    #[test]
+    fn test_regression_da13b_last_episode_start_records_the_probes_at_its_start() {
+        let wm = AppliedWatermark::new_for_tests();
+        assert_eq!(wm.last_episode_start(), None, "no episode yet");
+        wm.note_questdb_probe(true);
+        wm.note_questdb_probe(true);
+        wm.note_questdb_probe(true);
+        wm.note_questdb_probe(false);
+        let (episode, probes, secs) = wm.last_episode_start().expect("an episode began");
+        assert_eq!(episode, 1);
+        assert_eq!(probes, 3, "three clean probes ran before it");
+        assert!(secs > 0);
+        wm.note_questdb_probe(false);
+        assert_eq!(
+            wm.last_episode_start().map(|s| s.0),
+            Some(1),
+            "a second suspect probe in the same episode does not move it"
+        );
+        wm.note_questdb_probe(true);
+        wm.note_questdb_probe(false);
+        assert_eq!(wm.last_episode_start().map(|s| (s.0, s.1)), Some((2, 4)));
     }
 
     #[test]

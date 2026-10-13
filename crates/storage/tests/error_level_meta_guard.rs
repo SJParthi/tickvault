@@ -322,11 +322,6 @@ const REVIEWED_WARN_SITES: &[(&str, &str, &str)] = &[
     ),
     (
         "crates/storage/src/tick_spill_replay.rs",
-        "could not seek to the resume offset",
-        "the file is kept and retried next round",
-    ),
-    (
-        "crates/storage/src/tick_spill_replay.rs",
         "could not be written to quarantine",
         "the file is kept intact and retried next round",
     ),
@@ -340,28 +335,11 @@ const REVIEWED_WARN_SITES: &[(&str, &str, &str)] = &[
         "could not reach questdb",
         "the file is kept intact and retried next round",
     ),
-    (
-        "crates/storage/src/tick_spill_replay.rs",
-        "could not re-check a drained spill file",
-        "the file is not truncated, so no bytes can be lost; retried next round",
-    ),
     // The framed depth spill replay (plan item 49e) mirrors the text replay
     // above: every one of these keeps the file whole and retries next round.
-    (
-        "crates/storage/src/depth_spill_frame.rs",
-        "could not read a spill file",
-        "the file is kept and retried next round",
-    ),
-    (
-        "crates/storage/src/depth_spill_frame.rs",
-        "could not open a spill file",
-        "the file is kept and retried next round",
-    ),
-    (
-        "crates/storage/src/depth_spill_frame.rs",
-        "could not re-check a drained framed depth spill file",
-        "the file is not truncated, so no bytes can be lost; retried next round",
-    ),
+    // (Audit DA-13b, 2026-10-13: the stat, open, seek and re-check warns of
+    // both replays are now coded `error!`s counted on
+    // tv_tick_spill_replay_failed_total, so their rows were removed.)
     (
         "crates/storage/src/depth_spill_frame.rs",
         "could not read a record",

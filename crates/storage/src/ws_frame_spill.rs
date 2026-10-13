@@ -3453,6 +3453,7 @@ pub fn highest_frame_seq_on_disk(wal_dir: &Path) -> u64 {
     for dir in [
         wal_dir.to_path_buf(),
         wal_dir.join(REPLAYING_SUBDIR),
+        wal_dir.join(crate::wal_replay_settle::SETTLING_SUBDIR),
         wal_dir.join(ARCHIVE_SUBDIR),
     ] {
         let mut segs = wal_segments_in(&dir);
@@ -3781,6 +3782,7 @@ fn highest_segment_name_on_disk(wal_dir: &Path) -> u128 {
     for dir in [
         wal_dir.to_path_buf(),
         wal_dir.join(REPLAYING_SUBDIR),
+        wal_dir.join(crate::wal_replay_settle::SETTLING_SUBDIR),
         wal_dir.join(ARCHIVE_SUBDIR),
     ] {
         // O(1) EXEMPT: once per WAL directory per process, at its first segment rotation
@@ -3957,11 +3959,11 @@ pub(crate) fn crc32_ieee_of(chunks: &[&[u8]]) -> u32 {
 /// whose re-injection into the live pipeline has not yet been confirmed. These
 /// are re-globbed (and thus re-replayed) on every boot until `confirm_replayed`
 /// moves them to `archive/`.
-const REPLAYING_SUBDIR: &str = "replaying";
+pub(crate) const REPLAYING_SUBDIR: &str = "replaying";
 
 /// Confirmed-history directory: holds segments whose frames have been durably
 /// re-captured into the live pipeline. NEVER re-globbed by `replay_all`.
-const ARCHIVE_SUBDIR: &str = "archive";
+pub(crate) const ARCHIVE_SUBDIR: &str = "archive";
 
 /// Largest total frame payload `replay_all` will hold in RAM at once.
 ///
@@ -4325,6 +4327,9 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
         });
     }
 
+    // DA-13c: an earlier process's acked-but-unarchived segments are marked
+    // unapplied and returned to `replaying/` BEFORE the watermark is loaded.
+    crate::wal_replay_settle::recover_settling_leftovers(wal_dir);
     // Re-glob BOTH the in-progress staging dir (un-confirmed leftovers from a
     // PRIOR crashed boot — small + bounded: at most the segments a single
     // crashed boot was draining) AND the live `*.wal` segments (this crash's
@@ -5031,7 +5036,8 @@ pub fn replay_all_with_report_fenced<P: AsRef<Path>>(
 
 /// Lists the `*.wal` segment files directly under `dir` (NOT recursive).
 /// Returns an empty Vec for a missing/unreadable dir.
-fn wal_segments_in(dir: &Path) -> Vec<PathBuf> {
+// TEST-EXEMPT: widened from private to pub(crate) for wal_replay_settle; covered by every replay/prune test that lists segments.
+pub(crate) fn wal_segments_in(dir: &Path) -> Vec<PathBuf> {
     // O(1) EXEMPT: boot replay helper — cold path, bounded segment listing
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new(); // APPROVED: boot replay helper, cold path
@@ -5054,6 +5060,10 @@ fn wal_segments_in(dir: &Path) -> Vec<PathBuf> {
 /// can never strand frames. Idempotent and best-effort: a missing `replaying/`
 /// is a no-op; a rename failure leaves the segment in `replaying/` for a
 /// harmless (DEDUP-idempotent) re-replay next boot. NEVER panics, NEVER blocks.
+///
+/// DA-13c: a batch whose rows were ACKED is no longer archived here but
+/// settled (`wal_replay_settle::settle_confirm_replayed`), so the durability
+/// lag and two clean probes pass first. This archives only what nothing wrote.
 // TEST-EXEMPT: covered by test_confirmed_segment_is_not_rereplayed + test_confirm_replayed_missing_dir_is_noop + test_crash_between_move_and_confirm_still_rereplays
 pub fn confirm_replayed<P: AsRef<Path>>(wal_dir: P) {
     let wal_dir = wal_dir.as_ref();
@@ -6558,8 +6568,8 @@ pub struct SegmentSpan {
     pub is_open: bool,
 }
 
-/// Every `*.wal` segment in the active directory, `replaying/` and
-/// `archive/`, in capture order (file-name order is capture order), with its
+/// Every `*.wal` segment in the active directory, `replaying/`, `settling/`,
+/// `settling/unreadable/` and `archive/`, in capture order (file-name order is capture order), with its
 /// sequence range. The open segment IS listed — flagged — because it still
 /// bounds its predecessor's range. Cold path: one verified header read per
 /// segment.
@@ -6575,6 +6585,11 @@ pub fn deferred_segment_spans(wal_dir: &Path) -> std::io::Result<Vec<SegmentSpan
     for dir in [
         wal_dir.to_path_buf(),
         wal_dir.join(REPLAYING_SUBDIR),
+        wal_dir.join(crate::wal_replay_settle::SETTLING_SUBDIR),
+        // DA-13c review: leftovers set apart as unreadable stay protected.
+        wal_dir
+            .join(crate::wal_replay_settle::SETTLING_SUBDIR)
+            .join(crate::wal_replay_settle::SETTLING_UNREADABLE_SUBDIR),
         wal_dir.join(ARCHIVE_SUBDIR),
     ] {
         let entries = match std::fs::read_dir(&dir) {
