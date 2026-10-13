@@ -5983,6 +5983,10 @@ fn prune_wal_dir_at(
                              back. A verified raw copy is in S3, but those rows are not in the \
                              database until that copy is replayed."
                         );
+                        // DA-13d: the loss reaches /metrics, per segment.
+                        // Before, only the coded line above recorded it.
+                        metrics::counter!(WAL_DEFERRED_DEPTH_LOST_COUNTER, "copy_in_s3" => "true")
+                            .increment(1);
                     } else {
                         error!(
                             code = ErrorCode::WsSpill02FrameDropped.code_str(),
@@ -5994,6 +5998,8 @@ fn prune_wal_dir_at(
                              skipped under load was DELETED before they were written back — those \
                              rows are lost. Taken only to keep ticks and the database alive."
                         );
+                        metrics::counter!(WAL_DEFERRED_DEPTH_LOST_COUNTER, "copy_in_s3" => "false")
+                            .increment(1);
                     }
                 }
                 Err(err) => {
@@ -6161,22 +6167,45 @@ pub fn prune_archived_segments<P: AsRef<Path>>(
     );
     publish_deferred_kept("archive", outcome.deferred_kept);
     publish_not_uploaded_refusals("archive", &outcome);
-    if outcome.deleted > 0 || outcome.failed > 0 {
-        metrics::counter!("tv_ws_wal_archive_pruned_total").increment(outcome.deleted as u64);
+    // DA-13d: the byte pass and the disk-floor pass delete here too. Before,
+    // only age-pass deletes were counted or logged, so a pinned segment
+    // taken below the floor in this directory reached no counter at all.
+    let pruned = archive_prune_deletions(&outcome);
+    if pruned > 0 || outcome.failed > 0 {
+        metrics::counter!("tv_ws_wal_archive_pruned_total").increment(pruned);
         info!(
             deleted = outcome.deleted,
+            size_deleted = outcome.size_deleted,
+            size_deleted_deferred = outcome.size_deleted_deferred,
+            bytes_freed = outcome.size_deleted_bytes,
             failed = outcome.failed,
             kept = outcome.kept,
             retention_secs,
-            "WAL archive prune pass complete (confirmed-replay segments past retention)"
+            max_bytes,
+            "WAL archive prune pass complete (confirmed-replay segments past retention, \
+             and any the byte ceiling or the disk floor took)"
         );
     }
     outcome
 }
 
+/// Segments one archive-dir prune pass deleted: by age, by bytes, and below
+/// the disk floor (DA-13d). Pure, O(1).
+const fn archive_prune_deletions(outcome: &ArchivePruneOutcome) -> u64 {
+    // APPROVED: cast — per-pass segment counts, far below u64::MAX.
+    outcome.deleted as u64 + outcome.size_deleted as u64
+}
+
 /// Gauge: segments a prune pass kept because they hold shed depth that has
 /// not been written back yet (item 45a), per directory.
 pub const WAL_DEFERRED_KEPT_GAUGE: &str = "tv_wal_deferred_depth_kept_segments";
+
+/// Counter: WAL segments holding shed depth not yet written back that a prune
+/// deleted because free disk fell below the hard floor (DA-13d), labelled
+/// `copy_in_s3` (`"true"`: a verified raw copy is in S3, nothing replays it
+/// yet; `"false"`: the rows are gone). One per segment, beside its coded
+/// WS-SPILL-02 line. Local `/metrics` only; seeded at 0 at boot in `main.rs`.
+pub const WAL_DEFERRED_DEPTH_LOST_COUNTER: &str = "tv_wal_deferred_depth_segments_lost_total";
 
 /// Free-space fraction below which segments pinned by deferred-depth marks
 /// may be taken by the byte pass (item 45a). Five percent: well under the
@@ -11840,6 +11869,137 @@ mod tests {
         assert!(!a.exists(), "below the floor the pinned segment is taken");
         assert_eq!(below.size_deleted_deferred, 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Counts what a scoped recorder sees, keyed `name` or `name,k=v`.
+    #[derive(Clone, Default)]
+    struct Da13dCounters {
+        counts: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
+    }
+
+    struct Da13dCounter {
+        key: String,
+        counts: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
+    }
+
+    impl metrics::CounterFn for Da13dCounter {
+        fn increment(&self, value: u64) {
+            if let Ok(mut m) = self.counts.lock() {
+                *m.entry(self.key.clone()).or_insert(0) += value;
+            }
+        }
+        fn absolute(&self, value: u64) {
+            if let Ok(mut m) = self.counts.lock() {
+                m.insert(self.key.clone(), value);
+            }
+        }
+    }
+
+    impl metrics::Recorder for Da13dCounters {
+        fn describe_counter(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_gauge(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_histogram(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn register_counter(
+            &self,
+            key: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            let mut rendered = key.name().to_string();
+            for label in key.labels() {
+                rendered.push_str(&format!(",{}={}", label.key(), label.value()));
+            }
+            metrics::Counter::from_arc(std::sync::Arc::new(Da13dCounter {
+                key: rendered,
+                counts: std::sync::Arc::clone(&self.counts),
+            }))
+        }
+        fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            metrics::Gauge::noop()
+        }
+        fn register_histogram(
+            &self,
+            _: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
+    impl Da13dCounters {
+        fn get(&self, key: &str) -> u64 {
+            self.counts
+                .lock()
+                .map(|m| m.get(key).copied().unwrap_or(0))
+                .unwrap_or(0)
+        }
+    }
+
+    // Regression: 2026-10-13 (DA-13d) — a pinned segment deleted below the
+    // disk floor lost shed depth rows with no counter, only a coded log line.
+    #[test]
+    fn test_regression_da13d_floor_deleted_pinned_segment_is_counted() {
+        let dir = tmp_dir("da13d-floor-counted");
+        let now = SystemTime::now();
+        let a = write_wm_segment(&dir, 0, 3, WalEndpoint::MainFeed);
+        let _open_ended = write_wm_segment(&dir, 1_000, 3, WalEndpoint::MainFeed);
+        let applied = all_applied_through(wm_seq(5_000));
+        let deferred = deferred_at(wm_seq(100)); // A is pinned
+        let recorder = Da13dCounters::default();
+        let outcome = metrics::with_local_recorder(&recorder, || {
+            prune_active_segments_deferred_at(
+                &dir,
+                172_800,
+                0,
+                now,
+                Some(&applied),
+                Some(&deferred),
+                true,
+                UploadGate::NotRequired,
+            )
+        });
+        assert!(!a.exists(), "below the floor the pinned segment is taken");
+        assert_eq!(outcome.size_deleted_deferred, 1);
+        assert_eq!(
+            recorder.get(&format!(
+                "{WAL_DEFERRED_DEPTH_LOST_COUNTER},copy_in_s3=false"
+            )),
+            1,
+            "the lost shed depth must reach /metrics, one per segment"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Regression: 2026-10-13 (DA-13d) — the archive-dir prune counted only
+    // age-pass deletes, so byte-pass and disk-floor deletes reached no counter.
+    #[test]
+    fn test_regression_da13d_archive_prune_counts_byte_and_floor_deletes() {
+        let outcome = ArchivePruneOutcome {
+            deleted: 1,
+            size_deleted: 2,
+            size_deleted_deferred: 1,
+            ..ArchivePruneOutcome::default()
+        };
+        assert_eq!(archive_prune_deletions(&outcome), 3);
+        let none = ArchivePruneOutcome::default();
+        assert_eq!(archive_prune_deletions(&none), 0);
     }
 
     // ---- item 45e-1: no delete without a verified S3 copy -----------------

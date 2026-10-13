@@ -565,6 +565,25 @@ pub fn run_after_close_pass(
     if work.is_empty() {
         return summary;
     }
+    // DA-13d: no depth partition is archived (exported, recounted, dropped)
+    // from the first rewrite until the marks are cleared below, so a row
+    // written back here cannot land between an archive's recount and its
+    // DROP and vanish with the partition. Waits for at most the one depth
+    // partition an archive pass may have in flight. Held to the end of this
+    // function; this runs on the pass's own OS thread, never an async one.
+    //
+    // Held through the lag pauses and the settle too, though nothing is
+    // written then, and deliberately: from here until the marks are cleared
+    // the pass still has rows to write into these partitions, so an export
+    // and DROP in a pause would leave those rows out of the S3 copy and the
+    // later rewrite would recreate a partition holding only them. The
+    // archivers read a hold as "stand aside", never as a failure: the daily
+    // leg refunds the attempt and retries, the disk-pressure leg neither
+    // counts the pass nor escalates (DA-13d review). The hold ends by the
+    // pass's own deadline (17:15 IST plus the settle), or earlier at its disk
+    // floor or a cancel.
+    let _depth_partitions =
+        tickvault_storage::partition_archive::hold_depth_partitions_for_rewrite();
     info!(
         buckets = work.len(),
         overflowed = snap.overflowed,
@@ -1215,6 +1234,48 @@ mod tests {
         assert!(
             clock.get() >= IN_WINDOW + AFTER_CLOSE_SETTLE.as_secs(),
             "it waited to settle"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Regression: 2026-10-13 (DA-13d) — the pass wrote depth rows back while
+    // the partition archiver could be between a recount and a DROP of the
+    // same partition. It must hold the depth-partition gate through its
+    // writes and its settle, until the marks are cleared.
+    #[test]
+    fn test_regression_da13d_pass_holds_the_depth_partition_gate_until_cleared() {
+        let (dir, seq) = wal_with_one_refused_frame("gate");
+        let marks = DeferredDepth::new_for_tests();
+        marks.note_shed(seq, ShedDepth::Inline);
+        let clock = Cell::new(IN_WINDOW);
+        let gate_free_during_settle = Cell::new(None);
+        let sleep = |d: Duration| {
+            if d == AFTER_CLOSE_SETTLE {
+                let free =
+                    tickvault_storage::partition_archive::try_hold_depth_partitions().is_some();
+                gate_free_during_settle.set(Some(free));
+            }
+            clock.set(clock.get() + d.as_secs());
+        };
+        let signals = PassSignals {
+            now_secs_ist: &|| clock.get(),
+            lag_growing_tables: &|| 0,
+            sink_suspect: &|| false,
+            disk_free_fraction: &|_| Some(HEALTHY_FREE),
+            sleep: &sleep,
+        };
+        let summary = run_after_close_pass(
+            &mut DepthIngest::for_test(),
+            &marks,
+            &dir,
+            &AtomicBool::new(false),
+            &signals,
+        );
+        assert_eq!(summary.buckets_cleared, 1);
+        assert_eq!(
+            gate_free_during_settle.get(),
+            Some(false),
+            "an archive pass could take a depth partition while the pass settles"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
