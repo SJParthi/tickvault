@@ -58,9 +58,9 @@ on:
         required: true
         default: '600'
       target_iops:
-        description: 'Provisioned IOPS, 3000-16000 (the variables.tf ebs_gp3_iops range). Default 6000 = operator Quote 17, 2026-08-19. Unlike size this CAN go down.'
+        description: 'Provisioned IOPS, 3000-16000 (the variables.tf ebs_gp3_iops range). Default 3000 = operator Quote 30, 2026-10-13 (was 6000 per Quote 17). Unlike size this CAN go down.'
         required: true
-        default: '6000'
+        default: '3000'
       target_throughput:
         description: 'Throughput in MiB/s, 125-1000 (the variables.tf ebs_gp3_throughput range). Default 500 = operator Quote 17, 2026-08-19. Unlike size this CAN go down.'
         required: true

@@ -294,7 +294,7 @@ fn deploy_ebs_default_is_600gb() {
     // NOT higher: 700 GB would add another $9.12/mo on top of a forecast that
     // already sits above the $135 automatic-stop line.
     // NOTE: the trailing space is load-bearing — `squish` collapses the file to
-    // one string, and `ebs_gp3_iops` defaults to 6000, so a bare "default = 600"
+    // one string, and `ebs_gp3_iops` defaulted to 6000 until 2026-10-13 (3000 since Quote 30), so a bare "default = 600"
     // would match it; the 700 pin below has no such collision but keeps the
     // trailing space for the same reason. Caught by running it.
     assert!(
