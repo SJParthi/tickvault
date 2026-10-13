@@ -38,6 +38,21 @@ paths:
 >
 > **⚠ OPERATOR RULING 2026-07-19 — 30 GB accepted, t4g.medium as-of-now, NEW HARD TARGET < ₹1,000/mo:** verbatim quote + the itemized sub-1K path live in the dedicated "OPERATOR RULING 2026-07-19" section below. The base bill alone (~₹1,077/mo at the ~176-hr auto-schedule basis) EXCEEDS the target — <₹1,000 is UNREACHABLE without at least one operator-gated lever; see the lever table.
 
+## OPERATOR RULING 2026-10-13 — AWS at or under ₹15,000 a month: one stop at $170, IOPS 6,000 → 3,000
+
+Owner, 2026-10-13 (verbatim, typos preserved): "bro nto for claude dude im talkign about aws per month shdou leb inr 15 dude okay?", then two decision cards: "Stop at ₹15,000 + trim (Recommended)" and, after a correction naming the 90% early stop, "Stop at ₹15k + cut unused disk (Recommended)". Full record, measurements and REJECT list: `daily-universe-scope-expansion-2026-05-27.md` §0 Quote 30.
+
+| | Before | After |
+|---|---|---|
+| Four lockstep sites + `STANDING_BUDGET_KILL_USD` | $150 | **$170** (≈₹15,000 at an Assumed ~₹88/USD) |
+| Native `STOP_EC2_INSTANCES` actions | at 90% ($135) and 100% ($150) | **one, at 100% ($170)** |
+| Disk IOPS | 6,000 | **3,000** (free baseline); throughput stays 500 MiB/s |
+| October projection | ~$173–175, stopped ~23 Oct | ~$165 (Assumed), no stop |
+
+Measured 13 Oct: IOPS ~1,000 average after 10:00 IST (peak 3,658 during start-up); the instance's EBS burst balance was 0% from about 10:00 IST and the disk was held at ~149 MiB/s for the rest of the session. Alarm trim was measured at ~$0.40/mo of truly unused alarms and is not taken here.
+
+Honest limit: a stop does not stop the bill. The volume, alarms and IP keep billing (~$3.5/day), so a month that trips the $170 stop ends a little above it.
+
 ## OPERATOR RULING 2026-09-23 — September kill-ceiling $150 → $225; October clamped back to $150
 
 Operator, 2026-09-23 (verbatim, typos preserved):

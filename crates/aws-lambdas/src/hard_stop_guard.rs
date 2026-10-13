@@ -59,16 +59,21 @@ use tracing::{error, info, warn};
 /// 2026-10-01 (audit PR30b): 225.0 → 150.0, the scheduled revert of the
 /// September-only allowance. Equal to `STANDING_BUDGET_KILL_USD`, so the month
 /// clamp below no longer changes any month.
-pub const DEFAULT_BUDGET_KILL_USD: f64 = 150.0;
+///
+/// 2026-10-13 (operator Quote 30, daily-universe §0): 150.0 → 170.0, so AWS
+/// stays at or under ₹15,000 a month (≈$170 at an Assumed ~₹88/USD) and
+/// October is not stopped around 23 Oct by the old line.
+pub const DEFAULT_BUDGET_KILL_USD: f64 = 170.0;
 
 /// The STANDING monthly kill line: from October 2026 the bill must stay within
-/// $150 (operator Quote 23, 2026-09-23 — daily-universe §0 + aws-budget.md).
+/// $150 (operator Quote 23, 2026-09-23 — daily-universe §0 + aws-budget.md),
+/// raised to **$170** (≈₹15,000) by operator Quote 30 on 2026-10-13.
 ///
 /// The configured ceiling (`BUDGET_KILL_USD` / `DEFAULT_BUDGET_KILL_USD`) was
 /// $225 as a September-2026-only allowance, and is $150 again since 2026-10-01. `effective_budget_kill_usd` clamps
 /// every other month back to this value IN CODE, so October is protected even
 /// if the scheduled 1-Oct revert of the terraform value is late or never lands.
-pub const STANDING_BUDGET_KILL_USD: f64 = 150.0;
+pub const STANDING_BUDGET_KILL_USD: f64 = 170.0;
 
 // A clamp must never RAISE the line: the standing ceiling may not sit above
 // the configured (September-allowance) fallback.
@@ -745,7 +750,7 @@ pub async fn run_guard<E: Ec2Api, N: SnsApi, V: EventsApi, C: CeApi, P: SsmApi>(
         // 2026-09-23 (operator Quote 23): every kill decision, ping and
         // breach message below uses the EFFECTIVE line for this UTC billing
         // month: $150 since the 2026-10-01 revert (it was $225 in September
-        // 2026 only). Shadowing
+        // 2026 only), $170 since operator Quote 30 (2026-10-13). Shadowing
         // `env` makes it impossible for one branch to read the raw value.
         let effective_env = GuardEnv {
             budget_kill_usd: effective_budget_kill_usd(
@@ -2154,15 +2159,15 @@ aws events enable-rule --name tv-prod-daily-start\n"
 
     #[test]
     fn effective_ceiling_october_2026_is_clamped_to_the_standing_line() {
-        assert_eq!(effective_budget_kill_usd(225.0, 2026, 10), 150.0);
-        assert_eq!(effective_budget_kill_usd(225.0, 2026, 8), 150.0);
+        assert_eq!(effective_budget_kill_usd(225.0, 2026, 10), 170.0);
+        assert_eq!(effective_budget_kill_usd(225.0, 2026, 8), 170.0);
     }
 
     #[test]
     fn effective_ceiling_other_years_september_is_still_clamped() {
         // The allowance is one billing month, never "every September".
-        assert_eq!(effective_budget_kill_usd(225.0, 2027, 9), 150.0);
-        assert_eq!(effective_budget_kill_usd(225.0, 2025, 9), 150.0);
+        assert_eq!(effective_budget_kill_usd(225.0, 2027, 9), 170.0);
+        assert_eq!(effective_budget_kill_usd(225.0, 2025, 9), 170.0);
     }
 
     #[test]
@@ -2206,7 +2211,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
     }
 
     #[tokio::test]
-    async fn effective_ceiling_october_breach_at_160_stops_even_with_a_225_config() {
+    async fn effective_ceiling_october_breach_at_175_stops_even_with_a_225_config() {
         // 2026-10-01 is a Thursday; 04:30 UTC = 10:00 IST, inside the window.
         let env = GuardEnv {
             budget_kill_usd: 225.0,
@@ -2224,7 +2229,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
             &sns,
             &events,
             &FakeCe {
-                amount: Some(160.0),
+                amount: Some(175.0),
             },
             &ssm,
             utc(2026, 10, 1, 4, 30),
@@ -2235,10 +2240,43 @@ aws events enable-rule --name tv-prod-daily-start\n"
         assert_eq!(*ec2.stopped.borrow(), vec![vec!["i-tvapp".to_string()]]);
         let published = sns.published.borrow();
         assert!(
-            published[0].message.contains(">= $150 stop-budget"),
+            published[0].message.contains(">= $170 stop-budget"),
             "the breach page must name the EFFECTIVE line: {}",
             published[0].message
         );
+    }
+
+    #[tokio::test]
+    async fn test_regression_quote30_october_at_165_does_not_stop() {
+        // Operator Quote 30 (2026-10-13): the line is $170 (≈₹15,000). An
+        // October month-to-date of $165 was a breach at the old $150 line
+        // and must not stop the box now.
+        let env = GuardEnv {
+            budget_kill_usd: DEFAULT_BUDGET_KILL_USD,
+            ..test_env()
+        };
+        let (ec2, sns, events) = (
+            FakeEc2::new("running"),
+            FakeSns::default(),
+            FakeEvents::new(),
+        );
+        let ssm = FakeSsm::new(None);
+        let out = run_guard(
+            &env,
+            &ec2,
+            &sns,
+            &events,
+            &FakeCe {
+                amount: Some(165.0),
+            },
+            &ssm,
+            utc(2026, 10, 27, 4, 30),
+        )
+        .await
+        .expect("run_guard ok");
+        assert_ne!(out["breach"], json!(true));
+        assert!(ec2.stopped.borrow().is_empty());
+        assert!(events.disabled.borrow().is_empty());
     }
 
     #[tokio::test]

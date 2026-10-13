@@ -141,11 +141,11 @@ fn fallback_kill_line_is_never_below_the_real_ceiling() {
 
 /// The ceiling must stay a real guard, not a rubber stamp.
 ///
-/// The AUTOMATIC budget actions fire at 90% of the limit, so the ceiling has to
-/// clear the recorded bill's high estimate ($73.60/mo at ~210 hrs on
-/// r8g.xlarge, daily-universe §7 "Bill 2026-08-08") with margin — otherwise the
-/// kill trips mid-session, which is the 2026-07-31 incident. It also must not
-/// drift so high that it stops being a guard at all.
+/// Since operator Quote 30 (2026-10-13) the ONE native `STOP_EC2_INSTANCES`
+/// action fires at 100% of the limit (the 90% early stop was removed; see
+/// `native_stop_is_one_action_at_100_percent` below), so the limit itself has
+/// to clear the measured month with margin, or the box is stopped mid-month.
+/// It also must not drift so high that it stops being a guard at all.
 #[test]
 fn ceiling_brackets_the_recorded_bill_high_estimate() {
     let root = repo_root();
@@ -153,28 +153,49 @@ fn ceiling_brackets_the_recorded_bill_high_estimate() {
         &read(&root.join("deploy/aws/terraform/budget.tf")),
         "limit_amount",
     );
-    // 2026-08-19 (operator Quote 17): the gp3 IOPS 3000->6000 + throughput
-    // 125->500 raise adds $30.00/mo, moving the recorded high estimate
-    // $82.72 -> $112.72 (daily-universe-scope-expansion-2026-05-27.md §0
-    // Quote 17). Leaving this at the stale $73.60 would have let the guard
-    // pass vacuously: 100 * 0.90 = $90 still "clears" $73.60 while sitting
-    // BELOW the real bill, which is precisely the mid-session stop this test
-    // exists to prevent. The number must track the recorded bill or the test
-    // guards nothing.
-    const BILL_HIGH_USD: f64 = 112.72;
-    let ninety_pct = tf_limit * 0.90;
+    // 2026-10-13 (Quote 30): Cost Explorer read October 1-12 = $71.80 and
+    // projected ~$173-175 at the old config. With disk IOPS 6000 -> 3000
+    // (-$15/mo, ~$8.50 over the rest of October) the projection is ~$165
+    // (Assumed). The previous $112.72 here was the 2026-08-19 estimate and
+    // had gone stale: it let the 90% line "clear" a bill it sat far below.
+    const BILL_HIGH_USD: f64 = 165.0;
     assert!(
-        ninety_pct > BILL_HIGH_USD,
-        "the 90% budget-action line (${ninety_pct:.2}) does NOT clear the recorded \
-         bill high estimate (${BILL_HIGH_USD:.2}) — STOP_EC2_INSTANCES would fire \
-         mid-session. Raise limit_amount (all four sites) or re-cost the bill in \
-         daily-universe-scope-expansion-2026-05-27.md §7 first."
+        tf_limit > BILL_HIGH_USD,
+        "the native stop line (${tf_limit:.2}, 100% of limit_amount) does NOT clear \
+         the recorded month (${BILL_HIGH_USD:.2}) — STOP_EC2_INSTANCES would fire \
+         mid-month. Cut cost or raise the limit with a dated quote first."
     );
     assert!(
         tf_limit <= 3.0 * BILL_HIGH_USD,
-        "limit_amount (${tf_limit}) is more than 3x the recorded bill high estimate \
-         (${BILL_HIGH_USD:.2}) — that is a rubber stamp, not a kill line. Re-cost the \
-         bill in §7 if the workload genuinely grew."
+        "limit_amount (${tf_limit}) is more than 3x the recorded month \
+         (${BILL_HIGH_USD:.2}) — that is a rubber stamp, not a kill line."
+    );
+}
+
+/// Quote 30 (2026-10-13): exactly ONE native budget stop, at 100%. A second
+/// action below 100% would stop the box under the owner's ₹15,000 line
+/// (at $170, a 90% action fires at $153 ≈ ₹13,500).
+#[test]
+fn native_stop_is_one_action_at_100_percent() {
+    let body = read(&repo_root().join("deploy/aws/terraform/budget.tf"));
+    let live: String = body
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        live.matches("resource \"aws_budgets_budget_action\"")
+            .count(),
+        1,
+        "budget.tf must declare exactly one aws_budgets_budget_action (Quote 30)"
+    );
+    assert!(
+        live.contains("action_threshold_value = 100"),
+        "the one native stop must fire at 100% of limit_amount"
+    );
+    assert!(
+        !live.contains("stop_at_90"),
+        "the 90% early stop was removed by Quote 30; re-adding it needs a dated quote"
     );
 }
 
@@ -204,20 +225,21 @@ fn rule_files_record_the_current_ceiling() {
 }
 
 /// Quote 23 (2026-09-23): the September 2026 allowance is ONE month, and the
-/// standing ceiling after it is $150. Pinned so the allowance can never quietly
-/// become the new normal, and so the clamp can never sit ABOVE the configured
-/// ceiling (which would make it a raise, not a clamp).
+/// standing ceiling after it was $150; operator Quote 30 (2026-10-13) set it
+/// to $170 (≈₹15,000). Pinned so the allowance can never quietly become the
+/// new normal, and so the clamp can never sit ABOVE the configured ceiling
+/// (which would make it a raise, not a clamp).
 #[test]
-fn standing_cap_is_150_and_the_allowance_is_one_month() {
+fn standing_cap_is_170_and_the_allowance_is_one_month() {
     assert!(
-        (STANDING_BUDGET_KILL_USD - 150.0).abs() < f64::EPSILON,
-        "the standing ceiling moved off $150 without a dated operator quote"
+        (STANDING_BUDGET_KILL_USD - 170.0).abs() < f64::EPSILON,
+        "the standing ceiling moved off $170 without a dated operator quote"
     );
     // "The clamp never sits above the configured ceiling" is a compile-time
     // assert in hard_stop_guard.rs, next to the two constants.
     assert_eq!(SEPTEMBER_2026_ALLOWANCE, (2026, 9));
 
-    // Every month of the next three years EXCEPT 2026-09 resolves to $150.
+    // Every month of the next three years EXCEPT 2026-09 resolves to $170.
     for year in 2026..=2028 {
         for month in 1..=12 {
             let effective = effective_budget_kill_usd(DEFAULT_BUDGET_KILL_USD, year, month);
@@ -226,7 +248,7 @@ fn standing_cap_is_150_and_the_allowance_is_one_month() {
             } else {
                 assert!(
                     (effective - STANDING_BUDGET_KILL_USD).abs() < f64::EPSILON,
-                    "{year}-{month:02} resolved to ${effective}, not the standing $150"
+                    "{year}-{month:02} resolved to ${effective}, not the standing $170"
                 );
             }
         }
@@ -240,8 +262,8 @@ fn standing_cap_is_150_and_the_allowance_is_one_month() {
     ] {
         let body = read(&root.join(rel));
         assert!(
-            body.contains("$150") && body.contains("$225"),
-            "{rel} must record $150 and $225"
+            body.contains("$150") && body.contains("$225") && body.contains("$170"),
+            "{rel} must record $150, $225 and $170"
         );
     }
 }

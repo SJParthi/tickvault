@@ -225,7 +225,15 @@ resource "aws_budgets_budget" "tv_monthly" {
   #   sites. The native 90% STOP_EC2_INSTANCES line is $135.00 again, BELOW the
   #   code kill line of $150; aws-budget.md records the October projection
   #   (~$150 pre-tax) and that an operator lever is needed to stay under it.
-  limit_amount      = "150"
+  # 2026-10-13 (operator Quote 30, daily-universe §0): $150 -> $170 so AWS
+  #   stays at or under ₹15,000 a month (≈$170 at an Assumed ~₹88/USD).
+  #   Measured: October 1-12 = $71.80, projection ~$173-175 at the old
+  #   config, so the old native 90% stop ($135) would have stopped the box
+  #   around 23 Oct. The 90% early-stop action below is REMOVED in the same
+  #   change: the one native stop is at 100% = $170, matching the hourly
+  #   guard's line. Disk IOPS 6000 -> 3000 (variables.tf) brings the October
+  #   projection to ~$165 (Assumed).
+  limit_amount      = "170"
   limit_unit        = "USD"
   time_unit         = "MONTHLY"
   time_period_start = "2026-05-01_00:00"
@@ -438,29 +446,8 @@ resource "aws_budgets_budget_action" "stop_at_100" {
   }
 }
 
-# 90% ACTUAL — early stop so the box never even reaches 100% under a runaway.
-resource "aws_budgets_budget_action" "stop_at_90" {
-  budget_name        = aws_budgets_budget.tv_monthly.name
-  action_type        = "RUN_SSM_DOCUMENTS"
-  approval_model     = "AUTOMATIC"
-  execution_role_arn = aws_iam_role.budget_action.arn
-  notification_type  = "ACTUAL"
-
-  action_threshold {
-    action_threshold_type  = "PERCENTAGE"
-    action_threshold_value = 90
-  }
-
-  definition {
-    ssm_action_definition {
-      action_sub_type = "STOP_EC2_INSTANCES"
-      region          = var.aws_region
-      instance_ids    = [aws_instance.tv_app.id]
-    }
-  }
-
-  subscriber {
-    address           = var.operator_email
-    subscription_type = "EMAIL"
-  }
-}
+# 2026-10-13 (operator Quote 30): the 90% ACTUAL early-stop action
+# (`stop_at_90`) is REMOVED. At $170 it would stop the box at $153, about
+# ₹13,500, below the owner's ₹15,000 line. The one native stop is
+# `stop_at_100` above. Re-adding a native stop below 100% needs a fresh dated
+# quote (Quote 30 REJECT list).
