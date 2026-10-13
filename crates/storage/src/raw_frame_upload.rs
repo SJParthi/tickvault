@@ -1106,12 +1106,16 @@ fn any_file(_path: &Path) -> bool {
     true
 }
 
-/// The WAL root, `replaying/` and `archive/`, all marked in `<wal>/uploaded`.
+/// The WAL root, `replaying/`, `settling/` and `archive/`, all marked in
+/// `<wal>/uploaded`. `settling/` (DA-13c) holds acked replay segments until
+/// they are durable, for minutes or, when held, until the next boot: without
+/// it those segments had no off-box copy for that time.
 fn wal_scan_dirs(wal_dir: &Path) -> Vec<ScanDir> {
     let markers = markers_dir(wal_dir);
     [
         wal_dir.to_path_buf(),
         wal_dir.join("replaying"),
+        wal_dir.join(crate::wal_replay_settle::SETTLING_SUBDIR),
         wal_dir.join("archive"),
     ]
     .into_iter()
@@ -1996,6 +2000,21 @@ mod tests {
         assert_eq!((s.uploaded, s.backlog_after), (2, 1));
         let puts = store.puts.lock().expect("lock").clone(); // APPROVED: test-only
         assert!(puts[0].ends_with("01.wal.gz") && puts[1].ends_with("02.wal.gz"));
+    }
+
+    /// DA-13c: a segment the replay acked and is holding in `settling/`
+    /// until it is durable still gets its off-box copy.
+    #[tokio::test]
+    async fn test_regression_da13c_settling_segments_are_uploaded() {
+        let dir = temp_wal_dir("settling");
+        let settling = dir.join(crate::wal_replay_settle::SETTLING_SUBDIR);
+        std::fs::create_dir_all(&settling).expect("mkdir"); // APPROVED: test-only
+        plant(&settling, "ws-frames-01790000000000000004.wal", b"s");
+        let store = FakeStore::default();
+        let s = run_pass_with(&store, &dir, 8, &always, &never_open, SystemTime::now()).await;
+        assert_eq!((s.uploaded, s.backlog_after), (1, 0));
+        let puts = store.puts.lock().expect("lock").clone(); // APPROVED: test-only
+        assert!(puts[0].ends_with("04.wal.gz"));
     }
 
     #[tokio::test]
