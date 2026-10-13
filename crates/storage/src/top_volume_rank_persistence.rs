@@ -2441,6 +2441,177 @@ impl TopVolumeRankWriter {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Spill tier — constants and spec (top_volume spill plan item 2, 2026-10-13)
+// ---------------------------------------------------------------------------
+//
+// ⚠ NOT YET WRITTEN TO. This PR (PR-A of
+// `.claude/plans/active-plan-top-volume-spill.md`) lands the tier's constants
+// and its spec for the shared `tick_persistence::spill_failed_ilp_to` only.
+// The writer still DROPS a batch it cannot land (`report_lost`, the queue-full
+// arm), so every "no spill tier" sentence in this module stays true until
+// PR-B (plan items 3 and 4) routes those arms through this spec, and the
+// replay supervisor for the folder lands in PR-C (item 5).
+
+/// Folder a top_volume batch that cannot reach QuestDB will be appended to,
+/// once PR-B wires it: `data/spill/top_volume`, a sibling of
+/// `data/spill/ticks` and `data/spill/depth` under the same `data/` root.
+pub const TOP_VOLUME_SPILL_DIR: &str = "data/spill/top_volume";
+
+/// First part of the spill file name: `top_volume-dhan-<unix hour>.ilp`.
+pub const TOP_VOLUME_SPILL_FILE_PREFIX: &str = "top_volume";
+
+/// The feed in the spill file name. Every `top_volume` row is stamped
+/// `feed=dhan` (the app's `SNAPSHOT_FEED`), and the tables are Dhan only
+/// (owner rule 2026-10-13: "one and only dhan").
+pub const TOP_VOLUME_SPILL_FEED: tickvault_common::feed::Feed = tickvault_common::feed::Feed::Dhan;
+
+/// Fraction of the volume the top_volume spill folder may hold: one
+/// sixty-fourth, half the tick tier's share
+/// ([`crate::tick_persistence::TICK_SPILL_VOLUME_FRACTION`]), because this
+/// is derived data and the lowest-priority tier. On a 600 GB volume that is
+/// about 9.4 GB (owner decision Q3, 2026-10-13).
+pub const TOP_VOLUME_SPILL_VOLUME_FRACTION: u64 = 64;
+
+const _: () = assert!(
+    TOP_VOLUME_SPILL_VOLUME_FRACTION > crate::tick_persistence::TICK_SPILL_VOLUME_FRACTION,
+    "the top_volume spill tier must own a SMALLER share of the volume than \
+     the tick tier: it is derived data, refused first as the disk fills."
+);
+
+/// Floor for the top_volume spill ceiling (256 MiB), used when the volume is
+/// small or cannot be measured. About 800,000 rows at the ~330 B typical
+/// line (Assumed), so a short outage is still absorbed on a tiny volume.
+pub const TOP_VOLUME_SPILL_MIN_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Free space a top_volume spill write must leave behind: depth's reserve
+/// plus 8 GiB, so 40 GiB (owner decision Q2, 2026-10-13: on a filling disk
+/// top_volume is refused first, then depth, then ticks).
+///
+/// Used as this tier's ALWAYS-ON per-write floor, not only past a ceiling.
+/// That is what makes the order hold in every regime: depth's strongest
+/// guard is its ceiling reserve
+/// ([`crate::tick_persistence::DEPTH_SPILL_FREE_RESERVE_BYTES`], 32 GiB,
+/// reached only once depth's own folder is past its rail) and its always-on
+/// floor is 16 GiB; top_volume refuses at any free space below
+/// `payload + 40 GiB`, whatever either folder holds. The two folders are
+/// independent, which is exactly how the tick/depth inversion of 2026-09-01
+/// got through a same-kind comparison, so the asserts below compare across
+/// kinds.
+pub const TOP_VOLUME_SPILL_FREE_RESERVE_BYTES: u64 =
+    crate::tick_persistence::DEPTH_SPILL_FREE_RESERVE_BYTES + 8 * 1024 * 1024 * 1024;
+
+const _: () = assert!(
+    TOP_VOLUME_SPILL_FREE_RESERVE_BYTES > crate::tick_persistence::DEPTH_SPILL_FREE_RESERVE_BYTES,
+    "top_volume MUST reserve more than depth's strongest guard. If it does \
+     not, there is a band of free space where depth is refused while \
+     derived top_volume rows are still written."
+);
+
+const _: () = assert!(
+    TOP_VOLUME_SPILL_FREE_RESERVE_BYTES
+        > crate::tick_persistence::DEPTH_SPILL_MIN_FREE_HEADROOM_BYTES,
+    "top_volume's always-on floor MUST exceed depth's always-on floor."
+);
+
+/// The top_volume spill ceiling for a volume of `total_bytes`: one
+/// sixty-fourth of it, never below [`TOP_VOLUME_SPILL_MIN_MAX_BYTES`]. An
+/// unknown or zero total falls back to that floor. Pure, so every arm is
+/// testable without a real volume.
+#[must_use]
+pub const fn top_volume_spill_ceiling_from_total(total_bytes: Option<u64>) -> u64 {
+    match total_bytes {
+        Some(total) if total > 0 => {
+            let derived = total / TOP_VOLUME_SPILL_VOLUME_FRACTION;
+            if derived > TOP_VOLUME_SPILL_MIN_MAX_BYTES {
+                derived
+            } else {
+                TOP_VOLUME_SPILL_MIN_MAX_BYTES
+            }
+        }
+        _ => TOP_VOLUME_SPILL_MIN_MAX_BYTES,
+    }
+}
+
+/// The top_volume spill folder's HARD size ceiling, in bytes, derived from
+/// the volume ([`top_volume_spill_ceiling_from_total`]).
+///
+/// Resolved ONCE into a `OnceLock`, so every later read is O(1) and the
+/// enforcement can never disagree with the number the log line quotes. An
+/// unmeasurable volume falls back to [`TOP_VOLUME_SPILL_MIN_MAX_BYTES`] with
+/// a coded warning, never silently.
+///
+/// # Complexity
+/// O(1) after the first call; the first call makes one `statvfs` call, on
+/// the cold flush-failure path only.
+#[must_use]
+// WIRING-EXEMPT: reached through `top_volume_spill_spec`, whose spill writer lands in PR-B (plan item 3).
+pub fn top_volume_spill_max_bytes() -> u64 {
+    static RESOLVED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *RESOLVED.get_or_init(|| {
+        // Probe the deepest EXISTING ancestor: `statvfs` on a path that does
+        // not exist yet fails, and the spill folder is created lazily.
+        let mut probe = std::path::Path::new(TOP_VOLUME_SPILL_DIR);
+        while !probe.exists() {
+            match probe.parent() {
+                Some(parent) => probe = parent,
+                None => break,
+            }
+        }
+        let total = match crate::disk_health_watcher::probe_disk_free_bytes(probe) {
+            crate::disk_health_watcher::DiskHealthOutcome::Ok { total_bytes, .. }
+                if total_bytes > 0 =>
+            {
+                Some(total_bytes)
+            }
+            _ => None,
+        };
+        let ceiling = top_volume_spill_ceiling_from_total(total);
+        match total {
+            Some(total_bytes) => tracing::info!(
+                total_bytes,
+                ceiling_bytes = ceiling,
+                fraction = TOP_VOLUME_SPILL_VOLUME_FRACTION,
+                "top_volume spill ceiling derived from the volume — a hard limit: past it, \
+                 top_volume batches that cannot reach QuestDB are refused and counted"
+            ),
+            None => warn!(
+                code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
+                fallback_bytes = TOP_VOLUME_SPILL_MIN_MAX_BYTES,
+                "could not measure the spill volume, so the top_volume spill ceiling falls \
+                 back to the fixed floor. Past that size top_volume batches that cannot reach \
+                 QuestDB will be refused and counted"
+            ),
+        }
+        ceiling
+    })
+}
+
+/// The top_volume tier's spill spec for the shared
+/// `tick_persistence::spill_failed_ilp_to`: file
+/// `top_volume-dhan-<unix hour>.ilp` in `dir`, HARD ceiling
+/// [`top_volume_spill_max_bytes`], per-write floor
+/// [`TOP_VOLUME_SPILL_FREE_RESERVE_BYTES`], FAIL-CLOSED when the free-space
+/// probe is blind (like depth), and no drain-side folder total (this tier
+/// never spills on the frame drain).
+///
+/// Production passes [`TOP_VOLUME_SPILL_DIR`]; tests pass a scratch folder.
+#[must_use]
+// WIRING-EXEMPT: the formatter and flush threads that spill through this land in PR-B (plan item 3).
+pub fn top_volume_spill_spec(dir: &std::path::Path) -> crate::tick_persistence::IlpSpillSpec<'_> {
+    crate::tick_persistence::IlpSpillSpec {
+        dir,
+        file_prefix: TOP_VOLUME_SPILL_FILE_PREFIX,
+        feed: TOP_VOLUME_SPILL_FEED,
+        ceiling: top_volume_spill_max_bytes,
+        ceiling_kind: crate::tick_persistence::SpillCeilingKind::Hard,
+        free_reserve: TOP_VOLUME_SPILL_FREE_RESERVE_BYTES,
+        blind: crate::tick_persistence::BlindWritePolicy::FailClosed,
+        tier: crate::tick_persistence::SpillTier::TopVolume,
+        drain_held: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4166,5 +4337,329 @@ mod row_handoff_tests {
             !body.contains(".send(batch)"),
             "a blocking send re-couples the drain"
         );
+    }
+}
+// 2026-10-13 — top_volume spill plan item 2: the tier's constants and spec.
+// The writer does not spill yet (PR-B); these pin the numbers and the
+// refusal order it will run under.
+#[cfg(test)]
+mod spill_tier_tests {
+    use super::*;
+    use crate::tick_persistence::{
+        BlindWritePolicy, DEPTH_SPILL_FREE_RESERVE_BYTES, DEPTH_SPILL_MIN_FREE_HEADROOM_BYTES,
+        SPILL_MIN_FREE_HEADROOM_BYTES, SPILL_SOFT_CEILING_FREE_RESERVE_BYTES, SpillCeilingKind,
+        SpillCeilingVerdict, SpillFloorVerdict, SpillTier, classify_spill_ceiling,
+        classify_spill_floor, spill_failed_ilp_to, tick_spill_spec,
+    };
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "tv-top-volume-spill-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ))
+    }
+
+    #[test]
+    fn test_top_volume_reserve_is_above_depth_reserve() {
+        // The compile-time asserts beside the constant already refuse a
+        // build that breaks this; the test states the exact numbers so a
+        // change to either reserve is a visible diff here as well.
+        assert!(TOP_VOLUME_SPILL_FREE_RESERVE_BYTES > DEPTH_SPILL_FREE_RESERVE_BYTES);
+        assert!(TOP_VOLUME_SPILL_FREE_RESERVE_BYTES > DEPTH_SPILL_MIN_FREE_HEADROOM_BYTES);
+        assert_eq!(
+            TOP_VOLUME_SPILL_FREE_RESERVE_BYTES,
+            DEPTH_SPILL_FREE_RESERVE_BYTES + 8 * GIB
+        );
+        assert_eq!(TOP_VOLUME_SPILL_FREE_RESERVE_BYTES, 40 * GIB);
+        let dir = scratch_dir("reserve");
+        let spec = top_volume_spill_spec(&dir);
+        assert_eq!(
+            spec.free_reserve, TOP_VOLUME_SPILL_FREE_RESERVE_BYTES,
+            "the spec must enforce the reserve as its per-write floor"
+        );
+    }
+
+    /// The order the owner chose (Q2, 2026-10-13), driven through both tiers'
+    /// whole decision over known AND unknown free space and independent
+    /// folder sizes: wherever depth refuses, top_volume has refused too, and
+    /// so (by the existing tick/depth sweep) wherever ticks refuse.
+    #[test]
+    fn top_volume_never_spills_while_depth_is_refused_including_when_df_is_blind() {
+        fn depth_refuses(free: Option<u64>, dir: u64, cap: u64, payload: u64) -> bool {
+            if matches!(
+                classify_spill_ceiling(dir, cap, free, DEPTH_SPILL_FREE_RESERVE_BYTES),
+                SpillCeilingVerdict::OverCeilingNoRoom
+                    | SpillCeilingVerdict::OverCeilingProbeFailed
+            ) {
+                return true;
+            }
+            matches!(
+                classify_spill_floor(
+                    free,
+                    payload,
+                    DEPTH_SPILL_MIN_FREE_HEADROOM_BYTES,
+                    BlindWritePolicy::FailClosed,
+                ),
+                SpillFloorVerdict::RefuseNoRoom | SpillFloorVerdict::RefuseProbeFailed
+            )
+        }
+
+        // top_volume's decision, read from its real spec.
+        let scratch = scratch_dir("order");
+        let spec = top_volume_spill_spec(&scratch);
+        let top_volume_refuses = |free: Option<u64>, dir: u64, ceiling: u64, payload: u64| {
+            if dir >= ceiling && spec.ceiling_kind == SpillCeilingKind::Hard {
+                return true;
+            }
+            matches!(
+                classify_spill_floor(free, payload, spec.free_reserve, spec.blind),
+                SpillFloorVerdict::RefuseNoRoom | SpillFloorVerdict::RefuseProbeFailed
+            )
+        };
+
+        let frees = [
+            None,
+            Some(0),
+            Some(1),
+            Some(GIB),
+            Some(SPILL_SOFT_CEILING_FREE_RESERVE_BYTES),
+            Some(DEPTH_SPILL_FREE_RESERVE_BYTES),
+            Some(DEPTH_SPILL_FREE_RESERVE_BYTES + 1),
+            Some(TOP_VOLUME_SPILL_FREE_RESERVE_BYTES),
+            Some(TOP_VOLUME_SPILL_FREE_RESERVE_BYTES + 1),
+            Some(200 * GIB),
+        ];
+        let dirs = [0_u64, 5 * GIB, 10 * GIB];
+        let rails = [1_u64, 10 * GIB];
+        let payloads = [1_u64, 4096, 32 * 1024 * 1024];
+        for free in frees {
+            for dd in dirs {
+                for dc in rails {
+                    for td in dirs {
+                        for tc in rails {
+                            for dp in payloads {
+                                for tp in payloads {
+                                    if depth_refuses(free, dd, dc, dp) {
+                                        assert!(
+                                            top_volume_refuses(free, td, tc, tp),
+                                            "INVERSION: depth refused but top_volume would \
+                                             write. free={free:?} depth_dir={dd} \
+                                             depth_cap={dc} depth_payload={dp} \
+                                             top_volume_dir={td} top_volume_ceiling={tc} \
+                                             top_volume_payload={tp}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Past its ceiling the tier refuses WHATEVER the free space, through the
+    /// real shared spill function, and writes nothing.
+    #[test]
+    fn test_top_volume_spill_ceiling_is_hard() {
+        let dir = scratch_dir("hard");
+        let mut spec = top_volume_spill_spec(&dir);
+        assert_eq!(spec.ceiling_kind, SpillCeilingKind::Hard);
+        // A zero floor, so only the ceiling can refuse: the floor's 40 GiB
+        // would otherwise refuse on a small build machine and hide the arm.
+        spec.free_reserve = 0;
+
+        // Ceiling 0: an empty folder is already "at" it.
+        spec.ceiling = || 0;
+        let err = spill_failed_ilp_to(&spec, b"x\n", 1_700_000_000, None)
+            .expect_err("a hard ceiling refuses at the rail");
+        assert_eq!(err.kind(), std::io::ErrorKind::StorageFull);
+        assert!(
+            err.to_string()
+                .contains("top_volume spill dir at or past its 0-byte hard ceiling"),
+            "the refusal names the tier and the hard rail: {err}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&dir).map_or(0, |d| d.count()),
+            0,
+            "a refused write must leave no file behind"
+        );
+
+        // Under the ceiling the write proceeds and lands verbatim in
+        // `top_volume-dhan-<unix hour>.ilp`.
+        spec.ceiling = || u64::MAX;
+        let payload =
+            b"top_volume_1s,tf=1s,family=stock,feed=dhan,segment=NSE_FNO security_id=1i 1\n";
+        let path = spill_failed_ilp_to(&spec, payload, 1_700_000_000, None)
+            .expect("under the ceiling with a zero floor the write lands");
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("top_volume-dhan-472222.ilp")
+        );
+        assert_eq!(std::fs::read(&path).expect("readable"), payload.to_vec());
+
+        // Now the folder holds those bytes, past a 1-byte ceiling: it admits
+        // nothing more, free space notwithstanding.
+        spec.ceiling = || 1;
+        assert!(
+            spill_failed_ilp_to(&spec, b"y\n", 1_700_000_000, None).is_err(),
+            "a folder past its hard ceiling refuses every further write"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("readable"),
+            payload.to_vec(),
+            "the refused write appended nothing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A blind free-space probe refuses, like depth and unlike ticks. The
+    /// production probe cannot be made to fail from a unit test, so the
+    /// spec's policy is driven through the shared classifier it is handed to.
+    #[test]
+    fn test_top_volume_spill_refuses_when_the_probe_is_blind() {
+        let dir = scratch_dir("blind");
+        let spec = top_volume_spill_spec(&dir);
+        assert_eq!(spec.blind, BlindWritePolicy::FailClosed);
+        assert_eq!(
+            classify_spill_floor(None, 4096, spec.free_reserve, spec.blind),
+            SpillFloorVerdict::RefuseProbeFailed
+        );
+        // No zero-floor carve-out: blind is blind whatever the floor.
+        assert_eq!(
+            classify_spill_floor(None, 4096, 0, spec.blind),
+            SpillFloorVerdict::RefuseProbeFailed
+        );
+        // The tick tier, by contrast, writes blind (counted).
+        let tick = tick_spill_spec(&dir, TOP_VOLUME_SPILL_FEED);
+        assert_eq!(
+            classify_spill_floor(None, 4096, tick.free_reserve, tick.blind),
+            SpillFloorVerdict::AllowProbeFailed
+        );
+    }
+
+    /// `SpillCeilingKind::Soft` counts its growth on the TICK counter, so it
+    /// must stay tick-only until a second soft tier brings its own counter.
+    #[test]
+    fn test_only_the_tick_spec_is_a_soft_ceiling() {
+        let dir = scratch_dir("kinds");
+        assert_eq!(
+            tick_spill_spec(&dir, TOP_VOLUME_SPILL_FEED).ceiling_kind,
+            SpillCeilingKind::Soft {
+                reserve: SPILL_SOFT_CEILING_FREE_RESERVE_BYTES
+            }
+        );
+        assert_eq!(
+            top_volume_spill_spec(&dir).ceiling_kind,
+            SpillCeilingKind::Hard
+        );
+    }
+
+    #[test]
+    fn test_top_volume_spill_spec_names_the_tier_and_never_uses_the_drain_total() {
+        let dir = scratch_dir("spec");
+        let spec = top_volume_spill_spec(&dir);
+        assert_eq!(spec.dir, dir.as_path());
+        assert_eq!(spec.file_prefix, "top_volume");
+        assert_eq!(spec.feed.as_str(), "dhan");
+        assert_eq!(spec.tier, SpillTier::TopVolume);
+        assert_eq!(spec.tier.label(), "top_volume");
+        assert!(
+            spec.drain_held.is_none(),
+            "top_volume never spills on the frame drain, so it must list its folder \
+             every time rather than reuse the tick drain's remembered total"
+        );
+        assert_eq!(TOP_VOLUME_SPILL_DIR, "data/spill/top_volume");
+        // The spec's ceiling is the derived one, resolved once.
+        assert_eq!((spec.ceiling)(), top_volume_spill_max_bytes());
+        // Strictly above the tick floor too (transitively, via depth).
+        assert!(spec.free_reserve > SPILL_MIN_FREE_HEADROOM_BYTES);
+    }
+
+    #[test]
+    fn test_top_volume_spill_ceiling_from_total_covers_every_arm() {
+        // 1/64 of a 600 GB volume, as the owner was shown (Q3).
+        let six_hundred_gb = 600_000_000_000_u64;
+        assert_eq!(
+            top_volume_spill_ceiling_from_total(Some(six_hundred_gb)),
+            six_hundred_gb / 64
+        );
+        // A small volume never drops below the floor.
+        assert_eq!(
+            top_volume_spill_ceiling_from_total(Some(GIB)),
+            TOP_VOLUME_SPILL_MIN_MAX_BYTES
+        );
+        // Exactly at the boundary: 64 x floor yields the floor.
+        assert_eq!(
+            top_volume_spill_ceiling_from_total(Some(64 * TOP_VOLUME_SPILL_MIN_MAX_BYTES)),
+            TOP_VOLUME_SPILL_MIN_MAX_BYTES
+        );
+        assert_eq!(
+            top_volume_spill_ceiling_from_total(Some(64 * TOP_VOLUME_SPILL_MIN_MAX_BYTES + 64)),
+            TOP_VOLUME_SPILL_MIN_MAX_BYTES + 1
+        );
+        // Unknown or zero total: the floor.
+        assert_eq!(
+            top_volume_spill_ceiling_from_total(None),
+            TOP_VOLUME_SPILL_MIN_MAX_BYTES
+        );
+        assert_eq!(
+            top_volume_spill_ceiling_from_total(Some(0)),
+            TOP_VOLUME_SPILL_MIN_MAX_BYTES
+        );
+        // No overflow at the extreme.
+        assert_eq!(
+            top_volume_spill_ceiling_from_total(Some(u64::MAX)),
+            u64::MAX / 64
+        );
+        // Half the tick tier's share.
+        assert_eq!(
+            TOP_VOLUME_SPILL_VOLUME_FRACTION,
+            2 * crate::tick_persistence::TICK_SPILL_VOLUME_FRACTION
+        );
+    }
+
+    #[test]
+    fn test_top_volume_spill_max_bytes_is_resolved_once_and_never_below_the_floor() {
+        let resolved = top_volume_spill_max_bytes();
+        assert!(resolved >= TOP_VOLUME_SPILL_MIN_MAX_BYTES);
+        assert_eq!(
+            resolved,
+            top_volume_spill_max_bytes(),
+            "memoised: the enforced value can never disagree with the logged one"
+        );
+    }
+
+    /// Through the shared function with the real top_volume spec (zero floor
+    /// so a small build machine does not refuse): two batches in one hour
+    /// append to one `top_volume-dhan-<unix hour>.ilp`, verbatim, synced.
+    #[test]
+    fn test_spill_failed_ilp_to_appends_top_volume_batches_verbatim_and_synced() {
+        let dir = scratch_dir("verbatim");
+        let mut spec = top_volume_spill_spec(&dir);
+        spec.free_reserve = 0;
+        let first = b"top_volume_1s,tf=1s security_id=1i 1\n";
+        let second = b"top_volume_1m,tf=1m security_id=2i 2\n";
+        let sync = crate::tick_persistence::SPILL_SYNC_OFF_DRAIN;
+        let p1 = spill_failed_ilp_to(&spec, first, 1_700_000_000, sync).expect("first");
+        let p2 = spill_failed_ilp_to(&spec, second, 1_700_000_001, sync).expect("second");
+        assert_eq!(p1, p2, "same hour, same file");
+        assert_eq!(
+            p1.file_name().and_then(|n| n.to_str()),
+            Some("top_volume-dhan-472222.ilp")
+        );
+        let mut expected = first.to_vec();
+        expected.extend_from_slice(second);
+        assert_eq!(std::fs::read(&p1).expect("readable"), expected);
+        // A failed sync is a failed spill, never a silent success.
+        let failing: Option<crate::tick_persistence::SpillSyncFn> =
+            Some(|_| Err(std::io::Error::other("injected")));
+        assert!(spill_failed_ilp_to(&spec, b"z\n", 1_700_000_000, failing).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

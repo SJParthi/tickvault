@@ -1031,8 +1031,9 @@ const _: () = assert!(
      defences disagree about which lane gives way first."
 );
 
-/// Pre-register both `tier` label values of `tv_spill_free_probe_blind_total`
-/// at 0.
+/// Pre-register every `tier` label value of `tv_spill_free_probe_blind_total`
+/// at 0: `tick`, `depth`, `seal` (since deep audit DA-14) and `top_volume`
+/// (since 2026-10-13, the tier `SpillTier::TopVolume` counts under).
 ///
 /// That counter records rescues written WITHOUT a free-space answer, because
 /// the `df` probe failed. A per-write floor must NOT fail closed — one broken
@@ -1052,6 +1053,9 @@ const _: () = assert!(
 pub fn seed_spill_free_probe_blind_counters() {
     metrics::counter!("tv_spill_free_probe_blind_total", "tier" => "tick").increment(0);
     metrics::counter!("tv_spill_free_probe_blind_total", "tier" => "depth").increment(0);
+    // Deep audit DA-14: the seal escalation floor's blind writes.
+    metrics::counter!("tv_spill_free_probe_blind_total", "tier" => "seal").increment(0);
+    metrics::counter!("tv_spill_free_probe_blind_total", "tier" => "top_volume").increment(0);
 }
 
 // THE CROSS-KIND ASSERT — the one whose absence let the inversion through.
@@ -1388,7 +1392,150 @@ pub(crate) const SPILL_SYNC_OFF_DRAIN: Option<SpillSyncFn> = Some(sync_spill_dat
 /// watermark's durability lag (`WATERMARK_DURABILITY_LAG_SECS`) relies on.
 pub(crate) const SPILL_UNSYNCED_ON_DRAIN: Option<SpillSyncFn> = None;
 
-/// Appends a failed flush's ILP payload to the spill directory.
+/// Which spill tier a write belongs to (top_volume plan item 1, 2026-10-13).
+///
+/// Names the tier in refusal messages and picks the `tier` label of
+/// `tv_spill_free_probe_blind_total`. An enum rather than a free string on
+/// purpose: a non-literal label value drops the `metrics` macro to its
+/// allocating arm (it builds a `Vec` of labels), and the tick drain's inline
+/// fallback runs through this function. Each variant therefore counts with a
+/// LITERAL label, exactly as the tick-only code did before.
+///
+/// Depth is not here: it keeps its own `spill_failed_depth_ilp` (framed
+/// `.dspl` format); folding it in is a separate follow-up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpillTier {
+    /// `data/spill/ticks` — decision-critical, refused LAST.
+    Tick,
+    /// `data/spill/top_volume` — the busiest-contract boards, derived data,
+    /// refused FIRST (before depth and ticks) as the disk fills.
+    TopVolume,
+}
+
+impl SpillTier {
+    /// The tier's name in refusal messages and in the blind-probe counter's
+    /// `tier` label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Tick => "tick",
+            Self::TopVolume => "top_volume",
+        }
+    }
+
+    /// Counts one write decided without a free-space answer, under this
+    /// tier's literal label. O(1), no allocation.
+    fn count_free_probe_blind(self) {
+        match self {
+            Self::Tick => {
+                metrics::counter!("tv_spill_free_probe_blind_total", "tier" => "tick").increment(1);
+            }
+            Self::TopVolume => {
+                metrics::counter!("tv_spill_free_probe_blind_total", "tier" => "top_volume")
+                    .increment(1);
+            }
+        }
+    }
+}
+
+/// What a tier does once its folder is at or past its size ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpillCeilingKind {
+    /// A SOFT rail: past the ceiling, refuse only when free space is at or
+    /// below `reserve` ([`classify_spill_ceiling`]); with room, write and
+    /// count the growth on `tv_tick_spill_over_soft_ceiling_total`.
+    ///
+    /// Only the tick tier is soft, and that counter is the tick tier's. A
+    /// second soft tier must add its own growth counter before it uses this
+    /// arm (pinned by `test_only_the_tick_spec_is_a_soft_ceiling`).
+    Soft {
+        /// The room the database keeps; see
+        /// [`SPILL_SOFT_CEILING_FREE_RESERVE_BYTES`].
+        reserve: u64,
+    },
+    /// A HARD rail: past the ceiling, refuse whatever the free space. For a
+    /// lowest-priority tier, whose growth must never be paid for by a tier
+    /// above it.
+    Hard,
+}
+
+/// Everything that differs between two ILP spill tiers (top_volume plan
+/// item 1, 2026-10-13). One function, [`spill_failed_ilp_to`], serves every
+/// tier through this, so the rules (append, sync before `Ok`, ceiling,
+/// per-write floor, blind policy) are written once and cannot drift the way
+/// the depth twin once did.
+///
+/// Built by [`tick_spill_spec`] (today's tick constants, byte-identical
+/// behaviour) and `top_volume_rank_persistence::top_volume_spill_spec`.
+#[derive(Clone, Copy)]
+pub struct IlpSpillSpec<'a> {
+    /// The spill folder. Production passes the tier's `*_SPILL_DIR`; tests
+    /// pass a scratch folder.
+    pub(crate) dir: &'a Path,
+    /// First part of the file name: `<prefix>-<feed>-<unix hour>.ilp`.
+    pub(crate) file_prefix: &'static str,
+    /// The feed the rows came from (second part of the file name).
+    pub(crate) feed: Feed,
+    /// The folder's size ceiling in bytes. A function so the value is
+    /// resolved lazily (once, into the tier's `OnceLock`) and so a test can
+    /// inject a tiny one.
+    pub(crate) ceiling: fn() -> u64,
+    /// Soft (ticks) or hard (top_volume) at the ceiling.
+    pub(crate) ceiling_kind: SpillCeilingKind,
+    /// The per-write floor: a write must leave at least this many bytes
+    /// free. Ticks: [`SPILL_MIN_FREE_HEADROOM_BYTES`]; top_volume: its
+    /// reserve, which sits above every depth guard.
+    pub(crate) free_reserve: u64,
+    /// What the floor does when the free-space probe fails.
+    pub(crate) blind: BlindWritePolicy,
+    /// The tier, for messages and the blind-probe counter.
+    pub(crate) tier: SpillTier,
+    /// The frame drain's remembered folder total, consulted ONLY when `sync`
+    /// is `None` (the drain's inline fallback). Tick-only: no other tier
+    /// spills on the drain, so every other spec carries `None` and lists the
+    /// folder on every write.
+    pub(crate) drain_held: Option<&'static SpillHeldBytesCache>,
+}
+
+/// The tick tier's spill spec, built from the same constants the tick-only
+/// function used before 2026-10-13, so tick behaviour is unchanged: folder
+/// `dir`, file `ticks-<feed>-<unix hour>.ilp`, soft ceiling
+/// [`tick_spill_max_bytes`] with the [`SPILL_SOFT_CEILING_FREE_RESERVE_BYTES`]
+/// database reserve, per-write floor [`SPILL_MIN_FREE_HEADROOM_BYTES`],
+/// fail-OPEN when blind, and the drain's remembered folder total.
+#[must_use]
+pub(crate) fn tick_spill_spec(dir: &Path, feed: Feed) -> IlpSpillSpec<'_> {
+    IlpSpillSpec {
+        dir,
+        file_prefix: "ticks",
+        feed,
+        ceiling: tick_spill_max_bytes,
+        ceiling_kind: SpillCeilingKind::Soft {
+            reserve: SPILL_SOFT_CEILING_FREE_RESERVE_BYTES,
+        },
+        free_reserve: SPILL_MIN_FREE_HEADROOM_BYTES,
+        blind: BlindWritePolicy::FailOpen,
+        tier: SpillTier::Tick,
+        drain_held: Some(&TICK_DRAIN_SPILL_HELD),
+    }
+}
+
+/// Appends a failed flush's ILP payload to the tick spill directory.
+///
+/// A thin wrapper since 2026-10-13: the rules live in [`spill_failed_ilp_to`],
+/// fed the tick spec ([`tick_spill_spec`]). See that function for why the
+/// payload is stored verbatim and for the `sync` contract.
+fn spill_failed_ilp(
+    dir: &Path,
+    payload: &[u8],
+    feed: Feed,
+    now_unix_secs: i64,
+    sync: Option<SpillSyncFn>,
+) -> std::io::Result<PathBuf> {
+    spill_failed_ilp_to(&tick_spill_spec(dir, feed), payload, now_unix_secs, sync)
+}
+
+/// Appends a failed flush's ILP payload to a tier's spill directory.
 ///
 /// # Why the payload is stored verbatim
 ///
@@ -1402,28 +1549,39 @@ pub(crate) const SPILL_UNSYNCED_ON_DRAIN: Option<SpillSyncFn> = None;
 ///
 /// Re-ingest is idempotent because the `ticks` DEDUP key
 /// `(ts, security_id, segment, capture_seq, feed)` carries `capture_seq`, so a
-/// replayed row UPSERTs onto itself rather than duplicating.
+/// replayed row UPSERTs onto itself rather than duplicating. (The top_volume
+/// tables' key `(ts, tf, family, feed, security_id, segment)` gives the same
+/// property for their rows.)
 ///
 /// # Errors
 ///
-/// `Err` when the directory cannot be created or the append fails. The caller
-/// treats that as "rescue unavailable" and falls back to the counted drop —
-/// a spill that cannot be written must never mask the loss.
+/// `Err` when the directory cannot be created, the ceiling or the free-space
+/// floor refuses, or the append fails. The caller treats that as "rescue
+/// unavailable" and falls back to the counted drop — a spill that cannot be
+/// written must never mask the loss.
 ///
 /// `sync`: [`SPILL_SYNC_OFF_DRAIN`] from the writer and rescue threads (the
 /// payload is `fdatasync`ed before `Ok`), [`SPILL_UNSYNCED_ON_DRAIN`] from the
 /// drain's inline fallback. A failed sync is an `Err` like a failed write.
-fn spill_failed_ilp(
-    dir: &Path,
+///
+/// # Complexity
+///
+/// Not O(1), and flagged: one folder listing (O(files in the folder and its
+/// flat quarantine), skipped on the drain while the tick drain total is
+/// fresh), at most two `statvfs` probes, and an O(payload bytes) append plus
+/// the optional sync. Runs only after a flush already failed.
+pub(crate) fn spill_failed_ilp_to(
+    spec: &IlpSpillSpec<'_>,
     payload: &[u8],
-    feed: Feed,
     now_unix_secs: i64,
     sync: Option<SpillSyncFn>,
 ) -> std::io::Result<PathBuf> {
     // O(1) EXEMPT: begin — cold path, runs only on a flush failure.
+    let dir = spec.dir;
+    let tier = spec.tier.label();
     std::fs::create_dir_all(dir)?;
 
-    // The ceiling is a SOFT rail, not a refusal.
+    // The ceiling is a SOFT rail for ticks, not a refusal.
     //
     // MEASURED IN PRODUCTION 2026-09-01: this arm refused four times with
     // `ceiling = 10_063_871_360` (1/32 of a 322 GB volume) while `df` reported
@@ -1441,15 +1599,17 @@ fn spill_failed_ilp(
     // New rule: past the soft ceiling, refuse ONLY when free space is already
     // at or below the headroom the live guard below enforces anyway. Above it
     // there is demonstrably room, and discarding market data we have somewhere
-    // to put is indefensible.
-    let ceiling = tick_spill_max_bytes();
+    // to put is indefensible. (A HARD tier — top_volume — refuses past its
+    // ceiling whatever the free space: it is the lowest-priority tier, so its
+    // growth must never be paid for by depth or ticks.)
+    let ceiling = (spec.ceiling)();
     // The drain's inline fallback (no sync) reuses a fresh listing; the writer
-    // and rescue threads list every time (deep audit DA-12, NT-1).
+    // and rescue threads list every time (deep audit DA-12, NT-1). Only the
+    // tick spec carries a drain total.
     let on_drain = sync.is_none();
-    let held = if on_drain {
-        TICK_DRAIN_SPILL_HELD.held(dir, std::time::Instant::now(), spill_dir_bytes)
-    } else {
-        spill_dir_bytes(dir)
+    let held = match spec.drain_held {
+        Some(cache) if on_drain => cache.held(dir, std::time::Instant::now(), spill_dir_bytes),
+        _ => spill_dir_bytes(dir),
     };
     // The probe is deliberately INSIDE this branch, not an argument to the
     // call below.
@@ -1458,52 +1618,51 @@ fn spill_failed_ilp(
     // decision into a pure function made `spill_free_bytes(dir)` an eagerly
     // evaluated argument, so every rescue forked `df` -- including the common
     // under-ceiling case, which is most of them, and which needs no free-space
-    // answer at all. Combined with the live headroom guard further down that
-    // was TWO process forks per rescue where the pre-refactor code did one.
-    //
-    // Worth stating because it is the characteristic cost of pure functions:
-    // moving a decision out of an `if` turns a lazily-computed input into an
-    // unconditionally-computed one, and the compiler will not tell you.
+    // answer at all.
     if held >= ceiling {
-        match classify_spill_ceiling(
-            held,
-            ceiling,
-            spill_free_bytes(dir),
-            SPILL_SOFT_CEILING_FREE_RESERVE_BYTES,
-        ) {
-            SpillCeilingVerdict::UnderCeiling => {}
-            SpillCeilingVerdict::OverCeilingWithRoom => {
-                // Room to spare. Allow the rescue and record that we are past the
-                // soft rail, so the growth is never silent.
-                metrics::counter!("tv_tick_spill_over_soft_ceiling_total").increment(1);
+        match spec.ceiling_kind {
+            SpillCeilingKind::Soft { reserve } => {
+                match classify_spill_ceiling(held, ceiling, spill_free_bytes(dir), reserve) {
+                    SpillCeilingVerdict::UnderCeiling => {}
+                    SpillCeilingVerdict::OverCeilingWithRoom => {
+                        // Room to spare. Allow the rescue and record that we are
+                        // past the soft rail, so the growth is never silent.
+                        // Tick-only counter: see `SpillCeilingKind::Soft`.
+                        metrics::counter!("tv_tick_spill_over_soft_ceiling_total").increment(1);
+                    }
+                    SpillCeilingVerdict::OverCeilingNoRoom => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::StorageFull,
+                            format!(
+                                "{tier} spill dir past its {ceiling}-byte soft ceiling and free \
+                                 space is at or below the {reserve}-byte database reserve — \
+                                 refusing so QuestDB keeps room to operate"
+                            ),
+                        ));
+                    }
+                    SpillCeilingVerdict::OverCeilingProbeFailed => {
+                        // COUNT THE BLINDNESS (2026-09-01, adversarial review):
+                        // a failed probe refusing every rescue at the ceiling
+                        // must not leave `tv_spill_free_probe_blind_total` at
+                        // its seeded 0 while the drop counter climbs.
+                        spec.tier.count_free_probe_blind();
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::StorageFull,
+                            format!(
+                                "{tier} spill dir past its {ceiling}-byte soft ceiling and the \
+                                 free-space probe failed — refusing rather than growing blind"
+                            ),
+                        ));
+                    }
+                }
             }
-            SpillCeilingVerdict::OverCeilingNoRoom => {
+            SpillCeilingKind::Hard => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::StorageFull,
                     format!(
-                        "tick spill dir past its {ceiling}-byte soft ceiling and free space is \
-                     at or below the {SPILL_SOFT_CEILING_FREE_RESERVE_BYTES}-byte database \
-                     reserve — refusing so QuestDB keeps room to operate"
-                    ),
-                ));
-            }
-            SpillCeilingVerdict::OverCeilingProbeFailed => {
-                // COUNT THE BLINDNESS (2026-09-01, adversarial review).
-                //
-                // Until now only the FLOOR arms touched this counter, so a
-                // failed free-space probe refusing every rescue AT THE CEILING left the
-                // tier permanently refusing with `tv_spill_free_probe_blind_total`
-                // sitting at its seeded 0. The operator would watch
-                // `tv_ticks_dropped_total` climb with nothing naming the
-                // cause — and a broken probe is the one cause with a
-                // one-command fix. Same counter, same label, so a blind
-                // episode reads as one number wherever it bites.
-                metrics::counter!("tv_spill_free_probe_blind_total", "tier" => "tick").increment(1);
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::StorageFull,
-                    format!(
-                        "tick spill dir past its {ceiling}-byte soft ceiling and the free-space \
-                     probe failed — refusing rather than growing blind"
+                        "{tier} spill dir at or past its {ceiling}-byte hard ceiling — \
+                         refusing whatever the free space, so this lowest-priority tier \
+                         never grows at the expense of depth or ticks"
                     ),
                 ));
             }
@@ -1521,57 +1680,52 @@ fn spill_failed_ilp(
     // take QuestDB down with it, which is the outage this whole tier exists to
     // avoid trading a bounded tick loss for.
     //
-    // So the write is refused when it would leave less than
-    // `SPILL_MIN_FREE_HEADROOM_BYTES` behind. This is deliberately NOT
-    // memoised, unlike the ceiling: free space is a moving quantity, and a
-    // cached value would be answering a question about a disk that no longer
-    // exists. One probe per rescue is free — a rescue only happens when a
-    // flush already failed, and since 2026-10-12 (deep audit DA-12) the probe
-    // is one `statvfs` syscall, no longer a forked `df` process.
+    // So the write is refused when it would leave less than the spec's
+    // `free_reserve` behind. This is deliberately NOT memoised, unlike the
+    // ceiling: free space is a moving quantity, and a cached value would be
+    // answering a question about a disk that no longer exists. One probe per
+    // rescue is free — a rescue only happens when a flush already failed, and
+    // since 2026-10-12 (deep audit DA-12) the probe is one `statvfs` syscall,
+    // no longer a forked `df` process.
     //
     // A refusal here is still an honest counted drop, not a silent one: the
-    // caller's `Err` arm logs HOT-PATH-02 naming this reason.
-    // ASYMMETRY WITH THE CEILING ARM, DELIBERATE — flagged by adversarial
-    // review 2026-09-01 and kept, with the fall-through made VISIBLE.
+    // caller's `Err` arm logs naming this reason.
     //
-    // The ceiling arm fails CLOSED on a probe failure; this floor falls
-    // through and writes. Same file, opposite semantics — which reads like an
-    // oversight and is not. The two arms ask different questions:
-    //
-    //   ceiling — "we are ALREADY past our size rail; may we keep growing?"
-    //             Unknown => do not grow. It bites only in an already
-    //             abnormal state, so refusing costs little.
-    //   floor   — "is there room for THIS one write?" Unknown => refusing
-    //             means a single failed free-space probe disables the entire rescue tier
-    //             for the process lifetime, turning every failed flush back
-    //             into the permanent loss this tier exists to prevent.
-    //
-    // So the fail-open is the right call. What was actually wrong is that it
-    // was SILENT: the tier could write blind, indefinitely, with nothing
-    // saying so. It is now counted.
-    // FAIL OPEN when the probe fails, and that is deliberate for THIS tier:
-    // one failed free-space probe must not disable the rescue path that carries
-    // decision-critical rows. The depth twin fails CLOSED for the mirror-image
-    // reason — see `classify_spill_floor` for why the asymmetry is now a typed
-    // policy rather than two hand-written `else` arms that silently diverged.
+    // The blind arm follows the spec's policy. Ticks FAIL OPEN: one failed
+    // free-space probe must not disable the rescue path that carries
+    // decision-critical rows, and the blind write is counted. Depth and
+    // top_volume FAIL CLOSED for the mirror-image reason — see
+    // `classify_spill_floor` for why the asymmetry is a typed policy rather
+    // than hand-written `else` arms that silently diverged.
     let free_now = spill_free_bytes(dir);
     match classify_spill_floor(
         free_now,
         payload.len() as u64,
-        SPILL_MIN_FREE_HEADROOM_BYTES,
-        BlindWritePolicy::FailOpen,
+        spec.free_reserve,
+        spec.blind,
     ) {
         SpillFloorVerdict::Allow => {}
         SpillFloorVerdict::AllowProbeFailed => {
-            metrics::counter!("tv_spill_free_probe_blind_total", "tier" => "tick").increment(1);
+            spec.tier.count_free_probe_blind();
         }
-        SpillFloorVerdict::RefuseNoRoom | SpillFloorVerdict::RefuseProbeFailed => {
+        SpillFloorVerdict::RefuseProbeFailed => {
+            spec.tier.count_free_probe_blind();
             return Err(std::io::Error::new(
                 std::io::ErrorKind::StorageFull,
                 format!(
-                    "refusing a {}-byte tick spill: {} free, and the write must leave \
-                     {SPILL_MIN_FREE_HEADROOM_BYTES} bytes of headroom so it cannot take \
-                     QuestDB down with it",
+                    "refusing a {}-byte {tier} spill: the free-space probe failed and this \
+                     tier refuses rather than write blind",
+                    payload.len(),
+                ),
+            ));
+        }
+        SpillFloorVerdict::RefuseNoRoom => {
+            let floor = spec.free_reserve;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                format!(
+                    "refusing a {}-byte {tier} spill: {} free, and the write must leave \
+                     {floor} bytes of headroom so it cannot take QuestDB down with it",
                     payload.len(),
                     match free_now {
                         Some(b) => format!("only {b} bytes"),
@@ -1585,7 +1739,11 @@ fn spill_failed_ilp(
     // One file per feed per hour: bounded file count, and an operator replaying
     // a known-bad window does not have to read a single ever-growing file.
     let hour = now_unix_secs / 3_600;
-    let path = dir.join(format!("ticks-{}-{hour}.ilp", feed.as_str()));
+    let path = dir.join(format!(
+        "{}-{}-{hour}.ilp",
+        spec.file_prefix,
+        spec.feed.as_str()
+    ));
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -1595,13 +1753,12 @@ fn spill_failed_ilp(
     if let Some(sync) = sync {
         sync(&file)?;
     }
-    if on_drain {
-        TICK_DRAIN_SPILL_HELD.note_written(dir, payload.len() as u64);
+    if on_drain && let Some(cache) = spec.drain_held {
+        cache.note_written(dir, payload.len() as u64);
     }
     Ok(path)
     // O(1) EXEMPT: end
 }
-
 /// Total bytes of the spill directory, INCLUDING the quarantine subtree.
 ///
 /// # Why quarantine is counted (2026-08-28)
@@ -6635,6 +6792,67 @@ mod tests {
         );
     }
 
+    /// 2026-10-13 (top_volume spill plan item 1): the tick spill now runs
+    /// through the shared `spill_failed_ilp_to`, fed `tick_spill_spec`. This
+    /// pins that the spec is built from exactly the constants the tick-only
+    /// function used, so the tick tier's file name, ceiling, reserves, blind
+    /// policy and drain total are unchanged.
+    #[test]
+    fn test_tick_spill_spec_reproduces_the_old_file_name_and_reserve() {
+        let dir = scratch_dir("tick-spec");
+        let spec = tick_spill_spec(&dir, Feed::Dhan);
+        assert_eq!(spec.dir, dir.as_path());
+        assert_eq!(spec.file_prefix, "ticks");
+        assert_eq!(spec.feed, Feed::Dhan);
+        assert_eq!((spec.ceiling)(), tick_spill_max_bytes());
+        assert_eq!(
+            spec.ceiling_kind,
+            SpillCeilingKind::Soft {
+                reserve: SPILL_SOFT_CEILING_FREE_RESERVE_BYTES
+            }
+        );
+        assert_eq!(spec.free_reserve, SPILL_MIN_FREE_HEADROOM_BYTES);
+        assert_eq!(spec.blind, BlindWritePolicy::FailOpen);
+        assert_eq!(spec.tier, SpillTier::Tick);
+        assert!(
+            spec.drain_held
+                .is_some_and(|cache| std::ptr::eq(cache, &TICK_DRAIN_SPILL_HELD)),
+            "the tick spec must keep the drain's remembered folder total"
+        );
+
+        // The file name is the pre-2026-10-13 one: `ticks-<feed>-<unix hour>.ilp`.
+        let path = spill_failed_ilp(
+            &dir,
+            b"t\n",
+            Feed::Dhan,
+            1_700_000_000,
+            SPILL_SYNC_OFF_DRAIN,
+        )
+        .expect("spill");
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("ticks-dhan-472222.ilp")
+        );
+        // The wrapper and the shared function with the tick spec are one
+        // path: both append to the same file.
+        let same = spill_failed_ilp_to(&spec, b"u\n", 1_700_000_000, SPILL_SYNC_OFF_DRAIN)
+            .expect("spill through the shared function");
+        assert_eq!(same, path);
+        assert_eq!(std::fs::read(&path).expect("readable"), b"t\nu\n".to_vec());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_spill_tier_labels_are_the_counter_labels() {
+        // The labels double as `tv_spill_free_probe_blind_total{tier}` values,
+        // which the boot seed pre-registers by the same literals.
+        assert_eq!(SpillTier::Tick.label(), "tick");
+        assert_eq!(SpillTier::TopVolume.label(), "top_volume");
+        // Counting with no recorder installed must not panic.
+        SpillTier::Tick.count_free_probe_blind();
+        SpillTier::TopVolume.count_free_probe_blind();
+    }
+
     #[test]
     fn spill_failed_ilp_writes_the_payload_verbatim_so_it_can_be_replayed() {
         // The whole point of storing ILP text rather than a bespoke format:
@@ -7355,7 +7573,7 @@ mod tests {
             ))
             .map(|(_, rest)| rest.split_once("\n}").map_or(rest, |(b, _)| b))
             .unwrap_or_default();
-        for tier in ["\"tick\"", "\"depth\""] {
+        for tier in ["\"tick\"", "\"depth\"", "\"seal\"", "\"top_volume\""] {
             assert!(
                 body.contains(tier),
                 "the seeding function does not register the {tier} tier — the \
@@ -7365,8 +7583,8 @@ mod tests {
         }
         assert_eq!(
             body.matches("increment(0)").count(),
-            2,
-            "expected exactly two seeded label sets"
+            4,
+            "expected exactly four seeded label sets (tick, depth, seal, top_volume)"
         );
     }
 

@@ -440,14 +440,15 @@ impl SealEscalationSink {
 
     /// Write one batch: one `write(2)` per run of records that share an IST
     /// day (a batch straddles midnight at most once), and on a failed write
-    /// every record of that run goes to the DLQ, one line each.
+    /// every record of that run the spill did NOT keep goes to the DLQ, one
+    /// line each (deep audit DA-14: the whole records that landed before the
+    /// failure stay in the spill and are not written again).
     ///
     /// A seal the DLQ also refuses reaches `on_lost`, which is the page. The
-    /// failed batch write cut its torn tail back, or set the file aside when
-    /// it could not (see [`crate::seal_spill::SealSpillWriter::append_seals`]),
-    /// so no record of the run is left half-written in the spill; a record
-    /// that did land before the failure and is ALSO in the DLQ is collapsed by
-    /// the candle tables' DEDUP keys when both are replayed.
+    /// failed batch write cut its torn tail back to the last whole record, or
+    /// set the file aside when it could not (see
+    /// [`crate::seal_spill::SealSpillWriter::append_seals`]), so no record of
+    /// the run is left half-written in the spill.
     ///
     /// Returns how many spill writes it made: one per IST-day run, so 1 for
     /// almost every batch and 2 for one that straddles midnight (audit PR40c).
@@ -478,12 +479,19 @@ impl SealEscalationSink {
                 run[0].now_unix_secs,
             );
             let run_written = run.len();
-            if written.is_err() {
-                // Straight to the DLQ: the spill just refused a whole batch,
-                // and retrying it per record would pay a reopen per seal on a
+            if let Err(failure) = written {
+                // Straight to the DLQ: the spill just refused the batch, and
+                // retrying it per record would pay a reopen per seal on a
                 // failing disk — the case most likely to hold a full queue at
                 // shutdown, where every syscall counts against the budget.
-                for item in run {
+                //
+                // Deep audit DA-14: only the seals AFTER the ones the spill
+                // kept. A full disk takes what fits; those records stay in
+                // the spill, and sending them to the DLQ as well (on the same
+                // full volume, as larger records) only turned seals that were
+                // safe into reported losses.
+                let kept = failure.kept.min(run.len());
+                for item in &run[kept..] {
                     let record = crate::seal_dlq::SealDlqRecord::from(&item.seal);
                     if self.dlq.append_record(&record, item.now_unix_secs).is_ok() {
                         // Z6: a fuller copy committed later must be mirrored
@@ -794,7 +802,21 @@ impl SealOverflow {
     /// device, unbounded on a hung one. This note used to call the wait
     /// "known, bounded", which was true of its size and false of its length.
     /// No seal is lost while it waits; the cost is the frame drain, which
-    /// stops emptying the socket for the same time.
+    /// stops FOLDING for the same time.
+    ///
+    /// ⚠ CORRECTED 2026-10-13 (deep audit DA-14, tail HOT-2): this said the
+    /// drain "stops emptying the socket". It does not: the socket read tasks
+    /// are separate and keep reading. Each frame is queued to the frame log
+    /// (WAL) at receipt and then put in the frame ring, which holds
+    /// `FRAME_RING_CAPACITY` frames and `FRAME_RING_MAX_BYTES` (about 13 s at
+    /// the 5,000 frames/s envelope, Assumed from the ring's own doc). Past
+    /// that, frames are shed from the ring and kept in the frame log for a
+    /// later refold, so their candles arrive late, not never. The limit that
+    /// matters is the shared disk: the frame log lives on the same data
+    /// volume, so a stall long enough to hold this wait also stalls the frame
+    /// log writer, and once its queue is full a frame neither tier takes is
+    /// lost (counted and paged as WS-SPILL-02). Not measured: how long a disk
+    /// stall the two queues together absorb on the production volume.
     ///
     /// With NO offload installed (pre-2026-08-28 shape, and every unit test
     /// that does not call `split_escalation_offload`) every escalation is the
@@ -872,9 +894,11 @@ fn report_inline_stall(waited_ms: u64, stalls: u64, max_waited_ms: u64, outcome:
         outcome = ?outcome,
         "the live feed waited on a stalled disk: the escalation queue was full or its \
          thread had died, so the frame drain wrote a refused candle to disk itself and \
-         stopped reading the socket until the disk answered. No candle was lost unless \
-         outcome is Lost (that also fires AGGREGATOR-DROP-01); ticks during the wait may \
-         have been skipped by the exchange feed. Check df -h /data and the disk's health."
+         stopped folding frames until the disk answered. The socket readers kept reading \
+         into the frame ring, which sheds to the frame log once full (those candles come \
+         later from the refold). No candle was lost unless outcome is Lost (that also \
+         fires AGGREGATOR-DROP-01); a frame is lost only if the frame log, on the same \
+         disk, also refuses it (WS-SPILL-02). Check df -h /data and the disk's health."
     );
 }
 
@@ -957,6 +981,10 @@ pub struct CycleOutcome {
     /// tiers failed). Caller MUST fire `error!(code = AGGREGATOR-DROP-01)`
     /// per the runbook for each.
     pub mpsc_submit_dropped: usize,
+    /// Of `mpsc_submit_dropped`, how many were refused at the seal disk
+    /// floor rather than lost to two failed writes (deep audit DA-14). A
+    /// subset: the dropped total and its page are unchanged.
+    pub mpsc_submit_dropped_below_floor: usize,
     /// Drain-side outcome from `drain_once` (ring → ILP buffer →
     /// flush, with rescue cascade on flush failure).
     pub drain: DrainOutcome,
@@ -983,7 +1011,7 @@ impl CycleOutcome {
     /// having happened.
     ///
     /// # Complexity
-    /// O(1) — five saturating adds plus the drain's own.
+    /// O(1) — six saturating adds plus the drain's own.
     pub const fn accumulate(&mut self, other: &Self) {
         self.submitted_from_mpsc = self
             .submitted_from_mpsc
@@ -998,6 +1026,9 @@ impl CycleOutcome {
         self.mpsc_submit_dropped = self
             .mpsc_submit_dropped
             .saturating_add(other.mpsc_submit_dropped);
+        self.mpsc_submit_dropped_below_floor = self
+            .mpsc_submit_dropped_below_floor
+            .saturating_add(other.mpsc_submit_dropped_below_floor);
         self.drain.accumulate(&other.drain);
     }
 }
@@ -1244,6 +1275,10 @@ impl SealWriterRunner {
                         SubmitOutcome::Spilled => outcome.mpsc_submit_spilled += 1,
                         SubmitOutcome::DlqWritten => outcome.mpsc_submit_dlq += 1,
                         SubmitOutcome::Dropped(_) => outcome.mpsc_submit_dropped += 1,
+                        SubmitOutcome::DroppedBelowFloor(_) => {
+                            outcome.mpsc_submit_dropped += 1;
+                            outcome.mpsc_submit_dropped_below_floor += 1;
+                        }
                     }
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
@@ -2345,6 +2380,56 @@ mod tests {
             "a seal both tiers refused must reach the on_lost hook — that hook IS the page"
         );
         let _ = std::fs::remove_file(&spill);
+        let _ = std::fs::remove_file(&dlq);
+    }
+
+    /// Deep audit DA-14: a batch the spill took only part of keeps what
+    /// fitted. Only the seals after those go to the DLQ, so with the DLQ
+    /// also unwritable only they are reported lost.
+    #[test]
+    fn test_regression_da14_partly_written_batch_reports_only_the_rest_lost() {
+        let (spill, dlq) = temp_pair("da14-batch-partial");
+        let _ = std::fs::remove_dir_all(&dlq);
+        std::fs::write(&dlq, b"not a directory").expect("block the DLQ");
+        let runner = SealWriterRunner::for_test(spill.clone(), dlq.clone(), 16, 16, 16);
+        let mut overflow = runner.overflow();
+        let sink = overflow.split_escalation_offload();
+        let stop = sink.stop_flag();
+        for i in 0..4u32 {
+            assert_eq!(
+                overflow.escalate(
+                    &mk_seal(13 + u64::from(i), 0, TfIndex::M1, 34_200, 101.5),
+                    jan1_noon_utc()
+                ),
+                OverflowOutcome::Queued
+            );
+        }
+        // Two and a half records fit, then the disk refuses.
+        runner
+            .pipeline
+            .spill_handle()
+            .fail_batch_writes_after_for_test(
+                crate::seal_spill::SEAL_SPILL_RECORD_SIZE as u64 * 2 + 64,
+            );
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        let lost = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = std::sync::Arc::clone(&lost);
+        let summary = sink.run(move |_| {
+            seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        assert_eq!(summary.records, 4);
+        assert_eq!(
+            lost.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "the two seals that fitted are on disk; only the other two are lost"
+        );
+        let on_disk = runner
+            .pipeline
+            .spill_handle()
+            .read_all(jan1_noon_utc())
+            .expect("read spill");
+        assert_eq!(on_disk.len(), 2);
+        let _ = std::fs::remove_dir_all(&spill);
         let _ = std::fs::remove_file(&dlq);
     }
 

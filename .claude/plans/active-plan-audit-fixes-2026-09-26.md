@@ -3091,8 +3091,43 @@ and a call site; shell may only shrink. One PR per item, serial.
     0). Reviewed in three hostile rounds (6 confirmed findings fixed). **Honest limit:** if the
     pass holds the gate until its 17:15 stop and the box stops at 17:30, that day's depth
     partitions wait for the next day's sweep; nothing is dropped unarchived.
-- [ ] **DA-14 — The candle disk floor keeps what can be kept and says why** (DISK-1, DISK-2,
+- [x] **DA-14 — The candle disk floor keeps what can be kept and says why** (DISK-1, DISK-2,
   DISK-3, DISK-5, DISK-6, DISK-7, DISK-8, HOT-8, CRASH-1 partial, tail HOT-2 limit row). `storage`.
+  **Re-derived 2026-10-13:** the findings' text was lost (the audit page could not be opened), so
+  each was rebuilt from the code and proven with a state and a wrong outcome; they map onto the
+  original IDs only by theme (DISK-1 partial batch, DISK-2 per-seal uncoded refusal, DISK-3
+  misstated drop page, DISK-5 clock step, DISK-6 blind probe, DISK-7 DLQ torn line, DISK-8 the
+  drain-side path that ignores the floor: NOT changed, CRASH-1 partial both torn tails, HOT-8
+  not real for the floor, tail HOT-2 the inline-wait text). Fixed: a batch the full disk took part of was cut back to its
+  length before the write and every seal of it, including those on disk, went to the DLQ on the
+  same full volume (`append_seals` now keeps the whole records that landed, `BatchSpillFailure`
+  reports how many, `write_batch` dead-letters only the rest); a floor refusal was an uncoded
+  `warn!` per seal and the cycle page said "ring+spill+DLQ all failed" about seals nothing tried
+  to write (`SubmitOutcome::DroppedBelowFloor`, `tv_seal_floor_refused_total`, one coded
+  AGGREGATOR-SEAL-01 line per episode, `tv_seal_writer_drain_total{kind="dropped_below_floor"}`,
+  the AGGREGATOR-DROP-01 line now carries `dropped_below_floor` and `dropped_tiers_failed`); a
+  backward clock step froze the cached floor verdict until the clock caught up (re-probes when
+  the clock reads earlier); the floor probed a spill folder not created yet and wrote blind,
+  uncounted (`seal_free_bytes` probes the nearest existing ancestor; blind seal writes count on
+  `tv_spill_free_probe_blind_total{tier="seal"}`); a DLQ file left ending in a partial line glued
+  the next record onto it and the replay lost both (the append closes it with a newline,
+  `tv_seal_dlq_torn_line_closed_total`, and a failed write cuts its partial line back); a spill
+  tear found at open (a crash mid-write) was an uncoded `warn!` with no counter
+  (`tv_seal_spill_torn_tail_cut_total`, pre-resolved handle, coded). Docs: the floor's "reachable
+  from the frame drain" note was false (HOT-8: the pipeline runs on the seal writer loop; no
+  floor probe runs on the drain); the inline-fallback doc and AGGREGATOR-STALL-01 text said the
+  drain stops reading the socket (tail HOT-2: the read tasks keep reading into the frame ring,
+  which sheds to the frame log; a frame is lost only when the frame log on the same disk also
+  refuses it). All new counters local `/metrics` only, seeded at 0 in `main.rs`; no new alarm,
+  page, filter or EMF name. Tests: eight `test_regression_da14_*`, each bite-checked (all eight
+  fail with the fixes reverted). **Not changed, recorded:** the drain-side escalation (thread and
+  inline fallback) still writes below the 4 GiB seal floor until the volume refuses, so below the
+  floor the two seal paths differ (a policy decision about the ladder, not made here); the
+  terraform description of AGGREGATOR-STALL-01 still says "stopped reading the socket" (not
+  edited: terraform out of this crate); a DLQ line glued before this fix still counts as one
+  undecodable line though it held two records. **Honest limits:** the floor still drops candles
+  below 4 GiB free; how long a disk stall the frame ring plus the frame-log queue absorb is not
+  measured.
 - [x] **DA-22 — The after-close depth pass runs while the disk shed is on** (found live
   2026-10-13). `app`. On 2026-10-12 the disk shed turned on at 09:52 IST (used 80%) and stayed on
   all evening; 51.4M main-feed depth packets were deferred and the after-close pass, which paused

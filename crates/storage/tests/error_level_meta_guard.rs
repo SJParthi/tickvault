@@ -221,6 +221,11 @@ const REVIEWED_WARN_SITES: &[(&str, &str, &str)] = &[
         "a sizing probe; the spill keeps working at its fixed floor",
     ),
     (
+        "crates/storage/src/top_volume_rank_persistence.rs",
+        "so the top_volume spill ceiling falls back",
+        "a sizing probe (2026-10-13, top_volume spill plan item 2); the spill keeps working at its fixed floor, the same shape as its tick and depth twins",
+    ),
+    (
         "crates/storage/src/wal_deferred_depth.rs",
         "deferred-depth marks could not be persisted",
         "coded WS-SPILL-01 and latched once per episode; paged by durability-sync-failing on its counter",
