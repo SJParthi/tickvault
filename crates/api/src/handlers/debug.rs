@@ -118,7 +118,8 @@ fn spill_status_body() -> String {
 
     let mut categories = String::from("{");
     let mut first = true;
-    for kind in ["ticks", "candles", "depth"] {
+    // `top_volume` added 2026-10-13 (top_volume spill plan item 7).
+    for kind in ["ticks", "candles", "depth", "top_volume"] {
         let cat_dir = dir.join(kind);
         let (count, bytes, newest) = scan_spill_category(&cat_dir);
         if !first {
@@ -167,7 +168,9 @@ fn scan_spill_category(dir: &Path) -> (u64, u64, Option<String>) {
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        if !name.ends_with(".bin") {
+        // `.ilp` counted since 2026-10-13: the tick, depth and top_volume
+        // spill files are ILP text, so this scan read 0 for all three.
+        if !(name.ends_with(".bin") || name.ends_with(".ilp")) {
             continue;
         }
         count += 1;
@@ -831,5 +834,29 @@ mod tests {
         unsafe {
             std::env::remove_var(SPILL_DIR_ENV);
         }
+    }
+
+    #[test]
+    fn spill_status_reports_the_top_volume_ilp_folder() {
+        // 2026-10-13 (top_volume spill plan item 7): the top_volume folder is
+        // a category, and ILP spill files are counted.
+        let _env = env_guard();
+        let tmp = mktemp("spill_status_tv");
+        let cat_dir = tmp.path().join("top_volume");
+        fs::create_dir_all(&cat_dir).unwrap();
+        fs::write(cat_dir.join("top_volume-dhan-490000.ilp"), b"row\n").unwrap();
+        unsafe {
+            std::env::set_var(SPILL_DIR_ENV, tmp.path().to_str().unwrap());
+        }
+        let body = spill_status_body();
+        unsafe {
+            std::env::remove_var(SPILL_DIR_ENV);
+        }
+        assert!(
+            body.contains(
+                "\"top_volume\":{\"file_count\":1,\"total_bytes\":4,\"newest_file\":\"top_volume-dhan-490000.ilp\"}"
+            ),
+            "{body}"
+        );
     }
 }

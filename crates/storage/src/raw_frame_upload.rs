@@ -125,6 +125,9 @@ pub const SEAL_SPILL_S3_PREFIX: &str = "seal-spill";
 pub const TICK_QUARANTINE_S3_PREFIX: &str = "tick-quarantine";
 /// Key prefix for quarantined depth spill files.
 pub const DEPTH_QUARANTINE_S3_PREFIX: &str = "depth-quarantine";
+/// Key prefix for quarantined top_volume spill files (top_volume spill plan
+/// item 7, 2026-10-13).
+pub const TOP_VOLUME_QUARANTINE_S3_PREFIX: &str = "top-volume-quarantine";
 
 /// Counter: spill / quarantine files uploaded (or found uploaded) and
 /// marked, labelled `set`.
@@ -1226,6 +1229,21 @@ impl ColdFileSet {
         }
     }
 
+    /// Quarantined top_volume spill files: every file in
+    /// `<top_volume spill>/quarantine`, which includes files set aside for
+    /// being older than their table's hot window (top_volume spill plan
+    /// item 7, 2026-10-13; operator Quote 27: no market-data delete without
+    /// a verified copy).
+    #[must_use]
+    pub fn top_volume_quarantine(top_volume_spill_dir: &Path) -> Self {
+        Self {
+            label: "top_volume_quarantine",
+            prefix: TOP_VOLUME_QUARANTINE_S3_PREFIX,
+            dirs: vec![top_volume_spill_dir.join(crate::tick_spill_replay::QUARANTINE_DIR)],
+            matches: any_file,
+        }
+    }
+
     fn scan_dirs(&self) -> Vec<ScanDir> {
         self.dirs
             .iter()
@@ -1517,8 +1535,9 @@ async fn upload_candidates<S: ColdObjectStore>(
     (summary, first_failure)
 }
 
-/// Uploads the sealed-candle spill files and the tick and depth quarantine
-/// files, in that order, after the WAL pass (plan item 45e-1, the two
+/// Uploads the sealed-candle spill files and the tick, depth and top_volume
+/// quarantine files (the last added 2026-10-13, top_volume spill plan item 7),
+/// in that order, after the WAL pass (plan item 45e-1, the two
 /// remaining ungated prunes). `today_spill_file` is the seal-spill day file
 /// the live writer may hold open — never uploaded, as its prune never
 /// deletes it. Each set gets at most `max_files`.
@@ -1532,6 +1551,7 @@ pub async fn run_spill_and_quarantine_passes<S: ColdObjectStore>(
     spill_dir: &Path,
     tick_spill_dir: &Path,
     depth_spill_dir: &Path,
+    top_volume_spill_dir: &Path,
     today_spill_file: &str,
     max_files: usize,
     should_continue: &(dyn Fn() -> bool + Send + Sync),
@@ -1571,7 +1591,20 @@ pub async fn run_spill_and_quarantine_passes<S: ColdObjectStore>(
         &never_open,
     )
     .await;
-    spill.plus(ticks).plus(depth)
+    if depth.store_unreachable {
+        debug!("cold bucket timed out on the depth-quarantine pass; top_volume pass skipped");
+        return spill.plus(ticks).plus(depth);
+    }
+    // Fourth pass (top_volume spill plan item 7, 2026-10-13).
+    let top_volume = run_file_pass(
+        store,
+        &ColdFileSet::top_volume_quarantine(top_volume_spill_dir),
+        max_files,
+        should_continue,
+        &never_open,
+    )
+    .await;
+    spill.plus(ticks).plus(depth).plus(top_volume)
 }
 
 /// Test hook for the WAL prune's tests: records a marker for `segment`
@@ -2210,12 +2243,14 @@ mod tests {
         std::fs::create_dir_all(&quarantine).expect("mkdir"); // APPROVED: test-only
         plant(&quarantine, "ticks-quarantined.ndjson", b"tick");
         let depth = temp_wal_dir("skipdepth");
+        let top_volume = depth.join("top_volume");
         let hung = hanging_store();
         let pass = run_spill_and_quarantine_passes(
             &hung,
             &spill,
             &ticks,
             &depth,
+            &top_volume,
             "seals_v4-2099-01-01.bin",
             usize::MAX,
             &always,
@@ -2591,12 +2626,22 @@ mod tests {
         let spill = temp_wal_dir("all");
         let ticks = spill.join("ticks");
         let depth = spill.join("depth");
+        let top_volume = spill.join("top_volume");
+        std::fs::create_dir_all(top_volume.join("quarantine")).expect("mkdir"); // APPROVED: test-only
         std::fs::create_dir_all(ticks.join("quarantine")).expect("mkdir"); // APPROVED: test-only
         std::fs::create_dir_all(depth.join("quarantine")).expect("mkdir"); // APPROVED: test-only
         let today = plant(&spill, DAY_FILE, b"live writer file");
         let old = plant(&spill, "seals_v4-2026-09-18.bin", b"old");
         let tq = plant(&ticks.join("quarantine"), "ticks-a.ndjson", b"t");
         let dq = plant(&depth.join("quarantine"), "depth-a.ndjson", b"d");
+        let tvq = plant(
+            &top_volume.join("quarantine"),
+            "top_volume-dhan-1.ilp",
+            b"v",
+        );
+        // A pending top_volume file (not set aside) is the replay's, not
+        // this pass's.
+        let pending_tv = plant(&top_volume, "top_volume-dhan-2.ilp", b"pending");
         // A file still in the tick spill root (not quarantined) is not this
         // pass's business.
         let pending_tick = plant(&ticks, "ticks-b.ndjson", b"pending");
@@ -2606,13 +2651,14 @@ mod tests {
             &spill,
             &ticks,
             &depth,
+            &top_volume,
             DAY_FILE,
             usize::MAX,
             &always,
         )
         .await;
-        assert_eq!((s.uploaded, s.failed), (3, 0));
-        for f in [&old, &tq, &dq] {
+        assert_eq!((s.uploaded, s.failed), (4, 0));
+        for f in [&old, &tq, &dq, &tvq] {
             let meta = std::fs::metadata(f).expect("stat"); // APPROVED: test-only
             assert!(
                 CopyGate::Required.allows_delete(f, &meta),
@@ -2620,7 +2666,7 @@ mod tests {
                 f.display()
             );
         }
-        for f in [&today, &pending_tick] {
+        for f in [&today, &pending_tick, &pending_tv] {
             let meta = std::fs::metadata(f).expect("stat"); // APPROVED: test-only
             assert!(
                 !CopyGate::Required.allows_delete(f, &meta),
@@ -2631,6 +2677,48 @@ mod tests {
         let puts = store.puts.lock().expect("lock").clone(); // APPROVED: test-only
         assert!(puts.iter().any(|k| k.starts_with("tick-quarantine/")));
         assert!(puts.iter().any(|k| k.starts_with("depth-quarantine/")));
+        assert!(puts.iter().any(|k| k.starts_with("top-volume-quarantine/")));
+    }
+
+    #[test]
+    fn test_top_volume_quarantine_is_uploaded_before_prune() {
+        // Top_volume spill plan item 7: the set covers exactly the folder
+        // `prune_quarantine` trims, under its own prefix.
+        let set = ColdFileSet::top_volume_quarantine(Path::new("/d/spill/top_volume"));
+        assert_eq!(set.prefix, TOP_VOLUME_QUARANTINE_S3_PREFIX);
+        assert_eq!(set.prefix, "top-volume-quarantine");
+        assert_eq!(
+            set.dirs,
+            vec![PathBuf::from("/d/spill/top_volume/quarantine")]
+        );
+        assert!((set.matches)(Path::new("top_volume-dhan-1.ilp")));
+        assert!((set.matches)(Path::new(
+            "top_volume-dhan-1.ilp.rejected-lines"
+        )));
+        let labels = [
+            ColdFileSet::tick_quarantine(Path::new("/x")).label,
+            ColdFileSet::depth_quarantine(Path::new("/x")).label,
+            set.label,
+        ];
+        assert_ne!(labels[0], labels[2]);
+        assert_ne!(labels[1], labels[2]);
+    }
+
+    #[test]
+    fn test_prune_refuses_an_unuploaded_top_volume_quarantine_file() {
+        let root = temp_wal_dir("tvq-prune");
+        let dir = root.join("top_volume");
+        let quarantine = dir.join(crate::tick_spill_replay::QUARANTINE_DIR);
+        std::fs::create_dir_all(&quarantine).expect("mkdir"); // APPROVED: test-only
+        let kept = plant(&quarantine, "top_volume-dhan-1.ilp", &[b'x'; 4096]);
+        // A zero budget would trim everything, but no file has a verified
+        // copy, so the copy gate keeps it.
+        let pruned = crate::tick_persistence::prune_quarantine(&dir, 0, true);
+        assert_eq!(pruned, 0);
+        assert!(
+            kept.exists(),
+            "no market-data delete without a verified copy"
+        );
     }
 
     // S2 — a verified upload whose marker cannot be written still lets the
