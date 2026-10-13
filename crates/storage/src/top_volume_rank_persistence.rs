@@ -2433,17 +2433,21 @@ pub enum TopVolumeSpillArm {
     BreakerOpen,
     /// The flush thread is gone (panicked or never spawned).
     FlushThreadGone,
+    /// The lane is shutting down: the batch is spilled rather than sent, so
+    /// no queued batch waits on a slow QuestDB past the shutdown deadline.
+    Shutdown,
 }
 
 impl TopVolumeSpillArm {
     /// Every arm, for seeding the counter at zero.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::FlushFailed,
         Self::QueueFull,
         Self::Unkeyed,
         Self::NoSender,
         Self::BreakerOpen,
         Self::FlushThreadGone,
+        Self::Shutdown,
     ];
 
     /// The `arm` label on `tv_top_volume_rows_spilled_total`.
@@ -2456,6 +2460,7 @@ impl TopVolumeSpillArm {
             Self::NoSender => "no_sender",
             Self::BreakerOpen => "breaker_open",
             Self::FlushThreadGone => "flush_thread_gone",
+            Self::Shutdown => "shutdown",
         }
     }
 
@@ -2487,7 +2492,35 @@ impl TopVolumeSpillArm {
                 metrics::counter!("tv_top_volume_rows_spilled_total", "arm" => "flush_thread_gone")
                     .increment(rows);
             }
+            Self::Shutdown => {
+                metrics::counter!("tv_top_volume_rows_spilled_total", "arm" => "shutdown")
+                    .increment(rows);
+            }
         }
+    }
+}
+
+/// The lane's "shutting down" signal for the top_volume writer threads
+/// (2026-10-13, PR-B review). Set by the lane BEFORE it polls the two
+/// threads; from then on both threads spill instead of sending, so a slow or
+/// dead QuestDB cannot hold the up-to-four queued batches past the shutdown
+/// deadline. Every batch is then spilled, or counted as lost.
+#[derive(Clone, Debug, Default)]
+pub struct TopVolumeShutdown {
+    requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl TopVolumeShutdown {
+    /// Asks both threads to spill from now on. Idempotent. O(1).
+    pub fn request(&self) {
+        self.requested
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// True once [`Self::request`] has run. One Acquire load per batch.
+    #[must_use]
+    pub fn is_requested(&self) -> bool {
+        self.requested.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -2648,6 +2681,12 @@ pub(crate) struct TopVolumeSpiller {
     sync: Option<crate::tick_persistence::SpillSyncFn>,
     /// `formatter` or `flush`, for the log lines.
     thread: &'static str,
+    /// Shared by the formatter's and the flush thread's spillers (a clone
+    /// shares it): every top_volume append is serialised, so the hard
+    /// ceiling cannot be overshot by two concurrent payloads and a failed
+    /// append can be cut back (`truncate_failed_append`). Never taken on the
+    /// frame drain.
+    lock: std::sync::Arc<std::sync::Mutex<()>>,
     spilled_episodes: usize,
     lost_episodes: usize,
 }
@@ -2660,6 +2699,7 @@ impl TopVolumeSpiller {
             ceiling: top_volume_spill_max_bytes,
             sync: crate::tick_persistence::SPILL_SYNC_OFF_DRAIN,
             thread,
+            lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             spilled_episodes: 0,
             lost_episodes: 0,
         }
@@ -2683,12 +2723,21 @@ impl TopVolumeSpiller {
         let mut spec = top_volume_spill_spec(&self.dir);
         spec.free_reserve = self.free_reserve;
         spec.ceiling = self.ceiling;
-        match crate::tick_persistence::spill_failed_ilp_to(
-            &spec,
-            payload,
-            spill_now_unix_secs(),
-            self.sync,
-        ) {
+        let written = {
+            // A poisoned lock only means the other thread panicked mid-spill;
+            // the guarded data is `()`, so carry on.
+            let _serialised = self
+                .lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            crate::tick_persistence::spill_failed_ilp_to(
+                &spec,
+                payload,
+                spill_now_unix_secs(),
+                self.sync,
+            )
+        };
+        match written {
             Ok(path) => {
                 arm.count_spilled(rows as u64);
                 self.spilled_episodes = self.spilled_episodes.saturating_add(1);
@@ -2769,6 +2818,7 @@ pub struct TopVolumeRowWriter {
     /// Spent ILP buffers the flush thread returns for reuse.
     spare_buffers: std::sync::mpsc::Receiver<Buffer>,
     breaker: std::sync::Arc<TopVolumeFlushBreaker>,
+    shutdown: TopVolumeShutdown,
     spiller: TopVolumeSpiller,
     spares: std::sync::mpsc::SyncSender<Vec<TopVolumeStagedRow>>,
     unlabelled: &'static str,
@@ -2825,6 +2875,15 @@ impl TopVolumeRowWriter {
                 rows,
                 TopVolumeSpillArm::Unkeyed,
                 "the top_volume tables are not yet confirmed to carry their DEDUP key",
+                out,
+            );
+            return;
+        }
+        if self.shutdown.is_requested() {
+            self.spill_buffer(
+                rows,
+                TopVolumeSpillArm::Shutdown,
+                "the lane is shutting down",
                 out,
             );
             return;
@@ -2904,6 +2963,7 @@ pub struct TopVolumeFlushWorker {
     /// Spent buffers back to the formatter, two deep. Full or gone: dropped.
     spare_return: std::sync::mpsc::SyncSender<Buffer>,
     breaker: std::sync::Arc<TopVolumeFlushBreaker>,
+    shutdown: TopVolumeShutdown,
     spiller: TopVolumeSpiller,
 }
 
@@ -2916,7 +2976,18 @@ impl TopVolumeFlushWorker {
     /// queue at shutdown), then returns.
     pub fn run(mut self) {
         while let Ok(batch) = self.flushes.recv() {
-            let _outcome = self.flush_one(batch);
+            match self.flush_one(batch) {
+                TopVolumeFlushOutcome::Landed(rows) => {
+                    debug!(rows, "top_volume batch landed in QuestDB");
+                }
+                TopVolumeFlushOutcome::Spilled(rows) => {
+                    debug!(rows, "top_volume batch saved to the spill folder");
+                }
+                // Already counted and logged (powers of two) by the spiller.
+                TopVolumeFlushOutcome::Lost(rows) => {
+                    debug!(rows, "top_volume batch lost: the spill was refused");
+                }
+            }
         }
         tracing::info!("top-volume flush thread exiting — the formatter closed its queue");
     }
@@ -2926,6 +2997,14 @@ impl TopVolumeFlushWorker {
     fn flush_one(&mut self, mut batch: TopVolumeFlushBatch) -> TopVolumeFlushOutcome {
         let outcome = if batch.rows == 0 {
             TopVolumeFlushOutcome::Landed(0)
+        } else if self.shutdown.is_requested() {
+            // Shutting down: never start a network wait the deadline may not
+            // cover. On disk it is replayable; abandoned in RAM it is gone.
+            self.spill(
+                &mut batch,
+                TopVolumeSpillArm::Shutdown,
+                "the lane is shutting down",
+            )
         } else if self.breaker.is_open_at(std::time::Instant::now()) {
             // Queued before the breaker opened: do not spend another timeout
             // on a QuestDB that just failed.
@@ -2954,7 +3033,13 @@ impl TopVolumeFlushWorker {
                     )
                 }
                 Err(TopVolumeFlushFailure::Flush(err)) => {
-                    let _cooldown = self.breaker.record_failure_at(std::time::Instant::now());
+                    // Trip only on a transport failure (reset, refused,
+                    // timeout): that is an outage, and the next batch would
+                    // cost another timeout. A server-side refusal (4xx/5xx
+                    // answer) returns fast, so it is spilled without tripping.
+                    if crate::depth_persistence::flush_failure_is_retryable(&err) {
+                        let _cooldown = self.breaker.record_failure_at(std::time::Instant::now());
+                    }
                     let why = format!("{err}"); // APPROVED: failure arm after a flush already failed, never per row
                     self.spill(&mut batch, TopVolumeSpillArm::FlushFailed, &why)
                 }
@@ -3007,6 +3092,8 @@ pub struct TopVolumeOffload {
     pub rows: std::sync::mpsc::Receiver<TopVolumeRowBatch>,
     /// The flush thread's worker; call [`TopVolumeFlushWorker::run`].
     pub flusher: TopVolumeFlushWorker,
+    /// The lane requests this before it joins the two threads at shutdown.
+    pub shutdown: TopVolumeShutdown,
 }
 
 impl TopVolumeRankWriter {
@@ -3049,6 +3136,7 @@ impl TopVolumeRankWriter {
             arm.count_spilled(0);
         }
         let breaker = std::sync::Arc::new(TopVolumeFlushBreaker::new(std::time::Instant::now()));
+        let shutdown = TopVolumeShutdown::default();
         let sink = TopVolumeRankWriterSink {
             sender: self.sender.take(),
             keyed: self.keyed,
@@ -3061,6 +3149,7 @@ impl TopVolumeRankWriter {
             flushes: flush_rx,
             spare_return: buffer_tx,
             breaker: std::sync::Arc::clone(&breaker),
+            shutdown: shutdown.clone(),
             spiller: flush_spiller,
         };
         let row_writer = TopVolumeRowWriter {
@@ -3068,6 +3157,7 @@ impl TopVolumeRankWriter {
             flushes: flush_tx,
             spare_buffers: buffer_rx,
             breaker,
+            shutdown: shutdown.clone(),
             spiller,
             spares: spare_tx,
             unlabelled,
@@ -3077,6 +3167,7 @@ impl TopVolumeRankWriter {
             row_writer,
             rows: rx,
             flusher,
+            shutdown,
         }
     }
 }
@@ -3253,6 +3344,9 @@ pub fn top_volume_spill_spec(dir: &std::path::Path) -> crate::tick_persistence::
         blind: crate::tick_persistence::BlindWritePolicy::FailClosed,
         tier: crate::tick_persistence::SpillTier::TopVolume,
         drain_held: None,
+        // Every top_volume append is serialised by `TopVolumeSpiller`'s lock,
+        // so a failed append can be cut back without touching another's rows.
+        truncate_failed_append: true,
     }
 }
 
@@ -4858,6 +4952,7 @@ mod row_handoff_tests {
             row_writer,
             rows,
             flusher,
+            shutdown: _,
         } = w.split_rows_for_offload("unmapped", dir);
         (producer, row_writer, rows, flusher)
     }
@@ -5378,6 +5473,7 @@ mod spill_writer_tests {
             ceiling: || u64::MAX,
             sync: crate::tick_persistence::SPILL_SYNC_OFF_DRAIN,
             thread: "formatter",
+            lock: Arc::new(std::sync::Mutex::new(())),
             spilled_episodes: 0,
             lost_episodes: 0,
         }
@@ -5440,6 +5536,7 @@ mod spill_writer_tests {
             row_writer,
             rows: _rows,
             flusher,
+            shutdown: _,
         } = writer.split_rows_with_spiller("unmapped", spill);
         (producer, row_writer, flusher)
     }
@@ -5822,11 +5919,17 @@ mod spill_writer_tests {
             assert!(seen.insert(arm.label()), "duplicate label {}", arm.label());
             arm.count_spilled(0);
         }
-        assert_eq!(seen.len(), 6);
+        assert_eq!(seen.len(), 7);
         assert_eq!(TopVolumeSpillArm::FlushFailed.label(), "flush_failed");
         assert_eq!(TopVolumeSpillArm::QueueFull.label(), "queue_full");
         assert_eq!(TopVolumeSpillArm::Unkeyed.label(), "unkeyed");
         assert_eq!(TopVolumeSpillArm::NoSender.label(), "no_sender");
+        assert_eq!(TopVolumeSpillArm::BreakerOpen.label(), "breaker_open");
+        assert_eq!(
+            TopVolumeSpillArm::FlushThreadGone.label(),
+            "flush_thread_gone"
+        );
+        assert_eq!(TopVolumeSpillArm::Shutdown.label(), "shutdown");
     }
 
     #[test]
@@ -5847,6 +5950,151 @@ mod spill_writer_tests {
             Arc::ptr_eq(&offload.row_writer.breaker, &offload.flusher.breaker),
             "both threads share one breaker"
         );
+    }
+
+    /// An ILP server that answers 400 (a permanent refusal) to every write.
+    fn refusing_ilp_server() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 65_536];
+                let _ = stream.read(&mut buf);
+                let body = b"bad line";
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+                let _ = stream.write_all(body);
+            }
+        });
+        port
+    }
+
+    /// Review fix 2: once the lane requests shutdown, both threads spill
+    /// instead of sending, so a queued batch can never wait on a slow
+    /// QuestDB past the deadline: every batch is spilled or counted.
+    #[test]
+    fn test_shutdown_request_spills_queued_and_new_batches_instead_of_sending() {
+        let (port, hits) = accepting_ilp_server();
+        let dir = scratch_dir("shutdown");
+        let mut w = TopVolumeRankWriter::new(&cfg(port));
+        w.keyed = &KEYED;
+        let TopVolumeOffload {
+            mut producer,
+            row_writer: mut formatter,
+            rows: _rows,
+            mut flusher,
+            shutdown,
+        } = w.split_rows_with_spiller("unmapped", spiller(dir.clone()));
+        let out = formatter.write_batch(batch_of(&mut producer, &[1, 2]));
+        assert_eq!(out.queued, 2, "queued before the shutdown request");
+        assert!(!shutdown.is_requested());
+        shutdown.request();
+        assert!(shutdown.is_requested());
+        let queued = flusher.flushes.try_recv().expect("queued");
+        assert_eq!(
+            flusher.flush_one(queued),
+            TopVolumeFlushOutcome::Spilled(2),
+            "a batch queued before shutdown is spilled, never sent"
+        );
+        let out = formatter.write_batch(batch_of(&mut producer, &[3]));
+        assert_eq!((out.queued, out.spilled, out.lost), (0, 1, 0));
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "nothing reached the network"
+        );
+        assert_eq!(spilled_lines(&dir), 3);
+        assert!(
+            !flusher.breaker.is_open_at(std::time::Instant::now()),
+            "shutdown is not a QuestDB failure"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review fix 5: a permanent refusal (an HTTP 4xx answer) is spilled
+    /// but does not trip the breaker; only a transport failure does.
+    #[test]
+    fn test_permanent_refusal_spills_without_tripping_the_breaker() {
+        let dir = scratch_dir("permanent");
+        let mut w = TopVolumeRankWriter::new(&cfg(refusing_ilp_server()));
+        w.keyed = &KEYED;
+        let (mut producer, mut formatter, mut flusher) = split_with(w, spiller(dir.clone()));
+        let out = formatter.write_batch(batch_of(&mut producer, &[1]));
+        assert_eq!(out.queued, 1);
+        let queued = flusher.flushes.try_recv().expect("queued");
+        assert_eq!(flusher.flush_one(queued), TopVolumeFlushOutcome::Spilled(1));
+        assert!(
+            !flusher.breaker.is_open_at(std::time::Instant::now()),
+            "a 4xx is not an outage: the breaker stays closed"
+        );
+        let out = formatter.write_batch(batch_of(&mut producer, &[2]));
+        assert_eq!(out.queued, 1, "the next batch is still sent");
+        assert_eq!(spilled_lines(&dir), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review fix 4: the two threads' spillers share ONE lock, and a failed
+    /// append is cut back so no torn line is left for the next append.
+    #[test]
+    fn test_spills_are_serialised_and_a_failed_append_is_cut_back() {
+        let dir = scratch_dir("serialised");
+        let (_producer, formatter, flusher) =
+            split_with(keyed_writer(&KEYED), spiller(dir.clone()));
+        assert!(
+            Arc::ptr_eq(&formatter.spiller.lock, &flusher.spiller.lock),
+            "both threads must serialise on the same lock"
+        );
+        let mut ok = spiller(dir.clone());
+        assert!(ok.spill(
+            b"top_volume_1s,tf=1s security_id=1i 1\n",
+            1,
+            TopVolumeSpillArm::QueueFull,
+            "t"
+        ));
+        let before = spilled_bytes(&dir);
+        let mut failing = TopVolumeSpiller {
+            sync: Some(|_| Err(std::io::Error::other("injected"))),
+            ..spiller(dir.clone())
+        };
+        assert!(
+            !failing.spill(
+                b"top_volume_1s,tf=1s security_id=2i 2\n",
+                1,
+                TopVolumeSpillArm::QueueFull,
+                "t"
+            ),
+            "a failed sync is a lost batch, never a silent success"
+        );
+        assert_eq!(
+            spilled_bytes(&dir),
+            before,
+            "the failed append was truncated back: no torn or unsynced line remains"
+        );
+        assert!(ok.spill(
+            b"top_volume_1s,tf=1s security_id=3i 3\n",
+            1,
+            TopVolumeSpillArm::QueueFull,
+            "t"
+        ));
+        assert_eq!(spilled_lines(&dir), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_is_requested_after_request_is_shared_by_clones() {
+        let a = TopVolumeShutdown::default();
+        let b = a.clone();
+        assert!(!b.is_requested());
+        a.request();
+        assert!(b.is_requested(), "a clone sees the request");
+        a.request();
+        assert!(a.is_requested(), "idempotent");
     }
 
     proptest::proptest! {

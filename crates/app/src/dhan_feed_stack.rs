@@ -1648,6 +1648,10 @@ pub struct LiveIngest {
     /// land. It exits once the formatter exits (the formatter holds its only
     /// queue sender), so shutdown polls it second, against the same deadline.
     top_volume_flush_thread: Option<std::thread::JoinHandle<()>>,
+    /// Requested by `shutdown_top_volume_writer` BEFORE it polls the two
+    /// threads: from then on both spill instead of sending, so no queued
+    /// batch waits on a slow QuestDB past the shutdown deadline.
+    top_volume_shutdown: Option<tickvault_storage::top_volume_rank_persistence::TopVolumeShutdown>,
     /// Signalled by the writer thread as its LAST act, so shutdown can wait
     /// with a bounded grace instead of a `join` that has no timeout.
     ///
@@ -2051,15 +2055,22 @@ impl LiveIngest {
     }
 
     /// Hands the lane the top-volume FLUSH thread's join handle (2026-10-13,
-    /// top_volume spill plan item 3), so shutdown can wait for it.
+    /// top_volume spill plan item 3), `None` when its spawn failed, and the
+    /// shutdown signal both top-volume threads read, so shutdown can ask
+    /// them to spill and then wait for them.
     ///
     /// Separate from [`Self::with_top_volume_writer`] because the two threads
     /// are spawned separately and either spawn can fail on its own: a lane
     /// whose flush thread never started still runs the formatter, which then
     /// spills every batch.
     #[must_use]
-    pub fn with_top_volume_flush_thread(mut self, thread: std::thread::JoinHandle<()>) -> Self {
-        self.top_volume_flush_thread = Some(thread);
+    pub fn with_top_volume_flush_thread(
+        mut self,
+        thread: Option<std::thread::JoinHandle<()>>,
+        shutdown: tickvault_storage::top_volume_rank_persistence::TopVolumeShutdown,
+    ) -> Self {
+        self.top_volume_flush_thread = thread;
+        self.top_volume_shutdown = Some(shutdown);
         self
     }
 
@@ -2948,6 +2959,7 @@ impl LiveIngest {
             rescue_thread: None,
             top_volume_thread: None,
             top_volume_flush_thread: None,
+            top_volume_shutdown: None,
             writer_done: None,
             prev_close: crate::prev_close_store::PrevCloseStore::new(),
             prev_close_disagreements: 0,
@@ -3517,6 +3529,15 @@ impl LiveIngest {
         // queue's only sender, so the flush thread can finish only after the
         // formatter has. Both are polled against the SAME deadline, so the
         // second wait spends only what the first left.
+        //
+        // The shutdown signal goes FIRST (2026-10-13, PR-B review): from here
+        // both threads spill instead of sending, so the up-to-four queued
+        // batches go to disk at append speed instead of each waiting on a slow
+        // QuestDB. Only a batch already mid-flush can still hold the flush
+        // thread (one request timeout), which the deadline below bounds.
+        if let Some(shutdown) = self.top_volume_shutdown.as_ref() {
+            shutdown.request();
+        }
         let threads = [
             (self.top_volume_thread.take(), "formatter"),
             (self.top_volume_flush_thread.take(), "flush"),
@@ -3545,13 +3566,22 @@ impl LiveIngest {
             if !handle.is_finished() {
                 metrics::counter!(OFFLOAD_SHUTDOWN_INCOMPLETE_COUNTER, "writer" => "top_volume")
                     .increment(1);
+                let why = if thread == "flush" {
+                    "the flush thread was still inside a QuestDB request when the \
+                     lane's shared shutdown deadline passed (its own request \
+                     timeout, or a budget the tick and depth joins already spent)"
+                } else {
+                    "the formatter was still formatting or spilling its queue when \
+                     the lane's shared shutdown deadline passed (its own disk \
+                     writes, or a budget the tick and depth joins already spent)"
+                };
                 error!(
                     code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
                     thread,
-                    "the top-volume writer was abandoned at shutdown — the lane's \
-                     flush budget was already spent by the tick and depth joins, so \
-                     the final ranking batches of the session may not have reached \
-                     QuestDB or the top_volume spill folder. These are ranking \
+                    why,
+                    "the top-volume writer was abandoned at shutdown, so the final \
+                     ranking batches of the session may have reached neither \
+                     QuestDB nor the top_volume spill folder. These are ranking \
                      SNAPSHOTS, not ticks: no trade data is lost."
                 );
                 // An abandoned formatter still holds the flush queue open, so
@@ -17714,6 +17744,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             mut row_writer,
             rows: rx,
             flusher,
+            shutdown: top_volume_shutdown,
         } = writer.split_rows_for_offload(
             crate::contract_underlying_map::UNLABELLED_CONTRACT,
             std::path::PathBuf::from(
@@ -17781,11 +17812,10 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 );
             }
         }
-        // Held whether or not the formatter spawned: shutdown polls it against
-        // the same deadline (it exits once the formatter's queue sender drops).
-        if let Some(handle) = flush_handle {
-            ingest = ingest.with_top_volume_flush_thread(handle);
-        }
+        // Held whether or not either thread spawned: shutdown requests the
+        // spill-only mode and polls the flush thread against the same deadline
+        // (it exits once the formatter's queue sender drops).
+        ingest = ingest.with_top_volume_flush_thread(flush_handle, top_volume_shutdown);
     }
 
     // Move the blocking ILP round trip off the drain task, BEFORE any socket
@@ -25784,10 +25814,15 @@ mod tests {
                 tickvault_storage::top_volume_rank_persistence::TopVolumeRowProducer::for_test().0,
                 std::thread::spawn(|| {}),
             )
-            .with_top_volume_flush_thread(std::thread::spawn(move || {
-                flag.store(true, std::sync::atomic::Ordering::SeqCst);
-            }));
+            .with_top_volume_flush_thread(
+                Some(std::thread::spawn(move || {
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                })),
+                tickvault_storage::top_volume_rank_persistence::TopVolumeShutdown::default(),
+            );
         assert!(ingest.top_volume_flush_thread.is_some());
+        let signal = ingest.top_volume_shutdown.clone().expect("held");
+        assert!(!signal.is_requested());
         ingest.close_offload_queues();
         let deadline = std::time::Instant::now() + OFFLOAD_SHUTDOWN_GRACE;
         ingest.shutdown_top_volume_writer(deadline);
@@ -25800,14 +25835,21 @@ mod tests {
             "the flush thread was joined"
         );
         assert!(flush_done.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            signal.is_requested(),
+            "shutdown must ask both threads to spill before it waits on them"
+        );
 
         // A flush thread that outlives the deadline is ABANDONED, not waited
         // on: the call returns at the deadline.
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let mut stuck = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4)
-            .with_top_volume_flush_thread(std::thread::spawn(move || {
-                let _ = release_rx.recv();
-            }));
+            .with_top_volume_flush_thread(
+                Some(std::thread::spawn(move || {
+                    let _ = release_rx.recv();
+                })),
+                tickvault_storage::top_volume_rank_persistence::TopVolumeShutdown::default(),
+            );
         let started = std::time::Instant::now();
         stuck.shutdown_top_volume_writer(started + std::time::Duration::from_millis(50));
         assert!(
@@ -25822,8 +25864,20 @@ mod tests {
     fn test_with_top_volume_flush_thread_holds_the_handle_for_shutdown() {
         let ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
         assert!(ingest.top_volume_flush_thread.is_none());
-        let ingest = ingest.with_top_volume_flush_thread(std::thread::spawn(|| {}));
+        let ingest = ingest.with_top_volume_flush_thread(
+            Some(std::thread::spawn(|| {})),
+            tickvault_storage::top_volume_rank_persistence::TopVolumeShutdown::default(),
+        );
         assert!(ingest.top_volume_flush_thread.is_some());
+        assert!(ingest.top_volume_shutdown.is_some());
+        // A failed flush-thread spawn still hands over the shutdown signal.
+        let no_thread = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4)
+            .with_top_volume_flush_thread(
+                None,
+                tickvault_storage::top_volume_rank_persistence::TopVolumeShutdown::default(),
+            );
+        assert!(no_thread.top_volume_flush_thread.is_none());
+        assert!(no_thread.top_volume_shutdown.is_some());
     }
 
     #[test]
