@@ -26,9 +26,28 @@
 //!   sequence range unapplied, and an hours-old row beside a live one would
 //!   span dozens of buckets. A separate synchronous writer keeps every batch to
 //!   one bucket and gives this pass a direct acknowledgement.
-//! * **Paced.** It pauses while any QuestDB table's WAL apply lag is growing,
-//!   while the applied watermark distrusts the sink, and while the ingest shed
-//!   still refuses the kind it would write. It stops at 17:15.
+//! * **Paced.** It pauses while any QuestDB table's WAL apply lag is growing
+//!   and while the applied watermark distrusts the sink. It stops at 17:15,
+//!   and it stops early when free disk on the WAL volume falls below
+//!   [`AFTER_CLOSE_DISK_FLOOR_FREE_FRACTION`].
+//!
+//! # Why the ingest shed does not pause it (fixed 2026-10-13)
+//!
+//! Until 2026-10-13 the pass also paused while the ingest shed refused the
+//! kind it would write. MEASURED on 2026-10-12: the disk shed turned on at
+//! 09:52 IST and never turned off (inline depth restores only above 28% free),
+//! 51.4M inline-depth packets were shed, and the pass waited from 15:55 to
+//! 17:15 and wrote nothing (`rows=0`, `cleared=0`, `stop=Deadline`). The shed
+//! frames stay pinned in the WAL until this pass writes them back, so the disk
+//! the shed was waiting for could only be freed by the pass that waited for
+//! it, and below 5% free the byte prune deletes the pinned segments as a loss.
+//!
+//! After the close the shed gates nothing live (the pass starts after the
+//! capture window ends, asserted below). Its two inputs are covered directly:
+//! the apply-lag half is the same `wal_apply_lag_growing` signal this pass
+//! already pauses on, and the disk half is replaced by a measured floor that
+//! STOPS the pass (finished buckets are still settled and released) well
+//! above the 5% point where pinned segments start being deleted.
 //!
 //! # When a mark is cleared
 //!
@@ -97,6 +116,28 @@ pub const AFTER_CLOSE_SETTLE: Duration = Duration::from_secs(AFTER_CLOSE_SETTLE_
 const _: () =
     assert!(AFTER_CLOSE_DEPTH_STOP_SECS_IST + AFTER_CLOSE_SETTLE.as_secs() < BOX_STOP_SECS_IST);
 const _: () = assert!(AFTER_CLOSE_DEPTH_START_SECS_IST < AFTER_CLOSE_DEPTH_STOP_SECS_IST);
+// The pass never runs while live capture writes depth, which is why the
+// ingest shed no longer pauses it: after the capture end the shed gates
+// nothing live. Moving either constant so the two overlap fails the build.
+const _: () = assert!(
+    AFTER_CLOSE_DEPTH_START_SECS_IST
+        >= tickvault_common::constants::TICK_PERSIST_END_SECS_OF_DAY_IST as u64
+);
+
+/// Free-space fraction of the WAL volume below which the pass stops writing.
+///
+/// Equal to the ingest shed's all-depth threshold
+/// (`ingest_shed::SHED_ALL_DEPTH_BELOW_FREE`, 8%): the pass stops where even
+/// live dedicated depth would be shed. It sits three points (about 19 GB on
+/// the 644 GB volume) above `ws_frame_spill::WAL_PINNED_DISK_FLOOR_FREE_FRACTION`
+/// (5%), where the byte prune starts deleting pinned segments as a counted
+/// loss, so the pass's own writes (checked before every bucket and before
+/// every late flush, so at most one 16 MiB batch plus the partition rewrite
+/// its commit causes between checks) cannot carry the volume there. It is
+/// below the inline shed threshold (15%), so a disk-only inline shed does not
+/// stop the pass. Both orderings are pinned by a test.
+pub const AFTER_CLOSE_DISK_FLOOR_FREE_FRACTION: f64 =
+    tickvault_common::ingest_shed::SHED_ALL_DEPTH_BELOW_FREE;
 
 /// The widest bucket range one segment may cover before the overflow sweep
 /// stops trusting it (a segment normally spans one or two buckets).
@@ -131,6 +172,9 @@ pub enum PassStop {
     Deadline,
     /// The lane is shutting down.
     Cancelled,
+    /// Free disk on the WAL volume fell below
+    /// [`AFTER_CLOSE_DISK_FLOOR_FREE_FRACTION`], or could not be measured.
+    DiskFloor,
 }
 
 /// What the pass should do next.
@@ -143,17 +187,23 @@ pub enum PassStep {
 
 /// The pass's pacing rule. Pure and O(1).
 ///
-/// Cancellation and the window win over everything; inside the window the
-/// pass pauses while QuestDB is falling behind (`lag_growing_tables > 0`),
-/// while the applied watermark distrusts the sink, or while the ingest shed
-/// still refuses the depth kind being written (`shed_blocks`) — writing back
-/// under disk pressure would defeat the shed that protects the disk.
+/// Cancellation and the window win over everything. Inside the window a disk
+/// below the floor (`disk_low`) STOPS the pass: nothing the pass does frees
+/// disk before it finishes, so waiting would only run out the window, while
+/// stopping lets the buckets already written be settled and released. The
+/// pass pauses while QuestDB is falling behind (`lag_growing_tables > 0`) or
+/// the applied watermark distrusts the sink.
+///
+/// The ingest shed is deliberately NOT an input (2026-10-13, see the module
+/// header): after the close it gates nothing live, its apply-lag half is
+/// `lag_growing_tables`, and its disk half is `disk_low`. Pausing on it
+/// deadlocked the pass against the disk only the pass can free.
 #[must_use]
 pub const fn after_close_step(
     secs_ist: u64,
     lag_growing_tables: u32,
     sink_suspect: bool,
-    shed_blocks: bool,
+    disk_low: bool,
     cancelled: bool,
 ) -> PassStep {
     if cancelled {
@@ -165,10 +215,21 @@ pub const fn after_close_step(
     if secs_ist >= AFTER_CLOSE_DEPTH_STOP_SECS_IST {
         return PassStep::Stop(PassStop::Deadline);
     }
-    if lag_growing_tables > 0 || sink_suspect || shed_blocks {
+    if disk_low {
+        return PassStep::Stop(PassStop::DiskFloor);
+    }
+    if lag_growing_tables > 0 || sink_suspect {
         return PassStep::Pause;
     }
     PassStep::Run
+}
+
+/// Whether a measured free fraction is below the pass's disk floor. An
+/// unmeasured disk (`None`, a failed `statvfs`) reads as below it: adding
+/// rows to a volume nobody can measure is the direction that loses data,
+/// and stopping costs only a carry to the next evening. O(1).
+fn disk_below_pass_floor(free_fraction: Option<f64>) -> bool {
+    free_fraction.is_none_or(|f| !f.is_finite() || f < AFTER_CLOSE_DISK_FLOOR_FREE_FRACTION)
 }
 
 /// Seconds until the next window opens, from `secs_ist`. `0` inside the
@@ -189,9 +250,26 @@ pub struct PassSignals<'a> {
     pub now_secs_ist: &'a dyn Fn() -> u64,
     pub lag_growing_tables: &'a dyn Fn() -> u32,
     pub sink_suspect: &'a dyn Fn() -> bool,
-    /// `true` while the ingest shed refuses any of `kinds`.
-    pub shed_blocks: &'a dyn Fn(u8) -> bool,
+    /// Free-space fraction (0.0..=1.0) of the volume holding the WAL
+    /// directory passed in; `None` when it cannot be measured.
+    pub disk_free_fraction: &'a dyn Fn(&Path) -> Option<f64>,
     pub sleep: &'a dyn Fn(Duration),
+}
+
+/// Free-space fraction of the volume holding `path`: one `statvfs` call,
+/// `None` when the probe fails or reports an empty volume. Cold path.
+fn probe_free_fraction(path: &Path) -> Option<f64> {
+    match tickvault_storage::disk_health_watcher::probe_disk_free_bytes(path) {
+        tickvault_storage::disk_health_watcher::DiskHealthOutcome::Ok {
+            free_bytes,
+            total_bytes,
+        } if total_bytes > 0 => {
+            #[allow(clippy::cast_precision_loss)] // APPROVED: ratio of byte counts
+            let free = free_bytes as f64 / total_bytes as f64;
+            Some(free)
+        }
+        _ => None,
+    }
 }
 
 /// The production signals.
@@ -203,11 +281,7 @@ pub fn live_signals() -> PassSignals<'static> {
         sink_suspect: &|| {
             tickvault_storage::wal_applied_watermark::applied_watermark().is_sink_suspect()
         },
-        shed_blocks: &|kinds| {
-            let shed = &tickvault_common::ingest_shed::INGEST_SHED;
-            (kinds & ShedDepth::Inline as u8 != 0 && !shed.allows_inline_depth())
-                || (kinds & ShedDepth::Dedicated as u8 != 0 && !shed.allows_dedicated_depth())
-        },
+        disk_free_fraction: &probe_free_fraction,
         sleep: &|d| std::thread::sleep(d),
     }
 }
@@ -370,13 +444,17 @@ const fn endpoint_matches(endpoint: WalEndpoint, kinds: u8) -> bool {
 }
 
 /// Waits until the pacing rule says run. `Err` carries the stop reason.
-fn wait_for_run(signals: &PassSignals<'_>, kinds: u8, cancel: &AtomicBool) -> Result<(), PassStop> {
+fn wait_for_run(
+    signals: &PassSignals<'_>,
+    wal_dir: &Path,
+    cancel: &AtomicBool,
+) -> Result<(), PassStop> {
     loop {
         match after_close_step(
             (signals.now_secs_ist)(),
             (signals.lag_growing_tables)(),
             (signals.sink_suspect)(),
-            (signals.shed_blocks)(kinds),
+            disk_below_pass_floor((signals.disk_free_fraction)(wal_dir)),
             cancel.load(Ordering::Acquire),
         ) {
             PassStep::Run => return Ok(()),
@@ -384,6 +462,24 @@ fn wait_for_run(signals: &PassSignals<'_>, kinds: u8, cancel: &AtomicBool) -> Re
             PassStep::Stop(reason) => return Err(reason),
         }
     }
+}
+
+/// Counts and logs the pass stopping at the disk floor. Once per pass (the
+/// pass ends right after). Log-only `warn!`: nothing is lost here, the
+/// unfinished buckets stay marked and their segments stay pinned.
+fn report_disk_floor_stop(signals: &PassSignals<'_>, wal_dir: &Path, bucket: u64) {
+    metrics::counter!(DEFERRED_DEPTH_PASS_COUNTER, "outcome" => "disk_floor").increment(1);
+    let free = (signals.disk_free_fraction)(wal_dir);
+    warn!(
+        code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+        source = "deferred_depth_disk_floor",
+        bucket,
+        free_fraction = ?free,
+        floor = AFTER_CLOSE_DISK_FLOOR_FREE_FRACTION,
+        "after-close depth pass stopped early: free disk on the frame-log volume is below its \
+         floor (or unmeasured). Buckets already finished are settled and released; the rest \
+         stay marked, and their segments stay on disk for the next evening's pass"
+    );
 }
 
 /// Runs one after-close pass over every marked bucket in `marks`, writing to
@@ -491,7 +587,10 @@ pub fn run_after_close_pass(
     let mut done: Vec<(u64, u8)> = Vec::with_capacity(work.len()); // APPROVED: cold
 
     for &(id, kinds) in &work {
-        if let Err(reason) = wait_for_run(signals, kinds, cancel) {
+        if let Err(reason) = wait_for_run(signals, wal_dir, cancel) {
+            if reason == PassStop::DiskFloor {
+                report_disk_floor_stop(signals, wal_dir, id);
+            }
             summary.stop = Some(reason);
             break;
         }
@@ -543,6 +642,7 @@ pub fn run_after_close_pass(
             seq >> DEFERRED_BUCKET_SHIFT == id && endpoint_matches(endpoint, kinds)
         };
         let mut failed = false;
+        let mut disk_stop = false;
         let mut damaged = false;
         let mut bucket_no_receipt = 0u64;
         'segments: for path in &bucket.paths {
@@ -589,6 +689,16 @@ pub fn run_after_close_pass(
                     _ => rewrite_dedicated_depth(sink, frame, c),
                 };
                 summary.rows_written = summary.rows_written.saturating_add(rows);
+                // Re-check the disk floor before every late commit (one
+                // `statvfs` per 16 MiB batch): a bucket can hold many
+                // batches, and each commit rewrites an hour partition.
+                if sink.late_flush_due()
+                    && disk_below_pass_floor((signals.disk_free_fraction)(wal_dir))
+                {
+                    disk_stop = true;
+                    failed = true;
+                    break 'segments;
+                }
                 // The LATE-row trigger (plan item 55): every commit here
                 // rewrites a whole hour partition, so fewer, larger ones.
                 if sink.late_flush_due() && sink.flush().is_err() {
@@ -600,6 +710,15 @@ pub fn run_after_close_pass(
         // Flush at every bucket edge so no ILP batch spans two buckets.
         if !failed && sink.flush().is_err() {
             failed = true;
+        }
+        if disk_stop {
+            // The unflushed rows of this bucket are not sent: it stays
+            // marked and is rewritten onto the same keys next evening.
+            summary.buckets_carried += 1;
+            overflow_complete = false;
+            report_disk_floor_stop(signals, wal_dir, id);
+            summary.stop = Some(PassStop::DiskFloor);
+            break;
         }
         if failed {
             summary.buckets_carried += 1;
@@ -782,6 +901,9 @@ mod tests {
 
     const IN_WINDOW: u64 = AFTER_CLOSE_DEPTH_START_SECS_IST + 60;
 
+    /// A free fraction well clear of every shed and floor threshold.
+    const HEALTHY_FREE: f64 = 0.5;
+
     #[test]
     fn after_close_step_over_the_full_grid() {
         use PassStep::{Pause, Run, Stop};
@@ -790,7 +912,11 @@ mod tests {
         assert_eq!(after_close_step(IN_WINDOW, 0, false, false, false), Run);
         assert_eq!(after_close_step(IN_WINDOW, 1, false, false, false), Pause);
         assert_eq!(after_close_step(IN_WINDOW, 0, true, false, false), Pause);
-        assert_eq!(after_close_step(IN_WINDOW, 0, false, true, false), Pause);
+        // A low disk stops the pass (never a pause), even while QuestDB lags.
+        assert_eq!(
+            after_close_step(IN_WINDOW, 3, true, true, false),
+            Stop(PassStop::DiskFloor)
+        );
         assert_eq!(
             after_close_step(before, 0, false, false, false),
             Stop(PassStop::BeforeWindow)
@@ -814,13 +940,15 @@ mod tests {
             secs in 0u64..86_400,
             lag in 0u32..4,
             suspect in proptest::bool::ANY,
-            shed in proptest::bool::ANY,
+            disk_low in proptest::bool::ANY,
         ) {
-            let step = after_close_step(secs, lag, suspect, shed, false);
+            let step = after_close_step(secs, lag, suspect, disk_low, false);
             let in_window = (AFTER_CLOSE_DEPTH_START_SECS_IST..AFTER_CLOSE_DEPTH_STOP_SECS_IST).contains(&secs);
             if !in_window {
                 proptest::prop_assert!(matches!(step, PassStep::Stop(_)));
-            } else if lag > 0 || suspect || shed {
+            } else if disk_low {
+                proptest::prop_assert_eq!(step, PassStep::Stop(PassStop::DiskFloor));
+            } else if lag > 0 || suspect {
                 proptest::prop_assert_eq!(step, PassStep::Pause);
             } else {
                 proptest::prop_assert_eq!(step, PassStep::Run);
@@ -971,7 +1099,7 @@ mod tests {
             now_secs_ist: &|| IN_WINDOW,
             lag_growing_tables: &|| 0,
             sink_suspect: &|| false,
-            shed_blocks: &|_| false,
+            disk_free_fraction: &|_| Some(HEALTHY_FREE),
             sleep: &sleep,
         };
         let cancel = AtomicBool::new(false);
@@ -1002,7 +1130,7 @@ mod tests {
             now_secs_ist: &|| IN_WINDOW,
             lag_growing_tables: &|| 0,
             sink_suspect: &|| false,
-            shed_blocks: &|_| false,
+            disk_free_fraction: &|_| Some(HEALTHY_FREE),
             sleep: &|_| {},
         };
         let cancel = AtomicBool::new(true);
@@ -1023,7 +1151,7 @@ mod tests {
             now_secs_ist: &|| AFTER_CLOSE_DEPTH_STOP_SECS_IST,
             lag_growing_tables: &|| 0,
             sink_suspect: &|| false,
-            shed_blocks: &|_| false,
+            disk_free_fraction: &|_| Some(HEALTHY_FREE),
             sleep: &|_| {},
         };
         let cancel = AtomicBool::new(false);
@@ -1039,6 +1167,13 @@ mod tests {
     /// succeeds — which lets these tests reach the settle-and-clear step
     /// without a QuestDB.
     fn wal_with_one_refused_frame(tag: &str) -> (std::path::PathBuf, u64) {
+        wal_with_refused_frames(tag, 1)
+    }
+
+    /// [`wal_with_one_refused_frame`] with `buckets` frames, one in each of
+    /// that many consecutive deferred buckets. Returns the first frame's
+    /// sequence; frame `i` is at `seq + (i << DEFERRED_BUCKET_SHIFT)`.
+    fn wal_with_refused_frames(tag: &str, buckets: u64) -> (std::path::PathBuf, u64) {
         let dir = std::env::temp_dir().join(format!(
             "tv-deferred-{tag}-{}-{}",
             std::process::id(),
@@ -1048,13 +1183,15 @@ mod tests {
         let rx: i64 = 1_780_000_000 * 1_000_000_000; // 01:56 IST
         let seq = u64::try_from(rx).unwrap() >> 17 << 17;
         let wal = tickvault_storage::ws_frame_spill::WsFrameSpill::new(&dir).expect("wal");
-        wal.append_with_seq_at(
-            WsType::LiveFeed,
-            full_packet(13),
-            seq,
-            rx,
-            WalEndpoint::MainFeed,
-        );
+        for i in 0..buckets {
+            wal.append_with_seq_at(
+                WsType::LiveFeed,
+                full_packet(13),
+                seq + (i << DEFERRED_BUCKET_SHIFT),
+                rx,
+                WalEndpoint::MainFeed,
+            );
+        }
         wal.shutdown(Duration::from_secs(5));
         (dir, seq)
     }
@@ -1071,7 +1208,7 @@ mod tests {
             now_secs_ist: &|| clock.get(),
             lag_growing_tables: &|| 0,
             sink_suspect: &|| false,
-            shed_blocks: &|_| false,
+            disk_free_fraction: &|_| Some(HEALTHY_FREE),
             sleep: &sleep,
         };
         let summary = run_after_close_pass(
@@ -1113,7 +1250,7 @@ mod tests {
             now_secs_ist: &|| clock.get(),
             lag_growing_tables: &|| 0,
             sink_suspect: &|| false,
-            shed_blocks: &|_| false,
+            disk_free_fraction: &|_| Some(HEALTHY_FREE),
             sleep: &sleep,
         };
         let summary = run_after_close_pass(
@@ -1152,7 +1289,7 @@ mod tests {
             // Healthy while writing, lagging from the settle onwards.
             lag_growing_tables: &|| u32::from(settling.get()),
             sink_suspect: &|| false,
-            shed_blocks: &|_| false,
+            disk_free_fraction: &|_| Some(HEALTHY_FREE),
             sleep: &sleep,
         };
         let summary = run_after_close_pass(
@@ -1178,6 +1315,154 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Regression, 2026-10-12 (MEASURED on the box): the disk shed turned on
+    /// at 09:52 IST at 80% used and never turned off, because inline depth
+    /// restores only above 28% free. The pass paused on the shed from 15:55 to
+    /// 17:15 and wrote nothing (`rows=0`, `cleared=0`, `stop=Deadline`), so the
+    /// pinned segments it alone can release kept filling the disk.
+    ///
+    /// Here the disk sits at 15% free (the day's reading), where the disk
+    /// shed is on and stays on, and QuestDB is healthy: the pass must run,
+    /// settle and clear the bucket, not wait out the window.
+    #[test]
+    fn test_regression_deferred_pass_runs_while_the_disk_shed_is_on() {
+        use tickvault_common::ingest_shed::{ShedLevel, decide_shed_level};
+        const DAY_FREE: f64 = 0.15;
+        // Precondition: at this free fraction the disk shed is ON and holds.
+        assert_eq!(
+            decide_shed_level(ShedLevel::InlineDepth, DAY_FREE, true),
+            ShedLevel::InlineDepth,
+            "the fixture must reproduce a disk-held inline shed"
+        );
+
+        let (dir, seq) = wal_with_one_refused_frame("disk-shed");
+        let marks = DeferredDepth::new_for_tests();
+        marks.note_shed(seq, ShedDepth::Inline);
+        let clock = Cell::new(IN_WINDOW);
+        let sleep = |d: Duration| clock.set(clock.get() + d.as_secs());
+        let signals = PassSignals {
+            now_secs_ist: &|| clock.get(),
+            lag_growing_tables: &|| 0,
+            sink_suspect: &|| false,
+            disk_free_fraction: &|_| Some(DAY_FREE),
+            sleep: &sleep,
+        };
+        let summary = run_after_close_pass(
+            &mut DepthIngest::for_test(),
+            &marks,
+            &dir,
+            &AtomicBool::new(false),
+            &signals,
+        );
+        assert_eq!(summary.stop, None, "the pass must not wait out the window");
+        assert_eq!(summary.buckets_cleared, 1);
+        assert!(marks.snapshot().is_empty(), "the mark is released");
+        assert!(
+            clock.get() < IN_WINDOW + AFTER_CLOSE_SETTLE.as_secs() + AFTER_CLOSE_PAUSE.as_secs(),
+            "no pause before the bucket: only the settle elapsed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The disk floor sits above the point where pinned segments are deleted
+    /// as a loss, and below the inline shed threshold, so a disk-only inline
+    /// shed never stops the pass on its own.
+    #[test]
+    fn test_disk_floor_sits_between_the_pinned_delete_floor_and_the_inline_shed() {
+        assert!(
+            AFTER_CLOSE_DISK_FLOOR_FREE_FRACTION
+                > tickvault_storage::ws_frame_spill::WAL_PINNED_DISK_FLOOR_FREE_FRACTION
+        );
+        assert!(
+            AFTER_CLOSE_DISK_FLOOR_FREE_FRACTION
+                < tickvault_common::ingest_shed::SHED_INLINE_DEPTH_BELOW_FREE
+        );
+        assert!(!disk_below_pass_floor(Some(0.15)));
+        assert!(!disk_below_pass_floor(Some(
+            AFTER_CLOSE_DISK_FLOOR_FREE_FRACTION
+        )));
+        assert!(disk_below_pass_floor(Some(0.079)));
+        assert!(disk_below_pass_floor(Some(0.0)));
+        // Unmeasured or nonsense reads as low: never add rows blind.
+        assert!(disk_below_pass_floor(None));
+        assert!(disk_below_pass_floor(Some(f64::NAN)));
+    }
+
+    /// Two marked buckets; the disk falls below the floor after the first.
+    /// The pass stops (counted), still settles and releases the finished
+    /// bucket, and keeps the second marked for the next evening.
+    #[test]
+    fn test_deferred_pass_stops_at_the_disk_floor_and_releases_finished_buckets() {
+        let (dir, seq) = wal_with_refused_frames("disk-floor", 2);
+        let seq2 = seq + (1u64 << DEFERRED_BUCKET_SHIFT);
+        let marks = DeferredDepth::new_for_tests();
+        marks.note_shed(seq, ShedDepth::Inline);
+        marks.note_shed(seq2, ShedDepth::Inline);
+        assert_eq!(marks.snapshot().marked_buckets().len(), 2);
+
+        let probes = Cell::new(0u32);
+        let disk = |_: &Path| {
+            probes.set(probes.get() + 1);
+            if probes.get() == 1 {
+                Some(HEALTHY_FREE)
+            } else {
+                Some(0.01)
+            }
+        };
+        let clock = Cell::new(IN_WINDOW);
+        let sleep = |d: Duration| clock.set(clock.get() + d.as_secs());
+        let signals = PassSignals {
+            now_secs_ist: &|| clock.get(),
+            lag_growing_tables: &|| 0,
+            sink_suspect: &|| false,
+            disk_free_fraction: &disk,
+            sleep: &sleep,
+        };
+        let summary = run_after_close_pass(
+            &mut DepthIngest::for_test(),
+            &marks,
+            &dir,
+            &AtomicBool::new(false),
+            &signals,
+        );
+        assert_eq!(summary.stop, Some(PassStop::DiskFloor));
+        assert_eq!(
+            summary.buckets_cleared, 1,
+            "the finished bucket is released"
+        );
+        let left = marks.snapshot().marked_buckets();
+        assert_eq!(left.len(), 1, "the unfinished bucket stays marked");
+        assert_eq!(left[0].0, seq2 >> DEFERRED_BUCKET_SHIFT);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A disk below the floor from the start touches nothing.
+    #[test]
+    fn test_deferred_pass_below_the_disk_floor_touches_nothing() {
+        let (dir, seq) = wal_with_one_refused_frame("disk-low");
+        let marks = DeferredDepth::new_for_tests();
+        marks.note_shed(seq, ShedDepth::Inline);
+        let signals = PassSignals {
+            now_secs_ist: &|| IN_WINDOW,
+            lag_growing_tables: &|| 0,
+            sink_suspect: &|| false,
+            disk_free_fraction: &|_| None,
+            sleep: &|_| {},
+        };
+        let summary = run_after_close_pass(
+            &mut DepthIngest::for_test(),
+            &marks,
+            &dir,
+            &AtomicBool::new(false),
+            &signals,
+        );
+        assert_eq!(summary.stop, Some(PassStop::DiskFloor));
+        assert_eq!(summary.rows_written, 0);
+        assert_eq!(summary.buckets_cleared, 0);
+        assert!(!marks.snapshot().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn endpoint_matches_only_the_shed_kind() {
         let inline = ShedDepth::Inline as u8;
@@ -1190,13 +1475,18 @@ mod tests {
         assert!(!endpoint_matches(WalEndpoint::OrderUpdate, SHED_DEPTH_ALL));
     }
 
-    /// The production signals read real state and never block: the clock is
-    /// a second of the day, and an empty kinds mask is never blocked.
+    /// The production signals read real state: the clock is a second of the
+    /// day, and the disk probe measures a real directory as a fraction and an
+    /// absent one as unmeasured.
     #[test]
-    fn test_live_signals_read_a_valid_clock_and_an_empty_mask_never_blocks() {
+    fn test_live_signals_read_a_valid_clock_and_a_real_disk() {
         let signals = live_signals();
         assert!((signals.now_secs_ist)() < 86_400);
-        assert!(!(signals.shed_blocks)(0));
+        let free = (signals.disk_free_fraction)(&std::env::temp_dir());
+        assert!(free.is_some_and(|f| (0.0..=1.0).contains(&f)), "{free:?}");
+        let missing =
+            std::env::temp_dir().join(format!("tv-deferred-no-such-dir-{}", std::process::id()));
+        assert_eq!((signals.disk_free_fraction)(&missing), None);
     }
 
     /// A cancelled supervisor exits at once and never opens a writer.

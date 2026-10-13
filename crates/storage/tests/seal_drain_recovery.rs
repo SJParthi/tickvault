@@ -618,8 +618,10 @@ fn boot_drain_stays_wired_into_the_writer_loop() {
         .split_once("#[cfg(test)]")
         .expect("seal_writer_runner.rs must contain a test module marker");
     assert!(
-        runner_prod.contains("drain_recovered_seals("),
-        "SealWriterRunner::boot_drain must delegate to drain_recovered_seals"
+        runner_prod.contains("drain_recovered_seals_for_replay(")
+            && runner_prod.contains("&mut self.replay,"),
+        "SealWriterRunner::boot_drain must delegate to drain_recovered_seals_for_replay \
+         with its own mid-session replay (DA-13a review)"
     );
 }
 
