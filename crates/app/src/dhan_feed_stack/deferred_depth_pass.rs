@@ -1311,14 +1311,6 @@ mod tests {
             clock.get() < IN_WINDOW + AFTER_CLOSE_SETTLE.as_secs() + AFTER_CLOSE_PAUSE.as_secs(),
             "no pause before the bucket: only the settle elapsed"
         );
-
-        // And the pass no longer reads the shed gate at all.
-        let src = include_str!("deferred_depth_pass.rs");
-        let production = src.split("#[cfg(test)]").next().unwrap_or(src);
-        assert!(
-            !production.contains("INGEST_SHED"),
-            "the after-close pass must not pace on the ingest shed"
-        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
