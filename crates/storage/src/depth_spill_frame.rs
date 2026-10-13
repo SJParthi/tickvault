@@ -449,7 +449,12 @@ pub async fn replay_framed_spill_dir(
             &mut scratch,
         )
         .await;
-        if sent_bytes > 0 {
+        // Stamp on ANY progress, not only `sent_bytes`: a refused record whose
+        // lines were isolated had its good halves acknowledged by QuestDB
+        // without adding to `sent_bytes`, and those acks need confirming
+        // before the file is emptied too. Stamping a set-aside-only round as
+        // well costs at most one more confirm cycle before the empty-out.
+        if sent_bytes > 0 || offset > resume_from {
             note_spill_ack(&path, view);
         }
         if offset > resume_from {
@@ -1228,6 +1233,15 @@ mod tests {
         )))
         .expect("kept");
         assert_eq!(kept, b"market_depth,poison\n");
+        // Audit DA-13b: the good lines were acknowledged during isolation,
+        // so the drained file waits for those acks to be confirmed. Bite:
+        // stamp only on `sent_bytes > 0` and the file is emptied here.
+        assert_eq!(out.files_awaiting_confirm, 1);
+        assert!(
+            std::fs::metadata(&closed).expect("m").len() > 0,
+            "acks won by line isolation are confirmed before the file is emptied"
+        );
+        forget_resume_offset(&closed);
         forget_resume_offset(&dir.join("depth-dhan-2.dspl"));
         let _ = std::fs::remove_dir_all(&dir);
     }

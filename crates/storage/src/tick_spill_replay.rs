@@ -526,6 +526,11 @@ pub struct SpillSinkView {
     pub suspect_episodes: u64,
     /// Wall clock, Unix seconds.
     pub now_unix_secs: u64,
+    /// Read from the process (`current`), so an ack stamps the probe count
+    /// and clock AT THE ACK, not at the round's start: a long round's own
+    /// probes must not count as having run after its last ack. `false`
+    /// for a view a test built, which is stamped as given.
+    pub live: bool,
 }
 
 impl SpillSinkView {
@@ -542,6 +547,7 @@ impl SpillSinkView {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
+            live: true,
         }
     }
 }
@@ -594,8 +600,21 @@ fn ack_stamps() -> &'static std::sync::Mutex<std::collections::HashMap<std::path
 /// Records that QuestDB acknowledged bytes of `path` at `view`. When the
 /// earlier acks are already confirmed they are settled and the episode
 /// baseline restarts here; otherwise the first unconfirmed ack's episode is
-/// kept. Cold replay path, one lock and one probe.
+/// kept. The episode baseline is the ROUND's (an episode that began during
+/// the round may have lied about this ack, so it must still rewind it), while
+/// the clock and probe count are re-read at the ack for a live view (probes
+/// that ran during a long round, before the ack, must not count towards its
+/// confirmation). Cold replay path, one lock and one probe.
 pub(crate) fn note_spill_ack(path: &Path, view: &SpillSinkView) {
+    let (ack_secs, ack_probes) = if view.live {
+        let now = SpillSinkView::current();
+        (
+            now.now_unix_secs.max(view.now_unix_secs),
+            now.clean_probes.max(view.clean_probes),
+        )
+    } else {
+        (view.now_unix_secs, view.clean_probes)
+    };
     if let Ok(mut m) = ack_stamps().lock() {
         let first_episode = match m.get(path) {
             Some(prev) if prev.confirmed_at(view).is_err() => prev.first_episode,
@@ -605,8 +624,8 @@ pub(crate) fn note_spill_ack(path: &Path, view: &SpillSinkView) {
             path.to_path_buf(),
             AckStamp {
                 first_episode,
-                last_ack_secs: view.now_unix_secs,
-                last_ack_probes: view.clean_probes,
+                last_ack_secs: ack_secs,
+                last_ack_probes: ack_probes,
             },
         );
     }
@@ -615,7 +634,9 @@ pub(crate) fn note_spill_ack(path: &Path, view: &SpillSinkView) {
 /// If a suspicion episode began after the first unconfirmed ack of `path`,
 /// forgets its resume offset and stamp so this round POSTs the file again
 /// from the start, and returns `true`. The episode may have acknowledged rows
-/// it never applied; the DEDUP keys collapse the ones that did land.
+/// it never applied; the DEDUP keys collapse the ones that did land. A stamp
+/// this round finds already confirmed is settled (dropped) instead, so an
+/// episode that begins later does not rewind acks it cannot have lied about.
 pub(crate) fn rewind_after_suspicion(
     path: &Path,
     view: &SpillSinkView,
@@ -623,9 +644,18 @@ pub(crate) fn rewind_after_suspicion(
 ) -> bool {
     let rewind = ack_stamps()
         .lock()
-        .map(|m| {
-            m.get(path)
-                .is_some_and(|s| s.first_episode != view.suspect_episodes)
+        .map(|mut m| match m.get(path) {
+            // Confirmed before any episode began: those acks are settled, so
+            // a LATER episode cannot have lied about them. Dropping the stamp
+            // here keeps one later episode from re-sending the whole live
+            // hour file (possibly gigabytes) into a database that was just
+            // under stress.
+            Some(s) if s.confirmed_at(view).is_ok() => {
+                m.remove(path);
+                false
+            }
+            Some(s) => s.first_episode != view.suspect_episodes,
+            None => false,
         })
         .unwrap_or(false);
     if rewind {
@@ -2091,6 +2121,7 @@ pub(crate) mod tests {
         view.suspect = false;
         view.clean_probes = 0;
         view.suspect_episodes = 0;
+        view.live = false;
         view.now_unix_secs = view.now_unix_secs.saturating_add(2 * SPILL_FILE_HOUR_SECS);
         view
     }
@@ -3932,6 +3963,56 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
         let settled = confirmed_spill_view(&later);
         note_spill_ack(&path, &settled);
         assert!(!rewind_after_suspicion(&path, &settled, "ticks"));
+        forget_resume_offset(&path);
+    }
+
+    /// A live view's ack is stamped with the clock read AT the ack, not the
+    /// round's start: probes and time that passed during a long round, before
+    /// the ack, must not count towards its confirmation.
+    ///
+    /// Bite: stamp `view.now_unix_secs` for a live view and the verdict
+    /// below reads `Ok`.
+    #[test]
+    fn test_regression_da13b_a_live_ack_is_stamped_at_the_ack_not_the_round_start() {
+        let path = temp_dir("da13b-live-stamp").join("ticks-dhan-1.ilp");
+        let mut round_start = test_spill_view();
+        round_start.live = true;
+        round_start.now_unix_secs = 0;
+        note_spill_ack(&path, &round_start);
+        let mut later = round_start;
+        later.live = false;
+        later.clean_probes = u64::MAX / 2;
+        later.now_unix_secs = 1_000;
+        assert_eq!(
+            drained_file_empty_verdict(&path, &later),
+            Err("durability_lag"),
+            "the ack was stamped at the real clock, so the lag has not passed"
+        );
+        forget_resume_offset(&path);
+    }
+
+    /// A stamp a round finds confirmed is settled, so a LATER episode does
+    /// not rewind (and re-send) bytes whose acks were already confirmed
+    /// before it began; the live hour file can be gigabytes.
+    ///
+    /// Bite: remove the settle arm of `rewind_after_suspicion` and the last
+    /// call rewinds.
+    #[test]
+    fn test_regression_da13b_a_stamp_confirmed_before_an_episode_is_never_rewound() {
+        let path = temp_dir("da13b-settle").join("ticks-dhan-1.ilp");
+        let view = test_spill_view();
+        note_spill_ack(&path, &view);
+        record_resume_offset(&path, 42);
+        let confirmed = confirmed_spill_view(&view);
+        assert!(!rewind_after_suspicion(&path, &confirmed, "ticks"));
+        let mut after_episode = confirmed;
+        after_episode.suspect_episodes += 1;
+        assert!(
+            !rewind_after_suspicion(&path, &after_episode, "ticks"),
+            "acks confirmed before the episode are settled"
+        );
+        assert_eq!(resume_offset_for(&path), 42, "the offset is kept");
+        assert_eq!(drained_file_empty_verdict(&path, &after_episode), Ok(()));
         forget_resume_offset(&path);
     }
 
