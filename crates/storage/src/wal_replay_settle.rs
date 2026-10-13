@@ -30,7 +30,9 @@
 //! * [`WATERMARK_DURABILITY_LAG_SECS`] have passed since the ack;
 //! * at least [`WAL_REPLAY_SETTLE_CLEAN_PROBES`] clean QuestDB probes were
 //!   reported after the ack (so one whole probe ran after it);
-//! * no suspicion episode began after the ack.
+//! * no suspicion episode began after the batch STARTED writing (review fix:
+//!   rows are acked all through a refold, so the count is read where the
+//!   batch begins, [`replay_batch_start`], and the oldest waiting start wins).
 //!
 //! The watcher calls [`promote_settled_now`] after each probe. If a
 //! suspicion episode began, the settled segments are HELD in `settling/` for
@@ -39,7 +41,11 @@
 //! At boot, before the first replay pass reads the watermark, segments left
 //! in `settling/` by an earlier process have their sequence ranges marked
 //! unapplied in the watermark (persisted, then verified on disk) and are
-//! moved back to `replaying/`, so the replay reads them in full. The failure
+//! moved back to `replaying/`, so the replay reads them in full. Each range is
+//! read with the replay's own reader, so a torn first record still yields
+//! the range of the intact frames behind it; a segment that cannot be read at
+//! all is set apart in `settling/unreadable/`, never returned unmarked and
+//! never archived, and tried again at every boot. The failure
 //! direction of every step is "replay more"; the DEDUP keys absorb repeats.
 //!
 //! # Cost
@@ -48,7 +54,8 @@
 //! one rename per staged segment, once per replayed batch. Promote: one lock
 //! and three atomic loads per watcher probe (60 s) while nothing is settling;
 //! one listing and one rename per settled segment when promoting. Boot
-//! recovery: O(segments in `settling/`) header walks, once per process.
+//! recovery: one full CRC-checked read of each segment in `settling/` (O(bytes),
+//! one segment in memory at a time, no frame kept), once per process.
 //!
 //! # Honest limits
 //!
@@ -71,13 +78,63 @@ use crate::wal_applied_watermark::{
     AppliedSnapshot, AppliedWatermark, WATERMARK_DURABILITY_LAG_SECS, applied_watermark,
 };
 use crate::ws_frame_spill::{
-    ARCHIVE_SUBDIR, REPLAYING_SUBDIR, first_frame_seq_in_segment, highest_frame_seq_in_segment,
-    wal_segments_in,
+    ARCHIVE_SUBDIR, REPLAYING_SUBDIR, WalEndpoint, read_segment_frames_matching, wal_segments_in,
 };
 
 /// Acked-but-not-yet-durable replay segments. Never read by an in-process
 /// replay; read (after its ranges are marked unapplied) by the next boot's.
 pub const SETTLING_SUBDIR: &str = "settling";
+
+/// Under `settling/`: leftovers a boot could not read, so their sequence
+/// range could not be marked unapplied (DA-13c review). Never archived, never
+/// returned to the replay unmarked; every boot's recovery tries them again.
+pub const SETTLING_UNREADABLE_SUBDIR: &str = "unreadable";
+
+/// The watermark's suspicion-episode count when a replay batch STARTED
+/// writing (DA-13c review). Rows are acked all through a refold, so an
+/// episode that begins and ends inside it is invisible to a count taken at
+/// the settle; the settle compares against this one instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettleBatchStart {
+    episodes: u64,
+}
+
+impl SettleBatchStart {
+    /// The batch-start reading of `wm`. One atomic load.
+    #[must_use]
+    pub fn of(wm: &AppliedWatermark) -> Self {
+        Self {
+            episodes: wm.suspect_episode_count(),
+        }
+    }
+}
+
+/// [`SettleBatchStart::of`] the process-global watermark. Take it BEFORE the
+/// batch's first row is handed to a writer (where `unlanded_before` is read).
+// TEST-EXEMPT: thin global wrapper; SettleBatchStart::of is covered by the module tests.
+#[must_use]
+pub fn replay_batch_start() -> SettleBatchStart {
+    SettleBatchStart::of(applied_watermark())
+}
+
+/// The lowest and highest sequence of the INTACT records in a segment, found
+/// with the replay's own reader (CRC-checked, resyncing past damage), so the
+/// range covers every frame the replay will return from it. `Ok(None)` when
+/// no record carries a sequence. Cold: once per leftover segment at boot,
+/// reads the whole file; no frame payload is kept.
+fn intact_frame_seq_range(seg: &Path) -> anyhow::Result<Option<(u64, u64)>> {
+    let lo = std::cell::Cell::new(u64::MAX);
+    let hi = std::cell::Cell::new(0u64);
+    let keep = |seq: u64, _endpoint: WalEndpoint| {
+        if seq > 0 {
+            lo.set(lo.get().min(seq));
+            hi.set(hi.get().max(seq));
+        }
+        false
+    };
+    read_segment_frames_matching(seg, &keep)?;
+    Ok((hi.get() > 0).then(|| (lo.get(), hi.get())))
+}
 
 /// Clean QuestDB probes that must be reported after a batch's ack before its
 /// segments may be archived. Two, so at least one whole probe ran after the
@@ -150,11 +207,22 @@ impl SettleState {
     /// Moves every staged segment from `replaying/` to `settling/` and
     /// records the watermark's state at this ack. Returns the number moved.
     ///
+    /// `start` is the episode count read when the batch STARTED writing: an
+    /// episode that began after it, even one already over, holds the batch.
+    /// A newer batch keeps the oldest start still waiting, so it can never
+    /// hide an episode that touched an older one.
+    ///
     /// Settled leftovers from an EARLIER process found here (the boot
     /// recovery did not run, for example a pass refused on the disk floor)
     /// would otherwise be promoted with this batch unread, so they hold the
     /// whole set for the next boot instead.
-    pub fn settle(&mut self, wal_dir: &Path, wm: &AppliedWatermark, now: Instant) -> u64 {
+    pub fn settle(
+        &mut self,
+        wal_dir: &Path,
+        wm: &AppliedWatermark,
+        now: Instant,
+        start: SettleBatchStart,
+    ) -> u64 {
         let settling_dir = wal_dir.join(SETTLING_SUBDIR);
         if !self.settled_any && !self.held {
             let leftovers = wal_segments_in(&settling_dir).len() as u64;
@@ -169,7 +237,9 @@ impl SettleState {
         self.mark = Some(SettleMark {
             acked_at: now,
             clean_probes_at: wm.clean_probe_count(),
-            episodes_at: wm.suspect_episode_count(),
+            episodes_at: self
+                .mark
+                .map_or(start.episodes, |m| m.episodes_at.min(start.episodes)),
         });
         if self.held && moved > 0 {
             metrics::counter!(WAL_REPLAY_SETTLE_HELD_COUNTER).increment(moved);
@@ -239,20 +309,64 @@ impl SettleState {
             return 0;
         }
         let settling_dir = wal_dir.join(SETTLING_SUBDIR);
-        let leftovers = wal_segments_in(&settling_dir);
+        let mut leftovers = wal_segments_in(&settling_dir);
+        // Segments an earlier boot could not read are tried again here.
+        leftovers.extend(wal_segments_in(
+            &settling_dir.join(SETTLING_UNREADABLE_SUBDIR),
+        ));
         if leftovers.is_empty() {
             return 0;
         }
-        // O(1) EXEMPT: begin — boot-time recovery, one header walk per leftover segment
+        // O(1) EXEMPT: begin — boot-time recovery, one read per leftover segment
         let mut ranges: Vec<(u64, u64)> = Vec::with_capacity(leftovers.len()); // APPROVED: boot-time, cold path
+        let mut readable: Vec<PathBuf> = Vec::with_capacity(leftovers.len()); // APPROVED: boot-time, cold path
+        let mut unreadable: Vec<PathBuf> = Vec::new(); // APPROVED: boot-time, cold path
         for seg in &leftovers {
-            let lo = first_frame_seq_in_segment(seg);
-            if lo > 0 {
-                let hi = highest_frame_seq_in_segment(seg).max(lo);
-                ranges.push((lo, hi));
+            match intact_frame_seq_range(seg) {
+                Ok(Some(range)) => {
+                    ranges.push(range);
+                    readable.push(seg.clone());
+                }
+                // No record carries a sequence: the replay's applied filter
+                // cannot drop any frame of it, so it needs no mark.
+                Ok(None) => readable.push(seg.clone()),
+                // DA-13c review: no range can be derived, so it must never go
+                // back unmarked. Set apart, retried at every boot.
+                Err(err) => {
+                    warn!(
+                        code = ErrorCode::WsSpill01WriterRespawn.code_str(),
+                        source = "replay_settle_unreadable",
+                        segment = ?seg,
+                        error = %err,
+                        "WAL replay: a segment an earlier process acked could not be read, so \
+                         its sequence range cannot be marked unapplied. It is kept in \
+                         settling/unreadable/ and tried again at the next boot; never archived."
+                    );
+                    unreadable.push(seg.clone());
+                }
             }
         }
         // O(1) EXEMPT: end
+        if !unreadable.is_empty() {
+            let set_apart = rename_all(
+                &unreadable,
+                &settling_dir.join(SETTLING_UNREADABLE_SUBDIR),
+                "replay_settle_unreadable",
+            );
+            metrics::counter!(WAL_REPLAY_SETTLE_HELD_COUNTER).increment(set_apart);
+            if set_apart < unreadable.len() as u64 {
+                // One stayed in settling/: the next settle must not archive it.
+                self.hold(
+                    unreadable.len() as u64 - set_apart,
+                    "unreadable_not_set_apart",
+                );
+                return 0;
+            }
+        }
+        let leftovers = readable;
+        if leftovers.is_empty() {
+            return 0;
+        }
         wm.bind(wal_dir);
         for &(lo, hi) in &ranges {
             wm.note_unapplied_range(lo, hi);
@@ -343,8 +457,8 @@ fn state() -> std::sync::MutexGuard<'static, SettleState> {
 /// round): moves the staged segments to `settling/`. The watcher's
 /// [`promote_settled_now`] archives them later.
 // TEST-EXEMPT: thin global wrapper; SettleState::settle is covered by the module tests.
-pub fn settle_confirm_replayed<P: AsRef<Path>>(wal_dir: P) -> u64 {
-    state().settle(wal_dir.as_ref(), applied_watermark(), Instant::now())
+pub fn settle_confirm_replayed<P: AsRef<Path>>(wal_dir: P, start: SettleBatchStart) -> u64 {
+    state().settle(wal_dir.as_ref(), applied_watermark(), Instant::now(), start)
 }
 
 /// Called by the WAL-suspension watcher after each probe.
@@ -401,7 +515,7 @@ mod tests {
         let wm = AppliedWatermark::new_for_tests();
         let mut st = SettleState::new();
         let t0 = Instant::now();
-        assert_eq!(st.settle(&dir, &wm, t0), 1);
+        assert_eq!(st.settle(&dir, &wm, t0, SettleBatchStart::of(&wm)), 1);
         assert_eq!(
             names(&dir.join(SETTLING_SUBDIR)),
             1,
@@ -436,7 +550,7 @@ mod tests {
         wm.note_questdb_probe(true); // a probe from BEFORE the ack
         let mut st = SettleState::new();
         let t0 = Instant::now();
-        st.settle(&dir, &wm, t0);
+        st.settle(&dir, &wm, t0, SettleBatchStart::of(&wm));
         assert_eq!(
             st.promote(&wm, lagged(t0)),
             SettleVerdict::Waiting,
@@ -464,7 +578,7 @@ mod tests {
             &dir.join(REPLAYING_SUBDIR),
             "ws-frames-00000000000000000003.wal",
         );
-        st.settle(&dir, &wm, t0);
+        st.settle(&dir, &wm, t0, SettleBatchStart::of(&wm));
         assert_eq!(st.promote(&wm, lagged(t0)), SettleVerdict::Held);
         assert_eq!(names(&dir.join(SETTLING_SUBDIR)), 2);
         drop(std::fs::remove_dir_all(&dir));
@@ -500,6 +614,38 @@ mod tests {
         std::fs::write(path, bytes).expect("write"); // APPROVED: test-only
     }
 
+    /// Persists a DURABLE high-water of `seq(secs)` for `dir`: the ack, then a
+    /// persist past the durability lag (a persist inside it writes 0).
+    fn persist_high_water(dir: &Path, secs: u64) {
+        let before = AppliedWatermark::new_for_tests();
+        before.bind(dir);
+        before.note_ticks_acked(seq(secs));
+        before.note_depth_acked(seq(secs));
+        before.persist_at(1);
+        before.persist_at(1 + WATERMARK_DURABILITY_LAG_SECS * 1_000_000_000);
+        let snap = AppliedSnapshot::load(dir).expect("persisted");
+        assert!(
+            snap.frame_is_applied(
+                crate::wal_applied_watermark::AppliedSink::Ticks,
+                seq(secs / 2)
+            ),
+            "the persisted watermark really claims everything well below it as applied"
+        );
+    }
+
+    fn replay(dir: &Path) -> usize {
+        crate::ws_frame_spill::replay_all_with_report_guarded(
+            dir,
+            usize::MAX,
+            || None,
+            None,
+            crate::ws_frame_spill::WAL_REPLAY_RSS_STOP_PCT,
+        )
+        .expect("replay")
+        .frames
+        .len()
+    }
+
     /// c2 at the next boot: a crash inside the settle window leaves acked
     /// segments in `settling/`, and the persisted watermark already claims
     /// their (old) sequences as applied. Recovery marks them unapplied and
@@ -512,31 +658,144 @@ mod tests {
         segment(&settling, 0, 5);
         segment(&settling, 1_000, 5);
         segment(&dir, 2_000, 5); // a live segment after them
-        // Live acks lifted the watermark past the settled range (the normal
-        // state after a catch-up), and that watermark was persisted.
-        let before = AppliedWatermark::new_for_tests();
-        before.bind(&dir);
-        before.note_ticks_acked(seq(5_000));
-        before.note_depth_acked(seq(5_000));
-        before.persist_now();
+        // Live acks lifted the watermark past every segment here (the normal
+        // state after a catch-up), and that watermark was persisted durably.
+        persist_high_water(&dir, 5_000);
 
         let wm = AppliedWatermark::new_for_tests();
         let mut st = SettleState::new();
         assert_eq!(st.recover(&dir, &wm), 2, "both leftovers recovered");
         assert_eq!(names(&settling), 0);
-        let batch = crate::ws_frame_spill::replay_all_with_report_guarded(
-            &dir,
-            usize::MAX,
-            || None,
-            None,
-            crate::ws_frame_spill::WAL_REPLAY_RSS_STOP_PCT,
-        )
-        .expect("replay");
         assert_eq!(
-            batch.frames.len(),
-            15,
-            "every frame of the two settled segments is read again, plus the live one"
+            replay(&dir),
+            10,
+            "every frame of the two settled segments is read again; the live one \
+             really is applied and is filtered"
         );
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// DA-13c review: a leftover whose FIRST record is torn still has its
+    /// intact frames marked (the range comes from the replay's own reader),
+    /// so they are read again instead of being filtered as applied.
+    #[test]
+    fn test_regression_da13c_recover_marks_a_segment_whose_first_record_is_corrupt() {
+        let dir = tmp("torn-first");
+        let settling = dir.join(SETTLING_SUBDIR);
+        std::fs::create_dir_all(&settling).expect("mkdir"); // APPROVED: test-only
+        segment(&settling, 0, 5);
+        let seg = settling.join(format!("ws-frames-{:020}.wal", seq(0)));
+        let mut bytes = std::fs::read(&seg).expect("read"); // APPROVED: test-only
+        bytes[40] ^= 0xFF; // inside the first record's payload: its CRC fails
+        std::fs::write(&seg, bytes).expect("write"); // APPROVED: test-only
+        assert_eq!(
+            crate::ws_frame_spill::first_frame_seq_in_segment(&seg),
+            0,
+            "the header probe cannot read this segment's range"
+        );
+        segment(&dir, 2_000, 5);
+        persist_high_water(&dir, 5_000);
+
+        let wm = AppliedWatermark::new_for_tests();
+        let mut st = SettleState::new();
+        assert_eq!(st.recover(&dir, &wm), 1);
+        assert_eq!(
+            replay(&dir),
+            4,
+            "the four intact frames behind the torn one are read again, not \
+             filtered as applied"
+        );
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// DA-13c review: a leftover that cannot be read at all gets no range, so
+    /// it is set apart (never returned to the replay unmarked, never
+    /// archived) and does not hold the rest of the process.
+    #[test]
+    fn test_regression_da13c_recover_sets_apart_a_leftover_it_cannot_read() {
+        let dir = tmp("unreadable");
+        let settling = dir.join(SETTLING_SUBDIR);
+        // A directory with a segment's name: listed, but unreadable as a file.
+        let bad = settling.join("ws-frames-00000000000000000009.wal");
+        std::fs::create_dir_all(&bad).expect("mkdir"); // APPROVED: test-only
+        segment(&settling, 0, 5);
+        persist_high_water(&dir, 5_000);
+
+        let wm = AppliedWatermark::new_for_tests();
+        let mut st = SettleState::new();
+        assert_eq!(st.recover(&dir, &wm), 1, "the readable one is recovered");
+        let apart = settling.join(SETTLING_UNREADABLE_SUBDIR);
+        assert!(apart.join("ws-frames-00000000000000000009.wal").exists());
+        assert_eq!(names(&settling), 0);
+        assert_eq!(replay(&dir), 5);
+        // The next settle and promote archive only this process's batch.
+        st.settle(&dir, &wm, Instant::now(), SettleBatchStart::of(&wm));
+        wm.note_questdb_probe(true);
+        wm.note_questdb_probe(true);
+        assert_eq!(
+            st.promote(&wm, lagged(Instant::now())),
+            SettleVerdict::Promoted(1)
+        );
+        assert!(
+            apart.join("ws-frames-00000000000000000009.wal").exists(),
+            "the unreadable leftover is never archived"
+        );
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// DA-13c review: an episode that begins AND ends while the batch is
+    /// being written (acks all through it) holds the batch, though the count
+    /// read at the settle has already moved past it.
+    #[test]
+    fn test_regression_da13c_episode_inside_the_refold_holds_the_batch() {
+        let dir = tmp("inside");
+        plant(
+            &dir.join(REPLAYING_SUBDIR),
+            "ws-frames-00000000000000000007.wal",
+        );
+        let wm = AppliedWatermark::new_for_tests();
+        let start = SettleBatchStart::of(&wm);
+        // The refold runs; the table suspends and auto-resumes meanwhile.
+        wm.note_questdb_probe(false);
+        wm.note_questdb_probe(true);
+        assert!(!wm.is_sink_suspect(), "clean again by the settle");
+        let mut st = SettleState::new();
+        let t0 = Instant::now();
+        st.settle(&dir, &wm, t0, start);
+        wm.note_questdb_probe(true);
+        wm.note_questdb_probe(true);
+        assert_eq!(st.promote(&wm, lagged(t0)), SettleVerdict::Held);
+        assert_eq!(names(&dir.join(ARCHIVE_SUBDIR)), 0);
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// DA-13c review: a newer batch whose own start came after an episode
+    /// cannot replace the older batch's earlier start.
+    #[test]
+    fn test_regression_da13c_a_newer_batch_keeps_the_older_batch_start() {
+        let dir = tmp("older");
+        plant(
+            &dir.join(REPLAYING_SUBDIR),
+            "ws-frames-00000000000000000010.wal",
+        );
+        let wm = AppliedWatermark::new_for_tests();
+        let mut st = SettleState::new();
+        let t0 = Instant::now();
+        let first = SettleBatchStart::of(&wm);
+        st.settle(&dir, &wm, t0, first);
+        // An episode while the first batch waits; the second starts after it.
+        wm.note_questdb_probe(false);
+        wm.note_questdb_probe(true);
+        plant(
+            &dir.join(REPLAYING_SUBDIR),
+            "ws-frames-00000000000000000011.wal",
+        );
+        let second = SettleBatchStart::of(&wm);
+        st.settle(&dir, &wm, t0, second);
+        wm.note_questdb_probe(true);
+        wm.note_questdb_probe(true);
+        assert_eq!(st.promote(&wm, lagged(t0)), SettleVerdict::Held);
+        assert_eq!(names(&dir.join(ARCHIVE_SUBDIR)), 0);
         drop(std::fs::remove_dir_all(&dir));
     }
 
@@ -546,7 +805,10 @@ mod tests {
         let wm = AppliedWatermark::new_for_tests();
         let mut st = SettleState::new();
         assert_eq!(st.promote(&wm, Instant::now()), SettleVerdict::Idle);
-        assert_eq!(st.settle(&dir, &wm, Instant::now()), 0);
+        assert_eq!(
+            st.settle(&dir, &wm, Instant::now(), SettleBatchStart::of(&wm)),
+            0
+        );
         wm.note_questdb_probe(true);
         wm.note_questdb_probe(true);
         assert_eq!(
@@ -571,7 +833,7 @@ mod tests {
         );
         let wm = AppliedWatermark::new_for_tests();
         let mut st = SettleState::new();
-        st.settle(&dir, &wm, Instant::now());
+        st.settle(&dir, &wm, Instant::now(), SettleBatchStart::of(&wm));
         wm.note_questdb_probe(true);
         wm.note_questdb_probe(true);
         assert_eq!(
@@ -589,7 +851,7 @@ mod tests {
         let wm = AppliedWatermark::new_for_tests();
         let mut st = SettleState::new();
         assert_eq!(st.recover(&dir, &wm), 0);
-        st.settle(&dir, &wm, Instant::now());
+        st.settle(&dir, &wm, Instant::now(), SettleBatchStart::of(&wm));
         std::fs::create_dir_all(dir.join(SETTLING_SUBDIR)).expect("mkdir"); // APPROVED: test-only
         plant(
             &dir.join(SETTLING_SUBDIR),

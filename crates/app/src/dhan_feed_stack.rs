@@ -17873,6 +17873,8 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         } else {
             let unlanded_before =
                 tickvault_storage::wal_applied_watermark::applied_watermark().unlanded_total();
+            // DA-13c review: the suspicion count BEFORE the first row is acked.
+            let settle_start = tickvault_storage::wal_replay_settle::replay_batch_start();
             let (boot_frames, boot_gaps) = (&params.wal_replay_live_feed, &params.wal_replay_gaps);
             // Audit R1: outside the capture window the boot pass waits for
             // the writers instead of rescuing its own rows back to the WAL.
@@ -17966,6 +17968,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             if replay_rows_landed(&mut ingest, "boot_refold", unlanded_before) {
                 tickvault_storage::wal_replay_settle::settle_confirm_replayed(
                     crate::boot_helpers::ws_wal_dir(),
+                    settle_start,
                 );
                 boot_refold_confirmed = true;
             }
@@ -18377,6 +18380,8 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             }
             let unlanded_before =
                 tickvault_storage::wal_applied_watermark::applied_watermark().unlanded_total();
+            // DA-13c review: the suspicion count BEFORE this round's first ack.
+            let settle_start = tickvault_storage::wal_replay_settle::replay_batch_start();
             // Audit R1: paced like the boot pass, and never past this
             // drain's own deadline.
             let round_pace_until = wal_replay_pace_until(now_ist_secs_of_day(), Instant::now())
@@ -18389,7 +18394,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             if !replay_rows_landed(&mut ingest, "catchup", unlanded_before) {
                 break;
             }
-            tickvault_storage::wal_replay_settle::settle_confirm_replayed(&wal_dir);
+            tickvault_storage::wal_replay_settle::settle_confirm_replayed(&wal_dir, settle_start);
             catchup_frames = catchup_frames.saturating_add(staged.len());
             catchup_ticks = catchup_ticks.saturating_add(outcome.refolded as u64);
             rounds = rounds.saturating_add(1);

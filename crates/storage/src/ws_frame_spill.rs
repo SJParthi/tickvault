@@ -3497,7 +3497,7 @@ pub fn highest_frame_seq_on_disk(wal_dir: &Path) -> u64 {
 /// when it fails does the probe walk the segment again, verifying every
 /// record and ignoring the corrupt ones: O(segment bytes), rare, counted on
 /// `tv_wal_seq_probe_corrupt_record_total`.
-pub(crate) fn highest_frame_seq_in_segment(path: &Path) -> u64 {
+fn highest_frame_seq_in_segment(path: &Path) -> u64 {
     let (highest, best_offset) = header_walk_highest_frame_seq(path);
     if highest == 0 {
         return 0;
