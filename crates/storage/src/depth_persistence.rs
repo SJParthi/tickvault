@@ -879,14 +879,14 @@ pub const DEPTH_SPILL_VOLUME_FRACTION: u64 = 32;
 /// silently — same discipline as the tick tier.
 ///
 /// # Complexity
-/// O(1) after the first call (`OnceLock`). The first call spawns one `df`, on
-/// the cold flush-failure path only.
+/// O(1) after the first call (`OnceLock`). The first call makes one `statvfs`
+/// call, on the cold flush-failure path only.
 #[must_use]
 pub fn depth_spill_max_bytes() -> u64 {
     static RESOLVED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *RESOLVED.get_or_init(|| {
-        // Probe the deepest EXISTING ancestor: `df` on a path that does not
-        // exist yet fails, and the spill dir is created lazily.
+        // Probe the deepest EXISTING ancestor: `statvfs` on a path that does
+        // not exist yet fails, and the spill dir is created lazily.
         let mut probe: &std::path::Path = std::path::Path::new(DEPTH_SPILL_DIR);
         while !probe.exists() {
             match probe.parent() {
@@ -926,6 +926,11 @@ pub fn depth_spill_max_bytes() -> u64 {
         }
     })
 }
+
+/// The depth drain's spill-folder byte total (see
+/// [`crate::tick_persistence::SpillHeldBytesCache`]).
+static DEPTH_DRAIN_SPILL_HELD: crate::tick_persistence::SpillHeldBytesCache =
+    crate::tick_persistence::SpillHeldBytesCache::new();
 
 /// Total bytes currently held in the depth spill directory.
 ///
@@ -1028,11 +1033,18 @@ fn spill_failed_depth_ilp(
     // this guard removed on one path was still being paid on the other.
     //
     // `spill_free_bytes(dir)` is an EAGERLY evaluated argument, so passing it
-    // unconditionally forks `df` on EVERY rescue — including the common
+    // unconditionally probed free space (then a forked `df`) on EVERY rescue — including the common
     // under-cap case, which needs no free-space answer at all. Combined with
     // the per-write floor below that was TWO forks per depth rescue, on a path
     // that can run on the frame-drain task.
-    let held = depth_spill_dir_bytes(dir);
+    // The drain's inline fallback (no sync) reuses a fresh listing; the writer
+    // and rescue threads list every time (deep audit DA-12, NT-1).
+    let on_drain = sync.is_none();
+    let held = if on_drain {
+        DEPTH_DRAIN_SPILL_HELD.held(dir, std::time::Instant::now(), depth_spill_dir_bytes)
+    } else {
+        depth_spill_dir_bytes(dir)
+    };
     if held >= cap_bytes {
         match crate::tick_persistence::classify_spill_ceiling(
             held,
@@ -1060,7 +1072,7 @@ fn spill_failed_depth_ilp(
             }
             crate::tick_persistence::SpillCeilingVerdict::OverCeilingProbeFailed => {
                 // Twin of the tick ceiling arm (2026-09-01): count the blind
-                // refusal, or a broken `df` disables depth rescue for the
+                // refusal, or a failed free-space probe disables depth rescue for the
                 // whole session with no counter naming the cause.
                 metrics::counter!("tv_spill_free_probe_blind_total", "tier" => "depth")
                     .increment(1);
@@ -1105,7 +1117,7 @@ fn spill_failed_depth_ilp(
     // split this defeats was shipped).
     //
     // The tick tier fails OPEN here and its comment gives a good reason: one
-    // broken `df` must not disable the whole rescue tier. Copying that
+    // failed free-space probe must not disable the whole rescue tier. Copying that
     // reasoning to depth reintroduced the exact inversion the two-reserve
     // split exists to prevent. Both tiers refuse on a failed probe INSIDE
     // their ceiling arm, and that arm engages only once the tier's own spill
@@ -1183,9 +1195,22 @@ fn spill_failed_depth_ilp(
         .create(true)
         .append(true)
         .open(&path)?;
+    // The framing adds bytes, so the drain counts the file growth, not the
+    // payload (two `fstat`s, drain path only).
+    let len_before = if on_drain {
+        file.metadata().map_or(0, |m| m.len())
+    } else {
+        0
+    };
     crate::depth_spill_frame::append_framed_records(&mut file, payload, version)?;
     if let Some(sync) = sync {
         sync(&file)?;
+    }
+    if on_drain {
+        let grown = file
+            .metadata()
+            .map_or(payload.len() as u64, |m| m.len().saturating_sub(len_before));
+        DEPTH_DRAIN_SPILL_HELD.note_written(dir, grown);
     }
     Ok(path)
     // O(1) EXEMPT: end
@@ -2128,8 +2153,8 @@ impl DepthWriter {
     /// timer arm, and the shutdown tail all reach it.
     ///
     /// Inline it did `create_dir_all`, a `read_dir` + per-entry `metadata()`
-    /// walk of the depth spill directory, a live free-space probe that FORKS
-    /// `df` on its first call, and then up to
+    /// walk of the depth spill directory, a live free-space probe (a forked
+    /// `df` until 2026-10-12, one `statvfs` call since), and then up to
     /// [`MAX_DEPTH_PRODUCER_BUFFER_BYTES`] — 32 MiB — of file write. All on the
     /// frame-drain task, and all on the volume QuestDB is stalling on.
     ///
@@ -2871,6 +2896,14 @@ pub const DEPTH_RESCUE_QUEUE_DEPTH: usize = 2;
 /// write would have kept it, and past the bound the drain writes inline as
 /// before, counted on `tv_depth_rescue_inline_fallback_total`.
 pub const DEPTH_PARKED_RESCUE_MAX_BATCHES: usize = 8;
+// Deep audit DA-12 (2026-10-12): the depth twin of the tick assert — every
+// WAL-backed batch queued, parked or being written holds a rescue floor.
+const _: () = assert!(
+    // `<` rather than `+ 1 <=`: the one extra slot is the batch in flight.
+    DEPTH_RESCUE_QUEUE_DEPTH + DEPTH_PARKED_RESCUE_MAX_BATCHES
+        < crate::wal_applied_watermark::RESCUE_FLOOR_SLOTS,
+    "depth rescue queue + park + in-flight must fit the rescue floor table"
+);
 
 /// Byte bound on the depth park: four producer buffers at their cut-over size.
 pub const DEPTH_PARKED_RESCUE_MAX_BYTES: usize = 4 * MAX_DEPTH_PRODUCER_BUFFER_BYTES;
@@ -3867,7 +3900,7 @@ mod tests {
     }
 
     fn publish_labels(pairs: &[((i64, &'static str), &str)]) {
-        let mut m = crate::candle_contract_labels::CandleContractLabels::new();
+        let mut m = crate::candle_contract_labels::CandleContractLabels::default();
         for (k, v) in pairs {
             m.insert(*k, std::sync::Arc::<str>::from(*v));
         }

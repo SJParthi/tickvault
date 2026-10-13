@@ -333,3 +333,25 @@ CRITICAL: Quote vs Full diverge at offset 34. Prices are f32 in rupees (NOT pais
 - **Observability**: Prometheus metrics + OpenTelemetry tracing
 - **Valkey cache**: rkyv-serialized instrument cache for zero-copy deserialization
 - **Trading crate**: OMS state machine, order types, position tracking (86 tests)
+
+## Dev host vs prod behaviour (added 2026-10-12, deep audit CR-1)
+
+The same code runs on a developer machine and on the production box, but a
+few paths read the host and so behave differently. This is the one list of
+them. A Linux container on a Mac (Docker Desktop) takes the Linux paths and
+sees the Docker VM, not the Mac; a native `cargo run` on macOS takes the
+non-Linux paths.
+
+| Path (symbol) | Production (Linux box) | Dev host | Where it is tested |
+|---|---|---|---|
+| Socket reader core pin (`reader_runtime::resolve_ws_reader_core_for_process`) | worker threads pinned to one allowed core with `sched_setaffinity` | non-Linux: `ReaderCorePlan::Unsupported`, nothing pinned | unit tests run on Linux CI runners |
+| Frame ring byte budget (`dhan_feed_stack::ring_bytes_for_ram`) | a share of `/proc/meminfo` total RAM, clamped | non-Linux or unreadable: the floor `FRAME_RING_MAX_BYTES` | pure function tested across the whole input range |
+| Kernel receive-queue sampler (`kernel_rx_queue_sampler`) | reads `/proc/self/fd` and `/proc/net/tcp{,6}` once a second | no `/proc`: nothing to sample | parser unit tests on Linux CI |
+| Resource monitor (`resource_monitor`) | reads `/proc/self/{fd,limits,status}` | no `/proc`: those readings are absent | unit tests on Linux CI |
+| QuestDB core set (`TV_QDB_CPUSET` in `deploy/docker/docker-compose.yml`) | default `2,3` on the 4-core box | a host with fewer than 4 cores must set `TV_QDB_CPUSET`, or Docker refuses to create the container | not tested; documented in the compose file |
+
+**Honest limit:** the systemd unit's limits (its cgroup, allowed CPUs and
+memory ceilings) are applied only on the production box. No CI job boots the
+app under that unit, so a limit that is wrong for the app is first seen on the
+box. A CI runner with systemd that boots under the real unit is a possible
+follow-up, not built.

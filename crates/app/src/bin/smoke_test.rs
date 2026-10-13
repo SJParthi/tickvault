@@ -23,8 +23,19 @@
 //! - **NOT** a Dhan REST round-trip — that would burn a rate limit
 //!   and require a valid access token.
 //! - **NOT** a WebSocket connection — too slow, too token-consuming.
-//! - **NOT** a full trading pipeline cycle — the multi-phase chaos
-//!   tests cover that separately.
+//! - **NOT** data flow. Nothing at deploy time checks that the new
+//!   binary will receive, fold and persist ticks; no test runs the
+//!   pipeline end to end either (corrected 2026-10-12, deep audit
+//!   PROOF-6: an earlier line here named a chaos suite as the cover, and
+//!   no chaos test runs the pipeline).
+//!   The check is after the open: the `dhan-no-ticks-flowing` CloudWatch
+//!   alarm pages when the persisted-tick age stays at or above 300 s for
+//!   2 × 300 s inside 09:20–15:35 IST, with missing data counted as
+//!   breaching. So a binary that boots and writes nothing pages within
+//!   about ten minutes of the gate opening.
+//! - **NO automatic rollback** on a zero-row morning. Most deploys land
+//!   after the close, so the alarm fires the next morning, and recovery
+//!   is a manual redeploy of the previous commit.
 //!
 //! # Exit codes
 //!
@@ -37,8 +48,10 @@
 //! (--duration flag) before considering the test hung.
 
 #![cfg_attr(not(test), deny(unsafe_code))]
-#![allow(clippy::unwrap_used)] // APPROVED: test-only binary
-#![allow(clippy::expect_used)] // APPROVED: test-only binary
+// 2026-10-12 (deep audit CR-7): deny, not allow. No production unwrap/expect
+// exists here; a future one now fails clippy instead of aborting (exit 134).
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
+#![cfg_attr(not(test), deny(clippy::expect_used))]
 
 use std::path::Path;
 use std::time::Instant;
@@ -154,4 +167,32 @@ fn parse_duration_flag() -> Option<u64> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    /// Deep audit PROOF-6 (2026-10-12): the doc claimed chaos tests covered a
+    /// full pipeline cycle, and none do. It must name the real post-open check
+    /// (the `dhan-no-ticks-flowing` alarm) and must not bring the claim back.
+    #[test]
+    fn smoke_doc_names_the_post_open_alarm_not_a_chaos_test() {
+        let src = include_str!("smoke_test.rs");
+        let doc: String = src
+            .lines()
+            .take_while(|l| l.starts_with("//!") || l.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            doc.contains("dhan-no-ticks-flowing"),
+            "the smoke test doc must name the post-open no-ticks alarm"
+        );
+        assert!(
+            doc.contains("NO automatic rollback"),
+            "the smoke test doc must state there is no automatic rollback"
+        );
+        assert!(
+            !doc.contains("chaos tests cover"),
+            "the false claim that chaos tests cover the pipeline is back"
+        );
+    }
 }

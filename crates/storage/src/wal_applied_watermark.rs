@@ -147,12 +147,22 @@ const _: () = assert!(
     "the sample ring must outlive the durability lag"
 );
 
-/// Slots per sink for the queued-rescue floors (Z7, 2026-10-02). A sink's
-/// rescue queue holds `RESCUE_QUEUE_DEPTH` (2) batches plus the one its thread
-/// is writing, so three are live at most; eight leave room for a second
-/// writer of the same sink. A full table falls back to marking the batch's
-/// range unapplied, which only replays more.
-pub const RESCUE_FLOOR_SLOTS: usize = 8;
+/// Slots per sink for the queued-rescue floors (Z7, 2026-10-02). A full
+/// table falls back to marking the batch's range unapplied, which only
+/// replays more.
+///
+/// **Sized 8 → 16 by deep audit DA-12 (2026-10-12).** The old note said a
+/// sink's rescue queue holds `RESCUE_QUEUE_DEPTH` (2) batches plus the one its
+/// thread is writing, "so three are live at most". Since the H4 park
+/// (2026-10-03) a batch the queue refuses can also be PARKED, up to
+/// `PARKED_RESCUE_MAX_BATCHES` (8), and a parked batch keeps its floor. So one
+/// writer can hold 2 queued + 8 parked + 1 in flight = 11 floors, more than
+/// the 8 slots, and the overflow was counted on
+/// [`RESCUE_FLOOR_FULL_COUNTER`] in normal operation. 16 covers the 11 with
+/// room; compile-time asserts in `tick_persistence` and `depth_persistence`
+/// fail the build if either sink's queue + park + 1 outgrows it. The scan is
+/// still bounded (16 compare-and-swaps), on the rescue arm only.
+pub const RESCUE_FLOOR_SLOTS: usize = 16;
 /// Counter: a rescue hand-off found no free floor slot, so its range was
 /// marked unapplied instead (it is replayed next boot even if it lands).
 pub const RESCUE_FLOOR_FULL_COUNTER: &str = "tv_wal_rescue_floor_full_total";
@@ -1160,7 +1170,7 @@ impl AppliedWatermark {
     ///
     /// Called on the frame drain, on the rescue arm only (never per tick): at
     /// most [`RESCUE_FLOOR_SLOTS`] compare-and-swaps, no allocation, no lock —
-    /// O(RESCUE_FLOOR_SLOTS), a constant 8, not O(1). `None` when the batch
+    /// O(RESCUE_FLOOR_SLOTS), a constant 16, not O(1). `None` when the batch
     /// has no sequence (nothing in the WAL to protect) or when every slot is
     /// taken; a full table marks the range unapplied instead and counts it,
     /// which fails toward replay.
@@ -1175,7 +1185,7 @@ impl AppliedWatermark {
             return None;
         }
         let floors = self.rescue_floors(sink);
-        // O(1) EXEMPT: bounded by RESCUE_FLOOR_SLOTS (8), rescue arm only
+        // O(1) EXEMPT: bounded by RESCUE_FLOOR_SLOTS (16), rescue arm only
         for (slot, cell) in floors.iter().enumerate() {
             if cell
                 .compare_exchange(0, min_seq, Ordering::AcqRel, Ordering::Acquire)
@@ -1213,7 +1223,7 @@ impl AppliedWatermark {
     /// The lowest held floor for `sink`, or `u64::MAX` when none is held.
     fn rescue_floor_min(&self, sink: AppliedSink) -> u64 {
         let mut lowest = u64::MAX;
-        // O(1) EXEMPT: bounded by RESCUE_FLOOR_SLOTS (8), once-a-second persist
+        // O(1) EXEMPT: bounded by RESCUE_FLOOR_SLOTS (16), once-a-second persist
         for cell in self.rescue_floors(sink) {
             let held = cell.load(Ordering::Acquire);
             if held != 0 {
@@ -2353,6 +2363,43 @@ mod tests {
         assert_eq!(floors_held(&wm, AppliedSink::Ticks), 0);
         assert!(!wm.snapshot().overflowed);
         assert!(wm.snapshot().buckets.iter().all(|(id, _)| *id == 0));
+    }
+
+    /// DA-12 (2026-10-12): one writer's worst case — every queue slot and
+    /// every park slot holding a WAL-backed batch, plus the batch its rescue
+    /// thread is writing — takes a floor each, with no full-table fallback.
+    #[test]
+    fn test_rescue_floor_table_covers_queue_park_and_in_flight() {
+        let cases = [
+            (
+                AppliedSink::Ticks,
+                crate::tick_persistence::RESCUE_QUEUE_DEPTH
+                    + crate::tick_persistence::PARKED_RESCUE_MAX_BATCHES
+                    + 1,
+            ),
+            (
+                AppliedSink::Depth,
+                crate::depth_persistence::DEPTH_RESCUE_QUEUE_DEPTH
+                    + crate::depth_persistence::DEPTH_PARKED_RESCUE_MAX_BATCHES
+                    + 1,
+            ),
+        ];
+        for (sink, live) in cases {
+            assert!(live > 8, "the worst case outgrew the old table of 8");
+            let wm = AppliedWatermark::new_for_tests();
+            for i in 0..live as u64 {
+                let lo = seq(100 + i * 10);
+                assert!(
+                    wm.hold_rescue_floor(sink, lo, lo + 5).is_some(),
+                    "{sink:?}: batch {i} of {live} found no floor slot"
+                );
+            }
+            assert_eq!(floors_held(&wm, sink), live);
+            assert!(
+                !wm.snapshot().overflowed && wm.snapshot().buckets.iter().all(|(id, _)| *id == 0),
+                "{sink:?}: no batch fell back to the unapplied mark"
+            );
+        }
     }
 
     #[test]

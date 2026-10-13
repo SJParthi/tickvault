@@ -877,7 +877,9 @@ fn literals_in_group(after: &str) -> Vec<String> {
 
 /// Spawn literals in this file that name a banned interpreter/package manager.
 fn rust_spawn_violations(content: &str) -> Vec<String> {
-    let mut hits: Vec<String> = extract_spawn_literals(content)
+    // 2026-10-12 (RUST-6): a rustfmt-wrapped `Command::new(\n "<x>")` put a
+    // newline between the paren and the quote, so the markers missed it.
+    let mut hits: Vec<String> = extract_spawn_literals(&collapse_ws_after_open(content))
         .into_iter()
         .filter(|lit| line_has_banned_token(lit) || spawn_literal_names_node_family(lit))
         .collect();
@@ -1369,10 +1371,11 @@ fn count_node_invocations_in_line(line: &str) -> usize {
     hits
 }
 
-const GITHUB_SCRIPT_BUDGET: &[(&str, usize)] = &[
-    (".github/workflows/dep-freshness-nightly.yml", 2),
-    (".github/workflows/safety.yml", 12),
-];
+// 2026-10-12 (deep audit RUST-8): the last 14 steps — 12 in `safety.yml`, 2 in
+// `dep-freshness-nightly.yml` — were ported to `gh issue` run steps (same
+// titles, labels and dedup rule), so the budget is EMPTY. Any `github-script`
+// step anywhere now fails `github_script_usage_only_shrinks`.
+const GITHUB_SCRIPT_BUDGET: &[(&str, usize)] = &[];
 
 // The FRONTEND carve-out is pinned by `browser_surface_and_toolchain_guard.rs`,
 // NOT here (2026-08-14 merge resolution).
@@ -1951,6 +1954,233 @@ fn no_rust_spawn_of_banned_interpreter() {
          The rust-only operator directive (2026-07-19) forbids it — port the logic to \
          Rust instead of shelling out to another runtime."
     );
+}
+
+// ---- SCOPE FIX (2026-10-12, deep audit RUST-6): Rust that starts a SHELL ----
+//
+// `no_rust_spawn_of_banned_interpreter` bans the interpreter family, perl and
+// the node family, and lets shells through because shells are an allowed
+// runtime for the repo's own scripts. That left one way for shell to return
+// to the PRODUCT through Rust: `Command::new("sh").arg("-c").arg("…")` passed
+// every guard, and `shell_budget_guard.rs` said so in its own header.
+//
+// This ratchet looks at the same spawn literals (`Command::new("…")`,
+// `.arg("…")`, `run_with_timeout("…")`, `.args([…])`, `(&[…])`, `vec![…]`)
+// in production Rust only (`crates/*/src/**` and `crates/*/build.rs`, test
+// modules included, since the scan cannot tell them apart by path) and fails
+// on any literal naming a shell. Integration tests under `crates/*/tests/`
+// are out of scope: they run the repo's own `.sh` hooks as test harnesses
+// and never ship.
+//
+// The budget is per file and per count, shrink only. The one row today is the
+// dev-only MCP server: `tool_run_doctor` runs `bash scripts/doctor.sh` and a
+// test in the same file runs `sh -c`. A count below the pin fails too, so a
+// port forces the row down in the same PR.
+//
+// HONEST LIMIT: a shell named through a variable (`Command::new(prog)`) is not
+// seen here; `NON_LITERAL_SPAWN_BUDGET` pins how many such sites exist.
+const SHELL_PROGRAMS: &[&str] = &["ash", "bash", "dash", "ksh", "sh", "zsh"];
+
+const RUST_SHELL_SPAWN_BUDGET: &[(&str, usize)] = &[("crates/tickvault-logs-mcp/src/tools.rs", 2)];
+
+/// True when a spawn literal names a shell: the bare name (`"sh"`) or a path
+/// ending in one (`"/bin/bash"`, `"/usr/bin/env"` is NOT a shell).
+fn spawn_literal_is_shell(lit: &str) -> bool {
+    let trimmed = lit.trim();
+    let base = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    SHELL_PROGRAMS.contains(&base)
+}
+
+/// Drops whitespace that directly follows `(` or `[` outside string literals.
+///
+/// rustfmt breaks a long call as `run_with_timeout(\n    "bash", …)`, and the
+/// spawn markers (`run_with_timeout("`, `Command::new("`, `.arg("`) need the
+/// quote right after the paren. Without this the MCP doctor's own `"bash"`
+/// spawn was invisible to the marker scan (found writing RUST-6).
+fn collapse_ws_after_open(src: &str) -> String {
+    let chars: Vec<char> = src.chars().collect();
+    let mut out = String::with_capacity(src.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut skip_ws = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let ch = chars[i];
+        if in_string {
+            out.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if skip_ws && ch.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        skip_ws = ch == '(' || ch == '[';
+        // A char literal ('"', b'"', '\'', '\u{22}') is copied whole, so a
+        // quote character inside it never opens a string.
+        if ch == '\'' {
+            let end = if chars.get(i + 1) == Some(&'\\') {
+                (i + 2..chars.len().min(i + 12)).find(|&j| chars[j] == '\'')
+            } else if chars.get(i + 2) == Some(&'\'') {
+                Some(i + 2)
+            } else {
+                None // a lifetime or a label
+            };
+            if let Some(end) = end {
+                out.extend(&chars[i..=end]);
+                i = end + 1;
+                continue;
+            }
+        }
+        // A raw string (r"..", r#".."#, br#".."#) is copied whole up to its
+        // own closing quote and hashes; backslashes inside it escape nothing.
+        let ident_before = i > 0 && (chars[i - 1].is_alphanumeric() || chars[i - 1] == '_');
+        if (ch == 'r' && !ident_before)
+            || (ch == 'b' && !ident_before && chars.get(i + 1) == Some(&'r'))
+        {
+            let r_at = if ch == 'b' { i + 1 } else { i };
+            let mut j = r_at + 1;
+            while chars.get(j) == Some(&'#') {
+                j += 1;
+            }
+            if chars.get(j) == Some(&'"') {
+                let hashes = j - r_at - 1;
+                let mut k = j + 1;
+                let close = loop {
+                    if k >= chars.len() {
+                        break chars.len();
+                    }
+                    if chars[k] == '"' && (1..=hashes).all(|h| chars.get(k + h) == Some(&'#')) {
+                        break (k + hashes + 1).min(chars.len());
+                    }
+                    k += 1;
+                };
+                out.extend(&chars[i..close]);
+                i = close;
+                continue;
+            }
+        }
+        if ch == '"' {
+            in_string = true;
+        }
+        out.push(ch);
+        i += 1;
+    }
+    out
+}
+
+/// Shell-naming spawn literals in one Rust source, comments stripped first so
+/// prose such as ``/// runs `Command::new("sh")` `` is never counted.
+fn rust_shell_spawn_count(content: &str) -> usize {
+    extract_spawn_literals(&collapse_ws_after_open(&strip_rs_comments(content)))
+        .iter()
+        .filter(|lit| spawn_literal_is_shell(lit))
+        .count()
+}
+
+fn is_production_rust_path(path: &str) -> bool {
+    path.starts_with("crates/")
+        && path.ends_with(".rs")
+        && (path.contains("/src/") || path.ends_with("/build.rs"))
+}
+
+#[test]
+fn rust_shell_spawns_are_allowlisted() {
+    assert_sorted_unique(
+        &RUST_SHELL_SPAWN_BUDGET
+            .iter()
+            .map(|(p, _)| *p)
+            .collect::<Vec<_>>(),
+        "RUST_SHELL_SPAWN_BUDGET",
+    );
+    let root = repo_root();
+    let mut measured: Vec<(String, usize)> = Vec::new();
+    let mut scanned = 0_usize;
+    for path in git_ls_files_including_untracked(&["*.rs"]) {
+        if !is_production_rust_path(&path) {
+            continue;
+        }
+        scanned += 1;
+        let n = rust_shell_spawn_count(&read_scan_text(&root, &path));
+        if n > 0 {
+            measured.push((path, n));
+        }
+    }
+    // Anti-vacuity: the workspace has hundreds of production sources.
+    assert!(
+        scanned > 200,
+        "only {scanned} production Rust files scanned; the path filter is broken"
+    );
+    let (over, under) = github_script_budget_drift(&measured, RUST_SHELL_SPAWN_BUDGET);
+    assert!(
+        over.is_empty(),
+        "RUST-ONLY VIOLATION: Rust code starts a shell {over:?} (path, actual, budget). \
+         Shell must not come back into the product through `Command::new(\"sh\")`. \
+         Do the work in Rust; do NOT raise RUST_SHELL_SPAWN_BUDGET."
+    );
+    assert!(
+        under.is_empty(),
+        "SHRINK THE RATCHET: these files start FEWER shells than budgeted {under:?} \
+         (path, actual, budget). Lower (or remove) the RUST_SHELL_SPAWN_BUDGET row in \
+         the same PR."
+    );
+    let stale: Vec<&str> = RUST_SHELL_SPAWN_BUDGET
+        .iter()
+        .map(|(p, _)| *p)
+        .filter(|p| !measured.iter().any(|(m, _)| m == p))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "STALE RUST_SHELL_SPAWN_BUDGET row(s) {stale:?}: the file no longer starts a \
+         shell (or is gone). Remove the row in the same PR."
+    );
+}
+
+#[test]
+fn rust_shell_spawn_detector_bites() {
+    for (src, want) in [
+        ("let _ = Command::new(\"bash\").arg(\"x.sh\");", 1),
+        ("Command::new(\"/bin/sh\").arg(\"-c\").arg(\"echo hi\");", 1),
+        ("Command::new(\"env\").arg(\"sh\");", 1),
+        ("Command::new(\"env\").args([\"zsh\", \"-c\", \"x\"]);", 1),
+        ("run_with_timeout(\"dash\", &[], p, d);", 1),
+        (
+            "run_with_timeout(\n        \"bash\",\n        &[x], p, d);",
+            1,
+        ),
+        ("Command::new(\n    \"sh\",\n);", 1),
+        ("let s = \"( \\\"bash\\\" )\";", 0),
+        ("let v = vec![\"/usr/bin/bash\", \"-c\"];", 1),
+        // A quote inside a char literal or a raw string must not flip the
+        // string state for the rest of the file.
+        ("let q = '\"';\nCommand::new(\n    \"sh\",\n);", 1),
+        ("let q = b'\"';\nCommand::new(\n    \"sh\",\n);", 1),
+        ("let q = '\\\"';\nCommand::new(\n    \"sh\",\n);", 1),
+        ("let r = r#\"a \" b\"#;\nCommand::new(\n    \"sh\",\n);", 1),
+        ("fn f<'a>(x: &'a str) {}\nCommand::new(\n    \"sh\",\n);", 1),
+        // Not shells: benign programs, a shell word inside a payload, prose.
+        ("Command::new(\"git\").args([\"ls-files\"]);", 0),
+        ("Command::new(\"docker\").arg(\"shell-out\");", 0),
+        ("Command::new(\"/usr/bin/env\").arg(\"git\");", 0),
+        ("/// spawns `Command::new(\"sh\")` in an example", 0),
+        ("// Command::new(\"bash\")", 0),
+    ] {
+        assert_eq!(
+            rust_shell_spawn_count(src),
+            want,
+            "shell spawn detector wrong on: {src}"
+        );
+    }
+    assert!(is_production_rust_path("crates/app/src/main.rs"));
+    assert!(is_production_rust_path("crates/common/build.rs"));
+    assert!(!is_production_rust_path("crates/app/tests/x_guard.rs"));
 }
 
 /// (f) The inline-JavaScript shrinking ratchet (SCOPE FIX #5).
@@ -3158,7 +3388,6 @@ const CI_ACTION_ALLOWLIST: &[&str] = &[
     "actions/cache/save",
     "actions/checkout",
     "actions/download-artifact",
-    "actions/github-script",
     "actions/upload-artifact",
     "anthropics/claude-code-action",
     "aws-actions/configure-aws-credentials",

@@ -743,6 +743,11 @@ socket_close_arm = false
 # to apply. Off until the operator turns it on (step 4). Frames received before
 # the first boot with it on stay in `market_depth`; turn it on at a pre-market
 # boot. Turning it off again sends everything back to `market_depth`.
+# Common-runtime note (2026-10-12, deep audit HOT-6): production turns this on
+# (config/production.toml), so dev measures the 10-row-per-packet shape while
+# production runs the 2-row one. Both are DHAT-gated in
+# crates/app/tests/dhat_live_ingest_seam.rs; set it true locally to profile
+# the production shape.
 [depth_storage]
 array_rows = false
 

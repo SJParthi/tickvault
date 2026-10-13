@@ -3290,7 +3290,8 @@ impl LiveIngest {
         // What it takes off the drain is not small. The inline rescue did
         // `create_dir_all`, a `read_dir` + per-entry `metadata()` walk of the
         // spill directory AND its quarantine subdirectory, a live free-space
-        // probe (which forks `df` on its first call), and then up to 32 MiB of
+        // probe (a forked `df` until 2026-10-12, one `statvfs` call since), and
+        // then up to 32 MiB of
         // file write — all on the frame-drain task, and all on the same volume
         // QuestDB is stalling on.
         //
@@ -5861,7 +5862,7 @@ fn seed_drain_loss_baselines() {
     // first sample of a series it has never seen, so an unseeded counter
     // publishes NOTHING on the one day it matters.
     metrics::counter!(OFFLOAD_SHUTDOWN_INCOMPLETE_COUNTER, "writer" => "top_volume").increment(0);
-    // Rescues written WITHOUT a free-space answer, because the `df` probe
+    // Rescues written WITHOUT a free-space answer, because the free-space probe
     // failed. Both tiers, both label values — a partially-seeded family is a
     // partial blind spot wearing the appearance of a covered one, and the
     // agent computes its delta per LABEL SET.

@@ -285,3 +285,62 @@ fn summary_writer_reports_all_green_when_no_errors() {
 
     let _ = fs::remove_dir_all(&tmp);
 }
+
+/// The section of `main.rs` from `start` up to the first `end` after it.
+fn source_slice<'a>(src: &'a str, start: &str, end: &str) -> &'a str {
+    let from = src
+        .find(start)
+        .unwrap_or_else(|| panic!("main.rs no longer contains `{start}`"));
+    let rest = &src[from..];
+    let to = rest
+        .find(end)
+        .unwrap_or_else(|| panic!("no `{end}` after `{start}` in main.rs"));
+    &rest[..to]
+}
+
+/// Deep audit OBS-15 (2026-10-12): the two shipped log streams have two
+/// shapes ON PURPOSE. The app log stays nested (`fields.code`) with IST
+/// timestamps, because the terraform divergence control
+/// `log_schema_nested_errors` and the `preopen-ready-secs` filter read that
+/// shape; errors.jsonl stays flat with UTC timestamps, because every coded
+/// alarm filter reads `$.code`. Flattening the app log would silently blind
+/// both nested readers, so this source scan fails first.
+#[test]
+fn app_log_layer_stays_nested_for_the_schema_divergence_control() {
+    let main_rs = fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/main.rs"))
+        .unwrap_or_else(|e| panic!("read main.rs: {e}"));
+    let app_log = source_slice(
+        &main_rs,
+        "let file_fmt = tracing_subscriber::fmt::layer()",
+        ".with_filter(file_filter)",
+    );
+    assert!(
+        !app_log.contains("flatten_event"),
+        "the app log layer must stay nested (fields.code): \
+         log_schema_nested_errors and preopen-ready-secs read that shape"
+    );
+    assert!(
+        app_log.contains(".with_timer(ist_timer"),
+        "the app log layer must keep its IST timer (the OBS-15 notes say so)"
+    );
+    let jsonl = source_slice(
+        &main_rs,
+        "observability::init_errors_jsonl_appender(observability::ERRORS_JSONL_DIR)",
+        "Some(Box::new(layer))",
+    );
+    assert!(
+        jsonl.contains(".flatten_event(true)"),
+        "errors.jsonl must stay flat: every coded alarm filter reads `$.code`"
+    );
+    assert!(
+        !jsonl.contains(".with_timer("),
+        "errors.jsonl stamps UTC by default; if that changes, update the OBS-15 notes \
+         in main.rs and error-code-alarms.tf"
+    );
+    // Bite check: the scan sees a flattened app layer.
+    let bad = "let file_fmt = tracing_subscriber::fmt::layer().json().flatten_event(true)\
+               .with_filter(file_filter)";
+    assert!(
+        source_slice(bad, "let file_fmt", ".with_filter(file_filter)").contains("flatten_event")
+    );
+}

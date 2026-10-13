@@ -1830,7 +1830,7 @@ mod tests {
     }
 
     fn publish_one(security_id: i64, segment: &'static str, name: &str) {
-        let mut m = std::collections::HashMap::new();
+        let mut m = crate::candle_contract_labels::CandleContractLabels::default();
         m.insert((security_id, segment), std::sync::Arc::<str>::from(name));
         crate::candle_contract_labels::publish_candle_contract_labels(m);
     }

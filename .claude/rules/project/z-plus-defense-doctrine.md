@@ -89,8 +89,8 @@ This is what I'll call the **Z+ test**: name the 6 layers, name the audit trail,
 | `unwrap()` / `expect()` in prod (already banned) | Single-point panic = no L6 | Existing clippy lints |
 | Silent retry without escalation cap | No L6 = infinite loop | Adversarial review catches |
 | `warn!` on persist/flush/drain failure | Should be `error!` | Existing `error_level_meta_guard.rs` |
-| Counter without alert rule | No L1 detection without L2 verify path | Existing `resilience_sla_alert_guard.rs` |
-| Counter without Grafana panel | No visualization layer | Existing `operator_health_dashboard_guard.rs` |
+| Counter without alert rule | No L1 detection without L2 verify path | Existing `resilience_sla_alert_guard.rs` **⚠ CORRECTED 2026-10-12 (deep audit TRU-8): `resilience_sla_alert_guard.rs` does not exist in the tree; NOT ENFORCED.** |
+| Counter without Grafana panel | No visualization layer | Existing `operator_health_dashboard_guard.rs` **⚠ CORRECTED 2026-10-12 (deep audit TRU-8): `operator_health_dashboard_guard.rs` does not exist in the tree; NOT ENFORCED.** |
 | New table without DEDUP UPSERT KEYS | No uniqueness guarantee | Existing `dedup_segment_meta_guard.rs` |
 | New pub fn without call site | Dead code = no L5 audit | Existing `pub-fn-wiring-guard.sh` |
 | Promise "100% no disconnect" without envelope | Hallucination | Operator-charter-forever §F + reviewer agent |
@@ -212,7 +212,7 @@ The operator's charter is non-negotiable. If a PR seems "too much work for a sma
 
 | Gate | Where | What it catches |
 |---|---|---|
-| `per-item-guarantee-check.sh` | pre-PR + `make wave-guarantee-check` | Z+ matrix presence in plan |
+| `per-item-guarantee-check.sh` | ~~pre-PR +~~ `make wave-guarantee-check` only (**⚠ CORRECTED 2026-10-12:** no CI job or pre-PR hook runs it) | Z+ matrix presence in plan |
 | `banned-pattern-scanner.sh` | pre-commit | hot-path violations |
 | `pub-fn-test-guard.sh` | pre-push | dead code |
 | `pub-fn-wiring-guard.sh` | pre-push | unused exports |
@@ -220,15 +220,15 @@ The operator's charter is non-negotiable. If a PR seems "too much work for a sma
 | `error_code_tag_guard.rs` | `cargo test` | missing `code =` field |
 | `error_code_rule_file_crossref.rs` | `cargo test` | rule-file mention required |
 | `dedup_segment_meta_guard.rs` | `cargo test` | DEDUP key must include segment |
-| `operator_health_dashboard_guard.rs` | `cargo test` | counter must have Grafana panel |
-| `resilience_sla_alert_guard.rs` | `cargo test` | counter must have alert rule |
+| `operator_health_dashboard_guard.rs` | `cargo test` | counter must have Grafana panel **⚠ CORRECTED 2026-10-12 (deep audit TRU-8): `operator_health_dashboard_guard.rs` does not exist in the tree; NOT ENFORCED.** |
+| `resilience_sla_alert_guard.rs` | `cargo test` | counter must have alert rule **⚠ CORRECTED 2026-10-12 (deep audit TRU-8): `resilience_sla_alert_guard.rs` does not exist in the tree; NOT ENFORCED.** |
 | `error_level_meta_guard.rs` | `cargo test` | flush/persist uses `error!` |
 | `scripts/bench-gate.sh` | post-merge | 5% regression budget |
 | `scripts/coverage-gate.sh` | ~~post-merge~~ **⚠ CORRECTED 2026-10-11:** every PR (inside All Green) and again after merge | ratcheted per-crate floors (72.6–99.4, target 100%) per crate |
-| **NEW:** `z-plus-checklist-guard.sh` | pre-PR | Z+ checklist filled in for every plan item |
-| **NEW:** `auto-driver-test-guard.sh` | pre-PR | operator-facing text passes auto-driver test |
+| **NEW:** `z-plus-checklist-guard.sh` | pre-PR | Z+ checklist filled in for every plan item **⚠ CORRECTED 2026-10-12 (deep audit TRU-8): NOT BUILT; no such hook exists.** |
+| **NEW:** `auto-driver-test-guard.sh` | pre-PR | operator-facing text passes auto-driver test **⚠ CORRECTED 2026-10-12 (deep audit TRU-8): NOT BUILT; no such hook exists.** |
 
-The two NEW gates ship in the next maintenance commit.
+The two NEW gates ship in the next maintenance commit. **⚠ CORRECTED 2026-10-12 (deep audit TRU-8): they never shipped. Neither hook exists, and the two `_guard.rs` rows above name files that do not exist either. `crates/common/tests/rule_cited_guard_exists_guard.rs` now fails the build when a rule names a missing guard or `make` target without saying so on the same line.**
 
 ---
 

@@ -3011,6 +3011,53 @@ separately and are NOT done.
   `alarmed_counters_are_seeded_guard`, `aws_deploy_safety_guard`, `loss_counter_visibility_guard`.
   Not proven: Firehose delivery to S3 (never applied; terraform not installed here).
 
+### Deep audit 2026-10-12 — the findings nobody had started (DA-12 .. DA-21)
+
+Approved by Parthiban (operator), 2026-10-12 02:59 UTC: "i asked you to fix and resolve evryhting
+dude okay?", in the "Fix remaining audit findings" thread, for the 150 findings the audit page
+(https://claude.ai/artifact/9T6uHr91zzN6qo26Mu1fZv) marked "Not started". Not here: the 13 queued in
+the "Fix known defects and ship" thread, #2075 (DA-1 .. DA-11), #2082 (PROOF-1/9/10) and the 15
+owner decisions. That thread handed over PR6, PR9 (decision part), PR10, PR12 (honest-limit part),
+PR13, PR16, PR25, D6e and PR5 (doc part) on 2026-10-12 03:07 UTC. Each finding was re-read on main
+`f925536ee` before this list was written. Same rules as DA-1 .. DA-11: no new Telegram page,
+CloudWatch alarm, metric filter or EMF name without a dated noise-lock row (counters on local
+`/metrics` and coded logs are fine); nothing in `indicator/`, `strategy/`, the exit-order layer or
+OMS `dry_run`; no new dependency; no extra allocation on the tick path; every new pub fn has a test
+and a call site; shell may only shrink. One PR per item, serial.
+
+- [x] **DA-12 — Free space is one `statvfs` call, never a `df` fork; tick append hardening**
+  (RUST-5, DB-4, NT-1, tail HOT-3, DISK-9, DB-3, HOT-10, HOT-12, S3-1 partial). `storage`. Done: `disk_health_watcher::statvfs_probe`, `hours_left_warn_edge` (warns only when the disk fills before capture ends); `tick_persistence::{append_within_marker, SpillHeldBytesCache, tick_ilp_column}`; `candle_contract_labels::CandleContractLabels` on `ahash`; `wal_applied_watermark::RESCUE_FLOOR_SLOTS` = 16.
+- [ ] **DA-13 — Frame log, spill replay and archive close their counted-loss holes** (CR-2,
+  CLOCK-2, CRASH-2, QDB-3, QDB-6, RET-2, RET-3, RET-4, RET-5, RET-6, RET-7, OBS-11). `storage`, `app`.
+- [ ] **DA-14 — The candle disk floor keeps what can be kept and says why** (DISK-1, DISK-2,
+  DISK-3, DISK-5, DISK-6, DISK-7, DISK-8, HOT-8, CRASH-1 partial, tail HOT-2 limit row). `storage`.
+- [ ] **DA-15 — The frame drain's timers cannot starve; small drain fixes** (HOT-11, tail HOT-4,
+  tail HOT-9, CR-8, HOT-16, SCALE-7, INP-2, HOT-17, tail HOT-6, SCALE-3 limit, HOT-9 limit row,
+  NT-2, NT-3, NT-4). `app`, `core`, `trading`, `common`.
+- [ ] **DA-16 — Paper order book honesty** (ORD-1, ORD-4, ORD-5, ORD-6, ORD-7, ORD-9, ORD-11,
+  ORD-12, ORD-14, ORD-8 partial, DB-1). `trading`, `app`, `storage`, `core`. `dry_run` untouched.
+- [ ] **DA-17 — HTTP, Lambda and MCP edges** (SEC-5, SEC-6, INP-11, INP-10, NT-7, SEC-8, SEC-11,
+  LAM-4, LAM-6, LAM-7, LAM-8, IAC-4, INP-6, INP-15, TRU-13, MCP-1, OBS-9, RUST-2, RUST-13).
+  `api`, `aws-lambdas`, `tickvault-logs-mcp`, `core`, `app`, terraform.
+- [ ] **DA-18 — Config, host sizing and boot checks** (INP-3, DYN-1, DYN-2, DYN-5, MEM-1, SUP-7,
+  QDB-5, QDB-8, tail HOT-11, OBS-5, OBS-10, OBS-14, SCALE-5, CAL-1 partial, RUST-1 first slice).
+  `common`, `app`, `core`, `storage`, `deploy/`, `.github/workflows/`.
+- [x] **DA-19 — Guards, CI and docs that tell the truth** (RUST-6, RUST-7, RUST-8, RUST-9,
+  RUST-10, CR-4, CR-7, CR-9, TRU-2, TRU-8, SCALE-6, PROOF-5, PROOF-6, PROOF-12, PROOF-13, INC-1
+  ratchet, SEC-7, HOT-6, HOT-18, DYN-4, CR-1, SUP-10, OBS-7 ratchet, OBS-15, QDB-7, QDB-11). Done: `shell_budget_guard::{workflow_run_lines_never_grow, makefile_recipe_lines_never_grow}`, `rust_only_guard::rust_shell_spawns_are_allowlisted`, `GITHUB_SCRIPT_BUDGET` empty; new guards `source_scan_budget_guard`, `bench_claim_wording_guard`, `error_code_paging_decision_guard`, `rule_cited_guard_exists_guard`, `source_size_ratchet_guard`, `questdb_commit_mode_doc_guard`; `coverage_file_floors` (report-only, not run in CI yet); `naive_date_from_archived_i32` returns `Option`.
+- [ ] **DA-20 — Missing benches, chaos and fuzz** (HOT-5, HOT-7, HOT-15, SCALE-2, TEST-2, WS-1,
+  PROOF-7, PROOF-14, PROOF-16, INP-8, QDB-4).
+- [ ] **DA-21 — Structural hot-path work** (HOT-3 drain on its own thread, HOT-2 and tail HOT-10
+  frame ring, OBS-13 token and boot audit rows).
+
+No change, with the reason recorded on the audit page: RUST-12, HOT-14, tail HOT-8, NT-6, NT-8,
+NT-9, CR-6, DB-6, DB-7, DB-9, DB-10, SCALE-4, DISK-10, ORD-10. Owner decision (a rule needs a dated
+row first), not done: CANDLE-1 page, RUST-11 crypto dependency swap, S3-1 second copy, CAL-1 capture
+window, OBS-7 digest page, ORD-8 backfill and page. Staged as their own PR series after DA-21:
+RUST-1 (rest of the deploy port), RUST-3 (autopilot to Rust), RUST-4 (first-boot bootstrap),
+HOT-9 (probe unification, after the HOT-5 bench), INC-1 (file split), RET-8 (S3 read-back), SCALE-3
+(after-close tick rewrite).
+
 ## Edge Cases
 
 - PR1: log burst larger than the non-blocking buffer → lines dropped and counted, never blocking.

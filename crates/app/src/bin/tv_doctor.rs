@@ -33,8 +33,10 @@
 //!        probes are fail-safe)
 
 #![cfg_attr(not(test), deny(unsafe_code))]
-#![allow(clippy::unwrap_used)] // APPROVED: diagnostic CLI
-#![allow(clippy::expect_used)] // APPROVED: diagnostic CLI
+// 2026-10-12 (deep audit CR-7): deny, not allow. No production unwrap/expect
+// exists here; a future one now fails clippy instead of aborting (exit 134).
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
+#![cfg_attr(not(test), deny(clippy::expect_used))]
 
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};

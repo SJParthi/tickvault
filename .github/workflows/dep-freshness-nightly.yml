@@ -14,6 +14,9 @@
 #
 #   - UNKNOWN: logs and continues (network issue, not a failure).
 #
+# The two issue jobs use the `gh` CLI (ported off actions/github-script,
+# 2026-10-12, deep audit RUST-8); the label-based dedup is unchanged.
+#
 # No human intervention required for the PATCH path. The operator's
 # only job is triage the MINOR / MAJOR issues periodically.
 
@@ -177,47 +180,40 @@ jobs:
     if: needs.scan.outputs.minor_count != '0' && needs.scan.outputs.minor_count != ''
     steps:
       - name: Create / update issue
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v7
-        with:
-          script: |
-            const report = Buffer.from('${{ needs.scan.outputs.report }}', 'base64').toString();
-            const title = `Dep drift: ${{ needs.scan.outputs.minor_count }} MINOR upgrades available`;
-
-            // Look for existing issue to update instead of spawning duplicates.
-            const existing = await github.rest.issues.listForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              labels: 'deps-drift-minor',
-              state: 'open',
-            });
-
-            const body = `### MINOR dep drift detected by nightly scan\n\n` +
-              `**Generated:** ${new Date().toISOString()}\n\n` +
-              `\`\`\`\n${report}\n\`\`\`\n\n` +
-              `### What to do\n\n` +
-              `1. Pick one dep at a time (don't batch minors)\n` +
-              `2. Bump in \`Cargo.toml\`\n` +
-              `3. Run \`cargo test --workspace\`\n` +
-              `4. Commit + push\n\n` +
-              `The 12 pre-push gates will catch any regression.`;
-
-            if (existing.data.length > 0) {
-              await github.rest.issues.update({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: existing.data[0].number,
-                title: title,
-                body: body,
-              });
-            } else {
-              await github.rest.issues.create({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                title: title,
-                body: body,
-                labels: ['deps', 'deps-drift-minor'],
-              });
-            }
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          # Job outputs travel through env, never spliced into the script.
+          REPORT_B64: ${{ needs.scan.outputs.report }}
+          COUNT: ${{ needs.scan.outputs.minor_count }}
+        run: |
+          set -euo pipefail
+          TITLE="Dep drift: ${COUNT} MINOR upgrades available"
+          {
+            printf '### MINOR dep drift detected by nightly scan\n\n'
+            printf '**Generated:** %s\n\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            printf '```\n'
+            printf '%s' "$REPORT_B64" | base64 -d || printf '(the scanner report did not decode)'
+            printf '\n```\n\n### What to do\n\n'
+            printf '%s\n' \
+              '1. Pick one dep at a time (don'\''t batch minors)' \
+              '2. Bump in `Cargo.toml`' \
+              '3. Run `cargo test --workspace`' \
+              '4. Commit + push' \
+              '' \
+              'The 12 pre-push gates will catch any regression.' \
+              ''
+          } > /tmp/drift-body.md
+          # Update the newest open issue with this label instead of spawning
+          # duplicates (same rule as before the gh port).
+          num=$(gh issue list --state open --label deps-drift-minor --limit 1 \
+            --json number --template '{{range .}}{{.number}}{{end}}')
+          if [ -n "$num" ]; then
+            gh issue edit "$num" --title "$TITLE" --body-file /tmp/drift-body.md
+          else
+            gh issue create --title "$TITLE" --body-file /tmp/drift-body.md \
+              --label deps --label deps-drift-minor
+          fi
 
   open_major_issue:
     name: Open issue for MAJOR drift
@@ -226,45 +222,39 @@ jobs:
     if: needs.scan.outputs.major_count != '0' && needs.scan.outputs.major_count != ''
     steps:
       - name: Create / update issue
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v7
-        with:
-          script: |
-            const report = Buffer.from('${{ needs.scan.outputs.report }}', 'base64').toString();
-            const title = `Dep drift: ${{ needs.scan.outputs.major_count }} MAJOR upgrades available (API breaking)`;
-
-            const existing = await github.rest.issues.listForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              labels: 'deps-drift-major',
-              state: 'open',
-            });
-
-            const body = `### MAJOR dep drift detected by nightly scan\n\n` +
-              `**Generated:** ${new Date().toISOString()}\n\n` +
-              `\`\`\`\n${report}\n\`\`\`\n\n` +
-              `### What to do\n\n` +
-              `Major version bumps are API breaking. Each one needs:\n` +
-              `1. Read the upstream CHANGELOG for breaking changes\n` +
-              `2. Open a dedicated branch \`deps/major-<crate>\`\n` +
-              `3. Fix every call site that breaks\n` +
-              `4. Run \`cargo test --workspace\`\n` +
-              `5. Open a PR for explicit review\n\n` +
-              `Never auto-merge major bumps.`;
-
-            if (existing.data.length > 0) {
-              await github.rest.issues.update({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: existing.data[0].number,
-                title: title,
-                body: body,
-              });
-            } else {
-              await github.rest.issues.create({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                title: title,
-                body: body,
-                labels: ['deps', 'deps-drift-major'],
-              });
-            }
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          # Job outputs travel through env, never spliced into the script.
+          REPORT_B64: ${{ needs.scan.outputs.report }}
+          COUNT: ${{ needs.scan.outputs.major_count }}
+        run: |
+          set -euo pipefail
+          TITLE="Dep drift: ${COUNT} MAJOR upgrades available (API breaking)"
+          {
+            printf '### MAJOR dep drift detected by nightly scan\n\n'
+            printf '**Generated:** %s\n\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            printf '```\n'
+            printf '%s' "$REPORT_B64" | base64 -d || printf '(the scanner report did not decode)'
+            printf '\n```\n\n### What to do\n\n'
+            printf '%s\n' \
+              'Major version bumps are API breaking. Each one needs:' \
+              '1. Read the upstream CHANGELOG for breaking changes' \
+              '2. Open a dedicated branch `deps/major-<crate>`' \
+              '3. Fix every call site that breaks' \
+              '4. Run `cargo test --workspace`' \
+              '5. Open a PR for explicit review' \
+              '' \
+              'Never auto-merge major bumps.' \
+              ''
+          } > /tmp/drift-body.md
+          # Update the newest open issue with this label instead of spawning
+          # duplicates (same rule as before the gh port).
+          num=$(gh issue list --state open --label deps-drift-major --limit 1 \
+            --json number --template '{{range .}}{{.number}}{{end}}')
+          if [ -n "$num" ]; then
+            gh issue edit "$num" --title "$TITLE" --body-file /tmp/drift-body.md
+          else
+            gh issue create --title "$TITLE" --body-file /tmp/drift-body.md \
+              --label deps --label deps-drift-major
+          fi

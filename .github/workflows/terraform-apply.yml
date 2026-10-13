@@ -67,9 +67,11 @@ on:
   workflow_dispatch:
     inputs:
       confirm_market_hours:
-        description: 'Apply during market hours? Type "yes" to override the guard.'
+        description: 'Apply during market hours? Choose "yes" to override the guard.'
         required: false
         default: 'no'
+        type: choice
+        options: ['no', 'yes']
       skip_apply:
         description: 'Plan only, skip apply even on main. Type "yes" to skip.'
         required: false
@@ -466,6 +468,10 @@ jobs:
     if: needs.preflight.outputs.bootstrap_ready == 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')
     steps:
       - name: Check current IST time against market window
+        # SEC-7 (2026-10-12): a dispatch input reaches the script through env,
+        # never as an inline expression the runner pastes into the script.
+        env:
+          CONFIRM_MARKET_HOURS: ${{ github.event.inputs.confirm_market_hours }}
         run: |
           # No-deploy band 09:00-15:45 IST = 03:30-10:15 UTC (operator lock
           # 2026-06-03 — kept consistent with deploy-aws.yml: no prod mutation,
@@ -478,7 +484,7 @@ jobs:
           echo "UTC time: $UTC_HOUR:$UTC_MINUTE (day $UTC_DOW), numeric $UTC_TIME_NUM"
 
           if [ "$UTC_DOW" -le 5 ] && [ "$UTC_TIME_NUM" -ge 330 ] && [ "$UTC_TIME_NUM" -lt 1015 ]; then
-            if [ "${{ github.event.inputs.confirm_market_hours }}" = "yes" ]; then
+            if [ "${CONFIRM_MARKET_HOURS:-no}" = "yes" ]; then
               echo "WARNING: applying infra changes during market hours with explicit override"
             else
               echo "::error::BLOCK: applying infra changes during 09:00-15:45 IST is forbidden."

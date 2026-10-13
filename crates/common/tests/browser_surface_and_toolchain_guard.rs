@@ -436,7 +436,10 @@ const SPAWN_ALLOWLIST: &[(&str, &str)] = &[
         "docker",
         "compose health checks (infra.rs) + container tests",
     ),
-    ("df", "disk-health watcher"),
+    // `df` LEFT 2026-10-12 (deep audit DA-12): the disk-health probe reads
+    // free space with one `statvfs` call now, so no literal `df` spawn
+    // remains. (`tv_doctor` still runs `df -h` through a non-literal helper,
+    // which this literal scan does not see; that is an operator report.)
     (
         "kill",
         "test only (audit G3, 2026-10-11): main.rs sends SIGTERM to the test's \
@@ -587,7 +590,7 @@ fn spawn_allowlist_is_documented_and_has_no_language_runtime() {
         "bash",
         "sh",
         "docker",
-        "df",
+        // "df" left 2026-10-12 (deep audit DA-12): statvfs replaced the fork.
         // 2026-10-11 (audit G3): test-only SIGTERM to the test's own process.
         "kill",
         "open",
