@@ -953,7 +953,7 @@ mod tests {
         write_records(&closed, &[(b"market_depth,a=1 b=1i 1\n", 1), (v2, 2)]);
         write_records(&live, &[(b"market_depth,a=2 b=2i 2\n", 1)]);
         let (url, bodies, server) = spawn_recording_server().await;
-        let view = crate::tick_spill_replay::test_spill_view();
+        let view = crate::tick_spill_replay::tests::test_spill_view();
         let out = replay_framed_spill_dir(&dir, &url, &client(), &view).await;
         server.abort();
         let bodies = bodies.lock().expect("lock").clone();
@@ -984,7 +984,7 @@ mod tests {
             &dir,
             &url,
             &client(),
-            &crate::tick_spill_replay::confirmed_spill_view(&view),
+            &crate::tick_spill_replay::tests::confirmed_spill_view(&view),
         )
         .await;
         server.abort();
@@ -1020,7 +1020,7 @@ mod tests {
             &dir,
             &url,
             &client(),
-            &crate::tick_spill_replay::test_spill_view(),
+            &crate::tick_spill_replay::tests::test_spill_view(),
         )
         .await;
         assert_eq!(
@@ -1044,7 +1044,7 @@ mod tests {
             &dir,
             &url,
             &client(),
-            &crate::tick_spill_replay::test_spill_view(),
+            &crate::tick_spill_replay::tests::test_spill_view(),
         )
         .await;
         server.abort();
@@ -1078,7 +1078,7 @@ mod tests {
             &dir,
             &url,
             &client(),
-            &crate::tick_spill_replay::test_spill_view(),
+            &crate::tick_spill_replay::tests::test_spill_view(),
         )
         .await;
         server.abort();
@@ -1124,7 +1124,7 @@ mod tests {
             &[(b"market_depth,a=3 b=3i 3\n", 1)],
         );
         let (url, _bodies, server) = spawn_recording_server().await;
-        let view = crate::tick_spill_replay::test_spill_view();
+        let view = crate::tick_spill_replay::tests::test_spill_view();
         let out = replay_framed_spill_dir(&dir, &url, &client(), &view).await;
         assert_eq!(out.files_failed, 0);
         let kept = std::fs::read(
@@ -1137,7 +1137,7 @@ mod tests {
             &dir,
             &url,
             &client(),
-            &crate::tick_spill_replay::confirmed_spill_view(&view),
+            &crate::tick_spill_replay::tests::confirmed_spill_view(&view),
         )
         .await;
         server.abort();
@@ -1169,7 +1169,7 @@ mod tests {
             &dir,
             &url,
             &client(),
-            &crate::tick_spill_replay::test_spill_view(),
+            &crate::tick_spill_replay::tests::test_spill_view(),
         )
         .await;
         server.abort();
@@ -1216,7 +1216,7 @@ mod tests {
             &dir,
             &url,
             &client(),
-            &crate::tick_spill_replay::test_spill_view(),
+            &crate::tick_spill_replay::tests::test_spill_view(),
         )
         .await;
         server.abort();

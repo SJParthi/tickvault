@@ -2081,7 +2081,33 @@ pub fn spawn_supervised_tick_spill_replay(
     })
 }
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    // Test views shared with `depth_spill_frame`'s tests (audit DA-13b).
+    /// Test view: a clean sink with no probes yet and the clock two hours ahead,
+    /// so a fixture written just now with a small hour in its name reads as
+    /// closed and quiet (unless it is the last file).
+    pub(crate) fn test_spill_view() -> SpillSinkView {
+        let mut view = SpillSinkView::current();
+        view.suspect = false;
+        view.clean_probes = 0;
+        view.suspect_episodes = 0;
+        view.now_unix_secs = view.now_unix_secs.saturating_add(2 * SPILL_FILE_HOUR_SECS);
+        view
+    }
+
+    /// Test view: `view` after two clean probes and the durability lag, so the
+    /// acks it stamped are confirmed.
+    pub(crate) fn confirmed_spill_view(view: &SpillSinkView) -> SpillSinkView {
+        let mut later = *view;
+        later.clean_probes = later
+            .clean_probes
+            .saturating_add(SPILL_EMPTY_CONFIRM_PROBES);
+        later.now_unix_secs = later
+            .now_unix_secs
+            .saturating_add(crate::wal_applied_watermark::WATERMARK_DURABILITY_LAG_SECS);
+        later
+    }
+
     // ---- 2026-09-03 STREAMING FIX: the tests that bite ----------------------
 
     /// IST epoch nanos for a seconds-of-day on an arbitrary real trading date.
@@ -4177,34 +4203,4 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
-}
-
-// Test helpers shared with `depth_spill_frame`'s tests. Kept below the test
-// module so source scans that read the production part (everything above the
-// first `#[cfg(test)]`) still see the whole replay.
-/// Test view: a clean sink with no probes yet and the clock two hours ahead,
-/// so a fixture written just now with a small hour in its name reads as
-/// closed and quiet (unless it is the last file).
-#[cfg(test)]
-pub(crate) fn test_spill_view() -> SpillSinkView {
-    let mut view = SpillSinkView::current();
-    view.suspect = false;
-    view.clean_probes = 0;
-    view.suspect_episodes = 0;
-    view.now_unix_secs = view.now_unix_secs.saturating_add(2 * SPILL_FILE_HOUR_SECS);
-    view
-}
-
-/// Test view: `view` after two clean probes and the durability lag, so the
-/// acks it stamped are confirmed.
-#[cfg(test)]
-pub(crate) fn confirmed_spill_view(view: &SpillSinkView) -> SpillSinkView {
-    let mut later = *view;
-    later.clean_probes = later
-        .clean_probes
-        .saturating_add(SPILL_EMPTY_CONFIRM_PROBES);
-    later.now_unix_secs = later
-        .now_unix_secs
-        .saturating_add(crate::wal_applied_watermark::WATERMARK_DURABILITY_LAG_SECS);
-    later
 }
