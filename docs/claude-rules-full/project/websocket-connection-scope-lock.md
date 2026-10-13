@@ -9266,3 +9266,128 @@ REJECT (2026-10-10):
   here first.
 - Defaulting `frame_silence_fast_path` to `act` without a dated row here
   recording the shadow-week measurement.
+
+### 2026-10-13 — A SILENT DEPTH-200 SWAP IS RESUBSCRIBED IN PLACE AT 90 s
+
+**The owner's decision, verbatim (2026-10-13, decision card).** Card title:
+"Two depth-200 sockets went silent for 15 minutes today after a contract swap
+(Dhan never started the new contract). How should a silent swap be handled?"
+The owner tapped **"Resubscribe at 90s (Recommended)"**, whose option text reads:
+
+> "If the new contract sends nothing in 90 seconds, re-send the subscribe on the same socket (no disconnect). Only if still silent, fall back to the existing redial. Cuts a 15-minute gap to about 1.5 minutes."
+
+Recorded HERE before any code, per the rule-file-first law.
+
+#### The evidence (production CloudWatch, 2026-10-13, read-only)
+
+- Depth-200 sockets changed contract in place about once a minute
+  (`LiveSubscriptionCommand::Swap`: code 25 for the old contract, then code 23
+  for the new one); 555 swaps 09:15–12:20 IST, each logged "live subscription
+  swapped — this socket now carries the current at-the-money contract without
+  a re-dial".
+- Twice (11:08:10 IST pool_index 1; 12:03:10 IST pool_index 3, whose last swap
+  was 11:47:09) the socket then delivered no data frame for 900 s and was
+  redialled by the frame-silence backstop (WS-GAP-03 warn, `source =
+  frame_silence`, `basis = backstop`, `threshold_secs = 900`). The new
+  contract never streamed; about 15 minutes of 200-level depth was missed each
+  time.
+- `tv_depth_first_packet_silent_total` stayed 0 all day, and the shadow
+  cross-feed check did not visibly catch either case.
+- 80 ghost verdicts the same day (old contract still delivered after its 25),
+  answered by the existing `request_ghost_unsubscribe` resend.
+
+**Why the first-packet tracker stayed at 0 (read from the code, not measured).**
+`depth_first_packet` is a latency instrument keyed on the contract, not the
+socket. (a) `send_swap` refuses the stamp (`unmeasurable`) for any contract a
+depth socket held or dropped in the last `DROPPED_RETENTION_SECS` (600 s), so a
+ghost on another socket cannot fake a 0 ms sample; depth-200 rotates among a
+few near-the-money strikes of five underlyings, so many new contracts are in
+that window and are never watched. (b) The next swap on the same socket
+`forget`s the previous contract's stamp, so a socket that swaps every minute
+never keeps a stamp to the 120 s window. Which of the two applied to each of
+today's cases is **Unknown** (the `outcome` series are local `/metrics` only).
+Both are deliberate trades for the latency measurement and are left as they
+are; the silence question is answered per SOCKET by the new watch below.
+
+#### The contract
+
+- Depth-200 only. After a successful `Swap` (not a no-op), the connection task
+  arms a per-socket watch for the NEW contract, keyed on the composite
+  `(security_id, segment)` and on the socket's slot (one `AtomicU64` per slot).
+  The socket READ task clears it, before the frame is handed to the WAL and
+  the ring, when the first packet of a frame is a bid or ask packet for
+  exactly that contract (12-byte depth header, fixed offsets): one acquire
+  load per frame while nothing is awaited, no allocation, no metric. Read
+  BEFORE the sink because a frame the drain sheds or the ring refuses (WAL
+  only) never reaches the drain's parser; a drain-side check would read a
+  flowing contract as silent during a shed and send a false resend (review
+  finding, same day; the cross-feed check reads the read task's stamp for
+  the same reason).
+- If nothing for that contract arrives within the configured wait
+  (`[dhan_universe] depth200_silent_swap_resubscribe_secs`, default 90), the
+  connection task, on its existing
+  one-second idle tick, re-sends the subscription for that ONE contract on the
+  live socket: code 25 then code 23 for the same contract (the 2026-10-01
+  unsubscribe-first order). The 25 is sent first because a bare repeated 23
+  on a socket Dhan already counts as holding the contract is a duplicate, and
+  Dhan answers a duplicate subscribe with 804, which spends the slot's one
+  re-dial and parks it on the second. No disconnect.
+- At most ONE resend per swap. A second swap before the resend replaces the
+  watch. If the contract is still silent after the resend, nothing new
+  happens: the existing 900 s frame-silence backstop remains the fallback.
+- Refused (counted, nothing sent) after an 805 (`ROTATION_HALTED`) and when
+  the socket's `SubscribeGuard` no longer holds the contract.
+- If the 25 lands and the 23 then fails on the wire, the socket holds nothing,
+  and it takes the same `SubscribeFailed` redial as a failed swap (an existing
+  fault path, not a new policy).
+- Counted on `tv_depth200_silent_swap_resubscribe_total{outcome}` (`sent`,
+  `refused_halted_805`, `refused_not_held`, `wire_failed`, `recovered`),
+  registered at 0 at boot, local `/metrics` only; one coded `warn!` per
+  resend decision, never per packet.
+- **90 s is the STARTING value, not a measured one.** The wait is a config
+  value, validated at boot to 10..=600 s (the ceiling stays well under the
+  900 s backstop). The owner may lower it once the measured first-packet p99
+  supports it, and lowering it is a config change plus a restart, never a
+  code change. To measure it, every depth-200 swap's time
+  from subscribe to the new contract's first packet ON ITS SOCKET into the
+  existing local histogram `tv_depth_first_packet_latency_ms`, labelled
+  `basis = "depth200_socket"` (one sample per swap, recorded by the
+  connection task's 1 s poll after the read task clears the watch; the
+  production recorder can allocate a bucket block about once every 64
+  samples, as for `depth_first_packet`, never per frame). Local `/metrics` only; the name is not
+  EMF-selected. Contracts that never arrive are not in it, so read its p99
+  together with the `sent` count.
+- Every per-packet and per-tick step is O(1) and allocation-free; waiting is
+  not work: the 90 s is a timestamp compared once a second.
+
+#### Honest limits
+
+- Worst case to the resend: 90 s plus one idle tick (1 s), plus any wait for a
+  keepalive ping already on the wire, plus the two writes (each bounded by
+  `SWAP_WIRE_BUDGET`, 1 s). The idle tick sits behind the socket read arm in a
+  biased select; a socket delivering ghost packets back to back can delay it.
+- A swap made again within 90 s (the steering loop swaps about once a minute)
+  replaces the watch, so a socket that swaps every minute onto contracts Dhan
+  never starts is never resent. The 900 s backstop still covers it.
+- **Assumed:** a code 25 for a contract Dhan never started is harmless. Dhan
+  sends no acknowledgement, so it is not measured.
+- If Dhan ignored the 25 (the ghost behaviour), the 23 that follows is a
+  duplicate and may draw an 804; once per swap at most.
+- Only the first packet of a frame is read: a frame stacking a ghost of the
+  old contract ahead of the new one does not clear the watch; the next frame
+  of a flowing contract does.
+- The poll has no market-hours gate of its own. Swaps are only planned in
+  session, so nothing is armed outside it; a swap in the last 90 s of the
+  session can still be resent just after the close.
+- Not verified against a live Dhan socket.
+
+REJECT (2026-10-13):
+
+- A redial (close and redial) instead of the in-place resend.
+- More than one resend per swap.
+- A resend after an 805 or while `ROTATION_HALTED` is set.
+- A resend for a contract the socket's `SubscribeGuard` no longer holds.
+- A bare repeated code 23 without the code 25 before it.
+- Lowering the 900 s depth-200 backstop.
+- Any change to depth-20 or the main feed under this quote.
+- Any new CloudWatch alarm, Telegram page, metric filter or EMF name for it.
