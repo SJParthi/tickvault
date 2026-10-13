@@ -1670,6 +1670,10 @@ async fn async_main() -> Result<()> {
     // DA-13c: local `/metrics` only (no EMF name, no alarm).
     metrics::counter!(tickvault_app::dhan_feed_stack::WAL_REFOLD_ABANDONED_BYTES_COUNTER)
         .increment(0);
+    metrics::counter!(tickvault_storage::wal_replay_settle::WAL_REPLAY_SETTLE_HELD_COUNTER)
+        .increment(0);
+    metrics::counter!(tickvault_storage::wal_replay_settle::WAL_REPLAY_SETTLE_RECOVERED_COUNTER)
+        .increment(0);
     metrics::counter!("tv_seal_writer_drain_dropped_total").increment(0);
     metrics::counter!("tv_ws_frame_spill_write_errors_total", "stage" => "write_record")
         .increment(0);

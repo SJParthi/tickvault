@@ -17964,7 +17964,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             // returns rows handed to a queue. Wait for the writer threads to
             // land or rescue them before the segments leave the replay path.
             if replay_rows_landed(&mut ingest, "boot_refold", unlanded_before) {
-                tickvault_storage::ws_frame_spill::confirm_replayed(
+                tickvault_storage::wal_replay_settle::settle_confirm_replayed(
                     crate::boot_helpers::ws_wal_dir(),
                 );
                 boot_refold_confirmed = true;
@@ -18389,7 +18389,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             if !replay_rows_landed(&mut ingest, "catchup", unlanded_before) {
                 break;
             }
-            tickvault_storage::ws_frame_spill::confirm_replayed(&wal_dir);
+            tickvault_storage::wal_replay_settle::settle_confirm_replayed(&wal_dir);
             catchup_frames = catchup_frames.saturating_add(staged.len());
             catchup_ticks = catchup_ticks.saturating_add(outcome.refolded as u64);
             rounds = rounds.saturating_add(1);

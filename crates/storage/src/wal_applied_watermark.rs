@@ -619,6 +619,11 @@ pub struct AppliedWatermark {
     /// traffic and to archive a file only after a whole clean probe ran
     /// behind its last write.
     clean_probes: AtomicU64,
+    /// Suspicion episodes entered so far this process (DA-13c). Monotone. The
+    /// WAL replay settle step records it at an ack and refuses to archive the
+    /// acked segments if it has moved since: an episode in between means the
+    /// sink may have acked rows it never applied.
+    suspect_episodes: AtomicU64,
     /// Batches whose rows landed NOWHERE — the ILP write failed AND the
     /// rescue to the spill tier failed. Monotone. The replay confirm compares
     /// it before and after a batch: a batch that lost rows must never have its
@@ -744,6 +749,7 @@ impl AppliedWatermark {
             suspect_max_ticks: AtomicU64::new(0),
             suspect_max_depth: AtomicU64::new(0),
             clean_probes: AtomicU64::new(0),
+            suspect_episodes: AtomicU64::new(0),
             unlanded: AtomicU64::new(0),
             rescue_floors_ticks: [const { AtomicU64::new(0) }; RESCUE_FLOOR_SLOTS],
             rescue_floors_depth: [const { AtomicU64::new(0) }; RESCUE_FLOOR_SLOTS],
@@ -852,6 +858,7 @@ impl AppliedWatermark {
             self.healthy_depth
                 .store(self.hwm_depth.load(Ordering::Acquire), Ordering::Release);
         } else if !self.sink_suspect.swap(true, Ordering::AcqRel) {
+            self.suspect_episodes.fetch_add(1, Ordering::AcqRel);
             let hwm_ticks = self.hwm_ticks.load(Ordering::Acquire);
             let hwm_depth = self.hwm_depth.load(Ordering::Acquire);
             self.note_unapplied_range(
@@ -871,6 +878,14 @@ impl AppliedWatermark {
     #[must_use]
     pub fn clean_probe_count(&self) -> u64 {
         self.clean_probes.load(Ordering::Acquire)
+    }
+
+    /// How many suspicion episodes have begun this process (DA-13c). A
+    /// change between two reads means the sink was suspect at some point in
+    /// between, even if it has recovered since.
+    #[must_use]
+    pub fn suspect_episode_count(&self) -> u64 {
+        self.suspect_episodes.load(Ordering::Acquire)
     }
 
     /// Whether acks are currently parked rather than applied.
@@ -2042,6 +2057,25 @@ mod tests {
         wm.note_questdb_probe(false);
         wm.note_questdb_probe(true);
         assert_eq!(wm.clean_probe_count(), 2, "a suspect probe is not counted");
+    }
+
+    #[test]
+    fn suspect_episode_count_counts_each_entry_into_suspicion_once() {
+        let wm = AppliedWatermark::new_for_tests();
+        assert_eq!(wm.suspect_episode_count(), 0);
+        wm.note_questdb_probe(true);
+        assert_eq!(wm.suspect_episode_count(), 0, "a clean probe is no episode");
+        wm.note_questdb_probe(false);
+        wm.note_questdb_probe(false);
+        assert_eq!(wm.suspect_episode_count(), 1, "one episode, however long");
+        wm.note_questdb_probe(true);
+        assert_eq!(
+            wm.suspect_episode_count(),
+            1,
+            "recovery keeps the count, so a reader can still see the episode"
+        );
+        wm.note_questdb_probe(false);
+        assert_eq!(wm.suspect_episode_count(), 2);
     }
 
     #[test]
