@@ -2038,7 +2038,22 @@ pub struct SpillPruneOutcome {
     /// hold seals a recovery path gave up on and are those seals' only copy.
     /// Their bytes are in `bytes_after`.
     pub refused_kept: usize,
+    /// Non-empty files at the top level or in `replaying/` deleted WITH a
+    /// verified cold copy (DA-13a). Their seals were never written to
+    /// `candles_*`: the only copy is now the cold bucket's `seal-spill/`, and
+    /// nothing replays it from there. Not counted in `deleted_non_empty`
+    /// (which means no copy at all).
+    pub deleted_unreplayed_with_copy: usize,
+    /// Records in `deleted_unreplayed_with_copy` (bytes / record size).
+    pub records_unreplayed_with_copy: u64,
 }
+
+/// Counter: sealed candles in unreplayed spill files the retention sweep
+/// deleted WITH a verified cold copy (DA-13a). They are in the cold bucket and
+/// in no table. Local `/metrics` only (no EMF name, no alarm); the sweep also
+/// logs one coded STORAGE-GAP-04 line per pass that deletes any.
+pub const SEAL_SPILL_UNREPLAYED_DELETED_WITH_COPY_COUNTER: &str =
+    "tv_seal_spill_unreplayed_deleted_with_copy_records_total";
 
 /// Gauge: files in the spill folder's `refused/` (PR40b-f). They hold seals
 /// the boot drain or the replay gave up on and are never deleted; each was
@@ -2459,12 +2474,16 @@ fn prune_dir(
                     PrunedKind::Unreplayed => {
                         outcome.deleted += 1;
                         // With a verified copy the records are in the cold
-                        // bucket, not lost.
+                        // bucket, not lost, but they are in no table either:
+                        // counted apart (DA-13a), never reported as empty.
+                        let records = len / SEAL_SPILL_RECORD_SIZE as u64;
                         if len > 0 && !with_copy {
                             outcome.deleted_non_empty += 1;
-                            outcome.records_lost = outcome
-                                .records_lost
-                                .saturating_add(len / SEAL_SPILL_RECORD_SIZE as u64);
+                            outcome.records_lost = outcome.records_lost.saturating_add(records);
+                        } else if len > 0 {
+                            outcome.deleted_unreplayed_with_copy += 1;
+                            outcome.records_unreplayed_with_copy =
+                                outcome.records_unreplayed_with_copy.saturating_add(records);
                         }
                     }
                 }
@@ -2565,9 +2584,31 @@ pub fn prune_spill_files(
              This is data loss, reported rather than hidden; investigate why \
              the writer never drained these."
         );
-    } else if outcome.deleted > 0 {
+    }
+    if outcome.deleted_unreplayed_with_copy > 0 {
+        // DA-13a: these were logged as "removed aged empty spill files". They
+        // held seals that never reached the database; the verified copy in the
+        // cold bucket is the only one left. Log-only code: no new page.
+        metrics::counter!(SEAL_SPILL_UNREPLAYED_DELETED_WITH_COPY_COUNTER)
+            .increment(outcome.records_unreplayed_with_copy);
+        error!(
+            code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
+            source = "spill_unreplayed_deleted_copy_in_s3",
+            files = outcome.deleted_unreplayed_with_copy,
+            records = outcome.records_unreplayed_with_copy,
+            max_age_secs,
+            "aged spill files (top level or replaying/) that were NEVER replayed were deleted \
+             from the box: their sealed candles are only in the cold bucket's seal-spill/ copy \
+             and are NOT in candles_* until that copy is replayed"
+        );
+    }
+    let empty_deleted = outcome
+        .deleted
+        .saturating_sub(outcome.deleted_non_empty)
+        .saturating_sub(outcome.deleted_unreplayed_with_copy);
+    if empty_deleted > 0 {
         info!(
-            deleted = outcome.deleted,
+            deleted = empty_deleted,
             bytes_after = outcome.bytes_after,
             "spill retention sweep: removed aged empty spill files"
         );
@@ -4561,8 +4602,49 @@ mod tests {
         assert_eq!(out.deleted_with_copy, 1);
         // The records are in the cold bucket: not counted as lost.
         assert_eq!((out.deleted_non_empty, out.records_lost), (0, 0));
+        // DA-13a: but they were never replayed, so they are counted apart
+        // and never reported as an empty file.
+        assert_eq!(
+            (
+                out.deleted_unreplayed_with_copy,
+                out.records_unreplayed_with_copy
+            ),
+            (1, 2)
+        );
         assert_eq!(out.refused_not_uploaded, 0);
         assert!(!marker.exists(), "the deleted file's marker goes with it");
+    }
+
+    // Regression: 2026-10-13 — DA-13a. A never-replayed spill file deleted
+    // with a cold copy was counted only in `deleted` and logged as "removed
+    // aged empty spill files". Only a truly empty file may count as empty.
+    #[test]
+    fn test_regression_da13a_prune_counts_unreplayed_with_copy_apart_from_empty_files() {
+        let dir = spill_tmp("gate-copy-split");
+        let empty = write_aged(&dir, "seals_v4-2026-01-01.bin", 0, 10_000);
+        let full = write_aged(
+            &dir,
+            "seals_v4-2026-01-02.bin",
+            SEAL_SPILL_RECORD_SIZE * 3,
+            10_000,
+        );
+        crate::raw_frame_upload::write_file_marker_for_test(&empty);
+        crate::raw_frame_upload::write_file_marker_for_test(&full);
+        let out = prune_spill_files_at(
+            &dir,
+            3_600,
+            std::time::SystemTime::now(),
+            CopyGate::Required,
+        );
+        assert_eq!(out.deleted, 2);
+        assert_eq!(out.deleted_unreplayed_with_copy, 1, "only the full file");
+        assert_eq!(out.records_unreplayed_with_copy, 3);
+        assert_eq!((out.deleted_non_empty, out.records_lost), (0, 0));
+        let empty_deleted = out
+            .deleted
+            .saturating_sub(out.deleted_non_empty)
+            .saturating_sub(out.deleted_unreplayed_with_copy);
+        assert_eq!(empty_deleted, 1, "the empty file is the only empty one");
     }
 
     #[test]

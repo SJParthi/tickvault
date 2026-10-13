@@ -349,6 +349,12 @@ fn record_boot_drain_observability(outcome: &BootDrainOutcome) {
         metrics::counter!("tv_seal_writer_drain_total", "kind" => "boot_summary_not_persisted")
             .increment(outcome.summary_not_persisted as u64);
     }
+    // DA-13a: files the drain left staged because the database was suspect
+    // (their seals are already in `boot_pending`).
+    if outcome.files_held_sink_suspect > 0 {
+        metrics::counter!("tv_seal_writer_drain_total", "kind" => "boot_held_sink_suspect")
+            .increment(outcome.files_held_sink_suspect as u64);
+    }
     // Row 296: page the seals given up on for good, once, when their file
     // leaves `replaying/`. A file staged for another try is pending
     // (`boot_pending` above), not unrecovered, so a file refused on several
@@ -1274,6 +1280,7 @@ pub async fn run_seal_writer_loop(
             summary_seeded = boot.summary_seeded,
             summary_refused = boot.summary_refused,
             summary_not_persisted = boot.summary_not_persisted,
+            files_held_sink_suspect = boot.files_held_sink_suspect,
             "seal writer boot recovery drain finished"
         );
     }
@@ -1894,6 +1901,7 @@ mod tests {
             summary_seeded: 6,
             summary_refused: 1,
             summary_not_persisted: 2,
+            files_held_sink_suspect: 1,
             seals_unrecovered: 5,
             files_refused: 1,
         });

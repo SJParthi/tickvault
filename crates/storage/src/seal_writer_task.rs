@@ -460,6 +460,12 @@ pub struct BootDrainOutcome {
     /// reached, or the write failed) although files stay staged. A later boot
     /// may write an older copy of such a bar.
     pub summary_not_persisted: usize,
+    /// DA-13a: files left staged because the WAL-suspension watcher reported
+    /// the database suspect (a table suspended, lagging, or the probe blind).
+    /// A suspended table answers an ILP write with 2xx and applies nothing, so
+    /// those flushes prove nothing. Also counted in `files_left_pending`; their
+    /// seals are in `seals_left_pending`, never in `seals_reingested`.
+    pub files_held_sink_suspect: usize,
 }
 
 impl BootDrainOutcome {
@@ -660,10 +666,30 @@ fn read_staged_spill(path: &Path) -> Option<(Vec<SerializedSeal>, usize)> {
     let mut undecodable = 0usize;
     let mut checksum_refused = 0usize;
     let mut buf = [0u8; SEAL_SPILL_RECORD_SIZE];
-    // The loop ends on the first read error, which is either a clean EOF or a
-    // truncated trailing record (a torn write at the moment of the crash).
-    // Either way nothing further in the file is readable.
-    while reader.read_exact(&mut buf).is_ok() {
+    // The loop ends at `UnexpectedEof`: a clean end of file, or a truncated
+    // trailing record (a torn write at the moment of the crash). Nothing
+    // further in the file is readable then.
+    //
+    // ⚠ CORRECTED 2026-10-13 (audit DA-13a). This loop was
+    // `while read_exact(..).is_ok()`, so ANY read error (EIO on a bad block,
+    // ESTALE) ended it like a clean end of file. The caller then re-ingested
+    // the prefix and archived the file as fully recovered, and every record
+    // after the error was in no table and on no counter. Any other error now
+    // returns `None`: the caller keeps the file staged and logs it coded, the
+    // same way `read_step` (the mid-session reader of the same files) does.
+    loop {
+        match reader.read_exact(&mut buf) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(err) => {
+                warn!(
+                    ?path,
+                    ?err,
+                    "seal recovery: read error in a staged spill file"
+                );
+                return None;
+            }
+        }
         // Format-version gate — the SAME `!=` test as `SealSpillWriter::read_all`.
         //
         // ⚠ CORRECTED 2026-09-22. This gate refused only `buf[7] == 0`, the
@@ -723,9 +749,25 @@ fn read_staged_dlq(path: &Path) -> Option<(Vec<SerializedSeal>, usize)> {
     let mut out = Vec::new();
     let mut undecodable = 0usize;
     for line in BufReader::new(file).lines() {
-        let Ok(line) = line else {
-            undecodable += 1;
-            continue;
+        // Bad UTF-8 (`InvalidData`) consumes the line's bytes, so counting it
+        // undecodable and moving on is right. Any other error does not
+        // advance the reader: `lines()` returns it again forever, which spun
+        // the boot drain before its first cycle (audit DA-13a). The file is
+        // left staged instead.
+        let line = match line {
+            Ok(line) => line,
+            Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
+                undecodable += 1;
+                continue;
+            }
+            Err(err) => {
+                warn!(
+                    ?path,
+                    ?err,
+                    "seal recovery: read error in a staged dlq file"
+                );
+                return None;
+            }
         };
         if line.trim().is_empty() {
             continue;
@@ -976,7 +1018,9 @@ pub fn drain_recovered_seals<S: SealSink>(
     dlq_dir: &Path,
     max_batch: usize,
 ) -> BootDrainOutcome {
-    let outcome = drain_recovered_seals_once(writer, spill_dir, dlq_dir, max_batch);
+    let outcome = drain_recovered_seals_once(writer, spill_dir, dlq_dir, max_batch, &|| {
+        boot_drain_sink_suspect()
+    });
     // PR40b-f: the retention sweep may now delete aged unreplayed files here.
     // Whatever the drain found, it has read the folder; a file it left
     // staged stays inside the age window or is reported when it ages out.
@@ -984,12 +1028,39 @@ pub fn drain_recovered_seals<S: SealSink>(
     outcome
 }
 
+/// Whether the boot drain must hold staged files (DA-13a): the process-wide
+/// WAL-suspension watcher's flag, two atomic loads.
+///
+/// In this crate's own unit tests it reads `false`: one of them starts a real
+/// watcher against a closed port, whose failed probe sets the process-wide
+/// flag at a moment no other test controls. The gate itself is tested through
+/// [`drain_recovered_seals_once`] with an injected probe.
+fn boot_drain_sink_suspect() -> bool {
+    #[cfg(not(test))]
+    {
+        ReplayProbe::current().suspect
+    }
+    #[cfg(test)]
+    {
+        false
+    }
+}
+
 /// One boot drain; see [`drain_recovered_seals`].
+///
+/// `sink_suspect` is read before each file is flushed and again before it is
+/// archived (DA-13a). While it reads `true` the drain stops and leaves the
+/// file staged: a WAL-suspended table answers 2xx and applies nothing, so an
+/// archive then would move the only copy out of reach on the strength of an
+/// ack that proves nothing. Production passes the process-wide watcher's flag
+/// (two atomic loads); with no watcher running it reads `false` and the drain
+/// archives on a clean flush, as the mid-session replay does in that case.
 fn drain_recovered_seals_once<S: SealSink>(
     writer: &mut S,
     spill_dir: &Path,
     dlq_dir: &Path,
     max_batch: usize,
+    sink_suspect: &dyn Fn() -> bool,
 ) -> BootDrainOutcome {
     let mut outcome = BootDrainOutcome::default();
     let batch = max_batch.max(1);
@@ -1023,11 +1094,22 @@ fn drain_recovered_seals_once<S: SealSink>(
     // summary of what it committed; seed from it before reading any file.
     seed_from_boot_summary(spill_dir, &mut written, &mut outcome);
     let mut halted = false;
+    // DA-13a: set once the database reads suspect; every later file stays
+    // staged and is counted as held for that reason.
+    let mut held_suspect = false;
     for path in &staged {
-        if halted {
-            // QuestDB is down — count the untouched remainder honestly
-            // instead of burning a bounded flush timeout per file.
+        if !halted && !held_suspect && sink_suspect() {
+            // The database is suspect, so a flush would be acked without
+            // being applied. Leave this and every later file staged.
+            held_suspect = true;
+        }
+        if halted || held_suspect {
+            // QuestDB is down or suspect — count the untouched remainder
+            // honestly instead of burning a bounded flush timeout per file.
             outcome.files_left_pending += 1;
+            if held_suspect {
+                outcome.files_held_sink_suspect += 1;
+            }
             continue;
         }
         // A file we could not READ is never a file we may ARCHIVE.
@@ -1166,6 +1248,20 @@ fn drain_recovered_seals_once<S: SealSink>(
             }
         }
 
+        // DA-13a: every flush of this file was acked, but an ack from a
+        // suspect sink proves nothing. Re-read the flag after the last flush;
+        // if it is set, the file stays staged and its seals count as pending,
+        // not re-ingested. The re-send on the next read is collapsed by the
+        // DEDUP keys.
+        if file_ok && sink_suspect() {
+            outcome.files_left_pending += 1;
+            outcome.files_held_sink_suspect += 1;
+            outcome.seals_left_pending += records.len();
+            outcome.seals_append_failed += append_failed;
+            held_suspect = true;
+            continue;
+        }
+
         outcome.seals_reingested += committed;
         outcome.seals_append_failed += append_failed;
 
@@ -1230,6 +1326,7 @@ fn drain_recovered_seals_once<S: SealSink>(
         error!(
             code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
             files_pending = outcome.files_left_pending,
+            files_held_sink_suspect = outcome.files_held_sink_suspect,
             seals_pending = outcome.seals_left_pending,
             seals_append_failed = outcome.seals_append_failed,
             seals_reingested = outcome.seals_reingested,
@@ -5003,5 +5100,121 @@ mod tests {
             .unwrap_or("");
         assert!(drop.contains("self.parked.len()"));
         assert!(drop.contains("saturating_sub(parked)"));
+    }
+
+    // -----------------------------------------------------------------------
+    // DA-13a — the boot drain never archives on an ack it cannot trust, and
+    // never reads an I/O error as the end of a file
+    // -----------------------------------------------------------------------
+
+    // Regression: 2026-10-13 — DA-13a. The boot drain archived a staged file
+    // on any 2xx flush, including one from a WAL-suspended table that applies
+    // nothing; the mid-session replay already waited for clean probes.
+    #[test]
+    fn test_regression_da13a_boot_drain_holds_every_file_while_the_sink_is_suspect() {
+        let (spill, dlq) = temp_pair("da13a-suspect-start");
+        let writer = crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(spill.clone());
+        let t0 = jan1_noon_utc();
+        spill_range(&writer, 0, 3, t0);
+        spill_range(&writer, 10, 2, t0 + 86_400);
+
+        let mut sink = ReplaySink::default();
+        let out = drain_recovered_seals_once(&mut sink, &spill, &dlq, 64, &|| true);
+        assert_eq!(out.files_archived, 0, "nothing archived on a suspect sink");
+        assert_eq!(out.files_left_pending, 2);
+        assert_eq!(out.files_held_sink_suspect, 2);
+        assert_eq!(out.seals_reingested, 0);
+        assert_eq!(sink.flushes, 0, "no flush into a suspect sink");
+        assert_eq!(count_bin(&spill.join(SEAL_REPLAYING_SUBDIR)), 2);
+
+        // Once the sink is clean the next drain re-ingests and archives both.
+        let out = drain_recovered_seals_once(&mut sink, &spill, &dlq, 64, &|| false);
+        assert_eq!(out.files_archived, 2);
+        assert_eq!(out.files_held_sink_suspect, 0);
+        assert_eq!(out.seals_reingested, 5);
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn test_regression_da13a_boot_drain_keeps_a_file_staged_when_the_sink_turns_suspect_after_its_flush()
+     {
+        let (spill, dlq) = temp_pair("da13a-suspect-after");
+        let writer = crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(spill.clone());
+        let t0 = jan1_noon_utc();
+        spill_range(&writer, 0, 3, t0);
+        spill_range(&writer, 10, 2, t0 + 86_400);
+
+        // Clean before the first file's flush, suspect when it is checked
+        // again before the archive.
+        let reads = std::cell::Cell::new(0u32);
+        let suspect = || {
+            reads.set(reads.get() + 1);
+            reads.get() > 1
+        };
+        let mut sink = ReplaySink::default();
+        let out = drain_recovered_seals_once(&mut sink, &spill, &dlq, 64, &suspect);
+        assert_eq!(sink.committed, vec![0, 1, 2], "the first file was flushed");
+        assert_eq!(
+            out.files_archived, 0,
+            "but not archived: the ack proves nothing"
+        );
+        assert_eq!(
+            out.seals_reingested, 0,
+            "acked seals are not counted as landed"
+        );
+        assert_eq!(out.seals_left_pending, 3);
+        assert_eq!(out.files_left_pending, 2);
+        assert_eq!(out.files_held_sink_suspect, 2);
+        assert_eq!(count_bin(&spill.join(SEAL_REPLAYING_SUBDIR)), 2);
+        cleanup(&spill, &dlq);
+    }
+
+    // Regression: 2026-10-13 — DA-13a. Any read error ended the staged spill
+    // walk like a clean end of file, so the prefix was re-ingested and the
+    // file archived as fully recovered.
+    #[test]
+    fn test_regression_da13a_read_staged_spill_returns_none_on_a_read_error() {
+        let (spill, dlq) = temp_pair("da13a-read-err");
+        // A directory opens on Linux and every read fails with EISDIR: a read
+        // error that is not `UnexpectedEof`.
+        let dir_path = spill.join("seals_v5-20260101.bin");
+        std::fs::create_dir_all(&dir_path).expect("mkdir");
+        assert!(read_staged_spill(&dir_path).is_none());
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn test_regression_da13a_read_staged_spill_still_stops_at_a_torn_tail() {
+        let (spill, dlq) = temp_pair("da13a-torn");
+        std::fs::create_dir_all(&spill).expect("mkdir");
+        let path = spill.join("seals_v5-20260101.bin");
+        let seal = SerializedSeal::from(&mk_seal(13, 0, TfIndex::M1, 7, 101.5));
+        let mut bytes = seal.to_bytes().to_vec();
+        bytes.extend_from_slice(&[0u8; SEAL_SPILL_RECORD_SIZE / 2]);
+        std::fs::write(&path, &bytes).expect("write");
+        let (records, undecodable) = read_staged_spill(&path).expect("torn tail is readable");
+        assert_eq!(records.len(), 1);
+        assert_eq!(undecodable, 0);
+        cleanup(&spill, &dlq);
+    }
+
+    // Regression: 2026-10-13 — DA-13a. A read error that does not advance the
+    // reader made `lines()` return it forever, so the boot drain spun before
+    // its first cycle. Run on a thread so a regression fails instead of hanging.
+    #[test]
+    fn test_regression_da13a_read_staged_dlq_returns_none_on_a_read_error_instead_of_spinning() {
+        let (spill, dlq) = temp_pair("da13a-dlq-err");
+        let dir_path = dlq.join("seals-dlq-20260101.ndjson");
+        std::fs::create_dir_all(&dir_path).expect("mkdir");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe = dir_path.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_staged_dlq(&probe).is_none());
+        });
+        let returned_none = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("read_staged_dlq must return, not spin on a read error");
+        assert!(returned_none);
+        cleanup(&spill, &dlq);
     }
 }

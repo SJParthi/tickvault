@@ -1713,6 +1713,7 @@ async fn async_main() -> Result<()> {
         metrics::counter!("tv_wal_prune_refused_not_uploaded_total", "dir" => dir).increment(0);
     }
     metrics::counter!("tv_seal_spill_prune_refused_not_uploaded_total").increment(0);
+    metrics::counter!("tv_seal_spill_unreplayed_deleted_with_copy_records_total").increment(0);
     metrics::counter!("tv_quarantine_prune_refused_not_uploaded_total").increment(0);
     metrics::counter!("tv_order_update_broadcast_drops_total").increment(0);
     for sink in ["app_log", "errors_jsonl"] {
