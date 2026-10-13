@@ -1796,6 +1796,16 @@ async fn async_main() -> Result<()> {
     metrics::counter!("tv_seal_spill_sync_failed_total").increment(0);
     metrics::counter!("tv_seal_unwritten_mark_errors_total").increment(0);
     metrics::counter!("tv_wal_deferred_depth_persist_failed_total").increment(0);
+    // DA-13d: pinned WAL segments deleted below the disk floor. Local /metrics only.
+    for copy_in_s3 in ["true", "false"] {
+        metrics::counter!(
+            tickvault_storage::ws_frame_spill::WAL_DEFERRED_DEPTH_LOST_COUNTER,
+            "copy_in_s3" => copy_in_s3
+        )
+        .increment(0);
+    }
+    // DA-13d: depth partitions the archiver held for the after-close pass.
+    tickvault_storage::partition_archive::count_depth_partitions_held(0);
     // The after-close depth pass stopping at its disk floor (2026-10-13).
     // Local /metrics only: no alarm or filter reads it.
     metrics::counter!("tv_wal_deferred_depth_pass_total", "outcome" => "disk_floor").increment(0);
