@@ -571,6 +571,17 @@ pub fn run_after_close_pass(
     // DROP and vanish with the partition. Waits for at most the one depth
     // partition an archive pass may have in flight. Held to the end of this
     // function; this runs on the pass's own OS thread, never an async one.
+    //
+    // Held through the lag pauses and the settle too, though nothing is
+    // written then, and deliberately: from here until the marks are cleared
+    // the pass still has rows to write into these partitions, so an export
+    // and DROP in a pause would leave those rows out of the S3 copy and the
+    // later rewrite would recreate a partition holding only them. The
+    // archivers read a hold as "stand aside", never as a failure: the daily
+    // leg refunds the attempt and retries, the disk-pressure leg neither
+    // counts the pass nor escalates (DA-13d review). The hold ends by the
+    // pass's own deadline (17:15 IST plus the settle), or earlier at its disk
+    // floor or a cancel.
     let _depth_partitions =
         tickvault_storage::partition_archive::hold_depth_partitions_for_rewrite();
     info!(

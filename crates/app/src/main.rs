@@ -1804,6 +1804,8 @@ async fn async_main() -> Result<()> {
         )
         .increment(0);
     }
+    // DA-13d: depth partitions the archiver held for the after-close pass.
+    tickvault_storage::partition_archive::count_depth_partitions_held(0);
     // The after-close depth pass stopping at its disk floor (2026-10-13).
     // Local /metrics only: no alarm or filter reads it.
     metrics::counter!("tv_wal_deferred_depth_pass_total", "outcome" => "disk_floor").increment(0);

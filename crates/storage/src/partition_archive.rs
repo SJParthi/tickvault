@@ -195,13 +195,21 @@ fn is_depth_rewrite_table(table: &str) -> bool {
 /// Counts one depth partition held because the after-close pass is writing.
 fn note_depth_partition_held(summary: &mut ArchiveRunSummary) {
     summary.held_deferred_depth = summary.held_deferred_depth.saturating_add(1);
+    count_depth_partitions_held(1);
+}
+
+/// Adds `n` to `tv_partition_archive_skipped_total{reason="deferred_depth_pass"}`
+/// (DA-13d). The ONE place the series' labels are written, so the boot seed
+/// (`n = 0`, from `main.rs`) and every hold land on the same series. Local
+/// `/metrics` only. O(1).
+pub fn count_depth_partitions_held(n: u64) {
     metrics::counter!(
         "tv_partition_archive_skipped_total",
         "reason" => "deferred_depth_pass",
         "cause" => "rewrite_in_flight",
         "stage" => "pre_export"
     )
-    .increment(1);
+    .increment(n);
 }
 
 /// Free-space level below which an archive pass is reported as WEDGED.

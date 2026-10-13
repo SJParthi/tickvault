@@ -488,7 +488,11 @@ async fn run_disk_pressure_loop(
                 crate::reclaim_signal::request_raw_upload();
 
                 metrics::counter!("tv_disk_pressure_passes_total").increment(1);
-                let dropped = run_one_pass(&questdb, &cfg).await;
+                let pass = run_one_pass(&questdb, &cfg).await;
+                let dropped = match pass {
+                    PressurePass::Dropped(n) => Some(n),
+                    PressurePass::NotRun | PressurePass::StoodAside => None,
+                };
                 if let Some(n) = dropped {
                     metrics::counter!("tv_disk_pressure_partitions_dropped_total").increment(n);
                     // A `warn!` beside the counter, not merely a counter
@@ -515,7 +519,7 @@ async fn run_disk_pressure_loop(
                          history to stay writable"
                     );
                 }
-                apply_action(&mut state, action, now_secs, dropped);
+                fold_pressure_pass(&mut state, action, now_secs, pass);
             }
             PressureAction::Escalate => {
                 // Escalation is the state where this matters MOST: the
@@ -551,13 +555,75 @@ async fn run_disk_pressure_loop(
     }
 }
 
-/// One archive pass. Returns the partitions dropped, or `None` when the pass
-/// could not run at all (no bucket resolvable, client build failure).
+/// What one pressure pass did, as the episode logic reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PressurePass {
+    /// The pass never happened (no bucket, client build failure, another pass
+    /// holds the archive guard, or the WAL probe failed closed).
+    NotRun,
+    /// DA-13d: the pass ran, dropped nothing, and held depth partitions
+    /// because the after-close depth pass is writing rows back into them.
+    /// Those partitions are reclaimable once that pass ends (at most
+    /// ~17:16 IST), so this is not "nothing left to reclaim".
+    StoodAside,
+    /// The pass ran and dropped this many partitions (`0` escalates).
+    Dropped(u64),
+}
+
+/// Reads an archive summary as a [`PressurePass`]. Pure, O(1).
 ///
-/// `None` and `Some(0)` are deliberately distinct: `Some(0)` means the pass
-/// ran and found nothing reclaimable, which escalates; `None` means the pass
-/// never happened, which should not be read as "nothing left to reclaim".
-async fn run_one_pass(questdb: &QuestDbConfig, cfg: &PartitionRetentionConfig) -> Option<u64> {
+/// A pass that dropped something counts as a pass even if it also held depth
+/// partitions: it reclaimed space, and the episode logic should see that.
+#[must_use]
+pub const fn classify_pressure_pass(
+    summary: &tickvault_storage::partition_archive::ArchiveRunSummary,
+) -> PressurePass {
+    if !summary.pass_ran {
+        return PressurePass::NotRun;
+    }
+    if summary.dropped == 0 && summary.held_deferred_depth > 0 {
+        return PressurePass::StoodAside;
+    }
+    // APPROVED: cast — u32 to u64 widening, lossless (`From` is not const).
+    PressurePass::Dropped(summary.dropped as u64)
+}
+
+/// Folds one pass's result into the episode state (DA-13d).
+///
+/// A stood-aside pass is NOT a pass: it opens the episode when this poll
+/// starts one (the volume is over high water, which is true), but counts no
+/// pass, records no drop, and spends no re-arm, so it can never reach
+/// `Escalate` and its STORAGE-GAP-05 page. The next poll runs another pass,
+/// and the first one after the depth pass releases its partitions counts
+/// normally.
+pub fn fold_pressure_pass(
+    state: &mut PressureState,
+    action: PressureAction,
+    now_secs: u64,
+    pass: PressurePass,
+) {
+    match pass {
+        PressurePass::Dropped(n) => apply_action(state, action, now_secs, Some(n)),
+        PressurePass::NotRun => apply_action(state, action, now_secs, None),
+        PressurePass::StoodAside => {
+            if matches!(action, PressureAction::StartEpisode) {
+                apply_action(state, action, now_secs, None);
+                if let Some(ep) = state.episode.as_mut() {
+                    ep.passes_used = 0;
+                }
+            }
+            // ContinuePass (and a re-arm): nothing changes.
+        }
+    }
+}
+
+/// One archive pass, read as a [`PressurePass`].
+///
+/// `NotRun` and `Dropped(0)` are deliberately distinct: `Dropped(0)` means
+/// the pass ran and found nothing reclaimable, which escalates; `NotRun`
+/// means the pass never happened, which should not be read as "nothing left
+/// to reclaim". `StoodAside` is neither (DA-13d).
+async fn run_one_pass(questdb: &QuestDbConfig, cfg: &PartitionRetentionConfig) -> PressurePass {
     let pressure_cfg = pressure_config(cfg);
     match PartitionArchiver::new(questdb, &pressure_cfg).await {
         Ok(Some(mut archiver)) => {
@@ -565,9 +631,9 @@ async fn run_one_pass(questdb: &QuestDbConfig, cfg: &PartitionRetentionConfig) -
             // The pass may have returned WITHOUT running — the daily leg holds
             // the concurrency guard, or the WAL probe failed closed. Both hand
             // back an all-zero summary, and `dropped == 0` is this function's
-            // escalation signal, so reporting it as `Some(0)` would raise a
+            // escalation signal, so reporting it as `Dropped(0)` would raise a
             // false STORAGE-GAP-05 Critical for a pass that never started.
-            // `None` is exactly the "never happened" case this function's own
+            // `NotRun` is exactly the "never happened" case this function's own
             // doc comment reserves.
             if !summary.pass_ran {
                 info!(
@@ -575,7 +641,7 @@ async fn run_one_pass(questdb: &QuestDbConfig, cfg: &PartitionRetentionConfig) -
                      archive guard, or the WAL probe failed closed) — reporting as \
                      not-run rather than as nothing-reclaimable"
                 );
-                return None;
+                return PressurePass::NotRun;
             }
             info!(
                 verified = summary.verified,
@@ -585,9 +651,10 @@ async fn run_one_pass(questdb: &QuestDbConfig, cfg: &PartitionRetentionConfig) -
                 tables_wal_not_applied = summary.tables_wal_not_applied,
                 rows_archived = summary.rows_archived,
                 gzip_bytes_uploaded = summary.gzip_bytes_uploaded,
+                held_deferred_depth = summary.held_deferred_depth,
                 "disk-pressure archive pass complete (every drop had a verified S3 copy)"
             );
-            Some(u64::from(summary.dropped))
+            classify_pressure_pass(&summary)
         }
         Ok(None) => {
             // No bucket resolvable. Archival is the ONLY way this loop frees
@@ -599,7 +666,7 @@ async fn run_one_pass(questdb: &QuestDbConfig, cfg: &PartitionRetentionConfig) -
                  [partition_retention] archive_bucket or TV_ENVIRONMENT) — no partition \
                  can be freed until this is fixed"
             );
-            None
+            PressurePass::NotRun
         }
         Err(err) => {
             error!(
@@ -607,7 +674,7 @@ async fn run_one_pass(questdb: &QuestDbConfig, cfg: &PartitionRetentionConfig) -
                 code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
                 "disk-pressure pass could not build the archiver — no partition touched"
             );
-            None
+            PressurePass::NotRun
         }
     }
 }
@@ -640,6 +707,60 @@ mod tests {
             pressure_hot_days: 2,
             ..PartitionRetentionConfig::default()
         }
+    }
+
+    // Regression: 2026-10-13 (DA-13d review) — a pressure pass that held
+    // every depth partition for the after-close depth pass dropped 0, read as
+    // "nothing reclaimable", and the next poll escalated: a false
+    // STORAGE-GAP-05 Critical, then an hour with no reclaim. A stood-aside
+    // pass must never escalate; a pass that genuinely dropped 0 still does.
+    #[test]
+    fn test_regression_da13d_held_depth_pass_never_escalates() {
+        use tickvault_storage::partition_archive::ArchiveRunSummary;
+        let held = ArchiveRunSummary {
+            pass_ran: true,
+            held_deferred_depth: 4,
+            ..ArchiveRunSummary::default()
+        };
+        assert_eq!(classify_pressure_pass(&held), PressurePass::StoodAside);
+        let held_and_dropped = ArchiveRunSummary { dropped: 2, ..held };
+        assert_eq!(
+            classify_pressure_pass(&held_and_dropped),
+            PressurePass::Dropped(2)
+        );
+        assert_eq!(
+            classify_pressure_pass(&ArchiveRunSummary::default()),
+            PressurePass::NotRun
+        );
+
+        let cfg = cfg();
+        let over = PressureProbe::used(cfg.pressure_high_water_pct.saturating_add(5).min(100));
+        let mut state = PressureState::default();
+        // Ninety polls: the depth pass's whole window at one poll a minute.
+        for poll in 0..90_u64 {
+            let action = decide_pressure_action(over, &state, &cfg, poll * 60);
+            assert!(
+                matches!(
+                    action,
+                    PressureAction::StartEpisode | PressureAction::ContinuePass
+                ),
+                "poll {poll}: a held depth pass must keep trying, got {action:?}"
+            );
+            fold_pressure_pass(&mut state, action, poll * 60, PressurePass::StoodAside);
+        }
+        let episode = state.episode.expect("the episode opened");
+        assert_eq!(episode.passes_used, 0, "a stood-aside pass is not a pass");
+        assert!(!episode.escalated);
+
+        // Once the depth pass is done, a pass that really drops 0 escalates
+        // exactly as before.
+        let action = decide_pressure_action(over, &state, &cfg, 90 * 60);
+        assert_eq!(action, PressureAction::ContinuePass);
+        fold_pressure_pass(&mut state, action, 90 * 60, PressurePass::Dropped(0));
+        assert_eq!(
+            decide_pressure_action(over, &state, &cfg, 91 * 60),
+            PressureAction::Escalate
+        );
     }
 
     #[test]
