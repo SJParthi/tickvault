@@ -57,11 +57,12 @@
 //! propagated error. A `Result` would force every aggregator call
 //! site to handle a failure that the design already absorbs.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
-use tracing::warn;
+use tickvault_common::error_code::ErrorCode;
+use tracing::{error, info, warn};
 
 use tickvault_trading::candles::{BufferOutcome, BufferedSeal, SealRing};
 
@@ -108,12 +109,49 @@ const _: () = assert!(
 
 /// Minimum gap between free-space probes, in seconds.
 ///
-/// `spill_free_bytes` makes a `statvfs` call (a forked `df` until 2026-10-12). `escalate_evicted` is reachable from the
-/// FRAME-DRAIN task and a ring-overflow episode calls it in a tight burst,
-/// so an unthrottled probe would spawn a process per seal on the one task
-/// that must never block. THAT is why this tier had no floor, and a floor
-/// added without the throttle would have been worse than none.
+/// `spill_free_bytes` makes a `statvfs` call (a forked `df` until
+/// 2026-10-12), and a ring-overflow episode or a failed flush calls
+/// `escalate_evicted` in a tight burst, so the answer is cached for this long.
+///
+/// ⚠ CORRECTED 2026-10-13 (deep audit DA-14, HOT-8): this said
+/// `escalate_evicted` "is reachable from the FRAME-DRAIN task". It is not.
+/// The pipeline is owned by [`crate::seal_writer_runner::SealWriterRunner`]
+/// and runs on the seal writer loop under `block_in_place`; the frame drain
+/// reaches the disk for a candle only through
+/// [`crate::seal_writer_runner::SealOverflow::escalate`], whose inline
+/// fallback is documented, timed and counted there. The throttle still
+/// matters: a burst of a thousand escalations costs one probe, not a
+/// thousand.
 const SEAL_DISK_PROBE_INTERVAL_SECS: i64 = 5;
+
+/// Label value of `tv_spill_free_probe_blind_total` for a seal escalation
+/// written without a free-space answer (deep audit DA-14). The tick and depth
+/// values are seeded by `seed_spill_free_probe_blind_counters`; this one is
+/// seeded with them.
+pub const SEAL_BLIND_PROBE_TIER: &str = "seal";
+
+/// Free bytes of the volume holding `dir`, probing the deepest EXISTING
+/// ancestor (deep audit DA-14).
+///
+/// `statvfs` on a path that does not exist fails, and the spill directory is
+/// created lazily by the first append, so probing it directly made the floor
+/// BLIND (fail open, uncounted) for every escalation until the first spill
+/// had created it — exactly the first seconds of a disk-full episode on a
+/// box whose spill folder was never needed before. The ancestor sits on the
+/// same mount unless something is mounted at the missing path itself, which
+/// cannot be, since it does not exist. O(path depth) `exists` checks plus one
+/// `statvfs`; called at most once per [`SEAL_DISK_PROBE_INTERVAL_SECS`].
+#[must_use]
+pub fn seal_free_bytes(dir: &Path) -> Option<u64> {
+    let mut probe = dir;
+    while !probe.exists() {
+        match probe.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => probe = parent,
+            _ => return spill_free_bytes(Path::new(".")),
+        }
+    }
+    spill_free_bytes(probe)
+}
 
 /// Outcome of [`SealAbsorptionPipeline::submit`]. Maps 1:1 to the
 /// counter label `tv_seal_absorption_total{tier=...}` the async writer
@@ -135,6 +173,12 @@ pub enum SubmitOutcome {
     /// forensic logging (the operator should inspect host disk/memory
     /// state before deciding how to recover).
     Dropped(BufferedSeal),
+    /// Not attempted: free space was below [`SEAL_ESCALATION_MIN_FREE_BYTES`],
+    /// so neither the spill nor the DLQ was written (deep audit DA-14). The
+    /// seal is lost exactly as with [`Self::Dropped`] and the caller pages
+    /// the same way; the separate variant is so the page can say WHY instead
+    /// of claiming "ring, spill and DLQ all failed" when nothing failed.
+    DroppedBelowFloor(BufferedSeal),
 }
 
 /// Three-tier absorption pipeline for sealed candles.
@@ -169,6 +213,18 @@ pub struct SealAbsorptionPipeline {
     /// IST-epoch second of the last probe. `i64::MIN` forces the first call
     /// to probe rather than trusting the sentinel above.
     last_probe_secs: AtomicI64,
+    /// The free-space probe. [`seal_free_bytes`] in production; a test swaps
+    /// in a fixed answer so the refuse arm can be driven without filling a
+    /// disk. A plain `fn` pointer: no allocation, one indirect call per probe.
+    free_probe: fn(&Path) -> Option<u64>,
+    /// Edge latch of the floor-refusal episode (deep audit DA-14): set by the
+    /// first refusal, cleared by the next escalation the floor lets through.
+    /// One coded line opens an episode and one closes it, instead of an
+    /// uncoded `warn!` per refused seal.
+    floor_refusing: AtomicBool,
+    /// Seals refused at the floor in the current episode, for the closing
+    /// line.
+    floor_refused_in_episode: AtomicU64,
 }
 
 impl SealAbsorptionPipeline {
@@ -182,6 +238,9 @@ impl SealAbsorptionPipeline {
             dlq: Arc::new(SealDlqWriter::new()),
             last_free_bytes: AtomicU64::new(u64::MAX),
             last_probe_secs: AtomicI64::new(i64::MIN),
+            free_probe: seal_free_bytes,
+            floor_refusing: AtomicBool::new(false),
+            floor_refused_in_episode: AtomicU64::new(0),
         }
     }
 
@@ -196,6 +255,9 @@ impl SealAbsorptionPipeline {
             dlq: Arc::new(SealDlqWriter::with_dlq_dir_for_test(dlq_dir)),
             last_free_bytes: AtomicU64::new(u64::MAX),
             last_probe_secs: AtomicI64::new(i64::MIN),
+            free_probe: seal_free_bytes,
+            floor_refusing: AtomicBool::new(false),
+            floor_refused_in_episode: AtomicU64::new(0),
         }
     }
 
@@ -215,6 +277,9 @@ impl SealAbsorptionPipeline {
             dlq: Arc::new(SealDlqWriter::with_dlq_dir_for_test(dlq_dir)),
             last_free_bytes: AtomicU64::new(u64::MAX),
             last_probe_secs: AtomicI64::new(i64::MIN),
+            free_probe: seal_free_bytes,
+            floor_refusing: AtomicBool::new(false),
+            floor_refused_in_episode: AtomicU64::new(0),
         }
     }
 
@@ -302,16 +367,45 @@ impl SealAbsorptionPipeline {
     /// start discarding candles. Depth can afford the opposite default
     /// because a depth row is a record, not a decision input.
     fn has_room_to_escalate(&self, payload_len: u64, now_unix_secs: i64) -> bool {
+        let free = self.free_bytes_throttled(now_unix_secs);
+        match classify_spill_floor(
+            free,
+            payload_len,
+            SEAL_ESCALATION_MIN_FREE_BYTES,
+            BlindWritePolicy::FailOpen,
+        ) {
+            SpillFloorVerdict::Allow => true,
+            SpillFloorVerdict::AllowProbeFailed => {
+                // Deep audit DA-14: a seal written without a free-space
+                // answer is counted, as the tick tier's blind writes are.
+                metrics::counter!("tv_spill_free_probe_blind_total", "tier" => SEAL_BLIND_PROBE_TIER)
+                    .increment(1);
+                true
+            }
+            SpillFloorVerdict::RefuseNoRoom | SpillFloorVerdict::RefuseProbeFailed => false,
+        }
+    }
+
+    /// Free bytes, from the cache unless a probe is due.
+    ///
+    /// A probe is due when [`SEAL_DISK_PROBE_INTERVAL_SECS`] have passed since
+    /// the last one, OR when the clock now reads EARLIER than the last probe
+    /// (deep audit DA-14). Before, a backward clock step froze the cached
+    /// verdict until the clock caught up with the stamp: a step back of one
+    /// hour taken right after a probe that read the disk below the floor kept
+    /// refusing every seal for that hour, whatever was freed meanwhile.
+    fn free_bytes_throttled(&self, now_unix_secs: i64) -> Option<u64> {
         let last = self.last_probe_secs.load(Ordering::Relaxed);
-        let due = now_unix_secs.saturating_sub(last) >= SEAL_DISK_PROBE_INTERVAL_SECS;
-        let free = if due {
+        let due = now_unix_secs < last
+            || now_unix_secs.saturating_sub(last) >= SEAL_DISK_PROBE_INTERVAL_SECS;
+        if due {
             // Store the probe TIME before the value: a concurrent caller that
             // sees the new time and the old value re-uses a verdict at most
             // one interval stale, which is the same guarantee a single
             // caller gets. The inverse order could let every racing caller
             // decide it is due and probe in lockstep.
             self.last_probe_secs.store(now_unix_secs, Ordering::Relaxed);
-            let probed = spill_free_bytes(self.spill.spill_dir());
+            let probed = (self.free_probe)(self.spill.spill_dir());
             self.last_free_bytes
                 .store(probed.unwrap_or(u64::MAX), Ordering::Relaxed);
             probed
@@ -320,17 +414,61 @@ impl SealAbsorptionPipeline {
                 u64::MAX => None,
                 bytes => Some(bytes),
             }
-        };
-
-        match classify_spill_floor(
-            free,
-            payload_len,
-            SEAL_ESCALATION_MIN_FREE_BYTES,
-            BlindWritePolicy::FailOpen,
-        ) {
-            SpillFloorVerdict::Allow | SpillFloorVerdict::AllowProbeFailed => true,
-            SpillFloorVerdict::RefuseNoRoom | SpillFloorVerdict::RefuseProbeFailed => false,
         }
+    }
+
+    /// Counts one floor refusal and, on the first of an episode, logs it.
+    /// O(1): one counter add, two atomics; the coded line runs once per
+    /// episode, never per seal.
+    fn note_floor_refusal(&self, evicted: &BufferedSeal) {
+        // Each refusal is also a drop, counted on the paged
+        // `tv_seal_writer_drain_dropped_total`; this counter says WHY. Local
+        // `/metrics` only (no EMF name, no alarm), registered at 0 at boot.
+        metrics::counter!("tv_seal_floor_refused_total").increment(1);
+        self.floor_refused_in_episode
+            .fetch_add(1, Ordering::Relaxed);
+        if !self.floor_refusing.swap(true, Ordering::Relaxed) {
+            let free_bytes = match self.last_free_bytes.load(Ordering::Relaxed) {
+                u64::MAX => None,
+                bytes => Some(bytes),
+            };
+            error!(
+                code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                source = "seal_floor_refused",
+                security_id = evicted.security_id,
+                exchange_segment_code = evicted.exchange_segment_code,
+                ?free_bytes,
+                floor_bytes = SEAL_ESCALATION_MIN_FREE_BYTES,
+                "sealed candles are being refused at the disk floor: free space is below \
+                 the seal floor, so neither the spill nor the DLQ is written (both are on \
+                 the same volume as QuestDB). Every refused candle is lost and counted on \
+                 tv_seal_floor_refused_total; this line opens the episode and one info \
+                 line closes it. Free disk space on the data volume."
+            );
+        }
+    }
+
+    /// Closes a floor-refusal episode when an escalation is let through.
+    /// One relaxed load in the common case.
+    fn note_floor_cleared(&self) {
+        if self.floor_refusing.load(Ordering::Relaxed)
+            && self.floor_refusing.swap(false, Ordering::Relaxed)
+        {
+            let refused = self.floor_refused_in_episode.swap(0, Ordering::Relaxed);
+            info!(
+                source = "seal_floor_refused",
+                refused,
+                "seal escalation is writing to disk again: free space is back above the seal \
+                 floor; candles refused in the episode: refused"
+            );
+        }
+    }
+
+    /// Test hook: replace the free-space probe with a fixed answer.
+    #[cfg(test)]
+    // TEST-EXEMPT: test-only hook, used by the DA-14 floor regression tests in this module and in seal_writer_task
+    pub(crate) fn set_free_probe_for_test(&mut self, probe: fn(&Path) -> Option<u64>) {
+        self.free_probe = probe;
     }
 
     /// Tier 2 + tier 3 escalation chain for an evicted seal.
@@ -349,18 +487,19 @@ impl SealAbsorptionPipeline {
         // suspended fifteen tables and left the box unreachable over SSM.
         // The loss is LOUD — `Dropped` is what makes the caller fire
         // AGGREGATOR-DROP-01, which is alarmed.
+        //
+        // Deep audit DA-14: the refusal is its own outcome
+        // (`DroppedBelowFloor`), counted per seal on
+        // `tv_seal_floor_refused_total`, and logged ONCE per episode with a
+        // code. Before, every refused seal logged an uncoded `warn!` (a ring
+        // overflow at the floor is one line per seal, up to the ring's
+        // capacity), and the cycle's page then said "ring+spill+DLQ all
+        // failed" about seals nothing had even tried to write.
         if !self.has_room_to_escalate(serialised.to_bytes().len() as u64, now_unix_secs) {
-            warn!(
-                security_id = evicted.security_id,
-                exchange_segment_code = evicted.exchange_segment_code,
-                floor_bytes = SEAL_ESCALATION_MIN_FREE_BYTES,
-                "refusing seal escalation: free space is below the seal floor — \
-                 spilling would take the volume closer to the state that stalls \
-                 QuestDB, and the DLQ is on the same volume. Caller MUST fire \
-                 AGGREGATOR-DROP-01"
-            );
-            return SubmitOutcome::Dropped(evicted);
+            self.note_floor_refusal(&evicted);
+            return SubmitOutcome::DroppedBelowFloor(evicted);
         }
+        self.note_floor_cleared();
         match self.spill.append_seal(&serialised, now_unix_secs) {
             Ok(()) => SubmitOutcome::Spilled,
             Err(spill_err) => {
@@ -1004,7 +1143,9 @@ mod tests {
 
     #[test]
     fn has_room_to_escalate_fails_open_when_the_probe_cannot_answer() {
-        // A directory that does not exist: `spill_free_bytes` returns None.
+        // A probe that cannot answer. (Before DA-14 this used a missing
+        // directory; the probe now reads its nearest existing ancestor, so a
+        // missing directory is no longer blind and the failure is injected.)
         // Blind must ALLOW here — unlike depth — because a refused seal is a
         // candle that exists nowhere else, and one failed free-space probe must never be
         // able to start discarding candles.
@@ -1016,7 +1157,8 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&missing);
         let dlq = missing.join("dlq");
-        let pipeline = SealAbsorptionPipeline::with_dirs_for_test(missing.clone(), dlq);
+        let mut pipeline = SealAbsorptionPipeline::with_dirs_for_test(missing.clone(), dlq);
+        pipeline.set_free_probe_for_test(|_| None);
         assert!(
             pipeline.has_room_to_escalate(128, 1_000),
             "a blind probe must fail OPEN for the seal tier"
@@ -1166,5 +1308,111 @@ mod tests {
         assert!(!p.spill_handle().has_unsynced_writes());
         assert!(!p.dlq_handle().has_unsynced_writes());
         cleanup(&spill, &dlq);
+    }
+
+    // ---- deep audit DA-14: the candle disk floor says why ----------------
+
+    const LOW_FREE: u64 = 1024 * 1024 * 1024; // 1 GiB, below the 4 GiB floor
+    const HIGH_FREE: u64 = 64 * 1024 * 1024 * 1024; // 64 GiB, well above it
+
+    /// A ring eviction refused at the floor is `DroppedBelowFloor`, not the
+    /// `Dropped` that means "spill and DLQ both failed", and the episode
+    /// latch opens on it and closes on the next escalation let through.
+    #[test]
+    fn test_regression_da14_floor_refusal_is_its_own_outcome_and_closes() {
+        let (spill, dlq) = temp_pair("da14-floor-outcome");
+        let mut p =
+            SealAbsorptionPipeline::with_capacity_and_dirs_for_test(1, spill.clone(), dlq.clone());
+        p.set_free_probe_for_test(|_| Some(LOW_FREE));
+        let now = jan1_noon_utc();
+        let s1 = mk_buffered_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0);
+        let s2 = mk_buffered_seal(25, 0, TfIndex::M1, 1_716_024_300, 200.0);
+        let s3 = mk_buffered_seal(51, 0, TfIndex::M1, 1_716_024_900, 300.0);
+        assert_eq!(p.submit(s1, now), SubmitOutcome::Buffered);
+        match p.submit(s2, now) {
+            SubmitOutcome::DroppedBelowFloor(lost) => assert_eq!(lost.security_id, 13),
+            other => panic!("a floor refusal must say so, got {other:?}"),
+        }
+        assert!(
+            p.floor_refusing.load(Ordering::Relaxed),
+            "the episode opened"
+        );
+        assert_eq!(p.floor_refused_in_episode.load(Ordering::Relaxed), 1);
+        // Nothing was written: the floor refuses before either tier.
+        let writer = SealSpillWriter::with_spill_dir_for_test(spill.clone());
+        assert!(writer.read_all(now).expect("read spill").is_empty());
+
+        // Space comes back; the next probe (one interval later) lets the
+        // eviction through and closes the episode.
+        p.set_free_probe_for_test(|_| Some(HIGH_FREE));
+        let later = now + SEAL_DISK_PROBE_INTERVAL_SECS;
+        assert_eq!(p.submit(s3, later), SubmitOutcome::Spilled);
+        assert!(
+            !p.floor_refusing.load(Ordering::Relaxed),
+            "the episode closed"
+        );
+        assert_eq!(p.floor_refused_in_episode.load(Ordering::Relaxed), 0);
+        cleanup(&spill, &dlq);
+    }
+
+    /// A backward clock step must not freeze a cached "below the floor"
+    /// verdict until the clock catches up with the last probe.
+    #[test]
+    fn test_regression_da14_backward_clock_step_probes_again() {
+        let (spill, dlq) = temp_pair("da14-clock-step");
+        let mut p = SealAbsorptionPipeline::with_dirs_for_test(spill.clone(), dlq.clone());
+        p.set_free_probe_for_test(|_| Some(LOW_FREE));
+        assert!(
+            !p.has_room_to_escalate(128, 10_000),
+            "below the floor: refused"
+        );
+        p.set_free_probe_for_test(|_| Some(HIGH_FREE));
+        // The clock stepped back an hour. The disk now has room, and the
+        // floor must see it rather than reuse the verdict stamped at 10_000.
+        assert!(
+            p.has_room_to_escalate(128, 10_000 - 3_600),
+            "a clock that reads earlier than the last probe must probe again"
+        );
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn test_set_free_probe_for_test_replaces_the_probe() {
+        let (spill, dlq) = temp_pair("da14-probe-hook");
+        let mut p = SealAbsorptionPipeline::with_dirs_for_test(spill.clone(), dlq.clone());
+        p.set_free_probe_for_test(|_| Some(7));
+        assert_eq!(p.free_bytes_throttled(1_000), Some(7));
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn test_seal_free_bytes_answers_for_an_existing_dir() {
+        assert!(seal_free_bytes(&std::env::temp_dir()).is_some());
+    }
+
+    /// The production probe reads the nearest existing ancestor, so a spill
+    /// folder not created yet does not make the floor blind.
+    #[test]
+    fn test_regression_da14_probe_of_a_missing_spill_dir_is_not_blind() {
+        let mut missing = std::env::temp_dir();
+        missing.push(format!(
+            "tickvault-da14-missing-{}/spill/seals",
+            std::process::id()
+        ));
+        assert!(!missing.exists());
+        assert!(
+            seal_free_bytes(&missing).is_some(),
+            "a spill folder that does not exist yet must be probed through its \
+             nearest existing ancestor, not read as a failed probe"
+        );
+        let p = SealAbsorptionPipeline::with_dirs_for_test(missing.clone(), missing.join("dlq"));
+        // The verdict depends on this host's free space; only the probe's
+        // blindness is under test.
+        let _ = p.has_room_to_escalate(128, 1_000);
+        assert_ne!(
+            p.last_free_bytes.load(Ordering::Relaxed),
+            u64::MAX,
+            "the pipeline's own probe of a missing spill folder must not be blind"
+        );
     }
 }

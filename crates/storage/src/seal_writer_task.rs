@@ -84,6 +84,11 @@ pub struct DrainOutcome {
     /// `error!(code = ErrorCode::AggregatorDrop01.code_str(), …)`
     /// per the AGGREGATOR-DROP-01 runbook for each.
     pub rescued_dropped: usize,
+    /// Of `rescued_dropped`, how many were refused at the seal disk floor
+    /// (`SubmitOutcome::DroppedBelowFloor`) rather than lost to two failed
+    /// writes (deep audit DA-14). A SUBSET, so the dropped total and its page
+    /// are unchanged; this says why.
+    pub rescued_dropped_below_floor: usize,
 }
 
 impl DrainOutcome {
@@ -102,7 +107,7 @@ impl DrainOutcome {
     /// the false-OK this codebase keeps having to remove.
     ///
     /// # Complexity
-    /// O(1) — five saturating adds and a boolean.
+    /// O(1) — six saturating adds and a boolean.
     pub const fn accumulate(&mut self, other: &Self) {
         self.ring_seals_popped = self
             .ring_seals_popped
@@ -111,6 +116,9 @@ impl DrainOutcome {
         self.rescued_to_spill = self.rescued_to_spill.saturating_add(other.rescued_to_spill);
         self.rescued_to_dlq = self.rescued_to_dlq.saturating_add(other.rescued_to_dlq);
         self.rescued_dropped = self.rescued_dropped.saturating_add(other.rescued_dropped);
+        self.rescued_dropped_below_floor = self
+            .rescued_dropped_below_floor
+            .saturating_add(other.rescued_dropped_below_floor);
     }
 
     /// `true` if any seals were rescued to spill / DLQ / dropped
@@ -289,6 +297,10 @@ fn rescue_one(
         SubmitOutcome::Spilled => outcome.rescued_to_spill += 1,
         SubmitOutcome::DlqWritten => outcome.rescued_to_dlq += 1,
         SubmitOutcome::Dropped(_) => outcome.rescued_dropped += 1,
+        SubmitOutcome::DroppedBelowFloor(_) => {
+            outcome.rescued_dropped += 1;
+            outcome.rescued_dropped_below_floor += 1;
+        }
         // SubmitOutcome::Buffered cannot occur via rescue_in_flight
         // (it skips the ring). If it ever does, treat as a logic
         // bug and surface for triage; for now we count nothing.
@@ -3081,6 +3093,34 @@ mod tests {
             crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(spill.clone());
         let drained = spill_writer.read_all(now).expect("read");
         assert_eq!(drained.len(), 5);
+        cleanup(&spill, &dlq);
+    }
+
+    /// Deep audit DA-14: a flush-failure rescue refused at the seal disk
+    /// floor is counted as a drop AND as a floor refusal, so the cycle page
+    /// can say the disk is full rather than that two writes failed.
+    #[test]
+    fn test_regression_da14_rescue_refused_at_the_floor_is_counted_as_such() {
+        let (spill, dlq) = temp_pair("da14-rescue-floor");
+        let mut pipeline =
+            SealAbsorptionPipeline::with_capacity_and_dirs_for_test(8, spill.clone(), dlq.clone());
+        pipeline.set_free_probe_for_test(|_| Some(1024 * 1024 * 1024));
+        let now = jan1_noon_utc();
+        for i in 0..5 {
+            pipeline.submit(
+                mk_seal(13 + i, 0, TfIndex::M1, 1_716_023_700 + i as u32, 100.0),
+                now,
+            );
+        }
+        let mut writer = ShadowCandleWriter::for_test();
+        let outcome = drain_once(&mut pipeline, &mut writer, 16, now);
+        assert!(!outcome.flushed_ok);
+        assert_eq!(outcome.rescued_dropped, 5, "every refusal is still a drop");
+        assert_eq!(
+            outcome.rescued_dropped_below_floor, 5,
+            "and each one is counted as refused at the floor"
+        );
+        assert_eq!(outcome.rescued_to_spill + outcome.rescued_to_dlq, 0);
         cleanup(&spill, &dlq);
     }
 

@@ -1031,7 +1031,8 @@ const _: () = assert!(
      defences disagree about which lane gives way first."
 );
 
-/// Pre-register both `tier` label values of `tv_spill_free_probe_blind_total`
+/// Pre-register the three `tier` label values (tick, depth, and since deep
+/// audit DA-14 seal) of `tv_spill_free_probe_blind_total`
 /// at 0.
 ///
 /// That counter records rescues written WITHOUT a free-space answer, because
@@ -1052,6 +1053,8 @@ const _: () = assert!(
 pub fn seed_spill_free_probe_blind_counters() {
     metrics::counter!("tv_spill_free_probe_blind_total", "tier" => "tick").increment(0);
     metrics::counter!("tv_spill_free_probe_blind_total", "tier" => "depth").increment(0);
+    // Deep audit DA-14: the seal escalation floor's blind writes.
+    metrics::counter!("tv_spill_free_probe_blind_total", "tier" => "seal").increment(0);
 }
 
 // THE CROSS-KIND ASSERT — the one whose absence let the inversion through.
@@ -7355,7 +7358,7 @@ mod tests {
             ))
             .map(|(_, rest)| rest.split_once("\n}").map_or(rest, |(b, _)| b))
             .unwrap_or_default();
-        for tier in ["\"tick\"", "\"depth\""] {
+        for tier in ["\"tick\"", "\"depth\"", "\"seal\""] {
             assert!(
                 body.contains(tier),
                 "the seeding function does not register the {tier} tier — the \
@@ -7365,8 +7368,8 @@ mod tests {
         }
         assert_eq!(
             body.matches("increment(0)").count(),
-            2,
-            "expected exactly two seeded label sets"
+            3,
+            "expected exactly three seeded label sets (tick, depth, seal)"
         );
     }
 

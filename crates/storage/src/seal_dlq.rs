@@ -13,8 +13,10 @@
 //!   what was lost. NDJSON is the canonical text-streaming format
 //!   matching the existing `data/logs/errors.jsonl.*` rotation.
 //! - **Append-only single-line records.** A partial trailing line on
-//!   crash is silently dropped during replay (the `serde_json::from_str`
-//!   on the corrupt line returns `Err` and the reader skips it).
+//!   crash is refused during replay (the `serde_json::from_str` on the
+//!   corrupt line returns `Err`; the reader counts it and skips it). Deep
+//!   audit DA-14: the next append first closes such a line with a newline,
+//!   so it cannot glue itself to the next record and take that one too.
 //! - **Forward-compatible.** Adding a new field to `SealDlqRecord`
 //!   produces a JSON object with one extra key; older replay code
 //!   that doesn't know about it ignores via `#[serde(default)]`.
@@ -46,7 +48,7 @@
 //! = operator-action-required; the host is OOM AND out of disk AND
 //! the `data/dlq/` directory is unwritable.
 
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -261,6 +263,24 @@ fn ist_date_filename(now_unix_secs: i64) -> String {
 /// Counter for a failed DLQ sync, one series per `reason`.
 pub const SEAL_DLQ_SYNC_FAILED_COUNTER: &str = "tv_seal_dlq_sync_failed_total";
 
+/// Torn last lines the DLQ closed with a newline before appending (deep audit
+/// DA-14): each is one line a process died writing, which the replay refuses
+/// and counts. Local `/metrics` only, registered at 0 at boot.
+pub const SEAL_DLQ_TORN_LINE_CLOSED_COUNTER: &str = "tv_seal_dlq_torn_line_closed_total";
+
+/// Whether `file` ends with a newline. One seek and a 1-byte read; an empty
+/// file counts as ending cleanly. The append position is unaffected: the file
+/// is opened in append mode, so every write still lands at the end.
+fn ends_with_newline(file: &mut std::fs::File) -> std::io::Result<bool> {
+    if file.seek(SeekFrom::End(0))? == 0 {
+        return Ok(true);
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last)?;
+    Ok(last[0] == b'\n')
+}
+
 /// Append-only NDJSON DLQ writer. One instance lives in the writer
 /// task; `append_record` is the single producer entry point.
 pub struct SealDlqWriter {
@@ -423,7 +443,8 @@ impl SealDlqWriter {
 
     /// Append one record to the daily DLQ file as a single NDJSON
     /// line (`{...}\n`). Creates the DLQ directory + file if needed.
-    /// O(1) per call; uses `BufWriter` to coalesce small writes.
+    /// O(1) per call: one open, one `fstat`, one seek and 1-byte read of the
+    /// last byte, and one `write(2)` of the whole line.
     ///
     /// Per locked decision L-C1, this is the THIRD tier of the
     /// ring → spill → DLQ chain. If THIS append also fails, the
@@ -435,34 +456,69 @@ impl SealDlqWriter {
         std::fs::create_dir_all(&self.dlq_dir)
             .with_context(|| format!("failed to create dlq dir {:?}", self.dlq_dir))?;
         let path = self.dlq_path(now_unix_secs);
-        let file = std::fs::OpenOptions::new()
+        // Read access too (deep audit DA-14): the last byte is checked below.
+        // `append` still puts every write at the end, whatever the position.
+        let mut file = std::fs::OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .open(&path)
             .with_context(|| format!("failed to open dlq file {path:?}"))?;
+        let before = file
+            .metadata()
+            .with_context(|| format!("failed to stat dlq file {path:?}"))?
+            .len();
         // An empty file was (almost always) just created: its directory entry
         // must reach the device too. A false positive costs one extra
         // directory sync. Recorded before the write so a write that fails
         // after a partial line still gets that line synced.
-        let created_file = file.metadata().map_or(true, |meta| meta.len() == 0);
+        let created_file = before == 0;
         {
             let mut unsynced = self.lock_unsynced();
             unsynced.note_day(now_unix_secs);
             unsynced.dir |= created_file;
             unsynced.parent |= created_dir;
         }
-        let mut writer = BufWriter::new(file);
-        let line = serde_json::to_string(record)
+        // Deep audit DA-14 (CRASH-1 partial): a file that does not end in a
+        // newline ends in a line a process died writing. Appending straight
+        // after it glued the NEXT record onto that fragment, so the replay
+        // refused both as one undecodable line and lost a record this call had
+        // reported written. The fragment is closed with a newline first: it
+        // stays a refused line on its own, and the record below stays whole.
+        // One seek and one 1-byte read per append; the DLQ is the last tier
+        // of a failure path, never the steady state.
+        if before > 0 && !ends_with_newline(&mut file)? {
+            file.write_all(b"\n")
+                .with_context(|| format!("failed to close a torn dlq line in {path:?}"))?;
+            metrics::counter!(SEAL_DLQ_TORN_LINE_CLOSED_COUNTER).increment(1);
+            error!(
+                code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                source = "seal_dlq_torn_line",
+                ?path,
+                "seal DLQ: the file ended in a partial line (a process died mid-write); \
+                 it is closed with a newline so the next record is not glued to it. The \
+                 partial line is one candle the replay will refuse and count"
+            );
+        }
+        let mut line = serde_json::to_string(record)
             .with_context(|| "failed to serialise SealDlqRecord to JSON")?;
-        writer
-            .write_all(line.as_bytes())
-            .with_context(|| format!("failed to write dlq line to {path:?}"))?;
-        writer
-            .write_all(b"\n")
-            .with_context(|| format!("failed to write dlq newline to {path:?}"))?;
-        writer
-            .flush()
-            .with_context(|| format!("failed to flush dlq line to {path:?}"))?;
+        line.push('\n');
+        // One write of the whole line. On failure the file is cut back to its
+        // length before this call (deep audit DA-14), so a line the disk took
+        // only part of is not left behind for the next record to glue onto.
+        if let Err(err) = file.write_all(line.as_bytes()) {
+            let cut = file.set_len(before);
+            return match cut {
+                Ok(()) => Err(err)
+                    .with_context(|| format!("failed to write dlq line to {path:?} (cut back)")),
+                Err(cut_err) => Err(err).with_context(|| {
+                    format!(
+                        "failed to write dlq line to {path:?}; cutting the partial line back \
+                         ALSO failed ({cut_err}); the next append closes it with a newline"
+                    )
+                }),
+            };
+        }
         Ok(())
     }
 
@@ -1137,6 +1193,44 @@ mod tests {
         assert_eq!(drained.len(), 2, "corrupt line must NOT stall replay");
         assert_eq!(drained[0], r1);
         assert_eq!(drained[1], r2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Deep audit DA-14 (CRASH-1 partial): a DLQ file left ending in a
+    /// partial line (a process died mid-write) must not swallow the next
+    /// record. Before, the next append glued itself onto the fragment and the
+    /// replay refused both as one line: a record reported written was lost.
+    #[test]
+    fn test_regression_da14_torn_last_line_does_not_swallow_the_next_record() {
+        let dir = temp_dlq_dir("da14-torn-line");
+        let writer = SealDlqWriter::with_dlq_dir_for_test(dir.clone());
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
+            .single()
+            .expect("valid")
+            .timestamp();
+        let r1 = SealDlqRecord::from(&mk_serialized_seal(13, 0, 0, 1_716_000_900, 100.0));
+        let r2 = SealDlqRecord::from(&mk_serialized_seal(25, 0, 4, 1_716_001_500, 200.0));
+        writer.append_record(&r1, now).expect("append r1");
+        // The crash: half a JSON line, no newline.
+        let path = writer.dlq_path(now);
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("open append");
+            f.write_all(b"{\"security_id\":51,\"exchange_seg")
+                .expect("write torn line");
+        }
+        writer.append_record(&r2, now).expect("append r2");
+        let drained = writer.read_all(now).expect("read");
+        assert_eq!(
+            drained,
+            vec![r1, r2],
+            "the record appended after the tear must survive whole"
+        );
+        let text = std::fs::read_to_string(&path).expect("read text");
+        assert_eq!(text.lines().count(), 3, "r1, the closed fragment, r2");
         let _ = std::fs::remove_dir_all(dir);
     }
 
