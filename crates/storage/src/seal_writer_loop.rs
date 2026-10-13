@@ -244,12 +244,31 @@ fn record_cycle_observability(outcome: &CycleOutcome, dropped_this_cycle: u64) {
         // dominated by successes, and a `>= 1` threshold on it would fire on
         // every healthy cycle. A drop needs its own name to be visible at all.
         metrics::counter!("tv_seal_writer_drain_dropped_total").increment(dropped_this_cycle);
-        // DLQ all failed) MUST fire AGGREGATOR-DROP-01 — silent data loss
-        // for a sealed candle is the ONLY thing this code path can mean.
+        // Deep audit DA-14: a drop has two causes and the page must say
+        // which. `dropped_below_floor` is a subset of the drop count: seals
+        // the chain refused because free space was below the seal floor, with
+        // no write attempted. The rest are seals the spill AND the DLQ both
+        // failed to write. Before, every drop was reported as "ring+spill+DLQ
+        // all failed", which sent the operator looking for a broken disk when
+        // the disk was merely full.
+        let dropped_below_floor = (outcome.mpsc_submit_dropped_below_floor
+            + outcome.drain.rescued_dropped_below_floor) as u64;
+        let dropped_tiers_failed = dropped_this_cycle.saturating_sub(dropped_below_floor);
+        if dropped_below_floor > 0 {
+            metrics::counter!("tv_seal_writer_drain_total", "kind" => "dropped_below_floor")
+                .increment(dropped_below_floor);
+        }
+        // Silent data loss for a sealed candle is the ONLY thing this code
+        // path can mean, so it MUST fire AGGREGATOR-DROP-01.
         error!(
             code = ErrorCode::AggregatorDrop01.code_str(),
             dropped = dropped_this_cycle,
-            "sealed candles DROPPED after ring+spill+DLQ all failed — see AGGREGATOR-DROP-01 runbook"
+            dropped_below_floor,
+            dropped_tiers_failed,
+            "sealed candles DROPPED: dropped_below_floor were refused because free disk \
+             space is below the seal floor (nothing was written; free space on the data \
+             volume), dropped_tiers_failed were lost after the spill and the DLQ both \
+             failed to write — see AGGREGATOR-DROP-01 runbook"
         );
     }
 }

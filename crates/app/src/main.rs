@@ -1584,6 +1584,14 @@ async fn async_main() -> Result<()> {
     // (source-order scan of this file):
     // crates/app/tests/seal_drop_paging_wiring_guard.rs.
     metrics::counter!("tv_seal_writer_drain_total", "kind" => "dropped").increment(0);
+    // Deep audit DA-14: why a sealed candle was dropped or a disk file was
+    // repaired. Local `/metrics` only (no EMF name, no alarm); registered
+    // at 0 so the first increment is a delta, not the baseline. The drops
+    // themselves still page through `kind="dropped"` above.
+    metrics::counter!("tv_seal_writer_drain_total", "kind" => "dropped_below_floor").increment(0);
+    metrics::counter!("tv_seal_floor_refused_total").increment(0);
+    metrics::counter!("tv_seal_spill_torn_tail_cut_total").increment(0);
+    metrics::counter!(tickvault_storage::seal_dlq::SEAL_DLQ_TORN_LINE_CLOSED_COUNTER).increment(0);
     // Seal-spill retention (DA-13a, 2026-10-13): records of never-replayed
     // spill files the sweep deleted because a verified cold copy exists. A
     // sibling of the seal-writer counter above, NOT one of the paged
@@ -5706,9 +5714,17 @@ async fn run_process_runloop(
                     error!(
                         code = tickvault_common::error_code::ErrorCode::AggregatorDrop01.code_str(),
                         dropped = outcome.mpsc_submit_dropped,
+                        // Deep audit DA-14 review: why. A floor refusal wrote
+                        // nothing; the rest failed both disk writes.
+                        dropped_below_floor = outcome.mpsc_submit_dropped_below_floor,
+                        dropped_tiers_failed = outcome
+                            .mpsc_submit_dropped
+                            .saturating_sub(outcome.mpsc_submit_dropped_below_floor),
                         submitted = outcome.submitted_from_mpsc,
-                        "seal writer: seals were DROPPED on the final drain — all three \
-                         absorption tiers failed; these candles are gone"
+                        "seal writer: seals were DROPPED on the final drain: \
+                         dropped_below_floor were refused because free disk space is below the \
+                         seal floor (nothing was written), dropped_tiers_failed were lost after \
+                         the spill and the DLQ both failed; these candles are gone"
                     );
                 }
                 info!(
