@@ -3043,7 +3043,14 @@ and a call site; shell may only shrink. One PR per item, serial.
     never-replayed files deleted with a cold copy apart
     (`deleted_unreplayed_with_copy`, `records_unreplayed_with_copy`,
     `tv_seal_spill_unreplayed_deleted_with_copy_records_total`, coded STORAGE-GAP-04 line,
-    log-only) and calls only truly empty files empty.
+    log-only) and calls only truly empty files empty. **Review round (2026-10-13, 44-agent
+    attack + refuters, 10 confirmed):** the boot drain ran before the watcher had ever probed, so
+    its gate almost never fired. `AppliedWatermark::mark_probe_expected` is set before the seal
+    writer starts; while a watcher is expected or running, a boot-flushed file is handed to the
+    mid-session replay's awaiting list (`drain_recovered_seals_for_replay`, `adopt_boot_flushed`)
+    and archived only after two clean probes behind its last flush
+    (`files_awaiting_confirm`, `seals_awaiting_confirm`, `kind="boot_awaiting_confirm"`); the
+    mid-session replay gets the same startup fix through `ReplayProbe::is_running`.
   - [ ] **DA-13b — tick and depth spill replay.** The live hour file's half-written last line is
     posted and resumed mid-line; a 2xx from a suspended table truncates the only local copy; the
     live file is chosen by name order (a clock step); a drained live file is never emptied after
