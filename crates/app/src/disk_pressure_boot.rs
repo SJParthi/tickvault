@@ -233,6 +233,8 @@ async fn run_disk_pressure_loop(
     cfg: PartitionRetentionConfig,
 ) {
     let mut state = PressureState::default();
+    // DA-13d: the last pass stood aside for the after-close depth pass.
+    let mut last_stood_aside = false;
     // Edge latch for a PERSISTENTLY blind probe — fed every poll, pages once
     // per episode (2026-09-02, audit finding 10). It changes no action.
     let mut probe_health = ProbeHealth::new();
@@ -487,8 +489,23 @@ async fn run_disk_pressure_loop(
                 // wakes the prune again once it has marked a segment.
                 crate::reclaim_signal::request_raw_upload();
 
+                // DA-13d: after a pass stood aside, hold further passes while the
+                // after-close depth pass still has the depth partitions: another
+                // pass would find the same hold and nothing else to reclaim.
+                let depth_gate_busy = last_stood_aside
+                    && tickvault_storage::partition_archive::try_hold_depth_partitions().is_none();
+                if !pressure_pass_due(action, last_stood_aside, depth_gate_busy) {
+                    tracing::debug!(
+                        used_pct = used,
+                        "disk-pressure pass held: the after-close depth pass still holds \
+                         the depth partitions and the last pass found nothing else"
+                    );
+                    continue;
+                }
+
                 metrics::counter!("tv_disk_pressure_passes_total").increment(1);
                 let pass = run_one_pass(&questdb, &cfg).await;
+                last_stood_aside = matches!(pass, PressurePass::StoodAside);
                 let dropped = match pass {
                     PressurePass::Dropped(n) => Some(n),
                     PressurePass::NotRun | PressurePass::StoodAside => None,
@@ -574,6 +591,10 @@ pub enum PressurePass {
 ///
 /// A pass that dropped something counts as a pass even if it also held depth
 /// partitions: it reclaimed space, and the episode logic should see that.
+/// A pass that dropped nothing stands aside ONLY when the hold is the sole
+/// thing that stopped it: a failed partition, a suspended or unapplied WAL,
+/// or a table that could not be listed makes it `Dropped(0)`, so the normal
+/// escalation still runs (DA-13d re-review).
 #[must_use]
 pub const fn classify_pressure_pass(
     summary: &tickvault_storage::partition_archive::ArchiveRunSummary,
@@ -581,11 +602,34 @@ pub const fn classify_pressure_pass(
     if !summary.pass_ran {
         return PressurePass::NotRun;
     }
-    if summary.dropped == 0 && summary.held_deferred_depth > 0 {
+    if summary.dropped == 0
+        && summary.held_deferred_depth > 0
+        && summary.failed == 0
+        && summary.tables_wal_suspended == 0
+        && summary.tables_wal_not_applied == 0
+        && summary.tables_list_failed == 0
+    {
         return PressurePass::StoodAside;
     }
     // APPROVED: cast — u32 to u64 widening, lossless (`From` is not const).
     PressurePass::Dropped(summary.dropped as u64)
+}
+
+/// Whether this poll runs a pressure pass (DA-13d re-review). Pure, O(1).
+///
+/// After a pass stood aside, a `ContinuePass` (a re-arm of an escalated
+/// episode included) is held, as `Hold` would, while the depth-partition gate
+/// is still taken: a pass would find the same hold and nothing else to
+/// reclaim, and rerunning it every minute would spend QuestDB and S3 work for
+/// nothing. A `StartEpisode` always runs; the first poll after the gate frees
+/// runs a real pass that counts.
+#[must_use]
+pub const fn pressure_pass_due(
+    action: PressureAction,
+    last_stood_aside: bool,
+    depth_gate_busy: bool,
+) -> bool {
+    !(matches!(action, PressureAction::ContinuePass) && last_stood_aside && depth_gate_busy)
 }
 
 /// Folds one pass's result into the episode state (DA-13d).
@@ -593,9 +637,9 @@ pub const fn classify_pressure_pass(
 /// A stood-aside pass is NOT a pass: it opens the episode when this poll
 /// starts one (the volume is over high water, which is true), but counts no
 /// pass, records no drop, and spends no re-arm, so it can never reach
-/// `Escalate` and its STORAGE-GAP-05 page. The next poll runs another pass,
-/// and the first one after the depth pass releases its partitions counts
-/// normally.
+/// `Escalate` and its STORAGE-GAP-05 page. Further passes wait for the gate
+/// ([`pressure_pass_due`]); the first one after the depth pass releases its
+/// partitions counts normally.
 pub fn fold_pressure_pass(
     state: &mut PressureState,
     action: PressureAction,
@@ -761,6 +805,88 @@ mod tests {
             decide_pressure_action(over, &state, &cfg, 91 * 60),
             PressureAction::Escalate
         );
+    }
+
+    // Regression: 2026-10-13 (DA-13d re-review) — a pass that held depth AND
+    // hit a real failure stood aside, so passes_used never moved, passes
+    // reran every minute past the cap, and a real STORAGE-GAP-05 waited up to
+    // ~90 minutes. Only a pure hold stands aside; a stood-aside episode,
+    // escalated or not, runs no further pass while the gate stays taken.
+    #[test]
+    fn test_regression_da13d_only_a_pure_hold_stands_aside() {
+        use tickvault_storage::partition_archive::ArchiveRunSummary;
+        let held = ArchiveRunSummary {
+            pass_ran: true,
+            held_deferred_depth: 2,
+            ..ArchiveRunSummary::default()
+        };
+        assert_eq!(classify_pressure_pass(&held), PressurePass::StoodAside);
+        let real_trouble = [
+            ArchiveRunSummary { failed: 1, ..held },
+            ArchiveRunSummary {
+                tables_wal_suspended: 1,
+                ..held
+            },
+            ArchiveRunSummary {
+                tables_wal_not_applied: 1,
+                ..held
+            },
+            ArchiveRunSummary {
+                tables_list_failed: 1,
+                ..held
+            },
+        ];
+        let cfg = cfg();
+        let over = PressureProbe::used(cfg.pressure_high_water_pct.saturating_add(5).min(100));
+        for summary in real_trouble {
+            let pass = classify_pressure_pass(&summary);
+            assert_eq!(pass, PressurePass::Dropped(0), "{summary:?}");
+            let mut state = PressureState::default();
+            let action = decide_pressure_action(over, &state, &cfg, 0);
+            assert_eq!(action, PressureAction::StartEpisode);
+            fold_pressure_pass(&mut state, action, 0, pass);
+            assert_eq!(
+                decide_pressure_action(over, &state, &cfg, 60),
+                PressureAction::Escalate,
+                "a real failure behind a hold must still escalate: {summary:?}"
+            );
+        }
+
+        // A pure hold: the next ContinuePass is held while the gate is busy,
+        // runs once it frees; a StartEpisode always runs.
+        assert!(!pressure_pass_due(PressureAction::ContinuePass, true, true));
+        assert!(pressure_pass_due(PressureAction::ContinuePass, true, false));
+        assert!(pressure_pass_due(
+            PressureAction::ContinuePass,
+            false,
+            false
+        ));
+        assert!(pressure_pass_due(PressureAction::StartEpisode, true, true));
+
+        // An escalated episode whose re-arm stood aside: its next re-arm
+        // polls are held too, and no re-arm is spent while held.
+        let mut state = PressureState::default();
+        let a = decide_pressure_action(over, &state, &cfg, 0);
+        fold_pressure_pass(&mut state, a, 0, PressurePass::Dropped(5));
+        let a = decide_pressure_action(over, &state, &cfg, 60);
+        fold_pressure_pass(&mut state, a, 60, PressurePass::Dropped(0));
+        let a = decide_pressure_action(over, &state, &cfg, 120);
+        assert_eq!(a, PressureAction::Escalate);
+        apply_action(&mut state, a, 120, None);
+        let rearm_at = 120 + tickvault_storage::disk_pressure::PRESSURE_REARM_AFTER_SECS;
+        let a = decide_pressure_action(over, &state, &cfg, rearm_at);
+        assert_eq!(a, PressureAction::ContinuePass, "the re-arm is due");
+        fold_pressure_pass(&mut state, a, rearm_at, PressurePass::StoodAside);
+        let rearms_before = state.episode.map(|e| e.rearms_used);
+        let mut passes = 0;
+        for poll in 1..=90_u64 {
+            let a = decide_pressure_action(over, &state, &cfg, rearm_at + poll * 60);
+            if pressure_pass_due(a, true, true) {
+                passes += 1;
+            }
+        }
+        assert_eq!(passes, 0, "no pass reruns while the depth pass holds");
+        assert_eq!(state.episode.map(|e| e.rearms_used), rearms_before);
     }
 
     #[test]

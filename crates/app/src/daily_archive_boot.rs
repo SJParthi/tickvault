@@ -219,7 +219,16 @@ pub const fn pass_verdict(summary: &ArchiveRunSummary, max_partitions_per_run: u
     }
     // `>=` and not `>`: hitting the cap exactly means the worklist was
     // truncated at it, which is the same "there is more" as exceeding it.
-    if max_partitions_per_run > 0 && summary.partitions_considered >= max_partitions_per_run {
+    // DA-13d re-review: held depth partitions take worklist slots but no
+    // work, so they do not count toward the budget. Otherwise a backlog of
+    // 200 or more read as budget_exhausted, was not refunded, and the hold
+    // still used up the day's attempts.
+    if max_partitions_per_run > 0
+        && summary
+            .partitions_considered
+            .saturating_sub(summary.held_deferred_depth)
+            >= max_partitions_per_run
+    {
         return PassVerdict::Incomplete("budget_exhausted");
     }
     if summary.held_deferred_depth > 0 {
@@ -1191,6 +1200,41 @@ mod pass_ran_tests {
         ))));
         assert!(!refunds_attempt(PassOutcome::Ran(PassVerdict::Complete)));
         assert!(!refunds_attempt(PassOutcome::Failed));
+    }
+
+    // Regression: 2026-10-13 (DA-13d re-review) — held depth partitions took
+    // slots in the per-run budget, so a backlog of 200 read as
+    // budget_exhausted, was not refunded, and the attempts still ran out.
+    #[test]
+    fn test_regression_da13d_held_partitions_do_not_spend_the_budget() {
+        let full_of_held = ArchiveRunSummary {
+            pass_ran: true,
+            partitions_considered: 200,
+            held_deferred_depth: 200,
+            ..ArchiveRunSummary::default()
+        };
+        let verdict = pass_verdict(&full_of_held, 200);
+        assert_eq!(verdict, PassVerdict::Incomplete("deferred_depth_pass"));
+        assert!(refunds_attempt(PassOutcome::Ran(verdict)));
+
+        let truly_full = ArchiveRunSummary {
+            held_deferred_depth: 0,
+            ..full_of_held
+        };
+        let verdict = pass_verdict(&truly_full, 200);
+        assert_eq!(verdict, PassVerdict::Incomplete("budget_exhausted"));
+        assert!(!refunds_attempt(PassOutcome::Ran(verdict)));
+
+        // 200 real partitions besides the held ones: still budget-bound.
+        let over = ArchiveRunSummary {
+            partitions_considered: 210,
+            held_deferred_depth: 10,
+            ..full_of_held
+        };
+        assert_eq!(
+            pass_verdict(&over, 200),
+            PassVerdict::Incomplete("budget_exhausted")
+        );
     }
 
     // Regression: 2026-10-13 (DA-13d review) — the archiver's hold counter
