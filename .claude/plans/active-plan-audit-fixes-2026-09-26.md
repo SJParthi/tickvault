@@ -3029,6 +3029,38 @@ and a call site; shell may only shrink. One PR per item, serial.
   (RUST-5, DB-4, NT-1, tail HOT-3, DISK-9, DB-3, HOT-10, HOT-12, S3-1 partial). `storage`. Done: `disk_health_watcher::statvfs_probe`, `hours_left_warn_edge` (warns only when the disk fills before capture ends); `tick_persistence::{append_within_marker, SpillHeldBytesCache, tick_ilp_column}`; `candle_contract_labels::CandleContractLabels` on `ahash`; `wal_applied_watermark::RESCUE_FLOOR_SLOTS` = 16.
 - [ ] **DA-13 — Frame log, spill replay and archive close their counted-loss holes** (CR-2,
   CLOCK-2, CRASH-2, QDB-3, QDB-6, RET-2, RET-3, RET-4, RET-5, RET-6, RET-7, OBS-11). `storage`, `app`.
+  **Re-derived 2026-10-13:** the audit page that holds these findings' text could not be opened
+  from the session that picked DA-13 up, so the list was rebuilt from the code by a 64-agent
+  sweep (six lenses: crash, clock, QuestDB, retention, observability, replay; every finding
+  attacked by two refuters): 22 findings, 17 confirmed by both, 5 split, 7 rejected. They map onto
+  the original IDs only by theme. Split into four serial PRs:
+  - [x] **DA-13a — seal spill boot drain and retention.** `storage`, `app`. The boot drain no
+    longer flushes into, or archives on an ack from, a sink the WAL-suspension watcher reads
+    suspect (`drain_recovered_seals_once` takes the probe; `files_held_sink_suspect`,
+    `tv_seal_writer_drain_total{kind="boot_held_sink_suspect"}`); `read_staged_spill` ends only at
+    `UnexpectedEof` and returns `None` on any other read error; `read_staged_dlq` returns `None`
+    instead of spinning on a read error that does not advance; the retention sweep counts
+    never-replayed files deleted with a cold copy apart
+    (`deleted_unreplayed_with_copy`, `records_unreplayed_with_copy`,
+    `tv_seal_spill_unreplayed_deleted_with_copy_records_total`, coded STORAGE-GAP-04 line,
+    log-only) and calls only truly empty files empty. **Review round (2026-10-13, 44-agent
+    attack + refuters, 10 confirmed):** the boot drain ran before the watcher had ever probed, so
+    its gate almost never fired. `AppliedWatermark::mark_probe_expected` is set before the seal
+    writer starts; while a watcher is expected or running, a boot-flushed file is handed to the
+    mid-session replay's awaiting list (`drain_recovered_seals_for_replay`, `adopt_boot_flushed`)
+    and archived only after two clean probes behind its last flush
+    (`files_awaiting_confirm`, `seals_awaiting_confirm`, `kind="boot_awaiting_confirm"`); the
+    mid-session replay gets the same startup fix through `ReplayProbe::is_running`.
+  - [ ] **DA-13b — tick and depth spill replay.** The live hour file's half-written last line is
+    posted and resumed mid-line; a 2xx from a suspended table truncates the only local copy; the
+    live file is chosen by name order (a clock step); a drained live file is never emptied after
+    its hour; stuck rounds are not counted; a whole-file quarantine misreports bytes.
+  - [ ] **DA-13c — WAL refold and confirm.** A bad packet boundary abandons the rest of a frame
+    with no counter or log; segments are archived the instant their rows are acked, ignoring the
+    60 s durability lag and a suspect flag that lags one probe.
+  - [ ] **DA-13d — the split findings, re-verified first.** Audit spill drain deletes on any 2xx;
+    the after-close deferred-depth pass and the partition archiver touch the same partitions;
+    pinned depth segments deleted under the disk floor.
 - [ ] **DA-14 — The candle disk floor keeps what can be kept and says why** (DISK-1, DISK-2,
   DISK-3, DISK-5, DISK-6, DISK-7, DISK-8, HOT-8, CRASH-1 partial, tail HOT-2 limit row). `storage`.
 - [ ] **DA-15 — The frame drain's timers cannot starve; small drain fixes** (HOT-11, tail HOT-4,
