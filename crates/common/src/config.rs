@@ -1146,6 +1146,32 @@ pub struct DhanUniverseConfig {
     /// is in code and does not depend on this field.
     #[serde(default)]
     pub frame_silence_fast_path: FrameSilenceFastPath,
+
+    /// Seconds a depth-200 contract may send nothing after its in-place swap
+    /// before its subscription is sent again on the same socket, once, with no
+    /// redial (scope lock 2026-10-13, "A SILENT DEPTH-200 SWAP IS RESUBSCRIBED
+    /// IN PLACE AT 90 s"). 90 is the owner's STARTING value; lower it once the
+    /// measured first-packet p99 (`tv_depth_first_packet_latency_ms`,
+    /// `basis = "depth200_socket"`) supports it. That is a config change, not a
+    /// code change. Validated at boot to
+    /// [`DEPTH200_SILENT_SWAP_RESUBSCRIBE_MIN_SECS`]..=[`DEPTH200_SILENT_SWAP_RESUBSCRIBE_MAX_SECS`].
+    #[serde(default = "default_depth200_silent_swap_resubscribe_secs")]
+    pub depth200_silent_swap_resubscribe_secs: u64,
+}
+
+/// Default and starting value of `depth200_silent_swap_resubscribe_secs`.
+pub const DEPTH200_SILENT_SWAP_RESUBSCRIBE_DEFAULT_SECS: u64 = 90;
+
+/// Floor: below 10 s a contract whose book simply has not changed yet would be
+/// resubscribed for nothing, and each resend blanks it for the two writes.
+pub const DEPTH200_SILENT_SWAP_RESUBSCRIBE_MIN_SECS: u64 = 10;
+
+/// Ceiling: well below the 900 s depth-200 frame-silence backstop, so the
+/// in-place resend always gets its chance before the redial.
+pub const DEPTH200_SILENT_SWAP_RESUBSCRIBE_MAX_SECS: u64 = 600;
+
+const fn default_depth200_silent_swap_resubscribe_secs() -> u64 {
+    DEPTH200_SILENT_SWAP_RESUBSCRIBE_DEFAULT_SECS
 }
 
 /// What the evidence-based frame-silence fast paths do (scope lock
@@ -1200,6 +1226,7 @@ impl Default for DhanUniverseConfig {
             spot_universe_ntm_only: false,
             backup_top_n: default_main_feed_backup_top_n(),
             frame_silence_fast_path: FrameSilenceFastPath::Shadow,
+            depth200_silent_swap_resubscribe_secs: default_depth200_silent_swap_resubscribe_secs(),
         }
     }
 }
@@ -2676,6 +2703,20 @@ impl ApplicationConfig {
                 anyhow::anyhow!("{} is not a valid HH:MM:SS time: '{}'", field_name, value)
             })
         };
+
+        // Scope lock 2026-10-13: the silent depth-200 swap wait stays inside
+        // its bounds (a floor against needless resends, a ceiling well under
+        // the 900 s backstop).
+        let silent = self.dhan_universe.depth200_silent_swap_resubscribe_secs;
+        if !(DEPTH200_SILENT_SWAP_RESUBSCRIBE_MIN_SECS..=DEPTH200_SILENT_SWAP_RESUBSCRIBE_MAX_SECS)
+            .contains(&silent)
+        {
+            bail!(
+                "dhan_universe.depth200_silent_swap_resubscribe_secs must be within \
+                 {DEPTH200_SILENT_SWAP_RESUBSCRIBE_MIN_SECS}..={DEPTH200_SILENT_SWAP_RESUBSCRIBE_MAX_SECS} \
+                 (got {silent})"
+            );
+        }
 
         parse_time("trading.market_open_time", &self.trading.market_open_time)?;
         parse_time("trading.market_close_time", &self.trading.market_close_time)?;
@@ -4813,6 +4854,32 @@ mod tests {
             section.contains("frame_silence_fast_path = \"shadow\""),
             "base.toml must ship the frame-silence fast paths in shadow mode"
         );
+    }
+
+    #[test]
+    fn test_depth200_silent_swap_resubscribe_secs_defaults_to_90_and_is_bounded() {
+        assert_eq!(
+            DhanUniverseConfig::default().depth200_silent_swap_resubscribe_secs,
+            90
+        );
+        let base = include_str!("../../../config/base.toml");
+        assert!(base.contains("depth200_silent_swap_resubscribe_secs = 90"));
+        // The ceiling stays below the 900 s depth-200 backstop.
+        const { assert!(DEPTH200_SILENT_SWAP_RESUBSCRIBE_MAX_SECS < 900) };
+        const { assert!(DEPTH200_SILENT_SWAP_RESUBSCRIBE_MIN_SECS >= 10) };
+        let mut config = make_valid_config();
+        for ok in [10, 90, 600] {
+            config.dhan_universe.depth200_silent_swap_resubscribe_secs = ok;
+            assert!(config.validate().is_ok(), "{ok} s is inside the bounds");
+        }
+        for bad in [0, 9, 601, 900] {
+            config.dhan_universe.depth200_silent_swap_resubscribe_secs = bad;
+            let err = config.validate().expect_err("outside the bounds");
+            assert!(
+                err.to_string()
+                    .contains("depth200_silent_swap_resubscribe_secs")
+            );
+        }
     }
 
     #[test]
