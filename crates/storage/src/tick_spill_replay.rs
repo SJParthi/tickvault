@@ -5090,6 +5090,7 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
         /// recorder installed for this thread only, and returns what it
         /// returned and how much the counter moved. Tasks the test spawned
         /// on `rt` (a test server) run on its worker threads.
+        // TEST-EXEMPT: test-only helper (inside #[cfg(test)], shared with depth_spill_frame's tests)
         pub(crate) fn count_during<F: std::future::Future>(
             &self,
             rt: &tokio::runtime::Runtime,
@@ -5472,5 +5473,212 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
         assert_eq!(paged, 1, "the torn tail is on the paged counter");
         forget_resume_offset(&closed);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- DA-13b: direct tests for the spill-replay helpers -------------------
+
+    #[test]
+    fn test_note_spill_ack_opens_and_joins_one_pending_range() {
+        let path = temp_dir("da13b-direct-ack").join("ticks-dhan-1.ilp");
+        let view = test_spill_view();
+        assert!(!has_unconfirmed_ack_at(&path, &view), "no ack yet");
+        note_spill_ack(&path, &view, 10, 20);
+        note_spill_ack(&path, &view, 20, 42);
+        assert!(has_unconfirmed_ack_at(&path, &view), "acks pending");
+        // The joined range kept the first ack's start: a rewind returns to 10.
+        record_resume_offset(&path, 42);
+        let mut after_episode = view;
+        after_episode.suspect_episodes += 1;
+        assert!(rewind_after_suspicion(&path, &after_episode, "ticks"));
+        assert_eq!(resume_offset_for(&path), 10);
+        forget_resume_offset(&path);
+    }
+
+    #[test]
+    fn test_rewind_after_suspicion_rewinds_only_unconfirmed_acks_after_an_episode() {
+        let path = temp_dir("da13b-direct-rewind").join("ticks-dhan-1.ilp");
+        let view = test_spill_view();
+        assert!(
+            !rewind_after_suspicion(&path, &view, "ticks"),
+            "no acks: nothing to rewind"
+        );
+        note_spill_ack(&path, &view, 0, 30);
+        record_resume_offset(&path, 30);
+        assert!(
+            !rewind_after_suspicion(&path, &view, "ticks"),
+            "same episode: no rewind"
+        );
+        let confirmed = confirmed_spill_view(&view);
+        assert!(
+            !rewind_after_suspicion(&path, &confirmed, "ticks"),
+            "confirmed acks are settled, not rewound"
+        );
+        let mut after_episode = confirmed;
+        after_episode.suspect_episodes += 2;
+        assert!(
+            !rewind_after_suspicion(&path, &after_episode, "ticks"),
+            "settled acks stay settled after later episodes"
+        );
+        assert_eq!(resume_offset_for(&path), 30);
+        forget_resume_offset(&path);
+    }
+
+    #[test]
+    fn test_resend_through_for_is_zero_until_a_rewind_marks_the_old_offset() {
+        let path = temp_dir("da13b-direct-resend").join("ticks-dhan-1.ilp");
+        let view = test_spill_view();
+        assert_eq!(resend_through_for(&path), 0, "unknown file");
+        note_spill_ack(&path, &view, 5, 50);
+        record_resume_offset(&path, 50);
+        assert_eq!(resend_through_for(&path), 0, "no rewind yet");
+        let mut after_episode = view;
+        after_episode.suspect_episodes += 1;
+        assert!(rewind_after_suspicion(&path, &after_episode, "ticks"));
+        assert_eq!(resend_through_for(&path), 50, "old offset dealt with");
+        forget_resume_offset(&path);
+        assert_eq!(resend_through_for(&path), 0, "forgotten with the offset");
+    }
+
+    #[test]
+    fn test_spill_file_pending_reads_unsent_bytes_and_unconfirmed_acks() {
+        let path = temp_dir("da13b-direct-pending").join("ticks-dhan-1.ilp");
+        let view = test_spill_view();
+        assert!(!spill_file_pending(&path, 0), "empty file");
+        assert!(spill_file_pending(&path, 10), "bytes past the offset");
+        record_resume_offset(&path, 10);
+        assert!(!spill_file_pending(&path, 10), "drained, no acks");
+        // The ack is stamped two hours ahead of the real clock, so the real
+        // view cannot have confirmed it yet: the drained file stays pending.
+        note_spill_ack(&path, &view, 0, 10);
+        assert!(spill_file_pending(&path, 10), "drained, ack unconfirmed");
+        forget_resume_offset(&path);
+    }
+
+    #[test]
+    fn test_drained_file_empty_verdict_waits_for_confirmation() {
+        let path = temp_dir("da13b-direct-verdict").join("ticks-dhan-1.ilp");
+        let view = test_spill_view();
+        assert_eq!(drained_file_empty_verdict(&path, &view), Ok(()), "no acks");
+        let mut suspect = view;
+        suspect.suspect = true;
+        assert_eq!(
+            drained_file_empty_verdict(&path, &suspect),
+            Err(EMPTY_DEFER_REASONS[0])
+        );
+        note_spill_ack(&path, &view, 0, 10);
+        assert_eq!(
+            drained_file_empty_verdict(&path, &view),
+            Err(EMPTY_DEFER_REASONS[1]),
+            "no clean probes since the ack"
+        );
+        assert_eq!(
+            drained_file_empty_verdict(&path, &confirmed_spill_view(&view)),
+            Ok(())
+        );
+        forget_resume_offset(&path);
+    }
+
+    #[test]
+    fn test_spill_file_hour_parses_the_last_dash_field() {
+        assert_eq!(
+            spill_file_hour(Path::new("/x/ticks-dhan-493517.ilp")),
+            Some(493_517)
+        );
+        assert_eq!(spill_file_hour(Path::new("/x/depth-dhan-7.dspl")), Some(7));
+        assert_eq!(spill_file_hour(Path::new("/x/ticks-dhan-abc.ilp")), None);
+        assert_eq!(spill_file_hour(Path::new("/x/ticks.ilp")), None);
+    }
+
+    #[test]
+    fn test_spill_file_closed_and_quiet_needs_a_parsed_past_hour() {
+        let dir = temp_dir("da13b-direct-closed");
+        let closed = dir.join("ticks-dhan-1.ilp");
+        let unnamed = dir.join("ticks-dhan-x.ilp");
+        std::fs::write(&closed, GOOD_LINE).expect("write"); // APPROVED: test
+        std::fs::write(&unnamed, GOOD_LINE).expect("write"); // APPROVED: test
+        let view = test_spill_view();
+        let meta = std::fs::metadata(&closed).expect("meta"); // APPROVED: test
+        assert!(spill_file_closed_and_quiet(&closed, &meta, &view));
+        let meta_unnamed = std::fs::metadata(&unnamed).expect("meta"); // APPROVED: test
+        assert!(
+            !spill_file_closed_and_quiet(&unnamed, &meta_unnamed, &view),
+            "a name that does not parse reads as not closed"
+        );
+        let mut now = view;
+        now.now_unix_secs = SpillSinkView::current().now_unix_secs;
+        let current_hour = now.now_unix_secs / SPILL_FILE_HOUR_SECS;
+        let live = dir.join(format!("ticks-dhan-{current_hour}.ilp"));
+        std::fs::write(&live, GOOD_LINE).expect("write"); // APPROVED: test
+        let meta_live = std::fs::metadata(&live).expect("meta"); // APPROVED: test
+        assert!(
+            !spill_file_closed_and_quiet(&live, &meta_live, &now),
+            "the current hour is not closed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_spill_file_may_still_be_appended_last_always_live_and_counts_nonlast_live() {
+        let dir = temp_dir("da13b-direct-appended");
+        let closed = dir.join("ticks-dhan-1.ilp");
+        let unnamed = dir.join("ticks-dhan-x.ilp");
+        std::fs::write(&closed, GOOD_LINE).expect("write"); // APPROVED: test
+        std::fs::write(&unnamed, GOOD_LINE).expect("write"); // APPROVED: test
+        let meta = std::fs::metadata(&closed).expect("meta"); // APPROVED: test
+        let meta_unnamed = std::fs::metadata(&unnamed).expect("meta"); // APPROVED: test
+        let view = test_spill_view();
+        let rec = OneCounterRecorder::new(SPILL_REPLAY_NONLAST_LIVE_COUNTER);
+        let (last, closed_nonlast, unnamed_nonlast) = metrics::with_local_recorder(&rec, || {
+            (
+                spill_file_may_still_be_appended(&closed, &meta, true, &view, "ticks"),
+                spill_file_may_still_be_appended(&closed, &meta, false, &view, "ticks"),
+                spill_file_may_still_be_appended(&unnamed, &meta_unnamed, false, &view, "ticks"),
+            )
+        });
+        assert!(last, "the last file may always be appended");
+        assert!(!closed_nonlast, "a closed, quiet non-last file is not live");
+        assert!(unnamed_nonlast, "doubt keeps the file live");
+        assert_eq!(
+            rec.total.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "only the non-last live file is counted"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_empty_drained_closed_file_empties_only_once_confirmed() {
+        let dir = temp_dir("da13b-direct-empty");
+        let path = dir.join("ticks-dhan-1.ilp");
+        std::fs::write(&path, GOOD_LINE).expect("write"); // APPROVED: test
+        let view = test_spill_view();
+        note_spill_ack(&path, &view, 0, GOOD_LINE.len() as u64);
+        record_resume_offset(&path, GOOD_LINE.len() as u64);
+        assert!(matches!(
+            empty_drained_closed_file(&path, &view, "ticks"),
+            EmptyOutcome::Deferred
+        ));
+        assert_eq!(
+            std::fs::metadata(&path).expect("meta").len(), // APPROVED: test
+            GOOD_LINE.len() as u64,
+            "a deferred file keeps its bytes"
+        );
+        assert!(matches!(
+            empty_drained_closed_file(&path, &confirmed_spill_view(&view), "ticks"),
+            EmptyOutcome::Emptied
+        ));
+        assert_eq!(std::fs::metadata(&path).expect("meta").len(), 0); // APPROVED: test
+        assert_eq!(resume_offset_for(&path), 0, "offset forgotten on empty");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_note_spill_file_unreadable_counts_one_failure() {
+        let rec = OneCounterRecorder::new("tv_tick_spill_replay_failed_total");
+        let err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        metrics::with_local_recorder(&rec, || {
+            note_spill_file_unreadable(Path::new("/x/ticks-dhan-1.ilp"), "stat", &err);
+        });
+        assert_eq!(rec.total.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 }
