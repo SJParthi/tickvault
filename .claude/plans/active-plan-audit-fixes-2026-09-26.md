@@ -3058,9 +3058,23 @@ and a call site; shell may only shrink. One PR per item, serial.
   - [ ] **DA-13c — WAL refold and confirm.** A bad packet boundary abandons the rest of a frame
     with no counter or log; segments are archived the instant their rows are acked, ignoring the
     60 s durability lag and a suspect flag that lags one probe.
-  - [ ] **DA-13d — the split findings, re-verified first.** Audit spill drain deletes on any 2xx;
+  - [x] **DA-13d — the split findings, re-verified first.** Audit spill drain deletes on any 2xx;
     the after-close deferred-depth pass and the partition archiver touch the same partitions;
-    pinned depth segments deleted under the disk floor.
+    pinned depth segments deleted under the disk floor. **Verdicts:** the audit-spill finding is
+    not real (a 2xx means the rows are in that table's WAL; a suspended table keeps them and
+    applies them on RESUME WAL; the live audit flush trusts the same 2xx), no change. The
+    after-close pass now holds `partition_archive::DEPTH_REWRITE_GATE` from its first rewrite
+    until its marks are cleared; the archiver only try-locks it per `market_depth` /
+    `market_depth_book` partition and holds the partition when busy (`held_deferred_depth`,
+    `tv_partition_archive_skipped_total{reason="deferred_depth_pass"}`). A daily pass whose only
+    shortfall is that hold is `Incomplete("deferred_depth_pass")` and gets its attempt back; held
+    partitions use none of the per-run budget; the disk-pressure leg treats a pass whose only
+    reason for dropping nothing is the hold as standing aside (no pass counted, no re-arm spent,
+    no STORAGE-GAP-05), and waits while the gate is held. Pinned segments deleted under the disk
+    floor count on `tv_wal_deferred_depth_segments_lost_total{copy_in_s3}` (local only, seeded at
+    0). Reviewed in three hostile rounds (6 confirmed findings fixed). **Honest limit:** if the
+    pass holds the gate until its 17:15 stop and the box stops at 17:30, that day's depth
+    partitions wait for the next day's sweep; nothing is dropped unarchived.
 - [ ] **DA-14 — The candle disk floor keeps what can be kept and says why** (DISK-1, DISK-2,
   DISK-3, DISK-5, DISK-6, DISK-7, DISK-8, HOT-8, CRASH-1 partial, tail HOT-2 limit row). `storage`.
 - [x] **DA-22 — The after-close depth pass runs while the disk shed is on** (found live
