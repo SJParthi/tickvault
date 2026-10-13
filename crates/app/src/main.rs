@@ -1790,6 +1790,9 @@ async fn async_main() -> Result<()> {
     metrics::counter!("tv_seal_spill_sync_failed_total").increment(0);
     metrics::counter!("tv_seal_unwritten_mark_errors_total").increment(0);
     metrics::counter!("tv_wal_deferred_depth_persist_failed_total").increment(0);
+    // The after-close depth pass stopping at its disk floor (2026-10-13).
+    // Local /metrics only: no alarm or filter reads it.
+    metrics::counter!("tv_wal_deferred_depth_pass_total", "outcome" => "disk_floor").increment(0);
     metrics::counter!("tv_wal_applied_watermark_persist_failed_total").increment(0);
     // SEBI lifecycle / constituency write failures (audit OBS-2, 2026-10-11).
     // Seeded here, after the recorder install, so a scrape records 0 before
