@@ -50,7 +50,7 @@ fn the_spill_helper_fdatasyncs() {
 #[test]
 fn both_spill_writers_sync_before_returning_ok() {
     for (file, sig) in [
-        ("tick_persistence.rs", "fn spill_failed_ilp("),
+        ("tick_persistence.rs", "fn spill_failed_ilp_to("),
         ("depth_persistence.rs", "fn spill_failed_depth_ilp("),
     ] {
         let src = production(file);
@@ -64,6 +64,17 @@ fn both_spill_writers_sync_before_returning_ok() {
             "{file}: the sync must happen before the rescue reports Ok"
         );
     }
+    // 2026-10-13 (top_volume spill plan item 1): the sync now lives in the
+    // shared `spill_failed_ilp_to`; the tick entry point must still route
+    // through it, or the check above would be pinning a function ticks no
+    // longer call.
+    let ticks = production("tick_persistence.rs");
+    assert!(
+        body_of(&ticks, "fn spill_failed_ilp(").contains(
+            "spill_failed_ilp_to(&tick_spill_spec(dir, feed), payload, now_unix_secs, sync)"
+        ),
+        "the tick spill must go through the shared, synced spill function"
+    );
 }
 
 #[test]
