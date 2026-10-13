@@ -1495,6 +1495,15 @@ pub struct IlpSpillSpec<'a> {
     /// spills on the drain, so every other spec carries `None` and lists the
     /// folder on every write.
     pub(crate) drain_held: Option<&'static SpillHeldBytesCache>,
+    /// Truncate the file back to its pre-write length when the append or
+    /// its sync fails, so a short write cannot leave a torn line that merges
+    /// with the next append (2026-10-13, top_volume spill PR-B review).
+    ///
+    /// ONLY for a tier whose caller serialises every append to the folder
+    /// (top_volume: one lock in its spiller). Ticks keep `false`: the drain's
+    /// inline fallback and the rescue thread can append to the same hourly
+    /// file at once, and a truncate there could cut the other writer's rows.
+    pub(crate) truncate_failed_append: bool,
 }
 
 /// The tick tier's spill spec, built from the same constants the tick-only
@@ -1517,6 +1526,7 @@ pub(crate) fn tick_spill_spec(dir: &Path, feed: Feed) -> IlpSpillSpec<'_> {
         blind: BlindWritePolicy::FailOpen,
         tier: SpillTier::Tick,
         drain_held: Some(&TICK_DRAIN_SPILL_HELD),
+        truncate_failed_append: false,
     }
 }
 
@@ -1744,14 +1754,39 @@ pub(crate) fn spill_failed_ilp_to(
         spec.file_prefix,
         spec.feed.as_str()
     ));
-    let mut file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)?;
-    file.write_all(payload)?;
-    file.flush()?;
-    if let Some(sync) = sync {
-        sync(&file)?;
+    // The length before this append, taken only by a tier that serialises
+    // its appends (see `IlpSpillSpec::truncate_failed_append`).
+    let pre_len = if spec.truncate_failed_append {
+        Some(file.metadata()?.len())
+    } else {
+        None
+    };
+    let append = || -> std::io::Result<()> {
+        let mut writer = &file;
+        writer.write_all(payload)?;
+        writer.flush()?;
+        if let Some(sync) = sync {
+            sync(&file)?;
+        }
+        Ok(())
+    };
+    if let Err(err) = append() {
+        if let Some(len) = pre_len
+            && let Err(truncate_err) = file.set_len(len)
+        {
+            return Err(std::io::Error::new(
+                err.kind(),
+                format!(
+                    "{err}; and truncating the failed append back to {len} bytes also \
+                     failed: {truncate_err}"
+                ),
+            ));
+        }
+        return Err(err);
     }
     if on_drain && let Some(cache) = spec.drain_held {
         cache.note_written(dir, payload.len() as u64);

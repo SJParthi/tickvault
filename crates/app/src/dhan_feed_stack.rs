@@ -87,6 +87,7 @@ use std::sync::{Arc, OnceLock};
 // the ingest shed skipped. A child module so it reuses the drain's own packet
 // walk and depth writers rather than a second copy of either.
 mod deferred_depth_pass;
+mod top_volume_threads;
 use std::time::Instant;
 
 use secrecy::ExposeSecret;
@@ -1642,6 +1643,16 @@ pub struct LiveIngest {
     /// deadline already provides. A wedged socket is handled by checking the
     /// deadline BEFORE joining rather than by a second channel.
     top_volume_thread: Option<std::thread::JoinHandle<()>>,
+    /// The top-volume FLUSH thread's join handle (2026-10-13, top_volume
+    /// spill plan item 3). The formatter above no longer touches the network;
+    /// this thread owns the ILP sender and spills every batch that does not
+    /// land. It exits once the formatter exits (the formatter holds its only
+    /// queue sender), so shutdown polls it second, against the same deadline.
+    top_volume_flush_thread: Option<std::thread::JoinHandle<()>>,
+    /// Requested by `shutdown_top_volume_writer` BEFORE it polls the two
+    /// threads: from then on both spill instead of sending, so no queued
+    /// batch waits on a slow QuestDB past the shutdown deadline.
+    top_volume_shutdown: Option<tickvault_storage::top_volume_rank_persistence::TopVolumeShutdown>,
     /// Signalled by the writer thread as its LAST act, so shutdown can wait
     /// with a bounded grace instead of a `join` that has no timeout.
     ///
@@ -2041,6 +2052,26 @@ impl LiveIngest {
         // producer drops. Holding one without the other is a join that hangs or
         // a close nobody waits for.
         self.top_volume_thread = Some(thread);
+        self
+    }
+
+    /// Hands the lane the top-volume FLUSH thread's join handle (2026-10-13,
+    /// top_volume spill plan item 3), `None` when its spawn failed, and the
+    /// shutdown signal both top-volume threads read, so shutdown can ask
+    /// them to spill and then wait for them.
+    ///
+    /// Separate from [`Self::with_top_volume_writer`] because the two threads
+    /// are spawned separately and either spawn can fail on its own: a lane
+    /// whose flush thread never started still runs the formatter, which then
+    /// spills every batch.
+    #[must_use]
+    pub fn with_top_volume_flush_thread(
+        mut self,
+        thread: Option<std::thread::JoinHandle<()>>,
+        shutdown: tickvault_storage::top_volume_rank_persistence::TopVolumeShutdown,
+    ) -> Self {
+        self.top_volume_flush_thread = thread;
+        self.top_volume_shutdown = Some(shutdown);
         self
     }
 
@@ -2928,6 +2959,8 @@ impl LiveIngest {
             writer_thread: None,
             rescue_thread: None,
             top_volume_thread: None,
+            top_volume_flush_thread: None,
+            top_volume_shutdown: None,
             writer_done: None,
             prev_close: crate::prev_close_store::PrevCloseStore::new(),
             prev_close_disagreements: 0,
@@ -3471,73 +3504,6 @@ impl LiveIngest {
                 code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
                 "the tick writer thread PANICKED — the final batch of the session \
                  may not have reached QuestDB. Check the tick spill directory."
-            );
-        }
-    }
-
-    /// Waits for the top-volume snapshot writer to finish its queue.
-    ///
-    /// The THIRD writer to get shutdown accounting, and the last: ticks and
-    /// depth have had it since 2026-08-28, and this one was spawned with its
-    /// handle discarded until 2026-09-13.
-    ///
-    /// Shares the SAME deadline as the other two joins for the reason recorded
-    /// at `shutdown_offload_writer`: `main` gives this whole task ONE
-    /// `DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS`, and independent graces would SUM
-    /// past it — which is the arithmetic the compile-time assert in `main.rs`
-    /// exists to keep honest. All three queues are closed before any join
-    /// begins, so the threads drain in parallel and the total is the MAX of the
-    /// three waits, never the sum. Adding this third join therefore costs zero
-    /// shutdown budget.
-    ///
-    /// Idempotent, and a no-op on a lane whose writer never spawned.
-    pub fn shutdown_top_volume_writer(&mut self, deadline: std::time::Instant) {
-        let Some(handle) = self.top_volume_thread.take() else {
-            return;
-        };
-        // POLLED to the deadline, then joined only once the thread has actually
-        // finished — the `shutdown_rescue_writer` shape, adopted here on
-        // 2026-09-13 because this function did not have it.
-        //
-        // `JoinHandle::join` has no timeout, so a writer wedged on a hung
-        // socket hangs the box's shutdown until systemd's `TimeoutStopSec`
-        // SIGKILLs it — trading lost snapshot rows for a lost shutdown, which
-        // is the worse half of the trade. The previous version stated exactly
-        // that hazard in this comment and then called a bare `join()` anyway,
-        // guarded by a SINGLE `Instant::now() >= deadline` test at entry.
-        //
-        // A point-in-time check is not a bound. It only refuses to START
-        // waiting once the budget is already spent; enter this function one
-        // millisecond before the deadline with a wedged writer and it waits
-        // forever. This is the LAST of the three joins against one shared
-        // budget, so the two before it routinely leave very little — which is
-        // precisely the window in which the old check passed and then blocked.
-        //
-        // `is_finished()` is non-blocking, so the `join()` below cannot block:
-        // it runs only on a thread that has already exited.
-        while !handle.is_finished() && std::time::Instant::now() < deadline {
-            std::thread::sleep(RESCUE_JOIN_POLL);
-        }
-        if !handle.is_finished() {
-            metrics::counter!(OFFLOAD_SHUTDOWN_INCOMPLETE_COUNTER, "writer" => "top_volume")
-                .increment(1);
-            error!(
-                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
-                "the top-volume writer was abandoned at shutdown — the lane's \
-                 flush budget was already spent by the tick and depth joins, so \
-                 the final ranking batches of the session may not have reached \
-                 QuestDB. These are ranking SNAPSHOTS, not ticks: no trade data \
-                 is lost and the next session re-ranks from scratch."
-            );
-            return;
-        }
-        if handle.join().is_err() {
-            metrics::counter!(OFFLOAD_SHUTDOWN_INCOMPLETE_COUNTER, "writer" => "top_volume")
-                .increment(1);
-            error!(
-                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
-                "the top-volume writer thread PANICKED — the final ranking \
-                 batches of the session may not have reached QuestDB."
             );
         }
     }
@@ -17658,6 +17624,16 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // snapshot is a periodic SAMPLE, not a unique event), so its batches would
     // simply be dropped and counted.
     //
+    // ⚠ CHANGED 2026-10-13 (top_volume spill plan items 3 and 4): that premise
+    // was wrong for an audit table (a lost window is never re-ranked; 10,277
+    // rows were lost on 2026-10-13). There are now TWO threads: the formatter
+    // (`tv-top-volume-writer`) appends ILP and never waits on the network, and
+    // the flush thread (`tv-top-volume-flush`) owns the ILP sender. Every batch
+    // that does not land is spilled, synced, to `data/spill/top_volume`; a
+    // breaker keeps a dead QuestDB to one timeout per cooldown. The drain side
+    // is unchanged. Spilled files are kept on disk until the replay lands
+    // (plan item 5, a later change).
+    //
     // A spawn failure leaves `top_volume` unset. That is the honest degrade:
     // no snapshot rows rather than a synchronous ILP flush on the frame drain,
     // which is the coupling that loses ticks upstream at the vendor with no
@@ -17670,8 +17646,37 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         // data, and this thread does the per-row ILP append as well as the
         // flush. The append-failure count and its counter are shared with the
         // ingest, so its accessor still reads the truth.
-        let (producer, mut row_writer, rx) =
-            writer.split_rows_for_offload(crate::contract_underlying_map::UNLABELLED_CONTRACT);
+        let tickvault_storage::top_volume_rank_persistence::TopVolumeOffload {
+            producer,
+            mut row_writer,
+            rows: rx,
+            flusher,
+            shutdown: top_volume_shutdown,
+        } = writer.split_rows_for_offload(
+            crate::contract_underlying_map::UNLABELLED_CONTRACT,
+            std::path::PathBuf::from(
+                tickvault_storage::top_volume_rank_persistence::TOP_VOLUME_SPILL_DIR,
+            ),
+        );
+        // The flush thread first. A spawn failure drops `flusher` with the
+        // closure, which closes the flush queue: the formatter then spills
+        // every batch (arm `flush_thread_gone`) instead of dropping it.
+        let flush_handle = match std::thread::Builder::new()
+            .name("tv-top-volume-flush".to_owned())
+            .spawn(move || flusher.run())
+        {
+            Ok(handle) => Some(handle),
+            Err(err) => {
+                error!(
+                    code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                    error = %err,
+                    "top-volume flush thread could not be spawned — every ranking \
+                     snapshot will be saved to the top_volume spill folder instead of \
+                     QuestDB this session. The lane and every other writer are unaffected."
+                );
+                None
+            }
+        };
         let (append_failures, append_failure_counter) = ingest.top_volume_append_failure_sink();
         match std::thread::Builder::new()
             .name("tv-top-volume-writer".to_owned())
@@ -17714,6 +17719,10 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                 );
             }
         }
+        // Held whether or not either thread spawned: shutdown requests the
+        // spill-only mode and polls the flush thread against the same deadline
+        // (it exits once the formatter's queue sender drops).
+        ingest = ingest.with_top_volume_flush_thread(flush_handle, top_volume_shutdown);
     }
 
     // Move the blocking ILP round trip off the drain task, BEFORE any socket
