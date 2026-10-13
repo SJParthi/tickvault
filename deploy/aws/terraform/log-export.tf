@@ -36,7 +36,9 @@
 #
 # PERMISSIONS (least privilege, Quote 27 of the daily-universe lock):
 #   tv-<env>-logs-to-firehose: CloudWatch Logs may put records into the two
-#     streams only, and only for the log groups named here.
+#     streams only, and only from the app log group or a tv-<env> Lambda
+#     log group (two prefix patterns; the trust policy has a 2,048-character
+#     limit that a per-group list broke on 2026-10-12).
 #   tv-<env>-firehose-logs-to-s3: Firehose may write objects under logs/ and
 #     logs-errors/ of the cold bucket only, list that one bucket, and write its
 #     own error log stream. No Delete action, no lifecycle or versioning
@@ -68,12 +70,6 @@ locals {
     "start-watchdog"             = aws_cloudwatch_log_group.start_watchdog.name
     "telegram-webhook"           = aws_cloudwatch_log_group.telegram_webhook.name
   }
-
-  # Every exported log group, for the trust condition of the subscription role.
-  log_export_source_groups = concat(
-    [aws_cloudwatch_log_group.tv_app.name],
-    values(local.lambda_log_export_groups),
-  )
 
   log_export_firehose_log_group = "/aws/kinesisfirehose/tv-${var.environment}-logs-to-s3"
 }
@@ -224,16 +220,27 @@ resource "aws_iam_role" "logs_to_firehose" {
       Principal = { Service = "logs.${var.aws_region}.amazonaws.com" }
       Action    = "sts:AssumeRole"
       Condition = {
-        # Only the exported log groups may use this role. Both ARN forms are
-        # listed (with and without the trailing :*), because the AWS
-        # documentation shows the source ARN both ways (Assumed).
+        # Only the app log group and this environment's Lambda log groups may
+        # use this role. Two prefix patterns, not one ARN per group: the
+        # per-group list (two ARN forms for each of the 13 groups) broke AWS's
+        # 2,048-character limit on a role's trust policy (ACLSizePerRole), and
+        # every terraform apply from 2026-10-12 failed creating this role, so
+        # no subscription filter existed and nothing reached S3. The trailing
+        # * on the Lambda pattern covers both forms CloudWatch Logs may send
+        # (with and without ":*"). Wider than the list: any tv-<env> Lambda log group matches,
+        # but the role can only put records into the two streams below, and a
+        # subscription filter still has to name the role. Every exported
+        # Lambda group matches the last pattern (ratcheted by
+        # log_export_wiring_guard). The app group is named exactly, in both
+        # forms, so a future "/tickvault/<env>/app-..." group does not match;
+        # SourceAccount pins this account, as the Firehose role above does.
+        StringEquals = { "aws:SourceAccount" = data.aws_caller_identity.current.account_id }
         StringLike = {
-          "aws:SourceArn" = flatten([
-            for group in local.log_export_source_groups : [
-              "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:${group}",
-              "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:${group}:*",
-            ]
-          ])
+          "aws:SourceArn" = [
+            "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:${aws_cloudwatch_log_group.tv_app.name}",
+            "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:${aws_cloudwatch_log_group.tv_app.name}:*",
+            "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/tv-${var.environment}-*",
+          ]
         }
       }
     }]
