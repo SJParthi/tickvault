@@ -619,11 +619,13 @@ pub struct AppliedWatermark {
     /// traffic and to archive a file only after a whole clean probe ran
     /// behind its last write.
     clean_probes: AtomicU64,
-    /// Suspicion episodes this process (audit DA-13b). Monotone; bumped once
-    /// per transition into suspicion. The tick and depth spill replays stamp
-    /// it with each ack and refuse to empty a spill file whose acks an
-    /// episode may have lied about, even when the episode began and ended
-    /// between two of their rounds.
+    /// Suspicion episodes this process (audit DA-13b, DA-13c). Monotone;
+    /// bumped once per transition into suspicion. The tick and depth spill
+    /// replays stamp it with each ack and refuse to empty a spill file whose
+    /// acks an episode may have lied about, even when the episode began and
+    /// ended between two of their rounds; the WAL replay settle step records
+    /// it at an ack and refuses to archive the acked segments if it has moved
+    /// since.
     suspect_episodes: AtomicU64,
     /// Where the LATEST suspicion episode began (audit DA-13b review): its
     /// number (0 while being rewritten), the clean-probe count and the wall
@@ -917,9 +919,11 @@ impl AppliedWatermark {
         self.clean_probes.load(Ordering::Acquire)
     }
 
-    /// How many times suspicion has begun this process (audit DA-13b). An
-    /// ack stamped with one value and read back with another may have been
-    /// acknowledged by a table that never applied it.
+    /// How many suspicion episodes have begun this process (audit DA-13b,
+    /// DA-13c). A change between two reads means the sink was suspect at some
+    /// point in between, even if it has recovered since: an ack stamped with
+    /// one value and read back with another may have been acknowledged by a
+    /// table that never applied it.
     #[must_use]
     pub fn suspect_episode_count(&self) -> u64 {
         self.suspect_episodes.load(Ordering::Acquire)
@@ -2144,18 +2148,20 @@ mod tests {
     }
 
     #[test]
-    fn test_regression_da13b_suspect_episode_count_counts_each_entry_into_suspicion() {
+    fn suspect_episode_count_counts_each_entry_into_suspicion_once() {
         let wm = AppliedWatermark::new_for_tests();
         assert_eq!(wm.suspect_episode_count(), 0);
         wm.note_questdb_probe(true);
+        assert_eq!(wm.suspect_episode_count(), 0, "a clean probe is no episode");
         wm.note_questdb_probe(false);
         wm.note_questdb_probe(false);
+        assert_eq!(wm.suspect_episode_count(), 1, "one episode, however long");
+        wm.note_questdb_probe(true);
         assert_eq!(
             wm.suspect_episode_count(),
             1,
-            "a second suspect probe in the same episode is not a new episode"
+            "recovery keeps the count, so a reader can still see the episode"
         );
-        wm.note_questdb_probe(true);
         wm.note_questdb_probe(false);
         assert_eq!(wm.suspect_episode_count(), 2);
     }

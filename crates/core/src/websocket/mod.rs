@@ -59,6 +59,9 @@ pub mod pool_budget;
 pub mod pool_supervisor;
 pub mod reader_runtime;
 pub mod reconnect_ladder;
+// 2026-10-13: a depth-200 swap whose new contract never streams is
+// resubscribed in place once at 90 s (scope lock, same date).
+pub mod silent_swap;
 // Rebuilt 2026-08-11 with the operator-approved 16-connection revival
 // (websocket-connection-scope-lock.md, the two 2026-08-09 sections). Deleted
 // in the 2026-07-17 stage-3 sweep alongside the lane it served.

@@ -149,6 +149,70 @@ pub const ARCHIVE_TEMP_DIR: &str = "data/tmp/partition-archive";
 /// costs nothing until first contention and needs no lazy initialiser.
 static ARCHIVE_PASS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Mutual exclusion between the after-close deferred-depth pass and the
+/// archiving of a depth partition (DA-13d).
+///
+/// The pass rewrites shed depth rows at their ORIGINAL receipt time, so it
+/// writes into `market_depth` / `market_depth_book` partitions this archiver
+/// can select. A row it committed after the pre-drop recount and before the
+/// `DROP PARTITION` was dropped with the partition; the pass then saw its
+/// flush acked, cleared its mark, and the rows were gone with no counter.
+///
+/// The pass holds this from its first write until its marks are cleared
+/// ([`hold_depth_partitions_for_rewrite`]). The archiver `try_lock`s it around
+/// each depth partition, export to drop: busy means the partition is HELD for
+/// a later pass, counted, never exported. So a depth partition is never
+/// exported while the pass writes, and the pass never writes while one is
+/// between its recount and its drop. A tokio mutex hands a released permit
+/// to a queued waiter first, so a waiting pass is not starved by the next
+/// partition's `try_lock`.
+static DEPTH_REWRITE_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Takes [`DEPTH_REWRITE_GATE`] for the after-close deferred-depth pass,
+/// waiting for at most the one depth partition an archive pass may have in
+/// flight. Hold the guard until the pass has cleared its marks.
+///
+/// Call it ONLY from a plain OS thread (the pass's own `tv-deferred-depth`
+/// thread): it blocks, and inside an async context it would panic. Cold path,
+/// once per pass.
+pub fn hold_depth_partitions_for_rewrite() -> tokio::sync::MutexGuard<'static, ()> {
+    DEPTH_REWRITE_GATE.blocking_lock()
+}
+
+/// The archiver's side of [`DEPTH_REWRITE_GATE`]: `None` while the
+/// after-close pass holds it (or a pass is queued for it). Never waits.
+/// O(1), cold path, once per depth partition.
+#[must_use]
+pub fn try_hold_depth_partitions() -> Option<tokio::sync::MutexGuard<'static, ()>> {
+    DEPTH_REWRITE_GATE.try_lock().ok()
+}
+
+/// Whether `table` is one the after-close deferred-depth pass writes.
+fn is_depth_rewrite_table(table: &str) -> bool {
+    DEPTH_TABLES.contains(&table)
+}
+
+/// Counts one depth partition held because the after-close pass is writing.
+fn note_depth_partition_held(summary: &mut ArchiveRunSummary) {
+    summary.held_deferred_depth = summary.held_deferred_depth.saturating_add(1);
+    count_depth_partitions_held(1);
+}
+
+/// Adds `n` to `tv_partition_archive_skipped_total{reason="deferred_depth_pass"}`
+/// (DA-13d). The ONE place the series' labels are written, so the boot seed
+/// (`n = 0`, from `main.rs`) and every hold land on the same series. Local
+/// `/metrics` only. O(1).
+// TEST-EXEMPT: the series is asserted with a real Prometheus recorder by app's daily_archive_boot::test_regression_da13d_depth_hold_counter_seeds_at_zero (storage has no exporter dev-dependency); the hold path that adds 1 is driven by the archiver gate test above
+pub fn count_depth_partitions_held(n: u64) {
+    metrics::counter!(
+        "tv_partition_archive_skipped_total",
+        "reason" => "deferred_depth_pass",
+        "cause" => "rewrite_in_flight",
+        "stage" => "pre_export"
+    )
+    .increment(n);
+}
+
 /// Free-space level below which an archive pass is reported as WEDGED.
 ///
 /// # The trap this names (2026-09-01)
@@ -1262,6 +1326,12 @@ pub struct ArchiveRunSummary {
     /// latch: a held partition is retried by the next day's pass, and the
     /// hold itself is bounded by [`MAX_CROSSVERIFY_HOLD_DAYS`].
     pub held_unverified: u32,
+    /// Depth partitions HELD this run because the after-close deferred-depth
+    /// pass was writing back shed rows (DA-13d, [`DEPTH_REWRITE_GATE`]). Not
+    /// a failure: the partition is exported by a later pass, once the
+    /// rewritten rows are in it. The daily scheduler reads it as
+    /// "incomplete, retry".
+    pub held_deferred_depth: u32,
 }
 
 /// How one `process_one` call ended, as far as the run loop cares.
@@ -1839,12 +1909,33 @@ impl PartitionArchiver {
                 continue;
             }
             // O(1) EXEMPT: end
+            // DA-13d: a depth partition is archived only while the after-close
+            // pass is not writing depth back; held for the whole of
+            // `process_one`, export to drop. Released at the end of this
+            // iteration, so a waiting pass gets it before the next partition.
+            let _depth_gate = if is_depth_rewrite_table(table) {
+                let Some(guard) = try_hold_depth_partitions() else {
+                    note_depth_partition_held(&mut summary);
+                    continue;
+                };
+                Some(guard)
+            } else {
+                None
+            };
             if self.process_one(table, &partition, &mut summary).await
                 == PartitionStep::WalNotApplied
             {
                 wal_blocked.push(table);
                 summary.tables_wal_not_applied = summary.tables_wal_not_applied.saturating_add(1);
             }
+        }
+        if summary.held_deferred_depth > 0 {
+            info!(
+                held_deferred_depth = summary.held_deferred_depth,
+                "partition archive: depth partitions HELD while the after-close pass writes \
+                 back order-book rows skipped under load (not a failure; a later pass \
+                 archives them with those rows in)"
+            );
         }
 
         // Best-effort final audit flush (AUDIT-WS-01 class — never gates).
@@ -5057,8 +5148,21 @@ mod stub_integration_tests {
         csv_body: &'static str,
         wal: WalStub,
     ) -> Responder {
+        qdb_responder_listing("ticks", partitions, tally, csv_body, wal)
+    }
+
+    /// [`qdb_responder_with`] listing `partitions` for `listed_table` instead
+    /// of `ticks` (every other table lists none).
+    fn qdb_responder_listing(
+        listed_table: &'static str,
+        partitions: Vec<&'static str>,
+        tally: TallyStub,
+        csv_body: &'static str,
+        wal: WalStub,
+    ) -> Responder {
         let wal_probes = Arc::new(AtomicU64::new(0));
         let tally_calls = Arc::new(AtomicU64::new(0));
+        let listed = format!("table_partitions('{listed_table}')");
         Arc::new(move |req: &SeenRequest| {
             let t = &req.target;
             if t.starts_with("/exp") {
@@ -5084,7 +5188,7 @@ mod stub_integration_tests {
                 );
                 return (200, Vec::new(), body.into_bytes());
             }
-            if t.contains("table_partitions('ticks')") {
+            if t.contains(listed.as_str()) {
                 let rows: Vec<String> = partitions
                     .iter()
                     .map(|p| format!("[\"{p}\",false]"))
@@ -5253,6 +5357,60 @@ mod stub_integration_tests {
             1
         );
         assert!(qdb_reqs.iter().any(|r| r.target.contains("wal_tables()")));
+    }
+
+    // Regression: 2026-10-13 (DA-13d) — the after-close deferred-depth pass
+    // and the archiver ran on the same depth partitions with nothing between
+    // them, so a rewrite committed between the recount and the DROP was
+    // dropped with the partition and its mark then cleared, uncounted.
+    //
+    // The ONLY test that touches DEPTH_REWRITE_GATE in this crate, so it
+    // cannot race another test for it; every other stub lists `ticks` only.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_regression_da13d_try_hold_depth_partitions_refused_while_hold_depth_partitions_for_rewrite_holds()
+     {
+        let (qdb_url, qdb_log) = spawn_stub(qdb_responder_listing(
+            crate::depth_persistence::MARKET_DEPTH_TABLE,
+            vec!["2026-04-01T09"],
+            Arc::new(|_call| (3, Some(STUB_MAX_TS.to_string()))),
+            CSV,
+            Arc::new(|_probe| (200, wal_tables_body(&[], &[]))),
+        ))
+        .await;
+        let (ilp_url, _ilp_log) = spawn_stub(ilp_responder(204)).await;
+        let objects = Arc::new(Mutex::new(HashMap::new()));
+        let (s3_url, _s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
+        let mut archiver =
+            build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200)).await;
+
+        // The pass's own entry point, on a blocking thread as in production.
+        let pass_guard = tokio::task::spawn_blocking(hold_depth_partitions_for_rewrite)
+            .await
+            .expect("the pass takes the gate");
+        assert!(
+            try_hold_depth_partitions().is_none(),
+            "the archiver must not get the gate while the pass holds it"
+        );
+
+        let held = archiver.run_archive_pass().await;
+        assert_eq!(held.held_deferred_depth, 1, "the depth partition is held");
+        assert_eq!(held.dropped, 0, "nothing is dropped while the pass writes");
+        assert_eq!(held.failed, 0, "a hold is not a failure");
+        let exported_while_held = qdb_log
+            .lock()
+            .expect("qdb log")
+            .iter()
+            .filter(|r| r.target.starts_with("/exp") || r.target.contains("DROP PARTITION"))
+            .count();
+        assert_eq!(
+            exported_while_held, 0,
+            "a held depth partition is neither exported nor dropped"
+        );
+
+        drop(pass_guard);
+        let freed = archiver.run_archive_pass().await;
+        assert_eq!(freed.held_deferred_depth, 0);
+        assert_eq!(freed.dropped, 1, "once the pass is done the partition goes");
     }
 
     // Multi-thread runtime: the questdb-rs ILP flush is SYNC-blocking;

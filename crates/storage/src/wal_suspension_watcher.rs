@@ -1204,6 +1204,15 @@ pub fn spawn_wal_suspension_watcher(questdb: QuestDbConfig) -> tokio::task::Join
                             && delta.currently_suspended == 0
                             && lag_tracker.reported_count() == 0,
                     );
+                    // DA-13c: archive acked replay segments once they are past
+                    // the durability lag and two clean probes. A few renames at
+                    // most, off the runtime worker; a join error only defers.
+                    if let Err(err) =
+                        tokio::task::spawn_blocking(crate::wal_replay_settle::promote_settled_now)
+                            .await
+                    {
+                        warn!(error = %err, "WAL replay settle step did not run this probe");
+                    }
                     // Attempt recovery, CONDITIONALLY. The module header
                     // above says a resume is an operator decision because it
                     // "can replay into a still-broken disk" — which is right,

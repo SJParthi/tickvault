@@ -1677,6 +1677,17 @@ async fn async_main() -> Result<()> {
     // seeded for the refusal counter anyway — there are only two, and a reader
     // comparing this block against the emit sites should find them all.
     metrics::counter!("tv_wal_replay_unknown_magic_total").increment(0);
+    // DA-13c: local `/metrics` only (no EMF name, no alarm).
+    metrics::counter!(tickvault_app::dhan_feed_stack::WAL_REFOLD_ABANDONED_BYTES_COUNTER)
+        .increment(0);
+    metrics::counter!(tickvault_storage::wal_replay_settle::WAL_REPLAY_SETTLE_HELD_COUNTER)
+        .increment(0);
+    metrics::counter!(tickvault_storage::wal_replay_settle::WAL_REPLAY_SETTLE_RECOVERED_COUNTER)
+        .increment(0);
+    // A gauge the boot replay may already have set: `increment(0.0)` registers
+    // it without overwriting that value.
+    metrics::gauge!(tickvault_storage::wal_replay_settle::WAL_REPLAY_SETTLE_UNREADABLE_BYTES_GAUGE)
+        .increment(0.0);
     metrics::counter!("tv_seal_writer_drain_dropped_total").increment(0);
     metrics::counter!("tv_ws_frame_spill_write_errors_total", "stage" => "write_record")
         .increment(0);
@@ -1800,6 +1811,16 @@ async fn async_main() -> Result<()> {
     metrics::counter!("tv_seal_spill_sync_failed_total").increment(0);
     metrics::counter!("tv_seal_unwritten_mark_errors_total").increment(0);
     metrics::counter!("tv_wal_deferred_depth_persist_failed_total").increment(0);
+    // DA-13d: pinned WAL segments deleted below the disk floor. Local /metrics only.
+    for copy_in_s3 in ["true", "false"] {
+        metrics::counter!(
+            tickvault_storage::ws_frame_spill::WAL_DEFERRED_DEPTH_LOST_COUNTER,
+            "copy_in_s3" => copy_in_s3
+        )
+        .increment(0);
+    }
+    // DA-13d: depth partitions the archiver held for the after-close pass.
+    tickvault_storage::partition_archive::count_depth_partitions_held(0);
     // The after-close depth pass stopping at its disk floor (2026-10-13).
     // Local /metrics only: no alarm or filter reads it.
     metrics::counter!("tv_wal_deferred_depth_pass_total", "outcome" => "disk_floor").increment(0);
@@ -3777,6 +3798,15 @@ async fn async_main() -> Result<()> {
         tokio::spawn(tickvault_app::dhan_live_universe::run_degraded_universe_heartbeat(reason));
     }
 
+    // Scope lock 2026-10-13: the silent depth-200 swap wait, validated at boot
+    // (10..=600 s); installed before any depth socket can swap.
+    let silent_swap_secs = tickvault_core::websocket::silent_swap::set_resubscribe_after_secs(
+        config.dhan_universe.depth200_silent_swap_resubscribe_secs,
+    );
+    info!(
+        silent_swap_secs,
+        "depth-200 silent swap resubscribe wait installed"
+    );
     let dhan_feed_stack_monitor = tickvault_app::dhan_feed_stack::spawn_dhan_feed_stack(
         tickvault_app::dhan_feed_stack::DhanFeedStackParams {
             shutdown: std::sync::Arc::clone(&dhan_feed_shutdown),
