@@ -34,5 +34,10 @@
 # crossbeam-epoch 0.9.20 + quinn-proto 0.11.15 (surgical Cargo.lock
 # version+checksum edit). Both advisories are resolved in Cargo.lock, so
 # cargo-audit no longer flags them and no ignore is required.
+# 2026-10-13: RUSTSEC-2026-0338/0339/0340/0341/0342 (quinn-proto 0.11.15,
+# audit-only: quinn is a phantom lockfile entry, never compiled) resolved
+# the same way: quinn-proto 0.11.15 -> 0.11.18, plus rand_pcg 0.10.2 (new
+# dependency of 0.11.18) and two existing crates on getrandom 0.4.2's edge
+# list. No other package version changed; no ignore added.
 ignore = []
 
