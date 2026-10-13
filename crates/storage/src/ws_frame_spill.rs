@@ -5036,6 +5036,7 @@ pub fn replay_all_with_report_fenced<P: AsRef<Path>>(
 
 /// Lists the `*.wal` segment files directly under `dir` (NOT recursive).
 /// Returns an empty Vec for a missing/unreadable dir.
+// TEST-EXEMPT: widened from private to pub(crate) for wal_replay_settle; covered by every replay/prune test that lists segments.
 pub(crate) fn wal_segments_in(dir: &Path) -> Vec<PathBuf> {
     // O(1) EXEMPT: boot replay helper — cold path, bounded segment listing
     let Ok(entries) = std::fs::read_dir(dir) else {

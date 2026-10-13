@@ -121,8 +121,8 @@ impl SettleBatchStart {
 
 /// [`SettleBatchStart::of`] the process-global watermark. Take it BEFORE the
 /// batch's first row is handed to a writer (where `unlanded_before` is read).
-// TEST-EXEMPT: thin global wrapper; SettleBatchStart::of is covered by the module tests.
 #[must_use]
+// TEST-EXEMPT: thin global wrapper; SettleBatchStart::of is covered by the module tests.
 pub fn replay_batch_start() -> SettleBatchStart {
     SettleBatchStart::of(applied_watermark())
 }
@@ -507,6 +507,7 @@ pub fn promote_settled_now() -> SettleVerdict {
 
 /// Called at the top of every replay pass; does work only at boot, when an
 /// earlier process left segments in `settling/`.
+// TEST-EXEMPT: thin global wrapper; SettleState::recover is covered by the module tests.
 pub(crate) fn recover_settling_leftovers(wal_dir: &Path) -> u64 {
     state().recover(wal_dir, applied_watermark())
 }
