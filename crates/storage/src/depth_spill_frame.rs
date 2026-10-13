@@ -390,13 +390,13 @@ pub async fn replay_framed_spill_dir(
             }
         };
         let file_len = meta.len();
-        let writer_may_still_append =
-            spill_file_may_still_be_appended(&path, &meta, file_index == last_index, view, "depth");
         if file_len == 0 {
             forget_resume_offset(&path);
             outcome.files_skipped_empty = outcome.files_skipped_empty.saturating_add(1);
             continue;
         }
+        let writer_may_still_append =
+            spill_file_may_still_be_appended(&path, &meta, file_index == last_index, view, "depth");
         rewind_after_suspicion(&path, view, "depth");
         let resume_from = resume_offset_for(&path).min(file_len);
         if resume_from == file_len {

@@ -1163,8 +1163,6 @@ pub async fn replay_spill_dir(
             }
         };
         let file_len = meta.len();
-        let writer_may_still_append =
-            spill_file_may_still_be_appended(&path, &meta, file_index == last_index, view, label);
         if file_len == 0 {
             forget_resume_offset(&path);
             // Already drained. Leave it alone: truncating it again would
@@ -1172,6 +1170,10 @@ pub async fn replay_spill_dir(
             outcome.files_skipped_empty = outcome.files_skipped_empty.saturating_add(1);
             continue;
         }
+        // After the empty skip, so a just-emptied (fresh mtime) file is not
+        // counted as a live non-last file.
+        let writer_may_still_append =
+            spill_file_may_still_be_appended(&path, &meta, file_index == last_index, view, label);
         // A suspicion episode since this file's first unconfirmed ack: those
         // acks may be lies, so start the file again (audit DA-13b).
         rewind_after_suspicion(&path, view, label);
@@ -1951,7 +1953,7 @@ async fn run_replay_loop(dir: PathBuf, url: String, require_upload: bool) {
                     source = "spill_replay_held_sink_suspect",
                     dir = %dir.display(),
                     "spill replay is holding: QuestDB reports a suspended table, a growing \
-                     apply lag, or cannot be probed, so an acknowledgement would not prove the \
+                     apply lag, or its probe is blind, so an acknowledgement would not prove the \
                      rows were applied. The spill files are kept as they are and the replay \
                      resumes once a probe is clean."
                 );
