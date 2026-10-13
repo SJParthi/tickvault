@@ -4825,6 +4825,19 @@ wall-clock minute under its own note.
   has no spill tier, and a batch too wide is DROPPED.
 - Adds a CloudWatch metric name or alarm without a lever, per §2.3n.
 
+> **⚠ CHANGED 2026-10-13 (top_volume spill plan, owner approval "Approve dude
+> don't miss anything dude okay?") — the write path now HAS a spill tier.** A
+> board batch that does not land (flush failed, flush queue full, tables not
+> keyed, no sender, breaker open, flush thread gone, shutdown) is saved, synced,
+> to `data/spill/top_volume` and replayed by a third supervised replay after
+> 15:40 IST once the tables are keyed, with no session-window filter; a file
+> older than its table's hot window less a day is set aside in `quarantine/`
+> (uploaded to `top-volume-quarantine/` before any trim). Rows are counted as
+> discarded only when the spill itself is refused. `[top_volume]
+> spill_enabled = false` restores the drop. The REJECT row above STANDS: the
+> persistence bound is kept; only the drop became a spill. Plan:
+> `.claude/plans/active-plan-top-volume-spill.md`.
+
 ### 2026-09-12 (SAME DAY, LATER) — THE TABLE IS `top_volume`, AND ITS FOUR ORPHANED VIEWS ARE SWEPT
 
 **The verbatim operator demand (2026-09-12, typed directly in-session — preserve

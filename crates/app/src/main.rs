@@ -2660,6 +2660,9 @@ async fn async_main() -> Result<()> {
                         std::path::Path::new("data/spill"),
                         std::path::Path::new(tickvault_storage::tick_persistence::TICK_SPILL_DIR),
                         std::path::Path::new(tickvault_storage::depth_persistence::DEPTH_SPILL_DIR),
+                        std::path::Path::new(
+                            tickvault_storage::top_volume_rank_persistence::TOP_VOLUME_SPILL_DIR,
+                        ),
                         &today_spill_file,
                         max_segments,
                         &should_continue,
@@ -3041,6 +3044,18 @@ async fn async_main() -> Result<()> {
             config.questdb.http_port,
             require_raw_upload,
         );
+
+    // The third drain, for the top_volume board spill (2026-10-13, plan item 5):
+    // held until the tables are keyed, then after 15:40 IST; no window filter;
+    // a file older than the hot window less a day is set aside, never replayed.
+    let _top_volume_spill_drain_supervisor = config.top_volume.spill_enabled.then(|| {
+        tickvault_storage::tick_spill_replay::spawn_supervised_top_volume_spill_replay(
+            &config.questdb.host,
+            config.questdb.http_port,
+            require_raw_upload,
+            &config.partition_retention,
+        )
+    });
 
     // Feed-hardening Item 5 (2026-08-19): the watcher above MEASURES a filling
     // volume and does nothing about it. This loop is the remediation arm.
@@ -3835,6 +3850,7 @@ async fn async_main() -> Result<()> {
             // Frame-silence fast paths (scope lock 2026-10-10): shadow by
             // default, so they count would-redials before anything acts.
             frame_silence_fast_path: config.dhan_universe.frame_silence_fast_path,
+            top_volume_spill_enabled: config.top_volume.spill_enabled,
             dhan_enabled: config.feeds.dhan_enabled,
             instance_lock_held: std::sync::Arc::clone(&dhan_instance_lock_held),
             // Frames a previous session captured but died before folding. The

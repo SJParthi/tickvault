@@ -1465,6 +1465,40 @@ pub(crate) fn hour_window_decision(
     }
 }
 
+/// Whether `table` is one of the four `top_volume_<tf>` tables. O(4).
+#[must_use]
+pub(crate) fn is_top_volume_table(table: &str) -> bool {
+    crate::top_volume_rank_persistence::SnapshotCadence::ALL
+        .iter()
+        .any(|c| c.table_name() == table)
+}
+
+/// The spill folders whose pending rows a replay could still post into
+/// `table` (top_volume spill plan item 6, 2026-10-13): the top_volume folder
+/// for a `top_volume_<tf>` table, the depth and tick folders for every other.
+#[must_use]
+pub(crate) fn spill_dirs_for_table(table: &str) -> &'static [&'static str] {
+    const TOP_VOLUME: [&str; 1] = [crate::top_volume_rank_persistence::TOP_VOLUME_SPILL_DIR];
+    const TICKS_AND_DEPTH: [&str; 2] = [
+        crate::depth_persistence::DEPTH_SPILL_DIR,
+        crate::tick_persistence::TICK_SPILL_DIR,
+    ];
+    if is_top_volume_table(table) {
+        &TOP_VOLUME
+    } else {
+        &TICKS_AND_DEPTH
+    }
+}
+
+/// Whether a top_volume table's archive is skipped this run: its spill
+/// folder holds rows a replay will post into it, and the disk is not under
+/// pressure. Under pressure the archive proceeds (the drop stays verified,
+/// and a file older than the hot window is set aside, not replayed). Pure.
+#[must_use]
+pub(crate) fn top_volume_archive_deferred(spill_pending: bool, under_disk_pressure: bool) -> bool {
+    spill_pending && !under_disk_pressure
+}
+
 /// What a partition-list query found for one table.
 ///
 /// `TableAbsent` exists because "this table is not on the volume" and
@@ -1848,6 +1882,23 @@ impl PartitionArchiver {
                 continue; // WAL-suspended — warned above, skipped table-wide
             }
             summary.tables_scanned = summary.tables_scanned.saturating_add(1);
+            // Top_volume spill plan item 6 (2026-10-13): a top_volume table
+            // is not archived while its own spill folder still holds rows a
+            // replay could post into it, unless the disk is under pressure.
+            if is_top_volume_table(table)
+                && top_volume_archive_deferred(
+                    crate::off_worker::off_worker(|| Self::spill_dirs_have_pending_data(table)),
+                    self.cfg.under_disk_pressure,
+                )
+            {
+                metrics::counter!("tv_partition_archive_top_volume_deferred_total").increment(1);
+                info!(
+                    table,
+                    "partition archive: the top_volume spill folder still holds rows the \
+                     replay will post into this table, so it is not archived this run"
+                );
+                continue;
+            }
             let hot_days = hot_window_days(table, &self.cfg);
             match self.list_eligible_partitions(table, hot_days).await {
                 Ok(PartitionListing::Eligible(names)) => {
@@ -2540,13 +2591,15 @@ impl PartitionArchiver {
     /// is emptied to 0 bytes and kept, never deleted, so after the first spill
     /// the hour-window archive was deferred for good. See
     /// [`spill_dir_has_pending_data`] for the rule now used.
-    fn spill_dirs_have_pending_data() -> bool {
-        [
-            crate::depth_persistence::DEPTH_SPILL_DIR,
-            crate::tick_persistence::TICK_SPILL_DIR,
-        ]
-        .iter()
-        .any(|dir| spill_dir_has_pending_data(std::path::Path::new(dir)))
+    ///
+    /// ⚠ CHANGED 2026-10-13 (top_volume spill plan item 6): scoped to the
+    /// table. A `top_volume_<tf>` table looks only at its own spill folder;
+    /// every other table keeps the depth + tick check, so a top_volume spill
+    /// can never defer the hour archive of `market_depth`.
+    fn spill_dirs_have_pending_data(table: &str) -> bool {
+        spill_dirs_for_table(table)
+            .iter()
+            .any(|dir| spill_dir_has_pending_data(std::path::Path::new(dir)))
     }
 
     /// Lists a table's eligible (aged-out, inactive, well-formed-name)
@@ -2608,7 +2661,8 @@ impl PartitionArchiver {
         // alternative under pressure is a full volume, which WAL-suspends
         // EVERY table at once (precedent: 2026-08-25, 14 tables suspended,
         // writes ACKed and never applied, box unreachable by SSM).
-        let spill_pending = crate::off_worker::off_worker(Self::spill_dirs_have_pending_data);
+        let spill_pending =
+            crate::off_worker::off_worker(|| Self::spill_dirs_have_pending_data(table));
         let list_sql = match hour_window_decision(
             hot_window_hours(table, self.cfg.depth_hot_hours),
             spill_pending,
@@ -6316,6 +6370,75 @@ mod hour_granular_eligibility_tests {
     // dirs are non-empty BECAUSE the disk is full, so the hour window
     // deferred to a 2-day one that protects every partition the box wrote
     // that session.
+
+    #[test]
+    fn test_top_volume_spill_defers_only_top_volume_tables() {
+        // Top_volume spill plan item 6 (2026-10-13).
+        for c in crate::top_volume_rank_persistence::SnapshotCadence::ALL {
+            assert!(is_top_volume_table(c.table_name()));
+            assert_eq!(
+                spill_dirs_for_table(c.table_name()),
+                [crate::top_volume_rank_persistence::TOP_VOLUME_SPILL_DIR]
+            );
+        }
+        assert!(
+            !is_top_volume_table("top_volume"),
+            "the retired shared table has no writer"
+        );
+        assert!(
+            top_volume_archive_deferred(true, false),
+            "pending, no pressure: wait"
+        );
+        assert!(
+            !top_volume_archive_deferred(true, true),
+            "pressure archives anyway"
+        );
+        assert!(!top_volume_archive_deferred(false, false));
+        assert!(!top_volume_archive_deferred(false, true));
+        // Wired: the per-table check runs before the table is listed.
+        let src = include_str!("partition_archive.rs");
+        let prod = src.split_once("\n#[cfg(test)]").map_or(src, |(p, _)| p);
+        let gate = prod
+            .find("if is_top_volume_table(table)\n                && top_volume_archive_deferred(")
+            .expect("the top_volume gate is in the table loop");
+        let list = prod
+            .find("match self.list_eligible_partitions(table, hot_days).await")
+            .expect("the table listing");
+        assert!(gate < list, "the gate runs before the table is listed");
+    }
+
+    /// Names the three item-6 helpers together: the gate is the conjunction
+    /// of "a top_volume table", "its own folder" and "no disk pressure".
+    #[test]
+    fn test_is_top_volume_table_spill_dirs_for_table_and_top_volume_archive_deferred_compose() {
+        let table = crate::top_volume_rank_persistence::SnapshotCadence::OneMinute.table_name();
+        assert!(is_top_volume_table(table));
+        assert_eq!(spill_dirs_for_table(table).len(), 1);
+        assert!(top_volume_archive_deferred(true, false));
+        assert!(!is_top_volume_table("market_depth"));
+        assert_eq!(spill_dirs_for_table("market_depth").len(), 2);
+    }
+
+    #[test]
+    fn test_tick_and_depth_gate_unchanged() {
+        for table in ["ticks", "market_depth", "candles_1m", "order_audit"] {
+            assert!(!is_top_volume_table(table));
+            assert_eq!(
+                spill_dirs_for_table(table),
+                [
+                    crate::depth_persistence::DEPTH_SPILL_DIR,
+                    crate::tick_persistence::TICK_SPILL_DIR,
+                ],
+                "{table} keeps the depth + tick check"
+            );
+        }
+        // A pending top_volume file never defers the depth hour archive: the
+        // hour decision only ever sees the depth + tick folders for it.
+        assert!(
+            !spill_dirs_for_table("market_depth")
+                .contains(&crate::top_volume_rank_persistence::TOP_VOLUME_SPILL_DIR)
+        );
+    }
 
     /// Exhaustive truth table for `hour_window_decision`.
     ///

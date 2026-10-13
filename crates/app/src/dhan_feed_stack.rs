@@ -12189,6 +12189,8 @@ pub struct DhanFeedStackParams {
     /// whether the evidence-confirmed frame-silence redials count only
     /// (`shadow`, the default), act, or are off.
     pub frame_silence_fast_path: FrameSilenceFastPath,
+    /// `[top_volume] spill_enabled` (2026-10-13): false discards boards QuestDB refuses.
+    pub top_volume_spill_enabled: bool,
     pub questdb: QuestDbConfig,
     /// The process-wide write-ahead log every captured frame lands in BEFORE
     /// it is visible to the fold. `None` refuses the lane: capture-at-receipt
@@ -17632,7 +17634,8 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // that does not land is spilled, synced, to `data/spill/top_volume`; a
     // breaker keeps a dead QuestDB to one timeout per cooldown. The drain side
     // is unchanged. Spilled files are kept on disk until the replay lands
-    // (plan item 5, a later change).
+    // (plan item 5, a later change). ⚠ 2026-10-13 PR-C: it has; main.rs
+    // spawns it (it posts after 15:40 IST) unless `spill_enabled = false`.
     //
     // A spawn failure leaves `top_volume` unset. That is the honest degrade:
     // no snapshot rows rather than a synchronous ILP flush on the frame drain,
@@ -17654,8 +17657,8 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             shutdown: top_volume_shutdown,
         } = writer.split_rows_for_offload(
             crate::contract_underlying_map::UNLABELLED_CONTRACT,
-            std::path::PathBuf::from(
-                tickvault_storage::top_volume_rank_persistence::TOP_VOLUME_SPILL_DIR,
+            tickvault_storage::top_volume_rank_persistence::TopVolumeSpillSettings::production(
+                params.top_volume_spill_enabled,
             ),
         );
         // The flush thread first. A spawn failure drops `flusher` with the
@@ -21679,6 +21682,7 @@ mod tests {
             depth_storage: Default::default(),
             main_feed_backup_top_n: 0,
             frame_silence_fast_path: FrameSilenceFastPath::default(),
+            top_volume_spill_enabled: true,
             dhan_enabled: false,
             instance_lock_held: Arc::new(AtomicBool::new(false)),
             // A disabled lane never reaches the re-fold, which is exactly why
@@ -27623,6 +27627,23 @@ mod wal_refold_tests {
             "a post-replay rebaseline seeds from the same stale value — the observer \
              is skipped instead"
         );
+        // Top_volume spill plan edge case E2 (2026-10-13): the refold never
+        // ranks a board, so a replayed spill cannot overwrite a re-ranked one.
+        let one_tick = production
+            .split("\nfn refold_one_tick")
+            .nth(1)
+            .expect("refold_one_tick");
+        for b in [
+            body,
+            &one_tick[..one_tick.find("\nfn ").unwrap_or(one_tick.len())],
+        ] {
+            for t in ["_top_volume_sweep", "_top_volume_window", "step_idle_work"] {
+                assert!(
+                    !b.contains(t),
+                    "the WAL refold must not rank boards (`{t}`)"
+                );
+            }
+        }
         let observer = production
             .split("fn observe_for_ranking(&mut self")
             .nth(1)

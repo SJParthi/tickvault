@@ -2681,6 +2681,10 @@ pub(crate) struct TopVolumeSpiller {
     sync: Option<crate::tick_persistence::SpillSyncFn>,
     /// `formatter` or `flush`, for the log lines.
     thread: &'static str,
+    /// `[top_volume] spill_enabled` (default true). `false` restores the
+    /// pre-2026-10-13 behaviour: every arm that would spill discards and
+    /// counts the rows on `tv_top_volume_rank_rows_discarded_total` instead.
+    enabled: bool,
     /// Shared by the formatter's and the flush thread's spillers (a clone
     /// shares it): every top_volume append is serialised, so the hard
     /// ceiling cannot be overshot by two concurrent payloads and a failed
@@ -2692,13 +2696,14 @@ pub(crate) struct TopVolumeSpiller {
 }
 
 impl TopVolumeSpiller {
-    fn production(dir: std::path::PathBuf, thread: &'static str) -> Self {
+    fn production(settings: TopVolumeSpillSettings, thread: &'static str) -> Self {
         Self {
-            dir,
-            free_reserve: TOP_VOLUME_SPILL_FREE_RESERVE_BYTES,
+            dir: settings.dir,
+            free_reserve: settings.free_reserve_bytes,
             ceiling: top_volume_spill_max_bytes,
             sync: crate::tick_persistence::SPILL_SYNC_OFF_DRAIN,
             thread,
+            enabled: settings.enabled,
             lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             spilled_episodes: 0,
             lost_episodes: 0,
@@ -2723,7 +2728,15 @@ impl TopVolumeSpiller {
         let mut spec = top_volume_spill_spec(&self.dir);
         spec.free_reserve = self.free_reserve;
         spec.ceiling = self.ceiling;
-        let written = {
+        // `[top_volume] spill_enabled = false` (rollback switch, 2026-10-13):
+        // the batch takes the SAME refusal arm below, so it is discarded,
+        // counted and logged exactly as before the spill tier existed, and
+        // the discard counter keeps its single increment site.
+        let written = if !self.enabled {
+            Err(std::io::Error::other(
+                "the top_volume spill tier is turned off by [top_volume] spill_enabled = false",
+            ))
+        } else {
             // A poisoned lock only means the other thread panicked mid-spill;
             // the guarded data is `()`, so carry on.
             let _serialised = self
@@ -2757,8 +2770,8 @@ impl TopVolumeSpiller {
                         path = %path.display(),
                         "top_volume rows did not reach QuestDB and were SAVED to the spill \
                          file named here, not lost. They are not in the top_volume tables \
-                         until the replay posts them back (a later change; until then the \
-                         file stays on disk). Re-ingest by hand is safe to repeat, because \
+                         until the supervised replay posts them back, after 15:40 IST once \
+                         the tables are keyed. Re-ingest by hand is safe to repeat, because \
                          the top_volume dedup key covers every row: \
                          curl --data-binary @<path> http://<questdb>:9000/write"
                     );
@@ -3079,6 +3092,33 @@ impl TopVolumeFlushWorker {
     }
 }
 
+/// Where and whether [`TopVolumeRankWriter::split_rows_for_offload`] spills a
+/// batch that does not land (top_volume spill plan, PR-C, 2026-10-13).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopVolumeSpillSettings {
+    /// The spill folder. Production: [`TOP_VOLUME_SPILL_DIR`].
+    pub dir: std::path::PathBuf,
+    /// `[top_volume] spill_enabled`. `false` discards and counts instead of
+    /// spilling, which is the behaviour before the spill tier existed.
+    pub enabled: bool,
+    /// Free space a spill write must leave behind. Production:
+    /// [`TOP_VOLUME_SPILL_FREE_RESERVE_BYTES`] (40 GiB); a test lowers it,
+    /// because neither a build machine nor CI has that much free.
+    pub free_reserve_bytes: u64,
+}
+
+impl TopVolumeSpillSettings {
+    /// The production folder and floor, with the config switch.
+    #[must_use]
+    pub fn production(enabled: bool) -> Self {
+        Self {
+            dir: std::path::PathBuf::from(TOP_VOLUME_SPILL_DIR),
+            enabled,
+            free_reserve_bytes: TOP_VOLUME_SPILL_FREE_RESERVE_BYTES,
+        }
+    }
+}
+
 /// Everything [`TopVolumeRankWriter::split_rows_for_offload`] returns: the
 /// drain's producer, the formatter and its row queue, and the flush worker.
 /// The lane runs `row_writer` on `tv-top-volume-writer` and `flusher` on
@@ -3108,16 +3148,17 @@ impl TopVolumeRankWriter {
     /// `unlabelled` is the label written when a row's contract has no entry in
     /// the batch's label snapshot -- the same fallback the projection counts
     /// as `label_unavailable`.
+    ///
+    /// ⚠ CHANGED 2026-10-13 (PR-C): the folder comes in
+    /// [`TopVolumeSpillSettings`], with the `[top_volume] spill_enabled`
+    /// switch and the per-write free-space floor.
     #[must_use]
     pub fn split_rows_for_offload(
         self,
         unlabelled: &'static str,
-        spill_dir: std::path::PathBuf,
+        spill: TopVolumeSpillSettings,
     ) -> TopVolumeOffload {
-        self.split_rows_with_spiller(
-            unlabelled,
-            TopVolumeSpiller::production(spill_dir, "formatter"),
-        )
+        self.split_rows_with_spiller(unlabelled, TopVolumeSpiller::production(spill, "formatter"))
     }
 
     /// The split with an explicit spiller (tests lower its free-space floor
@@ -3189,6 +3230,14 @@ impl TopVolumeRankWriter {
 // production path builds; they are kept per house convention. ⚠ The replay
 // supervisor for this folder lands in PR-C (item 5): until it does, spilled
 // files are KEPT on disk and re-ingestable by hand, not replayed.
+//
+// ⚠ CHANGED 2026-10-13 (PR-C, item 5): the replay has landed. A third
+// supervised replay (`tick_spill_replay::spawn_supervised_top_volume_spill_replay`)
+// drains this folder after 15:40 IST once the tables are keyed, with no
+// session-window filter; a file older than its table's hot window less a day
+// is set aside in `quarantine/` (owner decision Q4(b)), which is uploaded to
+// the cold bucket before any trim. `[top_volume] spill_enabled = false`
+// discards instead of spilling and does not start the replay.
 
 /// Folder a top_volume batch that cannot reach QuestDB is appended to:
 /// `data/spill/top_volume`, a sibling of
@@ -4953,7 +5002,13 @@ mod row_handoff_tests {
             rows,
             flusher,
             shutdown: _,
-        } = w.split_rows_for_offload("unmapped", dir);
+        } = w.split_rows_for_offload(
+            "unmapped",
+            TopVolumeSpillSettings {
+                dir,
+                ..TopVolumeSpillSettings::production(true)
+            },
+        );
         (producer, row_writer, rows, flusher)
     }
 
@@ -5473,6 +5528,7 @@ mod spill_writer_tests {
             ceiling: || u64::MAX,
             sync: crate::tick_persistence::SPILL_SYNC_OFF_DRAIN,
             thread: "formatter",
+            enabled: true,
             lock: Arc::new(std::sync::Mutex::new(())),
             spilled_episodes: 0,
             lost_episodes: 0,
@@ -5937,7 +5993,13 @@ mod spill_writer_tests {
         // The production split, with its real spec (40 GiB floor): only the
         // folder is checked here, since a build machine may not have the room.
         let dir = scratch_dir("prod-split");
-        let offload = keyed_writer(&KEYED).split_rows_for_offload("unmapped", dir.clone());
+        let offload = keyed_writer(&KEYED).split_rows_for_offload(
+            "unmapped",
+            TopVolumeSpillSettings {
+                dir: dir.clone(),
+                ..TopVolumeSpillSettings::production(true)
+            },
+        );
         assert_eq!(offload.row_writer.spiller.dir, dir);
         assert_eq!(offload.flusher.spiller.dir, dir);
         assert_eq!(offload.row_writer.spiller.thread, "formatter");
@@ -5950,6 +6012,41 @@ mod spill_writer_tests {
             Arc::ptr_eq(&offload.row_writer.breaker, &offload.flusher.breaker),
             "both threads share one breaker"
         );
+        assert!(offload.row_writer.spiller.enabled && offload.flusher.spiller.enabled);
+    }
+
+    #[test]
+    fn test_spill_disabled_restores_discard_behaviour() {
+        // `[top_volume] spill_enabled = false` (PR-C rollback switch): every
+        // arm that would spill discards and counts instead, and nothing is
+        // written to the folder.
+        let dir = scratch_dir("disabled");
+        let settings = TopVolumeSpillSettings {
+            dir: dir.clone(),
+            ..TopVolumeSpillSettings::production(false)
+        };
+        let offload = keyed_writer(&KEYED).split_rows_for_offload("unmapped", settings);
+        assert!(!offload.row_writer.spiller.enabled && !offload.flusher.spiller.enabled);
+        let off = TopVolumeSpiller {
+            enabled: false,
+            ..spiller(dir.clone())
+        };
+        // Formatter arm (tables not keyed).
+        let (mut producer, mut formatter, _flusher) =
+            split_with(keyed_writer(&UNKEYED), off.clone());
+        let out = formatter.write_batch(batch_of(&mut producer, &[1, 2, 3]));
+        assert_eq!((out.spilled, out.lost), (0, 3));
+        // Flush-thread arm (no sender: the flush fails).
+        let (mut producer, mut formatter, mut flusher) = split_with(keyed_writer(&KEYED), off);
+        let out = formatter.write_batch(batch_of(&mut producer, &[4, 5]));
+        assert_eq!(out.queued, 2);
+        let queued = flusher.flushes.try_recv().expect("queued");
+        assert_eq!(flusher.flush_one(queued), TopVolumeFlushOutcome::Lost(2));
+        assert!(
+            spilled_bytes(&dir).is_empty(),
+            "a disabled tier writes nothing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// An ILP server that answers 400 (a permanent refusal) to every write.
