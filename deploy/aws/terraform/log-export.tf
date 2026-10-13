@@ -226,15 +226,19 @@ resource "aws_iam_role" "logs_to_firehose" {
         # 2,048-character limit on a role's trust policy (ACLSizePerRole), and
         # every terraform apply from 2026-10-12 failed creating this role, so
         # no subscription filter existed and nothing reached S3. The trailing
-        # * covers both forms CloudWatch Logs may send (with and without
-        # ":*"). Wider than the list: any tv-<env> Lambda log group matches,
+        # * on the Lambda pattern covers both forms CloudWatch Logs may send
+        # (with and without ":*"). Wider than the list: any tv-<env> Lambda log group matches,
         # but the role can only put records into the two streams below, and a
         # subscription filter still has to name the role. Every exported
-        # Lambda group matches the second pattern (ratcheted by
-        # log_export_wiring_guard).
+        # Lambda group matches the last pattern (ratcheted by
+        # log_export_wiring_guard). The app group is named exactly, in both
+        # forms, so a future "/tickvault/<env>/app-..." group does not match;
+        # SourceAccount pins this account, as the Firehose role above does.
+        StringEquals = { "aws:SourceAccount" = data.aws_caller_identity.current.account_id }
         StringLike = {
           "aws:SourceArn" = [
-            "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:${aws_cloudwatch_log_group.tv_app.name}*",
+            "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:${aws_cloudwatch_log_group.tv_app.name}",
+            "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:${aws_cloudwatch_log_group.tv_app.name}:*",
             "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/tv-${var.environment}-*",
           ]
         }

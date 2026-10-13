@@ -841,6 +841,14 @@ backup_top_n = 1000
 # behaviour. The depth-200 900 s backstop is in code, not here.
 frame_silence_fast_path = "shadow"
 
+# Scope lock 2026-10-13: a depth-200 contract that sends nothing this many
+# seconds after its in-place swap has its subscription sent again on the same
+# socket (unsubscribe, then subscribe), once, with no redial. 90 is the
+# owner's STARTING value; lower it once the measured first-packet p99
+# (tv_depth_first_packet_latency_ms, basis "depth200_socket") supports it.
+# Bounds 10..=600, checked at boot.
+depth200_silent_swap_resubscribe_secs = 90
+
 # ===========================================================================
 # Daily timeframe-consistency verifier (operator directive 2026-07-13 —
 # "how will you guarantee that all our defined timeframes internally are

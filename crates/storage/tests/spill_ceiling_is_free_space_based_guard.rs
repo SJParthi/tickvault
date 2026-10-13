@@ -74,8 +74,39 @@ fn ceiling_block<'a>(src: &'a str, compare: &str) -> Option<&'a str> {
 #[test]
 fn the_tick_spill_ceiling_refuses_only_against_free_space() {
     let src = production_half("src/tick_persistence.rs");
-    let block = ceiling_block(&src, "let ceiling = tick_spill_max_bytes();")
-        .expect("the tick soft-ceiling comparison must still exist");
+    // 2026-10-13 (top_volume spill plan item 1): the tick spill runs through
+    // the shared `spill_failed_ilp_to`, which reads the ceiling and the
+    // reserve from the tier's spec. So the rail is pinned in two places: the
+    // shared body decides a SOFT ceiling against free space, and the tick
+    // spec IS soft, with the tick ceiling and the database reserve.
+    let spec_at = src
+        .find("pub(crate) fn tick_spill_spec(")
+        .expect("the tick spill spec must exist");
+    let spec = &src[spec_at..(spec_at + 1_000).min(src.len())];
+    for needle in [
+        "ceiling: tick_spill_max_bytes,",
+        "SpillCeilingKind::Soft {",
+        "reserve: SPILL_SOFT_CEILING_FREE_RESERVE_BYTES,",
+    ] {
+        assert!(
+            spec.contains(needle),
+            "the tick spill spec must carry `{needle}`: ticks keep a SOFT rail \
+             measured against the database reserve"
+        );
+    }
+    let wrapper_at = src
+        .find("fn spill_failed_ilp(")
+        .expect("the tick spill entry point must exist");
+    assert!(
+        src[wrapper_at..].contains("spill_failed_ilp_to(&tick_spill_spec(dir, feed)"),
+        "the tick spill must run through the shared function with the tick spec"
+    );
+    let block = ceiling_block(&src, "let ceiling = (spec.ceiling)();")
+        .expect("the shared ceiling comparison must still exist");
+    assert!(
+        block.contains("SpillCeilingKind::Soft { reserve } =>"),
+        "the soft arm must take its reserve from the spec"
+    );
 
     assert!(
         block.contains("classify_spill_ceiling("),
@@ -90,9 +121,10 @@ fn the_tick_spill_ceiling_refuses_only_against_free_space() {
         "the decision must be fed REAL free space, not a placeholder"
     );
     assert!(
-        block.contains("SPILL_SOFT_CEILING_FREE_RESERVE_BYTES"),
-        "the refusal must be measured against the database reserve, not \
-         against the size rail alone"
+        block.contains("classify_spill_ceiling(held, ceiling, spill_free_bytes(dir), reserve)"),
+        "the refusal must be measured against the database reserve (the spec's, \
+         which for ticks is SPILL_SOFT_CEILING_FREE_RESERVE_BYTES, pinned above), \
+         not against the size rail alone"
     );
     assert!(
         block.contains("tv_tick_spill_over_soft_ceiling_total"),

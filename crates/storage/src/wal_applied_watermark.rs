@@ -619,6 +619,13 @@ pub struct AppliedWatermark {
     /// traffic and to archive a file only after a whole clean probe ran
     /// behind its last write.
     clean_probes: AtomicU64,
+    /// DA-13a review: set once, before the seal writer starts, by a process
+    /// that WILL run the WAL-suspension watcher. Until the watcher's first
+    /// verdict (an HTTP round trip after it spawns) `clean_probes` is 0 and
+    /// `sink_suspect` is false, which reads exactly like "no watcher at all";
+    /// this flag tells the seal replay to wait for the watcher's confirmation
+    /// instead of archiving on a bare 2xx in that window.
+    probe_expected: AtomicBool,
     /// Batches whose rows landed NOWHERE — the ILP write failed AND the
     /// rescue to the spill tier failed. Monotone. The replay confirm compares
     /// it before and after a batch: a batch that lost rows must never have its
@@ -744,6 +751,7 @@ impl AppliedWatermark {
             suspect_max_ticks: AtomicU64::new(0),
             suspect_max_depth: AtomicU64::new(0),
             clean_probes: AtomicU64::new(0),
+            probe_expected: AtomicBool::new(false),
             unlanded: AtomicU64::new(0),
             rescue_floors_ticks: [const { AtomicU64::new(0) }; RESCUE_FLOOR_SLOTS],
             rescue_floors_depth: [const { AtomicU64::new(0) }; RESCUE_FLOOR_SLOTS],
@@ -871,6 +879,23 @@ impl AppliedWatermark {
     #[must_use]
     pub fn clean_probe_count(&self) -> u64 {
         self.clean_probes.load(Ordering::Acquire)
+    }
+
+    /// DA-13a review: this process will run the QuestDB WAL-suspension
+    /// watcher. Called once by `main.rs` BEFORE the seal writer's boot drain
+    /// can run (the watcher itself is spawned later), so a file the drain
+    /// flushes before the watcher's first verdict waits for that verdict
+    /// instead of being archived on a 2xx a suspended table may have sent.
+    /// One Release store. Never cleared: the watcher is supervised and
+    /// respawns, so once expected it stays expected.
+    pub fn mark_probe_expected(&self) {
+        self.probe_expected.store(true, Ordering::Release);
+    }
+
+    /// Whether [`Self::mark_probe_expected`] has been called. One Acquire load.
+    #[must_use]
+    pub fn is_probe_expected(&self) -> bool {
+        self.probe_expected.load(Ordering::Acquire)
     }
 
     /// Whether acks are currently parked rather than applied.
@@ -2042,6 +2067,23 @@ mod tests {
         wm.note_questdb_probe(false);
         wm.note_questdb_probe(true);
         assert_eq!(wm.clean_probe_count(), 2, "a suspect probe is not counted");
+    }
+
+    // Regression: 2026-10-13 — DA-13a review. Before the watcher's first
+    // verdict the watermark read exactly like "no watcher", so the seal boot
+    // drain archived on a bare 2xx.
+    #[test]
+    fn test_regression_da13a_mark_probe_expected_is_sticky_and_independent_of_probes() {
+        let wm = AppliedWatermark::new_for_tests();
+        assert!(!wm.is_probe_expected());
+        wm.mark_probe_expected();
+        assert!(wm.is_probe_expected());
+        assert_eq!(wm.clean_probe_count(), 0, "marking reports no probe");
+        assert!(!wm.is_sink_suspect());
+        wm.note_questdb_probe(false);
+        wm.note_questdb_probe(true);
+        wm.mark_probe_expected();
+        assert!(wm.is_probe_expected(), "never cleared");
     }
 
     #[test]
