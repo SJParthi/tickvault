@@ -1584,6 +1584,12 @@ async fn async_main() -> Result<()> {
     // (source-order scan of this file):
     // crates/app/tests/seal_drop_paging_wiring_guard.rs.
     metrics::counter!("tv_seal_writer_drain_total", "kind" => "dropped").increment(0);
+    // Seal-spill retention (DA-13a, 2026-10-13): records of never-replayed
+    // spill files the sweep deleted because a verified cold copy exists. A
+    // sibling of the seal-writer counter above, NOT one of the paged
+    // data-at-risk counters below: no alarm reads it (local `/metrics` only).
+    // Registered at 0 so its first increment is a delta, not the baseline.
+    metrics::counter!("tv_seal_spill_unreplayed_deleted_with_copy_records_total").increment(0);
     // Order-side counters (cluster-C, 2026-07-14): dense-from-boot so the CW
     // agent's dropped-first-sample delta baseline is the harmless 0 — without
     // this, alarm #10 (orders-rejected) is dead for a single-rejection session
@@ -1794,6 +1800,9 @@ async fn async_main() -> Result<()> {
     metrics::counter!("tv_seal_spill_sync_failed_total").increment(0);
     metrics::counter!("tv_seal_unwritten_mark_errors_total").increment(0);
     metrics::counter!("tv_wal_deferred_depth_persist_failed_total").increment(0);
+    // The after-close depth pass stopping at its disk floor (2026-10-13).
+    // Local /metrics only: no alarm or filter reads it.
+    metrics::counter!("tv_wal_deferred_depth_pass_total", "outcome" => "disk_floor").increment(0);
     metrics::counter!("tv_wal_applied_watermark_persist_failed_total").increment(0);
     // SEBI lifecycle / constituency write failures (audit OBS-2, 2026-10-11).
     // Seeded here, after the recorder install, so a scrape records 0 before
@@ -4857,6 +4866,16 @@ async fn build_shared_infra(
         contract_names = early_contract_names,
         "contract names published before the seal writer starts"
     );
+
+    // --- QuestDB WAL-suspension watcher is EXPECTED (DA-13a review) ---
+    // The seal writer's task runs its boot drain at once, but the watcher is
+    // spawned only after `build_shared_infra` returns (always, in
+    // `async_main`), and its first verdict needs an HTTP round trip. Until
+    // then the watermark reads exactly like "no watcher", and the drain used
+    // to archive spill files on a 2xx that a WAL-suspended table sends while
+    // applying nothing. Marked here, before the seal writer starts, so a file
+    // flushed in that window waits for two clean probes instead.
+    tickvault_storage::wal_applied_watermark::applied_watermark().mark_probe_expected();
 
     // --- Seal-writer (installs the process-wide global_seal_sender) ---
     spawn_seal_writer_loop(&config.questdb);
