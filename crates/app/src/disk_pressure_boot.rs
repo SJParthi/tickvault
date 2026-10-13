@@ -813,7 +813,7 @@ mod tests {
     // ~90 minutes. Only a pure hold stands aside; a stood-aside episode,
     // escalated or not, runs no further pass while the gate stays taken.
     #[test]
-    fn test_regression_da13d_only_a_pure_hold_stands_aside() {
+    fn test_regression_da13d_fold_pressure_pass_only_a_pure_hold_stands_aside() {
         use tickvault_storage::partition_archive::ArchiveRunSummary;
         let held = ArchiveRunSummary {
             pass_ran: true,

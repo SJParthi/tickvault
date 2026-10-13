@@ -1168,7 +1168,7 @@ mod pass_ran_tests {
     // STORAGE-GAP-04 paged on a working box. A hold must be refunded, and a
     // real failure in the same pass must still spend its attempt.
     #[test]
-    fn test_regression_da13d_held_depth_pass_refunds_the_attempt() {
+    fn test_regression_da13d_refunds_attempt_only_for_a_held_depth_pass() {
         let held = ArchiveRunSummary {
             pass_ran: true,
             held_deferred_depth: 3,

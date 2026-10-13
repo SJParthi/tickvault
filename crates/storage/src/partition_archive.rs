@@ -202,6 +202,7 @@ fn note_depth_partition_held(summary: &mut ArchiveRunSummary) {
 /// (DA-13d). The ONE place the series' labels are written, so the boot seed
 /// (`n = 0`, from `main.rs`) and every hold land on the same series. Local
 /// `/metrics` only. O(1).
+// TEST-EXEMPT: the series is asserted with a real Prometheus recorder by app's daily_archive_boot::test_regression_da13d_depth_hold_counter_seeds_at_zero (storage has no exporter dev-dependency); the hold path that adds 1 is driven by the archiver gate test above
 pub fn count_depth_partitions_held(n: u64) {
     metrics::counter!(
         "tv_partition_archive_skipped_total",
@@ -5328,7 +5329,8 @@ mod stub_integration_tests {
     // The ONLY test that touches DEPTH_REWRITE_GATE in this crate, so it
     // cannot race another test for it; every other stub lists `ticks` only.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_regression_da13d_depth_partition_held_while_the_rewrite_pass_writes() {
+    async fn test_regression_da13d_try_hold_depth_partitions_refused_while_hold_depth_partitions_for_rewrite_holds()
+     {
         let (qdb_url, qdb_log) = spawn_stub(qdb_responder_listing(
             crate::depth_persistence::MARKET_DEPTH_TABLE,
             vec!["2026-04-01T09"],
