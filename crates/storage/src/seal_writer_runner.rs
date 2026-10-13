@@ -81,7 +81,7 @@ use crate::seal_dlq::SealDlqWriter;
 use crate::seal_spill::SealSpillWriter;
 use crate::seal_writer_task::{
     BootDrainOutcome, DrainOutcome, MidSessionReplay, ReplayOutcome, drain_once,
-    drain_recovered_seals,
+    drain_recovered_seals_for_replay,
 };
 use crate::shadow_candle_writer::ShadowCandleWriter;
 
@@ -1123,12 +1123,18 @@ impl SealWriterRunner {
     /// Without this, seals rescued to disk during a QuestDB outage were never
     /// read back by anything — see the module docs on
     /// [`crate::seal_writer_task::drain_recovered_seals`].
+    ///
+    /// DA-13a review: a file flushed while the QuestDB WAL-suspension watcher
+    /// is expected or running is handed to this runner's mid-session replay,
+    /// which archives it only after the watcher confirms it, instead of being
+    /// archived on the bare 2xx.
     pub fn boot_drain(&mut self) -> BootDrainOutcome {
-        drain_recovered_seals(
+        drain_recovered_seals_for_replay(
             &mut self.writer,
             &self.spill_dir,
             &self.dlq_dir,
             self.max_drain_per_cycle,
+            &mut self.replay,
         )
     }
 
