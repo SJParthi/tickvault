@@ -7535,6 +7535,9 @@ fn blocking_flush<T>(flush: impl FnOnce() -> T) -> T {
 ///
 /// Cost: two relaxed atomic stores plus one clock read, at FLUSH cadence
 /// (500 ms timer or the row threshold) — never per tick.
+/// *(⚠ CHANGED 2026-10-13, ITEM 57b: the live drain's two tick triggers call
+/// `flush_ticks_and_record`; this full flush now runs on the shutdown arm and
+/// the drain's tail.)*
 fn flush_and_record(
     ingest: &mut LiveIngest,
     feed_health: &tickvault_common::feed_health::FeedHealthRegistry,
@@ -7647,6 +7650,47 @@ fn flush_and_record(
         return ingest.flush();
     }
     let rows = ingest.flush();
+    record_synchronous_tick_flush(feed_health, rows)
+}
+
+/// The live drain's TICK triggers (the 1,000-row size trigger and the 500 ms
+/// timer): flushes the tick rows only and leaves depth to its own cadence
+/// (ADDED 2026-10-13, ITEM 57b).
+///
+/// Until 2026-10-13 both triggers went through [`flush_and_record`], which
+/// flushes the depth sink first, so live depth committed with every tick
+/// flush: MEASURED on 13 Oct, `market_depth_book`'s sequencer grew by about
+/// 77,000 transactions over the session (about 3.2 a second), each commit a
+/// QuestDB WAL apply on a disk whose burst runs out at 10:00 IST. Depth now
+/// flushes on its own size trigger ([`LiveIngest::depth_flush_due`], 8 MiB of
+/// array rows) and every [`DEPTH_TIMER_FLUSH_EVERY_TICKS`] ticks of the
+/// 500 ms timer ([`depth_timer_step`]), i.e. every 2 s.
+///
+/// Feed health is recorded exactly as [`flush_and_record`] records it: tick
+/// rows only, and only on the synchronous writer (the offloaded writer
+/// thread records what landed). The depth half was never part of that
+/// record. Every other caller (the shutdown arm and tail, the replay and
+/// refold paths, the synchronous fallbacks) keeps [`flush_and_record`] or
+/// [`LiveIngest::flush`], which flush depth too. O(1) here; the flush is one
+/// hand-off or one request.
+fn flush_ticks_and_record(
+    ingest: &mut LiveIngest,
+    feed_health: &tickvault_common::feed_health::FeedHealthRegistry,
+) -> u64 {
+    if ingest.writer_is_offloaded() {
+        return ingest.flush_ticks();
+    }
+    let rows = ingest.flush_ticks();
+    record_synchronous_tick_flush(feed_health, rows)
+}
+
+/// Records `rows` tick rows flushed by the SYNCHRONOUS writer as feed health
+/// (see [`flush_and_record`] for why the offloaded path does not). Returns
+/// `rows`. Two relaxed stores and one clock read.
+fn record_synchronous_tick_flush(
+    feed_health: &tickvault_common::feed_health::FeedHealthRegistry,
+    rows: u64,
+) -> u64 {
     feed_health.record_ticks(
         Feed::Dhan,
         rows,
@@ -7656,6 +7700,31 @@ fn flush_and_record(
             .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS),
     );
     rows
+}
+
+/// How many ticks of the 500 ms flush timer pass between two timer flushes
+/// of the live depth sink (ADDED 2026-10-13, ITEM 57b): 4 × 500 ms = 2 s.
+///
+/// Depth still flushes sooner on its size trigger (8 MiB of array rows,
+/// 10,000 level rows), so the 09:15 burst is cut by size as before; this
+/// bounds how long a quiet depth socket's rows wait. Under a QuestDB stall
+/// the producer holds about 2 s of depth per retained span instead of about
+/// 0.2 s, still cut at `MAX_DEPTH_PRODUCER_BUFFER_BYTES` and the span bound
+/// and rescued to the depth spill tier as before.
+pub const DEPTH_TIMER_FLUSH_EVERY_TICKS: u32 = 4;
+
+/// One tick of the 500 ms flush timer for the depth cadence: returns the next
+/// count and whether depth flushes on this tick. The count resets on the
+/// flushing tick, so depth flushes on every [`DEPTH_TIMER_FLUSH_EVERY_TICKS`]th
+/// tick. Pure, O(1), no allocation.
+#[must_use]
+const fn depth_timer_step(ticks_since_depth_flush: u32) -> (u32, bool) {
+    let next = ticks_since_depth_flush.saturating_add(1);
+    if next >= DEPTH_TIMER_FLUSH_EVERY_TICKS {
+        (0, true)
+    } else {
+        (next, false)
+    }
 }
 
 /// Has a RISK-GAP-03 page fired recently enough to suppress the next one?
@@ -7708,6 +7777,23 @@ fn silence_page_is_cooling(last_page_secs: Option<u64>, now_secs: u64, cooldown:
     // must not wrap into a gigantic elapsed value and silently clear the
     // cooldown at the one moment the log is hardest to read.
     last_page_secs.is_some_and(|last| now_secs.saturating_sub(last) < cooldown)
+}
+
+/// ITEM 57b review (2026-10-13): on a 500 ms tick that is not a depth tick,
+/// still hands any PARKED depth rescue (H4) to its thread when no depth rows
+/// are pending, as every tick did before depth got its own cadence.
+/// `DepthIngest::flush` with nothing pending only retries the park and returns;
+/// it hands no batch to the writer, so this adds no QuestDB commit. O(1) when
+/// nothing is parked. Rows still pending wait for the 2 s depth tick, whose
+/// flush retries the park first.
+fn retry_idle_depth_parks(depth: Option<&mut DepthIngest>) {
+    let Some(depth) = depth else { return };
+    if depth.pending_rows() != 0 {
+        return;
+    }
+    if let Err(err) = depth.flush() {
+        tracing::debug!(?err, "depth park retry on an idle tick reported an error");
+    }
 }
 
 /// Flushes the depth ILP buffer, if a depth ingest is wired.
@@ -7794,6 +7880,10 @@ async fn run_frame_drain(
     let mut unparseable: u64 = 0;
     let mut flush_timer = tokio::time::interval(FLUSH_INTERVAL);
     flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // ITEM 57b (2026-10-13): depth's timer flush rides every
+    // `DEPTH_TIMER_FLUSH_EVERY_TICKS`th tick of the flush timer above. A
+    // counter, not a second timer.
+    let mut depth_timer_ticks: u32 = 0;
     // Mid-session catch-up seal. Without it, a bar for an instrument that
     // stops ticking waits for the 15:30 close sweep — correct, but hours late.
     let mut catchup_timer = tokio::time::interval(CATCHUP_SEAL_INTERVAL);
@@ -8305,8 +8395,11 @@ async fn run_frame_drain(
                 // SIZE trigger. Rows sitting in the ILP buffer have NOT reached
                 // QuestDB — an unflushed buffer is not storage, it is a leak
                 // with a success counter in front of it.
+                //
+                // Ticks only since 2026-10-13 (ITEM 57b): depth flushes on its
+                // own size trigger just below and on its own timer cadence.
                 if ingest.pending_rows() >= FLUSH_ROW_THRESHOLD {
-                    flush_and_record(&mut ingest, &feed_health);
+                    flush_ticks_and_record(&mut ingest, &feed_health);
                 }
                 // Depth gets its OWN size trigger — see
                 // `DEPTH_FLUSH_ROW_THRESHOLD` for why reusing the tick one
@@ -8385,8 +8478,23 @@ async fn run_frame_drain(
                 tickvault_storage::hot_path_telemetry::beat(
                     tickvault_storage::hot_path_telemetry::HotTask::FrameDrain,
                 );
-                flush_and_record(&mut ingest, &feed_health);
-                flush_depth(ingest.depth_sink());
+                flush_ticks_and_record(&mut ingest, &feed_health);
+                // ITEM 57b: depth on every `DEPTH_TIMER_FLUSH_EVERY_TICKS`th
+                // tick (2 s), not every tick; its size trigger in the frame
+                // arm still cuts a burst at 8 MiB. Shutdown flushes both.
+                let (next, depth_due) = depth_timer_step(depth_timer_ticks);
+                depth_timer_ticks = next;
+                // Rows from a frame the WAL refused exist only in RAM, so they
+                // keep the old 500 ms hand-off; the 2 s cadence applies only
+                // to rows the WAL can replay after a crash.
+                let unbacked = ingest
+                    .depth_sink()
+                    .is_some_and(|d| d.has_unbacked_pending());
+                if depth_due || unbacked {
+                    flush_depth(ingest.depth_sink());
+                } else {
+                    retry_idle_depth_parks(ingest.depth_sink());
+                }
                 publish_fold_depth(&ingest);
             }
             // Mid-session catch-up seal. Deliberately BEFORE the silence arm
@@ -9227,6 +9335,12 @@ pub const DEPTH_FLUSH_ROW_THRESHOLD: u64 = 10_000;
 /// milliseconds. Half a second bounds how much of a thin instrument's tail can
 /// sit unflushed without making the flush rate meaningful against the size
 /// trigger.
+///
+/// *(⚠ CHANGED 2026-10-13, ITEM 57b: this bounds TICK rows only. A live
+/// depth row can wait up to `DEPTH_TIMER_FLUSH_EVERY_TICKS` × this (2 s), or
+/// until its own size trigger; depth no longer flushes with every tick flush.
+/// A depth row whose frame the WAL refused still flushes on the next tick
+/// (`DepthIngest::has_unbacked_pending`), so its RAM-only window stays 0.5 s.)*
 pub const FLUSH_INTERVAL_MILLIS: u64 = 500;
 
 /// [`FLUSH_INTERVAL_MILLIS`] as a `Duration`.
@@ -9967,6 +10081,31 @@ impl DepthIngest {
         }
     }
 
+    /// Book-only constructor for the after-close deferred pass (ADDED
+    /// 2026-10-13, ITEM 57a).
+    ///
+    /// Every frame goes to `market_depth_book`, whatever its receipt time:
+    /// a frame received before `since` (a bucket from before the array-row
+    /// switch) is rewritten into the book table too, never into
+    /// `market_depth`, whose WAL backlog is what holds the disk busy all
+    /// session. No ILP sender for `market_depth` is opened: the level slot
+    /// holds a disconnected writer that [`Self::writes_book`] never routes
+    /// to. `since` is kept only so the pass can count those rows
+    /// ([`Self::writes_pre_switch_to_book`]).
+    #[must_use]
+    // TEST-EXEMPT: thin constructor; the routing is exercised through
+    // `rewrite_inline_depth` via `for_test_book_only`.
+    fn new_book_only(questdb: &tickvault_common::config::QuestDbConfig, since: i64) -> Self {
+        Self {
+            writer: DepthWriter::new_book(questdb, Feed::Dhan),
+            buf: DepthLevelBuffer::new(),
+            book: Some(BookMode::boxed_book_only(since)),
+            writer_thread: None,
+            rescue_thread: None,
+            writer_done: None,
+        }
+    }
+
     /// Test constructor — disconnected writer, same buffer.
     #[must_use]
     // TEST-EXEMPT: test-only helper used by the depth drain tests below.
@@ -9997,18 +10136,48 @@ impl DepthIngest {
         }
     }
 
+    /// Test constructor in book-only mode (ITEM 57a): every frame goes to a
+    /// disconnected book writer; `since` only marks which ones count as
+    /// received before the switch.
+    #[must_use]
+    // TEST-EXEMPT: test-only helper used by the after-close pass tests.
+    pub fn for_test_book_only(since: i64) -> Self {
+        Self {
+            writer: DepthWriter::for_test_book(Feed::Dhan),
+            buf: DepthLevelBuffer::new(),
+            book: Some(BookMode::boxed_book_only(since)),
+            writer_thread: None,
+            rescue_thread: None,
+            writer_done: None,
+        }
+    }
+
     /// True when a frame is written as array rows. O(1).
     ///
     /// `live` is true for a frame this process received from a socket (never
     /// a replay): it always goes to the array rows when they are on, whatever
     /// the wall clock read, so a backward clock step can never send this
     /// process's own frames to the synchronous older-frame writer. A replayed
-    /// frame goes by its receipt time against the start instant.
+    /// frame goes by its receipt time against the start instant, except in
+    /// book-only mode (the after-close pass, ITEM 57a), where every frame
+    /// goes to the array rows.
     #[must_use]
     pub fn writes_book(&self, received_at_nanos: i64, live: bool) -> bool {
         self.book
             .as_ref()
-            .is_some_and(|b| live || received_at_nanos >= b.since)
+            .is_some_and(|b| b.book_only || live || received_at_nanos >= b.since)
+    }
+
+    /// True when this ingest is book-only and a frame received at
+    /// `received_at_nanos` predates the array-row switch, i.e. its rows go to
+    /// `market_depth_book` although the live drain of that day wrote
+    /// `market_depth` (ITEM 57a). The after-close pass counts those rows on
+    /// `tv_wal_deferred_depth_rows_total{outcome="pre_switch_to_book"}`. O(1).
+    #[must_use]
+    fn writes_pre_switch_to_book(&self, received_at_nanos: i64) -> bool {
+        self.book
+            .as_ref()
+            .is_some_and(|b| b.book_only && received_at_nanos < b.since)
     }
 
     /// Marks the writer that will carry this frame's rows as holding rows
@@ -10029,6 +10198,18 @@ impl DepthIngest {
         if let Some(b) = self.book.as_deref_mut() {
             b.levels.mark_pending_unbacked();
         }
+    }
+
+    /// True while any buffered row came from a frame the WAL refused, i.e.
+    /// a row that exists only in this buffer. The drain hands such rows on at
+    /// the next 500 ms tick instead of waiting for the 2 s depth tick
+    /// (ITEM 57b), so the unbacked window is no longer than before. O(1).
+    fn has_unbacked_pending(&self) -> bool {
+        self.writer.pending_unbacked()
+            || self
+                .book
+                .as_deref()
+                .is_some_and(|b| b.levels.pending_unbacked())
     }
 
     /// True when the buffered depth should be flushed now: the array-row
@@ -10373,7 +10554,8 @@ impl DepthIngest {
     /// In array-row mode the level writer for older frames is flushed too,
     /// only when it holds rows: it is synchronous (a network round trip), and
     /// it holds rows only while a replay of an earlier process's frames runs
-    /// (the boot WAL catch-up, the after-close pass), never from live frames.
+    /// (the boot WAL catch-up), never from live frames and never in the
+    /// after-close pass, whose ingest is book-only since 2026-10-13 (ITEM 57a).
     ///
     /// # Errors
     /// Propagates the writer's flush failure (which has already discarded and
@@ -10395,7 +10577,12 @@ struct BookMode {
     /// Frames received at or after this UTC instant go to `market_depth_book`.
     since: i64,
     /// Synchronous `market_depth` writer for frames received before `since`.
+    /// In book-only mode a disconnected writer that is never routed to.
     levels: DepthWriter,
+    /// Every frame goes to `market_depth_book`, whatever its receipt time
+    /// (the after-close pass, ITEM 57a). False on the live drain and the
+    /// boot replay, which route by receipt.
+    book_only: bool,
     price: [f64; MAX_DEPTH_BOOK_LEVELS],
     quantity: [f64; MAX_DEPTH_BOOK_LEVELS],
     orders: [f64; MAX_DEPTH_BOOK_LEVELS],
@@ -10406,10 +10593,21 @@ impl BookMode {
         Box::new(Self {
             since,
             levels,
+            book_only: false,
             price: [0.0; MAX_DEPTH_BOOK_LEVELS],
             quantity: [0.0; MAX_DEPTH_BOOK_LEVELS],
             orders: [0.0; MAX_DEPTH_BOOK_LEVELS],
         })
+    }
+
+    /// Book-only state (ITEM 57a). The level slot holds a disconnected
+    /// writer (no ILP sender, the production spill floor) that
+    /// [`DepthIngest::writes_book`] never routes to, so nothing here can
+    /// reach `market_depth`.
+    fn boxed_book_only(since: i64) -> Box<Self> {
+        let mut b = Self::boxed(since, DepthWriter::placeholder_for_offload_swap(Feed::Dhan));
+        b.book_only = true;
+        b
     }
 }
 
@@ -10536,7 +10734,8 @@ fn level_sink<'a>(
 ///
 /// `live` is true only for a frame the live drain took off a socket in this
 /// process; a replayed frame (the boot catch-up, the after-close pass) passes
-/// false. See [`DepthIngest::writes_book`].
+/// false. See [`DepthIngest::writes_book`] (the after-close pass's ingest is
+/// book-only, so its frames go to the array rows either way).
 fn append_inline_depth(
     sink: &mut DepthIngest,
     tick: &tickvault_common::tick_types::ParsedTick,
@@ -17572,8 +17771,11 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
     // partition is verified into S3 before it leaves local disk. Widen that
     // window and this does not fit.
     // Plan item 49e step 3: the array-row start instant, resolved once,
-    // before any socket dials, and shared with the after-close depth pass so
-    // both route every frame the same way. `None` while the setting is off.
+    // before any socket dials, and shared with the after-close depth pass.
+    // `None` while the setting is off. Since 2026-10-13 (ITEM 57a) the pass
+    // does not route by it: with an instant it writes every frame to
+    // `market_depth_book` and uses the instant only to count the frames
+    // received before it.
     // A clock past 2262 reads as "never", which keeps depth in `market_depth`.
     //
     // The array-row table is created here, only with the setting on, and the
@@ -22369,6 +22571,180 @@ mod tests {
         );
     }
 
+    /// ITEM 57b (2026-10-13): the live drain's tick triggers flush ticks
+    /// only; depth waits for its own size trigger or timer cadence, and the
+    /// full flush (shutdown) still takes depth.
+    #[test]
+    fn test_live_tick_flush_leaves_depth_to_its_own_cadence() {
+        let reg = tickvault_common::feed_health::FeedHealthRegistry::new();
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8)
+            .with_inline_depth(DepthIngest::for_test());
+        let frame = depth_frame(depth20_packet(13, 0, 41), DhanEndpointType::Depth20, 7);
+        let sink = ingest.depth_sink().expect("depth sink wired");
+        drain_depth_frame(sink, &frame, BOOK_RX, DepthFeedKind::Twenty, counters());
+        let held = ingest.depth_pending_rows();
+        assert!(held > 0, "depth rows buffered");
+        assert_eq!(flush_ticks_and_record(&mut ingest, &reg), 0);
+        assert_eq!(
+            ingest.depth_pending_rows(),
+            held,
+            "a tick trigger must leave the depth buffer to its own cadence"
+        );
+        flush_and_record(&mut ingest, &reg);
+        assert_eq!(
+            ingest.depth_pending_rows(),
+            0,
+            "the full flush (shutdown arm and tail) still flushes depth"
+        );
+
+        // The drain wiring: both tick triggers call the tick-only helper,
+        // the timer arm flushes depth only on the cadence, and the shutdown
+        // arm keeps the full flush plus the depth flush.
+        let src = include_str!("dhan_feed_stack.rs");
+        let prod = src.split(concat!("#[cfg(", "test)]")).next().unwrap_or(src);
+        let drain_at = prod
+            .find("async fn run_frame_drain(")
+            .expect("drain exists");
+        let drain = &prod[drain_at..];
+        let size_at = drain
+            .find("if ingest.pending_rows() >= FLUSH_ROW_THRESHOLD {")
+            .expect("size trigger");
+        assert!(
+            drain[size_at..].starts_with(
+                "if ingest.pending_rows() >= FLUSH_ROW_THRESHOLD {\n                    \
+                 flush_ticks_and_record(&mut ingest, &feed_health);"
+            ),
+            "the size trigger must flush ticks only"
+        );
+        let timer_at = drain
+            .find("_ = flush_timer.tick() => {")
+            .expect("timer arm");
+        let timer_end = timer_at
+            + drain[timer_at..]
+                .find("publish_fold_depth(&ingest);")
+                .expect("timer arm publishes");
+        let timer = &drain[timer_at..timer_end];
+        assert!(timer.contains("flush_ticks_and_record(&mut ingest, &feed_health);"));
+        assert!(
+            !timer.contains("flush_and_record("),
+            "no full flush per tick"
+        );
+        let step_at = timer
+            .find("depth_timer_step(depth_timer_ticks)")
+            .expect("the cadence counter drives the depth flush");
+        let depth_at = timer
+            .find(
+                "if depth_due || unbacked {\n                    flush_depth(ingest.depth_sink());",
+            )
+            .expect("depth flushes only when the cadence says so");
+        assert!(step_at < depth_at);
+        assert_eq!(
+            timer.matches("flush_depth(").count(),
+            1,
+            "exactly one depth flush in the timer arm, the cadenced one"
+        );
+        assert!(
+            timer.contains(
+                "} else {\n                    retry_idle_depth_parks(ingest.depth_sink());"
+            ),
+            "a non-depth tick still retries a parked depth rescue (H4)"
+        );
+        let arm_at = drain
+            .find("() = shutdown.notified() => {")
+            .expect("shutdown arm");
+        let arm = &drain[arm_at..arm_at + drain[arm_at..].find("break;").expect("arm ends")];
+        let full = arm
+            .find("flush_and_record(&mut ingest, &feed_health);")
+            .expect("the shutdown arm keeps the full flush");
+        let depth = arm
+            .find("flush_depth(ingest.depth_sink());")
+            .expect("the shutdown arm flushes depth");
+        assert!(full < depth);
+    }
+
+    /// ITEM 57b: the depth timer cadence fires on every
+    /// `DEPTH_TIMER_FLUSH_EVERY_TICKS`th tick of the 500 ms timer (2 s).
+    #[test]
+    fn test_depth_timer_cadence_counts_ticks() {
+        assert_eq!(DEPTH_TIMER_FLUSH_EVERY_TICKS, 4);
+        assert_eq!(
+            u64::from(DEPTH_TIMER_FLUSH_EVERY_TICKS) * FLUSH_INTERVAL_MILLIS,
+            2_000,
+            "the depth timer flush is every 2 s"
+        );
+        let mut count = 0u32;
+        let mut fired = Vec::new();
+        for tick in 1..=12u32 {
+            let (next, due) = depth_timer_step(count);
+            count = next;
+            if due {
+                fired.push(tick);
+            }
+        }
+        assert_eq!(fired, vec![4, 8, 12]);
+        assert_eq!(depth_timer_step(0), (1, false));
+        assert_eq!(depth_timer_step(3), (0, true));
+        // A count past the cadence (never produced, but saturating) still
+        // fires and resets rather than overflowing.
+        assert_eq!(depth_timer_step(u32::MAX), (0, true));
+    }
+
+    /// ITEM 57b review: the idle-tick park retry never hands pending depth
+    /// rows to the writer (that is the 2 s tick's job), and is a no-op with
+    /// no depth ingest wired.
+    #[test]
+    fn test_unbacked_depth_rows_keep_the_500ms_hand_off() {
+        // A real, base-aligned frame sequence: a hand-built one below the
+        // packet-index bits derives capture_seq 0, which already reads unbacked.
+        let reg = tickvault_common::feed_health::FeedHealthRegistry::new();
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8)
+            .with_inline_depth(DepthIngest::for_test());
+        let frame = depth_frame(
+            depth20_packet(13, 0, 41),
+            DhanEndpointType::Depth20,
+            1 << 40,
+        );
+        let sink = ingest.depth_sink().expect("depth sink wired");
+        drain_depth_frame(sink, &frame, BOOK_RX, DepthFeedKind::Twenty, counters());
+        assert!(
+            !ingest.depth_sink().expect("sink").has_unbacked_pending(),
+            "WAL-backed rows wait for the 2 s depth tick"
+        );
+        ingest
+            .depth_sink()
+            .expect("sink")
+            .mark_all_pending_unbacked();
+        assert!(
+            ingest.depth_sink().expect("sink").has_unbacked_pending(),
+            "rows the WAL refused flush on the next 500 ms tick"
+        );
+        flush_and_record(&mut ingest, &reg);
+        assert!(
+            !ingest.depth_sink().expect("sink").has_unbacked_pending(),
+            "the mark leaves with the rows"
+        );
+    }
+
+    #[test]
+    fn test_retry_idle_depth_parks_leaves_pending_rows_to_the_depth_tick() {
+        retry_idle_depth_parks(None);
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8)
+            .with_inline_depth(DepthIngest::for_test());
+        retry_idle_depth_parks(ingest.depth_sink());
+        assert_eq!(ingest.depth_pending_rows(), 0);
+        let frame = depth_frame(depth20_packet(13, 0, 41), DhanEndpointType::Depth20, 7);
+        let sink = ingest.depth_sink().expect("depth sink wired");
+        drain_depth_frame(sink, &frame, BOOK_RX, DepthFeedKind::Twenty, counters());
+        let held = ingest.depth_pending_rows();
+        assert!(held > 0);
+        retry_idle_depth_parks(ingest.depth_sink());
+        assert_eq!(
+            ingest.depth_pending_rows(),
+            held,
+            "pending rows wait for the depth tick"
+        );
+    }
+
     /// Plan item 55: the after-close pass writes late rows and must batch
     /// them on the late trigger; the live drain keeps the row threshold.
     #[test]
@@ -25965,15 +26341,47 @@ mod tests {
                  blocking call and the feed-health report in step"
             );
         }
+        // ⚠ CHANGED 2026-10-13 (ITEM 57b): the two TICK triggers (size, time)
+        // route through `flush_ticks_and_record`, which leaves depth to its
+        // own cadence; the shutdown arm and the shutdown tail still route
+        // through `flush_and_record`, which flushes depth too. Both helpers
+        // pair the flush with the same feed-health report, so the choke-point
+        // property is checked on each.
         let recorded_sites = production_half
             .matches("flush_and_record(&mut ingest, &feed_health)")
             .count();
         assert!(
-            recorded_sites >= 3,
-            "expected at least the 3 known flush sites (size trigger, time \
-             trigger, shutdown tail) routing through `flush_and_record`; found \
+            recorded_sites >= 2,
+            "expected at least the 2 known full-flush sites (shutdown arm, \
+             shutdown tail) routing through `flush_and_record`; found \
              {recorded_sites} — did a site get deleted, or start calling the \
              writer directly?"
+        );
+        let tick_sites = production_half
+            .matches("flush_ticks_and_record(&mut ingest, &feed_health)")
+            .count();
+        assert_eq!(
+            tick_sites, 2,
+            "expected exactly the 2 tick triggers (size, time) routing through \
+             `flush_ticks_and_record`; found {tick_sites}"
+        );
+        let ticks_helper_start = production_half
+            .find("fn flush_ticks_and_record")
+            .expect("flush_ticks_and_record must exist");
+        let ticks_helper_end = production_half[ticks_helper_start..]
+            .find("\nfn ")
+            .map_or(production_half.len(), |off| ticks_helper_start + off);
+        let ticks_helper = &production_half[ticks_helper_start..ticks_helper_end];
+        assert_eq!(
+            ticks_helper.matches("ingest.flush_ticks()").count(),
+            2,
+            "`flush_ticks_and_record` must keep both arms (offloaded and \
+             synchronous) bare and in the helper"
+        );
+        assert!(
+            ticks_helper.contains("if ingest.writer_is_offloaded()"),
+            "`flush_ticks_and_record` must gate on the offload flag, as \
+             `flush_and_record` does, so an offloaded hand-off never forges feed health"
         );
     }
 
@@ -28580,429 +28988,7 @@ mod silence_latch_tests {
 }
 
 #[cfg(test)]
-mod contract_attach_tests {
-    use super::{DEPTH_ATTACH_PREOPEN_RETRY_SECS, DEPTH_ATTACH_RETRY_SECS, preopen_retry_secs};
-
-    /// The four boundaries that decide whether the operator's 09:12 line is
-    /// met. Asserted as a table because an off-by-one at either edge is
-    /// invisible in production: the loop simply runs at the other cadence and
-    /// nothing logs which one it chose.
-    /// The deadline must fall BEFORE the minute the operator names as ready,
-    /// and after ticks start persisting — a deadline earlier than 09:00 could
-    /// never be met because no price exists to locate at-the-money against.
-    #[test]
-    fn preopen_ready_deadline_sits_between_first_tick_and_the_open() {
-        use super::PREOPEN_READY_DEADLINE_IST_SECS as D;
-        let persist = tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST;
-        assert!(
-            D > persist,
-            "a deadline before the first tick can never be met"
-        );
-        assert_eq!(D, 9 * 3_600 + 12 * 60, "the deadline is 09:12:00 IST");
-        assert!(
-            u64::from(D) < super::CONTINUOUS_SESSION_START_SECS_OF_DAY_IST,
-            "readiness must precede the open, not coincide with it"
-        );
-        // Inside the fast-poll window, or the deadline would be approached on
-        // the 60s grid it exists to defeat.
-        assert_eq!(
-            super::preopen_retry_secs(D),
-            super::DEPTH_ATTACH_PREOPEN_RETRY_SECS,
-            "the deadline must be approached at the fast cadence"
-        );
-    }
-
-    /// THE test for this change. `out_of_time` drives two arms — the quorum
-    /// wait and the GIVE-UP arm — and only the first wants a 09:12 deadline.
-    /// Folding it in would abandon contracts and depth at 09:12 on a morning
-    /// where nothing had resolved, which is the opposite of the requirement.
-    ///
-    /// A source scan because the loop is `TEST-EXEMPT` async I/O: it dials
-    /// sockets. This asserts the exact structural property that keeps the two
-    /// meanings apart, which no unit test of a pure function can reach.
-    #[test]
-    fn preopen_ready_deadline_never_reaches_the_give_up_arm() {
-        // PRODUCTION half only — `include_str!` carries this test module too,
-        // and the first draft counted its own assertion text (5 instead of 2).
-        // The house `test_marker` split is what keeps a source scan measuring
-        // the code rather than measuring itself.
-        let full = include_str!("dhan_feed_stack.rs");
-        let test_marker = concat!("#[cfg(", "test)]");
-        let src = full.split(test_marker).next().unwrap_or(full);
-        assert!(
-            src.contains("let out_of_time = past_hard_stop || past_deadline_and_window;"),
-            "out_of_time gained a term — if that term is the 09:12 deadline, the give-up \
-             arm now abandons the session at 09:12"
-        );
-        assert!(
-            src.contains(
-                "let past_preopen_ready_deadline = now_ist >= PREOPEN_READY_DEADLINE_IST_SECS;"
-            ),
-            "the readiness deadline must stay its own flag"
-        );
-        // And it must be spent on the quorum wait, nowhere else.
-        assert_eq!(
-            src.matches("past_preopen_ready_deadline").count(),
-            2,
-            "the readiness flag is declared once and read once (the quorum wait). A third \
-             use means it has reached an arm that was never reviewed for it"
-        );
-        assert!(
-            src.contains("&& !past_preopen_ready_deadline;"),
-            "the quorum wait must actually consult the deadline"
-        );
-    }
-
-    /// A mid-session restart is not a late pre-open, and must not be reported
-    /// as one.
-    ///
-    /// MEASURED 2026-08-25: the morning attach completed at 09:08:04 and MET
-    /// the 09:12 deadline, and five afternoon restarts each fired `WS-GAP-02`
-    /// and drove `tv-<env>-preopen-ready-late` into ALARM. The alarm is
-    /// ungated by design, so it stayed armed. Every one of those pages was
-    /// reporting a redeploy.
-    #[test]
-    fn the_preopen_deadline_does_not_apply_to_a_mid_session_restart() {
-        // The real morning: the loop began well before the deadline.
-        assert!(
-            super::preopen_deadline_applies(8 * 3_600 + 35 * 60),
-            "an attach that begins at 08:35 is racing the open and IS judged"
-        );
-        // The five real restarts from that afternoon, by their start second.
-        for (label, started) in [
-            ("12:37", 12 * 3_600 + 37 * 60),
-            ("16:17", 16 * 3_600 + 17 * 60),
-            ("17:33", 17 * 3_600 + 33 * 60),
-            ("18:17", 18 * 3_600 + 17 * 60),
-            ("19:21", 19 * 3_600 + 21 * 60),
-        ] {
-            assert!(
-                !super::preopen_deadline_applies(started),
-                "the {label} restart began after 09:12 and cannot be judged against it"
-            );
-        }
-    }
-
-    /// Keyed on the START, never the finish.
-    ///
-    /// An attach that begins at 09:11 and drags past 09:12 is the exact case
-    /// the deadline exists for; excusing it would hollow the alarm out from
-    /// the other side while fixing the false pages.
-    #[test]
-    fn an_attach_that_begins_before_the_deadline_is_still_judged_if_it_overruns() {
-        let d = super::PREOPEN_READY_DEADLINE_IST_SECS;
-        assert!(
-            super::preopen_deadline_applies(d - 1),
-            "one second before the deadline still counts as racing it"
-        );
-        assert!(
-            !super::preopen_deadline_applies(d),
-            "an attach that begins AT the deadline has already lost the race it would be \
-             judged on — it is a restart, not a late pre-open"
-        );
-        assert!(!super::preopen_deadline_applies(d + 1));
-    }
-
-    /// The alarm-side half of the fix, pinned in source.
-    ///
-    /// The CloudWatch metric filter is `{ $.fields.ready_at_ist_secs = * }`.
-    /// The mid-session arm must therefore NOT carry that field name, or the
-    /// datapoint still lands and the gate changes nothing that the operator
-    /// can see. Bite-proven: renaming `attached_at_ist_secs` back to
-    /// `ready_at_ist_secs` fails this test.
-    #[test]
-    fn the_mid_session_arm_does_not_emit_the_field_the_alarm_filters_on() {
-        let full = include_str!("dhan_feed_stack.rs");
-        let test_marker = concat!("#[cfg(", "test)]");
-        let src = full.split(test_marker).next().unwrap_or(full);
-
-        let gate = src
-            .find("if !preopen_deadline_applies(attach_started_ist) {")
-            .expect("the mid-session gate must exist");
-        let els = src[gate..]
-            .find("} else {")
-            .expect("the judged arm must be the else of that gate")
-            + gate;
-        // Comment lines are stripped before asserting: this arm's own comment
-        // QUOTES the CloudWatch filter pattern verbatim, so a raw substring
-        // scan matches the documentation rather than the code. Caught by this
-        // test failing on its first run, which is the right way round.
-        let mid_arm: String = src[gate..els]
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let mid_arm = mid_arm.as_str();
-
-        assert!(
-            mid_arm.contains("attached_at_ist_secs = ready_at"),
-            "the mid-session arm must report its completion second under a DIFFERENT field"
-        );
-        assert!(
-            !mid_arm.contains("ready_at_ist_secs ="),
-            "the mid-session arm must not emit `ready_at_ist_secs` — that field is what the \
-             CloudWatch filter matches, so emitting it re-creates the false page"
-        );
-        assert!(!mid_arm.contains("error!"), "a restart is not an error");
-        assert!(
-            !mid_arm.contains("metrics::gauge!(PREOPEN_READY_GAUGE)"),
-            "there is no readiness second on a restart; publishing the wall clock as one \
-             would read as a permanently missed deadline"
-        );
-    }
-
-    /// The readiness second is published once, at the only point where both
-    /// halves are provably on the wire — never on a give-up path, where there
-    /// is no readiness second and a placeholder would read as a met deadline.
-    #[test]
-    fn preopen_ready_gauge_is_published_only_on_the_both_halves_success_arm() {
-        let full = include_str!("dhan_feed_stack.rs");
-        let test_marker = concat!("#[cfg(", "test)]");
-        let src = full.split(test_marker).next().unwrap_or(full);
-        assert_eq!(
-            src.matches("metrics::gauge!(PREOPEN_READY_GAUGE)").count(),
-            1,
-            "the readiness gauge must have exactly one emit site"
-        );
-        let emit = src
-            .find("metrics::gauge!(PREOPEN_READY_GAUGE)")
-            .expect("emit site");
-        // The arm gained a `!readiness_published` latch on 2026-08-22: the
-        // loop can now outlive the both-halves moment to chase stocks that
-        // priced after the contract dial, so the `return` no longer guarantees
-        // one publication per session. The latch does. Anchoring on the FULL
-        // condition is deliberate — anchoring on the prefix would silently
-        // match the terminal return block further down and invert this
-        // assertion, which is exactly how this test first failed.
-        // RE-ANCHORED 2026-09-01: `depth_done` → `depth_ready`. The gate did
-        // not move; what `depth_done` MEANS did. It now means the COMPLETE
-        // depth set, and the fifth depth-200 socket is the day's biggest mover
-        // — which needs traded prices and cannot exist before 09:15, so gating
-        // the 09:12 pre-open verdict on it would miss that deadline every
-        // trading morning by construction. `depth_ready` is the first
-        // successful depth plan, i.e. exactly what `depth_done` used to mean
-        // here, so this arm fires on the same iteration it always did.
-        let arm = src
-            .find("if contracts_done && depth_ready && !readiness_published {")
-            .expect("success arm");
-        assert!(emit > arm, "the gauge is published outside the success arm");
-        assert_eq!(
-            src.matches("readiness_published = true;").count(),
-            1,
-            "one latch set, inside that arm — a second would let a lingering loop republish \
-             the readiness second and overwrite a met deadline with a later one"
-        );
-        // Measured AFTER the dials, not from the top of the iteration — the
-        // dials take real time and the earlier reading would flatter it.
-        assert!(
-            src.contains("let ready_at = ist_second_of_day_now();"),
-            "the readiness second must be read fresh at completion"
-        );
-    }
-
-    #[test]
-    fn preopen_retry_secs_switches_exactly_at_the_persistence_and_session_edges() {
-        const NINE: u32 = 9 * 3_600;
-        for (secs, want, why) in [
-            (
-                NINE - 1,
-                DEPTH_ATTACH_RETRY_SECS,
-                "08:59:59 — before ticks persist",
-            ),
-            (
-                NINE,
-                DEPTH_ATTACH_PREOPEN_RETRY_SECS,
-                "09:00:00 — first tick can persist",
-            ),
-            (
-                NINE + 8 * 60,
-                DEPTH_ATTACH_PREOPEN_RETRY_SECS,
-                "09:08 — Friday's real attach",
-            ),
-            (
-                NINE + 12 * 60,
-                DEPTH_ATTACH_PREOPEN_RETRY_SECS,
-                "09:12 — the operator's line",
-            ),
-            (
-                NINE + 15 * 60 - 1,
-                DEPTH_ATTACH_PREOPEN_RETRY_SECS,
-                "09:14:59 — still pre-open",
-            ),
-            (
-                NINE + 15 * 60,
-                DEPTH_ATTACH_RETRY_SECS,
-                "09:15:00 — open; nothing races now",
-            ),
-            (
-                14 * 3_600,
-                DEPTH_ATTACH_RETRY_SECS,
-                "14:00 — mid-session restart",
-            ),
-            (
-                0,
-                DEPTH_ATTACH_RETRY_SECS,
-                "midnight — no fast poll overnight",
-            ),
-        ] {
-            assert_eq!(preopen_retry_secs(secs), want, "{why}");
-        }
-    }
-
-    /// The fast cadence must be strictly faster, and bounded away from zero —
-    /// a 0 would spin the loop against QuestDB with no sleep at all.
-    #[test]
-    fn preopen_retry_secs_is_faster_than_the_session_cadence_and_never_zero() {
-        assert!(
-            DEPTH_ATTACH_PREOPEN_RETRY_SECS > 0,
-            "a zero sleep is a spin loop"
-        );
-        assert!(
-            DEPTH_ATTACH_PREOPEN_RETRY_SECS < DEPTH_ATTACH_RETRY_SECS,
-            "the pre-open cadence must be the faster one, or the window buys nothing"
-        );
-        // 15 minutes of window / 5s = 180 reads. Pinned so a later tightening
-        // has to face the read count it creates.
-        let reads = (15 * 60) / DEPTH_ATTACH_PREOPEN_RETRY_SECS;
-        assert!(
-            reads <= 200,
-            "pre-open window would issue {reads} QuestDB reads"
-        );
-    }
-
-    use super::*;
-
-    #[test]
-    fn remaining_capacity_is_counted_in_whole_connections() {
-        // The spot universe is ~4,565 instruments — one connection carrying
-        // 4,565 of its 5,000. The 435 unused slots on that socket are
-        // unreachable to a second planning pass, so the contract set gets 4
-        // connections, not 20,435 instruments.
-        assert_eq!(remaining_main_feed_capacity(1), 20_000);
-        assert_eq!(remaining_main_feed_capacity(0), 25_000);
-        assert_eq!(remaining_main_feed_capacity(4), 5_000);
-    }
-
-    #[test]
-    fn a_full_pool_leaves_no_room_rather_than_overflowing_it() {
-        // Every connection spent means NO contracts. Returning anything
-        // non-zero here would size a set the pool cannot dial, and `plan_pool`
-        // refuses the WHOLE pool — costing the session its depth as well.
-        assert_eq!(remaining_main_feed_capacity(5), 0);
-        assert_eq!(
-            remaining_main_feed_capacity(9),
-            0,
-            "saturating, never wraps"
-        );
-    }
-
-    #[test]
-    fn connection_count_mirrors_the_main_feed_pack_policy() {
-        // History, because this line has now been wrong in BOTH directions and
-        // the reason is the same each time: it must mirror `plan_pool`'s
-        // main-feed arm, and nothing else.
-        //
-        //  - originally PACKED while plan_pool SPREAD  -> understated by 4,
-        //    the attach asked for room that did not exist, the pool refused
-        //    everything and depth was never planned;
-        //  - briefly SPREAD to match                   -> honest, but left
-        //    literally zero room for contracts;
-        //  - now PACKED, with plan_pool packing too    -> both passes fit.
-        let max = usize::from(tickvault_core::websocket::pool_budget::MAX_MAIN_FEED_CONNECTIONS);
-        let cap = usize::try_from(
-            tickvault_core::websocket::pool_budget::MAIN_FEED_INSTRUMENTS_PER_CONNECTION,
-        )
-        .unwrap_or(usize::MAX);
-
-        assert_eq!(
-            main_feed_connections_for(0, max),
-            0,
-            "nothing occupies nothing"
-        );
-        assert_eq!(main_feed_connections_for(1, max), 1);
-        assert_eq!(main_feed_connections_for(3, max), 1, "three fit one socket");
-        assert_eq!(
-            main_feed_connections_for(cap, max),
-            1,
-            "exactly full is still one"
-        );
-        assert_eq!(
-            main_feed_connections_for(cap + 1, max),
-            2,
-            "one over spills"
-        );
-        assert_eq!(
-            main_feed_connections_for(4_565, max),
-            1,
-            "today's spot universe fits one socket — leaving four for contracts"
-        );
-        assert_eq!(main_feed_connections_for(25_000, max), max, "target scale");
-
-        // The clamp. Reporting more than the pool has free is what earns a
-        // BudgetRefused on the WHOLE pool.
-        assert_eq!(main_feed_connections_for(25_000, 2), 2);
-        assert_eq!(main_feed_connections_for(25_000, 0), 0);
-    }
-
-    #[test]
-    fn the_two_helpers_can_never_together_exceed_the_authorized_pool() {
-        // The 5-connection main-feed lock has to be arithmetic, not a hope:
-        // for every reachable spot-universe size, the connections the spots
-        // occupy plus the connections the remaining capacity could need must
-        // stay inside the cap.
-        let max = usize::from(tickvault_core::websocket::pool_budget::MAX_MAIN_FEED_CONNECTIONS);
-        for spot in [0usize, 1, 3, 4_565, 5_000, 5_001, 12_000, 24_999, 25_000] {
-            let used = main_feed_connections_for(spot, max);
-            let remaining = remaining_main_feed_capacity(used);
-            // Contracts may only occupy what the spots LEFT.
-            let would_need = main_feed_connections_for(remaining, max.saturating_sub(used));
-            assert!(
-                used + would_need <= max,
-                "spot={spot} used={used} + contracts={would_need} exceeds {max}"
-            );
-        }
-
-        // And the property the whole fix exists for, stated directly: after
-        // today's spot universe, contracts still fit — and together they fill
-        // every authorized main-feed socket. Under the old arithmetic this
-        // line read 0 connections for contracts and a refused pool.
-        let used = main_feed_connections_for(4_565, max);
-        assert_eq!(used, 1);
-        let room = remaining_main_feed_capacity(used);
-        assert_eq!(room, 20_000, "four connections x 5,000 remain");
-        assert_eq!(
-            used + main_feed_connections_for(room, max.saturating_sub(used)),
-            max,
-            "spots + contracts together fill all five main-feed sockets"
-        );
-    }
-
-    #[test]
-    fn ymd_from_ist_date_refuses_a_malformed_date_rather_than_selecting_an_expired_one() {
-        assert_eq!(ymd_from_ist_date("2026-08-19"), 2026_08_19);
-        // Every refusal returns 0, and 0 makes every expiry compare as "before
-        // today" — so the fail-closed direction is "no contracts", never "an
-        // expired one", whose silence looks exactly like a quiet book.
-        assert_eq!(ymd_from_ist_date(""), 0);
-        assert_eq!(ymd_from_ist_date("19-08-2026"), 0);
-        assert_eq!(ymd_from_ist_date("2026-13-01"), 0);
-        assert_eq!(ymd_from_ist_date("2026-08-32"), 0);
-        assert_eq!(ymd_from_ist_date("not-a-date"), 0);
-    }
-
-    #[test]
-    fn the_date_packing_matches_the_one_expiries_are_stored_in() {
-        // Both sides of the expiry comparison must pack identically or the
-        // whole >= today filter is meaningless. Same input, same answer.
-        for d in ["2026-08-19", "2026-01-01", "2026-12-31"] {
-            assert_eq!(
-                ymd_from_ist_date(d),
-                tickvault_core::instrument::master_csv::parse_expiry_ymd(d),
-                "the attach and the parser must agree on {d}"
-            );
-        }
-    }
-}
+mod contract_attach_tests;
 
 #[cfg(test)]
 mod alive_connection_guard_tests {

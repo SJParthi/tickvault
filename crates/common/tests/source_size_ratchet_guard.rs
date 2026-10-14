@@ -30,7 +30,9 @@ const NEW_FILE_CEILING: usize = 10_000;
 /// DA-12 batch merged into it. The ceiling is `measured + SLACK`.
 /// LOWER a row when a module is extracted; never raise one silently.
 const PINS: &[(&str, usize)] = &[
-    ("crates/app/src/dhan_feed_stack.rs", 33_766),
+    // 2026-10-14 (ITEM 57): lowered 14 (the file is 14 lines below main) after
+    // `contract_attach_tests` moved out and ITEM 57 code moved in.
+    ("crates/app/src/dhan_feed_stack.rs", 33_752),
     ("crates/app/src/main.rs", 7_002),
     ("crates/core/src/websocket/pool_supervisor.rs", 26_621),
     ("crates/storage/src/ws_frame_spill.rs", 13_467),

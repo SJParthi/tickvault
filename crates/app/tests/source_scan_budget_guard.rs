@@ -39,7 +39,11 @@ const BUDGET: &[(&str, usize)] = &[
     ("depth_subscription_view.rs", 3),
     ("dhan_contract_universe.rs", 1),
     ("dhan_depth_universe.rs", 3),
-    ("dhan_feed_stack.rs", 90),
+    // 2026-10-14 (ITEM 57): 90 -> 88; `contract_attach_tests` (3 scans) moved
+    // to its own file, one scan added by `test_live_tick_flush_leaves_depth_to_its_own_cadence`,
+    // which pairs it with a behaviour half on the same ingest.
+    ("dhan_feed_stack.rs", 88),
+    ("dhan_feed_stack/contract_attach_tests.rs", 3),
     ("dhan_feed_stack/feed_aux_tests.rs", 1),
     ("dhan_lifecycle.rs", 2),
     ("dhan_live_crossverify.rs", 7),
