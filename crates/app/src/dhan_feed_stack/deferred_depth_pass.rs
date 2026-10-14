@@ -58,7 +58,29 @@
 //! idempotent because `market_depth`'s DEDUP key carries `capture_seq`, and the
 //! packet walk here numbers packets exactly as the live drain does.
 //!
+//! # Which table (ITEM 57a, 2026-10-13)
+//!
+//! With array rows on, the pass writes ONLY `market_depth_book`, every frame,
+//! whatever its receipt time: its ingest is book-only
+//! ([`DepthIngest::new_book_only`]) and opens no `market_depth` writer. Until
+//! 2026-10-13 a frame received before the array-row switch went to
+//! `market_depth`, and measured on 13 Oct those rewrites added about 9,842
+//! transactions to that table's WAL backlog between 15:53 and 19:00, the
+//! backlog whose apply holds the disk busy the next session. `market_depth_book`
+//! carries `capture_seq` in its DEDUP key too, so a rewrite stays idempotent.
+//! With array rows off (no start instant) the pass writes `market_depth` as
+//! before.
+//!
 //! # Honest limits
+//!
+//! * A bucket from before the array-row switch is rewritten in full into
+//!   `market_depth_book`; packets the live drain had already written to
+//!   `market_depth` in that bucket then exist in both tables, and the packets
+//!   that were shed exist only in `market_depth_book`, so a query of
+//!   `market_depth` alone for that bucket still misses them. No loss; those
+//!   rows are counted (rows SENT, so a bucket carried after a failed write is
+//!   counted again) on
+//!   `tv_wal_deferred_depth_rows_total{outcome="pre_switch_to_book"}`.
 //!
 //! * A bucket still overlapping the segment the writer holds open is carried
 //!   to the next day (segments rotate by size, so the last bucket of a session
@@ -158,7 +180,10 @@ fn bucket_age_days(id: u64) -> u64 {
     now_nanos.saturating_sub(start_nanos) / (86_400 * 1_000_000_000)
 }
 
-/// Counter: rows this pass wrote back, and rows it refused.
+/// Counter: rows this pass wrote back (`written`), rows it refused
+/// (`refused`), and, of the written ones, rows from frames received before
+/// the array-row switch that went to `market_depth_book` (`pre_switch_to_book`,
+/// ITEM 57a).
 pub const DEFERRED_DEPTH_ROWS_COUNTER: &str = "tv_wal_deferred_depth_rows_total";
 /// Counter: per-bucket outcomes of the pass.
 pub const DEFERRED_DEPTH_PASS_COUNTER: &str = "tv_wal_deferred_depth_pass_total";
@@ -592,6 +617,10 @@ pub fn run_after_close_pass(
     );
 
     let c = pass_counters();
+    // ITEM 57a: rows of a frame received before the array-row switch that the
+    // book-only ingest sent to `market_depth_book` (a subset of `written`).
+    let pre_switch_to_book =
+        metrics::counter!(DEFERRED_DEPTH_ROWS_COUNTER, "outcome" => "pre_switch_to_book");
     let pass_counter = |outcome: &'static str| {
         metrics::counter!(DEFERRED_DEPTH_PASS_COUNTER, "outcome" => outcome).increment(1);
     };
@@ -699,6 +728,9 @@ pub fn run_after_close_pass(
                     }
                     _ => rewrite_dedicated_depth(sink, frame, c),
                 };
+                if sink.writes_pre_switch_to_book(frame.received_at_nanos) {
+                    pre_switch_to_book.increment(rows);
+                }
                 summary.rows_written = summary.rows_written.saturating_add(rows);
                 // Re-check the disk floor before every late commit (one
                 // `statvfs` per 16 MiB batch): a bucket can hold many
@@ -826,6 +858,20 @@ pub fn run_after_close_pass(
     summary
 }
 
+/// The pass's depth writer (ITEM 57a, 2026-10-13): book-only when the lane
+/// has an array-row start instant, so the pass cannot write `market_depth`
+/// at all; the level writer as before when array rows are off. Cold, once per
+/// pass.
+fn pass_depth_ingest(
+    questdb: &tickvault_common::config::QuestDbConfig,
+    book_since: Option<i64>,
+) -> DepthIngest {
+    match book_since {
+        Some(since) => DepthIngest::new_book_only(questdb, since),
+        None => DepthIngest::new(questdb, None),
+    }
+}
+
 /// Spawns the daily after-close supervisor. It sleeps until 15:45 IST, runs
 /// one pass on its own OS thread with its own synchronous depth writer, then
 /// sleeps until the next window. `cancel` stops it (set by the lane when its
@@ -833,9 +879,10 @@ pub fn run_after_close_pass(
 /// single waiter and would be stolen from the drain.
 ///
 /// `book_since` is the lane's array-row start instant (plan item 49e step 3),
-/// passed rather than re-read so the pass routes every frame exactly as the
-/// lane does: a frame received before it is rewritten into `market_depth`,
-/// one at or after it into `market_depth_book`.
+/// passed rather than re-read. `Some` builds a book-only ingest
+/// ([`pass_depth_ingest`], ITEM 57a): every frame goes to
+/// `market_depth_book`, and the instant only marks which rows count as
+/// `pre_switch_to_book`. `None` (array rows off) writes `market_depth`.
 pub fn spawn_after_close_supervisor(
     questdb: tickvault_common::config::QuestDbConfig,
     wal_dir: std::path::PathBuf,
@@ -867,7 +914,7 @@ pub fn spawn_after_close_supervisor(
             let spawned = std::thread::Builder::new()
                 .name("tv-deferred-depth".to_string())
                 .spawn(move || {
-                    let mut sink = DepthIngest::new(&questdb, book_since);
+                    let mut sink = pass_depth_ingest(&questdb, book_since);
                     let summary = run_after_close_pass(
                         &mut sink,
                         tickvault_storage::wal_deferred_depth::deferred_depth(),
@@ -1044,31 +1091,73 @@ mod tests {
         );
     }
 
-    /// Plan item 49e step 3 (review fix 2026-10-09): with array rows on, the
-    /// after-close pass routes each written-back frame by its recorded
-    /// receipt, exactly as the live drain did: at or after the start instant
-    /// to `market_depth_book`, before it to `market_depth`.
+    /// ITEM 57a (2026-10-13; replaces the 49e step 3 receipt-routing test):
+    /// with array rows on, the after-close pass writes every frame to
+    /// `market_depth_book`, both one received at or after the start instant
+    /// and one received before it. Nothing reaches `market_depth`, and only
+    /// the older frame counts as received before the switch.
     #[test]
-    fn test_rewrite_inline_depth_routes_by_receipt_with_array_rows_on() {
+    fn test_rewrite_inline_depth_goes_to_the_book_table_with_array_rows_on() {
         let frame = full_packet(13);
         let (seq, rx) = in_session();
 
-        let mut book = DepthIngest::for_test_book(rx);
-        let rows = rewrite_inline_depth(&mut book, &frame, seq, rx, pass_counters());
+        // Received at the start instant (post-switch).
+        let mut post = DepthIngest::for_test_book_only(rx);
+        assert!(!post.writes_pre_switch_to_book(rx));
+        let rows = rewrite_inline_depth(&mut post, &frame, seq, rx, pass_counters());
         assert_eq!(rows, 10, "5 levels x 2 sides, counted in levels");
-        assert!(!book.pending_book_bytes().is_empty(), "array rows written");
+        assert!(!post.pending_book_bytes().is_empty(), "array rows written");
         assert_eq!(
-            book.book.as_ref().map(|b| b.levels.pending()),
+            post.book.as_ref().map(|b| b.levels.pending()),
             Some(0),
-            "nothing on the older-frame writer"
+            "nothing on the level writer"
+        );
+        assert!(!post.pending_ilp().contains("market_depth,"));
+
+        // Received before the start instant (pre-switch): still the book.
+        let mut pre = DepthIngest::for_test_book_only(rx + 1);
+        assert!(pre.writes_pre_switch_to_book(rx), "counted as pre-switch");
+        assert!(pre.writes_book(rx, false), "routed to the book anyway");
+        let rows = rewrite_inline_depth(&mut pre, &frame, seq, rx, pass_counters());
+        assert_eq!(rows, 10);
+        assert!(!pre.pending_book_bytes().is_empty(), "array rows written");
+        assert_eq!(
+            pre.book.as_ref().map(|b| b.levels.pending()),
+            Some(0),
+            "a pre-switch frame must not reach the market_depth writer"
+        );
+        assert!(!pre.pending_ilp().contains("market_depth,"));
+        assert_eq!(
+            pre.pending_book_bytes(),
+            post.pending_book_bytes(),
+            "the same book rows whatever the receipt time"
         );
 
-        let mut older = DepthIngest::for_test_book(rx + 1);
-        let rows = rewrite_inline_depth(&mut older, &frame, seq, rx, pass_counters());
+        // The lane's receipt routing is unchanged: the same pre-switch frame
+        // on a non-book-only ingest still goes to the level writer.
+        let mut lane = DepthIngest::for_test_book(rx + 1);
+        assert!(!lane.writes_pre_switch_to_book(rx), "only book-only counts");
+        let rows = rewrite_inline_depth(&mut lane, &frame, seq, rx, pass_counters());
         assert_eq!(rows, 10);
-        assert!(older.pending_book_bytes().is_empty(), "no array row");
-        assert_eq!(older.pending_rows(), 10, "ten level rows");
-        assert!(older.pending_ilp().contains("market_depth,"));
+        assert!(lane.pending_book_bytes().is_empty(), "no array row");
+        assert!(lane.pending_ilp().contains("market_depth,"));
+    }
+
+    /// ITEM 57a: the pass builds its writer through `pass_depth_ingest`,
+    /// which is book-only whenever there is an array-row instant, and the
+    /// pass counts the pre-switch rows.
+    #[test]
+    fn test_the_pass_writer_is_book_only_with_an_array_row_instant() {
+        let src = include_str!("deferred_depth_pass.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+        assert!(prod.contains("let mut sink = pass_depth_ingest(&questdb, book_since);"));
+        assert!(!prod.contains("DepthIngest::new(&questdb, book_since)"));
+        assert!(prod.contains("Some(since) => DepthIngest::new_book_only(questdb, since),"));
+        assert!(prod.contains("None => DepthIngest::new(questdb, None),"));
+        assert!(prod.contains("\"outcome\" => \"pre_switch_to_book\""));
+        assert!(prod.contains("sink.writes_pre_switch_to_book(frame.received_at_nanos)"));
+        // With no instant there is no book mode, so nothing counts.
+        assert!(!DepthIngest::for_test().writes_pre_switch_to_book(0));
     }
 
     /// A shed frame's depth is written back; a frame outside the bucket is

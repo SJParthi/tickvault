@@ -6838,12 +6838,12 @@ Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.
 
 Finding (Verified from CloudWatch EBS bytes and the STORAGE-GAP-04 lines, 9, 12 and 13 Oct): the instance's disk burst runs out at 10:00 IST every day; after that reads plus writes sit at about 156 MB/s. QuestDB spends much of it applying the old `market_depth` WAL backlog (writer 632,973 / sequencer 771,919 at 08:31 on 13 Oct, 713,539 / 773,543 at 15:53, 725,495 / 783,385 at 19:00). The evening pass added about 9,842 old-table transactions between 15:53 and 19:00. Live depth into `market_depth_book` grew its sequencer by about 77,000 transactions on 13 Oct (about 3.2 a second) because the drain flushes depth with every tick flush.
 
-- [ ] 57a — the after-close deferred pass writes only `market_depth_book` while array rows are on; it can no longer reach the old table. With array rows off (dev) it writes `market_depth` as before.
+- [x] 57a — the after-close deferred pass writes only `market_depth_book` while array rows are on; it can no longer reach the old table. With array rows off (dev) it writes `market_depth` as before.
   - Files: crates/app/src/dhan_feed_stack/deferred_depth_pass.rs, crates/app/src/dhan_feed_stack.rs
-  - Tests: test_rewrite_inline_depth_goes_to_the_book_table_with_array_rows_on
-- [ ] 57b — the live drain no longer flushes depth with every tick flush: depth flushes on its own size trigger (8 MiB) and every `DEPTH_TIMER_FLUSH_EVERY_TICKS` (4) ticks of the 500 ms timer, i.e. every 2 s. Shutdown, replay and refold paths still flush everything.
+  - Tests: test_rewrite_inline_depth_goes_to_the_book_table_with_array_rows_on, test_the_pass_writer_is_book_only_with_an_array_row_instant
+- [x] 57b — the live drain no longer flushes depth with every tick flush: depth flushes on its own size trigger (8 MiB) and every `DEPTH_TIMER_FLUSH_EVERY_TICKS` (4) ticks of the 500 ms timer, i.e. every 2 s. Shutdown, replay and refold paths still flush everything.
   - Files: crates/app/src/dhan_feed_stack.rs
-  - Tests: test_live_tick_flush_leaves_depth_to_its_own_cadence, test_depth_timer_cadence_counts_ticks
+  - Tests: test_live_tick_flush_leaves_depth_to_its_own_cadence, test_depth_timer_cadence_counts_ticks, test_retry_idle_depth_parks_leaves_pending_rows_to_the_depth_tick
 
 57c — pausing the old table's WAL apply in market hours — NOT DONE. Verified on a local QuestDB 9.3.5: `ALTER TABLE md SUSPEND WAL` answers "Cannot suspend table, database is not in dev mode"; QuestDB offers no per-table pause outside dev mode, and turning dev mode on in production is not taken. At 13 Oct's apply rate (about 80,000 transactions over the session) the remaining ~58,000 finish during 14 Oct once 57a stops new ones (Assumed; checked at the 14 Oct 16:10 IST review).
 
@@ -6854,7 +6854,7 @@ Finding (Verified from CloudWatch EBS bytes and the STORAGE-GAP-04 lines, 9, 12 
 57a: a bucket from before the array-row switch (9 Oct and earlier) is rewritten in full into `market_depth_book`; packets the live drain had already written to `market_depth` in that bucket then exist in both tables (no loss; an honest limit, counted on `tv_wal_deferred_depth_rows_total{outcome="pre_switch_to_book"}`). No array-row instant (array rows off, or the book table failed at boot): unchanged, writes `market_depth`. 57b: the 09:15 burst still cuts batches at 8 MiB; a quiet depth socket flushes whatever is pending every 2 s; shutdown flushes both writers.
 
 ### Failure Modes (Item 57)
-No row is skipped. 57a: a failed book write leaves the bucket marked, as before. 57b: a QuestDB stall now holds about 2 s of depth per retained span instead of about 0.2 s; the producer still cuts at `MAX_DEPTH_PRODUCER_BUFFER_BYTES` (32 MiB) and the span bound, then rescues to the depth spill tier as before.
+No row is skipped. 57a: a failed book write leaves the bucket marked, as before. 57b: a QuestDB stall now holds about 2 s of depth per retained span instead of about 0.2 s; the producer still cuts at `MAX_DEPTH_PRODUCER_BUFFER_BYTES` (32 MiB) and the span bound, then rescues to the depth spill tier as before. A depth row whose frame the WAL refused waits unbacked up to 2 s (was 0.5 s); a crash in that window loses it, as before but over a longer window. A failed depth flush on the 2 s tick counts on the drain's `dropped` outcome (via `flush_depth`) where the per-tick full flush counted `depth_failed`; nothing alarms on either. A parked depth rescue is still retried on every 500 ms tick (`retry_idle_depth_parks`) when no depth row is pending.
 
 ### Test Plan (Item 57)
 `cargo test -p tickvault-app --lib` (the pass routing tests, the drain flush tests and the source-scan guards that pin the flush calls), `dhat_live_ingest_seam`, `cargo test -p tickvault-storage --lib depth_persistence`. Live, 14 Oct 16:10 IST: `market_depth_book` sequencer growth over the session (expect about 0.5 transactions a second, from about 3.2), `market_depth` writer/sequencer (expect the gap to reach 0 and the sequencer to stop growing after 15:45), EBS read+write bytes after 10:00, `tv_questdb_wal_apply_lag_max`.
