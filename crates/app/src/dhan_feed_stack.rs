@@ -7718,7 +7718,7 @@ pub const DEPTH_TIMER_FLUSH_EVERY_TICKS: u32 = 4;
 /// flushing tick, so depth flushes on every [`DEPTH_TIMER_FLUSH_EVERY_TICKS`]th
 /// tick. Pure, O(1), no allocation.
 #[must_use]
-pub const fn depth_timer_step(ticks_since_depth_flush: u32) -> (u32, bool) {
+const fn depth_timer_step(ticks_since_depth_flush: u32) -> (u32, bool) {
     let next = ticks_since_depth_flush.saturating_add(1);
     if next >= DEPTH_TIMER_FLUSH_EVERY_TICKS {
         (0, true)
@@ -8484,7 +8484,13 @@ async fn run_frame_drain(
                 // arm still cuts a burst at 8 MiB. Shutdown flushes both.
                 let (next, depth_due) = depth_timer_step(depth_timer_ticks);
                 depth_timer_ticks = next;
-                if depth_due {
+                // Rows from a frame the WAL refused exist only in RAM, so they
+                // keep the old 500 ms hand-off; the 2 s cadence applies only
+                // to rows the WAL can replay after a crash.
+                let unbacked = ingest
+                    .depth_sink()
+                    .is_some_and(|d| d.has_unbacked_pending());
+                if depth_due || unbacked {
                     flush_depth(ingest.depth_sink());
                 } else {
                     retry_idle_depth_parks(ingest.depth_sink());
@@ -9333,8 +9339,8 @@ pub const DEPTH_FLUSH_ROW_THRESHOLD: u64 = 10_000;
 /// *(⚠ CHANGED 2026-10-13, ITEM 57b: this bounds TICK rows only. A live
 /// depth row can wait up to `DEPTH_TIMER_FLUSH_EVERY_TICKS` × this (2 s), or
 /// until its own size trigger; depth no longer flushes with every tick flush.
-/// A depth row whose frame the WAL refused therefore sits unbacked in RAM for
-/// up to 2 s instead of 0.5 s before it reaches the writer.)*
+/// A depth row whose frame the WAL refused still flushes on the next tick
+/// (`DepthIngest::has_unbacked_pending`), so its RAM-only window stays 0.5 s.)*
 pub const FLUSH_INTERVAL_MILLIS: u64 = 500;
 
 /// [`FLUSH_INTERVAL_MILLIS`] as a `Duration`.
@@ -10089,7 +10095,7 @@ impl DepthIngest {
     #[must_use]
     // TEST-EXEMPT: thin constructor; the routing is exercised through
     // `rewrite_inline_depth` via `for_test_book_only`.
-    pub fn new_book_only(questdb: &tickvault_common::config::QuestDbConfig, since: i64) -> Self {
+    fn new_book_only(questdb: &tickvault_common::config::QuestDbConfig, since: i64) -> Self {
         Self {
             writer: DepthWriter::new_book(questdb, Feed::Dhan),
             buf: DepthLevelBuffer::new(),
@@ -10168,7 +10174,7 @@ impl DepthIngest {
     /// `market_depth` (ITEM 57a). The after-close pass counts those rows on
     /// `tv_wal_deferred_depth_rows_total{outcome="pre_switch_to_book"}`. O(1).
     #[must_use]
-    pub fn writes_pre_switch_to_book(&self, received_at_nanos: i64) -> bool {
+    fn writes_pre_switch_to_book(&self, received_at_nanos: i64) -> bool {
         self.book
             .as_ref()
             .is_some_and(|b| b.book_only && received_at_nanos < b.since)
@@ -10192,6 +10198,18 @@ impl DepthIngest {
         if let Some(b) = self.book.as_deref_mut() {
             b.levels.mark_pending_unbacked();
         }
+    }
+
+    /// True while any buffered row came from a frame the WAL refused, i.e.
+    /// a row that exists only in this buffer. The drain hands such rows on at
+    /// the next 500 ms tick instead of waiting for the 2 s depth tick
+    /// (ITEM 57b), so the unbacked window is no longer than before. O(1).
+    fn has_unbacked_pending(&self) -> bool {
+        self.writer.pending_unbacked()
+            || self
+                .book
+                .as_deref()
+                .is_some_and(|b| b.levels.pending_unbacked())
     }
 
     /// True when the buffered depth should be flushed now: the array-row
@@ -22615,7 +22633,9 @@ mod tests {
             .find("depth_timer_step(depth_timer_ticks)")
             .expect("the cadence counter drives the depth flush");
         let depth_at = timer
-            .find("if depth_due {\n                    flush_depth(ingest.depth_sink());")
+            .find(
+                "if depth_due || unbacked {\n                    flush_depth(ingest.depth_sink());",
+            )
             .expect("depth flushes only when the cadence says so");
         assert!(step_at < depth_at);
         assert_eq!(
@@ -22672,6 +22692,39 @@ mod tests {
     /// ITEM 57b review: the idle-tick park retry never hands pending depth
     /// rows to the writer (that is the 2 s tick's job), and is a no-op with
     /// no depth ingest wired.
+    #[test]
+    fn test_unbacked_depth_rows_keep_the_500ms_hand_off() {
+        // A real, base-aligned frame sequence: a hand-built one below the
+        // packet-index bits derives capture_seq 0, which already reads unbacked.
+        let reg = tickvault_common::feed_health::FeedHealthRegistry::new();
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8)
+            .with_inline_depth(DepthIngest::for_test());
+        let frame = depth_frame(
+            depth20_packet(13, 0, 41),
+            DhanEndpointType::Depth20,
+            1 << 40,
+        );
+        let sink = ingest.depth_sink().expect("depth sink wired");
+        drain_depth_frame(sink, &frame, BOOK_RX, DepthFeedKind::Twenty, counters());
+        assert!(
+            !ingest.depth_sink().expect("sink").has_unbacked_pending(),
+            "WAL-backed rows wait for the 2 s depth tick"
+        );
+        ingest
+            .depth_sink()
+            .expect("sink")
+            .mark_all_pending_unbacked();
+        assert!(
+            ingest.depth_sink().expect("sink").has_unbacked_pending(),
+            "rows the WAL refused flush on the next 500 ms tick"
+        );
+        flush_and_record(&mut ingest, &reg);
+        assert!(
+            !ingest.depth_sink().expect("sink").has_unbacked_pending(),
+            "the mark leaves with the rows"
+        );
+    }
+
     #[test]
     fn test_retry_idle_depth_parks_leaves_pending_rows_to_the_depth_tick() {
         retry_idle_depth_parks(None);

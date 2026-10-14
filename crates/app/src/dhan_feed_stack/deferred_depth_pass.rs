@@ -1148,15 +1148,21 @@ mod tests {
     /// pass counts the pre-switch rows.
     #[test]
     fn test_the_pass_writer_is_book_only_with_an_array_row_instant() {
-        let src = include_str!("deferred_depth_pass.rs");
-        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
-        assert!(prod.contains("let mut sink = pass_depth_ingest(&questdb, book_since);"));
-        assert!(!prod.contains("DepthIngest::new(&questdb, book_since)"));
-        assert!(prod.contains("Some(since) => DepthIngest::new_book_only(questdb, since),"));
-        assert!(prod.contains("None => DepthIngest::new(questdb, None),"));
-        assert!(prod.contains("\"outcome\" => \"pre_switch_to_book\""));
-        assert!(prod.contains("sink.writes_pre_switch_to_book(frame.received_at_nanos)"));
-        // With no instant there is no book mode, so nothing counts.
+        let questdb = tickvault_common::config::QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 9000,
+            pg_port: 8812,
+            ilp_port: 9009,
+        };
+        let since = 1_000_000;
+        // Book-only: a frame from before the switch is counted as one the
+        // pass moves into the book table; one at or after it is not.
+        let sink = pass_depth_ingest(&questdb, Some(since));
+        assert!(sink.writes_pre_switch_to_book(since - 1));
+        assert!(!sink.writes_pre_switch_to_book(since));
+        // No instant (array rows off): no book mode, so nothing counts.
+        let sink = pass_depth_ingest(&questdb, None);
+        assert!(!sink.writes_pre_switch_to_book(since - 1));
         assert!(!DepthIngest::for_test().writes_pre_switch_to_book(0));
     }
 
