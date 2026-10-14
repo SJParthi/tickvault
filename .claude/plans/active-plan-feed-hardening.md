@@ -6842,7 +6842,7 @@ Finding (Verified from CloudWatch EBS bytes and the STORAGE-GAP-04 lines, 9, 12 
   - Files: crates/app/src/dhan_feed_stack/deferred_depth_pass.rs, crates/app/src/dhan_feed_stack.rs
   - Tests: test_rewrite_inline_depth_goes_to_the_book_table_with_array_rows_on, test_the_pass_writer_is_book_only_with_an_array_row_instant
 - [x] 57b — the live drain no longer flushes depth with every tick flush: depth flushes on its own size trigger (8 MiB) and every `DEPTH_TIMER_FLUSH_EVERY_TICKS` (4) ticks of the 500 ms timer, i.e. every 2 s. Shutdown, replay and refold paths still flush everything.
-  - Files: crates/app/src/dhan_feed_stack.rs
+  - Files: crates/app/src/dhan_feed_stack.rs, crates/app/src/dhan_feed_stack/contract_attach_tests.rs (moved out unchanged to stay under the size pin), crates/common/tests/source_size_ratchet_guard.rs
   - Tests: test_live_tick_flush_leaves_depth_to_its_own_cadence, test_depth_timer_cadence_counts_ticks, test_retry_idle_depth_parks_leaves_pending_rows_to_the_depth_tick
 
 57c — pausing the old table's WAL apply in market hours — NOT DONE. Verified on a local QuestDB 9.3.5: `ALTER TABLE md SUSPEND WAL` answers "Cannot suspend table, database is not in dev mode"; QuestDB offers no per-table pause outside dev mode, and turning dev mode on in production is not taken. At 13 Oct's apply rate (about 80,000 transactions over the session) the remaining ~58,000 finish during 14 Oct once 57a stops new ones (Assumed; checked at the 14 Oct 16:10 IST review).
