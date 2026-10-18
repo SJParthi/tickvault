@@ -28,7 +28,7 @@ license = "MIT"
 # Run `bash .claude/hooks/dep-freshness-scanner.sh` to check for drift.
 
 # ---- Section 2: Backend Core — Async Runtime ----
-tokio = { version = "=1.53.2", features = ["full"] }
+tokio = { version = "=1.53.3", features = ["full"] }
 
 # ---- Section 2: Backend Core — WebSocket ----
 tokio-tungstenite = { version = "=0.29.0", features = ["rustls-tls-native-roots"] }
@@ -70,9 +70,9 @@ metrics-exporter-prometheus = "=0.18.3"
 # opentelemetry/opentelemetry_sdk/opentelemetry-otlp ^0.32. Bump all 4 together
 # or none (single-crate bumps split the dependency tree and fail to compile —
 # see .claude/plans/research/dep-decisions.md §1, dependabot PR #938 post-mortem).
-opentelemetry = "=0.33.0"
-opentelemetry_sdk = { version = "=0.33.0", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "=0.33.0", features = ["grpc-tonic"] }
+opentelemetry = "=0.33.1"
+opentelemetry_sdk = { version = "=0.33.1", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "=0.33.1", features = ["grpc-tonic"] }
 
 # ---- Section 5: Observability — Tracing ----
 tracing = "=0.1.44"
@@ -116,13 +116,13 @@ chrono-tz = "=0.10.4"
 
 # ---- Section 11: Serialization & Errors ----
 serde = { version = "=1.0.229", features = ["derive"] }
-serde_json = "=1.0.151"
+serde_json = "=1.0.154"
 rkyv = { version = "=0.8.18", features = ["std", "bytecheck"] }
 csv = "=1.4.0"
 thiserror = "=2.0.21"
 anyhow = "=1.0.104"
 bytes = "=1.12.1"
-sha2 = "=0.11.0"
+sha2 = "=0.11.1"
 
 # ---- Section 12: System & Resilience ----
 # core_affinity REMOVED 2026-08-10 — declared since Wave 5 (2026-05-01) with
@@ -160,15 +160,15 @@ zeroize = { version = "=1.9.1", features = ["derive"] }
 # ---- Section 14: TLS — Crypto Provider for rustls ----
 # Both tokio-tungstenite and reqwest depend on rustls 0.23+, which requires
 # an explicit CryptoProvider. We use aws-lc-rs (already in the dep tree).
-rustls = { version = "=0.23.45", default-features = false, features = ["aws_lc_rs"] }
-rustls-native-certs = "=0.8.4"
+rustls = { version = "=0.23.46", default-features = false, features = ["aws_lc_rs"] }
+rustls-native-certs = "=0.8.5"
 # 2026-07-04 (Groww native shadow client PR-R1, operator "go" this session):
 # promote aws-lc-rs from transitive (rustls already pulls it — Cargo.lock had
 # 1.17.0 resolved before this line existed) to a DIRECT dep for ed25519
 # session-keypair generation + NATS nonce signing in
 # crates/core/src/feed/groww/native/. No new supply-chain root — same crate,
 # same version the workspace already compiles.
-aws-lc-rs = "=1.18.1"
+aws-lc-rs = "=1.18.2"
 
 # ---- Section 11: AWS SDK ----
 # 2026-05-23: opt out of each crate's legacy `rustls` feature (which pulls
@@ -268,13 +268,13 @@ form_urlencoded = "=1.2.2"
 # ---- Section 16: CLI ----
 
 # ---- Section 17: Unique IDs ----
-uuid = { version = "=1.27.0", features = ["v4", "serde"] }
+uuid = { version = "=1.28.0", features = ["v4", "serde"] }
 
 # ---- Section 18: Telegram Alerts ----
 
 # ---- Section 13: Dev/Test Dependencies ----
 criterion = { version = "=0.8.2", features = ["html_reports"] }
-proptest = "=1.11.0"
+proptest = "=1.12.0"
 loom = "=0.7.2"
 dhat = "=0.3.3"
 
