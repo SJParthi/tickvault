@@ -1342,7 +1342,14 @@ impl MultiTfAggregator {
                 .increment(1);
             if !self.exhausted_logged {
                 self.exhausted_logged = true;
+                // AGGREGATOR-DROP-01, the code the live drain's 30 s read-out
+                // already uses for this refusal (`refused_slot_exhausted`), so
+                // this adds no page the read-out does not already raise.
+                // (2026-10-20: this line carried no code. The tag guard's
+                // `contains("code =")` matched `segment_code =` below.)
                 tracing::error!(
+                    code = tickvault_common::error_code::ErrorCode::AggregatorDrop01.code_str(),
+                    source = "slot_exhausted",
                     feed = key.0.as_str(),
                     security_id = key.1,
                     segment_code = key.2,

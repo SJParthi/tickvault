@@ -1452,6 +1452,10 @@ rules:
       of memory AND out of disk AND data/dlq/ unwritable — catastrophic.
       Operator runs mcp__tickvault-logs__docker_status, df -h /data,
       ls -la data/spill/ data/dlq/. Restart after remediation.
+      Exception, source=slot_exhausted: the candle aggregator's slot table
+      reached AGGREGATOR_MAX_SLOTS, so new instruments get no candles (their
+      ticks are still written); not a memory or disk fault, so do not
+      restart: raise the capacity or shrink the universe.
 
   - name: aggregator-stall-01-feed-waited-on-disk-escalate
     match:
@@ -2382,8 +2386,9 @@ rules:
     cooldown_secs: 600
     justification: >-
       TICK-GAP-01 = the per-instrument tick-gap tracker saw a silent
-      instrument (source=instrument_gap) or opened a reconnect backfill window
-      (source=reconnect_backfill_window). Dormant today. One illiquid
+      instrument (source=instrument_gap), opened a reconnect backfill window
+      (source=reconnect_backfill_window), or found an instrument with no tick
+      for 10 minutes (source=stale_ltp). Dormant today. One illiquid
       instrument is not a feed fault; compare with the live lane's silence
       gauges before acting.
 

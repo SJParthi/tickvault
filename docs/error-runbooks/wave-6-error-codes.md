@@ -53,6 +53,17 @@ unwritable — by definition catastrophic.
 
 **Source:** `crates/storage/src/shadow_persistence.rs::ShadowCandleWriter::handle_drop`.
 
+**2026-10-20 — `source = "slot_exhausted"`.** The candle aggregator's
+one-shot "slot table at capacity" line (`MultiTfAggregator`, fields
+`feed`, `security_id`, `segment_code`, `capacity`) now carries this code.
+It had none: the tag guard read `segment_code =` as a `code` field. It
+names the FIRST instrument refused when the slot table is full; the
+live drain's 30-second read-out already pages the same refusal under this
+code (`refused_slot_exhausted`), so no new page. This is NOT a disk
+failure: the instrument's ticks are still written, only its candles are
+missing. Do: raise `AGGREGATOR_MAX_SLOTS` or shrink the universe; do not
+run the disk triage above for this source.
+
 ### 2026-07-09 Update — AGGREGATOR-DROP-01 now PAGES (dual route)
 
 The 2026-07-09 audit confirmed this Severity::Critical code paged NOBODY

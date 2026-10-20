@@ -1095,7 +1095,9 @@ pub enum ErrorCode {
     /// TICK-GAP-01: the per-instrument tick-gap tracker saw an instrument go
     /// silent past the error threshold (`source = "instrument_gap"`,
     /// edge-latched per instrument), or opened a backfill window after a
-    /// WebSocket reconnect (`source = "reconnect_backfill_window"`). Not
+    /// WebSocket reconnect (`source = "reconnect_backfill_window"`), or found
+    /// an instrument with no tick for 10 minutes on its 30 s stale scan
+    /// (`source = "stale_ltp"`, coded 2026-10-20). Not
     /// RISK-GAP-03, whose filter pages on every line: a per-instrument page
     /// for an illiquid option is noise. Dormant today (the tracker has no
     /// production tick producer). Severity::Medium.
