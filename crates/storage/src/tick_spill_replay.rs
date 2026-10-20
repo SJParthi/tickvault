@@ -441,15 +441,66 @@ pub fn replay_held(hold: ReplayHold, secs_of_day_ist: u32, top_volume_keyed: boo
     }
 }
 
-/// Days of slack between a top_volume spill file's age limit and the hot
+/// Slack, in seconds, between a top_volume spill file's age limit and the hot
 /// window after which its table's partitions can be archived and dropped.
-pub const TOP_VOLUME_REPLAY_AGE_SLACK_DAYS: u32 = 1;
+///
+/// ⚠ CHANGED 2026-10-20 (audit C1): was `TOP_VOLUME_REPLAY_AGE_SLACK_DAYS = 1`,
+/// with the age counted from the hour's START. See
+/// [`top_volume_replay_max_age_secs`] for why 14 hours.
+pub const TOP_VOLUME_REPLAY_AGE_SLACK_SECS: u64 = 14 * 3_600;
 
 /// The age past which a top_volume spill file is set aside instead of
 /// replayed (owner decision Q4(b), 2026-10-13): the shortest hot window the
 /// archive applies to any `top_volume_<tf>` table (the same
 /// `hot_window_days` the archive calls, so the two cannot disagree) less
-/// [`TOP_VOLUME_REPLAY_AGE_SLACK_DAYS`], never below one day.
+/// [`TOP_VOLUME_REPLAY_AGE_SLACK_SECS`], never below one day. The age is
+/// counted from the END of the file's hour ([`spill_file_older_than`]).
+///
+/// ⚠ CHANGED 2026-10-20 (audit C1) — the age is counted from the hour's END
+/// and the slack is 14 hours, not one day. With the shipped config (pressure
+/// archival on, 2-day pressure window) the limit is 2 days − 14 h = **34 h**
+/// past the hour's end, where it was 24 h past the hour's START. The old
+/// limit gave a morning spill one evening: replay is held 08:00–15:40 IST
+/// ([`depth_replay_held_at`]) and the box stops at 17:25 IST, so a file whose
+/// hour ended 09:30 IST on day D could replay only 15:40–17:25 on D, and was
+/// set aside at 08:30 on D+1, before the next evening. The rule now: every
+/// file whose hour ends at or after 07:25 IST (every hour the box can spill
+/// in, from its 08:00 start) is set aside no earlier than 17:25 on the next
+/// day, so it gets the D+1 evening too. 34 h, in numbers: the earliest such
+/// hour ends 08:30 IST (02:00–03:00 UTC) and is set aside at D+1 18:30, after
+/// the stop; the latest one the box can spill in ends 17:30 IST (11:00–12:00
+/// UTC) and is set aside at D+2 03:30.
+///
+/// The upper side is the drop. The `top_volume_<tf>` tables are PARTITION BY
+/// HOUR (`top_volume_create_ddl`), and the archive's day cutoff
+/// `minTimestamp < dateadd('d', -N, now())` (UTC `now()`) judges each HOUR
+/// partition on its own `minTimestamp`. Rows are stamped in IST (5.5 h ahead
+/// of UTC), so a file of UTC hour `[h, h + 1 h)` writes into the IST hour
+/// partitions that start at IST-stamped `h + 5 h` and `h + 6 h`; the earlier
+/// one has `minTimestamp ≥ h + 5 h` and is first selected at UTC
+/// `h + 5 h + N days`. The file is set aside at `h + 1 h + N days − 14 h`, so
+/// the margin is **18 h at every hour of the day** (29 h under the old
+/// start-of-hour, one-day rule) and a replay never writes into an hour whose
+/// cold copy was already taken. Worked example, shipped config: the
+/// 16:30–17:30 IST file is set aside at D+2 03:30 IST and its first partition
+/// (D T16) can first drop at D+2 21:30 IST. The file is kept in `quarantine/`
+/// (uploaded cold before any trim), never deleted, so the cost of the longer
+/// window is only disk held: a pending file stays in the spill folder about
+/// 11 h longer (34 h from the end against 24 h from the start), inside the
+/// folder's existing hard ceiling (`top_volume_spill_max_bytes`), which is
+/// unchanged.
+///
+/// **Honest limit:** the 18 h holds for a row whose `ts` falls inside its
+/// file's hour. A row spilled later than its own `ts` (row lag: it waited in
+/// the writer before the spill) lands in an earlier hour partition, which can
+/// drop that much sooner, so the true margin is 18 h minus the largest such
+/// lag. The lag is not measured here; only a lag of 18 h or more lets a
+/// replay reach a dropped hour.
+/// *(⚠ 2026-10-20, C1 review LOW-1: the first version of this note modelled
+/// the tables as DAY-partitioned. Its "D+N 05:30" earliest drop is a lower
+/// bound for the 00:00 IST hour only, its 2 h margin was wrong, and its
+/// honest limit, "hours ending after 19:30 IST lose the margin", does not
+/// exist under the hour partitions.)*
 ///
 /// # Why
 ///
@@ -460,6 +511,12 @@ pub const TOP_VOLUME_REPLAY_AGE_SLACK_DAYS: u32 = 1;
 /// `hot − 1` days keeps it at least 5.5 h ahead of that, so a replay never
 /// writes into an hour whose cold copy was already taken. The file is kept in
 /// `quarantine/` (uploaded cold before any trim), never deleted. Pure. O(1).
+/// *(⚠ 2026-10-20, audit C1: the `hot − 1` days / 5.5 h figures in this
+/// paragraph and the "more than ONE day old" cost below are superseded by the
+/// C1 note above: `hot` days − 14 h from the hour's end, 18 h minus row lag
+/// ahead of the earliest drop at any hour. This paragraph's "day partition"
+/// is also wrong: the tables are PARTITION BY HOUR, and each hour partition
+/// is judged on its own oldest row.)*
 ///
 /// ⚠ CHANGED 2026-10-13 (PR-C review, MEDIUM): when the disk-pressure archive
 /// is enabled, the window is the SMALLER of the normal and the pressure
@@ -498,15 +555,26 @@ pub fn top_volume_replay_max_age_secs(
         };
         hot = hot.min(shortest(&pressure));
     }
-    let days = hot.saturating_sub(TOP_VOLUME_REPLAY_AGE_SLACK_DAYS).max(1);
-    u64::from(days).saturating_mul(86_400)
+    u64::from(hot)
+        .saturating_mul(SECS_PER_DAY)
+        .saturating_sub(TOP_VOLUME_REPLAY_AGE_SLACK_SECS)
+        .max(SECS_PER_DAY)
 }
 
+/// Seconds in a day, for the top_volume age limit.
+const SECS_PER_DAY: u64 = 86_400;
+
 /// Whether a spill file of hour `file_hour` is past `max_age_secs` at
-/// `now_unix_secs`: its hour STARTED more than `max_age_secs` ago. Pure. O(1).
+/// `now_unix_secs`: its hour ENDED more than `max_age_secs` ago. Pure. O(1).
+///
+/// ⚠ CHANGED 2026-10-20 (audit C1): counted from the hour's END, not its
+/// start. A file holds rows from anywhere in its hour, so its last rows are
+/// only as old as the hour's end; counting from the start aged every file by
+/// up to an hour it had not lived. Exactly at the limit the file is kept.
 #[must_use]
 pub fn spill_file_older_than(file_hour: u64, max_age_secs: u64, now_unix_secs: u64) -> bool {
     file_hour
+        .saturating_add(1)
         .saturating_mul(SPILL_FILE_HOUR_SECS)
         .saturating_add(max_age_secs)
         < now_unix_secs
@@ -514,9 +582,32 @@ pub fn spill_file_older_than(file_hour: u64, max_age_secs: u64, now_unix_secs: u
 
 /// Moves every PENDING spill file of `dir` older than `max_age_secs` to
 /// `quarantine/` (top_volume, owner decision Q4(b)). A file that is drained,
-/// empty, unnamed by hour, or still being written (not closed and quiet) is
-/// left alone. Each move is counted on `tv_spill_replay_aged_set_aside_total`
-/// and logged once. Returns the files moved.
+/// empty, or still being written (not closed and quiet) is left alone; a file
+/// whose name carries no hour is handled by the 2026-10-20 rule below. Each
+/// aged move is counted on `tv_spill_replay_aged_set_aside_total` and logged
+/// once. Returns the files moved (aged and undated together).
+///
+/// ⚠ CHANGED 2026-10-20 (audit C1 review, LOW-2): a NON-EMPTY `.ilp` file
+/// whose name carries no hour is no longer left alone. It is moved to the
+/// same `quarantine/` folder (same naming, never overwritten, never deleted,
+/// copied cold before any trim), counted on
+/// `tv_spill_replay_undated_set_aside_total{dir}` and logged once, when it is
+/// moved. Before, nothing ever moved it: this function could not age it, the
+/// replay never empties a file it cannot date (`spill_file_closed_and_quiet`
+/// reads it as live), and the resume offset is in memory only, so the file
+/// was re-posted after every restart, every evening, for as long as it sat
+/// there; and since the same change, the archive no longer holds any
+/// partition for it (`partition_archive::oldest_pending_spill_hour` skips it),
+/// so those re-posts could write into an hour already archived and dropped.
+/// Moving it makes the replay and the archive agree: neither reads it. No age
+/// or quiet check applies, because there is no hour to age and the spill
+/// writer never makes such a name (`<tier>-<feed>-<hour>.ilp`), so nothing in
+/// this process appends to it; a rename on the same volume also leaves any
+/// open handle writing into the moved file, so nothing is lost. An empty
+/// undated file holds nothing to replay and is left. Its rows reach the
+/// database only by hand, after checking the cold archive of the hours they
+/// cover. **Honest limit:** a file placed in the folder between this pass and
+/// the replay's own listing in the same round is still posted once.
 ///
 /// # Complexity
 /// O(files in `dir`): one listing and one `stat` per file, on the replay
@@ -526,6 +617,9 @@ pub fn set_aside_aged_spill_files(dir: &Path, max_age_secs: u64, view: &SpillSin
     let mut moved: u64 = 0;
     for path in list_spill_files(dir) {
         let Some(hour) = spill_file_hour(&path) else {
+            if set_aside_undated_spill_file(dir, &path, label) {
+                moved = moved.saturating_add(1);
+            }
             continue;
         };
         if !spill_file_older_than(hour, max_age_secs, view.now_unix_secs) {
@@ -562,6 +656,48 @@ pub fn set_aside_aged_spill_files(dir: &Path, max_age_secs: u64, view: &SpillSin
         }
     }
     moved
+}
+
+/// Counter for non-empty spill files set aside because their name carries no
+/// hour (audit C1 review, LOW-2, 2026-10-20).
+pub const SPILL_REPLAY_UNDATED_SET_ASIDE_COUNTER: &str = "tv_spill_replay_undated_set_aside_total";
+
+/// Moves one spill file whose name carries no hour to `quarantine/` when it
+/// holds bytes (see [`set_aside_aged_spill_files`]). Returns whether it moved.
+/// A file whose size cannot be read, or that vanished since the listing, is
+/// left for the next round. Cold: one `stat` and at most one rename.
+fn set_aside_undated_spill_file(dir: &Path, path: &Path, label: &'static str) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if meta.len() == 0 {
+        return false;
+    }
+    match quarantine_spill_file(dir, path) {
+        Ok(target) => {
+            metrics::counter!(SPILL_REPLAY_UNDATED_SET_ASIDE_COUNTER, "dir" => label).increment(1);
+            warn!(
+                code = ErrorCode::TickSpill01FileQuarantined.code_str(),
+                source = "spill_replay_undated_set_aside",
+                dir = label,
+                from = %path.display(),
+                to = %target.display(),
+                bytes = meta.len(),
+                "spill file whose name carries no hour was SET ASIDE in quarantine instead \
+                 of replayed: it carries no date, so the archive holds no hour for it and \
+                 a replay might write into an hour already archived and dropped. The \
+                 spill writer never makes such a name, so it came from outside this \
+                 process. Kept on disk and copied to the cold bucket before any trim; \
+                 re-ingest by hand only after checking the cold archive of the hours its \
+                 rows cover."
+            );
+            true
+        }
+        Err(err) => {
+            note_spill_file_unreadable(path, "spill_undated_set_aside_failed", &err);
+            false
+        }
+    }
 }
 
 /// The spill ceiling of the directory `dir`: the depth ceiling for the depth
@@ -2618,6 +2754,9 @@ async fn run_replay_loop(dir: PathBuf, url: String, require_upload: bool, policy
         metrics::counter!(SPILL_REPLAY_HELD_COUNTER, "dir" => policy.label, "reason" => "in_session")
             .increment(0);
         metrics::counter!("tv_spill_replay_aged_set_aside_total", "dir" => policy.label)
+            .increment(0);
+        // 2026-10-20 (audit C1 review, LOW-2): undated files set aside.
+        metrics::counter!(SPILL_REPLAY_UNDATED_SET_ASIDE_COUNTER, "dir" => policy.label)
             .increment(0);
     }
     // One coded `warn!` per suspicion episode, not one per held round.
@@ -6155,15 +6294,19 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
             hot, 35,
             "top_volume tables archive on the market-data window"
         );
-        assert_eq!(top_volume_replay_max_age_secs(&cfg), 34 * 86_400);
+        // 2026-10-20 (audit C1): the window less 14 hours, from the hour's end.
+        assert_eq!(
+            top_volume_replay_max_age_secs(&cfg),
+            35 * 86_400 - 14 * 3_600
+        );
         cfg.market_data_hot_days = 0;
-        // Floored at the archive's 2 days, less one: never below a day.
-        assert_eq!(top_volume_replay_max_age_secs(&cfg), 86_400);
+        // Floored at the archive's 2 days, less 14 hours: 34 hours.
+        assert_eq!(top_volume_replay_max_age_secs(&cfg), 34 * 3_600);
         let policy = top_volume_replay_policy(
             Path::new(crate::top_volume_rank_persistence::TOP_VOLUME_SPILL_DIR),
             &cfg,
         );
-        assert_eq!(policy.max_file_age_secs, Some(86_400));
+        assert_eq!(policy.max_file_age_secs, Some(34 * 3_600));
         assert_eq!(policy.window, ReplayWindow::None);
     }
 
@@ -6177,45 +6320,192 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
         cfg.market_data_hot_days = 15;
         cfg.pressure_hot_days = 2;
         cfg.pressure_archive_enabled = false;
-        assert_eq!(top_volume_replay_max_age_secs(&cfg), 14 * 86_400);
+        // 2026-10-20 (audit C1): every figure is the window less 14 hours.
+        let slack = TOP_VOLUME_REPLAY_AGE_SLACK_SECS;
+        assert_eq!(top_volume_replay_max_age_secs(&cfg), 15 * 86_400 - slack);
         cfg.pressure_archive_enabled = true;
         assert_eq!(
             top_volume_replay_max_age_secs(&cfg),
-            86_400,
-            "pressure archives top_volume at 2 days, so files older than 1 day are set aside"
+            34 * 3_600,
+            "pressure archives top_volume at 2 days, so files 34 h past their hour are set aside"
         );
         cfg.pressure_hot_days = 5;
-        assert_eq!(top_volume_replay_max_age_secs(&cfg), 4 * 86_400);
+        assert_eq!(top_volume_replay_max_age_secs(&cfg), 5 * 86_400 - slack);
         cfg.pressure_hot_days = 0;
         assert_eq!(
             top_volume_replay_max_age_secs(&cfg),
-            86_400,
-            "the pressure window is floored at 2 days, so never below one day"
+            34 * 3_600,
+            "the pressure window is floored at 2 days, so never below 34 hours"
         );
         // Pressure only ever shortens: a pressure window above the normal one
         // changes nothing.
         cfg.pressure_hot_days = 40;
-        assert_eq!(top_volume_replay_max_age_secs(&cfg), 14 * 86_400);
+        assert_eq!(top_volume_replay_max_age_secs(&cfg), 15 * 86_400 - slack);
     }
 
-    #[test]
-    fn test_spill_file_older_than_is_measured_from_the_hour_start() {
-        let day = 86_400;
-        let hour = 1_000_u64;
-        let start = hour * SPILL_FILE_HOUR_SECS;
+    /// 2026-10-19 00:00 IST (a Monday) as unix seconds: 2026-10-18 18:30 UTC.
+    const C1_IST_DAY_START: u64 = 1_792_348_200;
+
+    /// Unix seconds of `hh:mm` IST, `day` days after [`C1_IST_DAY_START`]
+    /// (negative for earlier days). IST has no daylight saving, so a day is
+    /// always 86,400 s and this arithmetic is exact.
+    fn c1_ist(day: i64, hh: u64, mm: u64) -> u64 {
+        let base = i64::try_from(C1_IST_DAY_START).expect("fits") + day * 86_400; // APPROVED: test
+        u64::try_from(base).expect("after epoch") + hh * 3_600 + mm * 60 // APPROVED: test
+    }
+
+    /// When the archive's day cutoff can first select the `top_volume_<tf>`
+    /// HOUR partition holding a row written at `written_unix_secs` (no row
+    /// lag), with `hot_days` as the window. Built from the real pieces: the
+    /// DDL (`PARTITION BY HOUR`), the list SQL
+    /// (`minTimestamp < dateadd('d', -N, now())`, UTC `now()`), and the
+    /// partition range the archive derives from the name. Rows are stamped in
+    /// IST, so the partition is named by the IST hour and its `minTimestamp`
+    /// is at least that hour's IST-stamped start; the cutoff first passes it
+    /// `hot_days` after that value, read as UTC.
+    fn c1_earliest_hour_partition_drop(written_unix_secs: u64, hot_days: u32) -> u64 {
+        let cadence = crate::top_volume_rank_persistence::SnapshotCadence::ALL[0];
         assert!(
-            !spill_file_older_than(hour, day, start + day),
+            crate::top_volume_rank_persistence::top_volume_create_ddl(cadence)
+                .contains("PARTITION BY HOUR")
+        );
+        assert!(
+            crate::partition_manager::build_detach_list_sql(cadence.table_name(), hot_days)
+                .contains(&format!("minTimestamp < dateadd('d', -{hot_days}, now())"))
+        );
+        let ist_offset =
+            u64::try_from(tickvault_common::constants::IST_UTC_OFFSET_SECONDS).expect("positive"); // APPROVED: test
+        let ist_stamped = i64::try_from(written_unix_secs + ist_offset).expect("fits"); // APPROVED: test
+        let name = chrono::DateTime::from_timestamp(ist_stamped, 0)
+            .expect("in range") // APPROVED: test
+            .format("%Y-%m-%dT%H")
+            .to_string();
+        let (start, _end) =
+            crate::partition_archive::partition_range_bounds(&name).expect("hour partition"); // APPROVED: test
+        let start = chrono::NaiveDateTime::parse_from_str(&start, "%Y-%m-%dT%H:%M:%S%.fZ")
+            .expect("literal") // APPROVED: test
+            .and_utc()
+            .timestamp();
+        u64::try_from(start).expect("after epoch") + u64::from(hot_days) * 86_400 // APPROVED: test
+    }
+
+    /// The shipped config: 15-day market-data window, pressure archival on at
+    /// 2 days (`config/base.toml`).
+    fn c1_shipped_retention() -> tickvault_common::config::PartitionRetentionConfig {
+        let mut cfg = tickvault_common::config::PartitionRetentionConfig::default();
+        cfg.market_data_hot_days = 15;
+        cfg.pressure_archive_enabled = true;
+        cfg.pressure_hot_days = 2;
+        cfg
+    }
+
+    /// Regression (audit C1, 2026-10-20): the age is counted from the END of
+    /// the file's hour, and a morning spill gets the next day's evening too.
+    /// Before, a file was set aside 24 h after its hour STARTED, so a 09:15
+    /// spill had only 15:40–17:25 that day before 08:30 the next morning set
+    /// it aside.
+    #[test]
+    fn test_top_volume_spill_age_is_measured_from_the_hour_end() {
+        // DST-free IST: every IST day boundary is 18:30 UTC, all year.
+        assert_eq!(C1_IST_DAY_START % 86_400, 86_400 - 19_800);
+        for day in 0..400 {
+            assert_eq!(c1_ist(day, 0, 0) % 86_400, 86_400 - 19_800, "day {day}");
+        }
+
+        let age = top_volume_replay_max_age_secs(&c1_shipped_retention());
+        assert_eq!(age, 34 * 3_600, "shipped config: 2 days less 14 hours");
+
+        // A 09:15 IST spill on day D: UTC hour 03:00–04:00, i.e. 08:30–09:30 IST.
+        let hour = c1_ist(0, 9, 15) / SPILL_FILE_HOUR_SECS;
+        let end = (hour + 1) * SPILL_FILE_HOUR_SECS;
+        assert_eq!(end, c1_ist(0, 9, 30));
+        assert!(
+            !spill_file_older_than(hour, age, c1_ist(1, 8, 31)),
+            "the old start-of-hour, one-day rule set it aside here"
+        );
+        for (hh, mm) in [(15, 40), (17, 0), (17, 25)] {
+            assert!(
+                !spill_file_older_than(hour, age, c1_ist(1, hh, mm)),
+                "D+1 {hh}:{mm}: the second evening is open"
+            );
+        }
+        // The exact boundary second: at end + age kept, one second later aged.
+        assert_eq!(end + age, c1_ist(1, 19, 30));
+        assert!(
+            !spill_file_older_than(hour, age, end + age),
             "exactly at the limit: kept"
         );
-        assert!(spill_file_older_than(hour, day, start + day + 1));
+        assert!(spill_file_older_than(hour, age, end + age + 1));
+
+        // The earliest hour the box (up from 08:00 IST) can spill in ends 08:30
+        // IST; it too is set aside only after the 17:25 stop on D+1.
+        let first = c1_ist(0, 8, 0) / SPILL_FILE_HOUR_SECS;
+        assert_eq!((first + 1) * SPILL_FILE_HOUR_SECS, c1_ist(0, 8, 30));
+        assert!(!spill_file_older_than(first, age, c1_ist(1, 17, 25)));
+
+        // The latest hour it can spill in ends 17:30 IST (16:30–17:30 IST):
+        // set aside at D+2 03:30. Its rows land in the IST HOUR partitions
+        // D T16 and D T17; the earlier one can first drop at D+2 21:30 IST,
+        // 18 h after the set-aside. (⚠ 2026-10-20, C1 review LOW-1: this block
+        // compared against the D 00:00 hour, "D+2 05:30", as if the table
+        // were DAY-partitioned; that is a lower bound for the 00:00 hour only.)
+        let last = c1_ist(0, 17, 0) / SPILL_FILE_HOUR_SECS;
+        let last_end = (last + 1) * SPILL_FILE_HOUR_SECS;
+        assert_eq!(last_end, c1_ist(0, 17, 30));
+        assert_eq!(last_end + age, c1_ist(2, 3, 30));
+        let last_drop = c1_earliest_hour_partition_drop(last * SPILL_FILE_HOUR_SECS, 2);
+        assert_eq!(last_drop, c1_ist(2, 21, 30));
+        assert!(spill_file_older_than(last, age, last_drop - 18 * 3_600 + 1));
         assert!(
-            !spill_file_older_than(hour, day, start),
-            "a current file is never old"
+            !spill_file_older_than(last, age, c1_ist(1, 17, 25)),
+            "D+1 evening open"
         );
+
+        // A file from YESTERDAY's last hour (UTC 18:00–19:00, i.e. 23:30–00:30
+        // IST; only if the box ran late): its hour ends 00:30 on D, so it
+        // replays on D's evening and is set aside at D+1 10:30. Its first rows
+        // (23:30–00:00 IST) sit in the HOUR partition D−1 T23, which can first
+        // drop at D+2 04:30 IST: 18 h after the set-aside, like every other
+        // hour. (⚠ 2026-10-20, C1 review LOW-1: this comment said the rows sat
+        // in a DAY partition D−1 that could drop at D+1 05:30, before the
+        // set-aside; the table is HOUR-partitioned and that limit was false.)
+        let late = (c1_ist(0, 0, 0) - 15 * 60) / SPILL_FILE_HOUR_SECS;
+        let late_end = (late + 1) * SPILL_FILE_HOUR_SECS;
+        assert_eq!(late_end, c1_ist(0, 0, 30));
         assert!(
-            !spill_file_older_than(u64::MAX, day, u64::MAX),
+            !spill_file_older_than(late, age, c1_ist(0, 15, 40)),
+            "D evening open"
+        );
+        assert!(!spill_file_older_than(late, age, c1_ist(1, 10, 30)));
+        assert!(spill_file_older_than(late, age, c1_ist(1, 10, 30) + 1));
+        let late_drop = c1_earliest_hour_partition_drop(late * SPILL_FILE_HOUR_SECS, 2);
+        assert_eq!(late_drop, c1_ist(2, 4, 30));
+        assert!(spill_file_older_than(late, age, late_drop - 18 * 3_600 + 1));
+
+        // Every hour of the day, under the shipped (2-day) window: the
+        // earliest drop of the first hour partition a file's rows reach is
+        // exactly 18 h after the file is set aside (with no row lag), so the
+        // set-aside always comes first.
+        for hh in 0..24 {
+            let file_hour = c1_ist(0, hh, 0) / SPILL_FILE_HOUR_SECS;
+            let set_aside_after = (file_hour + 1) * SPILL_FILE_HOUR_SECS + age;
+            let drop = c1_earliest_hour_partition_drop(file_hour * SPILL_FILE_HOUR_SECS, 2);
+            assert_eq!(drop - set_aside_after, 18 * 3_600, "IST hour {hh}");
+            assert!(spill_file_older_than(file_hour, age, drop), "IST hour {hh}");
+        }
+
+        // A current file is never old, and the arithmetic saturates.
+        assert!(!spill_file_older_than(hour, age, c1_ist(0, 9, 20)));
+        assert!(
+            !spill_file_older_than(hour, 0, end),
+            "zero age, exactly at the end: kept"
+        );
+        assert!(spill_file_older_than(hour, 0, end + 1));
+        assert!(
+            !spill_file_older_than(u64::MAX, age, u64::MAX),
             "saturates, no panic"
         );
+        assert!(!spill_file_older_than(u64::MAX - 1, u64::MAX, u64::MAX));
     }
 
     #[test]
@@ -6248,6 +6538,74 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
             fresh.exists(),
             "a file inside the age limit is replayed, not moved"
         );
+        let _ = std::fs::remove_dir_all(dir.parent().expect("parent"));
+    }
+
+    /// Regression (audit C1 review, LOW-2, 2026-10-20): a non-empty `.ilp`
+    /// file whose name carries no hour used to be skipped here, never emptied
+    /// by the replay, and re-posted after every restart, while the archive
+    /// (since C1) holds no hour for it. It is now set aside in `quarantine/`
+    /// on the first round, with no age or quiet check, so the replay's own
+    /// listing no longer sees it.
+    #[test]
+    fn test_undated_top_volume_spill_file_is_set_aside() {
+        let dir = temp_dir("c1-undated").join("top_volume");
+        std::fs::create_dir_all(&dir).expect("mkdir"); // APPROVED: test
+        let now = SpillSinkView::current().now_unix_secs;
+        let this_hour = now / SPILL_FILE_HOUR_SECS;
+        let undated = dir.join("top_volume-dhan-notanhour.ilp");
+        let undated_empty = dir.join("top_volume-dhan-empty.ilp");
+        let not_spill = dir.join("notes.txt");
+        let fresh = dir.join(format!("top_volume-dhan-{this_hour}.ilp"));
+        std::fs::write(&undated, GOOD_LINE).expect("write"); // APPROVED: test
+        std::fs::write(&undated_empty, b"").expect("write"); // APPROVED: test
+        std::fs::write(&not_spill, GOOD_LINE).expect("write"); // APPROVED: test
+        std::fs::write(&fresh, GOOD_LINE).expect("write"); // APPROVED: test
+        assert!(list_spill_files(&dir).contains(&undated), "replay reads it");
+
+        // Written this instant: no quiet check holds an undated file back.
+        let mut view = test_spill_view();
+        view.now_unix_secs = now;
+        assert_eq!(set_aside_aged_spill_files(&dir, 86_400, &view), 1);
+        assert!(!undated.exists(), "the undated file is set aside");
+        let moved = dir
+            .join(QUARANTINE_DIR)
+            .join("top_volume-dhan-notanhour.ilp");
+        assert_eq!(
+            std::fs::read(&moved).expect("moved"), // APPROVED: test
+            GOOD_LINE,
+            "kept whole in quarantine, never deleted"
+        );
+        assert!(
+            !list_spill_files(&dir).contains(&undated),
+            "the replay's listing no longer sees it"
+        );
+        assert!(
+            undated_empty.exists(),
+            "an empty file has nothing to replay"
+        );
+        assert!(not_spill.exists(), "only .ilp files are spill files");
+        assert!(fresh.exists(), "a dated file inside the age limit stays");
+        // The archive and the replay now agree: only the dated file counts.
+        assert_eq!(
+            crate::partition_archive::oldest_pending_spill_hour(&dir),
+            Some(this_hour)
+        );
+
+        // A second file of the same name never overwrites the first.
+        std::fs::write(&undated, b"second\n").expect("write"); // APPROVED: test
+        assert_eq!(set_aside_aged_spill_files(&dir, 86_400, &view), 1);
+        assert_eq!(std::fs::read(&moved).expect("first"), GOOD_LINE); // APPROVED: test
+        assert_eq!(
+            std::fs::read(
+                dir.join(QUARANTINE_DIR)
+                    .join("top_volume-dhan-notanhour.ilp.1")
+            )
+            .expect("second"), // APPROVED: test
+            b"second\n"
+        );
+        // Nothing left to move: the next round is a no-op.
+        assert_eq!(set_aside_aged_spill_files(&dir, 86_400, &view), 0);
         let _ = std::fs::remove_dir_all(dir.parent().expect("parent"));
     }
 
