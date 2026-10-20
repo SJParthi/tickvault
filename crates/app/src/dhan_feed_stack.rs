@@ -116,6 +116,7 @@ use tickvault_core::pipeline::tick_gap_detector::{
 use tickvault_core::websocket::connection::{
     DhanFeedSocketImpl, DhanSocketParams, FeedTokenBuffer,
 };
+use tickvault_core::websocket::frame_ring::frame_ring;
 use tickvault_core::websocket::pool_budget::{
     ConnectionSlot, DhanEndpointType, MAX_TOTAL_DHAN_CONNECTIONS, connection_slot_label,
 };
@@ -18729,8 +18730,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         }
     }
 
-    let (frame_tx, frame_rx) =
-        tickvault_core::websocket::frame_ring::frame_ring::<CapturedFrame>(FRAME_RING_CAPACITY);
+    let (frame_tx, frame_rx) = frame_ring(FRAME_RING_CAPACITY);
     // TWO properties, merged rather than picked between (2026-08-15).
     //
     // origin/main SPLIT the ring budget by endpoint so a 512 KiB depth frame

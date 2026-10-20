@@ -141,6 +141,7 @@ impl<T> FrameRingSender<T> {
     #[must_use]
     pub fn downgrade(&self) -> FrameRingWeakSender<T> {
         FrameRingWeakSender {
+            // APPROVED: an Arc count bump on a handle clone, once per socket dial, never per frame.
             tx: self.tx.clone(),
             shared: Arc::clone(&self.shared),
         }
@@ -151,6 +152,7 @@ impl<T> Clone for FrameRingSender<T> {
     fn clone(&self) -> Self {
         self.shared.senders.fetch_add(1, Ordering::Relaxed);
         Self {
+            // APPROVED: an Arc count bump on a handle clone, once per socket dial, never per frame.
             tx: self.tx.clone(),
             shared: Arc::clone(&self.shared),
         }
@@ -184,6 +186,7 @@ impl<T> FrameRingWeakSender<T> {
             ) {
                 Ok(_) => {
                     return Some(FrameRingSender {
+                        // APPROVED: an Arc count bump on a handle clone, once per socket dial, never per frame.
                         tx: self.tx.clone(),
                         shared: Arc::clone(&self.shared),
                     });
@@ -283,8 +286,36 @@ mod tests {
         assert_eq!(tx.try_send(2), Err(FrameRingTrySendError::Full(2)));
     }
 
+    #[test]
+    fn test_frame_ring_len_and_is_empty_track_the_queue() {
+        let (tx, mut rx) = frame_ring::<u32>(4);
+        assert!(rx.is_empty());
+        assert_eq!(rx.len(), 0);
+        tx.try_send(1).expect("room");
+        tx.try_send(2).expect("room");
+        assert_eq!(rx.len(), 2);
+        assert!(!rx.is_empty());
+        assert_eq!(rx.try_recv(), Some(1));
+        assert_eq!(rx.try_recv(), Some(2));
+        assert_eq!(rx.try_recv(), None);
+        assert!(rx.is_empty());
+    }
+
+    #[test]
+    fn test_frame_ring_upgrade_succeeds_while_a_strong_sender_lives() {
+        let (tx, _rx) = frame_ring::<u32>(4);
+        let weak = tx.downgrade();
+        let a = weak.upgrade().expect("open");
+        let b = weak.upgrade().expect("open");
+        drop(tx);
+        drop(a);
+        assert!(weak.upgrade().is_some(), "b still holds it open");
+        drop(b);
+        assert!(weak.upgrade().is_none());
+    }
+
     #[tokio::test]
-    async fn test_frame_ring_a_weak_sender_does_not_keep_the_ring_open() {
+    async fn test_frame_ring_downgrade_gives_a_weak_sender_that_does_not_keep_the_ring_open() {
         let (tx, mut rx) = frame_ring::<u32>(4);
         let weak = tx.downgrade();
         let strong = weak.upgrade().expect("a strong sender is alive");
