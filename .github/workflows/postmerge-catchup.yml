@@ -45,6 +45,10 @@
 # skip still decide whether/when the swap happens; this dispatcher only TRIGGERS.
 # The box-start deploy-watchdog Lambda remains the deterministic backstop that
 # catches a stale-binary boot from the on-box provenance and pages + redeploys.
+# 2026-10-20: on a day the NSE holiday gate stopped the box, the deploy-aws run
+# this dispatches skips green (`DEPLOY_SKIP_REASON=holiday_stop`) without
+# starting the box. That run still counts as covering the SHA here, so the
+# redeploy is the watchdog's on the next weekday boot (binary_stale), not this.
 #
 # HONEST ENVELOPE: cron/dispatch redundancy REDUCES but cannot ELIMINATE GitHub
 # scheduler risk — the scheduler is external and can drop any or all slots. This

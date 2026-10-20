@@ -36,6 +36,22 @@
 //! skip run can fool the GitHub signal but never the SSM param — the
 //! 2026-07-09 outage class).
 //!
+//! **Holiday-stop day (2026-10-20).** A stale verdict does NOT dispatch while
+//! `/tickvault/<env>/holiday-stop-date` (the marker the app's holiday gate
+//! writes before it stops the box on a weekday NSE holiday) is today's IST
+//! date: the dispatched `deploy-aws-after-close.yml` runs `deploy-aws.yml` by
+//! workflow_dispatch, which self-starts a stopped box, so a redeploy would
+//! undo the holiday stop or meet it mid-swap. The read reuses
+//! `start_watchdog::holiday_stop_is_today` (same parameter, same IST date,
+//! same fail-open: an unreadable marker dispatches as before). One `info!`
+//! line, result `"skipped": "holiday_stop"`, no page. The 24h mismatch
+//! metric is still published. `deploy-aws.yml` checks the same marker
+//! before it starts a stopped box, which covers the other dispatchers.
+//! **Honest limit:** on the instance-start event the watchdog can fire
+//! before the gate has written the marker in that same boot; that one
+//! firing still dispatches, and the deploy it starts skips at the marker
+//! once the box is stopped, or meets the stop during its verify.
+//!
 //! Behavior-parity ledger (deliberate deviations from the legacy runtime):
 //! * env vars are read PER INVOCATION (the legacy runtime read them at module import;
 //!   Lambda cold-starts per config change so both see current values).
@@ -506,6 +522,8 @@ pub async fn handle(event: Value) -> Result<Value, lambda_runtime::Error> {
         std::env::var("BINARY_SHA_PARAM").unwrap_or_else(|_| DEFAULT_BINARY_SHA_PARAM.to_string());
     let desired_sha_param = std::env::var("DESIRED_SHA_PARAM")
         .unwrap_or_else(|_| DEFAULT_DESIRED_SHA_PARAM.to_string());
+    let holiday_stop_param = std::env::var("HOLIDAY_STOP_PARAM")
+        .unwrap_or_else(|_| crate::start_watchdog::DEFAULT_HOLIDAY_STOP_PARAM.to_string());
 
     let config = crate::clients::sdk_config().await;
     let ssm = crate::clients::ssm(&config);
@@ -584,6 +602,36 @@ pub async fn handle(event: Value) -> Result<Value, lambda_runtime::Error> {
             "github_stale": github_stale,
             "binary_stale": binary_stale,
             "dispatched": false,
+        }));
+    }
+
+    // 2026-10-20: the holiday gate stopped the box on purpose today (weekday
+    // NSE holiday). A redeploy now would self-start it (deploy-aws.yml by
+    // workflow_dispatch) or meet the stop mid-swap. Same marker read as the
+    // start-watchdog, fail-open: an unreadable marker dispatches as before.
+    let holiday_marker = crate::start_watchdog::SdkSsm {
+        client: ssm.clone(),
+    };
+    if crate::start_watchdog::holiday_stop_is_today(
+        &holiday_marker,
+        &holiday_stop_param,
+        chrono::Utc::now(),
+    )
+    .await
+    {
+        info!(
+            window,
+            github_stale,
+            binary_stale,
+            "stale deploy, but the holiday-stop marker is today: the holiday gate stopped the box on purpose — not dispatching a redeploy"
+        );
+        return Ok(json!({
+            "window": window,
+            "stale": true,
+            "github_stale": github_stale,
+            "binary_stale": binary_stale,
+            "dispatched": false,
+            "skipped": "holiday_stop",
         }));
     }
 
@@ -837,6 +885,33 @@ mod tests {
             DEFAULT_DESIRED_SHA_PARAM, DEFAULT_BINARY_SHA_PARAM,
             "the mirror and the on-box provenance must be different params"
         );
+    }
+
+    /// 2026-10-20: on a holiday-stop day a stale verdict must not dispatch
+    /// (a dispatched deploy self-starts the box the holiday gate stopped).
+    /// Source scan of `handle`: the marker read sits after the stale verdict
+    /// and before the dispatch, and the skip returns without dispatching.
+    #[test]
+    fn handle_reads_the_holiday_stop_marker_before_it_dispatches() {
+        let src = include_str!("deploy_watchdog.rs");
+        let handle = src.find("pub async fn handle(").expect("handle is defined");
+        let body = &src[handle..];
+        let body = &body[..body.find("\n}\n").unwrap_or(body.len())];
+        let stale = body.find("if !stale {").expect("stale verdict branch");
+        let marker = body
+            .find("crate::start_watchdog::holiday_stop_is_today(")
+            .expect("handle must read the holiday-stop marker");
+        let skip = body
+            .find("\"skipped\": \"holiday_stop\"")
+            .expect("handle must report the holiday-stop skip");
+        let dispatch = body
+            .find("dispatch_deploy(")
+            .expect("handle dispatches the redeploy");
+        assert!(
+            stale < marker && marker < skip && skip < dispatch,
+            "the holiday-stop marker must be read and honoured before the dispatch"
+        );
+        assert!(body.contains("std::env::var(\"HOLIDAY_STOP_PARAM\")"));
     }
 
     #[test]

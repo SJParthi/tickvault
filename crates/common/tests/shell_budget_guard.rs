@@ -568,9 +568,16 @@ const CONSOLE_SHELL_SOURCES: &[(&str, usize, usize)] = &[
 
 /// Per workflow file: `(path, SSM command elements, bytes)` ceilings,
 /// measured 2026-10-04. A workflow absent here may send no SSM shell.
+/// 2026-10-20: `deploy-aws.yml` 95 / 11,980 → 94 / 11,907 (measured exactly):
+/// its two `systemctl enable` elements became one that also names
+/// `tickvault-holiday-gate`, which the deploy copied but never enabled
+/// (−1 element, −1 byte from the measured 11,979; the old row carried one
+/// byte of slack), and that unit's copy lost its `if [ -f … ]`
+/// wrapper so a missing file fails the deploy instead of silently failing
+/// the combined enable (−71 bytes).
 const SSM_WORKFLOW_SHELL_BUDGET: &[(&str, usize, usize)] = &[
     (".github/workflows/aws-control.yml", 22, 1486),
-    (".github/workflows/deploy-aws.yml", 95, 11980),
+    (".github/workflows/deploy-aws.yml", 94, 11907),
     (".github/workflows/downsize-instance.yml", 43, 3767),
     (".github/workflows/grow-ebs-volume.yml", 9, 353),
 ];
@@ -1254,7 +1261,10 @@ const WORKFLOW_RUN_LINE_BUDGET: &[(&str, usize)] = &[
     (".github/workflows/claude-triage-loop.yml", 6),
     (".github/workflows/dep-freshness-nightly.yml", 82),
     (".github/workflows/deploy-aws-after-close.yml", 58),
-    (".github/workflows/deploy-aws.yml", 643),
+    // 2026-10-20: 643 → 642, the two deploy `systemctl enable` lines became one;
+    // then 642 → 640: the holiday-stop skip before the self-start added 4 lines,
+    // paid by merging the two 4-line instance-state branches into one line each.
+    (".github/workflows/deploy-aws.yml", 640),
     (".github/workflows/downsize-instance.yml", 425),
     (".github/workflows/emergency-fs-recover.yml", 126),
     (".github/workflows/full-test-nightly.yml", 83),

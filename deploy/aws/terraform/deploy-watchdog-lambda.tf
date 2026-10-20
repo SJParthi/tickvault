@@ -72,6 +72,16 @@ resource "aws_iam_role_policy" "deploy_watchdog" {
         Resource = "arn:aws:ssm:${var.aws_region}:*:parameter/tickvault/${var.environment}/deploy/desired-git-sha"
       },
       {
+        # 2026-10-20: read the holiday-stop marker the app's holiday gate
+        # writes before it stops the box on a weekday NSE holiday, so a stale
+        # verdict does not dispatch a redeploy that would self-start the box
+        # the gate just stopped. Read-only, exactly that one parameter (the
+        # same one the start-watchdog reads).
+        Effect   = "Allow"
+        Action   = ["ssm:GetParameter"]
+        Resource = "arn:aws:ssm:${var.aws_region}:*:parameter/tickvault/${var.environment}/holiday-stop-date"
+      },
+      {
         # B9 deploy provenance: publish the mismatch metric. PutMetricData
         # supports no resource-level scoping — constrain by namespace so
         # this Lambda can only ever write Tickvault/Prod metrics.
@@ -142,6 +152,9 @@ resource "aws_lambda_function" "deploy_watchdog" {
       # path. GitHub stays the PREFERRED source, so adding a token later
       # upgrades the check with no further change.
       DESIRED_SHA_PARAM = "/tickvault/${var.environment}/deploy/desired-git-sha"
+      # 2026-10-20: no redeploy dispatch while this marker is today's IST date
+      # (the holiday gate stopped the box on purpose).
+      HOLIDAY_STOP_PARAM = "/tickvault/${var.environment}/holiday-stop-date"
     }
   }
 

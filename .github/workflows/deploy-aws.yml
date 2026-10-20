@@ -723,15 +723,10 @@ jobs:
             sleep 5
           done
 
-          if [ "$ST" = "running" ]; then
-            echo "instance already running — proceeding with deploy"
-            exit 0
-          fi
-
-          if [ "$ST" != "stopped" ]; then
-            echo "::error::instance in unexpected state '$ST' — not safe to deploy"
-            exit 1
-          fi
+          # 2026-10-20: each one-line branch was four lines; merged to pay for
+          # the holiday-stop check below (the run-line budget only shrinks).
+          if [ "$ST" = "running" ]; then echo "instance already running — proceeding with deploy"; exit 0; fi
+          if [ "$ST" != "stopped" ]; then echo "::error::instance in unexpected state '$ST' — not safe to deploy"; exit 1; fi
 
           if [ "$SHOULD_BE_UP" != "yes" ]; then
             echo "DEPLOY_SKIP_REASON=intentional_stopped" >> "$GITHUB_ENV"
@@ -757,6 +752,19 @@ jobs:
             echo "DEPLOY_SKIP_REASON=budget_stop" >> "$GITHUB_ENV"
             echo "::notice::Box is stopped by the monthly budget stop for $(date -u +%Y-%m) — not starting it, skipping deploy. To deploy anyway, delete /tickvault-guard/prod/budget-stop-month and re-enable the daily-start rule, then re-run."
             exit 0
+          fi
+
+          # 2026-10-20: the holiday gate (holiday_gate.rs) stamps today's IST
+          # date into this marker before it stops the box on a weekday NSE
+          # holiday. Every dispatcher (deploy-watchdog, deploy-aws-after-close,
+          # postmerge-catchup) runs this workflow by workflow_dispatch, which
+          # sets SHOULD_BE_UP=yes, so without this check a holiday redeploy
+          # would start the box the gate just stopped. Same read and fail-open
+          # as the budget latch above (unreadable = start as before); the
+          # GitHub role already reads this parameter (oidc.tf). Green no-op.
+          HSTOP=$(aws ssm get-parameter --region "$REGION" --name "/tickvault/prod/holiday-stop-date" --query 'Parameter.Value' --output text 2>/dev/null || echo "")
+          if [ -n "$HSTOP" ] && [ "$HSTOP" = "$(TZ='Asia/Kolkata' date +%F)" ]; then
+            echo "DEPLOY_SKIP_REASON=holiday_stop" >> "$GITHUB_ENV"; echo "::notice::Box was stopped today by the NSE holiday gate — not starting it, skipping deploy. To deploy anyway, start the box from the console (the gate lets a second start the same day through, and never stops a boot outside 08:25-09:15 IST), then re-run with confirm_market_hours=yes (09:00-15:45 IST) or after 15:45 IST: a running box deploys."; exit 0
           fi
 
           echo "box stopped but SHOULD be up — starting it (EventBridge start likely failed)"
@@ -1065,6 +1073,22 @@ jobs:
         # a deploy that fails its smoke test must not leave a new unit pointing
         # at an older copy that does not know that subcommand (it would ignore
         # the argument and boot the whole app inside the unit).
+        # ENABLE THE HOLIDAY GATE ON EVERY DEPLOY (2026-10-20): the deploy
+        # copied tickvault-holiday-gate.service but enabled only tickvault and
+        # tickvault-host-tuning. Only first-boot user-data enabled the gate, and
+        # terraform ignores user_data changes, so the live box never had it
+        # enabled and ran through the 2026-10-02 and 2026-10-20 NSE holidays.
+        # One `systemctl enable` element now names all three units, after
+        # `systemctl daemon-reload` (shell budget shrinks by one element).
+        # One `systemctl enable` naming three units fails whole if any unit
+        # file is absent, and `|| true` would hide that, so the gate unit's
+        # copy is unconditional: a missing file now fails the deploy under
+        # `set -euo pipefail` instead of silently leaving all three disabled.
+        # The gate itself stops the box only on a weekday NSE holiday booted
+        # inside 08:25 to 09:15 IST (holiday_gate.rs), so a weekend or
+        # after-hours deploy start is never stopped by it.
+        # Pinned by host_tuning_boot_wiring_guard.rs
+        # `deploy_enables_the_holiday_gate_after_daemon_reload`.
         id: ssm
         # EXPRESSION-LENGTH LOCK (2026-08-18): this run block MUST stay free of
         # `${{ }}` interpolation. GitHub compiles any run script containing an
@@ -1119,7 +1143,7 @@ jobs:
               "mv bin/smoke_test.new  bin/smoke_test",
               "chown ec2-user:ec2-user bin/tickvault bin/smoke_test",
               "install -m 0755 -o root -g root bin/tickvault bin/tickvault-host",
-              "if [ -f repo/deploy/systemd/tickvault-holiday-gate.service ]; then cp -f repo/deploy/systemd/tickvault-holiday-gate.service /etc/systemd/system/tickvault-holiday-gate.service; fi",
+              "cp -f repo/deploy/systemd/tickvault-holiday-gate.service /etc/systemd/system/tickvault-holiday-gate.service",
               "if [ -f repo/deploy/systemd/tickvault.service ]; then cp -f repo/deploy/systemd/tickvault.service /etc/systemd/system/tickvault.service; fi",
               "grep -q \"^TV_QDB_HTTP_BIND=\" repo/deploy/docker/.env 2>/dev/null || echo \"TV_QDB_HTTP_BIND=0.0.0.0\" >> repo/deploy/docker/.env",
               "chown ec2-user:ec2-user repo/deploy/docker/.env",
@@ -1127,8 +1151,7 @@ jobs:
               "for i in 1 2 3 4 5 6; do if curl -fsS http://127.0.0.1:9000/exec?query=SELECT%201 >/dev/null 2>&1; then echo QUESTDB-UP; break; fi; sleep 5; if [ $i -eq 6 ]; then echo FATAL: QuestDB not responding on :9000 after 30s; docker compose -f repo/deploy/docker/docker-compose.yml ps; exit 1; fi; done",
               "curl -fsS --max-time 5 -o /dev/null http://127.0.0.1:9000/index.html || { echo \"FATAL: console shell page (/index.html) not served as a complete HTTP 200 within 5s on the box\"; exit 1; }",
               "systemctl daemon-reload",
-              "systemctl enable tickvault || true",
-              "systemctl enable tickvault-host-tuning || true",
+              "systemctl enable tickvault tickvault-host-tuning tickvault-holiday-gate || true",
               "systemctl restart tickvault-host-tuning || true",
               "ENVF=/opt/tickvault/repo/deploy/docker/.env",
               "touch $ENVF",

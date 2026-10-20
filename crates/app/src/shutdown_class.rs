@@ -27,6 +27,21 @@
 //! DURING one of the two quiet windows renders quiet — bounded (the
 //! budget alarm pages independently; both windows sit outside the
 //! [09:15, 15:30) trading session).
+//!
+//! **⚠ CHANGED 2026-10-20 — the holiday window now ends 09:25, not 09:00.**
+//! The holiday gate (`holiday_gate.rs`) stops the box on a weekday NSE
+//! holiday at a boot inside 08:25 to 09:15 IST, and the app's SIGTERM
+//! arrives some time AFTER the gate's decision instant (the gate's own
+//! metadata and AWS calls, then EC2 delivering the shutdown). The quiet
+//! window therefore ends at the gate's window end plus
+//! [`HOLIDAY_GATE_STOP_LAG_SECS`], so every gate stop classifies as
+//! [`ShutdownClass::ScheduledStop`]; both windows START at the same 08:25
+//! (the gate reuses [`HOLIDAY_GATE_STOP_WINDOW_START_SECS_OF_DAY_IST`]).
+//! Residual, widened by 25 minutes: a manual or budget stop on a
+//! non-trading day between 08:25 and 09:25 IST renders quiet. The holiday
+//! window now runs 10 minutes past 09:15, so "both windows sit outside the
+//! trading session" above holds only because this arm needs a NON-trading
+//! day, on which no session runs.
 
 use std::path::Path;
 
@@ -57,8 +72,25 @@ pub const SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST: u32 = 63_900;
 /// start-cron jitter on both sides.
 pub const HOLIDAY_GATE_STOP_WINDOW_START_SECS_OF_DAY_IST: u32 = 30_300;
 
-/// End (exclusive) of the holiday-gate self-stop IST window: 09:00:00.
-pub const HOLIDAY_GATE_STOP_WINDOW_END_SECS_OF_DAY_IST: u32 = 32_400;
+/// How long after the holiday gate's decision instant the app's SIGTERM can
+/// arrive (2026-10-20): 300 s for everything the gate does after deciding
+/// (the `TimeoutStartSec=300` outer bound of `tickvault-holiday-gate.service`,
+/// which covers its metadata and AWS calls) plus 300 s for EC2 to deliver the
+/// shutdown to the guest and systemd to signal the app. The second half is
+/// **Assumed** (EC2 normally signals the guest within seconds); not measured.
+pub const HOLIDAY_GATE_STOP_LAG_SECS: u32 = 600;
+
+/// End (exclusive) of the holiday-gate self-stop IST window: 09:25:00.
+///
+/// **⚠ CHANGED 2026-10-20** — was 09:00:00 (`32_400`). It is now the holiday
+/// gate's own window end (09:15, see
+/// `holiday_gate::SCHEDULED_START_WINDOW_END_SECS_OF_DAY_IST`) plus
+/// [`HOLIDAY_GATE_STOP_LAG_SECS`], so a gate stop decided at the last
+/// second of the gate's window still classifies quiet when the app's SIGTERM
+/// lands. Pinned by
+/// `test_classify_shutdown_at_the_holiday_gates_latest_stop_is_scheduled`.
+pub const HOLIDAY_GATE_STOP_WINDOW_END_SECS_OF_DAY_IST: u32 =
+    crate::holiday_gate::SCHEDULED_START_WINDOW_END_SECS_OF_DAY_IST + HOLIDAY_GATE_STOP_LAG_SECS;
 
 /// Classify a graceful shutdown. Inputs are all in-process:
 ///
@@ -79,7 +111,7 @@ pub const HOLIDAY_GATE_STOP_WINDOW_END_SECS_OF_DAY_IST: u32 = 32_400;
 /// | ctrl_c   | any    | any                                        | OperatorStop  |
 /// | sigterm  | false  | any                                        | OperatorStop  |
 /// | sigterm  | true   | weekday ∧ 17:25–17:45 IST (any day)        | ScheduledStop |
-/// | sigterm  | true   | !is_trading_day ∧ 08:25–09:00 IST          | ScheduledStop |
+/// | sigterm  | true   | !is_trading_day ∧ 08:25–09:25 IST          | ScheduledStop |
 /// | sigterm  | true   | otherwise (incl. Muhurat / manual weekend) | ExternalStop  |
 /// | anything else     | —                                          | ExternalStop  |
 #[must_use]
@@ -468,7 +500,8 @@ mod tests {
     #[test]
     fn test_classify_shutdown_holiday_gate_self_stop_window_only() {
         // G5 (fix round 2): the non-trading-day quiet arm is the EXPLICIT
-        // 08:25–09:00 IST holiday-gate self-stop window — never any-hour.
+        // holiday-gate self-stop window (08:25–09:25 IST since 2026-10-20,
+        // 08:25–09:00 before) — never any-hour.
         // Inside the window (weekday holiday auto-start morning): quiet.
         for secs in [
             HOLIDAY_GATE_STOP_WINDOW_START_SECS_OF_DAY_IST,
@@ -481,7 +514,7 @@ mod tests {
                 "secs={secs}"
             );
         }
-        // Boundaries: one second before 08:25 / at 09:00 exactly → loud.
+        // Boundaries: one second before 08:25 / at 09:25 exactly → loud.
         assert_eq!(
             classify_shutdown(
                 "sigterm",
@@ -511,12 +544,39 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_shutdown_holiday_gate_window_consts_are_0825_and_0900_ist() {
+    fn test_classify_shutdown_holiday_gate_window_consts_are_0825_and_0925_ist() {
         assert_eq!(
             HOLIDAY_GATE_STOP_WINDOW_START_SECS_OF_DAY_IST,
             8 * 3600 + 25 * 60
         );
-        assert_eq!(HOLIDAY_GATE_STOP_WINDOW_END_SECS_OF_DAY_IST, 9 * 3600);
+        // 2026-10-20: was 09:00; now the gate's 09:15 end plus the 600 s lag.
+        assert_eq!(HOLIDAY_GATE_STOP_LAG_SECS, 600);
+        assert_eq!(
+            HOLIDAY_GATE_STOP_WINDOW_END_SECS_OF_DAY_IST,
+            9 * 3600 + 25 * 60
+        );
+    }
+
+    /// 2026-10-20: every stop the holiday gate can issue classifies quiet.
+    /// The gate stops only on a weekday NSE holiday (weekday, not a trading
+    /// day) at a boot inside its window, and the app's SIGTERM lands at most
+    /// `HOLIDAY_GATE_STOP_LAG_SECS` after the gate decided.
+    #[test]
+    fn test_classify_shutdown_at_the_holiday_gates_latest_stop_is_scheduled() {
+        let gate_start = crate::holiday_gate::SCHEDULED_START_WINDOW_START_SECS_OF_DAY_IST;
+        let gate_last = crate::holiday_gate::SCHEDULED_START_WINDOW_END_SECS_OF_DAY_IST - 1;
+        for decided in [gate_start, 8 * 3600 + 30 * 60, gate_last] {
+            for lag in [0, 1, HOLIDAY_GATE_STOP_LAG_SECS] {
+                assert_eq!(
+                    classify_shutdown("sigterm", true, decided + lag, true, false),
+                    ShutdownClass::ScheduledStop,
+                    "gate decided at {decided}, SIGTERM {lag} s later"
+                );
+            }
+        }
+        // Both windows start at the same instant: the gate reuses this
+        // module's constant.
+        assert_eq!(gate_start, HOLIDAY_GATE_STOP_WINDOW_START_SECS_OF_DAY_IST);
     }
 
     #[test]

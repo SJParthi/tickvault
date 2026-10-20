@@ -1368,15 +1368,29 @@ mod tests {
     /// Audit INP-14 (2026-10-11): the `--check-trading-day` gate and the boot
     /// read the SAME layered config, so a holiday list in the env file
     /// reaches both. Source scan of `main.rs`.
+    ///
+    /// 2026-10-20: the load moved into `load_gate_trading_calendar`, which
+    /// both `trading_day_gate_code` (`--check-trading-day`) and
+    /// `holiday_gate_calendar_day` (the holiday gate) call, so the scan reads
+    /// that body and checks both callers use it.
     #[test]
     fn test_trading_day_gate_reads_the_same_layered_config_as_the_boot() {
         let src = include_str!("main.rs");
-        let gate_start = src
-            .find("fn trading_day_gate_code")
-            .expect("main.rs must define trading_day_gate_code");
-        let gate_body = &src[gate_start..];
-        let gate_end = gate_body.find("\n}\n").unwrap_or(gate_body.len());
-        let gate_body = &gate_body[..gate_end];
+        let body_of = |name: &str| {
+            let start = src
+                .find(&format!("fn {name}("))
+                .unwrap_or_else(|| panic!("main.rs must define {name}"));
+            let body = &src[start..];
+            let end = body.find("\n}\n").unwrap_or(body.len());
+            &body[..end]
+        };
+        for caller in ["trading_day_gate_code", "holiday_gate_calendar_day"] {
+            assert!(
+                body_of(caller).contains("load_gate_trading_calendar()"),
+                "{caller} must load its calendar through load_gate_trading_calendar"
+            );
+        }
+        let gate_body = body_of("load_gate_trading_calendar");
         assert!(
             gate_body.contains("layered_config_figment"),
             "the trading-day gate must build its config with layered_config_figment"
