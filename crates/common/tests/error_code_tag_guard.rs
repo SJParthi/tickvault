@@ -15,6 +15,14 @@
 //! - Violations are listed with file:line.
 //!
 //! Escape hatch: preceding `// APPROVED:` comment skips the check.
+//!
+//! 2026-10-20 (plan item D2, `.claude/plans/active-plan-audit-2026-10-20.md`):
+//! `every_production_error_carries_a_code` demands a `code` field on EVERY
+//! production `error!` in every crate, message or no message, with a
+//! per-file allowlist that names only the frozen indicator/strategy lines.
+//! It matches the field NAME, not the substring `code =`: the substring
+//! matched `exchange_segment_code =` and `segment_code =` and let two
+//! uncoded production lines pass as coded.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -351,6 +359,19 @@ fn scan_corpus_exists_and_is_substantial() {
 /// The three left are the frozen-area lines (`indicator/engine.rs` and two
 /// in `strategy/hot_reload.rs`); they change only with a fresh dated
 /// operator approval under `daily-universe-scope-expansion` §28.
+///
+/// 3 -> 3 (2026-10-20, plan item D2). The number did not move and the count
+/// behind it was wrong. The walker treated `body.contains("code =")` as "has
+/// a code field", which is also true of `exchange_segment_code = …` and
+/// `segment_code = …`. So the stale-LTP line in `tick_gap_tracker.rs` and the
+/// slot-exhausted line in `multi_tf_aggregator.rs` carried NO code and were
+/// counted as coded, while two needle strings inside guard tests
+/// (`src.matches("tracing::error!(")`, `helper.contains("error!(")`) were
+/// counted as `error!` sites. True count before this change: 5. Both lines
+/// are coded in the same change (`TICK-GAP-01` source `stale_ltp`,
+/// `AGGREGATOR-DROP-01` source `slot_exhausted`), and the walker now uses
+/// `production_error_sites` (field-name match, string-aware), so the count is
+/// 3 again and this time it is the true 3.
 const UNCODED_ERROR_BUDGET: usize = 3;
 
 /// Per-crate uncoded-error budgets, for the crates the six-name list never
@@ -539,28 +560,430 @@ fn collect_uncoded(dir: &Path, out: &mut Vec<String>, scanned: &mut usize) {
         // then blank the `#[cfg(test)] mod tests` block while KEEPING every
         // production line that follows it. A file with no test module is
         // production end to end, which is what the fallback says.
-        let stripped = tickvault_common::source_scan::strip_rust_comments(&contents);
-        let production =
-            tickvault_common::source_scan::production_region(&stripped).unwrap_or(stripped);
-
-        let lines: Vec<&str> = production.lines().collect();
-        let mut idx = 0;
-        while idx < lines.len() {
-            let line = lines[idx];
-            if !(line.contains("error!(") || line.contains("tracing::error!(")) {
-                idx += 1;
-                continue;
-            }
-            let (body, end_idx) = collect_macro_body(&lines, idx);
-            let coded = body.contains("code =") || body.contains("code=");
-            let site = format!("{}:{}", path.display(), idx + 1);
+        // 2026-10-20: both steps, and the field match, now live in
+        // `production_error_sites`, shared with
+        // `every_production_error_carries_a_code`, so the two tests cannot
+        // count the same corpus two different ways.
+        for (line, coded) in production_error_sites(&contents) {
+            let site = format!("{}:{}", path.display(), line);
             let allowed = UNCODED_ERROR_ALLOWLIST.iter().any(|a| site.ends_with(a));
             if !coded && !allowed {
                 out.push(format!("  {site}"));
             }
-            idx = end_idx + 1;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// 2026-10-20 — EVERY production `error!` carries a code (plan item D2)
+// ---------------------------------------------------------------------------
+
+/// Production `error!` sites that may carry NO `code` field, per file, with
+/// the exact count. Today: only the frozen indicator/strategy area.
+///
+/// Both files sit under `daily-universe-scope-expansion-2026-05-27.md` §28
+/// ("as of now don't even touch indicators and strategies area dude okay?"):
+/// a change to `crates/trading/src/indicator/` or `crates/trading/src/strategy/`
+/// needs a fresh dated operator approval, and none exists for coding these
+/// lines. Measured 2026-10-20 by reading the code:
+/// - `indicator/engine.rs`: the indicator slot-capacity line;
+/// - `strategy/hot_reload.rs`: the file-watcher error line and the config
+///   reload failure line.
+///
+/// Only these prefixes may appear here (`FROZEN_AREA_PREFIXES`). The count is
+/// exact: coding one of these lines (after the approval) must lower or remove
+/// its entry in the same change.
+const FROZEN_UNCODED_ERROR_SITES: [(&str, usize); 2] = [
+    ("crates/trading/src/indicator/engine.rs", 1),
+    ("crates/trading/src/strategy/hot_reload.rs", 2),
+];
+
+/// The only directories `FROZEN_UNCODED_ERROR_SITES` may name.
+const FROZEN_AREA_PREFIXES: [&str; 2] = [
+    "crates/trading/src/indicator/",
+    "crates/trading/src/strategy/",
+];
+
+/// Anti-vacuity floor on the number of production `error!` sites seen.
+/// Measured 2026-10-20: 812 sites in 353 files under `crates/*/src`. The
+/// floor sits well under that so deleting code does not trip it, and far
+/// above what a walk that silently lost a crate would see.
+const MIN_PRODUCTION_ERROR_SITES: usize = 600;
+
+#[test]
+fn every_production_error_carries_a_code() {
+    let root = workspace_root();
+    let mut files: Vec<PathBuf> = Vec::new();
+    for (_crate_name, src_dir) in crates_with_src(&root) {
+        collect_rs_files(&src_dir, &mut files);
+    }
+    files.sort();
+
+    assert!(
+        files.len() > 100,
+        "the every-error-is-coded guard found only {} .rs files under \
+         crates/*/src; it would enforce nothing.",
+        files.len()
+    );
+
+    let mut total_sites = 0usize;
+    let mut uncoded: Vec<(String, Vec<usize>)> = Vec::new();
+    for path in &files {
+        let contents = fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("every-error-is-coded guard cannot read {path:?}: {e}"));
+        let sites = production_error_sites(&contents);
+        total_sites += sites.len();
+        let lines: Vec<usize> = sites
+            .iter()
+            .filter(|(_, coded)| !coded)
+            .map(|(line, _)| *line)
+            .collect();
+        if !lines.is_empty() {
+            uncoded.push((relative_path(&root, path), lines));
+        }
+    }
+
+    assert!(
+        total_sites >= MIN_PRODUCTION_ERROR_SITES,
+        "the every-error-is-coded guard saw only {total_sites} production \
+         `error!` sites (floor {MIN_PRODUCTION_ERROR_SITES}, measured 812 on \
+         2026-10-20). Either the walk lost files or the detector stopped \
+         matching; it would be passing by seeing nothing."
+    );
+
+    let mut violations: Vec<String> = Vec::new();
+    for (file, lines) in &uncoded {
+        let listed = FROZEN_UNCODED_ERROR_SITES
+            .iter()
+            .find(|(allowed, _)| allowed == file);
+        let where_ = lines
+            .iter()
+            .map(|line| format!("{file}:{line}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        match listed {
+            None => violations.push(format!(
+                "  {where_} — production `error!` with no `code` field"
+            )),
+            Some((_, expected)) if lines.len() > *expected => violations.push(format!(
+                "  {where_} — {} uncoded, allowlisted {expected}: a new uncoded \
+                 `error!` in a frozen file",
+                lines.len()
+            )),
+            Some((_, expected)) if lines.len() < *expected => violations.push(format!(
+                "  {file} — {} uncoded, allowlisted {expected}: lower the \
+                 FROZEN_UNCODED_ERROR_SITES entry to {} in this change",
+                lines.len(),
+                lines.len()
+            )),
+            Some(_) => {}
+        }
+    }
+    for (allowed, expected) in FROZEN_UNCODED_ERROR_SITES {
+        if !FROZEN_AREA_PREFIXES
+            .iter()
+            .any(|prefix| allowed.starts_with(prefix))
+        {
+            violations.push(format!(
+                "  {allowed} — FROZEN_UNCODED_ERROR_SITES may name only the \
+                 frozen indicator/strategy area; give this file's lines a code"
+            ));
+        }
+        if !uncoded.iter().any(|(file, _)| file == allowed) {
+            violations.push(format!(
+                "  {allowed} — allowlisted {expected} uncoded, found 0 (or the \
+                 file is gone): remove the stale FROZEN_UNCODED_ERROR_SITES entry"
+            ));
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "every production `error!` must carry a structured `code` field \
+         (`code = ErrorCode::X.code_str()`). Without one the line reaches the \
+         log files and nothing else: every CloudWatch metric filter matches \
+         `$.code`, and triage groups by it.\n\n\
+         Pick the existing ErrorCode that fits (read its runbook first; a code \
+         whose filter pages on every line is the wrong home for a \
+         per-instrument line). Only the frozen indicator/strategy lines \
+         (daily-universe-scope-expansion §28) are allowlisted.\n\n{}",
+        violations.join("\n")
+    );
+}
+
+/// Every `.rs` file under `dir`, recursively. Panics on an unreadable
+/// directory: a guard must not pass on files it never opened.
+fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let entries = fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("every-error-is-coded corpus unreadable {dir:?}: {e}"));
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rs_files(&path, out);
+        } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// `path` relative to the workspace root, with `/` separators, so the
+/// allowlist reads the same on every platform.
+fn relative_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// Every `error!` invocation in the PRODUCTION region of one source file:
+/// `(1-based line, carries a code field)`.
+///
+/// Comments are blanked and the `#[cfg(test)] mod tests` block is excised by
+/// `tickvault_common::source_scan`, the same carve the budget ratchet above
+/// has used since its own walker hid nineteen sites. A file with no test
+/// module is production end to end.
+///
+/// Honest limits: only the first `error!(` on a line is seen, and a second
+/// one opening on the line where the first closes is skipped (none exist
+/// today); a raw string (`r#"…"#`) inside the call is read as an ordinary
+/// string (none exist today); `#[cfg(test)]` items OUTSIDE `mod tests` are
+/// scanned as production, which errs toward demanding a code.
+fn production_error_sites(contents: &str) -> Vec<(usize, bool)> {
+    let stripped = tickvault_common::source_scan::strip_rust_comments(contents);
+    let production =
+        tickvault_common::source_scan::production_region(&stripped).unwrap_or(stripped);
+    let lines: Vec<&str> = production.lines().collect();
+    let mut sites = Vec::new();
+    let mut idx = 0usize;
+    while idx < lines.len() {
+        let Some(column) = error_macro_column(lines[idx]) else {
+            idx += 1;
+            continue;
+        };
+        let (body, end_idx) = macro_invocation(&lines, idx, column);
+        sites.push((idx + 1, carries_code_field(&body)));
+        idx = end_idx + 1;
+    }
+    sites
+}
+
+/// Byte offset of the first `error!(` on `line` that sits in CODE, not inside
+/// a string literal opened earlier on the same line. A guard that greps for
+/// its own needle (`src.matches("tracing::error!(")`) is not an emit site,
+/// and taking it for one also makes the body walk swallow the lines after it
+/// until its unbalanced `(` closes.
+fn error_macro_column(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut search_from = 0usize;
+    while let Some(rel) = line[search_from..].find("error!(") {
+        let at = search_from + rel;
+        search_from = at + "error!(".len();
+        // A qualified path (`tracing::error!`) is fine; the name must not be
+        // the tail of a longer identifier (`my_error!(` is another macro).
+        if at > 0 && is_ident_byte(bytes[at - 1]) {
+            continue;
+        }
+        let mut quotes = 0usize;
+        let mut idx = 0usize;
+        while idx < at {
+            match bytes[idx] {
+                b'\\' => idx += 1,
+                b'"' => quotes += 1,
+                _ => {}
+            }
+            idx += 1;
+        }
+        if quotes % 2 == 0 {
+            return Some(at);
+        }
+    }
+    None
+}
+
+/// The text of the `error!(…)` call that opens at `lines[start][column..]`,
+/// and the index of the line that closes it.
+///
+/// Parentheses count only in code: a `(` inside the message string or a
+/// `'('` char literal does not move the depth. `collect_macro_body` above
+/// counts every paren on the line, which is why it is not reused here.
+fn macro_invocation(lines: &[&str], start: usize, column: usize) -> (String, usize) {
+    let mut body = String::new();
+    let mut depth = 0i32;
+    let mut seen_open = false;
+    let mut in_str = false;
+    for (offset, raw) in lines.iter().enumerate().skip(start) {
+        let text = if offset == start { &raw[column..] } else { raw };
+        let bytes = text.as_bytes();
+        let mut idx = 0usize;
+        while idx < bytes.len() {
+            let byte = bytes[idx];
+            if in_str {
+                match byte {
+                    b'\\' => idx += 1,
+                    b'"' => in_str = false,
+                    _ => {}
+                }
+                idx += 1;
+                continue;
+            }
+            match byte {
+                b'"' => in_str = true,
+                b'\'' => {
+                    // Skip `'('` and `'\''`; a lifetime has no closing quote
+                    // two or three bytes on.
+                    if bytes.get(idx + 2) == Some(&b'\'') {
+                        idx += 2;
+                    } else if bytes.get(idx + 1) == Some(&b'\\')
+                        && bytes.get(idx + 3) == Some(&b'\'')
+                    {
+                        idx += 3;
+                    }
+                }
+                b'(' => {
+                    depth += 1;
+                    seen_open = true;
+                }
+                b')' => depth -= 1,
+                _ => {}
+            }
+            idx += 1;
+            if seen_open && depth == 0 {
+                body.push_str(&text[..idx]);
+                return (body, offset);
+            }
+        }
+        body.push_str(text);
+        body.push('\n');
+    }
+    (body, lines.len().saturating_sub(1))
+}
+
+fn is_ident_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// `body` with the CONTENT of every string literal replaced by spaces
+/// (quotes and newlines kept), so a message reading "code = 7" cannot pass
+/// for a field.
+fn blank_string_contents(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut in_str = false;
+    let mut escaped = false;
+    for ch in body.chars() {
+        if in_str {
+            if escaped {
+                escaped = false;
+                out.push(if ch == '\n' { '\n' } else { ' ' });
+                continue;
+            }
+            match ch {
+                '\\' => {
+                    escaped = true;
+                    out.push(' ');
+                }
+                '"' => {
+                    in_str = false;
+                    out.push('"');
+                }
+                '\n' => out.push('\n'),
+                _ => out.push(' '),
+            }
+            continue;
+        }
+        if ch == '"' {
+            in_str = true;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// True when the call passes a structured field named exactly `code`
+/// (`code = …`, whitespace and newlines allowed around `=`; `code: …` is also
+/// accepted).
+///
+/// The name must start after a non-identifier, non-`.` byte (`segment_code`
+/// and the dotted field `http.code` are other fields) and end at a
+/// non-identifier byte (`codes` is another field). `code ==` and `code::` are
+/// expressions, not fields. String contents never count.
+fn carries_code_field(body: &str) -> bool {
+    let code_only = blank_string_contents(body);
+    let bytes = code_only.as_bytes();
+    let mut search_from = 0usize;
+    while let Some(rel) = code_only[search_from..].find("code") {
+        let at = search_from + rel;
+        search_from = at + "code".len();
+        if at > 0 && (is_ident_byte(bytes[at - 1]) || bytes[at - 1] == b'.') {
+            continue;
+        }
+        let mut next = at + "code".len();
+        if bytes.get(next).is_some_and(|b| is_ident_byte(*b)) {
+            continue;
+        }
+        while bytes.get(next).is_some_and(u8::is_ascii_whitespace) {
+            next += 1;
+        }
+        match (bytes.get(next), bytes.get(next + 1)) {
+            (Some(b'='), after) if after != Some(&b'=') => return true,
+            (Some(b':'), after) if after != Some(&b':') => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// The scanner bites: an uncoded call is flagged even when another field
+/// ends in `code`, the message says "code =", or a paren in the message is
+/// left open; a needle string in a guard is not a site; test-module calls
+/// are not production.
+#[test]
+fn production_error_scanner_bites() {
+    let src = r##"fn a() {
+    error!(
+        exchange_segment_code = 1,
+        segment_code = 2,
+        "stale LTP, code = 3"
+    );
+    tracing::error!(code = ErrorCode::X.code_str(), "coded");
+    error!(
+        code =
+            ErrorCode::Y.code_str(),
+        "multi-line, left open ("
+    );
+    let n = src.matches("tracing::error!(").count();
+    error!(?err, "file watcher error");
+}
+
+#[cfg(test)]
+mod tests {
+    fn t() {
+        error!("test-only, never counted");
+    }
+}
+"##;
+    assert_eq!(
+        production_error_sites(src),
+        vec![(2, false), (7, true), (8, true), (14, false)],
+        "the scanner must flag lines 2 and 14, accept lines 7 and 8, skip the \
+         needle string on line 13 and the test module"
+    );
+}
+
+#[test]
+fn carries_code_field_matches_only_the_field_named_code() {
+    assert!(carries_code_field("error!(code = X, \"m\")"));
+    assert!(carries_code_field("error!(\n    code\n        = X, \"m\")"));
+    assert!(carries_code_field("error!(code: X)"));
+    assert!(!carries_code_field(
+        "error!(exchange_segment_code = 1, \"m\")"
+    ));
+    assert!(!carries_code_field("error!(segment_code = 1)"));
+    assert!(!carries_code_field("error!(http.code = 1)"));
+    assert!(!carries_code_field("error!(codes = 1)"));
+    assert!(!carries_code_field("error!(x = code::Y)"));
+    assert!(!carries_code_field("error!(ok = code == 1)"));
+    assert!(!carries_code_field("error!(\"code = 1 in the message\")"));
+    assert!(!carries_code_field("error!(\"escaped \\\" code = 1\")"));
 }
 /// Every crate under `crates/` that has a `src/` directory, discovered from the
 /// filesystem rather than listed.

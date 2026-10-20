@@ -31,7 +31,7 @@ EXISTING alarm, named in each section.
 | WS-SPILL-04 | `crates/storage/src/ws_frame_spill.rs`, boot replay | No new page. The event already pages through the existing `durable-floor-breach` alarm (counter `tv_wal_replay_corrupted_segments_total`). |
 | PROC-03 | `crates/app/src/main.rs`, panic hook | No new page. The process death is paged by the existing liveness alarms. *(⚠ Corrected 2026-10-11: only a restart loop or an outage of 5+ minutes between 09:20 and 15:35 IST pages; a single panic that systemd restarts is not paged. See the PROC-03 section.)* |
 | API-SERVER-01 | `crates/app/src/main.rs`, API server task | No. |
-| TICK-GAP-01 | `crates/trading/src/risk/tick_gap_tracker.rs` (two lines) | No. Dormant today. |
+| TICK-GAP-01 | `crates/trading/src/risk/tick_gap_tracker.rs` (three lines since 2026-10-20) | No. Dormant today. |
 | PIPELINE-LAG-01 | `crates/app/src/trading_pipeline.rs` | No. Dormant today. |
 
 ---
@@ -161,13 +161,18 @@ the API.
 
 ## TICK-GAP-01 — the per-instrument tick-gap tracker saw a gap
 
-**What happened:** one of two lines, told apart by `source`:
+**What happened:** one of three lines, told apart by `source`:
 
 - `source = "instrument_gap"`: an instrument went silent past the error threshold.
   The line fires once per instrument per gap (edge-latched) and clears when ticks
   resume.
 - `source = "reconnect_backfill_window"`: a WebSocket reconnect opened a backfill
   window for the instruments that were recently active.
+- `source = "stale_ltp"` (coded 2026-10-20): the 30-second scan found an
+  instrument with no tick for 10 minutes or more (`frozen_secs`). Once per
+  instrument per stale episode; the next tick resets it. Before this date the line
+  had no code: the tag guard read the field `exchange_segment_code =` as a `code`
+  field.
 
 **Why not RISK-GAP-03:** that code's filter pages on every line, and this tracker can
 fire once per silent instrument, which for illiquid options is normal. The live

@@ -438,7 +438,15 @@ impl TickGapTracker {
 
             let elapsed = now.duration_since(state.last_wall_clock);
             if elapsed >= threshold && !state.stale_alerted {
+                // TICK-GAP-01, not RISK-GAP-03, for the reason the
+                // instrument-gap line above gives: that code's filter pages
+                // on every line, and this fires once per stale instrument.
+                // (2026-10-20: this line carried no code at all. The tag
+                // guard's `contains("code =")` matched the field
+                // `exchange_segment_code =` below and counted it as coded.)
                 error!(
+                    code = tickvault_common::error_code::ErrorCode::TickGap01TrackerGap.code_str(),
+                    source = "stale_ltp",
                     security_id = security_id.0,
                     exchange_segment_code = security_id.1,
                     frozen_secs = elapsed.as_secs(),

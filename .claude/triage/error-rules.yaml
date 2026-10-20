@@ -2346,8 +2346,9 @@ rules:
     cooldown_secs: 600
     justification: >-
       TICK-GAP-01 = the per-instrument tick-gap tracker saw a silent
-      instrument (source=instrument_gap) or opened a reconnect backfill window
-      (source=reconnect_backfill_window). Dormant today. One illiquid
+      instrument (source=instrument_gap), opened a reconnect backfill window
+      (source=reconnect_backfill_window), or found an instrument with no tick
+      for 10 minutes (source=stale_ltp). Dormant today. One illiquid
       instrument is not a feed fault; compare with the live lane's silence
       gauges before acting.
 
