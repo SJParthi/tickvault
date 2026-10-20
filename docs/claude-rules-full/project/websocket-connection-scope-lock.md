@@ -9404,3 +9404,26 @@ REJECT (2026-10-13):
 - Lowering the 900 s depth-200 backstop.
 - Any change to depth-20 or the main feed under this quote.
 - Any new CloudWatch alarm, Telegram page, metric filter or EMF name for it.
+
+### 2026-10-20 note — NO DATA-SILENCE REDIAL ON A NON-TRADING DAY (a fix, not a new quote)
+
+Measured 2026-10-20 (Dussehra, an NSE holiday in `config/base.toml`), read-only
+from the production logs: the box started, every socket dialled, and the
+data-silence redials fired 569 times between 09:15 and 15:30 IST, because the
+2026-10-10 gate checked the time of day only. Owner, the same day: "go ahead
+and fix and resoleev everyhting dude okay?" / "yo utake care of the entiree
+xtreem full end to end automation dude okay?".
+
+The gate now also reads the trading calendar
+(`crates/core/src/websocket/silence_calendar.rs`): on a weekend or NSE holiday
+the 2026-10-10 silence paths (the 300 s fallback, the 60 s / 90 s fast paths,
+the 900 s depth-200 backstop, the depth-200 cross-feed check) and the overflow
+probe window stay shut all day. It only makes those paths fire LESS, so no
+2026-10-10 or 2026-10-13 REJECT row is touched. Unchanged: the ping idle
+watchdog and every close code (an 805 still parks the socket; only the probe
+window that releases it waits for a trading day). It fails open (a normal day) when
+no calendar is installed. One atomic load per 1 s poll; the calendar is asked
+once per IST day. Hostile review the same day: when at least 3 sockets delivered
+data in the last 10 s the market is open whatever the calendar says (a moved
+holiday, a special session, the run-anyway marker), so the gate reads the real
+time of day.
