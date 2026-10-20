@@ -8412,15 +8412,15 @@ async fn run_frame_drain(
                 // for a level writer and `DEPTH_BOOK_FLUSH_BYTES` for an
                 // array-row writer (one depth-200 row is ~4.8 KB, so 10,000
                 // rows would be ~48 MB, past the producer's queue-bytes bound).
-                if ingest.depth_flush_due() {
-                    flush_depth(ingest.depth_sink());
-                }
                 // A busy ring starves the timer arm (`biased`), so the frame
                 // arm hands on rows that exist only in RAM after 500 ms too.
                 let unbacked = ingest
                     .depth_sink()
                     .is_some_and(|d| d.has_unbacked_pending());
-                if unbacked_clock.due(unbacked, FLUSH_INTERVAL) {
+                if ingest.depth_flush_due() {
+                    flush_depth(ingest.depth_sink());
+                    unbacked_clock.reset();
+                } else if unbacked_clock.due(unbacked, FLUSH_INTERVAL) {
                     flush_depth(ingest.depth_sink());
                 }
                 if seen.is_multiple_of(DRAIN_REPORT_EVERY) {
@@ -8503,6 +8503,7 @@ async fn run_frame_drain(
                     .is_some_and(|d| d.has_unbacked_pending());
                 if depth_due || unbacked {
                     flush_depth(ingest.depth_sink());
+                    unbacked_clock.reset();
                 } else {
                     retry_idle_depth_parks(ingest.depth_sink());
                 }
@@ -22779,7 +22780,8 @@ mod tests {
             "the live drain keeps the row threshold for in-order rows"
         );
         assert!(
-            production.contains("if unbacked_clock.due(unbacked, FLUSH_INTERVAL) {"),
+            production.contains("} else if unbacked_clock.due(unbacked, FLUSH_INTERVAL) {")
+                && production.matches("unbacked_clock.reset();").count() == 2,
             "the frame arm hands on WAL-refused depth rows itself: a busy ring starves the timer arm"
         );
     }

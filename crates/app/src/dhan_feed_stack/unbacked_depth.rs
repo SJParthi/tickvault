@@ -33,6 +33,13 @@ impl UnbackedDepthClock {
         self.due_at(true, Instant::now(), limit)
     }
 
+    /// Forgets the wait after a flush made elsewhere (the timer arm, or the
+    /// size trigger in the same frame), so the frame arm does not hand the
+    /// same buffer on a second time inside one limit.
+    pub(super) fn reset(&mut self) {
+        self.since = None;
+    }
+
     /// [`Self::due`] at a given instant, for tests.
     fn due_at(&mut self, unbacked: bool, now: Instant, limit: Duration) -> bool {
         if !unbacked {
@@ -103,6 +110,21 @@ mod tests {
         assert!(!clock.due_at(true, t0 + Duration::from_millis(600), LIMIT));
         assert!(!clock.due_at(true, t0 + Duration::from_millis(1_099), LIMIT));
         assert!(clock.due_at(true, t0 + Duration::from_millis(1_100), LIMIT));
+    }
+
+    #[test]
+    fn test_unbacked_clock_reset_after_another_flush_waits_a_full_limit() {
+        let mut clock = UnbackedDepthClock::default();
+        let t0 = Instant::now();
+        assert!(!clock.due_at(true, t0, LIMIT));
+        // The timer arm flushed at t0 + 300 ms.
+        clock.reset();
+        assert!(!clock.due_at(true, t0 + Duration::from_millis(300), LIMIT));
+        assert!(
+            !clock.due_at(true, t0 + LIMIT, LIMIT),
+            "no second hand-off 200 ms after the timer arm's"
+        );
+        assert!(clock.due_at(true, t0 + Duration::from_millis(800), LIMIT));
     }
 
     #[test]

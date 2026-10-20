@@ -8,10 +8,13 @@
 //! of the 2026-10-20 hot-path review).
 //!
 //! This test installs a real set, then drives two sockets' worth of traffic
-//! through every verdict arm (Accept, DropIdentical on the second copy, older
-//! packets, aux pairs, packets outside the set) under the production metrics
-//! recorder type, and holds 10,000 rounds to the house budget. The install is
-//! cold (once per publication) and stays outside the measured window.
+//! through every verdict arm (Accept, AcceptLate, DropIdentical from both the
+//! main and the late ring, DropOlder for a replayed frame, the aux pair, and a
+//! packet outside the set) under the production metrics recorder type, and
+//! holds 10,000 rounds to the house budget. Each step asserts its own expected
+//! verdict, so a path that stops being reached fails the test instead of
+//! passing vacuously. The install is cold (once per publication) and stays
+//! outside the measured window.
 //!
 //! Run: `cargo test -p tickvault-app --test dhat_main_feed_backup_dedup`
 
@@ -57,49 +60,95 @@ fn packet(security_id: u64, volume: u32) -> [u8; PACKET_LEN] {
     p
 }
 
+/// The steps of one round, each with the verdict it must produce.
+#[derive(Clone, Copy)]
+enum Step {
+    /// Socket 1, cumulative `a`: new, accepted.
+    FirstOnOne,
+    /// Socket 1, cumulative `c` > `a`: newest, accepted.
+    NewestOnOne,
+    /// Socket 0, `a` < `b` < `c`: older than the newest, but socket 1's ring
+    /// entry `a` proves socket 1 never sent it, so it is kept (AcceptLate).
+    LateOnZero,
+    /// Socket 1's copy of `b`: found in the late ring, dropped.
+    LateCopyOnOne,
+    /// Socket 0's copy of `c`: found in the main ring, dropped.
+    NewestCopyOnZero,
+    /// A replayed frame (no socket id) older than everything: dropped as older.
+    ReplayedOlder,
+    /// Aux packet, first copy.
+    AuxFirst,
+    /// Aux packet, the other socket's identical copy.
+    AuxCopy,
+    /// A contract outside the backed-up set.
+    Outside,
+}
+
+const STEPS: usize = 9;
+
+fn expected(step: Step) -> BackupVerdict {
+    match step {
+        Step::FirstOnOne | Step::NewestOnOne | Step::AuxFirst => BackupVerdict::Accept,
+        Step::LateOnZero => BackupVerdict::AcceptLate,
+        Step::LateCopyOnOne | Step::NewestCopyOnZero | Step::AuxCopy => {
+            BackupVerdict::DropIdentical
+        }
+        Step::ReplayedOlder => BackupVerdict::DropOlder,
+        Step::Outside => BackupVerdict::NotBackup,
+    }
+}
+
+/// Per-step hit counts and the count of verdicts that differed from the
+/// expected one. Fixed arrays: counting allocates nothing.
 #[derive(Default)]
 struct Seen {
-    accept: u64,
-    identical: u64,
-    older_or_late: u64,
-    not_backup: u64,
+    hits: [u64; STEPS],
+    wrong: u64,
 }
 
 impl Seen {
-    fn note(&mut self, v: BackupVerdict) {
-        match v {
-            BackupVerdict::Accept => self.accept += 1,
-            BackupVerdict::DropIdentical => self.identical += 1,
-            BackupVerdict::AcceptLate | BackupVerdict::DropOlder => self.older_or_late += 1,
-            BackupVerdict::NotBackup => self.not_backup += 1,
+    fn note(&mut self, step: Step, v: BackupVerdict) {
+        if v == expected(step) {
+            self.hits[step as usize] += 1;
+        } else {
+            self.wrong += 1;
         }
     }
 }
 
-/// One round per call step: socket 0's copy, socket 1's copy, an older packet,
-/// an aux pair and a packet outside the set.
+/// The connection index a replayed WAL frame carries: no socket.
+const REPLAYED: u8 = u8::MAX;
+
+/// One round per contract visit, every verdict arm once.
 fn drive(dedup: &mut BackupDedup, seen: &mut Seen, round: &mut u32, rounds: u32) {
     for _ in 0..rounds {
         *round += 1;
         let r = *round;
         let id = u64::from(r % SET_SIZE) + 1;
-        let volume = 1_000 + r * 10;
-        let ltt = 1_700_000_000 + r;
+        let (a, b, c) = (1_000 + r * 10, 1_003 + r * 10, 1_006 + r * 10);
+        let ltt = 1_700_000_000 + r * 10;
         let now_ms = u64::from(r);
-        let t = tick(id, volume, ltt);
-        let p = packet(id, volume);
+        let (pa, pb, pc) = (packet(id, a), packet(id, b), packet(id, c));
         dedup.on_frame(0, now_ms);
         dedup.on_frame(1, now_ms);
-        seen.note(dedup.admit_tick(&t, &p, 0, now_ms));
-        seen.note(dedup.admit_tick(&t, &p, 1, now_ms));
-        let older = tick(id, volume - 5, ltt - 1);
-        let older_p = packet(id, volume - 5);
-        seen.note(dedup.admit_tick(&older, &older_p, 0, now_ms));
-        seen.note(dedup.admit_aux(id, SEGMENT_FNO, &p[..12], 0));
-        seen.note(dedup.admit_aux(id, SEGMENT_FNO, &p[..12], 1));
-        let out = tick(OUTSIDE_SET, volume, ltt);
-        seen.note(dedup.admit_tick(&out, &packet(OUTSIDE_SET, volume), 0, now_ms));
-        std::hint::black_box(&p);
+        let mut admit = |step: Step, cum: u32, dt: u32, p: &[u8], conn: u8| {
+            let v = dedup.admit_tick(&tick(id, cum, ltt + dt), p, conn, now_ms);
+            seen.note(step, v);
+        };
+        admit(Step::FirstOnOne, a, 0, &pa, 1);
+        admit(Step::NewestOnOne, c, 6, &pc, 1);
+        admit(Step::LateOnZero, b, 3, &pb, 0);
+        admit(Step::LateCopyOnOne, b, 3, &pb, 1);
+        admit(Step::NewestCopyOnZero, c, 6, &pc, 0);
+        let po = packet(id, a - 1);
+        admit(Step::ReplayedOlder, a - 1, 0, &po, REPLAYED);
+        let aux = &pc[..26];
+        seen.note(Step::AuxFirst, dedup.admit_aux(id, SEGMENT_FNO, aux, 0));
+        seen.note(Step::AuxCopy, dedup.admit_aux(id, SEGMENT_FNO, aux, 1));
+        let out = tick(OUTSIDE_SET, c, ltt);
+        let v = dedup.admit_tick(&out, &packet(OUTSIDE_SET, c), 0, now_ms);
+        seen.note(Step::Outside, v);
+        std::hint::black_box(&pc);
     }
 }
 
@@ -140,12 +189,16 @@ fn dhat_backup_dedup_admits_and_drops_without_allocating() {
          per packet there (a Vec, a String, a labelled metrics macro) must move out."
     );
 
-    // The window must have exercised every arm, or it proved nothing.
-    assert!(measured.accept > 0, "no Accept in the window");
-    assert!(measured.identical > 0, "no DropIdentical in the window");
-    assert!(measured.older_or_late > 0, "no older packet in the window");
-    assert!(
-        measured.not_backup > 0,
-        "no packet outside the set in the window"
+    // Every step must have produced exactly its expected verdict, on every
+    // round, or the window measured a different path than it claims.
+    assert_eq!(
+        warm.wrong + measured.wrong,
+        0,
+        "a step produced an unexpected verdict (warm-up per-step hits {:?}, measured {:?})",
+        warm.hits,
+        measured.hits
     );
+    for (i, hits) in measured.hits.iter().enumerate() {
+        assert!(*hits > 0, "step {i} never ran in the measured window");
+    }
 }
