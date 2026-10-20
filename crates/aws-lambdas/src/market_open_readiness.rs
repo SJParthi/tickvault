@@ -76,7 +76,7 @@ use crate::time::IST_OFFSET_SECS;
 /// 08:25 whose gate runs after 08:25 is stopped yet reads here as launched
 /// before the floor, so it pages as "box not running"; the scheduled 08:30
 /// start is never that close. Pinned from the app side by
-/// `test_window_start_matches_the_readiness_lambdas_holiday_self_stop_floor`,
+/// `holiday_gate_window_start_matches_the_readiness_lambdas_floor` (crates/app/tests/host_tuning_boot_wiring_guard.rs),
 /// which source-scans this exact line: move all three together.
 pub const HOLIDAY_SELF_STOP_EARLIEST_IST_MINUTES: u32 = 8 * 60 + 25;
 

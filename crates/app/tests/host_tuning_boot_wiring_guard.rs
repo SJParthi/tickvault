@@ -849,3 +849,32 @@ fn ensure_questdb_runs_the_subcommand_binary_and_every_caller_checks_for_it() {
         "the console's self-heal command no longer checks the binary version"
     );
 }
+
+/// (2026-10-20, moved here from `holiday_gate.rs` to keep app self-source
+/// scans shrink-only.) The gate's worst case, a marker read plus two marker
+/// puts and the retry delay (92 s), must fit the unit's `TimeoutStartSec`.
+#[test]
+fn holiday_gate_unit_timeout_covers_the_marker_retries() {
+    let unit = read("deploy/systemd/tickvault-holiday-gate.service");
+    assert!(
+        unit.contains("TimeoutStartSec=300"),
+        "the holiday gate unit must keep TimeoutStartSec=300 (worst case 92 s)"
+    );
+}
+
+/// (2026-10-20, moved here from `holiday_gate.rs`.) The gate's window start is
+/// the launch floor from which the `market_open_readiness` Lambda reads a
+/// stopped box as the gate's holiday self-stop. If either side moves, a gate
+/// stop pages as "box not running" or a non-gate stop goes silent.
+#[test]
+fn holiday_gate_window_start_matches_the_readiness_lambdas_floor() {
+    let src = read("crates/aws-lambdas/src/market_open_readiness.rs");
+    assert!(
+        src.contains("pub const HOLIDAY_SELF_STOP_EARLIEST_IST_MINUTES: u32 = 8 * 60 + 25;"),
+        "market_open_readiness must keep its 08:25 holiday self-stop floor"
+    );
+    assert_eq!(
+        tickvault_app::holiday_gate::SCHEDULED_START_WINDOW_START_SECS_OF_DAY_IST,
+        (8 * 60 + 25) * 60
+    );
+}

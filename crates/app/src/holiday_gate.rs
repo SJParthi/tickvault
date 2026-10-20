@@ -38,7 +38,7 @@
 //! constant), which is also the launch time from which the
 //! `market_open_readiness` Lambda reads a stopped box as the gate's holiday
 //! self-stop (`HOLIDAY_SELF_STOP_EARLIEST_IST_MINUTES`, 08:25; pinned by
-//! `test_window_start_matches_the_readiness_lambdas_holiday_self_stop_floor`).
+//! `holiday_gate_window_start_matches_the_readiness_lambdas_floor` (crates/app/tests/host_tuning_boot_wiring_guard.rs)).
 //! The Lambda compares the EC2 LAUNCH time, the gate its own clock a few
 //! seconds later in the same boot, so a launch in the last seconds before
 //! 08:25 can be stopped here yet read there as launched before the floor
@@ -690,24 +690,6 @@ mod tests {
         assert_eq!(hh_mm(SCHEDULED_START_WINDOW_END_SECS_OF_DAY_IST), "09:15");
     }
 
-    /// The window start is the launch floor from which the
-    /// `market_open_readiness` Lambda reads a stopped box as the gate's
-    /// holiday self-stop. The Lambda is a separate crate, so its constant is
-    /// pinned by source scan: if either side moves, a gate stop pages as
-    /// "box not running" or a non-gate stop goes silent.
-    #[test]
-    fn test_window_start_matches_the_readiness_lambdas_holiday_self_stop_floor() {
-        let src = include_str!("../../aws-lambdas/src/market_open_readiness.rs");
-        assert!(
-            src.contains("pub const HOLIDAY_SELF_STOP_EARLIEST_IST_MINUTES: u32 = 8 * 60 + 25;"),
-            "market_open_readiness must keep its 08:25 holiday self-stop floor"
-        );
-        assert_eq!(
-            SCHEDULED_START_WINDOW_START_SECS_OF_DAY_IST,
-            (8 * 60 + 25) * 60
-        );
-    }
-
     #[test]
     fn test_classify_calendar_day() {
         // Tuesday, not a holiday.
@@ -900,8 +882,9 @@ mod tests {
             + MARKER_PUT_RETRY_DELAY_SECS
             + AWS_CALL_TIMEOUT_SECS; // the marker read before it
         assert_eq!(worst, 92);
-        let unit = include_str!("../../../deploy/systemd/tickvault-holiday-gate.service");
-        assert!(unit.contains("TimeoutStartSec=300"));
+        // The unit's TimeoutStartSec (300 s) bounds it from outside: pinned in
+        // crates/app/tests/host_tuning_boot_wiring_guard.rs, which reads unit
+        // files (no self-source scan here).
     }
 
     #[test]
