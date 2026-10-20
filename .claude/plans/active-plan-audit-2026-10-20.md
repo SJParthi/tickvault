@@ -84,7 +84,7 @@ fall count on every flat poll, so it never released from late morning to
     a_lag_pinned_perfectly_flat_above_the_floor_still_latches,
     an_uneven_staircase_re_arms_but_pages_at_most_once_an_hour,
     a_new_episode_after_the_floor_pages_at_once,
-    a_staircase_release_is_still_untrusted_by_the_watermark
+    test_untrusted_count_holds_a_staircase_release_for_the_watermark
   - Proof: the two staircase tests FAIL on the old rule; the four hostile-review
     tests FAIL on the first version of this change (a fall count left stale
     after a fire or release, and no expiry for an old fall); all pass now.

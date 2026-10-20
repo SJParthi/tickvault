@@ -2401,7 +2401,7 @@ mod tests {
     /// distrusting the table until the older rule (two falls in a row) or the
     /// floor releases it.
     #[test]
-    fn a_staircase_release_is_still_untrusted_by_the_watermark() {
+    fn test_untrusted_count_holds_a_staircase_release_for_the_watermark() {
         let mut t = WalLagTracker::new();
         for _ in 1..=WAL_APPLY_LAG_GROWING_POLLS {
             t.observe(&[lag_row("market_depth", 109_993, 100_000)]);
