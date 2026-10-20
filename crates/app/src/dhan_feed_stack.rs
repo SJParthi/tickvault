@@ -88,6 +88,7 @@ use std::sync::{Arc, OnceLock};
 // walk and depth writers rather than a second copy of either.
 mod deferred_depth_pass;
 mod top_volume_threads;
+mod unbacked_depth;
 use std::time::Instant;
 
 use secrecy::ExposeSecret;
@@ -7884,6 +7885,8 @@ async fn run_frame_drain(
     // `DEPTH_TIMER_FLUSH_EVERY_TICKS`th tick of the flush timer above. A
     // counter, not a second timer.
     let mut depth_timer_ticks: u32 = 0;
+    // Rows the WAL refused also get the 500 ms hand-off from the frame arm.
+    let mut unbacked_clock = unbacked_depth::UnbackedDepthClock::default();
     // Mid-session catch-up seal. Without it, a bar for an instrument that
     // stops ticking waits for the 15:30 close sweep — correct, but hours late.
     let mut catchup_timer = tokio::time::interval(CATCHUP_SEAL_INTERVAL);
@@ -8410,6 +8413,14 @@ async fn run_frame_drain(
                 // array-row writer (one depth-200 row is ~4.8 KB, so 10,000
                 // rows would be ~48 MB, past the producer's queue-bytes bound).
                 if ingest.depth_flush_due() {
+                    flush_depth(ingest.depth_sink());
+                }
+                // A busy ring starves the timer arm (`biased`), so the frame
+                // arm hands on rows that exist only in RAM after 500 ms too.
+                let unbacked = ingest
+                    .depth_sink()
+                    .is_some_and(|d| d.has_unbacked_pending());
+                if unbacked_clock.due(unbacked, FLUSH_INTERVAL) {
                     flush_depth(ingest.depth_sink());
                 }
                 if seen.is_multiple_of(DRAIN_REPORT_EVERY) {
@@ -22766,6 +22777,10 @@ mod tests {
         assert!(
             production.contains("if ingest.depth_flush_due() {"),
             "the live drain keeps the row threshold for in-order rows"
+        );
+        assert!(
+            production.contains("if unbacked_clock.due(unbacked, FLUSH_INTERVAL) {"),
+            "the frame arm hands on WAL-refused depth rows itself: a busy ring starves the timer arm"
         );
     }
 
