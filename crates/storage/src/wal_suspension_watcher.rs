@@ -645,7 +645,28 @@ struct LagState {
     /// a parse skip, so it waits for [`WAL_LAG_ABSENT_POLLS_TO_EVICT`].
     absent_polls: u32,
     reported: bool,
+    /// Consecutive STRICT falls (any non-fall resets): the pre-2026-10-20
+    /// release rule, kept for the applied watermark only. See
+    /// [`WalLagTracker::untrusted_count`].
+    strict_falls: u32,
+    /// Set whenever the latch fires; cleared only below the floor or after
+    /// [`WAL_APPLY_LAG_RELEASE_POLLS`] strict falls in a row.
+    watermark_hold: bool,
+    /// Polls since this episode's last page; `None` until it pages, and again
+    /// once the lag drops below the floor. See [`WAL_APPLY_LAG_REPAGE_POLLS`].
+    polls_since_page: Option<u32>,
 }
+
+/// Polls between two pages for the same table inside one episode (one hour at
+/// [`WAL_SUSPENSION_POLL_INTERVAL_SECS`]).
+///
+/// Added 2026-10-20 (second hostile review of the staircase change): uneven
+/// steps (a short gap then a gap of six or more polls) release and re-arm on an
+/// 8-11 poll period, and every re-arm wrote a WAL-SUSPEND-01 ERROR. The latch
+/// still re-arms (the shed and the after-close pass follow it); only the page
+/// waits. A table that drops below the floor ends the episode and pages at once
+/// next time.
+pub const WAL_APPLY_LAG_REPAGE_POLLS: u32 = 60;
 
 /// Consecutive FALLING polls (above the floor) before a latched table is
 /// released.
@@ -851,6 +872,9 @@ impl WalLagTracker {
                 flat_since_fall: 0,
                 absent_polls: 0,
                 reported: false,
+                strict_falls: 0,
+                watermark_hold: false,
+                polls_since_page: None,
             });
             // Named on this poll, so any partial-view absence streak ends.
             entry.absent_polls = 0;
@@ -863,8 +887,23 @@ impl WalLagTracker {
                 entry.falling_polls = 0;
                 entry.flat_since_fall = 0;
                 entry.reported = false;
+                entry.strict_falls = 0;
+                entry.watermark_hold = false;
+                entry.polls_since_page = None;
                 entry.last_lag = lag;
                 continue;
+            }
+
+            if let Some(polls) = entry.polls_since_page.as_mut() {
+                *polls = polls.saturating_add(1);
+            }
+            if lag < entry.last_lag {
+                entry.strict_falls = entry.strict_falls.saturating_add(1);
+                if entry.strict_falls >= WAL_APPLY_LAG_RELEASE_POLLS {
+                    entry.watermark_hold = false;
+                }
+            } else {
+                entry.strict_falls = 0;
             }
 
             if lag < entry.last_lag {
@@ -907,7 +946,14 @@ impl WalLagTracker {
                 // Falls counted before the latch fired do not count toward
                 // releasing it (hostile review 2026-10-20).
                 entry.falling_polls = 0;
-                fired.push((row.name.clone(), lag));
+                entry.watermark_hold = true;
+                let page_due = entry
+                    .polls_since_page
+                    .is_none_or(|polls| polls >= WAL_APPLY_LAG_REPAGE_POLLS);
+                if page_due {
+                    entry.polls_since_page = Some(0);
+                    fired.push((row.name.clone(), lag));
+                }
             }
         }
         fired
@@ -936,6 +982,24 @@ impl WalLagTracker {
     #[must_use]
     pub fn reported_count(&self) -> usize {
         self.state.values().filter(|s| s.reported).count()
+    }
+
+    /// Tables whose ILP acks the applied watermark must not trust yet: latched,
+    /// or released by the 2026-10-20 staircase rule but not yet by the older,
+    /// stricter one (two falls in a row, or below the floor).
+    ///
+    /// Added 2026-10-20 (second hostile review): the staircase rule releases a
+    /// table that still has thousands of transactions unapplied, which is right
+    /// for the shed and the after-close pass (they must run for the backlog to
+    /// drain) and wrong for the watermark, which would treat those acks as
+    /// applied and let the replay settle step archive segments early. So the
+    /// watermark keeps exactly the release rule it had before.
+    #[must_use]
+    pub fn untrusted_count(&self) -> usize {
+        self.state
+            .values()
+            .filter(|s| s.reported || s.watermark_hold)
+            .count()
     }
 }
 
@@ -1240,7 +1304,8 @@ pub fn spawn_wal_suspension_watcher(questdb: QuestDbConfig) -> tokio::task::Join
                     // ack is the 2026-08-25 lie (rows ACKed, never applied),
                     // and a watermark that believed it would archive WAL
                     // segments unread. Clean = every row parsed, none
-                    // suspended, no table LATCHED as lagging.
+                    // suspended, no table LATCHED as lagging, nor released by
+                    // the 2026-10-20 staircase rule alone (`untrusted_count`).
                     //
                     // The LEVEL, not the edge. Until 2026-09-08 this read
                     // `growing.is_empty()` — the tables that crossed on THIS
@@ -1251,7 +1316,7 @@ pub fn spawn_wal_suspension_watcher(questdb: QuestDbConfig) -> tokio::task::Join
                     crate::wal_applied_watermark::applied_watermark().note_questdb_probe(
                         skipped == 0
                             && delta.currently_suspended == 0
-                            && lag_tracker.reported_count() == 0,
+                            && lag_tracker.untrusted_count() == 0,
                     );
                     // DA-13c: archive acked replay segments once they are past
                     // the durability lag and two clean probes. A few renames at
@@ -2221,7 +2286,8 @@ mod tests {
                     .len()
             })
             .sum();
-        assert_eq!(fired, 1, "re-armed once");
+        assert_eq!(fired, 0, "re-armed, but the episode already paged");
+        assert_eq!(t.reported_count(), 1, "re-armed");
         t.observe(&[lag_row("market_depth", 199_970, 100_000)]);
         assert_eq!(t.reported_count(), 1, "one fall does not release a re-arm");
         t.observe(&[lag_row("market_depth", 199_960, 100_000)]);
@@ -2261,6 +2327,101 @@ mod tests {
         }
         t.observe(&[lag_row("market_depth", 199_976, 100_000)]);
         assert_eq!(t.reported_count(), 1, "the first fall expired");
+    }
+
+    /// Second hostile review 2026-10-20 (MEDIUM): uneven steps (a gap of 2,
+    /// then 6) release and re-arm every 8 polls. The latch follows that, but
+    /// the page waits WAL_APPLY_LAG_REPAGE_POLLS, so it is one page an hour.
+    #[test]
+    fn an_uneven_staircase_re_arms_but_pages_at_most_once_an_hour() {
+        let mut t = WalLagTracker::new();
+        let mut lag = 200_000;
+        let mut fired = 0usize;
+        let mut polls = 0u32;
+        let mut re_arms = 0usize;
+        let observe = |t: &mut WalLagTracker, lag: i64, fired: &mut usize, polls: &mut u32| {
+            *fired += t.observe(&[lag_row("market_depth", lag, 100_000)]).len();
+            *polls += 1;
+        };
+        for _ in 1..=WAL_APPLY_LAG_GROWING_POLLS {
+            observe(&mut t, lag, &mut fired, &mut polls);
+        }
+        assert_eq!(fired, 1, "the episode pages once");
+        // Cycle: fall, flat, fall (released), then 5 flats (re-armed).
+        while polls < WAL_APPLY_LAG_REPAGE_POLLS - 10 {
+            lag -= 12;
+            observe(&mut t, lag, &mut fired, &mut polls);
+            observe(&mut t, lag, &mut fired, &mut polls);
+            lag -= 12;
+            observe(&mut t, lag, &mut fired, &mut polls);
+            assert_eq!(t.reported_count(), 0, "released");
+            for _ in 0..WAL_APPLY_LAG_GROWING_POLLS {
+                observe(&mut t, lag, &mut fired, &mut polls);
+            }
+            assert_eq!(t.reported_count(), 1, "re-armed");
+            re_arms += 1;
+        }
+        assert!(re_arms >= 5, "the pattern really sawtooths: {re_arms}");
+        assert_eq!(fired, 1, "no page inside the hour");
+        // Keep cycling past the hour: exactly one more page.
+        while polls < 2 * WAL_APPLY_LAG_REPAGE_POLLS - 10 {
+            lag -= 12;
+            observe(&mut t, lag, &mut fired, &mut polls);
+            observe(&mut t, lag, &mut fired, &mut polls);
+            lag -= 12;
+            observe(&mut t, lag, &mut fired, &mut polls);
+            for _ in 0..WAL_APPLY_LAG_GROWING_POLLS {
+                observe(&mut t, lag, &mut fired, &mut polls);
+            }
+        }
+        assert_eq!(fired, 2, "one page per hour of the same episode");
+    }
+
+    /// Below the floor ends the episode: the next latch pages at once.
+    #[test]
+    fn a_new_episode_after_the_floor_pages_at_once() {
+        let mut t = WalLagTracker::new();
+        for _ in 1..=WAL_APPLY_LAG_GROWING_POLLS {
+            t.observe(&[lag_row("market_depth", 200_000, 100_000)]);
+        }
+        t.observe(&[lag_row("market_depth", 100_500, 100_000)]); // below floor
+        assert_eq!(t.reported_count(), 0);
+        assert_eq!(t.untrusted_count(), 0);
+        let fired: usize = (1..=WAL_APPLY_LAG_GROWING_POLLS)
+            .map(|_| {
+                t.observe(&[lag_row("market_depth", 150_000, 100_000)])
+                    .len()
+            })
+            .sum();
+        assert_eq!(fired, 1, "a second episode pages");
+    }
+
+    /// Second hostile review 2026-10-20 (MEDIUM): a staircase release still has
+    /// thousands of transactions unapplied, so the applied watermark keeps
+    /// distrusting the table until the older rule (two falls in a row) or the
+    /// floor releases it.
+    #[test]
+    fn a_staircase_release_is_still_untrusted_by_the_watermark() {
+        let mut t = WalLagTracker::new();
+        for _ in 1..=WAL_APPLY_LAG_GROWING_POLLS {
+            t.observe(&[lag_row("market_depth", 109_993, 100_000)]);
+        }
+        assert_eq!(t.untrusted_count(), 1);
+        t.observe(&[lag_row("market_depth", 109_981, 100_000)]);
+        t.observe(&[lag_row("market_depth", 109_981, 100_000)]);
+        t.observe(&[lag_row("market_depth", 109_969, 100_000)]);
+        assert_eq!(t.reported_count(), 0, "the staircase rule released it");
+        assert_eq!(
+            t.untrusted_count(),
+            1,
+            "the watermark still does not trust it"
+        );
+        // The staircase goes on: a flat poll breaks the strict run.
+        t.observe(&[lag_row("market_depth", 109_969, 100_000)]);
+        t.observe(&[lag_row("market_depth", 109_957, 100_000)]);
+        assert_eq!(t.untrusted_count(), 1, "one strict fall is not enough");
+        t.observe(&[lag_row("market_depth", 109_945, 100_000)]);
+        assert_eq!(t.untrusted_count(), 0, "two falls in a row: trusted again");
     }
 
     /// A staircase slow enough to re-arm (a step every 6 polls) must stay
