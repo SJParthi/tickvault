@@ -75,10 +75,16 @@ fall count on every flat poll, so it never released from late morning to
   rise does. Jitter still never releases; a table stuck flat still latches.
   - Files: crates/storage/src/wal_suspension_watcher.rs
   - Tests: a_staircase_drain_with_flat_polls_releases_the_latch,
+    a_re_arm_after_a_release_needs_two_fresh_falls,
+    falls_before_the_latch_fires_do_not_count_toward_its_release,
+    two_falls_an_hour_apart_do_not_release_the_latch,
+    a_slow_staircase_stays_latched_instead_of_sawtoothing,
     a_rise_between_two_falls_keeps_the_latch_even_with_flat_polls,
     one_falling_poll_does_not_release_the_latch_but_two_do,
     a_lag_pinned_perfectly_flat_above_the_floor_still_latches
-  - Proof: both new tests FAIL on the old rule and pass on the new one.
+  - Proof: the two staircase tests FAIL on the old rule; the four hostile-review
+    tests FAIL on the first version of this change (a fall count left stale
+    after a fire or release, and no expiry for an old fall); all pass now.
 
 ### PR C — top_volume spill replay window (storage)
 
