@@ -46,6 +46,9 @@ pub mod audit_drop_latch;
 // attacker-controlled allocation). Contains no policy: every reconnect, park
 // and resubscribe decision stays in `pool_supervisor`.
 pub mod connection;
+// 2026-10-20 (audit M1): the live frame ring, pre-allocated so a backlog never
+// allocates on the socket read task (tokio's mpsc grows in 32-slot blocks).
+pub mod frame_ring;
 pub mod idle_watchdog;
 pub mod market_hours_gate;
 pub mod order_update_connection;

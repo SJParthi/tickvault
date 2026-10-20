@@ -194,7 +194,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain 1.95.0
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
         with:
           toolchain: '1.95.0'
           components: rustfmt, clippy
@@ -294,7 +294,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain 1.95.0
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
         with:
           toolchain: '1.95.0'
 
@@ -305,7 +305,7 @@ jobs:
           cache-on-failure: true
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
         with:
           tool: cargo-nextest
 
@@ -378,7 +378,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain 1.95.0
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
         with:
           toolchain: '1.95.0'
 
@@ -390,7 +390,7 @@ jobs:
       - name: Install cargo-audit + cargo-deny (prebuilt, pinned)
         id: install-audit-tools
         continue-on-error: true
-        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.82.7 SHA-pinned
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.82.7 SHA-pinned
         with:
           tool: cargo-audit@0.22.2,cargo-deny@0.19.9
 
@@ -481,7 +481,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain 1.95.0 + llvm-tools
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
         with:
           toolchain: '1.95.0'
           components: llvm-tools-preview
@@ -812,6 +812,7 @@ jobs:
           expected=$(LC_ALL=C sort <<'EOF'
           crates/app/tests/dhat_depth_drain.rs
           crates/app/tests/dhat_live_ingest_seam.rs
+          crates/app/tests/dhat_main_feed_backup_dedup.rs
           crates/app/tests/dhat_mark_forward.rs
           crates/app/tests/dhat_top_volume_sweep.rs
           crates/app/tests/dhat_wal_ring_sink_accept.rs
@@ -847,7 +848,7 @@ jobs:
           echo "DHAT target list matches the filesystem ($(echo "$actual" | wc -l) targets)."
 
       - name: Install Rust toolchain 1.95.0
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
         with:
           toolchain: '1.95.0'
 
@@ -1032,11 +1033,10 @@ jobs:
           cargo test -p tickvault-app \
             --test dhat_depth_drain \
             --test dhat_live_ingest_seam \
-            --test dhat_mark_forward \
+            --test dhat_main_feed_backup_dedup --test dhat_mark_forward \
             --test dhat_top_volume_sweep \
             --test dhat_wal_ring_sink_accept \
-            --test dhat_ws_lag \
-            --test dhat_ws_lag_recorder \
+            --test dhat_ws_lag --test dhat_ws_lag_recorder \
             2>&1 | tee /tmp/dhat-app.log
           if grep -q 'running 0 tests' /tmp/dhat-app.log; then
             echo "::error::an app dhat target ran ZERO tests — vacuous green. Rule 11: no false-OK."
@@ -1052,6 +1052,8 @@ jobs:
           # the run step, so the count is the only thing that notices. Bumping
           # it is the fix; loosening it to >= would delete the guard.
           #
+          # 8 since the 2026-10-20 audit (M2): dhat_main_feed_backup_dedup gates
+          # the backup-copy dedup with a published set.
           # 7 since the PROOF-10 / HOT-1 merge (2026-10-12): both sides added a
           # target, the same both-sides case the 2026-08-15 note above records.
           # 6 since audit PROOF-10 (2026-10-11): dhat_depth_drain gates the
@@ -1063,8 +1065,8 @@ jobs:
           # 4 since audit PR4 (2026-09-26): dhat_top_volume_sweep gates the
           # sliced top-volume sweep that moved off the drain's timer arms.
           ran=$(grep -c 'Running.*tests/dhat_' /tmp/dhat-app.log || true)
-          if [ "$ran" -ne 7 ]; then
-            echo "::error::app DHAT step executed $ran targets, expected 7 — a --test flag was dropped from this step."
+          if [ "$ran" -ne 8 ]; then
+            echo "::error::app DHAT step executed $ran targets, expected 8 — a --test flag was dropped from this step."
             exit 1
           fi
 
@@ -1127,7 +1129,7 @@ jobs:
           echo "Loom target list matches the filesystem ($(echo "$actual" | wc -l) targets)."
 
       - name: Install Rust toolchain 1.95.0
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # SHA-pinned (supply-chain hardening 2026-04-25)
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # SHA-pinned (supply-chain hardening 2026-04-25)
         with:
           toolchain: '1.95.0'
 
