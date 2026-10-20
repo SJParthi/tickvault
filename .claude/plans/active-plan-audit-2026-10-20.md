@@ -158,7 +158,7 @@ CONTRACT FOR AT LEAST 10 MINUTES".
 - [x] C1. A spilled hour is set aside by the age of its END and gets a second
   evening; an unparseable spill name no longer holds every partition's archive.
   - Files: crates/storage/src/tick_spill_replay.rs, crates/storage/src/partition_archive.rs
-  - Tests: test_top_volume_spill_age_is_measured_from_the_hour_end,
+  - Tests: test_spill_file_older_than_measures_a_top_volume_spill_from_the_hour_end,
     test_unparseable_spill_name_does_not_hold_every_partition,
     test_undated_top_volume_spill_file_is_set_aside
 

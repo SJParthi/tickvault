@@ -6406,7 +6406,7 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
     /// spill had only 15:40–17:25 that day before 08:30 the next morning set
     /// it aside.
     #[test]
-    fn test_top_volume_spill_age_is_measured_from_the_hour_end() {
+    fn test_spill_file_older_than_measures_a_top_volume_spill_from_the_hour_end() {
         // DST-free IST: every IST day boundary is 18:30 UTC, all year.
         assert_eq!(C1_IST_DAY_START % 86_400, 86_400 - 19_800);
         for day in 0..400 {
