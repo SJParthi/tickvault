@@ -287,7 +287,7 @@ mod tests {
     }
 
     #[test]
-    fn test_frame_ring_len_and_is_empty_track_the_queue() {
+    fn test_frame_ring_try_recv_len_and_is_empty_track_the_queue() {
         let (tx, mut rx) = frame_ring::<u32>(4);
         assert!(rx.is_empty());
         assert_eq!(rx.len(), 0);
