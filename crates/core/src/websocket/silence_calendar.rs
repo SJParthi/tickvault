@@ -17,7 +17,10 @@
 //! which is outside every frame-silence window, so the data-silence redials
 //! (the 300 s fallback, the 60 s / 90 s sibling-confirmed fast paths and the
 //! 900 s depth-200 backstop) and the overflow probe window all stay shut for
-//! the whole day. The silence clock is HELD, as it is pre-open.
+//! the whole day. The silence clock is HELD, as it is pre-open. One exception
+//! (hostile review, same day): when at least [`TRADING_EVIDENCE_MIN_SOCKETS`]
+//! sockets delivered data in the last 10 s, the market is open whatever the
+//! calendar says, and the real time of day is returned.
 //!
 //! NOT touched: the idle (ping) watchdog, the reaction to a close code, and
 //! every other redial path; they do not read this gate.
@@ -67,6 +70,9 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     /// Per-test verdict cache, paired with [`TEST_CALENDAR`].
     static TEST_VERDICT: AtomicU64 = const { AtomicU64::new(0) };
+    /// Per-test stand-in for [`market_is_streaming`], so a test never reads
+    /// the process-wide activity register other tests write.
+    static TEST_STREAMING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Installs the trading calendar the frame-silence gate consults. The first
@@ -86,7 +92,8 @@ fn install_calendar_in(
 }
 
 /// The IST seconds-of-day the frame-silence gate reads now: the wall clock
-/// on a trading day, [`NON_TRADING_DAY_SECS_OF_DAY_IST`] on any other day.
+/// on a trading day, [`NON_TRADING_DAY_SECS_OF_DAY_IST`] on any other day,
+/// unless the market is visibly streaming (see [`market_is_streaming`]).
 #[must_use]
 pub fn session_secs_of_day_now() -> u32 {
     let unix_secs = chrono::Utc::now().timestamp();
@@ -98,14 +105,78 @@ pub fn session_secs_of_day_now() -> u32 {
                 .with(|cache| session_secs_of_day_at(unix_secs, secs_of_day, Some(calendar), cache))
         })
     }) {
-        return secs;
+        let streaming = TEST_STREAMING.with(std::cell::Cell::get);
+        return override_on_evidence(secs, secs_of_day, || streaming);
     }
-    session_secs_of_day_at(
+    let secs = session_secs_of_day_at(
         unix_secs,
         secs_of_day,
         CALENDAR.get().map(AsRef::as_ref),
         &DAY_VERDICT,
-    )
+    );
+    override_on_evidence(secs, secs_of_day, || {
+        let now_wall_ms =
+            tickvault_storage::ws_frame_spill::receipt_nanos_from(std::time::Instant::now())
+                / 1_000_000;
+        market_is_streaming(
+            now_wall_ms,
+            &super::pool_supervisor::snapshot_frame_activity(),
+        )
+    })
+}
+
+/// Distinct sockets that must each have delivered a data frame within the
+/// last [`super::pool_supervisor::SIBLING_LIVE_EVIDENCE_SECS`] for a
+/// non-trading verdict to be overruled (hostile review 2026-10-20, HIGH).
+///
+/// The calendar can be wrong while the market is open: a holiday NSE moved
+/// or cancelled, a mistyped `nse_holidays` date, a special weekend session,
+/// or the operator's run-anyway marker. On such a day a silent socket would
+/// never be redialled for data silence, and its ticks would be lost all
+/// session. Live sockets are the evidence: on a real holiday no socket
+/// streams (2026-10-20: every socket silent from 09:15), so the gate stays
+/// shut; on a mis-judged day most sockets stream, so it opens. Three, not
+/// one, so a single redial's connect snapshot on a holiday cannot reopen the
+/// gate and start a chain of redials.
+pub const TRADING_EVIDENCE_MIN_SOCKETS: u8 = 3;
+
+/// Returns the real `secs_of_day` instead of the non-trading midnight when
+/// the market is visibly streaming. The evidence is read only on a
+/// non-trading day, so a trading day pays nothing for it.
+fn override_on_evidence(secs: u32, secs_of_day: u32, streaming: impl FnOnce() -> bool) -> u32 {
+    if secs == NON_TRADING_DAY_SECS_OF_DAY_IST
+        && secs_of_day != NON_TRADING_DAY_SECS_OF_DAY_IST
+        && streaming()
+    {
+        secs_of_day
+    } else {
+        secs
+    }
+}
+
+/// Whether at least [`TRADING_EVIDENCE_MIN_SOCKETS`] slots delivered a data
+/// frame within [`super::pool_supervisor::SIBLING_LIVE_EVIDENCE_SECS`] of
+/// `now_wall_ms` (a stamp up to one second in the future also counts). Pure
+/// over the injected stamps; O(32), no allocation.
+#[must_use]
+pub fn market_is_streaming(now_wall_ms: i64, stamps: &[i64]) -> bool {
+    let window_ms =
+        i64::try_from(super::pool_supervisor::SIBLING_LIVE_EVIDENCE_SECS.saturating_mul(1_000))
+            .unwrap_or(0);
+    let mut live: u8 = 0;
+    for stamp in stamps {
+        if *stamp <= 0 {
+            continue;
+        }
+        let age = now_wall_ms.saturating_sub(*stamp);
+        if age >= -1_000 && age <= window_ms {
+            live = live.saturating_add(1);
+            if live >= TRADING_EVIDENCE_MIN_SOCKETS {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// The pure half of [`session_secs_of_day_now`].
@@ -158,7 +229,8 @@ fn is_trading_day_cached(
         info!(
             date = %date,
             "today is not an NSE trading day: frame-silence redials and the overflow probe \
-             window stay shut all day (the ping watchdog and close codes still act)"
+             window stay shut unless at least 3 sockets are streaming (the ping watchdog \
+             and close codes still act)"
         );
     }
     trading
@@ -412,6 +484,81 @@ mod tests {
                 "a transport with no pings is still redialled on a holiday"
             );
         }
+    }
+
+    /// Hostile review 2026-10-20 (HIGH): a day the calendar calls a holiday
+    /// while the market streams (a moved holiday, a mistyped date, a special
+    /// session, the run-anyway marker) must keep the silence redials, or a
+    /// silent socket loses ticks all session.
+    #[test]
+    fn test_market_is_streaming_needs_three_fresh_sockets() {
+        let now = 1_792_470_600_000_i64;
+        let fresh = now - 2_000;
+        let stale = now - 11_000;
+        let mut stamps = [0_i64; 32];
+        stamps[0] = fresh;
+        stamps[5] = fresh;
+        assert!(
+            !market_is_streaming(now, &stamps),
+            "two sockets are not enough"
+        );
+        stamps[9] = stale;
+        assert!(
+            !market_is_streaming(now, &stamps),
+            "a stale socket does not count"
+        );
+        stamps[12] = now + 2_000;
+        assert!(
+            !market_is_streaming(now, &stamps),
+            "a stamp two seconds in the future does not count"
+        );
+        stamps[20] = now + 500;
+        assert!(market_is_streaming(now, &stamps), "three fresh sockets are");
+        assert!(
+            !market_is_streaming(now, &[0_i64; 32]),
+            "a silent pool is not"
+        );
+        let mut edge = [0_i64; 32];
+        edge[1] = now - 10_000;
+        edge[2] = now - 10_000;
+        edge[3] = now - 10_000;
+        assert!(market_is_streaming(now, &edge), "the window edge counts");
+        edge[3] = now - 10_001;
+        assert!(!market_is_streaming(now, &edge), "one past it does not");
+    }
+
+    #[test]
+    fn test_override_on_evidence_opens_a_holiday_only_when_streaming() {
+        assert_eq!(override_on_evidence(0, TEN_AM, || true), TEN_AM);
+        assert_eq!(override_on_evidence(0, TEN_AM, || false), 0);
+        assert_eq!(
+            override_on_evidence(TEN_AM, TEN_AM, || panic!("not read on a trading day")),
+            TEN_AM
+        );
+        assert_eq!(
+            override_on_evidence(0, 0, || panic!("midnight is midnight")),
+            0
+        );
+    }
+
+    #[test]
+    fn test_session_secs_of_day_now_overrules_a_holiday_while_streaming() {
+        struct StreamingGuard;
+        impl Drop for StreamingGuard {
+            fn drop(&mut self) {
+                TEST_STREAMING.with(|s| s.set(false));
+            }
+        }
+        let _guard = TestCalendarGuard::install(calendar_with_holidays(&[today_ist().as_str()]));
+        let _streaming = StreamingGuard;
+        TEST_STREAMING.with(|s| s.set(true));
+        let before = tickvault_common::market_hours::now_ist_secs_of_day();
+        let secs = session_secs_of_day_now();
+        let after = tickvault_common::market_hours::now_ist_secs_of_day();
+        assert!(
+            (before..=after).contains(&secs) || after < before,
+            "the real time of day ({secs}), not the holiday midnight"
+        );
     }
 
     #[test]
