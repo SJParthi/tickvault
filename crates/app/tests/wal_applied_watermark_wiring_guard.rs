@@ -377,7 +377,7 @@ fn an_unfinished_catchup_guards_its_leftover_backlog_before_the_live_drain() {
         .find("tickvault_storage::ws_frame_spill::guard_pending_backlog(")
         .expect("the not-drained arm marks the leftover backlog");
     let live = lane
-        .find("let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<CapturedFrame>(")
+        .find("let (frame_tx, frame_rx) = frame_ring(FRAME_RING_CAPACITY);")
         .expect("the live frame ring is created after the catch-up");
     assert!(
         snap < guard && guard < live,

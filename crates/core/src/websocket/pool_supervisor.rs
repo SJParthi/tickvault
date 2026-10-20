@@ -8207,7 +8207,7 @@ impl RingByteBudget {
 /// therefore a lag signal, not a loss event.
 pub struct WalRingSink {
     spill: std::sync::Arc<WsFrameSpill>,
-    ring: tokio::sync::mpsc::Sender<CapturedFrame>,
+    ring: crate::websocket::frame_ring::FrameRingSender<CapturedFrame>,
     budget: std::sync::Arc<RingByteBudget>,
     ws_type: WsType,
     endpoint: DhanEndpointType,
@@ -8266,7 +8266,7 @@ impl WalRingSink {
     #[must_use]
     pub fn new(
         spill: std::sync::Arc<WsFrameSpill>,
-        ring: tokio::sync::mpsc::Sender<CapturedFrame>,
+        ring: crate::websocket::frame_ring::FrameRingSender<CapturedFrame>,
         budget: std::sync::Arc<RingByteBudget>,
         ws_type: WsType,
         endpoint: DhanEndpointType,
@@ -15569,7 +15569,7 @@ mod tests {
         let spill = std::sync::Arc::new(
             WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
         );
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<CapturedFrame>(4);
+        let (tx, mut rx) = crate::websocket::frame_ring::frame_ring::<CapturedFrame>(4);
         let sink = WalRingSink::new(
             std::sync::Arc::clone(&spill),
             tx,
@@ -15601,7 +15601,7 @@ mod tests {
             WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
         );
         let budget = std::sync::Arc::new(RingByteBudget::new(usize::MAX));
-        let (frames_tx, _frames_rx) = tokio::sync::mpsc::channel::<CapturedFrame>(4);
+        let (frames_tx, _frames_rx) = crate::websocket::frame_ring::frame_ring::<CapturedFrame>(4);
         let build = || {
             WalRingSink::new(
                 std::sync::Arc::clone(&spill),
@@ -15651,7 +15651,7 @@ mod tests {
             WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
         );
         let budget = std::sync::Arc::new(RingByteBudget::new(usize::MAX));
-        let (frames_tx, _frames_rx) = tokio::sync::mpsc::channel::<CapturedFrame>(4);
+        let (frames_tx, _frames_rx) = crate::websocket::frame_ring::frame_ring::<CapturedFrame>(4);
 
         let plain = WalRingSink::new(
             std::sync::Arc::clone(&spill),
@@ -15911,7 +15911,7 @@ mod tests {
         let spill = std::sync::Arc::new(
             WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
         );
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<CapturedFrame>(4);
+        let (tx, mut rx) = crate::websocket::frame_ring::frame_ring::<CapturedFrame>(4);
         let sink = WalRingSink::new(
             std::sync::Arc::clone(&spill),
             tx,
@@ -15955,7 +15955,7 @@ mod tests {
         // A stopped writer refuses every later append: the closest real
         // reproduction of a WAL that cannot take the frame.
         let _ = spill.shutdown(std::time::Duration::from_secs(5));
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<CapturedFrame>(4);
+        let (tx, mut rx) = crate::websocket::frame_ring::frame_ring::<CapturedFrame>(4);
         let sink = WalRingSink::new(
             std::sync::Arc::clone(&spill),
             tx,
@@ -15988,7 +15988,7 @@ mod tests {
         let spill = std::sync::Arc::new(
             WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
         );
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<CapturedFrame>(4);
+        let (tx, mut rx) = crate::websocket::frame_ring::frame_ring::<CapturedFrame>(4);
         let sink = WalRingSink::new(
             spill,
             tx,
@@ -16110,7 +16110,7 @@ mod tests {
         let spill = std::sync::Arc::new(
             WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
         );
-        let (tx, _rx) = tokio::sync::mpsc::channel::<CapturedFrame>(1);
+        let (tx, _rx) = crate::websocket::frame_ring::frame_ring::<CapturedFrame>(1);
         let sink = WalRingSink::new(
             spill,
             tx,
@@ -16216,7 +16216,7 @@ mod tests {
             WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
         );
         // Capacity 1: the second frame is refused by COUNT, not by bytes.
-        let (tx, _rx) = tokio::sync::mpsc::channel::<CapturedFrame>(1);
+        let (tx, _rx) = crate::websocket::frame_ring::frame_ring::<CapturedFrame>(1);
         let budget = std::sync::Arc::new(RingByteBudget::new(1_000_000));
         let sink = WalRingSink::new(
             std::sync::Arc::clone(&spill),
@@ -16262,7 +16262,7 @@ mod tests {
             WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
         );
         // 64 slots, but only 25 bytes of budget: the count bound cannot bind.
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<CapturedFrame>(64);
+        let (tx, mut rx) = crate::websocket::frame_ring::frame_ring::<CapturedFrame>(64);
         let budget = std::sync::Arc::new(RingByteBudget::new(25));
         let sink = WalRingSink::new(
             std::sync::Arc::clone(&spill),
@@ -21430,7 +21430,7 @@ mod tests {
         let spill = std::sync::Arc::new(
             WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
         );
-        let (tx, _rx) = tokio::sync::mpsc::channel::<CapturedFrame>(4);
+        let (tx, _rx) = crate::websocket::frame_ring::frame_ring::<CapturedFrame>(4);
         let build = || {
             WalRingSink::new(
                 std::sync::Arc::clone(&spill),
@@ -22123,7 +22123,7 @@ mod tests {
         let spill = std::sync::Arc::new(
             WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
         );
-        let (tx, _rx) = tokio::sync::mpsc::channel::<CapturedFrame>(4);
+        let (tx, _rx) = crate::websocket::frame_ring::frame_ring::<CapturedFrame>(4);
         let build = |endpoint| {
             WalRingSink::new(
                 std::sync::Arc::clone(&spill),
@@ -22163,7 +22163,7 @@ mod tests {
         let spill = std::sync::Arc::new(
             WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
         );
-        let (tx, _rx) = tokio::sync::mpsc::channel::<CapturedFrame>(4);
+        let (tx, _rx) = crate::websocket::frame_ring::frame_ring::<CapturedFrame>(4);
         let (audit_tx, mut audit_rx) = tokio::sync::mpsc::channel::<WsLifecycleEvent>(4);
         let sink = WalRingSink::new(
             std::sync::Arc::clone(&spill),
@@ -22218,7 +22218,7 @@ mod tests {
         let spill = std::sync::Arc::new(
             WsFrameSpill::new(&dir).expect("WAL must open under a fresh temp dir"),
         );
-        let (tx, _rx) = tokio::sync::mpsc::channel::<CapturedFrame>(4);
+        let (tx, _rx) = crate::websocket::frame_ring::frame_ring::<CapturedFrame>(4);
         let sink = WalRingSink::new(
             std::sync::Arc::clone(&spill),
             tx,

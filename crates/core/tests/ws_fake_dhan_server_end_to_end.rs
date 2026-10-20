@@ -339,7 +339,8 @@ async fn production_socket_dials_subscribes_refreshes_on_807_and_parks_on_805() 
 
     let dir = temp_wal_dir();
     let spill = Arc::new(WsFrameSpill::new(&dir).expect("WsFrameSpill::new")); // APPROVED: test
-    let (ring_tx, mut ring_rx) = tokio::sync::mpsc::channel::<CapturedFrame>(1024);
+    let (ring_tx, mut ring_rx) =
+        tickvault_core::websocket::frame_ring::frame_ring::<CapturedFrame>(1024);
     let budget = Arc::new(RingByteBudget::with_slot_cap(1 << 20, 1024));
     let sink = Arc::new(WalRingSink::new(
         Arc::clone(&spill),
@@ -387,7 +388,7 @@ async fn production_socket_dials_subscribes_refreshes_on_807_and_parks_on_805() 
     // (5) The ring: every frame, byte for byte, in order, stacked ones
     // included.
     let mut ring: Vec<CapturedFrame> = Vec::new();
-    while let Ok(frame) = ring_rx.try_recv() {
+    while let Some(frame) = ring_rx.try_recv() {
         budget.release(frame.bytes.len());
         ring.push(frame);
     }
