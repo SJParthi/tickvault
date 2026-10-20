@@ -164,10 +164,10 @@ CONTRACT FOR AT LEAST 10 MINUTES".
 
 ### PR D — guards and docs (common tests, trading risk, docs)
 
-- [ ] D1. Shell budget covers compose CMD-SHELL healthchecks and systemd units outside deploy/systemd.
+- [x] D1. Shell budget covers compose CMD-SHELL healthchecks and systemd units outside deploy/systemd.
   - Files: crates/common/tests/shell_budget_guard.rs
   - Tests: compose_healthchecks_are_budgeted, every_systemd_unit_is_scanned
-- [ ] D2. Coded error on the tick-gap tracker emit; the code guard flags every production `error!` without `code =` (frozen §28 files allowlisted until their own approval).
+- [x] D2. Coded error on the tick-gap tracker emit; the code guard flags every production `error!` without `code =` (frozen §28 files allowlisted until their own approval).
   - Files: crates/trading/src/risk/tick_gap_tracker.rs, crates/common/tests/error_code_tag_guard.rs
   - Tests: every_production_error_carries_a_code
 - [ ] D3. CLAUDE.md: O(1) table rows for the frame ring backlog and the silent-swap register; stale benchmark rows; `variables.tf` IOPS text.

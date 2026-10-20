@@ -23,7 +23,10 @@
 //! 4. `systemd_units_never_add_shell` — each unit file's count of `Exec*=`
 //!    lines that run a shell (`/bin/sh`, `/bin/bash`, `sh -c`, or a `.sh`
 //!    path) is pinned exactly. It may only go down, and when it does the pin
-//!    goes down in the same PR.
+//!    goes down in the same PR. Since 2026-10-20 (audit plan D1) every
+//!    `*.service` file in the repo is scanned, not only `deploy/systemd/`
+//!    (`every_systemd_unit_is_scanned`), and docker-compose shell
+//!    healthchecks carry ceilings too (`compose_healthchecks_are_budgeted`).
 //!
 //! Developer tooling (`.claude/**`, `scripts/git-hooks/*`) is frozen by file
 //! set only: those files run on a developer machine or in a Claude session,
@@ -333,6 +336,17 @@ fn read_text(path: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+/// Read a file the listing found and a budget measures. 2026-10-20 (review
+/// of audit plan D1): the budget tests read these with `unwrap_or_default()`,
+/// so a listed unit, compose file or workflow that was not a readable file
+/// (a dangling symlink, a directory named `*.service`) measured as empty, i.e.
+/// zero shell, and passed. It now fails.
+fn read_listed(path: &str) -> String {
+    read_text(path).unwrap_or_else(|| {
+        panic!("shell_budget_guard: listed path `{path}` is not a readable file")
+    })
+}
+
 /// Every shell file in the tree with its line count.
 fn shell_files_with_lines() -> Vec<(String, usize)> {
     all_files()
@@ -405,12 +419,35 @@ fn ops_shell_files_never_grow() {
     );
 }
 
+/// Every systemd unit in the repo, wherever it lives. Until 2026-10-20 the scan
+/// read `deploy/systemd/` only, so `scripts/tv-tunnel/tickvault-tunnel.service`
+/// (run as root on the server) could gain a shell `Exec*=` line unseen (audit
+/// plan D1). The listing is `all_files()`: tracked plus untracked-not-ignored,
+/// so `target/`, `.git/` and other sessions' ignored worktrees are skipped.
+fn systemd_units() -> Vec<String> {
+    all_files()
+        .into_iter()
+        .filter(|p| p.ends_with(".service"))
+        .collect()
+}
+
+#[test]
+fn every_systemd_unit_is_scanned() {
+    let units = systemd_units();
+    for want in [
+        "deploy/systemd/tickvault.service",
+        "scripts/tv-tunnel/tickvault-tunnel.service",
+    ] {
+        assert!(
+            units.iter().any(|u| u == want),
+            "systemd scan did not find `{want}` (found {units:?}); the scan is broken"
+        );
+    }
+}
+
 #[test]
 fn systemd_units_never_add_shell() {
-    let units: Vec<String> = all_files()
-        .into_iter()
-        .filter(|p| p.starts_with("deploy/systemd/") && p.ends_with(".service"))
-        .collect();
+    let units = systemd_units();
     assert!(
         !units.is_empty(),
         "no systemd units found; the scan is broken"
@@ -419,7 +456,7 @@ fn systemd_units_never_add_shell() {
     assert_sorted_unique(&budget_names, "SYSTEMD_SHELL_EXEC_BUDGET");
     let mut drift = Vec::new();
     for unit in &units {
-        let text = read_text(unit).unwrap_or_default();
+        let text = read_listed(unit);
         let got = count_shell_exec_lines(&text);
         let want = SYSTEMD_SHELL_EXEC_BUDGET
             .iter()
@@ -1000,7 +1037,7 @@ fn ssm_workflow_shell_never_grows() {
     let mut report = Vec::new();
     let mut problems = Vec::new();
     for wf in &workflows {
-        let text = read_text(wf).unwrap_or_default();
+        let text = read_listed(wf);
         let payloads = ssm_payloads(&text)
             .unwrap_or_else(|| panic!("`{wf}`: unterminated `commands=[` payload"));
         let sends = count_ssm_send_commands(&text);
@@ -1354,7 +1391,7 @@ fn workflow_run_lines_never_grow() {
     for wf in all_files().into_iter().filter(|p| {
         p.starts_with(".github/workflows/") && (p.ends_with(".yml") || p.ends_with(".yaml"))
     }) {
-        let n = count_workflow_run_lines(&read_text(&wf).unwrap_or_default());
+        let n = count_workflow_run_lines(&read_listed(&wf));
         if n > 0 {
             measured.push((wf, n));
         }
@@ -1428,6 +1465,517 @@ fn workflow_run_line_counter_bites() {
     assert_eq!(count_workflow_run_lines("on: push\n"), 0);
     let mk = "all:\n\techo a\n\t# c\n\n\techo b\nvar = 1\n";
     assert_eq!(count_makefile_recipe_lines(mk), 2);
+}
+
+// ===================== COMPOSE HEALTHCHECK SHELL (2026-10-20) =====================
+//
+// 2026-10-20, audit plan item D1. A docker-compose healthcheck is shell the
+// container runtime runs every few seconds, on the production server too, and
+// it is neither a shell file nor a `run:` step, so nothing above counted it:
+// `["CMD-SHELL", "…"]` hands the string to `/bin/sh -c`, and a plain-string
+// `test:` means the same in the compose format. On 2026-10-20 the one compose
+// file held three: QuestDB's `bash -c` TCP probe, and a `wget` probe each for
+// Loki and Alloy.
+//
+// `compose_healthchecks_are_budgeted`: per compose file and service, the count
+// of shell healthchecks and the bytes of their commands are ceilings. A
+// service absent from the table may carry NO shell healthcheck; a row whose
+// service is gone or no longer runs one must be removed; a `test:` the scan
+// cannot read fails rather than being skipped. A ceiling may be lowered
+// freely and never raised (rust-only lock §0.10).
+//
+// HONEST LIMITS: a compose file is found by name (`docker-compose*` or
+// `compose*`, `.yml`/`.yaml`); `["CMD", "<binary>", …]` naming a non-shell
+// binary is not counted (no shell runs); bytes are counted after unquoting,
+// and a YAML escape is decoded only as `\x` -> `x`.
+//
+// 2026-10-20 (hostile review of D1): the first parser read YAML shapes it
+// does not understand as something harmless. `test: >-` measured as the
+// 2-byte command `>-` (the folded command on the next lines unseen); an
+// alias (`healthcheck: *hc`, `test: *cmd`), a flow mapping
+// (`healthcheck: {test: …}`) or a `<<:` merge was skipped or undercounted.
+// Each of those now fails the scan with its line number instead: a block
+// scalar, alias, anchor, tag or flow mapping as a `test:` value or item, a
+// `healthcheck:` or service line carrying an inline value, and any `<<:`
+// line anywhere in a compose file. Write the healthcheck out in full as a
+// flow sequence (`test: ["CMD", …]`) or a block sequence of plain scalars.
+
+/// Per compose file and service: (file, service, shell healthchecks, bytes of
+/// their commands). Ceilings, sorted by file then service. Measured 2026-10-20.
+const COMPOSE_SHELL_HEALTHCHECK_BUDGET: &[(&str, &str, usize, usize)] = &[
+    ("deploy/docker/docker-compose.yml", "tv-alloy", 1, 57),
+    ("deploy/docker/docker-compose.yml", "tv-loki", 1, 54),
+    ("deploy/docker/docker-compose.yml", "tv-questdb", 1, 106),
+];
+
+/// True when `path` names a compose file by its basename.
+fn is_compose_file(path: &str) -> bool {
+    let base = path.rsplit('/').next().unwrap_or(path);
+    (base.starts_with("docker-compose") || base.starts_with("compose"))
+        && (base.ends_with(".yml") || base.ends_with(".yaml"))
+}
+
+/// First characters of an unquoted YAML value this scan does not interpret: a
+/// block scalar (`|`, `>`), alias (`*`), anchor (`&`), tag (`!`) or nested
+/// flow collection (`{`, `[`). Reading any of them as a plain string would
+/// measure the wrong command.
+const UNREADABLE_YAML_STARTS: [char; 7] = ['|', '>', '*', '&', '!', '{', '['];
+
+/// True when an unquoted YAML value starts with one of `UNREADABLE_YAML_STARTS`.
+fn starts_unreadable_yaml(value: &str) -> bool {
+    value.trim_start().starts_with(UNREADABLE_YAML_STARTS)
+}
+
+/// Elements of a YAML flow sequence (`[a, "b c", 'd']`), unquoted. `None`
+/// when the brackets or a quote do not close, or an unquoted element is not a
+/// plain scalar (`starts_unreadable_yaml`).
+fn flow_sequence_items(value: &str) -> Option<Vec<String>> {
+    let inner = value.trim().strip_prefix('[')?.strip_suffix(']')?;
+    let mut items = Vec::new();
+    let mut chars = inner.chars().peekable();
+    loop {
+        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+            chars.next();
+        }
+        let Some(&quote) = chars.peek() else {
+            break;
+        };
+        if quote != '"' && quote != '\'' {
+            if UNREADABLE_YAML_STARTS.contains(&quote) {
+                return None;
+            }
+            let mut item = String::new();
+            for c in chars.by_ref() {
+                if c == ',' {
+                    break;
+                }
+                item.push(c);
+            }
+            items.push(item.trim().to_string());
+            continue;
+        }
+        chars.next();
+        let mut item = String::new();
+        let mut closed = false;
+        while let Some(c) = chars.next() {
+            if c == '\\' && quote == '"' {
+                item.push(chars.next()?);
+            } else if c == '\'' && quote == '\'' && chars.peek() == Some(&'\'') {
+                chars.next();
+                item.push('\'');
+            } else if c == quote {
+                closed = true;
+                break;
+            } else {
+                item.push(c);
+            }
+        }
+        if !closed {
+            return None;
+        }
+        items.push(item);
+        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+            chars.next();
+        }
+        match chars.next() {
+            None => break,
+            Some(',') => {}
+            Some(_) => return None,
+        }
+    }
+    Some(items)
+}
+
+/// One YAML scalar, unquoted. `None` when a quote does not close, or an
+/// unquoted value is not a plain scalar (`starts_unreadable_yaml`).
+fn unquote_scalar(s: &str) -> Option<String> {
+    let s = s.trim();
+    if !(s.starts_with('"') || s.starts_with('\'')) {
+        return (!starts_unreadable_yaml(s)).then(|| s.to_string());
+    }
+    let mut items = flow_sequence_items(&format!("[{s}]"))?;
+    (items.len() == 1).then(|| items.remove(0))
+}
+
+/// The shell command a healthcheck `test` runs, or `None` when it runs none.
+/// A list is `CMD-SHELL` + command, `CMD` + argv, or `NONE`.
+fn healthcheck_shell_command(items: &[String]) -> Option<String> {
+    let (head, rest) = items.split_first()?;
+    let runs_shell = match head.as_str() {
+        "CMD-SHELL" => true,
+        "CMD" => rest.first().is_some_and(|p| {
+            let base = p.rsplit('/').next().unwrap_or(p.as_str());
+            SHELL_RUNTIMES.contains(&base)
+        }),
+        _ => false,
+    };
+    runs_shell.then(|| rest.join(" "))
+}
+
+/// The inline value of a `key:` mapping line (`trimmed` has no indent), `""`
+/// when nothing or only a comment follows the colon. `None` when the line is
+/// not that key.
+fn inline_value<'a>(trimmed: &'a str, key: &str) -> Option<&'a str> {
+    let rest = trimmed.strip_prefix(key)?.strip_prefix(':')?;
+    if !(rest.is_empty() || rest.starts_with([' ', '\t'])) {
+        return None;
+    }
+    let rest = rest.trim();
+    Some(if rest.starts_with('#') { "" } else { rest })
+}
+
+/// True for a YAML merge-key line: `<<: *x`, `- <<: *x`, `<< : *x`.
+fn is_merge_key(trimmed: &str) -> bool {
+    let key = trimmed.strip_prefix('-').map_or(trimmed, str::trim_start);
+    key.strip_prefix("<<")
+        .is_some_and(|rest| rest.trim_start().starts_with(':'))
+}
+
+/// Every healthcheck `test:` under `services:` in one compose file, as
+/// `(service, shell command or None)`. A plain-string `test:` is the compose
+/// shorthand for `CMD-SHELL`. `Err` names a `test:` the scan cannot read.
+fn compose_healthcheck_tests(text: &str) -> Result<Vec<(String, Option<String>)>, String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = Vec::new();
+    let mut in_services = false;
+    let mut service_indent: Option<usize> = None;
+    let mut service = String::new();
+    let mut healthcheck_indent: Option<usize> = None;
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed = line.trim();
+        i += 1;
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        // A merge key copies keys in from an anchor elsewhere in the file, so
+        // a healthcheck could arrive unseen; anywhere in a compose file it fails.
+        if is_merge_key(trimmed) {
+            return Err(format!(
+                "line {i}: `<<:` merge key; write the keys out in full"
+            ));
+        }
+        // An inline healthcheck (`healthcheck: *hc`, `healthcheck: {test: …}`,
+        // `healthcheck: &hc`) hides or shares its `test:`; anywhere it fails.
+        if let Some(v) = inline_value(trimmed, "healthcheck")
+            && !v.is_empty()
+        {
+            return Err(format!(
+                "line {i}: `healthcheck:` with an inline value `{v}`; write it as \
+                 a block mapping with its own `test:`"
+            ));
+        }
+        let indent = indent_of(line);
+        if indent == 0 {
+            let services = inline_value(trimmed, "services");
+            if services.is_some_and(|v| !v.is_empty()) {
+                return Err(format!("line {i}: `services:` with an inline value"));
+            }
+            in_services = services.is_some();
+            service_indent = None;
+            healthcheck_indent = None;
+            continue;
+        }
+        if !in_services {
+            continue;
+        }
+        if healthcheck_indent.is_some_and(|h| indent <= h) {
+            healthcheck_indent = None;
+        }
+        if indent == *service_indent.get_or_insert(indent) {
+            // A service given inline (`db: *base`, `db: {…}`) could carry a
+            // healthcheck this scan never reads.
+            let (name, rest) = trimmed.split_once(':').unwrap_or((trimmed, ""));
+            let rest = rest.trim();
+            if !(rest.is_empty() || rest.starts_with('#')) {
+                return Err(format!(
+                    "line {i}: service `{name}` with an inline value `{rest}`"
+                ));
+            }
+            service = name.to_string();
+            continue;
+        }
+        if inline_value(trimmed, "healthcheck").is_some() {
+            healthcheck_indent = Some(indent);
+            continue;
+        }
+        let Some(value) = inline_value(trimmed, "test") else {
+            continue;
+        };
+        if healthcheck_indent.is_none() {
+            continue;
+        }
+        let at = i;
+        // A block scalar (`test: >-`, `test: |`) puts the command on the
+        // lines below; an alias, anchor, tag or flow mapping is not a command
+        // this scan can measure. Only a flow sequence (`[`) is read inline.
+        if !value.starts_with('[') && starts_unreadable_yaml(value) {
+            return Err(format!(
+                "line {at}: healthcheck `test: {value}` is a block scalar, alias, \
+                 anchor, tag or flow mapping; write it as a sequence of plain or \
+                 quoted strings"
+            ));
+        }
+        let mut value = value.to_string();
+        let items = if value.starts_with('[') {
+            // A flow sequence may run over several lines.
+            while !value.ends_with(']') && i < lines.len() {
+                value.push(' ');
+                value.push_str(lines[i].trim());
+                i += 1;
+            }
+            flow_sequence_items(&value)
+        } else if value.is_empty() {
+            // A block sequence: `- item` lines indented under `test:`.
+            let mut items = Vec::new();
+            let mut readable = true;
+            while i < lines.len() && indent_of(lines[i]) > indent {
+                let item = lines[i].trim();
+                i += 1;
+                if item.is_empty() || item.starts_with('#') {
+                    continue;
+                }
+                match item.strip_prefix('-').and_then(unquote_scalar) {
+                    Some(s) => items.push(s),
+                    None => readable = false,
+                }
+            }
+            (readable && !items.is_empty()).then_some(items)
+        } else {
+            unquote_scalar(&value).map(|s| vec!["CMD-SHELL".to_string(), s])
+        };
+        let items = items.ok_or_else(|| format!("line {at}: unreadable healthcheck `test:`"))?;
+        out.push((service.clone(), healthcheck_shell_command(&items)));
+    }
+    Ok(out)
+}
+
+#[test]
+fn compose_healthchecks_are_budgeted() {
+    let keys: Vec<String> = COMPOSE_SHELL_HEALTHCHECK_BUDGET
+        .iter()
+        .map(|r| format!("{} {}", r.0, r.1))
+        .collect();
+    let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+    assert_sorted_unique(&key_refs, "COMPOSE_SHELL_HEALTHCHECK_BUDGET");
+    let files: Vec<String> = all_files()
+        .into_iter()
+        .filter(|p| is_compose_file(p))
+        .collect();
+    assert!(
+        files
+            .iter()
+            .any(|f| f == "deploy/docker/docker-compose.yml"),
+        "compose scan found {files:?} without the main compose file; the scan is broken"
+    );
+    // (file, service, shell healthchecks, bytes of their commands).
+    let mut measured: Vec<(String, String, usize, usize)> = Vec::new();
+    for file in &files {
+        let text = read_listed(file);
+        let tests = compose_healthcheck_tests(&text).unwrap_or_else(|e| panic!("`{file}`: {e}"));
+        for (svc, cmd) in tests {
+            let Some(cmd) = cmd else {
+                continue;
+            };
+            match measured.iter_mut().find(|r| r.0 == *file && r.1 == svc) {
+                Some(row) => {
+                    row.2 += 1;
+                    row.3 += cmd.len();
+                }
+                None => measured.push((file.clone(), svc, 1, cmd.len())),
+            }
+        }
+    }
+    // Anti-vacuity: the scan must see the healthchecks it is guarding.
+    assert!(
+        measured.len() >= 3,
+        "only {} services with a shell healthcheck measured; the parser is broken",
+        measured.len()
+    );
+    let report: Vec<String> = measured
+        .iter()
+        .map(|(f, s, n, b)| format!("    (\"{f}\", \"{s}\", {n}, {b}),"))
+        .collect();
+    let mut over = Vec::new();
+    for (f, s, n, b) in &measured {
+        let (cap_n, cap_b) = COMPOSE_SHELL_HEALTHCHECK_BUDGET
+            .iter()
+            .find(|r| r.0 == f.as_str() && r.1 == s.as_str())
+            .map_or((0, 0), |r| (r.2, r.3));
+        if *n > cap_n || *b > cap_b {
+            over.push((format!("{f} {s}"), *n, cap_n, *b, cap_b));
+        }
+    }
+    let stale: Vec<String> = COMPOSE_SHELL_HEALTHCHECK_BUDGET
+        .iter()
+        .filter(|r| !measured.iter().any(|m| m.0 == r.0 && m.1 == r.1))
+        .map(|r| format!("{} {}", r.0, r.1))
+        .collect();
+    assert!(
+        over.is_empty() && stale.is_empty(),
+        "compose shell healthcheck budget broken. Over ceiling (service, checks, \
+         ceiling, bytes, ceiling): {over:?}. Stale rows (service gone or no shell \
+         healthcheck left): {stale:?}. Use `[\"CMD\", \"<binary>\", …]` with no shell \
+         or a Rust probe; lower a ceiling freely, never raise one. Measured now:\n{}",
+        report.join("\n")
+    );
+}
+
+#[test]
+fn compose_healthcheck_scan_bites() {
+    assert!(is_compose_file("deploy/docker/docker-compose.yml"));
+    assert!(is_compose_file("x/docker-compose.override.yaml"));
+    assert!(is_compose_file("compose.yml"));
+    assert!(!is_compose_file("deploy/docker/loki/loki-config.yml"));
+    assert!(!is_compose_file("docker-compose.md"));
+
+    let compose = concat!(
+        "networks:\n",
+        "  n:\n",
+        "services:\n",
+        "  # a comment\n",
+        "  db:\n",
+        "    image: x\n",
+        "    healthcheck:\n",
+        "      test: [\"CMD-SHELL\", \"bash -c 'true' || exit 1\"]\n",
+        "      interval: 5s\n",
+        "    environment:\n",
+        "      test: not a healthcheck\n",
+        "  web:\n",
+        "    healthcheck:\n",
+        "      test: curl -f http://web/ || exit 1\n",
+        "  bin:\n",
+        "    healthcheck:\n",
+        "      test: [CMD, /usr/bin/probe, --ready]\n",
+        "  wrapped:\n",
+        "    healthcheck:\n",
+        "      test: [\"CMD\", \"/bin/sh\", \"-c\", \"true\"]\n",
+        "  block:\n",
+        "    healthcheck:\n",
+        "      test:\n",
+        "        - CMD-SHELL\n",
+        "        - 'wget -q x'\n",
+        "  off:\n",
+        "    healthcheck:\n",
+        "      test: [\"NONE\"]\n",
+        "  split:\n",
+        "    healthcheck:\n",
+        "      test: [\"CMD-SHELL\",\n",
+        "             \"echo a, b\"]\n",
+        "volumes:\n",
+        "  v:\n",
+        "    healthcheck:\n",
+        "      test: [\"CMD-SHELL\", \"outside services\"]\n",
+    );
+    let shell = |s: &str| Some(s.to_string());
+    assert_eq!(
+        compose_healthcheck_tests(compose).expect("readable"),
+        vec![
+            ("db".to_string(), shell("bash -c 'true' || exit 1")),
+            ("web".to_string(), shell("curl -f http://web/ || exit 1")),
+            ("bin".to_string(), None),
+            ("wrapped".to_string(), shell("/bin/sh -c true")),
+            ("block".to_string(), shell("wget -q x")),
+            ("off".to_string(), None),
+            ("split".to_string(), shell("echo a, b")),
+        ]
+    );
+    // An unreadable `test:` fails, never skips.
+    let open = "services:\n  a:\n    healthcheck:\n      test: [\"CMD-SHELL\", \"open\n";
+    assert!(compose_healthcheck_tests(open).is_err());
+    let empty = "services:\n  a:\n    healthcheck:\n      test:\n    image: x\n";
+    assert!(compose_healthcheck_tests(empty).is_err());
+    // 2026-10-20 (hostile review of D1): every YAML shape the scan cannot
+    // measure fails with its line; before, a block scalar read as the 2-byte
+    // command `>-` and an alias, flow mapping or merge read as nothing.
+    let svc = |body: &str| format!("services:\n  a:\n    image: x\n{body}");
+    let hc = |test: &str| svc(&format!("    healthcheck:\n{test}      interval: 5s\n"));
+    let unreadable: &[(&str, String)] = &[
+        (
+            "folded test",
+            hc("      test: >-\n        bash -c 'curl x'\n"),
+        ),
+        (
+            "literal test",
+            hc("      test: |\n        bash -c 'curl x'\n"),
+        ),
+        ("alias test", hc("      test: *probe\n")),
+        (
+            "anchor test",
+            hc("      test: &probe [\"CMD-SHELL\", \"x\"]\n"),
+        ),
+        (
+            "tagged test",
+            hc("      test: !!seq [\"CMD-SHELL\", \"x\"]\n"),
+        ),
+        ("flow-mapping test", hc("      test: {cmd: x}\n")),
+        (
+            "alias flow item",
+            hc("      test: [\"CMD-SHELL\", *probe]\n"),
+        ),
+        (
+            "alias block item",
+            hc("      test:\n        - CMD-SHELL\n        - *probe\n"),
+        ),
+        (
+            "folded block item",
+            hc("      test:\n        - CMD-SHELL\n        - >-\n          curl x\n"),
+        ),
+        ("alias healthcheck", svc("    healthcheck: *hc\n")),
+        (
+            "flow-mapping healthcheck",
+            svc("    healthcheck: {test: [\"CMD-SHELL\", \"curl x\"]}\n"),
+        ),
+        (
+            "anchored healthcheck",
+            svc("    healthcheck: &hc\n      test: [\"CMD-SHELL\", \"x\"]\n"),
+        ),
+        ("merge in a service", svc("    <<: *base\n")),
+        (
+            "merge outside services",
+            format!("x-base: &base\n  <<: *other\n{}", svc("")),
+        ),
+        ("merge as a list item", svc("    - <<: *base\n")),
+        (
+            "inline service",
+            "services:\n  a: *base\n  b:\n    image: x\n".to_string(),
+        ),
+        ("inline services", "services: {a: {image: x}}\n".to_string()),
+    ];
+    for (shape, doc) in unreadable {
+        assert!(
+            compose_healthcheck_tests(doc).is_err(),
+            "{shape} must fail, not pass:\n{doc}"
+        );
+    }
+    // A trailing comment is not an inline value: these still read in full.
+    let commented = concat!(
+        "services: # the stack\n",
+        "  a: # one service\n",
+        "    healthcheck: # probe\n",
+        "      test: # block below\n",
+        "        - CMD-SHELL\n",
+        "        - wget -q x\n",
+    );
+    assert_eq!(
+        compose_healthcheck_tests(commented).expect("readable"),
+        vec![("a".to_string(), shell("wget -q x"))]
+    );
+    // Bite: the real QuestDB probe measures exactly its pinned 106 bytes, so
+    // one byte more breaks the ceiling.
+    let questdb = concat!(
+        "services:\n  tv-questdb:\n    healthcheck:\n",
+        "      test: [\"CMD-SHELL\", \"bash -c 'cat < /dev/null > /dev/tcp/localhost/9000 ",
+        "&& cat < /dev/null > /dev/tcp/localhost/9009' || exit 1\"]\n",
+    );
+    let got = compose_healthcheck_tests(questdb).expect("readable");
+    let cmd = got[0].1.as_deref().expect("shell");
+    let cap = COMPOSE_SHELL_HEALTHCHECK_BUDGET
+        .iter()
+        .find(|r| r.1 == "tv-questdb")
+        .map(|r| r.3);
+    assert_eq!(Some(cmd.len()), cap);
 }
 
 // ======================= NEXTEST FLAKY RESULT (2026-10-04) =======================
