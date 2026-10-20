@@ -23,6 +23,14 @@
 //! It matches the field NAME, not the substring `code =`: the substring
 //! matched `exchange_segment_code =` and `segment_code =` and let two
 //! uncoded production lines pass as coded.
+//!
+//! 2026-10-20 (hostile review of D2): the field match is now the tracing
+//! form only, `code =` not followed by `=` or `>`. It also took `code:` (a
+//! struct-literal field inside an argument) and `code =>` (a match arm), and
+//! neither is a structured field on the event. The first test below, which
+//! still matched the substring `code =` (a message reading "code = 3" passed
+//! as the field), now uses the same scanner; and a char literal such as
+//! `'"'` no longer reads as the start of a string in either scan.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -132,8 +140,9 @@ fn scan_file(path: &Path, contents: &str, tagged: &BTreeSet<String>, violations:
             idx = end_idx + 1;
             continue;
         }
-        let carries_code_field = body.contains("code =") || body.contains("code=");
-        if carries_code_field {
+        // 2026-10-20: the shared field scanner, not the substring `code =`,
+        // which a message ("… code = 3 …") or `segment_code =` satisfied.
+        if carries_code_field(&body) {
             idx = end_idx + 1;
             continue;
         }
@@ -783,21 +792,51 @@ fn error_macro_column(line: &str) -> Option<usize> {
         if at > 0 && is_ident_byte(bytes[at - 1]) {
             continue;
         }
-        let mut quotes = 0usize;
+        // 2026-10-20: walk the strings rather than count quotes, so a char
+        // literal `'"'` before the call does not read as an open string.
+        let mut in_str = false;
         let mut idx = 0usize;
         while idx < at {
-            match bytes[idx] {
-                b'\\' => idx += 1,
-                b'"' => quotes += 1,
-                _ => {}
+            let byte = bytes[idx];
+            if in_str {
+                match byte {
+                    b'\\' => idx += 1,
+                    b'"' => in_str = false,
+                    _ => {}
+                }
+                idx += 1;
+                continue;
+            }
+            if let Some(len) = char_literal_len(bytes, idx) {
+                idx += len;
+                continue;
+            }
+            if byte == b'"' {
+                in_str = true;
             }
             idx += 1;
         }
-        if quotes % 2 == 0 {
+        if !in_str {
             return Some(at);
         }
     }
     None
+}
+
+/// Byte length of the char (or byte) literal opening at `bytes[idx]`: 3 for
+/// `'x'`, 4 for an escape such as `'\''`, `'\"'` or `'\\'`. `None` for a
+/// lifetime (`'a`), for a byte that is not `'`, and for a literal this scan
+/// does not need to measure (`'\u{…}'`, `'\x7f'`, a multi-byte char): none of
+/// those can hold a `"`, `(` or `)`, which is all the scans here care about.
+fn char_literal_len(bytes: &[u8], idx: usize) -> Option<usize> {
+    if bytes.get(idx) != Some(&b'\'') {
+        return None;
+    }
+    match (bytes.get(idx + 1), bytes.get(idx + 2), bytes.get(idx + 3)) {
+        (Some(b'\\'), Some(_), Some(b'\'')) => Some(4),
+        (Some(b), Some(b'\''), _) if *b != b'\\' && b.is_ascii() => Some(3),
+        _ => None,
+    }
 }
 
 /// The text of the `error!(…)` call that opens at `lines[start][column..]`,
@@ -829,14 +868,12 @@ fn macro_invocation(lines: &[&str], start: usize, column: usize) -> (String, usi
             match byte {
                 b'"' => in_str = true,
                 b'\'' => {
-                    // Skip `'('` and `'\''`; a lifetime has no closing quote
-                    // two or three bytes on.
-                    if bytes.get(idx + 2) == Some(&b'\'') {
-                        idx += 2;
-                    } else if bytes.get(idx + 1) == Some(&b'\\')
-                        && bytes.get(idx + 3) == Some(&b'\'')
-                    {
-                        idx += 3;
+                    // Skip `'('`, `'"'` and `'\''`; a lifetime is not a char
+                    // literal. 2026-10-20: the escape form is checked first
+                    // (`char_literal_len`), where `'\''` used to match the
+                    // three-byte form and leave its last quote behind.
+                    if let Some(len) = char_literal_len(bytes, idx) {
+                        idx += len - 1;
                     }
                 }
                 b'(' => {
@@ -864,12 +901,25 @@ fn is_ident_byte(byte: u8) -> bool {
 
 /// `body` with the CONTENT of every string literal replaced by spaces
 /// (quotes and newlines kept), so a message reading "code = 7" cannot pass
-/// for a field.
+/// for a field. Char literals are blanked the same way (2026-10-20): `'"'`
+/// used to open a string, hiding the code that followed it.
 fn blank_string_contents(body: &str) -> String {
+    let bytes = body.as_bytes();
     let mut out = String::with_capacity(body.len());
     let mut in_str = false;
     let mut escaped = false;
-    for ch in body.chars() {
+    let mut skip_to = 0usize;
+    for (at, ch) in body.char_indices() {
+        if at < skip_to {
+            continue;
+        }
+        if !in_str && let Some(len) = char_literal_len(bytes, at) {
+            out.push('\'');
+            out.extend(std::iter::repeat_n(' ', len - 2));
+            out.push('\'');
+            skip_to = at + len;
+            continue;
+        }
         if in_str {
             if escaped {
                 escaped = false;
@@ -898,14 +948,16 @@ fn blank_string_contents(body: &str) -> String {
     out
 }
 
-/// True when the call passes a structured field named exactly `code`
-/// (`code = …`, whitespace and newlines allowed around `=`; `code: …` is also
-/// accepted).
+/// True when the call passes a structured field named exactly `code` in the
+/// form tracing takes: `code = …`, whitespace and newlines allowed around `=`.
 ///
 /// The name must start after a non-identifier, non-`.` byte (`segment_code`
 /// and the dotted field `http.code` are other fields) and end at a
-/// non-identifier byte (`codes` is another field). `code ==` and `code::` are
-/// expressions, not fields. String contents never count.
+/// non-identifier byte (`codes` is another field). `code ==` is an
+/// expression and `code =>` a match arm, not fields. `code: …` is NOT
+/// accepted (2026-10-20): inside a tracing call it can only be a
+/// struct-literal field of some argument, never a field of the event. String
+/// and char literal contents never count.
 fn carries_code_field(body: &str) -> bool {
     let code_only = blank_string_contents(body);
     let bytes = code_only.as_bytes();
@@ -923,10 +975,8 @@ fn carries_code_field(body: &str) -> bool {
         while bytes.get(next).is_some_and(u8::is_ascii_whitespace) {
             next += 1;
         }
-        match (bytes.get(next), bytes.get(next + 1)) {
-            (Some(b'='), after) if after != Some(&b'=') => return true,
-            (Some(b':'), after) if after != Some(&b':') => return true,
-            _ => {}
+        if bytes.get(next) == Some(&b'=') && !matches!(bytes.get(next + 1), Some(b'=' | b'>')) {
+            return true;
         }
     }
     false
@@ -973,7 +1023,16 @@ mod tests {
 fn carries_code_field_matches_only_the_field_named_code() {
     assert!(carries_code_field("error!(code = X, \"m\")"));
     assert!(carries_code_field("error!(\n    code\n        = X, \"m\")"));
-    assert!(carries_code_field("error!(code: X)"));
+    // 2026-10-20: a struct-literal field and a match arm are not the event's
+    // field; both used to pass.
+    assert!(!carries_code_field("error!(code: X)"));
+    assert!(!carries_code_field(
+        "error!(err = ?Status { code: 1 }, \"m\")"
+    ));
+    assert!(!carries_code_field(
+        "error!(kind = match c { code => 1 }, \"m\")"
+    ));
+    assert!(carries_code_field("error!(code = %c, x = 1 == 2, \"m\")"));
     assert!(!carries_code_field(
         "error!(exchange_segment_code = 1, \"m\")"
     ));
@@ -985,6 +1044,65 @@ fn carries_code_field_matches_only_the_field_named_code() {
     assert!(!carries_code_field("error!(\"code = 1 in the message\")"));
     assert!(!carries_code_field("error!(\"escaped \\\" code = 1\")"));
 }
+
+/// 2026-10-20. A char literal (`'x'`, `'\''`, `'"'`) is not a string. Before,
+/// `'"'` ahead of a call on the same line read as an open string and the call
+/// was missed; inside a call it hid the field after it, or exposed a
+/// message's "code = 1" as one. Lifetimes are left alone.
+#[test]
+fn char_literals_do_not_open_strings() {
+    assert_eq!(
+        error_macro_column("let q = '\"'; error!(code = X, \"m\");"),
+        Some(13)
+    );
+    assert_eq!(
+        error_macro_column("let q = '\\''; error!(\"m\");"),
+        Some(14)
+    );
+    assert_eq!(
+        error_macro_column("let q = '\\\"'; error!(\"m\");"),
+        Some(14)
+    );
+    assert_eq!(
+        error_macro_column("let q = \"'\"; error!(\"m\");"),
+        Some(13)
+    );
+    assert_eq!(error_macro_column("let q = \"error!(\";"), None);
+    assert!(carries_code_field("error!(sep = '\"', code = X, \"m\")"));
+    assert!(carries_code_field("error!(sep = '\\'', code = X, \"m\")"));
+    assert!(!carries_code_field("error!(sep = '\"', \"code = 1\")"));
+    assert_eq!(
+        blank_string_contents("f('\"', \"ab\", '\\'', '\\\\', 'x', &'a str)"),
+        "f(' ', \"  \", '  ', '  ', ' ', &'a str)"
+    );
+    // A call after a `'"'` on its line is seen, and a `')'` inside it does
+    // not close it early.
+    let src = "fn a() {\n    let q = '\"'; error!(sep = ')', \"m\");\n    \
+               error!(code = X, \"n\");\n}\n";
+    assert_eq!(production_error_sites(src), vec![(2, false), (3, true)]);
+}
+
+/// 2026-10-20. The tagged-code test reads the field with the same scanner:
+/// the substring `code =` it used before was satisfied by a message reading
+/// "code = 3" and by `segment_code =`.
+#[test]
+fn tagged_code_scan_needs_the_field_not_the_words() {
+    let tagged = compute_tagged_prefixes();
+    let code = ErrorCode::all()[0].code_str();
+    let src = format!(
+        "fn a() {{\n    error!(\"{code}: stale, code = 3\");\n    \
+         error!(segment_code = 1, \"{code}: x\");\n    \
+         error!(code = X, \"{code}: y\");\n}}\n"
+    );
+    let mut violations = Vec::new();
+    scan_file(Path::new("bite.rs"), &src, &tagged, &mut violations);
+    assert_eq!(
+        violations.len(),
+        2,
+        "lines 2 and 3 carry no `code` field and must be flagged: {violations:?}"
+    );
+}
+
 /// Every crate under `crates/` that has a `src/` directory, discovered from the
 /// filesystem rather than listed.
 ///

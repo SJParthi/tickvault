@@ -1416,6 +1416,10 @@ rules:
       of memory AND out of disk AND data/dlq/ unwritable — catastrophic.
       Operator runs mcp__tickvault-logs__docker_status, df -h /data,
       ls -la data/spill/ data/dlq/. Restart after remediation.
+      Exception, source=slot_exhausted: the candle aggregator's slot table
+      reached AGGREGATOR_MAX_SLOTS, so new instruments get no candles (their
+      ticks are still written); not a memory or disk fault, so do not
+      restart: raise the capacity or shrink the universe.
 
   - name: aggregator-stall-01-feed-waited-on-disk-escalate
     match:
