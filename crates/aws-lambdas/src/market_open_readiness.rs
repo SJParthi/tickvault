@@ -64,6 +64,20 @@ use crate::time::IST_OFFSET_SECS;
 /// EC2 never self-stops on app FAILURE, and the boot-heartbeat gate
 /// window (08:50-09:10) is the backstop pager for anything this
 /// heuristic misreads. Legacy parity: `HOLIDAY_SELF_STOP_EARLIEST_IST_MINUTES`.
+///
+/// 2026-10-20: this 08:25 is the same instant the app's holiday gate starts
+/// its stop window (`holiday_gate::SCHEDULED_START_WINDOW_START_SECS_OF_DAY_IST`,
+/// which is `shutdown_class::HOLIDAY_GATE_STOP_WINDOW_START_SECS_OF_DAY_IST`).
+/// The gate stops only when its own clock reads 08:25 or later, so a gate
+/// stop is on a box launched at or after about 08:25 and reads here as the
+/// holiday self-stop. The two instants differ by a few seconds: this Lambda
+/// reads the EC2 launch time, the gate reads its clock later in the same boot
+/// (after systemd reaches its unit). A launch in the last seconds before
+/// 08:25 whose gate runs after 08:25 is stopped yet reads here as launched
+/// before the floor, so it pages as "box not running"; the scheduled 08:30
+/// start is never that close. Pinned from the app side by
+/// `test_window_start_matches_the_readiness_lambdas_holiday_self_stop_floor`,
+/// which source-scans this exact line: move all three together.
 pub const HOLIDAY_SELF_STOP_EARLIEST_IST_MINUTES: u32 = 8 * 60 + 25;
 
 pub const DEFAULT_BOOT_LOOKBACK_MINUTES: i64 = 10;

@@ -533,11 +533,41 @@ fn holiday_gate_is_wired_and_fail_open() {
         gate.contains("ALLOW_HOLIDAY_RUN"),
         "gate must honour the /opt/tickvault/ALLOW_HOLIDAY_RUN override marker"
     );
+    // 2026-10-20: the gate stops ONLY on a weekday NSE holiday at a boot
+    // inside the scheduled-start window; a weekend, a Muhurat or mock
+    // session, an unreadable calendar or any other boot hour starts the app.
+    // Until this date it stopped on the exit-75 verdict, which covers
+    // weekends, so an enabled gate would have stopped every weekend deploy.
     assert!(
-        gate.contains("const HOLIDAY_EXIT: i32 = 75;")
-            && gate.contains("HOLIDAY_EXIT => Verdict::Stop,")
+        gate.contains("CalendarDay::WeekdayHoliday => {")
+            && gate.contains("if in_scheduled_start_window(now_ist.num_seconds_from_midnight()) {")
+            && gate.contains("CalendarDay::Weekend => Verdict::Start(")
+            && gate.contains("CalendarDay::Unreadable => Verdict::Start(")
+            && gate.contains("pub const SCHEDULED_START_WINDOW_START_SECS_OF_DAY_IST")
             && gate.contains(".stop_instances()"),
-        "gate must self-stop ONLY on the exit-75 verdict (every other code starts the app)"
+        "gate must self-stop ONLY on a weekday NSE holiday inside the scheduled \
+         start window (every other verdict or boot hour starts the app)"
+    );
+    assert!(
+        !gate.contains("HOLIDAY_EXIT => Verdict::Stop,"),
+        "gate must not stop on the bare exit-75 verdict again: 75 includes weekends"
+    );
+    // 2026-10-20 (second review round): a second start on a day the gate
+    // already stopped the box is let through. The gate reads its own marker
+    // and decides BEFORE it re-stamps the marker and stops; a failed read
+    // stops, as before.
+    let second_start = gate
+        .find("match decide_second_start(&marker_read, &today_ist) {")
+        .expect("the gate must check its own marker for a second start today");
+    let put = gate
+        .find(".put_parameter()")
+        .expect("the gate stamps the marker before the stop");
+    assert!(
+        gate.contains("let marker_read = read_holiday_marker(&ssm, &marker).await;")
+            && second_start < put
+            && put < gate.find(".stop_instances()").unwrap_or(0),
+        "the gate must read its marker and honour a same-day second start \
+         BEFORE it re-stamps the marker and stops"
     );
     assert!(
         gate.contains("X-aws-ec2-metadata-token"),
@@ -549,9 +579,10 @@ fn holiday_gate_is_wired_and_fail_open() {
     );
     assert!(
         main.contains("holiday_gate::is_invocation(&cli_args)")
-            && main.contains("holiday_gate::run(trading_day_gate_code)"),
+            && main.contains("holiday_gate::run(holiday_gate_calendar_day)")
+            && main.contains("fn load_gate_trading_calendar()"),
         "main.rs must dispatch `tickvault holiday-gate` to the gate with the same \
-         calendar check `--check-trading-day` uses"
+         layered calendar `--check-trading-day` loads"
     );
 
     // 3. Dedicated oneshot unit ordered BEFORE the app (NOT an ExecStartPre on
@@ -589,4 +620,102 @@ fn holiday_gate_is_wired_and_fail_open() {
         tf.contains("ec2:ResourceTag/Name"),
         "ec2:StopInstances must be tag-scoped to tv-<env>-app (avoids the role->instance cycle)"
     );
+}
+
+/// 2026-10-20: on a weekday NSE holiday the deploy chain must not undo the
+/// holiday gate's stop. Every dispatcher (the deploy-watchdog Lambda,
+/// `deploy-aws-after-close.yml`, `postmerge-catchup.yml`) ends in
+/// `deploy-aws.yml` by workflow_dispatch, which sets SHOULD_BE_UP=yes and
+/// self-starts a stopped box. So (a) `deploy-aws.yml` reads the gate's
+/// holiday-stop marker and skips green BEFORE `start-instances`, and (b) the
+/// watchdog reads the same marker before it dispatches, with the IAM grant
+/// and the env var to do it.
+#[test]
+fn deploy_chain_does_not_restart_a_box_the_holiday_gate_stopped() {
+    let wf = read(".github/workflows/deploy-aws.yml");
+    let marker = wf
+        .find("--name \"/tickvault/prod/holiday-stop-date\"")
+        .expect("deploy-aws.yml must read the holiday-stop marker");
+    let compare = wf
+        .find("[ \"$HSTOP\" = \"$(TZ='Asia/Kolkata' date +%F)\" ]")
+        .expect("deploy-aws.yml must compare the marker with today's IST date");
+    let skip = wf
+        .find("echo \"DEPLOY_SKIP_REASON=holiday_stop\" >> \"$GITHUB_ENV\"")
+        .expect("deploy-aws.yml must skip with DEPLOY_SKIP_REASON=holiday_stop");
+    let start = wf
+        .find("aws ec2 start-instances --region \"$REGION\" --instance-ids \"$IID\"")
+        .expect("deploy-aws.yml self-starts a stopped box");
+    assert!(
+        marker < compare && compare < skip && skip < start,
+        "deploy-aws.yml must read and honour the holiday-stop marker BEFORE it \
+         starts a stopped box"
+    );
+
+    // Scoped to `handle`'s body: the Lambda's own test module quotes both
+    // strings in a source-scan assertion, so a whole-file `contains` would
+    // pass even with the production read deleted (2026-10-20 review fix).
+    let watchdog = read("crates/aws-lambdas/src/deploy_watchdog.rs");
+    let handle = deploy_watchdog_handle_body(&watchdog);
+    assert!(
+        handle.contains("crate::start_watchdog::holiday_stop_is_today(")
+            && handle.contains("\"skipped\": \"holiday_stop\""),
+        "the deploy-watchdog's `handle` must reuse the start-watchdog's marker \
+         read and skip the dispatch on a holiday-stop day"
+    );
+    let tf = squish(&code_only(&read(
+        "deploy/aws/terraform/deploy-watchdog-lambda.tf",
+    )));
+    assert!(
+        tf.contains("parameter/tickvault/${var.environment}/holiday-stop-date")
+            && tf.contains(
+                "HOLIDAY_STOP_PARAM = \"/tickvault/${var.environment}/holiday-stop-date\""
+            ),
+        "the deploy-watchdog Lambda must be granted, and told, the holiday-stop \
+         marker parameter"
+    );
+}
+
+/// The body of `pub async fn handle(` in the deploy-watchdog source: from its
+/// signature to its closing `}` at column 0, and never past the test module
+/// (cut at `#[cfg(test)]` too, belt and braces). The Lambda's test module
+/// quotes the marker strings in its own source-scan assertion, so a check
+/// scoped to this body cannot be satisfied by that string literal
+/// (2026-10-20 review fix).
+fn deploy_watchdog_handle_body(src: &str) -> &str {
+    let start = src
+        .find("pub async fn handle(")
+        .expect("deploy_watchdog.rs must define `pub async fn handle(`");
+    let body = &src[start..];
+    let body = &body[..body.find("#[cfg(test)]").unwrap_or(body.len())];
+    &body[..body.find("\n}\n").map_or(body.len(), |end| end + 2)]
+}
+
+/// Bite check for [`deploy_watchdog_handle_body`]: a source whose `handle`
+/// lost the marker read, but whose test module still quotes both strings,
+/// passes a whole-file `contains` and fails the scoped one.
+#[test]
+fn deploy_watchdog_handle_scope_bites_on_a_test_module_literal() {
+    let fake = "pub async fn handle(event: Value) -> Result<Value, Error> {\n    \
+                let dispatched = dispatch_deploy(&http);\n    Ok(json!({}))\n}\n\n\
+                #[cfg(test)]\nmod tests {\n    \
+                // handle read crate::start_watchdog::holiday_stop_is_today( and\n    \
+                // returned \"skipped\": \"holiday_stop\" before the dispatch\n}\n";
+    // The whole file satisfies the old, unscoped check.
+    assert!(
+        fake.contains("crate::start_watchdog::holiday_stop_is_today(")
+            && fake.contains("\"skipped\": \"holiday_stop\"")
+    );
+    let handle = deploy_watchdog_handle_body(fake);
+    assert!(handle.starts_with("pub async fn handle("));
+    assert!(handle.ends_with("\n}"));
+    assert!(handle.contains("dispatch_deploy("));
+    assert!(
+        !handle.contains("holiday_stop_is_today(") && !handle.contains("holiday_stop"),
+        "the scoped body must not reach the test module's string literal"
+    );
+    // And the real file: the scoped body ends before the test module.
+    let real = read("crates/aws-lambdas/src/deploy_watchdog.rs");
+    let body = deploy_watchdog_handle_body(&real);
+    assert!(!body.contains("#[cfg(test)]") && !body.contains("mod tests"));
+    assert!(body.contains("dispatch_deploy("));
 }

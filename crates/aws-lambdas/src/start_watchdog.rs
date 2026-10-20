@@ -1028,7 +1028,9 @@ impl Ec2Api for SdkEc2 {
 }
 
 pub struct SdkSsm {
-    client: aws_sdk_ssm::Client,
+    /// `pub(crate)` since 2026-10-20 so the deploy-watchdog reads the same
+    /// holiday-stop marker through [`holiday_stop_is_today`] instead of a copy.
+    pub(crate) client: aws_sdk_ssm::Client,
 }
 
 impl SsmApi for SdkSsm {
@@ -1613,6 +1615,34 @@ mod tests {
         assert_eq!(out["alerted"], json!(true));
         assert_eq!(out["self_started"], json!(true));
         assert_eq!(*ec2.start_calls.borrow(), vec!["i-0test".to_string()]);
+    }
+
+    /// 2026-10-20: `holiday_stop_is_today` directly, the read the
+    /// deploy-watchdog now shares (moved here from `deploy_watchdog.rs`, next
+    /// to the checks above that drive it through `run`). The marker blocks
+    /// only on today's IST date; an older, empty, missing or unreadable
+    /// marker fails open.
+    #[tokio::test]
+    async fn holiday_marker_blocks_only_on_todays_ist_date() {
+        // 2026-10-20 03:10 UTC = 08:40 IST on the NSE holiday.
+        let now = utc(2026, 10, 20, 3, 10);
+        for (ssm, blocks) in [
+            (FakeSsm::with(Some("2026-10-20")), true),
+            (FakeSsm::with(Some(" 2026-10-20\n")), true),
+            (FakeSsm::with(Some("2026-10-19")), false),
+            (FakeSsm::with(Some("2026-10-02")), false),
+            (FakeSsm::with(Some("")), false),
+            (FakeSsm::with(None), false),
+            (FakeSsm::raising(), false),
+        ] {
+            assert_eq!(
+                holiday_stop_is_today(&ssm, DEFAULT_HOLIDAY_STOP_PARAM, now).await,
+                blocks,
+                "marker {:?} (raises: {})",
+                ssm.value,
+                ssm.raises
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

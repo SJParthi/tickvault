@@ -173,6 +173,146 @@ CONTRACT FOR AT LEAST 10 MINUTES".
   - Files: CLAUDE.md, deploy/aws/terraform/variables.tf
   - Tests: claude_md_codebase_map_guard
 
+### PR G — holiday gate enabled on deploy, weekday-holiday-only (app, aws-lambdas, common tests, storage tests, deploy workflows, terraform)
+
+Root cause, **Assumed** until `systemctl is-enabled tickvault-holiday-gate` is
+read on the box: the deploy copied `tickvault-holiday-gate.service` on every run
+but enabled only `tickvault` and `tickvault-host-tuning`; only first-boot
+user-data enabled the gate, terraform ignores `user_data` changes, so the live
+box ran on the 2026-10-02 and 2026-10-20 NSE holidays. Enabling it as-is would
+have stopped every non-trading boot, weekends included (`--check-trading-day`
+exit 75 = weekend or holiday): the post-merge catch-up deploy (every 30 minutes,
+all seven days), a console start, filesystem recovery, downsize, and a manual
+Sunday Muhurat start on 2026-11-08, each with a false "NSE holiday" page.
+
+- [ ] G1. The deploy enables all three units in one `systemctl enable` element
+  after `systemctl daemon-reload`; the gate unit's copy is unconditional, so a
+  missing file fails the deploy instead of silently failing the combined enable.
+  The guard helper counts a later `systemctl disable|mask` as removing a unit.
+  - Files: .github/workflows/deploy-aws.yml, crates/app/tests/host_tuning_boot_wiring_guard.rs,
+    crates/common/tests/shell_budget_guard.rs (deploy-aws 95 / 11,980 → 94 / 11,907,
+    run lines 643 → 642 → 640 with G3, shrink only)
+  - Tests: deploy_enables_the_holiday_gate_after_daemon_reload,
+    holiday_gate_enable_check_bites, ssm_workflow_shell_never_grows,
+    workflow_run_lines_never_grow
+  - Honest limits: the combined enable keeps `|| true`, so a failed enable is
+    not reported by the deploy. A `systemctl is-enabled tickvault-holiday-gate`
+    echo in an existing verify element was considered (review, 2026-10-20) and
+    NOT added: the deploy-aws.yml SSM payload budget (94 elements / 11,907
+    bytes) was measured exactly with no slack, so any echo grows it, and the
+    budget only shrinks. The enabled state stays unverified by the deploy; read
+    it on the box (the root-cause check above).
+- [ ] G2. The gate stops the box ONLY on a Monday-to-Friday NSE holiday with no
+  Muhurat or mock session, at a boot inside 08:25 to 09:15 IST (the 08:30 IST
+  EventBridge start); every other boot (weekend, Muhurat, trading day, outside
+  the window, unreadable config) starts the app with one log line saying why.
+  Marker and SNS page unchanged for the stop. `--check-trading-day` unchanged.
+  The window START is `shutdown_class::HOLIDAY_GATE_STOP_WINDOW_START_SECS_OF_DAY_IST`
+  itself (08:25, no copy), which is also the `market_open_readiness` Lambda's
+  holiday self-stop floor (`HOLIDAY_SELF_STOP_EARLIEST_IST_MINUTES`, pinned by a
+  source-scan test). `shutdown_class`'s quiet window END moves 09:00 → 09:25 =
+  the gate's 09:15 end + `HOLIDAY_GATE_STOP_LAG_SECS` (600 s: the gate unit's
+  300 s outer bound + 300 s **Assumed** for EC2 to signal the app), so every gate
+  stop classifies `ScheduledStop`; a compile-time assert holds gate window ⊆
+  quiet window with equal starts. (Review fix 2026-10-20: the first draft started
+  the gate at 08:00, so a gate stop 08:00–08:25 paged as an external stop and the
+  readiness Lambda read it as "box not running".)
+  - Files: crates/app/src/holiday_gate.rs, crates/app/src/shutdown_class.rs,
+    crates/app/src/main.rs, crates/app/src/boot_helpers.rs,
+    crates/aws-lambdas/src/market_open_readiness.rs (doc pin only),
+    crates/storage/tests/aws_deploy_safety_guard.rs
+  - Tests: test_weekday_holiday_inside_the_scheduled_start_window_stops,
+    test_weekday_holiday_outside_the_window_starts, test_weekend_boots_start_at_any_hour,
+    test_sunday_muhurat_starts, test_trading_day_starts_inside_and_outside_the_window,
+    test_unreadable_calendar_fails_open_even_at_the_scheduled_start,
+    test_classify_calendar_day, test_scheduled_start_window_is_0825_to_0915_ist_around_the_0830_start,
+    test_window_start_matches_the_readiness_lambdas_holiday_self_stop_floor,
+    test_classify_shutdown_at_the_holiday_gates_latest_stop_is_scheduled,
+    test_classify_shutdown_holiday_gate_window_consts_are_0825_and_0925_ist,
+    test_classify_shutdown_holiday_gate_self_stop_window_only,
+    test_trading_day_gate_reads_the_same_layered_config_as_the_boot,
+    holiday_gate_is_wired_and_fail_open,
+    test_decide_second_start_lets_only_a_same_day_restart_through,
+    test_marker_put_is_tried_twice_and_bounded, test_names_match_the_script
+  - Review fixes (2026-10-20, second round): (a) a deliberate restart inside
+    08:25 to 09:15 IST on a holiday-stop day was stopped again and paged again.
+    Before it stops, the gate now reads its own `/tickvault/<env>/holiday-stop-date`
+    (`read_holiday_marker`, 30 s ceiling, `ParameterNotFound` = absent) and the
+    pure `decide_second_start` lets the boot start with one log line when the
+    marker is today's IST date; absent, an older date, empty, or a FAILED read
+    stop as before (reviewer's choice: a failed read cannot tell the first boot
+    from the second, and the first is the common case). The page now says a
+    second start today stays on, and says so only when today's stop was
+    recorded. (b) The marker put is retried once after 2 s
+    (`MARKER_PUT_ATTEMPTS` = 2); with the read, the stop path grows by at most
+    62 s, inside the unit's 300 s `TimeoutStartSec`. (c) The readiness Lambda's
+    08:25 floor doc now says "launched at or after about 08:25" and names the
+    few-seconds skew between the EC2 launch time it reads and the gate's own
+    clock.
+  - Honest limits: a deploy or manual start that lands inside 08:25 to 09:15 IST
+    on a weekday holiday, BEFORE the gate stopped the box that day, is stopped
+    like the scheduled start; the `/opt/tickvault/ALLOW_HOLIDAY_RUN` marker
+    overrides it. A manual or budget stop on a non-trading day between 08:25 and
+    09:25 IST now renders quiet (was 08:25–09:00). A same-day reboot of a box
+    whose stop CALL failed now starts the app instead of trying the stop again.
+    After a second start the marker still reads today, so the start-watchdog,
+    the deploy-watchdog and the market-hours alarm gate treat the running box as
+    holiday-stopped for the rest of the day (no self-start, no automatic
+    redeploy, no liveness page; `deploy-aws.yml` run by hand still deploys a
+    running box, and will not start it again if it stops). When both marker puts fail, a second start
+    the same day is stopped again (errs toward the stop). A launch in the last
+    seconds before 08:25 whose gate runs after 08:25 is stopped but read by the
+    readiness Lambda as launched before its floor, so it pages "box not
+    running".
+- [ ] G3. The deploy chain never restarts a box the gate stopped. The
+  deploy-watchdog Lambda (instance-start event, 08:50 / 15:51 IST crons) reads
+  `/tickvault/<env>/holiday-stop-date` through the start-watchdog's
+  `holiday_stop_is_today` (same parameter, IST date, fail-open) after a stale
+  verdict and does not dispatch when it is today: one `info!` line, result
+  `"skipped": "holiday_stop"`, no page (it has no counters; the mismatch metric
+  is still published). Terraform grants it `ssm:GetParameter` on exactly that
+  parameter and sets `HOLIDAY_STOP_PARAM`. `deploy-aws.yml` reads the same
+  marker beside the budget-stop latch, before `start-instances`, and skips green
+  (`DEPLOY_SKIP_REASON=holiday_stop`); `deploy-aws-after-close.yml` and
+  `postmerge-catchup.yml` both end in that check (comments only there). The 4
+  new run lines are paid by merging two 4-line state branches (run lines
+  642 → 640; SSM payload and awk/jq budgets untouched).
+  - Files: crates/aws-lambdas/src/deploy_watchdog.rs,
+    crates/aws-lambdas/src/start_watchdog.rs (`SdkSsm.client` `pub(crate)`),
+    deploy/aws/terraform/deploy-watchdog-lambda.tf, .github/workflows/deploy-aws.yml,
+    .github/workflows/deploy-aws-after-close.yml, .github/workflows/postmerge-catchup.yml,
+    crates/common/tests/shell_budget_guard.rs, crates/storage/tests/aws_deploy_safety_guard.rs
+  - Tests: handle_reads_the_holiday_stop_marker_before_it_dispatches,
+    holiday_marker_blocks_only_on_todays_ist_date (in start_watchdog.rs since
+    the second review round, next to the `run`-driven holiday-marker checks; it
+    tests `start_watchdog::holiday_stop_is_today`),
+    deploy_chain_does_not_restart_a_box_the_holiday_gate_stopped (its
+    deploy-watchdog check is scoped to `handle`'s body, so the Lambda's own test
+    module literal cannot satisfy it),
+    deploy_watchdog_handle_scope_bites_on_a_test_module_literal,
+    workflow_run_lines_never_grow
+  - The `deploy-aws.yml` skip notice now says: start the box from the console
+    (a second start the same day is let through), then re-run with
+    `confirm_market_hours=yes` (09:00-15:45 IST) or after 15:45 IST. Same line,
+    run-line budget unchanged.
+  - Honest limits: on the instance-start event the watchdog can fire before the
+    gate writes the marker in that same boot, so that one firing can still
+    dispatch; the deploy it starts skips at the marker once the box is stopped,
+    or meets the stop during its verify (reported as an external stop, not a
+    crash). A holiday-skip run counts as covering its SHA for
+    `postmerge-catchup`, so that SHA's redeploy is the watchdog's on the next
+    weekday boot. An unreadable marker deploys (fail-open, as the budget latch).
+    The terraform grant needs an apply before the Lambda can read the marker;
+    until then the read fails open and the watchdog dispatches as before.
+    A merge on a holiday-stop day is NOT deployed that day: the next weekday
+    08:30 boot runs the stale binary, the deploy-watchdog (instance-start
+    event, 08:50 IST cron) reports it stale (`binary-sha-stale` metric) and
+    dispatches the redeploy inside the 08:30-09:00 prep window. The watchdog's
+    skip ignores box state: it reads only the marker, so after a manual start
+    on a holiday-stop day (let through by the gate's second-start rule, or
+    after 09:15 IST) a stale binary is not auto-deployed that day; re-run
+    `deploy-aws.yml` by hand (a running box deploys).
+
 ### Not in this plan (blocked by a rule, need their own dated quote)
 
 - Frame-silence fast path to `act`: the scope lock REJECTs defaulting to `act`
