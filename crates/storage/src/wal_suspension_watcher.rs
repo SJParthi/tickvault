@@ -659,6 +659,14 @@ struct LagState {
 /// (up-down-up-down never strings two falls together), while a backlog that
 /// is genuinely draining passes it in two minutes. Below the floor still
 /// releases at once — that is a recovery, not a fall.
+///
+/// **⚠ CHANGED 2026-10-20:** "consecutive" now means with no RISE between
+/// them; a flat poll neither counts nor resets. Measured in production on
+/// 14, 15 and 16 Oct: `market_depth` drained its backlog in 12-txn steps with
+/// flat polls between, so two strict falls in a row never happened, the latch
+/// held from late morning to 17:15, and the after-close depth pass (which
+/// pauses on this latch) wrote nothing on three evenings while the WAL disk
+/// filled. Pinned by `a_staircase_drain_with_flat_polls_releases_the_latch`.
 pub const WAL_APPLY_LAG_RELEASE_POLLS: u32 = 2;
 
 /// Consecutive PARTIAL polls a tracked table may be absent from before it is
@@ -851,7 +859,17 @@ impl WalLagTracker {
                     entry.reported = false;
                 }
             } else {
-                entry.falling_polls = 0;
+                // Only a RISE ends a drain. A flat poll is not a fall, but it
+                // is not a rise either (2026-10-20): QuestDB applies a deep
+                // backlog in steps (live 14-16 Oct: down 12 txn, flat, flat,
+                // down 12 txn), and resetting on every flat kept a draining
+                // table latched from 11:15 to 17:15, which paused the
+                // after-close depth pass all evening. Jitter (down, up, down,
+                // up) still never releases, and a flat poll still counts
+                // toward ARMING, so a table stuck flat stays latched.
+                if lag > entry.last_lag {
+                    entry.falling_polls = 0;
+                }
                 entry.growing_polls = entry.growing_polls.saturating_add(1);
             }
             entry.last_lag = lag;
@@ -2099,6 +2117,68 @@ mod tests {
             0,
             "{WAL_APPLY_LAG_RELEASE_POLLS} consecutive falls is a backlog draining"
         );
+    }
+
+    /// Regression, 2026-10-20: the live 14 Oct pattern. `market_depth` drained
+    /// a ~10k-txn backlog 12 txn at a time with flat polls between; the old
+    /// rule reset the fall count on every flat poll, so the latch never
+    /// released and the after-close depth pass waited all evening.
+    #[test]
+    fn a_staircase_drain_with_flat_polls_releases_the_latch() {
+        let mut t = WalLagTracker::new();
+        for _ in 1..=WAL_APPLY_LAG_GROWING_POLLS {
+            t.observe(&[lag_row("market_depth", 109_993, 100_000)]);
+        }
+        assert_eq!(
+            t.reported_count(),
+            1,
+            "a flat backlog above the floor latches"
+        );
+
+        // Down 12, flat, flat, flat: one step is not yet a drain.
+        t.observe(&[lag_row("market_depth", 109_981, 100_000)]);
+        for _ in 0..3 {
+            t.observe(&[lag_row("market_depth", 109_981, 100_000)]);
+            assert_eq!(
+                t.reported_count(),
+                1,
+                "one step down and a pause is not a release"
+            );
+        }
+        // The second step down, with no rise since the first: released.
+        t.observe(&[lag_row("market_depth", 109_969, 100_000)]);
+        assert_eq!(
+            t.reported_count(),
+            0,
+            "two steps down with only flat polls between is a backlog draining"
+        );
+
+        // Flat polls after the release do not re-arm it before
+        // WAL_APPLY_LAG_GROWING_POLLS, and the next step down resets them.
+        for _ in 0..3 {
+            t.observe(&[lag_row("market_depth", 109_969, 100_000)]);
+        }
+        t.observe(&[lag_row("market_depth", 109_957, 100_000)]);
+        assert_eq!(t.reported_count(), 0, "a staircase never re-arms");
+    }
+
+    /// A rise between two falls still resets the drain: the jitter guard holds
+    /// with flat polls mixed in.
+    #[test]
+    fn a_rise_between_two_falls_keeps_the_latch_even_with_flat_polls() {
+        let mut t = WalLagTracker::new();
+        for _ in 1..=WAL_APPLY_LAG_GROWING_POLLS {
+            t.observe(&[lag_row("market_depth", 200_000, 100_000)]);
+        }
+        t.observe(&[lag_row("market_depth", 199_990, 100_000)]); // fall
+        t.observe(&[lag_row("market_depth", 199_990, 100_000)]); // flat
+        t.observe(&[lag_row("market_depth", 199_995, 100_000)]); // rise
+        t.observe(&[lag_row("market_depth", 199_995, 100_000)]); // flat
+        t.observe(&[lag_row("market_depth", 199_985, 100_000)]); // fall
+        assert_eq!(t.reported_count(), 1, "the rise ended the first drain");
+        t.observe(&[lag_row("market_depth", 199_985, 100_000)]); // flat
+        t.observe(&[lag_row("market_depth", 199_975, 100_000)]); // fall
+        assert_eq!(t.reported_count(), 0, "two falls with no rise between");
     }
 
     /// An empty 2xx while tables are latched is a server mid-restart, and the

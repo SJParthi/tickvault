@@ -61,6 +61,25 @@ Crates touched across the plan: `tickvault-app` (crates/app), `tickvault-storage
     test_frame_ring_a_full_backlog_yields_to_other_tasks,
     dhat_wal_ring_sink_accept_allocates_nothing_in_steady_state_backlog_or_shed
 
+### PR C0 — WAL apply-lag latch releases on a staircase drain (storage) — live disk risk
+
+Found by the 2026-10-20 live AWS check (read-only): on 14, 15 and 16 Oct the
+after-close depth pass wrote 0 rows and cleared 0 buckets (stop: Deadline)
+while pinned WAL depth segments grew 74.6 → 118.1 GB against an 80.5 GB
+ceiling. The pass pauses on the apply-lag latch; `market_depth` drained its
+backlog 12 txn at a time with flat polls between, and the latch reset its
+fall count on every flat poll, so it never released from late morning to
+17:15. Operator chose "Pass ignores steady lag (Recommended)" on 2026-10-20.
+
+- [ ] C0. A flat poll neither counts as a fall nor resets the fall count; only a
+  rise does. Jitter still never releases; a table stuck flat still latches.
+  - Files: crates/storage/src/wal_suspension_watcher.rs
+  - Tests: a_staircase_drain_with_flat_polls_releases_the_latch,
+    a_rise_between_two_falls_keeps_the_latch_even_with_flat_polls,
+    one_falling_poll_does_not_release_the_latch_but_two_do,
+    a_lag_pinned_perfectly_flat_above_the_floor_still_latches
+  - Proof: both new tests FAIL on the old rule and pass on the new one.
+
 ### PR C — top_volume spill replay window (storage)
 
 - [ ] C1. A spilled hour is set aside by the age of its END and gets a second
