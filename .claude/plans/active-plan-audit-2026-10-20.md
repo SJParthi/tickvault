@@ -1,6 +1,6 @@
 # Implementation Plan: 2026-10-20 seven-agent code audit fixes
 
-**Status:** APPROVED
+**Status:** IN_PROGRESS
 **Date:** 2026-10-20
 **Approved by:** Parthiban, 2026-10-20: "Dee fic everything dude I need zero defects zero errors dude"
 
@@ -17,7 +17,7 @@ Crates touched across the plan: `tickvault-app` (crates/app), `tickvault-storage
 
 ### PR A — depth rows the WAL refused never wait past 500 ms, plus backup-dedup allocation proof (app)
 
-- [ ] A1. Hand off unbacked depth rows from the frame arm when they have waited
+- [x] A1. Hand off unbacked depth rows from the frame arm when they have waited
   `FLUSH_INTERVAL`, so a saturated ring (biased select, timer arm not polled)
   cannot hold them in RAM for seconds. O(1) per frame.
   - Files: crates/app/src/dhan_feed_stack.rs, crates/app/src/dhan_feed_stack/unbacked_depth.rs
@@ -28,7 +28,7 @@ Crates touched across the plan: `tickvault-app` (crates/app), `tickvault-storage
     test_unbacked_clock_due_reads_the_wall_only_while_unbacked,
     proptest_unbacked_clock_fires_at_most_once_per_limit_and_never_late,
     the_late_depth_paths_use_the_late_trigger_and_the_live_drain_does_not
-- [ ] A2. DHAT test that installs a backup set and runs two-socket duplicate
+- [x] A2. DHAT test that installs a backup set and runs two-socket duplicate
   traffic through every dedup arm under the production recorder.
   - Files: crates/app/tests/dhat_main_feed_backup_dedup.rs
   - Tests: dhat_backup_dedup_admits_and_drops_without_allocating
