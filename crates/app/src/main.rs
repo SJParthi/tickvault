@@ -154,26 +154,48 @@ const TRADING_DAY_GATE_LOAD_ERROR_EXIT: i32 = 70;
 /// The `--check-trading-day` verdict as an exit code, without exiting, so the
 /// in-process holiday gate asks the very same question.
 fn trading_day_gate_code() -> i32 {
-    // AUDIT INP-14 (2026-10-11): the same layered merge as the boot (base,
-    // then config/<env>.toml, then local). Until this date the gate skipped
-    // the env file.
-    let config: ApplicationConfig = match tickvault_app::boot_helpers::layered_config_figment(
-        &tickvault_app::boot_helpers::resolve_config_env(),
-    )
-    .extract()
-    {
-        Ok(c) => c,
+    let Some(calendar) = load_gate_trading_calendar() else {
         // FAIL-OPEN on load error (exit 70 → gate lets the app start).
-        Err(_) => return TRADING_DAY_GATE_LOAD_ERROR_EXIT,
-    };
-    let calendar = match TradingCalendar::from_config(&config.trading) {
-        Ok(c) => c,
-        Err(_) => return TRADING_DAY_GATE_LOAD_ERROR_EXIT,
+        return TRADING_DAY_GATE_LOAD_ERROR_EXIT;
     };
     let today_ist = (chrono::Utc::now()
         + chrono::TimeDelta::seconds(tickvault_common::constants::IST_UTC_OFFSET_SECONDS_I64))
     .date_naive();
     trading_day_gate_exit_code(calendar.is_trading_day(today_ist))
+}
+
+/// The trading calendar from the same layered config the boot uses, or
+/// `None` when the config or the calendar cannot be loaded (both gates then
+/// fail open).
+fn load_gate_trading_calendar() -> Option<TradingCalendar> {
+    // AUDIT INP-14 (2026-10-11): the same layered merge as the boot (base,
+    // then config/<env>.toml, then local). Until this date the gate skipped
+    // the env file.
+    let config: ApplicationConfig = tickvault_app::boot_helpers::layered_config_figment(
+        &tickvault_app::boot_helpers::resolve_config_env(),
+    )
+    .extract()
+    .ok()?;
+    TradingCalendar::from_config(&config.trading).ok()
+}
+
+/// What the holiday gate (`tickvault holiday-gate`) needs to know about one
+/// IST date (2026-10-20): a weekday NSE holiday is the only verdict it stops
+/// on, and a Muhurat or mock session never counts as one. A load error is
+/// `Unreadable`, which the gate treats as "let the app start". Asked
+/// in-process by `holiday_gate::run`; the `--check-trading-day` contract
+/// above is unchanged.
+fn holiday_gate_calendar_day(
+    today_ist: chrono::NaiveDate,
+) -> tickvault_app::holiday_gate::CalendarDay {
+    let Some(calendar) = load_gate_trading_calendar() else {
+        return tickvault_app::holiday_gate::CalendarDay::Unreadable;
+    };
+    tickvault_app::holiday_gate::classify_calendar_day(
+        today_ist,
+        calendar.is_holiday(today_ist),
+        calendar.is_muhurat_trading_day(today_ist) || calendar.is_mock_trading_day(today_ist),
+    )
 }
 
 /// Metric name for the dedicated boot-completed CloudWatch signal.
@@ -762,7 +784,7 @@ async fn async_main() -> Result<()> {
     // install because its IMDS and AWS clients use TLS.
     let cli_args: Vec<String> = std::env::args().collect();
     if tickvault_app::holiday_gate::is_invocation(&cli_args) {
-        let code = tickvault_app::holiday_gate::run(trading_day_gate_code).await;
+        let code = tickvault_app::holiday_gate::run(holiday_gate_calendar_day).await;
         std::process::exit(code);
     }
     // `tickvault ensure-questdb` (audit D6d; was scripts/ensure-questdb.sh):

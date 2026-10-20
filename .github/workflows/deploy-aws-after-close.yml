@@ -33,6 +33,11 @@
 #     deploy-aws run self-starts a stopped box (workflow_dispatch ⇒
 #     SHOULD_BE_UP=yes in its "Ensure instance running" step) and its final
 #     never-cross step stops the box again once the deploy finishes.
+#     2026-10-20: EXCEPT on a holiday-stop day. When the holiday gate stopped
+#     the box today (`/tickvault/<env>/holiday-stop-date` = today's IST date),
+#     deploy-aws skips green (`DEPLOY_SKIP_REASON=holiday_stop`) instead of
+#     self-starting it; the next weekday's boot is the redeploy (the
+#     deploy-watchdog catches the stale binary on the instance-start event).
 #
 # Idempotent: before dispatching, we compare main's current HEAD against the
 # `head_sha` of the most recent deploy-aws run on main that ACTUALLY DEPLOYED

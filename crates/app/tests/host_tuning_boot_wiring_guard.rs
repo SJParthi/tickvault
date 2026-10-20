@@ -30,6 +30,13 @@
 //! 5. The deploy workflow installs AND restarts it, so tuning lands without
 //!    waiting for the next stop/start.
 //! 6. Tuning failure never gates the app — a slower host beats no host.
+//! 7. (2026-10-20) The deploy ENABLES the holiday gate as well, after
+//!    `systemctl daemon-reload`. It copied that unit on every deploy and
+//!    enabled only `tickvault` and `tickvault-host-tuning`; only first-boot
+//!    user-data enabled the gate, and terraform ignores `user_data` changes, so
+//!    the live box never had it enabled and ran on the 2026-10-02 and
+//!    2026-10-20 NSE holidays. The same per-instance-vs-per-deploy gap as
+//!    point 4, one unit over.
 
 use std::path::{Path, PathBuf};
 
@@ -144,9 +151,15 @@ fn deploy_installs_and_applies_tuning_without_waiting_for_a_reboot() {
         "the deploy workflow must ship the unit file, or a tuning change never \
          reaches the box between instance replacements"
     );
+    // 2026-10-20: the deploy enables all its units in ONE element
+    // (`systemctl enable tickvault tickvault-host-tuning tickvault-holiday-gate`),
+    // so this reads the units the payload enables rather than one literal.
+    let enabled =
+        units_enabled_after_daemon_reload(&deploy).unwrap_or_else(|e| panic!("{DEPLOY}: {e}"));
     assert!(
-        deploy.contains("systemctl enable tickvault-host-tuning"),
-        "deploy must enable the unit so it arms for future boots"
+        enabled.iter().any(|u| u == "tickvault-host-tuning"),
+        "deploy must enable the unit so it arms for future boots; enabled after \
+         daemon-reload: {enabled:?}"
     );
     assert!(
         deploy.contains("systemctl restart tickvault-host-tuning"),
@@ -543,6 +556,226 @@ fn holiday_gate_unit_runs_the_subcommand_binary_and_is_copied_after_it() {
          refreshed, so a failed deploy can leave the new unit calling an older \
          copy that would boot the whole app instead of the gate"
     );
+}
+
+/// The units named by the `systemctl enable` elements of the deploy's SSM
+/// payload, counting only elements AFTER the `"systemctl daemon-reload"`
+/// element and inside the same `commands=[…]` payload (it ends at the line
+/// that starts with `]`). An element is one whole quoted line; comment lines
+/// are skipped; a leading `sudo ` is allowed; a unit is any non-flag word
+/// before the first `|`, `&`, `;` or `>`, with `.service` dropped. An enable
+/// buried inside an `if …; then …` element is not counted, so the check fails
+/// closed rather than trusting a conditional. A later `systemctl disable` or
+/// `systemctl mask` element naming a unit removes it again (a later enable
+/// re-adds it). `Err` when the payload has no `daemon-reload` element at all.
+fn units_enabled_after_daemon_reload(deploy: &str) -> Result<Vec<String>, String> {
+    let mut reloaded = false;
+    let mut units = Vec::new();
+    for line in deploy.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        if reloaded && trimmed.starts_with(']') {
+            break;
+        }
+        let Some(element) = trimmed
+            .trim_end_matches(',')
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+        else {
+            continue;
+        };
+        if element == "systemctl daemon-reload" {
+            reloaded = true;
+            continue;
+        }
+        if !reloaded {
+            continue;
+        }
+        let command = element.strip_prefix("sudo ").unwrap_or(element);
+        let (enable, args) = if let Some(args) = command.strip_prefix("systemctl enable ") {
+            (true, args)
+        } else if let Some(args) = command
+            .strip_prefix("systemctl disable ")
+            .or_else(|| command.strip_prefix("systemctl mask "))
+        {
+            (false, args)
+        } else {
+            continue;
+        };
+        let args = args.split(['|', '&', ';', '>']).next().unwrap_or_default();
+        let named = args
+            .split_whitespace()
+            .filter(|a| !a.starts_with('-'))
+            .map(|a| a.trim_end_matches(".service").to_string());
+        if enable {
+            units.extend(named);
+        } else {
+            // 2026-10-20: a later `disable` or `mask` undoes an earlier enable.
+            for unit in named {
+                units.retain(|u| u != &unit);
+            }
+        }
+    }
+    if !reloaded {
+        return Err("no `\"systemctl daemon-reload\"` element in the SSM payload".to_string());
+    }
+    Ok(units)
+}
+
+/// The holiday gate is armed by EVERY deploy, not only by first-boot
+/// user-data (2026-10-20).
+///
+/// # The defect this pins
+///
+/// The deploy copied `tickvault-holiday-gate.service` into
+/// `/etc/systemd/system` on every run, but its only `systemctl enable`
+/// elements named `tickvault` and `tickvault-host-tuning`. The gate was
+/// enabled only by `user-data.sh.tftpl`, which runs once per instance, and
+/// terraform ignores `user_data` changes, so an instance created before the
+/// gate existed never got it. A copied-but-not-enabled unit is inert and
+/// silent: the live box ran through the 2026-10-02 and 2026-10-20 NSE
+/// holidays with nothing in any log. The enable must come after
+/// `systemctl daemon-reload`, so systemd has read the freshly copied unit.
+#[test]
+fn deploy_enables_the_holiday_gate_after_daemon_reload() {
+    const HOLIDAY_UNIT: &str = "deploy/systemd/tickvault-holiday-gate.service";
+    let unit = read(HOLIDAY_UNIT);
+    assert!(
+        unit.contains("WantedBy=multi-user.target"),
+        "{HOLIDAY_UNIT} must be WantedBy=multi-user.target, or `systemctl enable` \
+         arms nothing and the gate never runs at boot"
+    );
+
+    let deploy = read(DEPLOY);
+    let enabled =
+        units_enabled_after_daemon_reload(&deploy).unwrap_or_else(|e| panic!("{DEPLOY}: {e}"));
+    for wanted in [
+        "tickvault",
+        "tickvault-host-tuning",
+        "tickvault-holiday-gate",
+    ] {
+        assert!(
+            enabled.iter().any(|u| u == wanted),
+            "{DEPLOY}: no `systemctl enable` element names `{wanted}` after \
+             `systemctl daemon-reload` (enabled there: {enabled:?}). A unit the \
+             deploy copies but never enables is inert on every instance that \
+             predates it; for the holiday gate that means the box runs on NSE \
+             holidays"
+        );
+    }
+
+    let reload = deploy
+        .find("\"systemctl daemon-reload\"")
+        .expect("checked above: the payload has a daemon-reload element");
+    let copy = deploy
+        .find("cp -f repo/deploy/systemd/tickvault-holiday-gate.service")
+        .expect("the deploy no longer refreshes the holiday-gate unit");
+    assert!(
+        copy < reload,
+        "{DEPLOY}: the holiday-gate unit is copied after `systemctl daemon-reload`, \
+         so the enable that follows reads the previous unit file"
+    );
+}
+
+/// The check above must reject each way the enable can go missing.
+#[test]
+fn holiday_gate_enable_check_bites() {
+    fn payload(body: &str) -> String {
+        format!("            --parameters 'commands=[\n{body}\n            ]' \\\n")
+    }
+    let has_gate = |text: &str| {
+        units_enabled_after_daemon_reload(text)
+            .map(|units| units.iter().any(|u| u == "tickvault-holiday-gate"))
+    };
+
+    // The fixed shape passes, `.service` suffix and `sudo` included.
+    let fixed = payload(
+        "              \"systemctl daemon-reload\",\n              \
+         \"systemctl enable tickvault tickvault-host-tuning tickvault-holiday-gate || true\",",
+    );
+    assert_eq!(has_gate(&fixed), Ok(true));
+    let suffixed = payload(
+        "              \"systemctl daemon-reload\",\n              \
+         \"sudo systemctl enable tickvault-holiday-gate.service\",",
+    );
+    assert_eq!(has_gate(&suffixed), Ok(true));
+
+    // The shape that shipped until 2026-10-20: the gate is never enabled.
+    let shipped = payload(
+        "              \"systemctl daemon-reload\",\n              \
+         \"systemctl enable tickvault || true\",\n              \
+         \"systemctl enable tickvault-host-tuning || true\",",
+    );
+    assert_eq!(has_gate(&shipped), Ok(false));
+
+    // Enabled BEFORE daemon-reload.
+    let early = payload(
+        "              \"systemctl enable tickvault-holiday-gate || true\",\n              \
+         \"systemctl daemon-reload\",",
+    );
+    assert_eq!(has_gate(&early), Ok(false));
+
+    // Commented out.
+    let commented = payload(
+        "              \"systemctl daemon-reload\",\n              \
+         # \"systemctl enable tickvault-holiday-gate || true\",",
+    );
+    assert_eq!(has_gate(&commented), Ok(false));
+
+    // In a later payload, past the end of the one that reloads.
+    let later = format!(
+        "{}{}",
+        payload("              \"systemctl daemon-reload\","),
+        payload("              \"systemctl enable tickvault-holiday-gate || true\","),
+    );
+    assert_eq!(has_gate(&later), Ok(false));
+
+    // A near-miss name, or the unit only after `||` (a fallback, not an enable).
+    let near = payload(
+        "              \"systemctl daemon-reload\",\n              \
+         \"systemctl enable tickvault-holiday-gate-old || true\",\n              \
+         \"systemctl enable tickvault || systemctl enable tickvault-holiday-gate\",",
+    );
+    assert_eq!(has_gate(&near), Ok(false));
+
+    // Disabled, or started only, is not enabled.
+    let disabled = payload(
+        "              \"systemctl daemon-reload\",\n              \
+         \"systemctl disable tickvault-holiday-gate || true\",\n              \
+         \"systemctl start tickvault-holiday-gate || true\",",
+    );
+    assert_eq!(has_gate(&disabled), Ok(false));
+
+    // Enabled, then disabled or masked by a later element: not enabled.
+    let enable_then_disable = payload(
+        "              \"systemctl daemon-reload\",\n              \
+         \"systemctl enable tickvault tickvault-host-tuning tickvault-holiday-gate || true\",\n              \
+         \"systemctl disable tickvault-holiday-gate || true\",",
+    );
+    assert_eq!(has_gate(&enable_then_disable), Ok(false));
+    let enable_then_mask = payload(
+        "              \"systemctl daemon-reload\",\n              \
+         \"systemctl enable tickvault-holiday-gate || true\",\n              \
+         \"sudo systemctl mask --now tickvault-holiday-gate.service\",",
+    );
+    assert_eq!(has_gate(&enable_then_mask), Ok(false));
+    // The disable removes only the unit it names.
+    let others_kept = units_enabled_after_daemon_reload(&enable_then_disable)
+        .expect("the payload has a daemon-reload element");
+    assert!(others_kept.iter().any(|u| u == "tickvault-host-tuning"));
+    // A later enable re-arms it.
+    let disable_then_enable = payload(
+        "              \"systemctl daemon-reload\",\n              \
+         \"systemctl disable tickvault-holiday-gate || true\",\n              \
+         \"systemctl enable tickvault-holiday-gate || true\",",
+    );
+    assert_eq!(has_gate(&disable_then_enable), Ok(true));
+
+    // No daemon-reload at all fails closed.
+    let no_reload = payload("              \"systemctl enable tickvault-holiday-gate || true\",");
+    assert!(units_enabled_after_daemon_reload(&no_reload).is_err());
 }
 
 /// The QuestDB self-heal (audit D6d) runs from the app unit itself, as an
