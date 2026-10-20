@@ -38,8 +38,26 @@ Crates touched across the plan: `tickvault-app` (crates/app), `tickvault-storage
 - [ ] B1. Replace the frame ring's growable block list with a pre-allocated
   bounded queue plus a wake, so a backlog never allocates on the socket reader.
   Design reviewed by hot-path, security and hostile agents before code.
-  - Files: crates/app/src/dhan_feed_stack.rs, crates/core/src/websocket/pool_supervisor.rs
-  - Tests: dhat_wal_ring_sink_accept (backlog arm held to the house budget)
+  - Files: crates/core/src/websocket/frame_ring.rs (new), crates/core/src/websocket/mod.rs,
+    crates/core/Cargo.toml, crates/core/src/websocket/pool_supervisor.rs,
+    crates/app/src/dhan_feed_stack.rs
+  - Design (agent-reviewed 2026-10-20): `crossbeam_channel::bounded` storage
+    (already a pinned workspace dep; all slots allocated at boot) plus a
+    `tokio::sync::Notify` wake; strong-sender count for the close, so the
+    drain still ends when every socket is gone; `recv` wrapped in
+    `tokio::task::coop::cooperative` so a backlog still yields like tokio's
+    channel; register (`Notified::enable`) before checking the queue, so no
+    wake is lost.
+  - Tests: test_frame_ring_delivers_in_order_then_none_after_the_last_sender,
+    test_frame_ring_try_send_refuses_past_capacity_and_hands_the_item_back,
+    test_frame_ring_try_send_after_the_receiver_is_dropped_is_closed,
+    test_frame_ring_zero_capacity_is_raised_to_one,
+    test_frame_ring_a_weak_sender_does_not_keep_the_ring_open,
+    test_frame_ring_a_cloned_sender_keeps_the_ring_open,
+    test_frame_ring_cross_thread_wake_never_loses_an_item,
+    test_frame_ring_recv_dropped_inside_select_loses_nothing,
+    test_frame_ring_a_full_backlog_yields_to_other_tasks,
+    dhat_wal_ring_sink_accept_allocates_nothing_in_steady_state_backlog_or_shed
 
 ### PR C — top_volume spill replay window (storage)
 

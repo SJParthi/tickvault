@@ -7834,7 +7834,7 @@ fn flush_depth(depth: Option<&mut DepthIngest>) {
 }
 
 async fn run_frame_drain(
-    mut rx: tokio::sync::mpsc::Receiver<CapturedFrame>,
+    mut rx: tickvault_core::websocket::frame_ring::FrameRingReceiver<CapturedFrame>,
     mut ingest: LiveIngest,
     main_feed_budget: Arc<RingByteBudget>,
     depth_budget: Arc<RingByteBudget>,
@@ -13559,7 +13559,7 @@ fn write_back_widen_rooms(
 /// Everything the widen borrows from the attach for one attempt.
 struct WidenCtx<'a> {
     pool: &'a mut PoolSupervisor,
-    frame_weak: &'a tokio::sync::mpsc::WeakSender<CapturedFrame>,
+    frame_weak: &'a tickvault_core::websocket::frame_ring::FrameRingWeakSender<CapturedFrame>,
     client_id: &'a str,
     spill: &'a Arc<WsFrameSpill>,
     main_feed_budget: &'a Arc<RingByteBudget>,
@@ -13849,7 +13849,7 @@ async fn attach_depth_when_available(
     questdb: tickvault_common::config::QuestDbConfig,
     client_id: String,
     spill: Arc<WsFrameSpill>,
-    frame_weak: tokio::sync::mpsc::WeakSender<CapturedFrame>,
+    frame_weak: tickvault_core::websocket::frame_ring::FrameRingWeakSender<CapturedFrame>,
     // Depth's own budget, not the shared one. This path dials ONLY depth
     // sockets, so passing the main feed's share here would silently undo the
     // split it exists to enforce.
@@ -15833,7 +15833,7 @@ struct DialContext<'a> {
     pool: &'a mut PoolSupervisor,
     client_id: &'a str,
     spill: &'a Arc<WsFrameSpill>,
-    frame_tx: &'a tokio::sync::mpsc::Sender<CapturedFrame>,
+    frame_tx: &'a tickvault_core::websocket::frame_ring::FrameRingSender<CapturedFrame>,
     main_feed_budget: &'a Arc<RingByteBudget>,
     depth_budget: &'a Arc<RingByteBudget>,
     depth200_budget: &'a Arc<RingByteBudget>,
@@ -18729,7 +18729,8 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         }
     }
 
-    let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<CapturedFrame>(FRAME_RING_CAPACITY);
+    let (frame_tx, frame_rx) =
+        tickvault_core::websocket::frame_ring::frame_ring::<CapturedFrame>(FRAME_RING_CAPACITY);
     // TWO properties, merged rather than picked between (2026-08-15).
     //
     // origin/main SPLIT the ring budget by endpoint so a 512 KiB depth frame
@@ -25747,9 +25748,9 @@ mod tests {
         // row out, and a clean end once the last sender is gone. The final
         // flush on the way out is what saves the tail of a session.
         let ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
-        let (tx, rx) = tokio::sync::mpsc::channel::<CapturedFrame>(4);
+        let (tx, rx) = tickvault_core::websocket::frame_ring::frame_ring::<CapturedFrame>(4);
 
-        tx.send(CapturedFrame {
+        tx.try_send(CapturedFrame {
             seq: 42,
             endpoint: DhanEndpointType::MainFeed,
             connection_index: 0,
@@ -25764,7 +25765,6 @@ mod tests {
                 todays_in_session_ltt(),
             )),
         })
-        .await
         .expect("the ring must accept a frame");
         drop(tx);
 
@@ -25825,10 +25825,10 @@ mod tests {
     #[tokio::test]
     async fn test_drain_exits_on_shutdown_signal_with_the_ring_still_open() {
         let ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
-        let (tx, rx) = tokio::sync::mpsc::channel::<CapturedFrame>(4);
+        let (tx, rx) = tickvault_core::websocket::frame_ring::frame_ring::<CapturedFrame>(4);
         let shutdown = Arc::new(tokio::sync::Notify::new());
 
-        tx.send(CapturedFrame {
+        tx.try_send(CapturedFrame {
             seq: 7,
             endpoint: DhanEndpointType::MainFeed,
             connection_index: 0,
@@ -25843,7 +25843,6 @@ mod tests {
                 todays_in_session_ltt(),
             )),
         })
-        .await
         .expect("the ring must accept a frame");
 
         let drain = tokio::spawn(run_frame_drain(
@@ -25932,8 +25931,8 @@ mod tests {
         // surface the operator explicitly authorised. The drain must survive
         // one and terminate cleanly.
         let ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 4);
-        let (tx, rx) = tokio::sync::mpsc::channel::<CapturedFrame>(4);
-        tx.send(CapturedFrame {
+        let (tx, rx) = tickvault_core::websocket::frame_ring::frame_ring::<CapturedFrame>(4);
+        tx.try_send(CapturedFrame {
             seq: 1,
             endpoint: DhanEndpointType::Depth20,
             connection_index: 5,
@@ -25944,7 +25943,6 @@ mod tests {
             wal_backed: true,
             bytes: bytes::Bytes::from_static(&[0x0C, 0x00, 0x29, 0x00, 0x0D, 0x00, 0x00, 0x00]),
         })
-        .await
         .expect("send");
         drop(tx);
 

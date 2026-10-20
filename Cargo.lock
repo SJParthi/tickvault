@@ -4293,6 +4293,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "criterion",
+ "crossbeam-channel",
  "csv",
  "dhat",
  "futures-util",

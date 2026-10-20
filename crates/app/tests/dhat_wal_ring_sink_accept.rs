@@ -13,7 +13,7 @@
 //!
 //! This file runs the REAL code: a real `WsFrameSpill` with its writer thread,
 //! a real `RingByteBudget`, the real tokio channel type the boot site builds
-//! (`tokio::sync::mpsc::channel::<CapturedFrame>(FRAME_RING_CAPACITY)`), and
+//! (`tickvault_core::websocket::frame_ring::frame_ring::<CapturedFrame>(FRAME_RING_CAPACITY)`), and
 //! the production metrics recorder installed so every counter handle is a real
 //! one, not a no-op.
 //!
@@ -23,15 +23,16 @@
 //!   received and released. The WAL writer thread's per-record work is inside
 //!   the window too (the arm waits until `persisted_count` catches up). Budget:
 //!   the house 8 blocks / 1 KiB for 10,000 calls.
-//! * **Backlog** — no consumer: 4,096 frames queue in the ring. A tokio
-//!   bounded `mpsc` stores items in a linked list of 32-slot blocks
-//!   (`BLOCK_CAP = 32`, tokio `sync/mpsc/block.rs` `grow`), so a backlog
-//!   allocates one block per 32 queued frames on the socket reader task. That
-//!   is a real allocation and this arm MEASURES it rather than hiding it: it
-//!   asserts the growth stays at one block per 32 frames (plus a small slack)
-//!   and prints the measured number. Blocks are reused once the drain catches
-//!   up. Replacing the ring with a pre-allocated array channel (as audit N2 did
-//!   for the seal queue) is a separate, larger change.
+//! * **Backlog** — no consumer: 4,096 frames queue in the ring. Until
+//!   2026-10-20 the ring was a tokio bounded `mpsc`, which grows in 32-slot
+//!   blocks, so this arm measured one block per 32 queued frames on the socket
+//!   reader task. The ring is now `frame_ring` (audit M1, 2026-10-20): a
+//!   pre-allocated array plus a `Notify`, so the backlog is held to the same
+//!   house budget as the steady state.
+//!
+//! **⚠ CHANGED 2026-10-20 (audit M1):** the notes below describe the tokio
+//! ring this file measured until then; they are kept as history. The
+//! re-backlog arm now asserts the house budget too.
 //!
 //! **⚠ CORRECTED 2026-10-11 (review of HOT-1).** Two things above were wrong
 //! or missing. (1) "Blocks are reused once the drain catches up" is false: in
@@ -79,15 +80,11 @@ const SHED_FRAMES: usize = 4_096;
 /// Attempts `measure_with_phantom_retry` may make, so every attempt gets
 /// fresh frames.
 const MEASURE_ATTEMPTS: usize = 3;
-/// Spare blocks a drained tokio `mpsc` keeps (`reclaim_block` tries 3 times),
-/// plus slack: a re-backlog must allocate at least this many fewer blocks
-/// than one per 32 frames to count as "blocks were reused".
-const REBACKLOG_REUSE_SLACK_BLOCKS: u64 = 8;
-/// tokio 1.53 `sync::mpsc` block size (`BLOCK_CAP`).
-const TOKIO_MPSC_BLOCK_CAP: usize = 32;
-/// One block per 32 queued frames, plus a little slack for the tail block
-/// already partly used and for one cross-thread phantom.
-const BACKLOG_BUDGET_BLOCKS: u64 = BACKLOG_FRAMES.div_ceil(TOKIO_MPSC_BLOCK_CAP) as u64 + 4;
+/// A backlog of any depth is held to the same house budget as the steady
+/// state since the ring became a pre-allocated array (2026-10-20, audit M1).
+/// Under the old tokio `mpsc` it took one block per 32 queued frames.
+const BACKLOG_BUDGET_BYTES: u64 = STEADY_BUDGET_BYTES;
+const BACKLOG_BUDGET_BLOCKS: u64 = STEADY_BUDGET_BLOCKS;
 
 fn temp_wal_dir(tag: &str) -> std::path::PathBuf {
     let nanos = SystemTime::now()
@@ -134,15 +131,15 @@ fn wait_persisted(spill: &WsFrameSpill, target: u64) {
 }
 
 #[test]
-fn dhat_wal_ring_sink_accept_steady_state_allocates_nothing_and_backlog_grows_one_block_per_32_frames()
- {
+fn dhat_wal_ring_sink_accept_allocates_nothing_in_steady_state_backlog_or_shed() {
     // The production recorder, BEFORE the sink resolves its counter handles.
     let recorder = PrometheusBuilder::new().build_recorder();
     metrics::set_global_recorder(recorder).expect("no recorder installed yet");
 
     let dir = temp_wal_dir("accept");
     let spill = Arc::new(WsFrameSpill::new(&dir).expect("WsFrameSpill::new"));
-    let (ring_tx, mut ring_rx) = tokio::sync::mpsc::channel::<CapturedFrame>(FRAME_RING_CAPACITY);
+    let (ring_tx, mut ring_rx) =
+        tickvault_core::websocket::frame_ring::frame_ring::<CapturedFrame>(FRAME_RING_CAPACITY);
     // The boot site builds per-class budgets with `with_slot_cap`; the main
     // feed's share is smaller than this, but the code path is the same.
     let budget = Arc::new(RingByteBudget::with_slot_cap(
@@ -164,7 +161,8 @@ fn dhat_wal_ring_sink_accept_steady_state_allocates_nothing_and_backlog_grows_on
     //   bytes: an 8-byte budget refuses every 16-byte frame (BytesFull);
     //   slots: a 0-slot budget refuses every frame (SlotsFull);
     //   send:  a capacity-1 channel, filled once, refuses at `try_send`.
-    let (bytes_tx, _bytes_rx) = tokio::sync::mpsc::channel::<CapturedFrame>(FRAME_RING_CAPACITY);
+    let (bytes_tx, _bytes_rx) =
+        tickvault_core::websocket::frame_ring::frame_ring::<CapturedFrame>(FRAME_RING_CAPACITY);
     let bytes_budget = Arc::new(RingByteBudget::with_slot_cap(8, usize::MAX));
     let bytes_sink = WalRingSink::new(
         Arc::clone(&spill),
@@ -174,7 +172,8 @@ fn dhat_wal_ring_sink_accept_steady_state_allocates_nothing_and_backlog_grows_on
         DhanEndpointType::MainFeed,
         1,
     );
-    let (slots_tx, _slots_rx) = tokio::sync::mpsc::channel::<CapturedFrame>(FRAME_RING_CAPACITY);
+    let (slots_tx, _slots_rx) =
+        tickvault_core::websocket::frame_ring::frame_ring::<CapturedFrame>(FRAME_RING_CAPACITY);
     let slots_budget = Arc::new(RingByteBudget::with_slot_cap(FRAME_RING_MAX_BYTES, 0));
     let slots_sink = WalRingSink::new(
         Arc::clone(&spill),
@@ -184,7 +183,7 @@ fn dhat_wal_ring_sink_accept_steady_state_allocates_nothing_and_backlog_grows_on
         DhanEndpointType::MainFeed,
         2,
     );
-    let (send_tx, _send_rx) = tokio::sync::mpsc::channel::<CapturedFrame>(1);
+    let (send_tx, _send_rx) = tickvault_core::websocket::frame_ring::frame_ring::<CapturedFrame>(1);
     let send_budget = Arc::new(RingByteBudget::with_slot_cap(
         FRAME_RING_MAX_BYTES,
         FRAME_RING_CAPACITY,
@@ -254,7 +253,7 @@ fn dhat_wal_ring_sink_accept_steady_state_allocates_nothing_and_backlog_grows_on
                 let outcome = sink.accept(frame.clone());
                 assert_eq!(outcome, FrameSinkOutcome::Captured);
                 let got = ring_rx.try_recv();
-                assert!(got.is_ok(), "frame must be in the ring");
+                assert!(got.is_some(), "frame must be in the ring");
                 drop(got);
                 budget.release(len);
             }
@@ -287,13 +286,14 @@ fn dhat_wal_ring_sink_accept_steady_state_allocates_nothing_and_backlog_grows_on
     let b_bytes = after.total_bytes.saturating_sub(before.total_bytes);
     eprintln!(
         "dhat_wal_ring_sink_accept: backlog of {BACKLOG_FRAMES} frames allocated {b_bytes} B / \
-         {b_blocks} blocks (tokio grows the ring in {TOKIO_MPSC_BLOCK_CAP}-slot blocks)"
+         {b_blocks} blocks"
     );
     assert!(
-        b_blocks <= BACKLOG_BUDGET_BLOCKS,
-        "a ring backlog of {BACKLOG_FRAMES} frames allocated {b_blocks} blocks, more than one \
-         per {TOKIO_MPSC_BLOCK_CAP} queued frames (budget {BACKLOG_BUDGET_BLOCKS}): something \
-         beyond the channel's block growth now allocates per frame"
+        b_bytes <= BACKLOG_BUDGET_BYTES && b_blocks <= BACKLOG_BUDGET_BLOCKS,
+        "a ring backlog of {BACKLOG_FRAMES} frames allocated {b_bytes} B / {b_blocks} blocks \
+         (budget {BACKLOG_BUDGET_BYTES} B / {BACKLOG_BUDGET_BLOCKS} blocks). The frame ring is a \
+         pre-allocated array; a growable channel (tokio mpsc) on this path allocates per 32 \
+         queued frames on the socket read task"
     );
 
     // Drain the backlog so the ring and the budget end empty.
@@ -307,9 +307,9 @@ fn dhat_wal_ring_sink_accept_steady_state_allocates_nothing_and_backlog_grows_on
     wait_persisted(&spill, persisted_target);
     next += BACKLOG_FRAMES;
 
-    // ---- Arm B2: re-backlog after a full drain. If tokio kept the drained
-    // blocks this would allocate (almost) nothing; it keeps about 3, so a
-    // second backlog of the same size allocates about as many blocks again.
+    // ---- Arm B2: re-backlog after a full drain. The old tokio ring freed
+    // all but about 3 drained blocks, so a second backlog allocated again;
+    // the array ring reuses its slots and must allocate nothing.
     let rebacklog = &frames[next..next + BACKLOG_FRAMES];
     let before = dhat::HeapStats::get();
     for frame in rebacklog {
@@ -320,19 +320,12 @@ fn dhat_wal_ring_sink_accept_steady_state_allocates_nothing_and_backlog_grows_on
     let r_bytes = after.total_bytes.saturating_sub(before.total_bytes);
     eprintln!(
         "dhat_wal_ring_sink_accept: re-backlog of {BACKLOG_FRAMES} frames after a full drain \
-         allocated {r_bytes} B / {r_blocks} blocks (the drained blocks were freed, not kept)"
-    );
-    let per_32 = BACKLOG_FRAMES.div_ceil(TOKIO_MPSC_BLOCK_CAP) as u64;
-    assert!(
-        r_blocks <= BACKLOG_BUDGET_BLOCKS,
-        "a re-backlog of {BACKLOG_FRAMES} frames allocated {r_blocks} blocks (budget \
-         {BACKLOG_BUDGET_BLOCKS})"
+         allocated {r_bytes} B / {r_blocks} blocks"
     );
     assert!(
-        r_blocks + REBACKLOG_REUSE_SLACK_BLOCKS >= per_32,
-        "a re-backlog allocated only {r_blocks} blocks against {per_32} needed: tokio now keeps \
-         drained ring blocks, so the 'blocks are freed, every backlog allocates again' notes in \
-         pool_supervisor.rs and this file are stale and must be corrected"
+        r_bytes <= BACKLOG_BUDGET_BYTES && r_blocks <= BACKLOG_BUDGET_BLOCKS,
+        "a re-backlog of {BACKLOG_FRAMES} frames allocated {r_bytes} B / {r_blocks} blocks \
+         (budget {BACKLOG_BUDGET_BYTES} B / {BACKLOG_BUDGET_BLOCKS} blocks)"
     );
     for frame in rebacklog {
         let got = ring_rx.try_recv().expect("re-backlog frame in ring");
