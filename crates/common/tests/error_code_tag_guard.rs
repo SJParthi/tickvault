@@ -988,7 +988,18 @@ fn carries_code_field(body: &str) -> bool {
 /// are not production.
 #[test]
 fn production_error_scanner_bites() {
-    let src = r##"fn a() {
+    assert_eq!(
+        production_error_sites(SCANNER_BITE_FIXTURE),
+        vec![(2, false), (7, true), (8, true), (14, false)],
+        "the scanner must flag lines 2 and 14, accept lines 7 and 8, skip the \
+         needle string on line 13 and the test module"
+    );
+}
+
+/// The source `production_error_scanner_bites` scans. It lives outside the
+/// test because its column-0 `}` and its own test module would otherwise end
+/// the test body early for any line-based reader of this file.
+const SCANNER_BITE_FIXTURE: &str = r##"fn a() {
     error!(
         exchange_segment_code = 1,
         segment_code = 2,
@@ -1011,13 +1022,6 @@ mod tests {
     }
 }
 "##;
-    assert_eq!(
-        production_error_sites(src),
-        vec![(2, false), (7, true), (8, true), (14, false)],
-        "the scanner must flag lines 2 and 14, accept lines 7 and 8, skip the \
-         needle string on line 13 and the test module"
-    );
-}
 
 #[test]
 fn carries_code_field_matches_only_the_field_named_code() {
