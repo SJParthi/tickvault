@@ -6392,11 +6392,12 @@ ticks,segment=NSE_EQ,feed=dhan security_id=4i 4\n";
     /// The shipped config: 15-day market-data window, pressure archival on at
     /// 2 days (`config/base.toml`).
     fn c1_shipped_retention() -> tickvault_common::config::PartitionRetentionConfig {
-        let mut cfg = tickvault_common::config::PartitionRetentionConfig::default();
-        cfg.market_data_hot_days = 15;
-        cfg.pressure_archive_enabled = true;
-        cfg.pressure_hot_days = 2;
-        cfg
+        tickvault_common::config::PartitionRetentionConfig {
+            market_data_hot_days: 15,
+            pressure_archive_enabled: true,
+            pressure_hot_days: 2,
+            ..Default::default()
+        }
     }
 
     /// Regression (audit C1, 2026-10-20): the age is counted from the END of
