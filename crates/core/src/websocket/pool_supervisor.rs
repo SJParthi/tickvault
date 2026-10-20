@@ -1046,14 +1046,15 @@ impl FrameSilenceGate {
     /// Whether frame silence counts right now.
     ///
     /// The IST arm reads the wall clock ONCE per call — on the 1 s idle poll,
-    /// never per frame — through [`tickvault_common::market_hours::now_ist_secs_of_day`].
+    /// never per frame — through [`super::silence_calendar::session_secs_of_day_now`]
+    /// (shut all day on a non-trading day, 2026-10-20).
     #[must_use]
     pub fn is_open(self) -> bool {
         match self {
             Self::AlwaysOn => true,
             Self::Off => false,
             Self::ContinuousSessionIst => {
-                self.is_open_at(tickvault_common::market_hours::now_ist_secs_of_day())
+                self.is_open_at(super::silence_calendar::session_secs_of_day_now())
             }
         }
     }
@@ -5468,10 +5469,11 @@ impl ConnectionSupervisor {
         if self.watchdog.is_expired(now) {
             return self.on_event(ConnEvent::IdleElapsed, now);
         }
-        // The ONE wall-clock read, and only for the IST gate.
+        // The wall-clock reads, only for the IST gate. 2026-10-20: two, and
+        // midnight (shut) all day on a non-trading day (silence_calendar).
         let secs_of_day = match self.frame_silence_gate {
             FrameSilenceGate::ContinuousSessionIst => {
-                tickvault_common::market_hours::now_ist_secs_of_day()
+                super::silence_calendar::session_secs_of_day_now()
             }
             FrameSilenceGate::AlwaysOn | FrameSilenceGate::Off => 0,
         };

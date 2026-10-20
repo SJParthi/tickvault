@@ -4794,9 +4794,9 @@ impl LiveIngest {
         fast_path: FrameSilenceFastPath,
     ) -> u32 {
         use tickvault_core::websocket::pool_supervisor as ps;
-        let gate_open = FrameSilenceGate::ContinuousSessionIst
-            .confirmed_window_open_at(tickvault_common::market_hours::now_ist_secs_of_day())
-            && !ps::overflow_episode_engaged()
+        let gate_open = FrameSilenceGate::ContinuousSessionIst.confirmed_window_open_at(
+            tickvault_core::websocket::silence_calendar::session_secs_of_day_now(),
+        ) && !ps::overflow_episode_engaged()
             && !ps::rotation_halted();
         self.check_depth200_cross_feed_with(
             now_millis,
@@ -17525,6 +17525,11 @@ pub fn spawn_dhan_feed_stack(params: DhanFeedStackParams) -> Option<tokio::task:
         // test; the first calendar stays authoritative either way.
         tracing::debug!("Dhan lane trading calendar was already installed — keeping the first");
     }
+    // 2026-10-20: the frame-silence gate reads it too, so no socket is
+    // redialled for data silence on a holiday. Set before any socket dials.
+    let _ = tickvault_core::websocket::silence_calendar::install_silence_calendar(Arc::clone(
+        &params.calendar,
+    ));
     Some(tokio::spawn(run_dhan_feed_stack(params)))
 }
 
