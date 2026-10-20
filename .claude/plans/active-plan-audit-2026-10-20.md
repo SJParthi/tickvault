@@ -110,6 +110,48 @@ IST, because its gate checked the time of day only.
     test_override_on_evidence_opens_a_holiday_only_when_streaming,
     test_session_secs_of_day_now_overrules_a_holiday_while_streaming
 
+### PR I — depth-200 10-minute minimum hold (app) — live finding
+
+Found by the 2026-10-20 live log read (read-only, 14, 15, 16 and 19 Oct):
+depth-200 swapped about 1,200 times a day, about 2 frames per swap. Owner
+tapped "Hold 10 min (Recommended)" on 2026-10-20; rule recorded in
+`websocket-connection-scope-lock.md` "2026-10-20 — DEPTH-200 HOLDS A SWAPPED-IN
+CONTRACT FOR AT LEAST 10 MINUTES".
+
+- [x] I1. A contract the steering loop swaps onto a depth-200 socket is not
+  swapped off for 600 s (`DEPTH200_MIN_HOLD_SECS`, a constant: the rule REJECTs
+  any other value). `Depth200HoldBook` keeps each socket's swap-in instant
+  (monotonic, stamped after `apply_decision` returns; compared against a
+  reading taken after the probe block) and the one before it, so a refused,
+  reverted swap gets its original time back. `locked_mask` gives the planner
+  the locked socket's underlying, so a same-underlying candidate is never put
+  on a second socket (the 2026-09-24 "top 5 distinct underlyings" rule).
+  Candidates the hold keeps waiting are `held_back` (logged), never
+  `unplaced` / `socket_empty`. An empty socket, a dial-placed contract and a
+  contract gone from the eligible set (not a stock option in today's
+  contract-to-underlying map) are never held. Caps, `ROTATION_HALTED`, 805
+  handling, the silent-swap resubscribe, depth-20 and the main feed unchanged;
+  no new alarm, page, filter or EMF name (`min_hold` is a local `/metrics`
+  label value on the existing counter).
+  - Files: crates/app/src/depth200_min_hold.rs, crates/app/src/depth200_ranked_steer.rs,
+    crates/app/src/depth_rebalance.rs, crates/app/src/lib.rs, CLAUDE.md
+  - Tests: test_depth200_min_hold_keeps_a_contract_for_600s,
+    test_depth200_min_hold_releases_after_600s,
+    test_depth200_min_hold_never_blocks_an_empty_socket,
+    test_depth200_min_hold_drops_an_ineligible_contract,
+    test_depth200_held_underlying_needs_a_stock_option_in_todays_map,
+    test_depth200_hold_book_observe_restores_the_prior_swap_in_on_a_revert,
+    test_depth200_hold_book_revert_restores_the_original_swap_in_inside_the_hold,
+    test_depth200_hold_book_note_sent_swaps_skips_a_swap_that_was_not_queued,
+    test_depth200_hold_book_locked_mask_is_false_for_a_mismatched_or_short_book,
+    proptest_depth200_min_hold_no_socket_changes_twice_within_600s,
+    plan_ranked_minute_skips_a_min_hold_socket_and_funds_the_next,
+    a_held_contract_keeps_its_underlying_so_a_same_name_candidate_is_not_placed_elsewhere,
+    the_planner_peeks_then_caps_then_consumes
+  - Rollback: revert the PR. There is deliberately NO runtime switch: the
+    2026-10-20 REJECT list bars a hold other than 600 s without a fresh dated
+    quote, and a switch that turns it off is such a hold.
+
 
 ### PR C — top_volume spill replay window (storage)
 
@@ -171,10 +213,17 @@ pin the frame-arm call; the new DHAT test; `cargo test -p tickvault-app --lib`,
 Revert the PR: the frame arm loses the extra check; the timer arm's 500 ms flush
 still runs whenever it is polled (the pre-PR behaviour).
 
+PR I: revert the PR (no runtime switch, per the 2026-10-20 REJECT row); the
+planner then swaps every minute as before.
+
 ## Observability
 
 No new metric: depth flushes and drops are already counted by the writer and
 `depth_dropped`. The fix shortens a window and adds no failure path.
+
+PR I: one new label value, `outcome="min_hold"`, on the existing local
+`tv_depth200_ranked_swaps_total` (pre-registered at 0; no EMF name, filter or
+alarm); `held_back` and `min_hold` in the existing per-minute steering `info!`.
 
 ## Guarantee matrix
 

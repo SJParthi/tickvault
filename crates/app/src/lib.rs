@@ -92,6 +92,10 @@ pub mod daily_archive_boot;
 pub mod daily_task_marker;
 pub mod depth200_atm;
 pub mod depth200_candidates;
+/// The 2026-10-20 depth-200 minimum hold: a contract swapped onto a socket
+/// stays at least 600 s (scope lock "DEPTH-200 HOLDS A SWAPPED-IN CONTRACT
+/// FOR AT LEAST 10 MINUTES").
+pub mod depth200_min_hold;
 pub mod depth200_ranked_steer;
 pub mod depth20_layout;
 pub mod depth20_name_board;
