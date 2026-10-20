@@ -62,6 +62,9 @@ pub mod pool_budget;
 pub mod pool_supervisor;
 pub mod reader_runtime;
 pub mod reconnect_ladder;
+// 2026-10-20: the frame-silence gate stays shut all day on an NSE holiday or
+// weekend (569 holiday redials on 2026-10-20 measured the gap).
+pub mod silence_calendar;
 // 2026-10-13: a depth-200 swap whose new contract never streams is
 // resubscribed in place once at 90 s (scope lock, same date).
 pub mod silent_swap;

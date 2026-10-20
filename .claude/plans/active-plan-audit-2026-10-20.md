@@ -9,7 +9,7 @@ path, storage and audit, hostile review of the last 8 commits, zero-tick-loss an
 reconnect paths, build run, branch check). One PR per lettered group, serially
 (pr-completion-protocol.md).
 
-Crates touched across the plan: `tickvault-app` (crates/app), `tickvault-storage`
+Crates touched across the plan: `tickvault-app` (crates/app), `tickvault-core` (crates/core), `tickvault-storage`
 (crates/storage), `tickvault-common` (crates/common/tests guards), `tickvault-trading`
 (crates/trading, risk only; indicator/ and strategy/ need their own §28 approval).
 
@@ -91,6 +91,25 @@ fall count on every flat poll, so it never released from late morning to
     A second review found re-arm pages every 8-11 polls on uneven steps and the
     watermark trusting a staircase release: pages now wait an hour inside one
     episode, and the watermark keeps the old two-falls-in-a-row rule.
+
+### PR H — no data-silence redial on a weekend or NSE holiday (core, app) — live finding
+
+Found by the 2026-10-20 live AWS check (read-only): on the Dussehra holiday the
+frame-silence watchdog redialled every socket 569 times between 09:15 and 15:30
+IST, because its gate checked the time of day only.
+
+- [x] H1. The silence gate reads the trading calendar (`tickvault-core`
+  `silence_calendar`); a weekend or NSE holiday keeps the data-silence redials
+  and the 805 probe window shut, unless at least 3 sockets delivered data in
+  the last 10 s (hostile review HIGH: a wrong calendar on an open market).
+  - Files: crates/core/src/websocket/silence_calendar.rs, crates/core/src/websocket/mod.rs,
+    crates/core/src/websocket/pool_supervisor.rs, crates/app/src/dhan_feed_stack.rs
+  - Tests: test_holiday_suppresses_the_silence_redial_but_not_the_ping_watchdog,
+    test_holiday_leaves_close_code_handling_unchanged,
+    test_market_is_streaming_needs_three_fresh_sockets,
+    test_override_on_evidence_opens_a_holiday_only_when_streaming,
+    test_session_secs_of_day_now_overrules_a_holiday_while_streaming
+
 
 ### PR C — top_volume spill replay window (storage)
 
