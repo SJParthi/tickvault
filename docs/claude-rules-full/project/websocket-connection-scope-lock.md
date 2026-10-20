@@ -9427,3 +9427,40 @@ once per IST day. Hostile review the same day: when at least 3 sockets delivered
 data in the last 10 s the market is open whatever the calendar says (a moved
 holiday, a special session, the run-anyway marker), so the gate reads the real
 time of day.
+
+### 2026-10-20 — DEPTH-200 HOLDS A SWAPPED-IN CONTRACT FOR AT LEAST 10 MINUTES
+
+Measured 2026-10-20 from the live logs (read-only), 14, 15, 16 and 19 Oct:
+depth-200 swapped about 1,200 times a day (1,252 "live subscription swapped"
+lines on 19 Oct), each socket held 112–151 different contracts a day, and a
+socket received about 2 frames per swap (pool 0, 10:00–15:00 on 19 Oct: 408
+frames, 203 swaps). The five depth-200 sockets delivered 5,532 frames on 19 Oct
+against 446,187 on depth-20. A held busy contract streams fast (c13 on 19 Oct,
+about 110 frames a minute at 09:15–09:30), so the churn, not the vendor, is why
+depth-200 carried mostly opening snapshots.
+
+Owner, 2026-10-20, asked "Depth-200 sockets switch contract about every 90
+seconds, so each contract gets about 2 snapshots instead of a continuous
+200-level book. How should depth-200 pick its 5 contracts?", tapped **"Hold 10
+min (Recommended)"**: "Keep the top-5-by-1-minute-volume rule, but once a
+contract is on a socket it stays at least 10 minutes. About 6 switches per
+socket per hour instead of about 40, so each held contract streams its full
+book."
+
+The rule: the 2026-09-24 ranking (top 5 distinct stock-option underlyings by
+1-minute volume, re-ranked every minute) and the 2026-10-01 in-place swap
+mechanism stay. A contract swapped onto a depth-200 socket is not swapped off
+for at least 600 s (`DEPTH200_MIN_HOLD_SECS`), counted from its swap-in. The
+per-socket and pool-wide caps, `ROTATION_HALTED`, the 805 handling and the
+silent-swap resubscribe (2026-10-13) are unchanged. A socket that holds no
+contract, or whose contract is gone from the board's eligible set (expired,
+not tradable), is not held by this rule.
+
+REJECT:
+- A minimum hold below 600 s, or a hold longer than 600 s, without a fresh
+  dated quote here.
+- Applying the hold to depth-20 or the main feed.
+- A hold that blocks the first fill of an empty socket, or keeps an expired
+  contract.
+- Raising any swap cap or touching `ROTATION_HALTED` under this quote.
+- Any new alarm, page, metric filter or EMF name for it.
