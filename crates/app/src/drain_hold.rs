@@ -391,6 +391,7 @@ pub fn spawn_drain_hold_supervisor(environment: String) -> tokio::task::JoinHand
         let mut progress = ProgressTracker::default();
         let mut stall_reported = false;
         let mut put_failing = false;
+        let mut evening_state_bad = false;
         loop {
             let secs_ist = crate::dhan_feed_stack::now_ist_secs_of_day();
             if !in_hold_window(secs_ist) {
@@ -417,10 +418,14 @@ pub fn spawn_drain_hold_supervisor(environment: String) -> tokio::task::JoinHand
                 (
                     measure_day_work(day),
                     crate::evening_drain::load_state(evening_path),
+                    crate::daily_task_marker::daily_marker_exists(
+                        crate::dhan_live_crossverify_boot::CROSSVERIFY_MARKER_TASK,
+                        day,
+                    ),
                 )
             })
             .await;
-            let (mut work, evening) = match measured {
+            let (mut work, evening, xverify_marker) = match measured {
                 Ok(pair) => pair,
                 Err(err) => {
                     // Not measured means not refreshed: repeated, the hold lapses.
@@ -444,18 +449,47 @@ pub fn spawn_drain_hold_supervisor(environment: String) -> tokio::task::JoinHand
                 tickvault_core::notification::source_badge::RuntimeSource::Aws
             );
             let evening_day = chrono::Datelike::num_days_from_ce(&day);
-            let evening_step = if on_aws {
-                crate::evening_drain::evening_step(
+            if evening.is_none() && !evening_state_bad {
+                evening_state_bad = true;
+                error!(
+                    code = ErrorCode::DrainHold01NotWritten.code_str(),
+                    source = "evening_drain_state",
+                    path = crate::evening_drain::EVENING_DRAIN_STATE_PATH,
+                    "evening drain: the state file cannot be read, so no restart is made (its \
+                     count could not be kept); the WAL backlog waits for the next boot"
+                );
+            }
+            let evening_step = match evening {
+                Some(evening) if on_aws => crate::evening_drain::evening_step(
                     &evening,
                     evening_day,
                     work.is_done(),
+                    crate::evening_drain::crossverify_settled(xverify_marker, secs_ist),
                     work.wal_backlog,
                     now_unix,
                     secs_ist,
-                )
-            } else {
-                crate::evening_drain::EveningStep::Idle
+                ),
+                _ => crate::evening_drain::EveningStep::Idle,
             };
+            if let Some(evening) = evening.filter(|e| {
+                evening_step == crate::evening_drain::EveningStep::GaveUp
+                    && !(e.day == evening_day && e.gave_up)
+            }) {
+                // Latch the verdict so it cannot flip back as the count moves.
+                let latched = crate::evening_drain::state_for_give_up(&evening, evening_day);
+                let stored = tokio::task::spawn_blocking(move || {
+                    crate::evening_drain::store_state(evening_path, &latched)
+                })
+                .await;
+                if matches!(stored, Ok(Ok(()))) {
+                    info!(
+                        left = %work.left_text(),
+                        restarts = evening.restarts,
+                        "evening drain: no more restarts tonight (cap, clock or no progress); the \
+                         WAL backlog no longer holds the box and waits for the next boot"
+                    );
+                }
+            }
             work.wal_holding = evening_step.holds();
             let pass_rows = crate::dhan_feed_stack::deferred_depth_pass::pass_rows_written_total();
             let stalled = progress.observe(&work, pass_rows, now_unix);
@@ -532,7 +566,9 @@ pub fn spawn_drain_hold_supervisor(environment: String) -> tokio::task::JoinHand
                             );
                         }
                         // A fresh hold is in place: restart now if due.
-                        if restart_now && action == HoldAction::Hold {
+                        if let Some(evening) =
+                            evening.filter(|_| restart_now && action == HoldAction::Hold)
+                        {
                             request_evening_restart(&evening, evening_day, &work, now_unix).await;
                         }
                     }
