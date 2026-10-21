@@ -6526,3 +6526,55 @@ Revert the commit. No schema, data or config change.
 Existing: `tv_questdb_wal_apply_lag_max`, `tv_depth_flush_offloaded_total`, `tv_wal_deferred_depth_rows_total{outcome}` (new outcome value `pre_switch_to_book`, local `/metrics` only), the pass summary log line. No alarm, filter, EMF name or page.
 
 Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
+
+## ITEM 58 — Same-day drain: the box stays up after the close until the day's data is in the database (added 2026-10-21, operator Quote 31: "go ahead dude make the change … until or unelss movign all tehse dtaa to db never evr shut down" and "evryday move shdou lbe finsihed withint that day")
+
+**Status:** APPROVED by the operator in session (2026-10-21, "go ahead dude make the change"). Quote recorded first in `docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md` §0 Quote 31, summary stub and `aws-budget.md` cost note.
+
+**Why (MEASURED 2026-10-21):** the 20 Oct after-close depth pass wrote 3,067,442,594 rows (its first full run after the 14–16 Oct latch fault), paced only on a GROWING lag, so QuestDB went 0 → 6,758 transactions behind; the 17:30 stop left ~6,000 unapplied; the 21 Oct boot started 4,440 behind, the boot replay added 18.5M depth rows, the disk sat at its 500 MiB/s limit 08:35–09:55, tick flushes were rescued to spill every few seconds and depth was shed 09:05–09:08 and 09:20–09:33. Raising disk throughput was offered and declined by the owner.
+
+- [x] 58a — Absolute apply-lag reading in process. `ingest_shed::{publish_wal_apply_lag_max, publish_wal_apply_lag_unknown, wal_apply_lag_max, wal_suspended_tables}` (unknown = `u64::MAX`, reads as not done); published by `wal_suspension_watcher` on every complete poll, unknown on a partial poll or a blind probe. Tests: `test_publish_wal_apply_lag_max_reads_back_and_unknown_withdraws_it`.
+  - Files: crates/common/src/ingest_shed.rs, crates/storage/src/wal_suspension_watcher.rs
+- [x] 58b — Idle seal of the open WAL segment on request. `wal_idle_seal::request_idle_seal(wal_dir)` (its own module: `ws_frame_spill.rs` is at its size pin): the writer closes its open segment in its next lull (empty-channel poll), so the session's last bucket is no longer carried a day. Per-directory request list (one load per poll when idle). Tests: `test_request_idle_seal_closes_the_open_segment_and_the_next_frame_opens_a_new_one`, `every_segment_finalisation_syncs_including_the_rotation` (now four arms).
+  - Files: crates/storage/src/ws_frame_spill.rs, crates/storage/src/wal_idle_seal.rs, crates/storage/src/lib.rs
+- [x] 58c — The after-close depth pass runs through the night. Window `[15:45, 07:15)` wrapping midnight (`in_after_close_window`); pauses while the backlog is above `AFTER_CLOSE_APPLY_LAG_CEILING` (500) or unknown; the supervisor repeats every minute (ten after a no-progress round), seals the open segment first, skips the writer when nothing is marked, and publishes `last_pass_retryable_left` (uncertain-neighbour carries do not count). Tests: `test_regression_pass_pauses_on_a_large_backlog_and_runs_past_midnight`, `after_close_pass_stops_before_the_stop_time` (proptest), `secs_until_window_is_zero_inside_and_counts_to_the_afternoon_start`, `retryable_left_ignores_uncertain_carries_but_not_an_early_stop`, `test_publish_pass_outcome_reads_back_via_last_pass_retryable_left`, `next_round_gap_secs_backs_off_only_when_a_round_made_no_progress`, `in_after_close_window_wraps_midnight`.
+  - Files: crates/app/src/dhan_feed_stack/deferred_depth_pass.rs, crates/app/src/dhan_feed_stack.rs
+- [x] 58d — The drain hold. `crates/app/src/drain_hold.rs`: 15:40–07:30 IST, once a minute, `DayWork` (marks, spill folders, today's seal spill, backlog ≤ `DRAIN_HOLD_IDLE_LAG` (10), no suspended table, trusted sink); writes `/tickvault/<env>/drain-hold` `{"v":1,"state":"holding"|"released","until_unix","written_unix","left"}` every 5 min with a 20 min expiry cut at 07:30; releases after two done readings; `DRAIN-HOLD-01` on a failed write (log-sink-only). Spawned from `main.rs` when `TV_ENVIRONMENT` is set. Tests: `is_done_needs_every_part_and_unknown_is_not_done`, `test_regression_a_6000_transaction_backlog_holds_the_box`, `step_refreshes_releases_once_and_reholds`, `hold_until_is_bounded` (proptest), `hold_value_is_the_lambda_contract`, `waiting_spill_files_ignores_empty_and_missing`, `stop_follows_tonights_hold_only_after_a_hold_and_only_out_of_hours`.
+  - Files: crates/app/src/drain_hold.rs, crates/app/src/lib.rs, crates/app/src/main.rs, crates/common/src/error_code.rs, docs/error-runbooks/drain-hold-error-codes.md, .claude/triage/error-rules.yaml
+- [x] 58e — A held evening's stop is scheduled, not "unexpected". `shutdown_class::classify_shutdown_with_deploy_marker` returns `ScheduledStop` for a SIGTERM after a hold this process wrote tonight (evening, night, or up to 07:40 IST).
+  - Files: crates/app/src/shutdown_class.rs
+- [x] 58f — Every scheduled stop honours the hold; the budget stop never does. (Implemented 2026-10-21: lib 663 + guards pass; `drain_hold_wiring_guard` pins the target, both env vars, both IAM reads, and that the budget check and breach stop come before a hold is honoured.) `crates/aws-lambdas/src/drain_hold.rs` verdict (Active / RecentlyHeld / None; ignored 07:30–17:25 IST and more than an hour ahead); start watchdog new mode `daily_stop` (17:30, replaces the direct SSM stop), `stop_check`, `curfew_check`; hard-stop guard out-of-window stop; terraform target + IAM reads + env vars; guard `drain_hold_wiring_guard.rs`.
+  - Files: crates/aws-lambdas/src/drain_hold.rs, crates/aws-lambdas/src/start_watchdog.rs, crates/aws-lambdas/src/hard_stop_guard.rs, deploy/aws/terraform/main.tf, deploy/aws/terraform/start-watchdog-lambda.tf, deploy/aws/terraform/budget-guards.tf
+
+- [x] 58g — Review fixes (2026-10-21, hot-path CLEAN; security 0 critical/0 high; hostile 1 high + 3 medium). (a) The hold is given up after `DRAIN_HOLD_STALL_SECS` (1 h) with no progress (`ProgressTracker`: pass rows written, or any part below its level at the last progress), so a stuck reading cannot hold the box 14 h a night; it re-holds when progress resumes. Tests: `observe_reports_a_stall_only_after_an_hour_without_any_progress`, `observe_never_counts_an_unknown_reading_as_progress`, `observe_counts_a_falling_backlog_after_a_rise_but_not_a_swing`. (b) A held night's quiet-stop window opens at 17:25 IST, not at the first hold write. (c) The pass outcome is forgotten between windows. (d) An empty `wal_tables()` reply is not a zero-backlog reading. (e) A failed measurement is a coded `DRAIN-HOLD-01` error. (f) Lambdas: on an active hold the hard-stop guard checks the budget first and stops on a breach; a quiet stop is quiet only when it succeeds and the box started before the hold was written; the 17:30 stop tries the stop when the instance state is unknown.
+  - Files: crates/app/src/drain_hold.rs, crates/app/src/dhan_feed_stack/deferred_depth_pass.rs, crates/storage/src/wal_suspension_watcher.rs, crates/aws-lambdas/src/hard_stop_guard.rs, crates/aws-lambdas/src/start_watchdog.rs, crates/aws-lambdas/src/drain_hold.rs
+
+### Design (Item 58)
+The app is the only party that knows whether the day's data is in the database, so it publishes that as a short-lived SSM lease; the stop paths only read it. The lease expires on its own (20 min) so a dead app cannot keep the box up, and it can never reach past 07:30 IST, so the 07:35 curfew stops the box and the 08:30 start boots it fresh. The budget stop is evaluated before and independently of the lease. The write-back stops being a fixed 15:45–17:15 job and becomes a loop that keeps going until nothing it can finish is left, paced on the backlog's size so QuestDB is never left thousands of transactions behind.
+
+### Edge Cases (Item 58)
+- No marks, no spill, idle QuestDB at 15:40: released after two readings (15:42); the 17:30 stop proceeds as before.
+- Marks left only next to an unreadable segment: they do not hold the box (`retryable_left` = 0); they expire as before after `UNCERTAIN_CARRY_MAX_DAYS`.
+- Unknown backlog (watcher blind, first minute after boot): holds (not done), and the pass pauses.
+- Hold written, then the app crashes: the lease lapses within 20 min; the next curfew stops the box; the work stays on disk.
+- Work never finishes (QuestDB stuck): held until 07:30; the box is stopped at 07:35 and boots fresh at 08:30.
+- A weekday holiday: the box stops in the morning (holiday gate); no evening.
+- Friday evening: held at most to Saturday 07:30; the weekend guards stop it.
+
+### Failure Modes (Item 58)
+- SSM write fails: `DRAIN-HOLD-01` once per episode; the previous lease keeps the box up until it expires; then the box can stop with work left (nothing lost; next evening).
+- SSM read fails in a Lambda: treated as no hold (stop as before, cost-safe).
+- October budget: at the measured rate October reaches ~$173 without extra hours; the $170 budget stop is not gated and would stop the box for the rest of the month.
+
+### Test Plan (Item 58)
+Unit + property tests named above; storage `ws_frame_spill` idle-seal test and the finalisation source scan; app lib tests for `drain_hold`, `deferred_depth_pass`, `shutdown_class`; Lambda verdict boundary tests and the new wiring guard; common `error_code` crossref/tag/triage guards for `DRAIN-HOLD-01`.
+
+### Rollback (Item 58)
+Revert the PR. With the app reverted no hold is written, so the Lambdas stop the box as before (no hold = stop). The terraform daily_stop target can stay on the Lambda (it stops when no hold exists) or be re-pointed at the SSM automation.
+
+### Observability (Item 58)
+Info lines "drain hold written" / "drain hold released" with what is left; `DRAIN-HOLD-01` on a failed write; the Lambdas log every hold they honour; existing `tv_questdb_wal_apply_lag_max`, `tv_wal_deferred_depth_pass_total{outcome}`, `tv_wal_deferred_depth_rows_total`. No new metric, alarm, filter, EMF name or page (Quote 31).
+
+**Not in this item (honest scope):** the old WAL backlog (1,192 segments waiting on 21 Oct, from 9 Oct onward) is still replayed only at boot, capped at 3,000,000 frames per boot; shrinking it is PR W's work (on this branch, not yet merged) and a post-close replay round is a separate item. Today's data is in the database the same day; old days' false-unapplied segments are not.
+
+Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.

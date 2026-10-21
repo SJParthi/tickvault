@@ -80,7 +80,7 @@
 //! flush faster, and it does not remove backpressure; it arms the existing
 //! relief valve early enough to matter instead of after the volume is full.
 
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 /// Free-space fraction below which inline depth stops being captured.
 pub const SHED_INLINE_DEPTH_BELOW_FREE: f64 = 0.15;
@@ -282,6 +282,49 @@ pub fn publish_wal_apply_lag_growing(tables: usize) {
 #[must_use]
 pub fn wal_apply_lag_growing() -> u32 {
     WAL_APPLY_LAG_GROWING_TABLES.load(Ordering::Relaxed)
+}
+
+/// "Not measured": no parsed poll yet, or the watcher's probe went blind.
+pub const WAL_APPLY_LAG_UNKNOWN: u64 = u64::MAX;
+
+/// The largest WAL apply lag (sequencer minus writer transactions) of any
+/// table at the watcher's last parsed poll, and the count of suspended
+/// tables. Operator Quote 31 (2026-10-21): the after-close work paces on the
+/// SIZE of the backlog, not only on whether it is growing, and the box may
+/// stop only once the backlog is back to zero. Unlike the growing count
+/// above, the start value is [`WAL_APPLY_LAG_UNKNOWN`]: here "unknown" must
+/// read as "not done", the direction that keeps the box up.
+static WAL_APPLY_LAG_MAX: AtomicU64 = AtomicU64::new(WAL_APPLY_LAG_UNKNOWN);
+static WAL_SUSPENDED_TABLES: AtomicU64 = AtomicU64::new(WAL_APPLY_LAG_UNKNOWN);
+
+/// Publishes the largest apply lag and the suspended-table count. Called by
+/// the watcher once per parsed poll; a negative lag (never seen) reads as 0.
+pub fn publish_wal_apply_lag_max(max_lag: i64, suspended_tables: usize) {
+    WAL_APPLY_LAG_MAX.store(u64::try_from(max_lag).unwrap_or(0), Ordering::Relaxed);
+    let suspended = u64::try_from(suspended_tables).unwrap_or(WAL_APPLY_LAG_UNKNOWN);
+    WAL_SUSPENDED_TABLES.store(suspended, Ordering::Relaxed);
+}
+
+/// Marks both readings unknown. Called when the watcher's probe goes blind.
+// TEST-EXEMPT: covered by test_publish_wal_apply_lag_max_reads_back_and_unknown_withdraws_it (one test owns these globals).
+pub fn publish_wal_apply_lag_unknown() {
+    WAL_APPLY_LAG_MAX.store(WAL_APPLY_LAG_UNKNOWN, Ordering::Relaxed);
+    WAL_SUSPENDED_TABLES.store(WAL_APPLY_LAG_UNKNOWN, Ordering::Relaxed);
+}
+
+/// The largest apply lag at the last parsed poll, `None` when unknown. O(1).
+#[must_use]
+pub fn wal_apply_lag_max() -> Option<u64> {
+    let v = WAL_APPLY_LAG_MAX.load(Ordering::Relaxed);
+    (v != WAL_APPLY_LAG_UNKNOWN).then_some(v)
+}
+
+/// Suspended tables at the last parsed poll, `None` when unknown. O(1).
+#[must_use]
+// TEST-EXEMPT: covered by test_publish_wal_apply_lag_max_reads_back_and_unknown_withdraws_it (one test owns these globals).
+pub fn wal_suspended_tables() -> Option<u64> {
+    let v = WAL_SUSPENDED_TABLES.load(Ordering::Relaxed);
+    (v != WAL_APPLY_LAG_UNKNOWN).then_some(v)
 }
 
 /// The WAL-apply-lag half of [`decide_shed_level_all_signals`], in isolation.
@@ -1726,5 +1769,26 @@ mod tests {
             "what is read back must be what the gate decides on"
         );
         publish_wal_apply_lag_growing(0);
+    }
+
+    #[test]
+    fn test_publish_wal_apply_lag_max_reads_back_and_unknown_withdraws_it() {
+        // One test owns these two globals, so no other test races it.
+        publish_wal_apply_lag_unknown();
+        assert_eq!(wal_apply_lag_max(), None, "unknown must never read as 0");
+        assert_eq!(wal_suspended_tables(), None);
+        publish_wal_apply_lag_max(4_440, 0);
+        assert_eq!(wal_apply_lag_max(), Some(4_440));
+        assert_eq!(wal_suspended_tables(), Some(0));
+        publish_wal_apply_lag_max(0, 2);
+        assert_eq!(wal_apply_lag_max(), Some(0));
+        assert_eq!(wal_suspended_tables(), Some(2));
+        // A negative lag is never produced; if it were, it reads as caught up.
+        publish_wal_apply_lag_max(-5, 0);
+        assert_eq!(wal_apply_lag_max(), Some(0));
+        // A blind probe withdraws both readings.
+        publish_wal_apply_lag_unknown();
+        assert_eq!(wal_apply_lag_max(), None);
+        assert_eq!(wal_suspended_tables(), None);
     }
 }

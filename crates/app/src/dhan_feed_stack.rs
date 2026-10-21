@@ -87,7 +87,7 @@ mod catchup_stop;
 // Item 45a (2026-09-29): the after-close pass that writes back order-book rows
 // the ingest shed skipped. A child module so it reuses the drain's own packet
 // walk and depth writers rather than a second copy of either.
-mod deferred_depth_pass;
+pub(crate) mod deferred_depth_pass;
 mod top_volume_threads;
 mod unbacked_depth;
 use std::time::Instant;

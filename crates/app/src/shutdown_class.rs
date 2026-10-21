@@ -257,6 +257,16 @@ pub fn classify_shutdown_with_deploy_marker(
     if planned_deploy_marker && is_aws && signal == "sigterm" {
         return ShutdownClass::PlannedDeployRestart;
     }
+    // Operator Quote 31 (2026-10-21): a box this process held after the
+    // close is stopped by a scheduled check once the hold ends, at any time
+    // up to 07:35 IST — not only in the 17:25–17:45 window. Without this
+    // every held evening would page "Unexpected stop".
+    if is_aws
+        && signal == "sigterm"
+        && crate::drain_hold::stop_follows_tonights_hold(ist_secs_of_day)
+    {
+        return ShutdownClass::ScheduledStop;
+    }
     classify_shutdown(signal, is_aws, ist_secs_of_day, is_weekday, is_trading_day)
 }
 

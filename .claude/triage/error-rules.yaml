@@ -2191,6 +2191,25 @@ rules:
       ticks dedup key carries capture_seq). No auto-action: the blocking
       condition is already resolved by the quarantine itself.
 
+  # DRAIN-HOLD-01 = the after-close drain hold could not be written to SSM
+  # (operator Quote 31, 2026-10-21). The box may then be stopped with the
+  # day's write-back unfinished. Nothing is lost (marks, spill files and WAL
+  # segments stay on disk for the next evening), so this is log-and-watch:
+  # the operator checks the instance role's SSM write grant if it repeats.
+  - name: drain-hold-01-not-written-escalate
+    match:
+      code: DRAIN-HOLD-01
+    action: escalate
+    runbook_path: docs/error-runbooks/drain-hold-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 1800
+    justification: >-
+      DRAIN-HOLD-01 = the hold that keeps the box up after the close was not
+      written, so the scheduled stops may stop it with work left. No data is
+      lost; the work runs the next evening. Escalate so a repeating SSM
+      permission or throttling fault is fixed. No auto-action: restarting the
+      app would not make SSM accept the write.
+
   # ------------------------------------------------------------------
   # LAMBDA-* — the AWS Lambda operations family (2026-09-05)
   #

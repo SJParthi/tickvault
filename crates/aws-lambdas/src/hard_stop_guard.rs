@@ -148,6 +148,10 @@ pub struct GuardEnv {
     /// stop so the start watchdog, the autopilot and the terraform apply do
     /// not restart the box for the rest of the billing month.
     pub budget_stop_param: String,
+    /// The drain hold (`drain_hold`, operator Quote 31, 2026-10-21), read by
+    /// the OUT-OF-WINDOW stop only. The in-window budget breach stop never
+    /// reads it.
+    pub drain_hold_param: String,
 }
 
 /// Grace: never out-of-window-stop a box within this many minutes of its
@@ -201,8 +205,27 @@ impl GuardEnv {
             budget_stop_param: std::env::var("BUDGET_STOP_PARAM").unwrap_or_else(|_| {
                 crate::budget_stop_latch::DEFAULT_BUDGET_STOP_PARAM.to_string()
             }),
+            drain_hold_param: std::env::var("DRAIN_HOLD_PARAM")
+                .unwrap_or_else(|_| crate::drain_hold::DEFAULT_DRAIN_HOLD_PARAM.to_string()),
         }
     }
+}
+
+/// Read the drain hold (operator Quote 31) for the out-of-window stop. A
+/// failed read is no hold, so the guard stays armed (the cost-safe side).
+pub async fn read_drain_hold<S: SsmApi>(
+    ssm: &S,
+    param: &str,
+    now_utc: DateTime<Utc>,
+) -> crate::drain_hold::DrainHold {
+    let raw = match ssm.get_parameter(param).await {
+        Ok(raw) => Some(raw),
+        Err(exc) => {
+            info!(error = %exc, "drain hold unavailable — no hold");
+            None
+        }
+    };
+    crate::drain_hold::drain_hold_verdict(raw.as_deref(), now_utc.timestamp())
 }
 
 /// One described instance — the fields this guard reads.
@@ -840,6 +863,53 @@ pub async fn run_guard<E: Ec2Api, N: SnsApi, V: EventsApi, C: CeApi, P: SsmApi>(
             "ok": true, "noop": true, "state": state, "skipped": "keep_alive"
         }));
     }
+    // 1b. The drain hold (operator Quote 31, 2026-10-21): the app keeps the
+    //     box up after the close until the day's data is in the database.
+    //     Read HERE only, after the in-window budget path above has returned.
+    //     Never honoured from 07:30 IST to 17:25 IST (`drain_hold`).
+    //
+    //     The budget stop is NEVER gated on the hold (Quote 31 REJECT row):
+    //     before honouring a hold, run the SAME budget evaluation the
+    //     in-window arm runs, with the same effective ceiling, and on a
+    //     breach take the same breach stop (stop, latch, disable the start
+    //     rule, page). A Cost Explorer error keeps the in-window fail-safe
+    //     posture: never stop on it, so the hold is then honoured.
+    let drain_hold = read_drain_hold(ssm, &env.drain_hold_param, now_utc).await;
+    if let crate::drain_hold::DrainHold::Active { until_unix } = drain_hold {
+        let effective_env = GuardEnv {
+            budget_kill_usd: effective_budget_kill_usd(
+                env.budget_kill_usd,
+                now_utc.year(),
+                now_utc.month(),
+            ),
+            ..env.clone()
+        };
+        let usd = mtd_usd(ce, now_utc).await;
+        let action = classify_in_window_action(usd, effective_env.budget_kill_usd);
+        if action == "breach_stop" {
+            // breach_stop implies usd is Some; 0.0 fallback is unreachable.
+            return execute_breach_stop(
+                &effective_env,
+                ec2,
+                sns,
+                events,
+                ssm,
+                usd.unwrap_or(0.0),
+                &state,
+                now_utc,
+            )
+            .await;
+        }
+        info!(
+            until_unix,
+            budget_action = action,
+            "out-of-window guard — drain hold active, budget not breached; leaving the box alone"
+        );
+        return Ok(json!({
+            "ok": true, "noop": true, "state": state, "skipped": "drain_hold",
+            "budget_action": action
+        }));
+    }
     // 2. Launch grace: a box started minutes ago is a deliberate manual
     //    start still being used, not a 17:30 stop that failed. The same
     //    grace the curfew uses, so the two guards cannot disagree on it.
@@ -858,7 +928,21 @@ pub async fn run_guard<E: Ec2Api, N: SnsApi, V: EventsApi, C: CeApi, P: SsmApi>(
     }
 
     // Force stop + alert (the legacy never-cross guard, unchanged by GAP 1).
+    // A failed stop returns the error here (unchanged), so only a SUCCESSFUL
+    // stop can reach the silent branch below.
     ec2.stop_instances(&env.instance_id).await?;
+    if drain_hold.silences_stop_of(inst.launch_time.map(|t| t.timestamp())) {
+        // The box was held tonight, was already running when the hold was
+        // written, and the hold has ended: the expected end of the evening
+        // drain, so no page.
+        info!(
+            was_state = %state,
+            "out-of-window guard — drain hold ended; stopped without a page"
+        );
+        return Ok(json!({
+            "ok": true, "noop": false, "was_state": state, "drain_hold": "ended"
+        }));
+    }
     sns.publish(
         &env.alerts_topic_arn,
         "[BUDGET] hard auto-stop guard fired",
@@ -1096,6 +1180,8 @@ mod tests {
         /// inside or outside the start-grace window deliberately.
         launch_time: DateTime<Utc>,
         stopped: RefCell<Vec<Vec<String>>>,
+        /// When set, `stop_instances` fails (an AccessDenied-style refusal).
+        stop_fails: bool,
     }
 
     impl FakeEc2 {
@@ -1108,7 +1194,13 @@ mod tests {
                 state: state.to_string(),
                 launch_time,
                 stopped: RefCell::new(Vec::new()),
+                stop_fails: false,
             }
+        }
+
+        fn stop_failing(mut self) -> Self {
+            self.stop_fails = true;
+            self
         }
     }
 
@@ -1121,6 +1213,9 @@ mod tests {
         }
 
         async fn stop_instances(&self, instance_id: &str) -> Result<(), String> {
+            if self.stop_fails {
+                return Err("UnauthorizedOperation".to_string());
+            }
             self.stopped
                 .borrow_mut()
                 .push(vec![instance_id.to_string()]);
@@ -1210,8 +1305,12 @@ mod tests {
     /// SSM fake for the change-only ping state (2026-07-09). read_fail /
     /// write_fail simulate outages; EVERY call is recorded so the
     /// breach-path test can prove SSM was never touched.
+    ///
+    /// Keyed on the parameter NAME since 2026-10-21, so the ping state, the
+    /// keep-alive, the budget-stop latch and the drain hold are distinct: a
+    /// value set for one is never what another read receives.
     struct FakeSsm {
-        value: RefCell<Option<String>>,
+        values: RefCell<std::collections::HashMap<String, String>>,
         read_fail: bool,
         write_fail: bool,
         reads: RefCell<u32>,
@@ -1219,37 +1318,58 @@ mod tests {
     }
 
     impl FakeSsm {
-        fn new(value: Option<&str>) -> Self {
+        /// No parameter exists (every read is ParameterNotFound).
+        fn empty() -> Self {
             Self {
-                value: RefCell::new(value.map(str::to_string)),
+                values: RefCell::new(std::collections::HashMap::new()),
                 read_fail: false,
                 write_fail: false,
                 reads: RefCell::new(0),
                 writes: RefCell::new(Vec::new()),
             }
         }
-        fn read_failing(value: Option<&str>) -> Self {
+        fn set(self, name: &str, value: &str) -> Self {
+            self.put_value(name, value);
+            self
+        }
+        fn put_value(&self, name: &str, value: &str) {
+            self.values
+                .borrow_mut()
+                .insert(name.to_string(), value.to_string());
+        }
+        fn keep_alive(self, value: &str) -> Self {
+            self.set(crate::start_watchdog::DEFAULT_KEEP_ALIVE_PARAM, value)
+        }
+        fn drain_hold(self, value: &str) -> Self {
+            self.set(crate::drain_hold::DEFAULT_DRAIN_HOLD_PARAM, value)
+        }
+        /// Every read fails; `ping_state` is the value a read would have
+        /// returned (proving the failure, not an absence, is what is seen).
+        fn read_failing(ping_state: &str) -> Self {
             Self {
                 read_fail: true,
-                ..Self::new(value)
+                ..Self::empty().set(DEFAULT_PING_STATE_PARAM, ping_state)
             }
         }
         fn write_failing() -> Self {
             Self {
                 write_fail: true,
-                ..Self::new(None)
+                ..Self::empty()
             }
         }
     }
 
     impl SsmApi for FakeSsm {
-        async fn get_parameter(&self, _name: &str) -> Result<String, String> {
+        async fn get_parameter(&self, name: &str) -> Result<String, String> {
             *self.reads.borrow_mut() += 1;
-            let value = self.value.borrow().clone();
-            match value {
-                Some(v) if !self.read_fail => Ok(v),
-                _ => Err("ParameterNotFound".to_string()),
+            if self.read_fail {
+                return Err("AccessDenied".to_string());
             }
+            self.values
+                .borrow()
+                .get(name)
+                .cloned()
+                .ok_or_else(|| "ParameterNotFound".to_string())
         }
 
         async fn put_parameter(&self, _name: &str, value: &str) -> Result<(), String> {
@@ -1270,6 +1390,7 @@ mod tests {
             ping_state_param: DEFAULT_PING_STATE_PARAM.to_string(),
             keep_alive_param: crate::start_watchdog::DEFAULT_KEEP_ALIVE_PARAM.to_string(),
             budget_stop_param: crate::budget_stop_latch::DEFAULT_BUDGET_STOP_PARAM.to_string(),
+            drain_hold_param: crate::drain_hold::DEFAULT_DRAIN_HOLD_PARAM.to_string(),
         }
     }
 
@@ -1377,7 +1498,7 @@ mod tests {
             &FakeSns::default(),
             &FakeEvents::new(),
             &FakeCe { amount: Some(1.0) },
-            &FakeSsm::new(None),
+            &FakeSsm::empty(),
             in_window(),
         )
         .await
@@ -1398,7 +1519,7 @@ mod tests {
             &FakeSns::default(),
             &FakeEvents::new(),
             &FakeCe { amount: Some(1.0) },
-            &FakeSsm::new(None),
+            &FakeSsm::empty(),
             in_window(),
         )
         .await
@@ -1434,7 +1555,7 @@ mod tests {
             FakeSns::default(),
             FakeEvents::new(),
         );
-        let ssm = FakeSsm::new(None);
+        let ssm = FakeSsm::empty();
         let out = run_scenario(
             &ec2,
             &sns,
@@ -1502,7 +1623,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
             FakeSns::default(),
             FakeEvents::new(),
         );
-        let ssm = FakeSsm::new(None);
+        let ssm = FakeSsm::empty();
         let out = run_scenario(
             &ec2,
             &sns,
@@ -1528,7 +1649,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
         );
         // Hour 2, same bucket -> silent, no extra write.
         let seeded = ssm.writes.borrow().last().expect("seeded").clone();
-        *ssm.value.borrow_mut() = Some(seeded);
+        ssm.put_value(DEFAULT_PING_STATE_PARAM, &seeded);
         let out2 = run_scenario(
             &ec2,
             &sns,
@@ -1556,7 +1677,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
             FakeSns::default(),
             FakeEvents::new(),
         );
-        let ssm = FakeSsm::new(None);
+        let ssm = FakeSsm::empty();
         let out = run_scenario(
             &ec2,
             &sns,
@@ -1580,7 +1701,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
     async fn test_disable_failure_still_stops_and_pages_honestly() {
         let (ec2, sns) = (FakeEc2::new("running"), FakeSns::default());
         let events = FakeEvents::failing();
-        let ssm = FakeSsm::new(None);
+        let ssm = FakeSsm::empty();
         let out = run_scenario(
             &ec2,
             &sns,
@@ -1605,7 +1726,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
             FakeSns::default(),
             FakeEvents::new(),
         );
-        let ssm = FakeSsm::new(None);
+        let ssm = FakeSsm::empty();
         let out = run_scenario(
             &ec2,
             &sns,
@@ -1630,8 +1751,8 @@ aws events enable-rule --name tv-prod-daily-start\n"
 
     /// 2026-09-08: an operator keep-alive marker that has not yet expired
     /// stops the out-of-window force-stop, exactly as it stops the curfew.
-    /// The FakeSsm serves ONE value for every parameter name, so the marker
-    /// is what `read_keep_alive_until` receives here.
+    /// The FakeSsm is keyed on the parameter name, so the marker is set on
+    /// the keep-alive parameter `read_keep_alive_until` reads.
     #[tokio::test]
     async fn test_out_of_window_keep_alive_override_leaves_the_box_running() {
         let (ec2, sns, events) = (
@@ -1640,7 +1761,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
             FakeEvents::new(),
         );
         // out_of_window() is 2026-07-07 14:00 UTC; the marker runs to 18:00.
-        let ssm = FakeSsm::new(Some("2026-07-07T18:00:00Z"));
+        let ssm = FakeSsm::empty().keep_alive("2026-07-07T18:00:00Z");
         let out = run_scenario(
             &ec2,
             &sns,
@@ -1670,7 +1791,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
             FakeSns::default(),
             FakeEvents::new(),
         );
-        let ssm = FakeSsm::new(Some("2026-07-07T13:00:00Z"));
+        let ssm = FakeSsm::empty().keep_alive("2026-07-07T13:00:00Z");
         let out = run_scenario(
             &ec2,
             &sns,
@@ -1697,7 +1818,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
             FakeSns::default(),
             FakeEvents::new(),
         );
-        let ssm = FakeSsm::new(None);
+        let ssm = FakeSsm::empty();
         let out = run_scenario(
             &ec2,
             &sns,
@@ -1735,7 +1856,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
             FakeSns::default(),
             FakeEvents::new(),
         );
-        let ssm = FakeSsm::new(None);
+        let ssm = FakeSsm::empty();
         let out = run_scenario(
             &ec2,
             &sns,
@@ -1769,21 +1890,21 @@ aws events enable-rule --name tv-prod-daily-start\n"
     /// or unparseable parameter is "no override", never a skip.
     #[tokio::test]
     async fn read_keep_alive_until_treats_missing_and_garbage_as_no_override() {
-        let missing = FakeSsm::new(None);
+        let missing = FakeSsm::empty();
         assert!(
-            read_keep_alive_until(&missing, DEFAULT_PING_STATE_PARAM)
+            read_keep_alive_until(&missing, crate::start_watchdog::DEFAULT_KEEP_ALIVE_PARAM)
                 .await
                 .is_none()
         );
-        let garbage = FakeSsm::new(Some("tomorrow-ish"));
+        let garbage = FakeSsm::empty().keep_alive("tomorrow-ish");
         assert!(
-            read_keep_alive_until(&garbage, DEFAULT_PING_STATE_PARAM)
+            read_keep_alive_until(&garbage, crate::start_watchdog::DEFAULT_KEEP_ALIVE_PARAM)
                 .await
                 .is_none()
         );
-        let good = FakeSsm::new(Some("2026-07-07T18:00:00Z"));
+        let good = FakeSsm::empty().keep_alive("2026-07-07T18:00:00Z");
         assert_eq!(
-            read_keep_alive_until(&good, DEFAULT_PING_STATE_PARAM).await,
+            read_keep_alive_until(&good, crate::start_watchdog::DEFAULT_KEEP_ALIVE_PARAM).await,
             Some(utc(2026, 7, 7, 18, 0))
         );
     }
@@ -1795,7 +1916,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
             FakeSns::default(),
             FakeEvents::new(),
         );
-        let ssm = FakeSsm::new(None);
+        let ssm = FakeSsm::empty();
         let out = run_scenario(
             &ec2,
             &sns,
@@ -1819,7 +1940,9 @@ aws events enable-rule --name tv-prod-daily-start\n"
             FakeSns::default(),
             FakeEvents::new(),
             FakeCe { amount: Some(0.4) },
-            FakeSsm::new(latch),
+            latch.map_or_else(FakeSsm::empty, |l| {
+                FakeSsm::empty().set(crate::budget_stop_latch::DEFAULT_BUDGET_STOP_PARAM, l)
+            }),
         )
     }
 
@@ -1841,7 +1964,10 @@ aws events enable-rule --name tv-prod-daily-start\n"
         );
 
         // The marker never releases again.
-        *ssm.value.borrow_mut() = Some("released-2026-06".to_string());
+        ssm.put_value(
+            crate::budget_stop_latch::DEFAULT_BUDGET_STOP_PARAM,
+            "released-2026-06",
+        );
         let again = run_scenario(&ec2, &sns, &events, &ce, in_window(), &ssm).await;
         assert_eq!(again["released"], json!(false));
         assert_eq!(events.enabled.borrow().len(), 1);
@@ -2012,7 +2138,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
     #[tokio::test]
     async fn test_ssm_read_failure_fails_open_to_ping() {
         // An unreadable state must PING (one ping beats a silent guard).
-        let ssm = FakeSsm::read_failing(Some(&state_json("2026-07", 6)));
+        let ssm = FakeSsm::read_failing(&state_json("2026-07", 6));
         let (ec2, sns, events) = (
             FakeEc2::new("running"),
             FakeSns::default(),
@@ -2106,19 +2232,21 @@ aws events enable-rule --name tv-prod-daily-start\n"
         );
     }
 
-    /// The out-of-window arm reads ONE parameter — the keep-alive marker —
-    /// and never writes. A read-only SSM that fails the read must fall
-    /// through to the stop (fail-CLOSED: an unreadable override is no
-    /// override), and the write path must stay untouched on this arm.
+    /// The out-of-window arm reads the keep-alive marker and (since operator
+    /// Quote 31, 2026-10-21) the drain hold, and never writes. A read-only
+    /// SSM that fails both reads must fall through to the stop (fail-CLOSED:
+    /// an unreadable override is no override), and the write path must stay
+    /// untouched on this arm.
     #[tokio::test]
     async fn test_out_of_window_force_stop_reads_keep_alive_only_and_never_writes_ssm() {
         struct ReadFailsWriteExplodes;
         impl SsmApi for ReadFailsWriteExplodes {
             async fn get_parameter(&self, name: &str) -> Result<String, String> {
-                assert_eq!(
-                    name,
-                    crate::start_watchdog::DEFAULT_KEEP_ALIVE_PARAM,
-                    "the only out-of-window read is the keep-alive marker"
+                assert!(
+                    name == crate::start_watchdog::DEFAULT_KEEP_ALIVE_PARAM
+                        || name == crate::drain_hold::DEFAULT_DRAIN_HOLD_PARAM,
+                    "the only out-of-window reads are the keep-alive marker and \
+                     the drain hold, not {name}"
                 );
                 Err("simulated SSM outage".to_string())
             }
@@ -2222,7 +2350,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
             FakeSns::default(),
             FakeEvents::new(),
         );
-        let ssm = FakeSsm::new(None);
+        let ssm = FakeSsm::empty();
         let out = run_guard(
             &env,
             &ec2,
@@ -2260,7 +2388,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
             FakeSns::default(),
             FakeEvents::new(),
         );
-        let ssm = FakeSsm::new(None);
+        let ssm = FakeSsm::empty();
         let out = run_guard(
             &env,
             &ec2,
@@ -2291,7 +2419,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
             FakeSns::default(),
             FakeEvents::new(),
         );
-        let ssm = FakeSsm::new(None);
+        let ssm = FakeSsm::empty();
         let out = run_guard(
             &env,
             &ec2,
@@ -2308,5 +2436,324 @@ aws events enable-rule --name tv-prod-daily-start\n"
         assert_ne!(out["breach"], json!(true));
         assert!(ec2.stopped.borrow().is_empty());
         assert!(events.disabled.borrow().is_empty());
+    }
+
+    // --- Drain hold (operator Quote 31, 2026-10-21) --------------------------
+
+    fn hold(state: &str, until: DateTime<Utc>, written: DateTime<Utc>) -> String {
+        format!(
+            r#"{{"v":1,"state":"{state}","until_unix":{},"written_unix":{},"left":"wal"}}"#,
+            until.timestamp(),
+            written.timestamp()
+        )
+    }
+
+    #[tokio::test]
+    async fn test_out_of_window_active_drain_hold_leaves_the_box_running() {
+        let now = out_of_window(); // Tue 19:30 IST
+        let (ec2, sns, events) = (
+            FakeEc2::new("running"),
+            FakeSns::default(),
+            FakeEvents::new(),
+        );
+        let ssm = FakeSsm::empty().drain_hold(&hold(
+            "holding",
+            now + Duration::minutes(10),
+            now - Duration::minutes(2),
+        ));
+        let out = run_scenario(
+            &ec2,
+            &sns,
+            &events,
+            &FakeCe { amount: Some(10.0) },
+            now,
+            &ssm,
+        )
+        .await;
+        assert_eq!(out["noop"], json!(true));
+        assert_eq!(out["skipped"], json!("drain_hold"));
+        assert!(ec2.stopped.borrow().is_empty());
+        assert!(sns.published.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_out_of_window_ended_drain_hold_stops_without_a_page() {
+        let now = out_of_window();
+        let (ec2, sns, events) = (
+            FakeEc2::new("running"),
+            FakeSns::default(),
+            FakeEvents::new(),
+        );
+        let ssm = FakeSsm::empty().drain_hold(&hold(
+            "released",
+            now - Duration::minutes(30),
+            now - Duration::minutes(30),
+        ));
+        let out = run_scenario(
+            &ec2,
+            &sns,
+            &events,
+            &FakeCe { amount: Some(10.0) },
+            now,
+            &ssm,
+        )
+        .await;
+        assert_eq!(out["noop"], json!(false));
+        assert_eq!(out["drain_hold"], json!("ended"));
+        assert_eq!(*ec2.stopped.borrow(), vec![vec!["i-tvapp".to_string()]]);
+        assert!(sns.published.borrow().is_empty());
+        assert!(events.disabled.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_out_of_window_stale_drain_hold_keeps_the_existing_page() {
+        let now = out_of_window();
+        let (ec2, sns, events) = (
+            FakeEc2::new("running"),
+            FakeSns::default(),
+            FakeEvents::new(),
+        );
+        let ssm = FakeSsm::empty().drain_hold(&hold(
+            "released",
+            now - Duration::days(1),
+            now - Duration::days(1),
+        ));
+        let out = run_scenario(
+            &ec2,
+            &sns,
+            &events,
+            &FakeCe { amount: Some(10.0) },
+            now,
+            &ssm,
+        )
+        .await;
+        assert_eq!(out["noop"], json!(false));
+        assert!(
+            sns.published.borrow()[0]
+                .message
+                .contains("Hard Auto-Stop Guard Fired")
+        );
+    }
+
+    /// The budget stop is NEVER gated on the hold. 17:28 IST is inside the
+    /// up-window AND inside the hours a hold counts, so a fresh hold exists
+    /// here; the breach still stops, latches, disables and pages, and the
+    /// breach path never even reads SSM.
+    #[tokio::test]
+    async fn test_in_window_breach_ignores_an_active_drain_hold() {
+        let now = utc(2026, 7, 7, 11, 58); // Tue 17:28 IST
+        let (ec2, sns, events) = (
+            FakeEc2::new("running"),
+            FakeSns::default(),
+            FakeEvents::new(),
+        );
+        let ssm = FakeSsm::empty().drain_hold(&hold(
+            "holding",
+            now + Duration::minutes(10),
+            now - Duration::minutes(1),
+        ));
+        assert!(matches!(
+            crate::drain_hold::drain_hold_verdict(
+                Some(&hold(
+                    "holding",
+                    now + Duration::minutes(10),
+                    now - Duration::minutes(1)
+                )),
+                now.timestamp()
+            ),
+            crate::drain_hold::DrainHold::Active { .. }
+        ));
+        let out = run_scenario(
+            &ec2,
+            &sns,
+            &events,
+            &FakeCe {
+                amount: Some(500.0),
+            },
+            now,
+            &ssm,
+        )
+        .await;
+        assert_eq!(out["breach"], json!(true));
+        assert_eq!(*ec2.stopped.borrow(), vec![vec!["i-tvapp".to_string()]]);
+        assert_eq!(*ssm.reads.borrow(), 0);
+        assert_eq!(sns.published.borrow().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_read_drain_hold_fails_toward_no_hold_on_a_read_error() {
+        use crate::drain_hold::{DEFAULT_DRAIN_HOLD_PARAM, DrainHold};
+        let now = out_of_window();
+        let raw = hold("holding", now + Duration::minutes(5), now);
+        assert_eq!(
+            read_drain_hold(
+                &FakeSsm::empty().drain_hold(&raw),
+                DEFAULT_DRAIN_HOLD_PARAM,
+                now
+            )
+            .await,
+            DrainHold::Active {
+                until_unix: (now + Duration::minutes(5)).timestamp()
+            }
+        );
+        assert_eq!(
+            read_drain_hold(&FakeSsm::read_failing(&raw), DEFAULT_DRAIN_HOLD_PARAM, now).await,
+            DrainHold::None
+        );
+        assert_eq!(
+            read_drain_hold(&FakeSsm::empty(), DEFAULT_DRAIN_HOLD_PARAM, now).await,
+            DrainHold::None
+        );
+    }
+
+    /// Review fix (2026-10-21): an ACTIVE hold never shields a budget breach.
+    /// Out of window (19:00 IST) with a fresh hold, a breached month still
+    /// takes the full breach stop: stop, latch, disable the start rule, page.
+    #[tokio::test]
+    async fn test_out_of_window_active_drain_hold_with_a_breach_still_breach_stops() {
+        let now = utc(2026, 7, 7, 13, 30); // Tue 19:00 IST
+        let (ec2, sns, events) = (
+            FakeEc2::new("running"),
+            FakeSns::default(),
+            FakeEvents::new(),
+        );
+        let ssm = FakeSsm::empty().drain_hold(&hold(
+            "holding",
+            now + Duration::minutes(10),
+            now - Duration::minutes(1),
+        ));
+        let out = run_scenario(
+            &ec2,
+            &sns,
+            &events,
+            &FakeCe {
+                amount: Some(500.0),
+            },
+            now,
+            &ssm,
+        )
+        .await;
+        assert_eq!(out["breach"], json!(true));
+        assert_eq!(*ec2.stopped.borrow(), vec![vec!["i-tvapp".to_string()]]);
+        assert_eq!(*ssm.writes.borrow(), vec!["2026-07".to_string()]);
+        assert_eq!(
+            *events.disabled.borrow(),
+            vec!["tv-prod-daily-start".to_string()]
+        );
+        assert_eq!(sns.published.borrow().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_out_of_window_active_drain_hold_below_budget_is_skipped() {
+        let now = utc(2026, 7, 7, 13, 30);
+        let (ec2, sns, events) = (
+            FakeEc2::new("running"),
+            FakeSns::default(),
+            FakeEvents::new(),
+        );
+        let ssm = FakeSsm::empty().drain_hold(&hold(
+            "holding",
+            now + Duration::minutes(10),
+            now - Duration::minutes(1),
+        ));
+        let out = run_scenario(
+            &ec2,
+            &sns,
+            &events,
+            &FakeCe { amount: Some(10.0) },
+            now,
+            &ssm,
+        )
+        .await;
+        assert_eq!(out["skipped"], json!("drain_hold"));
+        assert_eq!(out["budget_action"], json!("below_budget"));
+        assert!(ec2.stopped.borrow().is_empty());
+        assert!(events.disabled.borrow().is_empty());
+        assert!(sns.published.borrow().is_empty());
+    }
+
+    /// A Cost Explorer error keeps the in-window fail-safe posture: it never
+    /// stops the box, so the fresh hold is honoured.
+    #[tokio::test]
+    async fn test_out_of_window_active_drain_hold_with_a_cost_explorer_error_is_skipped() {
+        let now = utc(2026, 7, 7, 13, 30);
+        let (ec2, sns, events) = (
+            FakeEc2::new("running"),
+            FakeSns::default(),
+            FakeEvents::new(),
+        );
+        let ssm = FakeSsm::empty().drain_hold(&hold(
+            "holding",
+            now + Duration::minutes(10),
+            now - Duration::minutes(1),
+        ));
+        let out = run_scenario(&ec2, &sns, &events, &FakeCe { amount: None }, now, &ssm).await;
+        assert_eq!(out["skipped"], json!("drain_hold"));
+        assert_eq!(out["budget_action"], json!("cost_unknown"));
+        assert!(ec2.stopped.borrow().is_empty());
+        assert!(events.disabled.borrow().is_empty());
+        assert!(ssm.writes.borrow().is_empty());
+    }
+
+    /// A box started AFTER the hold record was written is a different
+    /// session: the ended hold does not silence its stop.
+    #[tokio::test]
+    async fn test_out_of_window_ended_drain_hold_does_not_silence_a_later_session() {
+        let now = out_of_window(); // 14:00 UTC
+        let (ec2, sns, events) = (
+            FakeEc2::launched_at("running", utc(2026, 7, 7, 13, 0)),
+            FakeSns::default(),
+            FakeEvents::new(),
+        );
+        let ssm = FakeSsm::empty().drain_hold(&hold(
+            "released",
+            utc(2026, 7, 7, 12, 30),
+            utc(2026, 7, 7, 12, 30),
+        ));
+        let out = run_scenario(
+            &ec2,
+            &sns,
+            &events,
+            &FakeCe { amount: Some(10.0) },
+            now,
+            &ssm,
+        )
+        .await;
+        assert_eq!(out["noop"], json!(false));
+        assert!(out.get("drain_hold").is_none());
+        assert!(
+            sns.published.borrow()[0]
+                .message
+                .contains("Hard Auto-Stop Guard Fired")
+        );
+    }
+
+    /// A FAILED stop is never silenced: it takes the existing failure path
+    /// (the invoke errors, which the Lambda's Errors alarm pages).
+    #[tokio::test]
+    async fn test_out_of_window_ended_drain_hold_failed_stop_is_not_silenced() {
+        let now = out_of_window();
+        let (ec2, sns, events) = (
+            FakeEc2::new("running").stop_failing(),
+            FakeSns::default(),
+            FakeEvents::new(),
+        );
+        let ssm = FakeSsm::empty().drain_hold(&hold(
+            "released",
+            now - Duration::minutes(30),
+            now - Duration::minutes(30),
+        ));
+        let out = run_guard(
+            &test_env(),
+            &ec2,
+            &sns,
+            &events,
+            &FakeCe { amount: Some(10.0) },
+            &ssm,
+            now,
+        )
+        .await;
+        assert!(out.is_err(), "a failed stop must surface, not read as done");
+        assert!(sns.published.borrow().is_empty());
     }
 }

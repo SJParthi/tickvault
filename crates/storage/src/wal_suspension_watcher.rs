@@ -1263,6 +1263,19 @@ pub fn spawn_wal_suspension_watcher(questdb: QuestDbConfig) -> tokio::task::Join
                     // mid-incident); the latch below fires only after a sustained
                     // non-falling window and so cannot answer "how far behind now".
                     emit_wal_apply_lag_gauge(&rows);
+                    // Quote 31: the after-close work reads the backlog SIZE.
+                    // Only a complete view is a measurement; a partial poll
+                    // could hide the worst table, so it reads as unknown.
+                    // An empty reply (QuestDB mid-restart) names no table, so it
+                    // is not a reading of zero either.
+                    if skipped == 0 && !rows.is_empty() {
+                        tickvault_common::ingest_shed::publish_wal_apply_lag_max(
+                            max_apply_lag(&rows),
+                            delta.currently_suspended,
+                        );
+                    } else {
+                        tickvault_common::ingest_shed::publish_wal_apply_lag_unknown();
+                    }
                     if lag_tracker.is_suspicious_empty(&rows) {
                         // The lag twin of the suspension check above: an
                         // empty 2xx while tables are latched stuck is a
@@ -1377,6 +1390,7 @@ pub fn spawn_wal_suspension_watcher(questdb: QuestDbConfig) -> tokio::task::Join
                         // `ingest_shed` documents zero as "not measured", and
                         // that is exactly what this is.
                         tickvault_common::ingest_shed::publish_wal_apply_lag_growing(0);
+                        tickvault_common::ingest_shed::publish_wal_apply_lag_unknown();
                         error!(
                             code = ErrorCode::WalSuspend01TableSuspended.code_str(),
                             source = "probe_blind",

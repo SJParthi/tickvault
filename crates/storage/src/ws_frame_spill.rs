@@ -2545,6 +2545,16 @@ fn writer_loop(
                 // Nothing arrived for a whole poll and the previous batch was
                 // flushed before this wait began: a pending abort drain is done.
                 abort_drain.ack_if_drained(rx);
+                // Quote 31: seal the open segment on request, in a lull only
+                // (`wal_idle_seal`); the next record opens a fresh one.
+                if crate::wal_idle_seal::take_idle_seal_request(wal_dir) && current.is_some() {
+                    let t = &mut tally;
+                    let to = Some(syncer);
+                    finalise_segment(&mut current, "flush_on_seal", "fsync_on_seal", to, t);
+                    bytes_written = 0;
+                    clear_open_segment_under(wal_dir);
+                    info!("ws-frame-spill-writer: idle segment sealed on request");
+                }
                 // A lull. Before 2026-10-02 only a NEW record could trigger the
                 // rate-limited sync, so the last batch before a quiet spell sat in
                 // the page cache until the next record arrived, leaving the
@@ -7531,7 +7541,12 @@ mod tests {
         // All three finalisations go through the ONE helper. Naming them
         // individually is what keeps a future fourth arm from quietly
         // hand-rolling a flush: the count below has to move with it.
-        for stage in ["flush_on_stop", "flush_on_close", "flush_on_rotate"] {
+        for stage in [
+            "flush_on_stop",
+            "flush_on_close",
+            "flush_on_rotate",
+            "flush_on_seal",
+        ] {
             let call = format!("finalise_segment(&mut current, \"{stage}\"");
             assert!(
                 production.contains(&call),
@@ -7549,9 +7564,10 @@ mod tests {
         // rather than banning the word.
         assert_eq!(
             production.matches("finalise_segment(&mut current").count(),
-            3,
-            "exactly three arms finalise a segment — stop, close, rotate. A \
-             fourth call site means a new finalisation nobody added to this \
+            4,
+            "exactly four arms finalise a segment — stop, close, rotate, and the idle seal \
+             (Quote 31). A \
+             fifth call site means a new finalisation nobody added to this \
              test; a missing one means an arm went back to flushing alone."
         );
 

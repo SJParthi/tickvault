@@ -220,6 +220,15 @@ pub enum ErrorCode {
     /// already set aside and the queue is already moving; the operator
     /// decides what to salvage.
     TickSpill01FileQuarantined,
+    /// DRAIN-HOLD-01 — the drain hold could not be written to SSM (operator
+    /// Quote 31, 2026-10-21). After the close the app writes
+    /// `/tickvault/<env>/drain-hold` so the scheduled stops keep the box up
+    /// until the day's data is in the database. A hold that is not written
+    /// lapses, and the box can be stopped with work left: nothing is lost (the
+    /// marks, spill files and WAL segments stay on disk for the next evening),
+    /// but the day does not finish the same day. Log-sink-only, no page
+    /// (Quote 31). Severity::Medium.
+    DrainHold01NotWritten,
     // PR #5 (2026-05-19): PHASE2-01 + PHASE2-02 variants RETIRED.
     // Phase 2 dispatcher chain (phase2_scheduler + phase2_delta +
     // phase2_emit_guard + phase2_readiness_check + phase2_recovery) is
@@ -1162,6 +1171,7 @@ impl ErrorCode {
             Self::Proc02Panic => "PROC-02",
             Self::ApiServer01Stopped => "API-SERVER-01",
             Self::TickSpill01FileQuarantined => "TICK-SPILL-01",
+            Self::DrainHold01NotWritten => "DRAIN-HOLD-01",
             // PR #5 (2026-05-19): PHASE2-01 / PHASE2-02 retired.
             Self::PrevClose01IlpFailed => "PREVCLOSE-01",
             Self::PrevClose02FirstSeenInconsistency => "PREVCLOSE-02",
@@ -1444,6 +1454,9 @@ impl ErrorCode {
             // TICK-SPILL-01: rescued ticks are on disk and unreplayable until
             // someone looks. High because the spill tier IS the loss guarantee.
             Self::TickSpill01FileQuarantined => Severity::High,
+            // DRAIN-HOLD-01: the box may stop with work left; the work stays on
+            // disk and is done the next evening.
+            Self::DrainHold01NotWritten => Severity::Medium,
             Self::HotPathStall01 => Severity::High,
             // BOOT-04 halts boot, PROC-02 is a crash, API-SERVER-01 leaves the
             // feed running. High, not Critical: each is already seen by another
@@ -1624,6 +1637,7 @@ impl ErrorCode {
             Self::TickSpill01FileQuarantined => {
                 "docs/error-runbooks/tick-spill-replay-error-codes.md"
             }
+            Self::DrainHold01NotWritten => "docs/error-runbooks/drain-hold-error-codes.md",
             Self::HotPath01SyncFsFailed
             | Self::HotPath02WriterQueueDrop
             | Self::HotPath03ReaderPinNotApplied
@@ -1933,6 +1947,7 @@ impl ErrorCode {
             Self::Proc02Panic,
             Self::ApiServer01Stopped,
             Self::TickSpill01FileQuarantined,
+            Self::DrainHold01NotWritten,
             // PR #5 (2026-05-19): Phase201DispatchFailed + Phase202EmitGuardDropped retired.
             Self::PrevClose01IlpFailed,
             Self::PrevClose02FirstSeenInconsistency,
@@ -2389,6 +2404,7 @@ mod tests {
                 || s.starts_with("VOLUME-")
                 // B6 (2026-07-03): off-thread tick ILP flush worker.
                 || s.starts_with("TICK-FLUSH-")
+                || s.starts_with("DRAIN-HOLD-")
                 // W2 PR#6 (2026-07-10): per-table WAL-suspension probe.
                 || s.starts_with("WAL-SUSPEND-")
                 // PR #450 commit 8b (2026-05-03): prev_oi cache state.
