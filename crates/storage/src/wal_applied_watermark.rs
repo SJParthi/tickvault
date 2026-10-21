@@ -2899,6 +2899,32 @@ pub(crate) fn write_v1_overflow_file_for_test(
 mod tests {
     use super::*;
 
+    #[test]
+    fn test_boot_range_floor_is_one_more_slack_below_the_boot_floor() {
+        let wm = AppliedWatermark::new();
+        // No file: the floor is 0 and the range floor stays at the start.
+        assert_eq!(wm.boot_range_floor(), frame_floor(0));
+        let floor = seq(100);
+        wm.boot_applied_floor.store(floor, Ordering::Release);
+        assert_eq!(
+            wm.boot_range_floor(),
+            frame_floor(floor - REPLAY_REORDER_SLACK_SEQ)
+        );
+        assert!(wm.boot_range_floor() < floor);
+    }
+
+    #[test]
+    fn test_persist_failing_latched_reports_both_episodes() {
+        let wm = AppliedWatermark::new();
+        assert_eq!(wm.persist_failing_latched(), (false, false));
+        wm.persist_failing.store(true, Ordering::Release);
+        assert_eq!(wm.persist_failing_latched(), (true, false));
+        wm.ranges_failing.store(true, Ordering::Release);
+        assert_eq!(wm.persist_failing_latched(), (true, true));
+        wm.persist_failing.store(false, Ordering::Release);
+        assert_eq!(wm.persist_failing_latched(), (false, true));
+    }
+
     fn seq(secs: u64) -> u64 {
         // A 2026-era sequence: nanos with the 17 reserved low bits zeroed.
         ((1_780_000_000 + secs) * 1_000_000_000) >> 17 << 17
