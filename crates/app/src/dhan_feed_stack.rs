@@ -83,6 +83,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
+mod catchup_stop;
 // Item 45a (2026-09-29): the after-close pass that writes back order-book rows
 // the ingest shed skipped. A child module so it reuses the drain's own packet
 // walk and depth writers rather than a second copy of either.
@@ -18301,6 +18302,8 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         // one state in which the applied-watermark's unapplied buckets can be
         // cleared: everything they guarded has been replayed and confirmed.
         let mut catchup_drained = false;
+        // 2026-10-20: what an early stop the named bounds do not cover was.
+        let mut catchup_early_stop = catchup_stop::STOP_INCOMPLETE;
         // Plan ITEM 47: whether the previous pass (the boot pass, then each
         // catch-up round) ended on a real gap. They are consecutive reads of
         // one backlog, so a round that follows a clean pass does not start
@@ -18463,6 +18466,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                         "the WAL catch-up drain could not read another batch. Stopping the \
                          drain -- whatever is left stays on disk for the next boot."
                     );
+                    catchup_early_stop = catchup_stop::STOP_REPLAY_FAILED;
                     break;
                 }
             };
@@ -18507,6 +18511,8 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
                     && !batch.stopped_for_disk
                     && !batch.stopped_for_frame_cap
                     && !batch.stopped_for_memory;
+                catchup_early_stop =
+                    catchup_stop::batch_stop_reason(&batch).unwrap_or(catchup_early_stop);
                 break;
             }
             // Count what this lane does NOT fold before dropping it.
@@ -18624,6 +18630,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             // the drain rather than re-offering the same batch to a sink that
             // is not answering: the segments stay staged for the next boot.
             if !replay_rows_landed(&mut ingest, "catchup", unlanded_before) {
+                catchup_early_stop = catchup_stop::STOP_ACK_TIMEOUT;
                 break;
             }
             tickvault_storage::wal_replay_settle::settle_confirm_replayed(&wal_dir, settle_start);
@@ -18715,7 +18722,7 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
             } else if exhausted {
                 "clock"
             } else {
-                "drained"
+                catchup_stop::residual_stop_reason(catchup_drained, catchup_early_stop)
             };
             info!(
                 rounds,

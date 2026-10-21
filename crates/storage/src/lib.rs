@@ -313,6 +313,10 @@ pub mod wal_frame_fate;
 // WAL replay settle step (2026-10-13, DA-13c): an acked replay batch is archived
 // only after the durability lag and two clean QuestDB probes.
 pub mod wal_replay_settle;
+// Bounded WAL unapplied ranges (2026-10-20, plan item PR W): the backlog guard,
+// the boot fold and an inherited overflow become at most 32 ranges in a sidecar,
+// so the WAL stops growing behind an unbounded overflow bit.
+pub mod wal_unapplied_ranges;
 
 // Stage-2 dead-WS sweep (2026-07-17): the `tick_persistence_testing` shim and
 // `spill_dir_test_lock` (both consumed only by the deleted tick benches/DHAT
