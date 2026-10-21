@@ -241,6 +241,11 @@ const REVIEWED_WARN_SITES: &[(&str, &str, &str)] = &[
         "2026-10-20 (plan item PR W): coded WS-SPILL-01, latched once per episode, counted on the same persist-failed counter durability-sync-failing pages on; the watermark file then names no sidecar generation, so the next boot reads the ranges as whole buckets or, when they do not fit, as an unbounded overflow (replay more, never less)",
     ),
     (
+        "crates/storage/src/wal_unapplied_ranges.rs",
+        "could not be persisted at the boot",
+        "2026-10-21 (PR W review round 6): the boot fold runs before logging starts, so this re-reports, once per process, the same persist failure the two wal_applied_watermark.rs entries above review; it is coded WS-SPILL-01, already counted on the persist-failed counter durability-sync-failing pages on, and fails toward replaying more",
+    ),
+    (
         "crates/storage/src/resource_monitor.rs",
         "the probe task failed",
         "a monitoring probe, not a write; the next cycle probes again",
