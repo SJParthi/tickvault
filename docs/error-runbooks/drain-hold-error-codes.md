@@ -36,8 +36,19 @@ same day, and the next morning boots with that work still waiting.
 4. If the box was stopped with work left, nothing needs doing: the next
    evening's after-close work picks it up.
 
+**`source = "evening_drain_state"` (2026-10-21, plan ITEM 60):** the evening
+drain's state file (`data/state/evening-drain.state`) could not be written.
+If it was the restart record, no planned restart is made that minute (an
+unrecorded restart would not count toward the evening's cap of three); the
+next minute tries again. If it was the pending flag, the restarted boot's
+longer catch-up clock may apply once more, until the flag ages out after
+15 minutes. Nothing is lost: the WAL segments stay on disk for the next
+restart or the next boot. Check the disk is not full and `data/state/` is
+writable.
+
 ## Related
 
+- The evening drain: `crates/app/src/evening_drain.rs`.
 - The write-back pass: `crates/app/src/dhan_feed_stack/deferred_depth_pass.rs`.
 - The hold: `crates/app/src/drain_hold.rs`.
 - The readers: `crates/aws-lambdas/src/drain_hold.rs`, used by the start

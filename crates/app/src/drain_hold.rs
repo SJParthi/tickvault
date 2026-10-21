@@ -157,6 +157,12 @@ pub struct DayWork {
     pub suspended: Option<u64>,
     /// The applied watermark distrusts the sink.
     pub sink_suspect: bool,
+    /// WAL segments the unapplied ranges still pin (replay work left for a
+    /// boot's catch-up); `None` when the waiting set could not be read.
+    pub wal_backlog: Option<u64>,
+    /// The backlog keeps the hold: an evening restart will replay it
+    /// (`evening_drain::EveningStep::holds`). Set by the supervisor.
+    pub wal_holding: bool,
 }
 
 impl DayWork {
@@ -172,6 +178,7 @@ impl DayWork {
             && self.apply_lag.is_some_and(|lag| lag <= DRAIN_HOLD_IDLE_LAG)
             && self.suspended == Some(0)
             && !self.sink_suspect
+            && !self.wal_holding
     }
 
     /// A short, plain summary for the parameter and the log line.
@@ -179,7 +186,8 @@ impl DayWork {
     pub fn left_text(&self) -> String {
         let show = |v: Option<u64>| v.map_or_else(|| "unknown".to_string(), |v| v.to_string());
         format!(
-            "depth_buckets={}{} spill_files={} seal_files={} db_backlog={} suspended={}{}",
+            "depth_buckets={}{} spill_files={} seal_files={} db_backlog={} suspended={}{} \
+             wal_segments={}{}",
             self.deferred_marks,
             if self.deferred_overflowed {
                 "+overflow"
@@ -196,6 +204,8 @@ impl DayWork {
             } else {
                 ""
             },
+            show(self.wal_backlog),
+            if self.wal_holding { "+replaying" } else { "" },
         )
     }
 }
@@ -255,6 +265,11 @@ pub fn measure_day_work(today_ist: chrono::NaiveDate) -> DayWork {
         suspended: tickvault_common::ingest_shed::wal_suspended_tables(),
         sink_suspect: tickvault_storage::wal_applied_watermark::applied_watermark()
             .is_sink_suspect(),
+        wal_backlog: tickvault_storage::wal_unapplied_ranges::backlog_segments(
+            &crate::boot_helpers::ws_wal_dir(),
+        ),
+        // Decided by the supervisor (`evening_drain::evening_step`).
+        wal_holding: false,
     }
 }
 
@@ -281,9 +296,9 @@ pub const DRAIN_HOLD_STALL_SECS: i64 = 3_600;
 /// Tracks whether the day's work is still moving. Pure, O(1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ProgressTracker {
-    /// Marks, spill files, seal files and backlog at the last progress;
-    /// `u64::MAX` for a part that was unknown then.
-    anchor: [u64; 4],
+    /// Marks, spill files, seal files, backlog and WAL segments at the last
+    /// progress; `u64::MAX` for a part that was unknown then.
+    anchor: [u64; 5],
     /// Pass rows written as of the last reading.
     pass_rows: u64,
     /// When progress was last seen; `None` before the first reading.
@@ -304,6 +319,7 @@ impl ProgressTracker {
             work.seal_staged
                 .map_or(u64::MAX, |v| u64::try_from(v).unwrap_or(u64::MAX)),
             work.apply_lag.unwrap_or(u64::MAX),
+            work.wal_backlog.unwrap_or(u64::MAX),
         ];
         let Some(last) = self.last_progress_unix else {
             self.anchor = parts;
@@ -396,8 +412,16 @@ pub fn spawn_drain_hold_supervisor(environment: String) -> tokio::task::JoinHand
             } else {
                 today
             };
-            let work = match tokio::task::spawn_blocking(move || measure_day_work(day)).await {
-                Ok(work) => work,
+            let evening_path = Path::new(crate::evening_drain::EVENING_DRAIN_STATE_PATH);
+            let measured = tokio::task::spawn_blocking(move || {
+                (
+                    measure_day_work(day),
+                    crate::evening_drain::load_state(evening_path),
+                )
+            })
+            .await;
+            let (mut work, evening) = match measured {
+                Ok(pair) => pair,
                 Err(err) => {
                     // Not measured means not refreshed: repeated, the hold lapses.
                     error!(
@@ -412,9 +436,37 @@ pub fn spawn_drain_hold_supervisor(environment: String) -> tokio::task::JoinHand
                 }
             };
             let now_unix = chrono::Utc::now().timestamp();
+            // Quote 31's evening drain: the WAL backlog holds the box only
+            // while a planned restart will replay it (AWS only: elsewhere
+            // nothing restarts the process).
+            let on_aws = matches!(
+                tickvault_core::notification::source_badge::runtime_source(),
+                tickvault_core::notification::source_badge::RuntimeSource::Aws
+            );
+            let evening_day = chrono::Datelike::num_days_from_ce(&day);
+            let evening_step = if on_aws {
+                crate::evening_drain::evening_step(
+                    &evening,
+                    evening_day,
+                    work.is_done(),
+                    work.wal_backlog,
+                    now_unix,
+                    secs_ist,
+                )
+            } else {
+                crate::evening_drain::EveningStep::Idle
+            };
+            work.wal_holding = evening_step.holds();
             let pass_rows = crate::dhan_feed_stack::deferred_depth_pass::pass_rows_written_total();
             let stalled = progress.observe(&work, pass_rows, now_unix);
             let done = work.is_done();
+            let restart_now =
+                evening_step == crate::evening_drain::EveningStep::Restart && !stalled;
+            if restart_now {
+                // Refresh the hold this minute, so the restarted process
+                // finds a fresh one while it boots.
+                state.last_hold_write = None;
+            }
             if stalled && !done && !stall_reported {
                 stall_reported = true;
                 warn!(
@@ -479,6 +531,10 @@ pub fn spawn_drain_hold_supervisor(environment: String) -> tokio::task::JoinHand
                                  yet, so the scheduled stops keep the box running"
                             );
                         }
+                        // A fresh hold is in place: restart now if due.
+                        if restart_now && action == HoldAction::Hold {
+                            request_evening_restart(&evening, evening_day, &work, now_unix).await;
+                        }
                     }
                     Err(reason) => {
                         // Retry at the next measurement instead of waiting a
@@ -508,6 +564,46 @@ pub fn spawn_drain_hold_supervisor(environment: String) -> tokio::task::JoinHand
             tokio::time::sleep(Duration::from_secs(DRAIN_HOLD_EVAL_SECS)).await;
         }
     })
+}
+
+/// Records the evening restart and asks `main` for it (Quote 31's evening
+/// drain). The record is written first and the restart asked only when it
+/// landed: an unrecorded restart would not count toward the evening's cap.
+// TEST-EXEMPT: file I/O and a Notify around evening_drain::state_for_restart and request_self_restart, both unit-tested.
+async fn request_evening_restart(
+    evening: &crate::evening_drain::EveningState,
+    day: i32,
+    work: &DayWork,
+    now_unix: i64,
+) {
+    let backlog = work.wal_backlog.unwrap_or(0);
+    let next = crate::evening_drain::state_for_restart(evening, day, backlog, now_unix);
+    let path = Path::new(crate::evening_drain::EVENING_DRAIN_STATE_PATH);
+    let stored =
+        tokio::task::spawn_blocking(move || crate::evening_drain::store_state(path, &next)).await;
+    match stored {
+        Ok(Ok(())) => {
+            info!(
+                restart = next.restarts,
+                wal_segments = backlog,
+                "evening drain: the day's work is in the database and WAL segments still wait \
+                 for replay, so the app restarts to replay them; the hold stays in place"
+            );
+            crate::evening_drain::request_self_restart();
+        }
+        Ok(Err(err)) => error!(
+            code = ErrorCode::DrainHold01NotWritten.code_str(),
+            source = "evening_drain_state",
+            error = %err,
+            "evening drain: the restart could not be recorded, so it is not made this minute"
+        ),
+        Err(err) => error!(
+            code = ErrorCode::DrainHold01NotWritten.code_str(),
+            source = "evening_drain_state",
+            error = %err,
+            "evening drain: the restart record task failed, so it is not made this minute"
+        ),
+    }
 }
 
 /// One SSM write of the hold, under [`DRAIN_HOLD_PUT_TIMEOUT`].
@@ -749,7 +845,20 @@ mod tests {
                 sink_suspect: true,
                 ..done_work()
             },
+            DayWork {
+                wal_backlog: Some(4),
+                wal_holding: true,
+                ..done_work()
+            },
         ];
+        assert!(
+            DayWork {
+                wal_backlog: Some(4),
+                ..done_work()
+            }
+            .is_done(),
+            "a backlog no evening restart will replay does not hold the box"
+        );
         for work in cases {
             assert!(!work.is_done(), "must hold: {work:?}");
         }
@@ -839,13 +948,21 @@ mod tests {
             apply_lag: Some(42),
             suspended: None,
             sink_suspect: true,
+            wal_backlog: Some(7),
+            wal_holding: true,
             ..DayWork::default()
         }
         .left_text();
         assert_eq!(
             text,
             "depth_buckets=2+overflow spill_files=1 seal_files=unknown db_backlog=42 \
-             suspended=unknown sink_suspect"
+             suspended=unknown sink_suspect wal_segments=7+replaying"
+        );
+        assert!(
+            DayWork::default()
+                .left_text()
+                .ends_with("wal_segments=unknown"),
+            "an unread backlog says so"
         );
     }
 

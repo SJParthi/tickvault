@@ -18249,10 +18249,10 @@ async fn run_dhan_feed_stack(params: DhanFeedStackParams) {
         //
         // Placed AFTER the first batch deliberately: the aggregator is seeded
         // once, above, and every round folds against that same seeded state.
-        // 44a (2026-09-22): the budget is clock-aware. A mid-session restart
-        // takes the short one so the sockets dial sooner; the rest of the
-        // backlog stays `*.wal` for the next out-of-session boot.
-        let catchup_budget_secs = wal_catchup_budget_secs(now_ist_secs_of_day());
+        // 44a (2026-09-22): the budget is clock-aware (short mid-session, so the
+        // sockets dial sooner); an evening drain boot (Quote 31) takes 15 min.
+        let catchup_budget_secs =
+            crate::evening_drain::budget_or(wal_catchup_budget_secs(now_ist_secs_of_day()));
         let in_session_counter = metrics::counter!(WAL_CATCHUP_IN_SESSION_COUNTER);
         in_session_counter.increment(0);
         if catchup_budget_secs < WAL_CATCHUP_BUDGET_SECS {

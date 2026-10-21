@@ -201,6 +201,8 @@ pub mod drain_hold;
 /// and the console's restart actions; audit D6d, replaced
 /// `scripts/ensure-questdb.sh`).
 pub mod ensure_questdb;
+/// Planned evening restarts that replay the WAL backlog (Quote 31, plan ITEM 60).
+pub mod evening_drain;
 /// `tickvault holiday-gate`: the boot-time NSE-holiday self-stop gate the
 /// holiday-gate systemd unit runs before the app (audit D6c; replaced
 /// `deploy/aws/holiday-gate.sh`).

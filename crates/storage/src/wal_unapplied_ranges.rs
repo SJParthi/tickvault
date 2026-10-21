@@ -90,7 +90,8 @@
 //! * **A backlog that never drains still costs one kept segment per boot.**
 //!   The replay reads the WAL oldest first, so when the oldest backlog never
 //!   drains it never reaches the later segments. Each boot's tail
-//!   `[boot_applied_floor + 1, own_floor]` keeps the previous session's last
+//!   `[boot_range_floor, own_floor]` (since round 6 one slack below
+//!   `boot_applied_floor`) keeps the previous session's last
 //!   segment (the frames past its last durable ack) for good, one island per
 //!   boot. The guard no longer adds a second island (its top is clamped to
 //!   `boot_frame_high`), and the merge no longer swallows acked sessions
@@ -143,7 +144,8 @@
 //!   outpaces that; how often the live box latches apply lag is Assumed.
 //!   The pinned set is now visible on local `/metrics`:
 //!   [`WAL_UNAPPLIED_PINNED_SEGMENTS_GAUGE`] and
-//!   [`WAL_UNAPPLIED_PINNED_BYTES_GAUGE`], set after every trim. Not fixed
+//!   [`WAL_UNAPPLIED_PINNED_BYTES_GAUGE`], set after the boot fold, the backlog guard and
+//!   every catch-up trim (a reading as of the last of those, never live). Not fixed
 //!   here: confirming parked live acks once enough clean probes follow (as
 //!   `settling/` does for replays) instead of pinning them for a full
 //!   replay. Pinned by `proptest_stuck_backlog_keeps_later_sessions_prunable`,
@@ -1791,6 +1793,28 @@ fn publish_pinned_scan(wm: &AppliedWatermark, scan: &SpanScan) -> Option<(u64, u
             Some(publish_pinned(wm, &spans.segments))
         }
         SpanScan::Refused(NOTHING_WAITING) => Some(publish_pinned(wm, &[])),
+        SpanScan::Refused(_) => None,
+    }
+}
+
+/// The waiting segments the held unapplied ranges pin: what a boot's catch-up
+/// would still replay (operator Quote 31's evening drain, 2026-10-21). `None`
+/// when the waiting set cannot be read. The same span scan and count as the
+/// pinned gauges, without publishing them. O(waiting segments) header reads
+/// plus O(segments × 32), cold: once a minute after the close.
+#[must_use]
+pub fn backlog_segments(wal_dir: &Path) -> Option<u64> {
+    backlog_segments_with(crate::wal_applied_watermark::applied_watermark(), wal_dir)
+}
+
+/// [`backlog_segments`] against `wm`. Cold.
+fn backlog_segments_with(wm: &AppliedWatermark, wal_dir: &Path) -> Option<u64> {
+    let ranges = wm.snapshot().ranges;
+    match scan_spans(wal_dir) {
+        SpanScan::Full(spans) | SpanScan::ReadableOnly(spans) => {
+            Some(pinned_by_ranges(&spans.segments, &ranges).0)
+        }
+        SpanScan::Refused(NOTHING_WAITING) => Some(0),
         SpanScan::Refused(_) => None,
     }
 }
@@ -3602,9 +3626,9 @@ mod tests {
         ack_both(&wm, seq(200));
         wm.note_questdb_probe(true);
         let src = include_str!("wal_applied_watermark.rs");
-        // Round 4 (C): the body moved into `note_questdb_probe_at` (the
-        // public probe passes it the monotonic clock).
-        let needle = concat!("fn ", "note_questdb_probe_at(");
+        // Round 4 (C): the body moved into `note_questdb_probe_at`; round 7
+        // moved it again, into `note_questdb_probe_full` (it takes the basis).
+        let needle = concat!("fn ", "note_questdb_probe_full(");
         let start = src.find(needle).unwrap_or(src.len());
         assert!(start < src.len(), "the probe is in the source");
         let body = &src[start..];
@@ -3993,6 +4017,34 @@ mod tests {
     /// never set there, and a clean box that drained nothing read the same.
     /// The boot fold and the backlog guard now publish them on every boot,
     /// and a scan that finds nothing waiting publishes 0.
+    #[test]
+    fn test_backlog_segments_counts_only_segments_a_range_pins() {
+        let dir = scratch("backlog-count");
+        let wm = AppliedWatermark::new();
+        wm.bind(&dir);
+        assert_eq!(backlog_segments_with(&wm, &dir), Some(0), "nothing waiting");
+        let _a = segment(&dir, 0, 3);
+        let _b = segment(&dir, 10_000, 3);
+        assert_eq!(
+            backlog_segments_with(&wm, &dir),
+            Some(0),
+            "no range: no backlog"
+        );
+        assert!(wm.add_unapplied_range(seq(10_000), seq(10_002)));
+        assert_eq!(backlog_segments_with(&wm, &dir), Some(1), "the pinned one");
+        assert!(
+            backlog_segments(&dir).is_some(),
+            "the global form reads too"
+        );
+        let unlistable = scratch("backlog-unlistable");
+        std::fs::write(
+            unlistable.join(crate::ws_frame_spill::REPLAYING_SUBDIR),
+            b"x",
+        )
+        .expect("a file where a folder belongs");
+        assert_eq!(backlog_segments_with(&wm, &unlistable), None, "unknown");
+    }
+
     #[test]
     fn test_fold_at_boot_and_guard_pending_backlog_publish_pinned_without_an_acked_batch() {
         let dir = scratch("pinned-boot");
