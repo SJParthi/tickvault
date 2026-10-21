@@ -536,6 +536,11 @@ resource "aws_cloudwatch_event_rule" "daily_start" {
 #   - start_watchdog.rs OPERATING_CLOSE_IST_MINUTES = 17*60+30 (curfew)
 #   - hard_stop_guard.rs in_up_window upper bound = 1730
 # Pinned by crates/aws-lambdas/tests/stop_window_lockstep_guard.rs.
+#
+# Operator Quote 31 (2026-10-21): this rule now fires the start-watchdog
+# Lambda (mode "daily_stop", target in start-watchdog-lambda.tf), which skips
+# the stop while the app's drain hold says the day's data is still going into
+# the database. The hold can never keep the box past 07:30 IST.
 resource "aws_cloudwatch_event_rule" "daily_stop" {
   name                = "tv-${var.environment}-daily-stop"
   description         = "Stop tickvault instance at 17:30 IST on trading weekdays (Mon-Fri)"
@@ -652,7 +657,6 @@ resource "aws_iam_role_policy" "eventbridge_ec2_scheduler" {
 
 locals {
   ssm_start_arn = "arn:aws:ssm:${data.aws_region.current.name}::automation-definition/AWS-StartEC2Instance:$DEFAULT"
-  ssm_stop_arn  = "arn:aws:ssm:${data.aws_region.current.name}::automation-definition/AWS-StopEC2Instance:$DEFAULT"
 }
 
 resource "aws_cloudwatch_event_target" "daily_start" {
@@ -680,29 +684,10 @@ resource "aws_cloudwatch_event_target" "daily_start" {
   }
 }
 
-resource "aws_cloudwatch_event_target" "daily_stop" {
-  rule      = aws_cloudwatch_event_rule.daily_stop.name
-  target_id = "stop-instance"
-  arn       = local.ssm_stop_arn
-  role_arn  = aws_iam_role.eventbridge_ec2_scheduler.arn
-
-  input = jsonencode({
-    InstanceId           = [aws_instance.tv_app.id]
-    AutomationAssumeRole = [aws_iam_role.eventbridge_ec2_scheduler.arn]
-  })
-
-  # Same resilience on the 16:30 IST stop — a dropped stop means the box bills
-  # 24/7 (~₹5,500/mo vs the locked ~₹2,919/mo per §7). Retry + DLQ
-  # + the 16:45 stop-watchdog are the defense in depth.
-  retry_policy {
-    maximum_retry_attempts       = 5
-    maximum_event_age_in_seconds = 600
-  }
-
-  dead_letter_config {
-    arn = aws_sqs_queue.eventbridge_dlq.arn
-  }
-}
+# The daily_stop TARGET lives in start-watchdog-lambda.tf since operator
+# Quote 31 (2026-10-21): the 17:30 stop now invokes the start-watchdog Lambda
+# (mode "daily_stop"), which honours the app's drain hold, instead of the SSM
+# stop automation, which could not. The rule above is unchanged.
 
 # S3 cold-storage bucket for tick data > 14 days old.
 resource "aws_s3_bucket" "tv_cold" {

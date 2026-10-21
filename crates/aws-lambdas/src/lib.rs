@@ -32,6 +32,7 @@ pub mod budget_stop_latch;
 pub mod clients;
 pub mod deploy_watchdog;
 pub mod dhan_token_minter;
+pub mod drain_hold;
 pub mod events;
 pub mod hard_stop_guard;
 pub mod logging;

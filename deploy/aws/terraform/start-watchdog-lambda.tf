@@ -85,6 +85,10 @@ resource "aws_iam_role_policy" "start_watchdog" {
           "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/tickvault/${var.environment}/holiday-stop-date",
           # Audit PR30: the budget-stop latch (read-only here).
           "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/tickvault-guard/${var.environment}/budget-stop-month",
+          # Operator Quote 31 (2026-10-21): the app's drain hold (read-only
+          # here). The 17:30 daily_stop, 17:45 stop_check and hourly curfew
+          # leave the box up while it is fresh; never past 07:30 IST.
+          "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/tickvault/${var.environment}/drain-hold",
         ]
       },
       {
@@ -146,6 +150,9 @@ resource "aws_lambda_function" "start_watchdog" {
       # Audit PR30: the budget-stop latch — the 08:45 check skips the
       # self-start while it names the current UTC billing month.
       BUDGET_STOP_PARAM = "/tickvault-guard/${var.environment}/budget-stop-month"
+      # Operator Quote 31 (2026-10-21): the app's drain hold (JSON, written
+      # by the box while the day's data is still going into the database).
+      DRAIN_HOLD_PARAM = "/tickvault/${var.environment}/drain-hold"
     }
   }
 
@@ -219,6 +226,36 @@ resource "aws_lambda_permission" "start_watchdog_check" {
   function_name = aws_lambda_function.start_watchdog.function_name
   principal     = "events.amazonaws.com"
   source_arn    = aws_cloudwatch_event_rule.start_watchdog_check.arn
+}
+
+# 17:30 IST daily stop — operator Quote 31 (2026-10-21). The RULE stays in
+# main.tf (aws_cloudwatch_event_rule.daily_stop, cron(0 12 ? * MON-FRI *));
+# its target moved here from the SSM stop automation, which could not see the
+# app's drain hold. mode "daily_stop" stops the box unless a fresh hold says
+# the day's data is still going into the database (never past 07:30 IST).
+# Same retry ladder and dead-letter queue as before.
+resource "aws_cloudwatch_event_target" "daily_stop" {
+  rule      = aws_cloudwatch_event_rule.daily_stop.name
+  target_id = "stop-instance"
+  arn       = aws_lambda_function.start_watchdog.arn
+  input     = jsonencode({ mode = "daily_stop" })
+
+  retry_policy {
+    maximum_retry_attempts       = 5
+    maximum_event_age_in_seconds = 600
+  }
+
+  dead_letter_config {
+    arn = aws_sqs_queue.eventbridge_dlq.arn
+  }
+}
+
+resource "aws_lambda_permission" "start_watchdog_daily_stop" {
+  statement_id  = "AllowExecutionFromEventBridgeDailyStop"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.start_watchdog.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.daily_stop.arn
 }
 
 # 16:45 IST stop-check — added 2026-06-10 after BOTH schedule directions

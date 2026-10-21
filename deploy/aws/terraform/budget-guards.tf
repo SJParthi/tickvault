@@ -236,6 +236,15 @@ resource "aws_iam_role_policy" "tv_hard_stop_guard" {
         Resource = "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/tickvault/${var.environment}/keep-alive-until"
       },
       {
+        # Operator Quote 31 (2026-10-21): the out-of-window stop honours the
+        # app's drain hold, as the start-watchdog's stops do. READ-ONLY, one
+        # ARN. The in-window budget breach stop never reads it.
+        Sid      = "ReadDrainHold"
+        Effect   = "Allow"
+        Action   = ["ssm:GetParameter"]
+        Resource = "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/tickvault/${var.environment}/drain-hold"
+      },
+      {
         # Audit PR30 (2026-09-27): the breach stop WRITES the budget-stop
         # latch so the start watchdog, the autopilot and the terraform apply
         # do not restart the box for the rest of the billing month (the
@@ -310,6 +319,9 @@ resource "aws_lambda_function" "tv_hard_stop_guard" {
       KEEP_ALIVE_PARAM = "/tickvault/${var.environment}/keep-alive-until"
       # Audit PR30: the budget-stop latch the breach stop writes.
       BUDGET_STOP_PARAM = "/tickvault-guard/${var.environment}/budget-stop-month"
+      # Operator Quote 31 (2026-10-21): the app's drain hold, read by the
+      # out-of-window stop only (same parameter as the start-watchdog's).
+      DRAIN_HOLD_PARAM = "/tickvault/${var.environment}/drain-hold"
     }
   }
 }

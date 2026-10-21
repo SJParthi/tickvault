@@ -1221,6 +1221,16 @@ mod tests {
     }
 
     #[test]
+    fn pass_rows_written_total_never_falls() {
+        let before = pass_rows_written_total();
+        PASS_ROWS_WRITTEN.fetch_add(3, Ordering::Relaxed);
+        assert!(
+            pass_rows_written_total() >= before + 3,
+            "a running total only grows"
+        );
+    }
+
+    #[test]
     fn in_after_close_window_wraps_midnight() {
         assert!(in_after_close_window(AFTER_CLOSE_DEPTH_START_SECS_IST));
         assert!(in_after_close_window(86_399));

@@ -99,8 +99,8 @@ const HELD_STOP_EARLIEST_SECS_IST: u64 = 17 * 3_600 + 25 * 60;
 pub fn stop_follows_tonights_hold(secs_ist: u32) -> bool {
     let secs = u64::from(secs_ist);
     HELD_TONIGHT.load(Ordering::Acquire)
-        && (secs >= HELD_STOP_EARLIEST_SECS_IST
-            || secs < DRAIN_HOLD_CEILING_SECS_IST + HELD_STOP_LAG_SECS)
+        && !(DRAIN_HOLD_CEILING_SECS_IST + HELD_STOP_LAG_SECS..HELD_STOP_EARLIEST_SECS_IST)
+            .contains(&secs)
 }
 
 /// The SSM parameter the Lambdas read, for `environment` (e.g. `prod`).
