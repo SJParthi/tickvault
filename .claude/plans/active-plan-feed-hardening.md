@@ -7019,3 +7019,49 @@ One boot `info!` names the switch; `tv_depth_sockets_enabled` (0/1, local `/metr
 **Honest limits:** the steering alarm reads 0 while switched off, so it cannot fire then (there is nothing to steer). The depth ILP writer and offload thread stay idle in memory. The ranking sweep still computes depth candidates nothing reads. Disk throughput, disk size and instance are unchanged here.
 
 Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
+
+## ITEMS 62–68 — November clean start: removals, monitoring squeeze, 16:30 stop, rebuild, wipe, $75 stop (added 2026-10-21, owner: "yes fix and reosleve nad impleemnt everyhtign dude okay?")
+
+**Status:** APPROVED (owner, 2026-10-21 evening, in session). Authority, recorded first: Quotes 34, 35, 36, 37 in `docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md`, Quotes 32/33 for the rebuild, and `websocket-connection-scope-lock.md` "2026-10-21 (EVENING) — CANDLES_3S, CANDLES_5S AND TOP_VOLUME ARE REMOVED".
+
+- [ ] 62 — Remove the 3 s and 5 s candle timeframes and every `top_volume_*` writer (Quote 34). `TF_COUNT` 10 → 8; the ranking, window-close clock, sweep, writer threads, spill and replay go; depth-only pieces the steering code still needs (`OptionFamily`, `RankedContract`, `distinct_underlying_over`, the gainer helpers, the `TOP_VOLUME_*` constants the depth planners read) and `render_delay_into` are relocated, not deleted; seal spill / DLQ format version bumped and the boot-committed summary magic changed because tf ordinals shift (M30 7→5, M60 8→6, M10 9→7); `candles_3s`, `candles_5s`, `top_volume_*` stay on an archive-only list so retention keeps copying them to S3 and nothing drops them before the copy; the four top_volume loss-group filter rows, `tv_spill_free_probe_blind_total{tier="top_volume"}` and `Volume01MonotonicityBreach` go with the code. Map: `crates/app/src/top_volume_sweep.rs`, `top_volume_snapshot.rs`, `volume_leaderboard.rs`, `dhan_feed_stack.rs`, `dhan_feed_stack/top_volume_threads.rs`, `crates/storage/src/top_volume_rank_persistence.rs`, `tick_spill_replay.rs`, `crates/trading/src/candles/tf_index.rs`, `crates/storage/src/seal_spill.rs`, `seal_dlq.rs`, `seal_spill_ledger.rs`, `deploy/aws/terraform/loss-group-alarms.tf`, `config/base.toml`, `crates/common/src/config.rs`.
+  - Files: crates/trading, crates/storage, crates/app, crates/common, crates/api, deploy/aws/terraform, config
+  - Tests: tf_index ordinal pins at 8, seal spill v6 round-trip and v5 refusal-or-translation, `dhat_live_ingest_seam`, `restart_differential`, every guard named in the removal map updated
+- [ ] 63 — Month-to-date spend from the free AWS Budgets API (`DescribeBudget` `CalculatedSpend.ActualSpend`) instead of paid Cost Explorer `GetCostAndUsage` in the hard-stop guard, the budget digest and the operator console (Quote 37). IAM: `budgets:ViewBudget` on the one budget; Cost Explorer permission removed once nothing calls it.
+  - Files: crates/aws-lambdas/src/hard_stop_guard.rs, budget_digest.rs, operator_control.rs, clients.rs, deploy/aws/terraform (Lambda IAM)
+  - Tests: spend parsed from a recorded `DescribeBudget` body; missing/zero/NaN spend fails closed exactly as the Cost Explorer path did
+- [ ] 64 — Daily stop 17:30 → 16:30 IST (Quote 37): `tv-prod-daily-stop` cron, the start-watchdog stop-check and curfew windows, the cross-verification end bound (17:23 → 16:23, with the retry spacing and the 17:50 evening attempt re-derived) and every guard that pins 17:30; the Quote 31 drain hold is still honoured by every stop path.
+  - Files: deploy/aws/terraform, crates/aws-lambdas/src/start_watchdog.rs, crates/app/src/dhan_live_crossverify_boot.rs (and constants), rule rows that name 17:30
+  - Tests: stop schedule and watchdog window pins at 16:30; cross-verification deadline derived from the stop; drain hold still blocks the stop
+- [ ] 65 — Alarm squeeze (Quote 37): delete the alarms and metrics of switched-off or removed features in the same change as the feature, then a written per-alarm review (`docs/audits/2026-10-alarm-review.md`: alarm, what it watches, kept or removed, which alarm covers it) taking 127 → about 60; noise-lock paging families keep their alarms unless that file records the removal first; dashboard kept.
+  - Files: deploy/aws/terraform/*.tf, docs/audits/2026-10-alarm-review.md, the alarm guards
+  - Tests: `alarmed_counters_are_seeded_guard`, `alarm_metric_has_a_route_guard`, `loss_counter_visibility_guard`, `live_lane_paging_lockstep_guard` green after each removal
+- [ ] 66 — The Thursday 2026-10-22 rebuild (Quotes 32/33): a reviewed workflow that, after the 17:30 stop and before 08:30, copies every QuestDB table to S3 and verifies it, drains or copies the WAL, snapshots the old volume, builds the 150 GB gp3 root on r8g.large (multi-AZ shape kept), retunes `MemoryHigh` and QuestDB memory for 16 GiB, and changes every instance-type lockstep site together; the new disk creates none of the Quote 34 tables.
+  - Files: .github/workflows (new rebuild workflow), deploy/aws/terraform/variables.tf, scripts/aws-upgrade-instance.sh, crates/storage/tests/instance_type_lock_guard.rs, rule files naming the instance type
+  - Tests: instance-type lockstep guard at r8g.large; workflow dry-run lists every table and its verified S3 copy before any volume change
+- [ ] 67 — The 2026-10-31 wipe tool (Quote 35): a one-off Rust tool and workflow, dry run then apply then verify listing, box files then S3 versions, scoped delete permission refused after 2026-11-01 IST, SEBI/audit keep-list enforced in code; removed by the next PR.
+  - Files: crates/aws-lambdas (or a tools bin), .github/workflows (one-off), deploy/aws/terraform (one-off role)
+  - Tests: keep-list refusal for every SEBI/audit table and `sebi-preserve/`, `deploys/`, `logs/`; date fence; dry run deletes nothing
+- [ ] 68 — Native budget `limit_amount` and the other lockstep sites to $75 on or after 2026-11-01 (Quote 37). Not before.
+  - Files: deploy/aws/terraform/budget.tf, budget-guards.tf, crates/aws-lambdas/tests/budget_ceiling_lockstep_guard.rs
+  - Tests: lockstep guard at $75
+
+### Design (Items 62–68)
+Each item is its own commit on `claude/awesome-edison-2jvfhx` (stacked on PR #2119), landed as one PR after #2119 merges (one PR at a time). 62 removes whole paths rather than gating them, because the owner ordered the tables deleted; pieces another live path reads (the depth planners, the delay renderer) move to a neutral module. 63 swaps the data source behind one function so callers are unchanged. 64 derives every later bound from one stop constant so the times cannot drift apart. 65 removes alarms only with the feature or with a written review row. 66 and 67 are reviewed, dry-run-first workflows, the Quote 29e shape.
+
+### Edge Cases (Items 62–68)
+62: a seal spill file written by the old build (v5, old ordinals) at the first boot of the new build must be translated or refused and kept, never decoded as the wrong timeframe; the six tables on the box keep being archived until copied. 63: a budget with no spend yet (first hours of a month) reads 0, not a failure. 64: a day whose cross-verification has not finished by 16:23 keeps its retry rules; a drain hold past 16:30 still wins. 66: a WAL backlog that cannot drain in the window is copied, not deleted. 67: anything dated 2026-11-01 or later, or on the keep-list, is refused.
+
+### Failure Modes (Items 62–68)
+62: a missed reader of a removed table fails a guard or a query test; ordinal confusion is caught by the spill version check. 63: Budgets API refusal fails closed (the guard treats unknown spend as it treats an unknown Cost Explorer result today). 64: a stop that fires during an unsaved day is held by the drain hold. 66: any copy that does not verify stops the workflow before the volume change; the old volume stays attached. 67: the dry run is reviewed before apply; the role expires.
+
+### Test Plan (Items 62–68)
+Per item: the crate's lib and integration tests, clippy `-D warnings -W clippy::perf`, `cargo fmt --check`, the guards named per item, DHAT gates on the drain (62), the restart differential (62), pub-fn test and wiring guards, banned-pattern scanner, source size ratchet.
+
+### Rollback (Items 62–68)
+62: revert the commit (the tables' S3 copies exist until 31 Oct). 63: revert; Cost Explorer permission restored in the same revert. 64: revert the cron and constants. 65: re-apply terraform from the previous commit. 66: re-attach the snapshot volume and the old instance type. 67: nothing to roll back after apply (Quote 35 states the loss); before apply, delete the role.
+
+### Observability (Items 62–68)
+62: the six tables stop growing; `tv_candle_*` counters show 8 timeframes. 63: the digest and guard log the spend source (`budgets`). 64: the stop Lambda logs the 16:30 stop and any drain-hold deferral. 65: the review file is the record. 66/67: workflow logs plus a verify listing committed to `docs/audits/`. No new alarm, page, metric filter or EMF name in any item.
+
+Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
