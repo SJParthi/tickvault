@@ -60,10 +60,10 @@ pub const NEW_ROOT_THROUGHPUT_MIBPS: i32 = 125;
 pub const REBUILD_TAG_KEY: &str = "tv-rebuild";
 /// Value of [`REBUILD_TAG_KEY`].
 pub const REBUILD_TAG_VALUE: &str = "2026-10-22";
-/// The old-root snapshot is kept at least this long (Quote 32 step 3,
-/// "the old volume kept as a snapshot for 7 days"); Quote 35 may delete it
-/// with the rest of the market data on the night of 2026-10-31.
-pub const SNAPSHOT_KEEP_UNTIL: &str = "2026-10-29";
+/// The old-root snapshot (and the old root volume) are kept until the
+/// Quote 35 wipe on the night of 2026-10-31: more than the 7 days Quote 32
+/// step 3 asks for. Nothing deletes by this tag; it records the date.
+pub const SNAPSHOT_KEEP_UNTIL: &str = "2026-10-31";
 /// Typed confirmation for any `apply` other than `rollback`.
 pub const APPLY_CONFIRM: &str = "REBUILD-2026-10-22";
 /// Typed confirmation for `rollback`.
