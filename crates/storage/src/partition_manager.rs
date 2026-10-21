@@ -388,6 +388,25 @@ pub fn all_managed_table_names() -> Vec<&'static str> {
     names
 }
 
+/// The tables the 2026-10-22 rebuild (plan item 66) carries onto the new
+/// disk: every DAY-partitioned audit / daily-data table plus every
+/// retention-EXEMPT table — the same union the operator console's SEBI
+/// preserve exports, and the keep-list Quote 35 names. De-duplicated and
+/// sorted. Derived from the retention lists, never restated, so a table that
+/// joins either list is restored automatically.
+///
+/// Market-data tables (`ticks`, `market_depth*`, `candles_*`, `top_volume*`,
+/// `feed_aux_packets`) are NOT in it: they are copied to S3 and verified, and
+/// start empty on the new disk.
+#[must_use]
+pub fn rebuild_keep_tables() -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = DAY_PARTITIONED_TABLES.to_vec();
+    names.extend_from_slice(RETENTION_EXEMPT_TABLES);
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
 // ---------------------------------------------------------------------------
 // Partition Manager
 // ---------------------------------------------------------------------------
