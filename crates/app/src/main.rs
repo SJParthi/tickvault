@@ -3882,6 +3882,14 @@ async fn async_main() -> Result<()> {
         silent_swap_secs,
         "depth-200 silent swap resubscribe wait installed"
     );
+    // Depth on/off (owner, 2026-10-21): stored before the stack spawns, so its
+    // depth attach reads it; while off, the steering heartbeat reads 0.
+    tickvault_app::depth_switch::set_depth_sockets_enabled(
+        config.dhan_universe.depth_sockets_enabled,
+    );
+    if !config.dhan_universe.depth_sockets_enabled {
+        let _depth_off = tickvault_app::depth_switch::spawn_switched_off_heartbeat();
+    }
     let dhan_feed_stack_monitor = tickvault_app::dhan_feed_stack::spawn_dhan_feed_stack(
         tickvault_app::dhan_feed_stack::DhanFeedStackParams {
             shutdown: std::sync::Arc::clone(&dhan_feed_shutdown),

@@ -37,6 +37,10 @@ const BUDGET: &[(&str, usize)] = &[
     ("depth_first_packet.rs", 1),
     ("depth_rebalance.rs", 7),
     ("depth_subscription_view.rs", 3),
+    // 2026-10-21 (owner: depth switched off): 2 wiring scans (the attach starts
+    // both depth halves done, main stores the switch); paired behaviour test
+    // `test_set_depth_sockets_enabled_round_trips`.
+    ("depth_switch.rs", 2),
     ("dhan_contract_universe.rs", 1),
     ("dhan_depth_universe.rs", 3),
     // 2026-10-14 (ITEM 57): 90 -> 88; `contract_attach_tests` (3 scans) moved
@@ -53,6 +57,11 @@ const BUDGET: &[(&str, usize)] = &[
     ("dhan_universe.rs", 3),
     ("disk_pressure_boot.rs", 7),
     ("ensure_questdb.rs", 1),
+    // 2026-10-21 (plan ITEM 60): 3 wiring scans (lane budget, main restart arm,
+    // hold supervisor); paired behaviour tests `evening_step_*`,
+    // `test_catchup_budget_for_only_a_fresh_evening_pending_flag`,
+    // `test_request_self_restart_resolves_a_later_self_restart_requested`.
+    ("evening_drain.rs", 3),
     ("feed_scoreboard_boot.rs", 2),
     ("index_constituency_boot.rs", 1),
     ("infra.rs", 3),

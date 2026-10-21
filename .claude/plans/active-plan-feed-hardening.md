@@ -6984,3 +6984,38 @@ The hold's `left` text and log line gain `wal_segments=N` (`+replaying` while he
 **Honest limits:** each restart replays at most the per-boot frame cap (3,000,000 frames, about one session), so the 9–20 Oct backlog (about ten sessions) takes several evenings. Each held hour costs about $0.19, and October is projected near the $170 stop before any held hour (Quote 31's limit). A backlog held by a QuestDB suspicion episode does not shrink, so the first restart ends the evening's restarts. The restarted app sends its usual boot message (at most 3 a night). Segments only `settling/unreadable/` holds, or a backlog the replay disk floor refuses, cost one useless restart before the evening gives up.
 
 Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
+
+## ITEM 61 — Depth-20 and depth-200 switched off (added 2026-10-21, owner: "switch off both depth 20 and depth 200 dude okay?")
+
+**Status:** APPROVED (owner, 2026-10-21, in session; recorded first in `websocket-connection-scope-lock.md`, "2026-10-21 — DEPTH-20 AND DEPTH-200 ARE SWITCHED OFF").
+
+**Why (Verified from the repo's measured records):** depth is 1,530,651,649 rows a session against 64,349,753 ticks (24x), about 80% of the daily disk burn, and the main load behind the morning disk saturation and the evening catch-up. Switching it off is step 1 of getting AWS under $100 a month (steps 2–4, throughput, disk and instance, are separate dated quotes).
+
+- [x] 61a — The switch. `[dhan_universe] depth_sockets_enabled` (serde default false; `config/base.toml` false). Test: `test_dhan_universe_depth_sockets_enabled_defaults_off`.
+  - Files: crates/common/src/config.rs, config/base.toml
+- [x] 61b — The gate. `depth_switch` stores the boot value (main, before the stack spawns); `attach_depth_when_available` starts `depth_ready` and `depth_done` at `!depth_sockets_enabled()`, so no depth socket is attached or dialled while the main-feed half of the same attach runs unchanged. Tests: `test_set_depth_sockets_enabled_round_trips`, `the_attach_and_main_read_the_switch`; app lib 2,816 and integration suites green.
+  - Files: crates/app/src/depth_switch.rs, crates/app/src/dhan_feed_stack.rs, crates/app/src/main.rs, crates/app/src/lib.rs, crates/app/tests/source_scan_budget_guard.rs
+- [x] 61c — No false page. `depth-steering-stalled` reads `tv_depth_rebalance_age_secs` with missing data as a breach; with steering never started, `spawn_switched_off_heartbeat` publishes it at 0 (and `tv_depth_sockets_enabled` at 0, local only).
+  - Files: crates/app/src/depth_switch.rs
+
+### Design (Item 61)
+Gate at the narrowest point found by the impact map: the depth attach's two state flags, not the spawn (the same task attaches the main-feed contracts, spot top-up and backup copies). A process-wide atomic set once at boot avoids threading a new parameter through the stack; it reads `true` until set, so tests and harnesses keep the old behaviour.
+
+### Edge Cases (Item 61)
+Depth off: the selection is skipped, `outstanding_halves` never dials depth, the give-up arm never fires, the terminal path completes on contracts alone and `spawn_depth_rebalance` returns with one `info!`; the 09:12 readiness verdict publishes on contracts (`depth_ready` starts true). Cross-verification's depth-held option pass finds no targets and returns (`no_targets`, no page). The drain hold has no depth marks. Depth on: unchanged.
+
+### Failure Modes (Item 61)
+Config unreadable: the field defaults to false (off). Boot never calls the setter: depth stays as before (on). The steering heartbeat loop dies: the alarm reads missing data and pages (the same as today's steering loop dying).
+
+### Test Plan (Item 61)
+common lib + integration (0 failures), app lib 2,816 / bins / integration, storage integration, clippy `-D warnings`, pub-fn guard, banned-pattern scanner, size ratchet, source-scan budget.
+
+### Rollback (Item 61)
+Set `depth_sockets_enabled = true` (needs a fresh dated quote in the scope lock) and redeploy; nothing was deleted.
+
+### Observability (Item 61)
+One boot `info!` names the switch; `tv_depth_sockets_enabled` (0/1, local `/metrics`); depth tables stop growing. No new alarm, page, filter or EMF name.
+
+**Honest limits:** the steering alarm reads 0 while switched off, so it cannot fire then (there is nothing to steer). The depth ILP writer and offload thread stay idle in memory. The ranking sweep still computes depth candidates nothing reads. Disk throughput, disk size and instance are unchanged here.
+
+Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
