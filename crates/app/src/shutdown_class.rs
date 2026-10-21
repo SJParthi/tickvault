@@ -257,6 +257,11 @@ pub fn classify_shutdown_with_deploy_marker(
     if planned_deploy_marker && is_aws && signal == "sigterm" {
         return ShutdownClass::PlannedDeployRestart;
     }
+    // Quote 31's evening drain: the app's own planned restart. Only the
+    // process itself produces this signal string.
+    if signal == "self_restart" {
+        return ShutdownClass::PlannedDeployRestart;
+    }
     // Operator Quote 31 (2026-10-21): a box this process held after the
     // close is stopped by a scheduled check once the hold ends, at any time
     // up to 07:35 IST — not only in the 17:25–17:45 window. Without this
@@ -299,6 +304,15 @@ mod tests {
                 MID_SESSION,
                 false,
                 ShutdownClass::ExternalStop,
+            ),
+            // The evening drain's own restart is planned, with or without a
+            // marker.
+            (
+                "self_restart",
+                true,
+                20 * 3600,
+                false,
+                ShutdownClass::PlannedDeployRestart,
             ),
             // Out-of-hours stop of a box the deploy started.
             (

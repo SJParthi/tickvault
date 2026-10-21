@@ -1797,6 +1797,28 @@ fn publish_pinned_scan(wm: &AppliedWatermark, scan: &SpanScan) -> Option<(u64, u
     }
 }
 
+/// The waiting segments the held unapplied ranges pin: what a boot's catch-up
+/// would still replay (operator Quote 31's evening drain, 2026-10-21). `None`
+/// when the waiting set cannot be read. The same span scan and count as the
+/// pinned gauges, without publishing them. O(waiting segments) header reads
+/// plus O(segments × 32), cold: once a minute after the close.
+#[must_use]
+pub fn backlog_segments(wal_dir: &Path) -> Option<u64> {
+    backlog_segments_with(crate::wal_applied_watermark::applied_watermark(), wal_dir)
+}
+
+/// [`backlog_segments`] against `wm`. Cold.
+fn backlog_segments_with(wm: &AppliedWatermark, wal_dir: &Path) -> Option<u64> {
+    let ranges = wm.snapshot().ranges;
+    match scan_spans(wal_dir) {
+        SpanScan::Full(spans) | SpanScan::ReadableOnly(spans) => {
+            Some(pinned_by_ranges(&spans.segments, &ranges).0)
+        }
+        SpanScan::Refused(NOTHING_WAITING) => Some(0),
+        SpanScan::Refused(_) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3995,6 +4017,34 @@ mod tests {
     /// never set there, and a clean box that drained nothing read the same.
     /// The boot fold and the backlog guard now publish them on every boot,
     /// and a scan that finds nothing waiting publishes 0.
+    #[test]
+    fn test_backlog_segments_counts_only_segments_a_range_pins() {
+        let dir = scratch("backlog-count");
+        let wm = AppliedWatermark::new();
+        wm.bind(&dir);
+        assert_eq!(backlog_segments_with(&wm, &dir), Some(0), "nothing waiting");
+        let _a = segment(&dir, 0, 3);
+        let _b = segment(&dir, 10_000, 3);
+        assert_eq!(
+            backlog_segments_with(&wm, &dir),
+            Some(0),
+            "no range: no backlog"
+        );
+        assert!(wm.add_unapplied_range(seq(10_000), seq(10_002)));
+        assert_eq!(backlog_segments_with(&wm, &dir), Some(1), "the pinned one");
+        assert!(
+            backlog_segments(&dir).is_some(),
+            "the global form reads too"
+        );
+        let unlistable = scratch("backlog-unlistable");
+        std::fs::write(
+            unlistable.join(crate::ws_frame_spill::REPLAYING_SUBDIR),
+            b"x",
+        )
+        .expect("a file where a folder belongs");
+        assert_eq!(backlog_segments_with(&wm, &unlistable), None, "unknown");
+    }
+
     #[test]
     fn test_fold_at_boot_and_guard_pending_backlog_publish_pinned_without_an_acked_batch() {
         let dir = scratch("pinned-boot");

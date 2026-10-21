@@ -6947,3 +6947,38 @@ Revert; the writer flushes every cycle again.
 Existing `tv_questdb_wal_apply_lag_max` and WAL-SUSPEND-01 per table; a bar reaches QuestDB at most about a second later (`last_seal_drained_unix_secs` moves up to a second later; the 51d readiness wait tolerates it).
 
 Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
+
+## ITEM 60 — The evening drain replays the WAL backlog the same evening (added 2026-10-21, operator: "Fix and resolve everything dude", under Quote 31)
+
+**Status:** APPROVED (operator, 2026-10-21, in session; Quote 31 authorizes "a post-close WAL catch-up run until done").
+
+**Why (MEASURED 2026-10-21):** 1,192 WAL segments from 9–20 Oct stay pinned by the unapplied ranges; only a boot's catch-up drain (before the sockets dial) replays them, and the 08:30 boot gets five minutes. The drain hold (Item 58) did not count them at all, although Quote 31's rule names "every waiting WAL segment is replayed".
+
+- [x] 60a — Backlog count. `wal_unapplied_ranges::backlog_segments` counts the waiting segments the held ranges pin (the pinned-gauge scan without publishing). Test: `test_backlog_segments_counts_only_segments_a_range_pins`.
+  - Files: crates/storage/src/wal_unapplied_ranges.rs
+- [x] 60b — Evening restarts. `evening_drain::evening_step` (pure): once the day's own work is done and the backlog is above 0, restart; at most 3 an evening, 20 minutes apart, 15:50–05:00 IST, and none after a restart that did not shrink the backlog. The hold supervisor writes the state file (`data/state/evening-drain.state`), then asks `main` for a planned restart (`request_self_restart`, a `Notify` arm in `wait_for_shutdown_signal`, signal `self_restart`, classified planned, no shutdown message); systemd `Restart=always` starts the app again. The backlog holds the box only while a restart will come (`EveningStep::holds`). AWS only. Tests: `evening_step_*`, `state_for_restart_counts_per_evening`, `test_store_state_load_state_to_line_from_line_round_trip`, `in_restart_window_wraps_midnight`, `test_request_self_restart_resolves_a_later_self_restart_requested`, the `is_done` and `left_text` cases, `test_classify_shutdown_with_deploy_marker_table`.
+  - Files: crates/app/src/evening_drain.rs, crates/app/src/drain_hold.rs, crates/app/src/main.rs, crates/app/src/shutdown_class.rs, crates/app/src/lib.rs
+- [x] 60c — The restarted boot's catch-up clock is 15 minutes (`budget_or`, once per boot on a fresh pending flag); the frame cap, round cap, memory stop and disk floor are unchanged. Tests: `test_catchup_budget_for_only_a_fresh_evening_pending_flag`, `the_lane_and_main_are_wired_to_the_evening_drain`.
+  - Files: crates/app/src/dhan_feed_stack.rs
+
+### Design (Item 60)
+Replay stays where it is safe today: the boot catch-up, before the sockets dial, with every per-boot bound. The evening only adds boots. One small state file carries the evening's count across the restart; the decision is a pure function of it, the backlog and the clock.
+
+### Edge Cases (Item 60)
+A backlog that cannot be read never restarts and never holds. A restart that does not shrink the backlog ends the evening's restarts (no loop). A pending flag older than 15 minutes, or seen in the morning, does not lengthen a boot. Three restarts at 20-minute spacing plus a deploy stay under systemd's 5 starts an hour. No restart after 05:00, so the last 15-minute catch-up ends before the 07:30 ceiling.
+
+### Failure Modes (Item 60)
+The state file cannot be written: no restart that minute (an unrecorded restart would escape the cap). The restarted app fails to boot: systemd retries as for any crash; the hold lapses in 20 minutes and the box stops as before; the WAL stays on disk. The catch-up stops on memory, disk or the frame cap: the backlog shrinks less, the next restart (or the morning) continues.
+
+### Test Plan (Item 60)
+The unit tests above; app lib tests for drain_hold, evening_drain and shutdown_class; storage lib tests; `error_level_meta_guard`; source size ratchet.
+
+### Rollback (Item 60)
+Revert; the backlog no longer holds the box and the app never restarts itself. A leftover state file is ignored.
+
+### Observability (Item 60)
+The hold's `left` text and log line gain `wal_segments=N` (`+replaying` while held for it); each restart logs one `info!` with its number and the backlog; the restarted boot logs its longer clock. `tv_wal_unapplied_pinned_segments` and `tv_wal_replay_confirmed_segments_total` show the drain. No new alarm, page or metric (Quote 31).
+
+**Honest limits:** each restart replays at most the per-boot frame cap (3,000,000 frames, about one session), so the 9–20 Oct backlog (about ten sessions) takes several evenings. Each held hour costs about $0.19, and October is projected near the $170 stop before any held hour (Quote 31's limit). A backlog held by a QuestDB suspicion episode does not shrink, so the first restart ends the evening's restarts.
+
+Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.

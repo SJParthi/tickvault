@@ -5657,9 +5657,14 @@ async fn run_process_runloop(
     // The hot tasks wind down from here on purpose; the stall page must not
     // read that as a stall (HOT-PATH-STALL-01, noise lock §2.8).
     tickvault_storage::hot_path_telemetry::begin_shutdown();
-    notifier.notify(NotificationEvent::ShutdownInitiated {
-        class: shutdown_class,
-    });
+    // An evening drain restart is not news: the restarted app reports its
+    // own boot, so no shutdown message is sent for it (Quote 31: no new
+    // Telegram traffic for the hold).
+    if final_signal != "self_restart" {
+        notifier.notify(NotificationEvent::ShutdownInitiated {
+            class: shutdown_class,
+        });
+    }
 
     // Cadence runner graceful teardown: REMOVED 2026-09-16 with the
     // scheduler itself (`no-rest-except-live-feed-2026-06-27.md` §12.10).
@@ -6123,6 +6128,12 @@ async fn wait_for_shutdown_signal() -> &'static str {
             () = next_signal(&mut signals.terminate) => {
                 info!("SIGTERM received — initiating graceful shutdown");
                 "sigterm"
+            }
+            // Quote 31's evening drain: a planned restart (systemd starts
+            // the app again) so the boot catch-up replays the WAL backlog.
+            () = tickvault_app::evening_drain::self_restart_requested() => {
+                info!("evening drain restart requested — initiating graceful shutdown");
+                "self_restart"
             }
         }
     }
