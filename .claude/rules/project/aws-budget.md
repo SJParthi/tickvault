@@ -38,6 +38,26 @@ paths:
 >
 > **⚠ OPERATOR RULING 2026-07-19 — 30 GB accepted, t4g.medium as-of-now, NEW HARD TARGET < ₹1,000/mo:** verbatim quote + the itemized sub-1K path live in the dedicated "OPERATOR RULING 2026-07-19" section below. The base bill alone (~₹1,077/mo at the ~176-hr auto-schedule basis) EXCEEDS the target — <₹1,000 is UNREACHABLE without at least one operator-gated lever; see the lever table.
 
+## OPERATOR RULING 2026-10-21 (latest) — stop at $75, GST included, from 1 November (supersedes the $85 and $100 lines below)
+
+Owner, 2026-10-21 (verbatim, typos preserved): "so that the max alogn with 18 percnetage gst also it shdou lneve revr cross maximised price of 75 dudde okay?". Full record and REJECT list: `daily-universe-scope-expansion-2026-05-27.md` §0 Quote 37 (also: free Budgets API lookups, alarm squeeze, dashboard kept, 16:30 IST stop).
+
+| | Before (Quote 36) | After (Quote 37) |
+|---|---|---|
+| `STANDING_BUDGET_KILL_USD` (the guard Lambda's line, in code) | $85 from 1 November | **$75 from 1 November 2026**, GST included; October 2026 stays capped at $170 |
+| Four lockstep sites (terraform `limit_amount` = native 100% stop) | $170 until 1 November, then $85 | $170 until 1 November, then **$75** (a follow-up change on or after that date) |
+
+## OPERATOR RULING 2026-10-21 (later) — stop at $85 from 1 November (supersedes the $100 line below)
+
+Owner, 2026-10-21 (verbatim, typos preserved): "okay set it with maximum 85 udde but why it even crosses mroe than 85 dude thats my question dude okay?". Full record and REJECT list: `daily-universe-scope-expansion-2026-05-27.md` §0 Quote 36.
+
+| | Before (Quote 33) | After (Quote 36) |
+|---|---|---|
+| `STANDING_BUDGET_KILL_USD` (the guard Lambda's line, in code) | $100 from 1 November | **$85 from 1 November 2026**; October 2026 stays capped at $170 |
+| Four lockstep sites (terraform `limit_amount` = native 100% stop) | $170 until 1 November, then $100 | $170 until 1 November, then **$85** (a follow-up change on or after that date) |
+
+Measured live the same evening: the budget `tv-prod-monthly-budget-v2` has `IncludeTax = true`, so the line is the bill paid, 18% GST included (the "pre-GST" wording in the older notes below and in `budget.tf` is stale). October: $120.31 spent on 1–21 Oct, AWS forecast $175.68 against the $170 line.
+
 ## OPERATOR RULING 2026-10-21 — stop at $100 from 1 November; disk speed 500 → 125 MiB/s tonight
 
 Owner, 2026-10-21 (verbatim, typos preserved): "Do everything now dude not Saturday brro do it now okay?", then the decision cards "Cut tonight anyway" (disk speed) and, after a correction that a $100 line in October would stop the box at once ($119.20 spent by 20 Oct), "$100 from 1 November (Recommended)". Full record and REJECT list: `daily-universe-scope-expansion-2026-05-27.md` §0 Quote 33.

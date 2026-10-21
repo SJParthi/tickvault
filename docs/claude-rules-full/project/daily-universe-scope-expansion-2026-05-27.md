@@ -2987,3 +2987,51 @@ The same shape as Quote 29e: a reviewed, one-off Rust tool and workflow, dry run
 - Suspending versioning, adding an `expiration` or `noncurrent_version_expiration`, or keeping any delete permission after the run.
 - Treating Quote 35 as standing permission: it is spent after this one run, and Quote 27 ("nothing is ever deleted") binds again from then on.
 - Skipping the Quote 32/33 copy-first rule for the 2026-10-22 rebuild because the copies are deleted on 31 Oct anyway: Quote 27 binds until Quote 35 runs.
+
+#### Quote 36 (2026-10-21, ~17:55 IST) — THE SPEND STOP IS $85 FROM 1 NOVEMBER, NOT $100 (amends Quote 33's budget line, preserve EXACTLY, typos included)
+
+Asked whether $75 could be the monthly maximum once every Quote 32 step is done, the owner was told that $70–75 is an estimate of a normal month and the only hard maximum is the spend stop, and was offered: keep $100 for November (recommended), set $85, or set $75. Answer:
+
+> "okay set it with maximum 85 udde but why it even crosses mroe than 85 dude thats my question dude okay?"
+
+**Measured the same evening (live, read-only):** the budget `tv-prod-monthly-budget-v2` counts tax (`IncludeTax = true`), so the line is the bill paid, GST included; October spend $120.31 on 1–21 Oct, AWS forecast $175.68 against the $170 line.
+
+| | Before (Quote 33) | After (Quote 36) |
+|---|---|---|
+| `STANDING_BUDGET_KILL_USD` (the guard Lambda's line, in code) | $100 from 1 November | **$85 from 1 November** |
+| October 2026 (`OCTOBER_2026_KILL_USD`) | $170 | $170, unchanged |
+| Terraform `limit_amount` (the native 100% stop) and the other lockstep sites | $170 until 1 November | $170 until 1 November, then **$85** (on or after 1 November, never before) |
+
+**Honest limits, stated to the owner:** $85 leaves about $10–15 a month above the $70–75 estimate. A month that reaches it switches the server off for the rest of that month. The estimate becomes a measurement only once November is billed.
+
+##### What violates Quote 36 (REJECT)
+- A November-or-later line above $85 without a fresh dated quote, or lowering the native `limit_amount` below $170 before 1 November 2026.
+- Moving October's line under this quote.
+- Presenting $70–75 as a maximum.
+
+#### Quote 37 (2026-10-21, ~18:40 IST) — THE SPEND STOP IS $75, GST INCLUDED, FROM 1 NOVEMBER; THE MONITORING SQUEEZE; A 16:30 IST STOP (amends Quote 36, preserve EXACTLY, typos included)
+
+After the squeeze table (plan as decided ~$70–75; free spend lookups, dead alarms, dead metrics, dashboard, 127 → ~60 alarms, 100 GB disk; fully squeezed ~$50–55):
+
+> "i believe alogn with evryhtign these also can be doen right dude ? except clouwatch dashbaord dude am i right due tlel me dudeokay?" (quoting the rows: free spend lookups, remove alarms that watch switched-off parts, remove metrics for removed features, delete the CloudWatch dashboard, fewer alarms overall 127 → about 60)
+> "so that the max alogn with 18 percnetage gst also it shdou lneve revr cross maximised price of 75 dudde okay?"
+> "bro now we can run our server same time rigth dude startign 8.30 am till 4 pm or 4.30 pm woudl be fine dude tell me dude okay?"
+
+**What this authorizes:**
+
+| Item | Disposition |
+|---|---|
+| `STANDING_BUDGET_KILL_USD` | **$75 from 1 November 2026** (was $85 under Quote 36). The live budget counts tax (`IncludeTax = true`), so $75 is the bill paid, 18% GST included. October stays $170. The native `limit_amount` moves to $75 on or after 1 November, never before. |
+| Spend lookups | The guard, digest and console read month-to-date spend from the free AWS Budgets API instead of paid Cost Explorer calls. |
+| Alarms and metrics for switched-off or removed features (depth, top_volume, 3 s/5 s candles) | Removed, each in the same change as its feature, with the noise-lock row that names it. |
+| Alarm count 127 → about 60 | Allowed after a written per-alarm review; each removal names the alarm, what it watched, and which remaining alarm covers that failure. The paging families in `dhan-rest-only-noise-lock-2026-07-14.md` are kept unless that file records the removal first. |
+| CloudWatch dashboard | **Kept** (the owner excluded it). |
+| Daily stop | 17:30 → **16:30 IST** (the owner allowed 16:00 or 16:30; 16:30 keeps the 15:44 cross-verification inside the run). The Quote 31 same-day drain hold still keeps the box up past the stop while the day's data is not saved; the cross-verification end bound and the stop-check move with the stop. Start stays 08:30 IST. |
+
+**Honest limits, stated to the owner:** the estimate under $75 assumes the squeeze rows above land before 1 November. If they do not, a normal November is about $70–75, so a $75 line could stop the server in the last days of the month. A month that reaches $75 switches the server off for the rest of that month.
+
+##### What violates Quote 37 (REJECT)
+- A November-or-later line above $75 without a fresh dated quote, or a native stop below $170 before 1 November 2026.
+- Deleting the CloudWatch dashboard under this quote.
+- Removing an alarm without the per-alarm review row, or a noise-lock paging family without that file's dated edit first.
+- A daily stop earlier than 16:30 IST, or one that ignores the same-day drain hold.

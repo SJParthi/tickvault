@@ -66,14 +66,16 @@ use tracing::{error, info, warn};
 ///
 /// 2026-10-21 (operator Quote 33): stays 170.0, the configured line for
 /// October 2026. From November the month clamp brings it down to
-/// `STANDING_BUDGET_KILL_USD` ($100) in code; the terraform `limit_amount`
+/// `STANDING_BUDGET_KILL_USD` ($75 since operator Quote 37) in code; the terraform `limit_amount`
 /// (the native 100% stop) can follow on or after 1 November.
 pub const DEFAULT_BUDGET_KILL_USD: f64 = 170.0;
 
 /// The STANDING monthly kill line: from October 2026 the bill must stay within
 /// $150 (operator Quote 23, 2026-09-23 — daily-universe §0 + aws-budget.md),
 /// raised to $170 (≈₹15,000) by operator Quote 30 on 2026-10-13, and lowered
-/// to **$100 from November 2026** by operator Quote 33 (2026-10-21). October
+/// to $100 from November 2026 by operator Quote 33 (2026-10-21), then to **$85 from
+/// November 2026** by operator Quote 36 (the same evening), and to **$75
+/// from November 2026, GST included,** by operator Quote 37. October
 /// 2026 keeps the configured $170 (`OCTOBER_2026_ALLOWANCE`): its spend was
 /// already $119.20 on 1–20 Oct, so a $100 line would have stopped the box at once.
 ///
@@ -81,7 +83,7 @@ pub const DEFAULT_BUDGET_KILL_USD: f64 = 170.0;
 /// $225 as a September-2026-only allowance, and is $150 again since 2026-10-01. `effective_budget_kill_usd` clamps
 /// every other month back to this value IN CODE, so October is protected even
 /// if the scheduled 1-Oct revert of the terraform value is late or never lands.
-pub const STANDING_BUDGET_KILL_USD: f64 = 100.0;
+pub const STANDING_BUDGET_KILL_USD: f64 = 75.0;
 
 // A clamp must never RAISE the line: the standing ceiling may not sit above
 // the configured (September-allowance) fallback.
@@ -91,8 +93,8 @@ const _: () = assert!(STANDING_BUDGET_KILL_USD <= DEFAULT_BUDGET_KILL_USD);
 /// `STANDING_BUDGET_KILL_USD`.
 pub const SEPTEMBER_2026_ALLOWANCE: (i32, u32) = (2026, 9);
 
-/// October 2026 keeps the $170 line (`OCTOBER_2026_KILL_USD`) while the $100 standing line
-/// starts in November (operator Quote 33, 2026-10-21). One month, like September.
+/// October 2026 keeps the $170 line (`OCTOBER_2026_KILL_USD`) while the $75 standing line
+/// starts in November (operator Quotes 33, 36 and 37, 2026-10-21). One month, like September.
 pub const OCTOBER_2026_ALLOWANCE: (i32, u32) = (2026, 10);
 
 /// The line October 2026 is capped at, whatever is configured (Quote 30, $170).
@@ -2307,24 +2309,24 @@ aws events enable-rule --name tv-prod-daily-start\n"
     #[test]
     fn effective_ceiling_october_2026_keeps_the_configured_line() {
         // Quote 33 (2026-10-21): October had spent $119.20 by the 20th, so the
-        // $100 standing line starts in November, never in October.
+        // standing line ($75 since Quote 37) starts in November, never in October.
         assert_eq!(effective_budget_kill_usd(170.0, 2026, 10), 170.0);
-        assert_eq!(effective_budget_kill_usd(225.0, 2026, 8), 100.0);
+        assert_eq!(effective_budget_kill_usd(225.0, 2026, 8), 75.0);
     }
 
     #[test]
-    fn test_regression_effective_ceiling_november_2026_is_the_100_dollar_line() {
-        // Regression: 2026-10-21 — the standing line is $100 from November.
-        assert_eq!(effective_budget_kill_usd(170.0, 2026, 11), 100.0);
-        assert_eq!(effective_budget_kill_usd(170.0, 2026, 12), 100.0);
-        assert_eq!(effective_budget_kill_usd(170.0, 2027, 10), 100.0);
+    fn test_regression_effective_ceiling_november_2026_is_the_75_dollar_line() {
+        // Regression: 2026-10-21 — the standing line is $75 from November (Quote 37; was $85 under Quote 36 and $100 under Quote 33).
+        assert_eq!(effective_budget_kill_usd(170.0, 2026, 11), 75.0);
+        assert_eq!(effective_budget_kill_usd(170.0, 2026, 12), 75.0);
+        assert_eq!(effective_budget_kill_usd(170.0, 2027, 10), 75.0);
     }
 
     #[test]
     fn effective_ceiling_other_years_september_is_still_clamped() {
         // The allowance is one billing month, never "every September".
-        assert_eq!(effective_budget_kill_usd(225.0, 2027, 9), 100.0);
-        assert_eq!(effective_budget_kill_usd(225.0, 2025, 9), 100.0);
+        assert_eq!(effective_budget_kill_usd(225.0, 2027, 9), 75.0);
+        assert_eq!(effective_budget_kill_usd(225.0, 2025, 9), 75.0);
     }
 
     #[test]
@@ -2353,7 +2355,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
     fn effective_ceiling_never_raises_a_lower_configured_value() {
         assert_eq!(effective_budget_kill_usd(55.0, 2026, 10), 55.0);
         assert_eq!(effective_budget_kill_usd(55.0, 2026, 9), 55.0);
-        assert_eq!(effective_budget_kill_usd(80.0, 2026, 11), 80.0);
+        assert_eq!(effective_budget_kill_usd(70.0, 2026, 11), 70.0);
     }
 
     #[test]
