@@ -598,6 +598,16 @@ pub const QUOTE_34_REMOVED_TABLES: [&str; 6] = [
     "top_volume_1m",
 ];
 
+/// `true` for a table Quote 34 removes: the six named ones, and any other
+/// `top_volume*` table ("the entire top volume tables", which also covers the
+/// legacy `top_volume` / `top_volume_rank` names still on the keep list).
+/// Such a table is copied to S3 like any other and never re-created on the
+/// new disk.
+#[must_use]
+pub fn is_quote_34_removed(table: &str) -> bool {
+    QUOTE_34_REMOVED_TABLES.contains(&table) || table.starts_with("top_volume")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -824,6 +834,18 @@ mod tests {
             parse_box_report(&format!("{BOX_REPORT_PREFIX}not json")),
             None
         );
+    }
+
+    #[test]
+    fn test_is_quote_34_removed_covers_the_six_and_every_top_volume_name() {
+        for t in QUOTE_34_REMOVED_TABLES {
+            assert!(is_quote_34_removed(t), "{t}");
+        }
+        assert!(is_quote_34_removed("top_volume_rank"));
+        assert!(is_quote_34_removed("top_volume"));
+        for keep in ["candles_1s", "candles_1m", "instrument_lifecycle", "ticks"] {
+            assert!(!is_quote_34_removed(keep), "{keep}");
+        }
     }
 
     #[test]

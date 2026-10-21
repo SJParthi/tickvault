@@ -25,7 +25,8 @@ use std::time::{Duration, Instant};
 
 use crate::rebuild_2026_10_22::{
     BoxReport, COLD_BUCKET, CopyManifest, KeepTableCopy, MANIFEST_VERSION, Mode, Phase,
-    QUOTE_34_REMOVED_TABLES, S3_PREFIX, apply_window, is_commit_sha, is_manifest_key, manifest_key,
+    QUOTE_34_REMOVED_TABLES, S3_PREFIX, apply_window, is_commit_sha, is_manifest_key,
+    is_quote_34_removed, manifest_key,
 };
 use tickvault_storage::partition_archive::{PartitionArchiver, is_rebuild_safe_table_name};
 use tickvault_storage::rebuild_copy::{
@@ -212,7 +213,10 @@ pub fn plan_table(name: &str, partition_by: &str, designated: &str, keep: &[&str
     if !is_rebuild_safe_table_name(name) {
         return TablePlan::Unsafe;
     }
-    if keep.contains(&name) {
+    // A Quote 34 table on the keep list (the legacy `top_volume_rank`) is
+    // still copied to S3, but by partition or whole, never as a keep table,
+    // so the restore cannot re-create it on the new disk.
+    if keep.contains(&name) && !is_quote_34_removed(name) {
         return TablePlan::Keep;
     }
     if partition_by != "NONE" && !partition_by.is_empty() && designated == "ts" {
@@ -969,6 +973,12 @@ async fn restore_tables(
     };
     for keep in &manifest.keep_tables {
         let t = keep.data.table.as_str();
+        if is_quote_34_removed(t) {
+            // Never in a manifest this build writes; refused here as well so
+            // no manifest can re-create a Quote 34 table.
+            r.line(format!("restore {t}: skipped, removed by Quote 34"));
+            continue;
+        }
         if existing.iter().any(|e| e == t) {
             match q.count(t).await {
                 Ok(n) if n == keep.data.rows => {
@@ -1221,10 +1231,15 @@ mod tests {
 
     #[test]
     fn test_plan_table_routes_each_class() {
-        let keep = ["instrument_lifecycle", "order_audit"];
+        let keep = ["instrument_lifecycle", "order_audit", "top_volume_rank"];
         assert_eq!(
             plan_table("instrument_lifecycle", "NONE", "ts", &keep),
             TablePlan::Keep
+        );
+        // On the keep list but removed by Quote 34: copied, never restored.
+        assert_eq!(
+            plan_table("top_volume_rank", "HOUR", "ts", &keep),
+            TablePlan::Partitions
         );
         assert_eq!(
             plan_table("ticks", "HOUR", "ts", &keep),
