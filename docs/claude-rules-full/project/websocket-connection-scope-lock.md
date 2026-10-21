@@ -9464,3 +9464,36 @@ REJECT:
   contract.
 - Raising any swap cap or touching `ROTATION_HALTED` under this quote.
 - Any new alarm, page, metric filter or EMF name for it.
+
+### 2026-10-21 — DEPTH-20 AND DEPTH-200 ARE SWITCHED OFF (main feed and order update stay)
+
+Owner, 2026-10-21, after being shown that order-book (depth) data is about 24
+times the trade volume (1,530,651,649 depth rows against 64,349,753 ticks a
+session), about 80% of the daily disk burn, and the main cause of the morning
+disk saturation and the evening catch-up: "See if we don't use depth 20 and
+depth 20 I mean can we switch it off dude so if we do that how much we can save
+dude tell me dude oakyv", then, after the cost table: "Still I can't understand
+dude can we get or shrink rhe budget less than 100 usd dude tell me if yes tell
+me how? Then switch off both depth 20 and depth 200 dude okay?"
+
+The rule: one switch, `[dhan_universe] depth_sockets_enabled`, default
+**false**. While it is false no depth-20 or depth-200 socket is attached or
+dialled, on either Dhan account; the main-feed sockets (up to 5, unchanged) and
+the order-update socket are untouched. Everything authorized for depth by the
+dated sections above (2026-08-09, 2026-09-24, 2026-09-26, 2026-10-01, 2026-10-02,
+2026-10-13, 2026-10-20) stays in the code and comes back unchanged when the
+switch is set true; nothing is deleted. The depth tables and every depth row
+already written are kept (no market-data delete is authorized here; Quote 27
+binds). A depth-held pass, alarm or readiness check that would read "no depth"
+as a failure must read it as switched off, never page.
+
+REJECT:
+- Defaulting the switch to true, or turning depth back on in any tracked
+  config, without a fresh dated quote here.
+- Deleting depth code, depth tables or depth rows under this quote.
+- Touching the main-feed socket count, its universe, or the order-update socket
+  under this quote.
+- A page, alarm or Telegram message that fires because depth is switched off.
+- Shrinking the disk, lowering disk throughput or changing the instance under
+  this quote (each is a separate dated quote in
+  `daily-universe-scope-expansion-2026-05-27.md`).
