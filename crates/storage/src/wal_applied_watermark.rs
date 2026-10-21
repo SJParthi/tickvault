@@ -1675,8 +1675,36 @@ impl AppliedWatermark {
         self.note_questdb_probe_at(clean, mono_nanos());
     }
 
+    /// The acknowledgement marks `(ticks, depth)` to pass to
+    /// [`Self::note_questdb_probe_with_basis`]: read BEFORE the probe's query
+    /// is sent. O(1).
+    #[must_use]
+    pub fn probe_basis(&self) -> (u64, u64) {
+        (
+            self.hwm_ticks.load(Ordering::Acquire),
+            self.hwm_depth.load(Ordering::Acquire),
+        )
+    }
+
+    /// [`Self::note_questdb_probe`] with the healthy marks taken from `basis`
+    /// (from [`Self::probe_basis`], read before the query was sent) instead
+    /// of the marks when the reply came back. PR W review round 7: a probe
+    /// is in flight for seconds; a table that starts lying after its query
+    /// snapshot is not in the reply, so acks taken during the flight are not
+    /// vouched for by it, and recording them as healthy put them in no
+    /// episode range when the next probe failed.
+    pub fn note_questdb_probe_with_basis(&self, clean: bool, basis: (u64, u64)) {
+        self.note_questdb_probe_full(clean, Some(basis), mono_nanos());
+    }
+
     /// [`Self::note_questdb_probe`] at monotonic instant `now`.
     fn note_questdb_probe_at(&self, clean: bool, now: u64) {
+        self.note_questdb_probe_full(clean, None, now);
+    }
+
+    /// The probe report: `basis` = the marks when the query was sent, or
+    /// `None` for the marks now.
+    fn note_questdb_probe_full(&self, clean: bool, basis: Option<(u64, u64)>, now: u64) {
         if clean {
             self.clean_probes.fetch_add(1, Ordering::AcqRel);
             // Round 6: the flip and the reads under the ack gate, so an ack
@@ -1718,10 +1746,14 @@ impl AppliedWatermark {
                     });
                 }
             }
-            self.healthy_ticks
-                .store(self.hwm_ticks.load(Ordering::Acquire), Ordering::Release);
-            self.healthy_depth
-                .store(self.hwm_depth.load(Ordering::Acquire), Ordering::Release);
+            // The marks the reply vouches for: those when the query was sent
+            // (never above the marks now, which only rise).
+            let (now_ticks, now_depth) = self.probe_basis();
+            let (healthy_ticks, healthy_depth) = basis.map_or((now_ticks, now_depth), |(t, d)| {
+                (t.min(now_ticks), d.min(now_depth))
+            });
+            self.healthy_ticks.store(healthy_ticks, Ordering::Release);
+            self.healthy_depth.store(healthy_depth, Ordering::Release);
         } else {
             // Round 6: the flip and the watermark reads under the ack gate,
             // so an ack either raised the watermark before it (and is
@@ -2153,7 +2185,8 @@ impl AppliedWatermark {
     /// may still read (`None` when there is none, one is unreadable, or a
     /// folder could not be listed, which widens the migrated range to start
     /// at 1). `spans` are the waiting segments' sequence spans
-    /// (`wal_unapplied_ranges::waiting_spans`, empty when unknown): when a
+    /// (the boot scan inside `wal_unapplied_ranges::fold_at_boot`, empty when
+    /// unknown; `waiting_spans` is only its test seam): when a
     /// range set is full, a merge prefers a gap no waiting span intersects.
     ///
     /// 1. An overflow present now (inherited at `u64::MAX`, or a known height
@@ -3303,6 +3336,44 @@ mod tests {
                 .exists(),
             "no sidecar"
         );
+    }
+
+    /// Regression (PR W review round 7): a clean probe vouches only for the
+    /// acks taken before its query left. Acks during the flight (100 -> 400
+    /// here) must fall inside the range the next failed probe writes; with the
+    /// marks read after the reply, healthy was 400 and they fell in none.
+    #[test]
+    fn test_note_questdb_probe_with_basis_keeps_in_flight_acks_unsettled() {
+        let wm = AppliedWatermark::new_for_tests();
+        wm.note_ticks_acked(seq(100));
+        wm.note_depth_acked(seq(100));
+        let basis = wm.probe_basis();
+        // In flight: a table starts lying, acks keep coming.
+        wm.note_ticks_acked(seq(400));
+        wm.note_depth_acked(seq(400));
+        wm.note_questdb_probe_with_basis(true, basis);
+        wm.note_questdb_probe(false);
+        let snap = wm.snapshot();
+        assert!(
+            !snap.frame_is_applied(AppliedSink::Ticks, seq(300)),
+            "an ack taken during the clean probe's flight is not vouched for"
+        );
+        assert!(snap.range_has_unapplied(seq(300), seq(300)));
+        // The marks now never go backwards: a basis above them is clamped.
+        let wm = AppliedWatermark::new_for_tests();
+        wm.note_ticks_acked(seq(50));
+        wm.note_depth_acked(seq(50));
+        wm.note_questdb_probe_with_basis(true, (seq(900), seq(900)));
+        assert_eq!(wm.probe_basis(), (seq(50), seq(50)));
+    }
+
+    #[test]
+    fn probe_basis_reads_both_acked_watermarks() {
+        let wm = AppliedWatermark::new_for_tests();
+        assert_eq!(wm.probe_basis(), (0, 0));
+        wm.note_ticks_acked(seq(70));
+        wm.note_depth_acked(seq(30));
+        assert_eq!(wm.probe_basis(), (seq(70), seq(30)));
     }
 
     #[test]
@@ -4626,7 +4697,7 @@ mod tests {
             assert!(gate < flag, "{name}: the gate is taken before the flag");
         }
         let start = src
-            .find("    fn note_questdb_probe_at(&self, clean: bool, now: u64) {")
+            .find("    fn note_questdb_probe_full(&self, clean: bool, basis: Option<(u64, u64)>, now: u64) {")
             .expect("probe present");
         let body = &src[start..];
         let body = &body[..body.find("\n    }\n").expect("end of the function")];

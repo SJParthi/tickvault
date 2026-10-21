@@ -2231,6 +2231,7 @@ struct UnflushedTally<'a> {
     untracked: u64,
     /// Highest sequence written since the last good flush.
     high_seq: u64,
+    reorder: crate::wal_reorder_guard::ReorderWatch,
 }
 
 impl<'a> UnflushedTally<'a> {
@@ -2246,6 +2247,7 @@ impl<'a> UnflushedTally<'a> {
             len: 0,
             untracked: 0,
             high_seq: 0,
+            reorder: crate::wal_reorder_guard::ReorderWatch::new(),
         }
     }
 
@@ -2255,6 +2257,7 @@ impl<'a> UnflushedTally<'a> {
         self.persisted.fetch_add(1, Ordering::Relaxed);
         self.segment_bytes = self.segment_bytes.saturating_add(size);
         self.high_seq = self.high_seq.max(seq);
+        self.reorder.observe(seq);
         let i = self.len;
         if let (Some(end), Some(s), Some(t)) = (
             self.ends.get_mut(i),
@@ -2805,13 +2808,9 @@ fn persist_record_resilient(
         // disk that is already full. The failure is detected either way
         // (WS-SPILL-01 has a live metric-filter alarm), so this is not a
         // silence fix — it stops a detected failure from amplifying itself and
-        // starving the very disk the operator has to recover.
-        //
-        // The sleep is the writer thread's own, exactly as in the sibling arms:
-        // this runs on the dedicated WAL writer, never on the hot path. Frames
-        // continue to reach the broadcast and the ring→spill→DLQ while it
-        // backs off — the durable-WAL belt is what is degraded, and it is
-        // already degraded by the full disk.
+        // starving the very disk the operator has to recover. The sleep is the
+        // WAL writer thread's own, never the hot path's; frames still reach the
+        // ring while it backs off (only the WAL belt, already degraded, waits).
         thread::sleep(WAL_WRITER_IO_RETRY_BACKOFF);
         return 0;
     };

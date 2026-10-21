@@ -90,7 +90,8 @@
 //! * **A backlog that never drains still costs one kept segment per boot.**
 //!   The replay reads the WAL oldest first, so when the oldest backlog never
 //!   drains it never reaches the later segments. Each boot's tail
-//!   `[boot_applied_floor + 1, own_floor]` keeps the previous session's last
+//!   `[boot_range_floor, own_floor]` (since round 6 one slack below
+//!   `boot_applied_floor`) keeps the previous session's last
 //!   segment (the frames past its last durable ack) for good, one island per
 //!   boot. The guard no longer adds a second island (its top is clamped to
 //!   `boot_frame_high`), and the merge no longer swallows acked sessions
@@ -143,7 +144,8 @@
 //!   outpaces that; how often the live box latches apply lag is Assumed.
 //!   The pinned set is now visible on local `/metrics`:
 //!   [`WAL_UNAPPLIED_PINNED_SEGMENTS_GAUGE`] and
-//!   [`WAL_UNAPPLIED_PINNED_BYTES_GAUGE`], set after every trim. Not fixed
+//!   [`WAL_UNAPPLIED_PINNED_BYTES_GAUGE`], set after the boot fold, the backlog guard and
+//!   every catch-up trim (a reading as of the last of those, never live). Not fixed
 //!   here: confirming parked live acks once enough clean probes follow (as
 //!   `settling/` does for replays) instead of pinning them for a full
 //!   replay. Pinned by `proptest_stuck_backlog_keeps_later_sessions_prunable`,
@@ -3602,9 +3604,9 @@ mod tests {
         ack_both(&wm, seq(200));
         wm.note_questdb_probe(true);
         let src = include_str!("wal_applied_watermark.rs");
-        // Round 4 (C): the body moved into `note_questdb_probe_at` (the
-        // public probe passes it the monotonic clock).
-        let needle = concat!("fn ", "note_questdb_probe_at(");
+        // Round 4 (C): the body moved into `note_questdb_probe_at`; round 7
+        // moved it again, into `note_questdb_probe_full` (it takes the basis).
+        let needle = concat!("fn ", "note_questdb_probe_full(");
         let start = src.find(needle).unwrap_or(src.len());
         assert!(start < src.len(), "the probe is in the source");
         let body = &src[start..];

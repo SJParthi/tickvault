@@ -1213,6 +1213,9 @@ pub fn spawn_wal_suspension_watcher(questdb: QuestDbConfig) -> tokio::task::Join
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
+            // PR W review round 7: the marks a clean reply vouches for are
+            // the ones before the query left, not after it came back.
+            let probe_basis = crate::wal_applied_watermark::applied_watermark().probe_basis();
             match probe_wal_tables(&base_url).await {
                 Ok((rows, skipped)) => {
                     schema_warned = false;
@@ -1326,11 +1329,13 @@ pub fn spawn_wal_suspension_watcher(questdb: QuestDbConfig) -> tokio::task::Join
                     // watermark was told the database was clean while the
                     // backlog stood exactly where it was. An ack trusted on
                     // such a poll archives frames that were never applied.
-                    crate::wal_applied_watermark::applied_watermark().note_questdb_probe(
-                        skipped == 0
-                            && delta.currently_suspended == 0
-                            && lag_tracker.untrusted_count() == 0,
-                    );
+                    crate::wal_applied_watermark::applied_watermark()
+                        .note_questdb_probe_with_basis(
+                            skipped == 0
+                                && delta.currently_suspended == 0
+                                && lag_tracker.untrusted_count() == 0,
+                            probe_basis,
+                        );
                     // DA-13c: archive acked replay segments once they are past
                     // the durability lag and two clean probes. A few renames at
                     // most, off the runtime worker; a join error only defers.
