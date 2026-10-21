@@ -4037,7 +4037,7 @@ mod tests {
     /// the connections it accepted, so a test can prove a write never reached
     /// the network.
     fn spawn_counting_ilp_server() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        use std::io::{Read as _, Write as _};
+        use std::io::Write as _;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -4046,8 +4046,7 @@ mod tests {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
                 counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let mut buf = [0u8; 65_536];
-                let _ = stream.read(&mut buf);
+                super::spill_writer_tests::read_whole_request(&mut stream);
                 let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
             }
         });
@@ -5603,6 +5602,44 @@ mod spill_writer_tests {
         w
     }
 
+    /// Reads one whole HTTP request (headers, then a `Content-Length` body or
+    /// a chunked body to its last chunk) before the fake servers below reply.
+    /// A single `read` could return only the headers; replying and closing
+    /// with the body still unread makes the kernel send a reset, which the
+    /// client reports as a transport failure instead of the reply (seen once
+    /// in CI as a 400 that tripped the breaker). Test-only, bounded by the
+    /// 5 s read timeout.
+    pub(super) fn read_whole_request(stream: &mut std::net::TcpStream) {
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+        let mut got: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 65_536];
+        // O(1) EXEMPT: test-only read loop, bounded by the timeout
+        loop {
+            if let Some(end) = got.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&got[..end]).to_ascii_lowercase();
+                let body = got.len() - (end + 4);
+                let length = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok());
+                let complete = match length {
+                    Some(n) => body >= n,
+                    None if head.contains("transfer-encoding: chunked") => {
+                        got.ends_with(b"0\r\n\r\n")
+                    }
+                    None => true,
+                };
+                if complete {
+                    return;
+                }
+            }
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+            }
+        }
+    }
+
     /// A port nothing listens on: a flush fails fast with a socket error.
     fn closed_port() -> u16 {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -5621,8 +5658,7 @@ mod spill_writer_tests {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
                 counted.fetch_add(1, Ordering::SeqCst);
-                let mut buf = [0u8; 65_536];
-                let _ = stream.read(&mut buf);
+                read_whole_request(&mut stream);
                 let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
             }
         });
@@ -6056,8 +6092,7 @@ mod spill_writer_tests {
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
-                let mut buf = [0u8; 65_536];
-                let _ = stream.read(&mut buf);
+                read_whole_request(&mut stream);
                 let body = b"bad line";
                 let _ = stream.write_all(
                     format!(
