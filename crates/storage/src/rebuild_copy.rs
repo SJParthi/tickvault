@@ -225,13 +225,15 @@ impl RebuildCold {
     // TEST-EXEMPT: one S3 call
     pub async fn get_small(&self, key: &str, scratch: &Path) -> Result<Vec<u8>, String> {
         let path = scratch.join("rebuild-manifest.download");
-        let _ = std::fs::remove_file(&path);
+        // A leftover from an earlier run may or may not exist; either is fine.
+        std::fs::remove_file(&path).ok();
         self.cold
             .get_to_path(key, &path)
             .await
             .map_err(|e| format!("{e:#}"))?;
         let body = std::fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        let _ = std::fs::remove_file(&path);
+        // The body is already in memory; a temp file left behind is harmless.
+        std::fs::remove_file(&path).ok();
         Ok(body)
     }
 
@@ -357,10 +359,10 @@ pub fn rename_ddl_table(ddl: &str, from: &str, to: &str) -> Option<String> {
         .filter(|p| p.eq_ignore_ascii_case("CREATE TABLE "))
         .map(|_| &trimmed[13..])?;
     for quoted in [format!("'{from}'"), format!("\"{from}\""), from.to_string()] {
-        if let Some(after) = rest.strip_prefix(&quoted) {
-            if after.starts_with([' ', '(']) {
-                return Some(format!("CREATE TABLE '{to}'{after}"));
-            }
+        if let Some(after) = rest.strip_prefix(&quoted)
+            && after.starts_with([' ', '('])
+        {
+            return Some(format!("CREATE TABLE '{to}'{after}"));
         }
     }
     None

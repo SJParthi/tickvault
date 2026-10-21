@@ -229,6 +229,16 @@ pub mod infra;
 pub mod kernel_rx_queue_sampler;
 pub mod leg_identity;
 pub mod log_coalescer;
+/// One-off (plan item 66, operator Quotes 32/33/34, 2026-10-21): the pure
+/// half of the 2026-10-22 rebuild (150 GB root, r8g.large). Removed with the
+/// tool, the box subcommand and the workflow after the run.
+pub mod rebuild_2026_10_22;
+/// One-off (plan item 66): `tickvault rebuild-box <phase>`, the box-side half
+/// of the 2026-10-22 rebuild, run over SSM only. Removed after the run.
+pub mod rebuild_box;
+/// One-off (plan item 66): the one budgeted SSM shell element the rebuild
+/// sends. Removed after the run.
+pub mod rebuild_ssm;
 // 2026-05-09 PR 5c.5-final (Bug 3 — movers retirement): the
 // `movers_pipeline` orchestrator is DELETED. Operator directive:
 // "only ticks and our 9 needed candle timeframes are available".
