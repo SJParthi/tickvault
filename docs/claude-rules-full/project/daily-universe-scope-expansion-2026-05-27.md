@@ -2919,3 +2919,71 @@ The owner then answered three decision cards. Each answer is given below with th
 - A rebuild inside market hours, with the app running, or before the S3 copies are verified.
 - Lowering the native stop (`limit_amount`) below $170 before 1 November 2026, or the October code line below $170.
 - Reusing the step-2 waiver after 2026-10-21.
+
+#### Quote 34 (2026-10-21, evening) — CANDLES_3S, CANDLES_5S AND EVERY TOP_VOLUME TABLE ARE REMOVED (preserve EXACTLY, typos included)
+
+> "dude meanhwiel remvoe candles 3s and 5s and alogn with delete and remove the entire top volume tables also dude okay? can yo udo all ytehse dud eokay? see in thsic ase what and all we cna save clelary tell me dude hwo much memory as well dude okay?"
+> "see clealry note to delete and permanently remove and drop candles 3 seconds and candles 5 seconds dude and even entire top volumes entire tables also dude okay? meanwhiel go ahead with eveythgin edude meanwhile see switch off depth 20 and dpeth 200 i eman let th eimpelemntations be there but just switch off depth 20 and depth 200 dude okay?"
+
+The timeframe and socket half of this quote is recorded in
+`websocket-connection-scope-lock.md` §"2026-10-21 (EVENING) — CANDLES_3S,
+CANDLES_5S AND TOP_VOLUME ARE REMOVED". This file records the data half.
+
+**Measured before the change (2026-10-21, read-only, from the `s3://tv-prod-cold/questdb-partitions/` daily archives of 9–19 Oct; row counts from 16 Oct):**
+
+| Table | Rows a day | Compressed archive a day | On the box (row width × rows, Assumed widths from the DDL) | Days kept on the box |
+|---|---|---|---|---|
+| `candles_3s` | 5,823,334 | ~290 MB | ~1.37 GB | today + yesterday (intraday class) |
+| `candles_5s` | 4,446,655 | ~225 MB | ~1.05 GB | today + yesterday (intraday class) |
+| `top_volume_1s` / `_3s` / `_5s` / `_1m` | 960,322 / 810,976 / 743,757 / 654,718 | ~55 MB together | ~0.29 GB together | 15 days (market-data class) |
+
+**What this authorizes:**
+
+| Surface | Disposition |
+|---|---|
+| Code | The fold stops producing 3 s and 5 s bars; nothing writes `candles_3s`, `candles_5s` or any `top_volume_*` table; the ranking that only fed `top_volume` (and the depth-200 choice, off since the same day) goes with it. |
+| The six tables on the box | **DROPPED**, but only after every partition still on the box is in `s3://tv-prod-cold/questdb-partitions/` and verified (Quote 27 binds until Quote 35 runs). The 2026-10-22 rebuild satisfies this by copying first and creating none of the six on the new disk. |
+| Their S3 archives | Kept until the Quote 35 wipe on 2026-10-31, which deletes them with the rest. |
+
+##### What violates Quote 34 (REJECT)
+- Dropping any of the six tables on the box before its partitions are copied to S3 and verified.
+- Removing any other timeframe (`1s`, `1m`, `3m`, `5m`, `10m`, `15m`, `30m`, `60m`) or table under this quote.
+- Deleting a SEBI or audit row, or any S3 object, under this quote (S3 deletes are Quote 35's, on 2026-10-31 only).
+- Re-adding a 3 s or 5 s candle table or any `top_volume_*` table without a fresh dated quote here.
+
+#### Quote 35 (2026-10-21, evening) — ONE FULL MARKET-DATA WIPE, BOX AND S3, ON THE NIGHT OF SATURDAY 2026-10-31; NOVEMBER STARTS CLEAN (preserve EXACTLY, typos included)
+
+> "see wipe off the entire data fully dude so tomorow run and entire run startign from november also should run as per the precise requriements dude okay?"
+
+**Decision cards, tapped by the owner in this order:**
+1. "Which data should be permanently deleted?" → **"Box clean, keep S3 (Recommended)"**, then, in the owner's next words: "nope bro remvoe evryhtigne ntilrey dude okay?" / "let us condeir it liek thsi startign novemebr month evryhtign eneds to be in place to run evrythign rpoecisleyd dude okay? as per our requirmenet dude okay??"
+2. "Confirm the full wipe: permanently delete ALL market data on the server AND every backup copy in S3 … Nothing from before the wipe can ever be recovered. SEBI/audit tables, order logs, instrument records and deploy files are kept by law. When should it run?" → **"Sat 31 Oct (Recommended)"**.
+3. "With the full wipe on Sat 31 Oct, should the 150 GB disk + smaller server rebuild move from Thursday night to the same Saturday?" → **"Keep Thursday night"**.
+4. Then: "see dod evryhtign nwo ddue okay?" / "make evryhtign as now dude okay?" / "oh okay ya ya keep it as oct 31 night dude okay?" — read as: do all the preparation now, and run the wipe on the night of 31 October. Nothing is deleted before then.
+
+Recorded HERE before anything is deleted, per the rule-file-first law and the
+Quote 27/28 retirement clause. Quote 35 names the data and states that it will
+be lost: **every market-data row and file from before 2026-11-01, on the box and in S3, every version, can never be recovered.**
+
+##### What this authorizes (one run, the night of Saturday 2026-10-31 IST, app stopped)
+
+| Surface | Disposition |
+|---|---|
+| QuestDB market-data tables (`ticks`, `market_depth`, `market_depth_book`, every `candles_<tf>`, any `top_volume_<tf>` still present, `feed_aux_packets` and the other market-data classes Quote 29 named) | Every partition dated before 2026-11-01 IST **DROPPED**. |
+| On-box raw frame log (WAL segments and their `replaying/` and `archive/` folders), tick / depth / seal / top_volume spill, spill-hold, seal DLQ | Every file from before 2026-11-01 **DELETED** (the app is stopped, so no segment is open). |
+| `s3://tv-prod-cold/questdb-partitions/<market-data table>/`, `raw-frames/<date before 2026-11-01>/`, `seal-spill/`, `top-volume-spill/` if present | **DELETED, every version**, by version id, once. |
+| The 7-day snapshot of the old 600 GB volume from the 2026-10-22 rebuild, if it still exists | **DELETED** (it holds the same market data). |
+
+##### What this does NOT touch
+Exactly Quote 29's keep-list: every SEBI and audit table and its S3 archive (`instrument_lifecycle`, `instrument_lifecycle_audit`, `index_constituency`, `order_audit`, `partition_archive_audit`, and the rest of the operator-console keep-list), `sebi-preserve/` (box and S3), `deploys/` and `bin/tickvault.backup`, the `logs/` export, config, secrets, the instrument cache, terraform state, and versioning, lifecycle and the public-access block on `tv-prod-cold`.
+
+##### How it runs
+The same shape as Quote 29e: a reviewed, one-off Rust tool and workflow, dry run, then apply, then a verify listing; S3 after the box files; any new delete permission scoped to exactly the prefixes above, refused after 2026-11-01 IST, and deleted with the tool and workflow by the next PR. That tool needs its own dated row in `rust-only-forever-lock-2026-07-19.md` if it carries any shell.
+
+##### What violates Quote 35 (REJECT)
+- Deleting anything before the night of 2026-10-31 IST, or anything dated 2026-11-01 or later.
+- Deleting a SEBI or audit row, `sebi-preserve/`, `deploys/` or the `logs/` export.
+- Running with the app running, inside 09:00–15:45 IST, or while `deploy-aws` is running.
+- Suspending versioning, adding an `expiration` or `noncurrent_version_expiration`, or keeping any delete permission after the run.
+- Treating Quote 35 as standing permission: it is spent after this one run, and Quote 27 ("nothing is ever deleted") binds again from then on.
+- Skipping the Quote 32/33 copy-first rule for the 2026-10-22 rebuild because the copies are deleted on 31 Oct anyway: Quote 27 binds until Quote 35 runs.
