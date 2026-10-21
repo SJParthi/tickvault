@@ -2865,3 +2865,28 @@ Earlier the same session, on the option of raising the disk's paid speed: *"bro 
 - Re-adds a fixed evening deadline to the deferred-depth pass or the post-close WAL catch-up.
 - Raises disk throughput, IOPS, instance type, EBS size or the kill line under cover of this quote.
 - Adds a Telegram page for the hold.
+
+#### Quote 32 (2026-10-21) — AWS UNDER $100 A MONTH: DEPTH OFF, FREE DISK SPEED, 150 GB DISK, HALF-SIZE SERVER (preserve EXACTLY, typos included)
+
+After being shown the October split (~$173 with tax: disk storage ~$73, server hours ~$45, disk speed ~$22, alarms ~$24, other ~$9) and four steps (depth off; disk speed 500 → 125 MiB/s; 600 GB disk replaced by 150 GB; r8g.xlarge → r8g.large), estimated at about $90–95 a month for the first three and about $70–75 with the fourth:
+
+> "Still I can't understand dude can we get or shrink rhe budget less than 100 usd dude tell me if yes tell me how? Then switch off both depth 20 and depth 200 dude okay?"
+> "Access the direct love Aws dude oaky / Then I believe you can go ahead with allctge steps right dude am icirght bro tellcme dude oaky / So max per month it will be only 75 right dude / Nope bro switch off depth 20 and depth 200 go ahead with all the items which you have listed dude oaky? / What bro doing or not dude see switch off depth 20 and depth 200 and all the steps also implement it dud eoaku"
+
+**What this authorizes, in this order (each step only after the one before it is live and checked):**
+
+| Step | Change | Precondition |
+|---|---|---|
+| 1 | Depth-20 and depth-200 off (`websocket-connection-scope-lock.md`, 2026-10-21) | Merged and deployed |
+| 2 | Disk throughput 500 → **125 MiB/s** (the free gp3 baseline) through `grow-ebs-volume.yml` (size 600 and IOPS 3,000 unchanged); `variables.tf` default 125 | One full session with depth off whose 1-minute write-throughput peak after 09:15 is under 100 MiB/s; outside 09:00–15:45 IST |
+| 3 | Root disk 600 GB → **150 GB**: a new volume on a rebuilt box (gp3 cannot shrink) | A reviewed rebuild plan and workflow; every QuestDB table the new disk does not hold, and every SEBI/audit table, copied to `s3://tv-prod-cold/` and verified first (Quote 27 binds); the WAL backlog drained or copied; a non-trading day; the old volume kept as a snapshot for 7 days |
+| 4 | **r8g.xlarge → r8g.large**, multi-AZ shape kept; memory limits (systemd `MemoryHigh`, QuestDB memory) retuned for 16 GiB; every instance-lock lockstep site in the same change | Done with step 3, on the same rebuild |
+
+**Honest limits, stated to the owner:** about $70–75 a month is an ESTIMATE from the 1–13 Oct bill, not a maximum. The only hard maximum is the budget stop (still $170; lowering it is a separate dated quote). October is already $119.20 on 1–20 Oct, so the saving shows from November. A 150 GB disk holds about two days of trades and candles at today's rate without depth (Assumed until measured after step 1); older partitions move to S3 sooner. A half-size server has half the memory: the WAL replay spike measured 15.5 GiB came from depth rows and should not recur, but this is Assumed until a depth-off replay is measured.
+
+##### What a PR or action that violates Quote 32 looks like (REJECT)
+- Lowers throughput before a depth-off session is measured, or inside 09:00–15:45 IST.
+- Replaces the disk or the instance on a trading day, or before the S3 copies are verified.
+- Deletes any SEBI/audit row, or any market data without a verified copy, under cover of this quote.
+- Changes the instance to anything but r8g.large, or to a single-zone shape.
+- Presents the $70–75 estimate as a guaranteed maximum, or changes the kill line under this quote.
